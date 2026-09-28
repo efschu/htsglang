@@ -156,6 +156,53 @@ def _rate(tok, ms):
 
 
 ONE_S = 1.0            # the "jetzt 1 s" window
+GEN_GAP_FACTOR = 2.5   # a Decode batch line later than this x the usual line interval covers a pause
+
+
+def mark_gen_artefacts(batches, pauses, gap_s=PHASE_GAP_S, factor=GEN_GAP_FACTOR):
+    """Drop the 'gen throughput' of Decode batch lines whose interval was not
+    continuous decode.  Pure, unit-tested.
+
+    sglang's figure is tokens since the PREVIOUS Decode batch line / the wall
+    time since it.  When decode paused in between (a flip, an extend of the
+    same group, idle), the pause sits in the denominator: measured rc12z20
+    12:34:57 bs6 13.65 tok/s, 4 s later bs5 133.  Such a line keeps its raw
+    value in ``gen_tps_raw`` (the tokens are real, the rate is not) and gets
+    ``gen_tps = None`` plus the reason in ``gen_art``:
+
+      * ``first``  -- no previous line: the interval is unknown;
+      * ``pause``  -- a pause stamp (flip begin/done, own-group prefill line)
+        fell in (previous line, this line + 1 s);
+      * ``gap``    -- the line came later than max(gap_s, factor x median of
+        the preceding clean intervals).
+
+    ``batches``: the group's Decode batch events in log order; ``pauses``:
+    sorted stamps.  Idempotent (always re-derived from ``gen_tps_raw``)."""
+    import bisect
+    prev_t = None
+    dts = collections.deque(maxlen=20)
+    for e in batches:
+        raw = e["gen_tps_raw"] if "gen_tps_raw" in e else e.get("gen_tps")
+        e["gen_tps_raw"] = raw
+        t = e["t"]
+        art = None
+        if raw is not None:
+            if prev_t is None:
+                art = "first"
+            else:
+                dt = t - prev_t
+                i = bisect.bisect_right(pauses, prev_t)
+                if i < len(pauses) and pauses[i] < t + 1.0:
+                    art = "pause"
+                else:
+                    med = sorted(dts)[len(dts) // 2] if dts else None
+                    if dt > max(gap_s, factor * med if med else gap_s):
+                        art = "gap"
+                    else:
+                        dts.append(max(dt, 1.0))
+        e["gen_art"] = art
+        e["gen_tps"] = None if art else raw
+        prev_t = t
 
 
 def _mid(t):
@@ -696,7 +743,10 @@ class Boot:
             # Decode batch line / the time between; those tokens are spread evenly
             # over the rounds that fell in between (bs x accept len over-counts:
             # measured 27.09. NF bs 4 -> ~180 against gen throughput ~100)
-            batches = [e for e in self.ev["%s_decode_batch" % g] if e.get("gen_tps") is not None and e["t"] >= since - 30]
+            # raw figure on purpose: gen throughput x (interval) are the tokens of
+            # that interval even when a pause made the RATE an artefact
+            batches = [e for e in self.ev["%s_decode_batch" % g]
+                       if e.get("gen_tps_raw", e.get("gen_tps")) is not None and e["t"] >= since - 30]
             rows = [e for e in self.ev["%s_decode_rank" % g]
                     if e["t"] >= since - 30 and e.get("rank", 0) == 0 and e.get("t_exact")]
             if rows and batches:
@@ -712,7 +762,7 @@ class Boot:
                             idx.append(j)
                         j += 1
                     if idx:
-                        tok = batches[k]["gen_tps"] * (hi - lo) / len(idx)
+                        tok = batches[k].get("gen_tps_raw", batches[k].get("gen_tps")) * (hi - lo) / len(idx)
                         for i in idx:
                             per_round[i] = tok
                 last_tok = None
@@ -773,6 +823,10 @@ class Boot:
               if e["t"] >= now - WINDOW_S and e.get("rank", 0) == 0 and e.get("gpu_ms")]
         last = self.last.get("%s_decode_batch" % g)
         gen = [e["gen_tps"] for e in rows if e.get("gen_tps") is not None]
+        # the newest figure that is a real decode rate (mark_gen_artefacts), not
+        # the first line after a flip or extend
+        clean_last = next((e["gen_tps"] for e in reversed(self.ev["%s_decode_batch" % g])
+                           if e.get("gen_tps") is not None), None)
         compute = None
         if rr and last and last.get("accept_len"):
             ms = sum(e["gpu_ms"] for e in rr)
@@ -783,7 +837,8 @@ class Boot:
             "one_s": self._one_s(g, "decode", now),
             "max3s_120": self._max3s(g, "decode", now),
             "gen_tps": (sum(gen) / len(gen)) if gen else None,
-            "gen_tps_last": last.get("gen_tps") if last else None,
+            "gen_tps_last": clean_last,
+            "artefacts": sum(1 for e in rows if e.get("gen_art")),
             "running": last.get("running") if last else None,
             "queue_req": last.get("queue") if last else None,
             "round_bs": self._round_bs(g),
@@ -885,7 +940,18 @@ class Boot:
     def groups_with(self, kind: str) -> List[str]:
         return [g for g in ("P", "D", "single") if self.ev.get("%s_%s" % (g, kind))]
 
+    def _mark_gen(self):
+        """Re-derive every Decode batch line's shown rate (mark_gen_artefacts):
+        pauses are the flips (begin and done) and the group's own prefill lines."""
+        flips = [e["t"] for e in self.ev["flip_begins"]] + [e["t"] for e in self.ev["flips"]]
+        if self.flip_open:
+            flips.append(self.flip_open["t"])
+        for g in self.groups_with("decode_batch"):
+            pauses = sorted(flips + [e["t"] for e in self.ev["%s_prefill_rank" % g]])
+            mark_gen_artefacts(self.ev["%s_decode_batch" % g], pauses)
+
     def view(self, now: float, with_series: bool = True) -> dict:
+        self._mark_gen()
         age = now - self.newest_mtime if self.newest_mtime else None
         v = {
             "stem": self.stem,

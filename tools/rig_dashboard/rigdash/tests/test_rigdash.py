@@ -147,7 +147,9 @@ class LiveTests(unittest.TestCase):
         now = time.time()
         self._write("front", [BOOT, FORM])
         self._write("P", [ARGS, _shift(P_RANK0, now - 5), _shift(P_RANK1, now - 5), _shift(P_BATCH, now - 5)])
-        self._write("D", [_shift(DEC, now - 3), _shift(DEC_RANK, now - 3)])
+        # two Decode batch lines: the boot's first one has no previous line, its
+        # interval (and so its rate) is unknown -- mark_gen_artefacts drops it
+        self._write("D", [_shift(DEC, now - 4), _shift(DEC, now - 3), _shift(DEC_RANK, now - 3)])
         ll = live.LiveLogs([os.path.join(self.tmp.name, "boot_*.log")])
         ll.poll()
         [v] = ll.snapshot()
@@ -930,6 +932,67 @@ class DecodeSeatsTests(unittest.TestCase):
         st = live._run_stats("dec", evs)
         self.assertEqual((st["bs_min"], st["bs_max"]), (4, 6))
         self.assertAlmostEqual(st["bs_mean"], 5.25)
+
+
+# verbatim, NF rc12z20 boot_weg2_dkrnfh91dprsavisnoadoptstbar1dauer09281220_3a86888ba5, 2026-09-28:
+# D decoded bs1 until 12:34:19, flipped away and back (12:34:19.9 .. 12:34:47.2), extended six
+# requests, and its first Decode batch line after that carried the pause in its denominator
+ART_D = [
+    "[2026-09-28 12:34:18 TP0] Decode batch, #running-req: 1, #full token: 333184, full token usage: 0.64, mamba num: 4, "
+    "mamba usage: 0.21, accept len: 2.70, accept rate: 0.57, cuda graph: True, gen throughput (token/s): 88.01, #queue-req: 0",
+    "[2026-09-28 12:34:19 TP0] Decode batch, #running-req: 1, #full token: 333248, full token usage: 0.64, mamba num: 4, "
+    "mamba usage: 0.21, accept len: 2.62, accept rate: 0.54, cuda graph: True, gen throughput (token/s): 93.22, #queue-req: 0",
+    "[2026-09-28 12:34:55 TP0] Prefill rank batch, #new-token: 164, #cached-token: 18560, #chunks: 1, gpu-ms: 1670.7 "
+    "(compute 1623.6, wait 47.1) (wait by family: tp.all_reduce 47.1/96x, ple.wait 0.0/1x)",
+    "[2026-09-28 12:34:57 TP0] Decode batch, #running-req: 6, #full token: 387840, full token usage: 0.74, mamba num: 24, "
+    "mamba usage: 0.63, accept len: 2.16, accept rate: 0.39, cuda graph: True, gen throughput (token/s): 13.65, #queue-req: 0",
+    "[2026-09-28 12:35:01 TP0] Decode batch, #running-req: 5, #full token: 387776, full token usage: 0.74, mamba num: 16, "
+    "mamba usage: 0.42, accept len: 2.58, accept rate: 0.53, cuda graph: True, gen throughput (token/s): 133.47, #queue-req: 0",
+]
+ART_FRONT = [
+    "[2026-09-28 12:34:44,088] INFO weg2.front: WEG2-FLIP begin epoch=11 sleep=P wake=D outstanding=0 queue=0",
+]
+
+
+class GenArtefactTests(unittest.TestCase):
+    """User 28.09.: 'messartefakte entfernen. unsinnige werte im dashboard nicht anzeigen'."""
+
+    def _boot(self, with_front=True):
+        b = live.Boot("x", "/tmp")
+        for ln in ART_D:
+            b._ingest("D", parse.parse_line(ln))
+        if with_front:
+            for ln in ART_FRONT:
+                b._ingest("front", parse.parse_line(ln))
+        return b
+
+    def test_line_after_flip_and_extend_is_no_rate(self):
+        b = self._boot()
+        b._mark_gen()
+        got = [(e["gen_tps"], e["gen_art"]) for e in b.ev["D_decode_batch"]]
+        self.assertEqual(got, [(None, "first"), (93.22, None), (None, "pause"), (133.47, None)])
+        self.assertEqual(b.ev["D_decode_batch"][2]["gen_tps_raw"], 13.65)   # tokens stay: raw kept
+
+    def test_gap_alone_marks_it(self):
+        b = self._boot(with_front=False)
+        b.ev["D_prefill_rank"].clear()
+        b._mark_gen()
+        self.assertEqual(b.ev["D_decode_batch"][2]["gen_art"], "gap")          # 38 s after a 1-s rhythm
+
+    def test_views_never_show_the_artefact(self):
+        b = self._boot()
+        t = parse.parse_line(ART_D[-1])["t"]
+        v = b.view(t + 1.0, with_series=True)
+        d = v["decode"]["D"]
+        self.assertEqual(d["gen_tps_last"], 133.47)
+        self.assertNotIn(13.65, [x for x in v["series"]["D_decode_tps"] if x])
+        self.assertTrue(all((s.get("tps") or 100) > 70 for s in v["timeline"]["segs"] if s["k"] == "dec"))
+
+    def test_idempotent(self):
+        b = self._boot()
+        b._mark_gen()
+        b._mark_gen()
+        self.assertEqual([e["gen_tps"] for e in b.ev["D_decode_batch"]], [None, 93.22, None, 133.47])
 
 
 if __name__ == "__main__":
