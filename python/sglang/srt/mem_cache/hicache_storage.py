@@ -4381,13 +4381,49 @@ def _l3_executor(n: int):
         return _l3_pool
 
 
+#: BS (28.09., 27B rc12z26 P 17:18:02): a page at least this large (the 27B
+#: Mamba anchor blob, 78446592 B) is read in pieces of L3_SPLIT_CHUNK_BYTES by
+#: the pool -- "#1433 L3->L2 fill: 1 of 1 pages ... threads=1 ms=281" was 72 %
+#: of that request's read. Desk, same XFS NVMe, cold file, fresh shm target:
+#: one pread 52 ms (1.5 GB/s), 8 x 4 MiB 23 ms (3.3 GB/s).
+L3_SPLIT_MIN_BYTES = 8 << 20
+L3_SPLIT_CHUNK_BYTES = 4 << 20
+
+
+def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int):
+    """Every page of ``paths`` in ``L3_SPLIT_CHUNK_BYTES`` pieces across ``k``
+    pool threads, each piece a pread at its offset into the page's own target
+    (``ptrs[i] + off``); a page's status is its first failing piece's (the
+    size check runs per piece against the whole file)."""
+    total = int(total_bytes)
+    pieces = [(i, off, min(L3_SPLIT_CHUNK_BYTES, total - off))
+              for i in range(len(paths)) for off in range(0, total, L3_SPLIT_CHUNK_BYTES)]
+    k = min(k, len(pieces))
+    groups = [pieces[g::k] for g in range(k)]
+
+    def one(group):
+        return pio.read_pages([paths[i] for i, _o, _l in group], [total] * len(group),
+                              [((o, l),) for _i, o, l in group],
+                              [int(ptrs[i]) + o for i, o, _l in group], True)
+
+    rc = [0] * len(paths)
+    for group, res in zip(groups, _l3_executor(k).map(one, groups)):
+        for (i, _o, _l), r in zip(group, res):
+            if r != 0 and rc[i] == 0:
+                rc[i] = r
+    return rc, k
+
+
 def l3_read_pages_parallel(pio, paths, total_bytes: int, ptrs, threads: Optional[int] = None):
     """``(status per page, threads used)`` -- the pages read into ``ptrs``
     split across ``threads`` concurrent pageio calls (strided, so every call
-    gets a spread of the batch); status as ``PageIO.read_pages``."""
+    gets a spread of the batch); status as ``PageIO.read_pages``. A page of
+    ``L3_SPLIT_MIN_BYTES`` or more is itself read in pieces (BS)."""
     n = len(paths)
     k = l3_read_threads() if threads is None else max(1, int(threads))
     ext = ((0, int(total_bytes)),)
+    if k > 1 and n and int(total_bytes) >= L3_SPLIT_MIN_BYTES:
+        return _l3_read_split(pio, paths, total_bytes, ptrs, k)
     if k <= 1 or n < L3_PARALLEL_MIN_PAGES:
         return pio.read_pages(paths, [int(total_bytes)] * n, [ext] * n, ptrs, True), 1
     k = min(k, n)
