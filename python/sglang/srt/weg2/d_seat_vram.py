@@ -597,7 +597,8 @@ def capture_floor_rows(n_ids: int, per_seat_ids: Optional[int]) -> int:
     return int(floors[b - 1]) if b <= len(floors) else 0
 
 
-def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False) -> int:
+def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False,
+                         is_draft_worker: bool = False, draft_shares_slots: bool = True) -> int:
     """#251c ``_config_from_budget``: the KV pool's rows are the TOP stage's
     (virtual -- the graphs keep one address range); the pages behind them are
     S0's (``kv_stage_born``). The budget must hold S0 on the attention host:
@@ -607,6 +608,18 @@ def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False) -> 
     form = stage_form()
     if form is None:
         return int(max_tokens)
+    if is_draft_worker and not draft_shares_slots:
+        # review 28.09. (#251c (c)): a draft pool is sized at the top stage and
+        # born with only S0's pages, but only the TARGET's allocator is capped
+        # to S0 (kv_stage_boot_cap). That is sound only while the draft writes
+        # at the target's slot ids (MTP/EAGLE share the allocator). A draft
+        # with its OWN allocator (the DFlash solo host) would hand out ids above
+        # S0 onto unmapped pages -- refused by name at the boot instead.
+        raise Weg2DSeatVramRefused(
+            "%s: the KV stage form needs the draft to write at the target's slot ids; this "
+            "draft worker has its own allocator (solo host), whose ids are not capped to "
+            "stage S0 -- turn the stage form off (SGLANG_WEG2_D_KV_STAGE_TOKENS) for this "
+            "draft form" % LINE_MARK)
     if not is_form_a_worker and int(max_tokens) < form.tokens[0]:
         raise Weg2DSeatVramRefused(
             "%s: the KV budget holds %d tokens, below stage S0 = %d -- the boot form "
