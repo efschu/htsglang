@@ -285,6 +285,166 @@ def seat_vram_rows(
 
 
 # ---------------------------------------------------------------------------
+# #251c: the attention host's KV pool as the THIRD post (KV stages)
+# ---------------------------------------------------------------------------
+#
+# Form A keeps the whole KV on TP0. A KV stage S_j maps the token prefix
+# [0, T_j) of every KV tensor; the pages a stage above S0 maps come out of
+# the expert bank's tail rows, exactly the way H95c hands the pages of empty
+# seats to extra expert rows. The virtual ranges stay at the top stage (the
+# graphs), the boot form is S0 with ``boot_rows_on`` stage rows ON -- the form
+# the planner prices -- and every (n, j) cell maps at most what it maps.
+
+
+@dataclass(frozen=True)
+class KvTensorGeom:
+    """A token-indexed KV tensor (``SlotTensorGeom`` at the TOP stage) and how
+    tokens become its slots: a paged K/V buffer holds ``tokens + page`` rows
+    (``token_pad`` = page, ``token_ratio`` = 1); the QSA compressed keys hold
+    one slot per ``ratio`` tokens of the same padded space."""
+
+    geom: SlotTensorGeom
+    token_ratio: int = 1
+    token_pad: int = 0
+
+    def slots_for(self, tokens: int) -> int:
+        need = -(-(int(tokens) + int(self.token_pad)) // max(1, int(self.token_ratio)))
+        return max(0, min(int(self.geom.slots), need))
+
+
+def kv_mapped_bytes(kv_tensors: Sequence[KvTensorGeom], tokens: int, granule: int) -> int:
+    return sum(span_bytes(slot_spans(k.geom, k.slots_for(tokens), granule)) for k in kv_tensors)
+
+
+@dataclass(frozen=True)
+class StageCell:
+    """One (n seats, KV stage j) phase form. ``extra_rows`` = the expert rows
+    ON (k), ``mamba_keep`` = the slots per layer the GDN pool maps
+    (``pool_size + 1`` = its cap form); ``feasible`` = some k >= 0 keeps the
+    mapped total within the boot form's."""
+
+    n: int
+    stage: int
+    tokens: int
+    slot_limit: int
+    mamba_keep: int
+    extra_rows: int
+    mamba_mapped: int
+    expert_mapped: int
+    kv_mapped: int
+    cap_mapped: int
+    feasible: bool
+
+    @property
+    def mapped(self) -> int:
+        return int(self.mamba_mapped) + int(self.expert_mapped) + int(self.kv_mapped)
+
+
+def stage_vram_cells(
+    slot_tensors: Sequence[SlotTensorGeom],
+    row_tensors: Sequence[RowTensorGeom],
+    kv_tensors: Sequence[KvTensorGeom],
+    *,
+    cap: int,
+    pool_size: int,
+    extra_max: int,
+    stage_tokens: Sequence[int],
+    boot_rows_on: int = 0,
+    granule: int = GRANULE_DEFAULT,
+) -> Dict[Tuple[int, int], StageCell]:
+    """Every (n, j): the largest k whose expert pages, with the GDN slots of n
+    seats and the KV prefix of stage j, stay within the BOOT form (n = cap,
+    j = 0, ``boot_rows_on`` rows ON). The GDN pool shrinks only when that buys
+    a row (else it keeps its cap form -- nothing to hand over, H95c's rule).
+    ``kv_tensors=()``, one stage and ``boot_rows_on=0`` give H95c's k(n)."""
+    cap = max(1, int(cap))
+    stages = [int(t) for t in stage_tokens] or [0]
+
+    def mamba(keep: int) -> int:
+        return sum(span_bytes(slot_spans(g, keep, granule)) for g in slot_tensors)
+
+    def expert(k: int) -> int:
+        return sum(span_bytes(row_spans(g, g.rows_boot + k, granule)) for g in row_tensors)
+
+    x_max = max(0, int(extra_max))
+    if row_tensors:
+        x_max = min(x_max, min(int(g.rows_max) - int(g.rows_boot) for g in row_tensors))
+    else:
+        x_max = 0
+    k_boot = max(0, min(int(boot_rows_on), x_max))
+    m_cap = mamba(int(pool_size) + 1)
+    budget = m_cap + expert(k_boot) + kv_mapped_bytes(kv_tensors, stages[0], granule)
+    ex = [expert(k) for k in range(x_max + 1)]
+
+    def best_k(fixed: int) -> int:
+        k = -1
+        while k < x_max and fixed + ex[k + 1] <= budget:
+            k += 1
+        return k
+
+    out: Dict[Tuple[int, int], StageCell] = {}
+    for n in range(1, cap + 1):
+        lim = phase_slot_limit(pool_size, n, cap)
+        m_n = mamba(lim + 1)
+        for j, tokens in enumerate(stages):
+            kv = kv_mapped_bytes(kv_tensors, tokens, granule)
+            k_shrunk = best_k(m_n + kv) if n < cap else -1
+            k_full = best_k(m_cap + kv)
+            if k_shrunk > k_full:
+                k, keep, m = k_shrunk, lim + 1, m_n
+            else:
+                k, keep, m = k_full, int(pool_size) + 1, m_cap
+            out[(n, j)] = StageCell(
+                n=n, stage=j, tokens=tokens, slot_limit=lim, mamba_keep=keep,
+                extra_rows=max(0, k), mamba_mapped=m, expert_mapped=ex[max(0, k)],
+                kv_mapped=kv, cap_mapped=budget, feasible=k >= 0)
+    return out
+
+
+@dataclass(frozen=True)
+class StageChoice:
+    stage: int
+    tokens: int
+    demand: Optional[int]
+    over: bool  # demand above the chosen (= highest usable) stage: the youngest parks
+    reason: str
+
+
+def choose_stage(
+    cells: Dict[Tuple[int, int], StageCell],
+    n: int,
+    demand_tokens: Optional[int],
+    *,
+    min_rows_on: int = 0,
+) -> StageChoice:
+    """#251c (Nutzer: Leistung geht vor): the SMALLEST stage whose tokens hold
+    the phase's demand, among the stages the n-seat form can fund with at least
+    ``min_rows_on`` expert rows ON (the captured waves' floor). The stage rises
+    only when the next wake's demand exceeds the KV and falls as soon as it
+    fits again; above the highest usable stage the highest one is taken and
+    the youngest parks (H91, ``over``). A pure function of the wake request --
+    every rank takes the same stage. No demand on the wake (an older front):
+    S0, the boot form."""
+    usable = sorted(
+        j for (m, j), c in cells.items()
+        if m == n and c.feasible and c.extra_rows >= int(min_rows_on)
+    )
+    if not usable:
+        usable = [0]
+    t = {j: cells[(n, j)].tokens for j in usable if (n, j) in cells}
+    if demand_tokens is None:
+        j0 = 0 if 0 in t else usable[0]
+        return StageChoice(j0, t.get(j0, 0), None, False, "no demand on the wake: S0")
+    d = int(demand_tokens)
+    for j in usable:
+        if t.get(j, 0) >= d:
+            return StageChoice(j, t[j], d, False, "smallest stage holding the demand")
+    top = usable[-1]
+    return StageChoice(top, t.get(top, 0), d, True,
+                       "demand above the highest usable stage: the youngest parks")
+
+
+# ---------------------------------------------------------------------------
 # the saver's span map (tms_csrc patch 3)
 # ---------------------------------------------------------------------------
 
