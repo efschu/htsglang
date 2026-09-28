@@ -8734,6 +8734,32 @@ class ServerArgs:
             and self.uneven_weighted_dcp_enabled()
             and int(getattr(self, "tp_size", 1) or 1) > 1
         ):
+            # #239 S4b (F14, rc12z29 -st-cut, 28.09.): under the Form A token
+            # cut a page DOES span owners -- global slot L belongs to the rank
+            # with L % S in [lo, hi) -- but the page is no longer one owner's:
+            # every owner writes its own token rows of each page
+            # (canonical_page_store.owner_token_runs / kv_extents_for, lifted
+            # at runtime by HiCacheController when canonical_kv_owner_rows is
+            # set). The rows are the same in every page only when S divides
+            # the page; that is what stays refused here. Any other weighted
+            # uneven DCP keeps the page-1 limit.
+            cut = self.form_a_dcp_vector()
+            split = int(sum(cut)) if cut else 0
+            if split > 0 and self.page_size % split == 0:
+                logger.info(
+                    "#239 F14 CANONICAL-PAGE UNDER TOKEN CUT: page %d spans owners "
+                    "%s (S=%d); each owner writes its own token rows of every page.",
+                    self.page_size, list(cut), split,
+                )
+                return
+            if split > 0:
+                raise ValueError(
+                    "--hicache-canonical-kv-page under the #239 token cut "
+                    f"{list(cut)} needs a page size divisible by S={split}, got "
+                    f"{self.page_size}: the owned token rows would differ from "
+                    "page to page and one key would name different bytes on "
+                    "every rank."
+                )
             raise ValueError(
                 "--hicache-canonical-kv-page requires --page-size 1 under "
                 f"weighted uneven DCP, got {self.page_size}. A multi-token "
