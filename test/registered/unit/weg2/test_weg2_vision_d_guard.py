@@ -216,3 +216,26 @@ def test_the_anchor_vote_is_capped_and_never_lowers_the_match(monkeypatch):
     assert _voter(req, monkeypatch)[1]["weg2-11-10"] == 9466
     req = _vote_req(anchor=4096, device=5000, host=0)  # anchor below the match: unchanged
     assert _voter(req, monkeypatch)[1]["weg2-11-10"] == 5000
+
+
+def test_head_vote_log_line_survives_an_empty_tensor_prefix():
+    """27B rc12z9 D 08:23:24: the #823 HEAD-VOTE ANCHOR line evaluated
+    ``prefix_indices or ()`` -- an empty tensor's truth value raises."""
+    import torch
+    from sglang.srt.managers import scheduler as S
+
+    class _R:
+        rid = "weg2-0-2"
+        num_matched_prefix_tokens = 22551
+        state_anchor_depth = 38911
+        prefix_indices = torch.empty(0, dtype=torch.int64)
+        host_hit_length = 22551
+        full_untruncated_fill_ids = list(range(38913))
+
+        def _compute_max_prefix_len(self, n):
+            return n - 1
+
+    assert S._head_vote_len(_R()) == 38911
+    assert S._len_or_zero(torch.empty(0)) == 0
+    assert S._len_or_zero(None) == 0
+    assert S._len_or_zero([1, 2]) == 2

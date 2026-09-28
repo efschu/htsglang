@@ -1072,6 +1072,13 @@ def _weg2_dormant_admit_armed() -> bool:
 _HEAD_VOTE_ANCHOR_N = [0]
 
 
+def _len_or_zero(x) -> int:
+    """``len(x)`` for a list or a tensor, 0 for None -- never ``x or ()``: the
+    truth value of an empty tensor raises (27B rc12z9 D 08:23:24, all three
+    ranks, `_head_vote_len`'s log line on a request with no device prefix)."""
+    return 0 if x is None else len(x)
+
+
 def _head_vote_len(req) -> int:
     """#823 vote for one head rid: the prefix the admission can MATERIALIZE.
 
@@ -1114,7 +1121,7 @@ def _head_vote_len(req) -> int:
                 "anchor_depth=%d vote=%d (n=%d): a device node without a state "
                 "below the host chain counts toward the materializable prefix",
                 str(getattr(req, "rid", "?"))[:16], n,
-                len(getattr(req, "prefix_indices", ()) or ()),
+                _len_or_zero(getattr(req, "prefix_indices", None)),
                 int(getattr(req, "host_hit_length", 0) or 0), int(anchor), vote, k,
             )
     return vote
@@ -9003,7 +9010,7 @@ class Scheduler(
                 return
         except Exception:  # noqa: BLE001
             return
-        span = int(len(getattr(req, "prefix_indices", ()) or ()))
+        span = int(_len_or_zero(getattr(req, "prefix_indices", None)))
         rid = str(getattr(req, "rid", "?"))
         try:
             release_kv_cache(req, self.tree_cache, is_insert=True)
