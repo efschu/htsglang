@@ -119,6 +119,48 @@ def refusal_message(req: Any, covered: Optional[int]) -> str:
     )
 
 
+#: (B) safety net switch: an image D cannot cover on a request that has sent no
+#: byte yet goes back through P (X-REQUEUE) instead of W123. Default on; "0"
+#: = the plain W123 as before.
+REROUTE_ENV = "SGLANG_WEG2_VISION_D_REROUTE"
+
+
+def reroute_enabled(env=None) -> bool:
+    import os
+
+    e = os.environ if env is None else env
+    return (e.get(REROUTE_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def reroute_eligible(req: Any, env=None) -> bool:
+    """(B) NF rc12z10 08:40:07Z weg2-2-12 (image 6290..9528 of 9537, P's END
+    anchor failed, D covered 0 -> W123 to the client): a request that has
+    generated NOTHING yet can go back through P with its ORIGINAL body --
+    image included, P has the tower -- which is the front's X-REQUEUE, keyed
+    on D's W50 refusal. An already streamed one cannot: RESUME-VIA-P's P leg
+    carries input_ids alone (``resume_via_p.eligible`` excludes multimodal),
+    so it keeps the named W123. Replicated: output_ids is the group's."""
+    if not reroute_enabled(env):
+        return False
+    out = getattr(req, "output_ids", None)
+    return (0 if out is None else len(out)) == 0
+
+
+def reroute_message(req: Any, covered: Optional[int]) -> str:
+    """The W50 refusal the front re-routes through P (``x_refusal_marker_in``
+    and the extent sentence ``_d_refusal_extent`` parses), W123 named inside.
+    The front's bound ends it: a second refusal after a P leg is its W35/W53."""
+    fill = getattr(req, "full_untruncated_fill_ids", None)
+    total = 0 if fill is None else len(fill)
+    extent = max(0, total - int(covered or 0))
+    return (
+        f"W50 Weg2TpPrefillExceeded (vision reroute): group D cannot serve this request "
+        f"itself; this request's extent after prefix matching is {extent}. "
+        f"Re-routed through the prefill group, which has the vision tower -- "
+        f"{refusal_message(req, covered)}"
+    )
+
+
 # -- the draft side (V2 death 11:20:26, weg2-14-72) ---------------------------------
 _DRAFT_NO_EMBEDS_N = [0]
 

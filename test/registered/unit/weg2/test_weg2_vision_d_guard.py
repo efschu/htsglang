@@ -110,6 +110,7 @@ def test_a_refused_request_leaves_the_queue_and_is_answered_by_name():
             send_output=lambda out, r: sent.append(out))),
         _weg2_vision_d_covered=lambda r, hi: 10,
     )
+    req.output_ids = [5]  # already streamed: the P reroute cannot carry it (see below)
     Scheduler._weg2_answer_vision_d_refusals(h, [req], None)
     assert h.waiting_queue == [other]
     assert sent[0].rid == "r1"
@@ -239,3 +240,58 @@ def test_head_vote_log_line_survives_an_empty_tensor_prefix():
     assert S._len_or_zero(torch.empty(0)) == 0
     assert S._len_or_zero(None) == 0
     assert S._len_or_zero([1, 2]) == 2
+
+
+# ------------------------------------------------------------------------------
+# (B) safety net, NF rc12z10 08:40:07Z rid weg2-2-12: image 6290..9528 of 9537
+# tokens, P "END-ANCHOR anchor=0 ... ok=False", D "#928 REFUSING resume ...
+# NONE-ON-THIS-PATH", covered=0 -> W123 to the client. A request that has sent
+# NO byte yet is answered with the W50 refusal the front re-routes through P
+# (X-REQUEUE: the ORIGINAL request, image included, P has the tower); W123 is
+# named in it. The front's own bound (second refusal after a P leg -> W35/W53)
+# ends it by name. An already streamed request keeps W123 (the RESUME-VIA-P leg
+# carries input_ids only, P could not encode the image from them).
+# ------------------------------------------------------------------------------
+
+
+def _metal_refused():
+    from sglang.srt.managers.scheduler import Scheduler
+
+    sent = []
+    req = _img_req("weg2-2-12", fill=9537, span=(6290, 9528))
+    req.output_ids = []
+    h = types.SimpleNamespace(
+        waiting_queue=[req], tree_cache=None,
+        enable_hicache_storage=False, enable_hierarchical_cache=False,
+        ipc_channels=types.SimpleNamespace(send_to_tokenizer=types.SimpleNamespace(
+            send_output=lambda out, r: sent.append(out))),
+        _weg2_vision_d_covered=lambda r, hi: 0,
+    )
+    return Scheduler, h, req, sent
+
+
+def test_an_unstreamed_vision_refusal_is_rerouted_through_p_not_w123():
+    from sglang.srt.weg2 import front as F
+
+    Scheduler, h, req, sent = _metal_refused()
+    Scheduler._weg2_answer_vision_d_refusals(h, [req], None)
+    msg = sent[0].finished_reason["message"]
+    assert F.x_refusal_marker_in(msg), "the front must see its X-REQUEUE marker"
+    assert F._d_refusal_extent(msg.encode()) == 9537, "the extent D would have to prefill"
+    assert g.W_NOT_IN_PREFIX in msg, "W123 stays named inside the reroute"
+    assert int(sent[0].finished_reason["status_code"]) == 503
+    assert h.waiting_queue == []
+
+
+def test_a_streamed_vision_refusal_keeps_w123():
+    Scheduler, h, req, sent = _metal_refused()
+    req.output_ids = [1, 2, 3]
+    Scheduler._weg2_answer_vision_d_refusals(h, [req], None)
+    assert sent[0].finished_reason["message"].startswith(g.W_NOT_IN_PREFIX)
+
+
+def test_reroute_switch_off_is_the_old_w123(monkeypatch):
+    monkeypatch.setenv(g.REROUTE_ENV, "0")
+    Scheduler, h, req, sent = _metal_refused()
+    Scheduler._weg2_answer_vision_d_refusals(h, [req], None)
+    assert sent[0].finished_reason["message"].startswith(g.W_NOT_IN_PREFIX)

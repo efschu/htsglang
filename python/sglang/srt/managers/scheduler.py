@@ -13016,8 +13016,16 @@ class Scheduler(
         self.waiting_queue = [q for q in self.waiting_queue if id(q) not in refused_ids]
         for req in refused:
             covered = self._weg2_vision_d_covered(req, head_inputs)
-            message = _vdg.refusal_message(req, covered)
-            logger.error("%s rid=%s covered=%s", _vdg.W_NOT_IN_PREFIX, req.rid, covered)
+            if _vdg.reroute_eligible(req):
+                # (B) NF rc12z10 weg2-2-12: nothing streamed yet -> back through P
+                # with the original request (image included), W123 named inside.
+                message = _vdg.reroute_message(req, covered)
+                logger.warning("%s rid=%s covered=%s -> W50 reroute through P (nothing "
+                               "streamed yet; the front's X-REQUEUE bound ends it by name)",
+                               _vdg.W_NOT_IN_PREFIX, req.rid, covered)
+            else:
+                message = _vdg.refusal_message(req, covered)
+                logger.error("%s rid=%s covered=%s", _vdg.W_NOT_IN_PREFIX, req.rid, covered)
             _tc = getattr(self, "tree_cache", None)
             if _tc is not None:
                 release_admission_acquired_mamba_slot(req, _tc, site="weg2_vision_d_refusal")
