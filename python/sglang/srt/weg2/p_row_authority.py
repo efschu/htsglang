@@ -48,6 +48,9 @@ TERM_ENVS = {
     "withhold": "SGLANG_WEG2_P_ROW_WITHHOLD",
     "floor_clamp": "SGLANG_WEG2_P_ROW_FLOOR_CLAMP",
     "corridor": "SGLANG_WEG2_P_ROW_CORRIDOR",
+    # (d) async vision stage: PP0 holds an image request out of the passes
+    # while the tower encodes (weg2/vision_rank_runner.vision_async_admissible)
+    "vision_async": "SGLANG_WEG2_P_ROW_VISION_ASYNC",
 }
 #: scheduler attribute: True while this rank runs the re-armed row form.
 ROW_ONLY_ATTR = "_weg2_p_row_only"

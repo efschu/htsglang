@@ -650,6 +650,42 @@ def vision_async_on(env: Optional[Dict[str, str]] = None) -> bool:
     return str(e.get(VISION_ASYNC_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
 
 
+#: the async stage withholds an image request on PP0 for several passes; that
+#: is a PP0 admission term (pp_admission_congruence.pp_row_carrier_present)
+W_ASYNC_NOT_ADMISSIBLE = "W102b Weg2VisionAsyncNotAdmissible"
+
+
+def vision_async_admissible(scheduler) -> Tuple[bool, str]:
+    """(d) May PP0 hold an image request out of its passes while the tower
+    encodes? Only where no other rank plans a batch, or where the followers
+    EXECUTE PP0's row instead of planning for themselves.
+
+    NF rc12z30c -st (f33274eac0) died of exactly this on 28.09. 20:48:53Z:
+    '#631 ROW AUTHORITY DISABLED' on PP1/PP2 (followers plan rank-locally),
+    PP0 'W102 ... ASYNC started' held weg2-6-33, PP1/PP2 '#969 EXTENT n=9
+    fwd=1' admitted it anyway and blocked in the proxy receive for a frame PP0
+    never owed; PP0's deferred chain-send join expired 120 s later as '#973
+    RING COMMIT TIMEOUT'. The same shape #1066/#969Z closed for the prefetch
+    withhold, and the same law: PP0 may withhold only when
+    ``pp_row_carrier_present`` says the followers execute its row -- here with
+    the term ``vision_async`` (SGLANG_WEG2_P_ROW_VISION_ASYNC, default off).
+    Otherwise the synchronous stage runs: it stages AND admits in the same
+    pass, so every rank admits the same request (the z29b behaviour)."""
+    ps = getattr(scheduler, "ps", None)
+    pp_size = int(getattr(ps, "pp_size", 1) or 1) if ps is not None else 1
+    if pp_size <= 1:
+        return True, "single stage"
+    try:
+        from sglang.srt.managers.pp_admission_congruence import pp_row_carrier_present
+
+        if pp_row_carrier_present(scheduler, term="vision_async"):
+            return True, "followers execute PP0's row (term vision_async)"
+    except Exception as exc:  # noqa: BLE001 -- unknown carrier = no withhold
+        return False, f"carrier unknown ({type(exc).__name__}: {exc})"
+    return False, (f"pp_size={pp_size} and the followers plan for themselves (no row carrier "
+                   f"for term vision_async) -- a PP0-only hold would split the ranks")
+
+
 _ASYNC_POOL = None
 
 
@@ -844,7 +880,14 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
     if pending:
         refusal = scheduler._weg2_vision_arm_refusal
         started = None
+        _async_ok = False
         if not refusal and vision_async_on():
+            _async_ok, _why = vision_async_admissible(scheduler)
+            if not _async_ok and not getattr(scheduler, "_weg2_vision_async_refused_said", False):
+                scheduler._weg2_vision_async_refused_said = True
+                logger.warning("%s: %s -- the synchronous stage stages and admits in the same "
+                               "pass on every rank", W_ASYNC_NOT_ADMISSIBLE, _why)
+        if _async_ok:
             scheduler._weg2_vision_runs += 1
             try:
                 started = start_async_stage(
