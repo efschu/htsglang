@@ -5591,6 +5591,12 @@ class SchedulerPPMixin:
                         self.launch_event
                     )
 
+                # hc_combine holder (NF rc12z14 10:02:57Z): the stage output of this pass
+                # (``result.pp_hidden_states_proxy_tensors``) has had its last read -- the
+                # proxy send above; the transport keeps what it still sends (P2PWork.payload,
+                # the torch Work). Without this line the frame kept it until the NEXT forward,
+                # i.e. across a whole sleep served at the top of the next pass.
+                result = None
                 self.pp_outputs = next_pp_outputs
 
                 # #788: flush THIS pass's request-chain send only after
@@ -5852,6 +5858,12 @@ class SchedulerPPMixin:
                             stamp=self._pp_proxy_stamp(mb_id, None),
                         )
 
+                # hc_combine holder (NF rc12z14 10:02:57Z): the stage output of this pass
+                # (``result.pp_hidden_states_proxy_tensors``) has had its last read -- the
+                # proxy send above; the transport keeps what it still sends (P2PWork.payload,
+                # the torch Work). Without this line the frame kept it until the NEXT forward,
+                # i.e. across a whole sleep served at the top of the next pass.
+                result = None
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
@@ -6066,6 +6078,12 @@ class SchedulerPPMixin:
                             stamp=self._pp_proxy_stamp(mb_id, None),
                         )
 
+                # hc_combine holder (NF rc12z14 10:02:57Z): the stage output of this pass
+                # (``result.pp_hidden_states_proxy_tensors``) has had its last read -- the
+                # proxy send above; the transport keeps what it still sends (P2PWork.payload,
+                # the torch Work). Without this line the frame kept it until the NEXT forward,
+                # i.e. across a whole sleep served at the top of the next pass.
+                result = None
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
                 consensus_retract_rids = next_consensus_retract_rids
