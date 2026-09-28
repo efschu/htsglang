@@ -153,4 +153,48 @@ def test_fs_of_takes_the_longest_mount_above_the_path(tmp_path):
 def test_the_launcher_logs_the_line_before_the_store_line():
     src = open(launcher.__file__).read()
     k = src.index("store_cfg = store_plan.extra_config()")
-    assert src.index('log(store_plan.disk_line("ok"))', k) < src.index('f"WEG2-STORE: dir=', k)
+    assert src.index("log(store_plan.disk_line(", k) < src.index('f"WEG2-STORE: dir=', k)
+
+
+# ---- W57b (user 28.09.: "L3 gehoert auf XFS, nie ZFS") -------------------------------
+
+def _launch(tmp_path, fs, dry, free=1000 * GIB):
+    with mock.patch.object(launcher, "fs_of", lambda p, mounts_text=None: ("/", fs, "src")):
+        return _plan(tmp_path, free, dry=dry)
+
+
+@pytest.mark.parametrize("fs", ["overlay", "zfs"])
+def test_a_real_boot_on_overlay_or_zfs_is_refused_by_name(tmp_path, fs):
+    _store(tmp_path, 4096)
+    with pytest.raises(launcher.Weg2StoreDiskRefused,
+                       match="W57 Weg2StoreDiskRefused: store on %s, not the told disk" % fs):
+        _launch(tmp_path, fs, dry=False)
+
+
+@pytest.mark.parametrize("fs", ["overlay", "zfs"])
+def test_a_dry_run_on_overlay_or_zfs_only_warns(tmp_path, fs):
+    _store(tmp_path, 4096)
+    # not even the space check refuses: the wrong disk's free space says nothing
+    plan = _launch(tmp_path, fs, dry=True, free=1 * GIB)
+    assert plan.fs_refused and plan.fs_type == fs
+
+
+def test_xfs_passes_and_the_switch_can_empty_the_list(tmp_path):
+    from sglang.srt.environ import envs
+
+    _store(tmp_path, 4096)
+    assert not _launch(tmp_path, "xfs", dry=False).fs_refused
+    with envs.SGLANG_WEG2_STORE_REFUSE_FS.override(()):
+        assert not _launch(tmp_path, "zfs", dry=False).fs_refused
+    assert envs.SGLANG_WEG2_STORE_REFUSE_FS.get() == ("overlay", "zfs")
+    # a sizing question (no launch: dry=None) never refuses on the filesystem
+    with mock.patch.object(launcher, "fs_of", lambda p, mounts_text=None: ("/", "zfs", "s")):
+        assert not _plan(tmp_path, 1000 * GIB).fs_refused
+
+
+def test_the_launcher_passes_dry_and_names_the_warning():
+    src = open(launcher.__file__).read()
+    k = src.index("store_plan = plan_store(")
+    body = src[k:src.index('f"WEG2-STORE: dir=', k)]
+    assert "dry=dry," in body
+    assert "WARN store on %s, not the told disk" in body
