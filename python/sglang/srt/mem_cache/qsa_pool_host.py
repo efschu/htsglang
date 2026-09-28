@@ -147,6 +147,67 @@ class QSAPagedHostPool(DeepSeekV4PagedHostPool):
     _formA_skip_n = 0
     _formA_skip_pages = 0
 
+    #: H106b: the transfer the skip lines are folded into (one merged load or
+    #: backup -- ``CacheOperation.merge_ops`` joins the requests, so no rid is
+    #: visible here; the ``#988 LOADBACK rid=`` line of the same pass names it)
+    _h106_open = None
+    _h106_suppressed = 0
+    _h106_transfers = 0
+    #: a periodic line after this many folded calls
+    H106_PERIODIC = 256
+
+    def load_to_device_per_layer(self, *args, **kwargs):
+        self._h106_dir = "load"
+        return super().load_to_device_per_layer(*args, **kwargs)
+
+    def backup_from_device_all_layer(self, *args, **kwargs):
+        self._h106_dir = "backup"
+        return super().backup_from_device_all_layer(*args, **kwargs)
+
+    def backup_from_device_indices(self, *args, **kwargs):
+        self._h106_dir = "backup"
+        return super().backup_from_device_indices(*args, **kwargs)
+
+    def _h106_note_skip(self, pages: int, hi: int, lo: int) -> None:
+        """H106b (rc12z17, 10:50:22Z): one line per skipped TRANSFER and
+        direction, not per layer call -- the load path calls this pool once per
+        layer with the same ids (dozens of lines in one second). A call with
+        the same (direction, first id, pages) as the open transfer is folded
+        into it; a new one prints its line with the previous transfer's sums
+        (calls, pages_total); every H106_PERIODIC folded calls a counter line
+        with suppressed_since_last_print."""
+        cls = QSAPagedHostPool
+        d = getattr(self, "_h106_dir", "?")
+        key = (d, int(lo), int(pages))
+        cur = cls._h106_open
+        if cur is not None and cur["key"] == key:
+            cur["calls"] += 1
+            cur["pages_total"] += int(pages)
+            cls._h106_suppressed += 1
+            if cls._h106_suppressed % cls.H106_PERIODIC == 0:
+                logger.warning(
+                    "H106 FORM-A SIDECAR SKIP (periodic) pool=%s dir=%s transfers=%d "
+                    "skipped_calls=%d pages_total=%d suppressed_since_last_print=%d",
+                    self.pool_name, d, cls._h106_transfers, cls._formA_skip_n,
+                    cls._formA_skip_pages, cls.H106_PERIODIC,
+                )
+            return
+        prev = ""
+        if cur is not None:
+            prev = " prev(dir=%s calls=%d pages_total=%d)" % (
+                cur["key"][0], cur["calls"], cur["pages_total"])
+        cls._h106_open = {"key": key, "calls": 1, "pages_total": int(pages)}
+        cls._h106_transfers += 1
+        logger.warning(
+            "H106 FORM-A SIDECAR SKIP pool=%s dir=%s pages=%d host_page_max=%d "
+            "host_pages=%d min_id=%d transfer=%d%s (skipped_calls=%d "
+            "pages_total=%d; further calls of this transfer are folded): the "
+            "byteless KV anchor grew its ids (#249), this pool did not; a Form A "
+            "worker never reads its QSA rows, so nothing is transferred.",
+            self.pool_name, d, int(pages), int(hi), int(self.num_host_pages), int(lo),
+            cls._h106_transfers, prev, cls._formA_skip_n, cls._formA_skip_pages,
+        )
+
     def _host_rows_in_range(self, host_indices) -> bool:
         """H106 (rc12z15 f49f7bddd2, D 10:22:39, TP1+TP2 at once): the KV
         anchor of a Form A worker is BYTELESS and, under #249 (9996780367),
@@ -183,16 +244,7 @@ class QSAPagedHostPool(DeepSeekV4PagedHostPool):
         if this_rank_is_form_a_worker():
             QSAPagedHostPool._formA_skip_n += 1
             QSAPagedHostPool._formA_skip_pages += pages
-            n = QSAPagedHostPool._formA_skip_n
-            if n <= 16 or n % 256 == 0:
-                logger.warning(
-                    "H106 FORM-A SIDECAR SKIP pool=%s pages=%d host_page_max=%d "
-                    "host_pages=%d min_id=%d (n=%d, pages_total=%d): the byteless KV "
-                    "anchor grew its ids (#249), this pool did not; a Form A worker "
-                    "never reads its QSA rows, so nothing is transferred.",
-                    self.pool_name, pages, hi, int(self.num_host_pages), lo, n,
-                    QSAPagedHostPool._formA_skip_pages,
-                )
+            self._h106_note_skip(pages, hi, lo)
             return False
         raise RuntimeError(
             f"H106 SIDECAR HOST INDEX OUT OF RANGE pool={self.pool_name} "

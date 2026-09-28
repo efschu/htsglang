@@ -118,3 +118,46 @@ def test_in_range_transfers_are_unchanged(pool, monkeypatch):
         _load(host, dev, [2, 0], [7, 3])
         for l, buf in enumerate(host.device_buffers):
             assert torch.all(buf[7] == 2 + 10 * l) and torch.all(buf[3] == 0 + 10 * l)
+
+
+def _skip_lines(caplog):
+    return [r.getMessage() for r in caplog.records if "H106 FORM-A SIDECAR SKIP" in r.getMessage()]
+
+
+def test_h106b_one_line_per_transfer_and_direction(pool, monkeypatch, caplog):
+    """H106b (rc12z17 10:50:22Z: n=1..11+ in one second -- one line per layer
+    call). A load over L layers is ONE transfer: one line; the next transfer
+    (a backup) prints its own line carrying the previous transfer's sums."""
+    import logging
+
+    dev, host = pool
+    monkeypatch.setattr(rank_role, "this_rank_is_form_a_worker", lambda: True)
+    monkeypatch.setattr(QSAPagedHostPool, "_h106_open", None)
+    caplog.set_level(logging.WARNING, logger="sglang.srt.mem_cache.qsa_pool_host")
+    _load(host, dev, [HOST_PAGES, HOST_PAGES + 1], [5, 6])  # one transfer, layer_num calls
+    lines = _skip_lines(caplog)
+    assert len(lines) == 1, lines
+    assert "dir=load" in lines[0] and "pages=2" in lines[0]
+    host.backup_from_device_all_layer(dev, _ids([HOST_PAGES + 3]), _ids([1]), "direct")
+    lines = _skip_lines(caplog)
+    assert len(lines) == 2, lines
+    assert "dir=backup" in lines[1]
+    assert f"prev(dir=load calls={host.layer_num} pages_total={2 * host.layer_num})" in lines[1]
+
+
+def test_h106b_periodic_counter_line(pool, monkeypatch, caplog):
+    """Folded calls still surface: every H106_PERIODIC folded calls one line
+    with suppressed_since_last_print."""
+    import logging
+
+    dev, host = pool
+    monkeypatch.setattr(rank_role, "this_rank_is_form_a_worker", lambda: True)
+    monkeypatch.setattr(QSAPagedHostPool, "_h106_open", None)
+    monkeypatch.setattr(QSAPagedHostPool, "_h106_suppressed", 0)
+    monkeypatch.setattr(QSAPagedHostPool, "H106_PERIODIC", 3)
+    caplog.set_level(logging.WARNING, logger="sglang.srt.mem_cache.qsa_pool_host")
+    for _ in range(4):
+        host.load_to_device_per_layer(dev, _ids([HOST_PAGES]), _ids([5]), 0, "direct")
+    lines = _skip_lines(caplog)
+    assert len(lines) == 2, lines  # the transfer line + one periodic line
+    assert "(periodic)" in lines[1] and "suppressed_since_last_print=3" in lines[1]
