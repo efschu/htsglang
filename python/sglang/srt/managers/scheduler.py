@@ -4129,6 +4129,12 @@ class Scheduler(
             )
             return None if code == _tmf.ADMISSION_ADMIT else AddReqResult[code]
 
+        # H105b (rc12z20 D 12:55:34, weg2-36-145): the host runs its host
+        # load-back BEFORE it sends the verdict, so a load-back WAIT on the
+        # host (no device room, anchor given back) rides the same broadcast.
+        # Under the token cut the verdict is a gather of real gates on every
+        # rank -- unchanged there.
+        _follow.host_decides_load_back = bool(is_host) and _gather is None
         return _follow
 
     def _form_a_extend_set_riegel(self, can_run_list) -> None:

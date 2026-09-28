@@ -2467,7 +2467,20 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     _gate = AddReqResult.NO_TOKEN
 
-            if _fa_follow is not None:
+            # H105b (rc12z20 D 12:55:34, weg2-36-145, FormAAdmissionSplit): the
+            # H105 verdict below was sent BEFORE the load-back, and the load-back
+            # has an exit of its own -- the no-room WAIT (applied 0, no device
+            # room, the adopted anchor given back, NO_TOKEN). TP0 took it; the
+            # expert workers hold no recurrent state, never adopt an anchor,
+            # took the #1048 "served 0" arm instead and admitted the rid at
+            # their device prefix (3712) -- two extend sets, a named stop. So
+            # on the host the load-back runs FIRST and its outcome is the
+            # verdict it sends (same broadcast, no new collective); a worker
+            # still reads the verdict first and loads back only on ADMIT.
+            _fa_host_first = _fa_follow is not None and bool(
+                getattr(_fa_follow, "host_decides_load_back", False)
+            )
+            if _fa_follow is not None and (_gate is not None or not _fa_host_first):
                 # H105: after every rank-local gate and BEFORE the load-back
                 # (and the tail-adopt vote behind it) -- the one point every
                 # rank of the group reaches for this rid. The host's verdict
@@ -2476,6 +2489,7 @@ class PrefillAdder:
                 _gate = _fa_follow(
                     req, _gate, int(total_tokens), int(self.rem_total_tokens)
                 )
+                _fa_host_first = False
             if _gate is not None:
                 return _gate
 
@@ -2609,6 +2623,9 @@ class PrefillAdder:
                                 getattr(req, "rid", "?"), int(_lb_extent),
                                 getattr(self, "rem_total_tokens", "?"), _n,
                             )
+                        if _fa_host_first:  # H105b: the group's verdict
+                            return _fa_follow(req, AddReqResult.NO_TOKEN,
+                                              int(total_tokens), int(self.rem_total_tokens))
                         return AddReqResult.NO_TOKEN
                     if _applied != _lb_extent and getattr(
                         req, "mamba_loadback_anchor_adopted", False
@@ -2787,6 +2804,14 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
+            if _fa_host_first:
+                # H105b: the host's load-back is through (or there was none):
+                # ADMIT goes out now, one broadcast per gate call as before.
+                _gate = _fa_follow(
+                    req, None, int(total_tokens), int(self.rem_total_tokens)
+                )
+                if _gate is not None:
+                    return _gate
 
             if (
                 self.rem_chunk_tokens is None
