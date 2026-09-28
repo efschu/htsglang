@@ -996,6 +996,59 @@ def _weg2_producer_wake_verdict(sched, req) -> str:
     return "complete"
 
 
+def _weg2_settle_writer_action(sched, req) -> str:
+    """P4b: the settle hold's action for one parked request (weg2/settle_writer):
+    ``poll`` (unchanged 2 s re-read) until the read was seen short once, then
+    ``wait`` / ``reread`` / ``decide`` / ``poll`` by who can still write it.
+    A named line on every change of the writer state."""
+    if not getattr(req, "_1471_short", False):
+        return "poll"
+    from sglang.srt.weg2 import settle_writer as _sw
+
+    prev = getattr(req, "_1471w_state", None)
+    t = time.monotonic()
+    if prev is not None and t - float(getattr(req, "_1471w_t", 0.0) or 0.0) < 0.1:
+        now_state = prev  # the hand-off directory is listed at most every 100 ms per request
+    else:
+        try:
+            now_state = _sw.observe(req)
+        except Exception as exc:  # noqa: BLE001 - unknown = the old poll, never a guess
+            logger.info("#1471w SETTLE-WRITER rid=%s n/a (%s: %s) -- 2 s re-read as before",
+                        str(getattr(req, "rid", "?"))[:12], type(exc).__name__, exc)
+            return "poll"
+        req._1471w_t = t
+    act, ack = _sw.step(prev, now_state, getattr(req, "_1471w_ack", None))
+    req._1471w_state = now_state
+    req._1471w_ack = ack
+    if now_state != prev:
+        _what = {
+            "wait": "a writer is at work: no re-read until its ack",
+            "reread": "the writer's ack is in: re-read now",
+            "decide": "no writer can fill the rest: decided now",
+            "poll": "a writer without a visible ack: the 2 s re-read stays",
+        }[act]
+        logger.info("#1471w SETTLE-WRITER rid=%s writer=%s prev=%s action=%s -- %s",
+                    str(getattr(req, "rid", "?"))[:12], now_state, prev, act, _what)
+    return act
+
+
+def _weg2_settle_no_writer_line(sched, req, now: float) -> None:
+    """P4b: the named line of a no-writer release (remainder, X, route)."""
+    from sglang.srt.weg2 import settle_writer as _sw
+
+    records = getattr(getattr(sched, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None) or {}
+    rem = _sw.remainder(req, records)
+    x = _weg2_store_short_tail_x(sched)
+    logger.info(
+        "#1471w SETTLE-NO-WRITER rid=%s remainder=%s X=%d route=%s held_s=%.1f re_reads=%d -- no "
+        "hand-off chain, no tail part and none under write: nothing can fill the rest, so the "
+        "request goes to admission now (D prefills within X; over X the X gate refuses by name "
+        "and the front re-routes via P)",
+        str(getattr(req, "rid", "?"))[:12], "?" if rem is None else rem, x, _sw.route(rem, x),
+        now - float(getattr(req, "_1471_since", now)), int(getattr(req, "_1456_n", 0) or 0),
+    )
+
+
 def _weg2_store_tail_settles(sched, req) -> bool:
     """#1324 x #1471 (weg2rc2): a request parked at the wake whose SHORT store
     read leaves a remainder within X is SETTLED -- D prefills the remainder (the
@@ -6000,15 +6053,26 @@ class Scheduler(
         # weg2xsn296: the re-read is a collective -- verdict first (no side
         # effects), group MIN on "due", then re-issue the agreed set on every
         # rank in the same pass (see _weg2_hold_refetch).
+        # P4b (28.09., rc12z17-s0 weg2-2-17/4-36/5-37): who can still fill a
+        # read seen short -- no writer: decide now, never another re-read; a
+        # writer at work: wait for its ack; the ack: re-read now, past the 2 s
+        # timer (weg2/settle_writer.py). Rank-local facts; every verdict built
+        # on them goes through the group MIN below.
+        _acts = [_weg2_settle_writer_action(self, req) for req in settle]
         _pre = []
-        for req in settle:
+        for req, _act in zip(settle, _acts):
+            if _act in ("wait", "decide"):
+                _pre.append(0)  # a re-read cannot see pages nobody writes / still writes
+                continue
+            if _act == "reread":
+                req._1456_last = 0.0  # the ack is the clock, not the 2 s timer
             try:
                 _pre.append(1 if _refetch(req, now, allow_reissue=False) == "due" else 0)
             except Exception:  # noqa: BLE001
                 _pre.append(0)
         _gmin0 = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
         _agreed_due = _gmin0(_pre)
-        for req, _ok in zip(settle, _agreed_due):
+        for req, _ok, _act in zip(settle, _agreed_due, _acts):
             try:
                 state = _refetch(req, now, allow_reissue=bool(_ok))
                 if state == "due":
@@ -6018,9 +6082,15 @@ class Scheduler(
                             type(exc).__name__, exc)
                 state = "complete"
             lapsed = now - float(getattr(req, "_1471_since", now)) >= self.WEG2_POST_WAKE_SETTLE_S
+            # P4b: no writer and no read in flight = decided now (the bound would
+            # release the same request "as it is" 20 s later).
+            _no_writer = _act == "decide" and state != "reading"
+            if _no_writer:
+                state = "no-writer"
             # weg2rc2: a remainder within X is D's to prefill -- settled now, not at the bound.
             _local.append((req, state, lapsed,
-                           state == "complete" or lapsed or _weg2_store_tail_settles(self, req)))
+                           state == "complete" or lapsed or _no_writer
+                           or _weg2_store_tail_settles(self, req)))
         _gmin = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
         _agreed = _gmin([x[3] for x in _local])  # #1471e
         for (req, state, lapsed, _r), ok in zip(_local, _agreed):
@@ -6044,6 +6114,8 @@ class Scheduler(
             except Exception:  # noqa: BLE001
                 pass
             for _r, _s, _l in release:
+                if _s == "no-writer":
+                    _weg2_settle_no_writer_line(self, _r, now)
                 logger.info("#1471 SETTLE-RELEASE rid=%s state=%s lapsed=%s held_after_wake_s=%.1f",
                             str(_r.rid)[:12], _s, _l, now - float(getattr(_r, "_1471_since", now)))
         return len(release)
