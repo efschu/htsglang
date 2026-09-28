@@ -19070,7 +19070,14 @@ class Scheduler(
         # (`weg2/front.py`, `Front.quiesce`), so a non-200 simply keeps the
         # poll going and the LAST body is what a W3 refusal prints.
         outstanding = getattr(self, "_weg2_vote_outstanding", None)
-        if outstanding is None or not envs.SGLANG_WEG2_QUIESCE_FAST.get():
+        # 27B rc12z21 park boot (flip epoch=5, 293 stale laps, W3): the guard
+        # below is ON by itself (SGLANG_WEG2_IDLE_VOTE_NO_REWANT), not only
+        # with the fast poll -- at the 50 ms poll a lap slower than the poll
+        # was dropped every time.
+        if outstanding is None or not (
+            envs.SGLANG_WEG2_QUIESCE_FAST.get()
+            or envs.SGLANG_WEG2_IDLE_VOTE_NO_REWANT.get()
+        ):
             self._weg2_vote_wanted = True
         else:
             # fnFL2 H111: a poll that finds its lap still on the ring does NOT
