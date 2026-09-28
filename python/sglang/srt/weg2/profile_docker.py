@@ -94,6 +94,13 @@ def registry_facts(profile: str, fmt: str) -> List[Fact]:
     for b in _BARE_FLAGS:
         out.append(Fact(b, "set" if b in wf.args else "unset"))
     for name, val in sorted(row.switch_defaults().items()):
+        # 27B park (28.09.): an EXPLICIT SGLANG_WEG2_D_PARK decides D's park alone
+        # (d_seats.d_flip_park_active) -- a rendered `_form ... 0` would veto the
+        # flip park the row's d_park_immediate asks for, and the launcher refuses
+        # that pair (D-PARK-SPLIT). Its default is the row itself, so it is not
+        # written as a fact there.
+        if name == "SGLANG_WEG2_D_PARK" and row.d_park_immediate and not row.standard_form:
+            continue
         out.append(Fact(f"_form {name}", _env_value(val)))
     return out
 

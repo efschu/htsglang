@@ -197,7 +197,19 @@ def test_a_zero_answer_settles_when_the_whole_span_fits_in_x(clean, n, short, de
     assert S._weg2_store_tail_settles(sched, _tail_req(n, short, delivered)) is want
 
 
-@pytest.mark.parametrize("profile,imm", [("nextflash", None), ("qwen27b", None), ("qwen27b", "0")])
+@pytest.mark.parametrize("profile", ["qwen27b", "nextflash"])
+def test_the_row_default_carries_the_zero_read_settle(clean, profile):
+    # 28.09.: the immediate park is the registry default of both rows now, so the
+    # zero-read settle that rides it is on without an explicit switch.
+    from sglang.srt.managers import scheduler as S
+
+    clean.setenv(FM.FORM_ENV, _form_env(profile))
+    clean.setenv("SGLANG_WEG2_STORE_SHORT_TAIL", "1")
+    sched = types.SimpleNamespace(server_args=types.SimpleNamespace(tp_prefill_max_tokens=4096))
+    assert S._weg2_store_tail_settles(sched, _tail_req(418, True, None)) is True
+
+
+@pytest.mark.parametrize("profile,imm", [("nextflash", "0"), ("qwen27b", "0")])
 def test_without_the_immediate_park_a_zero_answer_waits_as_before_pk2(clean, profile, imm):
     # NF 27.09. (Fork A on #1004): PK2 settled zero reads on NF-D against its
     # 12288 riegel. Off the immediate park a zero read waits out #1471 again;

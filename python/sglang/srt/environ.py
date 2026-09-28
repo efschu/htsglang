@@ -3038,8 +3038,8 @@ class Envs:
     # running decodes at once (the H91b FLIP park only: no pressure park, no
     # seats, no MTP draft carry) and the front flips to P (weg2/front.py,
     # weg2/d_seats.d_flip_park_active). Default per profile
-    # (ModelProfile.d_park_immediate: qwen27b off until measured, nextflash
-    # off); off without a form. d_seats/front read it through
+    # (ModelProfile.d_park_immediate: ON on qwen27b and nextflash since
+    # 28.09.); off without a form. d_seats/front read it through
     # weg2.form.d_park_immediate_state (same default); explicit value wins.
     SGLANG_WEG2_D_PARK_IMMEDIATE = EnvBool(_profile_default("SGLANG_WEG2_D_PARK_IMMEDIATE", False))
     # Fix B (weg2/p_row_authority.py): the #631 row form on group P

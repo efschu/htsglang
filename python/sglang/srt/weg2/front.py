@@ -10557,8 +10557,8 @@ def main():
                          "(pending tokens > X) while D decodes parks D's running decodes via POST "
                          "/weg2/park_running at once (behind min-dwell and the fairness floor) and flips "
                          "to P; the parked ones resume first after the flip back. Unset = "
-                         "SGLANG_WEG2_D_PARK_IMMEDIATE / the profile's d_park_immediate (qwen27b off "
-                         "until measured). D needs the same switch (its flip park).")
+                         "SGLANG_WEG2_D_PARK_IMMEDIATE / the profile's d_park_immediate (on for qwen27b "
+                         "and nextflash). D needs the same switch (its flip park).")
     ap.add_argument("--p-leg1-stall-s", type=float, default=None,
                     help="H91 part C: a leg 1 older than this while P showed no work for as long (no "
                          "leg 1 completed, P's progress counters unchanged) is aborted on P and "
