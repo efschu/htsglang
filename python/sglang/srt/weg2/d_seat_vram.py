@@ -597,6 +597,25 @@ def capture_floor_rows(n_ids: int, per_seat_ids: Optional[int]) -> int:
     return int(floors[b - 1]) if b <= len(floors) else 0
 
 
+def _form_a_worker() -> bool:
+    """This process is a Form A expert worker (rank_role's installed plan)."""
+    try:
+        from sglang.srt.rank_role import this_rank_is_form_a_worker
+    except ImportError:
+        return False
+    return bool(this_rank_is_form_a_worker())
+
+
+def kv_stage_trims_here(pool_size: int) -> bool:
+    """#251c: this rank trims its KV tensors to S0 at birth -- the stage form
+    is armed, the pool is the top stage's, and this is NOT a Form A worker.
+    rc12z11 (590fa56a02, 28.09. 09:01Z and 09:09Z): the workers' QSA keys were
+    trimmed like TP0's KV. The stage pages are TP0's only (the planner prices
+    them there); a worker's tensors stay H95c's, byte for byte."""
+    form = stage_form()
+    return form is not None and int(pool_size) >= form.tokens[-1] and not _form_a_worker()
+
+
 def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False,
                          is_draft_worker: bool = False, draft_shares_slots: bool = True) -> int:
     """#251c ``_config_from_budget``: the KV pool's rows are the TOP stage's
@@ -604,7 +623,9 @@ def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False,
     S0's (``kv_stage_born``). The budget must hold S0 on the attention host:
     below it the boot form the planner priced does not fit, refused by name.
     A Form A worker holds no KV: its (replicated) allocator takes the same
-    rows without a budget check. Off: ``max_tokens`` unchanged."""
+    rows without a budget check -- its page ids stay in step with TP0's --
+    and none of its tensors is trimmed (``kv_stage_trims_here``). Off:
+    ``max_tokens`` unchanged."""
     form = stage_form()
     if form is None:
         return int(max_tokens)
@@ -620,6 +641,7 @@ def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False,
             "draft worker has its own allocator (solo host), whose ids are not capped to "
             "stage S0 -- turn the stage form off (SGLANG_WEG2_D_KV_STAGE_TOKENS) for this "
             "draft form" % LINE_MARK)
+    is_form_a_worker = bool(is_form_a_worker) or _form_a_worker()
     if not is_form_a_worker and int(max_tokens) < form.tokens[0]:
         raise Weg2DSeatVramRefused(
             "%s: the KV budget holds %d tokens, below stage S0 = %d -- the boot form "
@@ -630,7 +652,7 @@ def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False,
 
 #: the attention host's KV tensors, trimmed to S0 the moment they are born
 #: (``kv_stage_born``), in birth order: (data_ptr, geometry). Process-local;
-#: TP0 only (a Form A worker allocates none).
+#: TP0 only (a Form A worker trims none, ``kv_stage_trims_here``).
 _KV_BORN: List[Tuple[int, KvTensorGeom]] = []
 
 
@@ -644,7 +666,7 @@ def kv_stage_born(t, *, pool_size: int, page_size: int, name: str = "kv",
     ``layers``/``slots``: a layer-major ``[L, slots x ...]`` tensor (the QSA
     compressed keys: one slot per ``tokens_per_slot`` tokens)."""
     form = stage_form()
-    if form is None or t is None or not t.numel() or int(pool_size) < form.tokens[-1]:
+    if form is None or t is None or not t.numel() or not kv_stage_trims_here(pool_size):
         return t
     spans = tms() if spans is None else spans
     info = spans.info(t.data_ptr()) if spans.available else None
@@ -660,6 +682,12 @@ def kv_stage_born(t, *, pool_size: int, page_size: int, name: str = "kv",
     geom = KvTensorGeom(
         SlotTensorGeom(name, int(layers), n_slots, int(slot_bytes), int(info.size)),
         token_ratio=int(tokens_per_slot), token_pad=int(page_size))
+    # the tensor was born by torch.zeros: its fill kernel may still be in
+    # flight. Unmapping under it is a GPU fault that surfaces at the next
+    # sync (rc12z11 TP1/TP2: KvRowCap._apply, exit -6) or as a dead context
+    # at the next launch (rc12z11 TP0: segfault in fill_kernel_cuda). H95c's
+    # apply_stage synchronizes before a page goes; the birth must as well.
+    _sync_before_unmap(t)
     rc = spans.set_spans(t.data_ptr(), slot_spans(geom.geom, geom.slots_for(form.tokens[0]), g),
                          now=True)
     if rc != 0:
@@ -677,6 +705,15 @@ def kv_stage_boot_cap(allocator, page_size: int) -> Optional[int]:
     if form is None or allocator is None:
         return None
     return _engage_kv_cap(allocator, form.tokens[0], page_size)
+
+
+def _sync_before_unmap(t) -> None:
+    """Every kernel that may still write ``t`` is done before a page of it is
+    unmapped (a CPU tensor -- the unit tests' -- has none)."""
+    if getattr(t, "is_cuda", False):
+        import torch
+
+        torch.cuda.synchronize(t.device)
 
 
 def _engage_kv_cap(allocator, tokens: int, page_size: int) -> int:

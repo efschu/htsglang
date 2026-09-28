@@ -163,10 +163,11 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # compressed pages are addressable from a single base pointer.
         # #251c: under D's KV stage form the keys live in the kv_cache tag
         # beside the KV they index, so their top-stage pages can be unmapped
-        # like the KV's (weg2/d_seat_vram.kv_stage_born); off, byte-identical.
+        # like the KV's (weg2/d_seat_vram.kv_stage_born); off, and on a Form A
+        # worker (its keys are no stage page), byte-identical.
         from sglang.srt.weg2 import d_seat_vram as _dsv
 
-        _staged = _dsv.stage_form() is not None and int(size) >= _dsv.stage_form().tokens[-1]
+        _staged = _dsv.kv_stage_trims_here(int(size))
         with (
             self.full_kv_pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE)
             if _staged
