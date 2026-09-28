@@ -456,6 +456,35 @@ class TestDaemonUnlockLatency(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("mem", r["err"])
 
+    def test_a_failed_undo_of_a_partial_memory_lock_is_reset_at_the_next_unlock(self):
+        # card 2 refuses -lmc, the undo on card 0 fails: card 0 may still sit at the lowest memory
+        # clock although mem_locked is False -- the next request-path unlock must reset mem AND app
+        nv = FakeNvml(mem_fail_index=2)
+        plain = nv.reset_mem
+
+        def undo_fails_on_0(h):
+            if h == 0:
+                nv.ops.append(("reset_mem", h))
+                raise dmn.NvmlError("NVML rc=999 Unknown Error", 999)
+            plain(h)
+        nv.reset_mem = undo_fails_on_0
+        st = dmn.ClockState(nv, _cards(), mem="lock")
+        a = object()
+        r = st.lock(a)
+        self.assertFalse(r["mem_locked"])
+        self.assertIn(0, nv.mem)                  # the stuck memory lock
+        self.assertIn("lock-undo", r["mem_err"])
+        nv.reset_mem = plain
+        nv.ops.clear()
+        st.release(a)
+        self.assertEqual(sorted(nv.ops), sorted([(op, i) for op in ("reset", "reset_mem", "reset_app")
+                                                 for i in range(3)]))
+        self.assertEqual(nv.mem, {})
+        nv.ops.clear()
+        st.lock(a)                                # healed: the fast path is back
+        st.release(a)
+        self.assertNotIn(("reset_app", 0), nv.ops)
+
     def test_lock_writes_all_cards_at_once(self):
         nv = FakeNvml()
         gate = threading.Barrier(3, timeout=2.0)

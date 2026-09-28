@@ -193,6 +193,10 @@ class ClockState:
         self.mem_mode = "off"      # mode of the lock currently held
         self.mem_locked = False
         self.mem_err: List[str] = []
+        # a memory mode may still sit on a card although no lock says so (a failed undo of a partial
+        # memory lock, a refused reset of the held one): the next request-path unlock resets mem AND
+        # app as the full reset did -- the fast path holds only while nothing is left over
+        self.mem_dirty = False
         self.card_ms: List[float] = []  # NVML ms per card of the last lock / reset (they run at once)
         self._pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
@@ -229,7 +233,7 @@ class ClockState:
                  ("app", getattr(self.nvml, "reset_app", None))]
         # the reset that undoes the memory mode of the lock held now (mem_mode "lock" -> reset "mem")
         held = {"lock": "mem", "app": "app"}.get(self.mem_mode) if self.locked and self.mem_locked else None
-        if only_set:
+        if only_set and not self.mem_dirty:
             modes = [m for m in modes if m[0] in ("gfx", held)]
         errs: List[str] = []
 
@@ -246,6 +250,8 @@ class ClockState:
 
         self.card_ms = [round(ms, 3) for _, _, ms in self._per_card(self.cards, work)]
         self.locked, self.mem_locked, self.mem_mode = False, False, "off"
+        # a refused mem/app reset may have left the mode on the card: the next unlock tries again
+        self.mem_dirty = any(" gfx:" not in e for e in errs)
         return (self._clock() - t0) * 1e3, sorted(errs)
 
     def _reply(self, ok: bool, ms: float, errs: List[str], op: str) -> Dict:
@@ -272,7 +278,11 @@ class ClockState:
         errs = [f"card{c.index} {mode}: {e}" for c, e, _ in res if e is not None]
         if errs:  # all or nothing for the memory step too
             undo = self.nvml.reset_mem if mode == "lock" else self.nvml.reset_app
-            self._per_card([c for c, e, _ in res if e is None], lambda c: undo(c.handle))
+            undone = self._per_card([c for c, e, _ in res if e is None], lambda c: undo(c.handle))
+            if any(e is not None for _, e, _ in undone):
+                # the undo itself failed: that card may still hold the mode -- never forget it
+                self.mem_dirty = True
+                errs += [f"card{c.index} {mode}-undo: {e}" for c, e, _ in undone if e is not None]
         self.card_ms = [round(a + ms, 3) for a, (_, _, ms) in zip(self.card_ms, res)]
         return errs
 
