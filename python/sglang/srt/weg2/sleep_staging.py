@@ -29,6 +29,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import sys
 import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -144,64 +145,146 @@ def _framed_blocks(snapshot: dict, top: int) -> List[Tuple[int, int, str]]:
     return out[: int(top)]
 
 
-#: referrers that are the walk's own machinery, never a holder
-_NOISE = frozenset({"cell", "frame", "list_iterator", "tuple_iterator", "generator", "function"})
+#: referrers that are the walk's own machinery, never a holder (a frame is NOT noise any more:
+#: the PP event loop's local ``result`` was the hc_combine holder, NF rc12z14 10:02:57Z)
+_NOISE = frozenset({"cell", "list_iterator", "tuple_iterator", "generator", "function"})
 
 
-def _describe(obj: Any, depth: int, seen: set) -> List[str]:
-    """Who references ``obj``: 'Class.attr', 'list[i] <- ...', bounded depth."""
+def _frame_locals_holding(frame: Any, obj: Any) -> List[str]:
+    try:
+        names = [k for k, v in frame.f_locals.items() if v is obj][:2]
+    except Exception:  # noqa: BLE001 -- a frame that cannot be read names nothing
+        names = []
+    return [f"frame {frame.f_code.co_name} local {k}" for k in names] or [f"frame {frame.f_code.co_name}"]
+
+
+_WALK_DICTS = -1  # key of the list of f_locals-dict ids inside the _stack_locals index
+
+
+def _stack_locals() -> Dict[int, List[str]]:
+    """id(value) -> ['frame fn local name'] over every thread's LIVE stack. An executing frame is
+    no gc object (3.11+), so ``gc.get_referrers`` never shows it: the PP event loop that serves
+    the sleep RPC from inside its own ``while True`` keeps its locals there, out of the walk's
+    sight. The walk's own frames are left out."""
+    idx: Dict[int, List[str]] = {}
+    try:
+        frames = list(sys._current_frames().values())
+    except Exception:  # noqa: BLE001
+        return idx
+    walk_dicts = idx.setdefault(_WALK_DICTS, [])  # the f_locals snapshots: walk machinery, never a holder
+    for f in frames:
+        while f is not None:
+            if f.f_code.co_filename != __file__:
+                try:
+                    loc = f.f_locals
+                    walk_dicts.append(id(loc))
+                    items = list(loc.items())
+                except Exception:  # noqa: BLE001
+                    items = []
+                for k, v in items:
+                    idx.setdefault(id(v), []).append(f"frame {f.f_code.co_name} local {k}")
+            f = f.f_back
+    return idx
+
+
+def _describe(obj: Any, depth: int, seen: set, skip: Optional[set] = None,
+              stack: Optional[Dict[int, List[str]]] = None) -> List[str]:
+    """Who references ``obj``: 'Class.attr', 'frame fn local x', 'list <- ...', bounded depth.
+    ``skip`` holds the ids of the walk's OWN temporaries (the candidate list, every
+    ``gc.get_referrers`` result): they referenced everything and filled the report with
+    'list <- list <- list <- ?' before this fix."""
     if depth <= 0:
         return []
-    out = []
-    for r in gc.get_referrers(obj):
-        if id(r) in seen or r is seen:
-            continue
-        seen.add(id(r))
-        if isinstance(r, dict):
-            owners = [o for o in gc.get_referrers(r) if getattr(o, "__dict__", None) is r]
-            keys = [k for k, v in r.items() if v is obj][:2]
-            if owners:
-                out.extend(f"{type(o).__name__}.{k}" for o in owners[:2] for k in keys)
+    skip = set() if skip is None else skip
+    stack = _stack_locals() if stack is None else stack
+    skip.update(stack.get(_WALK_DICTS, []))
+    out: List[str] = list(stack.get(id(obj), [])[:2])
+    refs = gc.get_referrers(obj)
+    skip.add(id(refs))
+    try:
+        for r in refs:
+            if id(r) in seen or id(r) in skip:
+                continue
+            seen.add(id(r))
+            if type(r).__name__ == "frame":
+                if r.f_code.co_filename == __file__:
+                    continue  # this walk's own frames
+                out.extend(_frame_locals_holding(r, obj))
+            elif isinstance(r, dict):
+                owners = [o for o in gc.get_referrers(r) if getattr(o, "__dict__", None) is r]
+                keys = [k for k, v in r.items() if v is obj][:2]
+                if owners:
+                    out.extend(f"{type(o).__name__}.{k}" for o in owners[:2] for k in keys)
+                else:
+                    up = _describe(r, depth - 1, seen, skip, stack)
+                    out.extend(f"dict[{k!r}] <- {u}" for k in keys for u in (up or ["?"]))
+            elif isinstance(r, (list, tuple)):
+                up = _describe(r, depth - 1, seen, skip, stack)
+                out.extend(f"{type(r).__name__} <- {u}" for u in (up or ["?"]))
+            elif type(r).__name__ in _NOISE:
+                continue
             else:
-                up = _describe(r, depth - 1, seen)
-                out.extend(f"dict[{k!r}] <- {u}" for k in keys for u in (up or ["?"]))
-        elif isinstance(r, (list, tuple)):
-            up = _describe(r, depth - 1, seen)
-            out.extend(f"{type(r).__name__} <- {u}" for u in (up or ["?"]))
-        elif type(r).__name__ in _NOISE:
+                # an instance whose attribute holds obj (3.12 keeps inline values:
+                # the owner is the referrer itself, not its __dict__); then who holds THAT
+                try:
+                    keys = [k for k, v in vars(r).items() if v is obj][:2]
+                except TypeError:
+                    keys = []
+                here = [f"{type(r).__name__}.{k}" for k in keys] or [type(r).__name__]
+                up = _describe(r, depth - 1, seen, skip, stack)
+                out.extend(f"{h} <- {u}" for h in here for u in up) if up else out.extend(here)
+            if len(out) >= 6:
+                break
+    finally:
+        del refs
+    return out[:6]
+
+
+def describe_holders(objs: List[Any], depth: int = 5) -> List[str]:
+    """The holders of ``objs`` (at most 6 names each), without the caller's list itself."""
+    skip = {id(objs)}
+    stack = _stack_locals()
+    out: List[str] = []
+    for o in objs:
+        out.extend(_describe(o, depth, set(), skip, stack))
+    return out
+
+
+def live_cuda_tensors() -> List[Any]:
+    """Every live CUDA tensor on the Python heap. A dead ``weakref.proxy`` in the heap raises
+    ReferenceError on ``isinstance`` (PP2, rc12z14 10:02:55Z: the whole report was skipped); such
+    objects are passed over, not fatal."""
+    try:
+        import torch
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for o in gc.get_objects():
+        try:
+            if isinstance(o, torch.Tensor) and getattr(o, "is_cuda", False):
+                out.append(o)
+        except ReferenceError:
             continue
-        else:
-            # an instance whose attribute holds obj (3.12 keeps inline values:
-            # the owner is the referrer itself, not its __dict__)
-            try:
-                keys = [k for k, v in vars(r).items() if v is obj][:2]
-            except TypeError:
-                keys = []
-            out.extend(f"{type(r).__name__}.{k}" for k in keys) if keys else out.append(type(r).__name__)
-        if len(out) >= 4:
-            break
-    return out[:4]
+    return out
 
 
-def holder_report(snapshot: Optional[dict], top: int = 4, depth: int = 3) -> List[str]:
+def holder_report(snapshot: Optional[dict], top: int = 4, depth: int = 5) -> List[str]:
     """(c) For the ``top`` largest framed live blocks: the Python tensors that
-    live in them and who references each (type/attribute only). Bounded: one
-    gc scan, ``top`` blocks, ``depth`` referrer hops, 4 names per tensor."""
+    live in them and who references each (type/attribute/frame local only). Bounded: one
+    gc scan, ``top`` blocks, ``depth`` referrer hops, 6 names per tensor."""
     if not snapshot:
         return []
     blocks = _framed_blocks(snapshot, top)
     if not blocks:
         return []
-    try:
-        import torch
-    except Exception:  # noqa: BLE001
-        return []
-    tensors = [o for o in gc.get_objects() if isinstance(o, torch.Tensor) and getattr(o, "is_cuda", False)]
+    tensors = live_cuda_tensors()
     lines = []
+    stack = _stack_locals()
     for addr, size, site in blocks:
         hit = [t for t in tensors if addr <= int(t.data_ptr()) < addr + size]
         holders = []
         for t in hit[:2]:
-            holders.extend(_describe(t, depth, set()))
+            holders.extend(_describe(t, depth, set(), {id(tensors), id(hit)}, stack))
         lines.append(f"{size / _MIB:.1f} MiB @{site} holders={holders or ['no python tensor (freed-but-cached or C++ owner)']}")
+    del tensors
     return lines
