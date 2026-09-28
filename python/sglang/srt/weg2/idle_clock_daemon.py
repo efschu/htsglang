@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import ctypes
 import json
 import logging
@@ -192,31 +193,67 @@ class ClockState:
         self.mem_mode = "off"      # mode of the lock currently held
         self.mem_locked = False
         self.mem_err: List[str] = []
+        self.card_ms: List[float] = []  # NVML ms per card of the last lock / reset (they run at once)
+        self._pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
-    def _reset_all(self) -> Tuple[float, List[str]]:
-        """Reset EVERYTHING this daemon can set, whatever it believes it set (start, stop, last holder)."""
+    def _per_card(self, cards: Sequence[Card], work) -> List[Tuple[Card, Optional[NvmlError], float]]:
+        """``work(card)`` on every card AT ONCE, one thread per card; (card, error, ms) in card order.
+
+        NF 28.09. (rc12z26): the unlock took 98-107 ms on the request path, the serial sum of
+        3 cards x 3 resets; the 3080 micro test put one card's unlock at ~30 ms. NVML is
+        thread-safe and ctypes drops the GIL for the call, so the cards' writes overlap.
+        """
+        def one(c):
+            t0 = self._clock()
+            try:
+                work(c)
+                return c, None, (self._clock() - t0) * 1e3
+            except NvmlError as e:
+                return c, e, (self._clock() - t0) * 1e3
+        if len(cards) <= 1:
+            return [one(c) for c in cards]
+        if self._pool is None:
+            self._pool = concurrent.futures.ThreadPoolExecutor(len(self.cards), thread_name_prefix="idle-clock")
+        return list(self._pool.map(one, cards))
+
+    def _reset_all(self, only_set: bool = False) -> Tuple[float, List[str]]:
+        """Reset what this daemon can set, all cards at once.
+
+        ``only_set=False`` (start, stop): EVERYTHING, whatever it believes it set.
+        ``only_set=True`` (the last holder leaves, i.e. the request path): the graphics lock plus the
+        memory mode of the lock it holds -- a mode never set costs a driver call per card for nothing
+        (the app reset in ``mem=lock`` mode was a third of the unlock's calls).
+        """
         t0 = self._clock()
-        errs = []
-        for c in self.cards:
-            for name, fn in (("gfx", self.nvml.reset), ("mem", getattr(self.nvml, "reset_mem", None)),
-                             ("app", getattr(self.nvml, "reset_app", None))):
+        modes = [("gfx", self.nvml.reset), ("mem", getattr(self.nvml, "reset_mem", None)),
+                 ("app", getattr(self.nvml, "reset_app", None))]
+        # the reset that undoes the memory mode of the lock held now (mem_mode "lock" -> reset "mem")
+        held = {"lock": "mem", "app": "app"}.get(self.mem_mode) if self.locked and self.mem_locked else None
+        if only_set:
+            modes = [m for m in modes if m[0] in ("gfx", held)]
+        errs: List[str] = []
+
+        def work(c):
+            for name, fn in modes:
                 if fn is None:
                     continue
                 try:
                     fn(c.handle)
                 except NvmlError as e:
                     # A mode never used on this card may be unsupported; only the gfx reset must work.
-                    if name == "gfx" or e.rc not in (NVML_NOT_SUPPORTED, NVML_NO_PERMISSION) or (
-                            self.locked and self.mem_locked and name == self.mem_mode):
+                    if name in ("gfx", held) or e.rc not in (NVML_NOT_SUPPORTED, NVML_NO_PERMISSION):
                         errs.append(f"card{c.index} {name}: {e}")
+
+        self.card_ms = [round(ms, 3) for _, _, ms in self._per_card(self.cards, work)]
         self.locked, self.mem_locked, self.mem_mode = False, False, "off"
-        return (self._clock() - t0) * 1e3, errs
+        return (self._clock() - t0) * 1e3, sorted(errs)
 
     def _reply(self, ok: bool, ms: float, errs: List[str], op: str) -> Dict:
         r = {"ok": ok, "op": op, "locked": self.locked, "ms": round(ms, 3), "holders": len(self.holders),
              "cards": [c.index for c in self.cards], "mhz": [c.mhz for c in self.cards],
              "mem_mode": self.mem_mode, "mem_locked": self.mem_locked,
-             "mem_mhz": [c.mem_min for c in self.cards] if self.mem_locked else None}
+             "mem_mhz": [c.mem_min for c in self.cards] if self.mem_locked else None,
+             "card_ms": list(self.card_ms) if ms else []}
         if self.mem_err and self.locked:
             r["mem_err"] = "; ".join(self.mem_err)
         if errs:
@@ -224,25 +261,19 @@ class ClockState:
         return r
 
     def _lock_mem(self, mode: str) -> List[str]:
-        errs, done = [], []
-        for c in self.cards:
-            try:
-                if not c.mem_min:
-                    raise NvmlError("no supported memory clock known", NVML_NOT_SUPPORTED)
-                if mode == "lock":
-                    self.nvml.lock_mem(c.handle, c.mem_min, c.mem_min)
-                else:
-                    self.nvml.set_app(c.handle, c.mem_min, c.gfx_at_mem_min or c.mhz)
-                done.append(c)
-            except NvmlError as e:
-                errs.append(f"card{c.index} {mode}: {e}")
-                break
+        def work(c):
+            if not c.mem_min:
+                raise NvmlError("no supported memory clock known", NVML_NOT_SUPPORTED)
+            if mode == "lock":
+                self.nvml.lock_mem(c.handle, c.mem_min, c.mem_min)
+            else:
+                self.nvml.set_app(c.handle, c.mem_min, c.gfx_at_mem_min or c.mhz)
+        res = self._per_card(self.cards, work)
+        errs = [f"card{c.index} {mode}: {e}" for c, e, _ in res if e is not None]
         if errs:  # all or nothing for the memory step too
-            for c in done:
-                try:
-                    (self.nvml.reset_mem if mode == "lock" else self.nvml.reset_app)(c.handle)
-                except NvmlError:
-                    pass
+            undo = self.nvml.reset_mem if mode == "lock" else self.nvml.reset_app
+            self._per_card([c for c, e, _ in res if e is None], lambda c: undo(c.handle))
+        self.card_ms = [round(a + ms, 3) for a, (_, _, ms) in zip(self.card_ms, res)]
         return errs
 
     def lock(self, who, mem: Optional[str] = None) -> Dict:
@@ -253,21 +284,15 @@ class ClockState:
         if self.locked:
             return self._reply(True, 0.0, [], "lock")
         t0 = self._clock()
-        done: List[Card] = []
-        try:
-            for c in self.cards:
-                self.nvml.lock(c.handle, c.mhz, c.mhz)
-                done.append(c)
-        except NvmlError as e:
+        res = self._per_card(self.cards, lambda c: self.nvml.lock(c.handle, c.mhz, c.mhz))
+        self.card_ms = [round(ms, 3) for _, _, ms in res]
+        bad = [f"card{c.index}: {e}" for c, e, _ in res if e is not None]
+        if bad:
             # FAIL-OPEN: a partial lock is undone, the holder is dropped, the answer is "not locked".
-            for c in done:
-                try:
-                    self.nvml.reset(c.handle)
-                except NvmlError:
-                    pass
+            self._per_card([c for c, e, _ in res if e is None], lambda c: self.nvml.reset(c.handle))
             self.holders.discard(who)
             self.locked = False
-            return self._reply(False, (self._clock() - t0) * 1e3, [f"card{c.index}: {e}"], "lock")
+            return self._reply(False, (self._clock() - t0) * 1e3, bad, "lock")
         self.locked, self.mem_err = True, []
         if mode != "off":
             self.mem_err = self._lock_mem(mode)
@@ -279,7 +304,7 @@ class ClockState:
         self.holders.discard(who)
         if self.holders or not self.locked:
             return self._reply(True, 0.0, [], op)
-        ms, errs = self._reset_all()
+        ms, errs = self._reset_all(only_set=True)
         return self._reply(not errs, ms, errs, op)
 
     def status(self) -> Dict:
@@ -308,9 +333,10 @@ async def serve_conn(state: ClockState, reader: asyncio.StreamReader, writer: as
             else:
                 r = {"ok": False, "err": f"unknown op {op!r}"}
             if op in ("lock", "unlock"):
-                logger.info("IDLE-CLOCK-D %s ok=%s locked=%s mem=%s/%s ms=%.3f holders=%d peer=%s%s%s", op,
-                            r.get("ok"), r.get("locked"), r.get("mem_mode"), r.get("mem_locked"), r.get("ms", 0.0),
-                            r.get("holders", 0), peer, f" err={r['err']}" if "err" in r else "",
+                logger.info("IDLE-CLOCK-D %s ok=%s locked=%s mem=%s/%s ms=%.3f card_ms=%s holders=%d peer=%s%s%s",
+                            op, r.get("ok"), r.get("locked"), r.get("mem_mode"), r.get("mem_locked"),
+                            r.get("ms", 0.0), r.get("card_ms"), r.get("holders", 0), peer,
+                            f" err={r['err']}" if "err" in r else "",
                             f" mem_err={r['mem_err']}" if "mem_err" in r else "")
             writer.write((json.dumps(r) + "\n").encode())
             await writer.drain()
@@ -320,8 +346,8 @@ async def serve_conn(state: ClockState, reader: asyncio.StreamReader, writer: as
         # The connection is the lease: gone -> released (fail-open).
         if who in state.holders:
             r = state.release(who, op="release-on-close")
-            logger.info("IDLE-CLOCK-D release-on-close locked=%s ms=%.3f holders=%d peer=%s",
-                        r["locked"], r["ms"], r["holders"], peer)
+            logger.info("IDLE-CLOCK-D release-on-close locked=%s ms=%.3f card_ms=%s holders=%d peer=%s",
+                        r["locked"], r["ms"], r.get("card_ms"), r["holders"], peer)
         try:
             writer.close()
         except Exception:  # noqa: BLE001
@@ -342,9 +368,9 @@ async def amain(args) -> None:
     nvml = Nvml()
     state = ClockState(nvml, select_cards(nvml, args.cards, args.mhz), mem=args.mem)
     ms, errs = state._reset_all()
-    logger.info("IDLE-CLOCK-D start cards=%s mhz=%s mem=%s mem_min=%s gfx_at_mem_min=%s reset_ms=%.3f%s",
+    logger.info("IDLE-CLOCK-D start cards=%s mhz=%s mem=%s mem_min=%s gfx_at_mem_min=%s reset_ms=%.3f card_ms=%s%s",
                 [(c.index, c.uuid) for c in state.cards], [c.mhz for c in state.cards], args.mem,
-                [c.mem_min for c in state.cards], [c.gfx_at_mem_min for c in state.cards], ms,
+                [c.mem_min for c in state.cards], [c.gfx_at_mem_min for c in state.cards], ms, state.card_ms,
                 f" reset_err={errs}" if errs else "")
     servers = []
     for spec in args.listen:
@@ -367,7 +393,8 @@ async def amain(args) -> None:
     for s in servers:
         s.close()
     ms, errs = state._reset_all()
-    logger.info("IDLE-CLOCK-D stop reset_ms=%.3f%s", ms, f" reset_err={errs}" if errs else "")
+    logger.info("IDLE-CLOCK-D stop reset_ms=%.3f card_ms=%s%s", ms, state.card_ms,
+                f" reset_err={errs}" if errs else "")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:

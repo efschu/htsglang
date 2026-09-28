@@ -299,6 +299,7 @@ class FakeNvml:
         self.mem[h] = (lo, hi)
 
     def reset_mem(self, h):
+        self.ops.append(("reset_mem", h))
         if self.mem_rc is not None and h not in self.mem:
             raise dmn.NvmlError("NVML rc=3 Not Supported", self.mem_rc)
         self.mem.pop(h, None)
@@ -309,6 +310,7 @@ class FakeNvml:
         self.app[h] = (mem, gfx)
 
     def reset_app(self, h):
+        self.ops.append(("reset_app", h))
         if self.app_rc is not None:
             raise dmn.NvmlError("NVML rc=3 Not Supported", self.app_rc)
         self.app.pop(h, None)
@@ -386,6 +388,85 @@ class TestDaemonMemoryModes(unittest.TestCase):
         r = st.lock(object())
         self.assertFalse(r["mem_locked"])
         self.assertEqual(nv.mem, {})
+        self.assertEqual(len(nv.locked), 3)
+
+
+class BarrierNvml(FakeNvml):
+    """Every graphics/memory reset waits until ALL cards are inside it: a serial daemon breaks the barrier."""
+
+    def __init__(self, n=3, wait_s=2.0):
+        super().__init__()
+        self.gate = threading.Barrier(n, timeout=wait_s)
+
+    def reset(self, h):
+        self.gate.wait()
+        super().reset(h)
+
+    def reset_mem(self, h):
+        self.gate.wait()
+        super().reset_mem(h)
+
+
+class TestDaemonUnlockLatency(unittest.TestCase):
+    """NF 28.09. rc12z26: unlock 98-107 ms on the request path = 3 cards x (gfx, mem, app) resets in series."""
+
+    def test_unlock_resets_all_cards_at_once(self):
+        nv = BarrierNvml()
+        st = dmn.ClockState(nv, _cards(), mem="lock")
+        a = object()
+        st.lock(a)
+        r = st.release(a)            # serial: the first card waits alone at the barrier -> BrokenBarrierError
+        self.assertTrue(r["ok"])
+        self.assertEqual((nv.locked, nv.mem), ({}, {}))
+        self.assertEqual(len(r["card_ms"]), 3)
+
+    def test_unlock_resets_only_the_modes_it_set(self):
+        nv = FakeNvml()
+        st = dmn.ClockState(nv, _cards(), mem="lock")
+        a = object()
+        st.lock(a)
+        nv.ops.clear()
+        st.release(a)
+        self.assertEqual(sorted(nv.ops), sorted([("reset", i) for i in range(3)] + [("reset_mem", i) for i in range(3)]))
+        nv.ops.clear()
+        st.lock(a, "off")             # graphics only: the unlock is one reset per card
+        nv.ops.clear()
+        st.release(a)
+        self.assertEqual(sorted(nv.ops), [("reset", i) for i in range(3)])
+
+    def test_start_and_stop_still_reset_every_mode(self):
+        nv = FakeNvml()
+        st = dmn.ClockState(nv, _cards(), mem="lock")
+        st._reset_all()
+        self.assertEqual(sorted(nv.ops), sorted([(op, i) for op in ("reset", "reset_mem", "reset_app")
+                                                 for i in range(3)]))
+
+    def test_a_refused_reset_of_the_held_memory_lock_is_an_error(self):
+        nv = FakeNvml()
+        st = dmn.ClockState(nv, _cards(), mem="lock")
+        a = object()
+        st.lock(a)
+        plain = nv.reset_mem
+
+        def refused(h):
+            plain(h)
+            raise dmn.NvmlError("NVML rc=3 Not Supported", 3)
+        nv.reset_mem = refused
+        r = st.release(a)             # the card may still sit at 405 MHz memory: never swallowed
+        self.assertFalse(r["ok"])
+        self.assertIn("mem", r["err"])
+
+    def test_lock_writes_all_cards_at_once(self):
+        nv = FakeNvml()
+        gate = threading.Barrier(3, timeout=2.0)
+        plain_lock = nv.lock
+
+        def lock(h, lo, hi):
+            gate.wait()
+            plain_lock(h, lo, hi)
+        nv.lock = lock
+        r = dmn.ClockState(nv, _cards()).lock(object())
+        self.assertTrue(r["ok"] and r["locked"])
         self.assertEqual(len(nv.locked), 3)
 
 
