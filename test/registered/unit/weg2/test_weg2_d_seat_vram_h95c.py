@@ -572,7 +572,7 @@ def test_the_scheduler_delegates_and_the_resume_calls_before_the_tags():
     for name in ("seat_vram_wake", "seat_cap", "seat_guard"):
         assert callable(getattr(d_park_runtime, name, None)), name
     src = open(sch.__file__).read()
-    i = src.index("    def get_num_allocatable_reqs(self, running_bs):")
+    i = src.index("    def get_num_allocatable_reqs(self, running_bs")
     body = src[i:i + 1200]
     assert "_seat_cap = self._weg2_d_seat_cap()" in body
     assert "limit = min(limit, _seat_cap)" in body
