@@ -58,7 +58,8 @@ class TestHoldVote(_PriceReset):
         a, b = _req("a", 12829), _req("b", 19017)
         rec = _records(a=12800)
         self.assertEqual(wc.hold_vote([(a, "complete", True), (b, "complete", True)], 0.0, 0.2, rec), 0)
-        self.assertEqual(wc.hold_vote([(a, "complete", True), (b, "wait", False)], 0.0, 0.2, rec), 0)
+        # L1b (28.09.): a sibling seen short with its re-read due ("wait") lands too -> hold
+        self.assertEqual(wc.hold_vote([(a, "complete", True), (b, "wait", False)], 0.0, 0.2, rec), 1)
 
     def test_cheap_or_unknown_member_never_waits(self):
         a, b = _req("a", 12803), _req("b", 19017)
@@ -148,6 +149,7 @@ class TestSettleTick(_PriceReset):
         a, b = _req("a", 12829, time.monotonic() - 5.0), _req("b", 19017, time.monotonic() - 5.0)
         h = _holder({"a": "complete", "b": "reading"}, _records(a=12800))
         h.weg2_post_wake_settle = [a, b]
+        h._weg2_cohort_ready_at = (None, time.monotonic() - 5.0)    # L1b: a was ready 5 s ago
         self.assertEqual(h._weg2_post_wake_settle_tick(), 1)
 
     def test_switch_off_releases_as_before(self):
