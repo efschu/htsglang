@@ -42,6 +42,20 @@ ROLES = ("host", "worker", "worker")
 CUT_BOUNDS = {0: (2, 0, 0), 1: (2, 0, 1), 2: (2, 1, 2)}
 
 
+@pytest.fixture(autouse=True)
+def _classic_process():
+    """Each test starts on a classic process -- no Form A plan, no lane -- and
+    leaves the installed plan as it found it. 27B 28.09.: a plan another
+    suite left installed made the classic case order-dependent."""
+    prev = (rank_role._INSTALLED_PLAN, rank_role._INSTALLED_RANK)
+    rank_role._INSTALLED_PLAN, rank_role._INSTALLED_RANK = None, 0
+    try:
+        with mock.patch.object(du, "_WEIGHTLESS_KV_HEAD_RANK", None):
+            yield
+    finally:
+        rank_role._INSTALLED_PLAN, rank_role._INSTALLED_RANK = prev
+
+
 @contextlib.contextmanager
 def _form_a(rank, *, bounds=None):
     prev = (rank_role._INSTALLED_PLAN, rank_role._INSTALLED_RANK)
