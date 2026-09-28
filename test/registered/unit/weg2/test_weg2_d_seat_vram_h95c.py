@@ -404,7 +404,10 @@ def test_weights_leg_first_then_kv_leg_with_n_grows_the_bank_in_place():
         assert pool._weg2_seat_keep == 7
         # experts (mapped): grown in place (now=True) and ON in the device tables
         grow = [c for c in tms.calls if c[2]]
-        assert grow and all(c[1] == ((0, dsv.align_up((10 + k) * 4096, 4096)),) for c in grow)
+        # S1-Wisch: the plan is cut at the lattice of all phases -- one prefix, many cells
+        end = dsv.align_up((10 + k) * 4096, 4096)
+        assert grow and all(c[1][0][0] == 0 and c[1][-1][1] == end and dsv.span_bytes(c[1]) == end
+                            for c in grow)
         for c in caches:
             assert c._pool_tables.seat_on == k
             assert c._pool_tables.row_key.tolist()[10:10 + k] == [-1] * k

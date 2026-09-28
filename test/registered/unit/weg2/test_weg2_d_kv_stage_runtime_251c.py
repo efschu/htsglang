@@ -327,10 +327,13 @@ def test_demand_picks_the_stage_the_bank_shrinks_tables_first_and_the_next_wake_
         assert r.log[0] == ("tables", k1)
         shrink = [c for c in tms.calls if c[2] and c[0] in {b.data_ptr() for x in r.caches
                                                               for b in x._resident.values()}]
-        assert shrink and all(c[1] == ((0, (10 + k1) * G),) for c in shrink[-2:])
+        # S1-Wisch: the prefix is cut at the lattice of all phases (whole cells go)
+        assert shrink and all(c[1][0][0] == 0 and c[1][-1][1] == (10 + k1) * G
+                              and dsv.span_bytes(c[1]) == (10 + k1) * G for c in shrink[-2:])
         # the KV (paused) got S1's plan: 128 + 16 rows of 1 KiB
         for t in r.kv:
-            assert tms.allocs[t.data_ptr()]["plan"] == [(0, 144 * 1024)]
+            # S1-Wisch: cut at S0 (64 + 16 rows) -- a later live S1 -> S0 keeps that cell
+            assert tms.allocs[t.data_ptr()]["plan"] == [(0, 80 * 1024), (80 * 1024, 144 * 1024)]
             assert not tms.allocs[t.data_ptr()]["active"]  # a plan, mapped at the resume
         assert r.kv_alloc.available_size() == 8 * PAGE  # S1 = 8 pages
         assert r.kv_pool.safe_zero_rows == 128 + PAGE

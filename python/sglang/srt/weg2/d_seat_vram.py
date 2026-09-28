@@ -63,7 +63,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,10 @@ GROUP_ENV = "SGLANG_WEG2_GROUP"
 POOL_GRAPH_MODE_ENV = "SGLANG_MOE_OFFLOAD_GRAPH_MODE"
 LINE_MARK = "WEG2 D-SEAT-VRAM (H95c)"
 REFUSAL_CODE = "W-SEAT Weg2DSeatOverrun"
+#: S1-Wisch (rc12z17 28.09.): a live apply that would release mapped bytes
+WIPE_CODE = "W-SEAT-WIPE"
+#: one line per live apply: extents kept, cells freed / mapped, wiped=0
+LIVE_MARK = "WEG2 D-SEAT-VRAM LIVE-SPANS"
 _MIB = float(1 << 20)
 
 
@@ -166,22 +170,56 @@ class SlotTensorGeom:
         return int(self.layers) * int(self.slots) * int(self.slot_bytes)
 
 
-def slot_spans(g: SlotTensorGeom, keep: int, granule: int) -> Tuple[Tuple[int, int], ...]:
+def split_at(ranges: Sequence[Tuple[int, int]], points: Iterable[int]) -> Tuple[Tuple[int, int], ...]:
+    """``ranges`` cut at every point strictly inside one of them."""
+    pts = sorted({int(p) for p in points})
+    out: List[Tuple[int, int]] = []
+    for lo, hi in ranges:
+        cur = int(lo)
+        for p in pts:
+            if cur < p < int(hi):
+                out.append((cur, p))
+                cur = p
+        out.append((cur, int(hi)))
+    return tuple(out)
+
+
+def slot_spans(g: SlotTensorGeom, keep: int, granule: int,
+               cuts: Sequence[int] = ()) -> Tuple[Tuple[int, int], ...]:
     """The mapped ranges that keep slots ``[0, keep)`` of every layer:
     OUTWARD-rounded per layer (a granule holding one live byte stays), plus
     the allocation's slack behind the tensor (the caching allocator may place
-    a small block there). ``keep >= slots``: the whole allocation."""
+    a small block there). ``keep >= slots``: the whole allocation.
+
+    ``cuts`` (S1-Wisch, rc12z17 28.09.): the keep values a later phase may
+    take. The saver maps ONE extent per range and a live ``tms_set_spans``
+    keeps only extents wholly inside one range of the new plan -- every other
+    extent is released and its range mapped FRESH, i.e. its bytes are gone.
+    Cut at every layer start and at every such keep, each extent is one cell
+    of a lattice all these plans share: a live shrink frees whole cells above
+    the new end and never drops a cell it keeps."""
     alloc = int(g.alloc_bytes)
-    if int(keep) >= int(g.slots):
-        return ((0, alloc),)
     sb, S = int(g.slot_bytes), int(g.slots)
-    ranges = []
+    if int(keep) >= S:
+        ranges: Tuple[Tuple[int, int], ...] = ((0, alloc),)
+    else:
+        rl = []
+        for layer in range(int(g.layers)):
+            lo = layer * S * sb
+            rl.append((align_down(lo, granule), min(alloc, align_up(lo + max(0, int(keep)) * sb, granule))))
+        if alloc > g.tensor_bytes:
+            rl.append((align_down(g.tensor_bytes, granule), alloc))
+        ranges = _coalesce(rl)
+    if not cuts:
+        return ranges
+    points = []
     for layer in range(int(g.layers)):
         lo = layer * S * sb
-        ranges.append((align_down(lo, granule), min(alloc, align_up(lo + max(0, int(keep)) * sb, granule))))
+        points.append(align_down(lo, granule))
+        points.extend(min(alloc, align_up(lo + int(c) * sb, granule)) for c in cuts if 0 < int(c) < S)
     if alloc > g.tensor_bytes:
-        ranges.append((align_down(g.tensor_bytes, granule), alloc))
-    return _coalesce(ranges)
+        points.append(align_down(g.tensor_bytes, granule))
+    return split_at(ranges, points)
 
 
 @dataclass(frozen=True)
@@ -196,13 +234,40 @@ class RowTensorGeom:
     alloc_bytes: int
 
 
-def row_spans(g: RowTensorGeom, rows_on: int, granule: int) -> Tuple[Tuple[int, int], ...]:
+def row_spans(g: RowTensorGeom, rows_on: int, granule: int,
+              cuts: Sequence[int] = ()) -> Tuple[Tuple[int, int], ...]:
     """The mapped prefix for ``rows_on`` rows (outward rounded); every row a
-    kernel may touch lies in it. ``rows_on >= rows_max``: the allocation."""
+    kernel may touch lies in it. ``rows_on >= rows_max``: the allocation.
+
+    ``cuts`` (S1-Wisch, rc12z17 28.09.): the row counts a later phase may map.
+    rc12z17 10:51:24 had the LIVE bank mapped as ONE extent ``[0, R+C+33)``
+    and shrank it to ``R+C+23`` -- the saver released that extent (it is not
+    inside the smaller plan) and mapped the prefix fresh: residents, staging
+    and LRU rows of all 48 layers were gone, D decoded with uninitialised
+    experts (accept 2.3 -> 1.05) and its next sleep handed them to the store.
+    Cut at every such row count, a shrink releases only whole cells above the
+    new end."""
     alloc = int(g.alloc_bytes)
-    if int(rows_on) >= int(g.rows_max):
-        return ((0, alloc),)
-    return ((0, min(alloc, align_up(int(rows_on) * int(g.row_bytes), granule))),)
+    rb = int(g.row_bytes)
+    end = alloc if int(rows_on) >= int(g.rows_max) else min(alloc, align_up(int(rows_on) * rb, granule))
+    if not cuts:
+        return ((0, end),)
+    return split_at(((0, end),), (min(alloc, align_up(int(c) * rb, granule)) for c in cuts if int(c) > 0))
+
+
+def straddling(prev: Sequence[Tuple[int, int]],
+               new: Sequence[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+    """The first mapped extent of ``prev`` a live apply of ``new`` would
+    release WITH bytes the new plan keeps -- neither wholly inside one range
+    of ``new`` (kept, core.cpp ``set_spans``) nor disjoint from all of them
+    (freed whole). None: the apply keeps every byte it keeps."""
+    for a, b in prev:
+        if any(lo <= a and b <= hi for lo, hi in new):
+            continue
+        if all(b <= lo or a >= hi for lo, hi in new):
+            continue
+        return (int(a), int(b))
+    return None
 
 
 def phase_slot_limit(size: int, n: int, cap: int) -> int:
@@ -1037,6 +1102,12 @@ class SeatVram:
     cells: Dict[Tuple[int, int], StageCell] = field(default_factory=dict)
     #: the expert rows ON as last applied (the bank is born at k = 0)
     rows_on: int = 0
+    #: S1-Wisch (rc12z17 28.09.): every k a phase of this rank can take -- the
+    #: bank's span plans are cut at ``rows_boot + k`` for all of them
+    row_cut_ks: Tuple[int, ...] = ()
+    #: the last span plan set on each managed allocation; after its tag's
+    #: resume or a live apply it IS the saver's extents (one per range)
+    spans_by_ptr: Dict[int, Tuple[Tuple[int, int], ...]] = field(default_factory=dict)
 
     def __post_init__(self):
         x_max = min((int(getattr(c, "seat_rows", 0)) for c in self.caches), default=0)
@@ -1050,6 +1121,65 @@ class SeatVram:
                 extra_max=x_max, stage_tokens=self.form.tokens,
                 boot_rows_on=self.form.rows_on, granule=self.granule)
             check_form_against_cells(self.form, self.cells, self.cap)
+        ks = {0, int(self.form.rows_on) if self.form is not None else 0}
+        ks.update(int(r.extra_rows) for r in self.rows)
+        for c in self.cells.values():
+            ks.add(int(c.extra_rows))
+            if int(c.rows_full) >= 0:
+                ks.add(int(c.rows_full))
+        self.row_cut_ks = tuple(sorted(k for k in ks if 0 <= k <= max(0, x_max)))
+        # the extents the birth trims left (seat_expert_buffer: the cap form's
+        # rows; kv_stage_born: stage S0), both one range per span, no cuts
+        for m in self.row_tensors:
+            self.spans_by_ptr.setdefault(int(m.ptr), row_spans(m.geom, m.geom.rows_boot, self.granule))
+        if self.form is not None:
+            for m in self.kv_tensors:
+                self.spans_by_ptr.setdefault(int(m.ptr), slot_spans(
+                    m.geom.geom, m.geom.slots_for(self.form.tokens[0]), self.granule))
+
+    def bank_spans(self, m: "_Managed", k: int) -> Tuple[Tuple[int, int], ...]:
+        """The bank tensor's plan for ``k`` rows ON, cut at every k a phase
+        can take (``row_spans`` cuts)."""
+        return row_spans(m.geom, m.geom.rows_boot + int(k), self.granule,
+                         cuts=[m.geom.rows_boot + c for c in self.row_cut_ks])
+
+    def kv_spans(self, m: "_Managed", tokens: int) -> Tuple[Tuple[int, int], ...]:
+        """A KV tensor's plan for a stage of ``tokens``, cut at every stage."""
+        cuts = [m.geom.slots_for(t) for t in self.form.tokens] if self.form is not None else []
+        return slot_spans(m.geom.geom, m.geom.slots_for(tokens), self.granule, cuts=cuts)
+
+    def refuse_wipes(self, plans: Sequence[Tuple[int, str, Tuple[Tuple[int, int], ...], bool]]) -> None:
+        """BEFORE anything moves: a live plan that would release an extent
+        holding bytes the plan keeps stops by name (the saver maps a released
+        range FRESH -- rc12z17's wiped bank). Nothing was changed then."""
+        for ptr, name, spans, live in plans:
+            prev = self.spans_by_ptr.get(int(ptr))
+            if not live or prev is None:
+                continue
+            cut = straddling(prev, spans)
+            if cut is not None:
+                raise Weg2DSeatVramRefused(
+                    "%s %s: a live apply would release the mapped extent [%d, %d) of %s, "
+                    "whose bytes the new plan keeps -- the saver maps a released range "
+                    "fresh (rc12z17 10:51:24: the whole expert bank). Nothing was changed."
+                    % (LINE_MARK, WIPE_CODE, cut[0], cut[1], name))
+
+    def set_plan(self, ptr: int, name: str, spans: Tuple[Tuple[int, int], ...], *,
+                 live: bool, census: Optional[Dict[str, int]] = None) -> None:
+        """``tms_set_spans`` of one managed allocation, recorded; a live one
+        counts its extents kept / cells freed / cells mapped into ``census``."""
+        prev = self.spans_by_ptr.get(int(ptr))
+        if live and census is not None and prev is not None:
+            kept = [e for e in prev if any(lo <= e[0] and e[1] <= hi for lo, hi in spans)]
+            census["kept"] += len(kept)
+            census["freed"] += sum(1 for a, b in prev if all(b <= lo or a >= hi for lo, hi in spans))
+            census["mapped"] += sum(1 for r in spans if r not in kept)
+            census["tensors"] += 1
+        rc = self.spans.set_spans(ptr, spans, now=live)
+        if rc != 0:
+            raise Weg2DSeatVramRefused("%s: tms_set_spans(%s, now=%s) rc=%d"
+                                       % (LINE_MARK, name, live, rc))
+        self.spans_by_ptr[int(ptr)] = tuple(spans)
 
     @classmethod
     def from_runtime(cls, *, cap: int, req_to_token_pool, model, spans: Optional[TmsSpans] = None,
@@ -1104,7 +1234,11 @@ class SeatVram:
         allocations get a plan (mapped at their tag's resume), mapped ones move
         in place. A LIVE bank that shrinks turns its rows OFF in the tables
         first and synchronizes before a page goes (a row a kernel may still
-        read is never unmapped); one that grows maps first, then turns ON."""
+        read is never unmapped); one that grows maps first, then turns ON.
+        Every plan is cut at the lattice of all phases (``bank_spans`` /
+        ``kv_spans``): a live move releases only whole cells above the new
+        end -- rc12z17's single-extent bank was released WHOLE by the shrink
+        33 -> 23 and mapped fresh (``refuse_wipes`` stops that by name)."""
         import torch
 
         n = max(1, min(int(n), self.cap))
@@ -1124,6 +1258,17 @@ class SeatVram:
         experts_live = any(
             (lambda i: i is not None and i.active)(self.spans.info(m.ptr))
             for m in self.row_tensors)
+        tokens = int(self.form.tokens[j])
+        kv_plans = []
+        for m in self.kv_tensors:
+            info = self.spans.info(m.ptr)
+            kv_plans.append((m, self.kv_spans(m, tokens), info is not None and info.active))
+        bank_plans = []
+        for m in self.row_tensors:
+            info = self.spans.info(m.ptr)
+            bank_plans.append((m, self.bank_spans(m, k), info is not None and info.active))
+        self.refuse_wipes([(m.ptr, m.geom.geom.name, sp, lv) for m, sp, lv in kv_plans]
+                          + [(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
         shrink = k < int(self.rows_on)
         if shrink:
             for cache in self.caches:
@@ -1142,30 +1287,19 @@ class SeatVram:
                                                % (LINE_MARK, m.geom.name, rc))
         if self.mamba_pool is not None and self.slot_tensors:
             self.mamba_pool._weg2_seat_keep = None if keep > self.pool_size else int(keep)
-        tokens = int(self.form.tokens[j])
-        for m in self.kv_tensors:
-            info = self.spans.info(m.ptr)
-            live = info is not None and info.active
-            rc = self.spans.set_spans(
-                m.ptr, slot_spans(m.geom.geom, m.geom.slots_for(tokens), self.granule), now=live)
-            if rc != 0:
-                raise Weg2DSeatVramRefused("%s: tms_set_spans(%s, now=%s) rc=%d"
-                                           % (LINE_MARK, m.geom.geom.name, live, rc))
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        for m, sp, live in kv_plans:
+            self.set_plan(m.ptr, m.geom.geom.name, sp, live=live, census=census)
         page = int(self.kv_tensors[0].geom.token_pad) if self.kv_tensors else 0
         for pool in self.kv_pools:
             # zero_kv_data_buffers (the idle flush) writes only mapped rows
             bound_stage_rows(pool, tokens + page)
-        for m in self.row_tensors:
-            info = self.spans.info(m.ptr)
-            live = info is not None and info.active
-            rc = self.spans.set_spans(
-                m.ptr, row_spans(m.geom, m.geom.rows_boot + k, self.granule), now=live)
-            if rc != 0:
-                raise Weg2DSeatVramRefused("%s: tms_set_spans(%s, now=%s) rc=%d"
-                                           % (LINE_MARK, m.geom.name, live, rc))
+        for m, sp, live in bank_plans:
+            self.set_plan(m.ptr, m.geom.name, sp, live=live, census=census)
         if not shrink:
             for cache in self.caches:
                 cache.set_seat_rows_on(k, device_write=experts_live)
+        log_live_spans(census, n=n, stage=j, rows_from=int(self.rows_on), rows_to=k)
         self.rows_on = k
         applied = PhaseApplied(
             n=n, extra_rows=k,
@@ -1205,20 +1339,21 @@ class SeatVram:
             # MambaPool.reset_state (the flush at the wake and before the next
             # sleep) zeroes only the slots that have pages
             self.mamba_pool._weg2_seat_keep = None if keep > self.pool_size else int(keep)
-        experts_live = False
+        bank_plans = []
         for m in self.row_tensors:
             info = self.spans.info(m.ptr)
-            live = info is not None and info.active
-            experts_live = experts_live or live
-            rc = self.spans.set_spans(
-                m.ptr, row_spans(m.geom, m.geom.rows_boot + k, self.granule), now=live)
-            if rc != 0:
-                raise Weg2DSeatVramRefused("%s: tms_set_spans(%s, now=%s) rc=%d"
-                                           % (LINE_MARK, m.geom.name, live, rc))
+            bank_plans.append((m, self.bank_spans(m, k), info is not None and info.active))
+        self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
+        experts_live = any(lv for _m, _sp, lv in bank_plans)
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        for m, sp, live in bank_plans:
+            self.set_plan(m.ptr, m.geom.name, sp, live=live, census=census)
         # the tables: written now when the bank is mapped (the wake's rearm
         # already ran), else recorded for the rearm's reinit
         for cache in self.caches:
             cache.set_seat_rows_on(k, device_write=experts_live)
+        log_live_spans(census, n=n, stage=None, rows_from=int(self.rows_on), rows_to=int(k))
+        self.rows_on = int(k)
         applied = PhaseApplied(
             n=n, extra_rows=int(k),
             mamba_mapped=sum(span_bytes(slot_spans(m.geom, keep, self.granule))
@@ -1241,6 +1376,20 @@ class SeatVram:
                self.fixed_bytes / _MIB)
             for r in self.rows
         ]
+
+
+def log_live_spans(census: Dict[str, int], *, n: int, stage: Optional[int], rows_from: int,
+                   rows_to: int) -> None:
+    """The metal marker of a live apply (none when every allocation was
+    paused: a plan moves no byte). ``wiped=0`` by construction --
+    ``refuse_wipes`` stopped the apply otherwise."""
+    if not census.get("tensors"):
+        return
+    logger.info(
+        "%s n=%d stage=%s rows_on %d->%d tensors=%d extents_kept=%d cells_freed=%d "
+        "cells_mapped=%d wiped=0 (a live move releases whole lattice cells only)",
+        LIVE_MARK, int(n), "-" if stage is None else "S%d" % int(stage), int(rows_from),
+        int(rows_to), census["tensors"], census["kept"], census["freed"], census["mapped"])
 
 
 # ---------------------------------------------------------------------------
