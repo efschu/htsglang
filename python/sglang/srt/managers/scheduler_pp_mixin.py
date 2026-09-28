@@ -9355,6 +9355,50 @@ class SchedulerPPMixin:
                     ]
                 except Exception:  # noqa: BLE001 - peek is advisory only
                     _missing = []
+                # #791T -- THE FRAME MUST NOT OVERTAKE ITS STORE-TOLD EITHER
+                # (rc12z20 27B proof boot 13:03:27, PP2 weg2-0-8): the request
+                # hop (r24) had landed, so the rid was LOCATABLE and the check
+                # above let the frame through -- but PP0's Weg2StoreTold (r25)
+                # rides the same request chain one hop later and was still in
+                # flight. The plan then skipped the rid (weg2_store_told_pending)
+                # and the forwarded schedule died as #791 UNEXECUTABLE. A queued
+                # rid that the told gate would skip right now is the same "hop in
+                # flight" as an unlocatable one: same defer, same chain hedge,
+                # same RowDeferCap bound and named stop. Never a drop, never a
+                # plan without the told.
+                _told_missing = []
+                if _row_raw is not None:
+                    try:
+                        from sglang.srt.weg2 import p_intake as _p_intake_791t
+
+                        _queued = {
+                            getattr(r, "rid", None): r for r in self.waiting_queue
+                        }
+                        _told_missing = [
+                            e.rid
+                            for e in _peek.entries
+                            if e.admitted
+                            and not e.retracted
+                            and e.rid not in _missing
+                            and e.rid in _queued
+                            and _p_intake_791t.told_pending(self, _queued[e.rid])
+                        ]
+                    except Exception:  # noqa: BLE001 - peek is advisory only
+                        _told_missing = []
+                if _told_missing:
+                    stats["defer_told"] = stats.get("defer_told", 0) + 1
+                    if stats["defer_told"] <= 8 or stats["defer_told"] % 1024 == 0:
+                        logger.info(
+                            "#791T ROW-PROBE DEFER slot=%s: frame's row admits %d "
+                            "rid(s) whose Weg2StoreTold has not reached this rank "
+                            "(first=%s) -- the told hop is still in flight; frame "
+                            "left in the inbox (defer_told=%d).",
+                            mb_id,
+                            len(_told_missing),
+                            str(_told_missing[0])[:8],
+                            stats["defer_told"],
+                        )
+                    _missing = list(_missing) + list(_told_missing)
                 if _missing:
                     stats["defer_rid"] = stats.get("defer_rid", 0) + 1
                     _dr = stats["defer_rid"]
@@ -9379,6 +9423,15 @@ class SchedulerPPMixin:
                         _cap = RowDeferCap()
                         self._pp_row_defer_cap = _cap
                     _verdict = _cap.observe(mb_id, _missing, token=stamp)
+                    if not _verdict.defer and _told_missing:
+                        _trace("defer_told_cap")
+                        raise PpRowDeferCapExceeded(
+                            "#791T STORE-TOLD HOP OVERDUE: the frame's row admits "
+                            f"rid(s) {','.join(str(r)[:8] for r in _told_missing[:4])} "
+                            "whose Weg2StoreTold never reached this rank within the "
+                            "row-defer lap cap (the request is queued here, its "
+                            "told is not) -- " + str(_verdict.message)
+                        )
                     if not _verdict.defer:
                         # RAENGE-NIE-UNEINS: a detected disagreement is a
                         # bounded, named stop -- never a compensation. This
