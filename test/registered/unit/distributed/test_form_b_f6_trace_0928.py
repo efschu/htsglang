@@ -261,3 +261,127 @@ def test_the_checker_catches_a_divergence():
             2: ({"tp": (0, 1, 2), "dcp": (0, 1, 2), "model_tp": (2,)}, [])}
     with pytest.raises(AssertionError, match="dcp"):
         _assert_lockstep(fake)
+
+
+# ---------------------------------------------------------------------------
+# F6 wired: the same claim on the PRODUCT paths. Real parallel_state groups
+# (tp, dcp, model_tp from the installed partition), real call sites: a
+# RowParallelLinear built under rank_form.form_b_build_context and run forward
+# (its all-reduce is tensor_model_parallel_all_reduce -> model_tp), the dcp
+# primitives on get_dcp_group(), attention_tensor_model_parallel_all_reduce,
+# the draft vocab gather tensor_model_parallel_all_gather, the spec channel on
+# its default group, the reversed guard at a control site. The recorder wraps
+# GroupCoordinator's methods (the same seam the GPU half's sitecustomize
+# records at), so what is checked is what the product issued.
+# ---------------------------------------------------------------------------
+_GC_OPS = ("all_reduce", "all_gather", "broadcast", "all_gather_into_tensor",
+           "reduce_scatter_tensor")
+
+
+def _record_groups(ps, rec):
+    GC = ps.GroupCoordinator
+    for op in _GC_OPS:
+        orig = getattr(GC, op)
+
+        def wrap(orig=orig, op=op):
+            def f(self, *a, **k):
+                t = a[0] if a else None
+                rec.append((self.unique_name.split(":")[0], op,
+                            tuple(getattr(t, "shape", ())), str(getattr(t, "dtype", ""))))
+                return orig(self, *a, **k)
+            return f
+        setattr(GC, op, wrap())
+
+
+def _run_product(rank, port, out_dir, case):
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank),
+                      WORLD_SIZE=str(WORLD), LOCAL_RANK=str(rank))
+    from sglang.srt.distributed import parallel_state as ps
+    from sglang.srt.distributed.utils import set_tp_partition_ratios
+
+    _orig = ps.init_model_parallel_group
+    ps.init_model_parallel_group = lambda *a, **k: _orig(*a, **{
+        **k, "use_pynccl": False, "use_custom_allreduce": False,
+        "use_mscclpp_allreduce": False, "use_torch_symm_mem_allreduce": False,
+        "use_message_queue_broadcaster": False})
+    ps.init_distributed_environment(world_size=WORLD, rank=rank, local_rank=rank,
+                                    distributed_init_method=f"tcp://127.0.0.1:{port}",
+                                    backend="gloo")
+    ps.set_model_tp_partition([list(W)] + [[k] for k in K])
+    ps.is_cuda = lambda: True                         # DCP's platform gate; groups are gloo
+    ps.initialize_model_parallel(tensor_model_parallel_size=WORLD,
+                                 decode_context_parallel_size=WORLD, backend="gloo")
+    set_tp_partition_ratios([3, 1, 0], allow_zero=True)
+    rec = []
+    _record_groups(ps, rec)
+    torch.manual_seed(rank)
+
+    from sglang.srt import rank_form as rf
+    from sglang.srt.distributed import communication_op as co
+    from sglang.srt.layers.dcp.comm import cp_all_gather_heads_uneven, cp_lse_ag_out_ar_mha_uneven
+    from sglang.srt.rank_role import COLLECTIVE_CONTROL, guard_collective_subgroup
+    from sglang.srt.speculative import form_b_spec as fbs
+
+    guard_collective_subgroup(COLLECTIVE_CONTROL, ps.get_tp_group(), "scheduler.tp_group")
+    o_proj = mlp = None
+    if rank in W:
+        from sglang.srt.layers.linear import RowParallelLinear
+
+        with rf.form_b_build_context(rank):
+            o_proj = RowParallelLinear(16, 8, bias=False, params_dtype=torch.float32)
+            mlp = RowParallelLinear(32, 8, bias=False, params_dtype=torch.float32)
+    else:
+        with pytest.raises(rf.RankFormKvRankBuild):
+            rf.form_b_build_context(rank)
+    dcp = ps.get_dcp_group()
+    kv_counts, q_counts = [1, 1, 0], [3, 1, 0]
+    for layer in range(8):                            # full attention every 4th, as the 27B
+        if layer % 4 == 3:
+            cp_all_gather_heads_uneven(torch.randn(2 * T, kv_counts[rank], D), dcp, kv_counts)
+            cp_all_gather_heads_uneven(torch.randn(T, q_counts[rank], D), dcp, q_counts)
+            cp_lse_ag_out_ar_mha_uneven(torch.randn(T, 4, D), torch.randn(T, 4), dcp, q_counts)
+        if rank in W:
+            o_proj(torch.randn(T, o_proj.input_size_per_partition))
+            co.attention_tensor_model_parallel_all_reduce(torch.randn(T, 8))
+            mlp(torch.randn(T, mlp.input_size_per_partition))
+    fbs.set_spec_k_max(3)
+    for k_lead in (1, 3, 2):
+        k = fbs.spec_k(k_lead if rank == 0 else None)
+        for _ in range(k):
+            if rank in W:
+                co.tensor_model_parallel_all_gather(torch.randn(2, 2), dim=-1)
+        fbs.broadcast_padded(torch.zeros(2, k, dtype=torch.int64) if rank == 0 else None,
+                             (2, k), fbs.draft_block_numel(2), dtype=torch.int64, device="cpu")
+        fbs.broadcast_padded_inplace(torch.zeros(2 * (2 * (k + 1) + 1), dtype=torch.int32),
+                                     fbs.accept_numel(2))
+    ps.get_tp_group().broadcast(torch.zeros(4), src=0)     # a control op over ALL ranks
+    parts = {"tp": tuple(ps.get_tp_group().ranks), "dcp": tuple(dcp.ranks),
+             "model_tp": tuple(ps.get_model_tp_group().ranks)}
+    with open(os.path.join(out_dir, f"{case}.{rank}.pkl"), "wb") as f:
+        pickle.dump((rank, [parts["tp"], parts["dcp"], parts["model_tp"]], rec), f)
+    fbs.set_spec_k_max(None)
+    set_tp_partition_ratios(None)
+    ps.destroy_model_parallel()
+    ps.set_model_tp_partition(None)
+    ps.destroy_distributed_environment()
+
+
+def test_form_b_product_paths_run_one_sequence_per_communicator():
+    d = tempfile.mkdtemp()
+    mp.spawn(_run_product, args=(_free_port(), d, "form_b_product"), nprocs=WORLD, join=True)
+    traces = {}
+    for r in range(WORLD):
+        with open(os.path.join(d, f"form_b_product.{r}.pkl"), "rb") as f:
+            rank, parts, rec = pickle.load(f)
+        traces[rank] = (dict(zip(("tp", "dcp", "model_tp"), parts)), rec)
+    _assert_lockstep(traces)
+    assert traces[0][0]["model_tp"] == (0, 1) and traces[2][0]["model_tp"] == (2,)
+    assert traces[0][0]["tp"] == traces[2][0]["tp"] == (0, 1, 2)
+    # the KV-only rank never enters model_tp; W does -- o_proj, attn, MLP per
+    # layer (8 x 3 all_reduce) and the draft vocab gathers (1 + 3 + 2)
+    assert not [e for e in traces[2][1] if e[0] == "model_tp"]
+    mt = [e[1] for e in traces[0][1] if e[0] == "model_tp"]
+    assert mt.count("all_reduce") == 24 and mt.count("all_gather") == 6
+    # the layer traffic never touched the all-ranks tp group: one control op
+    assert [e[1] for e in traces[0][1] if e[0] == "tp"] == ["broadcast"]
+    assert [e[1] for e in traces[2][1] if e[0] == "tp"] == ["broadcast"]

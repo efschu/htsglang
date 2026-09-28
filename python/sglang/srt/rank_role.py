@@ -297,14 +297,25 @@ SEAM_LIST: Tuple[Seam, ...] = (
     Seam(
         "F6",
         "a collective over a SUBSET of the ranks",
-        "distributed/parallel_state.py:1042-1068 (one communicator per "
-        "GroupCoordinator; barlink knows no subgroups)",
-        wired=False,
-        note="Form A's decode path needs no subgroup as long as the MoE "
-        "exchange spans all ranks; it becomes necessary when the dense "
-        "layers want a collective the workers must not join.",
+        "distributed/parallel_state.py init_model_tp_group / get_model_tp_group / "
+        "get_attn_tp_layer_group (Form B's model_tp: its own GroupCoordinator, gloo "
+        "cpu_group and barlink communicator), distributed/communication_op.py "
+        "(tensor_model_parallel_* on model_tp), rank_role.py "
+        "guard_collective_subgroup (control never on model_tp, layer never on tp), "
+        "speculative/form_b_spec.py (spec_k + fixed-form broadcasts over dcp), "
+        "rank_form.py (check_form_b_windows W187, form_b_build_context)",
+        wired=True,
+        note="F6 steps 2-6 + 2c (28.09., FORM-B-F6-ENTWURF-0928 v2): the "
+        "subgroup exists and every layer collective reaches it; the "
+        "scheduler group stays ALL ranks (NF objection 1). Proven on CPU by "
+        "test_form_b_f6_trace_0928 (product paths: one sequence per "
+        "communicator). What a Form B BOOT still needs is seam F15.",
         anchors=(
-            ("distributed/parallel_state.py", 618, "class GroupCoordinator"),
+            ("distributed/parallel_state.py", 3087, "def init_model_tp_group"),
+            ("distributed/communication_op.py", 27,
+             "get_model_tp_group().all_reduce(input_)"),
+            ("rank_role.py", 1002, "def guard_collective_subgroup"),
+            ("speculative/form_b_spec.py", 145, "def spec_k("),
         ),
     ),
     Seam(
@@ -475,6 +486,30 @@ SEAM_LIST: Tuple[Seam, ...] = (
              "class FormAWorkerNullStorage"),
         ),
     ),
+    # ---- Form B (rank form 28.09.): the boot path on top of F6 ----
+    Seam(
+        "F15",
+        "Form B's boot path: the vectors admitted, the model_tp partition "
+        "installed from them, the KV-only ranks built and run",
+        "server_args.py (--rank-tp-ratio zeros admitted only with --rank-role "
+        "or the lane), model_executor/model_runner.py (form_b_build_context "
+        "refuses a KV-only rank, W188; nobody calls set_model_tp_partition "
+        "before initialize_model_parallel), rank_form.py "
+        "(RankFormKvRankBuild; check_form_b_windows has no launcher caller)",
+        wired=False,
+        note="Open: (1) server_args admits a Form B vector by name and "
+        "installs FormBPlan.model_tp_partition before initialize_model_parallel; "
+        "(2) a KV-only rank builds on meta (no weight load) and runs the "
+        "attention-only forward with [T, 0, D] (the lane worker's shape, "
+        "N1/N9); (3) the DFLASH draft-hidden and selector broadcasts move off "
+        "tp for Form B (K ranks skip them); (4) the weg2 launcher calls "
+        "check_form_b_windows (W187) before any rank loads.",
+        anchors=(
+            ("rank_form.py", 637, "class RankFormKvRankBuild"),
+            ("model_executor/model_runner.py", 2840,
+             "form_b_build_context(self.tp_rank)"),
+        ),
+    ),
 )
 
 SEAMS: Dict[str, Seam] = _index_seams(SEAM_LIST)
@@ -482,7 +517,7 @@ SEAMS: Dict[str, Seam] = _index_seams(SEAM_LIST)
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F6",)
+UNWIRED_ORDER: Tuple[str, ...] = ("F15",)
 
 #: #239 S3e: the seams a real boot of the token cut (kv=qsa_forma_dcp) stands
 #: on -- F4 (a worker's KV share), F5 (the LSE merge with zero-head ranks),

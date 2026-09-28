@@ -52,7 +52,7 @@ def test_form_a_runs_on_the_existing_lane():
     ([1, 0], [1, 1, 1], rf.RankFormShapeMismatch),
     ([1, 0, 0], [50, 50, 0], rf.RankFormShapeMismatch),   # KV-only rank holding nothing
     ([1, -1, 0], None, rf.RankFormShapeMismatch),
-    ([77, 23, 0], None, rf.RankFormSubgroupTpNotWired),   # B needs F6
+    ([77, 23, 0], None, rf.RankFormKvRankBuild),          # B: F6 wired, boot path F15 not
 ])
 def test_nonsense_is_refused_by_name(w, t, cls):
     with pytest.raises(cls) as ei:
@@ -245,16 +245,25 @@ def test_second_token_vector_source_is_refused_by_name():
     assert _lane_args(uneven_token_vector="2,49,49").uneven_weighted_dcp_enabled()
 
 
-def test_form_b_waits_for_the_f6_seam_itself(monkeypatch):
+def test_form_b_waits_for_its_seams_themselves(monkeypatch):
+    """F6 (subgroup collectives) is wired since 28.09.; Form B still waits for
+    its boot path F15 -- both read from THE registry, never from a caller."""
     from sglang.srt import rank_role
 
-    assert rank_role.SEAMS["F6"].wired is False
-    with pytest.raises(rf.RankFormSubgroupTpNotWired):
+    def _seam(sid, wired):
+        monkeypatch.setitem(rank_role.SEAMS, sid, rank_role.SEAMS[sid].__class__(
+            **{**rank_role.SEAMS[sid].__dict__, "wired": wired}))
+
+    assert rank_role.SEAMS["F6"].wired is True and rank_role.SEAMS["F15"].wired is False
+    with pytest.raises(rf.RankFormKvRankBuild, match="W188.*F15"):
         rf.resolve_rank_form([77, 23, 0], [10, 45, 45])       # reads the registry
-    monkeypatch.setitem(rank_role.SEAMS, "F6",
-                        rank_role.SEAMS["F6"].__class__(**{**rank_role.SEAMS["F6"].__dict__, "wired": True}))
-    b = rf.resolve_rank_form([77, 23, 0], [10, 45, 45])
-    assert b.kind == rf.FORM_B
+    _seam("F6", False)
+    with pytest.raises(rf.RankFormSubgroupTpNotWired, match="W182"):
+        rf.resolve_rank_form([77, 23, 0], [10, 45, 45])
+    _seam("F6", True)
+    _seam("F15", True)
+    assert rf.resolve_rank_form([77, 23, 0], [10, 45, 45]).kind == rf.FORM_B
+    assert rank_role.UNWIRED_ORDER == ("F15",)
 
 
 def test_form_b_plan_keeps_the_scheduler_group_on_all_ranks():

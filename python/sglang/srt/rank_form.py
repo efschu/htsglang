@@ -20,9 +20,10 @@ nothing). The three forms of the 27B-NVFP4 question
                                       (--weightless-kv-fastlane, #115/#131/#143):
                                       head = that rank, TP=1 collective-free,
                                       every other rank KV-only
-  B  >= 2 ranks have weights and      TP over a SUBSET of the DCP group; needs
-     >= 1 rank has none               rank_role seam F6 (collectives over a
-                                      subgroup), not wired -> refused by name
+  B  >= 2 ranks have weights and      TP over a SUBSET of the DCP group: the
+     >= 1 rank has none               subgroup collectives are rank_role seam F6
+                                      (wired: model_tp); the boot path is seam
+                                      F15, not wired -> refused by name (W188)
 
 NO flag of its own (user 28.09.: one mechanism with NF's #239): the vectors
 ARE NF's #239 flags -- ``--rank-tp-ratio`` (0 = no dense share), ``--rank-role``
@@ -150,6 +151,15 @@ def f6_wired() -> bool:
     return bool(SEAMS["F6"].wired)
 
 
+def f15_wired() -> bool:
+    """Form B's second precondition (rank_role F15): its boot path -- the
+    flag admission, the partition installed from the vectors, the KV-only
+    ranks' construction and forward, the W187 launcher call."""
+    from sglang.srt.rank_role import SEAMS
+
+    return bool(SEAMS["F15"].wired)
+
+
 def resolve_rank_form(
     weights: Sequence,
     tokens: Optional[Sequence] = None,
@@ -167,7 +177,9 @@ def resolve_rank_form(
 
     Refusals: no weight rank (W180); vectors of different length (W181); a
     KV-only rank without token share -- it would hold nothing and still sit in
-    every collective (W181); form B while seam F6 is not wired (W182)."""
+    every collective (W181); form B while seam F6 is not wired (W182), or while
+    its boot path, seam F15, is not (W188). ``subgroup_tp_wired`` given
+    explicitly answers both for a hypothetical (planner, tests)."""
     w = _ints(weights, "weight shares")
     if not w:
         raise _refuse(RankFormShapeMismatch, "no ranks")
@@ -215,6 +227,14 @@ def resolve_rank_form(
                 f"weights {list(w)}: TP over ranks {list(weight_ranks)} with KV-only rank(s) "
                 f"{list(kv_only)} needs collectives over a subgroup (rank_role seam F6, "
                 f"wired=False) -- the TP all-reduce would include the KV-only ranks")
+        if subgroup_tp_wired is None and not f15_wired():
+            raise _refuse(
+                RankFormKvRankBuild,
+                f"weights {list(w)}: the subgroup collectives exist (F6), but Form B's boot path "
+                f"does not yet -- --rank-tp-ratio zeros without --rank-role are refused by the "
+                f"flag layer, no caller installs the model_tp partition, and the KV-only rank(s) "
+                f"{list(kv_only)} have no construction/forward path (rank_role seam F15, "
+                f"wired=False)")
     return RankForm(kind=kind, weights=w, tokens=t, weight_ranks=weight_ranks,
                     kv_only_ranks=kv_only, backend=backend)
 
