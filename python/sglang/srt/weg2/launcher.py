@@ -16550,7 +16550,15 @@ def log_wake_credit_solve(ns, cards: List[Card], fits, log, label: str, *,
         n_layers=int(fits[0].n_layers), ratios=ratios, p_rows=p_rows, d_rows=d_rows,
         slot_mib=float(fits[0].slot_mib),
         p_resident=[_er.resident_rows(num_experts, float(f)) for f in fr_pp],
-        d_resident=[int(f.resident_rows) for f in fits])
+        d_resident=[int(f.resident_rows) for f in fits],
+        # #239 S3h2: under the KV token cut the kv_cache tag per rank (KV pool
+        # from the SOLVED cut + the mamba state pool); None without the cut.
+        kv_first_mib=([float(f.kv_mib) + float(f.mamba_mib) for f in fits]
+                      if all(float(getattr(f, "kv_token_share", -1.0)) >= 0.0 for f in fits)
+                      else None),
+        kv_cut_shares=([float(f.kv_token_share) for f in fits]
+                       if all(float(getattr(f, "kv_token_share", -1.0)) >= 0.0 for f in fits)
+                       else None))
     if wplan.refusal is not None:
         log(f"{_wc.MARKER} {wplan.refusal}")
         raise Weg2LaunchRefused(wplan.refusal)
@@ -16561,7 +16569,8 @@ def log_wake_credit_solve(ns, cards: List[Card], fits, log, label: str, *,
 def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
                              chunk_layers: int, n_layers: int, ratios, p_rows, d_rows,
                              slot_mib: float, p_resident=None,
-                             d_resident=None) -> Optional[str]:
+                             d_resident=None, kv_first_mib=None,
+                             kv_cut_shares=None) -> Optional[str]:
     """H34: der Wake P->D der geplanten Form, je Karte in Millisekunden.
 
     fnFL2x141: im P->D-Wake wartet D TP2 (nvml2) 73-94 ms an weights_4 und
@@ -16602,6 +16611,8 @@ def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
                 parse_group_env(getattr(ns, "env_d", "") or "")),
             # #242r: die Geometrie des PP-Cut-Solves fuer den Umschnitt
             recut_geometry=getattr(ns, "_pcut_recut_geometry", None),
+            # #239 S3h2: the KV-first verdict per rank under the token cut
+            kv_first_mib=kv_first_mib, kv_cut_shares=kv_cut_shares,
         )
     except (KeyError, ValueError, IndexError) as _exc:
         log(f"{_wpd.MARKER} {_wpd.DIRECTION} {label} failed: {type(_exc).__name__}: {_exc}")
