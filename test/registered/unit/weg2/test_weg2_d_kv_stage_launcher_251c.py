@@ -171,8 +171,12 @@ def test_dry_run_of_the_nf_form_writes_the_stage_form():
     env = L.parse_group_env(ns.env_d)
     rows = int(env["SGLANG_WEG2_D_KV_STAGE_ROWS"])
     assert env["SGLANG_WEG2_D_KV_STAGE_TOKENS"] == "262144,393216,524288"
-    assert env["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"] == "%d,0,0" % (14 + rows)
-    assert env["SGLANG_MOE_SCRATCH_SLOTS"] == "%d,48,48" % (100 - rows)
+    # #239 S3g (main 28.09. ~19:40Z): the workers' QSA keys follow the stage from
+    # 3 of their own rows (262144 x 768 B over 112.5-MiB rows) instead of being
+    # mapped at the top stage against an S0 booking
+    assert env["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"] == "%d,3,3" % (14 + rows)
+    assert env["SGLANG_MOE_SCRATCH_SLOTS"] == "%d,45,45" % (100 - rows)
+    assert env["SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK"] == "%d,3,3" % rows
     assert len(env["SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS"].split(",")) == 6
     assert any("D-KV-STUFEN (#251c)" in ln for ln in lines)
 

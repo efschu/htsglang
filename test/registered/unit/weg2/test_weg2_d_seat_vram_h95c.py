@@ -855,7 +855,8 @@ def test_dry_run_of_the_x177_form_writes_the_rows_into_env_d():
     # takes them from its scratch) -- the H95c seat rows themselves are 14
     env = L.parse_group_env(ns.env_d)
     stage = int(env.get("SGLANG_WEG2_D_KV_STAGE_ROWS", "0"))
-    assert env["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"] == "%d,0,0" % (14 + stage)
+    # #239 S3g: the workers' QSA keys follow the stage from 3 rows of their own
+    assert env["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"] == "%d,3,3" % (14 + stage)
     assert env["SGLANG_OPT_WEG2_D_SEAT_VRAM"] == "1"
 
 
