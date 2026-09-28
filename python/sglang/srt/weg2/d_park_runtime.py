@@ -477,16 +477,22 @@ def _partial_keep(sched, victim, older_req) -> str:
     the free rows (0 on a seat trigger: a pure pause, empty window). Module
     missing / raising: today's retain (LRU eviction) -- the displacement stands.
     Returns what is logged as pages_out."""
+    def _n(x) -> int:
+        # never ``x or ()``: on D ``prefix_indices`` is a torch tensor and its
+        # truth value raises (review 28.09., the 7e227e5f76 class) -- which the
+        # except below turned into a silent "?" and no keep_role call
+        return 0 if x is None else len(x)
+
     try:
-        span = len(getattr(victim, "origin_input_ids", None) or ()) + len(
-            getattr(victim, "output_ids", None) or ())
+        span = _n(getattr(victim, "origin_input_ids", None)) + _n(
+            getattr(victim, "output_ids", None))
         tree = getattr(sched, "tree_cache", None)
         page = int(getattr(tree, "page_size", 1) or 1)
         shortfall = 0
         if older_req is not None:
-            need = len(getattr(older_req, "origin_input_ids", None) or ()) + len(
-                getattr(older_req, "output_ids", None) or ()) - len(
-                getattr(older_req, "prefix_indices", None) or ())
+            need = _n(getattr(older_req, "origin_input_ids", None)) + _n(
+                getattr(older_req, "output_ids", None)) - _n(
+                getattr(older_req, "prefix_indices", None))
             alloc = getattr(sched, "token_to_kv_pool_allocator", None)
             free = int(alloc.available_size()) if alloc is not None else 0
             shortfall = max(0, int(need) - free)
