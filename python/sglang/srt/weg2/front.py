@@ -2063,6 +2063,51 @@ def named_error_chunk(path: str, message: str) -> bytes:
     return b"data: " + json.dumps(body).encode() + b"\n\n"
 
 
+#: How long a client should wait before re-sending a request the front refused
+#: from STATE (a store hand-back that did not land, a blocked hand-off, a
+#: re-offer loop). One flip pair clears most of those; the number is a hint in
+#: the Retry-After header, never a bound the front enforces.
+STATE_REFUSAL_RETRY_AFTER_S = 5
+
+
+def refusal_status(measured_tokens: Optional[int], static_capacity: int) -> int:
+    """HTTP status of a NAMED terminal refusal: 413 only for a real size fault.
+
+    413 says "this request is too large for this server" -- Claude Code reads
+    it as "Request too large" and abandons the whole agent, so it may only be
+    sent when a MEASURED length (an exact prompt-token count, never the char
+    estimate) exceeds a STATIC capacity of the form (``carrier_max_tokens``,
+    fixed at launch). Every other refusal -- the store handed nothing back, D
+    refused a request well inside the form's capacity, the state of a group
+    blocked the hand-off -- is a condition that can change, so it is a 503
+    with Retry-After (rc12z30d 21:11:35: W53 answered 413 for a 17,053-token
+    prompt against carrier_max 314,553, and the agent died on a state fault).
+    """
+    if measured_tokens is None or int(static_capacity) <= 0:
+        return 503
+    return 413 if int(measured_tokens) > int(static_capacity) else 503
+
+
+def refusal_response(path: str, code: str, detail: str, status: int,
+                     extra: Optional[Dict[str, object]] = None) -> web.Response:
+    """A named refusal in the wire of ``path``: the Anthropic error object on
+    ``/v1/messages``, the OpenAI one elsewhere, the W-code and the full detail
+    in both; 503 carries Retry-After, 413 does not (a retry cannot help)."""
+    if path == "/v1/messages":
+        body: Dict[str, object] = {
+            "type": "error",
+            "error": {"type": "request_too_large" if status == 413 else "overloaded_error",
+                      "message": detail},
+            "code": code}
+    else:
+        body = {"error": {"message": detail,
+                          "type": "invalid_request_error" if status == 413 else "overloaded_error",
+                          "code": code}}
+    body.update(extra or {})
+    headers = {} if status == 413 else {"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)}
+    return web.json_response(body, status=status, headers=headers)
+
+
 def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
     """W3 in either direction; None when the two witnesses agree."""
     if front_outstanding == 0 and rank_idle:
@@ -6127,8 +6172,9 @@ class Front:
             len(text),
         )
         if route == "none":
-            # TERMINAL AT ADMISSION, and 4xx because it is the request that
-            # does not fit this server, not the server that failed.  sb5f
+            # TERMINAL AT ADMISSION, and 4xx only when the request provably
+            # does not fit this server (`refusal_status`: an EXACT count over
+            # the static carrier bound); on an estimate it is 503.  sb5f
             # spent a median 22.0 s per request discovering this by round trip
             # and answered 503, which reads as "try again" for a condition
             # that cannot change.
@@ -6145,12 +6191,16 @@ class Front:
                 f"tokens, or raise --tp-prefill-max-tokens / the carrier bound."
             )
             logger.error("%s", detail)
-            return web.json_response(
-                {"error": detail, "uncached": remainder,
+            # 413 only on the EXACT count: an estimate over the carrier is not
+            # a measured size fault, so it is a 503 the client may retry.
+            return refusal_response(
+                request.path, NO_ROUTE_NAME, detail,
+                refusal_status(carrier_est if exact is not None else None,
+                               self.carrier_max_tokens),
+                {"uncached": remainder,
                  "x_tokens": self.tp_prefill_max_tokens,
                  "carrier_est": carrier_est,
-                 "carrier_max": self.carrier_max_tokens},
-                status=413)
+                 "carrier_max": self.carrier_max_tokens})
         if route == "carrier_single":
             self.counters["route_carrier_exceeds"] += 1
             logger.warning("WEG2-ROUTE rid=%s CARRIER-EXCEEDS -> D single prefill carrier_est=%d (%s) > carrier_max=%d "
@@ -7661,9 +7711,13 @@ class Front:
         # there, so this is not a prose-only effect.
         #
         # So the terminal MOVES TO THE SECOND REFUSAL, where W35 already
-        # stands, and W35's bare 503 becomes this named, measured 413 --
-        # which is what #1291 actually wanted (name it, 4xx not 503) minus
-        # the lap it should never have skipped. Cost, stated honestly: the
+        # stands, and W35's bare 503 becomes this named, measured refusal --
+        # which is what #1291 actually wanted (name it) minus the lap it
+        # should never have skipped. Its STATUS is not the name's: the store
+        # not handing back is state, so it answers 503 + Retry-After, and 413
+        # only when the measured count exceeds the form's static capacity
+        # (`refusal_status`; rc12z30d 21:11:35, 413 on a state fault killed
+        # the client's agent). Cost, stated honestly: the
         # salad class spends its second P prefill again (13 on sb5h).
         # Benefit: the re-offer that sometimes pays is no longer deleted
         # before it is placed.
@@ -7722,11 +7776,12 @@ class Front:
             logger.error("%s", detail)
             if seat is not None:
                 seat.release(NO_ROUTE_NAME)
-            return web.json_response(
-                {"error": detail, "x_tokens": self.tp_prefill_max_tokens,
+            return refusal_response(
+                request.path, NO_ROUTE_NAME, detail,
+                refusal_status(carrier_est, self.carrier_max_tokens),
+                {"x_tokens": self.tp_prefill_max_tokens,
                  "carrier_est": carrier_est,
-                 "carrier_max": self.carrier_max_tokens},
-                status=413)
+                 "carrier_max": self.carrier_max_tokens})
         # SK-X (W35 class, NF rc12t weg2-6-30): W35 says "a second time AFTER
         # A FULL P PREFILL". A rid whose P leg never ran (a kept SHORT whose
         # first reroute skipped leg 1) gets the regular P reroute instead --
@@ -7782,14 +7837,19 @@ class Front:
                 logger.error("%s", detail)
                 if seat is not None:
                     seat.release(HANDBACK_NAME)
-                return web.json_response(
-                    {"error": detail, "x_tokens": self.tp_prefill_max_tokens,
+                # W53 is a STATE fault (the store did not hand P's prefill
+                # back), not a size fault: 413 only when P's MEASURED count
+                # exceeds the form's static capacity (rc12z30d 21:11:35 sent
+                # 413 for 17,053 tokens against carrier_max 314,553).
+                return refusal_response(
+                    request.path, HANDBACK_NAME, detail,
+                    refusal_status(measured_whole, self.carrier_max_tokens),
+                    {"x_tokens": self.tp_prefill_max_tokens,
                      "est_uncached": pending.est_uncached,
                      "leg1_prompt_tokens": measured_whole,
                      "d_extent": d_extent,
                      "carrier_max": self.carrier_max_tokens,
-                     "leg1_done": True},
-                    status=413)
+                     "leg1_done": True})
             logger.error("W35 Weg2XReQueueLoop rid=%s: D refused this rid with W31 a second time after a full "
                          "P prefill; refusing by name rather than a third pass. D said: %s",
                          rid, body.decode(errors="replace")[:400])

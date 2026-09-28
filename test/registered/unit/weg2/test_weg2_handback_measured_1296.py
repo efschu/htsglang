@@ -47,7 +47,8 @@ same refutation: the weg2sb5g figures it quotes are "3 served out of 53
 re-offer ran.
 
 THE FIX: W53 moves to the SECOND refusal, where W35 already stands, and W35's
-bare 503 becomes W53's named, measured 413.  W52 (`carrier_est > carrier_max`)
+bare 503 becomes W53's named, measured refusal (503 + Retry-After inside
+the form, 413 only over it -- `refusal_status`, rc12z30d 21:11:35).  W52 (`carrier_est > carrier_max`)
 stays terminal at n=1 -- that one is STRUCTURAL, no pass can move it, which is
 exactly the distinction round 1 lost.  No new bookkeeping, no new counter, no
 second store read.  W53 becomes a SUBSET of W35 (its population), so both
@@ -241,7 +242,9 @@ def test_arm_a_salad_an_empty_handback_is_terminal_only_after_the_re_offer():
 
     chars/token 2.78 < 3.0, so the front UNDER-estimates.  The store never
     hands anything back, so the one re-offer is spent and the SECOND refusal
-    is the named, measured 413.  RED at the parent for the placement: the
+    is the named, measured W53 -- a 503 with Retry-After, because the store
+    not handing back is state and the prompt is inside the form (rc12z30d
+    21:11:35; 413 only over the form, `refusal_status`).  RED at the parent for the placement: the
     parent refuses at n=1 after a single P prefill, which is exactly the lap
     that would have deleted weg2-28-259 had the estimate fallen the other way.
     """
@@ -256,7 +259,7 @@ def test_arm_a_salad_an_empty_handback_is_terminal_only_after_the_re_offer():
             assert t["measured"] > t["est"], t  # the front under-estimates
             h.d.refuse_real_for["sa"] = 9  # the store never hands anything back
             status, text = await asyncio.wait_for(h.post("sa", chars=BODY_CHARS), 30.0)
-            assert status == 413, (status, text[:400])
+            assert status == 503, (status, text[:400])  # state, inside the form
             assert HANDBACK_NAME in text
             assert h.front.counters["W53_Weg2StoreHandbackFailed"] == 1
             # THE PLACEMENT: the terminal is the SECOND refusal, and W53 is a
@@ -289,7 +292,7 @@ def test_arm_b_natural_prose_is_the_same_fault_and_must_reach_the_same_verdict()
             assert t["measured"] < t["est"], t  # the front OVER-estimates
             h.d.refuse_real_for["na"] = 9
             status, text = await asyncio.wait_for(h.post("na", chars=BODY_CHARS), 30.0)
-            assert status == 413, (status, text[:400])
+            assert status == 503, (status, text[:400])  # state, inside the form
             assert HANDBACK_NAME in text
             assert h.front.counters["W53_Weg2StoreHandbackFailed"] == 1
             assert h.front.counters["W35_Weg2XReQueueLoop"] == 1
