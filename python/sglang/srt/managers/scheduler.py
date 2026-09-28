@@ -1067,6 +1067,59 @@ def _weg2_dormant_admit_armed() -> bool:
     return os.environ.get("SGLANG_WEG2_DORMANT_ADMIT", "1") == "1"
 
 
+#: #823 HEAD-VOTE ANCHOR line count (module-level: the vote runs on scheduler
+#: doubles in the #823/#610 harnesses, which carry only the reduce's members).
+_HEAD_VOTE_ANCHOR_N = [0]
+
+
+def _head_vote_len(req) -> int:
+    """#823 vote for one head rid: the prefix the admission can MATERIALIZE.
+
+    ``num_matched_prefix_tokens`` is ``len(prefix_indices) + host_hit_length``.
+    Both terms MISS a device-resident node that carries no recurrent state
+    and sits BELOW a host chain: the mamba validator cuts the device match
+    at the deepest node with a state (``last_device_node``), and the host
+    walk (``FullComponent.finalize_match_result``) sums only ``host_value``
+    from ``best_match_node`` up to that cut -- a node whose host rows were
+    released after its load-back (``#248 LOADED-HOST-RELEASE``) counts in
+    neither. The load-back keeps such a node (it is on the device) and the
+    request materializes the whole path to ``best_match_node``, whose depth
+    is ``state_anchor_depth`` (#1040: every component, the mamba validator
+    included, accepted it).
+
+    27B rc12z7b (1961f756ad), D 07:47:28, rid weg2-11-10: the sibling
+    weg2-10-9 was loaded to the device and released its host rows one pass
+    earlier; weg2-11-10 then matched device 0 + host 9466 = 9466 of a 9535
+    span whose first 69 tokens were that device node (``matched=69
+    loaded=9466 ... materialized=9535``). The group vote was 9466, the X
+    gate priced 71 uncached, and the vision guard refused an image ending at
+    9528 with W123 (covered=9466). The vote is now the larger of the two,
+    capped like ``num_matched_prefix_tokens`` at the max prefix length;
+    still MIN-reduced over the group, so every rank reads one number."""
+    n = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
+    anchor = getattr(req, "state_anchor_depth", None)
+    if anchor is None or int(anchor) <= n:
+        return n
+    try:
+        cap = int(req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)))
+    except Exception:  # noqa: BLE001 - a req without the method keeps the old vote
+        return n
+    vote = max(n, min(int(anchor), cap))
+    if vote > n:
+        _HEAD_VOTE_ANCHOR_N[0] += 1
+        k = _HEAD_VOTE_ANCHOR_N[0]
+        if k <= 16 or k % 256 == 0:
+            logger.info(
+                "#823 HEAD-VOTE ANCHOR rid=%s matched=%d (device %d + host %d) "
+                "anchor_depth=%d vote=%d (n=%d): a device node without a state "
+                "below the host chain counts toward the materializable prefix",
+                str(getattr(req, "rid", "?"))[:16], n,
+                len(getattr(req, "prefix_indices", ()) or ()),
+                int(getattr(req, "host_hit_length", 0) or 0), int(anchor), vote, k,
+            )
+    return vote
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -9854,8 +9907,9 @@ class Scheduler(
                         str(rid)[:16], exc, self._head_vote_unpriced,
                     )
                 continue
-            matches[rid] = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
+            matches[rid] = _head_vote_len(req)
         return canonical, matches
+
 
     def _tp_head_enforcer_gate(self) -> tp_head_congruence.GateVerdict:
         """#823 W9: is the group's batch-formation decision in force, and WHY.

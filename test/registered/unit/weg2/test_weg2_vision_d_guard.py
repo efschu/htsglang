@@ -154,3 +154,65 @@ def test_the_scheduler_counts_deferrals_per_rid(monkeypatch):
     verdicts = [Scheduler._weg2_vision_d_verdict(h, req, object())
                 for _ in range(g.DEFER_BOUND_PASSES + 1)]
     assert verdicts[:-1] == [g.DEFER] * g.DEFER_BOUND_PASSES and verdicts[-1] == g.REFUSE
+
+
+# ------------------------------------------------------------------------------
+# 27B rc12z7b (1961f756ad) D 07:47:28, rid weg2-11-10: "HiCache prefetch success
+# ... matched=69 loaded=9466 ... deliverable=9535", PHASE-PURITY "host_hit=9466
+# matched=69 materialized=9535", then "W123 ... covered=9466" for an image
+# spanning 6290..9528 of a 9537-token prompt. The first 69 tokens were a device
+# node without a recurrent state (the sibling weg2-10-9 had been loaded and had
+# released its host rows); the match counted device 0 + host 9466.
+# ------------------------------------------------------------------------------
+
+
+def _vote_req(anchor=9535, device=0, host=9466, fill=9537, span=(6290, 9528)):
+    r = _img_req(rid="weg2-11-10", fill=fill, span=span)
+    r.prefix_indices = [0] * device
+    r.host_hit_length = host
+    r.num_matched_prefix_tokens = device + host
+    r.state_anchor_depth = anchor
+    r._compute_max_prefix_len = lambda n: max(n - 1, 0)
+    return r
+
+
+def _voter(req, monkeypatch):
+    """A Scheduler double whose head vote runs the shipped method; the match
+    itself is the metal's (match_prefix_for_req stamps nothing new here)."""
+    from sglang.srt.managers import schedule_policy as sp
+    from sglang.srt.managers.scheduler import Scheduler
+
+    h = types.SimpleNamespace(waiting_queue=[req], tree_cache=types.SimpleNamespace(match_prefix=None))
+    monkeypatch.setattr(sp, "match_prefix_for_req", lambda tree, r, include_req=True: None)
+    return Scheduler._local_head_prefix_matches(h)
+
+
+def test_the_head_vote_is_the_materializable_prefix_not_device_plus_host(monkeypatch):
+    req = _vote_req()
+    canonical, matches = _voter(req, monkeypatch)
+    assert canonical == ["weg2-11-10"]
+    assert matches["weg2-11-10"] == 9535, "device 0 + host 9466 misses the 69-token device head"
+
+
+def test_the_metal_image_is_admitted_with_the_groups_vote(monkeypatch):
+    from sglang.srt.managers import tp_head_congruence as thc
+    from sglang.srt.managers.scheduler import Scheduler
+
+    req = _vote_req()
+    _canonical, matches = _voter(req, monkeypatch)
+    h = types.SimpleNamespace(ps=types.SimpleNamespace(tp_size=3))
+    h._weg2_vision_d_covered = lambda r, hi: Scheduler._weg2_vision_d_covered(h, r, hi)
+    monkeypatch.setattr(thc, "group_match_for", lambda inputs, rid: matches[rid])
+    assert Scheduler._weg2_vision_d_verdict(h, req, object()) == g.ADMIT   # 9528 < 9535
+    # the old vote (9466) is the metal's W123
+    monkeypatch.setattr(thc, "group_match_for", lambda inputs, rid: 9466)
+    assert Scheduler._weg2_vision_d_verdict(h, req, object()) == g.REFUSE
+
+
+def test_the_anchor_vote_is_capped_and_never_lowers_the_match(monkeypatch):
+    req = _vote_req(anchor=9537)                      # capped at fill-1
+    assert _voter(req, monkeypatch)[1]["weg2-11-10"] == 9536
+    req = _vote_req(anchor=None)                      # pure-KV tree: unchanged
+    assert _voter(req, monkeypatch)[1]["weg2-11-10"] == 9466
+    req = _vote_req(anchor=4096, device=5000, host=0)  # anchor below the match: unchanged
+    assert _voter(req, monkeypatch)[1]["weg2-11-10"] == 5000
