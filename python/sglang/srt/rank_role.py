@@ -429,13 +429,50 @@ SEAMS: Dict[str, Seam] = {
                  "def assert_activation_aligned_shards"),
             ),
         ),
+        # ---- #239 S3d: a worker that OWNS full-attention rows (token cut) ----
+        Seam(
+            "F13",
+            "the KV-holding worker's host tier and store under the token cut "
+            "(owner-written rows of a page_size-64 page)",
+            "managers/cache_controller.py:1499 (weighted uneven-DCP owner mode "
+            "refuses page_size != 1 -- every rank of a D group with the cut and "
+            "the Weg2 --hicache-canonical-kv-page file tier dies at attach), "
+            "mem_cache/hicache_storage.py:3850 FormAWorkerNullStorage (a worker "
+            "claims every page and writes none -- with real rows that is a "
+            "silent wrong-KV read after an L2 eviction); weg2/tail_adopt.py, "
+            "weg2/tail_handoff.py, the #988/H105 park loadback (host-only)",
+            wired=False,
+            note="#239 S3d (1) wired the votes (floor line, #59 MIN, H105 "
+            "gate MIN). The BYTES are not: an NF page (64 tokens) spans two "
+            "owner ranks under a token vector, the canonical page format has "
+            "no partial-owner slot, and the worker's tier is the null tier. "
+            "Until this is built a real boot of kv=qsa_forma_dcp is refused "
+            "at launch (weg2.launcher.refuse_unwired_token_cut).",
+            anchors=(
+                ("managers/cache_controller.py", 1499,
+                 "Weighted uneven-DCP HiCache storage requires page_size == 1"),
+                ("mem_cache/hicache_storage.py", 3850,
+                 "class FormAWorkerNullStorage"),
+            ),
+        ),
     )
 }
 
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F6",)
+UNWIRED_ORDER: Tuple[str, ...] = ("F6", "F13")
+
+#: #239 S3e: the seams a real boot of the token cut (kv=qsa_forma_dcp) stands
+#: on -- F4 (a worker's KV share), F5 (the LSE merge with zero-head ranks),
+#: F12 (the host's dense collectives gone), F13 (the worker's bytes in the
+#: host tier and store). The launcher refuses the cut while any is unwired.
+TOKEN_CUT_SEAMS: Tuple[str, ...] = ("F4", "F5", "F12", "F13")
+
+
+def unwired_token_cut_seams() -> Tuple[str, ...]:
+    """#239 S3e: the :data:`TOKEN_CUT_SEAMS` still ``wired=False``."""
+    return tuple(sid for sid in TOKEN_CUT_SEAMS if not SEAMS[sid].wired)
 
 
 def require_wired(seam_id: str, context: str = "") -> None:
