@@ -49,5 +49,60 @@ class TestExpertOffloadCalibration(unittest.TestCase):
         self.assertNotIn("would not transfer", why)
 
 
+
+import types as _types
+
+
+def _plan(ceil, solved=(), owner=()):
+    fits = tuple(_types.SimpleNamespace(ceiling_fraction=c) for c in ceil)
+    return _types.SimpleNamespace(fits=fits, solved_fractions=tuple(solved),
+                                  solved_owner_ratio=tuple(owner))
+
+
+_GIVEN = [0.06, 0.51, 0.48]
+_CEIL = [0.062, 0.586, 0.491]   # NF rc12z26 17:52 front.log FRACTION-SOLVE D
+_P0 = {L.TORCH_CACHE_CAP_ENV: "1"}
+
+
+class TestFrCeilingAdopt(unittest.TestCase):
+    def test_edge_wins_with_p0(self):
+        new, lines = L.d_fr_ceiling_adopt(_plan(_CEIL), _GIVEN, _P0, owned=False)
+        self.assertEqual(new, _CEIL)
+        self.assertEqual(len([ln for ln in lines if "rang" in ln]), 3)
+
+    def test_without_p0_the_stated_fr_stays_and_is_named(self):
+        new, lines = L.d_fr_ceiling_adopt(_plan(_CEIL), _GIVEN, {}, owned=False)
+        self.assertIsNone(new)
+        self.assertTrue(any("P0 aus" in ln for ln in lines))
+
+    def test_owned_cut_is_untouched(self):
+        new, lines = L.d_fr_ceiling_adopt(_plan(_CEIL, owner=(215, 113, 160)), _GIVEN, _P0,
+                                          owned=True)
+        self.assertIsNone(new)
+        self.assertEqual(lines, [])
+
+    def test_s2b_solved_fr_is_untouched(self):
+        new, lines = L.d_fr_ceiling_adopt(_plan(_CEIL, solved=(0.1, 0.5, 0.5)), _GIVEN, _P0,
+                                          owned=False)
+        self.assertIsNone(new)
+        self.assertEqual(lines, [])
+
+    def test_named_cap_binds(self):
+        env = dict(_P0, **{L.FR_D_CAP_ENV: "0.07,0.55,0.60"})
+        new, _ = L.d_fr_ceiling_adopt(_plan(_CEIL), _GIVEN, env, owned=False)
+        self.assertEqual(new, [0.062, 0.55, 0.491])
+
+    def test_raise_only_and_switch_off(self):
+        new, lines = L.d_fr_ceiling_adopt(_plan([0.05, 0.586, 0.491]), _GIVEN, _P0, owned=False)
+        self.assertEqual(new, [0.06, 0.586, 0.491])
+        self.assertTrue(any("Decke unter gegeben" in ln for ln in lines))
+        off = dict(_P0, **{L.FR_D_CEILING_ENV: "0"})
+        self.assertIsNone(L.d_fr_ceiling_adopt(_plan(_CEIL), _GIVEN, off, owned=False)[0])
+
+    def test_no_edge_on_a_rank_keeps_the_stated_fr(self):
+        new, _ = L.d_fr_ceiling_adopt(_plan([0.062, None, 0.491]), _GIVEN, _P0, owned=False)
+        self.assertIsNone(new)
+
+
 if __name__ == "__main__":
     unittest.main()
