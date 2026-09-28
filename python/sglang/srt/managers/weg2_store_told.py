@@ -719,6 +719,10 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     held rids into ``Weg2StoreTold`` objects appended to the outgoing list.
     Returns the list to SEND; the caller keeps dispatching ``recv_reqs``."""
     held: Dict[str, Any] = scheduler._weg2_store_held
+    # TW (#56): every PP0 pass counts and notes the siblings that finished,
+    # also when nothing is held -- a twin arriving right after its sibling's
+    # finish is held until that finish settled (the end anchor published).
+    _twin.tick(scheduler)
     paced_on = bool(getattr(scheduler, "_weg2_told_paced_on", False))
     if paced_on:
         return _pp0_publish_paced(scheduler, recv_reqs)

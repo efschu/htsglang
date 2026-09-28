@@ -421,3 +421,70 @@ def test_paced_twin_read_ahead_then_admit_on_every_rank(on, clock, monkeypatch):
     assert kinds[1][0] > kinds[0][0]  # the Admit follows the read-ahead
     assert admitted[0] == admitted[1] == kinds[1][0]
     assert b[0]._weg2_prefix_cap == b[1]._weg2_prefix_cap == 57344
+
+
+# --------------------------------------------------------------------------
+# #56 (NF rc12z e8a2cd2dc5, 09280209): a sibling that FINISHED on PP0 a moment
+# before the twin's intake. 03:15:02 PP0 "WEG2 END-ANCHOR rid=weg2-20-25
+# anchor=37952", same second "#1416 STORE-TOLD ANCHOR-CLAMP rid=weg2-21-27
+# completed=37952 anchored=30528": the twin arrived after the finish, so TW did
+# not hold it (only in-flight siblings count), its store read ran before the
+# sibling's end anchor was published and told fell to the previous anchor.
+# 12 of the 20 clamps on the tree-key boots are this shape (END-ANCHOR of a
+# sibling at exactly `completed`, 0-3 s earlier), 91,776 of 537,600 tokens.
+# --------------------------------------------------------------------------
+
+
+def _finish_sibling(s, a, clock):
+    """A was in flight at a PP0 pass, then finished (its rows went to the tree,
+    the retain publish is still on its way) and left the queue."""
+    _run_pp0(s, clock, 1)
+    a.done = True
+    s.waiting_queue.remove(a)
+
+
+def test_twin_of_a_just_finished_sibling_is_held_until_the_publish_settled(on, clock):
+    s, a, b = _pp0_with_sibling(shared=37954)
+    _finish_sibling(s, a, clock)
+    _run_pp0(s, clock, 1, dt=0.05)  # PP0 notices the finish at the top of a pass
+    assert _intake(s, b) == tw.VERDICT_DEFERRED
+    assert all(rid != b.rid for rid, _ in s.registered)
+    # released after pp_size passes AND settle_ms since the FINISH, as a twin
+    s.local[b.rid] = (37952, 0)
+    wire = _run_pp0(s, clock, 6, dt=0.2)
+    told_b = [w for w in wire if w.rid == b.rid]
+    assert len(told_b) == 1 and told_b[0].told == 37952
+    assert tw.is_deferred(s, b.rid) is False
+
+
+def test_twin_arriving_in_the_same_pass_as_the_finish_is_held_too(on, clock):
+    s, a, b = _pp0_with_sibling(shared=37954)
+    _finish_sibling(s, a, clock)  # no PP0 pass between the finish and B's intake
+    assert _intake(s, b) == tw.VERDICT_DEFERRED
+
+
+def test_a_sibling_finished_longer_ago_than_the_settle_holds_nothing(on, clock):
+    s, a, b = _pp0_with_sibling(shared=37954)
+    _finish_sibling(s, a, clock)
+    _run_pp0(s, clock, 6, dt=0.2)  # 1.2 s and 6 passes: published long ago
+    s.local[b.rid] = (37952, 0)
+    assert _intake(s, b) != tw.VERDICT_DEFERRED
+    assert (b.rid, None) in s.registered
+
+
+def test_just_finished_non_twin_holds_nothing(on, clock):
+    s, a, _ = _pp0_with_sibling(shared=37954)
+    _finish_sibling(s, a, clock)
+    c = _Req("weg2-9-9", _ids(N + 100, 10, 7))
+    c.origin_input_ids = [5_000_000 + i for i in range(N + 110)]
+    s.local[c.rid] = (0, 64)
+    assert _intake(s, c) != tw.VERDICT_DEFERRED
+
+
+def test_just_finished_sibling_switch_off_is_unchanged(off, clock):
+    s, a, b = _pp0_with_sibling(shared=37954)
+    _run_pp0(s, clock, 1)
+    a.done = True
+    s.waiting_queue.remove(a)
+    s.local[b.rid] = (20000, 512)
+    assert _intake(s, b) == "issued"

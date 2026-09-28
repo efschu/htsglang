@@ -130,7 +130,14 @@ class _State:
     #: follower: rids whose absorbed told is a twin (absolute) told
     twin_follower: Dict[str, int] = field(default_factory=dict)
     passes: int = 0
+    #: #56: the in-flight requests PP0 saw at its last look (id -> req), and
+    #: the ones that FINISHED since, rid -> (req, pass, t), kept for the settle
+    #: window only: a twin arriving right after its sibling's finish is held
+    #: until the sibling's retain publish (its end anchor) has landed.
+    last_seen: Dict[int, Any] = field(default_factory=dict)
+    recent: Dict[str, Tuple[Any, int, float]] = field(default_factory=dict)
     n_defer: int = 0
+    n_recent: int = 0
     n_release: int = 0
     n_deadline: int = 0
 
@@ -234,6 +241,34 @@ def _say(n: int) -> bool:
     return n <= _LOG_FIRST or n % _LOG_EVERY == 0
 
 
+def _settled(st: "_State", done_pass: int, done_t: float, now: float) -> bool:
+    return st.passes - done_pass >= st.settle_passes and now - done_t >= st.settle_s
+
+
+def _refresh_recent(st: "_State", scheduler, now: float) -> List[Any]:
+    """#56 (NF rc12z 09280209, 03:15:02 PP0: ``WEG2 END-ANCHOR rid=weg2-20-25
+    anchor=37952``, the same second ``#1416 STORE-TOLD ANCHOR-CLAMP
+    rid=weg2-21-27 completed=37952 anchored=30528``): a sibling that has just
+    FINISHED on PP0 is no longer in flight, but its end anchor is not yet in
+    the store (the retain publish is the step TW's own settle waits for). A
+    twin arriving in that window registered at once, its store read found the
+    KV pages and no anchor, and told fell back to the previous anchor. Record
+    the requests that left the in-flight set FINISHED since the last look,
+    keep them for the settle window, and return the current in-flight set."""
+    cur = inflight(scheduler)
+    ids_now = {id(r) for r in cur}
+    for key, r in st.last_seen.items():
+        if key in ids_now:
+            continue
+        fin = getattr(r, "finished", None)
+        if callable(fin) and fin() and len(st.recent) < _FLAG_CAP:
+            st.recent[str(getattr(r, "rid", ""))] = (r, st.passes, now)
+    st.last_seen = {id(r): r for r in cur}
+    for rid in [k for k, (_r, p, t) in st.recent.items() if _settled(st, p, t, now)]:
+        st.recent.pop(rid, None)
+    return cur
+
+
 def intake_defer(scheduler, req) -> bool:
     """PP0 intake: True = hold ``req`` without registering its store read."""
     st = state(scheduler)
@@ -242,24 +277,39 @@ def intake_defer(scheduler, req) -> bool:
     rid = str(getattr(req, "rid", ""))
     if len(_ids(req)) < st.min_tokens:
         return False
+    now = _now()
+    live = _refresh_recent(st, scheduler, now)
     sources = [
-        s for s in inflight(scheduler)
+        s for s in live
         if s is not req and str(getattr(s, "rid", "")) != rid
         and is_twin(s, req, st.min_tokens)
     ]
-    if not sources:
+    # #56: siblings that finished within the settle window count too; their
+    # finish is the start of the settle (not this intake).
+    recent = [
+        (r, p, t) for k, (r, p, t) in st.recent.items()
+        if r is not req and k != rid and is_twin(r, req, st.min_tokens)
+    ]
+    if not sources and not recent:
         st.waits.pop(rid, None)
         return False
-    shared = max(shared_prefix_len(_ids(s), _ids(req)) for s in sources)
-    st.waits[rid] = _Wait(req=req, sources=sources, since=_now(), shared=shared)
+    all_src = sources + [r for r, _p, _t in recent]
+    shared = max(shared_prefix_len(_ids(s), _ids(req)) for s in all_src)
+    w = _Wait(req=req, sources=all_src, since=now, shared=shared)
+    if not sources:
+        w.done_pass = max(p for _r, p, _t in recent)
+        w.done_t = max(t for _r, _p, t in recent)
+        st.n_recent += 1
+    st.waits[rid] = w
     st.n_defer += 1
     if _say(st.n_defer):
         logger.info(
-            "#TW TWIN-DEFER rid=%s len=%d shared=%d sources=%s (n=%d): store read "
-            "held until the sibling finished; admission skips it meanwhile, "
-            "nothing else waits.",
+            "#TW TWIN-DEFER rid=%s len=%d shared=%d sources=%s just_finished=%s (n=%d): "
+            "store read held until the sibling finished and its publish settled; "
+            "admission skips it meanwhile, nothing else waits.",
             rid[:12], len(_ids(req)), shared,
-            [str(getattr(s, "rid", "?"))[:12] for s in sources], st.n_defer,
+            [str(getattr(s, "rid", "?"))[:12] for s in sources],
+            [str(getattr(r, "rid", "?"))[:12] for r, _p, _t in recent], st.n_defer,
         )
     return True
 
@@ -269,6 +319,17 @@ def is_deferred(scheduler, rid: str) -> bool:
     return bool(st) and str(rid) in st.waits
 
 
+def tick(scheduler) -> None:
+    """Top of EVERY PP0 pass (``weg2_store_told.pp0_publish``, before any early
+    return): count the pass and note who finished since the last one (#56).
+    Nothing when the switch is off; O(in-flight) host bookkeeping otherwise."""
+    st = state(scheduler)
+    if not st:
+        return
+    st.passes += 1
+    _refresh_recent(st, scheduler, _now())
+
+
 def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
     """Top of a PP0 pass: the held twins whose wait is over, as
     ``(req, twin)``; ``twin`` False = the Frist fired (ordinary request).
@@ -276,10 +337,9 @@ def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
     st = getattr(scheduler, _ATTR, None)
     if not st:
         return []
-    st.passes += 1
+    now = _now()
     if not st.waits:
         return []
-    now = _now()
     out: List[Tuple[Any, bool]] = []
     for rid in list(st.waits):
         w = st.waits[rid]
@@ -293,11 +353,7 @@ def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
         if not pending and w.done_pass is None:
             w.done_pass, w.done_t = st.passes, now
         reason = None
-        if (
-            not pending
-            and st.passes - w.done_pass >= st.settle_passes
-            and now - w.done_t >= st.settle_s
-        ):
+        if not pending and _settled(st, w.done_pass, w.done_t, now):
             reason = REL_PUBLISHED
         elif now - w.since >= st.wait_s:
             reason = REL_DEADLINE
