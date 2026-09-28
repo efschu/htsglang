@@ -267,3 +267,50 @@ def test_form_b_plan_keeps_the_scheduler_group_on_all_ranks():
     assert p.index_ranks() == [0]                                  # NF answer 3
     with pytest.raises(ValueError):
         rf.form_b_plan(rf.resolve_rank_form([1, 1, 1]))
+
+
+# F6 step 6: the BAR1 window riegel. Weg-2 layout: D "16,TP_0=32,DCP_0=40",
+# P resident 24 + PP_0 96 on each 3080 (#1234 C1: 224 usable per 3080).
+_D_SPEC = "16,TP_0=32,DCP_0=40"
+_P_RES = {"GPU-3080x8": {"P world:0": 24, "P pp:0": 96},
+          "GPU-3080x4": {"P world:0": 24, "P pp:0": 96}}
+_USABLE = {"GPU-5090": 32768, "GPU-3080x8": rf.BAR1_USABLE_MIB_3080,
+           "GPU-3080x4": rf.BAR1_USABLE_MIB_3080}
+
+
+def _b():
+    return rf.form_b_plan(rf.resolve_rank_form([77, 23, 0], [10, 45, 45], subgroup_tp_wired=True))
+
+
+def test_form_b_windows_charge_model_tp_and_the_flip_lane_on_weight_cards_only():
+    posts = rf.form_b_window_requirement(_b(), U, window_spec=_D_SPEC, resident_mib_by_card=_P_RES)
+    w3080, k3080 = posts["GPU-3080x8"], posts["GPU-3080x4"]
+    assert w3080["rank1 dcp:0"] == rf.FORM_B_DCP_WINDOW_MIB == 40
+    assert w3080["rank1 model_tp:0"] == 16 and w3080["rank1 flip_lane"] == 32
+    assert not [k for k in k3080 if "model_tp" in k or "flip_lane" in k]   # K: none
+    assert sum(k3080.values()) == 208                                      # today's D + P
+    assert sum(w3080.values()) == 256                                      # +16 +32
+
+
+def test_form_b_windows_refuse_the_w3080_by_name_and_pass_a_shrunk_layout():
+    with pytest.raises(rf.RankFormBar1Window, match=r"W187.*card GPU-3080x8 \(rank1\).*256 MiB > usable 224"):
+        rf.check_form_b_windows(_b(), U, _USABLE, window_spec=_D_SPEC, resident_mib_by_card=_P_RES)
+    # tp carries control only under Form B: TP_0 8, MODEL_TP_0 8 -> 16+8+40+8+32+120 = 224
+    posts = rf.check_form_b_windows(_b(), U, _USABLE, window_spec="16,TP_0=8,DCP_0=40,MODEL_TP_0=8",
+                                    resident_mib_by_card=_P_RES)
+    assert sum(posts["GPU-3080x8"].values()) == 224
+
+
+def test_form_b_windows_count_two_ranks_on_one_card_twice_and_check_shapes():
+    b = rf.form_b_plan(rf.resolve_rank_form([2, 1, 1, 0], [1, 1, 1, 1], subgroup_tp_wired=True))
+    posts = rf.form_b_window_requirement(b, ["GPU-5090", "GPU-5090", "GPU-3080x8", "GPU-3080x4"],
+                                         window_spec=_D_SPEC)
+    assert posts["GPU-5090"]["rank0 dcp:0"] == posts["GPU-5090"]["rank1 dcp:0"] == 40
+    assert sum(posts["GPU-5090"].values()) == 2 * (16 + 32 + 40 + 16 + 32)
+    with pytest.raises(rf.RankFormBar1Window, match="W187"):
+        rf.form_b_window_requirement(b, U, window_spec=_D_SPEC)             # 3 cards, 4 ranks
+    with pytest.raises(rf.RankFormBar1Window, match="W187"):
+        rf.parse_window_spec("16,TP_0=x")
+    assert rf.parse_window_spec(None) == (rf.BARLINK_WINDOW_MIB_DEFAULT, {})
+    with pytest.raises(rf.RankFormBar1Window, match="no usable BAR1"):
+        rf.check_form_b_windows(_b(), U, {"GPU-5090": 1}, window_spec=_D_SPEC)

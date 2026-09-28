@@ -467,3 +467,131 @@ def form_b_plan(form: RankForm) -> FormBPlan:
         raise ValueError(f"form_b_plan: form {form.kind} is not B ({form.line()})")
     return FormBPlan(weight_ranks=form.weight_ranks, kv_ranks=form.kv_only_ranks,
                      weights=form.weights)
+
+
+# --------------------------------------------------------------------------
+# F6 step 6: the BAR1 window riegel of Form B (draft v2 §5 "Fenster").
+#
+# Every rank process pins one BAR1 receive window per barlink group it is a
+# member of (world size > 1), on ITS card
+# (device_communicators/barlink_matrix_transport.py: _requested, the per-group
+# key from the live group name, e.g. ``dcp:0`` -> DCP_0). Form B adds one
+# group, ``model_tp:0``, and only the weight ranks W are in it (each KV-only
+# rank sits alone -> no communicator, no window). The flip lane (weight
+# exchange, 32-MiB slots) runs only where weights live. So a W card carries
+# dcp:0 + model_tp:0 + flip lane on top of the group's other windows, a K
+# card only the shared ones -- and the W-3080 is where the aperture binds
+# (#1234 C1: 224 of 256 MiB usable per 3080, measured Used 224/256 with D at
+# 16+32+40 and P at 24+96 -- already exhausted before Form B adds a window).
+# A configuration that does not fit is refused BY NAME before any rank loads,
+# instead of a Bar1WindowRefused at the model_tp build on metal.
+# --------------------------------------------------------------------------
+
+class RankFormBar1Window(RankFormError):
+    code = "W187 Weg2RankFormBar1Window"
+
+
+#: #1234 C1 (launcher, D argv): dcp:0's measured window.
+FORM_B_DCP_WINDOW_MIB = 40
+#: The flip lane's slot (draft v2 §5; the bar1 weight-exchange lanes carry
+#: 32-MiB slots). Charged once per WEIGHT rank.
+FORM_B_FLIP_LANE_MIB = 32
+#: #1234 C1: usable BAR1 per RTX 3080 (256 gross minus the RM carve-out,
+#: evaluated by barlink as NVML free minus RESERVE_MIB_DEFAULT 32).
+BAR1_USABLE_MIB_3080 = 224
+#: The window barlink requests for a group nobody configured
+#: (barlink_matrix_transport.WINDOW_MIB_DEFAULT).
+BARLINK_WINDOW_MIB_DEFAULT = 96
+
+
+def _group_key(group: str) -> str:
+    """Same spelling as barlink_matrix_transport._group_key (``dcp:0`` -> DCP_0)."""
+    return "".join(c if c.isalnum() else "_" for c in group).upper()
+
+
+def parse_window_spec(spec: Optional[str]) -> Tuple[int, Dict[str, int]]:
+    """``--barlink-bar1-window-mib``: a bare default plus GROUP=MiB overrides
+    (server_args publishes exactly these keys). None = barlink's own default."""
+    default, own = BARLINK_WINDOW_MIB_DEFAULT, {}
+    for part in str(spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if "=" in part:
+                g, _, v = part.partition("=")
+                own[g.strip().upper()] = int(v)
+            else:
+                default = int(part)
+        except ValueError:
+            raise _refuse(RankFormBar1Window, f"window spec {spec!r}: {part!r} is not GROUP=MiB or MiB")
+    return default, own
+
+
+def form_b_window_requirement(
+    plan: FormBPlan,
+    card_of_rank: Sequence[str],
+    *,
+    window_spec: Optional[str],
+    groups_all_ranks: Sequence[str] = ("world:0", "tp:0", "dcp:0"),
+    flip_lane_mib: int = FORM_B_FLIP_LANE_MIB,
+    resident_mib_by_card: Optional[Mapping[str, Mapping[str, int]]] = None,
+) -> Dict[str, Dict[str, int]]:
+    """Per card: every BAR1 window post this Form B group pins there, named.
+
+    ``groups_all_ranks`` are the barlink groups every rank is a member of (the
+    D group today: world, the scheduler tp, dcp); ``model_tp:0`` is added for
+    each weight rank when |W| >= 2, the flip lane likewise. A card hosting two
+    ranks pins every window twice (one region per process). ``resident`` are
+    the other tenants' posts on a card (group P's 24 + PP_0 96 on a 3080 in
+    the Weg-2 layout), taken as given."""
+    if len(card_of_rank) != plan.world:
+        raise _refuse(RankFormBar1Window,
+                      f"card map {list(card_of_rank)} names {len(card_of_rank)} ranks, the form {plan.world}")
+    default, own = parse_window_spec(window_spec)
+
+    def window(group: str) -> int:
+        return own.get(_group_key(group), default)
+
+    out: Dict[str, Dict[str, int]] = {}
+    for card, posts in (resident_mib_by_card or {}).items():
+        out.setdefault(str(card), {}).update({f"resident {k}": int(v) for k, v in posts.items()})
+    for r in range(plan.world):
+        card = str(card_of_rank[r])
+        posts = out.setdefault(card, {})
+        mine = list(groups_all_ranks)
+        if r in plan.weight_ranks and len(plan.weight_ranks) >= 2:
+            mine.append("model_tp:0")
+        for g in mine:
+            posts[f"rank{r} {g}"] = window(g)
+        if r in plan.weight_ranks and flip_lane_mib:
+            posts[f"rank{r} flip_lane"] = int(flip_lane_mib)
+    return out
+
+
+def check_form_b_windows(
+    plan: FormBPlan,
+    card_of_rank: Sequence[str],
+    usable_mib_by_card: Mapping[str, int],
+    **kw,
+) -> Dict[str, Dict[str, int]]:
+    """The riegel: every card's posts must fit its usable BAR1 aperture, or a
+    named W187 listing card, ranks, posts, sum and usable. Returns the posts
+    (for the launch line) when everything fits."""
+    posts = form_b_window_requirement(plan, card_of_rank, **kw)
+    over = []
+    for card, p in posts.items():
+        if card not in usable_mib_by_card:
+            raise _refuse(RankFormBar1Window, f"no usable BAR1 size for card {card!r}")
+        need, have = sum(p.values()), int(usable_mib_by_card[card])
+        if need > have:
+            ranks = sorted({k.split()[0] for k in p if k.startswith("rank")})
+            over.append(f"card {card} ({', '.join(ranks)}): "
+                        + " + ".join(f"{k} {v}" for k, v in p.items())
+                        + f" = {need} MiB > usable {have} MiB")
+    if over:
+        raise _refuse(RankFormBar1Window,
+                      "Form B's BAR1 windows do not fit: " + "; ".join(over)
+                      + ". Shrink a window (e.g. TP_0: under Form B the scheduler tp group carries "
+                      "control traffic only; MODEL_TP_0 sized to the o_proj/MLP all-reduce) or move a rank.")
+    return posts
