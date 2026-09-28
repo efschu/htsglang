@@ -6444,7 +6444,21 @@ class Scheduler(
         if _wc.asks(settle):
             _since = min(float(getattr(r, "_1471_since", now)) for r in settle)
             _records = getattr(getattr(self, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None)
-            _hv = _wc.hold_vote([(x[0], x[1], x[3]) for x in _local], _since, now, records=_records)
+            try:
+                _hv = _wc.hold_vote([(x[0], x[1], x[3]) for x in _local], _since, now, records=_records)
+            except Exception as _exc:  # noqa: BLE001
+                # L1 (EG 28.09.): the vote is a hint -- a raise counts as RELEASE (0), so this rank
+                # still sends its flags into the MIN (no desync, no dead rank) and the group releases
+                _hv = 0
+                _said = getattr(self, "_weg2_cohort_vote_err_rids", None)
+                if _said is None:
+                    _said = self._weg2_cohort_vote_err_rids = set()
+                _new = [str(getattr(r, "rid", "?")) for r in settle if str(getattr(r, "rid", "?")) not in _said]
+                if _new:
+                    _said.update(_new)
+                    logger.warning("WEG2-WAKE-COHORT VOTE-ERROR rids=%s %s: %s -- voted release (0); the "
+                                   "group releases the ready members as without the cohort",
+                                   [r[:16] for r in _new], type(_exc).__name__, _exc)
             _v = _gmin(_flags + [_hv])  # #1471e
             _agreed, _cohort_hold = _v[:-1], bool(_v[-1]) and any(_v[:-1])
         else:

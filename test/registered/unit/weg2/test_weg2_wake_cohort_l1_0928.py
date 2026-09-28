@@ -144,6 +144,29 @@ class TestSettleTick(_PriceReset):
         self.assertEqual(h._weg2_post_wake_settle_tick(), 1)
         self.assertEqual([r.rid for r in h.waiting_queue], ["a"])
 
+    def test_a_raising_vote_releases_and_the_rank_lives(self):
+        now = time.monotonic()
+        a, b = _req("a", 12829, now), _req("b", 19017, now)
+        h = _holder({"a": "complete", "b": "reading"}, _records(a=12800))
+        h.weg2_post_wake_settle = [a, b]
+        plain = wc.hold_vote
+
+        def boom(*_a, **_k):
+            raise RuntimeError("records unreadable")
+        wc.hold_vote = boom
+        try:
+            with self.assertLogs(sched_mod.logger, level="WARNING") as cm:
+                self.assertEqual(h._weg2_post_wake_settle_tick(), 1)   # released, not held, no raise
+            self.assertEqual(sum("WEG2-WAKE-COHORT VOTE-ERROR" in m for m in cm.output), 1)
+            self.assertEqual([len(c) for c in h.calls], [4, 3])        # the vote element still on the wire
+            self.assertEqual([r.rid for r in h.waiting_queue], ["a"])
+            # once per rid: the next tick raises again but names nobody new
+            h.calls.clear()
+            h._weg2_post_wake_settle_tick()
+            self.assertEqual(sorted(h._weg2_cohort_vote_err_rids), ["a", "b"])
+        finally:
+            wc.hold_vote = plain
+
     def test_lapsed_cohort_releases_the_ready_member(self):
         a, b = _req("a", 12829, time.monotonic() - 5.0), _req("b", 19017, time.monotonic() - 5.0)
         h = _holder({"a": "complete", "b": "reading"}, _records(a=12800))
