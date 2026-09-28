@@ -253,7 +253,8 @@ def test_wiring_sleep_retract_admission_abort_tick():
     assert ("self._add_request_to_queue(req, is_retracted=True)\n"
             "        self._weg2_d_park_note_retracted(retracted_reqs)") in sch
     assert "_d_park_gate = self._weg2_d_park_admission(running_batch)" in sch
-    assert "_d_skip = _d_park_gate.skip(req)" in sch
+    # AP (28.09.): the gate also sees the rids this pass already admitted
+    assert "_d_skip = _d_park_gate.skip(req, admitted=[str(_r.rid) for _r in adder.can_run_list])" in sch
     assert "self._weg2_d_park_abort(recv_req)" in sch
     assert "self._weg2_d_park_tick()" in sch
     assert "hold_armed=_weg2_dormant_admit_armed()" in sch
