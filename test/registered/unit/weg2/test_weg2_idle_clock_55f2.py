@@ -231,14 +231,16 @@ class TestFailOpen(unittest.TestCase):
 
 
 class FakeNvml:
-    def __init__(self, fail_index=None):
-        self.locked = {}
+    """gfx lock always works (unless fail_index); memory modes may be refused like on a GeForce."""
+
+    def __init__(self, fail_index=None, mem_rc=None, app_rc=None, mem_fail_index=None):
+        self.locked, self.mem, self.app = {}, {}, {}
         self.ops = []
-        self.fail_index = fail_index
+        self.fail_index, self.mem_rc, self.app_rc, self.mem_fail_index = fail_index, mem_rc, app_rc, mem_fail_index
 
     def lock(self, h, lo, hi):
         if h == self.fail_index:
-            raise dmn.NvmlError("NVML rc=4 Insufficient Permissions")
+            raise dmn.NvmlError("NVML rc=4 Insufficient Permissions", 4)
         self.locked[h] = (lo, hi)
         self.ops.append(("lock", h))
 
@@ -246,9 +248,29 @@ class FakeNvml:
         self.locked.pop(h, None)
         self.ops.append(("reset", h))
 
+    def lock_mem(self, h, lo, hi):
+        if self.mem_rc is not None or h == self.mem_fail_index:
+            raise dmn.NvmlError("NVML rc=3 Not Supported", self.mem_rc or 3)
+        self.mem[h] = (lo, hi)
+
+    def reset_mem(self, h):
+        if self.mem_rc is not None and h not in self.mem:
+            raise dmn.NvmlError("NVML rc=3 Not Supported", self.mem_rc)
+        self.mem.pop(h, None)
+
+    def set_app(self, h, mem, gfx):
+        if self.app_rc is not None:
+            raise dmn.NvmlError("NVML rc=3 Not Supported", self.app_rc)
+        self.app[h] = (mem, gfx)
+
+    def reset_app(self, h):
+        if self.app_rc is not None:
+            raise dmn.NvmlError("NVML rc=3 Not Supported", self.app_rc)
+        self.app.pop(h, None)
+
 
 def _cards(n=3):
-    return [dmn.Card(i, f"GPU-{i}", i, 210) for i in range(n)]
+    return [dmn.Card(i, f"GPU-{i}", i, 210, mem_min=405, gfx_at_mem_min=210) for i in range(n)]
 
 
 class TestDaemonState(unittest.TestCase):
@@ -271,6 +293,55 @@ class TestDaemonState(unittest.TestCase):
         self.assertFalse(r["locked"])
         self.assertEqual(nv.locked, {})
         self.assertEqual(st.holders, set())
+
+
+class TestDaemonMemoryModes(unittest.TestCase):
+    """28.09. 3080 test: the SM lock alone saved 12 W (still P2); the memory clock is the lever."""
+
+    def test_default_is_graphics_only(self):
+        nv = FakeNvml()
+        r = dmn.ClockState(nv, _cards()).lock(object())
+        self.assertTrue(r["locked"])
+        self.assertEqual((r["mem_mode"], r["mem_locked"], nv.mem), ("off", False, {}))
+
+    def test_mem_lock_to_the_lowest_supported_clock_and_back(self):
+        nv = FakeNvml()
+        st = dmn.ClockState(nv, _cards(), mem="lock")
+        a = object()
+        r = st.lock(a)
+        self.assertEqual((r["mem_mode"], r["mem_locked"], r["mem_mhz"]), ("lock", True, [405, 405, 405]))
+        self.assertEqual(nv.mem, {0: (405, 405), 1: (405, 405), 2: (405, 405)})
+        st.release(a)
+        self.assertEqual((nv.mem, nv.locked), ({}, {}))
+
+    def test_request_overrides_the_default_mode(self):
+        nv = FakeNvml()
+        st = dmn.ClockState(nv, _cards(), mem="off")
+        r = st.lock(object(), "app")
+        self.assertEqual((r["mem_mode"], r["mem_locked"]), ("app", True))
+        self.assertEqual(nv.app[0], (405, 210))
+        self.assertFalse(st.lock(object(), "bogus")["ok"])
+
+    def test_refused_memory_step_keeps_the_graphics_lock_and_names_it(self):
+        nv = FakeNvml(mem_rc=3)
+        st = dmn.ClockState(nv, _cards(), mem="lock")
+        a = object()
+        r = st.lock(a)
+        self.assertTrue(r["ok"] and r["locked"])
+        self.assertFalse(r["mem_locked"])
+        self.assertIn("Not Supported", r["mem_err"])
+        self.assertEqual(len(nv.locked), 3)
+        rel = st.release(a)
+        self.assertTrue(rel["ok"])            # the unsupported mem reset is not an error
+        self.assertEqual(nv.locked, {})
+
+    def test_partial_memory_lock_is_undone(self):
+        nv = FakeNvml(mem_fail_index=2)
+        st = dmn.ClockState(nv, _cards(), mem="lock")
+        r = st.lock(object())
+        self.assertFalse(r["mem_locked"])
+        self.assertEqual(nv.mem, {})
+        self.assertEqual(len(nv.locked), 3)
 
 
 class TestDaemonLeaseEndToEnd(unittest.TestCase):
@@ -310,14 +381,16 @@ class TestDaemonLeaseEndToEnd(unittest.TestCase):
                 self.assertEqual(len(nv.locked), 3)
                 self.assertTrue(c.call("unlock")["ok"])
                 self.assertEqual(nv.locked, {})
-                c.call("lock")
+                r = c.call("lock", mem="lock")
+                self.assertTrue(r["mem_locked"])
                 self.assertEqual(len(nv.locked), 3)
+                self.assertEqual(len(nv.mem), 3)
                 c.close()                       # the front dies / gives up: lease gone
                 for _ in range(200):
-                    if not nv.locked:
+                    if not nv.locked and not nv.mem:
                         break
                     threading.Event().wait(0.01)
-                self.assertEqual(nv.locked, {})
+                self.assertEqual((nv.locked, nv.mem), ({}, {}))
             finally:
                 loop.call_soon_threadsafe(task_holder["t"].cancel)
                 th.join(5)
