@@ -2951,6 +2951,10 @@ class Scheduler(
         # H103: the run-time-T FLA l2norm kernel loaded BEFORE the sampling
         # warmup's barrier and the first sleep (behind H101's rows prewarm).
         self.warm_fla_l2norm()
+        # P-COLD: the QSA indexer's TileLang prefill kernels built BEFORE the
+        # sampling warmup's barrier and the first sleep (rc12z30c: PP1 compiled
+        # them inside the first real forward, ~9 s of fwd_ms=12783).
+        self.warm_qsa_mqa_tilelang()
         # #603b: LAST in this method, after every worker, pool, backend and
         # graph exists. The warmup ends in a group barrier, so it must sit at a
         # point every rank reaches exactly once with the model fully built.
@@ -2971,6 +2975,17 @@ class Scheduler(
         run_boot_prewarm(
             hf_text_config=self.model_config.hf_text_config,
             dtype=self.model_config.dtype,
+            device=self.tp_worker.device,
+        )
+
+    def warm_qsa_mqa_tilelang(self):
+        """P-COLD: delegate to qsa/mqa_prewarm.run_boot_prewarm (rank-local, no
+        collective; the #603b barrier right after pairs the ranks up)."""
+        from sglang.srt.layers.attention.qsa.mqa_prewarm import run_boot_prewarm
+
+        runner = getattr(self.tp_worker, "model_runner", None)
+        run_boot_prewarm(
+            model=getattr(runner, "model", None),
             device=self.tp_worker.device,
         )
 
