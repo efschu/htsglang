@@ -3423,6 +3423,9 @@ class MoEExpertOffloadCache:
         # phase seat count (weg2/d_seat_vram.py); 0 = the bank of H95 B. Set
         # by the presplit that allocated the [R+C+X] buffer.
         self.seat_rows = int(getattr(layer, "_weg2_seat_rows", 0) or 0)
+        # #251c: the seat rows the step being CAPTURED may count as ON (set by
+        # pool_waves per captured forward; 0 = the live count)
+        self._pool_capture_on = 0
         from sglang.srt.environ import envs as _envs
 
         self.lookahead_sticky = int(_envs.SGLANG_MOE_EXPERT_LOOKAHEAD.get()) > 0
@@ -4344,6 +4347,10 @@ class MoEExpertOffloadCache:
             step_row_demand,
         )
 
+        # #251c: a D KV stage form moves stage rows from the scratch into the
+        # seat rows (OFF at boot); the captured step counts the fewest rows ON
+        # of any phase this batch can replay in (d_seat_vram.capture_floor_rows)
+        self._pool_capture_on = self._stage_capture_rows(int(n_ids))
         cap = int(envs.SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES.get() or 0)
         if cap < 2:
             return 1
@@ -4352,7 +4359,7 @@ class MoEExpertOffloadCache:
         t = self._pool_tables
         # H95c: C of the phase with EVERY seat occupied (seat rows OFF) --
         # the capture happens in that form, a phase with rows ON needs fewer
-        C = pool_row_capacity(t)
+        C = pool_row_capacity(t, getattr(self, "_pool_capture_on", 0))
         need = pool_waves_for(int(n_ids), t.num_experts, resident_count(t), C)
         waves = min(need, cap)
         if self._pool_waves_seen.get(int(n_ids)) != waves:
@@ -4362,11 +4369,35 @@ class MoEExpertOffloadCache:
                 logging.getLogger(__name__).info(
                     "MoE expert pool layer %s (H95): captured step of %d ids -> %d "
                     "wave(s); demand bound min(ids, E-R)=%d, C=LRU+staging=%d, "
-                    "SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES=%d",
+                    "SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES=%d%s",
                     lid, int(n_ids), waves,
                     step_row_demand(int(n_ids), t.num_experts, resident_count(t)), C, cap,
+                    (" (#251 capture floor: %d stage/seat rows ON)" % self._pool_capture_on)
+                    if self._pool_capture_on else "",
                 )
         return waves
+
+    def _stage_capture_rows(self, n_ids: int) -> int:
+        """#251c: the seat rows ON that the captured step of ``n_ids`` routed
+        ids may count on (``d_seat_vram.capture_floor_rows``); 0 on a layer
+        without seat rows or without a KV stage form."""
+        seat_rows = int(getattr(self, "seat_rows", 0) or 0)
+        if seat_rows <= 0:
+            return 0
+        from sglang.srt.weg2 import d_seat_vram as _dsv
+
+        per_seat = None
+        try:
+            from sglang.srt.runtime_context import get_server_args
+
+            sa = get_server_args()
+            spec = getattr(sa, "speculative_algorithm", None)
+            verify = getattr(sa, "speculative_num_draft_tokens", None) if spec else None
+            k = int(getattr(self.layer, "top_k", 0) or 0)
+            per_seat = max(1, int(verify or 1)) * k if k > 0 else None
+        except Exception:  # noqa: BLE001 -- no runtime context: no floor
+            per_seat = None
+        return min(seat_rows, _dsv.capture_floor_rows(int(n_ids), per_seat))
 
     def set_seat_rows_on(self, k: int, *, device_write: bool) -> int:
         """H95c: this phase's k of the layer's X seat rows are ON
@@ -4471,7 +4502,7 @@ class MoEExpertOffloadCache:
         armed = clock.armed
         with clock.span("pool.step") if armed else nullcontext():
             step(self._pool_tables, ids, self._pool_buffers, spill=spill, wave=True,
-                 waves=waves)
+                 waves=waves, capture_rows_on=getattr(self, "_pool_capture_on", 0))
         with clock.span("pool.fetch") if armed else nullcontext():
             copy_rows(
                 self._pool_srcs,
@@ -4516,9 +4547,11 @@ class MoEExpertOffloadCache:
         armed = clock.armed
         with clock.span("pool.step") if armed else nullcontext():
             if spill or waves != 1:
-                step(self._pool_tables, flat, self._pool_buffers, spill=spill, waves=waves)
+                step(self._pool_tables, flat, self._pool_buffers, spill=spill, waves=waves,
+                     capture_rows_on=getattr(self, "_pool_capture_on", 0))
             else:
-                step(self._pool_tables, flat, self._pool_buffers)
+                step(self._pool_tables, flat, self._pool_buffers,
+                     capture_rows_on=getattr(self, "_pool_capture_on", 0))
         with clock.span("pool.fetch") if armed else nullcontext():
             copy_rows(
                 self._pool_srcs,

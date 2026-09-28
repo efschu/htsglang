@@ -527,6 +527,76 @@ def check_form_against_cells(form: StageForm, cells: Dict[Tuple[int, int], Stage
             % (LINE_MARK, bad[:6], list(form.tokens), form.rows_on))
 
 
+def capture_floors(form: StageForm, cells: Dict[Tuple[int, int], StageCell],
+                   cap: int) -> Tuple[int, ...]:
+    """#251c, the capture floor per batch size b = 1..cap: the fewest expert
+    rows ON (k) in any phase a batch of b can replay in -- n >= b seats at a
+    stage the form lets n take. The graph of b is captured with these rows
+    counted as ON (``expert_pool_device.pool_row_capacity``), so its wave count
+    holds in every such phase; the launcher's ``max_by_seats`` decides how low
+    it goes (a stage that would add a wave is simply not allowed at n)."""
+    out = []
+    for b in range(1, int(cap) + 1):
+        ks = [cells[(n, j)].extra_rows for n in range(b, int(cap) + 1)
+              for j in range(form.max_stage(n) + 1) if (n, j) in cells]
+        out.append(max(0, min(ks)) if ks else 0)
+    return tuple(out)
+
+
+#: #251c: the model runner whose pools the capture floor is computed over
+#: (``note_capture_context``, after the KV pool exists, before the capture),
+#: and the floors, computed once at the first captured MoE step.
+_CAPTURE: Dict[str, object] = {"runner": None, "floors": None}
+
+
+def note_capture_context(runner) -> None:
+    """The KV mixin, once its pools exist: the capture that follows may ask
+    for the floors (``capture_floor_rows``). A no-op without a stage form."""
+    if stage_form() is None:
+        return
+    _CAPTURE["runner"] = runner
+    _CAPTURE["floors"] = None
+
+
+def _capture_floor_table() -> Tuple[int, ...]:
+    floors = _CAPTURE.get("floors")
+    if floors is not None:
+        return floors  # type: ignore[return-value]
+    runner = _CAPTURE.get("runner")
+    floors = ()
+    if runner is not None:
+        sa = getattr(runner, "server_args", None)
+        cap = int(getattr(sa, "max_running_requests", 0) or 0)
+        # a refusal of the form (check_form_against_cells) stops the boot here,
+        # at the capture, by name -- before any phase could run on it
+        ctl = SeatVram.from_runtime(cap=max(1, cap),
+                                    req_to_token_pool=getattr(runner, "req_to_token_pool", None),
+                                    model=getattr(runner, "model", None))
+        if ctl.form is not None and ctl.cells:
+            floors = capture_floors(ctl.form, ctl.cells, ctl.cap)
+            logger.info("%s CAPTURE-FLOOR rows ON per bs %s (stages %s, max_by_seats %s): the "
+                        "captured decode steps count these seat/stage rows as ON",
+                        STAGE_MARK, list(floors), list(ctl.form.tokens),
+                        list(ctl.form.max_by_seats) or "all")
+    _CAPTURE["floors"] = floors
+    return floors
+
+
+def capture_floor_rows(n_ids: int, per_seat_ids: Optional[int]) -> int:
+    """#251c: the rows ON the captured MoE step of ``n_ids`` routed ids may
+    count on. The batch is ``ceil(n_ids / per_seat_ids)`` (verify tokens x
+    top-k per seat; a draft step routes fewer ids per seat, its batch reads
+    SMALLER and its floor lower -- never too high). Past the seat cap (an
+    extend shape) or without a form/cells: 0, the live count."""
+    if not per_seat_ids or int(per_seat_ids) <= 0 or stage_form() is None:
+        return 0
+    floors = _capture_floor_table()
+    if not floors:
+        return 0
+    b = max(1, -(-int(n_ids) // int(per_seat_ids)))
+    return int(floors[b - 1]) if b <= len(floors) else 0
+
+
 def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False) -> int:
     """#251c ``_config_from_budget``: the KV pool's rows are the TOP stage's
     (virtual -- the graphs keep one address range); the pages behind them are
@@ -1199,6 +1269,14 @@ def on_wake(sched, recv_req, seats) -> Optional[PhaseState]:
         live = max_live_page(kv_alloc) if kv_alloc is not None else 0
         while stage < len(form.tokens) - 1 and form.tokens[stage] // page < live:
             stage += 1
+        if stage > form.max_stage(n_phys):
+            # the captured waves only hold in stages the form lets n take
+            # (capture_floors); replicated inputs -> every rank stops alike
+            raise Weg2DSeatVramRefused(
+                "%s: KV pages up to %d are still held at the wake and need stage S%d, "
+                "above the S%d the form allows %d seats -- the captured decode waves "
+                "would not hold there; nothing was mapped" % (
+                    LINE_MARK, live, stage, form.max_stage(n_phys), n_phys))
         if stage != choice.stage:
             st.note = ("KV pages up to %d still held at the wake: stage S%d instead of S%d"
                        % (live, stage, choice.stage))

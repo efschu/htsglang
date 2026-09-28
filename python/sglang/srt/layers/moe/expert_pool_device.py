@@ -390,12 +390,21 @@ def step_row_demand(n_ids: int, num_experts: int, n_resident: int) -> int:
     return int(min(int(n_ids), max(int(num_experts) - int(n_resident), 0)))
 
 
-def pool_row_capacity(tables: PoolTables) -> int:
+def pool_row_capacity(tables: PoolTables, capture_rows_on: int = 0) -> int:
     """H95: C = LRU + staging rows -- the distinct non-resident experts ONE
-    pool step can serve (module docstring). H95c: OFF seat rows are no rows."""
+    pool step can serve (module docstring). H95c: OFF seat rows are no rows.
+
+    #251c ``capture_rows_on``: a CAPTURED step counts at least that many seat
+    rows ON -- the fewest rows ON in any phase whose batch can replay this
+    graph (``d_seat_vram.capture_floor_rows``); the bank is born with every
+    seat row OFF, and the graph only ever replays in such a phase. 0 = the
+    live count, byte-identical."""
     off = seat_off_range(tables)
-    return int(tables.pool_rows - tables.lru_start + int(tables.staging_rows.shape[0])) - (
+    c = int(tables.pool_rows - tables.lru_start + int(tables.staging_rows.shape[0])) - (
         0 if off is None else off[1] - off[0])
+    if capture_rows_on and tables.seat_rows:
+        c += max(0, min(int(capture_rows_on), int(tables.seat_rows)) - int(tables.seat_on))
+    return c
 
 
 def pool_waves_for(n_ids: int, num_experts: int, n_resident: int, capacity: int) -> int:
@@ -713,7 +722,7 @@ def take_demand_report(tables: PoolTables) -> Optional[Tuple[int, int, int]]:
 
 def step_reference(
     tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False,
-    spill: bool = False, wave: bool = False, waves: int = 1,
+    spill: bool = False, wave: bool = False, waves: int = 1, capture_rows_on: int = 0,
 ) -> Tuple[List[Tuple[int, int]], Any]:
     """Plan and flip one step on the host (torch, synchronizing).
 
@@ -754,7 +763,7 @@ def step_reference(
     if len(raw) > buffers.gather_src.shape[0]:
         raise ValueError("Step ids exceed the plan width")
     if step_row_demand(len(raw), E, resident_count(tables)) > max(1, int(waves)) * (
-        pool_row_capacity(tables)
+        pool_row_capacity(tables, capture_rows_on)
     ):
         # Overflow-impossible bound (Task #40): a miss takes an LRU victim
         # (rows not used this step) or a staging row; hits protect at most
@@ -904,17 +913,20 @@ def step_reference(
 
 
 def step(tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False,
-         spill: bool = False, wave: bool = False, waves: int = 1) -> None:
+         spill: bool = False, wave: bool = False, waves: int = 1,
+         capture_rows_on: int = 0) -> None:
     """Plan and flip one step: Triton on CUDA, the reference elsewhere.
 
     ``prefetch=True`` runs the speculative pass (module docstring); it needs
     its OWN ``buffers``, because its gather list must survive on the side
     stream until the copy is done while the target layer's real step writes
     the layer's normal buffers. ``spill``/``wave``/``waves``: H95 overflow
-    waves (``step_reference``); the defaults are the step before H95."""
+    waves (``step_reference``); the defaults are the step before H95.
+    ``capture_rows_on``: #251c, the bound of a captured step
+    (:func:`pool_row_capacity`)."""
     if tables.hot_phys.device.type != "cuda":
         step_reference(tables, ids, buffers, prefetch=prefetch, spill=spill,
-                       wave=wave, waves=waves)
+                       wave=wave, waves=waves, capture_rows_on=capture_rows_on)
         return
     flat = ids.reshape(-1)
     if not flat.is_contiguous():
@@ -924,7 +936,7 @@ def step(tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False,
         raise ValueError("Step ids exceed the plan width")
     if step_row_demand(flat.numel(), tables.num_experts, resident_count(tables)) > max(
         1, int(waves)
-    ) * pool_row_capacity(tables):
+    ) * pool_row_capacity(tables, capture_rows_on):
         raise ValueError("Step ids exceed the LRU rows plus the staging rows")
     _launch_step_kernel(tables, flat, buffers, prefetch=prefetch, spill=spill, wave=wave)
 

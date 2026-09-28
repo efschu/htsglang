@@ -2125,6 +2125,114 @@ def seat_expert_rows_value(rows: Sequence[SeatTableRow]) -> Optional[str]:
     return ",".join(str(v) for v in vals)
 
 
+class KvStageTable(msgspec.Struct, frozen=True, kw_only=True):
+    """#251c: D's KV stage form on the attention host (Form A TP0), for the
+    launcher -- GERECHNET; the runtime recomputes every (n, stage) cell over
+    its real tensors and refuses a form its pages cannot fund.
+
+    The stages trade expert rows for KV: the boot maps S0's KV and ``rows``
+    stage rows ON (they are scratch rows moved into the seat rows, so the boot
+    books exactly the priced bank); a stage j > 0 unmaps ``stage_rows[j]`` of
+    them for its KV prefix. ``max_by_seats[n-1]``: the highest stage a phase
+    of n seats may take -- the DEFAULT keeps every captured batch at the waves
+    it has without stages (variant B: no extra wave), until a measurement
+    prices an extra wave."""
+
+    tokens: Tuple[int, ...]
+    #: the rows stage j's KV above S0 unmaps (0 for S0)
+    stage_rows: Tuple[int, ...]
+    #: the stage rows ON in the boot form: the top stage's rows + 1 (the
+    #: runtime's exact granule arithmetic; a spare row is an LRU row at S2)
+    rows: int
+    max_by_seats: Tuple[int, ...]
+    #: per n: the rows (LRU + staging) the n-seat phase needs for the waves
+    #: its batches have without stages, and per (n, j) the rows it would have
+    need: Tuple[int, ...]
+    capacity: Tuple[Tuple[int, ...], ...]
+    scratch: int
+    host_rank: int
+    row_mib: float
+    kv_cell_bytes: int
+    #: per batch b: the ids' row demand D(b) and today's (stage-free) waves
+    demand: Tuple[int, ...] = ()
+    waves: Tuple[int, ...] = ()
+
+    def extra_waves(self, max_by_seats: Sequence[int]) -> Tuple[int, ...]:
+        """Per batch b = 1..cap: the waves a ``max_by_seats`` row adds to b's
+        captured step over today's -- the capture floor of b is the fewest
+        rows of ANY phase n >= b at its highest stage (a 6-seat phase at S1
+        replays the bs2 graph too), exactly as ``d_seat_vram.capture_floors``."""
+        out = []
+        cap = len(self.capacity)
+        for b in range(1, cap + 1):
+            rows = min(self.capacity[n - 1][min(int(max_by_seats[n - 1]),
+                                                len(self.tokens) - 1)]
+                       for n in range(b, cap + 1))
+            d = self.demand[b - 1]
+            w = max(1, -(-d // max(1, rows))) if d > 0 else 1
+            out.append(w - self.waves[b - 1])
+        return tuple(out)
+
+
+def kv_stage_table(
+    rows: Sequence[SeatTableRow], form: SeatVramForm, *, kv_cell_bytes: int, kv_tokens: int,
+    local_experts: int, verify_tokens: int, top_k: int, host_rank: int = 0,
+    steps: Sequence[float] = (0.5, 1.0), staging_rows: int = 0,
+) -> Optional[KvStageTable]:
+    """#251c: the stage form over the H95 seat table (n = 1..cap).
+
+    Stage tokens: S0 = ``kv_tokens`` (the priced 262k), then S0 x (1 + step).
+    A stage row is an expert row minus its scales (the parts the runtime can
+    unmap: ``expert_row_bytes - small_row_bytes`` per MoE layer).
+
+    The wave rule, per batch b: today a captured step of b seats routes
+    D(b) = min(b x verify x top_k, E - R) ids over C = scratch rows in
+    W(b) = ceil(D(b) / C) waves, i.e. it needs ceil(D(b) / W(b)) rows. A phase
+    of n seats replays every b <= n; at stage j it has C + seat_extra(n) -
+    stage_rows[j] rows. The highest j with that >= the need of every b <= n is
+    ``max_by_seats[n-1]`` -- no batch gains a wave. None when the geometry is
+    incomplete (no KV cell, no scratch)."""
+    if not rows or int(kv_cell_bytes) <= 0 or int(kv_tokens) <= 0:
+        return None
+    h = int(host_rank)
+    last = rows[-1]
+    if h >= len(last.scratch_given):
+        return None
+    C = int(last.scratch_given[h])
+    R = int(last.max_rows[h]) - C
+    row_bytes = (int(form.expert_row_bytes) - int(form.small_row_bytes)) * int(form.moe_layers)
+    if C <= 0 or row_bytes <= 0:
+        return None
+    t0 = int(kv_tokens)
+    tokens = (t0,) + tuple(t0 + int(round(t0 * float(s))) for s in steps)
+    stage_rows = tuple(-(-(t - t0) * int(kv_cell_bytes) // row_bytes) for t in tokens)
+    S = int(stage_rows[-1]) + 1
+    if C - S <= max(1, int(staging_rows)):
+        return None
+    E = int(local_experts)
+    per_seat = int(verify_tokens) * int(top_k)
+    need_b, demand, waves = [], [], []
+    for b in range(1, len(rows) + 1):
+        d = min(b * per_seat, max(E - R, 0))
+        w = max(1, -(-d // C))
+        need_b.append(-(-d // w) if d > 0 else 0)
+        demand.append(d)
+        waves.append(w)
+    need, cap_rows, max_by = [], [], []
+    for n, row in enumerate(rows, start=1):
+        need_n = max(need_b[:n])
+        extra = int(row.seat_extra[h]) if row.seat_extra and h < len(row.seat_extra) else 0
+        caps = tuple(C + extra - int(r) for r in stage_rows)
+        need.append(need_n)
+        cap_rows.append(caps)
+        max_by.append(max([j for j, c in enumerate(caps) if c >= need_n] or [0]))
+    return KvStageTable(
+        tokens=tokens, stage_rows=stage_rows, rows=S, max_by_seats=tuple(max_by),
+        need=tuple(need), capacity=tuple(cap_rows), scratch=C, host_rank=h,
+        row_mib=round(row_bytes / MIB, 2), kv_cell_bytes=int(kv_cell_bytes),
+        demand=tuple(demand), waves=tuple(waves))
+
+
 def seat_table(
     plan_for_seats, *, seats_max: int, verify_tokens: int, top_k: int, waves: int,
     host_rank: int = 0, seat_vram: Optional[SeatVramForm] = None,

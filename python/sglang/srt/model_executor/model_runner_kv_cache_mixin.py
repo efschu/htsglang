@@ -5224,10 +5224,13 @@ class ModelRunnerKVCacheMixin:
         # #251c: under D's KV stage form the allocator hands out only stage
         # S0's pages until the first wake picks a stage (every rank, the same
         # cap -- the pool is VIRTUALLY the top stage, see _config_from_budget).
+        # The decode capture that follows asks for its row floor over these
+        # pools (d_seat_vram.capture_floor_rows).
         if not self.is_draft_worker:
             from sglang.srt.weg2 import d_seat_vram as _dsv
 
             _dsv.kv_stage_boot_cap(self.token_to_kv_pool_allocator, self.page_size)
+            _dsv.note_capture_context(self)
 
     def _hybrid_kv_token_cap(self: ModelRunner) -> Optional[int]:
         """Physically reachable ceiling on max_total_num_tokens for hybrid
