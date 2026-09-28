@@ -4112,6 +4112,44 @@ def pp_pass_retraction_reason_of(holder, mb_id: int) -> Optional[str]:
 
 
 
+def weg2_791c_release_on_idle_vote(self, vote) -> None:
+    """#791C LIVENESS: a follower under the row authority keeps a chunked
+    request whose abort it received until PP0's forwarded schedule stops
+    naming it. If PP0 then launches no further pass (idle queue, the
+    quiesce before a flip), no frame ever comes -- and a frameless cycle
+    skips the plan (PLAN BYPASS), so ``process_pending_chunked_abort``
+    never runs: the request, its pool row and KV would stay, and
+    ``is_fully_idle`` (``chunked_req is None``) would keep this rank's vote
+    not-idle, so the front's quiesce ends in W3.
+
+    The group-uniform release is this vote: PP0 attached its own slot
+    before the vote left it, and an IDLE PP0 slot means PP0 applied its
+    abort and every pass it launched completed the ring -- every frame that
+    named the rid ran here. Applied only when this rank's own microbatches
+    are drained too (else the next lap; the front polls). No collective.
+    A MODULE function on purpose: the #1268 lap tests drive
+    ``_weg2_vote_attach_own_slot`` on stand-ins that are no Scheduler; every
+    read here is a ``getattr`` with a default, so a stand-in returns at once."""
+    req = getattr(self, "_pending_chunked_abort_req", None)
+    if req is None or int(getattr(self.ps, "pp_rank", 0) or 0) == 0:
+        return
+    try:
+        from sglang.srt.weg2 import p_row_authority as _prow
+        from sglang.srt.weg2.pp_abort import pp0_idle_in_vote
+
+        if not _prow.applies(self) or not pp0_idle_in_vote(getattr(vote, "slots", ())):
+            return
+        if not self._pp_microbatches_drained():
+            return
+    except Exception:  # noqa: BLE001 - the release never blocks the vote
+        return
+    self._791c_pp0_drained = True
+    try:
+        self.process_pending_chunked_abort()
+    finally:
+        self._791c_pp0_drained = False
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -6403,8 +6441,10 @@ class SchedulerPPMixin:
                     exc,
                 )
         rank = int(self.ps.pp_rank)
+        weg2_791c_release_on_idle_vote(self, vote)
         if attach_slot(vote, rank, self.is_fully_idle(), ", ".join(self.idle_blockers()) or "none"):
             log_verdict(vote, rank)
+
 
     def _weg2_vote_maybe_stamp(self: Scheduler, recv_reqs: List) -> None:
         """PP0 only: mint a numbered vote when one is wanted and none is out.
