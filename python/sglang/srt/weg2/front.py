@@ -3771,6 +3771,8 @@ class Front:
         #: the D phase (epoch) whose immediate park was held by the dwell
         #: already named (one WEG2 PARK-IMMEDIATE-DWELL line per phase).
         self._park_immediate_dwell_epoch = -1
+        #: #1416i: wall time of the latest PARK-IMMEDIATE-DWELL hold decision.
+        self._park_dwell_held_t: Optional[float] = None
         #: UNIFY (operator 26.09.): the NF H91 standard form on this front --
         #: rule 2's hand-over term and handoff_n/parked_n on D's wake. qwen27b
         #: off: the 27B front byte-identical (profile field standard_form).
@@ -4247,6 +4249,9 @@ class Front:
         else:
             dwell_ok = phase_policy.immediate_park_dwell_ok(awake_s, need_ms, FAIRNESS_DWELL_FLOOR_MS)
         if not dwell_ok:
+            # DP-WAIT (#1416i): the wall time of the latest dwell hold -- the
+            # requests whose hold spans it name min-dwell, not only d-work
+            self._park_dwell_held_t = time.time()
             if self._park_immediate_dwell_epoch != self.epoch:
                 self._park_immediate_dwell_epoch = self.epoch
                 self.counters["park_immediate_dwell_holds"] += 1
@@ -9203,7 +9208,8 @@ class Front:
             p.dp_arrival = None
             try:
                 dec = _dp_wait.decompose(a, t_flip0, t_drain_end, self.t_awake)
-                by = _dp_wait.hold_by(a, self.counters)
+                by = _dp_wait.hold_by(a, self.counters, t_flip0=t_flip0,
+                                      dwell_held_t=getattr(self, "_park_dwell_held_t", None))
                 logger.info("%s", _dp_wait.line(
                     p.rid, self.epoch, a, dec, by, self.counters, p.est_prompt,
                     p.est_uncached, p.store_span_est, p.span_known))

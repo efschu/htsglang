@@ -238,3 +238,40 @@ class TheWiring(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheParkDwellNamesItsHold(CustomTestCase):
+    """#1416i, NF z30e (ca2a9706ec) 21:31:33.522: weg2-32-64 queued while
+    ``WEG2 PARK-IMMEDIATE-DWELL epoch=32 ... awake_ms=3502 min_dwell_ms=6050``
+    held the immediate park (one line per D phase, logged before or at the
+    arrival: no counter rises for it); the flip began 3.1 s later and the
+    DP-WAIT line said ``hold_by=d-work``."""
+
+    T_ARR, T_DWELL_LAST, T_FLIP0 = 33.522, 36.600, 36.636
+
+    def test_a_dwell_hold_inside_the_hold_names_min_dwell(self):
+        a = DW.take(self.T_ARR, "long", False, 5, 0, 0, _counters())
+        by = DW.hold_by(a, _counters(), t_flip0=self.T_FLIP0, dwell_held_t=self.T_DWELL_LAST)
+        self.assertEqual(by, "d-work+min-dwell")
+
+    def test_a_dwell_before_the_arrival_or_none_changes_nothing(self):
+        a = DW.take(self.T_ARR, "long", False, 5, 0, 0, _counters())
+        self.assertEqual(DW.hold_by(a, _counters(), t_flip0=self.T_FLIP0, dwell_held_t=30.0), "d-work")
+        self.assertEqual(DW.hold_by(a, _counters()), "d-work")
+
+    def test_the_report_passes_the_fronts_last_dwell_hold(self):
+        fr = _fake_front()
+        p = _pending("weg2-32-64")
+        p.dp_arrival = DW.take(self.T_ARR, "long", False, 5, 0, 0, fr.counters)
+        fr.queue.append(p)
+        fr.t_awake = self.T_FLIP0 + 2.6
+        fr._park_dwell_held_t = self.T_DWELL_LAST
+        with self.assertLogs("weg2.front", level=logging.INFO) as cm:
+            F.Front._dp_report(fr, self.T_FLIP0, None)
+        line = [r.getMessage() for r in cm.records if "WEG2 DP-WAIT" in r.getMessage()][0]
+        self.assertIn("hold_by=d-work+min-dwell", line)
+
+    def test_the_dwell_hold_stamps_its_wall_time(self):
+        src = inspect.getsource(F.Front)
+        i = src.index("if not dwell_ok:")
+        self.assertIn("self._park_dwell_held_t = time.time()", src[i:i + 400])
