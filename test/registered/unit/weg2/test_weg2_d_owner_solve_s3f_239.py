@@ -225,3 +225,48 @@ def test_the_flag_accepts_owned_with_a_vector():
     assert er.owned_cut_request((0.0, 32.0, 32.0)) == (False, None)
     with pytest.raises(L.Weg2LaunchRefused):
         L.d_kv_token_cut(types.SimpleNamespace(d_kv_token_cut="owned:x"))
+
+
+# ---- the seat table recomputes the SOLVED form (dry run 28.09. 17:50Z) ----------
+
+def _owned_plan():
+    return types.SimpleNamespace(solved_owner_ratio=(215, 113, 160), kv_token_cut=(0, 48, 16),
+                                 solved_fractions=(0.088, 0.579, 0.473))
+
+
+def test_seat_table_takes_the_solved_cut_and_fr_under_owned():
+    for cut in ("owned", "owned:0,32,32"):
+        kw, fr = L.d_seat_table_form(_owned_plan(), dict(kv_token_shares=cut, kv_dtype_bytes=1),
+                                     [0.06, 0.51, 0.48])
+        # a fixed vector: the table never re-solves the ownership
+        assert kw["kv_token_shares"] == (0.0, 48.0, 16.0)
+        assert not er.owned_cut_request(kw["kv_token_shares"])[0]
+        assert kw["kv_dtype_bytes"] == 1
+        assert fr == [0.088, 0.579, 0.473]
+
+
+def test_seat_table_is_unchanged_without_an_owned_solve():
+    stated = [0.06, 0.51, 0.48]
+    for kw_in in ({}, dict(kv_token_shares="joint", kv_dtype_bytes=1),
+                  dict(kv_token_shares=(0.0, 48.0, 16.0), kv_dtype_bytes=1)):
+        kw, fr = L.d_seat_table_form(_owned_plan(), kw_in, stated)
+        assert kw == kw_in and fr == stated
+    # owned asked, but the solve found nothing: no rewrite (the refusal stands)
+    failed = types.SimpleNamespace(solved_owner_ratio=(), kv_token_cut=(), solved_fractions=())
+    kw, fr = L.d_seat_table_form(failed, dict(kv_token_shares="owned"), stated)
+    assert kw == dict(kv_token_shares="owned") and fr == stated
+
+
+def test_the_launcher_feeds_the_seat_table_the_solved_form():
+    src = inspect.getsource(L.log_d_rank_vram_solve)
+    i = src.index("_seat_cut_kw, _seat_fr = d_seat_table_form(plan, _kv_cut_kw, fr_d)")
+    j = src.index("for _ln in d_seat_table_lines(ns, _er, dict(", i)
+    k = src.index("**_seat_cut_kw,", j)
+    assert "fractions=_seat_fr," in src[j:k]
+    assert "**_kv_cut_kw," not in src[j:k + 20]
+
+
+def test_the_target_form_worse_than_form_a_is_a_named_line():
+    src = inspect.getsource(er.plan_d_residency)
+    assert "ZIELFORM max T_r %.2f > " in src and "Form A max %.2f: +%.2f ms" in src
+    assert '"target_over_form_a_ms"' in src

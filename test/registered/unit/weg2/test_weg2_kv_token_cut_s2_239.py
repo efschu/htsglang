@@ -213,4 +213,8 @@ def test_every_d_solve_of_the_launcher_carries_the_cut():
 
     src = inspect.getsource(L.log_d_rank_vram_solve)
     assert src.count("_er.plan_d_residency(") == 2
-    assert src.count("**_kv_cut_kw") == 3
+    # #239 S3f: the seat table carries the cut through d_seat_table_form (the
+    # SOLVED vector under 'owned', else the stated kwargs unchanged)
+    assert src.count("**_kv_cut_kw") == 2
+    assert "d_seat_table_form(plan, _kv_cut_kw, fr_d)" in src
+    assert src.count("**_seat_cut_kw") == 1

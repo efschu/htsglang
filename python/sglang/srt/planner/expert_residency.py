@@ -3190,6 +3190,8 @@ def plan_d_residency(
             ("feasible", sol.feasible),
             ("forced_shares", list(_forced_shares) if _forced_shares else None),
             ("x1_ok", sol.x1_ok),
+            ("target_over_form_a_ms", round(max(sol.round_ms) - max(sol.base_round_ms), 3)
+             if sol.round_ms else None),
             ("kv_tokens", int(kv_tokens)),
         )
         if sol.feasible:
@@ -3219,6 +3221,17 @@ def plan_d_residency(
                    OWNED_MISS_MS_SOURCE_SEED, ids, fa_layers, OWNED_ATTN_SOURCE_SEED,
                    int(kv_tokens)),
             )
+            if max(sol.round_ms) > max(sol.base_round_ms) + 1e-9:
+                # main 28.09.: the x1 rule holds per worker, but the min-max
+                # objective ends above Form A -- named, so the record keeps it
+                cut_lines = cut_lines + (
+                    "%s FRACTION-SOLVE %s D-EIGENTUM (#239 S3f) ZIELFORM max T_r %.2f > "
+                    "Form A max %.2f: +%.2f ms je Runde bs1 (Rang %d, Saat UNMEASURED -- "
+                    "M1 misst)"
+                    % (marker, label, max(sol.round_ms), max(sol.base_round_ms),
+                       max(sol.round_ms) - max(sol.base_round_ms),
+                       sol.round_ms.index(max(sol.round_ms))),
+                )
         else:
             owner_refusal = (
                 "%s (%s): D-EIGENTUM (#239 S3f) -- keine tragbare Form mit Host-Anteil 0: "
