@@ -71,6 +71,10 @@ ENV_SMALL_BAR_GROUPS = "SGLANG_WEG2_BAR1_SMALL_BAR_GROUPS"
 #: (W109) instead of after the 120 s credit budget (W35).
 ENV_CYCLE_GRACE_S = "SGLANG_WEG2_BAR1_CYCLE_GRACE_S"
 SLOW_WAIT_S = 0.5     # a credit wait longer than this posts a `blocked` flag
+#: W109b (rc12z4 flip 22): how often a blocked depositor asks whether its wait
+#: closes a credit cycle, and the edge age it acts at -- a third of the
+#: waker's W109 grace, so the sleeper spills before the waker would refuse.
+SPILL_TICK_S = 0.5
 BIG_BAR_MIN = 4 << 30      # a BAR1 at least this large holds the big slot ring
 MODE_BAR1 = "bar1"
 MODE_HOST = "host"
@@ -259,14 +263,20 @@ def post_flag(d: str, kind: str, seq, g: int, payload: Optional[dict] = None) ->
 
 
 def take_flag(d: str, kind: str, seq, g: int, timeout_s: float,
-              liveness=None, on_slow=None) -> Optional[dict]:
+              liveness=None, on_slow=None, on_tick=None) -> Optional[dict]:
     """The flag's payload ({} when it carried none) once it exists -- consumed
     (unlinked); None on timeout or when ``liveness()`` says the peer is gone.
-    Hot poll: a batch is 0.6-5 ms of DMA, a 200-us sleep would be 4-30 %."""
+    Hot poll: a batch is 0.6-5 ms of DMA, a 200-us sleep would be 4-30 %.
+    ``on_tick`` (W109b): asked every SPILL_TICK_S; truthy raises _CycleSpill."""
     p = _flag_path(d, kind, seq, g)
     t0 = time.perf_counter()
     n = 0
+    next_tick = t0 + SPILL_TICK_S
     while True:
+        if on_tick is not None and time.perf_counter() >= next_tick:
+            next_tick = time.perf_counter() + SPILL_TICK_S
+            if on_tick():
+                raise _CycleSpill()
         try:
             with open(p) as fh:
                 raw = fh.read()
@@ -290,17 +300,59 @@ def take_flag(d: str, kind: str, seq, g: int, timeout_s: float,
 _FRAME = struct.Struct("<cI")
 
 
+class _CycleSpill(Exception):
+    """W109b: the depositor's credit wait closes a waker credit cycle -- the
+    rest of the tag goes to the lane's host backlog (``_spill_rest``)."""
+
+
+class _SpillBuf:
+    """Anonymous host memory for one spilled tag remainder, exactly sized
+    (no power-of-two pinned cache that outlives it) and page-locked for the
+    copies when the driver agrees; unmapped when the backlog has fed it."""
+
+    def __init__(self, nbytes: int, ops):
+        self.n = max(1, int(nbytes))
+        self.ops = ops
+        self.mm = mmap.mmap(-1, self.n)
+        self._c = ctypes.c_char.from_buffer(self.mm)
+        self.ptr = ctypes.addressof(self._c)
+        self.registered = False
+        reg = getattr(ops, "host_register", None)
+        if reg is not None and int(nbytes) > 0:
+            try:
+                reg(self.ptr, self.n, 0)
+                self.registered = True
+            except Exception:  # noqa: BLE001 -- pageable still copies, only slower
+                self.registered = False
+
+    def close(self) -> None:
+        if self.mm is None:
+            return
+        if self.registered:
+            try:
+                self.ops.host_unregister(self.ptr)
+            except Exception:  # noqa: BLE001 -- a teardown never fails the transfer
+                pass
+        self._c = None
+        try:
+            self.mm.close()
+        except BufferError:
+            pass
+        self.mm = None
+
+
 class FileCredits:
     def __init__(self, d: str, seq, liveness=None):
         self.d, self.seq, self.liveness = d, seq, liveness
         self.on_slow = None
+        self.on_tick = None
 
     def send(self, kind: str, g: int = 0, payload=None) -> None:
         post_flag(self.d, kind, self.seq, g, payload)
 
     def recv(self, kind: str, g: int, timeout_s: float):
         return take_flag(self.d, kind, self.seq, g, timeout_s, liveness=self.liveness,
-                         on_slow=self.on_slow)
+                         on_slow=self.on_slow, on_tick=self.on_tick)
 
 
 class SocketCredits:
@@ -312,6 +364,7 @@ class SocketCredits:
     def __init__(self, sock, liveness=None):
         self.sock, self.liveness = sock, liveness
         self.on_slow = None
+        self.on_tick = None
 
     def send(self, kind: str, g: int = 0, payload=None) -> None:
         body = b"" if payload is None else json.dumps(payload).encode()
@@ -332,6 +385,9 @@ class SocketCredits:
                 k += 1
                 if k == 1 and self.on_slow is not None:
                     self.on_slow()
+                # W109b: only between frames -- a half-read frame is never dropped
+                if not buf and self.on_tick is not None and self.on_tick():
+                    raise _CycleSpill()
                 if self.liveness is not None and not self.liveness():
                     return None
                 continue
@@ -565,6 +621,10 @@ class Bar1Lanes:
         self._dst_lanes: list = []
         self._windows_logged = False
         self.last_seq: dict = {}       # lane -> the seq this side ran last (the depositor's done-wait)
+        # W109b: lane -> FIFO of spilled tags fed from host memory, in order
+        self.backlog: dict = {}
+        self.backlog_errors: list = []
+        self.backlog_cv = threading.Condition()
         self._reconnect_tried: set = set()   # H89: lanes whose one flip-time reconnect is spent
         self._reconnect_lock = threading.Lock()
         self.turn: dict = {}           # lane -> {(flip, index), ...} pending tags, oldest runs first
@@ -653,22 +713,26 @@ class Bar1Lanes:
         except (OSError, ValueError):
             return None
 
-    def read_credit_waits(self) -> dict:
-        """waker rank -> payload, for THIS group's ranks in a credit wait."""
+    def read_credit_waits(self, group: Optional[str] = None) -> dict:
+        """waker rank -> payload, for THIS group's ranks in a credit wait
+        (``group``: another group's -- the depositor asks about its wakers)."""
         out = {}
         d = self.credit_dir()
+        grp = self.group if group is None else str(group).upper()
         for r in range(len({s for s, _ in self.cross_pairs} | {d_ for _, d_ in self.cross_pairs})):
-            p = self._read_json(_flag_path(d, "wait", self.group, r))
+            p = self._read_json(_flag_path(d, "wait", grp, r))
             if p is not None:
                 out[r] = p
         return out
 
-    def read_blocked(self) -> dict:
+    def read_blocked(self, group: Optional[str] = None) -> dict:
         """(src, dst) -> payload for every deposit of the OTHER group into
-        this group that is blocked on our collect (its `blocked` flag)."""
+        this group that is blocked on our collect (its `blocked` flag).
+        ``group``: the receiving group to read (default: this one)."""
         out = {}
+        grp = self.group if group is None else str(group).upper()
         for k, (s, d_) in enumerate(self.cross_pairs):
-            fd = flag_dir(self.boot_nonce, f"p{k}", self.group, self.root)
+            fd = flag_dir(self.boot_nonce, f"p{k}", grp, self.root)
             try:
                 names = os.listdir(fd)
             except OSError:
@@ -690,6 +754,73 @@ class Bar1Lanes:
         """The blocked chain closing at this rank, or None (see `credit_cycle`)."""
         g = cycle_grace_s() if grace_s is None else float(grace_s)
         return credit_cycle(self.rank, self.read_credit_waits(), self.read_blocked(), g, time.time())
+
+    # -- W109b: the depositor's half of the cycle ------------------------
+    def deposit_cycle(self, grace_s: Optional[float] = None):
+        """The waker credit cycle one of whose edges is THIS rank's blocked
+        deposit, or None. Read from the depositor's side: the wakers are the
+        other group, the blocked flags are the ones this group posted into
+        it. ``grace_s`` defaults to a third of the waker's W109 grace -- the
+        sleeper has to act (``_spill_rest``) before the waker refuses."""
+        g = (max(0.5, cycle_grace_s() / 3.0) if grace_s is None else float(grace_s))
+        other = other_group(self.group)
+        waits = self.read_credit_waits(other)
+        blocked = self.read_blocked(other)
+        now = time.time()
+        for w in sorted(waits):
+            chain = credit_cycle(w, waits, blocked, g, now)
+            if chain and any(int(s) == self.rank for s, _d, _t in chain):
+                return chain
+        return None
+
+    def backlog_busy(self, lane_key: str) -> bool:
+        """A spilled tag of this lane is still being fed from the host."""
+        with self.backlog_cv:
+            return bool(self.backlog.get(lane_key))
+
+    def backlog_push(self, lane_key: str, job) -> None:
+        with self.backlog_cv:
+            q = self.backlog.setdefault(lane_key, [])
+            q.append(job)
+            start = len(q) == 1
+            self.backlog_cv.notify_all()
+        if start:
+            threading.Thread(target=self._backlog_run, args=(lane_key,), daemon=True,
+                             name=f"weg2-bar1-backlog-{lane_key}").start()
+
+    def _backlog_run(self, lane_key: str) -> None:
+        while True:
+            with self.backlog_cv:
+                q = self.backlog.get(lane_key) or []
+                if not q:
+                    return
+                job = q[0]
+            try:
+                why = job()
+            except Exception as exc:  # noqa: BLE001 -- a feeder failure is named, never lost
+                why = f"{type(exc).__name__}: {exc}"
+            with self.backlog_cv:
+                if why:
+                    self.backlog_errors.append(f"{lane_key}: {why}")
+                self.backlog[lane_key].pop(0)
+                if not self.backlog[lane_key]:
+                    del self.backlog[lane_key]
+                self.backlog_cv.notify_all()
+
+    def join_backlog(self, budget_s: float) -> str:
+        """Wait until every spilled tag of every lane is fed (the sleep leg's
+        end, after the last pause -- nothing on this rank blocks a waker any
+        more). Returns "" or the feeders' refusals."""
+        deadline = time.monotonic() + float(budget_s)
+        with self.backlog_cv:
+            while self.backlog:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return (f"W109b backlog: {sorted(self.backlog)} still feeding after "
+                            f"{budget_s:.0f} s")
+                self.backlog_cv.wait(min(left, 0.5))
+            errs, self.backlog_errors = list(self.backlog_errors), []
+        return " | ".join(errs)
 
     def channel(self, lane_key: str, role: str):
         """The lane's open AF_UNIX connection from this side, or None (file flags)."""
@@ -1173,9 +1304,11 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
 
 
 def _recv_marked(cred, kind: str, g: int, budget_s: float, d: str, seq, lane_key: str,
-                 rank: int, wait: str):
+                 rank: int, wait: str, on_tick=None):
     """The depositor's credit wait; longer than SLOW_WAIT_S it posts a
-    `blocked` flag (#22) the wakers' cycle reader sees, removed on return."""
+    `blocked` flag (#22) the wakers' cycle reader sees, removed on return.
+    ``on_tick`` (W109b): asked while the wait lasts; truthy raises
+    _CycleSpill (the flag is removed on that exit too)."""
     posted = []
 
     def slow():
@@ -1188,10 +1321,12 @@ def _recv_marked(cred, kind: str, g: int, budget_s: float, d: str, seq, lane_key
                 pass
 
     cred.on_slow = slow
+    cred.on_tick = on_tick
     try:
         return cred.recv(kind, g, budget_s)
     finally:
         cred.on_slow = None
+        cred.on_tick = None
         if posted:
             try:
                 os.unlink(_flag_path(d, "blocked", seq, g))
@@ -1288,8 +1423,111 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
               str(getattr(descs[pc.desc_index], "tag", "") or ""), int(pc.nbytes), int(pc.slot_off)]
              for pc in b.pieces] for b in batches]
     lanes.last_seq[lane_key] = seq
+    # W109b (rc12z4 flip 22): a depositor whose credit wait is one edge of a
+    # waker credit cycle hands the rest of the tag to the lane's host backlog
+    # and returns -- the caller pauses the tag, the credit reaches the waker,
+    # the cycle is gone. The collector's protocol is unchanged.
+    tick_state: dict = {}
+    tick = None
+    if role == "src" and hasattr(lanes, "deposit_cycle") and hasattr(lanes, "backlog_push"):
+        def tick():
+            try:
+                chain = lanes.deposit_cycle()
+            except Exception:  # noqa: BLE001 -- a probe may not raise
+                chain = None
+            if chain:
+                tick_state["chain"] = chain
+            return bool(chain)
+
+    def _spill_rest(from_g: int, next_free: int, plan_sent: bool, pending=()) -> str:
+        for x in pending:
+            _finish(x)
+        rest = list(range(int(from_g), nb))
+        offs, h_total = {}, 0
+        for x in rest:
+            offs[x] = h_total
+            h_total += int(batches[x].total_bytes)
+        ts0 = time.perf_counter()
+        host = _SpillBuf(h_total, ops)
+        try:
+            st = streams[0]
+            for x in rest:
+                for piece in batches[x].pieces:
+                    desc = descs[piece.desc_index]
+                    if desc.src_ptr is None:
+                        host.close()
+                        return (f"bar1 deposit lane={lane_key} batch {x}: desc "
+                                f"{getattr(desc, 'param_name', '?')!r} carries no src_ptr")
+                    src = int(desc.src_ptr) + int(piece.src_off)
+                    dst = host.ptr + offs[x] + int(piece.slot_off)
+                    if piece.kind == tp.FLAT:
+                        ops.memcpy_async(dst, src, int(piece.nbytes), st)
+                    else:
+                        ops.memcpy2d_async(dst, int(piece.run_bytes), src, int(piece.spitch),
+                                           int(piece.run_bytes), int(piece.rows), st)
+            if rest:
+                timed_sync(ops, st, clk)
+        except BaseException:
+            host.close()
+            raise
+        spill_ms = (time.perf_counter() - ts0) * 1000
+        chain = tick_state.get("chain")
+        log(f"WEG2-BAR1 CYCLE-SPILL lane={lane_key} phase={phase} seq={seq} "
+            f"from_batch={from_g}/{nb} bytes={h_total} spill_ms={spill_ms:.0f} "
+            f"host_registered={host.registered} why="
+            + (" -> ".join(f"sleeper{s} blocked depositing {t} to waker{w}" for s, w, t in chain)
+               if chain else "an earlier tag of this lane is still in its backlog")
+            + " -- the tag's device bytes are free now; the rest is fed from host memory "
+            "as the collector drains (W109b)")
+
+        def job() -> str:
+            tj = time.perf_counter()
+            try:
+                c2 = (SocketCredits(chan, liveness) if chan is not None
+                      else FileCredits(d, seq, liveness))
+                if not plan_sent:
+                    c2.send("plan", 0, {"batches": plan})
+                nf = int(next_free)
+                with lane_streams(ops, device, 1) as fst:
+                    for x in rest:
+                        if x >= ring:
+                            if via == "sock":
+                                while nf <= x - ring:
+                                    if c2.recv("free", nf, budget_s) is None:
+                                        return (f"bar1 backlog lane={lane_key} seq={seq}: no "
+                                                f"'free' for batch {nf} within {budget_s:.0f} s")
+                                    nf += 1
+                            elif c2.recv("free", x - ring, budget_s) is None:
+                                return (f"bar1 backlog lane={lane_key} seq={seq}: no 'free' "
+                                        f"for batch {x - ring} within {budget_s:.0f} s")
+                        ops.memcpy_async(base + ring_slot(x, ring) * slot_bytes, host.ptr + offs[x],
+                                         int(batches[x].total_bytes), fst[0])
+                        ops.synchronize(fst[0])
+                        c2.send("full", x)
+                    if via == "sock":
+                        while nf < nb:
+                            if c2.recv("free", nf, budget_s) is None:
+                                return (f"bar1 backlog lane={lane_key} seq={seq}: no trailing "
+                                        f"'free' for batch {nf} within {budget_s:.0f} s")
+                            nf += 1
+                    if c2.recv("done", 0, budget_s) is None:
+                        return (f"bar1 backlog lane={lane_key} seq={seq}: the collector never "
+                                f"reported done within {budget_s:.0f} s")
+                log(f"WEG2-BAR1 CYCLE-SPILL fed lane={lane_key} seq={seq} batches={len(rest)} "
+                    f"bytes={h_total} ms={(time.perf_counter() - tj) * 1000:.0f}")
+                return ""
+            finally:
+                host.close()
+
+        lanes.backlog_push(lane_key, job)
+        return ""
+
     try:
         if role == "src":
+            _busy = getattr(lanes, "backlog_busy", None)
+            if _busy is not None and _busy(lane_key):
+                # the lane's byte stream belongs to the backlog until it drains
+                return _spill_rest(0, 0, plan_sent=False)
             cred.send("plan", 0, {"batches": plan})
         else:
             tw = time.perf_counter()
@@ -1315,8 +1553,14 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
             if role == "src":
                 if g >= ring:
                     tw = time.perf_counter()
-                    if _recv_marked(cred, "free", g - ring, budget_s, d, seq, lane_key,
-                                    lanes.rank, "free") is None:
+                    try:
+                        got_free = _recv_marked(cred, "free", g - ring, budget_s, d, seq, lane_key,
+                                                lanes.rank, "free", on_tick=tick)
+                    except _CycleSpill:
+                        clk.credit += time.perf_counter() - tw
+                        return _spill_rest(g, g - ring, plan_sent=True,
+                                           pending=range(max(0, g - lag), g))
+                    if got_free is None:
                         return (f"bar1 deposit lane={lane_key} seq={seq}: no 'free' for batch "
                                 f"{g - ring} within {budget_s:.0f} s (collector gone or stuck)")
                     clk.credit += time.perf_counter() - tw
@@ -1400,12 +1644,21 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
             tw = time.perf_counter()
             if via == "sock":
                 for g in range(max(0, nb - ring), nb):
-                    if _recv_marked(cred, "free", g, budget_s, d, seq, lane_key,
-                                    lanes.rank, "trailing-free") is None:
+                    try:
+                        got_free = _recv_marked(cred, "free", g, budget_s, d, seq, lane_key,
+                                                lanes.rank, "trailing-free", on_tick=tick)
+                    except _CycleSpill:
+                        # every byte is in the ring already: the backlog only waits
+                        return _spill_rest(nb, g, plan_sent=True)
+                    if got_free is None:
                         return (f"bar1 deposit lane={lane_key} seq={seq}: no trailing 'free' for "
                                 f"batch {g} within {budget_s:.0f} s")
-            if _recv_marked(cred, "done", 0, budget_s, d, seq, lane_key,
-                            lanes.rank, "done") is None:
+            try:
+                got_done = _recv_marked(cred, "done", 0, budget_s, d, seq, lane_key,
+                                        lanes.rank, "done", on_tick=tick)
+            except _CycleSpill:
+                return _spill_rest(nb, nb, plan_sent=True)
+            if got_done is None:
                 return (f"bar1 deposit lane={lane_key} seq={seq}: the collector never reported "
                         f"done within {budget_s:.0f} s")
             clk.credit += time.perf_counter() - tw
