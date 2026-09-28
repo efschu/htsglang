@@ -6,8 +6,8 @@ together, like continuous batching.
 
 What is new for the 27B and pinned here:
 
-* registry -- ``ModelProfile.d_park_immediate`` (qwen27b off until measured,
-  nextflash off), switch ``SGLANG_WEG2_D_PARK_IMMEDIATE`` (explicit wins);
+* registry -- ``ModelProfile.d_park_immediate`` (ON on qwen27b and nextflash
+  since 28.09.), switch ``SGLANG_WEG2_D_PARK_IMMEDIATE`` (explicit wins);
 * D -- ``d_seats.d_flip_park_active``: the FLIP park only (park_running, late
   hold, sleep hold, awake re-queue, admission barrier). The pressure park, the
   youngest-first retraction order and the MTP draft carry stay on
@@ -76,16 +76,20 @@ def d27(clean):
 
 
 # ------------------------------------------------------------------ registry
-def test_the_registry_rows_are_off_until_measured():
-    assert FM.PROFILES["qwen27b"].d_park_immediate is False
-    assert FM.PROFILES["nextflash"].d_park_immediate is False
+def test_both_rows_park_at_once():
+    # User 26.09. (d2p-sofort-flippen, "Wartegrenze 0"): D->P waits for nothing,
+    # for BOTH models -- a REGISTRY default since 28.09. (rc12z21 b1 stalled its
+    # D->P flip 13:44:38-~13:51 on one endless decode, 15 requests waiting,
+    # because only the b23 arm set the switch; NF ran on its 60 s wait bound).
     for prof in ("qwen27b", "nextflash"):
-        assert FM.PROFILE_SWITCH_DEFAULTS[prof][IMM] is False
+        assert FM.PROFILES[prof].d_park_immediate is True, prof
+        assert FM.PROFILE_SWITCH_DEFAULTS[prof][IMM] is True, prof
 
 
 @pytest.mark.parametrize("profile,explicit,want", [
-    ("qwen27b", None, False), ("nextflash", None, False), (None, None, False),
-    ("qwen27b", "1", True), ("qwen27b", "on", True), ("qwen27b", "0", False), (None, "1", True)])
+    ("qwen27b", None, True), ("nextflash", None, True), (None, None, False),
+    ("qwen27b", "1", True), ("qwen27b", "on", True), ("qwen27b", "0", False), (None, "1", True),
+    ("nextflash", "0", False)])  # an explicit 0 in the profile wins on either model
 def test_the_switch_follows_the_profile_and_an_explicit_value_wins(clean, profile, explicit, want):
     if profile is not None:
         clean.setenv(FM.FORM_ENV, _form_env(profile))
@@ -99,7 +103,8 @@ def test_the_switch_follows_the_profile_and_an_explicit_value_wins(clean, profil
 
 
 @pytest.mark.parametrize("profile,imm,park,group,flip,full", [
-    ("qwen27b", None, None, "D", False, False),     # 27B today: no park at all
+    ("qwen27b", None, None, "D", True, False),      # 27B default: flip park ONLY (row on)
+    ("qwen27b", "0", None, "D", False, False),      # explicit 0: no park at all
     ("qwen27b", "1", None, "D", True, False),       # 27B park: flip park ONLY
     ("qwen27b", "1", None, "P", False, False),      # group P never parks
     ("qwen27b", "1", "0", "D", False, False),       # explicit D_PARK=0 = no park at all
@@ -242,7 +247,7 @@ def test_27b_admission_is_the_stock_loop_until_something_is_flip_parked(d27):
     assert gate.skip(parked) is None and gate.skip(q[0]) == "weg2_d_park_first"
 
 
-@pytest.mark.parametrize("imm", [None, "0"])
+@pytest.mark.parametrize("imm", ["0"])  # 28.09.: the row is on, so "off" is explicit now
 def test_switch_off_27b_d_is_unchanged(clean, imm):
     clean.setenv(FM.FORM_ENV, _form_env("qwen27b"))
     clean.setenv("SGLANG_WEG2_GROUP", "D")
@@ -519,10 +524,39 @@ def test_27b_front_parks_at_once_and_resumes_first(clean):
     asyncio.run(body())
 
 
+def test_nf_wait_bound_60_does_not_delay_the_immediate_park(clean):
+    """28.09. (operator, user "Wartegrenze 0" for BOTH models): on the NF form
+    with its 60 s wait bound armed, a queued request over X parks D at once --
+    the immediate trigger, not the 60 s bound (wait_bound_fired stays 0)."""
+    clean.setenv(FM.FORM_ENV, _form_env("nextflash"))
+    H = _h91c()
+
+    async def body():
+        async with H.Harness(awake="P", p_concurrency=4, d_bs=2, d_park_immediate=True,
+                             d_wait_bound_s=60.0) as h:
+            assert h.front.d_wait_bound_s == 60.0
+            h.d.hold = {}
+            t0 = h.post("r0")
+            assert await H._until(lambda: h.d.running, 20)
+            t_arr = asyncio.get_event_loop().time()
+            t1 = h.post("r1")
+            assert await H._until(lambda: "gen:r1" in h.p.timeline, 20)
+            took = asyncio.get_event_loop().time() - t_arr
+            assert h.front.counters["park_immediate_fired"] == 1
+            assert h.front.counters["wait_bound_fired"] == 0
+            assert took < 10.0, took  # far below the 60 s bound
+            h.d.release_all()
+            await asyncio.wait_for(asyncio.gather(t0, t1), 30)
+
+    asyncio.run(body())
+
+
 def test_27b_front_switch_off_waits_for_d_as_today(clean):
-    """Same scenario, switch off (the qwen27b row): no park RPC, no flip while
-    r0 decodes; the flip comes after r0 ended (fairness disabled here)."""
+    """Same scenario, switch explicitly off (SGLANG_WEG2_D_PARK_IMMEDIATE=0 on
+    the qwen27b row): no park RPC, no flip while r0 decodes; the flip comes
+    after r0 ended (fairness disabled here)."""
     clean.setenv(FM.FORM_ENV, _form_env("qwen27b"))
+    clean.setenv(IMM, "0")
     H = _h91c()
 
     async def body():
@@ -605,8 +639,9 @@ def test_a_rearmed_dflash_resume_is_judged_cold_only_when_it_came_back_through_t
     ({IMM: "1"}, "SGLANG_WEG2_D_PARK=0", True),                     # --env-d vetoes D only
     ({IMM: "1"}, "SGLANG_WEG2_D_PARK_IMMEDIATE=0", True),           # D's switch off, front on
     ({IMM: "1", "SGLANG_WEG2_D_PARK": "1"}, "", False),             # explicit full park
-    ({"SGLANG_WEG2_D_PARK": "0"}, "", False),                       # immediate off: nothing to agree on
-    ({}, "", False),                                                # 27B today
+    ({IMM: "0", "SGLANG_WEG2_D_PARK": "0"}, "", False),             # immediate off: nothing to agree on
+    ({"SGLANG_WEG2_D_PARK": "0"}, "", True),                        # row on, explicit D_PARK 0 vetoes D
+    ({}, "", False),                                                # 27B default: row on, D follows
 ])
 def test_the_launcher_refuses_a_front_that_parks_into_a_d_that_cannot(clean, env, env_d, refused):
     from sglang.srt.weg2 import launcher as L
@@ -618,16 +653,39 @@ def test_the_launcher_refuses_a_front_that_parks_into_a_d_that_cannot(clean, env
         assert "D-PARK-SPLIT refused" in why
 
 
-def test_the_rendered_27b_registry_env_is_caught_when_the_park_is_switched_on(clean):
-    """profile_docker.render writes `_form SGLANG_WEG2_D_PARK 0` for qwen27b; a
-    profile that adds only SGLANG_WEG2_D_PARK_IMMEDIATE=1 on top must not boot."""
+@pytest.mark.parametrize("env,refused", [
+    ({}, False),                                          # NF default: front on, D standard-form park on
+    ({IMM: "0"}, False),                                  # NF first rc12z22 boot: profile sets 0
+    ({"SGLANG_WEG2_D_PARK": "0"}, True),                  # an explicit D veto under the armed front
+])
+def test_the_nf_row_park_is_consistent_with_its_d(clean, env, refused):
+    from sglang.srt.weg2 import launcher as L
+
+    ns = types.SimpleNamespace(profile="nextflash", env_d="")
+    assert (L.d_park_split_refusal(ns, env) is not None) is refused
+
+
+def test_the_rendered_27b_registry_env_boots_with_the_park_default(clean):
+    """28.09.: with the immediate park on the qwen27b row, profile_docker.render
+    must not write `_form SGLANG_WEG2_D_PARK 0` (an explicit 0 vetoes D's flip
+    park) -- the rendered fragment passes the launcher's D-PARK-SPLIT check. An
+    explicit D_PARK=0 on top of an armed front is still refused by name."""
     from sglang.srt.weg2 import launcher as L
     from sglang.srt.weg2 import profile_docker as PD
 
     frag = PD.render("27b", "qwen27b", "int8")
-    assert "  _form SGLANG_WEG2_D_PARK 0" in frag
-    env = {"SGLANG_WEG2_D_PARK": "0", IMM: "1"}
-    assert L.d_park_split_refusal(types.SimpleNamespace(profile="qwen27b", env_d=""), env)
+    assert "_form SGLANG_WEG2_D_PARK " not in frag
+    assert "  _form SGLANG_WEG2_D_PARK_IMMEDIATE 1" in frag
+    env = {}
+    for line in frag.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "_form":
+            env[parts[1]] = parts[2]
+    ns = types.SimpleNamespace(profile="qwen27b", env_d="")
+    assert L.d_park_split_refusal(ns, env) is None
+    assert L.d_park_split_refusal(ns, {"SGLANG_WEG2_D_PARK": "0", IMM: "1"})
+    # NF renders its standard-form park unchanged
+    assert "  _form SGLANG_WEG2_D_PARK 1" in PD.render("nf", "nextflash", "int4-mixed")
 
 
 def test_the_launcher_main_runs_the_refusal_before_anything_spawns():

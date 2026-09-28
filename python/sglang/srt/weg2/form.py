@@ -416,9 +416,10 @@ class ModelProfile:
     #: H91b flip park, POST /weg2/park_running) and the front flips to P; the
     #: parked ones resume first after the flip back. Only the FLIP park -- the
     #: pressure park, D seats and the MTP draft carry stay with
-    #: ``standard_form``. qwen27b off until a metal boot measures it (then the
-    #: operator turns the row on); nextflash off (its wait bound is the NF
-    #: seat's). Switch SGLANG_WEG2_D_PARK_IMMEDIATE (explicit value wins).
+    #: ``standard_form``. ON on both rows (operator 28.09.; qwen27b measured
+    #: 27.09. under agent load, nextflash already parks through its standard
+    #: form -- the immediate trigger comes on top of its 60 s wait bound).
+    #: Switch SGLANG_WEG2_D_PARK_IMMEDIATE (explicit value wins).
     d_park_immediate: bool = False
     #: X-EXACT (user decision 26.09. ~19:00Z, memory d2p-sofort-flippen-und-
     #: x-exakt-0926): the front prices a request's PENDING tokens exactly --
@@ -605,9 +606,14 @@ PROFILES: Dict[str, ModelProfile] = {
         prefill_transient_checkpoints=(),
         constants=_QWEN27B_CONSTANTS,
         d_residue_census=False,
-        # 27B park (user 26.09.): OFF until measured on the metal under agent
-        # load (profiles/27b-park-draft.env turns it on per env).
-        d_park_immediate=False,
+        # 27B park (user 26.09., memory d2p-sofort-flippen-und-x-exakt-0926:
+        # "D->P nicht warten, sofort flippen, laufende Decodes parken"): ON since
+        # the registry default (operator 28.09., after rc12z21 b1 stalled its
+        # D->P flip draining two decodes from 13:44:38). Measured on the metal
+        # under agent load: dkr27bparkodirectdraft 27.09. 09:57 (34 PARK-RUNNING
+        # immediate-over-x, 33 PARK-RESUME, 70 flips) and 12:26 (15/15, 33
+        # flips), needle 97k MATCH after the park round trips in both.
+        d_park_immediate=True,
         # X-EXACT (user 26.09.): OFF until an agent-load boot measured it.
         front_exact_tokens=False,
         # 27B b1 death (27.09. 06:57:17Z): the D budget books the driver carve
@@ -700,8 +706,11 @@ PROFILES: Dict[str, ModelProfile] = {
         constants=_NEXTFLASH_CONSTANTS,
         d_residue_census=True,
         p_mamba_slots_from_argv=True,
-        # NF keeps its H91 wait bound (standard_form); the NF seat decides.
-        d_park_immediate=False,
+        # User decision 26.09. ("Wartegrenze 0, sofort flippen + parken") holds for
+        # BOTH models (operator 28.09.): the immediate park fires at once for a
+        # queued request over X; the H91 60 s wait bound stays as the fallback for
+        # the rest. An explicit SGLANG_WEG2_D_PARK_IMMEDIATE=0 in a profile wins.
+        d_park_immediate=True,
         # X-EXACT (user 26.09., "gilt fuer 27B und NF"): ON with V1 (NF seat,
         # 27.09.) together with the D-side PLE pread gather (nf-h91-vis.env
         # NF_ENV_D_FORM). rc12g front log: chars/3 priced the uncached extent
