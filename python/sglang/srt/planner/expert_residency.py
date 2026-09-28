@@ -570,6 +570,10 @@ class DRankResidency(msgspec.Struct, frozen=True, kw_only=True):
     #: #239: this rank's share of the token-cut full-attention KV; -1 = the
     #: cut is not modelled (every rank priced with its reference cell).
     kv_token_share: float = -1.0
+    #: #239 S3g: bytes per GLOBAL token of this rank's full-attention KV share
+    #: under the cut (share x FA cell) -- what a KV stage above S0 maps on this
+    #: rank; 0 = no share (Form A, or a rank the cut gives none).
+    kv_stage_cell_bytes: int = 0
 
     @property
     def pre_kv_rest_mib(self) -> float:
@@ -1261,6 +1265,8 @@ def solve_d_rank_residency(
                 ),
                 ceiling_max_rows=max_rows,
                 kv_token_share=cut_shares[r] if cut_cells is not None else -1.0,
+                kv_stage_cell_bytes=(int(round(cut_shares[r] * float(kv_dcp_cell_bytes)))
+                                     if cut_cells is not None else 0),
             )
         )
     return tuple(out)
@@ -2862,6 +2868,126 @@ def kv_stage_table(
         need=tuple(need), capacity=tuple(cap_rows), scratch=C, host_rank=h,
         row_mib=round(row_bytes / MIB, 2), kv_cell_bytes=int(kv_cell_bytes),
         demand=tuple(demand), waves=tuple(waves))
+
+
+def kv_stage_trim_cell(fit: "DRankResidency", host_rank: int = 0) -> int:
+    """#239 S3g: the bytes per GLOBAL token a KV stage above S0 maps on this
+    rank -- the "Trim-Zelle". The attention host trims every KV tensor it has
+    (its cell, #251c); a worker only its token-cut full-attention share
+    (share x FA cell), never its QSA keys (rc12z11). 0 = no KV to stage."""
+    if int(fit.rank) == int(host_rank):
+        return int(fit.kv_cell_bytes)
+    return int(getattr(fit, "kv_stage_cell_bytes", 0) or 0)
+
+
+class KvStageGroup(msgspec.Struct, frozen=True, kw_only=True):
+    """#239 S3g: the KV stage form over EVERY rank that holds KV -- one
+    :class:`KvStageTable` per KV rank (the attention host first), each from
+    the same function (``kv_stage_table``) with the rank's own trim cell and
+    scratch. The stage tokens and the highest stage per seat count are
+    REPLICATED (every rank chooses the same stage at the wake); the stage rows
+    are per rank. In S0 a rank's stage rows are rows of its expert bank --
+    booked as residency in the FRACTION-SOLVE (scratch -> seat rows, no new
+    byte); a wake to S_j unmaps ``stage_rows[j]`` of them over the H95c row
+    switch (``set_seat_rows_on``) for the stage's KV. Form A: one table,
+    byte-identical to #251c."""
+
+    tables: Tuple[KvStageTable, ...]
+    n_ranks: int
+
+    @property
+    def host(self) -> KvStageTable:
+        return self.tables[0]
+
+    @property
+    def tokens(self) -> Tuple[int, ...]:
+        return self.host.tokens
+
+    @property
+    def rows(self) -> int:
+        return self.host.rows
+
+    @property
+    def rows_by_rank(self) -> Tuple[int, ...]:
+        out = [0] * int(self.n_ranks)
+        for t in self.tables:
+            out[int(t.host_rank)] = int(t.rows)
+        return tuple(out)
+
+    @property
+    def max_by_seats(self) -> Tuple[int, ...]:
+        """Per n: the highest stage EVERY KV rank keeps at its waves."""
+        return tuple(min(int(t.max_by_seats[i]) for t in self.tables)
+                     for i in range(len(self.host.max_by_seats)))
+
+    @property
+    def waves(self) -> Tuple[int, ...]:
+        return tuple(max(int(t.waves[i]) for t in self.tables)
+                     for i in range(len(self.host.waves)))
+
+    def capture_waves(self, max_by_seats: Sequence[int]) -> Tuple[int, ...]:
+        per = [t.capture_waves(max_by_seats) for t in self.tables]
+        return tuple(max(w[i] for w in per) for i in range(len(per[0])))
+
+    def extra_waves(self, max_by_seats: Sequence[int]) -> Tuple[int, ...]:
+        per = [t.extra_waves(max_by_seats) for t in self.tables]
+        return tuple(max(w[i] for w in per) for i in range(len(per[0])))
+
+
+def kv_stage_group(
+    rows: Sequence[SeatTableRow], form: SeatVramForm, fits: Sequence["DRankResidency"], *,
+    verify_tokens: int, top_k: int, host_rank: int = 0, steps: Sequence[float] = (0.5, 1.0),
+    why: Optional[List[str]] = None,
+) -> Optional[KvStageGroup]:
+    """#239 S3g: :class:`KvStageGroup` over the FRACTION-SOLVE's ``fits`` --
+    the host's table as in #251c, then one per worker whose trim cell is > 0
+    (the token cut gave it a full-attention share). Every table takes the
+    host's S0 (the tokens are the group's) and the same stage steps. None
+    (``why`` gets the rank and the reason) when a KV rank's table cannot be
+    built: its scratch cannot give its top stage's rows and keep its staging
+    -- a stage one rank cannot fund is a stage no rank may choose."""
+    fits = list(fits or ())
+    host = next((f for f in fits if int(f.rank) == int(host_rank)), None)
+    if host is None:
+        if why is not None:
+            why.append("kein Attention-Host %d im Plan" % host_rank)
+        return None
+    tables = []
+    for f in [host] + sorted((f for f in fits if int(f.rank) != int(host_rank)
+                              and kv_stage_trim_cell(f, host_rank) > 0),
+                             key=lambda f: int(f.rank)):
+        sub: List[str] = []
+        t = kv_stage_table(
+            rows, form, kv_cell_bytes=kv_stage_trim_cell(f, host_rank),
+            kv_tokens=int(host.kv_tokens), local_experts=int(f.local_experts),
+            verify_tokens=int(verify_tokens), top_k=int(top_k), host_rank=int(f.rank),
+            steps=steps, staging_rows=int(f.staging_rows), why=sub)
+        if t is None:
+            if why is not None:  # the host's reason reads as in #251c
+                why.append(("" if f is host else "Rang %d: " % int(f.rank))
+                           + ("; ".join(sub) or "ohne Grund"))
+            return None
+        tables.append(t)
+    n = max(len(rows[-1].scratch_given) if rows else 0, 1 + max(int(f.rank) for f in fits))
+    return KvStageGroup(tables=tuple(tables), n_ranks=n)
+
+
+def describe_kv_stage_residency(group: KvStageGroup, *, marker: str, label: str) -> Tuple[str, ...]:
+    """#239 S3g, one FRACTION-SOLVE line per KV rank: its stage rows booked as
+    residency in S0 and what each stage takes of them for its KV."""
+    out = []
+    for t in group.tables:
+        space = (int(t.tokens[-1]) - int(t.tokens[0])) * int(t.kv_cell_bytes) / MIB
+        out.append(
+            "%s FRACTION-SOLVE %s D-KV-STUFEN RESIDENZ (#239 S3g) rang%d: %d Stufenzeilen "
+            "(%.1f MiB) sind in S0 Experten-Zeilen der Bank (Scratch %d -> %d, Sitzzeilen +%d, "
+            "kein neues Byte) fuer den ungemappten Stufenraum %.1f MiB (Trim-Zelle %d B/Tok x "
+            "%d Tok); S1..S%d schneiden %s davon am Wake ab (H95c-Zeilenschaltung) -- GERECHNET"
+            % (marker, label, int(t.host_rank), int(t.rows), int(t.rows) * float(t.row_mib),
+               int(t.scratch), int(t.scratch) - int(t.rows), int(t.rows), space,
+               int(t.kv_cell_bytes), int(t.tokens[-1]) - int(t.tokens[0]),
+               len(t.tokens) - 1, list(t.stage_rows[1:])))
+    return tuple(out)
 
 
 def seat_table(

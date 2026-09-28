@@ -2591,6 +2591,11 @@ class Envs:
     #     every rank picks the stage from these and the wake request alone.
     SGLANG_WEG2_D_KV_STAGE_TOKENS = EnvStr("")
     SGLANG_WEG2_D_KV_STAGE_ROWS = EnvInt(0)
+    #   _ROWS_BY_RANK (#239 S3g): the stage rows ON per D rank ("6,21,8") when
+    #     the KV lies on more than the attention host (the token cut: every
+    #     rank holding FA KV trims it to S0 and funds its higher stages from
+    #     its own expert rows). Empty = _ROWS on every rank, byte-identical.
+    SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK = EnvStr("")
     SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS = EnvStr("")
     # #251d: the stage follows the next wake's demand alone -- every stage is
     #   open to every seat count (MAX_BY_SEATS is not read), the smallest one
