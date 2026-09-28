@@ -197,6 +197,7 @@ class App:
             "uptime_s": round(now - self.t0, 1),
             "boots": boots,
             "gpus": sv.get("gpus"),
+            "pcie": sv.get("pcie"),
             "gpu_series": gser,
             "docker": sv.get("docker"),
             "gpuq": sv.get("gpuq"),

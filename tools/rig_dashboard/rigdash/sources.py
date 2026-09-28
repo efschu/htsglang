@@ -152,6 +152,30 @@ def http_json(url: str, timeout: float = 3.0):
         return json.loads(r.read().decode("utf-8"))
 
 
+def pcie_mean(hist, now: float, window_s: float = 2.0):
+    """Mean PCIe RX/TX per card over the samples inside the window.
+
+    hist: list of (t, [(rx_kbps, tx_kbps), ...]) as appended by sample_pcie.
+    One dict per card index seen in hist: {"index", "rx_mb_s", "tx_mb_s",
+    "n"}; only samples with now - t <= window_s count. KB/s -> MB/s divides
+    by 1000.0 (decimal MB, the unit nvidia-smi dmon prints). A card with no
+    usable sample in the window reports None for rx/tx.
+    """
+    n_cards = max((len(cs) for _, cs in hist), default=0)
+    out = []
+    for i in range(n_cards):
+        samples = [cs[i] for t, cs in hist if now - t <= window_s and i < len(cs)]
+        rx = [s[0] for s in samples if s[0] is not None]
+        tx = [s[1] for s in samples if s[1] is not None]
+        out.append({
+            "index": i,
+            "rx_mb_s": (sum(rx) / len(rx) / 1000.0) if rx else None,
+            "tx_mb_s": (sum(tx) / len(tx) / 1000.0) if tx else None,
+            "n": len(samples),
+        })
+    return out
+
+
 class Sources:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -159,6 +183,7 @@ class Sources:
         self.samplers: Dict[str, Sampler] = {
             "gpus": Sampler("gpus", cfg.get("gpu_period", 2.0), self.sample_gpus),
             "gpuq": Sampler("gpuq", cfg.get("gpuq_period", 15.0), self.sample_gpuq),
+            "pcie": Sampler("pcie", cfg.get("pcie_period", 0.25), self.sample_pcie),
         }
         if ssh:
             self.samplers["docker"] = Sampler("docker", cfg.get("docker_period", 20.0), self.sample_docker)
@@ -167,6 +192,9 @@ class Sources:
                 "front:" + ep, cfg.get("front_period", 10.0),
                 (lambda ep=ep: http_json(ep.rstrip("/") + "/weg2/state", 3.0)))
         self.gpu_hist = collections.deque(maxlen=int(15 * 60 / cfg.get("gpu_period", 2.0)) + 5)
+        # ~10 s of PCIe samples at the 0.25-s period (the mean uses the last 2 s)
+        self.pcie_hist = collections.deque(maxlen=int(10.0 / cfg.get("pcie_period", 0.25)))
+        self._nvml_ready = False
         self.lock = threading.Lock()
         self.state_dir = cfg.get("state_dir")
         self._last_save = 0.0
@@ -219,6 +247,25 @@ class Sources:
                                           c.get("utilization.gpu")) for c in cards]))
         self.save_history(now)
         return cards
+
+    def sample_pcie(self):
+        # pynvml is imported only here: a host without it must not break the
+        # module import; the Sampler records the failure as its own error.
+        import pynvml
+        if not self._nvml_ready:
+            pynvml.nvmlInit()
+            self._nvml_ready = True
+        row = []
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            rx = pynvml.nvmlDeviceGetPcieThroughput(h, pynvml.NVML_PCIE_UTIL_RX_BYTES)
+            tx = pynvml.nvmlDeviceGetPcieThroughput(h, pynvml.NVML_PCIE_UTIL_TX_BYTES)
+            row.append((rx, tx))
+        now = time.time()
+        with self.lock:
+            self.pcie_hist.append((now, row))
+            hist = list(self.pcie_hist)
+        return pcie_mean(hist, now, 2.0)
 
     def sample_docker(self):
         ssh = self.cfg["docker_ssh"]

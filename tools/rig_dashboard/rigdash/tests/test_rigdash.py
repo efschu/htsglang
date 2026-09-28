@@ -538,6 +538,46 @@ class SourceTests(unittest.TestCase):
         self.assertIn("{{.Names}}\\t{{.Image}}", sources.DOCKER_PS_FORMAT)
 
 
+class PcieMeanTests(unittest.TestCase):
+    """pcie_mean is pure: history in, per-card means out -- no NVML here."""
+
+    def test_empty_history_has_no_values(self):
+        self.assertEqual(sources.pcie_mean([], 100.0, 2.0), [])
+
+    def test_all_samples_too_old_report_none(self):
+        r = sources.pcie_mean([(90.0, [(1000, 2000)])], 101.0, 2.0)
+        self.assertEqual(r[0]["index"], 0)
+        self.assertIsNone(r[0]["rx_mb_s"])
+        self.assertIsNone(r[0]["tx_mb_s"])
+        self.assertEqual(r[0]["n"], 0)
+
+    def test_two_samples_in_window_are_averaged(self):
+        hist = [(100.0, [(1000, 2000)]), (101.0, [(3000, 4000)])]
+        r = sources.pcie_mean(hist, 101.0, 2.0)
+        self.assertAlmostEqual(r[0]["rx_mb_s"], 2.0)   # (1000 + 3000) / 2 KB/s
+        self.assertAlmostEqual(r[0]["tx_mb_s"], 3.0)   # (2000 + 4000) / 2 KB/s
+        self.assertEqual(r[0]["n"], 2)
+
+    def test_sample_older_than_the_window_does_not_count(self):
+        hist = [(98.0, [(1000, 1000)]), (100.5, [(3000, 3000)])]
+        r = sources.pcie_mean(hist, 101.0, 2.0)
+        self.assertAlmostEqual(r[0]["rx_mb_s"], 3.0)
+        self.assertAlmostEqual(r[0]["tx_mb_s"], 3.0)
+        self.assertEqual(r[0]["n"], 1)
+
+    def test_kbps_becomes_decimal_mbytes(self):
+        r = sources.pcie_mean([(100.0, [(123456, 654321)])], 100.0, 2.0)
+        self.assertAlmostEqual(r[0]["rx_mb_s"], 123.456)
+        self.assertAlmostEqual(r[0]["tx_mb_s"], 654.321)
+
+    def test_two_cards_are_kept_apart(self):
+        hist = [(100.0, [(1000, 1000), (5000, 5000)])]
+        r = sources.pcie_mean(hist, 100.0, 2.0)
+        self.assertEqual([c["index"] for c in r], [0, 1])
+        self.assertAlmostEqual(r[0]["rx_mb_s"], 1.0)
+        self.assertAlmostEqual(r[1]["rx_mb_s"], 5.0)
+
+
 class PhaseTimelineTests(unittest.TestCase):
     """The phase bar: runs per class, flips grey, idle between, nothing guessed."""
 

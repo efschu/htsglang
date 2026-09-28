@@ -635,8 +635,12 @@ function gpusHtml(d, binders) {
   const cards = g.value || [];
   if (!cards.length) return `<div class="err">${esc(g.error || "keine Karten")}</div>`;
   const s = d.gpu_series || {t: [], power: []};
+  const pcie = {};
+  (((d.pcie || {}).value) || []).forEach((p) => { pcie[p.index] = p; });
   return cards.map((c, i) => {
     const pw = c["power.draw"], pl = c["power.limit"], mu = c["memory.used"], mt = c["memory.total"];
+    const pc = pcie[c.index] || {};
+    const rx = pc.rx_mb_s, tx = pc.tx_mb_s;
     const ser = (s.power || []).map((row) => row[i]);
     const sp = s.t && s.t.length > 1 ? spark(`gp-${i}`, s.t, ser, "var(--s1)", "W", 0, d.t) : null;
     if (sp) binders.push(sp.bind);
@@ -644,6 +648,7 @@ function gpusHtml(d, binders) {
       <div class="name">${esc(c.name.replace("NVIDIA GeForce ", ""))} <span>nvml ${c.index} &middot; ${fmt(c["temperature.gpu"])} &deg;C &middot; ${fmt(c["clocks.sm"])} MHz</span></div>
       <div class="meter">Leistung <b class="num">${fmt(pw)} / ${fmt(pl)} W</b><div class="bar"><b style="width:${pl ? Math.min(100, 100 * pw / pl) : 0}%"></b></div></div>
       <div class="meter">VRAM <b class="num">${fmt(mu / 1024, 1)} / ${fmt(mt / 1024, 1)} GiB</b> &middot; Last ${fmt(c["utilization.gpu"])} %<div class="bar"><b style="width:${mt ? Math.min(100, 100 * mu / mt) : 0}%"></b></div></div>
+      <div class="meter">PCIe &Oslash; 2 s <b class="num">RX ${fmt(rx, 1)} &middot; TX ${fmt(tx, 1)} MB/s</b></div>
       <div>${sp ? sp.svg : ""}</div>
     </div>`;
   }).join("");
