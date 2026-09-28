@@ -38,6 +38,15 @@ except ImportError:  # pragma: no cover - base
 SLOW_IMPORT_S = 3.0
 
 
+def subprocess_dead_pid() -> int:
+    """The pid of a process that has exited (and been reaped)."""
+    import subprocess
+
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    return p.pid
+
+
 def _child(payload, q):
     marker, blob = payload
     q.put((type(marker).__name__, len(blob), blob[:4], blob[-4:]))
@@ -105,6 +114,25 @@ class TestSpawnPayloadByReference(unittest.TestCase):
         proc.join(timeout=60)
         after = {f for f in os.listdir(tempfile.gettempdir()) if f.startswith(FILE_PREFIX)}
         self.assertEqual(after - before, set(), "the child must unlink its payload file")
+
+    def test_stale_file_of_dead_writer_is_swept(self):
+        """A parent SIGKILLed before its atexit leaves its unread payload
+        behind; the next writer removes files of DEAD writers only."""
+        from sglang.srt.utils import spawn_payload as sp
+
+        d = tempfile.mkdtemp(prefix="bootzeit_h1_sweep_")
+        dead = subprocess_dead_pid()
+        stale = os.path.join(d, f"{FILE_PREFIX}{dead}-abc.pkl")
+        live = os.path.join(d, f"{FILE_PREFIX}{os.getpid()}-def.pkl")
+        for p in (stale, live):
+            with open(p, "wb") as fh:
+                fh.write(b"x")
+        self.assertEqual(sp.sweep_stale(d), 1)
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(live))
+        # a new payload file names its writer, so the sweep can judge it
+        ref = sp.by_reference({"a": 1}, directory=d)
+        self.assertTrue(os.path.basename(ref.path).startswith(f"{FILE_PREFIX}{os.getpid()}-"))
 
     def test_scheduler_launch_passes_server_args_by_reference(self):
         from sglang.srt.entrypoints import engine

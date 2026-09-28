@@ -85,10 +85,49 @@ class SpawnPayloadRef:
         return (_load_by_reference, (self.path, self.sha256, self.nbytes))
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True  # exists, or cannot tell -> keep the file
+    return True
+
+
+def sweep_stale(directory: str = None) -> int:
+    """Remove payload files whose WRITER is dead (a parent killed before its
+    atexit ran, SIGKILL / OOM). The writer pid is part of the file name; a
+    living writer's files are never touched. Returns the count removed."""
+    d = directory or tempfile.gettempdir()
+    n = 0
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith(FILE_PREFIX):
+            continue
+        pid = name[len(FILE_PREFIX):].split("-", 1)[0]
+        if not pid.isdigit() or _pid_alive(int(pid)):
+            continue
+        try:
+            os.unlink(os.path.join(d, name))
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
 def by_reference(obj: Any, *, directory: str = None) -> Any:
     """Return a small picklable stand-in for ``obj`` (or ``obj`` itself when it
     cannot be pickled standalone). Call once PER child: the child unlinks the
-    file it read."""
+    file it read; the parent removes unread ones at exit; a later parent
+    removes those of a writer that died without its atexit (``sweep_stale``)."""
+    if not _ATEXIT["armed"]:
+        swept = sweep_stale(directory)
+        if swept:
+            logger.info("spawn payload: removed %d stale file(s) of dead writers", swept)
     try:
         data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     except Exception as exc:  # noqa: BLE001 -- the inline pipe is the old path
@@ -97,7 +136,8 @@ def by_reference(obj: Any, *, directory: str = None) -> Any:
             "inline through the spawn pipe as before",
             type(obj).__name__, type(exc).__name__, str(exc)[:160])
         return obj
-    fd, path = tempfile.mkstemp(prefix=FILE_PREFIX, suffix=".pkl", dir=directory)
+    fd, path = tempfile.mkstemp(prefix=f"{FILE_PREFIX}{os.getpid()}-", suffix=".pkl",
+                                dir=directory)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
@@ -111,4 +151,8 @@ def by_reference(obj: Any, *, directory: str = None) -> Any:
     if not _ATEXIT["armed"]:
         atexit.register(_cleanup_pending)
         _ATEXIT["armed"] = True
+    # One line per child: the size is the reason this path exists (a payload
+    # above the 64 KiB pipe serialised the rank starts), so the metal says it.
+    logger.info("spawn payload: %s by reference, %d bytes (%s)",
+                type(obj).__name__, len(data), path)
     return SpawnPayloadRef(path, hashlib.sha256(data).hexdigest(), len(data))
