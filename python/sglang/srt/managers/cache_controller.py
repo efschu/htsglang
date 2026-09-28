@@ -1331,6 +1331,13 @@ class HiCacheController:
         # #1068 (A12.4): a fresh pipeline holds nothing and has drained nothing.
         self._prefetch_current = None
         self._prefetch_io_current = None
+        # HICACHE-NEVER-SLOW: the L3 write-behind yields while a load is queued
+        try:
+            from sglang.srt.mem_cache import l3_write_behind as _l3wb
+
+            _l3wb.register_load_probe(self.storage_loads_pending)
+        except Exception:  # noqa: BLE001 -- the gate is an improvement, never a wall
+            pass
         self._prefetch_drained_after_stop = 0
         self._prefetch_io_drained_after_stop = 0
 
@@ -3530,17 +3537,29 @@ class HiCacheController:
             else:
                 pool.arena.ref_slots_np(_need, -1)  # undo the partial refs, take the slow path
                 lead = 0
-        for i in range(lead, int(_fs.shape[0])):
+        # L3-FAST (28.09.): every page past the complete lead that is not in
+        # the L2 is asked of the L3 in ONE fill (claims, parallel reads and
+        # completions batched in arena_fill_from_disk) instead of one fill per
+        # page -- the 27B boots read 1.4-3.2k tokens/s this way against 10-115k
+        # the disk gives. The prefix is walked exactly as before: it ends at
+        # the first page the L3 cannot give or the first reference that fails.
+        _n = int(_fs.shape[0])
+        _fills = {}
+        _need = [i for i in range(lead, _n)
+                 if not _hm[i] and (int(_fs[i]) < 0 or int(_st[i]) != 2)]
+        if _need:
+            _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
+            if callable(_fill_fn):
+                _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes))
+                _fills = dict(zip(_need, _got))
+        for i in range(lead, _n):
             slot, state = int(_fs[i]), int(_st[i])
             if _hm[i]:
                 slots.append(slot)  # #257: held since the probe
                 continue
             if slot < 0 or state != 2:
-                # #1433: not in the L2 -- ask the L3. A page on disk is read
-                # straight into a fresh slot and completed; only then is the
-                # prefix really over.
-                _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
-                fill = _fill_fn(pool.arena, [stems[i]], int(pool._page_bytes))[0] if callable(_fill_fn) else None
+                # #1433: not in the L2 -- the L3 fill above read it (or not)
+                fill = _fills.get(i)
                 if fill is None:
                     break
                 slot = fill
@@ -4153,6 +4172,15 @@ class HiCacheController:
                 logger.error("could not signal the parent: %s: %s", type(e).__name__, e)
         os.kill(os.getpid(), signal.SIGQUIT)
 
+    def storage_loads_pending(self) -> int:
+        """Store->host loads queued (prefetch queue, the aux thread's buffer)
+        or in flight on the aux thread -- the L3 write-behind's yield signal."""
+        n = int(getattr(getattr(self, "prefetch_queue", None), "qsize", lambda: 0)())
+        n += int(getattr(getattr(self, "prefetch_buffer", None), "qsize", lambda: 0)())
+        if getattr(self, "_prefetch_io_current", None) is not None:
+            n += 1
+        return n
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -4568,10 +4596,16 @@ class HiCacheController:
             found = dpool.arena.find_slots(stems)
             rows = (_hi_pages.cpu() - int(dpool.staging_rows)).tolist()
             flags, slots, hits = [], [], 0
+            # L3-FAST: the draft pages missing in the L2 in ONE fill (batched, parallel reads)
+            _dneed = [i for i, (s_, st_) in enumerate(found) if s_ < 0 or st_ != 2]
+            _dfill = {}
+            _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
+            if _dneed and callable(_fill_fn):
+                _dfill = dict(zip(_dneed, _fill_fn(dpool.arena, [stems[i] for i in _dneed],
+                                                   int(dpool._page_bytes))))
             for i, (slot, state) in enumerate(found):
                 if slot < 0 or state != 2:  # #1433: L3 -> L2 for the draft page too
-                    _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
-                    fill = _fill_fn(dpool.arena, [stems[i]], int(dpool._page_bytes))[0] if callable(_fill_fn) else None
+                    fill = _dfill.get(i)
                     if fill is not None:
                         slot, state = fill, 2
                 ok = slot >= 0 and state == 2 and dpool.arena.ref_slots([slot], +1) == 1
