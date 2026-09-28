@@ -553,3 +553,54 @@ def test_a_group_with_a_lease_is_never_idle():
     src = inspect.getsource(sm.Scheduler.is_fully_idle)
     assert '_weg2_vision_inflight' in src
     assert '"vision_async"' in inspect.getsource(sm.Scheduler.idle_blockers)
+
+
+def _pp3_async_sched(tmp_path, monkeypatch, *, row_only=False):
+    """A PP0 of a 3-stage group with everything the async start needs."""
+    _write_model(tmp_path)
+    pool = _ManualPool()
+    monkeypatch.setattr(vrr, "_async_pool", lambda: pool)
+    monkeypatch.setattr(vrr, "build_tower_meta", _build())
+    s, _ = _async_sched(tmp_path, [_req("img", [_Item(4)]), _req("txt")])
+    s.ps = types.SimpleNamespace(pp_size=3, pp_rank=0)
+    s.pp_flip_counters = None
+    if row_only:
+        from sglang.srt.weg2 import p_row_authority as prow
+
+        setattr(s, prow.ROW_ONLY_ATTR, True)
+    return s, pool
+
+
+def test_async_is_not_taken_where_the_followers_plan_for_themselves(tmp_path, monkeypatch,
+                                                                     stage_calls, caplog):
+    """NF rc12z30c -st, 28.09. 20:48:53Z: '#631 ROW AUTHORITY DISABLED' on the
+    followers, PP0 held weg2-6-33 for the async stage, PP1/PP2 admitted it
+    ('#969 EXTENT n=9 fwd=1') and waited for a frame PP0 never owed -> '#973
+    RING COMMIT TIMEOUT' 120 s later. Without a row carrier PP0 must not
+    withhold: the synchronous stage stages and admits in the same pass."""
+    import logging
+
+    calls, _ = stage_calls
+    monkeypatch.delenv(vrr.VISION_ASYNC_ENV, raising=False)
+    monkeypatch.delenv("SGLANG_WEG2_P_ROW_VISION_ASYNC", raising=False)
+    s, pool = _pp3_async_sched(tmp_path, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=vrr.logger.name):
+        parked = vrr.vision_rank_pass(s)
+        vrr.vision_rank_pass(types.SimpleNamespace(**{**vars(s), "waiting_queue": []}))
+    assert parked == []                              # nothing held out: every rank admits it
+    assert calls == [["img"]] and not vrr.vision_async_inflight(s) and pool.jobs == []
+    said = [r.getMessage() for r in caplog.records if vrr.W_ASYNC_NOT_ADMISSIBLE in r.getMessage()]
+    assert len(said) == 1 and "pp_size=3" in said[0]
+
+
+def test_async_on_the_row_form_needs_its_own_term(tmp_path, monkeypatch, stage_calls):
+    calls, _ = stage_calls
+    monkeypatch.delenv(vrr.VISION_ASYNC_ENV, raising=False)
+    monkeypatch.delenv("SGLANG_WEG2_P_ROW_VISION_ASYNC", raising=False)
+    s, pool = _pp3_async_sched(tmp_path, monkeypatch, row_only=True)
+    assert vrr.vision_rank_pass(s) == [] and calls == [["img"]]     # term off: synchronous
+    monkeypatch.setenv("SGLANG_WEG2_P_ROW_VISION_ASYNC", "1")
+    s2, pool2 = _pp3_async_sched(tmp_path, monkeypatch, row_only=True)
+    parked = vrr.vision_rank_pass(s2)
+    assert [r.rid for _, r in parked] == ["img"] and vrr.vision_async_inflight(s2)
+    assert len(pool2.jobs) == 1 and calls == [["img"]]              # no second sync stage
