@@ -918,8 +918,25 @@ def pace_window_s(own_read_s: float, told: int) -> float:
     factor = _env_float(ENV_PACE_FACTOR, PACE_FACTOR_DEFAULT)
     rate = _env_float(ENV_PACE_S_PER_100K, PACE_S_PER_100K_DEFAULT)
     cap = _env_float(ENV_PACE_CAP_S, PACE_CAP_S_DEFAULT)
+    if int(told) <= 0:
+        # #57: nothing to read on any follower (see pace_read_tokens)
+        return 0.0
     est = max(factor * max(0.0, float(own_read_s)), rate * max(0, int(told)) / 100000.0)
     return min(cap, est)
+
+
+def pace_read_tokens(told: int, head: int, absolute: bool) -> int:
+    """#57 (NF rc12v 09272047: told=1728 paced 8.5-8.9 s): the tokens a
+    follower actually reads for ``told``. An ABSOLUTE told counts from token 0
+    and the registration's device head (``registered_head``, stamped on every
+    rank by ``_prefetch_kvcache``) is already local -- the followers answered
+    "#1400 FOLLOWER SATISFIED LOCALLY ... local_prefix=2496: nothing to read"
+    while PP0 paced them for 1.25 x its own intake-to-poll time (6.82 s of 16k
+    chunk passes, not a read). A span-relative told IS the read span."""
+    told = max(0, int(told))
+    if not absolute:
+        return told
+    return max(0, told - max(0, int(head)))
 
 
 @dataclass
@@ -1079,7 +1096,21 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             told_map[rid] = told
             out.append(_cls(rid=rid, told=told, **_extra))
             continue
-        window = pace_window_s(own_read_s, told)
+        # #57: pace the READ, not the told -- the part below PP0's registered
+        # head is on every rank already (rank-uniform: PP0 decides alone,
+        # the followers follow the wire as before).
+        _read_tokens = pace_read_tokens(told, _twin.registered_head(req), bool(absolute))
+        window = pace_window_s(own_read_s, _read_tokens)
+        if _read_tokens < told:
+            n57 = getattr(scheduler, "_57_head_n", 0) + 1
+            scheduler._57_head_n = n57
+            if _log_due(n57):
+                logger.info(
+                    "#57 PACED-READ rid=%s told=%d head=%d read=%d own_read=%.2fs window=%.2fs "
+                    "(n=%d): the window paces the span beyond the registered head only",
+                    _rt(rid), int(told), _twin.registered_head(req), _read_tokens,
+                    own_read_s, window, n57,
+                )
         pacing[rid] = _Pace(req=req, told=told, published_at=now, published_pass=pass_n, window_s=window,
                             absolute=bool(absolute))
         ahead = _cls(rid=rid, told=told, paced=True, **_extra)
