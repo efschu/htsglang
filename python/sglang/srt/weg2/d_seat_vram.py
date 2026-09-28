@@ -616,6 +616,29 @@ def kv_stage_trims_here(pool_size: int) -> bool:
     return form is not None and int(pool_size) >= form.tokens[-1] and not _form_a_worker()
 
 
+def kv_stage_boot_rows(pool_size: int, page_size: int) -> Optional[int]:
+    """#251c: the rows a stage-form pool keeps mapped from its birth to the
+    first wake (S0's tokens + the page), None where this rank trims nothing."""
+    if not kv_stage_trims_here(pool_size):
+        return None
+    return int(stage_form().tokens[0]) + int(page_size)
+
+
+def bound_stage_rows(pool, rows: int) -> None:
+    """#251c: tell a KV pool (and a hybrid pool's full-attention pool) which
+    rows its stage keeps mapped -- through MHATokenToKVPool.set_stage_backed_rows,
+    whose ``safe_zero_rows`` / ``_committed_row_bound`` read it. Never assign
+    ``safe_zero_rows``: it is a property (rc12z13 died on exactly that)."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+
+    subs = [pool]
+    if isinstance(pool, HybridLinearKVPool):
+        subs.append(pool.full_kv_pool)
+    for sub in subs:
+        if isinstance(sub, MHATokenToKVPool):
+            sub.set_stage_backed_rows(rows)
+
+
 def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False) -> int:
     """#251c ``_config_from_budget``: the KV pool's rows are the TOP stage's
     (virtual -- the graphs keep one address range); the pages behind them are
@@ -1118,9 +1141,7 @@ class SeatVram:
         page = int(self.kv_tensors[0].geom.token_pad) if self.kv_tensors else 0
         for pool in self.kv_pools:
             # zero_kv_data_buffers (the idle flush) writes only mapped rows
-            for sub in (pool, getattr(pool, "full_kv_pool", None)):
-                if sub is not None:
-                    sub.safe_zero_rows = tokens + page
+            bound_stage_rows(pool, tokens + page)
         for m in self.row_tensors:
             info = self.spans.info(m.ptr)
             live = info is not None and info.active
