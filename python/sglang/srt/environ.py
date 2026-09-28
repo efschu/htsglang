@@ -2495,6 +2495,24 @@ class Envs:
     # exact granule arithmetic funds in a phase are ever mapped; unset/empty or
     # 0 on a rank = no extra rows there.
     SGLANG_WEG2_D_SEAT_EXPERT_ROWS = EnvStr("")
+    # #251c (Nutzer 27./28.09.): D's KV STAGES on the Form A attention host,
+    # traded against the expert bank's tail rows at every wake (the third post
+    # of the H95c span map, weg2/d_seat_vram.py). Form values the launcher
+    # writes into --env-d, never operator knobs; they act only with
+    # SGLANG_OPT_WEG2_D_SEAT_VRAM on group D.
+    #   _TOKENS: the stages' KV tokens ascending, "262144,393216,524288"; the
+    #     pool is VIRTUALLY the last one, physically the first at boot. Fewer
+    #     than two stages = no stages (byte-identical to H95c).
+    #   _ROWS: the expert rows ON in the boot form (S0 at the --d-bs cap) that
+    #     the higher stages take back -- part of SGLANG_WEG2_D_SEAT_EXPERT_ROWS.
+    #   _MAX_BY_SEATS: the highest stage a phase of n = 1..--d-bs seats may
+    #     take ("2,2,2,2,2,2"; empty = every stage). The launcher derives it
+    #     from the same geometry TP0 checks at its first wake, and from the
+    #     captured overflow waves when the stage must not add one. Replicated:
+    #     every rank picks the stage from these and the wake request alone.
+    SGLANG_WEG2_D_KV_STAGE_TOKENS = EnvStr("")
+    SGLANG_WEG2_D_KV_STAGE_ROWS = EnvInt(0)
+    SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS = EnvStr("")
     # #254: how a prefill forward that overflows the scratch region is split.
     #   "token"  (default) -- waves are disjoint TOKEN subsets; every wave
     #     re-fetches the spill experts its tokens need, so a spill expert is

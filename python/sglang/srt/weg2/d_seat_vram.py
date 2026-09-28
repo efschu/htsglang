@@ -62,7 +62,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
@@ -334,6 +334,9 @@ class StageCell:
     kv_mapped: int
     cap_mapped: int
     feasible: bool
+    #: k with the GDN pool in its cap form (it cannot shrink while it is
+    #: mapped and live -- H95c's rule); -1 = the stage needs the GDN pages
+    rows_full: int = -1
 
     @property
     def mapped(self) -> int:
@@ -397,7 +400,7 @@ def stage_vram_cells(
             out[(n, j)] = StageCell(
                 n=n, stage=j, tokens=tokens, slot_limit=lim, mamba_keep=keep,
                 extra_rows=max(0, k), mamba_mapped=m, expert_mapped=ex[max(0, k)],
-                kv_mapped=kv, cap_mapped=budget, feasible=k >= 0)
+                kv_mapped=kv, cap_mapped=budget, feasible=k >= 0, rows_full=k_full)
     return out
 
 
@@ -442,6 +445,198 @@ def choose_stage(
     top = usable[-1]
     return StageChoice(top, t.get(top, 0), d, True,
                        "demand above the highest usable stage: the youngest parks")
+
+
+@dataclass(frozen=True)
+class StageForm:
+    """#251c, REPLICATED: the launcher's form values -- the stages' tokens,
+    the stage rows ON in the boot form, and the highest stage a phase of n
+    seats may take. Every rank of D reads the same --env-d, so every rank
+    chooses the same stage from these and the wake request alone (the 3080
+    workers hold no KV and no cells; TP0 checks the table against its pages,
+    ``check_form_against_cells``)."""
+
+    tokens: Tuple[int, ...]
+    rows_on: int = 0
+    max_by_seats: Tuple[int, ...] = ()
+
+    def max_stage(self, n: int) -> int:
+        top = len(self.tokens) - 1
+        if not self.max_by_seats:
+            return top
+        i = min(max(1, int(n)), len(self.max_by_seats)) - 1
+        return max(0, min(top, int(self.max_by_seats[i])))
+
+
+def _ints(raw) -> Tuple[int, ...]:
+    out = []
+    for p in str(raw or "").split(","):
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            out.append(int(p))
+        except ValueError:
+            return ()
+    return tuple(out)
+
+
+def stage_form(env: Optional[Dict[str, str]] = None) -> Optional[StageForm]:
+    """The armed stage form of this D process, or None (off, not group D, or
+    fewer than two stages -- then everything is H95c, byte-identical)."""
+    if not armed(env):
+        return None
+    from sglang.srt.environ import envs
+
+    tokens = tuple(sorted({t for t in _ints(envs.SGLANG_WEG2_D_KV_STAGE_TOKENS.get()) if t > 0}))
+    if len(tokens) < 2:
+        return None
+    return StageForm(
+        tokens=tokens,
+        rows_on=max(0, int(envs.SGLANG_WEG2_D_KV_STAGE_ROWS.get() or 0)),
+        max_by_seats=_ints(envs.SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS.get()),
+    )
+
+
+def choose_form_stage(form: StageForm, n: int, demand_tokens: Optional[int]) -> StageChoice:
+    """``choose_stage`` over the replicated form: stages 0..max_stage(n)."""
+    top = form.max_stage(n)
+    if demand_tokens is None:
+        return StageChoice(0, form.tokens[0], None, False, "no demand on the wake: S0")
+    d = int(demand_tokens)
+    for j in range(top + 1):
+        if form.tokens[j] >= d:
+            return StageChoice(j, form.tokens[j], d, False, "smallest stage holding the demand")
+    return StageChoice(top, form.tokens[top], d, True,
+                       "demand above the highest usable stage: the youngest parks")
+
+
+def check_form_against_cells(form: StageForm, cells: Dict[Tuple[int, int], StageCell],
+                             cap: int) -> None:
+    """TP0 at its first wake: every stage the form lets a phase of n seats
+    take must be fundable by this rank's pages. The workers choose from the
+    same form without cells, so a table TP0 cannot honour is refused by name
+    here instead of being quietly lowered on one rank (RAENGE-NIE-UNEINS)."""
+    bad = [(n, j) for n in range(1, int(cap) + 1) for j in range(form.max_stage(n) + 1)
+           if not cells.get((n, j), None) or not cells[(n, j)].feasible]
+    if bad:
+        raise Weg2DSeatVramRefused(
+            "%s: the stage form promises (n seats, stage) %s that this rank's pages "
+            "cannot fund (stage tokens %s, stage rows %d) -- the launcher's table and "
+            "the attention host's geometry disagree; nothing was mapped"
+            % (LINE_MARK, bad[:6], list(form.tokens), form.rows_on))
+
+
+def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False) -> int:
+    """#251c ``_config_from_budget``: the KV pool's rows are the TOP stage's
+    (virtual -- the graphs keep one address range); the pages behind them are
+    S0's (``kv_stage_born``). The budget must hold S0 on the attention host:
+    below it the boot form the planner priced does not fit, refused by name.
+    A Form A worker holds no KV: its (replicated) allocator takes the same
+    rows without a budget check. Off: ``max_tokens`` unchanged."""
+    form = stage_form()
+    if form is None:
+        return int(max_tokens)
+    if not is_form_a_worker and int(max_tokens) < form.tokens[0]:
+        raise Weg2DSeatVramRefused(
+            "%s: the KV budget holds %d tokens, below stage S0 = %d -- the boot form "
+            "the planner priced does not fit this rank" % (LINE_MARK, int(max_tokens),
+                                                         form.tokens[0]))
+    return int(form.tokens[-1])
+
+
+#: the attention host's KV tensors, trimmed to S0 the moment they are born
+#: (``kv_stage_born``), in birth order: (data_ptr, geometry). Process-local;
+#: TP0 only (a Form A worker allocates none).
+_KV_BORN: List[Tuple[int, KvTensorGeom]] = []
+
+
+def kv_stage_born(t, *, pool_size: int, page_size: int, name: str = "kv",
+                  tokens_per_slot: int = 1, layers: int = 1, slots: Optional[int] = None,
+                  spans: Optional["TmsSpans"] = None, granule: Optional[int] = None):
+    """#251c: a KV tensor of a stage-form pool keeps its TOP-stage range but
+    only S0's pages -- trimmed right here, one tensor at a time, so the boot
+    never holds the top stage's pages (~3.5 GiB on NF) even for an instant.
+    Every other tensor passes through untouched (no form, another pool size).
+    ``layers``/``slots``: a layer-major ``[L, slots x ...]`` tensor (the QSA
+    compressed keys: one slot per ``tokens_per_slot`` tokens)."""
+    form = stage_form()
+    if form is None or t is None or not t.numel() or int(pool_size) < form.tokens[-1]:
+        return t
+    spans = tms() if spans is None else spans
+    info = spans.info(t.data_ptr()) if spans.available else None
+    if info is None:
+        raise Weg2DSeatVramRefused(
+            "%s: the KV tensor %s (%.1f MiB) is not a saver allocation -- its "
+            "top-stage pages could not be unmapped and would sit on the card "
+            "unpriced. Turn SGLANG_OPT_WEG2_D_SEAT_VRAM off for this boot."
+            % (LINE_MARK, name, t.numel() * t.element_size() / _MIB))
+    g = int(granule or granule_for(t.device))
+    n_slots = int(slots if slots is not None else t.shape[0])
+    slot_bytes = (t.numel() * t.element_size()) // max(1, int(layers) * n_slots)
+    geom = KvTensorGeom(
+        SlotTensorGeom(name, int(layers), n_slots, int(slot_bytes), int(info.size)),
+        token_ratio=int(tokens_per_slot), token_pad=int(page_size))
+    rc = spans.set_spans(t.data_ptr(), slot_spans(geom.geom, geom.slots_for(form.tokens[0]), g),
+                         now=True)
+    if rc != 0:
+        raise Weg2DSeatVramRefused("%s: trimming the KV tensor %s to stage S0 failed "
+                                   "(tms_set_spans rc=%d)" % (LINE_MARK, name, rc))
+    _KV_BORN.append((int(t.data_ptr()), geom))
+    return t
+
+
+def kv_stage_boot_cap(allocator, page_size: int) -> Optional[int]:
+    """#251c: the allocator of a stage-form pool hands out only S0's pages
+    until the first wake says otherwise (every rank, replicated). Returns the
+    page cap, None when off."""
+    form = stage_form()
+    if form is None or allocator is None:
+        return None
+    return _engage_kv_cap(allocator, form.tokens[0], page_size)
+
+
+def _engage_kv_cap(allocator, tokens: int, page_size: int) -> int:
+    from sglang.srt.managers.kv_backing_relief import KvRowCap
+
+    cap = getattr(allocator, "_weg2_kv_stage_cap", None)
+    if cap is None:
+        cap = KvRowCap(allocator)
+        allocator._weg2_kv_stage_cap = cap
+    pages = int(tokens) // max(1, int(page_size))
+    if pages >= int(getattr(allocator, "num_pages", pages)):
+        if cap.engaged:
+            cap.release()
+        return pages
+    # KvRowCap.engage only ever withholds MORE (it moves free ids above the
+    # cap out of the free lists); a stage that rises must first hand back
+    # what the lower cap held, then withhold above the new one
+    if cap.engaged and cap.cap is not None and pages > int(cap.cap):
+        cap.release()
+    cap.engage(pages)
+    return pages
+
+
+def max_live_page(allocator) -> int:
+    """The highest page id a request holds (0 = none): every id that is in
+    no free list and not withheld. Replicated like the allocator itself."""
+    import torch
+
+    n = int(getattr(allocator, "num_pages", 0) or 0)
+    if n <= 0:
+        return 0
+    live = torch.ones(n + 1, dtype=torch.bool)
+    live[0] = False
+    for name in ("free_pages", "release_pages"):
+        ids = getattr(allocator, name, None)
+        if ids is not None and ids.numel():
+            live[ids.detach().to("cpu", torch.int64)] = False
+    cap = getattr(allocator, "_weg2_kv_stage_cap", None)
+    held = getattr(cap, "_withheld", None) if cap is not None else None
+    if held is not None and held.numel():
+        live[held.to("cpu", torch.int64)] = False
+    idx = torch.nonzero(live).flatten()
+    return int(idx.max()) if idx.numel() else 0
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +824,12 @@ class PhaseState:
     done: bool = False
     slot_limit: Optional[int] = None
     note: str = ""
+    #: #251c: the phase's KV stage (None without a stage form), its tokens,
+    #: the wake's demand and whether it exceeds the highest usable stage
+    stage: Optional[int] = None
+    stage_tokens: Optional[int] = None
+    demand: Optional[int] = None
+    over: bool = False
 
 
 @dataclass
@@ -641,6 +842,9 @@ class PhaseApplied:
     expert_mapped: int
     cap_mapped: int
     note: str = ""
+    #: #251c: the stage this rank mapped and its KV prefix
+    stage: Optional[int] = None
+    kv_mapped: int = 0
 
 
 @dataclass
@@ -660,16 +864,31 @@ class SeatVram:
     applied: Optional[PhaseApplied] = None
     #: the MambaPool whose ``reset_state`` must zero only mapped slots
     mamba_pool: object = None
+    #: #251c: the KV tensors born trimmed (``kv_stage_born``), the stage form,
+    #: the KV pools whose flush must stay in the mapped prefix, the cells
+    kv_tensors: List[_Managed] = field(default_factory=list)
+    form: Optional[StageForm] = None
+    kv_pools: List[object] = field(default_factory=list)
+    cells: Dict[Tuple[int, int], StageCell] = field(default_factory=dict)
+    #: the expert rows ON as last applied (the bank is born at k = 0)
+    rows_on: int = 0
 
     def __post_init__(self):
         x_max = min((int(getattr(c, "seat_rows", 0)) for c in self.caches), default=0)
         self.rows = seat_vram_rows(
             [m.geom for m in self.slot_tensors], [m.geom for m in self.row_tensors],
             cap=self.cap, pool_size=self.pool_size, extra_max=x_max, granule=self.granule)
+        if self.form is not None and self.kv_tensors:
+            self.cells = stage_vram_cells(
+                [m.geom for m in self.slot_tensors], [m.geom for m in self.row_tensors],
+                [m.geom for m in self.kv_tensors], cap=self.cap, pool_size=self.pool_size,
+                extra_max=x_max, stage_tokens=self.form.tokens,
+                boot_rows_on=self.form.rows_on, granule=self.granule)
+            check_form_against_cells(self.form, self.cells, self.cap)
 
     @classmethod
     def from_runtime(cls, *, cap: int, req_to_token_pool, model, spans: Optional[TmsSpans] = None,
-                     granule: Optional[int] = None) -> "SeatVram":
+                     granule: Optional[int] = None, kv_pools: Sequence[object] = ()) -> "SeatVram":
         spans = tms() if spans is None else spans
         pool = getattr(req_to_token_pool, "mamba_pool", None)
         pool_size = int(getattr(pool, "size", 0) or 0)
@@ -703,12 +922,98 @@ class SeatVram:
                 row_tensors.append(_Managed(buf.data_ptr(), RowTensorGeom(
                     "%s.%s" % (getattr(cache.layer, "layer_id", "?"), attr), rows_boot,
                     rows_boot + x, row_bytes, int(info.size))))
+        form = stage_form()
+        kv_tensors = [_Managed(ptr, geom) for ptr, geom in _KV_BORN] if form is not None else []
         return cls(cap=int(cap), pool_size=pool_size, slot_tensors=slot_tensors,
                    row_tensors=row_tensors, caches=caches, fixed_bytes=int(fixed),
-                   spans=spans, granule=g, mamba_pool=pool)
+                   spans=spans, granule=g, mamba_pool=pool, kv_tensors=kv_tensors,
+                   form=form, kv_pools=list(kv_pools))
 
     def row_for(self, n: int) -> SeatVramRow:
         return self.rows[max(1, min(int(n), self.cap)) - 1]
+
+    def apply_stage(self, n: int, stage: int) -> PhaseApplied:
+        """#251c: the pages of a phase of ``n`` seats at KV stage ``stage``
+        (``stage_vram_cells``): the GDN slots, the KV prefix and the expert
+        rows ON move together, the total never above the boot form. Paused
+        allocations get a plan (mapped at their tag's resume), mapped ones move
+        in place. A LIVE bank that shrinks turns its rows OFF in the tables
+        first and synchronizes before a page goes (a row a kernel may still
+        read is never unmapped); one that grows maps first, then turns ON."""
+        import torch
+
+        n = max(1, min(int(n), self.cap))
+        j = max(0, min(int(stage), len(self.form.tokens) - 1))
+        cell = self.cells[(n, j)]
+        notes = []
+        k, keep = int(cell.extra_rows), int(cell.mamba_keep)
+        infos = [self.spans.info(m.ptr) for m in self.slot_tensors]
+        if keep <= self.pool_size and any(i is not None and i.active for i in infos):
+            if cell.rows_full < 0:
+                raise Weg2DSeatVramRefused(
+                    "%s: stage S%d at n=%d needs the GDN pages of the empty seats but the "
+                    "Mamba pool is mapped (live) -- the stage was chosen for a wake whose "
+                    "pool must already be paused" % (LINE_MARK, j, n))
+            notes.append("the Mamba pool is mapped (live): it keeps its cap form")
+            k, keep = int(cell.rows_full), self.pool_size + 1
+        experts_live = any(
+            (lambda i: i is not None and i.active)(self.spans.info(m.ptr))
+            for m in self.row_tensors)
+        shrink = k < int(self.rows_on)
+        if shrink:
+            for cache in self.caches:
+                cache.set_seat_rows_on(k, device_write=experts_live)
+            # the OFF writes are stream-ordered device writes: every kernel
+            # that could still read a row that goes must be done first
+            if experts_live and any(
+                    getattr(getattr(getattr(c, "_pool_tables", None), "row_key", None),
+                            "is_cuda", False) for c in self.caches):
+                torch.cuda.synchronize()
+        for m, info in zip(self.slot_tensors, infos):
+            if info is not None and not info.active:
+                rc = self.spans.set_spans(m.ptr, slot_spans(m.geom, keep, self.granule), now=False)
+                if rc != 0:
+                    raise Weg2DSeatVramRefused("%s: tms_set_spans(%s) rc=%d"
+                                               % (LINE_MARK, m.geom.name, rc))
+        if self.mamba_pool is not None and self.slot_tensors:
+            self.mamba_pool._weg2_seat_keep = None if keep > self.pool_size else int(keep)
+        tokens = int(self.form.tokens[j])
+        for m in self.kv_tensors:
+            info = self.spans.info(m.ptr)
+            live = info is not None and info.active
+            rc = self.spans.set_spans(
+                m.ptr, slot_spans(m.geom.geom, m.geom.slots_for(tokens), self.granule), now=live)
+            if rc != 0:
+                raise Weg2DSeatVramRefused("%s: tms_set_spans(%s, now=%s) rc=%d"
+                                           % (LINE_MARK, m.geom.geom.name, live, rc))
+        page = int(self.kv_tensors[0].geom.token_pad) if self.kv_tensors else 0
+        for pool in self.kv_pools:
+            # zero_kv_data_buffers (the idle flush) writes only mapped rows
+            for sub in (pool, getattr(pool, "full_kv_pool", None)):
+                if sub is not None:
+                    sub.safe_zero_rows = tokens + page
+        for m in self.row_tensors:
+            info = self.spans.info(m.ptr)
+            live = info is not None and info.active
+            rc = self.spans.set_spans(
+                m.ptr, row_spans(m.geom, m.geom.rows_boot + k, self.granule), now=live)
+            if rc != 0:
+                raise Weg2DSeatVramRefused("%s: tms_set_spans(%s, now=%s) rc=%d"
+                                           % (LINE_MARK, m.geom.name, live, rc))
+        if not shrink:
+            for cache in self.caches:
+                cache.set_seat_rows_on(k, device_write=experts_live)
+        self.rows_on = k
+        applied = PhaseApplied(
+            n=n, extra_rows=k,
+            mamba_mapped=sum(span_bytes(slot_spans(m.geom, keep, self.granule))
+                             for m in self.slot_tensors),
+            expert_mapped=sum(span_bytes(row_spans(m.geom, m.geom.rows_boot + k, self.granule))
+                              for m in self.row_tensors),
+            cap_mapped=int(cell.cap_mapped), note="; ".join(notes), stage=j,
+            kv_mapped=int(cell.kv_mapped))
+        self.applied = applied
+        return applied
 
     def apply(self, n: int) -> PhaseApplied:
         """The pages of a phase of ``n`` seats (``n`` = cap: the cap form).
@@ -792,6 +1097,31 @@ def _req_pool(sched):
     return getattr(runner, "req_to_token_pool", None) or getattr(sched, "req_to_token_pool", None)
 
 
+def _kv_pools(sched) -> List[object]:
+    """#251c: the KV pools of this rank's target and draft runners."""
+    out = []
+    runners = [getattr(getattr(sched, "tp_worker", None), "model_runner", None)]
+    draft = getattr(sched, "draft_worker", None)
+    for attr in ("model_runner", "draft_model_runner"):
+        runners.append(getattr(draft, attr, None))
+    for r in runners:
+        pool = getattr(r, "token_to_kv_pool", None)
+        if pool is not None and all(pool is not q for q in out):
+            out.append(pool)
+    return out
+
+
+def _kv_allocator(sched):
+    runner = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+    return (getattr(sched, "token_to_kv_pool_allocator", None)
+            or getattr(runner, "token_to_kv_pool_allocator", None))
+
+
+def _page_size(sched) -> int:
+    runner = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+    return int(getattr(sched, "page_size", None) or getattr(runner, "page_size", None) or 1)
+
+
 def controller(sched) -> Optional[SeatVram]:
     """This rank's page controller, built on first use; None when nothing on
     this rank is seat-proportional (the 3080 workers) or a piece is missing."""
@@ -801,7 +1131,8 @@ def controller(sched) -> Optional[SeatVram]:
     runner = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
     try:
         ctl = SeatVram.from_runtime(cap=_cap_of(sched), req_to_token_pool=_req_pool(sched),
-                                    model=getattr(runner, "model", None))
+                                    model=getattr(runner, "model", None),
+                                    kv_pools=_kv_pools(sched))
         if not ctl.slot_tensors and not ctl.row_tensors:
             ctl = None
     except Exception as exc:  # noqa: BLE001 -- a missing piece names itself, never guesses
@@ -855,11 +1186,50 @@ def on_wake(sched, recv_req, seats) -> Optional[PhaseState]:
             allocator.set_phase_limit(None)
     st.n, st.slot_limit, st.done = target, limit, True
     st.has_n = n is not None
+    # 1b. REPLICATED (#251c): the KV stage -- the form values and the wake's
+    # demand only, and the allocator's page cap that makes it safe
+    form = stage_form()
+    stage = None
+    if form is not None:
+        demand = getattr(recv_req, "phase_kv_tokens", None) if n is not None else None
+        choice = choose_form_stage(form, n_phys, demand)
+        stage = choice.stage
+        kv_alloc = _kv_allocator(sched)
+        page = _page_size(sched)
+        live = max_live_page(kv_alloc) if kv_alloc is not None else 0
+        while stage < len(form.tokens) - 1 and form.tokens[stage] // page < live:
+            stage += 1
+        if stage != choice.stage:
+            st.note = ("KV pages up to %d still held at the wake: stage S%d instead of S%d"
+                       % (live, stage, choice.stage))
+        if kv_alloc is not None:
+            _engage_kv_cap(kv_alloc, form.tokens[stage], page)
+        st.stage, st.stage_tokens = stage, form.tokens[stage]
+        st.demand, st.over = choice.demand, bool(choice.over)
     # 2. RANK-LOCAL: the pages
     ctl = controller(sched)
-    applied = ctl.apply(n_phys) if ctl is not None else None
+    if ctl is None:
+        applied = None
+    elif stage is not None and ctl.cells:
+        applied = ctl.apply_stage(n_phys, stage)
+    else:
+        applied = ctl.apply(n_phys)
     logger.info("%s", phase_line(st, applied, ctl))
+    if stage is not None:
+        logger.info("%s", stage_line(st, applied))
     return st
+
+
+STAGE_MARK = "#251 WAKE-RESHARD"
+
+
+def stage_line(st: PhaseState, applied: Optional[PhaseApplied]) -> str:
+    """The #251c metal marker, one per wake that carries a stage."""
+    return "%s n=%d stage=S%d tokens=%d demand=%s over=%s kv_mib=%s rows_on=%s epoch=%s" % (
+        STAGE_MARK, st.n, int(st.stage), int(st.stage_tokens or 0),
+        "-" if st.demand is None else int(st.demand), "yes" if st.over else "no",
+        "-" if applied is None else "%.1f" % (applied.kv_mapped / _MIB),
+        "-" if applied is None else int(applied.extra_rows), st.epoch)
 
 
 def phase_line(st: PhaseState, applied: Optional[PhaseApplied], ctl: Optional[SeatVram]) -> str:

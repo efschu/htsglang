@@ -5221,6 +5221,14 @@ class ModelRunnerKVCacheMixin:
                 "and --kv-cache-dtype != fp4_e2m1."
             )
 
+        # #251c: under D's KV stage form the allocator hands out only stage
+        # S0's pages until the first wake picks a stage (every rank, the same
+        # cap -- the pool is VIRTUALLY the top stage, see _config_from_budget).
+        if not self.is_draft_worker:
+            from sglang.srt.weg2 import d_seat_vram as _dsv
+
+            _dsv.kv_stage_boot_cap(self.token_to_kv_pool_allocator, self.page_size)
+
     def _hybrid_kv_token_cap(self: ModelRunner) -> Optional[int]:
         """Physically reachable ceiling on max_total_num_tokens for hybrid
         mamba/GDN + attention models (#79).
@@ -7872,6 +7880,14 @@ class ModelRunnerKVCacheMixin:
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
+        # #251c: D's KV stage form sizes the pool VIRTUALLY at the top stage;
+        # its pages are stage S0's (the budget must hold S0 on the attention
+        # host, else a named refusal). Off: unchanged.
+        from sglang.srt.weg2 import d_seat_vram as _dsv
+
+        max_tokens = _dsv.kv_stage_pool_tokens(
+            max_tokens, is_form_a_worker=bool(getattr(self, "is_form_a_worker", False))
+        )
         if max_tokens != config.max_total_num_tokens:
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 max_tokens, self.page_size

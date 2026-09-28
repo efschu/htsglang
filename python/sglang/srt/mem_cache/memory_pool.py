@@ -3021,6 +3021,22 @@ def maybe_poison_pool_data(tensors, source: str, row_limit=None) -> None:
     )
 
 
+def _kv_stage_born(pool, t: torch.Tensor, name: str) -> torch.Tensor:
+    """#251c: a K/V buffer of D's stage-form pool keeps its top-stage range and
+    only stage S0's pages (weg2/d_seat_vram.kv_stage_born); every other pool's
+    buffer passes through untouched."""
+    from sglang.srt.weg2.d_seat_vram import kv_stage_born
+
+    rows = max(1, int(t.shape[0]))
+    return kv_stage_born(
+        t,
+        pool_size=int(pool.size),
+        page_size=int(pool.page_size),
+        name=name,
+        tokens_per_slot=max(1, (int(pool.size) + int(pool.page_size)) // rows),
+    )
+
+
 def zero_kv_data_buffers(kvcache) -> int:
     """Zero the KV data buffers of ``kvcache`` (and its sub-pools) in place;
     returns the number of buffers zeroed.
@@ -3590,12 +3606,20 @@ class MHATokenToKVPool(KVCache):
                 else:
                     k_shape, v_shape = self._kv_buffer_shapes()
                     self.k_buffer = [
-                        torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
-                        for _ in range(self.layer_num)
+                        _kv_stage_born(
+                            self,
+                            torch.zeros(k_shape, dtype=self.store_dtype, device=self.device),
+                            f"k{i}",
+                        )
+                        for i in range(self.layer_num)
                     ]
                     self.v_buffer = [
-                        torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
-                        for _ in range(self.layer_num)
+                        _kv_stage_born(
+                            self,
+                            torch.zeros(v_shape, dtype=self.store_dtype, device=self.device),
+                            f"v{i}",
+                        )
+                        for i in range(self.layer_num)
                     ]
 
     # -- post-capture VA backing (opt-in; overridable per layout) --------------
