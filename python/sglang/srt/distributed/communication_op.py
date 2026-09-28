@@ -9,6 +9,7 @@ import torch.distributed
 
 from .parallel_state import (
     get_attn_tp_group,
+    get_attn_tp_layer_group,
     get_moe_ep_group,
     get_moe_tp_group,
     get_model_tp_group,
@@ -70,14 +71,14 @@ def broadcast_tensor_dict(
 
 def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across attention parallel group."""
-    return get_attn_tp_group().all_reduce(input_)
+    return get_attn_tp_layer_group().all_reduce(input_)
 
 
 def attention_tensor_model_parallel_quant_all_reduce(
     input_: torch.Tensor,
 ) -> torch.Tensor:
     """All-reduce the input tensor across attention parallel group."""
-    return get_attn_tp_group().quant_all_reduce(input_)
+    return get_attn_tp_layer_group().quant_all_reduce(input_)
 
 
 def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:

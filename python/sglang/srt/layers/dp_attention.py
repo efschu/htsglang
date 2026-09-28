@@ -744,19 +744,28 @@ def dp_reduce_scatterv_async(
 
 
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attn_tp_group().reduce_scatter_tensor(output, input)
+    return _attn_tp_layer_group().reduce_scatter_tensor(output, input)
 
 
 def attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attn_cp_group().reduce_scatter_tensor(output, input)
 
 
+def _attn_tp_layer_group():
+    """F6 step 2c: these attn-tp helpers are LAYER collectives -- under Form B
+    they run on model_tp (the weight ranks), classic on the attn-tp group,
+    byte-identical (parallel_state.get_attn_tp_layer_group)."""
+    from sglang.srt.distributed.parallel_state import get_attn_tp_layer_group
+
+    return get_attn_tp_layer_group()
+
+
 def attn_tp_all_reduce(input: torch.Tensor):
-    return get_attn_tp_group().all_reduce(input)
+    return _attn_tp_layer_group().all_reduce(input)
 
 
 def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attn_tp_group().all_gather_into_tensor(output, input)
+    return _attn_tp_layer_group().all_gather_into_tensor(output, input)
 
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
@@ -789,4 +798,4 @@ def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
-    return get_attn_tp_group().all_gather(input, output_tensor_list=output_list)
+    return _attn_tp_layer_group().all_gather(input, output_tensor_list=output_list)

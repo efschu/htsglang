@@ -595,3 +595,96 @@ def check_form_b_windows(
                       + ". Shrink a window (e.g. TP_0: under Form B the scheduler tp group carries "
                       "control traffic only; MODEL_TP_0 sized to the o_proj/MLP all-reduce) or move a rank.")
     return posts
+
+
+# --------------------------------------------------------------------------
+# F6 step 2c: the construction context of a Form B rank.
+#
+# Every parallel Linear caches tp_size / tp_rank from the parallel context
+# when it is BUILT (layers/linear.py: get_parallel().tp_size), and the
+# attention projections cache attn_tp_size / attn_tp_rank; RowParallelLinear
+# gates its all-reduce on the cached value. Under Form B a weight rank must
+# therefore be built as one of |W| ranks with its index in W -- never as one
+# of all N (which would size its shard against the KV-only ranks' zero and
+# hand the all-reduce a group of N). The shard plan is re-scoped the same way:
+# ``tp_partition_sizes`` applies a vector only when len == tp_size, so the
+# weight vector restricted to W is installed for the build. The model's
+# collectives then go to model_tp (2b), the attention layers' to
+# get_attn_tp_layer_group() (2c). Same mechanism as the weightless lane's
+# construction override (model_runner: _wl_build_ctx), with |W| instead of 1.
+# --------------------------------------------------------------------------
+
+class RankFormKvRankBuild(RankFormError):
+    code = "W188 Weg2RankFormKvRankBuildNotWired"
+
+
+def form_b_build_override(
+    partition: Sequence[Sequence[int]],
+    rank: int,
+    base_ratios: Optional[Sequence[int]] = None,
+    families: Optional[Mapping[str, Sequence[int]]] = None,
+) -> Tuple[Dict[str, int], Optional[List[int]], Dict[str, List[int]]]:
+    """(parallel override, W-restricted base vector, W-restricted families)
+    for a WEIGHT rank of the installed model_tp partition.
+
+    ``base_ratios`` / ``families`` are the process plan over ALL ranks (a
+    KV-only rank's entry is 0); None = even split, and it stays even over W.
+    A KV-only rank is refused by name (W188): its construction (meta model, no
+    weight load) and its attention-only forward belong to seam F15."""
+    multi = [list(p) for p in partition if len(p) >= 2]
+    if len(multi) != 1:
+        raise _refuse(RankFormShapeMismatch,
+                      f"model_tp partition {[list(p) for p in partition]} has no single weight group")
+    w = sorted(multi[0])
+    if rank not in w:
+        raise _refuse(
+            RankFormKvRankBuild,
+            f"rank {rank} is a KV-only rank of Form B (weight ranks {w}); building it needs the "
+            "KV-only construction path (meta model, attention-only forward) -- rank_role seam F15, "
+            "not wired. Refused before any layer is built.")
+    i = w.index(rank)
+    override = dict(tp_size=len(w), tp_rank=i, attn_tp_size=len(w), attn_tp_rank=i)
+    world = sum(len(p) for p in partition)
+
+    def restrict(vec: Optional[Sequence[int]], what: str) -> Optional[List[int]]:
+        if vec is None:
+            return None
+        vec = list(vec)
+        if len(vec) != world:
+            raise _refuse(RankFormShapeMismatch, f"{what} {vec} names {len(vec)} ranks, the form {world}")
+        bad = [r for r in range(world) if (r in w) != (vec[r] > 0)]
+        if what == "weight vector" and bad:
+            raise _refuse(RankFormShapeMismatch,
+                          f"weight vector {vec} disagrees with the weight ranks {w} at rank(s) {bad}")
+        return [vec[r] for r in w]
+
+    return (override, restrict(base_ratios, "weight vector"),
+            {k: restrict(v, f"family {k!r}") for k, v in (families or {}).items() if v})
+
+
+def form_b_build_context(rank: int):
+    """The context a Form B rank builds its model under (model_runner), or
+    None when no Form B partition is installed (the caller keeps its own)."""
+    import contextlib
+
+    from sglang.srt.distributed import parallel_state as ps
+    from sglang.srt.distributed.utils import (
+        get_tp_partition_families,
+        get_tp_partition_ratios,
+        scoped_tp_partition_ratios,
+    )
+    from sglang.srt.runtime_context import get_parallel
+
+    partition = ps.get_model_tp_partition()
+    if partition is None:
+        return None
+    override, base, fams = form_b_build_override(
+        partition, rank, get_tp_partition_ratios(), get_tp_partition_families())
+
+    @contextlib.contextmanager
+    def _ctx():
+        with get_parallel().override(**override), \
+                scoped_tp_partition_ratios(base, fams or None, allow_zero=False):
+            yield
+
+    return _ctx()

@@ -2821,6 +2821,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                     else contextlib.nullcontext()
                 )
+                # F6 step 2c: a Form B weight rank builds as one of |W| ranks
+                # with its index in W and the weight vector restricted to W
+                # (rank_form.form_b_build_context); a KV-only rank is refused
+                # by name there (W188, seam F15). None without a Form B
+                # partition -- the context above stands, byte-identical.
+                from sglang.srt.rank_form import form_b_build_context
+
+                # The solo draft (host and shadows) keeps its own TP=1 override.
+                _fb_ctx = (
+                    None
+                    if (
+                        self.is_weightless_head
+                        or self.is_weightless_worker
+                        or self.is_draft_solo_host
+                        or self.is_draft_solo_shadow
+                    )
+                    else form_b_build_context(self.tp_rank)
+                )
+                if _fb_ctx is not None:
+                    _wl_build_ctx = _fb_ctx
                 with _wl_build_ctx:
                     if self.is_dual_group_lane:
                         # Multi-group runtime (#274): the lane's model is not

@@ -234,6 +234,15 @@ def get_tp_partition_ratios(family: Optional[str] = None) -> Optional[list]:
     return base
 
 
+def get_tp_partition_families() -> dict:
+    """The active family vectors ({name: vector}), overlay first -- the
+    companion of get_tp_partition_ratios for a caller that re-scopes the whole
+    plan (F6 2c: Form B's weight ranks build under the plan restricted to W)."""
+    overlay = _TP_PARTITION_OVERLAY.get()
+    fams = overlay[1] if overlay is not _NO_OVERLAY else _TP_PARTITION_FAMILIES
+    return {k: list(v) for k, v in fams.items()}
+
+
 @contextmanager
 def scoped_tp_partition_ratios(
     ratios: Optional[Sequence[int]],

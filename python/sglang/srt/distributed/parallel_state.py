@@ -3116,6 +3116,26 @@ def get_model_tp_group_no_assert() -> Optional[GroupCoordinator]:
     return _MODEL_TP
 
 
+def get_model_tp_partition() -> Optional[List[List[int]]]:
+    """F6: the installed model_tp partition ([W] + one group per KV-only
+    rank), or None."""
+    return None if _MODEL_TP_PARTITION is None else [list(p) for p in _MODEL_TP_PARTITION]
+
+
+def get_attn_tp_layer_group() -> GroupCoordinator:
+    """F6 step 2c: the group the ATTENTION LAYERS' collectives run on.
+
+    Classic: the attention-TP group, exactly as before. Form B: model_tp --
+    the attention projections are sharded over the weight ranks W (the build
+    context carries attn_tp_size=|W|), while get_attn_tp_group() keeps
+    spanning ALL ranks because the scheduler's request broadcast
+    (attn_tp_cpu_group) must reach the KV-only ranks too (NF objection 1).
+    DP attention is outside Form B, so attn_tp == tp there."""
+    if _MODEL_TP is not None:
+        return _MODEL_TP
+    return get_attn_tp_group()
+
+
 def get_tp_group() -> GroupCoordinator:
     if _PHASE_FLIP_TP_ACTIVE:
         assert _FLIP_TP is not None, (
