@@ -236,6 +236,37 @@ def one_s_rate(per_rank, now, other_after=None, gone_after=None, gap_s=PHASE_GAP
     return min(rates) if rates else 0.0
 
 
+def max_rate(per_rank, t_lo, t_hi, w=3.0, rate=None):
+    """Maximum of the class rate (MIN over the ranks) over all anchor time
+    points in [t_lo, t_hi]: an anchor is the end (``end``) of any interval of
+    any rank in that span.  At anchor ``t`` a rank uses only its intervals
+    with ``end <= t`` and counts only if its newest such interval is not
+    older than max(PHASE_GAP_S, 1.5 x its duration + 1 s) before ``t``
+    (as in one_s_rate).  Per-rank rate: ``rate(iv, w)`` when given (prefill:
+    compute_rate with w=3.0), else spread_rate(iv, t, w) (decode).  The class
+    is the min over the counting ranks; the result is the max over the
+    anchors, or None when there is no anchor or no rate > 0 (a silent or
+    finished boot shows the dash, not 0)."""
+    anchors = sorted({e for iv in per_rank.values() for _, e, _ in iv if t_lo <= e <= t_hi})
+    best = None
+    for t in anchors:
+        rates = []
+        for iv in per_rank.values():
+            iv_t = [x for x in iv if x[1] <= t]
+            if not iv_t:
+                continue
+            s, e, _ = iv_t[-1]
+            if t - e > max(PHASE_GAP_S, 1.5 * (e - s) + 1.0):
+                continue        # too old to count at this anchor
+            rates.append(rate(iv_t, w) if rate else spread_rate(iv_t, t, w))
+        if not rates:
+            continue
+        v = min(rates)
+        if best is None or v > best:
+            best = v
+    return best if best and best > 0 else None
+
+
 def _flip_intervals(begins, dones, open_begin, t1):
     """Pair ``WEG2-FLIP begin`` with its ``done`` (the done carries the NEW
     epoch = begin epoch + 1, and slept/woke = sleep/wake).  Without a begin
@@ -635,6 +666,7 @@ class Boot:
         return {
             "window_s": WINDOW_S,
             "one_s": self._one_s(g, "prefill", now),
+            "max3s_120": self._max3s(g, "prefill", now),
             "now": win,
             "last_burst": burst,
             "last_t": last_t,
@@ -718,6 +750,15 @@ class Boot:
         return one_s_rate(per, now, other_after=other, gone_after=gone,
                           rate=compute_rate if kind == "prefill" else None)
 
+    def _max3s(self, g: str, kind: str, now: float):
+        if self.newest_mtime and now - self.newest_mtime > 120.0:
+            return None         # a finished boot: nothing ran in the last 120 s
+        per = self._intervals(g, kind, now - 123.0)
+        if not per:
+            return None
+        return max_rate(per, now - 120.0, now, w=3.0,
+                        rate=compute_rate if kind == "prefill" else None)
+
     def _round_bs(self, g: str) -> Optional[dict]:
         """bs of the newest 'Decode rank batch' round of rank 0: the requests
         that really compute now (below the seats when KV is short)."""
@@ -740,6 +781,7 @@ class Boot:
         return {
             "window_s": WINDOW_S,
             "one_s": self._one_s(g, "decode", now),
+            "max3s_120": self._max3s(g, "decode", now),
             "gen_tps": (sum(gen) / len(gen)) if gen else None,
             "gen_tps_last": last.get("gen_tps") if last else None,
             "running": last.get("running") if last else None,

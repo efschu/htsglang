@@ -455,6 +455,7 @@ function prefillTile(b, g, color, label, binders, now) {
   return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>${label}</div>
     ${bigPair(active ? "&Oslash; 60 s" : "letzter Schub", src && src.tps, one, 0)}
     <div class="state">${state}</div>
+    <div class="state">max 3 s / 120 s: ${p.max3s_120 != null ? fmt(p.max3s_120) + " tok/s" : "–"}</div>
     ${kv([
       ["Rechenrate je Rang (gpu-ms)", ranks],
       [active ? "Tokens / Chunks im Fenster" : "Tokens / Chunks im letzten Schub", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
@@ -480,6 +481,7 @@ function decodeTile(b, g, color, binders, now) {
   return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>Decode${g !== "D" ? " (" + g + ")" : ""}</div>
     ${bigPair(active ? "&Oslash; 60 s" : "letzter Wert", v, one, 1, bsBadge(d, one > 0))}
     <div class="state">${state}</div>
+    <div class="state">max 3 s / 120 s: ${d.max3s_120 != null ? fmt(d.max3s_120, 1) + " tok/s" : "–"}</div>
     ${kv([
       ["laufende Anfragen (bs) &middot; je Anfrage", `${fmt(d.running)} &middot; ${fmt(per, 1)} tok/s`],
       d.seats ? ["Sitze dieser D-Phase (D-PHASE-SEATS)", `${fmt(d.seats.n)} von ${fmt(d.seats.cap)} &middot; &uuml;bergeben ${fmt(d.seats.handoff_n)} + geparkt ${fmt(d.seats.parked_n)}${d.seats.clamped ? " (gekappt)" : ""}`] : null,

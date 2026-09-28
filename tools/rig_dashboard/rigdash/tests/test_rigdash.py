@@ -206,6 +206,43 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(v["awake"]["awake"], "D")
         self.assertFalse(v["health"]["P"]["alive"])
 
+    def test_max_rate_empty_is_none(self):
+        self.assertIsNone(live.max_rate({}, 0.0, 120.0))
+
+    def test_max_rate_constant_rank(self):
+        iv = [(float(i), float(i + 1), 1000) for i in range(10)]
+        self.assertAlmostEqual(live.max_rate({"r0": iv}, 0.0, 20.0, w=3.0, rate=live.compute_rate), 1000.0, delta=1)
+
+    def test_max_rate_picks_the_spike(self):
+        iv = [(float(i), float(i + 1), 1000) for i in range(20)] + [(20.0, 21.0, 5000)]
+        # anchor at the spike's end: compute_rate over the newest 3 s of compute
+        # walks back (5000 + 1000 + 1000) tokens in 3 s
+        self.assertAlmostEqual(live.max_rate({"r0": iv}, 0.0, 30.0, w=3.0, rate=live.compute_rate),
+                               7000.0 / 3.0, delta=1)
+
+    def test_max_rate_anchors_outside_the_window_do_not_count(self):
+        iv = [(float(i), float(i + 1), 1000) for i in range(20)] + [(20.0, 21.0, 5000)]
+        # t_lo past the spike's end: the spike's anchor falls out of [t_lo, t_hi]
+        self.assertIsNone(live.max_rate({"r0": iv}, 22.0, 40.0, w=3.0, rate=live.compute_rate))
+
+    def test_max_rate_class_is_the_slowest_rank(self):
+        r0 = [(float(i), float(i + 1), 1000) for i in range(10)]
+        r1 = [(float(i), float(i + 1), 500) for i in range(10)]
+        self.assertAlmostEqual(live.max_rate({"r0": r0, "r1": r1}, 0.0, 20.0, w=3.0, rate=live.compute_rate),
+                               500.0, delta=1)
+
+    def test_max3s_none_for_a_finished_boot(self):
+        # no existing finished-boot test for one_s to copy: the guard is the
+        # same newest_mtime test as _one_s's, exercised here with an old mtime
+        now = time.time()
+        self._write("P", [_shift(P_RANK0, now - 5), _shift(P_RANK1, now - 5)])
+        old = now - 300.0
+        os.utime(self.stem + ".P.log", (old, old))
+        ll = live.LiveLogs([os.path.join(self.tmp.name, "boot_*.log")])
+        ll.poll()
+        b = next(iter(ll.boots.values()))
+        self.assertIsNone(b._max3s("P", "prefill", now))
+
 
 class LaunchLineTests(unittest.TestCase):
     def test_key_lines_kept_dedup_and_stripped(self):
