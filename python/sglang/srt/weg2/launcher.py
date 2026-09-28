@@ -16422,7 +16422,7 @@ def solve_p_cut(
                 lru_rows=rows,
                 reserve_mib_by_stage=_reserve_p,
             ) if _reserve_p is not None else None
-            _ueber = [i for i, (f, m) in enumerate(
+            _stages_over_cap = [i for i, (f, m) in enumerate(
                 zip(fracs, _frec if _frec is not None else _fmax)) if f > m]
             log(
                 "PP-CUT FRACTION-SOLVE (#140): budgets %s MiB, layers %s, "
@@ -16438,7 +16438,7 @@ def solve_p_cut(
                     ["%.3f" % f for f in _fmax], ["%.3f" % f for f in fracs],
                     ((" | MIT KV-RESERVE: %s" % ["%.3f" % f for f in _frec])
                      if _frec is not None else "")
-                    + ((" -- DARUEBER auf Stufe(n) %s" % _ueber) if _ueber else ""),
+                    + ((" -- DARUEBER auf Stufe(n) %s" % _stages_over_cap) if _stages_over_cap else ""),
                 )
             )
         except BaseException as _exc:  # noqa: BLE001 -- eine Zahl kippt nie den Boot

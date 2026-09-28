@@ -904,7 +904,7 @@ def _prefix_field(name: str) -> str:
 
 def _explicit_env(env: Mapping[str, str], name: str) -> Optional[str]:
     """The explicitly set value of ``name`` in ``env`` -- any spelling of its
-    rename family (name_compat: SGLANG_/FLLIPER_ ...) counts, the tree's own
+    rename family (name_compat: legacy and renamed env prefix ...) counts, the tree's own
     spelling first; ``None`` when unset or blank."""
     from sglang.srt.name_compat import canonical_env_name
 
