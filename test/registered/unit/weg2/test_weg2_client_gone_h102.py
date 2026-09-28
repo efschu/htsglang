@@ -313,13 +313,40 @@ async def _on_d(park: bool):
         return rig, p
 
 
-def test_d_hang_up_keeps_todays_leg2_abort_and_is_named():
+def test_d_hang_up_aborts_on_d_and_is_named():
+    # stream: leg 2's write error closes D's connection AND the watcher aborts
+    # D by rid (idempotent) -- one named line either way.
     rig, p = _run(_on_d(park=False))
     gone = rig.lines.gone()
-    assert len(gone) == 1 and f"rid={p.rid} state=d action=none(leg2-path)" in gone[0], gone
-    assert rig.seen.get("d_aborts") is None     # no new call on D: today's path
-    assert rig.seen.get("d_conn_closed") is True
-    assert rig.seen.get("d_completed") is not True
+    assert len(gone) == 1 and f"rid={p.rid} state=d action=abort-d status=200" in gone[0], gone
+    assert rig.seen.get("d_aborts") == [p.rid], rig.seen
+
+
+async def _on_d_nonstream():
+    # 27B rc12z21 (weg2-0-8 / weg2-1-13): a NON-stream leg 2 writes nothing
+    # before D's end, so no write error ever aborts D -- only the watcher can.
+    async with _Rig() as rig:
+        r, w = await rig.open_client(stream=False)
+        await _until(lambda: len(rig.front.queue) == 1)
+        p = rig.front.queue.popleft()
+        p.leg1_done = True
+        rig.front.awake = "D"
+        p.fut.set_result(True)
+        await _until(lambda: p.rid in rig.front.groups["D"].outstanding
+                     and rig.seen.get("d_calls"))
+        await _hang_up(w)
+        await _until(lambda: rig.seen.get("d_aborts"), timeout=8.0)
+        await asyncio.sleep(0.5)
+        return rig, p
+
+
+def test_d_nonstream_hang_up_aborts_on_d_instead_of_decoding_for_nobody():
+    rig, p = _run(_on_d_nonstream())
+    assert rig.seen.get("d_aborts") == [p.rid], rig.seen
+    gone = rig.lines.gone()
+    assert len(gone) == 1 and f"rid={p.rid} state=d action=abort-d status=200" in gone[0], gone
+    assert p.client_gone is True
+    assert rig.seen.get("d_completed") is not True   # D stopped, it did not decode to the end
 
 
 def test_parked_hang_up_releases_the_park_on_d():

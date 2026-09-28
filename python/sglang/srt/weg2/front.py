@@ -5819,10 +5819,21 @@ class Front:
             except Exception as exc:  # noqa: BLE001
                 action = f"abort-d-park raised={type(exc).__name__}"
         elif state == "d":
-            # Unchanged: leg 2's next write to the client fails and closes
-            # D's connection, which aborts D; a hang-up after D's end is
-            # booked as served (H61/H61b).
-            action = "none(leg2-path)"
+            # 27B rc12z21 13:42-13:51 (weg2-0-8 / weg2-1-13, 35789 / 39729
+            # completion tokens for clients that had left at 13:44): relying
+            # on "leg 2's next write to the client fails" holds for a STREAM
+            # only. A NON-stream leg 2 writes nothing before D's end, so D
+            # decoded to the end for nobody and held the D->P drain for
+            # minutes. Abort on D by rid, stream or not -- the same call the
+            # parked branch makes; idempotent where the stream's write error
+            # already aborted it, and a hang-up after D's end is "done" above.
+            if p is not None:
+                p.client_gone = True
+            try:
+                code, _b = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
+                action = f"abort-d status={code}"
+            except Exception as exc:  # noqa: BLE001
+                action = f"abort-d raised={type(exc).__name__}"
         logger.warning("WEG2-CLIENT-GONE rid=%s state=%s action=%s wait_s=%.1f (H102)",
                        rid, state, action,
                        max(0.0, time.time() - p.t_arrive) if p is not None else 0.0)
