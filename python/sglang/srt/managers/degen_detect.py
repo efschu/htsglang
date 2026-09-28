@@ -33,10 +33,14 @@ loop and a content loop are measured separately.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import queue
+import threading
 import time
 from collections import deque
-from typing import Callable, Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -95,12 +99,22 @@ class DegenDetector:
     def __init__(self, think_end_id: Optional[int] = None, *, enabled: bool = True,
                  stop: bool = False, min_span: int = 512,
                  on_stop: Optional[Callable[[str, str, int, int], None]] = None,
+                 on_dump: Optional[Callable[[str, str, str, List[int], dict], None]] = None,
+                 dump_long: int = 0,
                  clock=time.monotonic):
         self.think_end_id = think_end_id
         self.enabled = bool(enabled)
         self.stop = bool(stop)
         self.min_span = max(0, int(min_span))
         self.on_stop = on_stop
+        # TAIL DUMP (EG 28.09., 27B weg2-0-8 / weg2-1-13: 35789 / 39729 tokens
+        # whose TEXT nobody kept): ``on_dump(rid, reason, part, ids, meta)`` gets
+        # the part's window (last <= WINDOW ids) at a DEGEN-SUSPECT
+        # (reason="suspect") and at the end of a request whose output reached
+        # ``dump_long`` ids (reason="long"; 0 = off). The caller writes it off
+        # this path (TailDumper: one thread, bounded).
+        self.on_dump = on_dump
+        self.dump_long = max(0, int(dump_long))
         self.clock = clock
         self.states: Dict[str, _State] = {}
         self.suspects = 0
@@ -114,6 +128,7 @@ class DegenDetector:
             enabled=envs.SGLANG_WEG2_DEGEN_DETECT.get(),
             stop=envs.SGLANG_WEG2_DEGEN_STOP.get(),
             min_span=envs.SGLANG_WEG2_DEGEN_MIN_SPAN.get(),
+            dump_long=envs.SGLANG_WEG2_DEGEN_DUMP_LONG.get(),
         )
 
     def observe(self, rid: str, new_ids: Iterable[int], prompt_tail: Iterable[int] = (),
@@ -145,6 +160,8 @@ class DegenDetector:
                 st.since = 0
                 hit = self._check(rid, st) or hit
         if finished:
+            if self.on_dump is not None and self.dump_long and st.out_len >= self.dump_long:
+                self._dump(rid, "long", st, {"out_len": st.out_len})
             self.states.pop(rid, None)
         return hit
 
@@ -162,6 +179,13 @@ class DegenDetector:
 
     def forget(self, rid: str) -> None:
         self.states.pop(rid, None)
+
+    def _dump(self, rid: str, reason: str, st: _State, meta: dict) -> None:
+        try:
+            self.on_dump(rid, reason, st.part, list(st.window), meta)
+        except Exception as e:  # noqa: BLE001 -- an instrument never kills the detokenizer
+            logger.warning("DEGEN-DUMP hook raised %s: %s (dump off)", type(e).__name__, e)
+            self.on_dump = None
 
     def _check(self, rid: str, st: _State) -> Optional[Tuple[int, int]]:
         if len(st.window) < max(self.min_span, 2 * MIN_REPS):
@@ -184,11 +208,89 @@ class DegenDetector:
             rid, st.part, period, reps, span, st.out_len, st.out_len / dt,
             "armed" if self.stop else "off", self.suspects, period, WINDOW,
         )
+        if self.on_dump is not None:
+            self._dump(rid, "suspect", st, {"out_len": st.out_len, "period": period,
+                                             "reps": reps, "span": span})
         if self.stop and self.on_stop is not None:
             # Stage 2 (prepared, OFF by default): the caller decides how to
             # end the request; the detector only names it.
             self.on_stop(rid, st.part, period, reps)
         return period, reps
+
+
+class TailDumper:
+    """Writes a request's decode tail (ids + decoded text) as one evidence JSON,
+    in ONE daemon thread behind a bounded queue: the detokenizer only enqueues
+    (O(WINDOW) list copy), decoding and the disk write run beside it. At most
+    ``max_files`` per process; a full queue or the cap drops (counted, named
+    once) -- an instrument never slows or kills the detokenizer."""
+
+    def __init__(self, tokenizer, directory: str, max_files: int = 16, *,
+                 start: bool = True):
+        self.tokenizer = tokenizer
+        self.directory = directory
+        self.max_files = max(0, int(max_files))
+        self.written = 0
+        self.dropped = 0
+        self.q: "queue.Queue" = queue.Queue(maxsize=max(1, self.max_files))
+        self._thread = None
+        if start and self.max_files:
+            self._thread = threading.Thread(target=self._run, name="degen-dump", daemon=True)
+            self._thread.start()
+
+    def __call__(self, rid: str, reason: str, part: str, ids: List[int], meta: dict) -> None:
+        if self.written + self.q.qsize() >= self.max_files:
+            self._drop(rid, reason, "cap")
+            return
+        try:
+            self.q.put_nowait((rid, reason, part, list(ids), dict(meta)))
+        except queue.Full:
+            self._drop(rid, reason, "queue")
+
+    def _drop(self, rid, reason, why):
+        self.dropped += 1
+        if self.dropped == 1:
+            logger.warning("DEGEN-DUMP dropped rid=%s reason=%s why=%s (max_files=%d; "
+                           "further drops only counted)", rid, reason, why, self.max_files)
+
+    def _run(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            self.write(*item)
+
+    def write(self, rid: str, reason: str, part: str, ids: List[int], meta: dict) -> Optional[str]:
+        try:
+            try:
+                text = self.tokenizer.decode(ids) if self.tokenizer is not None else None
+            except Exception as e:  # noqa: BLE001
+                text = f"<decode failed: {type(e).__name__}: {e}>"
+            os.makedirs(self.directory, exist_ok=True)
+            safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(rid))[:80]
+            path = os.path.join(self.directory,
+                                f"degen_{os.getpid()}_{safe}_{reason}_{self.written:03d}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"rid": rid, "reason": reason, "part": part, "n_ids": len(ids),
+                           **meta, "text": text, "ids": ids}, f, ensure_ascii=False)
+            self.written += 1
+            logger.warning("DEGEN-DUMP rid=%s reason=%s part=%s n_ids=%d meta=%s file=%s",
+                           rid, reason, part, len(ids), meta, path)
+            return path
+        except Exception as e:  # noqa: BLE001 -- an instrument never kills the detokenizer
+            self._drop(rid, reason, f"write:{type(e).__name__}")
+            return None
+
+    @classmethod
+    def from_env(cls, tokenizer) -> Optional["TailDumper"]:
+        from sglang.srt.environ import envs
+
+        n = envs.SGLANG_WEG2_DEGEN_DUMP_MAX.get()
+        if n <= 0:
+            return None
+        d = envs.SGLANG_WEG2_DEGEN_DUMP_DIR.get() or os.path.join(
+            os.environ.get("SGLANG_WEG2_EVIDENCE_DIR") or "/var/lib/htsglang/evidence", "degen")
+        return cls(tokenizer, d, n)
 
 
 def _think_end_id(tokenizer) -> Optional[int]:
