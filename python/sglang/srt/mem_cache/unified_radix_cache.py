@@ -7259,13 +7259,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # 896 at the same END as the host's 33600, and a MIN over the raw
         # counts would cut the host back to 896 at completion. 0 = the
         # unchanged length reduce (every other read and boot).
-        _eb = int((getattr(self, "_hp1_end_base_by_rid", None) or {}).get(str(req_id), 0))
+        _eb_rec = (getattr(self, "_hp1_end_base_by_rid", None) or {}).get(str(req_id))
+        _eb = int(_eb_rec or 0)
         _c_vote, _h_vote, _a_vote = _hp1_end_pack(
             _eb,
             completed_tokens,
             _hit_tokens_local,
             self._anchor_reach_local(completed_tokens, hash_value),
         )
+        _synced_end = int(_c_vote)
         packed_list = [_c_vote] + [0] * _POOL_SLOT_COUNT
         packed_list += [_probed_local, _h_vote, tail_adopt.local_vote(req_id)]
         packed_list += [_a_vote]
@@ -7288,7 +7290,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 torch.distributed.ReduceOp.MIN,
                 label="check_prefetch_progress",
             )
-            min_completed_tokens = _hp1_end_unpack(_eb, int(packed[0].item()))
+            _synced_end = int(packed[0].item())
+            min_completed_tokens = _hp1_end_unpack(_eb, _synced_end)
             for p in sidecar_pools:
                 hit_pages[p] = int(packed[_pool_slot(p, 1)].item())
         else:
@@ -7662,6 +7665,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # have had the mark refused on group D's uneven-DCP phase.
             synced=min_completed_tokens,
         )
+        if _eb_rec is not None:
+            # HFB (rc12z21 D 13:35:14, weg2-8-34): under the Form A END vote
+            # every rank's `synced`/`materialized` counts from ITS OWN span
+            # start (TP0 13376 from 12544, the workers 9536 from 16384), so a
+            # reader that needs a group fact takes the reduced END itself --
+            # the absolute prompt depth the group delivered (25920 on every
+            # rank). Absent = no END vote on this read (every other boot).
+            self.prefetch_loaded_tokens_by_reqid[req_id].synced_end = _synced_end
         # #843: `refused` separates the TWO reasons this line can say loaded=0,
         # which are not the same finding and were indistinguishable at INFO.
         #
