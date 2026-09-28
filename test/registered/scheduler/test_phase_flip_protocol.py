@@ -55,10 +55,35 @@ from test_phase_flip_runtime import (  # noqa: E402  (sibling harness)
     _MailboxExchange,
     _make_layout_pools,
 )
-from test_phase_flip_resident_carry import (  # noqa: E402  (sibling harness)
-    _FakeBatch as _CarryFakeBatch,
-    _req as _carry_req,
-)
+
+
+# The two stubs below lived in the sibling harness test_phase_flip_resident_carry.py, which #969 CUT K
+# (069f98c5f3, 29.08.) deleted with the resident carry -- since then this module did not even COLLECT
+# ("No module named 'test_phase_flip_resident_carry'"), so all its tests silently ran nowhere. Moved here
+# verbatim (069f98c5f3^), test-only.
+def _carry_req(rid, idx):
+    return SimpleNamespace(rid=rid, req_pool_idx=idx)
+
+
+class _CarryFakeBatch:
+    """Duck-typed ScheduleBatch: reqs, is_empty, merge_batch."""
+
+    def __init__(self, reqs=None):
+        self.reqs = list(reqs or [])
+        self.merged_from = []
+
+    def is_empty(self):
+        return len(self.reqs) == 0
+
+    def merge_batch(self, other):
+        self.merged_from.append(other)
+        self.reqs.extend(other.reqs)
+
+    def filter_batch(self, chunked_req_to_exclude=None, keep_indices=None):
+        """Same signature as the real one; the carry uses keep_indices."""
+        if keep_indices is not None:
+            self.reqs = [self.reqs[i] for i in keep_indices]
+
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
