@@ -447,7 +447,7 @@ SEAM_LIST: Tuple[Seam, ...] = (
         "(owner-written rows of a page_size-64 page)",
         "managers/cache_controller.py:1558 (the page-1 refusal of the "
         "owner mode -- lifted since S4b part 2 for the paged owner form, "
-        "canonical_kv_owner_rows), mem_cache/hicache_storage.py:4213 "
+        "canonical_kv_owner_rows), mem_cache/hicache_storage.py:4220 "
         "FormAWorkerNullStorage (still the tier of a worker WITHOUT rows); "
         "the worker's L2 (ArenaMHAHostPool with owner rows, compact device "
         "rows), the R12 host shadow, weg2/tail_adopt.py, "
@@ -468,7 +468,7 @@ SEAM_LIST: Tuple[Seam, ...] = (
         anchors=(
             ("managers/cache_controller.py", 1558,
              "Weighted uneven-DCP HiCache storage requires page_size == 1"),
-            ("mem_cache/hicache_storage.py", 4213,
+            ("mem_cache/hicache_storage.py", 4220,
              "class FormAWorkerNullStorage"),
         ),
     ),
