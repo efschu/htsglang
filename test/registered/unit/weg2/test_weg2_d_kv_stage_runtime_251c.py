@@ -130,6 +130,14 @@ def _kv_allocator():
                                        kvcache=types.SimpleNamespace(), need_sort=False)
 
 
+def _real_kv_pool():
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    with mock.patch.object(dsv, "stage_form", lambda env=None: None):
+        return MHATokenToKVPool(192, PAGE, torch.bfloat16, 1, 8, 2, "cpu", False,
+                                enable_alt_stream=False)
+
+
 def _rank(tms, *, pages=True, X=40):
     """A D rank: the GDN pool (11 slots x 4 KiB x 3 layers, 2 seats), two
     MoE layers of 4 KiB rows (R3 + C7 + X), two KV tensors born at the top
@@ -142,7 +150,10 @@ def _rank(tms, *, pages=True, X=40):
     pool = types.SimpleNamespace(size=11, mamba_cache=types.SimpleNamespace(temporal=temporal))
     alloc = MambaSlotAllocator(size=11, device="cpu")
     caches = [FakeCache(i, 3, 7, 2, X if pages else 0, 1024, log) for i in range(2)]
-    kv_pool = types.SimpleNamespace(size=192, page_size=PAGE)
+    # rc12z13: a REAL MHATokenToKVPool -- its safe_zero_rows is a property
+    # (#656) that the stage must feed, never assign. Built with the form off:
+    # its own tensors are not the FakeTms allocations this rank trims.
+    kv_pool = _real_kv_pool()
     kv = []
     if pages:
         tms.add(temporal, active=True)
@@ -331,6 +342,9 @@ def test_demand_picks_the_stage_the_bank_shrinks_tables_first_and_the_next_wake_
         st = dsv.on_wake(r.sched, types.SimpleNamespace(epoch="e2", handoff_n=1, parked_n=0,
                                                         phase_kv_tokens=40), _seats(1))
         assert st.stage == 0 and r.kv_alloc.available_size() == 4 * PAGE
+        # S1 -> S0: the flush bound falls back with the pages (rc12z13)
+        assert r.kv_pool.safe_zero_rows == 64 + PAGE
+        assert r.kv_pool._committed_row_bound() == 64 + PAGE
         # one seat: its GDN pages fund more rows than the boot form's 32
         assert ctl.applied.extra_rows > 32
 
