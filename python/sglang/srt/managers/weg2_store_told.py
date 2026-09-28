@@ -971,6 +971,45 @@ def _early(scheduler) -> Dict[str, int]:
     return d
 
 
+# #1416f IDLE ADMIT (NF z30e ca2a9706ec, boot
+# ...stvsyncbar1dauer09282117): the window guards ONE thing -- a follower's
+# bounded admission wait stopping OTHER work in pipeline flight on its stage
+# (the #1416e risk block above). The first request after a P wake has none:
+# every P leg of that boot waited the full window with the whole pipeline
+# empty. weg2-8-29: PP0's own read 831 ms, window 1.04 s (1.25 x), the
+# followers' reads 49/71 ms -> ~1 s of three idle GPUs before the forward
+# (wake -> first PP0 forward 2.18 s); over 27 legs wake -> forward
+# 0.45-2.18 s, the window 0.17-1.04 s of it. With nothing in flight the
+# follower's residual wait costs nothing (its read overlaps PP0's own forward,
+# >= 1 s on this form), so PP0 admits in the next pass -- the read-ahead still
+# precedes its Admit by one pass. Anything in flight, or a ring this helper
+# cannot read, keeps the window. Off: SGLANG_WEG2_DISABLE_TOLD_PACE_IDLE_SKIP=1.
+
+
+def _pace_idle_skip_armed() -> bool:
+    from sglang.srt.environ import envs
+
+    return not envs.SGLANG_WEG2_DISABLE_TOLD_PACE_IDLE_SKIP.get()
+
+
+def pipeline_idle(scheduler) -> bool:
+    """True only when PP0 provably has nothing in pipeline flight: every ring
+    slot empty (``mbs``), no running batch in any slot (``running_mbs``), no
+    chunked request. A missing ring reads as busy (the window stays)."""
+    mbs = getattr(scheduler, "mbs", None)
+    running = getattr(scheduler, "running_mbs", None)
+    if not isinstance(mbs, (list, tuple)) or not isinstance(running, (list, tuple)):
+        return False
+    if any(b is not None for b in mbs):
+        return False
+    for rb in running:
+        if rb is not None and not rb.is_empty():
+            return False
+    if getattr(scheduler, "chunked_req", None) is not None:
+        return False
+    return True
+
+
 def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     """PP0, paced form: publish read-aheads for terminated reads, then the
     Admits whose window has passed. Never waits."""
@@ -1043,7 +1082,18 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             out.append(admit)
             continue
         if now - p.published_at < p.window_s:
-            continue
+            if not (_pace_idle_skip_armed() and pipeline_idle(scheduler)):
+                continue
+            n_idle = getattr(scheduler, "_1416f_idle_n", 0) + 1
+            scheduler._1416f_idle_n = n_idle
+            if _log_due(n_idle):
+                logger.info(
+                    "#1416f PACED-IDLE-ADMIT rid=%s told=%d window=%.2fs waited=%.2fs saved=%.2fs "
+                    "passes=%d (n=%d): nothing in pipeline flight, the followers' reads "
+                    "overlap PP0's forward",
+                    _rt(rid), p.told, p.window_s, now - p.published_at,
+                    p.window_s - (now - p.published_at), pass_n - p.published_pass, n_idle,
+                )
         pacing.pop(rid, None)
         # TF (rc12k27 b1, weg2-10-95): the Admit names what PP0 ITSELF admits
         # in this pass. Its own tree cannot resume at told -> told=0 for every
