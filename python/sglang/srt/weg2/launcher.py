@@ -5490,6 +5490,135 @@ def l3_persist_check_identity(directory: str, identity: dict, dry: bool) -> str:
             f"(user 2026-09-27). Move the directory aside or set SGLANG_WEG2_L3_PERSIST=0.")
     return "match"
 
+#: L3-REVOKE (28.09., rc12z17): a persistent store cannot tell a page computed
+#: with broken weights from a good one -- the identity separates what was
+#: CONFIGURED, not what a running boot COMPUTED. rc12z17 (103bfdf29a) wiped
+#: D-TP0's live expert bank at its first S1 wake (10:51:24Z, n=4, rows +33 ->
+#: +23: tms_set_spans(now=True) released the one extent that held every row)
+#: and served garbage until the stop; every page it wrote in that window had
+#: the store's own identity and would have been reused as a hit. The operator
+#: names such a window in ``L3_REVOKED.json`` (``l3_revoke_window``); the next
+#: attach, before any rank starts, MOVES every ``.bin`` written inside it (by
+#: mtime -- a page is written once, whole, via tmp+rename) into the sibling
+#: ``<store>.revoked``. Moved, never deleted (deleting is the user's).
+L3_REVOKED_FILE = "L3_REVOKED.json"
+L3_REVOKED_SUFFIX = ".revoked"
+
+
+def _l3_revoked_path(directory: str) -> str:
+    return os.path.join(directory, L3_REVOKED_FILE)
+
+
+def l3_revoked_windows(directory: str) -> List[Tuple[float, float, str]]:
+    """L3-REVOKE: the store's revoked write windows ``(from, to, reason)`` in
+    unix seconds, [] without a record. An unreadable or malformed record is
+    REFUSED BY NAME (W57): a revocation that cannot be read must not turn
+    into silent reuse of the pages it names."""
+    path = _l3_revoked_path(directory)
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        raise Weg2StoreDiskRefused(
+            f"W57 Weg2StoreDiskRefused: L3-REVOKE record {path} unreadable "
+            f"({type(exc).__name__}: {exc}); the pages it names cannot be told apart. "
+            f"Fix the record (python -m sglang.srt.weg2.l3_store_audit revoke) or move "
+            f"the directory aside.")
+    out: List[Tuple[float, float, str]] = []
+    try:
+        for w in raw["windows"]:
+            t0, t1 = float(w["from_unix"]), float(w["to_unix"])
+            if not t0 <= t1:
+                raise ValueError(f"from {t0} after to {t1}")
+            out.append((t0, t1, str(w.get("reason", ""))))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Weg2StoreDiskRefused(
+            f"W57 Weg2StoreDiskRefused: L3-REVOKE record {path} malformed "
+            f"({type(exc).__name__}: {exc}); expected "
+            f'{{"windows": [{{"from_unix": s, "to_unix": s, "reason": "..."}}]}}.')
+    return out
+
+
+def l3_revoke_window(directory: str, from_unix: float, to_unix: float, reason: str) -> dict:
+    """L3-REVOKE: add a revoked write window to the store's record (atomic
+    replace). Pages are MOVED at the next attach, not here -- a store in use
+    by a running boot is never walked from outside."""
+    if not float(from_unix) <= float(to_unix):
+        raise ValueError(f"from {from_unix} after to {to_unix}")
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(directory)
+    wins = l3_revoked_windows(directory)
+    rec = {"windows": [{"from_unix": a, "to_unix": b, "reason": r} for a, b, r in wins]}
+    rec["windows"].append({
+        "from_unix": float(from_unix), "to_unix": float(to_unix), "reason": str(reason),
+        "from_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(from_unix))),
+        "to_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(to_unix))),
+        "recorded_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+    path = _l3_revoked_path(directory)
+    tmp = path + ".w"
+    with open(tmp, "w") as f:
+        json.dump(rec, f, sort_keys=True, indent=1)
+    os.replace(tmp, path)
+    return rec
+
+
+def _l3_rope_view(override: str) -> str:
+    """The rope/position part of a ``--json-model-override-args`` value
+    (``rope_scaling``/``rope_parameters``/``max_position_embeddings``, top
+    level and ``text_config``), canonical JSON; "" without one."""
+    if not override:
+        return ""
+    try:
+        args = json.loads(override)
+    except (TypeError, ValueError):
+        return override  # unparseable: compared verbatim
+    if not isinstance(args, dict):
+        return ""
+    keys = ("rope_scaling", "rope_parameters", "max_position_embeddings")
+    view = {k: args[k] for k in keys if k in args}
+    txt = args.get("text_config")
+    if isinstance(txt, dict):
+        sub = {k: txt[k] for k in keys if k in txt}
+        if sub:
+            view["text_config"] = sub
+    return json.dumps(view, sort_keys=True) if view else ""
+
+
+def l3_persist_check_rope(extra_p: str, extra_d: str) -> None:
+    """L3-REVOKE companion (#259): P and D write and read the SAME pages (one
+    L2, one L3; the key hashes token ids only). A rope override on one group
+    and not the other (YaRN x2 on D alone) gives both groups the same keys for
+    KV rotated at different positions -- refused by name before the store is
+    touched, instead of a directory identity that records both and shares
+    them."""
+    p = _l3_rope_view(_l3_extra_flag(extra_p, "--json-model-override-args"))
+    d = _l3_rope_view(_l3_extra_flag(extra_d, "--json-model-override-args"))
+    if p != d:
+        raise Weg2StoreDiskRefused(
+            f"W57 Weg2StoreDiskRefused: L3-PERSIST P and D rotate differently "
+            f"(P rope {p or 'config'} vs D rope {d or 'config'}); they share every "
+            f"L2/L3 page by token-id key, so one group would read the other's KV at "
+            f"the wrong positions. Give both --extra-p and --extra-d the same rope "
+            f"override, or set SGLANG_WEG2_L3_PERSIST=0.")
+
+
+def _l3_move_revoked(directory: str, root: str, name: str, dry: bool) -> bool:
+    """Move one revoked page into ``<directory>.revoked`` (same relative path)."""
+    if dry:
+        return True
+    src = os.path.join(root, name)
+    rel = os.path.relpath(src, directory)
+    dst = os.path.join(directory.rstrip("/") + L3_REVOKED_SUFFIX, rel)
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        os.replace(src, dst)
+        return True
+    except OSError:
+        return False
+
 
 L3_SUFFIX_REGISTRY = "L3_SUFFIXES"
 
@@ -5554,6 +5683,8 @@ def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, in
         log(f"L3-PERSIST fresh dir={directory} (no previous store) epoch={epoch:.3f}")
         return 0, 0, 0
     known = l3_registered_suffixes(directory)
+    revoked = l3_revoked_windows(directory)
+    rev_n = rev_bytes = rev_failed = 0
     if not dry:
         # N1: the suffixes the previous boot's groups scanned, published ONCE
         # for every rank -- a page under one of them that this rank's own
@@ -5582,6 +5713,13 @@ def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, in
             except OSError:
                 continue
             size = st.st_blocks * 512
+            if revoked and any(t0 <= st.st_mtime <= t1 for t0, t1, _r in revoked):
+                if _l3_move_revoked(directory, root, name, dry):
+                    rev_n += 1
+                    rev_bytes += size
+                else:
+                    rev_failed += 1
+                continue
             if known is not None and not name[:-4].endswith(known):
                 orphans += 1
                 orphan_bytes += size
@@ -5600,7 +5738,13 @@ def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, in
         f"({nbytes / host_ledger.GIB:.2f} GiB) orphans={orphans} ({orphan_bytes / host_ledger.GIB:.2f} GiB, "
         + ("no suffix record yet: counted, kept" if known is None else
            f"suffix in no group's record: {'would be ' if dry else ''}removed")
-        + f") staging+orphans_removed={removed} walk_s={walk_s:.1f} epoch={epoch:.3f}"
+        + f") staging+orphans_removed={removed}"
+        + (f" revoked={rev_n} ({rev_bytes / host_ledger.GIB:.2f} GiB, "
+           f"{'would be ' if dry else ''}moved to {directory.rstrip('/') + L3_REVOKED_SUFFIX}"
+           f"{f', {rev_failed} NOT moved (kept out of the count, still on disk)' if rev_failed else ''}"
+           f"; windows {[(time.strftime('%H:%M:%SZ', time.gmtime(a)), time.strftime('%H:%M:%SZ', time.gmtime(b)), r) for a, b, r in revoked]})"
+           if revoked else "")
+        + f" walk_s={walk_s:.1f} epoch={epoch:.3f}"
         + (" (DRY-RUN: nothing removed)" if dry else "")
         + " -- the ranks seed the L3 index and the evictor ledger from it at attach"
     )
@@ -5639,6 +5783,9 @@ def l3_persist_disk_sum(log: Log, root: str, directory: str, max_size_bytes: int
     for n in names:
         d = os.path.join(root, n)
         if not n.startswith(L3_PERSIST_PREFIX) or d == directory:
+            continue
+        if n.endswith(L3_REVOKED_SUFFIX):
+            parts.append(f"{n}=revoked pages held aside (no store; the user deletes)")
             continue
         try:
             with open(os.path.join(d, L3_CAP_FILE)) as f:
@@ -20786,6 +20933,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if _l3_ident:
         # identity FIRST: a store of another identity is refused before this
         # boot touches a single file in it.
+        l3_persist_check_rope(getattr(ns, "extra_p", "") or "", getattr(ns, "extra_d", "") or "")
         _l3_state = l3_persist_check_identity(store_plan.directory, _l3_ident, dry)
         log(f"L3-PERSIST identity={_l3_state} dir={store_plan.directory} "
             f"{json.dumps(_l3_ident, sort_keys=True)}")
