@@ -702,6 +702,36 @@ def _pp0_told_any(scheduler, tree, req, rid: str, twin: bool):
     return _pp0_told(scheduler, tree, req, rid), False
 
 
+def _ple_admit_at_told(scheduler, req, told: int, absolute: bool) -> None:
+    """#1416h: PP0's told names where the request's first chunk starts; the
+    PLE gather of that chunk starts now, beside the followers' reads and
+    PP0's pacing, instead of at token 0 at intake (dropped as cached_prefix
+    in 31 of 33 z30e admissions) or cold inside the forward (mean 186 ms,
+    max 510 ms on PP0). No-op unless an admitting PLE gather lives here."""
+    try:
+        from sglang.srt.models.qwen4_exp_ple_admit import (
+            admit_ple_request,
+            ple_admission_armed,
+        )
+
+        if not ple_admission_armed():
+            return
+        head = _twin.registered_head(req)
+        told = max(0, int(told))
+        start = told if absolute else head + told
+        if told <= 0:
+            start = head
+        admit_ple_request(
+            req,
+            getattr(scheduler, "chunked_prefill_size", None),
+            dormant=bool(getattr(scheduler, "weg2_dormant", False)),
+            start=start,
+            source="told",
+        )
+    except Exception:  # noqa: BLE001 -- a prefetch hint never stops the told
+        logger.debug("#1416h PLE admit at told failed", exc_info=True)
+
+
 def _parked(scheduler) -> set:
     """TK path 4: rids that left the waiting queue only for the dormant hold
     (#1443/#1455) or the post-wake settle (#1471). They come back through the
@@ -759,6 +789,7 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
             continue
         twin = _twin.take_pp0_twin(scheduler, rid)
         told, absolute = _pp0_told_any(scheduler, tree, req, rid, twin)
+        _ple_admit_at_told(scheduler, req, told, absolute)
         told_map[rid] = told
         held.pop(rid, None)
         out.append((Weg2StoreToldTwin if twin else Weg2StoreTold)(
@@ -1137,6 +1168,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             continue
         twin = _twin.take_pp0_twin(scheduler, rid)
         told, absolute = _pp0_told_any(scheduler, tree, req, rid, twin)
+        _ple_admit_at_told(scheduler, req, told, absolute)
         _cls = Weg2StoreToldTwin if twin else Weg2StoreTold
         _extra = {"absolute": absolute, "keys_digest": _pp0_keys_digest(req)}
         held.pop(rid, None)

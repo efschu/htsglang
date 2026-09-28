@@ -30,8 +30,10 @@ P, #1459) -- and, through the front's hint (:func:`admit_ple_hint`, route
   finished before the forward.
 
 Correctness does not rest on the admission: it is used only when the request
-is the FIRST request of the extend batch and its chunk starts at token 0 (no
-cached prefix); everything else drops it and the chunk is gathered as before.
+is the FIRST request of the extend batch and its chunk starts where the
+admission was made (#1416h: token 0, the registered head, or PP0's store
+told -- ``weg2_store_told``); everything else drops it (``start_moved``) and
+the chunk is gathered as before. H32's join compares every row anyway.
 An admission never reads while the H32 ring has a read in flight, and an
 admission read in flight is joined before H32 submits anything
 (``PlePreadProcs`` carries one read at a time).
@@ -72,12 +74,15 @@ _BATCH: tuple = ()
 class _Admission:
     __slots__ = (
         "rid", "tokens", "t_admit", "source", "dormant", "ids", "vocab",
-        "seq", "t_submit", "read_s", "joined", "orphan",
+        "seq", "t_submit", "read_s", "joined", "orphan", "start", "lead",
     )
 
-    def __init__(self, rid: str, tokens: torch.Tensor, t_admit: float, source: str, dormant: bool):
+    def __init__(self, rid: str, tokens: torch.Tensor, t_admit: float, source: str, dormant: bool,
+                 start: int = 0, lead: int = 0):
         self.rid = rid
         self.tokens = tokens
+        self.start = int(start)
+        self.lead = int(lead)
         self.t_admit = t_admit
         self.source = source
         self.dormant = bool(dormant)
@@ -116,19 +121,49 @@ def note_ple_batch(reqs: Sequence) -> None:
         sink.forget_served(_BATCH)
 
 
-def admit_ple_request(req, chunk_size: Optional[int], *, dormant: bool = False) -> Optional[str]:
-    """Scheduler intake: start (or queue) the first chunk's PLE gather of
-    ``req``. Returns the verdict (``started``/``queued``/``confirmed``/
-    ``skipped:<why>``), None when nothing in this process admits."""
+#: #1416h: intake verdicts that mean "a store read is registered (or held
+#: behind a twin) and PP0's told will name the first chunk's start".
+_STORE_READ_VERDICTS = ("issued", "declined:weg2_twin_deferred")
+
+
+def ple_first_chunk_start(req) -> int:
+    """Where ``req``'s first extend chunk starts when nothing more than its
+    registration is known: the device/host head its prefetch registration
+    matched (``_prefetch_registered_prefix_len``), else 0."""
+    try:
+        return max(0, int(getattr(req, "_prefetch_registered_prefix_len", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def admit_ple_request(
+    req, chunk_size: Optional[int], *, dormant: bool = False, start: Optional[int] = None,
+    source: str = "queue",
+) -> Optional[str]:
+    """Scheduler intake (``start`` None) or PP0's store told (``start`` =
+    the told offset, #1416h): start (or queue) the PLE gather of the chunk
+    that begins at ``start``. Returns the verdict (``started``/``queued``/
+    ``confirmed``/``skipped:<why>``), None when nothing in this process admits.
+
+    #1416h: at intake a request whose store read is still running is NOT
+    admitted from token 0 -- its first chunk starts where the read ends,
+    which only PP0's told knows (z30e: 31 of 33 token-0 admissions dropped
+    as ``cached_prefix``, 262144 rows read each for nothing); the told hook
+    admits it at the told offset. Without a store read the first chunk
+    starts at the registered head."""
     if not _SINKS:
         return None
     ids = getattr(req, "origin_input_ids", None)
     if not ids:
         return None
     rid = str(getattr(req, "rid", ""))
+    if start is None:
+        if getattr(req, "_969c_verdict", None) in _STORE_READ_VERDICTS:
+            return "skipped:told_pending"
+        start = ple_first_chunk_start(req)
     verdict = None
     for sink in list(_SINKS):
-        verdict = sink.admit(rid, ids, chunk_size, dormant=dormant, source="queue")
+        verdict = sink.admit(rid, ids, chunk_size, dormant=dormant, source=source, start=int(start))
     return verdict
 
 
@@ -218,12 +253,13 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
             return out
 
     # -- admission ---------------------------------------------------------------
-    def admit(self, rid: str, ids, chunk_size: Optional[int], *, dormant: bool, source: str) -> Optional[str]:
+    def admit(self, rid: str, ids, chunk_size: Optional[int], *, dormant: bool, source: str,
+              start: int = 0) -> Optional[str]:
         with self._lock:
             if self._disabled:
                 return None
             try:
-                return self._admit(rid, ids, chunk_size, dormant, source)
+                return self._admit(rid, ids, chunk_size, dormant, source, int(start))
             except (_pf.PleWorkerLost, OSError) as exc:
                 logger.error("PLE-PREFETCH disabled at admission rid=%s: %s -- serial gather from now on", rid, exc)
                 self._disable()
@@ -272,16 +308,22 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
                 warm()
             self._hash_warm = True
 
-    def _admit(self, rid, ids, chunk_size, dormant, source) -> str:
+    def _admit(self, rid, ids, chunk_size, dormant, source, start: int = 0) -> str:
         n = len(ids)
         size = int(chunk_size) if chunk_size and int(chunk_size) > 0 else n
-        tokens = _pf._as_int64(ids[: min(n, size)])
+        start = max(0, min(int(start), n))
+        if start >= n:
+            return "skipped:nothing_to_prefill"
+        # #1416h: a chunk that starts mid-prompt hashes its n-grams over the
+        # tokens before it -- the lead H32 uses for its next chunk
+        lead = min(start, _pf.PLE_PREFETCH_LEAD_TOKENS)
+        tokens = _pf._as_int64(ids[start - lead: min(n, start + size)])
         self.stats["admits"] += 1
         known = self._adm if (self._adm is not None and not self._adm.orphan and self._adm.rid == rid) else None
         if known is None:
             known = self._adm_queue.get(rid)
         if known is not None:
-            if torch.equal(known.tokens, tokens):
+            if known.start == start and torch.equal(known.tokens, tokens):
                 logger.info("PLE-PREFETCH admit rid=%s confirmed source=%s (admitted by %s)", rid, source, known.source)
                 return "confirmed"
             self.drop(rid, abort_all=False, reason="tokens_differ")
@@ -294,15 +336,15 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
         if len(self._adm_queue) >= PLE_ADMIT_QUEUE_MAX:
             logger.info("PLE-PREFETCH admit rid=%s skipped: %d admissions already waiting", rid, len(self._adm_queue))
             return "skipped:queue_full"
-        adm = _Admission(rid, tokens, _clock(), source, dormant)
+        adm = _Admission(rid, tokens, _clock(), source, dormant, start=start, lead=lead)
         self._adm_queue[rid] = adm
         self._pump(w)
         if self._adm is adm:
             return "started"
         if rid in self._adm_queue:
-            logger.info("PLE-PREFETCH admit rid=%s queued source=%s dormant=%d tokens=%d "
+            logger.info("PLE-PREFETCH admit rid=%s queued source=%s dormant=%d tokens=%d start=%d "
                         "(ring busy: the running request's read goes first)",
-                        rid, source, int(adm.dormant), int(tokens.numel()))
+                        rid, source, int(adm.dormant), int(tokens.numel()) - lead, start)
             return "queued"
         return "skipped:small"
 
@@ -335,7 +377,7 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
     def _start(self, w, adm: _Admission) -> bool:
         vocab = self._last_vocab
         t0 = time.monotonic()
-        nids = self._hasher(adm.tokens, 0).to(torch.int64).reshape(-1)
+        nids = self._hasher(adm.tokens, adm.lead).to(torch.int64).reshape(-1)
         if int(nids.numel()) < self.min_rows:
             logger.info("PLE-PREFETCH admit rid=%s skipped: rows=%d below the gather's %d",
                         adm.rid, int(nids.numel()), self.min_rows)
@@ -350,8 +392,8 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
         self._adm = adm
         self.stats["admit_started"] += 1
         logger.info(
-            "PLE-PREFETCH admit rid=%s rows=%d started source=%s dormant=%d waited_ms=%.1f host_ms=%.1f",
-            adm.rid, int(nids.numel()), adm.source, int(adm.dormant),
+            "PLE-PREFETCH admit rid=%s rows=%d started source=%s dormant=%d start=%d waited_ms=%.1f host_ms=%.1f",
+            adm.rid, int(nids.numel()), adm.source, int(adm.dormant), adm.start,
             (adm.t_submit - adm.t_admit) * 1000.0, (time.monotonic() - t0) * 1000.0,
         )
         return True
@@ -383,7 +425,7 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
             return
         first = batch[0] if batch else None
         if first is not None and adm.rid == first[0]:
-            if first[1] == 0 and self._pending is None and adm.vocab == self._last_vocab:
+            if first[1] == adm.start and self._pending is None and adm.vocab == self._last_vocab:
                 self._adm = None
                 ready = adm.joined or w.ready(adm.seq)
                 self._pending = _pf._Pending(adm.seq, PLE_ADMIT_SLOT, adm.ids, adm.vocab)
@@ -397,7 +439,7 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
                     adm.source, int(adm.dormant),
                 )
                 return
-            reason = "cached_prefix" if first[1] != 0 else (
+            reason = ("cached_prefix" if first[1] > adm.start else "start_moved") if first[1] != adm.start else (
                 "ring_holds_a_prediction" if self._pending is not None else "vocab")
         elif adm.rid in rids:
             reason = "not_first_in_batch"
