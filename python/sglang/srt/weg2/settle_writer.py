@@ -111,14 +111,15 @@ def observe(req) -> str:
     """Gather the facts for ``req`` and classify them (rank-local; the caller
     takes the group MIN of every verdict built on it)."""
     from sglang.srt.weg2 import handoff as _ho
-    from sglang.srt.weg2.handoff_keys import CHAIN_ATTR
+    from sglang.srt.weg2.handoff_keys import CHAIN_ATTR, SEEN_ATTR
 
     if not _ho._dir():
         return UNKNOWN
     rid = str(getattr(req, "rid", "") or "")
     if not rid:
         return UNKNOWN
-    chain = bool(getattr(req, CHAIN_ATTR, None))
+    # SEEN_ATTR (P4b-fix): the record this rank once read may be gone after the wake
+    chain = bool(getattr(req, CHAIN_ATTR, None)) or bool(getattr(req, SEEN_ATTR, False))
     handoff_file = _ho.read(rid) is not None
     tail_state, tail_tmp = _tail_facts(rid)
     return classify(chain=chain, handoff_file=handoff_file, tail_state=tail_state, tail_tmp=tail_tmp)
