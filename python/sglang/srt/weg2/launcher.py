@@ -4242,14 +4242,22 @@ def d_kv_dtype_bytes(ns) -> int:
 
 
 def refuse_unwired_token_cut(ns, boot_form) -> None:
-    """#239 S2: a real boot of ``kv=qsa_forma_dcp`` stops here, by name."""
+    """#239 S2/S3e: a real boot of ``kv=qsa_forma_dcp`` stops here, by name,
+    while a seam it stands on (``rank_role.TOKEN_CUT_SEAMS``) is unwired. The
+    refusal names the seams from the register, so it lifts when -- and only
+    when -- the last of them is marked built."""
     if boot_form is None or boot_form.kv != "qsa_forma_dcp" or getattr(ns, "dry_run", False):
+        return
+    from sglang.srt import rank_role
+
+    missing = rank_role.unwired_token_cut_seams()
+    if not missing:
         return
     raise Weg2TokenCutNotWired(
         f"{KV_TOKEN_CUT_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} (form kv=qsa_forma_dcp) "
-        "is planned but not wired -- the Form A workers attend nothing (seam F5; #239 S3 "
-        "wires the worker attention over its KV share). --dry-run prints the planned cut; "
-        "a real boot needs S3.")
+        f"is planned but not wired -- Form A seam(s) {', '.join(missing)} unwired "
+        f"({'; '.join(rank_role.SEAMS[m].what for m in missing)}; #239 S3d/S3e). "
+        "--dry-run prints the planned cut; a real boot needs every seam built.")
 
 
 #: #239 S3a: the D argv that carries the planner's token cut to the runtime
