@@ -1735,6 +1735,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             logger.warning("#243 HANDOFF-PENDING keep list unavailable", exc_info=True)
             keep = None
         stages = [0, 0, 0]
+        l3_state = [0, 0, 0]  # #257 (d): on_disk, written, dropped_without_l3
         try:
             if keep is not None and len(keep):
                 # (i) unreferenced, kept by nobody
@@ -1759,6 +1760,19 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 cands = arena.evict_candidates(need)
                 stages[0] = len(cands)
             if cands:
+                # #257 (d): no page leaves L2 without a copy in L3. A
+                # candidate already on disk is freed as before; one without a
+                # copy is written first (the clock evict's own write, bounded
+                # by this claim's `need`). Only what the write could not save
+                # is lost -- counted as dropped_without_l3, target 0.
+                secure = getattr(getattr(self, "_backend", None), "arena_secure_to_disk", None)
+                if callable(secure):
+                    sec = secure(arena, cands)
+                    l3_state[0] += int(sec.get("on_disk", 0))
+                    l3_state[1] += int(sec.get("written", 0))
+                    l3_state[2] += int(sec.get("lost", 0))
+                else:
+                    l3_state[2] += len(cands)
                 arena.free_slots([c[0] for c in cands])
                 stems = getattr(arena, "_stems", None)
                 if isinstance(stems, dict):
@@ -1771,6 +1785,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                   if len(cands) < need and getattr(self, "_weg2_reaps_orphan_claims", False) else [])
         k = getattr(ArenaMHAHostPool, "_1427_drop_n", 0) + 1
         ArenaMHAHostPool._1427_drop_n = k
+        ArenaMHAHostPool._257_dropped_without_l3 = (
+            getattr(ArenaMHAHostPool, "_257_dropped_without_l3", 0) + l3_state[2])
+        ArenaMHAHostPool._257_written_to_l3 = (
+            getattr(ArenaMHAHostPool, "_257_written_to_l3", 0) + l3_state[1])
         if _prefix_trace.on():
             # Prefix trace (IN 26.09.): uncapped, and joinable -- `dropped` are
             # the evicted slots' key128 low words (hex; key128 = blake2b-16 of
@@ -1782,13 +1800,19 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         int(getattr(arena, "slot_bytes", 0) or 0),
                         (str(claim_stem)[:80] if claim_stem else "-"),
                         ",".join("%016x" % (int(c[1]) & 0xFFFFFFFFFFFFFFFF) for c in cands))
-        elif k <= 8 or k % 256 == 0 or stages[1] or stages[2]:
-            # #248: stage ii (kept, L3 copy, freed without I/O) and stage iii
-            # (kept, no copy, named lost) are always spoken
+        else:
+            # #257 (c): EVERY claim-time drop is spoken -- the counter jumped
+            # 8 -> 58 on PP0 of the vision boot 0928 with not one line, and
+            # those were the pages a probe had just reported.
             logger.info("#1427 ARENA-DROP n=%d need=%d freed=%d stages=i:%d,ii:%d,iii:%d slot_bytes=%d "
-                        "(claim-time room without disk I/O -- H81, user rule 24.09.: no copy in the "
-                        "compute path)", k, need, len(cands), stages[0], stages[1], stages[2],
-                        int(getattr(arena, "slot_bytes", 0) or 0))
+                        "l3=on_disk:%d,written:%d dropped_without_l3=%d (total written=%d "
+                        "dropped_without_l3=%d; #257: a page without an L3 copy is written "
+                        "before its slot is freed, target dropped_without_l3=0)",
+                        k, need, len(cands), stages[0], stages[1], stages[2],
+                        int(getattr(arena, "slot_bytes", 0) or 0),
+                        l3_state[0], l3_state[1], l3_state[2],
+                        ArenaMHAHostPool._257_written_to_l3,
+                        ArenaMHAHostPool._257_dropped_without_l3)
         return len(cands) + len(reaped)
 
     def _claim(self, stems):

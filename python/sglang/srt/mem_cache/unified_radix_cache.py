@@ -288,7 +288,12 @@ _REAP_SLOT_HIT_TOKENS = 2 + _POOL_SLOT_COUNT
 #: MIN -- 1 = this rank can serve P's partial page + state at c (or holds no
 #: layer of it); the reduced slot is the group's one answer for the admission.
 _REAP_SLOT_TAIL_VOTE = 3 + _POOL_SLOT_COUNT
-_REAP_PACKED_LEN = 4 + _POOL_SLOT_COUNT
+#: #257 (b): the deepest reachable recurrent anchor of a SHORT read, in tokens
+#: (``_ANCHOR_ABSTAIN`` = this rank has no say: a full read, no mamba
+#: component, no store). The reduced slot cuts the claim to that anchor.
+_REAP_SLOT_ANCHOR = 4 + _POOL_SLOT_COUNT
+_REAP_PACKED_LEN = 5 + _POOL_SLOT_COUNT
+_ANCHOR_ABSTAIN = 2**31 - 1
 
 
 class UnifiedTreeNode:
@@ -6946,6 +6951,43 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         return done
 
+    def _anchor_reach_local(self, completed_tokens: int, hash_value) -> int:
+        """#257 (b): this rank's deepest reachable recurrent anchor of a SHORT
+        read, in tokens -- the trailing mamba boundary the store reports over
+        the pages that did land (the same question ``_storage_hit_query``
+        asked before the read, ``_presence_pool_transfers``). A full read, a
+        model without a mamba component, or a rank without a store abstains."""
+        full = len(hash_value) * self.page_size
+        if int(completed_tokens) >= full:
+            return _ANCHOR_ABSTAIN
+        cc = self.cache_controller
+        backend = getattr(cc, "storage_backend", None)
+        transfers_fn = getattr(cc, "_presence_pool_transfers", None)
+        if backend is None or not callable(transfers_fn):
+            return _ANCHOR_ABSTAIN
+        try:
+            from sglang.srt.managers.cache_controller import claim_vote_abstains
+
+            if claim_vote_abstains(cc):  # a Form A worker holds no recurrent state
+                return _ANCHOR_ABSTAIN
+            transfers = [t for t in (transfers_fn() or [])
+                         if str(getattr(t, "name", "")) == str(PoolName.MAMBA)]
+            if not transfers:
+                return _ANCHOR_ABSTAIN
+            pages = int(completed_tokens) // self.page_size
+            if pages <= 0:
+                return 0
+            from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
+
+            res = backend.batch_exists_v2(
+                list(hash_value[:pages]), transfers, HiCacheStorageExtraInfo(prefix_keys=None)
+            )
+            hits = getattr(res, "extra_pool_hit_pages", None) or {}
+            return int(hits.get(PoolName.MAMBA, hits.get(str(PoolName.MAMBA), 0))) * self.page_size
+        except Exception:  # noqa: BLE001 - an unanswerable question has no say
+            logger.warning("#257 anchor reach probe failed; this rank abstains", exc_info=True)
+            return _ANCHOR_ABSTAIN
+
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             return True
@@ -6983,6 +7025,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         packed_list = [completed_tokens] + [0] * _POOL_SLOT_COUNT
         packed_list += [_probed_local, _hit_tokens_local, tail_adopt.local_vote(req_id)]
+        packed_list += [self._anchor_reach_local(completed_tokens, hash_value)]
         assert len(packed_list) == _REAP_PACKED_LEN
         if self.tp_world_size > 1:
             # Reduce full completed tokens together with the sidecar pools that
@@ -7008,6 +7051,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             packed = torch.tensor(packed_list, dtype=torch.int)
         _probed, _hit_tokens = self._reap_annotation_from_packed(packed)
         tail_adopt.agree(req_id, int(packed[_REAP_SLOT_TAIL_VOTE].item()))
+        # #257 (b): a read that ended short keeps only what a recurrent anchor
+        # can resume -- the KV above the group's deepest reachable anchor is
+        # neither loaded nor inserted (vision boot 0928, weg2-4-27: 14016 KV
+        # tokens loaded below the first anchor at 16384, then prefilled from 0)
+        _anchored = int(packed[_REAP_SLOT_ANCHOR].item())
+        if _anchored < int(min_completed_tokens):
+            _cut = (max(0, _anchored) // self.page_size) * self.page_size
+            _257n = getattr(self, "_257_below_anchor_n", 0) + 1
+            self._257_below_anchor_n = _257n
+            if _257n <= 16 or _257n % 256 == 0:
+                logger.warning(
+                    "#257 PREFETCH BELOW-ANCHOR req=%s read=%d of %d anchored=%d: the KV "
+                    "above the deepest reachable recurrent anchor is not loaded (it could "
+                    "not be resumed -- the prefill would start at the anchor anyway); "
+                    "claim cut to %d (n=%d)",
+                    req_id, int(min_completed_tokens), len(hash_value) * self.page_size,
+                    _anchored, _cut, _257n)
+            min_completed_tokens = _cut
 
         # #1157: THE REAP IS A LINE. `probed` / `hit_pages` are the GROUP's
         # reading (MIN-reduced above, N1): whether the prefetch thread's store

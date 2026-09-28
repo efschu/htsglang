@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.hicache_collective import (
     bounded_wait,
 )
 from sglang.srt.mem_cache.weg2_store_gates import check_mamba_blob_present
+from sglang.srt.mem_cache import probe_hold as _probe_hold
 
 
 # #1402: module-level on purpose -- the harness doubles bind curated
@@ -3347,6 +3348,21 @@ class HiCacheController:
         stems = weg2_suffixed_stems(self.storage_backend, hash_values)  # Posten 2: suffix memoised per key class
         import numpy as _np
         _fs, _st = pool.arena.find_slots_np(stems)  # Posten 2 (18.09.): numpy, no 520k-tuple list
+        # #257 (a): pages the probe HOLDS are read from the held slot -- the
+        # probe's reference becomes the read's, no second reference is taken
+        _page0 = 0
+        _held = None
+        if getattr(operation, "probe_pins", None) is not None:
+            _page0 = int(operation.completed_tokens) // int(self.page_size)
+            _held = _probe_hold.adopt(operation, _page0, len(hash_values))
+        if _held is not None:
+            _fs = _np.asarray(_fs, dtype=_np.int64).copy()
+            _st = _np.asarray(_st).copy()
+            _hm = _held >= 0
+            _fs[_hm] = _held[_hm]
+            _st[_hm] = 2
+        else:
+            _hm = _np.zeros(int(_fs.shape[0]), dtype=bool)
         _t1 = time.perf_counter()
         slots = []
         # #1439b: the leading run of COMPLETE slots is referenced in ONE C
@@ -3355,14 +3371,18 @@ class HiCacheController:
         _bad = _np.flatnonzero((_fs < 0) | (_st != 2))
         lead = int(_bad[0]) if _bad.size else int(_fs.shape[0])
         if lead:
-            got = pool.arena.ref_slots_np(_fs[:lead], +1)
-            if got == lead:
+            _need = _fs[:lead][~_hm[:lead]]
+            got = pool.arena.ref_slots_np(_need, +1) if _need.size else 0
+            if got == int(_need.size):
                 slots = _fs[:lead].tolist()
             else:
-                pool.arena.ref_slots_np(_fs[:lead], -1)  # undo the partial refs, take the slow path
+                pool.arena.ref_slots_np(_need, -1)  # undo the partial refs, take the slow path
                 lead = 0
         for i in range(lead, int(_fs.shape[0])):
             slot, state = int(_fs[i]), int(_st[i])
+            if _hm[i]:
+                slots.append(slot)  # #257: held since the probe
+                continue
             if slot < 0 or state != 2:
                 # #1433: not in the L2 -- ask the L3. A page on disk is read
                 # straight into a fresh slot and completed; only then is the
@@ -3395,6 +3415,7 @@ class HiCacheController:
                             getattr(getattr(pool, "arena", None), "path", type(getattr(pool, "arena", None)).__name__))
             return 0
         _t2 = time.perf_counter()
+        _probe_hold.consumed(operation, _page0, len(slots))
         pool.resolve_rows(host_indices, slots)
         _t3 = time.perf_counter()
         # Task #3: ONE increment per batch. `increment` is a lock + an add;
@@ -3590,7 +3611,10 @@ class HiCacheController:
                 if self.storage_stop_event.is_set():
                     operation.mark_terminate()
                     self._prefetch_io_drained_after_stop += 1
+                _probe_hold.expire_if_stale(operation, getattr(self, "mem_pool_host", None))
                 self._page_transfer(operation)
+                # #257: what the read did not take, the probe gives back
+                _probe_hold.release(operation, getattr(self, "mem_pool_host", None), 0, reason="read-end")
                 # operation terminated by controller, release pre-allocated memory
                 # W35: this thread runs across cutovers, so the slots it
                 # releases may have been opened under an older binding.
@@ -3624,6 +3648,10 @@ class HiCacheController:
                         operation.pool_transfers_done = True
                     except Exception:  # noqa: BLE001
                         pass
+                    try:
+                        _probe_hold.release(operation, getattr(self, "mem_pool_host", None), 0, reason="read-failed")
+                    except Exception:  # noqa: BLE001 - a release may not re-kill
+                        logger.error("#257 PROBE-HOLD release of a failed operation raised", exc_info=True)
                     try:
                         self.append_host_mem_release(
                             operation.host_indices[operation.completed_tokens :],
@@ -3884,6 +3912,27 @@ class HiCacheController:
             )
             return 0
 
+    def _probe_hold_pin(self, operation, hash_value) -> int:
+        """#257 (a): reference the probe's reported pages that are COMPLETE
+        in the arena (probe_hold.pin). No arena, no hold -- a Form A worker's
+        byteless pool and every non-arena backend pass through unchanged."""
+        pool = getattr(self, "mem_pool_host", None)
+        if (
+            not hash_value
+            or not getattr(pool, "arena_read", False)
+            or self.storage_backend is None
+            or operation.is_terminated()
+        ):
+            return 0
+        try:
+            if not pool.ensure_bound(self.storage_backend, role="kv"):
+                return 0
+            stems = weg2_suffixed_stems(self.storage_backend, hash_value)
+            return _probe_hold.pin(operation, pool, stems)
+        except Exception:  # noqa: BLE001 - a hold is an improvement, never a wall
+            logger.warning("#257 PROBE-HOLD pin failed; the read runs without a hold", exc_info=True)
+            return 0
+
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
@@ -3998,6 +4047,8 @@ class HiCacheController:
                     operation.mark_terminate()
                     self._prefetch_drained_after_stop += 1
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
+                # #257 (a): hold what the probe reports until the read
+                self._probe_hold_pin(operation, hash_value[: storage_hit_count // self.page_size])
                 # fnFL2x22: the FORM is agreed over the group first (one
                 # scalar MAX), never read off this rank alone -- see
                 # CLAIM_VOTE_ABSTAIN for the boot that measured the mismatch.
@@ -4046,6 +4097,7 @@ class HiCacheController:
                     # (PARK-RETAIN READ: a read the caller priced below the
                     # threshold keeps its own floor, managers/weg2_min_hit.py)
                     self.draft_cold_spans.pop(operation.request_id, None)
+                    _probe_hold.release(operation, getattr(self, "mem_pool_host", None), 0, reason="revoke")
                     self.prefetch_revoke_queue.put(operation.request_id)
                     # #1068 (A12.5 addition, decided in the slice 4 fix): the
                     # LOST-REVOKE-AT-QUIESCE candidate is MOOT on every
@@ -4093,6 +4145,9 @@ class HiCacheController:
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
+                    # #257: the group read ends at the MIN -- holds above it go back now
+                    _probe_hold.release(operation, getattr(self, "mem_pool_host", None),
+                                        storage_hit_count // self.page_size, reason="group-min")
                     # free the pre-allocated memory for pages that are not hit
                     self.append_host_mem_release(
                         operation.host_indices[storage_hit_count:]

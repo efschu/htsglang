@@ -2818,9 +2818,6 @@ class HiCacheFile(HiCacheStorage):
         type(self)._evict_log_n = _en
         if _en <= 16 or _en % 64 == 0:
             logger.info("ARENA-EVICT n=%d want=%d (arena clock: COMPLETE unreferenced slots go to disk and FREE -- xsn328)", _en, int(want))
-        from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
-        from sglang.srt.mem_cache.canonical_page_store import canonical_fsync_default
-
         pins = getattr(self, "pins", None)
         keep = []
         if pins is not None:
@@ -2831,9 +2828,35 @@ class HiCacheFile(HiCacheStorage):
         cands = arena.evict_candidates(want, keep_stems=keep)
         if not cands:
             return 0
+        moved = self.arena_secure_to_disk(arena, cands)["written"]
+        arena.free_slots([c[0] for c in cands])
+        arena.reap_stale()
+        stems = getattr(arena, "_stems", {})
+        for c in cands:
+            stems.pop((c[1], c[2]), None)
+        return moved
+
+    def arena_secure_to_disk(self, arena, cands) -> dict:
+        """#257 (d): give every EVICTING candidate ``(slot, key_lo, key_hi,
+        total)`` an L3 copy before its slot is freed -- the disk half of
+        ``_arena_evict_to_disk``, shared with the claim-time room of
+        ``ArenaMHAHostPool._evict_for_claim``. A page already on disk is not
+        written again. Returns ``{on_disk, written, lost}``: ``lost`` pages
+        leave L2 with no copy in L3 (no stem recorded, the evictor refused the
+        room, or the write failed) -- each is counted, never silent.
+
+        Vision boot 0928 (weg2-4-27, P PP0 06:20:28): the claim path freed
+        COMPLETE pages with no disk copy (#1427 stage i, 49 unlogged drops on
+        PP0 between 06:17:41 and 06:22:29); the probe had counted them, the
+        read found neither slot nor file and ended at page 219 of 813."""
+        out = {"on_disk": 0, "written": 0, "lost": 0}
+        if not cands:
+            return out
+        from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
+        from sglang.srt.mem_cache.canonical_page_store import canonical_fsync_default
+
         pio = _load_pageio()
         stems = getattr(arena, "_stems", {})
-        moved = 0
         todo = []
         cand_stems = {}
         for slot, lo, hi, total in cands:
@@ -2851,8 +2874,10 @@ class HiCacheFile(HiCacheStorage):
                 if self._arena_dropped_n <= 8 or self._arena_dropped_n % 256 == 0:
                     logger.warning("[arena] evicting a page WITHOUT a stem (n=%d): not written to disk",
                                    self._arena_dropped_n)
+                out["lost"] += 1
                 continue
             if stem in on_disk:
+                out["on_disk"] += 1
                 continue
             path = self._sharded_path(stem)
             if not self._evictor.reserve(
@@ -2862,6 +2887,7 @@ class HiCacheFile(HiCacheStorage):
                     canonical_extent_write=True,
                 ),
             ):
+                out["lost"] += 1
                 continue
             self._ensure_shard_dir(path)
             todo.append((stem, slot, total, path))
@@ -2875,17 +2901,15 @@ class HiCacheFile(HiCacheStorage):
             for (stem, slot, total, path), st in zip(todo, statuses):
                 if st in (0, 1, 2):
                     self._evictor.commit(stem)
-                    moved += 1
+                    out["written"] += 1
                 else:
                     self._evictor.abort(stem)
+                    out["lost"] += 1
         elif todo:
             for stem, slot, total, path in todo:
                 self._evictor.abort(stem)
-        arena.free_slots([c[0] for c in cands])
-        arena.reap_stale()
-        for c in cands:
-            stems.pop((c[1], c[2]), None)
-        return moved
+            out["lost"] += len(todo)
+        return out
 
     def arena_copy_to_disk(self, arena, stems) -> dict:
         """#248 PARK-DEMOTE: copy the COMPLETE arena pages of ``stems`` to the
