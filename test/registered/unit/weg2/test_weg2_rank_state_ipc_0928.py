@@ -177,18 +177,30 @@ class TestLauncherGate(unittest.TestCase):
     def test_rc12z29d_d_group_is_not_refused(self):
         with open(self.log_path, "w") as f:
             f.write(_RC12Z29D_D_LOG)
-        # The log count reproduces the refused boot's numbers ...
+        # rc12z30f: with a33ee80394 the log count knows the F14 line too
+        # (1+2, 1+2); the records of the same three ranks pass and decide.
         n_kv, n_blob, _ = self.launcher.canonical_marker_counts(self.log_path)
-        self.assertEqual((n_kv, n_blob), (1, 1))
-        # ... the records of the same three ranks pass, and the disagreement
-        # is reported, not decided on.
+        self.assertEqual((n_kv, n_blob), (3, 3))
         self._write([_d_rank(0, False, True, rows=(64, 0, 40)),
                      _d_rank(1, True, True, rows=(64, 40, 52)),
                      _d_rank(2, True, True, rows=(64, 52, 64))])
         log = _Log()
         self.launcher.canonical_state_gate(self._spec(), 3, log)
-        self.assertTrue(any(l.startswith("IPC MISMATCH W7/W10 group D") for l in log.lines), log.lines)
+        self.assertFalse(any(l.startswith("IPC MISMATCH W7/W10 group D") for l in log.lines), log.lines)
         self.assertTrue(any("RankState" in l and "kv x3 blob x3" in l for l in log.lines), log.lines)
+
+    def test_row_owning_worker_that_reports_no_kv_is_refused(self):
+        # a33ee80394's point under the records: the argv gives tp1 token rows,
+        # the rank reports the KV page as not applicable -> refused, not 'n/a'
+        # a Form A worker that built no window reports kv as not applicable
+        # (build_rank_state) -- the records alone would grade it 'n/a' and pass
+        self._write([_d_rank(0, False, True, rows=(64, 0, 40)),
+                     _d_rank(1, True, False, rows=(64, 40, 52)),
+                     _d_rank(2, True, True, rows=(64, 52, 64))])
+        self.launcher.canonical_state_gate(self._spec(), 3, _Log())
+        with self.assertRaises(self.launcher.Weg2LaunchRefused) as cm:
+            self.launcher.canonical_state_gate(self._spec(), 3, _Log(), kv_owner_ranks=[1, 2])
+        self.assertIn("tp1 owns token rows", str(cm.exception))
 
     def test_missing_rank_refuses_even_when_log_counts_three(self):
         with open(self.log_path, "w") as f:

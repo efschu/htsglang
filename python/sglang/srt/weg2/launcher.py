@@ -11684,7 +11684,8 @@ def rank_state_dir_for(spec: GroupSpec) -> str:
     return rank_state_mod.rank_state_dir_for_log(spec.log)
 
 
-def canonical_state_gate(spec: GroupSpec, expected: int, log: Log) -> None:
+def canonical_state_gate(spec: GroupSpec, expected: int, log: Log,
+                         kv_owner_ranks: Sequence[int] = ()) -> None:
     """IPC Phase 1: the launcher half of W7/W10 decided on the ranks'
     RankState records (weg2/rank_state.py), not on counted log lines.
 
@@ -11699,6 +11700,17 @@ def canonical_state_gate(spec: GroupSpec, expected: int, log: Log) -> None:
     for b in bad:
         verdict.ok = False
         verdict.reasons.append(f"unreadable record {b}")
+    # #239 F14 (a33ee80394), kept under the records: a worker the launcher's own
+    # argv gives token rows must REPORT the KV page as applicable and active --
+    # a rank that under-reports applicability would otherwise pass as 'n/a'.
+    _by_tp = {s.tp_rank: s for s in states if s.pp_rank == 0}
+    for r in kv_owner_ranks:
+        s = _by_tp.get(int(r))
+        if s is None or not (s.kv_page_applicable and s.kv_page_active):
+            verdict.ok = False
+            verdict.reasons.append(
+                f"tp{r} owns token rows under the cut but reports kv "
+                f"{'missing' if s is None else f'applicable={s.kv_page_applicable} active={s.kv_page_active}'}")
     log(f"W7/W10 launcher half, group {spec.name} RankState ({state_dir}): {verdict.line()}")
     n_kv, n_blob, n_worker = canonical_marker_counts(spec.log)
     if (n_kv, n_blob) != (verdict.n_kv, verdict.n_blob):
@@ -23312,7 +23324,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "never builds either (enable_hierarchical_cache is False) -- no "
             "canonical-page/GDN-blob emitter to grade, same as group P above.")
     else:
-        canonical_state_gate(spec_d, 3, log)
+        canonical_state_gate(spec_d, 3, log,
+                             kv_owner_ranks=d_kv_worker_ranks(getattr(ns, "extra_d", "") or ""))
     # #1233 zero-remainder (1j finding 6): W9 LAUNCH-TIME KEY-SCHEME GATE. The
     # store is one carrier; a spec-less group keys pages by unigram unless
     # SGLANG_HICACHE_BIGRAM_KEYS=1 forced the bigram scheme, a NEXTN/EAGLE
