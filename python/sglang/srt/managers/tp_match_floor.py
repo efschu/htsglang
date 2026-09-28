@@ -1248,6 +1248,45 @@ def form_a_prefetch_span_vote(local_span: int):
     return int(local_span), -int(local_span)
 
 
+# --------------------------------------------------------------------------
+# HP1: the #580 vote compares span ENDS on a Form A group (rc12z20)
+# --------------------------------------------------------------------------
+#
+# rc12z20 (3a86888ba5, D 12:30:32-12:31:36, rid weg2-8-2): TP0 matched 0
+# (``[#904 match-census] ... refusers=MambaComponent:32704``: its mamba
+# anchor at 32704 was absent) and asked 33600 tokens; TP1/TP2 matched 32704
+# on their byteless shadow tree and asked 896. H99 made the workers abstain
+# in the SPAN pair but kept their LENGTH vote, so the MIN was 896 and TP0's
+# read was cut by 32704 (``#915 PREFETCH TRUNCATED need=33600 got=896
+# cut_rank=1`` with 319552 free rows on TP1) -- deferred as
+# host_pool_shortfall, re-voted every pass for 64 s, D at bs1 meanwhile.
+# The two lengths start at different depths and END at the same token.
+# Voting ENDS (start + allocated length) makes the byte holder's read the
+# group's read and each rank registers its own share of it.
+
+
+def form_a_end_base(span_base) -> Optional[int]:
+    """The absolute start of this rank's prefetch span when the vote must
+    compare ENDS (a Form A group with the follow on and a caller that knows
+    the start), else None -- the unchanged length vote. Group-uniform: the
+    follow predicate is, and every rank calls from the same site."""
+    if span_base is None or not form_a_follow_active():
+        return None
+    return max(0, int(span_base))
+
+
+def form_a_null_tier_span(prefetch_length: int, end_base) -> bool:
+    """True on a Form A expert worker (END vote) whose span is non-empty: its
+    null storage tier moves no bytes, so a remainder below the prefetch
+    threshold is no reason to vote the host's read down."""
+    return end_base is not None and int(prefetch_length) > 0 and this_rank_follows()
+
+
+def form_a_host_base_vote(end_base: int) -> int:
+    """Slot 6 of the END vote: the byte holder's start; a worker abstains."""
+    return PREFETCH_SPAN_ABSTAIN if this_rank_follows() else int(end_base)
+
+
 def form_a_trim_to_group(
     tree_cache: Any,
     req_id: Any,

@@ -302,6 +302,26 @@ _REAP_PACKED_LEN = 6 + _POOL_SLOT_COUNT
 _ANCHOR_ABSTAIN = 2**31 - 1
 
 
+def _hp1_end_pack(end_base: int, completed: int, hit_tokens: int, anchor: int):
+    """HP1: this rank's (completed, hit_tokens, anchor) slots of the
+    completion MIN as ENDS (start + count). ``end_base`` 0 = the unchanged
+    counts; ``_ANCHOR_ABSTAIN`` stays an abstention."""
+    eb = int(end_base)
+    return (
+        eb + int(completed),
+        eb + int(hit_tokens),
+        int(anchor) if int(anchor) == _ANCHOR_ABSTAIN else eb + int(anchor),
+    )
+
+
+def _hp1_end_unpack(end_base: int, reduced: int) -> int:
+    """HP1: a reduced END back to this rank's own count (never below 0; an
+    abstention stays one)."""
+    if int(reduced) == _ANCHOR_ABSTAIN:
+        return _ANCHOR_ABSTAIN
+    return max(0, int(reduced) - int(end_base))
+
+
 def _weg2_read_no_writer_local(req_id, operation) -> int:
     """P4b-cap: this rank's vote for the no-writer slot (1 = nothing can still
     add pages to this read, and its probe saw the store in that final state).
@@ -6090,6 +6110,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         prefix_keys: Optional[list[str]] = None,
         locally_eligible: bool = True,
         min_tokens: Optional[int] = None,
+        span_base: Optional[int] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -6107,6 +6128,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # point, so nothing between here and it may `return` -- see the
         # eligibility comment further down.
         symmetric = self._hicache_prefetch_symmetric()
+        # HP1 (rc12z20, D 12:30:32-12:31:36, rid weg2-8-2): on a Form A group
+        # the ranks' spans start at DIFFERENT depths -- TP0 matched 0 (its
+        # mamba anchor at 32704 was absent), the expert workers matched 32704
+        # on their byteless shadow tree -- so TP0 asked 33600 tokens and each
+        # worker 896. The vote MINed those LENGTHS: group_len 896, TP0 cut to
+        # 896 of 33600 (`#915 PREFETCH TRUNCATED ... lost=32704 cut_rank=1`,
+        # with 319552 free rows on TP1), deferred as host_pool_shortfall and
+        # re-voted every pass for 64 s while D decoded at bs1. The lengths
+        # have different origins; their ENDS do not (both 33600). With the
+        # absolute start of this rank's span (`span_base`, the caller's
+        # `_matched_len`) the vote compares ends; without it, or off a Form A
+        # group, it is the unchanged length vote.
+        from sglang.srt.managers.tp_match_floor import (
+            PREFETCH_SPAN_ABSTAIN as _FA_SPAN_ABSTAIN,
+            form_a_end_base as _fa_end_base,
+            form_a_host_base_vote as _fa_host_base_vote,
+            form_a_null_tier_span as _fa_null_tier_span,
+        )
+
+        _end_base = _fa_end_base(span_base) if symmetric else None
+        _local_end = group_end = 0
 
         extra_key = last_host_node.key.extra_key if last_host_node.key else None
         prefetch_key = RadixKey(
@@ -6160,7 +6202,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # the FIRST failing one is named -- a request can trip several, and
         # summing them would double-count the way `refused_tokens_by_component`
         # is documented to.
-        _topup = self._weg2_extent_topup(req_id)
+        # HP1: a Form A worker's span moves no bytes (null storage tier), so
+        # its own short remainder is no reason to vote the host's read down --
+        # only an empty span is. It passes the too_short term like a top-up.
+        _topup = self._weg2_extent_topup(req_id) or _fa_null_tier_span(
+            prefetch_length, _end_base
+        )
         if not locally_eligible:
             reason = "anchor"
         elif prefetch_length < _min_len and not _topup:
@@ -6463,16 +6510,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
             _span_vote, _neg_span_vote = _fa_span_vote(local_span)
-            vote = torch.tensor(
-                [
-                    _PREFETCH_VOTE_TAG,
-                    -_PREFETCH_VOTE_TAG,
-                    local_len,
-                    _span_vote,
-                    _neg_span_vote,
-                ],
-                dtype=torch.int,
-            )
+            # HP1: on a Form A group slot 2 carries this rank's allocated END
+            # (0 still means "declined"), and two slots follow: -base (the MIN
+            # is the deepest start, so every rank can tell whether each rank
+            # keeps at least one token of the group span) and the host's base
+            # (workers abstain, so the MIN is the byte holder's start). Off a
+            # Form A group the payload is byte-identical to before.
+            _vote_list = [
+                _PREFETCH_VOTE_TAG,
+                -_PREFETCH_VOTE_TAG,
+                local_len,
+                _span_vote,
+                _neg_span_vote,
+            ]
+            if _end_base is not None:
+                _vote_list[2] = _end_base + local_len if local_len > 0 else 0
+                _vote_list += [-_end_base, _fa_host_base_vote(_end_base)]
+            vote = torch.tensor(_vote_list, dtype=torch.int)
             self._all_reduce_attn_groups(
                 vote,
                 torch.distributed.ReduceOp.MIN,
@@ -6489,7 +6543,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "failure -- and continuing would corrupt the vote."
                 )
             group_len = int(vote[2].item())
-            if group_len > local_len:
+            # HP1: the length this rank registers. Equal to `group_len` off a
+            # Form A group; on one it is the group END minus this rank's own
+            # start, while `group_len` becomes the host's length (host
+            # coordinates, the ones the threshold, the truncation fact and
+            # the scheduler's deferral are about).
+            my_len = group_len
+            _end_decline = False
+            if _end_base is not None:
+                group_end = group_len
+                _local_end = _end_base + local_len if local_len > 0 else 0
+                if group_end > _local_end:
+                    raise HiCacheCollectiveDesyncError(
+                        "prefetch_participation_vote returned a group END above "
+                        f"this rank's own (group={group_end}, local={_local_end}): "
+                        "a MIN reduce can never do that, so the ranks were not "
+                        "all inside this collective."
+                    )
+                _max_base = -int(vote[5].item())
+                _host_base = int(vote[6].item())
+                if group_end <= 0 or _host_base >= _FA_SPAN_ABSTAIN:
+                    group_len = my_len = 0
+                else:
+                    group_len = max(0, group_end - _host_base)
+                    my_len = max(0, group_end - _end_base)
+                    # Every rank must keep at least one token of the group span
+                    # to register at all; the deepest start decides, and it is
+                    # a reduced value, so the decline is uniform.
+                    _end_decline = group_end - _max_base <= 0
+                self._hp1_note_end_vote(
+                    req_id, _end_base, _host_base, group_end, group_len, my_len
+                )
+            if group_len > local_len and _end_base is None:
                 # MIN can never exceed a voter's own vote -- same detector
                 # shape as the tag check above: the ranks were not all in
                 # THIS collective, and pricing a span on the foreign number
@@ -6500,7 +6585,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     f"local={local_len}): a MIN reduce can never do that, so "
                     "the ranks were not all inside this collective."
                 )
-            if group_len < self.prefetch_threshold:
+            if group_len < self.prefetch_threshold or _end_decline:
                 # #1068 L1: the group declined (0, or a common span below the
                 # prefetch threshold). Named on every rank, including the one
                 # whose own gate term or anchor exhaustion lowered the vote
@@ -6583,7 +6668,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _note_prefetch_gate(
                     "host_pool_truncated_group", len(prefetch_key) - group_len
                 )
-                _cut_rank = _prefetch_cut_rank(self, local_len, group_len)
+                # HP1: on a Form A group the cutter is the rank whose own
+                # END is the group END (lengths from different starts
+                # cannot name it).
+                _cut_rank = (
+                    _prefetch_cut_rank(self, _local_end, group_end)
+                    if _end_base is not None
+                    else _prefetch_cut_rank(self, local_len, group_len)
+                )
                 self._log_prefetch_truncated(
                     req_id, need, group_len, cut_rank=_cut_rank, local=local_len
                 )
@@ -6593,7 +6685,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _cuts[str(req_id)] = (_cut_rank, int(group_len), int(need))
                 while len(_cuts) > _PREFETCH_CUT_SLOTS:
                     _cuts.pop(next(iter(_cuts)))
-                if len(host_indices) > group_len and read_placeholders:
+                if len(host_indices) > my_len and read_placeholders:
                     # rc12z17-s0 (D TP0 11:22:04-11:22:57, W88 weg2-10-50):
                     # the cut tail is read placeholders -- `alloc_read` took
                     # no slot and no reference, the drain drops them unfreed
@@ -6608,13 +6700,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # queue. Nothing to give back, so nothing is queued.
                     self._weg2_trim_placeholders_dropped = int(
                         getattr(self, "_weg2_trim_placeholders_dropped", 0)
-                    ) + (len(host_indices) - group_len)
-                elif len(host_indices) > group_len:
+                    ) + (len(host_indices) - my_len)
+                elif len(host_indices) > my_len:
                     self.cache_controller.append_host_mem_release(
-                        host_indices=host_indices[group_len:]
+                        host_indices=host_indices[my_len:]
                     )
-                host_indices = host_indices[:group_len]
-                prefetch_key = prefetch_key[:group_len]
+                host_indices = host_indices[:my_len]
+                prefetch_key = prefetch_key[:my_len]
                 # The sidecar transfers built above wrap the PRE-trim KV
                 # host_indices; a KV-sourced sidecar would otherwise carry
                 # rows this trim just released. Rebuild from the trimmed
@@ -6636,7 +6728,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 form_a_trim_to_group as _fa_trim,
             )
 
-            _trimmed = _fa_trim(self, req_id, host_indices, prefetch_key, group_len, span_lo)
+            # HP1: a worker trims to ITS length of the group span (group END
+            # minus its own start), which is `group_len` off the END vote.
+            _trimmed = _fa_trim(self, req_id, host_indices, prefetch_key, my_len, span_lo)
             if _trimmed is not None:
                 host_indices, prefetch_key = _trimmed
                 sidecar_xfers = self._build_sidecar_transfers(
@@ -6666,6 +6760,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Registered before the operation is queued; group-uniform (the caller
         # derives it from replicated request state).
         note_min_hit_tokens(self.cache_controller, req_id, None if min_tokens is None else _min_len)
+        # HP1: the completion MIN (`check_prefetch_progress`) must compare
+        # the same ENDS the registration vote did, so the start rides along.
+        _bases = getattr(self, "_hp1_end_base_by_rid", None)
+        if _bases is None:
+            _bases = self._hp1_end_base_by_rid = {}
+        if _end_base is not None:
+            _bases[str(req_id)] = int(_end_base)
+            while len(_bases) > _PREFETCH_CUT_SLOTS:
+                _bases.pop(next(iter(_bases)))
+        else:
+            _bases.pop(str(req_id), None)
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
@@ -6878,6 +6983,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             "local" if cut_rank is None else cut_rank,
             int(got) if local is None else int(local),
         )
+
+    def _hp1_note_end_vote(
+        self, req_id, my_base: int, host_base: int, group_end: int,
+        group_len: int, my_len: int,
+    ) -> None:
+        """HP1: one line where this rank's span starts elsewhere than the
+        host's -- the case the length vote got wrong (rc12z20 weg2-8-2: a
+        worker at 32704 capped TP0's 33600 to 896): a line with
+        ``my_len < host_len`` names a read the old length MIN would have cut
+        to ``my_len``. Rate-limited; counted on every occurrence."""
+        if int(my_base) == int(host_base):
+            return
+        n = getattr(self, "_hp1_end_vote_n", 0) + 1
+        self._hp1_end_vote_n = n
+        if n <= 20 or n % 256 == 0:
+            logger.warning(
+                "HP1 FORM-A END-VOTE rid=%s host_base=%d my_base=%d group_end=%d "
+                "host_len=%d my_len=%d (n=%d): the #580 vote compared span "
+                "ENDS, not lengths from different starts",
+                str(req_id)[:16], int(host_base), int(my_base), int(group_end),
+                int(group_len), int(my_len), n,
+            )
 
     def prefetch_cut_terms(self, req_id) -> str:
         """#249: the last group truncation of ``req_id`` for the W88 line --
@@ -7127,9 +7254,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _probed_local, _hit_tokens_local = self._reap_annotation_local(
             operation, hash_value
         )
-        packed_list = [completed_tokens] + [0] * _POOL_SLOT_COUNT
-        packed_list += [_probed_local, _hit_tokens_local, tail_adopt.local_vote(req_id)]
-        packed_list += [self._anchor_reach_local(completed_tokens, hash_value)]
+        # HP1: a read registered under the Form A END vote reduces ENDS here
+        # too -- a worker whose span starts 32704 tokens deeper completes its
+        # 896 at the same END as the host's 33600, and a MIN over the raw
+        # counts would cut the host back to 896 at completion. 0 = the
+        # unchanged length reduce (every other read and boot).
+        _eb = int((getattr(self, "_hp1_end_base_by_rid", None) or {}).get(str(req_id), 0))
+        _c_vote, _h_vote, _a_vote = _hp1_end_pack(
+            _eb,
+            completed_tokens,
+            _hit_tokens_local,
+            self._anchor_reach_local(completed_tokens, hash_value),
+        )
+        packed_list = [_c_vote] + [0] * _POOL_SLOT_COUNT
+        packed_list += [_probed_local, _h_vote, tail_adopt.local_vote(req_id)]
+        packed_list += [_a_vote]
         packed_list += [_weg2_read_no_writer_local(req_id, operation)]
         assert len(packed_list) == _REAP_PACKED_LEN
         if self.tp_world_size > 1:
@@ -7149,18 +7288,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 torch.distributed.ReduceOp.MIN,
                 label="check_prefetch_progress",
             )
-            min_completed_tokens = int(packed[0].item())
+            min_completed_tokens = _hp1_end_unpack(_eb, int(packed[0].item()))
             for p in sidecar_pools:
                 hit_pages[p] = int(packed[_pool_slot(p, 1)].item())
         else:
             packed = torch.tensor(packed_list, dtype=torch.int)
         _probed, _hit_tokens = self._reap_annotation_from_packed(packed)
+        _hit_tokens = _hp1_end_unpack(_eb, int(_hit_tokens))
         tail_adopt.agree(req_id, int(packed[_REAP_SLOT_TAIL_VOTE].item()))
         # #257 (b): a read that ended short keeps only what a recurrent anchor
         # can resume -- the KV above the group's deepest reachable anchor is
         # neither loaded nor inserted (vision boot 0928, weg2-4-27: 14016 KV
         # tokens loaded below the first anchor at 16384, then prefilled from 0)
-        _anchored = int(packed[_REAP_SLOT_ANCHOR].item())
+        _anchored = _hp1_end_unpack(_eb, int(packed[_REAP_SLOT_ANCHOR].item()))
         if _anchored < int(min_completed_tokens):
             _cut = (max(0, _anchored) // self.page_size) * self.page_size
             _257n = getattr(self, "_257_below_anchor_n", 0) + 1
@@ -7452,6 +7592,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[req_id]
+        (getattr(self, "_hp1_end_base_by_rid", None) or {}).pop(str(req_id), None)
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
         self._weg2_note_dormant_done(req_id, host_indices[unclaimed_to:min_completed_tokens])
         # #243: D took the hand-off -- every rank's fetched pages carry its own
