@@ -1645,6 +1645,227 @@ class StreamStats:
         )
 
 
+#: BOOTZEIT (A) 0928: COALESCED RUNS. The per-tensor stream above issues one
+#: pread per tensor in NAME order -- measured on NF rc12z30c: PP0 0,56 GB/s,
+#: the load thread waits 52-65 % on its readers, while the disk (Samsung
+#: MZWLJ1T9HBJR, XFS) delivers 3,56 GB/s O_DIRECT sequential at bs 4M (fio,
+#: 1..8 jobs). Two reasons: 135 032 tensors per NF load (median 25 KB), and a
+#: safetensors file is laid out in dtype SECTIONS, each section sorted by name
+#: -- so name order jumps between sections on every tensor and no two
+#: consecutive preads touch neighbouring bytes (26 of 17 008 adjacent).
+#:
+#: Here every file's wanted tensors are grouped by FILE OFFSET into runs of at
+#: most ``COALESCE_ENV`` MiB (holes up to ``COALESCE_GAP_ENV`` KiB are read
+#: through), each run is ONE aligned O_DIRECT read into its own buffer, and the
+#: tensors are copied out of it in the reader thread. The yield order, the
+#: bytes, the ``should_load`` verdicts (asked once per name, up front) and
+#: ``post_load`` are those of the per-tensor path; only the route into memory
+#: changes. Model-agnostic: dense (27B TP3/PP3, DFlash2) and MoE checkpoints
+#: take the same path. The byte window counts RUN bytes from submission to the
+#: yield of the run's last tensor; a run the next tensor needs is always
+#: submitted, so the window can be exceeded by at most one run per open dtype
+#: section. Host transient per loading rank <= window + workers x run buffer;
+#: with O_DIRECT the page cache stays empty (nothing fills the cgroup).
+COALESCE_ENV = "SGLANG_WEIGHT_LOADER_COALESCE_MIB"
+COALESCE_GAP_ENV = "SGLANG_WEIGHT_LOADER_COALESCE_GAP_KIB"
+_COALESCE_GAP_DEFAULT_KIB = 256
+COALESCE_MARKER = "WEG2-LOAD-COALESCE"
+
+
+def coalesce_run_bytes() -> int:
+    """Run cap in bytes; 0 (the default) keeps the per-tensor stream."""
+    try:
+        mib = int(os.environ.get(COALESCE_ENV, "") or 0)
+    except ValueError:
+        mib = 0
+    return max(0, mib) << 20
+
+
+def _coalesce_gap_bytes() -> int:
+    try:
+        kib = int(os.environ.get(COALESCE_GAP_ENV, "") or _COALESCE_GAP_DEFAULT_KIB)
+    except ValueError:
+        kib = _COALESCE_GAP_DEFAULT_KIB
+    return max(0, kib) << 10
+
+
+class _Run:
+    __slots__ = ("path", "base", "start", "end", "items", "first", "future", "left")
+
+    def __init__(self, path, base, start, end, idx):
+        self.path = path
+        self.base = base
+        self.start = start  # relative to the data section (safetensors offsets)
+        self.end = end
+        self.items = [idx]
+        self.first = idx
+        self.future = None
+        self.left = 0
+
+    @property
+    def nbytes(self) -> int:
+        return self.end - self.start
+
+
+def plan_coalesced_runs(hf_weights_files, should_load, cap: int, gap: int):
+    """Yield-order items and the runs that carry them.
+
+    items[i] = [name, path, base, info, verdict, run or None]; runs are sorted by
+    the first item that needs them. ``should_load`` is asked exactly once per
+    name, in yield order."""
+    items, runs = [], []
+    for path in hf_weights_files:
+        header, base = read_safetensors_header(path)
+        wanted = []
+        for name in sorted(header.keys()):
+            info = header[name]
+            verdict = True if should_load is None else should_load(name)
+            if not verdict:
+                continue
+            items.append([name, path, base, info, verdict, None])
+            off0, off1 = info["data_offsets"]
+            if verdict != "meta" and int(off1) > int(off0):
+                wanted.append(len(items) - 1)
+        wanted.sort(key=lambda i: int(items[i][3]["data_offsets"][0]))
+        cur = None
+        for i in wanted:
+            off0, off1 = (int(x) for x in items[i][3]["data_offsets"])
+            if (cur is not None and off0 >= cur.end and off0 - cur.end <= gap
+                    and off1 - cur.start <= cap):
+                cur.end = off1
+                cur.items.append(i)
+                cur.first = min(cur.first, i)
+            else:
+                cur = _Run(path, base, off0, off1, i)
+                runs.append(cur)
+            items[i][5] = cur
+    runs.sort(key=lambda r: r.first)
+    for r in runs:
+        r.left = len(r.items)
+    return items, runs
+
+
+def _read_run(run: "_Run", direct_io: bool, post_load, counters) -> dict:
+    """ONE aligned read of the run's byte range; the tensors copied out of it."""
+    import mmap as _mm
+
+    a = (run.base + run.start) & ~(_DIRECT_ALIGN - 1)
+    b = run.base + run.end
+    length = (b - a + _DIRECT_ALIGN - 1) & ~(_DIRECT_ALIGN - 1)
+    fd = -1
+    direct = False
+    if direct_io:
+        try:
+            fd = os.open(run.path, os.O_RDONLY | getattr(os, "O_DIRECT", 0o40000))
+            direct = True
+        except OSError as err:
+            if run.path not in _DIRECT_FALLBACK_WARNED:
+                _DIRECT_FALLBACK_WARNED.add(run.path)
+                logger.warning("weight loader: O_DIRECT refused on %s (%s); reading it "
+                               "BUFFERED (page cache) instead", run.path, err)
+    if fd < 0:
+        fd = os.open(run.path, os.O_RDONLY)
+    buf = _mm.mmap(-1, length)  # anonymous => page aligned, as O_DIRECT needs
+    mv = memoryview(buf)
+    try:
+        got = 0
+        need = b - a
+        while got < need:
+            n = os.preadv(fd, [mv[got:length]], a + got)
+            if n <= 0:
+                raise IOError(f"short read in {run.path} at {a + got}: need {need - got} more")
+            got += n
+        src = torch.frombuffer(buf, dtype=torch.uint8)
+        out = {}
+        for i in run.items:
+            name, _path, base, info, _v, _r = counters["items"][i]
+            off0, off1 = (int(x) for x in info["data_offsets"])
+            lo = base + off0 - a
+            t = src[lo : lo + (off1 - off0)].clone()
+            t = t.view(_SAFETENSORS_DTYPES[info["dtype"]]).reshape(
+                tuple(int(x) for x in info["shape"]))
+            if post_load is not None:
+                t = post_load(name, t)
+            out[i] = t
+        del src
+        with counters["lock"]:
+            counters["read_bytes"] += got
+            counters["direct" if direct else "buffered"] += 1
+        return out
+    finally:
+        mv.release()
+        try:
+            buf.close()
+        except BufferError:
+            pass  # a frombuffer view still alive: the GC closes it
+        os.close(fd)
+
+
+def _coalesced_stream(hf_weights_files, should_load, post_load, direct_io, st, log):
+    import threading
+    import time as _time
+
+    cap = coalesce_run_bytes()
+    gap = _coalesce_gap_bytes()
+    st.t0 = _time.perf_counter()
+    items, runs = plan_coalesced_runs(hf_weights_files, should_load, cap, gap)
+    st.files += len(hf_weights_files)
+    counters = {"items": items, "lock": threading.Lock(), "read_bytes": 0,
+                "direct": 0, "buffered": 0}
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=st.workers)
+    nxt = 0
+    try:
+        for i, (name, _path, _base, info, verdict, run) in enumerate(items):
+            # submit every run the window allows, and ALWAYS the ones up to i
+            while nxt < len(runs) and (
+                runs[nxt].first <= i or st.inflight + runs[nxt].nbytes <= st.budget
+            ):
+                r = runs[nxt]
+                r.future = ex.submit(_read_run, r, direct_io, post_load, counters)
+                st.inflight += r.nbytes
+                st.inflight_peak = max(st.inflight_peak, st.inflight)
+                st.max_tensor = max(st.max_tensor, r.nbytes)
+                nxt += 1
+            if verdict == "meta":
+                yield name, torch.empty(tuple(int(x) for x in info["shape"]),
+                                        dtype=_SAFETENSORS_DTYPES[info["dtype"]], device="meta")
+                continue
+            if run is None:  # zero-byte tensor
+                yield name, torch.empty(tuple(int(x) for x in info["shape"]),
+                                        dtype=_SAFETENSORS_DTYPES[info["dtype"]])
+                continue
+            got = run.future.result()  # an exception MUST surface
+            t = got.pop(i)
+            run.left -= 1
+            if run.left == 0:
+                st.inflight -= run.nbytes
+                run.future = None
+            off0, off1 = info["data_offsets"]
+            st.tensors += 1
+            st.bytes += int(off1) - int(off0)
+            st.sample_anon()
+            yield name, t
+            del t
+    finally:
+        for r in runs:
+            if r.future is not None:
+                r.future.cancel()
+        ex.shutdown(wait=True)
+        st.seconds = _time.perf_counter() - st.t0
+        st.sample_anon(force=True)
+        st.direct_readers = counters["direct"]
+        st.buffered_readers = counters["buffered"]
+        if log:
+            gbs = counters["read_bytes"] / st.seconds / 1e9 if st.seconds > 0 else 0.0
+            logger.info(
+                "%s runs=%d cap_mib=%d gap_kib=%d read_bytes=%d used_bytes=%d "
+                "waste_pct=%.1f s=%.2f read_GB/s=%.2f workers=%d reads=direct:%d,buffered:%d",
+                COALESCE_MARKER, len(runs), cap >> 20, gap >> 10, counters["read_bytes"],
+                st.bytes, 100.0 * (counters["read_bytes"] - st.bytes) / max(1, counters["read_bytes"]),
+                st.seconds, gbs, st.workers, counters["direct"], counters["buffered"])
+            logger.info(st.line())
+
+
 def pread_safetensors_stream(
     hf_weights_files: List[str],
     should_load=None,
@@ -1671,6 +1892,12 @@ def pread_safetensors_stream(
     budget = int(budget_bytes) if budget_bytes is not None else _stream_budget_bytes()
     st = stats if stats is not None else StreamStats(budget, workers)
     st.budget, st.workers = budget, workers
+
+    if coalesce_run_bytes() > 0:
+        yield from _coalesced_stream(
+            hf_weights_files, should_load, post_load, direct_io, st, log,
+        )
+        return
 
     # The plan: (file, name, info) in yield order; skips resolved up front.
     plan = []
