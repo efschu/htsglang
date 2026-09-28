@@ -121,6 +121,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PrefetchTimeoutConfig,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.weg2 import p_fork_cut
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -1118,6 +1119,13 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        # P-FORK-CUT: KV the store holds past the anchor claim is a shared prefix
+        # without a recurrent state; PP0's adder ends a chunk at its depth.
+        p_fork_cut.note_store_uncapped(
+            getattr(operation, "request_id", None),
+            getattr(hit_result, "kv_uncapped", 0),
+            kv_hit_pages,
+        )
 
         # #1035c: RESOLVE "ANSWERED ZERO" INTO ITS THREE CAUSES.
         #
