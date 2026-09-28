@@ -236,3 +236,35 @@ def test_a_captured_step_counts_the_floor_rows_as_on():
     # with the rows really ON the floor adds nothing
     ep.set_seat_rows_on(t, 20, device_write=False)
     assert ep.pool_row_capacity(t, 10) == ep.pool_row_capacity(t) == live + 20
+
+
+# ---- (4) the refusal names its reason (YaRN x2 dry run 28.09.) ---------------------
+
+def test_no_stage_form_names_why():
+    """S0 = 524288 (YaRN x2): the top stage needs 64 rows; with 40 staging rows
+    the scratch of 100 cannot give them -- the reason is C - S <= staging, not
+    a missing KV cell."""
+    why = []
+    assert er.kv_stage_table(_rows(), FORM, kv_cell_bytes=14143, kv_tokens=524288,
+                             local_experts=193, verify_tokens=4, top_k=10,
+                             staging_rows=40, why=why) is None
+    (reason,) = why
+    assert "C 100 - S 64 = 36 <= Staging 40" in reason
+    assert "524288,786432,1048576" in reason and "D faehrt fest 524288 Token" in reason
+    why = []
+    assert er.kv_stage_table(_rows(), FORM, kv_cell_bytes=0, kv_tokens=524288,
+                             local_experts=193, verify_tokens=4, top_k=10, why=why) is None
+    assert why and "keine KV-Zelle" in why[0]
+
+
+def test_the_launcher_line_says_the_scratch_is_too_small():
+    from sglang.srt.weg2 import launcher as L
+
+    plan = types.SimpleNamespace(fits=[types.SimpleNamespace(
+        rank=0, kv_cell_bytes=14143, kv_tokens=524288, local_experts=193, staging_rows=40)])
+    ns = types.SimpleNamespace(env_d="SGLANG_MOE_SCRATCH_SLOTS=100,48,48")
+    (line,) = L.apply_d_kv_stage_form(ns, er, _rows(), FORM, plan, "D", verify_tokens=4,
+                                      top_k=10)
+    assert "D-KV-STUFEN (#251c): entfaellt -- Scratch zu klein" in line
+    assert "keine KV-Zelle" not in line
+    assert ns.env_d == "SGLANG_MOE_SCRATCH_SLOTS=100,48,48"
