@@ -121,3 +121,62 @@ def test_without_row_authority_a_follower_keeps_the_xsn324_countdown(monkeypatch
     assert _pass(f, fake, cur, _frame(66097))    # delay 1: one more pass
     assert not _pass(f, fake, cur, _frame(67121)), "the plan-lag form is unchanged"
     assert sent == [RID]
+
+
+# ---- #791C liveness: PP0 goes idle after its abort -> no frame ever comes ---------
+# A frameless cycle skips the plan (PLAN BYPASS), so process_pending_chunked_abort
+# never runs there; is_fully_idle (chunked_req is None) would keep the follower's
+# #1268 vote not-idle and the front's quiesce would end in W3. The release is the
+# vote itself: an IDLE PP0 slot = PP0 applied its abort and drained the ring.
+
+def test_pp0_idle_in_vote_reads_pp0s_slot_only():
+    assert pp_abort.pp0_idle_in_vote([(0, 1, "none")]) is True
+    assert pp_abort.pp0_idle_in_vote([(0, 0, "chunked_req")]) is False
+    assert pp_abort.pp0_idle_in_vote([(1, 1, "none")]) is False
+    assert pp_abort.pp0_idle_in_vote(None) is False
+    assert pp_abort.follower_row_verdict(2, True, None, RID, pp0_drained=True) is True
+    assert pp_abort.follower_row_verdict(0, True, None, RID, pp0_drained=True) is None
+
+
+def _vote(pp0_idle):
+    from sglang.srt.managers.weg2_idle_vote import Weg2IdleVoteReq
+
+    v = Weg2IdleVoteReq(epoch=7, origin=0, world=3)
+    v.slots.append((0, 1 if pp0_idle else 0, "none" if pp0_idle else "chunked_req"))
+    return v
+
+
+def _release(fake, vote):
+    from sglang.srt.managers import scheduler as sched_mod
+    from sglang.srt.managers.scheduler_pp_mixin import weg2_791c_release_on_idle_vote
+
+    fake.process_pending_chunked_abort = lambda: sched_mod.Scheduler.process_pending_chunked_abort(fake)
+    weg2_791c_release_on_idle_vote(fake, vote)
+    return fake.chunked_req is None
+
+
+def test_an_idle_pp0_vote_releases_the_held_chunk_on_a_drained_follower(monkeypatch):
+    f, fake, cur, req, sent = _fake(monkeypatch, pp_rank=2)
+    assert _pass(f, fake, cur, _frame(67121))        # PP0's last frame naming it ran here
+    fake._pp_microbatches_drained = lambda: True
+    assert not _release(fake, _vote(pp0_idle=False)), "PP0 not idle: it may still send a frame"
+    assert _release(fake, _vote(pp0_idle=True)), "PP0 idle and drained: release, no frame needed"
+    assert sent == [RID] and fake._pending_chunked_abort_req is None
+    assert not getattr(fake, "_791c_pp0_drained", False)
+
+
+def test_an_undrained_follower_waits_for_the_next_lap(monkeypatch):
+    f, fake, cur, req, sent = _fake(monkeypatch, pp_rank=1)
+    fake._pp_microbatches_drained = lambda: False
+    assert not _release(fake, _vote(pp0_idle=True)) and not sent
+    fake._pp_microbatches_drained = lambda: True
+    assert _release(fake, _vote(pp0_idle=True)) and sent == [RID]
+
+
+def test_the_vote_release_is_follower_and_row_authority_only(monkeypatch):
+    f, fake, cur, req, sent = _fake(monkeypatch, pp_rank=0)
+    fake._pp_microbatches_drained = lambda: True
+    assert not _release(fake, _vote(pp0_idle=True)) and not sent, "PP0 keeps its countdown"
+    f, fake, cur, req, sent = _fake(monkeypatch, pp_rank=2, row_authority=False)
+    fake._pp_microbatches_drained = lambda: True
+    assert not _release(fake, _vote(pp0_idle=True)) and not sent, "plan-lag form: the countdown owns it"

@@ -37,7 +37,8 @@ def countdown_step(delay: int) -> tuple:
     return False, d - 1
 
 
-def follower_row_verdict(pp_rank: int, row_authority: bool, scheduled_extents, rid: str):
+def follower_row_verdict(pp_rank: int, row_authority: bool, scheduled_extents, rid: str,
+                         pp0_drained: bool = False):
     """#791C (27B rc12z24 bb84760576, 15:59:23Z, weg2-0-6): under the #631 row
     authority (Fix B) the xsn324 premise "stage r reads the abort r passes
     later" is false -- the AbortReq rides the request chain and reached PP0,
@@ -62,6 +63,22 @@ def follower_row_verdict(pp_rank: int, row_authority: bool, scheduled_extents, r
                    other #791 refusal)."""
     if int(pp_rank or 0) <= 0 or not row_authority:
         return None
+    if pp0_drained:
+        # #791C liveness: PP0 voted idle in a #1268 lap -- it applied its own
+        # abort and every pass it launched completed the ring, so every frame
+        # that named ``rid`` has been executed here. The group-uniform release
+        # when PP0 sends no further frame (idle queue, quiesce before a flip).
+        return True
     if not scheduled_extents:
         return False
     return str(rid) not in scheduled_extents
+
+
+def pp0_idle_in_vote(slots) -> bool:
+    """#791C liveness: did PP0 attach an IDLE slot to this #1268 idle vote?
+    ``slots`` are ``(rank, idle 0/1, blockers)`` as ``attach_slot`` writes them;
+    PP0 attaches its own slot before the vote leaves it (``_weg2_vote_maybe_stamp``)."""
+    try:
+        return any(int(r) == 0 and int(i) == 1 for r, i, *_ in (slots or ()))
+    except Exception:  # noqa: BLE001 - an unreadable slot is not an idle PP0
+        return False

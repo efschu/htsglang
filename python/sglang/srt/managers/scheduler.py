@@ -9466,6 +9466,7 @@ class Scheduler(
                 _prow_791c.applies(self),
                 self._pp_scheduled_extents(),
                 req.rid,
+                pp0_drained=bool(getattr(self, "_791c_pp0_drained", False)),
             )
         except Exception:  # noqa: BLE001 - the verdict never blocks the old rule
             _row_791c = None
@@ -9478,9 +9479,11 @@ class Scheduler(
                 return  # xsn324: this stage still launches this pass's chunk
         else:
             logger.info(
-                "WEG2-PP-CHUNKED-ABORT applied rid=%s pp_rank=%s: PP0's forwarded "
-                "schedule no longer names it (#791C, row authority)",
+                "WEG2-PP-CHUNKED-ABORT applied rid=%s pp_rank=%s: %s (#791C, row authority)",
                 req.rid, getattr(self.ps, "pp_rank", 0),
+                "PP0 voted idle in a #1268 lap (liveness release)"
+                if getattr(self, "_791c_pp0_drained", False)
+                else "PP0's forwarded schedule no longer names it",
             )
 
         prepare_abort(req, "Aborted")
