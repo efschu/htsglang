@@ -779,8 +779,17 @@ def guard_collective_subgroup(plan: RankRolePlan, name: str) -> None:
 #: because the default that reads best ("it's probably fine") is exactly the
 #: one that records a dense forward on a rank with no dense weights.
 GRAPH_BODY_MOE_ROUTE = "form_a_moe_route"
+#: #239 S3c: the same worker route with each full-attention layer's A [, T,
+#: Q, M] step in front of its MoE carrier (Form A x the token cut). A body of
+#: its own because it records a different collective sequence.
+GRAPH_BODY_MOE_ROUTE_DCP = "form_a_moe_route_dcp"
 GRAPH_BODY_MODEL_FORWARD = "model_forward"
-GRAPH_BODIES: Tuple[str, ...] = (GRAPH_BODY_MOE_ROUTE, GRAPH_BODY_MODEL_FORWARD)
+GRAPH_BODIES: Tuple[str, ...] = (
+    GRAPH_BODY_MOE_ROUTE,
+    GRAPH_BODY_MOE_ROUTE_DCP,
+    GRAPH_BODY_MODEL_FORWARD,
+)
+_WORKER_ROUTES: Tuple[str, ...] = (GRAPH_BODY_MOE_ROUTE, GRAPH_BODY_MOE_ROUTE_DCP)
 
 
 def guard_graph_mode(
@@ -819,7 +828,7 @@ def guard_graph_mode(
         )
     is_worker = plan.is_worker(rank)
     if not is_worker:
-        if body == GRAPH_BODY_MOE_ROUTE:
+        if body in _WORKER_ROUTES:
             raise FormAWorkerDenseGraph(
                 f"rank {rank} is the Form A HOST but was about to capture the "
                 f"worker's MoE route ({body!r}). The host owns the whole dense "
@@ -830,7 +839,7 @@ def guard_graph_mode(
         return
     if mode in ("eager", "disabled", None):
         return
-    if body == GRAPH_BODY_MOE_ROUTE:
+    if body in _WORKER_ROUTES:
         return
     raise FormAWorkerDenseGraph(
         f"rank {rank} is a Form A expert worker and was given graph mode "

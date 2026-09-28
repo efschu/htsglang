@@ -269,12 +269,22 @@ def run_form_a_worker_layers(
     host_rank: int = 0,
     carrier: Optional[str] = None,
     receive: Optional[Callable[..., Any]] = None,
+    attention: Optional[Callable[[int], None]] = None,
+    attention_layer_ids: Sequence[int] = (),
 ) -> int:
     """The worker's whole forward: per MoE layer, receive and compute.
 
     Runs NO dense module (it has none) and returns only the number of layers
     it served -- the MoE output is all-reduced into every rank by the block
     itself, and the worker has nothing downstream to do with it.
+
+    #239 S3c: under Form A x the token cut the worker owns a token range of
+    the full-attention KV, so each full-attention layer (``attention_layer_ids``)
+    first runs ``attention(layer_id)`` -- the QSA backend's worker step, the
+    host's A [, T, Q, M] -- BEFORE the layer's MoE-input carrier: that is where
+    the host's attention sits in its own layer. Every such layer must have a
+    routed-MoE block here; one without would put the attention step nowhere in
+    the host's order.
     """
     if not this_rank_is_form_a_worker():
         raise FormAWorkerForwardError(
@@ -286,12 +296,28 @@ def run_form_a_worker_layers(
     from sglang.srt.debug_utils import host_anon_probe as _hap
 
     recv = receive or receive_moe_input
+    attn_ids = frozenset(int(i) for i in attention_layer_ids)
+    if attn_ids and attention is None:
+        raise FormAWorkerForwardError(
+            "#239 S3c: full-attention layers were named for the Form A worker "
+            "forward but no attention step was given; the host would issue "
+            "A/T/Q/M that nobody here answers."
+        )
+    missing = attn_ids - {int(layer_id) for layer_id, _ in blocks}
+    if missing:
+        raise FormAWorkerLayerMismatch(
+            f"#239 S3c: full-attention layers {sorted(missing)} have no routed-MoE "
+            "block on this worker, so their attention step has no place in the "
+            "per-layer order the host issues."
+        )
     served = 0
     # H13: SGLANG_DEBUG_HOST_ANON_PROBE -- the worker's pass and its layers.
     _mode = getattr(forward_batch, "forward_mode", None)
     _hap.pass_begin(getattr(_mode, "name", "WORKER"), int(num_tokens), role="worker")
     for _layer_id, mlp in blocks:
         _hap.checkpoint("worker.layer", layer=_layer_id)
+        if int(_layer_id) in attn_ids:
+            attention(int(_layer_id))
         moe_in = recv(
             num_tokens,
             hidden_size,

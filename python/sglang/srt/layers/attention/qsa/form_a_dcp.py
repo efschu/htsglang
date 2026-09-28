@@ -53,6 +53,14 @@ class FormADcpGeometry:
     rank: int
     q_heads: int
     kv_heads: int
+    #: #239 S3c: what a worker needs to join A/T/Q/M without a layer of its
+    #: own -- the head width of its [T, 0, D] slices, the top-k width the host
+    #: shares (config: indexer_budget + indexer_compress_ratio - 1) and the
+    #: layer's softmax scale. 0 = not known (the S3b tests build the geometry
+    #: without a model config).
+    head_dim: int = 0
+    topk_width: int = 0
+    scaling: float = 0.0
 
     def _host_only(self, n: int) -> list:
         return [int(n) if r == self.host_rank else 0 for r in range(self.world)]
@@ -75,7 +83,14 @@ class FormADcpGeometry:
 
 
 def form_a_dcp_geometry(
-    q_heads: int, kv_heads: int, dcp_size: int, dcp_rank: int
+    q_heads: int,
+    kv_heads: int,
+    dcp_size: int,
+    dcp_rank: int,
+    *,
+    head_dim: int = 0,
+    topk_width: int = 0,
+    scaling: float = 0.0,
 ) -> Optional[FormADcpGeometry]:
     """The geometry when THIS process runs Form A with DCP over the group,
     else None (every classic boot, and Form A without a token cut)."""
@@ -95,6 +110,66 @@ def form_a_dcp_geometry(
         rank=int(dcp_rank),
         q_heads=int(q_heads),
         kv_heads=int(kv_heads),
+        head_dim=int(head_dim),
+        topk_width=int(topk_width),
+        scaling=float(scaling),
+    )
+
+
+def form_a_dcp_of(attn_backend) -> Optional[FormADcpGeometry]:
+    """The Form A DCP geometry this rank's attention runs under: the QSA
+    full-attention backend (direct on a worker, inside the hybrid GDN wrapper
+    on the host) or the Form A worker backend (None by class). Any other
+    backend has no Form A DCP branch at all, so it answers None -- by its
+    type, not by a missing attribute."""
+    from sglang.srt.form_a_construction import FormAWorkerAttnBackend
+    from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QwenSparseAttnBackend,
+    )
+
+    backend = resolve_qsa_sparse_backend(attn_backend)
+    if isinstance(backend, (QwenSparseAttnBackend, FormAWorkerAttnBackend)):
+        return backend.form_a_dcp
+    return None
+
+
+def qsa_topk_width(hf_text_config) -> int:
+    """The width of the QSA top-k the indexer hands the attention: the token
+    budget plus the partial trailing block (qsa/kernel.py
+    expand_qsa_block_indices, ``final_topk``). A pure config fact, so every
+    rank knows it without a collective."""
+    return int(hf_text_config.indexer_budget) + int(hf_text_config.indexer_compress_ratio) - 1
+
+
+def form_a_attends(forward_batch) -> bool:
+    """#239 S3c: does this forward's full-attention layer run T, Q, M after A?
+
+    Rank-uniform by construction -- the forward mode and the prefix lengths
+    are the same batch on every rank -- and it is the host backend's own
+    branching, restated: decode and target verify take the rows path
+    (``forward_decode`` / ``_forward_paged_attention`` under DCP), an extend
+    takes it only when some request has a prefix (``_forward_extend_impl``:
+    without one the host attends locally over its own k/v and stops after A).
+    A draft extend never reaches a worker (the MTP draft is the host's solo);
+    reaching it here is a routing bug, refused by name."""
+    mode = forward_batch.forward_mode
+    if mode.is_decode() or mode.is_target_verify():
+        return True
+    if mode.is_draft_extend_v2():
+        raise ValueError(
+            "#239 S3c: a draft-extend forward reached a Form A worker's attention "
+            "step. The MTP draft is the host's alone (solo placement); a worker "
+            "joining its collectives would hang the group."
+        )
+    if mode.is_extend():
+        return any(
+            int(s) - int(e) > 0
+            for s, e in zip(forward_batch.seq_lens_cpu, forward_batch.extend_seq_lens_cpu)
+        )
+    raise ValueError(
+        f"#239 S3c: forward mode {mode!r} has no Form A attention step (decode, "
+        "target verify and extend do)."
     )
 
 
@@ -130,6 +205,12 @@ def share_topk(
     if geo.is_host:
         if topk is None:
             raise ValueError("#239 S3b: the Form A host has no top-k to share")
+        if geo.topk_width and int(topk.shape[-1]) != geo.topk_width:
+            raise ValueError(
+                f"#239 S3c: the host's top-k is {int(topk.shape[-1])} wide, the "
+                f"workers receive {geo.topk_width} (qsa_topk_width); the gather "
+                "would mix shapes across ranks."
+            )
         x = topk.to(torch.int32).reshape(int(rows), 1, int(width)).contiguous()
     else:
         x = torch.empty((int(rows), 0, int(width)), dtype=torch.int32, device=device)
