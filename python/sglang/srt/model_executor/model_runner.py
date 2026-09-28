@@ -5520,6 +5520,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_tokens = int(input_ids.shape[0])
         if num_tokens == 0:
             return ModelRunnerOutput(logits_output=None, can_run_graph=False)
+        # #239 M1s: this eager entry bypasses the eager runner's metadata init
+        from sglang.srt.form_a_dcp_wiring import prepare_form_a_worker_eager_forward
+
+        prepare_form_a_worker_eager_forward(self.attn_backend, forward_batch)
         self.run_form_a_worker_route(forward_batch, num_tokens)
         return ModelRunnerOutput(logits_output=None, can_run_graph=False)
 
