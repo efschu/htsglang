@@ -12339,6 +12339,40 @@ class Scheduler(
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
 
+    def _weg2_note_lost_anchors(self) -> None:
+        """ANCHOR-LOST: the Mamba anchors this flush's reset drops (device
+        only, no host copy -- a write-through the pin budget or the arena
+        claim refused, '#1421 BACKUP-REFUSED why=mamba_pin|mamba_claim').
+        Kept in ``_weg2_anchors_lost`` until the sleep leg's answer carries
+        them to the front, which then stops crediting presence at those
+        depths (weg2/front.py ``SpanLRU.retract_lost_anchors``)."""
+        probe = getattr(self.tree_cache, "weg2_unbacked_anchors", None)
+        if probe is None:
+            return
+        try:
+            lost = probe()
+        except Exception as exc:  # noqa: BLE001 - an instrument never blocks a flush
+            logger.warning("WEG2-ANCHOR-LOST probe raised: %s: %s", type(exc).__name__, exc)
+            return
+        if not lost:
+            return
+        ledger = getattr(self, "_weg2_anchors_lost", None)
+        if ledger is None:
+            ledger = self._weg2_anchors_lost = []
+        ledger.extend(int(d) for d, _rid in lost)
+        logger.warning(
+            "WEG2-ANCHOR-LOST at=flush n=%d depths=%s rids=%s (device Mamba anchors without "
+            "a host copy; the reset drops them and the front retracts presence credit at "
+            "these depths)",
+            len(lost), [d for d, _ in lost][:16], [r for _, r in lost][:16],
+        )
+
+    def weg2_take_anchors_lost(self) -> List[int]:
+        """The depths noted since the last sleep answer, cleared on read."""
+        lost = sorted(set(getattr(self, "_weg2_anchors_lost", None) or ()))
+        self._weg2_anchors_lost = []
+        return lost
+
     def get_num_allocatable_reqs(self, running_bs, slot_held: int = 0):
         # #287: the floating admission limit joins the existing bounds as one
         # more min(). Without --max-running-requests-ceiling the limiter holds
@@ -19360,6 +19394,7 @@ class Scheduler(
             # blockers -- x169: hicache_backup(5) on PP1/PP2 in the same
             # second, D's store read short by 11776 tokens.  Join them first.
             self._weg2_join_store_writes_before_reset()
+            self._weg2_note_lost_anchors()
             self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()

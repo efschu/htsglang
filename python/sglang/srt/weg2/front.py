@@ -60,7 +60,7 @@ import subprocess
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 from aiohttp import (
     ClientConnectionError,
@@ -603,6 +603,55 @@ MIB = 1024 * 1024
 #: the single bookkeeping of the fact, and its value changing is what a launch
 #: check is allowed to key on.
 FLIP_LEG_FORM = "interleave"
+
+
+def anchors_lost(body: str) -> List[int]:
+    """ANCHOR-LOST: the Mamba-anchor depths D's sleep flush dropped, from
+    the release leg's answer (``anchors_lost``, weight_updater / io_struct).
+    [] when the answer carries none or is not this tree's JSON."""
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(payload, dict):
+        return []
+    out = []
+    for d in payload.get("anchors_lost") or ():
+        try:
+            if int(d) > 0:
+                out.append(int(d))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(out))
+
+
+def retract_lost_anchors(spans: Any, depths: Sequence[int]) -> List[str]:
+    """ANCHOR-LOST: drop every presence entry whose credit stood on an
+    anchor D's sleep dropped -- its #59 depth cap (or, without a cap, its
+    measured ``cached_tokens``) is one of ``depths``. The KV of that prefix
+    comes back from the store after the wake, the anchor does not, and a
+    hybrid model resumes at an anchor only: kept, the entry routes the next
+    turn SHORT onto D, whose X-gate then refuses the whole prompt (bridge
+    f833 19:51:43 weg2-16-54: front price 2349, D's extent 38291, W31 ->
+    W50 reroute after a 17-s wait for a D seat). Works on :class:`SpanLRU`
+    and ``front_tokens.TokenSpans`` alike (``entries`` + ``depth_caps``).
+    Returns the retracted keys."""
+    lost = {int(d) for d in depths or () if int(d) > 0}
+    if not lost or spans is None:
+        return []
+    entries = getattr(spans, "entries", None)
+    caps = getattr(spans, "depth_caps", None)
+    if entries is None or caps is None:
+        return []
+    gone = []
+    for key, entry in list(entries.items()):
+        cap = caps.get(key)
+        ct = int(entry[1]) if len(entry) > 1 else 0
+        if (cap is not None and int(cap) in lost) or (cap is None and ct in lost):
+            entries.pop(key, None)
+            caps.pop(key, None)
+            gone.append(key)
+    return gone
 
 
 def completed_tags(body: str) -> Tuple[List[str], Dict[str, List[float]], str]:
@@ -5236,6 +5285,19 @@ class Front:
         logger.info("WEG2 X-EXACT-TOKENS rid=%s group=%s tokens_front=%d tokens_group=%d match=%d",
                     rid, group, got[1], int(prompt_tokens), int(int(prompt_tokens) == got[1]))
 
+    def _retract_lost_anchors(self, depths: Sequence[int]) -> None:
+        """ANCHOR-LOST: D slept and its flush dropped these anchors; no
+        presence entry may credit them any more (both span stores)."""
+        if not depths:
+            return
+        gone = retract_lost_anchors(self.spans, depths)
+        gone_t = retract_lost_anchors(getattr(self, "tspans", None), depths)
+        logger.info(
+            "WEG2 PRESENCE-ANCHOR-LOST depths=%s retracted=%d token_spans=%d (D's sleep flush "
+            "dropped these Mamba anchors; their KV presence is no credit)",
+            list(depths)[:16], len(gone), len(gone_t),
+        )
+
     def _note_resumable_depth(self, rid: str, pt: int, ct: int, held: bool,
                               depth: Optional[int]) -> None:
         """#59: one line when D's ``weg2_resumable_depth`` caps the credit
@@ -8983,6 +9045,8 @@ class Front:
         legs_wall_ms = (time.perf_counter() - t_gather0) * 1000
         s_done, s_per_tag, s_crit = completed_tags(s_body)
         w_done, w_per_tag, w_crit = completed_tags(w_body)
+        if src == "D":
+            self._retract_lost_anchors(anchors_lost(s_body))
         sleep_ms += s_ms
         wake_ms += w_ms
         if s_code != 200 or w_code != 200:

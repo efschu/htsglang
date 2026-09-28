@@ -155,7 +155,10 @@ def _merge_memory_occupation_reports(results) -> Optional[Dict[str, Any]]:
     """
     per_tag: Dict[str, List[float]] = {}
     crit: List[str] = []
+    lost: set = set()
     for r in results or ():
+        for d in getattr(r, "anchors_lost", None) or ():
+            lost.add(int(d))
         rep = getattr(r, "per_tag", None)
         if isinstance(rep, dict):
             for tag, pair in rep.items():
@@ -168,9 +171,12 @@ def _merge_memory_occupation_reports(results) -> Optional[Dict[str, Any]]:
         note = getattr(r, "critical_path", None)
         if note:
             crit.append(str(note))
-    if not per_tag and not crit:
+    if not per_tag and not crit and not lost:
         return None
-    return {"per_tag": per_tag, "critical_path": "; ".join(crit)}
+    out = {"per_tag": per_tag, "critical_path": "; ".join(crit)}
+    if lost:
+        out["anchors_lost"] = sorted(lost)  # ANCHOR-LOST, union over engines
+    return out
 
 
 class TokenizerControlMixin:
