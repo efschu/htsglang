@@ -633,6 +633,10 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
+#: H108: tree attribute, rid -> key source ("handoff" / "own") of the #950
+#: presence probe the scheduler asked for that rid; printed on #915 REFUSED.
+PRESENCE_SRC_ATTR = "_h108_presence_src"
+
 #: 27B line, 2026-09-24 (operator order after weg2xsn420): group P gives an
 #: INNER mamba anchor's arena reference back once its chain moved past it
 #: (UnifiedRadixCache._weg2_release_inner_anchor) and holds the END anchors one
@@ -6969,10 +6973,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         rate, and the acceptance expects 0 of them on a sized boot.
         """
         t = self._prefetch_line_terms(need)
+        # H108: the key source of this rank's #950 presence probe (handoff /
+        # own), "-" when the rank was eligible without asking.
+        _keys = (getattr(self, PRESENCE_SRC_ATTR, None) or {}).get(str(req_id), "-")
         logger.warning(
             "#915 PREFETCH REFUSED reason=%s rid=%s need=%d available=%d "
             "threshold=%d occupied=%d limit=%d pool_id=%d epoch=%d phase=%s "
-            "generation=%d",
+            "generation=%d keys=%s",
             reason,
             str(req_id)[:8],
             t["need"],
@@ -6984,6 +6991,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             t["epoch"],
             t["phase"],
             t["generation"],
+            _keys,
         )
 
     def _log_prefetch_truncated(

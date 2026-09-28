@@ -1394,6 +1394,87 @@ def _weg2_prefetch_span_start(sched, req, matched_len: int) -> int:
     return int(anchor)
 
 
+_PRESENCE_PROBE_N = [0]
+
+
+def _weg2_presence_keys(sched, req, matched_len: int, n_tokens: int):
+    """H108: P's hand-off keys (#1442) for the span the #950 presence probe
+    asks about, and their source -- ``(keys, "handoff")`` or ``(None, "own")``.
+
+    The same resolution the registration below the probe uses
+    (``resolve_chain`` + ``keys_for_span``), so the probe and the fetch key
+    the same pages. A missing hand-off file is retried on every call and
+    never cached (xsn331: the first registration on D can race P's write)."""
+    rid = getattr(req, "rid", None)
+    if not (isinstance(rid, str) and rid.startswith("weg2-")) or n_tokens <= 0:
+        return None, "own"
+    try:
+        from sglang.srt.weg2 import handoff as _ho
+        from sglang.srt.weg2.handoff_keys import keys_for_span, resolve_chain
+
+        span = keys_for_span(
+            resolve_chain(req, _ho.read),
+            int(matched_len),
+            int(n_tokens),
+            int(getattr(sched, "page_size", 1) or 1),
+        )
+    except Exception as exc:  # noqa: BLE001 -- the hand-off is a shortcut, never a gate
+        logger.info("H108 PRESENCE-KEYS n/a rid=%s (%s: %s)", rid, type(exc).__name__, exc)
+        return None, "own"
+    return (span, "handoff") if span else (None, "own")
+
+
+def _weg2_store_presence(
+    sched, req, probe, tokens, last_hash, prefix_keys, matched_len: int, generation: int
+) -> bool:
+    """H108 (rc12z25 D 16:56:02, weg2-72-124 W16 4317 > 4096): the #950
+    presence verdict, asked with the keys the fetch reads with.
+
+    The probe used to hash its own chain from ``last_hash``. It runs only when
+    ``last_host_node`` is not backuped -- on D that is a D-own node, whose
+    hash is the tree's bigram convention -- so the chain met none of P's
+    plain-convention keys: 0 with P's pages and end anchor in the store, TP0
+    entered the #580 vote with nothing (`#915 ... vote_negative ... need=0`,
+    `[#915 prefetch-gate] anchor=` +1 on TP0 only) and the group recomputed
+    the P leg's tail on D. All 7 short after-P legs of rc12z25 had this shape.
+
+    Cached per (generation, span, hand-off coverage): a hand-off record that
+    lands after a negative verdict changes the key and is asked again."""
+    keys, src = _weg2_presence_keys(sched, req, matched_len, len(tokens))
+    key = (int(generation), int(matched_len), len(tokens), len(keys) if keys else 0)
+    cached = getattr(req, "_pp_store_presence_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    if keys:
+        pages = probe(tokens, last_hash, prefix_keys, page_keys=keys)
+    else:
+        pages = probe(tokens, last_hash, prefix_keys)
+    present = bool(pages)
+    req._pp_store_presence_cache = (key, present)
+    tree = getattr(sched, "tree_cache", None)
+    if tree is not None:
+        from sglang.srt.mem_cache.unified_radix_cache import PRESENCE_SRC_ATTR
+
+        srcs = getattr(tree, PRESENCE_SRC_ATTR, None)
+        if srcs is None:
+            srcs = {}
+            setattr(tree, PRESENCE_SRC_ATTR, srcs)
+        srcs[str(getattr(req, "rid", ""))] = src
+        while len(srcs) > 4096:
+            srcs.pop(next(iter(srcs)))
+    _PRESENCE_PROBE_N[0] += 1
+    n = _PRESENCE_PROBE_N[0]
+    if n <= 64 or n % 256 == 0 or (src == "handoff" and not present):
+        logger.info(
+            "H108 PRESENCE-PROBE rid=%s keys=%s covered=%d span_tokens=%d matched=%d "
+            "pages=%d present=%s (n=%d): the #950 verdict this rank carries into the "
+            "#580 vote, asked with the keys the fetch reads with",
+            str(getattr(req, "rid", "?"))[:16], src, len(keys) if keys else 0,
+            len(tokens), int(matched_len), int(pages or 0), present, n,
+        )
+    return present
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -7175,19 +7256,18 @@ class Scheduler(
                     current_generation as _current_generation,
                 )
 
-                _key = (
-                    int(_current_generation()),
+                # H108: asked with P's hand-off keys where they cover the
+                # span, and re-asked when that coverage changes.
+                store_present = _weg2_store_presence(
+                    self,
+                    req,
+                    _probe,
+                    _new_input_tokens,
+                    _last_hash,
+                    _prefix_keys,
                     _matched_len,
-                    len(_new_input_tokens),
+                    _current_generation(),
                 )
-                _cached = getattr(req, "_pp_store_presence_cache", None)
-                if _cached is not None and _cached[0] == _key:
-                    store_present = _cached[1]
-                else:
-                    store_present = bool(
-                        _probe(_new_input_tokens, _last_hash, _prefix_keys)
-                    )
-                    req._pp_store_presence_cache = (_key, store_present)
             # The verdict enters the EXISTING #580 vote as this rank's local
             # term. Never a new early return, never a new collective -- a
             # rank-local answer that skipped the vote is the #580 desync.
