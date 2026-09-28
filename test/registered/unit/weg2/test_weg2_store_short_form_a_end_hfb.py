@@ -25,10 +25,16 @@ depth. A record without an END vote (every other boot) is untouched.
 
 import inspect
 import logging
+import os
+import sys
 
 import pytest
 
-import test_weg2_store_short_fallback_rc12y as rc12y
+# weg2/ is a package: a bare sibling import only resolves when pytest runs
+# from this directory. Put the directory on the path (the pattern of
+# test_weg2_settle_writer_veto_p4b_0928) so the repo root collects it too.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import test_weg2_store_short_fallback_rc12y as rc12y  # noqa: E402  (the rc12y harness)
 
 from sglang.srt.managers import scheduler as sched_mod
 from sglang.srt.mem_cache import unified_radix_cache as urc
