@@ -82,6 +82,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     _POOL_SLOT_COUNT,
     _REAP_PACKED_LEN,
     _REAP_SLOT_ANCHOR,
+    _REAP_SLOT_NO_WRITER,
     _REAP_SLOT_HIT_TOKENS,
     _REAP_SLOT_PROBED,
     _REAP_SLOT_TAIL_VOTE,
@@ -493,7 +494,9 @@ class N1TheReapAnnotationIsRankUniform(CustomTestCase):
         self.assertEqual(_REAP_SLOT_TAIL_VOTE, 3 + _POOL_SLOT_COUNT)
         # #257 (b): the deepest reachable anchor of a short read, one after the vote
         self.assertEqual(_REAP_SLOT_ANCHOR, 4 + _POOL_SLOT_COUNT)
-        self.assertEqual(_REAP_PACKED_LEN, 5 + _POOL_SLOT_COUNT)
+        # P4b-cap: the group's no-writer vote, one after the anchor
+        self.assertEqual(_REAP_SLOT_NO_WRITER, 5 + _POOL_SLOT_COUNT)
+        self.assertEqual(_REAP_PACKED_LEN, 6 + _POOL_SLOT_COUNT)
 
     def test_the_real_reap_records_the_groups_reading_not_the_local_stamp(self):
         """Drive the real `check_prefetch_progress` with a stamped LOCAL

@@ -292,8 +292,81 @@ _REAP_SLOT_TAIL_VOTE = 3 + _POOL_SLOT_COUNT
 #: (``_ANCHOR_ABSTAIN`` = this rank has no say: a full read, no mamba
 #: component, no store). The reduced slot cuts the claim to that anchor.
 _REAP_SLOT_ANCHOR = 4 + _POOL_SLOT_COUNT
-_REAP_PACKED_LEN = 5 + _POOL_SLOT_COUNT
+#: P4b-cap (28.09.): 1 = this rank sees NO writer that could still deliver pages
+#: of this read past what the store holds (group D, read registered and
+#: terminated awake with no leg between; no hand-off chain, no hand-off record,
+#: no E-tail part -- `_weg2_read_no_writer_local`). The MIN makes it the
+#: group's answer: one rank that still sees a writer keeps the old deliverable.
+_REAP_SLOT_NO_WRITER = 5 + _POOL_SLOT_COUNT
+_REAP_PACKED_LEN = 6 + _POOL_SLOT_COUNT
 _ANCHOR_ABSTAIN = 2**31 - 1
+
+
+def _weg2_read_no_writer_local(req_id, operation) -> int:
+    """P4b-cap: this rank's vote for the no-writer slot (1 = nothing can still
+    add pages to this read, and its probe saw the store in that final state).
+
+    All of: group D; this rank's scheduler was NOT dormant when the read was
+    registered and no leg began since (``l3_write_behind.awake_epoch()``
+    unchanged -- D not dormant = past the wake's late site, where P has
+    released its KV and its sleep drained the write-through, so the probe
+    answered a store P no longer adds to; a read registered in the flip or
+    during D's sleep probed a store in flux and keeps the old deliverable);
+    the shared hand-off directory exists (else nothing of P is visible:
+    unknown); and for this rid no hand-off chain (the scheduler's registry),
+    no hand-off record, no E-tail part and nothing under write
+    (``settle_writer.classify`` == none: P's tail publish threads can outlive
+    its sleep). Anything else, and any failure, votes 0 = the old deliverable."""
+    if (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() != "D":
+        return 0
+    rid = str(req_id or "")
+    if not rid:
+        return 0
+    try:
+        from sglang.srt.managers import cache_controller as _cc
+        from sglang.srt.mem_cache import l3_write_behind as _wb
+        from sglang.srt.weg2 import handoff as _ho
+        from sglang.srt.weg2 import settle_writer as _sw
+
+        epoch = _wb.awake_epoch()
+        if epoch is None or epoch != getattr(operation, "_weg2_awake_epoch", None):
+            return 0
+        if not _ho._dir():
+            return 0
+        tail_state, tail_tmp = _sw._tail_facts(rid)
+        state = _sw.classify(
+            chain=rid in _cc.WEG2_HANDOFF_PAGE_KEYS,
+            handoff_file=_ho.read(rid) is not None,
+            tail_state=tail_state,
+            tail_tmp=tail_tmp,
+        )
+        return int(state == _sw.NONE)
+    except Exception:  # noqa: BLE001 - unknown = the old deliverable, never a guess
+        return 0
+
+
+def _weg2_cap_deliverable(req_id, deliverable: int, no_writer: bool, hit_tokens: int,
+                          synced: int, page: int) -> int:
+    """P4b-cap: the deliverable of a read no writer can extend: capped at the
+    deepest prefix that EXISTS for its keys (the store's answer at the probe, or
+    what the read delivered, floored to pages). One named line per capped read."""
+    if not no_writer:
+        return int(deliverable)
+    known = (max(int(hit_tokens), int(synced)) // max(1, int(page))) * max(1, int(page))
+    capped = min(int(deliverable), known)
+    if capped < int(deliverable):
+        n = _WEG2_CAP_N[0] = _WEG2_CAP_N[0] + 1
+        if n <= 64 or n % 256 == 0:
+            logger.info(
+                "#1324c DELIVERABLE-CAP rid=%s asked=%d known=%d (store_hit=%d delivered=%d) "
+                "-> deliverable=%d (n=%d): no writer can deliver pages past what the store "
+                "holds for these keys (no hand-off chain, no hand-off record, no tail part), "
+                "so the read is complete as it stands",
+                str(req_id)[:16], int(deliverable), known, int(hit_tokens), int(synced), capped, n)
+    return capped
+
+
+_WEG2_CAP_N = [0]
 
 
 class UnifiedTreeNode:
@@ -6659,6 +6732,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         #
         # Retire, do not reap. See `_retire_ongoing_prefetch`.
         self._retire_ongoing_prefetch(req_id)
+        # P4b-cap: whether this read's probe can see a final store -- the
+        # awake epoch at registration, compared again at termination.
+        try:
+            from sglang.srt.mem_cache import l3_write_behind as _l3wb
+
+            operation._weg2_awake_epoch = _l3wb.awake_epoch()
+        except Exception:  # noqa: BLE001 - None = the old deliverable
+            operation._weg2_awake_epoch = None
         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
             last_host_node,
             prefetch_key,
@@ -7049,6 +7130,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         packed_list = [completed_tokens] + [0] * _POOL_SLOT_COUNT
         packed_list += [_probed_local, _hit_tokens_local, tail_adopt.local_vote(req_id)]
         packed_list += [self._anchor_reach_local(completed_tokens, hash_value)]
+        packed_list += [_weg2_read_no_writer_local(req_id, operation)]
         assert len(packed_list) == _REAP_PACKED_LEN
         if self.tp_world_size > 1:
             # Reduce full completed tokens together with the sidecar pools that
@@ -7407,6 +7489,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # phantom one-token shortfall on an otherwise complete read.
         _page = max(1, int(self.page_size))
         _deliverable = (len(prefetch_key) // _page) * _page
+        # P4b-cap (28.09., NF rc12z17-s0 weg2-2-17 / 4-36 / 5-37): the pages
+        # past the prefix a follow-up turn shares with the previous one (common
+        # 40569 / 45270 / 47001) were never computed by anyone, yet they counted
+        # as "not yet written" -- #1324 STORE READ INCOMPLETE, the settle hold,
+        # the 2 s re-reads, the dashboard's "L3 unvollst. Lesungen". With NO
+        # writer (group-agreed, slot above) the deliverable is what exists: the
+        # deepest prefix the store answered for these keys (the probe's hit,
+        # group MIN) or what the read delivered, whichever is deeper.
+        _deliverable = _weg2_cap_deliverable(
+            req_id, _deliverable, int(packed[_REAP_SLOT_NO_WRITER].item()) > 0,
+            int(_hit_tokens), int(min_completed_tokens), _page)
         self.prefetch_loaded_tokens_by_reqid[req_id] = PrefetchOutcome(
             loaded_from_storage,
             # #1203 (A1): NOT NECESSARILY THE REDUCED VALUE. The N1 comment

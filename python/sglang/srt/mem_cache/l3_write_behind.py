@@ -64,6 +64,20 @@ def quiet_reason() -> Optional[str]:
     return None
 
 
+def awake_epoch() -> Optional[int]:
+    """P4b-cap (28.09.): the leg counter while this rank's scheduler is known
+    and NOT dormant (W25 clears ``weg2_dormant`` at the wake's late site, after
+    the peer group released its KV); None while dormant or before any leg
+    named the scheduler. Two equal answers bracket a span in which no leg
+    began and the rank was awake at both ends -- the store read registered at
+    the first answer probed a store the sleeping group no longer writes."""
+    ref = _state["sched"]
+    sched = ref() if ref is not None else None
+    if sched is None or bool(getattr(sched, "weg2_dormant", False)):
+        return None
+    return int(_state["entered"])
+
+
 def quiet() -> bool:
     return quiet_reason() is not None
 
