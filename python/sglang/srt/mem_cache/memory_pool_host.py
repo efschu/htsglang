@@ -1630,6 +1630,31 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def set_from_flat_data_pages(self, indices, data_pages) -> None:
+        """#1416g: the pages of one read in one indexed copy per layer (the
+        per-page setter is layer_num small copies per page -- the QSA index
+        sidecar of a 90k prefix is 1409 pages)."""
+        n = len(indices)
+        if n == 0:
+            return
+        if isinstance(data_pages, torch.Tensor):
+            flat = data_pages.reshape(n, -1)
+        else:
+            flat = torch.stack([p.reshape(-1) for p in data_pages])
+        data = flat.view(self.dtype).reshape(n, self.layer_num, self.item_bytes)
+        rows = torch.tensor(
+            [int(i) // self.slot_page_size for i in indices], dtype=torch.int64
+        )
+        if self.layout == "layer_first":
+            for i in range(self.layer_num):
+                self.kv_buffer[i].index_copy_(0, rows, data[:, i])
+        elif self.layout == "page_first":
+            self.kv_buffer.index_copy_(0, rows, data)
+        elif self.layout == "page_first_direct":
+            self.kv_buffer.index_copy_(0, rows, data.unsqueeze(2))
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
     def get_page_buffer_meta(self, indices):
         ptr_list = []
         rows = self._to_page_indices(indices).tolist()
