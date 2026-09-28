@@ -86,6 +86,7 @@ from sglang.srt.weg2 import (
 )
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import rank_state as rank_state_mod
+from sglang.srt.weg2 import state_file as state_file_mod
 # WEG2-FORM (24.09.): the boot's form axes -- ONE resolver, ONE line, ONE env.
 from sglang.srt.weg2 import form as weg2_form
 
@@ -5357,6 +5358,10 @@ def wait_ready(port: int, pid: int, deadline_s: float, log: Log, name: str, proc
         if code == 200:
             dt = time.time() - t0
             log(f"R1 READY group={name} port={port} after {dt:.1f} s")
+            if name in ("P", "D"):
+                boot_state_write(log, fields={f"groups.{name}.state": "ready",
+                                              f"groups.{name}.ready_ts": round(time.time(), 3)},
+                                 event=("group_ready", {"group": name, "port": port, "after_s": round(dt, 1)}))
             return dt
         last = f"{code} {body[:80]!r}"
         time.sleep(3)
@@ -11619,6 +11624,66 @@ def d_kv_worker_ranks(extra_d: str) -> List[int]:
         return []
 
 
+_STATE_MISSING_LOGGED: set = set()
+
+
+def boot_state_dir() -> Optional[str]:
+    """IPC §2.2: the boot's state/<boot_id>/ directory (WEG2_STATE_DIR, mounted by
+    the arm), or None -- then the launcher writes no state and the rank records
+    stay next to the group logs."""
+    return envs.WEG2_STATE_DIR.get() or None
+
+
+def boot_state_write(log: Log, state: Optional[str] = None, *, cause: Optional[dict] = None,
+                     fields: Optional[dict] = None, event: Optional[Tuple[str, dict]] = None) -> None:
+    """Write the launcher's own fields of state.json through the ONE shared writer
+    (weg2/state_file.py, writer=launcher: groups.*, invariants.*, loading/ready,
+    dead with origin launcher|rank). The host writer creates the file; while it
+    does not exist the launcher says so once and writes nothing. A write the
+    order forbids (another writer is already further) is a no-op there, never an
+    error here."""
+    d = boot_state_dir()
+    if not d:
+        return
+    if not os.path.exists(os.path.join(d, "state.json")):
+        if d not in _STATE_MISSING_LOGGED:
+            _STATE_MISSING_LOGGED.add(d)
+            log(f"IPC STATE: {d}/state.json missing -- the host writer creates it; the launcher writes no state")
+        return
+    try:
+        if state is not None or cause is not None or fields:
+            state_file_mod.transition(d, state, cause=cause, fields=fields, writer="launcher")
+        if event is not None:
+            state_file_mod.add_event(d, event[0], event[1], writer="launcher")
+    except OSError as e:
+        log(f"IPC STATE WRITE FAILED ({type(e).__name__}): {e}")
+
+
+_CAUSE_RE = re.compile(r"\b(W\d+[a-z]?)\s+(Weg2[A-Za-z0-9]+)")
+
+
+def refusal_cause(e: BaseException) -> dict:
+    """A launcher refusal as §2.2 cause: code = W-number + name (never the bare
+    W-number, 27B requirement 6), origin launcher, the full text."""
+    msg = str(e)
+    m = _CAUSE_RE.search(msg)
+    if m:
+        code, name = f"{m.group(1)}_{m.group(2)}", m.group(2)
+    else:
+        name = type(e).__name__
+        code = f"{_w_code_of(e)}_{name}"
+    return state_file_mod.make_cause(code, "launcher", msg, name=name, exception_type=type(e).__name__)
+
+
+def rank_state_dir_for(spec: GroupSpec) -> str:
+    """Where group ``spec``'s ranks write their RankState: rankstate/<G> inside the
+    boot's state directory (§2.2), else next to the group log (Phase 1)."""
+    d = boot_state_dir()
+    if d:
+        return os.path.join(d, "rankstate", spec.name)
+    return rank_state_mod.rank_state_dir_for_log(spec.log)
+
+
 def canonical_state_gate(spec: GroupSpec, expected: int, log: Log) -> None:
     """IPC Phase 1: the launcher half of W7/W10 decided on the ranks'
     RankState records (weg2/rank_state.py), not on counted log lines.
@@ -11628,7 +11693,7 @@ def canonical_state_gate(spec: GroupSpec, expected: int, log: Log) -> None:
     KV-WORKER-WINDOW' and the count knew only the older worker line. The log
     count still runs beside the records and a disagreement is REPORTED
     ('IPC MISMATCH'), but it no longer decides."""
-    state_dir = rank_state_mod.rank_state_dir_for_log(spec.log)
+    state_dir = rank_state_dir_for(spec)
     states, bad = rank_state_mod.read_group_states(state_dir)
     verdict = rank_state_mod.grade_canonical(states, expected, group=spec.name)
     for b in bad:
@@ -11640,6 +11705,14 @@ def canonical_state_gate(spec: GroupSpec, expected: int, log: Log) -> None:
         log(f"IPC MISMATCH W7/W10 group {spec.name}: log count kv x{n_kv} blob x{n_blob} "
             f"(worker lines x{n_worker}) vs RankState kv x{verdict.n_kv} blob x{verdict.n_blob} "
             f"-- the records decide, the log count is reported only")
+    boot_state_write(log, fields={
+        f"groups.{spec.name}.ranks": [json.loads(s.to_json()) for s in states],
+        f"groups.{spec.name}.rankstate_dir": state_dir,
+        f"invariants.W7_W10_CanonicalWindow.{spec.name}": {
+            "verdict": "pass" if verdict.ok else "refuse",
+            "per_rank": [{"rank": k, "state": v} for k, v in sorted(verdict.by_rank.items())],
+            "why": verdict.line()},
+    })
     if not verdict.ok:
         raise Weg2LaunchRefused(
             f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half, RankState): "
@@ -11674,7 +11747,7 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
     # IPC Phase 1: the ranks write their RankState next to the group log;
     # records of an earlier launch into the same log path are removed first,
     # so a record the launcher grades is always THIS launch's.
-    _rs_dir = rank_state_mod.rank_state_dir_for_log(spec.log)
+    _rs_dir = rank_state_dir_for(spec)
     _rs_old = rank_state_mod.clear_rank_state_dir(_rs_dir)
     spec.env[rank_state_mod.RANK_STATE_ENV] = _rs_dir
     log(f"group {spec.name} rank state -> {_rs_dir}" + (f" ({_rs_old} record(s) of an earlier launch removed)" if _rs_old else ""))
@@ -11687,6 +11760,9 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
     spec.pid = p.pid
     spec.proc = p
     log(f"group {spec.name} pid {p.pid} (session id = pid) log {spec.log}")
+    if spec.name in ("P", "D"):
+        boot_state_write(log, "loading", fields={f"groups.{spec.name}": {
+            "state": "loading", "pids": [p.pid], "ready_ts": None, "rankstate_dir": _rs_dir, "ranks": []}})
 
 
 def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, tag: str, name: str, dry: bool) -> int:
@@ -24127,10 +24203,16 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
     refusal before any spawn still takes the fast exit below unchanged,
     because ``_ACTIVE_BOOT_STATE.pids`` is still empty at that point.
     """
+    def _say(line: str) -> None:
+        print(f"[{_now()}] {line}", flush=True)
+
     try:
-        return main(argv)
+        rc = main(argv)
     except REFUSALS as e:
         print(f"[{_now()}] WEG2-LAUNCH REFUSED: {e}", flush=True)
+        # IPC §2.2: the refusal is the boot's cause, written where the arm reads
+        # it -- not only printed for a later grep.
+        boot_state_write(_say, "dead", cause=refusal_cause(e))
         # #1275 fix 2 (3): the KILLER path drops the key too. weg2sb5 refused
         # here and left its key file behind -- a boot that never served, whose
         # secret outlived it. Both exits, or the guarantee is only half true.
@@ -24162,6 +24244,14 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
             flush=True,
         )
         return 2
+    except Exception as e:
+        # Not a refusal: a launcher crash. Named in state.json, then re-raised
+        # unchanged (traceback and exit code stay what they were).
+        boot_state_write(_say, "dead", cause=state_file_mod.make_cause(
+            f"LAUNCHER_EXCEPTION_{type(e).__name__}", "launcher", repr(e), exception_type=type(e).__name__))
+        raise
+    boot_state_write(_say, event=("launcher_done", {"rc": rc}))
+    return rc
 
 
 if __name__ == "__main__":
