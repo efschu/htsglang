@@ -4321,6 +4321,15 @@ class Front:
         self.counters["d_parked"] += len(known) + len(late)
         self.counters["d_parked_in_flight"] += len(late)
         still = self._flip_ledger(D)
+        if still:
+            # PARK-SETTLE (28.09.): a park that leaves D work running is PARTIAL --
+            # the D->P drain then waits for those decodes (27.09. 10:24:34: 171 s for
+            # the request that fired the park). Named, so a boot shows it by count.
+            self.counters["park_partial"] += 1
+            logger.warning(
+                "WEG2 PARK-PARTIAL epoch=%d still_running=%s late_hold=%s -- the drain waits for "
+                "these decodes; D's park should have taken them (settle, late hand-off)",
+                self.epoch, still[:8], phase_policy.park_late_hold(code, text))
         logger.warning(
             "WEG2 PARK-RUNNING epoch=%d reason=%s status=%d parked=%d rids=%s unknown_to_front=%s "
             "in_flight_held=%s still_running=%s rpc_s=%.2f -- parked requests stay in flight "
