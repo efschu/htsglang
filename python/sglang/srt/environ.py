@@ -1192,6 +1192,12 @@ class Envs:
     # they are read (weight_name_needed: PLE shards the checkpoint backend
     # only maps, experts and layers other ranks own).
     SGLANG_WEIGHT_LOADER_PREAD = EnvBool(False)
+    # NF-Bootzeit H2 (28.09.): group D does not read the expert rows group P
+    # already published in the shared expert store (sentinel), and does not
+    # rewrite them -- only its residents and the rows P did not write come from
+    # the checkpoint (layers/moe/store_adopt.py). Active only on SGLANG_WEG2_GROUP=D
+    # with the store and a nested expert map; False = read everything (pre-H2).
+    SGLANG_WEG2_ENABLE_D_STORE_ADOPT = EnvBool(True)
     # Weight loader: how many threads consume the EXPERT shards a model's
     # load_weights hands to FusedMoE.weight_loader (Ladezeit 2, 23.09.).
     # Measured fnFL2x26 with SGLANG_LOAD_PROFILE: 50 % of a 107 s rank load

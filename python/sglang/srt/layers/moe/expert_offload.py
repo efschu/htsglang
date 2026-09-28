@@ -7519,12 +7519,29 @@ def presplit_expert_offload_after_repack(
                     )
             except ImportError:
                 pass
-            written = _es.write_rows(
-                spill, t, list(plan.spill_ids), s_lo, s_pad, rows=s_index
+            # NF-Bootzeit H2: the rows this D rank vetoed at load were never
+            # read -- the store holds P's bytes for them (sentinel). Leave
+            # them out of the write; the reader index stays complete.
+            from sglang.srt.layers.moe import store_adopt as _sa
+
+            _rows_w, _n_adopt = _sa.filter_store_rows(
+                layer, attr, dict(s_index), plan.resident_ids, s_lo, s_pad
             )
+            if _n_adopt:
+                logger.info(
+                    "%s layer=%s attr=%s: %d store rows taken from P (not read, "
+                    "not rewritten), %d written",
+                    _sa.MARKER, s_key, attr, _n_adopt, len(_rows_w),
+                )
+            written = _es.write_rows(
+                spill, t, list(plan.spill_ids), s_lo, s_pad, rows=_rows_w
+            )
+            # H2: the adopted rows are valid store rows too (P's bytes); the
+            # sentinel keeps meaning "these rows hold real weights".
+            _adopted = [int(v) for k, v in s_index.items() if k not in _rows_w]
             _es.mark_rows_written(
                 s_dir, s_key, attr, int(getattr(layer, "moe_tp_rank", 0) or 0),
-                written.values(),
+                list(written.values()) + _adopted,
             )
         else:
             spill = pinned_exact_empty((len(plan.spill_ids),) + tuple(t.shape[1:]), t.dtype)
