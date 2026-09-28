@@ -2357,21 +2357,30 @@ class HiCacheFile(HiCacheStorage):
         # The shared arena first: a page another rank completed there is
         # served from RAM, no file I/O and no per-process staging.
         if self._arena_dir():
+            # #1416g: one arena call per width for the whole batch (it was one
+            # per page -- the extra pools' index pages pay it per page).
             still = []
+            by_arena: dict = {}
             for entry in plan:
-                i, key, suffixed, path, window, target = entry
-                arena = self._arena_for(int(window.total_bytes))
+                arena = self._arena_for(int(entry[4].total_bytes))
                 if arena is None:
                     still.append(entry)
                     continue
-                st = arena.read([suffixed], [int(window.total_bytes)], [tuple(window.extents)],
-                                [int(target.data_ptr())])[0]
-                if st == 0:
-                    if self.metadata_cache is not None:
-                        self.metadata_cache.add(suffixed)
-                    results[i] = target
-                else:
-                    still.append(entry)
+                by_arena.setdefault(id(arena), (arena, []))[1].append(entry)
+            for arena, entries in by_arena.values():
+                sts = arena.read(
+                    [e[2] for e in entries], [int(e[4].total_bytes) for e in entries],
+                    [tuple(e[4].extents) for e in entries], [int(e[5].data_ptr()) for e in entries],
+                )
+                for entry, st in zip(entries, sts):
+                    i, key, suffixed, path, window, target = entry
+                    if st == 0:
+                        if self.metadata_cache is not None:
+                            self.metadata_cache.add(suffixed)
+                        results[i] = target
+                    else:
+                        still.append(entry)
+            still.sort(key=lambda e: e[0])
             plan = still
             if not plan:
                 return results
@@ -4135,8 +4144,85 @@ class HiCacheFile(HiCacheStorage):
                 if ok and is_read:
                     self._qsa_sidecar_trace("read", transfer.name, key, host_pool, idx)
                 return ok
+            if is_read and getattr(op_fn, "__func__", None) is HiCacheFile._read_page:
+                batched = self._batch_read_extra(
+                    transfer.name, keys, host_pool, host_indices, page_size, pre, _is_ph, _is_ar
+                )
+                if batched is not None:
+                    results[transfer.name] = batched
+                    continue
             results[transfer.name] = [_one(i, key) for i, key in enumerate(keys)]
         return results
+
+    def _extra_page_spec(self, pool_name, host_pool):
+        """(numel, dtype) of one flat page of this extra pool -- probed once
+        (``get_dummy_flat_data_page`` allocates a pinned page per call)."""
+        specs = getattr(self, "_extra_page_specs", None)
+        if specs is None:
+            specs = self._extra_page_specs = {}
+        spec = specs.get(pool_name)
+        if spec is None:
+            probe = host_pool.get_dummy_flat_data_page()
+            spec = specs[pool_name] = (int(probe.numel()), probe.dtype)
+        return spec
+
+    def _batch_read_extra(self, pool_name, keys, host_pool, host_indices, page_size, pre, is_ph, is_ar):
+        """#1416g: the extra pools' pages of one prefetch in ONE ``batch_get``.
+
+        NF z30e (ca2a9706ec, boot ...stvsyncbar1dauer09282117): PP0's store
+        read is ``kv`` 1-3 ms (the arena addresses the KV pages in place) and
+        ``extra`` 35-695 ms, linear in pages (~0.22 ms/page: 1275 pages 301 ms,
+        256 pages 55 ms) -- the QSA index sidecar went through ``_read_page``
+        one page at a time (window lookup, arena read of one stem, borrowed
+        buffer, per-layer setter). ``batch_get`` serves the same pages with
+        one arena call per width and one ``pageio.read_pages`` for the rest
+        (#1402, the KV route since xsn134), into one staging block, then one
+        ``set_from_flat_data_pages``. Same stores, same bytes, same misses;
+        returns None when there is nothing to batch (the per-key path runs).
+        """
+        out: List[Optional[bool]] = [None] * len(keys)
+        todo = []
+        for i, key in enumerate(keys):
+            if pre is not None and pre[i] is not None:
+                out[i] = pre[i]
+                continue
+            idx = int(host_indices[i * page_size])
+            if (callable(is_ph) and is_ph(idx)) or (callable(is_ar) and is_ar(idx)):
+                out[i] = False  # a placeholder / arena id is never a copy target
+                continue
+            todo.append((i, key, idx))
+        if len(todo) < 2:
+            return None
+        numel, dtype = self._extra_page_spec(pool_name, host_pool)
+        # zeros, as the per-key path's fresh dummy page: an abstaining
+        # window (#239 F14) returns its target unread
+        stage = torch.zeros((len(todo), numel), dtype=dtype)
+        got = self.batch_get(
+            [self._log_key(pool_name, key) for _, key, _ in todo],
+            [stage[j] for j in range(len(todo))],
+        )
+        ok_rows, ok_idx = [], []
+        for j, ((i, key, idx), page) in enumerate(zip(todo, got)):
+            out[i] = page is not None
+            if page is not None:
+                ok_rows.append(j)
+                ok_idx.append(idx)
+        if ok_idx:
+            pages = stage if len(ok_rows) == len(todo) else stage[torch.tensor(ok_rows, dtype=torch.int64)]
+            host_pool.set_from_flat_data_pages(ok_idx, pages)
+            for (i, key, idx), page in zip(todo, got):
+                if page is not None:
+                    self._qsa_sidecar_trace("read", pool_name, key, host_pool, idx)
+        n = getattr(self, "_1416g_n", 0) + 1
+        self._1416g_n = n
+        if n <= 8 or n % 256 == 0:
+            logger.info(
+                "#1416g EXTRA-BATCH-READ pool=%s pages=%d read=%d miss=%d pre=%d (n=%d): one "
+                "batch_get + one set_from_flat_data_pages instead of a per-page read",
+                str(pool_name), len(keys), len(ok_idx), len(todo) - len(ok_idx),
+                sum(1 for v in (pre or ()) if v is not None), n,
+            )
+        return [bool(v) for v in out]
 
     def _qsa_sidecar_trace(self, side: str, pool_name, key: str, host_pool, idx: int) -> None:
         """fnFL2x56 (Task #106): the byte content of the index page, per layer
