@@ -641,6 +641,38 @@ def capture_floors(form: StageForm, cells: Dict[Tuple[int, int], StageCell],
     return tuple(out)
 
 
+#: S3g floor: the refusal of a rank that carries stage rows but staged no KV
+STAGE_ROWS_NO_KV_CODE = "W-STAGE-ROWS-NO-KV"
+
+
+def check_stage_rows_have_kv(form: Optional[StageForm],
+                             cells: Dict[Tuple[int, int], StageCell],
+                             per_rank: Optional[bool] = None) -> None:
+    """#239 S3g floor, before the capture counts anything: a rank the launcher
+    gave its own stage rows (``form.rows_on`` > 0) must have a KV tensor born
+    trimmed to S0 -- the cells are its stages. Without cells no capture floor
+    exists, the captured step counts the stage rows OFF while the planner
+    priced them ON in S0 (rc12z30b 28.09. 20:09:07, TP2: C 45 x 2 waves < 92
+    ids, 'Step ids exceed the LRU rows plus the staging rows'). Named here
+    instead of that anonymous death inside the capture. Only S3g's per-rank
+    rows (SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK) are a rank's OWN rows; without
+    them ``rows_on`` is the attention host's (#251c), which a Form A worker
+    reads but never carries (its seat rows are 0)."""
+    if per_rank is None:
+        from sglang.srt.environ import envs
+
+        per_rank = bool(_ints(envs.SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK.get()))
+    if form is None or not per_rank or int(form.rows_on) <= 0 or cells:
+        return
+    raise Weg2DSeatVramRefused(
+        "%s %s: this rank carries %d stage rows (SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK / "
+        "_ROWS) but no KV tensor was born trimmed to S0 -- nothing here grows at a stage, "
+        "and the captured decode steps would count those rows OFF while the planner priced "
+        "them ON in S0. A Form A worker holds KV only under the token cut (its FA share; "
+        "never QSA keys) -- the launcher must give it no stage rows otherwise"
+        % (LINE_MARK, STAGE_ROWS_NO_KV_CODE, int(form.rows_on)))
+
+
 #: #251c: the model runner whose pools the capture floor is computed over
 #: (``note_capture_context``, after the KV pool exists, before the capture),
 #: and the floors, computed once at the first captured MoE step.
@@ -670,6 +702,7 @@ def _capture_floor_table() -> Tuple[int, ...]:
         ctl = SeatVram.from_runtime(cap=max(1, cap),
                                     req_to_token_pool=getattr(runner, "req_to_token_pool", None),
                                     model=getattr(runner, "model", None))
+        check_stage_rows_have_kv(ctl.form, ctl.cells)
         if ctl.form is not None and ctl.cells:
             floors = capture_floors(ctl.form, ctl.cells, ctl.cap)
             logger.info("%s CAPTURE-FLOOR rows ON per bs %s (stages %s, max_by_seats %s): the "
@@ -1281,6 +1314,9 @@ class SeatVram:
                 extra_max=x_max, stage_tokens=self.form.tokens,
                 boot_rows_on=self.form.rows_on, granule=self.granule)
             check_form_against_cells(self.form, self.cells, self.cap)
+        # F5 (27B 28.09.): a rank with its own stage rows but no KV cells is
+        # refused at the wake too, not only at the capture
+        check_stage_rows_have_kv(self.form, self.cells)
         ks = {0, int(self.form.rows_on) if self.form is not None else 0}
         ks.update(int(r.extra_rows) for r in self.rows)
         for c in self.cells.values():

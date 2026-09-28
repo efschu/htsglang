@@ -2622,6 +2622,86 @@ def kv_stage_wave_cap(ns, er, tab, max_by: Sequence[int], env: Mapping[str, str]
                                           list(tab.capture_waves(max_by)), list(tab.waves))]
 
 
+def rank_wave_floor(demand: Sequence[int], scratch_after: Sequence[int],
+                    capture_on: Sequence[int], waves: int) -> Tuple[List[str], List[int]]:
+    """#239 S3g floor, ONE formula for the planner and the rank: the captured
+    step of the cap's seats routes D_r = min(ids, E - R) ids over
+    C_r = LRU + staging (the scratch AFTER the stage rows moved into the seat
+    rows) + capture_on[r] (the seat/stage rows the capture counts ON: the
+    rank's capture floor where it has KV cells, #251c; 0 where it has none --
+    'seat rows ... OFF until a D phase funds them'), in at most ``waves``
+    waves: D_r <= waves x C_r on EVERY rank. Returns (one line per rank with
+    its air ``waves x C - D``, the ranks that break it)."""
+    lines, bad = [], []
+    for r, (d, c0, on) in enumerate(zip(demand, scratch_after, capture_on)):
+        c = int(c0) + int(on)
+        air = int(waves) * c - int(d)
+        lines.append("rang%d D %d <= %d x (%d + %d) = %d, Luft %d%s"
+                     % (r, int(d), int(waves), int(c0), int(on), int(waves) * c, air,
+                        "" if air >= 0 else " -- BRICHT"))
+        if air < 0:
+            bad.append(r)
+    return lines, bad
+
+
+def kv_stage_wave_floor(group, rows, fits, max_by: Sequence[int], waves_cap: int,
+                        head: str) -> List[str]:
+    """#239 S3g floor (rc12z30b 28.09. 20:09:07): ``rank_wave_floor`` over the
+    form the launcher writes. D_r from the seat table at the cap (ids of the
+    cap's seats, E - R of the rank); the scratch after the move (a KV rank
+    gives its stage rows to its seat rows); capture_on[r] = a KV rank's
+    capture floor at the cap's batch (rows + seat extra - the stage rows of
+    the highest stage the cap may take, as ``d_seat_vram.capture_floors``),
+    0 on every rank without a stage table (no KV, no cells, no floor). A
+    rank given stage rows the plan stages no KV for is refused as well: its
+    runtime would build no cells and count them OFF. Refuses by name (W170)
+    before any rank is launched; the lines name each rank's air."""
+    last = rows[-1]
+    n = len(last.scratch_given)
+    staged = {int(t.host_rank): t for t in group.tables}
+    fit_by = {int(f.rank): f for f in fits}
+    cap = len(rows)
+    demand, after, on = [], [], []
+    for r in range(n):
+        c = int(last.scratch_given[r])
+        f = fit_by.get(r)
+        E = int(f.local_experts) if f is not None else 0
+        demand.append(min(int(last.ids_per_step), max(E - (int(last.max_rows[r]) - c), 0)))
+        t = staged.get(r)
+        if t is None:
+            after.append(c)
+            on.append(0)
+            continue
+        after.append(c - int(t.rows))
+        j = min(int(max_by[cap - 1]), len(t.tokens) - 1)
+        on.append(int(t.capacity[cap - 1][j]) - (c - int(t.rows)))
+    lines, bad = rank_wave_floor(demand, after, on, int(waves_cap))
+    # the smaller batches of a KV rank: its floor can sit lower (a stage the
+    # cap never takes) -- the table's per-batch waves, the same floor rule
+    bad += [r for r, t in sorted(staged.items())
+            if r not in bad and max(t.capture_waves(max_by)) > int(waves_cap)]
+    host = int(group.host.host_rank)
+    orphan = [r for r in staged if r != host and er_trim_cell(fit_by.get(r), host) <= 0]
+    if bad or orphan:
+        raise Weg2DKvStageWavesRefused(
+            "W170 Weg2DKvStageWavesRefused: Wellenboden je D-Rang gebrochen %s%s -- %s; "
+            "keine Stufenform geschrieben"
+            % (["rang%d" % r for r in bad],
+               " / Stufenzeilen ohne KV auf %s" % (["rang%d" % r for r in orphan],)
+               if orphan else "", "; ".join(lines)))
+    return ["%s: WELLENBODEN JE RANG (#239 S3g-Boden, D <= W x (LRU+Staging+Capture-Boden)) %s"
+            % (head, "; ".join(lines))]
+
+
+def er_trim_cell(fit, host_rank: int) -> int:
+    """The planner's trim cell of a fit (0 without one)."""
+    if fit is None:
+        return 0
+    from sglang.srt.planner import expert_residency as er
+
+    return int(er.kv_stage_trim_cell(fit, host_rank))
+
+
 def operator_kv_stage_max(raw: Optional[str], cap: int, stages: int) -> Optional[Tuple[int, ...]]:
     """The operator's highest stage per seat count, or None when --env-d does
     not name it. Refuses by name what the table cannot take."""
@@ -2723,6 +2803,12 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
         # read the row either; it is written so the capture line names it)
         max_by = tuple(len(tab.tokens) - 1 for _ in tab.max_by_seats)
     waves_to, waves_lines = kv_stage_wave_cap(ns, er, group, max_by, env, head)
+    # the cap the captured steps run with: the launcher's raise, else the
+    # H95 cap the seat table was solved at (the env the launcher derives)
+    waves_lines = waves_lines + kv_stage_wave_floor(
+        group, rows, fits, max_by,
+        int(waves_to) if waves_to is not None
+        else max(er.pool_overflow_waves(env), int(rows[-1].waves)), head)
     n = len(rows[-1].scratch_given)
     scratch = _rank_vec(env.get("SGLANG_MOE_SCRATCH_SLOTS"), n)
     seat_raw = env.get("SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
