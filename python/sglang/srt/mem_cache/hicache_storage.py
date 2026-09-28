@@ -383,6 +383,13 @@ class PrefetchOutcome(int):
         are equal by construction, so this choice costs nothing and closes the
         one path where the ranks could have disagreed.
         """
+        # HFB-b: an END-vote read (Form A) carries the group's absolute ENDs;
+        # the span-relative pair can disagree per rank when a span base is not
+        # page-aligned, the ENDs cannot. Absent on every other read.
+        _dend = getattr(self, "deliverable_end", None)
+        _send = getattr(self, "synced_end", None)
+        if _dend is not None and _send is not None:
+            return int(_dend) > 0 and int(_send) < int(_dend)
         return int(self.deliverable) > 0 and int(self.synced) < int(self.deliverable)
 
     @property

@@ -14078,7 +14078,9 @@ class Scheduler(
         _synced_end = getattr(outcome, "synced_end", None)
         if _synced_end is not None:
             # both ends absolute: the span END is the group's too (#580 END vote)
-            deliverable += int(_synced_end) - int(outcome.synced)
+            _dend = getattr(outcome, "deliverable_end", None)
+            deliverable = (int(_dend) if _dend is not None
+                           else deliverable + int(_synced_end) - int(outcome.synced))
             delivered = int(_synced_end)
         # The witness term, written BEFORE the arm reads it: a re-read that
         # gains nothing leaves this value unchanged and the standstill count
