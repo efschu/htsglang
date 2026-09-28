@@ -8690,6 +8690,18 @@ class SchedulerWeightUpdaterManager:
         # verdict over that group first and raises W120 on every rank alike.
         self._weg2_drain_hicache_before_sleep()
         _weg2_ph("drain_hicache")
+        if self._weg2_group_name() == "D":
+            # RW: the LRU owners of every pool layer, BEFORE any pause (the
+            # tables live under a paused tag); ids only, no expert bytes.
+            try:
+                from sglang.srt.layers.moe.expert_offload import resume_warm as _rw
+
+                _m = getattr(getattr(getattr(self, "tp_worker", None), "model_runner", None), "model", None)
+                if _m is not None:
+                    _rw().snapshot([_m])
+            except Exception as _exc:  # noqa: BLE001 -- the warm is a hint, never a sleep refusal
+                logger.warning("RW RESUME-WARM snapshot skipped: %s", _exc)
+            _weg2_ph("rw_snapshot")
 
         assert (
             self._weg2_sleep_idle()
@@ -9253,6 +9265,8 @@ class SchedulerWeightUpdaterManager:
 
         if replay is not None:
             return replay
+        if self.scheduler is not None:
+            self.scheduler._weg2_resume_t0 = time.perf_counter()  # RW instrument: the leg's start
         # KRIT3 (weg2/resume_via_p.py): a resume is a wake -- P ran in between;
         # RESUME-VIA-P counts its attempts per wake, not per refusal.
         try:
@@ -9453,6 +9467,7 @@ class SchedulerWeightUpdaterManager:
                 # fnFL2x36: the standstill pass bound gets a grace of one
                 # stall window from here (scheduler._weg2_note_prefetch_progress)
                 scheduler._weg2_last_wake_t = time.perf_counter()
+                scheduler._rw_first_token_open = True  # RW: one WAKE-FIRST-TOKEN line per wake
                 logger.info(
                     "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
                 )
@@ -10113,6 +10128,15 @@ class SchedulerWeightUpdaterManager:
                     len(_scratch), self._weg2_scratch_residue[0],
                     self._weg2_scratch_residue[1], _scratch[0],
                 )
+            if self._weg2_group_name() == "D":
+                # RW: the warm is ARMED here and RUNS after the legs, in the
+                # scheduler's idle settle passes -- nothing is copied in the leg.
+                try:
+                    from sglang.srt.layers.moe.expert_offload import resume_warm as _rw
+
+                    _rw().arm(_early)
+                except Exception as _exc:  # noqa: BLE001
+                    logger.warning("RW RESUME-WARM arm skipped: %s", _exc)
             if _rl:
                 _pf_rows = _pf_join.rows if _pf_join is not None else 0
                 _deferred = deferred_rows_fill().rows_pending()
