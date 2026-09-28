@@ -260,15 +260,24 @@ SEAMS: Dict[str, Seam] = {
         Seam(
             "F5",
             "the DCP LSE merge and head gather with a zero-head rank",
-            "layers/dcp/comm.py:196-199 (assertion on head_counts[rank]), "
-            ":222 cp_local_head_bounds",
-            wired=False,
-            note="Under Form A the merge should not run at all (the host "
-            "holds every head); the refusal exists so that a configuration "
-            "that still reaches it says so instead of asserting.",
+            "layers/dcp/comm.py:168 cp_all_gather_heads_uneven (a zero-head "
+            "rank hands [T, 0, D]), :322 cp_local_head_bounds, the merges at "
+            ":460/:526; layers/attention/qsa/form_a_dcp.py",
+            wired=True,
+            note="#239 S3b. Without a token cut the merge does not run (the "
+            "host holds every head and the whole KV, dcp 1). With one it "
+            "does, and it is built: the head counts are [H, 0, 0], a worker "
+            "takes part with a [T, 0, D] slice -- the 27B weightless worker's "
+            "shape, which the uneven gathers and merges already carry -- and "
+            "the two things only the host has travel as two more uneven "
+            "gathers: the new k/v (A, counts [kv, 0, 0]) and the top-k "
+            "(T, counts [1, 0, 0]). Per full-attention layer every rank "
+            "issues A [, T, Q, M] in that order (qsa/form_a_dcp.py).",
             anchors=(
-                ("layers/dcp/comm.py", 197, "assert counts[rank] == local_heads"),
-                ("layers/dcp/comm.py", 222, "def cp_local_head_bounds"),
+                ("layers/dcp/comm.py", 168, "def cp_all_gather_heads_uneven"),
+                ("layers/dcp/comm.py", 322, "def cp_local_head_bounds"),
+                ("layers/attention/qsa/form_a_dcp.py", 1,
+                 "def worker_attention_step"),
             ),
         ),
         Seam(
@@ -426,7 +435,7 @@ SEAMS: Dict[str, Seam] = {
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F5", "F6")
+UNWIRED_ORDER: Tuple[str, ...] = ("F6",)
 
 
 def require_wired(seam_id: str, context: str = "") -> None:

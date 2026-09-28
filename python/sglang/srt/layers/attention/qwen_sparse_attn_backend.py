@@ -466,6 +466,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.uneven_dcp_weighted = False
         self.cp_S = self.cp_lo = self.cp_hi = self.cp_ratio = 0
         self.dcp_kv_replicated_heads = True
+        # #239 S3b: the Form A geometry when the token cut spreads the KV over
+        # the group (None on every other path, byte-identical).
+        self.form_a_dcp = None
         self.dcp_model_config = model_config
         self.is_draft_worker = bool(getattr(runner, "is_draft_worker", False))
         if runner is None or model_config is None:
@@ -496,6 +499,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             # Same exclusion as the dense backends: the draft's pool keeps the
             # full token context, so DCP is off for this instance.
             return
+        if self._init_form_a_dcp(model_config, dcp_size, dcp_rank):
+            return
         self.dcp_size = dcp_size
         self.dcp_rank = dcp_rank
         self.uneven_dcp = bool(uneven_plan)
@@ -522,6 +527,54 @@ class QwenSparseAttnBackend(AttentionBackend):
             "weighted" if self.uneven_dcp_weighted else "even",
             f", cp_S={self.cp_S} [{self.cp_lo},{self.cp_hi})" if self.uneven_dcp_weighted else "",
         )
+
+    def _init_form_a_dcp(self, model_config, dcp_size: int, dcp_rank: int) -> bool:
+        """#239 S3b: Form A x the token cut. The host holds every q/kv head and
+        the indexer; every rank owns a token range of the full-attention KV.
+        The replicated-kv-heads refusal below does not apply: the pool holds
+        all kv heads on every rank because the HOST's k/v are shared (collective
+        A), not because every rank projects them. Returns True when it took
+        the instance (layers/attention/qsa/form_a_dcp.py)."""
+        from sglang.srt.distributed.utils import uneven_dcp_active
+        from sglang.srt.layers.attention.qsa.form_a_dcp import form_a_dcp_geometry
+        from sglang.srt.layers.dcp.owner import (
+            dcp_weighted_owner_bounds,
+            register_owner_bounds_consumer,
+        )
+
+        total_q = int(model_config.hf_text_config.num_attention_heads)
+        total_kv = int(model_config.get_total_num_kv_heads())
+        geo = form_a_dcp_geometry(total_q, total_kv, dcp_size, dcp_rank)
+        if geo is None:
+            return False
+        if not uneven_dcp_active(dcp_size):
+            raise ValueError(
+                "#239 S3b: Form A with DCP needs the planner's token vector "
+                "installed (weighted owner rule); none is active."
+            )
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
+        self.uneven_dcp = True
+        self.uneven_dcp_weighted = True
+        self.dcp_kv_replicated_heads = True
+        self.form_a_dcp = geo
+        self.cp_S, self.cp_lo, self.cp_hi, self.cp_ratio = dcp_weighted_owner_bounds(
+            dcp_size, dcp_rank
+        )
+        register_owner_bounds_consumer(self)
+        logger.info(
+            "[qsa-dcp] sparse attention on DCP rank %d/%d (weighted owner rule, "
+            "cp_S=%d [%d,%d), Form A %s: q heads %s, kv heads %s)",
+            dcp_rank,
+            dcp_size,
+            self.cp_S,
+            self.cp_lo,
+            self.cp_hi,
+            "host" if geo.is_host else "worker",
+            geo.q_counts,
+            geo.kv_counts,
+        )
+        return True
 
     def refresh_dcp_owner_bounds(self) -> None:
         """#297 cutover hook (the owner-bounds registry requires it of every
@@ -553,6 +606,19 @@ class QwenSparseAttnBackend(AttentionBackend):
         if self.dcp_size <= 1:
             self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
             return
+        geo = getattr(self, "form_a_dcp", None)
+        if geo is not None:
+            # #239 S3b collective A: the host's k/v reach every owner.
+            from sglang.srt.layers.attention.qsa.form_a_dcp import share_kv
+            from sglang.srt.runtime_context import get_parallel
+
+            rows = int(loc.shape[0])
+            k, v = share_kv(
+                k.reshape(rows, geo.kv_heads, -1),
+                v.reshape(rows, geo.kv_heads, -1),
+                get_parallel().dcp_group,
+                geo,
+            )
         if self.uneven_dcp_weighted:
             from sglang.srt.layers.dcp.owner import dcp_weighted_write_slots
 
@@ -607,6 +673,22 @@ class QwenSparseAttnBackend(AttentionBackend):
         prefix chunks) through the same launch (_qsa_rows_fused_route, H65)."""
         from sglang.srt.environ import envs
 
+        # getattr: the H65 wiring tests call this on a bare namespace
+        form_a = getattr(self, "form_a_dcp", None)
+        if form_a is not None:
+            # #239 S3b collective T: the indexer runs on the host only; every
+            # owner resolves its rows from the host's top-k.
+            from sglang.srt.layers.attention.qsa.form_a_dcp import share_topk
+            from sglang.srt.runtime_context import get_parallel
+
+            topk_indices = share_topk(
+                topk_indices,
+                int(topk_indices.shape[0]),
+                int(topk_indices.shape[1]),
+                get_parallel().dcp_group,
+                form_a,
+                topk_indices.device,
+            )
         eager = bool(envs.SGLANG_WEG2_QSA_ROWS_FUSED_EAGER.get())
         if _qsa_rows_fused_route(metadata, topk_indices, self.req_to_token, eager):
             from sglang.srt.layers.attention.qsa.rows_resolve import (
@@ -705,7 +787,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         from sglang.srt.runtime_context import get_parallel
 
         group = get_parallel().dcp_group
-        counts = self._dcp_group_q_head_counts(q.shape[1])
+        form_a = getattr(self, "form_a_dcp", None)
+        counts = (
+            form_a.q_counts
+            if form_a is not None
+            else self._dcp_group_q_head_counts(q.shape[1])
+        )
         q_all = cp_all_gather_heads_uneven(q.contiguous(), group, counts)
         if row_counts is None and _qsa_rows_compact_on():
             # Task #42: loop only over the rows this rank owns (see
