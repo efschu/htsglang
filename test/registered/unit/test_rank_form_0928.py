@@ -73,8 +73,9 @@ def test_lane_spec_is_the_eagle_chain_only():
     a = rf.resolve_rank_form([1, 0, 0])
     rf.check_form_spec(a, "NEXTN")
     rf.check_form_spec(a, None)
+    rf.check_form_spec(a, "DFLASH")  # G-A1: the DFLASH chain runs on the lane
     with pytest.raises(rf.RankFormLaneSpec):
-        rf.check_form_spec(a, "DFLASH")
+        rf.check_form_spec(a, "DSPARK")
     rf.check_form_spec(rf.resolve_rank_form([1, 1, 1]), "DFLASH")  # C: not the lane's business
 
 

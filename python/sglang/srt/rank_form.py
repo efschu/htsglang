@@ -234,17 +234,18 @@ def check_form_vision(form: RankForm, *, vision: bool, head_lease_mib: int = 0) 
 
 def check_form_spec(form: RankForm, algorithm: Optional[str]) -> None:
     """Form A runs on the weightless-KV lane, whose worker dispatch mirrors the
-    EAGLE-family chain only (server_args._reject_unsupported_weightless_spec).
-    DFLASH (the 27B's DFlash2) has its own round shape the workers do not
-    mirror yet (gap G-A1): refused here by name, before the serve chain would."""
+    EAGLE-family chain and (G-A1) the DFLASH chain -- solo draft on the head,
+    one draft-block and one accept broadcast per round
+    (server_args._reject_unsupported_weightless_spec). Anything else is
+    refused here by name, before the serve chain would."""
     if form.backend != BACKEND_LANE or not algorithm:
         return
     a = str(algorithm).upper()
-    if a not in ("EAGLE", "EAGLE3", "NEXTN"):
+    if a not in ("EAGLE", "EAGLE3", "NEXTN", "DFLASH"):
         raise _refuse(
             RankFormLaneSpec,
             f"form A runs on the weightless-KV lane, which mirrors the EAGLE/EAGLE3/NEXTN "
-            f"chain only; got --speculative-algorithm {algorithm} (DFLASH on the lane is gap G-A1)")
+            f"and DFLASH chains only; got --speculative-algorithm {algorithm}")
 
 
 # --------------------------------------------------------------------------

@@ -7872,7 +7872,24 @@ class ServerArgs:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         algo = SpeculativeAlgorithm.from_string(self.speculative_algorithm)
-        if algo.is_frozen_kv_mtp() or not algo.is_eagle():
+        if algo.is_dflash():
+            # G-A1 (rank form 28.09.): DFLASH as a CHAIN on the lane. The draft
+            # runs solo on the head, TP=1-locally (its embedding, lm_head and
+            # selector gathers are collective-free on a TP=1-built head); the
+            # workers join exactly (a) the draft-block broadcast, (b) the
+            # verify's per-layer DCP dispatch (TARGET_VERIFY is an extend over
+            # bs*block rows, causal) and (c) ONE accept broadcast from the head
+            # (DFlashWorkerV2._lane_accept_broadcast). A TREE verify
+            # (--speculative-dflash-tree-verify) masks draft->draft with a
+            # stride the owner-sharded prefix no longer describes: refused.
+            if getattr(self, "speculative_dflash_tree_verify", False):
+                raise ValueError(
+                    "--weightless-kv-fastlane supports DFLASH as a chain only; "
+                    "--speculative-dflash-tree-verify is refused (a tree mask's "
+                    "row stride is the GLOBAL prefix, which the lane's "
+                    "owner-sharded prefix no longer describes). W184 Weg2RankFormLaneSpec"
+                )
+        elif algo.is_frozen_kv_mtp() or not algo.is_eagle():
             # FROZEN_KV_MTP is is_eagle() but reads the TARGET's KV pool in
             # place; on the lane that pool is token-sharded across the workers,
             # so no single rank holds what the frozen draft needs. DFLASH /
