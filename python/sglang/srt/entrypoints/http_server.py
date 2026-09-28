@@ -1425,15 +1425,20 @@ async def weg2_park_running(obj: Annotated[Weg2ParkRunningReqInput, Body()], req
         ret = await _global_state.tokenizer_manager.weg2_park_running(obj)
     except Exception as e:
         return _create_error_response(e)
+    body = {
+        "success": ret.success,
+        "parked": list(ret.parked),
+        "held": list(ret.held),
+        "late_hold": bool(getattr(ret, "late_hold", False)),
+        "epoch": ret.epoch,
+        "message": ret.message,
+    }
+    # #59b: {rid: depth} each parked request resumes from; absent = old price.
+    resumable = getattr(ret, "weg2_resumable_depth", None)
+    if resumable:
+        body["weg2_resumable_depth"] = dict(resumable)
     return ORJSONResponse(
-        {
-            "success": ret.success,
-            "parked": list(ret.parked),
-            "held": list(ret.held),
-            "late_hold": bool(getattr(ret, "late_hold", False)),
-            "epoch": ret.epoch,
-            "message": ret.message,
-        },
+        body,
         status_code=200 if ret.success else HTTPStatus.CONFLICT,
     )
 

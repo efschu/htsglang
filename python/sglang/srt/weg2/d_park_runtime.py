@@ -31,6 +31,7 @@ import os
 import time
 from typing import Optional
 
+from sglang.srt.managers import weg2_resumable_depth
 from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats
 
 logger = logging.getLogger(__name__)
@@ -207,6 +208,13 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     setattr(sched, LATE_HOLD_ATTR, now if late_hold else None)
     rids = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is not None]
     held = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is None]
+    # #59b: the depth each parked request resumes from, after the retraction
+    # above retained its span (every rank parks the same list).
+    resumable = weg2_resumable_depth.park_depths(
+        getattr(sched, "tree_cache", None),
+        [r for r in sched.weg2_d_parked if d_seats.park_site(r) is not None],
+        getattr(sched, "ps", None),
+    )
     logger.info(
         "WEG2-D-PARK park_running epoch=%d reason=%s: %d running retracted (span retained, "
         "forced host write-through), parked=%s queued-behind=%s late_hold=%s -- the sleep "
@@ -219,6 +227,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     return Weg2ParkRunningReqOutput(
         success=True, parked=rids, held=held, epoch=epoch, late_hold=late_hold,
         message="parked %d, queued behind them %d" % (len(rids), len(held)),
+        weg2_resumable_depth=resumable,
     )
 
 

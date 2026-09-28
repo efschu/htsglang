@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 import types
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +106,54 @@ def _tp_min(values: Sequence[int]) -> List[int]:
     return [int(v) for v in t.tolist()]
 
 
+def group_depths(
+    tree_cache: Any,
+    reqs: Sequence[Any],
+    ps: Any,
+    *,
+    reduce_min: Optional[Callable[[Sequence[int]], List[int]]] = None,
+) -> Tuple[Optional[str], Optional[List[int]]]:
+    """``(mode, depths)`` for ``reqs`` -- the same list on every rank of the
+    group. ``depths`` is None where this rank names nothing (a Form A worker,
+    a group that cannot make the depth uniform). The MIN reduce runs only for
+    a non-empty list, so every rank enters it together or not at all."""
+    if not reqs:
+        return None, None
+    mode = group_mode(ps)
+    if mode in (MODE_NONE, MODE_FOLLOW):
+        return mode, None
+    depths = [local_depth(tree_cache, r) for r in reqs]
+    if mode == MODE_MIN:
+        depths = (reduce_min or _tp_min)(depths)
+    return mode, [max(0, int(d)) for d in depths]
+
+
+def park_depths(
+    tree_cache: Any,
+    reqs: Sequence[Any],
+    ps: Any,
+    *,
+    reduce_min: Optional[Callable[[Sequence[int]], List[int]]] = None,
+) -> Dict[str, int]:
+    """#59b: ``{rid: depth}`` for the requests a flip park holds, after its
+    retraction retained their spans -- what the park answer
+    (``/weg2/park_running``, also the front's WAIT-BOUND park) names so the
+    front caps a parked request's presence credit as it does a finished one.
+    Empty where the group names nothing (the front keeps its old price)."""
+    if tree_cache is None or ps is None:
+        return {}
+    mode, depths = group_depths(tree_cache, reqs, ps, reduce_min=reduce_min)
+    if depths is None:
+        return {}
+    out = {str(getattr(r, "rid", "")): d for r, d in zip(reqs, depths)}
+    if int(getattr(ps, "attn_tp_rank", 0) or 0) == 0:
+        logger.info(
+            "#59b PARK-RESUMABLE mode=%s %s", mode,
+            " ".join("%s=%d" % (rid[:24], d) for rid, d in out.items()),
+        )
+    return out
+
+
 def stamp_finished(
     tree_cache: Any,
     reqs: Sequence[Any],
@@ -117,16 +165,10 @@ def stamp_finished(
     ``reqs`` -- the requests whose finishing output this pass streams, the
     same list on every rank (replicated scheduling; the caller's filter is
     ``finished() and not finished_output``). Returns the mode, None when there
-    was nothing to stamp. The MIN reduce runs only for a non-empty list, so
-    every rank of the group enters it together or not at all."""
-    if not reqs:
-        return None
-    mode = group_mode(ps)
-    if mode in (MODE_NONE, MODE_FOLLOW):
+    was nothing to stamp (see :func:`group_depths`)."""
+    mode, depths = group_depths(tree_cache, reqs, ps, reduce_min=reduce_min)
+    if depths is None:
         return mode
-    depths = [local_depth(tree_cache, r) for r in reqs]
-    if mode == MODE_MIN:
-        depths = (reduce_min or _tp_min)(depths)
     announce = int(getattr(ps, "attn_tp_rank", 0) or 0) == 0
     for req, depth in zip(reqs, depths):
         ts = getattr(req, "time_stats", None)
