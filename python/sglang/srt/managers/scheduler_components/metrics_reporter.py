@@ -516,6 +516,13 @@ class RankPrefillLog:
                     else:
                         slot_acc[0] += stat.total_ms
                         slot_acc[1] += stat.count
+        try:  # L1 (weg2/wake_cohort): the measured extend price bounds the post-wake cohort hold
+            from sglang.srt.weg2 import wake_cohort as _wc
+
+            if k == 1:
+                _wc.note_extend(new_tokens, gpu_s * 1000.0)
+        except Exception:  # noqa: BLE001 -- an instrument feed never breaks the line
+            pass
         line = (
             "Prefill rank batch, #new-token: %d, #cached-token: %d, "
             "#chunks: %d, gpu-ms: %.1f"

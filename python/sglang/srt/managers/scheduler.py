@@ -1346,6 +1346,28 @@ def _weg2_resume_first_token_note(sched, batch) -> bool:
         return False
 
 
+def _weg2_wake_cohort_note(sched, batch) -> bool:
+    """L1 instrument (weg2/wake_cohort.WakeLedger): one line per wake, when
+    every request of the wake's cohort is in a decode batch."""
+    ledger = getattr(sched, "_weg2_wake_ledger", None)
+    if ledger is None or not ledger.open:
+        return False
+    try:
+        mode = getattr(batch, "forward_mode", None)
+        if mode is None or not mode.is_decode():
+            return False
+        from sglang.srt.weg2 import wake_cohort as _wc
+
+        line = ledger.decode_seen([r.rid for r in batch.reqs], _wc.monotonic(), _wc.enabled())
+        if line:
+            logger.info(line)
+        return bool(line)
+    except Exception as exc:  # noqa: BLE001 -- an instrument never breaks a pass
+        ledger.open = False
+        logger.warning("WEG2-WAKE-COHORT n/a: %s", exc)
+        return False
+
+
 #: FA (28.09.): switch of the prefetch span's anchor start, default on; 0 = the
 #: span starts at ``len(prefix_indices) + host_hit_length`` as before.
 PREFETCH_FROM_ANCHOR_ENV = "SGLANG_WEG2_PREFETCH_FROM_ANCHOR"
@@ -3953,6 +3975,7 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
                 self._weg2_post_wake_pass_log(batch)  # Wake-Parallel item 2
                 _weg2_resume_first_token_note(self, batch)  # RW: one line per wake
+                _weg2_wake_cohort_note(self, batch)  # L1: wake -> last cohort member's first decode
             else:
                 batch_result = None
 
@@ -6405,7 +6428,34 @@ class Scheduler(
                            state == "complete" or lapsed or _no_writer
                            or _weg2_store_tail_settles(self, req)))
         _gmin = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
-        _agreed = _gmin([x[3] for x in _local])  # #1471e
+        # L1 (28.09.): the post-wake cohort (weg2/wake_cohort.py) -- a ready member whose own
+        # extend is the 1.5-2.2 s expert pass waits (<= 1 s) while a sibling read of this settle
+        # is still in flight. Its vote rides the SAME MIN as the release flags; asked only when
+        # the replicated settle holds >= 2 (a wake of one never waits).
+        from sglang.srt.weg2 import wake_cohort as _wc
+
+        _flags = [x[3] for x in _local]
+        _cohort_hold = False
+        if _wc.asks(settle):
+            _since = min(float(getattr(r, "_1471_since", now)) for r in settle)
+            _records = getattr(getattr(self, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None)
+            _hv = _wc.hold_vote([(x[0], x[1], x[3]) for x in _local], _since, now, records=_records)
+            _v = _gmin(_flags + [_hv])  # #1471e
+            _agreed, _cohort_hold = _v[:-1], bool(_v[-1]) and any(_v[:-1])
+        else:
+            _agreed = _gmin(_flags)  # #1471e
+        _ledger = getattr(self, "_weg2_wake_ledger", None)
+        if _ledger is not None:
+            _ledger.note_hold(now, _cohort_hold)
+        if _cohort_hold:
+            _n_ready = sum(1 for a in _agreed if a)
+            _agreed = [0] * len(_agreed)
+            if getattr(self, "_weg2_cohort_said", None) != getattr(self, "_weg2_wake_seq", None):
+                self._weg2_cohort_said = getattr(self, "_weg2_wake_seq", None)
+                logger.info("WEG2-WAKE-COHORT HOLD ready=%d parked=%d since_wake_ms=%.0f cap_ms=%.0f "
+                            "price_ms=%.0f (a sibling read is in flight; the ready members join its extend)",
+                            _n_ready, len(settle), (now - _since) * 1000.0, _wc.cap_s() * 1000.0,
+                            _wc.price_s() * 1000.0)
         for (req, state, lapsed, _r), ok in zip(_local, _agreed):
             if ok:
                 req._weg2_settled_wake = getattr(self, "_weg2_wake_seq", None)  # WT
@@ -6494,6 +6544,14 @@ class Scheduler(
                             str(getattr(_r, "rid", "?"))[:12], type(exc).__name__, exc)
                 _state = "complete"
             _states.append(_state)
+        try:  # L1 instrument: this wake's cohort, wake -> its last member's first decode
+            from sglang.srt.weg2 import wake_cohort as _wc
+
+            if getattr(self, "_weg2_wake_ledger", None) is None:
+                self._weg2_wake_ledger = _wc.WakeLedger()
+            self._weg2_wake_ledger.arm(self._weg2_wake_seq, [str(r.rid) for r in hold], _now)
+        except Exception:  # noqa: BLE001 -- an instrument never blocks the wake
+            pass
         _gmin = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
         # weg2rc2: a short read whose remainder fits in X is settled -- D
         # prefills the remainder (#1324 tail) instead of parking for 20 s.
@@ -16702,7 +16760,15 @@ class Scheduler(
             return None, running_batch
 
         can_run_set = set(can_run_list)
+        # L2 (28.09., NF rc12z26 18:06:05): a pass admitted 2 of 5 ready requests with
+        # `admit=-` -- the skip census was published only for EMPTY passes. A partial pass
+        # names its skips too, on its own field (the ADMIT lines keep their "-").
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        self._admission_partial_note = "admitted=%d left=%d %s" % (
+            len(can_run_list), len(self.waiting_queue),
+            ",".join(f"{k}={v}(first={_skip_first_rid[k][:16]})" for k, v in sorted(_skips.items()))
+            if _skips else "no_skip",
+        )
         _p_intake.settle_told(self, self.waiting_queue)  # H91a: admitted/aborted verdicts go
 
         # #791 PP ADMISSION UNIFORMITY: PP0 publishes this pass's admission
@@ -20535,7 +20601,7 @@ class Scheduler(
         logger.info(
             "WEG2-POST-WAKE-PASS n=%d mode=%s bs=%d gap_ms=%.0f schedule_ms=%.0f run_ms=%.0f "
             "prefetch_ms=%.0f proc_input_ms=%.0f admission_ms=%.0f init_new_ms=%.0f prepare_ms=%.0f ready_ms=%.0f "
-            "addreq=[%s] init_load_back_ms=%.0f/%d init_next_round=[%s] waiting=%d admit=%s "
+            "addreq=[%s] init_load_back_ms=%.0f/%d init_next_round=[%s] waiting=%d admit=%s admit_partial=%s "
             "(gap = wall since the previous pass; schedule = get_next_batch_to_run incl. the three "
             "prefill terms; run is the launch, the forward itself overlaps; admit = the admission's "
             "own gate / skip census of this pass, BA 28.09.)",
@@ -20545,7 +20611,9 @@ class Scheduler(
             _g[0], _g[1], _g[2], float(getattr(self, '_weg2_ready_ms', -1.0) or -1.0), _addreq, _lb_ms, _lb_n, _initr,
             len(getattr(self, "waiting_queue", None) or ()),
             str(getattr(self, "_admission_decline_note", None) or "-")[:240],
+            str(getattr(self, "_admission_partial_note", None) or "-")[:240],
         )
+        self._admission_partial_note = None
 
     def _weg2_arm_wake_round_census(self) -> None:
         """fnFL2 H23: the first pass after the wake arms DECODE-ROUND-COST
