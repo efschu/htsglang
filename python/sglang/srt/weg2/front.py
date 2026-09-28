@@ -1149,12 +1149,31 @@ class SpanLRU:
         old = self.entries.pop(key, None)
         ct = old[1] if old else 0
         pt = max(1, int(prompt_tokens or 0), old[2] if old else 0)
+        if old is None:
+            # #59 A (operator 28.09.): a NEW text in flight is credited at most
+            # to the anchor depth already known for its prefix before the leg;
+            # none known -> 0 until the finish sets D's real depth.
+            self.depth_caps[key] = self.known_prefix_depth(text, exclude=key)
         self.entries[key] = (text, ct, pt, int(held_epoch))
         # #59: an old entry's depth cap stays (it bounds that measured ct);
         # the finish's record_presence replaces it with D's new depth.
         while len(self.entries) > self.cap:
             old_key, _ = self.entries.popitem(last=False)
             self.depth_caps.pop(old_key, None)
+
+    def known_prefix_depth(self, text: str, exclude: Optional[str] = None) -> int:
+        """#59 A: the resumable depth already known for a prefix of ``text`` --
+        the ``depth_cap`` of the CAPPED entry with the longest common prefix,
+        bounded by that prefix (floor of its chars/3 tokens: a depth past the
+        shared part is not on this text's prefix). 0 = no depth known."""
+        best_cp, depth = 0, 0
+        for key, (etext, _ct, _pt, _held) in self.entries.items():
+            if key == exclude or key not in self.depth_caps:
+                continue
+            cp = common_prefix_len(etext, text)
+            if cp > best_cp:
+                best_cp, depth = cp, int(self.depth_caps[key])
+        return max(0, min(depth, int(best_cp / CHARS_PER_TOKEN)))
 
     def uncached_tokens(self, text: str, est_prompt: int,
                         epoch: Optional[int] = None) -> Tuple[int, bool]:

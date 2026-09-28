@@ -162,3 +162,101 @@ def test_both_leg2_finish_sites_pass_the_depth():
     assert src.count("resumable_depth=_depth") == 4, "spans + tspans, stream + body"
     assert "_depth = d_resumable_depth_stream_tail(bytes(tail))" in src
     assert "_depth = d_resumable_depth(js)" in src
+
+
+# ---- #59 A (operator 28.09.): a NEW text in flight never credits past the depth known
+# for its prefix before the leg; none known -> 0 until the finish sets D's real depth.
+# Both prices: exact tokens (TokenSpans) and chars/3 (SpanLRU).
+
+def _spanlru():
+    return F.SpanLRU(agent_span=True) if "agent_span" in inspect.signature(F.SpanLRU).parameters \
+        else F.SpanLRU()
+
+
+def _tkey(ids):
+    return TokenSpans._key(ids)
+
+
+def _skey(text):
+    import hashlib
+
+    return hashlib.sha1(text.encode()).hexdigest()
+
+
+def test_a_tokens_i_inflight_without_a_known_depth_credits_nothing():
+    ts = TokenSpans(agent_span=True)
+    cur = _ids(1000)
+    ts.record_inflight(cur, 5)
+    pending, credit, known, _src = ts.pending(cur, epoch=5)
+    assert (pending, credit, known) == (1000, 0, False), "no depth known -> 0 until the finish"
+
+
+def test_a_tokens_ii_inflight_is_capped_at_the_known_prefix_depth():
+    ts = TokenSpans(agent_span=True)
+    prev = _ids(600)                                   # the earlier turn, D's depth 384
+    ts.record_presence(prev, 580, prompt_tokens=600, resumable_depth=384)
+    cur = _ids(1000)                                   # the running turn on the same prefix
+    ts.record_inflight(cur, 5)
+    assert ts.depth_caps[_tkey(cur)] == 384
+    pending, credit, known, _src = ts.pending(_ids(1100), epoch=5)   # the twin
+    assert known and credit == 384 and pending == 1100 - 384, (pending, credit)
+
+
+def test_a_tokens_iii_the_finish_sets_the_new_depth():
+    ts = TokenSpans(agent_span=True)
+    cur = _ids(1000)
+    ts.record_inflight(cur, 5)
+    assert ts.pending(cur, epoch=5)[1] == 0
+    ts.record_presence(cur, 990, prompt_tokens=1000, held_epoch=5, resumable_depth=960)
+    assert ts.pending(cur, epoch=5)[1] == 960
+    assert ts.depth_caps[_tkey(cur)] == 960
+
+
+def test_a_tokens_iv_an_old_entry_keeps_its_cap_in_flight():
+    ts = TokenSpans(agent_span=True)
+    old = _ids(1000)
+    ts.record_presence(old, 900, prompt_tokens=1000, resumable_depth=512)
+    ts.record_presence(_ids(2000), 1900, prompt_tokens=2000, resumable_depth=1800)  # a longer neighbour
+    ts.record_inflight(old, 5)
+    assert ts.depth_caps[_tkey(old)] == 512, "neither 0 nor the neighbour's depth"
+    ts.record_inflight(_ids(1500), 5)                  # a new text beside them: inherits, bounded
+    assert ts.depth_caps[_tkey(_ids(1500))] == 1500, "the longest capped prefix (1800), bounded by the shared 1500"
+
+
+def test_a_chars_i_inflight_without_a_known_depth_credits_nothing():
+    s = _spanlru()
+    cur = "a" * 3000
+    s.record_inflight(cur, 1000, held_epoch=5)
+    assert s.uncached_tokens(cur, 1000, epoch=5) == (1000, False)
+
+
+def test_a_chars_ii_inflight_is_capped_at_the_known_prefix_depth():
+    s = _spanlru()
+    prev = "a" * 1800
+    s.record_presence(prev, 580, prompt_tokens=600, resumable_depth=384)
+    cur = prev + "b" * 1200
+    s.record_inflight(cur, 1000, held_epoch=5)
+    assert s.depth_caps[_skey(cur)] == 384
+    rem, known = s.uncached_tokens(cur + "c" * 300, 1101, epoch=5)   # the twin
+    assert known and rem == 100 + (1000 - 384), rem   # uncapped (the old in-flight credit) = 100
+
+
+def test_a_chars_iii_the_finish_sets_the_new_depth():
+    s = _spanlru()
+    cur = "a" * 3000
+    s.record_inflight(cur, 1000, held_epoch=5)
+    assert s.uncached_tokens(cur, 1000, epoch=5) == (1000, False)
+    s.record_presence(cur, 990, prompt_tokens=1000, held_epoch=5, resumable_depth=960)
+    assert s.uncached_tokens(cur, 1000, epoch=5) == (40, True)
+    assert s.depth_caps[_skey(cur)] == 960
+
+
+def test_a_chars_iv_an_old_entry_keeps_its_cap_in_flight():
+    s = _spanlru()
+    old = "a" * 3000
+    s.record_presence(old, 900, prompt_tokens=1000, resumable_depth=512)
+    s.record_presence("a" * 6000, 1900, prompt_tokens=2000, resumable_depth=1800)
+    s.record_inflight(old, 1000, held_epoch=5)
+    assert s.depth_caps[_skey(old)] == 512, "neither 0 nor the neighbour's depth"
+    s.record_inflight("a" * 4500, 1500, held_epoch=5)  # a new text beside them: inherits, bounded
+    assert s.depth_caps[_skey("a" * 4500)] == 1500, "the longest capped prefix (1800), bounded by 4500/3"

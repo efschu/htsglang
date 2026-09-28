@@ -512,15 +512,28 @@ def _queued(f, rid, text, n, est, **kw):
     return p, ids
 
 
+def test_an_inflight_text_without_a_known_depth_does_not_reprice(caplog):
+    """#59 A (operator 28.09.): its twin's first content alone credits nothing when no
+    resumable depth is known for the prefix -- the queued price and the park stand."""
+    f = _front(True)
+    f.ftok = _FakeTokens(1)
+    p, ids = _queued(f, "weg2-1-2", "twin", X + 500, X + 500)
+    f.tspans.record_inflight(ids[:X + 300], f.epoch)
+    assert f._x_exact_reprice_queue("inflight") == 0
+    assert p.est_uncached == X + 500
+    assert PP.immediate_park_trigger(f.queue, X) is p
+
+
 def test_a_new_d_credit_reprices_the_queue_and_needs_p_follows(caplog):
     f = _front(True)
     f.ftok = _FakeTokens(1)
     p, ids = _queued(f, "weg2-1-2", "twin", X + 500, X + 500)
     assert PP.immediate_park_trigger(f.queue, X) is p  # priced over X: the park would fire
     with caplog.at_level(logging.INFO, logger="weg2.front"):
-        # its twin's first content: D now holds the first X+300 tokens (#49 in-flight)
-        f.tspans.record_inflight(ids[:X + 300], f.epoch)
-        assert f._x_exact_reprice_queue("inflight") == 1
+        # its twin's finish: D holds the first X+300 tokens and can resume there (#59 depth)
+        f.tspans.record_presence(ids[:X + 300], X + 300, prompt_tokens=X + 300,
+                                 held_epoch=f.epoch, resumable_depth=X + 300)
+        assert f._x_exact_reprice_queue("presence") == 1
     assert p.est_uncached == 200
     assert PP.immediate_park_trigger(f.queue, X) is None  # 200 pending: no park, no flip
     line = [r.getMessage() for r in caplog.records if "X-EXACT-REPRICE" in r.getMessage()][0]
