@@ -154,7 +154,7 @@ class CanonicalExtentWindow:
     total_bytes: int
     extents: tuple[tuple[int, int], ...]
     label: str = "page"
-    #: #239 S4b (F13): the caller's buffer is the WHOLE page and each extent is
+    #: #239 S4b (F14): the caller's buffer is the WHOLE page and each extent is
     #: taken from (write) / put at (read) the same offset in it, instead of the
     #: extents being packed front to back. The owner-row window of a token-cut
     #: rank is this shape: its flat host page has the canonical layout (every
@@ -294,7 +294,7 @@ class CanonicalPageWindow:
 
 
 def owner_token_runs(page_size: int, cp_split: int, lo: int, hi: int) -> tuple:
-    """#239 S4b (F13): the token rows of one page a DCP owner range holds.
+    """#239 S4b (F14): the token rows of one page a DCP owner range holds.
 
     The owner rule gives global slot ``L`` to the rank with ``L % S`` in
     ``[lo, hi)``. Pages are allocated page-aligned, so when ``S`` divides the
@@ -306,12 +306,12 @@ def owner_token_runs(page_size: int, cp_split: int, lo: int, hi: int) -> tuple:
     page_size, cp_split, lo, hi = int(page_size), int(cp_split), int(lo), int(hi)
     if page_size <= 0 or cp_split <= 0 or page_size % cp_split:
         raise CanonicalPageError(
-            f"#239 F13: owner split S={cp_split} does not divide the {page_size}-"
+            f"#239 F14: owner split S={cp_split} does not divide the {page_size}-"
             "token page; the owned rows would differ from page to page and one "
             "key would name different bytes on every rank."
         )
     if not 0 <= lo <= hi <= cp_split:
-        raise CanonicalPageError(f"#239 F13: owner range [{lo}, {hi}) outside S={cp_split}.")
+        raise CanonicalPageError(f"#239 F14: owner range [{lo}, {hi}) outside S={cp_split}.")
     if hi == lo:
         return ()
     runs = []
@@ -326,7 +326,7 @@ def owner_token_runs(page_size: int, cp_split: int, lo: int, hi: int) -> tuple:
 
 @dataclasses.dataclass(frozen=True)
 class CanonicalAbstainWindow:
-    """#239 S4b (F13): the KV page of a rank that owns NO token rows.
+    """#239 S4b (F14): the KV page of a rank that owns NO token rows.
 
     Under the token cut the attention host usually owns share 0 (the optimum
     at x1/x2, plan_s3 F4): its KV page slots are all written by the workers.
@@ -346,7 +346,7 @@ class CanonicalAbstainWindow:
 
 
 def kv_extents_for(kv_page: "CanonicalPageWindow", owner_rows: Optional[tuple]):
-    """#239 S4b (F13): the KV extent window this rank reads and writes.
+    """#239 S4b (F14): the KV extent window this rank reads and writes.
 
     ``owner_rows`` is ``(page_size, S, lo, hi)`` under the token cut (a paged
     owner form), None otherwise -- then the stage/whole-page window as before.
@@ -363,7 +363,7 @@ def kv_extents_for(kv_page: "CanonicalPageWindow", owner_rows: Optional[tuple]):
 def owner_row_window(
     window: "CanonicalPageWindow", page_size: int, runs: tuple
 ) -> CanonicalExtentWindow:
-    """#239 S4b (F13): the byte extents of ``runs`` (token rows of a page) in
+    """#239 S4b (F14): the byte extents of ``runs`` (token rows of a page) in
     every slot of a WHOLE-page window, identity-addressed.
 
     A token-cut rank holds every full-attention layer with the full kv heads
@@ -375,13 +375,13 @@ def owner_row_window(
     exactly when the last owner has written."""
     if not window.is_whole_page:
         raise CanonicalPageError(
-            "#239 F13: an owner-row window needs the whole page (every attention "
+            "#239 F14: an owner-row window needs the whole page (every attention "
             f"layer); this rank holds slots [{window.first_slot}, "
             f"{window.first_slot + window.num_slots})."
         )
     if not runs:
         raise CanonicalPageError(
-            "#239 F13: a rank that owns no token rows has no KV page window; it "
+            "#239 F14: a rank that owns no token rows has no KV page window; it "
             "must not take part in the KV page protocol."
         )
     spec = window.spec
@@ -389,7 +389,7 @@ def owner_row_window(
     page_size = int(page_size)
     if page_size <= 0 or half % page_size:
         raise CanonicalPageError(
-            f"#239 F13: a {half}-byte half cell is not {page_size} token rows."
+            f"#239 F14: a {half}-byte half cell is not {page_size} token rows."
         )
     row = half // page_size
     extents = []

@@ -137,341 +137,353 @@ class Seam:
         )
 
 
-SEAMS: Dict[str, Seam] = {
-    s.id: s
-    for s in (
-        Seam(
-            "F1",
-            "a zero entry in the dense ratio vector, admitted by the flag layer",
-            "server_args.py:12038 (--rank-tp-ratio entries must be positive), "
-            ":12010 (--rank-role requires an explicit vector), "
-            "distributed/utils.py:_normalize_partition_plan",
-            wired=True,
-            note="Slice 2: admitted only together with an explicit "
-            "--rank-role vector, so an accidental zero still raises.",
-            anchors=(
-                ("server_args.py", 12038, "--rank-tp-ratio entries must be"),
-                ("server_args.py", 12010, "--rank-role requires an explicit"),
-            ),
+def _index_seams(seams: Tuple["Seam", ...]) -> Dict[str, "Seam"]:
+    """The register by id. A duplicate id is refused: a dict built over the
+    tuple would keep the LAST entry and silently drop the first -- #239 S3d
+    registered the token cut as a second "F13" and so replaced the wired
+    vocab seam F13 with an unwired one (27B review 28.09.)."""
+    out: Dict[str, Seam] = {}
+    for s in seams:
+        if s.id in out:
+            raise ValueError(f"Form A seam id {s.id!r} registered twice")
+        out[s.id] = s
+    return out
+
+
+SEAM_LIST: Tuple[Seam, ...] = (
+    Seam(
+        "F1",
+        "a zero entry in the dense ratio vector, admitted by the flag layer",
+        "server_args.py:12038 (--rank-tp-ratio entries must be positive), "
+        ":12010 (--rank-role requires an explicit vector), "
+        "distributed/utils.py:_normalize_partition_plan",
+        wired=True,
+        note="Slice 2: admitted only together with an explicit "
+        "--rank-role vector, so an accidental zero still raises.",
+        anchors=(
+            ("server_args.py", 12038, "--rank-tp-ratio entries must be"),
+            ("server_args.py", 12010, "--rank-role requires an explicit"),
         ),
-        Seam(
-            "F2",
-            "a zero-width rank in the unit partition (q packets, kv heads, "
-            "GDN heads, o_proj, mixer, vocab)",
-            "distributed/utils.py:_partition_units_with_empty_ranks, "
-            "partition_units(allow_zero=), tp_partition_sizes",
-            wired=True,
-            note="Slice 1 opened the arithmetic, slice 2 threaded it through "
-            "the plan; the kv-group alignment composes.",
-            anchors=(
-                ("distributed/utils.py", 1357,
-                 "def _partition_units_with_empty_ranks"),
-                ("distributed/utils.py", 124, "def set_tp_partition_ratios"),
-            ),
+    ),
+    Seam(
+        "F2",
+        "a zero-width rank in the unit partition (q packets, kv heads, "
+        "GDN heads, o_proj, mixer, vocab)",
+        "distributed/utils.py:_partition_units_with_empty_ranks, "
+        "partition_units(allow_zero=), tp_partition_sizes",
+        wired=True,
+        note="Slice 1 opened the arithmetic, slice 2 threaded it through "
+        "the plan; the kv-group alignment composes.",
+        anchors=(
+            ("distributed/utils.py", 1357,
+             "def _partition_units_with_empty_ranks"),
+            ("distributed/utils.py", 124, "def set_tp_partition_ratios"),
         ),
-        Seam(
-            "F3",
-            "a worker rank that never LOADS the dense weights (not merely "
-            "idles through them)",
-            "models/qwen4_exp.py weight_name_needed (LOAD veto), :1497 / "
-            ":1523 / :1531 (ple, both hyper_connections), qwen3_5.py "
-            "(linear_attn, qkv_proj, o_proj, attn), qwen2_moe.py "
-            "(shared_expert), qwen3_vl.py (lm_head)",
-            wired=True,
-            note="BUILT, all three parts. (1) The loader veto: a worker "
-            "never READS a dense tensor (checked against the real weight "
-            "map -- 221.184 of 225.300 names kept, no shared expert, no "
-            "draft, no vision; the ROUTER was added to the kept set in "
-            "slice 6a, see _ROUTER_MARKER). (2) The CONSTRUCTION skip at "
-            "the posts that cost most -- the two per-layer hyper-connection "
-            "mixers and the model-level one (not sharded at all, so every "
-            "rank held them in full: 0.63 GiB per rank in INT8) and the "
-            "PLE. (3) The rest of the construction skip: linear_attn, "
-            "qkv_proj, o_proj and the RadixAttention layer in qwen3_5.py, "
-            "the QSA indexer in qwen4_exp.py, the SHARED expert in "
-            "qwen2_moe.py, embed_tokens and lm_head. Acceptance is "
-            "form_a_construction.expected_census_categories('worker'), "
-            "which slice 6a widened from ('experts',) to "
-            "('experts', 'moe_gate') with its reason attached.",
-            anchors=(
-                ("models/qwen4_exp.py", 2470, "this_rank_is_form_a_worker()"),
-                ("models/qwen4_exp.py", 1539, 'skip_on_worker("ple"'),
-                ("models/qwen4_exp.py", 1565,
-                 'skip_on_worker("hyper_connection"'),
-                ("models/qwen3_5.py", 807, 'skip_on_worker("linear_attn"'),
-                ("models/qwen3_5.py", 1120, 'skip_on_worker("self_attn"'),
-            ),
+    ),
+    Seam(
+        "F3",
+        "a worker rank that never LOADS the dense weights (not merely "
+        "idles through them)",
+        "models/qwen4_exp.py weight_name_needed (LOAD veto), :1497 / "
+        ":1523 / :1531 (ple, both hyper_connections), qwen3_5.py "
+        "(linear_attn, qkv_proj, o_proj, attn), qwen2_moe.py "
+        "(shared_expert), qwen3_vl.py (lm_head)",
+        wired=True,
+        note="BUILT, all three parts. (1) The loader veto: a worker "
+        "never READS a dense tensor (checked against the real weight "
+        "map -- 221.184 of 225.300 names kept, no shared expert, no "
+        "draft, no vision; the ROUTER was added to the kept set in "
+        "slice 6a, see _ROUTER_MARKER). (2) The CONSTRUCTION skip at "
+        "the posts that cost most -- the two per-layer hyper-connection "
+        "mixers and the model-level one (not sharded at all, so every "
+        "rank held them in full: 0.63 GiB per rank in INT8) and the "
+        "PLE. (3) The rest of the construction skip: linear_attn, "
+        "qkv_proj, o_proj and the RadixAttention layer in qwen3_5.py, "
+        "the QSA indexer in qwen4_exp.py, the SHARED expert in "
+        "qwen2_moe.py, embed_tokens and lm_head. Acceptance is "
+        "form_a_construction.expected_census_categories('worker'), "
+        "which slice 6a widened from ('experts',) to "
+        "('experts', 'moe_gate') with its reason attached.",
+        anchors=(
+            ("models/qwen4_exp.py", 2470, "this_rank_is_form_a_worker()"),
+            ("models/qwen4_exp.py", 1539, 'skip_on_worker("ple"'),
+            ("models/qwen4_exp.py", 1565,
+             'skip_on_worker("hyper_connection"'),
+            ("models/qwen3_5.py", 807, 'skip_on_worker("linear_attn"'),
+            ("models/qwen3_5.py", 1120, 'skip_on_worker("self_attn"'),
         ),
-        Seam(
-            "F13",
-            "the MODEL-LEVEL vocab collectives must fall with the vocab "
-            "sharding, exactly as F12's per-layer ones fall with the dense "
-            "sharding",
-            "layers/vocab_parallel_embedding.py:730-732 (the embedding "
-            "all-reduce), layers/logits_processor.py (the logits "
-            "all-gather), models/qwen3_vl.py:1358-1368 (the host's lm_head "
-            "built unsharded), against distributed/utils.py:1734 "
-            "tp_vocab_ratios "
-            "(\"vocab always even\" -- the vocab family deliberately does "
-            "NOT inherit the base ratio vector)",
-            wired=True,
-            note="FOUND BY THE WORKER FORWARD, not by the seam survey. F12 "
-            "silenced the collectives INSIDE a decoder layer; these two sit "
-            "outside it, once per forward, and the survey missed them "
-            "because they are not per-layer. They would have hung the boot "
-            "in exactly the same way and one op earlier: tp_vocab_ratios "
-            "keeps the vocab EVEN under a plain uneven-TP plan, so without "
-            "this the host would hold one third of the rows and all-reduce "
-            "the embedding with two ranks that hold none. Built as the same "
-            "answer F12 gives: the sharding goes (enable_tp=False on the "
-            "host's VocabParallelEmbedding / ParallelLMHead, so tp_size=1 "
-            "there -- full vocab, no mask, no collective) and the gather "
-            "goes with it (skip_all_gather in LogitsProcessor).",
-            anchors=(
-                ("models/qwen3_vl.py", 1367, "form_a_dense_is_unsharded"),
-                ("layers/logits_processor.py", 385, "form_a_dense_is_unsharded"),
-                ("distributed/utils.py", 1743, "def tp_vocab_ratios"),
-            ),
+    ),
+    Seam(
+        "F13",
+        "the MODEL-LEVEL vocab collectives must fall with the vocab "
+        "sharding, exactly as F12's per-layer ones fall with the dense "
+        "sharding",
+        "layers/vocab_parallel_embedding.py:730-732 (the embedding "
+        "all-reduce), layers/logits_processor.py (the logits "
+        "all-gather), models/qwen3_vl.py:1358-1368 (the host's lm_head "
+        "built unsharded), against distributed/utils.py:1734 "
+        "tp_vocab_ratios "
+        "(\"vocab always even\" -- the vocab family deliberately does "
+        "NOT inherit the base ratio vector)",
+        wired=True,
+        note="FOUND BY THE WORKER FORWARD, not by the seam survey. F12 "
+        "silenced the collectives INSIDE a decoder layer; these two sit "
+        "outside it, once per forward, and the survey missed them "
+        "because they are not per-layer. They would have hung the boot "
+        "in exactly the same way and one op earlier: tp_vocab_ratios "
+        "keeps the vocab EVEN under a plain uneven-TP plan, so without "
+        "this the host would hold one third of the rows and all-reduce "
+        "the embedding with two ranks that hold none. Built as the same "
+        "answer F12 gives: the sharding goes (enable_tp=False on the "
+        "host's VocabParallelEmbedding / ParallelLMHead, so tp_size=1 "
+        "there -- full vocab, no mask, no collective) and the gather "
+        "goes with it (skip_all_gather in LogitsProcessor).",
+        anchors=(
+            ("models/qwen3_vl.py", 1367, "form_a_dense_is_unsharded"),
+            ("layers/logits_processor.py", 385, "form_a_dense_is_unsharded"),
+            ("distributed/utils.py", 1743, "def tp_vocab_ratios"),
         ),
-        Seam(
-            "F4",
-            "KV only on the host: a worker builds no KV pool and owns no "
-            "context tokens",
-            "distributed/utils.py:1487 cp_token_context_budget "
-            "(assert all(v > 0 ...)), :1488 (capacities[r] // vector[r]), "
-            ":1554 (the search already skips v <= 0), "
-            "model_executor/pool_configurator.py:170-180 (the ratio_r == 0 "
-            "branch)",
-            wired=True,
-            note="Three halves, all built: the POLICY "
-            "(resolve_dcp_under_host_kv -- dcp off, replication off), the "
-            "ARITHMETIC (cp_token_context_budget excludes a rank that funds "
-            "no unit instead of dividing by zero, and still refuses an "
-            "all-zero vector), and the MIS-SCALE (pool_configurator returned "
-            "1.0 silently for a rank with no pool; it now returns 0.0, the "
-            "same answer it already gives a shadow rank at :152-153). The "
-            "pool ALLOCATION needs nothing: cell_size == 0 already has the "
-            "_KVLESS_STAGE_TOKENS path at :256 / :553-557.",
-            anchors=(
-                ("distributed/utils.py", 1487, "def cp_token_context_budget"),
-                ("model_executor/pool_configurator.py", 173, "FORM A (F4)"),
-            ),
+    ),
+    Seam(
+        "F4",
+        "KV only on the host: a worker builds no KV pool and owns no "
+        "context tokens",
+        "distributed/utils.py:1487 cp_token_context_budget "
+        "(assert all(v > 0 ...)), :1488 (capacities[r] // vector[r]), "
+        ":1554 (the search already skips v <= 0), "
+        "model_executor/pool_configurator.py:170-180 (the ratio_r == 0 "
+        "branch)",
+        wired=True,
+        note="Three halves, all built: the POLICY "
+        "(resolve_dcp_under_host_kv -- dcp off, replication off), the "
+        "ARITHMETIC (cp_token_context_budget excludes a rank that funds "
+        "no unit instead of dividing by zero, and still refuses an "
+        "all-zero vector), and the MIS-SCALE (pool_configurator returned "
+        "1.0 silently for a rank with no pool; it now returns 0.0, the "
+        "same answer it already gives a shadow rank at :152-153). The "
+        "pool ALLOCATION needs nothing: cell_size == 0 already has the "
+        "_KVLESS_STAGE_TOKENS path at :256 / :553-557.",
+        anchors=(
+            ("distributed/utils.py", 1487, "def cp_token_context_budget"),
+            ("model_executor/pool_configurator.py", 173, "FORM A (F4)"),
         ),
-        Seam(
-            "F5",
-            "the DCP LSE merge and head gather with a zero-head rank",
-            "layers/dcp/comm.py:168 cp_all_gather_heads_uneven (a zero-head "
-            "rank hands [T, 0, D]), :322 cp_local_head_bounds, the merges at "
-            ":460/:526; layers/attention/qsa/form_a_dcp.py",
-            wired=True,
-            note="#239 S3b. Without a token cut the merge does not run (the "
-            "host holds every head and the whole KV, dcp 1). With one it "
-            "does, and it is built: the head counts are [H, 0, 0], a worker "
-            "takes part with a [T, 0, D] slice -- the 27B weightless worker's "
-            "shape, which the uneven gathers and merges already carry -- and "
-            "the two things only the host has travel as two more uneven "
-            "gathers: the new k/v (A, counts [kv, 0, 0]) and the top-k "
-            "(T, counts [1, 0, 0]). Per full-attention layer every rank "
-            "issues A [, T, Q, M] in that order (qsa/form_a_dcp.py).",
-            anchors=(
-                ("layers/dcp/comm.py", 168, "def cp_all_gather_heads_uneven"),
-                ("layers/dcp/comm.py", 322, "def cp_local_head_bounds"),
-                ("layers/attention/qsa/form_a_dcp.py", 1,
-                 "def worker_attention_step"),
-            ),
+    ),
+    Seam(
+        "F5",
+        "the DCP LSE merge and head gather with a zero-head rank",
+        "layers/dcp/comm.py:168 cp_all_gather_heads_uneven (a zero-head "
+        "rank hands [T, 0, D]), :322 cp_local_head_bounds, the merges at "
+        ":460/:526; layers/attention/qsa/form_a_dcp.py",
+        wired=True,
+        note="#239 S3b. Without a token cut the merge does not run (the "
+        "host holds every head and the whole KV, dcp 1). With one it "
+        "does, and it is built: the head counts are [H, 0, 0], a worker "
+        "takes part with a [T, 0, D] slice -- the 27B weightless worker's "
+        "shape, which the uneven gathers and merges already carry -- and "
+        "the two things only the host has travel as two more uneven "
+        "gathers: the new k/v (A, counts [kv, 0, 0]) and the top-k "
+        "(T, counts [1, 0, 0]). Per full-attention layer every rank "
+        "issues A [, T, Q, M] in that order (qsa/form_a_dcp.py).",
+        anchors=(
+            ("layers/dcp/comm.py", 168, "def cp_all_gather_heads_uneven"),
+            ("layers/dcp/comm.py", 322, "def cp_local_head_bounds"),
+            ("layers/attention/qsa/form_a_dcp.py", 1,
+             "def worker_attention_step"),
         ),
-        Seam(
-            "F6",
-            "a collective over a SUBSET of the ranks",
-            "distributed/parallel_state.py:1042-1068 (one communicator per "
-            "GroupCoordinator; barlink knows no subgroups)",
-            wired=False,
-            note="Form A's decode path needs no subgroup as long as the MoE "
-            "exchange spans all ranks; it becomes necessary when the dense "
-            "layers want a collective the workers must not join.",
-            anchors=(
-                ("distributed/parallel_state.py", 618, "class GroupCoordinator"),
-            ),
+    ),
+    Seam(
+        "F6",
+        "a collective over a SUBSET of the ranks",
+        "distributed/parallel_state.py:1042-1068 (one communicator per "
+        "GroupCoordinator; barlink knows no subgroups)",
+        wired=False,
+        note="Form A's decode path needs no subgroup as long as the MoE "
+        "exchange spans all ranks; it becomes necessary when the dense "
+        "layers want a collective the workers must not join.",
+        anchors=(
+            ("distributed/parallel_state.py", 618, "class GroupCoordinator"),
         ),
-        Seam(
-            "F7",
-            "a DIRECTED reduce to the host instead of an all-reduce",
-            "layers/moe/host_moe_exchange.py (built), over "
-            "distributed/device_communicators/barlink_bar1.py:3270 (put)",
-            wired=True,
-            note="Slice 3. barlink's facade still has no reduce; the "
-            "exchange builds one from put and NAMES the all_reduce fallback "
-            "rather than degrading silently.",
-            anchors=(
-                ("distributed/device_communicators/barlink_bar1.py", 3270,
-                 "def put"),
-                ("layers/moe/host_moe_exchange.py", 14, "host-centric"),
-            ),
+    ),
+    Seam(
+        "F7",
+        "a DIRECTED reduce to the host instead of an all-reduce",
+        "layers/moe/host_moe_exchange.py (built), over "
+        "distributed/device_communicators/barlink_bar1.py:3270 (put)",
+        wired=True,
+        note="Slice 3. barlink's facade still has no reduce; the "
+        "exchange builds one from put and NAMES the all_reduce fallback "
+        "rather than degrading silently.",
+        anchors=(
+            ("distributed/device_communicators/barlink_bar1.py", 3270,
+             "def put"),
+            ("layers/moe/host_moe_exchange.py", 14, "host-centric"),
         ),
-        Seam(
-            "F8",
-            "planner VRAM posts booked per ROLE, not symmetrically",
-            "form_a_plan.py (built), against uneven_perf.py:196-197 "
-            "(_SOLO_HOST_* is the precedent) and :201 "
-            "(_PREDICT_MIN_RANK_TOKENS=4096 declares a KV-less rank "
-            "infeasible)",
-            wired=True,
-            note="Slice 1 built the solve; the predictor's minimum-token "
-            "rule still has to learn about worker ranks.",
-            anchors=(
-                ("uneven_perf.py", 196, "_SOLO_HOST_WORKSPACE_MIB"),
-            ),
+    ),
+    Seam(
+        "F8",
+        "planner VRAM posts booked per ROLE, not symmetrically",
+        "form_a_plan.py (built), against uneven_perf.py:196-197 "
+        "(_SOLO_HOST_* is the precedent) and :201 "
+        "(_PREDICT_MIN_RANK_TOKENS=4096 declares a KV-less rank "
+        "infeasible)",
+        wired=True,
+        note="Slice 1 built the solve; the predictor's minimum-token "
+        "rule still has to learn about worker ranks.",
+        anchors=(
+            ("uneven_perf.py", 196, "_SOLO_HOST_WORKSPACE_MIB"),
         ),
-        Seam(
-            "F9",
-            "CUDA-graph mode chosen per role (host captures the dense "
-            "families, a worker captures only its expert route)",
-            "model_executor/runner/decode_cuda_graph_runner.py "
-            "(capture_one_shape picks the recorded BODY per role; the "
-            "worker's body is form_a_worker_forward.py "
-            "run_form_a_worker_layers, the same one its eager forward "
-            "runs); the MoE offload's own mode stays process-wide in "
-            "layers/moe/offload_capture_gate.py:236/249 and is correct "
-            "there -- both roles run the same FusedMoE pool route",
-            wired=True,
-            note="Wired 20.09. after fnFA15 ran end-to-end EAGER at 233 ms "
-            "per round against 35 ms for the classic form with graphs. The "
-            "graph decision is no longer process-wide in the part that "
-            "matters: the host records model.forward, a worker records only "
-            "form_a_worker_forward.run_form_a_worker_layers -- the SAME "
-            "function its eager forward runs, so the two bodies cannot drift "
-            "into different collective sequences.",
-            anchors=(
-                ("model_executor/runner/decode_cuda_graph_runner.py", 1989,
-                 "def _capture_one_shape_form_a"),
-                ("form_a_worker_forward.py", 247,
-                 "def run_form_a_worker_layers"),
-            ),
+    ),
+    Seam(
+        "F9",
+        "CUDA-graph mode chosen per role (host captures the dense "
+        "families, a worker captures only its expert route)",
+        "model_executor/runner/decode_cuda_graph_runner.py "
+        "(capture_one_shape picks the recorded BODY per role; the "
+        "worker's body is form_a_worker_forward.py "
+        "run_form_a_worker_layers, the same one its eager forward "
+        "runs); the MoE offload's own mode stays process-wide in "
+        "layers/moe/offload_capture_gate.py:236/249 and is correct "
+        "there -- both roles run the same FusedMoE pool route",
+        wired=True,
+        note="Wired 20.09. after fnFA15 ran end-to-end EAGER at 233 ms "
+        "per round against 35 ms for the classic form with graphs. The "
+        "graph decision is no longer process-wide in the part that "
+        "matters: the host records model.forward, a worker records only "
+        "form_a_worker_forward.run_form_a_worker_layers -- the SAME "
+        "function its eager forward runs, so the two bodies cannot drift "
+        "into different collective sequences.",
+        anchors=(
+            ("model_executor/runner/decode_cuda_graph_runner.py", 1989,
+             "def _capture_one_shape_form_a"),
+            ("form_a_worker_forward.py", 247,
+             "def run_form_a_worker_layers"),
         ),
-        # ---- found by the slice-6a symmetry probe (form_a_symmetry.py) ----
-        Seam(
-            "F12",
-            "the HOST's own per-layer dense collectives must disappear with "
-            "the sharding",
-            "models/qwen4_exp.py:1100-1101 (o_proj all-reduce), :1574 "
-            "(attn_tp_all_reduce), :1640 (attn_tp_all_gather); verdict from "
-            "form_a_symmetry.py probe_form_a_boot",
-            wired=True,
-            note="BUILT. Three sites now return early under a Form A plan: "
-            "LinearBase.reduce (o_proj), the attn_tp_all_reduce in the "
-            "layer postprocess, and the attn_tp_all_gather in the q scatter "
-            "-- form_a_dense_is_unsharded(). THE ONE THE SLICE PLAN DID NOT "
-            "HAVE, and the reason slice "
-            "6a must not ship alone. Those collectives exist only because "
-            "the dense side is SHARDED; under Form A rank 0 owns every head, "
-            "so they have no second participant. Silencing the worker's "
-            "dense path while the host still issues them is not a "
-            "half-built feature, it is a DEADLOCK -- the host blocks on "
-            "ranks that already left the forward, on all three cards, with "
-            "no log line, until the deadman fires. Measured by the probe: "
-            "worker_skips_dense alone diverges at collective #0.",
-            anchors=(
-                ("models/qwen4_exp.py", 1156, "form_a_dense_is_unsharded"),
-                ("form_a_symmetry.py", 2, "do the ranks still AGREE"),
-            ),
+    ),
+    # ---- found by the slice-6a symmetry probe (form_a_symmetry.py) ----
+    Seam(
+        "F12",
+        "the HOST's own per-layer dense collectives must disappear with "
+        "the sharding",
+        "models/qwen4_exp.py:1100-1101 (o_proj all-reduce), :1574 "
+        "(attn_tp_all_reduce), :1640 (attn_tp_all_gather); verdict from "
+        "form_a_symmetry.py probe_form_a_boot",
+        wired=True,
+        note="BUILT. Three sites now return early under a Form A plan: "
+        "LinearBase.reduce (o_proj), the attn_tp_all_reduce in the "
+        "layer postprocess, and the attn_tp_all_gather in the q scatter "
+        "-- form_a_dense_is_unsharded(). THE ONE THE SLICE PLAN DID NOT "
+        "HAVE, and the reason slice "
+        "6a must not ship alone. Those collectives exist only because "
+        "the dense side is SHARDED; under Form A rank 0 owns every head, "
+        "so they have no second participant. Silencing the worker's "
+        "dense path while the host still issues them is not a "
+        "half-built feature, it is a DEADLOCK -- the host blocks on "
+        "ranks that already left the forward, on all three cards, with "
+        "no log line, until the deadman fires. Measured by the probe: "
+        "worker_skips_dense alone diverges at collective #0.",
+        anchors=(
+            ("models/qwen4_exp.py", 1156, "form_a_dense_is_unsharded"),
+            ("form_a_symmetry.py", 2, "do the ranks still AGREE"),
         ),
-        # ---- found by the slice-2 seam survey, not in the original nine ----
-        Seam(
-            "F10",
-            "the W62 saturation refusal rests on the written assumption "
-            "that a zero-head rank CANNOT happen",
-            "weg2/launcher.py:7203-7207 (\"A rank owning zero heads cannot "
-            "happen; asserting against zero heads would be a guard that can "
-            "never fire\"), predicate _saturated at :7226-7232",
-            wired=True,
-            note="Form A made that written assumption false, so both the "
-            "prose and the predicate were corrected: a weight of 0 is not a "
-            "saturated axis, it is a rank that was never on the axis, and "
-            "_saturated now skips it. Left as it was it fired for EVERY "
-            "Form A worker (0 / total * units = 0.0 < 1.0 always) and the "
-            "refusal would have rejected every Form A vector as 'axis "
-            "switched off'.",
-            anchors=(
-                # 22.09. nachgezogen: die Anker standen auf 7379/7383 und
-                # zeigten seit langem ins Leere (`def _saturated` lag da
-                # schon bei 7882, rund 500 Zeilen weiter). Ein Anker, der
-                # nicht mehr trifft, meldet bei JEDEM Lauf rot und wird
-                # dadurch zum Hintergrundrauschen, das echte Treffer
-                # verdeckt -- die Regel FILE:LINE-OHNE-SHA-KEINE-ADRESSE
-                # gilt auch fuer die eigene Registry.
-                ("weg2/launcher.py", 8006, "def _saturated"),
-                ("weg2/launcher.py", 8010, "Form A worker: not on this axis, not saturated"),
-            ),
+    ),
+    # ---- found by the slice-2 seam survey, not in the original nine ----
+    Seam(
+        "F10",
+        "the W62 saturation refusal rests on the written assumption "
+        "that a zero-head rank CANNOT happen",
+        "weg2/launcher.py:7203-7207 (\"A rank owning zero heads cannot "
+        "happen; asserting against zero heads would be a guard that can "
+        "never fire\"), predicate _saturated at :7226-7232",
+        wired=True,
+        note="Form A made that written assumption false, so both the "
+        "prose and the predicate were corrected: a weight of 0 is not a "
+        "saturated axis, it is a rank that was never on the axis, and "
+        "_saturated now skips it. Left as it was it fired for EVERY "
+        "Form A worker (0 / total * units = 0.0 < 1.0 always) and the "
+        "refusal would have rejected every Form A vector as 'axis "
+        "switched off'.",
+        anchors=(
+            # 22.09. nachgezogen: die Anker standen auf 7379/7383 und
+            # zeigten seit langem ins Leere (`def _saturated` lag da
+            # schon bei 7882, rund 500 Zeilen weiter). Ein Anker, der
+            # nicht mehr trifft, meldet bei JEDEM Lauf rot und wird
+            # dadurch zum Hintergrundrauschen, das echte Treffer
+            # verdeckt -- die Regel FILE:LINE-OHNE-SHA-KEINE-ADRESSE
+            # gilt auch fuer die eigene Registry.
+            ("weg2/launcher.py", 8006, "def _saturated"),
+            ("weg2/launcher.py", 8010, "Form A worker: not on this axis, not saturated"),
         ),
-        Seam(
-            "F11",
-            "a zero-width parallel Linear COMPUTES instead of being skipped",
-            "layers/linear.py:2069-2092 (row-parallel "
-            "input_size_per_partition can be a true 0 on the element path), "
-            ":670-699 (column-parallel output_partition_sizes=[0]), "
-            "distributed/utils.py:1806 assert_activation_aligned_shards "
-            "(0 % 8 == 0, so the only activation guard passes a zero "
-            "silently); backstop guard_zero_width_linear_shard at "
-            "layers/linear.py",
-            wired=True,
-            note="THE DANGEROUS ONE, now closed by refusal rather than by "
-            "prevention: both construction sites call "
-            "guard_zero_width_linear_shard, which raises FormAZeroWidthLinear "
-            "-- its OWN class, not a seam-not-wired, because the refusal is "
-            "the feature and would otherwise evaporate the moment this seam "
-            "was marked built. Inert on a classic boot (no role plan "
-            "installed). Prevention is still F3's construction half; this "
-            "only guarantees that a layer which slips through is LOUD.",
-            anchors=(
-                ("layers/linear.py", 2093, "guard_zero_width_linear_shard"),
-                ("layers/linear.py", 677, "guard_zero_width_linear_shard"),
-                ("distributed/utils.py", 1815,
-                 "def assert_activation_aligned_shards"),
-            ),
+    ),
+    Seam(
+        "F11",
+        "a zero-width parallel Linear COMPUTES instead of being skipped",
+        "layers/linear.py:2069-2092 (row-parallel "
+        "input_size_per_partition can be a true 0 on the element path), "
+        ":670-699 (column-parallel output_partition_sizes=[0]), "
+        "distributed/utils.py:1806 assert_activation_aligned_shards "
+        "(0 % 8 == 0, so the only activation guard passes a zero "
+        "silently); backstop guard_zero_width_linear_shard at "
+        "layers/linear.py",
+        wired=True,
+        note="THE DANGEROUS ONE, now closed by refusal rather than by "
+        "prevention: both construction sites call "
+        "guard_zero_width_linear_shard, which raises FormAZeroWidthLinear "
+        "-- its OWN class, not a seam-not-wired, because the refusal is "
+        "the feature and would otherwise evaporate the moment this seam "
+        "was marked built. Inert on a classic boot (no role plan "
+        "installed). Prevention is still F3's construction half; this "
+        "only guarantees that a layer which slips through is LOUD.",
+        anchors=(
+            ("layers/linear.py", 2093, "guard_zero_width_linear_shard"),
+            ("layers/linear.py", 677, "guard_zero_width_linear_shard"),
+            ("distributed/utils.py", 1815,
+             "def assert_activation_aligned_shards"),
         ),
-        # ---- #239 S3d: a worker that OWNS full-attention rows (token cut) ----
-        Seam(
-            "F13",
-            "the KV-holding worker's host tier and store under the token cut "
-            "(owner-written rows of a page_size-64 page)",
-            "managers/cache_controller.py:1529 (the page-1 refusal of the "
-            "owner mode -- lifted since S4b part 2 for the paged owner form, "
-            "canonical_kv_owner_rows), mem_cache/hicache_storage.py:4213 "
-            "FormAWorkerNullStorage (still the tier of a worker WITHOUT rows); "
-            "the worker's L2 (ArenaMHAHostPool with owner rows, compact device "
-            "rows), the R12 host shadow, weg2/tail_adopt.py, "
-            "weg2/tail_handoff.py, the #988/H105 park loadback (host-only)",
-            wired=False,
-            note="#239 S3d (1) wired the votes (floor line, #59 MIN, H105 "
-            "gate MIN). S4b part 1 gave the canonical page owner-row windows, "
-            "part 2 the store/backend/attach half (a worker with rows gets the "
-            "real file backend with its KV window, a rank with share 0 "
-            "abstains, the backup has no page mask). Still open: the worker's "
-            "L2 host tier (it keeps the byteless plain pool), the R12 shadow "
-            "verdict on worker bytes, the loadback/tail per owner and "
-            "#1424d/g on the worker trees -- so a real boot of "
-            "kv=qsa_forma_dcp with a host tier stays refused at launch "
-            "(weg2.launcher.refuse_unwired_token_cut).",
-            anchors=(
-                ("managers/cache_controller.py", 1529,
-                 "Weighted uneven-DCP HiCache storage requires page_size == 1"),
-                ("mem_cache/hicache_storage.py", 4213,
-                 "class FormAWorkerNullStorage"),
-            ),
+    ),
+    # ---- #239 S3d: a worker that OWNS full-attention rows (token cut) ----
+    Seam(
+        "F14",
+        "the KV-holding worker's host tier and store under the token cut "
+        "(owner-written rows of a page_size-64 page)",
+        "managers/cache_controller.py:1558 (the page-1 refusal of the "
+        "owner mode -- lifted since S4b part 2 for the paged owner form, "
+        "canonical_kv_owner_rows), mem_cache/hicache_storage.py:4213 "
+        "FormAWorkerNullStorage (still the tier of a worker WITHOUT rows); "
+        "the worker's L2 (ArenaMHAHostPool with owner rows, compact device "
+        "rows), the R12 host shadow, weg2/tail_adopt.py, "
+        "weg2/tail_handoff.py, the #988/H105 park loadback (host-only)",
+        wired=False,
+        note="#239 S3d (1) wired the votes (floor line, #59 MIN, H105 "
+        "gate MIN). S4b part 1 gave the canonical page owner-row windows, "
+        "part 2 the store/backend/attach half (a worker with rows gets the "
+        "real file backend with its KV window, a rank with share 0 "
+        "abstains, the backup has no page mask). Still open: the worker's "
+        "L2 host tier (it keeps the byteless plain pool), the R12 shadow "
+        "verdict on worker bytes, the loadback/tail per owner and "
+        "#1424d/g on the worker trees -- so a real boot of "
+        "kv=qsa_forma_dcp with a host tier stays refused at launch "
+        "(weg2.launcher.refuse_unwired_token_cut).",
+        anchors=(
+            ("managers/cache_controller.py", 1558,
+             "Weighted uneven-DCP HiCache storage requires page_size == 1"),
+            ("mem_cache/hicache_storage.py", 4213,
+             "class FormAWorkerNullStorage"),
         ),
-    )
-}
+    ),
+)
+
+SEAMS: Dict[str, Seam] = _index_seams(SEAM_LIST)
 
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F6", "F13")
+UNWIRED_ORDER: Tuple[str, ...] = ("F6", "F14")
 
 #: #239 S3e: the seams a real boot of the token cut (kv=qsa_forma_dcp) stands
 #: on -- F4 (a worker's KV share), F5 (the LSE merge with zero-head ranks),
-#: F12 (the host's dense collectives gone), F13 (the worker's bytes in the
+#: F12 (the host's dense collectives gone), F14 (the worker's bytes in the
 #: host tier and store). The launcher refuses the cut while any is unwired.
-TOKEN_CUT_SEAMS: Tuple[str, ...] = ("F4", "F5", "F12", "F13")
+TOKEN_CUT_SEAMS: Tuple[str, ...] = ("F4", "F5", "F12", "F14")
 
 
 def unwired_token_cut_seams() -> Tuple[str, ...]:

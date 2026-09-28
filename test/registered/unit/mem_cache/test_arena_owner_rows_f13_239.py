@@ -1,4 +1,4 @@
-"""#239 S4b (F13), part 3: the one L2 (arena) under the token cut.
+"""#239 S4b (F14), part 3: the one L2 (arena) under the token cut.
 
 Form A x the token cut, host share 0 (the optimum form): the KV bytes of every
 page live on the expert workers, each its own token rows of every attention
