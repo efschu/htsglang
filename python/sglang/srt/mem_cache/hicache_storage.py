@@ -3023,45 +3023,63 @@ class HiCacheFile(HiCacheStorage):
             on_disk = self._stat_stems(list(stems))
         except Exception:  # noqa: BLE001 - no stat, no fill
             return out
+        # L3-FAST (28.09., 27B boots: 1.4-3.2k tokens/s against 10-115k the
+        # disk gives -- measured with this pageio on the same store): ONE claim,
+        # ONE completion and parallel reads for the whole batch instead of a
+        # claim/read/complete per page. The claim statuses and what a page
+        # yields are exactly the per-page loop's; only the calls are batched.
+        t0 = time.perf_counter()
+        cand = [(i, st) for i, st in enumerate(stems) if st in on_disk]
         todo = []
-        for i, st in enumerate(stems):
-            if st not in on_disk:
-                continue
-            (slot, status, gen), = arena.claim_slots([st], [int(total_bytes)])
-            if status == 2:
-                out[i] = slot          # raced in by someone else: complete, usable
-            elif status == 0:
-                todo.append((i, slot, gen, st))
-            elif status == 4:
+        if cand:
+            claims = arena.claim_slots([st for _, st in cand], [int(total_bytes)] * len(cand))
+            full = []
+            for (i, st), (slot, status, gen) in zip(cand, claims):
+                if status == 2:
+                    out[i] = slot          # raced in by someone else: complete, usable
+                elif status == 0:
+                    todo.append((i, slot, gen, st))
+                elif status == 4:
+                    full.append((i, st))
+            if full:
                 try:
-                    self._arena_evict_to_disk(arena, 256)
+                    self._arena_evict_to_disk(arena, max(256, len(full)))
                 except Exception:  # noqa: BLE001
                     pass
-                (slot, status, gen), = arena.claim_slots([st], [int(total_bytes)])
-                if status == 0:
-                    todo.append((i, slot, gen, st))
-                elif status == 2:
-                    out[i] = slot
+                for (i, st), (slot, status, gen) in zip(
+                        full, arena.claim_slots([st for _, st in full], [int(total_bytes)] * len(full))):
+                    if status == 0:
+                        todo.append((i, slot, gen, st))
+                    elif status == 2:
+                        out[i] = slot
         if not todo:
             return out
         from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
         pio = _load_pageio()
         paths = [self._existing_path(st) for _, _, _, st in todo]
-        rc = pio.read_pages(paths, [int(total_bytes)] * len(todo), [((0, int(total_bytes)),)] * len(todo),
-                            [arena.slot_ptr(slot) for _, slot, _, _ in todo], True)
+        ptrs = [arena.slot_ptr(slot) for _, slot, _, _ in todo]
+        rc, threads = l3_read_pages_parallel(pio, paths, int(total_bytes), ptrs)
+        ok = [k for k, r in enumerate(rc) if r == 0]
+        bad = [todo[k][1] for k, r in enumerate(rc) if r != 0]
         filled = 0
-        for (i, slot, gen, st), r in zip(todo, rc):
-            if r == 0:
-                cs = arena.complete_slots([slot], [gen], [(0, int(total_bytes))])
-                if cs and cs[0] in (1, 2):
-                    out[i] = slot
+        if ok:
+            cs = arena.complete_slots([todo[k][1] for k in ok], [todo[k][2] for k in ok],
+                                      [(0, int(total_bytes))])
+            for k, c in zip(ok, cs):
+                if c in (1, 2):
+                    out[todo[k][0]] = todo[k][1]
                     filled += 1
-                    continue
-            arena.free_slots([slot])
+                else:
+                    bad.append(todo[k][1])
+        if bad:
+            arena.free_slots(bad)
         k = getattr(self, "_1433_n", 0) + 1
         self._1433_n = k
         if k <= 8 or k % 256 == 0:
-            logger.info("#1433 L3->L2 fill: %d of %d pages read from disk into the arena (n=%d)", filled, len(todo), k)
+            ms = (time.perf_counter() - t0) * 1000.0
+            logger.info("#1433 L3->L2 fill: %d of %d pages read from disk into the arena (n=%d) threads=%d "
+                        "ms=%.0f pages_per_s=%.0f", filled, len(todo), k, threads, ms,
+                        filled / max(1e-6, ms / 1000.0))
         return out
 
     def _arena_evict_to_disk(self, arena, want: int) -> int:
@@ -4303,3 +4321,59 @@ class FormAWorkerNullStorage(HiCacheStorage):
 
     def check_disk_space(self, force: bool = False) -> bool:
         return True
+
+
+#: L3-FAST (28.09.): parallel page reads on the STORE path (the prefetch aux
+#: thread / a fill caller), never in the scheduler's round. pageio releases the
+#: GIL once per call, so N calls on N threads read N files at a time -- measured
+#: on the 27B store (445k 32-KiB pages, NVMe): 1 call 11.7k pages/s, 8 threads
+#: 62k, 16 threads 106k, 32 threads 115k. SGLANG_HICACHE_L3_READ_THREADS
+#: (default 16; 1 = the serial single call as before).
+L3_READ_THREADS_ENV = "SGLANG_HICACHE_L3_READ_THREADS"
+L3_READ_THREADS_DEFAULT = 16
+L3_PARALLEL_MIN_PAGES = 64
+_l3_pool = None
+_l3_pool_n = 0
+_l3_pool_lock = threading.Lock()
+
+
+def l3_read_threads() -> int:
+    try:
+        n = int(os.environ.get(L3_READ_THREADS_ENV, "") or L3_READ_THREADS_DEFAULT)
+    except ValueError:
+        n = L3_READ_THREADS_DEFAULT
+    return max(1, min(64, n))
+
+
+def _l3_executor(n: int):
+    global _l3_pool, _l3_pool_n
+    with _l3_pool_lock:
+        if _l3_pool is None or _l3_pool_n != n:
+            from concurrent.futures import ThreadPoolExecutor
+
+            _l3_pool = ThreadPoolExecutor(max_workers=n, thread_name_prefix="l3-read")
+            _l3_pool_n = n
+        return _l3_pool
+
+
+def l3_read_pages_parallel(pio, paths, total_bytes: int, ptrs, threads: Optional[int] = None):
+    """``(status per page, threads used)`` -- the pages read into ``ptrs``
+    split across ``threads`` concurrent pageio calls (strided, so every call
+    gets a spread of the batch); status as ``PageIO.read_pages``."""
+    n = len(paths)
+    k = l3_read_threads() if threads is None else max(1, int(threads))
+    ext = ((0, int(total_bytes)),)
+    if k <= 1 or n < L3_PARALLEL_MIN_PAGES:
+        return pio.read_pages(paths, [int(total_bytes)] * n, [ext] * n, ptrs, True), 1
+    k = min(k, n)
+    groups = [list(range(g, n, k)) for g in range(k)]
+
+    def one(idx):
+        return pio.read_pages([paths[i] for i in idx], [int(total_bytes)] * len(idx),
+                              [ext] * len(idx), [ptrs[i] for i in idx], True)
+
+    rc = [4] * n
+    for idx, res in zip(groups, _l3_executor(k).map(one, groups)):
+        for i, r in zip(idx, res):
+            rc[i] = r
+    return rc, k
