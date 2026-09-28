@@ -849,6 +849,72 @@ def _weg2_park_on() -> bool:
 from sglang.srt.mem_cache.common import deliverable_evictable_or  # ED
 
 
+def _h105c_follow(adder, req, lb_extent, follow, new_indices) -> torch.Tensor:
+    """H105c (rc12z30g D 23:23:28, weg2-180-304): a load-back that served 0
+    rows under an adopted anchor, on a rank that already TOOK the group's
+    ADMIT (a follower reads the verdict before its load-back), must not WAIT
+    alone -- that ended the workers' loop one gate call short of the host's.
+    It follows (:func:`_h105c_follow_load_back`); anything else passes
+    ``new_indices`` through untouched."""
+    if (
+        int(new_indices.numel()) == 0
+        and lb_extent
+        and int(lb_extent) > 0
+        and getattr(req, "mamba_loadback_anchor_adopted", False)
+        and follow is not None
+        and not getattr(follow, "host_decides_load_back", False)
+    ):
+        return _h105c_follow_load_back(adder, req, int(lb_extent))
+    return new_indices
+
+
+def _h105c_follow_load_back(adder, req, lb_extent: int) -> torch.Tensor:
+    """H105c: the load-back of a rank that follows the group's ADMIT.
+
+    The first attempt yielded 0 rows under the published floor and adopted
+    the anchor (the WAIT shape). The anchor is given back, the load-back runs
+    once more with ``_h105c_follow_room`` set -- the rank evicts its own
+    shortfall and decides from its live pool
+    (``unified_radix_cache._form_a_load_back_floor``). Still nothing: a named
+    stop HERE, never a rank-local NO_TOKEN the host did not send."""
+    from sglang.srt.managers.tp_match_floor import FormAAdmissionSplit
+    from sglang.srt.mem_cache.common import release_admission_acquired_mamba_slot
+
+    tc = adder.tree_cache
+    release_admission_acquired_mamba_slot(req, tc, site="h105c_follow_retry")
+    req.mamba_loadback_anchor_adopted = False
+    tc._h105c_follow_room = True
+    try:
+        new_indices, req.last_node = tc.init_load_back(
+            InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=lb_extent,
+                req=req,
+            )
+        )
+    finally:
+        tc._h105c_follow_room = False
+    applied = int(new_indices.numel())
+    logger.info(
+        "H105c FORM-A FOLLOW LOAD-BACK rid=%s extent=%d applied=%d "
+        "rem_total_tokens=%s: the group's ADMIT was taken before this rank's "
+        "load-back; it made its own room instead of waiting alone",
+        getattr(req, "rid", "?"), int(lb_extent), applied,
+        getattr(adder, "rem_total_tokens", "?"),
+    )
+    if applied == 0:
+        if getattr(req, "mamba_loadback_anchor_adopted", False):
+            release_admission_acquired_mamba_slot(req, tc, site="h105c_follow_unservable")
+            req.mamba_loadback_anchor_adopted = False
+        raise FormAAdmissionSplit(
+            f"H105c FORM-A FOLLOW LOAD-BACK UNSERVABLE rid={getattr(req, 'rid', '?')} "
+            f"extent={int(lb_extent)}: the group admitted this rid, and this rank "
+            "cannot load its host hit back even after evicting its own leaves; "
+            "stopping by name instead of waiting alone (raenge-nie-uneins)."
+        )
+    return new_indices
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -2613,6 +2679,7 @@ class PrefillAdder:
                 # came from. Only its precondition changes: it now runs whenever
                 # an extent was chosen at all.
                 if _lb_extent is not None:
+                    new_indices = _h105c_follow(self, req, _lb_extent, _fa_follow, new_indices)  # H105c
                     _applied = int(new_indices.numel())
                     if _applied == 0 and _lb_extent > 0 and getattr(
                         req, "mamba_loadback_anchor_adopted", False
