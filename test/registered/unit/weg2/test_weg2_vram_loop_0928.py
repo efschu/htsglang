@@ -6,6 +6,7 @@ P1b: the D row planner's overhead calibration names an expert-offload D
 MEASURED-D budget line + FRACTION-SOLVE D, which read NF's own records.
 """
 
+import json
 import os
 import tempfile
 import unittest
@@ -162,6 +163,50 @@ class TestTorchCacheCap(unittest.TestCase):
               _types.SimpleNamespace(available_mib=19056.0),
               _types.SimpleNamespace(available_mib=19062.0)]
         self.assertEqual(TCC.launcher_caps(vs, 767.0), "28413,18289,18295")
+
+
+from sglang.srt.weg2 import profile_records as PR
+from sglang.srt.weg2 import vram_peak_record as VPR
+
+_D_LOG = [
+    "[2026-09-28 18:04:21 TP0] #251 WAKE-RESHARD n=6 stage=S1 tokens=393216 demand=- over=no kv_mib=- rows_on=- epoch=1",
+    "[2026-09-28 18:04:22 TP0] Decode batch, #running-req: 3, #full token: 1, gen throughput (token/s): 100.0",
+    "[2026-09-28 18:04:23 TP0] WEG2-VRAM-PEAK rank=0 phase=round n=1 peak_allocated_mib=31000 allocated_mib=30000 reserved_mib=31500 card_free_mib=900",
+    "[2026-09-28 18:04:23 TP2] WEG2-VRAM-PEAK rank=2 phase=round n=1 peak_allocated_mib=16000 allocated_mib=15800 reserved_mib=17000 card_free_mib=76",
+    "[2026-09-28 18:04:24 TP2] WEG2-VRAM-PEAK rank=2 phase=chunk rows=25 n=1 peak_allocated_mib=16700 allocated_mib=16000 reserved_mib=17000 card_free_mib=300",
+]
+
+
+class TestVramPeakRecord(unittest.TestCase):
+    def test_state_joins_seats_and_stage(self):
+        rows = VPR.samples("D", _D_LOG)
+        states = {(r["rank"], r["phase"]): r["state"] for r in rows}
+        self.assertEqual(states[(0, "round")], "bs3/S1")
+        self.assertEqual(states[(2, "round")], "bs3/S0")   # TP2 reported no stage -> S0
+        self.assertEqual(states[(2, "chunk")], "chunk")
+
+    def test_aggregate_names_cache_and_slack(self):
+        agg = VPR.aggregate(VPR.samples("D", _D_LOG))
+        x = agg["D"]["2"]["round"]["bs3/S0"]
+        self.assertEqual(x["cache_unused_max"], 1200)       # 17000 - 15800
+        self.assertEqual(x["slack_at_peak_min"], 1076)      # 76 + 17000 - 16000
+        self.assertEqual(x["card_free_min"], 76)
+
+    def test_written_record_loads_through_the_registry(self):
+        with tempfile.TemporaryDirectory() as d:
+            stem = os.path.join(d, "boot_weg2_t_abc_0928_180000")
+            with open(stem + ".D.log", "w") as f:
+                f.write("\n".join(_D_LOG) + "\n")
+            rec = VPR.record_for(stem, "nextflash")
+            path = os.path.join(d, "nextflash.json")
+            with open(path, "w") as f:
+                json.dump({"profile": "nextflash", "records": []}, f)
+            VPR.merge_into(path, rec)
+            with open(path) as f:
+                data = json.load(f)
+            r = PR.parse_record("nextflash", data["records"][0])
+        self.assertEqual(r.name, VPR.RECORD_NAME)
+        self.assertEqual(r.value["D"]["0"]["round"]["bs3/S1"]["n"], 1)
 
 
 if __name__ == "__main__":
