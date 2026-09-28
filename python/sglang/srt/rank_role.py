@@ -314,7 +314,7 @@ SEAM_LIST: Tuple[Seam, ...] = (
             ("distributed/parallel_state.py", 3087, "def init_model_tp_group"),
             ("distributed/communication_op.py", 27,
              "get_model_tp_group().all_reduce(input_)"),
-            ("rank_role.py", 1002, "def guard_collective_subgroup"),
+            ("rank_role.py", 1026, "def guard_collective_subgroup"),
             ("speculative/form_b_spec.py", 145, "def spec_k("),
         ),
     ),
@@ -505,8 +505,8 @@ SEAM_LIST: Tuple[Seam, ...] = (
         "tp for Form B (K ranks skip them); (4) the weg2 launcher calls "
         "check_form_b_windows (W187) before any rank loads.",
         anchors=(
-            ("rank_form.py", 637, "class RankFormKvRankBuild"),
-            ("model_executor/model_runner.py", 2840,
+            ("rank_form.py", 681, "class RankFormKvRankBuild"),
+            ("model_executor/model_runner.py", 2848,
              "form_b_build_context(self.tp_rank)"),
         ),
     ),
@@ -815,7 +815,9 @@ def kv_only_rank() -> bool:
     * the installed Form A plan: a worker with a share > 0 under the #239
       token cut (:func:`form_a_worker_holds_kv`);
     * the weightless-KV lane: every rank but the head, as long as its owner
-      range is not empty (the lane refuses a 0 share, W181).
+      range is not empty (the lane refuses a 0 share, W181);
+    * Form B (F15): a rank outside the weight group W of the installed
+      model_tp partition (:func:`form_b_kv_rank`), with owner rows.
 
     Readers ask this, never a backend name: the claim vote's min arm and
     the host-state pool split (cache_controller), the F14 page window, the
@@ -829,6 +831,9 @@ def kv_only_rank() -> bool:
         weightless_worker_rank,
     )
 
+    if form_b_kv_rank():
+        bounds = uneven_dcp_owner_bounds()
+        return bounds is None or int(bounds[2]) > int(bounds[1])
     if not weightless_kv_active():
         return False
     from sglang.srt.runtime_context import get_parallel
@@ -837,6 +842,25 @@ def kv_only_rank() -> bool:
         return False
     bounds = uneven_dcp_owner_bounds()
     return bounds is None or int(bounds[2]) > int(bounds[1])
+
+
+def form_b_kv_rank(rank: Optional[int] = None) -> bool:
+    """F15: True on a Form B rank outside the weight group W (the installed
+    model_tp partition's one multi-rank part) -- dense share 0 by
+    construction. :func:`kv_only_rank` adds the owner-rows half (NF answer 1:
+    share 0 WITHOUT token rows is the byteless expert worker, not KV-only).
+    False on every boot without a Form B partition."""
+    from sglang.srt.distributed import parallel_state as ps
+
+    part = ps.get_model_tp_partition()
+    if part is None:
+        return False
+    if rank is None:
+        from sglang.srt.runtime_context import get_parallel
+
+        rank = get_parallel().tp_rank
+    weight = [p for p in part if len(p) >= 2]
+    return bool(weight) and int(rank) not in weight[0]
 
 
 def form_a_token_src_rank() -> Optional[int]:

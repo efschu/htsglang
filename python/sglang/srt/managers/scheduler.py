@@ -21546,7 +21546,9 @@ def configure_scheduler_process(
     set_tp_partition_ratios(
         base_plan,
         families=uneven_family_plans(server_args) or None,
-        allow_zero=server_args.form_a_active(),
+        # F15 (2): Form B's KV-only ranks own no dense shard either -- the same
+        # plan property, installed with the vector.
+        allow_zero=server_args.form_a_active() or server_args.form_b_active(),
     )
 
     # ... and the role plan alongside it, for the same reason: the loader

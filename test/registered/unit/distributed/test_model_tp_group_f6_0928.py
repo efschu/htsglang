@@ -67,6 +67,10 @@ def _run(rank, port, out, partition):
         except FormBCollectiveWrongGroup:
             return "refused"
 
+    # F15 (2): the KV-only predicate's Form B source (share 0 = outside W)
+    from sglang.srt import rank_role as _rr
+
+    res["form_b_kv"] = _rr.form_b_kv_rank()
     # NF answer 2: moe_tp spans ALL expert holders (K included), never model_tp
     res["moe_tp_ranks"] = list(ps.get_moe_tp_group().ranks)
     saved = ps._MOE_TP
@@ -117,6 +121,7 @@ def test_model_tp_is_the_weight_ranks_and_tp_stays_everyone():
     assert res[0]["op_ar"] == res[1]["op_ar"] == [3.0, 3.0]
     assert res[0]["op_ag"] == res[1]["op_ag"] == [1.0, 1.0, 2.0, 2.0]
     assert res[2]["op_ag"] == [3.0, 3.0]
+    assert [res[r]["form_b_kv"] for r in range(3)] == [False, False, True]
     for r in range(3):
         assert res[r]["moe_tp_ranks"] == [0, 1, 2]                 # NF answer 2
         assert res[r]["moe_on_mtp"] is True                         # refused by name
@@ -134,6 +139,7 @@ def test_without_a_partition_model_tp_is_the_tp_group():
         assert res[r]["mtp_is_tp"] is True and res[r]["mtp_sum"] == [6.0, 6.0]
         assert res[r]["op_ar"] == [6.0, 6.0]                   # byte-identical: the TP group
         assert set(res[r]["guard"].values()) == {"ok"}         # 3: no-op without Form B
+        assert res[r]["form_b_kv"] is False
 
 
 def test_a_partition_must_cover_every_rank_once():
@@ -182,3 +188,16 @@ def test_reversed_guard_arithmetic():
         check_collective_group("sched", allr, None, allr)
     # its own class: survives F6 being wired
     assert not issubclass(FormBCollectiveWrongGroup, FormASeamNotWired)
+
+
+def test_the_model_runner_installs_the_partition_before_the_groups():
+    """F15 (2): set_model_tp_partition(server_args.form_b_model_tp_partition())
+    runs BEFORE initialize_model_parallel in the one place that builds the groups."""
+    import pathlib
+
+    import sglang.srt.model_executor.model_runner as mr
+
+    src = pathlib.Path(mr.__file__).read_text()
+    i = src.index("set_model_tp_partition(self.server_args.form_b_model_tp_partition())")
+    j = src.index("initialize_model_parallel(\n", i)
+    assert i < j and src.count("initialize_model_parallel(\n") == 1

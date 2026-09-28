@@ -2198,6 +2198,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
             )
+            # F15 (2): Form B's model_tp partition ([W] + one group per
+            # KV-only rank) goes in BEFORE the groups are built -- every rank
+            # builds every group (torch rule), so the list is the same
+            # everywhere (it comes from the pickled ServerArgs). None on every
+            # other boot: initialize_model_parallel builds no model_tp group.
+            from sglang.srt.distributed.parallel_state import set_model_tp_partition
+
+            set_model_tp_partition(self.server_args.form_b_model_tp_partition())
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 attention_data_parallel_size=self.dp_size,
