@@ -6,7 +6,8 @@ decisions the worker half of the token cut needs live here:
 
 * which attention backend a Form A worker builds (``form_a_worker_attn_backend``);
 * which LSE merge the boot gate declares for this rank (``form_a_dcp_merge_of``);
-* the per-layer attention step the worker route runs (``form_a_worker_attention_step``).
+* the per-layer attention step the worker route runs (``form_a_worker_attention_step``);
+* the eager forward's attention metadata (``prepare_form_a_worker_eager_forward``).
 
 Each is decided from the object that RUNS the attention (the backend), so a
 rank whose backend did not take the cut disagrees at the boot gate instead of
@@ -95,6 +96,32 @@ def form_a_dcp_merge_of(attn_backend) -> Optional[str]:
     from sglang.srt.layers.dcp.comm import lse_merge_mode
 
     return lse_merge_mode()
+
+
+def prepare_form_a_worker_eager_forward(attn_backend, forward_batch) -> None:
+    """#239 M1s (rc12z30g D-only, D log 22:07:33): build THIS forward's
+    attention metadata on a Form A worker's EAGER forward.
+
+    The host builds it per forward in its eager runner
+    (``runner/eager_runner.py`` -> ``attn_backend.init_forward_metadata``);
+    the worker's eager entry (``ModelRunner._forward_form_a_worker``) bypasses
+    that runner, and the backend's lazy ``_resolve_metadata`` only builds when
+    ``forward_metadata is None``. So the first extend with a prefix (the second
+    4096-token chunk of the S1 probe) resolved the host's 4096 top-k rows
+    against the LAST graph capture/replay metadata -- ``QSA top-k rows do not
+    match query rows`` on TP1/TP2 (``rows_resolve.py`` Tq-check). A stale table
+    of the same row count (an eager decode after a graph replay) attends the
+    wrong KV rows without any error; that is the same bug, silent.
+
+    Only forwards whose worker joins the rows path need it (``form_a_attends``:
+    decode, target verify, an extend with a prefix); the graph path gets its
+    metadata from the decode-graph runner's capture/replay, never from here."""
+    if getattr(attn_backend, "form_a_dcp", None) is None:
+        return
+    from sglang.srt.layers.attention.qsa.form_a_dcp import form_a_attends
+
+    if form_a_attends(forward_batch):
+        attn_backend.init_forward_metadata(forward_batch)
 
 
 def form_a_worker_attention_step(
