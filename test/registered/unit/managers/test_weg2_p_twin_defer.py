@@ -59,6 +59,9 @@ class _Sched:
         self.chunked_req = None
         self.running_batch = None
         self.pp_flip_counters = None
+        # the NF P form (rule 4 reads both: end anchor page, chunk anchors)
+        self.page_size = 64
+        self.chunked_prefill_size = 16384
         self.registered = []  # (rid, limit_tokens)
         #: what a registration finds: rid -> (local head, span completed)
         self.local = {}
@@ -488,3 +491,128 @@ def test_just_finished_sibling_switch_off_is_unchanged(off, clock):
     s.waiting_queue.remove(a)
     s.local[b.rid] = (20000, 512)
     assert _intake(s, b) == "issued"
+
+
+# --------------------------------------------------------------------------
+# Rule 4 (28.09., NF rc12z30e ca2a9706ec, P log ...09282117_..._211748): a
+# hybrid model resumes only at a Mamba anchor; the sibling writes anchors at
+# its chunk ends and at its END ANCHOR floor((len-1)/64)*64. A wait is worth
+# something only if one of those lands in (sibling start s0, shared]. The
+# metal numbers: weg2-8-30 (20171) behind weg2-8-29 (20033, s0 16384), shared
+# 20029 -> 'TWIN-RELEASE waited_s=6.34', then 3787 tokens from 16384 anyway.
+# --------------------------------------------------------------------------
+
+
+def _admit(s, req, prefix):
+    """PP0 admitted ``req`` (out of the waiting queue, chunk in flight) at
+    ``prefix`` device tokens -- the scheduler's own state after
+    get_next_batch_to_run."""
+    if req in s.waiting_queue:
+        s.waiting_queue.remove(req)
+    req.prefix_indices = [0] * prefix
+    s.chunked_req = req
+
+
+def _pair_8_29(s0_admitted_at_intake):
+    s = _Sched(0)
+    assert m.armed(s)
+    a = _Req("weg2-8-29", _ids(20029, 20033 - 20029, 1))
+    s.local[a.rid] = (0, 16384)
+    _intake(s, a)
+    if s0_admitted_at_intake:
+        _admit(s, a, 16384)
+    b = _Req("weg2-8-30", _ids(20029, 20171 - 20029, 2))
+    s.local[b.rid] = (0, 16384)  # the store span it reads with or without a wait
+    return s, a, b
+
+
+def test_no_gain_twin_registers_at_intake_when_sibling_start_is_known(on, clock):
+    s, a, b = _pair_8_29(True)
+    _run_pp0(s, clock, 1)  # PP0 sees 8-29 admitted at 16384
+    assert _intake(s, b) == "issued"
+    assert (b.rid, None) in s.registered
+    assert not tw.is_deferred(s, b.rid)
+    wire = _run_pp0(s, clock, 1)
+    told = [w for w in wire if w.rid == b.rid]
+    assert len(told) == 1 and type(told[0]) is m.Weg2StoreTold
+    assert told[0].told == 16384
+
+
+def test_no_gain_twin_released_as_soon_as_sibling_start_is_known(on, clock):
+    s, a, b = _pair_8_29(False)
+    # 8-29 still queued at 8-30's intake (its store read pending): undecidable
+    assert _intake(s, b) == tw.VERDICT_DEFERRED
+    _run_pp0(s, clock, 2)
+    assert tw.is_deferred(s, b.rid)
+    _admit(s, a, 16384)  # 21:25:52 '#988 LOADBACK rid=weg2-8-29 prefix moved to 16384'
+    wire = _run_pp0(s, clock, 2)
+    assert not a.done, "released while the sibling still computes"
+    assert not tw.is_deferred(s, b.rid)
+    told = [w for w in wire if w.rid == b.rid]
+    assert len(told) == 1 and type(told[0]) is m.Weg2StoreTold  # ordinary, not twin
+    assert told[0].told == 16384
+
+
+def test_sibling_whose_end_anchor_equals_its_start_brings_nothing(on, clock):
+    # weg2-2-9: 21229 tokens, s0 21184 ('END-ANCHOR FOLD ... [21184, 21229)'),
+    # weg2-2-10 shares 20030 -> held 4.19 s, got 16384 either way
+    s = _Sched(0)
+    m.armed(s)
+    a = _Req("weg2-2-9", _ids(20030, 21229 - 20030, 1))
+    s.local[a.rid] = (0, 21184)
+    _intake(s, a)
+    _admit(s, a, 21184)
+    _run_pp0(s, clock, 1)
+    b = _Req("weg2-2-10", _ids(20030, 21273 - 20030, 2))
+    s.local[b.rid] = (0, 16384)
+    assert _intake(s, b) == "issued"
+
+
+def test_end_anchor_inside_shared_still_holds_and_releases_as_twin(on, clock):
+    # weg2-22-47 (49561, s0 41856) -> end anchor 49536 <= shared 49557 of
+    # weg2-23-50: the real gain (41856 -> 49536) keeps the hold
+    s = _Sched(0)
+    m.armed(s)
+    a = _Req("weg2-22-47", _ids(49557, 49561 - 49557, 1))
+    s.local[a.rid] = (0, 41856)
+    _intake(s, a)
+    _admit(s, a, 41856)
+    _run_pp0(s, clock, 1)
+    b = _Req("weg2-23-50", _ids(49557, 49717 - 49557, 2))
+    assert _intake(s, b) == tw.VERDICT_DEFERRED
+    _run_pp0(s, clock, 3)
+    assert tw.is_deferred(s, b.rid), "a known gain keeps holding"
+    a.done = True
+    s.chunked_req = None
+    s.local[b.rid] = (49536, 0)
+    wire = _run_pp0(s, clock, 6)
+    told = [w for w in wire if w.rid == b.rid]
+    assert len(told) == 1 and type(told[0]) is m.Weg2StoreToldTwin
+    assert told[0].told == 49536
+
+
+def test_whole_chunk_inside_shared_still_holds(on, clock):
+    s = _Sched(0)
+    m.armed(s)
+    a = _Req("weg2-5-1", _ids(40000, 5000, 1))
+    s.local[a.rid] = (0, 0)
+    _intake(s, a)
+    _admit(s, a, 0)  # computes from 0: a chunk anchor at 16384 <= 40000
+    _run_pp0(s, clock, 1)
+    b = _Req("weg2-5-2", _ids(40000, 700, 2))
+    assert _intake(s, b) == tw.VERDICT_DEFERRED
+    _run_pp0(s, clock, 3)
+    assert tw.is_deferred(s, b.rid)
+
+
+def test_queued_sibling_that_cannot_reach_inside_shared_is_no_reason(on, clock):
+    # shared below one chunk and the sibling's end past shared: whatever its
+    # start, it writes nothing the twin can use
+    s = _Sched(0)
+    m.armed(s)
+    a = _Req("weg2-6-1", _ids(12000, 3000, 1))
+    s.local[a.rid] = (0, 0)
+    _intake(s, a)
+    b = _Req("weg2-6-2", _ids(12000, 900, 2))
+    s.local[b.rid] = (0, 0)
+    assert _intake(s, b) != tw.VERDICT_DEFERRED
