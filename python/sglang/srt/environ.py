@@ -1192,6 +1192,10 @@ class Envs:
     # nextflash and no form off. SGLANG_WEG2_TOLD_ABSOLUTE follows TREE_KEY.
     SGLANG_WEG2_TOLD_PROBE_TREE_KEY = EnvBool(_profile_default("SGLANG_WEG2_TOLD_PROBE_TREE_KEY", False))
     SGLANG_WEG2_TOLD_PACED = EnvBool(_profile_default("SGLANG_WEG2_TOLD_PACED", False))
+    # #1416f: PP0 admits a paced told without waiting out its window when
+    # nothing is in pipeline flight (managers/weg2_store_told.pipeline_idle).
+    # 1 = the window always runs, as before.
+    SGLANG_WEG2_DISABLE_TOLD_PACE_IDLE_SKIP = EnvBool(False)
     SGLANG_WEG2_P_TWIN_DEFER = EnvBool(_profile_default("SGLANG_WEG2_P_TWIN_DEFER", False))
     SGLANG_WEG2_TOLD_GROUP_FALLBACK = EnvBool(_profile_default("SGLANG_WEG2_TOLD_GROUP_FALLBACK", False))
     # Prefix trace (IN 26.09., weg2/prefix_trace.py): every prefix miss of an
