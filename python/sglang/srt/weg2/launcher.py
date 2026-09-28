@@ -4252,6 +4252,83 @@ def refuse_unwired_token_cut(ns, boot_form) -> None:
         "a real boot needs S3.")
 
 
+#: #239 S3a: the D argv that carries the planner's token cut to the runtime
+#: (server_args._resolve_form_a_dcp -> rank_role.resolve_dcp_under_host_kv).
+D_TOKEN_CUT_FLAGS = (
+    "--uneven-token-vector",
+    "--uneven-token-vector-role",
+    "--uneven-token-vector-provenance",
+)
+#: The provenance the runtime's #797 register sees: the planner, this boot.
+D_TOKEN_CUT_PROVENANCE = "planner-239-token-cut"
+
+
+def d_token_cut_vector(plan_cut, stated) -> Optional[Tuple[int, ...]]:
+    """#239 S3a: the integer token vector D runs, or None (no cut).
+
+    ``plan_cut`` is the planner's solved cut (``maxmin``/``joint``, already in
+    /``KV_TOKEN_SHARE_GRID``); a stated ratio vector (``stated``) goes onto the
+    same grid by largest remainder, zeros kept -- a 0 is a layout here.
+    """
+    from sglang.srt.distributed.utils import partition_units
+    from sglang.srt.planner import expert_residency as _er
+
+    if plan_cut:
+        return tuple(int(x) for x in plan_cut)
+    if not isinstance(stated, tuple) or not stated:
+        return None
+    return tuple(
+        partition_units(
+            _er.KV_TOKEN_SHARE_GRID,
+            [int(round(float(x) * 10**6)) for x in stated],
+            allow_zero=True,
+        )
+    )
+
+
+def publish_d_token_cut(ns, vector, label: str) -> Optional[str]:
+    """#239 S3a: ship the token cut to group D (``ns.extra_d``), or refuse.
+
+    An operator ``--d-uneven-token-vector`` next to a planned cut is a second
+    statement of the same fact; which one the runtime would read is argparse
+    order, so it is refused by name. Returns the log line, None when there is
+    no cut to ship.
+    """
+    if vector is None:
+        return None
+    if getattr(ns, "d_uneven_token_vector", None):
+        raise Weg2LaunchRefused(
+            f"{KV_TOKEN_CUT_MARKER}: --d-uneven-token-vector "
+            f"{ns.d_uneven_token_vector} and the planned token cut "
+            f"{list(vector)} (--d-kv-token-cut {ns.d_kv_token_cut}) both state "
+            "D's token ownership. Drop one: a stated vector goes through "
+            "--d-kv-token-cut, which prices it.")
+    toks = shlex.split(str(getattr(ns, "extra_d", "") or ""))
+    out: List[str] = []
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in D_TOKEN_CUT_FLAGS:
+            i += 2
+            continue
+        if any(t.startswith(f + "=") for f in D_TOKEN_CUT_FLAGS):
+            i += 1
+            continue
+        out.append(t)
+        i += 1
+    out += [
+        D_TOKEN_CUT_FLAGS[0], ",".join(str(int(v)) for v in vector),
+        D_TOKEN_CUT_FLAGS[1], "pin",
+        D_TOKEN_CUT_FLAGS[2], D_TOKEN_CUT_PROVENANCE,
+    ]
+    ns.extra_d = shlex.join(out)
+    return (
+        f"{KV_TOKEN_CUT_MARKER} {label} (#239 S3a) an D: --uneven-token-vector "
+        f"{','.join(str(int(v)) for v in vector)} role=pin provenance="
+        f"{D_TOKEN_CUT_PROVENANCE} -- der Planer-Schnitt ist die Laufzeit-Form "
+        "(dcp = Raenge, jeder Rang haelt die kv-Koepfe seiner Token)")
+
+
 class Weg2StoreDiskRefused(Weg2LaunchRefused):
     """W57: the disk cannot fund ``max_size + min_free`` for this boot's store.
 
@@ -15565,6 +15642,11 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             f"{','.join(_dp._fmt(x) for x in plan.solved_fractions)} (vorher "
             f"{','.join(str(x) for x in fr_d)}), Token-Schnitt {list(plan.kv_token_cut)}/"
             f"{_er.KV_TOKEN_SHARE_GRID}")
+    # #239 S3a: the cut itself goes to D as the runtime's token vector.
+    _cut_line = publish_d_token_cut(
+        ns, d_token_cut_vector(getattr(plan, "kv_token_cut", ()), _kv_cut), label)
+    if _cut_line:
+        log(f"{D_RANK_SOLVE_MARKER} {_cut_line}")
     if plan.overflow_waves is not None and plan.overflow_waves != _er.pool_overflow_waves(_env_d):
         # rc12e: the D group runs the waves its solved form needs.
         ns.env_d = set_group_env(getattr(ns, "env_d", "") or "",

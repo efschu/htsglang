@@ -170,13 +170,12 @@ def solo_draft_kv_cell_factor(mr: ModelRunner) -> float:
             if ratio_r > 0:
                 factor *= cp_token_split_factor(dcp_size) / ratio_r
             else:
-                # FORM A (F4): this rank owns no context tokens -- the
-                # attention host holds the whole KV. There is no token-axis
-                # correction to make because there is no pool here to
-                # correct. Falling through with factor unchanged (what this
-                # branch did before it existed) would scale a draft-KV cell
-                # for a pool that does not exist, and say nothing.
-                return 0.0
+                # FORM A (F4, #239 S3a): the draft host owns no token of the
+                # full-attention KV, but its draft pool still spans ALL C
+                # tokens. There is no local token to scale against: the
+                # rank's cell is priced per GLOBAL token instead
+                # (zero_token_share_cell), where the draft counts once.
+                return 1.0
     elif dcp_size > 1:
         factor *= float(dcp_size)
     # (b) head-axis share: the solo draft keeps all kv heads. When the target
@@ -216,6 +215,51 @@ def draft_kv_pool_on_this_rank(mr: ModelRunner) -> bool:
     if pp_size <= 1:
         return True
     return int(getattr(mr, "pp_rank", 0) or 0) == pp_size - 1
+
+
+def zero_token_share_cell(
+    mr: ModelRunner,
+    target_cell_size: int,
+    cell_size_with_draft: int,
+    qsa_cell_size: int,
+    window_reserve_bytes: int = 0,
+) -> Optional[int]:
+    """#239 S3a: the per-GLOBAL-token cell of a rank whose token share is 0.
+
+    Under the Form A token cut a rank may own no token of the full-attention
+    KV (the optimum puts the attention host there at x1/x2). Its full-attention
+    rows are zero, but what spans the WHOLE context stays: the QSA index
+    (``qsa_slot_space`` = C on every rank) and the solo draft pool on the draft
+    host. So the rank's cell is those terms per GLOBAL token, and its capacity
+    ``available // cell`` is a bound on C itself, not a local token count
+    (``_apply_token_constraints`` reads it that way). A worker with share 0 has
+    neither term: its cell is 0, it bounds nothing.
+
+    None (the caller keeps its cell, byte-identical) unless uneven DCP is
+    active and this rank's share is 0.
+    """
+    from sglang.srt.distributed.utils import get_cp_token_ratios, uneven_dcp_active
+
+    dcp_size = int(getattr(mr, "dcp_size", 1) or 1)
+    if not uneven_dcp_active(dcp_size):
+        return None
+    ratios = get_cp_token_ratios()
+    if int(ratios[get_parallel().attn_dcp_rank]) != 0:
+        return None
+    draft_part = int(cell_size_with_draft) - int(target_cell_size)
+    if draft_part < 0 or int(window_reserve_bytes) > 0:
+        # the window pool books its draft as a constant reserve, not per token
+        draft_part = 0
+    draft = int(round(draft_part * solo_draft_kv_cell_factor(mr)))
+    cell = int(qsa_cell_size) + draft
+    logger.info(
+        "#239 S3a ZERO-SHARE CELL: rank %d owns no full-attention token "
+        "(vector %s) -- cell %d -> %d B per GLOBAL token (QSA index %d + draft "
+        "%d), full-attention rows 0",
+        int(getattr(mr, "tp_rank", 0) or 0), list(ratios),
+        int(cell_size_with_draft), cell, int(qsa_cell_size), draft,
+    )
+    return cell
 
 
 def apply_solo_draft_kv_cell_factor(
@@ -504,6 +548,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_num_layers=int(draft_num_layers),
                 )
 
+        _cell_with_draft = self._cell_size
         # Draft-solo placement: re-scale ONLY the draft-KV part of the cell.
         # No-op (factor 1.0, byte-identical) on every split-placement path.
         self._cell_size = apply_solo_draft_kv_cell_factor(
@@ -514,6 +559,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self._cell_size, self._window_pool_reserve_bytes = apply_window_pool_draft_charge(
             mr, target_cell_size, self._cell_size
         )
+        # #239 S3a: a rank with token share 0 is priced per GLOBAL token.
+        _zero = zero_token_share_cell(
+            mr,
+            target_cell_size,
+            _cell_with_draft,
+            self._compute_qsa_cell_size(
+                hf_config=mr.model_config.hf_config, num_layers=num_layers
+            ),
+            self._window_pool_reserve_bytes,
+        )
+        if _zero is not None:
+            self._cell_size = _zero
 
     def _compute_cell_size(self, mr: ModelRunner, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
