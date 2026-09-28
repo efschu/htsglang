@@ -188,6 +188,34 @@
    },
    "power_limit_source": "not a power-dependent quantity (bytes of the GDN state)",
    "n": 6
+  },
+  {
+   "name": "P_OVERSHOOT_MIB",
+   "value": [
+    452,
+    397,
+    0
+   ],
+   "provenance": "#240: group P's awake footprint beyond its budget per P ordinal, measured at the CARD (CUDA context and every non-torch byte included, the part a torch-only peak_reserved never sees): excess = corridor + booked overshoot - free card at the window peak (card_free_mib - (peak_reserved - reserved) of every WEG2-VRAM-PEAK window), and the record is the part the corridor's builtin awake_overshoot 404 does not carry: max(0, excess - 404), so the free card at the observed peak lands on the measured floor instead of below it. Assumes the P footprint follows its budget 1:1 (FR_P residency fills it) -- the conservative side. Worst window per ordinal: PP0 +856 excess (free 1523 MiB, 7d507357b9 14:47, chunk) -> 452; PP1 +801 (free 698, dwell30 14:59, chunk) -> 397; PP2 +74 at most (free >= 1700 in every boot) -> 0. Replaces the 27B row [920, 0, 512] (boot weg2ls2b2) the NF line borrowed since 76f8debf2c: PP0 budget +468, PP1 -397, PP2 +512 against it. Coverage: 10 boots x 69-596 windows per rank, chunk/idle/flip/round phases, cut 29,11,8, bs 1..5 in a chunk; bs6 in one chunk not seen. The P activation is booked inside the budget (P_ACTIVATION_MIB, #242), so a heavier chunk raises the torch peak inside the budget, not this excess.",
+   "boots": [
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281209",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281220",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281322",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281447",
+    "dkrnfh91dprsavisnoadoptstdwell30bar1dauer09281459",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281515",
+    "dkrnfh91dprsavisnoadoptstdwell30bar1dauer09281540",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281617",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281752",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281938"
+   ],
+   "kind": "memory",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "not a power-dependent quantity (bytes outside the budget)",
+   "n": 10
   }
  ],
  "borrow": {
@@ -196,7 +224,6 @@
    "DC_MEASURED_D_5090_MIB",
    "DC_MEASURED_D_3080_MIB",
    "DC_MEASURED_D_XCHG_MIB",
-   "P_OVERSHOOT_MIB",
    "CALIBRATION_LAYERS",
    "MEASURED_MS_PER_LAYER",
    "X_RECORDED_R_D_TOKS",
