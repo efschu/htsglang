@@ -687,6 +687,15 @@ class Envs:
     SGLANG_WEG2_DEGEN_DETECT = EnvBool(True)
     SGLANG_WEG2_DEGEN_STOP = EnvBool(False)
     SGLANG_WEG2_DEGEN_MIN_SPAN = EnvInt(512)
+    # TAIL DUMP (EG 28.09.: the text of weg2-0-8 / weg2-1-13 was never kept):
+    # at a DEGEN-SUSPECT, and at the end of any request whose output reached
+    # DUMP_LONG ids (0 = off), the detokenizer hands the part's last <= 2048
+    # output ids to one background thread that writes ids + decoded text as
+    # <DUMP_DIR or $SGLANG_WEG2_EVIDENCE_DIR/degen>/degen_<pid>_<rid>_<reason>_<n>.json,
+    # at most DUMP_MAX files per process (0 = off).
+    SGLANG_WEG2_DEGEN_DUMP_MAX = EnvInt(16)
+    SGLANG_WEG2_DEGEN_DUMP_LONG = EnvInt(16384)
+    SGLANG_WEG2_DEGEN_DUMP_DIR = EnvStr(None)
     # TAIL_HANDOFF (H18, E1 of H17, fnFL2x132): P ends the prompt's last-but-one
     # chunk at c = floor_r(N-1) (r = QSA compress ratio) instead of the page,
     # and hands the GDN state after c plus the KV/QSA rows of the partial page

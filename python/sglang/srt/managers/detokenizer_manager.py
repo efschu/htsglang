@@ -151,9 +151,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # DEGEN-SUSPECT (managers/degen_detect.py): exact-repetition watch on
         # each request's decode tail, here because this process already holds
         # every new output id and is off the scheduler's decode round.
-        from sglang.srt.managers.degen_detect import DegenDetector
+        from sglang.srt.managers.degen_detect import DegenDetector, TailDumper
 
         self.degen = DegenDetector.from_env(getattr(self, "tokenizer", None))
+        # TAIL DUMP: the text behind a DEGEN-SUSPECT or a very long output,
+        # written by TailDumper's own thread (bounded), never on this path.
+        try:
+            self.degen.on_dump = TailDumper.from_env(getattr(self, "tokenizer", None))
+        except Exception as e:  # noqa: BLE001 -- an instrument never kills the detokenizer
+            logger.warning("DEGEN-DUMP off: %s: %s", type(e).__name__, e)
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
