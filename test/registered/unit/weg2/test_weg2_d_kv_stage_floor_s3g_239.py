@@ -16,7 +16,7 @@ WHAT MUST HOLD.
     D_r = min(ids, E - R) <= waves x (LRU + staging + capture_on[r]), with the
     scratch AFTER the stage rows moved and capture_on[r] = the rank's capture
     floor where it has KV cells, 0 where it has none. The launcher names each
-    rank's air and refuses a broken rank by name (W170) before the boot.
+    rank's air and refuses a broken rank by name (W171) before the boot.
 (3) The runtime: a rank with its own stage rows but no KV cells stops by name
     (W-STAGE-ROWS-NO-KV) at the capture and at the wake, never the anonymous
     'Step ids exceed ...'.
@@ -102,7 +102,7 @@ def test_a_stage_table_on_a_rank_without_kv_is_refused_by_name():
                            local_experts=120, verify_tokens=4, top_k=10, host_rank=2,
                            staging_rows=12)
     group = er.KvStageGroup(tables=(t0, t2), n_ranks=3)
-    with pytest.raises(L.Weg2DKvStageWavesRefused, match=r"W170 .*Stufenzeilen ohne KV"):
+    with pytest.raises(L.Weg2DKvStageWavesRefused, match=r"W171 .*Stufenzeilen ohne KV"):
         L.kv_stage_wave_floor(group, T251._rows(), fits, group.max_by_seats, 2, "D")
 
 
