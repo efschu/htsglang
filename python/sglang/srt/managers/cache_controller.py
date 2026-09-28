@@ -949,6 +949,40 @@ WEG2_HANDOFF_PAGE_KEYS: dict = {}  # rid -> P's page keys for the span the dorma
 WEG2_HANDOFF_OFF: dict = {}
 
 
+def probe_hold_pin(controller, operation, hash_value, hit_tokens=None) -> int:
+    """#257 (a): reference the probe's reported pages that are COMPLETE
+    in the arena (probe_hold.pin). No arena, no hold -- a Form A worker's
+    byteless pool and every non-arena backend pass through unchanged.
+
+    A module function, not a method: ``prefetch_thread_func`` is driven
+    unbound over controller stand-ins (#1233/H51/xsn392 suites), and a new
+    method on the class is an AttributeError there -- measured, three suites
+    red on 1961f756ad. Everything is read with getattr, so a stand-in without
+    an arena pool returns 0 before it touches ``storage_backend`` or
+    ``page_size`` (``hit_tokens`` cuts the keys to the probe's hit here, after
+    that check, for the same reason)."""
+    pool = getattr(controller, "mem_pool_host", None)
+    if (
+        not hash_value
+        or not getattr(pool, "arena_read", False)
+        or getattr(controller, "storage_backend", None) is None
+        or operation.is_terminated()
+    ):
+        return 0
+    if hit_tokens is not None:
+        hash_value = hash_value[: int(hit_tokens) // int(controller.page_size)]
+        if not hash_value:
+            return 0
+    try:
+        if not pool.ensure_bound(controller.storage_backend, role="kv"):
+            return 0
+        stems = weg2_suffixed_stems(controller.storage_backend, hash_value)
+        return _probe_hold.pin(operation, pool, stems)
+    except Exception:  # noqa: BLE001 - a hold is an improvement, never a wall
+        logger.warning("#257 PROBE-HOLD pin failed; the read runs without a hold", exc_info=True)
+        return 0
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -3916,27 +3950,6 @@ class HiCacheController:
             )
             return 0
 
-    def _probe_hold_pin(self, operation, hash_value) -> int:
-        """#257 (a): reference the probe's reported pages that are COMPLETE
-        in the arena (probe_hold.pin). No arena, no hold -- a Form A worker's
-        byteless pool and every non-arena backend pass through unchanged."""
-        pool = getattr(self, "mem_pool_host", None)
-        if (
-            not hash_value
-            or not getattr(pool, "arena_read", False)
-            or self.storage_backend is None
-            or operation.is_terminated()
-        ):
-            return 0
-        try:
-            if not pool.ensure_bound(self.storage_backend, role="kv"):
-                return 0
-            stems = weg2_suffixed_stems(self.storage_backend, hash_value)
-            return _probe_hold.pin(operation, pool, stems)
-        except Exception:  # noqa: BLE001 - a hold is an improvement, never a wall
-            logger.warning("#257 PROBE-HOLD pin failed; the read runs without a hold", exc_info=True)
-            return 0
-
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
@@ -4052,7 +4065,7 @@ class HiCacheController:
                     self._prefetch_drained_after_stop += 1
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
                 # #257 (a): hold what the probe reports until the read
-                self._probe_hold_pin(operation, hash_value[: storage_hit_count // self.page_size])
+                probe_hold_pin(self, operation, hash_value, storage_hit_count)
                 # fnFL2x22: the FORM is agreed over the group first (one
                 # scalar MAX), never read off this rank alone -- see
                 # CLAIM_VOTE_ABSTAIN for the boot that measured the mismatch.

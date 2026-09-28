@@ -25,6 +25,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
+from sglang.srt.managers import cache_controller as _cc  # noqa: E402
 from sglang.srt.managers.cache_controller import HiCacheController  # noqa: E402
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
 from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
@@ -103,8 +104,8 @@ def _controller(p, be):
 def _probe(c, op, hashes):
     """What prefetch_thread_func does after the hit query: hold what it reports
     (absent before #257 -- then nothing is held)."""
-    pin = getattr(c, "_probe_hold_pin", None)
-    return pin(op, hashes) if callable(pin) else 0
+    pin = getattr(_cc, "probe_hold_pin", None)
+    return pin(c, op, hashes) if callable(pin) else 0
 
 
 def _read(c, op, hashes, host):
@@ -164,7 +165,7 @@ def test_holds_above_the_group_min_and_after_the_read_go_back(tmp_path):
         _write(arena, h + "_sfx", i)
     c = _controller(p, be)
     op = _Op()
-    assert c._probe_hold_pin(op, hashes) == 12
+    assert _cc.probe_hold_pin(c, op, hashes) == 12
     probe_hold.release(op, p, 8, reason="group-min")        # the group agreed on 8
     host = p.alloc_read(8)
     assert c._arena_page_get(op, hashes[:8], host) == 8
@@ -185,7 +186,7 @@ def test_a_stale_hold_is_released_by_name(tmp_path):
         _write(arena, h + "_sfx", i)
     c = _controller(p, be)
     op = _Op()
-    assert c._probe_hold_pin(op, hashes) == 4
+    assert _cc.probe_hold_pin(c, op, hashes) == 4
     assert not probe_hold.expire_if_stale(op, p)
     assert probe_hold.expire_if_stale(op, p, now=op.probe_pins_t0 + probe_hold.PROBE_HOLD_MAX_S + 1)
     assert arena.ref_census()[1] == 0
