@@ -3025,16 +3025,20 @@ def _kv_stage_born(pool, t: torch.Tensor, name: str) -> torch.Tensor:
     """#251c: a K/V buffer of D's stage-form pool keeps its top-stage range and
     only stage S0's pages (weg2/d_seat_vram.kv_stage_born); every other pool's
     buffer passes through untouched."""
-    from sglang.srt.weg2.d_seat_vram import kv_stage_born
+    from sglang.srt.weg2.d_seat_vram import kv_stage_born, kv_stage_boot_rows
 
     rows = max(1, int(t.shape[0]))
-    return kv_stage_born(
+    t = kv_stage_born(
         t,
         pool_size=int(pool.size),
         page_size=int(pool.page_size),
         name=name,
         tokens_per_slot=max(1, (int(pool.size) + int(pool.page_size)) // rows),
     )
+    stage_rows = kv_stage_boot_rows(int(pool.size), int(pool.page_size))
+    if stage_rows is not None:
+        pool.set_stage_backed_rows(stage_rows)
+    return t
 
 
 def zero_kv_data_buffers(kvcache) -> int:
@@ -3375,6 +3379,10 @@ class MHATokenToKVPool(KVCache):
         #: unmapped. Empty = fully resident; a full set = fully released.
         self._released_layers = set()
         self._post_capture_owner = None
+        # #251c: the rows D's KV stage keeps mapped (set_stage_backed_rows),
+        # None off. Must exist before _create_buffers: a tensor born trimmed
+        # sets it (_kv_stage_born).
+        self._stage_backed_rows = None
         # #330 dial: chunked physical commits make the tail releasable at
         # runtime; None keeps one handle per extension (stock post-capture).
         self._vmm_commit_chunk_bytes = vmm_commit_chunk_bytes
@@ -4045,6 +4053,16 @@ class MHATokenToKVPool(KVCache):
         """
         return not self._released_layers
 
+    def set_stage_backed_rows(self, rows) -> None:
+        """#251c: the rows of each K/V buffer D's KV stage keeps mapped, or
+        None (no stage). The saver trims these tensors itself -- there is no
+        VMM owner whose watermark would say so -- so the stage is the backing
+        this pool reports: ``_committed_row_bound`` and ``safe_zero_rows`` take
+        it, and nothing that honours them writes an unmapped row. rc12z13 died
+        in the first wake assigning ``safe_zero_rows`` itself (a property since
+        #656, 65432cea6d); the bound is set HERE, the property reads it."""
+        self._stage_backed_rows = None if rows is None else int(rows)
+
     @property
     def safe_zero_rows(self):
         """Rows of each K/V buffer a kernel may legally write, or None.
@@ -4074,7 +4092,9 @@ class MHATokenToKVPool(KVCache):
         owner = self._post_capture_owner
         specs = getattr(owner, "_specs", None) if owner is not None else None
         if not specs:
-            return None
+            # #251c: token-major buffers, one row per token -- the stage's
+            # rows as they are (None off: the whole tensor is backed)
+            return self._stage_backed_rows
         tokens = int(self.size) + int(self.page_size)
         watermark = self._committed_row_bound()
         if watermark is not None:
@@ -4139,9 +4159,12 @@ class MHATokenToKVPool(KVCache):
         were minted at a larger backing and outlived a shrink.
         """
         owner = self._post_capture_owner
-        if owner is None:
-            return None
-        return int(owner.uniform_backed_tokens)
+        bound = None if owner is None else int(owner.uniform_backed_tokens)
+        # #251c: D's KV stage bounds the mapped rows like a watermark does
+        stage = self._stage_backed_rows
+        if stage is not None:
+            bound = stage if bound is None else min(bound, stage)
+        return bound
 
     @property
     def reserved_backing_rows(self) -> int:
