@@ -142,13 +142,21 @@ class RankForm:
                 f"tokens {list(self.tokens) if self.tokens is not None else 'default'}")
 
 
+def f6_wired() -> bool:
+    """Form B's precondition, read from THE seam registry (rank_role F6), never
+    from a caller's flag: a TP group over a subset of the ranks."""
+    from sglang.srt.rank_role import SEAMS
+
+    return bool(SEAMS["F6"].wired)
+
+
 def resolve_rank_form(
     weights: Sequence,
     tokens: Optional[Sequence] = None,
     *,
     rank_role: Optional[str] = None,
     dense: bool = True,
-    subgroup_tp_wired: bool = False,
+    subgroup_tp_wired: Optional[bool] = None,
 ) -> RankForm:
     """The form NF's #239 flags describe, or a named refusal.
 
@@ -201,7 +209,7 @@ def resolve_rank_form(
                 f"needs a token share >= 1 (host 0 is a #239 Form A layout for MoE/QSA)")
     else:
         kind = FORM_B
-        if not subgroup_tp_wired:
+        if not (f6_wired() if subgroup_tp_wired is None else subgroup_tp_wired):
             raise _refuse(
                 RankFormSubgroupTpNotWired,
                 f"weights {list(w)}: TP over ranks {list(weight_ranks)} with KV-only rank(s) "
@@ -406,3 +414,56 @@ def choose_form(
     best = min(costs, key=lambda k: costs[k].round_ms)
     table = ", ".join(f"{k} {costs[k].round_ms:.2f} ms" for k in sorted(costs))
     return best, f"{FORM_CHOICE_MARKER} CHOSEN {best} (decode round: {table})"
+
+
+# --------------------------------------------------------------------------
+# Form B (FORM-B-F6-ENTWURF-0928.md v2 §1-2). Its own plan, NOT a second host:
+# RankRolePlan keeps exactly one host. The scheduler group `tp` stays ALL
+# ranks (NF objection 1); the model's linear/vocab collectives run on a
+# separate `model_tp` group over the weight ranks only.
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FormBPlan:
+    weight_ranks: Tuple[int, ...]
+    kv_ranks: Tuple[int, ...]
+    weights: Tuple[int, ...]
+
+    @property
+    def lead(self) -> int:
+        """Draft (solo), QSA index and the vision lease live here."""
+        return self.weight_ranks[0]
+
+    @property
+    def world(self) -> int:
+        return len(self.weights)
+
+    def model_tp_partition(self) -> List[List[int]]:
+        """The `model_tp` group list every rank passes to new_group (torch
+        rule: all ranks build every group): W as one group, each KV-only rank
+        in a group of its own -- it never enters a model_tp collective."""
+        return [list(self.weight_ranks)] + [[r] for r in self.kv_ranks]
+
+    def model_tp_ratio(self) -> List[int]:
+        """The uneven TP vector INSIDE model_tp (weight ranks only)."""
+        return [self.weights[r] for r in self.weight_ranks]
+
+    def scheduler_tp_ranks(self) -> List[int]:
+        """NF objection 1: request/host exchange, prefetch/claim and the
+        tp_match_floor MINs run over ALL ranks -- a KV-only rank must join."""
+        return list(range(self.world))
+
+    def dcp_ranks(self) -> List[int]:
+        """A, T, Q, M and the spec channel (draft_block, accept, spec_k)."""
+        return list(range(self.world))
+
+    def index_ranks(self) -> List[int]:
+        """NF answer 3: the QSA index only on lead; W minus lead behaves like K."""
+        return [self.lead]
+
+
+def form_b_plan(form: RankForm) -> FormBPlan:
+    if form.kind != FORM_B:
+        raise ValueError(f"form_b_plan: form {form.kind} is not B ({form.line()})")
+    return FormBPlan(weight_ranks=form.weight_ranks, kv_ranks=form.kv_only_ranks,
+                     weights=form.weights)

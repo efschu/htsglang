@@ -243,3 +243,27 @@ def test_second_token_vector_source_is_refused_by_name():
     ok = _lane_args(uneven_token_vector="2,49,49", rank_kv_ratio="capacity")
     ok._refuse_second_token_vector_source()   # a MODE is not a second vector
     assert _lane_args(uneven_token_vector="2,49,49").uneven_weighted_dcp_enabled()
+
+
+def test_form_b_waits_for_the_f6_seam_itself(monkeypatch):
+    from sglang.srt import rank_role
+
+    assert rank_role.SEAMS["F6"].wired is False
+    with pytest.raises(rf.RankFormSubgroupTpNotWired):
+        rf.resolve_rank_form([77, 23, 0], [10, 45, 45])       # reads the registry
+    monkeypatch.setitem(rank_role.SEAMS, "F6",
+                        rank_role.SEAMS["F6"].__class__(**{**rank_role.SEAMS["F6"].__dict__, "wired": True}))
+    b = rf.resolve_rank_form([77, 23, 0], [10, 45, 45])
+    assert b.kind == rf.FORM_B
+
+
+def test_form_b_plan_keeps_the_scheduler_group_on_all_ranks():
+    b = rf.resolve_rank_form([77, 23, 0], [10, 45, 45], subgroup_tp_wired=True)
+    p = rf.form_b_plan(b)
+    assert (p.lead, p.weight_ranks, p.kv_ranks) == (0, (0, 1), (2,))
+    assert p.model_tp_partition() == [[0, 1], [2]]
+    assert p.model_tp_ratio() == [77, 23]
+    assert p.scheduler_tp_ranks() == [0, 1, 2] == p.dcp_ranks()   # NF objection 1
+    assert p.index_ranks() == [0]                                  # NF answer 3
+    with pytest.raises(ValueError):
+        rf.form_b_plan(rf.resolve_rank_form([1, 1, 1]))
