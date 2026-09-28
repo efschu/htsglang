@@ -2125,7 +2125,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             return out_tokens
 
         shard = lm_head.shard_indices
-        tp_group = get_tp_group()
+        # F6 2b: the vocab shards live on the MODEL tp group (Form B: W only)
+        from sglang.srt.distributed.parallel_state import get_model_tp_group
+
+        tp_group = get_model_tp_group()
         # G-A1: a head BUILT at TP=1 (the weightless lane's head) owns the whole
         # vocab; there is nobody to gather with, whatever the group's size.
         tp_size = 1 if int(getattr(lm_head, "tp_size", 0) or 0) == 1 else int(tp_group.world_size)
@@ -3886,7 +3889,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if _vlp is not None and logits_output.next_token_logits is not None:
             if self._verify_vocab_argmax_eligible(batch, sampling_info, lm_head, _vlp):
                 _shard = lm_head.shard_indices
-                _tp = get_tp_group()
+                from sglang.srt.distributed.parallel_state import get_model_tp_group
+
+                _tp = get_model_tp_group()
                 vocab_target_predict = vocab_parallel_argmax(
                     logits_output.next_token_logits,
                     int(_shard.num_org_elements),

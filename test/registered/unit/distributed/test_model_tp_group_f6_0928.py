@@ -46,6 +46,11 @@ def _run(rank, port, out, partition):
     x = torch.full((2,), float(rank + 1))
     res["mtp_sum"] = mtp.all_reduce(x.clone()).tolist()
     res["tp_sum"] = tp.all_reduce(x.clone()).tolist()
+    # F6 2b: the model's linear/vocab ops run on model_tp, control on tp
+    from sglang.srt.distributed import communication_op as co
+
+    res["op_ar"] = co.tensor_model_parallel_all_reduce(x.clone()).tolist()
+    res["op_ag"] = co.tensor_model_parallel_all_gather(x.clone(), dim=-1).tolist()
     with open(os.path.join(out, f"{rank}.pkl"), "wb") as f:
         pickle.dump(res, f)
     ps.destroy_model_parallel()
@@ -75,12 +80,17 @@ def test_model_tp_is_the_weight_ranks_and_tp_stays_everyone():
     assert res[0]["mtp_ranks"] == res[1]["mtp_ranks"] == [0, 1]
     assert res[0]["mtp_sum"] == res[1]["mtp_sum"] == [3.0, 3.0]   # 1 + 2, rank 2 not in it
     assert res[2]["mtp_ranks"] == [2] and res[2]["mtp_sum"] == [3.0, 3.0]  # alone: its own 3
+    # 2b: tensor_model_parallel_* reduce/gather over W only
+    assert res[0]["op_ar"] == res[1]["op_ar"] == [3.0, 3.0]
+    assert res[0]["op_ag"] == res[1]["op_ag"] == [1.0, 1.0, 2.0, 2.0]
+    assert res[2]["op_ag"] == [3.0, 3.0]
 
 
 def test_without_a_partition_model_tp_is_the_tp_group():
     res = _spawn(None)
     for r in range(3):
         assert res[r]["mtp_is_tp"] is True and res[r]["mtp_sum"] == [6.0, 6.0]
+        assert res[r]["op_ar"] == [6.0, 6.0]                   # byte-identical: the TP group
 
 
 def test_a_partition_must_cover_every_rank_once():
