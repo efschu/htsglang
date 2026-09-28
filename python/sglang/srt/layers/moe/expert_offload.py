@@ -4626,6 +4626,7 @@ class MoEExpertOffloadCache:
         H12: expert-major -- each spill expert fetched once and held by one
         row), then republish those rows to the device tables."""
         self.land_deferred_rows()  # H31b: run_waves plans with every resident row
+        resume_warm().eager_reached(self)  # RW: an eager layer never waits for the warm
         self.begin_eager_pool()
         out = self.run_waves(
             dispatch_output, apply_fn, lookahead=None, order=self._pool_eager_wave_order
@@ -4668,6 +4669,7 @@ class MoEExpertOffloadCache:
         from sglang.srt.environ import envs
 
         keep = envs.SGLANG_OPT_MOE_POOL_KEEP_LRU.get()
+        resume_warm().note_eager_sync(lid, len(self._scratch_holds))  # RW instrument
         report = sync_tables(
             self._pool_tables, dict(self._scratch_holds), keep_unwritten=keep
         )
@@ -4749,6 +4751,41 @@ class MoEExpertOffloadCache:
             local = to_local(torch.tensor(ids, dtype=torch.int64, device=dev))
             ids = [int(x) for x in local.tolist()]
         pairs = seed_lru_rows(self._pool_tables, ids, limit=int(limit))
+        if not pairs:
+            return 0
+        dev = self._pool_dsts[0].device
+        src = torch.tensor([p[0] for p in pairs], dtype=torch.int32, device=dev)
+        dst = torch.tensor([p[1] for p in pairs], dtype=torch.int32, device=dev)
+        count = torch.tensor([len(pairs)], dtype=torch.int32, device=dev)
+        copy_rows(self._pool_srcs, self._pool_dsts, src, dst, count)
+        return len(pairs)
+
+    def lru_snapshot(self, limit: int = 0) -> List[int]:
+        """RW: the LOCAL expert ids this layer's LRU rows own right now, most
+        recently used first (``row_use`` desc), at most ``limit`` (0 = all).
+        Two small host reads of the pool tables; call it outside any capture."""
+        if not self._pool_ready:
+            return []
+        t = self._pool_tables
+        lo, hi = int(t.lru_start), int(t.pool_rows)
+        key = t.row_key[lo:hi].cpu().tolist()
+        use = t.row_use[lo:hi].cpu().tolist()
+        owned = sorted(((int(u), int(k)) for k, u in zip(key, use) if int(k) >= 0), reverse=True)
+        ids = [k for _u, k in owned]
+        return ids[:limit] if limit > 0 else ids
+
+    def warm_lru_local(self, ids, limit: int = 0) -> int:
+        """RW: hand free LRU rows to the LOCAL expert ids ``ids`` and copy their
+        bytes from the pinned store rows, on the CURRENT stream -- the same rows,
+        the same copies a miss makes (``seed_lru_rows`` + ``copy_rows``); no new
+        VRAM, no transient. Returns the rows filled."""
+        if not self._pool_ready or not ids:
+            return 0
+        import torch
+
+        from sglang.srt.layers.moe.expert_pool_device import copy_rows, seed_lru_rows
+
+        pairs = seed_lru_rows(self._pool_tables, [int(e) for e in ids], limit=int(limit))
         if not pairs:
             return 0
         dev = self._pool_dsts[0].device
@@ -6406,6 +6443,184 @@ class DeferredRowsFill:
 
 
 _DEFERRED_ROWS_FILL: Optional[DeferredRowsFill] = None
+
+
+# ---------------------------------------------------------------------------
+# RW RESUME WARM (28.09., NF rc12z22 D): the first eager extend after a wake
+# re-fetched its experts one wave at a time -- "MoE expert pool layer N sync:
+# eager pass wrote 23..58 rows", 1.6-2.0 s of compute for 8..229 tokens, while
+# an extend with its experts resident took 12-16 ms. The wake's rearm drops the
+# LRU (the other group overwrote it) and prefetches nothing (rows_from_store=0
+# prefetched=0 overlap=off). The resumes are the requests D decoded before it
+# slept, so the experts its LRU owned then are the ones their tail extend
+# routes to.
+#
+#   * SNAPSHOT at the sleep, before the pauses: per pool layer the LRU's local
+#     expert ids, most recent first (two small host reads per layer, no copy).
+#   * WARM after the legs (never in a leg -- the x147 lesson): the rearm arms
+#     the queue; the scheduler warms up to LAYERS_PER_TICK layers per pass,
+#     only while the device is idle (nothing running, nothing in flight) and a
+#     wake read is still settling. Rows: only those the rearm left free, from
+#     the same pinned store rows a miss copies from -- no VRAM, no transient.
+#   * NEVER WAITS: an eager forward that reaches a layer still queued removes
+#     it (the eager sync fetches as today); a pass that admits work stops the
+#     warm (``cancel``). The copies are on the scheduler's stream, ordered
+#     before the next forward like the rearm's own.
+#   * UNIFORM: the snapshot comes from each rank's own LRU, which the
+#     replicated routing wrote; the ticks run in the group-agreed settle passes
+#     on every rank; no collective.
+# Switch SGLANG_WEG2_RESUME_WARM (default on), SGLANG_WEG2_RESUME_WARM_ROWS
+# (rows per layer, 0 = every snapshot row), SGLANG_WEG2_RESUME_WARM_LAYERS
+# (layers per pass).
+# ---------------------------------------------------------------------------
+
+RESUME_WARM_ENV = "SGLANG_WEG2_RESUME_WARM"
+RESUME_WARM_ROWS_ENV = "SGLANG_WEG2_RESUME_WARM_ROWS"
+RESUME_WARM_LAYERS_ENV = "SGLANG_WEG2_RESUME_WARM_LAYERS"
+
+
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def resume_warm_enabled() -> bool:
+    import os
+
+    return (os.environ.get(RESUME_WARM_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _pool_caches(model):
+    for module in model.modules():
+        cache = getattr(module, "_expert_offload", None)
+        if isinstance(cache, MoEExpertOffloadCache) and cache._pool_ready:
+            yield cache
+
+
+class ResumeWarm:
+    def __init__(self) -> None:
+        self._queue: List = []
+        self.reset_stats()
+
+    def reset_stats(self) -> None:
+        self.snap_layers = self.snap_rows = 0
+        self.snap_ms = 0.0
+        self.warm_layers = self.warm_rows = 0
+        self.warm_ms = 0.0
+        self.skipped_eager = self.skipped_cancel = 0
+        self.cancel_reason = ""
+        self._first_extend_layers: Dict = {}
+        self._first_extend_closed = False
+
+    # -- the sleep --------------------------------------------------------
+    def snapshot(self, models) -> int:
+        """Record every pool layer's LRU owners (before the pauses)."""
+        import time
+
+        if not resume_warm_enabled():
+            return 0
+        t0 = time.perf_counter()
+        rows = _env_int(RESUME_WARM_ROWS_ENV, 32)
+        layers = n = 0
+        for model in models:
+            for cache in _pool_caches(model):
+                ids = cache.lru_snapshot(rows)
+                cache._rw_snap = ids
+                layers += 1
+                n += len(ids)
+        self.snap_layers, self.snap_rows = layers, n
+        self.snap_ms = (time.perf_counter() - t0) * 1000.0
+        return n
+
+    # -- the wake, after the rearm (the legs are over) --------------------
+    def arm(self, models) -> int:
+        stats = (self.snap_layers, self.snap_rows, self.snap_ms)
+        self.reset_stats()
+        self.snap_layers, self.snap_rows, self.snap_ms = stats
+        self._queue = []
+        if not resume_warm_enabled():
+            return 0
+        for model in models:
+            for cache in _pool_caches(model):
+                if getattr(cache, "_rw_snap", None):
+                    self._queue.append(cache)
+        return len(self._queue)
+
+    def pending(self) -> int:
+        return len(self._queue)
+
+    def tick(self, layers: Optional[int] = None) -> int:
+        """Warm up to ``layers`` queued layers now (the caller checked that the
+        device is idle). Returns the layers warmed."""
+        import time
+
+        if not self._queue:
+            return 0
+        n = _env_int(RESUME_WARM_LAYERS_ENV, 8) if layers is None else int(layers)
+        t0 = time.perf_counter()
+        done = 0
+        while self._queue and done < max(1, n):
+            cache = self._queue.pop(0)
+            ids = getattr(cache, "_rw_snap", None) or []
+            cache._rw_snap = None
+            self.warm_rows += cache.warm_lru_local(ids)
+            self.warm_layers += 1
+            done += 1
+        self.warm_ms += (time.perf_counter() - t0) * 1000.0
+        return done
+
+    def eager_reached(self, cache) -> None:
+        """An eager forward reached ``cache``: never wait -- drop it."""
+        if cache in self._queue:
+            self._queue.remove(cache)
+            cache._rw_snap = None
+            self.skipped_eager += 1
+
+    def cancel(self, reason: str) -> int:
+        n = len(self._queue)
+        for cache in self._queue:
+            cache._rw_snap = None
+        self._queue = []
+        if n:
+            self.skipped_cancel += n
+            self.cancel_reason = reason
+        return n
+
+    # -- instrument -------------------------------------------------------
+    def note_eager_sync(self, layer_id, rows: int) -> None:
+        """The first eager forward after the wake: rows its sync wrote per
+        layer; it ends when a layer syncs a second time."""
+        if self._first_extend_closed:
+            return
+        if layer_id in self._first_extend_layers:
+            self._first_extend_closed = True
+            return
+        self._first_extend_layers[layer_id] = int(rows)
+
+    def fields(self) -> str:
+        fe = self._first_extend_layers
+        return (
+            f"first_extend_eager_syncs={sum(1 for r in fe.values() if r > 0)} "
+            f"first_extend_rows={sum(fe.values())} snap_layers={self.snap_layers} "
+            f"snap_rows={self.snap_rows} snap_ms={self.snap_ms:.1f} "
+            f"warm_layers={self.warm_layers} warm_rows={self.warm_rows} warm_ms={self.warm_ms:.1f} "
+            f"skipped_eager={self.skipped_eager} skipped_cancel={self.skipped_cancel}"
+            + (f" cancel={self.cancel_reason}" if self.cancel_reason else "")
+        )
+
+
+_RESUME_WARM: Optional[ResumeWarm] = None
+
+
+def resume_warm() -> ResumeWarm:
+    global _RESUME_WARM
+    if _RESUME_WARM is None:
+        _RESUME_WARM = ResumeWarm()
+    return _RESUME_WARM
 
 
 def deferred_rows_fill() -> DeferredRowsFill:

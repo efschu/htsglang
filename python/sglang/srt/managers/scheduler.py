@@ -1276,6 +1276,76 @@ def _head_vote_len(req) -> int:
     return vote
 
 
+def _weg2_device_idle(sched) -> bool:
+    """RW: nothing runs and nothing is in flight on this rank's device -- the
+    only state in which the pool tables may be rewritten from the host
+    (a replay promotes into them). Replicated: every rank of the lockstep
+    group has the same running batch, last batch and result queue."""
+    rb = getattr(sched, "running_batch", None)
+    if rb is not None and not rb.is_empty():
+        return False
+    lb = getattr(sched, "last_batch", None)
+    if lb is not None and not lb.is_empty():
+        return False
+    if getattr(sched, "enable_overlap", False) and len(getattr(sched, "result_queue", ()) or ()):
+        return False
+    return getattr(sched, "chunked_req", None) is None
+
+
+def _weg2_resume_warm_tick(sched) -> int:
+    """RW (expert_offload.ResumeWarm): warm queued layers while a wake read is
+    still settling and the device is idle; the settle over = the rest is
+    skipped (the eager sync fetches it as today). Never raises."""
+    try:
+        from sglang.srt.layers.moe.expert_offload import resume_warm
+
+        rw = resume_warm()
+        if not rw.pending():
+            return 0
+        if not getattr(sched, "weg2_post_wake_settle", None):
+            rw.cancel("settle_done")
+            return 0
+        if getattr(sched, "weg2_dormant", False) or not _weg2_device_idle(sched):
+            return 0
+        return rw.tick()
+    except Exception as exc:  # noqa: BLE001 -- a hint never breaks a pass
+        logger.warning("RW RESUME-WARM tick skipped: %s", exc)
+        return 0
+
+
+def _weg2_resume_first_token_note(sched, batch) -> bool:
+    """RW instrument (NF's three numbers, one line per wake): wake -> first
+    decode forward, the resume leg's duration, and the first eager extend's
+    syncs, beside the warm's own counts."""
+    if not getattr(sched, "_rw_first_token_open", False):
+        return False
+    try:
+        mode = getattr(batch, "forward_mode", None)
+        if mode is None or not mode.is_decode():
+            return False
+        import time as _t
+
+        sched._rw_first_token_open = False
+        wake = getattr(sched, "_weg2_last_wake_t", None)
+        t0 = getattr(sched, "_weg2_resume_t0", None)
+        from sglang.srt.layers.moe.expert_offload import resume_warm
+
+        rw = resume_warm()
+        rw.cancel("first_decode")
+        logger.info(
+            "RW WAKE-FIRST-TOKEN wake_to_first_decode_ms=%.0f leg_ms=%.0f %s "
+            "(RW: experts of the resumes warmed after the legs; the leg must not grow, "
+            "the first extend's eager syncs must fall)",
+            -1.0 if wake is None else (_t.perf_counter() - wake) * 1000.0,
+            -1.0 if (wake is None or t0 is None) else (wake - t0) * 1000.0,
+            rw.fields(),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("RW WAKE-FIRST-TOKEN n/a: %s", exc)
+        return False
+
+
 #: FA (28.09.): switch of the prefetch span's anchor start, default on; 0 = the
 #: span starts at ``len(prefix_indices) + host_hit_length`` as before.
 PREFETCH_FROM_ANCHOR_ENV = "SGLANG_WEG2_PREFETCH_FROM_ANCHOR"
@@ -3882,6 +3952,7 @@ class Scheduler(
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
                 self._weg2_post_wake_pass_log(batch)  # Wake-Parallel item 2
+                _weg2_resume_first_token_note(self, batch)  # RW: one line per wake
             else:
                 batch_result = None
 
@@ -11140,6 +11211,7 @@ class Scheduler(
         self.process_pending_weg2_park()  # Punkt 2 (18.09.)
         if getattr(self, "weg2_d_parked", None):
             self._weg2_d_park_tick()  # H91b
+        _weg2_resume_warm_tick(self)  # RW: experts of the resumes, after the legs, never waited for
         if getattr(self, "weg2_post_wake_settle", None):
             self._weg2_post_wake_settle_tick()  # #1471
 
