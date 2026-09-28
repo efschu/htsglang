@@ -5609,11 +5609,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # locks; the flip runtime evicts the same way), so no rank
             # decides from its own shard -- and refuse THIS pass as before:
             # the next iteration's floor is published from the freed pools.
+            # H106: counted -- under H105b only the Form A host runs this; its
+            # verdict carries the drain to the workers (add_one_req).
             _ev = int(self.evictable_size())
             if _ev > 0:
                 _n = getattr(self, "_weg2_loadback_evicts", 0) + 1
                 self._weg2_loadback_evicts = _n
                 _res = self.evict(EvictParams(num_tokens=_ev))
+                self._weg2_loadback_drained_total = int(
+                    getattr(self, "_weg2_loadback_drained_total", 0) or 0
+                ) + int(getattr(_res, "num_tokens_evicted", 0) or _ev)
                 if _n <= 3 or (_n & (_n - 1)) == 0:
                     logger.info(
                         "WEG2-LOADBACK-EVICT rid=%s kv_tokens=%d floor=%d: the uniform "

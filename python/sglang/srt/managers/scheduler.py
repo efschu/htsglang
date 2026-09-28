@@ -4116,8 +4116,55 @@ class Scheduler(
             def _gather(payload):
                 return self._form_a_tp_gather("form-a-admission/tp<->verdict", payload)
 
+        # H106 (rc12z23 D 15:28:40-15:36:12): the host's load-back drain and
+        # its deadlock verdict ride this verdict (tp_match_floor docstring).
+        _tree = getattr(self, "tree_cache", None)
+        _drain_rides = _gather is None and _tree is not None
+        _watch = None
+        if is_host and _gather is None:
+            _watch = getattr(self, "_h106_wedge_watch", None)
+            if _watch is None:
+                from sglang.srt.environ import envs
+
+                _watch = self._h106_wedge_watch = _tmf.FormAAdmissionWedgeWatch(
+                    envs.SGLANG_WEG2_FORM_A_DEADLOCK_STOP_S.get()
+                )
+
+        def _worker_drain(host_drained):
+            # The worker's own leaf set, whole -- the host drained its whole set
+            # (the replicas hold the same leaves); the gate's lock on
+            # req.last_node keeps the matched prefix here as it does on the host.
+            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+            ev = int(_tree.evictable_size())
+            got = _tree.evict(EvictParams(num_tokens=ev)) if ev > 0 else None
+            logger.info(
+                "H106 FORM-A LOADBACK-DRAIN FOLLOW host_drained=%d evictable=%d "
+                "evicted=%d: the attention host drained its evictable leaves for "
+                "a refused load-back; this worker drains alike so the group floor "
+                "sees the room",
+                int(host_drained), ev,
+                int(getattr(got, "num_tokens_evicted", 0) or 0),
+            )
+
         def _follow(req, gate, price=None, budget=None):
             local = _tmf.ADMISSION_ADMIT if gate is None else gate.name
+            drained, stop = 0, ""
+            if is_host and _drain_rides:
+                # set by add_one_req around ITS host-first load-back only
+                drained = int(getattr(req, "_h106_host_drained", 0) or 0)
+                req._h106_host_drained = 0
+            if _watch is not None:
+                rb = getattr(self, "running_batch", None)
+                running_empty = (
+                    rb is not None
+                    and rb.is_empty()
+                    and getattr(self, "chunked_req", None) is None
+                )
+                stop = _watch.observe(
+                    req.rid, local, price, budget,
+                    running_empty=running_empty, now=time.monotonic(),
+                )
             code = _tmf.form_a_admission_verdict(
                 req.rid,
                 local,
@@ -4126,6 +4173,9 @@ class Scheduler(
                 price=price,
                 budget=budget,
                 gather=_gather,
+                drained=drained,
+                stop=stop,
+                on_host_drain=_worker_drain if _drain_rides else None,
             )
             return None if code == _tmf.ADMISSION_ADMIT else AddReqResult[code]
 
@@ -5841,6 +5891,11 @@ class Scheduler(
         from sglang.srt.weg2 import d_park_runtime
 
         return d_park_runtime.admission(self, running_batch)
+
+    def _weg2_sa_exclude_displaced(self, prefetch_verdicts) -> None:
+        from sglang.srt.weg2 import d_park_runtime
+
+        d_park_runtime.exclude_displaced(self, prefetch_verdicts)
 
     def _weg2_d_park_abort(self, recv_req) -> int:
         from sglang.srt.weg2 import d_park_runtime
@@ -14739,6 +14794,7 @@ class Scheduler(
         # H91b: on group D the parked requests come first and hold the seats
         # they return to (weg2/d_seats.admission_gate); None = stock loop.
         _d_park_gate = self._weg2_d_park_admission(running_batch)
+        self._weg2_sa_exclude_displaced(prefetch_verdicts)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds

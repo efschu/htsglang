@@ -586,6 +586,13 @@ class Envs:
     SGLANG_WEG2_PARK_DEMOTE_S = EnvFloat(1.0)
     # PARK_DEMOTE_BATCH (#248): pages copied per write batch of the demoter.
     SGLANG_WEG2_PARK_DEMOTE_BATCH = EnvInt(256)
+    # FORM_A_DEADLOCK_STOP_S (H106, rc12z23 D 15:28:54-15:36:12): on a Form A
+    # D group the attention host's admission verdict for the queue head has
+    # refused with NOTHING running and an unchanged budget for this many
+    # seconds -> every rank stops by name (FormAAdmissionDeadlock) instead of
+    # standing still until the deadman. Decided on the host, carried by the
+    # H105 verdict broadcast. 0 = never stop.
+    SGLANG_WEG2_FORM_A_DEADLOCK_STOP_S = EnvFloat(120.0)
     # L3_WRITE_BEHIND_S (L3-REUSE 0928, NF rc12z13: the first request after a
     # boot read 399 of 512 KV pages from L3 -- the rest had been in the
     # boot's /dev/shm arena only -- and the QSA index for 47): the tick of the
