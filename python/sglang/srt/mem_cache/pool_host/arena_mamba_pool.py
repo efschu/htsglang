@@ -287,10 +287,70 @@ class ArenaMambaPoolHost(MambaPoolHost):
         return rows
 
     def drop_unreferenced(self, slots: Sequence[int]) -> int:
-        """Free the displaced anchors' slots once no rank references them."""
+        """Free the displaced anchors' slots once no rank references them.
+
+        #257 (ii): an inner chunk anchor displaced here was dropped with no
+        disk copy (arena_drop_unreferenced) -- with NF's anchor interval 0 the
+        inner anchors live only in this 32-slot arena, and every fork below
+        one re-prefilled from the previous surviving anchor (27B 62e7b80aed:
+        8 of 20 clamps). The rank whose release leaves a slot unreferenced now
+        pins it, gives it an L3 copy through the claim's own disk half
+        (HiCacheFile.arena_secure_to_disk: already on disk -> nothing written),
+        unpins and drops. A slot another rank still references is left to
+        that rank's drop -- the last releaser writes, once."""
         if self.arena is None or not slots:
             return 0
-        return self.arena.drop_unreferenced(list(slots))
+        slots = [int(s) for s in slots]
+        self._secure_before_drop(slots)
+        return self.arena.drop_unreferenced(slots)
+
+    def _secure_before_drop(self, slots) -> dict:
+        arena = self.arena
+        out = {"on_disk": 0, "written": 0, "lost": 0}
+        try:
+            idle = [s for s, r in zip(slots, arena.slot_refs(slots)) if r == 0]
+        except Exception as exc:  # noqa: BLE001 - loud; the drop below still re-checks
+            logger.warning("#257 ANCHOR-DROP refs unreadable (%r): %d slot(s) not secured", exc, len(slots))
+            return out
+        pinned = []
+        for s in idle:
+            # the pin holds the slot COMPLETE while it is written (a CLAIMED
+            # slot is never dropped, so it needs no copy)
+            if arena.ref_slots([s], +1) != 1:
+                continue
+            stem = arena.slot_stem(s)
+            if stem and arena.find_slots([stem])[0] == (s, 2):
+                pinned.append(s)
+            else:
+                arena.ref_slots([s], -1)
+        if not pinned:
+            return out
+        try:
+            secure = getattr(self._backend, "arena_secure_to_disk", None)
+            if callable(secure):
+                total = int(arena.slot_bytes)
+                res = secure(arena, [(s, None, None, total) for s in pinned])
+                for k in out:
+                    out[k] += int(res.get(k, 0))
+            else:
+                out["lost"] += len(pinned)
+        except Exception as exc:  # noqa: BLE001 - loud, counted as lost
+            logger.warning("#257 ANCHOR-DROP disk copy failed (%r): %d anchor(s)", exc, len(pinned))
+            out["lost"] += len(pinned) - out["on_disk"] - out["written"]
+        finally:
+            arena.ref_slots(pinned, -1)
+        ArenaMHAHostPool._257_dropped_without_l3 = (
+            getattr(ArenaMHAHostPool, "_257_dropped_without_l3", 0) + out["lost"])
+        ArenaMHAHostPool._257_written_to_l3 = (
+            getattr(ArenaMHAHostPool, "_257_written_to_l3", 0) + out["written"])
+        n = getattr(ArenaMambaPoolHost, "_257_anchor_drop_n", 0) + 1
+        ArenaMambaPoolHost._257_anchor_drop_n = n
+        if n <= 16 or n % 64 == 0 or out["lost"]:
+            logger.info("#257 ANCHOR-DROP n=%d anchors=%d l3=on_disk:%d,written:%d dropped_without_l3=%d "
+                        "(total written=%d dropped_without_l3=%d)",
+                        n, len(pinned), out["on_disk"], out["written"], out["lost"],
+                        ArenaMHAHostPool._257_written_to_l3, ArenaMHAHostPool._257_dropped_without_l3)
+        return out
 
     def is_arena_id(self, i: int) -> bool:
         return self.staging_rows <= int(i) < self.staging_rows + self.arena_slots
