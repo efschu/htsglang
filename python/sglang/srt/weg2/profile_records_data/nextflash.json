@@ -124,6 +124,70 @@
    "kind": "memory",
    "power_limit_w": null,
    "power_limit_source": "not a power-dependent quantity (bytes per extend row)"
+  },
+  {
+   "name": "P_ACTIVATION_MIB",
+   "value": [
+    5984,
+    2952,
+    2944
+   ],
+   "provenance": "#242: group P's prefill transient per P stage at chunk 16384, planner definition peak_allocated - allocated after the chunk (p_card_chunk ChunkWindow.transient_planner_mib), maximum over EVERY WEG2-VRAM-PEAK phase=chunk window of 62 NF boots 26.-28.09. (cut 29,11,8, FR_P 0.324/0.637/0.734, chunk 16384), rounded up to 8 MiB. LOAD STATE = sequences in ONE chunk (the rank's last '#969N ADMIT bs=' before the window): PP0 bs1 3441 (n=306, rows 16384), bs2 4394, bs3 5310 (dkrnfh91dprsabar1dauer09271947 20:30:27, rows 16320), bs4 5979 (dkrnfh91visbar1dauer09271103 11:09:50, rows 16300), bs5 3947 (11182 rows); PP1 2945 and PP2 2941 in every bs (n~2800). COVERAGE: bs 1..5 per chunk seen, bs6 in one chunk (6 seats) NOT seen -- not extrapolated. ELASTIC: freed after the forward (the allocator keeps it reserved). Replaces the builtin 16384 support point 3697/3287/3267 (fnFL2x118..x146, one sequence per chunk): the runtime post and the pool model book it per stage; the P-KARTE takes max(builtin, record).",
+   "boots": [
+    "dkrnfh91visbar1dauer09271103",
+    "dkrnfh91dprsabar1dauer09271947",
+    "dkrnfh91dprsavisbar1dauer09280831",
+    "dkrnfh91bar1dauer09270212"
+   ],
+   "kind": "memory",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "POWER-LIMIT line of every named boot: nvml0=230 nvml1=400 nvml2=230 W",
+   "pp_layer_ratio": [
+    29,
+    11,
+    8
+   ],
+   "n": 62
+  },
+  {
+   "name": "P_PP_STAGE_FIXED_MIB",
+   "value": "1584.0,527.1,1065.4",
+   "provenance": "#242: per-stage non-layer weight + runtime state of THIS checkpoint, recovered as the runtime's own 'KV budget posts' weights + runtime state (16.836/10.475/9.221 GiB = 17240.1/10726.4/9442.3 MiB, identical on every 28.09. NF boot of this FR) minus the pool model's per-layer term at the same FR and cut (PP-CUT POOL TERM 539.87/927.21/1047.11 MiB/layer x 29/11/8, recovered from PP-POOL-JOIN priced_per_rank 796942/778073/653934 x cell 7168/3072/2048 B). With it the PP-POOL-JOIN of the 11:11 boot joins priced and realised available bytes to <= 2 MiB/rank (before: -758/-988/-2883 MiB -- the 27B row 2342/1106/3518 carried a draft head on the last stage that NF's P no longer holds, H25). One FR measured: a boot at another FR_P re-checks it (Metall-Marker PP-POOL-JOIN).",
+   "boots": [
+    "dkrnfh91dprsavisnoadopts0bar1dauer09281111",
+    "dkrnfh91dprsavisbar1dauer09280831"
+   ],
+   "kind": "memory",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "POWER-LIMIT line of every named boot: nvml0=230 nvml1=400 nvml2=230 W",
+   "pp_layer_ratio": [
+    29,
+    11,
+    8
+   ],
+   "n": 2
+  },
+  {
+   "name": "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT",
+   "value": 1.5602,
+   "provenance": "#242: the runtime's 'mamba state pool + speculative intermediate state + prefill activation reserve' post (1.072/0.390/0.292 GiB; spec 0 and activation 0 on P since the transient has its own post) over linear layers x slots (22/8/6 x 32): 1.5594/1.5602/1.5573 MiB per linear layer per slot, maximum 1.5602 -- the 27B row measured 1.5588, same GDN state geometry.",
+   "boots": [
+    "dkrnfh91dprsavisnoadopts0bar1dauer09281111",
+    "dkrnfh91dprsavisbar1dauer09280831"
+   ],
+   "kind": "memory",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "not a power-dependent quantity (bytes of the GDN state)",
+   "n": 6
   }
  ],
  "borrow": {
@@ -135,8 +199,6 @@
    "P_OVERSHOOT_MIB",
    "CALIBRATION_LAYERS",
    "MEASURED_MS_PER_LAYER",
-   "P_PP_STAGE_FIXED_MIB",
-   "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT",
    "X_RECORDED_R_D_TOKS",
    "X_RECORDED_R_P_TOKS",
    "X_RECORDED_FLIP_S",

@@ -70,11 +70,14 @@ class TestRecordsAreTheOldLiterals(unittest.TestCase):
         self.assertEqual(row.constant("D_AWAKE_REST_MIB"), (3186, None, None))
         self.assertEqual(row.constant("D_FIXED_MIB"), (7442, 1036, 914))
         got = dict(F.borrowed_constants("nextflash"))
-        self.assertEqual(set(got), set(OLD_27B) - {"P_DRAFT_RESIDENT_BUDGET_MIB", "D_OVERSHOOT_MIB"})
+        # #242 (28.09.): P's stage-fixed post and mamba rate measured on NF
+        self.assertEqual(set(got), set(OLD_27B) - {"P_DRAFT_RESIDENT_BUDGET_MIB", "D_OVERSHOOT_MIB",
+                                                   "P_PP_STAGE_FIXED_MIB",
+                                                   "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT"})
         self.assertEqual(set(got.values()), {"qwen27b"})
         for n in got:
             self.assertEqual(row.constant(n), OLD_27B[n], n)
-        self.assertIn("16 constant row(s) BORROWED", F.borrowed_constants_line("nextflash"))
+        self.assertIn("14 constant row(s) BORROWED", F.borrowed_constants_line("nextflash"))
 
     def test_launcher_aliases(self):
         if L is None:

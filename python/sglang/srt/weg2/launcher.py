@@ -3519,6 +3519,61 @@ P_PREFILL_ACTIVATION_RESERVE_MIB = 1024.0
 #: on PP2 draws 3.19 GiB (x118 02:36:24, and x145/x146 without a draft on P).
 P_PREFILL_TRANSIENT_SUPPORT = _p_card.P_TRANSIENT_SUPPORT_FNFL2
 
+#: #242: the profile's OWN measured prefill transient per P stage, MiB, at the
+#: chunk :data:`P_ACTIVATION_RECORD_CHUNK` (``profile_records_data/<profile>
+#: .json``). Where a profile carries it, the record REPLACES the builtin
+#: support point of that chunk (H94: RECORD > BUILTIN): the runtime's post
+#: (``P_PREFILL_TRANSIENT_ENV``) and the pool model book the SAME bytes per
+#: stage. The builtin point (fnFL2x118..x146, 3697/3287/3267) was taken with
+#: one sequence per chunk; the NF Dauerlauf of 28.09. packs two to five
+#: sequences into one 16k chunk, and PP0 then draws 4594 MiB while PP1/PP2 stay
+#: at 2945/2941 (planner definition peak - allocated, every WEG2-VRAM-PEAK
+#: chunk window of 15 boots).
+P_ACTIVATION_RECORD = "P_ACTIVATION_MIB"
+P_ACTIVATION_RECORD_CHUNK = 16384
+
+
+def p_activation_record(profile: Optional[str] = None) -> Tuple[Optional[Tuple[float, ...]], str]:
+    """``(P_ACTIVATION_MIB per P stage, 'boot ...')`` of ``profile``, or
+    ``(None, "")`` where the profile never measured it (27B today: its
+    support, env and pool model stay byte-identical)."""
+    try:
+        vals = tuple(float(v) for v in _pconst(P_ACTIVATION_RECORD, profile))
+    except KeyError:
+        return None, ""
+    return vals, _pconst_boots(P_ACTIVATION_RECORD, profile)
+
+
+def p_transient_support(profile: Optional[str] = None, *, card: bool = False):
+    """#242: the support table the launcher prices from -- the builtin one,
+    with the point at :data:`P_ACTIVATION_RECORD_CHUNK` replaced by the
+    profile's ``P_ACTIVATION_MIB`` record where it carries one.
+
+    ``card=True`` (the P-KARTE): the LARGER of the builtin point and the record
+    per stage. The card's reference K0 was normalised against the builtin point
+    of its own boots (fnFL2x163-165); a record BELOW it would hand the card
+    headroom its reference never had (PP1 lands at 86 MiB card free on the
+    metal of 28.09., the card predicts 1274), a record ABOVE it is a load state
+    the reference never saw (PP0 with two to five sequences in one chunk). Until
+    the card reference is re-measured on this form (--p-card-reference-logs),
+    only the second direction may reach it.
+    """
+    base = P_PREFILL_TRANSIENT_SUPPORT
+    rec, boots = p_activation_record(profile)
+    if rec is None or len(rec) != base.n_stages or P_ACTIVATION_RECORD_CHUNK not in base.chunks:
+        return base
+    points = []
+    for p in base.points:
+        if p.chunk != P_ACTIVATION_RECORD_CHUNK:
+            points.append(p)
+            continue
+        mib = tuple(max(a, b) for a, b in zip(p.mib, rec)) if card else tuple(rec)
+        source = "record %s (%s)" % (P_ACTIVATION_RECORD, boots or "no boots named")
+        if card:
+            source += " max builtin %s" % p.source
+        points.append(_p_card.TransientPoint(chunk=p.chunk, mib=mib, source=source))
+    return _p_card.TransientSupport(model=base.model, points=tuple(points))
+
 #: The runtime's residual post for exactly this transient
 #: (``model_runner_kv_cache_mixin.PREFILL_TRANSIENT_ENV``): a comma vector,
 #: MiB per rank, that the sizer subtracts from ``rest`` before the KV pool.
@@ -3527,12 +3582,13 @@ P_PREFILL_TRANSIENT_SUPPORT = _p_card.P_TRANSIENT_SUPPORT_FNFL2
 P_PREFILL_TRANSIENT_ENV = "SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB"
 
 
-def p_prefill_transient_vector_mib(chunk_tokens: int) -> Tuple[float, ...]:
+def p_prefill_transient_vector_mib(chunk_tokens: int, profile: Optional[str] = None) -> Tuple[float, ...]:
     """Group P's MEASURED prefill transient for ``chunk_tokens``, MiB per
     stage (#114, H41) -- linear between the measured support points; a chunk
-    outside them is REFUSED by name (W131), never extrapolated."""
+    outside them is REFUSED by name (W131), never extrapolated. #242: the
+    profile's ``P_ACTIVATION_MIB`` record replaces its support point."""
     try:
-        return _p_card.transient_vector_mib(P_PREFILL_TRANSIENT_SUPPORT, int(chunk_tokens))
+        return _p_card.transient_vector_mib(p_transient_support(profile), int(chunk_tokens))
     except _p_card.PChunkUnmeasured as exc:
         raise Weg2LaunchRefused(str(exc)) from None
 
@@ -3627,6 +3683,26 @@ def p_prefill_activation_reserve_mib(pinned: Optional[float], chunk_tokens: int)
     return max(
         float(P_PREFILL_ACTIVATION_RESERVE_MIB),
         max(p_prefill_transient_vector_mib(chunk_tokens)),
+    )
+
+
+def p_prefill_activation_reserve_by_stage_mib(
+    pinned: Optional[float], chunk_tokens: int, profile: Optional[str] = None
+) -> Tuple[float, ...]:
+    """#242: the pool model's activation post PER STAGE -- ``()`` (the scalar
+    of :func:`p_prefill_activation_reserve_mib` on every stage, 27B
+    byte-identical) unless the profile carries ``P_ACTIVATION_MIB``. Then each
+    stage books its own measured transient, at least the reference 1024 MiB,
+    exactly what the runtime books per rank from ``P_PREFILL_TRANSIENT_ENV``
+    (the PP-POOL-JOIN of the two is then a join of equal posts). A pinned
+    ``--pp-cut-activation-reserve-mib`` pins every stage."""
+    if pinned is not None or p_activation_record(profile)[0] is None:
+        return ()
+    if int(chunk_tokens) < P_PREFILL_TRANSIENT_SUPPORT.chunks[0]:
+        return ()
+    return tuple(
+        max(float(P_PREFILL_ACTIVATION_RESERVE_MIB), float(v))
+        for v in p_prefill_transient_vector_mib(chunk_tokens, profile)
     )
 
 
@@ -8875,7 +8951,8 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
             env.setdefault(
                 P_PREFILL_TRANSIENT_ENV,
                 ",".join(
-                    "%.0f" % v for v in p_prefill_transient_vector_mib(P_CHUNKED_PREFILL_TOKENS)
+                    "%.0f" % v for v in p_prefill_transient_vector_mib(
+                        P_CHUNKED_PREFILL_TOKENS, getattr(boot_form, "profile", None) or None)
                 ),
             )
     else:
@@ -14088,8 +14165,8 @@ PROFILE_ARG_DEFAULTS: Tuple[Tuple[str, str, Callable[[str], object]], ...] = (
 
 def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
     """Rewrite the unset :data:`PROFILE_ARG_DEFAULTS` to ``ns.profile``'s row;
-    returns the dests that changed (none for the 27B and, today, for NF, whose
-    rows borrow these 27B measurements)."""
+    returns the dests that changed (none for the 27B; for NF since #242 its own
+    stage-fixed post and mamba rate, MEASURED_MS_PER_LAYER still borrowed)."""
     parser_default = {
         "pp_cut_measured_ms_per_layer": MEASURED_MS_PER_LAYER,
         "pp_cut_stage_fixed_mib": P_PP_STAGE_FIXED_MIB,
@@ -16053,7 +16130,8 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
     """
     from sglang.srt.weg2 import draft_post as _dp
 
-    support = P_PREFILL_TRANSIENT_SUPPORT
+    # #242: max(builtin, record) per stage -- see p_transient_support(card=True).
+    support = p_transient_support(getattr(ns, "profile", None) or None, card=True)
     name = os.path.basename(os.path.normpath(str(model)))
     # H87: a footprint-identical derivative carries the support's measurement.
     if name != support.model and not weg2_form.reference_model_verdict(
@@ -16512,6 +16590,11 @@ def solve_p_cut(
         activation_reserve_mib=p_prefill_activation_reserve_mib(
             ns.pp_cut_activation_reserve_mib, int(chunk_tokens)
         ),
+        # #242: per stage where the profile measured it (P_ACTIVATION_MIB).
+        activation_reserve_mib_by_stage=p_prefill_activation_reserve_by_stage_mib(
+            ns.pp_cut_activation_reserve_mib, int(chunk_tokens),
+            getattr(ns, "profile", None) or None,
+        ),
         # #1257c: None = follow the reserve (the runtime charges exactly it);
         # a number = the operator pinned it.
         corridor_holdback_mib=(
@@ -16858,6 +16941,26 @@ def solve_p_cut(
             else "max(reference 1024, binding stage)",
         )
     )
+    if model_pool.activation_reserve_mib_by_stage:
+        _rec, _rec_boots = p_activation_record(getattr(ns, "profile", None) or None)
+        log(
+            "PP-CUT activation post (#242): PER STAGE %s MiB (record %s %s at chunk "
+            "%d, %s) -- charged in place of the one scalar %.1f above, the same "
+            "vector group P's ranks book as %s; the P-KARTE takes max(builtin, "
+            "record) %s"
+            % (
+                ["%.1f" % v for v in model_pool.activation_reserve_mib_by_stage],
+                P_ACTIVATION_RECORD,
+                list(_rec or ()),
+                P_ACTIVATION_RECORD_CHUNK,
+                _rec_boots or "no boots named",
+                float(model_pool.activation_reserve_mib),
+                P_PREFILL_TRANSIENT_ENV,
+                [list(pt.mib) for pt in p_transient_support(
+                    getattr(ns, "profile", None) or None, card=True).points
+                 if pt.chunk == P_ACTIVATION_RECORD_CHUNK][0],
+            )
+        )
     log(
         "PP-CUT budget posts (the boot's own list, MiB/rank): "
         "weights+runtime = %.1f/layer x n + stage_fixed %s; corridor holdback "
