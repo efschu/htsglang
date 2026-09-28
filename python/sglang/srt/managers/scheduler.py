@@ -907,6 +907,28 @@ def _weg2_store_short_cycle(sched, req) -> int:
     return n
 
 
+#: WT (28.09.): switch of the post-wake no-writer exit, default on; 0 = the
+#: store-short bound applies to settled requests as to every other.
+WAKE_SHORT_DECIDE_ENV = "SGLANG_WEG2_WAKE_SHORT_DECIDE"
+
+
+def _weg2_settled_this_wake(sched, req) -> bool:
+    """WT (28.09., NF rc12z22 D 14:56:26-29, weg2-4-11): a request the group
+    released from the dormant hold / #1471 settle of THIS wake has had its
+    writer question answered -- D is awake, so P sleeps, and the settle waited
+    for P's visible writes (P4b ``wait``) or decided there was none. A
+    store-short read of it at admission has no writer left: re-reading it
+    (five times, 128 tokens each, 3 s) cannot grow it. Group-uniform: the
+    release is the group MIN in hold order and the wake counter moves on every
+    rank at the same resume; ``weg2_dormant`` is the W25 group flag."""
+    if (os.environ.get(WAKE_SHORT_DECIDE_ENV, "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    if getattr(sched, "weg2_dormant", False):
+        return False
+    seq = getattr(sched, "_weg2_wake_seq", None)
+    return seq is not None and getattr(req, "_weg2_settled_wake", None) == seq
+
+
 def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Optional[str]:
     """The bounded exit of a store-short read that stopped growing: None =
     still within the bound (defer as before). Past it, a remainder within X
@@ -918,7 +940,9 @@ def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Opti
     if reason != _DEFER_REASON_STORE_SHORT:
         return None
     cycles = _weg2_store_short_cycle(sched, req)
-    bound = _weg2_store_short_max_cycles()
+    settled = _weg2_settled_this_wake(sched, req)
+    # WT: no writer after this wake's settle -- the first short read decides
+    bound = 0 if settled else _weg2_store_short_max_cycles()
     if cycles <= bound:
         return None
     x = _weg2_store_short_tail_x(sched)
@@ -944,7 +968,8 @@ def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Opti
     sched._weg2_store_short_fallbacks = getattr(sched, "_weg2_store_short_fallbacks", 0) + 1
     logger.warning(
         "PREFETCH-DEFER-FALLBACK rid=%s delivered=%d tail=%d X=%d cycles=%d "
-        "bound=%d reason=no_writer_progress span=%s site=%s n=%d -- the store "
+        "bound=%d reason=" + ("settled_no_writer" if settled else "no_writer_progress")
+        + " span=%s site=%s n=%d -- the store "
         "read terminated short %d times in a row without delivering more; no "
         "writer is filling the tail, so the matched prefix is taken and D "
         "extends the rest (the X gate prices it with the group's match)",
@@ -6209,6 +6234,7 @@ class Scheduler(
         _agreed = _gmin([x[3] for x in _local])  # #1471e
         for (req, state, lapsed, _r), ok in zip(_local, _agreed):
             if ok:
+                req._weg2_settled_wake = getattr(self, "_weg2_wake_seq", None)  # WT
                 release.append((req, state, lapsed))
             else:
                 keep.append(req)
@@ -6239,6 +6265,8 @@ class Scheduler(
         the waiting queue in arrival order. Called by the resume handler
         AFTER flush_cache, so the idle witness saw an empty queue."""
         hold = getattr(self, "weg2_dormant_hold", None) or []
+        # WT: this wake's number (every rank runs this at the same resume)
+        self._weg2_wake_seq = int(getattr(self, "_weg2_wake_seq", 0) or 0) + 1
         try:  # xsn329/330: the handed-over keys served the hold; the wake re-admits from the tree
             from sglang.srt.managers import cache_controller as _cc
             from sglang.srt.weg2 import handoff as _ho
@@ -6305,6 +6333,7 @@ class Scheduler(
                             _weg2_store_short_remainder(_r))
         for _r, ok in zip(list(hold), _agreed):
             if ok:
+                _r._weg2_settled_wake = self._weg2_wake_seq  # WT
                 released.append(_r)
             else:
                 _r._1471_since = _now
