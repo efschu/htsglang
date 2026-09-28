@@ -21715,7 +21715,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     budgets_p = budgets_from_dc(
         cards, dc_expect_d, log, "P", overshoot_mib=list(_pconst("P_OVERSHOOT_MIB", ns.profile)),
-        overshoot_provenance="boot weg2ls2b2",
+        # #240: whose measurement the line charges -- the profile's own record
+        # (NF: measured at the card), not the 27B boot it used to name for
+        # every profile.
+        overshoot_provenance=_pconst_boots("P_OVERSHOOT_MIB", ns.profile) or "boot weg2ls2b2",
         user_reserve_by_card=user_reserve_by_card,
     )
     state.budgets["P"] = budgets_p
