@@ -17013,6 +17013,10 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
         pfad = os.path.join(evidence_dir, f"expert_map_{ns.tag}.json")
         with open(pfad, "w") as fh:
             _json.dump(karte, fh)
+        # #239 rc12z29c-Blocker 2: die D-Form, die diese Karte beschreibt --
+        # jeder D-Start wird dagegen geprueft (refuse_d_form_off_the_map)
+        ns._expert_map_d_form = {"ratios": [str(x) for x in ratios],
+                                 "fractions": [str(x) for x in fr_tp]}
         if _em.is_nested(karte):
             _pp = karte["phases"]["P"]
             _dp = karte["phases"]["D"]
@@ -17073,6 +17077,90 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
     except BaseException as _exc:  # noqa: BLE001 -- eine Karte kippt nie den Boot
         log("#107 EXPERTEN-KARTE failed: %s: %s" % (type(_exc).__name__, _exc))
         return ""
+
+
+class Weg2DFormOffTheMap(Weg2LaunchRefused):
+    """W170 (#239 rc12z29c-Blocker 2): group D is about to start with a MoE
+    ownership (--rank-moe-ratio) or FR_D (--rank-moe-resident-fraction /
+    SGLANG_MOE_RESIDENT_EXPERT_FRACTION) other than the one the Platztausch
+    map was built from. P loaded its common prefix and store slots from that
+    map, so D would load a form the map does not describe and die at load
+    ('Platztausch-Karte nennt N residente Zeilen ...'), minutes later."""
+
+
+#: The env the D ranks read FR_D from (resident_fraction.resident_fraction_for_rank).
+D_FR_ENV = "SGLANG_MOE_RESIDENT_EXPERT_FRACTION"
+
+
+def _same_vector(a, b) -> bool:
+    try:
+        fa, fb = [float(x) for x in a], [float(x) for x in b]
+    except (TypeError, ValueError):
+        return False
+    return len(fa) == len(fb) and all(abs(x - y) <= 1e-9 for x, y in zip(fa, fb))
+
+
+def refuse_d_form_off_the_map(ns, log) -> None:
+    """W170: the D form a D start carries must be the map's (#239 rc12z29c).
+
+    Called right before every D env/argv is built (d-only, dry run, real). A
+    no-op without a published map. Reads what D will actually read: the
+    ratio and FR in --extra-d and FR in --env-d. Whatever moved it after the
+    map (a later solve, the P1c FR-D ceiling, an operator edit) is refused by
+    name here, never discovered by D's loader."""
+    form = getattr(ns, "_expert_map_d_form", None)
+    if not form:
+        return
+    ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
+    fr = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-resident-fraction")
+    env_fr_text = parse_group_env(getattr(ns, "env_d", "") or "").get(D_FR_ENV)
+    moved = []
+    if not _same_vector(ratios or [], form["ratios"]):
+        moved.append(f"--rank-moe-ratio {ratios} (Karte {form['ratios']})")
+    if not _same_vector(fr or [], form["fractions"]):
+        moved.append(f"--rank-moe-resident-fraction {fr} (Karte {form['fractions']})")
+    if env_fr_text is not None and not _same_vector(
+            [x for x in str(env_fr_text).split(",") if x.strip()], form["fractions"]):
+        moved.append(f"--env-d {D_FR_ENV}={env_fr_text} (Karte {form['fractions']})")
+    if moved:
+        raise Weg2DFormOffTheMap(
+            "W170 Weg2DFormOffTheMap: D would start with a form the Platztausch map "
+            "does not describe -- " + "; ".join(moved) + ". P loaded its prefix and "
+            "store slots from the map; D would die at load. Fix the solve that "
+            "moved it, not the map (#239 rc12z29c)")
+    log(f"KARTE-FORM (#239 rc12z29c) D-START geprueft: --rank-moe-ratio "
+        f"{','.join(form['ratios'])}, FR_D {','.join(form['fractions'])} = die Form der Karte")
+
+
+def repoint_store_geometry_at_pinned_form(xchg_env: Dict[str, str], form: dict,
+                                          total: int, log) -> None:
+    """#239 rc12z29c-Blocker 2: the geometry published from --extra-d BEFORE
+    the pre-map D solve (#106 STORE-GEOMETRY, #134 bands, the V1 map) carries
+    the stated vectors -- rc12z29c's D log still printed '#96 STORE-SLOTS
+    rank=2 ... ratios=[183, 137, 168] fracs=[0.06, 0.51, 0.48]'. With the
+    Platztausch map that line is only a diagnostic (the map is the slot
+    authority), but a run whose map fails falls back to exactly these values.
+    So every geometry published from the vectors follows the pinned form."""
+    from sglang.srt.layers.moe import expert_map as _em
+
+    ratios, fracs = list(form["ratios"]), list(form["fractions"])
+    if "SGLANG_MOE_EXPERT_STORE_GEOMETRY" in xchg_env:
+        was = xchg_env["SGLANG_MOE_EXPERT_STORE_GEOMETRY"]
+        xchg_env["SGLANG_MOE_EXPERT_STORE_GEOMETRY"] = f"{','.join(ratios)}|{','.join(fracs)}"
+        log(f"WEG2-STORE-GEOMETRY shared={xchg_env['SGLANG_MOE_EXPERT_STORE_GEOMETRY']} "
+            f"source=KARTE-FORM (#239 rc12z29c; vorher {was} aus dem genannten Vektor)")
+    if "SGLANG_WEG2_EXPERT_BAND_SIZE" in xchg_env:
+        _bs, _bc = _em.band_geometry([int(float(x)) for x in ratios], int(total))
+        if _bs > 0:
+            xchg_env["SGLANG_WEG2_EXPERT_BAND_SIZE"] = str(_bs)
+            xchg_env["SGLANG_WEG2_EXPERT_BANDS"] = str(_bc)
+        else:
+            xchg_env.pop("SGLANG_WEG2_EXPERT_BAND_SIZE", None)
+            xchg_env.pop("SGLANG_WEG2_EXPERT_BANDS", None)
+        log(f"WEG2-EXPERT-BAND size={_bs} count={_bc} aus der KARTE-FORM (#239 rc12z29c)")
+    if xchg_env.pop(_em.MAP_ENV, None) is not None:
+        log("WEG2-EXPERT-MAP (V1, aus dem genannten Vektor) verworfen (#239 rc12z29c): "
+            "die Karte kommt aus publish_expert_map und der gepinnten Form")
 
 
 def _refuse_unbuilt_platztausch_buffers(karte: dict, *,
@@ -22199,6 +22287,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             ns.env_d = _dp.replace_env_vector(ns.env_d, "SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
                                               [float(x) for x in _pin["fractions"]])
+            repoint_store_geometry_at_pinned_form(
+                xchg_env, _pin,
+                int((_argv_vector(getattr(ns, "extra_d", ""), "--num-experts") or [512])[0]), log)
+
     # #107: EINMAL bauen, BEIDE Gruppen bekommen denselben Pfad.
     _emap = publish_expert_map(ns, ns.model, ns.evidence_dir, log,
                                p_stage_layers=getattr(state, "p_stage_layers", None),
@@ -22610,6 +22702,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_ratio.op_line)
         log(d_tokvec.line)
+        refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
         env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
         _sg = ";".join(f"{k}={v}" for k, v in sorted(env_d.items()) if str(k).startswith("SGLANG_"))
         log(f"WEG2-GROUP-ENV D: {_sg or '(leer)'}")
@@ -22647,6 +22740,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_ratio.op_line)
         log(d_tokvec.line)
+        refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
         env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
         env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
@@ -22779,6 +22873,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.line)
     log(d_ratio.op_line)
     log(d_tokvec.line)
+    refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
     env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
     env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'

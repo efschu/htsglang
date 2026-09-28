@@ -102,7 +102,8 @@ def test_the_map_is_built_from_the_pinned_published_form(monkeypatch, tmp_path):
     assert form["cut"] == CUT and ns._d_map_form is form
     assert any("KARTE-FORM (#239 rc12z29c) GEPINNT" in ln for ln in lines)
     karte = _publish(monkeypatch, tmp_path, ns)
-    assert karte["spans"] == [226, 119, 167]
+    # the rank's own cut (partition_units), not a second rounding (Blocker 2)
+    assert karte["spans"] == [226, 118, 168]
     for rank, (lo, span) in enumerate(zip(karte["bounds"], karte["spans"])):
         local = _local_ids(karte, rank, lo)
         assert all(0 <= e < span + 1 for e in local), (rank, local[:4])
