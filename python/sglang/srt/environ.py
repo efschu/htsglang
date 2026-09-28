@@ -598,6 +598,12 @@ class Envs:
     # L3_WRITE_BEHIND_MIB: bytes copied per arena and pass (KV 786 KiB pages:
     # 325 per pass; mamba blobs 56 MiB: 4 per pass).
     SGLANG_WEG2_L3_WRITE_BEHIND_MIB = EnvInt(256)
+    # STORE_REFUSE_FS (W57, user 28.09.: "L3 gehoert auf XFS, nie ZFS"): a
+    # real boot whose store directory lives on one of these filesystems
+    # (/proc/mounts) is refused by name -- the container layer (overlay) or
+    # the ZFS pool instead of the told store disk. A dry run only warns.
+    # Empty = no filesystem is refused.
+    SGLANG_WEG2_STORE_REFUSE_FS = EnvTuple(("overlay", "zfs"))
     # IDLE_VOTE_FRESHNESS (fnFL2 H77, #1268): PP0 reads a landed idle lap as
     # the PP group's /flush_cache verdict only while the state it witnessed
     # holds -- the lap of PP0's latest stamp, PP0 neither asleep nor busy

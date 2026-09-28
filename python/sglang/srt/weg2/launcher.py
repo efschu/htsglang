@@ -5466,6 +5466,9 @@ class StoreDiskPlan:
     fs_path: str = ""
     fs_type: str = ""
     fs_mount: str = ""
+    #: W57: the store's filesystem is one SGLANG_WEG2_STORE_REFUSE_FS names
+    #: (a dry run carries on with a warning; a real boot never gets here)
+    fs_refused: bool = False
 
     @property
     def growth_bytes(self) -> int:
@@ -5530,6 +5533,7 @@ def plan_store(
     root: Optional[str] = None,
     store_max_gb: float = 0.0,
     directory_name: Optional[str] = None,
+    dry: Optional[bool] = None,
 ) -> StoreDiskPlan:
     """Size the store from THE P POOL, and check the DISK can fund it.
 
@@ -5630,7 +5634,23 @@ def plan_store(
         fs_path=probe,
         fs_type=fs_type,
         fs_mount=fs_mount,
+        fs_refused=(dry is not None
+                    and fs_type in set(envs.SGLANG_WEG2_STORE_REFUSE_FS.get() or ())),
     )
+    if plan.fs_refused:
+        # W57 (user 28.09.: "L3 gehoert auf XFS, nie ZFS"): the container
+        # layer or the ZFS pool is not the told store disk -- its free space
+        # says nothing about the store. A dry run warns (the caller's line);
+        # ``dry=None`` (not a launch: a sizing question) never gets here.
+        if not dry:
+            raise Weg2StoreDiskRefused(
+                f"W57 Weg2StoreDiskRefused: store on {fs_type}, not the told disk -- "
+                f"{plan.disk_line('REFUSED')}. SGLANG_WEG2_STORE_ROOT={root} resolves to "
+                f"fs={fs_type} (SGLANG_WEG2_STORE_REFUSE_FS="
+                f"{','.join(envs.SGLANG_WEG2_STORE_REFUSE_FS.get() or ())}); mount the store "
+                f"volume (XFS) at the store root, or empty the variable to allow it."
+            )
+        return plan
     if plan.needed_bytes > free:
         raise Weg2StoreDiskRefused(
             f"W57 Weg2StoreDiskRefused: the filesystem hosting {root} cannot fund this "
@@ -21382,9 +21402,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         store_max_gb=ns.store_max_gb,
         min_free_gib=ns.store_disk_min_free_gib,
         directory_name=(l3_persist_dir_name(_l3_ident) if _l3_ident else None),
+        dry=dry,
     )
     store_cfg = store_plan.extra_config()
-    log(store_plan.disk_line("ok"))
+    log(store_plan.disk_line(
+        "WARN store on %s, not the told disk (dry run: not refused, the space check "
+        "is skipped)" % store_plan.fs_type if store_plan.fs_refused else "ok"))
     log(
         f"WEG2-STORE: dir={store_plan.directory} ON DISK (ZFS dataset, plain directory "
         f"-- #1236 user ruling 2026-09-09: 'normales hicaching mit lvl2 und lvl3', the "
