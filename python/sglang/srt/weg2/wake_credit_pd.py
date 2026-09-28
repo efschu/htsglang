@@ -744,6 +744,8 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
                         free0_records: Optional[Sequence[Mapping[str, object]]] = None,
                         free0_builtin: Optional[Sequence[Mapping[str, object]]] = None,
                         recut_geometry: Optional[Mapping[str, object]] = None,
+                        kv_first_mib: Optional[Sequence[float]] = None,
+                        kv_cut_shares: Optional[Sequence[float]] = None,
                         ) -> WakeCreditPlanPD:
     """Der Planer-Riegel P->D: der Wake der GEPLANTEN Form gegen die gemessene
     Referenz derselben Form (Draft auf P: fnFL2x141, H25: fnFL2x144), Delta =
@@ -875,7 +877,169 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
             "model": os.path.basename(os.path.normpath(str(model)))}
     if list(chosen) != list(ref.order):
         front[DIRECTION + "-order"] = {"given": list(ref.order), "timed": list(chosen)}
+    if kv_first_mib is not None:
+        # #239 S3h2: under the KV token cut the KV bytes sit on other cards
+        # than in the Form A reference -- the KV-first verdict per rank, and
+        # the legs of every later wake with the EARLY pools already mapped.
+        fc = kv_first_forecast(ref, kv_first_mib, cut_shares=kv_cut_shares)
+        lines = list(lines) + kv_first_lines(fc, label=label)
+        adj = kv_first_adjusted_reference(ref, fc)
+        if adj is not ref:
+            lines.append(kv_first_legs_line(ref, adj, label=label))
+        front[DIRECTION + "-kv-first"] = [dict(x) for x in fc]
     return WakeCreditPlanPD(lines=(head,) + tuple(lines), refusal=refusal, front_plan=front)
+
+
+# ---------------------------------------------------------------------------
+# #239 S3h2: KV-first under the token cut
+# ---------------------------------------------------------------------------
+
+#: The line the forecast prints, one per D rank, and its record (JSON after
+#: the marker) that :func:`kv_first_check` reads back.
+KV_FIRST_MARKER = "KV-FIRST (#239 S3h2)"
+#: ``_weg2_wake_kv_first_ok`` (weight_updater): the resume margin and the legs'
+#: reserve (SGLANG_WEG2_WAKE_KV_LEG_RESERVE_MIB, default 4352).
+KV_FIRST_MARGIN_MIB = 256.0
+KV_FIRST_LEG_RESERVE_MIB = 4352.0
+#: The runtime's line, one per D rank and wake.
+KV_FIRST_RUNTIME_RE = re.compile(
+    r"\bTP(\d+)\].*?WEG2-WAKE-KV-FIRST (EARLY|LATE) free=(\d+) MiB floor=(\d+) MiB "
+    r"need=(\d+) MiB")
+
+
+def kv_first_forecast(ref: PDReference, kv_mib: Sequence[float], *,
+                      cut_shares: Optional[Sequence[float]] = None,
+                      margin_mib: float = KV_FIRST_MARGIN_MIB,
+                      reserve_mib: Optional[float] = None) -> List[Dict[str, object]]:
+    """The runtime rule (``weight_updater._weg2_wake_kv_first_ok``) per D rank:
+
+    * the first wake of a rank has no leg record -> LATE (the old order);
+    * a later wake: EARLY iff ``free - floor - 256 >= kv`` AND ``legs' tightest
+      free last wake - kv >= floor + 256 + reserve``.
+
+    ``free`` = the planned flip-start free of the rank's card, ``floor`` =
+    ``ref.d_floor[r]``, ``kv`` = the rank's kv_cache tag as the plan books it
+    (KV pool from the SOLVED cut + mamba state pool), the legs' tightest free =
+    the least free the simulated legs leave that rank at a grant."""
+    if reserve_mib is None:
+        import os
+
+        try:
+            reserve_mib = float(os.environ.get("SGLANG_WEG2_WAKE_KV_LEG_RESERVE_MIB", "4352"))
+        except ValueError:
+            reserve_mib = KV_FIRST_LEG_RESERVE_MIB
+    run = simulate_pd(ref)
+    out: List[Dict[str, object]] = []
+    for r, kv in enumerate(kv_mib):
+        card = int(ref.d_card[r])
+        free = float(ref.free[card])
+        floor = float(ref.d_floor[r])
+        frees = [float(t.free_mib) for t in run.rank_tags(r)
+                 if t.need_mib > 0 and t.free_mib is not None]
+        legmin = min(frees) if frees else None
+        now_ok = free - floor - margin_mib >= float(kv)
+        legs_ok = legmin is not None and legmin - float(kv) >= floor + margin_mib + reserve_mib
+        out.append({
+            "rank": r, "card": card, "kv_mib": round(float(kv), 1),
+            "share": None if cut_shares is None else float(cut_shares[r]),
+            "free_mib": round(free, 1), "floor_mib": round(floor, 1),
+            "leg_min_free_mib": None if legmin is None else round(legmin, 1),
+            "first": "LATE",
+            "later": "EARLY" if (now_ok and legs_ok) else "LATE",
+            "why": ("free-floor-256 %.0f %s kv %.0f; legs %s"
+                    % (free - floor - margin_mib, ">=" if now_ok else "<", float(kv),
+                       "ohne Messpunkt" if legmin is None else
+                       "%.0f - kv %s floor+256+%.0f" % (legmin, ">=" if legs_ok else "<",
+                                                          reserve_mib))),
+        })
+    return out
+
+
+def kv_first_lines(forecast: Sequence[Mapping[str, object]], *, label: str) -> List[str]:
+    """One line per D rank: the verdict of the first wake and of every later
+    one, the numbers it stands on, and the record :func:`kv_first_check` reads
+    (``| {json}`` at the end)."""
+    import json
+
+    lines = []
+    for f in forecast:
+        share = "" if f.get("share") is None else " (Schnitt-Anteil %s/64)" % (
+            ("%g" % (float(f["share"]) * 64)))  # type: ignore[arg-type]
+        lines.append(
+            "%s %s %s %s TP%d card%d: kv_cache %.0f MiB%s -> Wake 1 %s (kein Leg-Record), "
+            "ab Wake 2 %s (%s); Metall: 'WEG2-WAKE-KV-FIRST EARLY|LATE ... need=' je Rang | %s"
+            % (MARKER, DIRECTION, label, KV_FIRST_MARKER, int(f["rank"]), int(f["card"]),  # type: ignore[arg-type]
+               float(f["kv_mib"]), share, f["first"], f["later"], f["why"],  # type: ignore[arg-type]
+               json.dumps(dict(f), sort_keys=True)))
+    return lines
+
+
+def kv_first_adjusted_reference(ref: PDReference,
+                                forecast: Sequence[Mapping[str, object]]) -> PDReference:
+    """The planned reference of a LATER wake: every rank whose KV resumes
+    EARLY has its kv bytes off the card's free before the legs. Unchanged
+    (the same object) when no rank resumes early."""
+    free = {int(c): float(v) for c, v in ref.free.items()}
+    moved = False
+    for f in forecast:
+        if f["later"] == "EARLY":
+            free[int(f["card"])] -= float(f["kv_mib"])  # type: ignore[arg-type]
+            moved = True
+    return replace(ref, free=free) if moved else ref
+
+
+def kv_first_legs_line(ref: PDReference, adj: PDReference, *, label: str) -> str:
+    """The legs of a later wake with the EARLY pools mapped against the
+    first wake's (the same order)."""
+    a, b = simulate_pd(ref), simulate_pd(adj)
+
+    def _leg(run: PDRun) -> str:
+        return "steht" if run.leg_ms is None or not run.complete else "%.0f ms" % run.leg_ms
+
+    return ("%s %s %s %s ab Wake 2 (EARLY-KV gemappt): free %s -> Leg %s (Wake 1: %s)"
+            % (MARKER, DIRECTION, label, KV_FIRST_MARKER,
+               {k: round(v) for k, v in adj.free.items()}, _leg(b), _leg(a)))
+
+
+def kv_first_check(forecast_text: str, d_log_text: str) -> List[str]:
+    """Forecast (the launcher's ``KV-FIRST (#239 S3h2)`` records) against the
+    metal (``WEG2-WAKE-KV-FIRST`` of the D log, per rank in log order): one
+    line per rank and wake -- verdict MATCH/MISS and need forecast vs metal."""
+    import json
+
+    fc: Dict[int, Mapping[str, object]] = {}
+    for line in forecast_text.splitlines():
+        if KV_FIRST_MARKER in line and "| {" in line:
+            rec = json.loads(line.rsplit("| ", 1)[1])
+            fc[int(rec["rank"])] = rec
+    seen: Dict[int, int] = {}
+    out = []
+    for m in KV_FIRST_RUNTIME_RE.finditer(d_log_text):
+        r = int(m.group(1))
+        k = seen.get(r, 0) + 1
+        seen[r] = k
+        f = fc.get(r)
+        if f is None:
+            out.append("TP%d Wake %d: Metall %s need=%s MiB -- keine Vorhersage fuer diesen Rang"
+                       % (r, k, m.group(2), m.group(5)))
+            continue
+        want = f["first"] if k == 1 else f["later"]
+        need = float(m.group(5))
+        out.append("TP%d Wake %d: Vorhersage %s kv %.0f MiB, Metall %s need %.0f MiB free %s floor %s "
+                   "-> %s, need %+.0f MiB"
+                   % (r, k, want, float(f["kv_mib"]), m.group(2), need, m.group(3),  # type: ignore[arg-type]
+                      m.group(4), "MATCH" if want == m.group(2) else "MISS",
+                      need - float(f["kv_mib"])))  # type: ignore[arg-type]
+    return out
+
+
+if __name__ == "__main__":  # pragma: no cover - the operator's check
+    import sys
+
+    if len(sys.argv) != 3:
+        sys.exit("usage: python -m sglang.srt.weg2.wake_credit_pd LAUNCH.log D.log")
+    with open(sys.argv[1], errors="replace") as _a, open(sys.argv[2], errors="replace") as _b:
+        print("\n".join(kv_first_check(_a.read(), _b.read())) or "keine Zeilen")
 
 
 def front_timed_order(pause_order: Sequence[str], plan: Optional[Mapping[str, object]]
