@@ -523,21 +523,31 @@ CLAIM_VOTE_ABSTAIN = 1 << 30
 PREFETCH_CLAIM_REDUCE_BOUND_S = 120.0
 
 
-def encode_claim_vote(count: int, abstain: bool) -> list:
+def encode_claim_vote(count: int, abstain: bool, min_only: bool = False) -> list:
     """The packed vote of one rank: ``[claim, -claim]`` for a voter, the
     abstain sentinel in BOTH slots for a rank that holds no bytes -- it can
-    win neither the min nor the max, so the extremes come from voters alone."""
+    win neither the min nor the max, so the extremes come from voters alone.
+    ``min_only`` (#239 S3h): a rank that holds PART of every page (a KV worker
+    under the token cut) votes its claim into the min and abstains from the
+    max -- its claim is not capped by the host's mamba anchor, so it may
+    exceed the host's without the stores disagreeing."""
     if abstain:
         return [CLAIM_VOTE_ABSTAIN, CLAIM_VOTE_ABSTAIN]
+    if min_only:
+        return [int(count), CLAIM_VOTE_ABSTAIN]
     return [int(count), -int(count)]
 
 
 def decode_claim_vote(packed) -> tuple:
     """``(min, max)`` over the VOTERS of one MIN-reduced packed vector; a
-    group in which every rank abstained holds nothing and decodes to 0."""
+    group in which every rank abstained holds nothing and decodes to 0. A
+    group whose only max voters abstained (every voter min-only) decodes
+    to ``(min, min)``."""
     lo, neg_hi = int(packed[0]), int(packed[1])
     if lo >= CLAIM_VOTE_ABSTAIN:
         return 0, 0
+    if neg_hi >= CLAIM_VOTE_ABSTAIN:
+        return lo, lo
     return lo, -neg_hi
 
 
@@ -546,6 +556,47 @@ def claim_vote_abstains(controller) -> bool:
     ``abstains_from_claim_vote``; every other tier votes its own claim."""
     backend = getattr(controller, "storage_backend", None)
     return bool(getattr(backend, "abstains_from_claim_vote", False))
+
+
+def claim_vote_min_only(controller) -> bool:
+    """#239 S3h: a Form A worker that OWNS full-attention rows under the token
+    cut (real file backend, KV window only) votes in the min arm alone. Its
+    claim counts the KV pages it can read; the host's claim is capped at its
+    deepest mamba anchor (the worker holds no recurrent state). Both are
+    honest answers about DIFFERENT parts of the same page, so the group takes
+    the MIN (see :func:`settle_claim_split`), never the worker's larger count
+    as a disagreement."""
+    if claim_vote_abstains(controller):
+        return False
+    from sglang.srt.rank_role import form_a_worker_holds_kv
+
+    return bool(form_a_worker_holds_kv())
+
+
+#: #239 S3h: the line of a claim split the token cut settles by MIN.
+CLAIM_CUT_MIN_ADOPT_MARKER = "#239 S3h CLAIM MIN-ADOPT (Schnitt)"
+
+
+def settle_claim_split(min_claim: int, max_claim: int, rid, *, cut_active: bool) -> int:
+    """The group's claim from one packed vote. Equal extremes: that claim.
+    Under the token cut the host and the KV workers hold different parts of
+    each page (host: mamba/QSA/draft, workers: their KV rows), so a worker
+    below the host is a shorter prefix the WHOLE group adopts (slower, never
+    wrong: the rest is re-prefilled) -- named, rank-uniform, because every
+    rank decodes the same reduced vector. Without the cut the L8 law stands:
+    a split is :func:`assert_draft_claims_agree`'s STOP."""
+    mn, mx = int(min_claim), int(max_claim)
+    if mn == mx:
+        return mn
+    if cut_active:
+        logger.warning(
+            "%s rid=%s per_rank_claim=[%d, %d] (min over host+KV workers, max over "
+            "the host's anchor-capped claim): every rank proceeds with %d",
+            CLAIM_CUT_MIN_ADOPT_MARKER, rid, mn, mx, mn,
+        )
+        return mn
+    assert_draft_claims_agree(mn, mx, rid)
+    return mn
 
 
 def resolve_draft_claim(kv_pages: int, draft_pages: int, chunk_pages: int, reprobe):
@@ -4295,13 +4346,20 @@ class HiCacheController:
                     # the group's is a named STOP, not a silent MIN (Q11).
                     # A rank holding no bytes (Form A worker) abstains: it
                     # adopts the voters' MIN below instead of setting the MAX.
+                    # #239 S3h: a KV worker under the token cut votes in the
+                    # min arm only (claim_vote_min_only).
                     packed = torch.tensor(
-                        encode_claim_vote(storage_hit_count, claim_vote_abstains(self)),
+                        encode_claim_vote(storage_hit_count, claim_vote_abstains(self),
+                                          min_only=claim_vote_min_only(self)),
                         dtype=torch.int,
                     )
                     self._all_reduce_prefetch_groups(packed, torch.distributed.ReduceOp.MIN)
                     _mn, _mx = decode_claim_vote(packed)
-                    if _mn != _mx and operation.request_id in getattr(self, "weg2_hold_rids", ()):
+                    from sglang.srt.rank_role import form_a_token_cut_active as _cut_active
+
+                    if _mn != _mx and _cut_active():
+                        settle_claim_split(_mn, _mx, operation.request_id, cut_active=True)
+                    elif _mn != _mx and operation.request_id in getattr(self, "weg2_hold_rids", ()):
                         # #1461 (boot weg2xsn216): a probe issued for a request in
                         # the DORMANT HOLD reads a store that P is still writing --
                         # the ranks' probes land ms apart and differ (TP2 94207 vs
