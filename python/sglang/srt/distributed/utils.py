@@ -632,7 +632,12 @@ def uneven_dcp_owner_bounds() -> Optional[tuple]:
 
     parallel = get_parallel()
     dcp_size = parallel.attn_dcp_size
-    if not uneven_dcp_kv_replicated(dcp_size):
+    # Rank form (28.09., NF review of kv_only_rank): the weightless-KV lane
+    # token-shards the same way (flashinfer ``uneven_dcp`` includes the lane:
+    # weighted prefix-range with a vector, even modulo without), so its
+    # device pool is COMPACT too -- HiCache and the F14 window must see its
+    # owner rows, not the full window (task #60 class otherwise).
+    if not (uneven_dcp_kv_replicated(dcp_size) or (dcp_size > 1 and weightless_kv_active())):
         return None
     prefix = cp_token_prefix(dcp_size)
     lo = prefix[parallel.attn_dcp_rank]

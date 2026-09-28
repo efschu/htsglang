@@ -48,10 +48,30 @@ KV_PAGES = 264  # the metal: '#1028B FETCH CAP n=4: kv=264 claimed=0 lost=264'
 KEYS = [f"b5{i:06d}" for i in range(KV_PAGES)]
 
 
-@pytest.fixture
-def kv_worker(monkeypatch):
-    """This rank is a Form A worker that owns token rows under the cut."""
-    monkeypatch.setattr(rank_role, "form_a_worker_holds_kv", lambda: True)
+@pytest.fixture(params=["form_a_cut", "weightless_lane"])
+def kv_worker(request, monkeypatch):
+    """This rank is a KV-only rank (rank form 28.09.: ONE predicate,
+    ``kv_only_rank``, two sources) -- a Form A worker that owns token rows
+    under the cut, or a weightless-lane worker built from the lane's REAL
+    process state (head rank, parallel context, token vector), no monkeypatch
+    of the predicate."""
+    if request.param == "form_a_cut":
+        monkeypatch.setattr(rank_role, "form_a_worker_holds_kv", lambda: True)
+        yield
+        return
+    from sglang.srt.distributed import utils as du
+    from sglang.srt.runtime_context import get_parallel
+
+    saved = du.get_cp_token_ratios()
+    du.set_weightless_kv_head_rank(0)
+    du.set_cp_token_ratios(du.reduce_token_vector([2, 64, 32]))
+    try:
+        with get_parallel().override(tp_rank=1, tp_size=3, attn_dcp_rank=1, attn_dcp_size=3):
+            assert rank_role.kv_only_rank()
+            yield
+    finally:
+        du.set_weightless_kv_head_rank(None)
+        du.set_cp_token_ratios(saved)
 
 
 @pytest.fixture
@@ -240,3 +260,25 @@ def test_a_cut_worker_takes_kv_of_ps_three_row_part(monkeypatch):
     st = ta._stage_e1([hdr], held, False, [])
     assert st.verdict == "ready", st.verdict  # base: fa_arity:3:3!=2
     assert len(st.fa[3]) == 2 and torch.equal(st.fa[3][0], k)
+
+
+def test_the_lane_worker_sees_its_owner_rows_not_the_full_window():
+    """NF note on kv_only_rank: under the lane the pool is compact, so the
+    owner bounds the F14 window and HiCache use must be the lane's."""
+    from sglang.srt.distributed import utils as du
+    from sglang.srt.runtime_context import get_parallel
+
+    saved = du.get_cp_token_ratios()
+    du.set_weightless_kv_head_rank(0)
+    try:
+        du.set_cp_token_ratios(du.reduce_token_vector([2, 64, 32]))
+        with get_parallel().override(tp_rank=2, tp_size=3, attn_dcp_rank=2, attn_dcp_size=3):
+            assert du.uneven_dcp_owner_bounds() == (49, 33, 49)
+        du.set_cp_token_ratios(None)
+        with get_parallel().override(tp_rank=1, tp_size=3, attn_dcp_rank=1, attn_dcp_size=3):
+            assert du.uneven_dcp_owner_bounds() == (3, 1, 2)   # even modulo lane
+        with get_parallel().override(tp_rank=0, tp_size=3, attn_dcp_rank=0, attn_dcp_size=3):
+            assert not rank_role.kv_only_rank()                 # the head is not KV-only
+    finally:
+        du.set_weightless_kv_head_rank(None)
+        du.set_cp_token_ratios(saved)
