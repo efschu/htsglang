@@ -61,6 +61,17 @@ EXPERT_MAP_ENV = "SGLANG_MOE_EXPERT_MAP"
 
 STORE_GEOMETRY_ENV = "SGLANG_MOE_EXPERT_STORE_GEOMETRY"
 
+#: H2c (NF-Bootzeit, 28.09.): WESSEN Zeilen ein Sentinel belegt. Der Store
+#: ueberlebt den Prozess -- auf einem Host-tmpfs auch den Boot --, und ein
+#: Sentinel ``rows=[...]`` sagt nur "diese Plaetze sind geschrieben", nicht
+#: mit welchem Checkpoint und welcher Karte. Ein Boot mit anderem Checkpoint
+#: oder anderer Slot-Zuordnung (FR, ``--rank-moe-ratio``) laese dann fremde
+#: Bytes als eigene Experten: D-Store-Adopt (H2) und #109 ``fill_rows``
+#: vertrauen genau diesen Sentinels. Launcher-Ausgabe, nie Operator-Eingabe:
+#: :func:`compute_identity` aus Checkpoint und Karte, fuer BEIDE Gruppen
+#: dieselbe Zeichenkette.
+STORE_IDENTITY_ENV = "SGLANG_MOE_EXPERT_STORE_IDENTITY"
+
 __all__ = [
     "STORE_DIR_ENV",
     "store_dir",
@@ -88,6 +99,57 @@ def store_dir() -> str:
 
 def store_enabled() -> bool:
     return bool(store_dir())
+
+
+def store_identity() -> str:
+    """Die Identitaet dieses Boots (H2c), oder "" wenn der Launcher keine setzt."""
+    return os.environ.get(STORE_IDENTITY_ENV, "").strip()
+
+
+def compute_identity(model: str, map_path: str) -> str:
+    """H2c: der Fingerabdruck, unter dem ein Sentinel gueltig ist.
+
+    Aus dem Checkpoint (``config.json``, ``*.safetensors.index.json`` als Bytes,
+    jede ``*.safetensors`` als Name + Groesse) und aus den Bytes der Karte,
+    die die Slot-Zuordnung traegt. Kein Datei-Inhalt der Gewichte wird
+    gehasht: das kostete je Boot 50 GB Lesung, genau das, was H2 spart.
+    ``""`` wenn die Karte fehlt -- dann gibt es keine Slot-Zuordnung, der ein
+    Sentinel gehoeren koennte, und niemand adoptiert.
+    """
+    import hashlib
+
+    if not map_path or not os.path.isfile(map_path):
+        return ""
+    h = hashlib.sha256()
+    h.update(b"h2c-v1\0")
+    if os.path.isdir(model):
+        names = sorted(os.listdir(model))
+        for name in names:
+            if name == "config.json" or name.endswith(".safetensors.index.json"):
+                with open(os.path.join(model, name), "rb") as fh:
+                    h.update(name.encode() + b"\0" + fh.read() + b"\0")
+            elif name.endswith(".safetensors"):
+                size = os.path.getsize(os.path.join(model, name))
+                h.update(f"{name}\0{size}\0".encode())
+    else:
+        h.update(b"model-id\0" + str(model).encode() + b"\0")
+    with open(map_path, "rb") as fh:
+        h.update(b"map\0" + fh.read())
+    return h.hexdigest()[:24]
+
+
+def sentinel_is_ours(data: dict) -> bool:
+    """H2c: gehoert dieser Sentinel zu DIESEM Boot?
+
+    Ohne gesetzte Identitaet: ja (das Verhalten vor H2c, byte-identisch).
+    Mit Identitaet: nur ein Sentinel, der genau sie traegt -- ein Sentinel
+    ohne Stempel stammt aus einem Boot vor H2c oder einem anderen Checkpoint
+    und belegt fuer uns NICHTS.
+    """
+    ours = store_identity()
+    if not ours:
+        return True
+    return str(data.get("identity", "")) == ours
 
 
 def slot_fraction() -> float:
@@ -592,8 +654,12 @@ def mark_rows_written(directory: str, layer_key: str, attr: str, rank: int, rows
     """Publish which store rows ``rank`` finished writing (atomic rename)."""
     path = _sentinel(directory, layer_key, attr, rank)
     tmp = path + ".tmp"
+    data = {"rank": int(rank), "rows": sorted(int(r) for r in rows)}
+    ident = store_identity()
+    if ident:
+        data["identity"] = ident  # H2c: wessen Bytes diese Zeilen sind
     with open(tmp, "w") as fh:
-        json.dump({"rank": int(rank), "rows": sorted(int(r) for r in rows)}, fh)
+        json.dump(data, fh)
     os.replace(tmp, path)
     # #75: der Cache des Lesers darf eine gerade publizierte Zeile nicht
     # verpassen -- er wird hier verworfen, nicht per Zeitstempel geraten.
@@ -611,6 +677,8 @@ def rows_written(directory: str, layer_key: str, attr: str, world: int) -> Dict[
             continue
         with open(path) as fh:
             data = json.load(fh)
+        if not sentinel_is_ours(data):
+            continue  # H2c: Zeilen eines fremden Boots belegen nichts
         for r in data.get("rows", []):
             out[int(r)] = int(rank)
     return out

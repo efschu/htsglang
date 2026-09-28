@@ -8814,6 +8814,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # zaehlen"). Gemessen w128: Hotset 1 Id -> 511 Store-Slots;
               # die Karte rechnet fuer dieselbe Form 354.
               expert_map_path: str = "",
+              # H2c: wessen Checkpoint und Karte die Store-Sentinels dieses
+              # Boots belegen (expert_store.compute_identity); BEIDE Gruppen
+              # dieselbe Zeichenkette, sonst adoptiert D nichts.
+              expert_store_identity: str = "",
               # Task #58: which vision form this boot runs. Published as
               # SGLANG_WEG2_VISION for the P group ONLY (see below).
               vision: str = VISION_OFF,
@@ -8913,6 +8917,12 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     if expert_map_path:
         # BEIDE Gruppen, derselbe Pfad -- das ist der ganze Punkt der Karte.
         env["SGLANG_MOE_EXPERT_MAP"] = expert_map_path
+    # H2c: Launcher-Ausgabe wie die Karte -- ohne Karte keine Identitaet, und
+    # ein Wert aus der Shell des Operators darf nie einen fremden Store adeln.
+    if expert_map_path and expert_store_identity:
+        env["SGLANG_MOE_EXPERT_STORE_IDENTITY"] = expert_store_identity
+    else:
+        env.pop("SGLANG_MOE_EXPERT_STORE_IDENTITY", None)
     # C18: the shared host granule ring (spec C1-C8).  These four variables are
     # LAUNCHER OUTPUT, never operator input (R19): every size in them is solved
     # by ring_table from the previous boot's own lines, and the whole family is
@@ -16156,6 +16166,36 @@ def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
     return pplan.refusal
 
 
+def publish_store_identity(model: str, map_path: str, log) -> str:
+    """H2c: die Identitaet des geteilten Expertenstores fuer diesen Boot.
+
+    Ein Sentinel ``*.written.json`` sagte bis hier nur "diese Plaetze sind
+    geschrieben" -- nicht mit welchem Checkpoint und welcher Slot-Karte. Der
+    Store ueberlebt den Prozess; ein Boot mit anderem Checkpoint oder anderen
+    FR/``--rank-moe-ratio`` haette mit D-Store-Adopt (H2) fremde Bytes als
+    eigene Experten gelesen. Deshalb war H2 im Profil aus
+    (ENTSCHEIDUNGEN-0927, 28.09.: "Expertenstore-Identitaet ist VORBEDINGUNG").
+
+    Ohne Karte ``""``: dann gibt es keine Slot-Zuordnung, und store_adopt
+    bleibt inaktiv. Ein Fehler beim Rechnen ist ebenfalls ``""`` -- das ist
+    die sichere Richtung (D liest vom Checkpoint), nie eine halbe Identitaet.
+    """
+    if not map_path:
+        log("H2c STORE-IDENTITY ENTFAELLT: keine Experten-Karte -> D-Store-Adopt inaktiv")
+        return ""
+    from sglang.srt.layers.moe import expert_store as _es
+
+    try:
+        ident = _es.compute_identity(model, map_path)
+    except OSError as exc:
+        log("H2c STORE-IDENTITY ENTFAELLT: %s: %s -> D-Store-Adopt inaktiv"
+            % (type(exc).__name__, exc))
+        return ""
+    log("H2c STORE-IDENTITY id=%s model=%s map=%s (beide Gruppen; ein Sentinel "
+        "ohne diese Identitaet belegt nichts)" % (ident or "-", model, map_path))
+    return ident
+
+
 def publish_expert_map(ns, model: str, evidence_dir: str, log,
                        p_stage_layers=None,
                        chunk_layers: Optional[int] = None) -> str:
@@ -21247,7 +21287,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _emap = publish_expert_map(ns, ns.model, ns.evidence_dir, log,
                                p_stage_layers=getattr(state, "p_stage_layers", None),
                                chunk_layers=chunk_layers)
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap)
+    _estore_id = publish_store_identity(ns.model, _emap, log)
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
     # H125: the host-RAM price of `--weg2-vision-source ram`, named where the
     # P env is built (the line is empty, and nothing is logged, for `disk`).
     _vis_line = vision_source_host_line(
@@ -21651,7 +21692,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_ratio.op_line)
         log(d_tokvec.line)
-        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
         _sg = ";".join(f"{k}={v}" for k, v in sorted(env_d.items()) if str(k).startswith("SGLANG_"))
         log(f"WEG2-GROUP-ENV D: {_sg or '(leer)'}")
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
@@ -21688,7 +21729,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_ratio.op_line)
         log(d_tokvec.line)
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
         env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
         env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
         env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
@@ -21819,7 +21860,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.line)
     log(d_ratio.op_line)
     log(d_tokvec.line)
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
+    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
     env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
     env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
     env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
