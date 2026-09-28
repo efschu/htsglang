@@ -1427,6 +1427,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if pool is not None and any(p is pool for p in pools.values()):
                 todo += [(pool, t) for t in list(getattr(xq, "queue", ()))]
         released = entries = 0
+        t0 = time.perf_counter()
         for pool, rows in todo:
             if getattr(getattr(pool, "arena", None), "_ledger", None) is None:
                 continue  # without the ledger the drain never gave these back either
@@ -1437,11 +1438,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue
             released += n
             entries += int(n > 0)
-        if released:
+        ms = (time.perf_counter() - t0) * 1000.0
+        # rc12z17-s0: a walk that gave nothing back was silent, and cost 16.4 s
+        if released or ms >= 100.0:
             logger.info(
-                "#1424g ARENA-REF RESET-QUEUE released=%d entries=%d of %d queued (the controller "
-                "reset drops the release queues; their arena rows' references go back first)",
-                released, entries, len(todo))
+                "#1424g ARENA-REF RESET-QUEUE released=%d entries=%d of %d queued ms=%.1f (the "
+                "controller reset drops the release queues; their arena rows' references go "
+                "back first)", released, entries, len(todo), ms)
         return released
 
     def _weg2_release_orphan_refs(self, where: str) -> int:
@@ -6104,6 +6107,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         anchor_lock_params = None
         host_indices = None
+        # rc12z17-s0: True when host_indices are read placeholders
+        # (`alloc_read`), which took no slot and no reference.
+        read_placeholders = False
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         sidecar_xfers: list[PoolTransfer] = []
         alloc_failed = True
@@ -6122,6 +6128,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # #1424 Stufe 3: read rows are arena slots, resolved at the
                 # read; the registration hands out placeholders, no budget.
                 host_indices = _alloc_read(prefetch_length)
+                read_placeholders = host_indices is not None
             else:
                 host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
             if host_indices is None:
@@ -6513,7 +6520,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _cuts[str(req_id)] = (_cut_rank, int(group_len), int(need))
                 while len(_cuts) > _PREFETCH_CUT_SLOTS:
                     _cuts.pop(next(iter(_cuts)))
-                if len(host_indices) > group_len:
+                if len(host_indices) > group_len and read_placeholders:
+                    # rc12z17-s0 (D TP0 11:22:04-11:22:57, W88 weg2-10-50):
+                    # the cut tail is read placeholders -- `alloc_read` took
+                    # no slot and no reference, the drain drops them unfreed
+                    # (`_free_arena_rows`). Queued, they were ~1000 one-page
+                    # entries per retry pass on THIS rank only (Form A: TP0
+                    # need=69952, the workers' group span 5760, lost=64192);
+                    # the group-MIN drain never reaches a surplus only one
+                    # rank has, 1299 passes left ~1.26M entries, and the
+                    # flush reset walked them one by one
+                    # (`_weg2_release_queued_refs_before_reset`): 16.4 s in
+                    # the D->P drain, the census thread 23 s on the same
+                    # queue. Nothing to give back, so nothing is queued.
+                    self._weg2_trim_placeholders_dropped = int(
+                        getattr(self, "_weg2_trim_placeholders_dropped", 0)
+                    ) + (len(host_indices) - group_len)
+                elif len(host_indices) > group_len:
                     self.cache_controller.append_host_mem_release(
                         host_indices=host_indices[group_len:]
                     )
