@@ -983,6 +983,26 @@ def probe_hold_pin(controller, operation, hash_value, hit_tokens=None) -> int:
         return 0
 
 
+def canonical_kv_owner_rows_for(owner_ctx, page_size, canonical_kv_page) -> Optional[tuple]:
+    """#239 S4b (F13): ``(page_size, S, lo, hi)`` when the owner rule runs on
+    PAGED pools with the canonical page (the token cut: a page is written by
+    every owner, each its own rows), else None -- the page-1 owner form and
+    every non-owner boot stay as they are."""
+    if owner_ctx is None or canonical_kv_page is None or int(page_size) == 1:
+        return None
+    S, lo, hi = (int(x) for x in owner_ctx)
+    logger.info(
+        "#239 F13 OWNER-ROWS: page %d, S=%d, this rank owns token rows "
+        "[%d, %d) of every page%s.",
+        int(page_size),
+        S,
+        lo,
+        hi,
+        " -- NONE: its KV page reads and writes abstain" if hi == lo else "",
+    )
+    return (int(page_size), S, lo, hi)
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -1490,13 +1510,21 @@ class HiCacheController:
         # the per-page owner rule needs page_size == 1 (a multi-token page
         # would span owner ranks). Fail fast instead of silently writing an
         # allocation-dependent (corrupt) store (task #60).
+        # #239 S4b (F13): the paged owner form -- every owner writes its own
+        # token rows of each page (``canonical_kv_owner_rows``) -- lifts the
+        # page_size limit; without it a page would still span owners.
+        owner_rows = (
+            self.storage_config.canonical_kv_owner_rows
+            if self.storage_config.dcp_owner_mode
+            else None
+        )
         if self.storage_config.dcp_owner_mode:
             if storage_backend != "file":
                 raise NotImplementedError(
                     "Weighted uneven-DCP HiCache storage currently supports "
                     f"only the 'file' backend, got '{storage_backend}'."
                 )
-            if self.page_size != 1:
+            if self.page_size != 1 and owner_rows is None:
                 raise NotImplementedError(
                     "Weighted uneven-DCP HiCache storage requires page_size == 1, "
                     f"got {self.page_size}."
@@ -1518,7 +1546,11 @@ class HiCacheController:
             # page_size tokens per slot; only weighted uneven-DCP ownership
             # (one page spanning two owner ranks) rules it out -- and that case
             # is already refused above. Qwen4Exp/QSA needs page_size >= 32.
-            if self.page_size != 1 and self.storage_config.dcp_owner_mode:
+            if (
+                self.page_size != 1
+                and self.storage_config.dcp_owner_mode
+                and owner_rows is None
+            ):
                 raise NotImplementedError(
                     "The #706 canonical KV page requires page_size == 1 under "
                     f"weighted uneven DCP (dcp_owner_mode), got {self.page_size}."
@@ -1534,12 +1566,17 @@ class HiCacheController:
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
-            from sglang.srt.rank_role import this_rank_is_form_a_worker
+            from sglang.srt.rank_role import (
+                form_a_worker_holds_kv,
+                this_rank_is_form_a_worker,
+            )
 
-            if this_rank_is_form_a_worker():
+            if this_rank_is_form_a_worker() and not form_a_worker_holds_kv():
                 # fnFL2 v16 (21.09.): no attention layer, no bytes in the
                 # canonical page -- the worker claims every page and moves
                 # nothing, so the tp-group MIN reduces settle on the host.
+                # #239 S4b (F13): a worker that OWNS token rows under the cut
+                # takes the real backend below, with its KV window only.
                 from sglang.srt.mem_cache.hicache_storage import FormAWorkerNullStorage
 
                 self.storage_backend = FormAWorkerNullStorage(self.storage_config)
@@ -1734,9 +1771,39 @@ class HiCacheController:
         canonical_kv_page = None
         canonical_mamba_blob = None
         canonical_qsa_page = None
-        from sglang.srt.rank_role import this_rank_is_form_a_worker
+        from sglang.srt.rank_role import (
+            form_a_worker_holds_kv,
+            this_rank_is_form_a_worker,
+        )
 
-        if this_rank_is_form_a_worker():
+        canonical_on = server_args is not None and bool(
+            getattr(server_args, "hicache_canonical_kv_page", False)
+        )
+        if this_rank_is_form_a_worker() and form_a_worker_holds_kv() and canonical_on:
+            # #239 S4b (F13): a worker that owns token rows under the cut holds
+            # every full-attention layer with the full kv heads -- a whole-page
+            # window, cut to its rows below. No mamba blob, no QSA page, no
+            # draft: those stay the attention host's.
+            from sglang.srt.mem_cache.canonical_page_store import (
+                build_page_window,
+                resolve_attn_layer_ids,
+            )
+
+            model_config = server_args.get_model_config()
+            attn_layer_ids = resolve_attn_layer_ids(model_config)
+            self._canonical_server_args = server_args
+            self._canonical_model_config = model_config
+            self._canonical_attn_layer_ids = [int(i) for i in attn_layer_ids]
+            canonical_kv_page = build_page_window(
+                attn_layer_ids, self.mem_pool_device_hybrid, self.mem_pool_host
+            )
+            logger.info(
+                "#239 F13 KV-WORKER-WINDOW: Form A worker owns token rows %s of "
+                "every %d-token page; KV page window only (no mamba/QSA/draft).",
+                self._dcp_owner_ctx(),
+                self.page_size,
+            )
+        elif this_rank_is_form_a_worker():
             # fnFL2 v16 (21.09.): the canonical page store refuses a rank
             # without attention layers a window; the worker rides the null
             # storage backend instead (attach_storage_backend).
@@ -1801,6 +1868,13 @@ class HiCacheController:
             )
             canonical_qsa_page = self._canonical_qsa_window(attn_layer_ids)
 
+        owner_ctx = self._dcp_owner_ctx()
+        canonical_kv_owner_rows = (
+            None
+            if owner_ctx is None
+            else canonical_kv_owner_rows_for(owner_ctx, self.page_size, canonical_kv_page)
+        )
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -1827,7 +1901,21 @@ class HiCacheController:
             canonical_kv_page=canonical_kv_page,
             canonical_mamba_blob=canonical_mamba_blob,
             canonical_qsa_page=canonical_qsa_page,
+            canonical_kv_owner_rows=canonical_kv_owner_rows,
         )
+
+    def page_owner_mask_ctx(self) -> Optional[tuple]:
+        """The owner ctx a store backup masks WHOLE PAGES with, or None.
+
+        The page-1 owner form (task #60) writes a page only on its owner
+        rank. #239 S4b (F13): under the paged owner form every rank writes
+        every page -- its own token rows, cut by the owner-row window, and a
+        rank that owns none abstains in the backend -- so there is no page
+        mask, and no node has to be skipped for lack of device indices."""
+        ctx = self._dcp_owner_ctx()
+        if ctx is None or self.storage_config.canonical_kv_owner_rows is not None:
+            return None
+        return ctx
 
     def _canonical_qsa_window(self, attn_layer_ids):
         """This rank's layer window in the canonical QSA index page (23.09.,

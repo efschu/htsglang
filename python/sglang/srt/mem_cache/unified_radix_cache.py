@@ -5983,7 +5983,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # the GLOBAL device slot). Pass a per-page owner mask so _page_backup
         # writes exactly those pages to the rank-shared L3 page files.
         kv_page_owner_mask = None
-        owner_ctx = self.cache_controller._dcp_owner_ctx()
+        owner_ctx = self.cache_controller.page_owner_mask_ctx()
         if owner_ctx is not None:
             device_value = node.component_data[BASE_COMPONENT_TYPE].value
             if device_value is None:

@@ -16,6 +16,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError
+from sglang.srt.mem_cache.canonical_page_store import (
+    CanonicalAbstainWindow,
+    kv_extents_for,
+)
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.mem_cache.weg2_store_gates import (
     owner_write_covers_whole_file,
@@ -232,6 +236,12 @@ class HiCacheStorageConfig:
     #: means three stages overwriting one another, so the window is REQUIRED
     #: wherever the sidecar pool is registered.
     canonical_qsa_page: Optional[CanonicalExtentWindow] = None
+    #: #239 S4b (F13): ``(page_size, S, lo, hi)`` of this rank's token-owner
+    #: range when the owner mode runs on PAGED pools (the token cut, page 64):
+    #: a page is then written by every owner, each its own token rows
+    #: (``canonical_page_store.owner_row_window``). None keeps the page-1
+    #: owner form (whole pages, one owner each) and every other path as is.
+    canonical_kv_owner_rows: Optional[tuple] = None
 
 
 @dataclass
@@ -1017,9 +1027,12 @@ class HiCacheFile(HiCacheStorage):
                 "is a prefix nobody can continue from."
             )
         # Precomputed once: the KV page's generic (one-extent) form, so the hot
-        # path does not rebuild and revalidate it per page.
+        # path does not rebuild and revalidate it per page. #239 S4b (F13):
+        # under the paged token cut it is this rank's owner rows instead, or
+        # the abstention of a rank that owns none.
+        self._kv_owner_rows = getattr(storage_config, "canonical_kv_owner_rows", None)
         self._canonical_kv_extents = (
-            self.canonical_kv_page.as_extents()
+            kv_extents_for(self.canonical_kv_page, self._kv_owner_rows)
             if self.canonical_kv_page is not None
             else None
         )
@@ -2213,7 +2226,7 @@ class HiCacheFile(HiCacheStorage):
                 f"{self.canonical_draft_page.total_bytes}-byte draft pages."
             )
         self.canonical_kv_page = kv_page
-        self._canonical_kv_extents = kv_page.as_extents()
+        self._canonical_kv_extents = kv_extents_for(kv_page, self._kv_owner_rows)
         self.canonical_mamba_blob = mamba_blob
         self.canonical_draft_page = draft_page
         if qsa_page is not None:
@@ -2232,13 +2245,19 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         window = self._canonical_window(key)
+        if isinstance(window, CanonicalAbstainWindow):
+            # #239 S4b (F13): no token rows of this page live on this rank;
+            # the owners read theirs, the group's MIN decides the hit.
+            return target_location
         if window is not None:
             # The shared arena first (the extra-pool route batch_get_v2 ->
             # _read_page -> get reads one page at a time; boot-xsn142 class:
             # a mamba blob completed in the arena is invisible to a disk
-            # read), then the disk.
+            # read), then the disk. The C arena packs extents front to back,
+            # so an identity-addressed window (#239 owner rows) reads the disk.
             if (
-                self._arena_dir()
+                not window.identity
+                and self._arena_dir()
                 and target_location is not None
                 and target_location.is_contiguous()
                 and int(target_location.numel()) * int(target_location.element_size())
@@ -2310,8 +2329,12 @@ class HiCacheFile(HiCacheStorage):
         plan = []
         for i, (key, target) in enumerate(zip(keys, targets)):
             window = self._canonical_window(key) if pio is not None else None
+            if isinstance(window, CanonicalAbstainWindow):
+                results[i] = target  # #239 S4b (F13): no rows here
+                continue
             if (
                 window is None
+                or window.identity  # #239 S4b: the C reader packs extents
                 or target is None
                 or not target.is_contiguous()
                 or int(target.numel()) * int(target.element_size())
@@ -2397,6 +2420,8 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> bool:
         window = self._canonical_window(key)
+        if isinstance(window, CanonicalAbstainWindow):
+            return True  # #239 S4b (F13): the owners write this page's rows
         if window is not None:
             return self._set_canonical_slice(key, window, value)
         suffixed = self._get_suffixed_key(key)
@@ -2487,7 +2512,11 @@ class HiCacheFile(HiCacheStorage):
         plan = []
         for i, (key, value) in enumerate(zip(keys, values)):
             window = self._canonical_window(key)
-            if window is None or value is None:
+            if isinstance(window, CanonicalAbstainWindow):
+                continue  # #239 S4b (F13): the owners write this page's rows
+            if window is None or value is None or window.identity:
+                # (#239 S4b: the C writer packs extents; owner rows are
+                # identity-addressed and take the per-key protocol.)
                 results[i] = bool(self.set(key, value))
                 continue
             flat = value.contiguous().view(torch.uint8)
@@ -3563,8 +3592,12 @@ class HiCacheFile(HiCacheStorage):
                 have = int(page.numel()) * int(page.element_size())
             except Exception:  # noqa: BLE001 - verification is best-effort
                 have = None
-            want = int(self._canonical_kv_extents.payload_bytes)
-            if have is not None and have != want:
+            kv_ext = self._canonical_kv_extents
+            want = (
+                None if isinstance(kv_ext, CanonicalAbstainWindow)
+                else int(kv_ext.buffer_bytes)
+            )
+            if have is not None and want is not None and have != want:
                 return (
                     f"the KV window cuts {want} bytes but the bound host "
                     f"pool's page is {have} bytes"

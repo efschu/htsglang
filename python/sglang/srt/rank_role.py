@@ -434,24 +434,28 @@ SEAMS: Dict[str, Seam] = {
             "F13",
             "the KV-holding worker's host tier and store under the token cut "
             "(owner-written rows of a page_size-64 page)",
-            "managers/cache_controller.py:1499 (weighted uneven-DCP owner mode "
-            "refuses page_size != 1 -- every rank of a D group with the cut and "
-            "the Weg2 --hicache-canonical-kv-page file tier dies at attach), "
-            "mem_cache/hicache_storage.py:4180 FormAWorkerNullStorage (a worker "
-            "claims every page and writes none -- with real rows that is a "
-            "silent wrong-KV read after an L2 eviction); weg2/tail_adopt.py, "
+            "managers/cache_controller.py:1529 (the page-1 refusal of the "
+            "owner mode -- lifted since S4b part 2 for the paged owner form, "
+            "canonical_kv_owner_rows), mem_cache/hicache_storage.py:4213 "
+            "FormAWorkerNullStorage (still the tier of a worker WITHOUT rows); "
+            "the worker's L2 (ArenaMHAHostPool with owner rows, compact device "
+            "rows), the R12 host shadow, weg2/tail_adopt.py, "
             "weg2/tail_handoff.py, the #988/H105 park loadback (host-only)",
             wired=False,
             note="#239 S3d (1) wired the votes (floor line, #59 MIN, H105 "
-            "gate MIN). The BYTES are not: an NF page (64 tokens) spans two "
-            "owner ranks under a token vector, the canonical page format has "
-            "no partial-owner slot, and the worker's tier is the null tier. "
-            "Until this is built a real boot of kv=qsa_forma_dcp is refused "
-            "at launch (weg2.launcher.refuse_unwired_token_cut).",
+            "gate MIN). S4b part 1 gave the canonical page owner-row windows, "
+            "part 2 the store/backend/attach half (a worker with rows gets the "
+            "real file backend with its KV window, a rank with share 0 "
+            "abstains, the backup has no page mask). Still open: the worker's "
+            "L2 host tier (it keeps the byteless plain pool), the R12 shadow "
+            "verdict on worker bytes, the loadback/tail per owner and "
+            "#1424d/g on the worker trees -- so a real boot of "
+            "kv=qsa_forma_dcp with a host tier stays refused at launch "
+            "(weg2.launcher.refuse_unwired_token_cut).",
             anchors=(
-                ("managers/cache_controller.py", 1499,
+                ("managers/cache_controller.py", 1529,
                  "Weighted uneven-DCP HiCache storage requires page_size == 1"),
-                ("mem_cache/hicache_storage.py", 4180,
+                ("mem_cache/hicache_storage.py", 4213,
                  "class FormAWorkerNullStorage"),
             ),
         ),
