@@ -9383,11 +9383,34 @@ class Scheduler(
                 self._pending_chunked_abort_req = None
                 self._pending_chunked_abort_delay = 0
             return
-        from sglang.srt.weg2.pp_abort import countdown_step
-        _apply, _left = countdown_step(getattr(self, "_pending_chunked_abort_delay", 0))
-        if not _apply:
-            self._pending_chunked_abort_delay = _left
-            return  # xsn324: this stage still launches this pass's chunk
+        from sglang.srt.weg2.pp_abort import countdown_step, follower_row_verdict
+        # #791C: a follower under the #631 row authority follows PP0's
+        # forwarded schedule of THIS pass (received before this plan), not a
+        # local pass count -- see weg2.pp_abort.follower_row_verdict.
+        try:
+            from sglang.srt.weg2 import p_row_authority as _prow_791c
+
+            _row_791c = follower_row_verdict(
+                getattr(self.ps, "pp_rank", 0),
+                _prow_791c.applies(self),
+                self._pp_scheduled_extents(),
+                req.rid,
+            )
+        except Exception:  # noqa: BLE001 - the verdict never blocks the old rule
+            _row_791c = None
+        if _row_791c is False:
+            return  # #791C: PP0's schedule still names this chunk (or no frame yet)
+        if _row_791c is None:
+            _apply, _left = countdown_step(getattr(self, "_pending_chunked_abort_delay", 0))
+            if not _apply:
+                self._pending_chunked_abort_delay = _left
+                return  # xsn324: this stage still launches this pass's chunk
+        else:
+            logger.info(
+                "WEG2-PP-CHUNKED-ABORT applied rid=%s pp_rank=%s: PP0's forwarded "
+                "schedule no longer names it (#791C, row authority)",
+                req.rid, getattr(self.ps, "pp_rank", 0),
+            )
 
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
@@ -20580,7 +20603,18 @@ class Scheduler(
                 from sglang.srt.weg2.pp_abort import chunked_abort_delay
                 self._pending_chunked_abort_delay = chunked_abort_delay(
                     getattr(self.ps, "pp_size", 1), getattr(self.ps, "pp_rank", 0))
-                if self._pending_chunked_abort_delay:
+                _row_791c = False
+                if getattr(self.ps, "pp_rank", 0) > 0:
+                    try:
+                        from sglang.srt.weg2 import p_row_authority as _prow_791c
+
+                        _row_791c = bool(_prow_791c.applies(self))
+                    except Exception:  # noqa: BLE001 - log wording only
+                        _row_791c = False
+                if _row_791c:
+                    logger.info("WEG2-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied when PP0's forwarded schedule stops naming it (#791C, row authority)",
+                                chunked_req.rid, getattr(self.ps, "pp_rank", 0))
+                elif self._pending_chunked_abort_delay:
                     logger.info("WEG2-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied in %d pass(es) so the stages stop at the same chunk (xsn324)",
                                 chunked_req.rid, getattr(self.ps, "pp_rank", 0), self._pending_chunked_abort_delay)
         # fnFL2 H42: an END-ANCHOR tail is finished with abort after its final
