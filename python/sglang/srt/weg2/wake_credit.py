@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.name_compat import tolerant_compile
@@ -697,6 +697,85 @@ def tag_layers_by_stage(p_split: Sequence[int], chunk_layers: int, n_tags: int
     return out
 
 
+def per_layer_mib(tags: Mapping[str, float], layers: Mapping[str, int]) -> float:
+    """#242r: MiB je Layer einer Stufe aus ihren Layer-Tags (volle Baender,
+    sonst alle), ``layers`` = Layer je Tag auf dieser Stufe."""
+    full = [t for t in tags if t in layers and layers[t] == max(layers.values())]
+    ks = full or [t for t in tags if t in layers]
+    n = sum(int(layers[t]) for t in ks)
+    return sum(float(tags[t]) for t in ks) / float(n) if n else 0.0
+
+
+def recut_reference(ref: WakeReference, p_split: Sequence[int], *, chunk_layers: int,
+                    n_layers: int) -> WakeReference:
+    """#242r: die gemessene Referenz des ersten Wakes D->P auf einen anderen
+    P-Schnitt umgerechnet. Die D-Seite (Tags je Chunk, Staging, free beim
+    Flip-Start, P-Floors) haengt nicht am P-Schnitt -- P schlaeft beim Flip-Start
+    und hat seinen kv_cache freigegeben. Neu verteilt werden die P-Tags: Tag t
+    auf Stufe s = Layer von t auf s x P-Bedarf je Layer DIESER Stufe (bei den
+    Referenzzeilen; die Pufferregel verschiebt danach wie immer); der
+    Nicht-Layer-Tag ``weights`` bleibt bei seiner Stufe. Das On-card-Staging je
+    D-Rang folgt seinem gemessenen Verhaeltnis Staging/D-Tag an der neuen
+    Eigentuemerschaft. Nicht umrechenbar -> ``ValueError`` mit W167."""
+    from sglang.srt.planner import p_card_chunk as _pc
+
+    new_split = tuple(int(x) for x in p_split)
+    ref_split = reference_p_split(ref, int(n_layers))
+    if ref_split is None:
+        raise ValueError(
+            "%s: %s -- die Referenz %s nennt ihren Schnitt nicht (keine 'MoE expert-offload "
+            "active on layer'-Zeilen); Schnitt %s nicht umrechenbar"
+            % (_pc.RECUT_REFUSAL_CODE, MARKER, ref.source, _pc.split_text(new_split)))
+    _pc.recut_check(ref_split, new_split, ["x"] * int(n_layers), MARKER)
+    n_tags = int(math.ceil(int(n_layers) / int(chunk_layers)))
+    old = tag_layers_by_stage(ref_split, chunk_layers, n_tags)
+    new = tag_layers_by_stage(new_split, chunk_layers, n_tags)
+    p_tags = []
+    for s in range(len(new_split)):
+        d = per_layer_mib(ref.p_tags[s], old[s])
+        tags = {t: round(nl * d, 3) for t, nl in new[s].items()}
+        if "weights" in ref.p_tags[s]:
+            tags["weights"] = ref.p_tags[s]["weights"]
+        p_tags.append(tags)
+    onc = []
+    for s in range(len(new_split)):
+        rel, meas = ref.d_tags[s], ref.d_oncard[s]
+        ratios = sorted(meas[t] / rel[t] for t in meas
+                        if rel.get(t, 0) > 0 and sum(1 for q in ref.p_tags if q.get(t, 0) > 0) == 1)
+        r = ratios[len(ratios) // 2] if ratios else 0.0
+        o = {}
+        for t, need in p_tags[s].items():
+            tot = sum(q.get(t, 0.0) for q in p_tags) or need
+            o[t] = round(rel.get(t, 0.0) * r * need / tot, 3)
+        onc.append(o)
+    firsts, b = [], 0
+    for n in new_split:
+        firsts.append(b)
+        b += n
+    return replace(ref, source="%s RECUT %s->%s" % (ref.source, _pc.split_text(ref_split),
+                                                    _pc.split_text(new_split)),
+                   p_tags=tuple(p_tags), d_oncard=tuple(onc), p_first_layers=tuple(firsts))
+
+
+_RX_CARD_VERDICT = re.compile(r"(card\d+) .*?-> (\w+)(?:, engste Luft (-?\d+) MiB)?")
+
+
+def recut_credit_line(ref_split: Sequence[int], p_split: Sequence[int], lines: Sequence[str],
+                      refusal: Optional[str], label: str) -> str:
+    """#242r: ``PP-CUT RECUT ref=<Schnitt> -> <Schnitt> WAKE-CREDIT D->P``: Kredit je Karte."""
+    from sglang.srt.planner import p_card_chunk as _pc
+
+    per = []
+    for ln in lines:
+        m = _RX_CARD_VERDICT.search(ln)
+        if m and ln.startswith("%s %s card" % (MARKER, label)):
+            per.append("%s %s%s" % (m.group(1), m.group(2),
+                                    "" if m.group(3) is None else " engste Luft %s MiB" % m.group(3)))
+    return "%s ref=%s -> %s WAKE-CREDIT D->P %s: %s -> %s" % (
+        _pc.RECUT_MARKER, _pc.split_text(ref_split), _pc.split_text(p_split), label,
+        " | ".join(per) or "-", "VERWEIGERT" if refusal else "PASST")
+
+
 def planned_cards(ref: WakeReference, *, p_rows: Sequence[int], d_rows: Sequence[int],
                   slot_mib: float, p_split: Sequence[int], chunk_layers: int,
                   n_layers: int) -> List[WakeCard]:
@@ -868,6 +947,22 @@ def plan_wake_credit(*, model: str, p_split: Sequence[int], chunk_layers: int,
     }
     _model_note = _model_same_footprint(model, key, have)
     diff = [k for k in key if key[k] != have.get(k)]
+    recut_from = None
+    if diff == ["p_split"]:
+        # #242r: NUR der Schnitt weicht ab -> die Referenz wird umgerechnet
+        # (P-Tags je Band auf die neuen Stufen); geht das nicht, VERWEIGERT
+        # der Riegel mit Namen statt still zu entfallen.
+        try:
+            if not isinstance(key["p_split"], tuple):
+                raise ValueError(
+                    "W167 Weg2PCutRecutRefused: %s %s -- der Schnitt der Referenz %s ist %s"
+                    % (MARKER, label, ref.source, key["p_split"]))
+            ref = recut_reference(ref, have["p_split"], chunk_layers=int(chunk_layers),
+                                  n_layers=int(n_layers))
+        except ValueError as exc:
+            return WakeCreditPlan(lines=("%s %s %s" % (MARKER, label, exc),), refusal=str(exc))
+        recut_from = key["p_split"]
+        diff = []
     if diff:
         return WakeCreditPlan(lines=(
             "%s %s ENTFAELLT: die Referenz %s gilt fuer %s, diese Form hat %s -- eine "
@@ -892,6 +987,10 @@ def plan_wake_credit(*, model: str, p_split: Sequence[int], chunk_layers: int,
         head += "; " + _model_note
     lines, refusal, _chosen = verdict_lines(ref.order, cards, label=label, reorder=reorder,
                                             search=search, double_staging=double_staging)
+    if recut_from is not None:
+        head += "; #242r Referenz umgerechnet %s -> %s" % (
+            ",".join(str(x) for x in recut_from), ",".join(str(x) for x in p_split))
+        lines = list(lines) + [recut_credit_line(recut_from, p_split, lines, refusal, label)]
     front_plan: Dict[str, object] = {"D->P": [
         {"card": wc.card, "release": dict(wc.release_mib), "demand": dict(wc.demand_mib),
          "oncard": dict(wc.oncard_mib), "sleeper": wc.sleeper, "waker": wc.waker}

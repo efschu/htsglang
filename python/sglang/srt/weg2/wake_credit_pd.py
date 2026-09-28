@@ -743,6 +743,7 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
                         d_seats: Optional[int] = None,
                         free0_records: Optional[Sequence[Mapping[str, object]]] = None,
                         free0_builtin: Optional[Sequence[Mapping[str, object]]] = None,
+                        recut_geometry: Optional[Mapping[str, object]] = None,
                         ) -> WakeCreditPlanPD:
     """Der Planer-Riegel P->D: der Wake der GEPLANTEN Form gegen die gemessene
     Referenz derselben Form (Draft auf P: fnFL2x141, H25: fnFL2x144), Delta =
@@ -792,6 +793,28 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
     _model_note = _model_same_footprint(model, key, have)
     diff = [k for k in key if key[k] != have.get(k)]
     main, first = refs.get(boot + "/1"), refs.get(boot + "/0")
+    recut_from = None
+    if key and main is not None and diff == ["p_split"]:
+        # #242r: NUR der Schnitt weicht ab -> Referenz umrechnen; ohne Geometrie
+        # (Layer-Typen, Dense, Mamba, KV je Layer) VERWEIGERT der Riegel mit Namen.
+        from sglang.srt.planner import p_card_chunk as _pc
+
+        try:
+            geo = dict(recut_geometry or {})
+            miss = [k for k in ("layer_kinds", "dense_mib_per_layer", "mamba_mib_per_linear_layer",
+                                "kv_mib_per_attn_layer") if geo.get(k) is None]
+            if miss:
+                raise ValueError(
+                    "%s: %s %s %s -- Schnitt %s: die Geometrie fuer den Umschnitt fehlt (%s)"
+                    % (_pc.RECUT_REFUSAL_CODE, MARKER, DIRECTION, label, _pc.split_text(p_split),
+                       ", ".join(miss)))
+            _pc.recut_check(key["p_split"], p_split, geo["layer_kinds"],  # type: ignore[arg-type]
+                            "%s %s" % (MARKER, DIRECTION))
+        except ValueError as exc:
+            return WakeCreditPlanPD(lines=("%s %s %s %s" % (MARKER, DIRECTION, label, exc),),
+                                    refusal=str(exc))
+        recut_from = tuple(int(x) for x in key["p_split"])  # type: ignore[union-attr]
+        diff = []
     if not key or diff or main is None:
         return WakeCreditPlanPD(lines=(
             "%s %s %s ENTFAELLT: die Referenz %s gilt fuer %s, diese Form hat %s -- eine "
@@ -805,9 +828,26 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
     fz = {f: resolve_free0(boot, d_seats, f, builtin=builtin, records=list(free0_records or ()),
                            model=str(model), form_model=key.get("model"))
           for f in (1, 0)}
-    ref = planned_reference_pd(reference_from_dict(main), free0=fz[1][0], **kw)
-    also = ([planned_reference_pd(reference_from_dict(first), free0=fz[0][0], **kw)]
-            if first is not None else [])
+    if recut_from is None:
+        ref = planned_reference_pd(reference_from_dict(main), free0=fz[1][0], **kw)
+        also = ([planned_reference_pd(reference_from_dict(first), free0=fz[0][0], **kw)]
+                if first is not None else [])
+    else:
+        def _recut(d, f0):
+            r0 = reference_from_dict(d)
+            base_free = dict((f0 or {}).get("free") or r0.free)
+            base_rows = [int(x) for x in ((f0 or {}).get("p_rows") or r0.p_rows)]
+            shift = recut_free_shift_mib(recut_from, p_split, base_rows, slot_mib=slot_mib,
+                                         geometry=recut_geometry or {})
+            free = {int(k): float(v) for k, v in base_free.items()}
+            for s, c in enumerate(r0.p_card):
+                free[int(c)] -= shift[s]
+            rc = recut_reference_pd(r0, p_split, ref_split=recut_from,
+                                    chunk_layers=chunk_layers, n_layers=n_layers)
+            return planned_reference_pd(rc, free0={"free": free, "p_rows": base_rows}, **kw)
+
+        ref = _recut(main, fz[1][0])
+        also = [_recut(first, fz[0][0])] if first is not None else []
     head = (
         "%s %s %s: Wake P->D (P schlaeft, D wacht, beide Legs zugleich) gegen die Referenz %s "
         "(gemessen: free %s, P-Zeilen %s, D-Zeilen %s), Delta = Pufferregel (Zeilen x Layer x "
@@ -821,6 +861,11 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
     if d_seats is not None:
         head += "; H92d " + fz[1][2] + (("; Vergleichsflip " + fz[0][2]) if also else "")
     lines, refusal, chosen = verdict_lines_pd(ref, label=label, apply=apply, also=also)
+    if recut_from is not None:
+        head += "; #242r Referenz umgerechnet %s -> %s" % (
+            ",".join(str(x) for x in recut_from), ",".join(str(int(x)) for x in p_split))
+        lines = list(lines) + [recut_credit_line_pd(recut_from, p_split, ref, simulate_pd(ref),
+                                                    refusal, label)]
     front: Dict[str, object] = {DIRECTION: untimed_table_pd(ref)}
     if d_seats is not None:
         # H92d: die Front misst free0 dieser Form an ihren ersten zwei Wakes
@@ -1360,6 +1405,112 @@ def planned_reference_pd(ref: PDReference, *, p_rows: Sequence[int], d_rows: Seq
                    p_resident=tuple(int(x) for x in (p_resident or ref.p_resident)),
                    d_resident=tuple(int(x) for x in (d_resident or ref.d_resident)),
                    metal={}, metal_publish={})
+
+
+def recut_reference_pd(ref: PDReference, p_split: Sequence[int], *, ref_split: Sequence[int],
+                       chunk_layers: int, n_layers: int) -> PDReference:
+    """#242r: die gemessene Referenz des Wakes P->D auf einen anderen P-Schnitt
+    umgerechnet (bei den Referenzzeilen; die Pufferregel folgt in
+    :func:`planned_reference_pd`). Je Stufe aus den vollen Baendern gemessen:
+    P-Freigabe und Pause je Layer, je Lane (Stufe -> Rang) MiB je Layer, ms und
+    Collect je MiB, der Deposit-Aufschlag ueber der laengsten Lane; daraus die
+    Baender der neuen Stufen. Der Nicht-Layer-Tag ``weights`` bleibt bei seiner
+    Stufe, die D-Seite (Bedarf, Resume, Floors, Starts) haengt nicht am
+    P-Schnitt. ``free`` verschiebt :func:`plan_wake_credit_pd` um die P-Haltung
+    der Stufen (P haelt beim Flip-Start ihren ganzen Puffer)."""
+    from sglang.srt.weg2.wake_credit import per_layer_mib
+
+    n_tags = int(math.ceil(int(n_layers) / int(chunk_layers)))
+    old = tag_layers_by_stage([int(x) for x in ref_split], chunk_layers, n_tags)
+    new = tag_layers_by_stage([int(x) for x in p_split], chunk_layers, n_tags)
+    rel_out, pz_out, dep_out, lanes = [], [], [], []
+    for s in range(len(ref.p_card)):
+        per = per_layer_mib(ref.p_release[s], old[s])
+        pms = [float(ref.p_pause_ms[s][t]) / float(ref.p_release[s][t]) for t in ref.p_pause_ms[s]
+               if t in old[s] and ref.p_release[s].get(t)]
+        pmib = statistics.median(pms) if pms else 0.0
+        rel, pz = {}, {}
+        for t, nl in new[s].items():
+            rel[t] = round(nl * per, 3)
+            pz[t] = round(rel[t] * pmib, 3)
+        if "weights" in ref.p_release[s]:
+            rel["weights"] = ref.p_release[s]["weights"]
+            if "weights" in ref.p_pause_ms[s]:
+                pz["weights"] = ref.p_pause_ms[s]["weights"]
+        rel_out.append(rel)
+        pz_out.append(pz)
+    per_lane: Dict[Tuple[int, int], List[Tuple[float, float, float, bool]]] = {}
+    for ln in ref.lanes:
+        nl = old[ln.stage].get(ln.tag, 0)
+        if nl <= 0 or not ln.mib:
+            continue
+        per_lane.setdefault((ln.stage, ln.rank), []).append(
+            (float(ln.mib) / nl, float(ln.ms) / float(ln.mib), float(ln.collect_ms) / float(ln.mib),
+             bool(ln.oncard)))
+    for s in range(len(ref.p_card)):
+        over = [float(d) - max((float(ln.ms) for ln in ref.lanes if ln.stage == s and ln.tag == t),
+                               default=0.0)
+                for t, d in ref.p_deposit_ms[s].items() if t in old[s]]
+        o = statistics.median(over) if over else 0.0
+        dep = {}
+        for t, nl in new[s].items():
+            mx = 0.0
+            for r in range(len(ref.d_floor)):
+                v = per_lane.get((s, r))
+                if not v:
+                    continue
+                mib = statistics.median(x[0] for x in v) * nl
+                ms = statistics.median(x[1] for x in v) * mib
+                cm = statistics.median(x[2] for x in v) * mib
+                lanes.append(PDLane(stage=s, rank=r, tag=t, mib=round(mib, 3), ms=round(ms, 3),
+                                    oncard=v[0][3], collect_ms=round(cm, 3)))
+                mx = max(mx, ms)
+            dep[t] = round(o + mx, 3)
+        if "weights" in ref.p_deposit_ms[s]:
+            dep["weights"] = ref.p_deposit_ms[s]["weights"]
+        lanes.extend(ln for ln in ref.lanes if ln.stage == s and ln.tag == "weights")
+        dep_out.append(dep)
+    return replace(ref, source="%s RECUT %s->%s" % (
+        ref.source, ",".join(str(int(x)) for x in ref_split), ",".join(str(int(x)) for x in p_split)),
+        p_release=tuple(rel_out), p_pause_ms=tuple(pz_out), lanes=tuple(lanes),
+        p_deposit_ms=tuple(dep_out), metal={}, metal_publish={})
+
+
+def recut_free_shift_mib(ref_split: Sequence[int], p_split: Sequence[int], rows: Sequence[int], *,
+                         slot_mib: float, geometry: Mapping[str, object]) -> List[float]:
+    """#242r: um wie viel MiB die P-Haltung je Stufe beim Flip-Start waechst, wenn
+    Layer die Stufe wechseln (bei den Zeilen ``rows`` der free-Messung): je Layer
+    Dense + Zeilen x slot, je linearem Layer der Mamba-Zustand, je
+    Attention-Layer der KV-Posten."""
+    from sglang.srt.planner import p_card_chunk as _pc
+
+    kinds = geometry["layer_kinds"]
+    a0, l0 = _pc.stage_kind_counts(kinds, ref_split)  # type: ignore[arg-type]
+    a1, l1 = _pc.stage_kind_counts(kinds, p_split)  # type: ignore[arg-type]
+    dense = float(geometry["dense_mib_per_layer"])  # type: ignore[arg-type]
+    mamba = float(geometry["mamba_mib_per_linear_layer"])  # type: ignore[arg-type]
+    kv = float(geometry["kv_mib_per_attn_layer"])  # type: ignore[arg-type]
+    return [(int(p_split[s]) - int(ref_split[s])) * (dense + int(rows[s]) * float(slot_mib))
+            + (l1[s] - l0[s]) * mamba + (a1[s] - a0[s]) * kv for s in range(len(p_split))]
+
+
+def recut_credit_line_pd(ref_split: Sequence[int], p_split: Sequence[int], ref: PDReference,
+                         run: "PDRun", refusal: Optional[str], label: str) -> str:
+    """#242r: ``PP-CUT RECUT ref=<Schnitt> -> <Schnitt> WAKE-CREDIT P->D``: Leg und
+    Kredit je Karte."""
+    from sglang.srt.planner import p_card_chunk as _pc
+
+    per = []
+    for r, c in enumerate(ref.d_card):
+        t = run.tightest(r)
+        per.append("card%d D TP%d free %.0f Kreditwarten %.0f ms%s" % (
+            int(c), r, float(ref.free[int(c)]), run.wait_sum(r),
+            "" if t is None else ", engste Luft %.0f MiB bei %s" % (t.headroom_mib, t.tag)))
+    return "%s ref=%s -> %s WAKE-CREDIT P->D %s: Leg %s ms (%s) | %s -> %s" % (
+        _pc.RECUT_MARKER, _pc.split_text(ref_split), _pc.split_text(p_split), label,
+        "-" if run.leg_ms is None else "%.0f" % run.leg_ms,
+        "vollstaendig" if run.complete else "STEHT", " | ".join(per),
+        "VERWEIGERT" if refusal else "PASST")
 
 
 def untimed_table_pd(ref: PDReference) -> List[Dict[str, object]]:

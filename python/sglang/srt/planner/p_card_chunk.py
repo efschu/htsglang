@@ -71,6 +71,12 @@ CARD_MARKER = "PP-CUT P-KARTE"
 UNMEASURED_CODE = "W131 Weg2PChunkTransientUnmeasured"
 #: Die Karte einer P-Stufe stirbt im Chunk-Forward (x121/x122).
 CARD_REFUSAL_CODE = "W132 Weg2PCardChunkOom"
+#: #242r: ein Schnitt, den weder eine Referenz DIESES Schnitts noch der Umschnitt
+#: der gemessenen Referenz rechnen kann (Geometrie unbekannt). Gilt fuer die
+#: P-KARTE und beide Wake-Kredit-Riegel: kein Riegel faellt wortlos weg.
+RECUT_REFUSAL_CODE = "W167 Weg2PCutRecutRefused"
+#: #242r: EIN Praefix fuer die Zeilen des Umschnitts (P-KARTE, D->P, P->D).
+RECUT_MARKER = "PP-CUT RECUT"
 
 #: ``corridor_guard.NEAR_OOM_MIB`` (per Test gebunden): "one allocation from
 #: death, a stopper in any phase". Hier gespiegelt, weil corridor_guard torch
@@ -89,6 +95,52 @@ HIGHWATER_STEP_MIB = 0.25 * GIB_IN_MIB
 
 class PChunkUnmeasured(ValueError):
     """W131: ein Chunk ausserhalb der gemessenen Stuetzpunkte."""
+
+
+class PCutRecutRefused(ValueError):
+    """#242r W167: der geplante Schnitt ist aus der gemessenen Referenz nicht
+    umrechenbar (Stufenzahl, Layersumme oder Layer-Typen unbekannt)."""
+
+
+def split_text(split: Sequence[int]) -> str:
+    return ",".join(str(int(x)) for x in split)
+
+
+def stage_kind_counts(layer_kinds: Sequence[str], split: Sequence[int]
+                      ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    """``(Attention-Layer, lineare Layer)`` je Stufe eines Schnitts, aus den
+    ``layer_types`` des Checkpoints (``full_attention`` = Attention)."""
+    attn, lin, b = [], [], 0
+    for n in split:
+        a = sum(1 for k in layer_kinds[b:b + int(n)] if str(k) == "full_attention")
+        attn.append(a)
+        lin.append(int(n) - a)
+        b += int(n)
+    return tuple(attn), tuple(lin)
+
+
+def recut_check(ref_split: Sequence[int], split: Sequence[int],
+                layer_kinds: Optional[Sequence[str]], what: str) -> None:
+    """Der Umschnitt ist nur fuer dieselbe Stufenzahl und dieselbe Layersumme
+    definiert, und nur mit den Layer-Typen des Checkpoints; sonst W167."""
+    ref_split = [int(x) for x in ref_split]
+    split = [int(x) for x in split]
+    why = []
+    if len(ref_split) != len(split):
+        why.append("Stufenzahl %d gegen %d der Referenz" % (len(split), len(ref_split)))
+    if sum(ref_split) != sum(split):
+        why.append("Layersumme %d gegen %d der Referenz" % (sum(split), sum(ref_split)))
+    if any(n <= 0 for n in split):
+        why.append("leere Stufe im Schnitt %s" % split_text(split))
+    if not layer_kinds:
+        why.append("Layer-Typen des Checkpoints unbekannt")
+    elif len(layer_kinds) != sum(split):
+        why.append("%d Layer-Typen fuer %d Layer" % (len(layer_kinds), sum(split)))
+    if why:
+        raise PCutRecutRefused(
+            "%s: %s -- Schnitt %s ist aus der Referenz (Schnitt %s) nicht umrechenbar: %s. "
+            "Boots DIESES Schnitts als Referenz geben oder den gemessenen Schnitt fahren."
+            % (RECUT_REFUSAL_CODE, what, split_text(split), split_text(ref_split), "; ".join(why)))
 
 
 class PCardFormUnmeasured(ValueError):
@@ -1553,6 +1605,62 @@ def _seats_text(fit: PCardFit, reference: PCardReference) -> str:
         "privat_frei -3 MiB) -- Boots dieser Form per --p-card-reference-logs geben"
         % (fit.seats, reference.seats)
     )
+
+
+def recut_reference(reference: "PCardReference", stage_layers: Sequence[int], *,
+                    layer_kinds: Optional[Sequence[str]],
+                    dense_mib_per_layer: Optional[float],
+                    mamba_mib_per_linear_layer_per_slot: Optional[float]) -> "PCardReference":
+    """#242r: die gemessene Referenz auf einen anderen Schnitt umgerechnet.
+
+    Der Kopfraum ``K0`` einer Stufe (Kopfraum ohne Expertenzeilen, KV und
+    Transiente) verliert je hinzukommendem Layer dessen Dense-Gewichte und je
+    hinzukommendem LINEAREN Layer dessen Mamba-Zustand (Slots der Referenz x
+    MiB je Slot); ein abgegebener Layer gibt beides zurueck. KV und Expertenzeilen
+    rechnet :func:`solve_p_card` ohnehin aus dem PLAN (KV je Attention-Layer,
+    Zeilen x Layer der Stufe); Transiente, Wachstum, Mitbewohner und Kappe
+    bleiben je Karte wie gemessen (HOCHRECHNUNG fuer die Layerzahl). Ein
+    gemessener Zeilenpreis (``row_card_mib``) skaliert mit der Layerzahl.
+    Nicht umrechenbar -> :class:`PCutRecutRefused` (W167)."""
+    split = tuple(int(x) for x in stage_layers)
+    ref_split = tuple(int(x) for x in reference.stage_layers)
+    recut_check(ref_split, split, layer_kinds, CARD_MARKER)
+    if dense_mib_per_layer is None or not (float(dense_mib_per_layer) > 0.0):
+        raise PCutRecutRefused(
+            "%s: %s -- Schnitt %s: Dense je Layer unbekannt (%r), der Kopfraum ist nicht "
+            "umrechenbar." % (RECUT_REFUSAL_CODE, CARD_MARKER, split_text(split), dense_mib_per_layer))
+    rate = float(mamba_mib_per_linear_layer_per_slot or 0.0)
+    if int(reference.mamba_slots) > 0 and rate <= 0.0:
+        raise PCutRecutRefused(
+            "%s: %s -- Schnitt %s: die Referenz traegt %d Mamba-Slots, der Preis je "
+            "linearem Layer und Slot ist unbekannt." % (
+                RECUT_REFUSAL_CODE, CARD_MARKER, split_text(split), int(reference.mamba_slots)))
+    _a0, lin0 = stage_kind_counts(layer_kinds, ref_split)
+    _a1, lin1 = stage_kind_counts(layer_kinds, split)
+    mamba_lin = int(reference.mamba_slots) * rate
+    h0 = tuple(
+        round(float(reference.headroom0_mib[s]) - (split[s] - ref_split[s]) * float(dense_mib_per_layer)
+              - (lin1[s] - lin0[s]) * mamba_lin, 1)
+        for s in range(len(split)))
+    row_card = tuple(round(float(reference.row_card_mib[s]) * split[s] / ref_split[s], 1)
+                     for s in range(len(split))) if reference.row_card_mib else ()
+    return msgspec.structs.replace(
+        reference, stage_layers=split, headroom0_mib=h0, row_card_mib=row_card,
+        source="%s RECUT %s->%s" % (reference.source, split_text(ref_split), split_text(split)))
+
+
+def recut_card_line(ref_split: Sequence[int], split: Sequence[int],
+                    fits: Sequence["PCardFit"], *, dense_mib_per_layer: float,
+                    mamba_mib_per_linear_layer: float) -> str:
+    """#242r: ``PP-CUT RECUT ref=<Schnitt> -> <Schnitt> P-KARTE: Decke je Stufe``."""
+    decke = " | ".join(
+        "stage%d f %s (<= %d Zeilen, Kopfraum %.0f MiB)" % (
+            f.stage, "KEINE" if f.ceiling_fraction is None else "%.3f" % f.ceiling_fraction,
+            f.ceiling_max_rows, f.headroom_mib) for f in fits)
+    return ("%s ref=%s -> %s P-KARTE: Decke %s; K0 je Stufe um Dense %.0f MiB/Layer und Mamba "
+            "%.1f MiB je linearem Layer verschoben, KV und Zeilen aus dem Plan"
+            % (RECUT_MARKER, split_text(ref_split), split_text(split), decke,
+               float(dense_mib_per_layer), float(mamba_mib_per_linear_layer)))
 
 
 def describe_p_card(fit: PCardFit, reference: PCardReference) -> str:

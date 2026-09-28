@@ -166,13 +166,16 @@ def test_the_riegel_passes_the_proven_form_and_form_a():
         assert "unchanged" in plan.lines[1]
 
 
-def test_a_foreign_geometry_is_named_not_graded():
+def test_a_foreign_cut_is_recut_not_dropped():
+    """#242r: ein anderer Schnitt wird aus der gemessenen Referenz umgerechnet
+    (P-Tags je Band auf die neuen Stufen), nie mehr ENTFAELLT."""
     plan = wc.plan_wake_credit(
         model=MODEL, p_split=(24, 12, 12), chunk_layers=CHUNK, n_layers=N_LAYERS,
         p_card=P_CARD, d_ratio="183,137,168", p_rows=[263] * 3, d_rows=[84, 128, 128],
         slot_mib=SLOT_MIB, label="D", reorder=True, double_staging=False)
-    assert plan.refusal is None and plan.front_plan is None
-    assert "ENTFAELLT" in plan.lines[0] and "p_split" in plan.lines[0]
+    assert not any("ENTFAELLT" in ln for ln in plan.lines) and plan.front_plan is not None
+    assert "RECUT 29,11,8->24,12,12" in plan.lines[0]
+    assert plan.lines[-1].startswith("PP-CUT RECUT ref=29,11,8 -> 24,12,12 WAKE-CREDIT D->P D:")
 
 
 def _launcher_ns(tmp_path, fr_p, fr_d):
