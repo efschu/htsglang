@@ -183,7 +183,11 @@ def _stack_locals() -> Dict[int, List[str]]:
                     items = []
                 for k, v in items:
                     idx.setdefault(id(v), []).append(f"frame {f.f_code.co_name} local {k}")
+                del items
             f = f.f_back
+    # `frames` holds this function's own frame (sys._current_frames) -- a cycle that would keep
+    # the last `items` list of (name, value) pairs alive as a fake holder ('tuple <- list <- ?')
+    frames.clear()
     return idx
 
 
@@ -268,6 +272,23 @@ def live_cuda_tensors() -> List[Any]:
     return out
 
 
+def live_cuda_tensor_ptrs() -> Tuple[List[Tuple[Any, int]], int]:
+    """``(tensor, data_ptr)`` of every live CUDA tensor, and how many were passed over because
+    their data pointer cannot be read. NF rc12z17 (103bfdf29a) 10:50:11Z, every sleep, all three P
+    ranks: a FakeTensor/FunctionalTensor on the heap (torch.compile / dynamo) raised in
+    ``data_ptr()`` and that one exception discarded the whole holder report. Such an object owns
+    no allocator block, so it can hold none of the blocks the report names -- skipping it loses
+    nothing; the count goes into the report line so the skip is never silent."""
+    pairs: List[Tuple[Any, int]] = []
+    skipped = 0
+    for t in live_cuda_tensors():
+        try:
+            pairs.append((t, int(t.data_ptr())))
+        except Exception:  # noqa: BLE001 - fake/functional/meta tensors: no pointer, no block
+            skipped += 1
+    return pairs, skipped
+
+
 def holder_report(snapshot: Optional[dict], top: int = 4, depth: int = 5) -> List[str]:
     """(c) For the ``top`` largest framed live blocks: the Python tensors that
     live in them and who references each (type/attribute/frame local only). Bounded: one
@@ -277,14 +298,16 @@ def holder_report(snapshot: Optional[dict], top: int = 4, depth: int = 5) -> Lis
     blocks = _framed_blocks(snapshot, top)
     if not blocks:
         return []
-    tensors = live_cuda_tensors()
+    pairs, skipped = live_cuda_tensor_ptrs()
     lines = []
     stack = _stack_locals()
     for addr, size, site in blocks:
-        hit = [t for t in tensors if addr <= int(t.data_ptr()) < addr + size]
+        hit = [t for t, p in pairs if addr <= p < addr + size]
         holders = []
-        for t in hit[:2]:
-            holders.extend(_describe(t, depth, set(), {id(tensors), id(hit)}, stack))
-        lines.append(f"{size / _MIB:.1f} MiB @{site} holders={holders or ['no python tensor (freed-but-cached or C++ owner)']}")
-    del tensors
+        for i in range(min(2, len(hit))):  # no slice: a slice is a new list, i.e. a fake holder
+            t = hit[i]
+            holders.extend(_describe(t, depth, set(), {id(pairs), id(hit), *map(id, pairs)}, stack))
+        lines.append(f"{size / _MIB:.1f} MiB @{site} holders={holders or ['no python tensor (freed-but-cached or C++ owner)']} "
+                     f"skipped_no_ptr={skipped}")
+    del pairs
     return lines
