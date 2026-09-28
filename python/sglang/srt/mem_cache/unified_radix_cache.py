@@ -810,6 +810,55 @@ def _weg2_prefetch_resolved_rows(rec):
 _PREFETCH_COMPLETION_SLOTS = 4096
 
 
+def _form_a_load_back_floor(tree, floor: int, kv_tokens: int, rid=None) -> int:
+    """H105c (rc12z30g dkrnfh91dprsavisnoadoptstvsyncbar1dauer09282210, D log
+    23:23:28, weg2-180-304): the room a Form A load-back decides from.
+
+    One pass admitted weg2-180-303 and weg2-180-304, both host-backed. The
+    floor is published ONCE per iteration; ``load_back`` read it raw, so the
+    second load-back of the pass was judged against rows the first had
+    already taken (``_form_a_note_loaded`` charged them, only the extend
+    trigger read the charge). TP0 (the 5090's larger pool) still fit and sent
+    ADMIT; the 3080 workers, bound by the same stale floor, got 0 rows
+    ('WEG2-LOADBACK-WAIT rid=weg2-180-304 extent=63296 applied=0 ...
+    rem_total_tokens=157504'), returned NO_TOKEN on their own and ended the
+    loop one gate call short of the host ('H105 RU FORM-A EXTEND-SET
+    MALFORMED got=(weg2-180-305, NO_TOKEN, 98650, 89792, 0, '')').
+
+    * On a Form A group the floor is charged with what this pass already
+      admitted and loaded (``uniform_avail_for_evict``, the #694 ledger), so
+      the host's host-first verdict sees the second load-back not fit.
+    * A rank that already TOOK the group's ADMIT (``_h105c_follow_room``, set
+      by ``PrefillAdder`` around its retry) must honour it: it evicts its own
+      shortfall and decides from its live pool -- the verdict is the host's,
+      the room is this rank's to make.
+    Everywhere else: the published floor, unchanged."""
+    alloc = tree.token_to_kv_pool_allocator
+    if getattr(tree, "_h105c_follow_room", False):
+        avail = int(alloc.available_size())
+        evicted = 0
+        if avail < kv_tokens:
+            ev = int(tree.evictable_size())
+            if ev > 0:
+                res = tree.evict(EvictParams(num_tokens=min(ev, kv_tokens - avail)))
+                evicted = int(getattr(res, "num_tokens_evicted", 0) or 0)
+            avail = int(alloc.available_size())
+        logger.info(
+            "H105c FORM-A FOLLOW-ROOM rid=%s kv_tokens=%d evicted=%d available=%d: "
+            "the group ADMIT is already taken; this rank makes its own room for "
+            "the load-back instead of waiting alone",
+            rid, int(kv_tokens), evicted, avail,
+        )
+        return avail
+    from sglang.srt.managers.tp_match_floor import form_a_follow_active
+
+    if not form_a_follow_active():
+        return floor
+    from sglang.srt.mem_cache.common import uniform_avail_for_evict
+
+    return int(uniform_avail_for_evict(tree, alloc))
+
+
 def _form_a_note_loaded(tree, rows: int) -> None:
     """D-OOM (rc12v dkrnfh91dprsabar1dauer09272047, 21:19:18, rid
     weg2-28-124): charge a load-back's device rows against this
@@ -5631,6 +5680,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 f"rid={getattr(req, 'rid', None)} kv_tokens={kv_tokens} "
                 f"local_available={self.token_to_kv_pool_allocator.available_size()}"
             )
+        # H105c: a Form A pass's earlier load-backs count; a rank following the
+        # group's ADMIT makes its own room.
+        floor = _form_a_load_back_floor(self, floor, kv_tokens, getattr(req, "rid", None))
         # SF (b23 #1004, weg2/pp_slot_fidelity.py): on TP=1/PP>1 the floor is
         # this rank's OWN value (#788: the reduce group has one member), so the
         # refuse-and-retry-next-pass below skews this stage a pass behind its
