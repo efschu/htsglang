@@ -344,27 +344,41 @@ class TokenSpans:
         # key -> (ids, cached_tokens, prompt_tokens, held_epoch)
         self.entries: "collections.OrderedDict[str, Tuple[np.ndarray, int, int, Optional[int]]]" = \
             collections.OrderedDict()
+        #: #59: key -> D's ``weg2_resumable_depth`` (see SpanLRU.depth_caps).
+        self.depth_caps: Dict[str, int] = {}
 
     @staticmethod
     def _key(ids: np.ndarray) -> str:
         return hashlib.sha1(ids.tobytes()).hexdigest()
 
     def record_presence(self, ids: Optional[np.ndarray], cached_tokens: int,
-                        prompt_tokens: int = 0, held_epoch: Optional[int] = None) -> None:
+                        prompt_tokens: int = 0, held_epoch: Optional[int] = None,
+                        resumable_depth: Optional[int] = None) -> None:
+        """#59: ``resumable_depth`` (D's ``weg2_resumable_depth``, None = not
+        sent) caps every credit of this entry; 0 retracts."""
         if ids is None or ids.size == 0:
             return
         key = self._key(ids)
         self.entries.pop(key, None)
+        self.depth_caps.pop(key, None)
         if not self.agent_span:
             prompt_tokens, held_epoch = 0, None
         ct = max(0, int(cached_tokens))
         pt = max(0, int(prompt_tokens or 0))
         held = held_epoch if (held_epoch is not None and pt > 0) else None
+        if resumable_depth is not None and int(resumable_depth) <= 0:
+            return
         if ct <= 0 and held is None:
             return
         self.entries[key] = (ids, ct, pt, held)
+        if resumable_depth is not None:
+            self.depth_caps[key] = int(resumable_depth)
+        self._trim()
+
+    def _trim(self) -> None:
         while len(self.entries) > self.cap:
-            self.entries.popitem(last=False)
+            old_key, _ = self.entries.popitem(last=False)
+            self.depth_caps.pop(old_key, None)
 
     def record_inflight(self, ids: Optional[np.ndarray], held_epoch: Optional[int]) -> None:
         if ids is None or ids.size == 0 or held_epoch is None:
@@ -374,18 +388,20 @@ class TokenSpans:
         ct = old[1] if old else 0
         pt = max(int(ids.size), old[2] if old else 0)
         self.entries[key] = (ids, ct, pt, int(held_epoch))
-        while len(self.entries) > self.cap:
-            self.entries.popitem(last=False)
+        self._trim()  # #59: an old depth cap stays until the finish replaces it
 
     def pending(self, ids: np.ndarray, epoch: Optional[int] = None) -> Tuple[int, int, bool, str]:
         """(pending tokens, credited tokens, presence known, witness)."""
         best, src, known = 0, "none", False
-        for eids, ct, pt, held_epoch in self.entries.values():
+        for key, (eids, ct, pt, held_epoch) in self.entries.items():
             lcp = token_lcp(eids, ids)
             if lcp <= 0:
                 continue
             held = epoch is not None and held_epoch is not None and held_epoch == epoch
             raw = max(ct, pt) if held else ct
+            cap = self.depth_caps.get(key)
+            if cap is not None:
+                raw = min(raw, cap)  # #59: never past D's deepest anchor
             if raw <= 0:
                 continue
             known = True

@@ -1067,14 +1067,27 @@ class SpanLRU:
         # key -> (text, cached_tokens, prompt_tokens, held_epoch)
         self.entries: collections.OrderedDict[
             str, Tuple[str, int, int, Optional[int]]] = collections.OrderedDict()
+        #: #59: key -> D's ``weg2_resumable_depth`` for that entry (the
+        #: deepest prefix D can actually resume from: its deepest held Mamba
+        #: anchor, group-uniform). Beside ``entries``, their tuple unchanged;
+        #: no key = no cap (D did not send the field -- the old credit).
+        self.depth_caps: Dict[str, int] = {}
         #: the witness of the last pricing answer, for the ROUTE-VERDICT label
         #: only (``none`` / ``d_leg2_cached`` / ``d_served_epoch``); nothing
         #: decides on it.
         self.last_src = "none"
 
     def record_presence(self, text: str, cached_tokens: int, prompt_tokens: int = 0,
-                        held_epoch: Optional[int] = None) -> None:
+                        held_epoch: Optional[int] = None,
+                        resumable_depth: Optional[int] = None) -> None:
         """One MEASURED cached-on-D outcome for ``text``.
+
+        #59: ``resumable_depth`` is D's ``weg2_resumable_depth`` from the same
+        response (None = D did not send it). It CAPS every credit this entry
+        gives -- the measured ``cached_tokens`` and the #49 held prompt alike:
+        D holds KV past its deepest Mamba anchor, but a hybrid model can only
+        resume at an anchor (rc12z weg2-12-61: credit 55424, D's extent 37952).
+        A depth of 0 is a measurement of nothing resumable and retracts.
 
         ``cached_tokens`` is a D leg-2 response's own ``cached_tokens``.
         NAMED ``record_presence`` and not ``record`` on purpose: the old name
@@ -1100,17 +1113,23 @@ class SpanLRU:
             return
         key = hashlib.sha1(text.encode()).hexdigest()
         self.entries.pop(key, None)
+        self.depth_caps.pop(key, None)
         if not self.agent_span:
             # NF (P49) switch off: the rc2.1l entry -- the presence witness only.
             prompt_tokens, held_epoch = 0, None
         ct = max(0, int(cached_tokens))
         pt = max(0, int(prompt_tokens or 0))
         held = held_epoch if (held_epoch is not None and pt > 0) else None
+        if resumable_depth is not None and int(resumable_depth) <= 0:
+            return  # #59: D can resume none of it -- a measured zero retracts
         if ct <= 0 and held is None:
             return
         self.entries[key] = (text, ct, pt, held)
+        if resumable_depth is not None:
+            self.depth_caps[key] = int(resumable_depth)
         while len(self.entries) > self.cap:
-            self.entries.popitem(last=False)
+            old_key, _ = self.entries.popitem(last=False)
+            self.depth_caps.pop(old_key, None)
 
     def record_inflight(self, text: str, prompt_tokens: int, held_epoch: int) -> None:
         """#49 rest: D has prefilled ``text`` (its leg 2 delivered its first
@@ -1131,8 +1150,11 @@ class SpanLRU:
         ct = old[1] if old else 0
         pt = max(1, int(prompt_tokens or 0), old[2] if old else 0)
         self.entries[key] = (text, ct, pt, int(held_epoch))
+        # #59: an old entry's depth cap stays (it bounds that measured ct);
+        # the finish's record_presence replaces it with D's new depth.
         while len(self.entries) > self.cap:
-            self.entries.popitem(last=False)
+            old_key, _ = self.entries.popitem(last=False)
+            self.depth_caps.pop(old_key, None)
 
     def uncached_tokens(self, text: str, est_prompt: int,
                         epoch: Optional[int] = None) -> Tuple[int, bool]:
@@ -1148,12 +1170,15 @@ class SpanLRU:
         best: Optional[int] = None
         src = "none"
         n = len(text)
-        for etext, ct, pt, held_epoch in self.entries.values():
+        for key, (etext, ct, pt, held_epoch) in self.entries.items():
             cp = common_prefix_len(etext, text)
             if cp <= 0:
                 continue
             held = epoch is not None and held_epoch is not None and held_epoch == epoch
             credit = max(ct, pt) if held else ct
+            cap = self.depth_caps.get(key)
+            if cap is not None:
+                credit = min(credit, cap)  # #59: never past D's deepest anchor
             if credit <= 0:
                 continue
             frac = cp / max(1, len(etext))
@@ -1308,6 +1333,45 @@ def d_prefill_seconds(body: Any) -> Optional[float]:
             except (TypeError, ValueError):
                 return None
             return s if s > 0 else None
+    return None
+
+
+def d_resumable_depth(body: Any) -> Optional[int]:
+    """#59: D's ``weg2_resumable_depth`` for this leg 2, or None.
+
+    The group-uniform depth D can actually RESUME this prompt from after the
+    leg (its deepest held Mamba anchor, or device + state_aligned_extent) --
+    ``meta_info`` on ``/generate``, ``sglext`` on the OpenAI wire, like
+    ``weg2_prefill_s``. None when neither carries it: the credit is then the
+    old one (``cached_tokens`` / the #49 held prompt), unchanged."""
+    if not isinstance(body, dict):
+        return None
+    for holder in (body.get("meta_info"), body.get("sglext")):
+        if isinstance(holder, dict) and holder.get("weg2_resumable_depth") is not None:
+            try:
+                return max(0, int(holder["weg2_resumable_depth"]))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def d_resumable_depth_stream_tail(tail: bytes) -> Optional[int]:
+    """#59: :func:`d_resumable_depth` of the LAST streamed chunk that carries
+    it (the finish chunk), scanning the retained tail from the end."""
+    for raw in reversed(tail.split(b"\n")):
+        line = raw.strip()
+        if not line.startswith(b"data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == b"[DONE]" or b"weg2_resumable_depth" not in data:
+            continue
+        try:
+            js = json.loads(data)
+        except Exception:  # noqa: BLE001
+            continue
+        got = d_resumable_depth(js)
+        if got is not None:
+            return got
     return None
 
 
@@ -4922,13 +4986,32 @@ class Front:
         logger.info("WEG2 X-EXACT-TOKENS rid=%s group=%s tokens_front=%d tokens_group=%d match=%d",
                     rid, group, got[1], int(prompt_tokens), int(int(prompt_tokens) == got[1]))
 
+    def _note_resumable_depth(self, rid: str, pt: int, ct: int, held: bool,
+                              depth: Optional[int]) -> None:
+        """#59: one line when D's ``weg2_resumable_depth`` caps the credit
+        this leg records (old = what the front would have credited: the
+        measured ``cached_tokens``, or the whole prompt under #49's held
+        epoch; new = the cap). Absent field: counted, no line."""
+        if depth is None:
+            self.counters["presence_depth_absent"] += 1
+            return
+        old = max(int(ct), int(pt)) if held else int(ct)
+        if int(depth) >= old:
+            self.counters["presence_depth_uncapped"] += 1
+            return
+        self.counters["presence_depth_capped"] += 1
+        logger.info("WEG2 PRESENCE-DEPTH-CAP rid=%s credit %d -> %d (D weg2_resumable_depth=%d, "
+                    "cached_tokens=%d prompt_tokens=%d held=%d; D resumes only from its deepest "
+                    "held Mamba anchor, #59)", rid, old, int(depth), int(depth), int(ct), int(pt),
+                    int(held))
+
     def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
-                        held_epoch: Optional[int]) -> None:
+                        held_epoch: Optional[int], resumable_depth: Optional[int] = None) -> None:
         """D leg 2 finished: feed the token spans with D's MEASURED reading and
         log the residual error of this request's exact price. NO BAND: the
         error is printed, never folded back into the routing bound."""
         self.tspans.record_presence(self.ftok.ids_for(text), ct, prompt_tokens=pt,
-                                    held_epoch=held_epoch)
+                                    held_epoch=held_epoch, resumable_depth=resumable_depth)
         self._x_exact_reprice_queue("presence")
         got = self._x_exact_rid.pop(rid, None)
         if got is None:
@@ -6984,14 +7067,18 @@ class Front:
                         # tokenisation fact (`carrier_est`); `ct` is what D
                         # did not have to prefill, and it is the only measured
                         # answer to "can D serve this text back".
+                        # #59: capped by D's resumable depth (finish chunk).
+                        _held = r.status == 200 and priced and not x_inband
+                        _depth = d_resumable_depth_stream_tail(bytes(tail))
+                        self._note_resumable_depth(rid, pt, ct, _held, _depth)
                         self.spans.record_presence(text, ct, prompt_tokens=pt,
-                                                   held_epoch=(self.epoch if r.status == 200 and priced
-                                                               and not x_inband else None))
+                                                   held_epoch=(self.epoch if _held else None),
+                                                   resumable_depth=_depth)
                         self._note_exact(text, pt)
                         if self.x_exact:
                             self._x_exact_record(rid, text, pt, ct, pending,
-                                                 (self.epoch if r.status == 200 and priced
-                                                  and not x_inband else None))
+                                                 (self.epoch if _held else None),
+                                                 resumable_depth=_depth)
                     dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
                                                      mark=_pfc_mark0)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
@@ -7079,14 +7166,18 @@ class Front:
                     # did not come back.
                     # #49: a 200 D served (not a re-route) leaves the whole
                     # prompt in D's radix for this epoch.
+                    # #59: capped by D's resumable depth (the body's field).
+                    _held = r.status == 200 and priced and verdict != "reroute"
+                    _depth = d_resumable_depth(js)
+                    self._note_resumable_depth(rid, pt, ct, _held, _depth)
                     self.spans.record_presence(text, ct, prompt_tokens=pt,
-                                               held_epoch=(self.epoch if r.status == 200 and priced
-                                                           and verdict != "reroute" else None))
+                                               held_epoch=(self.epoch if _held else None),
+                                               resumable_depth=_depth)
                     self._note_exact(text, pt)
                     if self.x_exact:
                         self._x_exact_record(rid, text, pt, ct, pending,
-                                             (self.epoch if r.status == 200 and priced
-                                              and verdict != "reroute" else None))
+                                             (self.epoch if _held else None),
+                                             resumable_depth=_depth)
                 if r.status == 200 and pending is not None and verdict == "reroute":
                     self.counters["reroute"] += 1
                     pending.reroutes += 1
