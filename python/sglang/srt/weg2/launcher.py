@@ -16239,6 +16239,18 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     )
     _korridor_riss = [v.rank for v in verdikte if not v.corridor_ok]
     drueber = [v.rank for v in verdikte if not v.fits]
+    # VRAM loop P0 (28.09.): with SGLANG_WEG2_TORCH_CACHE_CAP=1 in --env-d every
+    # D rank caps its caching allocator at the verdict's verfuegbar minus the
+    # corridor floor -- the booked size, not a reserve (weg2/torch_cache_cap.py).
+    if str(parse_group_env(getattr(ns, "env_d", "") or "").get(TORCH_CACHE_CAP_ENV, "0")
+           ).strip() == "1":
+        from sglang.srt.weg2 import torch_cache_cap as _tcc
+
+        _caps = _tcc.launcher_caps(verdikte, _floor)
+        ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", _tcc.MIB_ENV, _caps)
+        log(f"{D_RANK_SOLVE_MARKER} {label} P0 {_tcc.MARKER} {_tcc.MIB_ENV}={_caps} (verfuegbar "
+            f"minus Korridor-Floor {_floor:.0f} MiB je Rang; der torch-Allokator leert seinen "
+            f"Cache, bevor er die Linie ueberschreitet)")
     log(
         "%s VERDIKT %s: %s%s"
         % (

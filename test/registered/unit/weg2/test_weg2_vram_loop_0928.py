@@ -104,5 +104,65 @@ class TestFrCeilingAdopt(unittest.TestCase):
         self.assertIsNone(new)
 
 
+from sglang.srt.weg2 import torch_cache_cap as TCC
+
+
+class _FakeCuda:
+    def __init__(self):
+        self.calls = []
+
+    def mem_get_info(self, dev):
+        return (1 << 30, 32607 * (1 << 20))
+
+    def set_per_process_memory_fraction(self, frac, dev):
+        self.calls.append((frac, dev))
+
+
+class _FakeTorch:
+    def __init__(self):
+        self.cuda = _FakeCuda()
+
+
+class TestTorchCacheCap(unittest.TestCase):
+    def setUp(self):
+        self._env = {k: os.environ.get(k) for k in (TCC.ENV, TCC.MIB_ENV, "SGLANG_WEG2_GROUP")}
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_off_by_default_does_nothing(self):
+        os.environ.pop(TCC.ENV, None)
+        t = _FakeTorch()
+        self.assertIsNone(TCC.arm(0, 0, 0, torch_mod=t))
+        self.assertEqual(t.cuda.calls, [])
+
+    def test_d_rank_arms_its_own_tp_entry(self):
+        os.environ.update({TCC.ENV: "1", TCC.MIB_ENV: "28413,18237,18289", "SGLANG_WEG2_GROUP": "D"})
+        t = _FakeTorch()
+        frac = TCC.arm(0, 0, 0, torch_mod=t)
+        self.assertAlmostEqual(frac, 28413 / 32607, places=4)
+        self.assertEqual(len(t.cuda.calls), 1)
+
+    def test_p_rank_uses_its_pp_ordinal(self):
+        os.environ.update({TCC.ENV: "1", TCC.MIB_ENV: "100,200,300", "SGLANG_WEG2_GROUP": "P"})
+        self.assertEqual(TCC.rank_index(0, 2), 2)
+
+    def test_missing_entry_is_named_and_unarmed(self):
+        os.environ.update({TCC.ENV: "1", TCC.MIB_ENV: "100", "SGLANG_WEG2_GROUP": "D"})
+        t = _FakeTorch()
+        self.assertIsNone(TCC.arm(2, 0, 0, torch_mod=t))
+        self.assertEqual(t.cuda.calls, [])
+
+    def test_launcher_caps_are_verdict_minus_floor(self):
+        vs = [_types.SimpleNamespace(available_mib=29180.0),
+              _types.SimpleNamespace(available_mib=19056.0),
+              _types.SimpleNamespace(available_mib=19062.0)]
+        self.assertEqual(TCC.launcher_caps(vs, 767.0), "28413,18289,18295")
+
+
 if __name__ == "__main__":
     unittest.main()
