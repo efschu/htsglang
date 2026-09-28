@@ -90,19 +90,40 @@ def _twin_texts():
     return old, first, twin
 
 
-def test_twin_behind_a_running_turn_prices_its_own_tail_only(monkeypatch):
+def test_twin_behind_a_running_turn_without_a_known_depth_gets_no_inflight_credit(monkeypatch):
+    """#59 A (operator 28.09.): the running turn's text is credited in flight at most to the
+    anchor depth known for its prefix before the leg; the older turn here came from a D that
+    sent no ``weg2_resumable_depth`` -> no depth known -> 0 until the finish. (Before #59 A the
+    twin priced only its own ~155-token tail here: FS's uncapped in-flight credit.)"""
     _on(monkeypatch)
     old, first, twin = _twin_texts()
     spans = SpanLRU()
     spans.record_presence(old, 21000, prompt_tokens=21002, held_epoch=10)
-    # before: the running turn is unknown -> the twin prices first's tail too
     rem0, _, _ = price_remainder(twin, spans, epoch=10)
     assert rem0 > X, rem0
-    # D delivered the running turn's first content in epoch 10
     spans.record_inflight(first, int(len(first) / CHARS_PER_TOKEN) + 1, held_epoch=10)
     rem, _, known = price_remainder(twin, spans, epoch=10)
-    assert known and rem <= 585 / CHARS_PER_TOKEN + 1, rem
-    assert spans.last_src == "d_served_epoch"
+    assert known and rem == rem0, (rem, rem0)
+
+
+def test_twin_behind_a_running_turn_is_credited_up_to_the_known_depth(monkeypatch):
+    """#59 A: with D's depth for the older turn known (19000 of its 21002 tokens), the running
+    turn in flight inherits exactly that depth -- and so can never price the twin cheaper than
+    the older turn's own capped entry does: the in-flight entry charges its whole prompt minus
+    the same 19000. The twin keeps rem0 (FS adds nothing until the finish brings D's depth)."""
+    _on(monkeypatch)
+    old, first, twin = _twin_texts()
+    spans = SpanLRU()
+    spans.record_presence(old, 21000, prompt_tokens=21002, held_epoch=9, resumable_depth=19000)
+    rem0, _, _ = price_remainder(twin, spans, epoch=10)
+    pt = int(len(first) / CHARS_PER_TOKEN) + 1
+    spans.record_inflight(first, pt, held_epoch=10)
+    key = hashlib.sha1(first.encode()).hexdigest()
+    assert spans.depth_caps[key] == 19000
+    r = (len(twin) - len(first)) / CHARS_PER_TOKEN + (pt - 19000)   # the in-flight entry's price
+    r_inflight = int(r) + (0 if r == int(r) else 1)
+    rem, _, known = price_remainder(twin, spans, epoch=10)
+    assert known and r_inflight >= rem0 and rem == rem0, (rem, rem0, r_inflight)
 
 
 def test_inflight_credit_dies_with_its_epoch(monkeypatch):
@@ -233,7 +254,9 @@ def test_leg2_credits_the_text_while_d_still_decodes(monkeypatch, caplog):
     lines = [r.getMessage() for r in caplog.records if "LEG2-FIRST-CONTENT" in r.getMessage()]
     assert len(lines) == 1 and "rid=r1 epoch=7 via=d_direct" in lines[0], lines
     tail = int(585 / CHARS_PER_TOKEN) + 1
-    assert mid[2] is True and mid[0] <= tail, mid
+    # #59 A (operator 28.09.): no depth known for FIRST's prefix before the leg -> the text in
+    # flight is credited 0 until the finish: the twin mid-stream is priced whole, as without FS.
+    assert mid[2] is False and mid[0] == mid[1], mid
     assert front.counters["span_inflight_credited"] == 1
     # the finish books the measured entry for the same text
     key = hashlib.sha1(FIRST.encode()).hexdigest()

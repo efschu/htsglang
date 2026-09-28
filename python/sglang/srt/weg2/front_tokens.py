@@ -401,8 +401,25 @@ class TokenSpans:
         old = self.entries.pop(key, None)
         ct = old[1] if old else 0
         pt = max(int(ids.size), old[2] if old else 0)
+        if old is None:
+            # #59 A (operator 28.09.): a NEW text in flight is credited at most
+            # to the anchor depth already known for its prefix; none -> 0 until
+            # the finish's record_presence sets D's real depth.
+            self.depth_caps[key] = self.known_prefix_depth(ids, exclude=key)
         self.entries[key] = (ids, ct, pt, int(held_epoch))
         self._stamp(key)  # #59: an old depth cap stays until the finish replaces it
+
+    def known_prefix_depth(self, ids: np.ndarray, exclude: Optional[str] = None) -> int:
+        """#59 A: the ``depth_cap`` of the CAPPED entry with the longest token
+        LCP against ``ids``, bounded by that LCP; 0 = no depth known."""
+        best_lcp, depth = 0, 0
+        for key, (eids, _ct, _pt, _held) in self.entries.items():
+            if key == exclude or key not in self.depth_caps:
+                continue
+            lcp = token_lcp(eids, ids)
+            if lcp > best_lcp:
+                best_lcp, depth = lcp, int(self.depth_caps[key])
+        return max(0, min(depth, best_lcp))
 
     def pending(self, ids: np.ndarray, epoch: Optional[int] = None,
                 since_seq: Optional[int] = None) -> Tuple[int, int, bool, str]:

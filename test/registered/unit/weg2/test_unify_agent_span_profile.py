@@ -112,4 +112,6 @@ def test_inflight_credits_under_the_27b_profile(clean):
     front, mid, _end = asyncio.run(_mid_stream_price())
     assert front.spans.agent_span is True
     assert front.counters["span_inflight_credited"] == 1
-    assert mid[2] is True
+    # #59 A (operator 28.09.): the in-flight text is credited only up to a depth known for its
+    # prefix before the leg -- none here -> 0 until the finish; FS acted (the counter above).
+    assert mid[2] is False
