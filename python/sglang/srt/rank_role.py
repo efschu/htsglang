@@ -452,17 +452,19 @@ SEAM_LIST: Tuple[Seam, ...] = (
         "the worker's L2 (ArenaMHAHostPool with owner rows, compact device "
         "rows), the R12 host shadow, weg2/tail_adopt.py, "
         "weg2/tail_handoff.py, the #988/H105 park loadback (host-only)",
-        wired=False,
+        wired=True,
         note="#239 S3d (1) wired the votes (floor line, #59 MIN, H105 "
         "gate MIN). S4b part 1 gave the canonical page owner-row windows, "
         "part 2 the store/backend/attach half (a worker with rows gets the "
         "real file backend with its KV window, a rank with share 0 "
-        "abstains, the backup has no page mask). Still open: the worker's "
-        "L2 host tier (it keeps the byteless plain pool), the R12 shadow "
-        "verdict on worker bytes, the loadback/tail per owner and "
-        "#1424d/g on the worker trees -- so a real boot of "
-        "kv=qsa_forma_dcp with a host tier stays refused at launch "
-        "(weg2.launcher.refuse_unwired_token_cut).",
+        "abstains, the backup has no page mask), part 3 the worker's L2 "
+        "(ArenaMHAHostPool with owner rows), part 4 the R12 shadow under "
+        "the cut (workers rebind only on TP0's verdict), part 6 #1424d "
+        "(a KV-holding worker votes its last proven page) and #1424g (the "
+        "reset's orphan pass runs on its arena). Wired: a real boot of "
+        "kv=qsa_forma_dcp with a host tier passes the launch riegel "
+        "(weg2.launcher.refuse_unwired_token_cut). Open, performance only: "
+        "tail adopt per owner (the loadback path covers it).",
         anchors=(
             ("managers/cache_controller.py", 1558,
              "Weighted uneven-DCP HiCache storage requires page_size == 1"),
@@ -477,7 +479,7 @@ SEAMS: Dict[str, Seam] = _index_seams(SEAM_LIST)
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F6", "F14")
+UNWIRED_ORDER: Tuple[str, ...] = ("F6",)
 
 #: #239 S3e: the seams a real boot of the token cut (kv=qsa_forma_dcp) stands
 #: on -- F4 (a worker's KV share), F5 (the LSE merge with zero-head ranks),

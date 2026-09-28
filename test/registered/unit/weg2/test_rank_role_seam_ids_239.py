@@ -30,9 +30,9 @@ def test_a_duplicate_id_is_refused():
 def test_f13_is_the_wired_vocab_seam_and_f14_the_token_cut():
     f13, f14 = rank_role.SEAMS["F13"], rank_role.SEAMS["F14"]
     assert f13.wired and "vocab" in f13.what
-    assert not f14.wired and "token cut" in f14.what
+    assert f14.wired and "token cut" in f14.what  # #239 S4b part 7
     assert "F14" in rank_role.TOKEN_CUT_SEAMS and "F13" not in rank_role.TOKEN_CUT_SEAMS
-    assert rank_role.unwired_token_cut_seams() == ("F14",)
+    assert rank_role.unwired_token_cut_seams() == ()
 
 
 def test_the_unwired_order_names_only_unwired_seams():

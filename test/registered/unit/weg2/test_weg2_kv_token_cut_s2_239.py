@@ -184,8 +184,16 @@ def _form(kv):
     return SimpleNamespace(kv=kv)
 
 
-def test_a_real_boot_of_the_cut_is_refused_by_name():
+def test_a_real_boot_of_the_cut_is_refused_by_name_while_a_seam_is_open(monkeypatch):
+    import dataclasses
+
+    from sglang.srt import rank_role
+
     ns = SimpleNamespace(dry_run=False, d_kv_token_cut="maxmin")
+    L.refuse_unwired_token_cut(ns, _form("qsa_forma_dcp"))  # #239 S4b part 7: every seam wired
+    open_f14 = dict(rank_role.SEAMS)
+    open_f14["F14"] = dataclasses.replace(open_f14["F14"], wired=False)
+    monkeypatch.setattr(rank_role, "SEAMS", open_f14)
     with pytest.raises(L.Weg2TokenCutNotWired, match="#239 S3"):
         L.refuse_unwired_token_cut(ns, _form("qsa_forma_dcp"))
 

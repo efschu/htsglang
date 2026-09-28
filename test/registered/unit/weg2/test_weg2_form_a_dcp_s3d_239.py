@@ -257,11 +257,18 @@ class TestTokenCutRiegel(unittest.TestCase):
         would never lift."""
         from sglang.srt.weg2 import launcher as L
 
+        import dataclasses
+
         self.assertEqual(rank_role.TOKEN_CUT_SEAMS, ("F4", "F5", "F12", "F14"))
-        self.assertEqual(rank_role.unwired_token_cut_seams(), ("F14",))
-        with self.assertRaisesRegex(L.Weg2TokenCutNotWired, r"seam\(s\) F14 unwired.*#239 S3"):
-            L.refuse_unwired_token_cut(self._ns(), types.SimpleNamespace(kv="qsa_forma_dcp"))
-        L.refuse_unwired_token_cut(self._ns(dry=True), types.SimpleNamespace(kv="qsa_forma_dcp"))
+        # #239 S4b part 7: F14 is wired -- the pin keeps the riegel's naming
+        # alive on a register where it were not
+        open_f14 = dict(rank_role.SEAMS)
+        open_f14["F14"] = dataclasses.replace(open_f14["F14"], wired=False)
+        with mock.patch.object(rank_role, "SEAMS", open_f14):
+            self.assertEqual(rank_role.unwired_token_cut_seams(), ("F14",))
+            with self.assertRaisesRegex(L.Weg2TokenCutNotWired, r"seam\(s\) F14 unwired.*#239 S3"):
+                L.refuse_unwired_token_cut(self._ns(), types.SimpleNamespace(kv="qsa_forma_dcp"))
+            L.refuse_unwired_token_cut(self._ns(dry=True), types.SimpleNamespace(kv="qsa_forma_dcp"))
 
     def test_the_riegel_lifts_when_every_seam_is_built(self):
         import dataclasses
@@ -276,7 +283,7 @@ class TestTokenCutRiegel(unittest.TestCase):
         f5_open = dict(rank_role.SEAMS)
         f5_open["F5"] = dataclasses.replace(f5_open["F5"], wired=False)
         with mock.patch.object(rank_role, "SEAMS", f5_open):
-            with self.assertRaisesRegex(L.Weg2TokenCutNotWired, "F5, F14"):
+            with self.assertRaisesRegex(L.Weg2TokenCutNotWired, r"seam\(s\) F5 unwired"):
                 L.refuse_unwired_token_cut(self._ns(), types.SimpleNamespace(kv="qsa_forma_dcp"))
 
     def test_a_boot_without_a_host_tier_needs_no_f13(self):
@@ -290,13 +297,15 @@ class TestTokenCutRiegel(unittest.TestCase):
 
         ns = types.SimpleNamespace(dry_run=False, d_kv_token_cut="joint", weg2_disable_hicache=True)
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        open_f14 = dict(rank_role.SEAMS)
+        open_f14["F14"] = dataclasses.replace(open_f14["F14"], wired=False)
+        with mock.patch.object(rank_role, "SEAMS", open_f14), contextlib.redirect_stdout(out):
             L.refuse_unwired_token_cut(ns, types.SimpleNamespace(kv="qsa_forma_dcp"))
         self.assertIn("#239 KV-TOKEN-SCHNITT F14-FREI (kein Host-Tier)", out.getvalue())
         f5_open = dict(rank_role.SEAMS)
         f5_open["F5"] = dataclasses.replace(f5_open["F5"], wired=False)
         with mock.patch.object(rank_role, "SEAMS", f5_open):
-            with self.assertRaisesRegex(L.Weg2TokenCutNotWired, "F5, F14"):
+            with self.assertRaisesRegex(L.Weg2TokenCutNotWired, r"seam\(s\) F5 unwired"):
                 L.refuse_unwired_token_cut(ns, types.SimpleNamespace(kv="qsa_forma_dcp"))
 
     def test_the_f13_anchors_hit(self):
@@ -307,7 +316,7 @@ class TestTokenCutRiegel(unittest.TestCase):
             lines = open(os.path.join(root, rel)).read().splitlines()
             window = "\n".join(lines[max(0, line - 6): line + 5])
             self.assertIn(needle, window, f"{rel}:{line}")
-        self.assertIn("F14", rank_role.UNWIRED_ORDER)
+        self.assertNotIn("F14", rank_role.UNWIRED_ORDER)  # S4b part 7: wired
 
 
 if __name__ == "__main__":
