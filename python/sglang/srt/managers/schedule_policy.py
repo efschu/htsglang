@@ -929,8 +929,10 @@ class PrefillAdder:
         self.prefill_spill_region_tokens = int(prefill_spill_region_tokens)
         self.prefill_spill_deep_taken = False
         # H24 (E2): a request admitted with P's END state runs NO forward --
-        # its batch is closed behind it, like the born-spilled-deep one (a
+        # its batch is closed behind it to every request that needs one (a
         # neighbour needing a real extend would share the skipped forward).
+        # H24c: another END-state request still joins (add_one_req asks
+        # tail_adopt.skip_joinable), so a wake's skips share one pass.
         self.weg2_skip_extend_taken = False
         # RANK-UNIFORM admission under uneven DCP (kv-session-offload): a
         # non-negative correction (local_avail - min_reduce(local_avail))
@@ -1304,7 +1306,9 @@ class PrefillAdder:
         # PS2 batch separation: once a born-spilled-deep prompt is in the list
         # the extend batch is CLOSED -- its out_cache_loc is a row of host
         # sentinels and must not be concatenated with real device slots.
-        if self.prefill_spill_deep_taken or self.weg2_skip_extend_taken:
+        # H24c: an H24 skip batch stays open to further skips; add_one_req
+        # refuses everything else behind it (the pass visits the next request).
+        if self.prefill_spill_deep_taken:
             return AddReqResult.OTHER
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
@@ -2304,8 +2308,13 @@ class PrefillAdder:
         self, req: Req, truncation_align_size: Optional[int]
     ):
         # PS2 batch separation (see budget_state): a born-spilled-deep prompt
-        # owns its extend batch exclusively; so does an H24 skip-extend one.
-        if self.prefill_spill_deep_taken or self.weg2_skip_extend_taken:
+        # owns its extend batch exclusively; an H24 skip-extend batch admits
+        # only further skips (H24c, rank-uniform: the group's agreed vote and
+        # the request's own parameters), refused here before any match or
+        # load-back side effect -- the exact prefix check follows at the commit.
+        if self.prefill_spill_deep_taken:
+            return AddReqResult.OTHER
+        if self.weg2_skip_extend_taken and not tail_adopt.skip_joinable(req):
             return AddReqResult.OTHER
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
@@ -2327,6 +2336,8 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+            if self.weg2_skip_extend_taken:
+                return AddReqResult.OTHER  # H24c: that path never takes the END state
             return self.add_one_req_ignore_eos(req)
 
         # #791 CORE: EXECUTE, DO NOT DERIVE.
@@ -2834,6 +2845,16 @@ class PrefillAdder:
                 # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
+            if self.weg2_skip_extend_taken and (
+                self.dllm_config is not None
+                or (self.rem_chunk_tokens is not None and input_tokens > self.rem_chunk_tokens)
+                or not tail_adopt.skip_joinable(req, len(req.prefix_indices))
+            ):
+                # H24c: behind a skip only a request that takes the END state
+                # at THIS prefix (the matched page anchor) -- anything else
+                # would run its extend in a batch whose forward is skipped
+                return AddReqResult.OTHER
+
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
@@ -2858,8 +2879,12 @@ class PrefillAdder:
                 # N - floor_page(c)). None = today's extend.
                 # H24 (E2): with the group's level-2 vote and an EMPTY batch
                 # the extend is [N-1, N) as a shape only -- no forward runs
-                # (EAGLEWorkerV2 -> tail_adopt.run_skip).
-                _tail = tail_adopt.plan_adopt(req, _ea_start, batch_empty=not self.can_run_list)
+                # (EAGLEWorkerV2 -> tail_adopt.run_skip). H24c: a batch holding
+                # only skips counts as empty for the next skip.
+                _tail = tail_adopt.plan_adopt(
+                    req, _ea_start,
+                    batch_empty=not self.can_run_list or self.weg2_skip_extend_taken,
+                )
                 # W123 belt (D vision guard): the guard admitted an image on
                 # the tail it READ; the target's first computed position is
                 # fixed here. An image reaching it would be prefilled by a
