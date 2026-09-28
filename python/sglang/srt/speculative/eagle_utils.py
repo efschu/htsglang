@@ -929,6 +929,20 @@ def unpack_accept_payload(packed, predict, accept_index, num_correct_drafts):
     num_correct_drafts.reshape(-1).copy_(packed[n_p + n_a :])
 
 
+def _form_b_accept_broadcast(packed, bs: int) -> bool:
+    """F6 step 4: under Form B the accept broadcast of eagle_sample (send and
+    weightless-receive path alike, #616c) runs over dcp from the lead, in the
+    fixed form padded to k_max -- its size never depends on this round's k (NF
+    objection 3). Returns False (nothing sent) on every other boot, and the
+    caller issues its classic capture_safe_tp_broadcast."""
+    from sglang.srt.speculative import form_b_spec as fbs
+
+    if not fbs.form_b_spec_active():
+        return False
+    fbs.broadcast_padded_inplace(packed, fbs.accept_numel(bs))
+    return True
+
+
 def spec_accept_broadcast_src() -> int:
     """Group rank that owns the authoritative accept decision.
 
@@ -1035,11 +1049,12 @@ def eagle_sample(
             # default configuration, and fatal the moment it is on. Same
             # fusion, same order, one collective.
             _packed = pack_accept_payload(predict, accept_index, num_correct_drafts)
-            capture_safe_tp_broadcast(
-                tp_group,
-                (_packed,),
-                src=spec_accept_broadcast_src(),
-            )
+            if not _form_b_accept_broadcast(_packed, bs):
+                capture_safe_tp_broadcast(
+                    tp_group,
+                    (_packed,),
+                    src=spec_accept_broadcast_src(),
+                )
             unpack_accept_payload(
                 _packed, predict, accept_index, num_correct_drafts
             )
@@ -1273,11 +1288,12 @@ def eagle_sample(
         # capture-safe and adds no D2H.
         _packed = pack_accept_payload(predict, accept_index, num_correct_drafts)
 
-        capture_safe_tp_broadcast(
-            tp_group,
-            (_packed,),
-            src=spec_accept_broadcast_src(),
-        )
+        if not _form_b_accept_broadcast(_packed, bs):
+            capture_safe_tp_broadcast(
+                tp_group,
+                (_packed,),
+                src=spec_accept_broadcast_src(),
+            )
 
         # Unpack in place, so every downstream alias of these three tensors
         # (the guard snapshots, the mamba commit, the logprob path) keeps

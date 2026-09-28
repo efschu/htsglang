@@ -18,8 +18,8 @@ the weight ranks W={0,1}; rank 2 alone in its own group).
 Cases: decode, target-verify, extend chunk 1 (no prefix) and chunk 2 (WITH
 prefix -- the M1s root c5b6efa309 class), idle, the DFLASH lane round, the
 Form B dense layer schedule with spec_k-steered draft steps k = 1..3.
-``spec_k`` and the padded broadcasts are protocol-level here (their product
-call sites land with F6 step 4); the dcp primitives are the real ones.
+``spec_k`` and the padded broadcasts are the product functions of
+speculative/form_b_spec.py (F6 step 4); the dcp primitives are the real ones.
 """
 
 import os
@@ -161,16 +161,23 @@ def _dflash_lane_round(rank, tp, bs=2, block=4):
 
 
 def _form_b_spec_round(rank, dcp, model_tp, k_by_round, k_max=3, bs=2):
-    """spec_k (lead -> all over dcp) BEFORE the draft; k draft vocab gathers over
-    model_tp on W; padded draft_block and accept over dcp (fixed shape)."""
+    """F6 step 4, the PRODUCT spec channel (speculative/form_b_spec.py):
+    spec_k (lead -> all over dcp) BEFORE the draft; k draft vocab gathers over
+    model_tp on W; the padded draft block and the packed accept over dcp in the
+    k_max form (the real broadcast_padded / broadcast_padded_inplace)."""
+    from sglang.srt.speculative import form_b_spec as fbs
+
+    lead = rank == 0
     for k_lead in k_by_round:
-        k = torch.tensor([k_lead if rank == 0 else -1])
-        dcp.broadcast(k, src=0)                                  # spec_k
-        for _ in range(int(k.item())):
+        k = fbs.spec_k(k_lead if lead else None, group=dcp, lead=0, k_max=k_max)
+        for _ in range(k):
             if rank in W:
                 model_tp.all_gather(torch.randn(bs, 2), dim=-1)  # vocab-parallel top-1
-        dcp.broadcast(torch.zeros(bs, k_max + 1, dtype=torch.int64), src=0)   # padded block
-        dcp.broadcast(torch.zeros(2, bs, dtype=torch.int64), src=0)           # accept
+        blk = torch.zeros(bs, k, dtype=torch.int64) if lead else None
+        fbs.broadcast_padded(blk, (bs, k), fbs.draft_block_numel(bs, k_max),
+                             dtype=torch.int64, device="cpu", group=dcp, lead=0)
+        packed = torch.zeros(bs * (2 * (k + 1) + 1), dtype=torch.int32)
+        fbs.broadcast_padded_inplace(packed, fbs.accept_numel(bs, k_max), group=dcp, lead=0)
 
 
 def _run(rank, port, out_dir, case):
@@ -240,6 +247,10 @@ def test_every_communicator_runs_one_sequence(case):
         # rank 2 (KV-only) never enters model_tp; W do, identically
         assert not [e for e in traces[2][1] if e[0] == "model_tp"]
         assert [e for e in traces[0][1] if e[0] == "model_tp"]
+        # step 4: every dcp broadcast of the spec rounds has a k-independent
+        # shape (spec_k [1], block [bs*k_max], accept [bs*(2k_max+3)])
+        bshapes = {e[2] for e in traces[0][1] if e[0] == "dcp" and e[1].startswith("broadcast")}
+        assert bshapes == {(1,), (6,), (18,)}, bshapes
 
 
 def test_the_checker_catches_a_divergence():

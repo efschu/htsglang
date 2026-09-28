@@ -181,6 +181,18 @@ class _DflashDraftSampler:
         self.out[: tokens.shape[0]].copy_(tokens)
 
 
+def _model_tp_group():
+    """F6 2b: the group the draft's vocab shards live on -- Form B's model_tp
+    (weight ranks W) when a partition is installed, else THIS module's
+    ``get_tp_group()``. Resolved through the module-level name on purpose, so
+    the classic path is the exact call it was (and a test that patches
+    ``dflash_worker_v2.get_tp_group`` still reaches it)."""
+    from sglang.srt.distributed.parallel_state import get_model_tp_group_no_assert
+
+    mt = get_model_tp_group_no_assert()
+    return mt if mt is not None else get_tp_group()
+
+
 class _LaneNoTpSync:
     """G-A1: the weightless lane's stand-in for SpecTpSync -- the head is the one
     decider (see DFlashWorkerV2._lane_accept_broadcast), nothing to sync."""
@@ -555,6 +567,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self._spec_solo_active
             else 0
         )
+        # F6 step 4: under Form B the spec broadcasts come from the LEAD (min
+        # of the weight ranks); a solo draft anywhere else would publish a
+        # block nobody drafted. Named refusal; a no-op off Form B.
+        from sglang.srt.speculative import form_b_spec as _fbs
+
+        if (_fbs.form_b_spec_active() and self._spec_solo_active
+                and int(self._spec_solo_rank) != _fbs.form_b_lead()):
+            raise _fbs.FormBSpecError(
+                f"{_fbs.FormBSpecError.code}: Form B drafts solo on the lead (rank "
+                f"{_fbs.form_b_lead()}), but --speculative-draft-placement solo "
+                f"put the DFLASH draft on rank {self._spec_solo_rank}."
+            )
         # 19.09. (Punkt 5, D-Kapazitaet): SGLANG_DFLASH_SOLO_COMPACT=1 lets the
         # solo host keep the compact draft cache (the shadows run no draft,
         # write no draft KV and skip the round prep, so they never touch the
@@ -929,6 +953,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             ).contiguous()
         else:
             buf = torch.empty((2, bs), dtype=torch.int64, device=self.device)
+        from sglang.srt.speculative import form_b_spec as fbs
+
+        if fbs.form_b_spec_active():
+            # F6 step 4: over dcp from the lead. [2, bs] is already the fixed
+            # form (no k in it); the lead is the one rank with the lm_head row
+            # that decided.
+            fbs.broadcast_padded_inplace(buf, 2 * bs)
+            return buf[0], buf[1]
         tp_group = get_tp_group()
         if tp_group.world_size > 1:
             capture_safe_tp_broadcast(tp_group, (buf,), src=spec_accept_broadcast_src())
@@ -1022,6 +1054,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         """One broadcast per round: the host's [bs, block_size] draft block to
         the shadow ranks. Eager (never inside a captured region); capture-safe
         primitive so co-located rigs work too."""
+        from sglang.srt.speculative import form_b_spec as fbs
+
+        if fbs.form_b_spec_active():
+            # F6 step 4: over dcp from the lead; [bs, block_size] -- the DFLASH
+            # block is boot-fixed, so it IS the k_max-padded form.
+            fbs.broadcast_padded_inplace(draft_tokens, int(draft_tokens.numel()))
+            return
         tp_group = get_tp_group()
         if tp_group.world_size == 1:
             return
@@ -2126,9 +2165,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         shard = lm_head.shard_indices
         # F6 2b: the vocab shards live on the MODEL tp group (Form B: W only)
-        from sglang.srt.distributed.parallel_state import get_model_tp_group
-
-        tp_group = get_model_tp_group()
+        tp_group = _model_tp_group()
         # G-A1: a head BUILT at TP=1 (the weightless lane's head) owns the whole
         # vocab; there is nobody to gather with, whatever the group's size.
         tp_size = 1 if int(getattr(lm_head, "tp_size", 0) or 0) == 1 else int(tp_group.world_size)
@@ -3889,9 +3926,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if _vlp is not None and logits_output.next_token_logits is not None:
             if self._verify_vocab_argmax_eligible(batch, sampling_info, lm_head, _vlp):
                 _shard = lm_head.shard_indices
-                from sglang.srt.distributed.parallel_state import get_model_tp_group
-
-                _tp = get_model_tp_group()
+                _tp = _model_tp_group()
                 vocab_target_predict = vocab_parallel_argmax(
                     logits_output.next_token_logits,
                     int(_shard.num_org_elements),
