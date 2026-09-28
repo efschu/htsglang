@@ -58,6 +58,24 @@ def _psz(pool) -> int:
     return int(getattr(pool, "_arena_page_tokens", 1) or 1)
 
 
+def owner_page_tokens(owner_rows) -> torch.Tensor:
+    """#239 S4b (F13): the token offsets inside one page this rank owns under
+    the token cut, from ``(page_size, S, lo, hi)`` (empty for share 0)."""
+    from sglang.srt.mem_cache.canonical_page_store import owner_token_runs
+
+    page_size, cp_split, lo, hi = (int(x) for x in owner_rows)
+    toks = [t for a, b in owner_token_runs(page_size, cp_split, lo, hi) for t in range(a, b)]
+    return torch.tensor(toks, dtype=torch.int64)
+
+
+def _owner_tok_of(pool) -> Optional[torch.Tensor]:
+    """#239 S4b (F13): the pool's owned token offsets, None outside the token
+    cut. A module function for ``_psz``'s reason: the hermetic fixtures build
+    pools without ``_arena_init_fields`` and borrow the methods onto bare
+    namespaces -- neither ever holds owner rows."""
+    return getattr(pool, "_owner_tok", None)
+
+
 def _arena_mask(pool, hi: torch.Tensor) -> torch.Tensor:
     S = int(pool.staging_rows)
     return (hi >= S) & (hi < S + _atok(pool))
@@ -944,6 +962,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._v_offs: list = []
         self._pending: dict = {}
         self._pending_mask = None   # xsn355: bool[A], mirrors _pending's keys (vectorised membership)
+        # #239 S4b (F13): under the token cut the token offsets of a page this
+        # rank owns (None: every other form -- the whole-page paths below)
+        self._owner_tok: Optional[torch.Tensor] = None
         self.arena_k_ptrs = None
         self.arena_v_ptrs = None
 
@@ -959,14 +980,27 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             arena = storage_backend._arena_for(int(window.total_bytes))
             if arena is None:
                 return False
-            self.bind(arena, window, role=role)
+            from sglang.srt.mem_cache.canonical_page_store import (
+                CanonicalAbstainWindow,
+                CanonicalExtentWindow,
+            )
+
+            owner_rows = None
+            if role == "kv" and (
+                isinstance(window, CanonicalAbstainWindow)
+                or (isinstance(window, CanonicalExtentWindow) and window.identity)
+            ):
+                # #239 S4b (F13): the token cut -- this rank's rows of every
+                # page (identity window) or none of them (share 0)
+                owner_rows = storage_backend._kv_owner_rows
+            self.bind(arena, window, role=role, owner_rows=owner_rows)
             self._backend = storage_backend
             return True
         except Exception as exc:  # noqa: BLE001 - loud, never silent
             logger.error("#1424 arena host pool bind failed (role=%s): %r", role, exc)
             return False
 
-    def bind(self, arena, window, role: str = "kv", pin: bool = True) -> None:
+    def bind(self, arena, window, role: str = "kv", pin: bool = True, owner_rows=None) -> None:
         # x59 (23.09., Task #107): ONE arena slot per PAGE of ``page_size``
         # tokens. Next Flash pages by 64 (QSA groups, GDN anchors); the
         # token-paged 27B form is the special case P == 1 and stays
@@ -982,7 +1016,29 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 "#1424 the draft role of the arena host pool is token-paged only; a paged "
                 "draft page rides the KV page as a per-key sidecar (kv_cache_builder)"
             )
-        ext = [(int(o), int(l)) for o, l in window.extents]
+        own = None
+        owner_tok = None
+        if owner_rows is not None:
+            # #239 S4b (F13): a token-cut rank holds every attention layer with
+            # the full kv heads -- the slot geometry is the WHOLE page -- but
+            # writes (and completes) only its own token rows of it; a rank of
+            # share 0 takes part in claim/complete with no extents at all.
+            if int(owner_rows[0]) != P:
+                raise ValueError(
+                    f"#239 F13 owner rows {tuple(owner_rows)} are for {owner_rows[0]}-token "
+                    f"pages; this pool pages by {P}")
+            from sglang.srt.mem_cache.canonical_page_store import CanonicalAbstainWindow
+
+            half = int(window.total_bytes) // 2
+            ext = [(0, half), (half, half)]
+            own = (
+                []
+                if isinstance(window, CanonicalAbstainWindow)
+                else [(int(o), int(l)) for o, l in window.extents]
+            )
+            owner_tok = owner_page_tokens(owner_rows)
+        else:
+            ext = [(int(o), int(l)) for o, l in window.extents]
         if len(ext) == 1 and ext[0][0] == 0 and ext[0][1] == int(window.total_bytes):
             # the whole page (D's DCP ranks hold every layer and head): the
             # canonical page is K-major, [K all slots][V all slots]
@@ -1066,7 +1122,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._pin = bool(pin and torch.cuda.is_available())
         self._pin_base = int(buf.data_ptr()) + data_off
         self._pin_bytes = page_bytes
-        self._own_extents = list(ext)
+        self._own_extents = list(ext) if own is None else own
+        self._owner_tok = owner_tok
         self._k_offs, self._v_offs = list(k_offs), list(v_offs)
         self._page_bytes = page_bytes
         self._data_base = self._pin_base
@@ -1199,7 +1256,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._load_arena(device_pool, host_indices[sel] - S, device_indices[sel], layer_id)
         super().load_to_device_per_layer(device_pool, host_indices[rest], device_indices[rest], layer_id, io_backend)
 
-    def _arena_load_guard(self, device_pool, slots, device_indices, layer_id, *, nrows: int, nmiss: int) -> None:
+    def _arena_load_guard(self, device_pool, slots, device_indices, layer_id, *, nrows: int, nmiss: int,
+                          need_pinned: bool = True) -> None:
         """weg2xsn277 (18.09.): the first 98k-token arena->device load of a
         boot died with 'CUDA error: an illegal memory access' reported
         asynchronously at `_transfer` (the 4k smoke loaded fine). The kernel
@@ -1240,7 +1298,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             raise RuntimeError(
                 f"#1424 WEG2-ARENA-LOAD REFUSED: device rows [{d_min},{d_max}] outside the "
                 f"pool of {dst_rows} rows (layer {layer_id}, {nrows} rows)")
-        if pinned == "PARTIAL":
+        if need_pinned and pinned == "PARTIAL":
             raise RuntimeError(
                 f"#1424 WEG2-ARENA-LOAD REFUSED: {int(slots.numel())} slot(s) of layer "
                 f"{layer_id} are not all registered (pinned bitmap PARTIAL) -- a device "
@@ -1265,6 +1323,20 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
 
     def _load_arena(self, device_pool, rows, device_indices, layer_id) -> None:
         P = _psz(self)
+        if _owner_tok_of(self) is not None:
+            # #239 S4b (F13): this rank's token rows of each page, never the
+            # whole-page path (it would write P rows per page into the compact
+            # device pool); the controller already masked host AND device ids
+            # by the owner rule (_dcp_kv_transfer_pairs).
+            slots = rows // P
+            self.pin_slots(torch.unique(slots))
+            # the gather reads the arena through torch (host index + H2D), not
+            # through a kernel on mapped host memory: registration is not a
+            # precondition here, the ranges are
+            self._arena_load_guard(device_pool, slots, device_indices, layer_id,
+                                   nrows=int(rows.numel()), nmiss=0, need_pinned=False)
+            self._transfer_paged(device_pool, rows, device_indices, layer_id)
+            return
         if _arena_page_load_on() and getattr(self, "_page_view", None) is not None:
             key = getattr(self, "_page_key_hint", None) or (
                 id(rows), id(device_indices), int(rows.numel()), int(device_indices.numel()))
@@ -1959,6 +2031,39 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             self.arena.ref_slots([slots[i] for i in complete_idx], -1)
         return len(slots)
 
+    def _backup_owner_rows(self, device_pool, slots: torch.Tensor, toks: torch.Tensor,
+                           device_indices: torch.Tensor) -> None:
+        """#239 S4b (F13): this rank's token rows go from its COMPACT device
+        rows into their (slot, token) places of the canonical page, every
+        layer, K and V. A token outside the owner range is refused by name:
+        it would overwrite another owner's bytes in the shared slot."""
+        n = int(slots.numel())
+        if n == 0:
+            return
+        toks = toks.to("cpu", dtype=torch.int64)
+        slots_cpu = slots.to("cpu", dtype=torch.int64)
+        if not bool(torch.isin(toks, self._owner_tok).all()):
+            bad = toks[~torch.isin(toks, self._owner_tok)][:4].tolist()
+            raise RuntimeError(
+                f"#239 F13 ARENA-OWNER-WRITE REFUSED: token offset(s) {bad} are not this "
+                f"rank's rows ({int(self._owner_tok.numel())} owned per page) -- the "
+                "write would land in another owner's bytes of the shared page")
+        self.pin_slots(torch.unique(slots_cpu))
+        L = len(self._k_offs)
+        H, D = int(self.head_num), int(self.head_dim)
+        dev = device_pool.k_buffer[0].device
+        didx = device_indices.to(device=dev, dtype=torch.int64)
+        for l in range(L):
+            k = device_pool.k_buffer[l].index_select(0, didx).to("cpu").view(n, H, D)
+            v = device_pool.v_buffer[l].index_select(0, didx).to("cpu").view(n, H, D)
+            self.arena_k_refs[l][slots_cpu, toks] = k
+            self.arena_v_refs[l][slots_cpu, toks] = v
+        global _ARENA_WRITE_N
+        _ARENA_WRITE_N += 1
+        if _ARENA_WRITE_N <= 8 or _ARENA_WRITE_N % 256 == 0:
+            logger.info("#239 F13 WEG2-ARENA-WRITE n=%d rows=%d pages=%d mode=owner-rows layers=%d",
+                        _ARENA_WRITE_N, n, int(torch.unique(slots_cpu).numel()), L)
+
     def _backup_arena(self, device_pool, slots: torch.Tensor, device_indices: torch.Tensor) -> None:
         """This rank's K and V extents of every page go straight from the
         card into the slot (one all-layer kernel, the arena as the host
@@ -2086,12 +2191,21 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if not bool(is_arena.any()):
             return super().backup_from_device_all_layer(device_pool, host_indices, device_indices, io_backend)
         sel = is_arena.nonzero(as_tuple=True)[0]
+        owner_toks = None
         if self.row_slot is None and self._pending_mask is not None:
             # xsn355 (py-spy PP0): the per-row Python pairs/todo lists were ~30 ms
             # per 4096-page node; KV role membership comes from the mask.
             P = _psz(self)
             rows_t = (hi[sel] - S).to(torch.int64)
-            if P == 1:
+            if _owner_tok_of(self) is not None:
+                # #239 S4b (F13): only this rank's token rows of each page
+                # arrive (the owner rule masked them); token granular
+                page_slots = rows_t // P
+                keep = self._pending_mask[page_slots]
+                slots = page_slots[keep]
+                owner_toks = (rows_t % P)[keep]
+                sel = sel[keep]
+            elif P == 1:
                 keep = self._pending_mask[rows_t]
                 slots = rows_t[keep]
                 sel = sel[keep]
@@ -2120,7 +2234,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     0, sel.pin_memory().to(device_indices.device, non_blocking=True))
             else:
                 didx = device_indices[sel]
-            self._backup_arena(device_pool, slots, didx)
+            if owner_toks is not None:
+                self._backup_owner_rows(device_pool, slots, owner_toks, didx)
+            else:
+                self._backup_arena(device_pool, slots, didx)
         rest = (~is_arena).nonzero(as_tuple=True)[0]
         if rest.numel():
             super().backup_from_device_all_layer(
