@@ -1276,6 +1276,54 @@ def _head_vote_len(req) -> int:
     return vote
 
 
+#: FA (28.09.): switch of the prefetch span's anchor start, default on; 0 = the
+#: span starts at ``len(prefix_indices) + host_hit_length`` as before.
+PREFETCH_FROM_ANCHOR_ENV = "SGLANG_WEG2_PREFETCH_FROM_ANCHOR"
+_PREFETCH_FROM_ANCHOR_N = [0]
+
+
+def _weg2_prefetch_span_start(sched, req, matched_len: int) -> int:
+    """FA (28.09., NF rc12z22 D 14:56:01/26, weg2-4-11 / weg2-8-15 / weg2-10-16 /
+    weg2-11-18): where the store read of ``req`` must START.
+
+    ``len(prefix_indices) + host_hit_length`` misses a device node without a
+    recurrent state below the host chain (``_head_vote_len``'s rc12z7b case):
+    the mamba validator cuts the device match to 0, the host walk sums only the
+    host part, so weg2-10-16 read ``matched=50944 (device 0 + host 50944)``
+    while its host chain -- ``last_host_node`` IS ``best_match_node``, whose
+    depth is ``state_anchor_depth`` -- ended at 69184 (18240 device + 50944
+    host, KV and Mamba state complete). The span then started at 50944 with the
+    hash chain of 69184: keys that exist nowhere (``#1472 READ-TRACE asked=286
+    readable=0 why=no-file``, the same first stem again 25 s later for
+    weg2-4-11), a store-short read and 5 s of X-DEFER while nothing was
+    missing. The read starts at the chain's end, as its last hash says.
+
+    Group D (no PP) only: the #1400 told arithmetic on group P counts from its
+    own registration and stays as it was. Rank-local like the term it
+    replaces; the registration still goes through the group vote (#580/HP1)."""
+    if (os.environ.get(PREFETCH_FROM_ANCHOR_ENV, "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return matched_len
+    ps = getattr(sched, "ps", None)
+    if ps is not None and int(getattr(ps, "pp_size", 1) or 1) > 1:
+        return matched_len
+    if getattr(getattr(sched, "tree_cache", None), "cache_controller", None) is None:
+        return matched_len  # last_host_node is the DEVICE node then, not the anchor
+    anchor = getattr(req, "state_anchor_depth", None)
+    if anchor is None or int(anchor) <= int(matched_len):
+        return matched_len
+    _PREFETCH_FROM_ANCHOR_N[0] += 1
+    k = _PREFETCH_FROM_ANCHOR_N[0]
+    if k <= 16 or k % 256 == 0:
+        logger.info(
+            "FA PREFETCH-FROM-ANCHOR rid=%s matched=%d (device %d + host %d) anchor=%d (n=%d): "
+            "the store read starts at the host chain's end, where its last hash is",
+            str(getattr(req, "rid", "?"))[:16], int(matched_len),
+            _len_or_zero(getattr(req, "prefix_indices", None)),
+            int(getattr(req, "host_hit_length", 0) or 0), int(anchor), k,
+        )
+    return int(anchor)
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -6887,6 +6935,9 @@ class Scheduler(
         # have asked about an empty span and answered about nothing.
         _last_hash = last_host_node.get_last_hash_value()
         _matched_len = len(req.prefix_indices) + req.host_hit_length
+        # FA: from the host chain's END (its last hash), not from the sum that
+        # misses a state-less device node below it
+        _matched_len = _weg2_prefetch_span_start(self, req, _matched_len)
         # #1039 WHY THIS SPAN ENDS ONE PAGE SHORT OF A NODE'S OWN ANCHOR, AND WHY
         # THAT IS ACCEPTED RATHER THAN FIXED HERE.
         # `_compute_max_prefix_len` is input_len - 1 (schedule_batch.py:1715, an
