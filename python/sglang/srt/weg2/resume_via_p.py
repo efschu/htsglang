@@ -138,7 +138,12 @@ def open_stream_enabled(env=None) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
-def eligible(req, env=None, sched=None) -> bool:
+#: the needs-p reason of a VISION hold (D cannot cover an image of a request
+#: that has already streamed): the front's P leg sends the ORIGINAL body.
+REASON_VISION = "vision_not_in_prefix"
+
+
+def eligible(req, env=None, sched=None, vision: bool = False) -> bool:
     """A refusal D may turn into RESUME-VIA-P: switch on, group D, a streamed
     request, under the attempt bound. With ROS off only a request that has
     generated tokens (the old rule); with ROS on every streamed request -- the
@@ -151,11 +156,13 @@ def eligible(req, env=None, sched=None) -> bool:
         return False
     if not bool(getattr(req, "stream", False)):
         return False
-    if getattr(req, "multimodal_inputs", None) is not None:
+    if getattr(req, "multimodal_inputs", None) is not None and not vision:
         # VISION-D x ROS: the P-only leg 1 carries input_ids alone -- P would
         # prefill an image's placeholder ids as text and D would continue on a
         # wrong prefix. An image request keeps the named W50 (X-REQUEUE sends
-        # the original request, image included, before the first byte).
+        # the original request, image included, before the first byte). The
+        # VISION hold (``vision=True``) is different: its P leg is the ORIGINAL
+        # body (image included), see ``REASON_VISION`` and the front.
         return False
     if not open_stream_enabled(e):
         try:
@@ -230,7 +237,7 @@ def take_requests(directory: str) -> List[dict]:
     return out
 
 
-def keep_on_d(sched, req, d_extent: int, x: int) -> bool:
+def keep_on_d(sched, req, d_extent: int, x: int, reason: str = "x_refusal_midstream") -> bool:
     """D, inside the W31 answer: keep ``req`` parked for P instead of the abort.
     Every rank runs it (the same queue mutation); only TP rank 0 writes the
     file. Returns whether the file was written (rank > 0: True); the caller
@@ -254,17 +261,17 @@ def keep_on_d(sched, req, d_extent: int, x: int) -> bool:
     # the Scheduler keeps its rank on ``ps`` (``self.tp_rank`` does not exist
     # there -- scheduler.py's own notes at the #10516/#18042 sites)
     rank0 = int(getattr(getattr(sched, "ps", None), "tp_rank", 0) or 0) == 0
-    ok = bool(write_request(str(req.rid), context_ids(req), d_extent, x, "x_refusal_midstream",
+    ok = bool(write_request(str(req.rid), context_ids(req), d_extent, x, reason,
                             attempt=n)) if rank0 else True
     d_seats.mark_parked(req, d_seats.SITE_FLIP, epoch=None, now=time.monotonic())
     parked = d_park_runtime.parked_list(sched)
     if not any(p is req for p in parked):
         parked.append(req)
     logger.warning(
-        "WEG2 W50-REROUTE rid=%s d_extent=%d X=%d reason=x_refusal_midstream path=midstream n=%d "
+        "WEG2 W50-REROUTE rid=%s d_extent=%d X=%d reason=%s path=midstream n=%d "
         "attempt=%d/%d hold=%s written=%s -- D keeps the stream open and parks the request; P "
         "prefills its %d-token context, D resumes after the flip back (no abort, no bytes to the "
         "client)",
-        str(req.rid)[:24], int(d_extent), int(x), n, n, max_attempts(),
+        str(req.rid)[:24], int(d_extent), int(x), reason, n, n, max_attempts(),
         "same" if same else "new", ok if rank0 else "rank>0", len(context_ids(req)))
     return ok

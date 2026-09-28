@@ -3942,6 +3942,10 @@ class Front:
             # P-only leg queued or in flight (a second needs-p is the same hold).
             self._rvp_ended: Dict[str, float] = {}
             self._rvp_inflight: Set[str] = set()
+            # VISION hold: the ORIGINAL (path, payload) of every leg-2 stream in
+            # flight, for a P leg that must carry the image (bounded, dropped at
+            # the stream's end).
+            self._rvp_bodies: Dict[str, Tuple[str, dict]] = {}
 
     def _note_front_price(self, rid: str, uncached: int) -> None:
         """The front's route-time price of a rid, for the W50-REROUTE line."""
@@ -3980,12 +3984,34 @@ class Front:
                             "queued or running (one path per rid)", rid)
                 continue
             _path = "held-uncommitted" if rid in self._leg2_lookahead else "midstream"
-            payload = {"rid": rid, "input_ids": ids,
-                       "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}}
-            p = Pending(rid=rid, path="/generate", payload=payload, text=f"\x00rvp:{rid}",
-                        t_arrive=now, fut=asyncio.get_event_loop().create_future(),
-                        est_prompt=len(ids), est_uncached=int(r.get("d_extent") or len(ids)),
-                        span_known=True, p_only=True, resume_via_p=True)
+            if r.get("reason") == _rvp.REASON_VISION:
+                # VISION after the first byte: P must see the IMAGE -- its leg is
+                # the ORIGINAL request (leg1 sends max_tokens=1). P renders the same
+                # prompt ids (same template/tokenizer, image pad values from the
+                # image hash), so D's read of its prompt finds P's pages; the
+                # streamed output tail is text and D prefills it itself.
+                body = self._rvp_bodies.get(rid)
+                if body is None:
+                    self.counters["rvp_vision_no_body"] += 1
+                    logger.error("RESUME-VIA-P vision rid=%s: no original body on this front (not a "
+                                 "stream it serves) -- aborting D's hold by name", rid)
+                    self._rvp_abort_task = asyncio.ensure_future(self._rvp_abort_d(rid))
+                    continue
+                v_path, v_payload = body
+                v_payload = dict(v_payload)
+                v_payload["rid"] = rid
+                p = Pending(rid=rid, path=v_path, payload=v_payload, text=f"\x00rvp:{rid}",
+                            t_arrive=now, fut=asyncio.get_event_loop().create_future(),
+                            est_prompt=len(ids), est_uncached=int(r.get("d_extent") or len(ids)),
+                            span_known=True, p_only=True, resume_via_p=True)
+                self.counters["rvp_vision"] += 1
+            else:
+                payload = {"rid": rid, "input_ids": ids,
+                           "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}}
+                p = Pending(rid=rid, path="/generate", payload=payload, text=f"\x00rvp:{rid}",
+                            t_arrive=now, fut=asyncio.get_event_loop().create_future(),
+                            est_prompt=len(ids), est_uncached=int(r.get("d_extent") or len(ids)),
+                            span_known=True, p_only=True, resume_via_p=True)
             self.queue.append(p)
             self._rvp_inflight.add(rid)
             self.counters["rvp_rerouted"] += 1
@@ -4073,6 +4099,7 @@ class Front:
         self._rvp_p_done.pop(rid, None)
         self._rvp_requeue.pop(rid, None)
         self._leg2_lookahead.discard(rid)
+        getattr(self, "_rvp_bodies", {}).pop(rid, None)
         self._rvp_ended[rid] = time.time()
         while len(self._rvp_ended) > 4096:
             self._rvp_ended.pop(next(iter(self._rvp_ended)))
@@ -6988,6 +7015,12 @@ class Front:
         try:
             if getattr(self, "_rvp_dir", None) is not None:
                 self._rvp_stream_begin(rid)  # ROS-1P
+                if stream:
+                    # VISION hold: the original body, for a P leg with the image
+                    bodies = self._rvp_bodies
+                    bodies[rid] = (request.path, payload)
+                    while len(bodies) > 256:
+                        bodies.pop(next(iter(bodies)))
             async with self.session.post(f"{g.url}{request.path}", json=payload) as r:
                 # FIX 2 (round 1): LAW 4's RE-ROUTE IS DECIDED BEFORE THE
                 # RESPONSE IS COMMITTED, ON BOTH WIRE SHAPES.  The check used
