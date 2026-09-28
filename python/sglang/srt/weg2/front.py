@@ -94,6 +94,7 @@ from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
+from sglang.srt.weg2 import idle_clock as _idle_clock_mod  # #55 F2: idle clock lock
 from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
 from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
 from sglang.srt.weg2 import phase_policy  # H91 part C
@@ -3553,6 +3554,8 @@ class Front:
         self.idle_layout = "P" if str(idle_layout).upper().startswith("P") else "D"
         # MF-1: the IDLE-REST line's edge trigger (see _idle_disposition).
         self._idle_rest_shown = False
+        # #55 F2: graphics-clock lock after idle_s at rest in this layout; None = off (the default).
+        self._idle_clock = _idle_clock_mod.from_env()
         # 27B idle policy (user order 24.09., three settings beside --idle-layout):
         # (b) --d-short-drain-tokens N: a queued backlog made ONLY of SHORT
         #     requests (each <= X, law 4) totalling <= N is handed to D instead of
@@ -8498,6 +8501,10 @@ class Front:
 
     @_flip_single_flight
     async def flip(self, src: str, dst: str) -> None:
+        # #55 F2: unlock the clocks BEFORE anything of the flip runs -- both groups' legs use the cards.
+        _ic = getattr(self, "_idle_clock", None)
+        if _ic is not None:
+            _ic.note_busy("flip")
         S, D = self.groups[src], self.groups[dst]
         self.state = "flipping"
         t_flip0 = time.time()
@@ -9472,12 +9479,20 @@ class Front:
         claimed a rest the front was in the act of leaving.  A flip announces
         itself with ``WEG2-FLIP begin``; ``IDLE-REST`` now means what it says.
         """
+        ic = getattr(self, "_idle_clock", None)  # tests build Front without __init__
         if not at_rest:
             self._idle_rest_shown = False
+            if ic is not None:
+                ic.note_busy("controller-busy")
             return "busy"
         if awake != self.idle_layout:
             self._idle_rest_shown = False
+            if ic is not None:
+                ic.note_busy("controller-flip")
             return "flip"
+        if ic is not None:
+            # #55 F2: rest in the configured layout; the lock waits idle_s and for nothing in flight.
+            ic.note_rest(queued=len(self.queue) + len(self._ready_for_d), serving=self.state == "serving")
         if not self._idle_rest_shown:
             self._idle_rest_shown = True
             logger.info("WEG2 IDLE-REST layout=%s configured=%s reason=%s queue=0 ready_for_d=%d "
@@ -10725,7 +10740,8 @@ def main():
                 args.admin_key_file or "(none)",
                 admin_key_mod.redact(front.admin_key),
                 "REACHABLE" if front.admin_key else "unreachable (groups started without --admin-api-key)")
-    app = web.Application(client_max_size=1024**3)
+    app = web.Application(client_max_size=1024**3,
+                          middlewares=_idle_clock_mod.middlewares(front._idle_clock))  # #55 F2
     app.on_startup.append(front.startup)
     app.on_cleanup.append(front.cleanup)
     app.router.add_get("/health", front.handle_health)
