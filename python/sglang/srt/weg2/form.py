@@ -448,9 +448,11 @@ class ModelProfile:
     #: world_pool 559232 -> 557472).
     driver_carve_min_total_mib: int = 0
     #: Fix B (weg2/p_row_authority.py): SGLANG_WEG2_P_ROW_AUTHORITY, the #631
-    #: row form on group P. OFF on every row (operator 27.09.: the default turns
-    #: only after a clean metal proof under agent load); a proof boot switches
-    #: it on per docker profile (profiles/27b-row-authority.env, ``_form``).
+    #: row form on group P (only the main switch; the PP0 terms WITHHOLD/
+    #: FLOOR_CLAMP/CORRIDOR keep their own switches, default off). qwen27b ON
+    #: since the registry flip (operator 28.09., after the proof profile
+    #: profiles/27b-row-authority.env armed it per ``_form``); nextflash OFF
+    #: until the NF seat switches it on itself. An explicit value wins either way.
     p_row_authority: bool = False
 
     def switch_defaults(self) -> Dict[str, object]:
@@ -621,6 +623,12 @@ PROFILES: Dict[str, ModelProfile] = {
         # 3080s are 20480), see driver_carve_min_total_mib.
         budget_charges_driver_carve=True,
         driver_carve_min_total_mib=32000,
+        # Fix B registry flip (operator 28.09.): the 27B default arms the #631
+        # row form on group P -- what profiles/27b-row-authority.env set per
+        # ``_form`` for the metal proof (three markers: 'P-ROW-AUTHORITY armed',
+        # '#631 ROW-DELIVER', 'P-ROW-COST'). Terms stay off; group D (pp=1)
+        # is untouched; SGLANG_WEG2_P_ROW_AUTHORITY=0 turns it off.
+        p_row_authority=True,
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,
@@ -722,6 +730,9 @@ PROFILES: Dict[str, ModelProfile] = {
         front_exact_tokens=True,
         # rc12b OOM: the D budget books the driver carve (NF seat, 27.09.).
         budget_charges_driver_carve=True,
+        # Fix B stays OFF on NF (operator 28.09.: unchanged unless the NF seat
+        # switches it on -- its own row or SGLANG_WEG2_P_ROW_AUTHORITY=1).
+        p_row_authority=False,
     ),
 }
 

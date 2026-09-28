@@ -38,14 +38,61 @@ class Switches(unittest.TestCase):
             self.assertFalse(any(PR.term_on(t) for t in PR.TERM_ENVS))
             self.assertFalse(PR.applies(_sched()))
 
-    def test_registry_rows_off_and_profile_default_followed(self):
+    def test_profile_default_followed_and_explicit_env_wins(self):
         from sglang.srt.weg2 import form as F
 
-        for pid, row in F.PROFILES.items():
-            self.assertIs(row.switch_defaults()[PR.ENV], False, pid)
         with mock.patch.object(F, "profile_switch_default", lambda name, fb, env=None: name == PR.ENV):
             self.assertTrue(PR.enabled({}))
             self.assertFalse(PR.enabled({PR.ENV: "0"}), "an explicit env wins")
+
+
+def _form_env(profile):
+    """The published weg2 form of a 27B / NF boot (as test_27b_park_immediate builds it)."""
+    from sglang.srt.weg2 import form as F
+
+    arch, experts, draft, kv = (("dense", "none", "dflash", "paged_dcp") if profile == F.PROFILE_QWEN27B
+                                else ("moe", "offload", "mtp", "qsa_forma"))
+    return F.Weg2Form(arch=arch, experts=experts, draft=draft, p_draft="none", kv=kv,
+                      flip="family", vision="off", profile=profile, model="m").env_value()
+
+
+class RegistryDefaultPerModel(unittest.TestCase):
+    """Fix-B registry flip (operator 28.09.): the 27B row arms Fix B by DEFAULT (no profile/
+    CONTAINER_ENV switch needed); the NF row stays off unless NF sets the switch itself. Only the
+    main switch -- the PP0 terms stay off, exactly the metal proof form (27b-row-authority.env)."""
+
+    def test_the_rows(self):
+        from sglang.srt.weg2 import form as F
+
+        self.assertIs(F.PROFILES[F.PROFILE_QWEN27B].p_row_authority, True)
+        self.assertIs(F.PROFILES[F.PROFILE_NEXTFLASH].p_row_authority, False)
+        self.assertIs(F.PROFILE_SWITCH_DEFAULTS[F.PROFILE_QWEN27B][PR.ENV], True)
+        self.assertIs(F.PROFILE_SWITCH_DEFAULTS[F.PROFILE_NEXTFLASH][PR.ENV], False)
+        self.assertEqual(set(F.PROFILES), {F.PROFILE_QWEN27B, F.PROFILE_NEXTFLASH},
+                         "a new registry row must state its Fix-B default here")
+
+    def test_enabled_follows_the_published_form_per_model(self):
+        from sglang.srt.weg2 import form as F
+
+        e27 = {F.FORM_ENV: _form_env(F.PROFILE_QWEN27B)}
+        enf = {F.FORM_ENV: _form_env(F.PROFILE_NEXTFLASH)}
+        self.assertTrue(PR.enabled(e27), "27B: on without any switch")
+        self.assertFalse(PR.enabled(enf), "NF: unchanged, off")
+        self.assertFalse(PR.enabled({}), "no form (desk/upstream): the code default, off")
+        self.assertFalse(PR.enabled({**e27, PR.ENV: "0"}), "27B: an explicit 0 still turns it off")
+        self.assertTrue(PR.enabled({**enf, PR.ENV: "1"}), "NF: switches it on itself")
+
+    def test_27b_default_arms_only_the_main_switch(self):
+        from sglang.srt.weg2 import form as F
+
+        e27 = {F.FORM_ENV: _form_env(F.PROFILE_QWEN27B)}
+        for t in PR.TERM_ENVS:
+            self.assertFalse(PR.term_on(t, e27), t)
+        with mock.patch.dict(os.environ, e27, clear=False):
+            for k in [PR.ENV, *PR.TERM_ENVS.values()]:
+                os.environ.pop(k, None)
+            self.assertTrue(PR.applies(_sched(pp_size=3)), "group P (pp>1) re-arms the row form")
+            self.assertFalse(PR.applies(_sched(pp_rank=0, pp_size=1)), "group D (pp=1) is untouched")
 
     def test_stall_bound_finite(self):
         with _env(**{PR.STALL_ENV: ""}):

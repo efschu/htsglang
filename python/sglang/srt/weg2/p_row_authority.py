@@ -7,9 +7,10 @@ its own pool (``#631 ROW AUTHORITY DISABLED``), the class W27, #1004, TF and SF 
 a time. The PP0 terms keyed on the carrier (#1066/#1175 withhold, #1039 floor clamp, #794
 corridor) were disabled on purpose by 5c97a2286b (#973 ring commit timeout).
 
-WHAT THIS RE-ARMS (switch ``SGLANG_WEG2_P_ROW_AUTHORITY``, DEFAULT OFF -- operator order
-27.09.: activated per profile / --env-p in the proof boot only; off = every image byte for byte
-as today):
+WHAT THIS RE-ARMS (switch ``SGLANG_WEG2_P_ROW_AUTHORITY``; default = the model registry row
+(weg2/form.py ModelProfile.p_row_authority): qwen27b ON since the 28.09. registry flip, before it
+per profile / --env-p in the proof boot only (operator 27.09.); nextflash OFF; no form OFF;
+off = every image byte for byte as before):
   * the message counters (``phase_flip_counters.PhaseFlipCounters``, /dev/shm, swept at boot):
     the follower's non-blocking frame probe ``_pp_proxy_frame_pending`` -> receive-before-plan,
     PP0's admission row executed (#791 scheduled extents); no frame = PP0 planned nothing (#969J);
@@ -64,7 +65,8 @@ def _on(name: str, default: bool, env=None) -> bool:
 
 def enabled(env=None) -> bool:
     """Explicit env wins; unset -> the published form's profile default
-    (ModelProfile.p_row_authority, False on every registry row)."""
+    (ModelProfile.p_row_authority: qwen27b True since the 28.09. registry flip,
+    nextflash False); no form -> off."""
     e = os.environ if env is None else env
     if (e.get(ENV, "") or "").strip():
         return _on(ENV, False, e)
