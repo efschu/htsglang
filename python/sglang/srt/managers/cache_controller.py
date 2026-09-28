@@ -610,9 +610,23 @@ def claim_vote_min_only(controller) -> bool:
     as a disagreement."""
     if claim_vote_abstains(controller):
         return False
-    from sglang.srt.rank_role import form_a_worker_holds_kv
+    from sglang.srt.rank_role import kv_only_rank
 
-    return bool(form_a_worker_holds_kv())
+    return bool(kv_only_rank())
+
+
+def rank_holds_gdn_state(controller) -> bool:
+    """The RankState record's ``has_mamba_pool`` (W7 GDN-blob applicability):
+    this rank's device pool carries a mamba pool AND the rank holds GDN
+    state. Rank form (28.09.): a KV-only rank (:func:`kv_only_rank`) never
+    does -- the weight rank owns it, and the lane's one-slot placeholder
+    pool is not a blob the gate may demand."""
+    pool = getattr(getattr(controller, "mem_pool_device_hybrid", None), "mamba_pool", None)
+    if pool is None:
+        return False
+    from sglang.srt.rank_role import kv_only_rank
+
+    return not kv_only_rank()
 
 
 def split_host_state_pools(controller, transfers) -> tuple:
@@ -1992,19 +2006,18 @@ class HiCacheController:
         canonical_kv_page = None
         canonical_mamba_blob = None
         canonical_qsa_page = None
-        from sglang.srt.rank_role import (
-            form_a_worker_holds_kv,
-            this_rank_is_form_a_worker,
-        )
+        from sglang.srt.rank_role import kv_only_rank, this_rank_is_form_a_worker
 
         canonical_on = server_args is not None and bool(
             getattr(server_args, "hicache_canonical_kv_page", False)
         )
-        if this_rank_is_form_a_worker() and form_a_worker_holds_kv() and canonical_on:
+        if kv_only_rank() and canonical_on:
             # #239 S4b (F14): a worker that owns token rows under the cut holds
             # every full-attention layer with the full kv heads -- a whole-page
             # window, cut to its rows below. No mamba blob, no QSA page, no
-            # draft: those stay the attention host's.
+            # draft: those stay the attention host's. Rank form (28.09.): the
+            # same for a weightless-lane KV rank (kv_only_rank), whose
+            # placeholder mamba pool is no GDN state to publish.
             from sglang.srt.mem_cache.canonical_page_store import (
                 build_page_window,
                 resolve_attn_layer_ids,
@@ -2102,10 +2115,7 @@ class HiCacheController:
             canonical_on=canonical_on,
             canonical_kv_built=canonical_kv_page is not None,
             canonical_blob_built=canonical_mamba_blob is not None,
-            has_mamba_pool=getattr(
-                getattr(self, "mem_pool_device_hybrid", None), "mamba_pool", None
-            )
-            is not None,
+            has_mamba_pool=rank_holds_gdn_state(self),
             owner_ctx=owner_ctx,
         )
 
