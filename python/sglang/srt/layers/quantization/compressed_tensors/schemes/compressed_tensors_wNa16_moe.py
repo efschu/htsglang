@@ -357,6 +357,16 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 if not self.sym:
                     expected["w13_weight_zero_point"] = 2 * owned
                     expected["w2_weight_zero_point"] = owned
+                # NF-Bootzeit H2b: group D does not read the experts P already
+                # put into the shared store -- they never arrive here, so the
+                # counter must not wait for them (else the layer's host stack
+                # is never dropped: rc12z15 memcg-OOM). Symmetric, no act-order
+                # only: then every expert-major tensor is presplit and a vetoed
+                # expert leaves nothing behind that the kernel reads.
+                if self.sym and self.actorder is None:
+                    from sglang.srt.layers.moe import store_adopt as _sa
+
+                    expected = _sa.discount_expected(layer, expected, owned)
                 layer._ct_stream_presplit = {
                     "expected": expected,
                     "names": {id(getattr(layer, n)): n for n in expected},

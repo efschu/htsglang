@@ -132,6 +132,13 @@ def vetoed_global_ids(layer) -> FrozenSet[int]:
 
 
 def _compute(layer) -> FrozenSet[int]:
+    # H2b: only a layer whose quant scheme ARMED the adoption (it discounts the
+    # vetoed shards from its per-layer early-presplit counter, see
+    # ``discount_expected``) may veto. Without that the counter waits for
+    # shards that never come, the layer's host stack is never dropped, and the
+    # whole expert window piles up as anon (rc12z15 10:14:06Z memcg-OOM).
+    if not getattr(layer, ADOPT_OK_ATTR, False):
+        return frozenset()
     from sglang.srt.layers.moe import expert_map as _em
     from sglang.srt.layers.moe import expert_store as _es
     from sglang.srt.layers.moe.cold_tier_fetch import layer_key_for
@@ -169,6 +176,40 @@ def _compute(layer) -> FrozenSet[int]:
         if all(int(slot) in w for w in written):
             out.add(g)
     return frozenset(out)
+
+
+ADOPT_OK_ATTR = "_moe_store_adopt_ok"
+
+
+def discount_expected(layer, expected: Dict[str, int], owned: int) -> Dict[str, int]:
+    """H2b: the per-layer early-presplit counter (``FusedMoE._ct_stream_note``)
+    of a layer that adopts from the store. Every expected count is a multiple
+    of ``owned`` (shards per expert x owned experts); the vetoed experts never
+    arrive, so they come off: ``k * (owned - vetoed)``. Marks the layer as
+    adoption-armed FIRST, then takes the veto set -- the same cached set the
+    loader asks later, so counter and veto cannot disagree. Returns
+    ``expected`` unchanged when nothing is vetoed."""
+    owned = int(owned)
+    try:
+        setattr(layer, ADOPT_OK_ATTR, True)
+    except AttributeError:
+        return dict(expected)
+    v = len(vetoed_global_ids(layer))
+    if v <= 0:
+        return dict(expected)
+    if v > owned:
+        raise StoreAdoptBroken(
+            f"{MARKER}: layer {getattr(layer, 'layer_id', '?')} vetoes {v} of {owned} owned experts")
+    out = {}
+    for name, want in expected.items():
+        if owned <= 0 or int(want) % owned:
+            raise StoreAdoptBroken(
+                f"{MARKER}: presplit counter {name}={want} is not a multiple of owned={owned}")
+        out[name] = int(want) // owned * (owned - v)
+    logger.info("%s layer=%s: early-presplit counter discounted by %d vetoed experts "
+                "(%d of %d owned arrive)", MARKER, getattr(layer, "layer_id", "?"), v,
+                owned - v, owned)
+    return out
 
 
 def veto_expert(layer, global_id: int) -> bool:
