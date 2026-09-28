@@ -123,6 +123,37 @@ def told_admission(
     return credit
 
 
+def told_pending(scheduler, req) -> bool:
+    """#791T: would :func:`told_admission` SKIP ``req`` on this rank right now
+    because PP0's told has not arrived here yet? -- the same condition, read
+    without side effects (no skip census, no verdict consumed).
+
+    True only on a told-ARMED FOLLOWER (PP0 decides its own verdict) for a
+    queued request with no told in ``_weg2_store_told`` and no kept verdict of
+    an earlier visit (H91 STORE-TOLD KEPT) for this very request object. The
+    #631 row probe reads it: a forwarded frame that admits such a rid has
+    overtaken its ``Weg2StoreTold`` on the request chain (rc12z20 13:03:27,
+    PP2 weg2-0-8: r24 request located, r25 told still in flight), so the
+    frame waits for the hop instead of being planned into a #791 skip.
+    Any failure answers False (= today's behaviour: no defer)."""
+    try:
+        from sglang.srt.managers import weg2_store_told as _st
+
+        if not _st.armed(scheduler) or _st.is_pp0(scheduler):
+            return False
+        rid = str(getattr(req, "rid", ""))
+        if not rid:
+            return False
+        if rid in (getattr(scheduler, "_weg2_store_told", None) or {}):
+            return False
+        entry = (getattr(scheduler, KEPT_ATTR, None) or {}).get(rid)
+        if entry is not None and entry.req is req:
+            return False
+        return True
+    except Exception:  # noqa: BLE001 - advisory: never turn a probe into a crash
+        return False
+
+
 def settle_told(scheduler, waiting_queue: Iterable[Any]) -> int:
     """After a committed pass: drop the kept verdicts of requests that are no
     longer queued (admitted into the batch, or aborted). Returns the count."""
