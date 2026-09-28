@@ -101,6 +101,10 @@ class ArenaMambaPoolHost(MambaPoolHost):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._arena_init_fields()
+        # +254 MiB fix (a): the device state stage is dropped at a sleep
+        from sglang.srt.weg2 import sleep_staging as _ss
+
+        _ss.register_mamba_pool(self)
 
     def _arena_init_fields(self) -> None:
         self.staging_rows = int(self.size)
