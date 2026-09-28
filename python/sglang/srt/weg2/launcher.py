@@ -4508,6 +4508,25 @@ def refuse_flip_under_token_cut(ns, boot_form) -> Optional[str]:
 D_OWNER_MARKER = "D-EIGENTUM (#239 S3f)"
 
 
+def d_seat_table_form(plan, kv_cut_kw: dict, fractions):
+    """#239 S3f: what the H95 seat table solves at every seat count. Under an
+    owned cut (``owned`` / ``owned:<v>``) the planner has SOLVED ownership,
+    cut and FR_D once; the seat table recomputes exactly that form (the cut
+    as a fixed vector, FR_D as solved) and never re-solves the ownership --
+    a second owned solve starts from the already published vector as its x1
+    base and refuses every row (dry run 28.09. 17:50Z, 'keine tragbare Form
+    ... Eigentum ab 215,113,160'). Any other cut: unchanged."""
+    from sglang.srt.planner import expert_residency as _er
+
+    if (not kv_cut_kw or not _er.owned_cut_request(kv_cut_kw.get("kv_token_shares"))[0]
+            or not getattr(plan, "solved_owner_ratio", None)):
+        return dict(kv_cut_kw), [float(x) for x in fractions]
+    out = dict(kv_cut_kw)
+    out["kv_token_shares"] = tuple(float(x) for x in plan.kv_token_cut)
+    fr = plan.solved_fractions or fractions
+    return out, [float(x) for x in fr]
+
+
 def publish_d_owner_ratio(ns, plan, label: str, log) -> List[float]:
     """#239 S3f: the ownership vector the planner solved under
     ``--d-kv-token-cut owned`` goes to ``--extra-d --rank-moe-ratio`` (the one
@@ -16294,11 +16313,13 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         _env_d = parse_group_env(ns.env_d)
     # H95: the seats are dynamic 1..--d-bs per D phase -- the same solve per
     # seat count n (seat_rebook re-books the seat posts), one line each.
+    # #239 S3f: under an owned cut the table recomputes the solved form.
+    _seat_cut_kw, _seat_fr = d_seat_table_form(plan, _kv_cut_kw, fr_d)
     for _ln in d_seat_table_lines(ns, _er, dict(
             model_path=ns.model,
             budgets_mib=[float(b) for b in budgets_d],
             ratios=[float(x) for x in ratios],
-            fractions=[float(x) for x in fr_d],
+            fractions=_seat_fr,
             scratch_rows=[int(x) for x in scratch],
             rank_tp_ratio=",".join(tp_ratio),
             env_d=_env_d,
@@ -16315,7 +16336,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             activation_record_mib=_act_rec,
             activation_record_source=_act_src,
             derive_waves=_derive_waves,
-            **_kv_cut_kw,
+            **_seat_cut_kw,
     ), label):
         log(_ln)
     if plan.refusal is not None:
