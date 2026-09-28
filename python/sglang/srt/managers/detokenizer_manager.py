@@ -148,6 +148,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         if server_args.enable_metrics:
             start_cpu_monitor_thread("detokenizer")
 
+        # DEGEN-SUSPECT (managers/degen_detect.py): exact-repetition watch on
+        # each request's decode tail, here because this process already holds
+        # every new output id and is off the scheduler's decode round.
+        from sglang.srt.managers.degen_detect import DegenDetector
+
+        self.degen = DegenDetector.from_env(getattr(self, "tokenizer", None))
+
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -403,6 +410,24 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             for item in data_list
         ]
 
+    def _observe_degen(self, recv_obj: BatchTokenIDOutput) -> None:
+        degen = getattr(self, "degen", None)
+        if degen is None or not degen.enabled or not recv_obj.decode_ids:
+            return
+        try:
+            for i, rid in enumerate(recv_obj.rids):
+                if is_health_check_request(rid):
+                    continue
+                degen.observe_chunk(
+                    rid,
+                    recv_obj.decode_ids[i],
+                    recv_obj.read_offsets[i] if recv_obj.read_offsets else 0,
+                    finished=recv_obj.finished_reasons[i] is not None,
+                )
+        except Exception as e:  # noqa: BLE001 -- an instrument never kills the detokenizer
+            logger.warning("DEGEN-SUSPECT instrument raised %s: %s (disabled)", type(e).__name__, e)
+            degen.enabled = False
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
         output_strs = (
@@ -410,6 +435,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
+        self._observe_degen(recv_obj)
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
