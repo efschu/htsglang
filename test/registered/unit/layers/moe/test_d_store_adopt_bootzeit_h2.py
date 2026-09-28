@@ -59,7 +59,7 @@ def _layer(rank=1):
     return types.SimpleNamespace(
         layer_id=LAYER, num_local_experts=7, num_experts=12,
         _expert_shard_generic=True, _gguf_expert_range=(lo, lo + 6),
-        moe_tp_rank=rank,
+        moe_tp_rank=rank, _moe_store_adopt_ok=True,
         w13_weight_packed=torch.zeros(7, 2), w2_weight_packed=torch.zeros(7, 3))
 
 
@@ -109,6 +109,58 @@ class TestVetoSet(_Env):
             json.dump({"rank": 0, "rows": []}, fh)
         lay = _layer()
         self.assertEqual(sa.vetoed_global_ids(lay), first)
+
+
+class TestEarlyPresplitCounter(_Env):
+    """H2b (rc12z15 10:14:06Z memcg-OOM, D anon +0,6 GiB/s per rank): the
+    per-layer early presplit waits for every OWNED expert's shards. With H2 the
+    vetoed ones never arrive -> the layer never presplits, its host stack is
+    never dropped, the whole expert window piles up as anon. The counter must
+    discount the vetoed experts, and a layer whose scheme did not arm the
+    adoption must veto nothing."""
+
+    def test_unarmed_layer_vetoes_nothing(self):
+        self.assertIsNotNone(sa, "store_adopt missing (base)")
+        lay = _layer()
+        del lay._moe_store_adopt_ok
+        self.assertEqual(sa.vetoed_global_ids(lay), frozenset())
+
+    def test_layer_presplits_once_every_non_vetoed_shard_landed(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        lay = _layer()
+        del lay._moe_store_adopt_ok  # the scheme arms it, as in create_weights
+        owned = 6
+        expected = {"w13_weight_packed": 2 * owned, "w2_weight_packed": owned}
+        if hasattr(sa, "discount_expected"):
+            expected = sa.discount_expected(lay, expected, owned)
+        fired = []
+        lay._ct_stream_presplit = {
+            "expected": expected,
+            "names": {id(lay.w13_weight_packed): "w13_weight_packed",
+                      id(lay.w2_weight_packed): "w2_weight_packed"},
+            "seen": {}, "lock": __import__("threading").Lock(), "done": False,
+            "device": None}
+        lay._ct_stream_presplit_now = lambda state: fired.append(state)
+        # the loader delivers the shards of the experts it did NOT veto
+        vetoed = sa.vetoed_global_ids(lay)
+        self.assertEqual(vetoed, frozenset({8, 10, 11}))
+        for g in range(6, 12):
+            if g in vetoed:
+                continue
+            for _ in range(2):
+                FusedMoE._ct_stream_note(lay, lay.w13_weight_packed)
+            FusedMoE._ct_stream_note(lay, lay.w2_weight_packed)
+        self.assertEqual(len(fired), 1, "the layer never presplit: its host stack stays")
+
+    def test_wna16_arm_discounts(self):
+        import inspect
+
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            compressed_tensors_wNa16_moe as m,
+        )
+
+        self.assertIn("discount_expected", inspect.getsource(m))
 
 
 class TestPresplitFilter(_Env):
