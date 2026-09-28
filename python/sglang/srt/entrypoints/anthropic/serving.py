@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicMessageEndDelta,
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
+    AnthropicSglExt,
     AnthropicStreamEvent,
     AnthropicUsage,
     ContentBlockDeltaEvent,
@@ -222,6 +223,13 @@ def _anthropic_usage_from_openai(
             0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
         )
     return AnthropicUsage(**usage_fields)
+
+
+def _resumable_depth(openai_obj) -> Optional[int]:
+    """#59: ``sglext.weg2_resumable_depth`` of an OpenAI response or stream
+    chunk, or None (0 is a measured value and is kept)."""
+    ext = getattr(openai_obj, "sglext", None)
+    return getattr(ext, "weg2_resumable_depth", None) if ext is not None else None
 
 
 def _resolve_stop_sequence(
@@ -1194,6 +1202,9 @@ class AnthropicServing:
         matched_stop: Any = None
         accumulated_text: list[str] = []
         final_usage: Optional[AnthropicUsage] = None
+        # #59: the OpenAI stream's sglext chunk carries it; message_delta
+        # forwards it as a top-level sglext (the Weg-2 front's reader).
+        final_sglext: Optional[AnthropicSglExt] = None
         message_started = False
         had_content_delta = False
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -1662,6 +1673,7 @@ class AnthropicServing:
                             stop_sequence=matched_sequence,
                         ),
                         usage=final_usage or AnthropicUsage(output_tokens=0),
+                        sglext=final_sglext,
                     )
                 )
 
@@ -1698,6 +1710,9 @@ class AnthropicServing:
                 for frame in _flush_on_error("api_error", "Stream processing error"):
                     yield frame
                 return
+
+            if _resumable_depth(chunk) is not None:
+                final_sglext = AnthropicSglExt(weg2_resumable_depth=_resumable_depth(chunk))
 
             if chunk.usage is not None:
                 # ``include_input=True`` because message_start now ships
@@ -1981,6 +1996,11 @@ class AnthropicServing:
                 response.usage,
                 include_input=True,
                 include_output=True,
+            ),
+            sglext=(
+                AnthropicSglExt(weg2_resumable_depth=_resumable_depth(response))
+                if _resumable_depth(response) is not None
+                else None
             ),
         )
 

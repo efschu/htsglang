@@ -49,6 +49,16 @@ class AnthropicUsage(BaseModel):
     cache_read_input_tokens: Optional[NonNegativeInt] = None
 
 
+class AnthropicSglExt(BaseModel):
+    """SGLang extension beside an Anthropic message (the ``sglext`` of the
+    OpenAI wire): only set fields are serialized (exclude_none).
+
+    #59: ``weg2_resumable_depth`` -- the depth a Weg-2 D group can resume this
+    sequence from; the Weg-2 front caps its presence credit there."""
+
+    weg2_resumable_depth: Optional[NonNegativeInt] = None
+
+
 # ---------- Content blocks (discriminated by ``type``) ----------
 
 
@@ -547,6 +557,7 @@ class MessageDeltaEvent(BaseModel):
     type: Literal["message_delta"] = "message_delta"
     delta: AnthropicMessageEndDelta
     usage: AnthropicUsage
+    sglext: Optional[AnthropicSglExt] = None
 
 
 class MessageStopEvent(BaseModel):
@@ -607,6 +618,7 @@ class AnthropicMessagesResponse(BaseModel):
     ] = None
     stop_sequence: Optional[str] = None
     usage: Optional[AnthropicUsage] = None
+    sglext: Optional[AnthropicSglExt] = None
 
 
 # Resolve forward references for nested types.

@@ -65,6 +65,7 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
 )
+from sglang.srt.managers import weg2_resumable_depth
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -1137,6 +1138,7 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
+        resumable_depths = {}
         image_tokens = {}
         audio_tokens = {}
         video_tokens = {}
@@ -1166,6 +1168,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
+                # #59: only the finishing output carries it.
+                if content["meta_info"].get("weg2_resumable_depth") is not None:
+                    resumable_depths[index] = content["meta_info"]
                 image_tokens[index] = content["meta_info"].get("image_tokens", 0)
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
                 video_tokens[index] = content["meta_info"].get("video_tokens", 0)
@@ -1296,7 +1301,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 if first_details is not None:
                     sglext_details = cached_tokens_details_from_dict(first_details)
 
-            if sglext_routed is not None or sglext_details is not None:
+            # #59: the Weg-2 front reads the last data line that names it.
+            sglext_resumable = weg2_resumable_depth.from_meta_infos(
+                list(resumable_depths.values())
+            )
+
+            if (
+                sglext_routed is not None
+                or sglext_details is not None
+                or sglext_resumable is not None
+            ):
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -1305,6 +1319,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     sglext=SglExt(
                         routed_experts=sglext_routed,
                         cached_tokens_details=sglext_details,
+                        weg2_resumable_depth=sglext_resumable,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -1392,12 +1407,22 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         # H84: only a Weg-2 D group puts weg2_prefill_s into meta_info.
         weg2_prefill_s = first_ret["meta_info"].get("weg2_prefill_s")
+        # #59: MIN over the choices that carry it (0 is sent -- `is not None`).
+        resumable_depth = weg2_resumable_depth.from_meta_infos(
+            [r["meta_info"] for r in ret]
+        )
         response_sglext = None
-        if routed_experts or cached_tokens_details or weg2_prefill_s:
+        if (
+            routed_experts
+            or cached_tokens_details
+            or weg2_prefill_s
+            or resumable_depth is not None
+        ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
                 weg2_prefill_s=weg2_prefill_s,
+                weg2_resumable_depth=resumable_depth,
             )
 
         for idx, ret_item in enumerate(ret):
