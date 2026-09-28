@@ -57,6 +57,7 @@ class _Cache:
 
     lru_snapshot = eo.MoEExpertOffloadCache.lru_snapshot
     warm_lru_local = eo.MoEExpertOffloadCache.warm_lru_local
+    pool_row_bytes = eo.MoEExpertOffloadCache.pool_row_bytes
 
 
 def _own(tables, rows_experts_use):
@@ -141,6 +142,10 @@ class SnapshotAndWarm(_Env):
         self.assertEqual(rw.pending(), 0)
         self.assertEqual(len(calls), 4)
         self.assertEqual(rw.warm_rows, 8)
+        # K10: one row = the resident buffers' row bytes (one float32 buffer here)
+        self.assertEqual(caches[0].pool_row_bytes(), 4)
+        self.assertIn("row_bytes=4 warm_mib=0.0", rw.fields())
+        self.assertEqual(rw.warm_bytes, 32)
         self.assertEqual(rw.skipped_eager, 1)
         self.assertEqual(int(caches[2]._pool_tables.hot_phys[12]), -1)   # the dropped layer: untouched
 

@@ -4774,6 +4774,15 @@ class MoEExpertOffloadCache:
         ids = [k for _u, k in owned]
         return ids[:limit] if limit > 0 else ids
 
+    def pool_row_bytes(self) -> int:
+        """RW / K10: bytes ONE pool row moves (every resident buffer's row);
+        0 when the pool is not installed."""
+        dsts = getattr(self, "_pool_dsts", None) or ()
+        try:
+            return int(sum(int(t[0].numel()) * int(t.element_size()) for t in dsts))
+        except Exception:  # noqa: BLE001 -- an instrument
+            return 0
+
     def warm_lru_local(self, ids, limit: int = 0) -> int:
         """RW: hand free LRU rows to the LOCAL expert ids ``ids`` and copy their
         bytes from the pinned store rows, on the CURRENT stream -- the same rows,
@@ -6511,6 +6520,8 @@ class ResumeWarm:
         self.snap_ms = 0.0
         self.warm_layers = self.warm_rows = 0
         self.warm_ms = 0.0
+        self.warm_bytes = 0
+        self.row_bytes = 0
         self.skipped_eager = self.skipped_cancel = 0
         self.cancel_reason = ""
         self._first_extend_layers: Dict = {}
@@ -6567,7 +6578,11 @@ class ResumeWarm:
             cache = self._queue.pop(0)
             ids = getattr(cache, "_rw_snap", None) or []
             cache._rw_snap = None
-            self.warm_rows += cache.warm_lru_local(ids)
+            rows = cache.warm_lru_local(ids)
+            rb = cache.pool_row_bytes() if hasattr(cache, "pool_row_bytes") else 0
+            self.row_bytes = max(self.row_bytes, rb)
+            self.warm_bytes += rows * rb
+            self.warm_rows += rows
             self.warm_layers += 1
             done += 1
         self.warm_ms += (time.perf_counter() - t0) * 1000.0
@@ -6608,6 +6623,7 @@ class ResumeWarm:
             f"first_extend_rows={sum(fe.values())} snap_layers={self.snap_layers} "
             f"snap_rows={self.snap_rows} snap_ms={self.snap_ms:.1f} "
             f"warm_layers={self.warm_layers} warm_rows={self.warm_rows} warm_ms={self.warm_ms:.1f} "
+            f"row_bytes={self.row_bytes} warm_mib={self.warm_bytes / 2**20:.1f} "
             f"skipped_eager={self.skipped_eager} skipped_cancel={self.skipped_cancel}"
             + (f" cancel={self.cancel_reason}" if self.cancel_reason else "")
         )
