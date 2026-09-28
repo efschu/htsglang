@@ -11582,15 +11582,40 @@ def choose_host_ledger(
 #: KV-page and the GDN-blob marker of that rank (fnFL2 v18, 21.09.: D READY
 #: with 1 host + 2 workers was refused "kv x1 blob x1, need 3 each").
 FORM_A_WORKER_CANONICAL_MARKER = "this rank is a Form A expert worker (no attention layer) -- no page window"
+#: #239 S3h/F14 (rc12z29d, 28.09. 20:34:28Z): under the KV token cut a Form A
+#: worker that owns token rows builds a whole-page KV window
+#: (cache_controller, F14 branch) and says so with THIS line instead of the
+#: no-window one. It is that rank's canonical KV page; it holds no GDN blob
+#: (the recurrent state stays the attention host's), so like the no-window
+#: line it stands in for the blob marker of that rank. W7/W10 counted only the
+#: old line and refused the first cut boot that reached READY:
+#: "D logged kv x1 blob x1, need 3 each" (TP0 #706 lines + 2 F14 workers).
+FORM_A_KV_WORKER_CANONICAL_MARKER = "#239 F14 KV-WORKER-WINDOW: Form A worker owns token rows"
 
 
 def canonical_marker_counts(path: str) -> tuple:
     """(kv, blob, workers): the #706 KV-page and GDN-blob markers of a group
-    log, each worker line counted once into both."""
+    log, each worker line (no-window or F14 KV window) counted once into both."""
     n_kv = count_marker(path, "#706 canonical KV page active")
     n_blob = count_marker(path, "canonical GDN blob active")
-    n_worker = count_marker(path, FORM_A_WORKER_CANONICAL_MARKER)
+    n_worker = (count_marker(path, FORM_A_WORKER_CANONICAL_MARKER)
+                + count_marker(path, FORM_A_KV_WORKER_CANONICAL_MARKER))
     return n_kv + n_worker, n_blob + n_worker, n_worker
+
+
+def d_kv_worker_ranks(extra_d: str) -> List[int]:
+    """#239 F14: the Form A workers (``--rank-tp-ratio`` 0) that own token rows
+    under the cut D runs (``--uneven-token-vector``) -- exactly the ranks that
+    must build a canonical KV window. Empty without a cut or outside Form A."""
+    toks = _argv_vector(extra_d or "", "--uneven-token-vector")
+    tp = _argv_vector(extra_d or "", "--rank-tp-ratio")
+    if not toks or not tp or len(toks) != len(tp):
+        return []
+    try:
+        return [r for r, (t, w) in enumerate(zip(toks, tp))
+                if float(w) == 0.0 and float(t) > 0.0]
+    except ValueError:
+        return []
 
 
 def count_marker(path: str, marker: str) -> int:
@@ -23182,9 +23207,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         n_kv, n_blob, n_worker = canonical_marker_counts(spec_d.log)
         log(f"W7/W10 launcher half, group D log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob}"
-            + (f" (of which {n_worker} Form A expert worker(s): no attention layer, no page window, null storage tier -- fnFL2 v18)" if n_worker else ""))
+            + (f" (of which {n_worker} Form A worker line(s): no-window/null tier -- fnFL2 v18 -- or F14 KV window, no GDN blob -- #239)" if n_worker else ""))
         if n_kv < 3 or n_blob < 3:
             raise Weg2LaunchRefused(f"W7/W10 (launcher half): D logged kv x{n_kv} blob x{n_blob}, need 3 each")
+        # #239 F14: a worker that OWNS token rows must have built its KV
+        # window -- its no-window line would pass the count above while its
+        # rows ride no canonical page. The riegel's point, kept under the cut.
+        _kv_workers = d_kv_worker_ranks(getattr(ns, "extra_d", "") or "")
+        _n_f14 = count_marker(spec_d.log, FORM_A_KV_WORKER_CANONICAL_MARKER)
+        if _n_f14 < len(_kv_workers):
+            raise Weg2LaunchRefused(
+                f"W7/W10 (launcher half): D workers {_kv_workers} own token rows under "
+                f"the cut but only {_n_f14} logged a canonical KV window "
+                f"('{FORM_A_KV_WORKER_CANONICAL_MARKER}') -- a rank holds KV without "
+                f"a canonical page")
     # #1233 zero-remainder (1j finding 6): W9 LAUNCH-TIME KEY-SCHEME GATE. The
     # store is one carrier; a spec-less group keys pages by unigram unless
     # SGLANG_HICACHE_BIGRAM_KEYS=1 forced the bigram scheme, a NEXTN/EAGLE
