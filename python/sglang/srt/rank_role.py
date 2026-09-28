@@ -684,6 +684,34 @@ def this_rank_is_form_a_host() -> bool:
     )
 
 
+def form_a_token_cut_active() -> bool:
+    """#239 S3d: True on EVERY rank of a Form A group that runs the token cut
+    (form ``kv=qsa_forma_dcp``): DCP spans the group and the full-attention KV
+    is owned by token range, so a worker is no longer byteless. Group-uniform
+    by construction -- the installed plan and the installed token vector are
+    the same on every rank (without a cut Form A resolves dcp 1 and the owner
+    bounds are None). False on a classic boot."""
+    if _INSTALLED_PLAN is None:
+        return False
+    from sglang.srt.distributed.utils import uneven_dcp_owner_bounds
+
+    return uneven_dcp_owner_bounds() is not None
+
+
+def form_a_worker_holds_kv() -> bool:
+    """#239 S3d: True only on a Form A worker that OWNS full-attention KV
+    tokens under the token cut (share > 0). Such a worker keeps real KV rows
+    (device, host tier, store); it still holds no GDN/mamba state, no QSA
+    index and no draft -- those stay the host's. A worker with share 0 under
+    the cut, and every worker without it, is byteless as before."""
+    if not this_rank_is_form_a_worker():
+        return False
+    from sglang.srt.distributed.utils import uneven_dcp_owner_bounds
+
+    bounds = uneven_dcp_owner_bounds()
+    return bounds is not None and int(bounds[2]) > int(bounds[1])
+
+
 def form_a_token_src_rank() -> Optional[int]:
     """The rank whose sampled tokens every other rank adopts under Form A
     (the host: it alone has lm_head + hidden states), or None on a classic

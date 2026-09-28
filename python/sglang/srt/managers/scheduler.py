@@ -3994,6 +3994,18 @@ class Scheduler(
             self._note_pp_chain_blocked(None, None)
         return out[0] if out else None
 
+    def _form_a_tp_gather(self, site: str, payload):
+        """#239 S3d: :meth:`_form_a_tp_exchange` for a verdict EVERY rank
+        contributes to (the token cut): an all-gather over the TP cpu group,
+        in TP order, under the same blocked-recv stamp."""
+        self._note_pp_chain_blocked(site, time.monotonic())
+        try:
+            out = [None] * len(self.tp_group.ranks)
+            torch.distributed.all_gather_object(out, payload, group=self.tp_cpu_group)
+        finally:
+            self._note_pp_chain_blocked(None, None)
+        return out
+
     def _form_a_is_host(self) -> Optional[bool]:
         """H105: None off a Form A follow group (tp 1, pp > 1, switch off);
         else whether this rank is the attention host. The host must be the
@@ -4021,8 +4033,17 @@ class Scheduler(
             return None
         from sglang.srt.managers import tp_match_floor as _tmf
 
+        from sglang.srt.rank_role import form_a_token_cut_active
+
         def _exchange(payload):
             return self._form_a_tp_exchange("form-a-admission/tp<-verdict", payload)
+
+        # #239 S3d: under the token cut every rank's gate counts (MIN).
+        _gather = None
+        if form_a_token_cut_active():
+
+            def _gather(payload):
+                return self._form_a_tp_gather("form-a-admission/tp<->verdict", payload)
 
         def _follow(req, gate, price=None, budget=None):
             local = _tmf.ADMISSION_ADMIT if gate is None else gate.name
@@ -4033,6 +4054,7 @@ class Scheduler(
                 exchange=_exchange,
                 price=price,
                 budget=budget,
+                gather=_gather,
             )
             return None if code == _tmf.ADMISSION_ADMIT else AddReqResult[code]
 
