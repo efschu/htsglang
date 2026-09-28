@@ -1462,7 +1462,7 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool, role: str = "kv") -> ty
     if (
         os.environ.get("SGLANG_HICACHE_ARENA_HOST", "0") == "1"
         # no attention, no arena (as the mamba chooser) -- except a worker
-        # that OWNS token rows under the token cut (#239 S4b F13): its KV
+        # that OWNS token rows under the token cut (#239 S4b F14): its KV
         # lives in the one L2 like the host's did
         and (not this_rank_is_form_a_worker() or (role == "kv" and form_a_worker_holds_kv()))
         and (role == "kv" or int(device_pool.page_size) == 1)

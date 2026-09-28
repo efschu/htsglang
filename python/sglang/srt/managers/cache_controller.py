@@ -984,7 +984,7 @@ def probe_hold_pin(controller, operation, hash_value, hit_tokens=None) -> int:
 
 
 def refuse_kv_worker_sidecar_bytes(mem_pool_host) -> None:
-    """#239 S4b (F13): a Form A worker that owns token rows carries exactly ONE
+    """#239 S4b (F14): a Form A worker that owns token rows carries exactly ONE
     byte-holding host pool -- the KV anchor. Its sidecars (QSA index, draft,
     mamba) stay byteless: those states are the attention host's. A sidecar
     WITH bytes on such a worker would be addressed by the worker's KV ids,
@@ -1004,7 +1004,7 @@ def refuse_kv_worker_sidecar_bytes(mem_pool_host) -> None:
     ]
     if carrying:
         raise RuntimeError(
-            "#239 F13 KV-WORKER SIDECAR-BYTES REFUSED: this Form A worker owns KV "
+            "#239 F14 KV-WORKER SIDECAR-BYTES REFUSED: this Form A worker owns KV "
             f"token rows and also holds bytes in {', '.join(carrying)}. Under the "
             "token cut only the KV anchor carries bytes on a worker; a sidecar "
             "keyed by the worker's (arena) KV ids with its own fixed row count "
@@ -1013,7 +1013,7 @@ def refuse_kv_worker_sidecar_bytes(mem_pool_host) -> None:
 
 
 def canonical_kv_owner_rows_for(owner_ctx, page_size, canonical_kv_page) -> Optional[tuple]:
-    """#239 S4b (F13): ``(page_size, S, lo, hi)`` when the owner rule runs on
+    """#239 S4b (F14): ``(page_size, S, lo, hi)`` when the owner rule runs on
     PAGED pools with the canonical page (the token cut: a page is written by
     every owner, each its own rows), else None -- the page-1 owner form and
     every non-owner boot stay as they are."""
@@ -1021,7 +1021,7 @@ def canonical_kv_owner_rows_for(owner_ctx, page_size, canonical_kv_page) -> Opti
         return None
     S, lo, hi = (int(x) for x in owner_ctx)
     logger.info(
-        "#239 F13 OWNER-ROWS: page %d, S=%d, this rank owns token rows "
+        "#239 F14 OWNER-ROWS: page %d, S=%d, this rank owns token rows "
         "[%d, %d) of every page%s.",
         int(page_size),
         S,
@@ -1539,7 +1539,7 @@ class HiCacheController:
         # the per-page owner rule needs page_size == 1 (a multi-token page
         # would span owner ranks). Fail fast instead of silently writing an
         # allocation-dependent (corrupt) store (task #60).
-        # #239 S4b (F13): the paged owner form -- every owner writes its own
+        # #239 S4b (F14): the paged owner form -- every owner writes its own
         # token rows of each page (``canonical_kv_owner_rows``) -- lifts the
         # page_size limit; without it a page would still span owners.
         owner_rows = (
@@ -1604,7 +1604,7 @@ class HiCacheController:
                 # fnFL2 v16 (21.09.): no attention layer, no bytes in the
                 # canonical page -- the worker claims every page and moves
                 # nothing, so the tp-group MIN reduces settle on the host.
-                # #239 S4b (F13): a worker that OWNS token rows under the cut
+                # #239 S4b (F14): a worker that OWNS token rows under the cut
                 # takes the real backend below, with its KV window only.
                 from sglang.srt.mem_cache.hicache_storage import FormAWorkerNullStorage
 
@@ -1809,7 +1809,7 @@ class HiCacheController:
             getattr(server_args, "hicache_canonical_kv_page", False)
         )
         if this_rank_is_form_a_worker() and form_a_worker_holds_kv() and canonical_on:
-            # #239 S4b (F13): a worker that owns token rows under the cut holds
+            # #239 S4b (F14): a worker that owns token rows under the cut holds
             # every full-attention layer with the full kv heads -- a whole-page
             # window, cut to its rows below. No mamba blob, no QSA page, no
             # draft: those stay the attention host's.
@@ -1828,7 +1828,7 @@ class HiCacheController:
             )
             refuse_kv_worker_sidecar_bytes(self.mem_pool_host)
             logger.info(
-                "#239 F13 KV-WORKER-WINDOW: Form A worker owns token rows %s of "
+                "#239 F14 KV-WORKER-WINDOW: Form A worker owns token rows %s of "
                 "every %d-token page; KV page window only (no mamba/QSA/draft).",
                 self._dcp_owner_ctx(),
                 self.page_size,
@@ -1938,7 +1938,7 @@ class HiCacheController:
         """The owner ctx a store backup masks WHOLE PAGES with, or None.
 
         The page-1 owner form (task #60) writes a page only on its owner
-        rank. #239 S4b (F13): under the paged owner form every rank writes
+        rank. #239 S4b (F14): under the paged owner form every rank writes
         every page -- its own token rows, cut by the owner-row window, and a
         rank that owns none abstains in the backend -- so there is no page
         mask, and no node has to be skipped for lack of device indices."""

@@ -4251,12 +4251,12 @@ def refuse_unwired_token_cut(ns, boot_form) -> None:
     from sglang.srt import rank_role
 
     missing = rank_role.unwired_token_cut_seams()
-    if missing == ("F13",) and getattr(ns, "weg2_disable_hicache", False):
-        # #239 S4a: F13 is the worker's bytes in the HOST TIER and the store;
+    if missing == ("F14",) and getattr(ns, "weg2_disable_hicache", False):
+        # #239 S4a: F14 is the worker's bytes in the HOST TIER and the store;
         # a boot without either (--weg2-disable-hicache: no L2, no L3, #1386)
         # has no such bytes, so the runtime half is complete for it.
-        print(f"{KV_TOKEN_CUT_MARKER} F13-FREI (kein Host-Tier): --d-kv-token-cut "
-              f"{ns.d_kv_token_cut} bootet mit --weg2-disable-hicache; F13 (Host-Tier/"
+        print(f"{KV_TOKEN_CUT_MARKER} F14-FREI (kein Host-Tier): --d-kv-token-cut "
+              f"{ns.d_kv_token_cut} bootet mit --weg2-disable-hicache; F14 (Host-Tier/"
               "Store des KV-Workers) ist offen und wird hier nicht betreten.", flush=True)
         return
     if not missing:

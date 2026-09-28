@@ -1,4 +1,4 @@
-"""#239 S4b (F13), step 1: owner-row windows in the canonical page store.
+"""#239 S4b (F14), step 1: owner-row windows in the canonical page store.
 
 Under Form A x the token cut a page of 64 tokens is owned by several ranks
 (owner rule ``L % S in [lo, hi)``), each holding every full-attention layer

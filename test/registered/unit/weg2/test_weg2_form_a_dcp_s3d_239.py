@@ -12,7 +12,7 @@ must now ask whether this rank holds rows:
   worker KV reach), not the host's alone;
 * H105: the admission gate is the group MIN (a gather in place of the
   host's broadcast);
-* S3e: the launch refusal of the cut reads the seam register (F13 -- the
+* S3e: the launch refusal of the cut reads the seam register (F14 -- the
   worker's bytes in the host tier and store -- is still open).
 
 RED on cdd6522981: the predicate does not exist, a Form A worker names no
@@ -257,9 +257,9 @@ class TestTokenCutRiegel(unittest.TestCase):
         would never lift."""
         from sglang.srt.weg2 import launcher as L
 
-        self.assertEqual(rank_role.TOKEN_CUT_SEAMS, ("F4", "F5", "F12", "F13"))
-        self.assertEqual(rank_role.unwired_token_cut_seams(), ("F13",))
-        with self.assertRaisesRegex(L.Weg2TokenCutNotWired, r"seam\(s\) F13 unwired.*#239 S3"):
+        self.assertEqual(rank_role.TOKEN_CUT_SEAMS, ("F4", "F5", "F12", "F14"))
+        self.assertEqual(rank_role.unwired_token_cut_seams(), ("F14",))
+        with self.assertRaisesRegex(L.Weg2TokenCutNotWired, r"seam\(s\) F14 unwired.*#239 S3"):
             L.refuse_unwired_token_cut(self._ns(), types.SimpleNamespace(kv="qsa_forma_dcp"))
         L.refuse_unwired_token_cut(self._ns(dry=True), types.SimpleNamespace(kv="qsa_forma_dcp"))
 
@@ -269,18 +269,18 @@ class TestTokenCutRiegel(unittest.TestCase):
         from sglang.srt.weg2 import launcher as L
 
         built = dict(rank_role.SEAMS)
-        built["F13"] = dataclasses.replace(built["F13"], wired=True)
+        built["F14"] = dataclasses.replace(built["F14"], wired=True)
         with mock.patch.object(rank_role, "SEAMS", built):
             self.assertEqual(rank_role.unwired_token_cut_seams(), ())
             L.refuse_unwired_token_cut(self._ns(), types.SimpleNamespace(kv="qsa_forma_dcp"))
         f5_open = dict(rank_role.SEAMS)
         f5_open["F5"] = dataclasses.replace(f5_open["F5"], wired=False)
         with mock.patch.object(rank_role, "SEAMS", f5_open):
-            with self.assertRaisesRegex(L.Weg2TokenCutNotWired, "F5, F13"):
+            with self.assertRaisesRegex(L.Weg2TokenCutNotWired, "F5, F14"):
                 L.refuse_unwired_token_cut(self._ns(), types.SimpleNamespace(kv="qsa_forma_dcp"))
 
     def test_a_boot_without_a_host_tier_needs_no_f13(self):
-        """S4a: --weg2-disable-hicache (no L2, no L3) enters no F13 path, so the
+        """S4a: --weg2-disable-hicache (no L2, no L3) enters no F14 path, so the
         cut boots there -- with the named line -- and nowhere else."""
         import contextlib
         import dataclasses
@@ -292,22 +292,22 @@ class TestTokenCutRiegel(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             L.refuse_unwired_token_cut(ns, types.SimpleNamespace(kv="qsa_forma_dcp"))
-        self.assertIn("#239 KV-TOKEN-SCHNITT F13-FREI (kein Host-Tier)", out.getvalue())
+        self.assertIn("#239 KV-TOKEN-SCHNITT F14-FREI (kein Host-Tier)", out.getvalue())
         f5_open = dict(rank_role.SEAMS)
         f5_open["F5"] = dataclasses.replace(f5_open["F5"], wired=False)
         with mock.patch.object(rank_role, "SEAMS", f5_open):
-            with self.assertRaisesRegex(L.Weg2TokenCutNotWired, "F5, F13"):
+            with self.assertRaisesRegex(L.Weg2TokenCutNotWired, "F5, F14"):
                 L.refuse_unwired_token_cut(ns, types.SimpleNamespace(kv="qsa_forma_dcp"))
 
     def test_the_f13_anchors_hit(self):
         import os
 
         root = os.path.dirname(rank_role.__file__)
-        for rel, line, needle in rank_role.SEAMS["F13"].anchors:
+        for rel, line, needle in rank_role.SEAMS["F14"].anchors:
             lines = open(os.path.join(root, rel)).read().splitlines()
             window = "\n".join(lines[max(0, line - 6): line + 5])
             self.assertIn(needle, window, f"{rel}:{line}")
-        self.assertIn("F13", rank_role.UNWIRED_ORDER)
+        self.assertIn("F14", rank_role.UNWIRED_ORDER)
 
 
 if __name__ == "__main__":

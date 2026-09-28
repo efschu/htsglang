@@ -59,7 +59,7 @@ def _psz(pool) -> int:
 
 
 def owner_page_tokens(owner_rows) -> torch.Tensor:
-    """#239 S4b (F13): the token offsets inside one page this rank owns under
+    """#239 S4b (F14): the token offsets inside one page this rank owns under
     the token cut, from ``(page_size, S, lo, hi)`` (empty for share 0)."""
     from sglang.srt.mem_cache.canonical_page_store import owner_token_runs
 
@@ -69,7 +69,7 @@ def owner_page_tokens(owner_rows) -> torch.Tensor:
 
 
 def _owner_tok_of(pool) -> Optional[torch.Tensor]:
-    """#239 S4b (F13): the pool's owned token offsets, None outside the token
+    """#239 S4b (F14): the pool's owned token offsets, None outside the token
     cut. A module function for ``_psz``'s reason: the hermetic fixtures build
     pools without ``_arena_init_fields`` and borrow the methods onto bare
     namespaces -- neither ever holds owner rows."""
@@ -962,7 +962,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._v_offs: list = []
         self._pending: dict = {}
         self._pending_mask = None   # xsn355: bool[A], mirrors _pending's keys (vectorised membership)
-        # #239 S4b (F13): under the token cut the token offsets of a page this
+        # #239 S4b (F14): under the token cut the token offsets of a page this
         # rank owns (None: every other form -- the whole-page paths below)
         self._owner_tok: Optional[torch.Tensor] = None
         self.arena_k_ptrs = None
@@ -990,7 +990,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 isinstance(window, CanonicalAbstainWindow)
                 or (isinstance(window, CanonicalExtentWindow) and window.identity)
             ):
-                # #239 S4b (F13): the token cut -- this rank's rows of every
+                # #239 S4b (F14): the token cut -- this rank's rows of every
                 # page (identity window) or none of them (share 0)
                 owner_rows = storage_backend._kv_owner_rows
             self.bind(arena, window, role=role, owner_rows=owner_rows)
@@ -1019,13 +1019,13 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         own = None
         owner_tok = None
         if owner_rows is not None:
-            # #239 S4b (F13): a token-cut rank holds every attention layer with
+            # #239 S4b (F14): a token-cut rank holds every attention layer with
             # the full kv heads -- the slot geometry is the WHOLE page -- but
             # writes (and completes) only its own token rows of it; a rank of
             # share 0 takes part in claim/complete with no extents at all.
             if int(owner_rows[0]) != P:
                 raise ValueError(
-                    f"#239 F13 owner rows {tuple(owner_rows)} are for {owner_rows[0]}-token "
+                    f"#239 F14 owner rows {tuple(owner_rows)} are for {owner_rows[0]}-token "
                     f"pages; this pool pages by {P}")
             from sglang.srt.mem_cache.canonical_page_store import CanonicalAbstainWindow
 
@@ -1324,7 +1324,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
     def _load_arena(self, device_pool, rows, device_indices, layer_id) -> None:
         P = _psz(self)
         if _owner_tok_of(self) is not None:
-            # #239 S4b (F13): this rank's token rows of each page, never the
+            # #239 S4b (F14): this rank's token rows of each page, never the
             # whole-page path (it would write P rows per page into the compact
             # device pool); the controller already masked host AND device ids
             # by the owner rule (_dcp_kv_transfer_pairs).
@@ -2033,7 +2033,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
 
     def _backup_owner_rows(self, device_pool, slots: torch.Tensor, toks: torch.Tensor,
                            device_indices: torch.Tensor) -> None:
-        """#239 S4b (F13): this rank's token rows go from its COMPACT device
+        """#239 S4b (F14): this rank's token rows go from its COMPACT device
         rows into their (slot, token) places of the canonical page, every
         layer, K and V. A token outside the owner range is refused by name:
         it would overwrite another owner's bytes in the shared slot."""
@@ -2045,7 +2045,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if not bool(torch.isin(toks, self._owner_tok).all()):
             bad = toks[~torch.isin(toks, self._owner_tok)][:4].tolist()
             raise RuntimeError(
-                f"#239 F13 ARENA-OWNER-WRITE REFUSED: token offset(s) {bad} are not this "
+                f"#239 F14 ARENA-OWNER-WRITE REFUSED: token offset(s) {bad} are not this "
                 f"rank's rows ({int(self._owner_tok.numel())} owned per page) -- the "
                 "write would land in another owner's bytes of the shared page")
         self.pin_slots(torch.unique(slots_cpu))
@@ -2061,7 +2061,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         global _ARENA_WRITE_N
         _ARENA_WRITE_N += 1
         if _ARENA_WRITE_N <= 8 or _ARENA_WRITE_N % 256 == 0:
-            logger.info("#239 F13 WEG2-ARENA-WRITE n=%d rows=%d pages=%d mode=owner-rows layers=%d",
+            logger.info("#239 F14 WEG2-ARENA-WRITE n=%d rows=%d pages=%d mode=owner-rows layers=%d",
                         _ARENA_WRITE_N, n, int(torch.unique(slots_cpu).numel()), L)
 
     def _backup_arena(self, device_pool, slots: torch.Tensor, device_indices: torch.Tensor) -> None:
@@ -2198,7 +2198,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             P = _psz(self)
             rows_t = (hi[sel] - S).to(torch.int64)
             if _owner_tok_of(self) is not None:
-                # #239 S4b (F13): only this rank's token rows of each page
+                # #239 S4b (F14): only this rank's token rows of each page
                 # arrive (the owner rule masked them); token granular
                 page_slots = rows_t // P
                 keep = self._pending_mask[page_slots]
