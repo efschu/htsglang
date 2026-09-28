@@ -34,9 +34,10 @@ def test_form_a_backend_follows_the_model():
 
 
 def test_form_a_runs_on_the_existing_lane():
-    a = rf.resolve_rank_form([0, 1, 0])
+    a = rf.resolve_rank_form([0, 1, 0], [40, 0, 60])
     assert a.serve_argv() == ["--tp-size", "3", "--dcp-size", "3", "--weightless-kv-fastlane",
-                              "--weightless-kv-head-rank", "1"]
+                              "--weightless-kv-head-rank", "1", "--rank-tp-ratio", "0,1,0",
+                              "--uneven-token-vector", "40,0,60"]
     c = rf.resolve_rank_form([98, 19, 19], [40, 30, 30])
     assert c.serve_argv() == ["--tp-size", "3", "--rank-tp-ratio", "98,19,19",
                               "--uneven-token-vector", "40,30,30"]
@@ -74,17 +75,19 @@ def test_lane_spec_is_the_eagle_chain_only():
     rf.check_form_spec(rf.resolve_rank_form([1, 1, 1]), "DFLASH")  # C: not the lane's business
 
 
-def _measures(tmp_path, ar=None, dcp=None):
-    doc = {"schema": rf.MEASURES_SCHEMA, "allreduce": ar or {}, "dcp_exchange": dcp or {}}
+def _measures(tmp_path, ar=None, dcp=None, transport="bar1"):
+    doc = {"schema": rf.MEASURES_SCHEMA, "allreduce": {transport: ar or {}},
+           "dcp_exchange": {transport: dcp or {}}}
     p = tmp_path / "m.json"
     p.write_text(json.dumps(doc))
     return rf.FormMeasures.load(str(p))
 
 
-def _cost(form, m, bs=1):
+def _cost(form, m, bs=1, measured=True, const=None, label=None):
     return rf.form_round_cost(form, bs=bs, weight_read_ms=[10.0, 25.0, 25.0],
                               attn_ms=[1.0, 4.0, 4.0], fixed_ms=2.0, n_allreduce=98,
-                              n_attn_layers=16, uuids=U, measures=m)
+                              n_attn_layers=16, uuids=U, measures=m, const_ms=const,
+                              compute_measured=measured, label=label)
 
 
 def test_unmeasured_keeps_todays_form(tmp_path):
@@ -130,3 +133,73 @@ def test_measures_schema_is_checked(tmp_path):
     p.write_text(json.dumps({"schema": "other/1"}))
     with pytest.raises(ValueError):
         rf.FormMeasures.load(str(p))
+
+
+def test_calculated_compute_never_decides(tmp_path):
+    key3 = rf.cards_key(U)
+    m = _measures(tmp_path, dcp={key3: {"1": {"graph_median_us": 50.0}}})
+    a = rf.resolve_rank_form([1, 0, 0], [0, 50, 50])
+    ca = _cost(a, m, measured=False)
+    assert ca.round_ms is None and ca.estimate_ms == pytest.approx(12.8)
+    assert any("compute[A]" in x for x in ca.missing)
+    label, line = rf.choose_form({"A": a}, {"A": ca}, today="C")
+    assert label == "C" and "estimate, not a decision: A ~12.80 ms" in line
+
+
+def test_const_only_on_weight_ranks_and_measured_round_wins(tmp_path):
+    key3 = rf.cards_key(U)
+    doc = {"schema": rf.MEASURES_SCHEMA, "allreduce": {},
+           "dcp_exchange": {"bar1": {key3: {"1": {"graph_median_us": 0.0}}}},
+           "rounds": {"C": {key3: {"1": {"median_ms": 27.29, "source": "x", "transport": "bar1"}}}}}
+    p = tmp_path / "r.json"
+    p.write_text(json.dumps(doc))
+    m = rf.FormMeasures.load(str(p))
+    a = rf.resolve_rank_form([1, 0, 0], [0, 50, 50])
+    ca = _cost(a, m, const=[3.0, 8.0, 8.0])
+    # KV-only 3080s pay no model constant: max(3+10, 2, 2) + fixed 2
+    assert ca.terms["compute_ms"] == pytest.approx(13.0)
+    cc = _cost(rf.resolve_rank_form([98, 19, 19]), m, label="C")
+    assert cc.measured_round and cc.round_ms == 27.29
+
+
+def test_control_arm_never_prices_the_serve_path(tmp_path):
+    key3 = rf.cards_key(U)
+    p = _measures(tmp_path, dcp={key3: {"1": {"graph_median_us": 149.0}}}, transport="nccl_control")
+    bar1 = rf.FormMeasures.load(p.source)
+    assert bar1.transport == "bar1" and bar1.dcp_exchange_us == {}
+    a = rf.resolve_rank_form([1, 0, 0], [0, 50, 50])
+    assert "dcp_exchange[bar1]" in " ".join(_cost(a, bar1).missing)
+    ctl = rf.FormMeasures.load(p.source, transport="nccl_control")
+    assert ctl.dcp_exchange_us[key3][1] == 149.0
+
+
+def test_launcher_sees_the_lane_workers_through_the_239_vectors():
+    # NF review 28.09. (Befund 6): without the vectors d_kv_worker_ranks is []
+    # and the F14 gate (kv_owner_ranks) silently drops the lane workers
+    from sglang.srt.weg2 import launcher as L
+
+    a = rf.resolve_rank_form([1, 0, 0], [0, 50, 50])
+    assert L.d_kv_worker_ranks(" ".join(a.serve_argv())) == [1, 2]
+
+
+def _lane_args(**kw):
+    from sglang.srt.server_args import ServerArgs
+
+    kw.setdefault("enable_vram_ledger", False)
+    return ServerArgs(model_path="dummy", tp_size=3, dcp_size=3, weightless_kv_fastlane=True, **kw)
+
+
+def test_server_args_admit_the_lane_vector_and_nothing_else():
+    a = _lane_args(rank_tp_ratio=[1, 0, 0])
+    a._handle_uneven_tp()
+    assert a.rank_tp_ratio is None and a._lane_rank_tp_ratio == [1, 0, 0]
+    for bad in ([1, 1, 0], [0, 1, 0], [1, 0]):
+        b = _lane_args(rank_tp_ratio=list(bad))
+        with pytest.raises(ValueError, match="W181"):
+            b._handle_uneven_tp()
+    # outside the lane a zero stays an arithmetic accident, as before
+    from sglang.srt.server_args import ServerArgs
+
+    c = ServerArgs(model_path="dummy", tp_size=3, rank_tp_ratio=[1, 0, 0], enable_vram_ledger=False)
+    with pytest.raises(ValueError, match="positive"):
+        c._handle_uneven_tp()

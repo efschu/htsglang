@@ -33,7 +33,7 @@ a DENSE GQA model runs the existing weightless-KV lane (the same collectives
 of layers/dcp/comm.py, flashinfer/triton worker dispatch).
 
 The planner picks the form (``choose_form``) from measured prices
-(``weg2.form_measures/1``, written by devtools/dcp_exchange_bench.py); a
+(``weg2.form_measures/2``, written by devtools/dcp_exchange_bench.py); a
 missing price is UNMEASURED and keeps today's form C. An explicit form (the
 vectors) overrides the planner by name (``FORM-OVERRIDE``).
 """
@@ -53,7 +53,11 @@ FORM_C = "C"
 FORM_A = "A"
 FORM_B = "B"
 
-MEASURES_SCHEMA = "weg2.form_measures/1"
+MEASURES_SCHEMA = "weg2.form_measures/2"
+#: The transport the serve path runs (barlink BAR1, user 28.09. "DOCH die haben
+#: barlink bar1"). ``nccl_control`` prices are a CONTROL ARM: loadable for a
+#: side-by-side, never what the planner decides on by default.
+SERVE_TRANSPORT = "bar1"
 FORM_CHOICE_MARKER = "RANK-FORM"
 
 
@@ -118,8 +122,11 @@ class RankForm:
         n = str(self.world)
         argv: List[str] = ["--tp-size", n]
         if self.backend == BACKEND_LANE:
+            # the #239 vectors too (NF review 28.09.): launcher.d_kv_worker_ranks
+            # reads them, without them the lane workers fall out of the F14 gate
             argv += ["--dcp-size", n, "--weightless-kv-fastlane",
-                     "--weightless-kv-head-rank", str(self.head_rank)]
+                     "--weightless-kv-head-rank", str(self.head_rank),
+                     "--rank-tp-ratio", ",".join(str(w) for w in self.weights)]
         elif self.backend == BACKEND_FORM_A_239:
             argv += ["--rank-role", ",".join("host" if w > 0 else "worker" for w in self.weights),
                      "--rank-tp-ratio", ",".join(str(w) for w in self.weights)]
@@ -239,17 +246,21 @@ def check_form_spec(form: RankForm, algorithm: Optional[str]) -> None:
 
 @dataclass
 class FormMeasures:
-    """``weg2.form_measures/1``: the prices the model needs, each keyed so a
-    missing one is visible (never a default)."""
+    """``weg2.form_measures/2``: the prices the model needs, each keyed so a
+    missing one is visible (never a default). Collective tables are keyed by
+    transport first; ``load`` reads ONE transport (default the serve path's)."""
 
     allreduce_us: Dict[str, Dict[int, float]] = field(default_factory=dict)
     dcp_exchange_us: Dict[str, Dict[int, float]] = field(default_factory=dict)
+    #: whole decode rounds measured on metal: form label -> cards key -> bs -> ms
+    rounds_ms: Dict[str, Dict[str, Dict[int, float]]] = field(default_factory=dict)
     source: str = ""
+    transport: str = SERVE_TRANSPORT
 
     @classmethod
-    def load(cls, path: Optional[str]) -> "FormMeasures":
+    def load(cls, path: Optional[str], transport: str = SERVE_TRANSPORT) -> "FormMeasures":
         if not path or not os.path.exists(path):
-            return cls(source="")
+            return cls(source="", transport=transport)
         with open(path) as f:
             doc = json.load(f)
         if doc.get("schema") != MEASURES_SCHEMA:
@@ -257,7 +268,7 @@ class FormMeasures:
 
         def table(key: str) -> Dict[str, Dict[int, float]]:
             out: Dict[str, Dict[int, float]] = {}
-            for cards, per_bs in (doc.get(key) or {}).items():
+            for cards, per_bs in ((doc.get(key) or {}).get(transport) or {}).items():
                 out[cards] = {int(bs): float(v["graph_median_us"] if v.get("graph_median_us")
                                              is not None else v["eager_median_us"])
                               for bs, v in per_bs.items()
@@ -265,8 +276,15 @@ class FormMeasures:
                               or v.get("eager_median_us") is not None}
             return out
 
+        rounds: Dict[str, Dict[str, Dict[int, float]]] = {}
+        for form, per_cards in (doc.get("rounds") or {}).items():
+            for cards, per_bs in per_cards.items():
+                rounds.setdefault(form, {})[cards] = {
+                    int(bs): float(v["median_ms"]) for bs, v in per_bs.items()
+                    if v.get("median_ms") is not None
+                    and v.get("transport", SERVE_TRANSPORT) == transport}
         return cls(allreduce_us=table("allreduce"), dcp_exchange_us=table("dcp_exchange"),
-                   source=path)
+                   rounds_ms=rounds, source=path, transport=transport)
 
 
 def cards_key(uuids: Sequence[str]) -> str:
@@ -282,6 +300,11 @@ class FormCost:
     round_ms: Optional[float]
     terms: Mapping[str, float]
     missing: Tuple[str, ...]
+    #: the model's number even where an input is only calculated (never used
+    #: to CHOOSE -- a Hochrechnung is not a measurement), None if a collective
+    #: price is missing entirely
+    estimate_ms: Optional[float] = None
+    measured_round: bool = False
 
 
 def form_round_cost(
@@ -295,27 +318,42 @@ def form_round_cost(
     n_attn_layers: int,
     uuids: Sequence[str],
     measures: FormMeasures,
+    const_ms: Optional[Sequence[float]] = None,
+    compute_measured: bool = False,
+    label: Optional[str] = None,
 ) -> FormCost:
     """T_D(form) = max_r(weight_read_r * share_r + attn_r * tokshare_r)
                    + n_allreduce * t_ar(TP ranks) + n_attn_layers * t_dcp(DCP ranks)
                    + fixed.
 
     ``weight_read_ms[r]``: rank r reading ALL weights (its share scales it);
-    ``attn_ms[r]``: rank r attending over ALL KV of the round (its token share
-    scales it). Collective prices come ONLY from ``measures``; a price the form
-    needs and the file lacks is named in ``missing`` and the round is None."""
+    ``const_ms[r]``: rank r's non-GEMM/launch constant, paid only where the rank
+    holds weights (a KV-only rank runs no model layer); ``attn_ms[r]``: rank r
+    attending over ALL KV of the round (its token share scales it). Collective
+    prices come ONLY from ``measures``; a price the form needs and the file
+    lacks is named in ``missing``. A whole round measured on metal
+    (``measures.rounds_ms[label]``) replaces the model. Unless the compute
+    inputs are measured (``compute_measured``), ``round_ms`` stays None and
+    only ``estimate_ms`` carries the number."""
+    lab = label or form.kind
+    meas = measures.rounds_ms.get(lab, {}).get(cards_key(uuids), {}).get(int(bs))
+    if meas is not None:
+        return FormCost(form=lab, round_ms=meas, terms={"measured_round_ms": meas}, missing=(),
+                        estimate_ms=meas, measured_round=True)
     missing: List[str] = []
     wsum = float(sum(form.weights))
     tok = form.tokens if form.tokens is not None else tuple(1 for _ in form.weights)
     tsum = float(sum(tok))
-    per_rank = [float(weight_read_ms[r]) * form.weights[r] / wsum
+    const = list(const_ms) if const_ms is not None else [0.0] * form.world
+    per_rank = [(float(const[r]) if form.weights[r] > 0 else 0.0)
+                + float(weight_read_ms[r]) * form.weights[r] / wsum
                 + float(attn_ms[r]) * tok[r] / tsum for r in range(form.world)]
     terms: Dict[str, float] = {"compute_ms": max(per_rank), "fixed_ms": float(fixed_ms)}
     tp_uuids = [uuids[r] for r in form.weight_ranks]
     if len(tp_uuids) > 1:
         ar = measures.allreduce_us.get(cards_key(tp_uuids), {}).get(int(bs))
         if ar is None:
-            missing.append(f"allreduce[{cards_key(tp_uuids)}][bs{bs}]")
+            missing.append(f"allreduce[{measures.transport}][{cards_key(tp_uuids)}][bs{bs}]")
         else:
             terms["allreduce_ms"] = n_allreduce * ar / 1000.0
     if form.world > 1:
@@ -324,11 +362,15 @@ def form_round_cost(
         # host-broadcast shape of A, an upper bound for C's head-split gather
         dk = measures.dcp_exchange_us.get(cards_key(uuids), {}).get(int(bs))
         if dk is None:
-            missing.append(f"dcp_exchange[{cards_key(uuids)}][bs{bs}]")
+            missing.append(f"dcp_exchange[{measures.transport}][{cards_key(uuids)}][bs{bs}]")
         else:
             terms["dcp_ms"] = n_attn_layers * dk / 1000.0
-    total = None if missing else sum(terms.values())
-    return FormCost(form=form.kind, round_ms=total, terms=terms, missing=tuple(missing))
+    est = None if missing else sum(terms.values())
+    if not compute_measured:
+        missing.append(f"compute[{lab}] (calculated, not measured)")
+    total = None if missing else est
+    return FormCost(form=lab, round_ms=total, terms=terms, missing=tuple(missing),
+                    estimate_ms=est)
 
 
 def choose_form(
@@ -348,8 +390,11 @@ def choose_form(
                           f"{candidates[override].line()} (the planner does not decide)")
     unmeasured = {k: c.missing for k, c in costs.items() if c.round_ms is None}
     if unmeasured:
+        est = ", ".join(f"{k} ~{costs[k].estimate_ms:.2f} ms" for k in sorted(costs)
+                        if costs[k].estimate_ms is not None)
         return today, (f"{FORM_CHOICE_MARKER} UNMEASURED -- keeps today's form {today}; missing "
-                       + "; ".join(f"{k}: {', '.join(v)}" for k, v in sorted(unmeasured.items())))
+                       + "; ".join(f"{k}: {', '.join(v)}" for k, v in sorted(unmeasured.items()))
+                       + (f" (estimate, not a decision: {est})" if est else ""))
     best = min(costs, key=lambda k: costs[k].round_ms)
     table = ", ".join(f"{k} {costs[k].round_ms:.2f} ms" for k in sorted(costs))
     return best, f"{FORM_CHOICE_MARKER} CHOSEN {best} (decode round: {table})"

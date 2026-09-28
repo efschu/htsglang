@@ -11182,6 +11182,29 @@ class ServerArgs:
         if res.token_vector:
             logger.info("#239 S3a FORM-A DCP: dcp_size=%d -- %s", res.dcp_size, res.reason)
 
+    def _admit_lane_rank_tp_ratio(self) -> None:
+        """--rank-tp-ratio under --weightless-kv-fastlane (rank form, 28.09.):
+        exactly the lane's shape or refused by name, then kept only as
+        ``_lane_rank_tp_ratio`` (the lane places the weights itself)."""
+        ratio = list(self.rank_tp_ratio)
+        head = int(self.weightless_kv_head_rank)
+        want = [f"rank {head} > 0"] + [f"rank {r} = 0" for r in range(len(ratio)) if r != head]
+        if (
+            len(ratio) != self.tp_size
+            or any(not isinstance(r, int) or r < 0 for r in ratio)
+            or not (0 <= head < len(ratio))
+            or ratio[head] <= 0
+            or any(ratio[r] != 0 for r in range(len(ratio)) if r != head)
+        ):
+            raise ValueError(
+                f"--rank-tp-ratio {ratio} under --weightless-kv-fastlane must be the "
+                f"lane's shape for --tp-size {self.tp_size} and --weightless-kv-head-rank "
+                f"{head}: {', '.join(want)} (a KV-only rank holds no weight share). "
+                "W181 Weg2RankFormShapeMismatch"
+            )
+        self._lane_rank_tp_ratio = ratio
+        self.rank_tp_ratio = None
+
     def form_a_dcp_vector(self) -> Optional[List[int]]:
         """#239 S3a: the Form A token cut this boot runs, or None."""
         return getattr(self, "_form_a_dcp_vector", None)
@@ -12189,6 +12212,19 @@ class ServerArgs:
         # The checks below are exactly the ones that do not read
         # self.rank_gpu_id; everything that does stays after the early return.
         # ---------------------------------------------------------------
+
+        # Rank form (28.09., one mechanism with #239): the weightless-KV lane
+        # may state its shape with #239's own vector -- head share > 0, every
+        # KV-only rank 0 -- so the weg2 launcher reads the SAME flags for both
+        # backends (launcher.d_kv_worker_ranks). The lane owns placement (head
+        # TP=1, workers weightless): the vector is checked against the lane's
+        # head and then taken out of uneven-TP planning, byte-identical.
+        if (
+            isinstance(self.rank_tp_ratio, list)
+            and self.weightless_kv_fastlane
+            and not self.rank_role
+        ):
+            self._admit_lane_rank_tp_ratio()
 
         # Form A roles need an EXPLICIT partition, and a resolved one.
         if self.rank_role:
