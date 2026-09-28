@@ -791,6 +791,98 @@ def _weg2_store_short_tail_x(sched) -> int:
     return min(x, cap) if (x > 0 and cap > 0) else x
 
 
+#: rc12y (28.09., D-Log weg2-16-42, 00:07:35-00:13:24): ONE store read of
+#: 46850 tokens terminated 192 short (delivered 46656, deliverable 46848)
+#: 692 times in 6 minutes -- DEFERRED attempt=1 -> retry re-issues ->
+#: ``#1068 PREFETCH LANDED verdict=issued`` clears the mark -> the re-read
+#: terminates short again -> a FRESH mark. The progress witness only runs on
+#: a mark that survives into a second observation, so it never ran; the X
+#: gate held the request (X-DEFER bound_s=inf) until the front's deadman
+#: (BUSY-STARVED). No writer was coming: the tail lay beyond what D's
+#: previous turn (weg2-13-41, ``#1469 RETAIN ... cache_len=None value=False``)
+#: had put into the store, and P was asleep. This bound counts the FRESH
+#: store-short marks of a request whose delivered prefix did not grow; it is
+#: carried on the request, so the mark's clear cannot reset it. Passes, not
+#: seconds (every rank marks off the group-synced record in the same pass);
+#: not counted while this group sleeps (P can still publish then, xsn344).
+STORE_SHORT_MAX_CYCLES_ENV = "SGLANG_WEG2_STORE_SHORT_MAX_CYCLES"
+
+
+def _weg2_store_short_max_cycles() -> int:
+    """How many fresh store-short marks without growth a request may take
+    before the fallback (``#1068 DEFERRED`` per rid at most this many);
+    env-overridable, floor 1, default 4."""
+    try:
+        return max(1, int(os.environ.get(STORE_SHORT_MAX_CYCLES_ENV, "4")))
+    except (TypeError, ValueError):
+        return 4
+
+
+def _weg2_store_short_cycle(sched, req) -> int:
+    """Count one FRESH store-short mark of ``req``; returns how many in a row
+    delivered no more than the best before (1 = the delivered prefix grew)."""
+    delivered = int(getattr(req, "_weg2_store_delivered", 0) or 0)
+    best = getattr(req, "_weg2_store_short_cycle_best", None)
+    if best is None or delivered > int(best):
+        req._weg2_store_short_cycle_best = delivered
+        req._weg2_store_short_cycles = 1
+        return 1
+    n = int(getattr(req, "_weg2_store_short_cycles", 0) or 0)
+    from sglang.srt.weg2 import retain_publish as _rp
+
+    if not _rp.dormant_standstill_holds(getattr(sched, "weg2_dormant", False)):
+        n += 1
+    req._weg2_store_short_cycles = n
+    return n
+
+
+def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Optional[str]:
+    """The bounded exit of a store-short read that stopped growing: None =
+    still within the bound (defer as before). Past it, a remainder within X
+    (or no X riegel) is released to admission -- the matched prefix is taken
+    and D extends the rest; the X gate prices it with the group's match, so a
+    remainder the mamba validator widens past X is refused there by name
+    (W50, the front re-routes). A remainder over X takes the named W88 of the
+    windowed path, as the witness's own terminal does."""
+    if reason != _DEFER_REASON_STORE_SHORT:
+        return None
+    cycles = _weg2_store_short_cycle(sched, req)
+    bound = _weg2_store_short_max_cycles()
+    if cycles <= bound:
+        return None
+    x = _weg2_store_short_tail_x(sched)
+    remainder = _weg2_store_short_remainder(req)
+    tail = -1 if remainder is None else int(remainder)
+    delivered = int(getattr(req, "_weg2_store_delivered", 0) or 0)
+    rid = str(getattr(req, "rid", "?"))[:16]
+    if x > 0 and (remainder is None or remainder > x) and _weg2_windowed_path(sched):
+        logger.warning(
+            "PREFETCH-DEFER-FALLBACK rid=%s delivered=%d tail=%d X=%d cycles=%d "
+            "bound=%d reason=over_x span=%s -- the store read stopped growing "
+            "and the remainder exceeds X: named W88",
+            rid, delivered, tail, x, cycles, bound, span,
+        )
+        return sched._weg2_store_load_terminal(req, arm=reason, span=span, site=site)
+    from sglang.srt.mem_cache.match_refusal_census import (
+        note_prefetch_gate as _note_prefetch_gate,
+    )
+
+    sched._clear_prefetch_deferral_fields(req)
+    req._weg2_store_short_fallback = True
+    _note_prefetch_gate("defer_expired")
+    sched._weg2_store_short_fallbacks = getattr(sched, "_weg2_store_short_fallbacks", 0) + 1
+    logger.warning(
+        "PREFETCH-DEFER-FALLBACK rid=%s delivered=%d tail=%d X=%d cycles=%d "
+        "bound=%d reason=no_writer_progress span=%s site=%s n=%d -- the store "
+        "read terminated short %d times in a row without delivering more; no "
+        "writer is filling the tail, so the matched prefix is taken and D "
+        "extends the rest (the X gate prices it with the group's match)",
+        rid, delivered, tail, x, cycles, bound, span, site,
+        sched._weg2_store_short_fallbacks, cycles,
+    )
+    return "expired"
+
+
 def _weg2_zero_read_settle_on() -> bool:
     """PK2's zero-read settle belongs to the 27B immediate park
     (``SGLANG_WEG2_D_PARK_IMMEDIATE`` / ``ModelProfile.d_park_immediate``),
@@ -8235,6 +8327,12 @@ class Scheduler(
             )
             return "undeferrable"
         if not marked:
+            # rc12y: a store-short read that is marked afresh every pass (the
+            # retry's re-issue clears each mark as LANDED) never reaches the
+            # witness below; the bound counts those fresh marks instead.
+            _fallback = _weg2_store_short_fallback(self, req, reason, span, site)
+            if _fallback is not None:
+                return _fallback
             req.prefetch_deferred = reason
             req.prefetch_defer_attempts = 1
             req.prefetch_defer_passes = 0
@@ -13649,6 +13747,10 @@ class Scheduler(
         """
         rid = str(getattr(req, "rid", "") or "")
         if not rid:
+            return None
+        if getattr(req, "_weg2_store_short_fallback", False):
+            # rc12y: released by the bound (PREFETCH-DEFER-FALLBACK) -- the
+            # short record stays, and must not raise a fresh mark every pass.
             return None
         # #1400: a PP (prefill) group is the PRODUCER of what the store lacks.
         # A read that terminated short of the span it asked for is a PARTIAL
