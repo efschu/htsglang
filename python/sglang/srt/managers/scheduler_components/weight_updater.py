@@ -581,6 +581,11 @@ class SchedulerWeightUpdaterManager:
     #: rank instead of killing the owner alone.  A FIELD for the fourth time in
     #: this class, for the reason the three comments above give.
     weg2_store_rescan_failure: str = ""
+    #: 28.09. (flip regression wake-kv -> dc 0.3 s -> 4.8 s): the wake's store
+    #: rescan walks the whole persistent L3 (700k files, ~6.8 us/file) and ran
+    #: INSIDE the resume RPC. With SGLANG_WEG2_STORE_RESCAN_ASYNC (default on)
+    #: it runs on this thread; the release leg joins it and votes its verdict.
+    weg2_store_rescan_thread: Any = None
     #: C16: this rank's card, resolved once.  ``"unset"`` is distinct from
     #: ``None``, which is the resolved answer "no card key" -- so an
     #: unresolvable card is not re-resolved (and re-logged) on every tag.
@@ -4178,6 +4183,48 @@ class SchedulerWeightUpdaterManager:
         return {"per_tag": merged, "critical_path": critical}
 
     def _weg2_rescan_store_index(self) -> None:
+        """The wake's store rescan, OFF the resume RPC by default (28.09.).
+
+        Measured on the 27B line (WEG2-WAKE-TAIL store_rescan=, flip timeline
+        wake-kv -> dc): 225 ms at 41,869 files (13:00), 1,692 at 262,182,
+        3,826 at 410,733, 4,748 at 700,338 (18:51) -- linear in the persistent
+        L3 store's file count, and every millisecond of it on the flip's
+        critical path, because the RPC answers only after the rescan.
+
+        ``LRUFileEvictor.rescan`` already walks WITHOUT its lock and carries
+        over keys this process reserves during the walk (MUST_FIX 5), so it
+        may run beside the awake group's writes; the sibling group is asleep.
+        The W8b verdict it can record moves from the resume fence to the NEXT
+        leg's fence: :meth:`_weg2_join_store_rescan` joins the thread at the
+        release leg and that fence votes it through the same C15 ok-bit -- one
+        owner's finding still stops every rank, one leg later, and the awake
+        phase in between evicts against the previous (stale) index, the same
+        degradation a skipped rescan already has.
+        ``SGLANG_WEG2_STORE_RESCAN_ASYNC=0`` restores the in-RPC walk.
+        """
+        if str(os.environ.get("SGLANG_WEG2_STORE_RESCAN_ASYNC", "1")).strip() == "0":
+            self._weg2_rescan_store_index_sync()
+            return
+        self._weg2_join_store_rescan("wake (previous rescan)")
+        th = threading.Thread(target=self._weg2_rescan_store_index_sync,
+                              name="weg2-store-rescan", daemon=True)
+        self.weg2_store_rescan_thread = th
+        th.start()
+        logger.info("WEG2-STORE-RESCAN async at wake: walking the L3 store on thread %s, off the "
+                    "resume RPC; its W8b verdict is voted at the next release fence", th.name)
+
+    def _weg2_join_store_rescan(self, where: str) -> None:
+        th = self.weg2_store_rescan_thread
+        if th is None:
+            return
+        t0 = time.perf_counter()
+        th.join()
+        self.weg2_store_rescan_thread = None
+        waited = (time.perf_counter() - t0) * 1000
+        if waited >= 1.0:
+            logger.info("WEG2-STORE-RESCAN joined at %s: waited %.0f ms for the walk", where, waited)
+
+    def _weg2_rescan_store_index_sync(self) -> None:
         """Re-read the L3 store directory into the LRU index at this wake.
 
         #1295: ``HiCacheStorage.rescan_eviction_index`` was written as THE
@@ -9226,13 +9273,23 @@ class SchedulerWeightUpdaterManager:
 
         if weg2_memory_saver_on:
             self._weg2_log_dc_breakdown("release tags=%s" % (list(tags),))  # #1446
+        # 28.09.: the async wake rescan (see _weg2_rescan_store_index) ends
+        # before this group sleeps, and its W8b verdict rides THIS fence's
+        # ok-bit -- read-and-clear, exactly as the resume fence does.
+        self._weg2_join_store_rescan("release")
+        store_failure = self.weg2_store_rescan_failure
+        self.weg2_store_rescan_failure = ""
         report: Dict[str, Any] = {}
         if weg2_memory_saver_on:
             report = self._weg2_group_fence(
                 "release tags=%s" % (list(tags),),
+                ok=not store_failure,
+                failure=store_failure,
                 per_tag=weg2_per_tag,
                 leg_ms=weg2_leg_ms,
             )
+        if store_failure and not report:
+            raise Weg2WakeRefused(store_failure)
 
         # C17: the group's answer carries what the group moved.  ``per_tag``
         # falls back to THIS rank's own numbers when there was no group to
