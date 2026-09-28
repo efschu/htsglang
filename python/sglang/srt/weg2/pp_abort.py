@@ -35,3 +35,33 @@ def countdown_step(delay: int) -> tuple:
     if d <= 0:
         return True, 0
     return False, d - 1
+
+
+def follower_row_verdict(pp_rank: int, row_authority: bool, scheduled_extents, rid: str):
+    """#791C (27B rc12z24 bb84760576, 15:59:23Z, weg2-0-6): under the #631 row
+    authority (Fix B) the xsn324 premise "stage r reads the abort r passes
+    later" is false -- the AbortReq rides the request chain and reached PP0,
+    PP1 and PP2 in the same second, while the stages were 0/1/2 FRAMES behind
+    PP0. The static delays (2/1/0) let PP0 launch two more chunks (193, 194)
+    that PP1 (dropped before 194) and PP2 (dropped before 192) could no longer
+    execute: #791 FORWARDED SCHEDULE UNEXECUTABLE on both followers.
+
+    A follower under row authority therefore takes the abort off PP0's
+    DECISION, the forwarded schedule it received for THIS pass (no new
+    collective, no local count):
+
+      ``None``  -- not this form (PP0, or no row authority): the xsn324
+                   countdown stays the rule.
+      ``False`` -- keep the chunk: the schedule still names ``rid`` (PP0
+                   launched this chunk; its hidden states are on the wire), or
+                   there is no frame this pass (None / {} -- the plan bypass
+                   admits nothing, so keeping it cannot add a request).
+      ``True``  -- apply now: PP0's schedule for this pass names other rids
+                   but not ``rid`` -- PP0 has applied its abort; keeping the
+                   chunk would add a request the decision does not name (the
+                   other #791 refusal)."""
+    if int(pp_rank or 0) <= 0 or not row_authority:
+        return None
+    if not scheduled_extents:
+        return False
+    return str(rid) not in scheduled_extents
