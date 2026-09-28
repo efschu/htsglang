@@ -51,6 +51,28 @@ def _run(rank, port, out, partition):
 
     res["op_ar"] = co.tensor_model_parallel_all_reduce(x.clone()).tolist()
     res["op_ag"] = co.tensor_model_parallel_all_gather(x.clone(), dim=-1).tolist()
+    # F6 step 3: the reversed guard on the REAL groups (coordinator and
+    # ProcessGroup forms): control on model_tp / layer on tp refused.
+    from sglang.srt.rank_role import (
+        COLLECTIVE_CONTROL as C,
+        COLLECTIVE_LAYER as L,
+        FormBCollectiveWrongGroup,
+        guard_collective_subgroup,
+    )
+
+    def _verdict(kind, g):
+        try:
+            guard_collective_subgroup(kind, g, "t")
+            return "ok"
+        except FormBCollectiveWrongGroup:
+            return "refused"
+
+    res["guard"] = {
+        "control_tp": _verdict(C, tp), "control_tp_cpu": _verdict(C, tp.cpu_group),
+        "control_mtp": _verdict(C, mtp), "control_mtp_cpu": _verdict(C, mtp.cpu_group),
+        "layer_mtp": _verdict(L, mtp), "layer_tp": _verdict(L, tp),
+        "layer_tp_dev": _verdict(L, tp.device_group),
+    }
     with open(os.path.join(out, f"{rank}.pkl"), "wb") as f:
         pickle.dump(res, f)
     ps.destroy_model_parallel()
@@ -84,6 +106,12 @@ def test_model_tp_is_the_weight_ranks_and_tp_stays_everyone():
     assert res[0]["op_ar"] == res[1]["op_ar"] == [3.0, 3.0]
     assert res[0]["op_ag"] == res[1]["op_ag"] == [1.0, 1.0, 2.0, 2.0]
     assert res[2]["op_ag"] == [3.0, 3.0]
+    # 3: reversed guard -- control only on tp, layer only on model_tp
+    for r in range(3):
+        g = res[r]["guard"]
+        assert g["control_tp"] == g["control_tp_cpu"] == "ok", (r, g)
+        assert g["control_mtp"] == g["control_mtp_cpu"] == "refused", (r, g)
+        assert g["layer_mtp"] == "ok" and g["layer_tp"] == g["layer_tp_dev"] == "refused", (r, g)
 
 
 def test_without_a_partition_model_tp_is_the_tp_group():
@@ -91,6 +119,7 @@ def test_without_a_partition_model_tp_is_the_tp_group():
     for r in range(3):
         assert res[r]["mtp_is_tp"] is True and res[r]["mtp_sum"] == [6.0, 6.0]
         assert res[r]["op_ar"] == [6.0, 6.0]                   # byte-identical: the TP group
+        assert set(res[r]["guard"].values()) == {"ok"}         # 3: no-op without Form B
 
 
 def test_a_partition_must_cover_every_rank_once():
@@ -105,3 +134,37 @@ def test_a_partition_must_cover_every_rank_once():
     with pytest.raises(ValueError, match="does not cover the world"):
         ps.init_model_tp_group(0, "gloo", 3)
     ps.set_model_tp_partition(None)
+
+
+def test_reversed_guard_arithmetic():
+    """F6 step 3 on rank sets: W={0,1}, K={2}, all=(0,1,2)."""
+    from sglang.srt.rank_role import (
+        COLLECTIVE_CONTROL as C,
+        COLLECTIVE_LAYER as L,
+        FormBCollectiveWrongGroup,
+        FormASeamNotWired,
+        RankRoleError,
+        check_collective_group,
+    )
+
+    allr = (0, 1, 2)
+    for mt in ((0, 1), (2,)):                        # a W rank's and the K rank's view
+        check_collective_group(C, allr, mt, allr, "sched")
+        check_collective_group(L, mt, mt, allr, "o_proj")
+        with pytest.raises(FormBCollectiveWrongGroup, match="model_tp group"):
+            check_collective_group(C, mt, mt, allr, "sched")
+        with pytest.raises(FormBCollectiveWrongGroup, match="ALL-ranks scheduler group"):
+            check_collective_group(L, allr, mt, allr, "o_proj")
+    # a third group (e.g. a stray subgroup) is wrong for both kinds
+    with pytest.raises(FormBCollectiveWrongGroup):
+        check_collective_group(C, (0, 2), (0, 1), allr)
+    with pytest.raises(FormBCollectiveWrongGroup):
+        check_collective_group(L, (0, 2), (0, 1), allr)
+    # classic: no partition, or model_tp == tp -> nothing checked
+    check_collective_group(L, allr, None, allr)
+    check_collective_group(C, (0, 1), allr, allr)
+    check_collective_group(L, allr, allr, allr)
+    with pytest.raises(RankRoleError, match="collective kind"):
+        check_collective_group("sched", allr, None, allr)
+    # its own class: survives F6 being wired
+    assert not issubclass(FormBCollectiveWrongGroup, FormASeamNotWired)

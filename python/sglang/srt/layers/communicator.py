@@ -168,6 +168,21 @@ def _fused_rmsnorm_fp8_per_token_quant(
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
+def _guard_layer_on_tp(name: str) -> None:
+    """F6 step 3 (rank_role.guard_collective_subgroup, reversed): these
+    scatter-mode layer collectives run on get_tp_group(), the ALL-ranks
+    scheduler group. Under Form B that is wrong (the KV-only ranks hold no
+    shard) and refused by name. One module attribute read when no Form B
+    partition is installed."""
+    from sglang.srt.distributed import parallel_state as _ps
+
+    if _ps._MODEL_TP is None:
+        return
+    from sglang.srt.rank_role import COLLECTIVE_LAYER, guard_collective_subgroup
+
+    guard_collective_subgroup(COLLECTIVE_LAYER, get_tp_group(), name)
+
+
 # ---------------------------------------------------------------------------
 # #583: the ALL-REDUCE FUSION ARCH TERM is ONE GROUP-WIDE decision.
 #
@@ -346,6 +361,9 @@ class AttentionInputs:
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
         total_tokens = forward_batch.input_ids.shape[0]
         output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
+        # F6 step 3: a layer collective on the ALL-ranks group -- refused
+        # under Form B (KV-only ranks never issue it); a no-op otherwise.
+        _guard_layer_on_tp("AttentionInputs.tp_all_gather_hidden_states")
         get_tp_group().all_gather_into_tensor(output, hidden_states)
         return output
 
@@ -852,6 +870,7 @@ class LayerCommunicator:
         )
         local_tokens = hidden_states.shape[0] // self._context.tp_size
         output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
+        _guard_layer_on_tp("LayerCommunicator._tp_reduce_scatter")
         get_tp_group().reduce_scatter_tensor(output, hidden_states)
         if residual is not None:
             residual = residual.tensor_split(self._context.tp_size)[

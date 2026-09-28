@@ -2862,6 +2862,14 @@ class Scheduler(
         self.tp_cpu_group = self.tp_group.cpu_group
         self.attn_tp_group = get_parallel().attn_tp_group
         self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
+        # F6 step 3 (reversed guard, NF objection 1): the scheduler's control
+        # groups span ALL ranks under Form B -- never the weight-rank model_tp.
+        from sglang.srt.rank_role import COLLECTIVE_CONTROL, guard_collective_subgroup
+
+        guard_collective_subgroup(COLLECTIVE_CONTROL, self.tp_group, "scheduler.tp_group")
+        guard_collective_subgroup(
+            COLLECTIVE_CONTROL, self.attn_tp_group, "scheduler.attn_tp_group"
+        )
         self.attn_cp_group = get_parallel().attn_cp_group
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()

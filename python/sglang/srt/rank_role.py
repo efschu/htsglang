@@ -49,6 +49,10 @@ __all__ = [
     "guard_draft_worker",
     "guard_dense_weights",
     "guard_collective_subgroup",
+    "check_collective_group",
+    "FormBCollectiveWrongGroup",
+    "COLLECTIVE_CONTROL",
+    "COLLECTIVE_LAYER",
     "guard_graph_mode",
     "FormAWorkerDenseGraph",
     "GRAPH_BODY_MOE_ROUTE",
@@ -880,12 +884,108 @@ def guard_draft_worker(plan: RankRolePlan, rank: int) -> None:
         )
 
 
-def guard_collective_subgroup(plan: RankRolePlan, name: str) -> None:
-    """Called where a collective must span only the dense ranks (F6)."""
-    require_wired(
-        "F6",
-        f"collective {name!r} would have to run over the host alone, but "
-        "the transport has no subgroup.",
+#: F6 step 3 (FORM-B-F6-ENTWURF-0928.md v2 §5, NF objection 1): the two kinds
+#: of collective the reversed guard tells apart. A CLOSED vocabulary, same rule
+#: as GRAPH_BODIES: a caller that invents a third spelling is refused.
+COLLECTIVE_CONTROL = "control"  # scheduler / cache: request + host exchange,
+#                                 prefetch/claim votes, tp_match_floor MINs
+COLLECTIVE_LAYER = "layer"      # the model's linear/vocab collectives
+COLLECTIVE_KINDS: Tuple[str, ...] = (COLLECTIVE_CONTROL, COLLECTIVE_LAYER)
+
+
+class FormBCollectiveWrongGroup(RankRoleError):
+    """A Form B collective was handed the wrong communicator. Its own class,
+    not a seam-not-wired: the refusal IS the feature and survives F6 being
+    wired (same reasoning as FormAZeroWidthLinear)."""
+
+
+def check_collective_group(
+    kind: str,
+    group_ranks: Sequence[int],
+    model_tp_ranks: Optional[Sequence[int]],
+    all_ranks: Sequence[int],
+    name: str = "",
+) -> None:
+    """The reversed F6 guard, as arithmetic over rank sets (testable without
+    a process group).
+
+    Under Form B there are two TP communicators and they must never be
+    confused (draft v2 §2):
+
+    * ``tp`` -- ALL ranks. The scheduler and the cache controller live here:
+      a KV-only rank must see every request, every prefetch/claim vote and
+      every tp_match_floor MIN, or it falls out of the lockstep.
+    * ``model_tp`` -- the weight ranks W (a KV-only rank alone). Only the
+      model's linear/vocab collectives live here: a KV-only rank holds no
+      shard and never enters them.
+
+    A CONTROL collective on ``model_tp`` leaves the KV-only ranks out (they
+    block on the next control op forever); a LAYER collective on ``tp`` makes
+    W wait for ranks that never issue it -- both are hangs, not errors, so
+    both are refused here by name. ``model_tp_ranks=None`` (no Form B
+    partition installed) and ``model_tp == tp`` are the classic path: nothing
+    is checked.
+    """
+    if kind not in COLLECTIVE_KINDS:
+        raise RankRoleError(
+            f"{kind!r} is not a collective kind; known: {list(COLLECTIVE_KINDS)}."
+        )
+    if model_tp_ranks is None:
+        return
+    mt, allr, g = tuple(model_tp_ranks), tuple(all_ranks), tuple(group_ranks)
+    if mt == allr:
+        return
+    if kind == COLLECTIVE_CONTROL and g != allr:
+        raise FormBCollectiveWrongGroup(
+            f"Form B: the control collective {name!r} (scheduler / cache) was "
+            f"handed the group {list(g)}, but control traffic spans ALL ranks "
+            f"{list(allr)} (get_tp_group()). "
+            + ("That is this rank's model_tp group -- the weight ranks only; "
+               if g == mt else "")
+            + "a KV-only rank left out of it blocks on the next control op."
+        )
+    if kind == COLLECTIVE_LAYER and g != mt:
+        raise FormBCollectiveWrongGroup(
+            f"Form B: the layer collective {name!r} was handed the group "
+            f"{list(g)}, but the model's linear/vocab collectives run on "
+            f"model_tp {list(mt)} (get_model_tp_group()). "
+            + ("That is the ALL-ranks scheduler group; " if g == allr else "")
+            + "the KV-only ranks hold no shard and never issue it -- the "
+            "weight ranks would wait for them forever."
+        )
+
+
+def _group_ranks(group) -> Tuple[int, ...]:
+    ranks = getattr(group, "ranks", None)
+    if ranks is not None:
+        return tuple(ranks)
+    import torch.distributed as dist
+
+    return tuple(dist.get_process_group_ranks(group))
+
+
+def guard_collective_subgroup(kind: str, group, name: str = "") -> None:
+    """F6 step 3, the REVERSED guard (draft v2 §5, NF objection 1).
+
+    Called where a collective picks its communicator: raises
+    :class:`FormBCollectiveWrongGroup` if a scheduler/cache collective
+    (``kind=COLLECTIVE_CONTROL``) gets the weight-rank group ``model_tp``, or
+    a layer collective (``kind=COLLECTIVE_LAYER``) gets the all-ranks group
+    ``tp``. ``group`` is a GroupCoordinator or a torch ProcessGroup.
+
+    On every boot without a Form B partition this is one module attribute
+    read and a return -- the classic path is untouched.
+    """
+    from sglang.srt.distributed import parallel_state as ps
+
+    mt = ps._MODEL_TP
+    if mt is None:
+        if kind not in COLLECTIVE_KINDS:
+            check_collective_group(kind, (), None, ())
+        return
+    check_collective_group(
+        kind, _group_ranks(group), tuple(mt.ranks), tuple(ps.get_tp_group().ranks),
+        name,
     )
 
 

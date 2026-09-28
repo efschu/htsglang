@@ -344,10 +344,17 @@ def test_a_zero_width_linear_is_only_guarded_when_it_is_actually_zero():
 
 
 def test_subgroup_and_dcp_merge_guards_name_their_seams():
-    with pytest.raises(FormASeamNotWired, match="F6"):
-        guard_collective_subgroup(FORM_A, "dense_all_reduce")
-    with pytest.raises(FormASeamNotWired, match="F5"):
-        guard_dcp_merge(FORM_A, 0)
+    # F6 step 3 (28.09.): guard_collective_subgroup is the REVERSED Form B
+    # guard now (control vs layer group); without a model_tp partition it is
+    # a no-op, and an unknown kind is refused by name.
+    from sglang.srt.rank_role import COLLECTIVE_CONTROL, COLLECTIVE_LAYER, RankRoleError
+
+    guard_collective_subgroup(COLLECTIVE_CONTROL, None, "scheduler")
+    guard_collective_subgroup(COLLECTIVE_LAYER, None, "o_proj")
+    with pytest.raises(RankRoleError, match="collective kind"):
+        guard_collective_subgroup("dense", None, "dense_all_reduce")
+    # F5 is wired: the DCP merge guard no longer refuses
+    guard_dcp_merge(FORM_A, 0)
 
 
 def test_form_a_plan_shares_one_definition_of_the_host_with_the_role_vector():
