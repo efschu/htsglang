@@ -437,7 +437,7 @@ SEAMS: Dict[str, Seam] = {
             "managers/cache_controller.py:1499 (weighted uneven-DCP owner mode "
             "refuses page_size != 1 -- every rank of a D group with the cut and "
             "the Weg2 --hicache-canonical-kv-page file tier dies at attach), "
-            "mem_cache/hicache_storage.py:3850 FormAWorkerNullStorage (a worker "
+            "mem_cache/hicache_storage.py:3875 FormAWorkerNullStorage (a worker "
             "claims every page and writes none -- with real rows that is a "
             "silent wrong-KV read after an L2 eviction); weg2/tail_adopt.py, "
             "weg2/tail_handoff.py, the #988/H105 park loadback (host-only)",
@@ -451,7 +451,7 @@ SEAMS: Dict[str, Seam] = {
             anchors=(
                 ("managers/cache_controller.py", 1499,
                  "Weighted uneven-DCP HiCache storage requires page_size == 1"),
-                ("mem_cache/hicache_storage.py", 3850,
+                ("mem_cache/hicache_storage.py", 3875,
                  "class FormAWorkerNullStorage"),
             ),
         ),
