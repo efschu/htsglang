@@ -624,6 +624,17 @@ class Envs:
     # False = the 50 ms poll and the unconditional want, byte-identical.
     SGLANG_WEG2_QUIESCE_FAST = EnvBool(False)
     SGLANG_WEG2_QUIESCE_FAST_POLL_MS = EnvInt(10)
+    # IDLE_VOTE_NO_REWANT (27B rc12z21 park boot dkr27bparkdraftbar1w109281421,
+    # flip epoch=5 14:28:08-14:29:38): the H111 guard ALONE, without the fast
+    # poll. 27B profiles never set QUIESCE_FAST, so every poll (50 ms) that
+    # found PP0's lap on the ring wanted a new one; the harvest pass stamped
+    # it, and every landed lap read "#1268 IDLE-ROUND stale ... round id
+    # mismatch" -- 293 laps dropped, the lap (~300 ms, the followers flushing
+    # on every forwarded poll) never faster than the poll, W3 at the quiesce
+    # deadline. A poll that finds its lap still on the ring does not want
+    # another; the landed lap answers the next poll. ON by default (it only
+    # removes a want that can never be read fresh); False = the pre-fix want.
+    SGLANG_WEG2_IDLE_VOTE_NO_REWANT = EnvBool(True)
     # DEPOSIT_LANE_LOOKAHEAD (fnFL2 H111b, Legs): the sleeper's pair lanes
     # (cross-card, BAR1 or host) leave the per-tag lockstep -- each runs in
     # its own worker over the tag order, at most DEPOSIT_LANE_AHEAD tag(s)

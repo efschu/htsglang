@@ -111,7 +111,8 @@ class PendingDuringLap(_PCase):
         self.assertFalse(H.poll(g), "lap still on the ring: pending")
 
     def test_off_poll_during_lap_still_wants_byte_identical(self):
-        with envs.SGLANG_WEG2_QUIESCE_FAST.override(False):
+        with envs.SGLANG_WEG2_QUIESCE_FAST.override(False), \
+                envs.SGLANG_WEG2_IDLE_VOTE_NO_REWANT.override(False):
             self._poll_during_lap()
             self.assertTrue(
                 self.g.ranks[0]._weg2_vote_wanted,
@@ -149,7 +150,8 @@ class FastPollAgainstSlowLap(_PCase):
     CYCLES = 6
 
     def test_off_fast_polls_drop_every_lap(self):
-        with envs.SGLANG_WEG2_QUIESCE_FAST.override(False):
+        with envs.SGLANG_WEG2_QUIESCE_FAST.override(False), \
+                envs.SGLANG_WEG2_IDLE_VOTE_NO_REWANT.override(False):
             with self.assertLogs(H.VOTE_LOGGER, level="INFO") as logs:
                 answers = []
                 for _ in range(self.CYCLES):
@@ -171,6 +173,36 @@ class FastPollAgainstSlowLap(_PCase):
                 "on: no lap may be dropped as stale",
             )
             self.assertEqual(self.g.resets.n, 1, "exactly one group flush")
+
+    def test_27b_default_slow_poll_no_rewant_reaches_200(self):
+        """27B rc12z21 park boot (dkr27bparkdraftbar1w109281421, flip epoch=5):
+        QUIESCE_FAST unset (the 50 ms poll), a lap slower than the poll. With
+        the NO_REWANT default the landed lap answers the next poll; before,
+        every lap came home stale (293 dropped) and the quiesce ran into W3."""
+        with envs.SGLANG_WEG2_QUIESCE_FAST.override(False):
+            self.assertTrue(envs.SGLANG_WEG2_IDLE_VOTE_NO_REWANT.get(),
+                            "the guard must be on by default")
+            with self.assertLogs(H.VOTE_LOGGER, level="INFO") as logs:
+                first = self.fast_cycle()
+                self.assertEqual(first, (False, False))
+                ok = H.poll(self.g)
+            self.assertTrue(ok, "the landed lap must answer the next poll")
+            self.assertFalse([m for m in logs.output if "#1268 IDLE-ROUND stale" in m])
+            self.assertEqual(self.g.resets.n, 1, "exactly one group flush")
+
+    def test_27b_default_many_polls_during_one_lap_still_one_lap(self):
+        with envs.SGLANG_WEG2_QUIESCE_FAST.override(False):
+            g = self.g
+            self.assertFalse(H.poll(g))
+            self.pass_pp0()
+            ep = g.ranks[0]._weg2_vote_outstanding
+            for _ in range(6):   # six 50 ms polls during one ~300 ms lap
+                self.assertFalse(H.poll(g))
+                self.assertFalse(g.ranks[0]._weg2_vote_wanted)
+            self.lap_home()
+            self.pass_pp0()
+            self.assertEqual(int(g.ranks[0]._weg2_vote_epoch), int(ep), "no second lap was stamped")
+            self.assertTrue(H.poll(g))
 
     def test_on_busy_rank_still_blocks(self):
         """Faster is not looser: a follower with an in-flight write-through
