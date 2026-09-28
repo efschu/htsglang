@@ -11737,6 +11737,7 @@ class Scheduler(
             # set, are enumerated in `prefill_blocked_here`'s docstring rather
             # than papered over here.
             new_batch = None
+            self._admission_decline_note = "gate=phase_prefill_blocked"  # BA: named, not stale
         elif (
             self.congruent_prefill_lane is not None
             and not self.congruent_prefill_lane.allow_prefill(
@@ -11755,6 +11756,7 @@ class Scheduler(
             # argument the spill tick makes; a rank-local input here would
             # split the ranks across mismatched collective counts.
             new_batch = None
+            self._admission_decline_note = "gate=congruent_lane_cadence"  # BA
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
@@ -12997,7 +12999,16 @@ class Scheduler(
         # is group-agreed; absent a mark the read is simply still in flight.
         _defer_reason = getattr(req, "prefetch_deferred", None) or "prefetch_pending"
         if verdict == tp_head_congruence.X_DEFER:
-            if n <= 5 or n % 200 == 0:
+            # BA (28.09.): the global count hid every rid after the fifth pass --
+            # NF 14:56:27-31 showed weg2-4-11 only while weg2-10-16/11-18 waited
+            # unnamed. The first defer of each rid speaks too.
+            _first = not getattr(req, "_weg2_x_defer_said", False)
+            if _first:
+                try:
+                    req._weg2_x_defer_said = True
+                except Exception:  # noqa: BLE001
+                    pass
+            if n <= 5 or n % 200 == 0 or _first:
                 logger.info(
                     "WEG2 X-DEFER rid=%s reason=%s age_s=%.2f "
                     "bound_s=%.2f replicated_term=group verdict=defer "
@@ -20296,13 +20307,16 @@ class Scheduler(
         logger.info(
             "WEG2-POST-WAKE-PASS n=%d mode=%s bs=%d gap_ms=%.0f schedule_ms=%.0f run_ms=%.0f "
             "prefetch_ms=%.0f proc_input_ms=%.0f admission_ms=%.0f init_new_ms=%.0f prepare_ms=%.0f ready_ms=%.0f "
-            "addreq=[%s] init_load_back_ms=%.0f/%d init_next_round=[%s] "
+            "addreq=[%s] init_load_back_ms=%.0f/%d init_next_round=[%s] waiting=%d admit=%s "
             "(gap = wall since the previous pass; schedule = get_next_batch_to_run incl. the three "
-            "prefill terms; run is the launch, the forward itself overlaps)",
+            "prefill terms; run is the launch, the forward itself overlaps; admit = the admission's "
+            "own gate / skip census of this pass, BA 28.09.)",
             n, mode, bs, ((now - prev) * 1000.0) if prev is not None else -1.0,
             _pt_read(self, "_1466_schedule_ms"), _pt_read(self, "_1466_run_ms"),
             _pt_read(self, "_1474_prefetch_ms"), _pt_read(self, "_1475_process_input_ms"),
             _g[0], _g[1], _g[2], float(getattr(self, '_weg2_ready_ms', -1.0) or -1.0), _addreq, _lb_ms, _lb_n, _initr,
+            len(getattr(self, "waiting_queue", None) or ()),
+            str(getattr(self, "_admission_decline_note", None) or "-")[:240],
         )
 
     def _weg2_arm_wake_round_census(self) -> None:

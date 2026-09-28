@@ -119,3 +119,36 @@ def test_the_settle_tick_stamps_what_the_group_releases():
     h.weg2_post_wake_settle = [a, b]
     assert h._weg2_post_wake_settle_tick() == 1
     assert a._weg2_settled_wake == 7 and not hasattr(b, "_weg2_settled_wake")
+
+
+# --- BA (28.09.): why nothing was admitted beside the decode 14:56:27-31 ------
+
+
+def test_post_wake_pass_line_names_the_admission_census():
+    import inspect
+
+    src = inspect.getsource(sched_mod.Scheduler._weg2_post_wake_pass_log)
+    assert "waiting=%d admit=%s" in src
+    assert '"_admission_decline_note", None) or "-")[:240]' in src
+    nb = inspect.getsource(sched_mod.Scheduler.get_next_batch_to_run)
+    assert 'self._admission_decline_note = "gate=phase_prefill_blocked"' in nb
+    assert 'self._admission_decline_note = "gate=congruent_lane_cadence"' in nb
+
+
+def test_x_defer_speaks_the_first_defer_of_every_rid(caplog, monkeypatch):
+    from sglang.srt.managers import tp_head_congruence as thc
+
+    h = types.SimpleNamespace(_weg2_x_defer_passes=500)   # past the global n <= 5
+    h._weg2_local_store_read_pending_ms = lambda req: 2000
+    h._weg2_x_store_read_bound_s = lambda req: 60.0
+    monkeypatch.setattr(thc, "group_store_read_pending_ms", lambda hi, rid: 1500)
+    monkeypatch.setattr(thc, "x_completion_verdict", lambda ms, b: thc.X_DEFER)
+    xd = types.MethodType(sched_mod.Scheduler._weg2_x_defers, h)
+    reqs = [types.SimpleNamespace(rid=r, prefetch_deferred=None) for r in ("weg2-10-16", "weg2-11-18")]
+    with caplog.at_level(logging.INFO, logger=sched_mod.logger.name):
+        for _ in range(3):
+            for r in reqs:
+                assert xd(r) is True
+    lines = [x.getMessage() for x in caplog.records if "WEG2 X-DEFER" in x.getMessage()]
+    assert len(lines) == 2          # one per rid, the repeats stay under the global cap
+    assert "weg2-10-16" in lines[0] and "weg2-11-18" in lines[1]
