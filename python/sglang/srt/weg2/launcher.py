@@ -12663,6 +12663,19 @@ def d_overhead_calibration(
         if sorted(kv) != list(range(n)):
             skipped += 1
             continue
+        # 28.09. (VRAM loop, P1b): an expert-offload D (--rank-moe-resident-fraction,
+        # the NF Form A) is NOT priced by this row planner -- PerfCostModel books
+        # every expert resident (TP0 ~164 GiB at ratio 1,0,0) and the KV-less
+        # Form A workers report cell 0, so no overhead can come out of it. Its
+        # budget is the MEASURED-D budget line + FRACTION-SOLVE D (H8), which
+        # already read this model's own records. Named, not a cell mismatch.
+        if "--rank-moe-resident-fraction" in fm:
+            return None, (
+                f"{os.path.basename(d_log)}: expert-offload D (--rank-moe-resident-fraction "
+                f"{fm['--rank-moe-resident-fraction']}, --rank-tp-ratio "
+                f"{fm.get('--rank-tp-ratio', 'auto')}) -- this row planner prices every expert "
+                f"resident, so it does not apply; D's budget comes from the MEASURED-D budget "
+                f"line and FRACTION-SOLVE D (this model's records D_FIXED_MIB/D_ACTIVATION_MIB)")
         ratio = fm.get("--rank-tp-ratio", "auto")
         if ratio == "auto":
             weights = list(_gcd_reduce(budgets))
