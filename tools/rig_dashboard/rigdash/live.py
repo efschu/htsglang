@@ -912,6 +912,15 @@ class Boot:
                 return {"bs": e["bs"], "t": e.get("t_exact") or e["t"]}
         return None
 
+    def _round_ms_by_bs(self, g: str) -> dict:
+        """Median gpu-ms of rank 0's 'Decode rank batch' rounds per bs over the kept history
+        (the per-bs decode matrix cell of the running boot; depth and text kind are mixed)."""
+        per = collections.defaultdict(list)
+        for e in self.ev["%s_decode_rank" % g]:
+            if e.get("rank", 0) == 0 and e.get("bs") and e.get("gpu_ms"):
+                per[e["bs"]].append(e["gpu_ms"])
+        return {str(bs): {"median_ms": round(sorted(v)[len(v) // 2], 1), "n": len(v)} for bs, v in sorted(per.items())}
+
     def _decode_view(self, g: str, now: float) -> dict:
         rows = [e for e in self.ev["%s_decode_batch" % g] if e["t"] >= now - WINDOW_S]
         rr = [e for e in self.ev["%s_decode_rank" % g]
@@ -939,6 +948,8 @@ class Boot:
             "round_bs": self._round_bs(g),
             "seats": self.last.get("%s_d_seats" % g),
             "max_running": (self.last.get("%s_sched_cap" % g) or {}).get("max_running"),
+            "max_total_tokens": (self.last.get("%s_sched_cap" % g) or {}).get("max_total_tokens"),
+            "round_ms_by_bs": self._round_ms_by_bs(g),
             "accept_len": last.get("accept_len") if last else None,
             "accept_rate": last.get("accept_rate") if last else None,
             "full_use": last.get("full_use") if last else None,

@@ -53,3 +53,36 @@ Regeln: Gewinne strikt je Modell — bei `modell=beide` trägt jeder Gewinn `--m
 (sonst verweigert das CLI). Schalter: `NAME=art:gruppe:an_wert:default`, `art` env|flag,
 `gruppe` P|D|beide|front|launcher (front/launcher: nicht im Gruppen-Schnappschuss, rigdash
 liest das Profil), `default` an|aus. 27B trägt seine Zeilen selbst ein.
+
+## Features Soll/Ist (Nutzer-Rüge 29.09.: „Bugfixes sind keine Features“)
+
+Oben die **Produkt-Features** F1–F24 (`features.json` → `produkt`), darunter die Commits/Fixes
+als **Bausteine** (`features`, Karte oben). Je Produkt-Feature: `id, nr, titel, soll`
+(ein messbarer Satz), `ist.{27B,NF}` = `{status, wert, grund, beleg, belegt_am, quelle}`,
+`bausteine` (ids aus `features`), optional `kreuztabelle` (F2), `untertabelle` (F12 Formate,
+F23 Prompt-Längen), `matrix` (F24 Form × bs × Tiefe × Text), `marker` (Instrument je Format).
+
+* **Ist nur mit Beleg**, sonst `unbelegt`. Jeder Sitz schreibt nur seine Spalte: NF die NF-,
+  der 27B-Sitz die 27B-Zellen (`import-27b` liest `features_27b_ist_0929.md`, Quelle je Zeile).
+* **zuletzt belegt** (`belegt_am`, ISO): ist der Beleg älter als der Start des letzten Boots
+  dieses Modells, zeigt das Dashboard die Zelle gelb „Ist veraltet, neu messen“ (27B/Nutzer
+  29.09.: neue Erkenntnisse fallen nicht hinten runter). `produkt-ist` ohne `--belegt-am` = jetzt.
+* **Matrix-Zellen** sind nur Messungen (`wert` oder `ungültig` = EOS unter 500 Token);
+  eine fehlende Zelle ist „ungemessen“, nie interpoliert. Werte ohne Tiefe (Agentenlast)
+  stehen als Randwert `gemischt`.
+* **Wert im aktuellen Boot** rechnet rigdash selbst (live.py/state.json/Profil) und zeigt
+  das Instrument dazu; wo keins existiert, steht der fehlende Marker da (`MISSING` in
+  features.py). Je Format: NF INT4/NVFP4, 27B INT8/NVFP4/W4A8 (W4A8 = 3080-Rang eines
+  NVFP4-Boots). Das Format kommt aus `PROFILE_FORMAT` des Profils (inkl. `source`-Basis).
+* Ein neuer Baustein ohne Produkt-Feature ist nur ein Hinweis, kein Schreibverbot;
+  `set --produkt F8` hängt ihn im selben Schritt an.
+
+```bash
+python3 $U produkt-ist --id F1 --modell NF --status fertig+aktiv --wert "…" --beleg "Boot …" [--belegt-am 2026-09-29T06:00Z]
+python3 $U kreuz --modell NF --a kvonly --b dcp --status "nur Desk" --note "F15"
+python3 $U matrix --id F24 --modell NF --form "Form A" --bs 1 --tiefe kurz --text code --wert "131,9 tok/s" --boot x177 --beleg "…" [--ungueltig]
+python3 $U zeile-ist --id F23 --zeile 97k --modell NF --status fertig+aktiv --wert "24,18 s" --beleg x175
+python3 $U import-27b [--md /spinning/gpu-arb/docs/features_27b_ist_0929.md]
+python3 $U boot-override --boot <boot_id> --lifecycle "stopped (geplant)" --beleg "…"   # state.json bleibt unberührt
+python3 $U md --out /spinning/gpu-arb/docs/FEATURES-SOLL-IST-0929.md   # Tabelle als Markdown, Werte vom laufenden rigdash
+```

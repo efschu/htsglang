@@ -169,6 +169,21 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
 tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
 .gain { white-space: nowrap; } .gain .art { font-size: 11px; color: var(--muted); }
 .imgseat + .imgseat { margin-top: 14px; }
+.prod td { vertical-align: top; font-size: 12.5px; }
+.prod td.soll, .prod td.ist { max-width: 260px; }
+.prod td.bel { max-width: 300px; color: var(--text-2); font-size: 11.5px; overflow-wrap: anywhere; }
+.prod td.akt { max-width: 280px; font-size: 11.5px; }
+.prod .stale, .stale-key { background: color-mix(in srgb, var(--warn) 22%, transparent); }
+.prod .stale-note { color: var(--warn); font-weight: 650; font-size: 11px; }
+.prod .am { color: var(--muted); font-size: 10.5px; }
+.pill.p-fertig-aktiv { color: var(--good); } .pill.p-im-image-aber-aus { color: var(--warn); } .pill.p-desk { color: var(--bar); }
+.pill.p-offen { color: var(--bad); } .pill.p-unbelegt, .pill.p-entfaellt { color: var(--muted); }
+.kz td, .mx td { font-size: 11.5px; text-align: center; }
+.kz td:first-child, .mx td:first-child, .mx td:nth-child(2) { text-align: left; }
+.kz .k-metall { color: var(--good); } .kz .k-unterst { color: var(--bar); } .kz .k-desk { color: var(--warn); }
+.kz .k-nein { color: var(--bad); } .kz .k-unbelegt { color: var(--muted); }
+.mx .m-ung { color: var(--bad); font-style: italic; } .mx .m-leer { color: var(--muted); }
+.prod details > summary { cursor: pointer; font-size: 11.5px; color: var(--text-2); }
 .imgseat td.ev { color: var(--text-2); font-size: 12px; max-width: 460px; overflow-wrap: anywhere; }
 .note { font-size: 12px; color: var(--text-2); max-width: 900px; }
 .note b { color: var(--text); }
@@ -205,8 +220,12 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
   <div class="chips" id="chips"></div>
   <div class="cardstrip" id="cardstrip"></div>
   <div id="boots"></div>
+  <section class="card" id="prod-card">
+    <h2>Features Soll/Ist <span class="muted">Produkt-Features je Modell: Soll (messbar) &middot; Ist nur mit Beleg, sonst &bdquo;unbelegt&ldquo; &middot; <span class="stale-key">gelb</span> = Beleg &auml;lter als der letzte Boot des Modells, neu messen &middot; Wert im aktuellen Boot aus live.py/state.json &middot; Bausteine = Commits/Fixes darunter</span></h2>
+    <div id="prod"></div>
+  </section>
   <section class="card" id="feat-card">
-    <h2>Features <span class="muted">je Modell: fertig &middot; im Image (git-Vorfahr / patch-id / Betreff gegen die Image-REV, hier gerechnet) &middot; aktiv (state.json launch, sonst Profil) &middot; Gewinn &middot; Begr&uuml;ndung wenn aus</span>
+    <h2>Bausteine <span class="muted">Commits/Fixes je Modell: je Modell: fertig &middot; im Image (git-Vorfahr / patch-id / Betreff gegen die Image-REV, hier gerechnet) &middot; aktiv (state.json launch, sonst Profil) &middot; Gewinn &middot; Begr&uuml;ndung wenn aus</span>
       <label class="muted" style="font-size:12px;float:right"><input type="checkbox" id="feat-only-off"> nur &bdquo;im Image, aber aus&ldquo;</label></h2>
     <div id="feat"></div>
   </section>
@@ -762,6 +781,107 @@ function featGainHtml(g) {
   if (!g.length) return `<span class="muted">&mdash;</span>`;
   return g.map((x) => `<div class="gain" title="${esc((x.quelle || "") + (x.boot ? " \u00b7 " + x.boot : ""))}">${esc(x.metrik)}: ${esc(x.vorher != null ? x.vorher + " \u2192 " : "")}<b>${esc(x.nachher)}</b> ${esc(x.einheit || "")} <span class="art">${esc(x.art)}</span></div>`).join("");
 }
+// Produkt-Features Soll/Ist (Nutzer 29.09.: "Bugfixes sind keine Features") -- Commits nur als Bausteine darunter
+const PROD_MODELS = ["27B", "NF"];
+function prodSlug(st) { return String(st || "unbelegt").toLowerCase().replace("fertig+aktiv", "fertig-aktiv").replace(/ä/g, "ae").replace(/[^a-z0-9]+/g, "-"); }
+function prodIst(x) {
+  const v = x.wert ? esc(x.wert) : `<span class="muted">${x.status === "unbelegt" || !x.status ? "unbelegt" : "&mdash;"}</span>`;
+  const am = x.belegt_am ? `<div class="am">belegt ${esc(x.belegt_am)}</div>` : "";
+  return x.veraltet ? `<div class="stale">${v}<div class="stale-note">Ist veraltet, neu messen</div>${am}</div>` : v + am;
+}
+function prodAkt(a) {
+  if (!a) return `<span class="muted">&mdash;</span>`;
+  let t = a.wert ? `<span title="${esc(a.instrument || "")}">${esc(a.wert)}</span>`
+    : a.kein_instrument ? `<span class="muted">kein Instrument: ${esc(a.kein_instrument)}</span>` : `<span class="muted">${esc(a.leer || "")}</span>`;
+  const jf = a.je_format || {};
+  const run = Object.keys(jf).filter((f) => jf[f] === "dieser Boot");
+  const rest = Object.keys(jf).filter((f) => !run.includes(f));
+  if (run.length) t += `<div class="am">Format ${esc(run.join("/"))}${rest.length ? " &middot; " + esc(rest.join("/")) + ": kein Boot" : ""}</div>`;
+  return t;
+}
+function prodKreuz(p, achsen) {
+  const kt = p.kreuztabelle;
+  if (!kt) return "";
+  const cls = { "am Metall belegt": "k-metall", "unterstützt": "k-unterst", "nur Desk": "k-desk", "nein": "k-nein", "unbelegt": "k-unbelegt" };
+  const key = (a, b) => {
+    const i = achsen.findIndex((x) => x.key === a), j = achsen.findIndex((x) => x.key === b);
+    return i <= j ? a + "+" + b : b + "+" + a;
+  };
+  return PROD_MODELS.map((m) => {
+    const c = (kt.zellen || {})[m] || {};
+    return `<div style="margin-top:6px"><b>${m}</b><div class="tablewrap"><table class="kz"><tr><th></th>${achsen.map((x) => `<th>${esc(x.name)}</th>`).join("")}</tr>`
+      + achsen.map((a, i) => `<tr><td><b>${esc(a.name)}</b></td>` + achsen.map((b, j) => {
+        if (j < i) return "<td></td>";
+        const z = c[key(a.key, b.key)] || { status: "unbelegt" };
+        return `<td class="${cls[z.status] || ""}" title="${esc(z.note || "")}">${esc(z.status)}${z.note ? " *" : ""}</td>`;
+      }).join("") + "</tr>").join("") + "</table></div></div>";
+  }).join("");
+}
+function prodUnter(p) {
+  const ut = p.untertabelle;
+  if (!ut || !(ut.zeilen || []).length) return "";
+  const cell = (x) => !x ? `<span class="muted">&mdash;</span>`
+    : (x.status ? `<span class="pill p-${prodSlug(x.status)}">${esc(x.status)}</span> ` : "") + prodIst(x) + (x.beleg ? `<div class="am">${esc(x.beleg)}</div>` : "");
+  return `<div class="tablewrap"><table><tr><th>${esc(ut.spalte || "Zeile")}</th><th>Soll</th><th>Ist 27B</th><th>Ist NF</th><th>im aktuellen Boot</th></tr>`
+    + ut.zeilen.map((z) => `<tr><td><b>${esc(z.name)}</b></td><td>${esc(z.soll || "")}</td><td>${cell((z.ist || {})["27B"])}</td><td>${cell((z.ist || {}).NF)}</td>
+      <td class="am">${Object.entries(z.aktuell || {}).map(([m, v]) => esc(m + ": " + v)).join("<br>")}</td></tr>`).join("") + "</table></div>";
+}
+const MX_TIEFE = ["kurz", "2k", "10k", "32k", "97k", "257k", "gemischt"], MX_TEXT = ["code", "prosa", "thinking", "gemischt"];
+const MX_BS = ["1", "2", "3", "4", "5", "6"];
+function prodMatrix(p) {
+  const mx = p.matrix;
+  if (!mx) return "";
+  return PROD_MODELS.map((m) => {
+    const c = (mx.zellen || {})[m] || {};
+    const forms = [...new Set(Object.keys(c).map((k) => k.split("|")[0]))];
+    if (!forms.length) return `<div style="margin-top:6px"><b>${m}</b> <span class="muted">alle Zellen ungemessen</span></div>`;
+    return `<div style="margin-top:6px"><b>${m}</b>` + forms.map((f) => {
+      const rows = [];
+      MX_TIEFE.forEach((t) => MX_TEXT.forEach((x) => { if (MX_BS.some((b) => c[[f, b, t, x].join("|")])) rows.push([t, x]); }));
+      return `<div class="muted" style="margin-top:4px">${esc(f)} &middot; &uuml;brige Tiefe/Text-Zeilen ungemessen</div><div class="tablewrap"><table class="mx"><tr><th>Tiefe</th><th>Text</th>${MX_BS.map((b) => `<th>bs${b}</th>`).join("")}</tr>`
+        + rows.map(([t, x]) => `<tr><td>${t}</td><td>${x}</td>` + MX_BS.map((b) => {
+          const z = c[[f, b, t, x].join("|")];
+          if (!z) return `<td class="m-leer">ungemessen</td>`;
+          const tip = esc([z.boot, z.beleg, z.quelle].filter(Boolean).join(" · "));
+          return z.status === "ungültig" ? `<td class="m-ung" title="${tip}">ung&uuml;ltig</td>` : `<td title="${tip}">${esc(z.wert)}</td>`;
+        }).join("") + "</tr>").join("") + "</table></div>";
+    }).join("") + "</div>";
+  }).join("");
+}
+function prodBausteine(p) {
+  const bs = p.bausteine || [];
+  if (!bs.length) return `<span class="muted">&mdash;</span>`;
+  return `<details id="pb-${esc(p.id)}"><summary>${bs.length} Baustein${bs.length === 1 ? "" : "e"}</summary>`
+    + bs.map((b) => `<div style="margin-top:4px"><b class="mono">${esc(b.id)}</b> ${esc(b.titel || "")}`
+      + Object.entries(b.je_modell || {}).map(([m, r]) => `<div class="am">${m}: ${r.fertig ? "fertig" : "nicht fertig"} &middot; im Image ${esc((r.im_image || {}).state)} &middot; aktiv ${esc(r.aktiv)}${r.image_aber_aus && r.aus_begruendung ? " &middot; aus: " + esc(r.aus_begruendung) : ""}</div>`).join("")
+      + `</div>`).join("") + `</details>`;
+}
+function prodHtml(d) {
+  const fv = d.features;
+  if (!fv || !(fv.produkt || []).length) return `<div class="muted">keine Produkt-Features in features.json</div>`;
+  const achsen = fv.kreuz_achsen || [];
+  const nStale = fv.produkt.reduce((n, p) => n + PROD_MODELS.filter((m) => (p.ist[m] || {}).veraltet).length, 0);
+  return `<div class="muted" style="margin:-4px 0 8px">${fv.produkt.length} Features &middot; ${nStale} Ist-Zellen veraltet (Beleg &auml;lter als der letzte Boot)</div><div class="tablewrap"><table class="prod">
+    <tr><th>#</th><th>Feature</th><th>Soll</th><th>Ist 27B</th><th>Ist NF</th><th>Status</th><th>Beleg</th><th>Wert im aktuellen Boot</th><th>Bausteine</th></tr>`
+    + fv.produkt.map((p) => {
+      const ist = p.ist || {};
+      const st = PROD_MODELS.map((m) => {
+        const x = ist[m] || {};
+        return `<div>${m}: <span class="pill p-${prodSlug(x.status)}" title="${esc(x.status_text || x.grund || "")}">${esc(x.status || "unbelegt")}</span>${x.grund ? `<div class="am">${esc(x.grund)}</div>` : ""}</div>`;
+      }).join("");
+      const bel = PROD_MODELS.filter((m) => (ist[m] || {}).beleg).map((m) => `<div><b>${m}:</b> ${esc(ist[m].beleg)}${ist[m].quelle ? ` <span class="am">(${esc(ist[m].quelle)})</span>` : ""}</div>`).join("") || `<span class="muted">&mdash;</span>`;
+      const akt = PROD_MODELS.map((m) => `<div><b>${m}:</b> ${prodAkt((p.aktuell || {})[m])}</div>`).join("");
+      const extra = [
+        p.kreuztabelle ? `<details id="pk-${esc(p.id)}"><summary>Kreuztabelle</summary>${prodKreuz(p, achsen)}</details>` : "",
+        p.untertabelle ? `<details id="pu-${esc(p.id)}"><summary>${esc((p.untertabelle || {}).spalte || "Zeilen")} je Zeile</summary>${prodUnter(p)}</details>` : "",
+        p.matrix ? `<details id="pm-${esc(p.id)}"><summary>Matrix Form &times; bs &times; Tiefe &times; Text</summary>${prodMatrix(p)}</details>` : "",
+        p.marker ? `<details id="pr-${esc(p.id)}"><summary>Instrument-Marker</summary>${Object.entries(p.marker).map(([m, x]) => `<div class="am"><b>${m}:</b> ${esc(x.marker)} &middot; ${Object.entries(x.je_format || {}).map(([f, v]) => esc(f + ": " + v)).join(" &middot; ")}</div>`).join("")}</details>` : "",
+      ].join("");
+      return `<tr><td class="mono">${esc(p.nr || "")}</td><td><b>${esc(p.titel)}</b></td><td class="soll">${esc(p.soll)}</td>
+        <td class="ist">${prodIst(ist["27B"] || {})}</td><td class="ist">${prodIst(ist.NF || {})}</td><td>${st}</td><td class="bel">${bel}</td><td class="akt">${akt}</td><td>${prodBausteine(p)}</td></tr>`
+        + (extra ? `<tr><td></td><td colspan="8">${extra}</td></tr>` : "");
+    }).join("") + `</table></div>`;
+}
 function featHtml(d) {
   const fv = d.features;
   if (!fv) return `<div class="muted">keine Daten</div>`;
@@ -864,6 +984,7 @@ async function refresh() {
     if (!live.length && shown.length) $("boots").insertAdjacentHTML("afterbegin", shown.every(plannedStopped)
       ? `<section class="card" style="border-color:var(--flip)"><b>Kein Modell schreibt gerade Logs</b> <span class="muted">&middot; der letzte Boot wurde geplant gestoppt. Unten seine letzten Zahlen.</span></section>`
       : `<section class="card" style="border-color:var(--bad)"><b style="color:var(--bad)">Kein Modell schreibt gerade Logs.</b> <span class="muted">Unten der zuletzt aktive Boot mit seinen letzten Zahlen.</span></section>`);
+    $("prod").innerHTML = prodHtml(d);
     $("feat").innerHTML = featHtml(d);
     $("imgchg").innerHTML = imgChgHtml(d);
     $("gpus").innerHTML = gpusHtml(d, binders);

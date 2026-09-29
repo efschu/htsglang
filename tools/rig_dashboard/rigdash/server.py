@@ -211,7 +211,7 @@ class App:
             "collector_error": getattr(self.logs, "last_error", None),
             "energy_error": getattr(self, "energy_error", None),
             "image_changes": imagechanges.view(boots, images, img_err, self.imgchg.path),
-            "features": self.features.view(),
+            "features": features.attach_current(self.features.view(), boots, sv.get("gpus")),
             "windows": {"rate_s": live.WINDOW_S, "bucket_s": live.BUCKET_S, "history_s": live.HISTORY_S,
                         "live_s": live.LIVE_S},
         }

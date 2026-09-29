@@ -212,5 +212,183 @@ class FileAndCliCase(unittest.TestCase):
             self.assertEqual(features.validate(d["features"]), [])
 
 
+SAMPLE_27B = """# 27B-Ist-Werte (Stand 29.09.2026 ~07:10Z)
+
+## F1–F22
+
+| F | Feature | Status | Ist-Wert | Beleg / Grund |
+|---|---|---|---|---|
+| 1 | Flip | fertig+aktiv | flip_total **2167 ms** | z30j front.log `WEG2-FLIP` |
+| 2 | Heterogen | INT8 fertig+aktiv; NVFP4 im Image aus | TP3 | z30j |
+| 3 | nicht im Produkt | offen | – | – |
+
+## Kreuztabelle 27B
+
+| | tp | dcp | moe | pp | forma | kvonly |
+|---|---|---|---|---|---|---|
+| **tp** | am Metall belegt (24g) | nein | nein | nein | nur Desk | nur Desk |
+| **dcp** | | am Metall belegt | nein | nein | nein | nur Desk (F15) |
+| **moe** | | | nein | nein | nein | nein |
+| **pp** | | | | am Metall belegt | nein | nein |
+| **forma** | | | | | nur Desk | nur Desk |
+| **kvonly** | | | | | | nur Desk |
+
+### P1 Prefill
+
+| Format / Form | Instrument | ≤8k | 8–32k | Beleg |
+|---|---|---|---|---|
+| INT8 PP3 | A, PP0 | 4452 (n=588) | 6564 | z30j P.log |
+
+**Form ohne DCP/Schnitt, NVFP4 D-only (nvfp4form 09290630, rc12z30n):**
+
+| Form | Tiefe | Text | bs1 | bs2 | bs3 | bs4 | bs5 | bs6 |
+|---|---|---|---|---|---|---|---|---|
+| 5090 solo | 2k | Code | 23,6 | 22,2 | 22,2 | 22,0 | 22,7 | 25,1 |
+| 5090 solo | 10k | Prosa | 23,9 | ungültig | 23,0 | ungültig | ungültig | ungültig |
+
+- Gemessene Runde (gpu-ms): bs1 27,8 (n=1961), bs6 62,0 (n=208).
+
+| F | Marker (Quelle des Werts) | INT8 | NVFP4 | W4A8 |
+|---|---|---|---|---|
+| 2 Heterogen | state.json `groups.<P\\|D>.launch.argv` | ja | ja (argv) | ja (argv) |
+| P2 Decode-Matrix | TP0 `Decode rank batch` | ja (Tiefe gemischt) | ja | ja |
+"""
+
+
+def _prod_doc():
+    return {"features": [{"id": "B1", "modell": "beide", "titel": "Baustein", "fertig": True}],
+            "produkt": [{"id": "F%d" % i, "nr": i, "titel": "t%d" % i, "soll": "s%d" % i, "ist": {},
+                         "bausteine": ["B1"] if i == 1 else []} for i in (1, 2, 23, 24)]}
+
+
+class ProduktCase(unittest.TestCase):
+    def test_kreuz_key_is_axis_ordered_and_validated(self):
+        self.assertEqual(features.kreuz_key("kvonly", "tp"), "tp+kvonly")
+        d = _prod_doc()
+        d["produkt"][1]["kreuztabelle"] = {"zellen": {"NF": {"kvonly+tp": {"status": "nein"},
+                                                             "tp+dcp": {"status": "vielleicht"}}}}
+        probs = features.validate_doc(d)
+        self.assertTrue(any("kvonly+tp" in p for p in probs), probs)
+        self.assertTrue(any("vielleicht" in p for p in probs), probs)
+
+    def test_matrix_key_and_ist_status_validation(self):
+        self.assertIsNone(features.matrix_key_error("Form A|1|kurz|code"))
+        self.assertIn("bs", features.matrix_key_error("Form A|7|kurz|code"))
+        self.assertIn("tiefe", features.matrix_key_error("Form A|1|99k|code"))
+        d = _prod_doc()
+        d["produkt"][0]["ist"] = {"NF": {"status": "halbfertig"}, "27B": {"status": "offen", "belegt_am": "gestern"}}
+        probs = features.validate_doc(d)
+        self.assertTrue(any("halbfertig" in p for p in probs), probs)
+        self.assertTrue(any("belegt_am" in p for p in probs), probs)
+
+    def test_unassigned_baustein_is_a_hint_not_a_save_blocker(self):
+        d = _prod_doc()
+        d["features"].append({"id": "B2", "modell": "NF", "titel": "neu"})
+        self.assertEqual(features.validate_doc(d), [])
+        self.assertEqual(len(features.unassigned_bausteine(d["produkt"], {"B1", "B2"})), 1)
+
+    def test_view_joins_bausteine_and_marks_stale_ist(self):
+        d = _prod_doc()
+        d["produkt"][0]["ist"] = {"NF": {"status": "fertig+aktiv", "wert": "x", "belegt_am": "2026-09-29T05:48Z"},
+                                  "27B": {"status": "fertig+aktiv", "wert": "y", "belegt_am": "2026-09-29T07:10Z"}}
+        bs = {"NF": {"B1": {"titel": "Baustein", "fertig": True, "im_image": {"state": "ja"}, "aktiv": {"state": "an"},
+                            "image_aber_aus": False, "aus_begruendung": None, "gewinn": [], "zweige": []}}}
+        start = features.belegt_ts("2026-09-29T06:54Z")
+        v = features.produkt_view(d["produkt"], bs, {"NF": start, "27B": start})
+        f1 = v[0]
+        self.assertEqual([p["nr"] for p in v], [1, 2, 23, 24])
+        self.assertTrue(f1["ist"]["NF"]["veraltet"])
+        self.assertFalse(f1["ist"]["27B"]["veraltet"])
+        self.assertEqual(v[1]["ist"]["NF"]["status"], "unbelegt")
+        self.assertIsNone(v[1]["ist"]["NF"].get("veraltet"))
+        self.assertEqual(f1["bausteine"][0]["je_modell"]["NF"]["aktiv"], "an")
+
+    def test_attach_current_value_or_named_marker(self):
+        fv = {"models": [{"model": "NF", "boot": {"boot_s": 281, "format": "int4-mixed", "rc": "rc12z30u"}},
+                         {"model": "27B", "boot": None}],
+              "produkt": [{"id": "F17", "untertabelle": None}, {"id": "F9", "untertabelle": None},
+                          {"id": "F12", "untertabelle": {"zeilen": [{"name": "INT4 (AutoRound)"}, {"name": "NVFP4"}]}}]}
+        features.attach_current(fv, [], None)
+        f17, f9, f12 = fv["produkt"]
+        self.assertIn("281 s", f17["aktuell"]["NF"]["wert"])
+        self.assertEqual(f17["aktuell"]["NF"]["je_format"], {"INT4": "dieser Boot", "NVFP4": "kein Boot in diesem Format"})
+        self.assertEqual(f17["aktuell"]["27B"], {"leer": "kein Boot dieses Modells gefunden"})
+        self.assertIn("Marker", f9["aktuell"]["NF"]["kein_instrument"])
+        self.assertEqual([z["aktuell"]["NF"] for z in f12["untertabelle"]["zeilen"]],
+                         ["läuft in diesem Boot", "kein Boot in diesem Format"])
+
+    def test_formats_running_w4a8_rides_on_nvfp4_for_27b(self):
+        self.assertEqual(features._formats_running("27B", "nvfp4-modelopt"), {"NVFP4", "W4A8"})
+        self.assertEqual(features._formats_running("NF", "nvfp4-modelopt"), {"NVFP4"})
+        self.assertEqual(features._formats_running("27B", None), set())
+
+    def test_import_27b_fills_only_27b_with_source(self):
+        with tempfile.TemporaryDirectory() as t:
+            md = os.path.join(t, "features_27b_ist_0929.md")
+            with open(md, "w") as fh:
+                fh.write(SAMPLE_27B)
+            d = _prod_doc()
+            d["produkt"][0]["ist"]["NF"] = {"status": "offen"}
+            features_update.import_27b(d, md)
+            f1, f2, f23, f24 = d["produkt"]
+            self.assertEqual(f1["ist"]["NF"], {"status": "offen"})
+            self.assertEqual(f1["ist"]["27B"]["status"], "fertig+aktiv")
+            self.assertEqual(f1["ist"]["27B"]["wert"], "flip_total 2167 ms")
+            self.assertEqual(f1["ist"]["27B"]["quelle"], features_update.QUELLE_27B)
+            self.assertEqual(f1["ist"]["27B"]["belegt_am"], "2026-09-29T07:10Z")
+            self.assertEqual(f2["ist"]["27B"]["status"], "fertig+aktiv")   # earliest keyword wins
+            k = f2["kreuztabelle"]["zellen"]["27B"]
+            self.assertEqual(len(k), 21)
+            self.assertEqual(k["tp+tp"], {"status": "am Metall belegt", "note": "24g", "quelle": features_update.QUELLE_27B})
+            self.assertEqual(k["dcp+kvonly"]["note"], "F15")
+            self.assertEqual(f23["untertabelle"]["zeilen"][0]["name"], "27B INT8 PP3")
+            m = f24["matrix"]["zellen"]["27B"]
+            self.assertEqual(m["NVFP4 5090 solo|1|2k|code"]["wert"], "23,6 ms")
+            self.assertEqual(m["NVFP4 5090 solo|2|10k|prosa"]["status"], "ungültig")
+            self.assertEqual(m["INT8 uneven DCP D TP3|6|gemischt|gemischt"]["wert"], "62,0 ms (n=208)")
+            self.assertEqual(f2["marker"]["27B"]["marker"], "state.json groups.<P|D>.launch.argv")
+            self.assertEqual(f24["marker"]["27B"]["je_format"]["INT8"], "ja (Tiefe gemischt)")
+            self.assertEqual(features.validate_doc(d), [])
+
+    def test_cli_produkt_ist_kreuz_matrix_override_and_md(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = os.path.join(t, "f.json")
+            with open(p, "w") as fh:
+                json.dump(_prod_doc(), fh)
+            run = lambda *a: features_update.main(["--file", p, *a])
+            run("produkt-ist", "--id", "F1", "--modell", "NF", "--status", "fertig+aktiv", "--wert", "2,1 s",
+                "--beleg", "Boot x", "--belegt-am", "2026-09-29T06:00Z")
+            with self.assertRaises(SystemExit):
+                run("produkt-ist", "--id", "F1", "--modell", "NF", "--status", "fertig+aktiv", "--belegt-am", "heute")
+            run("kreuz", "--modell", "NF", "--a", "kvonly", "--b", "dcp", "--status", "nur Desk", "--note", "F15")
+            run("matrix", "--id", "F24", "--modell", "NF", "--form", "Form A", "--bs", "1", "--tiefe", "kurz",
+                "--text", "code", "--wert", "131,9 tok/s", "--boot", "x177", "--beleg", "Probe")
+            run("matrix", "--id", "F24", "--modell", "NF", "--form", "Form A", "--bs", "2", "--tiefe", "kurz",
+                "--text", "prosa", "--ungueltig", "--boot", "x177", "--beleg", "EOS < 500")
+            run("zeile-ist", "--id", "F23", "--zeile", "97k", "--modell", "NF", "--status", "fertig+aktiv",
+                "--wert", "24,18 s", "--beleg", "x175")
+            run("set", "--id", "B2", "--modell", "NF", "--titel", "neu", "--produkt", "F2")
+            run("boot-override", "--boot", "b-20260929T002052Z-86f6", "--lifecycle", "stopped (geplant)", "--beleg", "27B")
+            with open(p) as fh:
+                d = json.load(fh)
+            P = {x["id"]: x for x in d["produkt"]}
+            self.assertEqual(P["F1"]["ist"]["NF"]["belegt_am"], "2026-09-29T06:00Z")
+            self.assertEqual(P["F2"]["kreuztabelle"]["zellen"]["NF"]["dcp+kvonly"], {"status": "nur Desk", "note": "F15"})
+            self.assertEqual(P["F2"]["bausteine"], ["B2"])
+            cells = P["F24"]["matrix"]["zellen"]["NF"]
+            self.assertEqual(cells["Form A|2|kurz|prosa"]["status"], "ungültig")
+            self.assertTrue(P["F23"]["untertabelle"]["zeilen"][0]["ist"]["NF"]["belegt_am"].startswith("20"))
+            self.assertEqual(d["boot_overrides"]["b-20260929T002052Z-86f6"]["lifecycle"], "stopped (geplant)")
+            out = os.path.join(t, "o.md")
+            run("md", "--out", out, "--live-url", "")
+            text = open(out).read()
+            self.assertIn("| 1 | t1 | s1 |", text)
+            self.assertIn("## F24 Decode-Matrix NF", text)
+            self.assertIn("| kurz | code | 131,9 tok/s | ungemessen |", text)
+            self.assertIn("| kurz | prosa | ungemessen | ungültig |", text)
+            self.assertIn("## F24 Decode-Matrix 27B", text)
+            self.assertIn("alle Zellen ungemessen", text)
+
+
 if __name__ == "__main__":
     unittest.main()
