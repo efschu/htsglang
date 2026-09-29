@@ -89,7 +89,8 @@ def test_27b_switch_on_the_gate_holds_back_what_ends_after_the_deadline():
     with envs.SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE.override(True):
         f = _front(LINE_27B)
         (path, body), = _drive(f, 1000)
-    assert path == G.PATH and body["left_ms"] == 1000 and body["a_ms"] == 190.0
+    # 27B review (c): pessimistic by the maximal staleness (D reads no clock)
+    assert path == G.PATH and body["left_ms"] == 1000 - G.RESEND_MS and body["a_ms"] == 190.0
     s = _sched()
     G.note(s, _win(LINE_27B, 1000))
     # 190 + (0.575 + 0.020) * 3000 = 1975 ms > 1000: waits
@@ -112,6 +113,42 @@ def test_nf_the_metal_resume_extend_would_have_waited():
     # NF's fixed forward cost alone (1.9 s, the eager expert pass) exceeds a short window
     G.note(s, _win(LINE_NF, 1500))
     assert G.defers(s, object(), uncached=1, prefix_tokens=0, batch_empty=True, running_n=1)
+
+
+def test_review_a_a_skip_resume_is_never_held_even_below_a():
+    """27B review (a): a request without an extend forward (TAIL-READY / E2
+    skip, uncached=0) is charged no a -- admitted with left < a (NF a=1900)."""
+    s = _sched()
+    G.note(s, _win(LINE_NF, 100))
+    assert not G.defers(s, object(), uncached=0, prefix_tokens=97465, batch_empty=True, running_n=3)
+    # and it adds nothing to the pass: a real extend after it is priced alone
+    assert getattr(s, G.PASS_ATTR) == 0.0
+
+
+def test_review_b_defers_are_counted_per_request_and_named_at_release(caplog):
+    """27B review (b): hunger is accepted (after FIRE comes P, the resume stands
+    first after the wake; hard bound = the existing 60-s wait bound). Every
+    hold is counted on the request and named when it is finally admitted;
+    rankstats carries the longest hold."""
+    s = _sched()
+    r = types.SimpleNamespace(rid="weg2-92-164")
+    G.note(s, _win(LINE_NF, 5000))
+    for _ in range(3):
+        assert G.defers(s, r, uncached=2564, prefix_tokens=43712, batch_empty=True, running_n=3)
+    assert r._weg2_pw_defers == 3
+    G.clear(s, "wake")
+    with caplog.at_level("INFO"):
+        assert not G.defers(s, r, uncached=2564, prefix_tokens=43712, batch_empty=True, running_n=0)
+    assert "released rid=weg2-92-164 defers=3" in caplog.text
+    assert r._weg2_pw_defers == 0 and getattr(s, G.HOLD_MAX_ATTR) >= 0.0
+
+
+def test_review_c_the_front_sends_the_deadline_pessimistic_by_one_resend_step():
+    body, sent = G.front_message(None, epoch=1, left_ms=2000, line=LINE_27B)
+    assert body["left_ms"] == 2000 - G.RESEND_MS and sent[1] == 2000
+    # never negative: a window at its end reads 0 on D (no extend fits)
+    body, _ = G.front_message(None, epoch=1, left_ms=100, line=LINE_27B)
+    assert body["left_ms"] == 0
 
 
 def test_an_idle_d_is_never_held():
@@ -163,7 +200,7 @@ def test_the_window_in_force_is_in_the_rankstats_ipc():
     assert rs._park_window_left_ms(s) == 1000 and s._weg2_park_window_defer_n == 1
     src = inspect.getsource(rs)
     assert '"park_window_left_ms": _park_window_left_ms(scheduler)' in src
-    assert '"park_window_defers"' in src
+    assert '"park_window_defers"' in src and '"park_window_hold_max_ms"' in src
 
 
 def test_the_admission_asks_the_gate_after_the_x_gate_and_the_rpc_is_wired():
