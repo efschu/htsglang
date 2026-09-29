@@ -25,6 +25,20 @@ Gilt für NF und 27B.
 `events.jsonl`, sobald die Front Flip- und Pass-Ereignisse (FLIP done, erster Decode, POST-WAKE-PASS,
 Forward-Start/-Ende je Rang) dort schreibt; dann entfallen FWD-/FLUSH-/ANON-Paarung und Log-Scan.
 
+## Aus IPC, nicht aus Logs (Nutzer 29.09. über 27B)
+
+Die Order lautet: „das dashboard soll auch aus der inter prozess kommunikation gespeist werden, nicht aus logs“. Das Inventar mit jeder Kachel, ihrer Quelle heute, der IPC-Quelle und dem Stand liegt in `/spinning/gpu-arb/docs/DASHBOARD-AUS-IPC-INVENTAR-0929.md`.
+
+- `ipcstate.py` liest je Boot `state.json`, `events.jsonl` und `stop_request.json` unter `/spinning/docker-acceptance/<line>/state/<boot_id>/` (IPC-STATE-PLAN §2.2) und ordnet sie über `state.json.tag` dem Log-Boot zu.
+- Aus IPC kommen:
+  - Kopf (REV, Profil, Image, lifecycle, Topologie, Modell)
+  - Startform (`groups.<G>.launch`)
+  - geplanter Stopp oder Tod (`stops.classify_ipc`)
+  - Front-Zustand und Warteschlange (`/weg2/state`, sonst der `state.json front`-Spiegel)
+  - Feature-Werte „Transport“ und „bedient“
+- Was noch aus einem Log kommt, trägt sichtbar **„aus Log (Übergang)“**.
+- `tests/test_no_new_log_parsers.py` friert alle heutigen Regex-Literale ein. Ein neuer Log-Parser macht den Test rot, sein Weg ist: zuerst schreibt die Quelle (Front, Launcher, Rang), dann wird der Leser umgestellt, dann fällt der Parser.
+
 ## Ruhige Anzeige (Nutzer 29.09.: „ständig verschiebt sich das nach oben/unten“)
 
 `refresh()` baut keine Abschnitte per `innerHTML` neu, sondern arbeitet das neue HTML per
