@@ -4640,6 +4640,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._1421_refused("direct_no_hashes", node)
             return False
         pre = pool.alloc_write(hashes)
+        if pre is None and self._w3_arena_spill(pool, len(hashes), claimer=node) > 0:
+            # W3-ARENA: the spill handed this rank's references back; the
+            # claim's own room-making (#1427 _evict_for_claim) takes the slots
+            # once no rank holds them any more (a PP peer releases at its own
+            # claim of the same node)
+            pre = pool.alloc_write(hashes)
         if pre is None:
             self._1421_refused("arena_claim", node)
             return False
@@ -4716,6 +4722,104 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._1421_refused("draft_claim", node)
                 return False
         return pre
+
+    #: W3-ARENA: pages one spill round moves at least (one claim is one node's
+    #: pages; a round that frees only that makes every next node pay the walk)
+    W3_SPILL_MIN_PAGES = 64
+    #: W3-ARENA: after a round that found nothing to spill, the next claim
+    #: refusal does not walk the tree again for this long
+    W3_SPILL_EMPTY_BACKOFF_S = 0.5
+
+    def _w3_arena_spill(self, pool, need_pages: int, claimer=None) -> int:
+        """W3-ARENA (kvs2 0929, bs2 x 240k, P PP0 12:30:55): the arena was
+        full, and every COMPLETE slot carried THIS tree's reference
+        (ARENA-REF-HOLDERS tree=5419 of 5461 slots, tree_in_use=0). The claim's
+        room-making (#1427 ``_evict_for_claim``) takes unreferenced slots only
+        and the #257 L3 write only covers what it takes -- so nothing reached
+        L3, nothing was freed (74751x ARENA-DROP freed=0 written=0), the next
+        node's backup was refused (#1421 arena_claim, then parent_unbacked down
+        the chain), flush_cache answered 400 and the flip died with W3.
+
+        A tree reference on a finished page is a host copy of a node whose
+        KV is still on the device -- the arena is its L2 copy, not its only one.
+        Under claim pressure this spills such copies: each page gets its L3
+        copy first (``secure_rows_to_l3``), then the node's Full HOST rows go
+        (the #1407 transit release, KV layer only: the node stays in the tree
+        and on the device, ``l3_present`` marks it store-backed -- the parent
+        rule of ``write_backup`` and the publish sweep read it as backed). A
+        page without an L3 copy is never released (``lost`` != 0 keeps the
+        node as it is). Pages of running requests qualify as long as they are
+        written (no pending write, no host lock of a load in flight).
+
+        Deterministic order (node id, oldest first) so the PP ranks, whose
+        trees are replicas, release the same nodes -- a slot is free only when
+        every rank's reference is gone. Returns the pages released here."""
+        if pool is None or getattr(pool, "arena", None) is None:
+            return 0
+        if not hasattr(pool, "secure_rows_to_l3"):
+            return 0
+        if _r12.role() is not None:
+            # Form A: a worker's host rows mirror TP0's verdicts (R12); the
+            # spill stays on the groups without the shadow protocol
+            return 0
+        now = time.monotonic()
+        if now < getattr(self, "_w3_spill_quiet_until", 0.0):
+            return 0
+        want = max(int(need_pages), self.W3_SPILL_MIN_PAGES)
+        base = self.components.get(BASE_COMPONENT_TYPE)
+        if base is None:
+            return 0
+        P = max(1, int(getattr(self, "page_size", 1) or 1))
+        skip = set()
+        n = claimer
+        while n is not None and n is not self.root_node:
+            skip.add(id(n))   # the claimer's own chain: its parent rule reads backed/l3_present
+            n = n.parent
+        cands = []
+        for node in self._collect_all_nodes():
+            if node is self.root_node or id(node) in skip:
+                continue
+            cd = node.component_data[BASE_COMPONENT_TYPE]
+            hv = cd.host_value
+            if hv is None or cd.value is None or hv.numel() == 0:
+                continue   # host-only nodes stay: their host copy is their only copy on P
+            if node.id in self.ongoing_write_through:
+                continue   # pending write: the slots are not COMPLETE yet
+            if any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data):
+                continue   # a load-back reads these rows
+            if int(hv.min()) < int(getattr(pool, "staging_rows", 0)):
+                continue   # staging rows are not arena slots
+            cands.append(node)
+        cands.sort(key=lambda x: x.id)
+        released = secured = written = lost = 0
+        spilled = 0
+        for node in cands:
+            if released >= want:
+                break
+            hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+            sec = pool.secure_rows_to_l3(hv)
+            if int(sec.get("lost", 0)) or not int(sec.get("pages", 0)):
+                lost += int(sec.get("lost", 0))
+                continue
+            secured += int(sec.get("on_disk", 0))
+            written += int(sec.get("written", 0))
+            _dev, host_freed = self._evict_component_and_detach_lru(
+                node, base, target=EvictLayer.HOST, tracker=None)
+            self.evictable_host_leaves.discard(node)
+            node.l3_present = True
+            released += int(host_freed or 0) // P
+            spilled += 1
+        k = getattr(self, "_w3_spill_n", 0) + 1
+        self._w3_spill_n = k
+        if released == 0:
+            self._w3_spill_quiet_until = now + self.W3_SPILL_EMPTY_BACKOFF_S
+        if k <= 8 or k % 64 == 0 or lost:
+            logger.info(
+                "W3-ARENA SPILL n=%d need=%d released_pages=%d nodes=%d candidates=%d "
+                "l3=on_disk:%d,written:%d lost=%d (a finished page leaves L2 only with "
+                "its L3 copy; the node stays on the device, l3_present)",
+                k, int(need_pages), released, spilled, len(cands), secured, written, lost)
+        return released
 
     def _weg2_write_or_abort(self, node, device_value, aux_xfers, pre, ring):
         """The controller write of `write_backup`. #1424f (rc12p P-PP0
