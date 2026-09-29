@@ -5756,6 +5756,7 @@ class Front:
     def do_stop(self, name: str, detail: str) -> None:
         if self.state == "STOP":
             return
+        state_before = self.state
         self.stop = Weg2Stop(name, detail)
         self.state = "STOP"
         self.counters["stop"] += 1
@@ -5766,6 +5767,42 @@ class Front:
         self.queue.clear()
         self._ready_for_d.clear()
         self._sync_batch_gate()
+        self._publish_stop_state(name, detail, state_before)
+
+    def _enter_state(self, new: str) -> bool:
+        """W98-STOP-FINAL: the ONE way ``state`` leaves serving/flipping. STOP is
+        final -- nothing sets it back (z30u 07:14:10: a flip that was open when
+        W98 fired wrote "serving" over the STOP and the boot served 136 more
+        requests). False = STOP holds, nothing changed."""
+        if self.state == "STOP":
+            return False
+        self.state = new
+        return True
+
+    def _refuse_flip_in_stop(self, src: str, dst: str, when: str) -> None:
+        self.counters["flip_refused_stop"] += 1
+        logger.error(
+            "WEG2-FLIP REFUSED-STOP epoch=%s sleep=%s wake=%s (%s): the front is in STOP "
+            "(%s) -- a named teardown is final, no flip after it",
+            getattr(self, "epoch", "?"), src, dst, when, getattr(self, "stop", None))
+
+    def _publish_stop_state(self, name: str, detail: str, state_before: str) -> None:
+        """IPC §2.2 (user law: control never over log lines): the STOP into the
+        boot's state directory -- event ``front_stop`` and the A5 stop request,
+        through the one writer (weg2/state_file.py). No state directory = no-op;
+        a failed write is logged, never a second failure of the teardown."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        d = envs.WEG2_STATE_DIR.get() or None
+        if not d:
+            return
+        try:
+            out = front_state_ipc.publish_front_stop(
+                d, name=name, detail=detail, state_before=state_before,
+                epoch=getattr(self, "epoch", None), awake=getattr(self, "awake", None))
+            logger.error("WEG2 STOP STATE %s -> %s", name, out)
+        except Exception as e:  # noqa: BLE001 -- the teardown stands without the file
+            logger.error("WEG2 STOP STATE WRITE FAILED %s: %s: %s", name, type(e).__name__, e)
 
     # ---------------- HTTP handlers ----------------
     async def handle_health(self, request: web.Request) -> web.Response:
@@ -8820,12 +8857,21 @@ class Front:
 
     @_flip_single_flight
     async def flip(self, src: str, dst: str) -> None:
+        # W98-STOP-FINAL (z30u 07:14:10): a STOP is a named teardown, and no flip
+        # may run after it -- refused BEFORE any effect, the clock unlock
+        # included. (getattr: partial test fronts carry no `state`.)
+        if getattr(self, "state", None) == "STOP":
+            self._refuse_flip_in_stop(src, dst, "before the flip")
+            return
         # #55 F2: unlock the clocks BEFORE anything of the flip runs -- both groups' legs use the cards.
         _ic = getattr(self, "_idle_clock", None)
         if _ic is not None:
             await _ic.before_flip()
         S, D = self.groups[src], self.groups[dst]
-        self.state = "flipping"
+        if not self._enter_state("flipping"):
+            # the STOP landed while the clock unlock was awaited
+            self._refuse_flip_in_stop(src, dst, "during the clock unlock")
+            return
         t_flip0 = time.time()
         # #1262 tier 3: the open flip's identity, for `flip_stall_check`. Not
         # cleared on the exits below -- every one of them leaves `state` at
@@ -8900,7 +8946,7 @@ class Front:
                     self.drain_deadline_s, self.drain_refusals_in_a_row,
                 )
                 self.drain_refusals_in_a_row = 0
-                self.state = "serving" if self.state != "STOP" else "STOP"
+                self._enter_state("serving")
                 return
             if not await self._abort_parked_on_drain(S, src):
                 self.drain_refusals_in_a_row += 1
@@ -8911,7 +8957,7 @@ class Front:
                              self.counters.get("suspended_now", 0), self.drain_refusals_in_a_row)
                 if self.drain_refusals_in_a_row >= 3:
                     self.do_stop("W2 Weg2DrainStuck", f"three W1 in a row on {src}: {sorted(S.outstanding)[:8]}")
-                self.state = "serving" if self.state != "STOP" else "STOP"
+                self._enter_state("serving")
                 return
         self.drain_refusals_in_a_row = 0
         # 2. quiesce + double witness (W3)
@@ -9287,7 +9333,15 @@ class Front:
         self.awake = dst
         self.epoch += 1
         self.admit_d = True
-        self.state = "serving"
+        if not self._enter_state("serving"):
+            # W98-STOP-FINAL (z30u 07:14:10 -> 136 requests served after a W98):
+            # a STOP that fell INTO this flip stays the end state. The bookkeeping
+            # below still runs -- the legs happened, `awake`/`epoch` are facts.
+            self.counters["flip_ended_in_stop"] += 1
+            logger.error(
+                "WEG2-FLIP ENDED-IN-STOP epoch=%d slept=%s woke=%s stop=%s -- the STOP "
+                "was raised while this flip ran; the front stays in STOP (no return "
+                "to serving after a named teardown)", self.epoch, src, dst, self.stop)
         if self.x_exact:
             # X-EXACT: a held (#49) credit is bound to its epoch -- re-price
             # the queue against the new one (PK's needs_p reads est_uncached).
