@@ -9832,8 +9832,11 @@ class Scheduler(
         return batch
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
-    def _update_uniform_pool_budget(self) -> None:
+    def _update_uniform_pool_budget(self, running_batch=None) -> None:
         """MIN-reduce this iteration's pool headroom across the TP group.
+
+        ``running_batch``: the pass's running batch after the prefill merge
+        (W-SEAT, see ``_local_admit_limit``); None reads ``self.running_batch``.
 
         The rank-uniform counterpart to ``token_to_kv_pool_allocator.
         available_size()``, which under uneven DCP/TP differs per rank
@@ -10153,7 +10156,7 @@ class Scheduler(
         # derived from the uniform avail would still diverge.
         _limit_at = len(vals)
         vals = vals + tp_head_congruence.build_admit_limit_payload(
-            self._local_admit_limit()
+            self._local_admit_limit(running_batch)
         )
         # #1203 (family A1): THE SEAM-TRANSPORT PREMISE rides this reduce too,
         # as ONE AND-slot, and it is placed HERE for the reason the corridor
@@ -10926,7 +10929,7 @@ class Scheduler(
             tp_head_congruence.degradation_is_a_defect(gate.enabled, source),
         )
 
-    def _local_admit_limit(self) -> Optional[int]:
+    def _local_admit_limit(self, running=None) -> Optional[int]:
         """#823 W9: this rank's vote for HOW MANY of the head may be admitted.
 
         Its own slot rather than a derivation from the availability floor,
@@ -10934,9 +10937,21 @@ class Scheduler(
         ``admission_limiter.current`` -- rank-local floating state the
         availability reduce does not capture. ``None`` means "no opinion" and
         rides as the sentinel, leaving every rank's local limit untouched.
+
+        W-SEAT (29.09., z30x2 base 11:48:10Z): ``running`` is THE PASS'S
+        running batch, handed in by ``get_next_batch_to_run``. Its merge
+        rebinds the LOCAL ``running_batch`` to the just-finished extend batch
+        when the running batch was empty (``running_batch = last_batch``);
+        ``self.running_batch`` still names the old empty batch until the
+        event loop stores the plan. Read from ``self`` the vote counted 0
+        running while the admission loop counted 1, and the COUNT arm takes
+        the group vote as the limit (``admit_limit_decision``): a D phase of
+        n=2 seats admitted two more beside the merged one and died on
+        ``Weg2DSeatOverrun`` (a batch of 3).
         """
         try:
-            running = getattr(self, "running_batch", None)
+            if running is None:
+                running = getattr(self, "running_batch", None)
             running_bs = len(running.reqs) if running is not None else 0
             held = self._chunk_rest_slot_held(running)
             if held:
@@ -11879,7 +11894,9 @@ class Scheduler(
         # Unconditional and pre-branch, like the call above: every rank
         # reaches this line exactly once per iteration, so the collective
         # count stays rank-uniform no matter which branch is taken later.
-        self._update_uniform_pool_budget()
+        # W-SEAT: the COUNT vote reads THIS pass's running batch -- the merge
+        # above may have rebound it away from `self.running_batch`.
+        self._update_uniform_pool_budget(running_batch)
 
         # #583 collective census. Same placement argument as the reduce above:
         # every rank reaches this line exactly once per iteration, so the
