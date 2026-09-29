@@ -13049,7 +13049,10 @@ def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
     measured -- the solve then keeps its seed, byte-identical."""
     from sglang.srt.planner import expert_residency as _er
 
-    profile = ns.profile
+    # getattr like every other ns reader of this module (d_pool_peak_record,
+    # profile_row): a namespace without profile/model is the default profile.
+    profile = getattr(ns, "profile", None)
+    model = str(getattr(ns, "model", "") or "")
     try:
         builtin = list(_pconst("OWNED_MISS_MS", profile))
         builtin_src = _pconst_boots("OWNED_MISS_MS", profile)
@@ -13058,11 +13061,11 @@ def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
     from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
 
     root = str(env_d.get("SGLANG_WEG2_OWNED_MISS_RECORD", "") or "").strip()
-    rank_dir = _miss_cost.record_dir_for(root, ns.model) if root else None
+    rank_dir = _miss_cost.record_dir_for(root, model) if root else None
     ms, tier, src = _er.resolve_owned_miss_ms(
         _er.read_owned_miss_records(measured_record_path()),
         rank_records=_er.read_owned_miss_rank_records(rank_dir), host=int(host),
-        model=ns.model, builtin=builtin, builtin_source=builtin_src)
+        model=model, builtin=builtin, builtin_source=builtin_src)
     if tier == _er.OWNED_MISS_UNMEASURED:
         return None, ""
     return ms, src
