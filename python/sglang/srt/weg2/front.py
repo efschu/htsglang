@@ -3928,9 +3928,27 @@ class Front:
         #: x until this boot measured its own; None = none recorded.
         self._park_rt_seed: Optional[dict] = (
             phase_policy.read_park_round_trip(self.measured_record, self._park_form_key)
-            if envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get() else None)
+            if (envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get()
+                or envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get()) else None)
         #: PARK-COLLECT-WINDOW: round trips this boot appended to the sidecar.
         self._park_rt_written = 0
+        #: X-COST-LINE: the ``(boot, seq)`` head of D's per-forward prefill
+        #: cost ring at the last ``/get_server_info`` read (prefill_clock).
+        self._d_cost_mark: Optional[Tuple[str, int]] = None
+        #: X-COST-LINE: D's prefill forwards ``(n, prefix, ms)``, newest last --
+        #: the live fit's rows (read on every leg-2 read, under any load).
+        self._d_cost_rows: Deque[Tuple[int, int, float]] = collections.deque(maxlen=64)
+        #: X-COST-LINE: requests each P phase prefilled (the amortisation k).
+        self._p_phase_k: Deque[int] = collections.deque(maxlen=self.X_SAMPLE_WINDOW)
+        #: X-COST-LINE: the newest fitted line of this checkpoint x form, the
+        #: seed until this boot fitted its own; None = none recorded.
+        self._x_cost_seed: Optional[dict] = (
+            phase_policy.read_x_cost_line(self.measured_record, self._park_form_key)
+            if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get() else None)
+        #: X-COST-LINE: fitted lines this boot appended to the sidecar.
+        self._x_cost_written = 0
+        #: X-COST-LINE: which inputs were missing at the last NO-SOLVE.
+        self._x_cost_last_missing: List[str] = []
         #: H91c3-3: the D phase's seat count n (H95) this front sent at the
         #: last P->D wake; None before the first one (no seat cap known).
         self._d_phase_n: Optional[int] = None
@@ -4515,8 +4533,9 @@ class Front:
         medians of :meth:`_park_warm_legs_ms`) to the sidecar -- the next boot's
         seed of the same checkpoint x form. Built at D's first decoded chunk,
         written by the H78 writer thread."""
-        if (not envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get() or not self._park_form_key
-                or not self.measured_record
+        if (not (envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get()
+                 or envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get())
+                or not self._park_form_key or not self.measured_record
                 or self._park_rt_written >= phase_policy.PARK_ROUND_TRIP_RECORDS):
             return
         dp_ms, pd_ms, resume_ms, _ = self._park_warm_legs_ms()
@@ -8434,9 +8453,26 @@ class Front:
                     out["prefill_src"] = "server_info"
             self._d_prefill_mark = prefill_clock.advance(
                 getattr(self, "_d_prefill_mark", None), prefill_clock.mark_of(_pfc))
+            self._note_d_cost(info.get(prefill_clock.COST_STATE_KEY))
         except Exception as e:  # noqa: BLE001 - an instrument never breaks serving
             logger.debug("draft terms unavailable: %s: %s", type(e).__name__, e)
         return out
+
+    def _note_d_cost(self, block: Any) -> None:
+        """X-COST-LINE: take D's prefill forwards published since the last
+        read (prefill_clock.cost_since) as rows of the cost line. Every
+        forward counts, whatever else D ran -- the ring holds prefill forwards
+        only. A ring that wrapped between two reads is counted, not hidden."""
+        new, self._d_cost_mark, lost = prefill_clock.cost_since(block, self._d_cost_mark)
+        if lost:
+            self.counters["x_cost_rows_lost"] += lost
+        for r in new:
+            try:
+                self._d_cost_rows.append((int(r["n"]), int(r.get("cached", 0) or 0), float(r["ms"])))
+            except (KeyError, TypeError, ValueError):
+                self.counters["x_cost_rows_bad"] += 1
+                continue
+            self.counters["x_cost_rows"] += 1
 
     def check_identity(self) -> None:
         """W9 from the store directory: exactly ONE identity suffix on disk.
@@ -9914,6 +9950,8 @@ class Front:
             derive_x_star,
         )
 
+        if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get():
+            return self._resolve_x_cost_line()
         s = self._x_samples
         if not (s["r_d"] and s["r_p"] and s["flip_s"]):
             missing = [k for k in ("r_d", "r_p", "flip_s") if not s[k]]
@@ -9983,6 +10021,115 @@ class Front:
             self._x_seed_note,
         )
         return x
+
+    def _x_cost_inputs(self) -> Tuple[Optional[dict], str, Optional[float], str, float, str]:
+        """X-COST-LINE's inputs with their sources: ``(line, line_src, price_s,
+        price_src, k, k_src)``. Every one is LIVE > RECORD of this checkpoint x
+        form > missing (``None``) -- never a constant; ``k`` without any
+        measurement is 1 (no amortisation), named as such."""
+        line, why = phase_policy.fit_cost_line(
+            self._d_cost_rows, min_tokens=envs.SGLANG_WEG2_X_COST_FIT_MIN_TOKENS.get(),
+            min_samples=envs.SGLANG_WEG2_X_COST_FIT_MIN_SAMPLES.get())
+        if line is not None:
+            line_src = f"live:{why}:n={line['n']}"
+        elif self._x_cost_seed is not None:
+            line = self._x_cost_seed
+            line_src = f"record:{line['boot_tag']}@{line['at']}(live {why})"
+        else:
+            line_src = f"none(live {why})"
+        dp_ms, pd_ms, resume_ms, legs_src = self._park_warm_legs_ms()
+        price = phase_policy.park_round_trip_s(dp_ms, pd_ms, resume_ms)
+        if price is not None:
+            price_src = f"ski-live:{legs_src}"
+        elif self._park_rt_seed is not None:
+            price = float(self._park_rt_seed["round_trip_s"])
+            price_src = f"ski-record:{self._park_rt_seed['boot_tag']}@{self._park_rt_seed['at']}"
+        else:
+            price_src = f"none:{legs_src}"
+        cap = float(self.p_phase_max_requests) if self.p_phase_max_requests else float("inf")
+        if self._p_phase_k:
+            k = min(cap, max(1.0, statistics.mean(self._p_phase_k)))
+            k_src = f"live:mean-of-{len(self._p_phase_k)}"
+        elif self._x_cost_seed is not None and float(self._x_cost_seed.get("k", 0) or 0) >= 1.0:
+            k = min(cap, float(self._x_cost_seed["k"]))
+            k_src = "record"
+        else:
+            k, k_src = 1.0, "none(1=no-amortisation)"
+        return line, line_src, price, price_src, k, k_src
+
+    def _resolve_x_cost_line(self) -> Optional[int]:
+        """X-COST-LINE's re-solve (see phase_policy): X* from D's cost line at
+        the depth D prefills at, the ski round trip amortised over k, and the
+        drain r_P. Clamped to [the fitted range's lower edge, the ceiling] --
+        below the lowest measured forward the line is extrapolation, so that
+        edge, not 4096, is the floor. Prints every input with its source."""
+        line, line_src, price, price_src, k, k_src = self._x_cost_inputs()
+        r_p_s = self._x_samples["r_p"]
+        missing = [name for name, v in (("d_cost_line", line), ("round_trip", price),
+                                        ("r_p", r_p_s or None)) if v is None]
+        if missing:
+            if missing != self._x_cost_last_missing:
+                self._x_cost_last_missing = missing
+                logger.warning(
+                    "WEG2 X COST-LINE NO-SOLVE: no %s yet, so X stays at %d (line=%s price=%s "
+                    "k=%.2f[%s] r_P n=%d)", " and ".join(missing), self.tp_prefill_max_tokens,
+                    line_src, price_src, k, k_src, len(r_p_s))
+            return None
+        self._x_cost_last_missing = []
+        r_p = statistics.median(r_p_s)
+        live_prefix = [p for n, p, _ in self._d_cost_rows
+                       if n >= envs.SGLANG_WEG2_X_COST_FIT_MIN_TOKENS.get()]
+        prefix = (statistics.median(live_prefix) if live_prefix
+                  else float(line.get("prefix_med", 0) or 0))
+        x_star, why = phase_policy.solve_x_cost_line(
+            price_s=price, k=k, line=line, r_p=r_p, prefix_tokens=prefix)
+        prev = self.tp_prefill_max_tokens
+        if x_star is None:
+            logger.warning("WEG2 X COST-LINE held: %s -- X stays %d (line=%s)", why, prev, line_src)
+            return None
+        floor = int(line["n_lo"])
+        x = int(min(max(x_star, floor), self.x_ceiling_tokens))
+        clamp = ("ceiling" if x_star > self.x_ceiling_tokens
+                 else "floor" if x_star < floor else "none")
+        self.tp_prefill_max_tokens = x
+        if self._x_min_work_follows:
+            self.flip_min_work_tokens = x
+        self.counters["x_resolves"] += 1
+        bands = ", ".join(
+            "%dk:%s" % (d // 1000, "-" if xb is None else "inf" if xb == float("inf") else int(xb))
+            for d in (2048, 32768, 97280, 245760)
+            for xb in (phase_policy.solve_x_cost_line(
+                price_s=price, k=k, line=line, r_p=r_p, prefix_tokens=d)[0],))
+        logger.info(
+            "WEG2 X COST-LINE RE-SOLVE X=%d <- X_prev=%d X*=%.0f (%s) clamp=%s floor=%d (fitted "
+            "range n %d..%d) ceiling=%d | D line a=%.0fms b=%.3fms/tok c=%.4fms/tok/kprefix "
+            "[%s] at prefix=%d | price=%.2fs [%s] / k=%.2f [%s] | r_P=%.0f (median of %d "
+            "drains) | X* by depth {%s}",
+            x, prev, x_star, why, clamp, floor, int(line["n_lo"]), int(line["n_hi"]),
+            self.x_ceiling_tokens, float(line["a_ms"]), float(line["b_ms"]),
+            float(line["c_ms"]), line_src, int(prefix), price, price_src, k, k_src, r_p,
+            len(r_p_s), bands)
+        self._note_x_cost_line(line, line_src, k)
+        return x
+
+    def _note_x_cost_line(self, line: dict, line_src: str, k: float) -> None:
+        """X-COST-LINE: append this boot's first LIVE fitted lines to the
+        sidecar -- the next boot's seed of the same checkpoint x form. A line
+        taken from the record is never written back as new."""
+        if (not line_src.startswith("live:") or not self._park_form_key
+                or not self.measured_record
+                or self._x_cost_written >= phase_policy.X_COST_LINE_RECORDS):
+            return
+        self._x_cost_written += 1
+        now = time.time()
+        rec = phase_policy.x_cost_line_record(
+            form_key=self._park_form_key, line=line, k=k, boot_tag=str(self.tag),
+            commit=self.commit,
+            at=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now)) + ",%03d" % int((now % 1) * 1000))
+        logger.info("WEG2 X COST-LINE RECORD a=%.0f b=%.3f c=%.4f n=%d k=%.2f form=%s -> sidecar "
+                    "(the next boot's seed of this form)", rec["a_ms"], rec["b_ms"], rec["c_ms"],
+                    rec["n"], rec["k"], self._park_form_key)
+        self._sidecar_submit(host_ledger.append_measured_record, self.measured_record, rec)
 
     def _flip_economics_ok(self, fairness_fired: bool) -> bool:
         """C7/L13: is the queued work worth a round trip?
@@ -10730,6 +10877,9 @@ class Front:
                     _drain_s = time.time() - t_drain0
                     if _drain_s > 0 and _drain_uncached > 0:
                         self.note_x_sample("r_p", _drain_uncached / _drain_s)
+                    if prefilled > 0:
+                        # X-COST-LINE: the requests this P phase carried (k).
+                        self._p_phase_k.append(int(prefilled))
                     logger.info("WEG2 P-DRAIN epoch=%d prefilled=%d arrived_during=%d p_concurrency=%d "
                                 "passes=%d queue_at_exit=%d drain_s=%.1f",
                                 self.epoch, prefilled, max(0, prefilled - queue_at_entry),

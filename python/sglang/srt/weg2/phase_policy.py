@@ -449,6 +449,154 @@ def read_park_round_trip(path: str, form_key: str) -> Optional[dict]:
     return newest_park_round_trip(samples if isinstance(samples, list) else [], form_key)
 
 
+# ---------------------------------------------------------------------------
+# X-COST-LINE (29.09., third part of the ski-rental decision): X from D's
+# measured cost line, priced by the measured round trip, amortised over the
+# requests one P phase carries.
+#
+# THE MODEL. D prefilling ``n`` uncached tokens behind a cached prefix of
+# ``p`` tokens costs ``a + b*n + c*n*p`` ms (one forward's fixed cost -- NF's
+# expert stream, H118 -- plus a per-token cost that grows with the prefix the
+# attention reads). Routing it through P costs its share of one round trip
+# plus ``n / r_P``. Break-even:
+#
+#     a + (b + c*p) * n = price / k + 1000 * n / r_P
+#     X* = (1000 * price / k - a) / (b + c*p - 1000 / r_P)
+#
+# ``price`` is the ski instrument's warm round trip (D->P + P->D + wake ->
+# first decoded chunk), the one price source of the collect window; ``k`` the
+# mean number of requests a P phase prefills (FLIP-ECONOMICS "amortising
+# once over the backlog", 27B review 29.09.). Measured inputs (D logs
+# 09290827 NF / 09290020 27B, TP0 lines with n >= 64): NF a=1900 ms,
+# b=1.352, c=0.00088 ms/tok per k prefix; 27B a=227, b=0.611, c=0.00093.
+# ---------------------------------------------------------------------------
+
+#: The measured-record sidecar entry of one fitted D cost line (plus the
+#: amortisation k and the prefix depth it was solved at).
+X_COST_LINE_KIND = "x_cost_line"
+X_COST_LINE_GROUP = "X_COST"
+#: The first fitted lines of a boot that are appended (the newest seeds the next).
+X_COST_LINE_RECORDS = 3
+
+
+def _det3(m: Sequence[Sequence[float]]) -> float:
+    return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+
+
+def fit_cost_line(rows: Iterable[Tuple[int, int, float]], *, min_tokens: int,
+                  min_samples: int) -> Tuple[Optional[dict], str]:
+    """Least squares of ``ms = a + b*n + c*n*p_k`` over D's prefill forwards
+    ``(n, prefix_tokens, ms)`` with ``n >= min_tokens`` (``p_k`` = prefix in
+    thousands). Returns ``(line, why)``; ``line`` is ``None`` with a named
+    ``why`` when the rows cannot carry a line: too few, no spread in ``n``
+    (the slope would be one point's noise), or a non-positive slope.
+
+    The depth term falls back to 0 (``why`` says so) when the prefixes do not
+    span enough to separate it from ``b`` or it comes out negative -- a
+    per-token cost that FALLS with the prefix read is not a measurement of
+    attention, it is the fit using ``c`` to absorb noise."""
+    pts = [(float(n), float(p) / 1000.0, float(ms)) for n, p, ms in rows
+           if int(n) >= int(min_tokens) and float(ms) > 0.0]
+    if len(pts) < max(3, int(min_samples)):
+        return None, f"samples={len(pts)}<{max(3, int(min_samples))}"
+    n_lo = min(x[0] for x in pts)
+    n_hi = max(x[0] for x in pts)
+    if n_hi < 2.0 * n_lo:
+        return None, f"no-spread(n {int(n_lo)}..{int(n_hi)})"
+    why = "3p"
+    a = b = c = None
+    xs = [(1.0, n, n * pk) for n, pk, _ in pts]
+    ys = [ms for _, _, ms in pts]
+    A = [[sum(x[i] * x[j] for x in xs) for j in range(3)] for i in range(3)]
+    B = [sum(x[i] * y for x, y in zip(xs, ys)) for i in range(3)]
+    d = _det3(A)
+    scale = abs(A[0][0] * A[1][1] * A[2][2]) or 1.0
+    if abs(d) > 1e-9 * scale:
+        sol = []
+        for col in range(3):
+            m = [row[:] for row in A]
+            for i in range(3):
+                m[i][col] = B[i]
+            sol.append(_det3(m) / d)
+        a, b, c = sol
+        if c < 0.0:
+            a = None
+            why = "2p(depth-term<0)"
+    else:
+        why = "2p(no-depth-spread)"
+    if a is None:
+        mn = statistics.mean(x[0] for x in pts)
+        my = statistics.mean(ys)
+        sxx = sum((x[0] - mn) ** 2 for x in pts)
+        b = sum((x[0] - mn) * (y - my) for x, y in zip(pts, ys)) / sxx
+        a, c = my - b * mn, 0.0
+    if not b > 0.0:
+        return None, f"slope<=0(b={b:.4f})"
+    return {"a_ms": max(0.0, a), "b_ms": b, "c_ms": c, "n": len(pts),
+            "n_lo": int(n_lo), "n_hi": int(n_hi),
+            "prefix_med": int(statistics.median(x[1] for x in pts) * 1000.0)}, why
+
+
+def solve_x_cost_line(*, price_s: float, k: float, line: dict, r_p: float,
+                      prefix_tokens: float) -> Tuple[Optional[float], str]:
+    """``X*`` of the model above, in tokens (the caller clamps it to its
+    measured floor and the ceiling), or ``(None, why)`` without a price or an
+    r_P. When D's marginal token at this depth is not dearer than P's there
+    is no crossing: the round trip never pays back per token, so D is the
+    cheaper route for EVERY size while its fixed cost stays under the price
+    share (``inf``, the ceiling decides) and P for every size otherwise
+    (0, the floor decides). A price share below D's fixed cost gives 0 too."""
+    if not price_s > 0.0 or not r_p > 0.0:
+        return None, "no-price" if not price_s > 0.0 else "no-r_p"
+    per_req_ms = 1000.0 * float(price_s) / max(1.0, float(k))
+    marg_ms = float(line["b_ms"]) + float(line["c_ms"]) * float(prefix_tokens) / 1000.0
+    denom = marg_ms - 1000.0 / float(r_p)
+    num = per_req_ms - float(line["a_ms"])
+    if denom <= 0.0:
+        side = "d-never-dearer" if num > 0.0 else "p-always-cheaper"
+        return (float("inf") if num > 0.0 else 0.0), (
+            f"{side}(d={marg_ms:.3f}ms/tok<=p={1000.0 / float(r_p):.3f})")
+    return max(0.0, num / denom), "ok"
+
+
+def x_cost_line_record(*, form_key: str, line: dict, k: float, boot_tag: str,
+                       commit: Optional[str], at: str) -> dict:
+    """The sidecar entry of one fitted D cost line, keyed by ``form_key``
+    (checkpoint x form) -- a qwen27b boot never reads a nextflash line."""
+    return {
+        "kind": X_COST_LINE_KIND, "group": X_COST_LINE_GROUP, "form_key": str(form_key),
+        "a_ms": float(line["a_ms"]), "b_ms": float(line["b_ms"]), "c_ms": float(line["c_ms"]),
+        "n": int(line["n"]), "n_lo": int(line["n_lo"]), "n_hi": int(line["n_hi"]),
+        "prefix_med": int(line.get("prefix_med", 0)), "k": float(k),
+        "boot_tag": str(boot_tag), "commit": commit, "at": str(at),
+    }
+
+
+def newest_x_cost_line(samples: Iterable[dict], form_key: str) -> Optional[dict]:
+    """The newest cost-line entry of ``form_key`` among ``samples``, or ``None``."""
+    rows = [e for e in samples
+            if isinstance(e, dict) and e.get("kind") == X_COST_LINE_KIND
+            and e.get("form_key") == form_key
+            and isinstance(e.get("b_ms"), (int, float)) and float(e["b_ms"]) > 0.0]
+    return max(rows, key=lambda e: str(e.get("at", "")), default=None)
+
+
+def read_x_cost_line(path: str, form_key: str) -> Optional[dict]:
+    """:func:`newest_x_cost_line` of the sidecar at ``path``; a missing or
+    malformed sidecar is an ABSENCE (``None``), never a zero."""
+    if not path or not form_key:
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    samples = data.get("samples") if isinstance(data, dict) else None
+    return newest_x_cost_line(samples if isinstance(samples, list) else [], form_key)
+
+
 def park_verdict(status: int, text: str) -> Tuple[str, List[str], str]:
     """Read D's answer to :data:`PARK_PATH`.
 

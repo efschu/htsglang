@@ -20236,6 +20236,9 @@ class Scheduler(
 
         if _weg2_prefill_clock.armed(self.server_args):
             ret[_weg2_prefill_clock.INTERNAL_STATE_KEY] = _weg2_prefill_clock.snapshot()
+            # X-COST-LINE: D's per-forward prefill cost under load (the
+            # front fits its cost line over it; weg2/prefill_clock.py).
+            ret[_weg2_prefill_clock.COST_STATE_KEY] = _weg2_prefill_clock.cost_snapshot()
 
         if (
             not self.spec_algorithm.is_none()

@@ -523,6 +523,12 @@ class RankPrefillLog:
                 _wc.note_extend(new_tokens, gpu_s * 1000.0)
         except Exception:  # noqa: BLE001 -- an instrument feed never breaks the line
             pass
+        try:  # X-COST-LINE (weg2/prefill_clock): the measured numbers, never the parsed line
+            from sglang.srt.weg2 import prefill_clock as _pfc
+
+            _pfc.note_batch_cost(new_tokens, cached_tokens, gpu_s * 1000.0, k)
+        except Exception:  # noqa: BLE001 -- an instrument feed never breaks the line
+            pass
         line = (
             "Prefill rank batch, #new-token: %d, #cached-token: %d, "
             "#chunks: %d, gpu-ms: %.1f"
