@@ -1521,6 +1521,142 @@ def cached_tier_of(body: Any) -> Optional[Dict[str, int]]:
     return None
 
 
+#: The wires on which the front ASKS its internal hops for the tier split
+#: (``return_cached_tokens_details``, Operator 29.09.). ``/generate`` carries
+#: ``meta_info.cached_tokens_details`` unasked and is left alone.
+CACHED_TIER_ASK_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/messages")
+
+
+def cached_tier_asked(payload: Any) -> bool:
+    """Did this request body (the CLIENT's) ask for the tier split itself?"""
+    return isinstance(payload, dict) and bool(payload.get("return_cached_tokens_details"))
+
+
+def with_cached_tier_ask(payload: dict, path: str) -> dict:
+    """The body of an internal P/D hop: the client's, plus the tier ask. A new
+    dict -- the client's body is never mutated (a re-route re-sends it)."""
+    if path not in CACHED_TIER_ASK_PATHS or cached_tier_asked(payload):
+        return payload
+    out = dict(payload)
+    out["return_cached_tokens_details"] = True
+    return out
+
+
+_SGLEXT_KEY_RE = re.compile(rb'"sglext"\s*:\s*\{')
+_TIER_MEMBER_RE = re.compile(rb'"cached_tokens_details"\s*:\s*\{[^{}]*\}')
+
+
+def _json_obj_end(buf: bytes, start: int) -> int:
+    """Index after the JSON object opening at ``buf[start] == '{'`` (strings
+    and escapes respected); -1 when it does not close inside ``buf``."""
+    depth, i, n, in_str = 0, start, len(buf), False
+    while i < n:
+        c = buf[i]
+        if in_str:
+            if c == 0x5C:  # backslash
+                i += 1
+            elif c == 0x22:
+                in_str = False
+        elif c == 0x22:
+            in_str = True
+        elif c == 0x7B:
+            depth += 1
+        elif c == 0x7D:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def _drop_member(buf: bytes, start: int, end: int) -> bytes:
+    """Remove the object member ``buf[start:end]`` (``"key":value``) with its
+    separating comma, so the object reads as if it never had it."""
+    j = start - 1
+    while j >= 0 and buf[j] in b" \t\r\n":
+        j -= 1
+    if j >= 0 and buf[j] == 0x2C:
+        return buf[:j] + buf[end:]
+    k = end
+    while k < len(buf) and buf[k] in b" \t\r\n":
+        k += 1
+    if k < len(buf) and buf[k] == 0x2C:
+        return buf[:start] + buf[k + 1:]
+    return buf[:start] + buf[end:]
+
+
+def _strip_tier_doc(doc: bytes, path: str, stream: bool) -> Optional[bytes]:
+    """One JSON document (a body or one SSE data line) as D writes it WITHOUT
+    ``return_cached_tokens_details``; None = D would not have sent this stream
+    event at all. Byte surgery on D's own bytes -- nothing else is re-serialized.
+
+    Both wires drop unset members: ``SglExt`` serializes without its None fields
+    and the responses drop a None ``sglext`` (openai/protocol.py 527/561/595;
+    the Anthropic adapter serializes exclude_none). So the member goes, and what
+    D would have written for the REST follows D's own rule: OpenAI non-stream
+    builds sglext only for ``routed_experts or weg2_prefill_s or
+    weg2_resumable_depth is not None`` (serving_chat 1414), OpenAI stream emits
+    the sglext chunk only for ``routed_experts is not None or
+    weg2_resumable_depth is not None`` (serving_chat 1309), Anthropic drops an
+    empty sglext (``_sglext_of``)."""
+    m = _SGLEXT_KEY_RE.search(doc)
+    if m is None:
+        return doc
+    obj_start = m.end() - 1
+    obj_end = _json_obj_end(doc, obj_start)
+    if obj_end < 0:
+        return doc
+    ext_bytes = doc[obj_start:obj_end]
+    tm = _TIER_MEMBER_RE.search(ext_bytes)
+    if tm is None:
+        return doc
+    rest = _drop_member(ext_bytes, tm.start(), tm.end())
+    try:
+        left = json.loads(rest)
+    except ValueError:
+        return doc
+    if path == "/v1/messages":
+        empty = not left
+    elif stream:
+        empty = left.get("routed_experts") is None and left.get("weg2_resumable_depth") is None
+    else:
+        empty = not (left.get("routed_experts") or left.get("weg2_prefill_s")
+                     or left.get("weg2_resumable_depth") is not None)
+    if not empty:
+        return doc[:obj_start] + rest + doc[obj_end:]
+    if stream and path != "/v1/messages":
+        return None                                  # D writes no sglext chunk at all
+    return _drop_member(doc, m.start(), obj_end)
+
+
+def strip_cached_tier(data: bytes, path: str, stream: bool) -> bytes:
+    """What the client gets: D's answer without the tier split the FRONT asked
+    for (the caller checks the client did not ask itself). A body, or the END
+    of a stream (every SSE event after the finish marker, read once, never per
+    decode chunk). Bytes without the key come back untouched."""
+    if b"cached_tokens_details" not in data:
+        return data
+    if not stream:
+        return _strip_tier_doc(data, path, False)
+    out = []
+    for event in data.split(b"\n\n"):
+        if b"cached_tokens_details" not in event:
+            out.append(event)
+            continue
+        lines = event.split(b"\n")
+        for i, line in enumerate(lines):
+            if line.startswith(b"data:") and b"cached_tokens_details" in line:
+                head = b"data: " if line.startswith(b"data: ") else b"data:"
+                doc = _strip_tier_doc(line[len(head):], path, True)
+                if doc is None:
+                    lines = None
+                    break
+                lines[i] = head + doc
+        if lines is not None:
+            out.append(b"\n".join(lines))
+    return b"\n\n".join(out)
+
+
 def cached_tier_stream_tail(tail: bytes) -> Optional[Dict[str, int]]:
     """:func:`cached_tier_of` of the LAST streamed chunk that carries it."""
     for raw in reversed(tail.split(b"\n")):
@@ -7596,7 +7732,7 @@ class Front:
         t0 = time.time()
 
         async def _post() -> Tuple[int, bytes]:
-            async with self.session.post(f"{g.url}{p.path}", json=payload) as resp:
+            async with self.session.post(f"{g.url}{p.path}", json=with_cached_tier_ask(payload, p.path)) as resp:
                 return resp.status, await resp.read()
 
         try:
@@ -7863,7 +7999,11 @@ class Front:
                     bodies[rid] = (request.path, payload)
                     while len(bodies) > 256:
                         bodies.pop(next(iter(bodies)))
-            async with self.session.post(f"{g.url}{request.path}", json=payload) as r:
+            # Feld 2 (Operator 29.09.): the internal hop asks for the tier split;
+            # the client gets it only if it asked itself (strip below).
+            _strip_tier = not cached_tier_asked(payload) and request.path in CACHED_TIER_ASK_PATHS
+            async with self.session.post(f"{g.url}{request.path}",
+                                         json=with_cached_tier_ask(payload, request.path)) as r:
                 # FIX 2 (round 1): LAW 4's RE-ROUTE IS DECIDED BEFORE THE
                 # RESPONSE IS COMMITTED, ON BOTH WIRE SHAPES.  The check used
                 # to sit below the `if stream:` branch, which returns; so for
@@ -8066,6 +8206,29 @@ class Front:
                     # closes, D stops decoding for a client that is gone).
                     client_io = {"gone": False, "finished": False, "early": False,
                                  "err": None, "deadline": 0.0}
+                    # Feld 2: the client only ever gets COMPLETE SSE events; a
+                    # trailing partial one waits for the next read (a chunk that
+                    # ends on an event boundary -- D's normal case -- is one
+                    # endswith, nothing held, nothing parsed). From the finish
+                    # marker on, the written events lose the tier split the
+                    # front asked for (the sglext chunk / message_delta, whose
+                    # head must not have left before the marker). H61's hang-up
+                    # timing is unchanged: the finish event still leaves before
+                    # D's usage.
+                    tier_carry: Optional[bytearray] = bytearray() if _strip_tier else None
+
+                    async def _write_client(chunk: bytes) -> None:
+                        try:
+                            await resp.write(chunk)
+                        except ConnectionError as e:
+                            # aiohttp's ClientConnectionResetError is a
+                            # ConnectionResetError; the drain waiter's
+                            # "Connection lost" is a plain ConnectionError.
+                            client_io["gone"] = True
+                            if not client_io["finished"]:
+                                client_io["early"] = True
+                                client_io["err"] = e
+                                client_io["deadline"] = time.monotonic() + H61B_END_GRACE_S
 
                     async def _push(chunk: bytes) -> None:
                         if anth is not None:
@@ -8084,17 +8247,19 @@ class Front:
                         if len(tail) > 262144:
                             del tail[:-131072]
                         if not client_io["gone"]:
-                            try:
-                                await resp.write(chunk)
-                            except ConnectionError as e:
-                                # aiohttp's ClientConnectionResetError is a
-                                # ConnectionResetError; the drain waiter's
-                                # "Connection lost" is a plain ConnectionError.
-                                client_io["gone"] = True
-                                if not client_io["finished"]:
-                                    client_io["early"] = True
-                                    client_io["err"] = e
-                                    client_io["deadline"] = time.monotonic() + H61B_END_GRACE_S
+                            if tier_carry is not None:
+                                if tier_carry or not chunk.endswith(b"\n\n"):
+                                    tier_carry.extend(chunk)
+                                    cut = tier_carry.rfind(b"\n\n")
+                                    if cut < 0:
+                                        return
+                                    chunk = bytes(tier_carry[:cut + 2])
+                                    del tier_carry[:cut + 2]
+                                if client_io["finished"]:
+                                    chunk = strip_cached_tier(chunk, request.path, True)
+                                    if not chunk:
+                                        return
+                            await _write_client(chunk)
 
                     async def _next_d_chunk() -> bytes:
                         # Same reads as `r.content.iter_any()`; bounded by the
@@ -8124,6 +8289,9 @@ class Front:
                             if getattr(self, "_rvp_p_done", None) and rid in self._rvp_p_done:
                                 self._rvp_resumed(rid)
                             await _push(restate_inband_refusal(chunk, request.path))
+                    if tier_carry and not client_io["gone"]:
+                        await _write_client(strip_cached_tier(bytes(tier_carry), request.path, True))
+                    tier_carry = None  # D has ended: anything pushed after this (TN) goes out as is
                     if client_io["gone"] and not client_io["finished"]:
                         # The client left and D's stream ended without an end
                         # marker: not served, exactly as before H61b.
@@ -8345,6 +8513,8 @@ class Front:
                     return web.Response(body=restate_inband_refusal(body, request.path),
                                         status=503, content_type=r.content_type,
                                         headers={"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)})
+                if _strip_tier:
+                    body = strip_cached_tier(body, request.path, False)
                 return web.Response(body=body, status=r.status, content_type=r.content_type)
         except Weg2Stop:
             raise
