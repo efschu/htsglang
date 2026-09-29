@@ -179,6 +179,63 @@ class FieldSwitchTests(unittest.TestCase):
         self.assertEqual((s["ipc"], s["log"], s["n"]), (0, len(ipcfields.KEYS), len(ipcfields.KEYS)))
 
 
+#: the reader fixture of /spinning/gpu-arb/docs/RANKSTATS-S3-SCHEMA-0929.md, verbatim (producer 9969bd336b)
+S3_FIXTURE = json.loads("""
+{"schema":"weg2.rankstats/1","pid":1,"ts":1790680000.0,"seq":12,"group":"P","tp_rank":0,"pp_rank":0,
+ "rank_state_seq":null,"work":{"forward_ct":40},"tokens":{"prefill_total":65536,"decode_total":0},
+ "spec":{"accept_tokens_total":0,"forward_ct_total":0},
+ "sched":{"waiting":1,"running":0,"queue_req":1,"running_req":0,"pending_tokens":16384},
+ "prefill":{"chunks":4,"new_tokens":65536,"cached_tokens":0,"gpu_ms":11240.0,"split_ms":11240.0,
+            "compute_ms":11240.0,"wait_ms":0.0,"bubble_ms":698.0,
+            "last":{"t":1790679999.1,"new":16384,"gpu_ms":2810.0,"compute_ms":2810.0}},
+ "decode":{"rounds":null,"gpu_ms":null,"gpu_ms_by_bs":null,"tokens":0,"running":null,
+           "accept_len_ewma":null,"accept_rate_ewma":null,"cuda_graph":null},
+ "cache":{"loadback_n":0,"loadback_tok":0,"mamba_resume_n":0,"mamba_tok":null,"store_incomplete_n":0,
+          "prefetch":{"attempted":3,"issued":2,"landed":1,"deferred":1,"expired":0,"refused":0}},
+ "errors":{"n":0,"last":[]},"last_post_wake":null}
+""")
+
+
+class SchemaS3FixtureTests(unittest.TestCase):
+    """The producer's own fixture (RANKSTATS-S3-SCHEMA-0929): what switches, what stays on the log."""
+
+    def setUp(self):
+        self.rank = {"rankstats": {"P.tp0pp0": copy.deepcopy(S3_FIXTURE)}, "rankstate": {}}
+        self.f = ipcfields.resolve(None, self.rank, _logv(), rates={})
+
+    def test_blocks_switch(self):
+        f = self.f
+        self.assertEqual(f["C1"]["src"], "ipc")
+        self.assertEqual(f["C1"]["value"]["P.tp0pp0"]["gpu_ms"], 11240.0)
+        self.assertEqual(f["C2"]["value"]["P.tp0pp0"]["pending_tokens"], 16384)
+        self.assertEqual(f["E1"]["value"]["P.tp0pp0"], 0)                   # 0 is a value, not a missing source
+        self.assertEqual(f["E2"]["value"]["P.tp0pp0"]["prefetch"]["landed"], 1)
+        span = f["D1"]["value"]["P.tp0pp0"][0]
+        self.assertEqual((span["t1"], span["t0"], span["kind"]), (1790679999.1, round(1790679999.1 - 2.81, 3), "prefill"))
+        self.assertEqual(f["D2"]["src"], "log")                              # no D rank in the fixture
+
+    def test_nulls_stay_on_the_log_with_the_label(self):
+        f = self.f
+        self.assertEqual(f["E2"]["from_log"], ["mamba_tok", "prefetch.timeout"])
+        self.assertEqual(f["E2"]["from_log_label"], "aus Log (Übergang)")
+        self.assertEqual(f["C2"]["from_log"], ["full_token_usage"])
+        # a P rank's decode block is all null (+ tokens 0): C3/C4 do not switch on it
+        self.assertEqual(f["C3"]["src"], "log")
+        self.assertEqual(f["C4"]["src"], "log")
+
+    def test_compute_honest_rate_is_new_over_gpu_ms(self):
+        r = ipcfields.Rates()
+        a = copy.deepcopy(S3_FIXTURE)
+        b = copy.deepcopy(S3_FIXTURE)
+        b["ts"] += 2.0
+        b["prefill"]["new_tokens"] += 16384
+        b["prefill"]["gpu_ms"] += 2810.0
+        b["prefill"]["compute_ms"] += 9999.0                                  # not the denominator
+        r.update("b", {"P.tp0pp0": a})
+        out = r.update("b", {"P.tp0pp0": b})
+        self.assertAlmostEqual(out["P.tp0pp0"]["prefill_tps_gpu"], 16384 / 2.81, places=1)
+
+
 class RatesTests(unittest.TestCase):
     def test_delta_rates_and_restart(self):
         r = ipcfields.Rates()

@@ -324,8 +324,11 @@ const fieldIpc = (b, k) => { const f = (b.fields || {})[k]; return f && f.src ==
 const srcOf = (b, ...keys) => {
   const on = keys.map((k) => fieldIpc(b, k)).filter(Boolean);
   const off = keys.filter((k) => !fieldIpc(b, k));
+  // sub-fields the IPC record carries as null (RANKSTATS-S3-SCHEMA: source missing on this rank) stay on the log
+  const part = on.flatMap((f) => (f.from_log || []).map((s) => f.key + "." + s));
   const tag = on.length ? ipcTag([...new Set(on.map((f) => f.ipc_src))].join(" + ")) : "";
-  return off.length ? (tag ? tag + " " : "") + LOGSRC.replace('title="', `title="Felder aus Log: ${off.join(", ")}. `) : tag;
+  const miss = [...off, ...part];
+  return miss.length ? (tag ? tag + " " : "") + LOGSRC.replace('title="', `title="Felder aus Log: ${miss.join(", ")}. `) : tag;
 };
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("de-DE", {maximumFractionDigits: d, minimumFractionDigits: d});

@@ -42,11 +42,26 @@ KEYS = ("A1", "A4", "A12", "A13", "A14", "A15",
         "F3", "F4", "F6")
 
 
-def field(key: str, ipc_value, ipc_src: Optional[str], log_value) -> dict:
-    """The switch: IPC when present, else the log value with its label."""
+def field(key: str, ipc_value, ipc_src: Optional[str], log_value, from_log: Optional[List[str]] = None) -> dict:
+    """The switch: IPC when present, else the log value with its label.  ``from_log`` names the
+    sub-fields the IPC record carries as null (RANKSTATS-S3-SCHEMA: null = the source is missing
+    on this rank, never 0) -- those stay on the log with the label."""
     if ipc_value is not None:
-        return {"key": key, "src": "ipc", "ipc_src": ipc_src, "value": ipc_value, "label": None}
+        f = {"key": key, "src": "ipc", "ipc_src": ipc_src, "value": ipc_value, "label": None}
+        if from_log:
+            f["from_log"] = sorted(set(from_log))
+            f["from_log_label"] = LOG_LABEL
+        return f
     return {"key": key, "src": "log", "ipc_src": None, "value": log_value, "label": LOG_LABEL}
+
+
+def _nulls(rows: dict, names) -> List[str]:
+    """The named sub-fields that are null (or absent) in every rank row that carries the block."""
+    return [n for n in names if rows and all((r or {}).get(n) is None for r in rows.values())]
+
+
+def _non_null(d) -> bool:
+    return isinstance(d, dict) and any(v is not None for v in d.values())
 
 
 # ----------------------------------------------------------------------------- rank files
@@ -110,10 +125,12 @@ class Rates:
             pk = boot + "/" + k
             p = self.prev.get(pk)
             ts = float(rec.get("ts") or 0)
+            pre = rec.get("prefill") or {}
+            # RANKSTATS-S3-SCHEMA-0929: the compute-honest rate is Δnew_tokens / Δgpu_ms
             cur = {"ts": ts, "prefill": _num((rec.get("tokens") or {}).get("prefill_total")),
                    "decode": _num((rec.get("tokens") or {}).get("decode_total")),
-                   "pnew": _num((rec.get("prefill") or {}).get("new_tokens")),
-                   "pcomp": _num((rec.get("prefill") or {}).get("compute_ms"))}
+                   "pnew": _num(pre.get("new_tokens")),
+                   "pcomp": _num(pre.get("gpu_ms") if pre.get("gpu_ms") is not None else pre.get("compute_ms"))}
             if p is None or ts <= p["ts"]:
                 if p is None or ts != p["ts"]:
                     self.prev[pk] = cur
@@ -265,25 +282,28 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
 
     # C1 prefill per rank (plan §3 rankstats.prefill), rate from deltas
     c1 = {k: dict(rec["prefill"], **{kk: v for kk, v in (rates.get(k) or {}).items() if kk.startswith("prefill")})
-          for k, rec in stats.items() if isinstance(rec.get("prefill"), dict)} or None
+          for k, rec in stats.items() if _non_null(rec.get("prefill"))} or None
     f["C1"] = field("C1", c1, "rankstats.prefill", logv.get("prefill"))
 
-    # C2 scheduler queue: rankstats.sched (waiting/running, §3 queue_req/pending_tokens)
+    # C2 scheduler queue: rankstats.sched (waiting/running; §3 queue_req, running_req, pending_tokens);
+    # full_token_usage is not in the record yet -> that sub-field stays on the log
     c2 = {k: rec["sched"] for k, rec in stats.items() if isinstance(rec.get("sched"), dict)} or None
-    f["C2"] = field("C2", c2, "rankstats.sched", logv.get("queue_log"))
+    f["C2"] = field("C2", c2, "rankstats.sched", logv.get("queue_log"),
+                    from_log=_nulls(c2 or {}, ("full_token_usage",)) if c2 else None)
 
-    # C3 decode: rankstats.decode (§3) or tokens.decode_total + spec (2188e1bd98)
+    # C3 decode: rankstats.decode (§3; running/accept/cuda_graph only on the stats rank TP0,
+    # null elsewhere) or tokens.decode_total + spec (2188e1bd98)
     c3 = {}
     for k, rec in stats.items():
         dec = rec.get("decode") if isinstance(rec.get("decode"), dict) else {}
         spec = rec.get("spec") or {}
-        row = dict(dec)
+        row = {kk: v for kk, v in dec.items() if v is not None}
         fct, acc = spec.get("forward_ct_total"), spec.get("accept_tokens_total")
         if fct:
             row.setdefault("accept_len_mean", round(float(acc or 0) / float(fct), 3))
         if "decode_tps" in (rates.get(k) or {}):
             row["gen_tps"] = rates[k]["decode_tps"]
-        if dec or fct or "gen_tps" in row:
+        if any(v not in (None, 0) for kk, v in row.items() if kk != "tokens") or row.get("tokens"):
             c3[k] = row
     f["C3"] = field("C3", c3 or None, "rankstats.decode/spec + Deltas", logv.get("decode"))
 
@@ -307,13 +327,26 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
     # C7 rates from deltas
     f["C7"] = field("C7", rates or None, "rankstats Deltas", logv.get("series"))
 
-    # D1/D2 work spans (§3 rankstats.work.spans)
-    spans = {k: (rec.get("work") or {}).get("spans") for k, rec in stats.items()
-             if (rec.get("work") or {}).get("spans")}
-    d1 = {k: [s for s in v if s.get("kind") != "extend"] for k, v in spans.items() if _grp(k) != "D"} or None
-    d2 = {k: [s for s in v if s.get("kind") == "extend"] for k, v in spans.items() if _grp(k) == "D"} or None
-    f["D1"] = field("D1", d1, "rankstats.work.spans", (logv.get("timeline") or {}).get("P"))
-    f["D2"] = field("D2", d2, "rankstats.work.spans kind=extend", (logv.get("timeline") or {}).get("D"))
+    # D1/D2 work per forward: rankstats.work.spans when a producer keeps them, else the §3
+    # prefill.last {t, gpu_ms} (the last timed forward: end t, start t - gpu_ms) + chunks as the
+    # forward sequence.  P ranks -> D1 (prefill), D ranks -> D2 (the extend of a D phase).
+    work = {}
+    for k, rec in stats.items():
+        sp = (rec.get("work") or {}).get("spans")
+        last = (rec.get("prefill") or {}).get("last") or {}
+        if sp:
+            work[k] = sp
+        elif last.get("t") is not None and last.get("gpu_ms") is not None:
+            t1 = float(last["t"])
+            work[k] = [{"t0": round(t1 - float(last["gpu_ms"]) / 1000.0, 3), "t1": t1,
+                        "kind": "extend" if _grp(k) == "D" else "prefill", "new": last.get("new"),
+                        "seq": (rec.get("prefill") or {}).get("chunks")}]
+    d1 = {k: [s for s in v if s.get("kind") != "extend"] for k, v in work.items() if _grp(k) != "D"}
+    d2 = {k: [s for s in v if s.get("kind") == "extend"] for k, v in work.items() if _grp(k) == "D"}
+    d1 = {k: v for k, v in d1.items() if v} or None
+    d2 = {k: v for k, v in d2.items() if v} or None
+    f["D1"] = field("D1", d1, "rankstats.work.spans / prefill.last", (logv.get("timeline") or {}).get("P"))
+    f["D2"] = field("D2", d2, "rankstats.work.spans / prefill.last (D)", (logv.get("timeline") or {}).get("D"))
 
     # D3 flip grey / tail class: B1 + B3 + B7 together
     d3 = ({"first_work": f["B1"]["value"], "done": f["B3"]["value"], "post_wake": f["B7"]["value"]}
@@ -332,8 +365,14 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
     f["E1"] = field("E1", e1, "rankstats.prefill.cached_tokens", logv.get("cache"))
 
     # E2 loadback / mamba resume / store incomplete / prefetch (§3 rankstats.cache)
+    # (§3: mamba_tok is not counted yet (null); prefetch carries attempted/issued/landed/deferred/
+    # expired/refused -- no timeout; both stay on the log with the label)
     e2 = {k: rec["cache"] for k, rec in stats.items() if isinstance(rec.get("cache"), dict)} or None
-    f["E2"] = field("E2", e2, "rankstats.cache", logv.get("cache"))
+    e2_log = None
+    if e2:
+        e2_log = _nulls(e2, ("mamba_tok",)) + (
+            ["prefetch.timeout"] if all("timeout" not in ((r or {}).get("prefetch") or {}) for r in e2.values()) else [])
+    f["E2"] = field("E2", e2, "rankstats.cache", logv.get("cache"), from_log=e2_log)
 
     # E3 served tokens per leg
     f["E3"] = field("E3", front.get("served_tokens") or None, "state.json front.served_tokens",
