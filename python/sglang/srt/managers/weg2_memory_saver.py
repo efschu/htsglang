@@ -3282,6 +3282,60 @@ def current_weights_region_tag() -> str:
     return _WEIGHTS_REGION_TAG
 
 
+def capture_weights_region_for_thread() -> Optional[tuple]:
+    """BOOTZEIT 3 Stufe 1: what another thread needs to allocate like this one.
+
+    Called on the thread that holds the open weights region (the loader).
+    Returns ``(cdll, tag, enable_cpu_backup)`` when a TMS region is open here
+    and it is the BASE weights region (the only one ``weight_chunk_scope``
+    subdivides); None otherwise -- then the caller must keep the work on this
+    thread, because a second thread could not reproduce the tagging.
+    """
+    cdll = _tms_cdll_in_region()
+    if cdll is None or _WEIGHTS_REGION_TAG != GPU_MEMORY_TYPE_WEIGHTS:
+        return None
+    # Without layer bands ``weight_chunk_scope`` is a no-op, and the presplit's
+    # ``outside_tag_pool`` would step out of the LOADER's base pool -- from
+    # another thread, tearing the loader's routing. Not mirrorable.
+    if weight_chunk_geometry()[0] <= 0:
+        return None
+    try:
+        backup = bool(cdll.tms_get_enable_cpu_backup())
+    except Exception:  # noqa: BLE001 -- a hook without the getter: no backup
+        backup = False
+    return (cdll, _WEIGHTS_REGION_TAG, backup)
+
+
+@contextmanager
+def mirrored_weights_region(captured: Optional[tuple]) -> Iterator[bool]:
+    """On a worker thread: the TMS thread-local config of ``captured``.
+
+    ONLY the saver's thread-local state (interesting region, current tag, cpu
+    backup) -- deliberately NOT the region's ``use_mem_pool(primary)`` nor the
+    base tag pool: torch's ``_cuda_endAllocateToPool`` drops the FIRST routing
+    entry of a pool id, whichever thread made it, so two threads routed to one
+    pool would tear each other's routing. Every allocation of the presplit
+    happens inside ``weight_chunk_scope``, whose band pool only this thread
+    routes to during the load.
+    """
+    if captured is None:
+        yield False
+        return
+    cdll, tag, backup = captured
+    if cdll.tms_get_interesting_region():
+        raise RuntimeError(
+            "mirrored_weights_region: this thread already has a TMS region open "
+            "-- a mirror must start from a clean thread")
+    cdll.tms_set_current_tag(tag.encode("utf-8"))
+    cdll.tms_set_enable_cpu_backup(bool(backup))
+    cdll.tms_set_interesting_region(True)
+    try:
+        yield True
+    finally:
+        cdll.tms_set_interesting_region(False)
+        cdll.tms_set_current_tag(b"default")
+
+
 @contextmanager
 def weights_region_tag(tag: str) -> Iterator[str]:
     """Publish the weights region's tag for the duration of the region."""

@@ -1512,9 +1512,11 @@ class FusedMoE(torch.nn.Module):
             # holds the tag; on the loader thread it runs right here.
             from sglang.srt.model_loader import load_consumer
 
+            # BOOTZEIT 3 Stufe 1 (SGLANG_LOAD_PRESPLIT_THREAD): or to the
+            # presplit thread, which mirrors the loader's tag (load_consumer).
             _pool = load_consumer.current_pool()
-            if _pool is not None and not _pool.on_loader_thread():
-                _pool.defer_to_loader(lambda: self._ct_stream_presplit_now(state))
+            if _pool is not None:
+                _pool.run_presplit(lambda: self._ct_stream_presplit_now(state))
             else:
                 self._ct_stream_presplit_now(state)
 
