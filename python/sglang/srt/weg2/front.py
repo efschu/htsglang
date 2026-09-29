@@ -5347,6 +5347,8 @@ class Front:
                     "force_close" if _ka_client is None else "%.1f s" % _ka_client, _ka_server, _ka_src)
         app["controller"] = asyncio.create_task(self.controller())
         app["admitter"] = asyncio.create_task(self.d_admitter())
+        if getattr(self, "dual_layout", False) and getattr(self, "dual_dbusy_file", ""):
+            app["dual_dbusy"] = asyncio.create_task(self.dual_dbusy_writer())
         app["health"] = asyncio.create_task(self.health_poller())
         app["corridor"] = asyncio.create_task(self.corridor_sampler())
         # #1262 tier 3 -- the deadman's third signal, see flip_stall_check.
@@ -10881,6 +10883,20 @@ class Front:
                        queue_name, len(self.queue))
         return True
 
+    async def dual_dbusy_writer(self, period_s: float = 0.02) -> None:
+        """DUAL-TP3PP3 --dual-p-duty: publish whether D holds decodes (its
+        outstanding set, the admitted seats included) for P's duty throttle."""
+        from sglang.srt.weg2.dual_duty import DBusyWriter
+
+        w = DBusyWriter(self.dual_dbusy_file)
+        D = self.groups["D"]
+        while True:
+            try:
+                w.update(bool(D.outstanding) or self._handoff_in_flight() > 0)
+            except Exception as e:  # noqa: BLE001 -- a missing signal means no throttle
+                logger.warning("WEG2 DUAL-DBUSY write failed: %s", e)
+            await asyncio.sleep(period_s)
+
     def _dual_pump(self, pass_fn) -> None:
         """DUAL-TP3PP3: keep ONE P drain pass running while the queue holds
         work. A pass ends when the queue is empty (law 1), at the H91 cap or on
@@ -11992,6 +12008,9 @@ def main():
                          "to P; the parked ones resume first after the flip back. Unset = "
                          "SGLANG_WEG2_D_PARK_IMMEDIATE / the profile's d_park_immediate (on for qwen27b "
                          "and nextflash). D needs the same switch (its flip park).")
+    ap.add_argument("--dual-dbusy-file", default="",
+                    help="DUAL-TP3PP3 --dual-p-duty: the file the front rewrites with '1'/'0' when D's "
+                         "outstanding set turns non-empty/empty; P's first stage throttles on it.")
     ap.add_argument("--dual-layout", action="store_true", default=False,
                     help="DUAL-TP3PP3 (F26): both groups stay awake, the front never flips; leg 1 "
                          "goes to P at once, leg 2 to D right after leg 1 (prefix from the store). "
@@ -12177,6 +12196,7 @@ def main():
     # DUAL-TP3PP3: set after construction so the constructor call above stays
     # the one pinned by test_27b_park_immediate (the class default is off).
     front.dual_layout = bool(getattr(args, "dual_layout", False))
+    front.dual_dbusy_file = str(getattr(args, "dual_dbusy_file", "") or "")
     if front.dual_layout:
         logger.info("WEG2 DUAL-LAYOUT on: both groups stay awake, the front never flips; "
                     "leg 1 -> P at once, leg 2 -> D right after leg 1")

@@ -13601,6 +13601,20 @@ def dual_share_planned_dc(cards, budgets_p: List[int], extra_p: str, overhead_mi
     return {c.uuid: int(eff[i]) + int(overhead_mib) for i, c in enumerate(cards)}
 
 
+def dual_duty_env(ns) -> Dict[str, str]:
+    """DUAL-TP3PP3 --dual-p-duty below 1: P's throttle env (the front gets the
+    same signal file on its argv). {} when off."""
+    duty = float(getattr(ns, "dual_p_duty", 1.0))
+    if not (0.0 < duty <= 1.0):
+        raise Weg2DualLayoutRefused(f"DUAL-TP3PP3: --dual-p-duty {duty} outside (0, 1]")
+    if duty >= 1.0 or not getattr(ns, "dual_layout", False):
+        return {}
+    from sglang.srt.weg2.dual_duty import dbusy_path
+
+    return {"SGLANG_WEG2_DUAL_P_DUTY": f"{duty:.3f}",
+            "SGLANG_WEG2_DUAL_DBUSY_FILE": dbusy_path(ns.tag)}
+
+
 def dual_p_sm_env(ns) -> Dict[str, str]:
     """DUAL-TP3PP3: P's MPS SM share (only with --dual-mps on, only below 100)."""
     pct = int(getattr(ns, "dual_p_sm_pct", 100))
@@ -20691,6 +20705,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="DUAL-TP3PP3 --dual-share: what P holds on a card outside its "
                          "--rank-gpu-memory-mib budget (CUDA context, graphs, activations), charged "
                          "when D is sized from P's plan instead of P's measurement.")
+    ap.add_argument("--dual-p-duty", type=float, default=1.0,
+                    help="DUAL-TP3PP3: the share of wall time P's first stage may compute while D holds "
+                         "decodes (weg2/dual_duty.py; the latency guard WITHOUT MPS). 1.0 = off. The front "
+                         "publishes D's busy bit, P's PP0 idles t_fwd*(1-duty)/duty after each forward.")
     ap.add_argument("--dual-p-sm-pct", type=int, default=100,
                     help="DUAL-TP3PP3 with --dual-mps on: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for group P, "
                          "i.e. the share of SMs P's kernels may occupy while D decodes. MEASURED 29.09. "
@@ -24930,6 +24948,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns._dual_mps_env = start_dual_mps(ns, log, dry)
     spec_p.env.update(ns._dual_mps_env)
     spec_p.env.update(dual_p_sm_env(ns))
+    spec_p.env.update(dual_duty_env(ns))
     spec_p.env.update(dual_share_env(ns, "P"))
     launch_group(spec_p, tree, log, dry)
     ns._dual_spec_d = None
@@ -25774,7 +25793,9 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
     ] + (["--weights-resident"] if getattr(ns, "flip_weights", "family") == "resident" else []) + (
-        ["--dual-layout"] if getattr(ns, "dual_layout", False) else []) + [
+        ["--dual-layout"] if getattr(ns, "dual_layout", False) else []) + (
+        ["--dual-dbusy-file", dual_duty_env(ns)["SGLANG_WEG2_DUAL_DBUSY_FILE"]]
+        if dual_duty_env(ns) else []) + [
         "--carrier-max-tokens", str(carrier_max_tokens),
         "--p-concurrency", str(p_bs),
         "--d-bs", str(d_bs),

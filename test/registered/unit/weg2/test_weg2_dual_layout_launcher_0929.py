@@ -87,6 +87,7 @@ class DualLayoutLauncher(CustomTestCase):
                       "        host_ledger.append_measured_record(", src)
         # MPS env reaches BOTH groups, before each launch.
         self.assertIn("spec_p.env.update(ns._dual_mps_env)\n    spec_p.env.update(dual_p_sm_env(ns))\n"
+                      "    spec_p.env.update(dual_duty_env(ns))\n"
                       "    spec_p.env.update(dual_share_env(ns, \"P\"))\n    launch_group(spec_p", src)
         self.assertIn('spec_d.env.update(getattr(ns, "_dual_mps_env", None) or {})\n        launch_group(spec_d',
                       src)
