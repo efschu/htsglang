@@ -12236,6 +12236,12 @@ def group_form_block(env) -> Optional[dict]:
     return {**f.axes(), "profile": f.profile, "model": f.model, "describe": f.describe()}
 
 
+def front_launch_fields(argv: Sequence[str], env: Dict[str, str]) -> dict:
+    """Nutzer 29.09. (rigdash „komplette Startflags inkl. ENV“): state.json
+    launch.front = das exec'te argv der Front (redigiert wie im Log) + ihre Umgebung."""
+    return {"launch.front": state_file_mod.launch_snapshot(admin_key_mod.redact_argv(argv), env)}
+
+
 def release_shared_cache(spec_d: GroupSpec, log: Log) -> Optional[dict]:
     """W98 (z30u): BOOTZEIT 3 Stufe 2b's kept ranges dropped AFTER group D is
     ready -- D's take-over is over, so the boot time does not pay for it. One
@@ -24905,6 +24911,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ffh = open(front_log, "ab")
     fp = subprocess.Popen(front_argv, env=fenv, stdout=ffh, stderr=subprocess.STDOUT, cwd=tree, start_new_session=True)
     state.pids["front"] = fp.pid
+    boot_state_write(log, fields=front_launch_fields(front_argv, fenv))
     # H135b: the front into the state json AND the registry at once -- until the
     # LAUNCHED write below (behind wait_ready and the deadmen) a guard-run
     # `--teardown` would not know the front by pid.

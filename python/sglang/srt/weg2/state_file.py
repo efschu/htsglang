@@ -46,6 +46,7 @@ import contextlib
 import datetime as _dt
 import fcntl
 import json
+import re
 import os
 import secrets
 import subprocess
@@ -71,10 +72,13 @@ ORIGINS = ("preflight", "launcher", "rank", "front", "deadman", "operator", "con
 STOP_REASONS = ("stop_file", "operator", "window_end", "max_deaths", "probes_done", "d2_done")
 #: `deadman` (Phase 2): nur Herzschlag, Event deadman_verdict und stop_request.json -- keine Felder, keine Zustände
 WRITERS = ("host", "launcher", "front", "deadman")
-#: A1c Feld-Eigentum: oberstes Feld je Schreiber (heartbeat.<name> schreibt jeder für sich)
+#: A1c Feld-Eigentum: oberstes Feld je Schreiber (heartbeat.<name> schreibt jeder für sich).
+#: Ein Eintrag mit Punkt besitzt nur diesen Teilbaum: ``launch`` teilen sich Host
+#: (launch.container) und Launcher (launch.front), Nutzer 29.09. Startflags im rigdash.
 OWNED_FIELDS = {
-    "host": ("tag", "line", "rev", "image", "image_id", "container", "profile", "gpuq_id", "front"),
-    "launcher": ("groups", "invariants"),
+    "host": ("tag", "line", "rev", "image", "image_id", "container", "profile", "gpuq_id", "front",
+             "launch.container"),
+    "launcher": ("groups", "invariants", "launch.front"),
     "front": ("front",),
     "deadman": (),
 }
@@ -260,13 +264,18 @@ def make_cause(code, origin, detail="", *, group=None, rank=None, name=None, exc
             "exception_type": exception_type, "detail_full": detail, "log_ref": log_ref, "rc": rc}
 
 
+def owns(writer: str, key: str) -> bool:
+    """``key`` (Punktpfad) liegt in einem Feld, das ``writer`` besitzt."""
+    return any(key == o or key.startswith(o + ".") for o in OWNED_FIELDS.get(writer, ()))
+
+
 def _check_owner(writer: str, state, cause, fields) -> None:
     if writer not in WRITERS:
         raise StateFileError(f"state_file: Schreiber {writer!r} (erlaubt: {', '.join(WRITERS)})")
     if state is not None and state not in OWNED_STATES[writer]:
         raise StateFileError(f"state_file: Zustand {state!r} gehoert nicht dem Schreiber {writer!r}")
     for k in (fields or {}):
-        if k.split(".")[0] not in OWNED_FIELDS[writer]:
+        if not owns(writer, k):
             raise StateFileError(f"state_file: Feld {k!r} gehoert nicht zu {STATE_SCHEMA}/{writer} "
                                  f"(erlaubt: {', '.join(OWNED_FIELDS[writer])})")
     if writer == "launcher" and state == "dead" and (cause or {}).get("origin") not in LAUNCHER_DEAD_ORIGINS:
@@ -344,7 +353,7 @@ def init(root: str, boot_id: str, kind: str, fields: dict) -> str:
     if kind not in KINDS:
         raise StateFileError(f"state_file: kind {kind!r} (erlaubt: {', '.join(KINDS)})")
     for k in fields:
-        if k not in OWNED_FIELDS["host"]:
+        if "." in k or not owns("host", k):
             raise StateFileError(f"state_file: Feld {k!r} gehoert nicht zu {STATE_SCHEMA}")
     d = os.path.join(root, boot_id)
     with _locked(d):
@@ -508,18 +517,26 @@ def health(d: str):
 #: nach Schlüssel/Token aussehen; argv kommt schon redigiert (admin_key_mod.redact_argv).
 LAUNCH_ENV_PREFIXES = ("SGLANG_", "WEG2_", "HTSGLANG_", "NCCL_", "PYTORCH_", "CUDA_")
 LAUNCH_ENV_SECRET_MARKS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+#: Nutzer 29.09. („kompletten startflags … inkl. aller ENV“): der Rest der Umgebung
+#: steht als env_base daneben; Werte zu Namen, die nach Geheimnis aussehen, nur maskiert.
+LAUNCH_ENV_BASE_SECRET = re.compile(r"TOKEN|KEY|SECRET|PASS|CREDENTIAL|(^|_)PAT($|_)")
+LAUNCH_MASK = "***"
 
 
 def launch_snapshot(argv, env) -> dict:
-    """groups.<G>.launch: das exec'te argv und die Schalter-Umgebung der Gruppe."""
-    keep = {}
+    """groups.<G>.launch / launch.front: das exec'te argv, die Schalter-Umgebung
+    (``env``, Geheimnis-Namen fehlen dort wie bisher) und die übrige Umgebung
+    (``env_base``, Geheimnis-Werte maskiert)."""
+    keep, base = {}, {}
     for k, v in (env or {}).items():
-        if not k.startswith(LAUNCH_ENV_PREFIXES):
-            continue
-        if any(m in k.upper() for m in LAUNCH_ENV_SECRET_MARKS):
-            continue
-        keep[k] = str(v)
-    return {"argv": [str(a) for a in (argv or [])], "env": dict(sorted(keep.items()))}
+        if k.startswith(LAUNCH_ENV_PREFIXES):
+            if any(m in k.upper() for m in LAUNCH_ENV_SECRET_MARKS):
+                continue
+            keep[k] = str(v)
+        else:
+            base[k] = LAUNCH_MASK if LAUNCH_ENV_BASE_SECRET.search(k.upper()) else str(v)
+    return {"argv": [str(a) for a in (argv or [])], "env": dict(sorted(keep.items())),
+            "env_base": dict(sorted(base.items()))}
 
 
 def rc_of(st: dict, was_serving: bool) -> int:
