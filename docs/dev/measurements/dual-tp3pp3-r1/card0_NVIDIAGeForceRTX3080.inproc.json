@@ -1,0 +1,16 @@
+{
+ "dur_s": 6.0,
+ "decode_steps_per_s": 20.5,
+ "decode_p50_ms": 49.54934600391425,
+ "decode_p99_ms": 51.37831601314247,
+ "decode_max_ms": 52.336719003506005,
+ "decode_weight_gb": 3.3554432,
+ "prefill_tflops": 48.218166176426664,
+ "prefill_iters": 421,
+ "role": "both",
+ "rows": 4,
+ "prefill_m": 4096,
+ "device": "NVIDIA GeForce RTX 3080",
+ "mem_reserved_gb": 3.938451456,
+ "wall_start": 1790716800.799439
+}

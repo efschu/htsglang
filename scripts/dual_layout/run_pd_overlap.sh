@@ -45,15 +45,19 @@ for IDX in "$@"; do
   $B --role prefill $common --start-at $st --out "$T.2proc_prefill.json" >/dev/null &
   p2=$!
   wait $p1 $p2
+  if [ "${PROBES:-1}" = 1 ]; then
   $PY $HERE/ipc_mps_probe.py > "$T.ipc_nomps.jsonl" 2>"$T.ipc_nomps.err"
   $PY $HERE/vmm_mps_probe.py > "$T.vmm_nomps.jsonl" 2>"$T.vmm_nomps.err"
+  fi
   # two processes under a private MPS daemon
   mkdir -p $MPSROOT/pipe $MPSROOT/log
   CUDA_MPS_PIPE_DIRECTORY=$MPSROOT/pipe CUDA_MPS_LOG_DIRECTORY=$MPSROOT/log \
     nvidia-cuda-mps-control -d
   sleep 1
+  if [ "${PROBES:-1}" = 1 ]; then
   CUDA_MPS_PIPE_DIRECTORY=$MPSROOT/pipe $PY $HERE/ipc_mps_probe.py > "$T.ipc_mps.jsonl" 2>"$T.ipc_mps.err"
   CUDA_MPS_PIPE_DIRECTORY=$MPSROOT/pipe $PY $HERE/vmm_mps_probe.py > "$T.vmm_mps.jsonl" 2>"$T.vmm_mps.err"
+  fi
   for arm in mps mps_p50; do
     st=$(s 15)
     pct=100; [ $arm = mps_p50 ] && pct=50
@@ -69,7 +73,7 @@ for IDX in "$@"; do
   rm -rf $MPSROOT
 done
 # NCCL between two MPS clients on two cards (only with >= 2 cards)
-if [ $# -ge 2 ]; then
+if [ $# -ge 2 ] && [ "${PROBES:-1}" = 1 ]; then
   U0=$(nvidia-smi -i "$1" --query-gpu=uuid --format=csv,noheader | tr -d ' ')
   U1=$(nvidia-smi -i "$2" --query-gpu=uuid --format=csv,noheader | tr -d ' ')
   export CUDA_VISIBLE_DEVICES=$U0,$U1

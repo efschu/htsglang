@@ -90,7 +90,8 @@ def run_decode(g, stream, t_end, res):
         t0 = time.perf_counter()
         if t0 >= t_end:
             break
-        g.replay()
+        with torch.cuda.stream(stream):
+            g.replay()  # a graph replays into the CURRENT stream
         stream.synchronize()
         lat.append((time.perf_counter() - t0) * 1e3)
         n += 1

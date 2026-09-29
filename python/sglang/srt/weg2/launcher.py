@@ -13585,6 +13585,16 @@ def dual_share_planned_dc(cards, budgets_p: List[int], extra_p: str, overhead_mi
     return {c.uuid: int(eff[i]) + int(overhead_mib) for i, c in enumerate(cards)}
 
 
+def dual_p_sm_env(ns) -> Dict[str, str]:
+    """DUAL-TP3PP3: P's MPS SM share (only with --dual-mps on, only below 100)."""
+    pct = int(getattr(ns, "dual_p_sm_pct", 100))
+    if not (1 <= pct <= 100):
+        raise Weg2DualLayoutRefused(f"DUAL-TP3PP3: --dual-p-sm-pct {pct} outside 1..100")
+    if pct >= 100 or not getattr(ns, "dual_layout", False) or str(getattr(ns, "dual_mps", "off")) != "on":
+        return {}
+    return {"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(pct)}
+
+
 def start_dual_mps(ns, log, dry: bool) -> Dict[str, str]:
     """DUAL-TP3PP3 --dual-mps on: one PRIVATE MPS control daemon for this
     boot (pipe dir under /tmp/weg2-dual-mps-<tag>, so nothing outside the boot
@@ -20665,6 +20675,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="DUAL-TP3PP3 --dual-share: what P holds on a card outside its "
                          "--rank-gpu-memory-mib budget (CUDA context, graphs, activations), charged "
                          "when D is sized from P's plan instead of P's measurement.")
+    ap.add_argument("--dual-p-sm-pct", type=int, default=100,
+                    help="DUAL-TP3PP3 with --dual-mps on: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for group P, "
+                         "i.e. the share of SMs P's kernels may occupy while D decodes. MEASURED 29.09. "
+                         "(risk-1 bench, 5090): unlimited P takes ~90%% of the card and D's step runs "
+                         "~7x slower; 50 splits ~50/50; the sum of both shares stays ~1.0 either way. "
+                         "100 = no limit.")
     ap.add_argument("--dual-mps", choices=("off", "on"), default="off",
                     help="DUAL-TP3PP3: start a private MPS control daemon before the groups (pipe dir "
                          "under the boot's run dir) so P and D kernels run concurrently on a card instead "
@@ -24897,6 +24913,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(f"{_des.FREE_READ_MARKER} P journals its free-memory reads -> {_journal_dir}")
     ns._dual_mps_env = start_dual_mps(ns, log, dry)
     spec_p.env.update(ns._dual_mps_env)
+    spec_p.env.update(dual_p_sm_env(ns))
     spec_p.env.update(dual_share_env(ns, "P"))
     launch_group(spec_p, tree, log, dry)
     ns._dual_spec_d = None

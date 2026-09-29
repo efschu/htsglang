@@ -86,8 +86,8 @@ class DualLayoutLauncher(CustomTestCase):
         self.assertIn("if image_rec is not None:\n        log(host_ledger.format_dormant_image(image_rec))\n"
                       "        host_ledger.append_measured_record(", src)
         # MPS env reaches BOTH groups, before each launch.
-        self.assertIn("spec_p.env.update(ns._dual_mps_env)\n    spec_p.env.update(dual_share_env(ns, \"P\"))\n"
-                      "    launch_group(spec_p", src)
+        self.assertIn("spec_p.env.update(ns._dual_mps_env)\n    spec_p.env.update(dual_p_sm_env(ns))\n"
+                      "    spec_p.env.update(dual_share_env(ns, \"P\"))\n    launch_group(spec_p", src)
         self.assertIn('spec_d.env.update(getattr(ns, "_dual_mps_env", None) or {})\n        launch_group(spec_d',
                       src)
 
@@ -122,3 +122,16 @@ class DualLayoutLauncher(CustomTestCase):
         self.assertLess(blk.index("launch_group(spec_p"), blk.index("launch_group(_sd"))
         self.assertLess(blk.index("launch_group(_sd"), blk.index("if dry:"))
         self.assertIn('spec_d = getattr(ns, "_dual_spec_d", None)', src)
+
+    def test_p_sm_pct_only_with_mps_and_below_100(self):
+        ns = _ns("--dual-layout", "--dual-mps", "on", "--dual-p-sm-pct", "50")
+        L.resolve_dual_layout(ns)
+        self.assertEqual(L.dual_p_sm_env(ns), {"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "50"})
+        ns = _ns("--dual-layout", "--dual-p-sm-pct", "50")
+        L.resolve_dual_layout(ns)
+        self.assertEqual(L.dual_p_sm_env(ns), {})
+        self.assertEqual(L.dual_p_sm_env(_ns("--dual-layout", "--dual-mps", "on")), {})
+        with self.assertRaises(L.Weg2DualLayoutRefused):
+            L.dual_p_sm_env(_ns("--dual-layout", "--dual-mps", "on", "--dual-p-sm-pct", "0"))
+        src = inspect.getsource(L.main)
+        self.assertIn("spec_p.env.update(dual_p_sm_env(ns))", src)

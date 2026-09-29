@@ -1,0 +1,11 @@
+{
+ "dur_s": 5.0,
+ "prefill_tflops": 57.03716569088,
+ "prefill_iters": 415,
+ "role": "prefill",
+ "rows": 4,
+ "prefill_m": 4096,
+ "device": "NVIDIA GeForce RTX 5090",
+ "mem_reserved_gb": 0.478150656,
+ "wall_start": 1790716923.5709212
+}
