@@ -1214,6 +1214,63 @@ def remove_park(rid: str) -> None:
                      name="weg2-park-end-rm").start()
 
 
+def _park_files() -> List[Tuple[str, str]]:
+    """F4: (rid, path) of every finished park part in the store."""
+    d = _dir()
+    if not d:
+        return []
+    out = []
+    for p in glob.glob(os.path.join(d, f"*.tail.{PARK_PART}*")):
+        if _is_tmp(p) or not _is_park_file(p):
+            continue
+        out.append((os.path.basename(p).split(".tail.", 1)[0], p))
+    return out
+
+
+def remove_parks_aborted(rid: str, abort_all: bool = False) -> int:
+    """F4 leak (29.09.): the abort reaches D's park parts as it reaches the
+    park (``d_park_runtime.park_abort``, the same prefix match as the
+    scheduler's queues): an aborted rid is never resumed, so no adopt verdict
+    (``remove_park``) will take its parts. Every rank of D sees the same
+    abort; a file a sibling removed first is simply gone. Returns the files
+    removed."""
+    n = 0
+    for owner, p in _park_files():
+        if abort_all or (rid and owner.startswith(rid)):
+            try:
+                os.remove(p)
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
+def reap_orphan_parks(live_rids, own_index: str) -> Tuple[int, List[str]]:
+    """F4 leak (29.09.): at every D park, THIS rank's park parts whose rid D
+    no longer holds -- finished without an adopt verdict, re-routed to P,
+    aborted on a path the abort hook did not see. The census rule of H63b
+    (``census`` / ``_prune``) ages P's parts; this is its D-side twin for the
+    park parts that census deliberately skips. Only this rank's own parts
+    (``own_index`` = ``dpark<tp>``), never a rid in flight (H81). The live set
+    is the scheduler's replicated state, so every rank reaps the same rids.
+    Returns (files removed, rids)."""
+    own = f".tail.{own_index}-"
+    live = {str(r) for r in live_rids}
+    busy = _inflight_rids()
+    n, rids = 0, []
+    for owner, p in _park_files():
+        if own not in os.path.basename(p) or owner in live or owner in busy:
+            continue
+        try:
+            os.remove(p)
+            n += 1
+            if owner not in rids:
+                rids.append(owner)
+        except OSError:
+            pass
+    return n, rids
+
+
 # -- D side: readiness (the adoption itself lives in weg2/tail_adopt.py) -------------
 def local_readiness(spec: TailSpec, headers: Sequence[TailHeader], need_fa: Dict[int, List[int]],
                     need_gdn: Dict[int, List[int]]) -> str:
