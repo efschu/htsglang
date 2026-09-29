@@ -2676,7 +2676,11 @@ class Envs:
     #   holding the phase's KV tokens is taken. The captured waves are priced
     #   for the lowest stage row count (the launcher raises the wave cap it
     #   derived, or refuses a told one by name). Off = the table, byte-identical.
-    SGLANG_WEG2_D_KV_STAGE_BY_DEMAND = EnvBool(False)
+    #   Default ON since 29.09. (metal: z30x2 kvdemand 09291210, D.log _121057 --
+    #   '#251 WAKE-RESHARD n=2 stage=S1 tokens=393216 demand=262276 over=no' at
+    #   bs2 x 128k, every other wake S0, needle MATCH, no death). Inert without a
+    #   stage form (< 2 stage tokens): the 27B never gets one.
+    SGLANG_WEG2_D_KV_STAGE_BY_DEMAND = EnvBool(True)
     # #254: how a prefill forward that overflows the scratch region is split.
     #   "token"  (default) -- waves are disjoint TOKEN subsets; every wave
     #     re-fetches the spill experts its tokens need, so a spill expert is
