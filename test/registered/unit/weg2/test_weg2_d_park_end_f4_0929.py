@@ -309,7 +309,7 @@ def test_resume_below_the_window_is_todays_extend(arena, caplog):
     assert plans == [None] * 3
     prompt, out = _ids()
     assert all(r.req.output_ids == out and len(r.req.prefix_indices) == 0 for r in dst)  # untouched
-    assert f"skipped:prefix:0!in[{WIN},{C})" in caplog.text
+    assert f"skipped:prefix:0!in[{WIN},{C}]" in caplog.text
 
 
 def test_a_changed_token_is_refused(arena, caplog):

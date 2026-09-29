@@ -124,7 +124,36 @@ def test_without_the_anchor_the_same_park_misses_the_resume(arena, caplog):
     with caplog.at_level(logging.INFO, logger="sglang.srt.weg2.tail_adopt"):
         votes, plans = F4._resume(dst, prefix_len=ANCHOR)
     assert plans == [None] * 3
-    assert f"skipped:prefix:{ANCHOR}!in[{DEFAULT_FROM},{C})" in caplog.text
+    assert f"skipped:prefix:{ANCHOR}!in[{DEFAULT_FROM},{C}]" in caplog.text
+
+
+def test_resume_at_the_cut_is_a_skip(arena, caplog):
+    """y3r 09292330 23:42:49 weg2-24-28: a D-direct extend 103936 -> 104001
+    tracked its anchor AT the cut (``#59b ...=104000``, c = 104000); the park
+    window ended at c exclusive, ``adopt=skipped:prefix:104000!in[103488,
+    104000)``, and D extended 3 tokens in a 1541 ms pass. At the cut the END
+    state still spares the extend [c, N): the skip grows no prefix rows."""
+    src = F4._group(seed=4)
+    F4._park(src)  # the harness's own park: window [64, 240)
+    dst = F4._group()
+    caplog.set_level(logging.INFO, logger="sglang.srt.weg2.tail_adopt")
+    votes, plans = F4._resume(dst, prefix_len=C)
+    assert all(p is not None and p.skip for p in plans)
+    assert "skipped:prefix" not in caplog.text
+    for r in dst:
+        assert len(r.req.prefix_indices) == C  # nothing allocated, nothing grown
+        F4._prepare_for_extend(r)
+    assert [F4._skip_on(r) for r in dst] == [[F4.FIRST]] * 3
+    s, d = src[0], dst[0]
+    src_slots = s.rp.req_to_token[F4.SRC_RPI, C:N].to(torch.int64)
+    dst_slots = d.rp.req_to_token[F4.D_RPI, C:N].to(torch.int64)
+    for gid, local in d.kv.full_attention_layer_id_mapping.items():
+        sl = s.kv.full_attention_layer_id_mapping[gid]
+        got = d.kv.full_kv_pool.k_buffer[local][dst_slots].view(torch.uint8)
+        assert torch.equal(got, s.kv.full_kv_pool.k_buffer[sl][src_slots].view(torch.uint8))
+    for gid, local in d.rp.mamba_map.items():
+        assert torch.equal(d.rp.mamba_pool.mamba_cache.temporal[local, F4.SLOT],
+                           s.rp.mamba_pool.mamba_cache.temporal[local, F4.SLOT])
 
 
 # --------------------------------------------------- the group-uniform anchor
