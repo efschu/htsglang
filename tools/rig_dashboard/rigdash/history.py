@@ -540,14 +540,11 @@ class Recorder:
                     dd = e.get("data") or {}
                     t0 = dd.get("flip_begin_ts") or e.get("ts")
                     if t0 is not None and dd.get("dir") in ("P>D", "D>P"):
-                        self.db.mark(t0, model, "flip", dd["dir"], dd.get("flip_time_ms"))
-                self.db.set("src.%s.flip" % model, "ipc")
+                        self.db.mark(t0, model, "flip", dd["dir"] + " ipc", dd.get("flip_time_ms"))
             else:
                 for r in flips:
                     if lo - 60 <= r["t"] < hi and r.get("dir") in ("P>D", "D>P"):
-                        self.db.mark(r["t"], model, "flip", r["dir"], r.get("ms"))
-                if flips:
-                    self.db.set("src.%s.flip" % model, "log")
+                        self.db.mark(r["t"], model, "flip", r["dir"] + " log", r.get("ms"))
             self.db.set(key, hi)
         if not is_live and not self.db.get("ended." + b.stem):
             self.db.mark(b.newest_mtime, model, "end", "Boot-Ende (letzte Logzeile)")
@@ -663,13 +660,19 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
     tiers = ({k: sum((v or 0) for v in series["m.tier_" + k]) * step for k in cacheacct.TIERS}
              if src_tiers == "ipc" else None)
     marks = db.marks(model, lo, now)
+    flip_src = set()
+    for m in marks:                     # flip label = "<dir> <src>": the source per flip, not per model
+        if m["kind"] == "flip":
+            parts = (m["label"] or "").split()
+            m["label"] = parts[0] if parts else ""
+            if len(parts) > 1:
+                flip_src.add(parts[1])
     flips_pd = [m["v"] for m in marks if m["kind"] == "flip" and m["label"] == "P>D" and m["v"] is not None]
     last_pd = next((m for m in reversed(marks) if m["kind"] == "flip" and m["label"] == "P>D" and m["v"] is not None), None)
     nv = (rec.now_vals.get(model) if rec else None) or {}
     roles = {m: (db.get("roles." + m) or {}) for m in MODELS}
     card_info = [dict(c, roles={m: roles[m].get(c["uuid"], []) for m in MODELS}) for c in cards]
     src_cache = db.get("src.%s.cache" % model)
-    src_flip = db.get("src.%s.flip" % model)
     tiles = {
         "out_p50": _pct(series["m.stream_tps"], 0.5), "out_p90": _pct(series["m.stream_tps"], 0.9),
         "cache_hit": cacheacct.hit_share(tok), "tok": tok, "tiers": tiers,
@@ -705,7 +708,9 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
             "cache": "state.json front.served_tokens (D_after_P)" if src_cache == "ipc" else LOG_LABEL,
             "cache_tiers": ("state.json front.served_tokens.*.cached_tier" if src_tiers == "ipc"
                             else "– (Feld served_tokens.*.cached_tier ab Image z30y2, 9266bdfb8d)"),
-            "flip": "events.jsonl flip_first_work" if src_flip == "ipc" else (LOG_LABEL if src_flip else None),
+            "flip": ("events.jsonl flip_first_work" if flip_src == {"ipc"} else
+                     LOG_LABEL if flip_src == {"log"} else
+                     "events.jsonl flip_first_work + %s (ältere Boots)" % LOG_LABEL if flip_src else None),
             "now_tiles": LOG_LABEL,
         },
         "errors": dict(rec.errors) if rec else {},

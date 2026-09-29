@@ -212,7 +212,7 @@
         line("Boot-Container memory.current %", C.aqua, { fill: undefined })],
     }, [d.t, d.series["host.cpu"], d.series["host.mem_pct"], d.series["host.bootmem_pct"]]);
     charts.clock = mk("gf-c-clock", {
-      axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v / 1000, 1) + " GHz")],
+      axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v, 0) + " MHz", 72)],
       series: [{}].concat(cards.map((c, i) => line(cardLabel(c), CARD_COL[i % 4], { fill: undefined }))),
     }, rowsCards(d, "clock"));
     const fr = rowsFlips(d);
