@@ -1412,6 +1412,19 @@ def _weg2_wake_cohort_note(sched, batch) -> bool:
         return False
 
 
+def _weg2_decode_first_note(sched, batch) -> None:
+    """F3 (weg2/d_park_runtime.note_decode_round): count the decode rounds
+    since the wake -- the D park gate's decode-first window closes on them."""
+    if not getattr(sched, "_weg2_wake_seq", None):
+        return
+    try:
+        from sglang.srt.weg2 import d_park_runtime
+
+        d_park_runtime.note_decode_round(sched, batch)
+    except Exception as exc:  # noqa: BLE001 -- a counter never breaks a pass
+        logger.warning("F3 DECODE-FIRST round note n/a: %s", exc)
+
+
 #: FA (28.09.): switch of the prefetch span's anchor start, default on; 0 = the
 #: span starts at ``len(prefix_indices) + host_hit_length`` as before.
 PREFETCH_FROM_ANCHOR_ENV = "SGLANG_WEG2_PREFETCH_FROM_ANCHOR"
@@ -4027,6 +4040,7 @@ class Scheduler(
                 if self.idle_sleeper is not None:
                     self.idle_sleeper.reset()
                 result = self.run_batch(batch)
+                _weg2_decode_first_note(self, batch)  # F3: decode rounds since the wake
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -4120,6 +4134,7 @@ class Scheduler(
                 self._weg2_post_wake_pass_log(batch)  # Wake-Parallel item 2
                 _weg2_resume_first_token_note(self, batch)  # RW: one line per wake
                 _weg2_wake_cohort_note(self, batch)  # L1: wake -> last cohort member's first decode
+                _weg2_decode_first_note(self, batch)  # F3: decode rounds since the wake
             else:
                 batch_result = None
 

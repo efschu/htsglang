@@ -636,8 +636,82 @@ def admission(sched, running_batch):
         pending_outside=pending,
         avail_tokens=avail,
         resume_book=book,
+        decode_first=decode_first_facts(sched, running_batch),
     )
+    if gate.deferred:
+        _note_decode_first(sched, gate)
     return gate if gate.barrier else None
+
+
+#: F3: (wake_seq, decode rounds run since that wake) -- the event loop counts
+#: every decode batch it launches (:func:`note_decode_round`).
+ROUNDS_ATTR = "_weg2_decode_first_rounds"
+
+
+def note_decode_round(sched, batch) -> None:
+    """F3: one decode batch launched on this group (called by the event loop
+    right after ``run_batch``; every rank launches the same batches)."""
+    mode = getattr(batch, "forward_mode", None)
+    if mode is None or not mode.is_decode():
+        return
+    seq = getattr(sched, "_weg2_wake_seq", None)
+    have = getattr(sched, ROUNDS_ATTR, None)
+    n = have[1] if have is not None and have[0] == seq else 0
+    setattr(sched, ROUNDS_ATTR, (seq, n + 1))
+
+
+def rounds_since_wake(sched) -> int:
+    have = getattr(sched, ROUNDS_ATTR, None)
+    seq = getattr(sched, "_weg2_wake_seq", None)
+    return int(have[1]) if have is not None and have[0] == seq else 0
+
+
+def resume_tail(req) -> int:
+    """The tokens a parked request's resume extends: above the park's read
+    cap (the resumable depth, #59b / PARK-READ = RESUMABLE). No cap = unknown
+    = the whole request (it is not a cheap resume)."""
+    ntok = d_park_read._request_tokens(req)
+    if ntok is None:
+        return 1 << 30
+    cap = d_park_read.read_cap(req)
+    return int(ntok) if cap is None else max(0, int(ntok) - int(cap))
+
+
+def decode_first_facts(sched, running_batch) -> Optional["d_seats.DecodeFirst"]:
+    """F3's replicated inputs for this pass, or None (switch off, no wake yet)."""
+    if not d_seats.decode_first_enabled():
+        return None
+    seq = getattr(sched, "_weg2_wake_seq", None)
+    if seq is None:
+        return None
+    from sglang.srt.environ import envs
+
+    settle = list(getattr(sched, "weg2_post_wake_settle", None) or [])
+    tails = {
+        str(r.rid): resume_tail(r)
+        for r in sched.waiting_queue if d_seats.park_site(r) == d_seats.SITE_FLIP
+    }
+    return d_seats.DecodeFirst(
+        wake_seq=seq,
+        rounds=rounds_since_wake(sched),
+        running_n=len(getattr(running_batch, "reqs", None) or ()),
+        settle_cohort_n=len(settle),  # the #1471 settle holds only reads of the wake
+        tails=tails,
+        tail_over=int(envs.SGLANG_WEG2_D_DECODE_FIRST_TAIL.get()),
+        max_rounds=int(envs.SGLANG_WEG2_D_DECODE_FIRST_ROUNDS.get()),
+    )
+
+
+def _note_decode_first(sched, gate) -> None:
+    """One line per wake and deferred set (the census counts every pass)."""
+    key = (getattr(sched, "_weg2_wake_seq", None), gate.deferred)
+    if getattr(sched, "_weg2_decode_first_said", None) == key:
+        return
+    sched._weg2_decode_first_said = key
+    logger.info(
+        "F3 DECODE-FIRST wake=%s deferred=%s rounds=%d -- the wake's hand-offs extend and "
+        "decode first; the flip-parked resume(s) keep their seat and extend after",
+        key[0], sorted(r[:12] for r in gate.deferred), rounds_since_wake(sched))
 
 
 def park_abort(sched, recv_req) -> int:

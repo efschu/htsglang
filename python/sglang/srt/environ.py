@@ -3152,6 +3152,16 @@ class Envs:
     # 28.09.); off without a form. d_seats/front read it through
     # weg2.form.d_park_immediate_state (same default); explicit value wins.
     SGLANG_WEG2_D_PARK_IMMEDIATE = EnvBool(_profile_default("SGLANG_WEG2_D_PARK_IMMEDIATE", False))
+    # F3 (29.09., FLIPZEIT-VERLAUF-0929.md): after D's wake the hand-offs of the
+    # wake decode FIRST -- a flip-parked resume whose tail extend exceeds
+    # SGLANG_WEG2_D_DECODE_FIRST_TAIL tokens (~2 s expert pass on NF-D) waits
+    # in the D park gate (weg2/d_seats.admission_gate) until the wake's
+    # members had their first decode round, at most
+    # SGLANG_WEG2_D_DECODE_FIRST_ROUNDS decode rounds. Off = the gate byte for
+    # byte (parked first, newcomers wait).
+    SGLANG_WEG2_ENABLE_D_DECODE_FIRST = EnvBool(False)
+    SGLANG_WEG2_D_DECODE_FIRST_TAIL = EnvInt(8)
+    SGLANG_WEG2_D_DECODE_FIRST_ROUNDS = EnvInt(32)
     # Fix B (weg2/p_row_authority.py): the #631 row form on group P
     # (ModelProfile.p_row_authority: off on every row until the metal proof);
     # the proof boot sets it per docker profile (27b-row-authority.env).
