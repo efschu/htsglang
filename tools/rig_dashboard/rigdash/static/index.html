@@ -270,7 +270,10 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
     <p><b>input throughput</b> aus der Zeile <span class="mono">Prefill batch</span> ist <b>wall-konfundiert</b>: es teilt durch
     die Scheduler-Wanduhr und springt bei Leerlauf. Es steht nur grau und unter diesem Namen da.</p>
     <p><b>Decode tok/s</b> = <span class="mono">gen throughput</span> der Zeile <span class="mono">Decode batch</span>
-    (Tokens seit der vorigen Zeile durch die Zeit dazwischen), gemittelt &uuml;ber das Fenster. Daneben die
+    (Tokens seit der vorigen Zeile durch die Zeit dazwischen); die gro&szlig;e Zahl ist Tokens / Wanduhr:
+    &Sigma;(gen throughput &times; Zeilenabstand) / &Sigma; Zeilenabstand, nie das Mittel der Raten. Prefill: die gro&szlig;e Zahl
+    ist &Sigma; #new-token der ersten Stufe / Wanduhr (Start des ersten Chunks bis zur letzten Rang-Zeile); die GPU-Rechenrate
+    steht beschriftet daneben. Daneben die
     Rechenrate aus <span class="mono">Decode rank batch</span>: bs &times; accept len / gpu-ms je Runde.</p>
     <p>Quelle sind die Boot-Logs, die der weg2-Launcher ohnehin schreibt (per Byte-Offset gelesen, nie ganz).
     Das Dashboard schickt keinem Modell eine Anfrage au&szlig;er <span class="mono">GET /weg2/state</span> alle 10 s.</p>
@@ -413,8 +416,8 @@ function phaseTip(x, single) {
   if (x.k === "idle" && x.boot) return `<b>Boot l&auml;dt</b> &middot; noch keine Prefill-/Decode-Zeile<br>${when}`;
   if (x.k === "idle") return `<b>${x.awake ? esc(x.awake) + " wach" : "ruht"} &middot; keine Arbeit</b><br>${when} <span class="muted">keine Prefill-/Decode-Zeile</span>`;
   const nm = phaseName(x.k, single);
-  if (x.k === "dec") return `<b>${nm}</b> &middot; &Oslash; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(gen throughput, ${fmt(x.n)} Zeilen)</span>` : `&mdash; <span class="muted">(keine &bdquo;Decode batch&ldquo;-Zeile in dieser Phase)</span>`}${x.bs_mean != null ? ` &middot; bs ${x.bs_min === x.bs_max ? fmt(x.bs_min) : fmt(x.bs_min) + "&ndash;" + fmt(x.bs_max)} (&Oslash; ${fmt(x.bs_mean, 1)}, Runden)` : x.bs != null ? " &middot; bs &Oslash; " + fmt(x.bs, 1) : ""}<br>${when}${x.rounds ? " &middot; " + fmt(x.rounds) + " Runden" : ""}${x.running ? " &middot; l&auml;uft" : ""}`;
-  return `<b>${nm}</b> &middot; &Oslash; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Rechenrate, langsamster Rang)</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} Tok &middot; ${fmt(x.n)} Chunks${x.running ? " &middot; l&auml;uft" : ""}`;
+  if (x.k === "dec") return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s Wanduhr <span class="muted">(&Sigma; gen throughput &times; Zeilenabstand / &Sigma; Zeilenabstand, ${fmt(x.n)} Zeilen)</span>` : `&mdash; <span class="muted">(keine &bdquo;Decode batch&ldquo;-Zeile in dieser Phase)</span>`}${x.bs_mean != null ? ` &middot; bs ${x.bs_min === x.bs_max ? fmt(x.bs_min) : fmt(x.bs_min) + "&ndash;" + fmt(x.bs_max)} (&Oslash; ${fmt(x.bs_mean, 1)}, Runden)` : x.bs != null ? " &middot; bs &Oslash; " + fmt(x.bs, 1) : ""}<br>${when}${x.rounds ? " &middot; " + fmt(x.rounds) + " Runden" : ""}${x.running ? " &middot; l&auml;uft" : ""}`;
+  return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s Wanduhr <span class="muted">(&Sigma; #new-token erste Stufe / Laufdauer)</span>` : "&mdash;"}${x.tps_gpu != null ? ` &middot; GPU-Rechenrate ${fmt(x.tps_gpu)} tok/s <span class="muted">(&Sigma; Tok / &Sigma; compute-ms, langsamster Rang)</span>` : ""}<br>${when} &middot; ${fmt(x.tok)} Tok &middot; ${fmt(x.n)} Chunks${x.running ? " &middot; l&auml;uft" : ""}`;
 }
 function phaseHtml(b) {
   const tl = b.timeline;
@@ -511,9 +514,10 @@ function prefillTile(b, g, color, label, binders, now) {
   const charts = rateCharts(b, g + "_prefill_tps", color, 0, now, binders);
   const one = p.one_s || 0;
   return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>${label}${LOGSRC}</div>
-    ${bigPair(active ? "&Oslash; 60 s" : "letzter Schub", src && src.tps, one, 0, null, p.max3s_120)}
-    <div class="state">${state}</div>
+    ${bigPair(active ? "Wanduhr 60 s" : "letzter Schub, Wanduhr", src && src.wall_tps, one, 0, null, p.max3s_120)}
+    <div class="state">${state} &middot; <span class="muted" title="Z&auml;hler: &Sigma; #new-token der ersten Stufe (PP0/TP0); Nenner: Start des ersten Chunks (Stempel &minus; compute-ms) bis zur letzten Zeile irgendeines Rangs">Tokens / Wanduhr${src && src.wall_s ? " (" + fmt(src.tokens) + " Tok / " + fmt(src.wall_s, 1) + " s)" : ""}</span></div>
     ${kv([
+      ["GPU-Rechenrate (&Sigma; Tok / &Sigma; compute-ms, langsamster Rang)", src && src.tps_gpu != null ? fmt(src.tps_gpu) + " tok/s" : "—"],
       ["Rechenrate je Rang (gpu-ms)", ranks],
       [active ? "Tokens / Chunks im Fenster" : "Tokens / Chunks im letzten Schub", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
       ["mittl. Chunk &middot; aus Cache", src ? `${fmt(src.mean_chunk)} &middot; ${fmt(src.cached)}` : "—"],
@@ -530,13 +534,13 @@ function decodeTile(b, g, color, binders, now) {
   if (!d) return `<div class="tile"><div class="label"><i style="background:${color}"></i>Decode</div><div class="big">—</div><div class="state">keine Decode-Zeilen in diesem Log</div></div>`;
   const active = d.gen_tps != null;
   const v = active ? d.gen_tps : d.gen_tps_last;
-  const state = active ? `aktiv &middot; Mittel der letzten ${Math.round(d.window_s)} s (${d.rows} Zeilen)`
+  const state = active ? `aktiv &middot; Tokens / Wanduhr der letzten ${Math.round(d.window_s)} s (&Sigma; gen throughput &times; Zeilenabstand / &Sigma; Zeilenabstand, ${d.rows} Zeilen)`
     : (d.last_t ? `ruht &middot; letzte Zeile vor ${ago(now - d.last_t)}, Zahl = letzter Wert` : "noch keine Decode-Zeile");
   const charts = rateCharts(b, g + "_decode_tps", color, 1, now, binders);
   const per = (v != null && d.running) ? v / d.running : null;
   const one = d.one_s || 0;
   return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>Decode${g !== "D" ? " (" + g + ")" : ""}${LOGSRC}</div>
-    ${bigPair(active ? "&Oslash; 60 s" : "letzter Wert", v, one, 1, bsBadge(d, one > 0), d.max3s_120)}
+    ${bigPair(active ? "Wanduhr 60 s" : "letzter Wert", v, one, 1, bsBadge(d, one > 0), d.max3s_120)}
     <div class="state">${state}</div>
     ${kv([
       ["laufende Anfragen (bs) &middot; je Anfrage", `${fmt(d.running)} &middot; ${fmt(per, 1)} tok/s`],

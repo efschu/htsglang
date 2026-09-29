@@ -324,11 +324,13 @@ class HealthTests(unittest.TestCase):
     def test_healthy_boot_has_no_state(self):
         self.assertIsNone(health.assess(self._boot(), self.NOW)["state"])
 
-    def test_weg2_health_dead_group(self):
+    def test_weg2_health_dead_line_is_only_a_hint(self):
+        # operator 29.09.: dead only from IPC; a WEG2-HEALTH log line is a hint
         b = self._boot(health={"P": {"t": self.NOW - 10, "alive": False, "http_ok": False, "streak": 4}})
         a = health.assess(b, self.NOW)
-        self.assertEqual(a["state"], "TOT")
-        self.assertIn("Gruppe P tot", a["reasons"][0]["text"])
+        self.assertEqual(a["state"], "WARNUNG")
+        self.assertIn("Hinweis aus Log", a["reasons"][0]["text"])
+        self.assertNotIn("dead", {r["level"] for r in a["reasons"]})
 
     def test_stale_health_line_does_not_alarm(self):
         b = self._boot(health={"P": {"t": self.NOW - 600, "alive": False, "http_ok": False, "streak": 4}})
@@ -338,14 +340,15 @@ class HealthTests(unittest.TestCase):
         b = self._boot(health={"P": {"t": self.NOW - 10, "alive": True, "http_ok": False, "streak": 2}})
         self.assertEqual(health.assess(b, self.NOW)["state"], "HAENGT")
 
-    def test_named_stop_without_later_activity_is_dead_and_named_wins(self):
+    def test_named_stop_without_later_activity_is_a_hint_and_named_wins(self):
         t = self.NOW - 300
         b = self._boot(stops=[{"t": t, "group": "P", "text": "Traceback (most recent call last):", "bare": True},
-                              {"t": t, "group": "P", "text": W27_UNPREFIXED, "bare": False}],
+                              {"t": t, "group": "P", "text": W27_UNPREFIXED, "bare": False, "src": "x.P.log"}],
                        last_activity={"P": t - 1, "D": self.NOW - 5})
         a = health.assess(b, self.NOW)
-        self.assertEqual(a["state"], "TOT")
+        self.assertEqual(a["state"], "WARNUNG")
         self.assertIn("W27", a["reasons"][0]["text"])
+        self.assertIn("[Quelle: x.P.log]", a["reasons"][0]["text"])
 
     def test_stop_followed_by_activity_is_only_a_warning(self):
         t = self.NOW - 300
@@ -655,11 +658,12 @@ class PhaseTimelineTests(unittest.TestCase):
         self.assertEqual([x["k"] for x in segs], ["idle", "P", "idle", "flip", "idle", "dec"])
         p = segs[1]
         self.assertEqual((p["s"], p["e"]), (9.0, 14.0))          # first chunk's own gpu-ms, not a guess
-        self.assertAlmostEqual(p["tps"], 3000 / 4.0)             # sum tok / sum compute-ms
+        self.assertAlmostEqual(p["tps"], 3000 / 5.0)             # WALL: tok / run span 9..14 (operator 29.09.)
+        self.assertAlmostEqual(p["tps_gpu"], 3000 / 4.0)         # compute rate beside it: sum tok / sum compute-ms
         self.assertEqual((segs[3]["s"], segs[3]["e"]), (15.0, 17.0))
         self.assertEqual(segs[4]["awake"], "D")                  # after the flip D is awake, no work yet
         self.assertEqual(segs[5]["s"], 24.0)                    # >gap after the flip: 1 s before its first line
-        self.assertAlmostEqual(segs[5]["tps"], 110.0)           # mean gen throughput of the run
+        self.assertAlmostEqual(segs[5]["tps"], 120.0)           # sum(gen x interval) / sum(interval), not the mean 110
         self.assertTrue(segs[5]["running"])
         self.assertEqual(segs[5]["e"], 30.0)
         self.assertEqual(segs[0]["s"], 5.0)                     # nothing before the boot's first line
@@ -777,18 +781,23 @@ class PlannedStopTests(unittest.TestCase):
         self.assertEqual(a["state"], "GESTOPPT")
         self.assertEqual(a["reasons"], [])
         self.assertEqual(a["planned_stop"]["teardown_t"], _utc(17, 40, 2))
-        # the same signs without the marker: TOT, as before
-        self.assertEqual(health.assess(self._boot({"planned": None, "death": None}), self.NOW)["state"], "TOT")
+        # the same log signs without the marker: never TOT (no IPC death), the queue makes it a hang
+        self.assertEqual(health.assess(self._boot({"planned": None, "death": None}), self.NOW)["state"], "HAENGT")
 
     def test_death_before_the_planned_stop_stays_red(self):
-        end = {"planned": {"t": _utc(17, 40, 30), "text": H_DAUER_STOP, "src": "nf-dauer"}, "death": None}
+        # the death comes from IPC (state.json), not from the WEG2-HEALTH line
+        end = {"planned": {"t": _utc(17, 40, 30), "text": H_DAUER_STOP, "src": "nf-dauer"},
+               "death": {"t": _utc(17, 40, 2), "text": "state.json dead: DEADMAN_CRASH", "src": "state.json"},
+               "src": "state.json"}
         self.assertEqual(health.assess(self._boot(end), self.NOW)["state"], "TOT")
 
-    def test_named_stop_before_planned_stop_stays_red(self):
+    def test_named_stop_before_planned_stop_is_a_hint_not_tot(self):
         end = {"planned": {"t": _utc(17, 40, 50), "text": H_DAUER_STOP, "src": "nf-dauer"}, "death": None}
         b = self._boot(end, health={}, stops=[{"t": _utc(17, 38, 0), "group": "P", "text": W27_UNPREFIXED, "bare": False}],
                        last_activity={"P": _utc(17, 37, 0)})
-        self.assertEqual(health.assess(b, self.NOW)["state"], "TOT")
+        a = health.assess(b, self.NOW)
+        self.assertNotEqual(a["state"], "TOT")
+        self.assertTrue(any("Hinweis aus Log, Gruppe P" in r["text"] for r in a["reasons"]))
 
     def test_stop_requested_while_serving_changes_nothing(self):
         end = {"planned": {"t": self.NOW - 200, "text": H_DAUER_STOP, "src": "nf-dauer"}, "death": None}
@@ -1244,3 +1253,69 @@ class ImageChangesTests(unittest.TestCase):
             self.assertIn("FileNotFoundError", snap["features"]["error"])
             self.assertEqual([m["model"] for m in snap["features"]["models"]], ["NF", "27B"])
 
+
+
+class IpcDeathAndWallRateTests(unittest.TestCase):
+    """Operator 29.09.: (1) "GRUPPE D TOT" from a ConsumerGone traceback in D's HTTP
+    layer while D decoded on -- dead only from IPC; (2) the prefill bar said 1294
+    tok/s where 8192 tokens took 11 s -- the primary figure is tokens / wall clock."""
+    NOW = 1790673324.0
+
+    def _boot(self, **kw):
+        b = {"live": True, "health": {}, "stops": [], "last_activity": {}, "last_activity_any": self.NOW - 2,
+             "container": {"Names": "htsglang-acc-nf-x", "State": "running", "Status": "Up 9 minutes (healthy)"},
+             "front": None, "queue": None}
+        b.update(kw)
+        return b
+
+    def test_consumer_gone_traceback_while_decoding_is_no_death(self):
+        t = self.NOW - 14
+        b = self._boot(stops=[{"t": t, "group": "D", "text": "Traceback (most recent call last):", "bare": True,
+                               "src": "boot_weg2_x_110211.D.log"},
+                              {"t": t, "group": "D", "bare": True, "src": "boot_weg2_x_110211.D.log",
+                               "text": "sglang.srt.entrypoints.http_server.ConsumerGone: stream released after 122 s"}],
+                       last_activity={"D": self.NOW - 2})
+        a = health.assess(b, self.NOW)
+        self.assertNotEqual(a["state"], "TOT")
+        self.assertNotIn("dead", {r["level"] for r in a["reasons"]})
+        self.assertIn("[Quelle: boot_weg2_x_110211.D.log]", a["reasons"][0]["text"])
+
+    def test_death_only_from_ipc(self):
+        end = stops.classify_ipc({"lifecycle": "dead", "lifecycle_since": self.NOW - 30,
+                                  "cause": {"code": "DEADMAN_FLIP_STALL", "origin": "deadman", "rc": 24}})
+        a = health.assess(self._boot(end=end), self.NOW)
+        self.assertEqual(a["state"], "TOT")
+        self.assertIn("DEADMAN_FLIP_STALL", a["reasons"][0]["text"])
+        # a death named only by the harness log (fallback, no state dir) is no IPC death
+        a = health.assess(self._boot(end={"planned": None, "death": {"t": self.NOW - 30, "text": "x"},
+                                          "src": "Harness-Log (Übergang)"}), self.NOW)
+        self.assertNotEqual(a["state"], "TOT")
+
+    def test_prefill_wall_rate_beside_the_gpu_rate(self):
+        # one 8192-token prompt through PP3: first chunk starts 100.5, last stage ends 111.5 -> 11 s
+        rows = [{"t": 103.0, "rk": "PP", "rank": 0, "new_tok": 8192, "compute_ms": 3000.0},
+                {"t": 107.0, "rk": "PP", "rank": 1, "new_tok": 8192, "compute_ms": 3000.0},
+                {"t": 111.0, "rk": "PP", "rank": 2, "new_tok": 8192, "compute_ms": 3000.0}]
+        w = live.Boot._prefill_window(rows, [], 0.0)
+        self.assertAlmostEqual(w["wall_s"], 11.0)
+        self.assertAlmostEqual(w["wall_tps"], 8192 / 11.0)        # ~744, what the user saw on the clock
+        self.assertAlmostEqual(w["tps_gpu"], 8192 / 3.0)          # the compute rate, labelled beside it
+        self.assertGreater(w["tps_gpu"], w["wall_tps"])
+
+    def test_decode_wall_is_tokens_over_time_not_mean_of_rates(self):
+        lines = [{"t": 0.0, "gen_tps": 100.0}, {"t": 1.0, "gen_tps": 100.0}, {"t": 11.0, "gen_tps": 10.0}]
+        tps, covered = live._decode_wall(lines)
+        self.assertAlmostEqual(covered, 11.0)
+        self.assertAlmostEqual(tps, (100.0 * 1 + 10.0 * 10) / 11.0)   # 18.2, the mean of the rates would be 55
+        self.assertEqual(live._decode_wall([{"t": 5.0, "gen_tps": 42.0}]), (42.0, None))
+
+    def test_stop_record_names_its_source_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            stem = os.path.join(d, "boot_weg2_x_0927_000000")
+            with open(stem + ".P.log", "w") as fh:
+                fh.write("\n".join([P_RANK0, TB_PREFIXED, W27_UNPREFIXED]) + "\n")
+            ll = live.LiveLogs([os.path.join(d, "boot_*.log")])
+            ll.poll()
+            [v] = ll.snapshot()
+            self.assertTrue(v["stops"])
+            self.assertTrue(all(x["src"] == "boot_weg2_x_0927_000000.P.log" for x in v["stops"]))

@@ -5,11 +5,15 @@ the front alive, the container "unhealthy" and requests hanging, unnoticed):
 a state on the model card nobody can overlook.  Sources, each named in the
 reason line it produces:
 
-* WEG2-HEALTH (front log): ``process_alive=False`` -> the group is dead;
+* DEAD comes ONLY from IPC (operator 29.09., rule "IPC nie ueber Logs"):
+  ``b["end"]["death"]`` from stops.classify_ipc (state.json lifecycle/cause,
+  events deadman_verdict / front_stop).
+* WEG2-HEALTH (front log): ``process_alive=False`` -> a hint only;
   ``http_ok=False`` with a streak >= 2 while alive -> the group is hung.
 * named stops in the P/D logs (parse.STOP_RE: W27, #791b, SPLIT refused,
-  ADMISSION SPLIT, a scheduler traceback, CUDA OOM, DEBUG-HOLD) with no
-  prefill/decode line of that group after them.
+  ADMISSION SPLIT, a traceback, CUDA OOM, DEBUG-HOLD) -> a hint naming its
+  source file, never a death (a ConsumerGone traceback in D's HTTP layer
+  showed "GRUPPE D TOT" while D decoded on, 29.09.).
 * Docker health: ``(unhealthy)`` in the container status.
 * the hang indicator: work is queued, but no prefill/decode line for
   HANG_S seconds.
@@ -68,18 +72,30 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     def stopping():
         return pt is not None and (bool(teardown) or not b.get("live") or c.get("State") != "running")
 
-    # 1. WEG2-HEALTH
+    # 0. death: ONLY from IPC (state.json lifecycle/cause, events deadman_verdict /
+    # front_stop -- stops.classify_ipc).  Operator 29.09. after a ConsumerGone
+    # traceback in D's HTTP layer showed "GRUPPE D TOT" while D decoded on: a log
+    # line never says a group is dead (rule "IPC nie ueber Logs").
+    end = b.get("end") or {}
+    death = end.get("death")
+    if death and end.get("src") == "state.json":
+        add("dead", None, "tot laut IPC: %s" % death.get("text"), death.get("t"))
+
+    # 1. WEG2-HEALTH (front log line): a hint, never a death verdict
     for g, h in sorted((b.get("health") or {}).items()):
         if _age(now, h.get("t")) is None or _age(now, h["t"]) > HEALTH_FRESH_S:
             continue
         if not h.get("alive"):
-            add("dead", g, "Gruppe %s tot: WEG2-HEALTH process_alive=False%s" % (
-                g, " (streak %d)" % h["streak"] if h.get("streak") else ""), h["t"])
+            add("warn", g, "Hinweis aus Log (Übergang): WEG2-HEALTH group=%s process_alive=False%s -- "
+                "tot ist eine Gruppe nur laut state.json" % (g, " (streak %d)" % h["streak"] if h.get("streak") else ""),
+                h["t"])
         elif not h.get("http_ok") and (h.get("streak") or 0) >= 2:
             add("hang", g, "Gruppe %s antwortet nicht: WEG2-HEALTH http_ok=False, streak %d, Prozess lebt" % (
                 g, h["streak"]), h["t"])
 
-    # 2. named stops, newest per group; "why" lines beat the bare traceback line
+    # 2. named stops in the P/D logs (a traceback, W27, OOM ...), newest per group;
+    # "why" lines beat the bare traceback line.  A hint with its source file,
+    # never a death: a traceback in the HTTP layer (ConsumerGone) kills nothing.
     by_group = {}
     for s in b.get("stops") or []:
         cur = by_group.get(s["group"])
@@ -89,15 +105,16 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     for g, s in sorted(by_group.items()):
         act = (b.get("last_activity") or {}).get(g)
         recovered = act is not None and act > s["t"] + STOP_RECOVERED_S
-        text = "Gruppe %s gestoppt: %s" % (g, s["text"][:300])
+        src = " [Quelle: %s]" % s["src"] if s.get("src") else ""
+        text = "Hinweis aus Log, Gruppe %s: %s%s" % (g, s["text"][:300], src)
         if ended_on is None or s["t"] > ended_on["t"]:
-            ended_on = {"group": g, "text": s["text"][:300], "t": s["t"], "recovered": recovered}
+            ended_on = {"group": g, "text": s["text"][:300], "t": s["t"], "recovered": recovered, "src": s.get("src")}
         if recovered:
             add("warn", g, text + " (danach lief die Gruppe weiter)", s["t"])
         elif catching_up:
             add("warn", g, text + " (Log wird noch eingelesen: ob die Gruppe danach weiterlief, steht noch aus)", s["t"])
         else:
-            add("dead", g, text, s["t"])
+            add("warn", g, text + " (lebend/tot entscheidet state.json)", s["t"])
 
     # 3. Docker health.  Measured 27.09. ~14:40Z: the container healthcheck
     # itself raised a false "unhealthy" (its "W27 " pattern hit launcher prose)

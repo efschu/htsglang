@@ -183,6 +183,47 @@ def _rate(tok, ms):
     return (tok / (ms / 1000.0)) if (tok and ms and ms > 0) else None
 
 
+def _prefill_wall(rows):
+    """Prefill tokens per WALL second (operator 29.09.: 8192 tokens in 11 s are
+    ~744 tok/s, the tile said 1294 = the GPU compute rate).  Numerator: #new-token
+    of the first stage (PP0/TP0, each chunk once).  Denominator: first chunk's
+    start (stamp - its compute/gpu-ms) to the last line of ANY rank (the last
+    pipeline stage ends the prefill).  Returns (tok_per_s, span_s, tokens)."""
+    if not rows:
+        return None, None, 0
+    starts, ends, per = [], [], {}
+    for e in rows:
+        ms = e.get("compute_ms") or e.get("gpu_ms") or 0.0
+        t = _mid(e["t"])
+        starts.append(t - ms / 1000.0)
+        ends.append(t)
+        k = "%s%s" % (e.get("rk", ""), e.get("rank", 0))
+        per[k] = per.get(k, 0) + (e.get("new_tok") or 0)
+    tok = per.get("PP0", per.get("TP0", next(iter(per.values()))))
+    span = max(ends) - min(starts)
+    return ((tok / span) if (tok and span > 0) else None), (span if span > 0 else None), tok
+
+
+def _decode_wall(lines):
+    """Decode tokens per wall second over 'Decode batch' lines: 'gen throughput'
+    is the tokens since the previous line / the time between, so the honest mean
+    is SUM(gen_tps x interval) / SUM(interval) -- never the mean of the rates.
+    A line without a predecessor in ``lines`` has no known interval and is left
+    out; a single line is its own figure.  Returns (tok_per_s, covered_s)."""
+    ls = sorted((e for e in lines if e.get("t") is not None), key=lambda e: e["t"])
+    tok = dt = 0.0
+    for prev, cur in zip(ls, ls[1:]):
+        g, d = cur.get("gen_tps"), cur["t"] - prev["t"]
+        if g is None or d <= 0:
+            continue
+        tok += g * d
+        dt += d
+    if dt > 0:
+        return tok / dt, dt
+    single = [e["gen_tps"] for e in ls if e.get("gen_tps") is not None]
+    return (single[-1] if single else None), None
+
+
 ONE_S = 1.0            # the "jetzt 1 s" window
 GEN_GAP_FACTOR = 2.5   # a Decode batch line later than this x the usual line interval covers a pause
 
@@ -364,16 +405,22 @@ def _flip_intervals(begins, dones, open_begin, t1):
     return out
 
 
-def _run_stats(cls, evs):
-    """Mean rate of one phase run.  Prefill: compute-honest, per rank
-    sum(#new-token) / sum(compute-ms), the SLOWEST rank (as in the tiles).
-    Decode: mean 'gen throughput' of the run's 'Decode batch' lines."""
+def _run_stats(cls, evs, span_s=None):
+    """Rate of one phase run, primary figure = WALL rate (operator 29.09.:
+    the bar said 1294 tok/s where 8192 tokens took 11 s).  Prefill ``tps``:
+    #new-token of the first stage / the run's wall span (segment e - s);
+    ``tps_gpu``: per rank sum(#new-token) / sum(compute-ms), slowest rank.
+    Decode ``tps``: sum(gen throughput x line interval) / sum(interval) over the
+    run's 'Decode batch' lines (_decode_wall) -- never the mean of the rates."""
     if cls == "dec":
-        g = [e["gen_tps"] for e in evs if e.get("gen_tps") is not None]
+        lines = [e for e in evs if e.get("kind", "decode_batch") != "decode_rank"]
+        g = [e["gen_tps"] for e in lines if e.get("gen_tps") is not None]
         run = [e["running"] for e in evs if e.get("running") is not None]
         rb = [e["bs"] for e in evs if e.get("kind") == "decode_rank" and e.get("bs") is not None]
         rounds = sum(1 for e in evs if e.get("kind") == "decode_rank")
-        return {"tps": (sum(g) / len(g)) if g else None, "n": len(g), "rounds": rounds,
+        wall, _covered = _decode_wall(lines)
+        return {"tps": wall, "tps_src": "Σ(gen throughput × Zeilenabstand) / Σ Zeilenabstand", "n": len(g),
+                "rounds": rounds,
                 "bs_min": min(rb) if rb else None, "bs_max": max(rb) if rb else None,
                 "bs_mean": (sum(rb) / len(rb)) if rb else None,
                 "bs": (sum(run) / len(run)) if run else None}
@@ -388,7 +435,10 @@ def _run_stats(cls, evs):
     rated = [_rate(a[0], a[1]) for a in per.values()]
     rated = [r for r in rated if r]
     r0 = per.get("PP0") or per.get("TP0") or (next(iter(per.values())) if per else None)
-    return {"tps": min(rated) if rated else None, "tok": r0[0] if r0 else 0,
+    tok = r0[0] if r0 else 0
+    return {"tps": (tok / span_s) if (tok and span_s and span_s > 0) else None,
+            "tps_src": "Σ #new-token (erste Stufe) / Laufdauer (Wanduhr)",
+            "tps_gpu": min(rated) if rated else None, "tok": tok,
             "n": r0[2] if r0 else len(evs)}
 
 
@@ -462,7 +512,7 @@ def phase_timeline(acts, flips, t0, t1, first_t=None, awake_hint=None, gap_s=PHA
 
     segs = []
     for r in runs:
-        st = _run_stats(r["cls"], r["evs"])
+        st = _run_stats(r["cls"], r["evs"], r["e"] - r["s"])
         segs.append(dict(st, k=r["cls"], s=r["s"], e=r["e"], running=bool(r.get("running"))))
     for g in greys:
         segs.append({"k": "flip", "s": g["s"], "e": g["e"], "slept": g["slept"], "woke": g["woke"],
@@ -598,6 +648,8 @@ class Boot:
             return
         self.ev["stops"].append({
             "t": ts, "group": group, "text": text.strip()[:400],
+            # the view names where the hint came from (it is a hint, never a death)
+            "src": os.path.basename(getattr(tail, "path", "") or "") or None,
             # the bare "Traceback (most recent call last):" says THAT, the
             # named line (W27 ..., OOM ...) says WHY -- the view prefers WHY
             "bare": "Traceback (most recent" in text and not any(
@@ -910,7 +962,12 @@ class Boot:
         rated = [a["tps"] for a in per.values() if a["tps"]]
         wall = [b["wall_tps"] for b in batches if b["t"] >= t0 and b.get("wall_tps") is not None]
         rank0 = per.get("PP0") or per.get("TP0") or (next(iter(per.values())) if per else None)
+        wall_tps, wall_s, _ = _prefill_wall([e for e in ranks if e["t"] >= t0])
         return {
+            # primary figure: tokens per wall second over the rows' own span (first
+            # chunk start .. last line of any rank); the compute rate stays as tps_gpu
+            "wall_tps": wall_tps, "wall_s": wall_s,
+            "tps_gpu": min(rated) if rated else None,
             "tps": min(rated) if rated else None,
             "ranks": dict(sorted(per.items())),
             "unrated_rows": unrated,
@@ -1051,6 +1108,12 @@ class Boot:
               if e["t"] >= now - WINDOW_S and e.get("rank", 0) == 0 and e.get("gpu_ms")]
         last = self.last.get("%s_decode_batch" % g)
         gen = [e["gen_tps"] for e in rows if e.get("gen_tps") is not None]
+        # tokens / wall time: each line's rate weighted by its own interval (the
+        # previous line may lie before the window); the plain mean of the rates
+        # stays only as gen_tps_mean_of_rates
+        allb = list(self.ev["%s_decode_batch" % g])
+        i0 = next((i for i, e in enumerate(allb) if e["t"] >= now - WINDOW_S), len(allb))
+        wall, covered = _decode_wall(allb[max(0, i0 - 1):])
         # the newest figure that is a real decode rate (mark_gen_artefacts), not
         # the first line after a flip or extend
         clean_last = next((e["gen_tps"] for e in reversed(self.ev["%s_decode_batch" % g])
@@ -1064,7 +1127,9 @@ class Boot:
             "window_s": WINDOW_S,
             "one_s": self._one_s(g, "decode", now),
             "max3s_120": self._max3s(g, "decode", now),
-            "gen_tps": (sum(gen) / len(gen)) if gen else None,
+            "gen_tps": wall if gen else None,
+            "gen_tps_covered_s": covered,
+            "gen_tps_mean_of_rates": (sum(gen) / len(gen)) if gen else None,
             "gen_tps_last": clean_last,
             "artefacts": sum(1 for e in rows if e.get("gen_art")),
             "running": last.get("running") if last else None,
