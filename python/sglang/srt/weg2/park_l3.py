@@ -121,6 +121,44 @@ def issue_deferred_reads(sched, hold) -> list:
     return out
 
 
+def early_enabled() -> bool:
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_ENABLE_WAKE_READ_EARLY.get())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def issued(req) -> bool:
+    return bool(getattr(req, ISSUED_ATTR, False))
+
+
+def issue_reads_at_wake_begin(sched) -> list:
+    """F22 (29.09.): the deferred hold reads at the START of the weight legs.
+
+    MEASURED (marker audit x178 / z30w-park / z30x2-kvdemand): the #248 read
+    issued at ``#1443 DORMANT-RELEASE`` -- after the legs and the kv resume --
+    parks every held request in the #1471 settle for ``held_after_wake_s``
+    median 0.60 s (z30w) / 0.35 s (kvdemand); x178 read during the flip (0).
+    The read is host-side (aux threads, ``WEG2-READ-STAGES ... no H2D here``;
+    the device load is the admission's), so it can run beside the ~1.5 s of
+    weight legs. Same call as the release's (:func:`issue_deferred_reads`, in
+    hold order, at the same point of the same RPC on every rank); the release
+    then finds nothing deferred and its settle verdict sees complete reads.
+    Off (:func:`early_enabled`) = nothing here, the release issues as before."""
+    if not early_enabled() or not enabled() or not _group_d():
+        return []
+    hold = getattr(sched, "weg2_dormant_hold", None) or []
+    if not hold:
+        return []
+    out = issue_deferred_reads(sched, hold)
+    if out:
+        logger.info("#248 WAKE-READ-EARLY issued=%d at the weight legs' start (F22: the read runs "
+                    "beside the legs, the settle finds it complete)", len(out))
+    return out
+
+
 def after_release(reqs) -> None:
     """A request whose wake read completed leaves the settle: drop the hand-off
     keys the read registered with (what the wake does for a hold read)."""

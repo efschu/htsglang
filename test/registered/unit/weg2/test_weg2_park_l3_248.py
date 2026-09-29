@@ -466,3 +466,76 @@ def test_a_partial_park_frees_its_tail_first(env):
     states = dict(zip(pool._stems(chain), (int(st) for _, st in env.kv.find_slots(pool._stems(chain)))))
     assert states[head[0]] == 2 and states[head[1]] == 2
     assert states[pool._stems(["pC"])[0]] != 2
+
+
+# ---------------------------------------------------------------- F22 read early
+# F22 (29.09.): the #248 hold read at the weight legs' START, beside the legs.
+# Measured without it (#1471 SETTLE held_after_wake_s): z30w-park median 0.60 s,
+# z30x2-kvdemand 0.35 s; x178 (read during the flip) 0.
+
+
+def test_f22_early_read_runs_before_the_release_and_the_release_queues_it(env):
+    env.mp.setenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", "1")
+    assert ho.write(HELD, list(range(12)), ["hA", "hB", "hC"])
+    reads = []
+    tree = _Tree()
+    s = _wake_sched(tree, reads)
+    a, b = _req(PARKED), _req(HELD)
+    for r in (a, b):
+        park_l3.defer_hold_read(s, r)
+    _cc.WEG2_HANDOFF_PAGE_KEYS[HELD] = ["hA"]
+    s.weg2_dormant_hold = [a, b]
+    # the legs' start: one read per held request, hold order, nothing released yet
+    assert park_l3.issue_reads_at_wake_begin(s) == [a, b]
+    assert reads == [PARKED, HELD] and s.waiting_queue == []
+    # the legs run (~1.5 s on the metal): the reads complete meanwhile
+    tree.ongoing_prefetch.clear()
+    n = Scheduler._weg2_release_dormant_hold(s)
+    assert reads == [PARKED, HELD], "the release issues no second read"
+    assert n == 2 and s.waiting_queue == [a, b] and s.weg2_post_wake_settle == [], \
+        "complete at the release: no #1471 settle"
+    assert not os.path.exists(ho.path(HELD)) and HELD not in _cc.WEG2_HANDOFF_PAGE_KEYS
+
+
+def test_f22_early_read_keeps_the_keys_while_the_read_is_still_short(env):
+    """A read the legs did not outlast parks in the settle as before -- and the
+    release must not drop P's hand-off keys the read still registers with
+    (RED on 895559fed2's release: an issued read was not skipped there)."""
+    env.mp.setenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", "1")
+    assert ho.write(HELD, list(range(12)), ["hA", "hB", "hC"])
+    tree = _Tree()
+    s = _wake_sched(tree, [])
+    b = _req(HELD)
+    park_l3.defer_hold_read(s, b)
+    _cc.WEG2_HANDOFF_PAGE_KEYS[HELD] = ["hA"]
+    s.weg2_dormant_hold = [b]
+    park_l3.issue_reads_at_wake_begin(s)
+    assert Scheduler._weg2_release_dormant_hold(s) == 0
+    assert s.weg2_post_wake_settle == [b]
+    assert os.path.exists(ho.path(HELD)) and _cc.WEG2_HANDOFF_PAGE_KEYS.get(HELD) == ["hA"]
+
+
+def test_f22_switch_off_reads_at_the_release_as_before(env):
+    """Off (the default until the first series), and the 27B's D the same:
+    the legs' start issues nothing, the release reads as on 895559fed2."""
+    env.mp.delenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", raising=False)
+    reads = []
+    tree = _Tree()
+    s = _wake_sched(tree, reads)
+    a = _req(PARKED)
+    park_l3.defer_hold_read(s, a)
+    s.weg2_dormant_hold = [a]
+    assert park_l3.issue_reads_at_wake_begin(s) == [] and reads == []
+    Scheduler._weg2_release_dormant_hold(s)
+    assert reads == [PARKED] and s.weg2_post_wake_settle == [a]
+
+
+def test_f22_early_read_is_group_d_only(env):
+    env.mp.setenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", "1")
+    env.mp.setenv("SGLANG_WEG2_GROUP", "P")
+    reads = []
+    s = _wake_sched(_Tree(), reads)
+    r = _req(PARKED)
+    r._weg2_248_read_at_wake = True
+    s.weg2_dormant_hold = [r]
+    assert park_l3.issue_reads_at_wake_begin(s) == [] and reads == []

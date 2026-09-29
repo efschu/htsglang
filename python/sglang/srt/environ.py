@@ -601,6 +601,16 @@ class Envs:
     # device load -- at the wake. False = the pre-#248 hold read (reference
     # and pin during the sleep), byte for byte.
     SGLANG_WEG2_ENABLE_PARK_L3 = EnvBool(True)
+    # ENABLE_WAKE_READ_EARLY (F22, 29.09.): the #248 hold read is issued at the
+    # START of D's weight legs instead of after the kv resume, so the store
+    # reads (aux threads, host only) run beside the ~1.5 s of legs. Measured
+    # posten without it (#1471 SETTLE held_after_wake_s): z30w-park median
+    # 0.60 s, z30x2-kvdemand 0.35 s; x178 (read during the flip) 0. The
+    # reference exists from the wake's first RPC on -- P has drained by then
+    # (the front drains before the sleep/wake pair), so #248's measured fault
+    # (a reference over P's whole phase) stays closed. Model-neutral; off
+    # until the first boot series, then default on.
+    SGLANG_WEG2_ENABLE_WAKE_READ_EARLY = EnvBool(False)
     # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
     # rank 0, never the scheduler thread) that copies the kept pages of
     # parked and waiting rids from the arena to HiCacheFile without freeing

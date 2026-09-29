@@ -9860,6 +9860,17 @@ class SchedulerWeightUpdaterManager:
             # Same lock, same reason as the sleep leg above.
             t_w0 = time.perf_counter()
             _weg2_ph("pre_leg")
+            # F22 WAKE-READ-EARLY: the #248 hold reads start beside the legs
+            # (host-only aux-thread reads); off = issued at DORMANT-RELEASE.
+            if self.scheduler is not None:
+                try:
+                    from sglang.srt.weg2 import park_l3 as _pl3_early
+
+                    _pl3_early.issue_reads_at_wake_begin(self.scheduler)
+                except Exception as _early_exc:  # noqa: BLE001 -- the release issues what is left
+                    logger.warning("#248 WAKE-READ-EARLY n/a (%s: %s) -- the release issues it",
+                                   type(_early_exc).__name__, _early_exc)
+                _weg2_ph("read_early")
             shm0 = self._weg2_rss_shmem_mib()
             tag_bytes = {tag: self._weg2_tag_bytes(tag) for tag in weights_tags}
             # H31: the Platztausch pad+extra rows, issued per tag behind its
