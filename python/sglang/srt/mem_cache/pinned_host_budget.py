@@ -70,6 +70,13 @@ logger = logging.getLogger(__name__)
 # the value it used and where it came from.
 PINNED_HOST_RESERVE_ENV = "SGLANG_PINNED_HOST_RESERVE_GIB"
 PINNED_HOST_RESERVE_DEFAULT_GIB = 10
+# 29.09. (z30x2-yarn2, 27B conditions): the value a weg2 LAUNCHER hands its
+# ranks when nobody set PINNED_HOST_RESERVE_ENV -- the host ledger's measured
+# margin under the cgroup, the same number the ledger bounds its run peak by
+# (host_ledger.pinned_reserve_for_ranks). An explicit PINNED_HOST_RESERVE_ENV
+# always wins; neither set = the native 10 GiB, byte-identical.
+PINNED_HOST_RESERVE_LEDGER_ENV = "SGLANG_PINNED_HOST_RESERVE_LEDGER_GIB"
+PINNED_HOST_RESERVE_LEDGER_SOURCE_ENV = "SGLANG_PINNED_HOST_RESERVE_LEDGER_SOURCE"
 #: The DEFAULT reserve in bytes. The value the checks use is
 #: pinned_host_reserve() -- read it there, never from this constant.
 PINNED_HOST_RESERVE_BYTES: int = PINNED_HOST_RESERVE_DEFAULT_GIB * (1024**3)
@@ -87,7 +94,11 @@ def pinned_host_reserve() -> Tuple[int, str]:
     ``source`` is ``"default 10 GiB"`` or ``"env SGLANG_PINNED_HOST_RESERVE_GIB=<raw>"``
     -- every message that names the reserve carries it, so a refusal says
     which number refused it and who set that number."""
-    raw = os.environ.get(PINNED_HOST_RESERVE_ENV)
+    env = PINNED_HOST_RESERVE_ENV
+    raw = os.environ.get(env)
+    if raw is None or not raw.strip():
+        env = PINNED_HOST_RESERVE_LEDGER_ENV
+        raw = os.environ.get(env)
     if raw is None or not raw.strip():
         return (PINNED_HOST_RESERVE_BYTES,
                 f"default {PINNED_HOST_RESERVE_DEFAULT_GIB} GiB")
@@ -96,16 +107,19 @@ def pinned_host_reserve() -> Tuple[int, str]:
         gib = float(text)
     except ValueError:
         raise PinnedHostReserveInvalid(
-            f"{PINNED_HOST_RESERVE_ENV}={raw!r} is not a number of GiB: it is "
+            f"{env}={raw!r} is not a number of GiB: it is "
             "the host RAM the pinned-host checks keep free for the OS (a finite "
             f"number >= 0; unset = {PINNED_HOST_RESERVE_DEFAULT_GIB} GiB)"
         ) from None
     if not math.isfinite(gib) or gib < 0:
         raise PinnedHostReserveInvalid(
-            f"{PINNED_HOST_RESERVE_ENV}={raw!r} must be a finite number of GiB "
+            f"{env}={raw!r} must be a finite number of GiB "
             f">= 0 (unset = {PINNED_HOST_RESERVE_DEFAULT_GIB} GiB)"
         )
-    return int(gib * (1024**3)), f"env {PINNED_HOST_RESERVE_ENV}={text}"
+    if env == PINNED_HOST_RESERVE_LEDGER_ENV:
+        why = os.environ.get(PINNED_HOST_RESERVE_LEDGER_SOURCE_ENV, "").strip()
+        return int(gib * (1024**3)), f"ledger {text} GiB" + (f" ({why})" if why else "")
+    return int(gib * (1024**3)), f"env {env}={text}"
 
 
 def pinned_host_reserve_bytes() -> int:

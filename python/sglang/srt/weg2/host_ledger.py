@@ -1271,6 +1271,72 @@ def reap_mark_gib(ceiling_bytes: Optional[int] = None, ceiling_source: str = "")
     return min(const, float(ceiling_bytes) / GIB)
 
 
+def pinned_reserve_for_ranks(
+    margin_gib: float,
+    ceiling_bytes: Optional[int],
+    ceiling_source: str = "",
+) -> Tuple[Optional[float], str]:
+    """``(GiB, source)``: the OS reserve the ranks' pinned-host check
+    (``pinned_host_budget.check_and_register_pinned_post``) will keep free,
+    decided HERE so the ledger and the pools use one number.
+
+    29.09. (z30x2-yarn2, 27B conditions): an explicit
+    ``SGLANG_PINNED_HOST_RESERVE_GIB`` always wins. Otherwise, under a finite
+    cgroup ``memory.max``, it is this ledger's own measured margin -- the
+    flip transient, run-moment residual and idle drift the records measured
+    (:func:`resolve_margin`), the non-pool growth the box still spends after a
+    pool is admitted -- not a flat constant. The launcher exports it as
+    ``SGLANG_PINNED_HOST_RESERVE_LEDGER_GIB``; the ranks read it through
+    ``pinned_host_reserve()``. ``(None, why)`` without a finite cgroup: the
+    native 10 GiB stays, byte-identical."""
+    from sglang.srt.mem_cache import pinned_host_budget as _phb
+
+    raw = os.environ.get(_phb.PINNED_HOST_RESERVE_ENV)
+    if raw is not None and raw.strip():
+        b, src = _phb.pinned_host_reserve()
+        return b / GIB, src
+    if ceiling_bytes is None or (
+        ceiling_source and not ceiling_source.startswith("cgroup memory.max")
+    ):
+        return None, "no finite memory.max -- the ranks keep the native reserve"
+    return float(margin_gib), f"ledger margin {float(margin_gib):.2f} GiB (measured)"
+
+
+def pinned_wall(
+    ceiling_bytes: Optional[int],
+    ceiling_source: str,
+    reserve_gib: Optional[float],
+    reserve_source: str = "",
+) -> Tuple[Optional[float], str]:
+    """``(GiB, why)``: the non-reclaimable level above which the ranks'
+    pinned-host check refuses a pool -- ``memory.max`` minus the SAME reserve
+    :func:`pinned_reserve_for_ranks` hands them. The check reads ``available
+    = memory.max - non-reclaimable`` and demands ``available - reserve >=
+    requested``; a run peak (which includes every pool) at or under this wall
+    therefore admits every pool at every earlier moment. z30x2-yarn2 died at
+    73.6 GiB non-reclaimable under a 10 GiB reserve its ledger never saw."""
+    if reserve_gib is None or ceiling_bytes is None or (
+        ceiling_source and not ceiling_source.startswith("cgroup memory.max")
+    ):
+        return None, "no finite memory.max -- the pinned check reads MemAvailable"
+    cap = float(ceiling_bytes) / GIB
+    return cap - float(reserve_gib), (
+        f"memory.max {cap:.2f} - pinned reserve {float(reserve_gib):.2f} ({reserve_source})")
+
+
+def pinned_wall_binding(
+    predicted_gib: Optional[float], wall_gib: Optional[float], why: str,
+) -> Optional[str]:
+    """The arm's PINNED WALL binding, or None when the run peak fits under it
+    (or either side is unknown)."""
+    if predicted_gib is None or wall_gib is None or predicted_gib <= wall_gib:
+        return None
+    return (f"PINNED WALL ({predicted_gib:.2f} > {wall_gib:.2f} GiB = {why} -- the "
+            f"ranks' check_and_register_pinned_post refuses the HiCache host pools "
+            f"above it; z30x2-yarn2 D died there at 73.6 GiB non-reclaimable under "
+            f"a 10 GiB reserve)")
+
+
 def launch_moment_peak_gib(
     anon_load_peak_gib: float,
     ring_fill_gib: float,
@@ -3999,6 +4065,8 @@ class Arm:
     terms: Dict[str, float] = field(default_factory=dict)
     launch_leftover_gib: float = 0.0
     run_leftover_gib: float = 0.0
+    # 29.09.: (GiB|None, source) of the ranks' pinned-host reserve, set by choose()
+    pinned_reserve: Tuple[Optional[float], str] = (None, "")
 
     @property
     def launch_worst_case_gib(self) -> float:
@@ -6164,6 +6232,10 @@ def choose(
         )
     )
     hard_bound_gib = watermark_gib - margin.total_gib
+    pinned_reserve_gib, pinned_reserve_src = pinned_reserve_for_ranks(
+        margin.total_gib, cg_ceiling_bytes, cg_ceiling_source)
+    pinned_wall_gib, _pinned_wall_why = pinned_wall(
+        cg_ceiling_bytes, cg_ceiling_source, pinned_reserve_gib, pinned_reserve_src)
     # #1360: BOTH OR NEITHER, checked before a single arm is priced, so a
     # half-armed deviation can never reach a verdict it would then convert.
     _deviation_armed = bool(deviation_reason) and riegel_gib is not None
@@ -6195,6 +6267,8 @@ def choose(
     if census is not None:
         _wm_line += (f" | ungebucht={float(census.get('unbooked_shm_gib') or 0.0):.2f} GiB "
                      f"shmem without a post [{census.get('census_source', '')}]")
+    if pinned_wall_gib is not None:
+        _wm_line += f" | pinned_wall={pinned_wall_gib:.2f} GiB ({_pinned_wall_why})"
     lines.append(_wm_line)
     chosen: Optional[Arm] = None
     peak_bound_any = False
@@ -6305,7 +6379,13 @@ def choose(
                 f"condition, not a sufficient one -- it may refuse; it never "
                 f"funds by itself)"
             )
-        ok = moments_ok and peak_ok and cushion_ok and headroom_ok
+        # 29.09. (z30x2-yarn2): the run peak includes every pinned pool, so it
+        # must sit under the wall the ranks' own pinned check enforces too.
+        _pinned_binding = pinned_wall_binding(predicted, pinned_wall_gib, _pinned_wall_why)
+        pinned_ok = _pinned_binding is None
+        if not pinned_ok:
+            binding.append(_pinned_binding)
+        ok = moments_ok and peak_ok and cushion_ok and headroom_ok and pinned_ok
         # #1360: the deviation converts THIS verdict, after it has been computed
         # in full. `binding` is left exactly as it was so the DEVIATION line and
         # the refusal it replaces name the same terms.
@@ -6634,6 +6714,9 @@ def choose(
         "WEG2-STORE line rather than repeating a recalled number here."
     )
     lines.append(_advisory_line(chosen, chosen=True, watermark_gib=watermark_gib))
+    # the ONE reserve number: the launcher exports it to the ranks. Kept OFF
+    # arm.terms, which stay byte-identical with price()'s (#1360 guard).
+    chosen.pinned_reserve = (pinned_reserve_gib, pinned_reserve_src)
     return chosen, headroom, lines
 
 
