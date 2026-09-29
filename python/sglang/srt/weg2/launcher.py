@@ -85,6 +85,7 @@ from sglang.srt.weg2 import (
     DEFAULT_PP_ORDERED_CUT,
 )
 from sglang.srt.weg2 import admin_key as admin_key_mod
+from sglang.srt.weg2 import budget_rest as _budget_rest
 from sglang.srt.weg2 import rank_state as rank_state_mod
 from sglang.srt.weg2 import shared_cache_release as shared_cache_release_mod
 from sglang.srt.weg2 import state_file as state_file_mod
@@ -13022,6 +13023,38 @@ def d_awake_rest(cards: List[Card], profile: Optional[str] = None) -> Tuple[Opti
     return [None if v is None else int(v) for v in vals], _pconst_boots("D_AWAKE_REST_MIB", profile)
 
 
+def budget_rest_from_records(profile: Optional[str] = None) -> bool:
+    """VRAM-GRUNDGESETZ 29.09.: the profile row's ``budget_rest_from_records``
+    (qwen27b on, nextflash off) unless ``SGLANG_WEG2_BUDGET_REST_RECORD`` is set."""
+    row = weg2_form.profile_row(profile if profile is not None else weg2_form.DEFAULT_PROFILE)
+    return _budget_rest.switch_on(bool(getattr(row, "budget_rest_from_records", False)))
+
+
+def booked_rest_kwargs(cards: List[Card], profile: Optional[str] = None,
+                       group: str = "D", log: Optional[Log] = None) -> Dict[str, object]:
+    """The ``booked_rest_mib`` / ``booked_rest_provenance`` kwargs of
+    :func:`budgets_from_dc` for ``group`` -- ``{}`` (budgets byte-identical)
+    when the switch is off or the profile carries no record for the group
+    (then ``log`` says so once, by name: UNMEASURED, legacy terms stand)."""
+    if not budget_rest_from_records(profile):
+        return {}
+    name = _budget_rest.record_name(group)
+    try:
+        vals = list(_pconst(name, profile))
+    except KeyError:
+        if log is not None:
+            log(f"{_budget_rest.MARKER} {_budget_rest.SOURCE_UNMEASURED} group={group}: the "
+                f"profile carries no {name} -- floor + user reserve + awake_overshoot "
+                f"{D_AWAKE_OVERSHOOT_MIB} + overshoot record stand (named, not measured); "
+                f"measure with python -m sglang.srt.weg2.budget_rest")
+        return {}
+    try:
+        res = _budget_rest.resolve(vals, _pconst_boots(name, profile), len(cards), group)
+    except ValueError as exc:
+        raise Weg2LaunchRefused(f"{_budget_rest.MARKER}: {exc}") from None
+    return {"booked_rest_mib": list(res.values), "booked_rest_provenance": res.provenance}
+
+
 def d_fixed_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optional[float]]], str]:
     """``D_FIXED_MIB`` of the profile (the #145 fixed post measured on the
     form that runs today), or ``(None, "")`` -- the builtin reference stands."""
@@ -13345,10 +13378,22 @@ def budgets_from_dc(
     awake_rest_mib: Optional[List[Optional[int]]] = None,
     awake_rest_provenance: str = "",
     terms_out: Optional[List[Dict[str, object]]] = None,
+    booked_rest_mib: Optional[Sequence[Optional[int]]] = None,
+    booked_rest_provenance: str = "",
 ) -> List[int]:
     """Per card the budget of group ``label``; ``terms_out`` (a list) receives
     the terms per card in order, for the #145 card ledger (rc12c: the card
-    side prices the SAME terms, so budget and card cannot disagree)."""
+    side prices the SAME terms, so budget and card cannot disagree).
+
+    ``booked_rest_mib`` (VRAM-GRUNDGESETZ 29.09., weg2/budget_rest.py): per
+    card the MEASURED awake rest beyond the budget line (record
+    ``<G>_AWAKE_REST_BOOKED_MIB``). Where it is given the card's budget is
+    ``total - driver carve - dormant_other - growth - rest`` and NOTHING else:
+    the rest contains the floor's transient, and the user reserve, the
+    builtin awake overshoot, a budget-relative overshoot and the awake rest of
+    the form are what it replaces -- no reserve is charged beside it. A
+    ``None`` entry is UNMEASURED: that card keeps the terms below, and its
+    line says so by name."""
     out = []
     # #1257c: ONE derivation, per card, for the group this budget is for.
     # ``user_reserve_by_card`` is the operator's external headroom (default 0);
@@ -13360,11 +13405,57 @@ def budgets_from_dc(
     # day D is measured. Both are printed from here on, because an operator
     # who greps ``group=D`` must find the dry pass too.
     group = corridor_guard.normalise_group(label)
-    floors = corridor_budget.floors_for_cards(cards, label, user_reserve_by_card)
+    booked = [None] * len(cards) if booked_rest_mib is None else list(booked_rest_mib)
+    if len(booked) != len(cards):
+        raise Weg2LaunchRefused(
+            f"{_budget_rest.MARKER}: {len(booked)} booked rests for {len(cards)} cards "
+            f"({booked_rest_provenance}) -- a partial vector never prices a card it never saw")
+    _reserve_eff = user_reserve_by_card
+    if any(v is not None for v in booked):
+        # the reserve is not charged on a card whose measured rest is booked
+        # (the rest is what consumed it); the floor lines still print it
+        _reserve_eff = {c.uuid: (0 if booked[i] is not None
+                                 else int((user_reserve_by_card or {}).get(c.uuid, 0)))
+                        for i, c in enumerate(cards)}
+    floors = corridor_budget.floors_for_cards(cards, label, _reserve_eff)
     _terms_seen: List[Dict[str, object]] = []  # VRAM-VERTRAG M1: the pass's view
     for i, c in enumerate(cards):
         over = int(overshoot_mib[i]) if overshoot_mib is not None else 0
         cf = floors[c.uuid]
+        if booked[i] is not None:
+            rest_b = int(booked[i])
+            grow = int(dormant_growth_mib[i]) if dormant_growth_mib is not None else 0
+            carve = int(getattr(c, "reserved_mib", 0) or 0)
+            b = ((c.total_mib - carve - dc_mib[c.uuid] - grow - rest_b) // 8) * 8
+            out.append(b)
+            _terms_seen.append(dict(
+                total=int(c.total_mib), carve=carve, floor=0,
+                dormant=int(dc_mib[c.uuid]) + grow, growth=grow, awake=rest_b,
+                awake_source=f"{_budget_rest.SOURCE_RECORD} {booked_rest_provenance}".strip()))
+            if terms_out is not None:
+                terms_out.append({k: v for k, v in _terms_seen[-1].items() if k != "growth"})
+            _res = int((user_reserve_by_card or {}).get(c.uuid, 0))
+            log(
+                f"budget {label} group={group} ordinal={i} "
+                f"nvml_idx={c.nvml_index} {c.name}: "
+                f"{b} MiB = total {c.total_mib} - driver_carve {carve} (NVML reserved) "
+                f"- dormant_other {dc_mib[c.uuid]}"
+                + (f" - served_dormant_growth {grow} ({dormant_growth_provenance})" if grow else "")
+                + f" - awake_rest_booked {rest_b} ({_budget_rest.SOURCE_RECORD} "
+                f"{booked_rest_provenance}; replaces corridor floor transient "
+                f"{int(cf.mib)} (source={cf.source}), user reserve {_res}, awake_overshoot "
+                f"{D_AWAKE_OVERSHOOT_MIB}"
+                + (f", measured_awake_overshoot {over}" if over else "")
+                + ") MiB"
+            )
+            log(cf.line)
+            continue
+        if booked_rest_mib is not None:
+            log(f"{_budget_rest.MARKER} {_budget_rest.SOURCE_UNMEASURED} group={group} "
+                f"pass={label} ordinal={i} nvml{c.nvml_index}: no measured awake rest in "
+                f"{booked_rest_provenance or 'the record'} -- this card keeps floor + reserve "
+                f"{int((user_reserve_by_card or {}).get(c.uuid, 0))} + awake_overshoot "
+                f"{D_AWAKE_OVERSHOOT_MIB} + overshoot {over} (named, not measured)")
         # rc12c (NF Dauerlauf, D TP0 died at 29.2 GiB under budgets 29624 /
         # 29144 / 28288): where the awake rest is MEASURED against the booked
         # form (D_AWAKE_REST_MIB, weg2/d_awake_rest.py) it is the whole
@@ -23810,7 +23901,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _map_other, _map_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
         ns._d_expect_other = (_map_other if not _map_other_why.startswith("legacy") else None)
         log("D-EXPECT DORMANT-OTHER D(Karte, Erwartung): " + ", ".join(f"nvml{c.nvml_index} {_map_other[c.uuid]}" for c in cards) + f" MiB -- {_map_other_why}")
-        _map_budgets = budgets_from_dc(cards, _map_other, log, "D(Karte, Erwartung)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_map_terms)
+        _map_budgets = budgets_from_dc(cards, _map_other, log, "D(Karte, Erwartung)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), **booked_rest_kwargs(cards, ns.profile, "D"), terms_out=_map_terms)
         log_d_rank_vram_solve(ns, cards, _map_budgets, log, "D(Karte, Erwartung)",
                               p_split=p_split, chunk_layers=chunk_layers,
                               card_terms=(_map_terms if d_awake_rest(cards, ns.profile)[0] is not None else None))
@@ -24306,6 +24397,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
             charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
             awake_rest_mib=_rest, awake_rest_provenance=_rest_prov, terms_out=_d_terms,
+            **booked_rest_kwargs(cards, ns.profile, "D", log),
         )
         state.budgets["D"] = budgets_d
         if label == "D":  # the real pass: P's residue as measured after sleep(P)
@@ -24372,7 +24464,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _dry_terms: List[Dict[str, object]] = []
         _dry_other, _dry_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
         log("D-EXPECT DORMANT-OTHER D(dry, expectation): " + ", ".join(f"nvml{c.nvml_index} {_dry_other[c.uuid]}" for c in cards) + f" MiB -- {_dry_other_why}")
-        budgets_d = budgets_from_dc(cards, _dry_other, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_dry_terms)
+        budgets_d = budgets_from_dc(cards, _dry_other, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), **booked_rest_kwargs(cards, ns.profile, "D"), terms_out=_dry_terms)
         # #145 AN BEIDEN STELLEN -- siehe #114 direkt darunter: es gibt ZWEI
         # Stellen, an denen budgets_d entsteht, und eine Fassung, die nur die
         # untere trifft, fehlt genau im Dry-Run, wo das Gate sie sucht.
@@ -24481,6 +24573,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
             charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
             awake_rest_mib=_rest, awake_rest_provenance=_rest_prov,
+            **booked_rest_kwargs(cards, ns.profile, "D"),
         )
         uuids = [c.uuid for c in cards]
         names = {c.uuid: f"nvml{c.nvml_index}" for c in cards}

@@ -498,6 +498,17 @@ class ModelProfile:
     #: w109290020 (29.09.), qwen27b on since; nextflash off. An explicit env
     #: wins (=0 turns the 27B row off).
     p_row_authority: bool = False
+    #: VRAM-GRUNDGESETZ (user 19.09. / 29.09.: no reserve, only measured
+    #: transients; desk/27b-no-reserve-0929, weg2/budget_rest.py): group D's
+    #: budget books the MEASURED awake rest ``D_AWAKE_REST_BOOKED_MIB`` (max
+    #: over the newest boots of the form) INSTEAD of corridor floor + user
+    #: reserve + awake_overshoot 404 + D_OVERSHOOT_MIB. A card the record does
+    #: not price keeps those terms, named UNMEASURED on its budget line.
+    #: qwen27b on (record of the eight newest row-authority boots); nextflash
+    #: off -- it prices D's awake excess as D_AWAKE_REST_MIB (form-relative,
+    #: rc12c) and its reserve is 0 already. SGLANG_WEG2_BUDGET_REST_RECORD=0
+    #: turns it off (byte-identical budgets).
+    budget_rest_from_records: bool = False
     #: 27B row 24h (HG): :data:`HG_SWITCHES` on as ONE bundle -- they were
     #: measured only together: dkr27bint8dhgbar1dhg109261456 against
     #: dkr27bbar1i8h109261444 (rc9dwin bfc6bd87e2), step time better at all 24
@@ -728,6 +739,9 @@ PROFILES: Dict[str, ModelProfile] = {
         # 840, vanish 0; K3 PACED-ADMIT 24. RISK: z30x2 died under it at the
         # P->D flip (write-through drain); its fix 4e15b21564 awaits z30x3.
         p_row_authority=True,
+        # VRAM-GRUNDGESETZ 29.09.: D books its measured awake rest
+        # (D_AWAKE_REST_BOOKED_MIB, 8 boots) instead of reserve + 404 + 489.
+        budget_rest_from_records=True,
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,
