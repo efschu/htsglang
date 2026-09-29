@@ -3243,6 +3243,13 @@ class Envs:
     SGLANG_WEG2_ENABLE_X_COST_LINE = EnvBool(False)
     SGLANG_WEG2_X_COST_FIT_MIN_TOKENS = EnvInt(64)
     SGLANG_WEG2_X_COST_FIT_MIN_SAMPLES = EnvInt(8)
+    # 27B review of 800bb82ac6: a fit only from a window with n_hi/n_lo >=
+    # MIN_SPREAD and >= MIN_BIG forwards of >= 1024 tokens (else the whole
+    # boot's line, else the record, named); one re-solve moves X by at most
+    # MAX_STEP of the previous X (hysteresis against D/P route flapping).
+    SGLANG_WEG2_X_COST_FIT_MIN_SPREAD = EnvFloat(4.0)
+    SGLANG_WEG2_X_COST_FIT_MIN_BIG = EnvInt(8)
+    SGLANG_WEG2_X_COST_MAX_STEP = EnvFloat(0.25)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at

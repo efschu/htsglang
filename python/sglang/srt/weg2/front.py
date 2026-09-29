@@ -3938,6 +3938,9 @@ class Front:
         #: X-COST-LINE: D's prefill forwards ``(n, prefix, ms)``, newest last --
         #: the live fit's rows (read on every leg-2 read, under any load).
         self._d_cost_rows: Deque[Tuple[int, int, float]] = collections.deque(maxlen=64)
+        #: X-COST-LINE: the whole boot's forwards (bounded), the fallback fit
+        #: when the recent window has no spread (27B review of 800bb82ac6).
+        self._d_cost_all: Deque[Tuple[int, int, float]] = collections.deque(maxlen=4096)
         #: X-COST-LINE: requests each P phase prefilled (the amortisation k).
         self._p_phase_k: Deque[int] = collections.deque(maxlen=self.X_SAMPLE_WINDOW)
         #: X-COST-LINE: the newest fitted line of this checkpoint x form, the
@@ -3949,6 +3952,7 @@ class Front:
         #: the head of P's ring at the last read -- P's side of the break-even.
         self._p_cost_mark: Optional[Tuple[str, int]] = None
         self._p_cost_rows: Deque[Tuple[int, int, float]] = collections.deque(maxlen=64)
+        self._p_cost_all: Deque[Tuple[int, int, float]] = collections.deque(maxlen=4096)
         #: X-COST-LINE: P's newest recorded line of this checkpoint x form.
         self._x_cost_seed_p: Optional[dict] = (
             phase_policy.read_x_cost_line(self.measured_record, self._park_form_key, "P")
@@ -8476,18 +8480,20 @@ class Front:
         counted, not hidden."""
         if side == "D":
             new, self._d_cost_mark, lost = prefill_clock.cost_since(block, self._d_cost_mark)
-            rows, tag = self._d_cost_rows, "x_cost_rows"
+            rows, every, tag = self._d_cost_rows, self._d_cost_all, "x_cost_rows"
         else:
             new, self._p_cost_mark, lost = prefill_clock.cost_since(block, self._p_cost_mark)
-            rows, tag = self._p_cost_rows, "x_cost_p_rows"
+            rows, every, tag = self._p_cost_rows, self._p_cost_all, "x_cost_p_rows"
         if lost:
             self.counters[f"{tag}_lost"] += lost
         for r in new:
             try:
-                rows.append((int(r["n"]), int(r.get("cached", 0) or 0), float(r["ms"])))
+                row = (int(r["n"]), int(r.get("cached", 0) or 0), float(r["ms"]))
             except (KeyError, TypeError, ValueError):
                 self.counters[f"{tag}_bad"] += 1
                 continue
+            rows.append(row)
+            every.append(row)
             self.counters[tag] += 1
 
     def check_identity(self) -> None:
@@ -10038,25 +10044,37 @@ class Front:
         )
         return x
 
-    def _x_cost_line_of(self, rows: Deque[Tuple[int, int, float]], seed: Optional[dict]
+    def _x_cost_line_of(self, rows: Deque[Tuple[int, int, float]],
+                        every: Deque[Tuple[int, int, float]], seed: Optional[dict]
                         ) -> Tuple[Optional[dict], str]:
-        """One group's cost line and its source: LIVE fit over ``rows`` >
-        RECORD ``seed`` of this checkpoint x form > ``None``."""
-        line, why = phase_policy.fit_cost_line(
-            rows, min_tokens=envs.SGLANG_WEG2_X_COST_FIT_MIN_TOKENS.get(),
-            min_samples=envs.SGLANG_WEG2_X_COST_FIT_MIN_SAMPLES.get())
+        """One group's cost line and its source: LIVE fit over the recent
+        ``rows`` > the WHOLE BOOT's fit over ``every`` (the window lacked the
+        spread, 27B review of 800bb82ac6) > RECORD ``seed`` of this checkpoint
+        x form > ``None``. Every fallback names why the step before refused."""
+        def _fit(src):
+            return phase_policy.fit_cost_line(
+                src, min_tokens=envs.SGLANG_WEG2_X_COST_FIT_MIN_TOKENS.get(),
+                min_samples=envs.SGLANG_WEG2_X_COST_FIT_MIN_SAMPLES.get(),
+                min_spread=envs.SGLANG_WEG2_X_COST_FIT_MIN_SPREAD.get(),
+                min_big=envs.SGLANG_WEG2_X_COST_FIT_MIN_BIG.get())
+
+        line, why = _fit(rows)
         if line is not None:
             return line, f"live:{why}:n={line['n']}"
+        line, why_all = _fit(every)
+        if line is not None:
+            return line, f"boot:{why_all}:n={line['n']}(window {why})"
         if seed is not None:
-            return seed, f"record:{seed['boot_tag']}@{seed['at']}(live {why})"
-        return None, f"none(live {why})"
+            return seed, f"record:{seed['boot_tag']}@{seed['at']}(window {why}; boot {why_all})"
+        return None, f"none(window {why}; boot {why_all})"
 
     def _x_cost_inputs(self) -> Tuple[Optional[dict], str, Optional[float], str, float, str]:
         """X-COST-LINE's inputs with their sources: ``(line, line_src, price_s,
         price_src, k, k_src)``. Every one is LIVE > RECORD of this checkpoint x
         form > missing (``None``) -- never a constant; ``k`` without any
         measurement is 1 (no amortisation), named as such."""
-        line, line_src = self._x_cost_line_of(self._d_cost_rows, self._x_cost_seed)
+        line, line_src = self._x_cost_line_of(self._d_cost_rows, self._d_cost_all,
+                                              self._x_cost_seed)
         dp_ms, pd_ms, resume_ms, legs_src = self._park_warm_legs_ms()
         price = phase_policy.park_round_trip_s(dp_ms, pd_ms, resume_ms)
         if price is not None:
@@ -10086,7 +10104,8 @@ class Front:
         is extrapolation, so that edge, not 4096, is the floor. Prints every
         input with its source."""
         line, line_src, price, price_src, k, k_src = self._x_cost_inputs()
-        line_p, line_p_src = self._x_cost_line_of(self._p_cost_rows, self._x_cost_seed_p)
+        line_p, line_p_src = self._x_cost_line_of(self._p_cost_rows, self._p_cost_all,
+                                                  self._x_cost_seed_p)
         r_p_s = self._x_samples["r_p"]
         missing = [name for name, v in (("d_cost_line", line), ("round_trip", price),
                                         ("p_cost_line_or_r_p", line_p or r_p_s or None))
@@ -10120,9 +10139,16 @@ class Front:
             logger.warning("WEG2 X COST-LINE held: %s -- X stays %d (line=%s)", why, prev, line_src)
             return None
         floor = int(line["n_lo"])
-        x = int(min(max(x_star, floor), self.x_ceiling_tokens))
+        x_bound = min(max(x_star, floor), self.x_ceiling_tokens)
         clamp = ("ceiling" if x_star > self.x_ceiling_tokens
                  else "floor" if x_star < floor else "none")
+        # 27B review of 800bb82ac6: one re-solve moves X by at most MAX_STEP.
+        x, limited = phase_policy.x_step_limited(
+            x_bound, prev, envs.SGLANG_WEG2_X_COST_MAX_STEP.get())
+        x = min(max(x, floor), self.x_ceiling_tokens)
+        if limited:
+            clamp += "+hysteresis"
+            self.counters["x_cost_step_limited"] += 1
         self.tp_prefill_max_tokens = x
         if self._x_min_work_follows:
             self.flip_min_work_tokens = x
@@ -10146,7 +10172,7 @@ class Front:
         """X-COST-LINE: append this boot's first LIVE fitted lines of group
         ``side`` to the sidecar -- the next boot's seed of the same checkpoint
         x form. A line taken from the record is never written back as new."""
-        if (not line_src.startswith("live:") or not self._park_form_key
+        if (not line_src.startswith(("live:", "boot:")) or not self._park_form_key
                 or not self.measured_record
                 or self._x_cost_written[side] >= phase_policy.X_COST_LINE_RECORDS):
             return

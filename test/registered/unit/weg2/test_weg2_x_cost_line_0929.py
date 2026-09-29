@@ -133,7 +133,8 @@ def test_fit_refuses_by_name_and_drops_a_negative_depth_term():
     line, why = pp.fit_cost_line([(1000, 0, 3000.0)] * 10, min_tokens=64, min_samples=8)
     assert line is None and why.startswith("no-spread")
     # all at one depth: the depth term cannot be separated -> 2 parameters
-    rows = [(n, 50000, 1700.0 + 1.4 * n) for n in (100, 400, 900, 1600, 2500, 3600, 4000, 800)]
+    rows = [(n, 50000, 1700.0 + 1.4 * n)
+            for n in (200, 400, 800, 1100, 1200, 1300, 1500, 1600, 2000, 2500, 3000, 3600, 4000)]
     line, why = pp.fit_cost_line(rows, min_tokens=64, min_samples=8)
     assert why == "2p(no-depth-spread)" and line["c_ms"] == 0.0
     assert line["b_ms"] == pytest.approx(1.4) and line["a_ms"] == pytest.approx(1700.0)
@@ -206,6 +207,7 @@ def _front(name, **attrs):
         _x_seed_note="launcher solve X=4096", X_SAMPLE_WINDOW=32,
         _d_cost_rows=collections.deque(maxlen=64), _d_cost_mark=None,
         _p_cost_rows=collections.deque(maxlen=64), _p_cost_mark=None, _x_cost_seed_p=None,
+        _d_cost_all=collections.deque(maxlen=4096), _p_cost_all=collections.deque(maxlen=4096),
         _p_phase_k=collections.deque([d[0] for d in drains if d[0] > 0], maxlen=32),
         _x_cost_seed=None, _x_cost_written={"D": 0, "P": 0}, _park_rt_seed=None,
         _park_form_key="", measured_record="", p_phase_max_requests=6,
@@ -258,9 +260,11 @@ def test_green_x_moves_from_ds_forwards_under_load(name, caplog):
     msg = next(m for m in caplog.messages if "X COST-LINE RE-SOLVE" in m)
     assert "[live:" in msg and "ski-live" in msg and "k=" in msg and "X* by depth" in msg
     if name == "nextflash_z30w_park":
-        assert 2000 < x < 4096                       # the old floor would have held it at 4096
+        assert 3072 <= x < 4096                      # the old floor would have held it at 4096
     else:
-        assert x == 12288                            # 27B without a P line: drain r_P -> ceiling
+        # 27B without a P line: the drain r_P puts X* past the ceiling; one
+        # re-solve climbs at most 25 % (hysteresis, 27B review of 800bb82ac6)
+        assert x == 5120 and "hysteresis" in msg
 
 
 def test_front_seeds_from_the_record_and_names_missing_inputs(caplog):
@@ -358,18 +362,23 @@ def test_record_sides_never_mix(tmp_path):
     assert pp.read_x_cost_line(str(path), "NF|a", "P") is None
 
 
-def test_green_27b_x_below_the_ceiling_with_ps_own_line(caplog):
-    """27B 09290020: with the drain r_P the solve had no crossing and X sat at
-    the ceiling 12288; with P's PP0 line it is a real break-even."""
+def test_27b_p_window_without_spread_falls_back_to_the_boot_line_and_climbs_in_steps(caplog):
+    """27B 09290020: the last 64 PP0 forwards are all small extends (n
+    105..541, none >= 1024), the window that moved P's slope 0.039 <-> 0.247
+    ms/tok. The window is refused by name, the whole boot's P line (867
+    forwards) is used, and X climbs to the ceiling in <= 25 % steps."""
     F, ns, rows = _front("qwen27b_row_authority")
     _feed(ns, rows)
     _feed(ns, _load_p("qwen27b_row_authority"), every=10, side="P")
     assert ns.counters["x_cost_p_rows"] > 0
+    xs = []
     with envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), caplog.at_level("INFO"):
-        x = F.resolve_x_live(ns)
+        for _ in range(6):
+            xs.append(F.resolve_x_live(ns))
     msg = next(m for m in caplog.messages if "X COST-LINE RE-SOLVE" in m)
-    assert "P line a=" in msg and "[live:" in msg.split("P line")[1]
-    assert x is not None and 4096 < x < 12288
+    p_part = msg.split("P line")[1]
+    assert "[boot:" in p_part and "window no-spread" in p_part
+    assert xs == [5120, 6400, 8000, 10000, 12288, 12288]
 
 
 def test_green_nf_x_with_ps_own_line(caplog):
@@ -380,6 +389,39 @@ def test_green_nf_x_with_ps_own_line(caplog):
         x = F.resolve_x_live(ns)
     assert x is not None and 1000 < x < 12288
     assert any("P line a=" in m for m in caplog.messages)
+
+
+def test_a_window_of_small_extends_alone_is_no_live_fit():
+    """27B review of 800bb82ac6: only small n -> no live fit, named."""
+    rows = [(n, 90000, 20.0 + 0.25 * n) for n in range(100, 900, 25)]   # 32 rows, n < 1024
+    line, why = pp.fit_cost_line(rows, min_tokens=64, min_samples=8)
+    assert line is None and why.startswith("no-spread") and "0 >= 1024" in why
+    # spread alone is not enough either: 8 x 1k+ needed
+    rows2 = rows + [(4096, 90000, 1100.0)] * 7
+    assert pp.fit_cost_line(rows2, min_tokens=64, min_samples=8)[0] is None
+    assert pp.fit_cost_line(rows2 + [(2048, 90000, 560.0)], min_tokens=64, min_samples=8)[0]
+
+
+def test_hysteresis_caps_a_jump_from_8k_to_12k_at_10k(caplog):
+    assert pp.x_step_limited(12000, 8000, 0.25) == (10000, True)
+    assert pp.x_step_limited(9000, 8000, 0.25) == (9000, False)
+    assert pp.x_step_limited(3000, 8000, 0.25) == (6000, True)
+    assert pp.x_step_limited(12000, 8000, 0.0) == (12000, False)       # off
+    # at the front: X was 8000, the solve says 12000 -> 10000, named
+    F, ns, _ = _front("nextflash_z30w_park", tp_prefill_max_tokens=8000)
+    ns._x_cost_seed = {"a_ms": 0.0, "b_ms": 1.0, "c_ms": 0.0, "n": 40, "n_lo": 64,
+                       "n_hi": 16384, "prefix_med": 0, "k": 1.0, "boot_tag": "t",
+                       "at": "2026-09-29 12:00:00,000"}
+    ns._x_cost_seed_p = {"a_ms": 0.0, "b_ms": 0.5, "c_ms": 0.0, "n": 40, "n_lo": 64,
+                         "n_hi": 16384, "prefix_med": 0, "k": 1.0, "boot_tag": "t",
+                         "at": "2026-09-29 12:00:00,000"}
+    ns._p_phase_k = collections.deque([1])
+    ns._park_rt_seed = {"round_trip_s": 6.0, "boot_tag": "t", "at": "x"}
+    ns.flip_log, ns._resume_ms_log = [], []
+    with envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), caplog.at_level("INFO"):
+        x = F.resolve_x_live(ns)                  # X* = 6000 / (1.0 - 0.5) = 12000
+    assert x == 10000 and ns.counters["x_cost_step_limited"] == 1
+    assert any("X*=12000" in m and "hysteresis" in m for m in caplog.messages)
 
 
 def test_p_ring_read_off_the_flip_path_counts_a_failure_never_a_row():

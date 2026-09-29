@@ -485,13 +485,34 @@ def _det3(m: Sequence[Sequence[float]]) -> float:
             + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
 
 
+#: A fit needs this many forwards of at least FIT_BIG_TOKENS (27B review of
+#: 800bb82ac6): the break-even sits at thousands of tokens, and a window of
+#: small extends alone moved P's slope 0.039 <-> 0.247 ms/tok on 27B 09290020,
+#: X between 8.6k and 11.6k.
+FIT_BIG_TOKENS = 1024
+
+
+def x_step_limited(x_new: float, x_prev: int, max_step: float) -> Tuple[int, bool]:
+    """Hysteresis of the live X (27B review of 800bb82ac6): one re-solve moves
+    X by at most ``max_step`` of the previous value, so a noisy fit cannot
+    flip the D/P route back and forth. Returns ``(x, limited)``."""
+    if max_step <= 0.0 or x_prev <= 0:
+        return int(x_new), False
+    lo, hi = x_prev * (1.0 - max_step), x_prev * (1.0 + max_step)
+    x = min(max(float(x_new), lo), hi)
+    return int(x), x != float(x_new)
+
+
 def fit_cost_line(rows: Iterable[Tuple[int, int, float]], *, min_tokens: int,
-                  min_samples: int) -> Tuple[Optional[dict], str]:
+                  min_samples: int, min_spread: float = 4.0,
+                  min_big: int = 8) -> Tuple[Optional[dict], str]:
     """Least squares of ``ms = a + b*n + c*n*p_k`` over D's prefill forwards
     ``(n, prefix_tokens, ms)`` with ``n >= min_tokens`` (``p_k`` = prefix in
     thousands). Returns ``(line, why)``; ``line`` is ``None`` with a named
     ``why`` when the rows cannot carry a line: too few, no spread in ``n``
-    (the slope would be one point's noise), or a non-positive slope.
+    (``n_hi / n_lo`` below ``min_spread`` or fewer than ``min_big`` forwards
+    of at least :data:`FIT_BIG_TOKENS` -- the slope would be the small
+    extends' noise), or a non-positive slope.
 
     The depth term falls back to 0 (``why`` says so) when the prefixes do not
     span enough to separate it from ``b`` or it comes out negative -- a
@@ -503,8 +524,9 @@ def fit_cost_line(rows: Iterable[Tuple[int, int, float]], *, min_tokens: int,
         return None, f"samples={len(pts)}<{max(3, int(min_samples))}"
     n_lo = min(x[0] for x in pts)
     n_hi = max(x[0] for x in pts)
-    if n_hi < 2.0 * n_lo:
-        return None, f"no-spread(n {int(n_lo)}..{int(n_hi)})"
+    n_big = sum(1 for x in pts if x[0] >= FIT_BIG_TOKENS)
+    if n_hi < float(min_spread) * n_lo or n_big < int(min_big):
+        return None, f"no-spread(n {int(n_lo)}..{int(n_hi)}, {n_big} >= {FIT_BIG_TOKENS})"
     why = "3p"
     a = b = c = None
     xs = [(1.0, n, n * pk) for n, pk, _ in pts]
