@@ -1287,6 +1287,10 @@ class SeatVram:
     applied: Optional[PhaseApplied] = None
     #: the MambaPool whose ``reset_state`` must zero only mapped slots
     mamba_pool: object = None
+    #: NF1c 09291739: the GDN slots that HAVE pages -- the keep of the last
+    #: plan actually set on the (paused) pool, None = every slot. A live apply
+    #: never re-plans the pool, so it never moves this (``_plan_mamba``).
+    mamba_keep: Optional[int] = None
     #: #251c: the KV tensors born trimmed (``kv_stage_born``), the stage form,
     #: the KV pools whose flush must stay in the mapped prefix, the cells
     kv_tensors: List[_Managed] = field(default_factory=list)
@@ -1450,6 +1454,30 @@ class SeatVram:
     def row_for(self, n: int) -> SeatVramRow:
         return self.rows[max(1, min(int(n), self.cap)) - 1]
 
+    def _plan_mamba(self, infos, keep: int) -> None:
+        """The GDN pool's plan for ``keep`` slots -- set on a PAUSED pool only
+        (mapped at its tag's resume); a live pool keeps the pages it has.
+
+        ``MambaPool.reset_state`` (the flush at the wake and before the next
+        sleep) zeroes only ``[:, :_weg2_seat_keep]``, so that value must name
+        the pages the pool HAS, not the form this apply wanted: NF1c 09291739
+        the D-MEM-SCHED tick's live S1 -> S0 wrote None ("keeps its cap form")
+        over a pool mapped for one seat (slots 1..7); the sleep flush zeroed
+        the whole temporal -> FillFunctor<BFloat16> device exception on the
+        unmapped tail, 58 GB GPU coredump, abort in torch.cuda.synchronize."""
+        planned = False
+        for m, info in zip(self.slot_tensors, infos):
+            if info is not None and not info.active:
+                rc = self.spans.set_spans(m.ptr, slot_spans(m.geom, keep, self.granule), now=False)
+                if rc != 0:
+                    raise Weg2DSeatVramRefused("%s: tms_set_spans(%s) rc=%d"
+                                               % (LINE_MARK, m.geom.name, rc))
+                planned = True
+        if planned:
+            self.mamba_keep = None if keep > self.pool_size else int(keep)
+        if self.mamba_pool is not None and self.slot_tensors:
+            self.mamba_pool._weg2_seat_keep = self.mamba_keep
+
     def apply_stage(self, n: int, stage: int) -> PhaseApplied:
         """#251c: the pages of a phase of ``n`` seats at KV stage ``stage``
         (``stage_vram_cells``): the GDN slots, the KV prefix and the expert
@@ -1495,14 +1523,7 @@ class SeatVram:
         shrink = k < int(self.rows_on)
         if shrink:
             self._rows_off_live(k, experts_live)
-        for m, info in zip(self.slot_tensors, infos):
-            if info is not None and not info.active:
-                rc = self.spans.set_spans(m.ptr, slot_spans(m.geom, keep, self.granule), now=False)
-                if rc != 0:
-                    raise Weg2DSeatVramRefused("%s: tms_set_spans(%s) rc=%d"
-                                               % (LINE_MARK, m.geom.name, rc))
-        if self.mamba_pool is not None and self.slot_tensors:
-            self.mamba_pool._weg2_seat_keep = None if keep > self.pool_size else int(keep)
+        self._plan_mamba(infos, keep)
         census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
         # D-MEM-SCHED: a LIVE KV prefix that shrinks between rounds -- every
         # kernel that may still read a page above the new end is done first
@@ -1524,7 +1545,8 @@ class SeatVram:
         if not shrink:
             for cache in self.caches:
                 cache.set_seat_rows_on(k, device_write=experts_live)
-        log_live_spans(census, n=n, stage=j, rows_from=int(self.rows_on), rows_to=k)
+        log_live_spans(census, n=n, stage=j, rows_from=int(self.rows_on), rows_to=k,
+                       mamba_keep=self.mamba_keep)
         if experts_live:
             if k < int(self.rows_on):
                 self.evicted_rows += int(self.rows_on) - k
@@ -1607,16 +1629,7 @@ class SeatVram:
             notes.append("the Mamba pool is mapped (live) at this request: it cannot "
                          "shrink, no seat rows this phase")
             k, keep = 0, self.pool_size + 1
-        for m, info in zip(self.slot_tensors, infos):
-            if info is not None and not info.active:
-                rc = self.spans.set_spans(m.ptr, slot_spans(m.geom, keep, self.granule), now=False)
-                if rc != 0:
-                    raise Weg2DSeatVramRefused("%s: tms_set_spans(%s) rc=%d"
-                                               % (LINE_MARK, m.geom.name, rc))
-        if self.mamba_pool is not None and self.slot_tensors:
-            # MambaPool.reset_state (the flush at the wake and before the next
-            # sleep) zeroes only the slots that have pages
-            self.mamba_pool._weg2_seat_keep = None if keep > self.pool_size else int(keep)
+        self._plan_mamba(infos, keep)
         bank_plans = []
         for m in self.row_tensors:
             info = self.spans.info(m.ptr)
@@ -1639,7 +1652,8 @@ class SeatVram:
         if not shrink:
             for cache in self.caches:
                 cache.set_seat_rows_on(k, device_write=experts_live)
-        log_live_spans(census, n=n, stage=None, rows_from=int(self.rows_on), rows_to=int(k))
+        log_live_spans(census, n=n, stage=None, rows_from=int(self.rows_on), rows_to=int(k),
+                       mamba_keep=self.mamba_keep)
         self.rows_on = int(k)
         applied = PhaseApplied(
             n=n, extra_rows=int(k),
@@ -1666,7 +1680,7 @@ class SeatVram:
 
 
 def log_live_spans(census: Dict[str, int], *, n: int, stage: Optional[int], rows_from: int,
-                   rows_to: int) -> None:
+                   rows_to: int, mamba_keep: Optional[int] = None) -> None:
     """The metal marker of a live apply (none when every allocation was
     paused: a plan moves no byte). ``wiped=0`` by construction --
     ``refuse_wipes`` stopped the apply otherwise."""
@@ -1674,9 +1688,12 @@ def log_live_spans(census: Dict[str, int], *, n: int, stage: Optional[int], rows
         return
     logger.info(
         "%s n=%d stage=%s rows_on %d->%d tensors=%d extents_kept=%d cells_freed=%d "
-        "cells_mapped=%d wiped=0 (a live move releases whole lattice cells only)",
+        "cells_mapped=%d wiped=0 mamba_keep=%s (a live move releases whole lattice cells "
+        "only; mamba_keep = the GDN slots with pages = the flush's reset range, all = cap "
+        "form -- a live apply never moves it)",
         LIVE_MARK, int(n), "-" if stage is None else "S%d" % int(stage), int(rows_from),
-        int(rows_to), census["tensors"], census["kept"], census["freed"], census["mapped"])
+        int(rows_to), census["tensors"], census["kept"], census["freed"], census["mapped"],
+        "all" if mamba_keep is None else int(mamba_keep))
 
 
 # ---------------------------------------------------------------------------
