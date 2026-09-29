@@ -1302,6 +1302,13 @@ class Envs:
     # stops keeping past SGLANG_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB.
     SGLANG_WEIGHT_LOADER_SHARED_CACHE = EnvStr("")
     SGLANG_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB = EnvInt(6144)
+    # BOOTZEIT 3 (29.09., z30r3): the device -> store write of the presplit
+    # in RUNS of consecutive rows, async into the registered store and one
+    # stream sync per call, instead of one synchronous copy per expert row.
+    # z30r3 PP0: store_write 16.7 s of a 51.1 s presplit (29 layers, ~1200
+    # tiny sync D2H copies each, every one fighting 8 consumer threads for
+    # the GIL). Same bytes, same rows. False = the per-row copy.
+    SGLANG_EXPERT_STORE_WRITE_RUNS = EnvBool(False)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # HTTP server

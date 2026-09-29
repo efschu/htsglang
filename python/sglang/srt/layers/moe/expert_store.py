@@ -540,9 +540,35 @@ def write_rows(
     # -> 90 GiB against the 88 mark. Copy each row straight from the device
     # into the registered store mapping (D2H DMA), no host buffer at all.
     assert src.dtype == store.dtype, (src.dtype, store.dtype)
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_EXPERT_STORE_WRITE_RUNS.get():
+        _copy_row_runs(store, src, row_runs(rows), non_blocking=True)
+        if src.device.type == "cuda":
+            torch.cuda.current_stream(src.device).synchronize()
+        return rows
     for e in locals_:
         store[rows[e]].copy_(src[e], non_blocking=False)
     return rows
+
+
+def row_runs(rows: Dict[int, int]) -> list:
+    """``lokal -> Zeile`` as runs ``(row0, local0, n)`` where BOTH the store
+    rows and the source rows are consecutive -- one copy per run instead of
+    one per expert (BOOTZEIT 3, SGLANG_EXPERT_STORE_WRITE_RUNS)."""
+    runs = []
+    for row, local in sorted((int(r), int(e)) for e, r in rows.items()):
+        if runs and row == runs[-1][0] + runs[-1][2] and local == runs[-1][1] + runs[-1][2]:
+            runs[-1][2] += 1
+        else:
+            runs.append([row, local, 1])
+    return [tuple(r) for r in runs]
+
+
+def _copy_row_runs(store: torch.Tensor, src: torch.Tensor, runs, *,
+                   non_blocking: bool) -> None:
+    for row0, local0, n in runs:
+        store[row0:row0 + n].copy_(src[local0:local0 + n], non_blocking=non_blocking)
 
 
 #: #75: der LESER des Sentinels, den es bisher nicht gab.
