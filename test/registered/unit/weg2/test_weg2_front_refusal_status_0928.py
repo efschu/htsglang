@@ -86,7 +86,8 @@ def test_the_503_carries_retry_after_code_and_the_whole_detail_on_both_wires():
     assert a.headers["Retry-After"] == str(STATE_REFUSAL_RETRY_AFTER_S)
     b = _body(a)
     assert b["type"] == "error"
-    assert b["error"]["type"] == "overloaded_error"
+    # W88/W50 529 (29.09.): overloaded_error is the 529 on this wire
+    assert b["error"]["type"] == front_mod.STATE_REFUSAL_ANTHROPIC_TYPE
     assert b["error"]["message"] == detail
     assert b["code"] == HANDBACK_NAME
     assert b["leg1_prompt_tokens"] == RC12Z30D_PROMPT
