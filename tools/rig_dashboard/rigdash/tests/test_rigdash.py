@@ -1078,6 +1078,16 @@ class FlipTimeTests(unittest.TestCase):
         self.assertTrue(ft["P>D"]["open"])
         self.assertEqual([r["state"] for r in ft["recent"]], ["ohne Folgearbeit", "ohne Folgearbeit", "offen"])
 
+    def test_every_value_names_its_instrument_and_a_27b_boot_leads_with_flip_total(self):
+        # 27B-Review 29.09.: the 27B history is flip_total -- no silent switch of definition under it
+        for stem, tag, headline in (("boot_weg2_dkrnfh91x_0929", "dkrnfh91x", "first_token"),
+                                    ("boot_weg2_dkr27bb1_0929", "dkr27bb1", "flip_total")):
+            b = live.Boot(stem, "/tmp")
+            b.meta["tag"] = tag
+            ft = b.view(1790700000.0, with_series=False)["flip_times"]
+            self.assertEqual(ft["headline"], headline)
+            self.assertEqual(set(ft["instruments"]), {"first_token", "flip_total"})
+
 
 class ImageChangesTests(unittest.TestCase):
     def test_seat_from_tree_then_form_then_dir(self):

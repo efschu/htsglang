@@ -615,27 +615,45 @@ function bootCard(b, now, binders) {
   const topo = m.topology ? Object.entries(m.topology).map(([g, t]) => `${g}: TP${t.tp || 1}${t.pp > 1 ? "·PP" + t.pp : ""}`).join(", ") : "";
   const q = fr ? fr.queue : (b.queue ? b.queue.queue : null);
   // Flipzeit (Nutzer 29.09.) = WEG2-FLIP begin -> erstes Decode-Token (P→D) bzw. erste PP0-Prefill-Zeile (D→P);
-  // flip_total ist nur der Layer-Tausch darin
+  // flip_total ist nur der Layer-Tausch darin.  Jeder Wert nennt sein Instrument (27B-Review 29.09.); ein
+  // 27B-Boot fuehrt mit flip_total, bis ein 27B-Boot unter der neuen Definition gemessen ist (live.py).
   const ft = b.flip_times || {};
-  const recent = (ft.recent || []).filter((r) => r.ms != null);
+  const ins = ft.instruments || {first_token: "P-Ende→erstes Token", flip_total: "flip_total (reconciled)"};
+  const byTotal = ft.headline === "flip_total";
+  const barMs = (r) => byTotal ? r.layer_ms : r.ms;
+  const recent = (ft.recent || []).filter((r) => barMs(r) != null);
   let flipHtml = "";
   if (recent.length) {
-    const mx = Math.max(...recent.map((r) => r.ms), 1);
-    flipHtml = `<div class="flipbar" title="letzte Flipzeiten (blau P→D, orange D→P)">${recent.map((r) =>
-      `<b class="${r.dir === "D>P" ? "dp" : ""}" style="height:${Math.max(6, 100 * r.ms / mx)}%" title="${esc(r.dir.replace(">", "→"))} Flipzeit ${fmt(r.ms)} ms${r.layer_ms != null ? " (davon Layer-Tausch " + fmt(r.layer_ms) + " ms)" : ""} um ${hhmm(r.t)}"></b>`).join("")}</div>`;
+    const mx = Math.max(...recent.map(barMs), 1);
+    flipHtml = `<div class="flipbar" title="letzte Flips (blau P→D, orange D→P)">${recent.map((r) =>
+      `<b class="${r.dir === "D>P" ? "dp" : ""}" style="height:${Math.max(6, 100 * barMs(r) / mx)}%" title="${esc(r.dir.replace(">", "→"))} ${ins.first_token} ${r.ms != null ? fmt(r.ms) + " ms" : "—"} &middot; ${ins.flip_total} ${r.layer_ms != null ? fmt(r.layer_ms) + " ms" : "—"} um ${hhmm(r.t)}"></b>`).join("")}</div>`;
   }
-  const flipRow = (key, label) => {
+  const secs = (v) => v == null ? "—" : fmt(v / 1000, 2) + " s";
+  const tag = (name) => ` <span class="muted">[${esc(name)}]</span>`;
+  const firstRow = (key, label) => {
     const x = ft[key] || {};
-    if (!x.n) return [label, x.open ? "offen (noch kein erstes Token)" : "—"];
-    const s = (v) => v == null ? "—" : fmt(v / 1000, 2) + " s";
-    return [label, `<b>${s(x.last)}</b> &middot; Median ${s(x.median)} &middot; p90 ${s(x.p90)} &middot; n=${fmt(x.n)}`
+    if (!x.n) return [label, (x.open ? "offen (noch kein erstes Token)" : "—") + tag(ins.first_token)];
+    return [label, `<b>${secs(x.last)}</b> &middot; Median ${secs(x.median)} &middot; p90 ${secs(x.p90)} &middot; n=${fmt(x.n)}`
       + (x.no_work ? ` <span class="muted">(${fmt(x.no_work)} ohne Folgearbeit)</span>` : "")
-      + (x.resolution_s >= 1 ? ` <span class="muted">±1 s</span>` : "")];
+      + (x.resolution_s >= 1 ? ` <span class="muted">±1 s</span>` : "") + tag(ins.first_token)];
   };
-  const layerRow = (key, label) => {
+  const totalRow = (key, label, head) => {
     const x = ft[key] || {};
-    return x.layer_last == null ? null : [label, `${fmt(x.layer_last)} ms &middot; Median ${fmt(x.layer_median)} ms <span class="muted">(flip_total)</span>`];
+    if (!x.layer_n) return head ? [label, "—" + tag(ins.flip_total)] : null;
+    return [label, (head ? `<b>${secs(x.layer_newest)}</b> &middot; Median ${secs(x.layer_median)} &middot; p90 ${secs(x.layer_p90)} &middot; n=${fmt(x.layer_n)}`
+      : `${secs(x.layer_newest)} &middot; Median ${secs(x.layer_median)}`) + tag(ins.flip_total)];
   };
+  const flipRows = byTotal ? [
+    totalRow("P>D", "Flipzeit P→D", true),
+    totalRow("D>P", "Flipzeit D→P", true),
+    firstRow("P>D", "neu P→D (27B-Historie ist flip_total, nicht vergleichen)"),
+    firstRow("D>P", "neu D→P (27B-Historie ist flip_total, nicht vergleichen)"),
+  ] : [
+    firstRow("P>D", "Flipzeit P→D (P-Ende → 1. Decode-Token)"),
+    totalRow("P>D", "davon Layer-Tausch P→D", false),
+    firstRow("D>P", "Flipzeit D→P (→ 1. PP0-Prefill)"),
+    totalRow("D>P", "davon Layer-Tausch D→P", false),
+  ];
   const errs = (b.errors || []).slice(-3).reverse();
   const st = (b.alarm || {}).state;
   return `<section class="card ${st === "TOT" ? "dead" : st === "HAENGT" ? "hang" : ""}">
@@ -661,15 +679,12 @@ function bootCard(b, now, binders) {
         <div class="big num">${fmt(b.flip_count)}<small>Flips</small></div>
         <div class="state">${lastFlip ? `letzter ${esc(lastFlip.slept)}→${esc(lastFlip.woke)} vor ${ago(now - lastFlip.t)}` : "noch kein Flip"}</div>
         ${kv([
-          flipRow("P>D", "Flipzeit P→D (P-Ende → 1. Decode-Token)"),
-          layerRow("P>D", "davon Layer-Tausch P→D"),
-          flipRow("D>P", "Flipzeit D→P (→ 1. PP0-Prefill)"),
-          layerRow("D>P", "davon Layer-Tausch D→P"),
+          ...flipRows,
           ["Warteschlange Front", fmt(q)],
           fr ? ["bedient P / D", `${fmt((fr.served || {}).P)} / ${fmt((fr.served || {}).D)}`] : null,
           ["Fehlerzeilen (ERROR)", fmt(b.error_count)],
         ])}
-        ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">letzte ${recent.length} Flips, Höhe = Flipzeit &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}
+        ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">letzte ${recent.length} Flips, Höhe = ${byTotal ? ins.flip_total : ins.first_token} &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}
       </div>
     </div>
     ${cacheHtml(b, now, awake)}

@@ -46,6 +46,22 @@ PHASE_GAP_S = 5.0      # no line of a class for longer than this -> that phase p
 # after the begin always opens a run.
 FLIP_MARK_GAP_S = 0.5
 FLIP_MARKS_MAX = 100000
+# TODO(IPC, 27B-Review 29.09.): the Flipzeit is read from log lines (display for
+# humans only, no control). Switch to the front's events.jsonl as soon as the front
+# writes its flip events there (begin/done/first token) -- then drop the log scan.
+#
+# Instrument per value (27B-Review 29.09.): 'first_token' = P-Ende -> erstes Token,
+# 'flip_total' = flip_total (reconciled) of WEG2-FLIP done.  The 27B history was
+# measured as flip_total; until a 27B boot is measured and accepted under the new
+# definition, a 27B boot's headline stays flip_total, so it does not read as a
+# 27B regression.  Flip this when that boot exists.
+FIRST_TOKEN_HEADLINE_FOR_27B = False
+INSTRUMENTS = {"first_token": "P-Ende→erstes Token", "flip_total": "flip_total (reconciled)"}
+
+
+def is_27b_boot(meta: dict, stem: str) -> bool:
+    text = " ".join(str(x) for x in (meta.get("model"), meta.get("tag"), meta.get("model_path"), stem) if x)
+    return bool(re.search(r"27b", text, re.IGNORECASE))
 
 # Launcher summary lines worth showing as the boot's "start form" (read-only
 # view of what the weg2 launcher actually emitted; the full list is ~250 lines).
@@ -731,6 +747,8 @@ class Boot:
                 "n": len(vals), "last": last["ms"] if last else None, "last_t": last["t"] if last else None,
                 "median": q(vals, 0.5), "p90": q(vals, 0.9),
                 "layer_last": last["layer_ms"] if last else None, "layer_median": q(lay, 0.5),
+                "layer_p90": q(lay, 0.9), "layer_n": len(lay),
+                "layer_newest": next((r["layer_ms"] for r in reversed(rs) if r["layer_ms"] is not None), None),
                 "no_work": sum(1 for r in rs if r["state"] == "ohne Folgearbeit"),
                 "open": any(r["state"] == "offen" for r in rs),
                 "resolution_s": 0.001 if direction == "P>D" else 1.0,
@@ -1043,7 +1061,9 @@ class Boot:
             "flip_open": self.flip_open,
             "flips": list(self.ev["flips"])[-12:],
             "flip_count": self.counts.get("flip_done", 0),
-            "flip_times": self.flip_times_view(),
+            "flip_times": dict(self.flip_times_view(), instruments=INSTRUMENTS, headline=(
+                "flip_total" if is_27b_boot(self.meta, self.stem) and not FIRST_TOKEN_HEADLINE_FOR_27B
+                else "first_token")),
             "health": self.health,
             "errors": list(self.ev["errors"])[-8:],
             "stops": list(self.ev["stops"])[-12:],

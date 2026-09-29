@@ -1,5 +1,16 @@
 # rigdash — Pflegehinweise
 
+## Flipzeit (Nutzer-Korrektur 29.09.)
+
+Flipzeit = `WEG2-FLIP begin` → erstes Decode-Token (P→D) bzw. erste PP0-`Prefill batch` (D→P);
+`flip_total` (reconciled) ist nur der Layer-Tausch darin. Jeder Wert nennt sein Instrument.
+Ein 27B-Boot führt mit `flip_total`, bis ein 27B-Boot unter der neuen Definition gemessen ist
+(`FIRST_TOKEN_HEADLINE_FOR_27B` in `live.py`) — sonst sähe die 27B-Historie wie ein Rückschritt aus.
+
+**TODO (27B-Review 29.09.):** `live.py` liest die Flip-Zeiten aus Log-Zeilen (nur Anzeige für
+Menschen, keine Steuerung). Umstellen auf `events.jsonl` der Front, sobald die Front die
+Flip-Ereignisse (begin/done/erstes Token) dort schreibt; dann entfällt der Log-Scan.
+
 Der Dienst selbst ist in `server.py` und `deploy/rig-dashboard.service` beschrieben
 (LAN :8890, läuft aus `/opt/rigdash/current`, Deploy per `deploy/install.sh <rev>`).
 Diese Datei beschreibt nur, was Agenten und Operatoren **pflegen** müssen.
