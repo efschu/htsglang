@@ -24,7 +24,7 @@ import threading
 import time
 from typing import Dict, List, Optional
 
-from . import ipcstate, parse, redact, stops
+from . import ipcfields, ipcstate, parse, redact, stops
 
 DEFAULT_LOG_GLOBS = [
     "/spinning/docker-acceptance/*/evidence/boot_*.log",
@@ -1427,6 +1427,7 @@ class LiveLogs:
         self.scan_s = 10.0
         self.harness = stops.HarnessLogs()   # planned stop vs death (stops.py), boots without a state dir
         self.ipc = ipcstate.IpcStates()       # the boots' state dirs (IPC §2.2): read before any log
+        self.rates = ipcfields.Rates()        # deltas of the ranks' rankstats counters (C1/C3/C7)
 
     def scan(self, now: Optional[float] = None):
         now = now or time.time()
@@ -1487,6 +1488,14 @@ class LiveLogs:
             v["primary"] = primary
             last_line = max([t for t in b._last_t.values() if t] or [0]) or None
             v["ipc"] = self.ipc.for_tag((b.meta or {}).get("tag"), now)
+            # the 25 "Übergang" fields: an IPC reader per field, the log value only where the
+            # IPC has no source yet (ipcfields.py: switch by presence, no deploy waits for a boot)
+            rank = ipcfields.read_rank_files(ipcfields.rankstate_dirs(v.get("files")))
+            fields = ipcfields.resolve(v["ipc"], rank, v, self.rates.update(b.stem, rank["rankstats"]))
+            v["fields"] = ipcfields.for_page(fields)
+            v["fields_summary"] = ipcfields.summary(fields)
+            if v["ipc"]:
+                v["ipc"].pop("ipc_events", None)
             if v["ipc"]:
                 v["end"] = stops.classify_ipc(v["ipc"])
             else:

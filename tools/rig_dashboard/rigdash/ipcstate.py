@@ -29,9 +29,12 @@ SCHEMA = "weg2.state/1"
 EVENT_SCHEMA = "weg2.event/1"
 TERMINAL = ("refused_preflight", "stopped_clean", "dead")
 SHOW_S = 6 * 3600.0           # same horizon as the log-discovered boots (live.SHOW_S)
+#: the events the field readers use (ipcfields.py, DASHBOARD-AUS-IPC-INVENTAR rows A12/A14/B1-B7/D4)
+FIELD_EVENT_TYPES = ("flip_begin", "flip_done", "flip_first_work", "group_health", "rank_stop", "post_wake_pass",
+                     "group_ready")
 EVENT_TYPES = ("lifecycle", "hold_begin", "hold_end", "deadman_verdict", "front_stop", "flip_cushion",
-               "group_ready", "launcher_done")
-EVENTS_KEEP = 400
+               "group_ready", "launcher_done") + FIELD_EVENT_TYPES
+EVENTS_KEEP = 2000
 
 
 def _read_json(path: str) -> Optional[dict]:
@@ -163,6 +166,8 @@ def boot_view(d: str, st: dict, ev: Optional[_Events], now: float) -> dict:
         "transport": transport(groups),
         "launch": {g: (v or {}).get("launch") for g, v in groups.items() if (v or {}).get("launch")},
         "group_state": {g: (v or {}).get("state") for g, v in groups.items()},
+        "forms": {g: (v or {}).get("form") for g, v in groups.items() if (v or {}).get("form")},
+        "ipc_events": [e for e in rows if e.get("type") in FIELD_EVENT_TYPES][-600:],
         "events": {"counts": dict(ev.counts) if ev else {},
                    "hold_end": [e for e in rows if e.get("type") == "hold_end"][-1:],
                    "deadman_verdict": [e for e in rows if e.get("type") == "deadman_verdict"][-3:],

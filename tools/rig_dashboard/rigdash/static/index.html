@@ -318,6 +318,15 @@ const $ = (id) => document.getElementById(id);
 // DASHBOARD-AUS-IPC (Nutzer 29.09.): what still comes from a log line says so; the rest names its IPC source
 const LOGSRC = `<span class="logsrc" title="Quelle: Boot-Log (Regex in parse.py/live.py). Umstellung auf IPC: /spinning/gpu-arb/docs/DASHBOARD-AUS-IPC-INVENTAR-0929.md">aus Log (&Uuml;bergang)</span>`;
 const ipcTag = (what) => `<span class="ipcsrc" title="Quelle: IPC (${esc(what)})">${esc(what)}</span>`;
+// ipcfields.py (Nutzer 29.09. ~12:00Z): one reader per field -- the IPC value when the boot carries the
+// source, else the log value with its label. The switch is per field, by presence: no deploy waits for a boot.
+const fieldIpc = (b, k) => { const f = (b.fields || {})[k]; return f && f.src === "ipc" ? f : null; };
+const srcOf = (b, ...keys) => {
+  const on = keys.map((k) => fieldIpc(b, k)).filter(Boolean);
+  const off = keys.filter((k) => !fieldIpc(b, k));
+  const tag = on.length ? ipcTag([...new Set(on.map((f) => f.ipc_src))].join(" + ")) : "";
+  return off.length ? (tag ? tag + " " : "") + LOGSRC.replace('title="', `title="Felder aus Log: ${off.join(", ")}. `) : tag;
+};
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("de-DE", {maximumFractionDigits: d, minimumFractionDigits: d});
 const ago = (s) => s == null ? "—" : s < 90 ? Math.round(s) + " s" : s < 5400 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h";
@@ -474,7 +483,7 @@ function phaseHtml(b) {
   const ticks = span >= 900 ? ["&minus;15 min", "&minus;10", "&minus;5", end] : ["&minus;5 min", "&minus;2:30", end];
   const lg = (k) => `<span class="lg"><i style="background:${PHASE[k][1]}"></i>${phaseName(k, single)}</span>`;
   return `<div class="phasewrap">
-    <div class="ph-head"><b style="color:var(--text)">Phasen</b>${LOGSRC} ${lg("P")}${single ? "" : lg("D")}${lg("dec")}${single ? "" : lg("flip") + lg("flip_tail")}
+    <div class="ph-head"><b style="color:var(--text)">Phasen</b>${srcOf(b, "D1", "D2", "D3", "D4")} ${lg("P")}${single ? "" : lg("D")}${lg("dec")}${single ? "" : lg("flip") + lg("flip_tail")}
       <span class="lg"><i style="background:var(--bar-bg);box-shadow:inset 0 -3px 0 var(--muted)"></i>wach, keine Arbeit</span>
       <span class="span">${[300, 900].map((v) => `<button type="button" class="${span === v ? "sel" : ""}" onclick="setPhaseSpan(${v})">${v / 60} min</button>`).join("")}</span></div>
     <div class="phasebar" id="${esc(id)}" role="img" aria-label="Phasenverlauf der letzten ${span / 60} Minuten">${bars}${cut}</div>
@@ -534,6 +543,14 @@ document.addEventListener("click", (e) => { if (!e.target.closest(".phasebar")) 
 let fitTimer = null;
 window.addEventListener("resize", () => { clearTimeout(fitTimer); fitTimer = setTimeout(fitPhaseLabels, 100); });
 
+// the IPC rows of one tile: one row per rank of this group whose field value the IPC carries
+function ipcRankRows(b, g, key, show) {
+  const f = fieldIpc(b, key);
+  if (!f || !f.value) return [];
+  return Object.entries(f.value).filter(([r]) => r.split(".")[0] === g)
+    .map(([r, v]) => [`${esc(r)} ${ipcTag(f.ipc_src)}`, show(v || {})]);
+}
+
 function prefillTile(b, g, color, label, binders, now) {
   const p = (b.prefill || {})[g];
   if (!p) return `<div class="tile"><div class="label"><i style="background:${color}"></i>${label}</div><div class="big">—</div><div class="state">keine Prefill-Zeilen in diesem Log</div></div>`;
@@ -545,7 +562,7 @@ function prefillTile(b, g, color, label, binders, now) {
     : (p.last_t ? `ruht &middot; letzter Chunk vor ${ago(now - p.last_t)}, Zahl = letzter Schub` : "noch kein Chunk");
   const charts = rateCharts(b, g + "_prefill_tps", color, 0, now, binders);
   const one = p.one_s || 0;
-  return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>${label}${LOGSRC}</div>
+  return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>${label}${srcOf(b, "C1", "C2", "C7")}</div>
     ${bigPair(active ? "Wanduhr 60 s" : "letzter Schub, Wanduhr", src && src.wall_tps, one, 0, null, p.max3s_120)}
     <div class="state">${state} &middot; <span class="muted" title="Z&auml;hler: &Sigma; #new-token der ersten Stufe (PP0/TP0); Nenner: Wanduhr der Sch&uuml;be -- je Schub Start des ersten Chunks (Stempel &minus; compute-ms) bis zur letzten Zeile irgendeines Rangs; L&uuml;cken &gt; 5 s zwischen Sch&uuml;ben z&auml;hlen nicht">Tokens / Wanduhr${src && src.wall_s ? " (" + fmt(src.tokens) + " Tok / " + fmt(src.wall_s, 1) + " s)" : ""}</span></div>
     ${kv([
@@ -555,6 +572,7 @@ function prefillTile(b, g, color, label, binders, now) {
       ["mittl. Chunk &middot; aus Cache", src ? `${fmt(src.mean_chunk)} &middot; ${fmt(src.cached)}` : "—"],
       active ? ["Durchsatz Wandzeit (Tokens / " + Math.round(p.window_s) + " s)", fmt(n.tokens / p.window_s)] : null,
       ["Warteschlange &middot; ausstehende Tokens", `${fmt(p.queue)} &middot; ${fmt(p.pending_tok)}`],
+      ...ipcRankRows(b, g, "C1", (v) => v.prefill_tps_gpu != null ? fmt(v.prefill_tps_gpu) + " tok/s (Deltas)" : fmt(v.new_tokens) + " Tok neu"),
       src && src.wall_confounded_tps != null ? ["input throughput (wall-konfundiert)", fmt(src.wall_confounded_tps), "wc"] : null,
       ["&Oslash; tok/s/W &middot; 60 s (Kurvenmittel, Ruhe = 0)", fmt(((b.series || {}).per_w_60s || {})[g + "_prefill_tps"], 2)],
     ])}
@@ -571,13 +589,14 @@ function decodeTile(b, g, color, binders, now) {
   const charts = rateCharts(b, g + "_decode_tps", color, 1, now, binders);
   const per = (v != null && d.running) ? v / d.running : null;
   const one = d.one_s || 0;
-  return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>Decode${g !== "D" ? " (" + g + ")" : ""}${LOGSRC}</div>
+  return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>Decode${g !== "D" ? " (" + g + ")" : ""}${srcOf(b, "C3", "C4", "C7")}</div>
     ${bigPair(active ? "Wanduhr 60 s" : "letzter Wert", v, one, 1, bsBadge(d, one > 0), d.max3s_120)}
     <div class="state">${state}</div>
     ${kv([
       ["laufende Anfragen (bs) &middot; je Anfrage", `${fmt(d.running)} &middot; ${fmt(per, 1)} tok/s`],
       d.seats ? ["Sitze dieser D-Phase (D-PHASE-SEATS)", `${fmt(d.seats.n)} von ${fmt(d.seats.cap)} &middot; &uuml;bergeben ${fmt(d.seats.handoff_n)} + geparkt ${fmt(d.seats.parked_n)}${d.seats.clamped ? " (gekappt)" : ""}`] : null,
       ["accept len &middot; accept rate", `${fmt(d.accept_len, 2)} &middot; ${fmt(d.accept_rate, 2)}`],
+      ...ipcRankRows(b, g, "C3", (v) => `${v.gen_tps != null ? fmt(v.gen_tps, 1) + " tok/s (Deltas)" : "—"} &middot; accept len ${fmt(v.accept_len_mean != null ? v.accept_len_mean : v.accept_len_ewma, 2)}`),
       ["Rechenrate (bs&times;accept / gpu-ms)", d.compute_tps != null ? `${fmt(d.compute_tps, 1)} tok/s` : "—"],
       ["&Oslash; tok/s/W &middot; 60 s (Kurvenmittel, Ruhe = 0)", fmt(((b.series || {}).per_w_60s || {})[g + "_decode_tps"], 2)],
       ["KV-Belegung &middot; CUDA-Graph", `${d.full_use != null ? fmt(d.full_use * 100) + " %" : "—"} &middot; ${d.cuda_graph == null ? "—" : d.cuda_graph ? "ja" : "nein"}`],
@@ -662,7 +681,7 @@ function cacheHtml(b, now, awake) {
       (mehrere: zu gleichen Teilen); Intervalle ohne Arbeit z&auml;hlen als Leerlauf (${fmt((en.idle_j || 0) / 3600, 1)} Wh) und keiner Klasse.
       Token nur aus denselben Intervallen. Gemessen seit der Dashboard-Messung l&auml;uft: Abdeckung
       ${en.coverage == null ? "\u2014" : fmt(100 * en.coverage) + " %"} der Bootdauer (${fmt((en.covered_s || 0) / 60)} min).</div>
-    <h3 style="font-size:13px;margin:4px 0 6px">Cache-Treffer (aus den Boot-Logs)${LOGSRC}${prog}</h3>
+    <h3 style="font-size:13px;margin:4px 0 6px">Cache-Treffer${srcOf(b, "E1", "E2", "E3")}${prog}</h3>
     <div class="tablewrap"><table>
       <tr><th></th><th class="num">aus Cache / neu &middot; 60 s</th><th class="num">seit Boot</th><th class="num">L2 Host: #988 Load-back &middot; 60 s</th><th class="num">seit Boot</th><th class="num">MAMBA-HOST-RESUME</th><th class="num">L3 Store: unvollst. Lesungen</th></tr>
       ${row("P-Gruppe", "P")}${row("D-Gruppe", "D")}${row("Gruppe", "single")}
@@ -729,7 +748,7 @@ function bootCard(b, now, binders) {
     firstRow("D>P", "Flipzeit D→P (→ 1. PP0-Prefill)"),
     totalRow("D>P", "davon Layer-Tausch D→P", false),
   ];
-  const errs = (b.errors || []).slice(-3).reverse();
+  const errs = (fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.last : (b.errors || [])).slice(-3).reverse();
   const st = (b.alarm || {}).state;
   return `<section class="card ${st === "TOT" ? "dead" : st === "HAENGT" ? "hang" : ""}" id="boot-${esc(b.stem)}">
     ${alarmHtml(b, now)}
@@ -741,26 +760,30 @@ function bootCard(b, now, binders) {
       ${b.live && ((b.alarm || {}).planned_stop || {}).t && !plannedStopped(b) ? `<span class="chip">Stopp angefordert ${hhmm(b.alarm.planned_stop.t)} (geplant)</span>` : ""}
       ${awake ? `<span class="badge phase">wach: ${esc(awake)}${frState ? " &middot; Front: " + esc(frState) : flipping ? " &middot; flippt" : ""}</span>` : ""}
       ${c ? `<span class="chip ${c.State !== "running" ? "bad" : /unhealthy/.test(c.Status || "") ? "warn" : "ok"}">${esc(c.Names)} &middot; ${esc(c.Status)}</span>` : `<span class="chip warn">kein laufender Container zu diesem Log</span>`}
-      ${health.length && !plannedStopped(b) ? `<span class="chip bad">Gruppe ${health.map((h) => esc(h.group)).join(", ")} tot (WEG2-HEALTH)${LOGSRC}</span>` : ""}
+      ${health.length && !plannedStopped(b) ? `<span class="chip bad">Gruppe ${health.map((h) => esc(h.group)).join(", ")} tot (WEG2-HEALTH)${srcOf(b, "A12")}</span>` : ""}
     </div>
     <div class="muted" style="font-size:12px;margin:-6px 0 10px">
       <span class="mono">${esc(m.tag || b.stem)}</span>${ipc
         ? ` &middot; REV ${esc(ipc.rev)} &middot; Profil ${esc(ipc.profile)} &middot; ${esc(ipc.image)} &middot; lifecycle <b>${esc(ipc.lifecycle)}</b>${ipc.cause && ipc.cause.code ? " (" + esc(ipc.cause.code) + ")" : ""}${topo ? " &middot; " + esc(topo) : ""} ${ipcTag("state.json " + (ipc.boot_id || ""))}`
-        : `${m.sha ? " &middot; Baum " + esc(m.sha) : ""}${topo ? " &middot; " + esc(topo) : ""}${LOGSRC}`}${m.form ? " &middot; " + esc(m.form) + LOGSRC : ""}
+        : `${m.sha ? " &middot; Baum " + esc(m.sha) : ""}${topo ? " &middot; " + esc(topo) : ""}${LOGSRC}`}${fieldIpc(b, "A4") ? " &middot; " + esc(Object.entries(fieldIpc(b, "A4").value).map(([g, f]) => g + ": " + f).join(" | ")) + " " + ipcTag("state.json groups.form") : m.form ? " &middot; " + esc(m.form) + srcOf(b, "A4") : ""}
+      ${b.fields_summary ? ` &middot; <span class="muted" title="Felder aus Log: ${esc((b.fields_summary.log_keys || []).join(", "))}">Felder aus IPC ${b.fields_summary.ipc}/${b.fields_summary.n}</span>` : ""}
     </div>
     ${phaseHtml(b)}
     <div class="tiles">
       ${prefillTile(b, "P", "var(--s1)", "P-Prefill", binders, now)}
       ${prefillTile(b, "D", "var(--s2)", "D-Prefill", binders, now)}
       ${decodeTile(b, "D", "var(--s3)", binders, now)}
-      <div class="tile"><div class="label">Flips &middot; Warteschlange${LOGSRC}</div>
-        <div class="big num">${fmt(b.flip_count)}<small>Flips</small></div>
+      <div class="tile"><div class="label">Flips &middot; Warteschlange${srcOf(b, "B1", "B2", "B3", "B4", "B5", "B6")}</div>
+        <div class="big num">${fmt(fieldIpc(b, "B4") ? fieldIpc(b, "B4").value.n : b.flip_count)}<small>Flips</small></div>
         <div class="state">${lastFlip ? `letzter ${esc(lastFlip.slept)}→${esc(lastFlip.woke)} vor ${ago(now - lastFlip.t)}` : "noch kein Flip"}</div>
         ${kv([
           ...flipRows,
           ["Warteschlange Front", fmt(q) + (fr ? " " + ipcTag(fr.src || "/weg2/state") : LOGSRC)],
           fr && fr.served ? ["bedient P / D", `${fmt((fr.served || {}).P)} / ${fmt((fr.served || {}).D)} ${ipcTag(fr.src || "/weg2/state")}`] : null,
-          ["Fehlerzeilen (ERROR)", fmt(b.error_count)],
+          ["Fehlerzeilen (ERROR)", fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count) + " " + srcOf(b, "A13")],
+          fieldIpc(b, "B1") ? ["Flipzeit P&rarr;D (1. Decode-Token) median / letzte", `${fmt(fieldIpc(b, "B1").value.median_ms)} / ${fmt(fieldIpc(b, "B1").value.last_ms)} ms ${ipcTag("flip_first_work")}`] : null,
+          fieldIpc(b, "B2") ? ["Flipzeit D&rarr;P (1. P-Arbeit) median / letzte", `${fmt(fieldIpc(b, "B2").value.median_ms)} / ${fmt(fieldIpc(b, "B2").value.last_ms)} ms ${ipcTag("flip_first_work")}`] : null,
+          fieldIpc(b, "C6") ? ["D-Sitze n &middot; geparkt", `${fmt(fieldIpc(b, "C6").value.n)} &middot; ${fmt(fieldIpc(b, "C6").value.parked_n)} ${ipcTag("front.d_seats")}`] : null,
         ])}
         ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">letzte ${recent.length} Flips, Höhe = ${byTotal ? ins.flip_total : ins.first_token} &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}
       </div>
@@ -768,7 +791,7 @@ function bootCard(b, now, binders) {
     ${cacheHtml(b, now, awake)}
     ${ipc && Object.keys(ipc.launch || {}).length ? `<details id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform je Gruppe (argv + Schalter-Env) ${ipcTag("state.json groups.launch")}</summary><div class="launch mono">${Object.entries(ipc.launch).map(([g, l]) => `<div><b>${esc(g)}</b> ${esc((l.argv || []).join(" "))}</div>${Object.entries(l.env || {}).map(([k, v]) => `<div>&nbsp;&nbsp;${esc(k)}=${esc(v)}</div>`).join("")}`).join("")}</div></details>`
       : (m.launch || []).length ? `<details id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform (weg2-Launcher, ${m.launch.length} Kernzeilen aus dem Front-Log)${LOGSRC}</summary><div class="launch mono">${m.launch.map((l) => `<div>${esc(l)}</div>`).join("")}</div></details>` : ""}
-    ${errs.length ? `<details id="err-${esc(b.stem)}" style="margin-top:10px"><summary>letzte Fehlerzeilen (${fmt(b.error_count)})${LOGSRC}</summary>${errs.map((e) => `<div class="err mono">${hhmm(e.t)} [${esc(e.group)}] ${esc(e.text)}</div>`).join("")}</details>` : ""}
+    ${errs.length ? `<details id="err-${esc(b.stem)}" style="margin-top:10px"><summary>letzte Fehlerzeilen (${fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count)})${srcOf(b, "A13")}</summary>${errs.map((e) => `<div class="err mono">${hhmm(e.t)} [${esc(e.group)}] ${esc(e.text)}</div>`).join("")}</details>` : ""}
   </section>`;
 }
 
