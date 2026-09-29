@@ -1403,6 +1403,27 @@ class Envs:
     # prints gc= found= trim= either way, so one FULL boot says whether the
     # collect ever finds anything.
     SGLANG_OPT_LOAD_PRESPLIT_GC = EnvInt(PresplitGcMode.FULL)
+    # BOOTZEIT 5 (29.09., z30w-park): the expert-params mapping of a model's
+    # load_weights as a dict index (model_loader/expert_mapping_index.py)
+    # instead of a linear substring scan over all 3 x num_experts entries per
+    # expert tensor. Same entries, same order -- the loop body is unchanged.
+    # Measured on the rig's CPU with the identical loop: 10.8 s of loader-
+    # thread GIL time for PP0's 133632 expert tensors (81 us each). False =
+    # the scan (A/B only).
+    SGLANG_OPT_LOAD_EXPERT_MAPPING_INDEX = EnvBool(True)
+    # BOOTZEIT 5 (29.09., z30w-park): DefaultModelLoader.load_model builds and
+    # loads the model with the pre-load objects frozen (gc.freeze(), undone at
+    # the end; model_loader/load_gc.py). The presplit's per-layer full
+    # gc.collect() then walks only what the load created -- 1.5 ms instead of
+    # 0.26-0.29 s measured on the import graph alone (801522 objects); on the
+    # metal the fixed per-layer "repack" residual was 0.43 s (PP0, 29 layers)
+    # and 0.49 s (D TP0, 48). Everything the load allocates stays collectible.
+    # Only under expert offload (offload_active: the presplit and its collect
+    # exist); a dense load (27B) freezes nothing. One collect before the
+    # freeze, one after the unfreeze; the "BOOTZEIT5 LOAD-GC-FREEZE end" line
+    # names reclaim gc s/layer, the cgroup anon+shmem peak of the load and
+    # what the load-end collect freed. False = collect over the whole process.
+    SGLANG_OPT_LOAD_GC_FREEZE = EnvBool(True)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # HTTP server

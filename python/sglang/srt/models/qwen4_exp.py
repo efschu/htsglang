@@ -2654,6 +2654,22 @@ def _expert_layer_for_name(name: str, model):
     return None
 
 
+def _expert_mapping_index(mapping):
+    """BOOTZEIT 5: the index over the non-fused expert mapping, or None.
+
+    The index (``SGLANG_OPT_LOAD_EXPERT_MAPPING_INDEX``, default on) returns
+    for a tensor name exactly the entries the linear scan would stop at, in
+    list order; None (switch off) keeps the scan over the whole list (A/B).
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_LOAD_EXPERT_MAPPING_INDEX.get():
+        return None
+    from sglang.srt.model_loader.expert_mapping_index import ExpertMappingIndex
+
+    return ExpertMappingIndex(mapping)
+
+
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
@@ -3238,6 +3254,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             getattr(self.model, "end_layer", getattr(self.config, "num_hidden_layers", 1 << 30))
         )
         skipped_foreign_layer_count = 0
+        # BOOTZEIT 5: the non-fused expert mapping (3 x num_experts entries)
+        # is looked up, not scanned -- same entries, same order, the loop
+        # body below is unchanged (model_loader/expert_mapping_index.py).
+        expert_mapping_index = _expert_mapping_index(expert_params_mapping)
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -3317,11 +3337,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 break
             else:
                 is_expert_weight = False
-                current_expert_params_mapping = (
-                    fused_expert_params_mapping
-                    if is_fused_expert
-                    else expert_params_mapping
-                )
+                if is_fused_expert:
+                    current_expert_params_mapping = fused_expert_params_mapping
+                elif expert_mapping_index is not None:
+                    current_expert_params_mapping = expert_mapping_index.candidates(
+                        name
+                    )
+                else:
+                    current_expert_params_mapping = expert_params_mapping
                 for mapping in current_expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
@@ -3457,6 +3480,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             _gedreht,
             _angeboten,
             "an" if _transpose_in_worker() else "aus",
+        )
+        # BOOTZEIT 5: says whether the index took the lookups (a switch that
+        # never engaged and one that did not help must read differently).
+        logger.info(
+            "BOOTZEIT5 EXPERT-MAPPING index=%s entries=%d unindexed=%s lookups=%s",
+            "on" if expert_mapping_index is not None else "off",
+            len(expert_params_mapping),
+            expert_mapping_index.unindexed if expert_mapping_index is not None else "-",
+            expert_mapping_index.lookups if expert_mapping_index is not None else "-",
         )
 
         return loaded_params

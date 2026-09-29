@@ -254,7 +254,10 @@ _STORE_CLOCK = {"open_s": 0.0, "write_s": 0.0, "opens": 0,
                 # of the presplit, split out of presplit_s: gc_s = gc.collect,
                 # gc_found = the unreachable objects it found (0 = it freed
                 # nothing), trim_s = malloc_trim(0).
-                "gc_s": 0.0, "gc_found": 0, "trim_s": 0.0}
+                "gc_s": 0.0, "gc_found": 0, "trim_s": 0.0,
+                # BOOTZEIT 5: how many reclaims ran (the load-end line divides
+                # gc_s by it: seconds per layer is the metal criterion)
+                "reclaims": 0}
 
 
 def presplit_host_reclaim() -> None:
@@ -264,7 +267,13 @@ def presplit_host_reclaim() -> None:
     the D loader thread (TP0 48.6 s, TP2 39.1 s) and malloc_trim 1.3-4.0 %,
     both under the GIL, 48 times per D rank. The loaded [E] stack dies by
     refcount at ``del``; the collect only helps if it sits in a reference
-    cycle -- gc_found says per boot whether it ever did."""
+    cycle -- gc_found says per boot whether it ever did.
+
+    BOOTZEIT 5: the 7.8-9.6 % undercounted it -- a GIL-holding call gets
+    about one sampler hit per call (41 hits for 48 calls on TP0). Its real
+    price is the fixed per-layer residual (0.43 s PP0, 0.49 s D TP0), a walk
+    over the whole process heap; under ``load_gc_frozen`` (model_loader/
+    load_gc.py) it walks only what the load created. gc_s says which."""
     import time
 
     from sglang.srt.environ import PresplitGcMode, envs
@@ -275,6 +284,7 @@ def presplit_host_reclaim() -> None:
         _t = time.perf_counter()
         _STORE_CLOCK["gc_found"] += int(_gc.collect())
         _STORE_CLOCK["gc_s"] += time.perf_counter() - _t
+    _STORE_CLOCK["reclaims"] += 1
     _t = time.perf_counter()
     try:
         import ctypes as _ct

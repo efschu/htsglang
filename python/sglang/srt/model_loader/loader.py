@@ -902,7 +902,18 @@ class DefaultModelLoader(BaseModelLoader):
                 _prof.start()
             except Exception:  # pragma: no cover - diagnostic only
                 _prof = None
-        with set_default_torch_dtype(model_config.dtype):
+        # BOOTZEIT 5: build and load with the pre-load objects frozen, so the
+        # presplit's per-layer gc.collect() walks only what the load creates
+        # (model_loader/load_gc.py; SGLANG_OPT_LOAD_GC_FREEZE). Only where
+        # that collect exists (expert offload); a dense load is untouched.
+        from sglang.srt.model_loader.load_gc import (
+            expert_presplit_runs,
+            load_gc_frozen,
+        )
+
+        with load_gc_frozen(
+            what="model load", expert_presplit=expert_presplit_runs()
+        ), set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
                     model_config,
