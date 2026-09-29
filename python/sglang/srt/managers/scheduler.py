@@ -21112,20 +21112,22 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
-                # xsn324: on PP the chunk pipeline stops at the same chunk on
-                # every stage -- stage r keeps launching pp_size-1-r passes.
-                from sglang.srt.weg2.pp_abort import chunked_abort_delay
+                from sglang.srt.weg2.pp_abort import chunked_abort_delay, row_authority_of
+                _row_791c = row_authority_of(self)
                 self._pending_chunked_abort_delay = chunked_abort_delay(
-                    getattr(self.ps, "pp_size", 1), getattr(self.ps, "pp_rank", 0))
-                _row_791c = False
-                if getattr(self.ps, "pp_rank", 0) > 0:
-                    try:
-                        from sglang.srt.weg2 import p_row_authority as _prow_791c
-
-                        _row_791c = bool(_prow_791c.applies(self))
-                    except Exception:  # noqa: BLE001 - log wording only
-                        _row_791c = False
-                if _row_791c:
+                    getattr(self.ps, "pp_size", 1), getattr(self.ps, "pp_rank", 0),
+                    row_authority=_row_791c)
+                # xsn324: on PP the chunk pipeline stops at the same chunk on
+                # every stage. Under the #631 row authority stage r keeps
+                # launching pp_size-1-r passes (PP0's countdown; the followers
+                # follow PP0's forwarded schedule, #791C). #791C-NF: without it
+                # the request wire is pass-aligned -- every stage reads this
+                # abort before planning the same chunk -- so every stage
+                # applies it at receipt (weg2.pp_abort module docstring).
+                if _row_791c is False:
+                    logger.info("WEG2-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied at receipt -- the request wire delivers the abort to every stage in the pass PP0 read it, so no stage launches a chunk after it (#791C-NF, no row authority)",
+                                chunked_req.rid, getattr(self.ps, "pp_rank", 0))
+                elif _row_791c and getattr(self.ps, "pp_rank", 0) > 0:
                     logger.info("WEG2-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied when PP0's forwarded schedule stops naming it (#791C, row authority)",
                                 chunked_req.rid, getattr(self.ps, "pp_rank", 0))
                 elif self._pending_chunked_abort_delay:
