@@ -235,6 +235,13 @@ class Chunk:
     #: "model-key" (NF H92: the *.pchunk.json whose model_key is this
     #: checkpoint's, weg2/p_chunk_nf.py)
     dynamic_source: str = "stage-model"
+    #: the registry FORMATS on which the launcher's DEFAULT for an unset
+    #: --p-chunk-policy is ``policy`` (launcher apply_profile_arg_defaults,
+    #: :func:`format_of`); every other checkpoint keeps the code default
+    #: ``fixed``. The launcher's --p-chunk-max/-model/-mscale defaults (2048 /
+    #: builtin-int8 / int8) ARE the INT8 measurement's form, so only INT8 takes
+    #: ``dynamic`` from here; NVFP4 states its own model/mscale in its profile.
+    default_formats: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -571,7 +578,13 @@ PROFILES: Dict[str, ModelProfile] = {
         d_layout="paged_dcp",
         page_size=1,
         kv_dtype="auto",
-        chunk=Chunk(grid=0, policy="dynamic", model="builtin-int8", tokens=2048),
+        # P chunk policy dynamic as the launcher default on INT8 (user rule
+        # 29.09.; chunkab rc9j A fixed dkr27bbar1chunka09260010 vs B dynamic
+        # dkr27bint8chunkBbar109260034: 128k 36.59 -> 31.62 s (-13.6 %), 32k
+        # 4.68 -> 4.35 s, 2k/8k equal, needle 3/3 per step). FP8/GGUF
+        # unmeasured -> fixed; NVFP4 keeps its own profile flags.
+        chunk=Chunk(grid=0, policy="dynamic", model="builtin-int8", tokens=2048,
+                    default_formats=("int8",)),
         end_anchor="trim",
         mamba_anchor="grid4096",
         mamba_carrier_hold=False,
@@ -1082,6 +1095,24 @@ def profile_switch_default(name: str, fallback, environ: Optional[Mapping[str, s
     if isinstance(fallback, int):
         return int(val)
     return val
+
+
+def format_of(profile: Optional[str], model: str) -> str:
+    """The registry FORMAT of checkpoint ``model`` under ``profile``'s row --
+    the format whose ``checkpoint`` has the same calibration identity
+    (:func:`model_key`, the directory / file name; the rig mounts every
+    checkpoint under the registry's path). ``""`` for an unknown profile or a
+    checkpoint the row does not list: a caller then keeps its code default
+    (the conservative direction -- a derivative or a new export never inherits
+    a best form measured on another checkpoint)."""
+    row = profile_row(profile)
+    key = model_key(model)
+    if row is None or not key:
+        return ""
+    for name, wf in row.formats.items():
+        if wf.checkpoint and model_key(wf.checkpoint) == key:
+            return name
+    return ""
 
 
 def current_profile(environ: Optional[Mapping[str, str]] = None) -> Optional[ModelProfile]:

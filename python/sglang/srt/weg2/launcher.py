@@ -16038,7 +16038,42 @@ PROFILE_ARG_DEFAULTS: Tuple[Tuple[str, str, Callable[[str, object], object]], ..
     # carry replayssm=True, every profile passed --d-replayssm-spec on.
     ("--d-replayssm-spec", "d_replayssm_spec",
      lambda p, ns: "on" if _profile_row_or_27b(p).replayssm else "off"),
+    # P chunk policy: the row's chunk.policy on its chunk.default_formats
+    # (qwen27b dynamic on INT8, chunkab rc9j 128k -13.6 %) -- and only when
+    # the flags make that form RUNNABLE (_p_chunk_dynamic_runnable: the rc9j
+    # form ran with --p-prefill-graph 512); NF row fixed.
+    ("--p-chunk-policy", "p_chunk_policy",
+     lambda p, ns: (_row_format_default(p, ns, _profile_row_or_27b(p).chunk.policy,
+                                        _profile_row_or_27b(p).chunk.default_formats,
+                                        P_CHUNK_POLICY_DEFAULT)
+                    if _p_chunk_dynamic_runnable(ns) else P_CHUNK_POLICY_DEFAULT)),
 )
+
+
+def _p_chunk_dynamic_runnable(ns) -> bool:
+    """Whether --p-chunk-policy dynamic can run with ``ns``'s other flags --
+    the refusals of :func:`apply_p_chunk_policy`, read from the parsed flags
+    (the graph is installed later): the plan's baseline width (--p-chunk-fixed,
+    else the --p-prefill-graph bucket, else CHUNKED_PREFILL_TOKENS 4096) and its
+    floor (--p-chunk-min, else that width) must not exceed --p-chunk-max, and
+    the graph bucket neither. The measured form (27b.env, chunkab rc9j) is
+    dynamic WITH --p-prefill-graph 512; without a graph the baseline 4096 is
+    above the default max 2048 and the launcher would refuse the boot -- so a
+    registry default of dynamic applies only where it is runnable."""
+    bucket = int(getattr(ns, "p_prefill_graph", 0) or 0)
+    cap = int(getattr(ns, "p_chunk_max", P_CHUNK_MAX_DEFAULT) or P_CHUNK_MAX_DEFAULT)
+    fixed = int(getattr(ns, "p_chunk_fixed", 0) or 0) or bucket or CHUNKED_PREFILL_TOKENS
+    low = int(getattr(ns, "p_chunk_min", 0) or 0) or fixed
+    return 0 < low <= cap and not (bucket and cap < bucket)
+
+
+def _row_format_default(profile, ns, row_value, formats, code_default):
+    """A best-form value the row measured on some checkpoint FORMATS only: the
+    row's value when the booted checkpoint's registry format
+    (weg2_form.format_of, by calibration identity) is one of them, else the
+    code default."""
+    fmt = weg2_form.format_of(profile, str(getattr(ns, "model", "") or ""))
+    return row_value if fmt and fmt in formats else code_default
 
 
 def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
@@ -16052,6 +16087,7 @@ def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
         "pp_cut_mamba_mib_per_linear_layer_per_slot": P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT,
         "store_sidecar_factor": STORE_SIDECAR_FACTOR,
         "d_replayssm_spec": D_REPLAYSSM_SPEC_DEFAULT,
+        "p_chunk_policy": P_CHUNK_POLICY_DEFAULT,
     }
     profile = getattr(ns, "profile", None) or PROFILE_QWEN27B
     changed: List[str] = []
@@ -20205,7 +20241,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--p-chunk-policy", choices=["fixed", "dynamic"], default=P_CHUNK_POLICY_DEFAULT,
         help="Group P prefill chunk width (27B and NF line, weg2/p_chunk_policy.py). "
-             "'fixed' (the default for this release candidate) = today: every forward "
+             "DEFAULT: the booted profile's registry row (weg2/form.py chunk.policy on its "
+             "chunk.default_formats: qwen27b dynamic on the INT8 checkpoint, proven on metal "
+             "with --p-prefill-graph 512), where the other flags make it runnable (a P "
+             "prefill graph bucket <= --p-chunk-max); every other case and NF: 'fixed'. "
+             "'fixed' = today: every forward "
              "takes --chunked-prefill-size; argv, env and the P form key are "
              "byte-identical. 'dynamic' = a per-request plan priced on a per-stage "
              "time model as a pipeline (flow shop): a middle size from the ladder "
