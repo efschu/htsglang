@@ -9453,6 +9453,13 @@ class SchedulerWeightUpdaterManager:
         replay = self._weg2_leg_replay("resume", recv_req)
         _weg2_ph_t = [time.perf_counter()]
         _weg2_ph_l = []
+        # F22 (29.09.): sub-counters inside three WAKE-TAIL phases that grew
+        # against x178 (median z30w-park vs x178: reload 111/44, dest_hook_compare
+        # 123/13, store_rescan 146/1 ms) -- printed as WEG2-WAKE-TAIL-SUB
+        _weg2_sub = {}
+
+        def _weg2_sub_t(name, t0):
+            _weg2_sub[name] = _weg2_sub.get(name, 0.0) + (time.perf_counter() - t0) * 1000
         
         def _weg2_ph(name):
             _n = time.perf_counter()
@@ -9712,10 +9719,14 @@ class SchedulerWeightUpdaterManager:
                 _iw = getattr(scheduler, "_weg2_intake_watch", None)
                 if _iw is not None:
                     _iw.reset()
+                _sub_t0 = time.perf_counter()
                 self._weg2_rescan_store_index()
+                _weg2_sub_t("rescan", _sub_t0)
                 _rel = getattr(scheduler, "_weg2_release_dormant_hold", None)  # #1443
                 if callable(_rel):
+                    _sub_t0 = time.perf_counter()
                     _rel()
+                    _weg2_sub_t("hold_release", _sub_t0)
                 _weg2_ph("store_rescan")
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                     for queue_name in (
@@ -10434,7 +10445,9 @@ class SchedulerWeightUpdaterManager:
                 "tms_tag_bytes above is the instrument)",
                 weights_tags, self._weg2_rss_shmem_mib() - shm0, shm0, self._weg2_rss_shmem_mib(),
             )
+            _sub_t0 = time.perf_counter()
             torch.distributed.barrier(self.tp_cpu_group)
+            _weg2_sub_t("legs_barrier", _sub_t0)
             family_complete = not any(
                 is_weights_family_tag(t) for t in self.offload_tags
             )
@@ -10451,12 +10464,16 @@ class SchedulerWeightUpdaterManager:
                 # disk BEFORE the static-state import, so the stash exported
                 # from the live model at sleep stays the last writer for the
                 # buffers.  Both only once the WHOLE family is mapped again.
+                _sub_t0 = time.perf_counter()
                 self._weg2_wake_reload_weights()
+                _weg2_sub_t("reload_weights", _sub_t0)
                 _weg2_ph("reload")
+                _sub_t0 = time.perf_counter()
                 _import_static_state(
                     self.tp_worker.model_runner.model,
                     self.stashed_model_static_state,
                 )
+                _weg2_sub_t("static_import", _sub_t0)
                 del self.stashed_model_static_state
                 # #1273 S5b: the DESTINATION half.  This hook runs after
                 # family_complete and after the reload, so whatever DID
@@ -10491,12 +10508,14 @@ class SchedulerWeightUpdaterManager:
                     if t != GPU_MEMORY_TYPE_CUDA_GRAPH
                     and not is_weights_family_tag(t)
                 ]
+                _sub_t0 = time.perf_counter()
                 self._weg2_shadow_destination_leg(
                     recv_req,
                     reserve_bytes=sum(self._weg2_tag_bytes(t)
                                       for t in pending_tags),
                     ring_ms=sum(float(v[1]) for v in weg2_per_tag.values()),
                 )
+                _weg2_sub_t("dest_leg", _sub_t0)
                 # STEP 6c: THE SHADOW COMPARE (#1342 S1b -- moved here out of
                 # `_weg2_wake_reload_weights`, where it was parked at the end of
                 # the DISK-REFILL branch and therefore unreachable on the
@@ -10516,7 +10535,9 @@ class SchedulerWeightUpdaterManager:
                 # dressed as a finding.
                 # `test_the_compare_comes_after_the_reload_in_the_wake_path`
                 # pins the order; mutant M11 pulls it above the reload.
+                _sub_t0 = time.perf_counter()
                 self._weg2_xchg_shadow_compare()
+                _weg2_sub_t("shadow_compare", _sub_t0)
                 _weg2_ph("dest_hook_compare")
                 # #1350 SEAM GRADER, destination side.  THE SAME PLACEMENT RULE
                 # the two hooks above follow, and for the same reason: this is
@@ -10581,6 +10602,10 @@ class SchedulerWeightUpdaterManager:
             )
             _weg2_ph("fence")
             logger.info("WEG2-WAKE-TAIL ms " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _weg2_ph_l) + f" t={time.time():.3f}")
+            if _weg2_sub:
+                logger.info("WEG2-WAKE-TAIL-SUB ms " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _weg2_sub.items())
+                            + " (F22: reload = legs_barrier + reload_weights; dest_hook_compare = static_import"
+                            " + dest_leg + shadow_compare + rest; store_rescan = rescan + hold_release + rest)")
         if store_failure and not report:
             # The fence did not gather: no memory saver, no cpu group, or
             # world <= 1. A single-rank engine cannot disagree with itself, so
