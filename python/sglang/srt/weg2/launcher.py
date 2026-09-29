@@ -2326,6 +2326,37 @@ def d_kv_evict_env() -> Dict[str, str]:
     return {} if spec is None else {_dke.ENV: spec.to_json()}
 
 
+def p_draft_kv_cell_bytes_by_stage(ns, n_stages: int, target_text_cfg: dict,
+                                   kv_dtype_bytes: int = 1) -> Tuple[Tuple[int, ...], Optional[str]]:
+    """PP-CUT DRAFT-ZELLE (YaRN x2 27B, 29.09.): the per-token bytes group P's draft KV adds to the pool
+    cell of the stage that hosts it -- the LAST P stage (pool_configurator.draft_kv_pool_on_this_rank),
+    whenever P carries the draft runner (the resolved ``draft_kv_on_p``; ``cold`` builds its pool too).
+    From the draft's OWN geometry: DFLASH = the external draft's layers x 2 x kv heads x head_dim,
+    NEXTN = one layer of the target's geometry; fp8 KV (the solver's own kv dtype). Boot
+    dkr27browauthorityyarn2bar1fs09292006: PP2 cell 18432 = 4 x 2048 + 5 x 2 x 8 x 128.
+    ``((), None)`` without a draft on P: the pool model is byte-identical."""
+    resolved = _SPEC_FORM.get("draft_kv_on_p")
+    on_p = bool(resolved) if resolved is not None else bool(envs.SGLANG_WEG2_DRAFT_ON_P.get())
+    if not on_p or int(n_stages) <= 0:
+        return (), None
+    if spec_form_is_dflash():
+        dpath = str(getattr(ns, "dflash_draft_path", "") or DFLASH_DRAFT_PATH_DEFAULT)
+        dcfg = _model_config(dpath)
+        dcfg = dcfg.get("text_config") or dcfg
+        layers = int(dcfg["num_hidden_layers"])
+        src = f"DFLASH {os.path.basename(dpath.rstrip('/'))}"
+    else:
+        dcfg, layers, src = target_text_cfg, 1, "NEXTN (one target-geometry layer)"
+    heads = int(dcfg.get("num_key_value_heads") or dcfg["num_attention_heads"])
+    head_dim = int(dcfg.get("head_dim") or int(dcfg["hidden_size"]) // int(dcfg["num_attention_heads"]))
+    v_head_dim = int(dcfg.get("v_head_dim") or head_dim)
+    cell = int(layers) * heads * (head_dim + v_head_dim) * int(kv_dtype_bytes)
+    by_stage = tuple([0] * (int(n_stages) - 1) + [cell])
+    return by_stage, (f"PP-CUT DRAFT-ZELLE: {src}: {layers} layer(s) x {heads} kv heads x "
+                      f"({head_dim}+{v_head_dim}) x {kv_dtype_bytes} B = {cell} B per token on the last P stage "
+                      f"(its pool cell = attention layers x cell + this; pool_configurator cell_size_with_draft)")
+
+
 def spec_form_is_dflash() -> bool:
     return str(_SPEC_FORM["form"]) == "DFLASH"
 
@@ -19695,6 +19726,9 @@ def solve_p_cut(
     if _rope_line is not None:
         log(_rope_line)
         _stage_fixed = tuple(float(v) + float(d) for v, d in zip(_stage_fixed, _rope_delta))
+    _p_draft_cell, _p_draft_cell_line = p_draft_kv_cell_bytes_by_stage(ns, len(budgets_p), text_cfg)
+    if _p_draft_cell_line is not None:
+        log(_p_draft_cell_line)
     model_pool = _pp_cut.PhasePoolModel(
         free_mib=tuple(float(b) for b in budgets_p),
         # The FAMILY split of weights is deliberately averaged: a stage's
@@ -19780,6 +19814,7 @@ def solve_p_cut(
         # 32'), x178 10 against 24. p_mamba_slots reads P's argv and keeps the
         # bound above only for an argv without the flag.
         mamba_slots=int(_p_mamba_slots),
+        extra_cell_bytes_by_stage=_p_draft_cell,
         # #1286 F7: the sizer's second floor. Read off P's argv for the same
         # reason as the target above -- a second copy would drift the day
         # --page-size moves.
