@@ -13,7 +13,11 @@ RankState reader and the W7/W10 gate never see it):
             heartbeat together with ts)
   tokens    prefill_total, decode_total (MetricsReporter's monotone counters)
   spec      accept_tokens_total, forward_ct_total (lifetime spec counters)
-  sched     waiting, running, queue_req, running_req, pending_tokens
+  sched     waiting, running, queue_req, running_req, pending_tokens,
+            full_token_usage (the last Prefill/Decode batch line's pool stats)
+  cap       kv_tokens, seats (max_total_num_tokens, max_running_requests); the
+            timer also hands a change to the RankState record (C5,
+            rank_state.note_capacity) -- off the round path
   prefill   §3: chunks, new_tokens, cached_tokens, gpu_ms, split_ms, compute_ms,
             wait_ms, bubble_ms, last{t, new, gpu_ms, compute_ms}
             (RankPrefillLog.cum -- the ``Prefill rank batch`` numbers, summed)
@@ -22,9 +26,15 @@ RankState reader and the W7/W10 gate never see it):
             (DecodeRoundLog.cum_* + the logged Decode batch values)
   cache     §3: loadback_n, loadback_tok, mamba_resume_n, mamba_tok,
             store_incomplete_n, prefetch{landed, deferred, refused, expired,
-            issued, attempted} (the #988 / #1324 / #915 counters as they are)
+            issued, attempted, defer_refused, timeout} (the #988 / #1324 /
+            #915 / #1157 counters as they are; mamba_tok = the summed depths of
+            the MAMBA-HOST-RESUME acceptances)
   errors    n, last[8]{t, logger, level, exc, text}  (ERROR/CRITICAL records)
   last_post_wake  the latest WEG2-POST-WAKE-PASS census as a dict, or null
+  stops     n, last[8]{t, reason, code, exc, ticket, text}: the scheduler's
+            death path (A14), written synchronously by note_stop before the
+            #1223 hold and the SIGQUIT; the front publishes each as the event
+            ``rank_stop`` (front_state_ipc.publish_rank_stops)
 
 THE RULE (27B review of the plan, 29.09.): the decode/forward path writes NOTHING.
 One timer thread ``weg2-rankstats`` wakes every ``PERIOD_S``, READS counters the
@@ -40,6 +50,7 @@ import collections
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
@@ -48,6 +59,8 @@ SCHEMA = "weg2.rankstats/1"
 SUFFIX = ".rankstats"
 THREAD_NAME = "weg2-rankstats"
 ERRORS_KEEP = 8
+STOPS_KEEP = 8
+STOP_TEXT_MAX = 400
 
 
 def enabled() -> bool:
@@ -149,21 +162,34 @@ def _cache_block(scheduler) -> Dict[str, Any]:
         out["mamba_resume_n"] = int(seen.get("mamba", 0))
     except Exception:  # noqa: BLE001 -- a missing module reads as unknown
         pass
+    try:
+        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+            MambaComponent,
+        )
+
+        out["mamba_tok"] = int(getattr(MambaComponent, "_host_resume_tok", 0))
+    except Exception:  # noqa: BLE001 -- a missing module reads as unknown
+        pass
     out["store_incomplete_n"] = int(getattr(scheduler, "_weg2_store_short_seen", 0) or 0)
     try:
         from sglang.srt.mem_cache import match_refusal_census as _mrc
 
         counts = dict(getattr(_mrc, "PREFETCH_GATE_COUNTS", {}) or {})
+        # refused = the gate exits that print '#915 PREFETCH REFUSED' (the decline
+        # order); anchor_pool_exhausted is the CAUSE counter of an exit counted
+        # there already (match_refusal_census), so it is not summed twice.
+        declines = [k for k in getattr(_mrc, "PREFETCH_DECLINE_ORDER", ())
+                    if k != "anchor_pool_exhausted"]
+        tree = getattr(scheduler, "tree_cache", None)
         out["prefetch"] = {
             "attempted": counts.get("attempted", 0),
             "issued": counts.get("issued", 0),
             "landed": counts.get("landed", 0),
-            "deferred": counts.get("defer_refused", 0),
+            "deferred": counts.get("deferred", 0),
+            "defer_refused": counts.get("defer_refused", 0),
             "expired": counts.get("defer_expired", 0),
-            "refused": sum(v for k, v in counts.items()
-                           if k not in ("attempted", "issued", "landed", "defer_refused",
-                                        "defer_expired", "intake")
-                           and not k.endswith("_tokens")),
+            "refused": sum(int(counts.get(k, 0)) for k in declines),
+            "timeout": None if tree is None else int(getattr(tree, "_1157_reaped_n", 0) or 0),
         }
     except Exception:  # noqa: BLE001 -- a missing module reads as unknown
         pass
@@ -190,8 +216,36 @@ def scheduler_counters(scheduler) -> Dict[str, Any]:
                  "forward_ct_total": int(getattr(mr, "spec_total_num_forward_ct", 0) or 0)},
         "sched": {"waiting": waiting, "running": running,
                   "queue_req": waiting, "running_req": running,
-                  "pending_tokens": getattr(mr, "last_pending_tokens", None)},
+                  "pending_tokens": getattr(mr, "last_pending_tokens", None),
+                  "full_token_usage": _round_or_none(getattr(mr, "last_full_token_usage", None), 4)},
+        "cap": {"kv_tokens": getattr(scheduler, "max_total_num_tokens", None),
+                "seats": getattr(scheduler, "max_running_requests", None)},
     }
+
+
+def _round_or_none(v, nd: int):
+    try:
+        return None if v is None else round(float(v), nd)
+    except (TypeError, ValueError):
+        return None
+
+
+_W_RE = re.compile(r"\b(W\d+[a-z]?)\b")
+_TICKET_RE = re.compile(r"#(\d+[a-z]?)\b")
+
+
+def stop_entry(exc: BaseException, reason: str = "scheduler_exception",
+               now: Optional[float] = None) -> Dict[str, Any]:
+    """A14: one stop of the rank as a record. ``code`` is the W-number plus the
+    exception name when the text names a W-number (IPC §2.2 cause.code, never
+    the bare W-number), else the exception name. Pure."""
+    name = type(exc).__name__
+    msg = str(exc)
+    w = _W_RE.search(msg)
+    t = _TICKET_RE.search(msg)
+    return {"t": round(time.time() if now is None else float(now), 3), "reason": str(reason),
+            "code": f"{w.group(1)}_{name}" if w else name, "exc": name,
+            "ticket": f"#{t.group(1)}" if t else None, "text": msg[:STOP_TEXT_MAX]}
 
 
 def _rank_state_seq() -> Optional[int]:
@@ -215,6 +269,9 @@ class RankStats:
         self.period = float(period)
         self.errors = errors
         self.last_post_wake: Optional[dict] = None
+        self.stops: collections.deque = collections.deque(maxlen=STOPS_KEEP)
+        self.stops_n = 0
+        self._last_cap: Optional[dict] = None
         self.seq = 0
         self.writes = 0
         self.failed = 0
@@ -228,6 +285,8 @@ class RankStats:
         rec.update(self.read_counters())
         rec["errors"] = self.errors.snapshot() if self.errors is not None else None
         rec["last_post_wake"] = self.last_post_wake
+        rec["stops"] = {"n": self.stops_n, "last": list(self.stops)}
+        self._last_cap = rec.get("cap")
         return rec
 
     def write_once(self) -> None:
@@ -245,6 +304,21 @@ class RankStats:
                 self.write_once()
             except Exception:  # noqa: BLE001 -- a lost sample never stops the rank
                 self.failed += 1
+            self.sync_capacity()
+
+    def sync_capacity(self) -> None:
+        """C5: a changed pool/seat counter (the KV-stage dial moves
+        max_total_num_tokens) into the RankState record -- from this thread,
+        so the round path writes nothing. Unchanged = nothing written."""
+        try:
+            cap = self._last_cap or {}
+            if cap.get("kv_tokens") is None and cap.get("seats") is None:
+                return
+            from sglang.srt.weg2 import rank_state
+
+            rank_state.note_capacity(kv_tokens=cap.get("kv_tokens"), seats=cap.get("seats"))
+        except Exception:  # noqa: BLE001 -- a display record never stops the rank
+            self.failed += 1
 
     def start(self) -> "RankStats":
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -275,6 +349,24 @@ def maybe_start(scheduler, *, tp_rank: int, pp_rank: int) -> Optional[RankStats]
                          read_counters=lambda: scheduler_counters(scheduler),
                          period=period_s(), errors=install_error_tally()).start()
     return _CURRENT
+
+
+def note_stop(exc: BaseException, reason: str = "scheduler_exception") -> Optional[dict]:
+    """A14: the rank's stop, from the scheduler's death path. Appended to
+    ``stops`` and written AT ONCE (the process may not live to the next
+    sample). Switch off / no timer: nothing, None. Never raises."""
+    rs = _CURRENT
+    if rs is None:
+        return None
+    try:
+        entry = stop_entry(exc, reason)
+        rs.stops.append(entry)
+        rs.stops_n += 1
+        rs.write_once()
+        return entry
+    except Exception:  # noqa: BLE001 -- the death path goes on regardless
+        rs.failed += 1
+        return None
 
 
 def note_post_wake(census: dict) -> None:

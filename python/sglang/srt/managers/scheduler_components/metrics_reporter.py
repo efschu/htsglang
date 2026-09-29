@@ -683,6 +683,8 @@ class SchedulerMetricsReporter:
         self.last_running_reqs = None
         # C2: the last prefill report's #pending-token (every rank, pre-gate).
         self.last_pending_tokens = None
+        # C2: the last report's full token usage (the pool stats the line prints).
+        self.last_full_token_usage = None
 
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
@@ -1234,6 +1236,7 @@ class SchedulerMetricsReporter:
         )
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
+        self.last_full_token_usage = pool_stats.full_token_usage
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
@@ -1427,6 +1430,7 @@ class SchedulerMetricsReporter:
         num_running_reqs = len(batch.reqs)
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
+        self.last_full_token_usage = pool_stats.full_token_usage
         token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
 
         if RECORD_STEP_TIME:

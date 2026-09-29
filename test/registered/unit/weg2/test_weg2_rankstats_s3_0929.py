@@ -158,7 +158,7 @@ class TestCacheFromTheCounters(CustomTestCase):
         req = SimpleNamespace(rid="r1", mamba_loadback_anchor_adopted=True)
         sp._note_988_loadback(req, 4096)
         mrc.note_prefetch_gate("landed")
-        mrc.note_prefetch_gate("defer_refused")
+        mrc.note_prefetch_gate("deferred")  # the census key the #1068 DEFERRED line counts
         c = rankstats._cache_block(SimpleNamespace(_weg2_store_short_seen=3))
         self.assertEqual(c["loadback_n"], base["loadback_n"] + 1)
         self.assertEqual(c["loadback_tok"], (base["loadback_tok"] or 0) + 4096)

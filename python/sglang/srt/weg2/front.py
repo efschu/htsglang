@@ -5925,6 +5925,13 @@ class Front:
             "alive": bool(f.alive), "streak": int(f.streak or 0),
             "hold_pid": getattr(f.hold, "pid", None) if f.hold is not None else None,
             "ts": round(float(f.t or time.time()), 3)})
+        # (A14) a verdict turning failing/held/dead: the stops the group's ranks
+        # recorded on their death path -> ``rank_stop`` events, in the IPC thread.
+        if verdict in front_state_ipc.RANK_STOP_VERDICTS:
+            d = envs.WEG2_STATE_DIR.get() or None
+            if d:
+                seen = self.__dict__.setdefault("_ipc_rank_stops_seen", set())
+                self._ipc_submit(front_state_ipc.publish_rank_stops, d, g.name, seen)
 
     def _ipc_note_served(self, group: str, prompt: int, cached: int, completion: int) -> None:
         st = self.__dict__.setdefault("_ipc_served_tokens", {})

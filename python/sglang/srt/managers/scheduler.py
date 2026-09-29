@@ -21918,6 +21918,17 @@ def run_scheduler_process(
         from sglang.srt.weg2 import rankstats as _weg2_rankstats
 
         _weg2_rankstats.maybe_start(scheduler, tp_rank=tp_rank, pp_rank=pp_rank)
+        # DASHBOARD-AUS-IPC C5: the pool and seat counters into the RankState
+        # record (rewrites the attach record once; boot time, not a round).
+        try:
+            from sglang.srt.weg2 import rank_state as _weg2_rank_state
+
+            _weg2_rank_state.note_capacity(
+                kv_tokens=getattr(scheduler, "max_total_num_tokens", None),
+                seats=getattr(scheduler, "max_running_requests", None),
+            )
+        except Exception as e:  # noqa: BLE001 - display record, never the boot
+            logger.info("IPC RANK-STATE capacity not written (%s: %s)", type(e).__name__, e)
         # #605: every runner in this process is now up, so this is the first
         # moment a snapshot shows the WHOLE boot -- under speculative decoding
         # the target and the NEXTN draft each capture graphs, and a snapshot
@@ -21956,6 +21967,15 @@ def run_scheduler_process(
     except Exception as scheduler_exc:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        # DASHBOARD-AUS-IPC A14: the stop as a record in this rank's rankstats
+        # file, written HERE -- before the #1223 hold and before the SIGQUIT
+        # below end the group; the front publishes it as `rank_stop`.
+        try:
+            from sglang.srt.weg2 import rankstats as _weg2_rankstats
+
+            _weg2_rankstats.note_stop(scheduler_exc)
+        except Exception:  # noqa: BLE001 - a record may not mask the death
+            pass
         # #1223 HOLD AT THE WALL (env-gated, default OFF, no-op without
         # SGLANG_DEBUG_HOLD=1). Placed HERE -- after the traceback is logged,
         # before every census and before `parent_process.send_signal(SIGQUIT)`
