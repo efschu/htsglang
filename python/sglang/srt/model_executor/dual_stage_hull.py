@@ -157,7 +157,19 @@ def build_dual_stage_model(runner, spec: Optional[DualShareSpec] = None):
     plan = spec.nested_plan()
     local = spec.d_rank_on_stage(pp_rank)
     t0 = time.perf_counter()
-    parts = [_load_lane_part(runner, plan, r, gpu_id=runner.gpu_id) for r in range(plan.fast_size)]
+    bind = _union_bind_target(runner)
+    parts: List[object] = [None] * plan.fast_size
+    if bind is not None:
+        # D is the union OWNER and boots alongside; wait for its image BEFORE
+        # loading anything, so this rank's load never overlaps D's pack
+        # transient, then load the shared part FIRST and bind it at once: the
+        # load peak is max(shared part, the rest) instead of the whole stage.
+        _wait_for_owner(bind)
+        parts[local] = _load_lane_part(runner, plan, local, gpu_id=runner.gpu_id)
+        _bind_shared_part(runner, parts[local], bind)
+    for r in range(plan.fast_size):
+        if parts[r] is None:
+            parts[r] = _load_lane_part(runner, plan, r, gpu_id=runner.gpu_id)
     on_meta = not hull_needs_real_storage(runner.model_config)
     hull = _build_hull(runner, device="meta" if on_meta else None)
     counts = assemble_lane_shells(hull, parts)
@@ -186,3 +198,57 @@ def shared_part_named_parameters(runner) -> Dict[str, "object"]:
     if parts is None or local is None:
         return {}
     return dict(parts[local].named_parameters())
+
+
+#: How long a P rank waits for D's union image (D loads, packs and sizes its
+#: KV first). Generous on purpose: a timeout here is a refused boot, not a hang.
+OWNER_WAIT_S = float(os.environ.get("SGLANG_WEG2_DUAL_OWNER_WAIT_S", "1800"))
+
+
+@dataclasses.dataclass(frozen=True)
+class _BindTarget:
+    union_dir: str
+    card: str
+    device: int
+
+
+def _union_bind_target(runner) -> Optional[_BindTarget]:
+    """The union image this P rank binds to, or None (union off / not bind)."""
+    from sglang.srt.weg2.union_arena import UNION_DIR_ENV
+    from sglang.srt.weg2.union_arena_bind import UNION_MODE_ENV
+
+    union_dir = os.environ.get(UNION_DIR_ENV, "").strip()
+    mode = os.environ.get(UNION_MODE_ENV, "off").strip().lower()
+    if not union_dir or mode != "bind":
+        return None
+    import torch
+
+    card = str(torch.cuda.get_device_properties(runner.gpu_id).uuid)
+    return _BindTarget(union_dir, card, int(runner.gpu_id))
+
+
+def _wait_for_owner(t: _BindTarget) -> None:
+    from sglang.srt.weg2.union_arena_vmm import fetch_union, socket_path
+
+    t0 = time.perf_counter()
+    _text, fds = fetch_union(socket_path(t.union_dir, t.card), timeout_s=OWNER_WAIT_S)
+    for fd in fds:
+        os.close(fd)
+    logger.info("DUAL-TP3PP3 P: D's union image on card %s is up after %.1f s -- loading the "
+                "shared part now", t.card[-12:], time.perf_counter() - t0)
+
+
+def _bind_shared_part(runner, part, t: _BindTarget) -> None:
+    from sglang.srt.weg2.union_arena import PHASE_P
+    from sglang.srt.weg2.union_arena_bind import bind_image
+
+    shared, kept = bind_image(part, union_dir=t.union_dir, card=t.card, phase=PHASE_P,
+                              device=t.device, timeout_s=60.0, required=True)
+    if shared <= 0:
+        raise DualShareError(
+            "DUAL-TP3PP3: the shared part bound ZERO bytes to D's image -- D's vectors "
+            f"({D_TP_RATIO_ENV}/{D_FAMILIES_ENV}) or its post-load processing differ from this "
+            "part's; the stage would hold a second copy the plan has no room for")
+    runner.dual_share_bound = True
+    logger.info("DUAL-TP3PP3 P: shared part bound %.2f GiB to D's bytes, kept %.2f GiB of its own",
+                shared / 2**30, kept / 2**30)

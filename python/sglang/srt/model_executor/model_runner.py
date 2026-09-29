@@ -3174,11 +3174,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         _union_model = self.model
         if not self.is_draft_worker and getattr(self, "dual_share_part_models", None):
             _union_model = self.dual_share_part_models[self.dual_share_local_part]
-        maybe_union_image(
-            _union_model,
-            device=self.gpu_id,
-            role="draft" if self.is_draft_worker else "main",
-        )
+        if not (not self.is_draft_worker and getattr(self, "dual_share_bound", False)):
+            # (a dual-share P stage bound its shared part during the build)
+            maybe_union_image(
+                _union_model,
+                device=self.gpu_id,
+                role="draft" if self.is_draft_worker else "main",
+            )
 
         # #644: end-of-load host-anon discriminator. Off unless
         # SGLANG_644_DISCRIMINATOR is set; the answer it produces (references
