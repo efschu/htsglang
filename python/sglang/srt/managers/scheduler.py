@@ -2804,11 +2804,11 @@ class Scheduler(
         )
 
         note_p_memory_sized(
-            self.pp_rank, self.tp_rank, getattr(model_runner, "_weg2_used_by_me_gb", None)
+            self.ps.pp_rank, self.ps.tp_rank, getattr(model_runner, "_weg2_used_by_me_gb", None)
         )
         # ... and from here until the first wake every free-memory read of this
         # rank is journaled (SGLANG_WEG2_FREE_READ_JOURNAL; early vs serial diff)
-        start_free_read_journal(self.pp_rank, self.tp_rank)
+        start_free_read_journal(self.ps.pp_rank, self.ps.tp_rank)
         # #485 residency census (env-gated, read-only): the same point, seen
         # from the CUT's side. note_post_capture_leftover above answers "how
         # much is left"; this answers "what is here, and who owns it", which
