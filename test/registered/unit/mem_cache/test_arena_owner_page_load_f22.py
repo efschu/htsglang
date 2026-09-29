@@ -194,6 +194,81 @@ def test_registered_slots_take_the_dma_runs(arena, monkeypatch):
     _expect(dev, host, dev_rows)
 
 
+# --------------------------------------------------------------- 27B: byte-equal
+# 27B (29.09., z30y2 pick): uneven DCP, no Form A workers, page size 1. The
+# owner rows exist only for PAGED pools (``canonical_kv_owner_rows_for``
+# returns None at page 1 -- the "page-1 owner form"; 27B D log 09290020: 0 x
+# "#239 F14 OWNER-ROWS"), so a 27B arena pool never holds ``_owner_tok`` and
+# its load takes the whole-page path with ``lanes=None`` -- the same call and
+# the same bytes as on 895559fed2.
+
+P1, L1, H1, D1 = 1, 2, 2, 4
+CELL1 = H1 * D1
+PAGE1 = 2 * L1 * CELL1
+
+
+class _Win27:
+    total_bytes = PAGE1
+    extents = ((0, L1 * CELL1), (L1 * CELL1, L1 * CELL1))
+
+
+def _pool27(tmp_path):
+    p = object.__new__(ArenaMHAHostPool)
+    p.layout = "layer_first"; p.page_size = P1; p.layer_num = L1; p.head_num = H1; p.head_dim = D1
+    p.dtype = torch.uint8; p.device = "cpu"; p.pin_memory = False; p.size = STAGING
+    p.element_dim = H1 * D1; p.can_use_jit = True
+    p.free_slots = torch.arange(STAGING, dtype=torch.int64)
+    p.slot_used = torch.zeros(STAGING, dtype=torch.bool)
+    p.kv_buffer = torch.zeros(2, L1, STAGING, H1, D1, dtype=torch.uint8)
+    p._arena_init_fields()
+    p.bind(ShmArena(str(tmp_path / "kv27.bin"), PAGE1, NSLOTS), _Win27(), role="kv", pin=False)
+    p._pinned[:] = True
+    return p
+
+
+def test_27b_page_one_has_no_owner_rows():
+    from sglang.srt.managers.cache_controller import canonical_kv_owner_rows_for
+
+    assert canonical_kv_owner_rows_for((3, 0, 2), 1, object()) is None
+    assert canonical_kv_owner_rows_for((3, 0, 2), 64, object()) == (64, 3, 0, 2)  # NF: paged
+
+
+def test_27b_load_is_the_unchanged_whole_page_call_and_bytes(tmp_path):
+    p = _pool27(tmp_path)
+    assert p._owner_tok is None and p._arena_page_tokens == 1
+    slots = [0, 3, 4, 7]
+    for s in slots:
+        page = p._page_view[s].view(2, L1, CELL1)
+        for kv in range(2):
+            for l in range(L1):
+                page[kv, l] = _val(kv, l, s, 0)
+    host = [STAGING + s for s in slots]
+    dev_rows = [6, 1, 4, 2]
+    dev = types.SimpleNamespace(
+        k_buffer=[torch.zeros(8, H1, D1, dtype=torch.uint8) for _ in range(L1)],
+        v_buffer=[torch.zeros(8, H1, D1, dtype=torch.uint8) for _ in range(L1)])
+    seen, owner_calls = [], []
+    orig = ArenaMHAHostPool._load_pages_all_layers
+
+    def _spy(self, device_pool, slots_, device_indices, *a, **k):
+        seen.append((slots_.tolist(), a, k))
+        return orig(self, device_pool, slots_, device_indices, *a, **k)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ArenaMHAHostPool, "_load_pages_all_layers", _spy)
+        mp.setattr(ArenaMHAHostPool, "_owner_page_prefix_load",
+                   lambda *a, **k: owner_calls.append(1) or 0, raising=False)
+        hi, di = torch.tensor(host), torch.tensor(dev_rows)
+        for l in range(L1):
+            p.load_to_device_per_layer(dev, hi, di, l, "direct")
+    assert owner_calls == []
+    assert seen == [(slots, (), {})]      # one page load at layer 0, called exactly as on the base
+    for s, r in zip(slots, dev_rows):
+        for l in range(L1):
+            assert dev.k_buffer[l][r].flatten().tolist() == [_val(0, l, s, 0)] * CELL1
+            assert dev.v_buffer[l][r].flatten().tolist() == [_val(1, l, s, 0)] * CELL1
+
+
 def test_page_load_switch_off_keeps_the_gather(arena, monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_ARENA_PAGE_LOAD", "0")
     w1 = _pool(arena, W1)
