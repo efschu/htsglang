@@ -185,6 +185,7 @@ class IpcStates:
         self._st: Dict[str, dict] = {}
         self._ev: Dict[str, _Events] = {}
         self.last_error: Optional[str] = None
+        self.last_poll: Optional[float] = None     # history.py waits for the first poll before a backfill
 
     def poll(self, now: Optional[float] = None):
         now = now or time.time()
@@ -222,6 +223,7 @@ class IpcStates:
                     self._st.pop(d, None)
                     self._mt.pop(d, None)
                     self._ev.pop(d, None)
+        self.last_poll = now
 
     def for_tag(self, tag: Optional[str], now: Optional[float] = None) -> Optional[dict]:
         """The ``kind=boot`` state of this launcher tag (the newest one when a tag was reused)."""

@@ -7,6 +7,7 @@ Routes
                       the running image's changes per seat (image_changes.json)
   GET /api/launch     Startflags + ENV je Modell (Container/Front/P/D) aus state.json,
                       P<->D-Vergleich; ?ver=<ver> antwortet {same: true}, solange gleich
+  GET /api/history    Grafana-style panels (history.py): ?model=27B|NF&range=15m|1h|6h|24h|7d
   GET /api/health     liveness of the dashboard itself
 """
 
@@ -22,11 +23,18 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import energy, features, health, imagechanges, launchview, live, redact, sources, weg2line
+from . import energy, features, health, history, imagechanges, launchview, live, redact, sources, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
 VERSION_FILE = os.path.join(HERE, "VERSION")
+#: vendored, served locally (the rig is LAN-only, no CDN): uPlot 1.6.32 (MIT, static/uplot.LICENSE)
+STATIC_FILES = {
+    "/uplot.iife.min.js": ("uplot.iife.min.js", "application/javascript; charset=utf-8"),
+    "/uplot.min.css": ("uplot.min.css", "text/css; charset=utf-8"),
+    "/uplot.LICENSE": ("uplot.LICENSE", "text/plain; charset=utf-8"),
+    "/grafik.js": ("grafik.js", "application/javascript; charset=utf-8"),
+}
 
 
 def _version():
@@ -151,6 +159,9 @@ class App:
         self.imgchg_lock = threading.Lock()
         self.features = features.Features(args.features, args.features_repo)
         self.stop = threading.Event()
+        # DASHBOARD-GRAFIKEN: the persistent history of the Grafana-style panels (history.py)
+        self.hist = history.HistoryDB(os.path.join(args.state_dir, "history.sqlite") if args.state_dir else None)
+        self.hist_rec = history.Recorder(self.hist, self.logs, cfg["docker_ssh"])
         self.t0 = time.time()
         self.version = _version()
 
@@ -181,7 +192,8 @@ class App:
         self.logs.scan()
         for target, name in ((self.logs.run_forever, "rigdash-logs"),
                              (self.src.run_forever, "rigdash-sources"),
-                             (self.energy_loop, "rigdash-energy")):
+                             (self.energy_loop, "rigdash-energy"),
+                             (self.hist_rec.run_forever, "rigdash-history")):
             threading.Thread(target=target, args=(self.stop,), name=name, daemon=True).start()
 
     def snapshot(self, with_series=True) -> dict:
@@ -278,6 +290,19 @@ def make_handler(app: App):
                     snap = app.snapshot(series)
                     snap["via_proxy"] = self._via_proxy()
                     return self._json(snap)
+                if path == "/api/history":
+                    # DASHBOARD-GRAFIKEN: tiles + series + marks of one model over one range
+                    from urllib.parse import parse_qs, urlsplit
+
+                    q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                    model = q.get("model", "27B")
+                    if model not in history.MODELS:
+                        raise ValueError("model muss 27B oder NF sein")
+                    return self._json(history.view(app.hist, app.hist_rec, model, q.get("range", "1h")))
+                if path in STATIC_FILES:
+                    name, ctype = STATIC_FILES[path]
+                    with open(os.path.join(STATIC, name), "rb") as fh:
+                        return self._send(200, fh.read(), ctype)
                 if path in ("/logo.svg", "/logo-dark.svg", "/mark.svg", "/favicon.svg"):
                     name = "mark.svg" if path == "/favicon.svg" else path[1:]
                     with open(os.path.join(STATIC, name), "rb") as fh:
@@ -325,7 +350,7 @@ def main(argv=None):
     ap.add_argument("--front", action="append", default=[],
                     help="weg2 front base URL to read /weg2/state from (repeatable)")
     ap.add_argument("--gpuq", default="http://127.0.0.1:8770")
-    ap.add_argument("--state-dir", default="", help="keeps the 15-min card history across restarts")
+    ap.add_argument("--state-dir", default="", help="keeps the card history and history.sqlite (the panels' days)")
     ap.add_argument("--image-changes", default=imagechanges.DEFAULT_PATH,
                     help="the operator's per-image change list (rev -> fixes, expected gain, metal status)")
     ap.add_argument("--features", default=features.DEFAULT_PATH,

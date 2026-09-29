@@ -612,6 +612,9 @@ class Boot:
         self.win = collections.deque(maxlen=20000)
         self.rank_tot = collections.defaultdict(lambda: collections.defaultdict(lambda: [0, 0.0]))
         self.served_ev = collections.deque(maxlen=5000)    # (t, completion_tokens) of served D legs
+        # every served leg with its rid (history.py / cacheacct.py: the P->D hand-over is told from a
+        # cache hit by the rid of the P leg 1, not by the tier the D hit came from)
+        self.served_legs = collections.deque(maxlen=50000)  # (t, group, leg, rid, prompt, cached, completion)
 
     def add_file(self, group: str, path: str):
         if group in self.tails:
@@ -789,6 +792,8 @@ class Boot:
             tt["completion"] += ev.get("completion_tokens") or 0
             if ev.get("completion_tokens"):
                 self.served_ev.append((ev["t"], ev["completion_tokens"]))
+            self.served_legs.append((ev["t"], ev["group"], ev.get("leg"), ev.get("rid"), ev.get("prompt_tokens"),
+                                     ev.get("cached_tokens"), ev.get("completion_tokens")))
             self.win.append((ev["t"], key, "sv", ev.get("prompt_tokens") or 0, ev.get("cached_tokens") or 0))
             return
         if k == "flip_begin":
@@ -894,16 +899,7 @@ class Boot:
 
     # ---------------------------------------------------------------- views
 
-    def flip_times_view(self) -> dict:
-        """Flipzeit je Flip = WEG2-FLIP begin -> erste Arbeitszeile der geweckten Gruppe.
-
-        P->D: first TP0 'Decode rank batch' after the begin (= erstes Decode-Token);
-        D->P: first PP0 'Prefill batch' after the begin (whole-second stamp, so the
-        second of the begin counts and the value is floored at 0).  A flip whose
-        woken group did no work before the next flip began has no Flipzeit
-        ('ohne Folgearbeit'); the newest one still waiting is 'offen'.  flip_total
-        of the matching WEG2-FLIP done is kept beside it as 'davon Layer-Tausch'.
-        """
+    def _flip_rows(self) -> list:
         begins = sorted(self.ev["flip_begins"], key=lambda e: e["t"])
         dones = sorted(self.ev["flips"], key=lambda e: e["t"])
         rows = []
@@ -926,6 +922,24 @@ class Boot:
                 "state": "ok" if m is not None else ("offen" if nxt is None else "ohne Folgearbeit"),
                 "layer_ms": done.get("total_ms") if done else None,
             })
+
+        return rows
+
+    def flip_rows(self) -> list:
+        """Every flip of the kept history with its Flipzeit (see flip_times_view)."""
+        return self._flip_rows()
+
+    def flip_times_view(self) -> dict:
+        """Flipzeit je Flip = WEG2-FLIP begin -> erste Arbeitszeile der geweckten Gruppe.
+
+        P->D: first TP0 'Decode rank batch' after the begin (= erstes Decode-Token);
+        D->P: first PP0 'Prefill batch' after the begin (whole-second stamp, so the
+        second of the begin counts and the value is floored at 0).  A flip whose
+        woken group did no work before the next flip began has no Flipzeit
+        ('ohne Folgearbeit'); the newest one still waiting is 'offen'.  flip_total
+        of the matching WEG2-FLIP done is kept beside it as 'davon Layer-Tausch'.
+        """
+        rows = self._flip_rows()
 
         def stats(direction):
             rs = [r for r in rows if r["dir"] == direction]

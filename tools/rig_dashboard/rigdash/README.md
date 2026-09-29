@@ -139,3 +139,20 @@ python3 $U import-27b [--md /spinning/gpu-arb/docs/features_27b_ist_0929.md]
 python3 $U boot-override --boot <boot_id> --lifecycle "stopped (geplant)" --beleg "…"   # state.json bleibt unberührt
 python3 $U md --out /spinning/gpu-arb/docs/FEATURES-SOLL-IST-0929.md   # Tabelle als Markdown, Werte vom laufenden rigdash
 ```
+
+## Verlauf wie Grafana (DASHBOARD-GRAFIKEN, Nutzer 29.09. ~13:40Z)
+
+Oben auf der Seite: Kacheln und Verlaufsdiagramme im Stil der Grafana-Vorlage
+(`/spinning/gpu-arb/docs/vorlagen/dashboard-vorlage-grafana-0929.png`). 27B und NF sind getrennte
+Sichten, der Zeitraum ist wählbar (15m/1h/6h/24h/7d). Die Quelle steht an jeder Kachel und jedem Diagramm.
+
+- `history.py`: `history.sqlite` im `--state-dir`. Tiers p0 (1 s NVML, 5 s Host und Modell), p1 (10 s)
+  und p2 (60 s). Aufbewahrung 3 h / 3 d / 30 d, Deckel 256 MB. Es gibt keinen zusätzlichen Dienst.
+  Jede Reihe ist eine Rate oder ein Pegel, nie ein Zähler. Deshalb bleibt das Mittel über jede Stufe richtig.
+- `cacheacct.py` rechnet die Cache-Falle: „aus Cache“ = Prefix-Treffer bei der Annahme. Die Übergabe P→D
+  (D liest, was P für DIESELBE rid gerechnet hat) ist eine eigene Reihe und nie Cache. Quelle ist
+  `state.json front.served_tokens.D_after_P` (Produzent 9266bdfb8d, ab Image z30y2). Bis dahin
+  werden die `WEG2-SERVED`-Zeilen per rid gepaart (Etikett „aus Log (Übergang)“).
+- Neue Reihen: in `history.view` den Namen aufnehmen. Den Schreiber in `Recorder` setzen, nie aus
+  einem neuen Log-Regex (`tests/test_no_new_log_parsers.py`).
+- Diagramme: `static/grafik.js` mit uPlot 1.6.32, lokal eingebettet (`static/uplot.*`, MIT). Es gibt kein CDN.

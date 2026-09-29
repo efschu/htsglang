@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Rig-Dashboard</title>
 <link rel="icon" type="image/svg+xml" href="mark.svg">
+<link rel="stylesheet" href="uplot.min.css">
 <style>
 :root {
   color-scheme: light;
@@ -230,6 +231,52 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
   .tile .big { font-size: 28px; }
 }
 .kv .kvb span { font-weight: 700; }
+/* DASHBOARD-GRAFIKEN (Nutzer 29.09.): Kacheln + Verlauf im Stil der Grafana-Vorlage -- immer dunkel,
+   dichte Kacheln, feines Raster, Legende unten. uPlot lokal (uplot.iife.min.js), kein CDN. */
+.gf { background: #111217; color: #ccccdc; border-radius: 4px; padding: 8px; margin: 0 0 14px; color-scheme: dark; }
+.gf-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 2px 4px 8px; font-size: 13px; }
+.gf-bar b { font-weight: 600; color: #fff; }
+.gf-tabs { display: inline-flex; border: 1px solid #2c3235; border-radius: 3px; overflow: hidden; }
+.gf-tabs button { background: #181b1f; color: #ccccdc; border: 0; border-right: 1px solid #2c3235; padding: 3px 10px;
+  font: 12px system-ui, sans-serif; cursor: pointer; }
+.gf-tabs button:last-child { border-right: 0; }
+.gf-tabs button.on { background: #3d71d9; color: #fff; }
+.gf-note { color: #8e8e9a; font-size: 12px; min-height: 1.4em; }
+.gf-tiles { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: 6px; }
+@media (max-width: 900px) { .gf-tiles { grid-template-columns: repeat(2, 1fr); } }
+.gf-tile { background: #181b1f; border: 1px solid #22252b; border-radius: 2px; height: 116px; padding: 6px 8px;
+  display: flex; flex-direction: column; overflow: hidden; }
+.gf-th { display: flex; justify-content: space-between; gap: 6px; font-size: 12.5px; font-weight: 500; color: #ccccdc;
+  white-space: nowrap; }
+.gf-th { overflow: hidden; text-overflow: ellipsis; }
+.gf-tf { display: flex; justify-content: space-between; align-items: center; gap: 6px; min-width: 0; }
+.gf-big { flex: 1; display: flex; align-items: center; justify-content: center; font-size: 40px; font-weight: 500;
+  color: #fff; font-variant-numeric: tabular-nums; letter-spacing: -0.5px; line-height: 1; }
+.gf-big small { font-size: 18px; margin-left: 2px; color: #ccccdc; }
+.gf-big.c1 { color: #6aa4ee; } .gf-big.c2 { color: #ee8a5f; } .gf-big.c3 { color: #3fc08f; }
+.gf-gauge { flex: 1; min-height: 0; width: 100%; }
+.gf-gv { fill: #fff; font: 600 11px system-ui, sans-serif; }
+.gf-ts { font-size: 10.5px; color: #8e8e9a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.gf-src { font-size: 9.5px; color: #8e8e9a; border: 1px solid #2c3235; border-radius: 2px; padding: 0 4px;
+  max-width: 45%; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 400; }
+.gf-src.log { color: #d9a400; border-color: #5a4a12; }
+.gf-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
+.gf-p { background: #181b1f; border: 1px solid #22252b; border-radius: 2px; padding: 6px 8px 2px; min-width: 0; grid-column: span 3; }
+.gf-p.w2 { grid-column: span 2; }
+.gf-p h3 { display: flex; justify-content: space-between; gap: 8px; margin: 0 0 4px; font-size: 13px; font-weight: 500; color: #ccccdc; }
+.gf-p h3 .muted { color: #8e8e9a; font-weight: 400; font-size: 11px; }
+.gf-p .u { min-height: 190px; }
+.gf .uplot { font-family: system-ui, sans-serif; }
+.gf .u-legend { font-size: 11.5px; color: #ccccdc; text-align: left; margin: 2px 0 2px; }
+.gf .u-legend .u-marker { width: 14px; height: 3px; border-radius: 2px; }
+.gf .u-legend th, .gf .u-legend td { border: 0; padding: 0 3px; background: none; }
+.gf .u-legend .u-series:first-child { display: none; }
+.gf .u-legend .u-series { padding: 0 10px 0 0; }
+.gf .u-legend th { font-weight: 400; }
+.gf .u-legend .u-value { color: #fff; font-variant-numeric: tabular-nums; }
+.gf .u-legend tr:first-child { color: #8e8e9a; }
+.gf .u-select { background: rgba(255,255,255,0.07); }
+@media (max-width: 1100px) { .gf-p, .gf-p.w2 { grid-column: span 6; } }
 </style>
 </head>
 <body>
@@ -250,6 +297,22 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
   </nav>
 </header>
 <main>
+  <section class="gf" id="gf" aria-label="Verlauf wie Grafana">
+    <div class="gf-bar"><b>Verlauf</b><span class="gf-tabs" id="gf-model"></span><span class="gf-tabs" id="gf-range"></span>
+      <span class="gf-note" id="gf-note">lade&hellip;</span></div>
+    <div class="gf-tiles" id="gf-tiles"></div>
+    <div class="gf-grid">
+      <div class="gf-p"><h3><span>Token-Durchsatz <span class="muted">P-Prefill / D-Prefill / Decode &middot; log-Skala &middot; Tokens je 5 s</span></span><span id="gf-s-thr"></span></h3><div class="u" id="gf-c-thr"></div></div>
+      <div class="gf-p"><h3><span>GPU-Temperatur <span class="muted">Kern (NVML); Hotspot/Junction nicht lesbar</span></span><span id="gf-s-temp"></span></h3><div class="u" id="gf-c-temp"></div></div>
+      <div class="gf-p"><h3><span>Input-Tokens: aus Cache / neu gerechnet <span class="muted">gestapelt &middot; Übergabe P&rarr;D gestrichelt, nie Cache &middot; je Leg bei Abschluss</span></span><span id="gf-s-cache"></span></h3><div class="u" id="gf-c-cache"></div></div>
+      <div class="gf-p"><h3><span>GPU-Leistung</span><span id="gf-s-power"></span></h3><div class="u" id="gf-c-power"></div></div>
+      <div class="gf-p w2"><h3><span>Decode je Stream <span class="muted">Mittel</span></span><span id="gf-s-stream"></span></h3><div class="u" id="gf-c-stream"></div></div>
+      <div class="gf-p w2"><h3><span>KV-Cache-Belegung</span><span id="gf-s-kv"></span></h3><div class="u" id="gf-c-kv"></div></div>
+      <div class="gf-p w2"><h3><span>Host CPU &amp; Speicher</span><span id="gf-s-host"></span></h3><div class="u" id="gf-c-host"></div></div>
+      <div class="gf-p"><h3><span>SM-Takt</span><span id="gf-s-clock"></span></h3><div class="u" id="gf-c-clock"></div></div>
+      <div class="gf-p"><h3><span>Flipzeit je Flip <span class="muted">P-Ende &rarr; erstes Decode-Token (P&rarr;D)</span></span><span id="gf-s-flip"></span></h3><div class="u" id="gf-c-flip"></div></div>
+    </div>
+  </section>
   <div class="chips" id="chips"></div>
   <div class="cardstrip" id="cardstrip"></div>
   <section class="card" id="launch-card">
@@ -1359,5 +1422,7 @@ setInterval(() => refresh(), 2000);
 refreshLaunch();
 setInterval(() => refreshLaunch(), 15000);
 </script>
+<script src="uplot.iife.min.js"></script>
+<script src="grafik.js"></script>
 </body>
 </html>
