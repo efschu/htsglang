@@ -74,6 +74,26 @@ logger = logging.getLogger(__name__)
 _FusedKVMaterializeHelper = None
 
 
+ACCEPT_SYNC_FUSED_ENV = "SGLANG_DFLASH_ACCEPT_SYNC_FUSED"
+
+
+def accept_sync_fused_on() -> bool:
+    """SGLANG_DFLASH_ACCEPT_SYNC_FUSED: an explicitly set value decides as
+    always (only ``1`` arms); unset or blank takes the published form's profile
+    default (27B row 24h, ``ModelProfile.d_hostgap_levers``: qwen27b on,
+    nextflash off; no form: off). Rank-uniform: rank 0 broadcasts, every rank
+    of the group reads the same form."""
+    raw = os.environ.get(ACCEPT_SYNC_FUSED_ENV, "")
+    if raw.strip():
+        return raw == "1"
+    try:
+        from sglang.srt.weg2.form import profile_switch_default
+
+        return bool(profile_switch_default(ACCEPT_SYNC_FUSED_ENV, False))
+    except Exception:  # noqa: BLE001 -- no form module: the code default off
+        return False
+
+
 def _get_fused_kv_materialize_helper():
     global _FusedKVMaterializeHelper
     if _FusedKVMaterializeHelper is None:
@@ -659,9 +679,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # SGLANG_DFLASH_ACCEPT_SYNC_FUSED: the five rank-0 broadcasts of the
         # Triton accept outputs travel as ONE broadcast of a flat buffer the
         # five outputs are views of (_ensure_accept_bonus_buffers). Read once.
-        self._accept_sync_fused = (
-            os.environ.get("SGLANG_DFLASH_ACCEPT_SYNC_FUSED", "") == "1"
-        )
+        self._accept_sync_fused = accept_sync_fused_on()
         self._accept_bonus_flats: List[torch.Tensor] = []
         self._accept_bonus_last_flat: Optional[torch.Tensor] = None
         if self._early_draft:

@@ -58,3 +58,56 @@ def test_front_exact_tokens_default(clean, profile, explicit, want):
     assert envs.SGLANG_WEG2_FRONT_EXACT_TOKENS.get() is want
     assert FM.PROFILES["qwen27b"].front_exact_tokens is True
     assert FM.PROFILES["nextflash"].front_exact_tokens is True
+
+
+# ---------------------------------------------------------------------------
+# 2. HG bundle (row 24h): SGLANG_WEG2_D_EARLY_DRAFT + SGLANG_DFLASH_ACCEPT_SYNC_
+#    FUSED + SGLANG_BARLINK_BAR1_CANON_ORDER, measured only together --
+#    dkr27bint8dhgbar1dhg109261456 vs dkr27bbar1i8h109261444: step time better
+#    at all 24 points (10k bs1 code -2.9 %, prose -4.4 %, 240k -3.4/-2.3 %).
+#    ONE registry field (d_hostgap_levers); nextflash off (CANON_ORDER would
+#    change NF's bar1 reduction order -- the inventory does not prove it on NF).
+# ---------------------------------------------------------------------------
+
+HG = ("SGLANG_WEG2_D_EARLY_DRAFT", "SGLANG_DFLASH_ACCEPT_SYNC_FUSED",
+      "SGLANG_BARLINK_BAR1_CANON_ORDER")
+
+
+def _hg_readers():
+    """The three rank-side readers, each asked the way its caller asks."""
+    from sglang.srt.distributed.device_communicators import barlink_bar1 as B
+    from sglang.srt.managers import weg2_d_hostgap as H
+    from sglang.srt.speculative import dflash_worker_v2 as W
+
+    return {
+        "SGLANG_WEG2_D_EARLY_DRAFT": H.early_draft_on,
+        "SGLANG_DFLASH_ACCEPT_SYNC_FUSED": W.accept_sync_fused_on,
+        "SGLANG_BARLINK_BAR1_CANON_ORDER": B.canon_order_on,
+    }
+
+
+def test_hg_bundle_is_one_registry_field():
+    assert FM.PROFILES["qwen27b"].d_hostgap_levers is True
+    assert FM.PROFILES["nextflash"].d_hostgap_levers is False
+    for name in HG:
+        assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][name] is True
+        assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][name] is False
+
+
+@pytest.mark.parametrize("name", HG)
+@pytest.mark.parametrize("profile,explicit,want", [
+    ("qwen27b", None, True),      # default ON on the 27B row
+    ("qwen27b", "0", False),      # explicit off wins
+    ("qwen27b", "1", True),
+    ("nextflash", None, False),   # NF unchanged: off
+    ("nextflash", "1", True),     # an explicit on still reaches NF
+    (None, None, False),          # no form: the code default (off), unchanged
+])
+def test_hg_bundle_default(clean, name, profile, explicit, want):
+    for n in HG:
+        clean.delenv(n, raising=False)
+    _as(clean, profile)
+    if explicit is not None:
+        clean.setenv(name, explicit)
+    assert _hg_readers()[name]() is want
+    assert getattr(envs, name).get() is want

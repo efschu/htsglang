@@ -324,6 +324,17 @@ class Envs:
     # draft in stream order and read back through an event that fires ahead
     # of the draft. Off = the old planning path, byte-identical.
     SGLANG_DFLASH_PLAN_SYNC_FREE = EnvBool(False)
+    # 27B row 24h (HG): the three D host-gap levers, ONE registry field
+    # (weg2/form.py ModelProfile.d_hostgap_levers: qwen27b on since 29.09.,
+    # nextflash off); off without a form; an explicitly set value wins. The
+    # readers keep their own parse of an explicit value (weg2_d_hostgap
+    # early_draft_on, dflash_worker_v2 accept_sync_fused_on, barlink_bar1
+    # canon_order_on) and take this default when the env is unset or blank.
+    SGLANG_WEG2_D_EARLY_DRAFT = EnvBool(_profile_default("SGLANG_WEG2_D_EARLY_DRAFT", False))
+    SGLANG_DFLASH_ACCEPT_SYNC_FUSED = EnvBool(
+        _profile_default("SGLANG_DFLASH_ACCEPT_SYNC_FUSED", False))
+    SGLANG_BARLINK_BAR1_CANON_ORDER = EnvBool(
+        _profile_default("SGLANG_BARLINK_BAR1_CANON_ORDER", False))
     # [vram-peak] high-water check (model_runner, every forward): read the
     # allocator peak straight from torch's nested stats dict instead of the
     # flattened memory_stats() -- the same number without the Python flatten

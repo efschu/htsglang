@@ -293,6 +293,17 @@ PREFIX_SWITCHES: Tuple[Tuple[str, str], ...] = (
     ("front_span_inflight", "SGLANG_WEG2_FRONT_SPAN_INFLIGHT"),  # #49
     ("told_group_fallback", "SGLANG_WEG2_TOLD_GROUP_FALLBACK"),  # PF
 )
+#: 27B row 24h (Agent HG, 26.09.): the three D host-gap levers, measured ONLY
+#: together (one registry field, ``d_hostgap_levers``). EARLY_DRAFT and
+#: ACCEPT_SYNC_FUSED act only in the DFLASH worker and only with the deferred
+#: length read (SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU, inert without it);
+#: CANON_ORDER is the rank-bit-equality fix of the BAR1 oneshot reduction
+#: (rank-uniform: every rank of a group reads the same form).
+HG_SWITCHES: Tuple[str, ...] = (
+    "SGLANG_WEG2_D_EARLY_DRAFT",
+    "SGLANG_DFLASH_ACCEPT_SYNC_FUSED",
+    "SGLANG_BARLINK_BAR1_CANON_ORDER",
+)
 #: the one of them P and D must run identically (Befund M: the rendered
 #: prompt, hence the prefix keys, differ otherwise)
 PREFIX_SWITCH_P_EQ_D: Tuple[str, ...] = ("SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE",)
@@ -453,6 +464,16 @@ class ModelProfile:
     #: only after a clean metal proof under agent load); a proof boot switches
     #: it on per docker profile (profiles/27b-row-authority.env, ``_form``).
     p_row_authority: bool = False
+    #: 27B row 24h (HG): :data:`HG_SWITCHES` on as ONE bundle -- they were
+    #: measured only together: dkr27bint8dhgbar1dhg109261456 against
+    #: dkr27bbar1i8h109261444 (rc9dwin bfc6bd87e2), step time better at all 24
+    #: points (10k warm code bs1 -2.9 %, bs2 -2.6 %, prose bs1 -4.4 %, bs2
+    #: -4.2 %; 240k -3.4/-2.3 %), needle MATCH. qwen27b on since the user rule
+    #: of 29.09. (proven on metal -> default on in the code); nextflash off:
+    #: its D is MTP (EARLY_DRAFT/ACCEPT_SYNC_FUSED never act there) and
+    #: CANON_ORDER would change its BAR1 reduction order unproven. An
+    #: explicitly set env wins per switch.
+    d_hostgap_levers: bool = False
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -475,6 +496,8 @@ class ModelProfile:
         out["SGLANG_WEG2_D_PARK_IMMEDIATE"] = bool(self.d_park_immediate)
         out["SGLANG_WEG2_P_ROW_AUTHORITY"] = bool(self.p_row_authority)
         out["SGLANG_WEG2_FRONT_EXACT_TOKENS"] = bool(self.front_exact_tokens)
+        for env_name in HG_SWITCHES:
+            out[env_name] = bool(self.d_hostgap_levers)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -627,6 +650,8 @@ PROFILES: Dict[str, ModelProfile] = {
         # 3080s are 20480), see driver_carve_min_total_mib.
         budget_charges_driver_carve=True,
         driver_carve_min_total_mib=32000,
+        # HG (row 24h): proven together in dhg09261456 -- see the field.
+        d_hostgap_levers=True,
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,
@@ -759,6 +784,7 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: :func:`publish_prefix_switches`).
 #: SGLANG_WEG2_D_PARK_IMMEDIATE (``d_park_immediate``, 27B park 26.09.).
 #: SGLANG_WEG2_FRONT_EXACT_TOKENS (``front_exact_tokens``, X-EXACT 26.09.).
+#: :data:`HG_SWITCHES` (``d_hostgap_levers``, 27B row 24h, on 29.09.).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }

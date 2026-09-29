@@ -160,7 +160,12 @@ class TestEarlyDraftWiring(CustomTestCase):
 
         init_src = inspect.getsource(DFlashWorkerV2.__init__)
         self.assertIn("self._early_draft = early_draft_on()", init_src)
-        self.assertIn('"SGLANG_DFLASH_ACCEPT_SYNC_FUSED", "") == "1"', init_src)
+        # 29.09.: the explicit value keeps its parse (only "1" arms); unset
+        # takes the registry row (ModelProfile.d_hostgap_levers).
+        self.assertIn("self._accept_sync_fused = accept_sync_fused_on()", init_src)
+        from sglang.srt.speculative import dflash_worker_v2 as W
+
+        self.assertIn('return raw == "1"', inspect.getsource(W.accept_sync_fused_on))
 
     def test_order_in_the_draft_prep(self):
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
@@ -512,7 +517,12 @@ class TestBar1CanonOrder(CustomTestCase):
         from sglang.srt.distributed.device_communicators import barlink_bar1 as b1
 
         src = inspect.getsource(b1)
-        self.assertIn('"SGLANG_BARLINK_BAR1_CANON_ORDER", ""\n        ) not in ("", "0", "no", "off", "false")', src)
+        # 29.09.: read at init through canon_order_on -- an explicit value keeps
+        # its parse, unset/blank takes the registry row (qwen27b on, NF off,
+        # no form off: the old default).
+        self.assertIn("self.canon_order = canon_order_on()", src)
+        self.assertIn('return raw not in ("0", "no", "off", "false")',
+                      inspect.getsource(b1.canon_order_on))
         self.assertIn('bar1_algo_code(algo, getattr(self, "canon_order", False))', src)
 
     def test_kernel_source(self):
