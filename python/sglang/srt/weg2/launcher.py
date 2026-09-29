@@ -9076,6 +9076,66 @@ def group_kv_tokens(ns, group: str) -> Tuple[int, str]:
     return ctx, src
 
 
+def _rope_cache_cols(cfg: dict) -> int:
+    """Columns of the cos/sin cache ``get_rope`` builds for this config: the
+    rotary dim = head_dim x partial_rotary_factor (text sub-config first, the
+    v5 ``rope_parameters`` or the top level for the factor). 0 = unreadable."""
+    text = cfg.get("text_config") or cfg
+    head_dim = text.get("head_dim") or (
+        int(text["hidden_size"]) // int(text["num_attention_heads"])
+        if text.get("hidden_size") and text.get("num_attention_heads") else 0)
+    rope = text.get("rope_parameters") or text.get("rope_scaling") or {}
+    factor = rope.get("partial_rotary_factor", text.get("partial_rotary_factor", 1.0))
+    try:
+        return int(int(head_dim) * float(factor if factor is not None else 1.0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def p_rope_context_delta_mib(ns, n_stages: int) -> Tuple[Tuple[float, ...], Optional[str]]:
+    """YaRN x2 27B (29.09.): the per-stage VRAM the EAGER RoPE cos/sin cache
+    grows by when group P boots a longer context than the one its per-stage
+    posts (``--pp-cut-stage-fixed-mib``, P_PP_STAGE_FIXED_MIB) were read at.
+
+    ``reserve_rope_cache_for_long_sequences`` sizes every cache to the context
+    (fp32, ``rows x rotary_dim``) in ``load_model``, i.e. BEFORE the KV pool is
+    sized, so the growth comes straight out of the pool. MEASURED at 262144
+    (dkr27browauthoritybar1fs09290956, P): 'MRotaryEmbedding 262528x64 float32
+    64.1 MiB' on PP0/PP1/PP2 and the DFlash2 draft's 'RotaryEmbedding
+    262528x128 float32 128.2 MiB' on PP2 (the draft sits cold on the last
+    stage). At 524288 the pool model would otherwise price PP0 +64 MiB and PP2
+    +192 MiB too optimistic -- 4.1k / 24.6k tokens under the cap+chunk floor
+    it promised (per_request_max > realised pool). Delta = (ctx - 262144) x
+    cols x 4 B; target on every stage, the DFLASH draft on the last one.
+    ``((0,)*n, None)`` at or below 262144 -- every x1 form is byte-identical."""
+    ctx, src = group_context_tokens(ns, "p")
+    extra_rows = int(ctx) - CONTEXT_LENGTH_TOKENS
+    zero = tuple(0.0 for _ in range(int(n_stages)))
+    if extra_rows <= 0 or n_stages <= 0:
+        return zero, None
+    try:
+        tcols = _rope_cache_cols(_model_config(str(ns.model)))
+    except (OSError, ValueError, KeyError):
+        tcols = 0
+    dcols, dname = 0, None
+    if str(getattr(ns, "spec_form", "") or "").upper() == "DFLASH":
+        dpath = str(getattr(ns, "dflash_draft_path", "") or DFLASH_DRAFT_PATH_DEFAULT)
+        try:
+            dcols = _rope_cache_cols(_model_config(dpath))
+            dname = os.path.basename(dpath.rstrip("/"))
+        except (OSError, ValueError, KeyError):
+            dcols = 0
+    per_col = extra_rows * 4 / (1024.0 * 1024.0)
+    delta = [tcols * per_col for _ in range(int(n_stages))]
+    delta[-1] += dcols * per_col
+    line = (f"PP-CUT ROPE-KONTEXT (YaRN x2 27B): P context {ctx} (from {src}) > {CONTEXT_LENGTH_TOKENS} "
+            f"(the posts' context) -> eager cos/sin cache +{extra_rows} rows x 4 B: target {tcols} cols "
+            f"= +{tcols * per_col:.1f} MiB on every stage"
+            + (f", draft {dname} {dcols} cols = +{dcols * per_col:.1f} MiB on the last stage" if dcols else "")
+            + f"; stage_fixed += {[round(x, 1) for x in delta]} MiB")
+    return tuple(delta), line
+
+
 def _argv_vector(extra: str, flag: str):
     """Der Komma-Vektor hinter ``flag`` in einer ``--extra-*``-Zeichenkette.
 
@@ -19313,6 +19373,13 @@ def solve_p_cut(
                 for f, r in zip(fracs, rows)
             )
     ms = _csv_floats(ns.pp_cut_measured_ms_per_layer)
+    # YaRN x2 27B (29.09.): the posts were read at 262144; a longer P context
+    # grows the eager RoPE cache before the pool is sized (p_rope_context_delta_mib).
+    _stage_fixed = tuple(_csv_floats(ns.pp_cut_stage_fixed_mib))
+    _rope_delta, _rope_line = p_rope_context_delta_mib(ns, len(_stage_fixed))
+    if _rope_line is not None:
+        log(_rope_line)
+        _stage_fixed = tuple(float(v) + float(d) for v, d in zip(_stage_fixed, _rope_delta))
     model_pool = _pp_cut.PhasePoolModel(
         free_mib=tuple(float(b) for b in budgets_p),
         # The FAMILY split of weights is deliberately averaged: a stage's
@@ -19332,7 +19399,7 @@ def solve_p_cut(
         # this the model charged the per-LAYER weight half plus a 1229 MiB
         # arming floor and nothing else, and boot weg2sb5f published 499,967
         # tokens for the cut group P then sized at 304,655 (+64.1 %).
-        stage_fixed_mib=tuple(_csv_floats(ns.pp_cut_stage_fixed_mib)),
+        stage_fixed_mib=_stage_fixed,
         # #114: priced from the chunk P boots with (see the log line below),
         # never the reference boots' 1024 on a wider chunk.
         # --p-prefill-graph (27B): the SAME vector the ranks book (env_p, see

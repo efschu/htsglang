@@ -13,6 +13,7 @@
 # ==============================================================================
 """Config loading utilities."""
 
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +42,8 @@ from .common import (
 )
 from .mistral_utils import is_mistral_model, load_mistral_config
 
+logger = logging.getLogger(__name__)
+
 
 def apply_model_override_args(config, overrides: dict) -> None:
     """``--json-model-override-args`` onto a loaded config.
@@ -54,16 +57,39 @@ def apply_model_override_args(config, overrides: dict) -> None:
     attribute (``rope_parameters``) is merged too, so a partial override
     (``rope_type``/``factor``/``original_max_position_embeddings``) keeps its
     neighbours (``mrope_section``, ``mrope_interleaved``,
-    ``partial_rotary_factor``, ``rope_theta``)."""
+    ``partial_rotary_factor``, ``rope_theta``).
+
+    YaRN x2 27B (29.09.): a PARTIAL dict for a text sub-config key on a config
+    that has no such sub-config -- the config is its own text config -- is not
+    applied. One override string reaches the target AND its draft
+    (``ModelConfig.from_server_args``); beside the multimodal 27B the DFlash2
+    draft is a plain ``qwen3`` config, and ``update`` planted ``text_config``
+    there as a dict without ``num_attention_heads``, so ``get_hf_text_config``
+    asserted and the draft never built. The override addresses the wrapper's
+    sub-config; the draft keeps its own rope. A dict that can stand as a text
+    config (it names ``num_attention_heads``) keeps upstream's setattr."""
     plain = {}
     for key, val in overrides.items():
         cur = getattr(config, key, None)
         if isinstance(val, dict) and isinstance(cur, PretrainedConfig):
             _merge_into_sub_config(cur, val)
+        elif (isinstance(val, dict) and cur is None and key in _TEXT_SUB_CONFIG_KEYS
+                and "num_attention_heads" not in val
+                and getattr(config, "num_attention_heads", None) is not None):
+            logger.warning(
+                "--json-model-override-args: %r not applied to %s -- it addresses a "
+                "multimodal wrapper's text sub-config, and this config has none (it is "
+                "its own text config, e.g. a draft beside a multimodal target); keys %s",
+                key, (getattr(config, "architectures", None) or ["?"])[0], sorted(val))
         else:
             plain[key] = val
     if plain:
         config.update(plain)
+
+
+#: The attributes ``get_hf_text_config`` reads a multimodal wrapper's text
+#: sub-config from.
+_TEXT_SUB_CONFIG_KEYS = frozenset(("text_config", "llm_config", "language_config", "thinker_config"))
 
 
 def _merge_into_sub_config(sub, overrides: dict) -> None:
