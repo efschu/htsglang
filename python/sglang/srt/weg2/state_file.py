@@ -502,6 +502,26 @@ def health(d: str):
     return HEALTH_OK, f"lifecycle {lc}"
 
 
+#: Nutzer 29.09. (Feature-Tabelle im rigdash: „ob sie auch aktiv sind“): welche Schalter
+#: eine Gruppe WIRKLICH trägt, steht im Zustand -- nicht im Launcher-Log. Additiv in
+#: weg2.state/1: groups.<G>.launch = {argv, env}. Nur Schalter-Präfixe, nie Namen, die
+#: nach Schlüssel/Token aussehen; argv kommt schon redigiert (admin_key_mod.redact_argv).
+LAUNCH_ENV_PREFIXES = ("SGLANG_", "WEG2_", "HTSGLANG_", "NCCL_", "PYTORCH_", "CUDA_")
+LAUNCH_ENV_SECRET_MARKS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+
+
+def launch_snapshot(argv, env) -> dict:
+    """groups.<G>.launch: das exec'te argv und die Schalter-Umgebung der Gruppe."""
+    keep = {}
+    for k, v in (env or {}).items():
+        if not k.startswith(LAUNCH_ENV_PREFIXES):
+            continue
+        if any(m in k.upper() for m in LAUNCH_ENV_SECRET_MARKS):
+            continue
+        keep[k] = str(v)
+    return {"argv": [str(a) for a in (argv or [])], "env": dict(sorted(keep.items()))}
+
+
 def rc_of(st: dict, was_serving: bool) -> int:
     s = (st.get("lifecycle") or {}).get("state")
     cause = st.get("cause") or {}
