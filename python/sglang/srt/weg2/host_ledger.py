@@ -2924,7 +2924,43 @@ def census_shm_posts(terms: Mapping[str, object], census: Optional[Mapping[str, 
     measured_rest = (float(c.get("other_tmpfs_gib", 0.0) or 0.0)
                      + float(c.get("unbooked_shm_gib", 0.0) or 0.0))
     unposted = max(0.0, measured_rest - priced_small) if measured_arena is not None else 0.0
-    return {"arena_census_excess_gib": arena_excess, "unposted_shm_gib": unposted}
+    trim = _shm_total_trim_gib(terms, c, arena_excess, min(priced_small, measured_rest), unposted)
+    out = {"arena_census_excess_gib": arena_excess, "unposted_shm_gib": unposted - trim}
+    if trim:  # printed on the ARM line; absent = byte-identical to every pre-NF1d record
+        out["unposted_shm_trim_gib"] = trim
+    return out
+
+
+def _shm_total_trim_gib(terms: Mapping[str, object], c: Mapping[str, object],
+                        arena_excess: float, small_in_rest: float, unposted: float) -> float:
+    """29.09. NF1d (W21 84.16 vs 83.44): how much of ``unposted`` the ledger's
+    shmem claim holds ABOVE what one measured instant held, GiB (>= 0).
+
+    The census record max-merges every class and ``unattributed`` on its own,
+    so their sum is a sum of maxima from different samples: store 41.69
+    (09291559, written map 368 slots) + ungebucht 6.26 (z30w 09:12Z, store
+    39.20). The two trade -- 22 slots more in the store is less elsewhere:
+    z30w cg shmem 53.36, 09291559 host Shmem max 54.11 (+0.75 for +2.49 store).
+    The ledger claimed 56.80 GiB of shmem for 09291559's own arm. The record's
+    ``shm_total_max_gib`` is the peak of the SUM at one instant; the claim is
+    capped there, plus whatever THIS arm's store/arena price exceeds that
+    instant's. Only ``unposted`` (the pathless remainder) is trimmed -- every
+    named post keeps its price. No field (every pre-NF1d record, 27B): 0.
+    """
+    tot = c.get("shm_total_max_gib")
+    if tot is None or c.get("arena_measured_gib") is None:
+        return 0.0
+
+    def _t(k: str) -> float:
+        return float(terms.get(k, 0.0) or 0.0)
+
+    claimed = (_t("cold_tier_shm_gib") + _t("arena_gib") + arena_excess + _t("l3_index_gib")
+               + _t("seq_ring_gib") + _t("arena_sidecar_gib") + _t("arena_handoff_gib")
+               + small_in_rest + unposted)
+    cap = (float(tot)
+           + max(0.0, _t("cold_tier_shm_gib") - float(c.get("shm_total_store_gib") or 0.0))
+           + max(0.0, _t("arena_gib") - float(c.get("shm_total_arena_gib") or 0.0)))
+    return min(unposted, max(0.0, claimed - cap))
 
 
 def _charge_terms_priced(
@@ -4955,6 +4991,8 @@ def price(
         # while `census_now_gib` netted them out of the residual floor.
         "arena_census_excess_gib": float(charges.get("arena_census_excess_gib", 0.0) or 0.0),
         "unposted_shm_gib": float(charges.get("unposted_shm_gib", 0.0) or 0.0),
+        # 29.09. NF1d: printed, never charged (see _shm_total_trim_gib)
+        "unposted_shm_trim_gib": float(charges.get("unposted_shm_trim_gib", 0.0) or 0.0),
         "census_source": str(charges.get("census_source", "") or ""),
         "memhist_run_only": bool(charges.get("memhist_run_only", False)),
         "overhead_gib": overhead_gib,
@@ -6112,6 +6150,8 @@ def arm_terms_line(arm) -> str:
         + (f"cold_tier_shm={_g('cold_tier_shm_gib')} " if float(t.get('cold_tier_shm_gib') or 0.0) else "")
         + "".join(f"{_k[:-4]}={_g(_k)} " for _k in ("nonrank_anon_gib", "seq_ring_gib", "arena_sidecar_gib", "arena_handoff_gib",
                                                      "arena_census_excess_gib", "unposted_shm_gib") if float(t.get(_k) or 0.0))
+        + (f"unposted_shm_trim=-{_g('unposted_shm_trim_gib')}[cap: census shm_total, one instant] "
+           if float(t.get('unposted_shm_trim_gib') or 0.0) else "")
         + f"overhead={_g('overhead_gib')} xchg_bounce={_g('xchg_bounce_gib')} "
         f"host_weights={_g('host_ring_gib')} "
         f"ratchet_charged={_g('flip_ratchet_charged_gib')} "

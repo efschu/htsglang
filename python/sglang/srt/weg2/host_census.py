@@ -278,6 +278,21 @@ def merge_into_record(path: str, key: str, census: Mapping[str, object]) -> Dict
             ent[field][k] = max(float(ent[field].get(k, 0.0)), float(v))
     ent["unattributed_shm_gib"] = max(ent["unattributed_shm_gib"],
                                       float(census.get("unattributed_shm_gib") or 0.0))
+    # 29.09. NF1d (W21 84.16): the fields above are max-merged EACH ON ITS OWN,
+    # so their sum is a sum of maxima from different samples (store 41.69 of
+    # 09291559 + ungebucht 6.26 of z30w, whose store was 39.20). The peak of the
+    # SUM is kept beside them, with the store/arena of that same sample, so the
+    # ledger can cap its shmem claim at what one instant actually held.
+    for _f in ("shm_total_max_gib", "shm_total_store_gib", "shm_total_arena_gib", "shm_total_source"):
+        if _f in old:
+            ent[_f] = old[_f]
+    _tot = census.get("cg_shmem_gib")
+    if _tot is not None and float(_tot) > float(ent.get("shm_total_max_gib", -1.0)):
+        _cls = dict(census.get("shm_classes_gib") or {})
+        ent["shm_total_max_gib"] = float(_tot)
+        ent["shm_total_store_gib"] = float(_cls.get("store", 0.0))
+        ent["shm_total_arena_gib"] = float(_cls.get("arena_booked", 0.0))
+        ent["shm_total_source"] = f"{census.get('source', '')} {census.get('at', '')}".strip()
     data[key] = ent
     tmp = f"{path}.tmp.{os.getpid()}"
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -315,6 +330,12 @@ def ledger_terms(entry: Optional[Mapping[str, object]]) -> Dict[str, object]:
         "other_tmpfs_gib": float(cls.get("other_tmpfs", 0.0)),
         "census_roles": roles,
         "census_source": f"record: {int(entry.get('samples') or 0)} sample(s), last {entry.get('last_at', '?')}",
+        # 29.09. NF1d: the peak of the SUM (one instant), None when never sampled
+        "shm_total_max_gib": (float(entry["shm_total_max_gib"])
+                              if entry.get("shm_total_max_gib") is not None else None),
+        "shm_total_store_gib": float(entry.get("shm_total_store_gib") or 0.0),
+        "shm_total_arena_gib": float(entry.get("shm_total_arena_gib") or 0.0),
+        "shm_total_source": str(entry.get("shm_total_source") or ""),
     }
 
 
