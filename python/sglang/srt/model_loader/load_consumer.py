@@ -73,6 +73,13 @@ class ExpertLoadPool:
         self._deferred: List[Callable[[], Any]] = []
         self._loader_ident = threading.get_ident()
         self.deferred_run = 0
+        # BOOTZEIT 3 (29.09.): where the loader thread's time goes. The
+        # LOAD-PROFILE sampler saw ``threading.py wait`` 49-59 % on every
+        # rank of rc12z30o3 but cannot say on WHAT -- consumer slots, reads,
+        # or nothing. These three clocks split it (instrument only).
+        self.wait_slots_s = 0.0  # loader blocked on a free consumer slot
+        self.deferred_s = 0.0  # loader running deferred work (the presplit)
+        self.drain_wait_s = 0.0  # loader waiting for the last consumers
         self._ex: Optional[ThreadPoolExecutor] = None
         if self.threads > 0:
             self._ex = ThreadPoolExecutor(
@@ -102,7 +109,11 @@ class ExpertLoadPool:
         """Run ``fn`` on the loader thread at its next submit() or drain().
         Called from a consumer thread; on the loader thread it runs at once."""
         if self.on_loader_thread():
+            import time as _t
+
+            t0 = _t.perf_counter()
             fn()
+            self.deferred_s += _t.perf_counter() - t0
             self.deferred_run += 1
             return
         with self._lock:
@@ -115,7 +126,11 @@ class ExpertLoadPool:
                 if not self._deferred:
                     return
                 fn = self._deferred.pop(0)
+            import time as _t
+
+            t0 = _t.perf_counter()
             fn()
+            self.deferred_s += _t.perf_counter() - t0
             self.deferred_run += 1
 
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
@@ -130,7 +145,11 @@ class ExpertLoadPool:
         # acquire BEFORE submitting: the loader thread blocks here when the
         # consumers are behind, which is the throttle that bounds the mmaps
         # (and the host RAM) the deferred calls keep alive
+        import time as _t
+
+        t0 = _t.perf_counter()
         self._slots.acquire()
+        self.wait_slots_s += _t.perf_counter() - t0
         try:
             fut = self._ex.submit(self._run, fn, args, kwargs)
         except BaseException:
@@ -176,11 +195,15 @@ class ExpertLoadPool:
             with self._lock:
                 pending = list(self._pending)
                 self._pending = []
+            import time as _t
+
+            t0 = _t.perf_counter()
             for f in pending:
                 try:
                     f.result()
                 except BaseException:  # noqa: BLE001 -- the first one is re-raised below
                     pass
+            self.drain_wait_s += _t.perf_counter() - t0
             self._raise_if_failed()
             # a deferred call may have been queued by the last completions;
             # and nothing else can queue one once every future is done
