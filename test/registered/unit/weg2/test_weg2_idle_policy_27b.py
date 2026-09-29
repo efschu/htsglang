@@ -378,7 +378,9 @@ class Wiring(CustomTestCase):
 
     def test_the_controller_order(self):
         src = inspect.getsource(front_mod.Front.controller)
-        d_arm = src[src.index('if self.awake == "D":'):src.index("t_drain0 = time.time()")]
+        # DUAL-TP3PP3 moved the P drain block into the nested `_p_drain_pass`
+        # (defined before the loop); the D arm now ends at its call.
+        d_arm = src[src.index('if self.awake == "D":'):src.index("await _p_drain_pass()")]
         self.assertLess(d_arm.index("self._d_short_drain("), d_arm.index("self._fairness_switch("),
                         "(b) runs before the D arm's other decisions")
         idle = d_arm[d_arm.index("if not self.queue:"):]

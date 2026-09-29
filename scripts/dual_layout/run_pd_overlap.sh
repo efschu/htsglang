@@ -46,12 +46,14 @@ for IDX in "$@"; do
   p2=$!
   wait $p1 $p2
   $PY $HERE/ipc_mps_probe.py > "$T.ipc_nomps.jsonl" 2>"$T.ipc_nomps.err"
+  $PY $HERE/vmm_mps_probe.py > "$T.vmm_nomps.jsonl" 2>"$T.vmm_nomps.err"
   # two processes under a private MPS daemon
   mkdir -p $MPSROOT/pipe $MPSROOT/log
   CUDA_MPS_PIPE_DIRECTORY=$MPSROOT/pipe CUDA_MPS_LOG_DIRECTORY=$MPSROOT/log \
     nvidia-cuda-mps-control -d
   sleep 1
   CUDA_MPS_PIPE_DIRECTORY=$MPSROOT/pipe $PY $HERE/ipc_mps_probe.py > "$T.ipc_mps.jsonl" 2>"$T.ipc_mps.err"
+  CUDA_MPS_PIPE_DIRECTORY=$MPSROOT/pipe $PY $HERE/vmm_mps_probe.py > "$T.vmm_mps.jsonl" 2>"$T.vmm_mps.err"
   for arm in mps mps_p50; do
     st=$(s 15)
     pct=100; [ $arm = mps_p50 ] && pct=50
@@ -66,6 +68,19 @@ for IDX in "$@"; do
   stop_mps
   rm -rf $MPSROOT
 done
+# NCCL between two MPS clients on two cards (only with >= 2 cards)
+if [ $# -ge 2 ]; then
+  U0=$(nvidia-smi -i "$1" --query-gpu=uuid --format=csv,noheader | tr -d ' ')
+  U1=$(nvidia-smi -i "$2" --query-gpu=uuid --format=csv,noheader | tr -d ' ')
+  export CUDA_VISIBLE_DEVICES=$U0,$U1
+  $PY $HERE/nccl_mps_probe.py > "$OUT/nccl_nomps.jsonl" 2>"$OUT/nccl_nomps.err"
+  mkdir -p $MPSROOT/pipe $MPSROOT/log
+  CUDA_MPS_PIPE_DIRECTORY=$MPSROOT/pipe CUDA_MPS_LOG_DIRECTORY=$MPSROOT/log nvidia-cuda-mps-control -d
+  sleep 1
+  CUDA_MPS_PIPE_DIRECTORY=$MPSROOT/pipe $PY $HERE/nccl_mps_probe.py > "$OUT/nccl_mps.jsonl" 2>"$OUT/nccl_mps.err"
+  stop_mps
+  rm -rf $MPSROOT
+fi
 $PY - "$OUT" <<'EOF'
 import json, glob, os, sys
 d = sys.argv[1]
@@ -86,6 +101,6 @@ for base in sorted({f.split('.')[0] for f in glob.glob(d + '/card*.json')}):
         if 'decode_steps_per_s' not in x or 'prefill_tflops' not in y: print(f"  {name:14s} incomplete"); continue
         sd_ = x['decode_steps_per_s'] / D0; sp_ = y['prefill_tflops'] / P0
         print(f"  {name:14s} share_dec {sd_:.3f} share_pre {sp_:.3f}  E {sd_+sp_:.3f}  dec p50 {x['decode_p50_ms']:.2f} p99 {x['decode_p99_ms']:.2f} max {x['decode_max_ms']:.1f} ms")
-for f in sorted(glob.glob(d + '/*.ipc_*.jsonl')):
+for f in sorted(glob.glob(d + '/*.jsonl')):
     print(os.path.basename(f), open(f).read().strip()[:300])
 EOF

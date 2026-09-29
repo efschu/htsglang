@@ -167,10 +167,14 @@ class CardPlan:
     p_total: int
     capacity: int
     overhead: int
+    #: False = stage 1a: both layouts hold their FULL weight sets (nothing is
+    #: shared yet); the shared part is then paid twice.
+    share: bool = True
 
     @property
     def weights(self) -> int:
-        return self.shared + self.pp_only + self.tp_only
+        w = self.shared + self.pp_only + self.tp_only
+        return w if self.share else w + self.shared
 
     @property
     def context(self) -> int:
@@ -188,7 +192,7 @@ class CardPlan:
 
 
 def plan(model: ModelBytes, lay: DualLayout, capacity: Mapping[int, int],
-         overhead: Mapping[int, int]) -> List[CardPlan]:
+         overhead: Mapping[int, int], share: bool = True) -> List[CardPlan]:
     """Per card: shared / pp_only / tp_only bytes and what is left for context.
 
     ``capacity[card]`` is what torch can allocate on the card (bytes);
@@ -226,7 +230,8 @@ def plan(model: ModelBytes, lay: DualLayout, capacity: Mapping[int, int],
             card=card, d_rank=r, p_stage=s, layers=(lo, hi),
             shared=int(round(shared)), pp_only=int(round(p_total - shared)),
             tp_only=int(round(d_total - shared)), d_total=int(round(d_total)),
-            p_total=int(round(p_total)), capacity=int(capacity[card]), overhead=int(overhead[card])))
+            p_total=int(round(p_total)), capacity=int(capacity[card]), overhead=int(overhead[card]),
+            share=bool(share)))
     return rows
 
 
@@ -256,7 +261,8 @@ def check_physics(rows: Sequence[CardPlan], model: ModelBytes, lay: DualLayout) 
 
 def solve_cut_equal_context(model: ModelBytes, lay: DualLayout, capacity: Mapping[int, int],
                             overhead: Mapping[int, int],
-                            target: Optional[Mapping[int, float]] = None) -> Tuple[Tuple[int, ...], List[CardPlan]]:
+                            target: Optional[Mapping[int, float]] = None,
+                            share: bool = True) -> Tuple[Tuple[int, ...], List[CardPlan]]:
     """The P cut whose per-card context is closest to ``target`` shares
     (default: proportional to capacity, i.e. "gleicher Kontextanteil").
     Exhaustive over all cuts with every stage >= 1 layer (64 layers, 3 stages:
@@ -280,7 +286,7 @@ def solve_cut_equal_context(model: ModelBytes, lay: DualLayout, capacity: Mappin
                 yield (a,) + rest
     for cut in cuts(n, L):
         cand = dataclasses.replace(lay, p_cut=cut)
-        rows = plan(model, cand, capacity, overhead)
+        rows = plan(model, cand, capacity, overhead, share=share)
         ctx = {r.card: r.context for r in rows}
         tot = sum(ctx.values())
         if tot <= 0 or min(ctx.values()) <= 0:

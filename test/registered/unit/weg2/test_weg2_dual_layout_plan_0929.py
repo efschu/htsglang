@@ -103,6 +103,14 @@ class TestDualLayoutPlan(unittest.TestCase):
         self.assertEqual(dp.d_tokens(rows, m), sum(r.context for r in rows) // per_tok)
         self.assertGreater(dp.p_tokens(rows, m), 0)
 
+    def test_stage_1a_pays_the_shared_part_twice(self):
+        m = _model()
+        a = {r.card: r for r in dp.plan(m, _lay(), CAP, OV)}
+        b = {r.card: r for r in dp.plan(m, _lay(), CAP, OV, share=False)}
+        for c in CAP:
+            self.assertEqual(a[c].context - b[c].context, a[c].shared)
+            self.assertAlmostEqual(b[c].weights, a[c].d_total + a[c].p_total, delta=2)
+
     def test_refusals(self):
         m = _model()
         with self.assertRaises(dp.DualPlanError):

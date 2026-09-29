@@ -13510,6 +13510,61 @@ def driver_carve_min_total_mib(profile: Optional[str] = None) -> int:
     return int(getattr(row, "driver_carve_min_total_mib", 0) or 0)
 
 
+class Weg2DualLayoutRefused(Weg2LaunchRefused):
+    """DUAL-TP3PP3: a flag combination the dual layout cannot serve."""
+
+
+def resolve_dual_layout(ns) -> None:
+    """DUAL-TP3PP3 (F26): the ONE place --dual-layout changes other flags.
+
+    Both groups stay awake, so their weights never sleep: --flip-weights is
+    forced to 'resident'. Refused by name: --weg2-d-adopt on (D would hold
+    placeholders that only a flip fills -- and there is no flip), --idle-layout
+    pp (an idle flip), --dual-mps on without --dual-layout. Off: no-op."""
+    dual = bool(getattr(ns, "dual_layout", False))
+    if not dual:
+        if str(getattr(ns, "dual_mps", "off")) == "on":
+            raise Weg2DualLayoutRefused(
+                "DUAL-TP3PP3: --dual-mps on needs --dual-layout (MPS only pays when both groups "
+                "run kernels at the same time)")
+        return
+    if _d_adopt_armed(ns):
+        raise Weg2DualLayoutRefused(
+            "DUAL-TP3PP3: --dual-layout with --weg2-d-adopt on -- D would hold placeholder "
+            "weights that only the first flip fills, and the dual layout never flips")
+    if str(getattr(ns, "idle_layout", "tp")) == "pp":
+        raise Weg2DualLayoutRefused(
+            "DUAL-TP3PP3: --dual-layout with --idle-layout pp -- the idle layout is a flip, "
+            "and the dual layout never flips")
+    if getattr(ns, "flip_weights", "family") != "resident":
+        print(f"WEG2-DUAL --flip-weights {getattr(ns, 'flip_weights', 'family')} -> resident "
+              "(both groups stay awake, no weight ever sleeps)", flush=True)
+        ns.flip_weights = "resident"
+
+
+def start_dual_mps(ns, log, dry: bool) -> Dict[str, str]:
+    """DUAL-TP3PP3 --dual-mps on: one PRIVATE MPS control daemon for this
+    boot (pipe dir under /tmp/weg2-dual-mps-<tag>, so nothing outside the boot
+    can attach), started before the groups; returns the client env both
+    groups get. The daemon lives as long as the container. Off: {}."""
+    if not getattr(ns, "dual_layout", False) or str(getattr(ns, "dual_mps", "off")) != "on":
+        return {}
+    root = f"/tmp/weg2-dual-mps-{ns.tag}"
+    env = {"CUDA_MPS_PIPE_DIRECTORY": root + "/pipe", "CUDA_MPS_LOG_DIRECTORY": root + "/log"}
+    if not dry:
+        os.makedirs(env["CUDA_MPS_PIPE_DIRECTORY"], exist_ok=True)
+        os.makedirs(env["CUDA_MPS_LOG_DIRECTORY"], exist_ok=True)
+        r = subprocess.run(["nvidia-cuda-mps-control", "-d"], env={**os.environ, **env},
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            raise Weg2DualLayoutRefused(
+                f"DUAL-TP3PP3: nvidia-cuda-mps-control -d failed rc={r.returncode}: "
+                f"{(r.stderr or r.stdout).strip()[:300]}")
+    log(f"WEG2-DUAL MPS daemon {'(dry, not started)' if dry else 'started'}: pipe "
+        f"{env['CUDA_MPS_PIPE_DIRECTORY']} -- P and D are MPS clients on every card")
+    return env
+
+
 def _d_early_start_armed(ns) -> bool:
     """BOOTZEIT 3: the one resolution of ``--weg2-d-early-start``.
 
@@ -13518,6 +13573,10 @@ def _d_early_start_armed(ns) -> bool:
     Flash) and off for every other one, so the 27B line boots serial exactly
     as before until its own proof boot ran with an explicit 'on'."""
     mode = str(getattr(ns, "weg2_d_early_start", "off") or "off")
+    if getattr(ns, "dual_layout", False):
+        # DUAL-TP3PP3: D is sized from P's AWAKE footprint, measured after P's
+        # READY -- an early D would be planned before that number exists.
+        return False
     if mode == "auto":
         return d_early_start_proven(getattr(ns, "profile", None))
     return mode == "on"
@@ -20545,6 +20604,18 @@ def build_parser() -> argparse.ArgumentParser:
              "so the floor protects the box -- boot logs, the evidence tree, the model "
              "cache -- not the store. NOT the old 1 GiB, which was 1/6th of a 6 GiB "
              "tmpfs and latched the backend's write stop after 5 GiB.")
+    ap.add_argument("--dual-layout", action="store_true", default=False,
+                    help="DUAL-TP3PP3 (F26, user 29.09.): BOTH groups stay awake for the whole boot and "
+                         "the front never flips. Implies --flip-weights resident; P is NOT put to sleep "
+                         "after READY, its AWAKE footprint is measured in its place and D is sized from "
+                         "that measurement (the same per-PID reading the dormant residue uses). P's own "
+                         "budget is lowered with --extra-p '--rank-gpu-memory-mib ...' (W100 allows "
+                         "lowering). Refuses --weg2-d-adopt on and --idle-layout pp. Default off: the "
+                         "launcher is byte-identical.")
+    ap.add_argument("--dual-mps", choices=("off", "on"), default="off",
+                    help="DUAL-TP3PP3: start a private MPS control daemon before the groups (pipe dir "
+                         "under the boot's run dir) so P and D kernels run concurrently on a card instead "
+                         "of time-slicing. Only with --dual-layout.")
     ap.add_argument("--flip-weights", choices=("family", "resident"), default="family",
                     help="Task #47 Scheibe 6a: 'family' (default) moves the weights family across the flip "
                          "(gathered legs, host ring / exchange); 'resident' keeps BOTH groups' weights mapped "
@@ -22647,6 +22718,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         weights_cpu_backup_armed = weight_exchange.weights_cpu_backup_armed(
             explicit=ns.weg2_weights_cpu_backup)
+    resolve_dual_layout(ns)
     if getattr(ns, "flip_weights", "family") == "resident":
         # Task #47 Scheibe 6a: the weights never sleep -> no host ring, no cpu
         # backup, no exchange; the ring planner takes the ABSENT-BY-DESIGN path.
@@ -24770,6 +24842,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                     f"p_free_reads_{ns.tag}")
         spec_p.env[_des.FREE_READ_JOURNAL_ENV] = _journal_dir
         log(f"{_des.FREE_READ_MARKER} P journals its free-memory reads -> {_journal_dir}")
+    ns._dual_mps_env = start_dual_mps(ns, log, dry)
+    spec_p.env.update(ns._dual_mps_env)
     launch_group(spec_p, tree, log, dry)
     if dry:
         _dry_terms: List[Dict[str, object]] = []
@@ -24954,10 +25028,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # prices its image term from (BOOT_weg2dk7_0907.md: the weight-tag census
     # under-charged the measured image by +9.80 GiB).
     shmem_before = host_ledger.read_cgroup_shmem_bytes()
-    state.sleep_p_ms = sleep_group(PORT_P, log, "P", weights_tags)
-    time.sleep(2)
-    pids_p = session_pids(spec_p.pid)
-    image_rec = host_ledger.dormant_image_sample(
+    if getattr(ns, "dual_layout", False):
+        # DUAL-TP3PP3: P stays awake. What is measured below is P's AWAKE
+        # footprint, and D is sized from it exactly as it would be from the
+        # dormant residue. No dormant image is sampled or recorded -- an awake
+        # footprint in the dormant-image record would poison the next boot's
+        # ledger.
+        state.sleep_p_ms = 0.0
+        log("WEG2-DUAL P stays AWAKE (--dual-layout): no sleep leg, no dormant image; "
+            "the per-PID reading below is P's awake footprint and sizes D")
+        time.sleep(2)
+        pids_p = session_pids(spec_p.pid)
+    else:
+        state.sleep_p_ms = sleep_group(PORT_P, log, "P", weights_tags)
+        time.sleep(2)
+        pids_p = session_pids(spec_p.pid)
+    image_rec = None if getattr(ns, "dual_layout", False) else host_ledger.dormant_image_sample(
         group="P",
         shmem_before_bytes=shmem_before,
         shmem_after_bytes=host_ledger.read_cgroup_shmem_bytes(),
@@ -24975,9 +25061,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # forever and the transition path below would never retire.
         model_digest_=(host_ledger.checkpoint_digest(ns.model)[0] or ""),
     )
-    log(host_ledger.format_dormant_image(image_rec))
-    host_ledger.append_measured_record(measured_record_path(), image_rec)
-    state.dormant_image_p = image_rec
+    if image_rec is not None:
+        log(host_ledger.format_dormant_image(image_rec))
+        host_ledger.append_measured_record(measured_record_path(), image_rec)
+    state.dormant_image_p = image_rec or {}
     dc_p = nvml_process_mib(pids_p)
     for c in cards:
         dc_p.setdefault(c.uuid, 0)
@@ -25013,6 +25100,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if spec_d is None:
         spec_d, _ = _d_spec_from(dc_p, "D")
         state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
+        spec_d.env.update(getattr(ns, "_dual_mps_env", None) or {})
         launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
     _write_state(state)
@@ -25567,7 +25655,8 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
          if group_context_tokens(ns, "d")[0] > CONTEXT_LENGTH_TOKENS else []) + [
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
-    ] + (["--weights-resident"] if getattr(ns, "flip_weights", "family") == "resident" else []) + [
+    ] + (["--weights-resident"] if getattr(ns, "flip_weights", "family") == "resident" else []) + (
+        ["--dual-layout"] if getattr(ns, "dual_layout", False) else []) + [
         "--carrier-max-tokens", str(carrier_max_tokens),
         "--p-concurrency", str(p_bs),
         "--d-bs", str(d_bs),
