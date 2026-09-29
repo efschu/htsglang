@@ -131,7 +131,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.compat_shims import operator_dir as _operator_dir  # host dir kept through the rename
 
@@ -1269,6 +1269,32 @@ def reap_mark_gib(ceiling_bytes: Optional[int] = None, ceiling_source: str = "")
     if ceiling_source and not ceiling_source.startswith("cgroup memory.max"):
         return const
     return min(const, float(ceiling_bytes) / GIB)
+
+
+#: 29.09.: the line that names a derived runtime latch.
+RIEGEL_MARKER = "WEG2-HOST-LEDGER RIEGEL"
+
+
+def effective_riegel_gib(riegel_gib: Optional[float], hard_bound_gib: float
+                         ) -> Tuple[Optional[float], str]:
+    """``(latch, line)``: the runtime latch a boot runs with.
+
+    29.09. (27B z30y W97 13:02Z): since the mark follows ``memory.max``
+    (:func:`reap_mark_gib`), the latch is DERIVED from it -- the hard bound,
+    mark minus the measured margin. A profile's fixed ``--host-riegel-gib``
+    may only TIGHTEN it: 93.0 written for the 95.90 CT999 mark is above the
+    74.53 GiB bound of a 76 GiB container, so the derivation wins and the line
+    says so, instead of refusing the boot over a number the ceiling outdated.
+    ``None`` stays ``None`` (no latch was asked for)."""
+    if riegel_gib is None:
+        return None, ""
+    flag = float(riegel_gib)
+    if flag <= hard_bound_gib:
+        return flag, ""
+    return float(hard_bound_gib), (
+        f"{RIEGEL_MARKER} --host-riegel-gib {flag:.2f} is above the hard bound "
+        f"{hard_bound_gib:.2f} GiB (mark minus the measured margin) -- the latch is "
+        f"derived: {hard_bound_gib:.2f} GiB; a fixed flag may only tighten it")
 
 
 def pinned_reserve_for_ranks(
@@ -3091,9 +3117,24 @@ def record_run_residual_gib(
     return float(stored) - correction, correction
 
 
+#: 29.09. (27B d2 13:52Z W97, run peak 86.19 vs 60.85 measured): the host
+#: census posts (host_census.ledger_terms) this module charges as their own
+#: terms. A run-moment residual is ``nonreclaim - charges - image`` of the
+#: boot that sampled it; whatever of these posts that boot did NOT charge is
+#: inside its residual, so charging them again on top of it counts the same
+#: bytes twice.
+CENSUS_POST_KEYS = ("nonrank_anon_gib", "seq_ring_gib", "arena_sidecar_gib", "arena_handoff_gib")
+
+
+def census_posts_gib(charges: Optional[Mapping[str, object]]) -> float:
+    """The census posts of one charge dict, summed (0.0 when absent)."""
+    return sum(max(0.0, float((charges or {}).get(k, 0.0) or 0.0)) for k in CENSUS_POST_KEYS)
+
+
 def run_origin_gib(
     cg_nonreclaim_gib: Optional[float], record: Optional[Dict[str, dict]] = None,
     reference_model_ok: Optional[bool] = None, reference_model_why: str = "",
+    census_now_gib: float = 0.0,
 ) -> Tuple[Optional[float], str]:
     """The origin the RUN PEAK is predicted from, and where it came from.
 
@@ -3225,8 +3266,19 @@ def run_origin_gib(
             _any_death = True
             continue
         _repriced.append((record_run_residual_gib(e), g, e))
+    # 29.09.: EACH CENSUS POST COUNTS ONCE -- as its own term or inside the
+    # measured residual, never both. The residual holds every census post its
+    # sampler did not subtract (`residual_census_gib`, absent = 0 on records
+    # written before the census existed); what this boot charges above that is
+    # taken out of the floor here, so the run peak adds it exactly once.
+    _census_out: Dict[int, float] = {}
+    for (_v, _c), _g, _e in _repriced:
+        if _v is not None:
+            _census_out[id(_e)] = max(
+                0.0, float(census_now_gib or 0.0) - float(_e.get("residual_census_gib") or 0.0))
     residuals = [
-        (v, g, e, corr) for (v, corr), g, e in _repriced if v is not None
+        (v - _census_out.get(id(e), 0.0), g, e, corr)
+        for (v, corr), g, e in _repriced if v is not None
     ]
     if residuals:
         floor, group, entry, _corr = max(residuals, key=lambda r: r[0])
@@ -3245,6 +3297,10 @@ def run_origin_gib(
             f"{float(entry['run_residual_gib']):.2f}"
             + (
                 f", RE-PRICED -{_corr:.2f} for S_D (#1325)" if _corr else ""
+            )
+            + (
+                f", -{_census_out[id(entry)]:.2f} census posts charged as their own terms"
+                if _census_out.get(id(entry)) else ""
             )
             + ")"
         )
@@ -4610,7 +4666,16 @@ def price(
     # numbers (measured image and weight-tag census) to print.
     image_p_gib = images.p_gib
     image_d_gib = images.d_gib
-    common = base_gib - FLOOR_GIB - _boot_charges_gib(charges)
+    # 29.09. (z30y W87/W20 13:01Z): the tmpfs expert store counts ONCE -- in the
+    # run peak against memory.max, where its pages land (z30x2 memts: shmem
+    # 53.3 GiB of 79.54 non-reclaimable). The two moments here are the #721 /
+    # #1236 leftovers above FLOOR and the CLI reserve, and #1236 took the store
+    # out of them ("store=NOT CHARGED HERE"); charging it here as well made the
+    # same 38.97 GiB bind twice -- once in the run peak (77.98 vs 82.53, funded)
+    # and once against the 26 GiB FLOOR + CLI the moments keep -- and refused a
+    # form that ran at 79.54 of 84. The ARM line still prints the post.
+    cold_tier_gib = float(charges.get("cold_tier_shm_gib", 0.0) or 0.0)
+    common = base_gib - FLOOR_GIB - (_boot_charges_gib(charges) - cold_tier_gib)
     # R7: at the launch moment only span 1 is registered (P's first pause is the
     # launcher's sleep(P)); span 2 lands at D's first pause, when D's load
     # transient is gone.  Charging Sigma H at launch is what turns the M=1200
@@ -4640,6 +4705,7 @@ def price(
         measured_record,
         reference_model_ok=reference_model_ok,
         reference_model_why=reference_model_why,
+        census_now_gib=census_posts_gib(charges),
     )
     arm = Arm(
         s_gb=s_gb,
@@ -5235,6 +5301,7 @@ def dormant_image_sample(
     # `residual_charges_gib` reads it, and a name that exists on exactly one
     # path is a NameError waiting for the next editor (#1326).
     _charges_gib: Optional[float] = None
+    _census_gib: Optional[float] = None
     residual_note = ""
     if cg_current_bytes is None or arm is None:
         residual_note = (
@@ -5314,6 +5381,7 @@ def dormant_image_sample(
         # needs no version inference at all: correction = stored_charges -
         # correct_charges, and it is 0 for a record already in its own currency.
         _charges_gib = _boot_charges_gib(charges)
+        _census_gib = census_posts_gib(charges)
         residual = nonreclaim_gib - _charges_gib - rss_gib
         residual_note = (
             f"nonreclaimable {nonreclaim_gib:.2f} minus this boot's own charges "
@@ -5369,6 +5437,9 @@ def dormant_image_sample(
         # record without inferring which version of this function wrote it.
         # None when no run moment was available (the residual is None too).
         "residual_charges_gib": _charges_gib,
+        # 29.09.: the census posts inside that subtraction, so a later boot
+        # takes out of this residual only what it charges beyond them.
+        "residual_census_gib": _census_gib,
         # #1325: WHAT THE BOX WAS DOING WHEN THIS WAS SAMPLED, and WHICH
         # SERVING FORM it speaks for. Both RECORDED, neither yet a selector of
         # a different number -- and that ordering is deliberate. The reading
@@ -6232,6 +6303,11 @@ def choose(
         )
     )
     hard_bound_gib = watermark_gib - margin.total_gib
+    # 29.09. (27B z30y W97, 13:02Z): the latch is derived from the mark; a
+    # profile's fixed --host-riegel-gib may only tighten it.
+    riegel_gib, _riegel_line = effective_riegel_gib(riegel_gib, hard_bound_gib)
+    if _riegel_line:
+        lines.append(_riegel_line)
     pinned_reserve_gib, pinned_reserve_src = pinned_reserve_for_ranks(
         margin.total_gib, cg_ceiling_bytes, cg_ceiling_source)
     pinned_wall_gib, _pinned_wall_why = pinned_wall(
@@ -6409,10 +6485,10 @@ def choose(
                     f"fields, from the one producer, so the refusal and the arm "
                     f"it refused can be compared field by field."
                 )
-            if float(riegel_gib) >= hard_bound_gib:
+            if float(riegel_gib) > hard_bound_gib:
                 raise Weg2HostDeviationRefused(
                     f"W97 Weg2HostDeviationRefused: --host-riegel-gib "
-                    f"{float(riegel_gib):.2f} is AT OR ABOVE the hard bound "
+                    f"{float(riegel_gib):.2f} is ABOVE the hard bound "
                     f"{hard_bound_gib:.2f} GiB it is supposed to latch beneath. A "
                     f"latch above the bound cannot fire before the bound is already "
                     f"crossed; it is decoration, and the rule asks for a runtime "
@@ -6717,6 +6793,7 @@ def choose(
     # the ONE reserve number: the launcher exports it to the ranks. Kept OFF
     # arm.terms, which stay byte-identical with price()'s (#1360 guard).
     chosen.pinned_reserve = (pinned_reserve_gib, pinned_reserve_src)
+    chosen.riegel_effective = riegel_gib
     return chosen, headroom, lines
 
 

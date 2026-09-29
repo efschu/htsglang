@@ -68,13 +68,16 @@ class DeviationIsBothOrNeither1360(CustomTestCase):
 
 
 class TheTwoHardRefusalsStand1360(CustomTestCase):
-    def test_a_latch_at_or_above_the_hard_bound_refuses(self):
-        """A latch above the bound cannot fire before the bound is crossed."""
-        with self.assertRaises(hl.Weg2HostDeviationRefused) as cm:
-            _choose(deviation_reason="r", riegel_gib=99.0)
-        msg = str(cm.exception)
-        self.assertIn("--host-riegel-gib", msg)
-        self.assertIn("AT OR ABOVE the hard bound", msg)
+    def test_a_latch_above_the_hard_bound_takes_the_derivation(self):
+        """A latch above the bound cannot fire before the bound is crossed.
+        29.09. (27B z30y W97, memory.max 76): the latch is derived from the
+        mark (mark minus the measured margin); a fixed flag above it is
+        replaced by the derivation and named in one line instead of W97."""
+        arm, _h, lines = _choose(deviation_reason="r", riegel_gib=99.0)
+        rl = [ln for ln in lines if ln.startswith(hl.RIEGEL_MARKER)]
+        self.assertEqual(len(rl), 1, lines)
+        self.assertIn("--host-riegel-gib 99.00", rl[0])
+        self.assertLess(arm.riegel_effective, 99.0)
 
     def test_a_predicted_peak_at_or_above_the_reap_watermark_refuses(self):
         """The bound is soft; the WATERMARK is where the kernel reaped."""
