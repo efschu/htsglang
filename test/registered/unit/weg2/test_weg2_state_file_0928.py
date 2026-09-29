@@ -262,7 +262,52 @@ class TestLaunchSnapshot(_Base):
         sf.transition(d, "loading", fields={"groups.P": {"state": "loading", "launch": snap}}, writer="launcher")
         st = sf.read(d)
         self.assertEqual(st["schema"], sf.STATE_SCHEMA)
-        self.assertEqual(st["groups"]["P"]["launch"], {"argv": ["a", "--flag"], "env": {"SGLANG_X": "1"}})
+        self.assertEqual(st["groups"]["P"]["launch"],
+                         {"argv": ["a", "--flag"], "env": {"SGLANG_X": "1"}, "env_base": {}})
+
+
+class TestLaunchFrontAndContainer(_Base):
+    """Nutzer 29.09. (rigdash: „die kompletten startflags … inkl. aller ENV“): launch.front
+    schreibt der Launcher, launch.container der Host; die übrige Umgebung steht als
+    env_base daneben, Geheimnis-Werte maskiert."""
+
+    def test_env_base_keeps_the_rest_and_masks_secrets(self):
+        snap = sf.launch_snapshot(["x"], {"PATH": "/usr/bin", "CUDA_HOME": "/usr/local/cuda",
+                                          "HF_TOKEN": "hf_abc", "GITHUB_PAT": "ghp_x", "DB_PASSWORD": "pw",
+                                          "SGLANG_ADMIN_KEY": "geheim", "SGLANG_X": "1"})
+        self.assertEqual(snap["env"], {"CUDA_HOME": "/usr/local/cuda", "SGLANG_X": "1"})
+        self.assertEqual(snap["env_base"], {"DB_PASSWORD": "***", "GITHUB_PAT": "***", "HF_TOKEN": "***",
+                                            "PATH": "/usr/bin"})
+        self.assertNotIn("geheim", json.dumps(snap))
+        self.assertNotIn("hf_abc", json.dumps(snap))
+
+    def test_launcher_owns_launch_front_host_owns_launch_container(self):
+        d = self._boot()
+        sf.transition(d, None, fields={"launch.front": sf.launch_snapshot(["f"], {"SGLANG_F": "1"})},
+                      writer="launcher")
+        sf.transition(d, None, fields={"launch.container": {"image": "htsglang:rc", "rev": "abc"}}, writer="host")
+        st = sf.read(d)
+        self.assertEqual(st["launch"]["front"]["argv"], ["f"])
+        self.assertEqual(st["launch"]["container"], {"image": "htsglang:rc", "rev": "abc"})
+        with self.assertRaises(sf.StateFileError):
+            sf.transition(d, None, fields={"launch.container": {}}, writer="launcher")
+        with self.assertRaises(sf.StateFileError):
+            sf.transition(d, None, fields={"launch.front": {}}, writer="host")
+        with self.assertRaises(sf.StateFileError):
+            sf.transition(d, None, fields={"launch": {}}, writer="launcher")
+        with self.assertRaises(sf.StateFileError):
+            sf.transition(d, None, fields={"launchx": {}}, writer="launcher")
+
+    def test_front_launch_fields_redact_the_admin_key(self):
+        from sglang.srt.weg2 import launcher as L
+
+        f = L.front_launch_fields(["python", "-m", "sglang.srt.weg2.front", "--admin-api-key", "sekret"],
+                                  {"SGLANG_WEG2_FRONT_SPAN_INFLIGHT": "1", "PATH": "/bin"})
+        snap = f["launch.front"]
+        self.assertEqual(list(f), ["launch.front"])
+        self.assertNotIn("sekret", json.dumps(snap))
+        self.assertEqual(snap["env"], {"SGLANG_WEG2_FRONT_SPAN_INFLIGHT": "1"})
+        self.assertEqual(snap["env_base"], {"PATH": "/bin"})
 
 
 if __name__ == "__main__":
