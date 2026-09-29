@@ -94,6 +94,22 @@ def _1469_note(kind: str, _uncapped: bool = False, **kw) -> None:
         pass
 
 
+_NO_PROGRESS_N = 0
+
+
+def _mamba_evict_no_progress(request: int, freed: int) -> None:
+    """A full LRU round freed nothing (every leaf refused): the eviction ends
+    short instead of circling. Sampled: first 16, then every 256th."""
+    global _NO_PROGRESS_N
+    _NO_PROGRESS_N += 1
+    n = _NO_PROGRESS_N
+    if n <= 16 or n % 256 == 0:
+        logger.warning(
+            "MAMBA-EVICT NO-PROGRESS n=%d request=%d freed=%d: a whole LRU round "
+            "freed nothing (every device leaf refused its eviction) -- ending "
+            "short instead of restarting the walk", n, request, freed)
+
+
 class MambaLoadBackUnservable(Exception):
     """#968 FIX-4: the GDN half of a host load-back cannot be served.
 
@@ -933,6 +949,14 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
         lru = self.cache.lru_lists[ct]
         x = lru.get_lru_no_lock()
+        # M1s rc12z30j: the D-leaf branch restarts at the LRU end whenever its
+        # successor left the list -- and at the list head (get_prev -> None)
+        # too. With every leaf's backup refused nothing ever leaves the list,
+        # so the walk circled forever (TP1/TP2 01:04:50-01:07, 16189 refusals)
+        # while TP0 waited in the extend's all-reduce. A new round only runs
+        # if the last one freed something; otherwise the eviction ends short
+        # and the caller's under-delivery check names it.
+        round_mark = tracker[ct]
         while tracker[ct] < request and x is not None and lru.in_list(x):
             assert x.component_data[ct].value is not None
             # #1470b: the un-backed-skip tried here on weg2xsn228 crashed PP0
@@ -946,6 +970,11 @@ class MambaComponent(TreeComponent):
                 x_next = lru.get_prev_no_lock(x)
                 self.cache._evict_device_leaf(x, tracker)
                 if not lru.in_list(x_next):
+                    if x_next is None:
+                        if tracker[ct] == round_mark:
+                            _mamba_evict_no_progress(request, tracker[ct])
+                            break
+                        round_mark = tracker[ct]
                     x_next = lru.get_lru_no_lock()
                 x = x_next
             else:
