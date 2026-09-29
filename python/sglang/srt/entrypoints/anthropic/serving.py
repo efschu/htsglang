@@ -232,6 +232,21 @@ def _resumable_depth(openai_obj) -> Optional[int]:
     return getattr(ext, "weg2_resumable_depth", None) if ext is not None else None
 
 
+def _sglext_of(openai_obj) -> Optional[AnthropicSglExt]:
+    """The Anthropic ``sglext`` for an OpenAI response or stream chunk: #59's
+    resumable depth and, when the request asked, the cached-token tier split.
+    None when neither is set (the field is then absent, exclude_none)."""
+    depth = _resumable_depth(openai_obj)
+    ext = getattr(openai_obj, "sglext", None)
+    details = getattr(ext, "cached_tokens_details", None) if ext is not None else None
+    if depth is None and details is None:
+        return None
+    return AnthropicSglExt(
+        weg2_resumable_depth=depth,
+        cached_tokens_details=details.model_dump() if details is not None else None,
+    )
+
+
 def _resolve_stop_sequence(
     matched_stop: Any,
     stop_sequences: Optional[list[str]],
@@ -810,6 +825,8 @@ class AnthropicServing:
         # on every rank. Absent stays absent: the server then mints its own.
         if anthropic_request.rid is not None:
             request_data["rid"] = anthropic_request.rid
+        if anthropic_request.return_cached_tokens_details:
+            request_data["return_cached_tokens_details"] = True
 
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
@@ -1711,8 +1728,8 @@ class AnthropicServing:
                     yield frame
                 return
 
-            if _resumable_depth(chunk) is not None:
-                final_sglext = AnthropicSglExt(weg2_resumable_depth=_resumable_depth(chunk))
+            if _sglext_of(chunk) is not None:
+                final_sglext = _sglext_of(chunk)
 
             if chunk.usage is not None:
                 # ``include_input=True`` because message_start now ships
@@ -1997,11 +2014,7 @@ class AnthropicServing:
                 include_input=True,
                 include_output=True,
             ),
-            sglext=(
-                AnthropicSglExt(weg2_resumable_depth=_resumable_depth(response))
-                if _resumable_depth(response) is not None
-                else None
-            ),
+            sglext=_sglext_of(response),
         )
 
     def _convert_openai_error_response(self, response) -> JSONResponse:

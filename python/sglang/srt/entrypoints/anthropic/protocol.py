@@ -54,9 +54,15 @@ class AnthropicSglExt(BaseModel):
     OpenAI wire): only set fields are serialized (exclude_none).
 
     #59: ``weg2_resumable_depth`` -- the depth a Weg-2 D group can resume this
-    sequence from; the Weg-2 front caps its presence credit there."""
+    sequence from; the Weg-2 front caps its presence credit there.
+
+    ``cached_tokens_details`` -- the OpenAI wire's CachedTokensDetails
+    ({device, host[, storage, storage_backend]}), only when the request asked
+    for it (``return_cached_tokens_details``); the Weg-2 front counts the tier
+    of a served answer from it (RANKSTATS-S3 DASHBOARD-GRAFIKEN Feld 2)."""
 
     weg2_resumable_depth: Optional[NonNegativeInt] = None
+    cached_tokens_details: Optional[dict[str, Any]] = None
 
 
 # ---------- Content blocks (discriminated by ``type``) ----------
@@ -484,6 +490,11 @@ class AnthropicMessagesRequest(BaseModel):
     #: under a fresh uuid, the abort matched nothing, and PP1/PP2 kept it in
     #: their waiting queues -> W3 at the next flip.
     rid: Optional[str] = None
+    #: RANKSTATS-S3 DASHBOARD-GRAFIKEN Feld 2: as on ``/v1/chat/completions``,
+    #: the caller asks for the cached-token tier split (answered in
+    #: ``sglext.cached_tokens_details``). Declared for the reason ``rid`` is:
+    #: undeclared, ``extra="ignore"`` would drop it silently.
+    return_cached_tokens_details: Optional[bool] = None
 
     @field_validator("model")
     @classmethod
