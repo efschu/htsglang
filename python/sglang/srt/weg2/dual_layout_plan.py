@@ -133,6 +133,10 @@ class DualLayout:
     draft: Optional[Tuple[float, ...]] = None
     draft_stage: Optional[int] = -1  # -1 = last stage, None = P holds no draft
     vision_in_p: bool = True
+    #: D keeps the input embedding WHOLE on every rank (27B NVFP4: the
+    #: launcher's own D model prices embed 2425 MiB per rank). Then P's
+    #: stage-0 embed is shared in full, not by D's vocab share.
+    d_embed_replicated: bool = False
 
     def validate(self, model: ModelBytes) -> None:
         n = len(self.d_card)
@@ -213,7 +217,8 @@ def plan(model: ModelBytes, lay: DualLayout, capacity: Mapping[int, int],
         lo, hi = lay.stage_range(s)
         # D's shard on this card.
         d_layers = sum(l.mixer * mixer[r] + l.mlp * mlp[r] + l.rep for l in model.layers)
-        d_total = d_layers + (model.embed + model.lm_head) * vocab[r] + model.draft * draft_sh[r]
+        d_embed = model.embed if lay.d_embed_replicated else model.embed * vocab[r]
+        d_total = d_layers + d_embed + model.lm_head * vocab[r] + model.draft * draft_sh[r]
         # P's stage on this card.
         p_layers = sum(l.total for l in model.layers[lo:hi])
         p_total = p_layers
@@ -223,7 +228,7 @@ def plan(model: ModelBytes, lay: DualLayout, capacity: Mapping[int, int],
         p_total += model.vision if (lay.vision_in_p and s == 0) else 0
         # SHARED: D's shard of exactly the tensors P also holds here.
         shared = sum(l.mixer * mixer[r] + l.mlp * mlp[r] + l.rep for l in model.layers[lo:hi])
-        shared += model.embed * vocab[r] if s == 0 else 0
+        shared += d_embed if s == 0 else 0
         shared += model.lm_head * vocab[r] if s == last else 0
         shared += model.draft * draft_sh[r] if draft_stage == s else 0
         rows.append(CardPlan(
@@ -247,6 +252,7 @@ def check_physics(rows: Sequence[CardPlan], model: ModelBytes, lay: DualLayout) 
         bad.append(f"P stages hold {tot_p} B, the model has {want_p} B")
     tot_d = sum(r.d_total for r in rows)
     rep = sum(l.rep for l in model.layers) * (len(rows) - 1)
+    rep += model.embed * (len(rows) - 1) if lay.d_embed_replicated else 0
     want_d = model.layer_total + model.embed + model.lm_head + model.draft + rep
     if abs(tot_d - want_d) > len(rows):
         bad.append(f"D shards hold {tot_d} B, the model (+replicas) has {want_d} B")

@@ -125,3 +125,20 @@ class TestDualLayoutPlan(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReplicatedEmbed(unittest.TestCase):
+    def test_replicated_embed_is_shared_whole_on_stage0(self):
+        m = _model()
+        a = {r.card: r for r in dp.plan(m, _lay(), CAP, OV)}
+        b_lay = _lay(d_embed_replicated=True)
+        rows = dp.plan(m, b_lay, CAP, OV)
+        self.assertEqual(dp.check_physics(rows, m, b_lay), [])
+        b = {r.card: r for r in rows}
+        # stage 0 lives on card 0: shared grows by the rest of the embed, P's diff shrinks by it
+        grow = m.embed - m.embed * VR[0] / sum(VR)
+        self.assertAlmostEqual(b[0].shared - a[0].shared, grow, delta=2)
+        self.assertAlmostEqual(a[0].pp_only - b[0].pp_only, grow, delta=2)
+        # every D rank holds the whole embed
+        for c in CAP:
+            self.assertGreater(b[c].d_total, a[c].d_total - 1)
