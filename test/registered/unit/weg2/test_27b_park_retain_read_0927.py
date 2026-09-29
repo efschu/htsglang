@@ -333,3 +333,53 @@ def test_wiring_park_running_clears_then_stamps():
     retract = src.index("sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True)")
     stamp = src.index("d_park_read.stamp_parked(req)")
     assert clear < retract < stamp
+
+
+# -- PARK-READ = RESUMABLE (29.09., 27B z30j weg2-154-176) ---------------------
+# retained=72271 of 72272 (tombstoned KV above the anchor), PARK-RESUMABLE 72191,
+# store held 72191 -> INCOMPLETE shortfall=79 -> DEFERRED store_prefix_short ->
+# HOLD-REFETCH -> vote_negative -> DEFER-FALLBACK, every park-resume.
+
+
+def test_the_cap_drops_to_the_resumable_depth_bigram_and_plain():
+    for bigram, want in ((True, 72192), (False, 72191)):
+        r = _req(ntok=72272, prompt=71000)
+        setattr(r, pr.RETAINED_ATTR, 72271)
+        assert pr.stamp_parked(r) == 72271
+        assert pr.clamp_to_resumable(r, 72191, is_bigram=bigram) == want
+        assert pr.read_cap(r) == want and pr.park_match_end(r, 72271) == want
+        assert "tail %d" % (72272 - want) in pr.describe(r)
+
+
+def test_the_clamp_never_widens_and_keeps_the_cap_on_an_unpriced_depth(monkeypatch):
+    r = _req(ntok=72272, prompt=71000)
+    setattr(r, pr.RETAINED_ATTR, 72192)
+    pr.stamp_parked(r)
+    assert pr.clamp_to_resumable(r, 72191, is_bigram=True) is None  # on the anchor already
+    assert pr.clamp_to_resumable(r, 72300, is_bigram=False) is None  # never widens
+    assert pr.clamp_to_resumable(r, 0, is_bigram=True) is None  # 0 = the probe could not price
+    assert pr.clamp_to_resumable(r, None, is_bigram=True) is None
+    assert pr.read_cap(r) == 72192
+    monkeypatch.setenv(pr.ENV, "0")
+    assert pr.clamp_to_resumable(r, 100, is_bigram=True) is None
+    monkeypatch.delenv(pr.ENV)
+    plain = _req()
+    assert pr.clamp_to_resumable(plain, 100, is_bigram=True) is None  # no park stamp
+
+
+def test_park_running_reads_only_what_the_resume_can_take(monkeypatch, caplog):
+    from sglang.srt.managers import weg2_resumable_depth as wrd
+
+    a = _req(ntok=72272, prompt=71000)
+    a.rid = "weg2-154-176"
+    a.kv_arrival_seq, a.is_fast_lane, a.spill_class = 1, False, None
+    s = _Sched([a], {"weg2-154-176": 72271})
+    s.ps = types.SimpleNamespace(tp_size=3, attn_tp_rank=0)
+    s.tree_cache = types.SimpleNamespace(is_eagle=True)
+    monkeypatch.setattr(wrd, "park_depths", lambda tree, reqs, ps, **_k: {str(r.rid): 72191 for r in reqs})
+    with caplog.at_level("INFO", logger=rt.logger.name):
+        out = _park(s)
+    assert out.success and out.weg2_resumable_depth == {"weg2-154-176": 72191}
+    assert pr.read_cap(a) == 72192 and pr.park_match_end(a, 72271) == 72192
+    assert any("READ=RESUMABLE rid=weg2-154-176 cap 72271 -> retained=72192 of 72272" in m
+               for m in caplog.messages)

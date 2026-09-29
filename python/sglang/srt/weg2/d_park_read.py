@@ -102,6 +102,41 @@ def stamp_parked(req) -> Optional[int]:
     return retained
 
 
+def clamp_to_resumable(req, depth, *, is_bigram: bool) -> Optional[int]:
+    """PARK-READ = RESUMABLE (29.09., 27B z30j weg2-154-176 00:51:55): lower
+    the park's cap to the depth the resume can take (``#59b`` park depth, the
+    group-uniform admission probe). Returns the new cap, None = unchanged.
+
+    The retaining insert keeps the full-attention KV at full length and puts a
+    mamba TOMBSTONE above the last track point (#783/#1012: an off-grid end
+    declines the anchor, not the length) -- ``retained=72271 of 72272``. But no
+    admission resumes above the anchor, and the #248 park mark keeps only the
+    resumable chain (``PARK-MARK pages=72191``), so the store never holds the
+    79 units in between. A cap at the retained span therefore asked for bytes
+    that do not exist: every such resume ran ``prefetch INCOMPLETE shortfall=79``
+    -> ``#1068 DEFERRED store_prefix_short`` -> ``#1456 HOLD-REFETCH`` ->
+    ``vote_negative`` -> ``PREFETCH-DEFER-FALLBACK`` before it took 72191 and
+    extended the tail anyway. At the resumable depth the read lands COMPLETE on
+    the first pass; the tail extend is the same (without a recurrent state
+    above the anchor the tail is computed either way -- the #747 grid)."""
+    cap = getattr(req, CAP_ATTR, None)
+    if not cap or not enabled() or depth is None:
+        return None
+    retained, ntok = cap
+    try:
+        depth = int(depth)
+    except (TypeError, ValueError):
+        return None
+    if depth <= 0:
+        return None  # 0 is also the probe's "cannot price" -- keep the retained cap
+    # the depth counts key units; a bigram key of N units spans N + 1 raw tokens
+    raw = depth + 1 if is_bigram else depth
+    if raw >= int(retained):
+        return None
+    setattr(req, CAP_ATTR, (raw, int(ntok)))
+    return raw
+
+
 def read_cap(req) -> Optional[int]:
     """The park's cap while it applies: the request has not grown since the
     park (a resumed request that decoded is past it; its next park restamps)."""

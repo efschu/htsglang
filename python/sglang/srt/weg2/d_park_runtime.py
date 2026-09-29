@@ -235,6 +235,18 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         [r for r in sched.weg2_d_parked if d_seats.park_site(r) is not None],
         getattr(sched, "ps", None),
     )
+    # PARK-READ = RESUMABLE: the read of a request this park retracted ends at
+    # the depth it resumes from, not at the tombstoned KV above the anchor
+    # (d_park_read.clamp_to_resumable). Group-uniform: #59b's depths are.
+    if resumable:
+        bigram = bool(getattr(getattr(sched, "tree_cache", None), "is_eagle", False))
+        for req in retracted:
+            before = d_park_read.read_cap(req)
+            if d_park_read.clamp_to_resumable(
+                req, resumable.get(str(req.rid)), is_bigram=bigram
+            ) is not None:
+                logger.info("WEG2-D-PARK READ=RESUMABLE rid=%s cap %s -> %s",
+                            str(req.rid)[:12], before, d_park_read.describe(req))
     logger.info(
         "WEG2-D-PARK park_running epoch=%d reason=%s: %d running retracted (span retained, "
         "forced host write-through), parked=%s queued-behind=%s settle-folded=%s late_hold=%s -- "
