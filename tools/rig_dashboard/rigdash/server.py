@@ -5,6 +5,8 @@ Routes
   GET /api/live       one JSON snapshot: boots (from their logs), GPUs,
                       containers, gpuq plan, every source's age and error,
                       the running image's changes per seat (image_changes.json)
+  GET /api/launch     Startflags + ENV je Modell (Container/Front/P/D) aus state.json,
+                      P<->D-Vergleich; ?ver=<ver> antwortet {same: true}, solange gleich
   GET /api/health     liveness of the dashboard itself
 """
 
@@ -20,7 +22,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import energy, features, health, imagechanges, live, redact, sources, weg2line
+from . import energy, features, health, imagechanges, launchview, live, redact, sources, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -287,6 +289,14 @@ def make_handler(app: App):
                         return self._send(200, fh.read(), "text/html; charset=utf-8")
                 if path.startswith("/api/weg2/"):
                     return self._weg2(path)
+                if path == "/api/launch":
+                    # Startflags + ENV je Modell aus state.json (launchview); ?ver= spart den Körper,
+                    # solange sich das Gezeigte nicht geändert hat
+                    from urllib.parse import parse_qs, urlsplit
+
+                    have = (parse_qs(urlsplit(self.path).query).get("ver") or [""])[0]
+                    snap = launchview.snapshot()
+                    return self._json({"ver": snap["ver"], "same": True} if have == snap["ver"] else snap)
                 if path == "/api/health":
                     return self._json({"ok": True, "version": app.version,
                                        "uptime_s": round(time.time() - app.t0, 1)})

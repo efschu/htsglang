@@ -54,6 +54,29 @@ main { padding: 12px 16px 40px; max-width: 1500px; margin: 0 auto; }
 html, body { overflow-anchor: none; }
 header .livebox { font-size: 13px; color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; }
 header .livebox .note { display: inline-block; min-width: 17em; color: var(--warn); }
+/* Startflags (Nutzer 29.09.): eingeklappt, Tabellen umbrechen statt seitlich zu scrollen */
+.lf-tools { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin: 2px 0 8px; font-size: 12px; }
+.lf-tools input[type=search] { flex: 1 1 220px; max-width: 420px; padding: 4px 8px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--surface); color: var(--text); font: inherit; }
+.lf-legend span { display: inline-block; padding: 0 6px; border-radius: 4px; margin-right: 4px; }
+details.lf { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; margin: 6px 0; background: var(--surface); }
+details.lf > summary { cursor: pointer; font-size: 13px; }
+details.lf details { margin: 6px 0 6px 4px; }
+details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--text-2); }
+.lf .kopf { color: var(--text-2); font-size: 12px; }
+.lf .kopf b { color: var(--text); font-weight: 600; }
+.lf table.lft { table-layout: fixed; width: 100%; font-size: 12px; margin: 4px 0 8px; }
+.lf table.lft td, .lf table.lft th { overflow-wrap: anywhere; word-break: break-word; vertical-align: top; padding: 2px 6px; text-align: left; }
+.lf table.lft th { color: var(--text-2); font-weight: 600; }
+.lf table.lft col.k { width: 34%; } .lf table.lft.three col.k { width: 28%; }
+.lf table.lft tr.grp td { color: var(--muted); font-size: 11px; padding-top: 6px; border-bottom: 1px solid var(--line); }
+.lf pre.json { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+.lf .d-differ { background: color-mix(in srgb, var(--warn) 16%, transparent); }
+.lf .d-onlyp { background: color-mix(in srgb, var(--s1) 14%, transparent); }
+.lf .d-onlyd { background: color-mix(in srgb, var(--s2) 14%, transparent); }
+.lf button.copy { font: inherit; font-size: 11px; padding: 1px 8px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--surface-2); color: var(--text); cursor: pointer; }
+.lf .miss { color: var(--warn); font-size: 12px; }
 .cardstrip { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 6px; margin: -4px 0 12px; }
 .cardstrip > div { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
 .cardstrip b { font-size: 13px; }
@@ -229,6 +252,15 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
 <main>
   <div class="chips" id="chips"></div>
   <div class="cardstrip" id="cardstrip"></div>
+  <section class="card" id="launch-card">
+    <h2>Startflags &amp; ENV <span class="muted">je Modell, laufender bzw. letzter Boot &middot; Container / Front / P / D &middot; P&harr;D-Vergleich</span><span class="ipcsrc" title="state.json: groups.{P,D}.launch, launch.front, launch.container">state.json</span></h2>
+    <div class="lf-tools">
+      <input type="search" id="lf-filter" placeholder="Filter über alle Flags und ENV (Name oder Wert)" autocomplete="off">
+      <span class="lf-legend lf"><span class="d-differ">P&ne;D</span><span class="d-onlyp">nur P</span><span class="d-onlyd">nur D</span></span>
+      <span class="muted" id="lf-note"></span>
+    </div>
+    <div id="launchbox"></div>
+  </section>
   <div id="boots"></div>
   <section class="card" id="prod-card">
     <h2>Features Soll/Ist <span class="muted">Produkt-Features je Modell: Soll (messbar) &middot; Ist nur mit Beleg, sonst &bdquo;unbelegt&ldquo; &middot; <span class="stale-key">gelb</span> = Beleg &auml;lter als der letzte Boot des Modells, neu messen &middot; Wert im aktuellen Boot aus live.py/state.json &middot; Bausteine = Commits/Fixes darunter</span></h2>
@@ -1083,6 +1115,139 @@ function pauseReason() {
   return left > 0 ? `pausiert beim Lesen, noch ${Math.ceil(left / 1000)} s` : "";
 }
 
+// ---------------------------------------------------------------- Startflags (launchview.py)
+// Nur neu zeichnen, wenn sich ver (Digest des Gezeigten) ändert; Auf/Zu je <details> in localStorage.
+const LF_KEY = "rigdash.launch.open";
+let lfOpen = new Set(), lfVer = "", lfData = null, lfInflight = false;
+const lfAutoIds = new Set();   // vom Filter aufgeklappt: zählt nicht als Leser-Zustand
+try { lfOpen = new Set(JSON.parse(localStorage.getItem(LF_KEY) || "[]")); } catch (e) { lfOpen = new Set(); }
+function lfSaveOpen() { try { localStorage.setItem(LF_KEY, JSON.stringify([...lfOpen])); } catch (e) { /* private window */ } }
+const lfId = (...p) => "lf-" + p.join("-").replace(/[^A-Za-z0-9_-]/g, "_");
+function lfDet(id, summary, body, extra) {
+  return `<details id="${id}"${lfOpen.has(id) ? " open" : ""}${extra || ""}><summary>${summary}</summary>${body}</details>`;
+}
+function lfVal(v, js) {
+  if (js) return `<pre class="json mono">${esc(js)}</pre>`;
+  return v == null ? `<span class="muted">(Schalter)</span>` : `<span class="mono">${esc(v)}</span>`;
+}
+function lfKv(rows, cls) {
+  return rows.map(([k, v]) => `<tr class="lfr ${cls || ""}"><td class="mono">${esc(k)}</td><td class="mono">${esc(v)}</td></tr>`).join("");
+}
+function lfTable(head, body, three) {
+  return `<table class="lft${three ? " three" : ""}"><colgroup><col class="k"><col>${three ? "<col>" : ""}</colgroup>`
+    + `<tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr>${body}</table>`;
+}
+function lfLayer(m, name, L) {
+  const id = lfId(m.model, name);
+  if (!L) return "";
+  const copy = `<div style="margin:4px 0"><button class="copy" data-copy="${id}|argv">argv kopieren</button> <button class="copy" data-copy="${id}|env">ENV kopieren</button>`
+    + (L.cmd ? ` <span class="muted mono" style="font-size:11px">${esc(L.cmd)}</span>` : "") + `</div>`;
+  let flags = "";
+  if (L.meta) {
+    flags = lfTable(["Feld", "Wert"], lfKv(L.meta))
+      + (L.mounts && L.mounts.length ? lfTable(["Quelle", "Ziel &middot; Modus"], L.mounts.map(([s, d, mo, ty]) =>
+        `<tr class="lfr"><td class="mono">${esc(s)}</td><td class="mono">${esc(d)} ${esc(mo)} ${esc(ty)}</td></tr>`).join("")) : "");
+  } else {
+    flags = lfTable(["Flag", "Wert"], L.flags.map((g) => `<tr class="grp"><td colspan="2">${esc(g.group)} (${g.rows.length})</td></tr>`
+      + g.rows.map((f) => `<tr class="lfr"><td class="mono">${esc(f.flag)}</td><td>${lfVal(f.value, f.json)}</td></tr>`).join("")).join(""));
+  }
+  const envSet = L.env_set.length ? lfTable(["ENV gesetzt", "Wert"], lfKv(L.env_set)) : `<div class="muted">keine gesetzte ENV</div>`;
+  const envBase = L.env_base.length ? lfDet(id + "-base", `Basis/Image (${L.env_base.length})`, lfTable(["ENV Basis/Image", "Wert"], lfKv(L.env_base)))
+    : (L.has_env_base === false ? `<div class="muted" style="font-size:12px">Basis/Image-ENV: vom Launcher dieses Images noch nicht geschrieben (env_base ab 814c6657bb)</div>` : "");
+  const label = {container: "Container", front: "Front", P: "P", D: "D"}[name];
+  return lfDet(id, `<b>${label}</b> <span class="muted">&middot; ${L.meta ? `${L.meta.length} Felder, ${L.mounts.length} Mounts` : `${L.n_flags} Flags`} &middot; ${L.n_env} ENV gesetzt${L.n_env_base ? ` &middot; ${L.n_env_base} Basis` : ""}</span>`,
+    copy + flags + envSet + envBase);
+}
+function lfDiffRows(d) {
+  return d.differ.map(([k, a, b]) => `<tr class="lfr d-differ"><td class="mono">${esc(k)}</td><td class="mono">${esc(a)}</td><td class="mono">${esc(b)}</td></tr>`).join("")
+    + d.only_a.map(([k, a]) => `<tr class="lfr d-onlyp"><td class="mono">${esc(k)}</td><td class="mono">${esc(a)}</td><td class="muted">&ndash;</td></tr>`).join("")
+    + d.only_b.map(([k, b]) => `<tr class="lfr d-onlyd"><td class="mono">${esc(k)}</td><td class="muted">&ndash;</td><td class="mono">${esc(b)}</td></tr>`).join("");
+}
+function lfPd(m) {
+  const pd = m.pd;
+  if (!pd) return "";
+  const id = lfId(m.model, "pd");
+  const part = (what, d) => `<div style="margin-top:4px"><b style="font-size:12px">${what}</b> <span class="muted" style="font-size:12px">${d.differ.length} verschieden &middot; ${d.only_a.length} nur P &middot; ${d.only_b.length} nur D &middot; ${d.same.length} gleich</span></div>`
+    + lfTable([what === "Flags" ? "Flag" : "ENV", "P", "D"], lfDiffRows(d), true)
+    + lfDet(id + "-" + what + "-same", `gemeinsam (${d.same.length})`, lfTable([what === "Flags" ? "Flag" : "ENV", "Wert (P = D)"], lfKv(d.same)));
+  return lfDet(id, `<b>Vergleich P &harr; D</b> <span class="muted">&middot; Flags ${pd.flags.differ.length} verschieden, ${pd.flags.only_a.length}/${pd.flags.only_b.length} nur P/D &middot; ENV ${pd.env.differ.length} verschieden, ${pd.env.only_a.length}/${pd.env.only_b.length} nur P/D</span>`,
+    part("Flags", pd.flags) + part("ENV", pd.env));
+}
+function lfModel(m) {
+  const id = lfId(m.model);
+  if (!m.boot_id) return lfDet(id, `<b>${esc(m.model)}</b> <span class="muted">&middot; kein Boot mit state.json gefunden</span>`, "", ` class="lf"`);
+  const cnt = ["P", "D", "front"].filter((g) => m.counts[g]).map((g) => `${g} ${m.counts[g].flags}/${m.counts[g].env}`).join(" &middot; ");
+  const kopf = `<b>${esc(m.model)}</b> <span class="kopf">&middot; <b>${esc(m.lifecycle || "?")}</b> &middot; Tag ${esc(m.tag || "?")} &middot; Image <b>${esc(m.image || "?")}</b> &middot; REV <b class="mono">${esc((m.rev || "?").slice(0, 10))}</b> &middot; Profil ${esc(m.profile || "?")} &middot; Flags/ENV ${cnt}</span>`;
+  const miss = m.missing.filter((k) => k === "container" || k === "front");
+  const note = miss.length ? `<div class="miss">fehlt im state.json dieses Boots: ${miss.map((k) => k === "front" ? "launch.front (Launcher ab 814c6657bb)" : "launch.container (Host-Teil, 27B)").join(", ")}</div>` : "";
+  return lfDet(id, kopf, note + `<div class="muted mono" style="font-size:11px">${esc(m.boot_id)}</div>` + lfPd(m)
+    + ["container", "front", "P", "D"].map((k) => lfLayer(m, k, m.layers[k])).join(""), ` class="lf"`);
+}
+function lfApplyFilter() {
+  const q = ($("lf-filter").value || "").trim().toLowerCase();
+  const box = $("launchbox");
+  let hits = 0;
+  box.querySelectorAll("tr.lfr").forEach((tr) => {
+    const on = !q || tr.textContent.toLowerCase().includes(q);
+    tr.hidden = !on;
+    if (q && on) hits++;
+  });
+  box.querySelectorAll("tr.grp").forEach((tr) => {
+    let n = tr.nextElementSibling, any = false;
+    for (; n && !n.classList.contains("grp"); n = n.nextElementSibling) if (!n.hidden) { any = true; break; }
+    tr.hidden = !!q && !any;
+  });
+  if (q) {                                  // Treffer sichtbar machen, ohne den gespeicherten Zustand zu ändern
+    box.querySelectorAll("details").forEach((d) => {
+      if (!d.open && [...d.querySelectorAll("tr.lfr")].some((tr) => !tr.hidden)) { lfAutoIds.add(d.id); d.open = true; }
+    });
+  }
+  $("lf-note").textContent = q ? `${hits} Treffer` : "";
+}
+function lfRender(d) {
+  const anchor = readAnchor();
+  morph($("launchbox"), d.models.map(lfModel).join(""));
+  lfApplyFilter();
+  holdAnchor(anchor);
+}
+async function refreshLaunch() {
+  if (lfInflight || pauseReason()) return;
+  lfInflight = true;
+  try {
+    const r = await fetch("api/launch?ver=" + encodeURIComponent(lfVer), {cache: "no-store"});
+    const d = await r.json();
+    if (d.same || !d.models) return;
+    lfVer = d.ver; lfData = d;
+    lfRender(d);
+  } catch (e) {
+    $("lf-note").textContent = `api/launch nicht erreichbar: ${e}`;
+  } finally {
+    lfInflight = false;
+  }
+}
+$("launchbox").addEventListener("toggle", (e) => {
+  const d = e.target;
+  if (!d.id || (d.open && lfAutoIds.delete(d.id))) return;
+  if (d.open) lfOpen.add(d.id); else lfOpen.delete(d.id);
+  lfSaveOpen();
+}, true);
+$("launchbox").addEventListener("click", async (e) => {
+  const b = e.target.closest("button.copy");
+  if (!b || !lfData) return;
+  const [id, what] = b.dataset.copy.split("|");
+  const m = lfData.models.find((x) => id.startsWith(lfId(x.model) + "-"));
+  const L = m && m.layers[id.slice(lfId(m.model).length + 1)];
+  const text = L ? (what === "argv" ? L.argv_raw : L.env_raw) : "";
+  try { await navigator.clipboard.writeText(text); b.textContent = "kopiert"; }
+  catch (err) {                              // http ohne Clipboard-API: Auswahl-Fallback
+    const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); b.textContent = "kopiert"; } catch (e2) { b.textContent = "nicht kopiert"; }
+    ta.remove();
+  }
+  setTimeout(() => { b.textContent = what === "argv" ? "argv kopieren" : "ENV kopieren"; }, 1500);
+});
+$("lf-filter").addEventListener("input", lfApplyFilter);
+
 let failures = 0, inflight = false;
 async function refresh(force) {
   const why = force ? "" : pauseReason();
@@ -1151,6 +1316,8 @@ $("live-pause").addEventListener("change", (e) => {
 });
 refresh(true);
 setInterval(() => refresh(), 2000);
+refreshLaunch();
+setInterval(() => refreshLaunch(), 15000);
 </script>
 </body>
 </html>
