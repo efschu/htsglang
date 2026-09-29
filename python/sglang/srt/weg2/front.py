@@ -6099,6 +6099,8 @@ class Front:
                         free_gib=_free,
                         ceiling_gib=_ceiling,
                         free_source=_free_src,
+                        # W98 dmatrix: the arena is a writer with a known end
+                        bounded_shm=host_ledger.arena_fill_gib(self.tag),
                     )
                     if _line is not None and "RATE-GAP" in _line:
                         # Blindness is a finding, never silence -- but it is not
