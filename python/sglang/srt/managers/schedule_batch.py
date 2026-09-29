@@ -118,6 +118,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.thinking_budget import THINKING_BUDGET_INTERNAL_KEY
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list
+from sglang.srt.weg2 import turn_anchor as _weg2_turn
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
@@ -3355,6 +3356,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    # TURN ANCHOR (weg2/turn_anchor.py): this extend's second tracks, or None
+    weg2_turn_tracks: Optional[Any] = None
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
@@ -3832,6 +3835,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
+        # TURN ANCHOR: the token id when armed on this process, else None
+        _turn_tok = (
+            _weg2_turn.armed(server_args)
+            if server_args.enable_mamba_extra_buffer()
+            else None
+        )
+        _turn_desc = None
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             assert seq_len - pre_len == req.extend_range.length
@@ -3991,6 +4001,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_indices_cpu.append(track_entry.track_index)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
+                if _turn_tok is not None:
+                    # TURN ANCHOR: a second track where the prompt's last
+                    # message starts, when this step holds it (weg2/turn_anchor.py)
+                    _turn_desc = _weg2_turn.note_step(
+                        batch=self,
+                        desc=_turn_desc,
+                        req=req,
+                        row=i,
+                        prefix=pre_len,
+                        end=seq_len,
+                        track_mask=bool(track_entry.track_mask),
+                        main_track=req.mamba_last_track_seqlen,
+                        chunk=server_args.mamba_cache_chunk_size,
+                        page=self.token_to_kv_pool_allocator.page_size,
+                        tok=_turn_tok,
+                    )
 
             if self.return_logprob:
                 # Find input logprob token ids.
@@ -4107,6 +4133,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.int64,
                 device=self.device,
             )
+            self.weg2_turn_tracks = _turn_desc
 
         if _pp is not None:
             _pp.mark("reqs")
@@ -4999,6 +5026,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.weg2_turn_tracks = None
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
@@ -5100,6 +5128,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.weg2_turn_tracks = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
@@ -5196,6 +5225,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            weg2_turn_tracks=self.weg2_turn_tracks,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,

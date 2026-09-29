@@ -105,6 +105,7 @@ from sglang.srt.mem_cache.producer_phase_census import (
 )
 from sglang.srt.mem_cache.mamba_ckpt_utils import weg2_max_states_per_path
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.weg2.turn_anchor import PENDING_ATTR as _TURN_PENDING_ATTR
 
 
 def bigram_anchor_key(token_ids, cache_len: int, extra_key, *, is_bigram: bool,
@@ -2591,6 +2592,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # without waiting: only copies whose events are complete are
             # retired (writing_check's non-blocking branch, Event.query()).
             self.writing_check()
+        # TURN ANCHOR (weg2/turn_anchor.py): the step's second track goes in
+        # first, as its own node below the finish insert. Asked only when a
+        # plan is pending: unarmed, the finish path is the stock one byte for
+        # byte (the h63c/h63d harnesses bind this method alone).
+        if getattr(req, _TURN_PENDING_ATTR, None) is not None:
+            self._weg2_turn_insert(req, is_insert=is_insert)
 
         kv_committed_len = req.pop_committed_kv_cache()
         # #969L: THE VALUE AT THE PARK INSERT. §S proved this insert IS reached
@@ -2769,6 +2776,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
+        # TURN ANCHOR (weg2/turn_anchor.py): the step's second track goes in
+        # first, as its own node below this chunk's insert (only with a plan
+        # pending; unarmed nothing is asked)
+        if getattr(req, _TURN_PENDING_ATTR, None) is not None:
+            self._weg2_turn_insert(req)
 
         token_ids = req.get_fill_ids()
 
@@ -2948,6 +2960,108 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._weg2_defer_chunk_publish(req, radix_key)
         else:
             self._weg2_publish_at_chunk(req, radix_key)   # xsn346: the chunk's node goes out now
+
+    def _weg2_turn_insert(self, req: Req, is_insert: bool = True) -> None:
+        """TURN ANCHOR (weg2/turn_anchor.py): insert the state the step's
+        second track wrote at ``t`` (the start of the prompt's last message) as
+        the request's anchor node ``key[:t]``, before the step's own insert.
+
+        The same sequence as ``cache_unfinished_req`` for a chunk ending at t,
+        with the tracked slot as the mamba value: insert, re-match, rewrite the
+        request's rows to the tree's, move the lock, settle the #811 pin (the
+        step's own insert right after publishes the chain). A plan the forward did not fully write (a missing
+        GDN/PLE mark), a skipped insert, or a protected prefix already at t
+        frees the slot and inserts nothing. Unarmed: no pending plan, a no-op.
+        """
+        from sglang.srt.weg2 import turn_anchor as _ta
+
+        pend = _ta.pop_pending(req)
+        if pend is None:
+            return
+        t, slot, _desc, step_start, step_end = pend
+        ok, why = _ta.insert_verdict(pend)
+        if ok and (not is_insert or self.disable):
+            ok, why = False, "no_insert"
+        if ok and int(req.cache_protected_len or 0) >= t:
+            ok, why = False, "protected"
+        radix_key = None
+        if ok:
+            radix_key = bigram_anchor_key(
+                bigram_anchor_ids(req.origin_input_ids[:t], req.full_untruncated_fill_ids),
+                t, req.extra_key,
+                is_bigram=self.is_eagle, exact=self.bigram_anchor_exact,
+                page_size=self.page_size,
+            )
+            if len(radix_key) != t:
+                ok, why = False, "key_len"
+        if not ok:
+            self._weg2_turn_free(slot)
+            _ta.note_skip(req, why, t)
+            return
+        # #811: the old anchor's pin may already be gone (released at its ack);
+        # its MAMBA half is then not decremented again below.
+        mamba_anchor_released = bool(
+            self._anchor_ack_release_armed and req.mamba_anchor_pin_released
+        )
+        kv_step = self.req_to_token_pool.req_to_token[req.req_pool_idx, :step_end]
+        insert_params = InsertParams(
+            prev_prefix_len=req.cache_protected_len,
+            chunked=True,
+            priority=req.priority or 0,
+        )
+        insert_params.key = radix_key
+        insert_params.value = kv_step[:t].to(dtype=torch.int64, copy=True)
+        insert_params.mamba_value = slot
+        self._weg2_cap_tail = None
+        result = self.insert(insert_params)
+
+        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        new_indices = match_result.device_indices
+        new_last_node = match_result.last_device_node
+        assert req.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+            f"TURN ANCHOR: {req.cache_protected_len=}, {len(new_indices)=}, {t=}"
+        )
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
+            new_indices[req.cache_protected_len :],
+        )
+        dec_params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
+        if mamba_anchor_released:
+            dec_params.skip_lock_node_ids.setdefault(ComponentType.MAMBA, set()).add(
+                req.last_node.id
+            )
+        self.dec_lock_ref(req.last_node, dec_params)
+        lock_result = self.inc_lock_ref(new_last_node)
+        if len(new_indices) < len(kv_step):
+            req.prefix_indices = torch.cat([new_indices, kv_step[len(new_indices) :]])
+        else:
+            req.prefix_indices = new_indices
+        req.cache_protected_len = len(new_indices)
+        req.last_node = new_last_node
+        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        self.note_anchor_pin(req, lock_result, settle=True)
+
+        taken = result is not None and not result.mamba_exist
+        if not taken:
+            self._weg2_turn_free(slot)
+        self._weg2_cap_after_insert()
+        # No publish of its own: the step's insert follows in this same call
+        # and publishes the request's chain parents-first (chunk publish /
+        # retain), this node included -- one sweep, not two (~20 ms each of
+        # scheduler-thread wall between forwards, WEG2-PUBLISH-REQ).
+        _ta.note_insert(
+            req, t=t, prefix_len=len(new_indices), taken=taken,
+            prompt=len(req.origin_input_ids), step=(step_start, step_end),
+        )
+
+    def _weg2_turn_free(self, slot) -> None:
+        """Give an unused turn slot back (through the component's free, so
+        the #1469 provenance sees it)."""
+        comp = self.components.get(ComponentType.MAMBA)
+        if comp is not None:
+            comp._free_mamba_value(slot)
+        else:
+            self.req_to_token_pool.mamba_allocator.free(slot)
 
     def _weg2_defer_chunk_publish(self, req, radix_key) -> None:
         pend = getattr(self, "_weg2_deferred_chunk_publish", None)

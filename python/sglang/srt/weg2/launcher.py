@@ -16295,6 +16295,17 @@ def fork_anchor_env(token: Optional[int], p_trim: bool) -> Dict[str, str]:
     return {_fa.TOKEN_ENV: str(int(token))}
 
 
+def turn_anchor_env(token: Optional[int]) -> Dict[str, str]:
+    """``--turn-anchor-token``: group P's environment for the TURN ANCHOR
+    (weg2/turn_anchor.py; {} when off -- the byte-identity guarantee). Group
+    D reads nothing new: the anchor is a regular store node at a page."""
+    if token is None:
+        return {}
+    if int(token) <= 0:
+        raise SystemExit(f"--turn-anchor-token must be a positive token id, got {token}")
+    return {"SGLANG_WEG2_TURN_ANCHOR_TOKEN": str(int(token))}
+
+
 def p_host_overlap_env(overlap: bool, hostgap: bool) -> Dict[str, str]:
     """Group P's extra environment for ``--p-host-overlap`` / ``--p-hostgap``.
 
@@ -21174,6 +21185,16 @@ def build_parser() -> argparse.ArgumentParser:
              "SGLANG_WEG2_FORK_ANCHOR_TOKEN to both groups; default off = argv and "
              "env byte-identical.")
     ap.add_argument(
+        "--turn-anchor-token", type=int, default=None, metavar="ID",
+        help="TURN ANCHOR (NF, weg2/turn_anchor.py): the chat template's turn-start "
+             "token id (<|im_start|> = 248045 on Qwen3.8-27B and NF). Group P then "
+             "also snapshots the recurrent state where the prompt's LAST message "
+             "starts (a second extend track in the same forward, no extra forward) "
+             "and inserts it as an anchor -- where the next turn and a client's side "
+             "request fork (y3m weg2-50-71: FETCH CAP lost=16 pages behind the "
+             "END anchor). Adds SGLANG_WEG2_TURN_ANCHOR_TOKEN to group P only; "
+             "default off = argv and env byte-identical.")
+    ap.add_argument(
         "--fp8-uniform-marlin", action="store_true",
         help="27B line, an FP8 checkpoint (Qwen/Qwen3.8-27B-FP8, block 128x128) on "
              "the flip: force the Marlin FP8 kernel on EVERY rank of both groups "
@@ -24306,6 +24327,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _fork_env = fork_anchor_env(getattr(ns, "fork_anchor_token", None),
                                 bool(getattr(ns, "p_trim_end_anchor", False)))
     env_p.update(_fork_env)
+    # TURN ANCHOR (weg2/turn_anchor.py): {} when off; group P only.
+    _turn_env = turn_anchor_env(getattr(ns, "turn_anchor_token", None))
+    env_p.update(_turn_env)
+    if _turn_env:
+        log("WEG2 TURN-ANCHOR: on (--turn-anchor-token %s) -- group P snapshots the "
+            "recurrent state where a prompt's last message starts as a second extend "
+            "track and inserts it as its own anchor (rank lines 'WEG2 TURN-ANCHOR "
+            "TRACK', 'WEG2 TURN-ANCHOR INSERT')" % ns.turn_anchor_token)
     if _fork_env:
         log("WEG2 FORK-ANCHOR: on (--fork-anchor-token %s) -- group P cuts a leg-1 "
             "prompt before its generation prompt, group D reads the store up to the "
