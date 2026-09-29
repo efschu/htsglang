@@ -38,6 +38,19 @@ RANK_KEYS = ("card", "fixed", "elastic", "transient_by_state", "budget_mib",
 CLOSURE_KEYS = ("card", "phase", "state", "sum_mib", "total_mib", "rest_mib", "row_mib",
                 "rest_to", "bound_by", "idle", "terms")
 OVERRIDE_KEYS = ("group", "key", "value", "source")
+#: 29.09. (Nutzer 12:42Z): the TOKEN-EXACT demand. Optional top key: a plan
+#: without it (the z30y image) still reads. The KV a wake needs is known before
+#: the wake to the token; the plan carries the cells that turn those tokens into
+#: bytes and rows, the front/ranks/arena evaluate them with the functions below.
+OPTIONAL_TOP_KEYS = ("demand",)
+DEMAND_KEYS = ("P", "D", "arena")
+DEMAND_P_KEYS = ("page_tokens", "cap_tokens", "ranks")
+DEMAND_P_RANK_KEYS = ("card", "kv_cell_bytes", "row_mib", "provenance")
+DEMAND_D_KEYS = ("page_tokens", "stage_tokens", "ranks")
+DEMAND_D_RANK_KEYS = ("card", "kv_cell_bytes", "row_mib", "rows", "stage_rows", "low_rows",
+                      "provenance")
+DEMAND_ARENA_KEYS = ("page_tokens", "page_bytes", "kv_slots", "mamba_slots", "gib", "provenance")
+MIB = 1 << 20
 
 
 class VramPlanRefused(ValueError):
@@ -123,7 +136,8 @@ def provenance_ok(text: str) -> bool:
 def make_plan(*, boot_id: str, rev: str, pass_name: str, identity: Mapping,
               cards: Sequence[Mapping], groups: Mapping, asleep: Mapping,
               budget_terms: Mapping, closure: Sequence[Closure], open_items: Sequence[str],
-              overrides: Sequence[Mapping], flip_legs: Optional[Mapping] = None) -> dict:
+              overrides: Sequence[Mapping], flip_legs: Optional[Mapping] = None,
+              demand: Optional[Mapping] = None) -> dict:
     """The plan as a dict with its id; every nested key checked by the reader."""
     if pass_name not in PASSES:
         raise VramPlanRefused("VRAM_PLAN_FIELD", "pass %r not in %s" % (pass_name, PASSES))
@@ -136,6 +150,8 @@ def make_plan(*, boot_id: str, rev: str, pass_name: str, identity: Mapping,
         "open": sorted(set(str(x) for x in open_items)),
         "overrides": [dict(o) for o in overrides],
     }
+    if demand:
+        plan["demand"] = json.loads(canonical(demand))
     plan["plan_id"] = compute_plan_id(plan)
     read_plan(plan)
     return plan
@@ -154,7 +170,7 @@ def read_plan(plan: Mapping) -> Mapping:
     if plan.get("schema") != SCHEMA:
         raise VramPlanRefused("VRAM_PLAN_SCHEMA", "schema %r, this reader knows %r"
                               % (plan.get("schema"), SCHEMA))
-    _unknown("plan", plan, TOP_KEYS)
+    _unknown("plan", plan, TOP_KEYS + OPTIONAL_TOP_KEYS)
     missing = [k for k in TOP_KEYS if k not in plan]
     if missing:
         raise VramPlanRefused("VRAM_PLAN_FIELD", "plan: missing field(s) %s" % missing)
@@ -176,6 +192,7 @@ def read_plan(plan: Mapping) -> Mapping:
                                   % (i, c["bound_by"], BOUND_BY))
     for i, o in enumerate(plan["overrides"]):
         _unknown("overrides[%d]" % i, o, OVERRIDE_KEYS)
+    _read_demand(plan.get("demand"))
     if plan["plan_id"] != compute_plan_id(plan):
         raise VramPlanRefused("VRAM_PLAN_ID", "plan_id %r does not hash its content"
                               % (plan["plan_id"],))
@@ -267,3 +284,149 @@ def argv_budget_mismatches(plan: Mapping, group: str, argv: Sequence[str]) -> Li
         if i < len(vals) and uuid in by_card and by_card[uuid] != vals[i]:
             out.append("%s ordinal %d: plan %d != argv %d" % (group, i, by_card[uuid], vals[i]))
     return out
+
+
+# --- 29.09. (Nutzer 12:42Z): the token-exact demand ---------------------------
+# ONE set of functions for everybody who sizes by the known tokens: the P wake
+# (P-KV duty), the D wake and the D-MEM-SCHED tick (the stage), the arena (the
+# host pages a flip carries). The plan carries the cells; these turn tokens into
+# pages, bytes and rows. Stages and pages are only the granularity.
+
+
+def _read_demand(demand) -> None:
+    if demand is None:
+        return
+    if not isinstance(demand, Mapping):
+        raise VramPlanRefused("VRAM_PLAN_FIELD", "demand: not an object")
+    _unknown("demand", demand, DEMAND_KEYS)
+    for grp, keys, rank_keys in (("P", DEMAND_P_KEYS, DEMAND_P_RANK_KEYS),
+                                 ("D", DEMAND_D_KEYS, DEMAND_D_RANK_KEYS)):
+        body = demand.get(grp)
+        if body is None:
+            continue
+        _unknown("demand.%s" % grp, body, keys)
+        for r, rank in (body.get("ranks") or {}).items():
+            _unknown("demand.%s.ranks.%s" % (grp, r), rank, rank_keys)
+            prov = rank.get("provenance", "")
+            if prov and not provenance_ok(prov):
+                raise VramPlanRefused("VRAM_PLAN_FIELD", "demand.%s.ranks.%s.provenance %r is none of %s"
+                                      % (grp, r, prov, PROVENANCE_KINDS))
+    arena = demand.get("arena")
+    if arena is not None:
+        _unknown("demand.arena", arena, DEMAND_ARENA_KEYS)
+
+
+def pages(tokens: int, page_tokens: int) -> int:
+    """Whole pages holding ``tokens`` (a pool hands out pages, not tokens)."""
+    p = max(1, int(page_tokens))
+    return -(-max(0, int(tokens)) // p)
+
+
+def demand_tokens(seq_tokens: Sequence[int], page_tokens: int) -> int:
+    """The KV duty of a set of sequences, token-exact rounded up to the page:
+    every sequence its own pages (``seq_tokens`` = the tokens each one holds in
+    the pool -- the prompt on P, prompt + decode so far on D)."""
+    return sum(pages(t, page_tokens) for t in seq_tokens) * max(1, int(page_tokens))
+
+
+def kv_mib(tokens: int, cell_bytes: int) -> float:
+    return int(tokens) * int(cell_bytes) / MIB
+
+
+def rows_freed(cap_tokens: int, duty_tokens: int, cell_bytes: int, row_mib: float) -> int:
+    """Expert rows the KV between the duty and the booked cap funds on one rank,
+    rounded DOWN (never a byte above the unused KV). A duty above the cap funds
+    nothing (0) -- the caller's admission, not this function, refuses it."""
+    spare = max(0, int(cap_tokens) - int(duty_tokens)) * int(cell_bytes)
+    row = float(row_mib) * MIB
+    return int(spare // row) if row > 0 else 0
+
+
+def stage_of(duty_tokens: int, stage_tokens: Sequence[int]) -> int:
+    """The smallest stage holding the duty; the top stage when none does (the
+    caller parks or refuses what the top stage cannot hold)."""
+    st = [int(t) for t in stage_tokens]
+    for j, t in enumerate(st):
+        if int(duty_tokens) <= t:
+            return j
+    return len(st) - 1
+
+
+def arena_slots_needed(seq_tokens: Sequence[int], page_tokens: int) -> int:
+    """Arena KV slots (one slot = one page of every attention layer) a set of
+    sequences needs on the host -- what the flip carries."""
+    return sum(pages(t, page_tokens) for t in seq_tokens)
+
+
+def evaluate_demand(demand: Mapping, *, p_tokens: Sequence[int] = (),
+                    d_tokens: Sequence[int] = ()) -> dict:
+    """The plan's demand cells applied to KNOWN tokens: per P rank the duty and
+    the rows the rest of the booked cap funds, per D rank the stage and the rows
+    ON, the arena's slots against its capacity. Read-only; the callers act."""
+    out: dict = {}
+    p = demand.get("P") or {}
+    if p:
+        duty = demand_tokens(p_tokens, int(p.get("page_tokens") or 1))
+        ranks = {}
+        for r, c in sorted((p.get("ranks") or {}).items()):
+            ranks[r] = {"duty_tokens": duty,
+                        "kv_mib": round(kv_mib(duty, int(c["kv_cell_bytes"])), 1),
+                        "rows_freed": rows_freed(int(p["cap_tokens"]), duty,
+                                                 int(c["kv_cell_bytes"]), float(c["row_mib"]))}
+        out["P"] = {"duty_tokens": duty, "fits": duty <= int(p["cap_tokens"]), "ranks": ranks}
+    d = demand.get("D") or {}
+    if d:
+        duty = demand_tokens(d_tokens, int(d.get("page_tokens") or 1))
+        j = stage_of(duty, d["stage_tokens"])
+        ranks = {}
+        for r, c in sorted((d.get("ranks") or {}).items()):
+            sr = list(c.get("stage_rows") or ())
+            ranks[r] = {"rows_on": int(c["rows"]) - (int(sr[j]) if j < len(sr) else 0)}
+        out["D"] = {"duty_tokens": duty, "stage": j, "stage_tokens": int(d["stage_tokens"][j]),
+                    "fits": duty <= int(d["stage_tokens"][-1]), "ranks": ranks}
+    a = demand.get("arena") or {}
+    if a:
+        need = arena_slots_needed(list(p_tokens) or list(d_tokens), int(a.get("page_tokens") or 1))
+        out["arena"] = {"slots_needed": need, "kv_slots": int(a["kv_slots"]),
+                        "gib_needed": round(need * int(a["page_bytes"]) / (1 << 30), 2),
+                        "fits": need <= int(a["kv_slots"])}
+    return out
+
+
+def demand_line(plan: Mapping, probes: Sequence[Tuple[str, Sequence[int]]] = ()) -> str:
+    """The one human line of the demand: the cells and, per probe (a named set of
+    known tokens), what the duty makes of them."""
+    dm = plan.get("demand") or {}
+    if not dm:
+        return "VRAM-PLAN-PFLICHT pass=%s: keine Pflicht-Zellen im Plan" % plan.get("pass")
+    parts = []
+    p = dm.get("P") or {}
+    if p:
+        parts.append("P cap=%s page=%s zelle=[%s]" % (
+            p.get("cap_tokens"), p.get("page_tokens"),
+            ",".join("%s:%sB/%.1fMiB" % (r, c["kv_cell_bytes"], float(c["row_mib"]))
+                     for r, c in sorted((p.get("ranks") or {}).items()))))
+    d = dm.get("D") or {}
+    if d:
+        parts.append("D stufen=%s zeilen=[%s]" % (
+            ",".join(str(t) for t in d.get("stage_tokens") or ()),
+            ",".join("%s:%s/%s" % (r, c["rows"], "-".join(str(x) for x in c.get("stage_rows") or ()))
+                     for r, c in sorted((d.get("ranks") or {}).items()))))
+    a = dm.get("arena") or {}
+    if a:
+        parts.append("arena slots=%s seite=%sB mamba=%s" % (a.get("kv_slots"), a.get("page_bytes"),
+                                                            a.get("mamba_slots")))
+    for name, toks in probes:
+        ev = evaluate_demand(dm, p_tokens=toks, d_tokens=toks)
+        bits = []
+        if "P" in ev:
+            bits.append("P %s frei=[%s]" % ("ok" if ev["P"]["fits"] else "UEBER-CAP", ",".join(
+                "%s:%d" % (r, v["rows_freed"]) for r, v in ev["P"]["ranks"].items())))
+        if "D" in ev:
+            bits.append("D S%d=%d an=[%s]" % (ev["D"]["stage"], ev["D"]["stage_tokens"], ",".join(
+                "%s:%d" % (r, v["rows_on"]) for r, v in ev["D"]["ranks"].items())))
+        if "arena" in ev:
+            bits.append("arena %d/%d%s" % (ev["arena"]["slots_needed"], ev["arena"]["kv_slots"],
+                                           "" if ev["arena"]["fits"] else " VOLL"))
+        parts.append("%s(%s): %s" % (name, "+".join(str(t) for t in toks), " ".join(bits)))
+    return "VRAM-PLAN-PFLICHT pass=%s %s" % (plan.get("pass"), " | ".join(parts))

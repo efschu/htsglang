@@ -3119,6 +3119,7 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
     for k, v in items.items():
         env_raw = set_group_env(env_raw, k, v)
     ns.env_d = env_raw
+    vram_view().note_d_stages(group)
     ns._d_kv_stage_written = {"host": host_rank, "rows": tab.rows, "seat_raw": seat_raw,
                               "op_max": op_raw if op_max is not None else None,
                               "worker_rows": {int(t.host_rank): int(t.rows)
@@ -3186,6 +3187,7 @@ def d_kv_stage_undo(ns) -> None:
     w = getattr(ns, "_d_kv_stage_written", None)
     if not w:
         return
+    vram_view().note_d_stages(None)
     env_raw = str(getattr(ns, "env_d", "") or "")
     env = parse_group_env(env_raw)
     h, rows_ = int(w["host"]), int(w["rows"])
@@ -13292,6 +13294,10 @@ def budgets_from_dc(
 #: VRAM-VERTRAG M1 (29.09.): the budget passes' view (weg2/vram_plan_view.py),
 #: one per launcher run; ``main`` resets it with the profile's pins.
 _VRAM_VIEW = None
+#: the known-token sets the VRAM-PLAN-PFLICHT line evaluates (one short
+#: request, bs2 x 128k, the kvs2 load bs2 x 240k that filled the P arena)
+VRAM_DEMAND_PROBES = (("1x32k", (32768,)), ("2x128k", (131072, 131072)),
+                      ("2x240k", (245760, 245760)))
 
 
 def vram_view():
@@ -13314,12 +13320,15 @@ def vram_plan_emit(ns, cards: Sequence[Card], pass_name: str, log: Log, *,
 
     view = vram_view()
     try:
+        view.note_inputs(ns)
         plan = view.build(pass_name, cards, boot_id=str(getattr(ns, "tag", "") or ""),
                           rev=str(os.environ.get("HTSGLANG_REV", "") or ""), d_label=d_label)
     except Exception as exc:  # noqa: BLE001 -- the view never kills a launch
         log(f"VRAM-PLAN pass={pass_name} failed: {type(exc).__name__}: {exc}")
         return None
     log(_vp.plan_line(plan))
+    if plan.get("demand"):
+        log(_vp.demand_line(plan, VRAM_DEMAND_PROBES))
     prev = view.last
     if prev is not None:
         moved = _vp.diff_plans(prev, plan)

@@ -102,6 +102,8 @@ class PlanView:
         self.p_card: Optional[dict] = None
         self.d: Dict[str, dict] = {}
         self.asleep: Dict[str, Dict[str, dict]] = {"P": {}, "D": {}}
+        self.d_stages: Optional[dict] = None
+        self.inputs: dict = {}
         self.overrides = [dict(o) for o in overrides]
         self.identity = dict(identity or {})
         self.plans: Dict[str, dict] = {}
@@ -140,6 +142,91 @@ class PlanView:
                          "kv_tokens_max": int(kv_tokens_max or 0), "seats": seats,
                          "stage_rows": {int(k): int(v) for k, v in dict(stage_rows or {}).items()},
                          "fixed_src": fixed_src, "act_src": act_src}
+
+    def note_d_stages(self, group) -> None:
+        """#251c/#239 S3g: the stage group the launcher wrote into --env-d --
+        per KV rank its trim cell, stage rows and (floor ladder) low rows."""
+        tabs = list(getattr(group, "tables", None) or ())
+        if not tabs:
+            self.d_stages = None
+            return
+        self.d_stages = {
+            "stage_tokens": [int(t) for t in tabs[0].tokens],
+            "ranks": {int(t.host_rank): {
+                "kv_cell_bytes": int(t.kv_cell_bytes), "row_mib": round(float(t.row_mib), 3),
+                "rows": int(t.rows), "stage_rows": [int(x) for x in t.stage_rows],
+                "low_rows": int(getattr(t, "low_rows", 0) or 0)} for t in tabs}}
+
+    def note_inputs(self, ns) -> None:
+        """The page and arena geometry off the launcher's inputs (--extra-*,
+        --env-*): what the demand cells turn tokens into."""
+        a_p, a_d = _argv_pairs(getattr(ns, "extra_p", "")), _argv_pairs(getattr(ns, "extra_d", ""))
+        e_p, e_d = _env_pairs(getattr(ns, "env_p", "")), _env_pairs(getattr(ns, "env_d", ""))
+
+        def _int(v, default=0):
+            try:
+                return int(str(v).split()[0])
+            except (TypeError, ValueError, IndexError):
+                return default
+        arena = None
+        for grp, env in (("P", e_p), ("D", e_d)):
+            if "SGLANG_HICACHE_ARENA_KV_PAGE_BYTES" in env:
+                arena = (grp, env)
+                break
+        self.inputs = {"page_p": _int(a_p.get("--page-size"), 1),
+                       "page_d": _int(a_d.get("--page-size"), 1), "arena": None}
+        if arena is not None:
+            grp, env = arena
+            try:
+                gib = float(env.get("SGLANG_HICACHE_ARENA_GIB", "8"))
+            except ValueError:
+                gib = 8.0
+            page_bytes = _int(env.get("SGLANG_HICACHE_ARENA_KV_PAGE_BYTES"))
+            self.inputs["arena"] = {
+                "page_tokens": self.inputs["page_p" if grp == "P" else "page_d"],
+                "page_bytes": page_bytes, "gib": gib,
+                # arena_pool.planned_arena_slots: max(1024, GIB x 2^30 // page)
+                "kv_slots": max(1024, int(gib * (1 << 30)) // max(1, page_bytes)),
+                "mamba_slots": _int(env.get("SGLANG_HICACHE_ARENA_MAMBA_SLOTS"), 48),
+                "provenance": "MODEL(--env-%s SGLANG_HICACHE_ARENA_GIB x KV_PAGE_BYTES)" % grp.lower()}
+
+    def _demand(self, d_label: Optional[str]) -> dict:
+        """29.09. (Nutzer 12:42Z): the cells that turn the KNOWN tokens of a wake
+        into its KV duty -- P per stage (cell, row price, booked cap), D per KV
+        rank (stage ladder, stage rows), the arena (slots). Only what the solvers
+        computed; a missing piece is left out, never guessed."""
+        out: dict = {}
+        pc = self.p_card
+        if pc is not None and pc["fits"]:
+            ranks, cap = {}, 0
+            for f in pc["fits"]:
+                s = int(f.stage)
+                toks = int(getattr(f, "prompt_tokens", 0) or 0)
+                if s >= len(pc["cards"]) or toks <= 0:
+                    continue
+                cap = max(cap, toks)
+                ranks["pp%d" % s] = {
+                    "card": str(pc["cards"][s].uuid),
+                    "kv_cell_bytes": int(round(float(f.kv_mib) * vp.MIB / toks)),
+                    "row_mib": round(float(f.row_card_mib) or float(f.layer_row_mib), 3),
+                    "provenance": "MODEL(PP-CUT P-KARTE kv_mib / prompt_tokens)"}
+            if ranks:
+                out["P"] = {"page_tokens": int(self.inputs.get("page_p", 1)), "cap_tokens": cap,
+                            "ranks": ranks}
+        d = self.d.get(d_label) if d_label is not None else None
+        if d is not None and self.d_stages is not None:
+            ranks = {}
+            for r, c in sorted(self.d_stages["ranks"].items()):
+                if r >= len(d["cards"]):
+                    continue
+                ranks["tp%d" % r] = dict(c, card=str(d["cards"][r].uuid),
+                                         provenance="MODEL(kv_stage_group, Trim-Zelle)")
+            if ranks:
+                out["D"] = {"page_tokens": int(self.inputs.get("page_d", 1)),
+                            "stage_tokens": list(self.d_stages["stage_tokens"]), "ranks": ranks}
+        if self.inputs.get("arena"):
+            out["arena"] = dict(self.inputs["arena"])
+        return out
 
     # --- the plan ----------------------------------------------------------------
     @staticmethod
@@ -278,6 +365,6 @@ class PlanView:
             boot_id=boot_id, rev=rev, pass_name=pass_name, identity=self.identity,
             cards=[card_dict(c) for c in cards], groups=groups, asleep=asleep,
             budget_terms=self.budgets, closure=closure, open_items=open_items,
-            overrides=self.overrides)
+            overrides=self.overrides, demand=self._demand(d_label))
         self.plans[pass_name] = plan
         return plan
