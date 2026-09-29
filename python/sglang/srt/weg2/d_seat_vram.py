@@ -1981,6 +1981,39 @@ def global_demand(sched) -> Tuple[int, int, frozenset]:
     return used, incoming, frozenset(getattr(r, "rid", id(r)) for r in running)
 
 
+def kv_ladder_reading(sched) -> Optional[Dict[str, int]]:
+    """NF-STAU (29.09.): D's KV LADDER for the front's KV fit test (ARRIVAL-SEAT),
+    published on ``/server_info`` ``weg2_kv`` -- IPC, never a log line.
+
+    ``ladder_ceiling``: the highest stage D-MEM-SCHED may grow to this phase
+    (its ``stage_tokens[-1]``; before its first tick the stage form's
+    ``max_stage(n)``), ``ladder_stage``: the mapped stage, ``ladder_used``:
+    the global tokens the running requests hold (:func:`global_demand`, the
+    same census the machine steps on). The front tested against the MAPPED
+    stage (available + evictable) -- y3m 22:03:44 "kv need=130563 >
+    free=54016" at S3/S4 with ~77k used while the ladder reached 524288:
+    no KV shortage, a wrong size. None when no ladder runs (off, asleep, no
+    stage form, elastic stop) -- the reading then stays what it was."""
+    if not armed() or not elastic_on() or getattr(sched, "weg2_dormant", False):
+        return None
+    form = stage_form()
+    if form is None:
+        return None
+    ms = getattr(sched, MEM_SCHED_ATTR, None)
+    st = getattr(sched, PHASE_ATTR, None)
+    if ms is not None and getattr(ms, "stage_tokens", None):
+        ceiling = int(ms.stage_tokens[-1])
+        stage = int(ms.stage_tokens[min(int(ms.stage), len(ms.stage_tokens) - 1)])
+    else:
+        n = 1
+        if st is not None and int(getattr(st, "cap", 0) or 0) > 0:
+            n = max(1, min(int(st.n or st.cap), int(st.cap)))
+        ceiling = int(form.tokens[form.max_stage(n)])
+        stage = int(getattr(st, "stage_tokens", 0) or form.tokens[0]) if st is not None else int(form.tokens[0])
+    used, _incoming, _rids = global_demand(sched)
+    return {"ladder_ceiling": ceiling, "ladder_stage": stage, "ladder_used": int(used)}
+
+
 #: y3j 09291933: the admission gate a grown stage re-opened
 REOPEN_MARK = "WEG2 D-MEM-SCHED ADMIT-REOPEN"
 _REOPEN_N = [0]

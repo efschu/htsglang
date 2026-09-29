@@ -45,6 +45,12 @@ REASON_YOUNGEST = "arrival-seat-youngest"
 COUNTERS = (
     "arrival_seat_d_prefill", "arrival_seat_flip_now", "arrival_seat_wait_seat",
     "arrival_seat_wait_kv", "arrival_seat_youngest_park", "arrival_seat_youngest_park_refused",
+    # NF-STAU (29.09.): KV backfill past a head that does not fit, and the
+    # two TTFT clocks (IPC, no log parsing): arrival -> verdict and arrival ->
+    # first token, count/sum/max ms
+    "arrival_seat_backfill",
+    "arrival_seat_verdict_n", "arrival_seat_verdict_ms_sum", "arrival_seat_verdict_ms_max",
+    "arrival_seat_ttft_n", "arrival_seat_ttft_ms_sum", "arrival_seat_ttft_ms_max",
 )
 
 
@@ -102,20 +108,68 @@ def kv_need(est_prompt_tokens: int, reserve_tokens: int) -> int:
     return max(0, int(est_prompt_tokens or 0)) + max(0, int(reserve_tokens or 0))
 
 
+def ladder_free(kv_reading: Optional[Mapping]) -> Optional[Tuple[int, int, int]]:
+    """``(free, ceiling, used)`` against D's KV LADDER, or None when D does not
+    publish one. NF-STAU (29.09., y3m 22:03:44 "kv need=130563 > free=54016"
+    while D's ladder reached 524288 with ~77k used): the mapped stage is not
+    the limit -- D-MEM-SCHED grows it at the admission and the experts go to
+    host RAM (the user's law: free VRAM belongs to the experts, KV displaces
+    them when needed). The ceiling is the highest stage D may take this phase
+    (``d_seat_vram.kv_ladder_reading``: ``ladder_ceiling``), ``used`` the
+    global tokens its running requests hold."""
+    if not kv_reading:
+        return None
+    try:
+        ceiling = int(kv_reading.get("ladder_ceiling", 0) or 0)
+        used = kv_reading.get("ladder_used")
+        if ceiling <= 0 or used is None:
+            return None
+        used = max(0, int(used))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return max(0, ceiling - used), ceiling, used
+
+
 def kv_fits(need: int, kv_reading: Optional[Mapping]) -> Tuple[bool, str]:
     """``(fits, why)`` against D's reading ``{"available", "evictable"}`` (TP0's
-    ``/server_info`` ``weg2_kv``). No reading (an old D, a failed read): the
-    seat plan alone decides -- H95c's phase seats are KV-derived already --
-    and the verdict says so (``kv=unread``)."""
+    ``/server_info`` ``weg2_kv``) -- and, when D publishes its KV ladder, against
+    the ladder's ceiling (:func:`ladder_free`): the larger of the two decides.
+    No reading (an old D, a failed read): the seat plan alone decides --
+    H95c's phase seats are KV-derived already -- and the verdict says so
+    (``kv=unread``)."""
     if not kv_reading:
         return True, "kv=unread"
     try:
         free = int(kv_reading.get("available", 0) or 0) + int(kv_reading.get("evictable", 0) or 0)
     except (TypeError, ValueError, AttributeError):
         return True, "kv=unreadable"
+    lad = ladder_free(kv_reading)
+    tail = ""
+    if lad is not None:
+        tail = f" (ladder {lad[1]}-{lad[2]}={lad[0]}, stage free {free})"
+        free = max(free, lad[0])
     if int(need) <= free:
-        return True, f"kv need={int(need)} free={free}"
-    return False, f"kv need={int(need)} > free={free}"
+        return True, f"kv need={int(need)} free={free}{tail}"
+    return False, f"kv need={int(need)} > free={free}{tail}"
+
+
+def backfill_allowed(head_wait_s: Optional[float], bound_s: float) -> bool:
+    """#246 (user 17:50Z): strict arrival order PLUS KV backfill -- a later
+    arrival that fits may take a free seat the head cannot use (its KV does
+    not fit). The head does not starve: every tick asks the head FIRST, and
+    once it waited ``bound_s`` backfill stops (the freed room stays for it)
+    and the bound's displacement (c) runs instead."""
+    return not bound_fired(head_wait_s, bound_s)
+
+
+def note_ms(counters, key: str, ms: float) -> None:
+    """One sample of an IPC clock ``key`` (``verdict`` / ``ttft``): count, sum
+    and max in the front's counters (state.json ``front.arrival_seat``)."""
+    v = max(0, int(round(float(ms))))
+    counters[f"arrival_seat_{key}_n"] += 1
+    counters[f"arrival_seat_{key}_ms_sum"] += v
+    if v > int(counters.get(f"arrival_seat_{key}_ms_max", 0) or 0):
+        counters[f"arrival_seat_{key}_ms_max"] = v
 
 
 def seat_free(taken: int, seats: int) -> bool:
