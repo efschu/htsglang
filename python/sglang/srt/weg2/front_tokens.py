@@ -68,6 +68,9 @@ SEGMENT_MARKER = "<|im_start|>"
 SEGMENT_CACHE_TOKENS = 4_000_000
 #: ids kept per request text / per D measurement (int32 arrays).
 IDS_CAP = 64
+#: the store page both groups anchor on (ArenaMHAHostPool, #107); the front
+#: reads SGLANG_WEG2_FRONT_ANCHOR_PAGE and passes it in.
+ANCHOR_PAGE = 64
 
 COUNT_PATHS = ("/v1/messages", "/v1/chat/completions", "/generate")
 
@@ -366,9 +369,14 @@ class TokenSpans:
     entry against a new request is ``min(what D reported, token LCP)`` and
     no chars/token ratio enters anywhere."""
 
-    def __init__(self, agent_span: bool, cap: int = IDS_CAP):
+    def __init__(self, agent_span: bool, cap: int = IDS_CAP, anchor_page: int = ANCHOR_PAGE):
         self.agent_span = bool(agent_span)
         self.cap = int(cap)
+        #: the grain of the end anchor a served prompt leaves in the store (P's
+        #: END-ANCHOR, D's #1469 RETAIN): the page floor of the prompt.
+        self.anchor_page = max(1, int(anchor_page))
+        #: PREFILL-EINBRUCH-0929 K2: D readings clamped to their own text.
+        self.own_text_clamps = 0
         # key -> (ids, cached_tokens, prompt_tokens, held_epoch)
         self.entries: "collections.OrderedDict[str, Tuple[np.ndarray, int, int, Optional[int]]]" = \
             collections.OrderedDict()
@@ -389,7 +397,18 @@ class TokenSpans:
                         prompt_tokens: int = 0, held_epoch: Optional[int] = None,
                         resumable_depth: Optional[int] = None) -> None:
         """#59: ``resumable_depth`` (D's ``weg2_resumable_depth``, None = not
-        sent) caps every credit of this entry; 0 retracts."""
+        sent) caps every credit of this entry; 0 retracts.
+
+        PREFILL-EINBRUCH-0929 K2: a reading is about THIS text and never
+        credits past it. A D leg 2 that was parked and resumed answers with
+        the RETAINED prefix -- prompt plus the tokens decoded before the park
+        -- as ``prompt_tokens`` and ``cached_tokens`` (NF z30u weg2-2-7:
+        21760 for a 21601-token text, 'WEG2-D-PARK RETAINED ... 21761 of
+        21987'; 73 of 73 token mismatches of that boot were such resumes).
+        PX then credits every follow-up 0, since that depth lies past each
+        path the entry shares. Such a reading is clamped to the end anchor
+        of its own prompt, the page floor that P's END-ANCHOR and D's #1469
+        RETAIN hold (z30u weg2-6-13: P read exactly 21568 of it)."""
         if ids is None or ids.size == 0:
             return
         key = self._key(ids)
@@ -399,6 +418,15 @@ class TokenSpans:
             prompt_tokens, held_epoch = 0, None
         ct = max(0, int(cached_tokens))
         pt = max(0, int(prompt_tokens or 0))
+        n = int(ids.size)
+        if ct > n or pt > n or (resumable_depth is not None and int(resumable_depth) > n):
+            anchor = self.own_anchor(n)
+            if ct > n:
+                ct = anchor
+            pt = min(pt, n)
+            if resumable_depth is not None and int(resumable_depth) > n:
+                resumable_depth = max(anchor, ct)
+            self.own_text_clamps += 1
         held = held_epoch if (held_epoch is not None and pt > 0) else None
         if resumable_depth is not None and int(resumable_depth) <= 0:
             self.entry_seq.pop(key, None)
@@ -410,6 +438,42 @@ class TokenSpans:
         if resumable_depth is not None:
             self.depth_caps[key] = int(resumable_depth)
         self._stamp(key)
+
+    def own_anchor(self, n: int) -> int:
+        """The end anchor a served ``n``-token prompt leaves: its page floor."""
+        return max(0, int(n)) // self.anchor_page * self.anchor_page
+
+    def record_store_anchor(self, ids: Optional[np.ndarray], prompt_tokens: int = 0) -> int:
+        """PREFILL-EINBRUCH-0929 K1 (switch SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE):
+        P's END-ANCHOR of ``ids`` is in the store and D resumed from it -- the
+        caller calls this only at the first content of an ``after_p`` leg 2,
+        i.e. after the publish is complete and read (the #1324 danger was a
+        credit recorded while P's write-through was still in flight). The
+        entry credits that anchor from now on, beyond the epoch: it is a
+        store fact, not a held-radix one. An existing entry keeps its larger
+        measurement; a #59 A in-flight cap below the anchor is raised to it,
+        never past it. Returns the anchor credited (0 = none)."""
+        if ids is None or ids.size == 0:
+            return 0
+        n = int(ids.size)
+        if int(prompt_tokens or 0) > 0:
+            n = min(n, int(prompt_tokens))
+        anchor = self.own_anchor(n)
+        if anchor <= 0:
+            return 0
+        key = self._key(ids)
+        old = self.entries.pop(key, None)
+        if old is None:
+            self.entries[key] = (ids, anchor, 0, None)
+            self.depth_caps[key] = anchor
+        else:
+            oids, ct, pt, held = old
+            self.entries[key] = (oids, max(int(ct), anchor), pt, held)
+            cap = self.depth_caps.get(key)
+            if cap is not None and int(cap) < anchor:
+                self.depth_caps[key] = anchor
+        self._stamp(key)
+        return anchor
 
     def _stamp(self, key: str) -> None:
         self.seq += 1
