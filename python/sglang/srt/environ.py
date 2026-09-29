@@ -738,6 +738,15 @@ class Envs:
     # an eager forward (extend) lands its layer first (WEG2-REARM-DEFER
     # fill-start / landed, expert-rearm ... deferred=N). 0 = serial as before.
     SGLANG_WEG2_REARM_DEFER = EnvBool(True)
+    # REARM_DEFER_HOST_GROUPS (#284, D->P wake): waking groups whose MoE layers
+    # plan on the HOST (P's prefill) take the same deferral in its early form:
+    # the rearm does not wait for the extra rows, they load on a side stream
+    # right behind it and the rank's NEXT forward (any mode) waits their events.
+    # Measured x178/z30w-park/z30x2 (63/63 D->P wakes): PP1 ends the wake RPC
+    # last with a serial rearm of ~7000 store rows (894-1068 ms, reload=895),
+    # PP0 waits 474-538 ms in the fence; PP1's first forward comes after PP0's
+    # first chunk. Comma list; empty = the serial rearm on P, byte for byte.
+    SGLANG_WEG2_REARM_DEFER_HOST_GROUPS = EnvStr("")
     # VRAM_PEAK (H55): one WEG2-VRAM-PEAK line per P chunk, per D round window
     # (VRAM_PEAK_ROUNDS decode/verify forwards or 5 s) and per flip leg: the
     # allocator peak of that window (memory_stats + reset_peak_memory_stats,
@@ -3355,6 +3364,14 @@ class Envs:
     SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW = EnvBool(False)
     SGLANG_WEG2_PARK_COLLECT_WINDOW_S = EnvFloat(None)
     SGLANG_WEG2_PARK_COLLECT_THRESHOLD_TOKENS = EnvInt(0)
+    # PARK-WINDOW-GATE (27B decision 29.09. ~13:55Z, F22 audit: the park RPC
+    # waits for D's running pass -- NF z30w median 0.40 s / p90 2.32 s, 27B
+    # z30j 0.66 / 1.15 s, max 3.31 s): while the collect window HOLDs, the
+    # front sends D its deadline and D's X-COST-LINE; D admits no extend whose
+    # forward would end after it (weg2/park_window_gate). The window stays the
+    # one decision site. Front-side switch, model-neutral; off = nothing sent,
+    # D's admission byte for byte. Off until the first boot series, then on.
+    SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE = EnvBool(False)
     # X-COST-LINE (29.09., third part of the ski-rental decision; NF z30w
     # 09290827 and 27B 09290020 both ran with `X NO-SOLVE: no r_d` because the
     # solo r_D probe never fired under load). X is re-solved from D's measured

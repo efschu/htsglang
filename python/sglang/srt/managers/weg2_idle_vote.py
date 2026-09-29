@@ -268,6 +268,43 @@ def refusal_detail(vote: Weg2IdleVoteReq, t: Weg2VoteTally, note: str) -> str:
 # --------------------------------------------------------------------------
 
 
+#: kvs2 W3 (boot ...kvdemandbar1dauer09291534, 15:42:17): PP0's OWN publish
+#: work since boot, in seconds of lap_clock -- the /flush_cache poll's
+#: FLUSH-PUBLISH and the bubble publisher's sweep.  Measured there: every
+#: sweep 1.2-1.3 s (37 un-backed nodes, each refused by a full arena after a
+#: fruitless ARENA-DROP), FLUSH-PUBLISH 4.6-5.0 s per poll, a pass 6.1 s; the
+#: lap came home 3/3 idle every time and was read 10.6-11.3 s after its stamp
+#: -- past the 2 s TTL on EVERY poll, until the quiesce deadline (W3).  The
+#: time PP0 spends in these calls is time in which no work can enter the
+#: group (PP0 is the entrypoint and receives nothing while it runs them; work
+#: that entered before or after taints the witness at the next pass-top
+#: anyway), so it is not age: the TTL counts only the rest.
+_OWN_WORK_S = [0.0]
+
+
+class own_work:
+    """``with own_work():`` -- PP0 time that is not a lap's age (see above).
+    Re-entrant by nesting depth: only the outermost span is counted."""
+
+    _depth = 0
+
+    def __enter__(self):
+        own_work._depth += 1
+        if own_work._depth == 1:
+            self._t0 = lap_clock()
+        return self
+
+    def __exit__(self, *_exc):
+        own_work._depth -= 1
+        if own_work._depth == 0:
+            _OWN_WORK_S[0] += max(0.0, lap_clock() - self._t0)
+        return False
+
+
+def own_work_total() -> float:
+    return float(_OWN_WORK_S[0])
+
+
 @dataclass
 class Weg2LapWitness:
     """PP0's own record of what ONE lap witnesses.
@@ -275,12 +312,15 @@ class Weg2LapWitness:
     Minted with the stamp and never put on the wire: the lap carries the
     slots, this carries the conditions under which those slots still describe
     the group.  ``taint`` is the first reason the witnessed state stopped
-    holding, as PP0 saw it; empty while it holds.
+    holding, as PP0 saw it; empty while it holds.  ``own_work_at_stamp`` is
+    :func:`own_work_total` at the stamp: the PP0 publish work since then is
+    not age (kvs2 W3, 09291534).
     """
 
     epoch: int
     stamped_at: float
     taint: str = ""
+    own_work_at_stamp: float = field(default_factory=own_work_total)
 
     def spoil(self, reason: str) -> bool:
         """Record ``reason`` unless an earlier one is already recorded."""
@@ -315,10 +355,20 @@ def entrypoint_taint(*, dormant: bool, idle: bool) -> str:
     return ""
 
 
+def own_work_since(witness: Weg2LapWitness) -> float:
+    """PP0's own publish work since the stamp (never negative)."""
+    return max(0.0, own_work_total() - float(getattr(witness, "own_work_at_stamp", own_work_total())))
+
+
 def expiry_reason(witness: Weg2LapWitness, *, now: float, ttl_s: float) -> str:
-    age = float(now) - float(witness.stamped_at)
+    wall = float(now) - float(witness.stamped_at)
+    own = min(max(0.0, wall), own_work_since(witness))
+    age = wall - own
     if ttl_s > 0 and age > ttl_s:
-        return f"expired (age={age:.3f}s > ttl={float(ttl_s):.3f}s)"
+        return (
+            f"expired (age={age:.3f}s > ttl={float(ttl_s):.3f}s; wall={wall:.3f}s, "
+            f"PP0 own publish work {own:.3f}s not counted)"
+        )
     return ""
 
 

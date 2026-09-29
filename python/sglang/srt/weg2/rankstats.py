@@ -217,10 +217,20 @@ def scheduler_counters(scheduler) -> Dict[str, Any]:
         "sched": {"waiting": waiting, "running": running,
                   "queue_req": waiting, "running_req": running,
                   "pending_tokens": getattr(mr, "last_pending_tokens", None),
-                  "full_token_usage": _round_or_none(getattr(mr, "last_full_token_usage", None), 4)},
+                  "full_token_usage": _round_or_none(getattr(mr, "last_full_token_usage", None), 4),
+                  # PARK-WINDOW-GATE (29.09.): the front's window in force on this
+                  # rank (left_ms as received; null = none) and the extends it held back
+                  "park_window_left_ms": _park_window_left_ms(scheduler),
+                  "park_window_defers": int(getattr(scheduler, "_weg2_park_window_defer_n", 0) or 0),
+                  "park_window_hold_max_ms": int(getattr(scheduler, "_weg2_park_window_hold_max_ms", 0) or 0)},
         "cap": {"kv_tokens": getattr(scheduler, "max_total_num_tokens", None),
                 "seats": getattr(scheduler, "max_running_requests", None)},
     }
+
+
+def _park_window_left_ms(scheduler):
+    win = getattr(scheduler, "_weg2_park_window", None)
+    return None if not isinstance(win, dict) else int(win.get("left_ms", 0))
 
 
 def _round_or_none(v, nd: int):

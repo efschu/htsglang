@@ -1517,6 +1517,39 @@ def reap_model_line(
     )
 
 
+def arena_fill_gib(tag: Optional[str], root: str = "/dev/shm") -> Optional[Tuple[float, float]]:
+    """W98 dmatrix (09291358): ``(touched_gib, size_gib)`` of this boot's arena
+    files (``<root>/weg2-arena-<tag>/*``), or None when there is none.
+
+    A tmpfs file materialises its pages on first write, so its shmem charge
+    grows with the KV the arena has taken and STOPS at its size: ``st_blocks``
+    is what is charged now, ``st_size`` the bound. MEASURED: shmem rose
+    49.72 -> 53.95 GiB over the serving of boot ...z30x2bar1dauer09291358
+    (arena 5461 x 768 KiB + 32 x 56 MiB = 5.75 GiB) with anon flat at
+    24.5 GiB, and W98 fired on that rise at cg_room 2.73 GiB. Two ``stat``
+    calls per file; never raises."""
+    if not tag:
+        return None
+    d = os.path.join(root, f"weg2-arena-{tag}")
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return None
+    touched = size = 0
+    for n in names:
+        try:
+            st = os.stat(os.path.join(d, n))
+        except OSError:
+            continue
+        if not (st.st_mode & 0o170000) == 0o100000:
+            continue
+        size += int(st.st_size)
+        touched += min(int(st.st_size), int(getattr(st, "st_blocks", 0)) * 512)
+    if size <= 0:
+        return None
+    return touched / GIB, size / GIB
+
+
 class RateLatch:
     """#1361 (1): the sampler-independent projection latch.  PURE but for its clock.
 
@@ -1546,6 +1579,10 @@ class RateLatch:
         #: #1378: the far-from-the-mark cushion reading is said ONCE per latch.
         self._cushion_far_noted = False
         self._free_pool_noted = False
+        #: W98 dmatrix: shmem net of the arena's touched bytes, for the
+        #: "rising" gate of the writers the latch cannot bound.
+        self._last_unbounded_shmem: Optional[float] = None
+        self._bounded_fill_noted = False
 
     def rate_gib_per_s(self) -> Optional[float]:
         """The WORST consecutive slope inside the trailing window, or ``None``.
@@ -1595,6 +1632,7 @@ class RateLatch:
         free_gib: Optional[float] = None,
         ceiling_gib: Optional[float] = None,
         free_source: str = "MemFree",
+        bounded_shm: Optional[Tuple[float, float]] = None,
     ) -> Optional[str]:
         """#1361b: the CUSHION test replaces the remaining-bytes one, measured.
 
@@ -1663,6 +1701,27 @@ class RateLatch:
             )
             if shmem_gib is not None:
                 self._last_shmem = float(shmem_gib)
+            # W98 dmatrix (09291358, 14:07:48): ``bounded_shm`` = (touched,
+            # size) GiB of a writer whose END is known -- the arena files, a
+            # tmpfs file materialises its pages on first write, so its growth
+            # stops at ``size``. A rise of that writer alone is priced against
+            # what can absorb it: remaining + floor <= cushion + free pool, and
+            # the rest of shmem (the writers without a bound) keeps the old
+            # rising gate.
+            bounded_absorbed = False
+            if bounded_shm is not None and shmem_gib is not None:
+                _touched, _size = float(bounded_shm[0]), float(bounded_shm[1])
+                _own = float(shmem_gib) - _touched
+                _own_rising = (
+                    self._last_unbounded_shmem is not None
+                    and _own - self._last_unbounded_shmem > RATE_LATCH_FILL_RISING_GIB
+                )
+                self._last_unbounded_shmem = _own
+                _remaining = max(0.0, _size - _touched)
+                _absorb = float(cushion_gib) + (float(free_gib) if free_gib is not None else 0.0)
+                if rising and not _own_rising and (
+                        _remaining + RATE_LATCH_CUSHION_FLOOR_GIB <= _absorb):
+                    bounded_absorbed = True
             # W98 z30w: inside a finite cgroup the cgroup OOM fires at
             # memory.max, below the recorded host mark (84 vs 95.90 in the
             # Docker form); pricing headroom against the host mark over-states
@@ -1705,6 +1764,22 @@ class RateLatch:
                         f"(weg2xsn65 was torn down on exactly this reading, "
                         f"cushion 0.43 at 9.89 of 95.90, after a cold-cache "
                             f"launch); printed once"
+                        )
+                elif bounded_absorbed:
+                    if not self._bounded_fill_noted:
+                        self._bounded_fill_noted = True
+                        return (
+                            f"WEG2-HOST CUSHION-BELOW-FLOOR BOUNDED-FILL: cushion="
+                            f"{float(cushion_gib):.2f} GiB < floor "
+                            f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} and shmem rises "
+                            f"(shmem={float(shmem_gib):.2f}), but only the arena "
+                            f"grows: touched={float(bounded_shm[0]):.2f} of "
+                            f"{float(bounded_shm[1]):.2f} GiB, remaining "
+                            f"{max(0.0, float(bounded_shm[1]) - float(bounded_shm[0])):.2f} "
+                            f"+ floor fits the absorb {float(cushion_gib) + (float(free_gib) if free_gib is not None else 0.0):.2f} "
+                            f"GiB (cushion + {free_source}; now={nonreclaim_gib:.2f}, "
+                            f"mark={mark:.2f}) -- a tmpfs file stops at its size; "
+                            f"printed once, the unbounded writers keep the latch"
                         )
                 else:
                     self.latched = True

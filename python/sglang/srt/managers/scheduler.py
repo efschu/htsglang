@@ -114,6 +114,7 @@ from sglang.srt.managers.weg2_idle_vote import (
     lap_clock,
     log_fresh_read,
     log_stale_drop,
+    own_work as _weg2_own_work,
     refusal_detail,
     stale_detail,
     stale_reason,
@@ -196,6 +197,7 @@ from sglang.srt.managers.io_struct import (
     VramBudgetReqInput,
     VramBudgetReqOutput,
     Weg2ParkRunningReqInput,
+    Weg2ParkWindowReqInput,
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
@@ -3791,6 +3793,7 @@ class Scheduler(
                 (SessionCheckpointReqInput, self.handle_session_checkpoint),
                 (VramBudgetReqInput, self.handle_vram_budget),
                 (Weg2ParkRunningReqInput, self.handle_weg2_park_running),
+                (Weg2ParkWindowReqInput, self.handle_weg2_park_window),
                 (Weg2VisionVerdict, self.handle_weg2_vision_verdict),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
@@ -6206,11 +6209,19 @@ class Scheduler(
     def handle_weg2_park_running(self, recv_req):
         """H91b: ``POST /weg2/park_running`` -- park every running D request
         before D's sleep (d_park_runtime.park_running)."""
-        from sglang.srt.weg2 import d_park_runtime
+        from sglang.srt.weg2 import d_park_runtime, park_window_gate
 
+        park_window_gate.clear(self, "park")  # the window fired: its deadline is spent
         return d_park_runtime.park_running(
             self, recv_req, late_hold_armed=_weg2_dormant_admit_armed()
         )
+
+    def handle_weg2_park_window(self, recv_req) -> None:
+        """PARK-WINDOW-GATE: the front's open collect window (deadline and D's
+        cost line) or its clear; no reply (weg2/park_window_gate)."""
+        from sglang.srt.weg2 import park_window_gate
+
+        park_window_gate.note(self, recv_req)
 
     def weg2_d_hold_parked(self) -> int:
         """H91b: the sleep leg's dormant point -- parked requests enter the
@@ -6725,6 +6736,12 @@ class Scheduler(
                         os.remove(_p)
                 except OSError:
                     pass
+        except Exception:  # noqa: BLE001
+            pass
+        try:  # PARK-WINDOW-GATE: a window of the last D phase never outlives the wake
+            from sglang.srt.weg2 import park_window_gate as _pwg
+
+            _pwg.clear(self, "wake")
         except Exception:  # noqa: BLE001
             pass
         if not hold:
@@ -16528,6 +16545,19 @@ class Scheduler(
                 _note_skip("weg2_x_refused", req.rid)
                 _x_refused.append(req)
                 continue
+            # PARK-WINDOW-GATE (29.09.): while the front's collect window is
+            # open, no extend whose forward ends after its deadline -- the park
+            # must not wait for it. Inert without a window (every term replicated).
+            if getattr(self, "_weg2_park_window", None) is not None:
+                from sglang.srt.weg2 import park_window_gate as _pwg
+
+                _pw_unc = int(self.weg2_uncached_extent(req, _head_inputs))
+                if _pwg.defers(self, req, uncached=_pw_unc,
+                               prefix_tokens=max(0, len(req.fill_ids) - _pw_unc),
+                               batch_empty=not adder.can_run_list,
+                               running_n=len(self.running_batch.reqs)):
+                    _note_skip("weg2_park_window", req.rid)
+                    continue
             # WEG2 VISION (D side): priced like W31 -- the GROUP's match, no
             # new collective -- so the verdict is the same on every rank.
             if getattr(self, "_weg2_vision_d_guard", False):
@@ -19516,21 +19546,32 @@ class Scheduler(
                 _t0 = time.perf_counter()
                 _issued = 0
                 _stats = {}
-                for _round in range(64):
-                    _stats = _sweep(max_issue=256) or {}
-                    _issued += int(_stats.get("issued", 0) or 0)
-                    if int(_stats.get("unbacked", 0) or 0) == 0:
-                        break
+                # kvs2 W3 (boot ...kvdemandbar1dauer09291534): the poll's own
+                # publish work is not the idle lap's age (weg2_idle_vote.own_work).
+                with _weg2_own_work():
+                    for _round in range(64):
+                        _stats = _sweep(max_issue=256) or {}
+                        _issued += int(_stats.get("issued", 0) or 0)
+                        if int(_stats.get("unbacked", 0) or 0) == 0:
+                            break
+                        # kvs2 W3: a round that issued nothing with nothing in
+                        # flight cannot be followed by one that does -- no pin
+                        # frees, no write lands. Measured: 4 such rounds of
+                        # 1.2 s per poll (issued=0 unbacked_left=37, arena
+                        # full), 4.6-5.0 s ahead of the idle read on every poll.
+                        if (int(_stats.get("issued", 0) or 0) == 0
+                                and int(_stats.get("pending", 0) or 0) == 0):
+                            break
+                        if _wc is not None:
+                            _wc(write_back=True)  # free the pins, then sweep again
+                        if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:
+                            break
                     if _wc is not None:
-                        _wc(write_back=True)  # free the pins, then sweep again
-                    if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:
-                        break
-                if _wc is not None:
-                    _wc(write_back=True)
+                        _wc(write_back=True)
                 logger.info(
                     "#1470 FLUSH-PUBLISH issued=%d unbacked_left=%s in_flight_after=%s waited_ms=%.0f "
                     "(un-backed nodes published and their write-throughs joined BEFORE the reset)",
-                    _issued, _stats.get("unbacked"), _stats.get("in_flight_after"),
+                    _issued, _stats.get("unbacked"), _stats.get("pending"),
                     (time.perf_counter() - _t0) * 1000.0)
         group_idle, verdict_detail = self.group_idle_verdict(
             tp_group_verdict=tp_group_verdict
