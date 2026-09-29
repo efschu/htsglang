@@ -99,6 +99,11 @@ def _l3p_inheritance_from_env() -> Tuple[float, Tuple[str, ...]]:
 # rate-limited emitter that prints no suppressed count turns a throttle into
 # an apparent zero).
 _EVICT_LOG_INTERVAL_S = 10.0
+#: EVICT_OFFPATH: a lock-held batch of the background evictor ends after this many victims OR this much lock
+#: time, whichever comes first (~28 us per unlink on the rig's L3, S1 29.09.: 6.3 GB / ~170k files in 4.8 s).
+#: A reserve()/commit() behind it waits one batch -- at most one unlink past the time bound -- never a run.
+_BG_EVICT_BATCH = 256
+_BG_EVICT_BATCH_S = 0.005
 # Above this, a wake re-scan says so. A PRICE TAG, NOT A BOUND: crossing it
 # changes nothing about the scan (see ``rescan`` on why a deadline here would
 # make a rank-uniform verdict depend on wall clock).
@@ -364,6 +369,13 @@ class LRUFileEvictor:
         self._min_free_refusals: int = 0
         self._last_evict_log = 0.0
         self._evict_runs_suppressed = 0
+        # EVICT_OFFPATH (29.09.): the bulk eviction leaves reserve() for a thread no reset joins (see environ).
+        self._evict_offpath = bool(envs.SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH.get())
+        self._bg_evict_event = threading.Event()
+        self._bg_evict_thread: Optional[threading.Thread] = None
+        self._bg_evict_runs = 0
+        self._bg_evict_reclaimed = 0
+        self._last_bg_evict_log = 0.0
 
         self._load_config(extra_config or {})
 
@@ -907,9 +919,22 @@ class LRUFileEvictor:
                     # own. Evicting its whole index would cost the cache and
                     # buy nothing, so refuse first and keep the pages.
                     return self._refuse_cap_unholdable_locked(value_bytes, key)
-                self._evict_locked(value_bytes)
+                if self._evict_offpath:
+                    # Only what THIS write needs, down to the cap itself -- the rest of the way to cap x ratio is
+                    # the background evictor's, off the thread the flush joins.
+                    self._evict_locked(value_bytes,
+                                       target=max(0, self.max_size_bytes - value_bytes))
+                    self._kick_bg_evictor_locked()
+                else:
+                    self._evict_locked(value_bytes)
                 if (self._directory_bytes_locked() + value_bytes) > self.max_size_bytes:
                     return self._refuse_cap_unholdable_locked(value_bytes, key)
+            elif self._evict_offpath and self.max_size_bytes > 0 and (
+                self._directory_bytes_locked() + value_bytes
+            ) > self._bg_evict_high_mark_locked():
+                # Past the midpoint between cap x ratio and the cap: start the background run early, so a write
+                # rarely meets the cap at all.
+                self._kick_bg_evictor_locked()
             # Free-space watermark.
             if self.min_free_bytes > 0 and not self._enforce_free_space_locked(
                 value_bytes
@@ -1856,7 +1881,73 @@ class LRUFileEvictor:
             attempts_left = len(self._lru)
         return reclaimed
 
-    def _evict_locked(self, needed_bytes: int) -> None:
+    def _bg_evict_high_mark_locked(self) -> int:
+        """EVICT_OFFPATH wake mark: halfway between cap x ratio and the cap."""
+        low = int(self.max_size_bytes * self.eviction_ratio)
+        return low + (self.max_size_bytes - low) // 2
+
+    def _kick_bg_evictor_locked(self) -> None:
+        """EVICT_OFFPATH: wake (and on first use start) the background evictor. Caller holds ``_lock``."""
+        if self._bg_evict_thread is None or not self._bg_evict_thread.is_alive():
+            self._bg_evict_thread = threading.Thread(
+                target=self._bg_evictor_loop, name="l3_evictor", daemon=True)
+            self._bg_evict_thread.start()
+        self._bg_evict_event.set()
+
+    def _bg_evictor_loop(self) -> None:
+        """EVICT_OFFPATH: bring the directory down to cap x ratio in batches of ``_BG_EVICT_BATCH`` victims.
+
+        Each victim goes through the SAME ``_evict_one_lru_locked`` under the SAME ``_lock`` as before -- index,
+        l3_index, on_evict and the journal ``E`` line change together with the unlink, so no reader is ever handed
+        an index entry whose file this loop removed without it. The lock is dropped between batches, so a
+        ``reserve()`` (the backup thread the #1068 RESET JOIN waits for) waits at most one batch.
+        """
+        while True:
+            self._bg_evict_event.wait()
+            self._bg_evict_event.clear()
+            t0, reclaimed, before = time.monotonic(), 0, None
+            while True:
+                with self._lock:
+                    if self.max_size_bytes <= 0:
+                        break
+                    target = int(self.max_size_bytes * self.eviction_ratio)
+                    cur = self._directory_bytes_locked()
+                    if before is None:
+                        before = cur
+                    if cur <= target:
+                        break
+                    n, t_b = [0], time.monotonic()
+
+                    def more(_r, n=n, target=target, t_b=t_b):
+                        n[0] += 1
+                        return (n[0] == 1 or (n[0] <= _BG_EVICT_BATCH
+                                              and time.monotonic() - t_b < _BG_EVICT_BATCH_S)) \
+                            and self._directory_bytes_locked() > target
+
+                    got = self._evict_while(more)
+                    reclaimed += got
+                    stuck = got == 0 and self._directory_bytes_locked() > target
+                if stuck:
+                    break  # nothing evictable left (pending / sibling / pinned): the cap path names it
+                time.sleep(0)  # let a waiting reserve() take the lock between batches
+            if before is None:
+                continue
+            with self._lock:
+                self._bg_evict_runs += 1
+                self._bg_evict_reclaimed += reclaimed
+                after = self._directory_bytes_locked()
+                now = time.monotonic()
+                if (now - self._last_bg_evict_log) < _EVICT_LOG_INTERVAL_S:
+                    continue
+                self._last_bg_evict_log = now
+            logger.info(
+                f"HiCacheFile EVICTION-BG on {self.file_path!r}: reclaimed {reclaimed} B in "
+                f"{(time.monotonic() - t0) * 1000:.0f} ms (batches <= {_BG_EVICT_BATCH} or {_BG_EVICT_BATCH_S * 1000:.0f} ms, off the reset-joined "
+                f"threads); directory {before} -> {after} B toward cap {self.max_size_bytes} B x ratio "
+                f"{self.eviction_ratio:.2f}; runs {self._bg_evict_runs}, total {self._bg_evict_reclaimed} B"
+            )
+
+    def _evict_locked(self, needed_bytes: int, target: Optional[int] = None) -> None:
         """Evict LRU entries until DIRECTORY + needed <= cap*ratio.
 
         Caller holds _lock. #1295: the low-water mark is measured over the
@@ -1872,7 +1963,8 @@ class LRUFileEvictor:
         """
         if self.max_size_bytes <= 0:
             return
-        target = max(0, int(self.max_size_bytes * self.eviction_ratio) - needed_bytes)
+        if target is None:
+            target = max(0, int(self.max_size_bytes * self.eviction_ratio) - needed_bytes)
         before = self._directory_bytes_locked()
         reclaimed = self._evict_while(lambda _: self._directory_bytes_locked() > target)
         # EXECUTION PROOF AT INFO, not debug. On the boot of record the only
