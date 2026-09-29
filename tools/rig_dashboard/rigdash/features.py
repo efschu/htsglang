@@ -566,6 +566,9 @@ def _cur_lifecycle(lb, fb, gpus):
 
 
 def _cur_transport(lb, fb, gpus):
+    t = (lb.get("ipc") or {}).get("transport")
+    if t:
+        return ("Transport %s" % t, "state.json groups.launch.env HTSGLANG_TRANSPORT")
     tag = ((lb.get("meta") or {}).get("tag") or lb.get("stem") or "").lower()
     t = "bar1" if "bar1" in tag else ("nccl" if "nccl" in tag else None)
     return ("Transport %s" % t, "Boot-Tag (state.json launch.env HTSGLANG_TRANSPORT ab z30s)") if t else None
@@ -585,6 +588,10 @@ def _cur_context(lb, fb, gpus):
 
 
 def _cur_api(lb, fb, gpus):
+    served = (lb.get("front") or {}).get("served")
+    if isinstance(served, dict) and served:
+        return ("%s Anfragen bedient (P %s / D %s)" % (served.get("D", 0), served.get("P", 0), served.get("D", 0)),
+                "Front /weg2/state served")
     tot = lb.get("totals") or {}
     return ("%s Anfragen bedient" % tot["served_requests"], "front.log WEG2-SERVED") if tot.get("served_requests") else None
 
