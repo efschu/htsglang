@@ -4921,6 +4921,8 @@ class Front:
         # #1262 tier 3 -- the deadman's third signal, see flip_stall_check.
         app["flip_stall"] = asyncio.create_task(self.flip_stall_sampler())
         app["host_watermark"] = asyncio.create_task(self.host_watermark_sampler())
+        # DASHBOARD-AUS-IPC (b): the front's own keys under state.json `front`.
+        app["ipc_front"] = asyncio.create_task(self.ipc_front_writer())
         # H75 (x174): resolve_x_live imports the launcher module on its first
         # call, i.e. inside the first completed flip, and that import costs
         # 5-7 s. On the event loop it froze the whole front for that long
@@ -5836,6 +5838,95 @@ class Front:
             "WEG2-FLIP REFUSED-STOP epoch=%s sleep=%s wake=%s (%s): the front is in STOP "
             "(%s) -- a named teardown is final, no flip after it",
             getattr(self, "epoch", "?"), src, dst, when, getattr(self, "stop", None))
+
+    # ---------------- DASHBOARD-AUS-IPC (a)/(b): flip + front keys as records ----------------
+    def _ipc_submit(self, fn: Callable[..., Any], *args: Any) -> None:
+        """One state-dir write in the front's own IPC thread (BOUNDED FIFO, never on
+        the loop, never on the flip): a blocked writer drops the oldest entries
+        (front.ipc_dropped) instead of piling up RAM. A failed write is counted
+        and logged, never raised."""
+        w = self.__dict__.get("_ipc_writer")
+        if w is None:
+            from sglang.srt.weg2 import front_state_ipc
+            w = self.__dict__["_ipc_writer"] = front_state_ipc.BoundedWriter(
+                on_error=self._ipc_failed)
+        w.submit(fn, *args)
+
+    def _ipc_failed(self, fn: Callable[..., Any], e: Exception) -> None:
+        logger.warning("WEG2 IPC WRITE FAILED %s: %s: %s", getattr(fn, "__name__", fn),
+                       type(e).__name__, e)
+
+    def _ipc_publish(self, typ: str, data: dict) -> None:
+        """An event of the front into the boot's events.jsonl; no state dir = no-op."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        d = envs.WEG2_STATE_DIR.get() or None
+        if d:
+            self._ipc_submit(front_state_ipc.publish_event, d, typ, data)
+
+    def _ipc_first_work_clock(self):
+        from sglang.srt.weg2 import front_state_ipc
+
+        c = self.__dict__.get("_ipc_fw_clock")
+        if c is None:
+            c = self.__dict__["_ipc_fw_clock"] = front_state_ipc.FirstWorkClock()
+        return c
+
+    def _ipc_first_work_seen(self, group: str, what: str, rid: Optional[str]) -> None:
+        """The woken group's first work after a flip -> one ``flip_first_work`` event
+        (the flip time from the front's one clock). Cheap when nothing is armed."""
+        c = self.__dict__.get("_ipc_fw_clock")
+        if c is None:
+            return
+        ev = c.seen(group, what, rid, time.time())
+        if ev is not None:
+            self._ipc_publish("flip_first_work", ev)
+
+    def _ipc_front_fields(self) -> dict:
+        """The front's own keys under state.json `front` (never the host's mirror keys)."""
+        out: Dict[str, Any] = {"ts": round(time.time(), 3)}
+        out["outstanding_by_group"] = {g.name: len(g.outstanding) for g in self.groups.values()}
+        out["served"] = {g.name: g.served for g in self.groups.values()}
+        out["served_tokens"] = dict(self.__dict__.get("_ipc_served_tokens") or {})
+        out["d_phase_n"] = getattr(self, "_d_phase_n", None)
+        out["d_parked_n"] = len(getattr(self, "_d_parked", None) or {})
+        health = {}
+        for g in self.groups.values():
+            f = getattr(g, "health_facts", None)
+            health[g.name] = {"http_ok": getattr(f, "http_ok", None) if f is not None else None,
+                              "alive": getattr(f, "alive", None) if f is not None else None,
+                              "streak": int(getattr(g, "health_fail_streak", 0) or 0),
+                              "ts": round(getattr(f, "t", 0.0) or 0.0, 3) if f is not None else None}
+        out["groups"] = health
+        w = self.__dict__.get("_ipc_writer")
+        out["ipc"] = {"queue": w.depth() if w else 0, "max": w.maxlen if w else None,
+                      "dropped": w.dropped if w else 0, "failed": w.failed if w else 0}
+        return out
+
+    def _ipc_note_served(self, group: str, prompt: int, cached: int, completion: int) -> None:
+        st = self.__dict__.setdefault("_ipc_served_tokens", {})
+        row = st.setdefault(group, {"n": 0, "prompt": 0, "cached": 0, "completion": 0})
+        row["n"] += 1
+        row["prompt"] += int(prompt or 0)
+        row["cached"] += int(cached or 0)
+        row["completion"] += int(completion or 0)
+
+    async def ipc_front_writer(self, period_s: float = 5.0) -> None:
+        """(b) every ``period_s``: the front's keys into state.json `front` through
+        state_file (writer front). No state dir = the task ends at once."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        d = envs.WEG2_STATE_DIR.get() or None
+        if not d:
+            return
+        while True:
+            await asyncio.sleep(period_s)
+            try:
+                fields = self._ipc_front_fields()
+            except Exception as e:  # noqa: BLE001 -- an instrument never stops the front
+                logger.debug("WEG2 IPC front fields not built: %s: %s", type(e).__name__, e)
+                continue
+            self._ipc_submit(front_state_ipc.publish_front_fields, d, fields)
 
     def _publish_stop_state(self, name: str, detail: str, state_before: str) -> None:
         """IPC §2.2 (user law: control never over log lines): the STOP into the
@@ -7095,6 +7186,8 @@ class Front:
         at the head, ends the drain and flips (weg2xsn272). ``bound`` 0 =
         today's unbounded await. getattr: partial test fronts have no flag.
         """
+        # DASHBOARD-AUS-IPC (a): the first leg 1 dispatched after a D->P flip.
+        self._ipc_first_work_seen("P", "p_leg1_dispatch", getattr(p, "rid", None))
         bound = float(getattr(self, "p_leg1_stall_s", 0.0) or 0.0)
         if bound <= 0:
             return await post
@@ -7206,6 +7299,7 @@ class Front:
             # and there is nothing to correct here; above the cap the front
             # refuses at admission, before P's prefill is spent.
             g.served += 1
+            self._ipc_note_served("P", pt, ct, 0)
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
         finally:
@@ -7540,6 +7634,8 @@ class Front:
                                 rid, self.epoch, ("d_direct" if pending is None
                                                  else "d_single" if single_prefill else "after_p"),
                                 (time.time() - t0) * 1000.0)
+                    # DASHBOARD-AUS-IPC (a): D's first content after a P->D flip = first decode token.
+                    self._ipc_first_work_seen("D", "decode_token", rid)
                 if _has_content and front_span_inflight() and self.spans.agent_span:
                     # #49 rest: D has produced this leg's first content, so it
                     # has PREFILLED the whole prompt into its radix, where a
@@ -7757,6 +7853,7 @@ class Front:
                                                  resumable_depth=_depth)
                     dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
                                                      mark=_pfc_mark0)
+                    self._ipc_note_served("D", pt, ct, comp)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                                 "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
@@ -7788,6 +7885,7 @@ class Front:
                     return web.json_response({"error": f"W28 Weg2Leg2Unpriced rid={rid}"}, status=503)
                 verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid)
                 g.served += 1
+                self._ipc_note_served("D", pt, ct, comp)
                 dterms = await self._draft_terms(g, js, rid=rid, uncached=max(0, pt - ct),
                                                  mark=_pfc_mark0)
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
@@ -8933,6 +9031,12 @@ class Front:
         self._flip_stage = "drain"
         self._flip_marks["drain"] = time.time()
         logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d", self.epoch, src, dst, len(S.outstanding), len(self.queue))
+        # DASHBOARD-AUS-IPC (a): the begin as a record (IPC thread, not on the flip).
+        # The woken group's first work is timed from here (armed at the begin, not at
+        # `done`: with the tail overlap D can stream before the front logs `done`).
+        self._ipc_publish("flip_begin", {"epoch_before": self.epoch, "sleep": src, "wake": dst,
+                                         "flip_begin_ts": round(t_flip0, 3)})
+        self._ipc_first_work_clock().arm(self.epoch + 1, src, dst, t_flip0)
         # H91 part C rule 2: the wake message to D carries the hand-off count
         # (`handoff_n`, plus `parked_n`) on its kv_cache resume -- every one of
         # the three sites below. Unbound call: partial test fronts work too.
@@ -9480,6 +9584,9 @@ class Front:
             # while it is in flight (dc_mib {} until then, never a fake zero).
             rec["dc_off_path"] = True
         self.flip_log.append(rec)
+        # DASHBOARD-AUS-IPC (a): the flip_log record as `flip_done` (same begin stamp).
+        from sglang.srt.weg2 import front_state_ipc as _fsi
+        self._ipc_publish("flip_done", _fsi.flip_done_payload(rec, t_flip0))
         if dc_off_path:
             _t = asyncio.get_running_loop().create_task(self._dc_reading_off_path(src, S.sid, rec))
             self._dc_tasks.add(_t)

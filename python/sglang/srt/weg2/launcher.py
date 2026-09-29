@@ -12181,7 +12181,19 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
         # Nutzer 29.09.: rigdash liest daraus „aktiv“ je Schalter (argv redigiert wie im Log).
         boot_state_write(log, "loading", fields={f"groups.{spec.name}": {
             "state": "loading", "pids": [p.pid], "ready_ts": None, "rankstate_dir": _rs_dir, "ranks": [],
-            "launch": state_file_mod.launch_snapshot(admin_key_mod.redact_argv(spec.argv), spec.env)}})
+            "launch": state_file_mod.launch_snapshot(admin_key_mod.redact_argv(spec.argv), spec.env),
+            "form": group_form_block(spec.env)}})
+
+
+def group_form_block(env) -> Optional[dict]:
+    """DASHBOARD-AUS-IPC (e): the boot form this group was handed (the one
+    :data:`weg2_form.FORM_ENV` every rank reads), as ``groups.<G>.form`` -- the
+    rigdash's start form then comes from state.json, not from the log's
+    WEG2-FORM line. ``None`` = no weg2 form published (teardown, desk test)."""
+    f = weg2_form.current_form(env)
+    if f is None:
+        return None
+    return {**f.axes(), "profile": f.profile, "model": f.model, "describe": f.describe()}
 
 
 def release_shared_cache(spec_d: GroupSpec, log: Log) -> Optional[dict]:
