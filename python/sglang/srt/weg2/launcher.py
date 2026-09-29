@@ -4776,6 +4776,78 @@ def refuse_unwired_token_cut(ns, boot_form) -> None:
         "--dry-run prints the planned cut; a real boot needs every seam built.")
 
 
+class Weg2FormBWindowRefused(Weg2LaunchRefused):
+    """F15 (4): a Form B D group (``--rank-tp-ratio`` with >= 2 weight ranks and
+    a zero, in --extra-d) whose BAR1 windows do not fit a card
+    (rank_form.check_form_b_windows, W187) -- refused before any rank loads,
+    not at the model_tp group's build on metal."""
+
+
+#: 5090 BAR1 is the resizable 32 GiB aperture; the 3080's 256 MiB less the RM
+#: carve-out is rank_form.BAR1_USABLE_MIB_3080 (#1234 C1).
+FORM_B_BAR1_USABLE_BIG_MIB = 32768
+
+
+def _model_is_moe(model_path: str) -> bool:
+    """True when the checkpoint routes experts (NF): its tp window carries the
+    MoE combine and may not shrink (NF answer 4). Unreadable config = MoE, the
+    stricter window rule."""
+    import json
+
+    try:
+        with open(os.path.join(model_path, "config.json")) as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return True
+    return int((cfg.get("text_config") or cfg).get("num_experts_per_tok") or 0) > 0
+
+
+def refuse_form_b_windows(ns, cards) -> Optional[str]:
+    """F15 (4): if group D runs Form B, its BAR1 windows per card must fit, with
+    group P's windows (one P rank per card, P_BARLINK_BAR1_WINDOW_MIB) as
+    residents. D rank r sits on cards[r] (one rank per card, order_cards).
+    Returns the launch line, None when D is not Form B; raises W187 by name."""
+    from sglang.srt import rank_form as rf
+
+    extra_d = str(getattr(ns, "extra_d", "") or "")
+    w = _argv_vector(extra_d, "--rank-tp-ratio")
+    if not w or _argv_scalar(extra_d, "--rank-role") is not None:
+        return None
+    try:
+        weights = [int(x) for x in w]
+    except ValueError:
+        return None
+    if not (any(x == 0 for x in weights) and sum(1 for x in weights if x > 0) >= 2):
+        return None
+    toks = _argv_vector(extra_d, "--uneven-token-vector")
+    if len(cards) != len(weights):
+        raise Weg2FormBWindowRefused(
+            f"W187 Weg2RankFormBar1Window: Form B --rank-tp-ratio {weights} names "
+            f"{len(weights)} ranks, D runs one rank per card on {len(cards)} card(s)")
+    form = rf.resolve_rank_form(weights, [int(t) for t in toks] if toks else None,
+                                subgroup_tp_wired=True)   # the shape; F6/F15 refuse elsewhere
+    plan = rf.form_b_plan(form)
+    moe = _model_is_moe(str(getattr(ns, "model", "") or ""))
+    # the spec D RUNS: argv_d emits rf.D_WINDOW_SPEC_TODAY and appends extra_d
+    # last, so an --extra-d window flag wins (argparse: last one counts)
+    spec = _argv_scalar(extra_d, "--barlink-bar1-window-mib") or rf.D_WINDOW_SPEC_TODAY
+    uuids = [c.uuid for c in cards]
+    usable = {c.uuid: (rf.BAR1_USABLE_MIB_3080 if "3080" in c.name else FORM_B_BAR1_USABLE_BIG_MIB)
+              for c in cards}
+    resident = {c.uuid: rf.p_resident_posts(str(getattr(ns, "p_barlink_bar1_window_mib", "")
+                                                 or P_BARLINK_BAR1_WINDOW_MIB)) for c in cards}
+    try:
+        posts = rf.check_form_b_windows(plan, uuids, usable, moe=moe, window_spec=spec,
+                                        resident_mib_by_card=resident)
+    except rf.RankFormBar1Window as e:
+        raise Weg2FormBWindowRefused(
+            f"{e} -- the Form B windows of a {'MoE' if moe else 'dense'} model are "
+            f"--extra-d '--barlink-bar1-window-mib {rf.form_b_window_spec(moe=moe)}'") from e
+    return (f"FORM-B BAR1 windows ({spec}, {'MoE' if moe else 'dense'}): "
+            + "; ".join(f"{c.name} {sum(v for k, v in posts[c.uuid].items() if k != 'headroom')}"
+                        f"/{usable[c.uuid]} MiB (headroom {posts[c.uuid]['headroom']})" for c in cards))
+
+
 class Weg2TokenCutFlipNotWired(Weg2LaunchRefused):
     """#239 S3h: a FLIP boot under the token cut (``kv=qsa_forma_dcp`` with P)
     in a form whose P->D hand-off is not wired.
@@ -21607,6 +21679,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards_free_check(cards, log)
     cvd = ",".join(c.uuid for c in cards)
     state.cvd = cvd
+    # F15 (4): a Form B D group's BAR1 windows per card, before any rank loads.
+    _fb_line = refuse_form_b_windows(ns, cards)
+    if _fb_line:
+        log(_fb_line)
     # #1348 (review MF-1): THE BOOT DECLARES WHO MUST REPORT, here, where the
     # rank count is first known. A report derived from the dumps it FOUND can
     # never notice a rank that wrote nothing -- which is the #1329 shape and

@@ -1433,6 +1433,13 @@ class HiCacheController:
             if group is None or torch.distributed.get_world_size(group=group) == 1:
                 continue
             group_ranks = tuple(torch.distributed.get_process_group_ranks(group))
+            # F6 step 3: prefetch/claim votes are control traffic -- ALL ranks
+            # under Form B, never the weight-rank model_tp group.
+            from sglang.srt.rank_role import COLLECTIVE_CONTROL, guard_collective_subgroup
+
+            guard_collective_subgroup(
+                COLLECTIVE_CONTROL, group, "cache_controller.prefetch_sync"
+            )
             if group_ranks in seen_rank_sets:
                 continue
             seen_rank_sets.add(group_ranks)

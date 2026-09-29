@@ -2913,6 +2913,14 @@ class Scheduler(
         self.tp_cpu_group = self.tp_group.cpu_group
         self.attn_tp_group = get_parallel().attn_tp_group
         self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
+        # F6 step 3 (reversed guard, NF objection 1): the scheduler's control
+        # groups span ALL ranks under Form B -- never the weight-rank model_tp.
+        from sglang.srt.rank_role import COLLECTIVE_CONTROL, guard_collective_subgroup
+
+        guard_collective_subgroup(COLLECTIVE_CONTROL, self.tp_group, "scheduler.tp_group")
+        guard_collective_subgroup(
+            COLLECTIVE_CONTROL, self.attn_tp_group, "scheduler.attn_tp_group"
+        )
         self.attn_cp_group = get_parallel().attn_cp_group
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
@@ -21624,7 +21632,9 @@ def configure_scheduler_process(
     set_tp_partition_ratios(
         base_plan,
         families=uneven_family_plans(server_args) or None,
-        allow_zero=server_args.form_a_active(),
+        # F15 (2): Form B's KV-only ranks own no dense shard either -- the same
+        # plan property, installed with the vector.
+        allow_zero=server_args.form_a_active() or server_args.form_b_active(),
     )
 
     # ... and the role plan alongside it, for the same reason: the loader
@@ -21657,7 +21667,7 @@ def configure_scheduler_process(
     _dcp_size = getattr(server_args, "dcp_size", 1)
     if (
         _dcp_size > 1
-        and base_plan is not None
+        and (base_plan is not None or getattr(server_args, "weightless_kv_fastlane", False))
         and server_args.uneven_weighted_dcp_enabled()
     ):
         # #897: SGLANG_UNEVEN_TOKEN_VECTOR beats --rank-kv-ratio on PRESENCE
@@ -21699,6 +21709,19 @@ def configure_scheduler_process(
     # broadcast from head rank; O merge -> sliced back to head rank only),
     # independently of --rank-tp-ratio. None keeps every other path
     # byte-identical.
+    # F15 (5b): Form B (dense) is the lane over the head SET W -- the weight
+    # ranks with their shares; the lead (min W) is the token/accept source. A
+    # MoE model is refused by name at the model runner (W189).
+    if server_args.form_b_active():
+        from sglang.srt.distributed.utils import set_weightless_kv_weight_ranks
+        from sglang.srt.rank_form import form_b_head_set
+
+        _w, _wr = form_b_head_set(
+            server_args.form_b_model_tp_partition(), server_args.rank_tp_ratio
+        )
+        set_weightless_kv_weight_ranks(_w, _wr)
+        logger.info("Form B: weightless head set W=%s shares=%s (lead %d); every other "
+                    "rank a weightless KV worker.", list(_w), _wr, _w[0])
     if getattr(server_args, "weightless_kv_fastlane", False):
         from sglang.srt.distributed.utils import set_weightless_kv_head_rank
 

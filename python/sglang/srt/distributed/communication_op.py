@@ -9,20 +9,27 @@ import torch.distributed
 
 from .parallel_state import (
     get_attn_tp_group,
+    get_attn_tp_layer_group,
     get_moe_ep_group,
     get_moe_tp_group,
+    get_model_tp_group,
     get_tp_group,
 )
 
 
+# Rank form / F6 step 2b: the MODEL's linear and vocab collectives run on
+# get_model_tp_group() -- Form B's weight ranks when F6 is on, otherwise exactly
+# the TP group (byte-identical). Control traffic (broadcast_tensor_dict, the
+# scheduler's broadcast_pyobj / tp_cpu_group) stays on get_tp_group(), which
+# spans ALL ranks (NF objection 1).
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    return get_tp_group().all_reduce(input_)
+    return get_model_tp_group().all_reduce(input_)
 
 
 def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    return get_tp_group().quant_all_reduce(input_)
+    return get_model_tp_group().quant_all_reduce(input_)
 
 
 def tensor_model_parallel_fused_allreduce_rmsnorm(
@@ -37,21 +44,21 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     it may dispatch to communicator-native fused APIs, custom fused kernels,
     or return None so callers can run generic fallback paths.
     """
-    return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
+    return get_model_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
 
 
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:
     """All-gather the input tensor across model parallel group."""
-    return get_tp_group().all_gather(input_, dim)
+    return get_model_tp_group().all_gather(input_, dim)
 
 
 def tensor_model_parallel_gather(
     input_: torch.Tensor, dst: int = 0, dim: int = -1
 ) -> Optional[torch.Tensor]:
     """Gather the input tensor across model parallel group."""
-    return get_tp_group().gather(input_, dst, dim)
+    return get_model_tp_group().gather(input_, dst, dim)
 
 
 def broadcast_tensor_dict(
@@ -64,14 +71,14 @@ def broadcast_tensor_dict(
 
 def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across attention parallel group."""
-    return get_attn_tp_group().all_reduce(input_)
+    return get_attn_tp_layer_group().all_reduce(input_)
 
 
 def attention_tensor_model_parallel_quant_all_reduce(
     input_: torch.Tensor,
 ) -> torch.Tensor:
     """All-reduce the input tensor across attention parallel group."""
-    return get_attn_tp_group().quant_all_reduce(input_)
+    return get_attn_tp_layer_group().quant_all_reduce(input_)
 
 
 def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:

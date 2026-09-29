@@ -589,6 +589,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         _wl_target = _wl_fastlane and not is_draft_worker
         self.is_weightless_head = _wl_target and self.tp_rank == _wl_head
         self.is_weightless_worker = _wl_target and self.tp_rank != _wl_head
+        # F15 (5b): Form B (dense) runs the SAME two roles over the head SET W
+        # (installed by the scheduler, distributed.utils.
+        # set_weightless_kv_weight_ranks): a weight rank is a "head" (it builds
+        # as one of |W| ranks, rank_form.form_b_build_context -- NOT the lane's
+        # TP=1), every other rank a weightless KV worker. A MoE model is refused
+        # by name (W189): its KV-only rank holds experts (NF answer 1).
+        self.is_form_b_head = False
+        _fb_part = (
+            server_args.form_b_model_tp_partition()
+            if hasattr(server_args, "form_b_model_tp_partition")
+            else None
+        )
+        if _fb_part is not None and not is_draft_worker:
+            from sglang.srt.distributed.utils import is_weightless_head_rank
+            from sglang.srt.rank_form import form_b_kv_path
+
+            form_b_kv_path(model_config.hf_config)
+            self.is_weightless_head = is_weightless_head_rank(self.tp_rank)
+            self.is_weightless_worker = not self.is_weightless_head
+            self.is_form_b_head = self.is_weightless_head
         if self.is_weightless_worker:
             logger.info(
                 "Weightless-KV fast lane: rank %d is a WEIGHTLESS KV worker "
@@ -2198,6 +2218,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
             )
+            # F15 (2): Form B's model_tp partition ([W] + one group per
+            # KV-only rank) goes in BEFORE the groups are built -- every rank
+            # builds every group (torch rule), so the list is the same
+            # everywhere (it comes from the pickled ServerArgs). None on every
+            # other boot: initialize_model_parallel builds no model_tp group.
+            from sglang.srt.distributed.parallel_state import set_model_tp_partition
+
+            set_model_tp_partition(self.server_args.form_b_model_tp_partition())
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 attention_data_parallel_size=self.dp_size,
@@ -2814,13 +2842,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         attn_tp_rank=0,
                     )
                     if (
-                        self.is_weightless_head
+                        (self.is_weightless_head and not self.is_form_b_head)
                         or self.is_weightless_worker
                         or self.is_draft_solo_host
                         or self.is_draft_solo_shadow
                     )
                     else contextlib.nullcontext()
                 )
+                # F6 step 2c: a Form B weight rank builds as one of |W| ranks
+                # with its index in W and the weight vector restricted to W
+                # (rank_form.form_b_build_context); a KV-only rank is refused
+                # by name there (W188, seam F15). None without a Form B
+                # partition -- the context above stands, byte-identical.
+                from sglang.srt.rank_form import form_b_build_context
+
+                # The solo draft (host and shadows) keeps its own TP=1 override.
+                _fb_ctx = (
+                    None
+                    if (
+                        (self.is_weightless_head and not self.is_form_b_head)
+                        or self.is_weightless_worker
+                        or self.is_draft_solo_host
+                        or self.is_draft_solo_shadow
+                    )
+                    else form_b_build_context(self.tp_rank)
+                )
+                if _fb_ctx is not None:
+                    _wl_build_ctx = _fb_ctx
                 with _wl_build_ctx:
                     if self.is_dual_group_lane:
                         # Multi-group runtime (#274): the lane's model is not

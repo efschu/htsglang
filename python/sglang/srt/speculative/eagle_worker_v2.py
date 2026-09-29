@@ -1256,6 +1256,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _solo_send_draft_tokens(self, draft_tokens: torch.Tensor, bs: int) -> None:
         """Solo host: broadcast this round's k chain token ids — the ONE
         cross-rank transfer of the whole draft phase."""
+        from sglang.srt.speculative import form_b_spec as fbs
+
+        if fbs.form_b_spec_active():
+            # F6 step 4: over dcp, fixed form [bs, k_max] padded.
+            k = int(self.speculative_num_steps)
+            fbs.broadcast_padded(
+                draft_tokens.reshape(bs, k).to(torch.int64).contiguous(),
+                (bs, k), fbs.draft_block_numel(bs),
+                dtype=torch.int64, device=self.device,
+            )
+            return
         group = self._solo_tp_group()
         if group.world_size == 1:
             return
@@ -1268,6 +1279,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def _solo_recv_draft_tokens(self, bs: int) -> torch.Tensor:
         """Shadow rank: receive the solo rank's k chain token ids."""
+        from sglang.srt.speculative import form_b_spec as fbs
+
+        if fbs.form_b_spec_active():
+            k = int(self.speculative_num_steps)
+            return fbs.broadcast_padded(
+                None, (bs, k), fbs.draft_block_numel(bs),
+                dtype=torch.int64, device=self.device,
+            )
         group = self._solo_tp_group()
         payload = torch.empty(
             (bs, self.speculative_num_steps), dtype=torch.int64, device=self.device
@@ -2573,6 +2592,30 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
             self._arm_chain_policy()
+        self._arm_form_b_spec()
+
+    def _arm_form_b_spec(self) -> None:
+        """F6 step 4: under Form B install k_max (the largest BUILT chain length,
+        else the static one) for the fixed-form spec broadcasts, and refuse a
+        draft that is not solo on the lead. A no-op on every other boot."""
+        from sglang.srt.speculative import form_b_spec as fbs
+
+        if not fbs.form_b_spec_active():
+            return
+        lead = fbs.form_b_lead()
+        if not self._spec_solo_active or int(self._spec_solo_rank) != lead:
+            raise fbs.FormBSpecError(
+                f"{fbs.FormBSpecError.code}: Form B drafts solo on the lead (rank "
+                f"{lead}); got solo={self._spec_solo_active} rank="
+                f"{self._spec_solo_rank}. Pass --speculative-draft-placement solo "
+                "with the lead as the draft rank."
+            )
+        built = (
+            self.adaptive_controller.built_steps
+            if self.adaptive_controller is not None
+            else []
+        )
+        fbs.set_spec_k_max(max(built) if built else int(self.speculative_num_steps))
 
     def _arm_chain_policy(self) -> None:
         """Build the per-round policy over the chain lengths that got built.
@@ -3275,12 +3318,37 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def activate_step_by_batch(self, batch_size: int) -> None:
         if self.adaptive_controller is None:
             return
+        from sglang.srt.speculative import form_b_spec as fbs
+
+        if fbs.form_b_spec_active():
+            self._form_b_activate_round(batch_size)
+            return
         if self.chain_policy is not None and self._apply_chain_policy():
             # The per-round survival policy owns the chain length while it is
             # armed; running the batch-size EMA on top would have the two
             # fight over the same runtime state within one round.
             return
         self.adaptive_controller.activate_step_by_batch(batch_size)
+
+    def _form_b_activate_round(self, batch_size: int) -> None:
+        """F6 step 4 (NF objection 3): this round's k is the LEAD's, published
+        over dcp BEFORE the draft; every rank adopts it. Only the lead runs the
+        chain policy / batch EMA -- its survival curve is the only real one, and
+        the KV-only ranks have no draft at all. Replaces the decision-round
+        consensus (_agree_chain_length is identity under Form B)."""
+        from sglang.srt.speculative import form_b_spec as fbs
+
+        k_lead = None
+        if int(self.tp_rank) == fbs.form_b_lead():
+            if not (self.chain_policy is not None and self._apply_chain_policy()):
+                self.adaptive_controller.activate_step_by_batch(batch_size)
+            k_lead = int(self.speculative_num_steps)
+        k = fbs.spec_k(k_lead, device=self.device)
+        if k != int(self.speculative_num_steps) and not self.adaptive_controller.activate_steps(k):
+            raise fbs.FormBSpecError(
+                f"{fbs.FormBSpecError.code}: rank {self.tp_rank} has no runtime "
+                f"state for the lead's k={k} (built {self.adaptive_controller.built_steps})."
+            )
 
     def _apply_chain_policy(self) -> bool:
         """Pick this round's chain length from the last round's survival curve.
@@ -3347,7 +3415,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         import torch.distributed as dist
 
         from sglang.srt.distributed import get_tp_group
+        from sglang.srt.speculative.form_b_spec import form_b_spec_active
 
+        if form_b_spec_active():
+            # F6 step 4: only the lead runs the policy; the per-round spec_k
+            # over dcp (_form_b_activate_round) is the agreement.
+            return proposal
         if not dist.is_initialized():
             return proposal
         group = get_tp_group().cpu_group

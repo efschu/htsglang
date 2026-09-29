@@ -181,6 +181,54 @@ class _DflashDraftSampler:
         self.out[: tokens.shape[0]].copy_(tokens)
 
 
+def _form_b_accept_follower(worker) -> bool:
+    """F15 (5e): a Form B head that is not the lead (it computed an accept of
+    its own and must take the lead's). False on the lane and every other boot."""
+    from sglang.srt.speculative import form_b_spec as fbs
+
+    if not fbs.form_b_spec_active():
+        return False
+    return int(worker.tp_rank) != int(fbs.form_b_lead())
+
+
+def _solo_src_in(group, solo_tp_rank: int) -> int:
+    """The solo draft rank (a TP-group rank) as a rank IN ``group``. Classic
+    (group IS the TP group) that is ``solo_tp_rank`` itself; under Form B the
+    model tp group W, where the lead may sit at another index."""
+    tp = get_tp_group()
+    if group is tp:
+        return int(solo_tp_rank)
+    return list(group.ranks).index(tp.ranks[int(solo_tp_rank)])
+
+
+def _model_tp_group():
+    """F6 2b: the group the draft's vocab shards live on -- Form B's model_tp
+    (weight ranks W) when a partition is installed, else THIS module's
+    ``get_tp_group()``. Resolved through the module-level name on purpose, so
+    the classic path is the exact call it was (and a test that patches
+    ``dflash_worker_v2.get_tp_group`` still reaches it)."""
+    from sglang.srt.distributed.parallel_state import get_model_tp_group_no_assert
+
+    mt = get_model_tp_group_no_assert()
+    return mt if mt is not None else get_tp_group()
+
+
+class _LaneNoTpSync:
+    """G-A1: the weightless lane's stand-in for SpecTpSync -- the head is the one
+    decider (see DFlashWorkerV2._lane_accept_broadcast), nothing to sync."""
+
+    def sync(self, site, values):
+        return values
+
+    def enabled(self, site) -> bool:
+        return False
+
+    def available_memory_gb(self, site, device, gpu_id, *, group):
+        from sglang.srt.utils import get_available_gpu_memory
+
+        return get_available_gpu_memory(device, gpu_id)
+
+
 def _commit_accept(candidates, accept_len, bonus_tokens):
     """The committed block: drafted tokens shifted left, the bonus at the accept
     boundary. Returns it with the commit lengths."""
@@ -495,6 +543,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         # this worker then reads its context features from the latter.
         self._cross_dual_capture = False
         self._tp_sync = SpecTpSync(get_tp_group())
+        if getattr(server_args, "weightless_kv_fastlane", False):
+            # G-A1: on the lane the head decides alone and publishes ONE accept
+            # broadcast (_lane_accept_broadcast); the rank-0 decision syncs
+            # would be collectives the stripped workers never join.
+            self._tp_sync = _LaneNoTpSync()
 
         bundle = build_draft_tp_worker(
             server_args=server_args,
@@ -534,6 +587,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self._spec_solo_active
             else 0
         )
+        # F6 step 4: under Form B the spec broadcasts come from the LEAD (min
+        # of the weight ranks); a solo draft anywhere else would publish a
+        # block nobody drafted. Named refusal; a no-op off Form B.
+        from sglang.srt.speculative import form_b_spec as _fbs
+
+        if (_fbs.form_b_spec_active() and self._spec_solo_active
+                and int(self._spec_solo_rank) != _fbs.form_b_lead()):
+            raise _fbs.FormBSpecError(
+                f"{_fbs.FormBSpecError.code}: Form B drafts solo on the lead (rank "
+                f"{_fbs.form_b_lead()}), but --speculative-draft-placement solo "
+                f"put the DFLASH draft on rank {self._spec_solo_rank}."
+            )
         # 19.09. (Punkt 5, D-Kapazitaet): SGLANG_DFLASH_SOLO_COMPACT=1 lets the
         # solo host keep the compact draft cache (the shadows run no draft,
         # write no draft KV and skip the round prep, so they never touch the
@@ -877,6 +942,50 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _solo_is_shadow(self) -> bool:
         return self._spec_solo_active and not self._spec_solo_is_host
 
+    def _lane_role(self) -> Optional[str]:
+        """G-A1 (rank form 28.09.): ``"head"`` / ``"worker"`` on the weightless-KV
+        lane, else None. A boot-time role of the TARGET runner, rank-uniform in
+        meaning, so every branch below is decided identically on both sides."""
+        mr = getattr(self.target_worker, "model_runner", None)
+        if getattr(mr, "is_weightless_worker", False):
+            return "worker"
+        if getattr(mr, "is_weightless_head", False):
+            return "head"
+        return None
+
+    def _lane_accept_broadcast(
+        self, bs: int, accept_len: Optional[torch.Tensor], bonus: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """G-A1: THE one accept collective of a DFLASH round on the lane.
+
+        The head owns the only lm_head (the workers run a stripped attention-only
+        forward and have no logits), so it decides alone and publishes
+        ``(accept_len, bonus)`` once, packed int64 [2, bs], from
+        ``spec_accept_broadcast_src`` (the lane head); every worker receives and
+        derives the committed block from the replicated draft block. On the lane
+        this REPLACES every ``_tp_sync`` decision broadcast (rank 0 is not
+        necessarily the head, and a worker could not join them)."""
+        from sglang.srt.speculative.eagle_utils import spec_accept_broadcast_src
+
+        if accept_len is not None:
+            buf = torch.stack(
+                (accept_len.to(torch.int64).reshape(bs), bonus.to(torch.int64).reshape(bs))
+            ).contiguous()
+        else:
+            buf = torch.empty((2, bs), dtype=torch.int64, device=self.device)
+        from sglang.srt.speculative import form_b_spec as fbs
+
+        if fbs.form_b_spec_active():
+            # F6 step 4: over dcp from the lead. [2, bs] is already the fixed
+            # form (no k in it); the lead is the one rank with the lm_head row
+            # that decided.
+            fbs.broadcast_padded_inplace(buf, 2 * bs)
+            return buf[0], buf[1]
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1:
+            capture_safe_tp_broadcast(tp_group, (buf,), src=spec_accept_broadcast_src())
+        return buf[0], buf[1]
+
     def _solo_hidden_broadcast_buf(self, num_tokens: int) -> torch.Tensor:
         """Grow-only [num_tokens, hidden] staging buffer for the per-round
         hidden-state broadcast. Rank-uniform shape/dtype by construction."""
@@ -911,7 +1020,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         deadlock the round.
         """
         buf = self._solo_hidden_broadcast_buf(num_tokens)
-        tp_group = get_tp_group()
+        # F15 (3): the hidden feeds the VOCAB-PARALLEL head, whose shards live
+        # on the model tp group -- Form B's weight ranks W (a KV-only rank sits
+        # alone there and skips: it holds no lm_head shard). Classic: the TP
+        # group and the solo rank, exactly as before.
+        tp_group = _model_tp_group()
         if tp_group.world_size == 1 or num_tokens == 0:
             # Nothing to publish (or nobody to publish to). num_tokens is
             # rank-uniform, so skipping stays symmetric.
@@ -928,7 +1041,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Host: stage into the rank-uniform buffer (this is also the cast
             # to the lm_head weight dtype the greedy matmul would do anyway).
             buf.copy_(hidden_states)
-        capture_safe_tp_broadcast(tp_group, (buf,), src=self._spec_solo_rank)
+        capture_safe_tp_broadcast(tp_group, (buf,), src=_solo_src_in(tp_group, self._spec_solo_rank))
         return buf
 
     def _solo_broadcast_selector_sample(self, bs: int, sampling_info) -> None:
@@ -940,7 +1053,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling params are the same batch on every rank."""
         if _is_all_greedy(sampling_info):
             return
-        tp_group = get_tp_group()
+        # F15 (3): the selector sample goes where the verify's accept scatter
+        # runs over the vocab shards -- the model tp group (Form B: W; a
+        # KV-only rank alone, skips). Classic: the TP group, as before.
+        tp_group = _model_tp_group()
         if tp_group.world_size == 1:
             return
         gamma = int(self.block_size) - 1
@@ -958,13 +1074,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             dev = self.device
             cand = torch.empty((bs, gamma, top_k), dtype=torch.int64, device=dev)
             q = torch.empty((bs, gamma, top_k), dtype=torch.float32, device=dev)
-        capture_safe_tp_broadcast(tp_group, (cand, q), src=self._spec_solo_rank)
+        capture_safe_tp_broadcast(tp_group, (cand, q), src=_solo_src_in(tp_group, self._spec_solo_rank))
         self._selector_sample = (cand, q)
 
     def _solo_broadcast_draft_block(self, draft_tokens: torch.Tensor) -> None:
         """One broadcast per round: the host's [bs, block_size] draft block to
         the shadow ranks. Eager (never inside a captured region); capture-safe
         primitive so co-located rigs work too."""
+        from sglang.srt.speculative import form_b_spec as fbs
+
+        if fbs.form_b_spec_active():
+            # F6 step 4: over dcp from the lead; [bs, block_size] -- the DFLASH
+            # block is boot-fixed, so it IS the k_max-padded form.
+            fbs.broadcast_padded_inplace(draft_tokens, int(draft_tokens.numel()))
+            return
         tp_group = get_tp_group()
         if tp_group.world_size == 1:
             return
@@ -2068,8 +2191,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             return out_tokens
 
         shard = lm_head.shard_indices
-        tp_group = get_tp_group()
-        tp_size = int(tp_group.world_size)
+        # F6 2b: the vocab shards live on the MODEL tp group (Form B: W only)
+        tp_group = _model_tp_group()
+        # G-A1: a head BUILT at TP=1 (the weightless lane's head) owns the whole
+        # vocab; there is nobody to gather with, whatever the group's size.
+        tp_size = 1 if int(getattr(lm_head, "tp_size", 0) or 0) == 1 else int(tp_group.world_size)
 
         # Valid ranges in the local shard (excluding padding):
         #   base vocab:  [0, num_org)
@@ -2991,6 +3117,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         still consumed afterwards by the meta-worker's NEXTN warm-keeping
         catch-up, which nulls them when done.
         """
+        if logits_output is None:  # G-A1: a lane worker has no logits at all
+            return
         if self._cross_dual_capture:
             logits_output.cross_aux_hidden_states = None
         else:
@@ -3007,8 +3135,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch_output.logits_output,
             batch_output.next_token_ids,
         )
-        target_hidden = self._target_context_hidden(logits_output)
-        if target_hidden is None:
+        # G-A1: a lane worker has no hidden states (stripped forward) and, as a
+        # solo shadow, writes no draft KV; next_token_ids reached it from the
+        # head through tp_worker's lane token broadcast.
+        _lane_worker = self._lane_role() == "worker"
+        target_hidden = None if _lane_worker else self._target_context_hidden(logits_output)
+        if target_hidden is None and not _lane_worker:
             raise RuntimeError(
                 "DFLASH requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
@@ -3315,7 +3447,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         # can size the broadcast buffer without hearing from the host.
         num_sample_tokens = bs * (int(self.block_size) - 1)
 
-        if self._solo_is_shadow:
+        if self._solo_is_shadow and self._lane_role() == "worker":
+            # G-A1 lane worker: no weights at all (a meta target), so it is NOT
+            # a vocab-shard provider -- the lane head drafts TP=1-locally
+            # (embedding, lm_head and selector gathers are collective-free on a
+            # TP=1-built head, see gather_candidate_topk). It only receives the
+            # proposed block, the single draft-phase collective of a lane round.
+            self._selector_sample = None
+            self._solo_broadcast_draft_block(draft_tokens)
+            self._audit_mark("blk_bcast")  # DFLASH AUDIT (env-gated)
+        elif self._solo_is_shadow:
             # Shadow rank: runs NO draft forward, but is a vocab-shard logit
             # provider for the host's draft sampling. It must therefore join,
             # in this exact order, every collective the host issues below:
@@ -3652,7 +3793,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._draft_sampler.q_out[:bs],
                     )
             elif self.selector is not None:
-                if self._spec_solo_active:
+                if self._spec_solo_active and self._lane_role() is None:
                     # 19.09. (xsn388) solo HOST with the DFlash2 selector: the
                     # lattice and the sample are rank-local (the host's own
                     # draft codebooks), but `compute_candidates` all-gathers
@@ -3676,7 +3817,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     anchor_token_ids=block_ids[:, 0],
                     sampling_info=batch.sampling_info,
                 )
-                if self._spec_solo_active:
+                if self._spec_solo_active and self._lane_role() is None:
                     self._solo_broadcast_selector_sample(bs, batch.sampling_info)
             else:
                 draft_hidden = draft_logits_output.hidden_states
@@ -3686,7 +3827,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
                 draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
                 sample_hs = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
-                if self._spec_solo_active:
+                if self._spec_solo_active and self._lane_role() is None:
                     # Solo host: publish the trunk's hidden states (EAGER —
                     # the graph replay above has already returned) and then run
                     # the SAME vocab-parallel greedy reduction the split path
@@ -3777,17 +3918,42 @@ class DFlashWorkerV2(BaseSpecWorker):
         _d_hostgap_split_mark("verify")
         self._audit_mark("verify")  # DFLASH AUDIT (env-gated)
 
+        _lane = self._lane_role()
+        if _lane == "worker":
+            # G-A1: no logits here (stripped attention-only verify). Receive the
+            # head's decision, derive the committed block from the replicated
+            # draft block; no Mamba commit (the head owns the one GDN state),
+            # no logprobs (head-only), no draft KV (the solo head owns it).
+            accept_len, bonus = self._lane_accept_broadcast(bs, None, None)
+            out_tokens, commit_lens = _commit_accept(draft_tokens, accept_len, bonus)
+            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+            if on_publish is not None:
+                on_publish(new_seq_lens)
+            self._audit_mark("accept")  # DFLASH AUDIT (env-gated)
+            self._audit_round_end()
+            return GenerationBatchResult(
+                logits_output=None,
+                next_token_ids=out_tokens.reshape(-1),
+                accept_lens=commit_lens,
+                can_run_cuda_graph=can_run_cuda_graph,
+                next_draft_input=self._make_next_draft_input_decode(
+                    bonus_tokens=bonus, new_seq_lens=new_seq_lens
+                ),
+                speculative_num_draft_tokens=int(self.block_size),
+                new_seq_lens=new_seq_lens,
+            )
+
         # SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX: the verify forward left this
         # rank's vocab SHARD (no [rows, vocab] all_gather at the end of the
         # graph). A plain-greedy round takes the vocab-parallel argmax -- one
         # [rows, 2] int64 all_gather; every other round gathers the full
         # logits here, with the processor's own ops, and proceeds unchanged.
         vocab_target_predict = None
-        _vlp = self._verify_local_vocab_processor()
+        _vlp = self._verify_local_vocab_processor() if _lane is None else None
         if _vlp is not None and logits_output.next_token_logits is not None:
             if self._verify_vocab_argmax_eligible(batch, sampling_info, lm_head, _vlp):
                 _shard = lm_head.shard_indices
-                _tp = get_tp_group()
+                _tp = _model_tp_group()
                 vocab_target_predict = vocab_parallel_argmax(
                     logits_output.next_token_logits,
                     int(_shard.num_org_elements),
@@ -3943,6 +4109,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                     target_predict=target_predict,
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+
+        if _lane == "head":
+            _acc, _bon = self._lane_accept_broadcast(bs, accept_len, bonus)
+            # F15 (5e): under Form B there is more than one head; every head but
+            # the LEAD receives here and must ADOPT the lead's decision (its own
+            # near-tie argmax may differ -- the #622 class), then re-derive the
+            # committed block from it. The lane has one head, the sender: its
+            # own values stand, byte-identical.
+            if _form_b_accept_follower(self):
+                accept_len = _acc.to(accept_len.dtype)
+                bonus = _bon.to(bonus.dtype)
+                out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+                new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
 
         # === DFLASH AUDIT (env-gated) ===
         self._audit_mark("accept")

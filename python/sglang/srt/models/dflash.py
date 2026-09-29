@@ -85,6 +85,13 @@ def gather_candidate_topk(
         k,
     )
     global_ids = ids.long() + int(shard.org_vocab_start_index)
+    if int(getattr(lm_head, "tp_size", 0) or 0) == 1:
+        # G-A1 (rank form 28.09.): a head BUILT at TP=1 -- the weightless lane's
+        # head -- owns the whole vocab; there is nobody to gather with, whatever
+        # the TP group's size. Same result as a tp=1 group: the gather is the
+        # identity and the final top-k orders the candidates.
+        top_vals, sel = torch.topk(vals.float(), k, dim=-1)
+        return torch.gather(global_ids, -1, sel).long(), top_vals
     gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
     gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)

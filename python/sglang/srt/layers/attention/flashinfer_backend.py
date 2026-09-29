@@ -902,6 +902,7 @@ class FlashInferAttnBackend(AttentionBackend):
             tp_partition_sizes,
             uneven_dcp_active,
             uneven_dcp_kv_replicated,
+            weightless_dcp_head_counts,
             weightless_head_counts,
             weightless_kv_active,
         )
@@ -1038,10 +1039,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 # token's K,V from the head rank via the [total_kv,0,0]
                 # all-gather (the weightless ranks pass an empty [T,0,D] shard).
                 self.dcp_kv_replicated_heads = False
-                self.dcp_q_head_counts = weightless_head_counts(
-                    mc.num_attention_heads, attn_tp_size
+                # F15 (5c): over a head SET W (Form B) the heads split by the
+                # W shares in whole GQA groups -- the SAME units/groups the W
+                # ranks' qkv/o projections were built with (form_b_build_context,
+                # tp_partition_sizes over |W|); the lane (a set of one) ignores
+                # them and stays [total, 0, ...].
+                (
+                    self.dcp_q_head_counts,
+                    self.dcp_kv_head_counts,
+                ) = weightless_dcp_head_counts(
+                    mc.num_attention_heads, total_kv, attn_tp_size
                 )
-                self.dcp_kv_head_counts = weightless_head_counts(total_kv, attn_tp_size)
                 # Compute dtype for the weightless worker's empty [T,0,D]
                 # contributions -- must match the head rank's projected Q/K/V
                 # dtype so the padded all-gather shapes/dtypes agree.

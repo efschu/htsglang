@@ -30,7 +30,6 @@ that is wired loses its guard; a seam that is not keeps it until it is.
 
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -50,6 +49,10 @@ __all__ = [
     "guard_draft_worker",
     "guard_dense_weights",
     "guard_collective_subgroup",
+    "check_collective_group",
+    "FormBCollectiveWrongGroup",
+    "COLLECTIVE_CONTROL",
+    "COLLECTIVE_LAYER",
     "guard_graph_mode",
     "FormAWorkerDenseGraph",
     "GRAPH_BODY_MOE_ROUTE",
@@ -294,14 +297,25 @@ SEAM_LIST: Tuple[Seam, ...] = (
     Seam(
         "F6",
         "a collective over a SUBSET of the ranks",
-        "distributed/parallel_state.py:1042-1068 (one communicator per "
-        "GroupCoordinator; barlink knows no subgroups)",
-        wired=False,
-        note="Form A's decode path needs no subgroup as long as the MoE "
-        "exchange spans all ranks; it becomes necessary when the dense "
-        "layers want a collective the workers must not join.",
+        "distributed/parallel_state.py init_model_tp_group / get_model_tp_group / "
+        "get_attn_tp_layer_group (Form B's model_tp: its own GroupCoordinator, gloo "
+        "cpu_group and barlink communicator), distributed/communication_op.py "
+        "(tensor_model_parallel_* on model_tp), rank_role.py "
+        "guard_collective_subgroup (control never on model_tp, layer never on tp), "
+        "speculative/form_b_spec.py (spec_k + fixed-form broadcasts over dcp), "
+        "rank_form.py (check_form_b_windows W187, form_b_build_context)",
+        wired=True,
+        note="F6 steps 2-6 + 2c (28.09., FORM-B-F6-ENTWURF-0928 v2): the "
+        "subgroup exists and every layer collective reaches it; the "
+        "scheduler group stays ALL ranks (NF objection 1). Proven on CPU by "
+        "test_form_b_f6_trace_0928 (product paths: one sequence per "
+        "communicator). What a Form B BOOT still needs is seam F15.",
         anchors=(
-            ("distributed/parallel_state.py", 618, "class GroupCoordinator"),
+            ("distributed/parallel_state.py", 3087, "def init_model_tp_group"),
+            ("distributed/communication_op.py", 27,
+             "get_model_tp_group().all_reduce(input_)"),
+            ("rank_role.py", 1026, "def guard_collective_subgroup"),
+            ("speculative/form_b_spec.py", 145, "def spec_k("),
         ),
     ),
     Seam(
@@ -472,6 +486,30 @@ SEAM_LIST: Tuple[Seam, ...] = (
              "class FormAWorkerNullStorage"),
         ),
     ),
+    # ---- Form B (rank form 28.09.): the boot path on top of F6 ----
+    Seam(
+        "F15",
+        "Form B's boot path: the vectors admitted, the model_tp partition "
+        "installed from them, the KV-only ranks built and run",
+        "server_args.py (--rank-tp-ratio zeros admitted only with --rank-role "
+        "or the lane), model_executor/model_runner.py (form_b_build_context "
+        "refuses a KV-only rank, W188; nobody calls set_model_tp_partition "
+        "before initialize_model_parallel), rank_form.py "
+        "(RankFormKvRankBuild; check_form_b_windows has no launcher caller)",
+        wired=False,
+        note="Open: (1) server_args admits a Form B vector by name and "
+        "installs FormBPlan.model_tp_partition before initialize_model_parallel; "
+        "(2) a KV-only rank builds on meta (no weight load) and runs the "
+        "attention-only forward with [T, 0, D] (the lane worker's shape, "
+        "N1/N9); (3) the DFLASH draft-hidden and selector broadcasts move off "
+        "tp for Form B (K ranks skip them); (4) the weg2 launcher calls "
+        "check_form_b_windows (W187) before any rank loads.",
+        anchors=(
+            ("rank_form.py", 681, "class RankFormKvRankBuild"),
+            ("model_executor/model_runner.py", 2868,
+             "form_b_build_context(self.tp_rank)"),
+        ),
+    ),
 )
 
 SEAMS: Dict[str, Seam] = _index_seams(SEAM_LIST)
@@ -479,7 +517,7 @@ SEAMS: Dict[str, Seam] = _index_seams(SEAM_LIST)
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F6",)
+UNWIRED_ORDER: Tuple[str, ...] = ("F15",)
 
 #: #239 S3e: the seams a real boot of the token cut (kv=qsa_forma_dcp) stands
 #: on -- F4 (a worker's KV share), F5 (the LSE merge with zero-head ranks),
@@ -777,7 +815,9 @@ def kv_only_rank() -> bool:
     * the installed Form A plan: a worker with a share > 0 under the #239
       token cut (:func:`form_a_worker_holds_kv`);
     * the weightless-KV lane: every rank but the head, as long as its owner
-      range is not empty (the lane refuses a 0 share, W181).
+      range is not empty (the lane refuses a 0 share, W181);
+    * Form B (F15): a rank outside the weight group W of the installed
+      model_tp partition (:func:`form_b_kv_rank`), with owner rows.
 
     Readers ask this, never a backend name: the claim vote's min arm and
     the host-state pool split (cache_controller), the F14 page window, the
@@ -791,6 +831,9 @@ def kv_only_rank() -> bool:
         weightless_worker_rank,
     )
 
+    if form_b_kv_rank():
+        bounds = uneven_dcp_owner_bounds()
+        return bounds is None or int(bounds[2]) > int(bounds[1])
     if not weightless_kv_active():
         return False
     from sglang.srt.runtime_context import get_parallel
@@ -799,6 +842,25 @@ def kv_only_rank() -> bool:
         return False
     bounds = uneven_dcp_owner_bounds()
     return bounds is None or int(bounds[2]) > int(bounds[1])
+
+
+def form_b_kv_rank(rank: Optional[int] = None) -> bool:
+    """F15: True on a Form B rank outside the weight group W (the installed
+    model_tp partition's one multi-rank part) -- dense share 0 by
+    construction. :func:`kv_only_rank` adds the owner-rows half (NF answer 1:
+    share 0 WITHOUT token rows is the byteless expert worker, not KV-only).
+    False on every boot without a Form B partition."""
+    from sglang.srt.distributed import parallel_state as ps
+
+    part = ps.get_model_tp_partition()
+    if part is None:
+        return False
+    if rank is None:
+        from sglang.srt.runtime_context import get_parallel
+
+        rank = get_parallel().tp_rank
+    weight = [p for p in part if len(p) >= 2]
+    return bool(weight) and int(rank) not in weight[0]
 
 
 def form_a_token_src_rank() -> Optional[int]:
@@ -881,12 +943,108 @@ def guard_draft_worker(plan: RankRolePlan, rank: int) -> None:
         )
 
 
-def guard_collective_subgroup(plan: RankRolePlan, name: str) -> None:
-    """Called where a collective must span only the dense ranks (F6)."""
-    require_wired(
-        "F6",
-        f"collective {name!r} would have to run over the host alone, but "
-        "the transport has no subgroup.",
+#: F6 step 3 (FORM-B-F6-ENTWURF-0928.md v2 §5, NF objection 1): the two kinds
+#: of collective the reversed guard tells apart. A CLOSED vocabulary, same rule
+#: as GRAPH_BODIES: a caller that invents a third spelling is refused.
+COLLECTIVE_CONTROL = "control"  # scheduler / cache: request + host exchange,
+#                                 prefetch/claim votes, tp_match_floor MINs
+COLLECTIVE_LAYER = "layer"      # the model's linear/vocab collectives
+COLLECTIVE_KINDS: Tuple[str, ...] = (COLLECTIVE_CONTROL, COLLECTIVE_LAYER)
+
+
+class FormBCollectiveWrongGroup(RankRoleError):
+    """A Form B collective was handed the wrong communicator. Its own class,
+    not a seam-not-wired: the refusal IS the feature and survives F6 being
+    wired (same reasoning as FormAZeroWidthLinear)."""
+
+
+def check_collective_group(
+    kind: str,
+    group_ranks: Sequence[int],
+    model_tp_ranks: Optional[Sequence[int]],
+    all_ranks: Sequence[int],
+    name: str = "",
+) -> None:
+    """The reversed F6 guard, as arithmetic over rank sets (testable without
+    a process group).
+
+    Under Form B there are two TP communicators and they must never be
+    confused (draft v2 §2):
+
+    * ``tp`` -- ALL ranks. The scheduler and the cache controller live here:
+      a KV-only rank must see every request, every prefetch/claim vote and
+      every tp_match_floor MIN, or it falls out of the lockstep.
+    * ``model_tp`` -- the weight ranks W (a KV-only rank alone). Only the
+      model's linear/vocab collectives live here: a KV-only rank holds no
+      shard and never enters them.
+
+    A CONTROL collective on ``model_tp`` leaves the KV-only ranks out (they
+    block on the next control op forever); a LAYER collective on ``tp`` makes
+    W wait for ranks that never issue it -- both are hangs, not errors, so
+    both are refused here by name. ``model_tp_ranks=None`` (no Form B
+    partition installed) and ``model_tp == tp`` are the classic path: nothing
+    is checked.
+    """
+    if kind not in COLLECTIVE_KINDS:
+        raise RankRoleError(
+            f"{kind!r} is not a collective kind; known: {list(COLLECTIVE_KINDS)}."
+        )
+    if model_tp_ranks is None:
+        return
+    mt, allr, g = tuple(model_tp_ranks), tuple(all_ranks), tuple(group_ranks)
+    if mt == allr:
+        return
+    if kind == COLLECTIVE_CONTROL and g != allr:
+        raise FormBCollectiveWrongGroup(
+            f"Form B: the control collective {name!r} (scheduler / cache) was "
+            f"handed the group {list(g)}, but control traffic spans ALL ranks "
+            f"{list(allr)} (get_tp_group()). "
+            + ("That is this rank's model_tp group -- the weight ranks only; "
+               if g == mt else "")
+            + "a KV-only rank left out of it blocks on the next control op."
+        )
+    if kind == COLLECTIVE_LAYER and g != mt:
+        raise FormBCollectiveWrongGroup(
+            f"Form B: the layer collective {name!r} was handed the group "
+            f"{list(g)}, but the model's linear/vocab collectives run on "
+            f"model_tp {list(mt)} (get_model_tp_group()). "
+            + ("That is the ALL-ranks scheduler group; " if g == allr else "")
+            + "the KV-only ranks hold no shard and never issue it -- the "
+            "weight ranks would wait for them forever."
+        )
+
+
+def _group_ranks(group) -> Tuple[int, ...]:
+    ranks = getattr(group, "ranks", None)
+    if ranks is not None:
+        return tuple(ranks)
+    import torch.distributed as dist
+
+    return tuple(dist.get_process_group_ranks(group))
+
+
+def guard_collective_subgroup(kind: str, group, name: str = "") -> None:
+    """F6 step 3, the REVERSED guard (draft v2 §5, NF objection 1).
+
+    Called where a collective picks its communicator: raises
+    :class:`FormBCollectiveWrongGroup` if a scheduler/cache collective
+    (``kind=COLLECTIVE_CONTROL``) gets the weight-rank group ``model_tp``, or
+    a layer collective (``kind=COLLECTIVE_LAYER``) gets the all-ranks group
+    ``tp``. ``group`` is a GroupCoordinator or a torch ProcessGroup.
+
+    On every boot without a Form B partition this is one module attribute
+    read and a return -- the classic path is untouched.
+    """
+    from sglang.srt.distributed import parallel_state as ps
+
+    mt = ps._MODEL_TP
+    if mt is None:
+        if kind not in COLLECTIVE_KINDS:
+            check_collective_group(kind, (), None, ())
+        return
+    check_collective_group(
+        kind, _group_ranks(group), tuple(mt.ranks), tuple(ps.get_tp_group().ranks),
+        name,
     )
 
 
@@ -1138,8 +1296,9 @@ def _resolve_token_cut(
             f"{vec}: a token cut over {n} ranks is DCP over all {n}. Drop the "
             "flag; the cut decides the DCP group."
         )
-    g = math.gcd(*vec)
-    reduced = tuple(v // g for v in vec)
+    from sglang.srt.distributed.utils import reduce_token_vector
+
+    reduced = tuple(reduce_token_vector(vec) or [1] * n)
     return DcpResolution(
         dcp_size=n,
         uneven_dcp_kv_replicated=True,

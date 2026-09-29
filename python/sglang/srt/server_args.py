@@ -7872,7 +7872,24 @@ class ServerArgs:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         algo = SpeculativeAlgorithm.from_string(self.speculative_algorithm)
-        if algo.is_frozen_kv_mtp() or not algo.is_eagle():
+        if algo.is_dflash():
+            # G-A1 (rank form 28.09.): DFLASH as a CHAIN on the lane. The draft
+            # runs solo on the head, TP=1-locally (its embedding, lm_head and
+            # selector gathers are collective-free on a TP=1-built head); the
+            # workers join exactly (a) the draft-block broadcast, (b) the
+            # verify's per-layer DCP dispatch (TARGET_VERIFY is an extend over
+            # bs*block rows, causal) and (c) ONE accept broadcast from the head
+            # (DFlashWorkerV2._lane_accept_broadcast). A TREE verify
+            # (--speculative-dflash-tree-verify) masks draft->draft with a
+            # stride the owner-sharded prefix no longer describes: refused.
+            if getattr(self, "speculative_dflash_tree_verify", False):
+                raise ValueError(
+                    "--weightless-kv-fastlane supports DFLASH as a chain only; "
+                    "--speculative-dflash-tree-verify is refused (a tree mask's "
+                    "row stride is the GLOBAL prefix, which the lane's "
+                    "owner-sharded prefix no longer describes). W184 Weg2RankFormLaneSpec"
+                )
+        elif algo.is_frozen_kv_mtp() or not algo.is_eagle():
             # FROZEN_KV_MTP is is_eagle() but reads the TARGET's KV pool in
             # place; on the lane that pool is token-sharded across the workers,
             # so no single rank holds what the frozen draft needs. DFLASH /
@@ -10875,6 +10892,8 @@ class ServerArgs:
             os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0") == "1"
             or self.uneven_kv_flag_active()
             or bool(self.form_a_dcp_vector())
+            # rank form (28.09.): the #239 token vector on the weightless lane
+            or bool(self.weightless_kv_fastlane and self.uneven_token_vector)
         )
 
     def world_rank(self, pp_rank: int, tp_rank: int) -> int:
@@ -11077,6 +11096,63 @@ class ServerArgs:
         """True when this boot is the attention-host layout."""
         return bool(self.rank_role)
 
+    # ---- Form B (rank form 28.09., seam F15) -------------------------------
+    def _form_b_candidate(self) -> bool:
+        """--rank-tp-ratio names Form B: >= 2 weight ranks and >= 1 zero, no
+        --rank-role (that is #239 Form A), not the weightless lane (form A of a
+        dense model, admitted by _admit_lane_rank_tp_ratio)."""
+        r = self.rank_tp_ratio
+        if not isinstance(r, list) or self.rank_role or self.weightless_kv_fastlane:
+            return False
+        if any(not isinstance(x, int) for x in r):
+            return False
+        return any(x == 0 for x in r) and sum(1 for x in r if x > 0) >= 2
+
+    def _admit_form_b(self) -> None:
+        """Seam F15 (1): a Form B vector is admitted BY NAME, through the one
+        resolver (rank_form.resolve_rank_form: W181 shape, W182 while F6 is
+        unwired, W188 while F15 is), and only inside its scope: pure TP on one
+        node, every rank in DCP (the spec channel and the KV cut run over dcp
+        == tp), no pipeline, no data/DP-attention parallelism."""
+        from sglang.srt.rank_form import RankFormError, form_b_plan, resolve_rank_form
+
+        raw = self.uneven_token_vector or os.environ.get("SGLANG_UNEVEN_TOKEN_VECTOR") or None
+        tokens = None
+        if raw is not None and str(raw).strip():
+            tokens = [int(x) for x in str(raw).split(",") if x.strip()]
+        why = []
+        if self.pp_size > 1:
+            why.append(f"--pp-size {self.pp_size}")
+        if self.dp_size > 1 or self.enable_dp_attention:
+            why.append("data / DP-attention parallelism")
+        if self.dcp_size != self.tp_size:
+            why.append(f"--dcp-size {self.dcp_size} != --tp-size {self.tp_size} "
+                       "(Form B's KV and spec channel run over dcp = ALL ranks)")
+        if why:
+            raise ValueError(
+                f"--rank-tp-ratio {self.rank_tp_ratio} is Form B (weight ranks over a "
+                f"subset, KV-only ranks beside them), which runs pure TP x DCP only; "
+                f"refused: {'; '.join(why)}. W181 Weg2RankFormShapeMismatch")
+        try:
+            form = resolve_rank_form(self.rank_tp_ratio, tokens)
+        except RankFormError as e:
+            raise ValueError(f"--rank-tp-ratio {self.rank_tp_ratio} (Form B): {e}") from e
+        plan = form_b_plan(form)
+        # Underscore attributes: derived, pickled to the scheduler children.
+        self._form_b_partition = plan.model_tp_partition()
+        logger.info("%s -- model_tp %s", form.line(), self._form_b_partition)
+
+    def form_b_active(self) -> bool:
+        """True when this boot is Form B (admitted by _admit_form_b)."""
+        return getattr(self, "_form_b_partition", None) is not None
+
+    def form_b_model_tp_partition(self):
+        """FormBPlan.model_tp_partition of this boot, or None: what
+        parallel_state.set_model_tp_partition installs before
+        initialize_model_parallel."""
+        part = getattr(self, "_form_b_partition", None)
+        return [list(p) for p in part] if part is not None else None
+
     def _validate_rank_role_plan(self) -> None:
         """--rank-role x --rank-tp-ratio: the two must say the same thing.
 
@@ -11181,6 +11257,50 @@ class ServerArgs:
         )
         if res.token_vector:
             logger.info("#239 S3a FORM-A DCP: dcp_size=%d -- %s", res.dcp_size, res.reason)
+
+    def _refuse_second_token_vector_source(self) -> None:
+        """Rank form (28.09., NF review 2): when ``--uneven-token-vector`` is set
+        it is the ONE source of the KV-token ownership vector. An explicit
+        second vector beside it -- ``--rank-kv-ratio a,b,c`` or a
+        ``rank_kv_capacity_seed`` list -- is refused by name instead of losing
+        silently on precedence (#897). A MODE (``--rank-kv-ratio capacity`` /
+        ``speed``) is not a second vector: it measures and supersedes a seed."""
+        if not self.uneven_token_vector:
+            return
+        second = []
+        if isinstance(self.rank_kv_ratio, list):
+            second.append(f"--rank-kv-ratio {','.join(str(v) for v in self.rank_kv_ratio)}")
+        if isinstance(getattr(self, "rank_kv_capacity_seed", None), list):
+            second.append(f"rank_kv_capacity_seed {self.rank_kv_capacity_seed}")
+        if second:
+            raise ValueError(
+                f"--uneven-token-vector {self.uneven_token_vector} is the one source of the "
+                f"KV-token vector; {' and '.join(second)} beside it would lose silently on "
+                "precedence (#897). Drop the second vector. W185 Weg2TokenVectorTwoSources"
+            )
+
+    def _admit_lane_rank_tp_ratio(self) -> None:
+        """--rank-tp-ratio under --weightless-kv-fastlane (rank form, 28.09.):
+        exactly the lane's shape or refused by name, then kept only as
+        ``_lane_rank_tp_ratio`` (the lane places the weights itself)."""
+        ratio = list(self.rank_tp_ratio)
+        head = int(self.weightless_kv_head_rank)
+        want = [f"rank {head} > 0"] + [f"rank {r} = 0" for r in range(len(ratio)) if r != head]
+        if (
+            len(ratio) != self.tp_size
+            or any(not isinstance(r, int) or r < 0 for r in ratio)
+            or not (0 <= head < len(ratio))
+            or ratio[head] <= 0
+            or any(ratio[r] != 0 for r in range(len(ratio)) if r != head)
+        ):
+            raise ValueError(
+                f"--rank-tp-ratio {ratio} under --weightless-kv-fastlane must be the "
+                f"lane's shape for --tp-size {self.tp_size} and --weightless-kv-head-rank "
+                f"{head}: {', '.join(want)} (a KV-only rank holds no weight share). "
+                "W181 Weg2RankFormShapeMismatch"
+            )
+        self._lane_rank_tp_ratio = ratio
+        self.rank_tp_ratio = None
 
     def form_a_dcp_vector(self) -> Optional[List[int]]:
         """#239 S3a: the Form A token cut this boot runs, or None."""
@@ -12190,6 +12310,20 @@ class ServerArgs:
         # self.rank_gpu_id; everything that does stays after the early return.
         # ---------------------------------------------------------------
 
+        # Rank form (28.09., one mechanism with #239): the weightless-KV lane
+        # may state its shape with #239's own vector -- head share > 0, every
+        # KV-only rank 0 -- so the weg2 launcher reads the SAME flags for both
+        # backends (launcher.d_kv_worker_ranks). The lane owns placement (head
+        # TP=1, workers weightless): the vector is checked against the lane's
+        # head and then taken out of uneven-TP planning, byte-identical.
+        if (
+            isinstance(self.rank_tp_ratio, list)
+            and self.weightless_kv_fastlane
+            and not self.rank_role
+        ):
+            self._admit_lane_rank_tp_ratio()
+        self._refuse_second_token_vector_source()
+
         # Form A roles need an EXPLICIT partition, and a resolved one.
         if self.rank_role:
             if self.rank_tp_ratio is None:
@@ -12217,7 +12351,8 @@ class ServerArgs:
             # unchanged: in every caller older than Form A a zero is an
             # arithmetic accident, and admitting it globally would turn a
             # typo into a silently wrong shard plan.
-            floor = 0 if self.rank_role else 1
+            form_b = self._form_b_candidate()
+            floor = 0 if (self.rank_role or form_b) else 1
             if any(
                 not isinstance(r, int) or r < floor for r in self.rank_tp_ratio
             ):
@@ -12235,6 +12370,8 @@ class ServerArgs:
                 )
             if self.rank_role:
                 self._validate_rank_role_plan()
+            elif form_b:
+                self._admit_form_b()
             elif len(set(self.rank_tp_ratio)) == 1:
                 raise ValueError(
                     "--rank-tp-ratio with identical entries is the even "

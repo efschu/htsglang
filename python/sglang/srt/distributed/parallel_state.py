@@ -2997,6 +2997,14 @@ def init_model_parallel_group(
 
 
 _TP: Optional[GroupCoordinator] = None
+# Rank form / F6 (FORM-B-F6-ENTWURF-0928.md v2 §2): Form B's MODEL TP group --
+# the weight ranks only, for the linear/vocab collectives. NOT the scheduler
+# group: get_tp_group() / tp_cpu_group stay ALL ranks (NF objection 1: request
+# and host exchange, prefetch/claim and the tp_match_floor MINs must see the
+# KV-only ranks). None on every other boot -> get_model_tp_group() IS the TP
+# group, byte-identical.
+_MODEL_TP: Optional[GroupCoordinator] = None
+_MODEL_TP_PARTITION: Optional[List[List[int]]] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
@@ -3059,6 +3067,91 @@ _ENABLE_PDMUX_P_TP: bool = False
 def set_pdmux_status(enable_prefill_multiplexing: bool):
     global _ENABLE_PDMUX_P_TP
     _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
+
+
+def set_model_tp_partition(partition: Optional[List[List[int]]]) -> None:
+    """F6: install Form B's model_tp partition (rank_form.FormBPlan.
+    model_tp_partition: the weight ranks as one group, each KV-only rank alone)
+    BEFORE initialize_model_parallel, which then builds the group. None = off."""
+    global _MODEL_TP_PARTITION
+    if partition is not None:
+        flat = sorted(r for part in partition for r in part)
+        if flat != list(range(len(flat))) or any(not part for part in partition):
+            raise ValueError(
+                f"F6 model_tp partition {partition} must cover every rank exactly once "
+                "(torch rule: every rank builds every group). W181 Weg2RankFormShapeMismatch"
+            )
+    _MODEL_TP_PARTITION = [list(p) for p in partition] if partition is not None else None
+
+
+def init_model_tp_group(local_rank: int, backend: str, world_size: int) -> None:
+    """F6: build _MODEL_TP over the installed partition, its OWN GroupCoordinator
+    -- own gloo cpu_group, own barlink communicator where barlink is on
+    (GroupCoordinator.__init__), own device group -- named 'model_tp'.
+    A no-op without a partition."""
+    global _MODEL_TP
+    if _MODEL_TP_PARTITION is None:
+        return
+    assert _MODEL_TP is None, "model_tp group is already initialized"
+    flat = sorted(r for part in _MODEL_TP_PARTITION for r in part)
+    if flat != list(range(world_size)):
+        raise ValueError(
+            f"F6 model_tp partition {_MODEL_TP_PARTITION} does not cover the world "
+            f"of {world_size} ranks. W181 Weg2RankFormShapeMismatch"
+        )
+    _MODEL_TP = init_model_parallel_group(
+        _MODEL_TP_PARTITION, local_rank, backend, group_name="model_tp"
+    )
+
+
+def get_model_tp_group() -> GroupCoordinator:
+    """The group the MODEL's linear/vocab collectives run on: Form B's weight
+    ranks when F6 is on, else exactly the TP group (byte-identical)."""
+    if _MODEL_TP is not None:
+        return _MODEL_TP
+    return get_tp_group()
+
+
+def check_form_b_moe_tp() -> None:
+    """F6 x MoE (NF answer 2, 28.09.): under Form B the MoE combine runs over ALL
+    expert holders -- the KV-only ranks K hold experts too -- so moe_tp must span
+    every rank of the tp group, NEVER model_tp (W). Today moe_tp IS tp (the
+    ``moe_tp_size == tensor_model_parallel_size`` branch) and tp stays all ranks
+    under Form B, so this holds; if tp ever shrinks, moe_tp must be built as its
+    own all-ranks group, or K reduces silently in a group of one. Checked where
+    both groups exist; a no-op without a Form B partition."""
+    if _MODEL_TP is None or _MOE_TP is None or _TP is None:
+        return
+    if list(_MOE_TP.ranks) != list(_TP.ranks) or _MOE_TP is _MODEL_TP:
+        raise ValueError(
+            f"F6: under Form B moe_tp {list(_MOE_TP.ranks)} must span the ALL-ranks tp group "
+            f"{list(_TP.ranks)} (every expert holder, K included), not model_tp "
+            f"{list(_MODEL_TP.ranks)}. W181 Weg2RankFormShapeMismatch"
+        )
+
+
+def get_model_tp_group_no_assert() -> Optional[GroupCoordinator]:
+    return _MODEL_TP
+
+
+def get_model_tp_partition() -> Optional[List[List[int]]]:
+    """F6: the installed model_tp partition ([W] + one group per KV-only
+    rank), or None."""
+    return None if _MODEL_TP_PARTITION is None else [list(p) for p in _MODEL_TP_PARTITION]
+
+
+def get_attn_tp_layer_group() -> GroupCoordinator:
+    """F6 step 2c: the group the ATTENTION LAYERS' collectives run on.
+
+    Classic: the attention-TP group, exactly as before. Form B: model_tp --
+    the attention projections are sharded over the weight ranks W (the build
+    context carries attn_tp_size=|W|), while get_attn_tp_group() keeps
+    spanning ALL ranks because the scheduler's request broadcast
+    (attn_tp_cpu_group) must reach the KV-only ranks too (NF objection 1).
+    DP attention is outside Form B, so attn_tp == tp there."""
+    if _MODEL_TP is not None:
+        return _MODEL_TP
+    return get_attn_tp_group()
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -3748,6 +3841,11 @@ def initialize_model_parallel(
         pipeline_model_parallel_size, decode_context_parallel_size
     )
 
+    # F6: Form B's model_tp group (weight ranks), only when a partition is set.
+    init_model_tp_group(
+        get_world_group().local_rank, backend, torch.distributed.get_world_size()
+    )
+
     # Build decode context-parallel groups inside each TP group only when DCP is enabled.
     global _DCP
     assert _DCP is None, "decode context parallel group is already initialized"
@@ -3959,6 +4057,7 @@ def initialize_model_parallel(
             group_name="moe_tp",
             recovered_rank=recovered_rank,
         )
+    check_form_b_moe_tp()
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
@@ -4491,6 +4590,11 @@ def destroy_model_parallel():
     if _TP:
         _TP.destroy()
     _TP = None
+
+    global _MODEL_TP
+    if _MODEL_TP:
+        _MODEL_TP.destroy()
+    _MODEL_TP = None
 
     global _PP
     if _PP:

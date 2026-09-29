@@ -8290,7 +8290,17 @@ def apply_auto_performance(server_args) -> None:
             # install. The joint layout's own matched vector is printed on its
             # launch line instead.
             existing_kv = getattr(server_args, "rank_kv_ratio", None)
-            if not isinstance(existing_kv, list):
+            if getattr(server_args, "uneven_token_vector", None):
+                # rank form (28.09., NF review): --uneven-token-vector is THE one
+                # source of the KV-token vector; the planner does not seed a
+                # second one beside it (that would now be refused as W185, and
+                # before it lost silently on precedence). Named, not dropped.
+                lines.append(
+                    "Saat unterdrueckt, Operator-Vektor: --uneven-token-vector "
+                    f"{server_args.uneven_token_vector} is the KV-token vector; the "
+                    "planner writes no rank_kv_capacity_seed / --rank-kv-ratio beside it."
+                )
+            elif not isinstance(existing_kv, list):
                 tok_vec = [int(v) for v in pred["token_vector"]]
                 if len(tok_vec) == model.tp_size and all(v > 0 for v in tok_vec):
                     g = math.gcd(*tok_vec)

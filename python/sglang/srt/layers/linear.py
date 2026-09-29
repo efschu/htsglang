@@ -22,6 +22,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_quant_all_reduce,
 )
+from sglang.srt.distributed import parallel_state as _ps
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -99,7 +100,9 @@ def _tp_ar_pipeline_max_reduce(tensor: torch.Tensor) -> torch.Tensor:
     torch.distributed.all_reduce(
         tensor,
         op=torch.distributed.ReduceOp.MAX,
-        group=get_tp_group().device_group,
+        # F6 2c: a LAYER calibration -- the ranks that build the row linears
+        # (Form B: W only; classic: the TP group, byte-identical).
+        group=_ps.get_model_tp_group().device_group,
     )
     return tensor
 

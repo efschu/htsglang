@@ -234,6 +234,15 @@ def get_tp_partition_ratios(family: Optional[str] = None) -> Optional[list]:
     return base
 
 
+def get_tp_partition_families() -> dict:
+    """The active family vectors ({name: vector}), overlay first -- the
+    companion of get_tp_partition_ratios for a caller that re-scopes the whole
+    plan (F6 2c: Form B's weight ranks build under the plan restricted to W)."""
+    overlay = _TP_PARTITION_OVERLAY.get()
+    fams = overlay[1] if overlay is not _NO_OVERLAY else _TP_PARTITION_FAMILIES
+    return {k: list(v) for k, v in fams.items()}
+
+
 @contextmanager
 def scoped_tp_partition_ratios(
     ratios: Optional[Sequence[int]],
@@ -458,6 +467,14 @@ def assert_seed_superseded() -> None:
 # ---------------------------------------------------------------------------
 
 _WEIGHTLESS_KV_HEAD_RANK: Optional[int] = None
+#: F15 (5, rank form 28.09.): Form B generalises the ONE head to a head SET W
+#: -- the weight ranks, which hold the heads by the W-restricted ratio -- and
+#: every other rank is a weightless KV worker exactly as on the lane. The lane
+#: is the set of one: ``set_weightless_kv_head_rank(h)`` installs (h,) and every
+#: reader below answers byte-identically. ``_WEIGHTLESS_KV_HEAD_RANK`` stays the
+#: LEAD (min of the set): the rank whose tokens and accepts every rank adopts.
+_WEIGHTLESS_KV_WEIGHT_RANKS: Optional[Tuple[int, ...]] = None
+_WEIGHTLESS_KV_WEIGHT_RATIOS: Optional[Tuple[int, ...]] = None
 
 
 def set_weightless_kv_head_rank(head_rank: Optional[int]) -> None:
@@ -465,13 +482,45 @@ def set_weightless_kv_head_rank(head_rank: Optional[int]) -> None:
     that holds ALL attention heads / all weights (or None to disable, keeping
     every other path byte-identical). All other DCP ranks are weightless (0
     heads, KV-token-shard only)."""
-    global _WEIGHTLESS_KV_HEAD_RANK
+    global _WEIGHTLESS_KV_HEAD_RANK, _WEIGHTLESS_KV_WEIGHT_RANKS, _WEIGHTLESS_KV_WEIGHT_RATIOS
     _WEIGHTLESS_KV_HEAD_RANK = head_rank
+    _WEIGHTLESS_KV_WEIGHT_RANKS = None if head_rank is None else (int(head_rank),)
+    _WEIGHTLESS_KV_WEIGHT_RATIOS = None if head_rank is None else (1,)
+
+
+def set_weightless_kv_weight_ranks(
+    ranks: Optional[Sequence[int]], ratios: Optional[Sequence[int]] = None
+) -> None:
+    """F15 (5): Form B's head SET -- the weight ranks W (sorted, >= 1) and
+    their weight shares (the heads split by them); every other rank is a
+    weightless KV worker. The lead (min W) becomes the head rank the single-
+    head readers see. None disables."""
+    global _WEIGHTLESS_KV_HEAD_RANK, _WEIGHTLESS_KV_WEIGHT_RANKS, _WEIGHTLESS_KV_WEIGHT_RATIOS
+    if ranks is None:
+        set_weightless_kv_head_rank(None)
+        return
+    w = tuple(sorted(int(r) for r in ranks))
+    rat = None if ratios is None else tuple(int(x) for x in ratios)
+    if not w or len(set(w)) != len(w) or (
+        rat is not None and (len(rat) != len(w) or any(x <= 0 for x in rat))
+    ):
+        raise ValueError(
+            f"weightless head set {list(w)} with shares {None if rat is None else list(rat)}: one positive share per "
+            "distinct rank. W181 Weg2RankFormShapeMismatch")
+    _WEIGHTLESS_KV_HEAD_RANK = w[0]
+    _WEIGHTLESS_KV_WEIGHT_RANKS = w
+    _WEIGHTLESS_KV_WEIGHT_RATIOS = rat
+
+
+def get_weightless_kv_weight_ranks() -> Optional[Tuple[int, ...]]:
+    """The head set (the lane: one rank; Form B: W), or None."""
+    return _WEIGHTLESS_KV_WEIGHT_RANKS
 
 
 def get_weightless_kv_head_rank() -> Optional[int]:
     """The rank holding all heads/weights under the weightless-KV fast lane, or
-    None when the fast lane is not active."""
+    None when the fast lane is not active. Under Form B: the LEAD of the head
+    set -- the token and accept source."""
     return _WEIGHTLESS_KV_HEAD_RANK
 
 
@@ -483,33 +532,74 @@ def weightless_kv_active() -> bool:
 def is_weightless_head_rank(rank: int) -> bool:
     """True when the weightless-KV fast lane is active AND `rank` is the head
     rank (holds the full weights, runs the model TP=1 + the attention dispatch).
-    False on the default path (fast lane off)."""
-    head_rank = _WEIGHTLESS_KV_HEAD_RANK
-    return head_rank is not None and rank == head_rank
+    Under Form B: `rank` is in the head set W. False on the default path."""
+    heads = _WEIGHTLESS_KV_WEIGHT_RANKS
+    return heads is not None and int(rank) in heads
 
 
 def weightless_worker_rank(rank: int) -> bool:
     """True when the weightless-KV fast lane is active AND `rank` is a WEIGHTLESS
     KV worker (holds ONLY a KV token-shard; runs the stripped attention-only
     forward; materializes NO layer weights). False on the default path."""
-    head_rank = _WEIGHTLESS_KV_HEAD_RANK
-    return head_rank is not None and rank != head_rank
+    heads = _WEIGHTLESS_KV_WEIGHT_RANKS
+    return heads is not None and int(rank) not in heads
 
 
-def weightless_head_counts(total: int, world_size: int) -> list:
+def weightless_head_counts(
+    total: int,
+    world_size: int,
+    units: Optional[int] = None,
+    groups: Optional[int] = None,
+) -> list:
     """Per-rank head-count vector for the weightless-KV fast lane: `total` on
     the head rank, 0 on every weightless rank. E.g. total=24 heads, world=3,
     head_rank=0 -> [24, 0, 0]. The uneven-DCP collectives already tolerate a
     0-head shard (cp_all_gather_heads_uneven pads to max(counts); a 0-count
     rank contributes an empty slice, so the Q all-gather becomes a broadcast
     from the head rank and the O merge slices the merged output back to the
-    head rank only)."""
-    head_rank = _WEIGHTLESS_KV_HEAD_RANK
-    assert head_rank is not None, "weightless_head_counts() with fast lane off"
-    assert (
-        0 <= head_rank < world_size
-    ), f"weightless head_rank {head_rank} out of range for world {world_size}"
-    return [total if r == head_rank else 0 for r in range(world_size)]
+    head rank only).
+
+    F15 (5): with a head SET W (Form B) the heads split over W by the W
+    shares with the SAME rule the W ranks' projections were built with
+    (``partition_sizes`` over |W| ranks, ``units`` / ``groups`` as
+    ``tp_partition_sizes`` takes them), and every other rank gets 0 -- e.g. 24
+    q heads over W=(0, 1) shares (3, 1) in units of 6 -> [18, 6, 0]."""
+    heads = _WEIGHTLESS_KV_WEIGHT_RANKS
+    assert heads is not None, "weightless_head_counts() with fast lane off"
+    assert all(
+        0 <= h < world_size for h in heads
+    ), f"weightless head set {list(heads)} out of range for world {world_size}"
+    if len(heads) == 1:
+        return [total if r == heads[0] else 0 for r in range(world_size)]
+    # the SAME rule tp_partition_sizes applies to the W ranks' build under the
+    # W-restricted plan (rank_form.form_b_build_context): a vector -> the
+    # proportional split, none -> the even split
+    ratios = _WEIGHTLESS_KV_WEIGHT_RATIOS
+    if ratios is None:
+        ensure_divisibility(total, len(heads))
+        per = [total // len(heads)] * len(heads)
+    else:
+        per = partition_sizes(total, list(ratios), units, groups)
+    by_rank = dict(zip(heads, per))
+    return [int(by_rank.get(r, 0)) for r in range(world_size)]
+
+
+def weightless_dcp_head_counts(num_heads: int, total_kv: int, world_size: int):
+    """(q, kv) per-rank head counts the lane's attention backends plan with.
+
+    F15 (5c): over a head SET W the q heads split in whole GQA groups -- the
+    SAME units/groups the W ranks' qkv/o projections were built with
+    (rank_form.form_b_build_context: tp_partition_sizes over |W|) -- and the kv
+    heads per head; the lane (a set of one) is [total, 0, ...] for both, as
+    before."""
+    w_n = len(_WEIGHTLESS_KV_WEIGHT_RANKS or (0,))
+    q = weightless_head_counts(
+        num_heads, world_size,
+        units=attn_q_partition_units(num_heads, total_kv, w_n),
+        groups=attn_q_partition_groups(total_kv, w_n),
+    )
+    kv = weightless_head_counts(total_kv, world_size, units=total_kv)
+    return q, kv
 
 
 def uneven_dcp_active(dcp_size: Optional[int] = None) -> bool:
@@ -632,7 +722,12 @@ def uneven_dcp_owner_bounds() -> Optional[tuple]:
 
     parallel = get_parallel()
     dcp_size = parallel.attn_dcp_size
-    if not uneven_dcp_kv_replicated(dcp_size):
+    # Rank form (28.09., NF review of kv_only_rank): the weightless-KV lane
+    # token-shards the same way (flashinfer ``uneven_dcp`` includes the lane:
+    # weighted prefix-range with a vector, even modulo without), so its
+    # device pool is COMPACT too -- HiCache and the F14 window must see its
+    # owner rows, not the full window (task #60 class otherwise).
+    if not (uneven_dcp_kv_replicated(dcp_size) or (dcp_size > 1 and weightless_kv_active())):
         return None
     prefix = cp_token_prefix(dcp_size)
     lo = prefix[parallel.attn_dcp_rank]
@@ -932,9 +1027,11 @@ def reset_kv_ratio_supersession_announcement() -> None:
 
 
 def _gcd_reduced(vector: Sequence[int]) -> List[int]:
-    """The form ``resolve_cp_token_ratios`` compares and installs."""
-    g = math.gcd(*vector)
-    return [v // g for v in vector]
+    """The form ``resolve_cp_token_ratios`` compares and installs -- the ONE
+    reduction (``reduce_token_vector``), kept as a list even when all-equal."""
+    vec = [int(v) for v in vector]
+    reduced = reduce_token_vector(vec)
+    return reduced if reduced is not None else [1] * len(vec)
 
 
 def announce_superseded_rank_kv_ratio(server_args) -> None:
@@ -1163,6 +1260,19 @@ def announce_superseded_rank_kv_ratio(server_args) -> None:
     )
 
 
+def reduce_token_vector(vector: Sequence[int]) -> Optional[list]:
+    """THE one gcd reduction of a KV-token ownership vector (rank form, 28.09.:
+    one rule for #239's Form A cut and the weightless lane). ``None`` for an
+    all-equal vector -- the even modulo fast path, bit-identical. Zeros are
+    kept (a 0 is a layout: a rank that owns no rows); callers decide whether
+    their backend admits one."""
+    vec = [int(v) for v in vector]
+    if not vec or len(set(vec)) == 1:
+        return None
+    g = math.gcd(*vec)
+    return [v // g for v in vec]
+
+
 def resolve_cp_token_ratios(
     server_args, checkpoint_size_mib: Optional[int] = None
 ) -> Optional[list]:
@@ -1198,6 +1308,25 @@ def resolve_cp_token_ratios(
     vector (the pool pinning and owner rule must agree across ranks)."""
     weights = getattr(server_args, "rank_tp_ratio", None)
     dcp_size = getattr(server_args, "dcp_size", 1)
+    if getattr(server_args, "weightless_kv_fastlane", False) and dcp_size > 1:
+        # Rank form (28.09.): the lane is a base plan of its own (head holds
+        # the weights, every other rank KV only), so the #239 token vector is
+        # its ONE source too. Every rank owns >= 1 share on the lane: the
+        # pool is pinned per rank on local/ratio and the head also writes KV.
+        from sglang.srt.environ import envs as _envs
+
+        _env_vec = _envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
+        if not _env_vec:
+            return None
+        parsed = [int(x) for x in _env_vec.split(",") if x.strip() != ""]
+        if len(parsed) != dcp_size or any(v < 1 for v in parsed):
+            raise ValueError(
+                f"SGLANG_UNEVEN_TOKEN_VECTOR={_env_vec!r} on --weightless-kv-fastlane must be "
+                f"{dcp_size} POSITIVE integers (one per rank; the lane head writes and "
+                "attends KV too, a 0 there is a #239 Form A layout, not a lane one). "
+                "W181 Weg2RankFormShapeMismatch"
+            )
+        return reduce_token_vector(parsed)
     if not weights or dcp_size <= 1 or len(set(weights)) == 1:
         # HONESTY GUARD (measured): this bail-out runs BEFORE the env vector
         # is read, so SGLANG_UNEVEN_TOKEN_VECTOR without a non-uniform
@@ -1260,10 +1389,9 @@ def resolve_cp_token_ratios(
         _refuse_retracted_token_vector(
             server_args, parsed, "SGLANG_UNEVEN_TOKEN_VECTOR"
         )
-        if len(set(parsed)) == 1:
+        reduced = reduce_token_vector(parsed)
+        if reduced is None:
             return None
-        g = math.gcd(*parsed)
-        reduced = [v // g for v in parsed]
         # #797: a SEED claims it will be superseded in-process. Arm the claim
         # here, where the estimate actually enters the boot, so that
         # assert_seed_superseded() can hold the boot to it later. Armed with
@@ -1281,10 +1409,7 @@ def resolve_cp_token_ratios(
     kv_flag = getattr(server_args, "rank_kv_ratio", None)
     if isinstance(kv_flag, list) and len(kv_flag) == dcp_size:
         _refuse_retracted_token_vector(server_args, kv_flag, "--rank-kv-ratio")
-        if len(set(kv_flag)) == 1:
-            return None
-        g = math.gcd(*kv_flag)
-        return [v // g for v in kv_flag]
+        return reduce_token_vector(kv_flag)
 
     # Planner phase-1 SEED: the predicted per-rank capacity vector, parked by
     # apply_auto_performance. Below the explicit pin and the env override,
@@ -1299,10 +1424,7 @@ def resolve_cp_token_ratios(
     # the derived modes); under 'coupled' it is the boot vector.
     seed = getattr(server_args, "rank_kv_capacity_seed", None)
     if isinstance(seed, list) and len(seed) == dcp_size and all(v > 0 for v in seed):
-        if len(set(seed)) == 1:
-            return None
-        g = math.gcd(*seed)
-        return [v // g for v in seed]
+        return reduce_token_vector(seed)
 
     if checkpoint_size_mib is None:
         checkpoint_size_mib = _checkpoint_size_mib(
@@ -1321,11 +1443,9 @@ def resolve_cp_token_ratios(
             for b, w in zip(budgets, weights)
         ]
         vector = partition_units(_CP_TOKEN_UNITS, [max(int(a), 1) for a in avail])
-        g = math.gcd(*vector)
-        return [v // g for v in vector]
+        return _gcd_reduced(vector)
 
-    g = math.gcd(*weights)
-    return [w // g for w in weights]
+    return _gcd_reduced(weights)
 
 
 #: Token-vector resolution granularity (units) and the assumed
@@ -1593,8 +1713,7 @@ def cp_token_speed_vector(
     if best is None:  # cap_vec itself always meets its own floor
         best = (cap_vec, 0.0)
     vec, t = best
-    g = math.gcd(*vec)
-    vec = [v // g for v in vec]
+    vec = _gcd_reduced(vec)
     return vec, cp_token_context_budget(vec, capacities), t
 
 

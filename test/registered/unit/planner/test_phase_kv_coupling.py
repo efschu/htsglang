@@ -216,9 +216,10 @@ class PhaseKvCouplingTestCase(CustomTestCase):
         cls._tmp.cleanup()
         super().tearDownClass()
 
-    def plan(self, **kwargs):
+    def plan(self, uneven_token_vector=None, **kwargs):
         """Run the optimizer on the synthetic profile; return (args, log)."""
         sa = _args(self.model_path, **kwargs)
+        sa.uneven_token_vector = uneven_token_vector
         profile, inventory = _profile()
         captured = []
         with mock.patch.object(
@@ -340,6 +341,26 @@ class TestPrecedence(PhaseKvCouplingTestCase):
         self.assertIsNotNone(sa.rank_kv_capacity_seed)
         with mock.patch.dict(os.environ, {"SGLANG_UNEVEN_TOKEN_VECTOR": "5,3,3"}):
             self.assertEqual(resolve_cp_token_ratios(sa), [5, 3, 3])
+
+
+class TestTheOperatorVectorSuppressesTheSeed(PhaseKvCouplingTestCase):
+    """Rank form (28.09., NF review): --uneven-token-vector is THE one source.
+    The planner writes no seed beside it -- no W185 refusal later, and no
+    silent loss of the operator vector on precedence either."""
+
+    def test_no_seed_and_a_named_line(self):
+        sa, log = self.plan(tune="phase-prefill", uneven_token_vector="5,3,3")
+        self.assertIsNone(sa.rank_kv_capacity_seed)
+        self.assertEqual(sa.rank_kv_ratio, "coupled")
+        self.assertIn("Saat unterdrueckt, Operator-Vektor", log)
+        from sglang.srt.server_args import ServerArgs
+
+        ServerArgs._refuse_second_token_vector_source(sa)  # nothing second to refuse
+
+    def test_without_the_operator_vector_the_seed_stands(self):
+        sa, log = self.plan(tune="phase-prefill")
+        self.assertIsNotNone(sa.rank_kv_capacity_seed)
+        self.assertNotIn("Saat unterdrueckt", log)
 
 
 class TestTheOtherPathsAreUntouched(PhaseKvCouplingTestCase):
