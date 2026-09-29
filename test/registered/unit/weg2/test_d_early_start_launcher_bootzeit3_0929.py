@@ -16,10 +16,11 @@ from sglang.srt.weg2 import d_early_start as des
 from sglang.srt.weg2 import launcher as L
 
 
-def test_flag_defaults_off_and_help_renders():
+def test_flag_defaults_auto_and_help_renders():
     ap = L.build_parser()
     ns = ap.parse_known_args(["--tree", "t", "--tag", "x"])[0]
-    assert ns.weg2_d_early_start == "off"
+    assert ns.weg2_d_early_start == "auto"
+    # the parser's default profile is the 27B: auto stays serial there
     assert not L._d_early_start_armed(ns)
     assert L._d_early_start_armed(argparse.Namespace(weg2_d_early_start="on"))
     assert not L._d_early_start_armed(argparse.Namespace())
@@ -144,3 +145,22 @@ def test_load_gate_needs_stage0_go_and_d_gets_both_gates():
     assert 'stage0.get("verdict") != _des.VERDICT_GO' in v
     early = src[src.index("_early_snap = ("):src.index("def _d_early_verdict(")]
     assert "_des.STAGE0_ENV: _early_stage0" in early and "d_early_stage0_watch" in early
+
+
+# --- Default auto (Serie 29.09., dearly z30x2 424346f693: serving 205 s gegen frp 226 s) ---
+
+
+def test_auto_arms_next_flash_and_leaves_the_27b_serial():
+    assert L._d_early_start_armed(argparse.Namespace(weg2_d_early_start="auto", profile="nextflash"))
+    assert not L._d_early_start_armed(argparse.Namespace(weg2_d_early_start="auto", profile="qwen27b"))
+    assert not L._d_early_start_armed(argparse.Namespace(weg2_d_early_start="auto", profile=None))
+    assert not L._d_early_start_armed(argparse.Namespace(weg2_d_early_start="off", profile="nextflash"))
+
+
+def test_w185_refuses_only_an_explicit_on_never_auto():
+    # auto resolves to off on the 27B -- a default must not refuse a 27B boot
+    L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="auto", profile="qwen27b"))
+    L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="auto", profile=None))
+    L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="auto", profile="nextflash"))
+    with pytest.raises(L.Weg2DEarlyStartUnreviewed):
+        L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile="qwen27b"))
