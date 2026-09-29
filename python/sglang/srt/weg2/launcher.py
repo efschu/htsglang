@@ -13163,6 +13163,34 @@ def d_extend_trim_env(ledger, fits, growth_mib: Optional[Sequence[Optional[float
     return _et.launcher_thresholds(ledger.floor_mib, [act[r] for r in range(n)], growth_mib)
 
 
+D_ONLY_LABEL = "D(d-only, expectation)"
+
+
+def d_only_solve(ns, cards, dc_mib, log, *, user_reserve_by_card, p_split, chunk_layers):
+    """The --d-only pass priced with the SAME terms as the map pass (dormant
+    growth, driver carve, awake rest) and handed its card terms, so the #145
+    card ledger exists and ``log_d_rank_vram_solve`` writes EXTEND-TRIM and
+    EXTEND-STUECKELUNG here too. Without them the map pass wrote both, restored
+    env_d, and this pass wrote neither: kvstage-donly (29.09. 11:02Z) ran with
+    0 trims and its allocator cache climbed to 3.4-3.8 GiB per rank -- a D-solo
+    boot measured a card the flip boot never has."""
+    terms: List[Dict[str, object]] = []
+    rest = d_awake_rest(cards, ns.profile)
+    budgets = budgets_from_dc(
+        cards, dc_mib, log, D_ONLY_LABEL,
+        corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
+        user_reserve_by_card=user_reserve_by_card,
+        **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"),
+                   served_dormant_growth(cards, ns.profile))),
+        charge_driver_carve=budget_charges_driver_carve(ns.profile),
+        driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
+        awake_rest_mib=rest[0], awake_rest_provenance=rest[1], terms_out=terms)
+    log_d_rank_vram_solve(ns, cards, budgets, log, D_ONLY_LABEL,
+                          p_split=p_split, chunk_layers=chunk_layers,
+                          card_terms=(terms if rest[0] is not None else None))
+    return budgets
+
+
 def set_group_env(spec: str, key: str, value: str) -> str:
     """``spec`` ('KEY=VAL;...') with ``key`` set to ``value`` (appended when
     absent); every other entry keeps its text and its place."""
@@ -24223,9 +24251,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # gebaut wie im Dry-Run aus der Erwartung -- P's Ruherest bleibt eingeplant, also exakt die
         # D-Form des Flip-Boots. Kein Flip heisst: D muss jede ungecachte Laenge selbst prefillen,
         # der W50-Riegel steht deshalb auf dem Kontext statt auf X.
-        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(d-only, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card)
-        log_d_rank_vram_solve(ns, cards, budgets_d, log, "D(d-only, expectation)",
-                              p_split=p_split, chunk_layers=chunk_layers)
+        budgets_d = d_only_solve(ns, cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log,
+                                 user_reserve_by_card=user_reserve_by_card,
+                                 p_split=p_split, chunk_layers=chunk_layers)
         d_ratio = d_tp_ratio_decision(
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
