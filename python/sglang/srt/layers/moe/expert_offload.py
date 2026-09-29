@@ -110,6 +110,7 @@ Design notes
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import threading
@@ -4521,9 +4522,42 @@ class MoEExpertOffloadCache:
             if int(k) != 0:
                 raise ValueError("H95c: seat rows on a layer without seat rows / pool")
             return 0
+        from sglang.srt.environ import envs
         from sglang.srt.layers.moe.expert_pool_device import set_seat_rows_on
 
-        return set_seat_rows_on(self._pool_tables, int(k), device_write=device_write)
+        # D-MEM-SCHED (29.09.): a shrink moves the dropped rows' experts into
+        # the coldest kept rows first (Not-Aus: SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS)
+        mover = None
+        if (device_write and getattr(self, "_resident", None)
+                and not envs.SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS.get()):
+            mover = functools.partial(MoEExpertOffloadCache._move_bank_rows, self)
+        return set_seat_rows_on(self._pool_tables, int(k), device_write=device_write,
+                                move_rows=mover)
+
+    def _move_bank_rows(self, moves) -> None:
+        """Copy bank rows ``src -> dst`` in every row buffer the fetch writes
+        (``self._resident``: w13/w2 and their scales, [R+C+X, ...]),
+        stream-ordered like the fetch; the pairs' rows are disjoint (dropped
+        vs kept), so one index_copy each. A buffer too short for a row is a
+        stop, never a skip -- the tables would point at stale bytes."""
+        import torch
+
+        if not moves:
+            return
+        top = max(max(s, d) for s, d in moves)
+        src = dst = None
+        copied = 0
+        for attr, buf in self._resident.items():
+            if int(buf.shape[0]) <= top:
+                raise RuntimeError(
+                    "D-MEM-SCHED: bank buffer %s has %d rows, a coldest-first move needs row %d"
+                    % (attr, int(buf.shape[0]), top))
+            if src is None:
+                src = torch.tensor([s for s, _ in moves], dtype=torch.long, device=buf.device)
+                dst = torch.tensor([d for _, d in moves], dtype=torch.long, device=buf.device)
+            buf.index_copy_(0, dst, buf.index_select(0, src))
+            copied += len(moves) * (buf.numel() // int(buf.shape[0])) * buf.element_size()
+        self._weg2_bank_bytes_copied = int(getattr(self, "_weg2_bank_bytes_copied", 0)) + copied
 
     def _pool_zero_row(self):
         """H95: a [1] device view of the row that masked wave lanes point at.

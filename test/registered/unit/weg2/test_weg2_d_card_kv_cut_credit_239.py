@@ -76,7 +76,8 @@ def test_the_shift_is_reference_kv_minus_this_boots_kv_per_rank():
     fits = [types.SimpleNamespace(rank=r, kv_tokens=KV, kv_cell_bytes=int(round(c)))
             for r, c in enumerate(cells)]
     shift, line = er.card_kv_cut_shift(ref, fits)
-    assert shift == pytest.approx((3072.0, -2304.0, -768.0), abs=0.1)
+    # #239 S0: Worker ohne QSA-Schluessel (768 B/Token), +192 MiB je Worker: die Karten-Referenz hielt sie
+    assert shift == pytest.approx((3072.0, -2112.0, -576.0), abs=0.1)
     assert "rang0 262144 x 14143 B = 3536 -> 262144 x 1855 B = 464 MiB (+3072)" in line
     # the non-FA part of the host cell (QSA keys, draft) stays on the host
     assert int(round(cells[0])) == 14143 - DCP_CELL
