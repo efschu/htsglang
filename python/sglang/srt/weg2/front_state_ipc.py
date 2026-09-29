@@ -85,3 +85,83 @@ def publish_flip_cushion(d: str, rec: dict) -> bool:
     except state_file.StateFileError:
         return False
     return True
+
+
+# ---------------- DASHBOARD-AUS-IPC (a)/(b), 29.09. ----------------
+# User order (via 27B): the dashboard is fed from the IPC, not from log lines.
+# The front writes the flip as events and its own keys under state.json
+# `front` -- through state_file (writer front), never by a direct open, and
+# never a lifecycle field (those are the host's and the launcher's).
+
+#: the host mirrors these five keys of `front` from /weg2/state (state_file beat);
+#: the front never writes them, so every key has one writer.
+HOST_FRONT_KEYS = ("state", "epoch", "awake", "queue", "outstanding")
+#: kept out of a flip_done event: the chunk list (a line over state_file.EVENT_MAX
+#: would be cut into invalid JSON).
+FLIP_DONE_DROP = ("chunks",)
+
+
+def publish_event(d: str, typ: str, data: dict) -> bool:
+    """One event of the front into the boot's events.jsonl (writer front).
+    False = no state.json (no state dir, or the host has not created it)."""
+    if not d or not os.path.exists(os.path.join(d, "state.json")):
+        return False
+    try:
+        state_file.add_event(d, typ, dict(data), writer="front")
+    except state_file.StateFileError:
+        return False
+    return True
+
+
+def publish_front_fields(d: str, fields: dict) -> bool:
+    """The front's own keys under state.json `front`, dotted, so the host's mirror
+    keys (:data:`HOST_FRONT_KEYS`) stay the host's. A host key here is a ValueError."""
+    if not d or not os.path.exists(os.path.join(d, "state.json")):
+        return False
+    bad = [k for k in fields if k in HOST_FRONT_KEYS]
+    if bad:
+        raise ValueError(f"front_state_ipc: {bad} are the host's mirror keys of `front`")
+    try:
+        state_file.transition(d, None, fields={f"front.{k}": v for k, v in fields.items()},
+                              writer="front")
+    except state_file.StateFileError:
+        return False
+    return True
+
+
+def flip_done_payload(rec: dict, flip_begin_ts: float) -> dict:
+    """The ``flip_done`` event: the front's flip_log record (drain/sleep/wake/flip_ms,
+    legs, overlap, critical path) without the chunk list, plus the begin stamp."""
+    out = {k: v for k, v in rec.items() if k not in FLIP_DONE_DROP}
+    out["chunks_n"] = len(rec.get("chunks") or ())
+    out["flip_begin_ts"] = round(float(flip_begin_ts), 3)
+    return out
+
+
+class FirstWorkClock:
+    """Flip time from ONE clock (time.time() of the front's own process): the flip's
+    begin stamp and the woken group's first work are both taken here.
+
+    P->D: the first content D streams after the flip = the first decode token (the
+    user's flip time, P end -> first decode token; a P->D flip begins at P's end).
+    D->P: the first leg 1 the front dispatches to P after the flip. Armed at
+    ``WEG2-FLIP done``, fired once; the next flip re-arms it, so a flip whose woken
+    group never worked before the next one simply never fires. No model switch:
+    the 27B flip-time tile reads the same event."""
+
+    def __init__(self) -> None:
+        self._armed: Optional[dict] = None
+
+    def arm(self, epoch: int, sleep: str, wake: str, flip_begin_ts: float) -> None:
+        self._armed = {"epoch": int(epoch), "dir": f"{sleep}>{wake}", "wake": wake,
+                       "flip_begin_ts": float(flip_begin_ts)}
+
+    def seen(self, group: str, what: str, rid: Optional[str], now: float) -> Optional[dict]:
+        a = self._armed
+        if a is None or a["wake"] != group:
+            return None
+        self._armed = None
+        return {"epoch": a["epoch"], "dir": a["dir"], "flip_begin_ts": round(a["flip_begin_ts"], 3),
+                "first_work_ts": round(float(now), 3),
+                "flip_time_ms": round((float(now) - a["flip_begin_ts"]) * 1000.0),
+                "what": what, "rid": rid, "clock": "time.time front"}
