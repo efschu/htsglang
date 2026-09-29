@@ -20236,8 +20236,14 @@ class Scheduler(
 
         if _weg2_prefill_clock.armed(self.server_args):
             ret[_weg2_prefill_clock.INTERNAL_STATE_KEY] = _weg2_prefill_clock.snapshot()
-            # X-COST-LINE: D's per-forward prefill cost under load (the
-            # front fits its cost line over it; weg2/prefill_clock.py).
+        # X-COST-LINE: this rank's per-forward prefill cost -- D's under load,
+        # and P's from the rank answering /get_server_info (PP0, the
+        # bottleneck stage on both lines); weg2/prefill_clock.py.
+        from sglang.srt.managers.weg2_memory_saver import weg2_group_name as _weg2_group
+
+        if _weg2_prefill_clock.cost_published(
+            armed=_weg2_prefill_clock.armed(self.server_args), group=_weg2_group()
+        ):
             ret[_weg2_prefill_clock.COST_STATE_KEY] = _weg2_prefill_clock.cost_snapshot()
 
         if (

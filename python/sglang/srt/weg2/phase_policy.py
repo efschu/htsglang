@@ -539,34 +539,50 @@ def fit_cost_line(rows: Iterable[Tuple[int, int, float]], *, min_tokens: int,
             "prefix_med": int(statistics.median(x[1] for x in pts) * 1000.0)}, why
 
 
-def solve_x_cost_line(*, price_s: float, k: float, line: dict, r_p: float,
-                      prefix_tokens: float) -> Tuple[Optional[float], str]:
+def solve_x_cost_line(*, price_s: float, k: float, line: dict, r_p: Optional[float],
+                      prefix_tokens: float,
+                      line_p: Optional[dict] = None) -> Tuple[Optional[float], str]:
     """``X*`` of the model above, in tokens (the caller clamps it to its
     measured floor and the ceiling), or ``(None, why)`` without a price or an
     r_P. When D's marginal token at this depth is not dearer than P's there
     is no crossing: the round trip never pays back per token, so D is the
     cheaper route for EVERY size while its fixed cost stays under the price
     share (``inf``, the ceiling decides) and P for every size otherwise
-    (0, the floor decides). A price share below D's fixed cost gives 0 too."""
-    if not price_s > 0.0 or not r_p > 0.0:
-        return None, "no-price" if not price_s > 0.0 else "no-r_p"
+    (0, the floor decides). A price share below D's fixed cost gives 0 too.
+
+    ``line_p`` (P's own cost line on its bottleneck stage PP0, same
+    instrument) replaces the drain rate ``r_p`` when given: P's side is then
+    ``a_P + (b_P + c_P*p) * n`` -- compute-honest, where the drain rate also
+    counts P's waits (27B 09290020: drain 1437 tok/s, PP0 9180)."""
+    if not price_s > 0.0:
+        return None, "no-price"
+    pk = float(prefix_tokens) / 1000.0
     per_req_ms = 1000.0 * float(price_s) / max(1.0, float(k))
-    marg_ms = float(line["b_ms"]) + float(line["c_ms"]) * float(prefix_tokens) / 1000.0
-    denom = marg_ms - 1000.0 / float(r_p)
-    num = per_req_ms - float(line["a_ms"])
+    if line_p is not None:
+        p_fixed = float(line_p["a_ms"])
+        p_marg = float(line_p["b_ms"]) + float(line_p["c_ms"]) * pk
+    elif r_p is not None and r_p > 0.0:
+        p_fixed, p_marg = 0.0, 1000.0 / float(r_p)
+    else:
+        return None, "no-r_p"
+    marg_ms = float(line["b_ms"]) + float(line["c_ms"]) * pk
+    denom = marg_ms - p_marg
+    num = per_req_ms + p_fixed - float(line["a_ms"])
     if denom <= 0.0:
         side = "d-never-dearer" if num > 0.0 else "p-always-cheaper"
         return (float("inf") if num > 0.0 else 0.0), (
-            f"{side}(d={marg_ms:.3f}ms/tok<=p={1000.0 / float(r_p):.3f})")
+            f"{side}(d={marg_ms:.3f}ms/tok<=p={p_marg:.3f})")
     return max(0.0, num / denom), "ok"
 
 
 def x_cost_line_record(*, form_key: str, line: dict, k: float, boot_tag: str,
-                       commit: Optional[str], at: str) -> dict:
-    """The sidecar entry of one fitted D cost line, keyed by ``form_key``
-    (checkpoint x form) -- a qwen27b boot never reads a nextflash line."""
+                       commit: Optional[str], at: str, side: str = "D") -> dict:
+    """The sidecar entry of one fitted cost line of group ``side`` (D, or P's
+    PP0), keyed by ``form_key`` (checkpoint x form) -- a qwen27b boot never
+    reads a nextflash line, and a P line never seeds D's."""
     return {
         "kind": X_COST_LINE_KIND, "group": X_COST_LINE_GROUP, "form_key": str(form_key),
+        "side": str(side),
         "a_ms": float(line["a_ms"]), "b_ms": float(line["b_ms"]), "c_ms": float(line["c_ms"]),
         "n": int(line["n"]), "n_lo": int(line["n_lo"]), "n_hi": int(line["n_hi"]),
         "prefix_med": int(line.get("prefix_med", 0)), "k": float(k),
@@ -574,16 +590,18 @@ def x_cost_line_record(*, form_key: str, line: dict, k: float, boot_tag: str,
     }
 
 
-def newest_x_cost_line(samples: Iterable[dict], form_key: str) -> Optional[dict]:
-    """The newest cost-line entry of ``form_key`` among ``samples``, or ``None``."""
+def newest_x_cost_line(samples: Iterable[dict], form_key: str,
+                       side: str = "D") -> Optional[dict]:
+    """The newest cost-line entry of ``form_key`` and group ``side`` among
+    ``samples``, or ``None`` (an entry without ``side`` is D's)."""
     rows = [e for e in samples
             if isinstance(e, dict) and e.get("kind") == X_COST_LINE_KIND
-            and e.get("form_key") == form_key
+            and e.get("form_key") == form_key and e.get("side", "D") == side
             and isinstance(e.get("b_ms"), (int, float)) and float(e["b_ms"]) > 0.0]
     return max(rows, key=lambda e: str(e.get("at", "")), default=None)
 
 
-def read_x_cost_line(path: str, form_key: str) -> Optional[dict]:
+def read_x_cost_line(path: str, form_key: str, side: str = "D") -> Optional[dict]:
     """:func:`newest_x_cost_line` of the sidecar at ``path``; a missing or
     malformed sidecar is an ABSENCE (``None``), never a zero."""
     if not path or not form_key:
@@ -594,7 +612,7 @@ def read_x_cost_line(path: str, form_key: str) -> Optional[dict]:
     except (OSError, ValueError):
         return None
     samples = data.get("samples") if isinstance(data, dict) else None
-    return newest_x_cost_line(samples if isinstance(samples, list) else [], form_key)
+    return newest_x_cost_line(samples if isinstance(samples, list) else [], form_key, side)
 
 
 def park_verdict(status: int, text: str) -> Tuple[str, List[str], str]:

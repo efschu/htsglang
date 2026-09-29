@@ -3227,8 +3227,11 @@ class Envs:
     # cost line a + b*n + c*n*prefix over D's own prefill forwards (the
     # `Prefill rank batch` gpu-ms, published as a ring -- valid while D
     # decodes, mixed chunk is off), priced by the ski instrument's warm round
-    # trip and amortised over the mean requests per P phase:
-    #     X* = (price/k - a) / (b + c*prefix - 1/r_P)
+    # trip and amortised over the mean requests per P phase; P's side is its
+    # own cost line from the same ring on PP0 (the bottleneck stage), read
+    # after each P drain -- the drain r_P only while P has neither a fit nor a
+    # record (it counts P's waits: 27B 09290020 drain 1437 tok/s, PP0 9180):
+    #     X* = (price/k + a_P - a_D) / (b_D + c_D*prefix - b_P - c_P*prefix)
     # The seed is the newest record of this model x form (kind x_cost_line),
     # never a constant; the hard 4096 floor gives way to the fitted range's
     # lower edge, the ceiling (--x-ceiling-tokens) stays. Off = the solo-r_D

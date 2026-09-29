@@ -243,6 +243,13 @@ def note_batch_cost(new_tokens: int, cached_tokens: int, gpu_ms: float, chunks: 
                        "ms": round(ms, 3), "chunks": max(1, int(chunks or 1))})
 
 
+def cost_published(*, armed: bool, group: str) -> bool:
+    """Whether this server publishes the cost ring: the armed D group, and
+    group P (its X-COST-LINE r_P, read after each P drain) -- any rank that
+    carries a Weg-2 group name. A stock engine publishes nothing."""
+    return bool(armed) or bool((group or "").strip())
+
+
 def cost_snapshot() -> Dict[str, Any]:
     """The published cost block: ``{"boot", "seq" (head), "recent"}``."""
     return {"boot": BOOT, "seq": _COST_SEQ, "recent": [dict(r) for r in _COST_RING]}
