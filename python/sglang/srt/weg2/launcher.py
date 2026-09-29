@@ -11451,6 +11451,21 @@ def weg2_weights_cpu_backup_ring_kw(
     return 0, 0, True
 
 
+def pinned_reserve_line(ledger_gib, ledger_src: str = "") -> str:
+    """29.09.: the WEG2-HOST PINNED-RESERVE line -- the reserve the ranks'
+    pinned-host checks will ACTUALLY use (read back through
+    pinned_host_reserve(), after the export) with its source: env (explicit
+    SGLANG_PINNED_HOST_RESERVE_GIB), ledger (the host ledger's measured
+    margin) or native (10 GiB, no finite cgroup); plus the number the
+    ledger's PINNED WALL was priced with, so a mismatch is visible."""
+    from sglang.srt.mem_cache import pinned_host_budget as _phb
+
+    gib, kind, detail = _phb.pinned_host_reserve_effective()
+    wall = "none (no finite memory.max)" if ledger_gib is None else f"{float(ledger_gib):.2f} GiB ({ledger_src})"
+    return (f"WEG2-HOST PINNED-RESERVE effective={gib:.2f} GiB source={kind} ({detail}) "
+            f"ledger_wall_reserve={wall}")
+
+
 def choose_host_ledger(
     ring_bytes: int,
     ring_span1_bytes: int,
@@ -23353,8 +23368,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if _pin_gib is not None and not (os.environ.get(_phb.PINNED_HOST_RESERVE_ENV) or "").strip():
         os.environ[_phb.PINNED_HOST_RESERVE_LEDGER_ENV] = f"{float(_pin_gib):.4f}"
         os.environ[_phb.PINNED_HOST_RESERVE_LEDGER_SOURCE_ENV] = str(_pin_src or "")
-    log(f"WEG2-HOST PINNED-RESERVE ranks={'native' if _pin_gib is None else f'{float(_pin_gib):.2f} GiB'} "
-        f"({_pin_src}) -- the same number the ledger's PINNED WALL used")
+    log(pinned_reserve_line(_pin_gib, _pin_src))
     state.reap_headroom_gib = reap_headroom_gib
 
     # #1269 fix 4 follow-up: KEEP THE PREFLIGHT'S OWN ANON READING. `cg` is the

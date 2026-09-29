@@ -122,6 +122,16 @@ def pinned_host_reserve() -> Tuple[int, str]:
     return int(gib * (1024**3)), f"env {env}={text}"
 
 
+def pinned_host_reserve_effective() -> Tuple[float, str, str]:
+    """``(GiB, kind, detail)`` of the reserve the pinned checks use right now:
+    ``kind`` is ``env`` (explicit SGLANG_PINNED_HOST_RESERVE_GIB), ``ledger``
+    (the launcher's export of the host ledger's measured margin) or ``native``
+    (neither set: the upstream 10 GiB)."""
+    b, src = pinned_host_reserve()
+    kind = "env" if src.startswith("env ") else "ledger" if src.startswith("ledger ") else "native"
+    return b / (1024**3), kind, src
+
+
 def pinned_host_reserve_bytes() -> int:
     """The reserve's bytes alone -- see :func:`pinned_host_reserve`."""
     return pinned_host_reserve()[0]
