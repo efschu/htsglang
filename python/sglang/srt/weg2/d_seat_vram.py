@@ -1953,6 +1953,44 @@ def _group_floor_tokens(sched) -> int:
     return -int(gmin([-int(local)])[0])
 
 
+#: NF1d 09291811: the line a pending shrink's cap is handed back to the
+#: mapped stage because the ids below it cannot pay the group's demand
+CAP_LIFT_MARK = "WEG2 D-MEM-SCHED CAP-LIFT"
+
+
+def free_tokens_below(allocator, tokens: int, page_size: int) -> Optional[int]:
+    """Rank-local: the tokens of the FREE page ids at or below the cap of
+    ``tokens`` (the only ids an allocation under that cap can take); None
+    when the allocator shows no free lists (then nothing is decided)."""
+    page = max(1, int(page_size))
+    lim = int(tokens) // page
+    seen, n = False, 0
+    for name in ("free_pages", "release_pages"):
+        ids = getattr(allocator, name, None)
+        if ids is None or not hasattr(ids, "numel"):
+            continue
+        seen = True
+        if ids.numel():
+            n += int((ids <= lim).sum())
+    return n * page if seen else None
+
+
+def _group_room_below(sched, alloc, tokens: int, need: int) -> bool:
+    """REPLICATED verdict (MIN over the ranks, one collective): may a pending
+    shrink keep its cap at ``tokens``, i.e. do the free ids below it pay
+    ``need`` on EVERY rank? Entered only under a replicated condition
+    (pending shrink AND demand), so every rank enters it alike. Evictable
+    tree pages below the cap are NOT counted: the peel frees leaves in LRU
+    order, and the leaves of a long cached sequence sit ABOVE the cap
+    (NF1d: the pool received 0 of 246080 evictable tokens)."""
+    room = free_tokens_below(alloc, tokens, _page_size(sched))
+    ok = 1 if (room is None or room >= int(need)) else 0
+    gmin = getattr(sched, "_weg2_group_min_ints", None)
+    if gmin is None:
+        return bool(ok)
+    return bool(int(gmin([ok])[0]))
+
+
 #: 27B 29.09.: iterations the tick left at its first checks (P, the 27B, a
 #: D without stage form) -- no collective, no sync, no allocation there
 TICK_NOOP_ATTR = "_weg2_d_mem_tick_noop"
@@ -2007,7 +2045,38 @@ def runtime_tick(sched):
     step = ms.step(used, incoming, ended=ended, floor_tokens=floor)
     alloc = _kv_allocator(sched)
     page = _page_size(sched)
+    # NF1d 09291811 (z30y3f): a pending shrink caps new pages below the wanted
+    # stage -- sound only while the ids below it can pay the demand. After the
+    # 245k cell the end event left pending S0 (cap 32768, floor 248832: the
+    # retained tree); the first bs2 cell's 2113 tokens fit S0, so nothing
+    # cancelled the pending shrink, but every id below 32768 was the tree's
+    # and every leaf the peel freed sat above the cap: "EVICTION
+    # UNDER-DELIVERED ... the pool received 0", Prefill out of memory on all
+    # three D ranks. The stage is still MAPPED above the cap, so while the
+    # group has demand the cap goes back to the stage unless the free ids
+    # below it pay (replicated verdict); with no demand it returns to pending.
+    lifted_before = bool(getattr(ms, "_cap_lifted", False))
+    lifted = False
+    need = 0
+    if ms.pending is not None and alloc is not None and (incoming > 0 or used > 0):
+        chunk = int(getattr(getattr(sched, "server_args", None), "chunked_prefill_size", 0) or 0)
+        first = min(int(incoming), chunk) if chunk > 0 else int(incoming)
+        need = first + len(rids) * max(1, page)
+        lifted = not _group_room_below(sched, alloc, tokens[ms.pending], need)
+    ms._cap_lifted = lifted
     if not step.changed:
+        if lifted != lifted_before and alloc is not None:
+            want = ms.stage if lifted else ms.pending
+            if want is None:
+                want = ms.stage
+            _engage_kv_cap(alloc, tokens[want], page)
+            logger.info(
+                "%s pending=S%s stage=S%d cap=%d used=%d incoming=%d need=%d lifted=%s -- %s",
+                CAP_LIFT_MARK, "-" if ms.pending is None else ms.pending, ms.stage,
+                tokens[want], used, incoming, need, "yes" if lifted else "no",
+                "the free ids below the pending cap do not pay the demand: the mapped "
+                "stage pays it" if lifted else "no demand left: the pending cap again")
+            return step
         if ms.pending != pending_before and alloc is not None:
             # a shrink the floor blocks: new pages go below the wanted stage.
             # A pending shrink the need CANCELS (pending -> None, the stage
@@ -2017,7 +2086,7 @@ def runtime_tick(sched):
             # weg2-4-11 (33633 tokens, 33024 its locked prefix) cleared the
             # pending shrink and the cap stayed at 32768 -- available_size 0
             # on every rank, #1045 floor 0, H105 host_budget 0 for 13 min.
-            want = ms.pending if ms.pending is not None else ms.stage
+            want = ms.pending if (ms.pending is not None and not lifted) else ms.stage
             _engage_kv_cap(alloc, tokens[want], page)
             logger.info(
                 "%s cap=%d pending S%s->S%s stage=S%d used=%d incoming=%d floor=%d -- %s",
@@ -2027,7 +2096,8 @@ def runtime_tick(sched):
                 floor, step.reason)
         return step
     if alloc is not None:
-        _engage_kv_cap(alloc, tokens[ms.pending if ms.pending is not None else ms.stage], page)
+        _engage_kv_cap(alloc, tokens[ms.pending if (ms.pending is not None and not lifted)
+                                     else ms.stage], page)
     ctl = controller(sched)
     applied = ctl.apply_stage(n, ms.stage) if (ctl is not None and ctl.cells) else None
     st.stage, st.stage_tokens = ms.stage, tokens[ms.stage]
