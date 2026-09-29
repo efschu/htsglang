@@ -3364,6 +3364,14 @@ class Envs:
     SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW = EnvBool(False)
     SGLANG_WEG2_PARK_COLLECT_WINDOW_S = EnvFloat(None)
     SGLANG_WEG2_PARK_COLLECT_THRESHOLD_TOKENS = EnvInt(0)
+    # PARK-WINDOW-GATE (27B decision 29.09. ~13:55Z, F22 audit: the park RPC
+    # waits for D's running pass -- NF z30w median 0.40 s / p90 2.32 s, 27B
+    # z30j 0.66 / 1.15 s, max 3.31 s): while the collect window HOLDs, the
+    # front sends D its deadline and D's X-COST-LINE; D admits no extend whose
+    # forward would end after it (weg2/park_window_gate). The window stays the
+    # one decision site. Front-side switch, model-neutral; off = nothing sent,
+    # D's admission byte for byte. Off until the first boot series, then on.
+    SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE = EnvBool(False)
     # X-COST-LINE (29.09., third part of the ski-rental decision; NF z30w
     # 09290827 and 27B 09290020 both ran with `X NO-SOLVE: no r_d` because the
     # solo r_D probe never fired under load). X is re-solved from D's measured

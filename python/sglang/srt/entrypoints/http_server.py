@@ -161,6 +161,7 @@ from sglang.srt.managers.io_struct import (
     VertexGenerateReqInput,
     VramBudgetReqInput,
     Weg2ParkRunningReqInput,
+    Weg2ParkWindowReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
@@ -1441,6 +1442,19 @@ async def weg2_park_running(obj: Annotated[Weg2ParkRunningReqInput, Body()], req
         body,
         status_code=200 if ret.success else HTTPStatus.CONFLICT,
     )
+
+
+@app.api_route("/weg2/park_window", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def weg2_park_window(obj: Annotated[Weg2ParkWindowReqInput, Body()], request: Request):
+    """PARK-WINDOW-GATE: the front's open collect window for group D (body
+    {"epoch", "left_ms", "a_ms", "b_ms", "c_ms"}; left_ms < 0 clears). One-way
+    to the scheduler, which broadcasts it to every rank of the group."""
+    try:
+        _global_state.tokenizer_manager._dispatch_to_scheduler(obj)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse({"sent": True, "left_ms": obj.left_ms}, status_code=200)
 
 
 @app.api_route("/weg2/ple_prefetch_hint", methods=["POST"])
