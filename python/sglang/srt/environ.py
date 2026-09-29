@@ -3350,7 +3350,12 @@ class Envs:
     # expert-streaming prefill the line describes (z30w TP0: 1-31 new tokens
     # 46-106 ms mean, 32-511 tokens 1583-2199 ms). FIT_MIN_SAMPLES: forwards
     # the live fit needs before it replaces the record.
-    SGLANG_WEG2_ENABLE_X_COST_LINE = EnvBool(False)
+    # DEFAULT ON (29.09., Leistungsschalter rule): metal proof 27B z30y
+    # 09291331 (895559fed2) -- "X COST-LINE RE-SOLVE X=5120 <- 4096 X*=5878
+    # (ok)", RECORD side=D a=190 b=0.575 n=9, side=P b=0.138 n=62. The
+    # mechanism is model-neutral; NF confirms it in the first z30y2 series
+    # (back to off if it fails there). =0 is the solo-r_D re-solve.
+    SGLANG_WEG2_ENABLE_X_COST_LINE = EnvBool(True)
     SGLANG_WEG2_X_COST_FIT_MIN_TOKENS = EnvInt(64)
     SGLANG_WEG2_X_COST_FIT_MIN_SAMPLES = EnvInt(8)
     # 27B review of 800bb82ac6: a fit only from a window with n_hi/n_lo >=
