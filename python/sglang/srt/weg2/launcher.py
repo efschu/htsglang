@@ -4929,16 +4929,12 @@ FORM_B_BAR1_USABLE_BIG_MIB = 32768
 
 def _model_is_moe(model_path: str) -> bool:
     """True when the checkpoint routes experts (NF): its tp window carries the
-    MoE combine and may not shrink (NF answer 4). Unreadable config = MoE, the
-    stricter window rule."""
-    import json
+    MoE combine and may not shrink (NF answer 4). The ONE detection
+    (rank_form.model_routes_experts -> weg2.form.checkpoint_arch on config.json);
+    unreadable config = MoE, the stricter window rule."""
+    from sglang.srt.rank_form import model_routes_experts
 
-    try:
-        with open(os.path.join(model_path, "config.json")) as fh:
-            cfg = json.load(fh)
-    except (OSError, ValueError):
-        return True
-    return int((cfg.get("text_config") or cfg).get("num_experts_per_tok") or 0) > 0
+    return model_routes_experts(model_path)
 
 
 def refuse_form_b_windows(ns, cards) -> Optional[str]:

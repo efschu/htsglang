@@ -605,7 +605,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.distributed.utils import is_weightless_head_rank
             from sglang.srt.rank_form import form_b_kv_path
 
-            form_b_kv_path(model_config.hf_config)
+            form_b_kv_path(model_config.model_path)
             self.is_weightless_head = is_weightless_head_rank(self.tp_rank)
             self.is_weightless_worker = not self.is_weightless_head
             self.is_form_b_head = self.is_weightless_head

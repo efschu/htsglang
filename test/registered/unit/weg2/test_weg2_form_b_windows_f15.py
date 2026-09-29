@@ -18,7 +18,9 @@ CARDS = [L.Card(1, "GPU-5090", "NVIDIA GeForce RTX 5090", 32607),
 
 def _ns(tmp_path, extra_d, moe=False):
     (tmp_path / "config.json").write_text(json.dumps(
-        {"text_config": {"num_experts_per_tok": 8 if moe else 0}}))
+        # the NF checkpoint's own shape (num_experts 512 / per token 10); the one
+        # detection (weg2.form.checkpoint_arch) reads num_experts
+        {"text_config": {"num_experts": 512, "num_experts_per_tok": 10} if moe else {}}))
     return types.SimpleNamespace(extra_d=extra_d, model=str(tmp_path))
 
 

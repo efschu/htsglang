@@ -119,14 +119,19 @@ def test_form_b_roles_counts_and_sources_on_every_rank():
     assert res[2]["sampler_group"] == [2]
 
 
-def test_moe_under_form_b_is_refused_by_name():
+def test_moe_under_form_b_is_refused_by_name(tmp_path):
+    import json
+
     from sglang.srt import rank_form as rf
 
-    dense = types.SimpleNamespace(text_config=types.SimpleNamespace(num_experts_per_tok=0))
-    moe = types.SimpleNamespace(text_config=types.SimpleNamespace(num_experts_per_tok=8))
-    assert rf.form_b_kv_path(dense) == rf.FORM_B_KV_PATH_LANE
+    dense, moe = tmp_path / "dense", tmp_path / "moe"
+    dense.mkdir(), moe.mkdir()
+    (dense / "config.json").write_text(json.dumps({"text_config": {"model_type": "qwen3_5_text"}}))
+    (moe / "config.json").write_text(json.dumps(
+        {"text_config": {"model_type": "qwen4_exp_text", "num_experts": 512, "num_experts_per_tok": 10}}))
+    assert rf.form_b_kv_path(str(dense)) == rf.FORM_B_KV_PATH_LANE
     with pytest.raises(rf.RankFormBMoeNotBuilt, match="W189.*NF-K unter Form B braucht"):
-        rf.form_b_kv_path(moe)
+        rf.form_b_kv_path(str(moe))
     assert rf.form_b_head_set([[2], [0, 1]], [3, 1, 0]) == ((0, 1), (3, 1))
     assert rf.form_b_head_set([[0, 1], [2]], None) == ((0, 1), None)
 

@@ -787,24 +787,31 @@ class RankFormBMoeNotBuilt(RankFormError):
     code = "W189 Weg2RankFormBMoeKvRankNotBuilt"
 
 
-def model_routes_experts(hf_config) -> bool:
-    """True for a checkpoint with routed experts (NF): the text config names
-    experts per token."""
-    cfg = getattr(hf_config, "text_config", None) or hf_config
-    for key in ("num_experts_per_tok", "num_experts", "n_routed_experts"):
-        v = getattr(cfg, key, None)
-        if v:
-            return True
-    return False
+def model_routes_experts(model_path: str) -> bool:
+    """True for a checkpoint with routed experts (NF), read the ONE way the rank
+    form reads it: weg2.form.checkpoint_arch on the checkpoint's config.json (the
+    Weg-2 form's arch axis, arch=moe / experts=resident|offload). NOT the loaded
+    HF config object: transformers' Qwen3_5TextConfig class defaults carry
+    num_experts=512 / num_experts_per_tok=10 on the DENSE Qwen3.8-27B although its
+    config.json names no expert (12:02Z 29.09., a3_formb died with W189 on the
+    dense 27B). An unreadable config counts as MoE -- the stricter answer, the
+    same as weg2.launcher._model_is_moe."""
+    from sglang.srt.weg2.form import checkpoint_arch
+
+    arch, _ = checkpoint_arch(str(model_path or ""))
+    return arch != "dense"
 
 
-def form_b_kv_path(hf_config) -> str:
-    """The Form B KV-only rank's path for this model, or W189 by name."""
-    if model_routes_experts(hf_config):
+def form_b_kv_path(model_path: str) -> str:
+    """The Form B KV-only rank's path for the checkpoint at ``model_path``, or
+    W189 by name."""
+    if model_routes_experts(model_path):
+        from sglang.srt.weg2.form import checkpoint_arch
+
         raise _refuse(
             RankFormBMoeNotBuilt,
-            "NF-K unter Form B braucht einen Form-B-Plan im NF-Pfad, nicht gebaut: the KV-only rank "
-            "of a MoE model holds experts and runs form_a_dcp_wiring.form_a_worker_attention_step + "
+            f"NF-K unter Form B braucht einen Form-B-Plan im NF-Pfad, nicht gebaut ({checkpoint_arch(str(model_path or ''))[1]}): "
+            "the KV-only rank of a MoE model holds experts and runs form_a_dcp_wiring.form_a_worker_attention_step + "
             "the MoE route, which stand on RankRolePlan's exactly-one host; a Form B plan (weight "
             "ranks W >= 2) in that path does not exist.")
     return FORM_B_KV_PATH_LANE

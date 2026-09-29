@@ -258,3 +258,57 @@ def test_lane_wire_with_two_heads_on_three_ranks():
         assert r["set"] == (0, 1) and r["token_src"] == 0 and r["spec_lead"] == 0
         assert r["spec_active"] and r["adopted"] == [100, 200]
     assert res[0]["model_tp"] == res[1]["model_tp"] == [0, 1] and res[2]["model_tp"] == [2]
+
+
+# ------------------------------------------ 5. dense vs MoE, the one detection --
+_CACHE = "/spinning/llm_stuff/club-3090/models-cache"
+_DENSE_27B = f"{_CACHE}/Qwen3.8-27B-NVFP4-RadixArk"
+
+
+@pytest.mark.skipif(not os.path.isfile(f"{_DENSE_27B}/config.json"), reason="27B checkpoint not on this box")
+def test_dense_27b_checkpoint_is_not_w189():
+    """12:02Z 29.09.: a3_formb died with W189 on the DENSE 27B -- the loaded
+    Qwen3_5TextConfig carries class defaults num_experts=512 /
+    num_experts_per_tok=10 although config.json names no expert. The rank form
+    reads the checkpoint (weg2.form.checkpoint_arch), the Weg-2 form's arch
+    axis -- one detection."""
+    from sglang.srt import rank_form as rf
+    from sglang.srt.weg2.form import checkpoint_arch
+
+    import inspect
+
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.model_executor import model_runner as mr
+
+    # the trap, as the boot met it: the loaded HF object says "experts"
+    mc = ModelConfig(_DENSE_27B, trust_remote_code=True,
+                     model_override_args='{"language_model_only": true}')
+    text = getattr(mc.hf_config, "text_config", None) or mc.hf_config
+    assert getattr(text, "num_experts", 0), "the class-default trap is gone -- re-check this test"
+    # the checkpoint says dense, and that is what the runner asks
+    assert checkpoint_arch(_DENSE_27B)[0] == "dense"
+    assert rf.model_routes_experts(mc.model_path) is False
+    assert rf.form_b_kv_path(mc.model_path) == rf.FORM_B_KV_PATH_LANE
+    assert "form_b_kv_path(model_config.model_path)" in inspect.getsource(mr)
+
+
+def test_nf_config_stays_w189_and_the_runner_passes_the_path(tmp_path):
+    import inspect
+    import json
+
+    from sglang.srt import rank_form as rf
+    from sglang.srt.model_executor import model_runner as mr
+    from sglang.srt.weg2 import launcher as L
+
+    nf = tmp_path / "nf"
+    nf.mkdir()
+    (nf / "config.json").write_text(json.dumps({
+        "architectures": ["Qwen4ExpForConditionalGeneration"],
+        "text_config": {"model_type": "qwen4_exp_text", "num_experts": 512, "num_experts_per_tok": 10}}))
+    with pytest.raises(rf.RankFormBMoeNotBuilt, match="W189.*num_experts=512"):
+        rf.form_b_kv_path(str(nf))
+    assert L._model_is_moe(str(nf)) is True and L._model_is_moe(str(tmp_path / "missing")) is True
+    # the runner hands the checkpoint PATH, never the loaded HF object
+    src = inspect.getsource(mr)
+    assert "form_b_kv_path(model_config.model_path)" in src
+    assert "form_b_kv_path(model_config.hf_config)" not in src
