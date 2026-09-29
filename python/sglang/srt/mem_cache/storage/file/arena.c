@@ -952,6 +952,69 @@ int64_t arena_unclaim(uint8_t *base, int64_t n, const int64_t *slots, const int6
     return done;
 }
 
+/* #1427r (z30n D, Form A token cut 0,32,32): a direct writer gives up a
+ * claim it took FRESH (its node's host rows freed or its write aborted before
+ * the ack). arena_free_slots freed the slot whole -- but a fresh claim is only
+ * "fresh" for the rank that came first: the other ranks of the page JOINED it
+ * (the attention host of share 0 claims with no extents and is often first),
+ * and freeing it moved the generation under them. Their completion came back
+ * 3 ('#1427 ARENA-COMPLETE LOST ... recycled under the writer', 75 lines on
+ * TP1/TP2, same slots on both, never on TP0), a page they had ALREADY
+ * completed was freed silently, and the D decode tail the park wrote never
+ * became readable -- the wake re-computed 3.7-6.8k tokens per request.
+ * Now: the slot is freed only when this rank was its SOLE claimant and it is
+ * still CLAIMED; otherwise this writer only resolves its claim (writer_done)
+ * and the page stays for the writers that joined it, COMPLETE or not.
+ * status per slot: 0 = freed (sole claimant), 1 = kept (joined by others, or
+ * already COMPLETE), 2 = skipped (generation moved on / not claimed). */
+int64_t arena_release_claims(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
+                             int8_t *status) {
+    ArenaHeader *h = hdr(base);
+    int64_t freed = 0;
+    for (int64_t i = 0; i < n; i++) {
+        status[i] = 2;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) continue;
+        uint32_t st = atomic_load(&sh->state);
+        if (st == S_COMPLETE) { writer_done(sh); status[i] = 1; continue; }
+        if (st != S_CLAIMED) continue;
+        uint32_t w = atomic_load(&sh->writers);
+        if ((w >> 16) > 1u) { writer_done(sh); status[i] = 1; continue; }
+        uint32_t expect = S_CLAIMED;
+        if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) {
+            /* completed (or taken) between the load and here: keep it */
+            writer_done(sh); status[i] = 1; continue;
+        }
+        if (atomic_load(&sh->writers) != w || (int64_t)sh->generation != gens[i]) {
+            /* a writer joined between the load and the CAS: the slot is theirs */
+            atomic_store(&sh->state, S_CLAIMED);
+            writer_done(sh); status[i] = 1; continue;
+        }
+        _Atomic uint64_t *keys = index_keys(base);
+        _Atomic uint32_t *islots = index_slots(base);
+        uint64_t mask = h->index_cap - 1;
+        uint64_t j = mix64(sh->key_lo) & mask;
+        for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
+            uint64_t k = atomic_load(&keys[j]);
+            if (k == 0) break;
+            if (k == sh->key_lo && atomic_load(&islots[j]) == (uint32_t)slots[i]) {
+                atomic_store(&keys[j], TOMB);
+                break;
+            }
+        }
+        sh->key_lo = 0; sh->key_hi = 0;
+        sh->n_ivals = 0;
+        sh->generation++;
+        atomic_store(&sh->writers, 0u);
+        atomic_fetch_sub(&h->n_claimed, 1);
+        atomic_store(&sh->state, S_FREE);
+        status[i] = 0;
+        freed++;
+    }
+    return freed;
+}
+
 void arena_stats(uint8_t *base, int64_t *out) {
     ArenaHeader *h = hdr(base);
     out[0] = (int64_t)h->slots;

@@ -254,6 +254,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_reap_partial.argtypes = [p_u8, i64, p_i64, i64]
             lib.arena_unclaim.restype = i64
             lib.arena_unclaim.argtypes = [p_u8, i64, p_i64, p_i64]
+            lib.arena_release_claims.restype = i64
+            lib.arena_release_claims.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
             lib.arena_stats.restype = None
             lib.arena_stats.argtypes = [p_u8, p_i64]
             lib.arena_find_slots.restype = i64
@@ -756,6 +758,21 @@ class ShmArena:
         cs = (ctypes.c_int64 * n)(*[int(s) for s in slots])
         cg = (ctypes.c_int64 * n)(*[int(g) for g in gens])
         return int(self._lib.arena_unclaim(self._base, n, cs, cg))
+
+    def release_claims(self, slots: Sequence[int], gens: Sequence[int]) -> list[int]:
+        """#1427r: a direct writer gives up claims it took FRESH. A slot is
+        freed only when this writer was its sole claimant (status 0); a slot
+        other writers joined -- or already completed -- stays theirs and only
+        this writer's claim is resolved (1); a moved generation is skipped (2).
+        See arena.c arena_release_claims."""
+        n = len(slots)
+        if n == 0:
+            return []
+        cs = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        cg = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_release_claims(self._base, n, cs, cg, st)
+        return list(st)
 
     def stats(self) -> dict:
         out = (ctypes.c_int64 * 4)()
