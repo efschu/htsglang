@@ -5648,6 +5648,7 @@ class Front:
                 # level test below reuses, so the two can never disagree about
                 # the reading they graded.
                 _pr_fast = host_ledger.read_cgroup_pressure()
+                self._flip_cushion_note(_pr_fast)  # W98 (z30u): the per-flip cushion course
                 _nr = _pr_fast.get("nonreclaim_gib")
                 if _nr is not None:
                     # #1361b THE CUSHION REACHES THE LATCH, or the criterion is
@@ -5778,6 +5779,51 @@ class Front:
             return False
         self.state = new
         return True
+
+    def _flip_cushion_open(self, src: str, dst: str) -> None:
+        """W98 (z30u): the host cushion over this flip, begin -> done, on the
+        rate latch's own readings (weg2/flip_cushion.py). Instrument only."""
+        from sglang.srt.weg2 import flip_cushion as _fc
+
+        try:
+            w = self.__dict__.get("_flip_cushion_win")
+            if w is None:
+                w = _fc.FlipCushionWindow(
+                    _fc.cg_max_gib_of(host_ledger.read_cgroup()),
+                    host_ledger.RATE_LATCH_CUSHION_FLOOR_GIB)
+                self._flip_cushion_win = w
+            w.open(epoch=getattr(self, "epoch", 0), src=src, dst=dst,
+                   pr=host_ledger.read_cgroup_pressure())
+        except Exception as e:  # noqa: BLE001 -- an instrument never breaks a flip
+            logger.debug("WEG2-FLIP-CUSHION not opened: %s: %s", type(e).__name__, e)
+
+    def _flip_cushion_close(self) -> None:
+        """One WEG2-FLIP-CUSHION line per completed flip, and the same record
+        as the event ``flip_cushion`` in the boot's events.jsonl -- written by
+        the sidecar thread, never on the flip."""
+        from sglang.srt.weg2 import flip_cushion as _fc
+        from sglang.srt.weg2 import front_state_ipc
+
+        w = self.__dict__.get("_flip_cushion_win")
+        if w is None or not w.is_open:
+            return
+        try:
+            rec = w.close(host_ledger.read_cgroup_pressure())
+        except Exception as e:  # noqa: BLE001
+            logger.debug("WEG2-FLIP-CUSHION not closed: %s: %s", type(e).__name__, e)
+            return
+        if rec is None:
+            return
+        logger.info("%s", _fc.line(rec))
+        self.__dict__.setdefault("flip_cushion_log", collections.deque(maxlen=256)).append(rec)
+        d = envs.WEG2_STATE_DIR.get() or None
+        if d:
+            self._sidecar_submit(front_state_ipc.publish_flip_cushion, d, rec)
+
+    def _flip_cushion_note(self, pr: Dict[str, Any]) -> None:
+        w = self.__dict__.get("_flip_cushion_win")
+        if w is not None:
+            w.note(pr)
 
     def _refuse_flip_in_stop(self, src: str, dst: str, when: str) -> None:
         self.counters["flip_refused_stop"] += 1
@@ -8872,6 +8918,7 @@ class Front:
             # the STOP landed while the clock unlock was awaited
             self._refuse_flip_in_stop(src, dst, "during the clock unlock")
             return
+        self._flip_cushion_open(src, dst)
         t_flip0 = time.time()
         # #1262 tier 3: the open flip's identity, for `flip_stall_check`. Not
         # cleared on the exits below -- every one of them leaves `state` at
@@ -9465,6 +9512,7 @@ class Front:
                     rec["sleep_leg_ms"], rec["wake_leg_ms"], rec["overlap_ms"], rec["overlap_pct"],
                     rec["critical_path"], rec["flip_ms"], len(self.weights_tags),
                     "off-path" if dc_off_path else dc)
+        self._flip_cushion_close()
         if src == "D" and dst == "P":
             self._dp_report(t_flip0, _dp_drain_end)
 
