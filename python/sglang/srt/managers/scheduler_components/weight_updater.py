@@ -4294,10 +4294,9 @@ class SchedulerWeightUpdaterManager:
         pause = getattr(backend, "pause_background_eviction", None)
         if pause is None:
             return
-        try:
-            pause()
-        except Exception as e:  # noqa: BLE001 -- an instrument-free no-op path must never break the sleep
-            logger.warning("L3 evictor pause at sleep failed: %s: %s", type(e).__name__, e)
+        # NF review 3 (B): NOT swallowed -- a failed park is the named stop Weg2L3EvictorPauseRefused, raised here,
+        # before the dormant marker (no-op without the evictor thread)
+        pause()
 
     def _weg2_rescan_store_index(self) -> None:
         """The wake's store rescan, OFF the resume RPC by default (28.09.).

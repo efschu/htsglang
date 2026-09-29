@@ -207,5 +207,98 @@ class L3EvictOffpathPauseTest(CustomTestCase):
                 h.stop()
 
 
+class L3EvictOffpathHoldsTest(CustomTestCase):
+    """NF review 3 (619ed65def): (A) a clear()/rescan-walk hold must not lift the SLEEP hold; (B) a sleep park
+    that cannot complete is a NAMED stop; (C) no background unlink while the L3-index seed walk runs."""
+
+    def _running_store(self, d):
+        h = _Harness(d, offpath=True)
+        for i in range(N_PAGES):
+            self.assertTrue(h.write(f"p{i:05d}_t"))
+        return h
+
+    def _start_long_run(self, h, removed, unlink_s=UNLINK_S):
+        real_remove = os.remove
+
+        def slow_remove(p):
+            time.sleep(unlink_s)
+            removed.append(p)
+            real_remove(p)
+
+        return mock.patch.object(lfe.os, "remove", slow_remove)
+
+    def test_sleep_hold_survives_clear(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = self._running_store(d)
+            removed = []
+            try:
+                with self._start_long_run(h, removed):
+                    with h.ev._lock:
+                        h.ev.max_size_bytes = int(h.ev._directory_bytes_locked() * 0.5)
+                        h.ev._kick_bg_evictor_locked()
+                    time.sleep(0.3)
+                    # the sleep entry (619ed65def had only the one bool pause -- the same call the sleep made there)
+                    sleep = getattr(h.ev, "pause_for_sleep", None)
+                    sleep(timeout=5.0) if sleep is not None else h.ev.pause_background_eviction(timeout=5.0)
+                    h.ev.clear()                               # a clear during dormancy
+                    with h.ev._lock:
+                        h.ev.max_size_bytes = 10 ** 12
+                    for i in range(100):                       # the sibling's new pages land in the index
+                        self.assertTrue(h.write(f"q{i:05d}_t"))
+                    n0 = len(removed)
+                    with h.ev._lock:
+                        h.ev.max_size_bytes = int(h.ev._directory_bytes_locked() * 0.5)
+                        h.ev._kick_bg_evictor_locked()
+                    time.sleep(1.0)
+                    self.assertEqual(len(removed), n0, "clear() lifted the sleep hold -- the dormant owner unlinked")
+            finally:
+                h.stop()
+
+    def test_sleep_park_timeout_is_a_named_stop(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = self._running_store(d)
+            removed = []
+            try:
+                with self._start_long_run(h, removed, unlink_s=2.0):  # one unlink outlasts the park bound
+                    with h.ev._lock:
+                        h.ev.max_size_bytes = int(h.ev._directory_bytes_locked() * 0.5)
+                        h.ev._kick_bg_evictor_locked()
+                    time.sleep(0.2)
+                    with self.assertRaises(lfe.Weg2L3EvictorPauseRefused):
+                        h.ev.pause_for_sleep(timeout=0.3)
+                    h.ev.pause_background_eviction(timeout=10.0)
+            finally:
+                h.stop()
+
+    def test_sleep_park_without_thread_is_a_noop_that_holds(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = _Harness(d, offpath=True)
+            try:
+                h.ev.pause_for_sleep(timeout=0.01)  # no thread yet: no raise
+                self.assertIsNone(h.ev._bg_evict_thread)
+                self.assertTrue(h.ev._bg_paused)
+            finally:
+                h.stop()
+
+    def test_seed_hold_blocks_the_first_kick(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = self._running_store(d)
+            removed = []
+            try:
+                with self._start_long_run(h, removed):
+                    h.ev.pause_background_eviction(reason="seed")   # taken before the seed thread starts
+                    with h.ev._lock:
+                        h.ev.max_size_bytes = int(h.ev._directory_bytes_locked() * 0.5)
+                        h.ev._kick_bg_evictor_locked()          # the first reserve's kick during the seed walk
+                    time.sleep(0.8)
+                    self.assertEqual(removed, [], "the evictor unlinked during the seed walk")
+                    h.ev.resume_background_eviction(reason="seed")
+                    time.sleep(0.5)
+                    self.assertGreater(len(removed), 0, "the kick given during the seed was lost")
+                    h.ev.pause_background_eviction(timeout=10.0)
+            finally:
+                h.stop()
+
+
 if __name__ == "__main__":
     unittest.main()
