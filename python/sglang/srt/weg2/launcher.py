@@ -23164,6 +23164,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for ln in lines:
         log(ln)
     state.ledger_lines = lines
+    # 29.09. (z30x2-yarn2): ONE pinned-host reserve for the ledger and the
+    # ranks. The ledger bounded its run peak by memory.max minus this number
+    # (PINNED WALL); the ranks' HiCache pools now read it too, through
+    # pinned_host_reserve(). An explicit SGLANG_PINNED_HOST_RESERVE_GIB wins
+    # and is left untouched; without a finite cgroup nothing is exported.
+    _pin_gib, _pin_src = getattr(arm, "pinned_reserve", (None, ""))
+    from sglang.srt.mem_cache import pinned_host_budget as _phb
+    if _pin_gib is not None and not (os.environ.get(_phb.PINNED_HOST_RESERVE_ENV) or "").strip():
+        os.environ[_phb.PINNED_HOST_RESERVE_LEDGER_ENV] = f"{float(_pin_gib):.4f}"
+        os.environ[_phb.PINNED_HOST_RESERVE_LEDGER_SOURCE_ENV] = str(_pin_src or "")
+    log(f"WEG2-HOST PINNED-RESERVE ranks={'native' if _pin_gib is None else f'{float(_pin_gib):.2f} GiB'} "
+        f"({_pin_src}) -- the same number the ledger's PINNED WALL used")
     state.reap_headroom_gib = reap_headroom_gib
 
     # #1269 fix 4 follow-up: KEEP THE PREFLIGHT'S OWN ANON READING. `cg` is the

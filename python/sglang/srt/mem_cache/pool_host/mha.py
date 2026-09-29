@@ -871,7 +871,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             name="MiniMax index-K host pool",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=None,  # the configured OS reserve (pinned_host_reserve)
         )
         logger.info(
             "Allocating %.2f GB host memory for MiniMax sparse index-K (layout=%s).",

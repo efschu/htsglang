@@ -592,7 +592,7 @@ class MambaPoolHost(HostKVCache):
             name=self.budget_label,
             flag="--hicache-mamba-host-mib (or --hicache-size / --hicache-ratio)",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=None,  # the configured OS reserve (pinned_host_reserve)
         )
         logger.info(
             "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
@@ -1273,7 +1273,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             name=f"V4 paged host pool {pool_name}",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=None,  # the configured OS reserve (pinned_host_reserve)
         )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
@@ -1723,7 +1723,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             name=f"V4 state host pool {pool_name}",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=None,  # the configured OS reserve (pinned_host_reserve)
         )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
@@ -2647,7 +2647,7 @@ class DSAIndexerPoolHost(HostKVCache):
             name="DSA indexer host pool",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=None,  # the configured OS reserve (pinned_host_reserve)
         )
         logger.info(
             "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
