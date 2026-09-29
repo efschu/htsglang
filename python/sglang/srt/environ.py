@@ -2814,6 +2814,12 @@ class Envs:
     #   coldest kept rows first (weg2/d_mem_sched.py). ON by default; this is
     #   the diagnosis-only emergency stop, not a feature switch.
     SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS = EnvBool(False)
+    # D-KV-DRAIN (29.09., NF1d/NF1e): a pending shrink whose floor only UNLOCKED
+    #   tree pages above the pending cap hold demotes those nodes to the host
+    #   (L2 copy acked, nothing dropped), so the stage shrinks and the expert
+    #   rows come back before the next sleep (weg2/d_kv_drain.py). ON by
+    #   default (Grundgesetz VRAM = experts); the diagnosis-only emergency stop.
+    SGLANG_WEG2_DISABLE_D_KV_DRAIN = EnvBool(False)
     # 29.09. (Nutzer 12:35Z, Grundgesetz): KV stages BELOW the booked S0 at this
     #   granularity (floor, 2 x floor, ... < S0, e.g. 32768). The plan still
     #   books S0; the KV between the floor and S0 is born unmapped and funds

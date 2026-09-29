@@ -1905,6 +1905,7 @@ def guard(sched, batch) -> None:
 # ---------------------------------------------------------------------------
 
 MEM_SCHED_ATTR = "_weg2_d_mem_sched"
+_kv_drain = None  # weg2.d_kv_drain, bound on the first armed tick
 
 
 def elastic_on() -> bool:
@@ -1952,6 +1953,10 @@ def _group_floor_tokens(sched) -> int:
         return int(local)
     return -int(gmin([-int(local)])[0])
 
+
+#: D-KV-DRAIN counters on the MemSched (RankState stats block ``mem_sched``)
+DRAIN_COUNTERS = ("drain_runs", "drain_nodes", "drain_tokens", "drain_waited_backup",
+                  "drain_backup_issued", "drain_locked", "drain_mismatch")
 
 #: NF1d 09291811: the line a pending shrink's cap is handed back to the
 #: mapped stage because the ids below it cannot pay the group's demand
@@ -2004,6 +2009,30 @@ def _tick_noop(sched) -> None:
     return None
 
 
+def _drain_pending(sched, ms, cap_tokens: int, floor: int) -> None:
+    res = _kv_drain.drain(getattr(sched, "tree_cache", None), cap_tokens, _page_size(sched),
+                          getattr(sched, "_weg2_group_min_ints", None))
+    c = ms.counters
+    for k in DRAIN_COUNTERS:
+        c.setdefault(k, 0)
+    if not res.ran:
+        return
+    c["drain_runs"] += 1
+    c["drain_nodes"] += res.nodes
+    c["drain_tokens"] += res.tokens
+    c["drain_waited_backup"] += res.waiting_backup
+    c["drain_backup_issued"] += res.backup_issued
+    c["drain_locked"] += res.locked
+    c["drain_mismatch"] += int(res.mismatch)
+    if res.nodes or res.mismatch or res.backup_issued:
+        logger.info(
+            "%s pending=S%d cap=%d floor=%d hot=%d nodes=%d tokens=%d locked=%d "
+            "waiting_backup=%d backup_issued=%d mismatch=%s -- %s",
+            _kv_drain.MARKER, ms.pending, cap_tokens, floor, res.hot, res.nodes, res.tokens,
+            res.locked, res.waiting_backup, res.backup_issued,
+            "yes" if res.mismatch else "no", res.reason)
+
+
 def runtime_tick(sched):
     """Once per scheduler iteration of an AWAKE D (after the write-through
     acks are flushed): the KV stage follows the global demand between wakes
@@ -2023,6 +2052,9 @@ def runtime_tick(sched):
         return _tick_noop(sched)
     from sglang.srt.weg2.d_mem_sched import MemSched
 
+    global _kv_drain
+    if _kv_drain is None:
+        from sglang.srt.weg2 import d_kv_drain as _kv_drain
     n = max(1, min(int(st.n or st.cap), int(st.cap)))
     tokens = tuple(form.tokens[: form.max_stage(n) + 1])
     ms = getattr(sched, MEM_SCHED_ATTR, None)
@@ -2032,6 +2064,8 @@ def runtime_tick(sched):
                       stage=min(int(st.stage), len(tokens) - 1))
         if counters:
             ms.counters.update(counters)
+        for k in DRAIN_COUNTERS:
+            ms.counters.setdefault(k, 0)
         ms._epoch = st.epoch
         ms._rids = None
         setattr(sched, MEM_SCHED_ATTR, ms)
@@ -2043,6 +2077,16 @@ def runtime_tick(sched):
         floor = _group_floor_tokens(sched)
     before, pending_before = ms.stage, ms.pending
     step = ms.step(used, incoming, ended=ended, floor_tokens=floor)
+    # D-KV-DRAIN (NF1d/NF1e): a pending shrink the RETAINED TREE holds never
+    # drains by itself -- the peel runs only under allocation pressure, and
+    # under the pending cap that pressure lands below it. Demote the unlocked,
+    # L2-backed nodes above the pending cap (group-uniform, replicated entry:
+    # pending + floor above it + idle or every DRAIN_EVERY-th round); the next
+    # tick sees the lower floor and shrinks, and the cell's expert rows return.
+    if (ms.pending is not None and not step.changed and floor > tokens[ms.pending]
+            and _kv_drain.enabled()
+            and (used == 0 or ms._round % _kv_drain.DRAIN_EVERY == 0)):
+        _drain_pending(sched, ms, tokens[ms.pending], floor)
     alloc = _kv_allocator(sched)
     page = _page_size(sched)
     # NF1d 09291811 (z30y3f): a pending shrink caps new pages below the wanted
