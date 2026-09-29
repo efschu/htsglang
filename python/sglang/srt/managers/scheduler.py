@@ -114,6 +114,7 @@ from sglang.srt.managers.weg2_idle_vote import (
     lap_clock,
     log_fresh_read,
     log_stale_drop,
+    own_work as _weg2_own_work,
     refusal_detail,
     stale_detail,
     stale_reason,
@@ -19545,21 +19546,32 @@ class Scheduler(
                 _t0 = time.perf_counter()
                 _issued = 0
                 _stats = {}
-                for _round in range(64):
-                    _stats = _sweep(max_issue=256) or {}
-                    _issued += int(_stats.get("issued", 0) or 0)
-                    if int(_stats.get("unbacked", 0) or 0) == 0:
-                        break
+                # kvs2 W3 (boot ...kvdemandbar1dauer09291534): the poll's own
+                # publish work is not the idle lap's age (weg2_idle_vote.own_work).
+                with _weg2_own_work():
+                    for _round in range(64):
+                        _stats = _sweep(max_issue=256) or {}
+                        _issued += int(_stats.get("issued", 0) or 0)
+                        if int(_stats.get("unbacked", 0) or 0) == 0:
+                            break
+                        # kvs2 W3: a round that issued nothing with nothing in
+                        # flight cannot be followed by one that does -- no pin
+                        # frees, no write lands. Measured: 4 such rounds of
+                        # 1.2 s per poll (issued=0 unbacked_left=37, arena
+                        # full), 4.6-5.0 s ahead of the idle read on every poll.
+                        if (int(_stats.get("issued", 0) or 0) == 0
+                                and int(_stats.get("pending", 0) or 0) == 0):
+                            break
+                        if _wc is not None:
+                            _wc(write_back=True)  # free the pins, then sweep again
+                        if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:
+                            break
                     if _wc is not None:
-                        _wc(write_back=True)  # free the pins, then sweep again
-                    if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:
-                        break
-                if _wc is not None:
-                    _wc(write_back=True)
+                        _wc(write_back=True)
                 logger.info(
                     "#1470 FLUSH-PUBLISH issued=%d unbacked_left=%s in_flight_after=%s waited_ms=%.0f "
                     "(un-backed nodes published and their write-throughs joined BEFORE the reset)",
-                    _issued, _stats.get("unbacked"), _stats.get("in_flight_after"),
+                    _issued, _stats.get("unbacked"), _stats.get("pending"),
                     (time.perf_counter() - _t0) * 1000.0)
         group_idle, verdict_detail = self.group_idle_verdict(
             tp_group_verdict=tp_group_verdict

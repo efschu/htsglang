@@ -66,8 +66,13 @@ def bubble_begin(scheduler) -> None:
     if now - last < MIN_INTERVAL_S:
         return
     scheduler._weg2_bubble_last = now
+    from sglang.srt.managers.weg2_idle_vote import own_work
+
     try:
-        stats = scheduler.tree_cache.publish_unbacked_sweep(max_issue=MAX_ISSUE)
+        # kvs2 W3 (09291534): a 1.2 s sweep of a full arena on every pass is
+        # PP0's own work, not the idle lap's age (weg2_idle_vote.own_work).
+        with own_work():
+            stats = scheduler.tree_cache.publish_unbacked_sweep(max_issue=MAX_ISSUE)
     except Exception as e:  # noqa: BLE001 - a publisher never takes the loop down
         logger.warning("WEG2 BUBBLE-PUBLISH raised %s: %s", type(e).__name__, e)
         return
