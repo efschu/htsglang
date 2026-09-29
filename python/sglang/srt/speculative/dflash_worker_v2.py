@@ -905,6 +905,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             install_shadow_draft_runner_surface,
         )
 
+        if self._lane_role() == "worker":
+            # 29.09. (09291240: a3_lane TP1/TP2 and a3_formb TP2 died here): a
+            # weightless-lane KV worker holds a META target -- no lm_head
+            # weights, so nothing to resolve -- and it is NOT a vocab-shard
+            # provider: in the draft round it only receives the proposed block
+            # (G-A1, the `_lane_role() == "worker"` branch of the draft loop),
+            # never the hidden-state broadcast. It needs the shadow surface on
+            # its meta draft runner and nothing else.
+            if not self._spec_solo_is_host:
+                install_shadow_draft_runner_surface(self.draft_model_runner)
+            return
         target_model = self._target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None:
@@ -955,6 +966,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         if getattr(mr, "is_weightless_head", False):
             return "head"
         return None
+
+    def _solo_vocab_parallel(self) -> bool:
+        """True when this rank's draft sampling runs over a VOCAB-PARALLEL
+        lm_head that other ranks hold shards of -- so the solo host must publish
+        its draft hidden states (and a sampling round's selector sample) to
+        them. Classic solo: yes. The one-head lane: no, its head is built TP=1
+        and samples locally. Form B: yes on the head set W -- the lead's lm_head
+        is sharded over W (model_tp), and W minus the lead joins as a shadow
+        vocab provider (29.09.: skipping it there would leave W1 waiting in the
+        hidden broadcast the lead never sends). Rank-uniform per group."""
+        role = self._lane_role()
+        if role is None:
+            return True
+        if role == "worker":
+            return False
+        from sglang.srt.speculative import form_b_spec as _fbs
+
+        return bool(_fbs.form_b_spec_active())
 
     def _lane_accept_broadcast(
         self, bs: int, accept_len: Optional[torch.Tensor], bonus: Optional[torch.Tensor]
@@ -3796,7 +3825,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._draft_sampler.q_out[:bs],
                     )
             elif self.selector is not None:
-                if self._spec_solo_active and self._lane_role() is None:
+                if self._spec_solo_active and self._solo_vocab_parallel():
                     # 19.09. (xsn388) solo HOST with the DFlash2 selector: the
                     # lattice and the sample are rank-local (the host's own
                     # draft codebooks), but `compute_candidates` all-gathers
@@ -3820,7 +3849,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     anchor_token_ids=block_ids[:, 0],
                     sampling_info=batch.sampling_info,
                 )
-                if self._spec_solo_active and self._lane_role() is None:
+                if self._spec_solo_active and self._solo_vocab_parallel():
                     self._solo_broadcast_selector_sample(bs, batch.sampling_info)
             else:
                 draft_hidden = draft_logits_output.hidden_states
@@ -3830,7 +3859,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
                 draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
                 sample_hs = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
-                if self._spec_solo_active and self._lane_role() is None:
+                if self._spec_solo_active and self._solo_vocab_parallel():
                     # Solo host: publish the trunk's hidden states (EAGER —
                     # the graph replay above has already returned) and then run
                     # the SAME vocab-parallel greedy reduction the split path

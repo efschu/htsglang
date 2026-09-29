@@ -555,3 +555,50 @@ def dflash_solo_compact_refused(algorithm, solo: bool, window_size, environ=None
         return False
     env = os.environ if environ is None else environ
     return str(env.get(DFLASH_SOLO_COMPACT_ENV, "0")) != "1"
+
+
+def dflash_solo_lm_head_path(model_path: str):
+    """Which way the DFLASH solo draft computes logits over the TARGET lm_head
+    of the checkpoint at ``model_path``, read from its config files before any
+    rank loads (dflash_worker_v2._resolve_lm_head_compute decides the same at
+    load: a dense float ``.weight``, or a quantized head whose ``quant_method``
+    computes the logits -- logits_processor.should_apply_lm_head_quant_method).
+
+    Returns ``(path, why)`` with path one of ``"dense"``, ``"quant_method"``,
+    or ``None`` (no known path: the load would raise NotImplementedError).
+    Only the WEIGHT ranks hold an lm_head; a weightless-lane KV worker needs
+    none (it never samples the draft). Pure: json only."""
+    import json
+    import os
+
+    d = str(model_path or "")
+    try:
+        with open(os.path.join(d, "config.json")) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, f"config.json unreadable ({type(e).__name__})"
+    qc = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config")
+    hq = None
+    try:
+        with open(os.path.join(d, "hf_quant_config.json")) as f:
+            hq = (json.load(f) or {}).get("quantization") or {}
+    except (OSError, ValueError):
+        hq = None
+    if hq is not None:
+        layer = (hq.get("quantized_layers") or {}).get("lm_head")
+        algo = (layer or {}).get("quant_algo") if layer else None
+        if algo is None:
+            return "dense", "ModelOpt: lm_head not in quantized_layers (bf16)"
+        if algo in ("NVFP4", "FP8"):
+            return "quant_method", (f"ModelOpt lm_head {algo}: ModelOpt{'Fp4' if algo == 'NVFP4' else 'Fp8'}"
+                                    "LinearMethod.apply (should_apply_lm_head_quant_method)")
+        return None, f"ModelOpt lm_head quant_algo {algo!r}: no DFLASH solo logits path"
+    if not qc:
+        return "dense", "unquantized checkpoint"
+    method = str(qc.get("quant_method") or "")
+    ignore = [str(x) for x in (qc.get("ignore") or qc.get("modules_to_not_convert") or [])]
+    if any(x == "lm_head" or x.endswith(".lm_head") or x.endswith("lm_head") for x in ignore):
+        return "dense", f"{method}: lm_head in the ignore list (bf16)"
+    if method == "gguf":
+        return "quant_method", "GGUF-resident lm_head: GGUFEmbeddingMethod.apply"
+    return None, f"{method}: lm_head quantized, no proven DFLASH solo logits path"

@@ -350,3 +350,78 @@ def test_dflash_solo_compact_draft_cache_is_refused_at_parse(monkeypatch):
     i = post.index("self._handle_speculative_draft_placement()")
     assert post.index("self._refuse_dflash_solo_compact()") > i
     assert "raise ValueError(DFLASH_SOLO_COMPACT_REFUSAL)" in inspect.getsource(dw)
+
+
+# ------------------------------- 7. DFLASH solo: the lm_head a lane rank needs --
+def _meta_nvfp4_lm_head():
+    """What a weightless-lane KV worker holds as lm_head of the 27B NVFP4
+    (RadixArk: lm_head quant_algo NVFP4, U8 [248320, 2560]): a META-built
+    ParallelLMHead -- uint8 weight on meta, the ModelOpt FP4 method, and none of
+    the runtime attributes process_weights_after_loading would add."""
+    import torch
+
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
+
+    class ParallelLMHead(SimpleNamespace):   # the type name the boot log printed
+        pass
+
+    return ParallelLMHead(weight=torch.empty((248320 // 3, 2560), dtype=torch.uint8, device="meta"),
+                          quant_method=object.__new__(ModelOptFp4LinearMethod), embedding_dim=5120)
+
+
+def _solo_worker(role, host, lm_head):
+    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+    w = object.__new__(DFlashWorkerV2)
+    w._spec_solo_is_host = host
+    w._solo_hs_buf = None
+    w.draft_model_runner = SimpleNamespace()
+    mr = SimpleNamespace(model=SimpleNamespace(lm_head=lm_head), dtype=None,
+                         is_weightless_worker=(role == "worker"), is_weightless_head=(role == "head"))
+    w._target_worker = SimpleNamespace(model_runner=mr)   # DFlashWorkerV2.target_worker reads it
+    return w
+
+
+def test_lane_worker_solo_setup_needs_no_lm_head():
+    """09291240: a3_lane (TP1, TP2) and a3_formb (TP2) died in
+    _solo_setup_vocab_broadcast -> _resolve_lm_head_compute on the lane
+    WORKER's meta lm_head ("... got ParallelLMHead with neither"). The worker
+    never samples the draft (G-A1: it only receives the block), so it resolves
+    nothing; a real head still resolves (or refuses) as before."""
+    from sglang.srt.speculative import dflash_worker_v2 as dw
+
+    installed = []
+    import sglang.srt.speculative.eagle_worker_v2 as ew
+
+    with mock.patch.object(ew, "install_shadow_draft_runner_surface", lambda r: installed.append(r)):
+        w = _solo_worker("worker", False, _meta_nvfp4_lm_head())
+        w._solo_setup_vocab_broadcast()                  # red on 75d07b8927: NotImplementedError
+        assert installed == [w.draft_model_runner]
+        head = _solo_worker("head", True, _meta_nvfp4_lm_head())
+        with pytest.raises(NotImplementedError, match="got ParallelLMHead with neither"):
+            head._solo_setup_vocab_broadcast()           # an UNLOADED head is still refused loudly
+    assert "_resolve_lm_head_compute" in dw.__dict__
+
+
+def test_form_b_lead_publishes_the_draft_hidden_to_w(monkeypatch):
+    """Form B: the lead's lm_head is sharded over W (model_tp), W1 joins the
+    draft round as a shadow vocab provider -- so the lead must publish its
+    hidden states (the one-head lane must not: its head is TP=1)."""
+    from sglang.srt.speculative import form_b_spec as fbs
+
+    lane_head = _solo_worker("head", True, None)
+    monkeypatch.setattr(fbs, "form_b_spec_active", lambda: False)
+    assert lane_head._solo_vocab_parallel() is False
+    assert _solo_worker("worker", False, None)._solo_vocab_parallel() is False
+    assert _solo_worker(None, True, None)._solo_vocab_parallel() is True     # classic solo
+    monkeypatch.setattr(fbs, "form_b_spec_active", lambda: True)
+    assert lane_head._solo_vocab_parallel() is True                           # Form B lead / W1
+    assert _solo_worker("worker", False, None)._solo_vocab_parallel() is False  # K
+
+
+@pytest.mark.skipif(not os.path.isfile(f"{_DENSE_27B}/hf_quant_config.json"), reason="27B checkpoint not on this box")
+def test_checkpoint_lm_head_path_is_read_before_load():
+    from sglang.srt.speculative.spec_info import dflash_solo_lm_head_path
+
+    path, why = dflash_solo_lm_head_path(_DENSE_27B)
+    assert path == "quant_method" and "NVFP4" in why

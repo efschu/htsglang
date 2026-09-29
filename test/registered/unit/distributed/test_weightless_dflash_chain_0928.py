@@ -137,7 +137,9 @@ def test_lane_worker_verify_returns_before_any_logits_use():
     # the head publishes exactly once, after its decision
     assert src.count("self._lane_accept_broadcast(bs, accept_len, bonus)") == 1
     # the lane head issues no shadow-directed hidden/selector broadcasts
-    assert src.count("self._spec_solo_active and self._lane_role() is None") == 3
+    # (29.09.: via _solo_vocab_parallel -- False on the one-head lane, True on
+    # Form B's head set W, whose lead's lm_head is sharded over W)
+    assert src.count("self._spec_solo_active and self._solo_vocab_parallel()") == 3
 
 
 def test_tp1_built_head_selects_candidates_locally(monkeypatch):
