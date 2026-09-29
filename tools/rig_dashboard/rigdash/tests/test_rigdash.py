@@ -1301,6 +1301,11 @@ class IpcDeathAndWallRateTests(unittest.TestCase):
         self.assertAlmostEqual(w["wall_tps"], 8192 / 11.0)        # ~744, what the user saw on the clock
         self.assertAlmostEqual(w["tps_gpu"], 8192 / 3.0)          # the compute rate, labelled beside it
         self.assertGreater(w["tps_gpu"], w["wall_tps"])
+        # a second prompt 60 s later: the idle gap between the bursts is no prefill time
+        later = [dict(r, t=r["t"] + 60.0) for r in rows]
+        w2 = live.Boot._prefill_window(rows + later, [], 0.0)
+        self.assertAlmostEqual(w2["wall_s"], 22.0)
+        self.assertAlmostEqual(w2["wall_tps"], 2 * 8192 / 22.0)
 
     def test_decode_wall_is_tokens_over_time_not_mean_of_rates(self):
         lines = [{"t": 0.0, "gen_tps": 100.0}, {"t": 1.0, "gen_tps": 100.0}, {"t": 11.0, "gen_tps": 10.0}]

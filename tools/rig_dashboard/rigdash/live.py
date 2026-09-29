@@ -186,22 +186,33 @@ def _rate(tok, ms):
 def _prefill_wall(rows):
     """Prefill tokens per WALL second (operator 29.09.: 8192 tokens in 11 s are
     ~744 tok/s, the tile said 1294 = the GPU compute rate).  Numerator: #new-token
-    of the first stage (PP0/TP0, each chunk once).  Denominator: first chunk's
-    start (stamp - its compute/gpu-ms) to the last line of ANY rank (the last
-    pipeline stage ends the prefill).  Returns (tok_per_s, span_s, tokens)."""
+    of the first stage (PP0/TP0, each chunk once).  Denominator: the wall time
+    the group was prefilling -- every rank line is the interval (stamp -
+    compute/gpu-ms, stamp); intervals closer than PHASE_GAP_S merge into one
+    burst (pipeline hand-offs between stages count, they are the request's
+    wall time), a burst lasts from its first chunk's start to its last line of
+    ANY rank, and idle gaps between bursts do not count (Sigma tokens /
+    Sigma time, never a mean of rates).  Returns (tok_per_s, busy_s, tokens)."""
     if not rows:
         return None, None, 0
-    starts, ends, per = [], [], {}
+    iv, per = [], {}
     for e in rows:
         ms = e.get("compute_ms") or e.get("gpu_ms") or 0.0
         t = _mid(e["t"])
-        starts.append(t - ms / 1000.0)
-        ends.append(t)
+        iv.append((t - ms / 1000.0, t))
         k = "%s%s" % (e.get("rk", ""), e.get("rank", 0))
         per[k] = per.get(k, 0) + (e.get("new_tok") or 0)
     tok = per.get("PP0", per.get("TP0", next(iter(per.values()))))
-    span = max(ends) - min(starts)
-    return ((tok / span) if (tok and span > 0) else None), (span if span > 0 else None), tok
+    iv.sort()
+    busy, (s0, e0) = 0.0, iv[0]
+    for s, e in iv[1:]:
+        if s - e0 > PHASE_GAP_S:
+            busy += e0 - s0
+            s0, e0 = s, e
+        else:
+            e0 = max(e0, e)
+    busy += e0 - s0
+    return ((tok / busy) if (tok and busy > 0) else None), (busy if busy > 0 else None), tok
 
 
 def _decode_wall(lines):

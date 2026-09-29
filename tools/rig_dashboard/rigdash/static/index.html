@@ -272,7 +272,7 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
     <p><b>Decode tok/s</b> = <span class="mono">gen throughput</span> der Zeile <span class="mono">Decode batch</span>
     (Tokens seit der vorigen Zeile durch die Zeit dazwischen); die gro&szlig;e Zahl ist Tokens / Wanduhr:
     &Sigma;(gen throughput &times; Zeilenabstand) / &Sigma; Zeilenabstand, nie das Mittel der Raten. Prefill: die gro&szlig;e Zahl
-    ist &Sigma; #new-token der ersten Stufe / Wanduhr (Start des ersten Chunks bis zur letzten Rang-Zeile); die GPU-Rechenrate
+    ist &Sigma; #new-token der ersten Stufe / Wanduhr der Prefill-Sch&uuml;be (je Schub Start des ersten Chunks bis zur letzten Rang-Zeile; Leerlauf Wanduhr (Start des ersten Chunks bis zur letzten Rang-Zeile); die GPU-Rechenrategt; 5 s zwischen Sch&uuml;ben z&auml;hlt nicht); die GPU-Rechenrate
     steht beschriftet daneben. Daneben die
     Rechenrate aus <span class="mono">Decode rank batch</span>: bs &times; accept len / gpu-ms je Runde.</p>
     <p>Quelle sind die Boot-Logs, die der weg2-Launcher ohnehin schreibt (per Byte-Offset gelesen, nie ganz).
@@ -515,7 +515,7 @@ function prefillTile(b, g, color, label, binders, now) {
   const one = p.one_s || 0;
   return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>${label}${LOGSRC}</div>
     ${bigPair(active ? "Wanduhr 60 s" : "letzter Schub, Wanduhr", src && src.wall_tps, one, 0, null, p.max3s_120)}
-    <div class="state">${state} &middot; <span class="muted" title="Z&auml;hler: &Sigma; #new-token der ersten Stufe (PP0/TP0); Nenner: Start des ersten Chunks (Stempel &minus; compute-ms) bis zur letzten Zeile irgendeines Rangs">Tokens / Wanduhr${src && src.wall_s ? " (" + fmt(src.tokens) + " Tok / " + fmt(src.wall_s, 1) + " s)" : ""}</span></div>
+    <div class="state">${state} &middot; <span class="muted" title="Z&auml;hler: &Sigma; #new-token der ersten Stufe (PP0/TP0); Nenner: Wanduhr der Sch&uuml;be -- je Schub Start des ersten Chunks (Stempel &minus; compute-ms) bis zur letzten Zeile irgendeines Rangs; L&uuml;cken &gt; 5 s zwischen Sch&uuml;ben z&auml;hlen nicht">Tokens / Wanduhr${src && src.wall_s ? " (" + fmt(src.tokens) + " Tok / " + fmt(src.wall_s, 1) + " s)" : ""}</span></div>
     ${kv([
       ["GPU-Rechenrate (&Sigma; Tok / &Sigma; compute-ms, langsamster Rang)", src && src.tps_gpu != null ? fmt(src.tps_gpu) + " tok/s" : "—"],
       ["Rechenrate je Rang (gpu-ms)", ranks],
