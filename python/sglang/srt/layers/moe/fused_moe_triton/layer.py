@@ -1523,6 +1523,7 @@ class FusedMoE(torch.nn.Module):
 
         from sglang.srt.layers.moe.expert_offload import (
             expert_offload_release_totals,
+            expert_store_clock,
         )
         from sglang.srt.model_loader.loader import device_loading_context
 
@@ -1538,7 +1539,14 @@ class FusedMoE(torch.nn.Module):
         )
 
         before = expert_offload_release_totals()
+        clock0 = expert_store_clock()
         t0 = time.perf_counter()
+        # BOOTZEIT 3 (29.09.): the presplit is ~45 % of the loader thread
+        # (rc12z30o3: PP0 26.8 of 60 s); split it (instrument only):
+        # h2d = device_loading_context enter (pageable [E] copy to the card),
+        # repack = process_weights_after_loading minus the host store,
+        # exit = the context's exit, release = pool release + empty_cache.
+        t_body = t_repack = t0
         # fnFL2x5: IN THE LAYER'S CHUNK, like the loader's own post-load pass
         # (loader.py: `weight_chunk_scope(layer_id_from_module_name(name))`).
         # This repack runs DURING load_weights, i.e. in the BASE weights tag,
@@ -1559,14 +1567,19 @@ class FusedMoE(torch.nn.Module):
         ):
             if state.get("device_ctx", True):
                 with device_loading_context(self, state["device"]):
+                    t_body = time.perf_counter()
                     self.quant_method.process_weights_after_loading(self)
+                    t_repack = time.perf_counter()
             else:
                 # H68b (NVFP4 Marlin door): the scheme reads its host-staged
                 # experts one at a time itself, so the loader must NOT first
                 # copy the whole [E] stack to the card -- that copy is the
                 # transient this door exists to avoid. The compressed-tensors
                 # state carries no key and keeps the path above.
+                t_body = time.perf_counter()
                 self.quant_method.process_weights_after_loading(self)
+                t_repack = time.perf_counter()
+        t_exit = time.perf_counter()
         # The repack's [E] transients are freed but stay reserved in the
         # caching allocator; hand them back so the next layer's copy-in and
         # the KV pool are sized against real free memory, not the cache.
@@ -1587,7 +1600,11 @@ class FusedMoE(torch.nn.Module):
 
         release_active_tag_pools(reason="ct-stream-presplit")
         torch.cuda.empty_cache()
+        t_end = time.perf_counter()
         after = expert_offload_release_totals()
+        clock1 = expert_store_clock()
+        store_open = clock1["open_s"] - clock0["open_s"]
+        store_write = clock1["write_s"] - clock0["write_s"]
         presplit = getattr(self, "_moe_offload_presplit", None) or {}
         buf_bytes = sum(b.numel() * b.element_size() for b, _ in presplit.values())
         rows = {a: tuple(b.shape) for a, (b, _) in presplit.items()}
@@ -1595,7 +1612,8 @@ class FusedMoE(torch.nn.Module):
             "[ct-stream-presplit] layer %s: repack + presplit at load "
             "(%.2f GiB of weight VRAM released, %.2f GiB to the pinned host "
             "pool, %.1f s) | resident buffers %.2f GiB %s | torch allocated "
-            "%.2f GiB reserved %.2f GiB",
+            "%.2f GiB reserved %.2f GiB | split h2d=%.2f repack=%.2f "
+            "store_open=%.2f store_write=%.2f exit=%.2f release=%.2f s",
             getattr(self, "layer_id", "?"),
             (after.device_bytes - before.device_bytes) / 2**30,
             (after.host_bytes - before.host_bytes) / 2**30,
@@ -1604,6 +1622,12 @@ class FusedMoE(torch.nn.Module):
             rows,
             torch.cuda.memory_allocated() / 2**30,
             torch.cuda.memory_reserved() / 2**30,
+            t_body - t0,
+            max(0.0, (t_repack - t_body) - store_open - store_write),
+            store_open,
+            store_write,
+            t_exit - t_repack,
+            t_end - t_exit,
         )
         if _snap and int(getattr(self, "layer_id", -1)) in (2, 6):
             # OOM hunt (fn1g-fn1k): +1.17 GiB per presplit layer on the card

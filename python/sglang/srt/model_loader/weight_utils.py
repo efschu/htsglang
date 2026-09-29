@@ -1810,8 +1810,13 @@ def _coalesced_stream(hf_weights_files, should_load, post_load, direct_io, st, l
     st.t0 = _time.perf_counter()
     items, runs = plan_coalesced_runs(hf_weights_files, should_load, cap, gap)
     st.files += len(hf_weights_files)
+    # BOOTZEIT 3 (29.09.): wait_read_s = the consumer of this generator
+    # blocked on a read that had not landed yet (disk-bound); consume_s = the
+    # time the consumer held the tensor before asking for the next one
+    # (consumer-bound). Their sum is the stream's wall; which one dominates
+    # says whether a faster disk path or a faster consumer is the lever.
     counters = {"items": items, "lock": threading.Lock(), "read_bytes": 0,
-                "direct": 0, "buffered": 0}
+                "direct": 0, "buffered": 0, "wait_read_s": 0.0, "consume_s": 0.0}
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=st.workers)
     nxt = 0
     try:
@@ -1834,7 +1839,9 @@ def _coalesced_stream(hf_weights_files, should_load, post_load, direct_io, st, l
                 yield name, torch.empty(tuple(int(x) for x in info["shape"]),
                                         dtype=_SAFETENSORS_DTYPES[info["dtype"]])
                 continue
+            _tw = _time.perf_counter()
             got = run.future.result()  # an exception MUST surface
+            counters["wait_read_s"] += _time.perf_counter() - _tw
             t = got.pop(i)
             run.left -= 1
             if run.left == 0:
@@ -1844,7 +1851,9 @@ def _coalesced_stream(hf_weights_files, should_load, post_load, direct_io, st, l
             st.tensors += 1
             st.bytes += int(off1) - int(off0)
             st.sample_anon()
+            _tc = _time.perf_counter()
             yield name, t
+            counters["consume_s"] += _time.perf_counter() - _tc
             del t
     finally:
         for r in runs:
@@ -1859,10 +1868,12 @@ def _coalesced_stream(hf_weights_files, should_load, post_load, direct_io, st, l
             gbs = counters["read_bytes"] / st.seconds / 1e9 if st.seconds > 0 else 0.0
             logger.info(
                 "%s runs=%d cap_mib=%d gap_kib=%d read_bytes=%d used_bytes=%d "
-                "waste_pct=%.1f s=%.2f read_GB/s=%.2f workers=%d reads=direct:%d,buffered:%d",
+                "waste_pct=%.1f s=%.2f read_GB/s=%.2f workers=%d reads=direct:%d,buffered:%d "
+                "wait_read_s=%.2f consume_s=%.2f",
                 COALESCE_MARKER, len(runs), cap >> 20, gap >> 10, counters["read_bytes"],
                 st.bytes, 100.0 * (counters["read_bytes"] - st.bytes) / max(1, counters["read_bytes"]),
-                st.seconds, gbs, st.workers, counters["direct"], counters["buffered"])
+                st.seconds, gbs, st.workers, counters["direct"], counters["buffered"],
+                counters["wait_read_s"], counters["consume_s"])
             logger.info(st.line())
 
 

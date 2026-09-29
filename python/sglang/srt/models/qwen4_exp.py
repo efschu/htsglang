@@ -3049,10 +3049,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 expert_pool=expert_pool,
             )
         logger.info(
-            "Ladezeit-2 EXPERT-CONSUMER threads=%d submitted=%d completed=%d",
+            "Ladezeit-2 EXPERT-CONSUMER threads=%d submitted=%d completed=%d "
+            "wait_slots_s=%.2f deferred_s=%.2f deferred_run=%d drain_wait_s=%.2f",
             expert_pool.threads,
             expert_pool.submitted,
             expert_pool.completed,
+            expert_pool.wait_slots_s,
+            expert_pool.deferred_s,
+            expert_pool.deferred_run,
+            expert_pool.drain_wait_s,
         )
         return loaded_params
 

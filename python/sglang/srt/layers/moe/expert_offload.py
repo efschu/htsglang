@@ -235,6 +235,19 @@ def record_expert_offload_release(
         _RELEASE_TALLY.layers += 1
 
 
+# BOOTZEIT 3 (29.09.): the host-store half of the per-layer presplit, split
+# out of the `[ct-stream-presplit]` seconds (instrument only). open_s is
+# `open_store` -- a fresh store file is ftruncated, first-touched and
+# cudaHostRegister'ed there (shared_pinned_empty, 8-14 % of the loader
+# thread in rc12z30o3); write_s is the D2H of the cold rows into it.
+_STORE_CLOCK = {"open_s": 0.0, "write_s": 0.0, "opens": 0}
+
+
+def expert_store_clock() -> dict:
+    """Snapshot of the store clocks (a copy)."""
+    return dict(_STORE_CLOCK)
+
+
 def expert_offload_release_totals() -> ExpertOffloadRelease:
     """Snapshot of this rank's release tally (a copy; callers must not mutate)."""
     return ExpertOffloadRelease(
@@ -7974,10 +7987,15 @@ def presplit_expert_offload_after_repack(
             # darauf loszulassen -- die Datei waere doppelt verkleinert und
             # der letzte Rang schriebe hinter ihr Ende. Explizit als
             # `num_slots` durchreichen, damit genau eine Stelle rechnet.
+            import time
+
+            _t_open = time.perf_counter()
             spill, _created = _es.open_store(
                 s_dir, s_key, attr, s_num, tuple(t.shape[1:]), t.dtype,
                 num_slots=s_num,
             )
+            _STORE_CLOCK["open_s"] += time.perf_counter() - _t_open
+            _STORE_CLOCK["opens"] += 1
             # Only the COLD rows go to the host (flip design 20.09.: a row a
             # card holds in some layout is taken from that card over BAR1, the
             # host store keeps what no card holds). fn8m measured the store
@@ -8027,9 +8045,11 @@ def presplit_expert_offload_after_repack(
                     "not rewritten), %d written",
                     _sa.MARKER, s_key, attr, _n_adopt, len(_rows_w),
                 )
+            _t_write = time.perf_counter()
             written = _es.write_rows(
                 spill, t, list(plan.spill_ids), s_lo, s_pad, rows=_rows_w
             )
+            _STORE_CLOCK["write_s"] += time.perf_counter() - _t_write
             # H2: the adopted rows are valid store rows too (P's bytes); the
             # sentinel keeps meaning "these rows hold real weights".
             _adopted = [int(v) for k, v in s_index.items() if k not in _rows_w]
