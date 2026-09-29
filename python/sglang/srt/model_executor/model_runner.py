@@ -2504,6 +2504,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return draft_format
 
     def load_model(self):
+        # BOOTZEIT 3: an early-started group D waits for P asleep before the
+        # first byte and the avail-mem reading (no-op without the gate env).
+        from sglang.srt.weg2.d_early_start import wait_gate_from_env
+
+        wait_gate_from_env()
         tic_total = time.perf_counter()
         if os.environ.get("SGLANG_LOAD_MEMSNAP_DIR"):
             # frames for the [vram-census] segment report / snapshot after load
