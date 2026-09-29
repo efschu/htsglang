@@ -20293,6 +20293,14 @@ class Scheduler(
                 "evictable": int(self.tree_cache.evictable_size()),
                 "capacity": int(self.max_total_num_tokens),
             }
+            # NF-STAU (29.09.): the KV ladder's ceiling and the global used
+            # tokens -- the front's fit test counts against the ladder, not
+            # the mapped stage (D-MEM-SCHED grows it at the admission).
+            from sglang.srt.weg2.d_seat_vram import kv_ladder_reading
+
+            _lad = kv_ladder_reading(self)
+            if _lad:
+                ret["weg2_kv"].update(_lad)
         except Exception:  # noqa: BLE001 -- an instrument never breaks the info route
             pass
         # #287: the effective figure is the limiter's floating value. Without
