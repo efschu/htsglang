@@ -176,8 +176,9 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         # admission found nothing (state=cold host_hit=0) and the X gate
         # refused it mid-stream (W50, client stream dead). The stamp belongs
         # to one read -- cleared here, set again by this cycle's own read.
-        if getattr(req, "_weg2_store_delivered", None) is not None:
-            req._weg2_store_delivered = None
+        # W88 CYCLE: and with it the progress witness and the store-short
+        # bound of that read (d_park_read.READ_CYCLE_ATTRS).
+        d_park_read.clear_read_cycle(req)
         # PARK-RETAIN READ: the store read of this request ends at what the
         # retraction just retained (the KV above the mamba track was freed).
         if d_park_read.stamp_parked(req) is not None:
