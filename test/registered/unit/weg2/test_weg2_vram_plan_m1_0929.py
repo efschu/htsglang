@@ -141,6 +141,51 @@ class Idle(CustomTestCase):
         self.assertTrue(all(c["idle"] for c in plan["closure"] if c["phase"] == "D awake"))
 
 
+def _pfit(stage, *, rows, fraction, headroom):
+    return SimpleNamespace(stage=stage, fraction=fraction, buffer_rows=rows, layer_row_mib=19.3,
+                           row_card_mib=19.3, expert_mib=8000.0, kv_mib=544.0, transient_mib=3267.0,
+                           transient_source="RECORD(P_ACTIVATION_MIB)", draft_mib=0.0,
+                           prompt_tokens=262144, growth_mib=329.0, headroom_mib=float(headroom),
+                           near_oom_mib=400.0, ceiling_fraction=0.996)
+
+
+class ExpertsFull(CustomTestCase):
+    """-e2cut-z30x-frp (29.09.): PP2 holds all 512 expert rows (f 0.9956 after the
+    H25 draft post) and keeps 1572 MiB headroom -- not waste, no expert can take
+    it and P's KV is sized by its chunk admission. The plan names it
+    ``experts_full`` instead of IDLE; a stage below full stays IDLE."""
+
+    def _plan(self, rows, fraction):
+        cards = _cards()
+        v = vpv.PlanView()
+        v.reset(overrides=[], identity={"profile": "nextflash"})
+        v.note_p_card(cards, [_pfit(2, rows=rows, fraction=fraction, headroom=1572)],
+                      [0.33, 0.701, fraction], [32, 32, 32], "fnFL2x163", num_experts=512)
+        plan = v.build("p_budget", cards)
+        return [c for c in plan["closure"] if c["phase"] == "P awake"][0], plan
+
+    def test_full_stage_rest_is_bound_not_idle(self):
+        c, plan = self._plan(512, 0.995605)
+        self.assertEqual((c["bound_by"], c["idle"], c["rest_to"]), ("experts_full", False, "none"))
+        # the log line still names the rest, with its reason instead of "-"
+        self.assertEqual([x for x in vp.idle_items(plan) if x.startswith("P awake")],
+                         ["P awake/nvml2:1172(experts_full)"])
+        vp.read_plan(plan)  # the reader knows the reason
+
+    def test_stage_below_full_stays_idle(self):
+        c, _ = self._plan(408, 0.7339)
+        self.assertEqual((c["bound_by"], c["idle"], c["rest_to"]), ("", True, "experts_resident"))
+
+    def test_bound_by_of(self):
+        self.assertEqual(vp.bound_by_of(experts_full=True, rest_to="none"), "experts_full")
+        self.assertEqual(vp.bound_by_of(experts_full=True, ctx_at_max=True), "ctx_max")
+        self.assertEqual(vp.bound_by_of(experts_full=True, rest_to="kv"), "")
+
+    def test_launcher_passes_the_expert_count(self):
+        src = inspect.getsource(L.p_card_verdict)
+        self.assertEqual(src.count("num_experts=int(num_experts))"), 2)
+
+
 class ArgvBudgets(CustomTestCase):
     """(a) budget_mib per rank == --rank-gpu-memory-mib of the argv, card
     order. Numbers of the 29.09. dry runs on cb98c3d94a + M0 (m1a2 -st-cut z30v,

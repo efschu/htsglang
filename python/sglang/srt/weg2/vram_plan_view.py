@@ -127,10 +127,11 @@ class PlanView:
                               for c in cards if c.uuid in mib}
 
     def note_p_card(self, cards, fits: Sequence, fractions: Sequence[float],
-                    lru_rows: Sequence[int], source: str) -> None:
+                    lru_rows: Sequence[int], source: str, *, num_experts: int = 0) -> None:
         self.p_card = {"fits": list(fits), "cards": list(cards),
                        "fractions": [float(x) for x in fractions],
-                       "lru_rows": [int(x) for x in lru_rows], "source": str(source)}
+                       "lru_rows": [int(x) for x in lru_rows], "source": str(source),
+                       "num_experts": int(num_experts or 0)}
 
     def note_d_solve(self, label: str, cards, fits: Sequence, *, objective: str,
                      kv_tokens_max: int, seats: Optional[int], stage_rows: Mapping[int, int],
@@ -184,7 +185,10 @@ class PlanView:
                                "experts_resident": "MODEL(rows x layers x row_mib)"},
                 "cells": {}}
             total = int(c.total_mib)
-            full = float(f.fraction) >= 0.996
+            # every expert of the stage resident: the buffer holds all E rows (the
+            # fraction alone rounds -- -frp PP2 0.9956 is 512/512 rows)
+            n_exp = int(pc.get("num_experts") or 0)
+            full = (int(f.buffer_rows) >= n_exp) if n_exp > 0 else float(f.fraction) >= 0.996
             closure.append(vp.Closure(
                 card=str(c.uuid), phase="P awake", state="chunk=last,prompt=%d" % int(f.prompt_tokens),
                 total_mib=total,
@@ -192,7 +196,7 @@ class PlanView:
                        ("near_oom", int(round(float(f.near_oom_mib))))),
                 row_mib=int(round(float(f.row_card_mib) or float(f.layer_row_mib))),
                 rest_to="experts_resident" if not full else "none",
-                bound_by=vp.bound_by_of(experts_full=full, ctx_at_max=True,
+                bound_by=vp.bound_by_of(experts_full=full,
                                         rest_to="experts_resident" if not full else "none")))
         return {"ranks": ranks}, closure
 

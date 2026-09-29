@@ -25,7 +25,7 @@ SCHEMA = "weg2.vram_plan/1"
 PASSES = ("p_budget", "map", "dry", "d_early", "d_only", "d")
 PROVENANCE_KINDS = ("RECORD", "BUILTIN", "MODEL", "BORROWED", "UNMEASURED", "OVERRIDE")
 #: a user intent that binds a rest (§3.5): not a planner error
-BOUND_BY = ("ctx_max", "seats", "objective")
+BOUND_BY = ("ctx_max", "seats", "objective", "experts_full")
 FIXED_CATEGORIES = ("weights", "draft", "experts_resident", "state_pools", "graphs", "cuda_ctx")
 REST_TO = ("experts_resident", "experts_lru", "kv", "none")
 
@@ -91,6 +91,9 @@ def bound_by_of(*, objective: str = "", ctx_at_max: bool = False, experts_full: 
     - ``ctx_max``: every expert is resident already (the rest cannot become
       expert rows) and the KV holds the full context -- more KV serves nobody.
     - ``seats``: the rest could only buy seats and the seat count is reached.
+    - ``experts_full``: every expert is resident and the rest has no other
+      taker (``rest_to == "none"``, P: its KV is sized by the chunk admission)
+      -- not waste, the stage cannot use it.
     A rest that could still become expert rows is never bound by ctx or seats."""
     if str(objective).strip().lower() == "maxperf":
         return "objective"
@@ -98,6 +101,8 @@ def bound_by_of(*, objective: str = "", ctx_at_max: bool = False, experts_full: 
         return "ctx_max"
     if rest_to == "none" and seats_at_cap:
         return "seats"
+    if experts_full and rest_to == "none":
+        return "experts_full"
     return ""
 
 

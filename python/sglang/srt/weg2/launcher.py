@@ -18486,7 +18486,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
         return
     for fit in fits:
         log(_p_card.describe_p_card(fit, reference))
-    vram_view().note_p_card(cards, fits, fracs, lru_rows, reference.source)
+    vram_view().note_p_card(cards, fits, fracs, lru_rows, reference.source, num_experts=int(num_experts))
     if recut_from is not None:
         log(_p_card.recut_card_line(
             recut_from, stage_layers, fits, dense_mib_per_layer=float(dense_mib_per_layer),
@@ -18503,7 +18503,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
     capped = _solve(prompt, cap.fractions)
     for fit in capped:
         log(_p_card.describe_p_card(fit, reference))
-    vram_view().note_p_card(cards, capped, cap.fractions, lru_rows, reference.source)
+    vram_view().note_p_card(cards, capped, cap.fractions, lru_rows, reference.source, num_experts=int(num_experts))
     again = _p_card.p_card_refusal_text(capped, reference, chunk=int(chunk_tokens))
     if again is not None:
         again = "%s -- auch nach %s %s" % (again, P_FR_CAP_MARKER, "; ".join(cap.lines))
