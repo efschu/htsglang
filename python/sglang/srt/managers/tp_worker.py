@@ -60,6 +60,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+
+
+def _wl_token_src(server_args) -> int:
+    """The rank whose sampled tokens every rank adopts on the weightless lane:
+    the head (``--weightless-kv-head-rank``), or under Form B the LEAD of the
+    head set (distributed.utils.get_weightless_kv_head_rank -- installed from
+    the same flag on the lane, so byte-identical there)."""
+    from sglang.srt.distributed.utils import get_weightless_kv_head_rank
+
+    h = get_weightless_kv_head_rank()
+    return int(h) if h is not None else int(server_args.weightless_kv_head_rank)
+
 class BaseTpWorker(ABC):
     @abstractmethod
     def forward_batch_generation(self, forward_batch: ForwardBatch):
@@ -626,7 +638,7 @@ class TpModelWorker(BaseTpWorker):
                 _src = (
                     form_a_token_src_rank()
                     if _fa_worker
-                    else self.server_args.weightless_kv_head_rank
+                    else _wl_token_src(self.server_args)
                 )
                 head_ids = broadcast_pyobj(
                     [],
@@ -714,14 +726,22 @@ class TpModelWorker(BaseTpWorker):
                 _src = (
                     form_a_token_src_rank()
                     if this_rank_is_form_a_host()
-                    else self.server_args.weightless_kv_head_rank
+                    else _wl_token_src(self.server_args)
                 )
-                broadcast_pyobj(
+                _lead_ids = broadcast_pyobj(
                     batch_result.next_token_ids.tolist(),
                     self.tp_size * self.pp_rank + self.tp_rank,
                     self.world_group.cpu_group,
                     src=self.world_group.ranks[_src],
                 )
+                # F15 (5b): under Form B more than one rank is a head; every
+                # head but the lead RECEIVES here and adopts the lead's tokens
+                # (the lane has one head, which is the sender: unchanged).
+                if self.tp_rank != _src:
+                    batch_result.next_token_ids = torch.tensor(
+                        _lead_ids, dtype=torch.long,
+                        device=batch_result.next_token_ids.device,
+                    )
 
             return batch_result
         else:

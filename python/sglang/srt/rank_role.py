@@ -506,7 +506,7 @@ SEAM_LIST: Tuple[Seam, ...] = (
         "check_form_b_windows (W187) before any rank loads.",
         anchors=(
             ("rank_form.py", 681, "class RankFormKvRankBuild"),
-            ("model_executor/model_runner.py", 2848,
+            ("model_executor/model_runner.py", 2868,
              "form_b_build_context(self.tp_rank)"),
         ),
     ),

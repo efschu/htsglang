@@ -21623,6 +21623,19 @@ def configure_scheduler_process(
     # broadcast from head rank; O merge -> sliced back to head rank only),
     # independently of --rank-tp-ratio. None keeps every other path
     # byte-identical.
+    # F15 (5b): Form B (dense) is the lane over the head SET W -- the weight
+    # ranks with their shares; the lead (min W) is the token/accept source. A
+    # MoE model is refused by name at the model runner (W189).
+    if server_args.form_b_active():
+        from sglang.srt.distributed.utils import set_weightless_kv_weight_ranks
+        from sglang.srt.rank_form import form_b_head_set
+
+        _w, _wr = form_b_head_set(
+            server_args.form_b_model_tp_partition(), server_args.rank_tp_ratio
+        )
+        set_weightless_kv_weight_ranks(_w, _wr)
+        logger.info("Form B: weightless head set W=%s shares=%s (lead %d); every other "
+                    "rank a weightless KV worker.", list(_w), _wr, _w[0])
     if getattr(server_args, "weightless_kv_fastlane", False):
         from sglang.srt.distributed.utils import set_weightless_kv_head_rank
 

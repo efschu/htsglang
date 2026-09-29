@@ -124,8 +124,13 @@ _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.tp_sync_group = get_tp_group().device_group
-        self._tp_sync_coordinator = get_tp_group()
+        # F15 (5b): the sampled-token sync runs among the ranks that SAMPLE --
+        # the model tp group: Form B's weight ranks W (the KV-only ranks never
+        # reach the sampler), else exactly the TP group (byte-identical).
+        from sglang.srt.distributed.parallel_state import get_model_tp_group
+
+        self.tp_sync_group = get_model_tp_group().device_group
+        self._tp_sync_coordinator = get_model_tp_group()
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
             self._tp_sync_coordinator = get_parallel().attn_tp_group

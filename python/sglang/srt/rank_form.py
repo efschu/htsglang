@@ -752,3 +752,58 @@ def form_b_build_context(rank: int):
             yield
 
     return _ctx()
+
+
+# --------------------------------------------------------------------------
+# F15 (5): which path a Form B KV-only rank runs (NF answer 1, 28.09.).
+#   dense (27B)  the weightless-KV lane worker ([T, 0, D] attention-only
+#                forward, flashinfer_backend forward_*_weightless_worker) with
+#                the lane's ONE head generalised to the head SET W
+#                (distributed.utils.set_weightless_kv_weight_ranks).
+#   MoE (NF)     NF's K holds experts, so no meta model: form_a_dcp_wiring.
+#                form_a_worker_attention_step + the MoE route. That path stands
+#                on RankRolePlan's EXACTLY ONE host (NF declined loosening it,
+#                28.09.) -- so NF under Form B is refused by name, W189.
+# --------------------------------------------------------------------------
+
+FORM_B_KV_PATH_LANE = "weightless_lane_worker"
+
+
+class RankFormBMoeNotBuilt(RankFormError):
+    code = "W189 Weg2RankFormBMoeKvRankNotBuilt"
+
+
+def model_routes_experts(hf_config) -> bool:
+    """True for a checkpoint with routed experts (NF): the text config names
+    experts per token."""
+    cfg = getattr(hf_config, "text_config", None) or hf_config
+    for key in ("num_experts_per_tok", "num_experts", "n_routed_experts"):
+        v = getattr(cfg, key, None)
+        if v:
+            return True
+    return False
+
+
+def form_b_kv_path(hf_config) -> str:
+    """The Form B KV-only rank's path for this model, or W189 by name."""
+    if model_routes_experts(hf_config):
+        raise _refuse(
+            RankFormBMoeNotBuilt,
+            "NF-K unter Form B braucht einen Form-B-Plan im NF-Pfad, nicht gebaut: the KV-only rank "
+            "of a MoE model holds experts and runs form_a_dcp_wiring.form_a_worker_attention_step + "
+            "the MoE route, which stand on RankRolePlan's exactly-one host; a Form B plan (weight "
+            "ranks W >= 2) in that path does not exist.")
+    return FORM_B_KV_PATH_LANE
+
+
+def form_b_head_set(partition: Sequence[Sequence[int]],
+                    base_ratios: Optional[Sequence[int]]) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
+    """(W, W's weight shares or None) from the model_tp partition and the base
+    plan over ALL ranks -- what set_weightless_kv_weight_ranks installs."""
+    multi = [sorted(p) for p in partition if len(p) >= 2]
+    if len(multi) != 1:
+        raise _refuse(RankFormShapeMismatch, f"model_tp partition {list(partition)} has no single weight group")
+    w = tuple(multi[0])
+    if base_ratios is None:
+        return w, None
+    return w, tuple(int(base_ratios[r]) for r in w)

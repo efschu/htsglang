@@ -589,6 +589,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         _wl_target = _wl_fastlane and not is_draft_worker
         self.is_weightless_head = _wl_target and self.tp_rank == _wl_head
         self.is_weightless_worker = _wl_target and self.tp_rank != _wl_head
+        # F15 (5b): Form B (dense) runs the SAME two roles over the head SET W
+        # (installed by the scheduler, distributed.utils.
+        # set_weightless_kv_weight_ranks): a weight rank is a "head" (it builds
+        # as one of |W| ranks, rank_form.form_b_build_context -- NOT the lane's
+        # TP=1), every other rank a weightless KV worker. A MoE model is refused
+        # by name (W189): its KV-only rank holds experts (NF answer 1).
+        self.is_form_b_head = False
+        _fb_part = (
+            server_args.form_b_model_tp_partition()
+            if hasattr(server_args, "form_b_model_tp_partition")
+            else None
+        )
+        if _fb_part is not None and not is_draft_worker:
+            from sglang.srt.distributed.utils import is_weightless_head_rank
+            from sglang.srt.rank_form import form_b_kv_path
+
+            form_b_kv_path(model_config.hf_config)
+            self.is_weightless_head = is_weightless_head_rank(self.tp_rank)
+            self.is_weightless_worker = not self.is_weightless_head
+            self.is_form_b_head = self.is_weightless_head
         if self.is_weightless_worker:
             logger.info(
                 "Weightless-KV fast lane: rank %d is a WEIGHTLESS KV worker "
@@ -2822,7 +2842,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         attn_tp_rank=0,
                     )
                     if (
-                        self.is_weightless_head
+                        (self.is_weightless_head and not self.is_form_b_head)
                         or self.is_weightless_worker
                         or self.is_draft_solo_host
                         or self.is_draft_solo_shadow
@@ -2840,7 +2860,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 _fb_ctx = (
                     None
                     if (
-                        self.is_weightless_head
+                        (self.is_weightless_head and not self.is_form_b_head)
                         or self.is_weightless_worker
                         or self.is_draft_solo_host
                         or self.is_draft_solo_shadow

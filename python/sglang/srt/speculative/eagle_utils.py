@@ -958,6 +958,13 @@ def spec_accept_broadcast_src() -> int:
     server_args = get_server_args()
     if getattr(server_args, "weightless_kv_fastlane", False):
         return int(getattr(server_args, "weightless_kv_head_rank", 0))
+    # F15 (5b): Form B -- the lead of the head set decides the accepts (the
+    # fixed-form dcp broadcast of speculative/form_b_spec.py carries them).
+    from sglang.srt.distributed.utils import get_weightless_kv_head_rank
+
+    fb = getattr(server_args, "form_b_active", None)
+    if callable(fb) and fb() and get_weightless_kv_head_rank() is not None:
+        return int(get_weightless_kv_head_rank())
     return 0
 
 
