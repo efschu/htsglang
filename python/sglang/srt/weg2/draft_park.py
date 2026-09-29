@@ -37,6 +37,8 @@ from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
+
 MIB = float(1 << 20)
 
 PARK_LINE = "WEG2-DRAFT-PARK"
@@ -124,6 +126,24 @@ class ParkRecord(msgspec.Struct, frozen=True):
         )
 
 
+def _host_image(nbytes: int, *, pin: bool) -> torch.Tensor:
+    """The pinned host image of ``nbytes``.
+
+    Kriech-Sitz 29.09. (z30w-park): ``torch.empty(pin_memory=True)`` goes
+    through ATen's CachingHostAllocator, which rounds EVERY request up to the
+    next power of two (CachingHostAllocator.h PowerOf2Ceil, see 73b1a4750a):
+    the 1522.8 MiB draft image held a 2048 MiB block on D-TP0 -- 525 MiB of
+    host RAM under memory.max that no ledger post books (``d_draft_host``
+    prices the image, not the block). SGLANG_OPT_WEG2_DRAFT_PARK_EXACT_PIN
+    pins exactly ``nbytes`` (expert_offload.pinned_exact_empty: an anonymous
+    mapping + cudaHostRegister). Off = the torch.empty form, byte for byte."""
+    if pin and envs.SGLANG_OPT_WEG2_DRAFT_PARK_EXACT_PIN.get():
+        from sglang.srt.layers.moe.expert_offload import pinned_exact_empty
+
+        return pinned_exact_empty((int(nbytes),), torch.uint8)
+    return torch.empty(int(nbytes), dtype=torch.uint8, pin_memory=pin)
+
+
 class DraftHostPark:
     """The one pinned host image of this process's draft, and its two legs.
 
@@ -171,7 +191,7 @@ class DraftHostPark:
             self.entries, self.views = entries, [v for _n, v in population]
             return -1.0
         t0 = time.perf_counter()
-        self.host = torch.empty(max(1, off), dtype=torch.uint8, pin_memory=self.pin)
+        self.host = _host_image(max(1, off), pin=self.pin)
         self.entries, self.views = entries, [v for _n, v in population]
         return (time.perf_counter() - t0) * 1000
 
@@ -190,7 +210,7 @@ class DraftHostPark:
         if self.host is not None and int(self.host.numel()) >= off:
             return off, -1.0
         t0 = time.perf_counter()
-        self.host = torch.empty(max(1, off), dtype=torch.uint8, pin_memory=self.pin)
+        self.host = _host_image(max(1, off), pin=self.pin)
         self.entries, self.views = [], []
         return off, (time.perf_counter() - t0) * 1000
 

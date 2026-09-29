@@ -1049,6 +1049,12 @@ class Envs:
     # sleep's park -- x148/x151: cudaHostAlloc 7989/10442 ms inside TP0's first
     # sleep, TP0's first deposit 8.1 s behind TP1/TP2. False = first-park form.
     SGLANG_WEG2_DRAFT_PARK_PREALLOC = EnvBool(True)
+    # Kriech-Sitz 29.09. (z30w-park): that image is pinned at its EXACT size
+    # (expert_offload.pinned_exact_empty) instead of torch.empty(pin_memory),
+    # whose CachingHostAllocator rounds to the next power of two: 1522.8 MiB
+    # image -> 2048 MiB block on D-TP0, 525 MiB of host RAM no ledger post
+    # books. False = the torch.empty form, byte for byte.
+    SGLANG_OPT_WEG2_DRAFT_PARK_EXACT_PIN = EnvBool(False)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
