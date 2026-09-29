@@ -335,3 +335,34 @@ def format_table(rows: Sequence[CardPlan]) -> str:
         d = r.as_row()
         out.append(" ".join(f"{str(d[c]):>12s}" for c in cols))
     return "\n".join(out)
+
+
+def p_kv_need(rows: Sequence[CardPlan], model: ModelBytes, prompt_tokens: int) -> Dict[int, int]:
+    """Bytes of P KV each card needs to prefill ONE prompt of ``prompt_tokens``:
+    stage s keeps its own full-attention layers for every token."""
+    return {r.card: model.fa_layers(*r.layers) * model.kv_bytes_per_token_layer * int(prompt_tokens)
+            for r in rows}
+
+
+def p_max_prompt(rows: Sequence[CardPlan], model: ModelBytes, d_min: Mapping[int, int]) -> int:
+    """The longest single prompt P can hold when D keeps at least ``d_min``
+    bytes of context on every card (the card with the most FA layers per
+    free byte binds)."""
+    best = None
+    for r in rows:
+        fa = model.fa_layers(*r.layers)
+        if fa == 0:
+            continue
+        free = max(0, r.context - int(d_min.get(r.card, 0)))
+        t = free // (fa * model.kv_bytes_per_token_layer)
+        best = t if best is None else min(best, t)
+    return int(best or 0)
+
+
+def d_tokens_after_p(rows: Sequence[CardPlan], model: ModelBytes, prompt_tokens: int) -> int:
+    """D's KV tokens (uneven DCP, token vector follows capacity) with P holding
+    KV for one ``prompt_tokens`` prompt; a card where P's need exceeds the
+    context contributes nothing (the caller sees it in p_kv_need)."""
+    need = p_kv_need(rows, model, prompt_tokens)
+    per_tok = model.kv_bytes_per_token_layer * model.fa_layers(0, len(model.layers))
+    return int(sum(max(0, r.context - need[r.card]) for r in rows) // per_tok)

@@ -142,3 +142,19 @@ class TestReplicatedEmbed(unittest.TestCase):
         # every D rank holds the whole embed
         for c in CAP:
             self.assertGreater(b[c].d_total, a[c].d_total - 1)
+
+
+class TestContextSplit(unittest.TestCase):
+    def test_p_prompt_and_d_rest_are_consistent(self):
+        m = _model()
+        rows = dp.plan(m, _lay(p_card=(1, 0, 2), p_cut=(49, 8, 7)), CAP, OV)
+        t = dp.p_max_prompt(rows, m, {})
+        need = dp.p_kv_need(rows, m, t)
+        # at the bound, the binding card is (almost) exactly full, none is over
+        self.assertTrue(all(need[r.card] <= r.context for r in rows))
+        self.assertTrue(any(r.context - need[r.card] < 12 * m.kv_bytes_per_token_layer * 1 + 1 << 20
+                            for r in rows))
+        # more P prompt -> less D
+        self.assertGreater(dp.d_tokens_after_p(rows, m, 1000), dp.d_tokens_after_p(rows, m, t))
+        # D's floor lowers P's bound
+        self.assertLess(dp.p_max_prompt(rows, m, {r.card: 1 << 30 for r in rows}), t)
