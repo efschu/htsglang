@@ -153,18 +153,21 @@ def build_dual_stage_model(runner, spec: Optional[DualShareSpec] = None):
         raise DualShareError(
             f"DUAL-TP3PP3: the P stage hull is built at TP1, this P rank runs tp_size="
             f"{runner.tp_size}")
-    spec = spec or DualShareSpec.from_env(pp_size=pp_size)
-    plan = spec.nested_plan()
-    local = spec.d_rank_on_stage(pp_rank)
     t0 = time.perf_counter()
     bind = _union_bind_target(runner)
-    parts: List[object] = [None] * plan.fast_size
     if bind is not None:
         # D is the union OWNER and boots alongside; wait for its image BEFORE
         # loading anything, so this rank's load never overlaps D's pack
-        # transient, then load the shared part FIRST and bind it at once: the
-        # load peak is max(shared part, the rest) instead of the whole stage.
+        # transient. D publishes its INSTALLED vectors with the image.
         _wait_for_owner(bind)
+    spec = spec or DualShareSpec.from_env(
+        _env_with_d_ratios(bind.union_dir if bind is not None else None), pp_size=pp_size)
+    plan = spec.nested_plan()
+    local = spec.d_rank_on_stage(pp_rank)
+    parts: List[object] = [None] * plan.fast_size
+    if bind is not None:
+        # The shared part FIRST, bound at once: the load peak is
+        # max(shared part, the rest) instead of the whole stage.
         parts[local] = _load_lane_part(runner, plan, local, gpu_id=runner.gpu_id)
         _bind_shared_part(runner, parts[local], bind)
     for r in range(plan.fast_size):
@@ -252,3 +255,30 @@ def _bind_shared_part(runner, part, t: _BindTarget) -> None:
     runner.dual_share_bound = True
     logger.info("DUAL-TP3PP3 P: shared part bound %.2f GiB to D's bytes, kept %.2f GiB of its own",
                 shared / 2**30, kept / 2**30)
+
+
+def _env_with_d_ratios(union_dir: Optional[str]) -> Mapping[str, str]:
+    """os.environ, completed by D's published vectors when the env does not
+    name them (the normal case: D resolves its vectors at runtime)."""
+    env = dict(os.environ)
+    if env.get(D_TP_RATIO_ENV, "").strip() or not union_dir:
+        return env
+    import json
+
+    from sglang.srt.weg2.union_arena_bind import D_RATIOS_FILE
+
+    path = os.path.join(union_dir, D_RATIOS_FILE)
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except (OSError, ValueError) as e:
+        raise DualShareError(f"DUAL-TP3PP3: D's image is up but {path} is unreadable: {e}")
+    if not d.get("tp"):
+        raise DualShareError(
+            f"DUAL-TP3PP3: D published no base vector in {path} -- D runs an even split? "
+            f"then there is nothing uneven to share by; set {D_TP_RATIO_ENV} explicitly")
+    env[D_TP_RATIO_ENV] = ",".join(str(int(x)) for x in d["tp"])
+    fams = d.get("families") or {}
+    if fams and not env.get(D_FAMILIES_ENV, "").strip():
+        env[D_FAMILIES_ENV] = ";".join(f"{k}={','.join(str(int(x)) for x in v)}" for k, v in fams.items())
+    return env

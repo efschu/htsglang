@@ -255,6 +255,11 @@ def maybe_union_image(model, *, device, role: str = "main") -> Optional[str]:
     # living on the same card, and it needs its own arena and socket.
     scoped_dir = union_dir if role == "main" else os.path.join(union_dir, role)
     if mode == "own":
+        if phase == PHASE_D and role == "main":
+            # DUAL-TP3PP3 1b: the P stage builds its parts under D's vectors;
+            # D resolves them at runtime (auto / d-reshard), so D publishes the
+            # INSTALLED ones before its image -- P reads them after the wait.
+            write_d_ratios(scoped_dir)
         own_image(
             model,
             union_dir=scoped_dir,
@@ -274,3 +279,31 @@ def maybe_union_image(model, *, device, role: str = "main") -> Optional[str]:
             required=(role == "main"),
         )
     return mode
+
+
+D_RATIOS_FILE = "d_ratios.json"
+
+
+def write_d_ratios(union_dir: str) -> str:
+    """Write D's installed TP partition vectors (base + mlp/moe/vocab families
+    that differ from the base) to ``<union_dir>/d_ratios.json`` atomically.
+    Every D rank writes the same content; the last rename wins harmlessly."""
+    import json
+
+    from sglang.srt.distributed.utils import get_tp_partition_ratios
+
+    base = get_tp_partition_ratios(None)
+    fams = {}
+    for name in ("mlp", "moe", "vocab"):
+        vec = get_tp_partition_ratios(name)
+        if vec is not None and base is not None and list(vec) != list(base):
+            fams[name] = [int(x) for x in vec]
+    os.makedirs(union_dir, exist_ok=True)
+    path = os.path.join(union_dir, D_RATIOS_FILE)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump({"tp": None if base is None else [int(x) for x in base], "families": fams}, f)
+    os.replace(tmp, path)
+    logger.info("WEG2-UNION D ratios published for the dual P stage: %s -> %s",
+                {"tp": base, "families": fams}, path)
+    return path

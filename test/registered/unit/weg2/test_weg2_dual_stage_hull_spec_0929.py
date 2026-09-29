@@ -78,6 +78,43 @@ class DualStageHullSpec(CustomTestCase):
                 os.environ[H.DUAL_SHARE_ENV] = env0
 
 
+class DRatiosTravelWithTheImage(CustomTestCase):
+    """D resolves its vectors at runtime (auto / d-reshard); it publishes the
+    INSTALLED ones next to its union socket and P reads exactly those."""
+
+    def test_roundtrip(self):
+        import tempfile
+
+        from sglang.srt.distributed.utils import scoped_tp_partition_ratios
+        from sglang.srt.weg2.union_arena_bind import write_d_ratios
+
+        with tempfile.TemporaryDirectory() as d:
+            with scoped_tp_partition_ratios([58, 25, 25], {"mlp": [98, 19, 19]}):
+                write_d_ratios(d)
+            old = {k: os.environ.pop(k, None) for k in (H.D_TP_RATIO_ENV, H.D_FAMILIES_ENV)}
+            try:
+                env = H._env_with_d_ratios(d)
+            finally:
+                for k, v in old.items():
+                    if v is not None:
+                        os.environ[k] = v
+            spec = H.DualShareSpec.from_env(env, pp_size=3)
+            self.assertEqual(spec.tp_ratio, (58, 25, 25))
+            self.assertEqual(dict(spec.families), {"mlp": (98, 19, 19)})
+
+    def test_an_explicit_env_wins_and_a_missing_file_is_refused(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            os.environ[H.D_TP_RATIO_ENV] = "2,1,1"
+            try:
+                self.assertEqual(H._env_with_d_ratios(d)[H.D_TP_RATIO_ENV], "2,1,1")
+            finally:
+                os.environ.pop(H.D_TP_RATIO_ENV, None)
+            with self.assertRaises(H.DualShareError):
+                H._env_with_d_ratios(d)
+
+
 class ThreeShardShellsAreTheMonolith(CustomTestCase):
     """The P-stage algebra: shells over D's THREE shards (one per D rank, uneven
     [2,1,1] over 8 units) reproduce the full-width linear -- column parts by
