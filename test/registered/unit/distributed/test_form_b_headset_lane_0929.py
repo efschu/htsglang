@@ -312,3 +312,41 @@ def test_nf_config_stays_w189_and_the_runner_passes_the_path(tmp_path):
     src = inspect.getsource(mr)
     assert "form_b_kv_path(model_config.model_path)" in src
     assert "form_b_kv_path(model_config.hf_config)" not in src
+
+
+# ------------------------------- 6. DFLASH solo x compact draft cache at PARSE --
+def test_dflash_solo_compact_draft_cache_is_refused_at_parse(monkeypatch):
+    """12:21Z 29.09.: a3_formb died in the DFLASH worker's constructor on
+    --speculative-draft-placement solo + --speculative-draft-window-size, after
+    a green dry-run -- the refusal lived only in the worker. It is a parse
+    refusal now, one predicate and one text for both sites."""
+    import inspect
+
+    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative import dflash_worker_v2 as dw
+    from sglang.srt.speculative.spec_info import (
+        DFLASH_SOLO_COMPACT_REFUSAL,
+        dflash_solo_compact_refused,
+    )
+
+    monkeypatch.delenv("SGLANG_DFLASH_SOLO_COMPACT", raising=False)
+    a = ServerArgs(model_path="dummy", enable_vram_ledger=False, speculative_algorithm="DFLASH",
+                   speculative_draft_placement="solo", speculative_draft_window_size=2048)
+    with pytest.raises(ValueError) as ei:
+        a._refuse_dflash_solo_compact()
+    assert str(ei.value) == DFLASH_SOLO_COMPACT_REFUSAL
+    assert DFLASH_SOLO_COMPACT_REFUSAL.startswith(
+        "--speculative-draft-placement solo does not support the DFLASH compact draft cache")
+    for ok in (dict(speculative_draft_window_size=None),            # the lane arms' fix
+               dict(speculative_draft_placement="split"),            # a1/a2 keep the window
+               dict(speculative_algorithm="EAGLE")):
+        b = ServerArgs(model_path="dummy", enable_vram_ledger=False, **{
+            "speculative_algorithm": "DFLASH", "speculative_draft_placement": "solo",
+            "speculative_draft_window_size": 2048, **ok})
+        b._refuse_dflash_solo_compact()
+    assert not dflash_solo_compact_refused("DFLASH", True, 2048, {"SGLANG_DFLASH_SOLO_COMPACT": "1"})
+    # the parse calls it right after the placement validation; the worker reads the same predicate
+    post = inspect.getsource(ServerArgs.__post_init__)
+    i = post.index("self._handle_speculative_draft_placement()")
+    assert post.index("self._refuse_dflash_solo_compact()") > i
+    assert "raise ValueError(DFLASH_SOLO_COMPACT_REFUSAL)" in inspect.getsource(dw)

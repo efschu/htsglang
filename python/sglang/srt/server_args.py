@@ -7391,6 +7391,10 @@ class ServerArgs:
         # (NEXTN -> EAGLE, Gemma4 assistant draft -> FROZEN_KV_MTP) and the
         # speculative defaults (topk, num_steps) are final.
         self._handle_speculative_draft_placement()
+        # 29.09.: DFLASH solo x compact draft cache, refused at PARSE (it was
+        # refused only at the draft worker's construction -- a3_formb died
+        # there at 12:21Z behind a green dry-run). Same predicate and text.
+        self._refuse_dflash_solo_compact()
 
         # Weightless-KV fast lane x speculative decoding (#143): admit CHAIN
         # drafts, reject every other speculative shape by name. Runs HERE, after
@@ -9386,6 +9390,21 @@ class ServerArgs:
                 for r in range(self.tp_size)
             )
         )
+
+    def _refuse_dflash_solo_compact(self):
+        """The DFLASH worker's solo x compact-draft-cache refusal, fired at
+        parse (speculative.spec_info.dflash_solo_compact_refused, one source)."""
+        from sglang.srt.speculative.spec_info import (
+            DFLASH_SOLO_COMPACT_REFUSAL,
+            dflash_solo_compact_refused,
+        )
+
+        if dflash_solo_compact_refused(
+            self.speculative_algorithm,
+            getattr(self, "speculative_draft_placement", "split") == "solo",
+            getattr(self, "speculative_draft_window_size", None),
+        ):
+            raise ValueError(DFLASH_SOLO_COMPACT_REFUSAL)
 
     def _handle_speculative_draft_placement(self):
         """Validate the draft-solo placement (--speculative-draft-placement

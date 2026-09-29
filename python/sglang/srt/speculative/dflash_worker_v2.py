@@ -604,17 +604,20 @@ class DFlashWorkerV2(BaseSpecWorker):
         # write no draft KV and skip the round prep, so they never touch the
         # compact req->token table); measured on xsn384 ff. before it becomes
         # the default. Without the env the v2 refusal below stands.
+        # 29.09.: the refusal's predicate and text are shared with the parse
+        # (ServerArgs._refuse_dflash_solo_compact), which now refuses first.
+        from sglang.srt.speculative.spec_info import (
+            DFLASH_SOLO_COMPACT_REFUSAL,
+            dflash_solo_compact_refused,
+        )
+
         if (self._spec_solo_active and self.use_compact_draft_cache
                 and os.environ.get("SGLANG_DFLASH_SOLO_COMPACT", "0") == "1"):
             logger.info("DFLASH solo x compact draft cache ALLOWED by SGLANG_DFLASH_SOLO_COMPACT=1 "
                         "(host=%s window=%s)", self._spec_solo_is_host, self.draft_window_size)
-        elif self._spec_solo_active and self.use_compact_draft_cache:
-            raise ValueError(
-                "--speculative-draft-placement solo does not support the "
-                "DFLASH compact draft cache (--speculative-draft-window-size): "
-                "the draft KV lives only on the solo host, so the shadow ranks "
-                "have no compact req->token table to maintain."
-            )
+        elif self._spec_solo_active and dflash_solo_compact_refused(
+                "DFLASH", True, self.draft_window_size):
+            raise ValueError(DFLASH_SOLO_COMPACT_REFUSAL)
         self.selector = self.draft_model.candidate_selector
         # #1489 A/B (17.09.): SGLANG_DFLASH_DISABLE_SELECTOR=1 proposes the
         # draft's per-slot unary argmax through the legacy greedy head path

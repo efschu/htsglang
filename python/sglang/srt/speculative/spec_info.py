@@ -520,3 +520,38 @@ def create_dummy_verify_input(
         spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
     return spec_info
+
+
+#: The DFLASH solo x compact-draft-cache refusal text, ONE source for the parse
+#: (server_args) and the draft worker (dflash_worker_v2).
+DFLASH_SOLO_COMPACT_REFUSAL = (
+    "--speculative-draft-placement solo does not support the "
+    "DFLASH compact draft cache (--speculative-draft-window-size): "
+    "the draft KV lives only on the solo host, so the shadow ranks "
+    "have no compact req->token table to maintain."
+)
+#: 19.09. (Punkt 5, D-Kapazitaet): opt-in that lets the solo host keep the
+#: compact draft cache (measured on xsn384 ff. before it becomes the default).
+DFLASH_SOLO_COMPACT_ENV = "SGLANG_DFLASH_SOLO_COMPACT"
+
+
+def dflash_solo_compact_refused(algorithm, solo: bool, window_size, environ=None) -> bool:
+    """True when a DFLASH-family draft runs solo with the compact draft cache
+    and the opt-in env is not set -- the combination the draft worker refuses.
+    Pure: the parse (server_args) asks it BEFORE any rank loads, the worker
+    asks it again at construction (29.09.: a3_formb died at the worker, 12:21Z,
+    after a green parse)."""
+    import os
+
+    if not solo or window_size is None or algorithm is None:
+        return False
+    try:
+        algo = (algorithm if isinstance(algorithm, SpeculativeAlgorithm)
+                else SpeculativeAlgorithm.from_string(str(algorithm)))
+    except Exception:  # noqa: BLE001 -- an unknown name is not this refusal's business
+        return False
+    fam = getattr(algo, "is_dflash_family", None)
+    if not callable(fam) or not fam():
+        return False
+    env = os.environ if environ is None else environ
+    return str(env.get(DFLASH_SOLO_COMPACT_ENV, "0")) != "1"
