@@ -50,6 +50,7 @@ launch, i.e. the stretch the card waits for.  Host clocks only
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import time
@@ -90,8 +91,29 @@ def defer_rebuild_on() -> bool:
 
 
 def early_draft_on() -> bool:
-    """Stage 3 of the deferred read; inert unless the deferral itself is on."""
-    return os.environ.get(D_EARLY_DRAFT_ENV, "") == "1"
+    """Stage 3 of the deferred read; inert unless the deferral itself is on.
+    An explicitly set value decides as always (only ``1`` arms); unset or
+    blank takes the published form's profile default (27B row 24h,
+    ``ModelProfile.d_hostgap_levers``: qwen27b on, nextflash off; no form:
+    off)."""
+    raw = os.environ.get(D_EARLY_DRAFT_ENV, "")
+    if raw.strip():
+        return raw == "1"
+    return _profile_switch_on(D_EARLY_DRAFT_ENV, os.environ.get(_FORM_ENV, ""))
+
+
+#: weg2/form.py FORM_ENV (the published boot form; stdlib-only import below)
+_FORM_ENV = "SGLANG_WEG2_FORM"
+
+
+@functools.lru_cache(maxsize=32)
+def _profile_switch_on(name: str, form_value: str) -> bool:
+    """The registry default of switch ``name`` under the form ``form_value``
+    -- cached per (name, form): early_draft_on is asked once per deferred
+    decode round, and the form of a rank never changes."""
+    from sglang.srt.weg2.form import FORM_ENV, profile_switch_default
+
+    return bool(profile_switch_default(name, False, {FORM_ENV: form_value}))
 
 
 def hostgap_split_on() -> bool:

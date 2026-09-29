@@ -158,18 +158,24 @@ END_ANCHOR_SWITCHES: Dict[str, Dict[str, object]] = {
 MAMBA_ANCHOR_SWITCHES: Dict[str, Dict[str, object]] = {
     "deepest": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": -1,
                 "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": 0,
-                "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0},
+                "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0,
+                "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE": False},
     # UNIFY S7/S8: the 27B mechanism is in the tree now (34965fc3fa: group P
     # anchors every 4096 tokens whatever the chunk, at most 4 per path) -- the
     # profile carries the 27B arm's values (docker 27b.env), an explicit env
-    # still wins. INNER_ANCHOR_RELEASE stays arm-set (it is also the S2 alias
-    # of the carrier hold).
+    # still wins. 29.09. (registry = the metal form): the INNER-anchor release
+    # half of SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE (c255e10ddb, group P only)
+    # is part of this form -- every 27B profile since 24.09. set it to 1
+    # (27b.env), the proof boot w109290020 ran it; its carrier-hold half is
+    # ModelProfile.mamba_carrier_hold (True on qwen27b for the same reason).
     "grid4096": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": 0,
                  "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": 4096,
-                 "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 4},
+                 "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 4,
+                 "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE": True},
     "none": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": 0,
              "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": 0,
-             "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0},
+             "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0,
+             "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE": False},
 }
 
 
@@ -235,6 +241,13 @@ class Chunk:
     #: "model-key" (NF H92: the *.pchunk.json whose model_key is this
     #: checkpoint's, weg2/p_chunk_nf.py)
     dynamic_source: str = "stage-model"
+    #: the registry FORMATS on which the launcher's DEFAULT for an unset
+    #: --p-chunk-policy is ``policy`` (launcher apply_profile_arg_defaults,
+    #: :func:`format_of`); every other checkpoint keeps the code default
+    #: ``fixed``. The launcher's --p-chunk-max/-model/-mscale defaults (2048 /
+    #: builtin-int8 / int8) ARE the INT8 measurement's form, so only INT8 takes
+    #: ``dynamic`` from here; NVFP4 states its own model/mscale in its profile.
+    default_formats: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -292,6 +305,17 @@ PREFIX_SWITCHES: Tuple[Tuple[str, str], ...] = (
     ("p_twin_defer", "SGLANG_WEG2_P_TWIN_DEFER"),  # TW
     ("front_span_inflight", "SGLANG_WEG2_FRONT_SPAN_INFLIGHT"),  # #49
     ("told_group_fallback", "SGLANG_WEG2_TOLD_GROUP_FALLBACK"),  # PF
+)
+#: 27B row 24h (Agent HG, 26.09.): the three D host-gap levers, measured ONLY
+#: together (one registry field, ``d_hostgap_levers``). EARLY_DRAFT and
+#: ACCEPT_SYNC_FUSED act only in the DFLASH worker and only with the deferred
+#: length read (SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU, inert without it);
+#: CANON_ORDER is the rank-bit-equality fix of the BAR1 oneshot reduction
+#: (rank-uniform: every rank of a group reads the same form).
+HG_SWITCHES: Tuple[str, ...] = (
+    "SGLANG_WEG2_D_EARLY_DRAFT",
+    "SGLANG_DFLASH_ACCEPT_SYNC_FUSED",
+    "SGLANG_BARLINK_BAR1_CANON_ORDER",
 )
 #: the one of them P and D must run identically (Befund M: the rendered
 #: prompt, hence the prefix keys, differ otherwise)
@@ -426,9 +450,10 @@ class ModelProfile:
     #: the group's own tokenizer and chat template at the front, minus the
     #: MEASURED cached-on-D token prefix (weg2/front_tokens.py); X holds
     #: exactly for that count, no 1.3*X band. Off = the chars/3 pricing byte
-    #: for byte. Both rows off until an agent-load boot has measured it
-    #: (X-EXACT-ERR / X-EXACT-TOKENS); then the operator turns the row on.
-    #: Switch SGLANG_WEG2_FRONT_EXACT_TOKENS (explicit value wins).
+    #: for byte. Both rows were off until an agent-load boot had measured it
+    #: (X-EXACT-ERR / X-EXACT-TOKENS): nextflash on since V1 (27.09.), qwen27b
+    #: on since w109290020 (29.09.). Switch SGLANG_WEG2_FRONT_EXACT_TOKENS
+    #: (explicit value wins).
     front_exact_tokens: bool = False
     #: rc12b D TP0 OOM (27.09. 00:26:34Z): the D budget starts at NVML total
     #: and never took the driver carve (Card.reserved_mib, 519 MiB on the
@@ -452,6 +477,27 @@ class ModelProfile:
     #: only after a clean metal proof under agent load); a proof boot switches
     #: it on per docker profile (profiles/27b-row-authority.env, ``_form``).
     p_row_authority: bool = False
+    #: 27B row 24h (HG): :data:`HG_SWITCHES` on as ONE bundle -- they were
+    #: measured only together: dkr27bint8dhgbar1dhg109261456 against
+    #: dkr27bbar1i8h109261444 (rc9dwin bfc6bd87e2), step time better at all 24
+    #: points (10k warm code bs1 -2.9 %, bs2 -2.6 %, prose bs1 -4.4 %, bs2
+    #: -4.2 %; 240k -3.4/-2.3 %), needle MATCH. qwen27b on since the user rule
+    #: of 29.09. (proven on metal -> default on in the code); nextflash off:
+    #: its D is MTP (EARLY_DRAFT/ACCEPT_SYNC_FUSED never act there) and
+    #: CANON_ORDER would change its BAR1 reduction order unproven. An
+    #: explicitly set env wins per switch.
+    d_hostgap_levers: bool = False
+    #: 27B row 24b: --d-token-placement (weg2/d_token_placement.py) -- where
+    #: group D's NEW KV tokens land. The launcher's DEFAULT for an unset flag
+    #: on a checkpoint whose registry format is in ``d_token_placement_formats``
+    #: (launcher apply_profile_arg_defaults, :func:`format_of`); every other
+    #: format keeps the code default ``capacity``. qwen27b bandwidth on INT8:
+    #: rc9meas INT8 with R, depth gain -1.1 ... -3.1 % at 128k/240k against the
+    #: baseline (i8rt dkr27bint8drtbar109261117 vs i8h dkr27bbar1mwh09261051);
+    #: NVFP4 +0.2 ... -0.8 % (no gain: stays capacity); FP8/GGUF unmeasured.
+    #: nextflash capacity (the launcher refuses bandwidth for NF).
+    d_token_placement: str = "capacity"
+    d_token_placement_formats: Tuple[str, ...] = ()
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -474,6 +520,8 @@ class ModelProfile:
         out["SGLANG_WEG2_D_PARK_IMMEDIATE"] = bool(self.d_park_immediate)
         out["SGLANG_WEG2_P_ROW_AUTHORITY"] = bool(self.p_row_authority)
         out["SGLANG_WEG2_FRONT_EXACT_TOKENS"] = bool(self.front_exact_tokens)
+        for env_name in HG_SWITCHES:
+            out[env_name] = bool(self.d_hostgap_levers)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -547,10 +595,23 @@ PROFILES: Dict[str, ModelProfile] = {
         d_layout="paged_dcp",
         page_size=1,
         kv_dtype="auto",
-        chunk=Chunk(grid=0, policy="dynamic", model="builtin-int8", tokens=2048),
+        # P chunk policy dynamic as the launcher default on INT8 (user rule
+        # 29.09.; chunkab rc9j A fixed dkr27bbar1chunka09260010 vs B dynamic
+        # dkr27bint8chunkBbar109260034: 128k 36.59 -> 31.62 s (-13.6 %), 32k
+        # 4.68 -> 4.35 s, 2k/8k equal, needle 3/3 per step). FP8/GGUF
+        # unmeasured -> fixed; NVFP4 keeps its own profile flags.
+        chunk=Chunk(grid=0, policy="dynamic", model="builtin-int8", tokens=2048,
+                    default_formats=("int8",)),
         end_anchor="trim",
         mamba_anchor="grid4096",
-        mamba_carrier_hold=False,
+        # 29.09. (registry = the metal form, inventory 27B contradiction 1): the
+        # row said False ("the 27B A form: end anchors released at the reset"),
+        # but every 27B profile since 24.09. sets SGLANG_WEG2_MAMBA_INNER_ANCHOR_
+        # RELEASE=1 (27b.env), the environ.py alias that ARMS the hold -- so
+        # every 27B boot ran it, the agent-load proof w109290020 (bb82fbcb68,
+        # 0 tracebacks) and z30x2 included. The row now names that form; an
+        # explicit SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD / alias =0 still wins.
+        mamba_carrier_hold=True,
         # OPERATOR 26.09. (RM): on. Every 27B profile (27b.env and all derived
         # docker profiles) sets SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL=1, the RC9
         # metal ran with it; the repack lands in the default pool since
@@ -614,13 +675,25 @@ PROFILES: Dict[str, ModelProfile] = {
         # immediate-over-x, 33 PARK-RESUME, 70 flips) and 12:26 (15/15, 33
         # flips), needle 97k MATCH after the park round trips in both.
         d_park_immediate=True,
-        # X-EXACT (user 26.09.): OFF until an agent-load boot measured it.
-        front_exact_tokens=False,
+        # X-EXACT (user 26.09.): ON since the agent-load proof (user rule 29.09.
+        # ~10:15Z: proven on metal -> default on in the code). w109290020
+        # (bb82fbcb68, 29.09. 00:20-00:54Z, 30 min agent load): X-EXACT-TOKENS
+        # 108x match=1, 1x match=0 (a W50 midstream reroute, tokens_group >
+        # tokens_front expected there); chars/3 had over-priced dkr27brc10bar1
+        # agent09261821 by median +11.5 % (up to +60 %, c0347b7e4f).
+        front_exact_tokens=True,
         # 27B b1 death (27.09. 06:57:17Z): the D budget books the driver carve
         # (518 MiB, NVML reserved) -- on the 5090 only (32607 MiB board; the
         # 3080s are 20480), see driver_carve_min_total_mib.
         budget_charges_driver_carve=True,
         driver_carve_min_total_mib=32000,
+        # HG (row 24h): proven together in dhg09261456 -- see the field.
+        d_hostgap_levers=True,
+        # row 24b: bandwidth on INT8 only (rc9meas -1.1 ... -3.1 % in depth).
+        # --d-reshard stays off (wake-seg + drq: gain at 6 of 24 points, the
+        # drq preset has no A/B of its own -- inventory class b).
+        d_token_placement="bandwidth",
+        d_token_placement_formats=("int8",),
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,
@@ -753,6 +826,7 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: :func:`publish_prefix_switches`).
 #: SGLANG_WEG2_D_PARK_IMMEDIATE (``d_park_immediate``, 27B park 26.09.).
 #: SGLANG_WEG2_FRONT_EXACT_TOKENS (``front_exact_tokens``, X-EXACT 26.09.).
+#: :data:`HG_SWITCHES` (``d_hostgap_levers``, 27B row 24h, on 29.09.).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }
@@ -1050,6 +1124,24 @@ def profile_switch_default(name: str, fallback, environ: Optional[Mapping[str, s
     if isinstance(fallback, int):
         return int(val)
     return val
+
+
+def format_of(profile: Optional[str], model: str) -> str:
+    """The registry FORMAT of checkpoint ``model`` under ``profile``'s row --
+    the format whose ``checkpoint`` has the same calibration identity
+    (:func:`model_key`, the directory / file name; the rig mounts every
+    checkpoint under the registry's path). ``""`` for an unknown profile or a
+    checkpoint the row does not list: a caller then keeps its code default
+    (the conservative direction -- a derivative or a new export never inherits
+    a best form measured on another checkpoint)."""
+    row = profile_row(profile)
+    key = model_key(model)
+    if row is None or not key:
+        return ""
+    for name, wf in row.formats.items():
+        if wf.checkpoint and model_key(wf.checkpoint) == key:
+            return name
+    return ""
 
 
 def current_profile(environ: Optional[Mapping[str, str]] = None) -> Optional[ModelProfile]:

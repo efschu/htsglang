@@ -336,6 +336,17 @@ class Envs:
     # draft in stream order and read back through an event that fires ahead
     # of the draft. Off = the old planning path, byte-identical.
     SGLANG_DFLASH_PLAN_SYNC_FREE = EnvBool(False)
+    # 27B row 24h (HG): the three D host-gap levers, ONE registry field
+    # (weg2/form.py ModelProfile.d_hostgap_levers: qwen27b on since 29.09.,
+    # nextflash off); off without a form; an explicitly set value wins. The
+    # readers keep their own parse of an explicit value (weg2_d_hostgap
+    # early_draft_on, dflash_worker_v2 accept_sync_fused_on, barlink_bar1
+    # canon_order_on) and take this default when the env is unset or blank.
+    SGLANG_WEG2_D_EARLY_DRAFT = EnvBool(_profile_default("SGLANG_WEG2_D_EARLY_DRAFT", False))
+    SGLANG_DFLASH_ACCEPT_SYNC_FUSED = EnvBool(
+        _profile_default("SGLANG_DFLASH_ACCEPT_SYNC_FUSED", False))
+    SGLANG_BARLINK_BAR1_CANON_ORDER = EnvBool(
+        _profile_default("SGLANG_BARLINK_BAR1_CANON_ORDER", False))
     # [vram-peak] high-water check (model_runner, every forward): read the
     # allocator peak straight from torch's nested stats dict instead of the
     # flattened memory_stats() -- the same number without the Python flatten
@@ -1013,10 +1024,18 @@ class Envs:
     # claim D makes can drop a hand-over anchor D has not read yet. False =
     # the end anchors are released with the rest at the reset (the 27B A form).
     # UNIFY S2: default per profile (weg2/form.py PROFILE_SWITCH_DEFAULTS:
-    # qwen27b False, nextflash True), and the 27B line's switch
-    # SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE (which armed its hold, 27B arms =1)
-    # is read as its alias -- see _mamba_carrier_hold_default.
+    # qwen27b True since 29.09. -- the form every 27B boot ran --, nextflash
+    # True), and the 27B line's switch SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE
+    # (which armed its hold, 27B arms =1) is read as its alias -- see
+    # _mamba_carrier_hold_default.
     SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD = EnvBool(_mamba_carrier_hold_default)
+    # The 27B line's INNER-anchor release on group P (c255e10ddb,
+    # mem_cache/unified_radix_cache._weg2_inner_anchor_release_on): default per
+    # profile since 29.09. (weg2/form.py MAMBA_ANCHOR_SWITCHES: grid4096 = the
+    # qwen27b row on, deepest/none off), off without a form; an explicitly set
+    # value wins -- and, set, is also the carrier-hold alias above.
+    SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE = EnvBool(
+        _profile_default("SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE", False))
     # LANE_PARALLEL_COPY (H22, fnFL2x127/x132): a BAR1 deposit lane writes into
     # the peer's window as REGISTERED HOST memory, so cudaMemcpyAsync makes
     # every deposit copy a D2H on the card's ONE D2H copy engine
@@ -1223,8 +1242,8 @@ class Envs:
     # tokenizer runs in one worker thread, incremental per conversation
     # prefix. Every D leg 2 logs WEG2 X-EXACT-ERR (priced vs realised). Off
     # = the chars/3 pricing byte for byte. Default per profile
-    # (ModelProfile.front_exact_tokens: qwen27b off until an agent-load boot
-    # has measured it, nextflash on since V1 27.09.); off without a form;
+    # (ModelProfile.front_exact_tokens: qwen27b on since the agent-load boot
+    # w109290020 29.09., nextflash on since V1 27.09.); off without a form;
     # explicit wins (=0 turns the NF row off).
     SGLANG_WEG2_FRONT_EXACT_TOKENS = EnvBool(_profile_default("SGLANG_WEG2_FRONT_EXACT_TOKENS", False))
     # X-EXACT: longest wait for the count before the request is priced by the

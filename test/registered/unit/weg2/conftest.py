@@ -116,3 +116,31 @@ def _weg2_draft_on_p_form(request):
             os.environ.pop(_DRAFT_ON_P_ENV, None)
         else:
             os.environ[_DRAFT_ON_P_ENV] = backup
+
+
+#: The boot form ``launcher.main`` PUBLISHES into ``os.environ``
+#: (weg2/form.py FORM_ENV) and the speculative form it installs into
+#: ``launcher._SPEC_FORM`` outlive the case that ran ``main`` -- every later
+#: module then reads the registry defaults of THAT boot's profile. Measured
+#: 29.09.: once the qwen27b row turned --d-replayssm-spec and X-EXACT on, the
+#: dry-run cases (#1378, #1386, #1392) leaked d_replayssm_spec=on and the
+#: qwen27b form into NF wake-credit (h14, pd_h34), pd_free0 h92d and X-EXACT
+#: cases. Saved and restored around every case, like the H25 value above.
+_FORM_ENV = "SGLANG_WEG2_FORM"
+
+
+@pytest.fixture(autouse=True)
+def _weg2_published_form():
+    from sglang.srt.weg2 import launcher  # imported by nearly every case anyway
+
+    backup = os.environ.get(_FORM_ENV)
+    spec = dict(launcher._SPEC_FORM)
+    try:
+        yield
+    finally:
+        if backup is None:
+            os.environ.pop(_FORM_ENV, None)
+        else:
+            os.environ[_FORM_ENV] = backup
+        launcher._SPEC_FORM.clear()
+        launcher._SPEC_FORM.update(spec)

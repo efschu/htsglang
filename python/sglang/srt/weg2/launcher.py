@@ -1042,9 +1042,11 @@ DFLASH_PRODUCE_ENV = "SGLANG_WEG2_DFLASH_PRODUCE"
 #: ``--enable-linear-replayssm-spec``: its GDN target verify runs the compact
 #: spec ring instead of per-draft intermediate states, and the freed
 #: "speculative intermediate state" post goes to D's KV pool (27B desk, not an
-#: NF value: -0.41 GiB post / +0.41 GiB KV per rank at 18/6 heads, mrr 2). OFF
-#: BY DEFAULT until the metal gate (see d_replayssm_spec_line) has passed -- off
-#: leaves argv_d and the D pricing byte-identical. P never gets it: P runs no
+#: NF value: -0.41 GiB post / +0.41 GiB KV per rank at 18/6 heads, mrr 2). The
+#: CODE default (no registry row) is off -- off leaves argv_d and the D pricing
+#: byte-identical; the booted profile's row (``ModelProfile.replayssm``, both
+#: rows True since the metal: 27B xsn436, NF x172/x174) sets it for an unset
+#: flag (apply_profile_arg_defaults, 29.09.). P never gets it: P runs no
 #: target verify.
 D_REPLAYSSM_SPEC_DEFAULT = "off"
 _SPEC_FORM: Dict[str, object] = {
@@ -2598,19 +2600,22 @@ def d_replayssm_spec_line() -> str:
     the ON arm must pass before it may become the default."""
     if not d_replayssm_spec():
         return (
-            "WEG2 D-REPLAYSSM-SPEC: off -- STANDARD FORM: group D's GDN target "
-            "verify writes per-draft intermediate states (the 'speculative "
-            "intermediate state' post); --d-replayssm-spec on is the A/B arm"
+            "WEG2 D-REPLAYSSM-SPEC: off -- group D's GDN target verify writes "
+            "per-draft intermediate states (the 'speculative intermediate state' "
+            "post); explicit --d-replayssm-spec off, or a registry row without "
+            "replayssm"
         )
     accept = "DFLASH" if spec_form_is_dflash() else "MTP (NEXTN)"
     return (
-        "WEG2 D-REPLAYSSM-SPEC: on -- A/B ARM, METAL GATE PENDING: group D runs "
+        "WEG2 D-REPLAYSSM-SPEC: on -- METAL GATE PASSED (27B xsn436 D-KV +21/+13 %, "
+        "NF x172/x174), the registry row's form (replayssm) unless the flag says "
+        "off: group D runs "
         f"--enable-linear-replayssm-spec (ring L={d_replayssm_spec_ring_len()}, "
         f"verify window {d_verify_window()}, fold every commit, bf16 checkpoint "
         "with hi/lo compensation). Expect in D's log: 'GDN ReplaySSM SPEC ring "
         "allocated' and 'ReplaySSM spec ring: 'speculative intermediate state' "
         "priced at ...' per rank, the KV budget posts line with the smaller post, "
-        "and a smaller 'Mamba Cache is allocated' line. Gate before any default: "
+        "and a smaller 'Mamba Cache is allocated' line. The gate it passed: "
         f"{accept} acceptance length vs the off arm, needle MATCH at 262k, greedy "
         "A/B on fixed prompts (first tokens identical, logprob drift), a 4-8k "
         "token generation without degeneration."
@@ -16169,30 +16174,91 @@ def calib_log_accept_of(ns) -> Optional[Callable[[str], bool]]:
     return ident.accepts_log if ident is not None else None
 
 
-#: UNIFY S3: argparse defaults that are MEASURED constants of one model. The
-#: parser's default is the 27B row (the launcher's default --profile); after
-#: parsing, an UNSET flag takes the booted profile's row. A given flag, or a
-#: value that is no longer the parser default (argparse abbreviations), wins.
-PROFILE_ARG_DEFAULTS: Tuple[Tuple[str, str, Callable[[str], object]], ...] = (
+def _profile_row_or_27b(profile: Optional[str]):
+    return weg2_form.profile_row(profile) or _PROFILE_27B
+
+
+#: UNIFY S3: argparse defaults that come from the booted MODEL'S REGISTRY ROW
+#: (weg2/form.py PROFILES) -- the ONE mechanism for "the row is the default of
+#: this CLI flag". Two kinds:
+#:  * MEASURED constants of one model: the parser's default is the 27B row (the
+#:    launcher's default --profile);
+#:  * BEST-FORM fields (user rule 29.09. ~10:15Z: a switch proven on metal is
+#:    default-on in the code, not only in the docker profile): the parser's
+#:    default stays the code default (off / fixed / capacity), the row turns it
+#:    on -- ``replayssm`` -> --d-replayssm-spec.
+#: After parsing, an UNSET flag takes the booted profile's row. A given flag,
+#: or a value that is no longer the parser default (argparse abbreviations),
+#: wins. Each entry: (flag, dest, of(profile, ns) -> the row's value).
+PROFILE_ARG_DEFAULTS: Tuple[Tuple[str, str, Callable[[str, object], object]], ...] = (
     ("--pp-cut-measured-ms-per-layer", "pp_cut_measured_ms_per_layer",
-     lambda p: _pconst("MEASURED_MS_PER_LAYER", p)),
+     lambda p, ns: _pconst("MEASURED_MS_PER_LAYER", p)),
     ("--pp-cut-stage-fixed-mib", "pp_cut_stage_fixed_mib",
-     lambda p: _pconst("P_PP_STAGE_FIXED_MIB", p)),
+     lambda p, ns: _pconst("P_PP_STAGE_FIXED_MIB", p)),
     ("--pp-cut-mamba-mib-per-linear-layer-per-slot", "pp_cut_mamba_mib_per_linear_layer_per_slot",
-     lambda p: float(_pconst("P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT", p))),
-    ("--store-sidecar-factor", "store_sidecar_factor", store_sidecar_factor_of),
+     lambda p, ns: float(_pconst("P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT", p))),
+    ("--store-sidecar-factor", "store_sidecar_factor", lambda p, ns: store_sidecar_factor_of(p)),
+    # H64 (27B xsn436: D-KV +21/+13 %, not slower, user 24.09. ~20:47Z "ja
+    # einschalten"; NF x172/x174: TP0 -396 MiB, 257k needle MATCH): both rows
+    # carry replayssm=True, every profile passed --d-replayssm-spec on.
+    ("--d-replayssm-spec", "d_replayssm_spec",
+     lambda p, ns: "on" if _profile_row_or_27b(p).replayssm else "off"),
+    # P chunk policy: the row's chunk.policy on its chunk.default_formats
+    # (qwen27b dynamic on INT8, chunkab rc9j 128k -13.6 %) -- and only when
+    # the flags make that form RUNNABLE (_p_chunk_dynamic_runnable: the rc9j
+    # form ran with --p-prefill-graph 512); NF row fixed.
+    ("--p-chunk-policy", "p_chunk_policy",
+     lambda p, ns: (_row_format_default(p, ns, _profile_row_or_27b(p).chunk.policy,
+                                        _profile_row_or_27b(p).chunk.default_formats,
+                                        P_CHUNK_POLICY_DEFAULT)
+                    if _p_chunk_dynamic_runnable(ns) else P_CHUNK_POLICY_DEFAULT)),
+    # 27B row 24b: bandwidth on the formats the row measured it on (INT8).
+    ("--d-token-placement", "d_token_placement",
+     lambda p, ns: _row_format_default(p, ns, _profile_row_or_27b(p).d_token_placement,
+                                       _profile_row_or_27b(p).d_token_placement_formats,
+                                       D_TOKEN_PLACEMENT_DEFAULT)),
 )
+
+
+def _p_chunk_dynamic_runnable(ns) -> bool:
+    """Whether --p-chunk-policy dynamic can run with ``ns``'s other flags --
+    the refusals of :func:`apply_p_chunk_policy`, read from the parsed flags
+    (the graph is installed later): the plan's baseline width (--p-chunk-fixed,
+    else the --p-prefill-graph bucket, else CHUNKED_PREFILL_TOKENS 4096) and its
+    floor (--p-chunk-min, else that width) must not exceed --p-chunk-max, and
+    the graph bucket neither. The measured form (27b.env, chunkab rc9j) is
+    dynamic WITH --p-prefill-graph 512; without a graph the baseline 4096 is
+    above the default max 2048 and the launcher would refuse the boot -- so a
+    registry default of dynamic applies only where it is runnable."""
+    bucket = int(getattr(ns, "p_prefill_graph", 0) or 0)
+    cap = int(getattr(ns, "p_chunk_max", P_CHUNK_MAX_DEFAULT) or P_CHUNK_MAX_DEFAULT)
+    fixed = int(getattr(ns, "p_chunk_fixed", 0) or 0) or bucket or CHUNKED_PREFILL_TOKENS
+    low = int(getattr(ns, "p_chunk_min", 0) or 0) or fixed
+    return 0 < low <= cap and not (bucket and cap < bucket)
+
+
+def _row_format_default(profile, ns, row_value, formats, code_default):
+    """A best-form value the row measured on some checkpoint FORMATS only: the
+    row's value when the booted checkpoint's registry format
+    (weg2_form.format_of, by calibration identity) is one of them, else the
+    code default."""
+    fmt = weg2_form.format_of(profile, str(getattr(ns, "model", "") or ""))
+    return row_value if fmt and fmt in formats else code_default
 
 
 def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
     """Rewrite the unset :data:`PROFILE_ARG_DEFAULTS` to ``ns.profile``'s row;
-    returns the dests that changed (none for the 27B; for NF since #242 its own
-    stage-fixed post and mamba rate, MEASURED_MS_PER_LAYER still borrowed)."""
+    returns the dests that changed (for the 27B its best-form fields; for NF
+    since #242 its own stage-fixed post and mamba rate, MEASURED_MS_PER_LAYER
+    still borrowed, and its best-form fields)."""
     parser_default = {
         "pp_cut_measured_ms_per_layer": MEASURED_MS_PER_LAYER,
         "pp_cut_stage_fixed_mib": P_PP_STAGE_FIXED_MIB,
         "pp_cut_mamba_mib_per_linear_layer_per_slot": P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT,
         "store_sidecar_factor": STORE_SIDECAR_FACTOR,
+        "d_replayssm_spec": D_REPLAYSSM_SPEC_DEFAULT,
+        "p_chunk_policy": P_CHUNK_POLICY_DEFAULT,
+        "d_token_placement": D_TOKEN_PLACEMENT_DEFAULT,
     }
     profile = getattr(ns, "profile", None) or PROFILE_QWEN27B
     changed: List[str] = []
@@ -16201,11 +16267,21 @@ def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
             continue
         if getattr(ns, dest) != parser_default[dest]:
             continue
-        want = of(profile)
+        want = of(profile, ns)
         if want != getattr(ns, dest):
             setattr(ns, dest, want)
             changed.append(dest)
     return changed
+
+
+def profile_arg_defaults_line(ns, changed: Sequence[str]) -> Optional[str]:
+    """The launcher's one line naming every CLI default the registry row set
+    (None when the row changed nothing)."""
+    if not changed:
+        return None
+    parts = ", ".join(f"{d}={getattr(ns, d, None)!r}" for d in changed)
+    return (f"WEG2-PROFILE-ARG-DEFAULTS (registry row {getattr(ns, 'profile', '') or PROFILE_QWEN27B}; "
+            f"unset flags only, a given flag wins): {parts}")
 
 
 def pcie_lanes(cards: Sequence[Card]) -> List[Optional[int]]:
@@ -20340,13 +20416,15 @@ def build_parser() -> argparse.ArgumentParser:
              "values, and the launcher names the form in one line (WEG2 DFLASH-PRODUCE-ON-P).")
     ap.add_argument(
         "--d-replayssm-spec", choices=["off", "on"], default=D_REPLAYSSM_SPEC_DEFAULT,
-        help="27B ReplaySSM package. 'on' gives group D --enable-linear-replayssm-spec "
+        help="27B ReplaySSM package. DEFAULT: the booted profile's registry row "
+             "(weg2/form.py replayssm: qwen27b and nextflash on, proven on metal); "
+             "the parser value 'off' is the code default without a row. "
+             "'on' gives group D --enable-linear-replayssm-spec "
              "(+ --linear-replayssm-cache-len, a power of two >= 16 and >= the draft "
              "window): D's GDN target verify runs the compact spec ring instead of "
              "per-draft intermediate states and the freed 'speculative intermediate "
              "state' post goes to D's KV pool; the launcher's D pricing follows the "
-             "same switch. 'off' (default until the metal gate named on the WEG2 "
-             "D-REPLAYSSM-SPEC line has passed) leaves argv_d byte-identical. Group "
+             "same switch. 'off' leaves argv_d byte-identical. Group "
              "P never gets it (P runs no target verify). NF line (H64): the draft "
              "window is group D's --speculative-num-draft-tokens as --extra-d ships "
              "it (the Next-Flash MTP runs 4 over the constants' 3); the D planner "
@@ -20417,7 +20495,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--d-token-placement", choices=["capacity", "bandwidth"], default=D_TOKEN_PLACEMENT_DEFAULT,
         help="Group D: where NEW KV tokens land (27B uneven DCP only; weg2/d_token_placement.py, "
-             "DYN_D_RESHARD.md sec. 13). 'capacity' (default) = today, env byte-identical. "
+             "DYN_D_RESHARD.md sec. 13). DEFAULT: the booted profile's registry row "
+             "(weg2/form.py d_token_placement on its d_token_placement_formats: qwen27b "
+             "bandwidth on the INT8 checkpoint, proven on metal); every other checkpoint and "
+             "NF: 'capacity' = today, env byte-identical. "
              "'bandwidth' = the allocator interleaves its free slot ids so new tokens go to the "
              "ranks by effective bandwidth while the pool has room, by free capacity once a "
              "rank's class would pass --d-token-fill-switch; stored KV never moves. Refused "
@@ -20484,7 +20565,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--p-chunk-policy", choices=["fixed", "dynamic"], default=P_CHUNK_POLICY_DEFAULT,
         help="Group P prefill chunk width (27B and NF line, weg2/p_chunk_policy.py). "
-             "'fixed' (the default for this release candidate) = today: every forward "
+             "DEFAULT: the booted profile's registry row (weg2/form.py chunk.policy on its "
+             "chunk.default_formats: qwen27b dynamic on the INT8 checkpoint, proven on metal "
+             "with --p-prefill-graph 512), where the other flags make it runnable (a P "
+             "prefill graph bucket <= --p-chunk-max); every other case and NF: 'fixed'. "
+             "'fixed' = today: every forward "
              "takes --chunked-prefill-size; argv, env and the P form key are "
              "byte-identical. 'dynamic' = a per-request plan priced on a per-stage "
              "time model as a pipeline (flow shop): a middle size from the ladder "
@@ -22038,7 +22123,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(prefix_switches_announce(ns, boot_form), flush=True)
         # UNIFY S3: argparse defaults that are MEASURED constants follow the
         # profile's registry row (unset flags only).
-        apply_profile_arg_defaults(ns, list(sys.argv[1:] if argv is None else argv))
+        _pad_line = profile_arg_defaults_line(
+            ns, apply_profile_arg_defaults(ns, list(sys.argv[1:] if argv is None else argv)))
+        if _pad_line:
+            print(_pad_line, flush=True)
     ns.weg2_boot_form = boot_form
     # #239 S2: a planned-but-unwired token cut never reaches a rank.
     refuse_unwired_token_cut(ns, boot_form)
