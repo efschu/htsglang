@@ -3169,6 +3169,14 @@ class Envs:
     SGLANG_WEG2_ENABLE_D_DECODE_FIRST = EnvBool(False)
     SGLANG_WEG2_D_DECODE_FIRST_TAIL = EnvInt(8)
     SGLANG_WEG2_D_DECODE_FIRST_ROUNDS = EnvInt(32)
+    # F4 (#259 4c, 29.09.): D's flip park (weg2/d_park_runtime.park_running)
+    # writes the END state of every running request -- KV rows up to the last
+    # consumed token, the open QSA group's ring, the GDN/PLE slot -- as an
+    # END-only tail part (P's hand-off format, weg2/tail_handoff
+    # publish_park_end); the resume is then E2's skip (no tail extend, ~2 s
+    # expert pass on NF-D). Needs SGLANG_WEG2_TAIL_SKIP_EXTEND; refused by
+    # name under uneven DCP / the token cut. Off = the park byte for byte.
+    SGLANG_WEG2_ENABLE_D_PARK_END = EnvBool(False)
     # Fix B (weg2/p_row_authority.py): the #631 row form on group P
     # (ModelProfile.p_row_authority: off on every row until the metal proof);
     # the proof boot sets it per docker profile (27b-row-authority.env).

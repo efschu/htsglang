@@ -2977,10 +2977,12 @@ class PrefillAdder:
                             "none" if _tail is None else ("skip" if _tail.skip else "e1"),
                         )
                         return AddReqResult.OTHER
+                _ea_fill = len(req.full_untruncated_fill_ids)
                 if _tail is not None:
                     _ea_start = _tail.resume_at
+                    _ea_fill -= _tail.fill_drop  # F4: the commit pops the parked token
                 _ea_len, _ea_forced = self._weg2_end_anchor_split(
-                    req, _ea_start, len(req.full_untruncated_fill_ids) - _ea_start
+                    req, _ea_start, _ea_fill - _ea_start
                 )
                 # ONE chunked request per pass: the resident continuation
                 # (`chunked_req_outstanding`) AND a mint earlier in this pass

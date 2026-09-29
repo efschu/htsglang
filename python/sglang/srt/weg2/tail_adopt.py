@@ -324,6 +324,12 @@ class Staged(msgspec.Struct):
         return self.verdict in READY_VERDICTS
 
     @property
+    def park(self) -> bool:
+        """F4: the parts are D's own park END parts (weg2/tail_handoff
+        ``publish_park_end``), not P's hand-off."""
+        return bool(self.headers) and th.is_park_part(getattr(self.headers[0], "part", ""))
+
+    @property
     def end_ok(self) -> bool:
         return self.ok and self.end_verdict in READY_VERDICTS
 
@@ -619,6 +625,13 @@ class Agreed(msgspec.Struct):
         and is the proven order before the first decode draft."""
         return self.staged.spec.cut
 
+    @property
+    def fill_drop(self) -> int:
+        """F4: tokens the commit takes off the fill (a parked request's last
+        sampled token comes back as the skip's token); the admission sizes
+        the extend [c, N) on the fill without it."""
+        return 1 if (self.skip and _is_park(self.staged)) else 0
+
 
 _JOBS: Dict[str, _Job] = {}
 _AGREED: Dict[str, Agreed] = {}
@@ -745,6 +758,8 @@ def agree(rid: str, group_vote: int) -> None:
     # reads the files again; under SGLANG_WEG2_TAIL_KEEP_MIB they leave the
     # store now (the consumption receipt P's budget relies on)
     th.consumed(rid)
+    if job.headers and th.is_park_part(getattr(job.headers[0], "part", "")):
+        th.remove_park(rid)  # F4: the park parts are read (or given up) by every rank
     waited_ms = (time.perf_counter() - job.held_since) * 1000.0 if job.held_since >= 0 else 0.0
     st = job.box[0] if job.box else None
     if st is None:
@@ -777,13 +792,33 @@ def agree(rid: str, group_vote: int) -> None:
 
 
 # -- 2. ADOPT --------------------------------------------------------------------------
-def uniform_refusal(spec: th.TailSpec, ids, fill_len: int, extra_key, prefix_len: int) -> str:
+def _is_park(staged) -> bool:
+    """F4: whether the agreed parts are D's own park parts (a staging read
+    without headers -- or a desk stub -- is P's hand-off form)."""
+    return bool(getattr(staged, "park", False))
+
+
+def adopt_ids(req, park: bool):
+    """The token ids a tail keys on: P's prompt, or (F4) the tokens a parked
+    D request had consumed -- its prompt and all output but the last."""
+    return th.park_ids(req) if park else req.origin_input_ids
+
+
+def uniform_refusal(spec: th.TailSpec, ids, fill_len: int, extra_key, prefix_len: int,
+                    park: bool = False) -> str:
     """'' when the admission may take the tail; otherwise why not. Every
     input is identical on every rank of the group (the extend length the
-    group runs is decided HERE)."""
-    if len(ids) != spec.n_tokens or fill_len != spec.n_tokens:
-        return f"n_tokens:{fill_len}!={spec.n_tokens}"
-    if int(prefix_len) != spec.page_prefix:
+    group runs is decided HERE). F4 (``park``): the fill still carries the
+    last sampled token (N + 1), and the resume may re-enter anywhere in the
+    park's row window [page_prefix, cut) -- the rows below the re-entry are
+    the prefix's own, written again with the same bytes."""
+    want_fill = spec.n_tokens + 1 if park else spec.n_tokens
+    if len(ids) != spec.n_tokens or fill_len != want_fill:
+        return f"n_tokens:{fill_len}!={want_fill}"
+    if park:
+        if not (spec.page_prefix <= int(prefix_len) < spec.cut):
+            return f"prefix:{int(prefix_len)}!in[{spec.page_prefix},{spec.cut})"
+    elif int(prefix_len) != spec.page_prefix:
         return f"prefix:{int(prefix_len)}!={spec.page_prefix}"
     if not (0 < spec.rows and spec.extend >= 1):
         return "geometry"
@@ -828,8 +863,11 @@ def skip_refusal(entry: Agreed, req, batch_empty: bool) -> str:
     if sp.frequency_penalty or sp.presence_penalty or sp.repetition_penalty != 1.0 or sp.min_new_tokens:
         return "penalty_or_min_new_tokens"  # P's token never reached D's penalizer state
     end = entry.staged.headers[0].end
-    if th.tail_key(req.origin_input_ids, spec.n_tokens, req.extra_key) != end.key:
+    park = _is_park(entry.staged)
+    if th.tail_key(adopt_ids(req, park), spec.n_tokens, req.extra_key) != end.key:
         return "end_key_mismatch"
+    if park and (not req.output_ids or int(req.output_ids[-1]) != int(end.first_token)):
+        return "park_token_mismatch"  # F4: the token the decode feeds next must be the parked one
     return ""
 
 
@@ -845,8 +883,9 @@ def plan_adopt(req, prefix_len: int, batch_empty: bool = True) -> Optional[Agree
     if not entry.agreed:
         _log_ready(entry.staged, "skipped:group_vote", waited_ms=entry.waited_ms)
         return None
-    why = uniform_refusal(entry.staged.spec, req.origin_input_ids, len(req.full_untruncated_fill_ids),
-                          req.extra_key, prefix_len)
+    park = _is_park(entry.staged)
+    why = uniform_refusal(entry.staged.spec, adopt_ids(req, park), len(req.full_untruncated_fill_ids),
+                          req.extra_key, prefix_len, park=park)
     if why:
         _log_ready(entry.staged, f"skipped:{why}", waited_ms=entry.waited_ms)
         return None
@@ -882,8 +921,9 @@ def peek_target_start(req, prefix_len: int, batch_empty: bool = True) -> Tuple[O
     entry = _AGREED.get(str(req.rid))
     if entry is None or not entry.agreed:
         return None, False
-    if uniform_refusal(entry.staged.spec, req.origin_input_ids, len(req.full_untruncated_fill_ids),
-                       req.extra_key, prefix_len):
+    park = _is_park(entry.staged)
+    if uniform_refusal(entry.staged.spec, adopt_ids(req, park), len(req.full_untruncated_fill_ids),
+                       req.extra_key, prefix_len, park=park):
         return None, False
     spec = entry.staged.spec
     if entry.skip:
@@ -910,7 +950,9 @@ def skip_joinable(req, prefix_len: Optional[int] = None) -> bool:
         return False
     spec = entry.staged.spec
     at = spec.page_prefix if prefix_len is None else int(prefix_len)
-    if uniform_refusal(spec, req.origin_input_ids, len(req.full_untruncated_fill_ids), req.extra_key, at):
+    park = _is_park(entry.staged)
+    if uniform_refusal(spec, adopt_ids(req, park), len(req.full_untruncated_fill_ids), req.extra_key, at,
+                       park=park):
         return False
     return not skip_refusal(entry, req, batch_empty=True)
 
@@ -1071,9 +1113,20 @@ def _commit_skip(req, entry: Agreed, tree_cache, page_size: int) -> int:
 
     st = entry.staged
     spec = st.spec
-    page = alloc_token_slots(tree_cache, int(page_size))
-    rows = page[: spec.rows].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
+    # the prefix grows from where the match left it to c: P's hand-off
+    # re-enters at page_prefix (one page); F4's park anywhere in its window
+    need = spec.cut - len(req.prefix_indices)
+    page_size = int(page_size)
+    page = alloc_token_slots(tree_cache, -(-need // page_size) * page_size)
+    rows = page[:need].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
     req.prefix_indices = torch.cat([req.prefix_indices, rows])
+    if _is_park(st):
+        # F4: the parked request's last sampled token comes back as the
+        # skip's token -- take it off now so the batch is [c, N) over the
+        # consumed tokens and the decode feeds it next; the stream sent it
+        # before the park and re-sends nothing (send_token_offset is past it)
+        req.output_ids.pop()
+        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
     _log_ready(st, "done", skip=True, waited_ms=entry.waited_ms)
     inst = None
     if st.end_verdict == "ready":
@@ -1317,6 +1370,10 @@ def readback_digest(inst: Install) -> str:
 def _ring_readback_digest(inst: Install, h: th.TailHeader) -> str:
     ring = [inst.readback[f"ring{g}"][0] for g in sorted(h.fa_layers) if f"ring{g}" in inst.readback]
     rope = inst.readback.get("rope")
+    if not h.fa_layers and h.end.ring_digest == th.digest(ring):
+        # F4: a Form-A expert worker's park part holds no attention layer and
+        # so neither ring rows nor the RoPE row (P's stages always carry both)
+        return h.end.ring_digest
     return th.digest(ring + ([rope[0]] if rope is not None else []))
 
 

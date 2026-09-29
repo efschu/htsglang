@@ -159,6 +159,9 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     # 27B PARK: a DFlash window pool carries nothing; the resume is a fresh
     # hand-off's admission (rearm_window_draft_cold). MTP pools: no-op.
     rearmed = rearm_window_draft_cold(sched, running)
+    # F4 (#259 4c): the END state of each running request as a park tail part,
+    # gathered before the retraction hands its slots to the tree.
+    _park_end(sched, running)
     retracted = (
         sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True)
         if running else []
@@ -282,6 +285,41 @@ def hold_late_arrival(sched, req) -> bool:
                 "at the park), held behind the park (%d in the park list) -- the front counts it "
                 "parked", str(req.rid)[:12], len(parked))
     return True
+
+
+def _park_end(sched, running) -> int:
+    """F4 (#259 4c, SGLANG_WEG2_ENABLE_D_PARK_END): every rank writes its
+    part of each running request's END state (weg2/tail_handoff
+    ``publish_park_end``) -- the resume adopts it as E2's skip instead of
+    extending the tail from the last mamba anchor. The gathers are waited
+    for here, MEASURED (``sync_ms`` in the line): the retraction below frees
+    the rows. Returns the number of parts written on this rank."""
+    from sglang.srt.weg2 import tail_handoff as th
+
+    if not running or not th.park_end_enabled():
+        return 0
+    ps = getattr(sched, "ps", None)
+    tp_rank = int(getattr(ps, "tp_rank", getattr(sched, "tp_rank", 0)) or 0)
+    tp_size = int(getattr(ps, "tp_size", getattr(sched, "tp_size", 1)) or 1)
+    part = f"{th.PARK_PART}{tp_rank}-{os.getpid()}"
+    # the resume re-enters at the last mamba track point (#59b resumable
+    # depth), at most one track interval below the end: two cover the lag of
+    # a spec-decode track
+    interval = int(getattr(sched.server_args, "mamba_track_interval", 0) or 0) or int(sched.page_size)
+    events, why = [], {}
+    for req in running:
+        refusal, ev = th.publish_park_end(
+            req, sched.req_to_token_pool, sched.token_to_kv_pool_allocator, sched.page_size,
+            part, tp_size, 2 * interval,
+        )
+        if refusal:
+            why[str(req.rid)[:12]] = refusal
+        else:
+            events.append(ev)
+    sync_ms = th.park_end_barrier(events) if events else 0.0
+    logger.info("F4 PARK-END park: parts=%d of %d running sync_ms=%.1f refused=%s part=%s",
+                len(events), len(running), sync_ms, why or "-", part)
+    return len(events)
 
 
 def hold_parked(sched, *, hold_armed: bool) -> int:
