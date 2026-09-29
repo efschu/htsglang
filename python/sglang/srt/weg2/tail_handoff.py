@@ -864,6 +864,37 @@ def _fa_rows(kvpool, rows: torch.Tensor, groups: Optional[int] = None,
     return out
 
 
+def _fa_rows_owned(kvpool, rows: torch.Tensor, groups: Optional[int], owner,
+                   host: Callable[[torch.Tensor], torch.Tensor] = None) -> Dict[int, Tuple[torch.Tensor, ...]]:
+    """F4b: ``_fa_rows`` under the Form A token cut. K and V of the GLOBAL
+    slots ``rows`` in P's full-row layout, filled at the rows this rank OWNS
+    (read from their compact slot, ``tail_adopt.owner_rows`` -- the backends'
+    write rule) and zero elsewhere, so the group's parts OR together into the
+    full rows; the QSA compressed groups only where the pool keeps them (the
+    indexer's rank)."""
+    from sglang.srt.weg2.tail_adopt import owner_rows
+
+    host = host or _to_host
+    full = kvpool.full_kv_pool
+    compressed = bool(getattr(kvpool, "qsa_compressed_k_buffer_pool", None))
+    ratio = _qsa_ratio(kvpool) if compressed else 0
+    loc, keep = owner_rows(rows, owner)
+    out: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    for gid, local in sorted(kvpool.full_attention_layer_id_mapping.items()):
+        parts = []
+        for buf in (full.k_buffer[local], full.v_buffer[local]):
+            t = torch.zeros((int(rows.numel()),) + tuple(buf.shape[1:]), dtype=buf.dtype, device=buf.device)
+            if int(loc.numel()):
+                tb = t.view(torch.uint8)
+                tb[keep.to(buf.device)] = buf.view(torch.uint8).index_select(0, loc.to(buf.device))
+            parts.append(host(t))
+        if ratio:
+            slots = group_slots(rows.to(full.k_buffer[local].device), ratio, groups)
+            parts.append(host(kvpool.qsa_compressed_k_buffer_pool[local].index_select(0, slots)))
+        out[int(gid)] = tuple(parts)
+    return out
+
+
 def publish_rows(req, kv_indices: torch.Tensor, allocator, part: str, req_to_token_pool=None,
                  n_parts: int = 0) -> None:
     """cache_finished_req entry: never raises into the tree. ``n_parts``:
@@ -1038,10 +1069,13 @@ def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload]
 _PARK_N = [0]
 
 
-def park_end_refusal(req) -> str:
+def park_end_refusal(req, owner=None, page_size: int = 0) -> str:
     """F4: '' when this running request's END state can be parked, else why
-    not (named in the park line; the resume then extends as today)."""
+    not (named in the park line; the resume then extends as today).
+    ``owner``: this rank's token-cut owner rows (tail_adopt.cut_owner), the
+    same on every rank in its presence."""
     from sglang.srt.distributed.utils import uneven_dcp_active
+    from sglang.srt.weg2 import tail_adopt
 
     if not park_end_enabled():
         return "off"
@@ -1050,9 +1084,16 @@ def park_end_refusal(req) -> str:
     if req.return_logprob or req.return_hidden_states:
         return "logprob_or_hidden_requested"
     if bool(uneven_dcp_active()):
-        # the token cut / uneven DCP compacts KV rows per rank and the QSA
-        # ring is the host's ('cut_ring_on_worker'): not in this stage
-        return "uneven_dcp"
+        # uneven DCP compacts KV rows per rank: only under the Form A token
+        # cut, whose owner rows the resume takes the E2 way (F4b)
+        if owner is None:
+            return "uneven_dcp"
+        if not tail_adopt.cut_worker_end_enabled():
+            return "cut_worker_end_off"
+        if int(page_size or 1) % int(owner[0]):
+            # a token's owner is its slot % S: stable across the park only
+            # while S divides the page (slot = page base + token % page)
+            return f"cut_period:{int(owner[0])}"
     if req.mamba_pool_idx is None or req.req_pool_idx is None:
         return "no_slots"
     return ""
@@ -1076,11 +1117,11 @@ def publish_park_end(req, req_to_token_pool, allocator, page_size: int, part: st
 
         if not isinstance(req_to_token_pool, HybridReqToTokenPool):
             return "no_mamba_pool", None
-        why = park_end_refusal(req)
-        if why:
-            return why, None
         kvpool = allocator.get_kvcache()
         held = tail_adopt.held_shapes(kvpool, req_to_token_pool)
+        why = park_end_refusal(req, held.owner, page_size)
+        if why:
+            return why, None
         ids = park_ids(req)
         page = int(page_size or 1)
         grain = _grain_of(allocator, page)
@@ -1095,8 +1136,15 @@ def publish_park_end(req, req_to_token_pool, allocator, page_size: int, part: st
         fa: Dict[int, Tuple[torch.Tensor, ...]] = {}
         ring: Dict[int, Tuple[torch.Tensor, ...]] = {}
         rope = None
-        if held.fa:  # a Form-A expert worker holds no attention rows (0-head pool, no indexer)
+        # a Form-A expert worker holds no attention rows (0-head pool, no
+        # indexer); under the token cut (F4b) it holds its owned K/V rows and
+        # the ring/groups are the indexer rank's alone
+        indexer = held.owner is None or bool(held.qsa_ratio)
+        if held.fa and held.owner is not None:
+            fa = {g: t for g, t in _fa_rows_owned(kvpool, kv, groups, held.owner).items() if g in held.fa}
+        elif held.fa:
             fa = {g: t for g, t in _fa_rows(kvpool, kv, groups=groups, host=_to_host).items() if g in held.fa}
+        if held.fa and indexer:
             ring, rope = _ring_rows(kvpool, req.req_pool_idx, ring_rows)
             ring = {g: t for g, t in ring.items() if g in held.fa}
             if not ring:
