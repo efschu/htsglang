@@ -458,50 +458,93 @@ def dc_residue_from_record(
 
 
 P_DORMANT_EXPECT_ENV = "SGLANG_WEG2_D_EXPECT_P_RECORD"
+#: How many of the newest group-P boots (same calibration identity, same weight
+#: form, every card measured) the expectation takes the per-card MAXIMUM over.
+#: Measured scatter of this record under ONE P form (Next Flash, 28./29.09.,
+#: profile family -st/-st-cut/-odx, 30 boots): nvml1 1286-1414, nvml0 680-764,
+#: nvml2 666-1012 MiB; about one boot in four carries a +250..+350 MiB outlier
+#: on one card (09281447 nvml2 1012, 09290450/0500 nvml2 924). Eight boots are
+#: the last ~2-6 h of the serving loop: an outlier is inside the window with
+#: ~90 % (1 - 0.75^8), and the window stays within today's P form (the older
+#: form of 27.09., 1850/1130/1120, is a different P and ages out). A maximum
+#: of measurements, not a reserve: no margin is added on top.
+P_DORMANT_EXPECT_N = 8
 
 
-def p_dormant_from_record(
-    rec: Optional[Dict[str, object]], cards: Sequence[Card], weight_source: str
+def p_dormant_records(profile: Optional[str],
+                      accept: Optional[Callable[[dict], bool]]
+                      ) -> Optional[List[Dict[str, object]]]:
+    """The group-P dormant-image records the D expectation may price from --
+    READ ONLY where they are used. ``None`` without reading on every profile
+    whose expectation stays the legacy term (the 27B: a broken or foreign
+    sidecar must not touch a boot that never uses the value -- 27B review,
+    'Riegel hinter dem, was er sichert') and without a calibration identity
+    (no identity = no foreign model's record). A malformed sidecar reads as
+    ``[]`` (UNMEASURED), never as an exception."""
+    if not xchg_census_is_reserve(profile) or accept is None:
+        return None
+    return host_ledger.read_measured_records(measured_record_path(), "P", accept=accept)
+
+
+def p_dormant_from_records(
+    recs: Optional[Sequence[Dict[str, object]]], cards: Sequence[Card], weight_source: str,
+    n: int = P_DORMANT_EXPECT_N,
 ) -> Tuple[Optional[Dict[str, int]], str]:
-    """Group P's MEASURED dormant VRAM residue per card, from the newest
-    group-P dormant-image record the front stamped at P's first sleep
-    (``vram_residue_mib``, the same field #1444 reads for group D).
+    """Group P's MEASURED dormant VRAM residue per card: the per-card MAXIMUM
+    over the newest ``n`` group-P dormant-image records (one per boot) that
+    the front stamped at P's first sleep (``vram_residue_mib``, the same
+    field #1444 reads for group D), measured under the SAME weight form and
+    carrying a positive value for EVERY card of this boot.
 
-    ``(per-uuid MiB, provenance)`` when the record carries a positive value for
-    EVERY card of this boot, measured under the SAME weight form; ``(None,
-    why)`` otherwise (UNMEASURED -- the caller names its fallback). Priced
-    BARE, no margin: the real D pass after P's sleep charges the launcher's
-    own reading of the same residue bare too (``budgets_from_dc(cards, dc_p,
-    ...)``), and the served growth of P's dormant image has its own term
-    (``served_dormant_growth``). This is the one reader for "D's budget after
-    P's sleep" before P has slept -- the expectation pass and an early D start
-    read it here, not from a second source."""
-    if not isinstance(rec, dict):
+    ``(per-uuid MiB, provenance naming n, the boots and the maximum)``;
+    ``(None, why)`` when no such record exists (UNMEASURED -- the caller names
+    its fallback). A record of another form or missing a card is skipped by
+    name, never merged partially. Priced BARE, no margin: the real D pass
+    after P's sleep charges the launcher's own reading of the same residue
+    bare too (``budgets_from_dc(cards, dc_p, ...)``), and the served growth of
+    P's dormant image has its own term (``served_dormant_growth``). This is
+    the one reader for "D's budget after P's sleep" before P has slept -- the
+    expectation passes and an early D start read it here, not from a second
+    source."""
+    if not recs:
         return None, "no group-P dormant-image record in the sidecar"
-    tag = str(rec.get("boot_tag", "?"))
-    form = str(rec.get("vram_residue_form", "") or "")
-    if form != str(weight_source):
-        return None, (f"group-P record of boot {tag} measured form {form!r}, this boot is "
-                      f"{str(weight_source)!r}")
-    vals = rec.get("vram_residue_mib") or {}
-    if not isinstance(vals, dict):
-        return None, f"group-P record of boot {tag} carries no vram_residue_mib"
+    by_boot: Dict[str, Dict[str, object]] = {}
+    skipped = []
+    for rec in sorted((r for r in recs if isinstance(r, dict)),
+                      key=lambda r: str(r.get("at", "")), reverse=True):
+        tag = str(rec.get("boot_tag", "?"))
+        if tag in by_boot:
+            continue
+        form = str(rec.get("vram_residue_form", "") or "")
+        vals = rec.get("vram_residue_mib") or {}
+        if form != str(weight_source) or not isinstance(vals, dict):
+            skipped.append(f"{tag} (form {form!r})")
+            continue
+        miss = [c for c in cards if not isinstance(vals.get(c.uuid), (int, float))
+                or isinstance(vals.get(c.uuid), bool) or vals.get(c.uuid) <= 0]
+        if miss:
+            skipped.append(f"{tag} (no residue for nvml{miss[0].nvml_index})")
+            continue
+        by_boot[tag] = rec
+        if len(by_boot) >= int(n):
+            break
+    if not by_boot:
+        return None, (f"no group-P record measured under form {str(weight_source)!r} on "
+                      f"every card (skipped: {', '.join(skipped[:4]) or 'none'})")
     out: Dict[str, int] = {}
     parts = []
     for c in cards:
-        v = vals.get(c.uuid)
-        if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
-            return None, (f"group-P record of boot {tag} carries no residue for card "
-                          f"{c.uuid} ({c.name})")
-        out[c.uuid] = int(v)
-        parts.append(f"nvml{c.nvml_index} {int(v)}")
-    return out, (f"group-P record of boot {tag} at {rec.get('at', '?')} form {form!r}: "
-                 + ", ".join(parts) + " MiB")
+        vals = [int(r["vram_residue_mib"][c.uuid]) for r in by_boot.values()]
+        out[c.uuid] = max(vals)
+        parts.append(f"nvml{c.nvml_index} {out[c.uuid]} (min {min(vals)})")
+    return out, (f"MAX over the newest {len(by_boot)} of N={int(n)} group-P records form "
+                 f"{str(weight_source)!r}: " + ", ".join(parts) + " MiB; boots "
+                 + ", ".join(by_boot))
 
 
 def d_expect_dormant_other(
     cards: Sequence[Card], dc_expect_d: Mapping[str, int],
-    p_rec: Optional[Dict[str, object]], weight_source: str, profile: Optional[str],
+    p_recs: Optional[Sequence[Dict[str, object]]], weight_source: str, profile: Optional[str],
 ) -> Tuple[Dict[str, int], str]:
     """``dormant_other`` of group D's EXPECTATION budget (the map pass and the
     dry pass, both before P has slept): what group P leaves on each card
@@ -517,19 +560,43 @@ def d_expect_dormant_other(
     the real pass could not raise it any more (the map is built from it), so
     the gap sat free all run.
 
-    Next Flash (``xchg_census_is_reserve``) with a same-checkpoint group-P
-    record: P's measured residue, as the real pass charges it. Anything else:
-    the legacy term, with the reason named. ``SGLANG_WEG2_D_EXPECT_P_RECORD=0``
-    forces the legacy term."""
+    Next Flash (``xchg_census_is_reserve``) with same-checkpoint group-P
+    records: the maximum of P's measured residue over the newest
+    ``P_DORMANT_EXPECT_N`` boots (:func:`p_dormant_from_records`). Anything
+    else: the legacy term, with the reason named.
+    ``SGLANG_WEG2_D_EXPECT_P_RECORD=0`` forces the legacy term.
+
+    DANGER DIRECTION (P holds more after serving than the records say): the
+    real pass prices the launcher's own reading after P's sleep, and the
+    pinned form is CHECKED against that budget in ``log_d_rank_vram_solve``
+    -- the scratch is capped to the planner's edge (named), and a form that
+    still does not fit is refused by name (W122 ``Weg2LaunchRefused``), never
+    started into an OOM. ``D-EXPECT CHECK`` names each card's difference."""
     legacy = {c.uuid: int(dc_expect_d[c.uuid]) + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}
     if not xchg_census_is_reserve(profile):
         return legacy, "legacy (profile's dormant_other is D's reserve + windows)"
     if os.environ.get(P_DORMANT_EXPECT_ENV, "1").strip() == "0":
         return legacy, f"legacy ({P_DORMANT_EXPECT_ENV}=0)"
-    meas, why = p_dormant_from_record(p_rec, cards, weight_source)
+    meas, why = p_dormant_from_records(p_recs, cards, weight_source)
     if meas is None:
         return legacy, f"legacy (UNMEASURED: {why})"
     return meas, why
+
+
+def d_expect_check_lines(cards: Sequence[Card], expected: Optional[Mapping[str, int]],
+                         dc_p: Mapping[str, int]) -> List[str]:
+    """The real pass, after P's sleep: P's measured residue against what the
+    expectation priced, per card. ``[]`` when no expectation was priced here.
+    UNDER means the pinned D form gets less than it was solved for -- the
+    solve that follows caps the scratch or refuses (W122) by name."""
+    if not expected:
+        return []
+    parts = []
+    for c in cards:
+        e, m = int(expected.get(c.uuid, 0)), int(dc_p.get(c.uuid, 0))
+        parts.append(f"nvml{c.nvml_index} P real {m} vs expectation {e} MiB "
+                     f"({'UNDER by ' + str(m - e) if m > e else 'ok, ' + str(e - m) + ' spare'})")
+    return ["D-EXPECT CHECK (after P's sleep): " + "; ".join(parts)]
 
 
 def dc_measured_d_mib(card: Card, weight_source: str) -> int:
@@ -21735,12 +21802,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         measured_record_path(), accept=_dc_accept).get("D")
     _dc_from_record, _dc_record_prov = dc_residue_from_record(
         _dc_rec_d, cards, ns.weg2_weight_source)
-    # D-EXPECT: group P's measured dormant residue, same calibration identity
-    # (no identity = no foreign model's record: the expectation stays legacy).
-    _p_dormant_rec = (
-        host_ledger.read_measured_record(
-            measured_record_path(), accept=calib_sample_accept).get("P")
-        if calib_sample_accept is not None else None)
+    # D-EXPECT: group P's measured dormant residue, same calibration identity,
+    # read only where the expectation uses it (27B: not read at all).
+    _p_dormant_recs = p_dormant_records(ns.profile, calib_sample_accept)
     if _dc_rec_d is None and calib_sample_accept is not None:
         _dc_record_prov = (
             f"no group-D dormant-image record MEASURED ON {boot_form.model} under "
@@ -22870,7 +22934,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # cap, seat rows, stage form, waves, trims) come from the real budgets
         _env_d_before = str(getattr(ns, "env_d", "") or "")
         _map_terms: List[Dict[str, object]] = []
-        _map_other, _map_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_rec, ns.weg2_weight_source, ns.profile)
+        _map_other, _map_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
+        ns._d_expect_other = (_map_other if not _map_other_why.startswith("legacy") else None)
         log("D-EXPECT DORMANT-OTHER D(Karte, Erwartung): " + ", ".join(f"nvml{c.nvml_index} {_map_other[c.uuid]}" for c in cards) + f" MiB -- {_map_other_why}")
         _map_budgets = budgets_from_dc(cards, _map_other, log, "D(Karte, Erwartung)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_map_terms)
         log_d_rank_vram_solve(ns, cards, _map_budgets, log, "D(Karte, Erwartung)",
@@ -23322,7 +23387,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     launch_group(spec_p, tree, log, dry)
     if dry:
         _dry_terms: List[Dict[str, object]] = []
-        _dry_other, _dry_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_rec, ns.weg2_weight_source, ns.profile)
+        _dry_other, _dry_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
         log("D-EXPECT DORMANT-OTHER D(dry, expectation): " + ", ".join(f"nvml{c.nvml_index} {_dry_other[c.uuid]}" for c in cards) + f" MiB -- {_dry_other_why}")
         budgets_d = budgets_from_dc(cards, _dry_other, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_dry_terms)
         # #145 AN BEIDEN STELLEN -- siehe #114 direkt darunter: es gibt ZWEI
@@ -23440,6 +23505,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"({'AT OR BELOW' if dc_p[c.uuid] <= exp + P_WINDOWS_MIB else 'ABOVE'} expectation; the launcher derives D from the MEASUREMENT, record 1f B6)"
         )
     state.dc_measured_p = dc_p
+    for _ln in d_expect_check_lines(cards, getattr(ns, "_d_expect_other", None), dc_p):
+        log(_ln)
 
     # 5. group D
     _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
