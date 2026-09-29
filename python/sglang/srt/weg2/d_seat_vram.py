@@ -1991,9 +1991,23 @@ def runtime_tick(sched):
     alloc = _kv_allocator(sched)
     page = _page_size(sched)
     if not step.changed:
-        if ms.pending is not None and ms.pending != pending_before and alloc is not None:
-            # a shrink the floor blocks: new pages go below the wanted stage
-            _engage_kv_cap(alloc, tokens[ms.pending], page)
+        if ms.pending != pending_before and alloc is not None:
+            # a shrink the floor blocks: new pages go below the wanted stage.
+            # A pending shrink the need CANCELS (pending -> None, the stage
+            # holds) hands the cap back up to the mapped stage -- rc12z30y2
+            # 09291559 D: the end-event shrink S1->S0 waited on weg2-2-10's
+            # retained page 517, the cap went to 32768, the queue head
+            # weg2-4-11 (33633 tokens, 33024 its locked prefix) cleared the
+            # pending shrink and the cap stayed at 32768 -- available_size 0
+            # on every rank, #1045 floor 0, H105 host_budget 0 for 13 min.
+            want = ms.pending if ms.pending is not None else ms.stage
+            _engage_kv_cap(alloc, tokens[want], page)
+            logger.info(
+                "%s cap=%d pending S%s->S%s stage=S%d used=%d incoming=%d floor=%d -- %s",
+                ms.line(), tokens[want],
+                "-" if pending_before is None else pending_before,
+                "-" if ms.pending is None else ms.pending, ms.stage, used, incoming,
+                floor, step.reason)
         return step
     if alloc is not None:
         _engage_kv_cap(alloc, tokens[ms.pending if ms.pending is not None else ms.stage], page)
