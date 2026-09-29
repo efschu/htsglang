@@ -578,6 +578,8 @@ class _Recorder:
         self.marks: Dict[str, Dict[str, int]] = {}
         self.scheduler_ref: Optional[Callable[[], Any]] = None
         self.pid_class: Dict[int, str] = {}
+        #: P: rids that held KV in the current phase (the stau of the key)
+        self.phase_rids: set = set()
         self.tag_list: Optional[Tuple[str, ...]] = None
         self.providers_cache: Optional[Dict[str, int]] = None
         #: id(model) -> its expert caches; ("params", id(model)) -> [bytes]
@@ -934,22 +936,48 @@ def bind_scheduler(scheduler) -> None:
 # -- WEG2-VRAM-PEAK windows --------------------------------------------------
 
 
+def _batch_reqs(batch) -> list:
+    reqs = getattr(batch, "reqs", None) if batch is not None else None
+    return list(reqs) if reqs else []
+
+
+def _p_stau(sched) -> Optional[int]:
+    """P's ``stau``: the requests that hold KV on P in this phase -- the one(s)
+    being prefilled plus every request prefilled since P woke, whose rows stay
+    in the tree for the flip (H91 "P staut bis 6"). A request still in the
+    waiting queue holds no page and is NOT counted (planner seat 29.09.: else
+    a peak with 2 KV holders lands on stau=6). Rank-local: the rids seen in
+    this phase's batches, cleared at P's flip legs."""
+    if sched is None:
+        return None
+    batches = [getattr(sched, "last_batch", None), getattr(sched, "running_batch", None)]
+    for name in ("mbs", "running_mbs"):
+        batches += list(getattr(sched, name, None) or ())
+    reqs = [r for b in batches for r in _batch_reqs(b)]
+    chunked = getattr(sched, "chunked_req", None)
+    if chunked is not None:
+        reqs.append(chunked)
+    for r in reqs:
+        rid = getattr(r, "rid", None)
+        if rid is not None:
+            _REC.phase_rids.add(rid)
+    return len(_REC.phase_rids)
+
+
 def _window_key(phase: str, rows: int, leg: Optional[str], seats: int) -> Optional[str]:
     g = _group()
     if phase == "flip" and leg:
+        if g == "P":
+            _REC.phase_rids.clear()  # P's phase ends (sleep) or starts (wake)
         return flip_state_key(g, leg)
     if phase == "idle":
         return None
     sched = _scheduler()
     if g == "P":
-        stau = None
-        if sched is not None:
-            try:
-                wq = getattr(sched, "waiting_queue", None) or ()
-                rb = getattr(getattr(sched, "running_batch", None), "reqs", None) or ()
-                stau = len(wq) + len(rb)
-            except Exception:  # noqa: BLE001
-                stau = None
+        try:
+            stau = _p_stau(sched)
+        except Exception:  # noqa: BLE001
+            stau = None
         return p_state_key(rows if phase == "chunk" else 0, stau)
     stage = None
     if sched is not None:
