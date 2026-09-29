@@ -5376,6 +5376,7 @@ class Front:
         if anchor <= 0:
             return 0
         self.counters["p_anchor_presence"] += 1
+        self.counters["p_anchor_presence_tokens"] += anchor
         logger.info("WEG2 P-ANCHOR-PRESENCE rid=%s anchor=%d p_prompt=%d tokens_front=%d epoch=%d "
                     "(D resumed P's END-ANCHOR at its first content: a store presence every "
                     "later text on this prefix is priced against)",
@@ -5390,12 +5391,15 @@ class Front:
         error is printed, never folded back into the routing bound."""
         ids = self.ftok.ids_for(text)
         clamps = self.tspans.own_text_clamps
+        clamped_tokens = self.tspans.own_text_clamped_tokens
         self.tspans.record_presence(ids, ct, prompt_tokens=pt,
                                     held_epoch=held_epoch, resumable_depth=resumable_depth)
         if self.tspans.own_text_clamps != clamps:
             # PREFILL-EINBRUCH-0929 K2: a parked + resumed leg 2 counts its
             # decoded tokens as prompt; the entry credits its own end anchor.
             self.counters["presence_own_text_clamped"] += 1
+            self.counters["presence_own_text_clamped_tokens"] += (
+                self.tspans.own_text_clamped_tokens - clamped_tokens)
             logger.info("WEG2 PRESENCE-OWN-TEXT-CLAMP rid=%s tokens_front=%d cached_d=%d prompt_d=%d "
                         "depth_d=%s credited=%d (D's reading reaches past this text -- a D-park "
                         "resume counts its decoded tokens as prompt; the entry credits at most "
@@ -5845,6 +5849,14 @@ class Front:
             "outstanding": {g.name: len(g.outstanding) for g in self.groups.values()},
             "served": {g.name: g.served for g in self.groups.values()},
             "counters": dict(self.counters),
+            # PREFILL-EINBRUCH-0929: the X-price presence repairs as numbers per
+            # boot (count + tokens), so the metal read needs no log line.
+            "presence_price": {
+                "own_text_clamped": int(self.counters["presence_own_text_clamped"]),
+                "own_text_clamped_tokens": int(self.counters["presence_own_text_clamped_tokens"]),
+                "p_anchor_presence": int(self.counters["p_anchor_presence"]),
+                "p_anchor_presence_tokens": int(self.counters["p_anchor_presence_tokens"]),
+            },
             "corridor_min_mib": {k: dict(v) for k, v in self.corridor_min.items()},
             # Same instrument and band as the WEG2-CORRIDOR log line: a reader
             # of this dict must not have to guess which "free" it holds.  Both

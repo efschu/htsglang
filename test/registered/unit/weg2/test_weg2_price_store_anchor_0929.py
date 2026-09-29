@@ -91,6 +91,32 @@ def test_k2_park_resume_entry_credits_its_own_end_anchor(caplog):
     assert pending == 22851 - 21568 <= X, "SHORT: D reads 21568 back and prefills 1283"
     assert "WEG2 PRESENCE-OWN-TEXT-CLAMP rid=weg2-2-7 tokens_front=21601" in caplog.text
     assert f.counters["presence_own_text_clamped"] == 1
+    # 27B's condition: count + clamped tokens per boot as a number, not a log
+    assert f.counters["presence_own_text_clamped_tokens"] == 21760 - 21568
+
+
+def test_presence_price_numbers_in_the_state():
+    import inspect
+
+    f = _front()
+    f.ftok.m["prev"] = _ids(21601, salt=1)
+    f.ftok.m["other"] = _ids(30000, salt=4)
+    f._x_exact_record("a", "prev", 21760, 21760, types.SimpleNamespace(d_direct=False), None,
+                      resumable_depth=21760)
+    f._x_exact_record("b", "prev", 21824, 21824, types.SimpleNamespace(d_direct=False), None,
+                      resumable_depth=21824)
+    f._p_anchor_presence("c", "other", types.SimpleNamespace(leg1_prompt_tokens=30000))
+    src = inspect.getsource(F.Front.state_dict)
+    assert '"presence_price": {' in src
+    # the block reads the same counters the state endpoint serves
+    got = {
+        "own_text_clamped": f.counters["presence_own_text_clamped"],
+        "own_text_clamped_tokens": f.counters["presence_own_text_clamped_tokens"],
+        "p_anchor_presence": f.counters["p_anchor_presence"],
+        "p_anchor_presence_tokens": f.counters["p_anchor_presence_tokens"],
+    }
+    assert got == {"own_text_clamped": 2, "own_text_clamped_tokens": 192 + 256,
+                   "p_anchor_presence": 1, "p_anchor_presence_tokens": 29952}
 
 
 def test_k2_control_unparked_entry_is_unchanged(caplog):
