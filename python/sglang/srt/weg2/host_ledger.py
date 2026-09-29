@@ -1271,6 +1271,32 @@ def reap_mark_gib(ceiling_bytes: Optional[int] = None, ceiling_source: str = "")
     return min(const, float(ceiling_bytes) / GIB)
 
 
+#: 29.09.: the line that names a derived runtime latch.
+RIEGEL_MARKER = "WEG2-HOST-LEDGER RIEGEL"
+
+
+def effective_riegel_gib(riegel_gib: Optional[float], hard_bound_gib: float
+                         ) -> Tuple[Optional[float], str]:
+    """``(latch, line)``: the runtime latch a boot runs with.
+
+    29.09. (27B z30y W97 13:02Z): since the mark follows ``memory.max``
+    (:func:`reap_mark_gib`), the latch is DERIVED from it -- the hard bound,
+    mark minus the measured margin. A profile's fixed ``--host-riegel-gib``
+    may only TIGHTEN it: 93.0 written for the 95.90 CT999 mark is above the
+    74.53 GiB bound of a 76 GiB container, so the derivation wins and the line
+    says so, instead of refusing the boot over a number the ceiling outdated.
+    ``None`` stays ``None`` (no latch was asked for)."""
+    if riegel_gib is None:
+        return None, ""
+    flag = float(riegel_gib)
+    if flag <= hard_bound_gib:
+        return flag, ""
+    return float(hard_bound_gib), (
+        f"{RIEGEL_MARKER} --host-riegel-gib {flag:.2f} is above the hard bound "
+        f"{hard_bound_gib:.2f} GiB (mark minus the measured margin) -- the latch is "
+        f"derived: {hard_bound_gib:.2f} GiB; a fixed flag may only tighten it")
+
+
 def pinned_reserve_for_ranks(
     margin_gib: float,
     ceiling_bytes: Optional[int],
@@ -4610,7 +4636,16 @@ def price(
     # numbers (measured image and weight-tag census) to print.
     image_p_gib = images.p_gib
     image_d_gib = images.d_gib
-    common = base_gib - FLOOR_GIB - _boot_charges_gib(charges)
+    # 29.09. (z30y W87/W20 13:01Z): the tmpfs expert store counts ONCE -- in the
+    # run peak against memory.max, where its pages land (z30x2 memts: shmem
+    # 53.3 GiB of 79.54 non-reclaimable). The two moments here are the #721 /
+    # #1236 leftovers above FLOOR and the CLI reserve, and #1236 took the store
+    # out of them ("store=NOT CHARGED HERE"); charging it here as well made the
+    # same 38.97 GiB bind twice -- once in the run peak (77.98 vs 82.53, funded)
+    # and once against the 26 GiB FLOOR + CLI the moments keep -- and refused a
+    # form that ran at 79.54 of 84. The ARM line still prints the post.
+    cold_tier_gib = float(charges.get("cold_tier_shm_gib", 0.0) or 0.0)
+    common = base_gib - FLOOR_GIB - (_boot_charges_gib(charges) - cold_tier_gib)
     # R7: at the launch moment only span 1 is registered (P's first pause is the
     # launcher's sleep(P)); span 2 lands at D's first pause, when D's load
     # transient is gone.  Charging Sigma H at launch is what turns the M=1200
@@ -6232,6 +6267,11 @@ def choose(
         )
     )
     hard_bound_gib = watermark_gib - margin.total_gib
+    # 29.09. (27B z30y W97, 13:02Z): the latch is derived from the mark; a
+    # profile's fixed --host-riegel-gib may only tighten it.
+    riegel_gib, _riegel_line = effective_riegel_gib(riegel_gib, hard_bound_gib)
+    if _riegel_line:
+        lines.append(_riegel_line)
     pinned_reserve_gib, pinned_reserve_src = pinned_reserve_for_ranks(
         margin.total_gib, cg_ceiling_bytes, cg_ceiling_source)
     pinned_wall_gib, _pinned_wall_why = pinned_wall(
@@ -6409,10 +6449,10 @@ def choose(
                     f"fields, from the one producer, so the refusal and the arm "
                     f"it refused can be compared field by field."
                 )
-            if float(riegel_gib) >= hard_bound_gib:
+            if float(riegel_gib) > hard_bound_gib:
                 raise Weg2HostDeviationRefused(
                     f"W97 Weg2HostDeviationRefused: --host-riegel-gib "
-                    f"{float(riegel_gib):.2f} is AT OR ABOVE the hard bound "
+                    f"{float(riegel_gib):.2f} is ABOVE the hard bound "
                     f"{hard_bound_gib:.2f} GiB it is supposed to latch beneath. A "
                     f"latch above the bound cannot fire before the bound is already "
                     f"crossed; it is decoration, and the rule asks for a runtime "
@@ -6717,6 +6757,7 @@ def choose(
     # the ONE reserve number: the launcher exports it to the ranks. Kept OFF
     # arm.terms, which stay byte-identical with price()'s (#1360 guard).
     chosen.pinned_reserve = (pinned_reserve_gib, pinned_reserve_src)
+    chosen.riegel_effective = riegel_gib
     return chosen, headroom, lines
 
 

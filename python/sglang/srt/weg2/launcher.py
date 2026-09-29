@@ -12515,6 +12515,24 @@ def _group_env_value(name: str, group_envs, default: str) -> str:
     return str(os.environ.get(name, default) or default)
 
 
+def arena_gib_into_groups(ns, group_envs, gib: float) -> List[str]:
+    """29.09.: write a ledger-derived arena size into every group env that
+    names SGLANG_HICACHE_ARENA_GIB (``ns.env_p``/``ns.env_d`` and the parsed
+    dicts the ledger prices from), so ranks and ledger read the same number.
+    Groups that do not name it inherit the launcher env. Returns the groups
+    rewritten."""
+    key, val, done = "SGLANG_HICACHE_ARENA_GIB", f"{float(gib):g}", []
+    for attr in ("env_d", "env_p"):
+        spec = str(getattr(ns, attr, "") or "")
+        if key in parse_group_env(spec):
+            setattr(ns, attr, set_group_env(spec, key, val))
+            done.append(attr)
+    for e in group_envs or ():
+        if e is not None and key in e:
+            e[key] = val
+    return done
+
+
 #: model -> the arena page widths `_weg2_arena_ledger_terms` last priced
 _ARENA_BOOKED_WIDTHS: Dict[str, List[int]] = {}
 
@@ -12546,8 +12564,9 @@ def _weg2_arena_ledger_terms(model: str, group_envs=None) -> dict:
         from sglang.srt.planner import pp_cut as _pp_cut
         cell = int(_pp_cut.kv_mib_per_token_per_attn_layer_from_config(cfg, "fp8_e4m3", n_layers) * (1 << 20))
         kv_page = cell * n_attn
+        from sglang.srt.mem_cache.pool_host.arena_pool import arena_slots_for
         kv_gib = float(_group_env_value("SGLANG_HICACHE_ARENA_GIB", group_envs, "22"))
-        kv_slots = max(1024, int(kv_gib * (1 << 30)) // max(1, kv_page))
+        kv_slots = arena_slots_for(kv_gib, kv_page)
         # 29.09.: the ranks cut the arena in CANONICAL pages when the env
         # names one (HiCacheFile._arena_for: slots = GIB // canonical KV
         # extents; z30w wrote arena-786432.bin = 5461 x 64-token pages). The
@@ -12555,7 +12574,7 @@ def _weg2_arena_ledger_terms(model: str, group_envs=None) -> dict:
         # slot = one token, the draft 1:1), so the bytes are the same.
         _canon_page = int(float(_group_env_value("SGLANG_HICACHE_ARENA_KV_PAGE_BYTES", group_envs, "0") or 0))
         if _canon_page > 0 and kv_page > 0 and _canon_page % kv_page == 0:
-            kv_slots = max(1024, int(kv_gib * (1 << 30)) // _canon_page) * (_canon_page // kv_page)
+            kv_slots = arena_slots_for(kv_gib, _canon_page) * (_canon_page // kv_page)
         from sglang.srt.mem_cache.hicache_migrate import qwen3_5_mamba_spec
         blob = qwen3_5_mamba_spec(text_cfg, num_linear_layers=n_lin, units=1,
                                   temporal_itemsize=2, conv_itemsize=2).total_bytes if n_lin else 0
@@ -23346,11 +23365,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # --host-ledger-deviation it needed before (weg2xsn207: 93.15 vs 93.00).
     _arena_new, _arena_why = arena_from_ledger(
         float(_group_env_value("SGLANG_HICACHE_ARENA_GIB", _ledger_group_envs, "22")),
-        _arm_run_peak_gib(arm), getattr(ns, "host_riegel_gib", None),
+        # 29.09.: the latch the ledger derived (a flag only tightens it)
+        _arm_run_peak_gib(arm), getattr(arm, "riegel_effective", getattr(ns, "host_riegel_gib", None)),
         enabled=(os.environ.get("SGLANG_WEG2_ARENA_FROM_LEDGER", "1") == "1" and not hicache_disabled))
     log("#1453 L2-ARENA FROM LEDGER: " + _arena_why)
     if _arena_new is not None:
         os.environ["SGLANG_HICACHE_ARENA_GIB"] = f"{_arena_new:g}"
+        # 29.09. (arena8 09291303): a group that names the arena overrides the
+        # launcher env in build_env, so the new size goes where the ranks and
+        # the ledger read it -- otherwise the ledger re-prices a number no rank gets.
+        arena_gib_into_groups(ns, _ledger_group_envs, _arena_new)
         arm, reap_headroom_gib, lines, cg = _price_host_ledger()
         log("#1453 L2-ARENA FROM LEDGER: re-priced with arena %.2f GiB -> run_peak %s GiB"
             % (_arena_new, _fmt_gib(_arm_run_peak_gib(arm))))

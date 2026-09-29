@@ -930,6 +930,14 @@ def arena_host_enabled() -> bool:
 ENV_ARENA_KV_PAGE_BYTES = "SGLANG_HICACHE_ARENA_KV_PAGE_BYTES"
 
 
+def arena_slots_for(gib: float, page_bytes: int) -> int:
+    """The ONE slot rule of the KV arena: ``max(1024, GIB * 2^30 // page)``.
+    ``planned_arena_slots`` (the ranks) and the launcher's host-ledger arena
+    term both count through it, so ledger and ranks cannot disagree on the
+    rule, only on the inputs (29.09., arena8 09291303)."""
+    return max(1024, int(float(gib) * (1 << 30)) // max(1, int(page_bytes)))
+
+
 def planned_arena_slots(kv_page_bytes: int) -> int:
     """The slot count the storage backend will give the KV arena
     (``HiCacheFile._arena_for``: ``max(1024, GIB * 2^30 // page_bytes)``),
@@ -949,7 +957,7 @@ def planned_arena_slots(kv_page_bytes: int) -> int:
             kv_page_bytes = int(env_pb)
         except ValueError:
             pass
-    return max(1024, int(gib * (1 << 30)) // max(1, int(kv_page_bytes)))
+    return arena_slots_for(gib, kv_page_bytes)
 
 
 def planned_id_space_tokens(staging_tokens: int, page_size: int, kv_page_bytes: int) -> int:
