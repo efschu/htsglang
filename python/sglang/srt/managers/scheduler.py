@@ -12955,6 +12955,7 @@ class Scheduler(
             # value never reaches a verdict on a multi-rank boot. Solo boots
             # (tp_size == 1) price locally, which is replicated by
             # construction there.
+            self._weg2_x_terms = (total, None, None, None)
             return max(0, (total - len(req.prefix_indices)) - host_hit)
         gm = int(group_match)
         if gm > total:
@@ -13065,6 +13066,7 @@ class Scheduler(
                     max(0, total - floor), n,
                 )
             priced_match = floor
+        self._weg2_x_terms = (total, gm, None if gsm is None else int(gsm), floor)
         return max(0, total - priced_match)
 
     def _weg2_host_carry_tokens(self) -> int:
@@ -13644,6 +13646,27 @@ class Scheduler(
             "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",
             str(getattr(req, "rid", "?"))[:16], uncached, x, term, verdict,
         )
+        if verdict == "W31":
+            # #1471b (z30m 03:19-03:22, weg2-116-141): three W31s priced the
+            # WHOLE prompt right after every rank had read 28096/4352/36800 of
+            # it, and the lines that name the term that did it were all past
+            # their throttles. Every W31 now names its terms (group head,
+            # store arm, usable floor) and THIS rank's own usable vote with
+            # its reason -- the MIN's zero is on the rank whose line says 0.
+            from sglang.srt.managers import tp_match_floor as _tmf
+
+            _t = getattr(self, "_weg2_x_terms", None) or (None, None, None, None)
+            _v = _tmf.vote_reason(str(getattr(req, "rid", "") or ""))
+            logger.warning(
+                "WEG2 X-GATE-TERMS rid=%s total=%s head=%s store=%s floor=%s "
+                "uncached=%d my_vote=%s my_raw=%s why=%s (W31: the group priced "
+                "total - min(max(head, store), floor); this rank's usable vote "
+                "entered that floor's MIN)",
+                str(getattr(req, "rid", "?"))[:16], _t[0], _t[1], _t[2], _t[3],
+                uncached,
+                None if _v is None else _v[1], None if _v is None else _v[0],
+                None if _v is None else _v[2],
+            )
         return verdict == "W31"
 
     def _weg2_answer_x_refusals(self, refused: List[Req], head_inputs=None) -> None:

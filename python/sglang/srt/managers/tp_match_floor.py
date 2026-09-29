@@ -100,6 +100,31 @@ ABSENT = -1
 
 _STATS = {"zeroed": 0, "above_group": 0, "unusable_votes": 0}
 
+#: #1471b (z30m 03:19-03:22, rid weg2-116-141): this rank's last usable-match
+#: vote per rid and WHY it has that value. Three reads of the same prompt were
+#: priced uncached = the whole prompt although every rank had just read 28096,
+#: 4352 and 36800 of it -- the group's usable floor was 0, and every line that
+#: could have said which rank voted 0 and on which branch (#1424d PROOF-CUT,
+#: RU FLOOR ZERO, X-PRICE-FLOOR) was past its throttle. The X gate's W31 line
+#: reads this (``vote_reason``), so each rank names its own vote there.
+_VOTE_WHY: Dict[str, tuple] = {}
+_VOTE_WHY_CAP = 256
+
+
+def _note_vote(req: Any, raw: int, vote: int, why: str) -> None:
+    rid = str(getattr(req, "rid", "") or "")
+    if not rid:
+        return
+    if rid not in _VOTE_WHY and len(_VOTE_WHY) >= _VOTE_WHY_CAP:
+        _VOTE_WHY.pop(next(iter(_VOTE_WHY)))
+    _VOTE_WHY[rid] = (int(raw), int(vote), str(why))
+
+
+def vote_reason(rid: str) -> Optional[tuple]:
+    """``(raw, vote, why)`` of this rank's last usable-match vote for ``rid``
+    (None when this rank never voted on it)."""
+    return _VOTE_WHY.get(str(rid))
+
 
 # --------------------------------------------------------------------------
 # Close 1: the #580 predicate
@@ -201,18 +226,21 @@ def local_usable_matches(
     for rid, n in matches.items():
         n = int(n)
         req = by_rid.get(rid)
+        raw, why = n, "match"
         if n > 0 and req is not None and anchor_unusable(
             tree_cache, getattr(req, "best_match_node", None)
         ):
             _STATS["unusable_votes"] += 1
-            n = 0
+            n, why = 0, "anchor_unusable"
         if n > 0 and req is not None and proof_cut(
             tree_cache, req, types.SimpleNamespace(best_match_node=getattr(req, "best_match_node", None)), n
         ) is not None:
             # #1424d, symmetric form: no re-probe on the head walk -- a match
             # with an unproven host page votes 0 (re-prefill, or via P above X)
             _STATS["proof_cut_votes"] = _STATS.get("proof_cut_votes", 0) + 1
-            n = 0
+            n, why = 0, "proof_cut"
+        if req is not None:
+            _note_vote(req, raw, n, why)
         out[rid] = n
     return out
 
@@ -783,8 +811,10 @@ def admission_probe(tree_cache: Any, req: Any, *, follow: bool) -> int:
         from sglang.srt.mem_cache.radix_cache import RadixKey
 
         if envs.SGLANG_RADIX_FORCE_MISS.get():
+            _note_vote(req, 0, 0, "force_miss")
             return 0
         if getattr(req, "positional_embed_overrides", None) is not None:
+            _note_vote(req, 0, 0, "positional_overrides")
             return 0
         token_ids = list(req.origin_input_ids) + list(req.output_ids)
         carried = getattr(req, "pp_carried_fill_tail", None)
@@ -813,6 +843,7 @@ def admission_probe(tree_cache: Any, req: Any, *, follow: bool) -> int:
             with follow_walk(tree_cache):
                 result = tree_cache.match_prefix(params)
             n = _local_match_len(result)
+            raw, why = n, "worker_reach"
             if n > 0 and _worker_holds_kv():
                 # #239 S4b (F14) part 6: a worker that OWNS token rows under
                 # the token cut loads them from its own arena, and its load
@@ -824,12 +855,14 @@ def admission_probe(tree_cache: Any, req: Any, *, follow: bool) -> int:
                 cut = proof_cut(tree_cache, req, result, n)
                 if cut is not None:
                     _STATS["worker_proof_cuts"] = _STATS.get("worker_proof_cuts", 0) + 1
-                    n = int(cut)
+                    n, why = int(cut), f"worker_proof_cut@{int(cut)}"
+            _note_vote(req, raw, n, why)
             return n
         result = tree_cache.match_prefix(params)
         # H105b: the host votes what it will ADMIT -- device + the #1040
         # state-aligned load-back extent -- not the raw host-hit count.
         n = host_admission_len(result)
+        raw, why = n, "host_admission"
         cut = proof_cut(tree_cache, req, result, n)
         if cut is not None:
             # #1424d: a host page of this match is not proven against its
@@ -847,9 +880,12 @@ def admission_probe(tree_cache: Any, req: Any, *, follow: bool) -> int:
             )
             result = tree_cache.match_prefix(params)
             n = min(host_admission_len(result), int(cut))
+            why = f"proof_cut@{int(cut)}->{n}"
         if n > 0 and anchor_unusable(tree_cache, getattr(result, "best_match_node", None)):
             _STATS["unusable_votes"] += 1
+            _note_vote(req, raw, 0, why + "+anchor_unusable")
             return 0
+        _note_vote(req, raw, n, why)
         return n
     # H99 audit: this except stays, and only here: every caller is a VOTE
     # (usable arm, H97 realize round, H98 admission probe) that enters a MIN
@@ -857,8 +893,9 @@ def admission_probe(tree_cache: Any, req: Any, *, follow: bool) -> int:
     # every rank. Admission never reads it (the follower always follows);
     # a host that votes over an anchor it then refuses stops by name there
     # (FormAHostBelowGroup / RankFloorCapMiss).
-    except Exception:  # noqa: BLE001 - a vote may never break the reduce
+    except Exception as exc:  # noqa: BLE001 - a vote may never break the reduce
         _STATS["probe_failed"] = _STATS.get("probe_failed", 0) + 1
+        _note_vote(req, 0, 0, f"probe_failed:{type(exc).__name__}")
         return 0
 
 
