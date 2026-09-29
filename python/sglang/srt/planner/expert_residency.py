@@ -862,6 +862,27 @@ OWNED_SHARE_STEP = 4
 #: #239 S3f: the ranked estimates re-solved exactly (the memo's span may
 #: round one expert differently than the full vector's)
 OWNED_EXACT_CHECKS = 64
+#: #239 S3f round guard (29.09., Befund z30n/z30r3 gegen z30k): the x1 rule
+#: keeps every WORKER at or below its Form-A miss time and lets the HOST take
+#: the rest -- on metal the host then became the rank the synchronized round
+#: waits for (TP0 misses per seat +18..23 %, round bs1 +2.8..5.6 ms against
+#: Form A). ``workers`` (default) is the x1 rule as before; ``round`` reports
+#: x1 but does not enforce it: feasible is every form with an edge on every
+#: rank, ranked by the synchronized round (max T_r over ALL ranks, then the
+#: sum, then the ownership move).
+OWNED_X1_ENV = "SGLANG_WEG2_OWNED_CUT_X1"
+OWNED_X1_SCOPES = ("workers", "round")
+
+
+def owned_x1_scope() -> str:
+    """#239 S3f: the x1 scope of the owned solve (``SGLANG_WEG2_OWNED_CUT_X1``,
+    default ``workers``); an unknown value is refused, never guessed."""
+    import os
+
+    v = (os.environ.get(OWNED_X1_ENV) or "workers").strip().lower()
+    if v not in OWNED_X1_SCOPES:
+        raise ValueError("%s=%r: one of %s" % (OWNED_X1_ENV, v, "/".join(OWNED_X1_SCOPES)))
+    return v
 
 
 class OwnedCut(msgspec.Struct, frozen=True, kw_only=True):
@@ -1007,6 +1028,7 @@ def solve_owned_cut(
     fa_layers: int = 0,
     rows_per_round: int = 1,
     forced_shares: Optional[Sequence[float]] = None,
+    x1_scope: str = "workers",
 ) -> OwnedCut:
     """#239 S3f: ownership, token cut and FR_D in one solve.
 
@@ -1095,9 +1117,12 @@ def solve_owned_cut(
                for f in fits):
             return None
         x1 = not any(ms[w] > base_ms[w] + 1e-9 for w in workers)
-        if not x1 and not forced:
+        if not x1 and not forced and x1_scope != "round":
             return None
         return x1
+
+    # round guard: x1 is reported, the synchronized round alone ranks
+    ranks_x1 = x1_scope != "round"
 
     ranked = []
     cand = feas = 0
@@ -1113,8 +1138,8 @@ def solve_owned_cut(
                 continue
             feas += 1
             # forced: a form keeping x1 wins over one that breaks it
-            ranked.append((0 if x1 else 1, round(max(ms), 9), round(sum(ms), 9), move,
-                           tuple(rat), tuple(sh)))
+            ranked.append((0 if (x1 or not ranks_x1) else 1, round(max(ms), 9),
+                           round(sum(ms), 9), move, tuple(rat), tuple(sh)))
     ranked.sort()
     best = None
     for key in ranked[:OWNED_EXACT_CHECKS]:
@@ -1123,7 +1148,8 @@ def solve_owned_cut(
         x1 = _verdict(fits, ms)
         if x1 is None:
             continue
-        exact_key = (0 if x1 else 1, round(max(ms), 9), round(sum(ms), 9), key[3], rat, sh)
+        exact_key = (0 if (x1 or not ranks_x1) else 1, round(max(ms), 9), round(sum(ms), 9),
+                     key[3], rat, sh)
         if best is None or exact_key < best[0]:
             best = (exact_key, rat, sh, fits, ms)
         if best is not None and best[0][:2] <= key[:2]:
@@ -3438,11 +3464,13 @@ def plan_d_residency(
                     seat_graph_mib=seat_graph_mib, kv_token_cut=True)
             return tuple(int(c.ceiling_max_rows) for c in cs) if cs else None
 
+        _x1_scope = owned_x1_scope()
         sol = solve_owned_cut(
             lambda rat, sh: _solve(sh, None, rat), base_rat, host,
             num_experts=int(terms.num_experts), n_layers=int(terms.n_layers),
             ids_per_step=ids, card_rows=_card_rows, fa_layers=fa_layers,
-            rows_per_round=int(verify), forced_shares=_forced_shares)
+            rows_per_round=int(verify), forced_shares=_forced_shares,
+            x1_scope=_x1_scope)
         owner_record = (
             ("base_ratios", list(sol.base_ratios)),
             ("base_round_ms", [round(x, 3) for x in sol.base_round_ms]),
@@ -3464,6 +3492,7 @@ def plan_d_residency(
             ("elapsed_s", sol.elapsed_s),
             ("forced_shares", list(_forced_shares) if _forced_shares else None),
             ("x1_ok", sol.x1_ok),
+            ("x1_scope", _x1_scope),
             ("target_over_form_a_ms", round(max(sol.round_ms) - max(sol.base_round_ms), 3)
              if sol.round_ms else None),
             ("kv_tokens", int(kv_tokens)),
@@ -3489,7 +3518,9 @@ def plan_d_residency(
                    ["%.2f" % x for x in sol.round_ms], ["%.2f" % x for x in sol.base_round_ms],
                    max(sol.round_ms), max(sol.base_round_ms),
                    ("kein Worker ueber Form A" if sol.x1_ok else
-                    "VERLETZT (Schnitt erzwungen, Messarm M1b)") + (
+                    ("gemeldet, nicht erzwungen (%s=round: die Runde entscheidet)" % OWNED_X1_ENV
+                     if _x1_scope == "round" else
+                     "VERLETZT (Schnitt erzwungen, Messarm M1b)")) + (
                        " -- Schnitt ERZWUNGEN %s" % list(_forced_shares) if _forced_shares
                        else ""),
                    sol.candidates, OWNED_RATIO_STEP, sol.feasible, sol.solves,
