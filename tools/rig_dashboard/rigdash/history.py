@@ -479,6 +479,7 @@ class Recorder:
             lo = max(done, hi - 2 * 86400)
             n = int((hi - lo) // step)
             with b.lock:
+                b._mark_gen()       # flip/extend artefacts marked BEFORE the spread (view() does it too, but later)
                 pb = {g: list(b.ev.get("%s_prefill_batch" % g, ())) for g in ("P", "single", "D")}
                 dec = [list(b.ev.get("%s_decode_batch" % g, ())) for g in ("D", "single")]
                 legs = list(b.served_legs)
