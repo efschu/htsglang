@@ -581,6 +581,33 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
             track_indices,
             context.gather(1, track_offsets.unsqueeze(1) + context_cols.unsqueeze(0)),
         )
+    # TURN ANCHOR: the same boundary gather at the second track's offset
+    # (registered as required whether or not the default track ran)
+    turn = _ple_turn_rows(forward_batch, "ple_ngram")
+    if turn is not None:
+        pool.set_ngram_context(
+            turn.dst_phys,
+            context.index_select(0, turn.rows_dev).gather(
+                1, turn.offsets_dev.unsqueeze(1) + context_cols.unsqueeze(0)
+            ),
+        )
+        turn.done.add("ple_ngram")
+
+
+def _ple_turn_rows(forward_batch: ForwardBatch, kind: str):
+    """TURN ANCHOR (weg2/turn_anchor.py): the batch's second tracks when the
+    GDN backend added them (translated slots, rows, offsets on the device),
+    with ``kind`` registered as required -- a turn anchor whose PLE side
+    state was not written is never inserted. None = nothing to write."""
+    # getattr: forward-batch doubles predating the field carry no plan (the
+    # #624 stub-drift class, as for the replay metadata in gdn_backend)
+    turn = getattr(forward_batch, "weg2_turn_tracks", None)
+    if turn is None or not len(turn):
+        return None
+    turn.need.add(kind)
+    if "gdn" not in turn.done or turn.dst_phys is None:
+        return None
+    return turn
 
 
 def _ple_track_targets(
@@ -1580,6 +1607,21 @@ class Qwen4ExpPLELayer(nn.Module):
                 conv_state[track_indices] = _gather_at(track_offsets).to(
                     dtype=conv_state.dtype
                 )
+            # TURN ANCHOR: the second track's window, same gather (registered
+            # as required whether or not the default track ran)
+            turn = _ple_turn_rows(forward_batch, "ple_conv")
+            if turn is not None:
+                conv_state[turn.dst_phys] = (
+                    conv_input.index_select(0, turn.rows_dev)
+                    .gather(
+                        2,
+                        (turn.offsets_dev.unsqueeze(1) + state_cols.unsqueeze(0))
+                        .unsqueeze(1)
+                        .expand(-1, self.conv_channels, -1),
+                    )
+                    .to(dtype=conv_state.dtype)
+                )
+                turn.done.add("ple_conv")
 
         return F.silu(conv_output[batch.req_indices, batch.token_offsets])
 

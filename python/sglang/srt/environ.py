@@ -2903,6 +2903,13 @@ class Envs:
     # its own (`Scheduler.anchor_tails`); the tails [N-1', N) are re-added
     # together in the next pass. Inert without the END-ANCHOR (group D).
     SGLANG_WEG2_ENABLE_P_MULTI_ANCHOR_TAILS = EnvBool(False)
+    # TURN ANCHOR (weg2/turn_anchor.py, 29.09.): the chat template's turn-start
+    # token id (<|im_start|> = 248045 on Qwen3.8-27B and NF). Set on group P,
+    # a prefill step whose extend holds the start of the prompt's LAST message
+    # snapshots the recurrent state there too (a second extend track in the
+    # same forward) and inserts it as its own anchor -- where the next turn
+    # and a client's side request fork. Unset/None = every path byte-identical.
+    SGLANG_WEG2_TURN_ANCHOR_TOKEN = EnvInt(None)
     # fnFL2 H42b: burst assembly on the DECIDING P rank (PP0), only while
     # multi anchor tails are armed. A pass that would carry nothing but new
     # bodies is held back up to this many ms while more of a burst is still
