@@ -464,11 +464,15 @@ class MultimemAllGatherer:
         self._state = self._UNINIT if enabled else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
-            from sglang.srt.distributed import get_tp_group
-            from sglang.srt.distributed.parallel_state import in_the_same_node_as
+            from sglang.srt.distributed.parallel_state import (
+                get_model_tp_group,
+                in_the_same_node_as,
+            )
             from sglang.srt.runtime_context import get_server_args
 
-            tp_group = get_tp_group()
+            # The gathered shards are the MODEL's (lm_head vocab / fc): their
+            # group is model_tp -- see _build. Classic boots: model_tp IS tp.
+            tp_group = get_model_tp_group()
             # Only probe node topology when the deployment can actually span
             # nodes. Check world_size first so a TP=1 gatherer short-circuits
             # before reading server args (which may be unpublished on offline
@@ -523,9 +527,24 @@ class MultimemAllGatherer:
         if x.shape[-1] % _NUMEL_PER_THREAD != 0:
             return None
         try:
-            from sglang.srt.distributed import get_tp_group
+            # Form B (F6/F15): the shards live on the weight ranks W only, so the
+            # symmetric buffer rendezvouses over model_tp -- the same group the
+            # NCCL fallback below (tensor_model_parallel_all_gather) already
+            # uses. Over get_tp_group() (ALL ranks) the rendezvous waits for the
+            # KV-only rank, which has no lm_head and never reaches it, while that
+            # rank waits in the next tp barrier: the decode-graph warmup deadlock
+            # of 29.09. (formb-hang-09292056 / -09292128). Classic boots:
+            # model_tp IS the tp group, byte-identical.
+            from sglang.srt.distributed.parallel_state import get_model_tp_group
+            from sglang.srt.rank_role import (
+                COLLECTIVE_LAYER,
+                guard_collective_subgroup,
+            )
 
-            tp_group = get_tp_group()
+            tp_group = get_model_tp_group()
+            guard_collective_subgroup(
+                COLLECTIVE_LAYER, tp_group, "multimem_all_gather.rendezvous"
+            )
             if tp_group.world_size <= 1:
                 return None
             state = create_state(
