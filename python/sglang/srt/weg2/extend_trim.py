@@ -44,7 +44,7 @@ MARKER = "WEG2-EXTEND-CACHE-TRIM"
 MIB = float(1 << 20)
 
 _UNSET = object()
-_CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": None}
+_CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": None, "cap_trimmed": False}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -89,6 +89,7 @@ def reset_for_tests() -> None:
     _CACHE["rates"] = _UNSET
     _CACHE["armed"] = False
     _CACHE["logged_cap"] = None
+    _CACHE["cap_trimmed"] = False
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -144,13 +145,17 @@ def before_extend(worker, batch) -> Optional[str]:
     worker's extend batches only (the draft extend that follows shares the
     allocator and profits from the same trim)."""
     values = thresholds()
-    if values is None or batch is None:
+    if batch is None or (values is None and not _CACHE["cap_trimmed"]):
         return None
     if getattr(worker, "is_draft_worker", False) and not getattr(worker, "is_phase_flip_tp_stack", False):
         return None
     try:
         mode = batch.forward_mode
         if not mode.is_extend() or mode.is_target_verify():
+            return None
+        # WEG2-EXTEND-CAP (29.09.): the vote's cap trim is spent by this extend too
+        _CACHE["cap_trimmed"] = False
+        if values is None:
             return None
         import torch
 
@@ -278,6 +283,24 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
                 _CACHE["armed"] = True
         post, _total = cuda.mem_get_info()
         post_mib = post / MIB
+        # WEG2-EXTEND-CAP: under the P0 torch cache cap the allocator's own line
+        # binds before the card does (p0-nopin 17:24:06Z: card_free 134 MiB,
+        # the cap refused 40 MiB). What the chunk may grow is then
+        # cap - reserved; the cache above the live tensors is emptied once per
+        # extend first -- torch would do it at the line anyway, only too late
+        # for a chunk that is already formed.
+        torch_cap = _torch_cap_mib(rank)
+        cap_post = None
+        if torch_cap is not None:
+            cap_post = torch_cap - int(cuda.memory_reserved()) / MIB
+            if (rows_cap(min(post_mib, cap_post), rate, page_size) < int(configured)
+                    and not _CACHE["cap_trimmed"]):
+                cuda.synchronize()
+                cuda.empty_cache()
+                _CACHE["cap_trimmed"] = True
+                post_mib = cuda.mem_get_info()[0] / MIB
+                cap_post = torch_cap - int(cuda.memory_reserved()) / MIB
+            post_mib = min(post_mib, cap_post)
         cap = rows_cap(post_mib, rate, page_size)
         if cap >= int(configured):
             _CACHE["logged_cap"] = None
@@ -287,11 +310,22 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
             logger.info(
                 f"{STUECKELUNG_MARKER} rank={rank} geplant={int(configured)} cap={cap} "
                 f"post={post_mib:.0f} rate={rate:.4f} floor={STUECKELUNG_FLOOR_MIB:.0f}"
+                + ("" if cap_post is None else f" torch_cap={torch_cap:.0f} cap_post={cap_post:.0f}")
             )
         return cap
     except Exception as exc:  # noqa: BLE001 -- a vote that cannot price abstains
         logger.debug("%s skipped: %s", STUECKELUNG_MARKER, exc)
         return None
+
+
+def _torch_cap_mib(rank: int) -> Optional[float]:
+    """This rank's P0 torch cache cap in MiB while it is armed, else ``None``
+    (no cap: the vote reads the card alone, byte-identical)."""
+    from sglang.srt.weg2 import torch_cache_cap as _tcc
+
+    if not _tcc.enabled():
+        return None
+    return _tcc.cap_mib_for(int(rank))
 
 
 def launcher_rates(rate_mib: Sequence[Optional[float]]) -> str:

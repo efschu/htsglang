@@ -17880,6 +17880,43 @@ def d_record_torch_caps(ns, cards: List[Card], budgets_d: Sequence[int], log,
     return caps
 
 
+#: WEG2-EXTEND-CAP: allocated transient per D extend row under the P0 torch cache cap
+D_EXTEND_CAP_RATE_RECORD = "D_EXTEND_CAP_PER_ROW_MIB"
+
+
+def _d_extend_cap_rate_env(ns, log, label: str) -> Optional[str]:
+    """WEG2-EXTEND-CAP (29.09.): with the record caps armed (the 27B, whose verdict books no
+    non-torch term and so never reaches the #145 ledger's EXTEND-STUECKELUNG), the D extend
+    chunk must follow the CAP, not only the card: p0-nopin (dkr27browauthorityp0nopinbar1fs09291720)
+    D-TP1 died 17:24:06Z at a 4096-row extend on the torch line (reserved 18593 + 40 > cap 18609)
+    with 134 MiB still free on the card. Writes ``SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB`` from
+    the profile's ``D_EXTEND_CAP_PER_ROW_MIB`` -- the ALLOCATED transient per extend row under the
+    cap, a different quantity from Next Flash's uncapped reserved growth -- (extend_trim.width_vote then funds the chunk
+    from ``min(card_free, cap - reserved)``); a value named in --env-d wins. A profile without
+    the record: nothing written, no vote."""
+    try:
+        _rate = [None if v is None else float(v) for v in _pconst(D_EXTEND_CAP_RATE_RECORD, ns.profile)]
+    except KeyError:
+        return None
+    _rate_src = _pconst_boots(D_EXTEND_CAP_RATE_RECORD, ns.profile)
+    from sglang.srt.weg2 import extend_trim as _et
+
+    _rtext = _et.launcher_rates(_rate)
+    _env_d = getattr(ns, "env_d", "") or ""
+    _given = any(x.split("=", 1)[0].strip() == "SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB"
+                 and x.split("=", 1)[1].strip() != _rtext
+                 for x in _env_d.split(";") if "=" in x)
+    if not _rtext:
+        return None
+    if not _given:
+        ns.env_d = set_group_env(_env_d, "SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB", _rtext)
+    log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-CAP rows_cap aus min(card_free, torch_cap - reserved): "
+        f"SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB={_rtext}{' (aus --env-d, Vorrang)' if _given else ''} "
+        f"(Rate aus {D_EXTEND_CAP_RATE_RECORD} {_rate}, boots {_rate_src}; D kappt den Extend-Chunk "
+        f"auf floor((post - 300) / Rate), MIN ueber TP)")
+    return _rtext
+
+
 def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                           label: str, *, p_split=None, chunk_layers=None,
                           card_terms: Optional[Sequence[Dict[str, object]]] = None) -> None:
@@ -17975,6 +18012,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                 f"({_budget_rest.OVERHANG_MARKER}: physische Linie je Rang = Budget + gebuchter "
                 f"Rest - {_budget_rest.other_record_name('D')} = total - carve - dormant_other - "
                 f"nicht-torch; das Verdikt bucht hier kein fremd/nicht-torch)")
+            _d_extend_cap_rate_env(ns, log, label)
         else:
             _caps = _tcc.launcher_caps(verdikte, _floor)
             ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", _tcc.MIB_ENV, _caps)

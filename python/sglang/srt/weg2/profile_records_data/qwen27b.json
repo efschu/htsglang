@@ -136,6 +136,21 @@
    "power_limit_source": "not recorded per record; the eight boots ran 5090 400 W / 3080 230 W (boot json power_limit_w)"
   },
   {
+   "name": "D_EXTEND_CAP_PER_ROW_MIB",
+   "value": [
+    0.3091,
+    0.3091,
+    0.3091
+   ],
+   "provenance": "WEG2-EXTEND-CAP 29.09. (p0-nopin boot dkr27browauthorityp0nopinbar1fs09291720, 20cfcde893, D.log _0929_172029 + debug_hold rc12gbf09291718_rank0_pid9144): NOT the Next-Flash D_EXTEND_GROWTH_PER_ROW_MIB (reserved growth, uncapped): under the P0 torch cache cap the chunk grows the ALLOCATED transient against cap - reserved (the allocator empties its cache at the line itself). D-TP1 (nvml0, cap 18609) died 17:24:06Z in a target extend of 4096 rows at prefix 16434 (seq 20530), layer 48 of 64, barlink all_reduce torch.empty_like 40 MiB: allocated 17.91 GiB = 18340 MiB + 40 requested - start 17354 (WEG2-VRAM-PEAK round 17:24:02) = 1026 MiB at the refusal; the rest of that forward by the code's shapes: the DFlash capture at layer 62 (+40, target_layer_ids [5,19,33,47,61] +1) and logits_processor torch.cat of the five captures (+200, 5 x 4096 x 5120 x 2 B) -> 1266 MiB / 4096 rows = 0.3091 (rounded up to 4 decimals). The same extend is TP-symmetric (activations split by TP), so every rank takes the value. Shallow 27B extends measured far lower (4061 rows 495 MiB in the same boot; <= 566 MiB at 4096 rows over the newest 40 27B boots), so this is the deep-prefix maximum, not an average; a deeper extend that grows more per row is the named risk (the next measurement cell prices it).",
+   "boots": [
+    "dkr27browauthorityp0nopinbar1fs09291720"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not a power-dependent quantity (bytes per extend row)"
+  },
+  {
    "name": "P_DRAFT_RESIDENT_BUDGET_MIB",
    "value": 1618.2,
    "provenance": "27B NEXTN head: mtp 405.2 + embed 1213.0 MiB (#1233 fix 3, L2 resident_mib)",
