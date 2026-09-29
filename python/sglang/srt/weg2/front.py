@@ -5739,6 +5739,11 @@ class Front:
                     verdict = host_ledger.watermark_breach_verdict(
                         int(current),
                         margin=margin,
+                        # 29.09.: a finite memory.max (Docker) is the mark;
+                        # CT999 ('max') keeps the recorded 95.90.
+                        watermark_gib=host_ledger.reap_mark_gib(
+                            None if pr.get("max_gib") is None
+                            else int(float(pr["max_gib"]) * host_ledger.GIB)),
                         nonreclaim_gib=pr.get("nonreclaim_gib"),
                         file_reclaimable_gib=pr.get("file_reclaimable_gib"),
                         cgroup_anon_bytes=host_ledger.read_cgroup_anon_bytes(),

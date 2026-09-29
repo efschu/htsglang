@@ -1063,11 +1063,14 @@ def watermark_provenance(margin: Optional[Margin] = None,
     unreadable.
     """
     m = margin if margin is not None else resolve_margin()
-    w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    live = read_cgroup_pressure()
+    # 29.09.: no mark handed in (the front's periodic line) -> the same
+    # reap_mark_gib the ledger grades against: a finite memory.max bounds it.
+    w = watermark_gib if watermark_gib is not None else reap_mark_gib(
+        None if live.get("max_gib") is None else int(float(live["max_gib"]) * GIB))
     events = ", ".join(f"{k} {v:.2f}" for k, v in sorted(REAP_SAMPLES_GIB.items()))
     excl = ", ".join(f"{k} {v:.2f} EXCLUDED ({why})"
                      for k, (v, why) in sorted(REAP_SAMPLE_EXCLUDED.items()))
-    live = read_cgroup_pressure()
     if live.get("current_gib") is None:
         if refuse_unreadable:
             raise Weg2HostLedgerRefused(
@@ -1243,6 +1246,29 @@ def latch_free_pool(
         "min(cgroup room memory.max-memory.current, host MemAvailable)",
         float(ceiling),
     )
+
+
+def reap_mark_gib(ceiling_bytes: Optional[int] = None, ceiling_source: str = "") -> float:
+    """The non-reclaimable level at which this boot is reaped, GiB.
+
+    The recorded mark (:data:`OBSERVED_REAP_NONRECLAIM_BYTES`, 95.90) is the
+    CT999 HOST reap point: global OOM, ``memory.max`` reads ``max``. Inside a
+    finite cgroup the kernel reclaims and then OOM-kills at ``memory.max``
+    first, so the mark is the smaller of the two -- 84.00 in the Docker form
+    (``--memory 84g``), where every run-peak verdict priced against 95.90
+    funded 11.90 GiB the cgroup never had.
+
+    ``ceiling_source`` is :func:`resolve_cg_ceiling`'s own label: its lxcfs
+    ``MemTotal`` FALLBACK is not a ceiling (CT999, 118 GiB) and keeps the
+    recorded mark, byte for byte. An empty label means the caller read a finite
+    ``memory.max`` directly (:func:`read_cgroup_pressure` ``max_gib``).
+    """
+    const = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    if ceiling_bytes is None:
+        return const
+    if ceiling_source and not ceiling_source.startswith("cgroup memory.max"):
+        return const
+    return min(const, float(ceiling_bytes) / GIB)
 
 
 def launch_moment_peak_gib(
@@ -2679,6 +2705,9 @@ def charge_terms(
     memhist_gib: float = 0.0,
     # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
     l3_index_gib: float = 0.0,
+    # 29.09. (Planer post COLD_TIER_SHM): the expert store when it lives on a
+    # tmpfs -- shmem, unevictable without swap, resident in BOTH phases.
+    cold_tier_shm_gib: float = 0.0,
     memhist_run_only: bool = False,
 ) -> Dict[str, object]:
     """Everything the BOOT ITSELF adds to ``memory.current``, per term.
@@ -2746,6 +2775,7 @@ def charge_terms(
         # rc12d: the ledger post 'memhist'; key always present (0.0 = off)
         "memhist_gib": max(0.0, float(memhist_gib)),
         "l3_index_gib": max(0.0, float(l3_index_gib)),
+        "cold_tier_shm_gib": max(0.0, float(cold_tier_shm_gib)),
         "memhist_run_only": bool(memhist_run_only),
         "image_p_gib": images.p_gib,
         "image_d_gib": images.d_gib,
@@ -2797,6 +2827,7 @@ def _boot_charges_gib(terms: Dict[str, object]) -> float:
         # rc12d: the history armed from rank start is there at both moments
         + (0.0 if terms.get("memhist_run_only") else float(terms.get("memhist_gib", 0.0) or 0.0))
         + float(terms.get("l3_index_gib", 0.0) or 0.0)  # 28.09.: the L3 index, every owner
+        + float(terms.get("cold_tier_shm_gib", 0.0) or 0.0)  # 29.09.: tmpfs expert store
     )
 
 
@@ -4300,6 +4331,9 @@ def price(
     memhist_gib: float = 0.0,
     # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
     l3_index_gib: float = 0.0,
+    # 29.09. (Planer post COLD_TIER_SHM): the expert store when it lives on a
+    # tmpfs -- shmem, unevictable without swap, resident in BOTH phases.
+    cold_tier_shm_gib: float = 0.0,
     memhist_run_only: bool = False,
     # H87: see `charge_terms` (d_only) and `run_origin_gib`/`resolve_image_terms`
     # (reference_model_ok). Defaults are byte-identical to every caller before.
@@ -4468,7 +4502,8 @@ def price(
                            arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
                            d_draft_host_gib=d_draft_host_gib, d_only=d_only,
                            memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
-                           l3_index_gib=l3_index_gib)
+                           l3_index_gib=l3_index_gib,
+                           cold_tier_shm_gib=cold_tier_shm_gib)
     heaps_gib = charges["heaps_gib"]
     anchors_gib = charges["anchors_gib"]
     rings_gib = charges["rings_gib"]
@@ -4598,6 +4633,7 @@ def price(
         "d_draft_host_gib": float(charges.get("d_draft_host_gib", 0.0) or 0.0),  # H25
         "memhist_gib": float(charges.get("memhist_gib", 0.0) or 0.0),  # rc12d
         "l3_index_gib": float(charges.get("l3_index_gib", 0.0) or 0.0),  # 28.09.
+        "cold_tier_shm_gib": float(charges.get("cold_tier_shm_gib", 0.0) or 0.0),  # 29.09.
         "memhist_run_only": bool(charges.get("memhist_run_only", False)),
         "overhead_gib": overhead_gib,
         # #1386: SAME LABEL DEFECT the #1317n comment above names for
@@ -5636,7 +5672,7 @@ def _gib_or_none(value: Optional[float]) -> str:
     return "unreadable" if value is None else f"{value:.2f} GiB"
 
 
-def _advisory_line(arm: Arm, chosen: bool) -> str:
+def _advisory_line(arm: Arm, chosen: bool, watermark_gib: Optional[float] = None) -> str:
     """The RUN-PEAK line, printed for the CHOSEN arm or -- on a total refusal --
     for the most frugal arm on the ladder.
 
@@ -5646,7 +5682,10 @@ def _advisory_line(arm: Arm, chosen: bool) -> str:
     needs, and a refusal is the outcome on this box today.  Emitting it only on
     success would delete the explanation at the moment it is wanted.
     """
-    watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    # 29.09.: the mark `choose` graded against (reap_mark_gib), not the CT999
+    # constant -- the advisory must say ABOVE where the refusal does.
+    if watermark_gib is None:
+        watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
     predicted = arm.predicted_run_peak_gib()
     subject = "this arm" if chosen else f"the most frugal arm (S={arm.s_gb} M={arm.m_mib})"
     if predicted is None:
@@ -5710,6 +5749,7 @@ def arm_terms_line(arm) -> str:
         + (f"memhist={_g('memhist_gib')}{'(run)' if t.get('memhist_run_only') else ''} "
            if float(t.get('memhist_gib') or 0.0) else "")
         + (f"l3_index={_g('l3_index_gib')} " if float(t.get('l3_index_gib') or 0.0) else "")
+        + (f"cold_tier_shm={_g('cold_tier_shm_gib')} " if float(t.get('cold_tier_shm_gib') or 0.0) else "")
         + f"overhead={_g('overhead_gib')} xchg_bounce={_g('xchg_bounce_gib')} "
         f"host_weights={_g('host_ring_gib')} "
         f"ratchet_charged={_g('flip_ratchet_charged_gib')} "
@@ -5801,6 +5841,9 @@ def choose(
     memhist_gib: float = 0.0,
     # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
     l3_index_gib: float = 0.0,
+    # 29.09. (Planer post COLD_TIER_SHM): the expert store when it lives on a
+    # tmpfs -- shmem, unevictable without swap, resident in BOTH phases.
+    cold_tier_shm_gib: float = 0.0,
     memhist_run_only: bool = False,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
@@ -5866,6 +5909,7 @@ def choose(
             reference_model_why=reference_model_why,
             memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
             l3_index_gib=l3_index_gib,
+            cold_tier_shm_gib=cold_tier_shm_gib,
         )
         for s, m in arms
     ]
@@ -6038,7 +6082,12 @@ def choose(
         )
     )
     # FIX 6: origin and watermark in ONE currency -- both non-reclaimable.
-    watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    # 29.09. (W98 z30w follow-up): the recorded mark is the CT999 HOST reap
+    # point (global OOM, memory.max 'max'). Inside a finite cgroup the kernel
+    # reaps at memory.max first -- 84 GiB in the Docker form, 11.90 GiB below
+    # 95.90 -- so the mark is the smaller of the two. `reap_mark_gib` is the
+    # one place both the ladder and the launch/front latches read it from.
+    watermark_gib = reap_mark_gib(cg_ceiling_bytes, cg_ceiling_source)
     # #1269 / standing order 2026-09-08: the watermark alone is not the bound.
     # The bound is the watermark MINUS a named margin -- the flip transient the
     # box will actually spend and the idle anon drift it will actually
@@ -6387,7 +6436,7 @@ def choose(
         # The advisory's explanatory half belongs in the refusal too -- see
         # :func:`_advisory_line`.  The most frugal arm is the ladder's last.
         frugal = priced[-1]
-        lines.append(_advisory_line(frugal, chosen=False))
+        lines.append(_advisory_line(frugal, chosen=False, watermark_gib=watermark_gib))
         table = "\n".join(lines)
         # THE HONEST OUTCOME (fix 8): on today's box every arm may refuse, and
         # that IS the answer for this tree.  No term is shrunk to get an arm
@@ -6449,6 +6498,7 @@ def choose(
                         reference_model_why=reference_model_why,
                         memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
                         l3_index_gib=l3_index_gib,
+                        cold_tier_shm_gib=cold_tier_shm_gib,
                     )
                 except Exception:  # noqa: BLE001 - advice may never mask the refusal
                     return False
@@ -6511,7 +6561,7 @@ def choose(
         "the launcher prints the delta against THIS boot's own store budget on the "
         "WEG2-STORE line rather than repeating a recalled number here."
     )
-    lines.append(_advisory_line(chosen, chosen=True))
+    lines.append(_advisory_line(chosen, chosen=True, watermark_gib=watermark_gib))
     return chosen, headroom, lines
 
 

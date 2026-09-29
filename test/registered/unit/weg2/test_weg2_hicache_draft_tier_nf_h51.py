@@ -509,9 +509,11 @@ def test_nf_launcher_ledger_drops_the_1_83_gib_draft_term(monkeypatch, tmp_path,
     off = _nf_ledger(monkeypatch, tmp_path, arena_gib=None)
     monkeypatch.setenv(TIER_ENV, "on")
     on = _nf_ledger(monkeypatch, tmp_path, arena_gib=None)
-    assert on - off == 1922389 * 1024
+    # 29.09.: the ranks cut the arena in 786432-B pages (arena-786432.bin),
+    # 30037 pages x 64 = 1922368 token slots, not 22 GiB // 12288 = 1922389
+    assert on - off == 1922368 * 1024
     assert round((on - off) / (1 << 30), 2) == 1.83
-    assert "draft 0 x 1024 B" in caplog.text and "draft 1922389 x 1024 B" in caplog.text
+    assert "draft 0 x 1024 B" in caplog.text and "draft 1922368 x 1024 B" in caplog.text
 
 
 def test_nf_w10_skip_line_follows_the_tier(monkeypatch):

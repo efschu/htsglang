@@ -52,7 +52,8 @@ class Wiring(CustomTestCase):
     def test_main_prices_twice_when_the_arena_moves(self):
         src = inspect.getsource(launcher.main)
         self.assertIn("def _price_host_ledger():", src)
-        self.assertEqual(src.count("= _price_host_ledger()"), 2)
+        # 29.09.: a third pricing after the map is written (cold_tier_shm post)
+        self.assertEqual(src.count("= _price_host_ledger()"), 3)
         self.assertIn("arena_from_ledger(", src)
         self.assertIn('os.environ["SGLANG_HICACHE_ARENA_GIB"] = f"{_arena_new:g}"', src)
         # the env the groups inherit is the same one the ledger term reads

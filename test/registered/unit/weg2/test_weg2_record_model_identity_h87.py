@@ -180,7 +180,7 @@ class TestDOnlyHasNoFlipArm(_Tmp):
         meminfo, cg = _fake_host(self.tmp)
         model = _make_ckpt(self.tmp, NF_NVFP4)
         orig = launcher._weg2_arena_ledger_terms
-        launcher._weg2_arena_ledger_terms = lambda _m: dict(C_ARENA)
+        launcher._weg2_arena_ledger_terms = lambda _m, *_a, **_k: dict(C_ARENA)
         try:
             arm, _h, lines, _cg = launcher.choose_host_ledger(
                 0, 0, d_draft_host_gib=C_D_DRAFT_HOST_GIB, meminfo_path=meminfo,
@@ -230,7 +230,7 @@ class TestRunOriginOnlyFromTheSameModel(_Tmp):
     def _seam(self, model: str):
         meminfo, cg = _fake_host(self.tmp, ceiling="max")
         orig = launcher._weg2_arena_ledger_terms
-        launcher._weg2_arena_ledger_terms = lambda _m: dict(C_ARENA)
+        launcher._weg2_arena_ledger_terms = lambda _m, *_a, **_k: dict(C_ARENA)
         try:
             return launcher.choose_host_ledger(
                 0, 0, d_draft_host_gib=C_D_DRAFT_HOST_GIB, meminfo_path=meminfo,
