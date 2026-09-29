@@ -132,6 +132,19 @@ def bigram_anchor_key(token_ids, cache_len: int, extra_key, *, is_bigram: bool,
     return RadixKey(token_ids[:n], extra_key, is_bigram=is_bigram).page_aligned(page_size)
 
 
+def prefetch_namespace(*, anchor_extra_key, request_extra_key):
+    """The namespace a storage prefetch span is keyed and inserted under.
+
+    NF 09292034 (y3k-korr, 29.09.): every salted request (cache_salt ->
+    extra_key) read P's pages from the store (``loaded=10496``) under the
+    ROOT anchor's namespace, None, so the span landed beside the request's
+    own path; its match (namespace = the salt) found nothing, D re-prefilled
+    the whole prompt (``hit0``, ``cached_tokens=0``) and the flip time went
+    from ~3 s to 16-27 s. The request's namespace wins; the anchor's is the
+    fallback for a caller that does not pass one (upstream 3639655dda)."""
+    return request_extra_key if request_extra_key is not None else anchor_extra_key
+
+
 def bigram_anchor_ids(fill_ids, full_ids):
     """The ids the exact key reads its next token from.
 
@@ -6432,9 +6445,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         locally_eligible: bool = True,
         min_tokens: Optional[int] = None,
         span_base: Optional[int] = None,
+        extra_key: Optional[str] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
+        # `extra_key`: the REQUEST's namespace (cache_salt / lora), upstream
+        # 3639655dda. See `prefetch_namespace` -- a root anchor has none.
         # `min_tokens` (xsn437): the smallest read worth issuing. None = the
         # tree's `prefetch_threshold` (256), the unchanged default. A read that
         # COMPLETES an earlier store read which terminated short (the tail P's
@@ -6471,7 +6487,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _end_base = _fa_end_base(span_base) if symmetric else None
         _local_end = group_end = 0
 
-        extra_key = last_host_node.key.extra_key if last_host_node.key else None
+        extra_key = prefetch_namespace(
+            anchor_extra_key=last_host_node.key.extra_key if last_host_node.key else None,
+            request_extra_key=extra_key,
+        )
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=extra_key,
