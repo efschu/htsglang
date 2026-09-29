@@ -3574,7 +3574,8 @@ class Front:
             from sglang.srt.weg2.front_tokens import FrontTokens, TokenSpans
 
             self.ftok = FrontTokens()
-            self.tspans = TokenSpans(agent_span=self.spans.agent_span)
+            self.tspans = TokenSpans(agent_span=self.spans.agent_span,
+                                     anchor_page=envs.SGLANG_WEG2_FRONT_ANCHOR_PAGE.get())
         # NF (P49): a boot with the switch on says so once. Off prints nothing,
         # so an off boot's front log keeps the pre-P49 lines (the arm's env
         # line is the off witness).
@@ -5353,13 +5354,53 @@ class Front:
                     "held Mamba anchor, #59)", rid, old, int(depth), int(depth), int(ct), int(pt),
                     int(held))
 
+    def _p_anchor_presence(self, rid: str, text: str, pending: Any) -> int:
+        """PREFILL-EINBRUCH-0929 K1 (switch SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE).
+
+        NF z30u: 77 follow-up turns routed LONG prefilled < 2k new tokens on
+        P; 71 of their P hits sat exactly on the page floor of an earlier P
+        prompt (P's END-ANCHOR), and for 47 of those the witness's leg 2 on D
+        had not finished when they were priced -- so the front, which credits
+        only finished D readings (#1324, #59 A: in flight = 0), priced the
+        whole prompt. weg2-8-21: pending 4624 -> LONG, P prefilled 976 on a
+        26496 store hit.
+
+        Called at the first content of an ``after_p`` leg 2: D has resumed
+        from P's anchor, so the publish is complete and readable -- not the
+        in-flight write-through #1324 refused to credit. Returns the anchor."""
+        if not self.x_exact or self.tspans is None:
+            return 0
+        ids = self.ftok.ids_for(text)
+        p_pt = int(getattr(pending, "leg1_prompt_tokens", 0) or 0)
+        anchor = self.tspans.record_store_anchor(ids, p_pt)
+        if anchor <= 0:
+            return 0
+        self.counters["p_anchor_presence"] += 1
+        logger.info("WEG2 P-ANCHOR-PRESENCE rid=%s anchor=%d p_prompt=%d tokens_front=%d epoch=%d "
+                    "(D resumed P's END-ANCHOR at its first content: a store presence every "
+                    "later text on this prefix is priced against)",
+                    rid, anchor, p_pt, int(ids.size), self.epoch)
+        self._x_exact_reprice_queue("p_anchor")
+        return anchor
+
     def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
                         held_epoch: Optional[int], resumable_depth: Optional[int] = None) -> None:
         """D leg 2 finished: feed the token spans with D's MEASURED reading and
         log the residual error of this request's exact price. NO BAND: the
         error is printed, never folded back into the routing bound."""
-        self.tspans.record_presence(self.ftok.ids_for(text), ct, prompt_tokens=pt,
+        ids = self.ftok.ids_for(text)
+        clamps = self.tspans.own_text_clamps
+        self.tspans.record_presence(ids, ct, prompt_tokens=pt,
                                     held_epoch=held_epoch, resumable_depth=resumable_depth)
+        if self.tspans.own_text_clamps != clamps:
+            # PREFILL-EINBRUCH-0929 K2: a parked + resumed leg 2 counts its
+            # decoded tokens as prompt; the entry credits its own end anchor.
+            self.counters["presence_own_text_clamped"] += 1
+            logger.info("WEG2 PRESENCE-OWN-TEXT-CLAMP rid=%s tokens_front=%d cached_d=%d prompt_d=%d "
+                        "depth_d=%s credited=%d (D's reading reaches past this text -- a D-park "
+                        "resume counts its decoded tokens as prompt; the entry credits at most "
+                        "the end anchor of its own prompt)", rid, int(ids.size), int(ct), int(pt),
+                        resumable_depth, self.tspans.own_anchor(int(ids.size)))
         self._x_exact_reprice_queue("presence")
         got = self._x_exact_rid.pop(rid, None)
         if got is None:
@@ -7045,6 +7086,9 @@ class Front:
             # for P's own device tier, and its `prompt_tokens` speaks for
             # a prefill, not for a landing. The witness is D's own
             # `cached_tokens` on leg 2, recorded there.
+            # (W38 is gone since #1400/#1416; the landing is proven at D's
+            # first content of leg 2 -- `_p_anchor_presence`, behind
+            # SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.)
             #
             # `_note_exact` DOES stay: `prompt_tokens` is a TOKENISATION
             # fact (this text is 109,132 tokens), it feeds `carrier_est`,
@@ -7416,6 +7460,9 @@ class Front:
                         self.tspans.record_inflight(self.ftok.ids_for(text), self.epoch)
                         self._x_exact_reprice_queue("inflight")
                     self.counters["span_inflight_credited"] += 1
+                if (_has_content and pending is not None and not single_prefill
+                        and envs.SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.get()):
+                    self._p_anchor_presence(rid, text, pending)
                 if stream:
                     resp = web.StreamResponse(
                         status=r.status,

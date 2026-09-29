@@ -1249,6 +1249,15 @@ class Envs:
     # unswitched since RC9), nextflash off until the NF seat releases it with a
     # boot tag; off without a form (the NF code default).
     SGLANG_WEG2_ENABLE_AGENT_SPAN = EnvBool(_profile_default("SGLANG_WEG2_ENABLE_AGENT_SPAN", False))
+    # PREFILL-EINBRUCH-0929 K1 (Weg-2 front, X-EXACT): at the first content of
+    # an after_p leg 2 -- P's publish is complete, D resumed from it -- the
+    # prompt's END-ANCHOR (page floor of P's prompt_tokens) is recorded as a
+    # store presence, so a follow-up turn on that prefix prices its real rest
+    # and stays on D. Line 'WEG2 P-ANCHOR-PRESENCE'. Off = no record (#1324:
+    # P's leg 1 feeds no presence); A/B against the W50-REROUTE count.
+    SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE = EnvBool(False)
+    # The page grain of that end anchor (the store page, ArenaMHAHostPool #107).
+    SGLANG_WEG2_FRONT_ANCHOR_PAGE = EnvInt(64)
     # H102 (Weg-2 front): a per-request watcher sees the client's connection
     # close and cancels the work behind it -- dequeued while queued, aborted
     # on P (/abort_request, the intake-stall path) during leg 1, dropped
