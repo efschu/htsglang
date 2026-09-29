@@ -13518,9 +13518,10 @@ def resolve_dual_layout(ns) -> None:
     """DUAL-TP3PP3 (F26): the ONE place --dual-layout changes other flags.
 
     Both groups stay awake, so their weights never sleep: --flip-weights is
-    forced to 'resident'. Refused by name: --weg2-d-adopt on (D would hold
-    placeholders that only a flip fills -- and there is no flip), --idle-layout
-    pp (an idle flip), --dual-mps on without --dual-layout. Off: no-op."""
+    forced to 'resident' and --idle-layout pp (an idle flip rule) to 'tp'.
+    Refused by name: --weg2-d-adopt on (D would hold placeholders that only a
+    flip fills -- and there is no flip), --dual-mps on without --dual-layout.
+    Off: no-op."""
     dual = bool(getattr(ns, "dual_layout", False))
     if not dual:
         if str(getattr(ns, "dual_mps", "off")) == "on":
@@ -13533,9 +13534,11 @@ def resolve_dual_layout(ns) -> None:
             "DUAL-TP3PP3: --dual-layout with --weg2-d-adopt on -- D would hold placeholder "
             "weights that only the first flip fills, and the dual layout never flips")
     if str(getattr(ns, "idle_layout", "tp")) == "pp":
-        raise Weg2DualLayoutRefused(
-            "DUAL-TP3PP3: --dual-layout with --idle-layout pp -- the idle layout is a flip, "
-            "and the dual layout never flips")
+        # The idle layout is a flip rule; the dual layout never flips, so it is
+        # moot -- but the front would still read it, hence forced, not kept.
+        print("WEG2-DUAL --idle-layout pp -> tp (the idle layout is a flip rule; "
+              "the dual layout never flips)", flush=True)
+        ns.idle_layout = "tp"
     if getattr(ns, "flip_weights", "family") != "resident":
         print(f"WEG2-DUAL --flip-weights {getattr(ns, 'flip_weights', 'family')} -> resident "
               "(both groups stay awake, no weight ever sleeps)", flush=True)

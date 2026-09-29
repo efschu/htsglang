@@ -55,10 +55,17 @@ class DualLayoutLauncher(CustomTestCase):
 
     def test_refusals(self):
         for extra in (("--dual-layout", "--weg2-d-adopt", "on"),
-                      ("--dual-layout", "--idle-layout", "pp"),
                       ("--dual-mps", "on")):
             with self.assertRaises(L.Weg2DualLayoutRefused, msg=str(extra)):
                 L.resolve_dual_layout(_ns(*extra))
+
+    def test_idle_layout_pp_is_forced_to_tp(self):
+        ns = _ns("--dual-layout", "--idle-layout", "pp")
+        L.resolve_dual_layout(ns)
+        self.assertEqual(ns.idle_layout, "tp")
+        ns = _ns("--idle-layout", "pp")
+        L.resolve_dual_layout(ns)
+        self.assertEqual(ns.idle_layout, "pp")
 
     def test_mps_env_is_private_to_the_boot(self):
         ns = _ns("--dual-layout", "--dual-mps", "on")
