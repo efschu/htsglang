@@ -260,5 +260,23 @@ class TestImport(unittest.TestCase):
                                       transport="bar1").state, fm.STATE_IMPOSSIBLE_START)
 
 
+class TestHeatMisses(unittest.TestCase):
+    def _rec(self, d, rank, not_local, steps, kind="moe_heat"):
+        p = os.path.join(d, f"moe_heat_D_tp{rank}_{len(os.listdir(d))}.json")
+        with open(p, "w") as f:
+            json.dump({"kind": kind, "version": 1, "group": "D", "rank": rank,
+                       "layers": [{"counts": [5, 3], "not_local": not_local, "steps": steps}]}, f)
+        return p
+
+    def test_sum_per_rank_and_refuse_foreign(self):
+        with tempfile.TemporaryDirectory() as d:
+            ps = [self._rec(d, 0, 4, 10), self._rec(d, 0, 6, 10), self._rec(d, 1, 0, 0)]
+            m = fm.heat_misses(ps)
+            self.assertEqual(m[0]["misses_per_step"], 0.5)
+            self.assertEqual(m[1]["steps"], 0)
+            with self.assertRaises(fm.FormMeasuresError):
+                fm.heat_misses([self._rec(d, 2, 1, 1, kind="other")])
+
+
 if __name__ == "__main__":
     unittest.main()

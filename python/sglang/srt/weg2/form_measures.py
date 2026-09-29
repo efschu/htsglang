@@ -688,6 +688,44 @@ def import_calib_run(run_dir: str, arms: Mapping[str, Tuple[Identity, FormSpec]]
 
 
 # ---------------------------------------------------------------------------
+# Next Flash miss terms: from RECORDS, never from log lines (NF 29.09.)
+
+HEAT_KIND = "moe_heat"   # layers/moe/pool_heat.py RECORD_KIND (#276, 3c5ebeac97)
+
+
+def heat_misses(paths: Iterable[str]) -> Dict[int, Dict[str, float]]:
+    """Per D rank: ``{not_local, lanes, steps, misses_per_step}`` summed over
+    the given #276 heat records (``moe_heat_<group>_tp<r>_*.json``, one per D
+    sleep). ``not_local`` = routed lanes to an expert this rank does not own
+    (under the owned cut: a miss). A record of another kind/version is
+    refused, a record that counted no step is skipped.
+
+    What it CANNOT give: the split per (bs, depth, text) cell -- the record
+    is per PHASE (flushed at D's sleep), and a D-only calibration has no
+    phase boundary inside a run. The import does not attach it to cells;
+    ``misses_per_seat`` stays empty (= not measured) until the instrument
+    gives a per-group snapshot (docs/weg2/FORM_MEASURES_V3_FORMAT.md §4)."""
+    out: Dict[int, Dict[str, float]] = {}
+    for p in paths:
+        with open(p) as f:
+            rec = json.load(f)
+        if rec.get("kind") != HEAT_KIND or int(rec.get("version", 0)) != 1:
+            raise FormMeasuresError(f"{p}: not a {HEAT_KIND} v1 record")
+        r = int(rec["rank"])
+        acc = out.setdefault(r, {"not_local": 0.0, "lanes": 0.0, "steps": 0.0})
+        steps = max((int(L.get("steps") or 0) for L in rec.get("layers") or ()), default=0)
+        if steps <= 0:
+            continue
+        acc["steps"] += steps
+        for L in rec.get("layers") or ():
+            acc["not_local"] += int(L.get("not_local") or 0)
+            acc["lanes"] += sum(int(c) for c in (L.get("counts") or ())) + int(L.get("not_local") or 0)
+    for acc in out.values():
+        acc["misses_per_step"] = acc["not_local"] / acc["steps"] if acc["steps"] else 0.0
+    return out
+
+
+# ---------------------------------------------------------------------------
 # CLI: plan (the --calib selection -> run_matrix.sh env), import, show
 
 
