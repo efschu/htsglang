@@ -467,6 +467,14 @@ def assert_seed_superseded() -> None:
 # ---------------------------------------------------------------------------
 
 _WEIGHTLESS_KV_HEAD_RANK: Optional[int] = None
+#: F15 (5, rank form 28.09.): Form B generalises the ONE head to a head SET W
+#: -- the weight ranks, which hold the heads by the W-restricted ratio -- and
+#: every other rank is a weightless KV worker exactly as on the lane. The lane
+#: is the set of one: ``set_weightless_kv_head_rank(h)`` installs (h,) and every
+#: reader below answers byte-identically. ``_WEIGHTLESS_KV_HEAD_RANK`` stays the
+#: LEAD (min of the set): the rank whose tokens and accepts every rank adopts.
+_WEIGHTLESS_KV_WEIGHT_RANKS: Optional[Tuple[int, ...]] = None
+_WEIGHTLESS_KV_WEIGHT_RATIOS: Optional[Tuple[int, ...]] = None
 
 
 def set_weightless_kv_head_rank(head_rank: Optional[int]) -> None:
@@ -474,13 +482,45 @@ def set_weightless_kv_head_rank(head_rank: Optional[int]) -> None:
     that holds ALL attention heads / all weights (or None to disable, keeping
     every other path byte-identical). All other DCP ranks are weightless (0
     heads, KV-token-shard only)."""
-    global _WEIGHTLESS_KV_HEAD_RANK
+    global _WEIGHTLESS_KV_HEAD_RANK, _WEIGHTLESS_KV_WEIGHT_RANKS, _WEIGHTLESS_KV_WEIGHT_RATIOS
     _WEIGHTLESS_KV_HEAD_RANK = head_rank
+    _WEIGHTLESS_KV_WEIGHT_RANKS = None if head_rank is None else (int(head_rank),)
+    _WEIGHTLESS_KV_WEIGHT_RATIOS = None if head_rank is None else (1,)
+
+
+def set_weightless_kv_weight_ranks(
+    ranks: Optional[Sequence[int]], ratios: Optional[Sequence[int]] = None
+) -> None:
+    """F15 (5): Form B's head SET -- the weight ranks W (sorted, >= 1) and
+    their weight shares (the heads split by them); every other rank is a
+    weightless KV worker. The lead (min W) becomes the head rank the single-
+    head readers see. None disables."""
+    global _WEIGHTLESS_KV_HEAD_RANK, _WEIGHTLESS_KV_WEIGHT_RANKS, _WEIGHTLESS_KV_WEIGHT_RATIOS
+    if ranks is None:
+        set_weightless_kv_head_rank(None)
+        return
+    w = tuple(sorted(int(r) for r in ranks))
+    rat = None if ratios is None else tuple(int(x) for x in ratios)
+    if not w or len(set(w)) != len(w) or (
+        rat is not None and (len(rat) != len(w) or any(x <= 0 for x in rat))
+    ):
+        raise ValueError(
+            f"weightless head set {list(w)} with shares {None if rat is None else list(rat)}: one positive share per "
+            "distinct rank. W181 Weg2RankFormShapeMismatch")
+    _WEIGHTLESS_KV_HEAD_RANK = w[0]
+    _WEIGHTLESS_KV_WEIGHT_RANKS = w
+    _WEIGHTLESS_KV_WEIGHT_RATIOS = rat
+
+
+def get_weightless_kv_weight_ranks() -> Optional[Tuple[int, ...]]:
+    """The head set (the lane: one rank; Form B: W), or None."""
+    return _WEIGHTLESS_KV_WEIGHT_RANKS
 
 
 def get_weightless_kv_head_rank() -> Optional[int]:
     """The rank holding all heads/weights under the weightless-KV fast lane, or
-    None when the fast lane is not active."""
+    None when the fast lane is not active. Under Form B: the LEAD of the head
+    set -- the token and accept source."""
     return _WEIGHTLESS_KV_HEAD_RANK
 
 
@@ -492,33 +532,56 @@ def weightless_kv_active() -> bool:
 def is_weightless_head_rank(rank: int) -> bool:
     """True when the weightless-KV fast lane is active AND `rank` is the head
     rank (holds the full weights, runs the model TP=1 + the attention dispatch).
-    False on the default path (fast lane off)."""
-    head_rank = _WEIGHTLESS_KV_HEAD_RANK
-    return head_rank is not None and rank == head_rank
+    Under Form B: `rank` is in the head set W. False on the default path."""
+    heads = _WEIGHTLESS_KV_WEIGHT_RANKS
+    return heads is not None and int(rank) in heads
 
 
 def weightless_worker_rank(rank: int) -> bool:
     """True when the weightless-KV fast lane is active AND `rank` is a WEIGHTLESS
     KV worker (holds ONLY a KV token-shard; runs the stripped attention-only
     forward; materializes NO layer weights). False on the default path."""
-    head_rank = _WEIGHTLESS_KV_HEAD_RANK
-    return head_rank is not None and rank != head_rank
+    heads = _WEIGHTLESS_KV_WEIGHT_RANKS
+    return heads is not None and int(rank) not in heads
 
 
-def weightless_head_counts(total: int, world_size: int) -> list:
+def weightless_head_counts(
+    total: int,
+    world_size: int,
+    units: Optional[int] = None,
+    groups: Optional[int] = None,
+) -> list:
     """Per-rank head-count vector for the weightless-KV fast lane: `total` on
     the head rank, 0 on every weightless rank. E.g. total=24 heads, world=3,
     head_rank=0 -> [24, 0, 0]. The uneven-DCP collectives already tolerate a
     0-head shard (cp_all_gather_heads_uneven pads to max(counts); a 0-count
     rank contributes an empty slice, so the Q all-gather becomes a broadcast
     from the head rank and the O merge slices the merged output back to the
-    head rank only)."""
-    head_rank = _WEIGHTLESS_KV_HEAD_RANK
-    assert head_rank is not None, "weightless_head_counts() with fast lane off"
-    assert (
-        0 <= head_rank < world_size
-    ), f"weightless head_rank {head_rank} out of range for world {world_size}"
-    return [total if r == head_rank else 0 for r in range(world_size)]
+    head rank only).
+
+    F15 (5): with a head SET W (Form B) the heads split over W by the W
+    shares with the SAME rule the W ranks' projections were built with
+    (``partition_sizes`` over |W| ranks, ``units`` / ``groups`` as
+    ``tp_partition_sizes`` takes them), and every other rank gets 0 -- e.g. 24
+    q heads over W=(0, 1) shares (3, 1) in units of 6 -> [18, 6, 0]."""
+    heads = _WEIGHTLESS_KV_WEIGHT_RANKS
+    assert heads is not None, "weightless_head_counts() with fast lane off"
+    assert all(
+        0 <= h < world_size for h in heads
+    ), f"weightless head set {list(heads)} out of range for world {world_size}"
+    if len(heads) == 1:
+        return [total if r == heads[0] else 0 for r in range(world_size)]
+    # the SAME rule tp_partition_sizes applies to the W ranks' build under the
+    # W-restricted plan (rank_form.form_b_build_context): a vector -> the
+    # proportional split, none -> the even split
+    ratios = _WEIGHTLESS_KV_WEIGHT_RATIOS
+    if ratios is None:
+        ensure_divisibility(total, len(heads))
+        per = [total // len(heads)] * len(heads)
+    else:
+        per = partition_sizes(total, list(ratios), units, groups)
+    by_rank = dict(zip(heads, per))
+    return [int(by_rank.get(r, 0)) for r in range(world_size)]
 
 
 def uneven_dcp_active(dcp_size: Optional[int] = None) -> bool:
