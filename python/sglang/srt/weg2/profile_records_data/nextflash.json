@@ -246,6 +246,141 @@
    },
    "power_limit_source": "not a power-dependent quantity (bytes outside the budget)",
    "n": 10
+  },
+  {
+   "name": "FORM_MATRIX_AXES",
+   "kind": "geometry",
+   "fmt": "int4",
+   "provenance": "Planer-Sitz 29.09., abgestimmt mit dem Architektur-Sitz (VRAM-VERTRAG-0929.md §3.3 'NF-Formen D'; FORM-MESSMATRIX-ENTWURF-0929.md). Formen = D-Formen der NF-Linie (-e2cut-z30w-park / -z30x-frp). capacity = RECHNUNG aus dem OVERRIDE-Pin --max-total-tokens 262144 (bs x Tiefe <= 262144), wird ab M1 aus vram_plan kv.tokens gelesen; keine Messung",
+   "value": {
+    "forms": {
+     "A": {
+      "arm": "e2cut-z30w-park",
+      "axes": {
+       "roles": "host,worker,worker",
+       "weights": "1,0,0",
+       "transport": "bar1",
+       "spec": "mtp3",
+       "kv_stage": "S0",
+       "owned_cut": "round"
+      }
+     },
+     "A_T3232": {
+      "arm": null,
+      "axes": {
+       "roles": "host,worker,worker",
+       "weights": "1,0,0",
+       "transport": "bar1",
+       "spec": "mtp3",
+       "kv_stage": "S0",
+       "owned_cut": "round",
+       "tokens": "0,32,32"
+      }
+     },
+     "A_T0": {
+      "arm": "st-vsync",
+      "axes": {
+       "roles": "host,worker,worker",
+       "weights": "1,0,0",
+       "transport": "bar1",
+       "spec": "mtp3",
+       "kv_stage": "S0",
+       "tokens": "tp0"
+      }
+     },
+     "A_ST": {
+      "arm": null,
+      "startable": false,
+      "why_not": "bis M1 D-solo -kvstage gruen (Stufenleiter unter dem Schnitt, S3g/S3h, Stufen vom Planer statt STAGE_TOKENS-Pin)",
+      "axes": {
+       "roles": "host,worker,worker",
+       "weights": "1,0,0",
+       "transport": "bar1",
+       "spec": "mtp3",
+       "kv_stage": "ladder",
+       "owned_cut": "round"
+      }
+     },
+     "B": {
+      "arm": null,
+      "startable": false,
+      "why_not": "Entscheid 29.09. 00:05Z: nicht vorgesehen, bis ein gemessener Bedarf da ist",
+      "axes": {
+       "roles": "same",
+       "weights": "dense_tp",
+       "transport": "bar1",
+       "spec": "mtp3",
+       "kv_stage": "S0"
+      }
+     }
+    },
+    "bs": [
+     1,
+     2,
+     3,
+     4,
+     5,
+     6
+    ],
+    "depths": [
+     "2k",
+     "10k",
+     "32k",
+     "97k",
+     "240k",
+     "257k"
+    ],
+    "texts": [
+     "code",
+     "prose",
+     "thinking"
+    ],
+    "temps": [
+     "warm"
+    ],
+    "capacity": {
+     "A": {
+      "2k": 6,
+      "10k": 6,
+      "32k": 6,
+      "97k": 2,
+      "240k": 1,
+      "257k": 1
+     },
+     "A_T3232": {
+      "2k": 6,
+      "10k": 6,
+      "32k": 6,
+      "97k": 2,
+      "240k": 1,
+      "257k": 1
+     },
+     "A_T0": {
+      "2k": 6,
+      "10k": 6,
+      "32k": 6,
+      "97k": 2,
+      "240k": 1,
+      "257k": 1
+     }
+    },
+    "cell_attributes": [
+     "tokens(A: Planer, Trockenlauf 29.09. 0,44,20)",
+     "fr_d",
+     "scratch_rows",
+     "moe_ratio(Profil 183,137,168 = OVERRIDE; Planer 215,121,152)"
+    ],
+    "identity_terms": [
+     "model",
+     "precision",
+     "cards",
+     "links",
+     "power_limit_w",
+     "moe_ratio",
+     "p_chunk",
+     "graph_buckets"
+    ]
+   }
   }
  ],
  "borrow": {
