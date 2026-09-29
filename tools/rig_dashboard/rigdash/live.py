@@ -14,8 +14,10 @@ lines (launcher tag, model, form, topology).
 
 from __future__ import annotations
 
+import bisect
 import collections
 import glob
+import math
 import os
 import re
 import threading
@@ -37,6 +39,13 @@ WINDOW_S = 60.0        # headline window for the rates
 BUCKET_S = 5.0
 HISTORY_S = 15 * 60.0
 PHASE_GAP_S = 5.0      # no line of a class for longer than this -> that phase paused
+# Flipzeit (user 29.09.): P-Ende -> erstes Decode-Token, NOT flip_total (the layer swap).
+# Marks are the first work line of the woken group after a pause of this length:
+# TP0 'Decode rank batch' (its own ms stamp) for P->D, PP0 'Prefill batch' (whole
+# seconds only) for D->P.  The woken group slept through the flip, so its first line
+# after the begin always opens a run.
+FLIP_MARK_GAP_S = 0.5
+FLIP_MARKS_MAX = 100000
 
 # Launcher summary lines worth showing as the boot's "start form" (read-only
 # view of what the weg2 launcher actually emitted; the full list is ~250 lines).
@@ -477,6 +486,8 @@ class Boot:
         self.last = {}          # kind -> last event
         self.health = {}        # group -> last health event
         self.flip_open = None
+        self.flip_marks = {"D": [], "P": []}   # sorted run starts of TP0 decode / PP0 prefill
+        self._mark_last = {}
         self.counts = collections.Counter()
         self._last_t = {}       # group -> newest log timestamp seen in that file
         self.first_t = None     # first timestamp of this boot's logs
@@ -588,6 +599,10 @@ class Boot:
             if k == "decode_rank" and rank0 and ev.get("gpu_ms"):
                 self.tot[group]["dec_gpu_ms"] += ev["gpu_ms"]
                 self.tot[group]["dec_rounds"] += 1
+            if k == "decode_rank" and group == "D" and rank0:
+                self._flip_mark("D", ev.get("t_exact") or ev["t"])
+            if k == "prefill_batch" and group == "P" and rank0:
+                self._flip_mark("P", ev["t"])
             if k == "prefill_batch" and rank0:
                 # one "Prefill batch" line per chunk on the FIRST rank only (PP0/TP0):
                 # the other ranks log the same chunk again
@@ -658,7 +673,69 @@ class Boot:
             if ev["text"] is not None:
                 self.ev["errors"].append(ev)
 
+    def _flip_mark(self, group: str, t: float):
+        last = self._mark_last.get(group)
+        if last is None or t - last > FLIP_MARK_GAP_S:
+            marks = self.flip_marks[group]
+            bisect.insort(marks, t)
+            if len(marks) > FLIP_MARKS_MAX:
+                del marks[:len(marks) - FLIP_MARKS_MAX]
+        if last is None or t > last:
+            self._mark_last[group] = t
+
     # ---------------------------------------------------------------- views
+
+    def flip_times_view(self) -> dict:
+        """Flipzeit je Flip = WEG2-FLIP begin -> erste Arbeitszeile der geweckten Gruppe.
+
+        P->D: first TP0 'Decode rank batch' after the begin (= erstes Decode-Token);
+        D->P: first PP0 'Prefill batch' after the begin (whole-second stamp, so the
+        second of the begin counts and the value is floored at 0).  A flip whose
+        woken group did no work before the next flip began has no Flipzeit
+        ('ohne Folgearbeit'); the newest one still waiting is 'offen'.  flip_total
+        of the matching WEG2-FLIP done is kept beside it as 'davon Layer-Tausch'.
+        """
+        begins = sorted(self.ev["flip_begins"], key=lambda e: e["t"])
+        dones = sorted(self.ev["flips"], key=lambda e: e["t"])
+        rows = []
+        for i, b in enumerate(begins):
+            sleep, wake = b.get("sleep"), b.get("wake")
+            if wake not in ("P", "D"):
+                continue
+            nxt = begins[i + 1]["t"] if i + 1 < len(begins) else None
+            marks = self.flip_marks[wake]
+            lo = b["t"] if wake == "D" else math.floor(b["t"])
+            j = bisect.bisect_left(marks, lo)
+            m = marks[j] if j < len(marks) else None
+            if m is not None and nxt is not None and m >= nxt:
+                m = None
+            done = next((d for d in dones if d["t"] >= b["t"] and (nxt is None or d["t"] < nxt)
+                         and d.get("slept") == sleep and d.get("woke") == wake), None)
+            rows.append({
+                "t": b["t"], "epoch": b.get("epoch"), "dir": "%s>%s" % (sleep, wake),
+                "ms": round(max(0.0, m - b["t"]) * 1000.0) if m is not None else None,
+                "state": "ok" if m is not None else ("offen" if nxt is None else "ohne Folgearbeit"),
+                "layer_ms": done.get("total_ms") if done else None,
+            })
+
+        def stats(direction):
+            rs = [r for r in rows if r["dir"] == direction]
+            vals = sorted(r["ms"] for r in rs if r["ms"] is not None)
+            lay = sorted(r["layer_ms"] for r in rs if r["layer_ms"] is not None)
+            done_rows = [r for r in rs if r["ms"] is not None]
+            last = done_rows[-1] if done_rows else None
+
+            def q(xs, p):
+                return xs[max(0, math.ceil(p * len(xs)) - 1)] if xs else None
+            return {
+                "n": len(vals), "last": last["ms"] if last else None, "last_t": last["t"] if last else None,
+                "median": q(vals, 0.5), "p90": q(vals, 0.9),
+                "layer_last": last["layer_ms"] if last else None, "layer_median": q(lay, 0.5),
+                "no_work": sum(1 for r in rs if r["state"] == "ohne Folgearbeit"),
+                "open": any(r["state"] == "offen" for r in rs),
+                "resolution_s": 0.001 if direction == "P>D" else 1.0,
+            }
+        return {"P>D": stats("P>D"), "D>P": stats("D>P"), "recent": rows[-24:]}
 
     @staticmethod
     def _prefill_window(ranks, batches, t0):
@@ -966,6 +1043,7 @@ class Boot:
             "flip_open": self.flip_open,
             "flips": list(self.ev["flips"])[-12:],
             "flip_count": self.counts.get("flip_done", 0),
+            "flip_times": self.flip_times_view(),
             "health": self.health,
             "errors": list(self.ev["errors"])[-8:],
             "stops": list(self.ev["stops"])[-12:],
