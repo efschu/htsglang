@@ -220,7 +220,25 @@ def scheduler_counters(scheduler) -> Dict[str, Any]:
                   "full_token_usage": _round_or_none(getattr(mr, "last_full_token_usage", None), 4)},
         "cap": {"kv_tokens": getattr(scheduler, "max_total_num_tokens", None),
                 "seats": getattr(scheduler, "max_running_requests", None)},
+        "mem_sched": _mem_sched_block(scheduler),
     }
+
+
+def _mem_sched_block(scheduler) -> Optional[Dict[str, Any]]:
+    """D-MEM-SCHED (29.09.): the stage machine's counters incl. D-KV-DRAIN
+    (drain_runs/nodes/tokens/waited_backup/backup_issued/locked/mismatch) --
+    read only; null on P and on a D that never ticked."""
+    ms = getattr(scheduler, "_weg2_d_mem_sched", None)
+    if ms is None:
+        return None
+    try:
+        out = {k: int(v) for k, v in dict(ms.counters).items()}
+    except (RuntimeError, TypeError, ValueError):  # a racing first insert reads as unknown
+        return None
+    out["stage"] = int(getattr(ms, "stage", 0) or 0)
+    pending = getattr(ms, "pending", None)
+    out["pending"] = None if pending is None else int(pending)
+    return out
 
 
 def _round_or_none(v, nd: int):
