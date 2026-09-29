@@ -54,10 +54,12 @@ class TestRecordsAreTheOldLiterals(unittest.TestCase):
         # desk/27b-no-reserve-0929: a NEW measurement, not a changed literal --
         # D's awake rest beyond its budget line (weg2/budget_rest.py)
         # desk/27b-d-alloc-overhang-0929: two more NEW measurements (the rest's
-        # posts under the P0 torch cache cap, weg2/budget_rest.py --capped)
+        # posts under the P0 torch cache cap, weg2/budget_rest.py --capped);
+        # WEG2-EXTEND-CAP 29.09.: the extend's allocated transient per row under the cap
         # PP-POSTEN 29.09.: the measured YaRN x2 stage_fixed increment (a NEW measurement)
         self.assertEqual(set(row.constants) - {"D_AWAKE_REST_BOOKED_MIB", "D_TORCH_CAP_OTHER_MIB",
-                                               "D_AWAKE_REST_CAPPED_MIB", "P_PP_STAGE_FIXED_YARN2_DELTA_MIB"},
+                                               "D_AWAKE_REST_CAPPED_MIB", "D_EXTEND_CAP_PER_ROW_MIB",
+                                               "P_PP_STAGE_FIXED_YARN2_DELTA_MIB"},
                          set(OLD_27B))
         for n, v in OLD_27B.items():
             got = row.constant(n)
