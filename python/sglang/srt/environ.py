@@ -1408,7 +1408,11 @@ class Envs:
     # 0.26-0.29 s measured on the import graph alone (801522 objects); on the
     # metal the fixed per-layer "repack" residual was 0.43 s (PP0, 29 layers)
     # and 0.49 s (D TP0, 48). Everything the load allocates stays collectible.
-    # False = collect over the whole process (A/B).
+    # Only under expert offload (offload_active: the presplit and its collect
+    # exist); a dense load (27B) freezes nothing. One collect before the
+    # freeze, one after the unfreeze; the "BOOTZEIT5 LOAD-GC-FREEZE end" line
+    # names reclaim gc s/layer, the cgroup anon+shmem peak of the load and
+    # what the load-end collect freed. False = collect over the whole process.
     SGLANG_OPT_LOAD_GC_FREEZE = EnvBool(True)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 

@@ -254,7 +254,10 @@ _STORE_CLOCK = {"open_s": 0.0, "write_s": 0.0, "opens": 0,
                 # of the presplit, split out of presplit_s: gc_s = gc.collect,
                 # gc_found = the unreachable objects it found (0 = it freed
                 # nothing), trim_s = malloc_trim(0).
-                "gc_s": 0.0, "gc_found": 0, "trim_s": 0.0}
+                "gc_s": 0.0, "gc_found": 0, "trim_s": 0.0,
+                # BOOTZEIT 5: how many reclaims ran (the load-end line divides
+                # gc_s by it: seconds per layer is the metal criterion)
+                "reclaims": 0}
 
 
 def presplit_host_reclaim() -> None:
@@ -281,6 +284,7 @@ def presplit_host_reclaim() -> None:
         _t = time.perf_counter()
         _STORE_CLOCK["gc_found"] += int(_gc.collect())
         _STORE_CLOCK["gc_s"] += time.perf_counter() - _t
+    _STORE_CLOCK["reclaims"] += 1
     _t = time.perf_counter()
     try:
         import ctypes as _ct
