@@ -839,21 +839,31 @@ OWNED_MISS_MS_PER_ROW_SEED: Tuple[float, float] = (0.1, 0.2)
 OWNED_MISS_MS_SOURCE_SEED = "Saat UNMEASURED (plan_s3_251 §1, H29/x138)"
 #: #239 S3f miss record (29.09., z30w: the round rule moved misses from the
 #: 5090 to TP1 and the round got slower at bs1/bs2 -- the solve steered on
-#: the seed). The measured cost of one missed row per MoE layer and card,
-#: written into the sidecar ``weg2_measured_record.json`` by
-#: ``weg2.tools.owned_miss_record`` from a D log with the collective clock's
-#: graph reader on (pool.fetch device ms per rank / missed rows). RECORD
-#: (youngest sidecar entry of the model) > BUILTIN (profile constant
-#: ``OWNED_MISS_MS``) > UNMEASURED (the seed), the H94 rule.
+#: the seed). The measured cost of one missed row per MoE layer and card:
+#:
+#: * RECORD -- written by the D RANKS themselves at their sleep
+#:   (``layers.moe.pool_miss_cost``, ``SGLANG_WEG2_OWNED_MISS_RECORD=<dir>``):
+#:   pool.fetch device ms / missed rows of every pool layer, per rank;
+#: * LOG-BOOTSTRAP -- ``weg2.tools.owned_miss_record`` from one D log, the
+#:   TRANSITION ("aus Log (Uebergang)") until the first rank record exists;
+#:   it ranks under every rank record and is dropped once one is there;
+#: * BUILTIN -- the profile constant ``OWNED_MISS_MS``;
+#: * UNMEASURED -- the seed above (H94 rule, one tier more).
 OWNED_MISS_KIND = "owned_miss_ms"
+OWNED_MISS_RANK_KIND = "owned_miss_rank"
 OWNED_MISS_RECORD = "RECORD"
+OWNED_MISS_LOG_BOOTSTRAP = "LOG-BOOTSTRAP"
 OWNED_MISS_BUILTIN = "BUILTIN"
 OWNED_MISS_UNMEASURED = "UNMEASURED"
+OWNED_MISS_LOG_PROVENANCE = "aus Log (Uebergang)"
+#: rank records within this span before the youngest one form one measurement
+#: (a boot's phases); older ones belong to another form and are not mixed in
+OWNED_MISS_RANK_WINDOW_S = 6 * 3600.0
 
 
 def read_owned_miss_records(path: Optional[str]) -> List[Dict[str, object]]:
-    """The ``owned_miss_ms`` entries of the sidecar; a missing or broken
-    sidecar is an ABSENCE (``[]``), never a zero."""
+    """The log-bootstrap entries (``owned_miss_ms``) of the sidecar; a missing
+    or broken sidecar is an ABSENCE (``[]``), never a zero."""
     if not path:
         return []
     import json
@@ -867,6 +877,32 @@ def read_owned_miss_records(path: Optional[str]) -> List[Dict[str, object]]:
     if not isinstance(entries, list):
         return []
     return [e for e in entries if isinstance(e, dict) and e.get("kind") == OWNED_MISS_KIND]
+
+
+def read_owned_miss_rank_records(directory: Optional[str]) -> List[Dict[str, object]]:
+    """The rank records the D ranks wrote (``pool_miss_cost.flush``); a missing
+    directory or an unreadable file is skipped, never read as a zero."""
+    if not directory:
+        return []
+    import json
+    import os
+
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        if not (name.startswith("owned_miss_") and name.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(directory, name)) as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and rec.get("kind") == OWNED_MISS_RANK_KIND:
+            out.append(rec)
+    return out
 
 
 def _owned_miss_pair(value: object) -> Optional[Tuple[float, float]]:
@@ -900,17 +936,56 @@ def _owned_miss_model_ok(model: Optional[str], entry_model: object) -> bool:
     return mine is not None and mine == theirs
 
 
+def owned_miss_from_rank_records(
+    records: Sequence[Mapping[str, object]], *, host: int, model: Optional[str] = None,
+) -> Optional[Tuple[Tuple[float, float], str]]:
+    """``((host ms, worker ms), source)`` from the ranks' own records of this
+    model -- the youngest window (``OWNED_MISS_RANK_WINDOW_S``), host = the
+    attention host's rank, worker = the miss-weighted cost of the others --
+    or ``None`` when the window lacks the host or every worker."""
+    mine = []
+    for r in records:
+        if r.get("kind") != OWNED_MISS_RANK_KIND or not _owned_miss_model_ok(model, r.get("model")):
+            continue
+        try:
+            t, rank = float(r["time_unix"]), int(r["rank"])
+            fetch, rows = float(r["fetch_ms"]), int(r["miss_rows"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if fetch > 0 and rows > 0:
+            mine.append((t, rank, fetch, rows))
+    if not mine:
+        return None
+    newest = max(t for t, *_ in mine)
+    window = [m for m in mine if m[0] >= newest - OWNED_MISS_RANK_WINDOW_S]
+    hf = sum(f for _, r, f, _ in window if r == int(host))
+    hr = sum(n for _, r, _, n in window if r == int(host))
+    wf = sum(f for _, r, f, _ in window if r != int(host))
+    wr = sum(n for _, r, _, n in window if r != int(host))
+    if hr <= 0 or wr <= 0:
+        return None
+    return (hf / hr, wf / wr), "RECORD Rang-Records (%d Phasen-Records, %d+%d Zeilen)" % (
+        len(window), hr, wr)
+
+
 def resolve_owned_miss_ms(
     records: Sequence[Mapping[str, object]] = (),
     *,
+    rank_records: Sequence[Mapping[str, object]] = (),
+    host: int = 0,
     model: Optional[str] = None,
     builtin: Optional[Sequence[float]] = None,
     builtin_source: str = "",
 ) -> Tuple[Tuple[float, float], str, str]:
     """``(ms per missed row (host, worker), tier, source)`` for the owned
-    solve: the youngest RECORD of this model, else the BUILTIN profile
-    constant, else the seed, named UNMEASURED. An entry without two positive
-    costs is skipped, never read as a zero."""
+    solve: the ranks' own RECORD, else the LOG-BOOTSTRAP (youngest log entry
+    of this model, named "aus Log (Uebergang)" -- ignored as soon as any rank
+    record exists), else the BUILTIN profile constant, else the seed, named
+    UNMEASURED. An entry without two positive costs is skipped, never read as
+    a zero."""
+    from_ranks = owned_miss_from_rank_records(rank_records, host=host, model=model)
+    if from_ranks is not None:
+        return from_ranks[0], OWNED_MISS_RECORD, from_ranks[1]
     best: Optional[Tuple[str, Tuple[float, float], Mapping[str, object]]] = None
     for e in records:
         if e.get("kind", OWNED_MISS_KIND) != OWNED_MISS_KIND:
@@ -923,8 +998,9 @@ def resolve_owned_miss_ms(
             best = (at, pair, e)
     if best is not None:
         e = best[2]
-        return best[1], OWNED_MISS_RECORD, "RECORD %s (%s, %s Runden)" % (
-            e.get("source") or e.get("boot_tag") or "?", best[0] or "?", e.get("rounds", "?"))
+        return best[1], OWNED_MISS_LOG_BOOTSTRAP, "%s %s (%s, %s Runden)" % (
+            OWNED_MISS_LOG_PROVENANCE, e.get("source") or e.get("boot_tag") or "?",
+            best[0] or "?", e.get("rounds", "?"))
     pair = _owned_miss_pair(builtin) if builtin is not None else None
     if pair is not None:
         return pair, OWNED_MISS_BUILTIN, "BUILTIN %s" % (builtin_source or "OWNED_MISS_MS")

@@ -92,7 +92,8 @@ def test_resolve_builtin_beats_seed_and_record_beats_builtin():
     assert tier == er.OWNED_MISS_BUILTIN and ms == (0.08, 0.3)
     ms, tier, src = er.resolve_owned_miss_ms([_rec((0.05, 0.6), "2026-09-29 09:00:00")],
                                              model=MODEL, builtin=(0.08, 0.3))
-    assert tier == er.OWNED_MISS_RECORD and ms == (0.05, 0.6) and "z30w" in src
+    assert tier == er.OWNED_MISS_LOG_BOOTSTRAP and ms == (0.05, 0.6) and "z30w" in src
+    assert src.startswith(er.OWNED_MISS_LOG_PROVENANCE)
 
 
 def test_resolve_takes_the_youngest_record_of_this_model():
@@ -100,7 +101,7 @@ def test_resolve_takes_the_youngest_record_of_this_model():
             _rec((0.07, 0.5), "2026-09-29 10:00:00", source="new"),
             _rec((0.01, 0.01), "2026-09-29 11:00:00", model="/models/other", source="foreign")]
     ms, tier, src = er.resolve_owned_miss_ms(recs, model=MODEL)
-    assert tier == er.OWNED_MISS_RECORD and ms == (0.07, 0.5) and "new" in src
+    assert tier == er.OWNED_MISS_LOG_BOOTSTRAP and ms == (0.07, 0.5) and "new" in src
 
 
 def test_a_broken_entry_is_skipped_never_read_as_zero():
@@ -184,15 +185,15 @@ def test_depth_on_is_read_once_at_construction(monkeypatch):
 
 # -- the launcher hands the record to the planner ----------------------------
 
-def test_launcher_reads_the_sidecar_record(tmp_path, monkeypatch):
+def test_launcher_reads_the_log_bootstrap(tmp_path, monkeypatch):
     from sglang.srt.weg2 import launcher
 
     p = tmp_path / "weg2_measured_record.json"
     p.write_text(json.dumps({"samples": [_rec((0.05, 0.6), "2026-09-29 09:00:00")]}))
     monkeypatch.setattr(launcher, "measured_record_path", lambda: str(p))
     ns = types.SimpleNamespace(profile=None, model=MODEL)
-    ms, src = launcher.d_owned_miss_ms(ns)
-    assert ms == (0.05, 0.6) and src.startswith("RECORD")
+    ms, src = launcher.d_owned_miss_ms(ns, env_d={}, host=0)
+    assert ms == (0.05, 0.6) and src.startswith(er.OWNED_MISS_LOG_PROVENANCE)
 
 
 def test_launcher_without_a_record_keeps_the_seed_byte_identical(tmp_path, monkeypatch):
@@ -200,4 +201,111 @@ def test_launcher_without_a_record_keeps_the_seed_byte_identical(tmp_path, monke
 
     monkeypatch.setattr(launcher, "measured_record_path", lambda: str(tmp_path / "none.json"))
     ns = types.SimpleNamespace(profile=None, model=MODEL)
-    assert launcher.d_owned_miss_ms(ns) == (None, "")
+    assert launcher.d_owned_miss_ms(ns, env_d={}, host=0) == (None, "")
+
+
+# -- the ranks write the record themselves (IPC, not the log) ----------------
+
+from sglang.srt.layers.moe import pool_miss_cost as pmc
+
+
+@pytest.fixture
+def miss_dir(tmp_path, monkeypatch):
+    d = tmp_path / "owned_miss"
+    monkeypatch.setenv("SGLANG_WEG2_OWNED_MISS_RECORD", str(d))
+    pmc._reset_for_test()
+    yield d
+    pmc._reset_for_test()
+
+
+def _phase(rank, fetch_per_round, miss_per_sync, rounds=100):
+    for _ in range(rounds):
+        pmc.note_round({"spec_verify:pool.fetch": [fetch_per_round, 12, 0.1],
+                        "tp.all_reduce": [4.0, 96, 0.01]})
+    for _ in range(48):  # every pool layer syncs
+        pmc.note_sync(200, miss_per_sync)
+    return pmc.flush(rank=rank, group="D", reason="sleep", model=MODEL, phase_index=3)
+
+
+def test_rank_record_kind_is_the_one_the_planner_reads():
+    assert pmc.RECORD_KIND == er.OWNED_MISS_RANK_KIND
+
+
+def test_rank_writes_its_record_at_the_sleep(miss_dir):
+    path = _phase(0, 2.4, 10)
+    rec = json.loads(open(path).read())
+    # 240 ms over 48 layers x 10 missed rows = 0.5 ms per row
+    assert rec["kind"] == er.OWNED_MISS_RANK_KIND and rec["rank"] == 0
+    assert rec["miss_rows"] == 480 and rec["rounds"] == 100
+    assert abs(rec["ms_per_row"] - 240.0 / 480) < 1e-9
+    # counters zeroed: the next phase starts from nothing
+    assert pmc.rank_record(rank=0, group="D", reason="x", model=MODEL) is None
+
+
+def test_off_counts_nothing_and_writes_nothing(monkeypatch):
+    monkeypatch.delenv("SGLANG_WEG2_OWNED_MISS_RECORD", raising=False)
+    pmc._reset_for_test()
+    assert _phase(0, 2.4, 10) is None
+    assert pmc._ACC["rounds"] == 0 and pmc._ACC["miss_rows"] == 0
+
+
+def test_a_phase_without_split_writes_no_record(miss_dir):
+    for _ in range(48):
+        pmc.note_sync(200, 10)
+    assert pmc.flush(rank=1, group="D", reason="sleep", model=MODEL) is None
+    assert not miss_dir.exists() or not any(miss_dir.iterdir())
+
+
+def test_planner_reads_the_rank_records(miss_dir):
+    _phase(0, 2.4, 10)   # host 0.5 ms/row
+    _phase(1, 9.6, 10)   # worker 2.0 ms/row
+    _phase(2, 4.8, 20)   # worker 0.5 ms/row, twice the rows
+    recs = er.read_owned_miss_rank_records(str(miss_dir))
+    ms, tier, src = er.resolve_owned_miss_ms((), rank_records=recs, host=0, model=MODEL)
+    assert tier == er.OWNED_MISS_RECORD and src.startswith("RECORD")
+    # worker = (960 + 480) ms / (480 + 960) rows = 1.0
+    assert ms == pytest.approx((0.5, 1.0))
+
+
+def test_log_bootstrap_ranks_under_every_rank_record(miss_dir):
+    _phase(0, 2.4, 10)
+    _phase(1, 9.6, 10)
+    ranks = er.read_owned_miss_rank_records(str(miss_dir))
+    # a YOUNGER log entry still loses to the ranks' own record
+    log = [_rec((0.05, 0.6), "2099-01-01 00:00:00")]
+    ms, tier, _ = er.resolve_owned_miss_ms(log, rank_records=ranks, host=0, model=MODEL)
+    assert tier == er.OWNED_MISS_RECORD and ms == pytest.approx((0.5, 2.0))
+    # without the ranks the bootstrap stands, named as the transition
+    ms, tier, src = er.resolve_owned_miss_ms(log, rank_records=(), host=0, model=MODEL)
+    assert tier == er.OWNED_MISS_LOG_BOOTSTRAP and src.startswith(er.OWNED_MISS_LOG_PROVENANCE)
+
+
+def test_rank_records_without_a_worker_do_not_count(miss_dir):
+    _phase(0, 2.4, 10)
+    ranks = er.read_owned_miss_rank_records(str(miss_dir))
+    _ms, tier, _ = er.resolve_owned_miss_ms((), rank_records=ranks, host=0, model=MODEL)
+    assert tier == er.OWNED_MISS_UNMEASURED
+
+
+def test_launcher_takes_the_rank_records_from_group_d_env(miss_dir, tmp_path, monkeypatch):
+    from sglang.srt.weg2 import launcher
+
+    _phase(0, 2.4, 10)
+    _phase(1, 9.6, 10)
+    side = tmp_path / "weg2_measured_record.json"
+    side.write_text(json.dumps({"samples": [_rec((0.05, 0.6), "2099-01-01 00:00:00")]}))
+    monkeypatch.setattr(launcher, "measured_record_path", lambda: str(side))
+    ns = types.SimpleNamespace(profile=None, model=MODEL)
+    ms, src = launcher.d_owned_miss_ms(
+        ns, env_d={"SGLANG_WEG2_OWNED_MISS_RECORD": str(miss_dir)}, host=0)
+    assert ms == pytest.approx((0.5, 2.0)) and src.startswith("RECORD")
+
+
+def test_the_round_log_feeds_the_rank_record():
+    """DecodeRoundLog hands every split round's families to the record."""
+    import inspect
+
+    from sglang.srt.managers.scheduler_components import decode_round_log
+
+    assert "_miss_cost.note_round(family_acc)" in inspect.getsource(
+        decode_round_log.DecodeRoundLog._emit)

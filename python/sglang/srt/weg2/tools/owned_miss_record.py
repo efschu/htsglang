@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""#239 S3f Miss-Record: the measured cost of one missed expert row per card.
+"""#239 S3f Miss-Record BOOTSTRAP (transition, "aus Log (Uebergang)").
+
+THE RECORD IS THE RANKS' OWN (``layers.moe.pool_miss_cost``, written at every
+D sleep with ``SGLANG_WEG2_OWNED_MISS_RECORD=<dir>``). This tool reads the same
+two numbers from ONE D log of a boot that had no rank record yet; its entry
+ranks under every rank record (``resolve_owned_miss_ms``) and is dropped as
+soon as one exists. Nothing steers on it once the ranks have measured.
 
     python -m sglang.srt.weg2.tools.owned_miss_record <boot>.D.log [--append]
 
@@ -117,6 +123,7 @@ def owned_miss_from_log(d_text: str, *, n_moe_layers: int, host_rank: int = 0,
         "n_moe_layers": int(n_moe_layers), "host_rank": int(host_rank),
         "method": "sum(pool.fetch ms) / (misses per forward and layer, layers 0/23/47 "
                   "mean) x MoE layers x forwards",
+        "provenance": "aus Log (Uebergang)",
     }
 
 

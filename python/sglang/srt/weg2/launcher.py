@@ -12944,11 +12944,15 @@ def d_activation_record(profile: Optional[str] = None) -> Tuple[Optional[List[Op
     return [None if v is None else float(v) for v in vals], _pconst_boots("D_ACTIVATION_MIB", profile)
 
 
-def d_owned_miss_ms(ns) -> Tuple[Optional[Tuple[float, float]], str]:
+def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
+                    ) -> Tuple[Optional[Tuple[float, float]], str]:
     """#239 S3f Miss-Record (29.09.): the owned solve's cost per missed expert
-    row (host, worker), RECORD (sidecar, ``weg2.tools.owned_miss_record``) >
-    BUILTIN (profile constant ``OWNED_MISS_MS``) > UNMEASURED. ``(None, "")``
-    when nothing is measured -- the solve then keeps its seed, byte-identical."""
+    row (host, worker). RECORD = the D ranks' own records in group D's
+    ``SGLANG_WEG2_OWNED_MISS_RECORD`` directory (``layers.moe.pool_miss_cost``)
+    > LOG-BOOTSTRAP (sidecar entry of ``weg2.tools.owned_miss_record``, "aus
+    Log (Uebergang)", dropped once a rank record exists) > BUILTIN (profile
+    constant ``OWNED_MISS_MS``) > UNMEASURED. ``(None, "")`` when nothing is
+    measured -- the solve then keeps its seed, byte-identical."""
     from sglang.srt.planner import expert_residency as _er
 
     profile = ns.profile
@@ -12957,8 +12961,10 @@ def d_owned_miss_ms(ns) -> Tuple[Optional[Tuple[float, float]], str]:
         builtin_src = _pconst_boots("OWNED_MISS_MS", profile)
     except (KeyError, TypeError):
         builtin, builtin_src = None, ""
+    rank_dir = str(env_d.get("SGLANG_WEG2_OWNED_MISS_RECORD", "") or "").strip() or None
     ms, tier, src = _er.resolve_owned_miss_ms(
         _er.read_owned_miss_records(measured_record_path()),
+        rank_records=_er.read_owned_miss_rank_records(rank_dir), host=int(host),
         model=ns.model, builtin=builtin, builtin_source=builtin_src)
     if tier == _er.OWNED_MISS_UNMEASURED:
         return None, ""
@@ -17385,7 +17391,9 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                           else (None, ""))
     _derive_waves = bool(getattr(ns, "d_pool_waves_derived", False))
     # #239 S3f Miss-Record: measured cost per missed expert row, else the seed
-    _miss_ms, _miss_src = d_owned_miss_ms(ns)
+    _miss_ms, _miss_src = d_owned_miss_ms(
+        ns, env_d=_env_d,
+        host=next((i for i, v in enumerate(tp_ratio) if float(v) > 0), 0))
     if _miss_ms is not None:
         log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN (#239 S3f): "
             f"{_miss_ms[0]:g}/{_miss_ms[1]:g} ms je Zeile (Host/Worker) aus {_miss_src} "

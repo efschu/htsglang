@@ -4793,6 +4793,12 @@ class MoEExpertOffloadCache:
         forwards, misses = take_report(self._pool_tables)
         predicted, fetched, pf_hits, pf_skipped = take_prefetch_report(self._pool_tables)
         lid = getattr(self.layer, "layer_id", None)
+        if forwards:
+            # #239 S3f: every layer's misses into the rank's miss record
+            # (no-op unless SGLANG_WEG2_OWNED_MISS_RECORD)
+            from sglang.srt.layers.moe import pool_miss_cost
+
+            pool_miss_cost.note_sync(forwards, misses)
         if forwards and lid in (0, 23, 47):
             logging.getLogger(__name__).info(
                 "MoE expert pool layer %s: %d decode forwards since last sync, "
