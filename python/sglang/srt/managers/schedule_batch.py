@@ -182,21 +182,15 @@ def _weg2_claim_track(req, tree_cache, prefix_len: int, end: int, chunk: int,
     floor_page(N-2) whenever N % page is 0 or 1, so the read fell back to the
     previous chunk anchor (``#1028B FETCH CAP kv=256 claimed=128``, by=mamba).
     Only on the NF keying (bigram, node units == tokens the state consumed) and
-    a paged tree; a P-trim request keeps its own N-1 geometry."""
-    import os as _os
-
+    a paged tree; a P-trim request keeps its own N-1 geometry. The predicate
+    is ``tail_handoff.claim_anchor_end`` -- the same one the #1481 END-ANCHOR
+    probe marks with (dynpf-Praefix 0929)."""
     from sglang.srt.weg2 import fork_anchor as _fa
     from sglang.srt.weg2 import tail_handoff as _th
-    from sglang.srt.weg2.p_trim_end_anchor import TRIM_ATTR as _TRIM
 
-    if (_os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() != "P" or tree_cache is None:
+    claim = _th.claim_anchor_end(req, tree_cache)
+    if claim is None:
         return None
-    page = int(getattr(tree_cache, "page_size", 1) or 1)
-    if page <= 1 or not getattr(tree_cache, "bigram_anchor_exact", False):
-        return None
-    if getattr(req, _TRIM, None) is not None:
-        return None
-    claim = _th.reader_claim_end(len(req.origin_input_ids), page, True)
     t = _fa.track_target(prefix_len, end, claim, chunk, default_aligned)
     if t is not None:
         n = globals().get("_WEG2_CLAIM_TRACK_N", 0) + 1

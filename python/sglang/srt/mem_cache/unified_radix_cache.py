@@ -5265,6 +5265,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _trim_tail = getattr(req, _P_TRIM_ATTR, None)
         _trim = len(_trim_tail) if _trim_tail is not None else 0
         tokens = len(token_ids) + _trim
+        # CLAIM ANCHOR (dynpf-Praefix 0929): where group P tracks the hand-back
+        # anchor at the store reader's claim (80fa726f31), the probe asks for
+        # THAT depth -- the deepest a reader of this prompt claims -- and the
+        # #1481 mark lands on the anchor the reader actually reaches. Probing
+        # N-1 instead found the claim anchor one page short: ok=False, no mark,
+        # so the reachable anchor lost the un-backed eviction hold, the carrier
+        # hold across P's reset and the arena-victim exemption; and on the
+        # fixed-chunk shape ([0, 16384) + [16384, N)) the mark sat on the N-1
+        # leaf no reader reaches while the chunk anchor at the claim went
+        # unmarked. One predicate with the track (tail_handoff.claim_anchor_end).
+        # Only where the claim lies BELOW the N-1 probe's page floor (N % page
+        # == 1 under the exact key); elsewhere both ask the same units and
+        # nothing changes (N % page == 0 already floors N-1 to the claim).
+        _probe_len = len(token_ids) - 1
+        _claim = None if _trim else tail_handoff.claim_anchor_end(req, self)
+        if _claim is not None and 0 < _claim < tail_handoff.page_floor(_probe_len, self.page_size):
+            _probe_len = int(_claim)
+        else:
+            _claim = None
         try:
             # RadixKey asserts the array('q') type of `token_ids` (boot weg2zr1:
             # a list raised at the probe); slicing keeps the type.
@@ -5281,7 +5300,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # ok=False, no #1481 mark, end_anchor=none on P, W123 on D.
                 # The probe asks with the insert's key form.
                 probe = bigram_anchor_key(
-                    token_ids, len(token_ids) - 1, req.extra_key,
+                    token_ids, _probe_len, req.extra_key,
                     is_bigram=self.is_eagle, exact=self.bigram_anchor_exact,
                     page_size=self.page_size,
                 )
@@ -5317,10 +5336,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             UnifiedRadixCache._weg2_end_anchor_short = getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0) + 1
         logger.warning(
             "WEG2 END-ANCHOR n=%d rid=%s tokens=%d anchor=%d target=%d units=%d/%d ok=%s short=%d"
-            + (" trim=%d" % _trim if _trim else ""),
+            + (" trim=%d" % _trim if _trim else "")
+            # CLAIM ANCHOR: the target is the reader's claim, named as such
+            + (" claim=%d" % _claim if _claim is not None else ""),
             # FORK ANCHOR (weg2/fork_anchor.py): a fork cut's target is the
             # fork (N - trim), not N-1; trim=1 prints N-1 exactly as before.
-            n, str(getattr(req, "rid", "?"))[:12], tokens, anchor, tokens - (_trim or 1),
+            n, str(getattr(req, "rid", "?"))[:12], tokens, anchor,
+            (tokens - _trim) if _trim else _probe_len,
             usable_units, target_units, ok, getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0),
         )
 
