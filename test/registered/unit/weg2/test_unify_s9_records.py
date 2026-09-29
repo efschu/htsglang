@@ -51,7 +51,12 @@ OLD_27B = {
 class TestRecordsAreTheOldLiterals(unittest.TestCase):
     def test_qwen27b_constants_unchanged(self):
         row = F.PROFILES["qwen27b"]
-        self.assertEqual(set(row.constants), set(OLD_27B))
+        # desk/27b-no-reserve-0929: a NEW measurement, not a changed literal --
+        # D's awake rest beyond its budget line (weg2/budget_rest.py)
+        # desk/27b-d-alloc-overhang-0929: two more NEW measurements (the rest's
+        # posts under the P0 torch cache cap, weg2/budget_rest.py --capped)
+        self.assertEqual(set(row.constants) - {"D_AWAKE_REST_BOOKED_MIB", "D_TORCH_CAP_OTHER_MIB",
+                                               "D_AWAKE_REST_CAPPED_MIB"}, set(OLD_27B))
         for n, v in OLD_27B.items():
             got = row.constant(n)
             self.assertEqual(got, v, n)

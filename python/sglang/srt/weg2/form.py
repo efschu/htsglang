@@ -498,6 +498,30 @@ class ModelProfile:
     #: w109290020 (29.09.), qwen27b on since; nextflash off. An explicit env
     #: wins (=0 turns the 27B row off).
     p_row_authority: bool = False
+    #: VRAM-GRUNDGESETZ (user 19.09. / 29.09.: no reserve, only measured
+    #: transients; desk/27b-no-reserve-0929, weg2/budget_rest.py): group D's
+    #: budget books the MEASURED awake rest ``D_AWAKE_REST_BOOKED_MIB`` (max
+    #: over the newest boots of the form) INSTEAD of corridor floor + user
+    #: reserve + awake_overshoot 404 + D_OVERSHOOT_MIB. A card the record does
+    #: not price keeps those terms, named UNMEASURED on its budget line.
+    #: qwen27b on (record of the eight newest row-authority boots); nextflash
+    #: off -- it prices D's awake excess as D_AWAKE_REST_MIB (form-relative,
+    #: rc12c) and its reserve is 0 already. SGLANG_WEG2_BUDGET_REST_RECORD=0
+    #: turns it off (byte-identical budgets).
+    budget_rest_from_records: bool = False
+    #: WEG2-ALLOC-OVERHANG (desk/27b-d-alloc-overhang-0929) on P0 (5f33ec18836a,
+    #: weg2/torch_cache_cap.py): the row's default for SGLANG_WEG2_TORCH_CACHE_CAP
+    #: in --env-d (an explicit --env-d value wins, =0 turns it off). Armed on a
+    #: profile that carries ``D_TORCH_CAP_OTHER_MIB`` and
+    #: ``D_AWAKE_REST_CAPPED_MIB`` (weg2/budget_rest.py --capped), the D budget
+    #: books the CAPPED rest (non-torch + allocation overhang + kept cache)
+    #: instead of ``D_AWAKE_REST_BOOKED_MIB`` -- the general allocator cache
+    #: (897/944/1122 MiB at the tightest instants) stops being a post and goes
+    #: to the KV pool -- and each D rank caps torch at the physical line
+    #: ``budget + rest - OTHER``. qwen27b: OFF until the measurement cell
+    #: (Leistungsschalter rule 29.09.: default AN after the metal proof, in the
+    #: same commit as the proof); nextflash off (its verdict prices the cap).
+    torch_cache_cap: bool = False
     #: 27B row 24h (HG): :data:`HG_SWITCHES` on as ONE bundle -- they were
     #: measured only together: dkr27bint8dhgbar1dhg109261456 against
     #: dkr27bbar1i8h109261444 (rc9dwin bfc6bd87e2), step time better at all 24
@@ -728,6 +752,13 @@ PROFILES: Dict[str, ModelProfile] = {
         # 840, vanish 0; K3 PACED-ADMIT 24. RISK: z30x2 died under it at the
         # P->D flip (write-through drain); its fix 4e15b21564 awaits z30x3.
         p_row_authority=True,
+        # VRAM-GRUNDGESETZ 29.09.: D books its measured awake rest
+        # (D_AWAKE_REST_BOOKED_MIB, 8 boots) instead of reserve + 404 + 489.
+        budget_rest_from_records=True,
+        # WEG2-ALLOC-OVERHANG 29.09.: P0 torch cache cap + capped rest. OFF
+        # until the measurement cell (27b-row-authority-p0, one boot); AN in
+        # the commit that carries its proof.
+        torch_cache_cap=False,
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,
