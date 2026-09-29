@@ -21872,6 +21872,12 @@ def run_scheduler_process(
             dp_rank,
         )
 
+        # VRAM-Vertrag M2: the scheduler (paused tags, the runners' pools) is
+        # what the rank's VRAM actual attributes against from here on; bound
+        # before boot_complete so that mark is the first complete one.
+        from sglang.srt.weg2 import vram_actual as _weg2_vram_actual
+
+        _weg2_vram_actual.bind_scheduler(scheduler)
         # #605: every runner in this process is now up, so this is the first
         # moment a snapshot shows the WHOLE boot -- under speculative decoding
         # the target and the NEXTN draft each capture graphs, and a snapshot
