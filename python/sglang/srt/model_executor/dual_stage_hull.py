@@ -230,13 +230,27 @@ def _union_bind_target(runner) -> Optional[_BindTarget]:
     return _BindTarget(union_dir, card, int(runner.gpu_id))
 
 
+#: Same name as launcher.DUAL_D_READY_FILE (not imported: the launcher module
+#: is heavy and never imported by a rank).
+D_READY_FILE = "d_ready"
+
+
 def _wait_for_owner(t: _BindTarget) -> None:
+    """D's image published AND D READY (the launcher's marker): D sizes its KV
+    off the card's free memory, so P must not load while D is still sizing."""
     from sglang.srt.weg2.union_arena_vmm import fetch_union, socket_path
 
     t0 = time.perf_counter()
     _text, fds = fetch_union(socket_path(t.union_dir, t.card), timeout_s=OWNER_WAIT_S)
     for fd in fds:
         os.close(fd)
+    marker = os.path.join(t.union_dir, D_READY_FILE)
+    while not os.path.exists(marker):
+        if time.perf_counter() - t0 > OWNER_WAIT_S:
+            raise DualShareError(
+                f"DUAL-TP3PP3 P: D's image is up but D did not become READY within "
+                f"{OWNER_WAIT_S:.0f} s (no {marker})")
+        time.sleep(0.5)
     logger.info("DUAL-TP3PP3 P: D's union image on card %s is up after %.1f s -- loading the "
                 "shared part now", t.card[-12:], time.perf_counter() - t0)
 

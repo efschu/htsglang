@@ -13548,6 +13548,11 @@ def resolve_dual_layout(ns) -> None:
         ns.flip_weights = "resident"
 
 
+#: DUAL-TP3PP3 --dual-share: written by the launcher once D is READY; the P
+#: stage waits for it before loading (model_executor/dual_stage_hull.py).
+DUAL_D_READY_FILE = "d_ready"
+
+
 def dual_share_env(ns, group: str) -> Dict[str, str]:
     """DUAL-TP3PP3 --dual-share: the union env of one group. D OWNS the card's
     image (and publishes its installed TP vectors with it), P BINDS the part of
@@ -24929,6 +24934,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         state.argv["D"] = " ".join(shlex.quote(a) for a in _sd.argv)
         launch_group(_sd, tree, log, dry)
         ns._dual_spec_d = _sd
+        if not dry:
+            # D must be READY -- its KV sized, its graphs captured -- before P
+            # loads a byte: D sizes its KV off the card's free memory, and a P
+            # load running alongside would move that reading under it. P
+            # waits for this marker next to D's union socket.
+            state.t_ready["D"] = wait_ready(PORT_D, _sd.pid, ns.ready_deadline_s, log, "D", _sd.proc)
+            _udir = dual_share_env(ns, "D")["SGLANG_WEG2_UNION_DIR"]
+            os.makedirs(_udir, exist_ok=True)
+            with open(os.path.join(_udir, DUAL_D_READY_FILE), "w") as _f:
+                _f.write(f"{time.time():.3f}\n")
+            log(f"WEG2-DUAL-SHARE D READY -> {_udir}/{DUAL_D_READY_FILE}: P may load now")
     if dry:
         _dry_terms: List[Dict[str, object]] = []
         _dry_other, _dry_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)

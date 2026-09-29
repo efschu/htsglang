@@ -118,7 +118,7 @@ class DualLayoutLauncher(CustomTestCase):
     def test_main_launches_d_right_after_p_under_dual_share(self):
         src = inspect.getsource(L.main)
         i = src.index('spec_p.env.update(dual_share_env(ns, "P"))')
-        blk = src[i:i + 1400]
+        blk = src[i:i + 2600]
         self.assertLess(blk.index("launch_group(spec_p"), blk.index("launch_group(_sd"))
         self.assertLess(blk.index("launch_group(_sd"), blk.index("if dry:"))
         self.assertIn('spec_d = getattr(ns, "_dual_spec_d", None)', src)
@@ -135,3 +135,14 @@ class DualLayoutLauncher(CustomTestCase):
             L.dual_p_sm_env(_ns("--dual-layout", "--dual-mps", "on", "--dual-p-sm-pct", "0"))
         src = inspect.getsource(L.main)
         self.assertIn("spec_p.env.update(dual_p_sm_env(ns))", src)
+
+    def test_p_loads_only_after_d_is_ready(self):
+        from sglang.srt.model_executor import dual_stage_hull as H
+
+        self.assertEqual(L.DUAL_D_READY_FILE, H.D_READY_FILE)
+        src = inspect.getsource(L.main)
+        i = src.index("launch_group(_sd, tree, log, dry)")
+        blk = src[i:i + 1400]
+        self.assertLess(blk.index('wait_ready(PORT_D, _sd.pid'), blk.index("DUAL_D_READY_FILE"))
+        self.assertLess(src.index("DUAL_D_READY_FILE), \"w\")"),
+                        src.index('state.t_ready["P"] = wait_ready(PORT_P'))
