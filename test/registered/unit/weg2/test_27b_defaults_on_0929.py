@@ -111,3 +111,66 @@ def test_hg_bundle_default(clean, name, profile, explicit, want):
         clean.setenv(name, explicit)
     assert _hg_readers()[name]() is want
     assert getattr(envs, name).get() is want
+
+
+# ---------------------------------------------------------------------------
+# 3. REGISTRY -> CLI DEFAULT (one mechanism: launcher PROFILE_ARG_DEFAULTS /
+#    apply_profile_arg_defaults, UNIFY S3) and its first best-form field:
+#    --d-replayssm-spec from ModelProfile.replayssm. 27B xsn436: D-KV +21/+13 %,
+#    not slower (user 24.09. ~20:47Z); NF x172/x174 (its own inventory (a)).
+# ---------------------------------------------------------------------------
+
+import argparse  # noqa: E402
+
+
+def _parsed(argv):
+    from sglang.srt.weg2 import launcher as L
+
+    words = ["--tree", "/t", "--tag", "x"] + list(argv)
+    return L.build_parser().parse_args(words), words
+
+
+def _defaults(profile, argv=(), model=None):
+    from sglang.srt.weg2 import launcher as L
+
+    extra = ["--profile", profile] if profile else []
+    if model is not None:
+        extra += ["--model", model]
+    ns, words = _parsed(extra + list(argv))
+    L.apply_profile_arg_defaults(ns, words)
+    return ns
+
+
+def test_replayssm_parser_default_is_the_code_default_off():
+    from sglang.srt.weg2 import launcher as L
+
+    ns, _ = _parsed([])
+    assert ns.d_replayssm_spec == L.D_REPLAYSSM_SPEC_DEFAULT == "off"
+
+
+@pytest.mark.parametrize("profile,argv,want", [
+    ("qwen27b", (), "on"),                                   # row replayssm=True
+    (None, (), "on"),                                        # --profile default = qwen27b
+    ("qwen27b", ("--d-replayssm-spec", "off"), "off"),       # explicit off wins
+    ("qwen27b", ("--d-replayssm-spec=off",), "off"),
+    ("nextflash", ("--d-replayssm-spec", "on"), "on"),       # every NF profile passes on: byte-equal
+    ("nextflash", ("--d-replayssm-spec", "off"), "off"),
+])
+def test_replayssm_cli_default_follows_the_row(profile, argv, want):
+    assert _defaults(profile, argv).d_replayssm_spec == want
+
+
+def test_replayssm_nextflash_row_is_its_measured_form():
+    """nextflash's row says replayssm=True (NF inventory (a): x172/x174 TP0
+    -396 MiB, 257k needle MATCH; every NF profile passes --d-replayssm-spec on),
+    so its CLI default follows the row like the 27B's."""
+    assert FM.PROFILES["nextflash"].replayssm is True
+    assert _defaults("nextflash").d_replayssm_spec == "on"
+
+
+def test_the_one_mechanism_names_every_registry_flag():
+    from sglang.srt.weg2 import launcher as L
+
+    flags = [f for f, _d, _o in L.PROFILE_ARG_DEFAULTS]
+    assert "--d-replayssm-spec" in flags
+    assert len(flags) == len(set(flags))
