@@ -5664,6 +5664,9 @@ class Front:
                     # disagree about the moment they describe.
                     _file = _pr_fast.get("file_gib")
                     _shm = _pr_fast.get("shmem_gib")
+                    # W98 z30w: pool + ceiling from THIS cgroup in the Docker form
+                    # (host /proc/meminfo there); CT999 unchanged.
+                    _free, _free_src, _ceiling = host_ledger.latch_free_pool(_pr_fast)
                     _line = rate_latch.observe(
                         time.time(), float(_nr),
                         # cushion = file - shmem: cgroup-v2 `file` INCLUDES
@@ -5676,7 +5679,9 @@ class Front:
                             else float(_file) - float(_shm)
                         ),
                         shmem_gib=None if _shm is None else float(_shm),
-                        free_gib=_pr_fast.get("memfree_gib"),
+                        free_gib=_free,
+                        ceiling_gib=_ceiling,
+                        free_source=_free_src,
                     )
                     if _line is not None and "RATE-GAP" in _line:
                         # Blindness is a finding, never silence -- but it is not
