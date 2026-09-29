@@ -616,3 +616,20 @@ def test_queued_sibling_that_cannot_reach_inside_shared_is_no_reason(on, clock):
     b = _Req("weg2-6-2", _ids(12000, 900, 2))
     s.local[b.rid] = (0, 0)
     assert _intake(s, b) != tw.VERDICT_DEFERRED
+
+
+def test_note_s0_takes_a_tensor_prefix():
+    """rc12z30i 27B P 00:04:33Z: 'Boolean value of Tensor with more than one
+    value is ambiguous' in _note_s0 -- prefix_indices is a tensor on the metal."""
+    import types
+    import torch
+    from sglang.srt.weg2 import p_twin_defer as tw
+
+    st = tw._State(min_tokens=1, wait_s=1.0, settle_s=0.0, settle_passes=1)
+    r = types.SimpleNamespace(rid="weg2-1-1", prefix_indices=torch.arange(5))
+    sched = types.SimpleNamespace(waiting_queue=[])
+    tw._note_s0(st, sched, [r])
+    assert st.s0["weg2-1-1"] == 5
+    r2 = types.SimpleNamespace(rid="weg2-1-2", prefix_indices=None)
+    tw._note_s0(st, sched, [r2])
+    assert st.s0["weg2-1-2"] == 0

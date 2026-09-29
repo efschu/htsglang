@@ -327,8 +327,11 @@ def _note_s0(st: "_State", scheduler, cur: List[Any]) -> None:
             continue
         rid = _rid(r)
         if rid and rid not in st.s0 and len(st.s0) < _FLAG_CAP:
+            # prefix_indices is a torch tensor on the metal: never its truth
+            # value (rc12z30i 27B P 00:04:33Z died on `tensor or ()`)
+            _pi = getattr(r, "prefix_indices", None)
             try:
-                st.s0[rid] = len(getattr(r, "prefix_indices", None) or ())
+                st.s0[rid] = 0 if _pi is None else len(_pi)
             except TypeError:
                 pass
     if len(st.s0) > len(cur) + len(st.recent):
