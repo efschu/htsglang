@@ -6,12 +6,39 @@
 # /opt/rigdash/releases/<sha> (rigdash) and /opt/rigdash/planner/releases/<tree>
 # (python/sglang, keyed by its tree hash so an unchanged planner is not
 # re-extracted), `current` is switched atomically, the units are restarted.
-# Rolling back = install.sh <older-sha>.
+# Rolling back = RIGDASH_DEPLOY_ROLLBACK=1 install.sh <older-sha>.
+#
+# DEPLOY-LINIE (Order 29.09., DASHBOARD-AUS-IPC): desk/dashboard-ipc-0929 ist DIE Linie des
+# rigdash.  Wer deployt, setzt darauf auf oder übernimmt sie ff.  Das Deploy verweigert
+#   (1) eine Revision, die kein Nachfahre der Linienspitze (origin) ist, und
+#   (2) eine Revision, die kein Nachfahre des laufenden Releases ist (sonst fiele gelieferte
+#       Arbeit still heraus -- so wäre Stufe 1 beim nächsten Deploy der alten Linie verloren),
+# außer mit RIGDASH_DEPLOY_ROLLBACK=1 (bewusster Rückschritt, Grund im Commit/Entscheidungslog).
+# Nur prüfen, nichts ändern: install.sh --check [<git-rev>]
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-repo=$(git -C "$here" rev-parse --show-toplevel)
+repo=${RIGDASH_REPO:-$(git -C "$here" rev-parse --show-toplevel)}
+check_only=0
+if [ "${1:-}" = "--check" ]; then check_only=1; shift; fi
 rev=${1:-HEAD}
 sha=$(git -C "$repo" rev-parse --short=10 "$rev")
+LINE=${RIGDASH_DEPLOY_LINE:-desk/dashboard-ipc-0929}
+git -C "$repo" fetch -q origin "$LINE" 2>/dev/null || true
+line_tip=$(git -C "$repo" rev-parse -q --verify "origin/$LINE^{commit}" || git -C "$repo" rev-parse -q --verify "$LINE^{commit}") || {
+  echo "REFUSED: Deploy-Linie $LINE nicht auflösbar (weder origin/$LINE noch lokal)" >&2; exit 3; }
+if ! git -C "$repo" merge-base --is-ancestor "$line_tip" "$sha"; then
+  echo "REFUSED: $sha ist kein Nachfahre der Deploy-Linie $LINE (${line_tip:0:10}) -- auf $LINE aufsetzen oder ff übernehmen" >&2
+  exit 3
+fi
+cur=$(basename "$(readlink /opt/rigdash/current 2>/dev/null || true)")
+if [ -n "$cur" ] && [ "${RIGDASH_DEPLOY_ROLLBACK:-0}" != 1 ] \
+   && git -C "$repo" cat-file -e "$cur^{commit}" 2>/dev/null \
+   && ! git -C "$repo" merge-base --is-ancestor "$cur" "$sha"; then
+  echo "REFUSED: $sha enthält das laufende Release $cur nicht -- dessen Commits fielen heraus (RIGDASH_DEPLOY_ROLLBACK=1 für einen bewussten Rückschritt)" >&2
+  exit 3
+fi
+echo "deploy-linie ok: $sha enthält $LINE@${line_tip:0:10} und das laufende Release ${cur:-(keins)}"
+if [ "$check_only" = 1 ]; then exit 0; fi
 mkdir -p /opt/rigdash/releases /opt/rigdash/planner/releases
 
 # --- rigdash --------------------------------------------------------------

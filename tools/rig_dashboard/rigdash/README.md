@@ -25,6 +25,18 @@ Gilt für NF und 27B.
 `events.jsonl`, sobald die Front Flip- und Pass-Ereignisse (FLIP done, erster Decode, POST-WAKE-PASS,
 Forward-Start/-Ende je Rang) dort schreibt; dann entfallen FWD-/FLUSH-/ANON-Paarung und Log-Scan.
 
+## Deploy-Linie (Order 29.09.): `desk/dashboard-ipc-0929`
+
+Deployt wird der rigdash nur aus der Linie `desk/dashboard-ipc-0929`. Wer ihn ändert (Features-Sitz, Dashboard-Sitz, 27B), setzt darauf auf oder übernimmt die Linie ff und pusht dorthin.
+
+`deploy/install.sh` verweigert mit rc 3, wenn eine der beiden Bedingungen nicht erfüllt ist:
+1. Die Revision ist ein Nachfahre der Linienspitze auf origin.
+2. Die Revision enthält das laufende Release (`/opt/rigdash/current`).
+
+Ein bewusster Rückschritt geht nur mit `RIGDASH_DEPLOY_ROLLBACK=1`, der Grund gehört ins Entscheidungslog. Nur prüfen, ohne etwas zu ändern: `deploy/install.sh --check <rev>`. `RIGDASH_REPO=<worktree>` wählt das Repo, wenn das Skript außerhalb eines Checkouts liegt.
+
+Anlass: Der Features-Sitz deployte von `desk/dashboard-features-0929`. Ein Deploy von dort hätte Stufe 1 von DASHBOARD-AUS-IPC still wieder entfernt.
+
 ## Aus IPC, nicht aus Logs (Nutzer 29.09. über 27B)
 
 Die Order lautet: „das dashboard soll auch aus der inter prozess kommunikation gespeist werden, nicht aus logs“. Das Inventar mit jeder Kachel, ihrer Quelle heute, der IPC-Quelle und dem Stand liegt in `/spinning/gpu-arb/docs/DASHBOARD-AUS-IPC-INVENTAR-0929.md`.
