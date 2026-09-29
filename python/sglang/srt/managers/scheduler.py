@@ -20257,6 +20257,17 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
+        # ARRIVAL-SEAT (weg2/arrival_seat_rule.py): D's free KV for the front's
+        # seat verdict -- the allocator's free rows plus what the tree could
+        # evict. A reading only; nothing decides here.
+        try:
+            ret["weg2_kv"] = {
+                "available": int(self.token_to_kv_pool_allocator.available_size()),
+                "evictable": int(self.tree_cache.evictable_size()),
+                "capacity": int(self.max_total_num_tokens),
+            }
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the info route
+            pass
         # #287: the effective figure is the limiter's floating value. Without
         # a ceiling the limiter holds max_running_requests, so this key keeps
         # reporting exactly what it reported before.

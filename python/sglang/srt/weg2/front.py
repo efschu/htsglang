@@ -100,6 +100,7 @@ from sglang.srt.weg2 import idle_clock as _idle_clock_mod  # #55 F2: idle clock 
 from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
 from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
 from sglang.srt.weg2 import phase_policy  # H91 part C
+from sglang.srt.weg2 import arrival_seat_rule as _asr  # ARRIVAL-SEAT (user 29.09.)
 from sglang.srt.weg2 import p_read_overlap as _ro  # RO: P computes while a store read runs
 from sglang.srt.weg2 import resume_via_p as _rvp  # RESUME-VIA-P
 from sglang.srt.weg2 import handoff_seam as _hs  # #243 seam: HANDOFF-LOST reroute + rid-end drop
@@ -6340,6 +6341,9 @@ class Front:
         w = self.__dict__.get("_ipc_writer")
         out["ipc"] = {"queue": w.depth() if w else 0, "max": w.maxlen if w else None,
                       "dropped": w.dropped if w else 0, "failed": w.failed if w else 0}
+        if _asr.enabled():
+            # ARRIVAL-SEAT: the rule's verdict counters (state.json front.arrival_seat)
+            out["arrival_seat"] = _asr.state_block(self.counters, self._asr_st()["waiters"], True)
         return out
 
     def _ipc_group_health_observe(self, g) -> None:
@@ -7105,7 +7109,10 @@ class Front:
             # UNIFY S7 (27B Review V (3)): D's load at the grant, read BEFORE
             # the seat is taken (the seat itself is not work).
             _x_busy_at_grant = self._d_holds_work()
-            seat = await self._acquire_short_seat(rid, est_prompt, short_refused)
+            seat = await (self._acquire_short_seat(rid, est_prompt, short_refused,
+                                                   max_tokens=_asr.max_tokens_of(payload))
+                          if _asr.enabled()  # ARRIVAL-SEAT: the KV need's decode part
+                          else self._acquire_short_seat(rid, est_prompt, short_refused))
             if seat is not None:
                 if self.x_split:
                     self._note_x_grant(
@@ -7429,7 +7436,8 @@ class Front:
         return "moved"
 
     async def _acquire_short_seat(self, rid: str, est_tokens: int = 0,
-                                  refused: Optional[List[str]] = None) -> Optional[Seat]:
+                                  refused: Optional[List[str]] = None,
+                                  max_tokens: Optional[int] = None) -> Optional[Seat]:
         """A SHORT arrival's seat -- behind the BATCH gate (C5/R-16).
 
         Returns ``None`` when the request must fall through to route BATCH:
@@ -7451,7 +7459,13 @@ class Front:
             return None
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):
             return None
-        if self._d_phase_seats_full(rid):
+        if _asr.enabled():
+            # ARRIVAL-SEAT (b): no seat free or D's KV short -> wait for the
+            # next free seat in arrival order, never the P detour (H91c3-3's
+            # SEATS-FULL -> BATCH is off with the rule).
+            if not await self._arrival_seat_wait(rid, est_tokens, max_tokens):
+                return None
+        elif self._d_phase_seats_full(rid):
             # H91c3-3: D's seat cap n is full -- fall through to route BATCH
             # (the P queue, where the wait bound sees it), the return
             # contract this method already has.
@@ -7466,10 +7480,190 @@ class Front:
             return None
         await self._d_seat.acquire()
         if (not (self.awake == "D" and self.admit_d and self.state == "serving")
-                or self._d_phase_seats_full(rid, own_seat=True)):
+                or (not _asr.enabled() and self._d_phase_seats_full(rid, own_seat=True))):
             self._d_seat.release()
             return None
         return Seat(self, rid, "short", tokens=est_tokens)
+
+    # ------------------------------------------------------------------ ARRIVAL-SEAT
+    # User rule 29.09. ~19:40Z (weg2/arrival_seat_rule.py): D's decode seats stay
+    # filled in parallel. One decision site while D is awake: a free seat whose KV
+    # fits takes the arrival NOW (D prefill <= X at the next round boundary, else
+    # the immediate flip); no seat -> no flip, the arrival waits for the next seat
+    # in arrival order; the wait bound parks the youngest running decode. Off:
+    # none of the methods below is called.
+
+    def _asr_st(self) -> dict:
+        return self.__dict__.setdefault("_asr_state", {
+            "waiters": {}, "parked": {}, "granted": {}, "kv": None, "park_t": 0.0, "park_cooldown": 0.0,
+            "flip_rid": None, "wait_rid": None,
+        })
+
+    def _arrival_seat_taken(self) -> Tuple[int, int]:
+        """(taken, n): the D seats this phase owes -- D's running ledger (minus
+        the youngest-parked and the wait-bound-parked), the hand-offs in flight
+        and the prefilled requests still waiting for a front seat -- against the
+        phase's seat count (H95c ``_d_phase_n``, else ``--d-bs``)."""
+        n = getattr(self, "_d_phase_n", None) or self.d_bs
+        D = self.groups["D"]
+        st = self._asr_st()
+        parked, granted = st["parked"], st["granted"]
+        ready = [p for p in self._ready_for_d if getattr(p, "fut", None) is None or not p.fut.done()]
+        running = [r for r in self._flip_ledger(D) if r not in parked]
+        # a grant between this rule's verdict and its Seat (the caller still
+        # awaits the store-budget reading) holds its seat already: no second
+        # waiter may take it in that window. Settled once the rid runs or holds
+        # a Seat (then the hand-off term counts it); a lost grant lapses at 10 s.
+        now = time.time()
+        seat_rids = {s.rid for s in (getattr(self, "_d_seats_live", ()) or ())}
+        for r in [r for r, t in granted.items() if r in D.outstanding or r in seat_rids or now - t > 10.0]:
+            granted.pop(r, None)
+        return (len(running) + max(0, self._handoff_in_flight()) + len(ready) + len(granted), int(n))
+
+    async def _arrival_seat_kv_reading(self) -> Optional[Dict[str, Any]]:
+        """D's free KV (``/server_info`` internal_states[0].weg2_kv), at most 1 s
+        old; None when D does not publish it (the seat plan alone decides)."""
+        st = self._asr_st()
+        now = time.time()
+        cached = st.get("kv")
+        if cached is not None and now - cached[0] <= 1.0:
+            return cached[1]
+        got = None
+        try:
+            async with self.session.get(f"{self.groups['D'].url}/server_info",
+                                        timeout=ClientTimeout(total=2.0)) as resp:
+                if resp.status == 200:
+                    body = await resp.json()
+                    for s in (body.get("internal_states") or []):
+                        got = s.get("weg2_kv") or got
+                        if got:
+                            break
+        except Exception:  # noqa: BLE001 -- no reading: the seat count decides
+            got = None
+        st["kv"] = (now, got)
+        return got
+
+    async def _arrival_seat_fits(self, est_prompt: int, max_tokens: Optional[int]) -> Tuple[bool, str]:
+        need = _asr.kv_need(est_prompt, _asr.decode_reserve(max_tokens, _asr.default_reserve()))
+        return _asr.kv_fits(need, await self._arrival_seat_kv_reading())
+
+    async def _arrival_seat_wait(self, rid: str, est_tokens: int, max_tokens: Optional[int]) -> bool:
+        """ARRIVAL-SEAT (a)/(b) for an arrival D prefills itself (uncached <= X):
+        True as soon as a seat is free, its KV need fits and it is the OLDEST
+        seat waiter (arrival order, #244/#246); until then it waits here -- no P
+        detour, no flip request. False when the phase changed under the wait
+        (D asleep or admission closed by a flip): the caller routes BATCH, which
+        the flip being taken anyway serves."""
+        st = self._asr_st()
+        waiters = st["waiters"]
+        waiters[rid] = time.time()
+        told = None
+        try:
+            while True:
+                if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+                    return False
+                head = min(waiters.items(), key=lambda kv: kv[1])[0]
+                taken, n = self._arrival_seat_taken()
+                free = _asr.seat_free(taken, n)
+                fits, why = await self._arrival_seat_fits(est_tokens, max_tokens) if free else (True, "no seat")
+                if free and fits and head == rid:
+                    st["granted"][rid] = time.time()
+                    self.counters["arrival_seat_d_prefill"] += 1
+                    logger.info("%s rid=%s verdict=%s taken=%d n=%d %s waited_s=%.2f (D prefills it at its "
+                                "next round boundary)", _asr.MARKER, rid, _asr.D_PREFILL, taken, n, why,
+                                time.time() - waiters[rid])
+                    return True
+                why_wait = "kv" if (free and not fits) else ("order" if free else "seat")
+                if told is None:
+                    told = why_wait
+                    self.counters["arrival_seat_wait_kv" if why_wait == "kv" else "arrival_seat_wait_seat"] += 1
+                    logger.info("%s rid=%s verdict=%s why=%s taken=%d n=%d %s (no flip, no P detour: it takes "
+                                "the next free seat in arrival order)", _asr.MARKER, rid, _asr.WAIT_SEAT,
+                                why_wait, taken, n, why)
+                await asyncio.sleep(0.05)
+        finally:
+            waiters.pop(rid, None)
+
+    async def _arrival_seat_step(self, D: "Group", now: float) -> Tuple[bool, bool, Optional["Pending"]]:
+        """ARRIVAL-SEAT, the controller's D-phase decision: ``(wait_fired,
+        fairness_fired, immediate)`` for the code below it. (c) first: the oldest
+        waiter (queue for P + seat waiters) past the bound parks the youngest
+        running decode -- never a flip. Then the queue head that needs P: a free
+        seat whose KV fits flips NOW (``immediate``, the running decodes park at
+        the round boundary); otherwise nothing flips."""
+        st = self._asr_st()
+        for r in [r for r in st["parked"] if r not in D.outstanding]:
+            st["parked"].pop(r, None)
+        bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
+        live_q = [p for p in self.queue if not p.fut.done()]
+        wait_s = _asr.oldest_wait_s([p.t_arrive for p in live_q] + list(st["waiters"].values()),
+                                    self.t_awake, now)
+        if _asr.bound_fired(wait_s, bound):
+            await self._arrival_seat_park_youngest(D, wait_s, bound, now)
+        x_tok = int(self.tp_prefill_max_tokens)
+        p = phase_policy.immediate_park_trigger(live_q, x_tok) if live_q else None
+        if p is None:
+            return False, not self.admit_d, None
+        taken, n = self._arrival_seat_taken()
+        free = _asr.seat_free(taken, n)
+        if free:
+            fits, why = await self._arrival_seat_fits(int(getattr(p, "est_prompt", 0) or 0),
+                                                      _asr.max_tokens_of(getattr(p, "payload", None)))
+        else:
+            fits, why = False, "no seat"
+        v = _asr.verdict(free, fits, int(getattr(p, "est_uncached", 0) or 0), x_tok)
+        if v == _asr.FLIP_NOW:
+            if st["flip_rid"] != p.rid:
+                st["flip_rid"] = p.rid
+                self.counters["arrival_seat_flip_now"] += 1
+                logger.warning("%s rid=%s verdict=%s uncached=%d X=%d taken=%d n=%d %s -- D pauses its decodes "
+                               "at the round boundary and flips to P now (no collect window)", _asr.MARKER,
+                               p.rid, v, int(getattr(p, "est_uncached", 0) or 0), x_tok, taken, n, why)
+            return True, True, p
+        if st["wait_rid"] != p.rid:
+            st["wait_rid"] = p.rid
+            self.counters["arrival_seat_wait_kv" if (free and not fits) else "arrival_seat_wait_seat"] += 1
+            logger.info("%s rid=%s verdict=%s uncached=%d X=%d taken=%d n=%d %s -- no flip: it waits for the "
+                        "next free seat in arrival order", _asr.MARKER, p.rid, v,
+                        int(getattr(p, "est_uncached", 0) or 0), x_tok, taken, n, why)
+        return False, not self.admit_d, None
+
+    async def _arrival_seat_park_youngest(self, D: "Group", wait_s: float, bound: float,
+                                          now: float) -> Optional[str]:
+        """ARRIVAL-SEAT (c): park the YOUNGEST running decode (last admitted to a
+        D seat) at its round boundary on D -- one per bound interval; its front
+        seat is released so the oldest waiter takes it. Returns the parked rid."""
+        st = self._asr_st()
+        if now - float(st["park_t"]) < float(st["park_cooldown"]):
+            return None
+        running = [r for r in self._flip_ledger(D) if r not in st["parked"]]
+        victim = _asr.youngest_running(getattr(self, "_d_admit_t", None) or {}, running)
+        if victim is None:
+            return None
+        body = dict(phase_policy.park_body(self.epoch, bound, reason=_asr.REASON_YOUNGEST))
+        body["youngest"] = victim
+        try:
+            code, text = await self.rpc(D, phase_policy.PARK_PATH, body, phase_policy.PARK_TIMEOUT_S)
+        except Exception as e:  # noqa: BLE001 -- a failed park is retried, never kills the phase
+            code, text = 0, f"{type(e).__name__}: {e}"
+        verdict, rids, why = phase_policy.park_verdict(code, text)
+        st["park_t"] = now
+        if verdict == phase_policy.PARK_PARKED and victim in rids:
+            st["parked"][victim] = now
+            st["park_cooldown"] = float(bound)
+            self.counters["arrival_seat_youngest_park"] += 1
+            for s in list(getattr(self, "_d_seats_live", ()) or ()):
+                if s.rid == victim:
+                    s.release("arrival-seat-youngest-park")
+            logger.warning("%s YOUNGEST-PARK rid=%s oldest_wait_s=%.1f bound_s=%.1f running=%d -- the youngest "
+                           "decode pauses at its round boundary; its seat goes to the oldest waiter (#246)",
+                           _asr.MARKER, victim, float(wait_s or 0.0), float(bound), len(running))
+            return victim
+        st["park_cooldown"] = 0.5
+        self.counters["arrival_seat_youngest_park_refused"] += 1
+        logger.info("%s YOUNGEST-PARK refused rid=%s verdict=%s status=%s %s -- asked again next tick",
+                    _asr.MARKER, victim, verdict, code, why or (text or "")[:160])
+        return None
 
     def _d_phase_seats_full(self, rid: str, own_seat: bool = False) -> bool:
         """H91c3-3: are the D phase's n seats (H95, ``d_seats.phase_seats`` of
@@ -11196,6 +11390,10 @@ class Front:
                             (p.t_arrive for p in self.queue), self.t_awake, time.time())
                         wait_fired = phase_policy.wait_bound_fired(wait_s, self.d_wait_bound_s)
                         fairness_fired = wait_fired or not self.admit_d
+                    elif _asr.enabled():
+                        # ARRIVAL-SEAT (b): the fairness switch pre-empts no D
+                        # phase; the rule's own bound (c) replaces it below.
+                        fairness_fired = not self.admit_d
                     else:
                         fairness_fired = self._fairness_switch(oldest, "batch")
                     # 27B PARK (user 26.09.): "Wartegrenze 0" -- a queued request
@@ -11203,7 +11401,12 @@ class Front:
                     # dwell and the fairness floor aside); it pre-empts like the
                     # fairness bound. Off (the class default): nothing changes.
                     immediate: Optional[Pending] = None
-                    if self.d_park_immediate and not wait_fired and self.queue:
+                    if _asr.enabled():
+                        # ARRIVAL-SEAT: the one decision site while D is awake.
+                        # The collect window and the window gate are never
+                        # consulted (inert); X-COST-LINE only supplies X.
+                        wait_fired, fairness_fired, immediate = await self._arrival_seat_step(D, _now)
+                    elif self.d_park_immediate and not wait_fired and self.queue:
                         immediate = self._immediate_park_due(D, _now)
                         if immediate is not None:
                             wait_fired = fairness_fired = True

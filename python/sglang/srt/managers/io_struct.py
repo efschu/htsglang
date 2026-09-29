@@ -1641,6 +1641,10 @@ class Weg2ParkRunningReqInput(BaseReq, kw_only=True):
 
     epoch: int = 0
     reason: str = ""
+    #: ARRIVAL-SEAT (c): park ONLY this rid (the front's youngest running
+    #: decode) at the round boundary, in the SEAT-AGE pressure shape; empty =
+    #: park every running request (H91b).
+    youngest: str = ""
 
 
 class Weg2ParkRunningReqOutput(BaseReq, kw_only=True):

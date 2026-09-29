@@ -3372,6 +3372,17 @@ class Envs:
     # one decision site. Front-side switch, model-neutral; off = nothing sent,
     # D's admission byte for byte. Off until the first boot series, then on.
     SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE = EnvBool(False)
+    # ARRIVAL-SEAT (user 29.09. ~19:40Z, weg2/arrival_seat_rule.py): while D
+    # decodes, an arrival that finds a free D seat and fits D's free KV is
+    # prefilled at once -- on D (uncached <= X) or by an immediate flip to P
+    # (no collect window); without a seat nothing flips and it waits for the
+    # next seat in arrival order; the wait bound parks the youngest decode.
+    # With it on, PARK-COLLECT-WINDOW and PARK-WINDOW-GATE are inert. Front-
+    # side, model-neutral. Off until the first series, then on.
+    SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE = EnvBool(False)
+    # ARRIVAL-SEAT: the decode part of an arrival's KV need when the client
+    # set no max_tokens (prompt + this = the need checked against D's free KV).
+    SGLANG_WEG2_ARRIVAL_DECODE_RESERVE_TOKENS = EnvInt(2048)
     # X-COST-LINE (29.09., third part of the ski-rental decision; NF z30w
     # 09290827 and 27B 09290020 both ran with `X NO-SOLVE: no r_d` because the
     # solo r_D probe never fired under load). X is re-solved from D's measured

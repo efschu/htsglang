@@ -115,6 +115,8 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
 
     epoch = int(getattr(recv_req, "epoch", 0) or 0)
     reason = str(getattr(recv_req, "reason", "") or "")
+    if str(getattr(recv_req, "youngest", "") or ""):
+        return park_youngest(sched, recv_req)
     if not d_seats.d_flip_park_active():
         return Weg2ParkRunningReqOutput(
             success=False, parked=[], epoch=epoch,
@@ -552,16 +554,7 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
                         "decoding only the back of the batch may leave; the youngest is not the back",
                         older[:16], victim_rid[:16], n)
         return None
-    snap = sched._weg2_d_park_draft_snapshot(running_batch) if hasattr(
-        sched, "_weg2_d_park_draft_snapshot") else None
-    victim = reqs[idx]
-    running_batch.release_req(idx, len(reqs) - 1, sched.server_args, retain=True)
-    running_batch.filter_batch(keep_indices=[i for i in range(len(reqs)) if i != idx])
-    if snap is not None and hasattr(sched, "_weg2_d_park_draft_save"):
-        sched._weg2_d_park_draft_save([victim], snap)
-    sched._add_request_to_queue(victim, is_retracted=True)
-    d_seats.mark_parked(victim, d_seats.SITE_PRESSURE, now=time.monotonic())
-    sched.waiting_queue = [q for q in sched.waiting_queue if q is not victim] + [victim]
+    victim = _displace_at(sched, running_batch, reqs, idx)
     sched._weg2_sa_displaced = getattr(sched, "_weg2_sa_displaced", 0) + 1
     # H106b (rc12z22-dwell30 D 15:51:41, weg2-6-33): this runs AFTER the pass's
     # #580 prefetch drain, so the victim joins a queue the drain never saw.
@@ -575,6 +568,79 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
                    "the device only as far as the older one needs it -- LRU eviction, tail last)",
                    victim_rid[:16], older[:16], trigger, len(reqs), cap, pages_out)
     return victim_rid
+
+
+
+def _displace_at(sched, running_batch, reqs, idx):
+    """Park ``reqs[idx]`` WHOLE at this round boundary: retract it retaining its
+    span (KV, the node's GDN anchor, the draft rows), re-queue it as a pressure
+    park at the back (it resumes when it is the oldest live request and a seat
+    is free). The one retraction shape of SA (3) and ARRIVAL-SEAT (c)."""
+    snap = sched._weg2_d_park_draft_snapshot(running_batch) if hasattr(
+        sched, "_weg2_d_park_draft_snapshot") else None
+    victim = reqs[idx]
+    running_batch.release_req(idx, len(reqs) - 1, sched.server_args, retain=True)
+    running_batch.filter_batch(keep_indices=[i for i in range(len(reqs)) if i != idx])
+    if snap is not None and hasattr(sched, "_weg2_d_park_draft_save"):
+        sched._weg2_d_park_draft_save([victim], snap)
+    sched._add_request_to_queue(victim, is_retracted=True)
+    d_seats.mark_parked(victim, d_seats.SITE_PRESSURE, now=time.monotonic())
+    sched.waiting_queue = [q for q in sched.waiting_queue if q is not victim] + [victim]
+    return victim
+
+
+def park_youngest(sched, recv_req):
+    """ARRIVAL-SEAT (c) (weg2/arrival_seat_rule.py; user rule #246 "Ältester rückt
+    nach und verdrängt Jüngere"): the front's oldest waiter passed the wait bound,
+    so ONE running request -- the front's youngest, named in ``youngest`` -- is
+    parked at this round boundary in SA (3)'s pressure shape; the seat it frees
+    is the arrival rule's to fill (D prefill or the flip). Replicated inputs
+    (the running set, the named rid), so every rank parks alike. Under
+    speculative decoding only the back of the batch may leave: otherwise it is
+    refused by name and the front asks again on its next tick. Nothing else is
+    touched -- no sleep follows, the batch keeps decoding."""
+    from sglang.srt.managers.io_struct import Weg2ParkRunningReqOutput
+
+    epoch = int(getattr(recv_req, "epoch", 0) or 0)
+    rid = str(getattr(recv_req, "youngest", "") or "")
+
+    def _out(ok, parked, msg):
+        return Weg2ParkRunningReqOutput(success=ok, parked=list(parked), epoch=epoch, message=msg)
+
+    if not d_seats.d_flip_park_active():
+        return _out(False, [], "W-PARK refused: not group D -- nothing parked")
+    if getattr(sched, "weg2_dormant", False):
+        return _out(False, [], "group D is dormant: nothing runs, nothing parked")
+    # the in-flight result lands first (park_running's shape)
+    if sched.enable_overlap and sched.last_batch and sched.result_queue:
+        tmp_batch, tmp_result = sched.result_queue.popleft()
+        sched.process_batch_result(tmp_batch, tmp_result)
+    last = sched.last_batch
+    if last and last.forward_mode.is_extend():
+        last.filter_batch(chunked_req_to_exclude=[])
+        if not last.is_empty():
+            if sched.running_batch.is_empty():
+                sched.running_batch = last
+            else:
+                sched.running_batch.merge_batch(last)
+    sched.last_batch = None
+    running_batch = sched.running_batch
+    reqs = list(getattr(running_batch, "reqs", None) or [])
+    idx = next((i for i, r in enumerate(reqs) if str(r.rid) == rid), None)
+    if idx is None:
+        return _out(True, [], f"{rid} is not running here (finished or not admitted): nothing parked")
+    spec = not (getattr(running_batch, "spec_algorithm", None) is None
+                or running_batch.spec_algorithm.is_none())
+    if spec and idx != len(reqs) - 1:
+        return _out(False, [], f"{rid} is not the back of the batch under speculative decoding: "
+                               "refused, the front asks again")
+    _displace_at(sched, running_batch, reqs, idx)
+    n = getattr(sched, "_weg2_asr_parked", 0) + 1
+    sched._weg2_asr_parked = n
+    logger.warning("WEG2 ARRIVAL-SEAT YOUNGEST-PARK rid=%s running_before=%d n=%d: the youngest running "
+                   "decode pauses at this round boundary (span retained, pressure park); its seat goes "
+                   "to the oldest waiter (user rule #246)", rid[:16], len(reqs), n)
+    return _out(True, [rid], "parked (arrival-seat youngest)")
 
 
 def exclude_displaced(sched, prefetch_verdicts) -> Optional[str]:
