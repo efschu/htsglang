@@ -222,6 +222,39 @@ def park_spec(rid: str, ids: Sequence[int], extra_key: Optional[str], window_fro
     return TailSpec(rid=str(rid), n_tokens=n, page_prefix=prefix, cut=cut, key=tail_key(ids, cut, extra_key))
 
 
+def park_window_from(cut: int, page_size: int, window_tokens: int, anchor: Optional[int] = None,
+                     max_rows: int = 0) -> Tuple[int, str]:
+    """F4 PARK-ANCHOR (0929): where the park's row window starts, and why.
+
+    The default is ``window_tokens`` (two mamba track intervals) below the
+    cut's page -- the resume of a request that DECODED re-enters at its last
+    decode track point, at most one interval below the end. A request D
+    prefilled DIRECTLY re-enters at the anchor its EXTEND tracked (the fork /
+    turn anchor at the extend's start, y3p ep6 weg2-4-8: extend 2304 -> 4445
+    tracked 2368), a whole D-direct extend below the end: the default window
+    [3904, 4444) missed it, the resume logged
+    ``adopt=skipped:prefix:2368!in[3904,4444)`` and D computed the 2077 tokens
+    again (3.9 s behind the wake). ``anchor`` (the group-uniform depth the
+    retaining retraction leaves, ``d_park_runtime._park_anchors``) widens the
+    window down to that anchor's page, so the resume's prefix lies inside it.
+    Never narrower than the default. ``max_rows`` > 0 (D's X, the largest
+    extend D computes directly) bounds the widening: an anchor lag beyond one
+    D-direct extend plus the default window is no D-direct park, the window
+    stays the default (``capped``) and the resume extends as before.
+
+    Returns (window_from, 'default' | 'anchor' | 'capped')."""
+    page = max(1, int(page_size or 1))
+    default = max(0, page_floor(cut, page) - page_floor(int(window_tokens), page))
+    if anchor is None or int(anchor) < 0:
+        return default, "default"
+    at = page_floor(int(anchor), page)
+    if at >= default:
+        return default, "default"
+    if int(max_rows) > 0 and int(cut) - at > int(max_rows) + (int(cut) - default):
+        return default, "capped"
+    return at, "anchor"
+
+
 def tail_key(ids: Sequence[int], cut: int, extra_key: Optional[str]) -> str:
     """Token-exact key of the prefix [0, cut) (+ extra key)."""
     h = hashlib.sha256()
@@ -1151,13 +1184,15 @@ def park_end_refusal(req, owner=None, page_size: int = 0) -> str:
 
 
 def publish_park_end(req, req_to_token_pool, allocator, page_size: int, part: str, n_parts: int,
-                     window_tokens: int) -> Tuple[str, object]:
+                     window_tokens: int, anchor: Optional[int] = None,
+                     max_rows: int = 0) -> Tuple[str, object]:
     """F4 (#259 4c), D's park_running, BEFORE the retaining retraction frees
     the request's slots: gather this rank's END state of a running request --
     the KV (+ complete QSA groups) rows from ``floor_page(cut) - window`` to the
-    last consumed token, the open group's ring rows, the GDN/PLE slot (state
-    after every consumed token) -- on the current stream, and write it as an
-    END-only part of the rid from a background thread (P's hand-off format and
+    last consumed token (or from the resume ``anchor``'s page when that lies
+    deeper, :func:`park_window_from`, PARK-ANCHOR), the open group's ring
+    rows, the GDN/PLE slot (state after every consumed token) -- on the
+    current stream, and write it as an END-only part of the rid from a background thread (P's hand-off format and
     directory). The resume is then E2's skip: no tail extend. Only the layers
     this rank HOLDS are written (a Form-A expert worker writes an empty part,
     so the manifest completes). Never raises; returns ('' or the refusal, the
@@ -1177,7 +1212,7 @@ def publish_park_end(req, req_to_token_pool, allocator, page_size: int, part: st
         page = int(page_size or 1)
         grain = _grain_of(allocator, page)
         cut = tail_cut(len(ids), grain)
-        window_from = max(0, page_floor(cut, page) - page_floor(int(window_tokens), page))
+        window_from, window_why = park_window_from(cut, page, window_tokens, anchor, max_rows)
         spec = park_spec(str(req.rid), ids, req.extra_key, window_from, grain)
         if spec is None:
             return "no_tail", None
@@ -1217,9 +1252,10 @@ def publish_park_end(req, req_to_token_pool, allocator, page_size: int, part: st
         _PARK_N[0] += 1
         logger.info(
             "F4 PARK-END rid=%s n_tokens=%d rows_from=%d cut=%d rows=%d groups=%d ring_rows=%d "
-            "first_token=%d fa_layers=%d gdn_layers=%d part=%s of=%d (n=%d)",
+            "first_token=%d fa_layers=%d gdn_layers=%d part=%s of=%d window=%s anchor=%s (n=%d)",
             spec.rid, spec.n_tokens, spec.page_prefix, spec.cut, rows, groups, ring_rows, end.first_token,
-            len(fa), len(gdn), part, int(n_parts), _PARK_N[0],
+            len(fa), len(gdn), part, int(n_parts), window_why, "-" if anchor is None else int(anchor),
+            _PARK_N[0],
         )
         return "", event
     except Exception as exc:  # noqa: BLE001 -- no park part = the resume extends as today

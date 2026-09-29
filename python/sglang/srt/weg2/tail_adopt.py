@@ -858,14 +858,19 @@ def uniform_refusal(spec: th.TailSpec, ids, fill_len: int, extra_key, prefix_len
     input is identical on every rank of the group (the extend length the
     group runs is decided HERE). F4 (``park``): the fill still carries the
     last sampled token (N + 1), and the resume may re-enter anywhere in the
-    park's row window [page_prefix, cut) -- the rows below the re-entry are
-    the prefix's own, written again with the same bytes."""
+    park's row window [page_prefix, cut] -- the rows below the re-entry are
+    the prefix's own, written again with the same bytes. PARK-ANCHOR: the
+    cut itself included -- a D-direct extend whose track sat AT the cut (y3r
+    09292330 weg2-24-28, 103936 -> 104001, anchor 104000 = c) re-enters
+    there, and the END state still spares the extend [c, N)
+    (``adopt=skipped:prefix:104000!in[103488,104000)`` ran it: 3 tokens, one
+    1.5 s expert pass that the H24c skip batch of a sibling paid too)."""
     want_fill = spec.n_tokens + 1 if park else spec.n_tokens
     if len(ids) != spec.n_tokens or fill_len != want_fill:
         return f"n_tokens:{fill_len}!={want_fill}"
     if park:
-        if not (spec.page_prefix <= int(prefix_len) < spec.cut):
-            return f"prefix:{int(prefix_len)}!in[{spec.page_prefix},{spec.cut})"
+        if not (spec.page_prefix <= int(prefix_len) <= spec.cut):
+            return f"prefix:{int(prefix_len)}!in[{spec.page_prefix},{spec.cut}]"
     elif int(prefix_len) != spec.page_prefix:
         return f"prefix:{int(prefix_len)}!={spec.page_prefix}"
     if not (0 < spec.rows and spec.extend >= 1):
@@ -1188,9 +1193,10 @@ def _commit_skip(req, entry: Agreed, tree_cache, page_size: int) -> int:
     # re-enters at page_prefix (one page); F4's park anywhere in its window
     need = spec.cut - len(req.prefix_indices)
     page_size = int(page_size)
-    page = alloc_token_slots(tree_cache, -(-need // page_size) * page_size)
-    rows = page[:need].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
-    req.prefix_indices = torch.cat([req.prefix_indices, rows])
+    if need > 0:  # PARK-ANCHOR: a park resume AT the cut grows nothing
+        page = alloc_token_slots(tree_cache, -(-need // page_size) * page_size)
+        rows = page[:need].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
+        req.prefix_indices = torch.cat([req.prefix_indices, rows])
     if _is_park(st):
         # F4: the parked request's last sampled token comes back as the
         # skip's token -- take it off now so the batch is [c, N) over the
