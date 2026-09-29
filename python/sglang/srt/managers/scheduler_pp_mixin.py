@@ -4202,6 +4202,65 @@ def weg2_loadback_drain_on_idle_vote(self) -> int:
     return drained
 
 
+_WTV_N = [0]
+
+
+def weg2_writethrough_drain_on_idle_vote(self) -> int:
+    """WRITE-THROUGH LIVENESS (27B rc12z30x2 boot dkr27browauthoritybar1fs09290956,
+    424346f693, 09:59:40-10:01:10, W3): the write-through twin of
+    :func:`weg2_loadback_drain_on_idle_vote`.
+
+    A follower's write-through ack is drained by ``writing_check`` inside
+    ``check_hicache_events`` -- only on a PLANNED pass -- or by the blocking
+    ``#1465 WRITE-BACK DRAIN`` of the ``#1470 FLUSH-PUBLISH`` block at the top
+    of ``flush_cache``. Until 6218d74b35 every follower ran ``flush_cache`` on
+    every forwarded /flush_cache poll, and that drain joined its in-flight
+    write-throughs as a side effect (bb82fbcb68 boot ...09290020: #1465 on
+    PP1 80x, PP2 80x, not one ``hicache_write_through`` blocker). Since
+    6218d74b35 a follower PARKS the stamped flush and runs it only on PP0's
+    ``passed`` verdict. PP1's RETAIN-PUBLISH of weg2-0-2 (``issued=1
+    in_flight_after=1``, the last pass before the P->D quiesce) was then
+    polled by nobody: frameless cycles skip the plan, the flush never ran,
+    every #1268 lap voted ``hicache_write_through(1)`` on PP1 (14746 lines),
+    PP0 refused every flush on that lap, and the follower waited for a
+    ``passed`` that its own vote prevented -- a circular wait that ended in
+    ``WEG2 STOP W3 Weg2DrainWitnessDisagreement`` 90 s later.
+
+    The poll is rank-local where the tree is the #737 form
+    (``_count_ready_acks``: this rank's own finished events, no collective);
+    the legacy HiRadixCache ``writing_check`` carries a MIN all_reduce and is
+    never triggered from here. Nothing is waited on: an unfinished write
+    stays and votes not-idle, as before. Returns the drained count."""
+    tc = getattr(self, "tree_cache", None)
+    pending = getattr(tc, "ongoing_write_through", None)
+    if not pending or int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0) == 0:
+        return 0
+    check = getattr(tc, "writing_check", None)
+    if not callable(check) or not callable(getattr(tc, "_count_ready_acks", None)):
+        return 0
+    try:
+        from sglang.srt.weg2 import p_row_authority as _prow
+
+        if not _prow.applies(self) or not self._pp_microbatches_drained():
+            return 0
+        before = len(pending)
+        check()
+        drained = before - len(getattr(tc, "ongoing_write_through", None) or ())
+    except Exception:  # noqa: BLE001 - the drain never blocks the vote
+        logger.warning("WEG2-WRITETHROUGH-DRAIN-ON-VOTE raised; the slot votes on the undrained state",
+                       exc_info=True)
+        return 0
+    if drained > 0:
+        _WTV_N[0] += 1
+        if _WTV_N[0] <= 16 or _WTV_N[0] % 256 == 0:
+            logger.info("WEG2-WRITETHROUGH-DRAIN-ON-VOTE pp_rank=%d drained=%d left=%d (n=%d): the "
+                        "follower's finished write-through acks, polled at the #1268 vote -- a "
+                        "frameless cycle skips the plan and a parked flush (z30j verdict) skips "
+                        "the #1465 drain that polled them", int(self.ps.pp_rank),
+                        drained, len(getattr(tc, "ongoing_write_through", None) or ()), _WTV_N[0])
+    return drained
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -6505,6 +6564,7 @@ class SchedulerPPMixin:
         rank = int(self.ps.pp_rank)
         weg2_791c_release_on_idle_vote(self, vote)
         weg2_loadback_drain_on_idle_vote(self)
+        weg2_writethrough_drain_on_idle_vote(self)
         if attach_slot(vote, rank, self.is_fully_idle(), ", ".join(self.idle_blockers()) or "none"):
             log_verdict(vote, rank)
 
