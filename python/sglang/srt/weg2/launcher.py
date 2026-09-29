@@ -13082,8 +13082,15 @@ def driver_carve_min_total_mib(profile: Optional[str] = None) -> int:
 
 
 def _d_early_start_armed(ns) -> bool:
-    """BOOTZEIT 3: the one resolution of ``--weg2-d-early-start``."""
-    return str(getattr(ns, "weg2_d_early_start", "off") or "off") == "on"
+    """BOOTZEIT 3: the one resolution of ``--weg2-d-early-start``.
+
+    'auto' (the default since the series 29.09., dearly z30x2) is on for the
+    profiles W185 reviewed (Next Flash: ``xchg_census_is_reserve``) and off for
+    every other one, so the 27B line boots serial exactly as before."""
+    mode = str(getattr(ns, "weg2_d_early_start", "off") or "off")
+    if mode == "auto":
+        return xchg_census_is_reserve(getattr(ns, "profile", None))
+    return mode == "on"
 
 
 class Weg2DEarlyStartUnreviewed(Weg2LaunchRefused):
@@ -13094,7 +13101,8 @@ class Weg2DEarlyStartUnreviewed(Weg2LaunchRefused):
 
 def refuse_d_early_start_unreviewed(ns) -> None:
     """W185, called before group P starts: a named refusal, never a silent off."""
-    if _d_early_start_armed(ns) and not xchg_census_is_reserve(ns.profile):
+    if (str(getattr(ns, "weg2_d_early_start", "off")) == "on"
+            and not xchg_census_is_reserve(ns.profile)):
         raise Weg2DEarlyStartUnreviewed(
             f"W185 Weg2DEarlyStartUnreviewed: --weg2-d-early-start on with profile "
             f"{ns.profile or weg2_form.DEFAULT_PROFILE!r}; reviewed for Next Flash only (27B review "
@@ -20774,8 +20782,10 @@ def build_parser() -> argparse.ArgumentParser:
              "--weg2-d-early-start on immer an. Nur Instrument, aendert keine Entscheidung.",
     )
     ap.add_argument(
-        "--weg2-d-early-start", choices=("on", "off"), default="off",
-        help="BOOTZEIT 3 (29.09.): 'on' startet Gruppe D ZUSAMMEN mit P statt "
+        "--weg2-d-early-start", choices=("auto", "on", "off"), default="auto",
+        help="BOOTZEIT 3 (29.09.): 'auto' (Default seit der Serie 29.09., dearly "
+             "z30x2: serving 205 statt 226 s) = an fuer Next Flash, aus fuer jedes "
+             "andere Profil (W185: nur NF geprueft). 'on' startet Gruppe D ZUSAMMEN mit P statt "
              "nach P-READY + sleep(P) + D-Plan (z30r3: D-Init 30 s, davor 8 s "
              "Schlaf+Plan). D plant aus den Erwartungs-Budgets (Planer-Sitz: "
              "Record statt DC_EXPECT) und wartet VOR seinem Gewichtsladen an "
