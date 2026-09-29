@@ -11455,6 +11455,21 @@ def weg2_weights_cpu_backup_ring_kw(
     return 0, 0, True
 
 
+def pinned_reserve_line(ledger_gib, ledger_src: str = "") -> str:
+    """29.09.: the WEG2-HOST PINNED-RESERVE line -- the reserve the ranks'
+    pinned-host checks will ACTUALLY use (read back through
+    pinned_host_reserve(), after the export) with its source: env (explicit
+    SGLANG_PINNED_HOST_RESERVE_GIB), ledger (the host ledger's measured
+    margin) or native (10 GiB, no finite cgroup); plus the number the
+    ledger's PINNED WALL was priced with, so a mismatch is visible."""
+    from sglang.srt.mem_cache import pinned_host_budget as _phb
+
+    gib, kind, detail = _phb.pinned_host_reserve_effective()
+    wall = "none (no finite memory.max)" if ledger_gib is None else f"{float(ledger_gib):.2f} GiB ({ledger_src})"
+    return (f"WEG2-HOST PINNED-RESERVE effective={gib:.2f} GiB source={kind} ({detail}) "
+            f"ledger_wall_reserve={wall}")
+
+
 def choose_host_ledger(
     ring_bytes: int,
     ring_span1_bytes: int,
@@ -11463,6 +11478,14 @@ def choose_host_ledger(
     memhist_gib: float = 0.0,
     memhist_run_only: bool = False,
     l3_index_gib: float = 0.0,
+    # 29.09. (Planer post COLD_TIER_SHM): the tmpfs expert store, GiB, both
+    # moments -- `cold_tier_shm_post` sizes it from the map, never from df.
+    cold_tier_shm_gib: float = 0.0,
+    # 29.09.: the groups' own env (--env-d, --env-p); the arena term reads
+    # its sizes through it, not through the launcher env alone.
+    group_envs: Optional[Sequence[Dict[str, str]]] = None,
+    # 29.09.: the host census posts of this model|form (host_census.ledger_terms)
+    census: Optional[Dict[str, object]] = None,
     meminfo_path: str = "/proc/meminfo",
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
@@ -11782,9 +11805,13 @@ def choose_host_ledger(
         memhist_gib=float(memhist_gib), memhist_run_only=bool(memhist_run_only),
         # 28.09.: the L3 store's RAM index (ledger post 'l3_index'), every owner.
         l3_index_gib=float(l3_index_gib),
+        # 29.09.: the tmpfs expert store (Planer post COLD_TIER_SHM).
+        cold_tier_shm_gib=float(cold_tier_shm_gib),
+        # 29.09.: measured non-rank anon / lane ring / arena sidecar / hand-off
+        census=census,
         # #1451: no arena on a --weg2-disable-hicache boot -- the term charged
         # 33.6 GiB there too (test_weg2_hicache_disabled_1386 M=2400 unfundable)
-        **(_weg2_arena_ledger_terms(model_dir) if (model_dir and not hicache_disabled) else {}),  # #1432
+        **(_weg2_arena_ledger_terms(model_dir, group_envs) if (model_dir and not hicache_disabled) else {}),  # #1432
         # #1317n D's L2 IS PRICED SEPARATELY FROM P'S. It rides the ONE kwargs
         # block for exactly the reason the block exists (boot weg2sn6a died of
         # a price() call that had drifted from choose()'s keywords): a term
@@ -12493,7 +12520,22 @@ def sleep_group(port: int, log: Log, name: str, weights_tags: List[str]) -> floa
     return dt
 
 
-def _weg2_arena_ledger_terms(model: str) -> dict:
+def _group_env_value(name: str, group_envs, default: str) -> str:
+    """29.09.: ``name`` as the RANKS see it -- the group env (--env-p/--env-d,
+    applied over the launcher env by build_env) wins; when both groups set it
+    differently the larger one prices (the ONE arena is shared). The launcher
+    env only when no group sets it (ENV-LAUNCHER != RANG)."""
+    vals = [str(e[name]) for e in (group_envs or ()) if e and str(e.get(name, "") or "")]
+    if vals:
+        return max(vals, key=float)
+    return str(os.environ.get(name, default) or default)
+
+
+#: model -> the arena page widths `_weg2_arena_ledger_terms` last priced
+_ARENA_BOOKED_WIDTHS: Dict[str, List[int]] = {}
+
+
+def _weg2_arena_ledger_terms(model: str, group_envs=None) -> dict:
     """#1432: the L2 arena's host bytes and the REAL fallback pool sizes, for
     the ledger. Sizes come from the same environment the child processes get
     (SGLANG_HICACHE_ARENA_GIB / _MAMBA_SLOTS / _STAGING_GB, SGLANG_WEG2_MAMBA_
@@ -12501,7 +12543,12 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
     (all attention layers), one draft slot per KV slot (one layer cell), one
     mamba slot per canonical GDN blob (hicache_migrate.qwen3_5_mamba_spec,
     bf16 states -- 78,446,592 B on Qwen3.8-27B, checked against the arena
-    file). Empty dict when the arena host tier is off."""
+    file). Empty dict when the arena host tier is off.
+
+    29.09. (z30w-park): the sizes are read through ``_group_env_value`` --
+    the NF arm sets ARENA_GIB=4 / MAMBA_SLOTS=32 in the group env only, and
+    the launcher env's defaults (22 / 140) priced the arena at 23.75 GiB
+    against 6.27 GiB measured in /dev/shm."""
     import logging as _logging
     if os.environ.get("SGLANG_HICACHE_ARENA_HOST", "1") != "1":
         return {}
@@ -12515,12 +12562,20 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
         from sglang.srt.planner import pp_cut as _pp_cut
         cell = int(_pp_cut.kv_mib_per_token_per_attn_layer_from_config(cfg, "fp8_e4m3", n_layers) * (1 << 20))
         kv_page = cell * n_attn
-        kv_gib = float(os.environ.get("SGLANG_HICACHE_ARENA_GIB", "22") or 22)
+        kv_gib = float(_group_env_value("SGLANG_HICACHE_ARENA_GIB", group_envs, "22"))
         kv_slots = max(1024, int(kv_gib * (1 << 30)) // max(1, kv_page))
+        # 29.09.: the ranks cut the arena in CANONICAL pages when the env
+        # names one (HiCacheFile._arena_for: slots = GIB // canonical KV
+        # extents; z30w wrote arena-786432.bin = 5461 x 64-token pages). The
+        # count follows that page; the terms below stay in tokens (one KV
+        # slot = one token, the draft 1:1), so the bytes are the same.
+        _canon_page = int(float(_group_env_value("SGLANG_HICACHE_ARENA_KV_PAGE_BYTES", group_envs, "0") or 0))
+        if _canon_page > 0 and kv_page > 0 and _canon_page % kv_page == 0:
+            kv_slots = max(1024, int(kv_gib * (1 << 30)) // _canon_page) * (_canon_page // kv_page)
         from sglang.srt.mem_cache.hicache_migrate import qwen3_5_mamba_spec
         blob = qwen3_5_mamba_spec(text_cfg, num_linear_layers=n_lin, units=1,
                                   temporal_itemsize=2, conv_itemsize=2).total_bytes if n_lin else 0
-        mamba_slots = int(os.environ.get("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "140") or 140)
+        mamba_slots = int(float(_group_env_value("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", group_envs, "140")))
         # xsn267 (17.09.): under --spec-form DFLASH the draft slot is the
         # DFlash draft's own page -- draft_layers x (K+V) x draft kv heads x
         # head_dim x kv itemsize (5 x 2 x 8 x 128 x 1 = 10240 B, the
@@ -12547,14 +12602,20 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
         arena_bytes = kv_slots * kv_page + draft_slots * draft_cell + mamba_slots * blob
         out = dict(
             arena_gib=arena_bytes / (1 << 30),
-            staging_gb=float(os.environ.get("SGLANG_HICACHE_ARENA_STAGING_GB", "0.05") or 0.05),
-            anchor_mib=int(os.environ.get("SGLANG_WEG2_MAMBA_ANCHOR_MIB", "100") or 100),
+            staging_gb=float(_group_env_value("SGLANG_HICACHE_ARENA_STAGING_GB", group_envs, "0.05")),
+            anchor_mib=int(float(_group_env_value("SGLANG_WEG2_MAMBA_ANCHOR_MIB", group_envs, "100"))),
         )
         _logging.getLogger("weg2.launcher").info(
             "WEG2-ARENA-LEDGER kv=%d slots x %d B + draft %d x %d B + mamba %d x %d B = %.2f GiB "
             "(term arena_gib); fallback pools staging=%s GB anchor=%s MiB",
             kv_slots, kv_page, draft_slots, draft_cell, mamba_slots, blob, out["arena_gib"],
             out["staging_gb"], out["anchor_mib"])
+        # 29.09. (host census): the arena FILE widths this term prices, so the
+        # census can tell a sidecar width (the QSA index page) from them
+        _pt = (_canon_page // kv_page) if (_canon_page > 0 and kv_page > 0
+                                           and _canon_page % kv_page == 0) else 1
+        _ARENA_BOOKED_WIDTHS[str(model)] = [w for w in (
+            kv_page * _pt, (draft_cell * _pt) if draft_slots else 0, blob) if w]
         return out
     except Exception as exc:  # noqa: BLE001 - a mispriced arena is refused, never guessed
         raise Weg2LaunchRefused(f"W108 Weg2ArenaLedgerRefused: the arena term could not be derived: {exc!r}")
@@ -18063,14 +18124,7 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
         from sglang.srt.planner import pp_cut as _pp_cut
         from sglang.srt.layers.moe import expert_map as _em
 
-        ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
-        fr_tp = _argv_vector(getattr(ns, "extra_d", ""),
-                             "--rank-moe-resident-fraction")
-        _fp_text = str(getattr(ns, "pp_cut_expert_device_fraction", "") or "")
-        fr_pp = (_csv_floats(_fp_text) if _fp_text else
-                 [float(x) for x in (_argv_vector(
-                     getattr(ns, "extra_p", ""),
-                     "--rank-moe-resident-fraction") or [])])
+        ratios, fr_tp, fr_pp = expert_map_vectors(ns)
         luecken = []
         if not ratios:
             luecken.append("--rank-moe-ratio (extra_d)")
@@ -18109,27 +18163,13 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
         # der Ids (geschachtelt). Sie braucht den REALISIERTEN P-Layer-Split,
         # weil P's Residenz je STUFE gilt und ein Rang seinen Layer ueber die
         # Stufe adressiert (unter tp=1 ist moe_tp_rank fuer alle Stufen 0).
-        _stages = [int(x) for x in (p_stage_layers or []) if int(x) > 0]
-        if _stages and len(_stages) == len(fr_pp) and not _mirror:
-            _layer_stage = [s for s, n in enumerate(_stages) for _ in range(n)]
-            karte = _em.build_nested(
-                total=total,
-                ratios=[int(float(x)) for x in ratios],
-                fr_pp=[float(x) for x in fr_pp],
-                fr_tp=[float(x) for x in fr_tp],
-                p_layer_stage=_layer_stage,
-                pad_tp=1,
-            )
-        else:
-            if not _mirror:
-                log("#107 PLATZTAUSCH-KARTE ENTFAELLT: P-Layer-Split %s passt "
-                    "nicht zu %d P-Fractions -- Version-1-Karte wie bisher"
-                    % (_stages or "unbekannt", len(fr_pp)))
-            karte = _em.build(total=total,
-                              ratios=[int(float(x)) for x in ratios],
-                              fr_pp=[float(x) for x in fr_pp],
-                              fr_tp=[float(x) for x in fr_tp],
-                              mirror=_mirror)
+        karte, _layer_stage = build_expert_karte(total, ratios, fr_pp, fr_tp,
+                                                 p_stage_layers, _mirror)
+        if _layer_stage is None and not _mirror:
+            _stages = [int(x) for x in (p_stage_layers or []) if int(x) > 0]
+            log("#107 PLATZTAUSCH-KARTE ENTFAELLT: P-Layer-Split %s passt "
+                "nicht zu %d P-Fractions -- Version-1-Karte wie bisher"
+                % (_stages or "unbekannt", len(fr_pp)))
         grund = _em.refuse_if_inconsistent(karte)
         if grund:
             log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % grund)
@@ -18202,6 +18242,137 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
     except BaseException as _exc:  # noqa: BLE001 -- eine Karte kippt nie den Boot
         log("#107 EXPERTEN-KARTE failed: %s: %s" % (type(_exc).__name__, _exc))
         return ""
+
+
+def expert_map_vectors(ns) -> Tuple[List[str], List[str], List[float]]:
+    """(--rank-moe-ratio, FR_D, FR_P) exactly as :func:`publish_expert_map`
+    reads them -- one reader, so the host ledger's store post
+    (:func:`planned_expert_store_bytes`) sizes the store the map will build."""
+    ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
+    fr_tp = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-resident-fraction")
+    _fp_text = str(getattr(ns, "pp_cut_expert_device_fraction", "") or "")
+    fr_pp = (_csv_floats(_fp_text) if _fp_text else
+             [float(x) for x in (_argv_vector(
+                 getattr(ns, "extra_p", ""), "--rank-moe-resident-fraction") or [])])
+    return ratios, fr_tp, fr_pp
+
+
+def build_expert_karte(total, ratios, fr_pp, fr_tp, p_stage_layers, mirror: bool = False):
+    """(karte, p_layer_stage) -- the Version-2 (Platztausch) map when the
+    realised P layer split matches FR_P, else the Version-1 map with
+    p_layer_stage None. The ONE build both the map writer and the ledger's
+    dry sizing call."""
+    from sglang.srt.layers.moe import expert_map as _em
+
+    _stages = [int(x) for x in (p_stage_layers or []) if int(x) > 0]
+    if _stages and len(_stages) == len(fr_pp) and not mirror:
+        _layer_stage = [s for s, n in enumerate(_stages) for _ in range(n)]
+        return _em.build_nested(
+            total=total,
+            ratios=[int(float(x)) for x in ratios],
+            fr_pp=[float(x) for x in fr_pp],
+            fr_tp=[float(x) for x in fr_tp],
+            p_layer_stage=_layer_stage,
+            pad_tp=1,
+        ), _layer_stage
+    return _em.build(total=total,
+                     ratios=[int(float(x)) for x in ratios],
+                     fr_pp=[float(x) for x in fr_pp],
+                     fr_tp=[float(x) for x in fr_tp],
+                     mirror=mirror), None
+
+
+#: 29.09. (Planer post COLD_TIER_SHM): filesystems whose pages are shmem --
+#: unevictable without swap, charged to the cgroup that touched them.
+COLD_TIER_SHM_FS = ("tmpfs", "ramfs")
+#: The map may move the store after the first pricing (the D form is pinned
+#: for the map, #239 rc12z29c); a move above this re-prices the ledger.
+COLD_TIER_REPRICE_EPS_GIB = 0.01
+COLD_TIER_MARKER = "WEG2-HOST-LEDGER COLD-TIER"
+
+
+def expert_store_dir_of(ns) -> str:
+    """The expert store directory the RANKS get: --env-d, then --env-p, then
+    the launcher's own environment (ENV-LAUNCHER != RANG -- the NF arm sets it
+    in the group env only)."""
+    from sglang.srt.layers.moe.expert_store import STORE_DIR_ENV
+
+    for spec in (getattr(ns, "env_d", ""), getattr(ns, "env_p", "")):
+        v = parse_group_env(spec or "").get(STORE_DIR_ENV)
+        if v:
+            return str(v)
+    return str(os.environ.get(STORE_DIR_ENV, "") or "")
+
+
+def planned_expert_store_bytes(ns, model: str, p_stage_layers=None,
+                               karte_path: str = "") -> Tuple[Optional[int], str]:
+    """The expert store's size from its DIMENSIONING source, never from df:
+    store slots per layer x MoE layers x row bytes. ``karte_path`` = the map
+    as written (after the D form is pinned); else the map is dry-built from
+    the same vectors :func:`publish_expert_map` reads. (None, why) when no
+    map could be built -- the ranks then size their store themselves."""
+    from sglang.srt.planner import pp_cut as _pp_cut
+
+    _terms = []
+
+    def terms():
+        if not _terms:
+            _terms.append(_pp_cut.checkpoint_weight_terms(model))
+        return _terms[0]
+
+    if karte_path:
+        with open(karte_path) as fh:
+            karte = json.load(fh)
+        src = f"map {karte_path}"
+    else:
+        ratios, fr_tp, fr_pp = expert_map_vectors(ns)
+        if not (ratios and fr_tp and fr_pp):
+            return None, "no map vectors (--rank-moe-ratio / FR_D / FR_P) -- no map, no sized store"
+        _mirror = str(os.environ.get("WEG2_EXPERT_MAP_MIRROR", "0")).strip() in ("1", "true", "True", "on")
+        karte, _ls = build_expert_karte(int(terms().num_experts), ratios, fr_pp, fr_tp,
+                                        p_stage_layers, _mirror)
+        src = "map dry-built from the vectors publish_expert_map reads"
+    # the row the P cut priced (ns._expert_row_mib, same checkpoint terms) --
+    # read only once a map exists: a dense checkpoint has no rows to price
+    row = float(getattr(ns, "_expert_row_mib", 0.0) or 0.0) * _pp_cut.MIB
+    if row <= 0:
+        row = float(terms().expert_layer_weight_bytes) / max(1, int(terms().num_experts))
+    slots = int(karte["slots"])
+    layers = len(karte.get("p_layer_stage") or []) or int(terms().n_layers)
+    return int(slots * layers * row), (f"slots {slots} x {layers} layers x "
+                                       f"{row / _pp_cut.MIB:.3f} MiB/row ({src})")
+
+
+def cold_tier_shm_post(ns, model: str, p_stage_layers=None, karte_path: str = "",
+                       mounts_text: Optional[str] = None) -> Tuple[float, str]:
+    """29.09. Planer post COLD_TIER_SHM -> ledger term ``cold_tier_shm_gib``
+    (GiB, both moments): the expert store when its directory is on a tmpfs.
+
+    MEASURED z30w-park (29.09. 09:12Z, Docker memory.max 84 GiB): shmem 53.36
+    GiB of which /dev/shm 7.9 -- the store (/mnt/nf-experts, a per-boot tmpfs
+    mount, map 'Store ~39.2 GiB') was the largest host post and priced
+    nowhere; the ledger said 47.72 against 79.46 nonreclaim.
+
+    Bytes the tmpfs already holds are credited: they are in the ledger's
+    origin reading (nonreclaim now) and must not be charged twice."""
+    store_dir = expert_store_dir_of(ns)
+    if not store_dir:
+        return 0.0, (f"{COLD_TIER_MARKER} post cold_tier_shm 0.00 GiB: no expert store "
+                     f"(SGLANG_MOE_EXPERT_STORE_DIR not in --env-d/--env-p/env)")
+    mnt, fs, _src = fs_of(store_dir, mounts_text)
+    if fs not in COLD_TIER_SHM_FS:
+        return 0.0, (f"{COLD_TIER_MARKER} post cold_tier_shm 0.00 GiB: store {store_dir} on "
+                     f"fs={fs or '?'} mount={mnt or '?'} -- page cache, reclaimable, not a post")
+    planned, how = planned_expert_store_bytes(ns, model, p_stage_layers, karte_path)
+    if planned is None:
+        return 0.0, (f"{COLD_TIER_MARKER} post cold_tier_shm UNPRICED: store {store_dir} is "
+                     f"{fs} (shmem) but {how}")
+    resident = _tree_bytes(store_dir)[0] if os.path.exists(store_dir) else 0
+    post = max(0, planned - resident) / host_ledger.GIB
+    return post, (f"{COLD_TIER_MARKER} post cold_tier_shm {post:.2f} GiB = planned "
+                  f"{planned / host_ledger.GIB:.2f} GiB ({how}) - already resident "
+                  f"{resident / host_ledger.GIB:.2f} GiB (in the origin reading); store "
+                  f"{store_dir} on {fs} mount={mnt}, both moments")
 
 
 class Weg2DFormOffTheMap(Weg2LaunchRefused):
@@ -23216,6 +23387,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"({_l3_idx_src}) x {_store_journal.RAM_BYTES_PER_ENTRY} B x {_l3_idx_owners} owner(s), "
         f"both moments; grows with the store up to its cap between boots")
 
+    # 29.09. (Planer post COLD_TIER_SHM): the tmpfs expert store, sized from the
+    # map the ranks will load (dry-built here, re-priced below once written).
+    _ledger_group_envs = [parse_group_env(getattr(ns, "env_d", "") or ""),
+                          parse_group_env(getattr(ns, "env_p", "") or "")]
+    _cold_tier_shm_gib, _cold_tier_line = cold_tier_shm_post(
+        ns, ns.model, getattr(state, "p_stage_layers", None))
+    log(_cold_tier_line)
+    # 29.09. (host census): what this model|form was MEASURED to hold outside
+    # the ranks and outside store/arena -- a record, never a constant; the
+    # front keeps it current (sample_live every 60 s, max-merged).
+    from sglang.srt.weg2 import host_census as _hc
+
+    _census_key = _hc.census_key(
+        host_ledger.checkpoint_digest(ns.model)[0] or "",
+        (getattr(ns, "weg2_boot_form", None).env_value()
+         if getattr(ns, "weg2_boot_form", None) is not None else ""))
+    _census_record = f"{EVIDENCE_DIR}/{_hc.RECORD_NAME}"
+    _census_terms = _hc.ledger_terms(_hc.load_record(_census_record).get(_census_key))
+    log(_hc.census_line(_census_key, _census_terms))
+
     def _price_host_ledger():
         """#1453: the ONE ledger pricing, callable twice (see below)."""
         return choose_host_ledger(
@@ -23224,6 +23415,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             d_draft_host_gib=d_draft_host_mib / 1024.0,
             memhist_gib=_memhist_gib, memhist_run_only=_memhist_run_only,
             l3_index_gib=_l3_index_gib,
+            cold_tier_shm_gib=_cold_tier_shm_gib,
+            group_envs=_ledger_group_envs,
+            census=_census_terms,
             # #1390: NAMED, not left to choose_host_ledger's own literal
             # defaults -- see MEMINFO_PATH/CGROUP_ROOT above for why a bare call
             # would keep reading the real box even under a test's mock.
@@ -23309,7 +23503,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ledger prices once more -- the boot then funds itself without the
     # --host-ledger-deviation it needed before (weg2xsn207: 93.15 vs 93.00).
     _arena_new, _arena_why = arena_from_ledger(
-        float(os.environ.get("SGLANG_HICACHE_ARENA_GIB", "22") or 22),
+        float(_group_env_value("SGLANG_HICACHE_ARENA_GIB", _ledger_group_envs, "22")),
         _arm_run_peak_gib(arm), getattr(ns, "host_riegel_gib", None),
         enabled=(os.environ.get("SGLANG_WEG2_ARENA_FROM_LEDGER", "1") == "1" and not hicache_disabled))
     log("#1453 L2-ARENA FROM LEDGER: " + _arena_why)
@@ -23322,6 +23516,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for ln in lines:
         log(ln)
     state.ledger_lines = lines
+    # 29.09. (z30x2-yarn2): ONE pinned-host reserve for the ledger and the
+    # ranks. The ledger bounded its run peak by memory.max minus this number
+    # (PINNED WALL); the ranks' HiCache pools now read it too, through
+    # pinned_host_reserve(). An explicit SGLANG_PINNED_HOST_RESERVE_GIB wins
+    # and is left untouched; without a finite cgroup nothing is exported.
+    _pin_gib, _pin_src = getattr(arm, "pinned_reserve", (None, ""))
+    from sglang.srt.mem_cache import pinned_host_budget as _phb
+    if _pin_gib is not None and not (os.environ.get(_phb.PINNED_HOST_RESERVE_ENV) or "").strip():
+        os.environ[_phb.PINNED_HOST_RESERVE_LEDGER_ENV] = f"{float(_pin_gib):.4f}"
+        os.environ[_phb.PINNED_HOST_RESERVE_LEDGER_SOURCE_ENV] = str(_pin_src or "")
+    log(pinned_reserve_line(_pin_gib, _pin_src))
     state.reap_headroom_gib = reap_headroom_gib
 
     # #1269 fix 4 follow-up: KEEP THE PREFLIGHT'S OWN ANON READING. `cg` is the
@@ -23479,6 +23684,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                chunk_layers=chunk_layers)
     # rc12z30b: the map read FR_D from --extra-d now; a later D solve must not move it
     ns._expert_map_path = _emap
+    # 29.09.: the map is written -- the store post from the map as the ranks
+    # load it. The D form pinned for the map (#239) moves the store (z30w:
+    # ratios 183,137,168 -> 191,153,144); a move re-prices the ledger here,
+    # before any argv reads `arm` and before any rank starts.
+    if _emap:
+        _ct_after, _ct_line_after = cold_tier_shm_post(
+            ns, ns.model, getattr(state, "p_stage_layers", None), karte_path=_emap)
+        log(_ct_line_after)
+        if abs(_ct_after - _cold_tier_shm_gib) > COLD_TIER_REPRICE_EPS_GIB:
+            log(f"{COLD_TIER_MARKER} RE-PRICE: the written map moved the post "
+                f"{_cold_tier_shm_gib:.2f} -> {_ct_after:.2f} GiB -- the ledger prices again")
+            _cold_tier_shm_gib = _ct_after
+            arm, reap_headroom_gib, lines, cg = _price_host_ledger()
+            state.cgroup = dict(cg)
+            for ln in lines:
+                log(ln)
+            state.ledger_lines = lines
+            state.reap_headroom_gib = reap_headroom_gib
+    # 29.09.: the front samples the census live (widths known once the arena
+    # term has run inside the pricing above)
+    ns._host_census = {"record": _census_record, "key": _census_key,
+                       "store_dir": expert_store_dir_of(ns),
+                       "widths": list(_ARENA_BOOKED_WIDTHS.get(str(ns.model), []))}
     _estore_id = publish_store_identity(ns.model, _emap, log)
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
     # H125: the host-RAM price of `--weg2-vision-source ram`, named where the
@@ -24787,6 +25015,14 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     # and the front then prints no split rather than an invented one.
     if anon_preboot_bytes > 0:
         argv += ["--anon-preboot-bytes", str(int(anon_preboot_bytes))]
+    # 29.09.: the host census record the front keeps current (absent = off)
+    _hcn = getattr(ns, "_host_census", None)
+    if _hcn:
+        argv += ["--host-census-record", str(_hcn["record"]), "--host-census-key", str(_hcn["key"])]
+        if _hcn.get("store_dir"):
+            argv += ["--host-census-store-dir", str(_hcn["store_dir"])]
+        if _hcn.get("widths"):
+            argv += ["--host-census-arena-widths", ",".join(str(int(w)) for w in _hcn["widths"])]
     if ns.min_dwell_ms is not None:
         argv += ["--min-dwell-ms", str(ns.min_dwell_ms)]
     # 27B idle policy (b)/(c): emitted only when set, so a boot without them

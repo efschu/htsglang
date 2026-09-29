@@ -5920,6 +5920,11 @@ class Front:
                     verdict = host_ledger.watermark_breach_verdict(
                         int(current),
                         margin=margin,
+                        # 29.09.: a finite memory.max (Docker) is the mark;
+                        # CT999 ('max') keeps the recorded 95.90.
+                        watermark_gib=host_ledger.reap_mark_gib(
+                            None if pr.get("max_gib") is None
+                            else int(float(pr["max_gib"]) * host_ledger.GIB)),
                         nonreclaim_gib=pr.get("nonreclaim_gib"),
                         file_reclaimable_gib=pr.get("file_reclaimable_gib"),
                         cgroup_anon_bytes=host_ledger.read_cgroup_anon_bytes(),
@@ -11517,6 +11522,33 @@ class Front:
             return None
 
 
+def start_host_census_sampler(record: str, key: str, store_dir: str,
+                              widths: List[int], period_s: float = 60.0):
+    """29.09.: keep the host census record current (host_census.py). A daemon
+    thread, off the watermark loop: a smaps walk over ~40 processes that map a
+    39 GiB store is not a 0.5 s-cadence read. One line per changed peak."""
+    import threading
+
+    from sglang.srt.weg2 import host_census as _hc
+
+    def _run():
+        warned = False
+        while True:
+            time.sleep(period_s)
+            try:
+                c = _hc.sample_live(store_dir=store_dir, arena_booked_widths=widths)
+                ent = _hc.merge_into_record(record, key, c)
+                logger.info("%s", _hc.census_line(key, _hc.ledger_terms(ent)))
+            except Exception as exc:  # noqa: BLE001 -- an instrument never kills the front
+                if not warned:
+                    logger.warning("%s sampler failed (once): %r", _hc.CENSUS_MARKER, exc)
+                    warned = True
+
+    t = threading.Thread(target=_run, name="weg2-host-census", daemon=True)
+    t.start()
+    return t
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--prefill", required=True)
@@ -11668,6 +11700,13 @@ def main():
                          "and that level requires the admin key once one is configured. A path, "
                          "not a value, so the key does not appear in this process's argv too.")
     ap.add_argument("--commit", default="", help="#1233 fix 8: the tip this boot runs, stamped into every measurement")
+    ap.add_argument("--host-census-record", default="",
+                    help="29.09.: the host census record (host_census.py) this front keeps "
+                         "current -- every 60 s one sample_live, max-merged under "
+                         "--host-census-key. Empty = off.")
+    ap.add_argument("--host-census-key", default="")
+    ap.add_argument("--host-census-store-dir", default="")
+    ap.add_argument("--host-census-arena-widths", default="")
     ap.add_argument("--anon-preboot-bytes", type=int, default=0,
                     help="#1269 fix 3: cgroup memory.stat `anon` measured by the "
                          "launcher preflight BEFORE this boot existed. The only "
@@ -11733,6 +11772,10 @@ def main():
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:
         front._anon_preboot_bytes = int(args.anon_preboot_bytes)
+    if args.host_census_record and args.host_census_key:
+        start_host_census_sampler(
+            args.host_census_record, args.host_census_key, args.host_census_store_dir,
+            [int(w) for w in args.host_census_arena_widths.split(",") if w.strip()])
     # #1275: say ONCE whether this boot has the live levers, and say it with the
     # PATH and a redaction -- never the key. The front log is world-readable and
     # is routinely pasted into records.

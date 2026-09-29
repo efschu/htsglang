@@ -26,6 +26,12 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
+# The NATIVE value only. 29.09. (z30x2-yarn2 D died at pool build): the six
+# HiCache pool sites passed this constant as the caller's reserve, so the
+# container's SGLANG_PINNED_HOST_RESERVE_GIB=2 (RC2.1) never reached them --
+# "0.67 GB ... does not fit in 11.18 GB available minus a 10.74 GB OS reserve
+# (caller)" under an 84 GiB memory.max. The sites now pass None and read
+# pinned_host_reserve(): unset = 10 GiB, byte-identical natively.
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
@@ -208,7 +214,7 @@ class HostKVCache(abc.ABC):
             name=self.budget_label,
             flag=self.budget_flag,
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=None,  # the configured OS reserve (pinned_host_reserve)
         )
         # Name the POST, not the class of feature. This line used to say
         # "hierarchical KV cache" unconditionally, so a kv-session-offload
