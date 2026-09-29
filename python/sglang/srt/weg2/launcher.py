@@ -2892,6 +2892,76 @@ def kv_stage_wave_floor(group, rows, fits, max_by: Sequence[int], waves_cap: int
             % (head, "; ".join(lines))]
 
 
+D_KV_STAGE_LRU_FLOOR_ENV = "SGLANG_WEG2_D_KV_STAGE_LRU_FLOOR"
+D_KV_STAGE_LRU_FLOOR_MARKER = "LRU-UNTERGRENZE (#251c, gemessener Spitzenbedarf)"
+#: re-solves the floor may ask for in one pass (the second one checks the first)
+D_KV_STAGE_LRU_FLOOR_ROUNDS = 2
+
+
+def d_pool_peak_record(profile: Optional[str] = None
+                       ) -> Tuple[Optional[List[int]], Optional[List[int]], str]:
+    """``D_POOL_PEAK_NONRES_ROWS`` (the measured maximum of the MOE-POOL-DEMAND
+    ``max_nonres_per_step`` per D rank) with ``D_POOL_PEAK_NONRES_SPAN_ROWS``
+    (E - R of the form it was measured on), or ``(None, None, "")`` -- no
+    floor, the stage solve stays byte-identical (27B has no such record)."""
+    try:
+        peak = [int(v) for v in _pconst("D_POOL_PEAK_NONRES_ROWS", profile)]
+        span = [int(v) for v in _pconst("D_POOL_PEAK_NONRES_SPAN_ROWS", profile)]
+    except (KeyError, TypeError, ValueError):
+        return None, None, ""
+    if not peak or len(peak) != len(span):
+        return None, None, ""
+    return peak, span, _pconst_boots("D_POOL_PEAK_NONRES_ROWS", profile)
+
+
+def kv_stage_lru_floor(group, rows, fits, max_by: Sequence[int], peak: Sequence[int],
+                       span: Sequence[int], source: str, head: str
+                       ) -> Tuple[Dict[int, int], List[str]]:
+    """(3) 29.09.: the measured peak pool demand as the LRU floor of the stage
+    solve. A KV rank's stage rows are LRU rows in S0; a wake to S_j unmaps
+    ``stage_rows[j]`` of them. The wave rule prices the step at
+    min(b x verify x top_k, E - R) with waves -- the MEASURED peak of
+    non-resident ids per step (MOE-POOL-DEMAND, rc12z30r3: TP2 43 of C 48)
+    is the demand the extra wave hits. Floor per KV rank: the fewest rows any
+    allowed (n, stage) of the written form leaves (``capacity[n][max_by[n]]``)
+    >= the peak, scaled from the measured span E - R to this form's
+    (first order: the non-resident ids of a step grow with the non-resident
+    span). Short by d rows -> the scratch grows by ceil(d / (1 - p)) with
+    p = peak / span: a row moved from resident to scratch widens the span by
+    one row, so the need grows by p per row. Returns ({rank: rows to add},
+    lines); an empty dict when every KV rank holds its peak."""
+    last = rows[-1]
+    fit_by = {int(f.rank): f for f in fits}
+    cap = len(rows)
+    add: Dict[int, int] = {}
+    parts: List[str] = []
+    for t in group.tables:
+        r = int(t.host_rank)
+        if r >= len(peak) or r >= len(last.scratch_given):
+            continue
+        f = fit_by.get(r)
+        E = int(f.local_experts) if f is not None else 0
+        C = int(last.scratch_given[r])
+        span_now = max(E - (int(last.max_rows[r]) - C), 0)
+        p = min(float(peak[r]) / int(span[r]), 1.0) if int(span[r]) > 0 else 1.0
+        need = min(int(math.ceil(p * span_now - 1e-9)), span_now, int(last.ids_per_step))
+        j_by = [min(int(max_by[i]), len(t.tokens) - 1) for i in range(cap)]
+        lru = min(int(t.capacity[i][j_by[i]]) for i in range(cap))
+        text = ("rang%d Spitze %d bei Spanne %d -> Bedarf %d bei Spanne %d (E %d - R %d), "
+                "LRU bis S%d min %d" % (r, int(peak[r]), int(span[r]), need, span_now, E,
+                                        E - span_now, max(j_by), lru))
+        if need > lru:
+            k = int(math.ceil((need - lru) / max(1.0 - p, 0.05) - 1e-9))
+            add[r] = k
+            text += " < %d -> Scratch +%d (Bedarf +%.3f je Zeile)" % (need, k, p)
+        else:
+            text += " >= %d, haelt" % need
+        parts.append(text)
+    return add, ["%s: %s (%s aus %s): %s" % (
+        head, D_KV_STAGE_LRU_FLOOR_MARKER, "D_POOL_PEAK_NONRES_ROWS", source or "Record",
+        "; ".join(parts) or "kein KV-Rang")]
+
+
 def er_trim_cell(fit, host_rank: int) -> int:
     """The planner's trim cell of a fit (0 without one)."""
     if fit is None:
@@ -2964,6 +3034,7 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
     Returns the lines to log; ``d_kv_stage_undo`` reverses it for a second
     solve pass."""
     head = "%s FRACTION-SOLVE %s D-KV-STUFEN (#251c)" % (D_RANK_SOLVE_MARKER, label)
+    ns._d_kv_stage_lru_raise = None
     env_raw = str(getattr(ns, "env_d", "") or "")
     env = parse_group_env(env_raw)
     if D_KV_STAGE_KEYS[0] in env:
@@ -3008,6 +3079,19 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
         group, rows, fits, max_by,
         int(waves_to) if waves_to is not None
         else max(er.pool_overflow_waves(env), int(rows[-1].waves)), head)
+    # (3) 29.09.: the measured peak as the LRU floor of every allowed stage;
+    # a short rank gets its scratch raised and the solve runs again
+    # (log_d_rank_vram_solve), so FR_D moves the rows from resident to scratch
+    _peak, _span, _peak_src = d_pool_peak_record(getattr(ns, "profile", None))
+    if _peak is not None:
+        if os.environ.get(D_KV_STAGE_LRU_FLOOR_ENV, "1").strip() == "0":
+            waves_lines = waves_lines + ["%s: %s aus (%s=0)" % (
+                head, D_KV_STAGE_LRU_FLOOR_MARKER, D_KV_STAGE_LRU_FLOOR_ENV)]
+        else:
+            _add, _floor_lines = kv_stage_lru_floor(group, rows, fits, max_by, _peak, _span,
+                                                    _peak_src, head)
+            waves_lines = waves_lines + _floor_lines
+            ns._d_kv_stage_lru_raise = _add or None
     n = len(rows[-1].scratch_given)
     scratch = _rank_vec(env.get("SGLANG_MOE_SCRATCH_SLOTS"), n)
     seat_raw = env.get("SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
@@ -17359,6 +17443,41 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     if plan.refusal is not None:
         log(f"{D_RANK_SOLVE_MARKER} {plan.refusal}")
         raise Weg2LaunchRefused(plan.refusal)
+    _lru_add = getattr(ns, "_d_kv_stage_lru_raise", None)
+    ns._d_kv_stage_lru_raise = None
+    if _lru_add:
+        # (3) 29.09.: a KV rank's LRU falls below its measured peak at an
+        # allowed stage -- raise its scratch and solve again, so the planner
+        # moves the rows from resident to scratch (FR_D) before the map pins
+        _round = int(getattr(ns, "_d_kv_stage_lru_round", 0) or 0)
+        _what = ", ".join("rang%d +%d" % (r, k) for r, k in sorted(_lru_add.items()))
+        if _pinned:
+            log(f"{D_RANK_SOLVE_MARKER} {label} {D_KV_STAGE_LRU_FLOOR_MARKER}: Scratch {_what} "
+                f"waere noetig, die Karte ist gebaut -- nicht neu geloest (die Spitze kostet "
+                f"eine Zusatzwelle)")
+        elif _round >= D_KV_STAGE_LRU_FLOOR_ROUNDS:
+            log(f"{D_RANK_SOLVE_MARKER} {label} {D_KV_STAGE_LRU_FLOOR_MARKER}: nach {_round} "
+                f"Runden noch {_what} -- nicht erreicht, die Spitze kostet eine Zusatzwelle")
+        else:
+            d_kv_stage_undo(ns)
+            _base = _rank_vec(parse_group_env(getattr(ns, "env_d", "") or "")
+                              .get("SGLANG_MOE_SCRATCH_SLOTS"), n)
+            _new = [int(x) + int(_lru_add.get(r, 0)) for r, x in enumerate(_base)]
+            ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", "SGLANG_MOE_SCRATCH_SLOTS",
+                                     ",".join(str(x) for x in _new))
+            log(f"{D_RANK_SOLVE_MARKER} {label} {D_KV_STAGE_LRU_FLOOR_MARKER}: Scratch {_what} "
+                f"-> SGLANG_MOE_SCRATCH_SLOTS {','.join(str(x) for x in _base)} -> "
+                f"{','.join(str(x) for x in _new)}, neu geloest (Runde {_round + 1}; der Planer "
+                f"senkt FR_D, die Zeilen gehen von resident nach Scratch)")
+            ns._d_kv_stage_lru_round = _round + 1
+            # the map pass restores env_d; the raised scratch is part of the
+            # form the map pins (FR_D was solved with it), so it outlives it
+            ns._d_kv_stage_lru_scratch = list(_new)
+            try:
+                return log_d_rank_vram_solve(ns, cards, budgets_d, log, label, p_split=p_split,
+                                             chunk_layers=chunk_layers, card_terms=card_terms)
+            finally:
+                ns._d_kv_stage_lru_round = _round
     if _ledger is not None and plan.fits:
         # rc12e: D's extend trims the allocator cache when the card holds
         # less than floor + booked activation (WEG2-EXTEND-CACHE-TRIM).
@@ -23055,6 +23174,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _pin = pin_d_form_for_map(ns, log)
         ns.env_d = _env_d_before
         ns._d_kv_stage_written = None
+        _lru_scratch = getattr(ns, "_d_kv_stage_lru_scratch", None)
+        if _lru_scratch:
+            # (3) 29.09.: FR_D of the pinned form was solved with this scratch
+            ns.env_d = set_group_env(ns.env_d, "SGLANG_MOE_SCRATCH_SLOTS",
+                                     ",".join(str(int(x)) for x in _lru_scratch))
+            log(f"{D_RANK_SOLVE_MARKER} D(Karte, Erwartung) {D_KV_STAGE_LRU_FLOOR_MARKER}: "
+                f"SGLANG_MOE_SCRATCH_SLOTS={','.join(str(int(x)) for x in _lru_scratch)} "
+                f"gehoert zur gepinnten Form (FR_D mit ihm geloest) -- gilt fuer alle "
+                f"weiteren Passes")
         if _pin:
             from sglang.srt.weg2 import draft_post as _dp
 
