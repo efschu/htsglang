@@ -140,6 +140,47 @@ def page_floor(pos: int, page_size: int) -> int:
     return int(pos) // int(page_size) * int(page_size)
 
 
+#: F4 (#259 4c): the part name prefix of a D-park END part ("dpark<tp>-<pid>").
+PARK_PART = "dpark"
+
+
+def is_park_part(part: str) -> bool:
+    return str(part).startswith(PARK_PART)
+
+
+def _is_park_file(path: str) -> bool:
+    return f".tail.{PARK_PART}" in os.path.basename(path)
+
+
+def park_end_enabled() -> bool:
+    """F4, default off (SGLANG_WEG2_ENABLE_D_PARK_END), on top of E2 (the
+    resume of a parked request is the skip of its END state)."""
+    return bool(envs.SGLANG_WEG2_ENABLE_D_PARK_END.get()) and skip_extend_enabled()
+
+
+def park_ids(req) -> List[int]:
+    """The tokens a running D request has CONSUMED: its prompt and every
+    output token but the last (sampled, not yet fed to the model)."""
+    out = list(req.output_ids or ())
+    return list(req.origin_input_ids) + out[:-1]
+
+
+def park_spec(rid: str, ids: Sequence[int], extra_key: Optional[str], window_from: int,
+              grain: int) -> Optional[TailSpec]:
+    """F4: the END hand-off of a parked request -- the state after all
+    ``len(ids)`` consumed tokens, the KV rows from ``window_from`` (a page
+    boundary the resume re-enters at or after, D's #59b anchor) to the end.
+    None when nothing lies between (the resume is already short)."""
+    n = len(ids)
+    if n < 2 or int(grain) < 1:
+        return None
+    cut = tail_cut(n, grain)
+    prefix = int(window_from)
+    if prefix < 0 or cut <= prefix:
+        return None
+    return TailSpec(rid=str(rid), n_tokens=n, page_prefix=prefix, cut=cut, key=tail_key(ids, cut, extra_key))
+
+
 def tail_key(ids: Sequence[int], cut: int, extra_key: Optional[str]) -> str:
     """Token-exact key of the prefix [0, cut) (+ extra key)."""
     h = hashlib.sha256()
@@ -504,15 +545,16 @@ def verify_part(header: TailHeader) -> Optional[dict]:
     return read_part(header, check_digest=True)[0]
 
 
-def remove(rid: str) -> None:
+def remove(rid: str, parks: bool = False) -> None:
     """Remove the FINISHED part files of `rid`. A ``*.tmp`` is a write in
     flight on some rank -- its writer renames it or removes it itself; taking
-    it away is the fnNV4f2 FileNotFoundError (H81)."""
+    it away is the fnNV4f2 FileNotFoundError (H81). F4: a D-park part stays
+    unless ``parks`` (P's prune never takes D's park across its phase)."""
     d = _dir()
     if not d:
         return
     for p in glob.glob(os.path.join(d, f"{glob.escape(rid)}.tail.*")):
-        if _is_tmp(p):
+        if _is_tmp(p) or (_is_park_file(p) and not parks):
             continue
         try:
             os.remove(p)
@@ -534,6 +576,8 @@ def census(d: str) -> Tuple[Dict[str, float], Dict[str, int]]:
     newest: Dict[str, float] = {}
     size: Dict[str, int] = {}
     for p in glob.glob(os.path.join(d, "*.tail.*")):
+        if _is_park_file(p):
+            continue  # F4: a D-park part is D's own, never aged by P's budget
         rid = os.path.basename(p).split(".tail.", 1)[0]
         try:
             st = os.stat(p)
@@ -948,7 +992,8 @@ def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload]
         if end is not None and end.event is not None:
             end.event.synchronize()  # the forward-stream gather has landed
         header = write_part(spec, part, fa, gdn, end=end, n_parts=n_parts, e1=e1, ple=ple)
-        _prune(spec.rid, part)
+        if not is_park_part(part):  # F4: D's park never prunes P's hand-offs
+            _prune(spec.rid, part)
         # H63c: the PLE rows as P handed them over (D prints the same digest)
         if ple is not None and e1:
             ple_state.log_state("P", "e1", spec.rid, spec.cut, ple)
@@ -988,6 +1033,137 @@ def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload]
         e.gdn_digest, e.ring_digest, spec.rows, spec.cut, header.nbytes, spec.key, header.fa_digest,
         header.gdn_digest, _PUBLISH_N[0],
     )
+
+
+_PARK_N = [0]
+
+
+def park_end_refusal(req) -> str:
+    """F4: '' when this running request's END state can be parked, else why
+    not (named in the park line; the resume then extends as today)."""
+    from sglang.srt.distributed.utils import uneven_dcp_active
+
+    if not park_end_enabled():
+        return "off"
+    if not req.output_ids:
+        return "no_sampled_token"
+    if req.return_logprob or req.return_hidden_states:
+        return "logprob_or_hidden_requested"
+    if bool(uneven_dcp_active()):
+        # the token cut / uneven DCP compacts KV rows per rank and the QSA
+        # ring is the host's ('cut_ring_on_worker'): not in this stage
+        return "uneven_dcp"
+    if req.mamba_pool_idx is None or req.req_pool_idx is None:
+        return "no_slots"
+    return ""
+
+
+def publish_park_end(req, req_to_token_pool, allocator, page_size: int, part: str, n_parts: int,
+                     window_tokens: int) -> Tuple[str, object]:
+    """F4 (#259 4c), D's park_running, BEFORE the retaining retraction frees
+    the request's slots: gather this rank's END state of a running request --
+    the KV (+ complete QSA groups) rows from ``floor_page(cut) - window`` to the
+    last consumed token, the open group's ring rows, the GDN/PLE slot (state
+    after every consumed token) -- on the current stream, and write it as an
+    END-only part of the rid from a background thread (P's hand-off format and
+    directory). The resume is then E2's skip: no tail extend. Only the layers
+    this rank HOLDS are written (a Form-A expert worker writes an empty part,
+    so the manifest completes). Never raises; returns ('' or the refusal, the
+    gather's event)."""
+    try:
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sglang.srt.weg2 import tail_adopt
+
+        if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+            return "no_mamba_pool", None
+        why = park_end_refusal(req)
+        if why:
+            return why, None
+        kvpool = allocator.get_kvcache()
+        held = tail_adopt.held_shapes(kvpool, req_to_token_pool)
+        ids = park_ids(req)
+        page = int(page_size or 1)
+        grain = _grain_of(allocator, page)
+        cut = tail_cut(len(ids), grain)
+        window_from = max(0, page_floor(cut, page) - page_floor(int(window_tokens), page))
+        spec = park_spec(str(req.rid), ids, req.extra_key, window_from, grain)
+        if spec is None:
+            return "no_tail", None
+        ratio = _qsa_ratio(kvpool)
+        rows, groups, ring_rows = end_geometry(spec, ratio)
+        kv = req_to_token_pool.req_to_token[int(req.req_pool_idx), spec.page_prefix:spec.n_tokens].to(torch.int64)
+        fa: Dict[int, Tuple[torch.Tensor, ...]] = {}
+        ring: Dict[int, Tuple[torch.Tensor, ...]] = {}
+        rope = None
+        if held.fa:  # a Form-A expert worker holds no attention rows (0-head pool, no indexer)
+            fa = {g: t for g, t in _fa_rows(kvpool, kv, groups=groups, host=_to_host).items() if g in held.fa}
+            ring, rope = _ring_rows(kvpool, req.req_pool_idx, ring_rows)
+            ring = {g: t for g, t in ring.items() if g in held.fa}
+            if not ring:
+                rope = None
+        gdn: Dict[int, Tuple[torch.Tensor, ...]] = {}
+        if held.gdn:
+            gdn = {g: t for g, t in _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx).items()
+                   if g in held.gdn}
+        ple = _ple_rows(req_to_token_pool, req.mamba_pool_idx) if held.gdn else None
+        event = _record(None)
+        end = EndPayload(
+            first_token=int(req.output_ids[-1]), key=tail_key(ids, spec.n_tokens, req.extra_key),
+            rows=rows, groups=groups, ring_rows=ring_rows, fa=fa, gdn=gdn, ring=ring, rope=rope,
+            event=event, ple=ple,
+        )
+        _clear_for_park(spec.rid, _part_index(part))
+        threading.Thread(target=_write_and_log, args=(spec, part, {}, {}, end, int(n_parts), False),
+                         daemon=True, name="weg2-park-end").start()
+        _PARK_N[0] += 1
+        logger.info(
+            "F4 PARK-END rid=%s n_tokens=%d rows_from=%d cut=%d rows=%d groups=%d ring_rows=%d "
+            "first_token=%d fa_layers=%d gdn_layers=%d part=%s of=%d (n=%d)",
+            spec.rid, spec.n_tokens, spec.page_prefix, spec.cut, rows, groups, ring_rows, end.first_token,
+            len(fa), len(gdn), part, int(n_parts), _PARK_N[0],
+        )
+        return "", event
+    except Exception as exc:  # noqa: BLE001 -- no park part = the resume extends as today
+        logger.warning("F4 PARK-END failed rid=%s (%s: %s)", getattr(req, "rid", "?"), type(exc).__name__, exc)
+        return f"raised:{type(exc).__name__}", None
+
+
+def park_end_barrier(events) -> float:
+    """F4: the gathers are enqueued on the stream the park's retraction and
+    the sleep's release follow; the rows must be on the host before the
+    D->P flip frees them. Waits for the recorded events and returns the
+    milliseconds (named in the park line: a measured wait, ~ms per request)."""
+    import time as _time
+
+    t = _time.perf_counter()
+    for ev in events:
+        if ev is not None:
+            ev.synchronize()
+    return (_time.perf_counter() - t) * 1000.0
+
+
+def _clear_for_park(rid: str, own_index: str) -> None:
+    """F4: before a park part of ``rid`` is written, P's leftover parts and
+    THIS rank's own earlier park part go (either would mix into the
+    manifest). Another rank's park part is never touched: it may be the one
+    it just wrote for this very park."""
+    d = _dir()
+    if not d:
+        return
+    own = f".tail.{own_index}-"
+    for p in glob.glob(os.path.join(d, f"{glob.escape(rid)}.tail.*")):
+        if _is_tmp(p) or (_is_park_file(p) and own not in os.path.basename(p)):
+            continue
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def remove_park(rid: str) -> None:
+    """F4: the group decided on the rid's park parts -- nothing reads them again."""
+    threading.Thread(target=remove, args=(str(rid),), kwargs={"parks": True}, daemon=True,
+                     name="weg2-park-end-rm").start()
 
 
 # -- D side: readiness (the adoption itself lives in weg2/tail_adopt.py) -------------
