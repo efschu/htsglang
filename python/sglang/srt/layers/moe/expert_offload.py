@@ -249,7 +249,40 @@ _STORE_CLOCK = {"open_s": 0.0, "write_s": 0.0, "opens": 0,
                 # open/write included, see open_s/write_s), rows = expert rows
                 # repacked / rows in the [E] windows.
                 "marlin_s": 0.0, "scales_s": 0.0, "presplit_s": 0.0,
-                "rows_repacked": 0, "rows_total": 0}
+                "rows_repacked": 0, "rows_total": 0,
+                # BOOTZEIT 4 (29.09.): the per-layer host reclaim at the end
+                # of the presplit, split out of presplit_s: gc_s = gc.collect,
+                # gc_found = the unreachable objects it found (0 = it freed
+                # nothing), trim_s = malloc_trim(0).
+                "gc_s": 0.0, "gc_found": 0, "trim_s": 0.0}
+
+
+def presplit_host_reclaim() -> None:
+    """Hand the host memory a presplit layer freed back to the OS (clocked).
+
+    z30w-park (LOAD-PROFILE, 29.09.): the gc.collect here was 7.8-9.6 % of
+    the D loader thread (TP0 48.6 s, TP2 39.1 s) and malloc_trim 1.3-4.0 %,
+    both under the GIL, 48 times per D rank. The loaded [E] stack dies by
+    refcount at ``del``; the collect only helps if it sits in a reference
+    cycle -- gc_found says per boot whether it ever did."""
+    import time
+
+    from sglang.srt.environ import PresplitGcMode, envs
+
+    if envs.SGLANG_OPT_LOAD_PRESPLIT_GC.get() == PresplitGcMode.FULL:
+        import gc as _gc
+
+        _t = time.perf_counter()
+        _STORE_CLOCK["gc_found"] += int(_gc.collect())
+        _STORE_CLOCK["gc_s"] += time.perf_counter() - _t
+    _t = time.perf_counter()
+    try:
+        import ctypes as _ct
+
+        _ct.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    _STORE_CLOCK["trim_s"] += time.perf_counter() - _t
 
 
 def expert_store_clock() -> dict:
@@ -8219,15 +8252,7 @@ def presplit_expert_offload_after_repack(
         # gc + malloc_trim returns them so the host peak stays ~= spill, not the
         # full loaded set. Cheap (runs once per MoE layer at load).
         del t, buf, spill
-        import gc as _gc
-
-        _gc.collect()
-        try:
-            import ctypes as _ct
-
-            _ct.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
+        presplit_host_reclaim()
 
 
 # --- Task #49 (2026-09-20, after fn8c8b): the router-level probe ------------

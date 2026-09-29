@@ -1616,7 +1616,8 @@ class FusedMoE(torch.nn.Module):
             "pool, %.1f s) | resident buffers %.2f GiB %s | torch allocated "
             "%.2f GiB reserved %.2f GiB | split h2d=%.2f repack=%.2f "
             "store_open=%.2f store_write=%.2f exit=%.2f release=%.2f s | "
-            "repack marlin=%.2f scales=%.2f presplit=%.2f rows=%d/%d",
+            "repack marlin=%.2f scales=%.2f presplit=%.2f rows=%d/%d | "
+            "reclaim gc=%.2f found=%d trim=%.2f s",
             getattr(self, "layer_id", "?"),
             (after.device_bytes - before.device_bytes) / 2**30,
             (after.host_bytes - before.host_bytes) / 2**30,
@@ -1636,6 +1637,9 @@ class FusedMoE(torch.nn.Module):
             clock1.get("presplit_s", 0.0) - clock0.get("presplit_s", 0.0),
             clock1.get("rows_repacked", 0) - clock0.get("rows_repacked", 0),
             clock1.get("rows_total", 0) - clock0.get("rows_total", 0),
+            clock1.get("gc_s", 0.0) - clock0.get("gc_s", 0.0),
+            clock1.get("gc_found", 0) - clock0.get("gc_found", 0),
+            clock1.get("trim_s", 0.0) - clock0.get("trim_s", 0.0),
         )
         if _snap and int(getattr(self, "layer_id", -1)) in (2, 6):
             # OOM hunt (fn1g-fn1k): +1.17 GiB per presplit layer on the card

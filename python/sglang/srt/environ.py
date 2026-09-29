@@ -282,6 +282,18 @@ class Weg2HeapCensus(IntEnum):
     INLINE = 2
 
 
+class PresplitGcMode(IntEnum):
+    """The per-layer host reclaim at the end of the expert presplit
+    (layers.moe.expert_offload.presplit_host_reclaim).
+
+    FULL: gc.collect() + malloc_trim(0), the form since 19.07.
+    TRIM: malloc_trim(0) only
+    """
+
+    FULL = 0
+    TRIM = 1
+
+
 class Envs:
     # Raise on bare server_args field assignments after resolution; mutation
     # must go through ServerArgs.override() (enabled by the test harness).
@@ -1368,6 +1380,13 @@ class Envs:
     # rows that were read (+ the pad row). Same bytes for every row anyone
     # reads; the vetoed rows stay what they were -- unread garbage.
     SGLANG_MOE_REPACK_SKIP_VETOED = EnvBool(False)
+    # BOOTZEIT 4 (29.09., z30w-park): the per-layer host reclaim at the end of
+    # the presplit (PresplitGcMode). FULL: gc.collect() + malloc_trim(0) --
+    # the collect was 7.8-9.6 % of the D loader thread, under the GIL, 48x
+    # per D rank; TRIM: malloc_trim(0) only. The [ct-stream-presplit] line
+    # prints gc= found= trim= either way, so one FULL boot says whether the
+    # collect ever finds anything.
+    SGLANG_OPT_LOAD_PRESPLIT_GC = EnvInt(PresplitGcMode.FULL)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # HTTP server
