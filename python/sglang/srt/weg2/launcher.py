@@ -13031,14 +13031,32 @@ def budget_rest_from_records(profile: Optional[str] = None) -> bool:
 
 
 def booked_rest_kwargs(cards: List[Card], profile: Optional[str] = None,
-                       group: str = "D", log: Optional[Log] = None) -> Dict[str, object]:
+                       group: str = "D", log: Optional[Log] = None,
+                       capped: bool = False) -> Dict[str, object]:
     """The ``booked_rest_mib`` / ``booked_rest_provenance`` kwargs of
     :func:`budgets_from_dc` for ``group`` -- ``{}`` (budgets byte-identical)
     when the switch is off or the profile carries no record for the group
-    (then ``log`` says so once, by name: UNMEASURED, legacy terms stand)."""
+    (then ``log`` says so once, by name: UNMEASURED, legacy terms stand).
+
+    ``capped`` (WEG2-ALLOC-OVERHANG, P0 torch cache cap armed for the group,
+    :func:`torch_cache_cap_armed`): the CAPPED rest
+    ``<G>_AWAKE_REST_CAPPED_MIB`` (non-torch + allocation overhang + kept
+    cache) where the profile carries it -- the general allocator cache is
+    then torch's to release under the cap, not a post; without that record
+    the uncapped rest stands (named)."""
     if not budget_rest_from_records(profile):
         return {}
     name = _budget_rest.record_name(group)
+    if capped:
+        cname = _budget_rest.capped_record_name(group)
+        try:
+            _pconst(cname, profile)
+            name = cname
+        except KeyError:
+            if log is not None:
+                log(f"{_budget_rest.OVERHANG_MARKER} group={group}: torch cache cap armed but the "
+                    f"profile carries no {cname} -- the uncapped rest {name} stands (named); "
+                    f"measure with python -m sglang.srt.weg2.budget_rest --capped")
     try:
         vals = list(_pconst(name, profile))
     except KeyError:
@@ -13049,10 +13067,36 @@ def booked_rest_kwargs(cards: List[Card], profile: Optional[str] = None,
                 f"measure with python -m sglang.srt.weg2.budget_rest")
         return {}
     try:
-        res = _budget_rest.resolve(vals, _pconst_boots(name, profile), len(cards), group)
+        res = _budget_rest.resolve(vals, _pconst_boots(name, profile), len(cards), group, name)
     except ValueError as exc:
         raise Weg2LaunchRefused(f"{_budget_rest.MARKER}: {exc}") from None
     return {"booked_rest_mib": list(res.values), "booked_rest_provenance": res.provenance}
+
+
+def torch_cache_cap_armed(ns) -> bool:
+    """P0 (weg2/torch_cache_cap.py) armed for group D: ``SGLANG_WEG2_TORCH_CACHE_CAP=1``
+    in --env-d -- after :func:`apply_profile_torch_cache_cap_default` that is
+    the registry row's default unless --env-d named the switch itself."""
+    return str(parse_group_env(getattr(ns, "env_d", "") or "").get(TORCH_CACHE_CAP_ENV, "0")
+               ).strip() == "1"
+
+
+def apply_profile_torch_cache_cap_default(ns) -> Optional[str]:
+    """WEG2-ALLOC-OVERHANG: the registry row's ``torch_cache_cap`` into
+    ``ns.env_d`` (SGLANG_WEG2_TORCH_CACHE_CAP=1) unless --env-d states the
+    switch itself (=0 turns it off). Written INTO ``ns.env_d`` so every
+    reader (the D solve's cap vector, the budget's capped rest, P1c, the
+    rank) sees ONE value. Returns the line naming it, or None."""
+    row = weg2_form.profile_row(getattr(ns, "profile", None))
+    if row is None or not bool(getattr(row, "torch_cache_cap", False)):
+        return None
+    env_d = str(getattr(ns, "env_d", "") or "")
+    if TORCH_CACHE_CAP_ENV in parse_group_env(env_d):
+        return None
+    ns.env_d = set_group_env(env_d, TORCH_CACHE_CAP_ENV, "1")
+    return (f"{_budget_rest.OVERHANG_MARKER} registry {row.id}: --env-d {TORCH_CACHE_CAP_ENV}=1 "
+            f"(P0 torch cache cap on the physical line, D books the capped rest; --env-d "
+            f"{TORCH_CACHE_CAP_ENV}=0 = the uncapped form)")
 
 
 def d_fixed_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optional[float]]], str]:
@@ -17606,6 +17650,38 @@ _VRAM_PASS_BY_LABEL = {"D(Karte, Erwartung)": "map", "D(dry, expectation)": "dry
                        "D(d-only, expectation)": "d_only", "D": "d"}
 
 
+def d_record_torch_caps(ns, cards: List[Card], budgets_d: Sequence[int], log,
+                        label: str) -> Optional[List[int]]:
+    """WEG2-ALLOC-OVERHANG: the P0 cap vector from the RECORDS, for a D solve
+    whose verdict books no foreign/non-torch term (the 27B: its verdict's
+    ``verfuegbar`` is the NVML total, so ``verfuegbar - floor`` never binds --
+    31788 / 19661 / 19661 MiB against a torch reach of ~29.4 / 18.6 / 18.4 GiB).
+
+    Per card ``budget + rest - OTHER`` (:func:`budget_rest.torch_caps`), where
+    ``rest`` is what this pass's budget booked (the capped rest while the cap
+    is armed) and OTHER is ``D_TORCH_CAP_OTHER_MIB``. ``None`` (the caller
+    keeps the verdict's cap) for the d-only pass (no P: the record is the flip
+    form's), a profile without OTHER, or a card the rest record does not price."""
+    if label == D_ONLY_LABEL:
+        return None
+    try:
+        others = list(_pconst(_budget_rest.other_record_name("D"), ns.profile))
+    except KeyError:
+        return None
+    kw = booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns))
+    rests = kw.get("booked_rest_mib")
+    if rests is None or len(others) != len(cards):
+        return None
+    caps = _budget_rest.torch_caps([int(b) for b in budgets_d], list(rests),
+                                   [None if o is None else int(o) for o in others])
+    if caps is not None:
+        log(f"{_budget_rest.OVERHANG_MARKER} {label} caps "
+            + ", ".join(f"rang{i} {b} + {r} - {o} = {c}"
+                        for i, (b, r, o, c) in enumerate(zip(budgets_d, rests, others, caps)))
+            + f" MiB ({kw.get('booked_rest_provenance', '')})")
+    return caps
+
+
 def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                           label: str, *, p_split=None, chunk_layers=None,
                           card_terms: Optional[Sequence[Dict[str, object]]] = None) -> None:
@@ -17692,11 +17768,21 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
            ).strip() == "1":
         from sglang.srt.weg2 import torch_cache_cap as _tcc
 
-        _caps = _tcc.launcher_caps(verdikte, _floor)
-        ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", _tcc.MIB_ENV, _caps)
-        log(f"{D_RANK_SOLVE_MARKER} {label} P0 {_tcc.MARKER} {_tcc.MIB_ENV}={_caps} (verfuegbar "
-            f"minus Korridor-Floor {_floor:.0f} MiB je Rang; der torch-Allokator leert seinen "
-            f"Cache, bevor er die Linie ueberschreitet)")
+        _rec_caps = (d_record_torch_caps(ns, cards, budgets_d, log, label)
+                     if fremd is None and nicht_torch is None else None)
+        if _rec_caps is not None:
+            _caps = ",".join(str(int(x)) for x in _rec_caps)
+            ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", _tcc.MIB_ENV, _caps)
+            log(f"{D_RANK_SOLVE_MARKER} {label} P0 {_tcc.MARKER} {_tcc.MIB_ENV}={_caps} "
+                f"({_budget_rest.OVERHANG_MARKER}: physische Linie je Rang = Budget + gebuchter "
+                f"Rest - {_budget_rest.other_record_name('D')} = total - carve - dormant_other - "
+                f"nicht-torch; das Verdikt bucht hier kein fremd/nicht-torch)")
+        else:
+            _caps = _tcc.launcher_caps(verdikte, _floor)
+            ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", _tcc.MIB_ENV, _caps)
+            log(f"{D_RANK_SOLVE_MARKER} {label} P0 {_tcc.MARKER} {_tcc.MIB_ENV}={_caps} (verfuegbar "
+                f"minus Korridor-Floor {_floor:.0f} MiB je Rang; der torch-Allokator leert seinen "
+                f"Cache, bevor er die Linie ueberschreitet)")
     log(
         "%s VERDIKT %s: %s%s"
         % (
@@ -22239,6 +22325,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _h95c_line = apply_profile_d_seat_vram_default(ns)
     if _h95c_line:
         print(_h95c_line, flush=True)
+    _p0_line = apply_profile_torch_cache_cap_default(ns)  # WEG2-ALLOC-OVERHANG
+    if _p0_line:
+        print(_p0_line, flush=True)
     if not ns.teardown:
         _park_split = d_park_split_refusal(ns)  # 27B park (RV B5): front and D must agree
         if _park_split:
@@ -23901,7 +23990,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _map_other, _map_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
         ns._d_expect_other = (_map_other if not _map_other_why.startswith("legacy") else None)
         log("D-EXPECT DORMANT-OTHER D(Karte, Erwartung): " + ", ".join(f"nvml{c.nvml_index} {_map_other[c.uuid]}" for c in cards) + f" MiB -- {_map_other_why}")
-        _map_budgets = budgets_from_dc(cards, _map_other, log, "D(Karte, Erwartung)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), **booked_rest_kwargs(cards, ns.profile, "D"), terms_out=_map_terms)
+        _map_budgets = budgets_from_dc(cards, _map_other, log, "D(Karte, Erwartung)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), **booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns)), terms_out=_map_terms)
         log_d_rank_vram_solve(ns, cards, _map_budgets, log, "D(Karte, Erwartung)",
                               p_split=p_split, chunk_layers=chunk_layers,
                               card_terms=(_map_terms if d_awake_rest(cards, ns.profile)[0] is not None else None))
@@ -24397,7 +24486,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
             charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
             awake_rest_mib=_rest, awake_rest_provenance=_rest_prov, terms_out=_d_terms,
-            **booked_rest_kwargs(cards, ns.profile, "D", log),
+            **booked_rest_kwargs(cards, ns.profile, "D", log, capped=torch_cache_cap_armed(ns)),
         )
         state.budgets["D"] = budgets_d
         if label == "D":  # the real pass: P's residue as measured after sleep(P)
@@ -24464,7 +24553,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _dry_terms: List[Dict[str, object]] = []
         _dry_other, _dry_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
         log("D-EXPECT DORMANT-OTHER D(dry, expectation): " + ", ".join(f"nvml{c.nvml_index} {_dry_other[c.uuid]}" for c in cards) + f" MiB -- {_dry_other_why}")
-        budgets_d = budgets_from_dc(cards, _dry_other, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), **booked_rest_kwargs(cards, ns.profile, "D"), terms_out=_dry_terms)
+        budgets_d = budgets_from_dc(cards, _dry_other, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), **booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns)), terms_out=_dry_terms)
         # #145 AN BEIDEN STELLEN -- siehe #114 direkt darunter: es gibt ZWEI
         # Stellen, an denen budgets_d entsteht, und eine Fassung, die nur die
         # untere trifft, fehlt genau im Dry-Run, wo das Gate sie sucht.
@@ -24573,7 +24662,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
             charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
             awake_rest_mib=_rest, awake_rest_provenance=_rest_prov,
-            **booked_rest_kwargs(cards, ns.profile, "D"),
+            **booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns)),
         )
         uuids = [c.uuid for c in cards]
         names = {c.uuid: f"nvml{c.nvml_index}" for c in cards}

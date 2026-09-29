@@ -197,7 +197,7 @@ def switch_on(row_default: bool, environ: Optional[Mapping[str, str]] = None) ->
 
 
 def resolve(values: Optional[Sequence[Optional[int]]], boots: str, n_cards: int,
-            group: str) -> Optional[Resolved]:
+            group: str, name: Optional[str] = None) -> Optional[Resolved]:
     """The record's values for ``n_cards`` cards, or ``None`` when the
     profile carries no record for ``group`` (every card UNMEASURED; the
     caller's budgets stay byte-identical). A record of another card count is
@@ -206,10 +206,166 @@ def resolve(values: Optional[Sequence[Optional[int]]], boots: str, n_cards: int,
         return None
     vals = list(values)
     if len(vals) != int(n_cards):
-        raise ValueError(f"{record_name(group)} has {len(vals)} entries for {n_cards} cards; "
-                         f"re-measure with python -m sglang.srt.weg2.budget_rest")
+        raise ValueError(f"{name or record_name(group)} has {len(vals)} entries for {n_cards} "
+                         f"cards; re-measure with python -m sglang.srt.weg2.budget_rest")
     return Resolved(values=tuple(None if v is None else int(v) for v in vals),
-                    provenance=f"{record_name(group)} {boots}".strip())
+                    provenance=f"{name or record_name(group)} {boots}".strip())
+
+
+# --------------------------------------------------------------------------
+# WEG2-ALLOC-OVERHANG (desk/27b-d-alloc-overhang-0929): the rest SPLIT into its
+# posts, and the part the torch cache cap (weg2/torch_cache_cap.py, P0
+# 5f33ec18836a) takes away.
+#
+# At the tightest instant the measured rest is (w109290020 D-TP0, 5090)::
+#
+#     3191 = over 435 (peak_allocated 27955 - budget 27520: the extend
+#                      transient of a 3971-row chunk above the budget)
+#          + cache 1325 (peak_reserved 29280 - peak_allocated 27955:
+#                        private_free 428 of the graph/tag pools + 897 general)
+#          + other 1431 (card_total - card_free - reserved - dormant_other:
+#                        D's non-torch 1102 = context/driver/NCCL 846 + lmem
+#                        256, WEG2-DC-BREAKDOWN; plus P's served dormant growth)
+#
+# With the cap armed, torch's caching allocator releases its free segments
+# before it grows past the cap (set_per_process_memory_fraction), so the
+# general cache stops being a post of its own. The capped rest books
+#
+#     OTHER  max over awake (chunk/round) lines of
+#            card_total - card_free - reserved - dormant_other
+#     OVER   max over awake lines of peak_allocated - budget (signed: a card
+#            whose allocations stay under its budget books that slack)
+#     KEEP   private_free + general_cache of the first post-capture
+#            WEG2-GRAPH-POOL line: what the allocator holds right after the
+#            graphs are captured (the private pools' free part, which no
+#            empty_cache reaches, and the default pool's residue)
+#
+# each the maximum over the boots, and the cap per card is the physical line
+# ``card_total - driver_carve - dormant_other - growth - OTHER`` (=
+# ``budget + OVER + KEEP``): torch may hold its budget, its measured
+# overhang and the kept cache, and nothing that belongs to the non-torch part.
+# KEEP at post-capture is a LOWER bound of the cache the allocator cannot
+# return under load -- the measurement cell prices the real one.
+# --------------------------------------------------------------------------
+
+CAPPED_RECORD_FMT = "{group}_AWAKE_REST_CAPPED_MIB"
+OTHER_RECORD_FMT = "{group}_TORCH_CAP_OTHER_MIB"
+OVERHANG_MARKER = "WEG2-ALLOC-OVERHANG"
+_GRAPH_POOL = re.compile(r"WEG2-GRAPH-POOL rank=(?P<rank>\d+) ")
+_AWAKE_PHASES = ("chunk", "round")
+
+
+def capped_record_name(group: str) -> str:
+    return CAPPED_RECORD_FMT.format(group=str(group).upper())
+
+
+def other_record_name(group: str) -> str:
+    return OTHER_RECORD_FMT.format(group=str(group).upper())
+
+
+@dataclass(frozen=True)
+class AwakePosts:
+    """One rank of one boot: the maxima over its awake lines and the kept cache."""
+
+    other_total: Optional[int]   # max card_total - card_free - reserved (incl. dormant_other)
+    peak_allocated: Optional[int]
+    keep: Optional[int]          # post-capture private_free + general_cache
+
+
+def awake_posts(group_text: str) -> Dict[int, AwakePosts]:
+    """rank -> :class:`AwakePosts` from ``WEG2-VRAM-PEAK`` lines of the awake
+    phases (chunk / round: D serves, every tag is mapped) and the FIRST
+    ``WEG2-GRAPH-POOL phase=post-capture`` line. ``na`` fields are skipped."""
+    other: Dict[int, int] = {}
+    peak: Dict[int, int] = {}
+    keep: Dict[int, int] = {}
+    for line in group_text.splitlines():
+        m = _GRAPH_POOL.search(line)
+        if m:
+            f = dict(_FIELD.findall(line[m.start():]))
+            if f.get("phase") != "post-capture":
+                continue
+            try:
+                r = int(f["rank"])
+                k = int(f["private_free_mib"]) + int(f["general_cache_mib"])
+            except (KeyError, ValueError):
+                continue
+            keep.setdefault(r, k)
+            continue
+        m = _PEAK.search(line)
+        if not m:
+            continue
+        f = dict(_FIELD.findall(line[m.start():]))
+        if f.get("phase") not in _AWAKE_PHASES:
+            continue
+        try:
+            r = int(f["rank"])
+            o = int(f["card_total_mib"]) - int(f["card_free_mib"]) - int(f["reserved_mib"])
+            pa = int(f["peak_allocated_mib"])
+        except (KeyError, ValueError):
+            continue
+        other[r] = o if r not in other else max(other[r], o)
+        peak[r] = pa if r not in peak else max(peak[r], pa)
+    return {r: AwakePosts(other.get(r), peak.get(r), keep.get(r))
+            for r in set(other) | set(peak) | set(keep)}
+
+
+def capped_record_from_boots(
+    boots: Sequence[Tuple[str, str, str]], group: str, n_cards: int,
+) -> Tuple[List[Optional[int]], List[Optional[int]], List[str]]:
+    """``(OTHER, CAPPED_REST, lines)`` per card ordinal: each post the MAXIMUM
+    over the boots that priced it (a boot's budget line and its awake lines),
+    the capped rest = OTHER + OVER + KEEP. ``None`` where a post is missing on
+    every boot (UNMEASURED, never zero)."""
+    other: List[Optional[int]] = [None] * int(n_cards)
+    over: List[Optional[int]] = [None] * int(n_cards)
+    keep: List[Optional[int]] = [None] * int(n_cards)
+    lines: List[str] = []
+
+    def _mx(vec, i, v):
+        if v is not None:
+            vec[i] = v if vec[i] is None else max(vec[i], v)
+
+    for tag, front, grp in boots:
+        posts = awake_posts(grp)
+        for o, (nvml, budget, dormant) in sorted(budget_lines(front, group).items()):
+            if o >= n_cards or o not in posts:
+                continue
+            p = posts[o]
+            ot = None if p.other_total is None else p.other_total - dormant
+            ov = None if p.peak_allocated is None else p.peak_allocated - budget
+            _mx(other, o, ot)
+            _mx(over, o, ov)
+            _mx(keep, o, p.keep)
+            lines.append(f"{OVERHANG_MARKER} {tag} group={group} ordinal={o} nvml{nvml}: "
+                         f"other {ot} (max card_total - card_free - reserved - dormant_other "
+                         f"{dormant}) over {ov} (max peak_allocated {p.peak_allocated} - budget "
+                         f"{budget}) keep {p.keep} (post-capture private_free + general_cache) MiB")
+    capped: List[Optional[int]] = []
+    for o in range(int(n_cards)):
+        if other[o] is None or over[o] is None or keep[o] is None:
+            capped.append(None)
+            lines.append(f"{OVERHANG_MARKER} group={group} ordinal={o}: other {other[o]} over "
+                         f"{over[o]} keep {keep[o]} -- a post is missing: UNMEASURED")
+            continue
+        capped.append(int(other[o] + over[o] + keep[o]))
+        lines.append(f"{OVERHANG_MARKER} group={group} ordinal={o}: capped rest {capped[-1]} = "
+                     f"other {other[o]} + over {over[o]} + keep {keep[o]} MiB")
+    return other, capped, lines
+
+
+def torch_caps(budgets: Sequence[int], rests: Sequence[Optional[int]],
+               others: Sequence[Optional[int]]) -> Optional[List[int]]:
+    """Per card the torch cache cap on the physical line: the budget priced
+    ``total - carve - dormant_other - growth - rest``, so
+    ``total - carve - dormant_other - growth - OTHER = budget + rest - OTHER``.
+    ``None`` when a card is not priced by both records (the caller keeps the
+    verdict's cap, named) -- a partial vector never caps a card it never saw."""
+    if len(budgets) != len(rests) or len(budgets) != len(others):
+        return None
+    if any(r is None for r in rests) or any(o is None for o in others):
+        return None
+    return [int(b) + int(r) - int(o) for b, r, o in zip(budgets, rests, others)]
 
 
 def _boot_tag(path: str) -> str:
@@ -223,6 +379,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m sglang.srt.weg2.budget_rest")
     ap.add_argument("--group", choices=("P", "D"), default="D")
     ap.add_argument("--cards", type=int, default=3)
+    ap.add_argument("--capped", action="store_true",
+                    help="also print the torch-cache-cap records (<G>_TORCH_CAP_OTHER_MIB, "
+                         "<G>_AWAKE_REST_CAPPED_MIB)")
     ap.add_argument("front_logs", nargs="+", help="front logs, newest first; the group log "
                     "is the same path with .front.log -> .<group>.log")
     a = ap.parse_args(argv)
@@ -234,13 +393,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         grp = ""
         if os.path.exists(gp):
             with open(gp, errors="replace") as fh:
-                grp = "\n".join(ln for ln in fh if "WEG2-VRAM-PEAK" in ln)
+                grp = "\n".join(ln for ln in fh
+                                if "WEG2-VRAM-PEAK" in ln or "WEG2-GRAPH-POOL" in ln)
         boots.append((_boot_tag(p), front, grp))
     vals, lines = record_from_boots(boots, a.group, a.cards)
     for ln in lines:
         print(ln)
     print(json.dumps({"name": record_name(a.group), "value": vals,
                       "boots": [b[0] for b in boots], "kind": "memory"}))
+    if a.capped:
+        others, capped, clines = capped_record_from_boots(boots, a.group, a.cards)
+        for ln in clines:
+            print(ln)
+        for name, v in ((other_record_name(a.group), others),
+                        (capped_record_name(a.group), capped)):
+            print(json.dumps({"name": name, "value": v, "boots": [b[0] for b in boots],
+                              "kind": "memory"}))
     return 0
 
 

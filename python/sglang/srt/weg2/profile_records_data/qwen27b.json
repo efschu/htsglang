@@ -92,6 +92,50 @@
    "power_limit_source": "not recorded per record; the eight boots ran 5090 400 W / 3080 230 W (boot json power_limit_w)"
   },
   {
+   "name": "D_TORCH_CAP_OTHER_MIB",
+   "value": [
+    1537,
+    853,
+    793
+   ],
+   "provenance": "desk/27b-d-alloc-overhang-0929 (weg2/budget_rest.py --capped): per card ordinal (5090 nvml1, nvml0, nvml2) the MAXIMUM over the awake (phase chunk/round) WEG2-VRAM-PEAK lines of the newest 8 row-authority boots of card_total_mib - card_free_mib - reserved_mib - dormant_other (the boot's own 'budget D group=D' line): what the card holds beside D's torch allocator and P's measured dormant footprint -- D's non-torch part (WEG2-DC-BREAKDOWN stage=release 'other': 5090 1102 = context/driver/communicator 846 + lmem 256, 3080 518 = 414 + 104) plus P's served dormant growth. 5090 1537 (w109290020), nvml0 853 (w109290020), nvml2 793 (w109290020). The torch cache cap stands on the physical line total - carve - dormant_other - growth - this.",
+   "boots": [
+    "dkr27browauthoritybar1fs09291152",
+    "dkr27browauthoritybar1fs09290956",
+    "dkr27browauthoritybar1w109290020",
+    "dkr27browauthoritybar1w109290002",
+    "dkr27browauthoritybar1w109281851",
+    "dkr27browauthoritybar1w109281715",
+    "dkr27browauthoritybar1w109281556",
+    "dkr27browauthoritybar1w109281300"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded per record; the eight boots ran 5090 400 W / 3080 230 W (boot json power_limit_w)"
+  },
+  {
+   "name": "D_AWAKE_REST_CAPPED_MIB",
+   "value": [
+    2675,
+    1470,
+    1250
+   ],
+   "provenance": "desk/27b-d-alloc-overhang-0929 (weg2/budget_rest.py --capped): the awake rest D books while the P0 torch cache cap (weg2/torch_cache_cap.py) is armed = OTHER (D_TORCH_CAP_OTHER_MIB) + OVER (max peak_allocated_mib - budget over the awake lines, signed: 5090 564 w109281851, nvml0 -111, nvml2 -271) + KEEP (private_free_mib + general_cache_mib of the first WEG2-GRAPH-POOL phase=post-capture line: 5090 428+146, 3080 584+144). Replaces D_AWAKE_REST_BOOKED_MIB (3191/2079/2067) only under the cap: the general allocator cache at the tightest instants (897/944/1122 MiB, peak_reserved - peak_allocated - private_free) is then released by torch before it grows past the cap instead of being booked. Each post the max over the same 8 boots. KEEP is a LOWER bound of the cache the allocator cannot return under load (post-capture, not under an extend) -- the measurement cell (27b-row-authority-p0) prices the real one; until then this record is armed only with the cap.",
+   "boots": [
+    "dkr27browauthoritybar1fs09291152",
+    "dkr27browauthoritybar1fs09290956",
+    "dkr27browauthoritybar1w109290020",
+    "dkr27browauthoritybar1w109290002",
+    "dkr27browauthoritybar1w109281851",
+    "dkr27browauthoritybar1w109281715",
+    "dkr27browauthoritybar1w109281556",
+    "dkr27browauthoritybar1w109281300"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded per record; the eight boots ran 5090 400 W / 3080 230 W (boot json power_limit_w)"
+  },
+  {
    "name": "P_DRAFT_RESIDENT_BUDGET_MIB",
    "value": 1618.2,
    "provenance": "27B NEXTN head: mtp 405.2 + embed 1213.0 MiB (#1233 fix 3, L2 resident_mib)",

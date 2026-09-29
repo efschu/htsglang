@@ -509,6 +509,19 @@ class ModelProfile:
     #: rc12c) and its reserve is 0 already. SGLANG_WEG2_BUDGET_REST_RECORD=0
     #: turns it off (byte-identical budgets).
     budget_rest_from_records: bool = False
+    #: WEG2-ALLOC-OVERHANG (desk/27b-d-alloc-overhang-0929) on P0 (5f33ec18836a,
+    #: weg2/torch_cache_cap.py): the row's default for SGLANG_WEG2_TORCH_CACHE_CAP
+    #: in --env-d (an explicit --env-d value wins, =0 turns it off). Armed on a
+    #: profile that carries ``D_TORCH_CAP_OTHER_MIB`` and
+    #: ``D_AWAKE_REST_CAPPED_MIB`` (weg2/budget_rest.py --capped), the D budget
+    #: books the CAPPED rest (non-torch + allocation overhang + kept cache)
+    #: instead of ``D_AWAKE_REST_BOOKED_MIB`` -- the general allocator cache
+    #: (897/944/1122 MiB at the tightest instants) stops being a post and goes
+    #: to the KV pool -- and each D rank caps torch at the physical line
+    #: ``budget + rest - OTHER``. qwen27b: OFF until the measurement cell
+    #: (Leistungsschalter rule 29.09.: default AN after the metal proof, in the
+    #: same commit as the proof); nextflash off (its verdict prices the cap).
+    torch_cache_cap: bool = False
     #: 27B row 24h (HG): :data:`HG_SWITCHES` on as ONE bundle -- they were
     #: measured only together: dkr27bint8dhgbar1dhg109261456 against
     #: dkr27bbar1i8h109261444 (rc9dwin bfc6bd87e2), step time better at all 24
@@ -742,6 +755,10 @@ PROFILES: Dict[str, ModelProfile] = {
         # VRAM-GRUNDGESETZ 29.09.: D books its measured awake rest
         # (D_AWAKE_REST_BOOKED_MIB, 8 boots) instead of reserve + 404 + 489.
         budget_rest_from_records=True,
+        # WEG2-ALLOC-OVERHANG 29.09.: P0 torch cache cap + capped rest. OFF
+        # until the measurement cell (27b-row-authority-p0, one boot); AN in
+        # the commit that carries its proof.
+        torch_cache_cap=False,
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,
