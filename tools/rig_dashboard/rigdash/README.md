@@ -19,6 +19,11 @@ dann rückwirkend), D-Extends von `HOST-ANON-PASS phase=EXTEND wall_ms` (unter 5
 Ohne Anker bleibt die alte Zeichnung. Zwischen `WEG2-FLIP done woke=D` und dem ersten TP0-
 Decode-Token steht **Flip-Nachlauf D** statt „wach, keine Arbeit“, aufgeteilt nach
 `WEG2-POST-WAKE-PASS n=0` (Lesungen vor Pass 0, prepare = Park-Resume, run = Re-Extend).
+Gilt für NF und 27B.
+
+**TODO (27B-Review 29.09.):** auch das ist reine Anzeige aus Log-Zeilen. Umstellen auf
+`events.jsonl`, sobald die Front Flip- und Pass-Ereignisse (FLIP done, erster Decode, POST-WAKE-PASS,
+Forward-Start/-Ende je Rang) dort schreibt; dann entfallen FWD-/FLUSH-/ANON-Paarung und Log-Scan.
 
 Der Dienst selbst ist in `server.py` und `deploy/rig-dashboard.service` beschrieben
 (LAN :8890, läuft aus `/opt/rigdash/current`, Deploy per `deploy/install.sh <rev>`).

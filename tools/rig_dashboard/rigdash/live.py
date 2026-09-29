@@ -788,7 +788,9 @@ class Boot:
         """'Flip-Nachlauf D' (WACH-OHNE-ARBEIT-0929): from WEG2-FLIP done woke=D to the first TP0
         'Decode rank batch' t: after it -- flip time by the user's definition, not 'awake, no work'.
         Split by the TP0 WEG2-POST-WAKE-PASS n=0 inside it: reads before pass 0, prepare (park
-        resume), re-extend (the rest up to the first decode round)."""
+        resume), re-extend (the rest up to the first decode round).
+        TODO (27B-Review 29.09.): display only, read from log lines -- move to events.jsonl once the
+        front writes flip / pass / forward events there (see README, Phasenleiste)."""
         dec = sorted(e.get("t_exact") or _mid(e["t"]) for g in ("D",)
                      for e in self.ev.get("%s_decode_rank" % g, ()) if e.get("rank", 0) == 0 and e["t"] >= lo - 30)
         begins = sorted(e["t"] for e in self.ev["flip_begins"])
