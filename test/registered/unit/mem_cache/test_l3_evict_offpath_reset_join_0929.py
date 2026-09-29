@@ -69,7 +69,7 @@ class L3EvictOffResetJoinTest(CustomTestCase):
             h = _Harness(d, offpath)
             try:
                 for i in range(N_PAGES):
-                    self.assertTrue(h.write(f"p{i:05d}"))
+                    self.assertTrue(h.write(f"p{i:05d}_t"))
                 # the cap sits exactly at the committed directory: the next page crosses it
                 with h.ev._lock:
                     h.ev.max_size_bytes = h.ev._directory_bytes_locked()
@@ -81,7 +81,7 @@ class L3EvictOffResetJoinTest(CustomTestCase):
                     real_remove(p)
 
                 with mock.patch.object(lfe.os, "remove", slow_remove):
-                    backup = threading.Thread(target=h.write, args=("crossing",), name="backup")
+                    backup = threading.Thread(target=h.write, args=("crossing_t",), name="backup")
                     t0 = time.monotonic()
                     backup.start()
                     backup.join(JOIN_BOUND_S)          # the #1068 RESET JOIN, bounded
@@ -120,6 +120,91 @@ class L3EvictOffResetJoinTest(CustomTestCase):
         self.assertEqual(missing, [])
         self.assertLessEqual(final, int(cap * ev.eviction_ratio))
         self.assertIsNone(ev._bg_evict_thread)
+
+
+class L3EvictOffpathPauseTest(CustomTestCase):
+    """NF review 2 (5a8b44523c): (2a) rescan's walk runs WITHOUT _lock -- a background unlink between its
+    snapshot and install leaves a PHANTOM entry (index says there, file gone); (2b) after sleep's pause the
+    background evictor must not unlink anything (the sibling owns the store). Both red on 5a8b44523c."""
+
+    def _store(self, d, n=N_PAGES):
+        h = _Harness(d, offpath=True)
+        for i in range(n):
+            self.assertTrue(h.write(f"p{i:05d}_t"))
+        with h.ev._lock:
+            h.ev.max_size_bytes = h.ev._directory_bytes_locked()
+        return h
+
+    def test_rescan_walk_sees_no_background_unlink_phantom(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = self._store(d)
+            try:
+                real_census = h.ev._census_existing_files
+                real_remove = os.remove
+
+                def slow_remove(p):
+                    time.sleep(0.002)
+                    real_remove(p)
+
+                def census_then_evict():
+                    entries = real_census()  # the walk's snapshot: every page still on disk
+                    # background eviction wakes between snapshot and install (the review's interleaving)
+                    with h.ev._lock:
+                        h.ev._kick_bg_evictor_locked()
+                    time.sleep(0.5)
+                    return entries
+
+                with mock.patch.object(lfe.os, "remove", slow_remove), \
+                        mock.patch.object(h.ev, "_census_existing_files", census_then_evict), \
+                        mock.patch.object(lfe._sj, "enabled", lambda: False):
+                    h.ev.rescan()
+                    with h.ev._lock:
+                        indexed = list(h.ev._lru)
+                    phantom = [s for s in indexed if not os.path.exists(os.path.join(d, f"{s}.bin"))]
+                    self.assertEqual(phantom, [], f"{len(phantom)} phantom entries after rescan")
+                    # after the install the evictor may run again and must still keep index == disk
+                    t_end = time.monotonic() + 10
+                    while time.monotonic() < t_end:
+                        with h.ev._lock:
+                            if h.ev._directory_bytes_locked() <= int(h.ev.max_size_bytes * h.ev.eviction_ratio):
+                                break
+                        time.sleep(0.05)
+                    # the kick given during the walk is not lost: the run happens after the install ...
+                    self.assertGreater(len(h.evicted), 0, "the background run never happened")
+                    with h.ev._lock:
+                        indexed = list(h.ev._lru)
+                    # ... and still leaves no index entry without its file
+                    self.assertEqual([s for s in indexed if not os.path.exists(os.path.join(d, f"{s}.bin"))], [])
+            finally:
+                h.stop()
+
+    def test_after_sleep_pause_no_eviction(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = self._store(d)
+            try:
+                real_remove = os.remove
+                removed = []
+
+                def slow_remove(p):
+                    time.sleep(UNLINK_S)
+                    removed.append(p)
+                    real_remove(p)
+
+                with mock.patch.object(lfe.os, "remove", slow_remove):
+                    with h.ev._lock:
+                        h.ev.max_size_bytes = int(h.ev._directory_bytes_locked() * 0.5)  # long background run
+                        h.ev._kick_bg_evictor_locked()
+                    time.sleep(0.3)  # it is running
+                    self.assertTrue(h.ev.pause_background_eviction(timeout=5.0), "drain did not park the evictor")
+                    n_at_pause = len(removed)
+                    time.sleep(1.0)  # the sleeping group: nothing may be unlinked now
+                    self.assertEqual(len(removed), n_at_pause, "the background evictor unlinked after sleep's pause")
+                    h.ev.resume_background_eviction()
+                    time.sleep(0.5)
+                    self.assertGreater(len(removed), n_at_pause, "resume did not restart the background run")
+                    h.ev.pause_background_eviction(timeout=10.0)
+            finally:
+                h.stop()
 
 
 if __name__ == "__main__":

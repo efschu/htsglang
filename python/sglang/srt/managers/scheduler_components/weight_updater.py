@@ -4284,6 +4284,21 @@ class SchedulerWeightUpdaterManager:
     def _weg2_anchors_lost_for(self, what: str) -> List[int]:
         return _weg2_anchors_lost_for_leg(self, what)
 
+    def _weg2_pause_l3_evictor(self) -> None:
+        """L3 evict off-path: park this group's background L3 evictor at the sleep entry (see the call site)."""
+        sch = self.scheduler
+        tc = getattr(sch, "tree_cache", None)
+        if tc is None or not getattr(sch, "enable_hierarchical_cache", False):
+            return
+        backend = getattr(getattr(tc, "cache_controller", None), "storage_backend", None)
+        pause = getattr(backend, "pause_background_eviction", None)
+        if pause is None:
+            return
+        try:
+            pause()
+        except Exception as e:  # noqa: BLE001 -- an instrument-free no-op path must never break the sleep
+            logger.warning("L3 evictor pause at sleep failed: %s: %s", type(e).__name__, e)
+
     def _weg2_rescan_store_index(self) -> None:
         """The wake's store rescan, OFF the resume RPC by default (28.09.).
 
@@ -9005,6 +9020,9 @@ class SchedulerWeightUpdaterManager:
             # walking into prepare_for_extend.  ONE flag on the object that
             # owns the pools; cleared after resume(KV_CACHE) below.
             if scheduler is not None:
+                # L3 evict off-path (NF review 2): the sleeping group's background L3 evictor parks BEFORE the
+                # dormant marker -- after it the sibling owns the store. No-op when the switch is off.
+                self._weg2_pause_l3_evictor()
                 scheduler.weg2_dormant = True
                 logger.info(
                     "WEG2-DORMANT set: kv_cache paused, admission seams refuse "

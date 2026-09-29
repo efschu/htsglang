@@ -2113,6 +2113,13 @@ class HiCacheFile(HiCacheStorage):
                 self._evictor.abort(suffixed)
             return False
 
+    def pause_background_eviction(self) -> bool:
+        """L3 evict off-path (NF review 2): park the background evictor before this group sleeps -- the sibling
+        group owns the store from its wake on, and two owners must never evict at once (``rescan``). Resumed by
+        the wake's ``rescan_eviction_index``. No-op without the evictor thread."""
+        _pause = getattr(self._evictor, "pause_background_eviction", None)
+        return True if _pause is None else bool(_pause())
+
     def rescan_eviction_index(self) -> dict:
         """Re-read the store directory into the LRU index (Weg 2 wake path).
 
@@ -4364,6 +4371,10 @@ class HiCacheFile(HiCacheStorage):
                 self.file_path,
             )
             return False
+        # NF review 2 (L3 evict off-path): no background unlink races this walk (evictor.clear resumes it)
+        _pause = getattr(self._evictor, "pause_background_eviction", None)
+        if _pause is not None:
+            _pause()
         _idx = self._l3_index()
         if _idx is not None:
             _idx.clear()  # #1459
