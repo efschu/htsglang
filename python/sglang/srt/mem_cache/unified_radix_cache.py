@@ -4472,6 +4472,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return None
         return pool
 
+    def _weg2_kv_only_shadow_anchor(self) -> bool:
+        """A KV-only rank (:func:`rank_role.kv_only_rank`: dense share 0, owns
+        KV token rows, holds no GDN state) whose mamba host pool is the plain
+        byteless R12 shadow pool, not an arena: its anchor rows come from that
+        pool's own allocator, never from an arena claim."""
+        from sglang.srt.rank_role import kv_only_rank
+
+        if not kv_only_rank():
+            return False
+        group = getattr(self.cache_controller, "mem_pool_host", None)
+        get_pool = getattr(group, "get_pool", None)
+        names = getattr(group, "entry_map", None) or {}
+        if get_pool is None or PoolName.MAMBA not in names:
+            return False
+        try:
+            mp = get_pool(PoolName.MAMBA)
+        except Exception:  # noqa: BLE001 - no pool: the arena path decides
+            return False
+        return mp is not None and not hasattr(mp, "arena_resolve_reads")
+
+    def _weg2_shadow_anchor_room(self, mxfer) -> bool:
+        pool = self.cache_controller.mem_pool_host.get_pool(PoolName.MAMBA)
+        return int(pool.available_size()) >= len(mxfer.device_indices)
+
     def _weg2_mamba_pool(self):
         cc = self.cache_controller
         group = getattr(cc, "mem_pool_host", None)
@@ -4609,6 +4633,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for x in xfers:
                 if x.name == PoolName.MAMBA and x.host_indices is None and x.device_indices is not None:
                     mxfer, mct = x, ct
+        if mxfer is not None and self._weg2_kv_only_shadow_anchor():
+            # M1s rc12z30j (D-Log 01:04:50-01:06:34): under the #239 token cut
+            # a Form A worker's KV host pool is an arena (its rows are the
+            # page's bytes) while its mamba host pool stays the plain byteless
+            # shadow pool (R12, 0 B/row). There is no mamba arena slot to
+            # claim -- the anchor takes a shadow row from that pool in
+            # controller.write, like the staging path. Refusing here
+            # ('mamba_pool_unbound') refused EVERY worker backup: 16189x
+            # 'R12 SHADOW-SHORT', the workers' mamba eviction spun, TP0 alone
+            # reached the extend's MoE all-reduce -> Bar1CollectiveAborted.
+            # A full shadow pool under eviction goes KV-only (P-FUND): the
+            # worker's anchor is bookkeeping, its KV rows are what the
+            # eviction must free; R12 reconciles the anchor ('short').
+            if kv_only_if_mamba_refused and not self._weg2_shadow_anchor_room(mxfer):
+                comp_xfers.pop(mct, None)
+                self._pfund_note_kv_only(node)
+            mxfer = None
         if mxfer is not None:
             mp = self._weg2_mamba_pool()
             mrows = self._weg2_mamba_claim(node, mp, hashes[-1]) if mp is not None else None
