@@ -70,6 +70,9 @@ class DualStageHullSpec(CustomTestCase):
         src = inspect.getsource(MR.ModelRunner.load_model)
         self.assertIn("elif not self.is_draft_worker and _dual_share_on():", src)
         self.assertIn("self.model = build_dual_stage_model(self)", src)
+        init_src = inspect.getsource(MR.ModelRunner.init_torch_distributed)
+        self.assertLess(init_src.index("wait_for_d_before_load(self)"),
+                        init_src.index("pre_model_load_memory = get_available_gpu_memory("))
         env0 = os.environ.pop(H.DUAL_SHARE_ENV, None)
         try:
             self.assertFalse(MR._dual_share_on())

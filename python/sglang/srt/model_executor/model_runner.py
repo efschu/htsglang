@@ -2288,6 +2288,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # ranks); consistency across ranks is restored later by
         # min-reducing the derived token capacities.
         uneven_memory = self.server_args.uneven_memory_budgets_active()
+        if not self.is_draft_worker and _dual_share_on():
+            # DUAL-TP3PP3 1b: D boots alongside and sizes its KV off the card's
+            # free memory; this rank's budget is a before/after DELTA of the
+            # reading below. Take the reading only once D is READY, or D's
+            # whole footprint lands in this rank's "used by me".
+            from sglang.srt.model_executor.dual_stage_hull import (
+                wait_for_d_before_load,
+            )
+
+            wait_for_d_before_load(self)
         pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,

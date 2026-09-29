@@ -296,3 +296,11 @@ def _env_with_d_ratios(union_dir: Optional[str]) -> Mapping[str, str]:
     if fams and not env.get(D_FAMILIES_ENV, "").strip():
         env[D_FAMILIES_ENV] = ";".join(f"{k}={','.join(str(int(x)) for x in v)}" for k, v in fams.items())
     return env
+
+
+def wait_for_d_before_load(runner) -> None:
+    """Called from init_torch_distributed BEFORE the pre-load memory reading
+    (see there). No-op without a union bind target."""
+    bind = _union_bind_target(runner)
+    if bind is not None:
+        _wait_for_owner(bind)
