@@ -144,6 +144,8 @@ X_EXACT_VERDICT_NOTE = ("; X-EXACT: uncached, est_prompt and carrier_est are the
 #: 3.5.4, the #111 link-seam bound reused).  No code reads it except the
 #: argparse default -- the runtime reads ``Front.drain_deadline_s``.
 DRAIN_DEADLINE_DEFAULT_S = 120.0
+#: y3k-korr 09292034: the park cause (and D reason) of a POST /weg2/flip from D
+MANUAL_FLIP_PARK_CAUSE = "manual-flip"
 #: Spec C10/K5: the recorded PRE-BARLINK break-even inputs (record 1l/1o
 #: weg2zr2 pair) that produce X's fallback.  Only the FRONT's default; the
 #: launcher recomputes from this boot's own lines and tells the front (C2).
@@ -4826,7 +4828,18 @@ class Front:
         running = self._flip_ledger(D)
         self.admit_d = False
         now = time.time()
-        if immediate is not None:
+        if cause == MANUAL_FLIP_PARK_CAUSE:
+            # y3k-korr 09292034: a POST /weg2/flip from D closed admission and
+            # waited in the drain for a decode it never parked (13,4 s, then
+            # 17,9 s -> DEADMAN_FLIP_STALL). Parked like the policy flip's.
+            self.counters["park_manual_flip"] += 1
+            logger.warning(
+                "WEG2 MANUAL-FLIP PARK epoch=%d running=%d ready_for_d=%d queue=%d -- "
+                "admission to D closed for this phase, %s", self.epoch, len(running),
+                len(self._ready_for_d), len(self.queue),
+                "parking the running decodes, then the manual flip to P" if running
+                else "nothing running: the manual flip follows without a park")
+        elif immediate is not None:
             # 27B PARK (user 26.09.): not a bound -- the arrival itself fires.
             self.counters["park_immediate_fired"] += 1
             if cause != "over-x":
@@ -4869,7 +4882,8 @@ class Front:
             return "unsupported"
         body = phase_policy.park_body(
             self.epoch, self.d_wait_bound_s,
-            reason=phase_policy.PARK_REASON_IMMEDIATE if immediate is not None else None)
+            reason=(MANUAL_FLIP_PARK_CAUSE if cause == MANUAL_FLIP_PARK_CAUSE
+                    else phase_policy.PARK_REASON_IMMEDIATE if immediate is not None else None))
         # H91c3-1: the park's stamp is taken BEFORE the RPC. D stamps its park
         # while serving the RPC and re-queues it after PARK_REQUEUE_S on its
         # own clock; a front stamp taken after the answer ran that clock late
@@ -12043,6 +12057,10 @@ class Front:
                                       "code": "W115"}, status=409)
         src, dst = self.awake, ("P" if self.awake == "D" else "D")
         self.admit_d = False
+        if src == "D":
+            # the drain waits only for what the park leaves running (#1011:
+            # a decode is never cut, so an unparked one held the flip)
+            await self._wait_bound_park(None, cause=MANUAL_FLIP_PARK_CAUSE)
         await self.flip(src, dst)
         if self.awake == "P" and self.state == "serving":
             await self.flip("P", "D")
