@@ -48,6 +48,7 @@ import argparse
 import asyncio
 import collections
 import contextvars
+import functools
 import gc
 import hashlib
 import importlib
@@ -686,6 +687,16 @@ def completed_tags(body: str) -> Tuple[List[str], Dict[str, List[float]], str]:
         if isinstance(v, (list, tuple)) and len(v) >= 2
     }
     return sorted(clean), clean, str(crit)
+
+
+def _loop_running() -> bool:
+    """W3-STOP: ``do_stop`` is called from the loop and from sync test
+    code; only inside a running loop is there a current task to spare."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 class Weg2Stop(Exception):
@@ -5773,6 +5784,19 @@ class Front:
         self.queue.clear()
         self._ready_for_d.clear()
         self._sync_batch_gate()
+        # W3-STOP (kvs2 09291223): the requests already on a leg are answered
+        # too -- their handlers are cancelled and reply 503 with this name
+        # (handle_generate); a group that wedged the flip never answers them
+        current = asyncio.current_task() if _loop_running() else None
+        inflight = 0
+        for t in list(self.__dict__.get("_generate_tasks", ())):
+            if t is current or t.done():
+                continue
+            t._weg2_stop_cancel = True
+            t.cancel()
+            inflight += 1
+        if inflight:
+            logger.error("WEG2 STOP IN-FLIGHT %s -- %d request(s) on a leg answered 503", name, inflight)
         self._publish_stop_state(name, detail, state_before)
 
     def _enter_state(self, new: str) -> bool:
@@ -6200,6 +6224,42 @@ class Front:
                 return web.Response(body=body, status=r.status, content_type=r.content_type)
         except Exception as e:  # noqa: BLE001
             return web.json_response({"error": str(e)}, status=503)
+
+    def stop_guard(self, handler):
+        """W3-STOP (kvs2 boot 09291223): a STOP answers every request in
+        flight, not only the queued ones. MEASURED (front 12:32:58 STOP W3,
+        then 12:39:32): ``do_stop`` failed the queue and ``_ready_for_d``, but
+        rid weg2-0-2 was on its leg 2 (D asleep, the flip stalled) and its
+        handler waited on D for 6.5 min -- the host's probe (timeout 1800 s)
+        waited with it, never reached the hold loop that reads
+        ``stop_request.json``, and the boot stood in ``flipping`` until a
+        manual ``docker stop``. The wrapped handler registers its task;
+        ``do_stop`` cancels them and each answers 503 with the STOP's name (a
+        stream already started is closed instead -- its status line is sent).
+        Bound once in ``main`` around ``handle_generate``, like the #243 seam."""
+
+        @functools.wraps(handler)
+        async def guarded(request: web.Request) -> web.StreamResponse:
+            task = asyncio.current_task()
+            live = self.__dict__.setdefault("_generate_tasks", set())
+            if task is not None:
+                live.add(task)
+            try:
+                return await handler(request)
+            except asyncio.CancelledError:
+                if (self.state != "STOP" or task is None
+                        or not getattr(task, "_weg2_stop_cancel", False)
+                        or request.get("weg2_prepared")):
+                    raise
+                uncancel = getattr(task, "uncancel", None)
+                if callable(uncancel):
+                    uncancel()
+                self.counters["stop_inflight_answered"] += 1
+                return web.json_response({"error": f"WEG2 STOP {self.stop}"}, status=503)
+            finally:
+                live.discard(task)
+
+        return guarded
 
     async def handle_generate(self, request: web.Request) -> web.StreamResponse:
         if self.state == "STOP":
@@ -7570,6 +7630,7 @@ class Front:
                                  if r.status == 503 else None))
                     resp.content_type = r.content_type
                     await resp.prepare(request)
+                    request["weg2_prepared"] = True   # W3-STOP: a STOP closes this stream, no 503 after it
                     tail = bytearray()
                     # Q0-B: the Anthropic prompt count arrives ONCE, at the
                     # head of the stream, and the bounded tail below trims the
@@ -11213,6 +11274,8 @@ def main():
     # hand-off marks (weg2/handoff_seam.py:wrap_handler) -- bound once, here,
     # before the routes take the handler.
     front.handle_generate = _hs.wrap_handler(front.handle_generate)
+    # W3-STOP: a STOP answers the handlers in flight (Front.stop_guard).
+    front.handle_generate = front.stop_guard(front.handle_generate)
     for path in FORWARD_PATHS:
         app.router.add_post(path, front.handle_generate)
     # rename transition: the old and the new flip-front route prefixes both answer (compat_shims)
