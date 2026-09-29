@@ -2135,6 +2135,32 @@ class SchedulerWeightUpdaterManager:
         hosts = {g.strip() for g in str(envs.SGLANG_WEG2_REARM_DEFER_HOST_GROUPS.get() or "").split(",")}
         return DEFER_HOST if group in hosts else False
 
+    def _weg2_defer_host_fill_start(self) -> bool:
+        """#284b: issue the DEFER_HOST rows once the wake has no host wait left.
+
+        y3j 09291933 (#284 on, 22 D->P wakes): the rows went on the side stream
+        at the rearm, and the next host wait of the same wake paid them again
+        -- per rank static_import == the serial rearm it replaced (PP1 1146 vs
+        1262 ms, PP2 685 vs 716, PP0 134 vs 238), so the P wake stayed at
+        2.6 s. The kv RPC holds one more (the lmem restore's cuCtxSetLimit,
+        a device-idle wait). Behind both, i.e. once the kv_cache is resumed
+        and the admission seams admit, nothing on this wake waits the copy:
+        it runs while PP0 computes its first chunk (y3p: kv-RPC end -> PP1's
+        first forward 1.51..4.60 s, median 2.90, against PP1's ~1.3 s fill),
+        and the forward still waits the events (``DeferredRowsFill.tick``,
+        which also starts the fill itself when this call never ran).
+
+        Returns True when it issued rows. A dormant group (the weights RPC of
+        a late-kv wake) waits for the RPC that clears the dormancy."""
+        from sglang.srt.layers.moe.expert_offload import deferred_rows_fill
+
+        scheduler = self.scheduler
+        if scheduler is None or scheduler.weg2_dormant:
+            return False
+        return deferred_rows_fill().start_host_planned(
+            why="after the wake's last host wait (#284b: kv resumed, admission open), "
+                "before the next forward")
+
     def _weg2_rearm_defer_settle(self) -> None:
         """H31b: before the first pause of a sleep -- wait for a running
         deferred fill and forget what is pending (the next wake rewrites the
@@ -10352,7 +10378,6 @@ class SchedulerWeightUpdaterManager:
             # hier ist KEIN Warnfall: ein Layer mit Resten der anderen Gruppe
             # rechnet falsch und sagt es nicht.
             from sglang.srt.layers.moe.expert_offload import (
-                DEFER_HOST,
                 REARM_PREFETCH_OFF_FIELDS,
                 deferred_rows_fill,
                 rearm_expert_offload_after_wake,
@@ -10385,11 +10410,14 @@ class SchedulerWeightUpdaterManager:
                     _m, prefetch=_rearm_pf, defer=_defer, sync=False)
                 _rl += int(_l)
                 _rz += int(_z)
-            if _defer == DEFER_HOST:
-                # #284: host-planned layers never run cold -- their rows go on
-                # the side stream NOW and land during the fence and the earlier
-                # stages' first chunk; the rank's next forward waits the events
-                deferred_rows_fill().start(why="behind the rearm, before the next forward")
+            # #284 DEFER_HOST: the rows of the host-planned layers are NOT
+            # issued here any more (#284b): every host wait still ahead of this
+            # wake -- the static import below (a pageable H2D) and the kv RPC's
+            # lmem restore (cuCtxSetLimit, a device-idle wait) -- queued behind
+            # them and paid the whole copy again (y3j 09291933: PP1 reload
+            # 1262 -> 16 ms, static_import 11 -> 1146 ms, P wake unchanged).
+            # They go on the side stream at _weg2_defer_host_fill_start, once
+            # the admission is open; the next forward still waits the events.
             if _scratch:
                 # residue_nonzero: lock entries the recycled pages handed back
                 # NON-ZERO, counted before the memset (27B 2026-09-25: the
@@ -10644,6 +10672,9 @@ class SchedulerWeightUpdaterManager:
             # world <= 1. A single-rank engine cannot disagree with itself, so
             # here -- and only here -- the local raise IS the group-wide stop.
             raise Weg2WakeRefused(store_failure)
+        # #284b: the last statement before the answer -- behind the fence and
+        # every host wait of this wake (a no-op while the group is dormant).
+        self._weg2_defer_host_fill_start()
 
         return self._weg2_leg_commit("resume", recv_req, ResumeMemoryOccupationReqOutput(
             per_tag=(report.get("per_tag") or weg2_per_tag or None)
