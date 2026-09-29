@@ -23439,7 +23439,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # dormant_other = the planner seat's ONE selector (D-EXPECT, 9f74489683):
         # P's measured residue from the record on Next Flash, else the legacy term
         _early_other, _early_other_why = d_expect_dormant_other(
-            cards, dc_expect_d, _p_dormant_rec, ns.weg2_weight_source, ns.profile)
+            cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
         log("D-EXPECT DORMANT-OTHER D(frueh, Erwartung): " + ", ".join(
             f"nvml{c.nvml_index} {_early_other[c.uuid]}" for c in cards) + f" MiB -- {_early_other_why}")
         _early_spec, _early_budgets = _d_spec_from(

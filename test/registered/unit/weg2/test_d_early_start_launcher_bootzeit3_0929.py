@@ -37,7 +37,7 @@ def test_early_start_is_armed_only_by_the_flag_and_after_the_dry_branch():
 def test_early_plan_reads_the_planner_selector_no_second_source():
     src = _main_src()
     early = src[src.index("if _d_early_start_armed(ns):"):src.index("def _d_early_verdict(")]
-    assert "d_expect_dormant_other(" in early and "_p_dormant_rec" in early
+    assert "d_expect_dormant_other(" in early and "_p_dormant_recs" in early
     assert "P_WINDOWS_MIB" not in early and "dc_expect_d[" not in early
     # the gate path goes to D, and only on the early plan
     assert "_des.GATE_ENV: _early_gate" in early
