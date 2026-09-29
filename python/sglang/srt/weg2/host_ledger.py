@@ -5456,6 +5456,7 @@ def dormant_image_sample(
     vram_residue_mib: Optional[Dict[str, int]] = None,
     vram_residue_form: str = "",
     vram_residue_capture_bs: Optional[int] = None,
+    vram_residue_context_tokens: Optional[int] = None,
 ) -> Dict[str, object]:
     """One group's dormant image, measured at its FIRST sleep.  Pure but for /proc.
 
@@ -5689,6 +5690,11 @@ def dormant_image_sample(
         # (launcher.d_residue_record_accept). Absent when not given.
         **({"vram_residue_capture_bs": int(vram_residue_capture_bs)}
            if vram_residue_capture_bs is not None else {}),
+        # YaRN x2 27B (29.09.): the residue holds the RoPE caches of the group's CONTEXT; a sample of a longer
+        # context names it (absent = the rig's 262144), so the launcher prices only the difference to its own
+        # (launcher.d_rope_context_delta_mib / dc_residue_context).
+        **({"vram_residue_context_tokens": int(vram_residue_context_tokens)}
+           if vram_residue_context_tokens else {}),
     }
 
 

@@ -3754,6 +3754,8 @@ class Front:
         self.store_dir = store_dir
         self.dc_reserve = dc_reserve
         self.weight_form = str(weight_form or "")  # #1444: stamps the dormant record
+        # YaRN x2 27B: set from --d-residue-context-tokens after construction (main); 0 = not stamped
+        self.d_residue_context_tokens = 0
         self.w_s = w_s
         self.epoch = 0
         #: #1350: the non-reclaimable reading (anon+shmem+slab_unreclaimable)
@@ -9412,6 +9414,8 @@ class Front:
             # RC1: D's residue belongs to its capture set (--max-running-requests
             # = this front's --d-bs); P's sample stays as it was.
             vram_residue_capture_bs=(getattr(self, "d_bs", None) if group == "D" else None),
+            # YaRN x2 27B: D's residue names its context when it is not the rig's 262144 (launcher-given)
+            vram_residue_context_tokens=(getattr(self, "d_residue_context_tokens", 0) or None) if group == "D" else None,
             load_witness={
                 "queued": len(self.queue),
                 "outstanding": sum(
@@ -11864,6 +11868,9 @@ def main():
     ap.add_argument("--decode-sid", type=int, default=0)
     ap.add_argument("--dc-reserve", default="", help="uuid=mib,uuid=mib")
     ap.add_argument("--weight-form", default="", help="#1444: weight source form stamped into the dormant record")
+    ap.add_argument("--d-residue-context-tokens", type=int, default=0,
+                    help="YaRN x2 27B: group D's context, stamped into D's dormant record when it is not 262144 "
+                         "(0 = not stamped: every x1 record stays byte-identical)")
     ap.add_argument("--fairness-w-s", type=float, default=45.0,
                     help="A1-1: the ONLY sanctioned pre-emption of a P drain or a D exhaustion. "
                          "Seconds the oldest waiter may wait before the front stops admitting new "
@@ -12070,6 +12077,7 @@ def main():
                   d_wait_bound_s=args.d_wait_bound_s,
                   p_leg1_stall_s=args.p_leg1_stall_s,
                   d_park_immediate=args.d_park_immediate == "on")
+    front.d_residue_context_tokens = int(getattr(args, "d_residue_context_tokens", 0) or 0)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:
