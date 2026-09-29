@@ -289,7 +289,7 @@ def hold_late_arrival(sched, req) -> bool:
     return True
 
 
-def _park_end(sched, running) -> int:
+def _park_end(sched, running, *, reduce_min=None) -> int:
     """F4 (#259 4c, SGLANG_WEG2_ENABLE_D_PARK_END): every rank writes its
     part of each running request's END state (weg2/tail_handoff
     ``publish_park_end``) -- the resume adopts it as E2's skip instead of
@@ -315,20 +315,82 @@ def _park_end(sched, running) -> int:
     # depth), at most one track interval below the end: two cover the lag of
     # a spec-decode track
     interval = int(getattr(sched.server_args, "mamba_track_interval", 0) or 0) or int(sched.page_size)
+    # PARK-ANCHOR (0929): a D-direct prefill's track point sits at its
+    # extend's START, a whole extend below the end -- the window reaches down
+    # to the anchor the retraction below leaves (group-uniform), capped at X
+    t_anchor = time.perf_counter()
+    anchors, mode = _park_anchors(sched, running, reduce_min=reduce_min)
+    anchor_ms = (time.perf_counter() - t_anchor) * 1000.0
+    max_rows = int(getattr(sched.server_args, "tp_prefill_max_tokens", 0) or 0)
     events, why = [], {}
-    for req in running:
+    for req, anchor in zip(running, anchors):
         refusal, ev = th.publish_park_end(
             req, sched.req_to_token_pool, sched.token_to_kv_pool_allocator, sched.page_size,
-            part, tp_size, 2 * interval,
+            part, tp_size, 2 * interval, anchor=anchor, max_rows=max_rows,
         )
         if refusal:
             why[str(req.rid)[:12]] = refusal
         else:
             events.append(ev)
     sync_ms = th.park_end_barrier(events) if events else 0.0
-    logger.info("F4 PARK-END park: parts=%d of %d running sync_ms=%.1f refused=%s part=%s",
-                len(events), len(running), sync_ms, why or "-", part)
+    logger.info("F4 PARK-END park: parts=%d of %d running sync_ms=%.1f refused=%s part=%s "
+                "anchor_mode=%s anchor_ms=%.1f",
+                len(events), len(running), sync_ms, why or "-", part, mode, anchor_ms)
     return len(events)
+
+
+#: PARK-ANCHOR: a rank that names no anchor (a Form A worker, a request
+#: without a tracked position or prefix) votes this -- the MIN takes the
+#: deciding rank's value, and a reduce that stays here means "no anchor".
+_NO_ANCHOR = 1 << 62
+
+
+def _local_anchor(req) -> int:
+    """This rank's view of the depth ``req``'s retaining retraction leaves
+    as its resume anchor: the tracked position the mamba retention inserts
+    at (``mamba_last_track_seqlen``, the #1469 RETAIN ``cache_len`` -- y3p
+    weg2-4-8 2368, weg2-8-12 16704), else the admission's matched prefix
+    (the anchor the request was admitted on stays on its path)."""
+    t = req.mamba_last_track_seqlen
+    if t is not None and int(t) >= 0:
+        return int(t)
+    if req.prefix_indices is not None:
+        return len(req.prefix_indices)
+    return _NO_ANCHOR
+
+
+def _park_anchors(sched, running, *, reduce_min=None):
+    """PARK-ANCHOR (0929): per running request the resume anchor the F4
+    window must reach, the SAME list on every rank (the park parts of one rid
+    are OR-ed together and must name one geometry, ``end_differs``).
+
+    Only the rank that decides the recurrent anchor knows it: a Form A expert
+    worker tracks no mamba state (y3p TP1/TP2 ``#1469 RETAIN cache_len=4416``
+    where the host retained 2368) and votes ``_NO_ANCHOR``; the group takes
+    the MIN over the TP cpu group -- the collective #59b runs a few lines
+    later in the same park, entered by every rank with the same list (the
+    running batch is replicated). A group that cannot make a depth uniform
+    (``weg2_resumable_depth.MODE_NONE``: PP, DP attention) names none and
+    keeps today's window. Returns (anchors, mode)."""
+    if not running:
+        return [], "-"
+    mode = weg2_resumable_depth.group_mode(getattr(sched, "ps", None))
+    if mode == weg2_resumable_depth.MODE_NONE:
+        return [None] * len(running), mode
+    reduce = mode != weg2_resumable_depth.MODE_SOLO
+    if reduce and reduce_min is None:
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            # process-global, so group-uniform: no group to agree with
+            return [None] * len(running), "no_dist"
+    from sglang.srt.managers import tp_match_floor
+
+    follows = tp_match_floor.this_rank_follows()
+    local = [_NO_ANCHOR if follows else _local_anchor(r) for r in running]
+    if reduce:
+        local = (reduce_min or weg2_resumable_depth._tp_min)(local)
+    return [None if int(v) >= _NO_ANCHOR else int(v) for v in local], mode
 
 
 def _live_rids(sched, running) -> set:

@@ -361,7 +361,9 @@ def test_park_running_writes_every_running_request_and_measures_the_wait(arena, 
 
     calls = []
 
-    def fake(req, rtp, alloc, page, part, n_parts, window):
+    def fake(req, rtp, alloc, page, part, n_parts, window, anchor=None, max_rows=0):
+        # PARK-ANCHOR: no torch.distributed group here -> no anchor, today's window
+        assert anchor is None
         calls.append((str(req.rid), part, n_parts, window))
         return ("", None) if req.rid != "weg2-9-9" else ("no_tail", None)
 
