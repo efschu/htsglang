@@ -588,6 +588,13 @@ class SchedulerWeightUpdaterManager:
     #: this far -- died on ``AttributeError`` in the assignment itself on all
     #: three P ranks.
     _weg2_last_inject_cover: Any = None
+    #: BOOTZEIT 3 (A), #108 under the per-tag collect (#1374): the first
+    #: wake's cover ACCUMULATED over every tag -- ``{"filled": {tag: n},
+    #: "expected": n, "names": set}``. The single-value field above holds the
+    #: LAST tag only, and the per-tag wake returned before the #108 settle ever
+    #: ran, so under ``--weg2-d-adopt on`` the placeholder guard could never
+    #: fall. None outside a placeholder wake.
+    _weg2_adopt_acc: Any = None
     #: #1295: this rank's W8b verdict on the L3 store index it rebuilt at the
     #: wake, empty when there is none.  Written by
     #: :meth:`_weg2_rescan_store_index`, read and cleared by the resume fence,
@@ -3632,7 +3639,39 @@ class SchedulerWeightUpdaterManager:
             self._weg2_last_inject_cover = (len(_cdescs or ()), _erwartet)
         except (AttributeError, TypeError):
             self._weg2_last_inject_cover = (0, 0)
+        self._weg2_adopt_accumulate(tag, plan, _cdescs)
         return bool(_cdescs)
+
+    def _weg2_adopt_accumulate(self, tag, plan, cdescs) -> None:
+        """BOOTZEIT 3 (A): the #108 cover summed over the per-tag collects.
+
+        Only while this rank holds placeholders (the first wake under
+        ``--weg2-d-adopt on``); a no-op otherwise. ``filled`` is keyed by tag
+        so a tag collected twice is not counted twice; ``expected`` is the
+        whole plan (the same on every call); ``names`` are the parameters the
+        legs actually wrote -- the uncovered check in :meth:`_weg2_adopt_settle`
+        compares them against every tensor this rank holds.
+        """
+        try:
+            from sglang.srt.weg2 import adopt as _adopt
+
+            if not _adopt.weights_are_placeholder():
+                return
+        except ImportError:
+            return
+        try:
+            acc = self._weg2_adopt_acc
+            if not isinstance(acc, dict):
+                acc = {"filled": {}, "expected": 0, "names": set()}
+            descs = list(cdescs or ())
+            acc["filled"][str(tag)] = len(descs)
+            acc["expected"] = max(int(acc["expected"]),
+                                  len(getattr(plan, "descs", ()) or ()))
+            acc["names"].update(str(getattr(d, "param_name", "")) for d in descs
+                                if int(getattr(d, "src_rank", -1)) >= 0)
+            self._weg2_adopt_acc = acc
+        except (AttributeError, TypeError, ValueError):
+            pass
 
     def _weg2_adopt_cover(self) -> tuple:
         """(gefuellt, erwartet) fuer #108 -- aus der KARTE, nicht geschaetzt.
@@ -3656,12 +3695,65 @@ class SchedulerWeightUpdaterManager:
         rechnet.
         """
         try:
+            acc = getattr(self, "_weg2_adopt_acc", None)
+            if isinstance(acc, dict) and acc.get("filled"):
+                return (int(sum(acc["filled"].values())), int(acc["expected"]))
             letzter = getattr(self, "_weg2_last_inject_cover", None)
             if isinstance(letzter, tuple) and len(letzter) == 2:
                 return int(letzter[0]), int(letzter[1])
         except (TypeError, ValueError):
             pass
         return 0, 0
+
+    def _weg2_adopt_uncovered(self) -> list:
+        """Tensors this rank holds that no leg of the first wake wrote.
+
+        The cover above counts descriptors of the PLAN; a tensor that has no
+        descriptor at all (the peer does not hold it, or the plan files it
+        elsewhere) is invisible to it and would keep its dummy bytes while
+        the guard falls -- the one failure #108 exists to prevent. Empty when
+        the accumulated names are unknown (then the count decides alone).
+        """
+        acc = getattr(self, "_weg2_adopt_acc", None)
+        if not isinstance(acc, dict) or not acc.get("names"):
+            return []
+        try:
+            live = {str(name) for (_region, name) in self._weg2_rank_param_table()}
+        except Exception:  # noqa: BLE001 -- no table: the count decides alone
+            return []
+        return sorted(live - set(acc["names"]))
+
+    def _weg2_adopt_settle(self) -> None:
+        """#108: after the first wake's collect, the placeholder guard falls
+        -- or stays. ONE place for both wake shapes (whole plan and the
+        per-tag collect of #1374), so neither can skip it."""
+        try:
+            from sglang.srt.weg2 import adopt as _adopt
+        except ImportError:
+            return
+        if not _adopt.weights_are_placeholder():
+            return
+        _filled, _expected = self._weg2_adopt_cover()
+        _uncovered = self._weg2_adopt_uncovered()
+        _mode = str(os.environ.get("SGLANG_WEG2_D_ADOPT_UNCOVERED", "refuse")
+                    ).strip().lower()
+        if _uncovered:
+            logger.warning(
+                "#108 ADOPT-UNCOVERED n=%d first=%s mode=%s -- these tensors "
+                "got no bytes from the first flip and still hold the dummy "
+                "load", len(_uncovered), _uncovered[:12], _mode)
+        if _uncovered and _mode != "log":
+            _adopt.mark_adopted(0, max(1, int(_expected)))
+        else:
+            _adopt.mark_adopted(_filled, _expected)
+        if not _adopt.weights_are_placeholder():
+            self._weg2_adopt_acc = None
+        logger.info(
+            "#108 ADOPT-COVER filled=%d expected=%d uncovered=%d -> %s",
+            _filled, _expected, len(_uncovered),
+            "PLATZHALTER GELOEST, dieser Rang rechnet"
+            if not _adopt.weights_are_placeholder()
+            else f"RIEGEL BLEIBT ({_adopt.placeholder_reason()})")
 
     def _weg2_wake_reload_weights(self) -> None:
         """Fill the weight pages the resume recommitted, by whatever carries them.
@@ -3718,6 +3810,10 @@ class SchedulerWeightUpdaterManager:
                     "WEG2-XCHG INJECT per-tag=done -- the resume loop "
                     "collected each tag beside its own resume (#1374); this "
                     "once-per-wake entry stands down rather than re-injecting")
+                # BOOTZEIT 3 (A): the #108 settle ran only on the whole-plan
+                # path below; under the per-tag collect it was skipped and a
+                # placeholder rank could never answer.
+                self._weg2_adopt_settle()
                 return
             self._weg2_xchg_inject_weights()
             # #108 ERSTBOOT-ADOPTION: hier faellt der Riegel -- oder er bleibt.
@@ -3730,20 +3826,7 @@ class SchedulerWeightUpdaterManager:
             # alle, bleibt der Riegel stehen und der Rang verweigert weiter --
             # ein halb gefuelltes Modell rechnet, und das ist schlimmer als
             # eines, das nicht antwortet.
-            try:
-                from sglang.srt.weg2 import adopt as _adopt
-
-                if _adopt.weights_are_placeholder():
-                    _filled, _expected = self._weg2_adopt_cover()
-                    _adopt.mark_adopted(_filled, _expected)
-                    logger.info(
-                        "#108 ADOPT-COVER filled=%d expected=%d -> %s",
-                        _filled, _expected,
-                        "PLATZHALTER GELOEST, dieser Rang rechnet"
-                        if not _adopt.weights_are_placeholder()
-                        else f"RIEGEL BLEIBT ({_adopt.placeholder_reason()})")
-            except ImportError:
-                pass
+            self._weg2_adopt_settle()
             return
         server_args = self._weg2_server_args()
 
