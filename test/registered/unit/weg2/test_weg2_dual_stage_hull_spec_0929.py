@@ -76,3 +76,45 @@ class DualStageHullSpec(CustomTestCase):
         finally:
             if env0 is not None:
                 os.environ[H.DUAL_SHARE_ENV] = env0
+
+
+class ThreeShardShellsAreTheMonolith(CustomTestCase):
+    """The P-stage algebra: shells over D's THREE shards (one per D rank, uneven
+    [2,1,1] over 8 units) reproduce the full-width linear -- column parts by
+    concat (per sub-output for merged gate|up), row parts by the local sum.
+    The middle rank is the 'local' one on the 5090's neighbour card; the shell
+    does not care which part is shared."""
+
+    def test_merged_column_and_row(self):
+        import torch
+
+        from sglang.srt.distributed.utils import partition_sizes, scoped_tp_partition_ratios
+        from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
+        from sglang.srt.model_executor.dual_group_lane import (
+            LaneColumnParallelShell,
+            LaneRowParallelShell,
+        )
+
+        torch.manual_seed(3)
+        H, SUB, UNITS, BIG = 32, 128, 8, [2, 1, 1]
+        gate, up, down = torch.randn(SUB, H), torch.randn(SUB, H), torch.randn(H, SUB)
+        cols, rows = [], []
+        sizes = partition_sizes(SUB, BIG, UNITS)
+        for r in range(3):
+            off = sum(sizes[:r])
+            with scoped_tp_partition_ratios(BIG):
+                c = MergedColumnParallelLinear(H, [SUB, SUB], bias=False, params_dtype=torch.float32,
+                                               tp_rank=r, tp_size=3, tp_units=UNITS)
+                c.weight.data.copy_(torch.cat([gate[off:off + sizes[r]], up[off:off + sizes[r]]]))
+                w = RowParallelLinear(SUB, H, bias=False, input_is_parallel=True, reduce_results=False,
+                                      params_dtype=torch.float32, tp_rank=r, tp_size=3, tp_units=UNITS)
+                w.weight_loader(w.weight, down)
+            cols.append(c)
+            rows.append(w)
+        x = torch.randn(5, H)
+        gu, _ = LaneColumnParallelShell(cols)(x)
+        torch.testing.assert_close(gu, x @ torch.cat([gate, up]).t(), rtol=1e-5, atol=1e-5)
+        h = torch.randn(5, SUB)
+        out, _ = LaneRowParallelShell(rows)(h)
+        torch.testing.assert_close(out, h @ down.t(), rtol=1e-4, atol=1e-4)
+        self.assertEqual([p.weight.shape[0] for p in cols], [2 * s for s in sizes])
