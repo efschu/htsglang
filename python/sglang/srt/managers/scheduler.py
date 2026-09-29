@@ -836,6 +836,19 @@ def _weg2_store_tail_min_tokens(req) -> Optional[int]:
     return 1 if getattr(req, "_weg2_store_delivered", None) is not None else None
 
 
+def _prefetch_namespace_kw(tree_cache, req) -> dict:
+    """The request's namespace for the unified tree's storage prefetch
+    (``prefetch_namespace``: the span is keyed and inserted under the
+    request's extra_key, not the root anchor's None -- NF 09292034 salted
+    requests re-prefilled their whole prompt on D). {} for the legacy trees,
+    whose signature does not take it."""
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    if isinstance(tree_cache, UnifiedRadixCache):
+        return {"extra_key": req.extra_key}
+    return {}
+
+
 def _weg2_store_short_remainder(req) -> Optional[int]:
     """Tokens D prefills if ``req`` is admitted on what its short read
     materialised (device-resident prefix after the read); None = no stamp."""
@@ -7567,6 +7580,7 @@ class Scheduler(
         if _park_min is not None:
             _tail_min = _park_min if _tail_min is None else min(int(_tail_min), int(_park_min))
         _tail_kw = {"min_tokens": _tail_min} if _tail_min is not None else {}
+        _tail_kw.update(_prefetch_namespace_kw(self.tree_cache, req))
         if group_decides:
             self.tree_cache.prefetch_from_storage(
                 req.rid,
