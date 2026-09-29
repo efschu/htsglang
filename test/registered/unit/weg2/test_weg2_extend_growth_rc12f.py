@@ -84,8 +84,11 @@ class TheRecordIsTheMeasuredGrowth(CustomTestCase):
         vals, boots = L.d_extend_growth_record("nextflash")
         measured = ET.extend_growth_mib([(r, t, s, p) for _ts, r, t, s, p, _cf in RC12E])
         self.assertEqual(measured, 2304)
-        self.assertEqual(vals, [2304.0, None, None])
+        # 29.09.: the z30x2 flip boot (…_113056) raised TP0 to 2434 and measured the
+        # 3080 ranks (2176 / 1728); rc12e's 2304 stays a window of the record
+        self.assertEqual(vals, [2434.0, 2176.0, 1728.0])
         self.assertIn("dkrnfh91bar1dauer09270311", boots)
+        self.assertIn("dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30x2bar1dauer09291130", boots)
         # the growth exceeds 2 x activation, so the growth itself is the post
         self.assertGreater(measured, 2 * ACT)
 
@@ -105,10 +108,12 @@ class TheThresholdCoversTheExtend(CustomTestCase):
         led = L.d_card_ledger(terms, budgets, "D")
         fits = T._fits(budgets, (90, 48, 48))
         g, _src = L.d_extend_growth_record("nextflash")
-        # TP0 767 + max(activation, 2304); the 3080 ranks keep floor + activation
-        self.assertEqual(L.d_extend_trim_env(led, fits, g).split(",")[0], "3071")
-        self.assertEqual(L.d_extend_trim_env(led, fits, g).split(",")[1:],
-                         L.d_extend_trim_env(led, fits).split(",")[1:])
+        # floor + max(activation, growth) on every rank: 767+2434, 700+2176, 701+1728
+        self.assertEqual(L.d_extend_trim_env(led, fits, g), "3201,2876,2429")
+        # the 3080 ranks no longer keep floor + activation (1724/1725 let TP1/TP2
+        # fall to card_free 16/78 MiB with 4 retries in …_113056)
+        self.assertNotEqual(L.d_extend_trim_env(led, fits, g).split(",")[1:],
+                            L.d_extend_trim_env(led, fits).split(",")[1:])
 
     def test_the_three_rc12e_windows_trim_now_and_did_not_before(self):
         new = float(FLOOR + 2304)

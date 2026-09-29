@@ -90,12 +90,13 @@
   {
    "name": "D_EXTEND_GROWTH_MIB",
    "value": [
-    2304,
-    null,
-    null
+    2434,
+    2176,
+    1728
    ],
-   "provenance": "rc12f: what ONE D extend window adds to torch reserved on D-TP0 = peak_reserved of the window that holds the extend's peak minus reserved at the window's start (WEG2-VRAM-PEAK), max over the extends with >= 512 rows (weg2/extend_trim.extend_growth_mib): rc12e (f078f89a08) 03:39:12 rows=4096 transient 920 -> +2304 (card_free 2371 -> 67), 03:41:23 +2272, 03:33:37 +2026 (retry); rc12d (227ae1becd) 02:37:45 +1974, 02:41:14 +1852 (retry); rc12c/rc12b below. The allocator lays new segments on top of a cache it cannot reuse: growth/transient 2.0-2.5 on the 4096-row extends, so the booked activation (1104) under-prices the extend's card cost. Measured against the window start, never against the trim threshold: a trim empties the cache and the growth that follows is the extend's real segment demand, bounded -- no ratchet. The trim threshold is floor + max(activation, this). 3080 ranks: not measured (null: floor + activation stays).",
+   "provenance": "rc12f: what ONE D extend window adds to torch reserved on D-TP0 = peak_reserved of the window that holds the extend's peak minus reserved at the window's start (WEG2-VRAM-PEAK), max over the extends with >= 512 rows (weg2/extend_trim.extend_growth_mib): rc12e (f078f89a08) 03:39:12 rows=4096 transient 920 -> +2304 (card_free 2371 -> 67), 03:41:23 +2272, 03:33:37 +2026 (retry); rc12d (227ae1becd) 02:37:45 +1974, 02:41:14 +1852 (retry); rc12c/rc12b below. The allocator lays new segments on top of a cache it cannot reuse: growth/transient 2.0-2.5 on the 4096-row extends, so the booked activation (1104) under-prices the extend's card cost. Measured against the window start, never against the trim threshold: a trim empties the cache and the growth that follows is the extend's real segment demand, bounded -- no ratchet. The trim threshold is floor + max(activation, this). 29.09. (z30x2 flip boot dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30x2bar1dauer09291130, 424346f693, D.log _0929_113056, trim ON 3071/1724/1725): the same measure per rank, reserved at a window's start = reserved_mib of the rank's previous WEG2-VRAM-PEAK line -- TP0 11:44:39 4063 rows +2434 (transient 1296), 11:40:17 4096 +2184; TP1 11:40:17 4096 +2176 (transient 930), 11:44:39 4063 +2066 (retry); TP2 11:44:39 4063 +1728 (transient 897, retry), 11:40:17 4096 +1724 (retry). The 3080 ranks grow 1.9-2.3x their transient like TP0 did; with the null they trimmed at floor + 1024 = 1724/1725, too low: card_free fell to 16 (TP1) / 78 (TP2) MiB under the floors 700/701 with 4 alloc retries. TP0 takes the new maximum (2434 > 2304). Threshold now floor + growth = 3201/2876/2429.",
    "boots": [
+    "dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30x2bar1dauer09291130",
     "dkrnfh91bar1dauer09270311",
     "dkrnfh91bar1dauer09270212",
     "dkrnfh91bar1dauer09270103",
