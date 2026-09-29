@@ -2850,6 +2850,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     elif self.is_weightless_worker or self.is_draft_solo_shadow:
                         # B2a / draft-solo shadow: meta-model, NO weight load.
                         self.model = self._build_weightless_worker_meta_model()
+                    elif not self.is_draft_worker and _dual_share_on():
+                        # DUAL-TP3PP3 stage 1b (F26): the P stage is ASSEMBLED
+                        # from D's three TP shards of its layers (shells, the
+                        # #274 algebra), so the part that is D's resident shard
+                        # on this card can be bound to D's bytes by the union
+                        # image below. Off unless SGLANG_WEG2_DUAL_SHARE=1 on P.
+                        from sglang.srt.distributed.device_communicators import (
+                            barlink_launch_dump as _weg2_dump,
+                        )
+                        from sglang.srt.model_executor.dual_stage_hull import (
+                            build_dual_stage_model,
+                        )
+
+                        _weg2_dump.enter_load_phase()
+                        self.model = build_dual_stage_model(self)
+                        _weg2_dump.leave_load_phase()
                     else:
                         # #109: DER RIEGEL MUSS VOR DEM LADEN STEHEN, NICHT
                         # DANACH. `process_weights_after_loading` -- und damit
@@ -3151,8 +3167,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # which is exactly the failure this removes.
         from sglang.srt.weg2.union_arena_bind import maybe_union_image
 
+        # DUAL-TP3PP3 stage 1b: a P stage assembled from D's shards publishes /
+        # binds only the part that IS D's resident shard on this card, under
+        # D's parameter names -- never the hull (whose shells hold the parts
+        # by reference, so a rebind of the part is seen by the shells).
+        _union_model = self.model
+        if not self.is_draft_worker and getattr(self, "dual_share_part_models", None):
+            _union_model = self.dual_share_part_models[self.dual_share_local_part]
         maybe_union_image(
-            self.model,
+            _union_model,
             device=self.gpu_id,
             role="draft" if self.is_draft_worker else "main",
         )
@@ -6141,3 +6164,12 @@ class LocalSerializedTensor:
 
     def get(self, rank: int):
         return MultiprocessingSerializer.deserialize(self.values[rank])
+
+
+def _dual_share_on() -> bool:
+    """DUAL-TP3PP3 stage 1b gate (import-free when off)."""
+    if not os.environ.get("SGLANG_WEG2_DUAL_SHARE"):
+        return False
+    from sglang.srt.model_executor.dual_stage_hull import dual_share_armed
+
+    return dual_share_armed()
