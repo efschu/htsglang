@@ -36,6 +36,7 @@ from sglang.srt.distributed.utils import uneven_dcp_active
 from sglang.srt.environ import envs
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2 import tail_adopt, tail_handoff
+from sglang.srt.weg2 import short_read as _weg2_short_read
 from sglang.srt.weg2 import d_park_read as _weg2_park_read
 from sglang.srt.managers.weg2_min_hit import note_min_hit_tokens  # PARK-RETAIN READ
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -7685,6 +7686,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # is collective-free. On a rank whose scheduler thread is blocked in
         # something else, neither runs and this diagnostic is structurally
         # silent -- by construction, not by chance.
+        # held short wake read (weg2/short_read.py): the group's probe held
+        # every page, the read ended short -- the settle re-reads at once
+        _weg2_short_read.note_reap(
+            req_id,
+            requested_pages=len(getattr(operation, "token_ids", None) or ())
+            // max(1, int(self.page_size)),
+            hit_pages=_hit_tokens // max(1, int(self.page_size)),
+            completed_tokens=int(min_completed_tokens),
+            page_size=int(self.page_size),
+        )
         _hit_pages_kv = len(hash_value)
         _completed_local = (
             _hit_pages_kv > 0 and completed_tokens == _hit_pages_kv * self.page_size
