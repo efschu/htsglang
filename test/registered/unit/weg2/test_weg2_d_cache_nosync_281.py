@@ -171,5 +171,70 @@ class TestPrepareParts(unittest.TestCase):
         self.assertGreater(src.index("_pp.finish(self, prefix_lens)"), order[-1])
 
 
+
+class _AsCuda(torch.Tensor):
+    """A CPU tensor that answers ``is_cuda`` like a device tensor, so the
+    NOSYNC branch of ``move_indices`` runs on a card-less host."""
+
+    @property
+    def is_cuda(self):  # noqa: D401 - property override
+        return True
+
+
+class TestMoveIndicesBitEqual(unittest.TestCase):
+    """27B Auflage (2): the sync-free ``move_indices`` (device indices permuted
+    on the device) returns exactly the pairs of the synchronous path
+    (``device_indices.cpu()`` then permute). The danger of NOSYNC is a read
+    before a finished write; the permutation itself must be bit-equal."""
+
+    def _ctl(self):
+        c = types.SimpleNamespace(
+            io_backend="direct",
+            mem_pool_host=types.SimpleNamespace(layout="layer_first"),
+        )
+        return c
+
+    def _run(self, move, host, dev, **env):
+        real_pin = torch.Tensor.pin_memory
+        torch.Tensor.pin_memory = lambda self, *a, **k: self  # no CUDA here
+        try:
+            with _Env(**env):
+                h, d = move(self._ctl(), host.clone(), dev.clone().as_subclass(_AsCuda))
+        finally:
+            torch.Tensor.pin_memory = real_pin
+        return h.as_subclass(torch.Tensor), d.as_subclass(torch.Tensor)
+
+    def _assert_bit_equal(self, move):
+        g = torch.Generator().manual_seed(281)
+        for n in (1, 2, 7, 64, 4096, 51520):
+            host = torch.randperm(n * 3, generator=g)[:n].to(torch.int64)
+            dev = torch.randperm(n * 5, generator=g)[:n].to(torch.int64)
+            h0, d0 = self._run(move, host, dev)
+            h1, d1 = self._run(move, host, dev, **D_ON)
+            self.assertTrue(torch.equal(h0, h1), f"host order differs at n={n}")
+            self.assertTrue(torch.equal(d0.cpu(), d1.cpu()), f"device pairs differ at n={n}")
+            # and both are the pairs of the input, host-sorted
+            want = dict(zip(host.tolist(), dev.tolist()))
+            self.assertEqual(dict(zip(h1.tolist(), d1.tolist())), want)
+            self.assertEqual(h1.tolist(), sorted(host.tolist()))
+
+    def test_nosync_equals_the_synchronous_path(self):
+        self._assert_bit_equal(cc_mod.HiCacheController.move_indices)
+
+    def test_the_check_catches_an_unpermuted_mutant(self):
+        """Mutant: the NOSYNC branch forgets the permutation. The equality
+        check above must fail on it, or it proves nothing."""
+        src = inspect.getsource(cc_mod.HiCacheController.move_indices)
+        good = "return host_indices, device_indices.index_select(0, idx)"
+        i = src.index("cache_path_nosync_on()")
+        j = src.index(good, i)
+        mutant_src = src[:j] + "return host_indices, device_indices" + src[j + len(good):]
+        import textwrap
+
+        ns = dict(vars(cc_mod))
+        exec(textwrap.dedent(mutant_src), ns)
+        with self.assertRaises(AssertionError):
+            self._assert_bit_equal(ns["move_indices"])
+
 if __name__ == "__main__":
     unittest.main()
