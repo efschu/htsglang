@@ -3234,6 +3234,50 @@ class Envs:
     # expert pass on NF-D). Needs SGLANG_WEG2_TAIL_SKIP_EXTEND; refused by
     # name under uneven DCP / the token cut. Off = the park byte for byte.
     SGLANG_WEG2_ENABLE_D_PARK_END = EnvBool(False)
+    # PARK-COLLECT-WINDOW (29.09., NF z30w-park 08:31-08:46: 21 immediate parks
+    # in 15 min, 37 parked streams, park->resume median 8.4 s / p90 17.8 s --
+    # the user's stream stuttered). User decision 29.09. ~09:15Z, for qwen27b
+    # AND nextflash: D keeps decoding; once the queued P work passes
+    # THRESHOLD_TOKENS (0 = X) it collects -- SKI RENTAL: until the queued
+    # requests' summed wait reaches what the park costs, one measured flip
+    # round trip per running stream (K7's D->P + P->D + wake -> first decoded
+    # chunk: this boot's, else the newest record of this model x form, else 0
+    # = the immediate park). D running nothing or a hard cap
+    # (p_phase_max_requests, P's pool, d_wait_bound_s) fires at once. Off =
+    # the immediate park byte for byte.
+    # WINDOW_S: a fixed timer x instead of the measured price (override only).
+    SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW = EnvBool(False)
+    SGLANG_WEG2_PARK_COLLECT_WINDOW_S = EnvFloat(None)
+    SGLANG_WEG2_PARK_COLLECT_THRESHOLD_TOKENS = EnvInt(0)
+    # X-COST-LINE (29.09., third part of the ski-rental decision; NF z30w
+    # 09290827 and 27B 09290020 both ran with `X NO-SOLVE: no r_d` because the
+    # solo r_D probe never fired under load). X is re-solved from D's measured
+    # cost line a + b*n + c*n*prefix over D's own prefill forwards (the
+    # `Prefill rank batch` gpu-ms, published as a ring -- valid while D
+    # decodes, mixed chunk is off), priced by the ski instrument's warm round
+    # trip and amortised over the mean requests per P phase; P's side is its
+    # own cost line from the same ring on PP0 (the bottleneck stage), read
+    # after each P drain -- the drain r_P only while P has neither a fit nor a
+    # record (it counts P's waits: 27B 09290020 drain 1437 tok/s, PP0 9180):
+    #     X* = (price/k + a_P - a_D) / (b_D + c_D*prefix - b_P - c_P*prefix)
+    # The seed is the newest record of this model x form (kind x_cost_line),
+    # never a constant; the hard 4096 floor gives way to the fitted range's
+    # lower edge, the ceiling (--x-ceiling-tokens) stays. Off = the solo-r_D
+    # re-solve byte for byte.
+    # FIT_MIN_TOKENS: forwards below it are D's cheap tail extends, not the
+    # expert-streaming prefill the line describes (z30w TP0: 1-31 new tokens
+    # 46-106 ms mean, 32-511 tokens 1583-2199 ms). FIT_MIN_SAMPLES: forwards
+    # the live fit needs before it replaces the record.
+    SGLANG_WEG2_ENABLE_X_COST_LINE = EnvBool(False)
+    SGLANG_WEG2_X_COST_FIT_MIN_TOKENS = EnvInt(64)
+    SGLANG_WEG2_X_COST_FIT_MIN_SAMPLES = EnvInt(8)
+    # 27B review of 800bb82ac6: a fit only from a window with n_hi/n_lo >=
+    # MIN_SPREAD and >= MIN_BIG forwards of >= 1024 tokens (else the whole
+    # boot's line, else the record, named); one re-solve moves X by at most
+    # MAX_STEP of the previous X (hysteresis against D/P route flapping).
+    SGLANG_WEG2_X_COST_FIT_MIN_SPREAD = EnvFloat(4.0)
+    SGLANG_WEG2_X_COST_FIT_MIN_BIG = EnvInt(8)
+    SGLANG_WEG2_X_COST_MAX_STEP = EnvFloat(0.25)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at

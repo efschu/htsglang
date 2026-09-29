@@ -503,6 +503,19 @@ def record_identity_from_spec(spec: str):
         kv["model"], kv["evidence"], _form.current_form(), repo=kv.get("repo", ""))
 
 
+def park_form_key() -> str:
+    """PARK-COLLECT-WINDOW: the round-trip record's key -- the published form's
+    checkpoint (its directory name) and residue axes, so a qwen27b boot and a
+    nextflash boot never seed each other's collect window; "" without a form."""
+    from sglang.srt.weg2 import form as _form
+
+    boot_form = _form.current_form()
+    if boot_form is None:
+        return ""
+    axes = ",".join(f"{a}={getattr(boot_form, a)}" for a in _form.RESIDUE_AXES)
+    return f"{_form.model_key(boot_form.model)}|{axes}"
+
+
 class SidecarView:
     """H78: the measured-record sidecar as the sleep-leg gate reads it --
     parsed once per FILE VERSION, not once per flip.
@@ -686,6 +699,29 @@ def completed_tags(body: str) -> Tuple[List[str], Dict[str, List[float]], str]:
         if isinstance(v, (list, tuple)) and len(v) >= 2
     }
     return sorted(clean), clean, str(crit)
+
+
+#: #1317c's progress read (``/get_server_info`` -> ``weg2_decode_progress``)
+#: had NO timeout of its own, only the shared session's 3600 s: in NF z30w-park
+#: the drain hung on a dead P ring inside it and a blind DEADMAN_FLIP_STALL
+#: (epoch 113) came instead of a named W3. A live group answers the read
+#: between two scheduler iterations, so one forward pass bounds it; the
+#: longest measured is a P 16k chunk on PP0, ~5.6 s (x135, #117). Twice that:
+#: a live P mid-chunk never trips it, a dead one is named within 12 s -- well
+#: inside the flip-stall watch. Not 2 s: that would stop a healthy P that is
+#: merely in its chunk.
+PROGRESS_READ_TIMEOUT_S = 12.0
+
+
+class Weg2ProgressUnreachable(Exception):
+    """The progress read of ``group`` got no answer within
+    :data:`PROGRESS_READ_TIMEOUT_S` -- a diagnosis, never retried."""
+
+    def __init__(self, group: str, url: str):
+        super().__init__(f"group {group} ({url}) no /get_server_info answer "
+                         f"within {PROGRESS_READ_TIMEOUT_S:.0f} s")
+        self.group = group
+        self.url = url
 
 
 class Weg2Stop(Exception):
@@ -3880,6 +3916,53 @@ class Front:
         # PARK-DECODE-DWELL: time of the first chunk D streamed in epoch _d_decode_epoch
         self._d_decode_epoch = -1
         self._d_decode_t0 = 0.0
+        #: PARK-COLLECT-WINDOW: every D phase's wake -> first decoded chunk (ms,
+        #: the resume part of a flip round trip), oldest first; the first is cold.
+        self._resume_ms_log: List[float] = []
+        #: PARK-COLLECT-WINDOW: the D phase (epoch) whose collect hold is named.
+        self._park_collect_epoch = -1
+        #: PARK-COLLECT-WINDOW: checkpoint x form of this boot (the round-trip
+        #: record's key, qwen27b and nextflash never share one); "" = no form.
+        self._park_form_key = park_form_key()
+        #: PARK-COLLECT-WINDOW: the newest recorded round trip of this form,
+        #: x until this boot measured its own; None = none recorded.
+        self._park_rt_seed: Optional[dict] = (
+            phase_policy.read_park_round_trip(self.measured_record, self._park_form_key)
+            if (envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get()
+                or envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get()) else None)
+        #: PARK-COLLECT-WINDOW: round trips this boot appended to the sidecar.
+        self._park_rt_written = 0
+        #: X-COST-LINE: the ``(boot, seq)`` head of D's per-forward prefill
+        #: cost ring at the last ``/get_server_info`` read (prefill_clock).
+        self._d_cost_mark: Optional[Tuple[str, int]] = None
+        #: X-COST-LINE: D's prefill forwards ``(n, prefix, ms)``, newest last --
+        #: the live fit's rows (read on every leg-2 read, under any load).
+        self._d_cost_rows: Deque[Tuple[int, int, float]] = collections.deque(maxlen=64)
+        #: X-COST-LINE: the whole boot's forwards (bounded), the fallback fit
+        #: when the recent window has no spread (27B review of 800bb82ac6).
+        self._d_cost_all: Deque[Tuple[int, int, float]] = collections.deque(maxlen=4096)
+        #: X-COST-LINE: requests each P phase prefilled (the amortisation k).
+        self._p_phase_k: Deque[int] = collections.deque(maxlen=self.X_SAMPLE_WINDOW)
+        #: X-COST-LINE: the newest fitted line of this checkpoint x form, the
+        #: seed until this boot fitted its own; None = none recorded.
+        self._x_cost_seed: Optional[dict] = (
+            phase_policy.read_x_cost_line(self.measured_record, self._park_form_key)
+            if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get() else None)
+        #: X-COST-LINE: P's prefill forwards on PP0 ``(n, prefix, ms)`` and
+        #: the head of P's ring at the last read -- P's side of the break-even.
+        self._p_cost_mark: Optional[Tuple[str, int]] = None
+        self._p_cost_rows: Deque[Tuple[int, int, float]] = collections.deque(maxlen=64)
+        self._p_cost_all: Deque[Tuple[int, int, float]] = collections.deque(maxlen=4096)
+        #: X-COST-LINE: P's newest recorded line of this checkpoint x form.
+        self._x_cost_seed_p: Optional[dict] = (
+            phase_policy.read_x_cost_line(self.measured_record, self._park_form_key, "P")
+            if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get() else None)
+        #: X-COST-LINE: fitted lines this boot appended to the sidecar, per group.
+        self._x_cost_written: Dict[str, int] = {"D": 0, "P": 0}
+        #: X-COST-LINE: the in-flight P ring reads (held so they are not collected).
+        self._p_cost_tasks: Set["asyncio.Task"] = set()
+        #: X-COST-LINE: which inputs were missing at the last NO-SOLVE.
+        self._x_cost_last_missing: List[str] = []
         #: H91c3-3: the D phase's seat count n (H95) this front sent at the
         #: last P->D wake; None before the first one (no seat cap known).
         self._d_phase_n: Optional[int] = None
@@ -4347,15 +4430,18 @@ class Front:
         if p is None:
             return None
         need_ms, prov = self._derived_min_dwell_ms("D", "P")
+        collect = envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get()
         # PARK-CYCLE DWELL: a D phase that began by resuming parked requests is
         # priced at the whole park cycle (both flips), not at one flip.
+        # PARK-COLLECT-WINDOW replaces it and PARK-DECODE-DWELL: its ski price
+        # already charges the round trip, per running stream (27B review 29.09.).
         resumed = getattr(self, "_park_resume_epoch", -1) == self.epoch
-        if resumed and phase_policy.park_cycle_dwell_on():
+        if resumed and phase_policy.park_cycle_dwell_on() and not collect:
             back_ms, back_prov = self._derived_min_dwell_ms("P", "D")
             need_ms = phase_policy.park_cycle_dwell_ms(need_ms, back_ms, True)
             prov = f"{prov}+cycle:{back_prov}={int(back_ms)}ms"
         awake_s = now - self.t_awake
-        if phase_policy.park_decode_dwell_on():
+        if phase_policy.park_decode_dwell_on() and not collect:
             # PARK-DECODE-DWELL (NF rc12z22 14:52-14:58): the cycle is both flips
             # plus this phase's resume, and it is counted from D's first decoded
             # chunk -- not from the wake, which the resume's reload ate.
@@ -4386,7 +4472,100 @@ class Front:
                             "phase", self.epoch, p.rid, int(awake_s * 1000.0), int(need_ms), prov,
                             int(FAIRNESS_DWELL_FLOOR_MS))
             return None
+        if collect:
+            # PARK-COLLECT-WINDOW (NF z30w-park 08:31-08:46, user 29.09.): D keeps
+            # decoding while the pending P work collects for the window; the park
+            # comes at its end, or earlier when D runs nothing or a hard cap binds.
+            x_tok = int(self.tp_prefill_max_tokens)
+            # the queued requests that need P, read by the park trigger's own reader
+            items = [(float(q.t_arrive), int(q.est_uncached)) for q in self.queue
+                     if phase_policy.immediate_park_trigger([q], x_tok) is not None]
+            threshold = int(envs.SGLANG_WEG2_PARK_COLLECT_THRESHOLD_TOKENS.get()) or x_tok
+            round_trip_s, rt_src = self._park_collect_window_s()
+            n_running = len(self._flip_ledger(D))
+            timer = rt_src == "flag"
+            # ski rental: a park stalls every running stream for one round trip
+            price_s = round_trip_s if timer else round_trip_s * max(1, n_running)
+            fire, why, t_start, left_s = phase_policy.park_collect_window(
+                items, now, self.t_awake, n_running, price_s, threshold, timer=timer,
+                max_requests=self.p_phase_max_requests, pool_tokens=self.p_pool_tokens,
+                wait_bound_s=self.d_wait_bound_s)
+            if not fire:
+                if self._park_collect_epoch != self.epoch:
+                    self._park_collect_epoch = self.epoch
+                    self.counters["park_collect_holds"] += 1
+                    logger.info("WEG2 PARK-COLLECT-WINDOW HOLD epoch=%d rid=%s why=%s running=%d "
+                                "queued_p=%d uncached=%d threshold=%d round_trip_s=%.2f (%s) "
+                                "price_s=%.1f left_s=%.1f -- D keeps decoding, the pending P work "
+                                "collects", self.epoch, p.rid, why, n_running, len(items),
+                                sum(u for _, u in items), threshold, round_trip_s, rt_src, price_s,
+                                left_s)
+                return None
+            self.counters[f"park_collect_{why.replace('-', '_')}"] += 1
+            logger.info("WEG2 PARK-COLLECT-WINDOW FIRE epoch=%d rid=%s why=%s running=%d queued_p=%d "
+                        "uncached=%d collected_s=%.1f", self.epoch, p.rid, why, n_running, len(items),
+                        sum(u for _, u in items), (now - t_start) if t_start is not None else 0.0)
         return p
+
+    def _park_collect_window_s(self) -> Tuple[float, str]:
+        """PARK-COLLECT-WINDOW: one flip round trip in seconds and its source,
+        the unit of the SKI-RENTAL price (user decision 29.09.; the caller
+        charges it once per running stream) -- K7's D->P and P->D prices plus
+        the last D phase's wake -> first decoded chunk. RECORD > UNMEASURED
+        before this boot measured one: the newest round trip of this
+        checkpoint x form, else 0 (the immediate park, named).
+        SGLANG_WEG2_PARK_COLLECT_WINDOW_S overrides all of it as a fixed timer
+        (source "flag")."""
+        override = envs.SGLANG_WEG2_PARK_COLLECT_WINDOW_S.get()
+        if override is not None:
+            return float(override), "flag"
+        dp_ms, pd_ms, resume_ms, src = self._park_warm_legs_ms()
+        live = phase_policy.park_round_trip_s(dp_ms, pd_ms, resume_ms)
+        if live is not None:
+            return live, f"ski-live:{src}"
+        if self._park_rt_seed is not None:
+            return (float(self._park_rt_seed["round_trip_s"]),
+                    f"ski-record:{self._park_rt_seed['boot_tag']}@{self._park_rt_seed['at']}")
+        return 0.0, f"ski-unmeasured:{self._park_form_key or 'no-form'}"
+
+    def _park_warm_legs_ms(self) -> Tuple[float, float, Optional[float], str]:
+        """PARK-COLLECT-WINDOW: the round trip's three legs from WARM samples
+        only (27B review 29.09.): K7's D->P and P->D as H34b's median of the
+        last flips after the boot's first, and the median wake -> first chunk
+        of the last D phases after the first. One slow sample cannot move the
+        price, and the cold first park (JIT, pinning) is never in it."""
+        window = int(envs.SGLANG_WEG2_MIN_DWELL_WINDOW.get())
+        dp_ms, dp_src = warm_min_dwell_ms(self.flip_log, "D", "P", window=window)
+        pd_ms, pd_src = warm_min_dwell_ms(self.flip_log, "P", "D", window=window)
+        resume_ms = phase_policy.warm_resume_ms(self._resume_ms_log, window)
+        n_warm = max(0, len(self._resume_ms_log) - 1)
+        resume_src = "none-warm" if resume_ms is None else f"{int(resume_ms)}ms:n={min(n_warm, window)}"
+        return dp_ms, pd_ms, resume_ms, f"{dp_src}+{pd_src}+resume={resume_src}"
+
+    def _note_park_round_trip(self) -> None:
+        """PARK-COLLECT-WINDOW: append this boot's first WARM round trips (the
+        medians of :meth:`_park_warm_legs_ms`) to the sidecar -- the next boot's
+        seed of the same checkpoint x form. Built at D's first decoded chunk,
+        written by the H78 writer thread."""
+        if (not (envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get()
+                 or envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get())
+                or not self._park_form_key or not self.measured_record
+                or self._park_rt_written >= phase_policy.PARK_ROUND_TRIP_RECORDS):
+            return
+        dp_ms, pd_ms, resume_ms, _ = self._park_warm_legs_ms()
+        if phase_policy.park_round_trip_s(dp_ms, pd_ms, resume_ms) is None:
+            return  # nothing warm yet: the cold first park never becomes a record
+        self._park_rt_written += 1
+        now = time.time()
+        rec = phase_policy.park_round_trip_record(
+            form_key=self._park_form_key, dp_ms=dp_ms, pd_ms=pd_ms,
+            resume_ms=float(resume_ms), boot_tag=str(self.tag), commit=self.commit,
+            at=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now)) + ",%03d" % int((now % 1) * 1000))
+        logger.info("WEG2 PARK-ROUND-TRIP epoch=%d round_trip_s=%.2f dp_ms=%d pd_ms=%d resume_ms=%d "
+                    "form=%s -> sidecar (the next boot's collect window of this form)", self.epoch,
+                    rec["round_trip_s"], int(dp_ms), int(pd_ms), int(resume_ms),
+                    self._park_form_key)
+        self._sidecar_submit(host_ledger.append_measured_record, self.measured_record, rec)
 
     async def _wait_bound_park(self, wait_s: Optional[float], immediate: Optional["Pending"] = None,
                                cause: str = "over-x") -> str:
@@ -7234,7 +7413,12 @@ class Front:
                 t_evidence = max(t_evidence, getattr(self, "_p_leg1_done_t", 0.0))
                 if now - t_sample >= 10.0:
                     t_sample = now
-                    prog = await self._weg2_decode_progress(self.groups["P"])
+                    try:
+                        prog = await self._weg2_decode_progress(self.groups["P"])
+                    except Weg2ProgressUnreachable as e:
+                        # the leg-1 stall bound decides here; an unread counter is an absence
+                        logger.warning("WEG2 P-LEG1 progress unreadable: %s", e)
+                        prog = None
                     if prog is not None:
                         if last_prog is not None and prog != last_prog:
                             t_evidence = now
@@ -7758,6 +7942,8 @@ class Front:
                         if self.awake == "D" and self._d_decode_epoch != self.epoch:
                             self._d_decode_epoch = self.epoch
                             self._d_decode_t0 = time.time()
+                            self._resume_ms_log.append((self._d_decode_t0 - self.t_awake) * 1000.0)
+                            self._note_park_round_trip()
                         if len(tail) > 262144:
                             del tail[:-131072]
                         if not client_io["gone"]:
@@ -8407,9 +8593,34 @@ class Front:
                     out["prefill_src"] = "server_info"
             self._d_prefill_mark = prefill_clock.advance(
                 getattr(self, "_d_prefill_mark", None), prefill_clock.mark_of(_pfc))
+            self._note_cost_rows(info.get(prefill_clock.COST_STATE_KEY), "D")
         except Exception as e:  # noqa: BLE001 - an instrument never breaks serving
             logger.debug("draft terms unavailable: %s: %s", type(e).__name__, e)
         return out
+
+    def _note_cost_rows(self, block: Any, side: str) -> None:
+        """X-COST-LINE: take group ``side``'s prefill forwards published since
+        the last read (prefill_clock.cost_since) as rows of its cost line.
+        Every forward counts, whatever else the group ran -- the ring holds
+        prefill forwards only. A ring that wrapped between two reads is
+        counted, not hidden."""
+        if side == "D":
+            new, self._d_cost_mark, lost = prefill_clock.cost_since(block, self._d_cost_mark)
+            rows, every, tag = self._d_cost_rows, self._d_cost_all, "x_cost_rows"
+        else:
+            new, self._p_cost_mark, lost = prefill_clock.cost_since(block, self._p_cost_mark)
+            rows, every, tag = self._p_cost_rows, self._p_cost_all, "x_cost_p_rows"
+        if lost:
+            self.counters[f"{tag}_lost"] += lost
+        for r in new:
+            try:
+                row = (int(r["n"]), int(r.get("cached", 0) or 0), float(r["ms"]))
+            except (KeyError, TypeError, ValueError):
+                self.counters[f"{tag}_bad"] += 1
+                continue
+            rows.append(row)
+            every.append(row)
+            self.counters[tag] += 1
 
     def check_identity(self) -> None:
         """W9 from the store directory: exactly ONE identity suffix on disk.
@@ -8615,9 +8826,15 @@ class Front:
         caller as an ABSENCE, so it can keep the old residency behaviour
         instead of reading "no progress" out of a failed HTTP call and
         manufacturing the very W2 this change exists to prevent.
+
+        No answer within :data:`PROGRESS_READ_TIMEOUT_S` is not an absence but
+        a group that cannot serve a read between two forward passes:
+        :class:`Weg2ProgressUnreachable`, for the caller to name.
         """
         try:
-            async with self.session.get(f"{g.url}/get_server_info") as r:
+            async with self.session.get(
+                    f"{g.url}/get_server_info",
+                    timeout=ClientTimeout(total=PROGRESS_READ_TIMEOUT_S)) as r:
                 info = await r.json() if r.status == 200 else None
             if isinstance(info, list) and info:
                 info = info[0]
@@ -8628,6 +8845,8 @@ class Front:
                 info = st[0]
             blk = info.get("weg2_decode_progress")
             return blk if isinstance(blk, dict) else None
+        except asyncio.TimeoutError as e:
+            raise Weg2ProgressUnreachable(g.name, g.url) from e
         except Exception as e:  # noqa: BLE001 - an instrument never breaks the flip
             logger.debug("weg2 decode progress unavailable: %s: %s", type(e).__name__, e)
             return None
@@ -8701,19 +8920,36 @@ class Front:
         emitted tokens or ran forward passes is a WAIT, not a refusal.
         """
         t0 = time.time()
-        before = await self._weg2_decode_progress(g)
         self._drain_progress = None
+        try:
+            before = await self._weg2_decode_progress(g)
+        except Weg2ProgressUnreachable as e:
+            self._stop_progress_unreachable(e)
+            return False
         # H91 part C: requests D PARKED on the wait bound are not waited for
         # (they continue in D's next phase); `_flip_ledger` is the ledger
         # itself whenever nothing is parked.
         _ledger = getattr(self, "_flip_ledger", None)
         while (_ledger(g) if _ledger is not None else g.outstanding):
             if time.time() - t0 > self.drain_deadline_s:
-                after = await self._weg2_decode_progress(g)
+                try:
+                    after = await self._weg2_decode_progress(g)
+                except Weg2ProgressUnreachable as e:
+                    self._stop_progress_unreachable(e)
+                    return False
                 self._drain_progress = weg2_drain_progress_delta(before, after)
                 return False
             await asyncio.sleep(0.02)  # #1455: 250 ms poll was a quarter of the drain
         return True
+
+    def _stop_progress_unreachable(self, e: "Weg2ProgressUnreachable") -> None:
+        """The drain witness could not be read: stop by name on the W3 path
+        (the group's own entry rank did not answer), no retry, no flip."""
+        self.counters["W3_progress_unreachable"] += 1
+        self.do_stop("W3 Weg2DrainWitnessUnreachable",
+                     f"{e} -- the drain witness (#1317c) of group {e.group} cannot be read, its "
+                     f"entry rank does not answer between two forward passes; stopping by "
+                     f"name instead of a blind DEADMAN_FLIP_STALL (NF z30w-park epoch 113)")
 
     async def quiesce(self, g: Group) -> Tuple[bool, str]:
         """Witness B: poll /flush_cache (200 iff the GROUP's is_fully_idle,
@@ -9102,6 +9338,8 @@ class Front:
             )
         # 1. drain (W1/W2)
         if not await self.drain(S):
+            if self.state == "STOP":  # W3 Weg2DrainWitnessUnreachable: no W1, no abort, no flip
+                return
             # #1317c PROGRESS BEFORE VERDICT. A window in which D made decode
             # progress is a WAIT, not a refusal: under the standing user law
             # (#1011, "er decoded zuende ... und flippt dann zurueck") a
@@ -9869,6 +10107,8 @@ class Front:
             derive_x_star,
         )
 
+        if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get():
+            return self._resolve_x_cost_line()
         s = self._x_samples
         if not (s["r_d"] and s["r_p"] and s["flip_s"]):
             missing = [k for k in ("r_d", "r_p", "flip_s") if not s[k]]
@@ -9938,6 +10178,169 @@ class Front:
             self._x_seed_note,
         )
         return x
+
+    def _x_cost_line_of(self, rows: Deque[Tuple[int, int, float]],
+                        every: Deque[Tuple[int, int, float]], seed: Optional[dict]
+                        ) -> Tuple[Optional[dict], str]:
+        """One group's cost line and its source: LIVE fit over the recent
+        ``rows`` > the WHOLE BOOT's fit over ``every`` (the window lacked the
+        spread, 27B review of 800bb82ac6) > RECORD ``seed`` of this checkpoint
+        x form > ``None``. Every fallback names why the step before refused."""
+        def _fit(src):
+            return phase_policy.fit_cost_line(
+                src, min_tokens=envs.SGLANG_WEG2_X_COST_FIT_MIN_TOKENS.get(),
+                min_samples=envs.SGLANG_WEG2_X_COST_FIT_MIN_SAMPLES.get(),
+                min_spread=envs.SGLANG_WEG2_X_COST_FIT_MIN_SPREAD.get(),
+                min_big=envs.SGLANG_WEG2_X_COST_FIT_MIN_BIG.get())
+
+        line, why = _fit(rows)
+        if line is not None:
+            return line, f"live:{why}:n={line['n']}"
+        line, why_all = _fit(every)
+        if line is not None:
+            return line, f"boot:{why_all}:n={line['n']}(window {why})"
+        if seed is not None:
+            return seed, f"record:{seed['boot_tag']}@{seed['at']}(window {why}; boot {why_all})"
+        return None, f"none(window {why}; boot {why_all})"
+
+    def _x_cost_inputs(self) -> Tuple[Optional[dict], str, Optional[float], str, float, str]:
+        """X-COST-LINE's inputs with their sources: ``(line, line_src, price_s,
+        price_src, k, k_src)``. Every one is LIVE > RECORD of this checkpoint x
+        form > missing (``None``) -- never a constant; ``k`` without any
+        measurement is 1 (no amortisation), named as such."""
+        line, line_src = self._x_cost_line_of(self._d_cost_rows, self._d_cost_all,
+                                              self._x_cost_seed)
+        dp_ms, pd_ms, resume_ms, legs_src = self._park_warm_legs_ms()
+        price = phase_policy.park_round_trip_s(dp_ms, pd_ms, resume_ms)
+        if price is not None:
+            price_src = f"ski-live:{legs_src}"
+        elif self._park_rt_seed is not None:
+            price = float(self._park_rt_seed["round_trip_s"])
+            price_src = f"ski-record:{self._park_rt_seed['boot_tag']}@{self._park_rt_seed['at']}"
+        else:
+            price_src = f"none:{legs_src}"
+        cap = float(self.p_phase_max_requests) if self.p_phase_max_requests else float("inf")
+        if self._p_phase_k:
+            k = min(cap, max(1.0, statistics.mean(self._p_phase_k)))
+            k_src = f"live:mean-of-{len(self._p_phase_k)}"
+        elif self._x_cost_seed is not None and float(self._x_cost_seed.get("k", 0) or 0) >= 1.0:
+            k = min(cap, float(self._x_cost_seed["k"]))
+            k_src = "record"
+        else:
+            k, k_src = 1.0, "none(1=no-amortisation)"
+        return line, line_src, price, price_src, k, k_src
+
+    def _resolve_x_cost_line(self) -> Optional[int]:
+        """X-COST-LINE's re-solve (see phase_policy): X* from D's cost line at
+        the depth D prefills at, the ski round trip amortised over k, and P's
+        own cost line on PP0 (compute-honest; the drain r_P only while P has
+        neither a fit nor a record, named). Clamped to [the fitted range's
+        lower edge, the ceiling] -- below the lowest measured forward the line
+        is extrapolation, so that edge, not 4096, is the floor. Prints every
+        input with its source."""
+        line, line_src, price, price_src, k, k_src = self._x_cost_inputs()
+        line_p, line_p_src = self._x_cost_line_of(self._p_cost_rows, self._p_cost_all,
+                                                  self._x_cost_seed_p)
+        r_p_s = self._x_samples["r_p"]
+        missing = [name for name, v in (("d_cost_line", line), ("round_trip", price),
+                                        ("p_cost_line_or_r_p", line_p or r_p_s or None))
+                   if v is None]
+        if missing:
+            if missing != self._x_cost_last_missing:
+                self._x_cost_last_missing = missing
+                logger.warning(
+                    "WEG2 X COST-LINE NO-SOLVE: no %s yet, so X stays at %d (line=%s price=%s "
+                    "k=%.2f[%s] P line=%s r_P n=%d)", " and ".join(missing),
+                    self.tp_prefill_max_tokens, line_src, price_src, k, k_src, line_p_src,
+                    len(r_p_s))
+            return None
+        self._x_cost_last_missing = []
+        r_p = statistics.median(r_p_s) if r_p_s else None
+        p_src = (f"P line a={float(line_p['a_ms']):.0f}ms b={float(line_p['b_ms']):.3f} "
+                 f"c={float(line_p['c_ms']):.4f} [{line_p_src}]" if line_p is not None
+                 else f"r_P drain={r_p:.0f} (median of {len(r_p_s)}; P line {line_p_src})")
+        live_prefix = [p for n, p, _ in self._d_cost_rows
+                       if n >= envs.SGLANG_WEG2_X_COST_FIT_MIN_TOKENS.get()]
+        prefix = (statistics.median(live_prefix) if live_prefix
+                  else float(line.get("prefix_med", 0) or 0))
+
+        def _solve(depth: float) -> Tuple[Optional[float], str]:
+            return phase_policy.solve_x_cost_line(
+                price_s=price, k=k, line=line, r_p=r_p, prefix_tokens=depth, line_p=line_p)
+
+        x_star, why = _solve(prefix)
+        prev = self.tp_prefill_max_tokens
+        if x_star is None:
+            logger.warning("WEG2 X COST-LINE held: %s -- X stays %d (line=%s)", why, prev, line_src)
+            return None
+        floor = int(line["n_lo"])
+        x_bound = min(max(x_star, floor), self.x_ceiling_tokens)
+        clamp = ("ceiling" if x_star > self.x_ceiling_tokens
+                 else "floor" if x_star < floor else "none")
+        # 27B review of 800bb82ac6: one re-solve moves X by at most MAX_STEP.
+        x, limited = phase_policy.x_step_limited(
+            x_bound, prev, envs.SGLANG_WEG2_X_COST_MAX_STEP.get())
+        x = min(max(x, floor), self.x_ceiling_tokens)
+        if limited:
+            clamp += "+hysteresis"
+            self.counters["x_cost_step_limited"] += 1
+        self.tp_prefill_max_tokens = x
+        if self._x_min_work_follows:
+            self.flip_min_work_tokens = x
+        self.counters["x_resolves"] += 1
+        bands = ", ".join(
+            "%dk:%s" % (d // 1000, "-" if xb is None else "inf" if xb == float("inf") else int(xb))
+            for d in (2048, 32768, 97280, 245760) for xb in (_solve(d)[0],))
+        logger.info(
+            "WEG2 X COST-LINE RE-SOLVE X=%d <- X_prev=%d X*=%.0f (%s) clamp=%s floor=%d (fitted "
+            "range n %d..%d) ceiling=%d | D line a=%.0fms b=%.3fms/tok c=%.4fms/tok/kprefix "
+            "[%s] at prefix=%d | price=%.2fs [%s] / k=%.2f [%s] | %s | X* by depth {%s}",
+            x, prev, x_star, why, clamp, floor, int(line["n_lo"]), int(line["n_hi"]),
+            self.x_ceiling_tokens, float(line["a_ms"]), float(line["b_ms"]),
+            float(line["c_ms"]), line_src, int(prefix), price, price_src, k, k_src, p_src, bands)
+        self._note_x_cost_line(line, line_src, k, "D")
+        if line_p is not None:
+            self._note_x_cost_line(line_p, line_p_src, k, "P")
+        return x
+
+    def _note_x_cost_line(self, line: dict, line_src: str, k: float, side: str) -> None:
+        """X-COST-LINE: append this boot's first LIVE fitted lines of group
+        ``side`` to the sidecar -- the next boot's seed of the same checkpoint
+        x form. A line taken from the record is never written back as new."""
+        if (not line_src.startswith(("live:", "boot:")) or not self._park_form_key
+                or not self.measured_record
+                or self._x_cost_written[side] >= phase_policy.X_COST_LINE_RECORDS):
+            return
+        self._x_cost_written[side] += 1
+        now = time.time()
+        rec = phase_policy.x_cost_line_record(
+            form_key=self._park_form_key, line=line, k=k, boot_tag=str(self.tag),
+            commit=self.commit, side=side,
+            at=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now)) + ",%03d" % int((now % 1) * 1000))
+        logger.info("WEG2 X COST-LINE RECORD side=%s a=%.0f b=%.3f c=%.4f n=%d k=%.2f form=%s -> "
+                    "sidecar (the next boot's seed of this form)", side, rec["a_ms"], rec["b_ms"],
+                    rec["c_ms"], rec["n"], rec["k"], self._park_form_key)
+        self._sidecar_submit(host_ledger.append_measured_record, self.measured_record, rec)
+
+    async def _read_p_cost(self) -> None:
+        """X-COST-LINE: after a P drain, take P's prefill forwards (PP0, the
+        rank answering ``/get_server_info``) as rows of P's cost line. Runs as
+        its own task -- a slow or absent answer never delays the flip; a
+        failed read is counted, never a zero row."""
+        try:
+            async with self.session.get(f"{self.groups['P'].url}/get_server_info",
+                                        timeout=ClientTimeout(total=PROGRESS_READ_TIMEOUT_S)) as r:
+                info = await r.json() if r.status == 200 else {}
+            if isinstance(info, list) and info:
+                info = info[0]
+            st = info.get("internal_states") if isinstance(info, dict) else None
+            block = st[0].get(prefill_clock.COST_STATE_KEY) if (
+                isinstance(st, list) and st and isinstance(st[0], dict)) else None
+        except Exception as e:  # noqa: BLE001 - an instrument never breaks serving
+            self.counters["x_cost_p_read_errors"] += 1
+            logger.debug("P cost ring unavailable: %s: %s", type(e).__name__, e)
+            return
+        self._note_cost_rows(block, "P")
 
     def _flip_economics_ok(self, fairness_fired: bool) -> bool:
         """C7/L13: is the queued work worth a round trip?
@@ -10685,6 +11088,14 @@ class Front:
                     _drain_s = time.time() - t_drain0
                     if _drain_s > 0 and _drain_uncached > 0:
                         self.note_x_sample("r_p", _drain_uncached / _drain_s)
+                    if prefilled > 0:
+                        # X-COST-LINE: the requests this P phase carried (k).
+                        self._p_phase_k.append(int(prefilled))
+                    if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get():
+                        # X-COST-LINE: P's forwards of this drain, as a task.
+                        _pc = asyncio.get_running_loop().create_task(self._read_p_cost())
+                        self._p_cost_tasks.add(_pc)
+                        _pc.add_done_callback(self._p_cost_tasks.discard)
                     logger.info("WEG2 P-DRAIN epoch=%d prefilled=%d arrived_during=%d p_concurrency=%d "
                                 "passes=%d queue_at_exit=%d drain_s=%.1f",
                                 self.epoch, prefilled, max(0, prefilled - queue_at_entry),
