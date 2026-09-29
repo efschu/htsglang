@@ -983,6 +983,24 @@ def peek_target_start(req, prefix_len: int, batch_empty: bool = True) -> Tuple[O
     return spec.cut, False
 
 
+def peek_compute_tokens(req, prefix_len: int, batch_empty: bool = True) -> Optional[int]:
+    """cold-round1: the tokens the TARGET forward computes if the admission
+    takes the agreed tail now -- 0 under the E2 skip (no target forward),
+    ``fill - c`` under E1 -- WITHOUT taking the answer (no pop, no log).
+    None = the tail is not taken (the extend runs [prefix, fill)). The adder
+    fits THIS against the prefill chunk: a corridor-narrowed chunk (64 right
+    after a wake) must not send a resume whose tail makes its forward empty
+    into the chunked branch, which never takes a tail. Rank-uniform inputs,
+    exactly as ``peek_target_start``."""
+    start, _wait = peek_target_start(req, prefix_len, batch_empty)
+    if start is None:
+        return None
+    entry = _AGREED[str(req.rid)]
+    if entry.skip and start == entry.staged.spec.n_tokens:
+        return 0
+    return max(0, len(req.full_untruncated_fill_ids) - int(start))
+
+
 def skip_joinable(req, prefix_len: Optional[int] = None) -> bool:
     """H24c: whether ``plan_adopt`` would admit ``req`` with the END state
     into a batch holding only skip requests -- WITHOUT taking the answer (no

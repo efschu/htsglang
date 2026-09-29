@@ -831,6 +831,17 @@ class Envs:
     # slot of the existing MAX, never a new collective. 0 = no hold (vote at
     # the termination on whatever is staged then).
     SGLANG_WEG2_TAIL_WAIT_MS = EnvInt(1500)
+    # TAIL_FIT_ON_COMPUTE (cold-round1, metal y3p ...dauer09292250, D TP0): right
+    # after a wake the corridor narrows the prefill chunk to 64 tokens ('#794
+    # GROUP-NARROWED ... from 4096 to 64'); a parked resume with an agreed END
+    # tail but 112-211 uncached tokens then took the CHUNKED branch, where no
+    # tail is taken -- a real extend of 64 + the rest, each an expert-major pass
+    # of 1.9-2.4 s (ep44 5.97 s, ep54 5.16 s, 23:11:55 5.77 s, 23:13:24 5.66 s,
+    # 23:15:34 5.97 s from wake to the cohort's first decode). The whole-fit test
+    # and the chunk charge now take what the forward COMPUTES with the tail (0
+    # under the E2 skip, N - c under E1) instead of N - prefix; the KV charge is
+    # unchanged. 0 = the old test on N - prefix.
+    SGLANG_WEG2_TAIL_FIT_ON_COMPUTE = EnvBool(True)
     # TAIL FOLD (fnFL2 H63, group P, only with TAIL_HANDOFF + TAIL_ADOPT +
     # TAIL_SKIP_EXTEND): the END-ANCHOR no longer splits the last chunk at
     # c = floor_r(N-1) when N is not a page multiple -- the tail [c, N) runs
