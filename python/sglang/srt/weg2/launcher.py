@@ -457,6 +457,81 @@ def dc_residue_from_record(
                  + ", ".join(parts) + " MiB")
 
 
+P_DORMANT_EXPECT_ENV = "SGLANG_WEG2_D_EXPECT_P_RECORD"
+
+
+def p_dormant_from_record(
+    rec: Optional[Dict[str, object]], cards: Sequence[Card], weight_source: str
+) -> Tuple[Optional[Dict[str, int]], str]:
+    """Group P's MEASURED dormant VRAM residue per card, from the newest
+    group-P dormant-image record the front stamped at P's first sleep
+    (``vram_residue_mib``, the same field #1444 reads for group D).
+
+    ``(per-uuid MiB, provenance)`` when the record carries a positive value for
+    EVERY card of this boot, measured under the SAME weight form; ``(None,
+    why)`` otherwise (UNMEASURED -- the caller names its fallback). Priced
+    BARE, no margin: the real D pass after P's sleep charges the launcher's
+    own reading of the same residue bare too (``budgets_from_dc(cards, dc_p,
+    ...)``), and the served growth of P's dormant image has its own term
+    (``served_dormant_growth``). This is the one reader for "D's budget after
+    P's sleep" before P has slept -- the expectation pass and an early D start
+    read it here, not from a second source."""
+    if not isinstance(rec, dict):
+        return None, "no group-P dormant-image record in the sidecar"
+    tag = str(rec.get("boot_tag", "?"))
+    form = str(rec.get("vram_residue_form", "") or "")
+    if form != str(weight_source):
+        return None, (f"group-P record of boot {tag} measured form {form!r}, this boot is "
+                      f"{str(weight_source)!r}")
+    vals = rec.get("vram_residue_mib") or {}
+    if not isinstance(vals, dict):
+        return None, f"group-P record of boot {tag} carries no vram_residue_mib"
+    out: Dict[str, int] = {}
+    parts = []
+    for c in cards:
+        v = vals.get(c.uuid)
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
+            return None, (f"group-P record of boot {tag} carries no residue for card "
+                          f"{c.uuid} ({c.name})")
+        out[c.uuid] = int(v)
+        parts.append(f"nvml{c.nvml_index} {int(v)}")
+    return out, (f"group-P record of boot {tag} at {rec.get('at', '?')} form {form!r}: "
+                 + ", ".join(parts) + " MiB")
+
+
+def d_expect_dormant_other(
+    cards: Sequence[Card], dc_expect_d: Mapping[str, int],
+    p_rec: Optional[Dict[str, object]], weight_source: str, profile: Optional[str],
+) -> Tuple[Dict[str, int], str]:
+    """``dormant_other`` of group D's EXPECTATION budget (the map pass and the
+    dry pass, both before P has slept): what group P leaves on each card
+    while D runs.
+
+    Before (and still on every profile whose D residue is not census-priced,
+    i.e. the 27B, whose dormant_other IS its resident draft): D's own dormant
+    reserve moved by the window difference, ``dc_expect_d + P_WINDOWS_MIB -
+    D_WINDOWS_MIB`` -- D's residue standing in for P's. rc12z30r3 (29.09.,
+    Next Flash, token cut): that booked 2054/1188/1586 MiB (nvml1/0/2) where
+    P's measured residue was 1252-1326/646-718/630-980; the map pass solved
+    the D form (S3f ownership, FR_D, scratch) 540-960 MiB per card short, and
+    the real pass could not raise it any more (the map is built from it), so
+    the gap sat free all run.
+
+    Next Flash (``xchg_census_is_reserve``) with a same-checkpoint group-P
+    record: P's measured residue, as the real pass charges it. Anything else:
+    the legacy term, with the reason named. ``SGLANG_WEG2_D_EXPECT_P_RECORD=0``
+    forces the legacy term."""
+    legacy = {c.uuid: int(dc_expect_d[c.uuid]) + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}
+    if not xchg_census_is_reserve(profile):
+        return legacy, "legacy (profile's dormant_other is D's reserve + windows)"
+    if os.environ.get(P_DORMANT_EXPECT_ENV, "1").strip() == "0":
+        return legacy, f"legacy ({P_DORMANT_EXPECT_ENV}=0)"
+    meas, why = p_dormant_from_record(p_rec, cards, weight_source)
+    if meas is None:
+        return legacy, f"legacy (UNMEASURED: {why})"
+    return meas, why
+
+
 def dc_measured_d_mib(card: Card, weight_source: str) -> int:
     """Group D's MEASURED dormant residue for this card, on THIS form.
 
@@ -21660,6 +21735,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         measured_record_path(), accept=_dc_accept).get("D")
     _dc_from_record, _dc_record_prov = dc_residue_from_record(
         _dc_rec_d, cards, ns.weg2_weight_source)
+    # D-EXPECT: group P's measured dormant residue, same calibration identity
+    # (no identity = no foreign model's record: the expectation stays legacy).
+    _p_dormant_rec = (
+        host_ledger.read_measured_record(
+            measured_record_path(), accept=calib_sample_accept).get("P")
+        if calib_sample_accept is not None else None)
     if _dc_rec_d is None and calib_sample_accept is not None:
         _dc_record_prov = (
             f"no group-D dormant-image record MEASURED ON {boot_form.model} under "
@@ -22789,7 +22870,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # cap, seat rows, stage form, waves, trims) come from the real budgets
         _env_d_before = str(getattr(ns, "env_d", "") or "")
         _map_terms: List[Dict[str, object]] = []
-        _map_budgets = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(Karte, Erwartung)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_map_terms)
+        _map_other, _map_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_rec, ns.weg2_weight_source, ns.profile)
+        log("D-EXPECT DORMANT-OTHER D(Karte, Erwartung): " + ", ".join(f"nvml{c.nvml_index} {_map_other[c.uuid]}" for c in cards) + f" MiB -- {_map_other_why}")
+        _map_budgets = budgets_from_dc(cards, _map_other, log, "D(Karte, Erwartung)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_map_terms)
         log_d_rank_vram_solve(ns, cards, _map_budgets, log, "D(Karte, Erwartung)",
                               p_split=p_split, chunk_layers=chunk_layers,
                               card_terms=(_map_terms if d_awake_rest(cards, ns.profile)[0] is not None else None))
@@ -23239,7 +23322,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     launch_group(spec_p, tree, log, dry)
     if dry:
         _dry_terms: List[Dict[str, object]] = []
-        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_dry_terms)
+        _dry_other, _dry_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_rec, ns.weg2_weight_source, ns.profile)
+        log("D-EXPECT DORMANT-OTHER D(dry, expectation): " + ", ".join(f"nvml{c.nvml_index} {_dry_other[c.uuid]}" for c in cards) + f" MiB -- {_dry_other_why}")
+        budgets_d = budgets_from_dc(cards, _dry_other, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_dry_terms)
         # #145 AN BEIDEN STELLEN -- siehe #114 direkt darunter: es gibt ZWEI
         # Stellen, an denen budgets_d entsteht, und eine Fassung, die nur die
         # untere trifft, fehlt genau im Dry-Run, wo das Gate sie sucht.
