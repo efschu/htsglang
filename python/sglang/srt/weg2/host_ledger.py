@@ -481,6 +481,24 @@ RUN_PEAK_RESIDUAL_RATCHET_GIB = {
     "weg2xsn20": -1.513, "weg2xsn21b": -0.170, "weg2xsn22": 0.375,
     "weg2xsn23": 0.908, "weg2xsn24": 0.046,
 }
+#: 29.09. NF1c (W87 16:55:33Z, CUSHION FLOOR 81.36 + 1.50 = 82.86 > 82.53): H87
+#: FOR THE MARGIN'S RESIDUAL. The five rows above are Qwen3.8-27B-INT8 boots
+#: (REFERENCE_MODEL; H87 names the xsn series as 27B), yet the margin charged
+#: their +0.908 to the NF checkpoint silently -- the one 27B reference H87 never
+#: reached (run origin and ratchet say FOREIGN-MODEL, the margin did not).
+#: Keyed by memory FOOTPRINT (form.REFERENCE_FOOTPRINTS), the same identity H87
+#: decides by: ``measured peak - predicted ratchet-charged run peak`` of THIS
+#: model's own boots.
+#:   Qwen3.8-Flash-Next-INT4 (NF), boot ...z30y2bar1dauer09291559 @ 9fb98fd279:
+#:     measured = cg_peak_b 86,244,577,280 B = 80.32 GiB (memts csv, 16:18:46Z,
+#:     RAW memory.current incl. page cache and the teardown step +0.56 -- an
+#:     UPPER bound on the non-reclaimable peak, whose flip-window max was 78.53),
+#:     predicted = 81.36 (cf6f2108fb replay = NF1c's own ARM S=1 M=600 line),
+#:     residual <= -1.04 GiB: OVER-prediction. Clamped at >= 0 like every row.
+NF_FOOTPRINT = "5d82a6f6b1f14bfccf79fe321eb448d40751fd9bdc9b50b504f66b2acfddcb7b"
+RUN_PEAK_RESIDUAL_RATCHET_OWN_MODEL_GIB: Dict[str, Dict[str, float]] = {
+    NF_FOOTPRINT: {"dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30y2bar1dauer09291559": -1.04},
+}
 #: Measured STEADY-STATE drift (#1276), MiB/min, MAX of the recorded 0.01..0.07
 #: band. Two orders below IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT because that one
 #: is the sb4 LOAD-era default; this is the quiet serving rate the ratchet-era
@@ -902,8 +920,17 @@ def resolve_margin(
     foreign_headroom_gib: float = 0.0,
     foreign_source: str = "",
     flip_ratchet_charged_gib: Optional[float] = None,
+    reference_model_ok: Optional[bool] = None,
+    model_footprint: str = "",
 ) -> Margin:
     """Build the margin from measurements, naming every source.
+
+    ``reference_model_ok`` / ``model_footprint`` (29.09. NF1c, H87): on a
+    ratchet-priced arm of a checkpoint that is NOT the reference, the 27B
+    replay rows are FOREIGN; this model's own rows
+    (:data:`RUN_PEAK_RESIDUAL_RATCHET_OWN_MODEL_GIB`) bind instead. With no
+    own row the 27B rows stay (the refusing direction), tagged FALLBACK.
+    ``None`` / True: byte-identical.
 
     The transient is read from the RING-ERA records of this form (max over the
     recorded flips); the pre-ring :data:`FLIP_HOST_TRANSIENT_GIB` is used only
@@ -1024,6 +1051,29 @@ def resolve_margin(
                 "xsn21b -0.170, xsn22 +0.375, xsn23 +0.908, xsn24 +0.046 -- none "
                 "binds"
             )
+            # 29.09. NF1c (H87): the rows above are 27B boots. On another
+            # checkpoint they are FOREIGN -- its own replay rows bind, one term
+            # (measured - predicted, max, clamped >= 0), the same rule.
+            if reference_model_ok is False:
+                _own = RUN_PEAK_RESIDUAL_RATCHET_OWN_MODEL_GIB.get(str(model_footprint or ""))
+                if _own:
+                    residual = max(0.0, max(_own.values())) + _drift_gib
+                    r_src = (
+                        f"OWN-MODEL (H87, footprint {str(model_footprint)[:12]}...): "
+                        f"max over this checkpoint's ratchet-priced replays "
+                        f"{ {k[-12:]: round(v, 3) for k, v in sorted(_own.items())} } "
+                        f"= {max(_own.values()):+.3f} GiB, clamped at >= 0, plus "
+                        f"steady-state drift {_drift_gib:.3f} GiB; the 27B rows "
+                        f"{sorted(RUN_PEAK_RESIDUAL_RATCHET_GIB)} "
+                        f"(+{max(RUN_PEAK_RESIDUAL_RATCHET_GIB.values()):.3f}) are "
+                        f"{FOREIGN_REFERENCE_TAG} FOREIGN-MODEL here and NOT charged"
+                    )
+                else:
+                    r_src = (
+                        f"{FOREIGN_REFERENCE_TAG} FALLBACK (no own-model replay row "
+                        f"for footprint {str(model_footprint or '?')[:12]}...): the "
+                        f"27B rows are charged in the refusing direction -- " + r_src
+                    )
 
     if drift_mib_per_min is None:
         drift_rate, d_src = IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT, "sb4 default, no WEG2-IDLE-CENSUS yet"
@@ -6150,6 +6200,9 @@ def choose(
     d_only: bool = False,
     reference_model_ok: Optional[bool] = None,
     reference_model_why: str = "",
+    # 29.09. NF1c (H87): this checkpoint's memory footprint, keys the margin's
+    # own-model residual rows (resolve_margin). "" = unknown.
+    model_footprint: str = "",
     memhist_gib: float = 0.0,
     # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
     l3_index_gib: float = 0.0,
@@ -6413,7 +6466,10 @@ def choose(
     margin = margin if margin is not None else resolve_margin(
         flip_ratchet_charged_gib=(
             None if flip_ratchet is None else flip_ratchet.charged_gib
-        )
+        ),
+        # 29.09. NF1c (H87): the residual of THIS checkpoint, not the 27B one.
+        reference_model_ok=reference_model_ok,
+        model_footprint=model_footprint,
     )
     hard_bound_gib = watermark_gib - margin.total_gib
     # 29.09. (27B z30y W97, 13:02Z): the latch is derived from the mark; a

@@ -11988,6 +11988,13 @@ def choose_host_ledger(
         d_only=bool(d_only),
         reference_model_ok=_ref_ok,
         reference_model_why=_ref_why,
+        # 29.09. NF1c (H87): the footprint keys the margin's OWN-MODEL
+        # residual rows; only read when the checkpoint is not the reference
+        # (form.footprint_key is cached per checkpoint stamp).
+        model_footprint=(
+            (weg2_form.footprint_key(model_dir)[0] or "")
+            if (model_dir and _ref_ok is False) else ""
+        ),
         # #1273 S6: the exchange's own pinned host carrier.  The ARM STRINGS
         # decide it here, at the one ledger call site, and not inside the
         # ledger -- `WEIGHT_SOURCE_CHOICES` is this module's, and a ledger that
