@@ -3177,6 +3177,12 @@ class Envs:
     # expert pass on NF-D). Needs SGLANG_WEG2_TAIL_SKIP_EXTEND; refused by
     # name under uneven DCP / the token cut. Off = the park byte for byte.
     SGLANG_WEG2_ENABLE_D_PARK_END = EnvBool(False)
+    # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
+    # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
+    # worker takes the E2 END state of a hand-off -- its owned K/V rows at
+    # their compact slots and the QSA pending ring -- instead of refusing it,
+    # so the group votes 2 and the extend is skipped again. Off = the refusal.
+    SGLANG_WEG2_ENABLE_CUT_WORKER_END = EnvBool(False)
     # Fix B (weg2/p_row_authority.py): the #631 row form on group P
     # (ModelProfile.p_row_authority: off on every row until the metal proof);
     # the proof boot sets it per docker profile (27b-row-authority.env).

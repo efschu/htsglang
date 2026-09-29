@@ -182,6 +182,9 @@ class HeldShapes(msgspec.Struct, frozen=True):
     #: page's rows it OWNS at their compact slot (the write rule of
     #: ``layers/dcp/owner.dcp_weighted_write_slots``), nothing else.
     owner: Optional[Tuple[int, int, int, int]] = None
+    #: F4b: the QSA compress ratio of the pending ring (``ring``) -- also on a
+    #: Form A worker, which keeps the ring but no compressed rows (qsa_ratio 0)
+    ring_ratio: int = 0
 
     @property
     def holds_nothing(self) -> bool:
@@ -207,6 +210,14 @@ def cut_owner() -> Optional[Tuple[int, int, int, int]]:
         return None
     S, lo, hi = (int(x) for x in b)
     return S, lo, hi, hi - lo
+
+
+def cut_worker_end_enabled() -> bool:
+    """F4b (SGLANG_WEG2_ENABLE_CUT_WORKER_END, default off): under the Form A
+    token cut a worker takes the E2 END state like the host -- its owned K/V
+    rows at their compact slots and the pending ring -- instead of refusing
+    it ('cut_ring_on_worker'), so the group votes 2 and the hand-off skips."""
+    return bool(envs.SGLANG_WEG2_ENABLE_CUT_WORKER_END.get())
 
 
 def cut_gate(held: "HeldShapes") -> Optional[str]:
@@ -238,7 +249,7 @@ def held_shapes(kvpool, req_to_token_pool) -> HeldShapes:
     fa: Dict[int, List[RowSpec]] = {}
     ring: Dict[int, RowSpec] = {}
     rope: Optional[RowSpec] = None
-    ratio = 0
+    ratio = ring_ratio = 0
     if isinstance(kvpool, HybridLinearKVPool):
         full = kvpool.full_kv_pool
         qsa = isinstance(kvpool, QSATokenToKVPool)
@@ -249,6 +260,7 @@ def held_shapes(kvpool, req_to_token_pool) -> HeldShapes:
         # shape ``cut_gate`` and the owner install were built for.
         compressed = bool(getattr(kvpool, "qsa_compressed_k_buffer_pool", None)) if qsa else False
         ratio = int(kvpool.qsa_compress_ratio) if compressed else 0
+        ring_ratio = int(kvpool.qsa_compress_ratio) if qsa else 0
         for gid, local in sorted(kvpool.full_attention_layer_id_mapping.items()):
             k = full.k_buffer[local]
             if math.prod(k.shape[1:]) == 0:
@@ -274,7 +286,7 @@ def held_shapes(kvpool, req_to_token_pool) -> HeldShapes:
             gdn[int(gid)] = [_row(t)] + [_row(c[local]) for c in cache.conv]
     dcp = bool(fa) and bool(uneven_dcp_active())
     return HeldShapes(fa=fa, gdn=gdn, qsa_ratio=ratio, dcp=dcp,
-                      ring=ring, rope=rope, owner=cut_owner() if dcp else None)
+                      ring=ring, rope=rope, owner=cut_owner() if dcp else None, ring_ratio=ring_ratio)
 
 
 # -- 1. VOTE ---------------------------------------------------------------------------
@@ -318,6 +330,8 @@ class Staged(msgspec.Struct):
     end_ple_why: str = "absent"
     #: #239 S4b part 5: this rank's owner rows under the token cut (None: all)
     owner: Optional[Tuple[int, int, int, int]] = None
+    #: F4b: the ring's ratio on a cut worker (its qsa_ratio is 0: no groups)
+    ring_ratio: int = 0
 
     @property
     def ok(self) -> bool:
@@ -499,10 +513,17 @@ def _stage_end(st: Staged, bundles: List[dict], held: HeldShapes, check_digest: 
     st.first_token = int(end.first_token)
     if held.holds_nothing:
         return "not_mine"
-    if held.owner is not None and not held.gdn and held.ring:
-        # #239 S4b part 5: the QSA ring is the host's indexer state
-        return "cut_ring_on_worker"
-    if (end.rows, end.groups, end.ring_rows) != th.end_geometry(st.spec, held.qsa_ratio):
+    cut_worker = held.owner is not None and not held.gdn and bool(held.ring)
+    if cut_worker:
+        if not cut_worker_end_enabled():
+            # #239 S4b part 5: the QSA ring is the host's indexer state
+            return "cut_ring_on_worker"
+        # F4b: the worker takes its owned K/V rows and the ring like the
+        # host; its pool keeps no compressed groups, so the geometry is
+        # checked against the ring's ratio (the groups are the host's)
+        st.ring_ratio = int(held.ring_ratio)
+    geo_ratio = held.qsa_ratio or (st.ring_ratio if cut_worker else 0)
+    if (end.rows, end.groups, end.ring_rows) != th.end_geometry(st.spec, geo_ratio):
         return f"end_geometry:{end.rows}/{end.groups}/{end.ring_rows}"
     fa: Dict[int, Tuple[torch.Tensor, ...]] = {}
     gdn: Dict[int, Tuple[torch.Tensor, ...]] = {}
@@ -513,7 +534,18 @@ def _stage_end(st: Staged, bundles: List[dict], held: HeldShapes, check_digest: 
         if why:
             return f"{why}:{h.part}"
         sec = bundle["end"]
-        fa.update({int(g): tuple(t) for g, t in sec["fa"].items() if int(g) in held.fa})
+        # a rank takes the rows it holds -- a cut worker K/V only (#239
+        # Blocker 5), as E1 does. F4b: D's own park parts under the token cut
+        # carry the same layers on every rank, each filled at the rows its
+        # rank owns -- they OR together into P's full-row layout
+        for g, t in sec["fa"].items():
+            if int(g) not in held.fa:
+                continue
+            t = tuple(t)
+            if int(g) in fa and st.park and held.owner is not None:
+                t = _or_rows(fa[int(g)], t)
+            fa[int(g)] = t
+        fa = {g: t[: len(held.fa[g])] for g, t in fa.items()}
         gdn.update({int(g): tuple(t) for g, t in sec["gdn"].items() if int(g) in held.gdn})
         ring.update({int(g): tuple(t) for g, t in sec["ring"].items() if int(g) in held.fa})
         if sec["rope"] is not None:
@@ -528,9 +560,25 @@ def _stage_end(st: Staged, bundles: List[dict], held: HeldShapes, check_digest: 
     st.end_gdn = {g: tuple(_pin(t, pin) for t in ts) for g, ts in gdn.items()}
     st.end_ring = {g: tuple(_pin(t, pin) for t in ts) for g, ts in ring.items()}
     st.end_rope = _pin(ropes[0], pin) if ropes and held.ring else None
-    if check_digest and held.owner is None:
+    if check_digest and (held.owner is None or cut_worker_end_enabled()):
+        # F4b: under the cut the readback is compared with the staged
+        # payload (P's digest was checked on read), the owned rows only
         st.end_readback = _readback_buffers(st.end_fa, st.end_gdn, st.end_ring, st.end_rope, pin)
     return "ready"
+
+
+def _or_rows(a: Tuple[torch.Tensor, ...], b: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, ...]:
+    """F4b: two ranks' park rows of one layer, each zero outside the rows its
+    rank owns, bytewise OR-ed; a tensor only one side carries (the indexer's
+    groups) is taken as it is."""
+    out = []
+    for j in range(max(len(a), len(b))):
+        if j < len(a) and j < len(b):
+            x, y = a[j], b[j]
+            out.append(torch.bitwise_or(_as_bytes(x), _as_bytes(y)).view(x.dtype).reshape(x.shape))
+        else:
+            out.append(a[j] if j < len(a) else b[j])
+    return tuple(out)
 
 
 def _end_shape_refusal(end: th.EndHeader, held: HeldShapes, fa, gdn, ring, ropes: List[torch.Tensor]) -> str:
@@ -1043,6 +1091,11 @@ class Install(msgspec.Struct):
     pool: Optional[object] = None
     #: #239 S4b part 5: K/V rows go to this rank's compact owner slots only
     owner: Optional[Tuple[int, int, int, int]] = None
+    #: F4b: the ring's ratio where no compressed groups exist (a cut worker)
+    ring_ratio: int = 0
+    #: F4b: the owner mask of ``rows`` (the K/V rows this rank wrote), for
+    #: the owner readback
+    keep: Optional[torch.Tensor] = None
 
 
 #: installs waiting for the extend forward's GDN layer reads (memory_pool
@@ -1149,7 +1202,7 @@ def _skip_install(st: Staged, tree_cache) -> Install:
         t0=time.perf_counter(), readback=st.end_readback, end=True, ring=st.end_ring, ring_dst=ring_dst,
         rope=st.end_rope, rope_dst=kvpool.qsa_rope_position_buffer if st.end_rope is not None else None,
         req_to_token=rtp.req_to_token, translate=rtp.translate_mamba_indices, ratio=st.qsa_ratio,
-        ple=st.end_ple, ple_why=st.end_ple_why, pool=rtp, owner=st.owner,
+        ple=st.end_ple, ple_why=st.end_ple_why, pool=rtp, owner=st.owner, ring_ratio=st.ring_ratio,
     )
 
 
@@ -1211,8 +1264,9 @@ def _install_end(inst: Install, req) -> None:
     if inst.ratio:
         inst.groups = th.group_slots(rows, inst.ratio, end.groups)
     _put_fa(inst, rows)
-    if inst.ratio and (inst.ring or inst.rope is not None):
-        ring_idx = th.ring_slots(req.req_pool_idx, inst.ratio, end.ring_rows)
+    ring_ratio = inst.ratio or inst.ring_ratio
+    if ring_ratio and (inst.ring or inst.rope is not None):
+        ring_idx = th.ring_slots(req.req_pool_idx, ring_ratio, end.ring_rows)
         for gid in sorted(inst.ring):
             back = inst.readback.get(f"ring{gid}")
             _put(inst.ring_dst[gid], ring_idx, inst.ring[gid][0], None if back is None else back[0])
@@ -1275,17 +1329,21 @@ def _put_fa(inst: Install, rows: torch.Tensor) -> None:
     kv_idx, keep = rows, None
     if inst.owner is not None:
         kv_idx, keep = owner_rows(rows, inst.owner)
+        inst.keep = keep
     for gid in sorted(inst.fa):
         back = inst.readback.get(f"fa{gid}")
         for j, (dst, src) in enumerate(zip(inst.fa_dst[gid], inst.fa[gid])):
             if j == 2:
                 _put(dst, inst.groups, src, None if back is None else back[j])
                 continue
+            b = None if back is None else back[j]
             if keep is not None:
-                if int(kv_idx.numel()) == 0:
+                n = int(kv_idx.numel())
+                if n == 0:
                     continue  # share 0 (the host in 0/48/16): no rows of this page
                 src = src[keep.to(src.device)]
-            _put(dst, kv_idx, src, None if back is None else back[j])
+                b = None if b is None else b[:n]  # F4b: the owned rows' readback
+            _put(dst, kv_idx, src, b)
 
 
 def install_worker_rows(layer_id: int) -> None:
@@ -1352,6 +1410,8 @@ def readback_digest(inst: Install) -> str:
     """match | MISMATCH:<part> | partial: the written rows/state, read back
     from the device, against each part's publish digests (same byte order as
     tail_handoff.digest over the part's sorted layers)."""
+    if inst.owner is not None:
+        return _owner_readback_digest(inst)
     held_fa = {int(k[2:]) for k in inst.readback if k.startswith("fa")}
     held_gdn = {int(k[3:]) for k in inst.readback if k.startswith("gdn")}
     for h in inst.headers:
@@ -1364,6 +1424,41 @@ def readback_digest(inst: Install) -> str:
             return f"MISMATCH:{h.part}"
         if inst.end and h.end.ring_digest != _ring_readback_digest(inst, h):
             return f"MISMATCH:{h.part}:ring"
+    return "match"
+
+
+def _owner_readback_digest(inst: Install) -> str:
+    """F4b: under the token cut a rank writes a SUBSET of a part's rows (its
+    owned K/V rows; the host its groups, ring and GDN), so the part digests
+    cannot be re-derived from the device. The parts' digests were checked on
+    read (``end_digest_refusal``); here every written row read back from the
+    device must equal the staged payload it came from: match | MISMATCH:owner:<what>."""
+    keep = inst.keep
+    for gid, srcs in inst.fa.items():
+        back = inst.readback.get(f"fa{gid}")
+        if back is None:
+            return "partial"
+        for j, src in enumerate(srcs):
+            want = _as_bytes(src)
+            got = back[j]
+            if j < 2 and keep is not None:
+                k = keep.to(want.device)
+                want = want[k]
+                got = got[: int(k.sum())]
+            if not torch.equal(got, want.reshape(got.shape)):
+                return f"MISMATCH:owner:fa{gid}/{j}"
+    for gid, srcs in inst.gdn.items():
+        back = inst.readback.get(f"gdn{gid}")
+        if back is None or any(not torch.equal(b, _as_bytes(s).reshape(b.shape)) for b, s in zip(back, srcs)):
+            return f"MISMATCH:owner:gdn{gid}"
+    for gid, srcs in inst.ring.items():
+        back = inst.readback.get(f"ring{gid}")
+        if back is None or not torch.equal(back[0], _as_bytes(srcs[0]).reshape(back[0].shape)):
+            return f"MISMATCH:owner:ring{gid}"
+    if inst.rope is not None:
+        back = inst.readback.get("rope")
+        if back is None or not torch.equal(back[0], _as_bytes(inst.rope).reshape(back[0].shape)):
+            return "MISMATCH:owner:rope"
     return "match"
 
 
