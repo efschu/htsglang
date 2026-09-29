@@ -436,7 +436,8 @@ class TestMainStillCallsTheSeams(CustomTestCase):
         main_src = src[src.index("\ndef main("):]
         self.assertIn("choose_host_ledger(", main_src)
         self.assertIn("ring_plan.host_weights_bytes", main_src)
-        self.assertIn("gate_w11(spec_p.log, log)", main_src)
+        # 29.09. (YaRN x2 W11): the call carries the draft RoPE context term; the delegation is what is pinned
+        self.assertIn("gate_w11(spec_p.log, log, rope_ctx_mib=p_rope_draft_delta_mib(ns))", main_src)
         # And the four-line inline form is gone from main, not merely shadowed.
         self.assertNotIn("host_ledger.choose(", main_src)
         self.assertNotIn("check_draft_resident(spec_p.log)", main_src)

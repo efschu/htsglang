@@ -9162,6 +9162,15 @@ def p_rope_context_delta_mib(ns, n_stages: int) -> Tuple[Tuple[float, ...], Opti
     return tuple(delta), line
 
 
+def p_rope_draft_delta_mib(ns) -> float:
+    """YaRN x2 27B (29.09., heu5g3 W11b death): the DFlash draft's share of :func:`p_rope_context_delta_mib`
+    -- the SAME function, read at two stages (target on both, the draft only on the last), so the W11 draft
+    budget and the W11b build accounting price exactly the MiB the P pool floor already priced. 0.0 at or
+    below 262144 (every x1 form byte-identical) and without a DFLASH draft."""
+    delta, _line = p_rope_context_delta_mib(ns, 2)
+    return max(0.0, float(delta[-1]) - float(delta[0]))
+
+
 def _argv_vector(extra: str, flag: str):
     """Der Komma-Vektor hinter ``flag`` in einer ``--extra-*``-Zeichenkette.
 
@@ -10711,7 +10720,8 @@ _CARD_FREE_RE = tolerant_compile(r"WEG2 DRAFT-KV-PRODUCER armed .*card_free_mib=
 P_DRAFT_BUILD_ACCOUNTING_TOL_MIB = 256.0
 
 
-def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = None) -> Dict[str, object]:
+def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = None,
+                         rope_ctx_mib: float = 0.0) -> Dict[str, object]:
     """W11 (#1233 fix 2, second instrument added in fix 6): the producer's
     build on P's last stage, graded by TWO independent readings of the L2 line.
 
@@ -10736,6 +10746,12 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
     """
     budget = (float(_pconst("P_DRAFT_RESIDENT_BUDGET_MIB")) if budget_mib is None
               else float(budget_mib))
+    # YaRN x2 27B (heu5g3, 29.09.): the draft's eager RoPE cache grows with the context BEYOND the budget's
+    # 262144 (p_rope_draft_delta_mib): resident +128 MiB at 524288 (262528 -> 524672 rows x 128 cols fp32), and
+    # its build writes it once more through the allocator (NVML +254 MiB, unaccounted 149.5 -> 275.5). The budget
+    # takes the delta, the accounting explains the same delta once. 0 at x1: byte-identical.
+    rope_ctx = max(0.0, float(rope_ctx_mib or 0.0))
+    budget += rope_ctx
     tol = P_DRAFT_RESIDENT_TOL_MIB if tol_mib is None else float(tol_mib)
     out: Dict[str, object] = {
         "resident_mib": None, "budget_mib": budget, "tol_mib": tol, "over_mib": None,
@@ -10746,6 +10762,8 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         "accounting_tol_mib": P_DRAFT_BUILD_ACCOUNTING_TOL_MIB,
         "resident_ok": False, "accounted": False, "ok": False,
     }
+    if rope_ctx > 0:
+        out["rope_ctx_mib"] = rope_ctx
     try:
         with open(log_p, errors="replace") as f:
             for line in f:
@@ -10831,10 +10849,10 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         other_live = out.get("other_live_mib")
         other_live = 0.0 if other_live is None or float(other_live) < 0 else float(other_live)
         if torch_cached >= 0:
-            out["unaccounted_mib"] = delta - (r + other_live + torch_cached + outside)
+            out["unaccounted_mib"] = delta - (r + other_live + torch_cached + outside + rope_ctx)
             out["cache_term"] = "torch_total"
         else:
-            out["unaccounted_mib"] = delta - (r + other_live + released + pooled + outside)
+            out["unaccounted_mib"] = delta - (r + other_live + released + pooled + outside + rope_ctx)
             out["cache_term"] = "tag_pool+head_released"
         out["accounted"] = abs(out["unaccounted_mib"]) <= P_DRAFT_BUILD_ACCOUNTING_TOL_MIB
     out["ok"] = bool(out["resident_ok"] and out["accounted"])
@@ -10873,7 +10891,7 @@ def gate_w10(log_p: str, log_d: str, log, *, p_produces_draft_pages: bool) -> Di
     return w10
 
 
-def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
+def gate_w11(log_p: str, log: Log, rope_ctx_mib: float = 0.0) -> Dict[str, object]:
     """THE LAUNCHER'S W11 GATE, both instruments and both refusals.
 
     Grades group P's last-stage draft build from its log (see
@@ -10902,7 +10920,7 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
         _w11_budget = float(
             sum(dflash_draft_family_bytes(str(_SPEC_FORM["draft_path"])).values())
         ) / float(1 << 20)
-    w11 = check_draft_resident(log_p, budget_mib=_w11_budget)
+    w11 = check_draft_resident(log_p, budget_mib=_w11_budget, rope_ctx_mib=rope_ctx_mib)
     log(f"W11 DRAFT-RESIDENT P last stage resident_mib={w11['resident_mib']} budget_mib={w11['budget_mib']:.1f} "
         f"tol_mib={w11['tol_mib']:.0f} over_mib={w11['over_mib']} resident_ok={w11['resident_ok']} "
         f"| W11b BUILD-ACCOUNTING nvml_delta_mib={w11['nvml_delta_mib']} = resident_mib + "
@@ -10910,7 +10928,9 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
         f"+ outside_torch_mib={w11['outside_torch_mib']} "
         f"+ default_pool_inactive_mib={w11['default_pool_inactive_mib']} "
         f"+ other_live_mib={w11.get('other_live_mib')} "
-        f"+ unaccounted_mib={w11['unaccounted_mib']} cache_term={w11.get('cache_term')} "
+        + (f"+ rope_ctx_mib={w11['rope_ctx_mib']:.1f} (YaRN draft RoPE context, budget and build) "
+           if w11.get("rope_ctx_mib") else "")
+        + f"+ unaccounted_mib={w11['unaccounted_mib']} cache_term={w11.get('cache_term')} "
         f"card_free_mib={w11.get('card_free_mib')} "
         f"(tol {w11['accounting_tol_mib']:.0f}) accounted={w11['accounted']} "
         f"ok={w11['ok']}")
@@ -25147,7 +25167,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # line carries the MEASURED one. Over budget = the corridor derivation is refuted by this
         # boot -> refuse before the front opens (boot weg2dk2's 3994 MiB build).
         # IPC-LOG-EXCEPTION: W11 (see W10 above).
-        gate_w11(spec_p.log, log)
+        gate_w11(spec_p.log, log, rope_ctx_mib=p_rope_draft_delta_mib(ns))
     # IPC-LOG-EXCEPTION: display only (class A), decides nothing; metric bar1_window_clip_total later.
     clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
     log(f"BAR1 fit (deviation: transports open): D log 'window clip'/'Bar1WindowRefused' lines = {clips} (0 = both groups fit the aperture)")
