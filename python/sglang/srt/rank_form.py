@@ -20,10 +20,13 @@ nothing). The three forms of the 27B-NVFP4 question
                                       (--weightless-kv-fastlane, #115/#131/#143):
                                       head = that rank, TP=1 collective-free,
                                       every other rank KV-only
-  B  >= 2 ranks have weights and      TP over a SUBSET of the DCP group: the
-     >= 1 rank has none               subgroup collectives are rank_role seam F6
-                                      (wired: model_tp); the boot path is seam
-                                      F15, not wired -> refused by name (W188)
+  B  >= 2 ranks have weights and      the weightless-KV lane with a head SET W
+     >= 1 rank has none               (the weight ranks, TP over W by their
+                                      shares, collectives on model_tp = seam
+                                      F6); every other rank a lane KV worker;
+                                      boot path = seam F15 (wired 29.09.:
+                                      --weightless-kv-fastlane --rank-tp-ratio
+                                      77,23,0, head rank = lead = min W)
 
 NO flag of its own (user 28.09.: one mechanism with NF's #239): the vectors
 ARE NF's #239 flags -- ``--rank-tp-ratio`` (0 = no dense share), ``--rank-role``
@@ -115,7 +118,9 @@ class RankForm:
 
     @property
     def head_rank(self) -> Optional[int]:
-        return self.weight_ranks[0] if self.kind == FORM_A else None
+        """The lane's head rank: form A's one weight rank, form B's LEAD (min W,
+        the token/accept/solo-draft source of the head set). None for C."""
+        return self.weight_ranks[0] if self.kind in (FORM_A, FORM_B) else None
 
     def serve_argv(self) -> List[str]:
         """The serve-chain flags that run this form (group sizes and the form's
@@ -221,6 +226,14 @@ def resolve_rank_form(
                 f"needs a token share >= 1 (host 0 is a #239 Form A layout for MoE/QSA)")
     else:
         kind = FORM_B
+        # F15 (29.09.): dense B rides the weightless lane with the head SET W;
+        # a MoE model's KV-only rank holds experts and has no B path (W189).
+        if not dense:
+            raise _refuse(
+                RankFormBMoeNotBuilt,
+                f"weights {list(w)}: NF-K unter Form B braucht einen Form-B-Plan im NF-Pfad, "
+                "nicht gebaut (the KV-only rank of a MoE model holds experts)")
+        backend = BACKEND_LANE
         if not (f6_wired() if subgroup_tp_wired is None else subgroup_tp_wired):
             raise _refuse(
                 RankFormSubgroupTpNotWired,
@@ -693,8 +706,9 @@ def form_b_build_override(
 
     ``base_ratios`` / ``families`` are the process plan over ALL ranks (a
     KV-only rank's entry is 0); None = even split, and it stays even over W.
-    A KV-only rank is refused by name (W188): its construction (meta model, no
-    weight load) and its attention-only forward belong to seam F15."""
+    A KV-only rank is refused by name (W188): it never builds under the W
+    context -- it builds the weightless lane worker's meta model (no weight
+    load) and runs the lane's attention-only forward (model_runner, F15)."""
     multi = [list(p) for p in partition if len(p) >= 2]
     if len(multi) != 1:
         raise _refuse(RankFormShapeMismatch,
@@ -703,9 +717,9 @@ def form_b_build_override(
     if rank not in w:
         raise _refuse(
             RankFormKvRankBuild,
-            f"rank {rank} is a KV-only rank of Form B (weight ranks {w}); building it needs the "
-            "KV-only construction path (meta model, attention-only forward) -- rank_role seam F15, "
-            "not wired. Refused before any layer is built.")
+            f"rank {rank} is a KV-only rank of Form B (weight ranks {w}); it builds the lane "
+            "worker's meta model (no weight load, attention-only forward, model_runner), never "
+            "under the W build context (seam F15). Refused before any layer is built.")
     i = w.index(rank)
     override = dict(tp_size=len(w), tp_rank=i, attn_tp_size=len(w), attn_tp_rank=i)
     world = sum(len(p) for p in partition)
@@ -807,3 +821,33 @@ def form_b_head_set(partition: Sequence[Sequence[int]],
     if base_ratios is None:
         return w, None
     return w, tuple(int(base_ratios[r]) for r in w)
+
+
+def install_weightless_heads(server_args) -> Optional[Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]]:
+    """F15 (29.09.): THE one installer of the weightless lane's heads in a
+    scheduler process (scheduler.configure_scheduler_process).
+
+    Form B: the head SET W with its weight shares (form_b_head_set over the
+    admitted model_tp partition and the base plan); the lead (min W) becomes
+    the head rank every single-head reader sees. The lane (Form A + KV-only):
+    the one ``--weightless-kv-head-rank``, a set of one -- byte-identical to
+    before. Otherwise nothing is installed and None is returned.
+
+    One site on purpose: installing W and then the lane's single head (the
+    order the scheduler had) overwrote W with (lead,), so W1 would have come
+    up as a weightless worker beside a lead that all-reduces over model_tp."""
+    from sglang.srt.distributed.utils import (
+        set_weightless_kv_head_rank,
+        set_weightless_kv_weight_ranks,
+    )
+
+    fb = getattr(server_args, "form_b_active", None)
+    if callable(fb) and fb():
+        w, wr = form_b_head_set(server_args.form_b_model_tp_partition(), server_args.rank_tp_ratio)
+        set_weightless_kv_weight_ranks(w, wr)
+        return w, wr
+    if getattr(server_args, "weightless_kv_fastlane", False):
+        h = int(server_args.weightless_kv_head_rank)
+        set_weightless_kv_head_rank(h)
+        return (h,), None
+    return None

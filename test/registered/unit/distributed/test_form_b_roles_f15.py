@@ -144,5 +144,7 @@ def test_the_role_and_install_sites_read_the_head_set():
     src = inspect.getsource(mr)
     assert "self.is_weightless_head = is_weightless_head_rank(self.tp_rank)" in src
     assert "(self.is_weightless_head and not self.is_form_b_head)" in src
-    assert "set_weightless_kv_weight_ranks(_w, _wr)" in inspect.getsource(sch)
+    # 29.09.: the scheduler installs through THE one installer (W, not W then
+    # the lane's single head)
+    assert "install_weightless_heads(server_args)" in inspect.getsource(sch)
     assert "get_weightless_kv_head_rank()" in inspect.getsource(eu.spec_accept_broadcast_src)

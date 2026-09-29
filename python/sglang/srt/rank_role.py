@@ -314,7 +314,7 @@ SEAM_LIST: Tuple[Seam, ...] = (
             ("distributed/parallel_state.py", 3087, "def init_model_tp_group"),
             ("distributed/communication_op.py", 27,
              "get_model_tp_group().all_reduce(input_)"),
-            ("rank_role.py", 1026, "def guard_collective_subgroup"),
+            ("rank_role.py", 1032, "def guard_collective_subgroup"),
             ("speculative/form_b_spec.py", 145, "def spec_k("),
         ),
     ),
@@ -491,21 +491,27 @@ SEAM_LIST: Tuple[Seam, ...] = (
         "F15",
         "Form B's boot path: the vectors admitted, the model_tp partition "
         "installed from them, the KV-only ranks built and run",
-        "server_args.py (--rank-tp-ratio zeros admitted only with --rank-role "
-        "or the lane), model_executor/model_runner.py (form_b_build_context "
-        "refuses a KV-only rank, W188; nobody calls set_model_tp_partition "
-        "before initialize_model_parallel), rank_form.py "
-        "(RankFormKvRankBuild; check_form_b_windows has no launcher caller)",
-        wired=False,
-        note="Open: (1) server_args admits a Form B vector by name and "
-        "installs FormBPlan.model_tp_partition before initialize_model_parallel; "
-        "(2) a KV-only rank builds on meta (no weight load) and runs the "
-        "attention-only forward with [T, 0, D] (the lane worker's shape, "
-        "N1/N9); (3) the DFLASH draft-hidden and selector broadcasts move off "
-        "tp for Form B (K ranks skip them); (4) the weg2 launcher calls "
-        "check_form_b_windows (W187) before any rank loads.",
+        "server_args.py _admit_form_b (Form B = --weightless-kv-fastlane with "
+        "a --rank-tp-ratio naming >= 2 weight ranks; head rank = lead = min W), "
+        "managers/scheduler.py (rank_form.install_weightless_heads: THE head-set "
+        "installer), model_executor/model_runner.py (set_model_tp_partition "
+        "before initialize_model_parallel; W builds under form_b_build_context, "
+        "K builds the lane worker's meta model), weg2/launcher.py "
+        "refuse_form_b_windows (W187)",
+        wired=True,
+        note="DESK-WIRED 29.09. (desk/27b-form-b-headset-0929): (1) b9ae4978bb "
+        "admission, (2) 4fb70f8e39 partition + allow_zero, (3) 9860783092 DFLASH "
+        "broadcasts on model_tp, (4) 9dae72c3e4 launcher W187, (5a-e) the lane's "
+        "one head generalised to the head SET W (heads, roles, head counts, GDN "
+        "pool, DFLASH accept takeover); 29.09. the lane flag carries B (one "
+        "mechanism), one installer instead of W-then-head (which overwrote W). "
+        "NOT proven on metal: flashinfer head path with 2 heads, symmetric W/K "
+        "decode graphs, DFLASH on W minus lead -- the first Form B boot is that "
+        "test. NF (MoE) under B stays refused by name (W189).",
         anchors=(
-            ("rank_form.py", 681, "class RankFormKvRankBuild"),
+            ("server_args.py", 11134, "Form B IS the weightless-KV lane with a head SET W"),
+            ("rank_form.py", 826, "def install_weightless_heads"),
+            ("managers/scheduler.py", 21719, "install_weightless_heads(server_args)"),
             ("model_executor/model_runner.py", 2868,
              "form_b_build_context(self.tp_rank)"),
         ),
@@ -517,7 +523,7 @@ SEAMS: Dict[str, Seam] = _index_seams(SEAM_LIST)
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F15",)
+UNWIRED_ORDER: Tuple[str, ...] = ()
 
 #: #239 S3e: the seams a real boot of the token cut (kv=qsa_forma_dcp) stands
 #: on -- F4 (a worker's KV share), F5 (the LSE merge with zero-head ranks),

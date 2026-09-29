@@ -52,7 +52,7 @@ def test_form_a_runs_on_the_existing_lane():
     ([1, 0], [1, 1, 1], rf.RankFormShapeMismatch),
     ([1, 0, 0], [50, 50, 0], rf.RankFormShapeMismatch),   # KV-only rank holding nothing
     ([1, -1, 0], None, rf.RankFormShapeMismatch),
-    ([77, 23, 0], None, rf.RankFormKvRankBuild),          # B: F6 wired, boot path F15 not
+    ([77, 23, 0], [1, 2, 0], rf.RankFormShapeMismatch),   # B: a KV donor holding nothing
 ])
 def test_nonsense_is_refused_by_name(w, t, cls):
     with pytest.raises(cls) as ei:
@@ -213,10 +213,16 @@ def test_server_args_admit_the_lane_vector_and_nothing_else():
     a = _lane_args(rank_tp_ratio=[1, 0, 0])
     a._handle_uneven_tp()
     assert a.rank_tp_ratio is None and a._lane_rank_tp_ratio == [1, 0, 0]
-    for bad in ([1, 1, 0], [0, 1, 0], [1, 0]):
+    for bad in ([0, 1, 0], [1, 0]):
         b = _lane_args(rank_tp_ratio=list(bad))
         with pytest.raises(ValueError, match="W181"):
             b._handle_uneven_tp()
+    # 29.09. (F15): two weight ranks on the lane are no longer a wrong lane
+    # shape but Form B -- the lane's head becomes the head set W = {0, 1}
+    fb = _lane_args(rank_tp_ratio=[1, 1, 0])
+    fb._handle_uneven_tp()
+    assert fb.form_b_active() and fb.form_b_model_tp_partition() == [[0, 1], [2]]
+    assert fb.rank_tp_ratio == [1, 1, 0] and getattr(fb, "_lane_rank_tp_ratio", None) is None
     # outside the lane a zero stays an arithmetic accident, as before
     from sglang.srt.server_args import ServerArgs
 
@@ -262,15 +268,18 @@ def test_second_token_vector_source_is_refused_by_name():
 
 
 def test_form_b_waits_for_its_seams_themselves(monkeypatch):
-    """F6 (subgroup collectives) is wired since 28.09.; Form B still waits for
-    its boot path F15 -- both read from THE registry, never from a caller."""
+    """F6 (subgroup collectives) is wired since 28.09., Form B's boot path F15
+    since 29.09. -- both read from THE registry, never from a caller: a registry
+    that says unwired still refuses by name."""
     from sglang.srt import rank_role
 
     def _seam(sid, wired):
         monkeypatch.setitem(rank_role.SEAMS, sid, rank_role.SEAMS[sid].__class__(
             **{**rank_role.SEAMS[sid].__dict__, "wired": wired}))
 
-    assert rank_role.SEAMS["F6"].wired is True and rank_role.SEAMS["F15"].wired is False
+    assert rank_role.SEAMS["F6"].wired is True and rank_role.SEAMS["F15"].wired is True
+    assert rf.resolve_rank_form([77, 23, 0], [10, 45, 45]).backend == rf.BACKEND_LANE
+    _seam("F15", False)
     with pytest.raises(rf.RankFormKvRankBuild, match="W188.*F15"):
         rf.resolve_rank_form([77, 23, 0], [10, 45, 45])       # reads the registry
     _seam("F6", False)
@@ -279,7 +288,9 @@ def test_form_b_waits_for_its_seams_themselves(monkeypatch):
     _seam("F6", True)
     _seam("F15", True)
     assert rf.resolve_rank_form([77, 23, 0], [10, 45, 45]).kind == rf.FORM_B
-    assert rank_role.UNWIRED_ORDER == ("F15",)
+    assert rank_role.UNWIRED_ORDER == ()
+    with pytest.raises(rf.RankFormBMoeNotBuilt, match="W189"):
+        rf.resolve_rank_form([77, 23, 0], [10, 45, 45], dense=False)
 
 
 def test_form_b_plan_keeps_the_scheduler_group_on_all_ranks():
@@ -379,17 +390,19 @@ def _b_args(**kw):
 
 
 def test_server_args_admit_form_b_by_name(monkeypatch):
-    a = _b_args(rank_tp_ratio=[3, 1, 0], uneven_token_vector="1,2,2")
+    _seam(monkeypatch, "F15", False)
+    a = _b_args(rank_tp_ratio=[3, 1, 0], uneven_token_vector="1,2,2", weightless_kv_fastlane=True)
     with pytest.raises(ValueError, match="W188.*F15"):                  # boot path not wired
         a._handle_uneven_tp()
     _seam(monkeypatch, "F15", True)
-    a = _b_args(rank_tp_ratio=[3, 1, 0], uneven_token_vector="1,2,2")
+    a = _b_args(rank_tp_ratio=[3, 1, 0], uneven_token_vector="1,2,2", weightless_kv_fastlane=True)
     a._handle_uneven_tp()
     assert a.form_b_active() and a.form_b_model_tp_partition() == [[0, 1], [2]]
     assert a.rank_tp_ratio == [3, 1, 0] and not a.form_a_active()
     for bad, match in (({"dcp_size": 1}, "dcp-size 1 != --tp-size 3"),
                        ({"uneven_token_vector": "1,2,0"}, "token share 0")):
-        b = _b_args(rank_tp_ratio=[3, 1, 0], **{"uneven_token_vector": "1,2,2", **bad})
+        b = _b_args(rank_tp_ratio=[3, 1, 0], weightless_kv_fastlane=True,
+                    **{"uneven_token_vector": "1,2,2", **bad})
         with pytest.raises(ValueError, match=match):
             b._handle_uneven_tp()
     # a single weight rank without --rank-role stays the classic refusal
@@ -397,3 +410,7 @@ def test_server_args_admit_form_b_by_name(monkeypatch):
     with pytest.raises(ValueError, match="positive"):
         c._handle_uneven_tp()
     assert not _b_args(rank_tp_ratio=[2, 1, 1]).form_b_active()
+    # 29.09.: Form B rides the lane -- the vector alone is refused by name
+    d = _b_args(rank_tp_ratio=[3, 1, 0], uneven_token_vector="1,2,2")
+    with pytest.raises(ValueError, match="no --weightless-kv-fastlane"):
+        d._handle_uneven_tp()

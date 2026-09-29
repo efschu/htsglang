@@ -11099,10 +11099,12 @@ class ServerArgs:
     # ---- Form B (rank form 28.09., seam F15) -------------------------------
     def _form_b_candidate(self) -> bool:
         """--rank-tp-ratio names Form B: >= 2 weight ranks and >= 1 zero, no
-        --rank-role (that is #239 Form A), not the weightless lane (form A of a
-        dense model, admitted by _admit_lane_rank_tp_ratio)."""
+        --rank-role (that is #239 Form A). On the weightless lane a vector with
+        ONE weight rank is the lane's own shape (Form A + KV-only, admitted by
+        _admit_lane_rank_tp_ratio); >= 2 weight ranks make the lane's head a
+        head SET W -- Form B (F15, 29.09.)."""
         r = self.rank_tp_ratio
-        if not isinstance(r, list) or self.rank_role or self.weightless_kv_fastlane:
+        if not isinstance(r, list) or self.rank_role:
             return False
         if any(not isinstance(x, int) for x in r):
             return False
@@ -11128,6 +11130,23 @@ class ServerArgs:
         if self.dcp_size != self.tp_size:
             why.append(f"--dcp-size {self.dcp_size} != --tp-size {self.tp_size} "
                        "(Form B's KV and spec channel run over dcp = ALL ranks)")
+        lead = min(r for r, x in enumerate(self.rank_tp_ratio) if x > 0)
+        # F15 (29.09.): Form B IS the weightless-KV lane with a head SET W (the
+        # ranks with a weight share) instead of one head -- one mechanism, no
+        # second path. Its KV-only ranks run the lane worker, its spec/accept
+        # and token channels are the lane's; without the lane flag none of them
+        # would be on, so the flag is required, and the lane's head rank must
+        # be W's lead (min W: token, accept and solo-draft source).
+        if not self.weightless_kv_fastlane:
+            why.append(
+                "no --weightless-kv-fastlane: Form B (dense) runs the weightless-KV "
+                "lane over the head set W = the ranks with a weight share; add "
+                f"--weightless-kv-fastlane --weightless-kv-head-rank {lead}")
+        elif int(self.weightless_kv_head_rank) != lead:
+            why.append(
+                f"--weightless-kv-head-rank {self.weightless_kv_head_rank} is not the "
+                f"lead {lead} of the head set W (min of the ranks with a weight "
+                "share): the lead is the token, accept and solo-draft source")
         if why:
             raise ValueError(
                 f"--rank-tp-ratio {self.rank_tp_ratio} is Form B (weight ranks over a "
@@ -12316,10 +12335,14 @@ class ServerArgs:
         # backends (launcher.d_kv_worker_ranks). The lane owns placement (head
         # TP=1, workers weightless): the vector is checked against the lane's
         # head and then taken out of uneven-TP planning, byte-identical.
+        # F15 (29.09.): a vector with >= 2 weight ranks under the lane is Form B
+        # (the lane's head becomes the head set W) and is admitted below by
+        # _admit_form_b, the base plan kept for the W build.
         if (
             isinstance(self.rank_tp_ratio, list)
             and self.weightless_kv_fastlane
             and not self.rank_role
+            and not self._form_b_candidate()
         ):
             self._admit_lane_rank_tp_ratio()
         self._refuse_second_token_vector_source()

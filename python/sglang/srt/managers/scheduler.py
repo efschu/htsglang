@@ -21709,27 +21709,23 @@ def configure_scheduler_process(
     # broadcast from head rank; O merge -> sliced back to head rank only),
     # independently of --rank-tp-ratio. None keeps every other path
     # byte-identical.
-    # F15 (5b): Form B (dense) is the lane over the head SET W -- the weight
-    # ranks with their shares; the lead (min W) is the token/accept source. A
-    # MoE model is refused by name at the model runner (W189).
-    if server_args.form_b_active():
-        from sglang.srt.distributed.utils import set_weightless_kv_weight_ranks
-        from sglang.srt.rank_form import form_b_head_set
+    # F15 (5b, 29.09.): Form B (dense) is the lane over the head SET W -- the
+    # weight ranks with their shares; the lead (min W) is the token/accept
+    # source. ONE installer for both (rank_form.install_weightless_heads): the
+    # lane installed its single head AFTER W and overwrote the set. A MoE model
+    # is refused by name at the model runner (W189).
+    from sglang.srt.rank_form import install_weightless_heads
 
-        _w, _wr = form_b_head_set(
-            server_args.form_b_model_tp_partition(), server_args.rank_tp_ratio
-        )
-        set_weightless_kv_weight_ranks(_w, _wr)
+    _wl_heads = install_weightless_heads(server_args)
+    if _wl_heads is not None and len(_wl_heads[0]) > 1:
         logger.info("Form B: weightless head set W=%s shares=%s (lead %d); every other "
-                    "rank a weightless KV worker.", list(_w), _wr, _w[0])
-    if getattr(server_args, "weightless_kv_fastlane", False):
-        from sglang.srt.distributed.utils import set_weightless_kv_head_rank
-
-        set_weightless_kv_head_rank(server_args.weightless_kv_head_rank)
+                    "rank a weightless KV worker.", list(_wl_heads[0]), _wl_heads[1],
+                    _wl_heads[0][0])
+    elif _wl_heads is not None:
         logger.info(
             "Weightless-KV fast lane active: head rank = %d (holds all "
             "weights/heads); other ranks weightless (KV-token-shard only).",
-            server_args.weightless_kv_head_rank,
+            _wl_heads[0][0],
         )
 
     # Apply this rank's --rank-gpu-memory-mib budget as its
