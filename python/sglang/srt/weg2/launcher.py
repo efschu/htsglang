@@ -9134,11 +9134,37 @@ def p_rope_context_delta_mib(ns, n_stages: int) -> Tuple[Tuple[float, ...], Opti
     it promised (per_request_max > realised pool). Delta = (ctx - 262144) x
     cols x 4 B; target on every stage, the DFLASH draft on the last one.
     ``((0,)*n, None)`` at or below 262144 -- every x1 form is byte-identical."""
-    ctx, src = group_context_tokens(ns, "p")
-    extra_rows = int(ctx) - CONTEXT_LENGTH_TOKENS
     zero = tuple(0.0 for _ in range(int(n_stages)))
-    if extra_rows <= 0 or n_stages <= 0:
+    if n_stages <= 0:
         return zero, None
+    ctx, src, extra_rows, tcols, dcols, dname = _rope_context_terms(ns, "p")
+    if extra_rows <= 0:
+        return zero, None
+    per_col = extra_rows * 4 / (1024.0 * 1024.0)
+    delta = [tcols * per_col for _ in range(int(n_stages))]
+    delta[-1] += dcols * per_col
+    line = (f"PP-CUT ROPE-KONTEXT (YaRN x2 27B): P context {ctx} (from {src}) > {CONTEXT_LENGTH_TOKENS} "
+            f"(the posts' context) -> eager cos/sin cache +{extra_rows} rows x 4 B: target {tcols} cols "
+            f"= +{tcols * per_col:.1f} MiB on every stage"
+            + (f", draft {dname} {dcols} cols = +{dcols * per_col:.1f} MiB on the last stage" if dcols else "")
+            + f"; stage_fixed += {[round(x, 1) for x in delta]} MiB")
+    return tuple(delta), line
+
+
+def _rope_context_terms(ns, group: str):
+    """The ONE reading behind every RoPE-context delta (P pool floor, W11/W11b, D's dormant reserve):
+    ``(ctx, src, extra_rows, target_cols, draft_cols, draft_name)`` for group ``group``; extra_rows <= 0 at or
+    below 262144 (the rig's posts and records were measured there), and then no config is read."""
+    ctx, src = group_context_tokens(ns, group)
+    extra_rows = int(ctx) - CONTEXT_LENGTH_TOKENS
+    if extra_rows <= 0:
+        return ctx, src, extra_rows, 0, 0, None
+    tcols, dcols, dname = _rope_cols(ns)
+    return ctx, src, extra_rows, tcols, dcols, dname
+
+
+def _rope_cols(ns) -> Tuple[int, int, Optional[str]]:
+    """Cos/sin cache columns of the target and (DFLASH) the draft -- context-free; read from the configs."""
     try:
         tcols = _rope_cache_cols(_model_config(str(ns.model)))
     except (OSError, ValueError, KeyError):
@@ -9151,15 +9177,32 @@ def p_rope_context_delta_mib(ns, n_stages: int) -> Tuple[Tuple[float, ...], Opti
             dname = os.path.basename(dpath.rstrip("/"))
         except (OSError, ValueError, KeyError):
             dcols = 0
-    per_col = extra_rows * 4 / (1024.0 * 1024.0)
-    delta = [tcols * per_col for _ in range(int(n_stages))]
-    delta[-1] += dcols * per_col
-    line = (f"PP-CUT ROPE-KONTEXT (YaRN x2 27B): P context {ctx} (from {src}) > {CONTEXT_LENGTH_TOKENS} "
-            f"(the posts' context) -> eager cos/sin cache +{extra_rows} rows x 4 B: target {tcols} cols "
-            f"= +{tcols * per_col:.1f} MiB on every stage"
-            + (f", draft {dname} {dcols} cols = +{dcols * per_col:.1f} MiB on the last stage" if dcols else "")
-            + f"; stage_fixed += {[round(x, 1) for x in delta]} MiB")
-    return tuple(delta), line
+    return tcols, dcols, dname
+
+
+def d_rope_context_delta_mib(ns, from_ctx: int = CONTEXT_LENGTH_TOKENS) -> Tuple[float, Optional[str]]:
+    """YaRN x2 27B (29.09., zw4skn W19 at the first P wake): group D's per-rank share of the RoPE context
+    growth, from the SAME reading as :func:`p_rope_context_delta_mib`. D is TP -- every rank builds the whole
+    target's cos/sin cache AND the DFlash draft's -- and both stay resident while D sleeps, so D's dormant
+    residue (the x1 record behind ``dc_expect_d``) grows by (target + draft cols) x extra rows x 4 B on every
+    card. MEASURED dkr27browauthorityyarn2bar1fs09291825 (z30y3g, 524288): D_c(D) 2146 / 1718 / 1718 against the
+    reserve 2106 / 1678 / 1678 built from the x1 record 1786 / 1358 / 1358 + 256 + 64 -> W19. ``(0.0, None)`` at
+    or below 262144: every x1 reserve is byte-identical.
+
+    ``from_ctx`` = the context the residue it is added to was MEASURED at (a record stamps
+    ``vram_residue_context_tokens`` when it is not 262144; the constants are 262144): the delta is the
+    difference, so a record measured at 524288 prices 0 for a 524288 boot and a NEGATIVE delta for an x1 boot
+    (its own residue already carries the larger caches)."""
+    ctx, src = group_context_tokens(ns, "d")
+    if int(ctx) == int(from_ctx) or (int(ctx) <= CONTEXT_LENGTH_TOKENS and int(from_ctx) <= CONTEXT_LENGTH_TOKENS):
+        return 0.0, None
+    tcols, dcols, dname = _rope_cols(ns)
+    rows = int(ctx) - int(from_ctx)
+    per_col = rows * 4 / (1024.0 * 1024.0)
+    delta = (tcols + dcols) * per_col
+    return delta, (f"D ROPE-KONTEXT (YaRN x2 27B): D context {ctx} (from {src}) vs {int(from_ctx)} (the dormant "
+                   f"residue's measured context) -> {rows:+d} rows x 4 B x (target {tcols} + draft "
+                   f"{dname or '-'} {dcols}) cols = {delta:+.1f} MiB per D rank, resident in the dormant image")
 
 
 def p_rope_draft_delta_mib(ns) -> float:
@@ -22994,13 +23037,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"{' '.join(a + '=' + getattr(boot_form, a) for a in weg2_form.RESIDUE_AXES)}]")
     if calib_identity is not None and calib_identity.uses_d_capture_set:
         _dc_record_prov += f" [capture set --max-running-requests {int(d_bs)}]"
+    # YaRN x2 27B: D's RoPE context stays resident while D sleeps; the records/constants were measured at
+    # 262144 -> the same reading's D share on every card (0 at x1: byte-identical).
+    _d_rope_from = (int((_dc_rec_d or {}).get("vram_residue_context_tokens") or CONTEXT_LENGTH_TOKENS)
+                    if _dc_from_record is not None else CONTEXT_LENGTH_TOKENS)
+    _d_rope_mib, _d_rope_line = d_rope_context_delta_mib(ns, _d_rope_from)
+    _d_rope_add = int(math.ceil(_d_rope_mib)) if _d_rope_mib != 0 else 0
     dc_expect_d = {
         c.uuid: (
             _dc_from_record[c.uuid] if _dc_from_record is not None
             else dc_measured_d_mib(c, ns.weg2_weight_source)
-        ) + slack_mib
+        ) + slack_mib + _d_rope_add
         for c in cards
     }
+    if _d_rope_line:
+        log(_d_rope_line + f" -> dormant reserve += {_d_rope_add} MiB per card")
     log(f"#1444 DC-RESIDUE group=D source="
         f"{'RECORD' if _dc_from_record is not None else 'CONSTANT'}: {_dc_record_prov}; "
         f"reserve incl. {slack_mib} MiB slack = "
@@ -25512,6 +25563,8 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--vision", str(getattr(ns, "weg2_vision", VISION_OFF)),
         "--dc-reserve", ",".join(f"{c.uuid}={dc_expect_d.get(c.uuid, 0)}" for c in cards),
         "--weight-form", str(ns.weg2_weight_source),  # #1444: stamps the record
+    ] + (["--d-residue-context-tokens", str(group_context_tokens(ns, "d")[0])]  # YaRN x2: x1 argv unchanged
+         if group_context_tokens(ns, "d")[0] > CONTEXT_LENGTH_TOKENS else []) + [
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
     ] + (["--weights-resident"] if getattr(ns, "flip_weights", "family") == "resident" else []) + [
