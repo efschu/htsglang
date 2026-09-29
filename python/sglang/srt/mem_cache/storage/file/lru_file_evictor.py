@@ -1527,7 +1527,9 @@ class LRUFileEvictor:
         try:
             return self._rescan_impl()
         finally:
-            # the wake rescan is the one place the sleep hold ends (NF review 3 A), after the install
+            # the wake rescan is the one place the sleep hold ends (NF review 3 A), after the install.
+            # NF review 4 (1): it ends here even when _rescan_impl raises -- accepted, because a failed wake rescan
+            # stops the group anyway (W4 Weg2WakeRefused via the C15 ok-bit), so no dormant owner is left evicting.
             self.resume_background_eviction(reason="dormant")
             self.resume_background_eviction(reason="walk")
 

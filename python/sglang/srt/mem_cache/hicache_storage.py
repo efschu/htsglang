@@ -2125,6 +2125,11 @@ class HiCacheFile(HiCacheStorage):
     def rescan_eviction_index(self) -> dict:
         """Re-read the store directory into the LRU index (Weg 2 wake path).
 
+        ONE CALLER ONLY (NF review 4 (2)): the wake path, ``SchedulerWeightUpdaterManager._weg2_rescan_store_index``
+        (weight_updater, resume_memory_occupation). With SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH on, this call is
+        also what lifts the background evictor's SLEEP hold; a second caller during dormancy would lift it too and
+        let the sleeping owner evict on the store its sibling owns.
+
         Called when this group wakes. Two groups share one directory and only
         one of them is awake at a time, so the sibling's writes accumulated
         entirely outside this process's index while it slept; evicting against
