@@ -16,10 +16,11 @@ from sglang.srt.weg2 import d_early_start as des
 from sglang.srt.weg2 import launcher as L
 
 
-def test_flag_defaults_off_and_help_renders():
+def test_flag_defaults_auto_and_help_renders():
     ap = L.build_parser()
     ns = ap.parse_known_args(["--tree", "t", "--tag", "x"])[0]
-    assert ns.weg2_d_early_start == "off"
+    assert ns.weg2_d_early_start == "auto"
+    # the parser's default profile is the 27B: auto stays serial there
     assert not L._d_early_start_armed(ns)
     assert L._d_early_start_armed(argparse.Namespace(weg2_d_early_start="on"))
     assert not L._d_early_start_armed(argparse.Namespace())
@@ -73,12 +74,26 @@ def test_refuse_writes_the_gate_then_sweeps_the_group_and_restores_ns():
 # --- 27B review of cb98c3d94a: W185 and stage 0 ---
 
 
-def test_w185_refuses_on_for_the_27b_and_passes_next_flash():
-    with pytest.raises(L.Weg2DEarlyStartUnreviewed, match="W185"):
-        L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile=None))
-    with pytest.raises(L.Weg2DEarlyStartUnreviewed):
-        L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile="qwen27b"))
+def _legacy_27b_row():
+    import dataclasses
+    from unittest import mock
+
+    from sglang.srt.weg2 import form as F
+
+    row = dataclasses.replace(F.PROFILES["qwen27b"], d_expect_from_p_records=False)
+    return mock.patch.dict(F.PROFILES, {"qwen27b": row})
+
+
+def test_w185_refuses_on_where_the_expectation_is_legacy_and_passes_next_flash():
+    # 29.09. (step 1): W185 keys on d_expect_from_p_records; the 27B row set
+    # it, so W185 is exercised on a legacy row (what the 27B row was)
+    with _legacy_27b_row():
+        with pytest.raises(L.Weg2DEarlyStartUnreviewed, match="W185"):
+            L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile=None))
+        with pytest.raises(L.Weg2DEarlyStartUnreviewed):
+            L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile="qwen27b"))
     L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile="nextflash"))
+    L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile="qwen27b"))
     L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="off", profile=None))
 
 
@@ -144,3 +159,24 @@ def test_load_gate_needs_stage0_go_and_d_gets_both_gates():
     assert 'stage0.get("verdict") != _des.VERDICT_GO' in v
     early = src[src.index("_early_snap = ("):src.index("def _d_early_verdict(")]
     assert "_des.STAGE0_ENV: _early_stage0" in early and "d_early_stage0_watch" in early
+
+
+# --- Default auto (Serie 29.09., dearly z30x2 424346f693: serving 205 s gegen frp 226 s) ---
+
+
+def test_auto_arms_next_flash_and_leaves_the_27b_serial():
+    assert L._d_early_start_armed(argparse.Namespace(weg2_d_early_start="auto", profile="nextflash"))
+    assert not L._d_early_start_armed(argparse.Namespace(weg2_d_early_start="auto", profile="qwen27b"))
+    assert not L._d_early_start_armed(argparse.Namespace(weg2_d_early_start="auto", profile=None))
+    assert not L._d_early_start_armed(argparse.Namespace(weg2_d_early_start="off", profile="nextflash"))
+
+
+def test_w185_refuses_only_an_explicit_on_never_auto():
+    # auto resolves to off on the 27B -- a default must not refuse a 27B boot
+    L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="auto", profile="qwen27b"))
+    L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="auto", profile=None))
+    L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="auto", profile="nextflash"))
+    with _legacy_27b_row():
+        L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="auto", profile="qwen27b"))
+        with pytest.raises(L.Weg2DEarlyStartUnreviewed):
+            L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile="qwen27b"))
