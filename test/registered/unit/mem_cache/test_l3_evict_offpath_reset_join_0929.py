@@ -300,5 +300,19 @@ class L3EvictOffpathHoldsTest(CustomTestCase):
                 h.stop()
 
 
+class TestEvictOffpathDefault(unittest.TestCase):
+    def test_default_is_on_after_metal_proof(self):
+        # 29.09. l3cap10 boot proved the path; a proven performance switch is default on (user order).
+        from sglang.srt.environ import envs
+
+        old = os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH", None)
+        try:
+            self.assertTrue(envs.SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH.get())
+        finally:
+            if old is not None:
+                os.environ["SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH"] = old
+
+
 if __name__ == "__main__":
     unittest.main()
+

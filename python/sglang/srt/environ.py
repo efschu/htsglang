@@ -2307,8 +2307,10 @@ class Envs:
     # and the sleep flush's #1068 RESET JOIN waited for it. On: reserve() evicts only what ITS write needs, and a
     # background thread "l3_evictor" (never in the RESET JOIN set) brings the directory down to cap x ratio in
     # short lock-held batches, woken once the directory passes the midpoint between ratio and the cap.
-    # Off (default until the first series): byte-identical, the whole run stays in reserve().
-    SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH = EnvBool(False)
+    # Default ON since the metal proof (29.09. 27B dkr27browauthorityl3cap10bar1fs09292016, cap 10 GB: 22 background
+    # runs ~1 s each off the reset-joined threads, 23 flips interleave max 2.34 s, needle MATCH; user order: a
+    # proven performance switch is default on). Off: byte-identical old path, the whole run stays in reserve().
+    SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH = EnvBool(True)
     SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
     # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)

@@ -82,6 +82,9 @@ class TestWakeDelta(_Env):
         self.assertEqual(census.get("mode"), "journal")
         self.assertEqual(census["indexed_entries"], 30)
 
+    # the INLINE eviction contract (SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH=0); the default-on background
+    # path is covered by test_l3_evict_offpath_reset_join_0929.py
+    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH": "0"})
     def test_an_unlink_line_removes_the_page(self):
         me = _ev(self.d)
         sib = _ev(self.d, cap=10 * PAGE, group="P")    # small cap: it evicts its own

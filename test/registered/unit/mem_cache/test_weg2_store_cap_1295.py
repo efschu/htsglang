@@ -57,6 +57,7 @@ import re
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
@@ -143,6 +144,9 @@ def _weight_updater_source() -> tuple:
 class TestStoreCapBoundsTheDirectory(CustomTestCase):
     """The falsifier: two owners, one directory, one cap."""
 
+    # the INLINE eviction contract (SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH=0); with the default-on background
+    # evictor the post-condition is timing-dependent (1 of 3 runs red); background path: test_l3_evict_offpath_reset_join_0929.py
+    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH": "0"})
     def test_two_owners_over_one_directory_hold_one_cap(self):
         """THE #1295 SHAPE AT DESK SCALE.
 
@@ -262,6 +266,9 @@ class TestStoreCapBoundsTheDirectory(CustomTestCase):
             )
             self.assertEqual(me.stats()["foreign_indexed_bytes"], 20 * page)
 
+    # the INLINE eviction contract (SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH=0); the default-on background
+    # path is covered by test_l3_evict_offpath_reset_join_0929.py
+    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH": "0"})
     def test_a_directory_the_sibling_alone_fills_starves_this_owner_by_name(self):
         """The bound this fix buys, and its PRICE, stated as a test.
 
@@ -593,6 +600,9 @@ class TestStoreCapRefusalIsNamedAndCounted(CustomTestCase):
             "the staging walk itself is gone",
         )
 
+    # the INLINE eviction contract (SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH=0); the default-on background
+    # path is covered by test_l3_evict_offpath_reset_join_0929.py
+    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH": "0"})
     def test_an_eviction_run_leaves_a_proof_line_at_info(self):
         """``0 reclaimed lines`` was a log-level artefact, not a zero.
 
