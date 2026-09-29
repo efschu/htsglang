@@ -122,8 +122,8 @@ def test_main_solves_the_form_before_the_map_is_built():
     src = inspect.getsource(L.main)
     pre = src.index('"D(Karte, Erwartung)"')
     pin = src.index("pin_d_form_for_map(ns, log)")
-    emap = src.index("_emap = publish_expert_map(")
-    assert pre < pin < emap
+    emap_at = src.index("_emap = publish_expert_map(")
+    assert pre < pin < emap_at
 
 
 def test_which_forms_the_planner_solves():
