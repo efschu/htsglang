@@ -72,7 +72,12 @@ def _form_a(rank, *, bounds=None):
 def _lane(rank, *, head=0, bounds="even"):
     """The weightless-KV lane installed, this process = ``rank``."""
     b = None if bounds == "even" else bounds
-    with mock.patch.object(du, "_WEIGHTLESS_KV_HEAD_RANK", head), mock.patch(
+    # F15-5a (67b7ad3d96): the lane is a weight SET W; the readers ask
+    # _WEIGHTLESS_KV_WEIGHT_RANKS, the head rank stays its lead -- install both,
+    # as set_weightless_kv_head_rank does.
+    with mock.patch.object(du, "_WEIGHTLESS_KV_HEAD_RANK", head), mock.patch.object(
+        du, "_WEIGHTLESS_KV_WEIGHT_RANKS", (int(head),)
+    ), mock.patch(
         "sglang.srt.runtime_context.get_parallel",
         lambda: SimpleNamespace(tp_rank=rank),
     ), mock.patch.object(du, "uneven_dcp_owner_bounds", lambda: b):

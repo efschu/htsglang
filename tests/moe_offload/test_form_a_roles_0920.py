@@ -209,8 +209,11 @@ def test_an_explicit_dcp_flag_is_refused_not_overridden():
 # ==========================================================================
 # 4. The seam registry -- named refusals for what is not built
 # ==========================================================================
-WIRED = ("F1", "F2", "F3", "F4", "F7", "F8", "F9", "F10", "F11", "F12", "F13")
-UNWIRED = ("F5", "F6")
+# 29.09.: F5 is wired since #239 S3b, F6 since f3e2f8c636 (model_tp subgroup);
+# F14 (#239 KV window) and F15 (Form B start path, wired only after a metal
+# boot) joined the registry -- the lists follow the registry, not the 20.09. note.
+WIRED = ("F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14")
+UNWIRED = ("F15",)
 
 
 def test_every_seam_has_an_identity_a_place_and_a_verdict():
@@ -219,7 +222,7 @@ def test_every_seam_has_an_identity_a_place_and_a_verdict():
     slice-6a WORKER FORWARD found F13 (the model-level vocab collectives --
     the survey missed them because they are not per-layer). A seam that is
     known but unlisted is worse than one that was never looked for."""
-    assert set(SEAMS) == {f"F{i}" for i in range(1, 14)}
+    assert set(SEAMS) == {f"F{i}" for i in range(1, 16)}
     for sid, seam in SEAMS.items():
         assert seam.id == sid
         assert ":" in seam.where or ".py" in seam.where, sid
@@ -248,10 +251,11 @@ def test_the_remaining_work_is_ordered_and_complete():
     # the subgroup (not needed while every collective spans all ranks).
     # F9 left the list on 20.09.: fnFA15's 233 ms per round against the
     # classic form's 35 ms WITH graphs is what ended its deferrability.
-    assert UNWIRED_ORDER[0] == "F5"
+    # 29.09.: F5 and F6 are wired; the Form B start path F15 is all that is left.
+    assert UNWIRED_ORDER[0] == "F15"
     # Seams that left the list must stay off it; if one comes back the
     # order has to come back with it, not silently shrink.
-    for gone in ("F3", "F4", "F9", "F10", "F11", "F12", "F13"):
+    for gone in ("F3", "F4", "F5", "F6", "F9", "F10", "F11", "F12", "F13", "F14"):
         assert gone not in UNWIRED_ORDER
 
 
