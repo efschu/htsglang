@@ -129,6 +129,40 @@ def park_read_min_tokens(req) -> Optional[int]:
     return 1 if read_cap(req) is not None else None
 
 
+#: W88 CYCLE (29.09., NF dauer09290232 D 03:21:06, weg2-122-144 / weg2-126-148):
+#: everything the store-read chain remembers ABOUT ONE READ. The #1324 stamp
+#: (``_weg2_store_delivered``) was already cleared at a new cycle; the progress
+#: witness and the store-short bound were not. The next cycle's first drain
+#: then compared its fresh read (29696 of 97024) against the previous cycle's
+#: best (96000, "no growth"), counted on from the previous cycle's passes (9)
+#: and wall clock (49 s old >= the 30 s bound) -> W88 terminal 0.6 s after the
+#: read started, on ONE pass (weg2-126-148: no_progress_passes=1).
+READ_CYCLE_ATTRS = (
+    "_weg2_store_delivered",
+    "_weg2_best_delivered",
+    "_weg2_progress_terms",
+    "_weg2_no_progress_passes",
+    "_weg2_no_progress_t0",
+    "_weg2_store_short_cycle_best",
+    "_weg2_store_short_cycles",
+    "_weg2_store_short_fallback",
+)
+
+
+def clear_read_cycle(req) -> int:
+    """A NEW store-read cycle of ``req`` begins (flip park, RESUME-VIA-P hold):
+    forget what the chain witnessed about the previous cycle's read. Returns
+    how many terms were standing. Replicated: every rank parks / holds the same
+    requests in the same pass."""
+    n = 0
+    for attr in READ_CYCLE_ATTRS:
+        if getattr(req, attr, None) not in (None, False, 0):
+            n += 1
+        if hasattr(req, attr):
+            setattr(req, attr, None)
+    return n
+
+
 def describe(req) -> str:
     cap = getattr(req, CAP_ATTR, None)
     if not cap:

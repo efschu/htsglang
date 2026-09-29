@@ -931,6 +931,44 @@ def _weg2_settled_this_wake(sched, req) -> bool:
     return seq is not None and getattr(req, "_weg2_settled_wake", None) == seq
 
 
+def _weg2_store_short_reroute(sched, req, span, site: str, cause: str, detail: str = "") -> str:
+    """W88 CYCLE (29.09., NF dauer09290232 D 03:21:06-14, weg2-122-144): the
+    store-short exit whose remainder is OVER X falls back BY NAME to the depth
+    the store delivered, instead of answering the client 503.
+
+    The request goes to its admission with the mark cleared; the X gate prices
+    it with the group's match (the delivered prefix) and, over X, refuses it by
+    name: a streamed request is kept on D and P prefills its context
+    (RESUME-VIA-P, ``x_refusal_midstream``), any other one gets the W50 the
+    front re-routes through P before its first byte. Either way P READS what
+    the store holds and prefills only the rest -- never a prefill over X on D
+    (the gate has no exemption left), and never a recompute from 0 while a
+    readable prefix exists. W88 stays the answer of the other arm
+    (``host_pool_shortfall``: our own staging pool, not a missing prefix).
+    ``'expired'``."""
+    from sglang.srt.mem_cache.match_refusal_census import (
+        note_prefetch_gate as _note_prefetch_gate,
+    )
+
+    sched._clear_prefetch_deferral_fields(req)
+    req._weg2_store_short_fallback = True
+    _note_prefetch_gate("defer_expired")
+    n = getattr(sched, "_weg2_store_short_reroutes", 0) + 1
+    sched._weg2_store_short_reroutes = n
+    remainder = _weg2_store_short_remainder(req)
+    logger.warning(
+        "W88-REROUTE rid=%s cause=%s delivered=%d remainder=%d X=%d span=%s "
+        "site=%s %s n=%d -- the store read ended short and the remainder "
+        "exceeds X: released to the X gate on the delivered prefix, which "
+        "re-routes it through P by name (RESUME-VIA-P / W50); not a 503",
+        str(getattr(req, "rid", "?"))[:16], cause,
+        int(getattr(req, "_weg2_store_delivered", 0) or 0),
+        -1 if remainder is None else int(remainder),
+        _weg2_store_short_tail_x(sched), span, site, detail, n,
+    )
+    return "expired"
+
+
 def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Optional[str]:
     """The bounded exit of a store-short read that stopped growing: None =
     still within the bound (defer as before). Past it, a remainder within X
@@ -953,13 +991,12 @@ def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Opti
     delivered = int(getattr(req, "_weg2_store_delivered", 0) or 0)
     rid = str(getattr(req, "rid", "?"))[:16]
     if x > 0 and (remainder is None or remainder > x) and _weg2_windowed_path(sched):
-        logger.warning(
-            "PREFETCH-DEFER-FALLBACK rid=%s delivered=%d tail=%d X=%d cycles=%d "
-            "bound=%d reason=over_x span=%s -- the store read stopped growing "
-            "and the remainder exceeds X: named W88",
-            rid, delivered, tail, x, cycles, bound, span,
+        # W88 CYCLE (29.09.): over X is a RE-ROUTE, not a 503 -- see
+        # `_weg2_store_short_reroute`.
+        return _weg2_store_short_reroute(
+            sched, req, span=span, site=site, cause="over_x",
+            detail=f"cycles={cycles} bound={bound}",
         )
-        return sched._weg2_store_load_terminal(req, arm=reason, span=span, site=site)
     from sglang.srt.mem_cache.match_refusal_census import (
         note_prefetch_gate as _note_prefetch_gate,
     )
@@ -9063,6 +9100,13 @@ class Scheduler(
                 _tail = _weg2_store_short_recompute(self, req, reason, span)
                 if _tail is not None:
                     return _tail
+                if reason == _DEFER_REASON_STORE_SHORT:
+                    # W88 CYCLE: a missing prefix is P's to fill, by name
+                    return _weg2_store_short_reroute(
+                        self, req, span=span, site=site, cause="standstill",
+                        detail="no_progress_passes=%d" % int(
+                            getattr(req, "_weg2_no_progress_passes", 0) or 0),
+                    )
                 return self._weg2_store_load_terminal(
                     req, arm=reason, span=span, site=site
                 )

@@ -22,7 +22,8 @@ at most SGLANG_WEG2_STORE_SHORT_MAX_CYCLES DEFERRED lines per rid, then
 ``PREFETCH-DEFER-FALLBACK`` releases the request with its matched prefix (the
 remainder 194 <= X=12288, D extends it) and the short record raises no new
 mark; a read that still grows is waited for; a sleeping D does not count; a
-remainder over X takes the named W88. The NF profile runs with the xsn437
+remainder over X takes the named re-route through P (W88-REROUTE, 29.09.;
+before: the named W88 503). The NF profile runs with the xsn437
 store-short tail OFF, so every case here runs with it off too.
 """
 
@@ -153,14 +154,18 @@ def test_a_sleeping_d_does_not_count(caplog):
     assert outs == ["deferred"] * (BOUND - 1) + ["expired"]
 
 
-def test_over_x_the_bound_is_the_named_w88(caplog):
+def test_over_x_the_bound_is_the_named_reroute(caplog):
+    # W88 CYCLE (29.09.): over X the bound no longer answers 503 -- it falls
+    # back BY NAME to the delivered depth; the X gate (no exemption) refuses
+    # the remainder and re-routes it through P (RESUME-VIA-P / W50).
     n, delivered, deliverable, x = SN6S
     s, r = _sched(n, delivered, deliverable, x)
     with caplog.at_level(logging.WARNING, logger=sched_mod.logger.name):
         outs = [_cycle(s, r) for _ in range(BOUND + 1)]
-    assert outs[-1] == "failed" and "W88" in caplog.text
-    assert "reason=over_x" in caplog.text
-    assert r not in s.waiting_queue, "never a prefill over X"
+    assert outs[-1] == "expired"
+    assert "W88 Weg2StoreLoadNotProgressing" not in caplog.text
+    assert "W88-REROUTE" in caplog.text and "cause=over_x" in caplog.text
+    assert r in s.waiting_queue and r.prefetch_deferred is None
 
 
 def test_the_bound_is_env_overridable(monkeypatch):

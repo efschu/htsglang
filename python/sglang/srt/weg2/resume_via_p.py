@@ -252,8 +252,7 @@ def keep_on_d(sched, req, d_extent: int, x: int, reason: str = "x_refusal_midstr
     # the read after P is the WHOLE context: the park's retained-span cap and
     # the previous read's stamp describe a cycle that is over
     setattr(req, d_park_read.CAP_ATTR, None)
-    if getattr(req, "_weg2_store_delivered", None) is not None:
-        req._weg2_store_delivered = None
+    d_park_read.clear_read_cycle(req)  # W88 CYCLE: stamp, witness, bound
     # The decision is eligible() -- replicated on every rank. The file is TP0's
     # side effect only: a failed write never splits the ranks (the request
     # stays parked on all of them; park_tick's awake re-queue brings it back to
