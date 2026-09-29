@@ -849,8 +849,8 @@ def test_dry_run_of_the_x177_form_writes_the_rows_into_env_d():
     with mock.patch.object(L, "d_replayssm_spec_plan_form", lambda _ns: er.ReplaySSMSpecForm(
             ring_len=16, draft_tokens=4, max_running=6, ssm_dtype="bfloat16")):
         lines = L.d_seat_table_lines(ns, er, kw, "D")
-    assert any("H95c Laufzeit-Zeilen [133, 140, 141]" in ln for ln in lines if "n=1:" in ln)
-    assert any("H95c Laufzeit-Zeilen [120, 140, 141]" in ln for ln in lines if "n=6:" in ln)
+    assert any("H95c Laufzeit-Zeilen [133, 142, 143]" in ln for ln in lines if "n=1:" in ln)
+    assert any("H95c Laufzeit-Zeilen [120, 142, 143]" in ln for ln in lines if "n=6:" in ln)
     # #251c: the KV stage form adds its stage rows to TP0's seat rows (and
     # takes them from its scratch) -- the H95c seat rows themselves are 14
     env = L.parse_group_env(ns.env_d)

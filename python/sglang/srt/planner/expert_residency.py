@@ -613,6 +613,32 @@ class DRankResidency(msgspec.Struct, frozen=True, kw_only=True):
         return self.verdict != "PASST"
 
 
+def reference_kv_cells_s0(reference: DRankReference) -> Tuple[int, ...]:
+    """#239 S0 (e56d78a4ab): the per-token KV cell a D rank of this boot
+    builds, from a Form A reference measured BEFORE S0.
+
+    The shipped references (fnFL2x98-100, x151/x158) price a Form A worker at
+    768 B/token -- 12 layers x 64 B compressed QSA index keys. Since S0 a Form
+    A worker builds no QSA index (``qsa_index_on_rank = not
+    this_rank_is_form_a_worker()``, :func:`kv_stage_trim_cell` names the same
+    768 B as "no tensor on the card"): rc12z30w (0929_082743, TP1/TP2 'KV
+    pool sizing: cell_size=12288', ONE pool of share x 262144 tokens) holds
+    no key bytes on a worker. Booking them charged 262144 x 768 B = 192 MiB
+    per 3080 that no allocation ever takes -- VRAM the expert rows were owed
+    (freier-kv-platz-gehoert-experten). A worker's cell here is 0; the host
+    cell stays the measurement. A reference that is not Form A with ONE
+    attention host is returned unchanged."""
+    cells = tuple(int(c) for c in reference.kv_cell_bytes)
+    try:
+        tp = [int(x) for x in str(reference.rank_tp_ratio).split(",") if x.strip()]
+    except ValueError:
+        return cells
+    hosts = [r for r, v in enumerate(tp) if v > 0]
+    if len(tp) != len(cells) or len(hosts) != 1:
+        return cells
+    return tuple(c if r == hosts[0] else 0 for r, c in enumerate(cells))
+
+
 def kv_token_cut_cells(
     reference: DRankReference,
     shares: Sequence[float],
@@ -629,6 +655,8 @@ def kv_token_cut_cells(
 
         (reference cell_r - dcp_cell if r held the full KV else cell_r)
             + share_r x dcp_cell
+
+    with ``cell_r`` from :func:`reference_kv_cells_s0` (a worker's is 0 since S0).
 
     Refused, not guessed: a reference with more than one attention host (its
     cell already is a DCP slice), a share vector of the wrong length, a
@@ -656,9 +684,10 @@ def kv_token_cut_cells(
             % (int(dcp_cell_bytes), int(reference.kv_cell_bytes[host]))
         )
     total = sum(float(s) for s in shares)
+    s0 = reference_kv_cells_s0(reference)
     cells = []
     for r in range(n):
-        fixed = float(reference.kv_cell_bytes[r]) - (float(dcp_cell_bytes) if r == host else 0.0)
+        fixed = float(s0[r]) - (float(dcp_cell_bytes) if r == host else 0.0)
         cells.append(fixed + float(shares[r]) / total * float(dcp_cell_bytes))
     return tuple(cells)
 
@@ -1219,6 +1248,7 @@ def solve_d_rank_residency(
         cut_cells = kv_token_cut_cells(reference, kv_token_shares, kv_dcp_cell_bytes)
         total = sum(float(s) for s in kv_token_shares)
         cut_shares = tuple(float(s) / total for s in kv_token_shares)
+    ref_cells = reference_kv_cells_s0(reference)
     for name, vec in (
         ("fractions", fractions),
         ("ratios", ratios),
@@ -1250,7 +1280,7 @@ def solve_d_rank_residency(
                 -float(vocab_mib) if reference.draft_vocab_held else float(vocab_mib)
             )
         cell = (
-            float(reference.kv_cell_bytes[r]) if cut_cells is None else cut_cells[r]
+            float(ref_cells[r]) if cut_cells is None else cut_cells[r]
         )
         kv_mib = float(kv_tokens) * cell / MIB
         posts = (
@@ -1307,7 +1337,7 @@ def describe_rank(fit: DRankResidency) -> str:
         "darin, kein eigener Posten), f %.3f -> R %d, Puffer min(R+S,E) = %s Zeilen x %d Layer x "
         "%.3f MiB = %.0f MiB | fest %.0f%s + mamba %.0f + spec %.0f + Aktivierung "
         "%.0f + KV %d Token x %d B%s = %.0f MiB | Budget %.0f -> Rest vor KV %.0f, nach "
-        "KV %.0f MiB (%d Token erreichbar) -> %s | DECKE f %s (<= %d Zeilen)"
+        "KV %.0f MiB (%s) -> %s | DECKE f %s (<= %d Zeilen)"
         % (
             fit.rank,
             fit.ratio,
@@ -1342,7 +1372,8 @@ def describe_rank(fit: DRankResidency) -> str:
             fit.budget_mib,
             fit.pre_kv_rest_mib,
             fit.kv_rest_mib,
-            fit.kv_tokens_reachable(),
+            ("%d Token erreichbar" % fit.kv_tokens_reachable()
+             if fit.kv_cell_bytes > 0 else "keine KV-Zelle auf dem Rang, #239 S0"),
             fit.verdict,
             ceiling,
             fit.ceiling_max_rows,
@@ -4074,8 +4105,11 @@ def _plan_d_card(
             ),
         )
         shift_line = shift_line + seat_line
-    if kv_token_cut:
-        kv_shift, kv_line = card_kv_cut_shift(ref, fits)
+    kv_shift, kv_line = card_kv_cut_shift(ref, fits)
+    # #239 S0: without a cut the cells still move -- a Form A worker of the
+    # pre-S0 card reference held QSA keys this boot does not build.
+    kv_moved = kv_shift is not None and any(abs(s) >= 0.05 for s in kv_shift)
+    if kv_token_cut or kv_moved:
         if kv_shift is not None:
             ref = msgspec.structs.replace(
                 ref,
@@ -4088,7 +4122,9 @@ def _plan_d_card(
                     for f, s in zip(ref.free_decode0_mib, kv_shift)
                 ),
             )
-        shift_line = shift_line + ("%s KARTE %s KV-SCHNITT (#239): %s" % (marker, label, kv_line),)
+        shift_line = shift_line + ("%s KARTE %s %s: %s" % (
+            marker, label, "KV-SCHNITT (#239)" if kv_token_cut else "KV-ZELLE (#239 S0)",
+            kv_line),)
     floor = float(corridor_band_floor_mib())
     cards = solve_d_card(
         fits=fits,

@@ -57,8 +57,9 @@ def _solve(kv_tokens=262144, shares=None, reference=RC12R, dcp=FA_CELL):
 
 def test_without_shares_the_booking_is_the_rc12r_log():
     fits = _solve()
-    assert [f.ceiling_max_rows for f in fits] == [102, 132, 135]
-    assert [f.kv_cell_bytes for f in fits] == [14143, 768, 768]
+    # #239 S0: Worker ohne QSA-Schluessel (768 B/Token), +192 MiB je Worker (rc12r buchte sie noch)
+    assert [f.ceiling_max_rows for f in fits] == [102, 134, 136]
+    assert [f.kv_cell_bytes for f in fits] == [14143, 0, 0]
     assert all(f.kv_token_share == -1.0 for f in fits)
     assert all("Token-Schnitt" not in er.describe_rank(f) for f in fits)
 
@@ -72,20 +73,20 @@ def test_the_form_a_cut_is_the_identity():
 
 def test_a_third_each_moves_the_full_attention_kv_off_the_host():
     fits = _solve(shares=(1, 1, 1))
-    # Host: 14143 - 12288 + 4096; Worker: 768 + 4096
-    assert [f.kv_cell_bytes for f in fits] == [5951, 4864, 4864]
+    # Host: 14143 - 12288 + 4096; Worker: 4096 (seit S0 ohne 768 B QSA-Schluessel)
+    assert [f.kv_cell_bytes for f in fits] == [5951, 4096, 4096]
     assert [round(f.kv_token_share, 6) for f in fits] == [round(1 / 3, 6)] * 3
-    assert [f.ceiling_max_rows for f in fits] == [120, 123, 126]
+    assert [f.ceiling_max_rows for f in fits] == [120, 125, 128]
     assert "Token-Schnitt, Anteil 0.333" in er.describe_rank(fits[0])
 
 
 def test_x2_is_where_the_cut_decides_the_host():
     """YaRN x2: Form A laesst TP0 72 Zeilen, der Drittelschnitt 107."""
-    assert [f.ceiling_max_rows for f in _solve(kv_tokens=524288)] == [72, 130, 133]
+    assert [f.ceiling_max_rows for f in _solve(kv_tokens=524288)] == [72, 134, 136]
     assert [f.ceiling_max_rows for f in _solve(kv_tokens=524288, shares=(1, 1, 1))] == [
         107,
-        113,
-        115,
+        116,
+        119,
     ]
 
 
