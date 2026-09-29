@@ -375,8 +375,11 @@ class TokenSpans:
         #: the grain of the end anchor a served prompt leaves in the store (P's
         #: END-ANCHOR, D's #1469 RETAIN): the page floor of the prompt.
         self.anchor_page = max(1, int(anchor_page))
-        #: PREFILL-EINBRUCH-0929 K2: D readings clamped to their own text.
+        #: PREFILL-EINBRUCH-0929 K2: D readings clamped to their own text, and
+        #: the tokens they reported past the credited anchor (per boot, read
+        #: by the front's /weg2/state 'presence_price').
         self.own_text_clamps = 0
+        self.own_text_clamped_tokens = 0
         # key -> (ids, cached_tokens, prompt_tokens, held_epoch)
         self.entries: "collections.OrderedDict[str, Tuple[np.ndarray, int, int, Optional[int]]]" = \
             collections.OrderedDict()
@@ -421,6 +424,7 @@ class TokenSpans:
         n = int(ids.size)
         if ct > n or pt > n or (resumable_depth is not None and int(resumable_depth) > n):
             anchor = self.own_anchor(n)
+            self.own_text_clamped_tokens += max(0, max(ct, pt) - anchor)
             if ct > n:
                 ct = anchor
             pt = min(pt, n)
