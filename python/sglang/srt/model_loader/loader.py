@@ -139,20 +139,45 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 
+def _to_device_rows(data: torch.Tensor, target_device: torch.device, rows) -> torch.Tensor:
+    """BOOTZEIT 5d: ``data.to(target_device)`` for an expert-major [E, ...]
+    host tensor of which only ``rows`` were ever loaded. The other rows were
+    never read (H2 veto) and nobody reads them on the card (the Marlin repack
+    skips them, the presplit neither keeps nor stores them); they come out as
+    zeros -- what the untouched host pages of the old full copy held -- and
+    only the loaded rows cross the bus."""
+    out = torch.zeros(data.shape, dtype=data.dtype, device=target_device)
+    idx = torch.as_tensor(rows, dtype=torch.long)
+    out.index_copy_(
+        0, idx.to(target_device), data.index_select(0, idx).to(target_device)
+    )
+    return out
+
+
 @contextmanager
-def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+def device_loading_context(
+    module: torch.nn.Module, target_device: torch.device, *, rows=None
+):
+    """Move the module's CPU parameters to ``target_device`` for the block and
+    back after it. ``rows`` (BOOTZEIT 5d): for the expert-major parameters
+    ([E, ...], E = ``module.num_local_experts``) only these rows are copied
+    over; None = everything, as always."""
     if target_device.type == "cpu":
         # If target is CPU, no need to move anything
         yield module
         return
 
     original_infos: Dict[str, Dict] = {}
+    n_rows = getattr(module, "num_local_experts", None) if rows is not None else None
 
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
             original_data = p.data
-            device_data = p.data.to(target_device)
+            if n_rows and p.dim() >= 1 and p.shape[0] == int(n_rows):
+                device_data = _to_device_rows(p.data, target_device, rows)
+            else:
+                device_data = p.data.to(target_device)
             original_infos[name] = dict(
                 device=p.device,
                 original_data=original_data,

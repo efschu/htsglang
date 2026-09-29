@@ -212,6 +212,36 @@ def open_store(
     Zuordnung Experte -> Platz ist dann nicht mehr die Identitaet; sie gehoert
     dem Aufrufer, der die Verdraengung kennt.
     """
+    slots = int(num_slots) if num_slots is not None else slots_for(int(num_experts))
+    if register is None:
+        # BOOTZEIT 5c: the file the background prefetch already opened for
+        # exactly this path/shape/dtype (layers/moe/store_prefetch.py).
+        from sglang.srt.layers.moe import store_prefetch as _sp
+
+        hit = _sp.take(
+            store_path(directory, layer_key, attr),
+            (int(slots),) + tuple(int(d) for d in row_shape),
+            dtype,
+        )
+        if hit is not None:
+            return hit
+    return open_store_uncached(
+        directory, layer_key, attr, num_experts, row_shape, dtype, register,
+        num_slots=slots,
+    )
+
+
+def open_store_uncached(
+    directory: str,
+    layer_key: str,
+    attr: str,
+    num_experts: int,
+    row_shape: Sequence[int],
+    dtype: torch.dtype,
+    register=None,
+    num_slots: Optional[int] = None,
+) -> Tuple[torch.Tensor, bool]:
+    """``open_store`` without the prefetch lookup (the prefetch itself)."""
     os.makedirs(directory, exist_ok=True)
     path = store_path(directory, layer_key, attr)
     slots = int(num_slots) if num_slots is not None else slots_for(int(num_experts))

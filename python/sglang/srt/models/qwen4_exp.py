@@ -3055,15 +3055,22 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         expert_pool = ExpertLoadPool(
             consumer_threads(), device_index=current_device_index()
         )
-        with expert_pool:
-            loaded_params = self._load_weights_with_pool(
-                weights,
-                stacked_params_mapping=stacked_params_mapping,
-                expert_params_mapping=expert_params_mapping,
-                fused_expert_params_mapping=fused_expert_params_mapping,
-                num_experts=num_experts,
-                expert_pool=expert_pool,
-            )
+        from sglang.srt.layers.moe import store_prefetch
+
+        try:
+            with expert_pool:
+                loaded_params = self._load_weights_with_pool(
+                    weights,
+                    stacked_params_mapping=stacked_params_mapping,
+                    expert_params_mapping=expert_params_mapping,
+                    fused_expert_params_mapping=fused_expert_params_mapping,
+                    num_experts=num_experts,
+                    expert_pool=expert_pool,
+                )
+        finally:
+            # BOOTZEIT 5c: every presplit of this load has run; what the
+            # store prefetch opened and nobody took is dropped, census logged.
+            store_prefetch.drain(what=type(self).__name__)
         logger.info(
             "Ladezeit-2 EXPERT-CONSUMER threads=%d submitted=%d completed=%d "
             "wait_slots_s=%.2f deferred_s=%.2f deferred_run=%d drain_wait_s=%.2f",

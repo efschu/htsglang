@@ -1424,6 +1424,23 @@ class Envs:
     # names reclaim gc s/layer, the cgroup anon+shmem peak of the load and
     # what the load-end collect freed. False = collect over the whole process.
     SGLANG_OPT_LOAD_GC_FREEZE = EnvBool(True)
+    # BOOTZEIT 5c (29.09., z30w-park): open the NEXT layer's expert-store
+    # files (tmpfs ftruncate + mmap + cudaHostRegister) on one background
+    # thread while this layer's shards are consumed, instead of inside the
+    # presplit on the loader thread (layers/moe/store_prefetch.py). store_open
+    # was 5.17 s on PP0 (29 x 4 files, 23.78 GiB), 2.90 s on D TP0 (48 x 4).
+    # Same files, same bytes; a prefetch whose geometry is not the one asked
+    # for is dropped. Off until the first metal series (then default on).
+    SGLANG_OPT_LOAD_STORE_PREFETCH = EnvBool(False)
+    # BOOTZEIT 5d (29.09., z30w-park): the presplit's copy of a layer's [E]
+    # host stack to the card moves only the rows this rank READ
+    # (store_adopt.repack_rows -- all but the H2-vetoed; acts only where
+    # SGLANG_MOE_REPACK_SKIP_VETOED is on and something was vetoed, i.e. group
+    # D). D TP0 read 29 of 201 rows per layer and copied all 201 (h2d 3.76 s).
+    # The unread rows arrive as zeros, and nobody on the card reads them
+    # (repack skips them, presplit neither keeps nor stores them). Every read
+    # row is byte-identical. False = the full copy.
+    SGLANG_OPT_LOAD_H2D_READ_ROWS = EnvBool(True)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # HTTP server

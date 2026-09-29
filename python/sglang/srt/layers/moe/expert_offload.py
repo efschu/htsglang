@@ -8023,6 +8023,8 @@ def presplit_expert_offload_after_repack(
     presplit = {}
     freed_device = 0
     freed_host = 0
+    _store_geom = []  # BOOTZEIT 5c: (attr, row shape, dtype) of each store opened
+    _store_dev = None
     for attr in MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS:
         p = getattr(layer, attr, None)
         if p is None:
@@ -8087,6 +8089,9 @@ def presplit_expert_offload_after_repack(
             )
             _STORE_CLOCK["open_s"] += time.perf_counter() - _t_open
             _STORE_CLOCK["opens"] += 1
+            _store_geom.append((attr, tuple(t.shape[1:]), t.dtype))
+            if t.is_cuda:
+                _store_dev = t.device.index
             # Only the COLD rows go to the host (flip design 20.09.: a row a
             # card holds in some layout is taken from that card over BAR1, the
             # host store keeps what no card holds). fn8m measured the store
@@ -8235,6 +8240,14 @@ def presplit_expert_offload_after_repack(
         else:
             setattr(layer, attr, empty)
 
+    if store_rows is not None and _store_geom:
+        # BOOTZEIT 5c: the next layer's store has this geometry; the caller
+        # (_ct_stream_presplit_now) starts its open once this layer's host
+        # stack is gone (layers/moe/store_prefetch.py).
+        layer._store_prefetch_next = dict(
+            directory=store_rows[0], slots=int(store_rows[3]),
+            geometry=list(_store_geom), device_index=_store_dev,
+        )
     if presplit:
         layer._moe_offload_presplit = presplit
         if _seat_x > 0:
