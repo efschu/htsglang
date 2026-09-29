@@ -620,7 +620,10 @@ def main(argv=None) -> int:
                        container=a.container)
             return 3
         front = _front_of(a.front_json)
-        fields = {"front": front} if front else {}
+        # DASHBOARD-AUS-IPC (b): only the host's five mirror keys, dotted -- the front
+        # writes its own keys under `front` (writer front), and a whole-object write
+        # here would erase them on every beat.
+        fields = {f"front.{k}": v for k, v in front.items()} if front else {}
         fs = (front or {}).get("state")
         if fs in ("serving", "flipping") and cur in ("serving", "flipping") and fs != cur:
             transition(a.dir, fs, if_state=["serving", "flipping"], fields=fields, container=a.container)

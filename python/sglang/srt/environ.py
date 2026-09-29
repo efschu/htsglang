@@ -623,6 +623,13 @@ class Envs:
     # in memory and a write only on a change (never per decode round).
     # Display and records only; nothing decides on it. Off = RankState as before.
     SGLANG_WEG2_VRAM_ACTUAL = EnvBool(False)
+    # RANKSTATS (DASHBOARD-AUS-IPC, 29.09.): each rank writes its cumulative
+    # counters (forward_ct, prefill/decode tokens, spec, queue, errors, last
+    # post-wake census) as <G>.tp<t>pp<p>.rankstats next to its RankState, from
+    # one timer thread every PERIOD_S (weg2/rankstats.py); the forward path
+    # writes nothing. Off = no thread, no file. Display only.
+    SGLANG_WEG2_ENABLE_RANKSTATS = EnvBool(False)
+    SGLANG_WEG2_RANKSTATS_PERIOD_S = EnvFloat(2.0)
     # WEG2_STATE_DIR (IPC §2.2, 27B B1/H5): the boot's own state directory
     # state/<boot_id>/ (state.json + events.jsonl), mounted into the container
     # by the arm, the host writer creates it. The launcher writes its fields
