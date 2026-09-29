@@ -1303,6 +1303,11 @@ class SeatVram:
     evicted_rows: int = 0
     refilled_rows: int = 0
     sync_ms: float = 0.0
+    #: coldest-first moves (27B): bank bytes copied and the milliseconds the
+    #: copy + table writes took up to the sync that lands them (> 1 ms per
+    #: round: the copy goes to the copy stream with an event)
+    bytes_copied: int = 0
+    copy_ms: float = 0.0
     #: the last span plan set on each managed allocation; after its tag's
     #: resume or a live apply it IS the saver's extents (one per range)
     spans_by_ptr: Dict[int, Tuple[Tuple[int, int], ...]] = field(default_factory=dict)
@@ -1489,14 +1494,7 @@ class SeatVram:
                           + [(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
         shrink = k < int(self.rows_on)
         if shrink:
-            for cache in self.caches:
-                cache.set_seat_rows_on(k, device_write=experts_live)
-            # the OFF writes are stream-ordered device writes: every kernel
-            # that could still read a row that goes must be done first
-            if experts_live and any(
-                    getattr(getattr(getattr(c, "_pool_tables", None), "row_key", None),
-                            "is_cuda", False) for c in self.caches):
-                self._timed_sync()
+            self._rows_off_live(k, experts_live)
         for m, info in zip(self.slot_tensors, infos):
             if info is not None and not info.active:
                 rc = self.spans.set_spans(m.ptr, slot_spans(m.geom, keep, self.granule), now=False)
@@ -1543,6 +1541,41 @@ class SeatVram:
             kv_mapped=int(cell.kv_mapped))
         self.applied = applied
         return applied
+
+    def _rows_off_live(self, k: int, experts_live: bool) -> None:
+        """Turn bank rows OFF (coldest first) on a live bank: sync, then the
+        copies and table writes of every layer, then a sync that lands them
+        before the next forward and before a page goes."""
+        import time
+
+        import torch
+
+        live_cuda = experts_live and any(
+            getattr(getattr(getattr(c, "_pool_tables", None), "row_key", None),
+                    "is_cuda", False) for c in self.caches)
+        # D-MEM-SCHED (27B 29.09.): every kernel that may still read a
+        # row -- source or coldest-first destination -- is done before a
+        # byte moves; the copies and the table writes of EVERY layer then
+        # land (second sync) before the next forward reads the routing
+        # and before a page of the dropped rows goes
+        if live_cuda:
+            self._timed_sync()
+        moved0 = self._bank_bytes_copied()
+        t0 = time.perf_counter()
+        for cache in self.caches:
+            cache.set_seat_rows_on(k, device_write=experts_live)
+        if live_cuda:
+            torch.cuda.synchronize()
+        ms = (time.perf_counter() - t0) * 1000.0
+        moved = self._bank_bytes_copied() - moved0
+        if moved > 0:
+            self.bytes_copied += moved
+            self.copy_ms += ms
+        elif live_cuda:
+            self.sync_ms += ms
+
+    def _bank_bytes_copied(self) -> int:
+        return sum(int(getattr(c, "_weg2_bank_bytes_copied", 0) or 0) for c in self.caches)
 
     def _timed_sync(self) -> None:
         import time
@@ -1903,6 +1936,19 @@ def _group_floor_tokens(sched) -> int:
     return -int(gmin([-int(local)])[0])
 
 
+#: 27B 29.09.: iterations the tick left at its first checks (P, the 27B, a
+#: D without stage form) -- no collective, no sync, no allocation there
+TICK_NOOP_ATTR = "_weg2_d_mem_tick_noop"
+
+
+def _tick_noop(sched) -> None:
+    try:
+        setattr(sched, TICK_NOOP_ATTR, int(getattr(sched, TICK_NOOP_ATTR, 0) or 0) + 1)
+    except (AttributeError, TypeError):  # a slotted test double: nothing to count on
+        pass
+    return None
+
+
 def runtime_tick(sched):
     """Once per scheduler iteration of an AWAKE D (after the write-through
     acks are flushed): the KV stage follows the global demand between wakes
@@ -1913,13 +1959,13 @@ def runtime_tick(sched):
     the stage's cell go OFF coldest first and come back lazily. Returns the
     step, or None when nothing runs (not armed, the stop, asleep, no stage)."""
     if not armed() or not elastic_on() or getattr(sched, "weg2_dormant", False):
-        return None
+        return _tick_noop(sched)
     st = getattr(sched, PHASE_ATTR, None)
     if st is None or st.stage is None or not st.done:
-        return None
+        return _tick_noop(sched)
     form = stage_form()
     if form is None:
-        return None
+        return _tick_noop(sched)
     from sglang.srt.weg2.d_mem_sched import MemSched
 
     n = max(1, min(int(st.n or st.cap), int(st.cap)))
@@ -1956,7 +2002,8 @@ def runtime_tick(sched):
     st.stage, st.stage_tokens = ms.stage, tokens[ms.stage]
     logger.info("%s from=S%d to=S%d used=%d incoming=%d ended=%s floor=%d -- %s%s", ms.line(),
                 before, ms.stage, used, incoming, "yes" if ended else "no", floor, step.reason,
-                "" if ctl is None else " evicted_rows=%d refilled_rows=%d sync_ms=%.1f rows_on=%s"
-                % (ctl.evicted_rows, ctl.refilled_rows, ctl.sync_ms,
-                   "-" if applied is None else int(applied.extra_rows)))
+                "" if ctl is None else (" evicted_rows=%d refilled_rows=%d sync_ms=%.1f "
+                                        "bytes_copied=%d copy_ms=%.1f rows_on=%s")
+                % (ctl.evicted_rows, ctl.refilled_rows, ctl.sync_ms, ctl.bytes_copied,
+                   ctl.copy_ms, "-" if applied is None else int(applied.extra_rows)))
     return step

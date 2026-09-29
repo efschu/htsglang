@@ -361,6 +361,11 @@ def apply_row_moves(tables: PoolTables, moves: Sequence[Tuple[int, int]]) -> Non
     tables.row_key.copy_(keys.to(tables.row_key.device))
     tables.row_use.copy_(uses.to(tables.row_use.device))
     tables.hot_phys.copy_(hot.to(tables.hot_phys.device))
+    pf = getattr(tables, "pf_row", None)
+    if pf is not None:
+        # a destination's prefetch mark named the expert it held before
+        for _s, d in moves:
+            pf[int(d)] = -1
 
 
 def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True,

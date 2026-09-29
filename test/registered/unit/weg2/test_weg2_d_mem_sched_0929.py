@@ -335,3 +335,104 @@ def test_the_scheduler_runs_the_tick_after_the_ack_flush():
 
     src = inspect.getsource(scheduler.Scheduler.get_next_batch_to_run)
     assert src.index("flush_write_through_acks()") < src.index("_weg2_d_seat_vram.runtime_tick(self)")
+
+
+# --- 27B conditions to f499865784 --------------------------------------------------
+
+
+def _no_side_effects(monkeypatch, dsv):
+    """Every path the tick could take to the device or the group, as a trap."""
+    hits = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: hits.append("sync"))
+    monkeypatch.setattr(dsv, "_engage_kv_cap", lambda *a, **k: hits.append("cap"))
+    monkeypatch.setattr(dsv, "max_live_page", lambda *a, **k: hits.append("live") or 0)
+    monkeypatch.setattr(dsv, "controller", lambda *a, **k: hits.append("ctl"))
+    monkeypatch.setattr(torch, "tensor", lambda *a, **k: hits.append("alloc"))
+    sched = types.SimpleNamespace(
+        _weg2_group_min_ints=lambda vals: hits.append("collective") or vals,
+        running_batch=types.SimpleNamespace(reqs=[_req("a", 300_000)]), waiting_queue=[])
+    return hits, sched
+
+
+@pytest.mark.parametrize("group,stage_tokens", [
+    ("", None),           # the 27B / a non-weg2 boot: no group
+    ("P", None),          # group P
+    ("D", None),          # NF D without a stage form (no -kvstage)
+    ("D", "262144"),      # the pin itself: one stage = no form
+])
+def test_the_tick_leaves_early_without_a_stage_form(monkeypatch, group, stage_tokens):
+    from sglang.srt.weg2 import d_seat_vram as dsv
+
+    monkeypatch.setenv("SGLANG_WEG2_GROUP", group)
+    monkeypatch.setenv("SGLANG_OPT_WEG2_D_SEAT_VRAM", "1")
+    if stage_tokens is None:
+        monkeypatch.delenv("SGLANG_WEG2_D_KV_STAGE_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_WEG2_D_KV_STAGE_TOKENS", stage_tokens)
+    hits, sched = _no_side_effects(monkeypatch, dsv)
+    # a D wake without a form sets no stage (on_wake: stage None)
+    setattr(sched, dsv.PHASE_ATTR, dsv.PhaseState(epoch="e", n=6, cap=6, done=True))
+    for _ in range(3):
+        assert dsv.runtime_tick(sched) is None
+    assert hits == []                                   # 0 collectives, 0 syncs, 0 allocations
+    assert getattr(sched, dsv.TICK_NOOP_ATTR) == 3
+    assert not hasattr(sched, dsv.MEM_SCHED_ATTR)
+
+
+def _live_ctl(events, *, moved_per_cache):
+    from sglang.srt.weg2 import d_seat_vram as dsv
+
+    class _Cache:
+        def __init__(self):
+            self._pool_tables = types.SimpleNamespace(
+                row_key=types.SimpleNamespace(is_cuda=True))
+            self._weg2_bank_bytes_copied = 0
+
+        def set_seat_rows_on(self, k, device_write=False):
+            events.append("copy+tables")
+            self._weg2_bank_bytes_copied += moved_per_cache
+
+    ctl = types.SimpleNamespace(caches=[_Cache(), _Cache()], sync_ms=0.0, bytes_copied=0,
+                                copy_ms=0.0)
+    ctl._bank_bytes_copied = lambda: dsv.SeatVram._bank_bytes_copied(ctl)
+    ctl._timed_sync = lambda: dsv.SeatVram._timed_sync(ctl)
+    return dsv, ctl
+
+
+def test_the_coldest_first_copy_runs_between_two_syncs_and_is_counted(monkeypatch):
+    events = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: events.append("sync"))
+    dsv, ctl = _live_ctl(events, moved_per_cache=4096)
+    dsv.SeatVram._rows_off_live(ctl, 3, True)
+    # every in-flight kernel is done before a byte moves; the copies and the
+    # table writes of all layers land before the next forward and before unmap
+    assert events == ["sync", "copy+tables", "copy+tables", "sync"]
+    assert ctl.bytes_copied == 2 * 4096 and ctl.copy_ms >= 0.0
+
+
+def test_a_shrink_without_moves_counts_no_copy(monkeypatch):
+    events = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: events.append("sync"))
+    dsv, ctl = _live_ctl(events, moved_per_cache=0)
+    dsv.SeatVram._rows_off_live(ctl, 3, True)
+    assert ctl.bytes_copied == 0 and ctl.copy_ms == 0.0
+
+
+def test_the_bank_move_counts_its_bytes():
+    from sglang.srt.layers.moe.expert_offload import MoEExpertOffloadCache
+
+    cache = object.__new__(MoEExpertOffloadCache)
+    cache._resident = {"w13_weight": torch.zeros(8, 3, dtype=torch.float32),
+                       "w2_weight": torch.zeros(8, 5, dtype=torch.bfloat16)}
+    cache._move_bank_rows([(7, 3), (6, 4)])
+    assert cache._weg2_bank_bytes_copied == 2 * (3 * 4 + 5 * 2)
+
+
+def test_a_moved_destination_loses_its_prefetch_mark():
+    keys = [0, 1, 2, -1, 4, 5, 6, 7]
+    uses = [0, 0, 5, 0, 1, 9, 2, 50]
+    t = _tables(keys, uses, lru_start=2, seat_base=6, seat_rows=2, seat_on=2, clock=60)
+    t.pf_row[3] = 11
+    t.pf_row[4] = 12
+    epd.apply_row_moves(t, [(7, 3), (6, 4)])
+    assert t.pf_row[3].item() == -1 and t.pf_row[4].item() == -1

@@ -4546,6 +4546,7 @@ class MoEExpertOffloadCache:
             return
         top = max(max(s, d) for s, d in moves)
         src = dst = None
+        copied = 0
         for attr, buf in self._resident.items():
             if int(buf.shape[0]) <= top:
                 raise RuntimeError(
@@ -4555,6 +4556,8 @@ class MoEExpertOffloadCache:
                 src = torch.tensor([s for s, _ in moves], dtype=torch.long, device=buf.device)
                 dst = torch.tensor([d for _, d in moves], dtype=torch.long, device=buf.device)
             buf.index_copy_(0, dst, buf.index_select(0, src))
+            copied += len(moves) * (buf.numel() // int(buf.shape[0])) * buf.element_size()
+        self._weg2_bank_bytes_copied = int(getattr(self, "_weg2_bank_bytes_copied", 0)) + copied
 
     def _pool_zero_row(self):
         """H95: a [1] device view of the row that masked wave lanes point at.
