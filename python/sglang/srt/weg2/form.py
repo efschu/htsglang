@@ -454,6 +454,11 @@ class ModelProfile:
     #: on 27b/27b-fp8, UN dry-run 26.09.), because its measured stage
     #: constants were fitted with the formula's slot count.
     p_mamba_slots_from_argv: bool = False
+    #: PP-POSTEN (27B, 29.09.): group P's pool model books what the P runtime books -- corridor
+    #: holdback 0 (inside the P budget line) and no activation reserve unless pinned (the runtime
+    #: books the prefill transient only for measured checkpoints). qwen27b on, measured on boots
+    #: 09291750/09291831/09292006; nextflash off (byte-identical).
+    p_pool_posts_as_booked: bool = False
     #: 27B PARK (user decision 26.09. ~19:00Z, memory d2p-sofort-flippen-und-
     #: x-exakt-0926): D->P waits for nothing. A queued request whose pending
     #: tokens exceed X while D decodes parks D's running decodes at once (the
@@ -717,6 +722,11 @@ PROFILES: Dict[str, ModelProfile] = {
         # with an explicit '--weg2-d-early-start on' proved it.
         d_expect_from_p_records=True,
         d_early_start_proven=False,
+        # PP-POSTEN (29.09., YaRN x2 300k needle): P's pool priced with what P books -- its argv's
+        # --max-mamba-cache-size (24 slots: 37.41 MiB per linear layer on every P rank of 09291750/
+        # 09291831/09292006), holdback 0, no activation; stage constants refitted with that slot count.
+        p_mamba_slots_from_argv=True,
+        p_pool_posts_as_booked=True,
         # 27B park (user 26.09., memory d2p-sofort-flippen-und-x-exakt-0926:
         # "D->P nicht warten, sofort flippen, laufende Decodes parken"): ON since
         # the registry default (operator 28.09., after rc12z21 b1 stalled its

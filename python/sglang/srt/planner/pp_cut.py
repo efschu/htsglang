@@ -3324,11 +3324,13 @@ class PhasePoolModel:
         now.
         """
         missing: List[str] = []
+        acknowledged = {str(x) for x in self.zero_posts_acknowledged}
         if not self.stage_fixed_mib:
             missing.append("stage_fixed_mib")
+        # PP-POSTEN (27B): a runtime that books NO activation says so ("prefill activation reserve")
         if float(self.activation_reserve_mib) <= 0.0 and not any(
             float(v) > 0.0 for v in self.activation_reserve_mib_by_stage
-        ):
+        ) and "prefill activation reserve" not in acknowledged:
             missing.append("activation_reserve_mib")
         if self.corridor_holdback_mib is None:
             missing.append("corridor_holdback_mib")
@@ -3337,7 +3339,6 @@ class PhasePoolModel:
             or int(self.mamba_slots) <= 0
         ):
             missing.append("mamba_mib_per_linear_layer_per_slot")
-        acknowledged = {str(x) for x in self.zero_posts_acknowledged}
         for post, field in (
             ("mamba pre-capture reserve", "mamba_precapture_reserve_mib"),
             ("speculative intermediate state", "speculative_intermediate_mib"),

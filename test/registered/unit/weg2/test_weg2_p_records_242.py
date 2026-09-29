@@ -82,7 +82,8 @@ def test_nextflash_carries_its_own_p_records_and_no_longer_borrows_them():
 
 
 def test_the_27b_profile_is_untouched():
-    assert form.profile_constant("P_PP_STAGE_FIXED_MIB", B27) == "2342.0,1105.5,3518.0"
+    # PP-POSTEN 29.09.: refitted with the booked posts (the NF row stays untouched below)
+    assert form.profile_constant("P_PP_STAGE_FIXED_MIB", B27) == "1418.4,148.8,4960.6"
     assert form.profile_constant("P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT", B27) == pytest.approx(1.5588)
     with pytest.raises(KeyError):
         form.profile_constant("P_ACTIVATION_MIB", B27)

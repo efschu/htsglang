@@ -176,7 +176,8 @@ def test_the_27b_constants_moved_unchanged_and_the_nf_row_is_separate():
         "P_OVERSHOOT_MIB": (920, 0, 512), "D_OVERSHOOT_MIB": (489, 0, 0),
         "P_DRAFT_RESIDENT_BUDGET_MIB": 405.2 + 1213.0, "CALIBRATION_LAYERS": 64,
         "MEASURED_MS_PER_LAYER": "8.10,35.16,33.59",
-        "P_PP_STAGE_FIXED_MIB": "2342.0,1105.5,3518.0",
+        # PP-POSTEN 29.09.: refitted with the booked posts (24 mamba slots, resident draft on PP2)
+        "P_PP_STAGE_FIXED_MIB": "1418.4,148.8,4960.6",
         "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT": 1.5588,
         "X_RECORDED_R_D_TOKS": 690.0, "X_RECORDED_R_P_TOKS": 3640.0, "X_RECORDED_FLIP_S": 13.247,
         "STORE_CENSUS_KV_PAGES": 50651, "STORE_CENSUS_MAMBA_BLOBS": 42,

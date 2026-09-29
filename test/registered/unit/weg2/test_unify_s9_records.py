@@ -40,7 +40,7 @@ OLD_27B = {
     "DC_MEASURED_D_XCHG_MIB": (2588, 3084, 2588), "P_OVERSHOOT_MIB": (920, 0, 512),
     "D_OVERSHOOT_MIB": (489, 0, 0), "P_DRAFT_RESIDENT_BUDGET_MIB": 405.2 + 1213.0,
     "CALIBRATION_LAYERS": 64, "MEASURED_MS_PER_LAYER": "8.10,35.16,33.59",
-    "P_PP_STAGE_FIXED_MIB": "2342.0,1105.5,3518.0", "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT": 1.5588,
+    "P_PP_STAGE_FIXED_MIB": "1418.4,148.8,4960.6", "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT": 1.5588,
     "X_RECORDED_R_D_TOKS": 690.0, "X_RECORDED_R_P_TOKS": 3640.0, "X_RECORDED_FLIP_S": 13.247,
     "STORE_CENSUS_PROVENANCE": "boot weg2sb5g W9 store census 2026-09-09T07:12:38Z",
     "STORE_CENSUS_KV_PAGES": 50651, "STORE_CENSUS_MAMBA_BLOBS": 42, "STORE_CENSUS_DRAFT_PAGES": 26040,
@@ -55,8 +55,10 @@ class TestRecordsAreTheOldLiterals(unittest.TestCase):
         # D's awake rest beyond its budget line (weg2/budget_rest.py)
         # desk/27b-d-alloc-overhang-0929: two more NEW measurements (the rest's
         # posts under the P0 torch cache cap, weg2/budget_rest.py --capped)
+        # PP-POSTEN 29.09.: the measured YaRN x2 stage_fixed increment (a NEW measurement)
         self.assertEqual(set(row.constants) - {"D_AWAKE_REST_BOOKED_MIB", "D_TORCH_CAP_OTHER_MIB",
-                                               "D_AWAKE_REST_CAPPED_MIB"}, set(OLD_27B))
+                                               "D_AWAKE_REST_CAPPED_MIB", "P_PP_STAGE_FIXED_YARN2_DELTA_MIB"},
+                         set(OLD_27B))
         for n, v in OLD_27B.items():
             got = row.constant(n)
             self.assertEqual(got, v, n)
