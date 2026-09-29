@@ -242,6 +242,8 @@ from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progre
 from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision verdict on the chain
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import d_seat_vram as _weg2_d_seat_vram  # D-MEM-SCHED stage between wakes
+from sglang.srt.weg2 import skip_first as _weg2_skip_first  # E2 in a mixed wake cohort
+from sglang.srt.weg2 import tail_adopt as _weg2_tail_adopt
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
@@ -12330,6 +12332,11 @@ class Scheduler(
             # split the ranks across mismatched collective counts.
             new_batch = None
             self._admission_decline_note = "gate=congruent_lane_cadence"  # BA
+        elif _weg2_skip_first.hold_prefill_after_skip(last_batch, running_batch):
+            # E2 in a mixed wake cohort: the skip batch's tokens go out with
+            # this decode round before the next extend (rank-uniform)
+            new_batch = None
+            self._admission_decline_note = "gate=weg2_skip_first_decode"
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
@@ -15419,6 +15426,10 @@ class Scheduler(
         # H91b: on group D the parked requests come first and hold the seats
         # they return to (weg2/d_seats.admission_gate); None = stock loop.
         _d_park_gate = self._weg2_d_park_admission(running_batch)
+        # E2: the END-state hand-offs lead the pass (weg2/skip_first.py)
+        self.waiting_queue, _skip_first_rids = _weg2_skip_first.order(
+            self.waiting_queue, _weg2_tail_adopt.skip_joinable
+        )
         self._weg2_sa_exclude_displaced(prefetch_verdicts)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
@@ -16106,7 +16117,8 @@ class Scheduler(
                 continue
             if _d_park_gate is not None:  # H91b: parked first, newcomers wait
                 # AP: the parked requests already admitted THIS pass hold no seat
-                _d_skip = _d_park_gate.skip(req, admitted=[str(_r.rid) for _r in adder.can_run_list])
+                _d_skip = _d_park_gate.skip(req, admitted=[str(_r.rid) for _r in adder.can_run_list],
+                                            skip_extend=str(req.rid) in _skip_first_rids)
                 if _d_skip is not None:
                     _note_skip(_d_skip, req.rid)
                     continue
@@ -17417,6 +17429,7 @@ class Scheduler(
             )
         )
         new_batch.weg2_anchor_tail_bodies = _tails_in_batch
+        new_batch.weg2_skip_extend = bool(adder.weg2_skip_extend_taken)
         # #861k: CARRY THE TRANSPORT CLAIM TO THE BATCH, so the conformance
         # detector can judge the MEASURED bytes against it at emit time. The
         # seam stamp itself is one-shot and was spent above; this flag is the

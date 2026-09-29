@@ -3291,6 +3291,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # (Scheduler.anchor_tails); excluded from the running-batch merge when the
     # batch returns as last_batch, like `chunked_req`. Empty unless armed.
     weg2_anchor_tail_bodies: Tuple = ()
+    # E2 (H24): every request of this extend batch took P's END state -- no
+    # target forward ran; the next pass decodes first (weg2/skip_first.py)
+    weg2_skip_extend: bool = False
 
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None

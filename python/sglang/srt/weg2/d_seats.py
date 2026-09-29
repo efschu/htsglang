@@ -268,16 +268,19 @@ class AdmissionGate:
     #: (their seats are the wake's ``handoff_n``, counted at the wake)
     cohort_wake: Optional[int] = None
 
-    def skip(self, req, admitted=None) -> Optional[str]:
+    def skip(self, req, admitted=None, skip_extend: bool = False) -> Optional[str]:
         """Census key when ``req`` is skipped this pass, else None.
         ``admitted``: the rids already in this pass's batch (None = the old
-        static barrier)."""
+        static barrier). ``skip_extend``: ``req`` takes P's END state this
+        pass (weg2/skip_first.py) -- it runs no forward and its seat is the
+        wake's own (``note_wake_seats`` counts hand-offs and parked alike), so
+        the barrier that keeps parked seats from newcomers does not hold it."""
         site = park_site(req)
         if site is not None:
             if str(req.rid) in self.blocked:
                 return "weg2_d_park_older_live"
             return "weg2_d_park_decode_first" if str(req.rid) in self.deferred else None
-        if not self.barrier:
+        if not self.barrier or skip_extend:
             return None
         if self.deferred and self.cohort_wake is not None and in_wake_cohort(req, self.cohort_wake):
             # F3: a member of THIS wake goes ahead of the deferred resume; the
