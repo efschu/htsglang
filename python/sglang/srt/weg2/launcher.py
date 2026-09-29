@@ -17627,6 +17627,37 @@ def publish_store_identity(model: str, map_path: str, log) -> str:
     return ident
 
 
+EXPERT_MAP_DIR_ENV = "SGLANG_WEG2_EXPERT_MAP_DIR"
+
+
+def expert_map_dir(evidence_dir: str, log) -> str:
+    """Where the expert maps (#107 Platztausch, V1) are written: the evidence
+    dir when this process can write it, else a NAMED writable fallback
+    (``SGLANG_WEG2_EXPERT_MAP_DIR``, default ``<tmp>/weg2-expert-maps``).
+
+    Dry runs against a container's evidence tree (owned by the container's
+    user) printed 'WEG2-EXPERT-MAP failed: PermissionError' and published no
+    map -- so the dry run never showed the map the boot would build. Both
+    groups read the map by the path in their env, so any directory this
+    launcher can write and the ranks can read is correct; the redirect is
+    logged so a reader never looks for the map in the wrong place."""
+    try:
+        os.makedirs(evidence_dir, exist_ok=True)
+    except OSError:
+        pass
+    if os.path.isdir(evidence_dir) and os.access(evidence_dir, os.W_OK | os.X_OK):
+        return evidence_dir
+    import tempfile
+
+    alt = (os.environ.get(EXPERT_MAP_DIR_ENV)
+           or os.path.join(tempfile.gettempdir(), "weg2-expert-maps"))
+    os.makedirs(alt, exist_ok=True)
+    log(f"WEG2-EXPERT-MAP-DIR {evidence_dir} is not writable by this process -> "
+        f"maps go to {alt} ({EXPERT_MAP_DIR_ENV}); both groups read them by the "
+        f"path in their env")
+    return alt
+
+
 def publish_expert_map(ns, model: str, evidence_dir: str, log,
                        p_stage_layers=None,
                        chunk_layers: Optional[int] = None) -> str:
@@ -17739,8 +17770,7 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
             log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % grund)
             return ""
         _refuse_unbuilt_platztausch_buffers(karte, chunk_layers=chunk_layers)
-        os.makedirs(evidence_dir, exist_ok=True)
-        pfad = os.path.join(evidence_dir, f"expert_map_{ns.tag}.json")
+        pfad = os.path.join(expert_map_dir(evidence_dir, log), f"expert_map_{ns.tag}.json")
         with open(pfad, "w") as fh:
             _json.dump(karte, fh)
         # #239 rc12z29c-Blocker 2: die D-Form, die diese Karte beschreibt --
@@ -22703,7 +22733,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             else:
                 import json as _json
 
-                _mp = os.path.join(getattr(ns, "evidence_dir", EVIDENCE_DIR),
+                _mp = os.path.join(expert_map_dir(getattr(ns, "evidence_dir", EVIDENCE_DIR), log),
                                    f"expert_map_{ns.tag}.json")
                 with open(_mp, "w") as _fh:
                     _json.dump(_karte, _fh)
