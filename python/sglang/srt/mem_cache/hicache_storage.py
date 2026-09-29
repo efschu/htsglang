@@ -3316,7 +3316,12 @@ class HiCacheFile(HiCacheStorage):
         ``{written, on_disk, absent, bytes}``."""
         import ctypes
 
-        out = {"written": 0, "on_disk": 0, "absent": 0, "bytes": 0}
+        # absent = missing (no slot in the arena at all) + busy (a slot that
+        # was not in the ready state, held by another reference, or moved
+        # between lookup and pin). The anchor pool keeps two candidate pages
+        # of which only one exists (handoff_pending.ANCHOR_TAIL_KEYS), so its
+        # other candidate is `missing` by design, not a lost page.
+        out = {"written": 0, "on_disk": 0, "absent": 0, "missing": 0, "busy": 0, "bytes": 0}
         stems = [s for s in dict.fromkeys(stems or ()) if s]
         if not stems or arena is None:
             return out
@@ -3330,7 +3335,7 @@ class HiCacheFile(HiCacheStorage):
 
         pio = _load_pageio()
         if pio is None:
-            out["absent"] = len(todo)
+            out["absent"] = out["busy"] = len(todo)
             return out
         lib, base = arena._lib, arena._base
 
@@ -3339,13 +3344,19 @@ class HiCacheFile(HiCacheStorage):
 
         pinned = []
         for stem, (slot, state) in zip(todo, arena.find_slots(todo)):
-            if slot < 0 or int(state) != 2 or _ref(slot, +1) != 1:
+            if slot < 0:
                 out["absent"] += 1
+                out["missing"] += 1
+                continue
+            if int(state) != 2 or _ref(slot, +1) != 1:
+                out["absent"] += 1
+                out["busy"] += 1
                 continue
             (s2, st2), = arena.find_slots([stem])
             if s2 != slot or int(st2) != 2:
                 _ref(slot, -1)  # evicted and re-claimed between find and pin
                 out["absent"] += 1
+                out["busy"] += 1
                 continue
             pinned.append((stem, int(slot)))
         try:
