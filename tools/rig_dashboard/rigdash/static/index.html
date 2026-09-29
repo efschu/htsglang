@@ -546,6 +546,17 @@ document.addEventListener("click", (e) => { if (!e.target.closest(".phasebar")) 
 let fitTimer = null;
 window.addEventListener("resize", () => { clearTimeout(fitTimer); fitTimer = setTimeout(fitPhaseLabels, 100); });
 
+// E2 prefetch census per rank (rankstats.cache.prefetch): deferred = #1068 DEFERRED, refused = #915 REFUSED,
+// timeout = #1157 REAPED -- the log's PREFETCH TIMEOUT line is the one config line, never a timeout
+function prefetchRows(b) {
+  const f = fieldIpc(b, "E2");
+  if (!f || !f.value) return "";
+  const cols = ["attempted", "issued", "landed", "deferred", "defer_refused", "expired", "refused", "timeout"];
+  const rows = Object.entries(f.value).filter(([, v]) => v && v.prefetch)
+    .map(([r, v]) => `<tr><td>${esc(r)}</td>${cols.map((c) => `<td class="num">${fmt(v.prefetch[c])}</td>`).join("")}<td class="num">${fmt(v.mamba_tok)}</td></tr>`).join("");
+  return rows ? `<div class="tablewrap" style="margin-top:6px"><table><tr><th>Prefetch je Rang ${ipcTag(f.ipc_src)}</th>${cols.map((c) => `<th class="num">${c}</th>`).join("")}<th class="num">mamba_tok</th></tr>${rows}</table></div>` : "";
+}
+
 // the IPC rows of one tile: one row per rank of this group whose field value the IPC carries
 function ipcRankRows(b, g, key, show) {
   const f = fieldIpc(b, key);
@@ -600,6 +611,7 @@ function decodeTile(b, g, color, binders, now) {
       d.seats ? ["Sitze dieser D-Phase (D-PHASE-SEATS)", `${fmt(d.seats.n)} von ${fmt(d.seats.cap)} &middot; &uuml;bergeben ${fmt(d.seats.handoff_n)} + geparkt ${fmt(d.seats.parked_n)}${d.seats.clamped ? " (gekappt)" : ""}`] : null,
       ["accept len &middot; accept rate", `${fmt(d.accept_len, 2)} &middot; ${fmt(d.accept_rate, 2)}`],
       ...ipcRankRows(b, g, "C3", (v) => `${v.gen_tps != null ? fmt(v.gen_tps, 1) + " tok/s (Deltas)" : "—"} &middot; accept len ${fmt(v.accept_len_mean != null ? v.accept_len_mean : v.accept_len_ewma, 2)}`),
+      ...ipcRankRows(b, g, "C5", (v) => `KV ${fmt(v.kv_tokens)} Tok${v.share != null ? " &middot; Anteil " + fmt(v.share, 3) : ""}${v.holds_kv === false ? " (h&auml;lt kein KV)" : ""} &middot; Sitze ${fmt(v.seats)}`),
       ["Rechenrate (bs&times;accept / gpu-ms)", d.compute_tps != null ? `${fmt(d.compute_tps, 1)} tok/s` : "—"],
       ["&Oslash; tok/s/W &middot; 60 s (Kurvenmittel, Ruhe = 0)", fmt(((b.series || {}).per_w_60s || {})[g + "_decode_tps"], 2)],
       ["KV-Belegung &middot; CUDA-Graph", `${d.full_use != null ? fmt(d.full_use * 100) + " %" : "—"} &middot; ${d.cuda_graph == null ? "—" : d.cuda_graph ? "ja" : "nein"}`],
@@ -690,6 +702,7 @@ function cacheHtml(b, now, awake) {
       ${row("P-Gruppe", "P")}${row("D-Gruppe", "D")}${row("Gruppe", "single")}
       ${req("Front je Anfrage, P-Bein (cached/prompt)", "served_P")}${req("Front je Anfrage, D-Bein (cached/prompt)", "served_D")}
     </table></div>
+    ${prefetchRows(b)}
     <div class="muted" style="font-size:11px;margin-top:4px">aus Cache = &Sigma; #cached-token / neu = &Sigma; #new-token der Zeile &bdquo;Prefill batch&ldquo; (nur erster Rang, jeder Chunk einmal). Bei D ist &bdquo;aus Cache&ldquo; vor allem der von P &uuml;bergebene Pr&auml;fix, nicht nur echte Treffer.
       L2: Zeilen &bdquo;#988 LOADBACK&ldquo; (TP0), Tokens = anchor_depth, Anteil gegen alle Prompt-Tokens der Gruppe. L3: nur <b>unvollst&auml;ndige</b> Store-Lesungen werden geloggt (&bdquo;STORE READ INCOMPLETE&ldquo;, delivered/deliverable) &mdash; vollst&auml;ndige erscheinen nicht.
       L1-Device ist nicht eigens geloggt; h&ouml;chstens aus Cache &minus; L2 &minus; L3. Front: WEG2-SERVED cached_tokens/prompt_tokens je Anfrage.</div>
@@ -786,6 +799,7 @@ function bootCard(b, now, binders) {
           ["Fehlerzeilen (ERROR)", fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count) + " " + srcOf(b, "A13")],
           fieldIpc(b, "B1") ? ["Flipzeit P&rarr;D (1. Decode-Token) median / letzte", `${fmt(fieldIpc(b, "B1").value.median_ms)} / ${fmt(fieldIpc(b, "B1").value.last_ms)} ms ${ipcTag("flip_first_work")}`] : null,
           fieldIpc(b, "B2") ? ["Flipzeit D&rarr;P (1. P-Arbeit) median / letzte", `${fmt(fieldIpc(b, "B2").value.median_ms)} / ${fmt(fieldIpc(b, "B2").value.last_ms)} ms ${ipcTag("flip_first_work")}`] : null,
+          ["Rang-Stopps (benannt)", fieldIpc(b, "A14") ? fieldIpc(b, "A14").value.slice(-3).map((x) => `${esc(x.group)}.${esc(x.rank)} ${esc(x.code)}${x.ticket ? " " + esc(x.ticket) : ""}`).join(" &middot; ") + " " + ipcTag(fieldIpc(b, "A14").ipc_src) : fmt(b.stop_count || 0) + " " + srcOf(b, "A14")],
           fieldIpc(b, "C6") ? ["D-Sitze n &middot; geparkt", `${fmt(fieldIpc(b, "C6").value.n)} &middot; ${fmt(fieldIpc(b, "C6").value.parked_n)} ${ipcTag("front.d_seats")}`] : null,
         ])}
         ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">letzte ${recent.length} Flips, Höhe = ${byTotal ? ins.flip_total : ins.first_token} &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}

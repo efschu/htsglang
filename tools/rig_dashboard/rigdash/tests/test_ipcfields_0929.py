@@ -46,8 +46,9 @@ def _ipc():
                                     "flip_time_ms": 2500, "what": "decode_token", "rid": "r1"}),
             _ev("flip_first_work", {"epoch": 5, "dir": "D>P", "flip_begin_ts": 110.0, "first_work_ts": 113.0,
                                     "flip_time_ms": 3000, "what": "p_prefill", "rid": "r2"}),
-            _ev("rank_stop", {"exception_type": "RuntimeError", "detail_full": "x"}, group="D", rank=0,
-                code="W35"),
+            _ev("rank_stop", {"t": 1790680001.0, "reason": "scheduler_exception", "code": "W35_RuntimeError",
+                              "exc": "RuntimeError", "ticket": "#1068", "text": "W35 credit wait #1068", "pid": 7,
+                              "group": "D", "rank": "tp0pp0"}, group="D", rank="tp0pp0", code="W35_RuntimeError"),
             _ev("post_wake_pass", {"epoch": 4, "mode": "decode", "schedule_ms": 3, "run_ms": 31, "prepare_ms": 2}),
             _ev("group_ready", {"group": "D", "after_s": 182.0}),
         ],
@@ -75,7 +76,8 @@ def _stats(ts=1000.0, prefill_total=1000, decode_total=500, new_tokens=16384, co
 
 def _rank():
     return {"rankstats": _stats(),
-            "rankstate": {"D.tp0pp0": {"schema": 2, "kv": {"kv_tokens": 262144}, "seats": {"n": 2, "cap": 6}}}}
+            "rankstate": {"D.tp0pp0": {"schema": 2, "kv": {"holds_kv": True, "kv_tokens": 262144, "share": 0.5},
+                                       "seats": 6}}}
 
 
 def _logv():
@@ -120,7 +122,8 @@ class FieldSwitchTests(unittest.TestCase):
         self.assertEqual(on["A12"]["value"]["D"]["verdict"], "ok")
         self.assertEqual(on["A13"]["value"]["n"], 1 + 2 + 2)          # front + two ranks
         self.assertEqual(off["A13"]["value"]["n"], 9)
-        self.assertEqual(on["A14"]["value"][0]["code"], "W35")
+        self.assertEqual(on["A14"]["value"][0]["code"], "W35_RuntimeError")
+        self.assertEqual((on["A14"]["value"][0]["rank"], on["A14"]["value"][0]["ticket"]), ("tp0pp0", "#1068"))
         self.assertEqual(on["A15"]["value"]["D.tp0pp0"]["forward_ct"], 7)
         self.assertEqual(on["B1"]["value"]["last_ms"], 2500)
         self.assertEqual(on["B2"]["value"]["last_ms"], 3000)
@@ -136,7 +139,8 @@ class FieldSwitchTests(unittest.TestCase):
         self.assertEqual(on["C3"]["value"]["D.tp0pp0"]["gen_tps"], 88.0)
         self.assertEqual(on["C3"]["value"]["D.tp0pp0"]["accept_len_mean"], 3.0)
         self.assertEqual(on["C4"]["value"]["D.tp0pp0"], {"1": [40, 1200.0]})
-        self.assertEqual(on["C5"]["value"]["D.tp0pp0"]["kv_tokens"], 262144)
+        self.assertEqual(on["C5"]["value"]["D.tp0pp0"],
+                         {"holds_kv": True, "kv_tokens": 262144, "share": 0.5, "seats": 6, "src": "RankState"})
         self.assertEqual(on["C6"]["value"], {"n": 2, "parked_n": 1})
         self.assertIn("D.tp0pp0", on["C7"]["value"])
         self.assertEqual(on["D1"]["value"]["P.tp0pp0"][0]["kind"], "prefill")
@@ -179,20 +183,23 @@ class FieldSwitchTests(unittest.TestCase):
         self.assertEqual((s["ipc"], s["log"], s["n"]), (0, len(ipcfields.KEYS), len(ipcfields.KEYS)))
 
 
-#: the reader fixture of /spinning/gpu-arb/docs/RANKSTATS-S3-SCHEMA-0929.md, verbatim (producer 9969bd336b)
+#: the reader fixture of /spinning/gpu-arb/docs/RANKSTATS-S3-SCHEMA-0929.md, verbatim (producer
+#: desk/rankstats-s3-0929 @ ff643c9010, "Nachzug A14 / C5": full_token_usage, mamba_tok,
+#: prefetch.deferred/defer_refused/timeout, cap, stops)
 S3_FIXTURE = json.loads("""
 {"schema":"weg2.rankstats/1","pid":1,"ts":1790680000.0,"seq":12,"group":"P","tp_rank":0,"pp_rank":0,
  "rank_state_seq":null,"work":{"forward_ct":40},"tokens":{"prefill_total":65536,"decode_total":0},
  "spec":{"accept_tokens_total":0,"forward_ct_total":0},
- "sched":{"waiting":1,"running":0,"queue_req":1,"running_req":0,"pending_tokens":16384},
+ "sched":{"waiting":1,"running":0,"queue_req":1,"running_req":0,"pending_tokens":16384,"full_token_usage":0.4271},
+ "cap":{"kv_tokens":262144,"seats":6},
  "prefill":{"chunks":4,"new_tokens":65536,"cached_tokens":0,"gpu_ms":11240.0,"split_ms":11240.0,
             "compute_ms":11240.0,"wait_ms":0.0,"bubble_ms":698.0,
             "last":{"t":1790679999.1,"new":16384,"gpu_ms":2810.0,"compute_ms":2810.0}},
  "decode":{"rounds":null,"gpu_ms":null,"gpu_ms_by_bs":null,"tokens":0,"running":null,
            "accept_len_ewma":null,"accept_rate_ewma":null,"cuda_graph":null},
- "cache":{"loadback_n":0,"loadback_tok":0,"mamba_resume_n":0,"mamba_tok":null,"store_incomplete_n":0,
-          "prefetch":{"attempted":3,"issued":2,"landed":1,"deferred":1,"expired":0,"refused":0}},
- "errors":{"n":0,"last":[]},"last_post_wake":null}
+ "cache":{"loadback_n":0,"loadback_tok":0,"mamba_resume_n":0,"mamba_tok":0,"store_incomplete_n":0,
+          "prefetch":{"attempted":3,"issued":2,"landed":1,"deferred":1,"defer_refused":0,"expired":0,"refused":0,"timeout":0}},
+ "errors":{"n":0,"last":[]},"last_post_wake":null,"stops":{"n":0,"last":[]}}
 """)
 
 
@@ -214,14 +221,43 @@ class SchemaS3FixtureTests(unittest.TestCase):
         self.assertEqual((span["t1"], span["t0"], span["kind"]), (1790679999.1, round(1790679999.1 - 2.81, 3), "prefill"))
         self.assertEqual(f["D2"]["src"], "log")                              # no D rank in the fixture
 
-    def test_nulls_stay_on_the_log_with_the_label(self):
+    def test_nachzug_leaves_come_from_the_record(self):
+        """ff643c9010 fills full_token_usage, mamba_tok and prefetch.timeout: nothing of C2/E2 on the log."""
         f = self.f
-        self.assertEqual(f["E2"]["from_log"], ["mamba_tok", "prefetch.timeout"])
-        self.assertEqual(f["E2"]["from_log_label"], "aus Log (Übergang)")
-        self.assertEqual(f["C2"]["from_log"], ["full_token_usage"])
+        self.assertNotIn("from_log", f["C2"])
+        self.assertNotIn("from_log", f["E2"])
+        self.assertEqual(f["C2"]["value"]["P.tp0pp0"]["full_token_usage"], 0.4271)
+        self.assertEqual(f["E2"]["value"]["P.tp0pp0"]["mamba_tok"], 0)
+        pf = f["E2"]["value"]["P.tp0pp0"]["prefetch"]
+        # deferred = census key 'deferred' (#1068 DEFERRED), defer_refused its own key (9969bd336b mixed them)
+        self.assertEqual((pf["deferred"], pf["defer_refused"], pf["timeout"]), (1, 0, 0))
         # a P rank's decode block is all null (+ tokens 0): C3/C4 do not switch on it
         self.assertEqual(f["C3"]["src"], "log")
         self.assertEqual(f["C4"]["src"], "log")
+
+    def test_a_leaf_null_on_every_rank_stays_on_the_log_with_the_label(self):
+        """null = the source is missing on this rank (e.g. timeout without tree_cache): generic, per leaf."""
+        rec = copy.deepcopy(S3_FIXTURE)
+        rec["cache"]["prefetch"]["timeout"] = None
+        rec["cache"]["mamba_tok"] = None
+        rec["sched"]["full_token_usage"] = None
+        other = copy.deepcopy(rec)
+        other["cache"]["prefetch"]["timeout"] = 5                       # one rank carries it: not on the log
+        f = ipcfields.resolve(None, {"rankstats": {"P.tp0pp0": rec, "P.tp0pp1": copy.deepcopy(rec)},
+                                     "rankstate": {}}, _logv(), rates={})
+        self.assertEqual(f["E2"]["from_log"], ["mamba_tok", "prefetch.timeout"])
+        self.assertEqual(f["E2"]["from_log_label"], "aus Log (Übergang)")
+        self.assertEqual(f["C2"]["from_log"], ["full_token_usage"])
+        f = ipcfields.resolve(None, {"rankstats": {"P.tp0pp0": rec, "P.tp0pp1": other}, "rankstate": {}},
+                              _logv(), rates={})
+        self.assertEqual(f["E2"]["from_log"], ["mamba_tok"])
+        self.assertEqual(f["C2"]["from_log"], ["full_token_usage"])
+
+    def test_c5_from_the_cap_block_until_the_rankstate_names_it(self):
+        f = self.f
+        self.assertEqual(f["C5"]["src"], "ipc")
+        self.assertEqual(f["C5"]["value"]["P.tp0pp0"],
+                         {"holds_kv": None, "kv_tokens": 262144, "share": None, "seats": 6, "src": "rankstats.cap"})
 
     def test_compute_honest_rate_is_new_over_gpu_ms(self):
         r = ipcfields.Rates()
@@ -234,6 +270,59 @@ class SchemaS3FixtureTests(unittest.TestCase):
         r.update("b", {"P.tp0pp0": a})
         out = r.update("b", {"P.tp0pp0": b})
         self.assertAlmostEqual(out["P.tp0pp0"]["prefill_tps_gpu"], 16384 / 2.81, places=1)
+
+
+class NachzugA14C5Tests(unittest.TestCase):
+    """RANKSTATS-S3-SCHEMA "Nachzug A14 / C5": rank_stop events, rankstats.stops, RankState kv/seats."""
+
+    def _stop(self, t, code, ticket=None):
+        return {"t": t, "reason": "scheduler_exception", "code": code, "exc": code.split("_")[-1],
+                "ticket": ticket, "text": code + " text"}
+
+    def test_a14_rank_stop_event_envelope_and_data(self):
+        ipc = {"ipc_events": [_ev("rank_stop", dict(self._stop(2.0, "W27_RuntimeError", "#1223"), pid=9,
+                                                     group="D", rank="tp1pp0"),
+                                  group="D", rank="tp1pp0", code="W27_RuntimeError")]}
+        f = ipcfields.resolve(ipc, None, _logv(), rates={})
+        self.assertEqual(f["A14"]["src"], "ipc")
+        self.assertEqual(f["A14"]["ipc_src"], "events rank_stop")
+        s = f["A14"]["value"][0]
+        self.assertEqual((s["group"], s["rank"], s["code"], s["ticket"], s["pid"]),
+                         ("D", "tp1pp0", "W27_RuntimeError", "#1223", 9))
+
+    def test_a14_from_the_ranks_stops_before_the_front_published_them(self):
+        st = {"D.tp1pp0": copy.deepcopy(S3_FIXTURE), "D.tp0pp0": copy.deepcopy(S3_FIXTURE)}
+        st["D.tp1pp0"]["stops"] = {"n": 1, "last": [self._stop(5.0, "ValueError")]}
+        st["D.tp0pp0"]["stops"] = {"n": 1, "last": [self._stop(3.0, "W35_RuntimeError", "#1068")]}
+        f = ipcfields.resolve(None, {"rankstats": st, "rankstate": {}}, _logv(), rates={})
+        self.assertEqual(f["A14"]["src"], "ipc")
+        self.assertEqual(f["A14"]["ipc_src"], "rankstats.stops")
+        self.assertEqual([(s["rank"], s["code"]) for s in f["A14"]["value"]],
+                         [("tp0pp0", "W35_RuntimeError"), ("tp1pp0", "ValueError")])
+
+    def test_a14_no_stop_anywhere_stays_on_the_log(self):
+        f = ipcfields.resolve(None, {"rankstats": {"P.tp0pp0": copy.deepcopy(S3_FIXTURE)}, "rankstate": {}},
+                              _logv(), rates={})
+        self.assertEqual(f["A14"]["src"], "log")
+        self.assertEqual(f["A14"]["label"], "aus Log (Übergang)")
+
+    def test_c5_rankstate_kv_and_seats(self):
+        rs = {"D.tp0pp0": {"schema": 2, "kv": {"holds_kv": True, "kv_tokens": 180000, "share": 0.625}, "seats": 6},
+              "D.tp1pp0": {"schema": 2, "kv": {"holds_kv": False, "kv_tokens": 0, "share": 0.0}, "seats": 6}}
+        cap = copy.deepcopy(S3_FIXTURE)
+        cap["cap"] = {"kv_tokens": 999, "seats": 1}                      # RankState wins over the cap echo
+        f = ipcfields.resolve(None, {"rankstats": {"D.tp0pp0": cap}, "rankstate": rs}, _logv(), rates={})
+        self.assertEqual(f["C5"]["value"]["D.tp0pp0"],
+                         {"holds_kv": True, "kv_tokens": 180000, "share": 0.625, "seats": 6, "src": "RankState"})
+        self.assertIs(f["C5"]["value"]["D.tp1pp0"]["holds_kv"], False)
+
+    def test_c5_record_without_kv_and_seats_stays_on_the_log(self):
+        rs = {"D.tp0pp0": {"schema": 2, "rank": 0}}                       # nothing named yet
+        st = copy.deepcopy(S3_FIXTURE)
+        st.pop("cap")
+        f = ipcfields.resolve(None, {"rankstats": {"D.tp0pp0": st}, "rankstate": rs}, _logv(), rates={})
+        self.assertEqual(f["C5"]["src"], "log")
+        self.assertEqual(f["C5"]["label"], "aus Log (Übergang)")
 
 
 class RatesTests(unittest.TestCase):
@@ -301,6 +390,13 @@ class PageTests(unittest.TestCase):
             self.assertIn(needle, html)
         self.assertNotIn("Cache-Treffer (aus den Boot-Logs)${LOGSRC}", html)
         self.assertNotIn("Flips &middot; Warteschlange${LOGSRC}", html)
+
+    def test_nachzug_surfaces(self):
+        """E2 prefetch census per rank incl. defer_refused/timeout, C5 per rank, A14 named stops."""
+        html = open(STATIC).read()
+        for needle in ('function prefetchRows(b)', '"deferred", "defer_refused", "expired", "refused", "timeout"',
+                       'ipcRankRows(b, g, "C5"', 'fieldIpc(b, "A14")', 'srcOf(b, "A14")'):
+            self.assertIn(needle, html)
 
 
 if __name__ == "__main__":

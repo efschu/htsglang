@@ -15,7 +15,7 @@ Sources (read-only; the writers are weg2/state_file.py, weg2/front.py, weg2/rank
                   post_wake_pass, group_ready
   <log>.rankstate/<G>.tp<t>pp<p>.rankstats   weg2.rankstats/1: work, tokens, spec, sched,
                   errors, last_post_wake and (plan §3) prefill, decode, cache
-  <log>.rankstate/<G>.tp<t>pp<p>.json        RankState (schema 1/2), kv.kv_tokens, seats
+  <log>.rankstate/<G>.tp<t>pp<p>.json        RankState (schema 1/2), kv{holds_kv,kv_tokens,share}, seats
 
 Rates (C7 and the headline tok/s of C1/C3) come from the deltas of the monotone rankstats
 counters between two samples of the same file (the reader keeps the previous sample); a
@@ -55,9 +55,19 @@ def field(key: str, ipc_value, ipc_src: Optional[str], log_value, from_log: Opti
     return {"key": key, "src": "log", "ipc_src": None, "value": log_value, "label": LOG_LABEL}
 
 
-def _nulls(rows: dict, names) -> List[str]:
-    """The named sub-fields that are null (or absent) in every rank row that carries the block."""
-    return [n for n in names if rows and all((r or {}).get(n) is None for r in rows.values())]
+def _null_leaves(rows: dict) -> List[str]:
+    """Dotted leaves (one nesting level) that are null in every rank row of a block --
+    RANKSTATS-S3-SCHEMA: null = the source is missing on this rank, never 0.  Generic over the
+    block, no per-name exception list: a producer that fills a leaf switches it by itself."""
+    keys: Dict[str, list] = {}
+    for r in rows.values():
+        for k, v in (r or {}).items():
+            if isinstance(v, dict):
+                for kk, vv in v.items():
+                    keys.setdefault(k + "." + kk, []).append(vv)
+            else:
+                keys.setdefault(k, []).append(v)
+    return sorted(k for k, vs in keys.items() if all(v is None for v in vs))
 
 
 def _non_null(d) -> bool:
@@ -239,10 +249,20 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
     f["A13"] = field("A13", a13, "rankstats.errors + front.errors",
                      {"n": logv.get("error_count"), "last": logv.get("errors")})
 
-    # A14 named stops: rank_stop events (non-fatal) + the fatal ones on record
-    stops_ev = [_data(e) | {"ts": e.get("ts"), "group": e.get("group"), "rank": e.get("rank"), "code": e.get("code")}
+    # A14 named stops: the front's rank_stop events (writer front, envelope group/rank/code,
+    # data {t, reason, code, exc, ticket, text, pid, group, rank}); before the front has
+    # published them, the ranks' own rankstats.stops {n, last[8]} (written on the death path)
+    stops_ev = [dict(_data(e), ts=e.get("ts"), group=e.get("group") or _data(e).get("group"),
+                     rank=e.get("rank") or _data(e).get("rank"), code=e.get("code") or _data(e).get("code"))
                 for e in _ev(ipc, "rank_stop")]
-    f["A14"] = field("A14", stops_ev[-12:] or None, "events rank_stop",
+    a14_src = "events rank_stop"
+    if not stops_ev:
+        for k, rec in sorted(stats.items()):
+            for x in ((rec.get("stops") or {}).get("last") or []):
+                stops_ev.append(dict(x, group=_grp(k), rank=k.split(".", 1)[-1]))
+        stops_ev.sort(key=lambda x: x.get("t") or 0)
+        a14_src = "rankstats.stops"
+    f["A14"] = field("A14", stops_ev[-12:] or None, a14_src,
                      {"n": logv.get("stop_count"), "last": logv.get("stops")})
 
     # A15 alarm dead/hung: the per-rank heartbeat = rankstats ts + forward counter
@@ -285,11 +305,11 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
           for k, rec in stats.items() if _non_null(rec.get("prefill"))} or None
     f["C1"] = field("C1", c1, "rankstats.prefill", logv.get("prefill"))
 
-    # C2 scheduler queue: rankstats.sched (waiting/running; §3 queue_req, running_req, pending_tokens);
-    # full_token_usage is not in the record yet -> that sub-field stays on the log
+    # C2 scheduler queue: rankstats.sched (waiting/running; §3 queue_req, running_req, pending_tokens,
+    # full_token_usage); a leaf null on every rank stays on the log with the label
     c2 = {k: rec["sched"] for k, rec in stats.items() if isinstance(rec.get("sched"), dict)} or None
     f["C2"] = field("C2", c2, "rankstats.sched", logv.get("queue_log"),
-                    from_log=_nulls(c2 or {}, ("full_token_usage",)) if c2 else None)
+                    from_log=_null_leaves(c2) if c2 else None)
 
     # C3 decode: rankstats.decode (§3; running/accept/cuda_graph only on the stats rank TP0,
     # null elsewhere) or tokens.decode_total + spec (2188e1bd98)
@@ -313,11 +333,21 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
     f["C4"] = field("C4", c4, "rankstats.decode.gpu_ms_by_bs", {g: (d or {}).get("round_ms_by_bs")
                                                                   for g, d in (logv.get("decode") or {}).items()})
 
-    # C5 D KV tokens / seats from the RankState record
-    c5 = {k: {"kv_tokens": (rec.get("kv") or {}).get("kv_tokens"), "seats": rec.get("seats")}
-          for k, rec in rstate.items() if (rec.get("kv") or {}).get("kv_tokens") is not None
-          or rec.get("seats") is not None} or None
-    f["C5"] = field("C5", c5, "RankState kv/seats", None)
+    # C5 KV tokens / seats: the RankState record's kv {holds_kv, kv_tokens, share} + seats
+    # (rank_state.note_capacity, both optional -- absent = the field stays on the log); the
+    # rankstats cap {kv_tokens, seats} carries the same numbers between two RankState rewrites
+    c5 = {}
+    for k, rec in rstate.items():
+        kv = rec.get("kv") if isinstance(rec.get("kv"), dict) else {}
+        if kv.get("kv_tokens") is not None or rec.get("seats") is not None:
+            c5[k] = {"holds_kv": kv.get("holds_kv"), "kv_tokens": kv.get("kv_tokens"), "share": kv.get("share"),
+                     "seats": rec.get("seats"), "src": "RankState"}
+    for k, rec in stats.items():
+        cap = rec.get("cap") if isinstance(rec.get("cap"), dict) else {}
+        if k not in c5 and (cap.get("kv_tokens") is not None or cap.get("seats") is not None):
+            c5[k] = {"holds_kv": None, "kv_tokens": cap.get("kv_tokens"), "share": None,
+                     "seats": cap.get("seats"), "src": "rankstats.cap"}
+    f["C5"] = field("C5", c5 or None, "RankState kv/seats + rankstats.cap", None)
 
     # C6 D seats: front.d_seats, or the front's d_phase_n / d_parked_n
     c6 = front.get("d_seats") or ({"n": front.get("d_phase_n"), "parked_n": front.get("d_parked_n")}
@@ -365,14 +395,11 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
     f["E1"] = field("E1", e1, "rankstats.prefill.cached_tokens", logv.get("cache"))
 
     # E2 loadback / mamba resume / store incomplete / prefetch (§3 rankstats.cache)
-    # (§3: mamba_tok is not counted yet (null); prefetch carries attempted/issued/landed/deferred/
-    # expired/refused -- no timeout; both stay on the log with the label)
+    # (§3 + Nachzug ff643c9010: prefetch {attempted, issued, landed, deferred (#1068 DEFERRED),
+    # defer_refused, expired, refused (#915 REFUSED), timeout (#1157 REAPED)}; a leaf null on every
+    # rank -- e.g. timeout on a rank without tree_cache -- stays on the log with the label)
     e2 = {k: rec["cache"] for k, rec in stats.items() if isinstance(rec.get("cache"), dict)} or None
-    e2_log = None
-    if e2:
-        e2_log = _nulls(e2, ("mamba_tok",)) + (
-            ["prefetch.timeout"] if all("timeout" not in ((r or {}).get("prefetch") or {}) for r in e2.values()) else [])
-    f["E2"] = field("E2", e2, "rankstats.cache", logv.get("cache"), from_log=e2_log)
+    f["E2"] = field("E2", e2, "rankstats.cache", logv.get("cache"), from_log=_null_leaves(e2) if e2 else None)
 
     # E3 served tokens per leg
     f["E3"] = field("E3", front.get("served_tokens") or None, "state.json front.served_tokens",
