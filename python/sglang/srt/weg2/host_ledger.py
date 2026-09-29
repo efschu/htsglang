@@ -2759,6 +2759,16 @@ def _arm_s_d(arm) -> str:
 # ---------------------------------------------------------------------------
 
 
+def xchg_carrier_gib(priced_bytes: int, census: Optional[Dict[str, object]]) -> float:
+    """The exchange carrier's host post: the census MEASUREMENT when a record
+    of this model|form carries one, else the priced bounce region."""
+    priced = max(0, int(priced_bytes)) / GIB
+    measured = (census or {}).get("xchg_measured_gib")
+    if measured is None or priced <= 0.0:
+        return priced
+    return max(0.0, float(measured))
+
+
 def charge_terms(
     s_gb: int, m_mib: int, ranks_per_group: int, images: ImageTerms,
     s_gb_d: Optional[int] = None,
@@ -2886,7 +2896,16 @@ def charge_terms(
         "weight_tags_d_gib": WEIGHT_TAGS_D_BYTES / GIB,
         "image_extra_p_gib": images.extra_p_gib,
         "image_extra_d_gib": images.extra_d_gib,
-        "xchg_bounce_gib": max(0, int(xchg_bounce_host_bytes)) / GIB,
+        # 29.09. (27B d2 W97; z30y 09291331 predicted 65.53 without the census,
+        # 75.8 with it, measured peak 62.29): EACH POST ONCE. The priced bounce
+        # region (#1464b: the incumbent's 5-lane price, kept as a coverage
+        # constant for "an unattributed ~10 GiB since xsn31") and the census
+        # posts that now attribute those bytes (non-rank anon 7.20 + lane ring
+        # 3.00) are the same bytes. With a census record the carrier is charged
+        # as MEASURED (weg2-xchg-* shmem, 0.0006 GiB on that boot); without one
+        # the price stands.
+        "xchg_bounce_gib": xchg_carrier_gib(xchg_bounce_host_bytes, census),
+        "xchg_bounce_priced_gib": max(0, int(xchg_bounce_host_bytes)) / GIB,
         # #1350: what the first waking of EACH GROUP adds to the cgroup and
         # NEVER gives back.  A MEASUREMENT (`resolve_flip_ratchet_gib`, read
         # from the sidecar the front writes at `WEG2-FLIP done epoch=2`), never
