@@ -5836,24 +5836,20 @@ class Front:
 
     # ---------------- DASHBOARD-AUS-IPC (a)/(b): flip + front keys as records ----------------
     def _ipc_submit(self, fn: Callable[..., Any], *args: Any) -> None:
-        """One state-dir write in the front's own IPC thread (FIFO, never on the loop,
-        never on the flip). A failed write is counted and logged, never raised."""
-        pool = self.__dict__.get("_ipc_pool")
-        if pool is None:
-            import concurrent.futures
-            pool = self.__dict__["_ipc_pool"] = concurrent.futures.ThreadPoolExecutor(
-                1, thread_name_prefix="weg2-ipc")
-        pool.submit(self._ipc_run, fn, *args)
+        """One state-dir write in the front's own IPC thread (BOUNDED FIFO, never on
+        the loop, never on the flip): a blocked writer drops the oldest entries
+        (front.ipc_dropped) instead of piling up RAM. A failed write is counted
+        and logged, never raised."""
+        w = self.__dict__.get("_ipc_writer")
+        if w is None:
+            from sglang.srt.weg2 import front_state_ipc
+            w = self.__dict__["_ipc_writer"] = front_state_ipc.BoundedWriter(
+                on_error=self._ipc_failed)
+        w.submit(fn, *args)
 
-    def _ipc_run(self, fn: Callable[..., Any], *args: Any) -> None:
-        try:
-            fn(*args)
-        except Exception as e:  # noqa: BLE001 -- a lost record never stops the front
-            counters = getattr(self, "counters", None)
-            if counters is not None:
-                counters["ipc_write_failed"] += 1
-            logger.warning("WEG2 IPC WRITE FAILED %s: %s: %s", getattr(fn, "__name__", fn),
-                           type(e).__name__, e)
+    def _ipc_failed(self, fn: Callable[..., Any], e: Exception) -> None:
+        logger.warning("WEG2 IPC WRITE FAILED %s: %s: %s", getattr(fn, "__name__", fn),
+                       type(e).__name__, e)
 
     def _ipc_publish(self, typ: str, data: dict) -> None:
         """An event of the front into the boot's events.jsonl; no state dir = no-op."""
@@ -5897,6 +5893,9 @@ class Front:
                               "streak": int(getattr(g, "health_fail_streak", 0) or 0),
                               "ts": round(getattr(f, "t", 0.0) or 0.0, 3) if f is not None else None}
         out["groups"] = health
+        w = self.__dict__.get("_ipc_writer")
+        out["ipc"] = {"queue": w.depth() if w else 0, "max": w.maxlen if w else None,
+                      "dropped": w.dropped if w else 0, "failed": w.failed if w else 0}
         return out
 
     def _ipc_note_served(self, group: str, prompt: int, cached: int, completion: int) -> None:

@@ -138,6 +138,56 @@ def flip_done_payload(rec: dict, flip_begin_ts: float) -> dict:
     return out
 
 
+#: the front's IPC queue bound (27B review of b02cec1ad5): a writer blocked on the
+#: disk or on the state lock must never make the front pile up anon RAM.
+IPC_QUEUE_MAX = 1024
+
+
+class BoundedWriter:
+    """ONE writer thread over a BOUNDED FIFO. On overflow the OLDEST entry is
+    dropped and counted (``dropped``) -- a newer record supersedes it for the
+    dashboard, and the front never waits here. A failed write is counted
+    (``failed``) and handed to ``on_error``, never raised into the front."""
+
+    def __init__(self, maxlen: int = IPC_QUEUE_MAX, name: str = "weg2-ipc", on_error=None) -> None:
+        import collections
+        import threading
+
+        self.maxlen = int(maxlen)
+        self.dropped = 0
+        self.failed = 0
+        self._q = collections.deque()
+        self._cv = threading.Condition()
+        self._on_error = on_error
+        self._t = threading.Thread(target=self._run, name=name, daemon=True)
+        self._t.start()
+
+    def depth(self) -> int:
+        with self._cv:
+            return len(self._q)
+
+    def submit(self, fn, *args) -> None:
+        with self._cv:
+            if len(self._q) >= self.maxlen:
+                self._q.popleft()
+                self.dropped += 1
+            self._q.append((fn, args))
+            self._cv.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._q:
+                    self._cv.wait()
+                fn, args = self._q.popleft()
+            try:
+                fn(*args)
+            except Exception as e:  # noqa: BLE001 -- a lost record never stops the front
+                self.failed += 1
+                if self._on_error is not None:
+                    self._on_error(fn, e)
+
+
 class FirstWorkClock:
     """Flip time from ONE clock (time.time() of the front's own process): the flip's
     begin stamp and the woken group's first work are both taken here.

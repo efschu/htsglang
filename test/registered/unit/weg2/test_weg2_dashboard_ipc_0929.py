@@ -211,7 +211,60 @@ class TestFrontWrites(CustomTestCase):
         f = _front()
         with mock.patch.dict(os.environ, {"WEG2_STATE_DIR": ""}):
             asyncio.run(asyncio.wait_for(f.ipc_front_writer(period_s=0.01), 1.0))
-        self.assertIsNone(f.__dict__.get("_ipc_pool"))
+        self.assertIsNone(f.__dict__.get("_ipc_writer"))
+
+
+class TestBoundedQueue(CustomTestCase):
+    """27B review of b02cec1ad5: a writer blocked on the disk or the state lock
+    must not make the front pile up anon RAM (host-RAM creep hunt, 29.09.).
+    RED on b02cec1ad5: an unbounded ThreadPoolExecutor queue, no BoundedWriter."""
+
+    def test_blocked_writer_keeps_the_queue_at_the_bound_and_counts_drops(self):
+        import threading
+
+        gate, started, done = threading.Event(), threading.Event(), []
+
+        def blocked(i):
+            started.set()
+            gate.wait(10)
+            done.append(i)
+
+        w = fsi.BoundedWriter(maxlen=16, name="weg2-ipc-test")
+        w.submit(blocked, -1)
+        self.assertTrue(started.wait(5))  # the writer thread now hangs in entry -1
+        for i in range(1000):
+            w.submit(blocked, i)
+            self.assertLessEqual(w.depth(), 16)
+        self.assertEqual((w.depth(), w.dropped), (16, 1000 - 16))
+        gate.set()
+        deadline = time.time() + 5
+        while time.time() < deadline and len(done) < 17:
+            time.sleep(0.01)
+        # the newest 16 survive, oldest first
+        self.assertEqual(done, [-1] + list(range(1000 - 16, 1000)))
+
+    def test_front_uses_the_bound_and_reports_it_in_front_fields(self):
+        import threading
+
+        self.assertEqual(fsi.IPC_QUEUE_MAX, 1024)
+        f = _front()
+        gate = threading.Event()
+        f._ipc_submit(gate.wait, 10)
+        for _ in range(fsi.IPC_QUEUE_MAX + 50):
+            f._ipc_submit(lambda: None)
+        ipc = f._ipc_front_fields()["ipc"]
+        gate.set()
+        self.assertEqual(ipc["max"], fsi.IPC_QUEUE_MAX)
+        self.assertLessEqual(ipc["queue"], fsi.IPC_QUEUE_MAX)
+        self.assertGreaterEqual(ipc["dropped"], 50)
+
+    def test_failed_write_is_counted_not_raised(self):
+        w = fsi.BoundedWriter(maxlen=4, name="weg2-ipc-test")
+        w.submit(lambda: 1 / 0)
+        deadline = time.time() + 3
+        while time.time() < deadline and w.failed < 1:
+            time.sleep(0.01)
+        self.assertEqual(w.failed, 1)
 
 
 class TestLauncherForm(CustomTestCase):
