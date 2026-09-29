@@ -95,6 +95,38 @@ def enter_capture_group_barrier(model_runner: ModelRunner) -> bool:
     return True
 
 
+def role_dummy_forward(mr, input_ids, forward_batch, kwargs):
+    """The warmup / autotune dummy forward, dispatched by rank ROLE like
+    ``ModelRunner._forward_raw`` dispatches a real one.
+
+    A rank-stripped role holds no model to run: the weightless KV worker
+    (lane, Form B's KV-only rank) holds a META model, the Form A worker only
+    experts and a router. Their real forward is the role's own route
+    (``_forward_weightless_worker`` / ``_forward_form_a_worker``), which issues
+    the same per-layer collectives the heads issue from ``model.forward`` -- so
+    the dummy pairs up exactly as a served batch does. nvfp4lane 09291648
+    (a3_formb, a74de9c84a): the FlashInfer autotune dummy forward called
+    ``mr.model.forward`` on KV-only rank 2 and died in the first layernorm,
+    "Expected a cuda device, but got: meta". Every other role: model.forward,
+    byte-identical."""
+    if getattr(mr, "is_weightless_head", False) or getattr(mr, "is_weightless_worker", False):
+        # the same per-forward step reset _forward_raw does on BOTH sides, so the
+        # DCP guard's step counters of head and worker stay aligned
+        from sglang.srt.layers.dcp.collective_guard import reset_forward_guard
+
+        reset_forward_guard()
+    if getattr(mr, "is_weightless_worker", False):
+        return mr._forward_weightless_worker(forward_batch)
+    if getattr(mr, "is_form_a_worker", False):
+        return mr._forward_form_a_worker(forward_batch)
+    return mr.model.forward(
+        input_ids,
+        forward_batch.positions,
+        forward_batch,
+        **kwargs,
+    )
+
+
 def runs_target_verify(model_runner) -> bool:
     """Does THIS runner ever run a TARGET_VERIFY forward?
 
@@ -643,13 +675,7 @@ class BaseRunner(ABC):
             if not mr.is_generation:
                 kwargs["get_embedding"] = True
 
-            logits_output_or_pp_proxy_tensors = mr.model.forward(
-                input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
-            return logits_output_or_pp_proxy_tensors
+            return role_dummy_forward(mr, input_ids, forward_batch, kwargs)
 
         torch.get_device_module(mr.device).synchronize()
         enter_capture_group_barrier(mr)
