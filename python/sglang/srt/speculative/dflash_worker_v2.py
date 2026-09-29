@@ -181,6 +181,16 @@ class _DflashDraftSampler:
         self.out[: tokens.shape[0]].copy_(tokens)
 
 
+def _solo_src_in(group, solo_tp_rank: int) -> int:
+    """The solo draft rank (a TP-group rank) as a rank IN ``group``. Classic
+    (group IS the TP group) that is ``solo_tp_rank`` itself; under Form B the
+    model tp group W, where the lead may sit at another index."""
+    tp = get_tp_group()
+    if group is tp:
+        return int(solo_tp_rank)
+    return list(group.ranks).index(tp.ranks[int(solo_tp_rank)])
+
+
 def _model_tp_group():
     """F6 2b: the group the draft's vocab shards live on -- Form B's model_tp
     (weight ranks W) when a partition is installed, else THIS module's
@@ -1000,7 +1010,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         deadlock the round.
         """
         buf = self._solo_hidden_broadcast_buf(num_tokens)
-        tp_group = get_tp_group()
+        # F15 (3): the hidden feeds the VOCAB-PARALLEL head, whose shards live
+        # on the model tp group -- Form B's weight ranks W (a KV-only rank sits
+        # alone there and skips: it holds no lm_head shard). Classic: the TP
+        # group and the solo rank, exactly as before.
+        tp_group = _model_tp_group()
         if tp_group.world_size == 1 or num_tokens == 0:
             # Nothing to publish (or nobody to publish to). num_tokens is
             # rank-uniform, so skipping stays symmetric.
@@ -1017,7 +1031,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Host: stage into the rank-uniform buffer (this is also the cast
             # to the lm_head weight dtype the greedy matmul would do anyway).
             buf.copy_(hidden_states)
-        capture_safe_tp_broadcast(tp_group, (buf,), src=self._spec_solo_rank)
+        capture_safe_tp_broadcast(tp_group, (buf,), src=_solo_src_in(tp_group, self._spec_solo_rank))
         return buf
 
     def _solo_broadcast_selector_sample(self, bs: int, sampling_info) -> None:
@@ -1029,7 +1043,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling params are the same batch on every rank."""
         if _is_all_greedy(sampling_info):
             return
-        tp_group = get_tp_group()
+        # F15 (3): the selector sample goes where the verify's accept scatter
+        # runs over the vocab shards -- the model tp group (Form B: W; a
+        # KV-only rank alone, skips). Classic: the TP group, as before.
+        tp_group = _model_tp_group()
         if tp_group.world_size == 1:
             return
         gamma = int(self.block_size) - 1
@@ -1047,7 +1064,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             dev = self.device
             cand = torch.empty((bs, gamma, top_k), dtype=torch.int64, device=dev)
             q = torch.empty((bs, gamma, top_k), dtype=torch.float32, device=dev)
-        capture_safe_tp_broadcast(tp_group, (cand, q), src=self._spec_solo_rank)
+        capture_safe_tp_broadcast(tp_group, (cand, q), src=_solo_src_in(tp_group, self._spec_solo_rank))
         self._selector_sample = (cand, q)
 
     def _solo_broadcast_draft_block(self, draft_tokens: torch.Tensor) -> None:

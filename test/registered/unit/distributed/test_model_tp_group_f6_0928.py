@@ -67,6 +67,18 @@ def _run(rank, port, out, partition):
         except FormBCollectiveWrongGroup:
             return "refused"
 
+    # F15 (3): the DFLASH solo draft-hidden broadcast runs on model_tp (W),
+    # a KV-only rank skips it (alone in its group)
+    import types as _t
+
+    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2 as _DW
+
+    stub = _t.SimpleNamespace(_solo_hs_buf=None, _solo_hs_cap=0, _solo_hidden_dim=4,
+                              _solo_hs_dtype=torch.float32, device="cpu", _spec_solo_rank=0)
+    stub._solo_hidden_broadcast_buf = lambda n: _DW._solo_hidden_broadcast_buf(stub, n)
+    hs = torch.full((2, 4), 7.0) if rank == 0 else None
+    dh = _DW._solo_broadcast_draft_hidden(stub, 2, hs)
+    res["draft_hidden"] = dh.tolist() if rank != 2 or partition is None else "skipped"
     # F15 (2): the KV-only predicate's Form B source (share 0 = outside W)
     from sglang.srt import rank_role as _rr
 
@@ -122,6 +134,8 @@ def test_model_tp_is_the_weight_ranks_and_tp_stays_everyone():
     assert res[0]["op_ag"] == res[1]["op_ag"] == [1.0, 1.0, 2.0, 2.0]
     assert res[2]["op_ag"] == [3.0, 3.0]
     assert [res[r]["form_b_kv"] for r in range(3)] == [False, False, True]
+    assert res[0]["draft_hidden"] == res[1]["draft_hidden"] == [[7.0] * 4] * 2
+    assert res[2]["draft_hidden"] == "skipped"
     for r in range(3):
         assert res[r]["moe_tp_ranks"] == [0, 1, 2]                 # NF answer 2
         assert res[r]["moe_on_mtp"] is True                         # refused by name
@@ -140,6 +154,7 @@ def test_without_a_partition_model_tp_is_the_tp_group():
         assert res[r]["op_ar"] == [6.0, 6.0]                   # byte-identical: the TP group
         assert set(res[r]["guard"].values()) == {"ok"}         # 3: no-op without Form B
         assert res[r]["form_b_kv"] is False
+        assert res[r]["draft_hidden"] == [[7.0] * 4] * 2          # classic: the TP group
 
 
 def test_a_partition_must_cover_every_rank_once():
