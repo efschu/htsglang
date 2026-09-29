@@ -140,6 +140,18 @@ def page_floor(pos: int, page_size: int) -> int:
     return int(pos) // int(page_size) * int(page_size)
 
 
+def reader_claim_end(n_tokens: int, page_size: int, bigram: bool) -> int:
+    """CLAIM ANCHOR (0929): the deepest page boundary a store reader of an
+    N-token prompt asks for -- the upstream match leaves one token to forward
+    (``_compute_max_prefix_len`` = N-1 raw tokens) and a bigram key of r raw
+    tokens holds r-1 units, both floored to the page: floor_page(N-1), or
+    floor_page(N-2) under bigram keys. A recurrent anchor deeper than this is
+    never reached by that reader (dynpf 0929, weg2-24-38: anchor at 16448,
+    claim 16384, read capped at the 8192 chunk anchor)."""
+    units = int(n_tokens) - 1 - (1 if bigram else 0)
+    return page_floor(max(0, units), max(1, int(page_size or 1)))
+
+
 #: F4 (#259 4c): the part name prefix of a D-park END part ("dpark<tp>-<pid>").
 PARK_PART = "dpark"
 

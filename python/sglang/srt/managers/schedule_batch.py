@@ -173,6 +173,44 @@ def _weg2_fork_track(req, prefix_len: int, end: int, chunk: int,
     return t
 
 
+def _weg2_claim_track(req, tree_cache, prefix_len: int, end: int, chunk: int,
+                      default_aligned: int) -> Optional[int]:
+    """CLAIM ANCHOR (dynpf 0929, weg2-24-38): group P's extend track for the
+    step that crosses the deepest page its store reader claims, or None = keep
+    the default. The default lands on the step's last grid point, floor_page(N)
+    for the step reaching the end -- one page past a bigram reader's claim
+    floor_page(N-2) whenever N % page is 0 or 1, so the read fell back to the
+    previous chunk anchor (``#1028B FETCH CAP kv=256 claimed=128``, by=mamba).
+    Only on the NF keying (bigram, node units == tokens the state consumed) and
+    a paged tree; a P-trim request keeps its own N-1 geometry."""
+    import os as _os
+
+    from sglang.srt.weg2 import fork_anchor as _fa
+    from sglang.srt.weg2 import tail_handoff as _th
+    from sglang.srt.weg2.p_trim_end_anchor import TRIM_ATTR as _TRIM
+
+    if (_os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() != "P" or tree_cache is None:
+        return None
+    page = int(getattr(tree_cache, "page_size", 1) or 1)
+    if page <= 1 or not getattr(tree_cache, "bigram_anchor_exact", False):
+        return None
+    if getattr(req, _TRIM, None) is not None:
+        return None
+    claim = _th.reader_claim_end(len(req.origin_input_ids), page, True)
+    t = _fa.track_target(prefix_len, end, claim, chunk, default_aligned)
+    if t is not None:
+        n = globals().get("_WEG2_CLAIM_TRACK_N", 0) + 1
+        globals()["_WEG2_CLAIM_TRACK_N"] = n
+        if n & (n - 1) == 0:
+            logger.info(
+                "WEG2 CLAIM-ANCHOR TRACK n=%d rid=%s step=[%d,%d) anchor %d -> %d "
+                "(the deepest page a bigram reader of N=%d claims; chunk grid %d)",
+                n, str(getattr(req, "rid", "?"))[:16], prefix_len, end,
+                default_aligned, t, len(req.origin_input_ids), chunk,
+            )
+    return t
+
+
 #: #1036: per-callsite census of admitted-prefix demotions. site -> count.
 _1036_PREFIX_DEMOTIONS: Dict[str, int] = {}
 
@@ -4172,6 +4210,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # chunk in absolute terms (78886 + 15*64 on 26-66).
                     mamba_track_seqlen = _fork_t + 1
                     mamba_track_seqlen_aligned = _fork_t
+
+            # CLAIM ANCHOR (group P): the step crossing the store reader's
+            # deepest claim tracks AT it -- a mid-step grid point, the same +1
+            # as the fork track above.
+            _claim_t = _weg2_claim_track(
+                req, getattr(self, "tree_cache", None), len(req.prefix_indices),
+                len(req.prefix_indices) + req.extend_range.length,
+                mamba_cache_chunk_size, mamba_track_seqlen_aligned,
+            )
+            if _claim_t is not None:
+                mamba_track_seqlen = _claim_t + 1
+                mamba_track_seqlen_aligned = _claim_t
 
             # In lazy mode, skip the swap — the second ping-pong slot is not
             # allocated yet; it will be allocated on demand at the track boundary
