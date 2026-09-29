@@ -1977,8 +1977,40 @@ def global_demand(sched) -> Tuple[int, int, frozenset]:
                 sum(_req_tokens(r) for r in extra))
     used = sum(_req_tokens(r) for r in running)
     queue = getattr(sched, "waiting_queue", None) or ()
-    incoming = _req_tokens(queue[0]) if len(queue) else 0
+    incoming = sum(_req_tokens(r) for r in _admissible_queue(queue, _cap_of(sched) - len(running)))
     return used, incoming, frozenset(getattr(r, "rid", id(r)) for r in running)
+
+
+#: y3j 09291933: the admission gate a grown stage re-opened
+REOPEN_MARK = "WEG2 D-MEM-SCHED ADMIT-REOPEN"
+_REOPEN_N = [0]
+
+
+def _reopen_admission(sched) -> None:
+    """A grown (or cap-lifted) stage has room the last admission did not
+    see: its NO_TOKEN set ``batch_is_full``, and upstream clears that only
+    when a request finishes -- a whole decode later (y3j: 6 s per request
+    after the wake, 32k bs4). The grow is the event that frees the room, so
+    it re-opens the gate; the admission in this same iteration re-asks."""
+    rb = getattr(sched, "running_batch", None)
+    if rb is None or not getattr(rb, "batch_is_full", False):
+        return
+    rb.batch_is_full = False
+    _REOPEN_N[0] += 1
+    n = _REOPEN_N[0]
+    if n <= 20 or n % 200 == 0:
+        queue = getattr(sched, "waiting_queue", None) or ()
+        logger.info("%s n=%d queue=%d -- the stage grew: the batch-full gate of the last "
+                    "NO_TOKEN no longer holds", REOPEN_MARK, n, len(queue))
+
+
+def _admissible_queue(queue, free_seats: int) -> list:
+    """The queued requests the next admission can take: one per free seat,
+    at least the head. y3j 09291933 (bs4 x 32k after the wake): with only the
+    head as ``incoming`` the stage grew by ONE request per NO_TOKEN, and the
+    batch-full gate held the next one until a whole decode had ended -- the
+    four first tokens came 6 s apart (flip time 19-26 s for the last)."""
+    return list(queue[: max(1, int(free_seats))]) if len(queue) else []
 
 
 def _air(sched) -> int:
@@ -2118,6 +2150,8 @@ def runtime_tick(sched):
             if want is None:
                 want = ms.stage
             _engage_kv_cap(alloc, tokens[want], page)
+            if lifted:
+                _reopen_admission(sched)
             logger.info(
                 "%s pending=S%s stage=S%d cap=%d used=%d incoming=%d need=%d lifted=%s -- %s",
                 CAP_LIFT_MARK, "-" if ms.pending is None else ms.pending, ms.stage,
@@ -2149,6 +2183,8 @@ def runtime_tick(sched):
     ctl = controller(sched)
     applied = ctl.apply_stage(n, ms.stage) if (ctl is not None and ctl.cells) else None
     st.stage, st.stage_tokens = ms.stage, tokens[ms.stage]
+    if ms.stage > before:
+        _reopen_admission(sched)
     logger.info("%s from=S%d to=S%d used=%d incoming=%d ended=%s floor=%d -- %s%s", ms.line(),
                 before, ms.stage, used, incoming, "yes" if ended else "no", floor, step.reason,
                 "" if ctl is None else (" evicted_rows=%d refilled_rows=%d sync_ms=%.1f "
