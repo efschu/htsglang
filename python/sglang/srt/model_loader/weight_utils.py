@@ -1804,9 +1804,11 @@ def _resident_bytes(fd: int, offset: int, length: int) -> int:
 
 
 def _shared_cache_after_read(fd: int, offset: int, length: int, mode: str,
-                             counters) -> None:
+                             counters, path: str = "") -> None:
     """keep: leave the range cached for the next group, up to the budget;
-    drop: this group is the last reader -- hand the pages back now."""
+    drop: this group is the last reader -- hand the pages back now.
+    A kept range is recorded (path, offset, length) for the launcher's release
+    after D is ready (weg2/shared_cache_release.py)."""
     from sglang.srt.environ import envs
 
     advice = None
@@ -1815,6 +1817,7 @@ def _shared_cache_after_read(fd: int, offset: int, length: int, mode: str,
             cap = max(0, int(envs.SGLANG_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB.get() or 0)) << 20
             if counters["shared_kept_bytes"] + length <= cap:
                 counters["shared_kept_bytes"] += length
+                counters.setdefault("shared_kept_ranges", []).append((path, offset, length))
             else:
                 counters["shared_over_budget_bytes"] += length
                 advice = "dontneed"
@@ -1826,6 +1829,27 @@ def _shared_cache_after_read(fd: int, offset: int, length: int, mode: str,
             os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
         except OSError:
             pass
+
+
+def _write_shared_cache_manifest(counters) -> None:
+    """keep: the ranges this stream left in the page cache, for the launcher's
+    release after D is ready. No manifest directory (launched outside the weg2
+    launcher) = nothing written; a failed write is logged, never a load error."""
+    from sglang.srt.environ import envs
+    from sglang.srt.weg2 import shared_cache_release as _scr
+
+    d = envs.SGLANG_WEIGHT_LOADER_SHARED_CACHE_MANIFEST.get() or ""
+    if not d:
+        return
+    try:
+        path = _scr.write_keep_manifest(d, counters["shared_kept_ranges"],
+                                        counters["shared_kept_bytes"])
+        logger.info("%s SHARED-CACHE manifest %s ranges=%d kept_mib=%.0f", COALESCE_MARKER,
+                    path, len(counters["shared_kept_ranges"]),
+                    counters["shared_kept_bytes"] / 2**20)
+    except OSError as e:
+        logger.warning("%s SHARED-CACHE manifest NOT written (%s): the kept ranges "
+                       "stay until the kernel reclaims them", COALESCE_MARKER, e)
 
 
 def _read_run(run: "_Run", direct_io: bool, post_load, counters) -> dict:
@@ -1866,7 +1890,7 @@ def _read_run(run: "_Run", direct_io: bool, post_load, counters) -> dict:
                 raise IOError(f"short read in {run.path} at {a + got}: need {need - got} more")
             got += n
         if share:
-            _shared_cache_after_read(fd, a, need, share, counters)
+            _shared_cache_after_read(fd, a, need, share, counters, path=run.path)
         src = torch.frombuffer(buf, dtype=torch.uint8)
         out = {}
         for i in run.items:
@@ -1962,6 +1986,8 @@ def _coalesced_stream(hf_weights_files, should_load, post_load, direct_io, st, l
         st.sample_anon(force=True)
         st.direct_readers = counters["direct"]
         st.buffered_readers = counters["buffered"]
+        if share_mode == "keep" and counters.get("shared_kept_ranges"):
+            _write_shared_cache_manifest(counters)
         if log:
             gbs = counters["read_bytes"] / st.seconds / 1e9 if st.seconds > 0 else 0.0
             logger.info(
