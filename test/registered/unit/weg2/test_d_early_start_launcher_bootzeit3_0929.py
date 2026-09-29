@@ -74,12 +74,26 @@ def test_refuse_writes_the_gate_then_sweeps_the_group_and_restores_ns():
 # --- 27B review of cb98c3d94a: W185 and stage 0 ---
 
 
-def test_w185_refuses_on_for_the_27b_and_passes_next_flash():
-    with pytest.raises(L.Weg2DEarlyStartUnreviewed, match="W185"):
-        L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile=None))
-    with pytest.raises(L.Weg2DEarlyStartUnreviewed):
-        L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile="qwen27b"))
+def _legacy_27b_row():
+    import dataclasses
+    from unittest import mock
+
+    from sglang.srt.weg2 import form as F
+
+    row = dataclasses.replace(F.PROFILES["qwen27b"], d_expect_from_p_records=False)
+    return mock.patch.dict(F.PROFILES, {"qwen27b": row})
+
+
+def test_w185_refuses_on_where_the_expectation_is_legacy_and_passes_next_flash():
+    # 29.09. (step 1): W185 keys on d_expect_from_p_records; the 27B row set
+    # it, so W185 is exercised on a legacy row (what the 27B row was)
+    with _legacy_27b_row():
+        with pytest.raises(L.Weg2DEarlyStartUnreviewed, match="W185"):
+            L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile=None))
+        with pytest.raises(L.Weg2DEarlyStartUnreviewed):
+            L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile="qwen27b"))
     L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile="nextflash"))
+    L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile="qwen27b"))
     L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="off", profile=None))
 
 
@@ -162,5 +176,7 @@ def test_w185_refuses_only_an_explicit_on_never_auto():
     L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="auto", profile="qwen27b"))
     L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="auto", profile=None))
     L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="auto", profile="nextflash"))
-    with pytest.raises(L.Weg2DEarlyStartUnreviewed):
-        L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile="qwen27b"))
+    with _legacy_27b_row():
+        L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="auto", profile="qwen27b"))
+        with pytest.raises(L.Weg2DEarlyStartUnreviewed):
+            L.refuse_d_early_start_unreviewed(argparse.Namespace(weg2_d_early_start="on", profile="qwen27b"))

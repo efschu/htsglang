@@ -11,8 +11,12 @@ is solved in that pass and pinned into the Platztausch map; the real pass
 could not raise it later, so 540-960 MiB per card stayed free all run.
 
 DANGER DIRECTIONS this file guards (27B review 29.09.):
-* the 27B line is byte-identical AND never reads the sidecar -- a broken or
-  foreign sidecar cannot touch a 27B boot (the reader sits behind the gate);
+* a profile whose row keeps the legacy expectation (registry
+  ``d_expect_from_p_records`` False) is byte-identical AND never reads the
+  sidecar -- a broken or foreign sidecar cannot touch it (the reader sits
+  behind the gate). The 27B row switched on 29.09. (early D start step 1,
+  test_weg2_d_early_start_27b_records_0929); a broken sidecar prices it
+  legacy (UNMEASURED), never an exception;
 * no record, a record of another weight form or a record missing a card:
   skipped by name, never a partial dictionary; none left: legacy, UNMEASURED;
 * the maximum over the newest N boots, not the newest one -- a lucky low
@@ -27,6 +31,7 @@ DANGER DIRECTIONS this file guards (27B review 29.09.):
 Hermetic: no NVML, no boot, no GPU.
 """
 import ast
+import dataclasses
 import inspect
 import json
 import os
@@ -36,6 +41,7 @@ from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
+from sglang.srt.weg2 import form as weg2_form
 from sglang.srt.weg2 import host_ledger
 from sglang.srt.weg2 import launcher
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -78,6 +84,13 @@ def _prec(tag="09290548", at="2026-09-29T05:53:05Z", form=XCHG, vals=None):
             "vram_residue_mib": dict(P_MEASURED if vals is None else vals)}
 
 
+def _legacy_row(profile="qwen27b"):
+    """``profile``'s registry row with the legacy expectation (what the 27B
+    row was until 29.09.)."""
+    row = dataclasses.replace(weg2_form.PROFILES[profile], d_expect_from_p_records=False)
+    return mock.patch.dict(weg2_form.PROFILES, {profile: row})
+
+
 def _series(rows=SERIES):
     return [_prec(t, at, vals={BIG: b, S0: s0, S2: s2}) for t, at, b, s0, s2 in rows]
 
@@ -98,11 +111,18 @@ class DExpectDormantOther(CustomTestCase):
         # the z30r3 gap this frees, per card
         self.assertEqual({u: LEGACY[u] - got[u] for u in got}, {BIG: 766, S0: 506, S2: 920})
 
-    def test_27b_is_byte_identical(self):
+    def test_a_legacy_row_is_byte_identical(self):
+        with _legacy_row():
+            for prof in (None, "qwen27b"):
+                got, why = launcher.d_expect_dormant_other(CARDS, DC_EXPECT_D, [_prec()], XCHG,
+                                                           prof)
+                self.assertEqual(got, LEGACY)
+                self.assertIn("legacy", why)
+
+    def test_27b_prices_the_record_since_0929(self):
         for prof in (None, "qwen27b"):
-            got, why = launcher.d_expect_dormant_other(CARDS, DC_EXPECT_D, [_prec()], XCHG, prof)
-            self.assertEqual(got, LEGACY)
-            self.assertIn("legacy", why)
+            got, _ = launcher.d_expect_dormant_other(CARDS, DC_EXPECT_D, [_prec()], XCHG, prof)
+            self.assertEqual(got, P_MEASURED)
 
     def test_no_record_is_named_legacy(self):
         for recs in (None, []):
@@ -165,15 +185,19 @@ class MaximumOverTheNewestBoots(CustomTestCase):
 
 
 class TheReaderSitsBehindTheGate(CustomTestCase):
-    """27B review (1): the 27B path never reads the sidecar."""
+    """27B review (1): a legacy-expectation row never reads the sidecar."""
 
-    def test_27b_does_not_read(self):
-        with mock.patch.object(host_ledger, "read_measured_records",
-                               side_effect=AssertionError("27B read the sidecar")):
+    def test_legacy_row_does_not_read(self):
+        with _legacy_row(), mock.patch.object(
+                host_ledger, "read_measured_records",
+                side_effect=AssertionError("a legacy row read the sidecar")):
             for prof in (None, "qwen27b"):
                 self.assertIsNone(launcher.p_dormant_records(prof, lambda e: True))
+        with mock.patch.object(host_ledger, "read_measured_records",
+                               side_effect=AssertionError("read without identity")):
             # no calibration identity: no read either
             self.assertIsNone(launcher.p_dormant_records(NF, None))
+            self.assertIsNone(launcher.p_dormant_records("qwen27b", None))
 
     def test_broken_sidecar_on_27b_is_byte_identical_and_on_nf_unmeasured(self):
         import tempfile

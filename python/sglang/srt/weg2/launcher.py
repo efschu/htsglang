@@ -477,12 +477,13 @@ def p_dormant_records(profile: Optional[str],
                       ) -> Optional[List[Dict[str, object]]]:
     """The group-P dormant-image records the D expectation may price from --
     READ ONLY where they are used. ``None`` without reading on every profile
-    whose expectation stays the legacy term (the 27B: a broken or foreign
-    sidecar must not touch a boot that never uses the value -- 27B review,
-    'Riegel hinter dem, was er sichert') and without a calibration identity
-    (no identity = no foreign model's record). A malformed sidecar reads as
-    ``[]`` (UNMEASURED), never as an exception."""
-    if not xchg_census_is_reserve(profile) or accept is None:
+    whose expectation stays the legacy term (``d_expect_from_p_records``
+    False: a broken or foreign sidecar must not touch a boot that never uses
+    the value -- 27B review, 'Riegel hinter dem, was er sichert') and without
+    a calibration identity (no identity = no foreign model's record). A
+    malformed sidecar reads as ``[]`` (UNMEASURED), never as an exception.
+    Since 29.09. the 27B reads them too (its row switched the expectation)."""
+    if not d_expect_from_p_records(profile) or accept is None:
         return None
     return host_ledger.read_measured_records(measured_record_path(), "P", accept=accept)
 
@@ -615,10 +616,13 @@ def d_expect_dormant_other(
     the real pass could not raise it any more (the map is built from it), so
     the gap sat free all run.
 
-    Next Flash (``xchg_census_is_reserve``) with same-checkpoint group-P
+    A profile whose row sets ``d_expect_from_p_records`` (Next Flash; the
+    27B since 29.09. -- its legacy term booked ~2.1 GiB on the 5090 against
+    a measured P residue of 1104-1240 MiB) with same-identity group-P
     records: the maximum of P's measured residue over the newest
     ``P_DORMANT_EXPECT_N`` boots (:func:`p_dormant_from_records`). Anything
-    else: the legacy term, with the reason named.
+    else: the legacy term, with the reason named. The switch is its own
+    registry field, not ``d_residue_census`` (the reserve question).
     ``SGLANG_WEG2_D_EXPECT_P_RECORD=0`` forces the legacy term.
 
     DANGER DIRECTION (P holds more after serving than the records say): the
@@ -628,7 +632,7 @@ def d_expect_dormant_other(
     still does not fit is refused by name (W122 ``Weg2LaunchRefused``), never
     started into an OOM. ``D-EXPECT CHECK`` names each card's difference."""
     legacy = {c.uuid: int(dc_expect_d[c.uuid]) + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}
-    if not xchg_census_is_reserve(profile):
+    if not d_expect_from_p_records(profile):
         return legacy, "legacy (profile's dormant_other is D's reserve + windows)"
     if os.environ.get(P_DORMANT_EXPECT_ENV, "1").strip() == "0":
         return legacy, f"legacy ({P_DORMANT_EXPECT_ENV}=0)"
@@ -13085,29 +13089,39 @@ def _d_early_start_armed(ns) -> bool:
     """BOOTZEIT 3: the one resolution of ``--weg2-d-early-start``.
 
     'auto' (the default since the series 29.09., dearly z30x2) is on for the
-    profiles W185 reviewed (Next Flash: ``xchg_census_is_reserve``) and off for
-    every other one, so the 27B line boots serial exactly as before."""
+    profiles whose row carries a metal proof (``d_early_start_proven``: Next
+    Flash) and off for every other one, so the 27B line boots serial exactly
+    as before until its own proof boot ran with an explicit 'on'."""
     mode = str(getattr(ns, "weg2_d_early_start", "off") or "off")
     if mode == "auto":
-        return xchg_census_is_reserve(getattr(ns, "profile", None))
+        return d_early_start_proven(getattr(ns, "profile", None))
     return mode == "on"
 
 
 class Weg2DEarlyStartUnreviewed(Weg2LaunchRefused):
-    """W185: the early D start is reviewed for Next Flash only (27B review of
-    cb98c3d94a); another profile's readers of the D plan between P's launch
-    and step 5 were not audited with it on."""
+    """W185: an explicit early D start on a profile whose D expectation is
+    still the legacy term (``d_expect_from_p_records`` False): D would be
+    planned from D's own reserve standing in for P's residue (NF z30r3:
+    540-960 MiB per card short; 27B: ~1 GiB on the 5090), and the gate only
+    checks planned <= measured, it never re-solves D."""
 
 
 def refuse_d_early_start_unreviewed(ns) -> None:
-    """W185, called before group P starts: a named refusal, never a silent off."""
+    """W185, called before group P starts: a named refusal, never a silent off.
+
+    27B (29.09.): with ``d_expect_from_p_records`` the 27B plans the early D
+    from P's records, so an explicit 'on' boots (the proof boot); 'auto'
+    stays off there until ``d_early_start_proven``. The 27B review's reader
+    concern (ns.env_d/_d_owner_solve between launch_group(P) and #5) holds on
+    this tree without a reader: only the early branch itself and the
+    refusal's restore touch them in that window."""
     if (str(getattr(ns, "weg2_d_early_start", "off")) == "on"
-            and not xchg_census_is_reserve(ns.profile)):
+            and not d_expect_from_p_records(ns.profile)):
         raise Weg2DEarlyStartUnreviewed(
             f"W185 Weg2DEarlyStartUnreviewed: --weg2-d-early-start on with profile "
-            f"{ns.profile or weg2_form.DEFAULT_PROFILE!r}; reviewed for Next Flash only (27B review "
-            f"29.09.: its readers of ns.env_d/_d_owner_solve between launch_group(P) and "
-            f"#5 are not audited with the switch on). Boot with 'off' (byte-identical).")
+            f"{ns.profile or weg2_form.DEFAULT_PROFILE!r}, whose D expectation is the legacy "
+            f"term (registry d_expect_from_p_records=False): the early D would be planned "
+            f"from D's own reserve, not P's measured residue. Boot with 'off' (byte-identical).")
 
 
 def _group_rank_count(argv: Sequence[str]) -> int:
@@ -20784,8 +20798,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--weg2-d-early-start", choices=("auto", "on", "off"), default="auto",
         help="BOOTZEIT 3 (29.09.): 'auto' (Default seit der Serie 29.09., dearly "
-             "z30x2: serving 205 statt 226 s) = an fuer Next Flash, aus fuer jedes "
-             "andere Profil (W185: nur NF geprueft). 'on' startet Gruppe D ZUSAMMEN mit P statt "
+             "z30x2: serving 205 statt 226 s) = an, wo die Registry einen "
+             "Metallbeleg traegt (d_early_start_proven: Next Flash), sonst aus "
+             "(27B bis zu seinem Beleg-Boot). 'on' erlaubt W185 auf jedem Profil "
+             "mit d_expect_from_p_records (NF, 27B). 'on' startet Gruppe D ZUSAMMEN mit P statt "
              "nach P-READY + sleep(P) + D-Plan (z30r3: D-Init 30 s, davor 8 s "
              "Schlaf+Plan). D plant aus den Erwartungs-Budgets (Planer-Sitz: "
              "Record statt DC_EXPECT) und wartet VOR seinem Gewichtsladen an "
@@ -23901,6 +23917,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
         log("D-EXPECT DORMANT-OTHER D(frueh, Erwartung): " + ", ".join(
             f"nvml{c.nvml_index} {_early_other[c.uuid]}" for c in cards) + f" MiB -- {_early_other_why}")
+        # the D-EXPECT CHECK after P's sleep compares against the plan D was
+        # started with; a map pass (NF) already published the same selector's
+        # value, the 27B runs none -- publish it here then (display only)
+        if (getattr(ns, "_d_expect_other", None) is None
+                and not _early_other_why.startswith("legacy")):
+            ns._d_expect_other = _early_other
         _early_stage0 = os.path.join(os.path.dirname(_early_gate), f"d_early_stage0_{ns.tag}.json")
         try:
             os.unlink(_early_stage0)
@@ -24456,6 +24478,26 @@ def xchg_census_is_reserve(profile: Optional[str]) -> bool:
     No/unknown profile = the launcher default (``--profile`` qwen27b)."""
     row = weg2_form.profile_row(profile or weg2_form.DEFAULT_PROFILE)
     return bool(getattr(row, "d_residue_census", False))
+
+
+def d_expect_from_p_records(profile: Optional[str]) -> bool:
+    """Does D's EXPECTATION budget (before P's first sleep) price P's measured
+    dormant residue from the records? The registry row decides
+    (``ModelProfile.d_expect_from_p_records``); independent of the reserve
+    question :func:`xchg_census_is_reserve` answers. No/unknown profile = the
+    launcher default (``--profile`` qwen27b)."""
+    row = weg2_form.profile_row(profile or weg2_form.DEFAULT_PROFILE)
+    return bool(getattr(row, "d_expect_from_p_records", False))
+
+
+def d_early_start_proven(profile: Optional[str]) -> bool:
+    """``--weg2-d-early-start auto`` = on for this profile: the registry row
+    carries a metal proof (``ModelProfile.d_early_start_proven``) AND prices
+    the early plan from P's records. No/unknown profile = the launcher
+    default (qwen27b)."""
+    row = weg2_form.profile_row(profile or weg2_form.DEFAULT_PROFILE)
+    return (bool(getattr(row, "d_early_start_proven", False))
+            and d_expect_from_p_records(profile))
 
 
 def xchg_form_dormant_reserve(

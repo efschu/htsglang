@@ -402,6 +402,26 @@ class ModelProfile:
     #: the 27B census (weg2xsn246: 1622 MiB on the 5090) is below every 27B D
     #: residue record (2074-2150 MiB), so taking it would under-reserve D.
     d_residue_census: bool = False
+    #: D-EXPECT (29.09.): group D's EXPECTATION budget (map pass, dry pass,
+    #: early D start -- all before P's first sleep) prices ``dormant_other``
+    #: from group P's MEASURED dormant residue (the per-card maximum over the
+    #: newest same-identity P records, ``launcher.p_dormant_from_records``)
+    #: instead of the legacy term ``dc_expect_d + P_WINDOWS_MIB - D_WINDOWS_MIB``
+    #: (D's own reserve standing in for P's). Its own switch, NOT
+    #: ``d_residue_census``: that one answers the RESERVE question (D's census
+    #: vs the weg2xsn14 constant), this one only which residue stands for P
+    #: before P has slept -- the real pass after P's sleep charges the
+    #: launcher's own reading of that same residue on both rows. 27B: the
+    #: legacy term booked ~2.1 GiB on the 5090 against a measured P residue of
+    #: 1104-1240 MiB (dkr27b 28./29.09.), i.e. an early D planned from it
+    #: would carry ~1 GiB less KV than the serial one.
+    d_expect_from_p_records: bool = False
+    #: BOOTZEIT 3: ``--weg2-d-early-start auto`` arms the early D start on this
+    #: profile. Only after a metal proof of the early start ON THIS PROFILE
+    #: (NF: dearly z30x2 424346f693, serving 205 s vs 226 s, needle MATCH,
+    #: 23c84bbe85). An explicit ``on`` needs only ``d_expect_from_p_records``
+    #: (W185), so the proof boot can be run.
+    d_early_start_proven: bool = False
     #: NF H92c: group P's mamba pool in the P pool model = the
     #: --max-mamba-cache-size P's argv states (what the runtime allocates),
     #: instead of the demand formula ceil(p_bs x 2 x 1.25). Operator rule
@@ -606,6 +626,11 @@ PROFILES: Dict[str, ModelProfile] = {
         prefill_transient_checkpoints=(),
         constants=_QWEN27B_CONSTANTS,
         d_residue_census=False,
+        # D-EXPECT for the 27B (29.09.): P's measured residue, not the legacy
+        # term; the early start stays off under 'auto' until a 27B metal boot
+        # with an explicit '--weg2-d-early-start on' proved it.
+        d_expect_from_p_records=True,
+        d_early_start_proven=False,
         # 27B park (user 26.09., memory d2p-sofort-flippen-und-x-exakt-0926:
         # "D->P nicht warten, sofort flippen, laufende Decodes parken"): ON since
         # the registry default (operator 28.09., after rc12z21 b1 stalled its
@@ -705,6 +730,10 @@ PROFILES: Dict[str, ModelProfile] = {
         prefill_transient_checkpoints=("Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",),
         constants=_NEXTFLASH_CONSTANTS,
         d_residue_census=True,
+        # D-EXPECT 9f74489683 (was keyed on d_residue_census) and BOOTZEIT 3
+        # proven on metal (dearly z30x2 424346f693, 23c84bbe85): auto = on.
+        d_expect_from_p_records=True,
+        d_early_start_proven=True,
         p_mamba_slots_from_argv=True,
         # User decision 26.09. ("Wartegrenze 0, sofort flippen + parken") holds for
         # BOTH models (operator 28.09.): the immediate park fires at once for a

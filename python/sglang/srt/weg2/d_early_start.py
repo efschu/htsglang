@@ -39,8 +39,9 @@ must not create a context before P is SIZED:
     AND no D process held VRAM on any card while it waited
     (:func:`stage0_verdict`), and records the event in state.json.
 
-Default auto (``--weg2-d-early-start``: on for Next Flash, off for every other
-profile); without the env vars nothing here runs.
+Default auto (``--weg2-d-early-start``: on where the registry row carries a metal
+proof, ``d_early_start_proven`` -- Next Flash; off for the 27B until its proof
+boot); without the env vars nothing here runs.
 """
 
 from __future__ import annotations
