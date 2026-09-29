@@ -134,3 +134,90 @@ class TestNf1dReplay(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+R27B_CENSUS = "/spinning/docker-acceptance/27b/evidence/host_census_record.json"
+MODEL_27B = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
+
+
+def _fixture(d: str, with_memts: bool, record_src: str = CENSUS) -> str:
+    """A tmp evidence dir: the real record (field stripped) + optionally the
+    real 09291559 memts CSV at the path the boot writes it to."""
+    import shutil
+
+    data = json.load(open(record_src))
+    for e in data.values():
+        for k in ("shm_total_max_gib", "shm_total_store_gib", "shm_total_arena_gib", "shm_total_source"):
+            e.pop(k, None)
+    rec = os.path.join(d, host_census.RECORD_NAME)
+    json.dump(data, open(rec, "w"), indent=1, sort_keys=True)
+    if with_memts:
+        os.makedirs(os.path.join(d, f"docker_{TAG_1559}"))
+        shutil.copy(MEMTS_1559, os.path.join(d, f"docker_{TAG_1559}", os.path.basename(MEMTS_1559)))
+    return rec
+
+
+@unittest.skipUnless(EVID and os.path.isdir(MODEL), "NF evidence/checkpoint absent")
+class TestLauncherBackfill(CustomTestCase):
+    """Operator 29.09. ~18:00Z: no hand-seeded record. The launcher rebuilds the
+    peak of the SUM from the key's own memts, writes it back with provenance and
+    prices with it; no memts -> today's refusing sum; 27B untouched."""
+
+    def _price(self, entry):
+        ref_ok, ref_why = weg2_form.reference_model_verdict(MODEL, host_ledger.REFERENCE_MODEL)
+        rec = host_ledger.read_measured_record(REC, boot_tag=TAG_1559)
+        ratchet = host_ledger.FlipRatchet(per_flip_gib=1.84, flips_priced=1,
+                                          source="09291559 FLIP", from_record=True)
+        return host_ledger.choose(
+            int(125.70 * GIB), int(99.11 * GIB), arms=[(1, 600)], s_gb_d=4,
+            ring_absent_by_design=True, cg_current_bytes=int(1.26 * GIB),
+            reclaimable_bytes=int(0.39 * GIB), cg_ceiling_bytes=84 * GIB, measured_record=rec,
+            flip_ratchet=ratchet, arena_gib=ARENA_PRICED, staging_gb=0.0494, anchor_mib=101,
+            d_draft_host_gib=1587 / 1024, l3_index_gib=0.10, cold_tier_shm_gib=STORE_WRITTEN,
+            census=host_census.ledger_terms(entry), reference_model_ok=ref_ok,
+            reference_model_why=ref_why, model_footprint=weg2_form.footprint_key(MODEL)[0] or "")
+
+    def test_backfill_from_memts_funds_and_is_written_back(self):
+        import tempfile
+
+        from sglang.srt.weg2 import launcher
+        key = next(iter(json.load(open(CENSUS))))
+        with tempfile.TemporaryDirectory() as d:
+            rec = _fixture(d, with_memts=True)
+            entry, line = launcher.census_entry_for_pricing(rec, key, model=MODEL, evidence_dir=d)
+            self.assertAlmostEqual(entry["shm_total_max_gib"], 54.11, places=2)
+            self.assertIn("BACKFILLED", line)
+            self.assertIn("backfill from memts", json.load(open(rec))[key]["shm_total_source"])
+            arm, _h, lines = self._price(entry)
+            self.assertLessEqual(arm.predicted_run_peak_gib() + host_ledger.RATE_LATCH_CUSHION_FLOOR_GIB, 83.44)
+            self.assertIn("run_peak=81.47 GiB vs hard bound 83.44", "\n".join(lines))
+            # second load reads the written field, no second backfill
+            _e2, line2 = launcher.census_entry_for_pricing(rec, key, model=MODEL, evidence_dir=d)
+            self.assertEqual(line2, "")
+
+    def test_without_memts_the_refusing_sum_stays(self):
+        import tempfile
+
+        from sglang.srt.weg2 import launcher
+        key = next(iter(json.load(open(CENSUS))))
+        with tempfile.TemporaryDirectory() as d:
+            rec = _fixture(d, with_memts=False)
+            entry, line = launcher.census_entry_for_pricing(rec, key, model=MODEL, evidence_dir=d)
+            self.assertIsNone(entry.get("shm_total_max_gib"))
+            self.assertIn("NOT BACKFILLED", line)
+            with self.assertRaises(REFUSED) as cm:
+                self._price(entry)
+            self.assertRegex(str(cm.exception), r"run_peak=84\.1[56] GiB vs hard bound 83\.44")
+
+    @unittest.skipUnless(os.path.exists(R27B_CENSUS) and os.path.isdir(MODEL_27B), "27B record/checkpoint absent")
+    def test_27b_record_is_never_touched(self):
+        import tempfile
+
+        from sglang.srt.weg2 import launcher
+        key = next(iter(json.load(open(R27B_CENSUS))))
+        with tempfile.TemporaryDirectory() as d:
+            rec = _fixture(d, with_memts=True, record_src=R27B_CENSUS)
+            before = open(rec, "rb").read()
+            _e, line = launcher.census_entry_for_pricing(rec, key, model=MODEL_27B, evidence_dir=d)
+            self.assertEqual(line, "")
+            self.assertEqual(open(rec, "rb").read(), before)

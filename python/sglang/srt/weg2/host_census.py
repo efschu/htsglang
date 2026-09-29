@@ -339,6 +339,83 @@ def ledger_terms(entry: Optional[Mapping[str, object]]) -> Dict[str, object]:
     }
 
 
+BACKFILL_TAG = "WEG2-HOST-CENSUS SHM-TOTAL"
+
+
+def _memts_span_and_shmem_max(path: str) -> Optional[Tuple[str, str, float, str]]:
+    """``(first_ts, last_ts, shmem_max_gib, ts_of_max)`` of one memts CSV
+    (launcher.start_memts: host /proc/meminfo per 5 s), None when unreadable."""
+    import csv
+
+    try:
+        with open(path) as fh:
+            rows = [r for r in csv.DictReader(fh)
+                    if r.get("ts_utc") and str(r.get("shmem_kb", "")).isdigit()]
+    except OSError:
+        return None
+    if not rows:
+        return None
+    top = max(rows, key=lambda r: int(r["shmem_kb"]))
+    return rows[0]["ts_utc"], rows[-1]["ts_utc"], int(top["shmem_kb"]) / (1024 * 1024), top["ts_utc"]
+
+
+def backfill_shm_total(path: str, key: str, evidence_dir: str) -> Tuple[Optional[Mapping[str, object]], str]:
+    """29.09. NF1d: the record's peak of the SUM (``shm_total_max_gib``), when it
+    is missing, rebuilt from the MEASURED source of the boot that last sampled
+    into this key: its memts CSV (the one whose time span holds the entry's
+    ``last_at``), host Shmem per sample, max over the boot. Written back with
+    provenance and returned; ``(entry, line)``.
+
+    The key IS the identity (checkpoint digest | form, what the front of that
+    boot wrote under), so the sample is this model's and this form's. memts
+    carries no store/arena PER SAMPLE: the instant's store/arena are taken as
+    the entry's class maxima -- an UPPER-bound assumption for the store at that
+    instant, named on the line. Host Shmem >= cgroup shmem: the total is an
+    upper bound too. No entry, a field already there, or no CSV whose span
+    holds ``last_at``: the entry unchanged (the ledger then keeps today's
+    refusing sum) and the line says which.
+    """
+    import glob
+
+    data = load_record(path)
+    ent = data.get(key) if isinstance(data.get(key), dict) else None
+    if ent is None or ent.get("shm_total_max_gib") is not None:
+        return ent, ""
+    at = str(ent.get("last_at") or "")
+    hit = None
+    for csv_path in sorted(glob.glob(os.path.join(evidence_dir, "docker_*", "memts_weg2_*.csv"))
+                           + glob.glob(os.path.join(evidence_dir, "memts_weg2_*.csv"))):
+        span = _memts_span_and_shmem_max(csv_path)
+        if span and at and span[0] <= at <= span[1]:
+            hit = (csv_path, span)
+            break
+    if hit is None:
+        return ent, (f"{BACKFILL_TAG} NOT BACKFILLED: no memts CSV under {evidence_dir} spans the "
+                     f"record's last_at={at or '?'} -- the census shmem is charged as the sum of its "
+                     f"per-field maxima (refusing direction)")
+    csv_path, (_t0, _t1, tot, ts) = hit
+    cls = dict(ent.get("shm_classes_gib") or {})
+    ent = dict(ent)
+    ent["shm_total_max_gib"] = float(tot)
+    ent["shm_total_store_gib"] = float(cls.get("store", 0.0))
+    ent["shm_total_arena_gib"] = float(cls.get("arena_booked", 0.0))
+    ent["shm_total_source"] = (f"backfill from memts {csv_path} sample {ts} (host Shmem, upper bound; "
+                               f"store/arena of that instant = the record's class maxima, upper-bound "
+                               f"assumption: memts has no per-sample classes)")
+    data[key] = ent
+    persisted = "written back"
+    try:
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError as e:
+        persisted = f"NOT written back ({type(e).__name__}: {e}), used for this pricing only"
+    return ent, (f"{BACKFILL_TAG} BACKFILLED shm_total_max={tot:.2f} GiB "
+                 f"store@={ent['shm_total_store_gib']:.2f} arena@={ent['shm_total_arena_gib']:.2f} "
+                 f"-- {ent['shm_total_source']}; {persisted}")
+
+
 def census_line(key: str, terms: Mapping[str, object]) -> str:
     roles = dict(terms.get("census_roles") or {})
     rl = " ".join(f"{r}={roles[r]:.2f}" for r in NONRANK_ROLES if roles.get(r))

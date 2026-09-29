@@ -12528,6 +12528,23 @@ def _stop_helper_pid(pid: int, expect: str = "boot_deadman") -> str:
         return "gone"
 
 
+def census_entry_for_pricing(record_path: str, key: str, *, model: str,
+                             evidence_dir: str) -> Tuple[Optional[Dict[str, object]], str]:
+    """29.09. NF1d: the host census entry the ledger prices from, ``(entry, line)``.
+
+    A record that predates ``shm_total_max_gib`` (the peak of the SUM at one
+    instant) gets it rebuilt from this key's own memts
+    (host_census.backfill_shm_total) -- only for a checkpoint that is NOT the
+    reference: the 27B record stays byte for byte, and no model named (a desk
+    caller) touches nothing."""
+    from sglang.srt.weg2 import host_census as _hc
+
+    if model and weg2_form.reference_model_verdict(model, host_ledger.REFERENCE_MODEL)[0] is False:
+        entry, line = _hc.backfill_shm_total(record_path, key, evidence_dir)
+        return (dict(entry) if entry is not None else None), line
+    return _hc.load_record(record_path).get(key), ""
+
+
 def memts_csv_path(tag: str) -> str:
     return f"{GPU_ARB}/memts_weg2_{tag}.csv"
 
@@ -23866,7 +23883,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         (getattr(ns, "weg2_boot_form", None).env_value()
          if getattr(ns, "weg2_boot_form", None) is not None else ""))
     _census_record = f"{EVIDENCE_DIR}/{_hc.RECORD_NAME}"
-    _census_terms = _hc.ledger_terms(_hc.load_record(_census_record).get(_census_key))
+    _census_entry, _bf_line = census_entry_for_pricing(
+        _census_record, _census_key, model=ns.model, evidence_dir=EVIDENCE_DIR)
+    if _bf_line:
+        log(_bf_line)
+    _census_terms = _hc.ledger_terms(_census_entry)
     log(_hc.census_line(_census_key, _census_terms))
 
     def _price_host_ledger():
