@@ -616,6 +616,13 @@ class Envs:
     # (weg2/rank_state.py). Set by the weg2 launcher per group, next to the
     # group log; unset = no record is written (a boot outside the launcher).
     SGLANG_WEG2_RANK_STATE_DIR = EnvStr(None)
+    # VRAM_ACTUAL (VRAM-Vertrag M2, 29.09.): each rank writes its VRAM actual
+    # per PID and category as the block ``vram`` of its RankState
+    # (weg2/vram_actual.py): at the boot posts (flight_recorder.mark), each
+    # flip leg and each WEG2-VRAM-PEAK window end, the window max per state key
+    # in memory and a write only on a change (never per decode round).
+    # Display and records only; nothing decides on it. Off = RankState as before.
+    SGLANG_WEG2_VRAM_ACTUAL = EnvBool(False)
     # WEG2_STATE_DIR (IPC §2.2, 27B B1/H5): the boot's own state directory
     # state/<boot_id>/ (state.json + events.jsonl), mounted into the container
     # by the arm, the host writer creates it. The launcher writes its fields

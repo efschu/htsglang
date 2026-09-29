@@ -11866,6 +11866,7 @@ def canonical_state_gate(spec: GroupSpec, expected: int, log: Log,
                 f"tp{r} owns token rows under the cut but reports kv "
                 f"{'missing' if s is None else f'applicable={s.kv_page_applicable} active={s.kv_page_active}'}")
     log(f"W7/W10 launcher half, group {spec.name} RankState ({state_dir}): {verdict.line()}")
+    rank_vram_display(spec, log, states=states)
     n_kv, n_blob, n_worker = canonical_marker_counts(spec.log)
     if (n_kv, n_blob) != (verdict.n_kv, verdict.n_blob):
         log(f"IPC MISMATCH W7/W10 group {spec.name}: log count kv x{n_kv} blob x{n_blob} "
@@ -11883,6 +11884,30 @@ def canonical_state_gate(spec: GroupSpec, expected: int, log: Log,
         raise Weg2LaunchRefused(
             f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half, RankState): "
             f"group {spec.name} {verdict.line()}")
+
+
+def rank_vram_display(spec: GroupSpec, log: Log, states: Optional[list] = None) -> int:
+    """VRAM-Vertrag M2, DISPLAY ONLY: the ranks' RankState ``vram`` blocks
+    (weg2/vram_actual.py) as one human line per rank, and -- when re-read
+    later than the W7/W10 gate -- the fresh records into
+    ``groups.<G>.ranks`` of state.json. Nothing here decides; a rank without
+    a block (SGLANG_WEG2_VRAM_ACTUAL off) is simply not shown. Returns the
+    number of blocks shown."""
+    fresh = states is None
+    if fresh:
+        states, _bad = rank_state_mod.read_group_states(rank_state_dir_for(spec))
+    from sglang.srt.weg2 import vram_actual as vram_actual_mod
+
+    n = 0
+    for s in sorted(states, key=lambda x: x.rank_key):
+        if s.vram is None:
+            continue
+        n += 1
+        log(f"VRAM-IST group {spec.name} {s.rank_key}: "
+            f"{vram_actual_mod.VramBlock.from_dict(s.vram).line()}")
+    if fresh and n:
+        boot_state_write(log, fields={f"groups.{spec.name}.ranks": [json.loads(s.to_json()) for s in states]})
+    return n
 
 
 def count_marker(path: str, marker: str) -> int:
@@ -23596,6 +23621,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         canonical_state_gate(spec_d, 3, log,
                              kv_owner_ranks=d_kv_worker_ranks(getattr(ns, "extra_d", "") or ""))
+        # VRAM-Vertrag M2 (display only): P's blocks again, now carrying its
+        # first sleep leg -- the per-PID source of the plan's asleep.P
+        rank_vram_display(spec_p, log)
     # #1233 zero-remainder (1j finding 6): W9 LAUNCH-TIME KEY-SCHEME GATE. The
     # store is one carrier; a spec-less group keys pages by unigram unless
     # SGLANG_HICACHE_BIGRAM_KEYS=1 forced the bigram scheme, a NEXTN/EAGLE

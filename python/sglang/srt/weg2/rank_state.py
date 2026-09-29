@@ -36,7 +36,12 @@ from typing import Dict, List, Optional, Tuple
 
 #: Bumped on every incompatible change of :class:`RankState`. A reader
 #: refuses a record of another version by name instead of guessing fields.
-RANK_STATE_SCHEMA = 1
+#: 2 (VRAM-Vertrag M2, 29.09.): schema 1 plus the optional block ``vram``
+#: (weg2/vram_actual.py, ``weg2.rank_vram/1``). A schema-1 record still reads
+#: (it carries no ``vram``); any other version is refused by name.
+RANK_STATE_SCHEMA = 2
+#: Versions this reader accepts; a record's ``vram`` is only legal from 2 on.
+RANK_STATE_SCHEMAS_READ = (1, 2)
 
 RANK_STATE_ENV = "SGLANG_WEG2_RANK_STATE_DIR"
 
@@ -85,6 +90,10 @@ class RankState:
     #: Attach counter of this process (re-attach after a cutover rewrites).
     seq: int = 0
     schema: int = RANK_STATE_SCHEMA
+    #: VRAM-Vertrag M2: the rank's VRAM actual per PID and category
+    #: (``weg2.rank_vram/1``, weg2/vram_actual.py); None with
+    #: SGLANG_WEG2_VRAM_ACTUAL off. Display and records only -- no gate reads it.
+    vram: Optional[dict] = None
 
     @property
     def rank_key(self) -> str:
@@ -104,14 +113,24 @@ class RankState:
             raise RankStateSchemaError(f"not a RankState record: {e}") from e
         if not isinstance(d, dict):
             raise RankStateSchemaError("not a RankState record: top level is not an object")
-        if d.get("schema") != RANK_STATE_SCHEMA:
+        schema = d.get("schema")
+        if schema not in RANK_STATE_SCHEMAS_READ:
             raise RankStateSchemaError(
-                f"RankState schema {d.get('schema')!r}, this reader knows {RANK_STATE_SCHEMA}"
+                f"RankState schema {schema!r}, this reader knows {list(RANK_STATE_SCHEMAS_READ)}"
             )
         names = set(cls.__dataclass_fields__)
+        if schema == 1:
+            names.discard("vram")
         unknown = sorted(set(d) - names)
         if unknown:
-            raise RankStateSchemaError(f"RankState schema {RANK_STATE_SCHEMA} has no field(s) {unknown}")
+            raise RankStateSchemaError(f"RankState schema {schema} has no field(s) {unknown}")
+        if d.get("vram") is not None:
+            from sglang.srt.weg2.vram_actual import VramBlock, VramBlockSchemaError
+
+            try:
+                VramBlock.from_dict(d["vram"])
+            except VramBlockSchemaError as e:
+                raise RankStateSchemaError(f"RankState vram block refused: {e}") from e
         if d.get("dcp_owner") is not None:
             d["dcp_owner"] = tuple(int(x) for x in d["dcp_owner"])
         try:
