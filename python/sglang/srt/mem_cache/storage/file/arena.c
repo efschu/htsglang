@@ -99,13 +99,26 @@ static inline void writer_done(SlotHeader *sh) {
            !atomic_compare_exchange_weak(&sh->writers, &w, w - 1u)) { }
 }
 
+/* #1427s (z30n/z30p D, Form A token cut S=2): an owner-row writer merges
+ * one extent per (K|V half, attention layer, owned token run) -- TP1 owns the
+ * even tokens, TP2 the odd ones: 2 x 12 x 32 = 768 disjoint intervals of a
+ * 786432-byte KV page before the second owner fills the gaps. KV_IVALS=64
+ * overflowed on the FIRST writer of every page: arena_complete answered 3
+ * ('#1427 ARENA-COMPLETE LOST ... recycled under the writer' -- nothing was
+ * recycled), the page stayed CLAIMED for ever and every page D wrote itself
+ * (decode tail, park) was unreadable -- the wake re-computed it. The KV cap
+ * now scales with the page: the worst alternation of 512-byte token rows is
+ * slot_bytes / 1024 intervals, plus KV_IVALS for the whole-page / stage
+ * writers that may merge into the same page. The interval array lives in the
+ * sparse tmpfs file: only the headers a page actually fragments are touched. */
+static uint64_t ival_cap_for(int64_t slot_bytes) {
+    if (slot_bytes > (1 << 20)) return BLOB_IVALS;
+    return KV_IVALS + (uint64_t)slot_bytes / 1024u;
+}
+
 /* Size the file for `slots` slots of `slot_bytes`; returns the total bytes and
  * fills the offsets into out[0..5] = header_bytes, index_off, index_slot_off,
  * headers_off, data_off, index_cap. */
-static uint64_t ival_cap_for(int64_t slot_bytes) {
-    return slot_bytes > (1 << 20) ? BLOB_IVALS : KV_IVALS;
-}
-
 int64_t arena_layout(int64_t slots, int64_t slot_bytes, int64_t *out) {
     uint64_t cap_iv = ival_cap_for(slot_bytes);
     uint64_t header_bytes = (sizeof(SlotHeader) + cap_iv * sizeof(Ival) + 63) & ~63ULL;
@@ -140,7 +153,10 @@ int arena_init(uint8_t *base, int64_t slots, int64_t slot_bytes) {
     arena_layout(slots, slot_bytes, o);
     ArenaHeader *h = hdr(base);
     if (h->magic == A_MAGIC) {
-        return (h->slots == (uint64_t)slots && h->slot_bytes == (uint64_t)slot_bytes) ? 1 : -1;
+        /* #1427s: the header size is part of the layout (interval capacity) --
+         * a file laid out by an older build is a different arena */
+        return (h->slots == (uint64_t)slots && h->slot_bytes == (uint64_t)slot_bytes
+                && h->header_bytes == (uint64_t)o[0]) ? 1 : -1;
     }
     h->slots = (uint64_t)slots;
     h->slot_bytes = (uint64_t)slot_bytes;
@@ -570,7 +586,10 @@ int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
 
 /* status per slot: 1 = completed by this call, 0 = extents merged, page not
  * yet full (other writers pending), 2 = already COMPLETE, 3 = slot recycled
- * (generation moved on) or interval overflow -- the writer's bytes are lost. */
+ * (generation moved on), 4 = slot not CLAIMED any more (freed or evicting in
+ * this generation), 5 = interval overflow (#1427s: the page's coverage list
+ * is full -- it can never complete). 3..5: the writer's bytes are lost; each
+ * reason is its own status so the caller can NAME it. */
 int64_t arena_complete(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
                        const int64_t *n_ext, const int64_t *ext_off, const int64_t *ext_len,
                        int8_t *status) {
@@ -582,11 +601,11 @@ int64_t arena_complete(uint8_t *base, int64_t n, const int64_t *slots, const int
         if ((int64_t)sh->generation != gens[i]) { status[i] = 3; e += k; continue; }
         uint32_t st0 = atomic_load(&sh->state);
         if (st0 == S_COMPLETE) { writer_done(sh); status[i] = 2; e += k; ok++; continue; }
-        if (st0 != S_CLAIMED) { status[i] = 3; e += k; continue; }  /* freed or evicting */
+        if (st0 != S_CLAIMED) { status[i] = 4; e += k; continue; }  /* freed or evicting */
         atomic_thread_fence(memory_order_release);
         int mr = merge_ivals(sh, k, ext_off + e, ext_len + e, sh->total_bytes);
         e += k;
-        if (mr < 0) { status[i] = 3; continue; }
+        if (mr < 0) { writer_done(sh); status[i] = 5; continue; }
         atomic_store(&sh->touched_ms, mono_ms());
         writer_done(sh);
         if (mr == 0) { status[i] = 0; ok++; continue; }
@@ -1013,6 +1032,12 @@ int64_t arena_release_claims(uint8_t *base, int64_t n, const int64_t *slots, con
         freed++;
     }
     return freed;
+}
+
+/* #1427s: the coverage-interval capacity of this arena's slots (one value per
+ * file: every slot header is laid out alike). */
+int64_t arena_ival_cap(uint8_t *base) {
+    return (int64_t)slot_hdr(base, 0)->cap_ivals;
 }
 
 void arena_stats(uint8_t *base, int64_t *out) {

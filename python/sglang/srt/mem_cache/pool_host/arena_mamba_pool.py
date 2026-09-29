@@ -28,6 +28,7 @@ from typing import Optional, Sequence
 import torch
 
 from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost
+from sglang.srt.mem_cache.storage.file.hicache_arena import free_named
 from sglang.srt.weg2 import ple_state
 from sglang.srt.mem_cache.pool_host.arena_pool import (
     PLACEHOLDERS,
@@ -748,7 +749,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
             if joined:
                 self.arena.unclaim(joined, jgens)   # #231: a join freed unwritten is no longer open
             if fresh:
-                self.arena.free_slots(fresh)
+                free_named(self.arena, fresh, "mamba_free_pending")
             keep = [s for s in rows if s not in pend]
             if keep:
                 self.arena.ref_slots(keep, -1)
