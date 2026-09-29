@@ -5898,10 +5898,33 @@ class Front:
                               "streak": int(getattr(g, "health_fail_streak", 0) or 0),
                               "ts": round(getattr(f, "t", 0.0) or 0.0, 3) if f is not None else None}
         out["groups"] = health
+        tally = self.__dict__.get("_ipc_error_tally")
+        out["errors"] = tally.snapshot() if tally is not None else None
         w = self.__dict__.get("_ipc_writer")
         out["ipc"] = {"queue": w.depth() if w else 0, "max": w.maxlen if w else None,
                       "dropped": w.dropped if w else 0, "failed": w.failed if w else 0}
         return out
+
+    def _ipc_group_health_observe(self, g) -> None:
+        """(A12) one ``group_health`` event when a group's health verdict CHANGES
+        (the first poll counts as a change): ok / busy / failing / held / dead,
+        from the poll's own GroupFacts. Unchanged polls write nothing."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        f = getattr(g, "health_facts", None)
+        if f is None:
+            return
+        verdict = front_state_ipc.group_health_verdict(f.http_ok, f.alive, f.streak, f.hold is not None)
+        prev = self.__dict__.setdefault("_ipc_gh_prev", {})
+        if prev.get(g.name) == verdict:
+            return
+        was = prev.get(g.name)
+        prev[g.name] = verdict
+        self._ipc_publish("group_health", {
+            "group": g.name, "verdict": verdict, "prev": was, "http_ok": bool(f.http_ok),
+            "alive": bool(f.alive), "streak": int(f.streak or 0),
+            "hold_pid": getattr(f.hold, "pid", None) if f.hold is not None else None,
+            "ts": round(float(f.t or time.time()), 3)})
 
     def _ipc_note_served(self, group: str, prompt: int, cached: int, completion: int) -> None:
         st = self.__dict__.setdefault("_ipc_served_tokens", {})
@@ -5919,6 +5942,11 @@ class Front:
         d = envs.WEG2_STATE_DIR.get() or None
         if not d:
             return
+        # front.errors: this process's ERROR/CRITICAL records, structured from the
+        # record objects (weg2/rankstats.ErrorTally), never parsed from a log line.
+        from sglang.srt.weg2 import rankstats as _rankstats
+
+        self.__dict__["_ipc_error_tally"] = _rankstats.install_error_tally()
         while True:
             await asyncio.sleep(period_s)
             try:
@@ -10849,6 +10877,9 @@ class Front:
                     )
                 else:
                     self.do_stop("W17 Weg2GroupDead", f"group {g.name}: /health failed {n}x and process_alive={alive} (a 200 alone is a transport fact)")
+        # DASHBOARD-AUS-IPC (A12): a verdict change of any group as an event.
+        for g in groups:
+            self._ipc_group_health_observe(g)
 
     async def _health_poller_old(self) -> None:
         while True:

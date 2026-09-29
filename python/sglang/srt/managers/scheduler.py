@@ -20931,6 +20931,11 @@ class Scheduler(
             _sp.WEG2_ADMIT_T["lb_n"] = 0
         except Exception:  # noqa: BLE001
             _lb_ms, _lb_n = -1.0, -1
+        # read_ms resets what it reads: read each pass term ONCE, for the line
+        # and for rankstats.last_post_wake alike.
+        _sched_ms, _run_ms = _pt_read(self, "_1466_schedule_ms"), _pt_read(self, "_1466_run_ms")
+        _pf_ms, _pi_ms = _pt_read(self, "_1474_prefetch_ms"), _pt_read(self, "_1475_process_input_ms")
+        _gap_ms = ((now - prev) * 1000.0) if prev is not None else -1.0
         logger.info(
             "WEG2-POST-WAKE-PASS n=%d mode=%s bs=%d gap_ms=%.0f schedule_ms=%.0f run_ms=%.0f "
             "prefetch_ms=%.0f proc_input_ms=%.0f admission_ms=%.0f init_new_ms=%.0f prepare_ms=%.0f ready_ms=%.0f "
@@ -20938,14 +20943,22 @@ class Scheduler(
             "(gap = wall since the previous pass; schedule = get_next_batch_to_run incl. the three "
             "prefill terms; run is the launch, the forward itself overlaps; admit = the admission's "
             "own gate / skip census of this pass, BA 28.09.)",
-            n, mode, bs, ((now - prev) * 1000.0) if prev is not None else -1.0,
-            _pt_read(self, "_1466_schedule_ms"), _pt_read(self, "_1466_run_ms"),
-            _pt_read(self, "_1474_prefetch_ms"), _pt_read(self, "_1475_process_input_ms"),
+            n, mode, bs, _gap_ms, _sched_ms, _run_ms, _pf_ms, _pi_ms,
             _g[0], _g[1], _g[2], float(getattr(self, '_weg2_ready_ms', -1.0) or -1.0), _addreq, _lb_ms, _lb_n, _initr,
             len(getattr(self, "waiting_queue", None) or ()),
             str(getattr(self, "_admission_decline_note", None) or "-")[:240],
             str(getattr(self, "_admission_partial_note", None) or "-")[:240],
         )
+        # DASHBOARD-AUS-IPC: the same census as rankstats.last_post_wake (one
+        # assignment here; the rankstats timer writes it -- never a decode round).
+        from sglang.srt.weg2 import rankstats as _weg2_rankstats
+
+        _weg2_rankstats.note_post_wake({
+            "n": n, "mode": mode, "bs": bs, "t": round(_t.time(), 3), "gap_ms": round(_gap_ms, 1),
+            "schedule_ms": _sched_ms, "run_ms": _run_ms, "prefetch_ms": _pf_ms, "proc_input_ms": _pi_ms,
+            "admission_ms": _g[0], "init_new_ms": _g[1], "prepare_ms": _g[2],
+            "waiting": len(getattr(self, "waiting_queue", None) or ()),
+        })
         self._admission_partial_note = None
 
     def _weg2_arm_wake_round_census(self) -> None:
@@ -21900,6 +21913,11 @@ def run_scheduler_process(
         from sglang.srt.weg2 import vram_actual as _weg2_vram_actual
 
         _weg2_vram_actual.bind_scheduler(scheduler)
+        # DASHBOARD-AUS-IPC: the rank's counters for the rigdash, from a timer
+        # thread that only reads them (switch SGLANG_WEG2_ENABLE_RANKSTATS).
+        from sglang.srt.weg2 import rankstats as _weg2_rankstats
+
+        _weg2_rankstats.maybe_start(scheduler, tp_rank=tp_rank, pp_rank=pp_rank)
         # #605: every runner in this process is now up, so this is the first
         # moment a snapshot shows the WHOLE boot -- under speculative decoding
         # the target and the NEXTN draft each capture graphs, and a snapshot

@@ -138,6 +138,19 @@ def flip_done_payload(rec: dict, flip_begin_ts: float) -> dict:
     return out
 
 
+def group_health_verdict(http_ok: bool, alive: bool, streak: int, held: bool) -> str:
+    """One word per FH poll (front_health GroupFacts): dead (process gone),
+    held (#1223 DEBUG-HOLD), failing (a counted /health failure), busy (a slow
+    /health while the group computes, FP beacon: not counted), ok."""
+    if not alive:
+        return "dead"
+    if held:
+        return "held"
+    if int(streak or 0) > 0:
+        return "failing"
+    return "ok" if http_ok else "busy"
+
+
 #: the front's IPC queue bound (27B review of b02cec1ad5): a writer blocked on the
 #: disk or on the state lock must never make the front pile up anon RAM.
 IPC_QUEUE_MAX = 1024

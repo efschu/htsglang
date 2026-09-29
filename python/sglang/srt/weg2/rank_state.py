@@ -185,7 +185,9 @@ def clear_rank_state_dir(state_dir: str) -> int:
     except FileNotFoundError:
         return 0
     for name in names:
-        if name.endswith(".json") or ".json.tmp." in name:
+        # .rankstats (weg2/rankstats.py) lives beside the records and is cleared
+        # with them, so no sample of an earlier launch is read as this one's.
+        if name.endswith((".json", ".rankstats")) or ".json.tmp." in name or ".rankstats.tmp." in name:
             try:
                 os.unlink(os.path.join(state_dir, name))
                 n += 1
