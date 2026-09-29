@@ -118,6 +118,29 @@ from sglang.srt.weg2.front import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
+
+# X-COST-LINE is the default since 29.09. (27B z30y metal proof); this module
+# pins the solo-r_D re-solve it was written for -- the =0 path, still valid.
+_XCL_KEY = "SGLANG_WEG2_ENABLE_X_COST_LINE"
+_XCL_SAVED = None
+
+
+def setup_module(module=None):
+    global _XCL_SAVED
+    import os as _os
+
+    _XCL_SAVED = _os.environ.get(_XCL_KEY)
+    _os.environ[_XCL_KEY] = "0"
+
+
+def teardown_module(module=None):
+    import os as _os
+
+    if _XCL_SAVED is None:
+        _os.environ.pop(_XCL_KEY, None)
+    else:
+        _os.environ[_XCL_KEY] = _XCL_SAVED
+
 # --- sb5g, measured -------------------------------------------------------
 SB5G_X = 8742                 # after the #1290 base change, source=boot
 SB5G_D_UNCACHED = 24657       # what D priced the LONG request at

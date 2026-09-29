@@ -65,6 +65,29 @@ from sglang.srt.weg2.front import Front
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
+
+# X-COST-LINE is the default since 29.09. (27B z30y metal proof); this module
+# pins the solo-r_D re-solve it was written for -- the =0 path, still valid.
+_XCL_KEY = "SGLANG_WEG2_ENABLE_X_COST_LINE"
+_XCL_SAVED = None
+
+
+def setup_module(module=None):
+    global _XCL_SAVED
+    import os as _os
+
+    _XCL_SAVED = _os.environ.get(_XCL_KEY)
+    _os.environ[_XCL_KEY] = "0"
+
+
+def teardown_module(module=None):
+    import os as _os
+
+    if _XCL_SAVED is None:
+        _os.environ.pop(_XCL_KEY, None)
+    else:
+        _os.environ[_XCL_KEY] = _XCL_SAVED
+
 #: The four D->P and four P->D legs weg2sb5f actually measured, ms.
 SB5F_LEGS_MS = [6126, 3836, 3906, 3843, 4175, 4365, 4068, 4062]
 #: The front's own wall-clock leg rates on that boot (both group_throughput).
