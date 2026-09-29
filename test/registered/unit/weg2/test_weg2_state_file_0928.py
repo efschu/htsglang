@@ -244,5 +244,26 @@ class TestLauncherWrites(_Base):
         self.assertTrue(any("state.json missing" in l for l in self.lines))
 
 
+class TestLaunchSnapshot(_Base):
+    """Nutzer 29.09.: groups.<G>.launch trägt argv + Schalter-Env (rigdash „aktiv“), additiv in weg2.state/1."""
+
+    def test_snapshot_keeps_switches_and_drops_secrets(self):
+        snap = sf.launch_snapshot(
+            ["python", "-m", "sglang.launch_server", "--d-kv-token-cut", "owned"],
+            {"SGLANG_WEG2_ENABLE_D_STORE_ADOPT": "1", "WEG2_STATE_DIR": "/x", "PATH": "/bin",
+             "HOME": "/root", "SGLANG_ADMIN_KEY": "geheim", "HF_TOKEN": "t", "NCCL_P2P_LEVEL": 2})
+        self.assertEqual(snap["argv"][-2:], ["--d-kv-token-cut", "owned"])
+        self.assertEqual(snap["env"], {"NCCL_P2P_LEVEL": "2", "SGLANG_WEG2_ENABLE_D_STORE_ADOPT": "1",
+                                       "WEG2_STATE_DIR": "/x"})
+
+    def test_launcher_writes_launch_into_group_additively(self):
+        d = self._boot()
+        snap = sf.launch_snapshot(["a", "--flag"], {"SGLANG_X": "1"})
+        sf.transition(d, "loading", fields={"groups.P": {"state": "loading", "launch": snap}}, writer="launcher")
+        st = sf.read(d)
+        self.assertEqual(st["schema"], sf.STATE_SCHEMA)
+        self.assertEqual(st["groups"]["P"]["launch"], {"argv": ["a", "--flag"], "env": {"SGLANG_X": "1"}})
+
+
 if __name__ == "__main__":
     unittest.main()

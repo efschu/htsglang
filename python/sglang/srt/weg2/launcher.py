@@ -11788,8 +11788,10 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
     spec.proc = p
     log(f"group {spec.name} pid {p.pid} (session id = pid) log {spec.log}")
     if spec.name in ("P", "D"):
+        # Nutzer 29.09.: rigdash liest daraus „aktiv“ je Schalter (argv redigiert wie im Log).
         boot_state_write(log, "loading", fields={f"groups.{spec.name}": {
-            "state": "loading", "pids": [p.pid], "ready_ts": None, "rankstate_dir": _rs_dir, "ranks": []}})
+            "state": "loading", "pids": [p.pid], "ready_ts": None, "rankstate_dir": _rs_dir, "ranks": [],
+            "launch": state_file_mod.launch_snapshot(admin_key_mod.redact_argv(spec.argv), spec.env)}})
 
 
 def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, tag: str, name: str, dry: bool) -> int:
