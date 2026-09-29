@@ -1,0 +1,61 @@
+{
+ "group": "P",
+ "size": 1048576,
+ "gemm_m": 4096,
+ "mps": false,
+ "sm_pct": null,
+ "ok": true,
+ "ranks": [
+  {
+   "group": "P",
+   "rank": 0,
+   "ok": true,
+   "err": "",
+   "bad": 0,
+   "ops": 1051,
+   "proof": {
+    "(0, 1)": true,
+    "(0, 2)": true,
+    "(1, 0)": true,
+    "(1, 2)": true,
+    "(2, 0)": true,
+    "(2, 1)": true
+   },
+   "handles": true
+  },
+  {
+   "group": "P",
+   "rank": 1,
+   "ok": true,
+   "err": "",
+   "bad": 0,
+   "ops": 1051,
+   "proof": {
+    "(0, 1)": true,
+    "(0, 2)": true,
+    "(1, 0)": true,
+    "(1, 2)": true,
+    "(2, 0)": true,
+    "(2, 1)": true
+   },
+   "handles": true
+  },
+  {
+   "group": "P",
+   "rank": 2,
+   "ok": true,
+   "err": "",
+   "bad": 0,
+   "ops": 1051,
+   "proof": {
+    "(0, 1)": true,
+    "(0, 2)": true,
+    "(1, 0)": true,
+    "(1, 2)": true,
+    "(2, 0)": true,
+    "(2, 1)": true
+   },
+   "handles": true
+  }
+ ]
+}
