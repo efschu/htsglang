@@ -278,6 +278,21 @@ def merge_into_record(path: str, key: str, census: Mapping[str, object]) -> Dict
             ent[field][k] = max(float(ent[field].get(k, 0.0)), float(v))
     ent["unattributed_shm_gib"] = max(ent["unattributed_shm_gib"],
                                       float(census.get("unattributed_shm_gib") or 0.0))
+    # 29.09. NF1d (W21 84.16): the fields above are max-merged EACH ON ITS OWN,
+    # so their sum is a sum of maxima from different samples (store 41.69 of
+    # 09291559 + ungebucht 6.26 of z30w, whose store was 39.20). The peak of the
+    # SUM is kept beside them, with the store/arena of that same sample, so the
+    # ledger can cap its shmem claim at what one instant actually held.
+    for _f in ("shm_total_max_gib", "shm_total_store_gib", "shm_total_arena_gib", "shm_total_source"):
+        if _f in old:
+            ent[_f] = old[_f]
+    _tot = census.get("cg_shmem_gib")
+    if _tot is not None and float(_tot) > float(ent.get("shm_total_max_gib", -1.0)):
+        _cls = dict(census.get("shm_classes_gib") or {})
+        ent["shm_total_max_gib"] = float(_tot)
+        ent["shm_total_store_gib"] = float(_cls.get("store", 0.0))
+        ent["shm_total_arena_gib"] = float(_cls.get("arena_booked", 0.0))
+        ent["shm_total_source"] = f"{census.get('source', '')} {census.get('at', '')}".strip()
     data[key] = ent
     tmp = f"{path}.tmp.{os.getpid()}"
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -315,7 +330,90 @@ def ledger_terms(entry: Optional[Mapping[str, object]]) -> Dict[str, object]:
         "other_tmpfs_gib": float(cls.get("other_tmpfs", 0.0)),
         "census_roles": roles,
         "census_source": f"record: {int(entry.get('samples') or 0)} sample(s), last {entry.get('last_at', '?')}",
+        # 29.09. NF1d: the peak of the SUM (one instant), None when never sampled
+        "shm_total_max_gib": (float(entry["shm_total_max_gib"])
+                              if entry.get("shm_total_max_gib") is not None else None),
+        "shm_total_store_gib": float(entry.get("shm_total_store_gib") or 0.0),
+        "shm_total_arena_gib": float(entry.get("shm_total_arena_gib") or 0.0),
+        "shm_total_source": str(entry.get("shm_total_source") or ""),
     }
+
+
+BACKFILL_TAG = "WEG2-HOST-CENSUS SHM-TOTAL"
+
+
+def _memts_span_and_shmem_max(path: str) -> Optional[Tuple[str, str, float, str]]:
+    """``(first_ts, last_ts, shmem_max_gib, ts_of_max)`` of one memts CSV
+    (launcher.start_memts: host /proc/meminfo per 5 s), None when unreadable."""
+    import csv
+
+    try:
+        with open(path) as fh:
+            rows = [r for r in csv.DictReader(fh)
+                    if r.get("ts_utc") and str(r.get("shmem_kb", "")).isdigit()]
+    except OSError:
+        return None
+    if not rows:
+        return None
+    top = max(rows, key=lambda r: int(r["shmem_kb"]))
+    return rows[0]["ts_utc"], rows[-1]["ts_utc"], int(top["shmem_kb"]) / (1024 * 1024), top["ts_utc"]
+
+
+def backfill_shm_total(path: str, key: str, evidence_dir: str) -> Tuple[Optional[Mapping[str, object]], str]:
+    """29.09. NF1d: the record's peak of the SUM (``shm_total_max_gib``), when it
+    is missing, rebuilt from the MEASURED source of the boot that last sampled
+    into this key: its memts CSV (the one whose time span holds the entry's
+    ``last_at``), host Shmem per sample, max over the boot. Written back with
+    provenance and returned; ``(entry, line)``.
+
+    The key IS the identity (checkpoint digest | form, what the front of that
+    boot wrote under), so the sample is this model's and this form's. memts
+    carries no store/arena PER SAMPLE: the instant's store/arena are taken as
+    the entry's class maxima -- an UPPER-bound assumption for the store at that
+    instant, named on the line. Host Shmem >= cgroup shmem: the total is an
+    upper bound too. No entry, a field already there, or no CSV whose span
+    holds ``last_at``: the entry unchanged (the ledger then keeps today's
+    refusing sum) and the line says which.
+    """
+    import glob
+
+    data = load_record(path)
+    ent = data.get(key) if isinstance(data.get(key), dict) else None
+    if ent is None or ent.get("shm_total_max_gib") is not None:
+        return ent, ""
+    at = str(ent.get("last_at") or "")
+    hit = None
+    for csv_path in sorted(glob.glob(os.path.join(evidence_dir, "docker_*", "memts_weg2_*.csv"))
+                           + glob.glob(os.path.join(evidence_dir, "memts_weg2_*.csv"))):
+        span = _memts_span_and_shmem_max(csv_path)
+        if span and at and span[0] <= at <= span[1]:
+            hit = (csv_path, span)
+            break
+    if hit is None:
+        return ent, (f"{BACKFILL_TAG} NOT BACKFILLED: no memts CSV under {evidence_dir} spans the "
+                     f"record's last_at={at or '?'} -- the census shmem is charged as the sum of its "
+                     f"per-field maxima (refusing direction)")
+    csv_path, (_t0, _t1, tot, ts) = hit
+    cls = dict(ent.get("shm_classes_gib") or {})
+    ent = dict(ent)
+    ent["shm_total_max_gib"] = float(tot)
+    ent["shm_total_store_gib"] = float(cls.get("store", 0.0))
+    ent["shm_total_arena_gib"] = float(cls.get("arena_booked", 0.0))
+    ent["shm_total_source"] = (f"backfill from memts {csv_path} sample {ts} (host Shmem, upper bound; "
+                               f"store/arena of that instant = the record's class maxima, upper-bound "
+                               f"assumption: memts has no per-sample classes)")
+    data[key] = ent
+    persisted = "written back"
+    try:
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError as e:
+        persisted = f"NOT written back ({type(e).__name__}: {e}), used for this pricing only"
+    return ent, (f"{BACKFILL_TAG} BACKFILLED shm_total_max={tot:.2f} GiB "
+                 f"store@={ent['shm_total_store_gib']:.2f} arena@={ent['shm_total_arena_gib']:.2f} "
+                 f"-- {ent['shm_total_source']}; {persisted}")
 
 
 def census_line(key: str, terms: Mapping[str, object]) -> str:
