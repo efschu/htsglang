@@ -375,6 +375,11 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                     "done": False,
                     "device": ambient,
                 }
+                # BOOTZEIT 5c: this process presplits this layer -- the store
+                # prefetch may open its files ahead (never another stage's).
+                from sglang.srt.layers.moe import store_prefetch as _sp
+
+                _sp.note_armed(getattr(layer, "layer_id", None))
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 

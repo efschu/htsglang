@@ -1414,6 +1414,14 @@ class Envs:
     # names reclaim gc s/layer, the cgroup anon+shmem peak of the load and
     # what the load-end collect freed. False = collect over the whole process.
     SGLANG_OPT_LOAD_GC_FREEZE = EnvBool(True)
+    # BOOTZEIT 5c (29.09., z30w-park): open the NEXT layer's expert-store
+    # files (tmpfs ftruncate + mmap + cudaHostRegister) on one background
+    # thread while this layer's shards are consumed, instead of inside the
+    # presplit on the loader thread (layers/moe/store_prefetch.py). store_open
+    # was 5.17 s on PP0 (29 x 4 files, 23.78 GiB), 2.90 s on D TP0 (48 x 4).
+    # Same files, same bytes; a prefetch whose geometry is not the one asked
+    # for is dropped. Off until the first metal series (then default on).
+    SGLANG_OPT_LOAD_STORE_PREFETCH = EnvBool(False)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # HTTP server

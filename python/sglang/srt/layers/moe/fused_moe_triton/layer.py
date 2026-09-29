@@ -1600,6 +1600,14 @@ class FusedMoE(torch.nn.Module):
 
         release_active_tag_pools(reason="ct-stream-presplit")
         torch.cuda.empty_cache()
+        # BOOTZEIT 5c: this layer's host stack is gone (the context above has
+        # exited) -- now the next layer's store files may open beside the
+        # load (layers/moe/store_prefetch.py; SGLANG_OPT_LOAD_STORE_PREFETCH).
+        _next = self.__dict__.pop("_store_prefetch_next", None)
+        if _next is not None:
+            from sglang.srt.layers.moe import store_prefetch as _sp
+
+            _sp.prefetch_next(getattr(self, "layer_id", None), **_next)
         t_end = time.perf_counter()
         after = expert_offload_release_totals()
         clock1 = expert_store_clock()
