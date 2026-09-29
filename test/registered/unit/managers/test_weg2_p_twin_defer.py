@@ -10,6 +10,7 @@ that is delayed or changed (the switch must touch only twins).
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.srt.managers import weg2_store_told as m
 from sglang.srt.weg2 import p_twin_defer as tw
@@ -73,7 +74,9 @@ class _Sched:
             head = min(head, int(limit_tokens))
             span = max(0, min(span, int(limit_tokens) - head))
         req._prefetch_registered_prefix_len = head
-        req.prefix_indices = [0] * head
+        # a tensor, as the scheduler's Req carries it (rc12z30i 27B P died on
+        # `tensor or ()` -- a list double never showed it)
+        req.prefix_indices = torch.zeros(head, dtype=torch.int64)
         req.host_hit_length = 0
         if span <= 0 and head > 0:
             return "declined:too_short"
@@ -85,6 +88,7 @@ class _Req:
     def __init__(self, rid, ids, extra_key=None):
         self.rid = rid
         self.origin_input_ids = list(ids)
+        self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.extra_key = extra_key
         self.prefetch_deferred = None
         self.done = False
@@ -509,7 +513,7 @@ def _admit(s, req, prefix):
     get_next_batch_to_run."""
     if req in s.waiting_queue:
         s.waiting_queue.remove(req)
-    req.prefix_indices = [0] * prefix
+    req.prefix_indices = torch.zeros(prefix, dtype=torch.int64)
     s.chunked_req = req
 
 
