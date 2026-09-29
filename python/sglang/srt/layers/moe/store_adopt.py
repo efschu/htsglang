@@ -235,6 +235,34 @@ def discount_expected(layer, expected: Dict[str, int], owned: int) -> Dict[str, 
     return out
 
 
+def repack_rows(layer, num_experts: int):
+    """BOOTZEIT 3 (SGLANG_MOE_REPACK_SKIP_VETOED): the local expert rows the
+    Marlin repack must touch -- every row but the vetoed ones -- or None for
+    "all" (switch off, nothing vetoed, or no window). A vetoed row was never
+    read; ``filter_store_rows`` keeps it out of the store write and it is not
+    a resident (``StoreAdoptBroken`` otherwise), so no reader ever sees the
+    repack's output for it. The pad row (local 0) is kept."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_MOE_REPACK_SKIP_VETOED.get():
+        return None
+    vg = getattr(layer, "_moe_store_adopt_vetoed_global", None)
+    if not vg:
+        return None
+    from sglang.srt.layers.moe.expert_offload import _layer_expert_window
+
+    fenster = _layer_expert_window(layer)
+    if fenster is None:
+        return None
+    lo, pad = fenster
+    first = 1 if pad else 0
+    keep = [e for e in range(int(num_experts))
+            if e < first or (int(lo) + e - first) not in vg]
+    if len(keep) == int(num_experts):
+        return None
+    return keep
+
+
 def veto_expert(layer, global_id: int) -> bool:
     """Loader question: skip this checkpoint expert tensor?"""
     return int(global_id) in vetoed_global_ids(layer)

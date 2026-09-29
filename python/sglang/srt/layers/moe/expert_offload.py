@@ -240,7 +240,15 @@ def record_expert_offload_release(
 # `open_store` -- a fresh store file is ftruncated, first-touched and
 # cudaHostRegister'ed there (shared_pinned_empty, 8-14 % of the loader
 # thread in rc12z30o3); write_s is the D2H of the cold rows into it.
-_STORE_CLOCK = {"open_s": 0.0, "write_s": 0.0, "opens": 0}
+_STORE_CLOCK = {"open_s": 0.0, "write_s": 0.0, "opens": 0,
+                # BOOTZEIT 3 (29.09.): the repack itself, split (instrument
+                # only): marlin_s = gptq_marlin_moe_repack of w13+w2 (one JIT
+                # launch per expert row), scales_s = marlin_moe_permute_scales,
+                # presplit_s = presplit_expert_offload_after_repack (store
+                # open/write included, see open_s/write_s), rows = expert rows
+                # repacked / rows in the [E] windows.
+                "marlin_s": 0.0, "scales_s": 0.0, "presplit_s": 0.0,
+                "rows_repacked": 0, "rows_total": 0}
 
 
 def expert_store_clock() -> dict:

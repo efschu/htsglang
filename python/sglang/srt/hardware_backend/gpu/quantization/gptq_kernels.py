@@ -76,7 +76,11 @@ def gptq_marlin_moe_repack(
     size_k: int,
     size_n: int,
     num_bits: int,
+    rows=None,
 ) -> torch.Tensor:
+    """``rows``: the expert rows to repack (None = all). The others are left
+    as ``torch.empty`` leaves them (BOOTZEIT 3, SGLANG_MOE_REPACK_SKIP_VETOED:
+    rows nobody reads)."""
     num_experts = b_q_weight.shape[0]
     assert size_k % 16 == 0
     output = torch.empty(
@@ -112,7 +116,7 @@ def gptq_marlin_moe_repack(
     # Pfad, der die Gewichtsbytes schreibt, ist keine Ladezeit-Optimierung
     # wert, solange diese hier ohne jedes Korrektheitsrisiko zu haben ist.
     module = _jit_gptq_marlin_repack_module()
-    for e in range(num_experts):
+    for e in (range(num_experts) if rows is None else rows):
         module.gptq_marlin_repack(
             b_q_weight[e], perm[e], output[e], size_k, size_n, num_bits
         )

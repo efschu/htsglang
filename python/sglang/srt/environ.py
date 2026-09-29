@@ -1309,6 +1309,14 @@ class Envs:
     # tiny sync D2H copies each, every one fighting 8 consumer threads for
     # the GIL). Same bytes, same rows. False = the per-row copy.
     SGLANG_EXPERT_STORE_WRITE_RUNS = EnvBool(False)
+    # BOOTZEIT 3 (29.09., z30r3): D's Marlin repack runs over the rank's whole
+    # [E] window although H2 vetoed most of it (never read -- the store holds
+    # P's bytes for those rows, and the presplit neither copies nor writes
+    # them). Measured: TP0 reads 3171 of 9040 owned rows on 40 layers, TP1
+    # 3320/6096, TP2 3120/7632; repack ~30 s per D rank. On: repack only the
+    # rows that were read (+ the pad row). Same bytes for every row anyone
+    # reads; the vetoed rows stay what they were -- unread garbage.
+    SGLANG_MOE_REPACK_SKIP_VETOED = EnvBool(False)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # HTTP server
