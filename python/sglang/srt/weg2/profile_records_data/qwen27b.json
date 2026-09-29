@@ -445,6 +445,91 @@
    "power_limit_source": "nvidia-smi power.limit 24.09. 18:55Z and 26.09. (row 27): 5090 400 W, 3080 230 W; boots in between did not record the limit (weg2/power_limit.RIG_POWER_LIMIT_W_0924)",
    "fmt": "nvfp4",
    "n": 2
+  },
+  {
+   "name": "FORM_MATRIX_AXES",
+   "kind": "geometry",
+   "fmt": "nvfp4",
+   "provenance": "27B-Sitz 29.09. (Nutzer: Messmatrix aus dem Hardware-/Modellprofil, ganz oder teilweise durchmessbar; FORM-MESSMATRIX-ENTWURF-0929.md). Kapazität Form A gerechnet: KV ~9 GB / 32 KB/Tok ~ 280k Tok (START_MATRIX.txt), keine Messung",
+   "value": {
+    "forms": {
+     "A": {
+      "arm": "a1",
+      "axes": {
+       "roles": "same",
+       "weights": "1",
+       "transport": "none"
+      }
+     },
+     "B77": {
+      "arm": "a2_7723",
+      "axes": {
+       "roles": "same",
+       "weights": "77,23",
+       "transport": "nccl"
+      }
+     },
+     "B88": {
+      "arm": "a2_8812",
+      "axes": {
+       "roles": "same",
+       "weights": "88,12",
+       "transport": "nccl"
+      }
+     },
+     "A_KV": {
+      "arm": null,
+      "startable": false,
+      "why_not": "F15 wired=False: Form mit 3080-KV-only-Rängen im Image nicht startbar (desk/27b-form-a-kv-ranks-0928, Sitz Form-B-Verdrahtung)",
+      "axes": {
+       "roles": "host,kv_only,kv_only",
+       "weights": "1,0,0",
+       "transport": "bar1"
+      }
+     },
+     "C": {
+      "arm": null,
+      "axes": {
+       "roles": "same",
+       "weights": "58,25,25",
+       "tokens": "uneven",
+       "transport": "bar1"
+      }
+     }
+    },
+    "bs": [
+     1,
+     2,
+     3,
+     4,
+     5,
+     6
+    ],
+    "depths": [
+     "2k",
+     "10k",
+     "32k",
+     "97k",
+     "240k"
+    ],
+    "texts": [
+     "code",
+     "prose",
+     "thinking"
+    ],
+    "temps": [
+     "warm"
+    ],
+    "capacity": {
+     "A": {
+      "2k": 6,
+      "10k": 6,
+      "32k": 6,
+      "97k": 2,
+      "240k": 1
+     }
+    }
+   }
   }
  ]
 }
