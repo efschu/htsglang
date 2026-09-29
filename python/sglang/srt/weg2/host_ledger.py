@@ -2708,6 +2708,10 @@ def charge_terms(
     # 29.09. (Planer post COLD_TIER_SHM): the expert store when it lives on a
     # tmpfs -- shmem, unevictable without swap, resident in BOTH phases.
     cold_tier_shm_gib: float = 0.0,
+    # 29.09. (host census, z30w): measured posts per model|form from
+    # host_census.ledger_terms -- non-rank anon, lane ring, arena sidecar,
+    # hand-off (charged) and the shmem no class names (printed, ungebucht).
+    census: Optional[Dict[str, object]] = None,
     memhist_run_only: bool = False,
 ) -> Dict[str, object]:
     """Everything the BOOT ITSELF adds to ``memory.current``, per term.
@@ -2776,6 +2780,13 @@ def charge_terms(
         "memhist_gib": max(0.0, float(memhist_gib)),
         "l3_index_gib": max(0.0, float(l3_index_gib)),
         "cold_tier_shm_gib": max(0.0, float(cold_tier_shm_gib)),
+        "nonrank_anon_gib": max(0.0, float((census or {}).get("nonrank_anon_gib", 0.0) or 0.0)),
+        "seq_ring_gib": max(0.0, float((census or {}).get("seq_ring_gib", 0.0) or 0.0)),
+        "arena_sidecar_gib": max(0.0, float((census or {}).get("arena_sidecar_gib", 0.0) or 0.0)),
+        "arena_handoff_gib": max(0.0, float((census or {}).get("arena_handoff_gib", 0.0) or 0.0)),
+        "unbooked_shm_gib": max(0.0, float((census or {}).get("unbooked_shm_gib", 0.0) or 0.0)),
+        "census_source": str((census or {}).get("census_source", "") or ""),
+        "census_roles": dict((census or {}).get("census_roles") or {}),
         "memhist_run_only": bool(memhist_run_only),
         "image_p_gib": images.p_gib,
         "image_d_gib": images.d_gib,
@@ -2828,6 +2839,10 @@ def _boot_charges_gib(terms: Dict[str, object]) -> float:
         + (0.0 if terms.get("memhist_run_only") else float(terms.get("memhist_gib", 0.0) or 0.0))
         + float(terms.get("l3_index_gib", 0.0) or 0.0)  # 28.09.: the L3 index, every owner
         + float(terms.get("cold_tier_shm_gib", 0.0) or 0.0)  # 29.09.: tmpfs expert store
+        + float(terms.get("nonrank_anon_gib", 0.0) or 0.0)
+        + float(terms.get("seq_ring_gib", 0.0) or 0.0)
+        + float(terms.get("arena_sidecar_gib", 0.0) or 0.0)
+        + float(terms.get("arena_handoff_gib", 0.0) or 0.0)  # 29.09.: host census posts
     )
 
 
@@ -4334,6 +4349,10 @@ def price(
     # 29.09. (Planer post COLD_TIER_SHM): the expert store when it lives on a
     # tmpfs -- shmem, unevictable without swap, resident in BOTH phases.
     cold_tier_shm_gib: float = 0.0,
+    # 29.09. (host census, z30w): measured posts per model|form from
+    # host_census.ledger_terms -- non-rank anon, lane ring, arena sidecar,
+    # hand-off (charged) and the shmem no class names (printed, ungebucht).
+    census: Optional[Dict[str, object]] = None,
     memhist_run_only: bool = False,
     # H87: see `charge_terms` (d_only) and `run_origin_gib`/`resolve_image_terms`
     # (reference_model_ok). Defaults are byte-identical to every caller before.
@@ -4503,7 +4522,8 @@ def price(
                            d_draft_host_gib=d_draft_host_gib, d_only=d_only,
                            memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
                            l3_index_gib=l3_index_gib,
-                           cold_tier_shm_gib=cold_tier_shm_gib)
+                           cold_tier_shm_gib=cold_tier_shm_gib,
+                           census=census)
     heaps_gib = charges["heaps_gib"]
     anchors_gib = charges["anchors_gib"]
     rings_gib = charges["rings_gib"]
@@ -4634,6 +4654,12 @@ def price(
         "memhist_gib": float(charges.get("memhist_gib", 0.0) or 0.0),  # rc12d
         "l3_index_gib": float(charges.get("l3_index_gib", 0.0) or 0.0),  # 28.09.
         "cold_tier_shm_gib": float(charges.get("cold_tier_shm_gib", 0.0) or 0.0),  # 29.09.
+        "nonrank_anon_gib": float(charges.get("nonrank_anon_gib", 0.0) or 0.0),
+        "seq_ring_gib": float(charges.get("seq_ring_gib", 0.0) or 0.0),
+        "arena_sidecar_gib": float(charges.get("arena_sidecar_gib", 0.0) or 0.0),
+        "arena_handoff_gib": float(charges.get("arena_handoff_gib", 0.0) or 0.0),
+        "unbooked_shm_gib": float(charges.get("unbooked_shm_gib", 0.0) or 0.0),
+        "census_source": str(charges.get("census_source", "") or ""),
         "memhist_run_only": bool(charges.get("memhist_run_only", False)),
         "overhead_gib": overhead_gib,
         # #1386: SAME LABEL DEFECT the #1317n comment above names for
@@ -5014,6 +5040,36 @@ def rss_shmem_bytes(pids: Iterable[int]) -> Tuple[int, List[int]]:
     return total, seen
 
 
+def image_shmem_bytes(pids: Iterable[int], reader=None) -> Tuple[int, List[int]]:
+    """A group's dormant IMAGE: the Pss of its ANONYMOUS shared mappings;
+    return (bytes, the pids that answered).
+
+    29.09. (z30w: stored run residual -98.95 GiB): :func:`rss_shmem_bytes` sums
+    ``RssShmem``, which counts every shared page IN FULL in EVERY process that
+    maps it. Under the tmpfs expert store each of D's three ranks maps the
+    same 39 GiB (RssShmem 52/46/46 GiB, Pss_Shmem 15.9/11.5/11.5), so the
+    'image' came out at ~144 GiB and the residual went negative by the store
+    counted three times. Named tmpfs files -- the store, the arena, the lane
+    ring -- are priced by their own ledger terms; the image is what has no
+    file (the TMS CPU backup, a parked draft: anonymous MAP_SHARED, see
+    :func:`rss_shmem_bytes`), and Pss splits a page shared between processes
+    instead of counting it once per mapper."""
+    from sglang.srt.weg2 import host_census as _hc
+
+    rd = reader or _hc._read
+    total = 0
+    seen: List[int] = []
+    for pid in pids:
+        try:
+            text = rd(f"/proc/{int(pid)}/smaps")
+        except OSError:
+            continue
+        total += sum(b for path, b in _hc.smaps_shm_pss(text).items()
+                     if _hc.shm_class(path.replace(" (deleted)", "")) == "anon_shared")
+        seen.append(int(pid))
+    return total, seen
+
+
 def _cg_oom_kill_now() -> Optional[int]:
     """``memory.events oom_kill`` for this cgroup, or ``None`` if unreadable.
 
@@ -5102,7 +5158,9 @@ def dormant_image_sample(
         if shmem_before_bytes is None or shmem_after_bytes is None
         else (int(shmem_after_bytes) - int(shmem_before_bytes)) / GIB
     )
-    rss, seen = rss_shmem_bytes(pids)
+    # 29.09.: the image in Pss of anonymous shared memory, not RssShmem
+    # (which counted the shared tmpfs store once per mapping rank, z30w)
+    rss, seen = image_shmem_bytes(pids)
     rss_gib = rss / GIB
     residual: Optional[float] = None
     # Initialised here and not only in the branch below: the record's
@@ -5208,6 +5266,7 @@ def dormant_image_sample(
         "shmem_after_bytes": shmem_after_bytes,
         "shmem_delta_gib": delta,
         "rss_shmem_gib": rss_gib,
+        "image_instrument": "pss_anon_shared",  # 29.09.: not RssShmem (z30w -98.95)
         # #1350: WHEN, relative to the flips, this sample was taken. The
         # run-moment residual of a sample taken during or after the first flip
         # pair ALREADY CONTAINS the ratchet (measured: `stored=` walks
@@ -5750,6 +5809,7 @@ def arm_terms_line(arm) -> str:
            if float(t.get('memhist_gib') or 0.0) else "")
         + (f"l3_index={_g('l3_index_gib')} " if float(t.get('l3_index_gib') or 0.0) else "")
         + (f"cold_tier_shm={_g('cold_tier_shm_gib')} " if float(t.get('cold_tier_shm_gib') or 0.0) else "")
+        + "".join(f"{_k[:-4]}={_g(_k)} " for _k in ("nonrank_anon_gib", "seq_ring_gib", "arena_sidecar_gib", "arena_handoff_gib") if float(t.get(_k) or 0.0))
         + f"overhead={_g('overhead_gib')} xchg_bounce={_g('xchg_bounce_gib')} "
         f"host_weights={_g('host_ring_gib')} "
         f"ratchet_charged={_g('flip_ratchet_charged_gib')} "
@@ -5844,6 +5904,10 @@ def choose(
     # 29.09. (Planer post COLD_TIER_SHM): the expert store when it lives on a
     # tmpfs -- shmem, unevictable without swap, resident in BOTH phases.
     cold_tier_shm_gib: float = 0.0,
+    # 29.09. (host census, z30w): measured posts per model|form from
+    # host_census.ledger_terms -- non-rank anon, lane ring, arena sidecar,
+    # hand-off (charged) and the shmem no class names (printed, ungebucht).
+    census: Optional[Dict[str, object]] = None,
     memhist_run_only: bool = False,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
@@ -5910,6 +5974,7 @@ def choose(
             memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
             l3_index_gib=l3_index_gib,
             cold_tier_shm_gib=cold_tier_shm_gib,
+            census=census,
         )
         for s, m in arms
     ]
@@ -6124,7 +6189,13 @@ def choose(
             f"if it were measured (got prior_cushion_min_gib={prior_cushion_min_gib!r} "
             f"prior_bounce_gib={prior_bounce_gib!r})."
         )
-    lines.append(watermark_provenance(margin, watermark_gib, refuse_unreadable=True))
+    _wm_line = watermark_provenance(margin, watermark_gib, refuse_unreadable=True)
+    # 29.09.: shmem the host census could not name is not charged -- but it is
+    # never silent either: it rides the WATERMARK line as `ungebucht`.
+    if census is not None:
+        _wm_line += (f" | ungebucht={float(census.get('unbooked_shm_gib') or 0.0):.2f} GiB "
+                     f"shmem without a post [{census.get('census_source', '')}]")
+    lines.append(_wm_line)
     chosen: Optional[Arm] = None
     peak_bound_any = False
     # #1236: the STORE TERM IS GONE FROM THIS LOOP.  Train fix 3 sized it here
@@ -6499,6 +6570,7 @@ def choose(
                         memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
                         l3_index_gib=l3_index_gib,
                         cold_tier_shm_gib=cold_tier_shm_gib,
+                        census=census,
                     )
                 except Exception:  # noqa: BLE001 - advice may never mask the refusal
                     return False

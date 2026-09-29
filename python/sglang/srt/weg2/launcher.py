@@ -11465,6 +11465,8 @@ def choose_host_ledger(
     # 29.09.: the groups' own env (--env-d, --env-p); the arena term reads
     # its sizes through it, not through the launcher env alone.
     group_envs: Optional[Sequence[Dict[str, str]]] = None,
+    # 29.09.: the host census posts of this model|form (host_census.ledger_terms)
+    census: Optional[Dict[str, object]] = None,
     meminfo_path: str = "/proc/meminfo",
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
@@ -11786,6 +11788,8 @@ def choose_host_ledger(
         l3_index_gib=float(l3_index_gib),
         # 29.09.: the tmpfs expert store (Planer post COLD_TIER_SHM).
         cold_tier_shm_gib=float(cold_tier_shm_gib),
+        # 29.09.: measured non-rank anon / lane ring / arena sidecar / hand-off
+        census=census,
         # #1451: no arena on a --weg2-disable-hicache boot -- the term charged
         # 33.6 GiB there too (test_weg2_hicache_disabled_1386 M=2400 unfundable)
         **(_weg2_arena_ledger_terms(model_dir, group_envs) if (model_dir and not hicache_disabled) else {}),  # #1432
@@ -12496,6 +12500,10 @@ def _group_env_value(name: str, group_envs, default: str) -> str:
     return str(os.environ.get(name, default) or default)
 
 
+#: model -> the arena page widths `_weg2_arena_ledger_terms` last priced
+_ARENA_BOOKED_WIDTHS: Dict[str, List[int]] = {}
+
+
 def _weg2_arena_ledger_terms(model: str, group_envs=None) -> dict:
     """#1432: the L2 arena's host bytes and the REAL fallback pool sizes, for
     the ledger. Sizes come from the same environment the child processes get
@@ -12571,6 +12579,12 @@ def _weg2_arena_ledger_terms(model: str, group_envs=None) -> dict:
             "(term arena_gib); fallback pools staging=%s GB anchor=%s MiB",
             kv_slots, kv_page, draft_slots, draft_cell, mamba_slots, blob, out["arena_gib"],
             out["staging_gb"], out["anchor_mib"])
+        # 29.09. (host census): the arena FILE widths this term prices, so the
+        # census can tell a sidecar width (the QSA index page) from them
+        _pt = (_canon_page // kv_page) if (_canon_page > 0 and kv_page > 0
+                                           and _canon_page % kv_page == 0) else 1
+        _ARENA_BOOKED_WIDTHS[str(model)] = [w for w in (
+            kv_page * _pt, (draft_cell * _pt) if draft_slots else 0, blob) if w]
         return out
     except Exception as exc:  # noqa: BLE001 - a mispriced arena is refused, never guessed
         raise Weg2LaunchRefused(f"W108 Weg2ArenaLedgerRefused: the arena term could not be derived: {exc!r}")
@@ -18149,10 +18163,6 @@ def planned_expert_store_bytes(ns, model: str, p_stage_layers=None,
             _terms.append(_pp_cut.checkpoint_weight_terms(model))
         return _terms[0]
 
-    # the row the P cut priced (ns._expert_row_mib, same checkpoint terms)
-    row = float(getattr(ns, "_expert_row_mib", 0.0) or 0.0) * _pp_cut.MIB
-    if row <= 0:
-        row = float(terms().expert_layer_weight_bytes) / max(1, int(terms().num_experts))
     if karte_path:
         with open(karte_path) as fh:
             karte = json.load(fh)
@@ -18165,6 +18175,11 @@ def planned_expert_store_bytes(ns, model: str, p_stage_layers=None,
         karte, _ls = build_expert_karte(int(terms().num_experts), ratios, fr_pp, fr_tp,
                                         p_stage_layers, _mirror)
         src = "map dry-built from the vectors publish_expert_map reads"
+    # the row the P cut priced (ns._expert_row_mib, same checkpoint terms) --
+    # read only once a map exists: a dense checkpoint has no rows to price
+    row = float(getattr(ns, "_expert_row_mib", 0.0) or 0.0) * _pp_cut.MIB
+    if row <= 0:
+        row = float(terms().expert_layer_weight_bytes) / max(1, int(terms().num_experts))
     slots = int(karte["slots"])
     layers = len(karte.get("p_layer_stage") or []) or int(terms().n_layers)
     return int(slots * layers * row), (f"slots {slots} x {layers} layers x "
@@ -23206,6 +23221,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _cold_tier_shm_gib, _cold_tier_line = cold_tier_shm_post(
         ns, ns.model, getattr(state, "p_stage_layers", None))
     log(_cold_tier_line)
+    # 29.09. (host census): what this model|form was MEASURED to hold outside
+    # the ranks and outside store/arena -- a record, never a constant; the
+    # front keeps it current (sample_live every 60 s, max-merged).
+    from sglang.srt.weg2 import host_census as _hc
+
+    _census_key = _hc.census_key(
+        host_ledger.checkpoint_digest(ns.model)[0] or "",
+        (getattr(ns, "weg2_boot_form", None).env_value()
+         if getattr(ns, "weg2_boot_form", None) is not None else ""))
+    _census_record = f"{EVIDENCE_DIR}/{_hc.RECORD_NAME}"
+    _census_terms = _hc.ledger_terms(_hc.load_record(_census_record).get(_census_key))
+    log(_hc.census_line(_census_key, _census_terms))
 
     def _price_host_ledger():
         """#1453: the ONE ledger pricing, callable twice (see below)."""
@@ -23217,6 +23244,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             l3_index_gib=_l3_index_gib,
             cold_tier_shm_gib=_cold_tier_shm_gib,
             group_envs=_ledger_group_envs,
+            census=_census_terms,
             # #1390: NAMED, not left to choose_host_ledger's own literal
             # defaults -- see MEMINFO_PATH/CGROUP_ROOT above for why a bare call
             # would keep reading the real box even under a test's mock.
@@ -23490,6 +23518,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 log(ln)
             state.ledger_lines = lines
             state.reap_headroom_gib = reap_headroom_gib
+    # 29.09.: the front samples the census live (widths known once the arena
+    # term has run inside the pricing above)
+    ns._host_census = {"record": _census_record, "key": _census_key,
+                       "store_dir": expert_store_dir_of(ns),
+                       "widths": list(_ARENA_BOOKED_WIDTHS.get(str(ns.model), []))}
     _estore_id = publish_store_identity(ns.model, _emap, log)
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
     # H125: the host-RAM price of `--weg2-vision-source ram`, named where the
@@ -24796,6 +24829,14 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     # and the front then prints no split rather than an invented one.
     if anon_preboot_bytes > 0:
         argv += ["--anon-preboot-bytes", str(int(anon_preboot_bytes))]
+    # 29.09.: the host census record the front keeps current (absent = off)
+    _hcn = getattr(ns, "_host_census", None)
+    if _hcn:
+        argv += ["--host-census-record", str(_hcn["record"]), "--host-census-key", str(_hcn["key"])]
+        if _hcn.get("store_dir"):
+            argv += ["--host-census-store-dir", str(_hcn["store_dir"])]
+        if _hcn.get("widths"):
+            argv += ["--host-census-arena-widths", ",".join(str(int(w)) for w in _hcn["widths"])]
     if ns.min_dwell_ms is not None:
         argv += ["--min-dwell-ms", str(ns.min_dwell_ms)]
     # 27B idle policy (b)/(c): emitted only when set, so a boot without them
