@@ -1689,10 +1689,27 @@ def _coalesce_gap_bytes() -> int:
     return max(0, kib) << 10
 
 
-class _Run:
-    __slots__ = ("path", "base", "start", "end", "items", "first", "future", "left")
+#: BOOTZEIT 3 Stufe 2b: which tensors travel P -> D through the page cache.
+#: Everything but the routed experts (H2 store adopt carries those) -- dense
+#: attention/MLP, embed, lm_head, norms, the draft. Both groups classify with
+#: this one predicate, so a byte P kept is a byte D asks for.
+def shared_cache_mode() -> str:
+    from sglang.srt.environ import envs
 
-    def __init__(self, path, base, start, end, idx):
+    mode = str(envs.SGLANG_WEIGHT_LOADER_SHARED_CACHE.get() or "").strip().lower()
+    return mode if mode in ("keep", "drop") else ""
+
+
+def is_shared_cache_tensor(name: str) -> bool:
+    return ".experts." not in name
+
+
+class _Run:
+    __slots__ = ("path", "base", "start", "end", "items", "first", "future", "left",
+                 "shared")
+
+    def __init__(self, path, base, start, end, idx, shared=False):
+        self.shared = bool(shared)
         self.path = path
         self.base = base
         self.start = start  # relative to the data section (safetensors offsets)
@@ -1707,12 +1724,14 @@ class _Run:
         return self.end - self.start
 
 
-def plan_coalesced_runs(hf_weights_files, should_load, cap: int, gap: int):
+def plan_coalesced_runs(hf_weights_files, should_load, cap: int, gap: int,
+                        shared_class=None):
     """Yield-order items and the runs that carry them.
 
     items[i] = [name, path, base, info, verdict, run or None]; runs are sorted by
     the first item that needs them. ``should_load`` is asked exactly once per
-    name, in yield order."""
+    name, in yield order. ``shared_class`` (BOOTZEIT 3 Stufe 2b), when given,
+    keeps shared and non-shared tensors in separate runs and marks each run."""
     items, runs = [], []
     for path in hf_weights_files:
         header, base = read_safetensors_header(path)
@@ -1730,19 +1749,83 @@ def plan_coalesced_runs(hf_weights_files, should_load, cap: int, gap: int):
         cur = None
         for i in wanted:
             off0, off1 = (int(x) for x in items[i][3]["data_offsets"])
+            cls = bool(shared_class(items[i][0])) if shared_class is not None else False
             if (cur is not None and off0 >= cur.end and off0 - cur.end <= gap
-                    and off1 - cur.start <= cap):
+                    and off1 - cur.start <= cap and cur.shared == cls):
                 cur.end = off1
                 cur.items.append(i)
                 cur.first = min(cur.first, i)
             else:
-                cur = _Run(path, base, off0, off1, i)
+                cur = _Run(path, base, off0, off1, i, shared=cls)
                 runs.append(cur)
             items[i][5] = cur
     runs.sort(key=lambda r: r.first)
     for r in runs:
         r.left = len(r.items)
     return items, runs
+
+
+def _resident_bytes(fd: int, offset: int, length: int) -> int:
+    """Bytes of [offset, offset+length) of ``fd`` already in the page cache
+    (mincore over a read-only map of the range); 0 when it cannot tell."""
+    import ctypes
+    import mmap as _mm
+
+    page = _mm.PAGESIZE
+    lo = offset & ~(page - 1)
+    span = offset + length - lo
+    if span <= 0:
+        return 0
+    try:
+        # ACCESS_COPY: a private map is writable for ctypes and never written,
+        # so every page mincore sees is the file's page-cache page
+        m = _mm.mmap(fd, span, access=_mm.ACCESS_COPY, offset=lo)
+    except (OSError, ValueError):
+        return 0
+    anchor = None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        npages = (span + page - 1) // page
+        vec = (ctypes.c_ubyte * npages)()
+        anchor = ctypes.c_char.from_buffer(m)
+        rc = libc.mincore(ctypes.c_void_p(ctypes.addressof(anchor)),
+                          ctypes.c_size_t(span), vec)
+        if rc != 0:
+            return 0
+        return min(length, page * sum(1 for v in vec if v & 1))
+    except Exception:  # noqa: BLE001 -- an instrument, never a load killer
+        return 0
+    finally:
+        del anchor
+        try:
+            m.close()
+        except BufferError:
+            pass
+
+
+def _shared_cache_after_read(fd: int, offset: int, length: int, mode: str,
+                             counters) -> None:
+    """keep: leave the range cached for the next group, up to the budget;
+    drop: this group is the last reader -- hand the pages back now."""
+    from sglang.srt.environ import envs
+
+    advice = None
+    with counters["lock"]:
+        if mode == "keep":
+            cap = max(0, int(envs.SGLANG_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB.get() or 0)) << 20
+            if counters["shared_kept_bytes"] + length <= cap:
+                counters["shared_kept_bytes"] += length
+            else:
+                counters["shared_over_budget_bytes"] += length
+                advice = "dontneed"
+        else:
+            counters["shared_dropped_bytes"] += length
+            advice = "dontneed"
+    if advice and hasattr(os, "posix_fadvise"):
+        try:
+            os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
 
 
 def _read_run(run: "_Run", direct_io: bool, post_load, counters) -> dict:
@@ -1754,7 +1837,8 @@ def _read_run(run: "_Run", direct_io: bool, post_load, counters) -> dict:
     length = (b - a + _DIRECT_ALIGN - 1) & ~(_DIRECT_ALIGN - 1)
     fd = -1
     direct = False
-    if direct_io:
+    share = counters.get("share_mode", "") if run.shared else ""
+    if direct_io and not share:
         try:
             fd = os.open(run.path, os.O_RDONLY | getattr(os, "O_DIRECT", 0o40000))
             direct = True
@@ -1770,11 +1854,19 @@ def _read_run(run: "_Run", direct_io: bool, post_load, counters) -> dict:
     try:
         got = 0
         need = b - a
+        if share == "drop":
+            # the metal proof that the byte was read ONCE: how much of this
+            # range the first reader left in the page cache
+            hit = _resident_bytes(fd, a, need)
+            with counters["lock"]:
+                counters["shared_hit_bytes"] += hit
         while got < need:
             n = os.preadv(fd, [mv[got:length]], a + got)
             if n <= 0:
                 raise IOError(f"short read in {run.path} at {a + got}: need {need - got} more")
             got += n
+        if share:
+            _shared_cache_after_read(fd, a, need, share, counters)
         src = torch.frombuffer(buf, dtype=torch.uint8)
         out = {}
         for i in run.items:
@@ -1808,7 +1900,10 @@ def _coalesced_stream(hf_weights_files, should_load, post_load, direct_io, st, l
     cap = coalesce_run_bytes()
     gap = _coalesce_gap_bytes()
     st.t0 = _time.perf_counter()
-    items, runs = plan_coalesced_runs(hf_weights_files, should_load, cap, gap)
+    share_mode = shared_cache_mode()
+    items, runs = plan_coalesced_runs(
+        hf_weights_files, should_load, cap, gap,
+        shared_class=is_shared_cache_tensor if share_mode else None)
     st.files += len(hf_weights_files)
     # BOOTZEIT 3 (29.09.): wait_read_s = the consumer of this generator
     # blocked on a read that had not landed yet (disk-bound); consume_s = the
@@ -1816,7 +1911,10 @@ def _coalesced_stream(hf_weights_files, should_load, post_load, direct_io, st, l
     # (consumer-bound). Their sum is the stream's wall; which one dominates
     # says whether a faster disk path or a faster consumer is the lever.
     counters = {"items": items, "lock": threading.Lock(), "read_bytes": 0,
-                "direct": 0, "buffered": 0, "wait_read_s": 0.0, "consume_s": 0.0}
+                "direct": 0, "buffered": 0, "wait_read_s": 0.0, "consume_s": 0.0,
+                "share_mode": share_mode, "shared_kept_bytes": 0,
+                "shared_over_budget_bytes": 0, "shared_dropped_bytes": 0,
+                "shared_hit_bytes": 0}
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=st.workers)
     nxt = 0
     try:
@@ -1874,6 +1972,16 @@ def _coalesced_stream(hf_weights_files, should_load, post_load, direct_io, st, l
                 st.bytes, 100.0 * (counters["read_bytes"] - st.bytes) / max(1, counters["read_bytes"]),
                 st.seconds, gbs, st.workers, counters["direct"], counters["buffered"],
                 counters["wait_read_s"], counters["consume_s"])
+            if share_mode:
+                logger.info(
+                    "%s SHARED-CACHE mode=%s kept_mib=%.0f over_budget_mib=%.0f "
+                    "dropped_mib=%.0f hit_mib=%.0f (BOOTZEIT 3 Stufe 2b: non-expert "
+                    "bytes P->D through the page cache; hit = found cached by D)",
+                    COALESCE_MARKER, share_mode,
+                    counters["shared_kept_bytes"] / 2**20,
+                    counters["shared_over_budget_bytes"] / 2**20,
+                    counters["shared_dropped_bytes"] / 2**20,
+                    counters["shared_hit_bytes"] / 2**20)
             logger.info(st.line())
 
 

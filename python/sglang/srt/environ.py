@@ -1292,6 +1292,16 @@ class Envs:
     # queued layer keeps its full host [E] stack alive (PP0 ~1.4 GB/layer),
     # so this bounds the extra host RAM; a full queue blocks the submitter.
     SGLANG_LOAD_PRESPLIT_DEPTH = EnvInt(1)
+    # BOOTZEIT 3 Stufe 2b (29.09.): the NON-expert tensors (dense, embed,
+    # lm_head, norms, draft) read ONCE per boot. With the coalesced O_DIRECT
+    # stream every group reads them from disk; here they go through the page
+    # cache instead: "keep" (group P, the first reader) leaves them there,
+    # "drop" (group D, the last reader) takes them from there and drops each
+    # range after reading it. The expert rows are H2's (store adopt). Empty =
+    # off (every run as before). The cache is clean and reclaimable; "keep"
+    # stops keeping past SGLANG_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB.
+    SGLANG_WEIGHT_LOADER_SHARED_CACHE = EnvStr("")
+    SGLANG_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB = EnvInt(6144)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # HTTP server
