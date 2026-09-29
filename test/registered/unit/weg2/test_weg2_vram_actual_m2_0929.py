@@ -434,19 +434,48 @@ class TestCallEdges(_Base):
         self.assertEqual(peaks["n=3,S-,extend=0"]["allocated_peak"], 19700)
         self.assertEqual(peaks["n=3,S-,extend=0"]["nvml_pid"], 21000)
 
-    def test_chunk_window_on_p_carries_chunk_and_stau(self):
+    def test_p_stau_counts_kv_holders_not_the_waiting_queue(self):
+        """Planner seat 29.09.: stau = requests holding KV on P in this phase
+        (being prefilled + prefilled for the flip); the waiting queue holds no
+        page. Old rule len(waiting)+len(running) put 2 KV holders on stau=4."""
         os.environ["SGLANG_WEG2_GROUP"] = "P"
 
+        class _Req:
+            def __init__(self, rid):
+                self.rid = rid
+
         class _Sched:
-            waiting_queue = [1, 2, 3]
-            running_batch = type("B", (), {"reqs": [1]})()
+            waiting_queue = [_Req("w1"), _Req("w2"), _Req("w3")]
+            running_batch = type("B", (), {"reqs": []})()
+            last_batch = None
+            chunked_req = None
 
         sched = _Sched()
         va.bind_scheduler(sched)
         va._REC.fake_providers = lambda: dict(self.f.prov)
-        self.cuda.alloc_free(3000 * M)
-        vpw.on_forward_end(_Runner(), _FB("extend", bs=1, rows=16384), self.cuda)
-        self.assertIn("chunk=16384,stau=4", self._record().vram["peak_by_state"])
+        for rid, transient in (("a", 3000), ("b", 3500)):  # a finishes, then b is prefilled
+            sched.last_batch = type("B", (), {"reqs": [_Req(rid)]})()
+            self.cuda.alloc_free(transient * M)
+            vpw.on_forward_end(_Runner(), _FB("extend", bs=1, rows=16384), self.cuda)
+        peaks = self._record().vram["peak_by_state"]
+        self.assertEqual(sorted(k for k in peaks if k.startswith("chunk=")),
+                         ["chunk=16384,stau=1", "chunk=16384,stau=2"])
+        # P's sleep leg ends the phase: the next chunk counts from 1 again
+        vpw._STATE["cuda_override"] = self.cuda
+        try:
+            class Mgr:
+                scheduler = None
+
+                @vpw.flip_leg("release")
+                def release(self):
+                    return 1
+
+            Mgr().release()
+        finally:
+            vpw._STATE.pop("cuda_override", None)
+        self.assertIn("flip=P->D,leg=sleep", self._record().vram["peak_by_state"])
+        sched.last_batch = type("B", (), {"reqs": [_Req("c")]})()
+        self.assertEqual(va._p_stau(sched), 1)
 
     def test_flip_leg_reaches_the_block_with_direction(self):
         vpw._STATE["cuda_override"] = self.cuda
