@@ -171,5 +171,58 @@ class TestArenaOneSource(CustomTestCase):
         self.assertLess(t22["arena_gib"] - t8["arena_gib"], 14.0 * 1.25)
 
 
+R27B = "/spinning/docker-acceptance/27b/evidence/weg2_measured_record.json"
+CENSUS_27B = {"nonrank_anon_gib": 7.20, "seq_ring_gib": 3.00,   # record 13:37:58Z
+              "arena_sidecar_gib": 0.0, "arena_handoff_gib": 0.0}
+
+
+class TestCensusCountsOnce(CustomTestCase):
+    """27B d2 13:52Z (z30y): W97 run peak 86.19 vs 65.53 at 13:23Z; the boot
+    measured at most 60.85 non-reclaimable. The 13:31 boot's own run residual
+    (10.53 GiB, sampled with census posts 0) already holds front/detokenizer/
+    compile-worker anon and the lane ring -- and d2 charged them again."""
+
+    def _entry(self, resid, census=None):
+        e = {"run_residual_gib": resid, "sampled_at_flip_epoch": 0, "boot_tag": "b",
+             "pids": [1], "at": "t"}
+        if census is not None:
+            e["residual_census_gib"] = census
+        return {"P": e}
+
+    def test_a_residual_sampled_without_the_census_gives_it_back(self):
+        o, src = host_ledger.run_origin_gib(0.77, self._entry(10.53), census_now_gib=10.20)
+        self.assertAlmostEqual(o, 0.77, places=2)  # 10.53 - 10.20 = 0.33 < launch 0.77
+        o2, _ = host_ledger.run_origin_gib(0.77, self._entry(15.0), census_now_gib=10.20)
+        self.assertAlmostEqual(o2, 4.80, places=2)
+
+    def test_a_residual_that_already_subtracted_them_is_left_alone(self):
+        o, _ = host_ledger.run_origin_gib(0.77, self._entry(10.53, census=10.20), census_now_gib=10.20)
+        self.assertAlmostEqual(o, 10.53, places=2)
+
+    def test_no_census_no_change(self):
+        o, _ = host_ledger.run_origin_gib(0.77, self._entry(10.53))
+        self.assertAlmostEqual(o, 10.53, places=2)
+
+    def test_the_sampler_stores_what_it_subtracted(self):
+        import inspect
+
+        self.assertIn('"residual_census_gib": _census_gib', inspect.getsource(host_ledger))
+
+    @unittest.skipUnless(os.path.exists(R27B), "27B measured record absent")
+    def test_27b_z30y_replay_prediction_below_measured_plus_margin(self):
+        """The real record: the census taken out of the floor brings the d2
+        origin back to the launch reading; predicted = 65.53 (13:31) + census
+        10.20 + l3 +0.09 = 75.82 against the refused 86.19, and the census posts
+        (not the floor) now carry those bytes. Measured peak 60.85 + the posts
+        the 13:31 boot had not yet charged is the bound."""
+        rec = host_ledger.read_measured_record(R27B, boot_tag="dkr27browauthorityz30ybar1fs09291331")
+        o_old, _ = host_ledger.run_origin_gib(0.77, rec)
+        o_new, src = host_ledger.run_origin_gib(0.77, rec, census_now_gib=sum(CENSUS_27B.values()))
+        self.assertGreater(o_old, 10.0)       # the double count: residual holds the census
+        self.assertLess(o_new, 1.0, src)      # once: the posts carry it, the floor does not
+        predicted = 65.53 - 0.77 + o_new + sum(CENSUS_27B.values()) + 0.09
+        self.assertLessEqual(predicted, 60.85 + 10.20 + 5.0)
+
+
 if __name__ == "__main__":
     unittest.main()
