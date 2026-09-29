@@ -25,6 +25,7 @@ from sglang.srt.distributed.pp_typed_channel import (
 )
 from sglang.srt.weg2 import p_layer_split as _pls_S  # --p-layer-split row key
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt
+from sglang.srt.weg2 import flush_verdict as _flush_verdict  # z30j PP0 flush verdict
 from sglang.srt.distributed.pp_object_recv import get_or_create_frame
 from sglang.srt.distributed.utils import pp_gapped_ownership_active
 from sglang.srt.managers import anchor_tails as _anchor_tails
@@ -6358,6 +6359,10 @@ class SchedulerPPMixin:
                 _wire_reqs = _anchor_tails.stamp_burst_clock(
                     _wire_reqs, self._weg2_burst_clock
                 )
+            # z30j: PP0 stamps the flushes it forwards and puts the verdicts it
+            # decided last pass at the front of the wire (weg2/flush_verdict.py).
+            if self.pp_group.is_first_rank:
+                _wire_reqs = _flush_verdict.pp0_wire(self, _wire_reqs)
             try:  # #1460: when did PP0 put a Weg-2 control request on the chain?
                 _ctrl = [type(r).__name__ for r in (_wire_reqs or ())
                          if type(r).__name__ in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
@@ -6384,6 +6389,12 @@ class SchedulerPPMixin:
         # leaves `recv_reqs` before dispatch on EVERY rank -- it is a lap, not
         # a request, and `process_input_requests` has no handler for it.
         recv_reqs = self._weg2_vote_after_forward(recv_reqs)
+        # z30j: a follower applies PP0's flush verdicts (already forwarded
+        # onward above) to the flushes it parked, before this pass's dispatch.
+        if not self.pp_group.is_first_rank:
+            recv_reqs = _flush_verdict.follower_absorb(
+                self, recv_reqs, self.flush_wrapper.apply_pp0_verdict
+            )
         # fnFL2 H42c: a follower takes PP0's pass clock off the list after
         # relaying it; pass-scoped (None when absent, and the burst verdict
         # then stops by name rather than read this rank's own clock).

@@ -232,6 +232,7 @@ from sglang.srt.managers import weg2_store_told
 from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
 from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
 from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
+from sglang.srt.weg2 import flush_verdict as _weg2_flush_verdict  # z30j PP0 flush verdict
 from sglang.srt.weg2 import fork_anchor as _weg2_fork
 from sglang.srt.weg2 import d_park_read as _weg2_park_read  # PARK-RETAIN READ
 from sglang.srt.weg2 import resume_via_p as _weg2_rvp  # RESUME-VIA-P
@@ -3075,6 +3076,9 @@ class Scheduler(
             ipc_channels=self.ipc_channels,
             # FD (rc12o27 b1): a /flush_cache on a released group is refused.
             is_dormant=lambda: bool(getattr(self, "weg2_dormant", False)),
+            # z30j: PP0 decides a forwarded flush once; followers follow it.
+            park_forwarded=lambda req: _weg2_flush_verdict.follower_park(self, req),
+            on_decided=lambda req, ok, detail: _weg2_flush_verdict.pp0_record(self, req, ok, detail),
         )
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None

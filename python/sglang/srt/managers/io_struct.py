@@ -1431,6 +1431,9 @@ class ClearHiCacheReqOutput(BaseReq, kw_only=True):
 
 class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
+    # z30j: PP0's stamp on the request chain; a follower waits for PP0's
+    # verdict on this seq instead of deciding the flush itself (weg2/flush_verdict.py).
+    weg2_flush_seq: Optional[int] = None
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):
