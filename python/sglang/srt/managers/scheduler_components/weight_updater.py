@@ -9567,6 +9567,7 @@ class SchedulerWeightUpdaterManager:
                     _kv_epoch, _unfit,
                 )
                 return self._weg2_kv_group_verdict(False, _kv_epoch)
+            _t_kv = time.perf_counter()
             try:
                 self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
             except Weg2TmsResumeRefused as _exc:
@@ -9576,6 +9577,17 @@ class SchedulerWeightUpdaterManager:
                     _kv_epoch, _exc,
                 )
                 return self._weg2_kv_group_verdict(False, _kv_epoch)
+            # #251c/d §6.4: the resume's own price per stage (log only)
+            try:
+                from sglang.srt.weg2.d_seat_vram import PHASE_ATTR as _PHASE_ATTR
+                from sglang.srt.weg2.wake_kv import kv_resume_time_line
+
+                logger.info("%s", kv_resume_time_line(
+                    (time.perf_counter() - _t_kv) * 1000, _kv_need, _kv_free,
+                    self._weg2_free_bytes() if _kv_free is not None else None,
+                    getattr(self.scheduler, _PHASE_ATTR, None), _kv_epoch))
+            except Exception as _exc:  # noqa: BLE001 -- an instrument never stops a wake
+                logger.info("WEG2-WAKE-KV-TIME skipped (%s: %s)", type(_exc).__name__, _exc)
             if not self._weg2_kv_group_verdict(True, _kv_epoch):
                 return False  # a sibling refused: the verdict paused this rank's pool again
             self._weg2_kv_resumed_epoch = _kv_epoch
