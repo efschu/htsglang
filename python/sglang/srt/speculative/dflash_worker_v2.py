@@ -235,7 +235,16 @@ def _commit_accept(candidates, accept_len, bonus_tokens):
     out_tokens = torch.empty_like(candidates, dtype=torch.int64)
     out_tokens[:, :-1].copy_(candidates[:, 1:])
     out_tokens[:, -1].fill_(0)
-    out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus_tokens[:, None])
+    # out_tokens is int64 by construction, so the bonus is cast to it: the Triton
+    # accept buffers hold it as int32 (_bonus_id_bufs), and a Form B follower
+    # head adopts the lead's bonus INTO that dtype before it lands here -- a raw
+    # int32 src is "scatter(): Expected self.dtype to be equal to src.dtype"
+    # (metal 29.09. 22:47:55Z, TP1). Eager callers pass int64: a no-op cast.
+    out_tokens.scatter_(
+        1,
+        accept_len.to(torch.int64)[:, None],
+        bonus_tokens.to(out_tokens.dtype)[:, None],
+    )
     return out_tokens, accept_len.to(torch.int32) + 1
 
 
