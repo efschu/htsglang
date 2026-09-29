@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import statistics
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 # H91c3-3: imported with this module (the front imports it before its loop),
@@ -390,6 +391,17 @@ PARK_ROUND_TRIP_GROUP = "PARK_RT"
 #: The first round trips of a boot that are appended (the sidecar is
 #: append-only across every boot of the rig; the newest one seeds the next).
 PARK_ROUND_TRIP_RECORDS = 3
+
+
+def warm_resume_ms(resume_log: Sequence[float], window: int = 5) -> Optional[float]:
+    """The median wake -> first decoded chunk of the last ``window`` WARM D
+    phases, or ``None`` before there is one. The boot's first resume is never
+    warm (first park, JIT, pinning -- the same exclusion as H34b's first
+    flip), and one slow resume must not move the price: the caller charges it
+    once per running stream, so a single cold 10 s resume at bs6 would hold D
+    for 60 s (27B review 29.09.)."""
+    warm = [float(ms) for ms in list(resume_log)[1:]][-max(1, int(window)):]
+    return statistics.median(warm) if warm else None
 
 
 def park_round_trip_s(dp_ms: float, pd_ms: float, resume_ms: Optional[float]) -> Optional[float]:

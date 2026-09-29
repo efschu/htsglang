@@ -163,6 +163,18 @@ def test_round_trip_record_is_per_checkpoint_and_form(tmp_path):
     assert pp.park_round_trip_s(2525.0, 0.0, 1000.0) is None                     # K7 before its flip
 
 
+def _flip_log(dp_ms=2525, pd_ms=2218, warm_pairs=3, cold_ms=24600):
+    """The boot's cold first flip (H34b: lane registration) and warm pairs."""
+    log = [{"sleep": "D", "wake": "P", "flip_ms": cold_ms}, {"sleep": "P", "wake": "D", "flip_ms": pd_ms}]
+    for _ in range(warm_pairs):
+        log += [{"sleep": "D", "wake": "P", "flip_ms": dp_ms}, {"sleep": "P", "wake": "D", "flip_ms": pd_ms}]
+    return log
+
+
+# NF z30w-park medians: first resume cold, then warm ones around 3123 ms
+WARM_RESUMES = [11800.0, 3100.0, 3123.0, 3150.0]
+
+
 def _front(running, waits_s, awake_s=30.0, uncached=6396, **attrs):
     from sglang.srt.weg2 import front as F
 
@@ -170,7 +182,7 @@ def _front(running, waits_s, awake_s=30.0, uncached=6396, **attrs):
     t_awake = now - awake_s
     ns = types.SimpleNamespace(
         epoch=6, _park_attempt_epoch=-1, _park_resume_epoch=-1, _park_immediate_dwell_epoch=-1,
-        _park_collect_epoch=-1, _last_resume_ms=None, _park_rt_seed=None,
+        _park_collect_epoch=-1, _resume_ms_log=[], flip_log=[], _park_rt_seed=None,
         _park_form_key="Qwen3.8-Flash-Next|arch=moe", t_awake=t_awake, _d_decode_epoch=6,
         _d_decode_t0=t_awake + 1.0,
         queue=[types.SimpleNamespace(rid=f"weg2-6-{18 + j}", est_uncached=uncached, t_arrive=now - w,
@@ -183,6 +195,7 @@ def _front(running, waits_s, awake_s=30.0, uncached=6396, **attrs):
                                             else (2218, "warm-P->D")),
     )
     ns._park_collect_window_s = lambda: F.Front._park_collect_window_s(ns)
+    ns._park_warm_legs_ms = lambda: F.Front._park_warm_legs_ms(ns)
     for k, v in attrs.items():
         setattr(ns, k, v)
     return F.Front._immediate_park_due, ns
@@ -198,13 +211,13 @@ def test_front_switch_off_is_the_immediate_park():
 def test_front_ski_default_prices_live_then_record_then_unmeasured(caplog):
     with envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.override(True):
         # this boot measured a round trip: 2525 + 2218 + 3123 ms = 7.87 s, 3 streams -> 23.6 s
-        fn, ns = _front(running=3, waits_s=[10.0], _last_resume_ms=3123.0)
+        fn, ns = _front(running=3, waits_s=[10.0], _resume_ms_log=list(WARM_RESUMES), flip_log=_flip_log())
         with caplog.at_level("INFO"):
             assert fn(ns, None, time.time()) is None
         assert ns.counters["park_collect_holds"] == 1
         assert any("PARK-COLLECT-WINDOW HOLD" in m and "ski-live" in m and "price_s=23.6" in m
                    for m in caplog.messages)
-        fn, ns = _front(running=3, waits_s=[24.0], _last_resume_ms=3123.0)
+        fn, ns = _front(running=3, waits_s=[24.0], _resume_ms_log=list(WARM_RESUMES), flip_log=_flip_log())
         assert fn(ns, None, time.time()).rid == "weg2-6-18"
         assert ns.counters["park_collect_rent"] == 1
         # nothing measured yet this boot: the record of this checkpoint x form seeds it
@@ -224,7 +237,7 @@ def test_front_ski_default_prices_live_then_record_then_unmeasured(caplog):
 def test_front_timer_override_and_caps():
     with envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.override(True), \
             envs.SGLANG_WEG2_PARK_COLLECT_WINDOW_S.override(20.0):
-        fn, ns = _front(running=3, waits_s=[0.2], _last_resume_ms=3123.0)
+        fn, ns = _front(running=3, waits_s=[0.2], _resume_ms_log=list(WARM_RESUMES), flip_log=_flip_log())
         assert fn(ns, None, time.time()) is None
         fn, ns = _front(running=3, waits_s=[20.5, 3.0])
         assert fn(ns, None, time.time()).rid == "weg2-6-18"
@@ -243,14 +256,53 @@ def test_front_timer_override_and_caps():
             assert fn(ns, None, time.time()) is None
 
 
-def test_front_decode_dwell_still_binds_first(caplog):
-    # the window is asked only once the decode dwell passed: 3 s of decode is too little
-    with envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.override(True):
+def test_front_collect_window_replaces_the_decode_dwell(caplog):
+    """27B review 29.09.: the ski price charges the round trip per running
+    stream; PARK-DECODE-DWELL charging it again would cost the same wait twice.
+    3 s awake: switch off, the decode dwell (D->P + P->D + resume) holds; switch
+    on, only K7's D->P (2.5 s) and the fairness floor remain, and the window
+    decides."""
+    with envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.override(False):
         fn, ns = _front(running=3, waits_s=[30.0], awake_s=3.0)
         with caplog.at_level("INFO"):
             assert fn(ns, None, time.time()) is None
-        assert ns.counters["park_collect_holds"] == 0
-        assert any("PARK-IMMEDIATE-DWELL" in m for m in caplog.messages)
+        assert ns.counters["park_immediate_dwell_holds"] == 1
+    caplog.clear()
+    with envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.override(True), \
+            envs.SGLANG_WEG2_PARK_COLLECT_WINDOW_S.override(20.0):
+        fn, ns = _front(running=3, waits_s=[30.0], awake_s=3.0)
+        with caplog.at_level("INFO"):
+            fn(ns, None, time.time())
+        assert ns.counters["park_immediate_dwell_holds"] == 0
+        assert not any("PARK-IMMEDIATE-DWELL" in m for m in caplog.messages)
+        assert any("PARK-COLLECT-WINDOW" in m for m in caplog.messages)
+
+
+def test_warm_resume_median_ignores_the_cold_first_and_one_outlier():
+    # the first resume (first park, JIT, pinning) is never a sample
+    assert pp.warm_resume_ms([11800.0]) is None
+    assert pp.warm_resume_ms([11800.0, 3100.0]) == 3100.0
+    # one 10 s outlier among warm resumes does not move the median
+    assert pp.warm_resume_ms([11800.0, 3100.0, 3123.0, 10000.0, 3150.0]) == pytest.approx(3136.5)
+    # only the last `window` warm samples count
+    assert pp.warm_resume_ms([9e3, 1e4, 1e4, 1e4, 3000.0, 3000.0, 3000.0], window=3) == 3000.0
+
+
+def test_front_one_slow_resume_does_not_blow_up_the_window():
+    """bs6 x one cold 10 s resume would be a 60 s window (27B review): the
+    live price is the warm median, 7.87 s per stream, not the last sample."""
+    with envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.override(True):
+        log = list(WARM_RESUMES) + [10000.0]                # the last D phase resumed slowly
+        fn, ns = _front(running=6, waits_s=[48.0], awake_s=60.0, _resume_ms_log=log,
+                        flip_log=_flip_log())
+        rt_s, src = ns._park_collect_window_s()
+        assert rt_s == pytest.approx((2525 + 2218 + 3136.5) / 1000.0) and src.startswith("ski-live:")
+        assert fn(ns, None, time.time()) is not None       # 48 s >= 6 x 7.88 s: fires
+        assert ns.counters["park_collect_rent"] == 1
+        # before any warm sample: the cold first flip/resume price nothing -> seed/unmeasured
+        fn, ns = _front(running=6, waits_s=[1.0], _resume_ms_log=[11800.0],
+                        flip_log=_flip_log(warm_pairs=0)[:1])
+        assert ns._park_collect_window_s()[1].startswith("ski-unmeasured")
 
 
 def test_front_writes_its_first_round_trips_per_form(tmp_path):
@@ -260,15 +312,23 @@ def test_front_writes_its_first_round_trips_per_form(tmp_path):
     submitted = []
     ns = types.SimpleNamespace(
         _park_form_key="Qwen3.8-27B|arch=dense", measured_record=str(path), _park_rt_written=0,
-        _last_resume_ms=2351.0, tag="dkr27b", commit="bb82fbcb68", epoch=4,
-        _derived_min_dwell_ms=lambda s, d: ((2167, "k7") if (s, d) == ("D", "P") else (2421, "k7")),
+        _resume_ms_log=[9800.0], tag="dkr27b", commit="bb82fbcb68", epoch=4,
+        flip_log=_flip_log(dp_ms=2167, pd_ms=2421, warm_pairs=0)[:1],
         _sidecar_submit=lambda fn, *a: submitted.append(fn(*a)))
+    ns._park_warm_legs_ms = lambda: F.Front._park_warm_legs_ms(ns)
     with envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.override(True):
+        # the cold first park (first flip 24.6 s, first resume 9.8 s) is no record
+        F.Front._note_park_round_trip(ns)
+        assert submitted == [] and not path.exists()
+        # warm flips and resumes: the warm medians are written, the cold ones never
+        ns.flip_log = _flip_log(dp_ms=2167, pd_ms=2421, warm_pairs=2)
+        ns._resume_ms_log = [9800.0, 2351.0, 2360.0, 2340.0]
         for _ in range(pp.PARK_ROUND_TRIP_RECORDS + 2):
             F.Front._note_park_round_trip(ns)
         assert len(submitted) == pp.PARK_ROUND_TRIP_RECORDS            # the first ones only
         got = pp.read_park_round_trip(str(path), "Qwen3.8-27B|arch=dense")
         assert got["round_trip_s"] == pytest.approx(6.939) and got["boot_tag"] == "dkr27b"
+        assert got["resume_ms"] == 2351.0 and got["dp_ms"] == 2167.0          # no cold sample in it
         ns._park_form_key, ns._park_rt_written = "", 0                   # no form: nothing written
         F.Front._note_park_round_trip(ns)
         assert len(submitted) == pp.PARK_ROUND_TRIP_RECORDS
