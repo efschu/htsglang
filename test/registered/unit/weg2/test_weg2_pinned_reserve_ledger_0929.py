@@ -130,6 +130,36 @@ class TheLedgerBooksTheWallThePoolsEnforce(_CleanEnv):
         self.assertTrue(self._pool_admitted(at))
 
 
+class TheLauncherLineNamesValueAndSource(_CleanEnv):
+    def test_env(self):
+        os.environ[phb.PINNED_HOST_RESERVE_ENV] = "2"
+        line = launcher.pinned_reserve_line(2.0, "env SGLANG_PINNED_HOST_RESERVE_GIB=2")
+        self.assertIn("effective=2.00 GiB source=env", line)
+
+    def test_ledger(self):
+        gib, src = hl.pinned_reserve_for_ranks(MARGIN, CAP, CG)
+        self._export(gib, src)
+        line = launcher.pinned_reserve_line(gib, src)
+        self.assertIn("effective=1.47 GiB source=ledger", line)
+        self.assertIn("ledger_wall_reserve=1.47 GiB", line)
+
+    def test_native(self):
+        line = launcher.pinned_reserve_line(None, "")
+        self.assertIn("effective=10.00 GiB source=native", line)
+        self.assertIn("ledger_wall_reserve=none", line)
+
+
+class TheRenderCarriesNoFixedReserve(CustomTestCase):
+    """27B 29.09.: no flat reserve in the container form -- the ledger's
+    measured margin decides; an operator -e still wins."""
+
+    def test_no_profile_renders_the_line(self):
+        from sglang.srt.weg2 import profile_docker as PD
+
+        for name, profile, fmt in (("27b", "qwen27b", "int8"), ("nf", "nextflash", "int4-mixed")):
+            self.assertNotIn("PINNED_HOST_RESERVE", PD.render(name, profile, fmt), name)
+
+
 class Wiring(CustomTestCase):
     def test_choose_gates_by_the_wall_and_hands_the_number_on(self):
         src = inspect.getsource(hl.choose)
@@ -140,7 +170,7 @@ class Wiring(CustomTestCase):
     def test_the_launcher_exports_it_unless_the_env_is_explicit(self):
         src = inspect.getsource(launcher.main)
         self.assertIn("PINNED_HOST_RESERVE_LEDGER_ENV", src)
-        self.assertIn("PINNED-RESERVE ranks=", src)
+        self.assertIn("pinned_reserve_line(", src)
 
 
 if __name__ == "__main__":
