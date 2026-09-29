@@ -139,20 +139,22 @@ class TestCallEdges(unittest.TestCase):
         # The host-peak argument: layer N+1's tmpfs pages may exist only once
         # layer N's host stack is dropped, i.e. after the device_loading_context
         # of the presplit has exited -- never inside it.
+        # The whole device_loading_context sits inside the presplit's outer
+        # `with weight_chunk_scope(...), outside_tag_pool(...)`; the prefetch
+        # call must stand in no `with` at all, and after the pool release.
         src = textwrap.dedent(inspect.getsource(fl.FusedMoE._ct_stream_presplit_now))
         fn = ast.parse(src).body[0]
-        inside_ctx = set()
+        inside_with = set()
         for node in ast.walk(fn):
-            if isinstance(node, ast.With) and any(
-                isinstance(i.context_expr, ast.Call)
-                and getattr(i.context_expr.func, "id", "") == "device_loading_context"
-                for i in node.items
-            ):
-                inside_ctx |= {id(n) for n in ast.walk(node)}
+            if isinstance(node, ast.With):
+                inside_with |= {id(n) for n in ast.walk(node)}
         calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
                  and isinstance(n.func, ast.Attribute) and n.func.attr == "prefetch_next"]
+        release = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                   and getattr(n.func, "id", "") == "release_active_tag_pools"]
         self.assertEqual(len(calls), 1)
-        self.assertNotIn(id(calls[0]), inside_ctx)
+        self.assertNotIn(id(calls[0]), inside_with)
+        self.assertGreater(calls[0].lineno, release[0].lineno)
 
     def test_presplit_hands_its_geometry_and_the_scheme_arms_the_layer(self):
         self.assertIn("_store_prefetch_next",

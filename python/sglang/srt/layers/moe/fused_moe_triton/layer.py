@@ -434,6 +434,24 @@ def ct_method_transposes(method) -> bool:
 CT_WORKER_TRANSPOSED_ATTR = "_ct_worker_transposed"
 
 
+def ct_h2d_rows(layer):
+    """BOOTZEIT 5d: the expert rows the presplit's copy to the card needs --
+    the ones this rank read (``store_adopt.repack_rows``: all but the
+    H2-vetoed, pad row kept) -- or None for all. z30w-park D TP0 read 29 of
+    201 rows per layer and copied all 201 (h2d 3.76 s over 48 layers). A
+    layer without an expert count (a test stand-in) copies everything."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_LOAD_H2D_READ_ROWS.get():
+        return None
+    num_local = getattr(layer, "num_local_experts", None)
+    if not num_local:
+        return None
+    from sglang.srt.layers.moe.store_adopt import repack_rows
+
+    return repack_rows(layer, int(num_local))
+
+
 def transpose_done_in_worker(layer) -> bool:
     """Hat der Lade-Worker die Shards DIESES Layers schon transponiert? (#68e)
 
@@ -1566,7 +1584,13 @@ class FusedMoE(torch.nn.Module):
             reason="ct-stream-presplit"
         ):
             if state.get("device_ctx", True):
-                with device_loading_context(self, state["device"]):
+                _h2d_rows = ct_h2d_rows(self)
+                _ctx = (
+                    device_loading_context(self, state["device"])
+                    if _h2d_rows is None
+                    else device_loading_context(self, state["device"], rows=_h2d_rows)
+                )
+                with _ctx:
                     t_body = time.perf_counter()
                     self.quant_method.process_weights_after_loading(self)
                     t_repack = time.perf_counter()
