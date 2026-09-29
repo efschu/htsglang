@@ -1460,6 +1460,7 @@ async def weg2_ple_prefetch_hint(raw_request: Request):
             serving_completion=raw_request.app.state.openai_serving_completion,
             encode=tm.tokenizer.encode,
             raw_request=raw_request,
+            serving_anthropic=raw_request.app.state.anthropic_serving,
         )
     except Exception as e:
         return _create_error_response(e)

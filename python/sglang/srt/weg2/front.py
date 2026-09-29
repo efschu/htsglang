@@ -6434,13 +6434,27 @@ class Front:
         (weg2/ple_admit_hint.py). Fire and forget; never delays the route."""
         if not envs.SGLANG_WEG2_PLE_ADMIT_HINT.get():
             return
-        from sglang.srt.weg2.ple_admit_hint import HINT_PATH, ple_hint_body, ple_hint_wanted
+        from sglang.srt.weg2.ple_admit_hint import (
+            HINT_PATH,
+            ple_hint_body,
+            ple_hint_skip_reason,
+            ple_hint_wanted,
+        )
 
         if not ple_hint_wanted(awake=self.awake, skip_leg1=p.skip_leg1):
             return
         body = ple_hint_body(p.path, p.payload)
         g = self.groups.get("P")
         if body is None or g is None or self.session is None:
+            # NF z30k: a wanted hint that is not sent is counted by name -- the
+            # /v1/messages hints were dropped here without a trace.
+            why = (ple_hint_skip_reason(p.path, p.payload) if body is None
+                   else ("no-group-P" if g is None else "no-session"))
+            self.counters["ple_hint_skipped"] += 1
+            n = self.counters["ple_hint_skipped"]
+            if n <= 8 or n % 256 == 0:
+                logger.info("WEG2 PLE-HINT SKIPPED rid=%s path=%s why=%s (n=%d)",
+                            p.rid, p.path, why, n)
             return
 
         async def _post() -> None:

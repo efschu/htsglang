@@ -16,6 +16,16 @@ is handled by P's scheduler before the wake, and PP0's pread workers read the
 first chunk while P wakes. The later leg 1 of the same rid finds the admission
 (``confirmed`` when the tokens are equal, re-admitted otherwise).
 
+NF z30k (29.09., boot ...dauer09290122_5527da6564): 71x ``BATCH queued
+(awake=D ...)``, 0x ``WEG2 PLE-HINT``, 0x ``dormant=1`` -- the agent load comes
+over ``/v1/messages`` (114 POSTs against 5 on ``/v1/chat/completions``) and the
+path table knew only the OpenAI shapes, so every hint was dropped silently and
+P's first cold chunk after a D->P flip waited ``ready=no wait_ms~1000`` on its
+own gather. An Anthropic leg 1 is tokenized through the SAME conversion its
+POST takes (``AnthropicServing._convert_to_chat_completion_request`` -- with
+the process's INLINE_SYSTEM_IN_PLACE choice -- then the chat serving's
+internal request), and a hint the front does not send is counted by name.
+
 A hint is only a prefetch: nothing is queued, nothing is answered but 200, a
 failed or late hint costs the gain and nothing else. Front switch
 ``SGLANG_WEG2_PLE_ADMIT_HINT`` (default on); P needs
@@ -30,7 +40,7 @@ from typing import Any, Callable, List, Optional
 logger = logging.getLogger(__name__)
 
 HINT_PATH = "/weg2/ple_prefetch_hint"
-_LEG1_PATHS = ("/v1/chat/completions", "/v1/completions", "/generate")
+_LEG1_PATHS = ("/v1/chat/completions", "/v1/completions", "/generate", "/v1/messages")
 
 
 # ---------------------------------------------------------------- front side
@@ -44,16 +54,25 @@ def ple_hint_wanted(*, awake: Optional[str], skip_leg1: bool = False) -> bool:
     return awake != "P" and not skip_leg1
 
 
+def ple_hint_skip_reason(path: str, payload: Any) -> Optional[str]:
+    """Why the front sends no hint for this leg 1 (None: it sends one)."""
+    if path not in _LEG1_PATHS:
+        return "path"
+    if not isinstance(payload, dict):
+        return "payload"
+    if not payload.get("rid"):
+        return "rid"
+    return None
+
+
 def ple_hint_body(path: str, payload: dict) -> Optional[dict]:
     """The hint body: the leg-1 path and payload (the payload is the one leg 1
     will POST: same rid, ``max_tokens`` 1, no stream)."""
-    if path not in _LEG1_PATHS:
+    if ple_hint_skip_reason(path, payload) is not None:
         return None
     body = dict(payload)
     body.pop("stream", None)
     body.pop("stream_options", None)
-    if not body.get("rid"):
-        return None
     return {"path": path, "payload": body}
 
 
@@ -67,6 +86,7 @@ async def build_ple_prefetch_hint(
     serving_completion: Any,
     encode: Callable[[str], List[int]],
     raw_request: Any = None,
+    serving_anthropic: Any = None,
 ):
     """Tokenize the leg-1 body the way its POST will be tokenized; returns a
     ``PlePrefetchHintReqInput`` or None (not a leg-1 shape)."""
@@ -90,7 +110,18 @@ async def build_ple_prefetch_hint(
             CompletionRequest,
         )
 
-        if path == "/v1/chat/completions":
+        if path == "/v1/messages":
+            if serving_anthropic is None:
+                return None
+            from sglang.srt.entrypoints.anthropic.protocol import (
+                AnthropicMessagesRequest,
+            )
+
+            req = serving_anthropic._convert_to_chat_completion_request(
+                AnthropicMessagesRequest(**payload)
+            )
+            serving = serving_chat
+        elif path == "/v1/chat/completions":
             req = ChatCompletionRequest(**payload)
             serving = serving_chat
         else:
