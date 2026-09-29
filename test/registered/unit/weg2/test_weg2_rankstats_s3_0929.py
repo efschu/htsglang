@@ -121,9 +121,9 @@ class TestPrefillFromTheLine(CustomTestCase):
 class TestDecodeFromTheRound(CustomTestCase):
     def test_emit_sums_rounds_and_gpu_ms_by_bs(self):
         drl = drl_mod.DecodeRoundLog(clock=None, rank=0)
-        drl._emit(SimpleNamespace(round_id=1, wall=0.0, bs=2, rows=3), [_round_result(10.0, 2.0)])
-        drl._emit(SimpleNamespace(round_id=2, wall=0.0, bs=2, rows=3), [_round_result(12.0)])
-        drl._emit(SimpleNamespace(round_id=3, wall=0.0, bs=4, rows=6), [_round_result(20.0, 5.0)])
+        drl._emit(SimpleNamespace(round_id=1, wall=0.0, bs=2, rows=3, depth=None), [_round_result(10.0, 2.0)])
+        drl._emit(SimpleNamespace(round_id=2, wall=0.0, bs=2, rows=3, depth=None), [_round_result(12.0)])
+        drl._emit(SimpleNamespace(round_id=3, wall=0.0, bs=4, rows=6, depth=None), [_round_result(20.0, 5.0)])
         d = rankstats._decode_block(_mr(drl=drl))
         self.assertEqual(d["rounds"], 3)
         self.assertAlmostEqual(d["gpu_ms"], 42.0, places=1)
