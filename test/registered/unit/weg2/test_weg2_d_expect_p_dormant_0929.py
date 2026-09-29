@@ -119,7 +119,8 @@ class ExpectationPassesUseTheSelector(CustomTestCase):
         tree = ast.parse(src)
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
                  and getattr(n.func, "id", None) == "d_expect_dormant_other"]
-        self.assertEqual(len(calls), 2)
+        # map pass, dry pass, and the early D start (BOOTZEIT 3) -- one selector
+        self.assertEqual(len(calls), 3)
         for label in ('"D(Karte, Erwartung)"', '"D(dry, expectation)"'):
             line = next(l for l in src.splitlines() if "budgets_from_dc(" in l and label in l)
             self.assertNotIn("P_WINDOWS_MIB - D_WINDOWS_MIB", line)
