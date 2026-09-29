@@ -1356,19 +1356,6 @@ class Envs:
     # serial form (A/B); the pool is bounded (2 x threads in flight) so the
     # sliding-window file buffer stays the only thing that holds mmaps.
     SGLANG_LOAD_CONSUMER_THREADS = EnvInt(4)
-    # BOOTZEIT 3 Stufe 1 (29.09.): run the per-layer expert presplit (Marlin
-    # repack + host-store spill) on ONE dedicated serial thread instead of the
-    # loader thread. rc12z30o3: the presplit was ~45 % of every rank's load
-    # (PP0 26.8 of 60 s) and blocked the loader, so reading and consuming
-    # stood still while it ran. The thread mirrors the loader's TMS region
-    # (thread-local tag + interesting flag) and owns every tag-pool step of
-    # the presplit; the loader thread does no tag-pool step during
-    # load_weights. False = the presplit stays on the loader thread (fnFL2x31).
-    SGLANG_LOAD_PRESPLIT_THREAD = EnvBool(False)
-    # Layers the presplit thread may have QUEUED behind the running one. Each
-    # queued layer keeps its full host [E] stack alive (PP0 ~1.4 GB/layer),
-    # so this bounds the extra host RAM; a full queue blocks the submitter.
-    SGLANG_LOAD_PRESPLIT_DEPTH = EnvInt(1)
     # BOOTZEIT 3 Stufe 2b (29.09.): the NON-expert tensors (dense, embed,
     # lm_head, norms, draft) read ONCE per boot. With the coalesced O_DIRECT
     # stream every group reads them from disk; here they go through the page
