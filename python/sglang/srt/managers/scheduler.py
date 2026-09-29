@@ -243,6 +243,7 @@ from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision ver
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import d_seat_vram as _weg2_d_seat_vram  # D-MEM-SCHED stage between wakes
 from sglang.srt.weg2 import skip_first as _weg2_skip_first  # E2 in a mixed wake cohort
+from sglang.srt.weg2 import short_read as _weg2_short_read  # held short wake reads
 from sglang.srt.weg2 import tail_adopt as _weg2_tail_adopt
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
@@ -6426,7 +6427,10 @@ class Scheduler(
             req._1471_short = False
             return "complete"
         req._1471_short = True
-        if now - float(getattr(req, "_1456_last", 0.0) or 0.0) < 2.0:
+        if (now - float(getattr(req, "_1456_last", 0.0) or 0.0) < 2.0
+                and not _weg2_short_read.reread_now(req, _have2)):
+            # a read reaped short with its span in the store is re-read at the
+            # next tick while it moves (weg2/short_read.py); else the 2 s timer
             return "wait"
         if not allow_reissue:
             # weg2xsn296 (Task #9, xsn287 class): the re-read is a TP
@@ -6439,6 +6443,7 @@ class Scheduler(
             return "due"
         req._1456_last = now
         req._1456_n = int(getattr(req, "_1456_n", 0) or 0) + 1
+        _weg2_short_read.note_reissue(req, _have2)
         clear = getattr(self, "_clear_prefetch_deferral_fields", None)
         if clear is not None:
             clear(req)  # the shortfall mark is ours to re-issue, not the drain's
