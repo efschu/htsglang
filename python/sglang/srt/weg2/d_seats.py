@@ -56,10 +56,13 @@ per layer and tail) and the graph pool (shared by every bs) stay at the cap.
 """
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 PARK_ENV = "SGLANG_WEG2_D_PARK"
 #: mirrors ``corridor_guard.GROUP_ENV`` / ``retract_retain.GROUP_ENV``.
@@ -310,19 +313,38 @@ class ResumeBook:
     margin_tokens: int = -1
     steps: int = RESUME_STEPS_DEFAULT
     _hyst: Dict[str, object] = field(default_factory=dict)
+    #: who armed the margin: "env" (RESUME_MARGIN_ENV) or "arrival-seat"
+    source: str = "env"
+    _told: set = field(default_factory=set)
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "ResumeBook":
+        """ARRIVAL-SEAT (user rule 29.09. ~19:40Z, y3j needle weg2-40-151):
+        with the rule on and no explicit margin, the margin is 0 -- a
+        pressure-parked request resumes as soon as it FITS (avail - need >= 0
+        for ``steps`` passes), the same seat+KV verdict the rule gives an
+        arrival. "Resume when no older request is live" alone parked the
+        needle behind an 11-minute agent turn while its 64k fit beside it.
+        The older-first order stays for the case the KV does not pay."""
         env = os.environ if env is None else env
-        try:
-            margin = int(str(env.get(RESUME_MARGIN_ENV, "-1")).strip())
-        except ValueError:
-            margin = -1
+        source = "env"
+        raw = env.get(RESUME_MARGIN_ENV)
+        if raw is None or not str(raw).strip():
+            from sglang.srt.weg2 import arrival_seat_rule as _asr
+
+            margin = 0 if _asr.enabled(env) else -1
+            if margin == 0:
+                source = "arrival-seat"
+        else:
+            try:
+                margin = int(str(raw).strip())
+            except ValueError:
+                margin = -1
         try:
             steps = int(str(env.get(RESUME_STEPS_ENV, RESUME_STEPS_DEFAULT)).strip())
         except ValueError:
             steps = RESUME_STEPS_DEFAULT
-        return cls(margin_tokens=margin, steps=max(1, steps))
+        return cls(margin_tokens=margin, steps=max(1, steps), source=source)
 
     def early_ok(self, rid: str, *, avail_tokens: int, need_tokens: int) -> bool:
         if self.margin_tokens < 0:
@@ -334,10 +356,22 @@ class ResumeBook:
             h = self._hyst[rid] = RestoreHysteresis(self.steps)
         return bool(h.update(int(avail_tokens) - int(need_tokens) >= self.margin_tokens))
 
+    def note_resume(self, rid: str, *, avail_tokens: int, need_tokens: int) -> None:
+        """The marker of an early resume the arrival rule armed, once per rid."""
+        if self.source != "arrival-seat" or rid in self._told:
+            return
+        self._told.add(rid)
+        logger.info(
+            "WEG2 ARRIVAL-SEAT PRESSURE-RESUME rid=%s avail=%d need=%d steps=%d -- an older "
+            "request is live but this one fits now: it resumes beside it (no wait behind "
+            "the older one while its KV pays)", rid, int(avail_tokens), int(need_tokens),
+            int(self.steps))
+
     def forget(self, live_rids: Iterable[str]) -> None:
         keep = set(live_rids)
         for rid in [r for r in self._hyst if r not in keep]:
             del self._hyst[rid]
+        self._told &= keep
 
 
 #: WT: set on every request the wake released (at the wake or from the #1471
@@ -458,6 +492,7 @@ def admission_gate(
                 getattr(r, "output_ids", None) or ()
             )
             if resume_book.early_ok(str(r.rid), avail_tokens=int(avail_tokens), need_tokens=need):
+                resume_book.note_resume(str(r.rid), avail_tokens=int(avail_tokens), need_tokens=need)
                 continue
         blocked.add(str(r.rid))
     if resume_book is not None:
