@@ -549,12 +549,20 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             )
             replace_tensor("w2_weight_packed", _leer2)
         else:
+            import time as _time
+
+            from sglang.srt.layers.moe.expert_offload import _STORE_CLOCK
+            from sglang.srt.layers.moe.store_adopt import repack_rows
+
+            _rows = repack_rows(layer, num_experts)
+            _t_marlin = _time.perf_counter()
             marlin_w13_qweight = gptq_marlin_moe_repack(
                 layer.w13_weight_packed,
                 layer.w13_g_idx_sort_indices,
                 layer.w13_weight_packed.shape[1] * self.packed_factor,
                 layer.w13_weight_packed.shape[2],
                 self.num_bits,
+                rows=_rows,
             )
             replace_tensor("w13_weight_packed", marlin_w13_qweight)
             marlin_w2_qweight = gptq_marlin_moe_repack(
@@ -563,8 +571,12 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 layer.w2_weight_packed.shape[1] * self.packed_factor,
                 layer.w2_weight_packed.shape[2],
                 self.num_bits,
+                rows=_rows,
             )
             replace_tensor("w2_weight_packed", marlin_w2_qweight)
+            _STORE_CLOCK["marlin_s"] += _time.perf_counter() - _t_marlin
+            _STORE_CLOCK["rows_repacked"] += num_experts if _rows is None else len(_rows)
+            _STORE_CLOCK["rows_total"] += num_experts
         # Repack scales
         # #112/3 DIESELBE HOST-ALLOKATION, DIESELBE BEHANDLUNG.
         #
@@ -593,6 +605,11 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 if _t is not None and _t.device.type != "cuda":
                     replace_tensor(_attr, _t.data.to(_dev2))
 
+        import time as _time
+
+        from sglang.srt.layers.moe.expert_offload import _STORE_CLOCK
+
+        _t_scales = _time.perf_counter()
         marlin_w13_scales = marlin_moe_permute_scales(
             layer.w13_weight_scale,
             layer.w13_weight_packed.shape[2],
@@ -609,6 +626,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             self.group_size,
         )
         replace_tensor("w2_weight_scale", marlin_w2_scales)
+        _STORE_CLOCK["scales_s"] += _time.perf_counter() - _t_scales
 
         # Repack zero
         if not self.sym:
@@ -654,7 +672,9 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             presplit_expert_offload_after_repack,
         )
 
+        _t_presplit = _time.perf_counter()
         presplit_expert_offload_after_repack(layer)
+        _STORE_CLOCK["presplit_s"] += _time.perf_counter() - _t_presplit
 
     def restore_weights_before_loading(self, layer: torch.nn.Module):
         """Forcibly resize parameters back to their original shapes (e.g., GPTQ format) before loading weights."""
