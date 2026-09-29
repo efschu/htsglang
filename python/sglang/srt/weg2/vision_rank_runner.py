@@ -86,6 +86,11 @@ logger = logging.getLogger(__name__)
 #: whole tower 0.86 GiB).
 RESIDUE_TOLERANCE_BYTES = 2 * vrs.MIB
 
+#: W110 (F10 Rest, 29.09.): a teardown residue the stage did NOT allocate --
+#: a live block on a stream the stage never ran on (another thread of PP0:
+#: HiCache, the PP transport, the async forward passes). Named, no verdict.
+W_FOREIGN_RESIDUE = "W110b Weg2VisionForeignResidue"
+
 
 # ---------------------------------------------------------------------------
 # arming (Scheduler.__init__, once)
@@ -350,6 +355,100 @@ def own_torch_bytes(device: torch.device) -> Optional[int]:
         return None
 
 
+@dataclass(frozen=True)
+class Survivor:
+    """One allocator block live after the teardown that was not live before
+    the build. ``segment_bytes`` is the cudaMalloc segment it sits in: a live
+    block keeps its whole segment from ``empty_cache`` -- a 1-10 MiB request
+    is served from a 20 MiB large-buffer segment, which is the NVML
+    ``vram_residue_mib=+18/+20`` of the 0928 NF boots."""
+
+    address: int
+    size: int
+    stream: int
+    segment_bytes: int
+    segment_type: str
+    new_segment: bool
+    own: bool
+
+
+def live_blocks(device: torch.device, snapshot: Optional[Callable[[], Any]] = None
+                ) -> Optional[Dict[str, Any]]:
+    """{"blocks": {address: (size, stream, segment_bytes, segment_type,
+    segment_address)}, "segments": {segment_address}} of every ACTIVE block of
+    this process on ``device`` (the caching allocator's own snapshot, every
+    pool), or None when it cannot be taken. Host bookkeeping only."""
+    if device.type != "cuda" and snapshot is None:
+        return None
+    try:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        segs = (snapshot or torch.cuda.memory_snapshot)()
+    except Exception:  # noqa: BLE001 -- unmeasured is reported as n/a
+        return None
+    blocks: Dict[int, Tuple[int, int, int, str, int]] = {}
+    seg_addrs = set()
+    for seg in segs or ():
+        if int(seg.get("device", idx)) != int(idx):
+            continue
+        base = int(seg.get("address", 0))
+        seg_addrs.add(base)
+        total = int(seg.get("total_size", 0))
+        stype = str(seg.get("segment_type", "?"))
+        stream = int(seg.get("stream", 0) or 0)
+        off = 0
+        for b in seg.get("blocks", ()) or ():
+            size = int(b.get("size", 0))
+            addr = int(b.get("address", base + off))
+            off += size
+            if str(b.get("state", "")) == "active_allocated":
+                blocks[addr] = (size, stream, total, stype, base)
+    return {"blocks": blocks, "segments": seg_addrs}
+
+
+def stage_survivors(before: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]],
+                    own_streams: Sequence[int]) -> Optional[List[Survivor]]:
+    """The blocks live after the teardown that were not live (at that address
+    and size) before the build; ``own`` = allocated on a stream the stage ran
+    on. None when either snapshot is missing."""
+    if before is None or after is None:
+        return None
+    b0 = before["blocks"]
+    own = {int(s) for s in own_streams if s is not None}
+    out = []
+    for addr, (size, stream, total, stype, base) in sorted(after["blocks"].items()):
+        prev = b0.get(addr)
+        if prev is not None and prev[0] == size:
+            continue
+        out.append(Survivor(address=addr, size=size, stream=stream, segment_bytes=total,
+                            segment_type=stype, new_segment=base not in before["segments"],
+                            own=stream in own))
+    return out
+
+
+def note_survivors(out: "StageOutcome", survivors: Optional[List[Survivor]]) -> None:
+    if survivors is None:
+        return
+    out.survivors = list(survivors)
+    out.own_residue_bytes = sum(s.size for s in survivors if s.own)
+    out.foreign_residue_bytes = sum(s.size for s in survivors if not s.own)
+
+
+def _stream_id(stream: Any) -> Optional[int]:
+    try:
+        return int(stream.cuda_stream) if stream is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fmt_survivors(survivors: Sequence[Survivor], limit: int = 6) -> str:
+    parts = [f"{s.size / vrs.MIB:.1f}MiB@{'own' if s.own else 'foreign'}:stream=0x{s.stream:x}"
+             f":seg={s.segment_bytes / vrs.MIB:.0f}MiB/{s.segment_type}"
+             f"{'/new' if s.new_segment else ''}" for s in survivors[:limit]]
+    if len(survivors) > limit:
+        parts.append(f"+{len(survivors) - limit} more")
+    return ", ".join(parts)
+
+
 def host_bytes() -> Tuple[Optional[int], Optional[int]]:
     """(cgroup memory.current, this process's RssAnon) in bytes, or None."""
     cur = anon = None
@@ -369,6 +468,10 @@ def host_bytes() -> Tuple[Optional[int], Optional[int]]:
     except Exception:  # noqa: BLE001
         anon = None
     return cur, anon
+
+
+def _mib_or_na(v: Optional[int]) -> str:
+    return "n/a" if v is None else f"{v / vrs.MIB:+.1f}"
 
 
 def _delta_mib(a: Optional[int], b: Optional[int]) -> str:
@@ -399,6 +502,15 @@ class StageOutcome:
     #: run=1: NVML +44.0 MiB with every tower tensor released), which is not a
     #: teardown leak. The NVML figure stays in the line as vram_residue_mib.
     torch_residue_bytes: Optional[int] = None
+    #: W110 F10-Rest (29.09.): the torch delta is PROCESS-wide -- every thread
+    #: of PP0 allocates from the same device counter, and in the async form
+    #: whole forward passes run inside the window. The allocator snapshot
+    #: before the build and after the teardown names the blocks that survived
+    #: (``Survivor``); a block on one of the stage's own streams is the
+    #: stage's residue (W110), one on any other stream is foreign (W110b).
+    survivors: List["Survivor"] = field(default_factory=list)
+    own_residue_bytes: Optional[int] = None
+    foreign_residue_bytes: Optional[int] = None
     #: H125: where the tower sat (kvtail | free) and where it came from
     place: str = ""
     source: str = ""
@@ -461,6 +573,11 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
     touched = False  # did the build start (anything to release)?
     module = res = views = plan = rows = slab = None
     on_card = device.type == "cuda"
+    # W110 F10-Rest: the allocator's live blocks before the build and the
+    # streams the stage allocates on (the scheduler's current one; the read
+    # stream joins below) -- the survivors are judged against these
+    blocks0 = live_blocks(device) if on_card else None
+    own_streams = [_stream_id(torch.cuda.current_stream(device))] if on_card else []
     leg, t0 = "items", clock()
     try:
         try:
@@ -541,6 +658,7 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
                     scheduler._weg2_vision_source = src
             out.source = src.kind
             stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+            own_streams.append(_stream_id(stream))
             rep = vrs.read_into(src.path, vrs.shift_plan(plan, src.shift), stream=stream,
                                 direct=src.direct)
             out.read_bytes, out.direct = rep.bytes_read, rep.direct
@@ -600,6 +718,8 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
     torch1 = own_torch_bytes(device)
     if torch0 is not None and torch1 is not None:
         out.torch_residue_bytes = torch1 - torch0
+    if on_card:
+        note_survivors(out, stage_survivors(blocks0, live_blocks(device), own_streams))
     out.host_current_delta = _delta_mib(host0[0], host1[0])
     out.host_anon_delta = _delta_mib(host0[1], host1[1])
     return out
@@ -630,6 +750,8 @@ def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
             f"read_mib={out.read_bytes / vrs.MIB:.1f} "
             f"legs_ms=({legs}) sync_ms={sync} vram_residue_mib={residue} "
             f"torch_residue_mib={torch_res} "
+            f"own_residue_mib={_mib_or_na(out.own_residue_bytes)} "
+            f"foreign_residue_mib={_mib_or_na(out.foreign_residue_bytes)} "
             f"host_current_delta_mib={out.host_current_delta} host_anon_delta_mib={out.host_anon_delta}")
     if out.encode_ms or out.teardown_ms:  # (d) Befund 28.09.: the two long legs, split
         line += " encode_split_ms=(%s) teardown_split_ms=(%s)" % (
@@ -640,15 +762,31 @@ def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
     else:
         logger.error("%s %s rids=%s -- %s", out.code, line, list(rids), out.detail)
     leak, basis = teardown_leak_bytes(out)
+    own = [s for s in out.survivors if s.own]
+    foreign = [s for s in out.survivors if not s.own]
     if leak is not None and leak > RESIDUE_TOLERANCE_BYTES:
         logger.error("%s run=%d: this process holds %.1f MiB more on the card after the "
-                     "teardown than before the build (%s)", W_TEARDOWN, run,
-                     leak / vrs.MIB, basis)
+                     "teardown than before the build (%s)%s", W_TEARDOWN, run,
+                     leak / vrs.MIB, basis,
+                     f" survivors=({_fmt_survivors(own)})" if own else "")
+    if out.foreign_residue_bytes is not None and out.foreign_residue_bytes > RESIDUE_TOLERANCE_BYTES:
+        # not the stage's: a block another stream allocated inside the window
+        # (and, in a segment the window created, what keeps NVML +20 MiB)
+        logger.warning("%s run=%d: %.1f MiB live after the teardown on streams the stage never "
+                       "ran on -- not the tower's (torch delta %s MiB, stage-own %.1f MiB) "
+                       "survivors=(%s)", W_FOREIGN_RESIDUE, run,
+                       out.foreign_residue_bytes / vrs.MIB, torch_res,
+                       (out.own_residue_bytes or 0) / vrs.MIB, _fmt_survivors(foreign))
 
 
 def teardown_leak_bytes(out: "StageOutcome") -> Tuple[Optional[int], str]:
-    """(bytes, basis) W110 judges: the torch-allocated delta when measured,
-    else the NVML process delta (a rank without torch accounting)."""
+    """(bytes, basis) W110 judges: the stage's OWN survivors when the
+    allocator snapshot was taken (F10-Rest 29.09.: the torch delta is
+    process-wide -- NF z30w-park run=1 +6.5 MiB with every tower tensor
+    stripped, the rows on the host), else the torch-allocated delta, else the
+    NVML process delta (a rank without torch accounting)."""
+    if out.own_residue_bytes is not None:
+        return out.own_residue_bytes, "the stage's own surviving blocks (allocator snapshot)"
     if out.torch_residue_bytes is not None:
         return out.torch_residue_bytes, "torch allocated delta"
     if out.residue_bytes is not None:
@@ -759,6 +897,10 @@ class AsyncStage:
     #: passes run while the stage is in flight, their transients are freed
     #: again by the time finish_async_stage measures between two passes
     torch0: Optional[int] = None
+    #: W110 F10-Rest: live blocks before the build, and the streams the stage
+    #: allocates on (the scheduler's at the build/teardown, the worker's)
+    blocks0: Optional[Dict[str, Any]] = None
+    own_streams: List[Optional[int]] = field(default_factory=list)
 
     def done(self) -> bool:
         return self.future is not None and self.future.done()
@@ -790,6 +932,9 @@ def start_async_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_conf
     rope_keys = set(rope_factory._ROPE_DICT)
     own0, host0 = own_card_bytes(device), host_bytes()
     torch0 = own_torch_bytes(device)
+    on_card = device.type == "cuda"
+    blocks0 = live_blocks(device) if on_card else None
+    own_streams = [_stream_id(torch.cuda.current_stream(device))] if on_card else []
     module = res = None
     t0 = clock()
     try:
@@ -824,6 +969,7 @@ def start_async_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_conf
 
     def _work():
         stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        own_streams.append(_stream_id(stream))  # before any allocation on it
         ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
         legs = {}
         with ctx:
@@ -842,7 +988,8 @@ def start_async_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_conf
 
     st = AsyncStage(reqs=list(reqs), items=items, out=out, module=module, res=res,
                     allocator=allocator, device=device, rope_keys=rope_keys,
-                    own0=own0, host0=host0, t_start=clock(), torch0=torch0)
+                    own0=own0, host0=host0, t_start=clock(), torch0=torch0,
+                    blocks0=blocks0, own_streams=own_streams)
     st.future = (submit or _async_pool().submit)(_work)
     return st
 
@@ -887,6 +1034,10 @@ def finish_async_stage(st: AsyncStage, clock: Callable[[], float] = time.perf_co
     torch1 = own_torch_bytes(st.device)
     if st.torch0 is not None and torch1 is not None:
         out.torch_residue_bytes = torch1 - st.torch0
+    if st.device.type == "cuda":
+        # the forward passes of the async window allocate on forward_stream /
+        # the PP transport's streams -- foreign by stream, never the stage's
+        note_survivors(out, stage_survivors(st.blocks0, live_blocks(st.device), st.own_streams))
     out.host_current_delta = _delta_mib(st.host0[0], host1[0])
     out.host_anon_delta = _delta_mib(st.host0[1], host1[1])
     return out
