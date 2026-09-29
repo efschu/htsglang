@@ -86,6 +86,39 @@ class DualLayoutLauncher(CustomTestCase):
         self.assertIn("if image_rec is not None:\n        log(host_ledger.format_dormant_image(image_rec))\n"
                       "        host_ledger.append_measured_record(", src)
         # MPS env reaches BOTH groups, before each launch.
-        self.assertIn("spec_p.env.update(ns._dual_mps_env)\n    launch_group(spec_p", src)
+        self.assertIn("spec_p.env.update(ns._dual_mps_env)\n    spec_p.env.update(dual_share_env(ns, \"P\"))\n"
+                      "    launch_group(spec_p", src)
         self.assertIn('spec_d.env.update(getattr(ns, "_dual_mps_env", None) or {})\n        launch_group(spec_d',
                       src)
+
+    def test_dual_share_implies_dual_and_splits_the_union_roles(self):
+        ns = _ns("--dual-share", "--tag", "x" * 90)
+        L.resolve_dual_layout(ns)
+        self.assertTrue(ns.dual_layout)
+        self.assertEqual(ns.flip_weights, "resident")
+        p, d = L.dual_share_env(ns, "P"), L.dual_share_env(ns, "D")
+        self.assertEqual((p["SGLANG_WEG2_UNION_MODE"], d["SGLANG_WEG2_UNION_MODE"]), ("bind", "own"))
+        self.assertEqual(p["SGLANG_WEG2_DUAL_SHARE"], "1")
+        self.assertNotIn("SGLANG_WEG2_DUAL_SHARE", d)
+        self.assertEqual(p["SGLANG_WEG2_UNION_DIR"], d["SGLANG_WEG2_UNION_DIR"])
+        # a 90-character tag still leaves room for the card socket (<= 107 bytes)
+        self.assertLess(len(p["SGLANG_WEG2_UNION_DIR"]) + len("/draft/u-0123456789ab.sock"), 107)
+        self.assertEqual(L.dual_share_env(_ns(), "P"), {})
+
+    def test_planned_dc_takes_the_lowered_p_budget_plus_overhead(self):
+        import types
+
+        cards = [types.SimpleNamespace(uuid=u) for u in ("A", "B", "C")]
+        dc = L.dual_share_planned_dc(cards, [28000, 17000, 17000],
+                                     "--max-running-requests=2 --rank-gpu-memory-mib 10100,12600,12000", 1500)
+        self.assertEqual(dc, {"A": 11600, "B": 14100, "C": 13500})
+        dc = L.dual_share_planned_dc(cards, [28000, 17000, 17000], "", 0)
+        self.assertEqual(dc, {"A": 28000, "B": 17000, "C": 17000})
+
+    def test_main_launches_d_right_after_p_under_dual_share(self):
+        src = inspect.getsource(L.main)
+        i = src.index('spec_p.env.update(dual_share_env(ns, "P"))')
+        blk = src[i:i + 1400]
+        self.assertLess(blk.index("launch_group(spec_p"), blk.index("launch_group(_sd"))
+        self.assertLess(blk.index("launch_group(_sd"), blk.index("if dry:"))
+        self.assertIn('spec_d = getattr(ns, "_dual_spec_d", None)', src)

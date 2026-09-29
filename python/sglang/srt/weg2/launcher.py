@@ -13522,6 +13522,9 @@ def resolve_dual_layout(ns) -> None:
     Refused by name: --weg2-d-adopt on (D would hold placeholders that only a
     flip fills -- and there is no flip), --dual-mps on without --dual-layout.
     Off: no-op."""
+    if getattr(ns, "dual_share", False) and not getattr(ns, "dual_layout", False):
+        print("WEG2-DUAL --dual-share implies --dual-layout", flush=True)
+        ns.dual_layout = True
     dual = bool(getattr(ns, "dual_layout", False))
     if not dual:
         if str(getattr(ns, "dual_mps", "off")) == "on":
@@ -13543,6 +13546,43 @@ def resolve_dual_layout(ns) -> None:
         print(f"WEG2-DUAL --flip-weights {getattr(ns, 'flip_weights', 'family')} -> resident "
               "(both groups stay awake, no weight ever sleeps)", flush=True)
         ns.flip_weights = "resident"
+
+
+def dual_share_env(ns, group: str) -> Dict[str, str]:
+    """DUAL-TP3PP3 --dual-share: the union env of one group. D OWNS the card's
+    image (and publishes its installed TP vectors with it), P BINDS the part of
+    its stage that is D's shard on the same card. Off: {}."""
+    if not getattr(ns, "dual_share", False):
+        return {}
+    import hashlib
+
+    # SHORT on purpose: the card sockets live under it and a unix socket path
+    # takes at most ~107 bytes; boot tags on this rig run past 60 characters.
+    _h = hashlib.sha1(str(ns.tag).encode()).hexdigest()[:10]
+    env = {"SGLANG_WEG2_UNION_DIR": f"/dev/shm/wu-{_h}",
+           "SGLANG_WEG2_UNION_MODE": "own" if group == "D" else "bind"}
+    if group == "P":
+        env["SGLANG_WEG2_DUAL_SHARE"] = "1"
+    return env
+
+
+def dual_share_planned_dc(cards, budgets_p: List[int], extra_p: str, overhead_mib: int) -> Dict[str, int]:
+    """What P will hold per card, from its PLAN: the effective P budget (an
+    --extra-p '--rank-gpu-memory-mib' lowers the launcher's, W100) plus what P
+    holds outside it. Indexed like ``cards`` (P rank i on cards[i])."""
+    eff = [int(b) for b in budgets_p]
+    toks = shlex.split(extra_p or "")
+    for i, t in enumerate(toks):
+        raw = None
+        if t == "--rank-gpu-memory-mib" and i + 1 < len(toks):
+            raw = toks[i + 1]
+        elif t.startswith("--rank-gpu-memory-mib="):
+            raw = t.split("=", 1)[1]
+        if raw is not None:
+            vals = [int(x) for x in raw.split(",") if x]
+            if len(vals) == len(eff):
+                eff = [min(a, b) for a, b in zip(eff, vals)]
+    return {c.uuid: int(eff[i]) + int(overhead_mib) for i, c in enumerate(cards)}
 
 
 def start_dual_mps(ns, log, dry: bool) -> Dict[str, str]:
@@ -20615,6 +20655,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "budget is lowered with --extra-p '--rank-gpu-memory-mib ...' (W100 allows "
                          "lowering). Refuses --weg2-d-adopt on and --idle-layout pp. Default off: the "
                          "launcher is byte-identical.")
+    ap.add_argument("--dual-share", action="store_true", default=False,
+                    help="DUAL-TP3PP3 stage 1b (implies --dual-layout): P's stage computes on D's TP "
+                         "shards (shells over D's three shards of its layers) and binds the shard of the "
+                         "D rank on its card to D's bytes via the union image. D boots right after P as "
+                         "the union OWNER, sized from P's PLANNED budget (+ --dual-p-overhead-mib); P "
+                         "waits for D's image before it loads anything.")
+    ap.add_argument("--dual-p-overhead-mib", type=int, default=1500,
+                    help="DUAL-TP3PP3 --dual-share: what P holds on a card outside its "
+                         "--rank-gpu-memory-mib budget (CUDA context, graphs, activations), charged "
+                         "when D is sized from P's plan instead of P's measurement.")
     ap.add_argument("--dual-mps", choices=("off", "on"), default="off",
                     help="DUAL-TP3PP3: start a private MPS control daemon before the groups (pipe dir "
                          "under the boot's run dir) so P and D kernels run concurrently on a card instead "
@@ -24847,7 +24897,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(f"{_des.FREE_READ_MARKER} P journals its free-memory reads -> {_journal_dir}")
     ns._dual_mps_env = start_dual_mps(ns, log, dry)
     spec_p.env.update(ns._dual_mps_env)
+    spec_p.env.update(dual_share_env(ns, "P"))
     launch_group(spec_p, tree, log, dry)
+    ns._dual_spec_d = None
+    if getattr(ns, "dual_share", False):
+        # DUAL-TP3PP3 1b: D boots NOW as the union owner; P holds before its
+        # load until D's image (and D's installed vectors) are published.
+        _dual_dc = dual_share_planned_dc(cards, state.budgets["P"], getattr(ns, "extra_p", ""),
+                                         int(getattr(ns, "dual_p_overhead_mib", 1500)))
+        log("WEG2-DUAL-SHARE D sized from P's PLAN (budget + overhead, MiB): " + ", ".join(
+            f"nvml{c.nvml_index} {_dual_dc[c.uuid]}" for c in cards))
+        _sd, _ = _d_spec_from(_dual_dc, "D(dual-share, P-Plan)", dual_share_env(ns, "D"))
+        _sd.env.update(ns._dual_mps_env)
+        state.argv["D"] = " ".join(shlex.quote(a) for a in _sd.argv)
+        launch_group(_sd, tree, log, dry)
+        ns._dual_spec_d = _sd
     if dry:
         _dry_terms: List[Dict[str, object]] = []
         _dry_other, _dry_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
@@ -25097,8 +25161,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(_ln)
 
     # 5. group D
-    spec_d = None
-    if _early_d is not None:
+    spec_d = getattr(ns, "_dual_spec_d", None)  # DUAL-TP3PP3 1b: launched right after P
+    if spec_d is None and _early_d is not None:
         spec_d = _d_early_verdict(_early_d, dc_p)
     if spec_d is None:
         spec_d, _ = _d_spec_from(dc_p, "D")
