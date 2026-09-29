@@ -12951,7 +12951,9 @@ def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
     ``SGLANG_WEG2_OWNED_MISS_RECORD`` directory (``layers.moe.pool_miss_cost``)
     > LOG-BOOTSTRAP (sidecar entry of ``weg2.tools.owned_miss_record``, "aus
     Log (Uebergang)", dropped once a rank record exists) > BUILTIN (profile
-    constant ``OWNED_MISS_MS``) > UNMEASURED. ``(None, "")`` when nothing is
+    constant ``OWNED_MISS_MS``) > UNMEASURED. The env names the records root
+    of the line; the records of this model lie in its
+    ``<model_id>/owned_miss`` (``pool_miss_cost.record_dir_for``). ``(None, "")`` when nothing is
     measured -- the solve then keeps its seed, byte-identical."""
     from sglang.srt.planner import expert_residency as _er
 
@@ -12961,7 +12963,10 @@ def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
         builtin_src = _pconst_boots("OWNED_MISS_MS", profile)
     except (KeyError, TypeError):
         builtin, builtin_src = None, ""
-    rank_dir = str(env_d.get("SGLANG_WEG2_OWNED_MISS_RECORD", "") or "").strip() or None
+    from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
+
+    root = str(env_d.get("SGLANG_WEG2_OWNED_MISS_RECORD", "") or "").strip()
+    rank_dir = _miss_cost.record_dir_for(root, ns.model) if root else None
     ms, tier, src = _er.resolve_owned_miss_ms(
         _er.read_owned_miss_records(measured_record_path()),
         rank_records=_er.read_owned_miss_rank_records(rank_dir), host=int(host),

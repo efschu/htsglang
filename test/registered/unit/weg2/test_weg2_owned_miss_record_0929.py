@@ -14,6 +14,7 @@ at bs1/bs2 -- the solve steered on the seed.
 from __future__ import annotations
 
 import json
+import os
 import types
 
 import pytest
@@ -231,8 +232,15 @@ def test_rank_record_kind_is_the_one_the_planner_reads():
     assert pmc.RECORD_KIND == er.OWNED_MISS_RANK_KIND
 
 
+def _rank_dir(miss_dir):
+    return pmc.record_dir_for(str(miss_dir), MODEL)
+
+
 def test_rank_writes_its_record_at_the_sleep(miss_dir):
     path = _phase(0, 2.4, 10)
+    # VRAM contract M3 layout: records/<line>/<model_id>/owned_miss/
+    assert os.path.dirname(path) == os.path.join(
+        str(miss_dir), os.path.basename(MODEL.rstrip("/")), "owned_miss")
     rec = json.loads(open(path).read())
     # 240 ms over 48 layers x 10 missed rows = 0.5 ms per row
     assert rec["kind"] == er.OWNED_MISS_RANK_KIND and rec["rank"] == 0
@@ -260,7 +268,7 @@ def test_planner_reads_the_rank_records(miss_dir):
     _phase(0, 2.4, 10)   # host 0.5 ms/row
     _phase(1, 9.6, 10)   # worker 2.0 ms/row
     _phase(2, 4.8, 20)   # worker 0.5 ms/row, twice the rows
-    recs = er.read_owned_miss_rank_records(str(miss_dir))
+    recs = er.read_owned_miss_rank_records(_rank_dir(miss_dir))
     ms, tier, src = er.resolve_owned_miss_ms((), rank_records=recs, host=0, model=MODEL)
     assert tier == er.OWNED_MISS_RECORD and src.startswith("RECORD")
     # worker = (960 + 480) ms / (480 + 960) rows = 1.0
@@ -270,7 +278,7 @@ def test_planner_reads_the_rank_records(miss_dir):
 def test_log_bootstrap_ranks_under_every_rank_record(miss_dir):
     _phase(0, 2.4, 10)
     _phase(1, 9.6, 10)
-    ranks = er.read_owned_miss_rank_records(str(miss_dir))
+    ranks = er.read_owned_miss_rank_records(_rank_dir(miss_dir))
     # a YOUNGER log entry still loses to the ranks' own record
     log = [_rec((0.05, 0.6), "2099-01-01 00:00:00")]
     ms, tier, _ = er.resolve_owned_miss_ms(log, rank_records=ranks, host=0, model=MODEL)
@@ -282,7 +290,7 @@ def test_log_bootstrap_ranks_under_every_rank_record(miss_dir):
 
 def test_rank_records_without_a_worker_do_not_count(miss_dir):
     _phase(0, 2.4, 10)
-    ranks = er.read_owned_miss_rank_records(str(miss_dir))
+    ranks = er.read_owned_miss_rank_records(_rank_dir(miss_dir))
     _ms, tier, _ = er.resolve_owned_miss_ms((), rank_records=ranks, host=0, model=MODEL)
     assert tier == er.OWNED_MISS_UNMEASURED
 
@@ -299,6 +307,29 @@ def test_launcher_takes_the_rank_records_from_group_d_env(miss_dir, tmp_path, mo
     ms, src = launcher.d_owned_miss_ms(
         ns, env_d={"SGLANG_WEG2_OWNED_MISS_RECORD": str(miss_dir)}, host=0)
     assert ms == pytest.approx((0.5, 2.0)) and src.startswith("RECORD")
+
+
+def test_records_of_another_model_are_not_read(miss_dir, tmp_path, monkeypatch):
+    """The model_id segment separates the lines' models on disk: a record
+    written for another checkpoint lies in another directory."""
+    from sglang.srt.weg2 import launcher
+
+    for rank, fetch in ((0, 2.4), (1, 9.6)):
+        for _ in range(100):
+            pmc.note_round({"spec_verify:pool.fetch": [fetch, 12, 0.1]})
+        for _ in range(48):
+            pmc.note_sync(200, 10)
+        pmc.flush(rank=rank, group="D", reason="sleep", model="/m/Other-Model", phase_index=1)
+    monkeypatch.setattr(launcher, "measured_record_path", lambda: str(tmp_path / "none.json"))
+    ns = types.SimpleNamespace(profile=None, model=MODEL)
+    assert launcher.d_owned_miss_ms(
+        ns, env_d={"SGLANG_WEG2_OWNED_MISS_RECORD": str(miss_dir)}, host=0) == (None, "")
+
+
+def test_model_id_is_the_checkpoint_directory_name():
+    assert pmc.model_id("/models/Qwen3.8-Flash-Next-INT4/") == "Qwen3.8-Flash-Next-INT4"
+    assert pmc.model_id("a b:c") == "a_b_c"
+    assert pmc.model_id(None) == "unknown-model"
 
 
 def test_the_round_log_feeds_the_rank_record():

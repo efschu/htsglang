@@ -1,7 +1,8 @@
 """#239 S3f miss record of the device-planned expert pool (D decode), per rank.
 
-``SGLANG_WEG2_OWNED_MISS_RECORD=<dir>`` (default unset = off): each D rank
-accumulates, over its decode phase,
+``SGLANG_WEG2_OWNED_MISS_RECORD=<records root of the line>`` (default unset =
+off; the layout of the VRAM contract M3, ``records/<line>/<model_id>/<kind>``):
+each D rank accumulates, over its decode phase,
 
 * the device ms of the pool's host->device expert traffic -- the collective
   clock's ``pool.fetch`` family (``spec_verify:`` folded) of every decode
@@ -10,11 +11,12 @@ accumulates, over its decode phase,
 * the expert rows it missed -- the pool's own per-layer counters
   (``take_report`` in ``sync_pool_from_host``), summed over EVERY pool layer,
 
-and writes one JSON record at D's sleep, next to the #276 heat record, before
-any pause. ``ms per missed row`` = fetch ms / missed rows is the cost the owned
+and writes one JSON record at D's sleep into ``<root>/<model_id>/owned_miss/``
+(:func:`record_dir_for`), next to the #276 heat record, before any pause. ``ms per missed row`` = fetch ms / missed rows is the cost the owned
 solve (``planner.expert_residency.solve_owned_cut``) prices a rank's round
 with (``missed rows per layer x MoE layers x ms per row``); the launcher reads
-these records (``read_owned_miss_rank_records``) instead of the seed.
+these records (``read_owned_miss_rank_records`` on the same
+:func:`record_dir_for`) instead of the seed.
 
 A phase without a split round or without a miss writes NOTHING (named in one
 warning) -- a cost from half the numbers would be invented. Off, nothing is
@@ -26,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, Mapping, Optional
 
@@ -35,14 +38,30 @@ MARKER = "OWNED-MISS-COST (#239 S3f)"
 RECORD_KIND = "owned_miss_rank"
 RECORD_VERSION = 1
 FETCH_FAMILY = "pool.fetch"
+RECORD_SUBDIR = "owned_miss"
 
 _DIR: Optional[str] = None
 _READ = False
 _ACC: Dict[str, float] = {"fetch_ms": 0.0, "rounds": 0, "miss_rows": 0, "forwards": 0}
 
 
+def model_id(model: Optional[str]) -> str:
+    """The ``<model_id>`` path segment of a checkpoint: its directory name,
+    reduced to ``[A-Za-z0-9._-]`` (the same name on the host and in a
+    container mount); ``unknown-model`` without a path."""
+    name = os.path.basename(str(model or "").rstrip("/").strip("'\""))
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name) or "unknown-model"
+
+
+def record_dir_for(root: str, model: Optional[str]) -> str:
+    """``<root>/<model_id>/owned_miss`` -- the ONE producer of the path the
+    ranks write and the launcher reads."""
+    return os.path.join(root, model_id(model), RECORD_SUBDIR)
+
+
 def record_dir() -> Optional[str]:
-    """The record directory, or ``None`` when off (read once per process)."""
+    """The records root of the line, or ``None`` when off (read once per
+    process)."""
     global _DIR, _READ
     if not _READ:
         try:
@@ -132,6 +151,7 @@ def flush(*, rank: int, group: str, reason: str, model: Optional[str],
                 MARKER, rank, int(_ACC["rounds"]), int(_ACC["miss_rows"]), _ACC["fetch_ms"])
             _reset()
             return None
+        directory = record_dir_for(directory, model)
         os.makedirs(directory, exist_ok=True)
         stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(rec["time_unix"]))
         path = os.path.join(directory, "owned_miss_%s_tp%d_%s_p%s.json" % (
