@@ -4,9 +4,10 @@ Metal z30r3 (-st-cut, ad95392095, 29.09., cut [0, 1, 1] = S 2, host share 0):
 of 97 hand-offs with parts every one read "verdict=ready" on all ranks, but
 the workers' END staging answered 'cut_ring_on_worker' (194 lines = 97 x 2).
 The parts are the H63 fold (END-only, 'e1=absent(fold)'): no E1 level to fall
-back on, so a worker votes 0 and the group MIN is 0 -- 91 x 'skipped:group_vote'
-(the extend [page_prefix, N) ran on D, ~2 s on NF-D), 6 x E1 'done'
-(unfolded parts), 0 x WEG2-TAIL-SKIP-EXTEND. Before the cut (x178, 25.09.):
+back on, so a worker votes 0 and the group MIN is 0 -- 94 hand-offs
+'skipped:group_vote' (282 lines over 3 ranks; the extend [page_prefix, N) ran
+on D, ~2 s on NF-D), 2 E1 'done' (unfolded parts), 1 'skipped:n_tokens',
+0 x WEG2-TAIL-SKIP-EXTEND. Before the cut (x178, 25.09.):
 36 x SKIP-EXTEND, 0 x cut_ring_on_worker, 0 x group_vote.
 
 The refusal came from #239 S4b part 5 ("the QSA ring is the host's indexer
