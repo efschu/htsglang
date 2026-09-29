@@ -212,11 +212,15 @@ _AR_CENSUS_BROKEN = False
 class RoundAcc:
     """One round's folded brackets, before it is readable."""
 
-    __slots__ = ("round_id", "bs", "rows", "spans", "categories", "wall")
+    __slots__ = ("round_id", "bs", "rows", "spans", "categories", "wall", "depth")
 
-    def __init__(self, round_id: int, bs: int, rows: int) -> None:
+    def __init__(self, round_id: int, bs: int, rows: int,
+                 depth: Optional[Tuple[int, int, int]] = None) -> None:
         self.round_id = int(round_id)
         self.bs = int(bs)
+        #: #239 S3f: (min, median, max) KV length of the running requests,
+        #: or None (SGLANG_DEBUG_DECODE_ROUND_DEPTH off).
+        self.depth = depth
         #: Rows SUBMITTED this round, never rows accepted. See the module
         #: docstring's join-key section for why the distinction is load
         #: bearing against the ladder's completion count.
@@ -243,8 +247,12 @@ class DecodeRoundLog:
     MAX_PENDING_ROUNDS: int = 64
 
     def __init__(self, clock=None, rank: int = 0) -> None:
+        from sglang.srt.environ import envs
+
         self.clock = clock
         self.rank = int(rank)
+        #: #239 S3f: price every round's request depth (host lists only)
+        self.depth_on = bool(envs.SGLANG_DEBUG_DECODE_ROUND_DEPTH.get())
         #: Set by the scheduler at the round boundary; read by every bracket
         #: opened inside that round. ``None`` = not in a decode round, and
         #: every bracket is then a no-op, which is how prefill forwards and
@@ -286,7 +294,17 @@ class DecodeRoundLog:
 
     # -- round boundary --------------------------------------------------
 
-    def begin_round(self, round_id: int, bs: int, rows: int) -> None:
+    @staticmethod
+    def round_depth(kv_lens: List[int]) -> Optional[Tuple[int, int, int]]:
+        """#239 S3f: ``(min, median, max)`` of the running requests' KV
+        lengths, or None for an empty batch."""
+        if not kv_lens:
+            return None
+        s = sorted(int(x) for x in kv_lens)
+        return s[0], s[len(s) // 2], s[-1]
+
+    def begin_round(self, round_id: int, bs: int, rows: int,
+                    depth: Optional[Tuple[int, int, int]] = None) -> None:
         """Open round ``round_id`` and read whatever earlier rounds are ready.
 
         The flush happens BEFORE the new round is opened, so the reading of
@@ -303,7 +321,7 @@ class DecodeRoundLog:
         self.host_split.on_round_open(round_id=round_id, mono=t0 / 1e9)
         self._retire_open()
         self.flush()
-        self._open = RoundAcc(round_id, bs, rows)
+        self._open = RoundAcc(round_id, bs, rows, depth)
         self.round_id = int(round_id)
         self._overhead_ns += time.perf_counter_ns() - t0
 
@@ -520,6 +538,9 @@ class DecodeRoundLog:
                 graphed_fwd,
                 len(results),
             ]
+        if acc.depth is not None:
+            line += ", depth: %d/%d/%d"
+            args += list(acc.depth)
         logger.info(line, *args)
 
         self.last_round_ms = round_ms

@@ -869,6 +869,13 @@ class Envs:
     # set, no swap, no fence; graphed rounds print 'split unavailable:
     # graph-replay-reader-off'. Per rank env (set it in group D).
     SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES = EnvBool(False)
+    # DECODE ROUND DEPTH (#239 S3f A/B, 29.09.): the 'Decode rank batch' line
+    # carries ', depth: min/median/max' -- the KV length of every running
+    # request (prompt + output tokens, host-side lists only) -- so rounds
+    # can be compared at equal bs AND depth ('#full token' of 'Decode batch'
+    # is pool occupancy incl. the radix cache, not a request's depth). No
+    # device work, no graph change; off: one attribute test per round.
+    SGLANG_DEBUG_DECODE_ROUND_DEPTH = EnvBool(False)
     # LRU_WARM_FROM_HANDOFF (H29b): after rearm_after_wake the free LRU rows
     # of every pool layer are filled with P's most-routed experts of the last
     # LRU_WARM_TOKENS prompt tokens (no new VRAM: only rows the reinit left

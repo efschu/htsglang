@@ -18216,6 +18216,18 @@ class Scheduler(
                     round_id=int(batch.forward_iter),
                     bs=int(_bs),
                     rows=int(_bs) * int(_rows or 1),
+                    # #239 S3f: the requests' KV lengths (host lists), for the
+                    # bs x depth A/B; None unless SGLANG_DEBUG_DECODE_ROUND_DEPTH
+                    depth=(
+                        _drl.round_depth(
+                            [
+                                len(r.origin_input_ids) + len(r.output_ids)
+                                for r in batch.reqs
+                            ]
+                        )
+                        if _drl.depth_on
+                        else None
+                    ),
                 )
 
         # #1233 (WEG 2, S0): the draft worker used to start COLD after a
