@@ -239,6 +239,7 @@ from sglang.srt.weg2 import resume_via_p as _weg2_rvp  # RESUME-VIA-P
 from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progress beacon
 from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision verdict on the chain
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
+from sglang.srt.weg2 import d_seat_vram as _weg2_d_seat_vram  # D-MEM-SCHED stage between wakes
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
@@ -11623,6 +11624,9 @@ class Scheduler(
         # ack count across the TP group.
         if self.enable_hierarchical_cache:
             self.tree_cache.flush_write_through_acks()
+        # D-MEM-SCHED: the KV stage between wakes, after the acks above (an
+        # ended request's pages go only once backed); rank-symmetric like them
+        _weg2_d_seat_vram.runtime_tick(self)
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()

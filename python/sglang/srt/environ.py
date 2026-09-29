@@ -2677,6 +2677,11 @@ class Envs:
     #   for the lowest stage row count (the launcher raises the wave cap it
     #   derived, or refuses a told one by name). Off = the table, byte-identical.
     SGLANG_WEG2_D_KV_STAGE_BY_DEMAND = EnvBool(False)
+    # D-MEM-SCHED (29.09., user law "free VRAM is always experts"): one budget
+    #   per D rank -- a seat-row shrink moves the dropped rows' experts into the
+    #   coldest kept rows first (weg2/d_mem_sched.py). ON by default; this is
+    #   the diagnosis-only emergency stop, not a feature switch.
+    SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS = EnvBool(False)
     # #254: how a prefill forward that overflows the scratch region is split.
     #   "token"  (default) -- waves are disjoint TOKEN subsets; every wave
     #     re-fetches the spill experts its tokens need, so a spill expert is

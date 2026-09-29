@@ -307,7 +307,64 @@ def _allocate_seat_tables(
     )
 
 
-def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True) -> int:
+def coldest_first_moves(row_key: Sequence[int], row_use: Sequence[int], *, lru_start: int,
+                        keep_hi: int, drop_lo: int, drop_hi: int, num_experts: int,
+                        clock: int) -> List[Tuple[int, int]]:
+    """D-MEM-SCHED (29.09., 27B: "kälteste Zeile zuerst"): before seat rows
+    ``[drop_lo, drop_hi)`` go OFF, the experts they hold move into the
+    COLDEST rows of the kept LRU range ``[lru_start, keep_hi)`` -- a free row
+    first, then the least recently selected one -- as long as the kept row is
+    colder than the dropped one and was not selected in the running step
+    (``use < clock``). What goes OFF is then the coldest content, not the
+    table's tail. Pure: returns ``(src_row, dst_row)`` pairs, hottest source
+    first; the caller copies the bytes and :func:`apply_row_moves` rewrites
+    the tables."""
+    E = int(num_experts)
+    srcs = sorted(
+        (r for r in range(int(drop_lo), int(drop_hi)) if 0 <= int(row_key[r]) < E),
+        key=lambda r: -int(row_use[r]))
+    free = [r for r in range(int(lru_start), int(keep_hi)) if int(row_key[r]) == -1]
+    held = sorted(
+        (r for r in range(int(lru_start), int(keep_hi))
+         if 0 <= int(row_key[r]) < E and int(row_use[r]) < int(clock)),
+        key=lambda r: int(row_use[r]))
+    dsts = free + held
+    moves: List[Tuple[int, int]] = []
+    for s, d in zip(srcs, dsts):
+        if int(row_key[d]) != -1 and int(row_use[d]) >= int(row_use[s]):
+            break
+        moves.append((s, d))
+    return moves
+
+
+def apply_row_moves(tables: PoolTables, moves: Sequence[Tuple[int, int]]) -> None:
+    """Rewrite the tables for moves whose BYTES were already copied: the
+    destination takes the source's expert and clock, the expert it held (if
+    any) goes back to the store (``hot_phys`` -1, the next miss fetches it),
+    the source row is left for the OFF write that follows."""
+    if not moves:
+        return
+    keys = tables.row_key.cpu()
+    uses = tables.row_use.cpu()
+    hot = tables.hot_phys.cpu()
+    E = int(tables.num_experts)
+    for s, d in moves:
+        old = int(keys[d])
+        if 0 <= old < E and int(hot[old]) == int(d):
+            hot[old] = -1
+        e = int(keys[s])
+        keys[d] = e
+        uses[d] = uses[s]
+        if 0 <= e < E:
+            hot[e] = int(d)
+        keys[s] = -1
+    tables.row_key.copy_(keys.to(tables.row_key.device))
+    tables.row_use.copy_(uses.to(tables.row_use.device))
+    tables.hot_phys.copy_(hot.to(tables.hot_phys.device))
+
+
+def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True,
+                     move_rows=None) -> int:
     """H95c: turn the first ``k`` seat rows ON (ordinary free LRU rows) and
     the rest OFF. ``device_write=False`` only records k on the host (the next
     :func:`reinit_pool_tables` -- the wake's rearm -- writes the layout);
@@ -331,6 +388,15 @@ def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True) -
         tables.pf_row[lo:hi].fill_(-1)
         return old
     lo, hi = base + k, base + old
+    if move_rows is not None:
+        # D-MEM-SCHED: the coldest content goes OFF, not the tail's
+        moves = coldest_first_moves(
+            tables.row_key.cpu().tolist(), tables.row_use.cpu().tolist(),
+            lru_start=int(tables.lru_start), keep_hi=lo, drop_lo=lo, drop_hi=hi,
+            num_experts=int(tables.num_experts), clock=int(tables.clock.cpu()[0]))
+        if moves:
+            move_rows(moves)
+            apply_row_moves(tables, moves)
     keys = tables.row_key[lo:hi].cpu()
     hot = tables.hot_phys.cpu()
     E = int(tables.num_experts)
