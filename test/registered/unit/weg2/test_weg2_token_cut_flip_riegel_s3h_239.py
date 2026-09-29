@@ -6,21 +6,37 @@ writes whole geometry-neutral pages, a KV-holding D worker reads its owner
 rows of them (S4b parts 2/3), tail adopt is per owner (part 5), the prefetch
 claim is the group MIN (the worker votes in the min arm only), the wake credit
 is taken per rank against its own card. The riegel lets exactly that form
-through -- F14 wired, a host tier, ONE KV stage (the #251c stage form would
-build a KV worker's pool for the top stage, S3g) -- and refuses every other
-flip boot under the cut by name. ``--d-only`` (H87) keeps booting; every other
-form is untouched.
+through -- F14 wired, a host tier, and either ONE operator-named KV stage or
+the launcher's S3g stage form with a trim cell for EVERY KV worker -- and
+refuses every other flip boot under the cut by name. ``--d-only`` (H87) keeps
+booting; every other form is untouched.
+
+29.09. (S3h lifted where S3g holds): the riegel runs before the plan, so an
+unnamed stage form passes it provisionally and the proof comes after the
+FRACTION-SOLVE (``refuse_flip_stage_form_without_trim_cells``): every rank the
+cut gives FA KV must carry its own stage rows in the written form, else the
+flip boot stops by name there. Operator-named stages (more than one) stay
+refused -- the launcher writes no per-rank rows for them.
 """
 
 from __future__ import annotations
 
 import inspect
+import os
+import sys
 import types
 
-import pytest
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt import rank_role
-from sglang.srt.weg2 import launcher as L
+import pytest  # noqa: E402
+
+from sglang.srt import rank_role  # noqa: E402
+from sglang.srt.planner import expert_residency as er  # noqa: E402
+from sglang.srt.weg2 import launcher as L  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import test_weg2_d_kv_stage_launcher_251c as T251  # noqa: E402
+import test_weg2_d_kv_stage_per_rank_s3g_239 as S3G  # noqa: E402
 
 CUT = types.SimpleNamespace(kv="qsa_forma_dcp")
 
@@ -56,15 +72,91 @@ def test_without_a_host_tier_the_flip_is_refused_by_name():
     assert isinstance(ei.value, L.Weg2LaunchRefused)
 
 
-@pytest.mark.parametrize("env_d, why", [
-    ("SGLANG_MOE_SCRATCH_SLOTS=100,48,48", "not named"),
-    ("SGLANG_WEG2_D_KV_STAGE_TOKENS=262144,393216,524288", "3 stages"),
-])
-def test_without_exactly_one_kv_stage_the_flip_is_refused(env_d, why):
+def test_operator_named_stages_stay_refused():
     with pytest.raises(L.Weg2TokenCutFlipNotWired) as ei:
-        L.refuse_flip_under_token_cut(_ns(env_d=env_d), CUT)
-    assert why in str(ei.value)
+        L.refuse_flip_under_token_cut(
+            _ns(env_d="SGLANG_WEG2_D_KV_STAGE_TOKENS=262144,393216,524288"), CUT)
+    assert "3 stages" in str(ei.value)
     assert "S3g" in str(ei.value)
+
+
+def test_unnamed_stages_pass_to_the_solve(capsys):
+    """RED on 6d418b49c2: 'the D KV stage form is not named ... (S3g open)' --
+    the riegel refused the very form S3g writes per KV rank."""
+    line = L.refuse_flip_under_token_cut(_ns(env_d="SGLANG_MOE_SCRATCH_SLOTS=100,48,48"), CUT)
+    assert line and line.startswith(L.KV_TOKEN_CUT_FLIP_MARKER + " ERLAUBT")
+    assert "Trim-Zelle" in line and "S3g" in line
+    assert line in capsys.readouterr().out
+
+
+# ---- after the FRACTION-SOLVE: every KV worker has its trim cell ---------------------
+
+def _solved(plan, shares=(0, 48, 16), env_d="SGLANG_MOE_SCRATCH_SLOTS=100,48,48", **kw):
+    ns = _ns(env_d=env_d, **kw)
+    lines = L.apply_d_kv_stage_form(ns, er, T251._rows(), T251.FORM, plan, "D",
+                                    verify_tokens=4, top_k=10, kv_token_shares=shares)
+    return ns, lines
+
+
+def test_the_s3g_form_with_every_worker_trim_cell_is_let_through():
+    """RED on 6d418b49c2: no such check -- the flip boot never got this far."""
+    ns, _ = _solved(S3G._cut_plan())
+    out = []
+    line = L.refuse_flip_stage_form_without_trim_cells(ns, CUT, out.append)
+    assert line == out[-1]
+    assert line.startswith(L.KV_TOKEN_CUT_FLIP_MARKER + " STUFEN ERLAUBT")
+    assert "rang1: 22" in line and "rang2: 8" in line
+    assert "'#251c KV-STAGE form=" in line  # the metal marker it names
+
+
+def test_a_dropped_stage_form_is_refused_by_name():
+    """A plan without the workers' trim cells writes no form ('entfaellt unter
+    dem Token-Schnitt'); the flip boot does not fall back to fixed tokens."""
+    ns, lines = _solved(T251._plan())
+    assert "entfaellt unter dem Token-Schnitt" in lines[0]
+    with pytest.raises(L.Weg2TokenCutFlipNotWired) as ei:
+        L.refuse_flip_stage_form_without_trim_cells(ns, CUT, print)
+    assert L.KV_TOKEN_CUT_FLIP_MARKER in str(ei.value)
+    assert "keine Stufenform" in str(ei.value) and "--d-only" in str(ei.value)
+
+
+def test_a_worker_without_its_stage_rows_is_refused_by_name():
+    ns, _ = _solved(S3G._cut_plan())
+    del ns._d_kv_stage_written["worker_rows"][2]
+    with pytest.raises(L.Weg2TokenCutFlipNotWired) as ei:
+        L.refuse_flip_stage_form_without_trim_cells(ns, CUT, print)
+    assert "Rang 2" in str(ei.value) and "Trim-Zelle" in str(ei.value)
+
+
+def test_the_dry_run_names_the_missing_trim_cell():
+    ns, _ = _solved(T251._plan(), dry_run=True)
+    out = []
+    line = L.refuse_flip_stage_form_without_trim_cells(ns, CUT, out.append)
+    assert line and "(dry run: would refuse)" in out[-1]
+
+
+def test_one_operator_named_stage_has_nothing_to_prove():
+    ns, lines = _solved(S3G._cut_plan(), env_d=SERVING_ENV_D)
+    assert "--env-d nennt" in lines[0]
+    assert L.refuse_flip_stage_form_without_trim_cells(ns, CUT, print) is None
+
+
+@pytest.mark.parametrize("form, kw", [
+    (types.SimpleNamespace(kv="qsa_forma"), {}), (None, {}), (CUT, {"d_only": True})])
+def test_the_post_check_leaves_every_other_boot_alone(form, kw):
+    ns, _ = _solved(T251._plan(), **kw)
+    assert L.refuse_flip_stage_form_without_trim_cells(ns, form, print) is None
+
+
+def test_main_checks_before_every_flip_d_start():
+    src = inspect.getsource(L.main)
+    starts = [i for i in range(len(src))
+              if src.startswith("refuse_d_form_off_the_map(ns, log)", i)]
+    checks = [i for i in range(len(src))
+              if src.startswith("refuse_flip_stage_form_without_trim_cells(", i)]
+    assert len(checks) == 2  # dry run and real flip boot; d-only never flips
+    for c in checks:
+        assert any(0 < s - c < 200 for s in starts)
 
 
 def test_an_unwired_seam_refuses_the_flip(monkeypatch):
