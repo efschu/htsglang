@@ -1493,6 +1493,53 @@ def d_resumable_depth_stream_tail(tail: bytes) -> Optional[int]:
     return None
 
 
+#: RANKSTATS-S3 "DASHBOARD-GRAFIKEN" Feld 2: the cache tiers a served row splits
+#: its ``cached`` into (CachedTokensDetails: device / host / storage).
+CACHED_TIERS = ("device", "host", "storage")
+
+
+def cached_tier_of(body: Any) -> Optional[Dict[str, int]]:
+    """``{device, host, storage}`` of this answer's cached tokens, or None.
+
+    The scheduler's CachedTokensDetails (output_streamer
+    ``get_cached_tokens_details``) rides in ``meta_info`` on ``/generate``, in
+    ``sglext`` on the OpenAI wire, or in ``usage.prompt_tokens_details``. None
+    when no holder carries it: the served row then adds nothing to its tiers
+    (the sum stays in ``cached``), never a guessed split. ``storage`` is absent
+    without an L3 backend and counts 0."""
+    if not isinstance(body, dict):
+        return None
+    usage = body.get("usage")
+    ptd = usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
+    for holder in (body.get("meta_info"), body.get("sglext"), ptd):
+        det = holder.get("cached_tokens_details") if isinstance(holder, dict) else None
+        if isinstance(det, dict):
+            try:
+                return {k: max(0, int(det.get(k) or 0)) for k in CACHED_TIERS}
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def cached_tier_stream_tail(tail: bytes) -> Optional[Dict[str, int]]:
+    """:func:`cached_tier_of` of the LAST streamed chunk that carries it."""
+    for raw in reversed(tail.split(b"\n")):
+        line = raw.strip()
+        if not line.startswith(b"data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == b"[DONE]" or b"cached_tokens_details" not in data:
+            continue
+        try:
+            js = json.loads(data)
+        except Exception:  # noqa: BLE001
+            continue
+        got = cached_tier_of(js)
+        if got is not None:
+            return got
+    return None
+
+
 def r_d_probe(uncached: int, prefill_s: Optional[float],
               min_uncached: int) -> Tuple[Optional[float], str]:
     """H84: ``(r_D, "sample")`` or ``(None, why)`` for ONE solo leg 2 on D.
@@ -6141,13 +6188,30 @@ class Front:
                 seen = self.__dict__.setdefault("_ipc_rank_stops_seen", set())
                 self._ipc_submit(front_state_ipc.publish_rank_stops, d, g.name, seen)
 
-    def _ipc_note_served(self, group: str, prompt: int, cached: int, completion: int) -> None:
+    def _ipc_note_served(self, group: str, prompt: int, cached: int, completion: int,
+                         cached_tier: Optional[Dict[str, int]] = None) -> None:
         st = self.__dict__.setdefault("_ipc_served_tokens", {})
         row = st.setdefault(group, {"n": 0, "prompt": 0, "cached": 0, "completion": 0})
         row["n"] += 1
         row["prompt"] += int(prompt or 0)
         row["cached"] += int(cached or 0)
         row["completion"] += int(completion or 0)
+        # Feld 2: only an answer that carried CachedTokensDetails adds to the
+        # tiers; the row grows the key with the first such answer.
+        if cached_tier is not None:
+            tiers = row.setdefault("cached_tier", {k: 0 for k in CACHED_TIERS})
+            for k in CACHED_TIERS:
+                tiers[k] += int(cached_tier.get(k) or 0)
+
+    def _ipc_note_served_d(self, pending: Any, prompt: int, cached: int, completion: int,
+                           cached_tier: Optional[Dict[str, int]]) -> None:
+        """Leg 2's served row, and -- when P's leg 1 ran for THIS rid -- the same
+        numbers again under ``D_after_P`` (RANKSTATS-S3 "DASHBOARD-GRAFIKEN" Feld 1):
+        D's ``cached`` there is the P->D hand-off, not a cache hit made before the
+        request. A subset of ``D``, cumulative, never reset."""
+        self._ipc_note_served("D", prompt, cached, completion, cached_tier)
+        if pending is not None and pending.leg1_ran:
+            self._ipc_note_served("D_after_P", prompt, cached, completion, cached_tier)
 
     async def ipc_front_writer(self, period_s: float = 5.0) -> None:
         """(b) every ``period_s``: the front's keys into state.json `front` through
@@ -7583,7 +7647,7 @@ class Front:
             # and there is nothing to correct here; above the cap the front
             # refuses at admission, before P's prefill is spent.
             g.served += 1
-            self._ipc_note_served("P", pt, ct, 0)
+            self._ipc_note_served("P", pt, ct, 0, cached_tier_of(js))
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
         finally:
@@ -8140,8 +8204,8 @@ class Front:
                                                  resumable_depth=_depth)
                     dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
                                                      mark=_pfc_mark0)
-                    self._ipc_note_served("D", pt, ct, comp)
-                    logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
+                    self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_stream_tail(bytes(tail)))
+                    logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                                 "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
                                 dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"],
@@ -8172,7 +8236,7 @@ class Front:
                     return web.json_response({"error": f"W28 Weg2Leg2Unpriced rid={rid}"}, status=503)
                 verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid)
                 g.served += 1
-                self._ipc_note_served("D", pt, ct, comp)
+                self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_of(js))
                 dterms = await self._draft_terms(g, js, rid=rid, uncached=max(0, pt - ct),
                                                  mark=_pfc_mark0)
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
