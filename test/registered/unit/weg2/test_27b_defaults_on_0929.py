@@ -174,3 +174,44 @@ def test_the_one_mechanism_names_every_registry_flag():
     flags = [f for f, _d, _o in L.PROFILE_ARG_DEFAULTS]
     assert "--d-replayssm-spec" in flags
     assert len(flags) == len(set(flags))
+
+
+# ---------------------------------------------------------------------------
+# 4. --d-token-placement bandwidth (27B row 24b) -- INT8 only: rc9meas INT8
+#    with R, depth gain -1.1 ... -3.1 % at 128k/240k; NVFP4 no gain, FP8/GGUF
+#    unmeasured -> capacity. --d-reshard stays off (inventory point 7, class b).
+# ---------------------------------------------------------------------------
+
+_MC = "/spinning/llm_stuff/club-3090/models-cache/"
+INT8 = _MC + "Qwen3.8-27B-INT8-gdncov-vocabembed"
+FP8 = _MC + "Qwen3.8-27B-FP8"
+NVFP4 = _MC + "Qwen3.8-27B-NVFP4-RadixArk"
+GGUF = _MC + "Qwen3.8-27B-GGUF-unsloth/Qwen3.8-27B-UD-IQ4_XS.gguf"
+NF_INT4 = _MC + "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist"
+
+
+@pytest.mark.parametrize("profile,model,argv,want", [
+    ("qwen27b", INT8, (), "bandwidth"),                                  # 27B INT8: default on
+    (None, None, (), "bandwidth"),                                       # launcher defaults = 27B INT8
+    ("qwen27b", INT8, ("--d-token-placement", "capacity"), "capacity"),  # explicit wins
+    ("qwen27b", FP8, (), "capacity"), ("qwen27b", GGUF, (), "capacity"),  # unmeasured formats
+    ("qwen27b", NVFP4, (), "capacity"),                                  # measured, no gain
+    ("nextflash", NF_INT4, (), "capacity"),                              # NF unchanged
+])
+def test_token_placement_cli_default_follows_the_row(profile, model, argv, want):
+    assert _defaults(profile, argv, model=model).d_token_placement == want
+
+
+def test_token_placement_rows():
+    assert FM.PROFILES["qwen27b"].d_token_placement == "bandwidth"
+    assert FM.PROFILES["qwen27b"].d_token_placement_formats == ("int8",)
+    assert FM.PROFILES["nextflash"].d_token_placement == "capacity"
+    assert FM.PROFILES["nextflash"].d_token_placement_formats == ()
+
+
+def test_d_reshard_stays_off_by_default():
+    """Inventory point 7 (wake-seg + drq) is class b: no registry default."""
+    from sglang.srt.weg2 import launcher as L
+
+    assert _defaults("qwen27b", (), model=INT8).d_reshard == L.D_RESHARD_DEFAULT == "off"
+    assert "--d-reshard" not in [f for f, _d, _o in L.PROFILE_ARG_DEFAULTS]

@@ -481,6 +481,17 @@ class ModelProfile:
     #: CANON_ORDER would change its BAR1 reduction order unproven. An
     #: explicitly set env wins per switch.
     d_hostgap_levers: bool = False
+    #: 27B row 24b: --d-token-placement (weg2/d_token_placement.py) -- where
+    #: group D's NEW KV tokens land. The launcher's DEFAULT for an unset flag
+    #: on a checkpoint whose registry format is in ``d_token_placement_formats``
+    #: (launcher apply_profile_arg_defaults, :func:`format_of`); every other
+    #: format keeps the code default ``capacity``. qwen27b bandwidth on INT8:
+    #: rc9meas INT8 with R, depth gain -1.1 ... -3.1 % at 128k/240k against the
+    #: baseline (i8rt dkr27bint8drtbar109261117 vs i8h dkr27bbar1mwh09261051);
+    #: NVFP4 +0.2 ... -0.8 % (no gain: stays capacity); FP8/GGUF unmeasured.
+    #: nextflash capacity (the launcher refuses bandwidth for NF).
+    d_token_placement: str = "capacity"
+    d_token_placement_formats: Tuple[str, ...] = ()
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -665,6 +676,11 @@ PROFILES: Dict[str, ModelProfile] = {
         driver_carve_min_total_mib=32000,
         # HG (row 24h): proven together in dhg09261456 -- see the field.
         d_hostgap_levers=True,
+        # row 24b: bandwidth on INT8 only (rc9meas -1.1 ... -3.1 % in depth).
+        # --d-reshard stays off (wake-seg + drq: gain at 6 of 24 points, the
+        # drq preset has no A/B of its own -- inventory class b).
+        d_token_placement="bandwidth",
+        d_token_placement_formats=("int8",),
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,

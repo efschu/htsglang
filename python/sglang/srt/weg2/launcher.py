@@ -16047,6 +16047,11 @@ PROFILE_ARG_DEFAULTS: Tuple[Tuple[str, str, Callable[[str, object], object]], ..
                                         _profile_row_or_27b(p).chunk.default_formats,
                                         P_CHUNK_POLICY_DEFAULT)
                     if _p_chunk_dynamic_runnable(ns) else P_CHUNK_POLICY_DEFAULT)),
+    # 27B row 24b: bandwidth on the formats the row measured it on (INT8).
+    ("--d-token-placement", "d_token_placement",
+     lambda p, ns: _row_format_default(p, ns, _profile_row_or_27b(p).d_token_placement,
+                                       _profile_row_or_27b(p).d_token_placement_formats,
+                                       D_TOKEN_PLACEMENT_DEFAULT)),
 )
 
 
@@ -16088,6 +16093,7 @@ def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
         "store_sidecar_factor": STORE_SIDECAR_FACTOR,
         "d_replayssm_spec": D_REPLAYSSM_SPEC_DEFAULT,
         "p_chunk_policy": P_CHUNK_POLICY_DEFAULT,
+        "d_token_placement": D_TOKEN_PLACEMENT_DEFAULT,
     }
     profile = getattr(ns, "profile", None) or PROFILE_QWEN27B
     changed: List[str] = []
@@ -20174,7 +20180,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--d-token-placement", choices=["capacity", "bandwidth"], default=D_TOKEN_PLACEMENT_DEFAULT,
         help="Group D: where NEW KV tokens land (27B uneven DCP only; weg2/d_token_placement.py, "
-             "DYN_D_RESHARD.md sec. 13). 'capacity' (default) = today, env byte-identical. "
+             "DYN_D_RESHARD.md sec. 13). DEFAULT: the booted profile's registry row "
+             "(weg2/form.py d_token_placement on its d_token_placement_formats: qwen27b "
+             "bandwidth on the INT8 checkpoint, proven on metal); every other checkpoint and "
+             "NF: 'capacity' = today, env byte-identical. "
              "'bandwidth' = the allocator interleaves its free slot ids so new tokens go to the "
              "ranks by effective bandwidth while the pool has room, by free capacity once a "
              "rank's class would pass --d-token-fill-switch; stored KV never moves. Refused "
