@@ -49,6 +49,11 @@ header .sub { color: var(--text-2); font-size: 13px; }
 header nav { margin-left: auto; display: flex; gap: 12px; font-size: 13px; }
 a { color: var(--s1); text-decoration: none; } a:hover { text-decoration: underline; }
 main { padding: 12px 16px 40px; max-width: 1500px; margin: 0 auto; }
+/* Nutzer 29.09.: "ständig verschiebt sich das nach oben/unten". refresh() hält den Leseanker
+   selbst (holdAnchor); die Browser-Verankerung ist aus, sonst korrigieren zwei Stellen. */
+html, body { overflow-anchor: none; }
+header .livebox { font-size: 13px; color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; }
+header .livebox .note { display: inline-block; min-width: 17em; color: var(--warn); }
 .cardstrip { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 6px; margin: -4px 0 12px; }
 .cardstrip > div { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
 .cardstrip b { font-size: 13px; }
@@ -210,6 +215,7 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
   </a>
   <h1>Rig-Dashboard</h1>
   <span class="sub" id="sub">verbinde&hellip;</span>
+  <label class="livebox"><input type="checkbox" id="live-pause"> Live-Update pausieren <span class="note" id="pausenote"></span></label>
   <nav>
     <a id="gpuqlink" class="lan" href="#" target="_blank" rel="noopener">GPU-Fensterplan</a>
     <a id="weg2link" class="lan" href="weg2" target="_blank" rel="noopener">Startzeile</a>
@@ -323,7 +329,7 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
     const el = document.getElementById(svgId);
     if (!el) return;
     const cross = el.querySelector(".cross");
-    el.addEventListener("mousemove", (e) => {
+    el.onmousemove = (e) => {
       const r = el.getBoundingClientRect();
       const tx = t0 + (t1 - t0) * (e.clientX - r.left) / r.width;
       let best = null;
@@ -332,8 +338,8 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
       cross.setAttribute("x1", x(best[0])); cross.setAttribute("x2", x(best[0])); cross.setAttribute("visibility", "visible");
       tip.innerHTML = `<b>${fmt(best[1], digits)}</b> ${unit} &middot; ${hhmm(best[0])}${best[1] === 0 ? " &middot; ruht / keine Arbeit" : ""}`;
       tip.style.display = "block"; tip.style.left = (e.clientX + 12) + "px"; tip.style.top = (e.clientY - 28) + "px";
-    });
-    el.addEventListener("mouseleave", () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); });
+    };
+    el.onmouseleave = () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); };
   }};
 }
 
@@ -387,7 +393,7 @@ const phaseSpanS = () => phaseSpan || (window.innerWidth < 760 ? 300 : 900);
 function setPhaseSpan(v) {
   phaseSpan = v;
   try { localStorage.setItem("rigdash.phaseSpan", String(v)); } catch (e) { /* private window */ }
-  refresh();
+  refresh(true);
 }
 const dur = (s) => s < 90 ? fmt(s, s < 10 ? 1 : 0) + " s" : fmt(s / 60, 1) + " min";
 function phaseName(k, single) { return single && k === "P" ? "Prefill" : (PHASE[k] || [k])[0]; }
@@ -464,13 +470,13 @@ function bindPhaseBars() {
     const data = phaseData[bar.id];
     if (!data) return;
     const segAt = (e) => { const el = e.target.closest(".seg"); return el ? [el, data.segs[+el.dataset.i]] : [null, null]; };
-    bar.addEventListener("mousemove", (e) => {
+    bar.onmousemove = (e) => {
       const [, x] = segAt(e);
       if (!x) { tip.style.display = "none"; return; }
       showTip(phaseTip(x, data.single), e.clientX, e.clientY);
-    });
-    bar.addEventListener("mouseleave", () => { if (!tapPinned) { tip.style.display = "none"; tip.style.whiteSpace = ""; } });
-    bar.addEventListener("click", (e) => {        // a tap on the phone
+    };
+    bar.onmouseleave = () => { if (!tapPinned) { tip.style.display = "none"; tip.style.whiteSpace = ""; } };
+    bar.onclick = (e) => {        // a tap on the phone
       const [el, x] = segAt(e);
       if (!x) return;
       e.stopPropagation();
@@ -480,7 +486,7 @@ function bindPhaseBars() {
       tapPinned = true;
       clearTimeout(tapTimer);
       tapTimer = setTimeout(() => { tapPinned = false; tip.style.display = "none"; el.classList.remove("sel"); }, 5000);
-    });
+    };
   });
   fitPhaseLabels();
 }
@@ -682,7 +688,7 @@ function bootCard(b, now, binders) {
   ];
   const errs = (b.errors || []).slice(-3).reverse();
   const st = (b.alarm || {}).state;
-  return `<section class="card ${st === "TOT" ? "dead" : st === "HAENGT" ? "hang" : ""}">
+  return `<section class="card ${st === "TOT" ? "dead" : st === "HAENGT" ? "hang" : ""}" id="boot-${esc(b.stem)}">
     ${alarmHtml(b, now)}
     <div class="boot-head">
       <span class="model">${esc(m.model || b.stem)}</span>
@@ -978,35 +984,125 @@ function chipsHtml(d) {
   return out.join("");
 }
 
-let failures = 0;
-async function refresh() {
+// Ruhige Anzeige (Nutzer 29.09.: "das dashboard lässt sich schlecht anschauen, ständig verschiebt
+// sich das nach oben/unten automatisch"):
+// (1) morph(): neues HTML wird abseits geparst und Knoten für Knoten eingearbeitet -- was gleich
+//     bleibt, bleibt derselbe Knoten; Kinder mit id werden über die id gepaart.
+// (1b) holdAnchor(): das Element auf Lesehöhe steht nach dem Neuzeichnen an derselben Stelle.
+// (2) reserveHeights(): jeder Abschnitt schrumpft beim Refresh nicht (min-height ratscht), erst ein
+//     Auf-/Zuklappen des Lesers gibt die Höhe frei.
+// (3) <details open> fasst morph() nicht an -- aufgeklappt bleibt aufgeklappt.
+// (4) pauseReason(): 10 s nach Scrollen/Tippen/Klicken und solange markiert ist, kein Neuzeichnen;
+//     dazu der Schalter "Live-Update pausieren".
+const tplEl = document.createElement("template");
+function morph(el, html) {
+  tplEl.innerHTML = html;
+  morphChildren(el, tplEl.content);
+}
+function sameNode(a, b) {
+  return a.nodeType === b.nodeType && a.nodeName === b.nodeName && (a.nodeType !== 1 || (a.id || "") === (b.id || ""));
+}
+function morphChildren(cur, next) {
+  let c = cur.firstChild;
+  for (let n = next.firstChild; n;) {
+    const nn = n.nextSibling;
+    if (!c) cur.appendChild(n);
+    else if (sameNode(c, n)) { morphNode(c, n); c = c.nextSibling; }
+    else if (n.nodeType === 1 && n.id) {
+      const m = [...cur.children].find((k) => k.id === n.id && k.nodeName === n.nodeName);
+      if (m) { cur.insertBefore(m, c); morphNode(m, n); c = m.nextSibling; }
+      else cur.insertBefore(n, c);        // a new keyed node: the old one at c still gets its turn
+    } else { cur.replaceChild(n, c); c = n.nextSibling; }
+    n = nn;
+  }
+  while (c) { const cn = c.nextSibling; cur.removeChild(c); c = cn; }
+}
+function morphNode(c, n) {
+  if (c.nodeType !== 1) { if (c.nodeValue !== n.nodeValue) c.nodeValue = n.nodeValue; return; }
+  const keepOpen = c.nodeName === "DETAILS";
+  for (const a of [...c.attributes]) if (!n.hasAttribute(a.name) && !(keepOpen && a.name === "open")) c.removeAttribute(a.name);
+  for (const a of n.attributes) if (!(keepOpen && a.name === "open") && c.getAttribute(a.name) !== a.value) c.setAttribute(a.name, a.value);
+  morphChildren(c, n);
+}
+let selfScrollUntil = 0;
+function readAnchor() {
+  if (window.scrollY < 1) return [];             // oben bleibt oben
+  const chain = [];
+  for (const fx of [0.5, 0.25, 0.75]) {
+    let el = document.elementFromPoint(window.innerWidth * fx, window.innerHeight / 3);
+    if (el && el.closest("#tip")) continue;
+    for (; el && el !== document.body && el !== document.documentElement; el = el.parentElement)
+      if (el !== tip) chain.push([el, el.getBoundingClientRect().top]);
+    if (chain.length) break;
+  }
+  return chain;
+}
+function holdAnchor(chain) {
+  for (const [el, top] of chain) {
+    if (!el.isConnected) continue;
+    const d = el.getBoundingClientRect().top - top;
+    if (Math.abs(d) >= 1) { selfScrollUntil = performance.now() + 400; window.scrollBy(0, d); }
+    return d;
+  }
+  return 0;
+}
+const RESERVED = ["chips", "cardstrip", "boots", "prod", "feat", "imgchg", "gpus", "containers", "gpuq", "history"];
+function reserveHeights() {
+  for (const id of RESERVED) {
+    const el = $(id), h = el.offsetHeight;
+    if (h > (el._minH || 0)) { el._minH = h; el.style.minHeight = h + "px"; }
+  }
+}
+function releaseHeight(box) { if (box) { box._minH = 0; box.style.minHeight = ""; } }
+document.addEventListener("toggle", (e) => releaseHeight(e.target.closest && e.target.closest(RESERVED.map((i) => "#" + i).join(","))), true);
+const PAUSE_AFTER_INPUT_MS = 10000;
+let lastInput = -Infinity;
+const noteInput = () => { lastInput = performance.now(); };
+["wheel", "touchstart", "touchmove", "keydown", "pointerdown"].forEach((t) => window.addEventListener(t, noteInput, {passive: true, capture: true}));
+window.addEventListener("scroll", () => { if (performance.now() > selfScrollUntil) noteInput(); }, {passive: true});
+function pauseReason() {
+  if ($("live-pause").checked) return "pausiert (Schalter)";
+  const sel = document.getSelection();
+  if (sel && !sel.isCollapsed && sel.toString().trim()) return "pausiert, solange markiert ist";
+  const left = PAUSE_AFTER_INPUT_MS - (performance.now() - lastInput);
+  return left > 0 ? `pausiert beim Lesen, noch ${Math.ceil(left / 1000)} s` : "";
+}
+
+let failures = 0, inflight = false;
+async function refresh(force) {
+  const why = force ? "" : pauseReason();
+  $("pausenote").textContent = why;
+  if (why || inflight) return;
+  inflight = true;
   try {
     const r = await fetch("api/live", {cache: "no-store"});   // relative: works behind the /rigdash/ prefix
     const d = await r.json();
     failures = 0;
+    const late = force ? "" : pauseReason();      // the reader may have started while the fetch ran
+    if (late) { $("pausenote").textContent = late; return; }
+    const anchor = readAnchor();
     const now = d.t;
     const binders = [];
-    const openDetails = new Set([...document.querySelectorAll("details[open]")].map((e) => e.id));
     // a boot whose container still runs is shown and judged even when its logs went quiet (a hang can be silent)
     const live = d.boots.filter((b) => b.live || (b.container && b.container.State === "running"));
     const shown = live.length ? live : d.boots.filter((b) => b.primary).slice(0, 1);
-    $("boots").innerHTML = shown.length ? shown.map((b) => bootCard(b, now, binders)).join("")
-      : `<section class="card"><div class="muted">Kein Boot-Log der letzten 6 h gefunden.</div></section>`;
-    if (!live.length && shown.length) $("boots").insertAdjacentHTML("afterbegin", shown.every(plannedStopped)
-      ? `<section class="card" style="border-color:var(--flip)"><b>Kein Modell schreibt gerade Logs</b> <span class="muted">&middot; der letzte Boot wurde geplant gestoppt. Unten seine letzten Zahlen.</span></section>`
-      : `<section class="card" style="border-color:var(--bad)"><b style="color:var(--bad)">Kein Modell schreibt gerade Logs.</b> <span class="muted">Unten der zuletzt aktive Boot mit seinen letzten Zahlen.</span></section>`);
-    $("prod").innerHTML = prodHtml(d);
-    $("feat").innerHTML = featHtml(d);
-    $("imgchg").innerHTML = imgChgHtml(d);
-    $("gpus").innerHTML = gpusHtml(d, binders);
-    $("containers").innerHTML = containersHtml(d);
-    $("gpuq").innerHTML = gpuqHtml(d);
-    $("history").innerHTML = historyHtml(d.boots.filter((b) => !shown.includes(b)), now);
-    $("chips").innerHTML = chipsHtml(d);
+    const banner = !live.length && shown.length ? (shown.every(plannedStopped)
+      ? `<section class="card" id="boots-banner" style="border-color:var(--flip)"><b>Kein Modell schreibt gerade Logs</b> <span class="muted">&middot; der letzte Boot wurde geplant gestoppt. Unten seine letzten Zahlen.</span></section>`
+      : `<section class="card" id="boots-banner" style="border-color:var(--bad)"><b style="color:var(--bad)">Kein Modell schreibt gerade Logs.</b> <span class="muted">Unten der zuletzt aktive Boot mit seinen letzten Zahlen.</span></section>`) : "";
+    morph($("boots"), banner + (shown.length ? shown.map((b) => bootCard(b, now, binders)).join("")
+      : `<section class="card" id="boots-none"><div class="muted">Kein Boot-Log der letzten 6 h gefunden.</div></section>`));
+    morph($("prod"), prodHtml(d));
+    morph($("feat"), featHtml(d));
+    morph($("imgchg"), imgChgHtml(d));
+    morph($("gpus"), gpusHtml(d, binders));
+    morph($("containers"), containersHtml(d));
+    morph($("gpuq"), gpuqHtml(d));
+    morph($("history"), historyHtml(d.boots.filter((b) => !shown.includes(b)), now));
+    morph($("chips"), chipsHtml(d));
     // compact card strip at the top: the load at a glance, also on a phone
-    $("cardstrip").innerHTML = ((d.gpus || {}).value || []).map((c) => `<div><b>${esc(c.name.replace("NVIDIA GeForce ", ""))}</b>
+    morph($("cardstrip"), ((d.gpus || {}).value || []).map((c) => `<div><b>${esc(c.name.replace("NVIDIA GeForce ", ""))}</b>
       <span class="num">${fmt(c["power.draw"])} W &middot; ${fmt(c["memory.used"] / 1024, 1)}/${fmt(c["memory.total"] / 1024, 0)} GiB &middot; ${fmt(c["utilization.gpu"])} %</span>
-      <div class="bar"><i style="width:${c["power.limit"] ? Math.min(100, 100 * c["power.draw"] / c["power.limit"]) : 0}%"></i></div></div>`).join("");
+      <div class="bar"><i style="width:${c["power.limit"] ? Math.min(100, 100 * c["power.draw"] / c["power.limit"]) : 0}%"></i></div></div>`).join(""));
     // behind the public proxy the LAN-only services are not reachable: hide their links, say so once
     document.querySelectorAll("a.lan").forEach((a) => { a.style.display = d.via_proxy ? "none" : ""; });
     $("lannote").style.display = d.via_proxy ? "" : "none";
@@ -1015,10 +1111,13 @@ async function refresh() {
     $("sub").textContent = `${live.length} Modell${live.length === 1 ? "" : "e"} live · Stand ${hhmm(now)} · rigdash ${d.version}`;
     binders.forEach((f) => f());
     bindPhaseBars();
-    openDetails.forEach((id) => { const el = id && document.getElementById(id); if (el) el.open = true; });
+    reserveHeights();
+    window.__lastShift = holdAnchor(anchor);       // headless check reads it (tests: scroll_hold.py)
   } catch (e) {
     failures++;
     $("sub").textContent = `Dashboard-API nicht erreichbar (${failures}×): ${e}`;
+  } finally {
+    inflight = false;
   }
 }
 $("gpuqlink").href = `${location.protocol}//${location.hostname}:8770/`;
@@ -1027,10 +1126,16 @@ $("feat-only-off").checked = featOnlyOff;
 $("feat-only-off").addEventListener("change", (e) => {
   featOnlyOff = e.target.checked;
   try { localStorage.setItem("rigdash-feat-only-off", featOnlyOff ? "1" : "0"); } catch (err) { /* no storage */ }
-  refresh();
+  releaseHeight($("feat"));
+  refresh(true);
 });
-refresh();
-setInterval(refresh, 2000);
+try { $("live-pause").checked = localStorage.getItem("rigdash-live-pause") === "1"; } catch (e) { /* no storage */ }
+$("live-pause").addEventListener("change", (e) => {
+  try { localStorage.setItem("rigdash-live-pause", e.target.checked ? "1" : "0"); } catch (err) { /* no storage */ }
+  if (!e.target.checked) refresh(true); else $("pausenote").textContent = pauseReason();
+});
+refresh(true);
+setInterval(() => refresh(), 2000);
 </script>
 </body>
 </html>

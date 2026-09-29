@@ -25,6 +25,19 @@ Gilt für NF und 27B.
 `events.jsonl`, sobald die Front Flip- und Pass-Ereignisse (FLIP done, erster Decode, POST-WAKE-PASS,
 Forward-Start/-Ende je Rang) dort schreibt; dann entfallen FWD-/FLUSH-/ANON-Paarung und Log-Scan.
 
+## Ruhige Anzeige (Nutzer 29.09.: „ständig verschiebt sich das nach oben/unten“)
+
+`refresh()` baut keine Abschnitte per `innerHTML` neu, sondern arbeitet das neue HTML per
+`morph()` Knoten für Knoten ein (Kinder mit `id` werden über die id gepaart — neue Karten, Banner
+und Tabellen brauchen deshalb eine stabile `id`). Das Element auf Lesehöhe steht nach dem
+Neuzeichnen an derselben Stelle (`holdAnchor`, Browser-`overflow-anchor` ist dafür aus), Abschnitte
+schrumpfen beim Refresh nicht (min-height ratscht, Auf-/Zuklappen gibt frei), `<details open>`
+bleibt offen. 10 s nach Scrollen/Tippen/Klicken und solange etwas markiert ist, wird nicht neu
+gezeichnet; dazu der Schalter „Live-Update pausieren“ im Kopf. Event-Handler in neu gezeichneten
+Teilen als Property (`el.onmousemove = …`), nicht `addEventListener` — der Knoten bleibt ja.
+Prüfung headless: `python3 deploy/scroll_hold.py http://127.0.0.1:8891/ 300 --stress`
+(Sprung der Leseposition muss 0 px sein).
+
 Der Dienst selbst ist in `server.py` und `deploy/rig-dashboard.service` beschrieben
 (LAN :8890, läuft aus `/opt/rigdash/current`, Deploy per `deploy/install.sh <rev>`).
 Diese Datei beschreibt nur, was Agenten und Operatoren **pflegen** müssen.
