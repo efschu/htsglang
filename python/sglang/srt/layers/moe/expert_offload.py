@@ -6744,6 +6744,17 @@ class DeferredRowsFill:
                     len(self.pending), self.rows_pending(),
                     (self.t_start - (self.t_rearm or self.t_start)) * 1000, why)
 
+    def start_host_planned(self, why: str) -> bool:
+        """#284b: ``start`` for DEFER_HOST (early) layers only -- H31b's decode
+        layers keep their start at the first decode tick (x147: D's link is
+        busy until then). True when rows were issued."""
+        if self.started or not any(
+            c._deferred_rows is not None and c._deferred_rows.early for c in self.pending
+        ):
+            return False
+        self.start(why=why)
+        return True
+
     def _issue(self, caches) -> None:
         """Die Zeilen dieser Layer auf den Seitenstrom, ein Event je Layer
         (ohne Strom-Handgriffe -- CPU -- synchron auf dem laufenden Strom)."""
