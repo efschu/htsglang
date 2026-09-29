@@ -2839,6 +2839,50 @@ def charge_terms(
     :func:`price`'s own fix-8 note records what a shadowed name costs.
     """
     _m_real = m_mib if anchor_mib is None else int(anchor_mib)
+    _terms = _charge_terms_priced(
+        s_gb, m_mib, ranks_per_group, images, s_gb_d, xchg_bounce_host_bytes,
+        flip_ratchet_gib, arena_gib, staging_gb, _m_real, hicache_disabled,
+        d_draft_host_gib, d_only, memhist_gib, l3_index_gib, cold_tier_shm_gib,
+        census, memhist_run_only)
+    _terms.update(census_shm_posts(_terms, census))
+    return _terms
+
+
+def census_shm_posts(terms: Mapping[str, object], census: Optional[Mapping[str, object]]) -> Dict[str, float]:
+    """29.09.: the two shmem posts a census record MEASURES and no price carries.
+
+    Two-sided replay of 27B z30y 09291331 (peak 62.29 GiB in the level currency
+    memory.current - inactive_file - active_file, 13:36:49Z: anon 24.40 + shmem
+    36.90 + kernel 0.99): the priced arm left shmem 2.2 GiB short --
+      * arena: priced 30.18, the file measured 31.41 (arena_booked) -> the
+        excess is charged, never a deficit (a smaller measured file is a
+        different arm, not a refund);
+      * other_tmpfs 0.89 + unattributed 1.49 (anon_shared: TMS images, parked
+        drafts, memfd) hold the small priced host posts (anchors, rings,
+        overhead, parked drafts, 0.82) and 1.56 GiB more that no post books.
+    Each byte once: the priced small posts are netted out of the measured
+    remainder, and the excess over the arena price is only the excess.
+    Without a record both posts are 0 (UNMEASURED, as every census post).
+    """
+    c = census or {}
+    measured_arena = c.get("arena_measured_gib")
+    arena_excess = (0.0 if measured_arena is None
+                    else max(0.0, float(measured_arena) - float(terms.get("arena_gib", 0.0) or 0.0)))
+    priced_small = sum(float(terms.get(k, 0.0) or 0.0) for k in (
+        "anchors_gib", "rings_gib", "overhead_gib", "draft_host_p_gib",
+        "draft_host_d_gib", "d_draft_host_gib"))
+    measured_rest = (float(c.get("other_tmpfs_gib", 0.0) or 0.0)
+                     + float(c.get("unbooked_shm_gib", 0.0) or 0.0))
+    unposted = max(0.0, measured_rest - priced_small) if measured_arena is not None else 0.0
+    return {"arena_census_excess_gib": arena_excess, "unposted_shm_gib": unposted}
+
+
+def _charge_terms_priced(
+    s_gb, m_mib, ranks_per_group, images, s_gb_d, xchg_bounce_host_bytes,
+    flip_ratchet_gib, arena_gib, staging_gb, _m_real, hicache_disabled,
+    d_draft_host_gib, d_only, memhist_gib, l3_index_gib, cold_tier_shm_gib,
+    census, memhist_run_only,
+) -> Dict[str, object]:
     anchors_gib = 0.0 if hicache_disabled else (
         (ANCHORS_AT_2400_BYTES * (_m_real / ANCHORS_REFERENCE_M_MIB)) / GIB
     )
@@ -2954,6 +2998,8 @@ def _boot_charges_gib(terms: Dict[str, object]) -> float:
         + float(terms.get("seq_ring_gib", 0.0) or 0.0)
         + float(terms.get("arena_sidecar_gib", 0.0) or 0.0)
         + float(terms.get("arena_handoff_gib", 0.0) or 0.0)  # 29.09.: host census posts
+        + float(terms.get("arena_census_excess_gib", 0.0) or 0.0)
+        + float(terms.get("unposted_shm_gib", 0.0) or 0.0)  # 29.09.: measured shmem, once
     )
 
 
@@ -3142,7 +3188,8 @@ def record_run_residual_gib(
 #: boot that sampled it; whatever of these posts that boot did NOT charge is
 #: inside its residual, so charging them again on top of it counts the same
 #: bytes twice.
-CENSUS_POST_KEYS = ("nonrank_anon_gib", "seq_ring_gib", "arena_sidecar_gib", "arena_handoff_gib")
+CENSUS_POST_KEYS = ("nonrank_anon_gib", "seq_ring_gib", "arena_sidecar_gib", "arena_handoff_gib",
+                    "arena_census_excess_gib", "unposted_shm_gib")
 
 
 def census_posts_gib(charges: Optional[Mapping[str, object]]) -> float:

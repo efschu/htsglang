@@ -210,9 +210,17 @@ class TestCensusCountsOnce(CustomTestCase):
         self.assertIn('"residual_census_gib": _census_gib', inspect.getsource(host_ledger))
 
     @unittest.skipUnless(os.path.exists(R27B) and os.path.exists(CENSUS27B), "27B z30y evidence absent")
-    def test_27b_d2_replay_is_below_its_own_measured_peak(self):
-        """Operator 29.09.: prediction(record 09291331) <= measured peak + a
-        small margin. The d2 arm replayed term by term (TERMS line 13:52:11Z:
+    def test_27b_d2_replay_brackets_its_own_measured_peak(self):
+        """Operator 29.09., two-sided: measured peak <= prediction(record
+        09291331) <= measured peak + a small, justified margin. ONE currency:
+        memory.current - inactive_file - active_file (the level the reap mark
+        and the launch origin 0.77 are read in); the front's 60.85 is the
+        post-flip anon+shmem+slab_unreclaimable POINT reading (ratchet
+        instrument), not the peak. Upper margin 1.0 = the L3 index priced 0.82
+        against 0.125 measured at 13:37:58Z (priced for its growth) + one 2-s
+        step of the csv (0.25). Red on 1b8d1f25fd (75.80, upper) and on
+        b03e724bda (60.05, lower: arena file 31.41 vs 30.18 priced, 1.56 GiB
+        other_tmpfs+anon_shared no post booked). The d2 arm replayed term by term (TERMS line 13:52:11Z:
         heaps 17.23, anchors 0.40, rings 0.22, arena 30.18, l3 0.82, overhead
         0.02, draft pools 0.17, ratchet 0.03, priced bounce 15.75) with the REAL
         census record (13:37:58Z) and the REAL residual record. Measured: peak
@@ -237,8 +245,21 @@ class TestCensusCountsOnce(CustomTestCase):
         self.assertAlmostEqual(t["rings_gib"], 0.22, places=2)
         self.assertAlmostEqual(t["heaps_gib"], 17.23, places=1)
         peak = Z30Y_27B_PEAK
-        self.assertLessEqual(predicted, peak + 0.25, (predicted, t["xchg_bounce_gib"]))
-        self.assertGreater(predicted, peak - 5.0)  # and not a new under-count
+        self.assertGreaterEqual(predicted, peak, (predicted, t.get("arena_census_excess_gib"),
+                                                  t.get("unposted_shm_gib")))
+        self.assertLessEqual(predicted, peak + 1.0, (predicted, t["xchg_bounce_gib"]))
+
+    def test_measured_shm_posts_count_once(self):
+        terms = {"arena_gib": 30.18, "anchors_gib": 0.40, "rings_gib": 0.22, "overhead_gib": 0.025,
+                 "draft_host_p_gib": 0.116, "draft_host_d_gib": 0.058}
+        p = host_ledger.census_shm_posts(terms, {"arena_measured_gib": 31.41, "other_tmpfs_gib": 0.89,
+                                                 "unbooked_shm_gib": 1.49})
+        self.assertAlmostEqual(p["arena_census_excess_gib"], 1.23, places=2)
+        self.assertAlmostEqual(p["unposted_shm_gib"], 0.89 + 1.49 - 0.819, places=2)
+        # a smaller measured arena is another arm, never a refund; no record -> 0
+        self.assertEqual(host_ledger.census_shm_posts(terms, {"arena_measured_gib": 5.0})["arena_census_excess_gib"], 0.0)
+        self.assertEqual(host_ledger.census_shm_posts(terms, None), {"arena_census_excess_gib": 0.0,
+                                                                   "unposted_shm_gib": 0.0})
 
     def test_the_priced_bounce_stands_without_a_census(self):
         self.assertAlmostEqual(host_ledger.xchg_carrier_gib(int(15.75 * GIB), None), 15.75, places=6)

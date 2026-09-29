@@ -293,6 +293,7 @@ def ledger_terms(entry: Optional[Mapping[str, object]]) -> Dict[str, object]:
     if not entry:
         return {"nonrank_anon_gib": 0.0, "seq_ring_gib": 0.0, "arena_sidecar_gib": 0.0,
                 "arena_handoff_gib": 0.0, "unbooked_shm_gib": 0.0, "xchg_measured_gib": None,
+                "arena_measured_gib": None, "other_tmpfs_gib": 0.0,
                 "census_roles": {},
                 "census_source": "UNMEASURED (no host census record for this model|form)"}
     roles = {k: float(v) for k, v in dict(entry.get("roles_anon_gib") or {}).items() if k != RANK_ROLE}
@@ -307,6 +308,11 @@ def ledger_terms(entry: Optional[Mapping[str, object]]) -> Dict[str, object]:
         # files). With a record present the ledger charges this, not the
         # priced bounce region (see host_ledger.charge_terms).
         "xchg_measured_gib": float(cls.get("xchg", 0.0)),
+        # 29.09. (two-sided replay of 27B 09291331): the L2 arena file as
+        # MEASURED, and the tmpfs no class names -- both are shmem the cgroup
+        # holds; charge_terms books what no priced post already carries.
+        "arena_measured_gib": (float(cls["arena_booked"]) if "arena_booked" in cls else None),
+        "other_tmpfs_gib": float(cls.get("other_tmpfs", 0.0)),
         "census_roles": roles,
         "census_source": f"record: {int(entry.get('samples') or 0)} sample(s), last {entry.get('last_at', '?')}",
     }
