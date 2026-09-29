@@ -3125,6 +3125,21 @@ class PhasePoolModel:
     weight_mib_per_layer_by_stage: Tuple[float, ...] = ()
     mamba_mib_per_linear_layer_per_slot: float = 0.0
     mamba_slots: int = 0
+    #: Per-STAGE bytes one token adds to that stage's pool cell BEYOND its
+    #: attention layers: the draft KV the draft runner keeps in the same pool
+    #: (pool_configurator: ``cell_size_with_draft``), only on the stage that hosts
+    #: it -- group P's LAST stage (draft_kv_pool_on_this_rank). YaRN x2 27B
+    #: 29.09. (dkr27browauthorityyarn2bar1fs09292006, 34,17,13 / attn 8,4,4):
+    #: PP2 "cell_size=18432 -> max_total_num_tokens=273712" = 4 x 2048 + the
+    #: DFlash2 draft's 5 x 2048, while this model divided by 4 x 2048 and priced
+    #: the cut at 508382. Empty = no draft cell anywhere (byte-identical).
+    extra_cell_bytes_by_stage: Tuple[int, ...] = ()
+
+    def extra_cell_bytes(self, stage: int) -> int:
+        by_stage = self.extra_cell_bytes_by_stage
+        if by_stage and 0 <= int(stage) < len(by_stage):
+            return int(by_stage[int(stage)])
+        return 0
 
     def layer_mib(self, stage: int) -> float:
         """The weight MiB one layer costs on ``stage`` (Task #47/#48)."""
@@ -3309,11 +3324,13 @@ class PhasePoolModel:
         now.
         """
         missing: List[str] = []
+        acknowledged = {str(x) for x in self.zero_posts_acknowledged}
         if not self.stage_fixed_mib:
             missing.append("stage_fixed_mib")
+        # PP-POSTEN (27B): a runtime that books NO activation says so ("prefill activation reserve")
         if float(self.activation_reserve_mib) <= 0.0 and not any(
             float(v) > 0.0 for v in self.activation_reserve_mib_by_stage
-        ):
+        ) and "prefill activation reserve" not in acknowledged:
             missing.append("activation_reserve_mib")
         if self.corridor_holdback_mib is None:
             missing.append("corridor_holdback_mib")
@@ -3322,7 +3339,6 @@ class PhasePoolModel:
             or int(self.mamba_slots) <= 0
         ):
             missing.append("mamba_mib_per_linear_layer_per_slot")
-        acknowledged = {str(x) for x in self.zero_posts_acknowledged}
         for post, field in (
             ("mamba pre-capture reserve", "mamba_precapture_reserve_mib"),
             ("speculative intermediate state", "speculative_intermediate_mib"),
@@ -3384,7 +3400,7 @@ def stage_pp_capacities(
         if swing:
             # each swing attention layer's KV mirror is pool-shaped
             a += int(swing[r][0])
-        caps.append(float(stage_capacity_tokens(free, a, model)))
+        caps.append(float(stage_capacity_tokens(free, a, model, model.extra_cell_bytes(r))))
     return tuple(caps)
 
 
@@ -4130,7 +4146,8 @@ def _stage_free_after_residency(
     return tuple(out)
 
 
-def stage_capacity_tokens(free_mib: float, attn_layers: int, model: PhasePoolModel) -> int:
+def stage_capacity_tokens(free_mib: float, attn_layers: int, model: PhasePoolModel,
+                          extra_cell_bytes: int = 0) -> int:
     """``floor(available_bytes / cell) // page_size * page_size`` -- INTEGER.
 
     The runtime's own two floors, in the runtime's own arithmetic
@@ -4149,7 +4166,7 @@ def stage_capacity_tokens(free_mib: float, attn_layers: int, model: PhasePoolMod
     the code, and the code should not depend on it.
     """
     cell_bytes_per_attn_layer = int(round(float(model.kv_mib_per_token_per_attn_layer) * MIB))
-    cell = int(attn_layers) * cell_bytes_per_attn_layer
+    cell = int(attn_layers) * cell_bytes_per_attn_layer + int(extra_cell_bytes)
     if cell <= 0:
         raise ValueError("a KV cell of zero bytes cannot bound a token count.")
     available_bytes = int(float(free_mib) * MIB)
@@ -4198,7 +4215,7 @@ def gapped_phase_pool(
             # cell_size=0 artifact, 1048576 -- large enough to be invisible in
             # a MIN and to look like a capacity win in any other reduction.
             continue
-        caps.append(float(stage_capacity_tokens(f, int(a), model)))
+        caps.append(float(stage_capacity_tokens(f, int(a), model, model.extra_cell_bytes(r))))
     if not caps:
         raise ValueError(
             f"gapped map {tuple(counts)} with attention counts "

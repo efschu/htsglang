@@ -2326,6 +2326,72 @@ def d_kv_evict_env() -> Dict[str, str]:
     return {} if spec is None else {_dke.ENV: spec.to_json()}
 
 
+#: PP-POSTEN (27B, 29.09.): the measured stage_fixed increment of the YaRN x2 context over the x1 record
+P_STAGE_FIXED_YARN2_DELTA_RECORD = "P_PP_STAGE_FIXED_YARN2_DELTA_MIB"
+
+
+def p_pool_posts_as_booked(ns) -> bool:
+    """PP-POSTEN (27B, 29.09.): does the profile's registry row price group P's pool with the posts the
+    P runtime BOOKS (``ModelProfile.p_pool_posts_as_booked``)? Then the corridor holdback is 0 (the P
+    budget line already subtracts corridor = reserve + awake overshoot; every P rank logs 'KV budget
+    holdback ... holdback=0.0') and the activation reserve is 0 unless pinned (the runtime books P's
+    prefill transient only for a checkpoint with measured slopes, p_prefill_transient_for; the 27B has
+    none -- boots 09291750/09291831/09292006: 'mamba state pool + speculative intermediate state + prefill
+    activation reserve' = 37.41 MiB x linear layers, the mamba pool alone). Off = byte-identical."""
+    row = weg2_form.profile_row(getattr(ns, "profile", None))
+    return bool(row is not None and getattr(row, "p_pool_posts_as_booked", False))
+
+
+def p_stage_fixed_ctx_delta_record(ns, n_stages: int) -> Tuple[Optional[Tuple[float, ...]], str]:
+    """The profile's MEASURED stage_fixed increment for group P's context, where it has one:
+    ``P_PP_STAGE_FIXED_YARN2_DELTA_MIB`` for a P context of 2 x 262144 (YaRN x2). ``(None, '')``
+    otherwise -- the RoPE estimate (p_rope_context_delta_mib) stands."""
+    ctx, _src = group_context_tokens(ns, "p")
+    if int(ctx) != 2 * CONTEXT_LENGTH_TOKENS:
+        return None, ""
+    try:
+        vals = tuple(float(v) for v in _pconst(P_STAGE_FIXED_YARN2_DELTA_RECORD, getattr(ns, "profile", None)))
+    except KeyError:
+        return None, ""
+    if len(vals) != int(n_stages):
+        return None, ""
+    return vals, (f"PP-CUT STAGE-FIXED KONTEXT (gemessen): P context {ctx} -> stage_fixed += "
+                  f"{[round(v, 1) for v in vals]} MiB ({P_STAGE_FIXED_YARN2_DELTA_RECORD}, boots "
+                  f"{_pconst_boots(P_STAGE_FIXED_YARN2_DELTA_RECORD, getattr(ns, 'profile', None))}) "
+                  f"statt der RoPE-Schaetzung")
+
+
+def p_draft_kv_cell_bytes_by_stage(ns, n_stages: int, target_text_cfg: dict,
+                                   kv_dtype_bytes: int = 1) -> Tuple[Tuple[int, ...], Optional[str]]:
+    """PP-CUT DRAFT-ZELLE (YaRN x2 27B, 29.09.): the per-token bytes group P's draft KV adds to the pool
+    cell of the stage that hosts it -- the LAST P stage (pool_configurator.draft_kv_pool_on_this_rank),
+    whenever P carries the draft runner (the resolved ``draft_kv_on_p``; ``cold`` builds its pool too).
+    From the draft's OWN geometry: DFLASH = the external draft's layers x 2 x kv heads x head_dim,
+    NEXTN = one layer of the target's geometry; fp8 KV (the solver's own kv dtype). Boot
+    dkr27browauthorityyarn2bar1fs09292006: PP2 cell 18432 = 4 x 2048 + 5 x 2 x 8 x 128.
+    ``((), None)`` without a draft on P: the pool model is byte-identical."""
+    resolved = _SPEC_FORM.get("draft_kv_on_p")
+    on_p = bool(resolved) if resolved is not None else bool(envs.SGLANG_WEG2_DRAFT_ON_P.get())
+    if not on_p or int(n_stages) <= 0:
+        return (), None
+    if spec_form_is_dflash():
+        dpath = str(getattr(ns, "dflash_draft_path", "") or DFLASH_DRAFT_PATH_DEFAULT)
+        dcfg = _model_config(dpath)
+        dcfg = dcfg.get("text_config") or dcfg
+        layers = int(dcfg["num_hidden_layers"])
+        src = f"DFLASH {os.path.basename(dpath.rstrip('/'))}"
+    else:
+        dcfg, layers, src = target_text_cfg, 1, "NEXTN (one target-geometry layer)"
+    heads = int(dcfg.get("num_key_value_heads") or dcfg["num_attention_heads"])
+    head_dim = int(dcfg.get("head_dim") or int(dcfg["hidden_size"]) // int(dcfg["num_attention_heads"]))
+    v_head_dim = int(dcfg.get("v_head_dim") or head_dim)
+    cell = int(layers) * heads * (head_dim + v_head_dim) * int(kv_dtype_bytes)
+    by_stage = tuple([0] * (int(n_stages) - 1) + [cell])
+    return by_stage, (f"PP-CUT DRAFT-ZELLE: {src}: {layers} layer(s) x {heads} kv heads x "
+                      f"({head_dim}+{v_head_dim}) x {kv_dtype_bytes} B = {cell} B per token on the last P stage "
+                      f"(its pool cell = attention layers x cell + this; pool_configurator cell_size_with_draft)")
+
+
 def spec_form_is_dflash() -> bool:
     return str(_SPEC_FORM["form"]) == "DFLASH"
 
@@ -19694,7 +19760,18 @@ def solve_p_cut(
     _rope_delta, _rope_line = p_rope_context_delta_mib(ns, len(_stage_fixed))
     if _rope_line is not None:
         log(_rope_line)
+        _ctx_delta, _ctx_line = p_stage_fixed_ctx_delta_record(ns, len(_stage_fixed))
+        if _ctx_delta is not None:
+            # measured beats the RoPE estimate (the posts carry more than the cos/sin cache)
+            log(_ctx_line)
+            _rope_delta = _ctx_delta
         _stage_fixed = tuple(float(v) + float(d) for v, d in zip(_stage_fixed, _rope_delta))
+    _booked = p_pool_posts_as_booked(ns)
+    # the draft cell rides the same per-model gate: a model whose row keeps the old posts keeps the old cell
+    _p_draft_cell, _p_draft_cell_line = (p_draft_kv_cell_bytes_by_stage(ns, len(budgets_p), text_cfg)
+                                         if _booked else ((), None))
+    if _p_draft_cell_line is not None:
+        log(_p_draft_cell_line)
     model_pool = _pp_cut.PhasePoolModel(
         free_mib=tuple(float(b) for b in budgets_p),
         # The FAMILY split of weights is deliberately averaged: a stage's
@@ -19725,20 +19802,21 @@ def solve_p_cut(
         # --p-attn-head-split: the SAME vector the ranks book (env_p, see
         # p_attn_head_split_env); () when off -- the pool model is unchanged.
         attn_head_split_mib=_p_ah_post_vector(ns, len(budgets_p), chunk_tokens, model),
-        activation_reserve_mib=p_prefill_activation_reserve_mib(
-            ns.pp_cut_activation_reserve_mib, int(chunk_tokens)
-        ),
+        activation_reserve_mib=(0.0 if _booked and ns.pp_cut_activation_reserve_mib is None
+                                else p_prefill_activation_reserve_mib(
+                                    ns.pp_cut_activation_reserve_mib, int(chunk_tokens))),
         # #242: per stage where the profile measured it (P_ACTIVATION_MIB).
         activation_reserve_mib_by_stage=p_prefill_activation_reserve_by_stage_mib(
             ns.pp_cut_activation_reserve_mib, int(chunk_tokens),
             getattr(ns, "profile", None) or None,
         ),
         # #1257c: None = follow the reserve (the runtime charges exactly it);
-        # a number = the operator pinned it.
+        # a number = the operator pinned it. PP-POSTEN (27B, p_pool_posts_as_booked):
+        # the P budget line already carries the corridor -> 0.
         corridor_holdback_mib=(
-            p_corridor_holdback_default_mib(
+            (0.0 if _booked else p_corridor_holdback_default_mib(
                 max((user_reserve_by_card or {}).values() or [0])
-            )
+            ))
             if ns.pp_cut_corridor_holdback_mib is None
             else float(ns.pp_cut_corridor_holdback_mib)
         ),
@@ -19780,6 +19858,7 @@ def solve_p_cut(
         # 32'), x178 10 against 24. p_mamba_slots reads P's argv and keeps the
         # bound above only for an argv without the flag.
         mamba_slots=int(_p_mamba_slots),
+        extra_cell_bytes_by_stage=_p_draft_cell,
         # #1286 F7: the sizer's second floor. Read off P's argv for the same
         # reason as the target above -- a second copy would drift the day
         # --page-size moves.
@@ -19800,8 +19879,16 @@ def solve_p_cut(
             "mamba pre-capture reserve",
             "speculative intermediate state",
             "GGUF dequant scratch",
-        ),
+        ) + (("prefill activation reserve",)
+             if _booked and ns.pp_cut_activation_reserve_mib is None else ()),
     )
+    if _booked:
+        log("PP-CUT POSTEN (p_pool_posts_as_booked, %s): corridor holdback %s, prefill activation %s, "
+            "mamba slots from P's argv -- what group P books (KV budget holdback=0.0 on every P rank; the P budget "
+            "line carries the corridor)" % (
+                getattr(ns, "profile", None),
+                "0" if ns.pp_cut_corridor_holdback_mib is None else "%s (pinned)" % ns.pp_cut_corridor_holdback_mib,
+                "0" if ns.pp_cut_activation_reserve_mib is None else "%s (pinned)" % ns.pp_cut_activation_reserve_mib))
     # #1286: a LAUNCH may not price with an unfunded post. The desk paths keep
     # their upper bound; this seam publishes a number that is compared against
     # --max-kv-per-request and read as the boot's pool, so it refuses instead.

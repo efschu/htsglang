@@ -172,15 +172,31 @@
   },
   {
    "name": "P_PP_STAGE_FIXED_MIB",
-   "value": "2342.0,1105.5,3518.0",
-   "provenance": "boots weg2sb5f + weg2rg6 (#1286)",
+   "value": "1418.4,148.8,4960.6",
+   "provenance": "PP-POSTEN 29.09. (YaRN x2 300k needle, 27B seat): refitted with the slot count P ALLOCATES (p_mamba_slots_from_argv, --max-mamba-cache-size 24) and the posts P books (p_pool_posts_as_booked): per stage the MAX over the x1 boots of 'weights + runtime state' (P.log 'KV budget posts', GiB x 1024) minus mean_layer_mib 363.3980 x layers: 09291750/09291331 (43,11,10) 1418.4/148.8/4958.4, 09291831 (42,11,11) 1415.2/146.8/4960.6. The last stage now carries the resident DFlash2 draft (DRAFT-KV-PRODUCER resident_mib=2302.5; the previous record ['2', '3', '4', '2', '.', '0', ',', '1', '1', '0', '5', '.', '5', ',', '3', '5', '1', '8', '.', '0'] was fitted 09.09. before it lived on P and with the 3-slot formula).",
    "boots": [
-    "weg2sb5f",
-    "weg2rg6"
+    "dkr27browauthoritybar1fs09291750",
+    "dkr27browauthoritycds6bar1fs09291831",
+    "dkr27browauthorityz30ybar1fs09291331"
    ],
    "kind": "memory",
    "power_limit_w": null,
    "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "P_PP_STAGE_FIXED_YARN2_DELTA_MIB",
+   "value": [
+    234.4,
+    259.9,
+    439.6
+   ],
+   "provenance": "PP-POSTEN 29.09.: the measured stage_fixed increment of group P at context 524288 (YaRN x2) over P_PP_STAGE_FIXED_MIB: boot dkr27browauthorityyarn2bar1fs09292006 (34,17,13) 'weights + runtime state' 13.680/6.432/9.887 GiB minus mean_layer_mib x layers minus the x1 record = [234.4, 259.9, 439.6] MiB. Replaces the RoPE estimate [64, 64, 192] (cos/sin cache) where it applies -- the posts carry ~4x the target's estimate on every stage; the estimate stays for contexts no boot measured.",
+   "boots": [
+    "dkr27browauthorityyarn2bar1fs09292006"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not a power-dependent quantity (resident bytes)"
   },
   {
    "name": "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT",

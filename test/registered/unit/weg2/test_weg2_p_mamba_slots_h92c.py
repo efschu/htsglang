@@ -129,14 +129,12 @@ class TestMambaPost:
         assert slots == lc.P_MAX_MAMBA_CACHE_SIZE == 24
         assert "on P's argv" in src
 
-    def test_qwen27b_keeps_the_demand_formula(self, model):
-        """Operator rule 26.09. (27B byte-identical): on the qwen27b row the post
-        stays ceil(p_bs x 2 x 1.25) even with the flag on P's argv -- the 27B
-        stage constants were fitted with it (reading the argv moves the solved
-        27B cut 42,11,11 -> 39,13,12)."""
+    def test_qwen27b_reads_the_argv_since_the_posts_refit(self, model):
+        """PP-POSTEN 29.09. (27B seat): the qwen27b row reads P's argv too -- its stage constants were
+        refitted with the slot count P allocates (24: 37.41 MiB per linear layer on every P rank of
+        09291750/09291831/09292006), so the demand formula would now UNDER-charge the pool."""
         slots, src = lc.p_mamba_slots(_ns("--max-mamba-cache-size 32", profile="qwen27b"), model, 8)
-        assert slots == 20 and "UPPER BOUND" in src
-        assert lc.p_mamba_slots(_ns("", p_bs=2, profile="qwen27b"), model, 2)[0] == 5
+        assert slots == 32 and "argv" in src
 
     def test_the_demand_bound_only_for_an_argv_without_the_flag(self, model):
         real = lc.argv_p
