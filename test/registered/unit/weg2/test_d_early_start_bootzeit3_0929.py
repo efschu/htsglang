@@ -87,3 +87,50 @@ def test_gate_sits_before_the_load_and_the_avail_reading():
     i_gate = src.index("wait_gate_from_env()")
     assert i_gate < src.index("before_avail_memory =")
     assert i_gate < src.index("Load weight begin")
+
+
+# --- stage 0 (27B review of cb98c3d94a): no D context before P is sized ---
+
+
+def test_stage0_noop_without_env(monkeypatch):
+    monkeypatch.delenv(des.STAGE0_ENV, raising=False)
+    assert des.wait_stage0_from_env() is None
+
+
+def test_stage0_refuse_raises_named(monkeypatch, tmp_path):
+    gate = str(tmp_path / "s0.json")
+    des.write_gate(gate, des.VERDICT_REFUSE, "nvml1: D held 482 MiB before P was sized")
+    monkeypatch.setenv(des.STAGE0_ENV, gate)
+    with pytest.raises(des.DEarlyGateRefused, match="482 MiB"):
+        des.wait_stage0_from_env()
+
+
+def test_p_sized_record_roundtrip(monkeypatch, tmp_path):
+    monkeypatch.delenv(des.P_SIZED_DIR_ENV, raising=False)
+    assert des.note_p_memory_sized(0, 0, 16.68) is None  # off without the env
+    monkeypatch.setenv(des.P_SIZED_DIR_ENV, str(tmp_path))
+    des.note_p_memory_sized(2, 0, 9.06)
+    des.note_p_memory_sized(0, 0, 16.68)
+    recs = des.read_p_sized(str(tmp_path))
+    assert [(r["pp_rank"], r["used_by_me_mib"]) for r in recs] == [(0, 17080), (2, 9277)]
+
+
+def test_stage0_verdict_waits_then_goes_and_refuses_on_taint():
+    recs = [{"pp_rank": k, "tp_rank": 0, "used_by_me_mib": 1000 + k} for k in range(3)]
+    v, _ = des.stage0_verdict(recs[:2], 3, {"u1": 0})
+    assert v is None  # PP2 not sized yet
+    v, lines = des.stage0_verdict(recs, 3, {"u1": 0, "u0": 0})
+    assert v is True and "D held 0 MiB" in lines[-1]
+    # a D context seen before P was sized taints P's used_by_me: refuse, even if P is done
+    v, lines = des.stage0_verdict(recs, 3, {"u1": 888}, {"u1": "nvml1"})
+    assert v is False and any("nvml1: D held 888 MiB" in l for l in lines)
+
+
+def test_stage0_sits_before_the_first_cuda_call_and_p_reports_after_sizing():
+    from sglang.srt.managers import scheduler as sch
+
+    run = inspect.getsource(sch.run_scheduler_process)
+    i = run.index("wait_stage0_from_env()")
+    assert i < run.index("install_triton_loader_window()") < run.index("Scheduler(")
+    init = inspect.getsource(sch.Scheduler.init_model_worker)
+    assert init.index("note_post_capture_leftover(") < init.index("note_p_memory_sized(")

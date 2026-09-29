@@ -12806,6 +12806,69 @@ def _d_early_start_armed(ns) -> bool:
     return str(getattr(ns, "weg2_d_early_start", "off") or "off") == "on"
 
 
+class Weg2DEarlyStartUnreviewed(Weg2LaunchRefused):
+    """W185: the early D start is reviewed for Next Flash only (27B review of
+    cb98c3d94a); another profile's readers of the D plan between P's launch
+    and step 5 were not audited with it on."""
+
+
+def refuse_d_early_start_unreviewed(ns) -> None:
+    """W185, called before group P starts: a named refusal, never a silent off."""
+    if _d_early_start_armed(ns) and not xchg_census_is_reserve(ns.profile):
+        raise Weg2DEarlyStartUnreviewed(
+            f"W185 Weg2DEarlyStartUnreviewed: --weg2-d-early-start on with profile "
+            f"{ns.profile or weg2_form.DEFAULT_PROFILE!r}; reviewed for Next Flash only (27B review "
+            f"29.09.: its readers of ns.env_d/_d_owner_solve between launch_group(P) and "
+            f"#5 are not audited with the switch on). Boot with 'off' (byte-identical).")
+
+
+def _group_rank_count(argv: Sequence[str]) -> int:
+    """Scheduler ranks one group spawns: --tp-size x --pp-size of its argv."""
+    toks = list(argv)
+    return int(_last_flag_value(toks, "--tp-size") or 1) * int(_last_flag_value(toks, "--pp-size") or 1)
+
+
+def d_early_stage0_watch(gate: str, sized_dir: str, expected_p_ranks: int, d_pid_fn,
+                         d_alive_fn, p_alive_fn, vram_fn, names: Mapping[str, str],
+                         result: Dict[str, object], log: Log, poll_s: float = 1.0,
+                         clock=time.monotonic, sleep=time.sleep) -> None:
+    """BOOTZEIT 3 stage 0, launcher side: sample the early D's VRAM per card
+    until every P rank reports sized, then write the stage-0 gate. ``go`` only
+    if D held 0 MiB on every card meanwhile (else P's used_by_me holds D's
+    context: refuse, D exits, the serial path starts D later)."""
+    from sglang.srt.weg2 import d_early_start as _des
+
+    held: Dict[str, int] = {}
+    t0 = clock()
+    while True:
+        try:
+            now = vram_fn(d_pid_fn())
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            now = {}
+            log(f"{_des.STAGE0_MARKER} VRAM sample failed ({type(e).__name__}: {e}); counted as no reading")
+        for u, v in now.items():
+            held[u] = max(held.get(u, 0), int(v))
+        records = _des.read_p_sized(sized_dir)
+        verdict, lines = _des.stage0_verdict(records, expected_p_ranks, held, names)
+        if verdict is None and not (d_alive_fn() and p_alive_fn()):
+            verdict, lines = False, lines + ["a group exited before P was sized"]
+        if verdict is not None:
+            for ln in lines:
+                log(f"{_des.STAGE0_MARKER} {ln}")
+            waited = clock() - t0
+            _des.write_gate(gate, _des.VERDICT_GO if verdict else _des.VERDICT_REFUSE,
+                            "; ".join(lines), measured=held)
+            log(f"{_des.STAGE0_MARKER} {'GO' if verdict else 'REFUSE'} after {waited:.1f} s -- "
+                + ("D creates its CUDA contexts now" if verdict else "early D exits; D starts serially"))
+            result.update({"verdict": _des.VERDICT_GO if verdict else _des.VERDICT_REFUSE,
+                           "waited_s": round(waited, 1), "d_held_mib": dict(held),
+                           "p_used_by_me_mib": {f"pp{r.get('pp_rank')}tp{r.get('tp_rank')}": r.get("used_by_me_mib")
+                                                for r in records}})
+            boot_state_write(log, event=("d_early_stage0", dict(result)))
+            return
+        sleep(poll_s)
+
+
 def budgets_from_dc(
     cards: List[Card],
     dc_mib: Dict[str, int],
@@ -23374,6 +23437,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         return spec_d, budgets_d
 
+    refuse_d_early_start_unreviewed(ns)  # W185, before any group starts
+    _early_sized_dir = None
+    if _d_early_start_armed(ns):
+        from sglang.srt.weg2 import d_early_start as _des
+
+        _early_sized_dir = os.path.join(os.path.dirname(os.path.abspath(state.logs["D"])),
+                                        f"d_early_p_sized_{ns.tag}")
+        os.makedirs(_early_sized_dir, exist_ok=True)
+        for _old in os.listdir(_early_sized_dir):
+            os.unlink(os.path.join(_early_sized_dir, _old))
+        spec_p.env[_des.P_SIZED_DIR_ENV] = _early_sized_dir  # stage 0: P ranks report sized
     launch_group(spec_p, tree, log, dry)
     if dry:
         _dry_terms: List[Dict[str, object]] = []
@@ -23442,19 +23516,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
         log("D-EXPECT DORMANT-OTHER D(frueh, Erwartung): " + ", ".join(
             f"nvml{c.nvml_index} {_early_other[c.uuid]}" for c in cards) + f" MiB -- {_early_other_why}")
+        _early_stage0 = os.path.join(os.path.dirname(_early_gate), f"d_early_stage0_{ns.tag}.json")
+        try:
+            os.unlink(_early_stage0)
+        except FileNotFoundError:
+            pass
         _early_spec, _early_budgets = _d_spec_from(
-            _early_other, "D(frueh, Erwartung)", {_des.GATE_ENV: _early_gate})
+            _early_other, "D(frueh, Erwartung)",
+            {_des.GATE_ENV: _early_gate, _des.STAGE0_ENV: _early_stage0})
         state.argv["D"] = " ".join(shlex.quote(a) for a in _early_spec.argv)
         launch_group(_early_spec, tree, log, dry)
         log(f"{_des.MARKER} LAUNCH group D with P (planned budgets {_early_budgets} MiB, "
-            f"gate {_early_gate}); D's load waits for the verdict after sleep(P)")
-        _early_d = (_early_spec, _early_budgets, _early_gate, _early_snap)
+            f"gate {_early_gate}); D holds before its CUDA context until P is sized "
+            f"({_early_stage0}) and before its load until the verdict after sleep(P)")
+        _early_stage0_result: Dict[str, object] = {}
+        threading.Thread(
+            target=d_early_stage0_watch, name="bz3-d-early-stage0", daemon=True,
+            args=(_early_stage0, _early_sized_dir, _group_rank_count(spec_p.argv),
+                  lambda: session_pids(_early_spec.pid), lambda: _early_spec.proc.poll() is None,
+                  lambda: spec_p.proc.poll() is None, nvml_process_mib,
+                  {c.uuid: f"nvml{c.nvml_index}" for c in cards}, _early_stage0_result, log),
+        ).start()
+        _early_d = (_early_spec, _early_budgets, _early_gate, _early_snap, _early_stage0_result)
 
     def _d_early_verdict(early, dc_measured):
         """go -> the running early D; refuse -> None (it exits, the caller starts D serially)."""
         from sglang.srt.weg2 import d_early_start as _des
 
-        spec, planned, gate, snap = early
+        spec, planned, gate, snap, stage0 = early
         _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
         _rest, _rest_prov = d_awake_rest(cards, ns.profile)
         _over, _over_prov = d_overshoot_record(ns.profile)
@@ -23473,6 +23562,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rc = spec.proc.poll() if spec.proc is not None else None
         if rc is not None:
             ok, lines = False, lines + [f"early D exited before the gate rc={rc}"]
+        if stage0.get("verdict") != _des.VERDICT_GO:
+            ok, lines = False, lines + [f"stage 0 not go ({stage0.get('verdict', 'no verdict yet')})"]
         for _ln in lines:
             log(f"{_des.MARKER} {_ln}")
         if ok:
