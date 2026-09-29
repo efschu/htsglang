@@ -323,6 +323,120 @@ def park_decode_dwell_ok(awake_s: float, decode_s: Optional[float], cycle_ms: fl
     return float(decode_s) >= need
 
 
+def park_collect_window(items: Sequence[Tuple[float, int]], now: float, t_awake: float,
+                        n_running: int, price_s: float, threshold_tokens: int, *,
+                        timer: bool = False, max_requests: int = 0, pool_tokens: int = 0,
+                        wait_bound_s: float = 0.0) -> Tuple[bool, str, Optional[float], float]:
+    """PARK-COLLECT-WINDOW: may the immediate park stop D's running decodes now?
+
+    NF z30w-park 08:31-08:46: 21 immediate parks in 15 min, all fired by ONE
+    over-X arrival (7 of them 4224-4761 uncached against X=4096), 37 parked
+    streams, park -> resume 8.4 s median / 17.8 s p90. The user's model: D
+    keeps decoding; once the pending P work passes the bound, it collects
+    while D decodes on, and the flip comes when collecting has cost as much as
+    the flip would -- or earlier when D's decodes end.
+
+    SKI RENTAL (user decision 29.09.), both sides in request-seconds: the
+    RENT is what the queued requests have waited since the window opened
+    (their sum), the PRICE of the flip is ``price_s`` -- the caller passes one
+    measured round trip per running stream, which is what a park stalls. One
+    stream and one waiting request = "wait one round trip". ``timer`` (the
+    fixed-x override) instead closes the window ``price_s`` after it opened.
+
+    ``items`` are the queued requests that need P as ``(t_arrive, uncached)``.
+    The window opens when their uncached sum first passes
+    ``threshold_tokens`` (head first by arrival), never before this D phase
+    woke. Fires on: nothing running (the park stops nobody), a hard cap --
+    ``max_requests`` queued (P's phase cap), ``pool_tokens`` queued (P's
+    pool), the oldest waited ``wait_bound_s`` -- or the rent reaching the
+    price. Returns ``(fire, why, t_start, left_s)`` (``left_s`` at the current
+    queue); pure -- the front owns the clocks."""
+    rows = sorted((float(t), int(u)) for t, u in items)
+    if not rows:
+        return False, "empty", None, 0.0
+    total, t_cross = 0, None
+    for t, u in rows:
+        total += u
+        if total > int(threshold_tokens):
+            t_cross = t
+            break
+    if t_cross is None:
+        return False, "below-threshold", None, 0.0
+    t_start = max(t_cross, float(t_awake))
+    if timer:
+        left = max(0.0, float(price_s) - (float(now) - t_start))
+    else:
+        rent = sum(max(0.0, float(now) - max(t, t_start)) for t, _ in rows)
+        left = max(0.0, (float(price_s) - rent) / len(rows))
+    if int(n_running) <= 0:
+        return True, "d-idle", t_start, left
+    if int(max_requests) > 0 and len(rows) >= int(max_requests):
+        return True, "cap-requests", t_start, left
+    if int(pool_tokens) > 0 and sum(u for _, u in rows) >= int(pool_tokens):
+        return True, "cap-pool", t_start, left
+    if float(wait_bound_s) > 0.0 and float(now) - rows[0][0] >= float(wait_bound_s):
+        return True, "wait-bound", t_start, left
+    if left <= 0.0:
+        return True, "timer" if timer else "rent", t_start, 0.0
+    return False, "collect", t_start, left
+
+
+#: PARK-COLLECT-WINDOW: the measured-record sidecar entry of one flip round
+#: trip. The sidecar's other readers filter on their own fields
+#: (``rss_shmem_gib``/``flip_ratchet_gib``, ``kind == "pd_free0"``) and do
+#: not see it.
+PARK_ROUND_TRIP_KIND = "park_round_trip"
+PARK_ROUND_TRIP_GROUP = "PARK_RT"
+#: The first round trips of a boot that are appended (the sidecar is
+#: append-only across every boot of the rig; the newest one seeds the next).
+PARK_ROUND_TRIP_RECORDS = 3
+
+
+def park_round_trip_s(dp_ms: float, pd_ms: float, resume_ms: Optional[float]) -> Optional[float]:
+    """The ski-rental price of one flip round trip in seconds: K7's D->P and
+    P->D prices plus D's wake -> first decoded chunk; ``None`` while any of
+    the three is unmeasured (K7 prices 0 before its first flip)."""
+    if resume_ms is None or float(dp_ms) <= 0.0 or float(pd_ms) <= 0.0:
+        return None
+    return (float(dp_ms) + float(pd_ms) + float(resume_ms)) / 1000.0
+
+
+def park_round_trip_record(*, form_key: str, dp_ms: float, pd_ms: float, resume_ms: float,
+                           boot_tag: str, commit: Optional[str], at: str) -> dict:
+    """The sidecar entry of one measured round trip, keyed by ``form_key``
+    (checkpoint x form, see the front's ``_park_form_key``) so a qwen27b
+    boot never reads a nextflash round trip and vice versa."""
+    return {
+        "kind": PARK_ROUND_TRIP_KIND, "group": PARK_ROUND_TRIP_GROUP, "form_key": str(form_key),
+        "round_trip_s": park_round_trip_s(dp_ms, pd_ms, resume_ms),
+        "dp_ms": float(dp_ms), "pd_ms": float(pd_ms), "resume_ms": float(resume_ms),
+        "boot_tag": str(boot_tag), "commit": commit, "at": str(at),
+    }
+
+
+def newest_park_round_trip(samples: Iterable[dict], form_key: str) -> Optional[dict]:
+    """The newest round-trip entry of ``form_key`` among ``samples``, or ``None``."""
+    rows = [e for e in samples
+            if isinstance(e, dict) and e.get("kind") == PARK_ROUND_TRIP_KIND
+            and e.get("form_key") == form_key and isinstance(e.get("round_trip_s"), (int, float))
+            and float(e["round_trip_s"]) > 0.0]
+    return max(rows, key=lambda e: str(e.get("at", "")), default=None)
+
+
+def read_park_round_trip(path: str, form_key: str) -> Optional[dict]:
+    """:func:`newest_park_round_trip` of the sidecar at ``path``; a missing or
+    malformed sidecar is an ABSENCE (``None``), never a zero."""
+    if not path or not form_key:
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    samples = data.get("samples") if isinstance(data, dict) else None
+    return newest_park_round_trip(samples if isinstance(samples, list) else [], form_key)
+
+
 def park_verdict(status: int, text: str) -> Tuple[str, List[str], str]:
     """Read D's answer to :data:`PARK_PATH`.
 

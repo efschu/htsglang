@@ -3206,6 +3206,21 @@ class Envs:
     # expert pass on NF-D). Needs SGLANG_WEG2_TAIL_SKIP_EXTEND; refused by
     # name under uneven DCP / the token cut. Off = the park byte for byte.
     SGLANG_WEG2_ENABLE_D_PARK_END = EnvBool(False)
+    # PARK-COLLECT-WINDOW (29.09., NF z30w-park 08:31-08:46: 21 immediate parks
+    # in 15 min, 37 parked streams, park->resume median 8.4 s / p90 17.8 s --
+    # the user's stream stuttered). User decision 29.09. ~09:15Z, for qwen27b
+    # AND nextflash: D keeps decoding; once the queued P work passes
+    # THRESHOLD_TOKENS (0 = X) it collects -- SKI RENTAL: until the queued
+    # requests' summed wait reaches what the park costs, one measured flip
+    # round trip per running stream (K7's D->P + P->D + wake -> first decoded
+    # chunk: this boot's, else the newest record of this model x form, else 0
+    # = the immediate park). D running nothing or a hard cap
+    # (p_phase_max_requests, P's pool, d_wait_bound_s) fires at once. Off =
+    # the immediate park byte for byte.
+    # WINDOW_S: a fixed timer x instead of the measured price (override only).
+    SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW = EnvBool(False)
+    SGLANG_WEG2_PARK_COLLECT_WINDOW_S = EnvFloat(None)
+    SGLANG_WEG2_PARK_COLLECT_THRESHOLD_TOKENS = EnvInt(0)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at

@@ -503,6 +503,19 @@ def record_identity_from_spec(spec: str):
         kv["model"], kv["evidence"], _form.current_form(), repo=kv.get("repo", ""))
 
 
+def park_form_key() -> str:
+    """PARK-COLLECT-WINDOW: the round-trip record's key -- the published form's
+    checkpoint (its directory name) and residue axes, so a qwen27b boot and a
+    nextflash boot never seed each other's collect window; "" without a form."""
+    from sglang.srt.weg2 import form as _form
+
+    boot_form = _form.current_form()
+    if boot_form is None:
+        return ""
+    axes = ",".join(f"{a}={getattr(boot_form, a)}" for a in _form.RESIDUE_AXES)
+    return f"{_form.model_key(boot_form.model)}|{axes}"
+
+
 class SidecarView:
     """H78: the measured-record sidecar as the sleep-leg gate reads it --
     parsed once per FILE VERSION, not once per flip.
@@ -3880,6 +3893,21 @@ class Front:
         # PARK-DECODE-DWELL: time of the first chunk D streamed in epoch _d_decode_epoch
         self._d_decode_epoch = -1
         self._d_decode_t0 = 0.0
+        #: PARK-COLLECT-WINDOW: the last D phase's wake -> first decoded chunk
+        #: (ms, the resume part of a flip round trip); None before the first.
+        self._last_resume_ms: Optional[float] = None
+        #: PARK-COLLECT-WINDOW: the D phase (epoch) whose collect hold is named.
+        self._park_collect_epoch = -1
+        #: PARK-COLLECT-WINDOW: checkpoint x form of this boot (the round-trip
+        #: record's key, qwen27b and nextflash never share one); "" = no form.
+        self._park_form_key = park_form_key()
+        #: PARK-COLLECT-WINDOW: the newest recorded round trip of this form,
+        #: x until this boot measured its own; None = none recorded.
+        self._park_rt_seed: Optional[dict] = (
+            phase_policy.read_park_round_trip(self.measured_record, self._park_form_key)
+            if envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get() else None)
+        #: PARK-COLLECT-WINDOW: round trips this boot appended to the sidecar.
+        self._park_rt_written = 0
         #: H91c3-3: the D phase's seat count n (H95) this front sent at the
         #: last P->D wake; None before the first one (no seat cap known).
         self._d_phase_n: Optional[int] = None
@@ -4386,7 +4414,86 @@ class Front:
                             "phase", self.epoch, p.rid, int(awake_s * 1000.0), int(need_ms), prov,
                             int(FAIRNESS_DWELL_FLOOR_MS))
             return None
+        if envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get():
+            # PARK-COLLECT-WINDOW (NF z30w-park 08:31-08:46, user 29.09.): D keeps
+            # decoding while the pending P work collects for the window; the park
+            # comes at its end, or earlier when D runs nothing or a hard cap binds.
+            x_tok = int(self.tp_prefill_max_tokens)
+            # the queued requests that need P, read by the park trigger's own reader
+            items = [(float(q.t_arrive), int(q.est_uncached)) for q in self.queue
+                     if phase_policy.immediate_park_trigger([q], x_tok) is not None]
+            threshold = int(envs.SGLANG_WEG2_PARK_COLLECT_THRESHOLD_TOKENS.get()) or x_tok
+            round_trip_s, rt_src = self._park_collect_window_s()
+            n_running = len(self._flip_ledger(D))
+            timer = rt_src == "flag"
+            # ski rental: a park stalls every running stream for one round trip
+            price_s = round_trip_s if timer else round_trip_s * max(1, n_running)
+            fire, why, t_start, left_s = phase_policy.park_collect_window(
+                items, now, self.t_awake, n_running, price_s, threshold, timer=timer,
+                max_requests=self.p_phase_max_requests, pool_tokens=self.p_pool_tokens,
+                wait_bound_s=self.d_wait_bound_s)
+            if not fire:
+                if self._park_collect_epoch != self.epoch:
+                    self._park_collect_epoch = self.epoch
+                    self.counters["park_collect_holds"] += 1
+                    logger.info("WEG2 PARK-COLLECT-WINDOW HOLD epoch=%d rid=%s why=%s running=%d "
+                                "queued_p=%d uncached=%d threshold=%d round_trip_s=%.2f (%s) "
+                                "price_s=%.1f left_s=%.1f -- D keeps decoding, the pending P work "
+                                "collects", self.epoch, p.rid, why, n_running, len(items),
+                                sum(u for _, u in items), threshold, round_trip_s, rt_src, price_s,
+                                left_s)
+                return None
+            self.counters[f"park_collect_{why.replace('-', '_')}"] += 1
+            logger.info("WEG2 PARK-COLLECT-WINDOW FIRE epoch=%d rid=%s why=%s running=%d queued_p=%d "
+                        "uncached=%d collected_s=%.1f", self.epoch, p.rid, why, n_running, len(items),
+                        sum(u for _, u in items), (now - t_start) if t_start is not None else 0.0)
         return p
+
+    def _park_collect_window_s(self) -> Tuple[float, str]:
+        """PARK-COLLECT-WINDOW: one flip round trip in seconds and its source,
+        the unit of the SKI-RENTAL price (user decision 29.09.; the caller
+        charges it once per running stream) -- K7's D->P and P->D prices plus
+        the last D phase's wake -> first decoded chunk. RECORD > UNMEASURED
+        before this boot measured one: the newest round trip of this
+        checkpoint x form, else 0 (the immediate park, named).
+        SGLANG_WEG2_PARK_COLLECT_WINDOW_S overrides all of it as a fixed timer
+        (source "flag")."""
+        override = envs.SGLANG_WEG2_PARK_COLLECT_WINDOW_S.get()
+        if override is not None:
+            return float(override), "flag"
+        dp_ms, dp_src = self._derived_min_dwell_ms("D", "P")
+        pd_ms, pd_src = self._derived_min_dwell_ms("P", "D")
+        live = phase_policy.park_round_trip_s(dp_ms, pd_ms, self._last_resume_ms)
+        if live is not None:
+            return live, f"ski-live:{dp_src}+{pd_src}+resume={int(self._last_resume_ms)}ms"
+        if self._park_rt_seed is not None:
+            return (float(self._park_rt_seed["round_trip_s"]),
+                    f"ski-record:{self._park_rt_seed['boot_tag']}@{self._park_rt_seed['at']}")
+        return 0.0, f"ski-unmeasured:{self._park_form_key or 'no-form'}"
+
+    def _note_park_round_trip(self) -> None:
+        """PARK-COLLECT-WINDOW: append this boot's first measured round trips to
+        the sidecar (the next boot's seed of the same checkpoint x form). Built
+        at D's first decoded chunk, written by the H78 writer thread."""
+        if (not envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get() or not self._park_form_key
+                or not self.measured_record
+                or self._park_rt_written >= phase_policy.PARK_ROUND_TRIP_RECORDS):
+            return
+        dp_ms, _ = self._derived_min_dwell_ms("D", "P")
+        pd_ms, _ = self._derived_min_dwell_ms("P", "D")
+        if phase_policy.park_round_trip_s(dp_ms, pd_ms, self._last_resume_ms) is None:
+            return
+        self._park_rt_written += 1
+        now = time.time()
+        rec = phase_policy.park_round_trip_record(
+            form_key=self._park_form_key, dp_ms=dp_ms, pd_ms=pd_ms,
+            resume_ms=float(self._last_resume_ms), boot_tag=str(self.tag), commit=self.commit,
+            at=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now)) + ",%03d" % int((now % 1) * 1000))
+        logger.info("WEG2 PARK-ROUND-TRIP epoch=%d round_trip_s=%.2f dp_ms=%d pd_ms=%d resume_ms=%d "
+                    "form=%s -> sidecar (the next boot's collect window of this form)", self.epoch,
+                    rec["round_trip_s"], int(dp_ms), int(pd_ms), int(self._last_resume_ms),
+                    self._park_form_key)
+        self._sidecar_submit(host_ledger.append_measured_record, self.measured_record, rec)
 
     async def _wait_bound_park(self, wait_s: Optional[float], immediate: Optional["Pending"] = None,
                                cause: str = "over-x") -> str:
@@ -7634,6 +7741,8 @@ class Front:
                         if self.awake == "D" and self._d_decode_epoch != self.epoch:
                             self._d_decode_epoch = self.epoch
                             self._d_decode_t0 = time.time()
+                            self._last_resume_ms = (self._d_decode_t0 - self.t_awake) * 1000.0
+                            self._note_park_round_trip()
                         if len(tail) > 262144:
                             del tail[:-131072]
                         if not client_io["gone"]:
