@@ -134,7 +134,7 @@ class TestHiCacheController(unittest.TestCase):
 
     def test_rowcheck_defers_only_for_identity_rows_on_the_device(self):
         src = inspect.getsource(cc_mod.HiCacheController._refuse_unaddressable_kv_rows)
-        i = src.index("_weg2_p_overlap.p_nosync_on()")
+        i = src.index("_weg2_p_overlap.cache_path_nosync_on()")
         gate = src[i:src.index("self._923_defer_bound_check", i)]
         self.assertIn("rows.is_cuda", gate)
         self.assertIn("self._dcp_owner_ctx() is None", gate)
@@ -143,7 +143,7 @@ class TestHiCacheController(unittest.TestCase):
 
     def test_move_indices_keeps_device_indices_on_the_device(self):
         src = inspect.getsource(cc_mod.HiCacheController.move_indices)
-        i = src.index("_weg2_p_overlap.p_nosync_on()")
+        i = src.index("_weg2_p_overlap.cache_path_nosync_on()")
         branch = src[i:src.index("device_indices = device_indices.cpu()", i)]
         self.assertIn("device_indices.is_cuda", branch)
         self.assertIn("non_blocking=True", branch)

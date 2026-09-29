@@ -3163,6 +3163,56 @@ def _group_world_size() -> int:
         return 1
 
 
+#: #281 WEG2-PREPARE-PARTS: where ``prepare_for_extend`` spends its time.
+#: z30u measured D TP0 ``prepare_ms`` linear in the admitted prefix (~5.6 ms
+#: per 1000 hit tokens) and nothing inside the function said which line.
+#: "1" = host wall per segment (perf_counter only, no device call);
+#: "2" = additionally the device work PENDING on the current stream at entry,
+#: timed by one synchronize (diagnosis only: it moves that wait out of the
+#: segments, it does not remove it). Unset = the function is unchanged.
+PREPARE_PARTS_ENV = "SGLANG_WEG2_PREPARE_PARTS"
+
+
+class _PrepareParts:
+    __slots__ = ("_t", "_parts", "_entry_sync_ms")
+
+    @classmethod
+    def begin(cls) -> Optional["_PrepareParts"]:
+        mode = os.environ.get(PREPARE_PARTS_ENV, "")
+        if mode not in ("1", "2"):
+            return None
+        pp = cls()
+        pp._entry_sync_ms = -1.0
+        if mode == "2" and torch.cuda.is_available():
+            t = time.perf_counter()
+            torch.cuda.current_stream().synchronize()
+            pp._entry_sync_ms = (time.perf_counter() - t) * 1000.0
+        pp._parts = []
+        pp._t = time.perf_counter()
+        return pp
+
+    def mark(self, name: str) -> None:
+        now = time.perf_counter()
+        self._parts.append((name, (now - self._t) * 1000.0))
+        self._t = now
+
+    def finish(self, batch, prefix_lens) -> None:
+        self.mark("tail")
+        try:
+            logger.info(
+                "WEG2-PREPARE-PARTS bs=%d prefix_tokens=%d extend_tokens=%d "
+                "entry_sync_ms=%.1f %s (host wall per segment of "
+                "prepare_for_extend; entry_sync = device work pending on the "
+                "current stream at entry, -1 = not probed)",
+                len(prefix_lens), int(sum(prefix_lens)),
+                int(getattr(batch, "extend_num_tokens", 0) or 0),
+                self._entry_sync_ms,
+                " ".join(f"{n}={ms:.1f}" for n, ms in self._parts),
+            )
+        except Exception:  # noqa: BLE001 - an instrument may never break prepare
+            pass
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -3533,6 +3583,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
+        _pp = _PrepareParts.begin()  # #281 WEG2-PREPARE-PARTS; None = off
         self.forward_mode = ForwardMode.EXTEND
         server_args = get_server_args()
 
@@ -3681,6 +3732,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
         ).to(self.device, non_blocking=True)
 
+        if _pp is not None:
+            _pp.mark("head")
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
         self.extend_lens = extend_lens
@@ -3730,6 +3783,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 alloc_for_extend(self)
             )
 
+        if _pp is not None:
+            _pp.mark("alloc")
         # Set fields
         input_embeds = []
         all_replace_embeds: List[torch.Tensor] = []
@@ -4018,9 +4073,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 device=self.device,
             )
 
+        if _pp is not None:
+            _pp.mark("reqs")
         # Collect mamba init info for deferred ops on forward stream
         if any(req.mamba_pool_idx is not None for req in reqs):
             self._collect_deferred_mamba_cow_and_clear(reqs)
+        if _pp is not None:
+            _pp.mark("mamba_cow")
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
@@ -4030,6 +4089,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+        if _pp is not None:
+            _pp.finish(self, prefix_lens)
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
@@ -4261,7 +4322,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # per rid at the moment it is established. `src` is the tree
                 # anchor's slot, `dst` this request's own -- if a later probe's
                 # dst equals a slot some node still names, #1190 is #924.
-                from sglang.srt.managers.weg2_p_overlap import p_nosync_on
+                from sglang.srt.managers.weg2_p_overlap import (
+                    cache_path_nosync_on as p_nosync_on,  # #281 D-CACHE-NOSYNC
+                )
                 from sglang.srt.mem_cache.allocator.mamba import (
                     note_924d,
                     slot_trail_on,

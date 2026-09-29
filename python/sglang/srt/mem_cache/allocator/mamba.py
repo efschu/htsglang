@@ -162,9 +162,10 @@ class MambaSlotAllocator:
         # schedule stream -- which holds the fence of the forward that is still
         # running (py-spy weg2xsn422 PP0: 1731 of 2357 samples on that line,
         # #PGAP anchor 409-604 ms per 4096 chunk). Read once; off = unchanged.
-        from sglang.srt.managers.weg2_p_overlap import p_nosync_on
+        # D-CACHE-NOSYNC (#281): group D asks the same cache-path switch.
+        from sglang.srt.managers.weg2_p_overlap import cache_path_nosync_on
 
-        self._nosync = p_nosync_on()
+        self._nosync = cache_path_nosync_on()
         # Active preallocated batch for `alloc_group_begin` / `alloc_group_end`.
         # When non-None, `alloc(1)` consumes the next slot from this iterator
         # instead of calling `_do_alloc(1)` per request. Reset to None outside
