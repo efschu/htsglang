@@ -114,6 +114,22 @@ class Weg2StoreTold:
     keys_digest: Optional[str] = None
 
 
+#: P-FORK-CUT (weg2.p_fork_cut) wire attribute of a told: the absolute token
+#: depth at which the request's truncating chunk ends -- PP0's verdict, decided
+#: once at the publish from PP0's store probe / tree match. Set only when there
+#: is a cut (like PF's ``ack``), so a told without one stays byte-identical on
+#: the wire. Every rank's adder cuts at exactly this value and at nothing
+#: rank-local (z30j: a cut read from PP0's own probe split PP0 4608 / PP1
+#: 16384 -> W27).
+WIRE_FORK = "fork"
+
+
+def _with_fork(told, fork: int):
+    if fork > 0:
+        setattr(told, WIRE_FORK, int(fork))
+    return told
+
+
 @dataclass
 class Weg2StoreAdmit:
     """#1416e: PP0's membership verdict for a PACED told -- PP0 admits the
@@ -159,6 +175,9 @@ def armed(scheduler) -> bool:
     if value:
         scheduler._weg2_store_told = {}
         scheduler._weg2_store_held = {}
+        #: P-FORK-CUT: rid -> the told fork (PP0: published, follower: absorbed);
+        #: `admission` hands it to the request.
+        scheduler._weg2_store_fork = {}
         # #1416e: resolved ONCE, read on PP0 only -- a follower follows the
         # `paced` flag of the object PP0 put on the wire, never its own env,
         # so a launcher that armed the switch on one rank only cannot split
@@ -792,8 +811,9 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
         _ple_admit_at_told(scheduler, req, told, absolute)
         told_map[rid] = told
         held.pop(rid, None)
-        out.append((Weg2StoreToldTwin if twin else Weg2StoreTold)(
-            rid=rid, told=told, absolute=absolute, keys_digest=_pp0_keys_digest(req)))
+        out.append(_with_fork((Weg2StoreToldTwin if twin else Weg2StoreTold)(
+            rid=rid, told=told, absolute=absolute, keys_digest=_pp0_keys_digest(req)),
+            _pp0_fork(scheduler, req, rid)))
         n = getattr(scheduler, "_weg2_store_told_published", 0) + 1
         scheduler._weg2_store_told_published = n
         if _log_due(n):
@@ -809,6 +829,33 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     if not out:
         return recv_reqs
     return list(recv_reqs) + out
+
+
+def _note_fork(scheduler, rid: str, fork) -> None:
+    """P-FORK-CUT: keep the told's fork until this rank admits ``rid``."""
+    forks = getattr(scheduler, "_weg2_store_fork", None)
+    if forks is None:
+        forks = scheduler._weg2_store_fork = {}
+    fork = int(fork or 0)
+    if fork > 0:
+        forks[rid] = fork
+    else:
+        forks.pop(rid, None)
+    if len(forks) > 256:
+        queued = {_rid(r) for r in scheduler.waiting_queue}
+        for k in [k for k in forks if k != rid and k not in queued]:
+            forks.pop(k, None)
+
+
+def _pp0_fork(scheduler, req, rid: str) -> int:
+    """P-FORK-CUT: PP0 decides the fork depth ONCE, at the told it publishes,
+    from its own store probe and tree match; the told carries the number to
+    every follower (0 = no cut anywhere)."""
+    from sglang.srt.weg2 import p_fork_cut
+
+    fork = p_fork_cut.pp0_fork_verdict(req, int(getattr(scheduler, "page_size", 1) or 1))
+    _note_fork(scheduler, rid, fork)
+    return fork
 
 
 def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
@@ -844,6 +891,8 @@ def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
                     early.pop(k, None)
         else:
             told_map[rid] = told
+        # P-FORK-CUT: PP0's fork verdict, the only one this rank cuts at.
+        _note_fork(scheduler, rid, getattr(item, WIRE_FORK, 0))
         if getattr(item, "twin", False) or getattr(item, "absolute", False):
             # TW: an absolute twin told (read-ahead or single-phase alike);
             # TK: every absolute told takes the same follower mark.
@@ -1171,12 +1220,13 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
         _ple_admit_at_told(scheduler, req, told, absolute)
         _cls = Weg2StoreToldTwin if twin else Weg2StoreTold
         _extra = {"absolute": absolute, "keys_digest": _pp0_keys_digest(req)}
+        _fork = _pp0_fork(scheduler, req, rid)
         held.pop(rid, None)
         own_read_s = now - intake_t.pop(rid, now)
         if told <= 0:
             # nothing to read on any rank: single-phase, as before
             told_map[rid] = told
-            out.append(_cls(rid=rid, told=told, **_extra))
+            out.append(_with_fork(_cls(rid=rid, told=told, **_extra), _fork))
             continue
         # #57: pace the READ, not the told -- the part below PP0's registered
         # head is on every rank already (rank-uniform: PP0 decides alone,
@@ -1195,7 +1245,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
                 )
         pacing[rid] = _Pace(req=req, told=told, published_at=now, published_pass=pass_n, window_s=window,
                             absolute=bool(absolute))
-        ahead = _cls(rid=rid, told=told, paced=True, **_extra)
+        ahead = _with_fork(_cls(rid=rid, told=told, paced=True, **_extra), _fork)
         if fb_on:
             # PF: ask the followers for their read state (wire marker, set
             # only here) and start the Frist.
@@ -1268,6 +1318,10 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
     if told is None:
         note_skip(SKIP_TOLD_PENDING, rid)
         return None
+    # P-FORK-CUT: the told's fork rides onto the request on every rank alike
+    # (PP0 published it, the followers absorbed it); the adder cuts only there.
+    forks = getattr(scheduler, "_weg2_store_fork", None) or {}
+    req._weg2_fork_told = int(forks.pop(rid, 0) or 0)
     tree = scheduler.tree_cache
     # #1419: told bounds this rank's radix match (schedule_batch
     # _weg2_cap_key_limit) so no rank -- PP0 included -- admits more than told.

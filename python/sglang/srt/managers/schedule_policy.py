@@ -183,6 +183,7 @@ _WEG2_END_ANCHOR = os.environ.get("SGLANG_WEG2_END_ANCHOR", "0") == "1"
 # P-TRIM-END-ANCHOR (weg2/p_trim_end_anchor.py): a request P's intake cut to
 # N-1 carries its held-back token under this attribute; the split leaves it be.
 from sglang.srt.weg2.p_trim_end_anchor import TRIM_ATTR as _P_TRIM_ATTR
+from sglang.srt.weg2 import p_fork_cut as _weg2_p_fork_cut
 
 
 def _weg2_end_anchor_grain(allocator, page_size) -> int:
@@ -2168,6 +2169,11 @@ class PrefillAdder:
         )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if truncated:
+            # P-FORK-CUT: end this chunk at the shared-prefix fork when that is free.
+            new_len = _weg2_p_fork_cut.apply(
+                self, req, len(req.prefix_indices), new_len, "add_chunked_req"
+            )
         # #1233 END-OF-PREFILL ANCHOR: hold the last token back (see helper).
         new_len, _forced = self._weg2_end_anchor_split(
             req, len(req.prefix_indices), new_len
@@ -3056,6 +3062,12 @@ class PrefillAdder:
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
+
+                # P-FORK-CUT: end this chunk at the shared-prefix fork when that is
+                # free, so its anchor lands where the next session reads.
+                trunc_len = _weg2_p_fork_cut.apply(
+                    self, req, len(req.prefix_indices), trunc_len, "add_one_req"
+                )
 
                 # #959 ONE CONTINUATION AT A TIME -- the sibling of the guard
                 # in the no-prefix branch above, which carries the reasoning.
