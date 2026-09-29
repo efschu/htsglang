@@ -100,7 +100,9 @@ class TestSwitch(CustomTestCase):
         self.assertEqual((rec["group"], rec["tp_rank"], rec["pp_rank"]), ("D", 1, 0))
         self.assertEqual(rec["work"]["forward_ct"], 7)
         self.assertEqual(rec["tokens"], {"prefill_total": 16384, "decode_total": 7})
-        self.assertEqual(rec["sched"], {"waiting": 2, "running": 0})
+        # §3 (29.09.) extends sched with queue_req/running_req/pending_tokens
+        self.assertEqual({k: rec["sched"][k] for k in ("waiting", "running")},
+                         {"waiting": 2, "running": 0})
         self.assertEqual(rec["last_post_wake"], {"n": 0, "run_ms": 31.0})
         self.assertIn("errors", rec)
         self.assertFalse([n for n in os.listdir(d) if ".tmp." in n])

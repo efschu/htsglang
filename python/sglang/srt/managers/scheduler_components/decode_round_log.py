@@ -265,6 +265,13 @@ class DecodeRoundLog:
         self.last_compute_ms: Optional[float] = None
         self.last_split_known: bool = False
         self.last_seq: int = 0
+        #: RANKSTATS §3 (DASHBOARD-AUS-IPC, 29.09.): emitted rounds and their
+        #: gpu-ms, summed and never reset, total and per batch size
+        #: ``{bs: [rounds, gpu_ms]}``. Written after the line in ``_emit``;
+        #: the rankstats timer thread only reads them (D1/C3 from the IPC).
+        self.cum_rounds: int = 0
+        self.cum_gpu_ms: float = 0.0
+        self.cum_by_bs: dict = {}
         #: fnFL2 H23: DECODE-ROUND-COST for the first rounds after a Weg-2
         #: wake. Inert until ``arm_wake_census``.
         self.wake_census = WakeRoundCensus(rank=self.rank)
@@ -531,6 +538,14 @@ class DecodeRoundLog:
 
         self._overhead_rounds += 1
         self._overhead_gpu_ms += round_ms
+        self.cum_rounds += 1
+        self.cum_gpu_ms += round_ms
+        slot_bs = self.cum_by_bs.get(acc.bs)
+        if slot_bs is None:
+            self.cum_by_bs[acc.bs] = [1, round_ms]
+        else:
+            slot_bs[0] += 1
+            slot_bs[1] += round_ms
         if split_known and family_acc:
             # fnFL2 H28: BARLINK-ROUND-CENSUS every N rounds; no-op unless
             # SGLANG_WEG2_AR_ROUND_CENSUS.

@@ -13,7 +13,16 @@ RankState reader and the W7/W10 gate never see it):
             heartbeat together with ts)
   tokens    prefill_total, decode_total (MetricsReporter's monotone counters)
   spec      accept_tokens_total, forward_ct_total (lifetime spec counters)
-  sched     waiting, running
+  sched     waiting, running, queue_req, running_req, pending_tokens
+  prefill   §3: chunks, new_tokens, cached_tokens, gpu_ms, split_ms, compute_ms,
+            wait_ms, bubble_ms, last{t, new, gpu_ms, compute_ms}
+            (RankPrefillLog.cum -- the ``Prefill rank batch`` numbers, summed)
+  decode    §3: rounds, gpu_ms, gpu_ms_by_bs{bs: [rounds, gpu_ms]}, tokens,
+            running, accept_len_ewma, accept_rate_ewma, cuda_graph
+            (DecodeRoundLog.cum_* + the logged Decode batch values)
+  cache     §3: loadback_n, loadback_tok, mamba_resume_n, mamba_tok,
+            store_incomplete_n, prefetch{landed, deferred, refused, expired,
+            issued, attempted} (the #988 / #1324 / #915 counters as they are)
   errors    n, last[8]{t, logger, level, exc, text}  (ERROR/CRITICAL records)
   last_post_wake  the latest WEG2-POST-WAKE-PASS census as a dict, or null
 
@@ -92,6 +101,75 @@ def install_error_tally(logger_name: str = "sglang") -> ErrorTally:
     return h
 
 
+def _prefill_block(mr) -> Optional[Dict[str, Any]]:
+    """§3 prefill: RankPrefillLog.cum, copied (the path writes, the timer reads)."""
+    rpl = getattr(mr, "rank_prefill_log", None)
+    cum = getattr(rpl, "cum", None)
+    if not isinstance(cum, dict):
+        return None
+    out = dict(cum)
+    for k in ("gpu_ms", "split_ms", "compute_ms", "wait_ms", "bubble_ms"):
+        if isinstance(out.get(k), float):
+            out[k] = round(out[k], 1)
+    return out
+
+
+def _decode_block(mr) -> Optional[Dict[str, Any]]:
+    """§3 decode: DecodeRoundLog.cum_* plus the Decode batch line's values."""
+    if mr is None:
+        return None
+    drl = getattr(mr, "decode_round_log", None)
+    by_bs = getattr(drl, "cum_by_bs", None)
+    ewma = getattr(mr, "accept_len_ewma", None)
+    rate = getattr(mr, "accept_rate_ewma", None)
+    return {
+        "rounds": getattr(drl, "cum_rounds", None),
+        "gpu_ms": None if drl is None else round(float(getattr(drl, "cum_gpu_ms", 0.0)), 1),
+        "gpu_ms_by_bs": None if by_bs is None else {
+            str(bs): [int(v[0]), round(float(v[1]), 1)] for bs, v in list(by_bs.items())},
+        "tokens": int(getattr(mr, "gen_tokens_total", 0) or 0),
+        "running": getattr(mr, "last_running_reqs", None),
+        "accept_len_ewma": None if ewma is None else round(float(ewma), 3),
+        "accept_rate_ewma": None if rate is None else round(float(rate), 3),
+        "cuda_graph": getattr(mr, "last_cuda_graph", None),
+    }
+
+
+def _cache_block(scheduler) -> Dict[str, Any]:
+    """§3 cache: the #988 / #1324 / #915 counters the paths already keep."""
+    out: Dict[str, Any] = {"loadback_n": None, "loadback_tok": None,
+                           "mamba_resume_n": None, "mamba_tok": None,
+                           "store_incomplete_n": None, "prefetch": None}
+    try:
+        from sglang.srt.managers import schedule_policy as _sp
+
+        seen = getattr(_sp, "_988_LOADBACK_SEEN", None) or {}
+        out["loadback_n"] = int(seen.get("n", 0))
+        out["loadback_tok"] = int(seen["tok"]) if "tok" in seen else None
+        out["mamba_resume_n"] = int(seen.get("mamba", 0))
+    except Exception:  # noqa: BLE001 -- a missing module reads as unknown
+        pass
+    out["store_incomplete_n"] = int(getattr(scheduler, "_weg2_store_short_seen", 0) or 0)
+    try:
+        from sglang.srt.mem_cache import match_refusal_census as _mrc
+
+        counts = dict(getattr(_mrc, "PREFETCH_GATE_COUNTS", {}) or {})
+        out["prefetch"] = {
+            "attempted": counts.get("attempted", 0),
+            "issued": counts.get("issued", 0),
+            "landed": counts.get("landed", 0),
+            "deferred": counts.get("defer_refused", 0),
+            "expired": counts.get("defer_expired", 0),
+            "refused": sum(v for k, v in counts.items()
+                           if k not in ("attempted", "issued", "landed", "defer_refused",
+                                        "defer_expired", "intake")
+                           and not k.endswith("_tokens")),
+        }
+    except Exception:  # noqa: BLE001 -- a missing module reads as unknown
+        pass
+    return out
+
+
 def scheduler_counters(scheduler) -> Dict[str, Any]:
     """READ ONLY: the counters the scheduler's round path increments anyway."""
     mr = getattr(scheduler, "metrics_reporter", None)
@@ -100,14 +178,19 @@ def scheduler_counters(scheduler) -> Dict[str, Any]:
         running = len(getattr(rb, "reqs", None) or ())
     except Exception:  # noqa: BLE001 -- a racing swap of the batch reads as unknown
         running = None
+    waiting = len(getattr(scheduler, "waiting_queue", None) or ())
     return {
+        "prefill": _prefill_block(mr),
+        "decode": _decode_block(mr),
+        "cache": _cache_block(scheduler),
         "work": {"forward_ct": int(getattr(scheduler, "forward_ct", 0) or 0)},
         "tokens": {"prefill_total": int(getattr(mr, "prefill_tokens_total", 0) or 0),
                    "decode_total": int(getattr(mr, "gen_tokens_total", 0) or 0)},
         "spec": {"accept_tokens_total": int(getattr(mr, "spec_total_num_accept_tokens", 0) or 0),
                  "forward_ct_total": int(getattr(mr, "spec_total_num_forward_ct", 0) or 0)},
-        "sched": {"waiting": len(getattr(scheduler, "waiting_queue", None) or ()),
-                  "running": running},
+        "sched": {"waiting": waiting, "running": running,
+                  "queue_req": waiting, "running_req": running,
+                  "pending_tokens": getattr(mr, "last_pending_tokens", None)},
     }
 
 
