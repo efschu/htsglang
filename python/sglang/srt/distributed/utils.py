@@ -584,6 +584,24 @@ def weightless_head_counts(
     return [int(by_rank.get(r, 0)) for r in range(world_size)]
 
 
+def weightless_dcp_head_counts(num_heads: int, total_kv: int, world_size: int):
+    """(q, kv) per-rank head counts the lane's attention backends plan with.
+
+    F15 (5c): over a head SET W the q heads split in whole GQA groups -- the
+    SAME units/groups the W ranks' qkv/o projections were built with
+    (rank_form.form_b_build_context: tp_partition_sizes over |W|) -- and the kv
+    heads per head; the lane (a set of one) is [total, 0, ...] for both, as
+    before."""
+    w_n = len(_WEIGHTLESS_KV_WEIGHT_RANKS or (0,))
+    q = weightless_head_counts(
+        num_heads, world_size,
+        units=attn_q_partition_units(num_heads, total_kv, w_n),
+        groups=attn_q_partition_groups(total_kv, w_n),
+    )
+    kv = weightless_head_counts(total_kv, world_size, units=total_kv)
+    return q, kv
+
+
 def uneven_dcp_active(dcp_size: Optional[int] = None) -> bool:
     """True when the uneven-DCP token-axis split is in force: a non-uniform
     token vector is installed. When `dcp_size` is given, the vector must also

@@ -54,3 +54,20 @@ def test_a_bad_head_set_is_refused_by_name():
     for ranks, ratios in (([], None), ([0, 0], None), ([0, 1], [1]), ([0, 1], [1, 0])):
         with pytest.raises(ValueError, match="W181"):
             du.set_weightless_kv_weight_ranks(ranks, ratios)
+
+
+def test_the_backend_plans_its_counts_through_one_helper():
+    """F15 (5c): flashinfer's lane branch plans (q, kv) with
+    weightless_dcp_head_counts: the lane [H,0,0]/[KV,0,0] as before, the head set
+    in whole GQA groups by the W shares (= the W build)."""
+    import inspect
+
+    from sglang.srt.layers.attention import flashinfer_backend as fb
+
+    assert "weightless_dcp_head_counts(" in inspect.getsource(fb.FlashInferAttnBackend.__init__)
+    du.set_weightless_kv_head_rank(0)
+    assert du.weightless_dcp_head_counts(24, 4, 3) == ([24, 0, 0], [4, 0, 0])
+    du.set_weightless_kv_weight_ranks((0, 1), (77, 23))
+    assert du.weightless_dcp_head_counts(24, 4, 3) == ([18, 6, 0], [3, 1, 0])
+    du.set_weightless_kv_weight_ranks((1, 2), None)
+    assert du.weightless_dcp_head_counts(24, 4, 3) == ([0, 12, 12], [0, 2, 2])
