@@ -18,7 +18,7 @@ import websockets
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8891/"
 DURATION = float(sys.argv[2]) if len(sys.argv) > 2 else 60
 STRESS = "--stress" in sys.argv
-PORT = 9337
+PORT = int(__import__("os").environ.get("CDP_PORT", "9337"))
 
 
 async def main():
@@ -93,7 +93,7 @@ async def main():
                   "anchor corrections", sorted({round(x["shift"] or 0) for x in samples})[:12])
             # (4) pause: a wheel event stops redraws for ~10 s
             await ev("window.dispatchEvent(new WheelEvent('wheel', {deltaY: 0})), 1")
-            await asyncio.sleep(1)
+            await asyncio.sleep(2.5)            # the note is written on the next 2-s tick
             print("pause after wheel:", await ev("document.getElementById('pausenote').textContent"))
             ok = worst < 1 and all(x["same"] for x in samples) and all(x["open"] in (True, None) for x in samples)
             print("RESULT", "OK" if ok else "FAIL")
