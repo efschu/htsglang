@@ -5036,6 +5036,9 @@ class MoEExpertOffloadCache:
         holt sie wie jeden anderen kalten Experten), der Pad wird sofort
         genullt, und :class:`DeferredRowsFill` laedt die Zeilen nach dem ersten
         Decode-Forward und befoerdert den Layer dann auf das volle Layout.
+        ``defer=DEFER_HOST`` (P, Host-Planung): dieselben Zeilen, aber ohne
+        Pool-Tabellen und ``early`` -- der Nachlader startet schon hinter dem
+        Rearm, der naechste Forward des Rangs (jeder Modus) wartet ihre Events.
 
         Gibt die Zahl der HIER nachgeladenen Experten-Zeilen zurueck.
         """
@@ -5048,15 +5051,26 @@ class MoEExpertOffloadCache:
                    for attr, buf in self._resident.items()]
         lid = getattr(self.layer, "layer_id", "?")
         extra = tuple(r for r in runs if r[1] >= 0)
+        early = defer == DEFER_HOST
         plan = None
         if defer and not rows_loaded and self._pool_ready and extra:
             plan = self._deferred_layout(extra, entries)
+        # DEFER_HOST on a layer without the pool (P: run_waves plans on the
+        # host): no cold layout to write, the rows only need to be on the
+        # card before this rank's next forward
+        host_rows = (early and plan is None and not rows_loaded and not self._pool_ready
+                     and bool(extra) and all(spill is not None for _a, _b, spill in entries))
         zeilen = 0
-        if plan is not None:
+        if plan is not None or host_rows:
             load_refill_rows(entries, tuple(r for r in runs if r[1] < 0), layer_id=lid)
         elif not rows_loaded:
             zeilen = load_refill_rows(entries, runs, layer_id=lid)
         self._scratch_holds.clear()
+        if host_rows:
+            self._deferred_rows = DeferredRows(
+                entries=entries, runs=extra, full=None,
+                rows=sum(n for _z, _p, n in extra) * len(entries), layer_id=lid, early=True)
+            deferred_rows_fill().add(self)
         if self._pool_ready:
             from sglang.srt.layers.moe.expert_pool_device import (
                 apply_pool_layout,
@@ -5074,7 +5088,8 @@ class MoEExpertOffloadCache:
                                   pool_layout_tensors(self._pool_tables, hot_cold, host_cold))
                 self._deferred_rows = DeferredRows(
                     entries=entries, runs=extra, full=full,
-                    rows=sum(n for _z, _p, n in extra) * len(entries), layer_id=lid)
+                    rows=sum(n for _z, _p, n in extra) * len(entries), layer_id=lid,
+                    early=early)
                 deferred_rows_fill().add(self)
             if self._pool_pf_buffers is not None:
                 self._pool_pf_armed = False
@@ -5117,7 +5132,8 @@ class MoEExpertOffloadCache:
         d = self._deferred_rows
         if d is None:
             return
-        apply_pool_layout(self._pool_tables, d.full)
+        if d.full is not None:
+            apply_pool_layout(self._pool_tables, d.full)
         self._scratch_holds.clear()
         if self._pool_pf_buffers is not None:
             self._pool_pf_armed = False
@@ -6614,15 +6630,26 @@ def rearm_expert_offload_after_wake(model, prefetch=None, defer=False, sync=True
     return layers, zeilen
 
 
+#: ``defer`` mode of :func:`rearm_expert_offload_after_wake` for a group whose
+#: MoE layers plan on the HOST with full residency (P's prefill): the extra
+#: rows are not loaded before the rearm returns, but they load at once on a
+#: side stream and land before that rank's FIRST forward (any mode) -- a
+#: host-planned layer can never compute on cold rows.
+DEFER_HOST = "host"
+
+
 @dataclass
 class DeferredRows:
     """H31b: what one pool layer still owes after a deferred rearm."""
 
     entries: list  # (attr, buf, spill)
     runs: tuple  # the extra runs (zeile0, platz0, n), platz0 >= 0
-    full: object  # expert_pool_device.PoolLayout of the full residency
+    full: object  # expert_pool_device.PoolLayout of the full residency (None: no pool)
     rows: int  # rows over all attrs, the unit of rows_from_store
     layer_id: object = "?"
+    # DEFER_HOST: lands before the next forward of any mode, not after the
+    # first decode forward
+    early: bool = False
 
 
 class DeferredRowsFill:
@@ -6692,7 +6719,7 @@ class DeferredRowsFill:
                    if c._deferred_rows is not None)
 
     # -- forward side -------------------------------------------------------
-    def start(self) -> None:
+    def start(self, why: str = "behind the first forward") -> None:
         """Alle offenen Layer auf den Seitenstrom, ein Event je Layer."""
         if self.started or not self.pending:
             return
@@ -6703,9 +6730,9 @@ class DeferredRowsFill:
             self.stream = ops.new_stream()
         self._issue(list(self.pending))
         logger.info("%s fill-start layers=%d rows=%d since_rearm_ms=%.0f (the extra rows "
-                    "load now, behind the first forward, on a side stream)", self.LINE,
+                    "load now, %s, on a side stream)", self.LINE,
                     len(self.pending), self.rows_pending(),
-                    (self.t_start - (self.t_rearm or self.t_start)) * 1000)
+                    (self.t_start - (self.t_rearm or self.t_start)) * 1000, why)
 
     def _issue(self, caches) -> None:
         """Die Zeilen dieser Layer auf den Seitenstrom, ein Event je Layer
@@ -6764,6 +6791,20 @@ class DeferredRowsFill:
         if not self.pending:
             return
         self.ticks += 1
+        early = [c for c in self.pending
+                 if c._deferred_rows is not None and c._deferred_rows.early]
+        if early:
+            # DEFER_HOST: this forward's stream waits every early layer's
+            # event (no host wait); the rows were issued at the rearm
+            if not self.started:
+                self.start()
+            late = [c for c in early if id(c) not in self.events]
+            if late:
+                self._issue(late)
+            for cache in early:
+                self._promote(cache, "tick")
+            if not self.pending:
+                return
         if not self.started:
             if is_decode:
                 self.start()

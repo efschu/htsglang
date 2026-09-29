@@ -728,6 +728,15 @@ class Envs:
     # an eager forward (extend) lands its layer first (WEG2-REARM-DEFER
     # fill-start / landed, expert-rearm ... deferred=N). 0 = serial as before.
     SGLANG_WEG2_REARM_DEFER = EnvBool(True)
+    # REARM_DEFER_HOST_GROUPS (#284, D->P wake): waking groups whose MoE layers
+    # plan on the HOST (P's prefill) take the same deferral in its early form:
+    # the rearm does not wait for the extra rows, they load on a side stream
+    # right behind it and the rank's NEXT forward (any mode) waits their events.
+    # Measured x178/z30w-park/z30x2 (63/63 D->P wakes): PP1 ends the wake RPC
+    # last with a serial rearm of ~7000 store rows (894-1068 ms, reload=895),
+    # PP0 waits 474-538 ms in the fence; PP1's first forward comes after PP0's
+    # first chunk. Comma list; empty = the serial rearm on P, byte for byte.
+    SGLANG_WEG2_REARM_DEFER_HOST_GROUPS = EnvStr("")
     # VRAM_PEAK (H55): one WEG2-VRAM-PEAK line per P chunk, per D round window
     # (VRAM_PEAK_ROUNDS decode/verify forwards or 5 s) and per flip leg: the
     # allocator peak of that window (memory_stats + reset_peak_memory_stats,

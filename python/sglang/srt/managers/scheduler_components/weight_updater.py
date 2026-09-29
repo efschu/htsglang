@@ -2117,13 +2117,23 @@ class SchedulerWeightUpdaterManager:
         if line:
             logger.info("%s", line)
 
-    def _weg2_rearm_defer_armed(self) -> bool:
-        """H31b: defer the extra rows past the first token? Only on the
-        DECODE group (its MoE layers run the device pool; P's prefill plans
-        on the host with full residency and would land every layer at once)."""
+    def _weg2_rearm_defer_armed(self):
+        """H31b: defer the extra rows past the first token? True on the
+        DECODE group (its MoE layers run the device pool). P's prefill plans
+        on the host with full residency and lands every layer at once: a
+        group named in REARM_DEFER_HOST_GROUPS gets ``DEFER_HOST`` (#284 --
+        the rows load behind the rearm, the next forward waits them), any
+        other group False (the serial rearm)."""
         from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_offload import DEFER_HOST
 
-        return bool(envs.SGLANG_WEG2_REARM_DEFER.get()) and self._weg2_group_name() == "D"
+        if not bool(envs.SGLANG_WEG2_REARM_DEFER.get()):
+            return False
+        group = self._weg2_group_name()
+        if group == "D":
+            return True
+        hosts = {g.strip() for g in str(envs.SGLANG_WEG2_REARM_DEFER_HOST_GROUPS.get() or "").split(",")}
+        return DEFER_HOST if group in hosts else False
 
     def _weg2_rearm_defer_settle(self) -> None:
         """H31b: before the first pause of a sleep -- wait for a running
@@ -10303,6 +10313,7 @@ class SchedulerWeightUpdaterManager:
             # hier ist KEIN Warnfall: ein Layer mit Resten der anderen Gruppe
             # rechnet falsch und sagt es nicht.
             from sglang.srt.layers.moe.expert_offload import (
+                DEFER_HOST,
                 REARM_PREFETCH_OFF_FIELDS,
                 deferred_rows_fill,
                 rearm_expert_offload_after_wake,
@@ -10335,6 +10346,11 @@ class SchedulerWeightUpdaterManager:
                     _m, prefetch=_rearm_pf, defer=_defer, sync=False)
                 _rl += int(_l)
                 _rz += int(_z)
+            if _defer == DEFER_HOST:
+                # #284: host-planned layers never run cold -- their rows go on
+                # the side stream NOW and land during the fence and the earlier
+                # stages' first chunk; the rank's next forward waits the events
+                deferred_rows_fill().start(why="behind the rearm, before the next forward")
             if _scratch:
                 # residue_nonzero: lock entries the recycled pages handed back
                 # NON-ZERO, counted before the memset (27B 2026-09-25: the
