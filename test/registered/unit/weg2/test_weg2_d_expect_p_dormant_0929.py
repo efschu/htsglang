@@ -295,7 +295,11 @@ class ExpectationPassesUseTheSelector(CustomTestCase):
                  for n in ast.walk(tree) if isinstance(n, ast.Call)]
         self.assertEqual(calls.count("d_expect_dormant_other"), 2)
         self.assertEqual(calls.count("p_dormant_records"), 1)
-        self.assertEqual(calls.count("read_measured_records"), 0)
+        # the only direct read in main is group D's (D-RESERVE, inside the
+        # NF census branch); group P's goes through the gated reader
+        direct = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                  and getattr(n.func, "attr", None) == "read_measured_records"]
+        self.assertEqual([ast.literal_eval(n.args[1]) for n in direct], ["D"])
         self.assertEqual(calls.count("d_expect_check_lines"), 1)
         for label in ('"D(Karte, Erwartung)"', '"D(dry, expectation)"'):
             line = next(l for l in src.splitlines() if "budgets_from_dc(" in l and label in l)

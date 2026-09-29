@@ -486,11 +486,12 @@ def p_dormant_records(profile: Optional[str],
     return host_ledger.read_measured_records(measured_record_path(), "P", accept=accept)
 
 
-def p_dormant_from_records(
+def dormant_max_from_records(
     recs: Optional[Sequence[Dict[str, object]]], cards: Sequence[Card], weight_source: str,
-    n: int = P_DORMANT_EXPECT_N,
+    n: int = P_DORMANT_EXPECT_N, group: str = "P",
 ) -> Tuple[Optional[Dict[str, int]], str]:
-    """Group P's MEASURED dormant VRAM residue per card: the per-card MAXIMUM
+    """A group's MEASURED dormant VRAM residue per card (``group`` names it in
+    the provenance; the caller reads that group's records): the per-card MAXIMUM
     over the newest ``n`` group-P dormant-image records (one per boot) that
     the front stamped at P's first sleep (``vram_residue_mib``, the same
     field #1444 reads for group D), measured under the SAME weight form and
@@ -507,7 +508,7 @@ def p_dormant_from_records(
     expectation passes and an early D start read it here, not from a second
     source."""
     if not recs:
-        return None, "no group-P dormant-image record in the sidecar"
+        return None, f"no group-{group} dormant-image record in the sidecar"
     by_boot: Dict[str, Dict[str, object]] = {}
     skipped = []
     for rec in sorted((r for r in recs if isinstance(r, dict)),
@@ -529,7 +530,7 @@ def p_dormant_from_records(
         if len(by_boot) >= int(n):
             break
     if not by_boot:
-        return None, (f"no group-P record measured under form {str(weight_source)!r} on "
+        return None, (f"no group-{group} record measured under form {str(weight_source)!r} on "
                       f"every card (skipped: {', '.join(skipped[:4]) or 'none'})")
     out: Dict[str, int] = {}
     parts = []
@@ -537,9 +538,62 @@ def p_dormant_from_records(
         vals = [int(r["vram_residue_mib"][c.uuid]) for r in by_boot.values()]
         out[c.uuid] = max(vals)
         parts.append(f"nvml{c.nvml_index} {out[c.uuid]} (min {min(vals)})")
-    return out, (f"MAX over the newest {len(by_boot)} of N={int(n)} group-P records form "
+    return out, (f"MAX over the newest {len(by_boot)} of N={int(n)} group-{group} records form "
                  f"{str(weight_source)!r}: " + ", ".join(parts) + " MiB; boots "
                  + ", ".join(by_boot))
+
+
+def p_dormant_from_records(
+    recs: Optional[Sequence[Dict[str, object]]], cards: Sequence[Card], weight_source: str,
+    n: int = P_DORMANT_EXPECT_N,
+) -> Tuple[Optional[Dict[str, int]], str]:
+    """Group P's measured dormant residue for D's expectation budget
+    (:func:`dormant_max_from_records` over group-P records)."""
+    return dormant_max_from_records(recs, cards, weight_source, n, group="P")
+
+
+D_RESERVE_RECORD_ENV = "SGLANG_WEG2_D_RESERVE_RECORD_MAX"
+
+
+def d_reserve_from_records_or_census(
+    cards: Sequence[Card], dc_expect_d: Mapping[str, int], census_reserve: Mapping[str, int],
+    d_max: Optional[Mapping[str, int]], slack_mib: int, record_priced: bool,
+) -> Tuple[Dict[str, int], List[str]]:
+    """Group D's dormant-residue RESERVE per card on the census-priced profile
+    (Next Flash): what P's budget subtracts, the front's ``--dc-reserve`` and
+    the W19 bolt at D's first sleep grade.
+
+    With D records of this identity and form (``d_max`` = per-card maximum over
+    the newest boots, :func:`dormant_max_from_records`): that maximum +
+    :data:`DC_RECORD_MARGIN_MIB` + slack -- the same margin the single #1444
+    record carried. The census is only reported. Before (still without
+    records): per card the larger of the newest record and the xchg census.
+    rc12z30r3: census 1140/1538 (nvml0/2) against D records 612-680, so P's
+    budget carried ~460/860 MiB per 3080 for a D residue that was never there
+    -- VRAM that belongs to P's resident experts. The fnFL2x111 lesson (an
+    OLDER census undercut a NEWER record -> W19) holds: a maximum of recent
+    same-form measurements, never a single low sample.
+    ``SGLANG_WEG2_D_RESERVE_RECORD_MAX=0`` keeps the old rule."""
+    out = dict(dc_expect_d)
+    won: List[str] = []
+    use_max = (d_max is not None
+               and os.environ.get(D_RESERVE_RECORD_ENV, "1").strip() != "0")
+    for c in cards:
+        if c.uuid not in census_reserve:
+            continue
+        census = int(census_reserve[c.uuid])
+        if use_max:
+            out[c.uuid] = int(d_max[c.uuid]) + DC_RECORD_MARGIN_MIB + int(slack_mib)
+            won.append(f"nvml{c.nvml_index}=record-max({out[c.uuid]}; census {census} reported)")
+            continue
+        record = int(dc_expect_d[c.uuid]) if record_priced else 0
+        if record > census:
+            out[c.uuid] = record
+            won.append(f"nvml{c.nvml_index}=record({record})>census({census})")
+        else:
+            out[c.uuid] = census
+            won.append(f"nvml{c.nvml_index}=census({census})>=record({record})")
+    return out, won
 
 
 def d_expect_dormant_other(
@@ -21899,17 +21953,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # Flip. Eine aeltere Census unterbietet keine neuere Messung derselben
             # Form: je Karte gewinnt die GROESSERE der beiden gepreisten Reserven,
             # und die Zeile darunter nennt, welche.
-            _won: List[str] = []
-            for c in cards:
-                if c.uuid in _xr:
-                    _census_reserve = int(_xr[c.uuid]) + slack_mib
-                    _record_reserve = int(dc_expect_d[c.uuid]) if _dc_from_record is not None else 0
-                    if _record_reserve > _census_reserve:
-                        dc_expect_d[c.uuid] = _record_reserve
-                        _won.append(f"nvml{c.nvml_index}=record({_record_reserve})>census({_census_reserve})")
-                    else:
-                        dc_expect_d[c.uuid] = _census_reserve
-                        _won.append(f"nvml{c.nvml_index}=census({_census_reserve})>=record({_record_reserve})")
+            # D-RESERVE 29.09.: the maximum over the newest D records of this
+            # identity and form wins over the (older) census when records exist.
+            _d_recs = (host_ledger.read_measured_records(
+                measured_record_path(), "D", accept=_dc_accept)
+                if _dc_accept is not None else [])
+            _d_max, _d_max_why = dormant_max_from_records(
+                _d_recs, cards, ns.weg2_weight_source, group="D")
+            log(f"D-RESERVE RECORD-MAX: {_d_max_why}")
+            dc_expect_d, _won = d_reserve_from_records_or_census(
+                cards, dc_expect_d,
+                {u: int(v) + slack_mib for u, v in _xr.items()},
+                _d_max, slack_mib, _dc_from_record is not None)
             state.dc_expect_d = dc_expect_d
             log("dormant residue RESERVE for group D (census-korrigiert, neuere Messung "
                 "unterbietet die aeltere nicht): "
