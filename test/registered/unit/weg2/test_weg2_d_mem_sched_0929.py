@@ -436,3 +436,54 @@ def test_a_moved_destination_loses_its_prefetch_mark():
     t.pf_row[4] = 12
     epd.apply_row_moves(t, [(7, 3), (6, 4)])
     assert t.pf_row[3].item() == -1 and t.pf_row[4].item() == -1
+
+
+# --- rc12z30y2 (boot 09291559 D, 16:04:59-16:18:01): a pending shrink that the --
+# --- queue head cancels hands the cap back up to the mapped stage ---------------------
+#: the 29.09. floor ladder below the booked S0 (SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS 32768)
+FLOOR_LADDER = (32768, 65536, 98304, 131072, 163840, 196608, 229376, 262144, 393216, 524288)
+
+
+@pytest.fixture
+def floor_env(tick_env, monkeypatch):
+    dsv, sched, caps, floor, votes, _grid = tick_env
+    monkeypatch.setenv("SGLANG_WEG2_D_KV_STAGE_TOKENS", ",".join(str(t) for t in FLOOR_LADDER))
+    # the wake took S1 for the 32k handoff (#251 WAKE-RESHARD stage=S1 tokens=65536)
+    setattr(sched, dsv.PHASE_ATTR, dsv.PhaseState(epoch="e4", n=1, cap=6, done=True, stage=1,
+                                                  stage_tokens=FLOOR_LADDER[1]))
+    return dsv, sched, caps, floor
+
+
+def test_a_cancelled_pending_shrink_lifts_the_cap_to_the_stage(floor_env):
+    """Metal: weg2-2-10 (33093 tokens) finished at S1; its 516 retained pages
+    (page 517 live) blocked the end-event shrink to S0, so the cap went to
+    32768 (pending S0). The queue head weg2-4-11 (33633 tokens, 33024 of them
+    the retained prefix) needs S1 again -- the machine dropped ``pending`` but
+    the cap stayed at 32768: available_size 0 on every rank, #1045 floor 0,
+    H105 host_budget 0, 96320 refusals until DEADMAN_BUSY_STARVED."""
+    dsv, sched, caps, floor = floor_env
+    sched.running_batch.reqs = [_req("weg2-2-10", 32835, 258)]
+    st = dsv.runtime_tick(sched)
+    assert not st.changed and getattr(sched, dsv.PHASE_ATTR).stage == 1
+    sched.running_batch.reqs = []                       # finished, prefix retained
+    floor["page"] = 517                                 # 33088 tokens still live
+    st = dsv.runtime_tick(sched)
+    ms_ = getattr(sched, dsv.MEM_SCHED_ATTR)
+    assert not st.changed and ms_.pending == 0 and caps[-1] == FLOOR_LADDER[0]
+    sched.waiting_queue = [_req("weg2-4-11", 33633)]    # the follow-up turn
+    st = dsv.runtime_tick(sched)
+    assert not st.changed and ms_.pending is None and ms_.stage == 1
+    assert caps[-1] == FLOOR_LADDER[1]                  # the cap follows the stage again
+
+
+def test_a_still_pending_shrink_keeps_its_cap(floor_env):
+    dsv, sched, caps, floor = floor_env
+    sched.running_batch.reqs = [_req("a", 32835, 258)]
+    dsv.runtime_tick(sched)
+    sched.running_batch.reqs = []
+    floor["page"] = 517
+    dsv.runtime_tick(sched)
+    n = len(caps)
+    st = dsv.runtime_tick(sched)                        # nothing moved: no new cap call
+    assert not st.changed and getattr(sched, dsv.MEM_SCHED_ATTR).pending == 0
+    assert len(caps) == n and caps[-1] == FLOOR_LADDER[0]
