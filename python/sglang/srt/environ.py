@@ -2740,7 +2740,11 @@ class Envs:
     #   holding the phase's KV tokens is taken. The captured waves are priced
     #   for the lowest stage row count (the launcher raises the wave cap it
     #   derived, or refuses a told one by name). Off = the table, byte-identical.
-    SGLANG_WEG2_D_KV_STAGE_BY_DEMAND = EnvBool(False)
+    #   Default ON since 29.09. (metal: z30x2 kvdemand 09291210, D.log _121057 --
+    #   '#251 WAKE-RESHARD n=2 stage=S1 tokens=393216 demand=262276 over=no' at
+    #   bs2 x 128k, every other wake S0, needle MATCH, no death). Inert without a
+    #   stage form (< 2 stage tokens): the 27B never gets one.
+    SGLANG_WEG2_D_KV_STAGE_BY_DEMAND = EnvBool(True)
     # D-MEM-SCHED (29.09., user law "free VRAM is always experts"): one budget
     #   per D rank -- a seat-row shrink moves the dropped rows' experts into the
     #   coldest kept rows first (weg2/d_mem_sched.py). ON by default; this is

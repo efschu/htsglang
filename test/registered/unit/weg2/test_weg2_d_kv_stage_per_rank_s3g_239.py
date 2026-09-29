@@ -45,6 +45,18 @@ register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_weg2_d_kv_stage_launcher_251c as T251  # noqa: E402
 import test_weg2_d_kv_stage_worker_251c as W251  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _kv_stage_table_path():
+    """29.09.: #251d is the default now; this file covers the table path, so
+    the switch is pinned off here (a test that wants demand overrides it)."""
+    from sglang.srt.environ import envs
+
+    with envs.SGLANG_WEG2_D_KV_STAGE_BY_DEMAND.override(False):
+        yield
+
 
 FA_CELL = 12288  # NF full-attention KV cell, B per token
 

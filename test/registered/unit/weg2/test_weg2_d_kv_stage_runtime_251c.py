@@ -34,6 +34,17 @@ import torch  # noqa: E402
 from sglang.srt.layers.moe import expert_pool_device as ep  # noqa: E402
 from sglang.srt.weg2 import d_seat_vram as dsv  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _kv_stage_table_path():
+    """29.09.: #251d is the default now; this file covers the table path, so
+    the switch is pinned off here (a test that wants demand overrides it)."""
+    from sglang.srt.environ import envs
+
+    with envs.SGLANG_WEG2_D_KV_STAGE_BY_DEMAND.override(False):
+        yield
+
+
 G = 4096
 PAGE = 16
 STAGES = "64,128,192"

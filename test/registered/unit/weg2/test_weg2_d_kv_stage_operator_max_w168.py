@@ -28,6 +28,17 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 from sglang.srt.planner import expert_residency as er  # noqa: E402
 from sglang.srt.weg2 import d_seat_vram as dsv  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _kv_stage_table_path():
+    """29.09.: #251d is the default now; this file covers the table path, so
+    the switch is pinned off here (a test that wants demand overrides it)."""
+    from sglang.srt.environ import envs
+
+    with envs.SGLANG_WEG2_D_KV_STAGE_BY_DEMAND.override(False):
+        yield
+
+
 FORM = er.SeatVramForm(temporal_slot_bytes=(48 * 128 * 128 * 2, 0, 0), gdn_layers=36,
                        expert_row_bytes=2534448, moe_layers=48, small_row_bytes=76848)
 KEY = "SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS"

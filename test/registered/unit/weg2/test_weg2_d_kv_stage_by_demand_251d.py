@@ -52,6 +52,17 @@ import test_weg2_d_kv_stage_runtime_251c as rt  # noqa: E402
 from sglang.srt.planner import expert_residency as er  # noqa: E402
 from sglang.srt.weg2 import d_seat_vram as dsv  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _kv_stage_table_path():
+    """29.09.: #251d is the default now; this file covers the table path, so
+    the switch is pinned off here (a test that wants demand overrides it)."""
+    from sglang.srt.environ import envs
+
+    with envs.SGLANG_WEG2_D_KV_STAGE_BY_DEMAND.override(False):
+        yield
+
+
 NF_STAGES = "262144,393216,524288"
 TABLE = "2,1,1,1,0,0"
 WAVES = "SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES"

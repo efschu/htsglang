@@ -2798,9 +2798,15 @@ def d_kv_stage_tokens_named(ns) -> Optional[Tuple[int, ...]]:
 
 
 def d_kv_stage_by_demand(env: Mapping[str, str]) -> bool:
-    """#251d: SGLANG_WEG2_D_KV_STAGE_BY_DEMAND truthy in the D group's env."""
-    return str((env or {}).get(D_KV_STAGE_BY_DEMAND_KEY, "")).strip().lower() in (
-        "1", "true", "yes", "on")
+    """#251d: SGLANG_WEG2_D_KV_STAGE_BY_DEMAND in the D group's env; a D env that
+    does not name it gets the rank's own default (environ.py, ON since 29.09.),
+    so the launcher prices the form the rank will run."""
+    raw = (env or {}).get(D_KV_STAGE_BY_DEMAND_KEY)
+    if raw is None:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_D_KV_STAGE_BY_DEMAND.get())
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
 def kv_stage_wave_cap(ns, er, tab, max_by: Sequence[int], env: Mapping[str, str],
