@@ -426,9 +426,10 @@ class ModelProfile:
     #: the group's own tokenizer and chat template at the front, minus the
     #: MEASURED cached-on-D token prefix (weg2/front_tokens.py); X holds
     #: exactly for that count, no 1.3*X band. Off = the chars/3 pricing byte
-    #: for byte. Both rows off until an agent-load boot has measured it
-    #: (X-EXACT-ERR / X-EXACT-TOKENS); then the operator turns the row on.
-    #: Switch SGLANG_WEG2_FRONT_EXACT_TOKENS (explicit value wins).
+    #: for byte. Both rows were off until an agent-load boot had measured it
+    #: (X-EXACT-ERR / X-EXACT-TOKENS): nextflash on since V1 (27.09.), qwen27b
+    #: on since w109290020 (29.09.). Switch SGLANG_WEG2_FRONT_EXACT_TOKENS
+    #: (explicit value wins).
     front_exact_tokens: bool = False
     #: rc12b D TP0 OOM (27.09. 00:26:34Z): the D budget starts at NVML total
     #: and never took the driver carve (Card.reserved_mib, 519 MiB on the
@@ -614,8 +615,13 @@ PROFILES: Dict[str, ModelProfile] = {
         # immediate-over-x, 33 PARK-RESUME, 70 flips) and 12:26 (15/15, 33
         # flips), needle 97k MATCH after the park round trips in both.
         d_park_immediate=True,
-        # X-EXACT (user 26.09.): OFF until an agent-load boot measured it.
-        front_exact_tokens=False,
+        # X-EXACT (user 26.09.): ON since the agent-load proof (user rule 29.09.
+        # ~10:15Z: proven on metal -> default on in the code). w109290020
+        # (bb82fbcb68, 29.09. 00:20-00:54Z, 30 min agent load): X-EXACT-TOKENS
+        # 108x match=1, 1x match=0 (a W50 midstream reroute, tokens_group >
+        # tokens_front expected there); chars/3 had over-priced dkr27brc10bar1
+        # agent09261821 by median +11.5 % (up to +60 %, c0347b7e4f).
+        front_exact_tokens=True,
         # 27B b1 death (27.09. 06:57:17Z): the D budget books the driver carve
         # (518 MiB, NVML reserved) -- on the 5090 only (32607 MiB board; the
         # 3080s are 20480), see driver_carve_min_total_mib.

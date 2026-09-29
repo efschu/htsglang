@@ -454,8 +454,8 @@ def test_off_constructs_and_imports_nothing():
 
 
 # ---------------------------------------------------------------------------
-# (6) registry: qwen27b off until measured, nextflash on (V1, NF seat
-# 27.09.); explicit wins -- SGLANG_WEG2_FRONT_EXACT_TOKENS=0 as container env
+# (6) registry: qwen27b on since w109290020 (29.09.), nextflash on (V1, NF
+# seat 27.09.); explicit wins -- SGLANG_WEG2_FRONT_EXACT_TOKENS=0 as container env
 # turns the NF row off again (the V1 fallback without a rebuild)
 # ---------------------------------------------------------------------------
 
@@ -472,15 +472,15 @@ def _form_env(profile):
                        flip="family", vision="off", profile=profile, model="m").env_value()
 
 
-def test_qwen27b_row_off_nextflash_row_on():
-    assert FM.PROFILES["qwen27b"].front_exact_tokens is False
-    assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][XE] is False
+def test_qwen27b_row_on_nextflash_row_on():
+    assert FM.PROFILES["qwen27b"].front_exact_tokens is True
+    assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][XE] is True
     assert FM.PROFILES["nextflash"].front_exact_tokens is True
     assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][XE] is True
 
 
 @pytest.mark.parametrize("profile,explicit,row_on,want", [
-    ("qwen27b", None, False, False), ("nextflash", None, False, True), (None, None, False, False),
+    ("qwen27b", None, False, True), ("nextflash", None, False, True), (None, None, False, False),
     ("qwen27b", None, True, True),    # the operator turns the row on -> on without an env
     ("nextflash", None, True, True),
     ("qwen27b", "1", False, True), ("qwen27b", "0", True, False), (None, "1", False, True),

@@ -1181,8 +1181,8 @@ class Envs:
     # tokenizer runs in one worker thread, incremental per conversation
     # prefix. Every D leg 2 logs WEG2 X-EXACT-ERR (priced vs realised). Off
     # = the chars/3 pricing byte for byte. Default per profile
-    # (ModelProfile.front_exact_tokens: qwen27b off until an agent-load boot
-    # has measured it, nextflash on since V1 27.09.); off without a form;
+    # (ModelProfile.front_exact_tokens: qwen27b on since the agent-load boot
+    # w109290020 29.09., nextflash on since V1 27.09.); off without a form;
     # explicit wins (=0 turns the NF row off).
     SGLANG_WEG2_FRONT_EXACT_TOKENS = EnvBool(_profile_default("SGLANG_WEG2_FRONT_EXACT_TOKENS", False))
     # X-EXACT: longest wait for the count before the request is priced by the
