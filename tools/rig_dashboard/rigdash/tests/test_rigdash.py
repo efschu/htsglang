@@ -1306,6 +1306,13 @@ class IpcDeathAndWallRateTests(unittest.TestCase):
         w2 = live.Boot._prefill_window(rows + later, [], 0.0)
         self.assertAlmostEqual(w2["wall_s"], 22.0)
         self.assertAlmostEqual(w2["wall_tps"], 2 * 8192 / 22.0)
+        # whole-second stamps: PP0 chunks back to back, each 1.4 s but stamped one
+        # second apart -> the union says 5 s, PP0 alone computed 7 s; wall >= 7 s
+        tight = [{"t": 100.0 + i, "rk": "PP", "rank": 0, "new_tok": 4096, "compute_ms": 1400.0}
+                 for i in range(5)]
+        w3 = live.Boot._prefill_window(tight, [], 0.0)
+        self.assertAlmostEqual(w3["wall_s"], 7.0)
+        self.assertLessEqual(w3["wall_tps"], w3["tps_gpu"] + 1e-9)
 
     def test_decode_wall_is_tokens_over_time_not_mean_of_rates(self):
         lines = [{"t": 0.0, "gen_tps": 100.0}, {"t": 1.0, "gen_tps": 100.0}, {"t": 11.0, "gen_tps": 10.0}]

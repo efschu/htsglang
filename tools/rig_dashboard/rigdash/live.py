@@ -192,16 +192,19 @@ def _prefill_wall(rows):
     burst (pipeline hand-offs between stages count, they are the request's
     wall time), a burst lasts from its first chunk's start to its last line of
     ANY rank, and idle gaps between bursts do not count (Sigma tokens /
-    Sigma time, never a mean of rates).  Returns (tok_per_s, busy_s, tokens)."""
+    Sigma time, never a mean of rates).  Floor: no rank's own Sigma compute,
+    so the wall rate never exceeds the slowest rank's GPU rate.  Returns
+    (tok_per_s, busy_s, tokens)."""
     if not rows:
         return None, None, 0
-    iv, per = [], {}
+    iv, per, cms = [], {}, {}
     for e in rows:
         ms = e.get("compute_ms") or e.get("gpu_ms") or 0.0
         t = _mid(e["t"])
         iv.append((t - ms / 1000.0, t))
         k = "%s%s" % (e.get("rk", ""), e.get("rank", 0))
         per[k] = per.get(k, 0) + (e.get("new_tok") or 0)
+        cms[k] = cms.get(k, 0.0) + ms
     tok = per.get("PP0", per.get("TP0", next(iter(per.values()))))
     iv.sort()
     busy, (s0, e0) = 0.0, iv[0]
@@ -212,6 +215,9 @@ def _prefill_wall(rows):
         else:
             e0 = max(e0, e)
     busy += e0 - s0
+    # log stamps are whole seconds (_mid): the union can come out shorter than
+    # one rank's own compute -- wall is never below any rank's Sigma compute
+    busy = max(busy, max(cms.values()) / 1000.0)
     return ((tok / busy) if (tok and busy > 0) else None), (busy if busy > 0 else None), tok
 
 
