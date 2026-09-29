@@ -1975,13 +1975,16 @@ def _coalesced_stream(hf_weights_files, should_load, post_load, direct_io, st, l
             if share_mode:
                 logger.info(
                     "%s SHARED-CACHE mode=%s kept_mib=%.0f over_budget_mib=%.0f "
-                    "dropped_mib=%.0f hit_mib=%.0f (BOOTZEIT 3 Stufe 2b: non-expert "
-                    "bytes P->D through the page cache; hit = found cached by D)",
+                    "dropped_mib=%.0f hit_mib=%.0f disk_bytes=%d (BOOTZEIT 3 Stufe 2b: "
+                    "non-expert bytes P->D through the page cache; hit = found cached "
+                    "by D; read_bytes above counts every byte preadv returned, cache "
+                    "hits included -- disk_bytes = read_bytes - hit)",
                     COALESCE_MARKER, share_mode,
                     counters["shared_kept_bytes"] / 2**20,
                     counters["shared_over_budget_bytes"] / 2**20,
                     counters["shared_dropped_bytes"] / 2**20,
-                    counters["shared_hit_bytes"] / 2**20)
+                    counters["shared_hit_bytes"] / 2**20,
+                    counters["read_bytes"] - counters["shared_hit_bytes"])
             logger.info(st.line())
 
 

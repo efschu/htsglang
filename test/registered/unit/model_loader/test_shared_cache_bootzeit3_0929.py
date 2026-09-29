@@ -97,6 +97,12 @@ class TestSharedCache(unittest.TestCase):
         dropped = float(line.split("dropped_mib=")[1].split()[0])
         self.assertGreaterEqual(dropped, 0.0)
         self.assertGreaterEqual(hit, 0.0)
+        # z30r3 question: read_bytes counts cache hits too; disk_bytes does not
+        main = next(r for r in cm.output if "read_bytes=" in r and "SHARED-CACHE" not in r)
+        read_bytes = int(main.split("read_bytes=")[1].split()[0])
+        disk = int(line.split("disk_bytes=")[1].split()[0])
+        self.assertLessEqual(disk, read_bytes)
+        self.assertLessEqual(abs((read_bytes - disk) - hit * MIB), MIB)  # hit_mib is rounded
 
     def test_keep_budget_is_honoured(self):
         import threading
