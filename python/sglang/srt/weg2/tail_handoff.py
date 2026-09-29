@@ -152,6 +152,35 @@ def reader_claim_end(n_tokens: int, page_size: int, bigram: bool) -> int:
     return page_floor(max(0, units), max(1, int(page_size or 1)))
 
 
+def claim_anchor_end(req, tree_cache) -> Optional[int]:
+    """CLAIM ANCHOR (0929): the store reader's claim for ``req`` wherever group
+    P files its recurrent anchor for that reader, else None.
+
+    ONE predicate for the two sides of the hand-back anchor: the extend track
+    that PUTS the anchor at the claim (``schedule_batch._weg2_claim_track``)
+    and the #1233/#1481 END-ANCHOR probe that MARKS the anchor the reader can
+    reach (``UnifiedRadixCache._weg2_note_end_anchor``). Two predicates would
+    let the track move the anchor while the mark still aims one page deeper
+    (dynpf-Praefix 0929: after 80fa726f31 every N % 64 in {0, 1} probed N-1,
+    found the claim anchor, printed ok=False and marked nothing).
+
+    Only group P, the NF keying (bigram, node units == tokens the state
+    consumed), a paged tree, no P-trim request (its own N-1 geometry)."""
+    if (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() != "P" or tree_cache is None:
+        return None
+    page = int(getattr(tree_cache, "page_size", 1) or 1)
+    if page <= 1 or not getattr(tree_cache, "bigram_anchor_exact", False):
+        return None
+    from sglang.srt.weg2.p_trim_end_anchor import TRIM_ATTR
+
+    if getattr(req, TRIM_ATTR, None) is not None:
+        return None
+    ids = getattr(req, "origin_input_ids", None)
+    if ids is None:
+        return None
+    return reader_claim_end(len(ids), page, True)
+
+
 #: F4 (#259 4c): the part name prefix of a D-park END part ("dpark<tp>-<pid>").
 PARK_PART = "dpark"
 
