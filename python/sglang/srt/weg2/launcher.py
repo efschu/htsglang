@@ -86,6 +86,7 @@ from sglang.srt.weg2 import (
 )
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import rank_state as rank_state_mod
+from sglang.srt.weg2 import shared_cache_release as shared_cache_release_mod
 from sglang.srt.weg2 import state_file as state_file_mod
 # WEG2-FORM (24.09.): the boot's form axes -- ONE resolver, ONE line, ONE env.
 from sglang.srt.weg2 import form as weg2_form
@@ -11917,6 +11918,10 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
     _rs_old = rank_state_mod.clear_rank_state_dir(_rs_dir)
     spec.env[rank_state_mod.RANK_STATE_ENV] = _rs_dir
     log(f"group {spec.name} rank state -> {_rs_dir}" + (f" ({_rs_old} record(s) of an earlier launch removed)" if _rs_old else ""))
+    if spec.name in ("P", "D"):
+        # W98 (z30u): Stufe 2b's keeper writes its kept ranges here; the
+        # launcher drops exactly those once D is ready (release_shared_cache).
+        spec.env[shared_cache_release_mod.MANIFEST_ENV] = shared_cache_release_mod.manifest_dir_for(spec.log)
     fh = open(spec.log, "ab")
     _logged_argv = ' '.join(shlex.quote(a) for a in admin_key_mod.redact_argv(spec.argv))
     fh.write(f"=== WEG2 group {spec.name} launched {_now()} ===\nargv: {_logged_argv}\n".encode())
@@ -11929,6 +11934,27 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
     if spec.name in ("P", "D"):
         boot_state_write(log, "loading", fields={f"groups.{spec.name}": {
             "state": "loading", "pids": [p.pid], "ready_ts": None, "rankstate_dir": _rs_dir, "ranks": []}})
+
+
+def release_shared_cache(spec_d: GroupSpec, log: Log) -> Optional[dict]:
+    """W98 (z30u): BOOTZEIT 3 Stufe 2b's kept ranges dropped AFTER group D is
+    ready -- D's take-over is over, so the boot time does not pay for it. One
+    measured line (advised vs evicted by mincore, memory.current before/after)
+    plus the event ``shared_cache_release`` in state.json's events. No manifest
+    = 2b was off = nothing to do, nothing said."""
+    d = shared_cache_release_mod.manifest_dir_for(spec_d.log)
+    if not os.path.isdir(d):
+        return None
+    try:
+        rec = shared_cache_release_mod.release(d, read_pressure=host_ledger.read_cgroup_pressure)
+    except Exception as e:  # noqa: BLE001 -- a lost release costs cache, never the boot
+        log(f"{shared_cache_release_mod.MARKER} FAILED ({type(e).__name__}): {e}")
+        return None
+    if rec is None:
+        return None
+    log(shared_cache_release_mod.line(rec))
+    boot_state_write(log, event=("shared_cache_release", rec))
+    return rec
 
 
 def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, tag: str, name: str, dry: bool) -> int:
@@ -23586,6 +23612,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _write_state(state)
     register_boot_group(ns.tag, "D", spec_d.pid, log)  # H135b
     state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid, ns.ready_deadline_s, log, "D", spec_d.proc)
+    if not dry:
+        release_shared_cache(spec_d, log)  # W98 (z30u): 2b's kept ranges, after D's take-over
     # #1386 FOLLOW-UP 2: the mirror of group P's same skip above -- D's
     # cache_controller never builds under `hicache_disabled` either (D is a
     # plain MambaRadixCache then, same as P), so it prints neither marker.

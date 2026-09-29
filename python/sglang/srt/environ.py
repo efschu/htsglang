@@ -1302,6 +1302,11 @@ class Envs:
     # stops keeping past SGLANG_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB.
     SGLANG_WEIGHT_LOADER_SHARED_CACHE = EnvStr("")
     SGLANG_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB = EnvInt(6144)
+    # W98 (z30u): the directory "keep" writes its kept ranges to, so the
+    # launcher drops exactly those ranges once group D is ready
+    # (weg2/shared_cache_release.py). Set per group by the weg2 launcher;
+    # empty = no manifest (the ranges stay until the kernel reclaims them).
+    SGLANG_WEIGHT_LOADER_SHARED_CACHE_MANIFEST = EnvStr("")
     # BOOTZEIT 3 (29.09., z30r3): the device -> store write of the presplit
     # in RUNS of consecutive rows, async into the registered store and one
     # stream sync per call, instead of one synchronous copy per expert row.
