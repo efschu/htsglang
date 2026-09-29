@@ -701,6 +701,29 @@ def completed_tags(body: str) -> Tuple[List[str], Dict[str, List[float]], str]:
     return sorted(clean), clean, str(crit)
 
 
+#: #1317c's progress read (``/get_server_info`` -> ``weg2_decode_progress``)
+#: had NO timeout of its own, only the shared session's 3600 s: in NF z30w-park
+#: the drain hung on a dead P ring inside it and a blind DEADMAN_FLIP_STALL
+#: (epoch 113) came instead of a named W3. A live group answers the read
+#: between two scheduler iterations, so one forward pass bounds it; the
+#: longest measured is a P 16k chunk on PP0, ~5.6 s (x135, #117). Twice that:
+#: a live P mid-chunk never trips it, a dead one is named within 12 s -- well
+#: inside the flip-stall watch. Not 2 s: that would stop a healthy P that is
+#: merely in its chunk.
+PROGRESS_READ_TIMEOUT_S = 12.0
+
+
+class Weg2ProgressUnreachable(Exception):
+    """The progress read of ``group`` got no answer within
+    :data:`PROGRESS_READ_TIMEOUT_S` -- a diagnosis, never retried."""
+
+    def __init__(self, group: str, url: str):
+        super().__init__(f"group {group} ({url}) no /get_server_info answer "
+                         f"within {PROGRESS_READ_TIMEOUT_S:.0f} s")
+        self.group = group
+        self.url = url
+
+
 class Weg2Stop(Exception):
     """A named refusal that STOPS the front (spec section 5)."""
 
@@ -7236,7 +7259,12 @@ class Front:
                 t_evidence = max(t_evidence, getattr(self, "_p_leg1_done_t", 0.0))
                 if now - t_sample >= 10.0:
                     t_sample = now
-                    prog = await self._weg2_decode_progress(self.groups["P"])
+                    try:
+                        prog = await self._weg2_decode_progress(self.groups["P"])
+                    except Weg2ProgressUnreachable as e:
+                        # the leg-1 stall bound decides here; an unread counter is an absence
+                        logger.warning("WEG2 P-LEG1 progress unreadable: %s", e)
+                        prog = None
                     if prog is not None:
                         if last_prog is not None and prog != last_prog:
                             t_evidence = now
@@ -8614,9 +8642,15 @@ class Front:
         caller as an ABSENCE, so it can keep the old residency behaviour
         instead of reading "no progress" out of a failed HTTP call and
         manufacturing the very W2 this change exists to prevent.
+
+        No answer within :data:`PROGRESS_READ_TIMEOUT_S` is not an absence but
+        a group that cannot serve a read between two forward passes:
+        :class:`Weg2ProgressUnreachable`, for the caller to name.
         """
         try:
-            async with self.session.get(f"{g.url}/get_server_info") as r:
+            async with self.session.get(
+                    f"{g.url}/get_server_info",
+                    timeout=ClientTimeout(total=PROGRESS_READ_TIMEOUT_S)) as r:
                 info = await r.json() if r.status == 200 else None
             if isinstance(info, list) and info:
                 info = info[0]
@@ -8627,6 +8661,8 @@ class Front:
                 info = st[0]
             blk = info.get("weg2_decode_progress")
             return blk if isinstance(blk, dict) else None
+        except asyncio.TimeoutError as e:
+            raise Weg2ProgressUnreachable(g.name, g.url) from e
         except Exception as e:  # noqa: BLE001 - an instrument never breaks the flip
             logger.debug("weg2 decode progress unavailable: %s: %s", type(e).__name__, e)
             return None
@@ -8700,19 +8736,36 @@ class Front:
         emitted tokens or ran forward passes is a WAIT, not a refusal.
         """
         t0 = time.time()
-        before = await self._weg2_decode_progress(g)
         self._drain_progress = None
+        try:
+            before = await self._weg2_decode_progress(g)
+        except Weg2ProgressUnreachable as e:
+            self._stop_progress_unreachable(e)
+            return False
         # H91 part C: requests D PARKED on the wait bound are not waited for
         # (they continue in D's next phase); `_flip_ledger` is the ledger
         # itself whenever nothing is parked.
         _ledger = getattr(self, "_flip_ledger", None)
         while (_ledger(g) if _ledger is not None else g.outstanding):
             if time.time() - t0 > self.drain_deadline_s:
-                after = await self._weg2_decode_progress(g)
+                try:
+                    after = await self._weg2_decode_progress(g)
+                except Weg2ProgressUnreachable as e:
+                    self._stop_progress_unreachable(e)
+                    return False
                 self._drain_progress = weg2_drain_progress_delta(before, after)
                 return False
             await asyncio.sleep(0.02)  # #1455: 250 ms poll was a quarter of the drain
         return True
+
+    def _stop_progress_unreachable(self, e: "Weg2ProgressUnreachable") -> None:
+        """The drain witness could not be read: stop by name on the W3 path
+        (the group's own entry rank did not answer), no retry, no flip."""
+        self.counters["W3_progress_unreachable"] += 1
+        self.do_stop("W3 Weg2DrainWitnessUnreachable",
+                     f"{e} -- the drain witness (#1317c) of group {e.group} cannot be read, its "
+                     f"entry rank does not answer between two forward passes; stopping by "
+                     f"name instead of a blind DEADMAN_FLIP_STALL (NF z30w-park epoch 113)")
 
     async def quiesce(self, g: Group) -> Tuple[bool, str]:
         """Witness B: poll /flush_cache (200 iff the GROUP's is_fully_idle,
@@ -9095,6 +9148,8 @@ class Front:
             )
         # 1. drain (W1/W2)
         if not await self.drain(S):
+            if self.state == "STOP":  # W3 Weg2DrainWitnessUnreachable: no W1, no abort, no flip
+                return
             # #1317c PROGRESS BEFORE VERDICT. A window in which D made decode
             # progress is a WAIT, not a refusal: under the standing user law
             # (#1011, "er decoded zuende ... und flippt dann zurueck") a
