@@ -628,13 +628,17 @@ def d_expect_dormant_other(
     started into an OOM. ``D-EXPECT CHECK`` names each card's difference."""
     legacy = {c.uuid: int(dc_expect_d[c.uuid]) + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}
     if not xchg_census_is_reserve(profile):
-        return legacy, "legacy (profile's dormant_other is D's reserve + windows)"
-    if os.environ.get(P_DORMANT_EXPECT_ENV, "1").strip() == "0":
-        return legacy, f"legacy ({P_DORMANT_EXPECT_ENV}=0)"
-    meas, why = p_dormant_from_records(p_recs, cards, weight_source)
-    if meas is None:
-        return legacy, f"legacy (UNMEASURED: {why})"
-    return meas, why
+        why = "legacy (profile's dormant_other is D's reserve + windows)"
+    elif os.environ.get(P_DORMANT_EXPECT_ENV, "1").strip() == "0":
+        why = f"legacy ({P_DORMANT_EXPECT_ENV}=0)"
+    else:
+        meas, why = p_dormant_from_records(p_recs, cards, weight_source)
+        if meas is not None:
+            vram_view().note_asleep("P", cards, meas, f"RECORD({why})")
+            return meas, why
+        why = f"legacy (UNMEASURED: {why})"
+    vram_view().note_asleep("P", cards, legacy, f"MODEL(dc_expect_d + windows; {why})")
+    return legacy, why
 
 
 def d_expect_check_lines(cards: Sequence[Card], expected: Optional[Mapping[str, int]],
@@ -12977,6 +12981,7 @@ def budgets_from_dc(
     # who greps ``group=D`` must find the dry pass too.
     group = corridor_guard.normalise_group(label)
     floors = corridor_budget.floors_for_cards(cards, label, user_reserve_by_card)
+    _terms_seen: List[Dict[str, object]] = []  # VRAM-VERTRAG M1: the pass's view
     for i, c in enumerate(cards):
         over = int(overshoot_mib[i]) if overshoot_mib is not None else 0
         cf = floors[c.uuid]
@@ -13009,16 +13014,17 @@ def budgets_from_dc(
         b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over - carve - awake
         b = (b // 8) * 8
         out.append(b)
+        _terms_seen.append(dict(
+            total=int(c.total_mib), carve=carve, floor=int(cf.mib),
+            dormant=int(dc_mib[c.uuid]) + grow, growth=grow,
+            awake=(awake if rest is not None else awake_builtin + over),
+            awake_source=(
+                f"D_AWAKE_REST_MIB {awake_rest_provenance}".strip() if rest is not None
+                else f"awake_overshoot {awake_builtin}"
+                + (f" + measured_awake_overshoot {over}" if over else "")),
+        ))
         if terms_out is not None:
-            terms_out.append(dict(
-                total=int(c.total_mib), carve=carve, floor=int(cf.mib),
-                dormant=int(dc_mib[c.uuid]) + grow,
-                awake=(awake if rest is not None else awake_builtin + over),
-                awake_source=(
-                    f"D_AWAKE_REST_MIB {awake_rest_provenance}".strip() if rest is not None
-                    else f"awake_overshoot {awake_builtin}"
-                    + (f" + measured_awake_overshoot {over}" if over else "")),
-            ))
+            terms_out.append({k: v for k, v in _terms_seen[-1].items() if k != "growth"})
         log(
             f"budget {label} group={group} ordinal={i} "
             f"nvml_idx={c.nvml_index} {c.name}: "
@@ -13035,6 +13041,7 @@ def budgets_from_dc(
         )
         log(cf.line)
     if not corridor_constrain:
+        vram_view().note_budget(label, cards, out, out, _terms_seen)
         return out
     # #1257c THE INSTALL GATE. The corridor pass may lower a budget only where
     # SOMEBODY PRICED THE FLOOR -- a measured transient, an explicit reserve,
@@ -13054,6 +13061,7 @@ def budgets_from_dc(
         )
         for cf in floors.values():
             log(cf.line)
+        vram_view().note_budget(label, cards, out, out, _terms_seen)
         return out
     # #1257 -- THE CORRIDOR LAW AS A HARD CONSTRAINT, applied here and nowhere
     # else so this function stays the one producer of a budget number.  The
@@ -13072,7 +13080,59 @@ def budgets_from_dc(
     )
     for line in solve.lines:
         log(line)
+    vram_view().note_budget(label, cards, out, list(solve.budgets), _terms_seen)
     return list(solve.budgets)
+
+
+#: VRAM-VERTRAG M1 (29.09.): the budget passes' view (weg2/vram_plan_view.py),
+#: one per launcher run; ``main`` resets it with the profile's pins.
+_VRAM_VIEW = None
+
+
+def vram_view():
+    global _VRAM_VIEW
+    if _VRAM_VIEW is None:
+        from sglang.srt.weg2 import vram_plan_view as _vpv
+
+        _VRAM_VIEW = _vpv.PlanView()
+    return _VRAM_VIEW
+
+
+def vram_plan_emit(ns, cards: Sequence[Card], pass_name: str, log: Log, *,
+                   d_label: Optional[str] = None, group: str = "D") -> Optional[dict]:
+    """M1: lay the pass's solver outputs into ``weg2.vram_plan/1``, write it to
+    the boot's state directory (vram_plan-<pass>.json + vram_plan.json) and log
+    the one human line plus the terms that moved since the previous pass. A
+    VIEW: it changes no budget, argv or bolt, and a view that fails is named,
+    never raised into the boot."""
+    from sglang.srt.weg2 import vram_plan as _vp
+
+    view = vram_view()
+    try:
+        plan = view.build(pass_name, cards, boot_id=str(getattr(ns, "tag", "") or ""),
+                          rev=str(os.environ.get("HTSGLANG_REV", "") or ""), d_label=d_label)
+    except Exception as exc:  # noqa: BLE001 -- the view never kills a launch
+        log(f"VRAM-PLAN pass={pass_name} failed: {type(exc).__name__}: {exc}")
+        return None
+    log(_vp.plan_line(plan))
+    prev = view.last
+    if prev is not None:
+        moved = _vp.diff_plans(prev, plan)
+        if moved:
+            log("VRAM-PLAN-DIFF %s -> %s: %d Terme%s %s" % (
+                prev["pass"], pass_name, len(moved), ":" if moved else "",
+                "; ".join("%s %s->%s" % m for m in moved[:16])
+                + (" ..." if len(moved) > 16 else "")))
+    view.last = plan
+    d = boot_state_dir()
+    if d:
+        try:
+            _vp.write_plan(d, plan, state_file_mod.write_json_atomic)
+        except OSError as exc:
+            log(f"VRAM-PLAN pass={pass_name} write failed ({type(exc).__name__}): {exc}")
+        boot_state_write(log, fields={f"groups.{group}.launch.vram_plan_id": plan["plan_id"],
+                                      f"groups.{group}.launch.vram_plan_pass": pass_name})
+    return plan
 
 
 def _max_running_requests(model: str, group: str = "D", bs: int = DEFAULT_D_BS) -> int:
@@ -16998,6 +17058,12 @@ def shipped_line(
 D_RANK_SOLVE_MARKER = "D-RANK VRAM (#145)"
 
 
+#: VRAM-VERTRAG M1: the pass a D solve's label belongs to (anything else, the
+#: early start's expectation, is ``d_early``)
+_VRAM_PASS_BY_LABEL = {"D(Karte, Erwartung)": "map", "D(dry, expectation)": "dry",
+                       "D(d-only, expectation)": "d_only", "D": "d"}
+
+
 def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                           label: str, *, p_split=None, chunk_layers=None,
                           card_terms: Optional[Sequence[Dict[str, object]]] = None) -> None:
@@ -17411,6 +17477,15 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                     f"{' (aus --env-d, Vorrang)' if _given else ''} "
                     f"(Rate aus D_EXTEND_GROWTH_PER_ROW_MIB {_rate}, boots {_rate_src}; D kappt den "
                     f"Extend-Chunk auf floor((card_free_post - 300) / Rate), MIN ueber TP)")
+    _w = getattr(ns, "_d_kv_stage_written", None) or {}
+    _stage_rows = dict((_w.get("worker_rows") or {}))
+    if _w:
+        _stage_rows[int(_w.get("host", 0))] = int(_w.get("rows", 0))
+    vram_view().note_d_solve(label, cards, plan.fits,
+                             objective=str(getattr(ns, "d_tp_objective", "") or ""),
+                             kv_tokens_max=int(_d_kv), seats=d_stated_seats(ns),
+                             stage_rows=_stage_rows, fixed_src=_fixed_src, act_src=_act_src)
+    vram_plan_emit(ns, cards, _VRAM_PASS_BY_LABEL.get(label, "d_early"), log, d_label=label)
     log_wake_credit_solve(ns, cards, plan.fits, log, label,
                           p_split=p_split, chunk_layers=chunk_layers)
 
@@ -18197,6 +18272,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
         return
     for fit in fits:
         log(_p_card.describe_p_card(fit, reference))
+    vram_view().note_p_card(cards, fits, fracs, lru_rows, reference.source)
     if recut_from is not None:
         log(_p_card.recut_card_line(
             recut_from, stage_layers, fits, dense_mib_per_layer=float(dense_mib_per_layer),
@@ -18213,6 +18289,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
     capped = _solve(prompt, cap.fractions)
     for fit in capped:
         log(_p_card.describe_p_card(fit, reference))
+    vram_view().note_p_card(cards, capped, cap.fractions, lru_rows, reference.source)
     again = _p_card.p_card_refusal_text(capped, reference, chunk=int(chunk_tokens))
     if again is not None:
         again = "%s -- auch nach %s %s" % (again, P_FR_CAP_MARKER, "; ".join(cap.lines))
@@ -21471,6 +21548,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if _park_split:
             print(_park_split, flush=True)
             raise SystemExit(_park_split)
+    # VRAM-VERTRAG M1: the profile's hand pins, read before any solver
+    # publishes into --extra-*/--env-* (every one is planner debt: OVERRIDE)
+    from sglang.srt.weg2 import vram_plan_view as _vpv
+
+    vram_view().reset(overrides=_vpv.profile_pins(ns), identity={
+        "profile": str(getattr(ns, "profile", "") or ""),
+        "model": os.path.basename(str(getattr(ns, "model", "") or "").rstrip("/")),
+        "tag": str(getattr(ns, "tag", "") or "")})
     _sf_on, _sf_src = standard_form_resolved(ns)
     if _sf_on or _sf_src.startswith("env "):
         print("WEG2-STANDARD-FORM (NF H91, profile field standard_form): %s (%s) -- D seats per "
@@ -22078,6 +22163,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "CORRIDOR-FLOOR line and infer the ordering from it; after this line "
         "nobody has to."
     )
+    vram_view().note_asleep("D", cards, dc_expect_d,
+                            "MODEL(dc_expect_d: D reserve = record or census + margin + slack)")
     budgets_p = budgets_from_dc(
         cards, dc_expect_d, log, "P", overshoot_mib=list(_pconst("P_OVERSHOOT_MIB", ns.profile)),
         overshoot_provenance="boot weg2ls2b2",
@@ -22119,6 +22206,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # UNIFY S9: the P chunk model is a per-stage table of ONE cut as well
     # (record pp_layer_ratio); checked on the final cut, after the graph's.
     p_chunk_model_cut_check(ns, cut, log)
+    vram_plan_emit(ns, cards, "p_budget", log, group="P")
     stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
     # 1b' (moved here by the argv slice's FIX 2) -- P's PP LAYER SPLIT, of the
     # cut group P is ACTUALLY LAUNCHED WITH.  Read off PCutFacts, where
@@ -23549,6 +23637,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             awake_rest_mib=_rest, awake_rest_provenance=_rest_prov, terms_out=_d_terms,
         )
         state.budgets["D"] = budgets_d
+        if label == "D":  # the real pass: P's residue as measured after sleep(P)
+            vram_view().note_asleep("P", cards, dc_src, "RECORD(NVML je PID nach sleep(P))")
         log_d_rank_vram_solve(ns, cards, budgets_d, log, label,
                               p_split=p_split, chunk_layers=chunk_layers,
                               card_terms=(_d_terms if _rest is not None else None))
