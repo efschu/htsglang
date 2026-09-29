@@ -811,9 +811,17 @@ PROFILES: Dict[str, ModelProfile] = {
         # NF P49: off until the NF seat releases #49 with a boot tag
         agent_span=False,
         standard_form=True,
-        # RG 26.09.: off until the NF seat releases them with a boot tag (the
-        # NF group env stays byte-identical).
-        inline_system_in_place=False,
+        # NF-MZ (29.09., y3m boot ...dauer09292136, 375f44975e): released.
+        # Claude Code 2.1.280 sends role:"system" (api_system) messages
+        # mid-conversation -- mcp_instructions_delta + auto_mode arrive once
+        # the MCP servers are connected, i.e. right before turn 2. Hoisted
+        # into the head system turn they re-render every token behind the
+        # system text: SESSION-PREFIX weg2-2-8 common=3844 of 14970 and
+        # weg2-2-9 common=3861 of 18699 (= the head segment minus
+        # "<|im_end|>\n"; X-EXACT reused=11124/14836 = every later segment
+        # byte-equal), P cached 0 on both. Rendered in place, turn N stays a
+        # token prefix of turn N+1. P, D and the front take the row alike.
+        inline_system_in_place=True,
         # NF-TK (HS 27.09., NF rc12t 09271756: 0 of 41 P legs cached -- every
         # P read with loaded>0 was clamped to told=0 by "#1416 STORE-TOLD
         # ANCHOR-CLAMP ... anchored=0", because with TK off the clamp hashed

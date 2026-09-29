@@ -4,7 +4,8 @@ metal -- 108 requests, flips 0.23/request (before 1.35), wasted prefill ~7 %
 (before 48 %), 0 group deaths, ENV-IM-RANG all five = 1 on P, D and the front
 -- are MODEL PROFILE fields (weg2/form.py PREFIX_SWITCHES), plus PF as a field
 only (off, unproven on metal). qwen27b on; nextflash since HS 27.09. TK, PACED
-and TW on (NF3), MZ and #49 off until the NF seat releases them. An explicitly
+and TW on, since NF-MZ 29.09. MZ too (NF3), #49 off until the NF seat
+releases it. An explicitly
 set env wins. P, D (build_env) and the front
 (its env) get one value; MZ must be equal on P and D. No form: off.
 """
@@ -30,7 +31,8 @@ PF = "SGLANG_WEG2_TOLD_GROUP_FALLBACK"
 ALL = FIVE + (PF,)
 MZ = "SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE"
 #: NF-TK (HS 27.09.): the told trio the nextflash row carries.
-NF3 = ("SGLANG_WEG2_TOLD_PROBE_TREE_KEY", "SGLANG_WEG2_TOLD_PACED", "SGLANG_WEG2_P_TWIN_DEFER")
+#: NF-MZ (29.09.): the in-place inline system render joins it (P == D == front).
+NF3 = ("SGLANG_WEG2_TOLD_PROBE_TREE_KEY", "SGLANG_WEG2_TOLD_PACED", "SGLANG_WEG2_P_TWIN_DEFER", MZ)
 
 
 def _nf_on(name):
@@ -89,7 +91,7 @@ def test_state_reads_the_published_form(clean):
     assert FM.prefix_switch_state("SGLANG_WEG2_TOLD_PACED", env) == (True, "profile qwen27b")
     env = {FM.FORM_ENV: _form("nextflash").env_value()}
     assert FM.prefix_switch_state("SGLANG_WEG2_TOLD_PACED", env) == (True, "profile nextflash")
-    assert FM.prefix_switch_state(MZ, env) == (False, "profile nextflash")
+    assert FM.prefix_switch_state(MZ, env) == (True, "profile nextflash")
 
 
 @pytest.mark.parametrize("profile", ["qwen27b", "nextflash", None])
@@ -217,7 +219,7 @@ def test_p_d_front_agree(clean, profile):
     FM.publish_prefix_switches(front, profile)
     for n in ALL:
         assert p.get(n) == d.get(n) == front.get(n), (profile, n)
-    assert (p.get(MZ) == "1") is (profile == "qwen27b")
+    assert p.get(MZ) == "1"  # NF-MZ 29.09.: both rows carry it
 
 
 def test_the_front_spawn_publishes_on_its_env():
@@ -241,8 +243,9 @@ def test_mz_split_is_refused():
     assert msg and "P=1 D=0" in msg and MZ in msg
     nf = {}
     FM.publish_prefix_switches(nf, "nextflash")
-    assert FM.prefix_p_eq_d_mismatch(nf, {MZ: "1"}, {}) is not None
-    assert FM.prefix_p_eq_d_mismatch(nf, {MZ: "1"}, {MZ: "true"}) is None
+    assert FM.prefix_p_eq_d_mismatch(nf, {}, {}) is None  # NF-MZ: on, one value
+    assert FM.prefix_p_eq_d_mismatch(nf, {}, {MZ: "0"}) is not None
+    assert FM.prefix_p_eq_d_mismatch(nf, {MZ: "0"}, {MZ: "false"}) is None
     # a non-MZ switch may differ per group (TW is PP0-only by design)
     assert FM.prefix_p_eq_d_mismatch(base, {}, {"SGLANG_WEG2_P_TWIN_DEFER": "0"}) is None
 
@@ -259,9 +262,12 @@ def test_the_launcher_refuses_the_mz_split_and_names_the_line():
     env = {MZ: "0"}
     line = L.prefix_switches_announce(ns, _form("qwen27b"), environ=env)
     assert f"{MZ}=0 (env {MZ}=0)" in line and env == {MZ: "0"}  # a copy, never written
-    ns.env_p = f"{MZ}=1"
+    ns.env_p, ns.env_d = "", f"{MZ}=0"
     with pytest.raises(L.Weg2LaunchRefused, match="P=1 D=0"):
         L.prefix_switches_announce(ns, _form("nextflash"), environ={})
+    ns.env_d = ""
+    line = L.prefix_switches_announce(ns, _form("nextflash"), environ={})
+    assert f"{MZ}=1 (profile nextflash)" in line
 
 
 def test_main_announces_before_argparse_defaults():
