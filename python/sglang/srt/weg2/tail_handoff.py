@@ -246,8 +246,12 @@ def agree_cut(page_prefix: int, cut: int, local_ok: bool, reduce_min: Callable[[
 def digest(tensors: Sequence[torch.Tensor]) -> str:
     """SEAM-digest style: sha1 over the raw bytes of CPU tensors, in order."""
     h = hashlib.sha1()
+    no_copy = envs.SGLANG_OPT_WEG2_TAIL_READ_MMAP.get()
     for t in tensors:
-        h.update(t.detach().contiguous().view(torch.uint8).numpy().tobytes())
+        a = t.detach().contiguous().view(torch.uint8).numpy()
+        # hashlib takes the buffer as is; tobytes() was a second full copy
+        # of every tensor on the heap (same bytes either way)
+        h.update(a.reshape(-1) if no_copy else a.tobytes())
     return h.hexdigest()[:16]
 
 
@@ -511,7 +515,13 @@ def read_part(header: TailHeader, check_digest: bool = True) -> Tuple[Optional[d
     row is never applied)."""
     _j, ppath = part_paths(header.spec.rid, header.part)
     try:
-        bundle = torch.load(ppath, map_location="cpu")
+        if envs.SGLANG_OPT_WEG2_TAIL_READ_MMAP.get():
+            # views of the part file's tmpfs pages: no anonymous copy of the
+            # bundle (a rank keeps only its rows, pin_memory copies those);
+            # an unlink or replace of the part leaves this mapping intact
+            bundle = torch.load(ppath, map_location="cpu", mmap=True)
+        else:
+            bundle = torch.load(ppath, map_location="cpu")
     except (OSError, RuntimeError, EOFError):
         logger.warning("WEG2-TAIL part unreadable: %s", ppath, exc_info=True)
         return None, "unreadable"

@@ -811,6 +811,16 @@ class Envs:
     # being written; one 97k rid (PP0+PP1+PP2) is 56.9 MiB folded (H63),
     # 113.8 MiB not (x166).
     SGLANG_WEG2_TAIL_KEEP_MIB = EnvInt(0)
+    # TAIL READ MMAP (Kriech-Sitz 29.09., z30w-park): a D rank reads a tail
+    # part with torch.load(mmap=True) -- the tensors are views of the part
+    # file's tmpfs pages (already charged as shmem, <arena dir>/handoff)
+    # instead of an anonymous copy of the WHOLE bundle, and the digest hashes
+    # the buffers without a bytes copy. Measured on z30w: each tail stage put
+    # +250-390 MiB of glibc heap on a D rank (HOST-ANON-DELTA, weg2-tail-stage
+    # thread, malloc_inuse), returned only by the sleep's malloc_trim -- the
+    # 1.5-2 GiB anon sawtooth under memory.max. Same bytes, same digests.
+    # False = the torch.load copy, byte for byte.
+    SGLANG_OPT_WEG2_TAIL_READ_MMAP = EnvBool(False)
     # PLE STATE HAND-OFF (fnFL2 H63c, set on BOTH groups): the Qwen4-Exp PLE
     # side states of a request slot -- the n-gram history (NGramPool, the
     # last ngram_size-1 tokens) and the short-conv window (ShortConvPool, the
