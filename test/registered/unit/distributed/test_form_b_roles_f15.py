@@ -51,6 +51,21 @@ def _run(rank, port, out):
     res["q_counts"] = du.weightless_head_counts(24, 3, units=du.attn_q_partition_units(24, 4, 2),
                                                 groups=du.attn_q_partition_groups(4, 2))
     res["kv_counts"] = du.weightless_head_counts(4, 3, units=4)
+    # F15 (5d): the GDN state pool is sized under the geometry the layers were
+    # built with -- W: |W| ranks, W-restricted plan; K: the lane worker's 1 elem
+    from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+    from sglang.srt.distributed.utils import set_tp_partition_ratios, tp_partition_sizes
+
+    set_tp_partition_ratios(RATIO, allow_zero=True)
+    cfg = Qwen3NextConfig(num_hidden_layers=4)
+    cfg.full_attention_interval = 4
+    mp_ = cfg.mamba2_cache_params
+    res["gdn_temporal"] = tuple(mp_.shape.temporal)
+    with du.scoped_tp_partition_ratios([77, 23]):
+        res["gdn_want_v_heads"] = tp_partition_sizes(cfg.linear_num_value_heads, 2,
+                                                     units=cfg.linear_num_key_heads)
+    res["gdn_v_heads_total"] = cfg.linear_num_value_heads
+    set_tp_partition_ratios(None)
     # the sampler's sync group: the ranks that sample
     from sglang.srt.layers.sampler import Sampler
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -95,6 +110,12 @@ def test_form_b_roles_counts_and_sources_on_every_rank():
         assert r["q_counts"] == [18, 6, 0] and r["kv_counts"] == [3, 1, 0]   # rank-uniform
         assert r["adopted"] == [100, 200]                                    # the lead's tokens
     assert res[0]["sampler_group"] == res[1]["sampler_group"] == [0, 1], res[0]["sampler_group"]
+    # GDN state: W rank r holds its W-share of the value heads; K the 1-element pool
+    want = res[0]["gdn_want_v_heads"]
+    assert res[0]["gdn_temporal"][0] == want[0] and res[1]["gdn_temporal"][0] == want[1], (
+        res[0]["gdn_temporal"], res[1]["gdn_temporal"], want)
+    assert sum(want) == res[0]["gdn_v_heads_total"]
+    assert res[2]["gdn_temporal"] == (1, 1, 1)
     assert res[2]["sampler_group"] == [2]
 
 

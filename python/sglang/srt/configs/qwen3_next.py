@@ -344,26 +344,45 @@ class Qwen3NextConfig(PretrainedConfig):
         # Uneven TP: the per-rank state shapes follow the k-head-unit
         # partition of the GDN layers; pass this rank. None on the
         # default path (create() then ignores it).
+        import contextlib
+
         attn_tp_size = get_parallel().attn_tp_size
+        _geo = contextlib.nullcontext()
         if weightless_kv_active():
-            attn_tp_size = 1
-        tp_rank = (
-            get_parallel().attn_tp_rank if tp_plan_active(attn_tp_size) else None
-        )
-        shape = Mamba2StateShape.create(
-            tp_world_size=attn_tp_size,
-            intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
-            n_groups=self.linear_num_key_heads,
-            num_heads=self.linear_num_value_heads,
-            head_dim=self.linear_value_head_dim,
-            state_size=self.linear_key_head_dim,
-            conv_kernel=self.linear_conv_kernel_dim,
-            tp_rank=tp_rank,
-            # Coarsened GDN unit family (set by Qwen3_5GatedDeltaNet for GGUF
-            # K-quant so the state cache matches the layers' block-aligned
-            # split). None -> falls back to n_groups (k heads), unchanged.
-            tp_units=getattr(self, "gdn_tp_units", None),
-        )
+            # F15 (5d): a Form B head (a head SET of >= 2) built its GDN layers
+            # as one of |W| ranks with the W-restricted plan
+            # (rank_form.form_b_build_context) -- its state pool must be sized
+            # under the SAME geometry, or conv_dim and the conv state disagree
+            # (the lane's own TP=1 mismatch, mirrored). The lane head: TP=1.
+            from sglang.srt.distributed.utils import get_weightless_kv_weight_ranks
+
+            _heads = get_weightless_kv_weight_ranks() or ()
+            if len(_heads) > 1:
+                from sglang.srt.rank_form import form_b_build_context
+
+                _geo = form_b_build_context(get_parallel().tp_rank) or _geo
+            else:
+                attn_tp_size = 1
+        with _geo:
+            if not isinstance(_geo, contextlib.nullcontext):
+                attn_tp_size = get_parallel().attn_tp_size
+            tp_rank = (
+                get_parallel().attn_tp_rank if tp_plan_active(attn_tp_size) else None
+            )
+            shape = Mamba2StateShape.create(
+                tp_world_size=attn_tp_size,
+                intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
+                n_groups=self.linear_num_key_heads,
+                num_heads=self.linear_num_value_heads,
+                head_dim=self.linear_value_head_dim,
+                state_size=self.linear_key_head_dim,
+                conv_kernel=self.linear_conv_kernel_dim,
+                tp_rank=tp_rank,
+                # Coarsened GDN unit family (set by Qwen3_5GatedDeltaNet for GGUF
+                # K-quant so the state cache matches the layers' block-aligned
+                # split). None -> falls back to n_groups (k heads), unchanged.
+                tp_units=getattr(self, "gdn_tp_units", None),
+            )
 
         return Mamba2CacheParams(
             shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
