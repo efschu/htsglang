@@ -87,3 +87,101 @@ def test_gate_sits_before_the_load_and_the_avail_reading():
     i_gate = src.index("wait_gate_from_env()")
     assert i_gate < src.index("before_avail_memory =")
     assert i_gate < src.index("Load weight begin")
+
+
+# --- stage 0 (27B review of cb98c3d94a): no D context before P is sized ---
+
+
+def test_stage0_noop_without_env(monkeypatch):
+    monkeypatch.delenv(des.STAGE0_ENV, raising=False)
+    assert des.wait_stage0_from_env() is None
+
+
+def test_stage0_refuse_raises_named(monkeypatch, tmp_path):
+    gate = str(tmp_path / "s0.json")
+    des.write_gate(gate, des.VERDICT_REFUSE, "nvml1: D held 482 MiB before P was sized")
+    monkeypatch.setenv(des.STAGE0_ENV, gate)
+    with pytest.raises(des.DEarlyGateRefused, match="482 MiB"):
+        des.wait_stage0_from_env()
+
+
+def test_p_sized_record_roundtrip(monkeypatch, tmp_path):
+    monkeypatch.delenv(des.P_SIZED_DIR_ENV, raising=False)
+    assert des.note_p_memory_sized(0, 0, 16.68) is None  # off without the env
+    monkeypatch.setenv(des.P_SIZED_DIR_ENV, str(tmp_path))
+    des.note_p_memory_sized(2, 0, 9.06)
+    des.note_p_memory_sized(0, 0, 16.68)
+    recs = des.read_p_sized(str(tmp_path))
+    assert [(r["pp_rank"], r["used_by_me_mib"]) for r in recs] == [(0, 17080), (2, 9277)]
+
+
+def test_stage0_verdict_waits_then_goes_and_refuses_on_taint():
+    recs = [{"pp_rank": k, "tp_rank": 0, "used_by_me_mib": 1000 + k} for k in range(3)]
+    v, _ = des.stage0_verdict(recs[:2], 3, {"u1": 0})
+    assert v is None  # PP2 not sized yet
+    v, lines = des.stage0_verdict(recs, 3, {"u1": 0, "u0": 0})
+    assert v is True and "D held 0 MiB" in lines[-1]
+    # a D context seen before P was sized taints P's used_by_me: refuse, even if P is done
+    v, lines = des.stage0_verdict(recs, 3, {"u1": 888}, {"u1": "nvml1"})
+    assert v is False and any("nvml1: D held 888 MiB" in l for l in lines)
+
+
+# --- free-read journal (27B follow-up): P's reads from stage 0 to first wake ---
+
+
+def _p_reader_under_test():
+    import torch
+
+    return torch.cuda.mem_get_info(0)
+
+
+def test_free_read_journal_records_the_call_site_and_restores(monkeypatch, tmp_path):
+    import torch
+
+    fake = lambda *a, **k: (512 << 20, 20480 << 20)  # noqa: E731
+    monkeypatch.setattr(torch.cuda, "mem_get_info", fake)
+    monkeypatch.delenv(des.FREE_READ_JOURNAL_ENV, raising=False)
+    assert des.start_free_read_journal(0, 0) is None  # off without the env
+    monkeypatch.setenv(des.FREE_READ_JOURNAL_ENV, str(tmp_path))
+    path = des.start_free_read_journal(1, 0)
+    assert _p_reader_under_test() == (512 << 20, 20480 << 20)  # value unchanged
+    des.stop_free_read_journal()
+    assert torch.cuda.mem_get_info is fake  # restored
+    rows = des.read_free_journal(path)
+    assert len(rows) == 1 and rows[0]["free_mib"] == 512 and rows[0]["total_mib"] == 20480
+    assert rows[0]["site"].endswith(":_p_reader_under_test")
+    _p_reader_under_test()  # after stop: not journaled
+    assert len(des.read_free_journal(path)) == 1
+
+
+def test_free_read_diff_flags_the_site_that_sees_d():
+    early = [{"site": "g.py:9:spendable", "via": "", "free_mib": 900},
+             {"site": "c.py:1:census", "via": "", "free_mib": 4000}]
+    serial = [{"site": "g.py:9:spendable", "via": "", "free_mib": 1382},
+              {"site": "c.py:1:census", "via": "", "free_mib": 4010}]
+    lines = des.free_read_diff(early, serial)
+    assert any(l.startswith("DEVIATES g.py:9:spendable") and "delta -482" in l for l in lines)
+    assert any(l.startswith("same c.py:1:census") for l in lines)
+    only = des.free_read_diff(early[:1], [])
+    assert only[0].startswith("DEVIATES") and "one boot only" in only[0]
+
+
+def test_journal_window_is_stage0_to_first_wake():
+    from sglang.srt.managers import scheduler as sch
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    init = inspect.getsource(sch.Scheduler.init_model_worker)
+    assert init.index("note_p_memory_sized(") < init.index("start_free_read_journal(")
+    resume = inspect.getsource(wu)
+    i = resume.index("def resume_memory_occupation(")
+    assert "stop_free_read_journal()" in resume[i:i + 400]
+
+
+def test_stage0_sits_before_the_first_cuda_call_and_p_reports_after_sizing():
+    from sglang.srt.managers import scheduler as sch
+
+    run = inspect.getsource(sch.run_scheduler_process)
+    i = run.index("wait_stage0_from_env()")
+    assert i < run.index("install_triton_loader_window()") < run.index("Scheduler(")
+    init = inspect.getsource(sch.Scheduler.init_model_worker)
+    assert init.index("note_post_capture_leftover(") < init.index("note_p_memory_sized(")

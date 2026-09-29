@@ -1037,6 +1037,7 @@ class ModelRunnerKVCacheMixin:
             )
             budget_gb = budget_mib / 1024.0
             used_by_me_gb = pre_model_load_memory - available_gpu_memory
+            self._weg2_used_by_me_gb = used_by_me_gb  # BOOTZEIT 3 stage-0 check line
             rest_memory = budget_gb - used_by_me_gb
             budget_posts.append(("weights + runtime state", used_by_me_gb))
             rest_memory, _reserve_post = self._gapped_corridor_holdback(rest_memory)

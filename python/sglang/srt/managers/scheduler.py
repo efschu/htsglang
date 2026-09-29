@@ -2795,6 +2795,20 @@ class Scheduler(
         model_runner.note_post_capture_leftover(
             draft_solo_pool_bytes=self._solo_draft_kv_pool_bytes()
         )
+        # BOOTZEIT 3 stage 0: every free-memory reading this rank's sizing
+        # depends on is taken; an early-started D may create its context now
+        # (no-op without SGLANG_WEG2_P_MEM_SIZED_DIR).
+        from sglang.srt.weg2.d_early_start import (
+            note_p_memory_sized,
+            start_free_read_journal,
+        )
+
+        note_p_memory_sized(
+            self.pp_rank, self.tp_rank, getattr(model_runner, "_weg2_used_by_me_gb", None)
+        )
+        # ... and from here until the first wake every free-memory read of this
+        # rank is journaled (SGLANG_WEG2_FREE_READ_JOURNAL; early vs serial diff)
+        start_free_read_journal(self.pp_rank, self.tp_rank)
         # #485 residency census (env-gated, read-only): the same point, seen
         # from the CUT's side. note_post_capture_leftover above answers "how
         # much is left"; this answers "what is here, and who owns it", which
@@ -21813,6 +21827,14 @@ def run_scheduler_process(
 
     flight_recorder.arm_process_trace(rank=tp_rank)
     flight_recorder.mark("process_start", rank=tp_rank)
+
+    # BOOTZEIT 3 stage 0: an early-started group D holds HERE, before the
+    # rank's first CUDA call, until group P's KV is sized (a context created
+    # between P's two free-memory readings is charged to P). No-op without
+    # the gate env.
+    from sglang.srt.weg2.d_early_start import wait_stage0_from_env
+
+    wait_stage0_from_env()
 
     # #1056: wrap the Triton loader chokepoint BEFORE any kernel can be built,
     # so no first-loader of this process can slip in ahead of the window. Every

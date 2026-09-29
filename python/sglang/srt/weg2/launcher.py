@@ -13045,6 +13045,74 @@ def driver_carve_min_total_mib(profile: Optional[str] = None) -> int:
     return int(getattr(row, "driver_carve_min_total_mib", 0) or 0)
 
 
+def _d_early_start_armed(ns) -> bool:
+    """BOOTZEIT 3: the one resolution of ``--weg2-d-early-start``."""
+    return str(getattr(ns, "weg2_d_early_start", "off") or "off") == "on"
+
+
+class Weg2DEarlyStartUnreviewed(Weg2LaunchRefused):
+    """W185: the early D start is reviewed for Next Flash only (27B review of
+    cb98c3d94a); another profile's readers of the D plan between P's launch
+    and step 5 were not audited with it on."""
+
+
+def refuse_d_early_start_unreviewed(ns) -> None:
+    """W185, called before group P starts: a named refusal, never a silent off."""
+    if _d_early_start_armed(ns) and not xchg_census_is_reserve(ns.profile):
+        raise Weg2DEarlyStartUnreviewed(
+            f"W185 Weg2DEarlyStartUnreviewed: --weg2-d-early-start on with profile "
+            f"{ns.profile or weg2_form.DEFAULT_PROFILE!r}; reviewed for Next Flash only (27B review "
+            f"29.09.: its readers of ns.env_d/_d_owner_solve between launch_group(P) and "
+            f"#5 are not audited with the switch on). Boot with 'off' (byte-identical).")
+
+
+def _group_rank_count(argv: Sequence[str]) -> int:
+    """Scheduler ranks one group spawns: --tp-size x --pp-size of its argv."""
+    toks = list(argv)
+    return int(_last_flag_value(toks, "--tp-size") or 1) * int(_last_flag_value(toks, "--pp-size") or 1)
+
+
+def d_early_stage0_watch(gate: str, sized_dir: str, expected_p_ranks: int, d_pid_fn,
+                         d_alive_fn, p_alive_fn, vram_fn, names: Mapping[str, str],
+                         result: Dict[str, object], log: Log, poll_s: float = 1.0,
+                         clock=time.monotonic, sleep=time.sleep) -> None:
+    """BOOTZEIT 3 stage 0, launcher side: sample the early D's VRAM per card
+    until every P rank reports sized, then write the stage-0 gate. ``go`` only
+    if D held 0 MiB on every card meanwhile (else P's used_by_me holds D's
+    context: refuse, D exits, the serial path starts D later)."""
+    from sglang.srt.weg2 import d_early_start as _des
+
+    held: Dict[str, int] = {}
+    t0 = clock()
+    while True:
+        try:
+            now = vram_fn(d_pid_fn())
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            now = {}
+            log(f"{_des.STAGE0_MARKER} VRAM sample failed ({type(e).__name__}: {e}); counted as no reading")
+        for u, v in now.items():
+            held[u] = max(held.get(u, 0), int(v))
+        records = _des.read_p_sized(sized_dir)
+        verdict, lines = _des.stage0_verdict(records, expected_p_ranks, held, names)
+        if verdict is None and not (d_alive_fn() and p_alive_fn()):
+            verdict, lines = False, lines + ["a group exited before P was sized"]
+        if verdict is not None:
+            for ln in lines:
+                log(f"{_des.STAGE0_MARKER} {ln}")
+            waited = clock() - t0
+            _des.write_gate(gate, _des.VERDICT_GO if verdict else _des.VERDICT_REFUSE,
+                            "; ".join(lines), measured=held)
+            log(f"{_des.STAGE0_MARKER} {'GO' if verdict else 'REFUSE'} after {waited:.1f} s -- "
+                + ("D creates its CUDA contexts now" if verdict else "early D exits; D starts serially"))
+            result.update({"verdict": _des.VERDICT_GO if verdict else _des.VERDICT_REFUSE,
+                           "waited_s": round(waited, 1), "d_held_mib": dict(held),
+                           "p_used_by_me_mib": {f"pp{r.get('pp_rank')}tp{r.get('tp_rank')}": r.get("used_by_me_mib")
+                                                for r in records}})
+            boot_state_write(log, event=("d_early_stage0", dict(result)))
+            return
+        sleep(poll_s)
+
+
 def budgets_from_dc(
     cards: List[Card],
     dc_mib: Dict[str, int],
@@ -20662,6 +20730,25 @@ def build_parser() -> argparse.ArgumentParser:
              "VOLLSTAENDIG gedeckt hat. 'off' ist byte-identisch zu vorher.",
     )
     ap.add_argument(
+        "--weg2-p-free-read-journal", choices=("on", "off"), default="off",
+        help="BOOTZEIT 3 (29.09., 27B-Auflage): jede Lesung des freien Kartenspeichers "
+             "durch P von 'P kv sized' bis zum ersten Wake als JSONL je Rang "
+             "(p_free_reads_<tag>/), fuer den Vergleich frueher gegen seriellen Start "
+             "(python -m sglang.srt.weg2.d_early_start EARLY SERIAL). Mit "
+             "--weg2-d-early-start on immer an. Nur Instrument, aendert keine Entscheidung.",
+    )
+    ap.add_argument(
+        "--weg2-d-early-start", choices=("on", "off"), default="off",
+        help="BOOTZEIT 3 (29.09.): 'on' startet Gruppe D ZUSAMMEN mit P statt "
+             "nach P-READY + sleep(P) + D-Plan (z30r3: D-Init 30 s, davor 8 s "
+             "Schlaf+Plan). D plant aus den Erwartungs-Budgets (Planer-Sitz: "
+             "Record statt DC_EXPECT) und wartet VOR seinem Gewichtsladen an "
+             "einem Gate (weg2/d_early_start.py). Nach sleep(P) misst der "
+             "Launcher wie bisher und schreibt 'go' nur, wenn jedes geplante "
+             "D-Budget <= dem gemessenen ist; sonst 'refuse', D beendet sich und "
+             "startet seriell wie bisher. 'off' ist byte-identisch zu vorher.",
+    )
+    ap.add_argument(
         "--weg2-xchg-legs", choices=list(weight_exchange.XCHG_LEGS_CHOICES),
         default=weight_exchange.LEGS_BOTH,
         help="#1330 B4n. WHICH DIRECTION's exchange legs run. 'both' (the "
@@ -23623,6 +23710,82 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             time.sleep(5)
         log(f"WEG2-LAUNCH D-ONLY group D exited rc={spec_d.proc.returncode}")
         return int(spec_d.proc.returncode or 0)
+    # 5-prep. THE D PLAN AS ONE FUNCTION (BOOTZEIT 3): the serial path calls it
+    # with P's measured dormant footprint after sleep(P), the early start with
+    # the expectation before P loads. Its body is the former inline block,
+    # unchanged but for the two names (dc_src, label) and the extra env.
+    def _d_spec_from(dc_src, label, extra_env=None):
+        _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
+        _rest, _rest_prov = d_awake_rest(cards, ns.profile)
+        _over, _over_prov = d_overshoot_record(ns.profile)
+        _d_terms: List[Dict[str, object]] = []
+        budgets_d = budgets_from_dc(
+            cards, dc_src, log, label, overshoot_mib=_over,
+            overshoot_provenance=_over_prov,
+            corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
+            user_reserve_by_card=user_reserve_by_card,
+            dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
+            charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
+            awake_rest_mib=_rest, awake_rest_provenance=_rest_prov, terms_out=_d_terms,
+        )
+        state.budgets["D"] = budgets_d
+        log_d_rank_vram_solve(ns, cards, budgets_d, log, label,
+                              p_split=p_split, chunk_layers=chunk_layers,
+                              card_terms=(_d_terms if _rest is not None else None))
+        state.d_owner_solve = dict(getattr(ns, "_d_owner_solve", None) or {})
+        d_ratio = d_tp_ratio_decision(
+            ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
+            d_bs, getattr(ns, "env_d", "") or "",
+            user_reserve_by_card=user_reserve_by_card,
+            overhead_mib_by_rank=d_overhead_mib,
+        )
+        log(d_ratio.line)
+        log(d_ratio.op_line)
+        log(d_tokvec.line)
+        refuse_flip_stage_form_without_trim_cells(ns, getattr(ns, "weg2_boot_form", None), log)
+        refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
+        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
+        env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
+        env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
+        env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
+        env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
+        env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
+        env_d.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None),
+                                     bool(getattr(ns, "p_trim_end_anchor", False))))  # {} when off
+        # #114: DIE EFFEKTIVE GRUPPEN-ENV GEHOERT INS LOG.
+        #
+        # Der Verdrahtungs-Check (weg2/verdrahtung_check.sh) liest das
+        # Dry-Run-Log, also das, was der Boot WIRKLICH startet. Er konnte bisher
+        # keine einzige Env pruefen, weil der Launcher sie nirgends druckt:
+        # `grep SGLANG_MOE_EXPERT_STORE_DIR dry_*.log` gibt 0 Treffer, obwohl sie
+        # gesetzt IST. Ein Pruefer, der am falschen Ort misst, meldet Luecken,
+        # die es nicht gibt, und uebersieht die echten.
+        env_d.update(extra_env or {})  # BOOTZEIT 3: the early start's gate paths; {} serially
+        for _g, _e in (("P", env_p), ("D", env_d)):
+            _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
+                           if str(k).startswith("SGLANG_"))
+            log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+        return spec_d, budgets_d
+
+    refuse_d_early_start_unreviewed(ns)  # W185, before any group starts
+    _early_sized_dir = None
+    if _d_early_start_armed(ns):
+        from sglang.srt.weg2 import d_early_start as _des
+
+        _early_sized_dir = os.path.join(os.path.dirname(os.path.abspath(state.logs["D"])),
+                                        f"d_early_p_sized_{ns.tag}")
+        os.makedirs(_early_sized_dir, exist_ok=True)
+        for _old in os.listdir(_early_sized_dir):
+            os.unlink(os.path.join(_early_sized_dir, _old))
+        spec_p.env[_des.P_SIZED_DIR_ENV] = _early_sized_dir  # stage 0: P ranks report sized
+    if _d_early_start_armed(ns) or str(getattr(ns, "weg2_p_free_read_journal", "off")) == "on":
+        from sglang.srt.weg2 import d_early_start as _des
+
+        _journal_dir = os.path.join(os.path.dirname(os.path.abspath(state.logs["P"])),
+                                    f"p_free_reads_{ns.tag}")
+        spec_p.env[_des.FREE_READ_JOURNAL_ENV] = _journal_dir
+        log(f"{_des.FREE_READ_MARKER} P journals its free-memory reads -> {_journal_dir}")
     launch_group(spec_p, tree, log, dry)
     if dry:
         _dry_terms: List[Dict[str, object]] = []
@@ -23671,6 +23834,100 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             x_ceiling_tokens=front_x_ceiling)))
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
+    # BOOTZEIT 3 (--weg2-d-early-start): D starts NOW, planned from the
+    # expectation, and holds before its weight load until _d_early_verdict
+    # below has compared that plan with P's measured dormant footprint.
+    _early_d = None
+    if _d_early_start_armed(ns):
+        from sglang.srt.weg2 import d_early_start as _des
+
+        _early_snap = (getattr(ns, "env_d", ""), getattr(ns, "_d_kv_stage_written", None),
+                       getattr(ns, "_d_owner_solve", None))
+        _early_gate = os.path.join(os.path.dirname(os.path.abspath(state.logs["D"])),
+                                   f"d_early_gate_{ns.tag}.json")
+        try:
+            os.unlink(_early_gate)
+        except FileNotFoundError:
+            pass
+        # dormant_other = the planner seat's ONE selector (D-EXPECT, 9f74489683):
+        # P's measured residue from the record on Next Flash, else the legacy term
+        _early_other, _early_other_why = d_expect_dormant_other(
+            cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
+        log("D-EXPECT DORMANT-OTHER D(frueh, Erwartung): " + ", ".join(
+            f"nvml{c.nvml_index} {_early_other[c.uuid]}" for c in cards) + f" MiB -- {_early_other_why}")
+        _early_stage0 = os.path.join(os.path.dirname(_early_gate), f"d_early_stage0_{ns.tag}.json")
+        try:
+            os.unlink(_early_stage0)
+        except FileNotFoundError:
+            pass
+        _early_spec, _early_budgets = _d_spec_from(
+            _early_other, "D(frueh, Erwartung)",
+            {_des.GATE_ENV: _early_gate, _des.STAGE0_ENV: _early_stage0})
+        state.argv["D"] = " ".join(shlex.quote(a) for a in _early_spec.argv)
+        launch_group(_early_spec, tree, log, dry)
+        log(f"{_des.MARKER} LAUNCH group D with P (planned budgets {_early_budgets} MiB, "
+            f"gate {_early_gate}); D holds before its CUDA context until P is sized "
+            f"({_early_stage0}) and before its load until the verdict after sleep(P)")
+        _early_stage0_result: Dict[str, object] = {}
+        threading.Thread(
+            target=d_early_stage0_watch, name="bz3-d-early-stage0", daemon=True,
+            args=(_early_stage0, _early_sized_dir, _group_rank_count(spec_p.argv),
+                  lambda: session_pids(_early_spec.pid), lambda: _early_spec.proc.poll() is None,
+                  lambda: spec_p.proc.poll() is None, nvml_process_mib,
+                  {c.uuid: f"nvml{c.nvml_index}" for c in cards}, _early_stage0_result, log),
+        ).start()
+        _early_d = (_early_spec, _early_budgets, _early_gate, _early_snap, _early_stage0_result)
+
+    def _d_early_verdict(early, dc_measured):
+        """go -> the running early D; refuse -> None (it exits, the caller starts D serially)."""
+        from sglang.srt.weg2 import d_early_start as _des
+
+        spec, planned, gate, snap, stage0 = early
+        _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
+        _rest, _rest_prov = d_awake_rest(cards, ns.profile)
+        _over, _over_prov = d_overshoot_record(ns.profile)
+        measured = budgets_from_dc(
+            cards, dc_measured, log, "D(gemessen, Gate)", overshoot_mib=_over,
+            overshoot_provenance=_over_prov,
+            corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
+            user_reserve_by_card=user_reserve_by_card,
+            dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
+            charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
+            awake_rest_mib=_rest, awake_rest_provenance=_rest_prov,
+        )
+        uuids = [c.uuid for c in cards]
+        names = {c.uuid: f"nvml{c.nvml_index}" for c in cards}
+        ok, lines = _des.budget_verdict(dict(zip(uuids, planned)), dict(zip(uuids, measured)), names)
+        rc = spec.proc.poll() if spec.proc is not None else None
+        if rc is not None:
+            ok, lines = False, lines + [f"early D exited before the gate rc={rc}"]
+        if stage0.get("verdict") != _des.VERDICT_GO:
+            ok, lines = False, lines + [f"stage 0 not go ({stage0.get('verdict', 'no verdict yet')})"]
+        for _ln in lines:
+            log(f"{_des.MARKER} {_ln}")
+        if ok:
+            _des.write_gate(gate, _des.VERDICT_GO, "planned <= measured on every card",
+                            dict(zip(uuids, planned)), dict(zip(uuids, measured)))
+            state.budgets["D"] = planned
+            log(f"{_des.MARKER} GO -- D loads now with the plan it was started with")
+            return spec
+        _des.write_gate(gate, _des.VERDICT_REFUSE, "; ".join(lines),
+                        dict(zip(uuids, planned)), dict(zip(uuids, measured)))
+        log(f"{_des.MARKER} REFUSE -- early D exits, D starts serially from the measured budgets")
+        try:
+            spec.proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            spec.proc.kill()
+            spec.proc.wait(timeout=30)
+        # the group leads its own session (launch_group): its scheduler ranks
+        # must not outlive it on the cards the serial D is about to take
+        try:
+            os.killpg(spec.proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        ns.env_d, ns._d_kv_stage_written, ns._d_owner_solve = snap
+        return None
+
     state.pids["P"] = spec_p.pid
     _write_state(state)
     register_boot_group(ns.tag, "P", spec_p.pid, log)  # H135b
@@ -23744,62 +24001,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"({'AT OR BELOW' if dc_p[c.uuid] <= exp + P_WINDOWS_MIB else 'ABOVE'} expectation; the launcher derives D from the MEASUREMENT, record 1f B6)"
         )
     state.dc_measured_p = dc_p
+    # BOOTZEIT 3: the free-read journal's cut (P's first sleep is over here) and,
+    # with an early D, D's bytes on each card measured per PID -- the known term
+    # a deviating P reader would have to carry (never an estimate).
+    _p_sleep_evt: Dict[str, object] = {"t": time.time(), "dc_p_mib": dict(dc_p)}
+    if _early_d is not None:
+        try:
+            _p_sleep_evt["d_early_foreign_mib"] = nvml_process_mib(session_pids(_early_d[0].pid))
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            _p_sleep_evt["d_early_foreign_mib"] = f"unmeasured ({type(e).__name__}: {e})"
+        log(f"BZ3 D-EARLY-FOREIGN after sleep(P): D per-PID MiB {_p_sleep_evt['d_early_foreign_mib']}")
+    boot_state_write(log, event=("p_first_sleep_done", _p_sleep_evt))
     for _ln in d_expect_check_lines(cards, getattr(ns, "_d_expect_other", None), dc_p):
         log(_ln)
 
     # 5. group D
-    _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
-    _rest, _rest_prov = d_awake_rest(cards, ns.profile)
-    _over, _over_prov = d_overshoot_record(ns.profile)
-    _d_terms: List[Dict[str, object]] = []
-    budgets_d = budgets_from_dc(
-        cards, dc_p, log, "D", overshoot_mib=_over,
-        overshoot_provenance=_over_prov,
-        corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
-        user_reserve_by_card=user_reserve_by_card,
-        dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
-        charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
-        awake_rest_mib=_rest, awake_rest_provenance=_rest_prov, terms_out=_d_terms,
-    )
-    state.budgets["D"] = budgets_d
-    log_d_rank_vram_solve(ns, cards, budgets_d, log, "D",
-                          p_split=p_split, chunk_layers=chunk_layers,
-                          card_terms=(_d_terms if _rest is not None else None))
-    state.d_owner_solve = dict(getattr(ns, "_d_owner_solve", None) or {})
-    d_ratio = d_tp_ratio_decision(
-        ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
-        d_bs, getattr(ns, "env_d", "") or "",
-        user_reserve_by_card=user_reserve_by_card,
-        overhead_mib_by_rank=d_overhead_mib,
-    )
-    log(d_ratio.line)
-    log(d_ratio.op_line)
-    log(d_tokvec.line)
-    refuse_flip_stage_form_without_trim_cells(ns, getattr(ns, "weg2_boot_form", None), log)
-    refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
-    env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
-    env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
-    env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
-    env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
-    env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
-    env_d.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None),
-                                 bool(getattr(ns, "p_trim_end_anchor", False))))  # {} when off
-    # #114: DIE EFFEKTIVE GRUPPEN-ENV GEHOERT INS LOG.
-    #
-    # Der Verdrahtungs-Check (weg2/verdrahtung_check.sh) liest das
-    # Dry-Run-Log, also das, was der Boot WIRKLICH startet. Er konnte bisher
-    # keine einzige Env pruefen, weil der Launcher sie nirgends druckt:
-    # `grep SGLANG_MOE_EXPERT_STORE_DIR dry_*.log` gibt 0 Treffer, obwohl sie
-    # gesetzt IST. Ein Pruefer, der am falschen Ort misst, meldet Luecken,
-    # die es nicht gibt, und uebersieht die echten.
-    for _g, _e in (("P", env_p), ("D", env_d)):
-        _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
-                       if str(k).startswith("SGLANG_"))
-        log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
-    state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
-    launch_group(spec_d, tree, log, dry)
+    spec_d = None
+    if _early_d is not None:
+        spec_d = _d_early_verdict(_early_d, dc_p)
+    if spec_d is None:
+        spec_d, _ = _d_spec_from(dc_p, "D")
+        state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
+        launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
     _write_state(state)
     register_boot_group(ns.tag, "D", spec_d.pid, log)  # H135b
