@@ -15,18 +15,54 @@ returned.
 The rule: stage r applies the chunked abort ``pp_size - 1 - r`` passes after
 it received the AbortReq. Then every stage launches the same chunks
 (k .. k + pp_size - 2) and stops before the same one. Pure module, desk-testable.
+
+#791C ON THE FORM WITHOUT THE ROW AUTHORITY (NF z30w-park, 29.09. 09:11Z,
+weg2-112-205, 111k prefill in 16k chunks, PP3): the premise above holds in
+WALL time only. Without the row authority every follower receives PP0's
+request list once per pass, in the pass of the SAME index (blocking recv at
+the top of the pass; PP0 forwards before it plans), and continues the chunk
+rank-locally in lockstep -- so every stage reads the AbortReq right before it
+plans the SAME chunk. Measured: PP0 09:11:10, PP1 :13, PP2 :16, each in slot 2
+of the lap, each right before 69888. The static delays 2/1/0 then gave three
+launch sets -- PP0 69888 and 86272, PP1 69888, PP2 none -- and the ring stood
+(PP0 in recv_object[src=2] awaiting the output of chunks PP2 never ran, PP1 in
+recv_object[src=0]). On that form the wire position of the AbortReq IS PP0's
+decision, and the rule is delay 0 on every stage: PP0 launches no chunk after
+it, the followers drain only what PP0 already sent. Under the row authority
+(27B Fix B) the xsn324 delays stay byte for byte: PP0 keeps its countdown and
+the followers follow PP0's forwarded schedule (``follower_row_verdict``).
 """
 from __future__ import annotations
 
 
-def chunked_abort_delay(pp_size: int, pp_rank: int) -> int:
+def chunked_abort_delay(pp_size: int, pp_rank: int, row_authority=None) -> int:
     """Passes stage ``pp_rank`` keeps launching chunks after it received an
     abort for its in-flight chunked request. 0 on a non-PP engine and on the
-    last stage; ``pp_size - 1`` on PP0."""
+    last stage; ``pp_size - 1`` on PP0.
+
+    ``row_authority=False`` (a PP group WITHOUT the #631 row authority: the
+    request wire is pass-aligned, see the module docstring): 0 on EVERY stage
+    -- all stages read the abort before planning the same chunk, so applying
+    it at receipt stops them at the same chunk. ``True`` or ``None`` (not
+    known): the xsn324 delays, unchanged."""
     n = int(pp_size or 1)
-    if n <= 1:
+    if n <= 1 or row_authority is False:
         return 0
     return max(0, n - 1 - int(pp_rank or 0))
+
+
+def row_authority_of(scheduler):
+    """#791C-NF: does the #631 row authority apply on this rank's PP group?
+    ``True``/``False``; ``None`` on a non-PP engine or when it cannot be read
+    -- then the xsn324 rule stands (``chunked_abort_delay``), never a guess."""
+    try:
+        if int(getattr(getattr(scheduler, "ps", None), "pp_size", 1) or 1) <= 1:
+            return None
+        from sglang.srt.weg2 import p_row_authority
+
+        return bool(p_row_authority.applies(scheduler))
+    except Exception:  # noqa: BLE001 - an unreadable form never blocks the abort
+        return None
 
 
 def countdown_step(delay: int) -> tuple:

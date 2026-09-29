@@ -117,9 +117,12 @@ def test_pp0_keeps_the_xsn324_countdown(monkeypatch):
 
 
 def test_without_row_authority_a_follower_keeps_the_xsn324_countdown(monkeypatch):
+    # The method counts down whatever was recorded (the unknown-form fallback);
+    # since #791C-NF `_abort_request_now` records 0 on this form
+    # (test_weg2_pp_chunked_abort_wire_791c_nf_0929.py).
     f, fake, cur, req, sent = _fake(monkeypatch, pp_rank=1, row_authority=False)
     assert _pass(f, fake, cur, _frame(66097))    # delay 1: one more pass
-    assert not _pass(f, fake, cur, _frame(67121)), "the plan-lag form is unchanged"
+    assert not _pass(f, fake, cur, _frame(67121)), "a recorded countdown still counts down"
     assert sent == [RID]
 
 
