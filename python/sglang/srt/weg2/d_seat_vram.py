@@ -1919,14 +1919,62 @@ def _req_tokens(req) -> int:
         getattr(req, "output_ids", None) or ())
 
 
+#: y3j 09291933: the tick found an extend batch its merge had not taken yet
+UNMERGED_MARK = "WEG2 D-MEM-SCHED UNMERGED-EXTEND"
+_UNMERGED_N = [0]
+
+
+def _unmerged_extend(sched, running) -> list:
+    """The requests of the extend batch that ran last and is not merged yet.
+
+    The tick runs at the top of ``get_next_batch_to_run``, BEFORE the merge
+    of ``last_batch`` into the running batch. After every extend its
+    requests are in neither the running batch nor the queue, so the census
+    read them as gone: y3j 09291933 D 20:02:20 -- the wake's extend held
+    weg2-27-76 (23168) and the needle weg2-40-151 (64072), the tick saw
+    used=0, an END event and a pending shrink to S0 (cap 32768) while live
+    pages reached 87296; the bs2 decode found no page below the cap, the
+    retraction emptied the batch (solo-OOM on the last) and the pressure
+    park left the needle behind the older agent turn until its client gave
+    up (MISS, empty answer). The same shape at 19:41:57 and 19:43:52.
+    Replicated like the rest of the census: every D rank ran the same batch."""
+    last = getattr(sched, "last_batch", None)
+    mode = getattr(last, "forward_mode", None)
+    if last is None or mode is None or not mode.is_extend():
+        return []
+    have = {id(r) for r in running}
+    out = []
+    for r in list(getattr(last, "reqs", None) or ()):
+        if id(r) in have:
+            continue
+        fin = getattr(r, "finished", None)
+        if callable(fin) and fin():
+            continue
+        out.append(r)
+        have.add(id(r))
+    return out
+
+
 def global_demand(sched) -> Tuple[int, int, frozenset]:
     """REPLICATED (27B condition 2): the tokens the running requests hold,
     the tokens the queue head wants, the running rids -- the request lists
-    are the same on every D rank, the page lists are not (#603)."""
+    are the same on every D rank, the page lists are not (#603). The
+    requests of an extend batch the merge has not taken yet run too."""
     running = list(getattr(getattr(sched, "running_batch", None), "reqs", None) or ())
     chunked = getattr(sched, "chunked_req", None)
     if chunked is not None and all(chunked is not r for r in running):
         running.append(chunked)
+    extra = _unmerged_extend(sched, running)
+    if extra:
+        running.extend(extra)
+        _UNMERGED_N[0] += 1
+        n = _UNMERGED_N[0]
+        if n <= 20 or n % 200 == 0:
+            logger.info(
+                "%s n=%d rids=%s tokens=%d -- the extend batch that ran last is not merged "
+                "yet at this tick: its requests hold their pages (no end event, no shrink "
+                "below them)", UNMERGED_MARK, n, [str(getattr(r, "rid", ""))[:16] for r in extra],
+                sum(_req_tokens(r) for r in extra))
     used = sum(_req_tokens(r) for r in running)
     queue = getattr(sched, "waiting_queue", None) or ()
     incoming = _req_tokens(queue[0]) if len(queue) else 0
