@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 STATE_ATTR = "_weg2_park_window"
 #: the marginal cost (ms) of the extends this gate admitted in the current pass
 PASS_ATTR = "_weg2_park_window_pass_ms"
+#: per request: how often the gate held it back, and since when (instrument only)
+REQ_DEFERS_ATTR = "_weg2_pw_defers"
+REQ_SINCE_ATTR = "_weg2_pw_since"
+#: rankstats: the longest a held request waited before its admission (ms)
+HOLD_MAX_ATTR = "_weg2_park_window_hold_max_ms"
 
 
 def extend_ms(line: dict, new_tokens: int, prefix_tokens: int) -> float:
@@ -79,7 +84,10 @@ def front_message(sent: Optional[tuple], *, epoch: int, left_ms: int,
     if (sent is not None and sent[0] == int(epoch) and sent[2] == key
             and int(sent[1]) - int(left_ms) < RESEND_MS):
         return None, sent
-    body = {"epoch": int(epoch), "left_ms": int(left_ms), "a_ms": key[0], "b_ms": key[1], "c_ms": key[2]}
+    # 27B review (c): D reads no clock, the window it applies is at most one
+    # resend step old -- so the front sends it pessimistic by that step
+    body = {"epoch": int(epoch), "left_ms": max(0, int(left_ms) - RESEND_MS),
+            "a_ms": key[0], "b_ms": key[1], "c_ms": key[2]}
     return body, (int(epoch), int(left_ms), key)
 
 
@@ -104,7 +112,27 @@ def note(sched, recv_req) -> None:
 def clear(sched, why: str) -> None:
     if getattr(sched, STATE_ATTR, None) is not None:
         setattr(sched, STATE_ATTR, None)
-        logger.info("WEG2 PARK-WINDOW-GATE clear why=%s", why)
+        logger.info("WEG2 PARK-WINDOW-GATE clear why=%s defers_total=%d hold_max_ms=%d", why,
+                    int(getattr(sched, "_weg2_park_window_defer_n", 0) or 0),
+                    int(getattr(sched, HOLD_MAX_ATTR, 0) or 0))
+
+
+def _released(sched, req) -> None:
+    """A request the gate held before is admitted: name its defers and its
+    hold (27B review (b): hunger is accepted -- after FIRE comes P, the resume
+    stands first after the wake; the hard bound is the existing 60-s wait
+    bound). The clock is the instrument's, never the verdict's."""
+    n = int(getattr(req, REQ_DEFERS_ATTR, 0) or 0)
+    if not n:
+        return
+    import time as _time
+
+    held_ms = (_time.monotonic() - float(getattr(req, REQ_SINCE_ATTR, _time.monotonic()))) * 1000.0
+    setattr(sched, HOLD_MAX_ATTR, max(float(getattr(sched, HOLD_MAX_ATTR, 0.0) or 0.0), held_ms))
+    logger.info("WEG2 PARK-WINDOW-GATE released rid=%s defers=%d held_ms=%.0f window=%s",
+                str(getattr(req, "rid", "?"))[:16], n, held_ms,
+                "open" if getattr(sched, STATE_ATTR, None) is not None else "cleared")
+    setattr(req, REQ_DEFERS_ATTR, 0)
 
 
 def defers(sched, req, *, uncached: int, prefix_tokens: int, batch_empty: bool,
@@ -113,15 +141,33 @@ def defers(sched, req, *, uncached: int, prefix_tokens: int, batch_empty: bool,
     Inert without a window -- the stock admission, byte for byte."""
     window = getattr(sched, STATE_ATTR, None)
     if window is None:
+        _released(sched, req)
         return False
     if batch_empty:
         setattr(sched, PASS_ATTR, 0.0)
     batch_ms = float(getattr(sched, PASS_ATTR, 0.0) or 0.0)
+    if int(uncached) <= 0:
+        # 27B review (a): no extend forward (TAIL-READY / E2 skip, nothing
+        # uncached) -- no a, no marginal cost; it never delays the park
+        _released(sched, req)
+        return False
     ok, cost = admits(window, new_tokens=uncached, prefix_tokens=prefix_tokens,
                       batch_ms=batch_ms, running_n=running_n)
     if ok:
         setattr(sched, PASS_ATTR, batch_ms + extend_ms(window, uncached, prefix_tokens))
+        _released(sched, req)
         return False
+    if not getattr(req, REQ_DEFERS_ATTR, 0):
+        import time as _time
+
+        try:
+            setattr(req, REQ_SINCE_ATTR, _time.monotonic())
+        except AttributeError:  # a slotted stand-in: no instrument
+            pass
+    try:
+        setattr(req, REQ_DEFERS_ATTR, int(getattr(req, REQ_DEFERS_ATTR, 0) or 0) + 1)
+    except AttributeError:
+        pass
     n = getattr(sched, "_weg2_park_window_defer_n", 0) + 1
     sched._weg2_park_window_defer_n = n
     if n <= 8 or n % 64 == 0:
