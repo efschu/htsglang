@@ -2293,6 +2293,13 @@ class Envs:
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
     SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO = EnvFloat(0.9)
+    # 29.09. (27B S1 dkr27browauthoritynopinbar1fs09291638, flip 13->14 7,05 s): the L3 cap eviction ran INSIDE
+    # reserve() on the backup thread -- one run from the cap down to cap x ratio (6.3 GB, ~170k unlinks, 4.8 s) --
+    # and the sleep flush's #1068 RESET JOIN waited for it. On: reserve() evicts only what ITS write needs, and a
+    # background thread "l3_evictor" (never in the RESET JOIN set) brings the directory down to cap x ratio in
+    # short lock-held batches, woken once the directory passes the midpoint between ratio and the cap.
+    # Off (default until the first series): byte-identical, the whole run stays in reserve().
+    SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
     # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)

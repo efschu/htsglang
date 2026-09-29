@@ -99,6 +99,16 @@ def _l3p_inheritance_from_env() -> Tuple[float, Tuple[str, ...]]:
 # rate-limited emitter that prints no suppressed count turns a throttle into
 # an apparent zero).
 _EVICT_LOG_INTERVAL_S = 10.0
+#: EVICT_OFFPATH: a lock-held batch of the background evictor ends after this many victims OR this much lock
+#: time, whichever comes first (~28 us per unlink on the rig's L3, S1 29.09.: 6.3 GB / ~170k files in 4.8 s).
+#: A reserve()/commit() behind it waits one batch -- at most one unlink past the time bound -- never a run.
+_BG_EVICT_BATCH = 256
+
+
+class Weg2L3EvictorPauseRefused(RuntimeError):
+    """NF review 3 (B): the background L3 evictor could not be parked at the sleep entry (named stop)."""
+
+_BG_EVICT_BATCH_S = 0.005
 # Above this, a wake re-scan says so. A PRICE TAG, NOT A BOUND: crossing it
 # changes nothing about the scan (see ``rescan`` on why a deadline here would
 # make a rank-uniform verdict depend on wall clock).
@@ -364,6 +374,21 @@ class LRUFileEvictor:
         self._min_free_refusals: int = 0
         self._last_evict_log = 0.0
         self._evict_runs_suppressed = 0
+        # EVICT_OFFPATH (29.09.): the bulk eviction leaves reserve() for a thread no reset joins (see environ).
+        self._evict_offpath = bool(envs.SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH.get())
+        self._bg_evict_event = threading.Event()
+        self._bg_evict_thread: Optional[threading.Thread] = None
+        self._bg_evict_runs = 0
+        self._bg_evict_reclaimed = 0
+        self._last_bg_evict_log = 0.0
+        # NF review 2 (29.09.): pause/drain/resume. _bg_cv guards _bg_paused/_bg_busy; a batch starts only while
+        # not paused, and drain() returns once no batch is running -- so a paused evictor touches nothing.
+        self._bg_cv = threading.Condition()
+        # NF review 3 (A): holds by reason, not one bool -- a transient walk hold ("walk", "seed") must not lift
+        # the sleep hold ("dormant"); the evictor runs only while NO hold is set. "dormant" is a flag (set at the
+        # sleep entry, cleared only by the wake rescan); the others count (nested walks).
+        self._bg_holds: dict = {}
+        self._bg_busy = False
 
         self._load_config(extra_config or {})
 
@@ -907,9 +932,22 @@ class LRUFileEvictor:
                     # own. Evicting its whole index would cost the cache and
                     # buy nothing, so refuse first and keep the pages.
                     return self._refuse_cap_unholdable_locked(value_bytes, key)
-                self._evict_locked(value_bytes)
+                if self._evict_offpath:
+                    # Only what THIS write needs, down to the cap itself -- the rest of the way to cap x ratio is
+                    # the background evictor's, off the thread the flush joins.
+                    self._evict_locked(value_bytes,
+                                       target=max(0, self.max_size_bytes - value_bytes))
+                    self._kick_bg_evictor_locked()
+                else:
+                    self._evict_locked(value_bytes)
                 if (self._directory_bytes_locked() + value_bytes) > self.max_size_bytes:
                     return self._refuse_cap_unholdable_locked(value_bytes, key)
+            elif self._evict_offpath and self.max_size_bytes > 0 and (
+                self._directory_bytes_locked() + value_bytes
+            ) > self._bg_evict_high_mark_locked():
+                # Past the midpoint between cap x ratio and the cap: start the background run early, so a write
+                # rarely meets the cap at all.
+                self._kick_bg_evictor_locked()
             # Free-space watermark.
             if self.min_free_bytes > 0 and not self._enforce_free_space_locked(
                 value_bytes
@@ -1077,6 +1115,16 @@ class LRUFileEvictor:
 
     def clear(self) -> None:
         """Reset all bookkeeping after the backend has removed the files."""
+        # NF review 2/3: a transient walk hold (the backend took a "clear" hold before its removal, released here);
+        # the sleep hold stays -- a clear during dormancy must not wake the sleeping owner's evictor
+        self.pause_background_eviction(reason="walk")
+        try:
+            self._clear_impl()
+        finally:
+            self.resume_background_eviction(reason="walk")
+            self.resume_background_eviction(reason="clear")  # the backend's hold, taken before its removal
+
+    def _clear_impl(self) -> None:
         with self._lock:
             self._lru.clear()
             self._pending_writes.clear()
@@ -1472,6 +1520,20 @@ class LRUFileEvictor:
         """
         if not self._eviction_enabled:
             return self.index_coverage()
+        # NF review 2: no background unlink between the snapshot/read_delta and the install -- the walk and the
+        # journal read run without _lock, and a file the walk saw and the evictor then removed would come back as
+        # a phantom entry (presence says "there", prefetch hits ENOENT, _total_bytes too high -> over-eviction).
+        self.pause_background_eviction(reason="walk")
+        try:
+            return self._rescan_impl()
+        finally:
+            # the wake rescan is the one place the sleep hold ends (NF review 3 A), after the install.
+            # NF review 4 (1): it ends here even when _rescan_impl raises -- accepted, because a failed wake rescan
+            # stops the group anyway (W4 Weg2WakeRefused via the C15 ok-bit), so no dormant owner is left evicting.
+            self.resume_background_eviction(reason="dormant")
+            self.resume_background_eviction(reason="walk")
+
+    def _rescan_impl(self) -> dict:
         t0 = time.monotonic()
         if self._journal_reader is not None and _sj.enabled():
             recs, nbytes = self._journal_reader.read_delta()
@@ -1856,7 +1918,150 @@ class LRUFileEvictor:
             attempts_left = len(self._lru)
         return reclaimed
 
-    def _evict_locked(self, needed_bytes: int) -> None:
+    def _bg_evict_high_mark_locked(self) -> int:
+        """EVICT_OFFPATH wake mark: halfway between cap x ratio and the cap."""
+        low = int(self.max_size_bytes * self.eviction_ratio)
+        return low + (self.max_size_bytes - low) // 2
+
+    def _kick_bg_evictor_locked(self) -> None:
+        """EVICT_OFFPATH: wake (and on first use start) the background evictor. Caller holds ``_lock``."""
+        if self._bg_evict_thread is None or not self._bg_evict_thread.is_alive():
+            self._bg_evict_thread = threading.Thread(
+                target=self._bg_evictor_loop, name="l3_evictor", daemon=True)
+            self._bg_evict_thread.start()
+        self._bg_evict_event.set()
+
+    @property
+    def _bg_paused(self) -> bool:
+        return any(v > 0 for v in self._bg_holds.values())
+
+    def pause_background_eviction(self, timeout: Optional[float] = None, reason: str = "walk") -> bool:
+        """NF review 2: stop the background evictor at a batch boundary and wait until it is parked.
+
+        Called at the sleep entry BEFORE the dormant marker (the sleeping group must not unlink on a store its
+        sibling is about to own -- ``rescan``'s docstring rules out two owners evicting at once) and at the start
+        of ``rescan``/``clear`` (their walk / journal read run without ``_lock`` and must not see a file vanish
+        between snapshot and install). Returns True once no batch runs. No-op (True) without the thread.
+        """
+        with self._bg_cv:
+            if reason == "dormant":
+                self._bg_holds["dormant"] = 1
+            else:
+                self._bg_holds[reason] = self._bg_holds.get(reason, 0) + 1
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while self._bg_busy:
+                left = None if deadline is None else deadline - time.monotonic()
+                if left is not None and left <= 0:
+                    return False
+                self._bg_cv.wait(left)
+        return True
+
+    def resume_background_eviction(self, reason: str = "walk") -> None:
+        """NF review 2/3: lift ONE hold of ``reason`` (``"dormant"`` clears the sleep hold -- only the wake rescan
+        does that); the evictor runs again once no hold is left, re-kicked when the directory is still past the
+        wake mark, since a kick during the pause may have been consumed."""
+        with self._bg_cv:
+            was = self._bg_paused
+            if reason == "dormant":
+                self._bg_holds.pop("dormant", None)
+            elif self._bg_holds.get(reason, 0) > 0:
+                self._bg_holds[reason] -= 1
+            now_free = was and not self._bg_paused
+            self._bg_cv.notify_all()
+        if now_free and self._evict_offpath and self._bg_evict_thread is not None:
+            with self._lock:
+                if self.max_size_bytes > 0 and self._directory_bytes_locked() > self._bg_evict_high_mark_locked():
+                    self._kick_bg_evictor_locked()
+
+    def pause_for_sleep(self, timeout: float = 10.0) -> None:
+        """NF review 3 (B): the SLEEP hold, before the dormant marker. Without the background thread a no-op; with
+        it, a drain that does not complete within ``timeout`` is a NAMED stop (:class:`Weg2L3EvictorPauseRefused`)
+        -- the group must not go dormant while its evictor may still unlink on the store its sibling takes over."""
+        if self._bg_evict_thread is None:
+            with self._bg_cv:
+                self._bg_holds["dormant"] = 1  # a later first kick parks at once
+            return
+        if not self.pause_background_eviction(timeout=timeout, reason="dormant"):
+            raise Weg2L3EvictorPauseRefused(
+                f"W-L3E Weg2L3EvictorPauseRefused: the background L3 evictor on {self.file_path!r} did not park "
+                f"within {timeout:.1f} s at the sleep entry (a batch still unlinking); the group does not go "
+                f"dormant with its evictor live on the store the sibling group owns next"
+            )
+
+    def _bg_evictor_loop(self) -> None:
+        """EVICT_OFFPATH: bring the directory down to cap x ratio in batches of ``_BG_EVICT_BATCH`` victims.
+
+        Each victim goes through the SAME ``_evict_one_lru_locked`` under the SAME ``_lock`` as before -- index,
+        l3_index, on_evict and the journal ``E`` line change together with the unlink, so no reader is ever handed
+        an index entry whose file this loop removed without it. The lock is dropped between batches, so a
+        ``reserve()`` (the backup thread the #1068 RESET JOIN waits for) waits at most one batch.
+        """
+        while True:
+            self._bg_evict_event.wait()
+            self._bg_evict_event.clear()
+            t0, reclaimed, before = time.monotonic(), 0, None
+            while True:
+                with self._bg_cv:
+                    while self._bg_paused:
+                        self._bg_cv.wait()
+                    self._bg_busy = True
+                try:
+                    step = self._bg_evict_batch(before)
+                finally:
+                    with self._bg_cv:
+                        self._bg_busy = False
+                        self._bg_cv.notify_all()
+                if step is None:
+                    break
+                before, got, stuck = step
+                reclaimed += got
+                if stuck:
+                    break  # nothing evictable left (pending / sibling / pinned): the cap path names it
+                time.sleep(0)  # let a waiting reserve() take the lock between batches
+            if before is None:
+                continue
+            self._bg_evict_report(t0, reclaimed, before)
+
+    def _bg_evict_batch(self, before: Optional[int]):
+        """One lock-held batch; None when the directory is at or under cap x ratio, else
+        ``(before, reclaimed, stuck)``."""
+        with self._lock:
+            if self.max_size_bytes <= 0:
+                return None
+            target = int(self.max_size_bytes * self.eviction_ratio)
+            cur = self._directory_bytes_locked()
+            if before is None:
+                before = cur
+            if cur <= target:
+                return None
+            n, t_b = [0], time.monotonic()
+
+            def more(_r, n=n, target=target, t_b=t_b):
+                n[0] += 1
+                return (n[0] == 1 or (n[0] <= _BG_EVICT_BATCH
+                                      and time.monotonic() - t_b < _BG_EVICT_BATCH_S)) \
+                    and self._directory_bytes_locked() > target
+
+            got = self._evict_while(more)
+            return before, got, (got == 0 and self._directory_bytes_locked() > target)
+
+    def _bg_evict_report(self, t0: float, reclaimed: int, before: int) -> None:
+        with self._lock:
+            self._bg_evict_runs += 1
+            self._bg_evict_reclaimed += reclaimed
+            after = self._directory_bytes_locked()
+            now = time.monotonic()
+            if (now - self._last_bg_evict_log) < _EVICT_LOG_INTERVAL_S:
+                return
+            self._last_bg_evict_log = now
+        logger.info(
+            f"HiCacheFile EVICTION-BG on {self.file_path!r}: reclaimed {reclaimed} B in "
+            f"{(time.monotonic() - t0) * 1000:.0f} ms (batches <= {_BG_EVICT_BATCH} or {_BG_EVICT_BATCH_S * 1000:.0f} ms, off the reset-joined "
+            f"threads); directory {before} -> {after} B toward cap {self.max_size_bytes} B x ratio "
+            f"{self.eviction_ratio:.2f}; runs {self._bg_evict_runs}, total {self._bg_evict_reclaimed} B"
+        )
+
+    def _evict_locked(self, needed_bytes: int, target: Optional[int] = None) -> None:
         """Evict LRU entries until DIRECTORY + needed <= cap*ratio.
 
         Caller holds _lock. #1295: the low-water mark is measured over the
@@ -1872,7 +2077,8 @@ class LRUFileEvictor:
         """
         if self.max_size_bytes <= 0:
             return
-        target = max(0, int(self.max_size_bytes * self.eviction_ratio) - needed_bytes)
+        if target is None:
+            target = max(0, int(self.max_size_bytes * self.eviction_ratio) - needed_bytes)
         before = self._directory_bytes_locked()
         reclaimed = self._evict_while(lambda _: self._directory_bytes_locked() > target)
         # EXECUTION PROOF AT INFO, not debug. On the boot of record the only

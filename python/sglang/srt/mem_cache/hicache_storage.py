@@ -2113,8 +2113,22 @@ class HiCacheFile(HiCacheStorage):
                 self._evictor.abort(suffixed)
             return False
 
+    def pause_background_eviction(self) -> None:
+        """L3 evict off-path (NF review 2/3): the SLEEP hold -- park the background evictor before this group sleeps
+        (the sibling owns the store from its wake on; two owners never evict at once, ``rescan``). Lifted only by
+        the wake's ``rescan_eviction_index``. No-op without the evictor thread; a drain that does not complete is
+        the named stop ``Weg2L3EvictorPauseRefused`` (raised, never swallowed)."""
+        _sleep = getattr(self._evictor, "pause_for_sleep", None)
+        if _sleep is not None:
+            _sleep()
+
     def rescan_eviction_index(self) -> dict:
         """Re-read the store directory into the LRU index (Weg 2 wake path).
+
+        ONE CALLER ONLY (NF review 4 (2)): the wake path, ``SchedulerWeightUpdaterManager._weg2_rescan_store_index``
+        (weight_updater, resume_memory_occupation). With SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH on, this call is
+        also what lifts the background evictor's SLEEP hold; a second caller during dormancy would lift it too and
+        let the sleeping owner evict on the store its sibling owns.
 
         Called when this group wakes. Two groups share one directory and only
         one of them is awake at a time, so the sibling's writes accumulated
@@ -3430,11 +3444,26 @@ class HiCacheFile(HiCacheStorage):
                     # (PREFETCH_CLAIM_REDUCE_BOUND_S), and a 150 GB store is
                     # ~2 M files. Queries before the seed completes see
                     # misses only (the index is an accelerator).
-                    threading.Thread(target=self._l3p_seed_index, args=(idx,),
+                    # NF review 3 (C): no background unlink during the seed walk (a stem the walk listed and the
+                    # evictor then removed would be added back as a phantom); held here, BEFORE the thread and
+                    # any first reserve(), released in the seed's finally
+                    _pause = getattr(self._evictor, "pause_background_eviction", None)
+                    if _pause is not None:
+                        _pause(reason="seed")
+                    threading.Thread(target=self._l3p_seed_index_held, args=(idx,),
                                name="l3p-index-seed", daemon=True).start()
         except Exception as exc:  # noqa: BLE001
             logger.warning("#1459 L3-INDEX n/a (%s: %s)", type(exc).__name__, exc)
         return idx
+
+    def _l3p_seed_index_held(self, idx) -> int:
+        """``_l3p_seed_index`` under the evictor's "seed" hold (taken by the caller), released however it ends."""
+        try:
+            return self._l3p_seed_index(idx)
+        finally:
+            _resume = getattr(self._evictor, "resume_background_eviction", None)
+            if _resume is not None:
+                _resume(reason="seed")
 
     def _l3p_seed_index(self, idx) -> int:
         """L3P: a freshly CREATED index starts empty, and "a stem missing here
@@ -4364,6 +4393,10 @@ class HiCacheFile(HiCacheStorage):
                 self.file_path,
             )
             return False
+        # NF review 2 (L3 evict off-path): no background unlink races this walk (evictor.clear resumes it)
+        _pause = getattr(self._evictor, "pause_background_eviction", None)
+        if _pause is not None:
+            _pause(reason="clear")  # released by evictor.clear()
         _idx = self._l3_index()
         if _idx is not None:
             _idx.clear()  # #1459
