@@ -5250,15 +5250,44 @@ def read_measured_record(
     Qwen3.8-27B boot the Next-Flash boot fnFL2x142's D residue and run sample
     (xsn417). ``None`` (every caller before the form) keeps today's answer.
     """
+    out: Dict[str, dict] = {}
+    for g, e in _measured_entries(path, boot_tag, accept):
+        if g not in out or str(e.get("at", "")) >= str(out[g].get("at", "")):
+            out[g] = e
+    return out
+
+
+def read_measured_records(
+    path: str,
+    group: str,
+    accept: Optional[Callable[[dict], bool]] = None,
+) -> List[dict]:
+    """EVERY entry of one group from the sidecar, oldest first, through the
+    same filter as :func:`read_measured_record` (entry shape, calibration
+    identity ``accept``). A malformed or missing file is an ABSENCE: ``[]``.
+
+    D-EXPECT (29.09.): the D expectation budget prices group P's dormant VRAM
+    residue as the MAXIMUM over the newest boots, not the newest one -- a
+    lucky low sample must not size the D form too large (27B review)."""
+    rows = [e for g, e in _measured_entries(path, None, accept) if g == str(group)]
+    rows.sort(key=lambda e: str(e.get("at", "")))
+    return rows
+
+
+def _measured_entries(
+    path: str,
+    boot_tag: Optional[str],
+    accept: Optional[Callable[[dict], bool]],
+):
+    """The one filter loop of the sidecar readers: ``(group, entry)`` pairs."""
     try:
         with open(path) as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return {}
+        return
     entries = data.get("samples") if isinstance(data, dict) else None
     if not isinstance(entries, list):
-        return {}
-    out: Dict[str, dict] = {}
+        return
     for e in entries:
         # #1350: TWO ENTRY SHAPES, ONE READER. An image entry carries
         # `rss_shmem_gib`; the flip-ratchet entry (group "FLIP", written by the
@@ -5286,9 +5315,7 @@ def read_measured_record(
             continue
         if accept is not None and not accept(e):
             continue
-        if g not in out or str(e.get("at", "")) >= str(out[g].get("at", "")):
-            out[g] = e
-    return out
+        yield g, e
 
 
 #: #1377 W11: where the v3 sampler's CSV is, published by whoever ARMS the
