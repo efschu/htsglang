@@ -1202,6 +1202,49 @@ RATE_LATCH_CUSHION_RELEVANCE_GIB = 32.0
 RATE_LATCH_FREE_POOL_GIB = 3.0
 
 
+def latch_free_pool(
+    pr: Dict[str, Optional[float]],
+) -> Tuple[Optional[float], str, Optional[float]]:
+    """W98 z30w (29.09.): WHICH free pool absorbs the next write, and the ceiling.
+
+    Returns ``(free_gib, source, ceiling_gib)`` for :meth:`RateLatch.observe`.
+
+    CT999 (LXC, ``memory.max`` reads ``max``): ``/proc/meminfo`` is lxcfs, i.e.
+    the container's own view, and ``MemFree`` is the pool fnFL2 v14 was
+    calibrated on -- unchanged, and there is no cgroup ceiling to price.
+
+    DOCKER (``--memory 84g``: a finite ``memory.max``): ``/proc/meminfo`` is the
+    HOST's, and its ``MemFree`` counts neither the room left under this
+    cgroup's own ceiling nor the page cache of FOREIGN cgroups the kernel
+    reclaims globally before any OOM. Boot z30w-park 1 (08:22:13Z) was torn
+    down on exactly that reading: host MemFree < 3 GiB (34 at launch against 58
+    on z30u, the difference foreign page cache while MemAvailable stayed above
+    100), nonreclaim 64.28 under an 84 GiB ceiling -- ~19.7 GiB of real room.
+    Here the pool is the SMALLER of the cgroup's room (``memory.max -
+    memory.current``, what a charge can take before cgroup reclaim starts) and
+    the host's ``MemAvailable`` (what global reclaim can still hand out), and
+    the ceiling is ``memory.max``: a cgroup OOM fires there, whatever the host
+    mark says.
+    """
+    ceiling = pr.get("max_gib")
+    if ceiling is None:
+        return pr.get("memfree_gib"), "MemFree", None
+    cur = pr.get("current_gib")
+    pools = []
+    if cur is not None:
+        pools.append(float(ceiling) - float(cur))
+    avail = pr.get("memavail_gib")
+    if avail is not None:
+        pools.append(float(avail))
+    if not pools:
+        return pr.get("memfree_gib"), "MemFree", float(ceiling)
+    return (
+        min(pools),
+        "min(cgroup room memory.max-memory.current, host MemAvailable)",
+        float(ceiling),
+    )
+
+
 def launch_moment_peak_gib(
     anon_load_peak_gib: float,
     ring_fill_gib: float,
@@ -1382,12 +1425,19 @@ class RateLatch:
         cushion_gib: Optional[float] = None,
         shmem_gib: Optional[float] = None,
         free_gib: Optional[float] = None,
+        ceiling_gib: Optional[float] = None,
+        free_source: str = "MemFree",
     ) -> Optional[str]:
         """#1361b: the CUSHION test replaces the remaining-bytes one, measured.
 
         ``free_gib`` (MemFree): free pages absorb a write before the page
         cache does; at or above RATE_LATCH_FREE_POOL_GIB the cushion reading
         is noted once and never latched (fnFL2 v14).
+
+        ``ceiling_gib`` / ``free_source`` (W98 z30w): a finite cgroup
+        ``memory.max`` caps the mark the headroom is taken against, and the pool
+        is the one :func:`latch_free_pool` names -- ``None`` keeps the CT999 form
+        (the recorded host mark, lxcfs MemFree) byte for byte.
 
         ``remaining_leg_gib`` IS DELETED, not left beside this -- a parameter
         that no longer decides anything is the present-but-unwired state this
@@ -1445,7 +1495,14 @@ class RateLatch:
             )
             if shmem_gib is not None:
                 self._last_shmem = float(shmem_gib)
-            headroom = self.reap_mark_gib - float(nonreclaim_gib)
+            # W98 z30w: inside a finite cgroup the cgroup OOM fires at
+            # memory.max, below the recorded host mark (84 vs 95.90 in the
+            # Docker form); pricing headroom against the host mark over-states
+            # it by the difference.
+            mark = self.reap_mark_gib
+            if ceiling_gib is not None and float(ceiling_gib) < mark:
+                mark = float(ceiling_gib)
+            headroom = mark - float(nonreclaim_gib)
             if rising and float(cushion_gib) < RATE_LATCH_CUSHION_FLOOR_GIB:
                 if free_gib is not None and float(free_gib) >= RATE_LATCH_FREE_POOL_GIB:
                     if not self._free_pool_noted:
@@ -1454,9 +1511,9 @@ class RateLatch:
                             f"WEG2-HOST CUSHION-BELOW-FLOOR FREE-POOL-ABSORBS: cushion="
                             f"{float(cushion_gib):.2f} GiB < floor "
                             f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} while shmem rises "
-                            f"(shmem={float(shmem_gib):.2f}) but MemFree={float(free_gib):.2f} "
+                            f"(shmem={float(shmem_gib):.2f}) but {free_source}={float(free_gib):.2f} "
                             f"GiB >= {RATE_LATCH_FREE_POOL_GIB:.2f} (now={nonreclaim_gib:.2f}, "
-                            f"mark={self.reap_mark_gib:.2f}, headroom={headroom:.2f}) -- the "
+                            f"mark={mark:.2f}, headroom={headroom:.2f}) -- the "
                             f"next write lands in free pages, not in a page cache the shared "
                             f"expert store (tmpfs) has already displaced (fnFL2 v14 was torn "
                             f"down on this reading); printed once"
@@ -1474,7 +1531,7 @@ class RateLatch:
                         f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} while shmem rises "
                         f"(shmem={float(shmem_gib):.2f}) but headroom="
                         f"{headroom:.2f} GiB (now={nonreclaim_gib:.2f}, mark="
-                        f"{self.reap_mark_gib:.2f}) is ABOVE the relevance bound "
+                        f"{mark:.2f}) is ABOVE the relevance bound "
                         f"{RATE_LATCH_CUSHION_RELEVANCE_GIB:.2f} -- the free pool, "
                         f"not the page cache, absorbs the next write here "
                         f"(weg2xsn65 was torn down on exactly this reading, "
@@ -4634,7 +4691,9 @@ def read_flip_currency_gib(root: str = "/sys/fs/cgroup") -> Optional[float]:
     return total / GIB
 
 
-def read_cgroup_pressure(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[float]]:
+def read_cgroup_pressure(
+    root: str = "/sys/fs/cgroup", meminfo_path: str = "/proc/meminfo",
+) -> Dict[str, Optional[float]]:
     """NON-RECLAIMABLE PRESSURE in GiB, with the raw reading beside it.
 
     #1269 fix 3 -- the defect that refused boot weg2sb5b 28 GiB below danger.
@@ -4677,16 +4736,30 @@ def read_cgroup_pressure(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[flo
         "anon_gib": None,
         "shmem_gib": None,
         "memfree_gib": None,
+        # W98 z30w: MemAvailable and a finite memory.max feed latch_free_pool;
+        # memory.max 'max' (CT999) stays None, so that form is unchanged.
+        "memavail_gib": None,
+        "max_gib": None,
         "source": None,
     }
     st: Dict[str, int] = {}
     try:
-        with open("/proc/meminfo") as f:
+        with open(meminfo_path) as f:
             for line in f:
                 if line.startswith("MemFree:"):
                     out["memfree_gib"] = int(line.split()[1]) * 1024 / GIB
+                elif line.startswith("MemAvailable:"):
+                    out["memavail_gib"] = int(line.split()[1]) * 1024 / GIB
+                if out["memfree_gib"] is not None and out["memavail_gib"] is not None:
                     break
     except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open(f"{root}/memory.max") as f:
+            raw = f.read().strip()
+        if raw.isdigit():
+            out["max_gib"] = int(raw) / GIB
+    except OSError:
         pass
     try:
         with open(f"{root}/memory.stat") as f:

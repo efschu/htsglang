@@ -11064,6 +11064,9 @@ class LaunchGuard:
                 nr = pr.get("nonreclaim_gib")
                 if nr is not None:
                     f, sh = pr.get("file_gib"), pr.get("shmem_gib")
+                    # W98 z30w: in the Docker form /proc/meminfo is the HOST's;
+                    # the pool and the ceiling come from this cgroup.
+                    free, free_src, ceiling = host_ledger.latch_free_pool(pr)
                     line = self._latch.observe(
                         time.time(), float(nr),
                         cushion_gib=(
@@ -11071,7 +11074,9 @@ class LaunchGuard:
                             else float(f) - float(sh)
                         ),
                         shmem_gib=None if sh is None else float(sh),
-                        free_gib=pr.get("memfree_gib"),
+                        free_gib=free,
+                        ceiling_gib=ceiling,
+                        free_source=free_src,
                     )
                     self.ticks += 1
                     if line is not None:
