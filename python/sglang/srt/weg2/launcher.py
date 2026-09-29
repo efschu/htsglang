@@ -17302,6 +17302,12 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     n = len(list(budgets_d))
     fehlend: List[str] = []
 
+    def _plan_without_solve() -> None:
+        # M1: a pass whose solve does not run (27B dense, half geometry, an
+        # unreadable reference) still writes its plan -- the D closure is then
+        # named open, never dropped with the pass.
+        vram_plan_emit(ns, cards, _VRAM_PASS_BY_LABEL.get(label, "d_early"), log, d_label=label)
+
     def _vec(attr: str, name: str):
         raw = str(getattr(ns, attr, "") or "").strip()
         if not raw:
@@ -17388,6 +17394,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     if _skips:
         for _x in _skips:
             log(f"{D_RANK_SOLVE_MARKER} {label}: {_x}")
+        _plan_without_solve()
         return
     luecken: List[str] = []
     ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
@@ -17410,6 +17417,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         log(f"{D_RANK_SOLVE_MARKER} FRACTION-SOLVE {label} ENTFAELLT: "
             f"{', '.join(luecken)} fehlt/passt nicht zu {n} Raengen. Eine "
             f"halbe Geometrie loest nichts (#91), also rechnet hier nichts.")
+        _plan_without_solve()
         return
     # H8: DIE METALLREGELN. Die alte Decke rechnete gegen die KARTE mit
     # ``fraction x Spanne + Scratch`` Zeilen und ohne KV/Aktivierung -- sie
@@ -17527,6 +17535,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         # benannt; die Verweigerung unten kommt nur aus einer GERECHNETEN Bilanz.
         log(f"{D_RANK_SOLVE_MARKER} FRACTION-SOLVE {label} failed: "
             f"{type(_exc).__name__}: {_exc}")
+        _plan_without_solve()
         return
     for line in plan.lines:
         log(line)

@@ -144,11 +144,14 @@ class Idle(CustomTestCase):
 class ArgvBudgets(CustomTestCase):
     """(a) budget_mib per rank == --rank-gpu-memory-mib of the argv, card
     order. Numbers of the 29.09. dry runs on cb98c3d94a + M0 (m1a2 -st-cut z30v,
-    m1y -yarn2); the 27B dry run was refused by W87 (host RAM) before any argv,
-    its P budgets matched the 'budget P' lines."""
+    m1y -yarn2). 27B (x27r on z30x 188b82ec2e, profile 27b.env): the host
+    ledger (W87, host RAM -- not a VRAM post) refuses before any argv, so that
+    run used a fixture that replaces only the host verdict by a stub arm; its
+    budgets and argv are the launcher's own."""
 
     RUNS = {"st-cut": {"P": [28192, 17976, 17704], "D": [26312, 17640, 17640]},
-            "yarn2": {"P": [28176, 18048, 17768], "D": [26344, 17696, 17888]}}
+            "yarn2": {"P": [28176, 18048, 17768], "D": [26344, 17696, 17888]},
+            "27b": {"P": [25280, 14928, 14648], "D": [25920, 15272, 15272]}}
 
     def test_plan_budgets_are_the_argv_budgets(self):
         cards = _cards()
@@ -190,6 +193,34 @@ class Wiring(CustomTestCase):
         self.assertIn("note_p_card(", inspect.getsource(L.p_card_verdict))
         self.assertEqual(set(L._VRAM_PASS_BY_LABEL.values()) | {"p_budget", "d_early"},
                          set(vp.PASSES))
+
+    def test_a_pass_without_solve_still_writes_its_plan(self):
+        # 27B (dense) leaves the D solve at the form gate: the pass must still
+        # write its plan, the D closure named open -- every early return of
+        # the solve's own body goes through _plan_without_solve().
+        src = inspect.getsource(L.log_d_rank_vram_solve)
+        fn = ast.parse(src).body[0]
+
+        def own(node):
+            for ch in ast.iter_child_nodes(node):
+                if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    continue
+                yield ch
+                yield from own(ch)
+
+        # the LRU-floor re-solve returns the recursive call, which emits itself
+        bare = [n for n in own(fn) if isinstance(n, ast.Return) and n.value is None]
+        calls = [n for n in own(fn) if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", "") == "_plan_without_solve"]
+        self.assertTrue(bare)
+        self.assertEqual(len(bare), len(calls))
+        cards = _cards()
+        v = vpv.PlanView()
+        zeros = [{"carve": 0, "floor": 0, "dormant": 0, "awake": 0}] * 3
+        v.note_budget("D(dry, expectation)", cards, [25920, 15272, 15272],
+                      [25920, 15272, 15272], zeros)
+        plan = v.build("dry", cards, d_label="D(dry, expectation)")
+        self.assertTrue(any(o.startswith("D.closure UNMEASURED") for o in plan["open"]))
 
     def test_emit_writes_the_state_dir_and_one_line(self):
         import json
