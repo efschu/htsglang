@@ -164,6 +164,10 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
   background: var(--surface-2); white-space: nowrap; }
 .pill.s-belegt { color: var(--good); } .pill.s-wirkungslos { color: var(--bad); } .pill.s-unbelegt { color: var(--warn); }
 .pill.s-erwartet { color: var(--bar); } .pill.s-unbekannt { color: var(--muted); }
+.pill.f-ja, .pill.f-an { color: var(--good); } .pill.f-nein, .pill.f-aus { color: var(--bad); }
+.pill.f-teilweise { color: var(--warn); } .pill.f-unbekannt { color: var(--muted); }
+tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.gain { white-space: nowrap; } .gain .art { font-size: 11px; color: var(--muted); }
 .imgseat + .imgseat { margin-top: 14px; }
 .imgseat td.ev { color: var(--text-2); font-size: 12px; max-width: 460px; overflow-wrap: anywhere; }
 .note { font-size: 12px; color: var(--text-2); max-width: 900px; }
@@ -201,6 +205,11 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
   <div class="chips" id="chips"></div>
   <div class="cardstrip" id="cardstrip"></div>
   <div id="boots"></div>
+  <section class="card" id="feat-card">
+    <h2>Features <span class="muted">je Modell: fertig &middot; im Image (git-Vorfahr / patch-id / Betreff gegen die Image-REV, hier gerechnet) &middot; aktiv (state.json launch, sonst Profil) &middot; Gewinn &middot; Begr&uuml;ndung wenn aus</span>
+      <label class="muted" style="font-size:12px;float:right"><input type="checkbox" id="feat-only-off"> nur &bdquo;im Image, aber aus&ldquo;</label></h2>
+    <div id="feat"></div>
+  </section>
   <section class="card" id="imgchg-card">
     <h2>Image-&Auml;nderungen <span class="muted">was das laufende Boot-Image je Sitz gegen&uuml;ber seinem Vorg&auml;nger tr&auml;gt, erwartete Wirkung und Stand am Metall</span></h2>
     <div id="imgchg"></div>
@@ -700,6 +709,56 @@ function gpuqHtml(d) {
 }
 
 const IMG_STATUS = ["belegt", "wirkungslos", "unbelegt", "erwartet", "unbekannt"];
+let featOnlyOff = false;
+try { featOnlyOff = localStorage.getItem("rigdash-feat-only-off") === "1"; } catch (e) { /* no storage */ }
+function featPill(v, title) {
+  const st = (v || {}).state || "unbekannt";
+  return `<span class="pill f-${esc(st)}" title="${esc(title || "")}">${esc(st)}</span>`;
+}
+function featImTitle(im) {
+  if (!im) return "";
+  if (im.state === "ja") return `${im.how}: ${im.sha}${im.line_sha ? " = " + im.line_sha + " auf der Image-Linie" : ""}`;
+  return im.detail || "";
+}
+function featAkTitle(ak) {
+  if (!ak) return "";
+  const d = (ak.detail || []).map((x) => `${x.name}${x.gruppe ? " [" + x.gruppe + "]" : ""}: ${x.state} (${x.src}${x.value != null ? ", " + x.value : ""})`);
+  return (ak.note ? ak.note + (d.length ? "\n" : "") : "") + d.join("\n");
+}
+function featGainHtml(g) {
+  if (!g.length) return `<span class="muted">&mdash;</span>`;
+  return g.map((x) => `<div class="gain" title="${esc((x.quelle || "") + (x.boot ? " \u00b7 " + x.boot : ""))}">${esc(x.metrik)}: ${esc(x.vorher != null ? x.vorher + " \u2192 " : "")}<b>${esc(x.nachher)}</b> ${esc(x.einheit || "")} <span class="art">${esc(x.art)}</span></div>`).join("");
+}
+function featHtml(d) {
+  const fv = d.features;
+  if (!fv) return `<div class="muted">keine Daten</div>`;
+  let h = fv.error ? `<div class="err">features.json: ${esc(fv.error)}</div>` : "";
+  if ((fv.problems || []).length) h += `<div class="err">${fv.problems.map(esc).join("<br>")}</div>`;
+  return h + (fv.models || []).map((m) => {
+    const b = m.boot;
+    const head = `<div class="boot-head"><span class="model">${esc(m.model)}</span>`
+      + (b ? (b.rc ? `<span class="badge phase">${esc(b.rc)}</span>` : "")
+        + `<span class="chip mono">REV ${esc(b.rev)}</span>`
+        + `<span class="chip ${b.running ? "ok" : "warn"}">${b.running ? "l&auml;uft (" + esc(b.lifecycle) + ")" : "letzter " + esc(m.model) + "-Boot " + esc(b.rc || b.boot_id) + " (" + esc(b.lifecycle) + ")"}</span>`
+        + `<span class="chip mono" title="Quelle f&uuml;r &bdquo;aktiv&ldquo;">${(b.launch_groups || []).length ? "launch " + esc(b.launch_groups.join("+")) : "Profil " + esc(b.profile)}</span>`
+        : `<span class="chip warn">kein Boot-Zustand</span>`)
+      + (m.git_s != null ? `<span class="chip">git ${esc(m.git_s)} s</span>` : "")
+      + `</div>`;
+    let rows = m.features || [];
+    const nOff = rows.filter((r) => r.image_aber_aus).length;
+    if (featOnlyOff) rows = rows.filter((r) => r.image_aber_aus);
+    if (!rows.length) return `<div class="imgseat">${head}<div class="muted">${featOnlyOff ? "kein Feature im Image, das aus ist" : "keine Features eingetragen"}</div></div>`;
+    return `<div class="imgseat">${head}<div class="muted" style="margin:-4px 0 8px">${(m.features || []).length} Features &middot; ${nOff} im Image, aber aus</div><div class="tablewrap"><table>
+      <tr><th>Feature</th><th>fertig</th><th>im Image</th><th>aktiv</th><th>Gewinn</th><th>Begr&uuml;ndung (wenn aus)</th></tr>`
+      + rows.map((r) => `<tr class="${r.image_aber_aus ? "feat-off" : ""}"><td><b class="mono">${esc(r.id)}</b> ${esc(r.titel)}<div class="muted mono" style="font-size:11px">${(r.zweige || []).map((z) => esc(z.branch) + " @ " + esc((z.sha || "").slice(0, 10))).join("<br>")}</div></td>
+        <td>${r.fertig ? `<span class="pill f-ja">ja</span>` : `<span class="pill f-teilweise">nein</span>`}</td>
+        <td>${featPill(r.im_image, featImTitle(r.im_image))}</td>
+        <td>${featPill(r.aktiv, featAkTitle(r.aktiv))}</td>
+        <td>${featGainHtml(r.gewinn || [])}</td>
+        <td>${r.image_aber_aus ? (r.aus_begruendung ? esc(r.aus_begruendung) : `<span class="err">Begr&uuml;ndung fehlt</span>`) : `<span class="muted">${esc(r.aus_begruendung || "")}</span>`}</td></tr>`).join("")
+      + `</table></div></div>`;
+  }).join("");
+}
 function imgChgHtml(d) {
   const ic = d.image_changes;
   if (!ic) return `<div class="muted">keine Daten</div>`;
@@ -772,6 +831,7 @@ async function refresh() {
     if (!live.length && shown.length) $("boots").insertAdjacentHTML("afterbegin", shown.every(plannedStopped)
       ? `<section class="card" style="border-color:var(--flip)"><b>Kein Modell schreibt gerade Logs</b> <span class="muted">&middot; der letzte Boot wurde geplant gestoppt. Unten seine letzten Zahlen.</span></section>`
       : `<section class="card" style="border-color:var(--bad)"><b style="color:var(--bad)">Kein Modell schreibt gerade Logs.</b> <span class="muted">Unten der zuletzt aktive Boot mit seinen letzten Zahlen.</span></section>`);
+    $("feat").innerHTML = featHtml(d);
     $("imgchg").innerHTML = imgChgHtml(d);
     $("gpus").innerHTML = gpusHtml(d, binders);
     $("containers").innerHTML = containersHtml(d);
@@ -798,6 +858,12 @@ async function refresh() {
 }
 $("gpuqlink").href = `${location.protocol}//${location.hostname}:8770/`;
 $("plannerlink").href = `${location.protocol}//${location.hostname}:8780/`;
+$("feat-only-off").checked = featOnlyOff;
+$("feat-only-off").addEventListener("change", (e) => {
+  featOnlyOff = e.target.checked;
+  try { localStorage.setItem("rigdash-feat-only-off", featOnlyOff ? "1" : "0"); } catch (err) { /* no storage */ }
+  refresh();
+});
 refresh();
 setInterval(refresh, 2000);
 </script>

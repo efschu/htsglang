@@ -20,7 +20,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import energy, health, imagechanges, live, redact, sources, weg2line
+from . import energy, features, health, imagechanges, live, redact, sources, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -146,6 +146,7 @@ class App:
         self.energy = energy.EnergyBook(args.state_dir or None, live.BUCKET_S)
         self.imgchg = imagechanges.ImageChanges(args.image_changes)
         self.imgchg_lock = threading.Lock()
+        self.features = features.Features(args.features, args.features_repo)
         self.stop = threading.Event()
         self.t0 = time.time()
         self.version = _version()
@@ -210,6 +211,7 @@ class App:
             "collector_error": getattr(self.logs, "last_error", None),
             "energy_error": getattr(self, "energy_error", None),
             "image_changes": imagechanges.view(boots, images, img_err, self.imgchg.path),
+            "features": self.features.view(),
             "windows": {"rate_s": live.WINDOW_S, "bucket_s": live.BUCKET_S, "history_s": live.HISTORY_S,
                         "live_s": live.LIVE_S},
         }
@@ -311,6 +313,10 @@ def main(argv=None):
     ap.add_argument("--state-dir", default="", help="keeps the 15-min card history across restarts")
     ap.add_argument("--image-changes", default=imagechanges.DEFAULT_PATH,
                     help="the operator's per-image change list (rev -> fixes, expected gain, metal status)")
+    ap.add_argument("--features", default=features.DEFAULT_PATH,
+                    help="the feature list (built / in image / active / gain; im Image and aktiv are computed here)")
+    ap.add_argument("--features-repo", default=features.DEFAULT_REPO,
+                    help="git repo holding the image revs and feature commits")
     ap.add_argument("--release-profile", action="append", default=[],
                     help="profile name offered by the start-line wizard (repeatable; the unit names the release ones)")
     args = ap.parse_args(argv)

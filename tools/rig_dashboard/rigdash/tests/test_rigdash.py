@@ -1083,8 +1083,12 @@ class ImageChangesTests(unittest.TestCase):
             with open(p, "w") as fh:
                 json.dump({"images": IMAGES}, fh)
             ns = argparse.Namespace(log_glob=[os.path.join(d, "none-*.log")], docker_ssh="", docker_host_prefix="",
-                                    front=[], gpuq="", state_dir="", release_profile=[], image_changes=p)
+                                    front=[], gpuq="", state_dir="", release_profile=[], image_changes=p,
+                                    features=os.path.join(d, "features.json"), features_repo=d)
             app = server.App(ns)
             snap = app.snapshot(with_series=False)
             self.assertEqual(snap["image_changes"], {"path": p, "error": None, "seats": []})
+            # the feature table rides the same snapshot; a missing file is named, never a crash
+            self.assertIn("FileNotFoundError", snap["features"]["error"])
+            self.assertEqual([m["model"] for m in snap["features"]["models"]], ["NF", "27B"])
 
