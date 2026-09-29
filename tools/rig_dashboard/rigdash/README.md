@@ -11,6 +11,15 @@ Ein 27B-Boot führt mit `flip_total`, bis ein 27B-Boot unter der neuen Definitio
 Menschen, keine Steuerung). Umstellen auf `events.jsonl` der Front, sobald die Front die
 Flip-Ereignisse (begin/done/erstes Token) dort schreibt; dann entfällt der Log-Scan.
 
+**Phasenleiste mit echter Arbeitszeit (WACH-OHNE-ARBEIT-0929):** Die Rang-Zeilen kommen zu spät
+(P nach dem Pipeline-Durchlauf, D einen Pass später). P-Arbeit zeichnet deshalb von
+`TIMING-FLUSH-WAIT t_unix_ms` am Kopf des Forwards bis + `FWD-TIMING-PREFILL total_ms` (gepaart
+über #new-token und gpu-ms; die Timing-Zeile kommt erst am Kopf des nächsten Forwards und korrigiert
+dann rückwirkend), D-Extends von `HOST-ANON-PASS phase=EXTEND wall_ms` (unter 50 ms verworfen).
+Ohne Anker bleibt die alte Zeichnung. Zwischen `WEG2-FLIP done woke=D` und dem ersten TP0-
+Decode-Token steht **Flip-Nachlauf D** statt „wach, keine Arbeit“, aufgeteilt nach
+`WEG2-POST-WAKE-PASS n=0` (Lesungen vor Pass 0, prepare = Park-Resume, run = Re-Extend).
+
 Der Dienst selbst ist in `server.py` und `deploy/rig-dashboard.service` beschrieben
 (LAN :8890, läuft aus `/opt/rigdash/current`, Deploy per `deploy/install.sh <rev>`).
 Diese Datei beschreibt nur, was Agenten und Operatoren **pflegen** müssen.

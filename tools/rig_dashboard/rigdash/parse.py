@@ -57,6 +57,12 @@ F_ACCRATE = _f(r"accept rate: ([\d.]+)")
 F_BS = _f(r"\bbs: (\d+)")
 F_ROUND = _f(r"#round: (\d+)")
 F_RANK_T = _f(r", t: (\d+\.\d+),")
+# exact work times (WACH-OHNE-ARBEIT-0929: the rank lines are written a pass / a pipeline late)
+F_FWD_PREFILL = _f(r"FWD-TIMING-PREFILL forward=(\d+) tokens=(\d+) .*?\btotal_ms=([\d.]+)")
+F_FLUSH_WAIT = _f(r"TIMING-FLUSH-WAIT .*?\bforward=(\d+) .*?\bt_unix_ms=(\d+)")
+F_ANON_EXTEND = _f(r"HOST-ANON-PASS pass=\d+ phase=EXTEND .*?\bwall_ms=(\d+)")
+F_POST_WAKE0 = _f(r"WEG2-POST-WAKE-PASS n=0 mode=(\w+) .*?\bschedule_ms=(-?\d+) run_ms=(-?\d+)"
+                  r".*?\bprepare_ms=(-?\d+)")
 F_BUBBLE = _f(r"bubble_ms=([\d.]+)")
 F_CUDAG = _f(r"cuda graph: (\w+)")
 
@@ -174,6 +180,28 @@ def parse_line(line: str) -> Optional[dict]:
         ev["t_exact"] = _num(F_RANK_T, rest)     # the round's own epoch stamp (ms), not the whole-second prefix
         ev["gpu_ms"] = _num(F_GPUMS_BARE, rest)
         return ev
+    if rest.startswith("FWD-TIMING-PREFILL"):
+        m2 = F_FWD_PREFILL.search(rest)
+        if m2:
+            ev.update(kind="fwd_prefill", forward=int(m2.group(1)), tokens=int(m2.group(2)),
+                      total_ms=float(m2.group(3)))
+            return ev
+    if rest.startswith("TIMING-FLUSH-WAIT"):
+        m2 = F_FLUSH_WAIT.search(rest)
+        if m2:
+            ev.update(kind="flush_wait", forward=int(m2.group(1)), t_unix=int(m2.group(2)) / 1000.0)
+            return ev
+    if rest.startswith("HOST-ANON-PASS"):
+        m2 = F_ANON_EXTEND.search(rest)
+        if m2:
+            ev.update(kind="anon_extend", wall_ms=float(m2.group(1)))
+            return ev
+    if rest.startswith("WEG2-POST-WAKE-PASS n=0"):
+        m2 = F_POST_WAKE0.search(rest)
+        if m2:
+            ev.update(kind="post_wake0", mode=m2.group(1), schedule_ms=int(m2.group(2)),
+                      run_ms=int(m2.group(3)), prepare_ms=int(m2.group(4)))
+            return ev
     if rest.startswith("Decode batch"):
         ev["kind"] = "decode_batch"
         ev["running"] = _num(F_RUNREQ, rest, int)

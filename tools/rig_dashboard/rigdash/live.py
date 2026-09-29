@@ -39,6 +39,9 @@ WINDOW_S = 60.0        # headline window for the rates
 BUCKET_S = 5.0
 HISTORY_S = 15 * 60.0
 PHASE_GAP_S = 5.0      # no line of a class for longer than this -> that phase paused
+ANON_EXTEND_MIN_MS = 50.0     # HOST-ANON-PASS phase=EXTEND below this is the empty follow-up pass
+ANON_EXTEND_WINDOW_S = 8.0    # the D rank line trails its extend by about one pass
+FLIP_TAIL_MAX_S = 60.0        # a 'first decode' later than this after FLIP done is not the flip's
 # Flipzeit (user 29.09.): P-Ende -> erstes Decode-Token, NOT flip_total (the layer swap).
 # Marks are the first work line of the woken group after a pause of this length:
 # TP0 'Decode rank batch' (its own ms stamp) for P->D, PP0 'Prefill batch' (whole
@@ -389,7 +392,8 @@ def _run_stats(cls, evs):
             "n": r0[2] if r0 else len(evs)}
 
 
-def phase_timeline(acts, flips, t0, t1, first_t=None, awake_hint=None, gap_s=PHASE_GAP_S, work_from=None):
+def phase_timeline(acts, flips, t0, t1, first_t=None, awake_hint=None, gap_s=PHASE_GAP_S, work_from=None,
+                   tails=None):
     """Segments of the phase bar over [t0, t1].  Pure, unit-tested.
 
     ``acts``: dicts {t, s, cls, ev}: ``t`` = the log line's stamp (the END of
@@ -408,7 +412,9 @@ def phase_timeline(acts, flips, t0, t1, first_t=None, awake_hint=None, gap_s=PHA
       * whatever is left is ``idle`` (awake group from the flips: no work);
         before the boot's first work line (``work_from``) it is the boot
         loading (``boot``), not an awake group waiting;
-      * the run still going (last line within ``gap_s`` of t1) reaches t1.
+      * the run still going (last line within ``gap_s`` of t1) reaches t1;
+      * ``tails`` ({s, e, ms, parts}, Flip-Nachlauf D): idle inside one is ``flip_tail``,
+        the flip not yet finished by the user's definition (P end -> first decode token).
     """
     acts = sorted(acts, key=lambda a: a["t"])
     greys = []
@@ -475,6 +481,25 @@ def phase_timeline(acts, flips, t0, t1, first_t=None, awake_hint=None, gap_s=PHA
         cur = max(cur, x["e"])
     if t1 - cur > 0.5 and (first_t is None or first_t < t1):
         out.append({"k": "idle", "s": cur, "e": t1, "awake": awake_at((cur + t1) / 2)})
+    if tails:
+        split = []
+        for x in out:
+            if x["k"] != "idle":
+                split.append(x)
+                continue
+            cur_s = x["s"]
+            for tl in sorted(tails, key=lambda z: z["s"]):
+                a, b = max(cur_s, tl["s"]), min(x["e"], tl["e"])
+                if b - a <= 0.05:
+                    continue
+                if a - cur_s > 0.05:
+                    split.append(dict(x, s=cur_s, e=a))
+                split.append({"k": "flip_tail", "s": a, "e": b, "awake": "D", "ms": tl["ms"],
+                              "tail_s": tl["s"], "tail_e": tl["e"], "parts": tl.get("parts")})
+                cur_s = b
+            if x["e"] - cur_s > 0.05:
+                split.append(dict(x, s=cur_s))
+        out = split
     for x in out:
         if x["k"] == "idle" and work_from is not None and x["e"] <= work_from + 0.5:
             x["awake"], x["boot"] = None, True
@@ -503,6 +528,12 @@ class Boot:
         self.health = {}        # group -> last health event
         self.flip_open = None
         self.flip_marks = {"D": [], "P": []}   # sorted run starts of TP0 decode / PP0 prefill
+        # exact work times per (group, rank): FWD-TIMING-PREFILL (+ first TIMING-FLUSH-WAIT of that
+        # forward) and HOST-ANON-PASS phase=EXTEND; the rank lines come a pipeline / a pass late
+        self._fwd = collections.defaultdict(lambda: collections.deque(maxlen=64))
+        self._flush0 = collections.OrderedDict()
+        self._anon = collections.defaultdict(lambda: collections.deque(maxlen=64))
+        self.post_wake0 = collections.deque(maxlen=512)
         self._mark_last = {}
         self.counts = collections.Counter()
         self._last_t = {}       # group -> newest log timestamp seen in that file
@@ -603,6 +634,37 @@ class Boot:
             return
         self.counts[k] += 1
         rank0 = ev.get("rank") in (None, 0)
+        rkey = (group, "%s%s" % (ev.get("rk", ""), ev.get("rank", 0)))
+        if k == "flush_wait":
+            key = rkey + (ev["forward"],)
+            if key not in self._flush0:
+                self._flush0[key] = ev["t_unix"]
+                while len(self._flush0) > 512:
+                    self._flush0.popitem(last=False)
+            return
+        if k == "fwd_prefill":
+            # the timing of forward K is flushed at the head of forward K+1 (sometimes long after K's
+            # rank line); K's start is the flush of K-1, which ran at the head of K
+            s = self._flush0.get(rkey + (ev["forward"] - 1,))
+            f = {"t": ev["t"], "total_ms": ev["total_ms"], "tokens": ev["tokens"], "s": s, "used": False}
+            self._fwd[rkey].append(f)
+            if s is not None:
+                for i, r in enumerate(reversed(self.ev.get("%s_prefill_rank" % group, ()))):
+                    if i >= 64:
+                        break
+                    if "%s%s" % (r.get("rk", ""), r.get("rank", 0)) == rkey[1] and self._pair_fwd(f, r):
+                        break
+            return
+        if k == "anon_extend":
+            if ev["wall_ms"] >= ANON_EXTEND_MIN_MS:     # shorter = the empty follow-up pass
+                self._anon[rkey].append({"t": ev["t"], "wall_ms": ev["wall_ms"], "used": False})
+            return
+        if k == "post_wake0":
+            if rank0:
+                self.post_wake0.append(ev)
+            return
+        if k == "prefill_rank":
+            self._exact_prefill(rkey, ev)
         if k in ("prefill_rank", "prefill_batch", "decode_batch", "decode_rank"):
             if self.first_work_t is None or ev["t"] < self.first_work_t:
                 self.first_work_t = ev["t"]
@@ -688,6 +750,66 @@ class Boot:
             ev["text"] = redact.clean(ev.get("text"))
             if ev["text"] is not None:
                 self.ev["errors"].append(ev)
+
+    @staticmethod
+    def _pair_fwd(f, ev) -> bool:
+        """Rank line <-> FWD-TIMING-PREFILL of the same forward: same #new-token and gpu-ms = total_ms."""
+        ms = ev.get("gpu_ms")
+        if f["used"] or f["s"] is None or ev.get("e_exact") is not None or not ms:
+            return False
+        if f["tokens"] != (ev.get("new_tok") or 0) or abs(f["total_ms"] - ms) > max(1.0, 0.002 * ms):
+            return False
+        f["used"] = True
+        ev["s_exact"], ev["e_exact"], ev["exact_src"] = f["s"], f["s"] + f["total_ms"] / 1000.0, "fwd"
+        return True
+
+    def _exact_prefill(self, rkey, ev):
+        """Give a 'Prefill rank batch' line its real work interval (s_exact, e_exact).  P: the same
+        rank's FWD-TIMING-PREFILL of that forward (start = TIMING-FLUSH-WAIT t_unix_ms at the head of
+        the forward, end = start + total_ms) -- when that line comes later, it pairs itself then.
+        D: the newest HOST-ANON-PASS phase=EXTEND before the line (end = its line, start = end -
+        wall_ms).  Neither: left as is."""
+        for f in reversed(self._fwd.get(rkey, ())):
+            if self._pair_fwd(f, ev):
+                return
+        if self._fwd.get(rkey):
+            return          # a P rank with the FWD instrument: wait for its own line, never guess
+        for a in reversed(self._anon.get(rkey, ())):
+            if a["used"] or a["t"] > ev["t"] + 1:
+                continue
+            if a["t"] < ev["t"] - ANON_EXTEND_WINDOW_S:
+                break
+            a["used"] = True
+            e = _mid(a["t"])
+            ev["s_exact"], ev["e_exact"], ev["exact_src"] = e - a["wall_ms"] / 1000.0, e, "anon"
+            return
+
+    def flip_tails(self, lo: float, now: float) -> list:
+        """'Flip-Nachlauf D' (WACH-OHNE-ARBEIT-0929): from WEG2-FLIP done woke=D to the first TP0
+        'Decode rank batch' t: after it -- flip time by the user's definition, not 'awake, no work'.
+        Split by the TP0 WEG2-POST-WAKE-PASS n=0 inside it: reads before pass 0, prepare (park
+        resume), re-extend (the rest up to the first decode round)."""
+        dec = sorted(e.get("t_exact") or _mid(e["t"]) for g in ("D",)
+                     for e in self.ev.get("%s_decode_rank" % g, ()) if e.get("rank", 0) == 0 and e["t"] >= lo - 30)
+        begins = sorted(e["t"] for e in self.ev["flip_begins"])
+        out = []
+        for d in self.ev["flips"]:
+            if d.get("woke") != "D" or d["t"] < lo:
+                continue
+            s = d["t"]          # the front log stamps carry milliseconds
+            i = bisect.bisect_right(dec, s)
+            nb = next((b for b in begins if b > d["t"]), None)
+            if i >= len(dec) or (nb is not None and dec[i] > nb) or dec[i] - s > FLIP_TAIL_MAX_S:
+                continue
+            e = dec[i]
+            pw = next((p for p in self.post_wake0 if s - 1 <= p["t"] <= e + 1), None)
+            parts = None
+            if pw:
+                first_pass = _mid(pw["t"]) - (pw["schedule_ms"] + max(pw["run_ms"], 0)) / 1000.0
+                parts = {"reads_ms": max(0, round((first_pass - s) * 1000)), "prepare_ms": pw["prepare_ms"],
+                         "schedule_ms": pw["schedule_ms"], "run_ms": pw["run_ms"]}
+            out.append({"s": s, "e": e, "ms": round((e - s) * 1000), "parts": parts})
+        return out
 
     def _flip_mark(self, group: str, t: float):
         last = self._mark_last.get(group)
@@ -1021,6 +1143,9 @@ class Boot:
         for g, cls in (("P", "P"), ("single", "P"), ("D", "D")):
             for e in self.ev.get("%s_prefill_rank" % g, ()):
                 if e["t"] >= lo:
+                    if e.get("e_exact") is not None:      # the real forward, not the late line
+                        acts.append({"t": e["e_exact"], "s": e["s_exact"], "cls": cls, "ev": e})
+                        continue
                     t = mid(e["t"])
                     ms = e.get("gpu_ms") or e.get("compute_ms")
                     acts.append({"t": t, "s": t - ms / 1000.0 if ms else t, "cls": cls, "ev": e})
@@ -1041,7 +1166,8 @@ class Boot:
         hint = (self.last.get("awake") or {}).get("awake")
         return {"t0": t0, "t1": now, "span_s": span, "gap_s": PHASE_GAP_S,
                 "segs": phase_timeline(acts, flips, t0, now, self.first_t, hint,
-                                       work_from=self.first_work_t if self.first_work_t is not None else now)}
+                                       work_from=self.first_work_t if self.first_work_t is not None else now,
+                                       tails=self.flip_tails(lo, now))}
 
     def groups_with(self, kind: str) -> List[str]:
         return [g for g in ("P", "D", "single") if self.ev.get("%s_%s" % (g, kind))]

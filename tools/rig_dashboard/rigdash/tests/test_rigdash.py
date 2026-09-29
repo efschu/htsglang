@@ -995,6 +995,85 @@ class GenArtefactTests(unittest.TestCase):
         self.assertEqual([e["gen_tps"] for e in b.ev["D_decode_batch"]], [None, 93.22, None, 133.47])
 
 
+class WachOhneArbeitTests(unittest.TestCase):
+    """WACH-OHNE-ARBEIT-0929: P/D-Arbeit mit ihrer echten Zeit, 'Flip-Nachlauf D' statt 'wach, keine Arbeit'."""
+
+    @staticmethod
+    def _stamp(t):
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t))
+
+    def _line(self, b, group, t, rank, text):
+        b._ingest(group, parse.parse_line("[%s %s] %s" % (self._stamp(t), rank, text)))
+
+    def test_p_rank_line_gets_the_forward_it_reports_even_when_the_timing_comes_later(self):
+        base = 1790665270.0
+        b = live.Boot("x", "/tmp")
+        # forward 11 starts at base+3.571: the flush of forward 10 runs at its head layer
+        self._line(b, "P", base + 3, "PP0", "TIMING-FLUSH-WAIT instrument=attn forward=10 mode=event wait_ms=0.0 "
+                   "events=5 t_unix_ms=%d (x)" % int((base + 3.571) * 1000))
+        self._line(b, "P", base + 3, "PP0", "TIMING-FLUSH-WAIT instrument=moe_prefill forward=10 mode=event "
+                   "wait_ms=0.0 events=5 t_unix_ms=%d (x)" % int((base + 3.589) * 1000))
+        # the rank line of forward 11 comes after the pipeline, 07:01:16-style ...
+        self._line(b, "P", base + 6, "PP0", "Prefill rank batch, #new-token: 1440, #cached-token: 21568, #chunks: 1, "
+                   "gpu-ms: 1795.0 (compute 1795.0, wait 0.0) bubble_ms=1.0 (x)")
+        r = b.ev["P_prefill_rank"][-1]
+        self.assertIsNone(r.get("e_exact"))              # no timing yet: never guessed
+        # ... and forward 11's own timing only at the head of forward 12, 46 s later
+        self._line(b, "P", base + 52, "PP0", "FWD-TIMING-PREFILL forward=11 tokens=1440 layers=29 embed_ms=0.5 "
+                   "total_ms=1795.0 marks=3")
+        self.assertAlmostEqual(r["s_exact"], base + 3.571, places=3)
+        self.assertAlmostEqual(r["e_exact"], base + 3.571 + 1.795, places=3)
+        tl = b.timeline(base + 60, span=120)
+        p = [s for s in tl["segs"] if s["k"] == "P"]
+        self.assertEqual(len(p), 1)
+        self.assertAlmostEqual(p[0]["s"], base + 3.57, places=1)
+
+    def test_d_extend_is_drawn_from_host_anon_pass_not_the_pass_late_rank_line(self):
+        base = 1790666370.0
+        b = live.Boot("x", "/tmp")
+        self._line(b, "D", base, "TP0", "HOST-ANON-PASS pass=9 phase=EXTEND tokens=460 anon_begin=1MiB anon_end=1MiB "
+                   "peak=1MiB (x) wall_ms=2500 (instrument)")
+        self._line(b, "D", base + 1, "TP0", "HOST-ANON-PASS pass=10 phase=EXTEND tokens=460 anon_begin=1MiB "
+                   "anon_end=1MiB peak=1MiB (x) wall_ms=20 (empty follow-up)")
+        self._line(b, "D", base + 3, "TP0", "Prefill rank batch, #new-token: 460, #cached-token: 0, #chunks: 1, "
+                   "gpu-ms: 2400.0 (compute 2300.0, wait 100.0) (x)")
+        r = b.ev["D_prefill_rank"][-1]
+        self.assertEqual(r["exact_src"], "anon")
+        self.assertAlmostEqual(r["e_exact"], base + 0.5)
+        self.assertAlmostEqual(r["s_exact"], base + 0.5 - 2.5)
+
+    def test_flip_tail_replaces_awake_idle_between_flip_done_and_first_decode(self):
+        base = 1790667000.0
+        b = live.Boot("x", "/tmp")
+        FlipTimeTests()._front(b, base, "WEG2-FLIP begin epoch=2 sleep=P wake=D outstanding=0 queue=1")
+        FlipTimeTests()._front(b, base + 2.0, "WEG2-FLIP done epoch=3 slept=P woke=D drain+quiesce=100 ms "
+                               "sleep=1000 ms wake=1000 ms flip_total=2000 ms weights_tags=17")
+        self._line(b, "D", base + 4, "TP0", "WEG2-POST-WAKE-PASS n=0 mode=EXTEND bs=5 gap_ms=-1 schedule_ms=1400 "
+                   "run_ms=2500 prefetch_ms=7 prepare_ms=1300 ready_ms=1 (x)")
+        for k in range(5):
+            FlipTimeTests()._decode(b, base + 7.2 + k * 0.05)
+        tails = b.flip_tails(base - 10, base + 20)
+        self.assertEqual(len(tails), 1)
+        t = tails[0]
+        self.assertAlmostEqual(t["s"], base + 2.0, places=2)
+        self.assertEqual(t["ms"], 5200)
+        self.assertEqual(t["parts"]["prepare_ms"], 1300)
+        self.assertEqual(t["parts"]["run_ms"], 2500)
+        segs = b.timeline(base + 8, span=60)["segs"]
+        kinds = [s["k"] for s in segs if s["s"] >= base + 1.9]
+        self.assertIn("flip_tail", kinds)
+        self.assertFalse(any(s["k"] == "idle" and s.get("awake") == "D" and base + 2.1 < s["s"] < base + 7
+                             for s in segs))
+
+    def test_phase_timeline_splits_idle_by_tails_only(self):
+        acts = [{"t": 10.0, "s": 9.0, "cls": "dec", "ev": {"kind": "decode_rank"}}]
+        segs = live.phase_timeline(acts, [], 0.0, 30.0, tails=[{"s": 15.0, "e": 20.0, "ms": 5000, "parts": None}])
+        ks = [(s["k"], s["s"], s["e"]) for s in segs]
+        self.assertIn(("flip_tail", 15.0, 20.0), ks)
+        self.assertTrue(any(k == "idle" and s == 10.0 and e == 15.0 for k, s, e in ks))
+        self.assertTrue(any(k == "idle" and s == 20.0 and e == 30.0 for k, s, e in ks))
+
+
 if __name__ == "__main__":
     unittest.main()
 

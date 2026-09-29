@@ -112,6 +112,7 @@ h2 .muted, .muted { color: var(--muted); font-weight: 400; }
 .phasebar .seg span.hide { display: none; }
 .phasebar .seg.k-P { background: var(--s1); } .phasebar .seg.k-D { background: var(--s2); }
 .phasebar .seg.k-dec { background: var(--s3); } .phasebar .seg.k-flip { background: var(--flip); }
+.phasebar .seg.k-flip_tail { background: repeating-linear-gradient(135deg, var(--flip) 0 4px, transparent 4px 8px); box-shadow: inset 0 -3px 0 var(--s2); }
 .phasebar .seg.k-idle { background: transparent; box-shadow: inset 0 -3px 0 var(--ic, transparent); }
 .phasebar .seg.run { background-image: repeating-linear-gradient(135deg, rgba(255,255,255,.18) 0 6px, transparent 6px 12px); }
 .phasebar .seg.sel { outline: 2px solid var(--text); outline-offset: -2px; }
@@ -378,7 +379,7 @@ function bsBadge(d, on) {
 }
 
 // ---- phase bar: P-Prefill / D-Prefill / Decode runs and the flips between them
-const PHASE = {P: ["P-Prefill", "var(--s1)"], D: ["D-Prefill", "var(--s2)"], dec: ["Decode", "var(--s3)"], flip: ["Flip", "var(--flip)"]};
+const PHASE = {P: ["P-Prefill", "var(--s1)"], D: ["D-Prefill", "var(--s2)"], dec: ["Decode", "var(--s3)"], flip: ["Flip", "var(--flip)"], flip_tail: ["Flip-Nachlauf D", "repeating-linear-gradient(135deg, var(--flip) 0 3px, transparent 3px 6px)"]};
 const phaseData = {};
 let phaseSpan = 0;
 try { phaseSpan = +localStorage.getItem("rigdash.phaseSpan") || 0; } catch (e) { phaseSpan = 0; }
@@ -393,6 +394,11 @@ function phaseName(k, single) { return single && k === "P" ? "Prefill" : (PHASE[
 function phaseTip(x, single) {
   const when = `${hhmm(x.s)}&ndash;${x.running || x.open ? "jetzt" : hhmm(x.e)} &middot; ${dur(x.e - x.s)}`;
   if (x.k === "flip") return `<b>Flip ${esc(x.slept)}&rarr;${esc(x.woke)}</b>${x.open ? " &middot; l&auml;uft" : ` &middot; davon Layer-Tausch (flip_total) ${fmt(x.total_ms)} ms${x.drain_ms != null ? " (drain+quiesce " + fmt(x.drain_ms) + " ms)" : ""}`}<br>${when} <span class="muted">grau ab der letzten Arbeitszeile der alten Gruppe bis WEG2-FLIP done</span>`;
+  if (x.k === "flip_tail") {
+    const p = x.parts;
+    const parts = p ? `<br>Lesungen vor Pass 0 ${fmt(p.reads_ms)} ms &middot; Park-Resume (prepare) ${fmt(p.prepare_ms)} ms &middot; Re-Extend ${fmt(p.run_ms)} ms <span class="muted">(WEG2-POST-WAKE-PASS n=0, schedule ${fmt(p.schedule_ms)} ms)</span>` : "";
+    return `<b>Flip-Nachlauf D ${fmt((x.ms || 0) / 1000, 1)} s</b> &middot; WEG2-FLIP done bis erstes Decode-Token (Flipzeit nach Nutzerdefinition, keine Leerlaufzeit)${parts}<br>${when}`;
+  }
   if (x.k === "idle" && x.boot) return `<b>Boot l&auml;dt</b> &middot; noch keine Prefill-/Decode-Zeile<br>${when}`;
   if (x.k === "idle") return `<b>${x.awake ? esc(x.awake) + " wach" : "ruht"} &middot; keine Arbeit</b><br>${when} <span class="muted">keine Prefill-/Decode-Zeile</span>`;
   const nm = phaseName(x.k, single);
@@ -422,7 +428,7 @@ function phaseHtml(b) {
   const ticks = span >= 900 ? ["&minus;15 min", "&minus;10", "&minus;5", end] : ["&minus;5 min", "&minus;2:30", end];
   const lg = (k) => `<span class="lg"><i style="background:${PHASE[k][1]}"></i>${phaseName(k, single)}</span>`;
   return `<div class="phasewrap">
-    <div class="ph-head"><b style="color:var(--text)">Phasen</b> ${lg("P")}${single ? "" : lg("D")}${lg("dec")}${single ? "" : lg("flip")}
+    <div class="ph-head"><b style="color:var(--text)">Phasen</b> ${lg("P")}${single ? "" : lg("D")}${lg("dec")}${single ? "" : lg("flip") + lg("flip_tail")}
       <span class="lg"><i style="background:var(--bar-bg);box-shadow:inset 0 -3px 0 var(--muted)"></i>wach, keine Arbeit</span>
       <span class="span">${[300, 900].map((v) => `<button type="button" class="${span === v ? "sel" : ""}" onclick="setPhaseSpan(${v})">${v / 60} min</button>`).join("")}</span></div>
     <div class="phasebar" id="${esc(id)}" role="img" aria-label="Phasenverlauf der letzten ${span / 60} Minuten">${bars}${cut}</div>
