@@ -1746,7 +1746,7 @@ def plan_load_time_staging(
         order = [int(e) for e in resident_order]
         if sorted(order) != resident_ids or len(set(order)) != len(order):
             raise ValueError(
-                f"resident_order nennt {len(order)} Ids, die Residenz dieses "
+                f"resident_order names {len(order)} Ids, the residency of this "
                 f"Plans hat {len(resident_ids)} -- nicht dieselbe Menge "
                 f"(erste Abweichung: "
                 f"{sorted(set(order) ^ set(resident_ids))[:4]})"
@@ -7130,7 +7130,7 @@ class ExpertRearmPrefetch:
         import contextlib
 
         if self.joined:
-            raise RuntimeError("ExpertRearmPrefetch.issue nach dem Join")
+            raise RuntimeError("ExpertRearmPrefetch.issue after the join")
         if self.failed:
             return 0  # nach einem Fehler laedt der Rest seriell
         layers = self._by_tag.pop(str(tag), None)
@@ -7453,7 +7453,7 @@ def _expert_store_rows_for(layer, plan):
                 # selbst falsch ist -- nicht, dass zwei Rechnungen
                 # auseinanderlaufen. Deshalb nennt die Meldung die Karte.
                 raise RuntimeError(
-                    f"#107: {len(_missing)} eigene kalte Experten haben in der "
+                    f"#107: {len(_missing)} own cold experts have in the "
                     f"KARTE keinen Platz (erste: {_missing[:4]}, Phase "
                     f"{_phase}, mein Bereich ab lo={lo}). Die Karte sagt fuer "
                     f"diese Phase {len(_karte['phases'][_phase]['slot_of'])} "
@@ -7485,7 +7485,7 @@ def _expert_store_rows_for(layer, plan):
             _missing = [g for g in _index.values() if g not in _pos]
             if _missing:
                 raise RuntimeError(
-                    f"#97: {len(_missing)} eigene kalte Experten stehen in der "
+                    f"#97: {len(_missing)} own cold experts are in the "
                     f"GLOBALEN Residenzmenge und haetten keinen Store-Platz "
                     f"(erste: {_missing[:4]}, mein Bereich ab lo={lo}). Die "
                     f"Menge und die tatsaechliche Residenz muessen dieselbe "
@@ -7545,7 +7545,7 @@ def _expert_store_rows_for(layer, plan):
                 _missing = [g for g in _index.values() if g not in _pos]
                 if _missing:
                     raise RuntimeError(
-                        f"#91: {len(_missing)} kalte Experten stehen im Hotset "
+                        f"#91: {len(_missing)} cold experts are in the Hotset "
                         f"und haetten keinen Store-Platz (erste: {_missing[:4]}). "
                         f"Das Hotset und die tatsaechliche Residenz muessen "
                         f"dieselbe Menge meinen."
@@ -7900,7 +7900,7 @@ def presplit_expert_offload_after_repack(
             # hat. Die Karte und die Fraction muessen zusammenpassen, und
             # wenn nicht, gehoert das VOR die erste Allokation.
             raise RuntimeError(
-                f"#159: die KARTE nennt {len(_card_res)} residente Experten "
+                f"#159: the CARD names {len(_card_res)} resident experts "
                 f"fuer Layer {getattr(layer, 'layer_id', '?')} Rang "
                 f"{getattr(layer, 'moe_tp_rank', '?')}, die Fraction {frac} "
                 f"ueber {int(E)} Experten ergibt {_R_expected}. Beide "

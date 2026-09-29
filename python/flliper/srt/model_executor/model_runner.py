@@ -3092,7 +3092,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 _pdflip_adopt.arm_placeholder(
                     f"load-format={getattr(self.server_args, 'load_format', '?')}")
                 logger.info(
-                    "#108 ADOPTION ARMED: dieser Rang haelt PLATZHALTER. Kein "
+                    "#108 ADOPTION ARMED: this rank holds PLACEHOLDER. No "
                     "Forward und kein Store-Schreiben, bis der Erstflip P's "
                     "Bytes gebracht hat (adopt.mark_adopted).")
         except ImportError:

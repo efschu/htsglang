@@ -23,11 +23,11 @@ def test_ratios_are_scaled_not_taken_raw():
     Grenzen des SERVERS fuehren, sonst beschreibt sie eine Aufteilung, die
     es nicht gibt.
     """
-    assert sum(RATIOS) == 488, "sonst testet dieser Test nichts"
+    assert sum(RATIOS) == 488, "otherwise this test tests nothing"
     assert em.scaled_spans(RATIOS, TOTAL) == [192, 144, 176]
     assert em.bounds(em.scaled_spans(RATIOS, TOTAL)) == [0, 192, 336]
     assert sum(em.scaled_spans(RATIOS, TOTAL)) == TOTAL, (
-        "keine Id darf zwischen zwei Baendern verschwinden")
+        "no Id may disappear between two bands")
 
 
 def test_slot_count_is_the_one_measured_on_metal():
@@ -49,10 +49,10 @@ def test_store_holds_the_swap_not_the_union():
     res_d = {g for ids in k["phases"]["D"]["resident"] for g in ids}
     assert len(res_p) == 188 and len(res_d) == 188
     union = TOTAL - len(res_p & res_d)
-    assert union == 420, "die Zahl, die w49 belegt hat"
+    assert union == 420, "the number that w49 has occupied"
     assert k["slots"] == 324 < union
-    assert k["shared_resident"] == 92, "was auf den Karten liegen bleibt"
-    assert k["moves"] == 192, "96 raus + 96 rein, Platz gegen Platz"
+    assert k["shared_resident"] == 92, "what stays on the cards"
+    assert k["moves"] == 192, "96 out + 96 in, slot against slot"
 
 
 @pytest.mark.parametrize("phase", ["P", "D"])
@@ -62,8 +62,8 @@ def test_each_id_is_resident_or_in_store(phase):
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
     res = {g for ids in k["phases"][phase]["resident"] for g in ids}
     cold_ids = {int(x) for x in k["phases"][phase]["slot_of"]}
-    assert not (res & cold_ids), "keine Id darf beides sein"
-    assert len(res | cold_ids) == TOTAL, "und keine darf fehlen"
+    assert not (res & cold_ids), "no Id may be both"
+    assert len(res | cold_ids) == TOTAL, "and none may be missing"
 
 
 def test_slots_are_gap_and_collision_free():
@@ -71,7 +71,7 @@ def test_slots_are_gap_and_collision_free():
     for phase in ("P", "D"):
         slots = sorted(int(v) for v in k["phases"][phase]["slot_of"].values())
         assert slots == list(range(len(slots))), (
-            f"{phase}: Plaetze muessen 0..n-1 sein, luecken- und doppelfrei")
+            f"{phase}: Slots must be 0..n-1, gap- and duplicate-free")
         assert len(slots) <= k["slots"]
 
 
@@ -91,8 +91,8 @@ def test_broken_map_is_named_not_swallowed():
 
 def test_slot_of_gives_none_for_residents():
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
-    assert em.slot_of(k, "P", 0) is None, "Id 0 haelt P auf der Karte"
-    assert em.slot_of(k, "P", 511) is not None, "Id 511 liegt im Store"
+    assert em.slot_of(k, "P", 0) is None, "Id 0 holds P on the card"
+    assert em.slot_of(k, "P", 511) is not None, "Id 511 lies in the store"
 
 
 def test_phase_of_separates_the_groups():
@@ -108,9 +108,9 @@ def test_fraction_zero_holds_nothing_one_holds_all():
     # Kartenformel schrieb 0 auf und liess die Store-Datei einen Platz zu
     # gross werden. Die Karte schreibt auf, was passiert.
     k0 = em.build(TOTAL, RATIOS, 0.0, [0.0, 0.0, 0.0])
-    assert k0["slots"] == TOTAL - 1, "ein Experte bleibt immer auf der Karte"
+    assert k0["slots"] == TOTAL - 1, "an expert always stays on the card"
     k1 = em.build(TOTAL, RATIOS, 1.0, [1.0, 1.0, 1.0])
-    assert k1["slots"] == 0, "voll resident heisst: kein Store"
+    assert k1["slots"] == 0, "fully resident means: no store"
 
 
 # --------------------------------------------------------------------------
@@ -140,7 +140,7 @@ def test_reader_reads_what_writer_writes(tmp_path):
         else:
             os.environ[es.EXPERT_MAP_ENV] = alt
 
-    assert read_back is not None, "der Leser verwirft, was der Schreiber schreibt"
+    assert read_back is not None, "the reader discards what the writer writes"
     assert read_back["slots"] == 324
     assert em.slot_of(read_back, "P", 511) == em.slot_of(k, "P", 511)
 
@@ -176,7 +176,7 @@ def test_without_env_no_map():
     alt = os.environ.pop(es.EXPERT_MAP_ENV, None)
     es._EXPERT_MAP_CACHE.clear()
     try:
-        assert es.expert_map() is None, "ohne Env bleibt alles wie vor #107"
+        assert es.expert_map() is None, "without Env everything stays as before #107"
     finally:
         if alt is not None:
             os.environ[es.EXPERT_MAP_ENV] = alt
@@ -216,9 +216,9 @@ def test_map_disables_other_paths_not_just_precedes():
     i_global = src.index("elif _global_only is not None:")
     i_ratios = src.index("elif _ratios and _fracs:")
     assert i_card < i_global < i_ratios, (
-        "die Karte muss der ERSTE Zweig sein, und die beiden alten Wege "
+        "the card must be the FIRST branch, and the two old paths "
         "muessen `elif` sein -- sonst rechnen sie hinter ihr weiter")
 
     between = src[i_card:i_global]
     assert "_global_only = None if _karte is not None" in between, (
-        "ohne diese Zeile liest der alte Weg wieder shared_resident_ids()")
+        "without this line the old path reads shared_resident_ids() again")

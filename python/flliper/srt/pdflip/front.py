@@ -9837,14 +9837,14 @@ class Front:
         if not _adopt.adopt_armed():
             return
         logger.info(
-            "PDFLIP-ADOPT-FIRSTFLIP begin -- D haelt Platzhalter, das erste "
+            "PDFLIP-ADOPT-FIRSTFLIP begin -- D holds placeholder, the first "
             "Flip-Paar holt P's Bytes ueber dieselben Legs, die jeder "
             "spaetere Flip nimmt (#108)")
         t0 = time.time()
         await self.flip("P", "D")
         await self.flip("D", "P")
         logger.info(
-            "PDFLIP-ADOPT-FIRSTFLIP done in %.2f s -- D traegt jetzt P's "
+            "PDFLIP-ADOPT-FIRSTFLIP done in %.2f s -- D now carries P's "
             "Bytes, P ist wieder wach. Ob die Deckung VOLLSTAENDIG war, "
             "sagt D's eigener Riegel (adopt.mark_adopted); ein Rang, dem "
             "Tensoren fehlen, verweigert weiter.", time.time() - t0)
@@ -10832,7 +10832,7 @@ def main():
                          "is dispatched only while the in-flight requests' est_prompt plus its own "
                          "fit it (one always goes). 0 = no token plan, --p-concurrency alone.")
     ap.add_argument("--d-wait-bound-s", type=float, default=None,
-                    help="H91 part C rule 3 (user: 'wartegrenze 60 s, dann zurueck zu P'): a request "
+                    help="H91 part C rule 3 (user: 'wait limit 60 s, then back to P' (user order, translated)): a request "
                          "waiting for P longer than this during the D phase (from max(arrival, D phase "
                          "start)) parks D's running decodes via POST /pdflip/park_running and flips to P. "
                          "Replaces --fairness-w-s in the D phase while > 0; 0 = off (fairness as before).")

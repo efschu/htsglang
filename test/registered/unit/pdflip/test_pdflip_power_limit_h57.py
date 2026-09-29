@@ -367,7 +367,7 @@ def test_the_vram_guards_stay_untouched():
         state = L.BootState(tag="h57v", tip="0", tree=tmp, stamp="s")
         with mock.patch(
             "flliper.srt.planner.card_rate_pass.load_measured_library",
-            side_effect=RuntimeError("kaputte Bibliothek"),
+            side_effect=RuntimeError("broken library"),
         ):
             L.log_power_limits(
                 state, stage_cards(), log, reading=rd

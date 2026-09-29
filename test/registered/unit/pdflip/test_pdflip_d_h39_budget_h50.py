@@ -116,7 +116,7 @@ def _weight_tags_tp0(text):
         if has_marker(ln, "TP0] PDFLIP-DC-BREAKDOWN stage=release tags=['kv_cache', 'cuda_graph']"):
             d = ast.literal_eval(re.search(r"tms_resident \d+ (\{[^}]*\})", ln).group(1))
             return sum(v for k, v in d.items() if k.startswith("weights") and k != "weights_draft")
-    raise AssertionError("keine DC-BREAKDOWN-Zeile")
+    raise AssertionError("no DC-BREAKDOWN row")
 
 
 def test_the_item_is_the_same_4354_mib_in_two_independent_instruments():

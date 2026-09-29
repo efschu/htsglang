@@ -119,7 +119,7 @@ def main():
             if v:
                 R["5090"][key] = v
     C = derive_constants()
-    print("HOCHRECHNUNG -- keine Messung (Eingaben: #PGAP-Fits = Messung, Lane-Raten = Messung, Rest = Modell)")
+    print("EXTRAPOLATION -- no measurement (inputs: #PGAP-Fits = measurement, Lane-Rates = measurement, rest = model)")
     for r in (0, 1, 2):
         c = C[r]
         print(f"  PP{r} ({c['card']}): gpu_fwd(p=0) {c['a']:.1f} ms = INT8-GEMM {c['gemm_int8']:.1f} (Lane-Rate) "
@@ -130,13 +130,13 @@ def main():
     fm, fa = stage_flops(lo, hi)
     g_nv = FIT_NV[1][0] - (C[1]["a"] - C[1]["gemm_int8"])
     m3080 = a.marlin3080_m512 or (fm + fa) / (g_nv * 1e-3) / 1e12
-    print(f"  3080 Marlin (FP4+FP8) bei M=512 aus PP1-NVFP4-Fit: {m3080:.1f} TFLOPS (Lane-Wert M=2048: 63/60)")
+    print(f"  3080 Marlin (FP4+FP8) at M=512 from PP1-NVFP4-Fit: {m3080:.1f} TFLOPS (Lane-value M=2048: 63/60)")
     rates_int8 = {"5090": (R["5090"]["int8"], R["5090"]["int8"]), "3080": (R["3080"]["int8"], R["3080"]["int8"])}
     rates_nv = {"5090": (R["5090"]["nvfp4_marlin"], R["5090"]["fp8_marlin"]), "3080": (m3080, m3080)}
     w_i, _ = model_wall(CUT0, rates_int8, C)
     w_n, _ = model_wall(CUT0, rates_nv, C)
     cal_i, cal_n = (8192 / w_i) / MEAS_8K["int8"], (8192 / w_n) / MEAS_8K["nvfp4_marlin"]
-    print(f"  Modellprobe 8k: INT8 {8192/w_i:.0f} (gemessen 8905, Faktor {1/cal_i:.3f}), "
+    print(f"  Model probe 8k: INT8 {8192/w_i:.0f} (measured 8905, factor {1/cal_i:.3f}), "
           f"NVFP4-Marlin {8192/w_n:.0f} (gemessen 4246, Faktor {1/cal_n:.3f})")
     print("  5090-Raten (TFLOPS):", {k: round(v) for k, v in R["5090"].items()})
     for w in a.w4a8_tops:
@@ -152,10 +152,10 @@ def main():
                     best = (wall, cut, ts)
             wall, cut, ts = best
             tps = 8192 / wall
-            print(f"  W4A8 {w:.0f} TOPS | {label}: Schnitt {cut}, Stufen {[round(t,1) for t in ts]} ms -> "
+            print(f"  W4A8 {w:.0f} TOPS | {label}: Average {cut}, Stages {[round(t,1) for t in ts]} ms -> "
                   f"P8k ~{tps/cal_n/1e3:.1f}-{tps/cal_i/1e3:.1f}k tok/s (kalibriert NVFP4/INT8)")
     if a.bench:
-        print("D, 5090-Rang, GEMM-Anteil je Verify-Runde (ms), gemessen je Kernel, summiert:")
+        print("D, 5090-rank, GEMM share per Verify-round (ms), measured per kernel, summed:")
         for M, res in d_gemm_term(a.bench).items():
             print(f"  M={M}: {res}")
 
@@ -235,7 +235,7 @@ def window_projection(d, w4a8_tops=(117.0, 150.0)):
             for r, (lo, hi) in enumerate(ranks(CUT0))}
     unexpl = {r: (stage_meas[r] - sums[r]) / (hi - lo) for r, (lo, hi) in enumerate(ranks(CUT0))}
     extra_last = (unexpl[2] - unexpl[1]) * 11
-    print("\n== v3: Kerne GEMESSEN (zcx7pv), Zusammensetzung/Schnitt/W4A8 = HOCHRECHNUNG ==")
+    print("\n== v3: Cores MEASURED (zcx7pv), Composition/Average/W4A8 = EXTRAPOLATION ==")
     for r in (0, 1, 2):
         lo, hi = ranks(CUT0)[r]
         print(f"  PP{r}: gemessene Kernsumme INT8 {sums[r]:.1f} ms vs #PGAP {stage_meas[r]:.1f} ms "
@@ -280,7 +280,7 @@ def window_projection(d, w4a8_tops=(117.0, 150.0)):
             tps = 8192 / ((N_CHUNKS_8K + 2) * max(ts) / 1e3)
             lo_, hi_ = sorted((tps / cal_i, tps / cal_n))
             vram = vram_5090(cut[0])
-            print(f"  3080 {lab3} | 5090 NVFP4 nativ + {lab}: Schnitt {cut}, Stufen "
+            print(f"  3080 {lab3} | 5090 NVFP4 native + {lab}: Average {cut}, Stages "
                   f"{[round(x,1) for x in ts]} ms -> P8k {tps/1e3:.2f}k (kalibriert {lo_/1e3:.1f}-{hi_/1e3:.1f}k) tok/s; "
                   f"5090-VRAM P {vram}")
             res.append((m3, lab, cut, ts, tps))
@@ -290,7 +290,7 @@ def window_projection(d, w4a8_tops=(117.0, 150.0)):
             tps = 8192 / ((N_CHUNKS_8K + 2) * max(ts) / 1e3)
             lo_, hi_ = sorted((tps / cal_i, tps / cal_n))
             vram = vram_5090(cut[0])
-            print(f"  3080 W4A8 {t:.0f} TOPS | 5090 NVFP4 nativ + {lab}: Schnitt {cut}, Stufen "
+            print(f"  3080 W4A8 {t:.0f} TOPS | 5090 NVFP4 native + {lab}: Average {cut}, Stages "
                   f"{[round(x,1) for x in ts]} ms -> P8k {tps/1e3:.2f}k (kalibriert {lo_/1e3:.1f}-{hi_/1e3:.1f}k) tok/s; "
                   f"5090-VRAM P {vram}")
             res.append((t, lab, cut, ts, tps))

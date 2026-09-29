@@ -31,7 +31,7 @@ def test_map_builder_does_not_ask_namespace_extra_p():
                      if not z.lstrip().startswith("#"))
     assert "pp_cut_expert_device_fraction" in code
     assert '_argv_vector(getattr(ns, "extra_p", ""),\n                             "--pp-cut-expert-device-fraction")' not in code, (
-        "der Kartenbauer sucht das Launcher-Flag wieder in extra_p -- "
+        "the card builder searches the launcher flag in extra_p again -- "
         "dort steht es nie, das war die w60/w62-Wurzel"
     )
 

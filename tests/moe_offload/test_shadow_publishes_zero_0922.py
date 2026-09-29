@@ -63,12 +63,12 @@ def test_empty_manifest_keeps_rank_in_join():
     ]
     join = xm.join_manifests(mans, pp_group="P", tp_group="D")
     assert len(join.cards) == 3, (
-        "drei Raenge, drei Karten -- mit nur einer Karte haelt "
+        "three ranks, three cards -- with only one card, holds "
         "refuse_diagonal_layout den Austausch fuer die PP-Form und wirft W68")
     t = next(t for t in join.tensors if t.param_name == NAME)
-    assert t.tp_widths[0] > 0, "Rang 0 haelt den Tensor"
+    assert t.tp_widths[0] > 0, "Rank 0 holds the tensor"
     assert t.tp_widths[1] == 0 and t.tp_widths[2] == 0, (
-        "die Schatten halten NICHTS -- Breite 0, nicht 'fehlt'")
+        "the shadows hold NICHTS -- width 0, not 'missing'")
 
 
 def test_without_shadows_join_sees_one_card():
@@ -79,7 +79,7 @@ def test_without_shadows_join_sees_one_card():
     ]
     join = xm.join_manifests(mans, pp_group="P", tp_group="D")
     assert len(join.cards) == 1, (
-        "ohne die Schatten-Manifeste bleibt eine Karte uebrig -- das ist "
+        "without the shadow manifests, one card remains -- that is "
         "der w38-Zustand, und er fuehrt in refuse_diagonal_layout")
 
 
@@ -108,9 +108,9 @@ def test_leg_filter_keeps_the_shadow():
     kept = [m for m in narrowed
             if m.pieces or (str(m.group), int(m.rank)) in empty]
     assert len(kept) == 3, (
-        "alle drei Raenge muessen den Filter ueberleben -- sonst zaehlt der "
+        "all three ranks must survive the filter -- otherwise the "
         "Join eine Karte und refuse_diagonal_layout wirft W68 (w40)")
-    assert sum(1 for m in kept if m.pieces) == 1, "nur Rang 0 haelt Stuecke"
+    assert sum(1 for m in kept if m.pieces) == 1, "only Rank 0 holds pieces"
 
 
 # --------------------------------------------------------------------------
@@ -147,7 +147,7 @@ def _three_ranks():
 def test_holder_gets_its_descriptors():
     leg, refusal = _leg(0, _three_ranks())
     assert refusal == "", refusal
-    assert len(leg.descs) == 1, "Rang 0 haelt den Draft und bewegt ihn"
+    assert len(leg.descs) == 1, "Rank 0 holds the draft and moves it"
 
 
 @pytest.mark.parametrize("rank", [1, 2])
@@ -155,10 +155,10 @@ def test_shadow_gets_empty_instead_of_refusing(rank):
     """DER FALL, DER w41 TOETETE."""
     leg, refusal = _leg(rank, _three_ranks())
     assert refusal == "", (
-        f"Rang {rank} publiziert ein LEERES Manifest -- er haelt nichts, "
+        f"Rank {rank} publishes an EMPTY manifest -- it holds nothing, "
         f"also sind null Descriptors die richtige Antwort: {refusal}")
     assert leg is not None and len(leg.descs) == 0
-    assert leg.card == rank, "der LegPlan gehoert weiter diesem Rang"
+    assert leg.card == rank, "the LegPlan still belongs to this rank"
 
 
 def test_rank_without_manifest_still_refuses():

@@ -52,7 +52,7 @@ def test_small_p_takes_proportional_part_d_carries_extra():
     assert len(c0) == resident_slot_count(TOTAL, 0.20)
     # jede D-Spanne ist vertreten (keine Breite 0 im Zeilenschnitt)
     for r, pre in enumerate(k["phases"]["D"]["prefix_by_stage"]):
-        assert len(pre[0]) > 0, f"Rang {r} haette Breite 0"
+        assert len(pre[0]) > 0, f"Rank {r} would have width 0"
     # D's Extra fuer Stufe-0-Layer liegt im Store
     for ext in k["phases"]["D"]["extra_by_stage"]:
         for g in ext[0]:

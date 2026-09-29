@@ -640,7 +640,7 @@ def plan_vision_stage(
         raise ValueError("floor_bytes must be >= 0")
     if floor_bytes and not floor_reason:
         raise ValueError(
-            "floor_bytes without floor_reason: the user law is 'Reserven NIE, "
+            "floor_bytes without floor_reason: the user law is 'Reserves NEVER, "
             "nicht ein Byte'; a non-zero floor is allowed only WITH a named "
             "reason, which the plan then prints"
         )

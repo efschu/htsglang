@@ -110,7 +110,7 @@ def refuse_if_placeholder() -> None:
     """Der Riegel am Generierungspfad. Wirft, statt Unsinn zu rechnen."""
     if weights_are_placeholder():
         raise PdFlipAdoptWeightsArePlaceholder(
-            f"{REFUSAL_MARKER}: dieser Rang haelt PLATZHALTER-Gewichte "
+            f"{REFUSAL_MARKER}: this rank holds PLACEHOLDER-weights "
             f"({placeholder_reason() or 'dummy-load'}). Der Erstflip hat sie "
             f"nicht (vollstaendig) ersetzt. Eine Antwort waere syntaktisch "
             f"gueltiger Unsinn -- der Fehlerfall, der wie ein Ergebnis "

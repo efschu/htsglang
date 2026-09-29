@@ -89,10 +89,10 @@ def test_with_vector_same_count(_welt):
 def test_all_ranks_agree(_welt):
     z = {_slots(_Layer(r, lo, n), _welt)
          for r, (lo, n) in enumerate([(0, 183), (183, 137), (320, 168)])}
-    assert z == {324}, f"die Raenge sind uneins: {z}"
+    assert z == {324}, f"the ranks disagree: {z}"
 
 
 def test_without_env_old_path_stays(_welt, monkeypatch):
     monkeypatch.delenv(es.RESIDENT_IDS_ENV)
     lay = _Layer(1, 183, 137)
-    assert _slots(lay, _welt) != 324, "ohne globale Menge darf nichts geraten werden"
+    assert _slots(lay, _welt) != 324, "without a global set nothing may be guessed"

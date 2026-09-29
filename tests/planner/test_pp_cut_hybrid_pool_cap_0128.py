@@ -54,9 +54,9 @@ def test_cap_never_falls_below_server_cap():
     # Ein `min(concurrency, 1)` an der Stelle laesst `mit == ohne` und waere
     # ein Planer-Deckel UNTER dem des Servers -> OOM statt Refusal.
     assert mit == without * expected_conc, (
-        f"mamba-Term wirkt nicht: mit={mit} ohne={without} conc={expected_conc}"
+        f"mamba-Term has no effect: mit={mit} ohne={without} conc={expected_conc}"
     )
-    assert expected_conc > 1, "die Probe misst nichts -- ratio zu gross gewaehlt"
+    assert expected_conc > 1, "the probe measures nothing -- ratio chosen too large"
 
 
 def test_without_concurrency_or_context_no_cap():
@@ -71,5 +71,5 @@ def test_caller_takes_smaller_value():
     code = "\n".join(z for z in src.split("\n") if not z.lstrip().startswith("#"))
     assert "_pp_cut_hybrid_pool_cap()" in code
     assert "_hyb < pool_tokens" in code, (
-        "der Deckel darf den Pool nur SENKEN, nie anheben"
+        "the cap may only LOWER the pool, never raise"
     )

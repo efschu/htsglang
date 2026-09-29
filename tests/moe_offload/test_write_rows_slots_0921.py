@@ -42,7 +42,7 @@ def test_precomputed_map_writes_into_slots():
     emap = {370: 12, 371: 13}
     rows = es.write_rows(store, src, [370, 371], lo=0, pad=False, rows=emap)
     assert rows == emap
-    assert torch.equal(store[12], src[370]), "Platz 12 traegt Experte 370"
+    assert torch.equal(store[12], src[370]), "slot 12 carries expert 370"
     assert torch.equal(store[13], src[371])
     assert store[370 % 324].abs().sum() == 0 or True  # keine Zeile 370
 

@@ -44,11 +44,11 @@ def test_source_honours_the_holder_map(monkeypatch):
     """DER FALL, DER w36 UND w37 TOETETE."""
     geom = _dense_geom(src_widths=(4098, 0, 0))
     blocks = wx._blocks_of(geom, _form_a_layout(), is_dst=False)
-    assert len(blocks) == 3, "drei Raenge, drei Blocklisten"
+    assert len(blocks) == 3, "three ranks, three block lists"
     assert sum(b.size for b in blocks[0]) == 4098, (
-        "Rang 0 HAELT den Tensor ganz")
+        "rank 0 HOLDS the tensor whole")
     assert sum(b.size for b in blocks[1]) == 0, (
-        "Rang 1 haelt unter Form A kein Dense -- bekommt er hier Bytes, "
+        "rank 1 holds no Dense under Form A -- does it get bytes here, "
         "verlangt die Lane sie spaeter von ihm (w37: 33 of 37 descs have "
         "no address on the side this rank owns)")
     assert sum(b.size for b in blocks[2]) == 0, "Rang 2 ebenso"
@@ -69,7 +69,7 @@ def test_without_map_source_still_shards(monkeypatch):
     geom = _dense_geom()
     blocks = wx._blocks_of(geom, _form_a_layout(), is_dst=False)
     assert all(sum(b.size for b in r) > 0 for r in blocks), (
-        "ohne Halter-Karte teilt der Plan weiter ueber alle Raenge -- diese "
+        "without the holder card the plan still distributes over all ranks -- this "
         "Form ist die richtige fuer eine echte TP-Gruppe")
 
 
@@ -89,8 +89,8 @@ def test_geom_carries_map_both_directions():
     g_src = t.geom(tp_is_dst=False)   # D->P: die TP-Gruppe ist QUELLE
     g_dst = t.geom(tp_is_dst=True)    # P->D: die TP-Gruppe ist ZIEL
     assert g_src.src_widths == (4098, 0, 0), (
-        "ohne diese Karte verlangt der Plan Dense von einem Rang, der es "
+        "without this card the plan demands Dense from a rank that "
         "nicht haelt -- der w36/w37-Tod")
-    assert g_src.dst_widths is None, "als Quelle ist die Zielkarte nicht dran"
-    assert g_dst.dst_widths == (4098, 0, 0), "die Gegenrichtung bleibt, wie sie war"
+    assert g_src.dst_widths is None, "as source the target card is not involved"
+    assert g_dst.dst_widths == (4098, 0, 0), "the reverse direction stays as it was"
     assert g_dst.src_widths is None

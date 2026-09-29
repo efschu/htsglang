@@ -508,7 +508,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             import logging as _lg
 
             _lg.getLogger(__name__).info(
-                "#112 REPACK UEBERSPRUNGEN: dieser Rang haelt Platzhalter "
+                "#112 REPACK SKIPPED: this rank holds a placeholder "
                 "(%s). Die g_idx-Sortierindizes sind Zufall und wuerden den "
                 "Marlin-Repack ausserhalb der Tensoren indizieren; die "
                 "echten Bytes kommen bereits marlin-geformt aus dem "

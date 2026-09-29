@@ -270,4 +270,4 @@ def test_ct_stream_presplit_runs_in_layer_chunk():
     between = code[w:p].split("\n")[1:]
     assert all(
         len(z) - len(z.lstrip()) >= head_depth for z in between if z.strip()
-    ), "der Repack steht nicht im Chunk-Scope"
+    ), "the repack is not in chunk scope"

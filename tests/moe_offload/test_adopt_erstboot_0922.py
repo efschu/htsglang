@@ -25,7 +25,7 @@ def _clean(monkeypatch):
 def test_without_flag_no_adoption():
     assert adopt.adopt_armed() is False
     assert adopt.store_writes_denied() is False, (
-        "ohne Adoption darf der normale Plattenweg schreiben wie immer")
+        "without Adoption, the normal disk path may write as always")
 
 
 def test_launcher_reads_argv_rank_reads_env(monkeypatch):
@@ -33,7 +33,7 @@ def test_launcher_reads_argv_rank_reads_env(monkeypatch):
     assert adopt.adopt_armed(explicit="on") is True
     assert adopt.adopt_armed(explicit="off") is False
     monkeypatch.setenv(adopt.ADOPT_ENV, "on")
-    assert adopt.adopt_armed() is True, "ein Rang hat kein argv"
+    assert adopt.adopt_armed() is True, "a rank has no argv"
 
 
 # --- Riegel 1: kein dummy-Spill in den GETEILTEN Store -------------------
@@ -56,7 +56,7 @@ def test_after_first_flip_d_may_write_again(monkeypatch):
     adopt.arm_placeholder()
     adopt.mark_adopted(filled=34, expected=34)
     assert adopt.store_writes_denied() is False, (
-        "mit echten Bytes ist D ein normaler Schreiber")
+        "with real bytes, D is a normal writer")
 
 
 # --- Riegel 2: keine Antwort auf Platzhaltern ---------------------------
@@ -121,14 +121,14 @@ def test_write_rows_under_adoption_writes_nothing(monkeypatch):
     adopt.arm_placeholder()
     written = es.write_rows(store, src, local_ids=[0, 1, 2], lo=0, pad=False)
     assert store.sum().item() == 0, (
-        "unter Adoption darf KEIN Byte in den geteilten Store -- sonst "
+        "under Adoption, NO byte may go into the shared store -- otherwise "
         "ueberschreibt D's dummy-Presplit P's echte Experten")
     assert written == {}
 
     adopt.mark_adopted(filled=3, expected=3)
     es.write_rows(store, src, local_ids=[0, 1, 2], lo=0, pad=False)
     assert store.sum().item() > 0, (
-        "nach dem Erstflip ist D ein normaler Schreiber")
+        "after the first flip, D is a normal writer")
 
 
 def test_without_adoption_write_rows_writes_as_before():
@@ -171,7 +171,7 @@ def test_front_runs_a_flip_pair_not_one():
 
     src = inspect.getsource(front.Front._adopt_first_flip)
     assert src.index('self.flip("P", "D")') < src.index('self.flip("D", "P")'), (
-        "erst P->D (Bytes holen), dann D->P (Rollen zurueck)")
+        "first P->D (fetch bytes), then D->P (roll back)")
 
 
 def test_trigger_runs_before_serving_loop():
@@ -183,7 +183,7 @@ def test_trigger_runs_before_serving_loop():
     src = inspect.getsource(front.Front.controller)
     assert "_adopt_first_flip" in src
     assert src.index("_adopt_first_flip") < src.index("while True"), (
-        "der Erstflip gehoert vor die Serving-Schleife")
+        "the first flip belongs before the serving loop")
 
 
 def test_trigger_without_flag_is_a_no_op():
@@ -195,8 +195,8 @@ def test_trigger_without_flag_is_a_no_op():
     src = inspect.getsource(front.Front._adopt_first_flip)
     i_guard = src.index("adopt_armed()")
     i_flip = src.index('self.flip("P", "D")')
-    assert i_guard < i_flip, "erst pruefen, dann flippen"
-    assert "return" in src[i_guard:i_flip], "ohne Flag sofort zurueck"
+    assert i_guard < i_flip, "check first, then flip"
+    assert "return" in src[i_guard:i_flip], "without flag, return immediately"
 
 
 def test_no_try_except_around_flip_pair():
@@ -231,11 +231,11 @@ def test_coverage_is_recorded_where_it_is_known():
     # dieses Tests hat genau diese Verwechslung aufgedeckt.
     inject = inspect.getsource(wu.SchedulerWeightUpdaterManager._pdflip_xchg_inject_from_peer)
     assert "_pdflip_last_inject_cover" in inject, (
-        "die Deckung muss dort festgehalten werden, wo plan.descs und die "
+        "the coverage must be recorded where plan.descs and the "
         "getragenen Descriptors beide bekannt sind")
     cover = inspect.getsource(wu.SchedulerWeightUpdaterManager._pdflip_adopt_cover)
     assert "_pdflip_last_inject_cover" in cover and "plan" not in cover, (
-        "der Leser darf sie NICHT neu ableiten")
+        "the reader may NICHT re-derive them")
 
 
 def test_undeterminable_coverage_keeps_the_guard():
@@ -290,10 +290,10 @@ def test_production_call_site_passes_the_decision():
 
     src = inspect.getsource(lx)
     bauer = [z for z in src.split("\n") if "argv_d(py, ns.model" in z]
-    assert bauer, "keine Produktions-Aufrufstelle von argv_d gefunden"
+    assert bauer, "no production call site of argv_d found"
     for z in bauer:
         assert "d_adopt=" in z, (
-            "eine argv_d-Aufrufstelle gibt d_adopt NICHT mit -- dann faellt "
+            "an argv_d call site gives d_adopt NICHT with -- then falls "
             "sie auf den Default False und der Flag verschwindet still: "
             + z.strip()[:120]
         )

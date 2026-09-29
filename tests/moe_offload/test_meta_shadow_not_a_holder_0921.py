@@ -81,7 +81,7 @@ def test_form_a_dense_lives_on_the_host_alone_and_still_joins():
     ]
     j = xm.join_manifests(pp + tp)
     got = {t.param_name: t for t in j.tensors}
-    assert DENSE in got, "der Solo-Halter muss geplant werden, nicht verweigert"
+    assert DENSE in got, "the solo holder must be planned, not refused"
     t = got[DENSE]
     assert t.shard_axis == wx.REPLICATED
     # Der Breitenvektor bleibt in RANGORDNUNG: wer nichts haelt, haelt null.

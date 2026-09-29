@@ -3751,9 +3751,9 @@ class SchedulerWeightUpdaterManager:
         logger.info(
             "#108 ADOPT-COVER filled=%d expected=%d uncovered=%d -> %s",
             _filled, _expected, len(_uncovered),
-            "PLATZHALTER GELOEST, dieser Rang rechnet"
+            "PLACEHOLDER RESOLVED, this rank computes"
             if not _adopt.weights_are_placeholder()
-            else f"RIEGEL BLEIBT ({_adopt.placeholder_reason()})")
+            else f"GUARD STAYS ({_adopt.placeholder_reason()})")
 
     def _pdflip_wake_reload_weights(self) -> None:
         """Fill the weight pages the resume recommitted, by whatever carries them.

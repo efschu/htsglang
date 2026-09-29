@@ -26,7 +26,7 @@ def test_host_tensor_still_gives_a_card(monkeypatch):
         w13_weight_packed=torch.empty(0)  # cpu -- der w60-Zustand
     )
     d = m._rang_karte(layer)
-    assert d.type == "cuda", "ein Host-Tensor darf die Karte nicht verschlucken"
+    assert d.type == "cuda", "a host tensor must not swallow the card"
     assert d.index == 0
 
 
@@ -54,5 +54,5 @@ def test_caller_asks_the_function():
     code = "\n".join(z for z in src.split("\n") if not z.lstrip().startswith("#"))
     assert "marlin_make_workspace(_rang_karte(layer), 4)" in code
     assert "marlin_make_workspace(layer.w13_weight_packed.device" not in code, (
-        "der Aufrufer liest wieder das Device des Gewichts -- die w60-Wurzel"
+        "the caller reads the weight's device again -- the w60 root"
     )

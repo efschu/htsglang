@@ -732,17 +732,17 @@ def default_owner_pattern(tag: str) -> str:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--out", required=True, help="Eimer-CSV; Rohstrom daneben als .raw.csv")
+    ap.add_argument("--out", required=True, help="Bucket CSV; raw stream beside as .raw.csv")
     ap.add_argument("--cards", default="0,1,2", help="NVML-Indizes")
     ap.add_argument("--period-ms", type=float, default=DEFAULT_PERIOD_MS)
     ap.add_argument("--proc-every-ms", type=float, default=DEFAULT_PROC_EVERY_MS)
     ap.add_argument("--budget", type=float, default=DEFAULT_BUDGET,
-                    help="Tick-Preis hoechstens dieser Anteil der Periode, sonst Periode anheben")
-    ap.add_argument("--no-raw", action="store_true", help="nur 1-s-Eimer (Rohstrom ist Standard)")
+                    help="Tick price at most this fraction of the period, otherwise raise the period")
+    ap.add_argument("--no-raw", action="store_true", help="only 1-s buckets (raw stream is default)")
     ap.add_argument("--tag", default=None)
     ap.add_argument("--boot-json", default=None, help="Standard: /spinning/gpu-arb/weg2/boot_<tag>.json")
     ap.add_argument("--owner-pattern", default=None,
-                    help="argv-Regex des Eigentuemers; 'auto' = launcher/front dieses --tag")
+                    help="argv regex of the owner; 'auto' = launcher/front of this --tag")
     ap.add_argument("--owner-poll-s", type=float, default=5.0)
     ap.add_argument("--owner-grace-s", type=float, default=900.0)
     ap.add_argument("--owner-gone-s", type=float, default=60.0)

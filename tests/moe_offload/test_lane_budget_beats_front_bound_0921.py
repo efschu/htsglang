@@ -34,7 +34,7 @@ def test_the_lead_is_big_enough_to_be_read():
     from flliper.srt.pdflip import weight_exchange_bounce as wxb
 
     lead = front.DRAIN_DEADLINE_DEFAULT_S - wxb.SEQ_LANE_BUDGET_S
-    assert lead >= 15.0, f"nur {lead}s Vorlauf"
+    assert lead >= 15.0, f"only {lead}s warmup"
 
 
 def test_both_entry_points_use_the_constant():

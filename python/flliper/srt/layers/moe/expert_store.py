@@ -323,14 +323,14 @@ def expert_map():
         refuse_reason = _em.refuse_if_inconsistent(roh)
         if refuse_reason:
             logging.getLogger(__name__).error(
-                "#107 EXPERTEN-KARTE %s VERWORFEN: %s -- dieser Lauf rechnet "
+                "#107 EXPERTEN-KARTE %s REJECTED: %s -- this run computes "
                 "wie vor der Karte, also koennen zwei Gruppen wieder "
                 "auseinanderlaufen", file_path, refuse_reason)
         else:
             emap = roh
     except (OSError, ValueError, KeyError, TypeError) as exc:
         logging.getLogger(__name__).error(
-            "#107 EXPERTEN-KARTE %s unlesbar (%s: %s)", file_path,
+            "#107 EXPERTEN-KARTE %s unreadable (%s: %s)", file_path,
             type(exc).__name__, exc)
     _EXPERT_MAP_CACHE[file_path] = emap
     return emap
@@ -497,7 +497,7 @@ def write_rows(
             import logging as _lg
 
             _lg.getLogger(__name__).info(
-                "#108 STORE-WRITE UNTERDRUECKT: dieser Rang haelt "
+                "#108 STORE-WRITE SUPPRESSED: this rank holds "
                 "Platzhalter-Gewichte (%s) und der Store gehoert BEIDEN "
                 "Gruppen -- %d Zeilen NICHT geschrieben",
                 _adopt.placeholder_reason() or "dummy-load", len(local_ids))
@@ -512,7 +512,7 @@ def write_rows(
     outside_rows = sorted(r for r in rows.values() if not (0 <= int(r) < capacity))
     if outside_rows:
         raise RuntimeError(
-            f"#94: {len(outside_rows)} Zeilen liegen ausserhalb der Store-Datei "
+            f"#94: {len(outside_rows)} rows lie outside the Store-file "
             f"(0..{capacity-1}), erste: {outside_rows[:4]}. Entweder ist die "
             f"Abbildung lokal->Slot nicht durchgereicht worden (dann sind es "
             f"globale Ids), oder die Datei wurde mit einer anderen "
@@ -665,7 +665,7 @@ def fill_rows(
         r = int(row)
         if not (0 <= r < capacity):
             raise RuntimeError(
-                f"#109: Store-Zeile {r} liegt ausserhalb der Datei "
+                f"#109: Store-row {r} lies outside the file "
                 f"(0..{capacity-1}) -- dieselbe Abbildungsfrage wie #94, "
                 f"nur auf der Leseseite."
             )

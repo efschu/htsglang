@@ -72,7 +72,7 @@ def test_reader_understands_what_writer_writes():
             os.environ[es.STORE_GEOMETRY_ENV] = old
 
     assert got is not None, (
-        f"der Leser verwirft, was der Schreiber publiziert: {published!r}")
+        f"the reader discards what the writer publishes: {published!r}")
     got_ratios, got_fracs = got
     assert got_ratios == [183, 137, 168]
     assert got_fracs == [0.12, 0.319, 0.284]

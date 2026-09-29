@@ -2755,7 +2755,7 @@ def kv_stage_wave_cap(ns, er, tab, max_by: Sequence[int], env: Mapping[str, str]
         return None, []
     if er.POOL_OVERFLOW_WAVES_ENV in env and not getattr(ns, "d_pool_waves_derived", False):
         raise PdFlipDKvStageWavesRefused(
-            "W169 PdFlipDKvStageWavesRefused: die Stufenform (hoechste Stufe je Sitzzahl %s) "
+            "W169 PdFlipDKvStageWavesRefused: the stage form (highest stage per seat count %s) "
             "braucht %d Ueberlaufwellen je bs %s, --env-d nennt %s=%s -- der Capture "
             "verweigerte auf TP0 ('Step ids exceed ...'); keine Stufenform geschrieben"
             % (list(max_by), need, list(tab.capture_waves(max_by)),
@@ -4763,7 +4763,7 @@ def refuse_unwired_token_cut(ns, boot_form) -> None:
         # #239 S4a: F14 is the worker's bytes in the HOST TIER and the store;
         # a boot without either (--pdflip-disable-hicache: no L2, no L3, #1386)
         # has no such bytes, so the runtime half is complete for it.
-        print(f"{KV_TOKEN_CUT_MARKER} F14-FREI (kein Host-Tier): --d-kv-token-cut "
+        print(f"{KV_TOKEN_CUT_MARKER} F14-FREI (no Host-Tier): --d-kv-token-cut "
               f"{ns.d_kv_token_cut} bootet mit --pdflip-disable-hicache; F14 (Host-Tier/"
               "Store des KV-Workers) ist offen und wird hier nicht betreten.", flush=True)
         return
@@ -5091,7 +5091,7 @@ def pin_d_form_for_map(ns, log) -> Optional[dict]:
     # R2: a form without a token cut (the P1c pin) pins cut None -- only a
     # cut that was ASKED for and not published leaves the form unpinned
     if not ratios or not fr or (not cut and d_kv_token_cut(ns) is not None):
-        log(f"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) NICHT GEPINNT: der Solve "
+        log(f"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) NICHT GEPINNT: the Solve "
             f"vor der Karte hat keinen Schnitt/Vektor veroeffentlicht (ratio {ratios}, "
             f"FR_D {fr}, Schnitt {cut}) -- die Karte liest die Vektoren, die jetzt in "
             f"--extra-d stehen")
@@ -16975,7 +16975,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             return None
         v = _csv_floats(raw)
         if len(v) != n:
-            log(f"{D_RANK_SOLVE_MARKER} IGNORIERT: {name} hat {len(v)} "
+            log(f"{D_RANK_SOLVE_MARKER} IGNORED: {name} has {len(v)} "
                 f"Eintraege, die D-Gruppe hat {n} Raenge")
             absent.append(name)
             return None
@@ -17035,10 +17035,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                 + " [" + v.corridor_note + "]"
                 for v in rank_verdicts
             ),
-            ((" -- DARUEBER auf Rang %s" % above) if above else "")
+            ((" -- DARUEBER on rank %s" % above) if above else "")
             + ((" -- KORRIDOR GERISSEN auf Rang %s: die Bytes passen, die "
                 "Betriebsregel nicht" % _corridor_riss) if _corridor_riss else "")
-            + ((" [NICHT GEBUCHT: %s -- diese Zeile ist damit eine OBERGRENZE, "
+            + ((" [NICHT GEBUCHT: %s -- this row is therefore a OBERGRENZE, "
                 "keine Bilanz]" % ", ".join(absent)) if absent else ""),
         )
     )
@@ -17115,7 +17115,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     # the rig's fixed 262144 -- a 524288 form priced at 262144 "fitted".
     _d_kv, _d_kv_src = group_kv_tokens(ns, "d")
     if _d_kv != CONTEXT_LENGTH_TOKENS:
-        log(f"{D_RANK_SOLVE_MARKER} {label} KV-PFLICHT {_d_kv} Token aus {_d_kv_src} "
+        log(f"{D_RANK_SOLVE_MARKER} {label} KV-PFLICHT {_d_kv} tokens from {_d_kv_src} "
             f"(statt {CONTEXT_LENGTH_TOKENS}): der KV-Posten jedes Rangs ist damit bepreist")
     try:
         plan = _er.plan_d_residency(
@@ -17308,7 +17308,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             if _rtext and not _given:
                 ns.env_d = set_group_env(_env_d, "FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB", _rtext)
             if _rtext:
-                log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-STUECKELUNG rows_cap aus card_free_post: "
+                log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-STUECKELUNG rows_cap from card_free_post: "
                     f"FLLIPER_PDFLIP_EXTEND_GROWTH_PER_ROW_MIB={_rtext}"
                     f"{' (aus --env-d, Vorrang)' if _given else ''} "
                     f"(Rate aus D_EXTEND_GROWTH_PER_ROW_MIB {_rate}, boots {_rate_src}; D kappt den "
@@ -17367,7 +17367,7 @@ def log_wake_credit_solve(ns, cards: List[Card], fits, log, label: str, *,
     if not p_split or len(scratch_p) != len(p_split):
         gaps.append("FLLIPER_MOE_SCRATCH_SLOTS (env_p)")
     if gaps:
-        log(f"{_wc.MARKER} {label} ENTFAELLT: {', '.join(gaps)} fehlt -- "
+        log(f"{_wc.MARKER} {label} ENTFAELLT: {', '.join(gaps)} missing -- "
             f"ohne vollstaendige Geometrie rechnet der Riegel nichts.")
         _WAKE_CREDIT_FRONT_PLAN = None
         return
@@ -17532,17 +17532,17 @@ def publish_store_identity(model: str, map_path: str, log) -> str:
     die sichere Richtung (D liest vom Checkpoint), nie eine halbe Identitaet.
     """
     if not map_path:
-        log("H2c STORE-IDENTITY ENTFAELLT: keine Experten-Karte -> D-Store-Adopt inaktiv")
+        log("H2c STORE-IDENTITY ENTFAELLT: no experts card -> D-Store-Adopt inactive")
         return ""
     from flliper.srt.layers.moe import expert_store as _es
 
     try:
         ident = _es.compute_identity(model, map_path)
     except OSError as exc:
-        log("H2c STORE-IDENTITY ENTFAELLT: %s: %s -> D-Store-Adopt inaktiv"
+        log("H2c STORE-IDENTITY ENTFAELLT: %s: %s -> D-Store-Adopt inactive"
             % (type(exc).__name__, exc))
         return ""
-    log("H2c STORE-IDENTITY id=%s model=%s map=%s (beide Gruppen; ein Sentinel "
+    log("H2c STORE-IDENTITY id=%s model=%s map=%s (both groups; one Sentinel "
         "ohne diese Identitaet belegt nichts)" % (ident or "-", model, map_path))
     return ident
 
@@ -17603,7 +17603,7 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
         if not fr_pp:
             gaps.append("--pp-cut-expert-device-fraction / extra_p")
         if gaps:
-            log("#107 EXPERTEN-KARTE ENTFAELLT: %s fehlt. Ohne sie rechnet "
+            log("#107 EXPERTEN-KARTE ENTFAELLT: %s missing. Without it, computes "
                 "jede Gruppe wieder selbst und die Residenz der jeweils "
                 "anderen Raenge zaehlt nicht mit." % ", ".join(gaps))
             return ""
@@ -17656,7 +17656,7 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
                               mirror=_mirror)
         refuse_reason = _em.refuse_if_inconsistent(emap)
         if refuse_reason:
-            log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % refuse_reason)
+            log("#107 EXPERTEN-KARTE VERWORFEN (not written): %s" % refuse_reason)
             return ""
         _refuse_unbuilt_platztausch_buffers(emap, chunk_layers=chunk_layers)
         os.makedirs(evidence_dir, exist_ok=True)
@@ -17672,7 +17672,7 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
             _dp = emap["phases"]["D"]
             _row_mib = float(getattr(ns, "_expert_row_mib", 0.0) or 0.0)
             log(
-                "PLATZTAUSCH-KARTE %s: %d Experten, Store %d Plaetze je Layer "
+                "PLATZTAUSCH-KARTE %s: %d experts, Store %d slots per Layer "
                 "(= Komplement der Schnittmenge %d, in BEIDEN Phasen dieselbe "
                 "Belegung, beim Flip wird nichts zurueckgeschrieben); P je Stufe "
                 "resident %s davon gemeinsam %s; D je Rang resident %s. Der "
@@ -17695,10 +17695,10 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
             return file_path
         _join = _em.join_verdict(emap)
         if _join:
-            log("#159 FLIP-JOIN UNMOEGLICH -- dieser Boot kann nicht flippen:")
+            log("#159 FLIP-JOIN IMPOSSIBLE -- this boot cannot flip:")
             for _z in _join:
                 log("     " + _z)
-            log("     Der Austausch ist ein BESITZERWECHSEL: was die eine "
+            log("     The swap is an OWNER CHANGE: what the one "
                 "Gruppe nicht resident haelt, kann die andere nicht "
                 "uebernehmen. Gleiche ANZAHL genuegt nicht -- P nimmt die "
                 "ersten N von 0..total, D je Rang die ersten N SEINES Bandes; "
@@ -17706,7 +17706,7 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
                 "fnFL2w130/w131/w132: jedes Mal W68 PdFlipXchgPlanDisagree beim "
                 "Wake, 40 Minuten nach dem Start, alle drei PP-Raenge tot.")
         else:
-            log("#159 FLIP-JOIN ok: beide Gruppen halten je Layer dieselben Ids")
+            log("#159 FLIP-JOIN ok: both groups hold per layer the same Ids")
         log(
             "#107 EXPERTEN-KARTE %s: %d Experten, %d Store-Plaetze, P haelt je "
             "Stufe %s, D je Rang %s; der Flip bewegt %d Zeilen, %d bleiben auf "
@@ -17807,9 +17807,9 @@ def repoint_store_geometry_at_pinned_form(xchg_env: Dict[str, str], form: dict,
         else:
             xchg_env.pop("FLLIPER_PDFLIP_EXPERT_BAND_SIZE", None)
             xchg_env.pop("FLLIPER_PDFLIP_EXPERT_BANDS", None)
-        log(f"PDFLIP-EXPERT-BAND size={_bs} count={_bc} aus der KARTE-FORM (#239 rc12z29c)")
+        log(f"PDFLIP-EXPERT-BAND size={_bs} count={_bc} from the KARTE-FORM (#239 rc12z29c)")
     if xchg_env.pop(_em.MAP_ENV, None) is not None:
-        log("PDFLIP-EXPERT-MAP (V1, aus dem genannten Vektor) verworfen (#239 rc12z29c): "
+        log("PDFLIP-EXPERT-MAP (V1, from the referenced vector) rejected (#239 rc12z29c): "
             "die Karte kommt aus publish_expert_map und der gepinnten Form")
 
 
@@ -17999,7 +17999,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
         else:
             reference = _p_card.P_CARD_REFERENCE_FNFL2
     except (OSError, ValueError) as exc:
-        log(f"{_p_card.CARD_MARKER} ENTFAELLT: Referenz unlesbar: "
+        log(f"{_p_card.CARD_MARKER} ENTFAELLT: reference unreadable: "
             f"{type(exc).__name__}: {exc}")
         return
     # H59 FORM-SCHLUESSEL: die Sitze DIESES Boots = group P's wirksames
@@ -18007,7 +18007,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
     # --p-bs, dieselbe Regel wie p_micro_batch_flags).
     seats = p_seats(ns)
     if kv_mib is None:
-        log(f"{_p_card.CARD_MARKER} ENTFAELLT: kein KV-Preis je Stufe (#156 entfiel "
+        log(f"{_p_card.CARD_MARKER} ENTFAELLT: no KV price per stage (#156 dropped "
             f"oder --pp-cut-reserve-mib ersetzt ihn); ohne KV ist der Kopfraum "
             f"nicht rechenbar.")
         return
@@ -18019,7 +18019,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
                 or "")
         weights, transient = _dp.p_draft_post_mib(str(path))
         if weights is None:
-            log(f"{_p_card.CARD_MARKER} ENTFAELLT: Draft auf P "
+            log(f"{_p_card.CARD_MARKER} ENTFAELLT: Draft on P "
                 f"{'an' if draft_on_p else 'aus'}, die Referenz ({reference.source}) "
                 f"{'an' if reference.draft_on_p else 'aus'}, und der Draft-Posten "
                 f"ist nicht lesbar ({path!r}).")
@@ -18345,7 +18345,7 @@ def solve_p_cut(
             if len(_r) == n_stages_p:
                 _reserve_p = _r
             else:
-                log("PP-CUT RESERVE (#141) IGNORIERT: --pp-cut-reserve-mib hat "
+                log("PP-CUT RESERVE (#141) IGNORED: --pp-cut-reserve-mib has "
                     "%d Eintraege, die P-Gruppe hat %d Stufen"
                     % (len(_r), n_stages_p))
 
@@ -18400,7 +18400,7 @@ def solve_p_cut(
                     )
                     _reserve_p = _kv_p
                     log(
-                        "PP-CUT KV-PREIS (#156): %d Token x Zelle je Stufe "
+                        "PP-CUT KV-PREIS (#156): %d Token x cell per Stage "
                         "(Attention-Layer %s + Draft %d auf der letzten Stufe, %s -> %.0f B je "
                         "Attention-Layer und Token) = %s MiB je Stufe. DAS ist "
                         "der Posten, der in der Kette fehlte; er geht jetzt als "
@@ -18458,7 +18458,7 @@ def solve_p_cut(
                     ["%.3f" % f for f in _fmax], ["%.3f" % f for f in fracs],
                     ((" | MIT KV-RESERVE: %s" % ["%.3f" % f for f in _frec])
                      if _frec is not None else "")
-                    + ((" -- DARUEBER auf Stufe(n) %s" % _stages_over_cap) if _stages_over_cap else ""),
+                    + ((" -- DARUEBER on stage(s) %s" % _stages_over_cap) if _stages_over_cap else ""),
                 )
             )
         except BaseException as _exc:  # noqa: BLE001 -- eine Zahl kippt nie den Boot
@@ -19444,7 +19444,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="K7: minimum phase dwell. Unset = derived from the last flip in that direction.")
     ap.add_argument(
         "--pp-cut-reserve-mib", default="",
-        help="#141: je P-Stufe die MiB, die auf der Karte NICHT den Gewichten "
+        help="#141: per P stage the MiB that on the card are NICHT the weights "
              "gehoeren (KV-Pool, Draft-KV-Produzent, Prefill-Transiente). "
              "Macht aus der #140-Decke eine Empfehlung. Ohne Angabe druckt "
              "der Solver nur die Decke -- fnFL2w73 starb in genau dieser "
@@ -19471,7 +19471,7 @@ def build_parser() -> argparse.ArgumentParser:
              "refused by name (--d-only boots it either way).")
     ap.add_argument(
         "--d-foreign-context-mib", default="",
-        help="#145 Term (b): je D-RANG (ordinal) der VRAM, den die SCHLAFENDE "
+        help="#145 Term (b): per D-RANG (ordinal) of the VRAM, which the SLEEPING "
              "Phase auf derselben Karte liegen laesst -- ihr CUDA-Kontext. "
              "Die Layer-Bytes wechseln beim Flip nur den Besitzer (Sharing, "
              "kein Backup), der Kontext nicht; dieser Betrag steht der "
@@ -19481,7 +19481,7 @@ def build_parser() -> argparse.ArgumentParser:
              "Ordinal-Reihenfolge (5090 zuerst) 1342,852,844.")
     ap.add_argument(
         "--d-nontorch-mib", default="",
-        help="#145 Term (c): je D-RANG (ordinal) der VRAM, den der Rang "
+        help="#145 Term (c): per D-RANG (ordinal) of the VRAM, which the rank "
              "AUSSERHALB des Torch-Allokators haelt -- eigener CUDA-Kontext, "
              "TMS-Handles aus cu_mem_create, private VMM-Pools. Messbar als "
              "nvml_used - Fremd-Kontext - torch_reserved. GEMESSEN am Ende "
@@ -19492,7 +19492,7 @@ def build_parser() -> argparse.ArgumentParser:
              "32607-1342-3628 = 27637.")
     ap.add_argument(
         "--d-reserve-mib", default="",
-        help="#145: das Gegenstueck zu --pp-cut-reserve-mib auf der D-Seite. "
+        help="#145: the counterpart to --pp-cut-reserve-mib on the D-side. "
              "Je D-Rang (ordinal) die MiB, die auf der Karte NICHT den "
              "Gewichten gehoeren: KV-Pool, Draft, Aktivierungen. Ohne Angabe "
              "druckt der Solver die DECKE, nicht die Empfehlung.")
@@ -19505,12 +19505,12 @@ def build_parser() -> argparse.ArgumentParser:
              "Zahl auf D's wirksame --max-running-requests umgebucht.")
     ap.add_argument(
         "--d-seat-graph-mib", default="",
-        help="H91b: GEMESSENE Mehrkosten des Decode-CUDA-Graphen je zusaetzlichem "
+        help="H91b: MEASURED extra cost of the Decode-CUDA-Graph per additional "
              "D-Sitz, MiB (ein Wert fuer alle Raenge oder einer je Rang). Leer = die "
              "KARTE-Zeile nennt den Posten als NICHT GEBUCHT (Obergrenze).")
     ap.add_argument(
         "--d-residency-reference-logs", default="",
-        help="H8: Komma-Liste von D-Boot-Logs (boot_weg2_<tag>_*.D.log), aus "
+        help="H8: comma-separated list of D-Boot-Logs (boot_weg2_<tag>_*.D.log), from "
              "denen der D-FRACTION-SOLVE den festen Rang-Posten MISST "
              "('weights + runtime state' minus Experten-Puffer, Aktivierung, "
              "mamba/spec, KV-Zelle, Draft-Vokabular; je Term das Maximum ueber "
@@ -19524,7 +19524,7 @@ def build_parser() -> argparse.ArgumentParser:
              "gerechnet.")
     ap.add_argument(
         "--d-card-reference-logs", default="",
-        help="H33: Komma-Liste von D-Boot-Logs, aus denen die KARTEN-Bilanz des "
+        help="H33: comma-separated list of D-Boot-Logs, from which the CARDS-balance of the "
              "D-FRACTION-SOLVE den Posten AUSSERHALB des Budgets misst: je Rang "
              "Kopfraum = cap - peak - privat_frei am bindenden Messpunkt "
              "(PDFLIP-GRAPH-POOL-Zeilen; aeltere Logs: [vram-peak] + #1027 "
@@ -19551,7 +19551,7 @@ def build_parser() -> argparse.ArgumentParser:
              "(privat_frei, LMEM) und wird mit ihm aufgefrischt.")
     ap.add_argument(
         "--p-card-over-logs", default="",
-        help="H41c: Komma-Liste von P-Boot-Logs DERSELBEN Form mit mehr "
+        help="H41c: comma-separated list of P-boat logs of the SAME form with more "
              "Pufferzeilen (lebend oder tot). Ihr CHUNK-0-Punkt (PDFLIP-GRAPH-POOL + "
              "#969 EXTENT) misst, was eine Zeile ueber der Referenz die Karte "
              "kostet (obere Schranke, nie unter dem Zeilenbild). Nur zusammen mit "
@@ -19565,7 +19565,7 @@ def build_parser() -> argparse.ArgumentParser:
              "HOCHRECHNUNG. 0 = der volle Kontext (262144).")
     ap.add_argument(
         "--wake-credit-reference-logs", default="",
-        help="H14: P.log,D.log,front.log EINES Boots, dessen erster Wake (D->P) "
+        help="H14: P.log,D.log,front.log of ONE boat, whose first Wake (D->P) "
              "die Referenz des WAKE-CREDIT-Riegels (W126) ist: free beim "
              "Flip-Start, Ordnung, Tags beider Gruppen, P-Floors, Pufferzeilen, "
              "On-card-Staging. Leer = die eingebaute Referenz "
@@ -20170,7 +20170,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--pdflip-weights-cpu-backup",
         choices=list(weight_exchange.WEIGHTS_CPU_BACKUP_CHOICES),
         default=weight_exchange.WEIGHTS_CPU_BACKUP_AUTO,
-        help="#1369: user order 2026-09-14 (\"DIE 48GB MUESSEN WEG... wenn es "
+        help="#1369: user order 2026-09-14 (\"THE 48GB MUST GO... if it \" (user order, translated)"
              "korrekt implementiert ist braucht es NIEMALS einen Rueckfall\"). "
              "The WEIGHTS region's 46.40 GiB host ring "
              "(host_ledger.host_ring_gib) has backed both groups' weights "
@@ -20418,7 +20418,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--pdflip-d-adopt", choices=("on", "off"), default="off",
-        help="#108 ERSTBOOT-ADOPTION (Nutzer-Order 22.09.): 'on' laesst die "
+        help="#108 ERSTBOOT-ADOPTION (user-order 22.09.): 'on' lets the "
              "D-Gruppe mit --load-format dummy starten und ihre Gewichte vom "
              "ERSTFLIP aus P's Karten holen, statt denselben Checkpoint ein "
              "zweites Mal von Platte zu lesen. Gemessen fnFL2w51: P 28,24 s, "
@@ -22486,12 +22486,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             xchg_env["FLLIPER_LOAD_KEY_WORKERS"] = str(
                 max(1, int(os.environ.get("PDFLIP_LOAD_KEY_WORKERS", "4") or 4))
             )
-            log("PDFLIP-VMM-EXPORTABLE on -- jede TMS-Allokation bekommt "
+            log("PDFLIP-VMM-EXPORTABLE on -- each TMS allocation gets "
                 "CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, damit die "
                 "Union-Arena die Gewichtsbytes zwischen den Phasen teilen "
                 "kann statt sie zweimal zu halten (#113).")
         if _adopt_on == _adopt.ADOPT_ON:
-            log("PDFLIP-D-ADOPT on -- D startet mit --load-format dummy und "
+            log("PDFLIP-D-ADOPT on -- D starts with --load-format dummy and "
                 "holt seine Gewichte vom ERSTFLIP aus P's Karten. Riegel: "
                 "kein Store-Schreiben und kein Forward auf D, bis der Flip "
                 "vollstaendig gedeckt hat (#108).")
@@ -22617,7 +22617,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 fr_tp=[float(x) for x in _geom_fracs])
             _reason = _em.refuse_if_inconsistent(_karte)
             if _reason:
-                log(f"PDFLIP-EXPERT-MAP REFUSED: {_reason} -- keine Karte "
+                log(f"PDFLIP-EXPERT-MAP REFUSED: {_reason} -- no card "
                     f"publiziert, beide Gruppen rechnen wie vor #107")
             else:
                 import json as _json

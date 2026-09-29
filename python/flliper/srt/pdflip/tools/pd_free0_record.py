@@ -38,7 +38,7 @@ def records_from_boot(front_log: str, max_flips: int = 2) -> List[Dict[str, obje
             texts[kind] = fh.read()
     m = _RX_FORM.search(texts["front"])
     if m is None:
-        raise ValueError("%s: keine WAKE-CREDIT P->D-Zeile mit Referenz -- die Form ist "
+        raise ValueError("%s: no WAKE-CREDIT P->D row with reference -- the form is "
                          "ungenannt, kein Record" % front_log)
     name = _form._FRONT_LOG_RE.match(os.path.basename(stem + ".front.log"))
     tag = name.group("tag") if name else os.path.basename(stem)

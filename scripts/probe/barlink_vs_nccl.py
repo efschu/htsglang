@@ -169,7 +169,7 @@ def run_rank(a: argparse.Namespace) -> int:
     sizes = [int(x) for x in a.sizes.split(",")]
     for nb in sizes:
         if nb % esize:
-            raise SystemExit(f"{nb} B ist kein Vielfaches von {esize} B ({a.dtype})")
+            raise SystemExit(f"{nb} B is not a multiple of {esize} B ({a.dtype})")
 
     log(f"# rank{rank} -> cuda:{dev_ord} {props.name} sm_{props.major}{props.minor}")
 
@@ -221,7 +221,7 @@ def run_rank(a: argparse.Namespace) -> int:
 
     active = [b for b in a.backends if b == "nccl" or b in comms]
     for k, why in fail_reason.items():
-        log(f"# {k}: NICHT hochgekommen -- {why}")
+        log(f"# {k}: NICHT come up -- {why}")
 
     # ---------------- Puffer und Operationen ----------------
     # Nullen als Inhalt: NCCLs all_reduce ist in-place, ein wiederholtes
@@ -261,7 +261,7 @@ def run_rank(a: argparse.Namespace) -> int:
         return out
 
     # ---------------- Pilot: FESTE Iterationszahl auf allen Raengen -------
-    log(f"# Pilot ({a.pilot} Iterationen je Zelle, feste Zahl auf beiden Raengen)")
+    log(f"# Pilot ({a.pilot} iterations per cell, fixed number on both ranks)")
     pilot: dict[tuple, float] = {}
     for cell in cells:
         dist.barrier(group=gloo_pg)
@@ -284,7 +284,7 @@ def run_rank(a: argparse.Namespace) -> int:
     plan = plan_box[0]
 
     est = sum((w + a.rounds * (m + 1)) * pilot[c] for c, (w, m) in plan.items()) / 1e6
-    log(f"# Plan von Rang 0 verteilt; geschaetzte Messdauer ~{est:.0f} s")
+    log(f"# Plan from rank 0 distributed; estimated measurement duration ~{est:.0f} s")
 
     # ---------------- Warmup ----------------
     # Fehlende Aufwaermung hat auf diesem Rig schon Werte um Faktor 7
@@ -306,9 +306,9 @@ def run_rank(a: argparse.Namespace) -> int:
             s = series(cell, plan[cell][1] + 1, timed=True)
             lat[cell].extend(s[1:])
         if rank == 0:
-            print(f"# Runde {rnd + 1}/{a.rounds} nach {time.time() - t0:.1f} s",
+            print(f"# Round {rnd + 1}/{a.rounds} after {time.time() - t0:.1f} s",
                   flush=True)
-    log(f"# Messung fertig in {time.time() - t0:.1f} s")
+    log(f"# Measurement done in {time.time() - t0:.1f} s")
 
     # ---------------- Ergebnis ----------------
     res = {c: summarize(v, c[1]) for c, v in lat.items()}
@@ -355,7 +355,7 @@ def report(a, cells, res, peer_res, meta) -> None:
 
     print()
     print("=" * 78)
-    print("barlink gegen NCCL -- Kollektive, zwei Raenge, ein Lauf, verschraenkt")
+    print("barlink against NCCL -- collectives, two ranks, one run, interleaved")
     print("=" * 78)
     for k, v in meta.items():
         if k == "gpus":
@@ -363,20 +363,20 @@ def report(a, cells, res, peer_res, meta) -> None:
                 print(f"  {g}")
         elif k == "failed_backends":
             for kk, vv in v.items():
-                print(f"  nicht hochgekommen: {kk} -- {vv}")
+                print(f"  did not come up: {kk} -- {vv}")
         else:
             print(f"  {k}: {v}")
     print()
-    print("  Alle Zeiten in Mikrosekunden und VOLLE OPERATIONSDAUER.")
-    print("  Ein all_reduce hat keinen halben Weg -- nicht mit den")
-    print("  Punkt-zu-Punkt-Zahlen (halber Round-trip) verrechnen.")
-    print("  MB/s = Nutzlast je Operation / p50, keine Busbandbreite.")
+    print("  All times in microseconds and FULL OPERATION DURATION.")
+    print("  An all_reduce has no half way -- do not reconcile with the")
+    print("  point-to-point numbers (half round-trip).")
+    print("  MB/s = payload per operation / p50, not bus bandwidth.")
     if "barlink:shm" in backends and "broadcast" in ops:
         print()
-        print("  ACHTUNG zu 'broadcast / barlink:shm': der shm-Transport bedient")
-        print("  laut BarlinkShmTransport.BARLINK_OPS nur all_reduce. Ein broadcast")
-        print("  faellt dort auf die host-gestagte gloo-Ebene in barlink.py zurueck.")
-        print("  Die Zeile misst also NICHT den shm-Datenpfad, sondern gloo.")
+        print("  NOTE on 'broadcast / barlink:shm': the shm transport serves")
+        print("  per BarlinkShmTransport.BARLINK_OPS only all_reduce. A broadcast")
+        print("  falls back to the host-based gloo layer in barlink.py there.")
+        print("  The row thus does NICHT measure the shm-data path, but gloo.")
     print()
 
     for op in ops:
@@ -394,7 +394,7 @@ def report(a, cells, res, peer_res, meta) -> None:
                       f"{r['mbps']:>10.1f}{r['p50'] / best:>9.2f}")
             print()
 
-    print("# Maschinenlesbar (VOLLE Operationsdauer, us):")
+    print("# Machine-readable (FULL operation duration, us):")
     for op in ops:
         for nb in sizes:
             rows = [(be, res[(op, nb, be)]) for be in backends if (op, nb, be) in res]
@@ -451,8 +451,8 @@ def preflight(devices: list[int], max_used_mib: int) -> None:
         print(f"# Fremde Rechenprozesse:\n{apps}")
     if busy:
         raise SystemExit(
-            "ABBRUCH: Zielkarten sind nicht frei -- " + "; ".join(busy)
-            + ". Es wird nichts verdraengt."
+            "ABBRUCH: target cards are not free -- " + "; ".join(busy)
+            + ". Nothing is displaced."
         )
 
 
@@ -466,13 +466,13 @@ def main() -> int:
     ap.add_argument("--ops", default="all_reduce,broadcast")
     ap.add_argument("--backends", default=",".join(BACKENDS))
     ap.add_argument("--secs", type=float, default=2.5,
-                    help="Messbudget je Zelle in Sekunden (ueber alle Runden)")
+                    help="Measurement budget per cell in seconds (over all rounds)")
     ap.add_argument("--warmup", type=float, default=0.7,
-                    help="Warmup-Budget je Zelle in Sekunden")
+                    help="Warmup budget per cell in seconds")
     ap.add_argument("--rounds", type=int, default=8,
-                    help="Verschraenkungsrunden; je Runde eine kurze Serie je Zelle")
+                    help="Interleaving rounds; one short series per cell per round")
     ap.add_argument("--pilot", type=int, default=15,
-                    help="feste Pilotiterationen je Zelle (Rundenzahl-Schaetzung)")
+                    help="Fixed pilot iterations per cell (round count estimate)")
     ap.add_argument("--max-secs", type=float, default=1500.0,
                     help="harter Watchdog je Rang")
     ap.add_argument("--pg-timeout", type=float, default=120.0)

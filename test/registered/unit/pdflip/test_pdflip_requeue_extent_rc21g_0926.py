@@ -57,7 +57,7 @@ def _requeue(body: bytes, **kw):
 
 def test_red_first_with_ds_extent_the_backlog_is_worth_its_flip():
     f, est, ok = _requeue(W50)
-    assert f.flip_min_work_tokens == X, "Front-Voreinstellung: min_work folgt X"
+    assert f.flip_min_work_tokens == X, "Front default: min_work follows X"
     assert est == 13000
     assert ok is True, "13000 >= min_work 10000: P prefillt ihn jetzt"
 
@@ -87,7 +87,7 @@ def test_red_first_the_nf_pin_4096_class():
 
 def test_without_a_parsed_extent_the_estimate_stands():
     _, est, ok = _requeue(b'{"error": "W50 PdFlipTpPrefillExceeded"}')
-    assert est == 9001, "keine Messung, keine erfundene Zahl"
+    assert est == 9001, "no measurement, no invented number"
     assert ok is False
 
 

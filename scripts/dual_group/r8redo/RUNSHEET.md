@@ -7,7 +7,7 @@ agent). A later window executes it in minutes.
 
 **Posten 1 of #328 has already been measured.** The corrected-window r8-E
 values are in `docs/dev/INTEGRATION_R3_VALIDATION.md`, section *"#328 Posten 1:
-r8-E-Werte mit korrigiertem Fenster — und ein Befund"*:
+r8-E-values with corrected window — and a finding"*:
 
 | quantity | r8 (4403a98312) | corrected (cc522801e2) |
 | --- | --- | --- |

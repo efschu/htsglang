@@ -71,7 +71,7 @@ def test_other_length_is_refused():
 def test_argv_builders_call_the_guard(fn):
     src = inspect.getsource(getattr(lx, fn))
     assert "_refuse_if_extra_raises_budget(budgets" in src, (
-        f"{fn} baut argv, ohne den Riegel zu rufen -- dann gewinnt die "
+        f"{fn} builds argv without calling the guard -- then the "
         f"extra-Flag wieder still."
     )
     # Und zwar VOR dem return, sonst ist er unerreichbar.

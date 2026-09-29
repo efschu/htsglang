@@ -63,7 +63,7 @@ def run_check(check: str, step_dir) -> tuple[int, str]:
     )
     lines = [line for line in proc.stdout.splitlines() if line.strip()]
     assert len(lines) == 1, (
-        f"{check} gab {len(lines)} Zeilen aus, der Executor liest genau eine: {lines}"
+        f"{check} emitted {len(lines)} rows, the Executor reads exactly one: {lines}"
     )
     return proc.returncode, lines[0]
 
@@ -112,7 +112,7 @@ class TestStepTable:
             for dep in step.deps:
                 assert dep in STEPS_BY_ID, (step.step_id, dep)
                 assert STEP_ORDER.index(dep) < STEP_ORDER.index(step.step_id), (
-                    f"{step.step_id} haengt an {dep}, das spaeter kommt"
+                    f"{step.step_id} depends on {dep}, which comes later"
                 )
 
     def test_timeout_exceeds_expectation(self):
@@ -1314,14 +1314,14 @@ class TestS06PairLaunch:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and any(_alive(p) for p in pids):
             time.sleep(0.2)
-        assert not any(_alive(p) for p in pids), "Kinder leben nach dem Timeout"
+        assert not any(_alive(p) for p in pids), "Children survive after the timeout"
 
     def test_timeout_writes_a_pyspy_dump_before_the_kill(self, tmp_path, monkeypatch):
         s06 = _import_s06()
         self._run_pair(s06, tmp_path, "hang", 3, monkeypatch)
         for rank in (0, 1):
             dump = tmp_path / f"seg.rank{rank}.pyspy.txt"
-            assert dump.exists(), f"kein Dump fuer Rang {rank}"
+            assert dump.exists(), f"no dump for rank {rank}"
             assert dump.read_text().strip()
 
     def test_killpg_only_ever_targets_a_group_this_parent_created(self, monkeypatch):
@@ -1669,7 +1669,7 @@ class TestOffloadRegisterProbe:
         modes = {k: v["mode"] for k, v in payload["class_policies"].items()}
         for row in payload["rows"]:
             assert modes[row["offload_class"]] == "ram", modes
-        assert modes["drafter_heads"] == "auto", "unbeteiligte Klassen bleiben auto"
+        assert modes["drafter_heads"] == "auto", "unrelated classes remain auto"
 
     def test_negative_control_still_refuses_auto_without_pressure(self, tmp_path):
         _, payload = self._dry_run(tmp_path)
@@ -2081,7 +2081,7 @@ class TestVerdictContract:
     @pytest.mark.parametrize("step", STEPS, ids=[s.step_id for s in STEPS])
     def test_empty_step_dir_never_crashes_and_never_passes(self, step, tmp_path):
         rc, line = run_check(step.check, tmp_path)
-        assert rc in (1, 2), f"{step.check} auf leerem Verzeichnis: rc={rc} / {line}"
+        assert rc in (1, 2), f"{step.check} on empty directory: rc={rc} / {line}"
         assert line.startswith(("BATTERY-FAIL ", "BATTERY-STOP ")), line
 
     @pytest.mark.parametrize("step", STEPS, ids=[s.step_id for s in STEPS])

@@ -138,7 +138,7 @@ def buffer_rows(*, local_experts: int, fraction: float, scratch_rows: int) -> in
     room = E - R
     if room < 2:
         raise ValueError(
-            f"expert pool: {E} lokale Zeilen mit {R} resident lassen {room} "
+            f"expert pool: {E} local rows with {R} resident leave {room} "
             f"Scratch-Zeile(n); die Runtime verlangt mindestens 2 "
             f"(scratch_slot_count) -- fraction {fraction} ist zu hoch"
         )
@@ -154,10 +154,10 @@ def expert_span_by_rank(
     n = len(ratios)
     units = int(num_experts)
     if units < n:
-        raise ValueError(f"{units} Experten reichen nicht fuer {n} Raenge")
+        raise ValueError(f"{units} experts are not enough for {n} ranks")
     total_w = float(sum(float(w) for w in ratios))
     if total_w <= 0.0:
-        raise ValueError(f"--rank-moe-ratio {list(ratios)} hat Summe <= 0")
+        raise ValueError(f"--rank-moe-ratio {list(ratios)} has sum <= 0")
     quotas = [units * float(w) / total_w for w in ratios]
     sizes = [max(int(q), 1) for q in quotas]
     remaining = units - sum(sizes)
@@ -232,7 +232,7 @@ def draft_share_embed(env: Mapping[str, str]) -> bool:
         return True
     if raw in _FALSE:
         return False
-    raise ValueError(f'{DRAFT_SHARE_EMBED_ENV}="{raw}" ist kein Boolean')
+    raise ValueError(f'{DRAFT_SHARE_EMBED_ENV}="{raw}" is not a Boolean')
 
 
 def dense_repack_outside_pool(env: Mapping[str, str]) -> bool:
@@ -250,7 +250,7 @@ def dense_repack_outside_pool(env: Mapping[str, str]) -> bool:
         return True
     if raw in _FALSE:
         return False
-    raise ValueError(f'{DENSE_REPACK_OUTSIDE_POOL_ENV}="{raw}" ist kein Boolean')
+    raise ValueError(f'{DENSE_REPACK_OUTSIDE_POOL_ENV}="{raw}" is not a Boolean')
 
 
 #: Die Zeile, die ein Rang NUR druckt, wenn H39 am Metall gewirkt hat: der
@@ -460,7 +460,7 @@ def d_rank_reference_from_logs(
     ]
     if missing:
         raise ValueError(
-            "D-Referenz unvollstaendig in %s: %s"
+            "D-reference incomplete in %s: %s"
             % ([b[0] for b in boots], ", ".join(missing))
         )
     return DRankReference(
@@ -1396,7 +1396,7 @@ def solve_stage_fraction_by_buffer_rule(
     res = list(reserve_mib_by_stage) if reserve_mib_by_stage is not None else [0.0] * n
     if len(budgets_mib) != n or len(scratch_rows) != n or len(res) != n:
         raise ValueError(
-            f"solve_stage_fraction_by_buffer_rule: {n} Stufen, aber {len(budgets_mib)} "
+            f"solve_stage_fraction_by_buffer_rule: {n} stages, but {len(budgets_mib)} "
             f"Budgets / {len(scratch_rows)} Scratch / {len(res)} Reserven"
         )
     out: List[float] = []
@@ -1855,7 +1855,7 @@ def solve_d_card_ledger(
     n = len(fits)
     if len(ledger.total_mib) != n:
         raise ValueError(
-            f"solve_d_card_ledger: {n} Raenge, aber das Ledger ({ledger.source}) "
+            f"solve_d_card_ledger: {n} ranks, but the ledger ({ledger.source}) "
             f"hat {len(ledger.total_mib)}"
         )
     out: List[DCardFit] = []
@@ -2101,7 +2101,7 @@ def gdn_spec_unit_bytes(
     h = int(text_cfg["linear_num_key_heads"])
     if h <= 0 or hv % h:
         raise ValueError(
-            "GDN-Geometrie: %d v-Koepfe sind kein Vielfaches von %d k-Koepfen" % (hv, h)
+            "GDN geometry: %d v-heads are not a multiple of %d k-heads" % (hv, h)
         )
     r = hv // h
     kc = int(text_cfg["linear_conv_kernel_dim"])
@@ -2385,7 +2385,7 @@ def pool_overflow_waves(env: Mapping[str, str]) -> int:
     try:
         n = int(raw)
     except ValueError as exc:
-        raise ValueError('%s="%s" ist keine Zahl' % (POOL_OVERFLOW_WAVES_ENV, raw)) from exc
+        raise ValueError('%s="%s" is not a number' % (POOL_OVERFLOW_WAVES_ENV, raw)) from exc
     return max(1, n)
 
 
@@ -3342,7 +3342,7 @@ def plan_d_residency(
     if fixed_record_mib is not None:
         if len(fixed_record_mib) != n:
             raise ValueError(
-                "D_FIXED_MIB hat %d Eintraege, die D-Gruppe %d Raenge"
+                "D_FIXED_MIB has %d entries, the D group %d ranks"
                 % (len(fixed_record_mib), n)
             )
         old = tuple(ref.fixed_mib)
@@ -3377,7 +3377,7 @@ def plan_d_residency(
     if activation_record_mib is not None:
         if len(activation_record_mib) != n:
             raise ValueError(
-                "D_ACTIVATION_MIB hat %d Eintraege, die D-Gruppe %d Raenge"
+                "D_ACTIVATION_MIB has %d entries, the D-group %d ranks"
                 % (len(activation_record_mib), n)
             )
         old_act = tuple(ref.activation_mib)

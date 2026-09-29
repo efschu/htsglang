@@ -44,7 +44,7 @@ def test_both_groups_compute_same_slot_count():
     slots = es.slot_base_for_rank(rat, fr, len(rat))
     # Was P aus SEINEN Vektoren rechnen wuerde -- die Zahl, die kollidiert.
     p_alone = es.slot_base_for_rank([512], [0.30], 1)
-    assert slots != p_alone, "Test waere sinnlos, wenn beide ohnehin gleich waeren"
+    assert slots != p_alone, "The test would be pointless if both were equal anyway"
     assert slots == es.slot_base_for_rank(rat, fr, len(rat))
 
 

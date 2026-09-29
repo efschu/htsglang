@@ -23,7 +23,7 @@ def test_without_floor_not_silently_green():
 
 def test_5090_breaks_corridor_although_bytes_fit():
     v0 = budget_verdict(**W131, corridor_floor_mib=FLOOR)[0]
-    assert v0.fits is True, "die Physik passt -- das war nie das Problem"
+    assert v0.fits is True, "the physics fits -- that was never the problem"
     assert v0.corridor_ok is False
     assert round(v0.rest_mib) == 940
     assert "115 MiB unter dem Floor" in v0.corridor_note
@@ -41,7 +41,7 @@ def test_mutant_without_145_terms_looks_green():
     nicht auf, dass die 5090 an der Grenze laeuft."""
     blind = dict(W131, foreign_context_mib=[0, 0, 0], nontorch_mib=[0, 0, 0])
     v0 = budget_verdict(**blind, corridor_floor_mib=FLOOR)[0]
-    assert v0.corridor_ok is True, "ohne die Terme faellt nichts auf"
+    assert v0.corridor_ok is True, "without the terms nothing stands out"
     assert round(v0.rest_mib) == 4367
     # Mit den Termen sind es 940 -- 3427 MiB Unterschied, die der Planer
     # als frei verbucht hat.
@@ -50,6 +50,6 @@ def test_mutant_without_145_terms_looks_green():
 
 def test_mutant_just_above_and_just_below():
     v = budget_verdict(**W131, corridor_floor_mib=940.0)[0]
-    assert v.corridor_ok is True, "genau auf dem Floor ist ok"
+    assert v.corridor_ok is True, "exactly on the floor is ok"
     v = budget_verdict(**W131, corridor_floor_mib=941.0)[0]
-    assert v.corridor_ok is False, "ein MiB darunter ist es nicht"
+    assert v.corridor_ok is False, "one MiB below it is not"

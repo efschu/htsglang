@@ -116,6 +116,6 @@ def test_w73_form_per_stage():
         assert all(a <= b for a, b in zip(now, before)), (r, now, before)
         before = now
     assert before[2] < 0.95, (
-        f"bei 11 GB Reserve muss auch die kleinste Stufe unter die "
+        f"with 11 GB reserve even the smallest stage must be below the "
         f"gefahrenen 0.95 fallen: {before}"
     )

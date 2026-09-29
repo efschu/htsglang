@@ -1167,7 +1167,7 @@ def kv_reserve_mib_per_stage(
     )
     if len(draft) != n:
         raise ValueError(
-            f"kv_reserve_mib_per_stage: {n} Stufen, aber {len(draft)} "
+            f"kv_reserve_mib_per_stage: {n} stages, but {len(draft)} "
             f"Draft-Layer-Angaben -- eine halbe Geometrie loest nichts"
         )
     cell_layer = kv_cell_bytes_per_attention_layer(
@@ -1235,7 +1235,7 @@ def solve_expert_fraction_per_stage(
     res = list(reserve_mib_by_stage) if reserve_mib_by_stage is not None else [0.0] * n
     if len(list(budgets_mib)) != n or len(rows) != n or len(res) != n:
         raise ValueError(
-            f"solve_expert_fraction_per_stage: {n} Stufen, aber "
+            f"solve_expert_fraction_per_stage: {n} stages, but "
             f"{len(list(budgets_mib))} Budgets / {len(rows)} LRU-Zeilen / "
             f"{len(res)} Reserven -- eine halbe Geometrie loest nichts"
         )
@@ -1391,7 +1391,7 @@ def d_rank_available_mib(
     rs = list(reserve_mib_by_rank) if reserve_mib_by_rank is not None else [0.0] * n
     if len(fk) != n or len(nt) != n or len(rs) != n:
         raise ValueError(
-            f"d_rank_available_mib: {n} Karten, aber {len(fk)} Fremd-Kontexte / "
+            f"d_rank_available_mib: {n} cards, but {len(fk)} foreign contexts / "
             f"{len(nt)} Nicht-Torch-Werte / {len(rs)} Reserven -- eine halbe "
             f"Bilanz entscheidet nichts"
         )

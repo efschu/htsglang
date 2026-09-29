@@ -58,7 +58,7 @@ def test_both_groups_reach_same_slot_count(_clean_env):
     os.environ[es.RESIDENT_IDS_ENV] = str(p)
     ids = es.shared_resident_ids()
     assert len(ids) == 188
-    assert 512 - len(ids) == 324, "das ist die Zahl, die P am Metall schrieb"
+    assert 512 - len(ids) == 324, "this is the number P wrote on the metal"
 
 
 @pytest.mark.parametrize("roh", ["", "abc", "1,,2", "-4", "[1,2", "1.5"])

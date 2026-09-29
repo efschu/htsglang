@@ -44,7 +44,7 @@ def test_without_env_all_as_before(chunks):
     ]
     assert m.weight_chunk_tag(7) == "weights_2"
     assert m.weight_chunk_tag(7, 200) == "weights_2", (
-        "ohne Bandteilung muss eine expert_id den Layer-Tag liefern -- sonst "
+        "without band splitting an expert_id must deliver the layer tag -- otherwise "
         "traegt jeder Aufrufer, der sie durchreicht, einen Tag, den die "
         "Familie nicht kennt"
     )
@@ -105,9 +105,9 @@ def test_band_inherits_card_of_its_chunk(band_set):
     cards = m.chunk_tag_cards([6, 3, 3], 3, 4, [0, 1, 2])
     for tag, cs in cards.items():
         chunk = m.chunk_of_band_tag(tag)
-        assert cs == cards[chunk], f"{tag} liegt auf {cs}, sein Chunk auf {cards[chunk]}"
+        assert cs == cards[chunk], f"{tag} lies on {cs}, its chunk on {cards[chunk]}"
     assert "weights_0_e7" in cards, (
-        "ohne Karten-Eintrag nimmt interleave_pause_order den missing-Zweig "
+        "without a card entry interleave_pause_order takes the missing branch "
         "und JEDER Flip faellt auf die Identitaets-Ordnung zurueck"
     )
 
@@ -117,7 +117,7 @@ def test_band_inherits_card_of_its_chunk(band_set):
 def test_family_has_every_band_and_base_stays_last(band_set):
     tags = m.weights_family_tags()
     assert tags[-1] == m.GPU_MEMORY_TYPE_WEIGHTS, (
-        "derive_waves liest tags[-1] als Basis-Tag, der die letzte Welle "
+        "derive_waves reads tags[-1] as the base tag, which the last wave "
         "schliesst -- ein Band dort wuerde IHN zur Basis machen"
     )
     for k in range(4):
@@ -150,7 +150,7 @@ def test_bands_do_not_change_wave_count(chunks, monkeypatch):
     monkeypatch.setenv(m.EXPERT_BAND_ENV_COUNT, "8")
     mit = _waves(True)
     assert len(mit) == len(without) == 2, (
-        f"{len(without)} Wellen ohne Baender, {len(mit)} mit. Ein Band bringt "
+        f"{len(without)} waves without bands, {len(mit)} with. A band brings "
         f"KEINE neue Karte; eine Welle je Band kostet laut DESIGN §1.2 "
         f"+25,8..+36,8 % Transport."
     )
@@ -170,7 +170,7 @@ def test_waves_are_a_permutation_of_the_family(band_set):
     waves = _waves(True)
     flat = [t for w in waves for t in w]
     assert sorted(flat) == sorted(m.weights_family_tags()), (
-        "build_plan verlangt eine PERMUTATION: ein Tag in zwei Wellen ist "
+        "build_plan requires a PERMUTATION: a tag in two waves is "
         "W68, ein Tag in keiner ist W74"
     )
     assert waves[-1][-1] == m.GPU_MEMORY_TYPE_WEIGHTS

@@ -52,7 +52,7 @@ def test_predicate_decides_on_the_method():
 
     assert m.ct_method_transposes(CompressedTensorsWNA16MoE()) is True
     assert m.ct_method_transposes(CompressedTensorsW8A8Int8()) is False, (
-        "genau dieser Fall war v87: ein compressed-tensors-Schema, das der "
+        "exactly this case was v87: a compressed-tensors schema that the "
         "Verbraucher NICHT transponiert"
     )
     assert m.ct_method_transposes(None) is False
@@ -72,9 +72,9 @@ def test_lock_is_gone_and_reason_named():
     src = (_ROOT / "srt/models/qwen4_exp.py").read_text()
     i = src.index("def weight_post_load")
     block = src[i : src.index("def weight_name_needed", i)]
-    assert "DEFECT and locked" not in block, "die alte Verriegelung steht noch"
+    assert "DEFECT and locked" not in block, "the old lock is still there"
     assert "_is_ct_wna16_expert_shard(name, self)" in block, (
-        "der Worker transponiert ohne das gemeinsame Praedikat zu fragen"
+        "the worker transposes without asking the shared predicate"
     )
     assert "tensor.t()" in block
     # Der ZWEITE Grund (post_load seriell je Datei) muss benannt bleiben --
