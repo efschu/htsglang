@@ -362,6 +362,11 @@ class MambaComponent(TreeComponent):
                 try:
                     n = getattr(MambaComponent, "_host_resume_count", 0) + 1
                     MambaComponent._host_resume_count = n
+                    # E2 (rankstats cache.mamba_tok): the depths the line
+                    # samples (n == 1 or n % 8), summed for every acceptance.
+                    MambaComponent._host_resume_tok = getattr(
+                        MambaComponent, "_host_resume_tok", 0
+                    ) + int(depth)
                     if n == 1 or n % 8 == 0:
                         logger.info(
                             "MAMBA-HOST-RESUME n=%d: anchor accepted at depth=%d on a "

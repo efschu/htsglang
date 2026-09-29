@@ -30,8 +30,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
 #: Bumped on every incompatible change of :class:`RankState`. A reader
@@ -41,6 +42,9 @@ from typing import Dict, List, Optional, Tuple
 #: (it carries no ``vram``); any other version is refused by name. A ``vram``
 #: block this reader refuses costs only the block (``vram_refused``), never
 #: the record: it is display and record, not a control value.
+#: 2 also carries the optional ``kv`` {holds_kv, kv_tokens, share} and ``seats``
+#: (Plan §2.1; DASHBOARD-AUS-IPC C5, 29.09.): the scheduler's own pool and seat
+#: counters, display and record only -- no gate reads them.
 RANK_STATE_SCHEMA = 2
 #: Versions this reader accepts; a record's ``vram`` is only legal from 2 on.
 RANK_STATE_SCHEMAS_READ = (1, 2)
@@ -99,6 +103,13 @@ class RankState:
     #: READER-SIDE: why this reader dropped the record's ``vram`` block
     #: (VRAM-ACTUAL-BLOCK-REFUSED), None otherwise. A writer never sets it.
     vram_refused: Optional[str] = None
+    #: C5: ``{holds_kv, kv_tokens, share}`` -- ``kv_tokens`` is the scheduler's
+    #: ``max_total_num_tokens`` (the KV pool as the rank admits against it),
+    #: ``share`` this rank's token rows per page / page_size. None before the
+    #: scheduler named them (:func:`note_capacity`).
+    kv: Optional[dict] = None
+    #: C5: the scheduler's ``max_running_requests``.
+    seats: Optional[int] = None
 
     @property
     def rank_key(self) -> str:
@@ -110,6 +121,9 @@ class RankState:
             d["dcp_owner"] = list(d["dcp_owner"])
         if d["vram_refused"] is None:
             del d["vram_refused"]  # reader-side finding; a writer's record never carries it
+        for k in ("kv", "seats"):
+            if d[k] is None:
+                del d[k]  # C5 not named yet: the record reads as before
         return json.dumps(d, sort_keys=True)
 
     @classmethod
@@ -127,7 +141,7 @@ class RankState:
             )
         names = set(cls.__dataclass_fields__)
         if schema == 1:
-            names -= {"vram", "vram_refused"}
+            names -= {"vram", "vram_refused", "kv", "seats"}
         unknown = sorted(set(d) - names)
         if unknown:
             raise RankStateSchemaError(f"RankState schema {schema} has no field(s) {unknown}")
@@ -160,21 +174,76 @@ def rank_state_path(state_dir: str, state: RankState) -> str:
     return os.path.join(state_dir, f"{state.group or 'G'}.{state.rank_key}.json")
 
 
+#: C5 (DASHBOARD-AUS-IPC, 29.09.): the counters the last :func:`note_capacity`
+#: named ({kv_tokens, seats}); every record written after it carries them.
+_CAPACITY: Dict[str, Optional[int]] = {}
+#: the last record written and its directory -- what a capacity change rewrites.
+_LAST: Optional[Tuple[RankState, str]] = None
+#: one writer at a time per process (attach, the VRAM actual, a capacity change).
+_WRITE_LOCK = threading.RLock()
+
+
+def capacity_fields(state: RankState, kv_tokens: Optional[int], seats: Optional[int]) -> dict:
+    """``kv``/``seats`` of a record from the scheduler's counters. Pure. A rank
+    that owns no token rows under the cut holds no KV, whatever the pool says."""
+    kv = None
+    if kv_tokens is not None:
+        rows, page = int(state.kv_rows_per_page), int(state.page_size)
+        kv = {"holds_kv": bool(kv_tokens) and rows > 0, "kv_tokens": int(kv_tokens),
+              "share": round(rows / page, 4) if page > 0 else None}
+    return {"kv": kv, "seats": None if seats is None else int(seats)}
+
+
 def write_rank_state(state: RankState, state_dir: Optional[str]) -> Optional[str]:
     """Atomic write of this rank's record; None when no directory was named
     (a boot outside the weg2 launcher). Raises on an I/O failure: a record
-    the launcher will decide on must not be silently absent."""
+    the launcher will decide on must not be silently absent. A record without
+    ``kv``/``seats`` takes the ones :func:`note_capacity` named (C5)."""
+    global _LAST
     if not state_dir:
         return None
-    os.makedirs(state_dir, exist_ok=True)
-    path = rank_state_path(state_dir, state)
-    tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, "w") as f:
-        f.write(state.to_json())
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    return path
+    with _WRITE_LOCK:
+        if _CAPACITY and state.kv is None and state.seats is None:
+            state = replace(state, **capacity_fields(state, _CAPACITY.get("kv_tokens"),
+                                                     _CAPACITY.get("seats")))
+        os.makedirs(state_dir, exist_ok=True)
+        path = rank_state_path(state_dir, state)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w") as f:
+            f.write(state.to_json())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _LAST = (state, state_dir)
+        return path
+
+
+def note_capacity(*, kv_tokens: Optional[int], seats: Optional[int]) -> Optional[str]:
+    """C5: the scheduler's pool and seat counters (``max_total_num_tokens``,
+    ``max_running_requests``). Unchanged = nothing written. Changed = the last
+    record is rewritten ONCE with them (its path); None while no record was
+    written yet -- the attach then carries them. Called at the end of the
+    scheduler's init and from the rankstats timer thread, never from a round."""
+    cap = {"kv_tokens": None if kv_tokens is None else int(kv_tokens),
+           "seats": None if seats is None else int(seats)}
+    with _WRITE_LOCK:
+        if cap == _CAPACITY:
+            return None
+        _CAPACITY.clear()
+        _CAPACITY.update(cap)
+        last = _LAST
+        if last is None:
+            return None
+        state, state_dir = last
+        return write_rank_state(replace(state, kv=None, seats=None, ts=time.time()), state_dir)
+
+
+def reset_capacity() -> None:
+    """Forget the counters and the last record (tests; a new process starts clean)."""
+    global _LAST
+    with _WRITE_LOCK:
+        _CAPACITY.clear()
+        _LAST = None
 
 
 def clear_rank_state_dir(state_dir: str) -> int:

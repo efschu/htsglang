@@ -7545,6 +7545,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _hit_pages_kv > 0 and completed_tokens == _hit_pages_kv * self.page_size
         )
         if self.prefetch_stop_policy != "best_effort" and not _completed_local:
+            # E2 (rankstats cache.prefetch.timeout): the reaps this line prints.
+            self._1157_reaped_n = getattr(self, "_1157_reaped_n", 0) + 1
             logger.warning(
                 "#1157 PREFETCH REAPED req=%s probed=%s requested_pages=%d "
                 "hit_pages=%d completed=%d elapsed=%.2fs budget=%.2fs "

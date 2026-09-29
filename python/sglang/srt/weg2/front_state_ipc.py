@@ -20,9 +20,11 @@ format.
 """
 from __future__ import annotations
 
+import glob
+import json
 import os
 import re
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from sglang.srt.weg2 import state_file
 
@@ -136,6 +138,62 @@ def flip_done_payload(rec: dict, flip_begin_ts: float) -> dict:
     out["chunks_n"] = len(rec.get("chunks") or ())
     out["flip_begin_ts"] = round(float(flip_begin_ts), 3)
     return out
+
+
+#: A14: the group-health verdicts on whose CHANGE the front looks for rank stops.
+RANK_STOP_VERDICTS = ("failing", "held", "dead")
+
+
+def rank_stops_of(rankstate_dir: str, group: str) -> List[Tuple[str, dict]]:
+    """``(rank_key, stop)`` for every stop the group's ranks recorded in their
+    rankstats files (weg2/rankstats.py ``stops.last``). A file of another
+    schema or a torn one is skipped, never raised."""
+    from sglang.srt.weg2 import rankstats
+
+    out: List[Tuple[str, dict]] = []
+    for p in sorted(glob.glob(os.path.join(rankstate_dir, f"{group}.*{rankstats.SUFFIX}"))):
+        try:
+            with open(p) as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict) or rec.get("schema") != rankstats.SCHEMA:
+            continue
+        rk = f"tp{rec.get('tp_rank')}pp{rec.get('pp_rank')}"
+        for s in ((rec.get("stops") or {}).get("last") or ()):
+            if isinstance(s, dict):
+                out.append((rk, dict(s, pid=rec.get("pid"))))
+    return out
+
+
+def publish_rank_stops(d: str, group: str, seen: set) -> int:
+    """A14: every stop of ``group``'s ranks not yet published -> one event
+    ``rank_stop`` (writer front; envelope group/rank/code, data t/reason/code/
+    exc/ticket/text/pid). The rank directory is the launcher's
+    ``groups.<G>.rankstate_dir``. ``seen`` belongs to the caller's ONE IPC
+    thread. Returns the number published; no state dir = 0."""
+    if not d or not os.path.exists(os.path.join(d, "state.json")):
+        return 0
+    try:
+        st = state_file.read(d)
+    except state_file.StateFileError:
+        return 0
+    rs_dir = ((st.get("groups") or {}).get(group) or {}).get("rankstate_dir")
+    if not rs_dir:
+        return 0
+    n = 0
+    for rk, s in rank_stops_of(rs_dir, group):
+        key = (group, rk, s.get("t"), s.get("code"))
+        if key in seen:
+            continue
+        try:
+            state_file.add_event(d, "rank_stop", dict(s, group=group, rank=rk),
+                                 writer="front", group=group, rank=rk, code=s.get("code"))
+        except state_file.StateFileError:
+            return n
+        seen.add(key)
+        n += 1
+    return n
 
 
 def group_health_verdict(http_ok: bool, alive: bool, streak: int, held: bool) -> str:
