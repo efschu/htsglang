@@ -17,7 +17,7 @@ from sglang.srt.managers.pp_admission_congruence import (
 )
 
 WEG2_ADMIT_T = {"lb_ms": 0.0, "lb_n": 0}  # xsn325: init_load_back wall per pass, read+reset by the POST-WAKE-PASS line
-_988_LOADBACK_SEEN = {"n": 0, "mamba": 0, "kv_only": 0}
+_988_LOADBACK_SEEN = {"n": 0, "mamba": 0, "kv_only": 0, "tok": 0}  # tok: RANKSTATS §3 cache.loadback_tok
 #: #1048: this rank's own stamp went stale between the match and the apply.
 _1048_STALE = {"n": 0}
 
@@ -32,6 +32,7 @@ def _note_988_loadback(req, new_prefix_len: int) -> None:
     ('already_in_batch'), so this line carries the geometry facts only.
     """
     _988_LOADBACK_SEEN["n"] += 1
+    _988_LOADBACK_SEEN["tok"] += int(new_prefix_len or 0)
     n = _988_LOADBACK_SEEN["n"]
     # #1040 KV/MAMBA SPLIT, COUNTED APART. A load-back that moved the KV prefix
     # while the recurrent restore refused is a HALF SUCCESS with a named link --

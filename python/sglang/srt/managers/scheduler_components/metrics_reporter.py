@@ -382,6 +382,24 @@ class RankPrefillLog:
         # same one seen again; it is monotone and never reset, so a wrap or a
         # missed read shows up as a gap rather than as a repeat.
         self.last_split_seq: int = 0
+        # RANKSTATS §3 (DASHBOARD-AUS-IPC, 29.09.): the same numbers the line
+        # carries, summed and never reset, so the rigdash reads C1/E1 from the
+        # rankstats file instead of the log. Plain adds after the line is
+        # emitted; the rankstats timer thread only reads this dict.
+        # ``compute_ms``/``wait_ms`` sum only the split-known flushes
+        # (``split_ms`` is their gpu-ms), so compute+wait never mixes with a
+        # graph-covered forward's unsplit time.
+        self.cum: dict = {
+            "chunks": 0, "new_tokens": 0, "cached_tokens": 0, "gpu_ms": 0.0,
+            "split_ms": 0.0, "compute_ms": 0.0, "wait_ms": 0.0, "bubble_ms": 0.0,
+            "last": None,
+        }
+
+    def _cum_untimed(self, new_tokens: int, cached_tokens: int) -> None:
+        c = self.cum
+        c["chunks"] += 1
+        c["new_tokens"] += int(new_tokens or 0)
+        c["cached_tokens"] += int(cached_tokens or 0)
 
     @property
     def has_pending(self) -> bool:
@@ -421,6 +439,7 @@ class RankPrefillLog:
                 new_tokens,
                 cached_tokens,
             )
+            self._cum_untimed(new_tokens, cached_tokens)
 
     def _drain_untimed(self) -> None:
         """Emit the queued records without a duration, and drop the durations.
@@ -437,6 +456,7 @@ class RankPrefillLog:
                 new_tokens,
                 cached_tokens,
             )
+            self._cum_untimed(new_tokens, cached_tokens)
 
     def _refuse_pairing(self, skew: int) -> None:
         """Announce once, then stop attaching durations on this rank.
@@ -571,6 +591,21 @@ class RankPrefillLog:
         self.last_gpu_ms = gpu_s * 1000.0
         self.last_wait_ms = (wait_s * 1000.0) if split_known else None
         self.last_split_known = split_known
+        c = self.cum
+        c["chunks"] += k
+        c["new_tokens"] += new_tokens
+        c["cached_tokens"] += cached_tokens
+        c["gpu_ms"] += gpu_s * 1000.0
+        c["bubble_ms"] += bubble_ms
+        compute_ms = None
+        if split_known:
+            compute_ms = max(gpu_s - wait_s, 0.0) * 1000.0
+            c["split_ms"] += gpu_s * 1000.0
+            c["compute_ms"] += compute_ms
+            c["wait_ms"] += wait_s * 1000.0
+        c["last"] = {"t": round(time.time(), 3), "new": new_tokens,
+                     "gpu_ms": round(gpu_s * 1000.0, 1),
+                     "compute_ms": None if compute_ms is None else round(compute_ms, 1)}
         if split_known:
             # Advanced only for a reading a consumer may legitimately count.
             # A graph-covered flush leaves the sequence where it was, so the
@@ -646,6 +681,14 @@ class SchedulerMetricsReporter:
         self.spec_total_num_forward_ct = 0
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
+        # RANKSTATS §3 (C3): lifetime EWMA of the logged accept len/rate and
+        # the last logged graph flag / running count; None until first logged.
+        self.accept_len_ewma = None
+        self.accept_rate_ewma = None
+        self.last_cuda_graph = None
+        self.last_running_reqs = None
+        # C2: the last prefill report's #pending-token (every rank, pre-gate).
+        self.last_pending_tokens = None
 
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
@@ -1170,6 +1213,7 @@ class SchedulerMetricsReporter:
         # Before the logging-rank gate: the online estimator runs on the rank
         # that carries the lanes, which is not necessarily the logging rank.
         self.prefill_tokens_total += int(prefill_stats.log_input_tokens or 0)
+        self.last_pending_tokens = getattr(prefill_stats, "num_pending_tokens", None)
         # #861k: the wrong-layout detector, also before the gate -- the
         # conformance counters are rank-local and every rank runs the same
         # batch, so every rank keeps its own honest count.
@@ -1495,6 +1539,18 @@ class SchedulerMetricsReporter:
                 f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
             )
 
+        # RANKSTATS §3 (C3): the values this line prints, kept for the
+        # rankstats timer (read-only there); EWMA over the log intervals.
+        if spec_accept_length:
+            a = 0.2
+            self.accept_len_ewma = (
+                float(spec_accept_length) if self.accept_len_ewma is None
+                else (1 - a) * self.accept_len_ewma + a * float(spec_accept_length))
+            self.accept_rate_ewma = (
+                float(spec_accept_rate) if self.accept_rate_ewma is None
+                else (1 - a) * self.accept_rate_ewma + a * float(spec_accept_rate))
+        self.last_cuda_graph = bool(can_run_cuda_graph)
+        self.last_running_reqs = num_running_reqs
         msg += (
             f"{self._graph_backend_label}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
