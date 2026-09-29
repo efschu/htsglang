@@ -3001,6 +3001,10 @@ class KvStageTable(msgspec.Struct, frozen=True, kw_only=True):
     #: per batch b: the ids' row demand D(b) and today's (stage-free) waves
     demand: Tuple[int, ...] = ()
     waves: Tuple[int, ...] = ()
+    #: 29.09. (Grundgesetz, stages below the booked S0): the rows the unbooked
+    #: KV between the floor stage and the booked S0 funds -- ON at the floor,
+    #: an addition to the booked bank (``rows`` includes them)
+    low_rows: int = 0
 
     def capture_waves(self, max_by_seats: Sequence[int]) -> Tuple[int, ...]:
         """Per batch b = 1..cap: the waves b's captured step needs under a
@@ -3027,7 +3031,7 @@ def kv_stage_table(
     rows: Sequence[SeatTableRow], form: SeatVramForm, *, kv_cell_bytes: int, kv_tokens: int,
     local_experts: int, verify_tokens: int, top_k: int, host_rank: int = 0,
     steps: Sequence[float] = (0.5, 1.0), staging_rows: int = 0,
-    why: Optional[List[str]] = None,
+    why: Optional[List[str]] = None, floor_tokens: int = 0,
 ) -> Optional[KvStageTable]:
     """#251c: the stage form over the H95 seat table (n = 1..cap).
 
@@ -3062,10 +3066,22 @@ def kv_stage_table(
     if C <= 0 or row_bytes <= 0:
         return _none("keine Scratch-Geometrie (Scratch %d, Stufenzeile %d B)" % (C, row_bytes))
     t0 = int(kv_tokens)
-    tokens = (t0,) + tuple(t0 + int(round(t0 * float(s))) for s in steps)
-    stage_rows = tuple(-(-(t - t0) * int(kv_cell_bytes) // row_bytes) for t in tokens)
+    up = (t0,) + tuple(t0 + int(round(t0 * float(s))) for s in steps)
+    # 29.09. (Nutzer 12:35Z, Grundgesetz): stages BELOW the booked S0 at the
+    # floor's granularity (floor, 2 x floor, ... < S0). The booked plan still
+    # prices S0's KV; the KV between the floor and S0 is born unmapped and its
+    # bytes fund ``low`` more expert rows (rounded DOWN: never a byte more than
+    # the unmapped KV). The stage rows count from the floor, so S0 and every
+    # stage above it keep exactly today's rows (capture floor and waves unchanged).
+    fl = int(floor_tokens or 0)
+    below = tuple(range(fl, t0, fl)) if 0 < fl < t0 else ()
+    cell = int(kv_cell_bytes)
+    low = ((t0 - below[0]) * cell // row_bytes) if below else 0
+    tokens = below + up
+    stage_rows = tuple(low - ((t0 - t) * cell // row_bytes) for t in below) + tuple(
+        low + -(-(t - t0) * cell // row_bytes) for t in up)
     S = int(stage_rows[-1]) + 1
-    if C - S <= max(1, int(staging_rows)):
+    if C + low - S <= max(1, int(staging_rows)):
         return _none(
             "Scratch zu klein fuer die oberste Stufe: C %d - S %d = %d <= Staging %d "
             "(Stufen %s Token, Stufenzeilen %s bei %d B/Token und %.1f MiB/Zeile) -- "
@@ -3085,7 +3101,7 @@ def kv_stage_table(
     for n, row in enumerate(rows, start=1):
         need_n = max(need_b[:n])
         extra = int(row.seat_extra[h]) if row.seat_extra and h < len(row.seat_extra) else 0
-        caps = tuple(C + extra - int(r) for r in stage_rows)
+        caps = tuple(C + low + extra - int(r) for r in stage_rows)
         need.append(need_n)
         cap_rows.append(caps)
         max_by.append(max([j for j, c in enumerate(caps) if c >= need_n] or [0]))
@@ -3093,7 +3109,7 @@ def kv_stage_table(
         tokens=tokens, stage_rows=stage_rows, rows=S, max_by_seats=tuple(max_by),
         need=tuple(need), capacity=tuple(cap_rows), scratch=C, host_rank=h,
         row_mib=round(row_bytes / MIB, 2), kv_cell_bytes=int(kv_cell_bytes),
-        demand=tuple(demand), waves=tuple(waves))
+        demand=tuple(demand), waves=tuple(waves), low_rows=int(low))
 
 
 def kv_stage_trim_cell(fit: "DRankResidency", host_rank: int = 0) -> int:
@@ -3170,7 +3186,7 @@ class KvStageGroup(msgspec.Struct, frozen=True, kw_only=True):
 def kv_stage_group(
     rows: Sequence[SeatTableRow], form: SeatVramForm, fits: Sequence["DRankResidency"], *,
     verify_tokens: int, top_k: int, host_rank: int = 0, steps: Sequence[float] = (0.5, 1.0),
-    why: Optional[List[str]] = None,
+    why: Optional[List[str]] = None, floor_tokens: int = 0,
 ) -> Optional[KvStageGroup]:
     """#239 S3g: :class:`KvStageGroup` over the FRACTION-SOLVE's ``fits`` --
     the host's table as in #251c, then one per worker whose trim cell is > 0
@@ -3194,7 +3210,8 @@ def kv_stage_group(
             rows, form, kv_cell_bytes=kv_stage_trim_cell(f, host_rank),
             kv_tokens=int(host.kv_tokens), local_experts=int(f.local_experts),
             verify_tokens=int(verify_tokens), top_k=int(top_k), host_rank=int(f.rank),
-            steps=steps, staging_rows=int(f.staging_rows), why=sub)
+            steps=steps, staging_rows=int(f.staging_rows), why=sub,
+            floor_tokens=int(floor_tokens))
         if t is None:
             if why is not None:  # the host's reason reads as in #251c
                 why.append(("" if f is host else "Rang %d: " % int(f.rank))

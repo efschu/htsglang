@@ -2797,6 +2797,25 @@ def d_kv_stage_tokens_named(ns) -> Optional[Tuple[int, ...]]:
         return ()
 
 
+#: 29.09.: the lowest KV stage and the step of the stages below the booked S0
+D_KV_STAGE_FLOOR_KEY = "SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS"
+
+
+def d_kv_stage_floor_tokens(env: Mapping[str, str]) -> int:
+    """29.09. (Nutzer 12:35Z, Grundgesetz): the floor stage below S0 in tokens --
+    stages floor, 2 x floor, ... below the booked S0 (0 = none, byte-identical).
+    The D group's env wins over the environ default."""
+    raw = (env or {}).get(D_KV_STAGE_FLOOR_KEY)
+    if raw is None:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS.get() or 0))
+    try:
+        return max(0, int(float(str(raw).strip() or 0)))
+    except ValueError:
+        return 0
+
+
 def d_kv_stage_by_demand(env: Mapping[str, str]) -> bool:
     """#251d: SGLANG_WEG2_D_KV_STAGE_BY_DEMAND in the D group's env; a D env that
     does not name it gets the rank's own default (environ.py, ON since 29.09.),
@@ -3078,8 +3097,10 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
                    next((int(f.kv_tokens) for f in fits if f.rank == host_rank),
                         "die gebuchten"))]
     why: List[str] = []
+    floor_tokens = d_kv_stage_floor_tokens(env)
     group = er.kv_stage_group(rows, seat_vram, fits, verify_tokens=int(verify_tokens),
-                              top_k=int(top_k), host_rank=host_rank, why=why)
+                              top_k=int(top_k), host_rank=host_rank, why=why,
+                              floor_tokens=floor_tokens)
     if group is None:
         return ["%s: entfaellt -- %s" % (head, "; ".join(why) or "ohne Grund")]
     tab = group.host
@@ -3115,9 +3136,11 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
     scratch = _rank_vec(env.get("SGLANG_MOE_SCRATCH_SLOTS"), n)
     seat_raw = env.get("SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
     seat = _rank_vec(seat_raw, n)
-    # every KV rank moves its stage rows from its scratch into its seat rows
+    # every KV rank moves its stage rows from its scratch into its seat rows;
+    # the rows a floor below S0 funds (low_rows) are NEW rows of the bank (the
+    # KV they replace is born unmapped), so only the rest leaves the scratch
     for t in group.tables:
-        scratch[t.host_rank] -= t.rows
+        scratch[t.host_rank] -= t.rows - int(getattr(t, "low_rows", 0) or 0)
         seat[t.host_rank] += t.rows
     items = {
         "SGLANG_MOE_SCRATCH_SLOTS": ",".join(str(x) for x in scratch),

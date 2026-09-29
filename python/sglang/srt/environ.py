@@ -2781,6 +2781,12 @@ class Envs:
     #   coldest kept rows first (weg2/d_mem_sched.py). ON by default; this is
     #   the diagnosis-only emergency stop, not a feature switch.
     SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS = EnvBool(False)
+    # 29.09. (Nutzer 12:35Z, Grundgesetz): KV stages BELOW the booked S0 at this
+    #   granularity (floor, 2 x floor, ... < S0, e.g. 32768). The plan still
+    #   books S0; the KV between the floor and S0 is born unmapped and funds
+    #   expert rows that the wake / the D-MEM-SCHED tick turn off as the known
+    #   tokens grow. 0 = no stage below S0, byte-identical.
+    SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS = EnvInt(0)
     # #254: how a prefill forward that overflows the scratch region is split.
     #   "token"  (default) -- waves are disjoint TOKEN subsets; every wave
     #     re-fetches the spill experts its tokens need, so a spill expert is
