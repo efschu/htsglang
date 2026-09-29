@@ -7877,6 +7877,35 @@ def publish_expert_bands(layer, attr: str, buf, resident_ids) -> int:
     return n
 
 
+class H2dCutBroken(RuntimeError):
+    """BOOTZEIT 5d: a row the presplit takes from the card's [E] copy was not
+    in the h2d cut -- it would carry the cut's zeros into the resident buffer
+    (forward, flip exchange) or into the shared store (every reader)."""
+
+
+def assert_h2d_cut_covers(layer, rows, *, what: str) -> None:
+    """Every local row in ``rows`` must be one the presplit's h2d copied.
+
+    ``layer._h2d_cut_rows`` is the cut ``_ct_stream_presplit_now`` handed to
+    ``device_loading_context`` (None = the full copy, nothing to check). The
+    cut is ``store_adopt.repack_rows`` = all rows but the H2-vetoed; a vetoed
+    row is never a resident (``filter_store_rows`` raises) and never written
+    (it is skipped there) -- this guard is the same promise stated against the
+    cut itself, so a later change on either side fails loudly instead of
+    loading zeros."""
+    cut = getattr(layer, "_h2d_cut_rows", None)
+    if cut is None:
+        return
+    have = set(int(r) for r in cut)
+    missing = sorted(int(r) for r in rows if int(r) not in have)
+    if missing:
+        raise H2dCutBroken(
+            f"BOOTZEIT5d NULL-ROW: layer {getattr(layer, 'layer_id', '?')} {what}: "
+            f"{len(missing)} rows were not copied to the card (first local "
+            f"{missing[:4]}) -- the cut zeroed them; set "
+            f"SGLANG_OPT_LOAD_H2D_READ_ROWS=0 and report the layer")
+
+
 def presplit_expert_offload_after_repack(
     layer, cold_shard: Optional[ColdShardContext] = None
 ) -> None:  # pragma: no cover - CUDA
@@ -8020,6 +8049,13 @@ def presplit_expert_offload_after_repack(
     if store_rows is not None:
         layer._moe_offload_store_index = dict(store_rows[4])
 
+    # BOOTZEIT 5d: the residents (buffer rows the forward and the flip
+    # exchange read) must all have crossed to the card
+    assert_h2d_cut_covers(
+        layer,
+        range(int(R)) if static else plan.resident_ids,
+        what="resident rows",
+    )
     presplit = {}
     freed_device = 0
     freed_host = 0
@@ -8141,6 +8177,7 @@ def presplit_expert_offload_after_repack(
                     "not rewritten), %d written",
                     _sa.MARKER, s_key, attr, _n_adopt, len(_rows_w),
                 )
+            assert_h2d_cut_covers(layer, _rows_w.keys(), what=f"store rows {attr}")
             _t_write = time.perf_counter()
             written = _es.write_rows(
                 spill, t, list(plan.spill_ids), s_lo, s_pad, rows=_rows_w

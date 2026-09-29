@@ -1585,6 +1585,8 @@ class FusedMoE(torch.nn.Module):
         ):
             if state.get("device_ctx", True):
                 _h2d_rows = ct_h2d_rows(self)
+                # the presplit checks every row it takes against this cut
+                self._h2d_cut_rows = _h2d_rows
                 _ctx = (
                     device_loading_context(self, state["device"])
                     if _h2d_rows is None
@@ -1627,6 +1629,7 @@ class FusedMoE(torch.nn.Module):
         # BOOTZEIT 5c: this layer's host stack is gone (the context above has
         # exited) -- now the next layer's store files may open beside the
         # load (layers/moe/store_prefetch.py; SGLANG_OPT_LOAD_STORE_PREFETCH).
+        self.__dict__.pop("_h2d_cut_rows", None)  # this layer's cut is spent
         _next = self.__dict__.pop("_store_prefetch_next", None)
         if _next is not None:
             from sglang.srt.layers.moe import store_prefetch as _sp

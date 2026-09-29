@@ -134,5 +134,77 @@ class TestPresplitCallEdge(unittest.TestCase):
         self.assertTrue(envs.SGLANG_OPT_LOAD_H2D_READ_ROWS.get())
 
 
+class TestZeroRowsNeverLeaveTheCard(unittest.TestCase):
+    """Operator condition 29.09.: a zero row of the cut must never reach a
+    forward or a flip deposit before it is filled. The forward and the flip
+    exchange read the presplit's resident buffer; a non-resident expert is
+    filled at run time from the shared store (P's bytes). So the invariant
+    is: every row the presplit takes from the card's [E] copy -- residents
+    into the buffer, rows into the store -- was in the cut."""
+
+    def _layer(self, vetoed_global):
+        import types
+
+        return types.SimpleNamespace(
+            layer_id=5, num_experts=512, num_local_experts=9,
+            _expert_shard_generic=True, _gguf_expert_range=(100, 108),
+            _moe_store_adopt_vetoed_global=set(vetoed_global),
+        )
+
+    def test_guard_refuses_a_resident_outside_the_cut(self):
+        from sglang.srt.layers.moe import expert_offload as eo
+
+        layer = self._layer(())
+        layer._h2d_cut_rows = [0, 1, 2, 5]
+        eo.assert_h2d_cut_covers(layer, [0, 2, 5], what="resident rows")
+        with self.assertRaises(eo.H2dCutBroken):
+            eo.assert_h2d_cut_covers(layer, [0, 3], what="resident rows")
+        layer._h2d_cut_rows = None  # full copy: nothing to check
+        eo.assert_h2d_cut_covers(layer, [0, 3, 8], what="resident rows")
+
+    def test_what_h2_lets_through_is_always_inside_the_cut(self):
+        # Derived across the real functions: the cut (repack_rows) against
+        # what filter_store_rows accepts as residents and keeps for writing.
+        from sglang.srt.layers.moe import store_adopt as sa
+
+        vetoed = {101, 103, 104}  # local 2, 4, 5 (pad: local = g - lo + 1)
+        layer = self._layer(vetoed)
+        with envs.SGLANG_MOE_REPACK_SKIP_VETOED.override(True):
+            cut = set(sa.repack_rows(layer, 9))
+        self.assertEqual(cut, {0, 1, 3, 6, 7, 8})
+        rows = {e: e for e in range(1, 9)}  # every local id has a store slot
+        with mock.patch.object(sa, "snapshot_rows",
+                               return_value={("L5", "w13_weight_packed"): frozenset(range(9))}):
+            keep, n = sa.filter_store_rows(layer, "w13_weight_packed", rows,
+                                           resident_local=[0, 1, 3], lo=100, pad=True)
+            self.assertEqual(n, 3)
+            self.assertTrue(set(keep) <= cut)
+            with self.assertRaises(sa.StoreAdoptBroken):
+                sa.filter_store_rows(layer, "w13_weight_packed", rows,
+                                     resident_local=[0, 2], lo=100, pad=True)
+
+    def test_presplit_checks_before_it_copies_or_writes(self):
+        from sglang.srt.layers.moe import expert_offload as eo
+
+        src = textwrap.dedent(inspect.getsource(eo.presplit_expert_offload_after_repack))
+        fn = ast.parse(src).body[0]
+
+        def lines(pred):
+            return sorted(n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call) and pred(n))
+
+        guard = lines(lambda n: getattr(n.func, "id", "") == "assert_h2d_cut_covers")
+        write = lines(lambda n: getattr(n.func, "attr", "") == "write_rows")
+        copies = lines(lambda n: getattr(n.func, "attr", "") == "copy_"
+                       and isinstance(n.func.value, ast.Subscript)
+                       and getattr(n.func.value.value, "id", "") == "buf")
+        self.assertEqual(len(guard), 2)
+        self.assertLess(guard[0], min(copies))
+        self.assertLess(guard[1], write[0])
+        # the cut the guard reads is the one the h2d used, and it is cleared
+        pre = inspect.getsource(fl.FusedMoE._ct_stream_presplit_now)
+        self.assertIn("self._h2d_cut_rows = _h2d_rows", pre)
+        self.assertIn('pop("_h2d_cut_rows"', pre)
+
+
 if __name__ == "__main__":
     unittest.main()
