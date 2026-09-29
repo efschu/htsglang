@@ -106,6 +106,7 @@ def own_image(
     card: str,
     phase: str,
     device,
+    include=None,
 ) -> ArenaLayout:
     """Pack this rank's weights into an exportable arena and publish them.
 
@@ -117,6 +118,13 @@ def own_image(
     from sglang.srt.managers.phase_flip_boot import checkpoint_param_dict
 
     named = _shareable(checkpoint_param_dict(model))
+    if include is not None:
+        # DUAL-TP3PP3: only what the peer can bind goes into the image; the rest
+        # stays where the loader put it (TMS weight tags: sleepable in stage 2).
+        kept_out = sum(1 for n in named if not include(n))
+        named = {n: t for n, t in named.items() if include(n)}
+        logger.info("WEG2-UNION OWNER image filter: %d tensors in, %d stay outside the image",
+                    len(named), kept_out)
     layout = plan_arena_layout(dict(named))
     before = _free_bytes(device)
     # BEFORE the pack. Once a parameter is rebound to an arena view its
@@ -267,6 +275,7 @@ def maybe_union_image(model, *, device, role: str = "main") -> Optional[str]:
             card=card,
             phase=phase,
             device=device,
+            include=(dual_share_include() if phase == PHASE_D and role == "main" else None),
         )
     else:
         bind_image(
@@ -307,3 +316,46 @@ def write_d_ratios(union_dir: str) -> str:
     logger.info("WEG2-UNION D ratios published for the dual P stage: %s -> %s",
                 {"tp": base, "families": fams}, path)
     return path
+
+
+#: DUAL-TP3PP3: the P layer cut ("49,8,7") and which P stage shares this D
+#: rank's card; with both set, D's image holds only the tensors that P stage
+#: binds (its layers; embed on stage 0; lm_head/final norm on the last stage).
+DUAL_P_CUT_ENV = "SGLANG_WEG2_DUAL_P_CUT"
+DUAL_P_STAGE_OF_RANK_ENV = "SGLANG_WEG2_DUAL_P_STAGE_OF_D_RANK"
+
+
+def dual_share_include_for(cut, stage: int):
+    """Name filter for D's image under the P stage ``stage`` of ``cut``."""
+    import re
+
+    cut = [int(x) for x in cut]
+    lo = sum(cut[:stage])
+    hi = lo + cut[stage]
+    last = stage == len(cut) - 1
+    layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+    def include(name: str) -> bool:
+        m = layer_re.search(name)
+        if m:
+            return lo <= int(m.group(1)) < hi
+        if "embed_tokens" in name:
+            return stage == 0
+        if "lm_head" in name or name.endswith("model.norm.weight") or name.endswith(".norm.weight"):
+            return last
+        return False
+
+    return include
+
+
+def dual_share_include():
+    """The filter for THIS D rank, from env; None (whole image) when unset."""
+    cut = os.environ.get(DUAL_P_CUT_ENV, "").strip()
+    if not cut:
+        return None
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    r = int(get_tensor_model_parallel_rank())
+    stages = [int(x) for x in os.environ.get(DUAL_P_STAGE_OF_RANK_ENV, "").split(",") if x.strip()]
+    stage = stages[r] if stages else r
+    return dual_share_include_for(cut.split(","), stage)

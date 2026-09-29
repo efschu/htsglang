@@ -13571,6 +13571,17 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
     return env
 
 
+def dual_p_cut_from_argv(argv) -> str:
+    """The --pp-stage-ratio group P was launched with ('' if absent)."""
+    argv = list(argv or ())
+    for i, t in enumerate(argv):
+        if t == "--pp-stage-ratio" and i + 1 < len(argv):
+            return str(argv[i + 1])
+        if str(t).startswith("--pp-stage-ratio="):
+            return str(t).split("=", 1)[1]
+    return ""
+
+
 def dual_share_planned_dc(cards, budgets_p: List[int], extra_p: str, overhead_mib: int) -> Dict[str, int]:
     """What P will hold per card, from its PLAN: the effective P budget (an
     --extra-p '--rank-gpu-memory-mib' lowers the launcher's, W100) plus what P
@@ -24929,7 +24940,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                          int(getattr(ns, "dual_p_overhead_mib", 1500)))
         log("WEG2-DUAL-SHARE D sized from P's PLAN (budget + overhead, MiB): " + ", ".join(
             f"nvml{c.nvml_index} {_dual_dc[c.uuid]}" for c in cards))
-        _sd, _ = _d_spec_from(_dual_dc, "D(dual-share, P-Plan)", dual_share_env(ns, "D"))
+        _denv = dual_share_env(ns, "D")
+        _pcut = dual_p_cut_from_argv(spec_p.argv)
+        if _pcut:
+            # D's union image then holds only what the P stage on each card binds;
+            # D's other weights stay in their TMS tags (sleepable, stage 2).
+            _denv["SGLANG_WEG2_DUAL_P_CUT"] = _pcut
+        log(f"WEG2-DUAL-SHARE P cut for D's image filter: {_pcut or '(none -> whole image)'}")
+        _sd, _ = _d_spec_from(_dual_dc, "D(dual-share, P-Plan)", _denv)
         _sd.env.update(ns._dual_mps_env)
         state.argv["D"] = " ".join(shlex.quote(a) for a in _sd.argv)
         launch_group(_sd, tree, log, dry)

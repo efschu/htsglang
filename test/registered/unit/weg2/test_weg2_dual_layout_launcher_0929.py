@@ -146,3 +146,21 @@ class DualLayoutLauncher(CustomTestCase):
         self.assertLess(blk.index('wait_ready(PORT_D, _sd.pid'), blk.index("DUAL_D_READY_FILE"))
         self.assertLess(src.index("DUAL_D_READY_FILE), \"w\")"),
                         src.index('state.t_ready["P"] = wait_ready(PORT_P'))
+
+    def test_p_cut_reaches_ds_image_filter(self):
+        self.assertEqual(L.dual_p_cut_from_argv(["x", "--pp-stage-ratio", "49,8,7", "y"]), "49,8,7")
+        self.assertEqual(L.dual_p_cut_from_argv(["--pp-stage-ratio=13,30,21"]), "13,30,21")
+        self.assertEqual(L.dual_p_cut_from_argv(["--pp-size", "3"]), "")
+        from sglang.srt.weg2.union_arena_bind import dual_share_include_for
+
+        inc0 = dual_share_include_for(["49", "8", "7"], 0)
+        inc2 = dual_share_include_for(["49", "8", "7"], 2)
+        self.assertTrue(inc0("model.language_model.layers.48.mlp.down_proj.weight_packed"))
+        self.assertFalse(inc0("model.language_model.layers.49.mlp.down_proj.weight_packed"))
+        self.assertTrue(inc0("model.language_model.embed_tokens.weight"))
+        self.assertFalse(inc0("lm_head.weight"))
+        self.assertTrue(inc2("model.language_model.layers.63.self_attn.o_proj.weight"))
+        self.assertFalse(inc2("model.language_model.layers.56.self_attn.o_proj.weight"))
+        self.assertTrue(inc2("lm_head.weight"))
+        self.assertTrue(inc2("model.language_model.norm.weight"))
+        self.assertFalse(inc2("model.language_model.embed_tokens.weight"))
