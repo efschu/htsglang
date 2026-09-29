@@ -22003,6 +22003,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if calib_identity is not None:
             log("WEG2-PROFILE calibration identity (" + boot_form.profile + "): a measured "
                 "source counts only when its boot ran " + calib_identity.describe())
+            _head_gap = calib_identity.head_unresolvable_line()
+            if _head_gap:
+                log(_head_gap)
         if _h87_alias_line:
             log(_h87_alias_line)
         log("#114 P-PREFILL-TRANSIENT (form " + boot_form.describe() + "): "

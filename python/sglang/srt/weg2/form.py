@@ -2117,6 +2117,20 @@ class CalibrationIdentity:
                 return None
         return None
 
+    def head_unresolvable_line(self) -> Optional[str]:
+        """The loud line when the ``line`` term cannot read the tree's HEAD;
+        None when it can (or the term is not used). Without HEAD only the
+        declared line heads can prove a boot's commit, so every record measured
+        on a newer tip is silently priced as CONSTANT -- a git-archive dry-run
+        tree put 27B-P 1040 MiB low that way (29.09., z30j vs x27ra)."""
+        if not self.uses_line or _repo_head(self.repo):
+            return None
+        heads = ", ".join(h[:10] for h in self.line_heads) or "none"
+        return (f"RECORD-IDENTITY UNRESOLVABLE: tree {self.repo} has no readable git HEAD "
+                f"(no .git?) -- the line term proves only boots on the declared heads "
+                f"({heads}); every record measured on a newer commit falls to CONSTANT. "
+                f"Run on a git checkout of the tree.")
+
     def describe(self) -> str:
         parts = [f"checkpoint {model_key(self.model)}"]
         if "form" in self.fields and self.form is not None:
