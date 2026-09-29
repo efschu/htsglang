@@ -126,6 +126,36 @@
    "power_limit_source": "not a power-dependent quantity (bytes per extend row)"
   },
   {
+   "name": "D_POOL_PEAK_NONRES_ROWS",
+   "value": [
+    89,
+    32,
+    43
+   ],
+   "provenance": "rc12z30r3 (ad95392095, boot dkrnfh91dprsavisadoptstcutvsyncodxbz3bar1dauer09290548, 29.09. 05:48Z, flip steady state, SGLANG_DEBUG_MOE_POOL_DEMAND=64): maximum of 'MOE-POOL-DEMAND (H95) ... max_nonres_per_step' per D rank over 117 lines each (TP0 89 of C 100, TP1 32 of C 48, TP2 43 of C 48; over_C_steps 0). Stage form off in that boot (SGLANG_WEG2_D_KV_STAGE_TOKENS=262144), so C was the whole LRU. The floor of the stage solve (launcher kv_stage_lru_floor) scales it by the non-resident span of the form it prices (D_POOL_PEAK_NONRES_SPAN_ROWS).",
+   "boots": [
+    "dkrnfh91dprsavisadoptstcutvsyncodxbz3bar1dauer09290548"
+   ],
+   "kind": "census",
+   "power_limit_w": null,
+   "power_limit_source": "not a power-dependent quantity (expert ids a step routes)"
+  },
+  {
+   "name": "D_POOL_PEAK_NONRES_SPAN_ROWS",
+   "value": [
+    204,
+    61,
+    94
+   ],
+   "provenance": "the non-resident span E - R per D rank of the form D_POOL_PEAK_NONRES_ROWS was measured on (dkrnfh91dprsavisadoptstcutvsyncodxbz3bar1dauer09290548 front 'FRACTION-SOLVE D rang<r>': E 227/128/160, R 23/67/66; POOL-SCHRITT 'Pflicht je Rang [204, 61, 94] = min(Ids, E-R)').",
+   "boots": [
+    "dkrnfh91dprsavisadoptstcutvsyncodxbz3bar1dauer09290548"
+   ],
+   "kind": "geometry",
+   "power_limit_w": null,
+   "power_limit_source": "not a power-dependent quantity (a row count of the form)"
+  },
+  {
    "name": "P_ACTIVATION_MIB",
    "value": [
     5984,

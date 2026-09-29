@@ -486,11 +486,12 @@ def p_dormant_records(profile: Optional[str],
     return host_ledger.read_measured_records(measured_record_path(), "P", accept=accept)
 
 
-def p_dormant_from_records(
+def dormant_max_from_records(
     recs: Optional[Sequence[Dict[str, object]]], cards: Sequence[Card], weight_source: str,
-    n: int = P_DORMANT_EXPECT_N,
+    n: int = P_DORMANT_EXPECT_N, group: str = "P",
 ) -> Tuple[Optional[Dict[str, int]], str]:
-    """Group P's MEASURED dormant VRAM residue per card: the per-card MAXIMUM
+    """A group's MEASURED dormant VRAM residue per card (``group`` names it in
+    the provenance; the caller reads that group's records): the per-card MAXIMUM
     over the newest ``n`` group-P dormant-image records (one per boot) that
     the front stamped at P's first sleep (``vram_residue_mib``, the same
     field #1444 reads for group D), measured under the SAME weight form and
@@ -507,7 +508,7 @@ def p_dormant_from_records(
     expectation passes and an early D start read it here, not from a second
     source."""
     if not recs:
-        return None, "no group-P dormant-image record in the sidecar"
+        return None, f"no group-{group} dormant-image record in the sidecar"
     by_boot: Dict[str, Dict[str, object]] = {}
     skipped = []
     for rec in sorted((r for r in recs if isinstance(r, dict)),
@@ -529,7 +530,7 @@ def p_dormant_from_records(
         if len(by_boot) >= int(n):
             break
     if not by_boot:
-        return None, (f"no group-P record measured under form {str(weight_source)!r} on "
+        return None, (f"no group-{group} record measured under form {str(weight_source)!r} on "
                       f"every card (skipped: {', '.join(skipped[:4]) or 'none'})")
     out: Dict[str, int] = {}
     parts = []
@@ -537,9 +538,62 @@ def p_dormant_from_records(
         vals = [int(r["vram_residue_mib"][c.uuid]) for r in by_boot.values()]
         out[c.uuid] = max(vals)
         parts.append(f"nvml{c.nvml_index} {out[c.uuid]} (min {min(vals)})")
-    return out, (f"MAX over the newest {len(by_boot)} of N={int(n)} group-P records form "
+    return out, (f"MAX over the newest {len(by_boot)} of N={int(n)} group-{group} records form "
                  f"{str(weight_source)!r}: " + ", ".join(parts) + " MiB; boots "
                  + ", ".join(by_boot))
+
+
+def p_dormant_from_records(
+    recs: Optional[Sequence[Dict[str, object]]], cards: Sequence[Card], weight_source: str,
+    n: int = P_DORMANT_EXPECT_N,
+) -> Tuple[Optional[Dict[str, int]], str]:
+    """Group P's measured dormant residue for D's expectation budget
+    (:func:`dormant_max_from_records` over group-P records)."""
+    return dormant_max_from_records(recs, cards, weight_source, n, group="P")
+
+
+D_RESERVE_RECORD_ENV = "SGLANG_WEG2_D_RESERVE_RECORD_MAX"
+
+
+def d_reserve_from_records_or_census(
+    cards: Sequence[Card], dc_expect_d: Mapping[str, int], census_reserve: Mapping[str, int],
+    d_max: Optional[Mapping[str, int]], slack_mib: int, record_priced: bool,
+) -> Tuple[Dict[str, int], List[str]]:
+    """Group D's dormant-residue RESERVE per card on the census-priced profile
+    (Next Flash): what P's budget subtracts, the front's ``--dc-reserve`` and
+    the W19 bolt at D's first sleep grade.
+
+    With D records of this identity and form (``d_max`` = per-card maximum over
+    the newest boots, :func:`dormant_max_from_records`): that maximum +
+    :data:`DC_RECORD_MARGIN_MIB` + slack -- the same margin the single #1444
+    record carried. The census is only reported. Before (still without
+    records): per card the larger of the newest record and the xchg census.
+    rc12z30r3: census 1140/1538 (nvml0/2) against D records 612-680, so P's
+    budget carried ~460/860 MiB per 3080 for a D residue that was never there
+    -- VRAM that belongs to P's resident experts. The fnFL2x111 lesson (an
+    OLDER census undercut a NEWER record -> W19) holds: a maximum of recent
+    same-form measurements, never a single low sample.
+    ``SGLANG_WEG2_D_RESERVE_RECORD_MAX=0`` keeps the old rule."""
+    out = dict(dc_expect_d)
+    won: List[str] = []
+    use_max = (d_max is not None
+               and os.environ.get(D_RESERVE_RECORD_ENV, "1").strip() != "0")
+    for c in cards:
+        if c.uuid not in census_reserve:
+            continue
+        census = int(census_reserve[c.uuid])
+        if use_max:
+            out[c.uuid] = int(d_max[c.uuid]) + DC_RECORD_MARGIN_MIB + int(slack_mib)
+            won.append(f"nvml{c.nvml_index}=record-max({out[c.uuid]}; census {census} reported)")
+            continue
+        record = int(dc_expect_d[c.uuid]) if record_priced else 0
+        if record > census:
+            out[c.uuid] = record
+            won.append(f"nvml{c.nvml_index}=record({record})>census({census})")
+        else:
+            out[c.uuid] = census
+            won.append(f"nvml{c.nvml_index}=census({census})>=record({record})")
+    return out, won
 
 
 def d_expect_dormant_other(
@@ -2837,6 +2891,76 @@ def kv_stage_wave_floor(group, rows, fits, max_by: Sequence[int], waves_cap: int
             % (head, "; ".join(lines))]
 
 
+D_KV_STAGE_LRU_FLOOR_ENV = "SGLANG_WEG2_D_KV_STAGE_LRU_FLOOR"
+D_KV_STAGE_LRU_FLOOR_MARKER = "LRU-UNTERGRENZE (#251c, gemessener Spitzenbedarf)"
+#: re-solves the floor may ask for in one pass (the second one checks the first)
+D_KV_STAGE_LRU_FLOOR_ROUNDS = 2
+
+
+def d_pool_peak_record(profile: Optional[str] = None
+                       ) -> Tuple[Optional[List[int]], Optional[List[int]], str]:
+    """``D_POOL_PEAK_NONRES_ROWS`` (the measured maximum of the MOE-POOL-DEMAND
+    ``max_nonres_per_step`` per D rank) with ``D_POOL_PEAK_NONRES_SPAN_ROWS``
+    (E - R of the form it was measured on), or ``(None, None, "")`` -- no
+    floor, the stage solve stays byte-identical (27B has no such record)."""
+    try:
+        peak = [int(v) for v in _pconst("D_POOL_PEAK_NONRES_ROWS", profile)]
+        span = [int(v) for v in _pconst("D_POOL_PEAK_NONRES_SPAN_ROWS", profile)]
+    except (KeyError, TypeError, ValueError):
+        return None, None, ""
+    if not peak or len(peak) != len(span):
+        return None, None, ""
+    return peak, span, _pconst_boots("D_POOL_PEAK_NONRES_ROWS", profile)
+
+
+def kv_stage_lru_floor(group, rows, fits, max_by: Sequence[int], peak: Sequence[int],
+                       span: Sequence[int], source: str, head: str
+                       ) -> Tuple[Dict[int, int], List[str]]:
+    """(3) 29.09.: the measured peak pool demand as the LRU floor of the stage
+    solve. A KV rank's stage rows are LRU rows in S0; a wake to S_j unmaps
+    ``stage_rows[j]`` of them. The wave rule prices the step at
+    min(b x verify x top_k, E - R) with waves -- the MEASURED peak of
+    non-resident ids per step (MOE-POOL-DEMAND, rc12z30r3: TP2 43 of C 48)
+    is the demand the extra wave hits. Floor per KV rank: the fewest rows any
+    allowed (n, stage) of the written form leaves (``capacity[n][max_by[n]]``)
+    >= the peak, scaled from the measured span E - R to this form's
+    (first order: the non-resident ids of a step grow with the non-resident
+    span). Short by d rows -> the scratch grows by ceil(d / (1 - p)) with
+    p = peak / span: a row moved from resident to scratch widens the span by
+    one row, so the need grows by p per row. Returns ({rank: rows to add},
+    lines); an empty dict when every KV rank holds its peak."""
+    last = rows[-1]
+    fit_by = {int(f.rank): f for f in fits}
+    cap = len(rows)
+    add: Dict[int, int] = {}
+    parts: List[str] = []
+    for t in group.tables:
+        r = int(t.host_rank)
+        if r >= len(peak) or r >= len(last.scratch_given):
+            continue
+        f = fit_by.get(r)
+        E = int(f.local_experts) if f is not None else 0
+        C = int(last.scratch_given[r])
+        span_now = max(E - (int(last.max_rows[r]) - C), 0)
+        p = min(float(peak[r]) / int(span[r]), 1.0) if int(span[r]) > 0 else 1.0
+        need = min(int(math.ceil(p * span_now - 1e-9)), span_now, int(last.ids_per_step))
+        j_by = [min(int(max_by[i]), len(t.tokens) - 1) for i in range(cap)]
+        lru = min(int(t.capacity[i][j_by[i]]) for i in range(cap))
+        text = ("rang%d Spitze %d bei Spanne %d -> Bedarf %d bei Spanne %d (E %d - R %d), "
+                "LRU bis S%d min %d" % (r, int(peak[r]), int(span[r]), need, span_now, E,
+                                        E - span_now, max(j_by), lru))
+        if need > lru:
+            k = int(math.ceil((need - lru) / max(1.0 - p, 0.05) - 1e-9))
+            add[r] = k
+            text += " < %d -> Scratch +%d (Bedarf +%.3f je Zeile)" % (need, k, p)
+        else:
+            text += " >= %d, haelt" % need
+        parts.append(text)
+    return add, ["%s: %s (%s aus %s): %s" % (
+        head, D_KV_STAGE_LRU_FLOOR_MARKER, "D_POOL_PEAK_NONRES_ROWS", source or "Record",
+        "; ".join(parts) or "kein KV-Rang")]
+
+
 def er_trim_cell(fit, host_rank: int) -> int:
     """The planner's trim cell of a fit (0 without one)."""
     if fit is None:
@@ -2909,6 +3033,7 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
     Returns the lines to log; ``d_kv_stage_undo`` reverses it for a second
     solve pass."""
     head = "%s FRACTION-SOLVE %s D-KV-STUFEN (#251c)" % (D_RANK_SOLVE_MARKER, label)
+    ns._d_kv_stage_lru_raise = None
     env_raw = str(getattr(ns, "env_d", "") or "")
     env = parse_group_env(env_raw)
     if D_KV_STAGE_KEYS[0] in env:
@@ -2953,6 +3078,19 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
         group, rows, fits, max_by,
         int(waves_to) if waves_to is not None
         else max(er.pool_overflow_waves(env), int(rows[-1].waves)), head)
+    # (3) 29.09.: the measured peak as the LRU floor of every allowed stage;
+    # a short rank gets its scratch raised and the solve runs again
+    # (log_d_rank_vram_solve), so FR_D moves the rows from resident to scratch
+    _peak, _span, _peak_src = d_pool_peak_record(getattr(ns, "profile", None))
+    if _peak is not None:
+        if os.environ.get(D_KV_STAGE_LRU_FLOOR_ENV, "1").strip() == "0":
+            waves_lines = waves_lines + ["%s: %s aus (%s=0)" % (
+                head, D_KV_STAGE_LRU_FLOOR_MARKER, D_KV_STAGE_LRU_FLOOR_ENV)]
+        else:
+            _add, _floor_lines = kv_stage_lru_floor(group, rows, fits, max_by, _peak, _span,
+                                                    _peak_src, head)
+            waves_lines = waves_lines + _floor_lines
+            ns._d_kv_stage_lru_raise = _add or None
     n = len(rows[-1].scratch_given)
     scratch = _rank_vec(env.get("SGLANG_MOE_SCRATCH_SLOTS"), n)
     seat_raw = env.get("SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
@@ -17204,6 +17342,41 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     if plan.refusal is not None:
         log(f"{D_RANK_SOLVE_MARKER} {plan.refusal}")
         raise Weg2LaunchRefused(plan.refusal)
+    _lru_add = getattr(ns, "_d_kv_stage_lru_raise", None)
+    ns._d_kv_stage_lru_raise = None
+    if _lru_add:
+        # (3) 29.09.: a KV rank's LRU falls below its measured peak at an
+        # allowed stage -- raise its scratch and solve again, so the planner
+        # moves the rows from resident to scratch (FR_D) before the map pins
+        _round = int(getattr(ns, "_d_kv_stage_lru_round", 0) or 0)
+        _what = ", ".join("rang%d +%d" % (r, k) for r, k in sorted(_lru_add.items()))
+        if _pinned:
+            log(f"{D_RANK_SOLVE_MARKER} {label} {D_KV_STAGE_LRU_FLOOR_MARKER}: Scratch {_what} "
+                f"waere noetig, die Karte ist gebaut -- nicht neu geloest (die Spitze kostet "
+                f"eine Zusatzwelle)")
+        elif _round >= D_KV_STAGE_LRU_FLOOR_ROUNDS:
+            log(f"{D_RANK_SOLVE_MARKER} {label} {D_KV_STAGE_LRU_FLOOR_MARKER}: nach {_round} "
+                f"Runden noch {_what} -- nicht erreicht, die Spitze kostet eine Zusatzwelle")
+        else:
+            d_kv_stage_undo(ns)
+            _base = _rank_vec(parse_group_env(getattr(ns, "env_d", "") or "")
+                              .get("SGLANG_MOE_SCRATCH_SLOTS"), n)
+            _new = [int(x) + int(_lru_add.get(r, 0)) for r, x in enumerate(_base)]
+            ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", "SGLANG_MOE_SCRATCH_SLOTS",
+                                     ",".join(str(x) for x in _new))
+            log(f"{D_RANK_SOLVE_MARKER} {label} {D_KV_STAGE_LRU_FLOOR_MARKER}: Scratch {_what} "
+                f"-> SGLANG_MOE_SCRATCH_SLOTS {','.join(str(x) for x in _base)} -> "
+                f"{','.join(str(x) for x in _new)}, neu geloest (Runde {_round + 1}; der Planer "
+                f"senkt FR_D, die Zeilen gehen von resident nach Scratch)")
+            ns._d_kv_stage_lru_round = _round + 1
+            # the map pass restores env_d; the raised scratch is part of the
+            # form the map pins (FR_D was solved with it), so it outlives it
+            ns._d_kv_stage_lru_scratch = list(_new)
+            try:
+                return log_d_rank_vram_solve(ns, cards, budgets_d, log, label, p_split=p_split,
+                                             chunk_layers=chunk_layers, card_terms=card_terms)
+            finally:
+                ns._d_kv_stage_lru_round = _round
     if _ledger is not None and plan.fits:
         # rc12e: D's extend trims the allocator cache when the card holds
         # less than floor + booked activation (WEG2-EXTEND-CACHE-TRIM).
@@ -17472,6 +17645,37 @@ def publish_store_identity(model: str, map_path: str, log) -> str:
     return ident
 
 
+EXPERT_MAP_DIR_ENV = "SGLANG_WEG2_EXPERT_MAP_DIR"
+
+
+def expert_map_dir(evidence_dir: str, log) -> str:
+    """Where the expert maps (#107 Platztausch, V1) are written: the evidence
+    dir when this process can write it, else a NAMED writable fallback
+    (``SGLANG_WEG2_EXPERT_MAP_DIR``, default ``<tmp>/weg2-expert-maps``).
+
+    Dry runs against a container's evidence tree (owned by the container's
+    user) printed 'WEG2-EXPERT-MAP failed: PermissionError' and published no
+    map -- so the dry run never showed the map the boot would build. Both
+    groups read the map by the path in their env, so any directory this
+    launcher can write and the ranks can read is correct; the redirect is
+    logged so a reader never looks for the map in the wrong place."""
+    try:
+        os.makedirs(evidence_dir, exist_ok=True)
+    except OSError:
+        pass
+    if os.path.isdir(evidence_dir) and os.access(evidence_dir, os.W_OK | os.X_OK):
+        return evidence_dir
+    import tempfile
+
+    alt = (os.environ.get(EXPERT_MAP_DIR_ENV)
+           or os.path.join(tempfile.gettempdir(), "weg2-expert-maps"))
+    os.makedirs(alt, exist_ok=True)
+    log(f"WEG2-EXPERT-MAP-DIR {evidence_dir} is not writable by this process -> "
+        f"maps go to {alt} ({EXPERT_MAP_DIR_ENV}); both groups read them by the "
+        f"path in their env")
+    return alt
+
+
 def publish_expert_map(ns, model: str, evidence_dir: str, log,
                        p_stage_layers=None,
                        chunk_layers: Optional[int] = None) -> str:
@@ -17584,8 +17788,7 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
             log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % grund)
             return ""
         _refuse_unbuilt_platztausch_buffers(karte, chunk_layers=chunk_layers)
-        os.makedirs(evidence_dir, exist_ok=True)
-        pfad = os.path.join(evidence_dir, f"expert_map_{ns.tag}.json")
+        pfad = os.path.join(expert_map_dir(evidence_dir, log), f"expert_map_{ns.tag}.json")
         with open(pfad, "w") as fh:
             _json.dump(karte, fh)
         # #239 rc12z29c-Blocker 2: die D-Form, die diese Karte beschreibt --
@@ -21835,17 +22038,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # Flip. Eine aeltere Census unterbietet keine neuere Messung derselben
             # Form: je Karte gewinnt die GROESSERE der beiden gepreisten Reserven,
             # und die Zeile darunter nennt, welche.
-            _won: List[str] = []
-            for c in cards:
-                if c.uuid in _xr:
-                    _census_reserve = int(_xr[c.uuid]) + slack_mib
-                    _record_reserve = int(dc_expect_d[c.uuid]) if _dc_from_record is not None else 0
-                    if _record_reserve > _census_reserve:
-                        dc_expect_d[c.uuid] = _record_reserve
-                        _won.append(f"nvml{c.nvml_index}=record({_record_reserve})>census({_census_reserve})")
-                    else:
-                        dc_expect_d[c.uuid] = _census_reserve
-                        _won.append(f"nvml{c.nvml_index}=census({_census_reserve})>=record({_record_reserve})")
+            # D-RESERVE 29.09.: the maximum over the newest D records of this
+            # identity and form wins over the (older) census when records exist.
+            _d_recs = (host_ledger.read_measured_records(
+                measured_record_path(), "D", accept=_dc_accept)
+                if _dc_accept is not None else [])
+            _d_max, _d_max_why = dormant_max_from_records(
+                _d_recs, cards, ns.weg2_weight_source, group="D")
+            log(f"D-RESERVE RECORD-MAX: {_d_max_why}")
+            dc_expect_d, _won = d_reserve_from_records_or_census(
+                cards, dc_expect_d,
+                {u: int(v) + slack_mib for u, v in _xr.items()},
+                _d_max, slack_mib, _dc_from_record is not None)
             state.dc_expect_d = dc_expect_d
             log("dormant residue RESERVE for group D (census-korrigiert, neuere Messung "
                 "unterbietet die aeltere nicht): "
@@ -22555,7 +22759,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             else:
                 import json as _json
 
-                _mp = os.path.join(getattr(ns, "evidence_dir", EVIDENCE_DIR),
+                _mp = os.path.join(expert_map_dir(getattr(ns, "evidence_dir", EVIDENCE_DIR), log),
                                    f"expert_map_{ns.tag}.json")
                 with open(_mp, "w") as _fh:
                     _json.dump(_karte, _fh)
@@ -22877,6 +23081,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _pin = pin_d_form_for_map(ns, log)
         ns.env_d = _env_d_before
         ns._d_kv_stage_written = None
+        _lru_scratch = getattr(ns, "_d_kv_stage_lru_scratch", None)
+        if _lru_scratch:
+            # (3) 29.09.: FR_D of the pinned form was solved with this scratch
+            ns.env_d = set_group_env(ns.env_d, "SGLANG_MOE_SCRATCH_SLOTS",
+                                     ",".join(str(int(x)) for x in _lru_scratch))
+            log(f"{D_RANK_SOLVE_MARKER} D(Karte, Erwartung) {D_KV_STAGE_LRU_FLOOR_MARKER}: "
+                f"SGLANG_MOE_SCRATCH_SLOTS={','.join(str(int(x)) for x in _lru_scratch)} "
+                f"gehoert zur gepinnten Form (FR_D mit ihm geloest) -- gilt fuer alle "
+                f"weiteren Passes")
         if _pin:
             from sglang.srt.weg2 import draft_post as _dp
 

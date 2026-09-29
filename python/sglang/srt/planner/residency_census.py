@@ -72,7 +72,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +159,48 @@ def group_parameter_bytes(named_tensors) -> Dict[str, int]:
     )
     groups["n_layers_linear"] = sum(1 for f in layer_family.values() if f == "linear")
     return groups
+
+
+def card_process_split_mib(gpu_uuid: Optional[str],
+                           pid: Optional[int] = None) -> Tuple[Optional[float], Optional[float]]:
+    """``(own, foreign)`` MiB on this rank's card, NVML per process.
+
+    ``own`` is what NVML attributes to ``pid`` (default: this process);
+    ``foreign`` is the sum over every OTHER compute process on the same card
+    -- the other group's CUDA contexts when D starts early, a co-tenant, a
+    probe. The census's ``nvml_used_mib`` is card-wide (``mem_get_info``), so
+    a residual derived from it silently charges those contexts to this rank
+    (27B review 29.09.). ``(None, None)`` when NVML cannot say -- never 0,
+    which would read as "no foreign context" when nothing was measured."""
+    if not gpu_uuid:
+        return None, None
+    try:
+        import os
+
+        from sglang.srt.registry.nvml import nvml_session
+
+        me = int(pid if pid is not None else os.getpid())
+        uuid = str(gpu_uuid)
+        if not uuid.startswith("GPU-"):
+            uuid = "GPU-" + uuid
+        with nvml_session() as pynvml:
+            handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+            try:
+                procs = pynvml.nvmlDeviceGetComputeRunningProcesses_v3(handle)
+            except AttributeError:  # older binding
+                procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+            own = foreign = 0
+            for proc in procs:
+                used = getattr(proc, "usedGpuMemory", None)
+                if used is None:
+                    return None, None
+                if int(proc.pid) == me:
+                    own += int(used)
+                else:
+                    foreign += int(used)
+        return own / _MIB, foreign / _MIB
+    except Exception:  # instrument, never fatal
+        return None, None
 
 
 def log_residency_census(model_runner, tag: str = "post-capture") -> Optional[str]:
@@ -374,6 +416,7 @@ def log_residency_census(model_runner, tag: str = "post-capture") -> Optional[st
                         gpu_uuid = cards[0].uuid
                 except Exception:
                     gpu_uuid = None
+            own_mib, foreign_mib = card_process_split_mib(gpu_uuid)
             payload = {
                 "pp_rank": pp_rank,
                 "tag": tag,
@@ -393,6 +436,14 @@ def log_residency_census(model_runner, tag: str = "post-capture") -> Optional[st
                 "nvml_used_mib": used_b / _MIB,
                 "nvml_free_mib": int(free_b) / _MIB,
                 "nvml_total_mib": int(total_b) / _MIB,
+                # 27B review 29.09.: NVML per process on this card -- this
+                # rank's own bytes and every OTHER process's. The calibration
+                # subtracts `nvml_foreign_mib` from the card-wide used, so a
+                # context of the other group (early D start) or a co-tenant
+                # is not priced as this rank's residual. None = NVML could
+                # not say (the consumer then names the card-wide reading).
+                "nvml_process_used_mib": own_mib,
+                "nvml_foreign_mib": foreign_mib,
                 # #1009(a): the NVML reconciliation verdict travels WITH the
                 # bytes. A consumer that prices from this file can refuse on
                 # `ok: false` without re-deriving the check, and a reader
