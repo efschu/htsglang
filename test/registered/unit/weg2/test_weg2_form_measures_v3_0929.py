@@ -151,8 +151,11 @@ class TestSelection(unittest.TestCase):
 
     def test_profile_record_27b(self):
         spec = fm.matrix_spec("qwen27b", "nvfp4")
+        # int8 has its record since 29.09. (Resplit je Flip, test_weg2_d_resplit_measured_0929);
+        # a format without one is still refused, never a default matrix
+        self.assertEqual(fm.matrix_spec("qwen27b", "int8").forms[0].name, "C")
         with self.assertRaises(fm.FormMeasuresError):
-            fm.matrix_spec("qwen27b", "int8")
+            fm.matrix_spec("qwen27b", "fp8")
         names = {f.name for f in spec.forms}
         self.assertTrue({"A", "B77", "B88", "A_KV", "C"} <= names)
         self.assertFalse(next(f for f in spec.forms if f.name == "A_KV").startable)

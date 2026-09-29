@@ -530,6 +530,185 @@
      }
     }
    }
+  },
+  {
+   "name": "FORM_MATRIX_AXES",
+   "kind": "geometry",
+   "fmt": "int8",
+   "provenance": "27B-Sitz 29.09. (Resplit je Flip, DYN_D_RESHARD.md Nachtrag 29.09.). Formen = D-Formen der 27B-INT8-Linie, benannt wie VRAM-VERTRAG-0929.md §3.3 (laufende Form ohne Suffix, Messarme mit Suffix); C = Release-Standard drq (27b-release-draft.env PROFILE_RC10_D_PLACE_BEST=drq; A/B dkr27bint8drqbar1i8drq109262005 gegen dkr27bint8drtbar1i8rt109261955). Der MLP-Einheitenvektor (1088 INT8-Einheiten) ist Teil der Achse weights, weil er genau das ist, was der Resplit je Flip waehlt. arm = Wert des Knopfs HTSGLANG_RC10_D_PLACE. capacity = RECHNUNG aus EFFECTIVE max_total_num_tokens 759616 (Serienboot dkr27browauthoritybar1w109290020, D-Log 'Uneven-DCP token sizing', Form C): max bs = min(6, floor(759616 / Tiefe)); die KV-Summe bleibt beim Verschieben von MLP-Einheiten erhalten (DYN_D_RESHARD.md §11), darum gilt sie fuer alle C-Formen; keine Messung je Form",
+   "value": {
+    "forms": {
+     "C": {
+      "arm": "drq",
+      "axes": {
+       "roles": "same",
+       "weights": "58,25,25/mlp=652,218,218",
+       "tokens": "bandwidth",
+       "precision": "int8",
+       "spec": "dflash2_8",
+       "transport": "bar1"
+      }
+     },
+     "C_RT": {
+      "arm": "rt",
+      "axes": {
+       "roles": "same",
+       "weights": "58,25,25/mlp=707,191,190",
+       "tokens": "bandwidth",
+       "precision": "int8",
+       "spec": "dflash2_8",
+       "transport": "bar1"
+      }
+     },
+     "C_T": {
+      "arm": "t",
+      "axes": {
+       "roles": "same",
+       "weights": "58,25,25/mlp=584,252,252",
+       "tokens": "bandwidth",
+       "precision": "int8",
+       "spec": "dflash2_8",
+       "transport": "bar1"
+      }
+     },
+     "C_H": {
+      "arm": "off",
+      "axes": {
+       "roles": "same",
+       "weights": "58,25,25/mlp=584,252,252",
+       "tokens": "capacity",
+       "precision": "int8",
+       "spec": "dflash2_8",
+       "transport": "bar1"
+      }
+     },
+     "C_SEG": {
+      "arm": null,
+      "axes": {
+       "roles": "same",
+       "weights": "58,25,25/mlp=628,230,230",
+       "tokens": "capacity",
+       "precision": "int8",
+       "spec": "dflash2_8",
+       "transport": "bar1"
+      }
+     },
+     "A": {
+      "arm": null,
+      "startable": false,
+      "why_not": "RECHNUNG, kein Start versucht: INT8-Checkpoint 28202 MiB + DFlash2-W8-Draft 2073 MiB (du --apparent-size) = 30275 MiB auf der 5090 (total 32607 MiB) + gemessene XCHG-Reserve 3084 MiB (Serienboot 09290020, WEG2-XCHG-RESERVE nvml1) > 32607 MiB, ohne KV, Graphen und CUDA-Kontext",
+      "axes": {
+       "roles": "same",
+       "weights": "1",
+       "precision": "int8",
+       "spec": "dflash2_8",
+       "transport": "none"
+      }
+     },
+     "A_KV": {
+      "arm": null,
+      "startable": false,
+      "why_not": "RECHNUNG, kein Start versucht: INT8-Checkpoint 28202 MiB + DFlash2-W8-Draft 2073 MiB (du --apparent-size) = 30275 MiB auf der 5090 (total 32607 MiB) + gemessene XCHG-Reserve 3084 MiB (Serienboot 09290020, WEG2-XCHG-RESERVE nvml1) > 32607 MiB, ohne KV, Graphen und CUDA-Kontext; ausserdem F15 (Form-B-Bootpfad) wired=False",
+      "axes": {
+       "roles": "host,kv_only,kv_only",
+       "weights": "1,0,0",
+       "precision": "int8",
+       "spec": "dflash2_8",
+       "transport": "bar1"
+      }
+     },
+     "B77": {
+      "arm": null,
+      "startable": false,
+      "why_not": "TP2 5090+3080(x8) mit KV-only-3080(x4) auf bar1: Form-B-Bootpfad F15 offen (349ab71f2e), Kopf-Menge W im Bau auf desk/27b-form-b-headset-0929 (anderer Sitz); NCCL-Arme gelten nicht (Nutzer 29.09.: nur barlink)",
+      "axes": {
+       "roles": "tp,tp,kv_only",
+       "weights": "77,23,0",
+       "precision": "int8",
+       "spec": "dflash2_8",
+       "transport": "bar1"
+      }
+     },
+     "B88": {
+      "arm": null,
+      "startable": false,
+      "why_not": "wie B77: Form-B-Bootpfad F15 offen, desk/27b-form-b-headset-0929 im Bau; NCCL-Arme gelten nicht",
+      "axes": {
+       "roles": "tp,tp,kv_only",
+       "weights": "88,12,0",
+       "precision": "int8",
+       "spec": "dflash2_8",
+       "transport": "bar1"
+      }
+     }
+    },
+    "bs": [
+     1,
+     2,
+     3,
+     4,
+     5,
+     6
+    ],
+    "depths": [
+     "2k",
+     "10k",
+     "32k",
+     "97k",
+     "240k",
+     "257k"
+    ],
+    "texts": [
+     "code",
+     "prose",
+     "thinking"
+    ],
+    "temps": [
+     "warm"
+    ],
+    "capacity": {
+     "C": {
+      "2k": 6,
+      "10k": 6,
+      "32k": 6,
+      "97k": 6,
+      "240k": 3,
+      "257k": 2
+     },
+     "C_RT": {
+      "2k": 6,
+      "10k": 6,
+      "32k": 6,
+      "97k": 6,
+      "240k": 3,
+      "257k": 2
+     },
+     "C_T": {
+      "2k": 6,
+      "10k": 6,
+      "32k": 6,
+      "97k": 6,
+      "240k": 3,
+      "257k": 2
+     },
+     "C_H": {
+      "2k": 6,
+      "10k": 6,
+      "32k": 6,
+      "97k": 6,
+      "240k": 3,
+      "257k": 2
+     },
+     "C_SEG": {
+      "2k": 6,
+      "10k": 6,
+      "32k": 6,
+      "97k": 6,
+      "240k": 3,
+      "257k": 2
+     }
+    }
+   }
   }
  ]
 }
