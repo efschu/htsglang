@@ -1504,7 +1504,7 @@ class LiveLogs:
             v["ipc"] = self.ipc.for_tag((b.meta or {}).get("tag"), now)
             # the 25 "Übergang" fields: an IPC reader per field, the log value only where the
             # IPC has no source yet (ipcfields.py: switch by presence, no deploy waits for a boot)
-            rank = ipcfields.read_rank_files(ipcfields.rankstate_dirs(v.get("files")))
+            rank = ipcfields.read_rank_files(ipcfields.rank_dirs(v.get("files"), v["ipc"]))
             fields = ipcfields.resolve(v["ipc"], rank, v, self.rates.update(b.stem, rank["rankstats"]))
             v["fields"] = ipcfields.for_page(fields)
             v["fields_summary"] = ipcfields.summary(fields)

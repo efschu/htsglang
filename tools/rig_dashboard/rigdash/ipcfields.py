@@ -86,6 +86,23 @@ def rankstate_dirs(files: dict) -> List[str]:
     return out
 
 
+def state_rankstate_dirs(ipc: Optional[dict]) -> List[str]:
+    """The rank state dirs of a boot with a state dir (IPC §2.2 H5): the launcher names
+    ``$WEG2_STATE_DIR/rankstate/<G>`` in ``SGLANG_WEG2_RANK_STATE_DIR``, and host_acceptance mounts
+    that state dir from ``/spinning/docker-acceptance/<line>/state/<boot_id>`` -- so the files sit
+    under ``ipc["dir"]/rankstate/<G>/``, not next to the group logs."""
+    d = (ipc or {}).get("dir") if isinstance(ipc, dict) else None
+    if not d:
+        return []
+    return sorted(p for p in glob.glob(os.path.join(d, "rankstate", "*")) if os.path.isdir(p))
+
+
+def rank_dirs(files: dict, ipc: Optional[dict]) -> List[str]:
+    """Every rank state dir of one boot: next to the group logs and in its state dir."""
+    out = rankstate_dirs(files)
+    return out + [d for d in state_rankstate_dirs(ipc) if d not in out]
+
+
 def _load(path: str) -> Optional[dict]:
     try:
         with open(path) as fh:
