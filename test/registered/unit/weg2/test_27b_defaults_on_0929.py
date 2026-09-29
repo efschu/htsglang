@@ -215,3 +215,57 @@ def test_d_reshard_stays_off_by_default():
 
     assert _defaults("qwen27b", (), model=INT8).d_reshard == L.D_RESHARD_DEFAULT == "off"
     assert "--d-reshard" not in [f for f, _d, _o in L.PROFILE_ARG_DEFAULTS]
+
+
+# ---------------------------------------------------------------------------
+# 5. MAMBA: registry = the metal form (inventory 27B, contradiction 1). Every
+#    27B profile since 24.09. set SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE=1
+#    (27b.env): the environ alias that ARMS the END-anchor carrier hold, and on
+#    group P the inner-anchor release (c255e10ddb). The row said
+#    mamba_carrier_hold=False -- a form no 27B boot ran.
+# ---------------------------------------------------------------------------
+
+HOLD = "SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD"
+RELEASE = "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE"
+
+
+def test_mamba_rows_name_the_metal_form():
+    assert FM.PROFILES["qwen27b"].mamba_carrier_hold is True
+    assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][HOLD] is True
+    assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][RELEASE] is True
+    assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][HOLD] is True      # NF unchanged
+    assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][RELEASE] is False  # NF unchanged
+
+
+@pytest.mark.parametrize("profile,hold,alias,want_hold,want_release", [
+    ("qwen27b", None, None, True, True),     # the 27B form without a profile line
+    ("qwen27b", None, "1", True, True),      # the 27B profile line: same form
+    ("qwen27b", None, "0", False, False),    # explicit alias off wins both halves
+    ("qwen27b", "0", None, False, True),     # explicit hold off wins the hold only
+    ("nextflash", None, None, True, False),  # NF unchanged
+    (None, None, None, True, False),         # no form: unchanged (NF default hold, no release)
+])
+def test_mamba_hold_and_inner_release_defaults(clean, profile, hold, alias, want_hold, want_release):
+    from sglang.srt.mem_cache import unified_radix_cache as urc
+
+    for k in (HOLD, RELEASE):
+        clean.delenv(k, raising=False)
+    clean.setenv("SGLANG_WEG2_GROUP", "P")
+    clean.setattr(urc, "_WEG2_END_ANCHOR", True)
+    _as(clean, profile)
+    if hold is not None:
+        clean.setenv(HOLD, hold)
+    if alias is not None:
+        clean.setenv(RELEASE, alias)
+    assert envs.SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD.get() is want_hold
+    assert urc._weg2_inner_anchor_release_on() is want_release
+
+
+def test_inner_release_stays_group_p_only(clean):
+    from sglang.srt.mem_cache import unified_radix_cache as urc
+
+    clean.delenv(RELEASE, raising=False)
+    clean.setattr(urc, "_WEG2_END_ANCHOR", True)
+    _as(clean, "qwen27b")
+    clean.setenv("SGLANG_WEG2_GROUP", "D")
+    assert urc._weg2_inner_anchor_release_on() is False

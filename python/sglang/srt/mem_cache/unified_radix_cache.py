@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -641,7 +642,8 @@ PRESENCE_SRC_ATTR = "_h108_presence_src"
 #: 27B line, 2026-09-24 (operator order after weg2xsn420): group P gives an
 #: INNER mamba anchor's arena reference back once its chain moved past it
 #: (UnifiedRadixCache._weg2_release_inner_anchor) and holds the END anchors one
-#: phase across the flip's reset (_weg2_carrier_rotate, UNIFY S2 NF form). Default off; "1" arms both.
+#: phase across the flip's reset (_weg2_carrier_rotate, UNIFY S2 NF form). "1" arms both; unset =
+#: the profile row (qwen27b on since 29.09., nextflash off; no form off).
 INNER_ANCHOR_RELEASE_ENV = "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE"
 
 
@@ -654,10 +656,23 @@ def _weg2_inner_anchor_release_on() -> bool:
         return False
     if not _WEG2_END_ANCHOR:
         return False
-    # Default OFF until the metal proves it (operator/user 2026-09-24); the
-    # arm switches it on with =1.
-    return os.environ.get(INNER_ANCHOR_RELEASE_ENV, "0").strip().lower() in (
-        "1", "true", "yes", "on")
+    # An explicitly set value decides (1/true/yes/on). Unset or blank: the
+    # published form's profile default (29.09., registry = the metal form:
+    # qwen27b grid4096 on -- every 27B profile since 24.09. set =1 --,
+    # nextflash off; no form: off, the pre-registry default).
+    raw = os.environ.get(INNER_ANCHOR_RELEASE_ENV, "").strip().lower()
+    if raw:
+        return raw in ("1", "true", "yes", "on")
+    return _inner_anchor_release_profile_default(os.environ.get("SGLANG_WEG2_FORM", ""))
+
+
+@functools.lru_cache(maxsize=8)
+def _inner_anchor_release_profile_default(form_value: str) -> bool:
+    """The registry default of the inner-anchor release under ``form_value``
+    (cached: asked per completed anchor; a rank's form never changes)."""
+    from sglang.srt.weg2.form import FORM_ENV, profile_switch_default
+
+    return bool(profile_switch_default(INNER_ANCHOR_RELEASE_ENV, False, {FORM_ENV: form_value}))
 
 
 def _weg2_release_drain_cap() -> int:
@@ -4797,7 +4812,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         added with the per-path cap, Agent G), a host-locked or write-pending
         one. Host bookkeeping only (one `free`, no sync, no copy).
         SGLANG_WEG2_GROUP=P only, armed by
-        SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE=1 (default off)."""
+        SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE (explicit, else the profile
+        row: qwen27b on, nextflash off, no form off)."""
         if not _weg2_inner_anchor_release_on():
             return False
         mc = self.components.get(ComponentType.MAMBA)

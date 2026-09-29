@@ -158,18 +158,24 @@ END_ANCHOR_SWITCHES: Dict[str, Dict[str, object]] = {
 MAMBA_ANCHOR_SWITCHES: Dict[str, Dict[str, object]] = {
     "deepest": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": -1,
                 "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": 0,
-                "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0},
+                "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0,
+                "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE": False},
     # UNIFY S7/S8: the 27B mechanism is in the tree now (34965fc3fa: group P
     # anchors every 4096 tokens whatever the chunk, at most 4 per path) -- the
     # profile carries the 27B arm's values (docker 27b.env), an explicit env
-    # still wins. INNER_ANCHOR_RELEASE stays arm-set (it is also the S2 alias
-    # of the carrier hold).
+    # still wins. 29.09. (registry = the metal form): the INNER-anchor release
+    # half of SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE (c255e10ddb, group P only)
+    # is part of this form -- every 27B profile since 24.09. set it to 1
+    # (27b.env), the proof boot w109290020 ran it; its carrier-hold half is
+    # ModelProfile.mamba_carrier_hold (True on qwen27b for the same reason).
     "grid4096": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": 0,
                  "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": 4096,
-                 "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 4},
+                 "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 4,
+                 "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE": True},
     "none": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": 0,
              "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": 0,
-             "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0},
+             "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0,
+             "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE": False},
 }
 
 
@@ -598,7 +604,14 @@ PROFILES: Dict[str, ModelProfile] = {
                     default_formats=("int8",)),
         end_anchor="trim",
         mamba_anchor="grid4096",
-        mamba_carrier_hold=False,
+        # 29.09. (registry = the metal form, inventory 27B contradiction 1): the
+        # row said False ("the 27B A form: end anchors released at the reset"),
+        # but every 27B profile since 24.09. sets SGLANG_WEG2_MAMBA_INNER_ANCHOR_
+        # RELEASE=1 (27b.env), the environ.py alias that ARMS the hold -- so
+        # every 27B boot ran it, the agent-load proof w109290020 (bb82fbcb68,
+        # 0 tracebacks) and z30x2 included. The row now names that form; an
+        # explicit SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD / alias =0 still wins.
+        mamba_carrier_hold=True,
         # OPERATOR 26.09. (RM): on. Every 27B profile (27b.env and all derived
         # docker profiles) sets SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL=1, the RC9
         # metal ran with it; the repack lands in the default pool since

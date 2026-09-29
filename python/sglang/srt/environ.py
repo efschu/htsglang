@@ -988,10 +988,18 @@ class Envs:
     # claim D makes can drop a hand-over anchor D has not read yet. False =
     # the end anchors are released with the rest at the reset (the 27B A form).
     # UNIFY S2: default per profile (weg2/form.py PROFILE_SWITCH_DEFAULTS:
-    # qwen27b False, nextflash True), and the 27B line's switch
-    # SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE (which armed its hold, 27B arms =1)
-    # is read as its alias -- see _mamba_carrier_hold_default.
+    # qwen27b True since 29.09. -- the form every 27B boot ran --, nextflash
+    # True), and the 27B line's switch SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE
+    # (which armed its hold, 27B arms =1) is read as its alias -- see
+    # _mamba_carrier_hold_default.
     SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD = EnvBool(_mamba_carrier_hold_default)
+    # The 27B line's INNER-anchor release on group P (c255e10ddb,
+    # mem_cache/unified_radix_cache._weg2_inner_anchor_release_on): default per
+    # profile since 29.09. (weg2/form.py MAMBA_ANCHOR_SWITCHES: grid4096 = the
+    # qwen27b row on, deepest/none off), off without a form; an explicitly set
+    # value wins -- and, set, is also the carrier-hold alias above.
+    SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE = EnvBool(
+        _profile_default("SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE", False))
     # LANE_PARALLEL_COPY (H22, fnFL2x127/x132): a BAR1 deposit lane writes into
     # the peer's window as REGISTERED HOST memory, so cudaMemcpyAsync makes
     # every deposit copy a D2H on the card's ONE D2H copy engine
