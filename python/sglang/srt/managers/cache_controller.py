@@ -1216,6 +1216,11 @@ def weg2_publish_rank_state(
         owner_ctx=owner_ctx,
         seq=seq,
     )
+    # VRAM-Vertrag M2: the attach record carries the rank's VRAM actual
+    # (weg2/vram_actual.py); SGLANG_WEG2_VRAM_ACTUAL off = the record unchanged.
+    from sglang.srt.weg2 import vram_actual
+
+    state = vram_actual.attach(state, state_dir)
     path = write_rank_state(state, state_dir)
     logger.info("IPC RANK-STATE written %s: %s", path, state.to_json())
 

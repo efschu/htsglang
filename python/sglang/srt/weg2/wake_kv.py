@@ -137,3 +137,26 @@ def resume_landed(free_before, free_after, need_bytes) -> Optional[bool]:
         return None
     delta = int(free_before) - int(free_after)
     return delta >= int(need * RESUME_LANDED_FRACTION)
+
+
+#: #251c/d (EXPERTEN-KV-DYNAMISCH-D-0929 §6.4): the kv_cache resume, timed.
+#: WEG2-WAKE-TAG-TIME covers the weights tags only (wake_credit_pd parses it);
+#: this marker is its own, so no parser reads a kv row as a weights leg.
+KV_TIME_MARK = "WEG2-WAKE-KV-TIME"
+
+
+def kv_resume_time_line(resume_ms: float, need_bytes, free_before, free_after,
+                        phase=None, epoch=None) -> str:
+    """One line per kv_cache resume: its wall time, the bytes the saver names
+    for the tag, the bytes the card actually lost across it, and the phase's
+    KV stage (``d_seat_vram.PhaseState``; '-' without a stage form) -- the
+    price of a stage wake next to an S0 wake, per epoch. Log only."""
+    need = int(need_bytes or 0)
+    mapped = ("%d" % ((int(free_before) - int(free_after)) >> 20)
+              if free_before is not None and free_after is not None else "-")
+    stage = getattr(phase, "stage", None) if phase is not None else None
+    tokens = getattr(phase, "stage_tokens", None) if phase is not None else None
+    return "%s tag=kv_cache resume_ms=%.1f need_mib=%d mapped_mib=%s stage=%s tokens=%s epoch=%s" % (
+        KV_TIME_MARK, float(resume_ms), need >> 20, mapped,
+        "-" if stage is None else "S%d" % int(stage),
+        "-" if tokens is None else int(tokens), epoch)

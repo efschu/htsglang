@@ -3574,7 +3574,8 @@ class Front:
             from sglang.srt.weg2.front_tokens import FrontTokens, TokenSpans
 
             self.ftok = FrontTokens()
-            self.tspans = TokenSpans(agent_span=self.spans.agent_span)
+            self.tspans = TokenSpans(agent_span=self.spans.agent_span,
+                                     anchor_page=envs.SGLANG_WEG2_FRONT_ANCHOR_PAGE.get())
         # NF (P49): a boot with the switch on says so once. Off prints nothing,
         # so an off boot's front log keeps the pre-P49 lines (the arm's env
         # line is the off witness).
@@ -5353,13 +5354,57 @@ class Front:
                     "held Mamba anchor, #59)", rid, old, int(depth), int(depth), int(ct), int(pt),
                     int(held))
 
+    def _p_anchor_presence(self, rid: str, text: str, pending: Any) -> int:
+        """PREFILL-EINBRUCH-0929 K1 (switch SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE).
+
+        NF z30u: 77 follow-up turns routed LONG prefilled < 2k new tokens on
+        P; 71 of their P hits sat exactly on the page floor of an earlier P
+        prompt (P's END-ANCHOR), and for 47 of those the witness's leg 2 on D
+        had not finished when they were priced -- so the front, which credits
+        only finished D readings (#1324, #59 A: in flight = 0), priced the
+        whole prompt. weg2-8-21: pending 4624 -> LONG, P prefilled 976 on a
+        26496 store hit.
+
+        Called at the first content of an ``after_p`` leg 2: D has resumed
+        from P's anchor, so the publish is complete and readable -- not the
+        in-flight write-through #1324 refused to credit. Returns the anchor."""
+        if not self.x_exact or self.tspans is None:
+            return 0
+        ids = self.ftok.ids_for(text)
+        p_pt = int(getattr(pending, "leg1_prompt_tokens", 0) or 0)
+        anchor = self.tspans.record_store_anchor(ids, p_pt)
+        if anchor <= 0:
+            return 0
+        self.counters["p_anchor_presence"] += 1
+        self.counters["p_anchor_presence_tokens"] += anchor
+        logger.info("WEG2 P-ANCHOR-PRESENCE rid=%s anchor=%d p_prompt=%d tokens_front=%d epoch=%d "
+                    "(D resumed P's END-ANCHOR at its first content: a store presence every "
+                    "later text on this prefix is priced against)",
+                    rid, anchor, p_pt, int(ids.size), self.epoch)
+        self._x_exact_reprice_queue("p_anchor")
+        return anchor
+
     def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
                         held_epoch: Optional[int], resumable_depth: Optional[int] = None) -> None:
         """D leg 2 finished: feed the token spans with D's MEASURED reading and
         log the residual error of this request's exact price. NO BAND: the
         error is printed, never folded back into the routing bound."""
-        self.tspans.record_presence(self.ftok.ids_for(text), ct, prompt_tokens=pt,
+        ids = self.ftok.ids_for(text)
+        clamps = self.tspans.own_text_clamps
+        clamped_tokens = self.tspans.own_text_clamped_tokens
+        self.tspans.record_presence(ids, ct, prompt_tokens=pt,
                                     held_epoch=held_epoch, resumable_depth=resumable_depth)
+        if self.tspans.own_text_clamps != clamps:
+            # PREFILL-EINBRUCH-0929 K2: a parked + resumed leg 2 counts its
+            # decoded tokens as prompt; the entry credits its own end anchor.
+            self.counters["presence_own_text_clamped"] += 1
+            self.counters["presence_own_text_clamped_tokens"] += (
+                self.tspans.own_text_clamped_tokens - clamped_tokens)
+            logger.info("WEG2 PRESENCE-OWN-TEXT-CLAMP rid=%s tokens_front=%d cached_d=%d prompt_d=%d "
+                        "depth_d=%s credited=%d (D's reading reaches past this text -- a D-park "
+                        "resume counts its decoded tokens as prompt; the entry credits at most "
+                        "the end anchor of its own prompt)", rid, int(ids.size), int(ct), int(pt),
+                        resumable_depth, self.tspans.own_anchor(int(ids.size)))
         self._x_exact_reprice_queue("presence")
         got = self._x_exact_rid.pop(rid, None)
         if got is None:
@@ -5603,6 +5648,7 @@ class Front:
                 # level test below reuses, so the two can never disagree about
                 # the reading they graded.
                 _pr_fast = host_ledger.read_cgroup_pressure()
+                self._flip_cushion_note(_pr_fast)  # W98 (z30u): the per-flip cushion course
                 _nr = _pr_fast.get("nonreclaim_gib")
                 if _nr is not None:
                     # #1361b THE CUSHION REACHES THE LATCH, or the criterion is
@@ -5618,6 +5664,9 @@ class Front:
                     # disagree about the moment they describe.
                     _file = _pr_fast.get("file_gib")
                     _shm = _pr_fast.get("shmem_gib")
+                    # W98 z30w: pool + ceiling from THIS cgroup in the Docker form
+                    # (host /proc/meminfo there); CT999 unchanged.
+                    _free, _free_src, _ceiling = host_ledger.latch_free_pool(_pr_fast)
                     _line = rate_latch.observe(
                         time.time(), float(_nr),
                         # cushion = file - shmem: cgroup-v2 `file` INCLUDES
@@ -5630,7 +5679,9 @@ class Front:
                             else float(_file) - float(_shm)
                         ),
                         shmem_gib=None if _shm is None else float(_shm),
-                        free_gib=_pr_fast.get("memfree_gib"),
+                        free_gib=_free,
+                        ceiling_gib=_ceiling,
+                        free_source=_free_src,
                     )
                     if _line is not None and "RATE-GAP" in _line:
                         # Blindness is a finding, never silence -- but it is not
@@ -5711,6 +5762,7 @@ class Front:
     def do_stop(self, name: str, detail: str) -> None:
         if self.state == "STOP":
             return
+        state_before = self.state
         self.stop = Weg2Stop(name, detail)
         self.state = "STOP"
         self.counters["stop"] += 1
@@ -5721,6 +5773,87 @@ class Front:
         self.queue.clear()
         self._ready_for_d.clear()
         self._sync_batch_gate()
+        self._publish_stop_state(name, detail, state_before)
+
+    def _enter_state(self, new: str) -> bool:
+        """W98-STOP-FINAL: the ONE way ``state`` leaves serving/flipping. STOP is
+        final -- nothing sets it back (z30u 07:14:10: a flip that was open when
+        W98 fired wrote "serving" over the STOP and the boot served 136 more
+        requests). False = STOP holds, nothing changed."""
+        if self.state == "STOP":
+            return False
+        self.state = new
+        return True
+
+    def _flip_cushion_open(self, src: str, dst: str) -> None:
+        """W98 (z30u): the host cushion over this flip, begin -> done, on the
+        rate latch's own readings (weg2/flip_cushion.py). Instrument only."""
+        from sglang.srt.weg2 import flip_cushion as _fc
+
+        try:
+            w = self.__dict__.get("_flip_cushion_win")
+            if w is None:
+                w = _fc.FlipCushionWindow(
+                    _fc.cg_max_gib_of(host_ledger.read_cgroup()),
+                    host_ledger.RATE_LATCH_CUSHION_FLOOR_GIB)
+                self._flip_cushion_win = w
+            w.open(epoch=getattr(self, "epoch", 0), src=src, dst=dst,
+                   pr=host_ledger.read_cgroup_pressure())
+        except Exception as e:  # noqa: BLE001 -- an instrument never breaks a flip
+            logger.debug("WEG2-FLIP-CUSHION not opened: %s: %s", type(e).__name__, e)
+
+    def _flip_cushion_close(self) -> None:
+        """One WEG2-FLIP-CUSHION line per completed flip, and the same record
+        as the event ``flip_cushion`` in the boot's events.jsonl -- written by
+        the sidecar thread, never on the flip."""
+        from sglang.srt.weg2 import flip_cushion as _fc
+        from sglang.srt.weg2 import front_state_ipc
+
+        w = self.__dict__.get("_flip_cushion_win")
+        if w is None or not w.is_open:
+            return
+        try:
+            rec = w.close(host_ledger.read_cgroup_pressure())
+        except Exception as e:  # noqa: BLE001
+            logger.debug("WEG2-FLIP-CUSHION not closed: %s: %s", type(e).__name__, e)
+            return
+        if rec is None:
+            return
+        logger.info("%s", _fc.line(rec))
+        self.__dict__.setdefault("flip_cushion_log", collections.deque(maxlen=256)).append(rec)
+        d = envs.WEG2_STATE_DIR.get() or None
+        if d:
+            self._sidecar_submit(front_state_ipc.publish_flip_cushion, d, rec)
+
+    def _flip_cushion_note(self, pr: Dict[str, Any]) -> None:
+        w = self.__dict__.get("_flip_cushion_win")
+        if w is not None:
+            w.note(pr)
+
+    def _refuse_flip_in_stop(self, src: str, dst: str, when: str) -> None:
+        self.counters["flip_refused_stop"] += 1
+        logger.error(
+            "WEG2-FLIP REFUSED-STOP epoch=%s sleep=%s wake=%s (%s): the front is in STOP "
+            "(%s) -- a named teardown is final, no flip after it",
+            getattr(self, "epoch", "?"), src, dst, when, getattr(self, "stop", None))
+
+    def _publish_stop_state(self, name: str, detail: str, state_before: str) -> None:
+        """IPC §2.2 (user law: control never over log lines): the STOP into the
+        boot's state directory -- event ``front_stop`` and the A5 stop request,
+        through the one writer (weg2/state_file.py). No state directory = no-op;
+        a failed write is logged, never a second failure of the teardown."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        d = envs.WEG2_STATE_DIR.get() or None
+        if not d:
+            return
+        try:
+            out = front_state_ipc.publish_front_stop(
+                d, name=name, detail=detail, state_before=state_before,
+                epoch=getattr(self, "epoch", None), awake=getattr(self, "awake", None))
+            logger.error("WEG2 STOP STATE %s -> %s", name, out)
+        except Exception as e:  # noqa: BLE001 -- the teardown stands without the file
+            logger.error("WEG2 STOP STATE WRITE FAILED %s: %s: %s", name, type(e).__name__, e)
 
     # ---------------- HTTP handlers ----------------
     async def handle_health(self, request: web.Request) -> web.Response:
@@ -5804,6 +5937,14 @@ class Front:
             "outstanding": {g.name: len(g.outstanding) for g in self.groups.values()},
             "served": {g.name: g.served for g in self.groups.values()},
             "counters": dict(self.counters),
+            # PREFILL-EINBRUCH-0929: the X-price presence repairs as numbers per
+            # boot (count + tokens), so the metal read needs no log line.
+            "presence_price": {
+                "own_text_clamped": int(self.counters["presence_own_text_clamped"]),
+                "own_text_clamped_tokens": int(self.counters["presence_own_text_clamped_tokens"]),
+                "p_anchor_presence": int(self.counters["p_anchor_presence"]),
+                "p_anchor_presence_tokens": int(self.counters["p_anchor_presence_tokens"]),
+            },
             "corridor_min_mib": {k: dict(v) for k, v in self.corridor_min.items()},
             # Same instrument and band as the WEG2-CORRIDOR log line: a reader
             # of this dict must not have to guess which "free" it holds.  Both
@@ -7045,6 +7186,9 @@ class Front:
             # for P's own device tier, and its `prompt_tokens` speaks for
             # a prefill, not for a landing. The witness is D's own
             # `cached_tokens` on leg 2, recorded there.
+            # (W38 is gone since #1400/#1416; the landing is proven at D's
+            # first content of leg 2 -- `_p_anchor_presence`, behind
+            # SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.)
             #
             # `_note_exact` DOES stay: `prompt_tokens` is a TOKENISATION
             # fact (this text is 109,132 tokens), it feeds `carrier_est`,
@@ -7416,6 +7560,9 @@ class Front:
                         self.tspans.record_inflight(self.ftok.ids_for(text), self.epoch)
                         self._x_exact_reprice_queue("inflight")
                     self.counters["span_inflight_credited"] += 1
+                if (_has_content and pending is not None and not single_prefill
+                        and envs.SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.get()):
+                    self._p_anchor_presence(rid, text, pending)
                 if stream:
                     resp = web.StreamResponse(
                         status=r.status,
@@ -8761,12 +8908,22 @@ class Front:
 
     @_flip_single_flight
     async def flip(self, src: str, dst: str) -> None:
+        # W98-STOP-FINAL (z30u 07:14:10): a STOP is a named teardown, and no flip
+        # may run after it -- refused BEFORE any effect, the clock unlock
+        # included. (getattr: partial test fronts carry no `state`.)
+        if getattr(self, "state", None) == "STOP":
+            self._refuse_flip_in_stop(src, dst, "before the flip")
+            return
         # #55 F2: unlock the clocks BEFORE anything of the flip runs -- both groups' legs use the cards.
         _ic = getattr(self, "_idle_clock", None)
         if _ic is not None:
             await _ic.before_flip()
         S, D = self.groups[src], self.groups[dst]
-        self.state = "flipping"
+        if not self._enter_state("flipping"):
+            # the STOP landed while the clock unlock was awaited
+            self._refuse_flip_in_stop(src, dst, "during the clock unlock")
+            return
+        self._flip_cushion_open(src, dst)
         t_flip0 = time.time()
         # #1262 tier 3: the open flip's identity, for `flip_stall_check`. Not
         # cleared on the exits below -- every one of them leaves `state` at
@@ -8841,7 +8998,7 @@ class Front:
                     self.drain_deadline_s, self.drain_refusals_in_a_row,
                 )
                 self.drain_refusals_in_a_row = 0
-                self.state = "serving" if self.state != "STOP" else "STOP"
+                self._enter_state("serving")
                 return
             if not await self._abort_parked_on_drain(S, src):
                 self.drain_refusals_in_a_row += 1
@@ -8852,7 +9009,7 @@ class Front:
                              self.counters.get("suspended_now", 0), self.drain_refusals_in_a_row)
                 if self.drain_refusals_in_a_row >= 3:
                     self.do_stop("W2 Weg2DrainStuck", f"three W1 in a row on {src}: {sorted(S.outstanding)[:8]}")
-                self.state = "serving" if self.state != "STOP" else "STOP"
+                self._enter_state("serving")
                 return
         self.drain_refusals_in_a_row = 0
         # 2. quiesce + double witness (W3)
@@ -9228,7 +9385,15 @@ class Front:
         self.awake = dst
         self.epoch += 1
         self.admit_d = True
-        self.state = "serving"
+        if not self._enter_state("serving"):
+            # W98-STOP-FINAL (z30u 07:14:10 -> 136 requests served after a W98):
+            # a STOP that fell INTO this flip stays the end state. The bookkeeping
+            # below still runs -- the legs happened, `awake`/`epoch` are facts.
+            self.counters["flip_ended_in_stop"] += 1
+            logger.error(
+                "WEG2-FLIP ENDED-IN-STOP epoch=%d slept=%s woke=%s stop=%s -- the STOP "
+                "was raised while this flip ran; the front stays in STOP (no return "
+                "to serving after a named teardown)", self.epoch, src, dst, self.stop)
         if self.x_exact:
             # X-EXACT: a held (#49) credit is bound to its epoch -- re-price
             # the queue against the new one (PK's needs_p reads est_uncached).
@@ -9352,6 +9517,7 @@ class Front:
                     rec["sleep_leg_ms"], rec["wake_leg_ms"], rec["overlap_ms"], rec["overlap_pct"],
                     rec["critical_path"], rec["flip_ms"], len(self.weights_tags),
                     "off-path" if dc_off_path else dc)
+        self._flip_cushion_close()
         if src == "D" and dst == "P":
             self._dp_report(t_flip0, _dp_drain_end)
 

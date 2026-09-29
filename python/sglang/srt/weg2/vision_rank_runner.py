@@ -339,6 +339,17 @@ def own_card_bytes(device: torch.device) -> Optional[int]:
         return None
 
 
+def own_torch_bytes(device: torch.device) -> Optional[int]:
+    """Bytes this process's tensors hold on the card (torch allocator,
+    allocated -- not the cached-but-free segments)."""
+    if device.type != "cuda":
+        return None
+    try:
+        return int(torch.cuda.memory_allocated(device))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def host_bytes() -> Tuple[Optional[int], Optional[int]]:
     """(cgroup memory.current, this process's RssAnon) in bytes, or None."""
     cur = anon = None
@@ -381,6 +392,13 @@ class StageOutcome:
     read_bytes: int = 0
     direct: bool = False
     residue_bytes: Optional[int] = None
+    #: 29.09.: the stage's OWN residue -- torch.cuda.memory_allocated after the
+    #: teardown minus before the build. W110 judges this one: the NVML process
+    #: delta (residue_bytes) also moves when the caching allocator keeps a
+    #: segment or cuBLAS/cuDNN create a workspace on the first encode (z30j
+    #: run=1: NVML +44.0 MiB with every tower tensor released), which is not a
+    #: teardown leak. The NVML figure stays in the line as vram_residue_mib.
+    torch_residue_bytes: Optional[int] = None
     #: H125: where the tower sat (kvtail | free) and where it came from
     place: str = ""
     source: str = ""
@@ -439,6 +457,7 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
     page_size = int(getattr(allocator, "page_size", 1) or 1)
     rope_keys = set(rope_factory._ROPE_DICT)
     own0, host0 = own_card_bytes(device), host_bytes()
+    torch0 = own_torch_bytes(device)
     touched = False  # did the build start (anything to release)?
     module = res = views = plan = rows = slab = None
     on_card = device.type == "cuda"
@@ -578,6 +597,9 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
     own1, host1 = own_card_bytes(device), host_bytes()
     if own0 is not None and own1 is not None:
         out.residue_bytes = own1 - own0
+    torch1 = own_torch_bytes(device)
+    if torch0 is not None and torch1 is not None:
+        out.torch_residue_bytes = torch1 - torch0
     out.host_current_delta = _delta_mib(host0[0], host1[0])
     out.host_anon_delta = _delta_mib(host0[1], host1[1])
     return out
@@ -597,6 +619,8 @@ def _strip_module(module: torch.nn.Module) -> None:
 def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
     legs = ", ".join(f"{k} {v:.0f}" for k, v in out.legs_ms.items())
     residue = "n/a" if out.residue_bytes is None else f"{out.residue_bytes / vrs.MIB:+.1f}"
+    torch_res = ("n/a" if out.torch_residue_bytes is None
+                 else f"{out.torch_residue_bytes / vrs.MIB:+.1f}")
     sync = "n/a" if out.sync_ms is None else f"{out.sync_ms:.1f}"
     line = (f"run={run} rank=PP0 requests={len(rids)} items={out.items} "
             f"place={out.place or 'none'} source={out.source or 'none'} "
@@ -605,6 +629,7 @@ def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
             f"read={('O_DIRECT' if out.direct else 'BUFFERED') if out.read_bytes else 'none'} "
             f"read_mib={out.read_bytes / vrs.MIB:.1f} "
             f"legs_ms=({legs}) sync_ms={sync} vram_residue_mib={residue} "
+            f"torch_residue_mib={torch_res} "
             f"host_current_delta_mib={out.host_current_delta} host_anon_delta_mib={out.host_anon_delta}")
     if out.encode_ms or out.teardown_ms:  # (d) Befund 28.09.: the two long legs, split
         line += " encode_split_ms=(%s) teardown_split_ms=(%s)" % (
@@ -614,10 +639,21 @@ def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
         logger.info("%s %s rids=%s", W_STAGE_OK, line, list(rids))
     else:
         logger.error("%s %s rids=%s -- %s", out.code, line, list(rids), out.detail)
-    if out.residue_bytes is not None and out.residue_bytes > RESIDUE_TOLERANCE_BYTES:
+    leak, basis = teardown_leak_bytes(out)
+    if leak is not None and leak > RESIDUE_TOLERANCE_BYTES:
         logger.error("%s run=%d: this process holds %.1f MiB more on the card after the "
-                     "teardown than before the build", W_TEARDOWN, run,
-                     out.residue_bytes / vrs.MIB)
+                     "teardown than before the build (%s)", W_TEARDOWN, run,
+                     leak / vrs.MIB, basis)
+
+
+def teardown_leak_bytes(out: "StageOutcome") -> Tuple[Optional[int], str]:
+    """(bytes, basis) W110 judges: the torch-allocated delta when measured,
+    else the NVML process delta (a rank without torch accounting)."""
+    if out.torch_residue_bytes is not None:
+        return out.torch_residue_bytes, "torch allocated delta"
+    if out.residue_bytes is not None:
+        return out.residue_bytes, "NVML process delta, torch delta unavailable"
+    return None, "unmeasured"
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +755,10 @@ class AsyncStage:
     future: Any = None
     t_start: float = 0.0
     passes: int = 0
+    #: torch-allocated bytes before the build (W110 basis, 29.09.); forward
+    #: passes run while the stage is in flight, their transients are freed
+    #: again by the time finish_async_stage measures between two passes
+    torch0: Optional[int] = None
 
     def done(self) -> bool:
         return self.future is not None and self.future.done()
@@ -749,6 +789,7 @@ def start_async_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_conf
     page_size = int(getattr(allocator, "page_size", 1) or 1)
     rope_keys = set(rope_factory._ROPE_DICT)
     own0, host0 = own_card_bytes(device), host_bytes()
+    torch0 = own_torch_bytes(device)
     module = res = None
     t0 = clock()
     try:
@@ -801,7 +842,7 @@ def start_async_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_conf
 
     st = AsyncStage(reqs=list(reqs), items=items, out=out, module=module, res=res,
                     allocator=allocator, device=device, rope_keys=rope_keys,
-                    own0=own0, host0=host0, t_start=clock())
+                    own0=own0, host0=host0, t_start=clock(), torch0=torch0)
     st.future = (submit or _async_pool().submit)(_work)
     return st
 
@@ -843,6 +884,9 @@ def finish_async_stage(st: AsyncStage, clock: Callable[[], float] = time.perf_co
     own1, host1 = own_card_bytes(st.device), host_bytes()
     if st.own0 is not None and own1 is not None:
         out.residue_bytes = own1 - st.own0
+    torch1 = own_torch_bytes(st.device)
+    if st.torch0 is not None and torch1 is not None:
+        out.torch_residue_bytes = torch1 - st.torch0
     out.host_current_delta = _delta_mib(st.host0[0], host1[0])
     out.host_anon_delta = _delta_mib(st.host0[1], host1[1])
     return out

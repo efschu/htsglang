@@ -244,6 +244,6 @@ def test_the_store_geometry_follows_the_pinned_form():
     src = inspect.getsource(L.main)
     pin = src.index("_pin = pin_d_form_for_map(ns, log)")
     repoint = src.index("repoint_store_geometry_at_pinned_form(")
-    emap = src.index("_emap = publish_expert_map(")
+    emap_at = src.index("_emap = publish_expert_map(")
     env_p = src.index('group="P", xchg_env=xchg_env')
-    assert pin < repoint < emap < env_p
+    assert pin < repoint < emap_at < env_p

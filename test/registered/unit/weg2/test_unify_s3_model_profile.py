@@ -211,11 +211,16 @@ def test_the_27b_constants_moved_unchanged_and_the_nf_row_is_separate():
                 "P_OVERSHOOT_MIB"):
         assert n[own].measured_on == "nextflash", own
     assert "P_ACTIVATION_MIB" not in q
+    # (3) 29.09.: D's measured peak pool demand, the LRU floor of the stage solve
+    for own in ("D_POOL_PEAK_NONRES_ROWS", "D_POOL_PEAK_NONRES_SPAN_ROWS"):
+        assert n[own].measured_on == "nextflash", own
+        assert own not in q, own
     assert set(borrowed) == set(n) - {"P_DRAFT_RESIDENT_BUDGET_MIB", "P_DORMANT_SERVED_GROWTH_MIB",
                                       "D_AWAKE_REST_MIB", "D_FIXED_MIB", "D_ACTIVATION_MIB",
                                       "D_EXTEND_GROWTH_MIB", "D_EXTEND_GROWTH_PER_ROW_MIB",
                                       "P_ACTIVATION_MIB", "P_PP_STAGE_FIXED_MIB",
-                                      "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT", "P_OVERSHOOT_MIB"}
+                                      "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT", "P_OVERSHOOT_MIB",
+                                      "D_POOL_PEAK_NONRES_ROWS", "D_POOL_PEAK_NONRES_SPAN_ROWS"}
     assert set(borrowed.values()) == {"qwen27b"}
     assert F.borrowed_constants("qwen27b") == ()
     assert "P_OVERSHOOT_MIB" not in F.borrowed_constants_line("nextflash")

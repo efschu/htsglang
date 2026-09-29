@@ -36,7 +36,14 @@ from typing import Dict, List, Optional, Tuple
 
 #: Bumped on every incompatible change of :class:`RankState`. A reader
 #: refuses a record of another version by name instead of guessing fields.
-RANK_STATE_SCHEMA = 1
+#: 2 (VRAM-Vertrag M2, 29.09.): schema 1 plus the optional block ``vram``
+#: (weg2/vram_actual.py, ``weg2.rank_vram/1``). A schema-1 record still reads
+#: (it carries no ``vram``); any other version is refused by name. A ``vram``
+#: block this reader refuses costs only the block (``vram_refused``), never
+#: the record: it is display and record, not a control value.
+RANK_STATE_SCHEMA = 2
+#: Versions this reader accepts; a record's ``vram`` is only legal from 2 on.
+RANK_STATE_SCHEMAS_READ = (1, 2)
 
 RANK_STATE_ENV = "SGLANG_WEG2_RANK_STATE_DIR"
 
@@ -85,6 +92,13 @@ class RankState:
     #: Attach counter of this process (re-attach after a cutover rewrites).
     seq: int = 0
     schema: int = RANK_STATE_SCHEMA
+    #: VRAM-Vertrag M2: the rank's VRAM actual per PID and category
+    #: (``weg2.rank_vram/1``, weg2/vram_actual.py); None with
+    #: SGLANG_WEG2_VRAM_ACTUAL off. Display and records only -- no gate reads it.
+    vram: Optional[dict] = None
+    #: READER-SIDE: why this reader dropped the record's ``vram`` block
+    #: (VRAM-ACTUAL-BLOCK-REFUSED), None otherwise. A writer never sets it.
+    vram_refused: Optional[str] = None
 
     @property
     def rank_key(self) -> str:
@@ -94,6 +108,8 @@ class RankState:
         d = asdict(self)
         if d["dcp_owner"] is not None:
             d["dcp_owner"] = list(d["dcp_owner"])
+        if d["vram_refused"] is None:
+            del d["vram_refused"]  # reader-side finding; a writer's record never carries it
         return json.dumps(d, sort_keys=True)
 
     @classmethod
@@ -104,14 +120,28 @@ class RankState:
             raise RankStateSchemaError(f"not a RankState record: {e}") from e
         if not isinstance(d, dict):
             raise RankStateSchemaError("not a RankState record: top level is not an object")
-        if d.get("schema") != RANK_STATE_SCHEMA:
+        schema = d.get("schema")
+        if schema not in RANK_STATE_SCHEMAS_READ:
             raise RankStateSchemaError(
-                f"RankState schema {d.get('schema')!r}, this reader knows {RANK_STATE_SCHEMA}"
+                f"RankState schema {schema!r}, this reader knows {list(RANK_STATE_SCHEMAS_READ)}"
             )
         names = set(cls.__dataclass_fields__)
+        if schema == 1:
+            names -= {"vram", "vram_refused"}
         unknown = sorted(set(d) - names)
         if unknown:
-            raise RankStateSchemaError(f"RankState schema {RANK_STATE_SCHEMA} has no field(s) {unknown}")
+            raise RankStateSchemaError(f"RankState schema {schema} has no field(s) {unknown}")
+        if d.get("vram") is not None:
+            # The block is display and record, never a control value: a block
+            # this reader refuses is dropped BY NAME and the record -- the
+            # W7/W10 facts -- still reads (coordinator 29.09.).
+            from sglang.srt.weg2.vram_actual import VramBlock, VramBlockSchemaError
+
+            try:
+                VramBlock.from_dict(d["vram"])
+            except VramBlockSchemaError as e:
+                d["vram"] = None
+                d["vram_refused"] = str(e)
         if d.get("dcp_owner") is not None:
             d["dcp_owner"] = tuple(int(x) for x in d["dcp_owner"])
         try:

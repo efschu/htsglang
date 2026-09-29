@@ -296,11 +296,18 @@ def _park_end(sched, running) -> int:
     the rows. Returns the number of parts written on this rank."""
     from sglang.srt.weg2 import tail_handoff as th
 
-    if not running or not th.park_end_enabled():
+    if not th.park_end_enabled():
         return 0
     ps = getattr(sched, "ps", None)
     tp_rank = int(getattr(ps, "tp_rank", getattr(sched, "tp_rank", 0)) or 0)
     tp_size = int(getattr(ps, "tp_size", getattr(sched, "tp_size", 1)) or 1)
+    # leak (29.09.): the parts of rids D no longer holds leave before new ones come
+    n_reaped, reaped = th.reap_orphan_parks(_live_rids(sched, running), f"{th.PARK_PART}{tp_rank}")
+    if n_reaped:
+        logger.info("F4 PARK-REAP files=%d rids=%s (parts of rids D no longer holds)",
+                    n_reaped, [r[:12] for r in reaped])
+    if not running:
+        return 0
     part = f"{th.PARK_PART}{tp_rank}-{os.getpid()}"
     # the resume re-enters at the last mamba track point (#59b resumable
     # depth), at most one track interval below the end: two cover the lag of
@@ -320,6 +327,21 @@ def _park_end(sched, running) -> int:
     logger.info("F4 PARK-END park: parts=%d of %d running sync_ms=%.1f refused=%s part=%s",
                 len(events), len(running), sync_ms, why or "-", part)
     return len(events)
+
+
+def _live_rids(sched, running) -> set:
+    """Every rid D still holds: running (about to park), parked, queued, in
+    the #1471 settle or the #1443 dormant hold, the chunked one."""
+    live = set()
+    for group in (running, getattr(sched, "weg2_d_parked", None),
+                  getattr(sched, "waiting_queue", None),
+                  getattr(sched, "weg2_post_wake_settle", None),
+                  getattr(sched, "weg2_dormant_hold", None),
+                  [getattr(sched, "chunked_req", None)]):
+        for r in group or ():
+            if r is not None:
+                live.add(str(getattr(r, "rid", "")))
+    return live
 
 
 def hold_parked(sched, *, hold_armed: bool) -> int:
@@ -757,12 +779,20 @@ def park_abort(sched, recv_req) -> int:
     (#1445): a parked request owns no device rows (retracted), so dropping it
     and telling the tokenizer is the whole release."""
     from sglang.srt.managers.io_struct import AbortReq
+    from sglang.srt.weg2 import tail_handoff as th
 
+    rid = str(getattr(recv_req, "rid", "") or "")
+    abort_all = bool(getattr(recv_req, "abort_all", False))
+    if th.park_end_enabled():
+        # F4 leak (29.09.): an aborted rid is never resumed -- no adopt verdict
+        # takes its park parts; wherever it was queued, they go with the abort
+        n = th.remove_parks_aborted(rid, abort_all)
+        if n:
+            logger.info("F4 PARK-END abort: %d park part file(s) removed (rid=%s abort_all=%s)",
+                        n, rid[:12], abort_all)
     parked = getattr(sched, "weg2_d_parked", None)
     if not parked:
         return 0
-    rid = str(getattr(recv_req, "rid", "") or "")
-    abort_all = bool(getattr(recv_req, "abort_all", False))
     gone = [r for r in parked if abort_all or str(r.rid).startswith(rid)]
     if not gone:
         return 0
