@@ -32,6 +32,14 @@ detail_full in cause-<seq>.txt und das Event verweist darauf).
   state_file.py rc     --dir D
   state_file.py get    --dir D [--key a.b]
   state_file.py new-boot-id --prefix P --kind K
+  state_file.py deadman --dir D --tier T --name N [--group G] --detail T     (Phase 2, Wächter)
+  state_file.py health  --dir D                                             (Phase 2, Healthcheck)
+
+Phase 2 (27B-Verbraucher, IPC-VERBRAUCHER-27B A4/W1): der Deadman schreibt sein
+Urteil als Event `deadman_verdict` plus stop_request.json direkt hierher (kein
+Text-Hop Deadman -> .out -> Arm -> Abnahme-Log mehr); der Docker-Healthcheck
+entscheidet über `health` aus dem Zustand statt aus einer eingebrannten Liste
+von Todesmustern.
 """
 import argparse
 import contextlib
@@ -61,12 +69,14 @@ KINDS = ("dry", "d2", "boot")
 ORIGINS = ("preflight", "launcher", "rank", "front", "deadman", "operator", "container_exit", "oom", "host")
 #: stopping-/stopped_clean-Gründe (cause.code, origin operator); stopped_clean trägt cause.rc = 0 (A3)
 STOP_REASONS = ("stop_file", "operator", "window_end", "max_deaths", "probes_done", "d2_done")
-WRITERS = ("host", "launcher", "front")
+#: `deadman` (Phase 2): nur Herzschlag, Event deadman_verdict und stop_request.json -- keine Felder, keine Zustände
+WRITERS = ("host", "launcher", "front", "deadman")
 #: A1c Feld-Eigentum: oberstes Feld je Schreiber (heartbeat.<name> schreibt jeder für sich)
 OWNED_FIELDS = {
     "host": ("tag", "line", "rev", "image", "image_id", "container", "profile", "gpuq_id", "front"),
     "launcher": ("groups", "invariants"),
     "front": ("front",),
+    "deadman": (),
 }
 #: A1c Zustands-Eigentum
 OWNED_STATES = {
@@ -74,11 +84,12 @@ OWNED_STATES = {
              "stopping", "stopped_clean", "dead"),
     "launcher": ("loading", "ready", "dead"),
     "front": ("serving", "flipping"),
+    "deadman": (),
 }
 #: A1c: ein `dead` des Launchers trägt nur diese Ursprünge (Host: Container-Exit, OOM, Wächter, host)
 LAUNCHER_DEAD_ORIGINS = ("launcher", "rank")
 #: Heartbeat-Name je Schreiber (H3: die Namen sind offen, Ränge schreiben "<G>.tp<t>pp<p>")
-HEARTBEAT_NAME = {"host": "host_acceptance", "launcher": "launcher", "front": "front"}
+HEARTBEAT_NAME = {"host": "host_acceptance", "launcher": "launcher", "front": "front", "deadman": "deadman"}
 #: Verbraucher-Regel §2.2: Herzschlag älter als das = verdächtig
 HEARTBEAT_STALE_S = 30.0
 #: Aus Abwärtsverträglichkeit: der Host-Schreiber durfte immer genau diese Felder
@@ -217,6 +228,8 @@ def _heartbeat(st: dict, writer: str = "host", container=None) -> None:
     me = hb.get(name) or {"seq": 0}
     if writer == "host":
         pid = int(os.environ.get("ACC_WRITER_PID") or os.getppid())
+    elif writer == "deadman":
+        pid = int(os.environ.get("WEG2_WRITER_PID") or os.getppid())   # die Deadman-Shell, nicht dieses python
     else:
         pid = os.getpid()
     inside = _in_container()
@@ -416,6 +429,79 @@ def death_cause(d: str, container: str, code=None) -> dict:
     return make_cause(code, origin, "; ".join(parts))
 
 
+#: Zustände, in denen ein Deadman-Urteil KEINE Stop-Anfrage wird: das Ende läuft schon
+#: (stopping: beim geplanten docker stop sieht der Deadman im Container seine Prozesse
+#: verschwinden, bevor er selbst stirbt -- ein stop_request machte aus dem geplanten Ende
+#: über `finish` ein dead rc 24) oder ist schon da (terminal).
+DEADMAN_NO_STOP = ("stopping",) + TERMINAL
+
+
+def deadman_code(tier: str) -> str:
+    """DEADMAN_<TIER>, wie acc_nf_rc11b_dauer_v2.sh dm_request (Großbuchstaben, sonst `_`)."""
+    t = "".join(c if c.isalnum() or c == "_" else "_" for c in (tier or "UNKNOWN")) or "UNKNOWN"
+    return f"DEADMAN_{t.upper()}"
+
+
+def deadman_verdict(d: str, tier: str, detail: str, *, name: str = "", group=None) -> dict:
+    """Phase 2 (IPC-VERBRAUCHER-27B A4/N4): das Deadman-Urteil als Zustand statt als Text-Hop.
+
+    Immer: Event `deadman_verdict` {tier, detail_full, after_state} mit code DEADMAN_<TIER>.
+    In einem lebenden Zustand zusätzlich stop_request.json (A5, Format wie dm_request des
+    NF-Arms: {code, origin deadman, group P|D|null, rank null, detail_full "<name>: <zeile>"});
+    der Host-Schreiber macht daraus dead rc 24. Die erste Ursache gewinnt: eine schon
+    liegende Stop-Anfrage (Arm-Wächter, Relay) wird nicht überschrieben.
+    Ohne state.json (Boot ohne Zustandsverzeichnis) wird nichts geschrieben.
+    Rückgabe: {"written": bool, "stop_request": bool, "state": <lifecycle>}"""
+    st = read(d)
+    if not st:
+        return {"written": False, "stop_request": False, "state": None}
+    group = group if group in ("P", "D") else None
+    code = deadman_code(tier)
+    full = f"{name}: {detail}" if name else str(detail)
+    cur = (st.get("lifecycle") or {}).get("state")
+    add_event(d, "deadman_verdict", {"tier": tier, "detail_full": full, "after_state": cur},
+              writer="deadman", group=group, code=code)
+    req = False
+    path = os.path.join(d, "stop_request.json")
+    if cur not in DEADMAN_NO_STOP:
+        with _locked(d):
+            if not os.path.exists(path):
+                write_json_atomic(path, {"code": code, "origin": "deadman", "group": group, "rank": None,
+                                         "detail_full": full})
+                req = True
+    return {"written": True, "stop_request": req, "state": cur}
+
+
+#: Rückgabe von `health`: 0 = der Zustand kennt keinen Tod, 1 = tot, 2 = kein lesbarer Zustand
+HEALTH_OK, HEALTH_DEAD, HEALTH_NO_STATE = 0, 1, 2
+
+
+def health(d: str):
+    """Phase 2 (IPC-VERBRAUCHER-27B W1): das Urteil des Docker-Healthchecks aus dem Zustand
+    statt aus einer im Image eingebrannten Todesmuster-Liste. Tot ist, was der Zustand als
+    tot führt: lifecycle `dead`, eine Stop-Anfrage des Wächters (stop_request.json), oder eine
+    Gruppe mit groups.<G>.state == "dead". Kein Zustand oder fremdes Schema = HEALTH_NO_STATE
+    (der Aufrufer entscheidet dann selbst, nie "gesund" aus Stille).
+    Rückgabe: (code, grund)."""
+    try:
+        st = read(d)
+    except (StateFileError, ValueError, OSError) as e:
+        return HEALTH_NO_STATE, f"state.json unlesbar: {e}"
+    if not st:
+        return HEALTH_NO_STATE, f"{_path(d)} fehlt"
+    lc = (st.get("lifecycle") or {}).get("state")
+    if lc == "dead":
+        c = st.get("cause") or {}
+        return HEALTH_DEAD, f"lifecycle dead {c.get('code')} origin={c.get('origin')} group={c.get('group')}"
+    req = stop_request(d)
+    if req is not None:
+        return HEALTH_DEAD, f"stop_request {req['code']} origin={req['origin']} group={req.get('group')}"
+    for g, gs in sorted((st.get("groups") or {}).items()):
+        if isinstance(gs, dict) and gs.get("state") == "dead":
+            return HEALTH_DEAD, f"group {g} dead"
+    return HEALTH_OK, f"lifecycle {lc}"
+
+
 def rc_of(st: dict, was_serving: bool) -> int:
     s = (st.get("lifecycle") or {}).get("state")
     cause = st.get("cause") or {}
@@ -481,6 +567,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("rc"); p.add_argument("--dir", required=True)
     p = sub.add_parser("get"); p.add_argument("--dir", required=True); p.add_argument("--key")
     p = sub.add_parser("new-boot-id"); p.add_argument("--prefix", required=True); p.add_argument("--kind", required=True)
+    p = sub.add_parser("deadman"); p.add_argument("--dir", required=True); p.add_argument("--tier", required=True)
+    p.add_argument("--name", default=""); p.add_argument("--group"); p.add_argument("--detail", default="")
+    p = sub.add_parser("health"); p.add_argument("--dir", required=True)
     a = ap.parse_args(argv)
 
     if a.cmd == "new-boot-id":
@@ -543,6 +632,13 @@ def main(argv=None) -> int:
     if a.cmd == "rc":
         print(rc_of(read(a.dir), served(a.dir)))
         return 0
+    if a.cmd == "deadman":
+        print(json.dumps(deadman_verdict(a.dir, a.tier, a.detail, name=a.name, group=a.group), sort_keys=True))
+        return 0
+    if a.cmd == "health":
+        code, why = health(a.dir)
+        print(why)
+        return code
     return 2
 
 

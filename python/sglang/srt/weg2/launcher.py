@@ -11614,6 +11614,8 @@ FORM_A_KV_WORKER_CANONICAL_MARKER = "#239 F14 KV-WORKER-WINDOW: Form A worker ow
 def canonical_marker_counts(path: str) -> tuple:
     """(kv, blob, workers): the #706 KV-page and GDN-blob markers of a group
     log, each worker line (no-window or F14 KV window) counted once into both."""
+    # IPC-LOG-EXCEPTION: comparison number only -- canonical_state_gate decides on the
+    # RankState records and merely REPORTS a disagreement ('IPC MISMATCH').
     n_kv = count_marker(path, "#706 canonical KV page active")
     n_blob = count_marker(path, "canonical GDN blob active")
     n_worker = (count_marker(path, FORM_A_WORKER_CANONICAL_MARKER)
@@ -11724,6 +11726,7 @@ def canonical_state_gate(spec: GroupSpec, expected: int, log: Log,
                 f"tp{r} owns token rows under the cut but reports kv "
                 f"{'missing' if s is None else f'applicable={s.kv_page_applicable} active={s.kv_page_active}'}")
     log(f"W7/W10 launcher half, group {spec.name} RankState ({state_dir}): {verdict.line()}")
+    # IPC-LOG-EXCEPTION: reported, never decides (see canonical_marker_counts).
     n_kv, n_blob, n_worker = canonical_marker_counts(spec.log)
     if (n_kv, n_blob) != (verdict.n_kv, verdict.n_blob):
         log(f"IPC MISMATCH W7/W10 group {spec.name}: log count kv x{n_kv} blob x{n_blob} "
@@ -11791,7 +11794,13 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
 
 def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, tag: str, name: str, dry: bool) -> int:
     out = f"{GPU_ARB}/deadman_{tag}_{name}.out"
-    cmd = f"GRACE_S=600 PROBE_S={probe_s} setsid {DEADMAN} {shlex.quote(boot_log)} {port} {shlex.quote(pattern)} > {shlex.quote(out)} 2>&1 & echo $!"
+    # IPC Phase 2 (IPC-VERBRAUCHER-27B A4/N4): the deadman writes its verdict into the
+    # boot's state (event deadman_verdict + stop_request.json) through the ONE writer,
+    # and reads READY from groups.<G>.state -- WEG2_STATE_DIR is inherited; these name
+    # the group, the interpreter and the writer file (the image has no sglang on PATH).
+    ipc = (f"WEG2_DEADMAN_GROUP={shlex.quote(name)} WEG2_PY={shlex.quote(sys.executable)} "
+           f"WEG2_STATE_FILE_PY={shlex.quote(state_file_mod.__file__)} ")
+    cmd = f"{ipc}GRACE_S=600 PROBE_S={probe_s} setsid {DEADMAN} {shlex.quote(boot_log)} {port} {shlex.quote(pattern)} > {shlex.quote(out)} 2>&1 & echo $!"
     if dry:
         log(f"DRY-RUN: would arm deadman: {cmd}")
         return 0
@@ -23366,6 +23375,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "NEXTN head) and immaterial without a store to key.")
     else:
         _forced = "#1233 HICACHE BIGRAM KEYS FORCED"
+        # IPC-LOG-EXCEPTION: W9 still reads the forced-bigram LINE (Phase 2 rest, producer
+        # side: RankState schema 2 `store_key_scheme`, IPC-STATE-PLAN §2.1).
         _p_bigram = ("--speculative-algorithm" in spec_p.argv) or count_marker(spec_p.log, _forced) >= 1
         _d_bigram = ("--speculative-algorithm" in spec_d.argv) or count_marker(spec_d.log, _forced) >= 1
         log(f"W9 launch-time key-scheme gate: P bigram={_p_bigram} (forced lines {count_marker(spec_p.log, _forced)}) "
@@ -23440,6 +23451,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # tier) hold no carrier; their plain pool is synced to the attention
         # host's staging ring and prints 0.9 x that, while the host prints the
         # arena's capacity -- they abstain, as they do in the prefetch vote.
+        # IPC-LOG-EXCEPTION: W45 still reads worker and '#915 PREFETCH LIMIT' lines (Phase 2
+        # rest, IPC-STATE-PLAN R1: RankState role + `carrier_prefetch_limit_tokens`).
         _abstain = _cc.form_a_worker_ranks(spec_d.log)
         _cen = _cc.census(spec_d.log, expected_ranks=_expect_ranks, floor=_floor,
                           abstain_ranks=_abstain)
@@ -23510,13 +23523,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # UNIFY S6 (27B c60a5d387f): under p_draft=cold P builds the producer
         # but writes NO draft pages -- W10 is skipped by name (identities still
         # logged); W11 still grades the cold-resident draft bytes.
+        # IPC-LOG-EXCEPTION: W10-drafter / W11 still read drafter identity and draft-build
+        # lines (Phase 2 rest: RankState schema 2 `drafter`, `draft_build`).
         gate_w10(spec_p.log, spec_d.log, log,
                  p_produces_draft_pages=p_produces_draft_pages())
         # #1233 fix 2: W11 DRAFT-RESIDENT gate. The last stage's pool is priced
         # against a budgeted draft residue (P_DRAFT_RESIDENT_BUDGET_MIB); the L2
         # line carries the MEASURED one. Over budget = the corridor derivation is refuted by this
         # boot -> refuse before the front opens (boot weg2dk2's 3994 MiB build).
+        # IPC-LOG-EXCEPTION: W11 (see W10 above).
         gate_w11(spec_p.log, log)
+    # IPC-LOG-EXCEPTION: display only (class A), decides nothing; metric bar1_window_clip_total later.
     clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
     log(f"BAR1 fit (deviation: transports open): D log 'window clip'/'Bar1WindowRefused' lines = {clips} (0 = both groups fit the aperture)")
 
