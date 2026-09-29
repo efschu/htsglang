@@ -2791,7 +2791,7 @@ class HiCacheController:
         if rows.numel() == 0:
             return False
         if (
-            _weg2_p_overlap.p_nosync_on()
+            _weg2_p_overlap.cache_path_nosync_on()  # #281: D too
             and rows.is_cuda
             and self._dcp_owner_ctx() is None
         ):
@@ -2913,7 +2913,7 @@ class HiCacheController:
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
                 if (
-                    _weg2_p_overlap.p_nosync_on()
+                    _weg2_p_overlap.cache_path_nosync_on()  # #281: D too
                     and device_indices.is_cuda
                     and not host_indices.is_cuda
                 ):

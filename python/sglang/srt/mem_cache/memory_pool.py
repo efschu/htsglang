@@ -2097,9 +2097,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # P-NOSYNC (managers/weg2_p_overlap.py): `alloc` writes the mamba
         # mapping rows without a host wait on the stream. Read once; off =
         # the stock write, unchanged.
-        from sglang.srt.managers.weg2_p_overlap import p_nosync_on
+        # D-CACHE-NOSYNC (#281): group D asks the same cache-path switch.
+        from sglang.srt.managers.weg2_p_overlap import cache_path_nosync_on
 
-        self._nosync = p_nosync_on()
+        self._nosync = cache_path_nosync_on()
         # Bound by the radix cache at construction (`bind_tree_cache`) so the
         # allocation sites below can evict cached checkpoints before declaring
         # the pool exhausted. None until then (and for pool-only unit setups),
