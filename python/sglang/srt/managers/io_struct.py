@@ -1661,6 +1661,20 @@ class Weg2ParkRunningReqOutput(BaseReq, kw_only=True):
     weg2_resumable_depth: Dict[str, int] = {}
 
 
+class Weg2ParkWindowReqInput(BaseReq, kw_only=True):
+    """PARK-WINDOW-GATE (29.09.): the front's open collect window, ``POST
+    /weg2/park_window`` to group D -- ``left_ms`` until the window's deadline
+    (``< 0`` clears it) and D's X-COST-LINE (``a_ms + (b_ms + c_ms * p_k) * n``).
+    No reply; D admits no extend whose forward ends after the deadline
+    (weg2/park_window_gate)."""
+
+    epoch: int = 0
+    left_ms: int = -1
+    a_ms: float = 0.0
+    b_ms: float = 0.0
+    c_ms: float = 0.0
+
+
 class PlePrefetchHintReqInput(BaseReq, kw_only=True):
     """fnFL2 H43: the front's hint that request ``rid`` (its prompt tokenized
     here, ``input_ids``) will come to this group; the PP0 scheduler starts the

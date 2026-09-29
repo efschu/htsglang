@@ -3921,6 +3921,9 @@ class Front:
         self._resume_ms_log: List[float] = []
         #: PARK-COLLECT-WINDOW: the D phase (epoch) whose collect hold is named.
         self._park_collect_epoch = -1
+        #: PARK-WINDOW-GATE: (epoch, left_ms, line key) of the last open window
+        #: sent to D, None = none open there.
+        self._park_window_sent: Optional[tuple] = None
         #: PARK-COLLECT-WINDOW: checkpoint x form of this boot (the round-trip
         #: record's key, qwen27b and nextflash never share one); "" = no form.
         self._park_form_key = park_form_key()
@@ -4428,6 +4431,8 @@ class Front:
             return None
         p = phase_policy.immediate_park_trigger(self.queue, int(self.tp_prefill_max_tokens))
         if p is None:
+            if envs.SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE.get():  # off: nothing touched
+                self._park_window_send(D, -1)
             return None
         need_ms, prov = self._derived_min_dwell_ms("D", "P")
         collect = envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get()
@@ -4490,6 +4495,10 @@ class Front:
                 items, now, self.t_awake, n_running, price_s, threshold, timer=timer,
                 max_requests=self.p_phase_max_requests, pool_tokens=self.p_pool_tokens,
                 wait_bound_s=self.d_wait_bound_s)
+            # PARK-WINDOW-GATE: an open window (t_start set, holding) tells D its
+            # deadline; FIRE parks (D clears there), anything else clears it.
+            if not fire and envs.SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE.get():
+                self._park_window_send(D, int(left_s * 1000.0) if t_start is not None else -1)
             if not fire:
                 if self._park_collect_epoch != self.epoch:
                     self._park_collect_epoch = self.epoch
@@ -4506,6 +4515,39 @@ class Front:
                         "uncached=%d collected_s=%.1f", self.epoch, p.rid, why, n_running, len(items),
                         sum(u for _, u in items), (now - t_start) if t_start is not None else 0.0)
         return p
+
+    def _park_window_send(self, D: Group, left_ms: int) -> None:
+        """PARK-WINDOW-GATE (27B decision 29.09. ~13:55Z): the open collect
+        window's deadline and D's X-COST-LINE to group D (``left_ms < 0`` clears
+        a window sent before). The window stays the one decision site; D only
+        refuses to START an extend that would end after it, so the park never
+        waits for one (weg2/park_window_gate). Fire and forget; off = nothing."""
+        if not envs.SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE.get():
+            return
+        from sglang.srt.weg2 import park_window_gate as _pwg
+
+        line = None
+        if left_ms >= 0:
+            line, _src = self._x_cost_line_of(self._d_cost_rows, self._d_cost_all,
+                                              self._x_cost_seed)
+        body, self._park_window_sent = _pwg.front_message(
+            self._park_window_sent, epoch=self.epoch, left_ms=left_ms, line=line)
+        if body is None or self.session is None:
+            return
+        self.counters["park_window_sent" if left_ms >= 0 else "park_window_cleared"] += 1
+
+        async def _post() -> None:
+            try:
+                code, _ = await self.rpc(D, _pwg.PATH, body, 5)
+                logger.info("WEG2 PARK-WINDOW-GATE sent epoch=%d left_ms=%d status=%d",
+                            int(body["epoch"]), int(body["left_ms"]), code)
+            except Exception as e:  # noqa: BLE001 -- a lost window costs the gain only
+                logger.info("WEG2 PARK-WINDOW-GATE send failed: %r", e)
+
+        tasks = self.__dict__.setdefault("_park_window_tasks", set())
+        task = asyncio.ensure_future(_post())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     def _park_collect_window_s(self) -> Tuple[float, str]:
         """PARK-COLLECT-WINDOW: one flip round trip in seconds and its source,

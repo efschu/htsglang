@@ -196,6 +196,7 @@ from sglang.srt.managers.io_struct import (
     VramBudgetReqInput,
     VramBudgetReqOutput,
     Weg2ParkRunningReqInput,
+    Weg2ParkWindowReqInput,
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
@@ -3791,6 +3792,7 @@ class Scheduler(
                 (SessionCheckpointReqInput, self.handle_session_checkpoint),
                 (VramBudgetReqInput, self.handle_vram_budget),
                 (Weg2ParkRunningReqInput, self.handle_weg2_park_running),
+                (Weg2ParkWindowReqInput, self.handle_weg2_park_window),
                 (Weg2VisionVerdict, self.handle_weg2_vision_verdict),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
@@ -6206,11 +6208,19 @@ class Scheduler(
     def handle_weg2_park_running(self, recv_req):
         """H91b: ``POST /weg2/park_running`` -- park every running D request
         before D's sleep (d_park_runtime.park_running)."""
-        from sglang.srt.weg2 import d_park_runtime
+        from sglang.srt.weg2 import d_park_runtime, park_window_gate
 
+        park_window_gate.clear(self, "park")  # the window fired: its deadline is spent
         return d_park_runtime.park_running(
             self, recv_req, late_hold_armed=_weg2_dormant_admit_armed()
         )
+
+    def handle_weg2_park_window(self, recv_req) -> None:
+        """PARK-WINDOW-GATE: the front's open collect window (deadline and D's
+        cost line) or its clear; no reply (weg2/park_window_gate)."""
+        from sglang.srt.weg2 import park_window_gate
+
+        park_window_gate.note(self, recv_req)
 
     def weg2_d_hold_parked(self) -> int:
         """H91b: the sleep leg's dormant point -- parked requests enter the
@@ -6723,6 +6733,12 @@ class Scheduler(
                         os.remove(_p)
                 except OSError:
                     pass
+        except Exception:  # noqa: BLE001
+            pass
+        try:  # PARK-WINDOW-GATE: a window of the last D phase never outlives the wake
+            from sglang.srt.weg2 import park_window_gate as _pwg
+
+            _pwg.clear(self, "wake")
         except Exception:  # noqa: BLE001
             pass
         if not hold:
@@ -16526,6 +16542,19 @@ class Scheduler(
                 _note_skip("weg2_x_refused", req.rid)
                 _x_refused.append(req)
                 continue
+            # PARK-WINDOW-GATE (29.09.): while the front's collect window is
+            # open, no extend whose forward ends after its deadline -- the park
+            # must not wait for it. Inert without a window (every term replicated).
+            if getattr(self, "_weg2_park_window", None) is not None:
+                from sglang.srt.weg2 import park_window_gate as _pwg
+
+                _pw_unc = int(self.weg2_uncached_extent(req, _head_inputs))
+                if _pwg.defers(self, req, uncached=_pw_unc,
+                               prefix_tokens=max(0, len(req.fill_ids) - _pw_unc),
+                               batch_empty=not adder.can_run_list,
+                               running_n=len(self.running_batch.reqs)):
+                    _note_skip("weg2_park_window", req.rid)
+                    continue
             # WEG2 VISION (D side): priced like W31 -- the GROUP's match, no
             # new collective -- so the verdict is the same on every rank.
             if getattr(self, "_weg2_vision_d_guard", False):
