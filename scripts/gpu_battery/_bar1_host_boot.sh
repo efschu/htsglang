@@ -166,7 +166,7 @@ bar1_boot_start() {
 #   * the card occupancy does not care who holds it -- and that is exactly the
 #     condition building the BAR1 region really depends on (the holder
 #     reported ENOMEM).
-BAR1_ALTLAST_MIB="${BAR1_ALTLAST_MIB:-2000}"
+BAR1_LEGACY_MIB="${BAR1_LEGACY_MIB:-2000}"
 bar1_altlast_pruefen() {
     local port="$1" report="${2:-}" raw busy proc vram bad=""
     # A report from an EARLIER, failed attempt in the same step directory must
@@ -208,7 +208,7 @@ bar1_altlast_pruefen() {
     for mib in $vram; do
         mib="${mib// /}"
         [ -z "$mib" ] && continue
-        if [ "$mib" -gt "$BAR1_ALTLAST_MIB" ] 2>/dev/null; then
+        if [ "$mib" -gt "$BAR1_LEGACY_MIB" ] 2>/dev/null; then
             bad="$bad GPU$i=${mib}MiB"
         fi
         i=$((i + 1))
@@ -223,7 +223,7 @@ bar1_altlast_pruefen() {
         [ -n "$report" ] && printf 'Altlast:%s\n' "$bad" > "$report"
         return 1
     fi
-    echo "leftover check: port free, no launch_server processes, cards below ${BAR1_ALTLAST_MIB} MiB"
+    echo "leftover check: port free, no launch_server processes, cards below ${BAR1_LEGACY_MIB} MiB"
     return 0
 }
 
@@ -234,8 +234,8 @@ bar1_altlast_pruefen() {
 # while a server has long been running on the host -- then the pidfile the
 # boot script wrote itself applies. Without the second source that very window
 # is a leak.
-BAR1_KILL_NACHSCHAU_TIMEOUT_S="${BAR1_KILL_NACHSCHAU_TIMEOUT_S:-15}"
-BAR1_KILL_NACHSCHAU_POLL_S="${BAR1_KILL_NACHSCHAU_POLL_S:-1}"
+BAR1_KILL_RECHECK_TIMEOUT_S="${BAR1_KILL_RECHECK_TIMEOUT_S:-15}"
+BAR1_KILL_RECHECK_POLL_S="${BAR1_KILL_RECHECK_POLL_S:-1}"
 bar1_kill_host_server() {
     local pid="${1:-}" hostpid="${2:-}" dump="${3:-}" file_pid=""
     if ! bar1_pid_ok "$pid" && [ -n "$hostpid" ]; then
@@ -255,17 +255,17 @@ bar1_kill_host_server() {
     # process dies within the deadline it counts as cleaned up; if it does
     # NOT, the honest report "still alive" stands (and the caller has never
     # treated that as a STOP for the run).
-    local tries=$(( BAR1_KILL_NACHSCHAU_TIMEOUT_S / BAR1_KILL_NACHSCHAU_POLL_S ))
+    local tries=$(( BAR1_KILL_RECHECK_TIMEOUT_S / BAR1_KILL_RECHECK_POLL_S ))
     [ "$tries" -lt 1 ] && tries=1
     local i=0
     while host_ssh_for 60 "kill -0 $pid 2>/dev/null" >/dev/null 2>&1; do
         i=$((i + 1))
         if [ "$i" -ge "$tries" ]; then
-            echo "WARNING: host pid $pid lebt nach dem Abraeumen noch (after ~${BAR1_KILL_NACHSCHAU_TIMEOUT_S}s grace period)." >&2
+            echo "WARNING: host pid $pid lebt nach dem Abraeumen noch (after ~${BAR1_KILL_RECHECK_TIMEOUT_S}s grace period)." >&2
             echo "The next attempt will hang at the leftover check." >&2
             return 1
         fi
-        sleep "$BAR1_KILL_NACHSCHAU_POLL_S"
+        sleep "$BAR1_KILL_RECHECK_POLL_S"
     done
     echo "host server $pid abgeraeumt."
     return 0

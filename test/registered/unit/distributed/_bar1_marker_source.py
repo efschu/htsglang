@@ -297,16 +297,16 @@ def render_graph_check_header(devs: list = None, replays: int = 5) -> str:
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "WIEDERGABEN"
+            and node.targets[0].id == "REPLAYS"
             and isinstance(node.value, ast.Constant)
         ):
             replay_count = node.value.value
     assert replay_count is not None, (
-        f"{GRAPH_CHECK_PY}: WIEDERGABEN constant not found"
+        f"{GRAPH_CHECK_PY}: REPLAYS constant not found"
     )
     return _render_fstring(
         tree, MARK_GRAPH_CHECK_HEADER, GRAPH_CHECK_PY,
-        devs=devs, WIEDERGABEN=replay_count,
+        devs=devs, REPLAYS=replay_count,
     )
 
 
@@ -317,11 +317,11 @@ def render_graph_check_summary_heading() -> str:
 
 
 def render_graph_check_case_line(
-    marke: str, gate: bool, name: str, grund: str = ""
+    mark_label: str, gate: bool, name: str, refuse_reason: str = ""
 ) -> str:
     return _render_fstring(
         _tree(GRAPH_CHECK_PY), MARK_GRAPH_CHECK_CASE_LINE, GRAPH_CHECK_PY,
-        marke=marke, gate=gate, name=name, grund=grund,
+        mark_label=mark_label, gate=gate, name=name, refuse_reason=refuse_reason,
     )
 
 
@@ -364,8 +364,8 @@ def render_graph_check_transcript(
     lines.append(render_graph_check_summary_heading())
     lines.append("=" * 62)
     for name, gate, ok in gate_cases:
-        marke = "PASSED" if ok else "FAILED"
-        lines.append(render_graph_check_case_line(marke, gate, name))
+        mark_label = "PASSED" if ok else "FAILED"
+        lines.append(render_graph_check_case_line(mark_label, gate, name))
     lines.append("")
     failed = [name for name, gate, ok in gate_cases if gate and not ok]
     if failed:

@@ -83,7 +83,7 @@ import torch.multiprocessing as mp
 
 # Replays per graph. More than two, because a ring slot with L = 2 only
 # shows a problem from the third round on.
-WIEDERGABEN = 5
+REPLAYS = 5
 
 
 # ===========================================================================
@@ -463,13 +463,13 @@ def _check_graphs(t, sizes, interleaved, rang, welt, dev, log_lines,
     # Replay. Interleaved means: round by round, ALL graphs, so that a
     # slot shared between two captures shows up. Otherwise each graph on
     # its own, so a finding can be attributed to one graph.
-    sequences = ([[(round, g) for g in graphs] for round in range(1, WIEDERGABEN + 1)]
+    sequences = ([[(round, g) for g in graphs] for round in range(1, REPLAYS + 1)]
               if interleaved
-              else [[(round, g) for round in range(1, WIEDERGABEN + 1)]
+              else [[(round, g) for round in range(1, REPLAYS + 1)]
                     for g in graphs])
 
-    for folge in sequences:
-        for round, (n_bytes, n, graph, input, output, src) in folge:
+    for step_sequence in sequences:
+        for round, (n_bytes, n, graph, input, output, src) in step_sequence:
             input.copy_(_pattern(n, rang, round, dev))
             if src is None:
                 want = _expected_tensor(n, welt, round, dev)
@@ -544,14 +544,14 @@ def worker(local_rank: int, devs: list, port: str, fall: dict, store: str) -> No
 
     log_lines: list[str] = []
     result = {"fall": fall["name"], "rang": rang, "ok": False,
-                "grund": "", "protokoll": log_lines}
+                "refuse_reason": "", "protokoll": log_lines}
     t = None
     try:
         t = BarlinkBar1Transport(dist.group.WORLD, dev, _window_bytes())
-        belege = t.byte_proof_all()
-        if not all(belege.values()):
+        evidence_items = t.byte_proof_all()
+        if not all(evidence_items.values()):
             raise RuntimeError(
-                f"transport byte proof failed: {belege}. Without it, "
+                f"transport byte proof failed: {evidence_items}. Without it, "
                 f"handles() says False to everything, and a graph over a "
                 f"path that loses bytes proves nothing."
             )
@@ -582,7 +582,7 @@ def worker(local_rank: int, devs: list, port: str, fall: dict, store: str) -> No
         )
         result["ok"] = True
     except BaseException as e:
-        result["grund"] = f"{type(e).__name__}: {e}"
+        result["refuse_reason"] = f"{type(e).__name__}: {e}"
         sys.stderr.write(
             f"\n===== [r{rang}] CASE {fall['name']!r} FAILED =====\n"
         )
@@ -617,7 +617,7 @@ def main() -> int:
     nur = sys.argv[3].split(",") if len(sys.argv) > 3 else None
 
     print(f"BAR1 graph proof: devices {devs}, {len(devs)} ranks, "
-          f"{WIEDERGABEN} replays per graph.\n")
+          f"{REPLAYS} replays per graph.\n")
 
     stand = []
     for i, fall in enumerate(CASES):
@@ -633,9 +633,9 @@ def main() -> int:
                     args=(devs, str(port + i), fall, store),
                     nprocs=len(devs), join=True,
                 )
-                ok, grund = True, ""
+                ok, refuse_reason = True, ""
             except Exception as e:
-                ok, grund = False, str(e)
+                ok, refuse_reason = False, str(e)
             row_list = []
             for r in range(len(devs)):
                 p = pathlib.Path(store, f"r{r}.json")
@@ -644,7 +644,7 @@ def main() -> int:
                     row_list.append(d)
                     if not d["ok"]:
                         ok = False
-                        grund = grund or d["grund"]
+                        refuse_reason = refuse_reason or d["refuse_reason"]
         for d in row_list:
             for z in d["protokoll"]:
                 print(f"    [r{d['rang']}] {z}")
@@ -655,17 +655,17 @@ def main() -> int:
         # a single commit -- renaming it again without doing the same would
         # silently break them.
         print(f"    => {'PASSED' if ok else 'FAILED'}"
-              + (f": {grund}" if grund else ""))
+              + (f": {refuse_reason}" if refuse_reason else ""))
         print()
-        stand.append((fall["name"], fall.get("gate", True), ok, grund))
+        stand.append((fall["name"], fall.get("gate", True), ok, refuse_reason))
 
     print("=" * 62)
     print("Summary")
     print("=" * 62)
-    for name, gate, ok, grund in stand:
-        marke = "PASSED" if ok else "FAILED"
-        print(f"  {marke}  {'[Gate]' if gate else '[Info]'}  {name}"
-              + (f"  -- {grund[:80]}" if grund else ""))
+    for name, gate, ok, refuse_reason in stand:
+        mark_label = "PASSED" if ok else "FAILED"
+        print(f"  {mark_label}  {'[Gate]' if gate else '[Info]'}  {name}"
+              + (f"  -- {refuse_reason[:80]}" if refuse_reason else ""))
 
     gates = [(n, ok) for n, gate, ok, _ in stand if gate]
     absent = [n for n, ok in gates if not ok]

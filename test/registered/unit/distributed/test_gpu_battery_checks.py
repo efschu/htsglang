@@ -223,7 +223,7 @@ class TestResumeAndSelection:
             "s09_sensor_smoke",
             "s10_bar1_driver",
             "s11_bar1_e2e",
-            "s12_prefill_kurve",
+            "s12_prefill_curve",
         ]
         assert select_ids(to_id="s01") == ["s00_preflight", "s01_p2p_reprobe"]
         assert "s03_boot_b" not in select_ids(skip="s03,s04")

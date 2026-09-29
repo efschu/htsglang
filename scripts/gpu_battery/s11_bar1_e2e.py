@@ -156,7 +156,7 @@ RE_CAPTURE_BOLT = re.compile(
     r"CUDA graph capture"
 )
 RE_GATE_CASE = re.compile(
-    r"^\s*(?P<marke>PASSED|FAILED)\s*\[(?P<art>Gate|Info)\]\s*(?P<name>\S+)"
+    r"^\s*(?P<mark_label>PASSED|FAILED)\s*\[(?P<art>Gate|Info)\]\s*(?P<name>\S+)"
 )
 
 FATAL_MARKERS = (
@@ -199,7 +199,7 @@ def parse_graph_check(step_dir: str) -> dict:
                 {
                     "name": m.group("name"),
                     "gate": m.group("art") == "Gate",
-                    "ok": m.group("marke") == "PASSED",
+                    "ok": m.group("mark_label") == "PASSED",
                 }
             )
     gates = [c for c in cases if c["gate"]]

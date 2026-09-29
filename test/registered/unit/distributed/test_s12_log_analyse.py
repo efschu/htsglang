@@ -49,7 +49,7 @@ from s12_log_analyse import (  # noqa: E402
     parse_decode,
     parse_prefill_rang,
     point_window,
-    runden,
+    round_list,
     tables,
     wait_aggregate,
 )
@@ -109,7 +109,7 @@ def _sources() -> list:
 @pytest.fixture(scope="module")
 def payload():
     return evaluate(
-        _sources(), load_points(_fixture("punkte.jsonl")), hidden=5120, welt=3
+        _sources(), load_points(_fixture("data_points.jsonl")), hidden=5120, welt=3
     )
 
 
@@ -166,13 +166,13 @@ class TestArithmetic:
 
     def test_a_2048_chunk_needs_exactly_one_round(self):
         """6,67 MiB shard against a 7,996 MiB slot -- one round, with room."""
-        assert runden(collective_bytes(2048, 5120), 8188 * 1024, 3) == 1
+        assert round_list(collective_bytes(2048, 5120), 8188 * 1024, 3) == 1
 
     def test_the_tipping_point_is_2457_tokens(self):
         """At welt*slot the payload stops fitting -- and BAR1 stops carrying it
         at all, because handles() says False above max_nutzlast."""
-        assert runden(collective_bytes(2456, 5120), 8188 * 1024, 3) == 1
-        assert runden(collective_bytes(2457, 5120), 8188 * 1024, 3) == 2
+        assert round_list(collective_bytes(2456, 5120), 8188 * 1024, 3) == 1
+        assert round_list(collective_bytes(2457, 5120), 8188 * 1024, 3) == 2
 
     def test_the_wait_share_is_built_from_sums_not_from_median_ratios(self):
         """A median of per-batch ratios does not add up to a point. Here the
@@ -312,7 +312,7 @@ class TestFinding:
         assert {g["chunks_max"] for g in payload["groessen"]} == {1}
 
     def test_no_collective_ever_needed_a_second_round(self, payload):
-        assert {g["runden"] for g in payload["groessen"]} == {1}
+        assert {g["round_list"] for g in payload["groessen"]} == {1}
         assert all(g["traegt_bar1"] for g in payload["groessen"])
         assert payload["kipp_token"] == 2456
 
@@ -338,7 +338,7 @@ class TestReport:
         argv = [sys.executable, os.path.join(BATTERY, "s12_log_analyse.py")]
         for arm, sessions, file_path in _sources():
             argv += ["--log", f"{arm}:{sessions}:{file_path}"]
-        argv += ["--punkte", _fixture("punkte.jsonl"), "--json", str(target)]
+        argv += ["--data_points", _fixture("data_points.jsonl"), "--json", str(target)]
         p = subprocess.run(argv, capture_output=True, text=True, timeout=120)
         assert p.returncode == 0, p.stderr
         assert "compute/wait je Rang" in p.stdout
@@ -367,19 +367,19 @@ class TestHarnessGap:
     def test_the_run_recorded_no_accept_at_all(self):
         """The gap this fix closes, asserted against the run's own artefacts so
         it cannot be argued away later."""
-        punkte = load_points(_fixture("punkte.jsonl"))
-        assert punkte
-        for p in punkte.values():
+        data_points = load_points(_fixture("data_points.jsonl"))
+        assert data_points
+        for p in data_points.values():
             for d in p["decode"]:
                 assert d["spec_accept_length"] is None
 
     def test_the_measuring_side_harvests_the_ticks_of_its_own_window(self):
-        """s12_prefill_kurve calls this right after a decode point, with the
+        """s12_prefill_curve calls this right after a decode point, with the
         wall clock it just ran in. Same local clock on both sides, so the
         window is comparable without a timezone argument."""
         import datetime
 
-        from s12_prefill_kurve import harvest_ticks
+        from s12_prefill_curve import harvest_ticks
 
         def stempel(s):
             return datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp()
@@ -397,14 +397,14 @@ class TestHarnessGap:
         assert "ms_pro_token" not in agg
 
     def test_a_missing_server_log_says_so_instead_of_inventing_a_number(self):
-        from s12_prefill_kurve import harvest_ticks
+        from s12_prefill_curve import harvest_ticks
 
         agg = harvest_ticks("", 0.0, 1.0, 1)
         assert agg["tick_fehler"] == "kein Serverlog"
         assert "tick_accept_len_median" not in agg
 
     def test_the_table_names_both_levels(self, tmp_path):
-        from s12_prefill_kurve import table
+        from s12_prefill_curve import table
 
         payload = {
             "kurven": {"bar1": {"1": 1469.0}, "grundlinie": {}},
@@ -426,7 +426,7 @@ class TestHarnessGap:
         assert "| bar1 | 1 | 93.7 | 10.68 | 2.83 | 1 | 33.2 |" in text
 
     def test_the_table_survives_a_point_without_a_server_log(self):
-        from s12_prefill_kurve import table
+        from s12_prefill_curve import table
 
         payload = {
             "kurven": {"bar1": {"1": 1469.0}, "grundlinie": {}},
@@ -436,10 +436,10 @@ class TestHarnessGap:
         assert "| bar1 | 1 | None | None | None | None | 33.2 |" in table(payload)
 
     def test_the_recorded_request_rate_is_half_the_tick_rate(self, payload):
-        punkte = load_points(_fixture("punkte.jsonl"))
+        data_points = load_points(_fixture("data_points.jsonl"))
         request = {
             (arm, sessions, d["batch"]): d["decode_tok_s"]
-            for (arm, sessions), p in punkte.items()
+            for (arm, sessions), p in data_points.items()
             for d in p["decode"]
         }
         tick = {

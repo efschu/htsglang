@@ -49,12 +49,12 @@ _BOOT_CHATTER = "gestartet, pid 1962637"
 _DRIVER = r"""
 set -uo pipefail
 
-: "${STUB_PIDFILE_INHALT=1962637}"     # OHNE Doppelpunkt: eine ausdruecklich
+: "${STUB_PIDFILE_CONTENT=1962637}"     # OHNE Doppelpunkt: eine ausdruecklich
 : "${STUB_KILL0_RC:=1}"                 # LEERE Vorgabe soll leer bleiben --
-: "${STUB_ALTLAST=}"                    # ":=" haette sie ueberschrieben.
-: "${STUB_ALTLAST_REAL:=}"              # gesetzt: die PORT/PROC/VRAM-Zeile
+: "${STUB_LEGACY=}"                    # ":=" haette sie ueberschrieben.
+: "${STUB_LEGACY_REAL:=}"              # gesetzt: die PORT/PROC/VRAM-Zeile
                                          # wirklich lokal ausfuehren statt die
-                                         # STUB_ALTLAST-Buchstaben zurueckzugeben.
+                                         # STUB_LEGACY-Buchstaben zurueckzugeben.
 : "${STUB_KILL0_SEQ:=}"                  # z.B. "0,0,1": erst zweimal "lebt
                                          # noch", dann tot -- stellt den
                                          # verzoegerten Tod nach.
@@ -74,18 +74,18 @@ host_ssh_for() {
         *"kill -0"*)
             if [ -n "$STUB_KILL0_SEQ" ]; then
                 local IFS=,
-                local -a folge=($STUB_KILL0_SEQ)
+                local -a step_sequence=($STUB_KILL0_SEQ)
                 unset IFS
-                local letzter=$((${#folge[@]} - 1))
+                local letzter=$((${#step_sequence[@]} - 1))
                 local idx=$_STUB_KILL0_IDX
                 [ "$idx" -gt "$letzter" ] && idx=$letzter
                 _STUB_KILL0_IDX=$((_STUB_KILL0_IDX + 1))
-                return "${folge[$idx]}"
+                return "${step_sequence[$idx]}"
             fi
             return "$STUB_KILL0_RC" ;;
-        cat*)         printf '%s\n' "$STUB_PIDFILE_INHALT"; return 0 ;;
+        cat*)         printf '%s\n' "$STUB_PIDFILE_CONTENT"; return 0 ;;
         *PORT=*)
-            if [ -n "$STUB_ALTLAST_REAL" ]; then
+            if [ -n "$STUB_LEGACY_REAL" ]; then
                 # Kein ssh, kein Host, keine Karte -- aber die echte
                 # Kommandozeile laeuft, gegen die echte lokale Prozessliste.
                 # Das ist die einzige Art, den Selbsttreffer ueberhaupt zu
@@ -94,7 +94,7 @@ host_ssh_for() {
                 bash -c "$cmd"
                 return 0
             fi
-            printf '%s\n' "$STUB_ALTLAST"; return 0 ;;
+            printf '%s\n' "$STUB_LEGACY"; return 0 ;;
         *)            return 0 ;;
     esac
 }
@@ -172,11 +172,11 @@ class TestPidOnStdoutOnly(CustomTestCase):
     def test_a_pidfile_with_noise_still_yields_a_bare_pid(self):
         """The file is filtered too -- belt and braces, the file is the
         second source the cleanup path falls back to."""
-        done, _ = _run("boot_start", STUB_PIDFILE_INHALT="pid: 4242\n")
+        done, _ = _run("boot_start", STUB_PIDFILE_CONTENT="pid: 4242\n")
         self.assertIn("PID[4242]", done.stdout, msg=done.stdout)
 
     def test_an_empty_pidfile_is_a_failure_not_an_empty_pid(self):
-        done, _ = _run("boot_start", STUB_PIDFILE_INHALT="")
+        done, _ = _run("boot_start", STUB_PIDFILE_CONTENT="")
         self.assertIn("PID[<rc!=0>]", done.stdout, msg=done.stdout)
         self.assertIn("kein brauchbarer Host-pid", done.stderr)
 
@@ -219,16 +219,16 @@ class TestCleanupReallyKills(CustomTestCase):
         all. Now the pidfile the boot script wrote is the second source --
         which also covers a step that died between boot and assignment.
         """
-        _, log_lines = _run("kill_server", _BOOT_CHATTER, STUB_PIDFILE_INHALT="777")
+        _, log_lines = _run("kill_server", _BOOT_CHATTER, STUB_PIDFILE_CONTENT="777")
         self.assertIn("DUMP_AND_KILL[777]", log_lines)
 
     def test_an_empty_variable_falls_back_too(self):
-        _, log_lines = _run("kill_server", "", STUB_PIDFILE_INHALT="888")
+        _, log_lines = _run("kill_server", "", STUB_PIDFILE_CONTENT="888")
         self.assertIn("DUMP_AND_KILL[888]", log_lines)
 
     def test_nothing_anywhere_kills_nothing(self):
         """Negative control: no pid must not become a kill of something else."""
-        _, log_lines = _run("kill_server", "", STUB_PIDFILE_INHALT="")
+        _, log_lines = _run("kill_server", "", STUB_PIDFILE_CONTENT="")
         self.assertEqual(log_lines.strip(), "")
 
     def test_a_survivor_is_reported_loudly(self):
@@ -240,7 +240,7 @@ class TestCleanupReallyKills(CustomTestCase):
         """
         done, log_lines = _run(
             "kill_server", "4242", STUB_KILL0_RC=0,
-            BAR1_KILL_NACHSCHAU_TIMEOUT_S=1, BAR1_KILL_NACHSCHAU_POLL_S=1,
+            BAR1_KILL_RECHECK_TIMEOUT_S=1, BAR1_KILL_RECHECK_POLL_S=1,
         )
         self.assertIn("DUMP_AND_KILL[4242]", log_lines)
         self.assertIn("lebt nach dem Abraeumen noch", done.stderr)
@@ -267,7 +267,7 @@ class TestBoundedKillRecheck(CustomTestCase):
         "abgeraeumt", not a survivor report."""
         done, log_lines = _run(
             "kill_server", "4242", STUB_KILL0_SEQ="0,0,1",
-            BAR1_KILL_NACHSCHAU_TIMEOUT_S=5, BAR1_KILL_NACHSCHAU_POLL_S=1,
+            BAR1_KILL_RECHECK_TIMEOUT_S=5, BAR1_KILL_RECHECK_POLL_S=1,
         )
         self.assertIn("DUMP_AND_KILL[4242]", log_lines)
         self.assertIn("abgeraeumt", done.stdout, msg=done.stdout + done.stderr)
@@ -283,7 +283,7 @@ class TestBoundedKillRecheck(CustomTestCase):
         "Altlast"."""
         done, log_lines = _run(
             "kill_server", "4242", STUB_KILL0_SEQ="0,0,0,0,0",
-            BAR1_KILL_NACHSCHAU_TIMEOUT_S=2, BAR1_KILL_NACHSCHAU_POLL_S=1,
+            BAR1_KILL_RECHECK_TIMEOUT_S=2, BAR1_KILL_RECHECK_POLL_S=1,
         )
         self.assertIn("DUMP_AND_KILL[4242]", log_lines)
         self.assertIn("lebt nach dem Abraeumen noch", done.stderr)
@@ -303,16 +303,16 @@ class TestLeftoverDetection(CustomTestCase):
     CLEAN = "PORT=0\nPROC=0\nVRAM=12, 8, 10,\n"
 
     def test_a_clean_host_passes(self):
-        done, _ = _run("altlast", STUB_ALTLAST=self.CLEAN)
+        done, _ = _run("altlast", STUB_LEGACY=self.CLEAN)
         self.assertIn("FREI", done.stdout, msg=done.stdout + done.stderr)
 
     def test_a_busy_port_aborts(self):
-        done, _ = _run("altlast", STUB_ALTLAST="PORT=1\nPROC=0\nVRAM=12, 8, 10,\n")
+        done, _ = _run("altlast", STUB_LEGACY="PORT=1\nPROC=0\nVRAM=12, 8, 10,\n")
         self.assertIn("ALTLAST", done.stdout)
         self.assertIn("Port-30030-belegt", done.stderr)
 
     def test_a_live_launch_server_aborts(self):
-        done, _ = _run("altlast", STUB_ALTLAST="PORT=0\nPROC=4\nVRAM=12, 8, 10,\n")
+        done, _ = _run("altlast", STUB_LEGACY="PORT=0\nPROC=4\nVRAM=12, 8, 10,\n")
         self.assertIn("ALTLAST", done.stdout)
         self.assertIn("launch_server-Prozesse=4", done.stderr)
 
@@ -320,7 +320,7 @@ class TestLeftoverDetection(CustomTestCase):
         """The one that actually fired: the holder returned ENOMEM because
         the cards were still full, and the gate read as a bar1 fault."""
         done, _ = _run(
-            "altlast", STUB_ALTLAST="PORT=0\nPROC=0\nVRAM=12, 19850, 10,\n"
+            "altlast", STUB_LEGACY="PORT=0\nPROC=0\nVRAM=12, 19850, 10,\n"
         )
         self.assertIn("ALTLAST", done.stdout)
         self.assertIn("GPU1=19850MiB", done.stderr)
@@ -328,8 +328,8 @@ class TestLeftoverDetection(CustomTestCase):
     def test_the_threshold_is_adjustable_and_respected(self):
         done, _ = _run(
             "altlast",
-            STUB_ALTLAST="PORT=0\nPROC=0\nVRAM=12, 2500, 10,\n",
-            BAR1_ALTLAST_MIB=4000,
+            STUB_LEGACY="PORT=0\nPROC=0\nVRAM=12, 2500, 10,\n",
+            BAR1_LEGACY_MIB=4000,
         )
         self.assertIn("FREI", done.stdout, msg=done.stdout + done.stderr)
 
@@ -338,7 +338,7 @@ class TestLeftoverDetection(CustomTestCase):
         ours, and a broad pkill is exactly the blast radius the rig rules
         rule out."""
         _, log_lines = _run(
-            "altlast", STUB_ALTLAST="PORT=1\nPROC=9\nVRAM=20000, 20000, 20000,\n"
+            "altlast", STUB_LEGACY="PORT=1\nPROC=9\nVRAM=20000, 20000, 20000,\n"
         )
         self.assertEqual(log_lines.strip(), "")
 
@@ -361,7 +361,7 @@ class TestStaleReportDoesNotSurviveACleanPass(CustomTestCase):
         try:
             done, _ = _run(
                 "altlast",
-                STUB_ALTLAST="PORT=0\nPROC=0\nVRAM=12, 8, 10,\n",
+                STUB_LEGACY="PORT=0\nPROC=0\nVRAM=12, 8, 10,\n",
             )
             self.assertIn("FREI", done.stdout, msg=done.stdout + done.stderr)
             self.assertFalse(
@@ -380,7 +380,7 @@ class TestStaleReportDoesNotSurviveACleanPass(CustomTestCase):
         try:
             done, _ = _run(
                 "altlast",
-                STUB_ALTLAST="PORT=0\nPROC=4\nVRAM=12, 8, 10,\n",
+                STUB_LEGACY="PORT=0\nPROC=4\nVRAM=12, 8, 10,\n",
             )
             self.assertIn("ALTLAST", done.stdout)
             content = report.read_text()
@@ -402,12 +402,12 @@ class TestPgrepSelfMatchTrap(CustomTestCase):
     Prozesse=4" with zero real servers running.
 
     These tests run the real ``pgrep`` line for real, with
-    ``STUB_ALTLAST_REAL`` swapping the ssh hop for a plain local
+    ``STUB_LEGACY_REAL`` swapping the ssh hop for a plain local
     ``bash -c`` -- no ssh, no host, no card, same as the rest of this file.
     """
 
     def _run_real(self, **env):
-        return _run("altlast", STUB_ALTLAST_REAL="1", **env)
+        return _run("altlast", STUB_LEGACY_REAL="1", **env)
 
     @staticmethod
     def _real_launch_servers() -> int:
@@ -493,11 +493,11 @@ class TestBothStepsUseIt(CustomTestCase):
         return (_REPO / "scripts" / "gpu_battery" / name).read_text(encoding="utf-8")
 
     def test_both_steps_check_for_leftovers_before_booting(self):
-        for step in ("s11_bar1_e2e.sh", "s12_prefill_kurve.sh"):
+        for step in ("s11_bar1_e2e.sh", "s12_prefill_curve.sh"):
             self.assertIn("bar1_altlast_pruefen", self._text(step), msg=step)
 
     def test_both_steps_clean_up_through_the_checked_path(self):
-        for step in ("s11_bar1_e2e.sh", "s12_prefill_kurve.sh"):
+        for step in ("s11_bar1_e2e.sh", "s12_prefill_curve.sh"):
             text = self._text(step)
             self.assertIn("bar1_kill_host_server", text, msg=step)
             self.assertIn("trap cleanup EXIT INT TERM", text, msg=step)
@@ -507,7 +507,7 @@ class TestBothStepsUseIt(CustomTestCase):
         through `bar1_kill_host_server`, which validates the pid, falls back
         to the pidfile and looks afterwards. A direct call would skip all
         three."""
-        for step in ("s11_bar1_e2e.sh", "s12_prefill_kurve.sh"):
+        for step in ("s11_bar1_e2e.sh", "s12_prefill_curve.sh"):
             row_list = [
                 z for z in self._text(step).splitlines()
                 if "host_dump_and_kill" in z and not z.lstrip().startswith("#")

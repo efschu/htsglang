@@ -89,7 +89,7 @@ def check(step_dir: str) -> None:
         )
     # "blockiert" stays: an out-of-scope unit test matches the verdict on it.
     if payload.get("blocked"):
-        raise CheckStop(f"Schritt blockiert: {payload['blocked']}")
+        raise CheckStop(f"Schritt is_blocked: {payload['blocked']}")
 
     gate = payload.get("graph_check") or {}
     if not gate.get("gate_cases"):

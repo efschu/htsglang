@@ -6,7 +6,7 @@ PLACEMENT NOTE. The natural home of this file is next to
 owns the s12 parser fixtures. That directory belongs to another change in
 flight, so the file lands here and should be moved when the two merge.
 
-(2a) THE CLOCK RAMP (#475 SS6). ``s12_prefill_kurve.py`` measured one draw per
+(2a) THE CLOCK RAMP (#475 SS6). ``s12_prefill_curve.py`` measured one draw per
 invocation, so a floor round was three separate invocations with the harness's
 own orchestration between them: #435 sub-arm B2 drew 1597.7 / 1720.2 / 1820.2
 tok/s 48-51 s apart, with ~12 s of work each, and reported that 13.0 % as an
@@ -54,7 +54,7 @@ from s12_log_analyse import (  # noqa: E402  one parser, one place
     decode_tick_aggregate,
     parse_decode,
 )
-from s12_prefill_kurve import (  # noqa: E402
+from s12_prefill_curve import (  # noqa: E402
     BACK_TO_BACK_MAX_GAP_S,
     WARMUP_DRAW_INDEX,
     draw_label,
@@ -210,7 +210,7 @@ class _Clock:
 
 def _series(draws, *, warmup=True, work_s=12.0, gap_s=0.0, rates=None, clock=None):
     """Run ``run_draw_series`` against a fake server on a fake clock."""
-    import s12_prefill_kurve as s12
+    import s12_prefill_curve as s12
 
     clock = clock or _Clock()
     seen: list = []
@@ -363,7 +363,7 @@ class TestTheEmittedArtifactCarriesIt:
     def test_a_floor_series_writes_one_point_per_draw_with_the_evidence(
         self, tmp_path, monkeypatch
     ):
-        import s12_prefill_kurve as s12
+        import s12_prefill_curve as s12
 
         clock = _Clock()
         rates = iter([800.0, 1000.0, 1010.0, 1005.0])
@@ -386,7 +386,7 @@ class TestTheEmittedArtifactCarriesIt:
             port = 1
             arm = "int8_match_B2"
             sessions = 8
-            folge = 3
+            step_sequence = 3
             point_seconds = 12.0
             warmup_seconds = 6.0
             prompt_tokens = 2048
@@ -399,7 +399,7 @@ class TestTheEmittedArtifactCarriesIt:
 
         lines = [
             json.loads(x)
-            for x in open(os.path.join(str(tmp_path), "punkte.jsonl"))
+            for x in open(os.path.join(str(tmp_path), "data_points.jsonl"))
             if x.strip()
         ]
         assert [p["arm"] for p in lines] == [
@@ -437,7 +437,7 @@ class TestTheEmittedArtifactCarriesIt:
     ):
         """Backward compatibility: one draw, plain arm name, same shape as
         before -- plus the warm-up record that was missing."""
-        import s12_prefill_kurve as s12
+        import s12_prefill_curve as s12
 
         clock = _Clock()
         rates = iter([800.0, 1190.7])
@@ -455,7 +455,7 @@ class TestTheEmittedArtifactCarriesIt:
             port = 1
             arm = "bar1"
             sessions = 1
-            folge = 1
+            step_sequence = 1
             point_seconds = 15.0
             warmup_seconds = 8.0
             prompt_tokens = 2048
@@ -467,7 +467,7 @@ class TestTheEmittedArtifactCarriesIt:
         assert s12.mode_measure(Args()) == 0
         (point,) = [
             json.loads(x)
-            for x in open(os.path.join(str(tmp_path), "punkte.jsonl"))
+            for x in open(os.path.join(str(tmp_path), "data_points.jsonl"))
             if x.strip()
         ]
         assert point["arm"] == "bar1"

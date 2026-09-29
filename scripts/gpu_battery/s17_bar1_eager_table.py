@@ -43,7 +43,7 @@ def _read_jsonl(path: str) -> list:
 
 
 def load(out_dir: str) -> Dict[Tuple[str, str, str], Optional[float]]:
-    pre = _read_jsonl(os.path.join(out_dir, "punkte.jsonl"))
+    pre = _read_jsonl(os.path.join(out_dir, "data_points.jsonl"))
     dec = _read_jsonl(os.path.join(out_dir, "decode_punkte.jsonl"))
     out: Dict[Tuple[str, str, str], Optional[float]] = {}
     for fmt in ("fp8", "int8"):

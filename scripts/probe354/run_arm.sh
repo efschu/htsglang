@@ -79,9 +79,9 @@ grep -E "auto-performance|MLP vector PINNED|CHOSEN|derived memory budgets|materi
 SEQ=0
 for N in $SESSIONS; do
     SEQ=$((SEQ + 1))
-    "$PY" "$WT/scripts/gpu_battery/s12_prefill_kurve.py" --mode messen \
+    "$PY" "$WT/scripts/gpu_battery/s12_prefill_curve.py" --mode messen \
         --port "$PORT" --out-dir "$OUT" --arm "$ARM" --sessions "$N" \
-        --folge "$SEQ" --point-seconds "$POINT_S" --warmup-seconds 6 \
+        --step_sequence "$SEQ" --point-seconds "$POINT_S" --warmup-seconds 6 \
         --prompt-tokens 2048 --with-decode 0 --server-log "$LOG" \
         >> "$OUT/messen_$ARM.log" 2>&1
     echo "  prefill s=$N rc=$?"
@@ -91,7 +91,7 @@ for B in $BATCHES; do
     SEQ=$((SEQ + 1))
     "$PY" "$WT/scripts/gpu_battery/s14_decode_punkt.py" \
         --port "$PORT" --out-dir "$OUT" --arm "$ARM" --bs "$B" \
-        --folge "$SEQ" --context-tokens 2048 --model-context-tokens 32768 \
+        --step_sequence "$SEQ" --context-tokens 2048 --model-context-tokens 32768 \
         --ramp-seconds 6 --window-seconds "$POINT_S" --server-log "$LOG" \
         >> "$OUT/messen_$ARM.log" 2>&1
     echo "  decode bs=$B rc=$?"

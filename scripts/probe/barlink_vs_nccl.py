@@ -13,7 +13,7 @@ WARUM KOLLEKTIVE UND KEIN send/recv
 ===================================
 barlink implementiert ausschliesslich Kollektive (all_reduce, broadcast,
 all_gather, reduce_scatter) und KEIN send/recv. Ein Vergleich mit dem
-Punkt-zu-Punkt-Ping-Pong waere deshalb schief. Gemessen wird daher
+Punkt-zu-Punkt-Ping-Pong waere deshalb skewed. Gemessen wird daher
 all_reduce gegen all_reduce und broadcast gegen broadcast.
 
     Alle Zeiten sind die VOLLE Operationsdauer.

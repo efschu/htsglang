@@ -2,7 +2,7 @@
 
 H86 (b191dc8bb0) setzt watchdog_last_time zurueck, solange is_active() falsch ist. Arm #821
 (invariant_checker.pp_receive_is_overdue) schaltet is_active aber erst ein, wenn ein PP-Empfang schon laenger als
-der Timeout T blockiert. Die Blockade begann also T VOR dem Einschalten, der Wachhund zaehlte sie erst ab dem
+der Timeout T is_blocked. Die Blockade begann also T VOR dem Einschalten, der Wachhund zaehlte sie erst ab dem
 Einschalten: Ausloesen nach 2T-2,5T (bei T=300: 600-750 s) statt nach T-1,5T.
 
 Fix: WatchdogRaw nimmt einen optionalen ``stall_age``-Callback (Sekunden, die der Arm schon haengt, als DAUER) und

@@ -482,7 +482,7 @@ def health(d: str):
     tot führt: lifecycle `dead`, eine Stop-Anfrage des Wächters (stop_request.json), oder eine
     Gruppe mit groups.<G>.state == "dead". Kein Zustand oder fremdes Schema = HEALTH_NO_STATE
     (der Aufrufer entscheidet dann selbst, nie "gesund" aus Stille).
-    Rückgabe: (code, grund)."""
+    Rückgabe: (code, refuse_reason)."""
     try:
         st = read(d)
     except (StateFileError, ValueError, OSError) as e:

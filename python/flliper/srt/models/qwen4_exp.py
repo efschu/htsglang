@@ -2638,10 +2638,10 @@ def _expert_layer_for_name(name: str, model):
     Praefix VOR ``.experts.``, damit die Namensform an genau einer Stelle
     steht und nicht als zweite Regel neben dem Loader lebt.
     """
-    marke = ".experts."
-    if marke not in name:
+    mark_label = ".experts."
+    if mark_label not in name:
         return None
-    name_prefix = name.split(marke, 1)[0] + ".experts"
+    name_prefix = name.split(mark_label, 1)[0] + ".experts"
     for candidate in (
         name_prefix.replace("model.language_model.", "model."),
         name_prefix,

@@ -75,11 +75,11 @@ if [[ "$READY" == "1" ]]; then
     --out "$OUT/coherence_${TAG}.jsonl" >> "$PROG" 2>&1
 
   say "PREFILL"
-  "$PY" "$WT/scripts/gpu_battery/s12_prefill_kurve.py" \
+  "$PY" "$WT/scripts/gpu_battery/s12_prefill_curve.py" \
     --mode messen --port "$PORT" --out-dir "$OUT" \
     --point-seconds 12 --warmup-seconds 6 \
     --prompt-tokens 2048 --with-decode 0 \
-    --arm "$TAG" --sessions 1 --folge 1 --server-log "$LOG" >> "$PROG" 2>&1
+    --arm "$TAG" --sessions 1 --step_sequence 1 --server-log "$LOG" >> "$PROG" 2>&1
 
   for BS in ${BS_LIST//,/ }; do
     say "DECODE bs=${BS}"
@@ -87,7 +87,7 @@ if [[ "$READY" == "1" ]]; then
       --port "$PORT" --out-dir "$OUT" --arm "$TAG" --bs "$BS" \
       --context-tokens 2048 --model-context-tokens 32768 \
       --ramp-seconds 6 --window-seconds 12 --drain-seconds 4 \
-      --folge 1 --server-log "$LOG" >> "$PROG" 2>&1
+      --step_sequence 1 --server-log "$LOG" >> "$PROG" 2>&1
   done
   curl -s -m 30 "http://127.0.0.1:${PORT}/metrics" \
     > "$OUT/proofs/${TAG}.metrics.txt" 2>/dev/null

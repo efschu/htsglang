@@ -40,12 +40,12 @@ PROMPT_TOKENS="${S12_PROMPT_TOKENS:-2048}"
 # <arm>_floorPn and whose gaps land in the artifact.
 FLOOR_DRAWS="${S12_FLOOR_DRAWS:-1}"
 
-mkdir -p "$DIR/belege" "$DIR/logs"
+mkdir -p "$DIR/evidence_items" "$DIR/logs"
 DIR_HOST="$(host_path "$DIR")" || exit 2
-DRIVER_HOST="$(host_path "$BATTERY_DIR/s12_prefill_kurve.py")" || exit 2
+DRIVER_HOST="$(host_path "$BATTERY_DIR/s12_prefill_curve.py")" || exit 2
 
 summarize() {
-    "$PY" "$BATTERY_DIR/s12_prefill_kurve.py" --mode zusammenfassen --step-dir "$DIR"
+    "$PY" "$BATTERY_DIR/s12_prefill_curve.py" --mode zusammenfassen --step-dir "$DIR"
 }
 
 if ! host_reachable; then
@@ -96,7 +96,7 @@ set -uo pipefail
   --mode messen --port $PORT --out-dir $DIR_HOST \\
   --point-seconds $POINT_S --warmup-seconds $WARMUP_S \\
   --prompt-tokens $PROMPT_TOKENS --floor-draws $FLOOR_DRAWS \\
-  --arm "\$1" --sessions "\$2" --folge "\$3" --server-log "\$4"
+  --arm "\$1" --sessions "\$2" --step_sequence "\$3" --server-log "\$4"
 EOF
 chmod +x "$DIR/remote_messen.sh"
 
@@ -134,7 +134,7 @@ for N in $SESSIONS; do
 
         # The arm's own evidence, BEFORE the numbers: which transport each
         # communicator group really got.
-        host_grep_into "$HOSTLOG" "$DIR/belege/${SEQ}_${ARM}_${N}.txt" \
+        host_grep_into "$HOSTLOG" "$DIR/evidence_items/${SEQ}_${ARM}_${N}.txt" \
             "barlink enabled for group" \
             "ACHIEVED=" \
             "barlink-BAR1: setup in" \
@@ -182,7 +182,7 @@ trap - EXIT INT TERM
 
 summarize
 if [ -n "$ABORT" ]; then
-    echo "aborted: $ABORT" | tee "$DIR/abbruch.txt"
+    echo "aborted: $ABORT" | tee "$DIR/abort_reason.txt"
     exit 1
 fi
 exit 0

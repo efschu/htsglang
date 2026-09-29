@@ -105,7 +105,7 @@ S15_ARM_COST_S="${S15_ARM_COST_S:-300}"
 
 mkdir -p "$DIR/proofs" "$DIR/logs" "$DIR/wait" "$DIR/power"
 DIR_HOST="$(host_path "$DIR")" || exit 2
-DRIVER_HOST="$(host_path "$BATTERY_DIR/s12_prefill_kurve.py")" || exit 2
+DRIVER_HOST="$(host_path "$BATTERY_DIR/s12_prefill_curve.py")" || exit 2
 ANALYSE_HOST="$(host_path "$BATTERY_DIR/s12_log_analyse.py")" || exit 2
 
 if ! host_reachable; then
@@ -187,7 +187,7 @@ set -uo pipefail
   --point-seconds $POINT_S --warmup-seconds $WARMUP_S \\
   --prompt-tokens $PROMPT_TOKENS --decode-batches $DECODE_BATCHES \\
   --floor-draws $FLOOR_DRAWS \\
-  --arm "\$1" --sessions "\$2" --folge "\$3" --server-log "\$4" \\
+  --arm "\$1" --sessions "\$2" --step_sequence "\$3" --server-log "\$4" \\
   --with-decode "\$5"
 EOF
 chmod +x "$DIR/remote_measure.sh"
@@ -287,7 +287,7 @@ for ROW in "${ARM_TABLE[@]}"; do
         "Traceback (most recent call last)"
 
     host_ssh_for 300 "/spinning/miniforge3_local_install/bin/python3.12 \
-        $ANALYSE_HOST --log '$ARM:8:$HOSTLOG' --punkte $DIR_HOST/punkte.jsonl \
+        $ANALYSE_HOST --log '$ARM:8:$HOSTLOG' --data_points $DIR_HOST/data_points.jsonl \
         --json $DIR_HOST/wait/${ARM}.json" > "$DIR/wait/${ARM}.txt" 2>&1 || true
 
     host_tail_into "$HOSTLOG" "$DIR/logs/${ARM}.tail.txt" 120

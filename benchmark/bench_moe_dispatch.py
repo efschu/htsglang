@@ -62,7 +62,7 @@ AUFRUF
     FLLIPER_BARLINK=1 FLLIPER_BARLINK_TRANSPORT=bar1 \\
     torchrun --nproc_per_node=3 benchmark/bench_moe_dispatch.py \\
         --hidden 4096 --experts 24 --topk 8 \\
-        --tokens 128,512,2048 --verteilung gleich,schief
+        --tokens 128,512,2048 --distribution gleich,skewed
 
 ``FLLIPER_BARLINK`` und ``FLLIPER_BARLINK_TRANSPORT`` muessen **vor** dem Aufbau
 der Prozessgruppe stehen -- der ``GroupCoordinator`` liest sie dort. Das
@@ -237,7 +237,7 @@ def build_variants(args, proc_group, welt: int) -> Tuple[Dict[str, object], List
     )
 
     # -- bar1ep
-    if "bar1ep" in args.varianten:
+    if "bar1ep" in args.variants:
         try:
             from flliper.srt.layers.moe.token_dispatcher.bar1ep import (
                 Bar1EPDispatcher,
@@ -245,9 +245,9 @@ def build_variants(args, proc_group, welt: int) -> Tuple[Dict[str, object], List
             )
             from flliper.srt.layers.moe.utils import DeepEPMode
 
-            ok, grund = bar1ep_available(proc_group)
+            ok, refuse_reason = bar1ep_available(proc_group)
             if not ok:
-                tot.append(f"bar1ep: {grund}")
+                tot.append(f"bar1ep: {refuse_reason}")
             else:
                 alive["bar1ep"] = Bar1EPDispatcher(
                     group=proc_group.device_group,
@@ -258,14 +258,14 @@ def build_variants(args, proc_group, welt: int) -> Tuple[Dict[str, object], List
             tot.append(f"bar1ep: {type(e).__name__}: {e}")
 
     # -- torch
-    if "torch" in args.varianten:
+    if "torch" in args.variants:
         try:
             alive["torch"] = _torch_reference_class()(proc_group, **kw)
         except Exception as e:  # noqa: BLE001
             tot.append(f"torch: {type(e).__name__}: {e}")
 
     # -- deepep. Erst nachsehen, ob es die Bibliothek ueberhaupt gibt.
-    if "deepep" in args.varianten:
+    if "deepep" in args.variants:
         if importlib.util.find_spec("deep_ep") is None:
             tot.append(
                 "deepep: die Bibliothek `deep_ep` ist in dieser Umgebung nicht "
@@ -309,22 +309,22 @@ class _TopK:
 
 
 def build_last(tokens: int, hidden: int, experts: int, topk: int,
-              verteilung: str, rank: int, dev, keim: int):
+              distribution: str, rank: int, dev, seed_value: int):
     """Eine Last, die aussieht wie eine echte.
 
     ``gleich``: jeder Experte gleich wahrscheinlich -- der freundliche Fall,
     in dem alle Bloecke aehnlich gross sind.
 
-    ``schief``: eine Zipf-aehnliche Gewichtung, die einen kleinen Teil der
+    ``skewed``: eine Zipf-aehnliche Gewichtung, die einen kleinen Teil der
     Experten den Grossteil der Token bekommen laesst. Das ist der Fall, der
     MoE-Dispatch wirklich weh tut: die Bloecke werden ungleich, ein Ziel
     bekommt ein Vielfaches der anderen, und die Rundenzerlegung greift. Ohne
     diesen Fall misst man den Sonderfall und nennt ihn Normalfall.
     """
-    g = torch.Generator(device="cpu").manual_seed(keim + 1000 * rank)
-    if verteilung == "gleich":
+    g = torch.Generator(device="cpu").manual_seed(seed_value + 1000 * rank)
+    if distribution == "gleich":
         weight = torch.ones(experts, dtype=torch.float32)
-    elif verteilung == "schief":
+    elif distribution == "skewed":
         # Zipf(1.0) auf einer je Rang verschobenen Expertenreihenfolge --
         # sonst waeren die heissen Experten auf allen Raengen dieselben und
         # die Schieflage traefe genau einen Zielrang statt einer Verteilung.
@@ -333,7 +333,7 @@ def build_last(tokens: int, hidden: int, experts: int, topk: int,
         weight = torch.empty(experts, dtype=torch.float32)
         weight[rang_order] = w
     else:
-        raise ValueError(f"unbekannte Verteilung {verteilung!r}")
+        raise ValueError(f"unbekannte Verteilung {distribution!r}")
 
     if tokens == 0:
         ids = torch.zeros((0, topk), dtype=torch.int64, device=dev)
@@ -424,11 +424,11 @@ def messe(args, alive, proc_group, welt, rank, dev):
     results = []
     nle = args.experts // welt
 
-    for verteilung in args.verteilung:
+    for distribution in args.distribution:
         for tokens in args.tokens:
             x, topk = build_last(
-                tokens, args.hidden, args.experts, args.topk, verteilung,
-                rank, dev, args.keim,
+                tokens, args.hidden, args.experts, args.topk, distribution,
+                rank, dev, args.seed_value,
             )
             names = list(alive.keys())
             want = {}
@@ -442,10 +442,10 @@ def messe(args, alive, proc_group, welt, rank, dev):
             #    Messung.
             for name, d in alive.items():
                 t0 = time.perf_counter()
-                runden = 0
-                while time.perf_counter() - t0 < args.vorlauf or runden < 3:
+                round_list = 0
+                while time.perf_counter() - t0 < args.warmup or round_list < 3:
                     one_round(d, x, topk, events)
-                    runden += 1
+                    round_list += 1
                 # Ueber die CPU-Gruppe, nicht ueber die Vorgabegruppe: bei
                 # aktivem barlink ist die Vorgabegruppe NCCL, und auf einer
                 # Gruppe ueber zwei Hersteller ist das kein langsamerer Weg,
@@ -456,7 +456,7 @@ def messe(args, alive, proc_group, welt, rank, dev):
             times = {n: [] for n in names}
             errors = {n: 0 for n in names}
             deviation = {n: 0.0 for n in names}
-            for _ in range(args.runden):
+            for _ in range(args.round_list):
                 for name in names:
                     z, td, tc = one_round(alive[name], x, topk, events)
                     # KORREKTHEIT IN JEDER RUNDE -- nicht einmal am Anfang.
@@ -469,7 +469,7 @@ def messe(args, alive, proc_group, welt, rank, dev):
                         else 0.0
                     )
                     deviation[name] = max(deviation[name], d_abs)
-                    if d_abs > args.schranke:
+                    if d_abs > args.bound_value:
                         errors[name] += 1
                     times[name].append((td, tc))
                 dist.barrier(group=proc_group.cpu_group)
@@ -481,17 +481,17 @@ def messe(args, alive, proc_group, welt, rank, dev):
                 m = len(ds) // 2
                 results.append(
                     dict(
-                        variante=name,
-                        verteilung=verteilung,
+                        variant=name,
+                        distribution=distribution,
                         tokens=tokens,
                         dispatch_ms_median=ds[m],
                         combine_ms_median=cs[m],
-                        summe_ms_median=ds[m] + cs[m],
+                        sum_ms_median=ds[m] + cs[m],
                         dispatch_ms_min=ds[0],
                         combine_ms_min=cs[0],
-                        runden=len(ds),
+                        round_list=len(ds),
                         fehlrunden=errors[name],
-                        max_abweichung=deviation[name],
+                        max_deviation=deviation[name],
                     )
                 )
     return results
@@ -505,13 +505,13 @@ def reports(results, tot, args, rank):
     print("MoE-Dispatch/Combine -- verschraenkt im selben Lauf")
     print(
         f"hidden={args.hidden} experts={args.experts} topk={args.topk} "
-        f"vorlauf>={args.vorlauf}s runden={args.runden} schranke={args.schranke}"
+        f"warmup>={args.warmup}s round_list={args.round_list} bound_value={args.bound_value}"
     )
     print("=" * 78)
     if tot:
         print("TOTE VARIANTEN (nicht gemessen, nicht ersetzt):")
-        for grund in tot:
-            print(f"  - {grund}")
+        for refuse_reason in tot:
+            print(f"  - {refuse_reason}")
         print()
     if not results:
         print("Keine lebende Variante. Es gibt nichts zu berichten.")
@@ -525,10 +525,10 @@ def reports(results, tot, args, rank):
     print("-" * len(header))
     for e in results:
         print(
-            f"{e['variante']:<10}{e['verteilung']:<12}{e['tokens']:>7}"
+            f"{e['variant']:<10}{e['distribution']:<12}{e['tokens']:>7}"
             f"{e['dispatch_ms_median']:>13.4f}{e['combine_ms_median']:>12.4f}"
-            f"{e['summe_ms_median']:>11.4f}{e['fehlrunden']:>12d}"
-            f"{e['max_abweichung']:>10.4g}"
+            f"{e['sum_ms_median']:>11.4f}{e['fehlrunden']:>12d}"
+            f"{e['max_deviation']:>10.4g}"
         )
     bad = [e for e in results if e["fehlrunden"]]
     if bad:
@@ -550,18 +550,18 @@ def main() -> int:
     p.add_argument("--experts", type=int, default=24)
     p.add_argument("--topk", type=int, default=8)
     p.add_argument("--tokens", default="128,512,2048")
-    p.add_argument("--verteilung", default="gleich,schief")
+    p.add_argument("--distribution", default="gleich,skewed")
     p.add_argument(
-        "--varianten", default="bar1ep,torch,deepep",
+        "--variants", default="bar1ep,torch,deepep",
         help="Komma-getrennt. Eine nicht genannte Variante wird weder gebaut "
              "noch als tot gemeldet -- sie wurde nicht gefragt.",
     )
-    p.add_argument("--vorlauf", type=float, default=3.0,
+    p.add_argument("--warmup", type=float, default=3.0,
                    help="Sekunden Vorlauf je Variante und Form. Untergrenze 3.")
-    p.add_argument("--runden", type=int, default=30)
-    p.add_argument("--keim", type=int, default=1234)
+    p.add_argument("--round_list", type=int, default=30)
+    p.add_argument("--seed_value", type=int, default=1234)
     p.add_argument(
-        "--schranke", type=float, default=0.0,
+        "--bound_value", type=float, default=0.0,
         help="Groesste erlaubte Abweichung vom Sollergebnis. 0 heisst "
              "bitgenau -- das ist der richtige Wert fuer bar1ep und torch, "
              "weil beide in float32 summieren und danach dieselbe Rundung "
@@ -572,11 +572,11 @@ def main() -> int:
     args = p.parse_args()
 
     args.tokens = [int(t) for t in args.tokens.split(",") if t]
-    args.verteilung = [v for v in args.verteilung.split(",") if v]
-    args.varianten = [v for v in args.varianten.split(",") if v]
-    if args.vorlauf < 3.0:
+    args.distribution = [v for v in args.distribution.split(",") if v]
+    args.variants = [v for v in args.variants.split(",") if v]
+    if args.warmup < 3.0:
         print("Vorlauf unter 3 s ist nicht vorgesehen -- auf 3 s gehoben.")
-        args.vorlauf = 3.0
+        args.warmup = 3.0
 
     welt = _env_int("WORLD_SIZE", 1)
     rank = _env_int("RANK", 0)
@@ -597,7 +597,7 @@ def main() -> int:
 
     # Diese beiden liest der GroupCoordinator beim Aufbau. Sie hier zu setzen
     # waere zu spaet -- also wird nur geprueft und mit Grund abgebrochen.
-    if "bar1ep" in args.varianten:
+    if "bar1ep" in args.variants:
         if os.environ.get("FLLIPER_BARLINK", "0") in ("0", "false", ""):
             print(
                 "FLLIPER_BARLINK ist nicht gesetzt. Ohne barlink gibt es keinen "
@@ -616,7 +616,7 @@ def main() -> int:
             return 2
 
     proc_group = build_env(welt, rank, local_rank)
-    set_moe_flags("bar1ep" if "bar1ep" in args.varianten else "deepep")
+    set_moe_flags("bar1ep" if "bar1ep" in args.variants else "deepep")
     dev = torch.device("cuda", local_rank)
 
     alive, tot = build_variants(args, proc_group, welt)

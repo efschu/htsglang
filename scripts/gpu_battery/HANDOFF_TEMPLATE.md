@@ -88,7 +88,7 @@ In addition, depending on the step:
   ```
   Plus the one JSON per step: `driver_state.json` (`missing` names exactly
   what is absent), `bar1_e2e.json` (`capture_bolt`, `gruppen`, `graph_check`),
-  `prefill_kurve.json` (`abbruch`, `reihenfolge`,
+  `prefill_kurve.json` (`abort_reason`, `reihenfolge`,
   `grundlinie_abweichung_pct`). On a hang, the py-spy dumps run on the host
   and land as `$S/pyspy-host-*.txt`; the matching PIDs are in `$S/host_pids`.
   **Check the host locks too** — CT999 and the host have separate `/tmp`.

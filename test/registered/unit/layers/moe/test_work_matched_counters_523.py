@@ -441,7 +441,7 @@ class TestTheS12WindowBasis:
     does not bias them -- that part of the inventory is a NEGATIVE finding and
     is stated as such in ``fenster_basis_pruefen``'s docstring rather than
     fixed. What is NOT covered is the window basis: ``punkt_fenster`` bounds
-    the point by a request count from punkte.jsonl and falls through to 0 --
+    the point by a request count from data_points.jsonl and falls through to 0 --
     "every large batch in the log, warmup included" -- when the point is
     missing. Two arms then aggregate different phases and nothing says so.
     """

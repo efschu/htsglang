@@ -50,7 +50,7 @@ from s11_bar1_e2e import (  # noqa: E402
     parse_log_evidence,
     parse_smoke,
 )
-from s12_prefill_kurve import table, summarize  # noqa: E402
+from s12_prefill_curve import table, summarize  # noqa: E402
 
 # The lines the code really writes -- built from the ACTUAL format strings in
 # parallel_state.py / barlink.py / barlink_bar1.py / benchmark/bar1_graph_check.py
@@ -155,7 +155,7 @@ def write_json(path, payload) -> None:
 
 
 class TestBar1StepTable:
-    IDS = ("s10_bar1_driver", "s11_bar1_e2e", "s12_prefill_kurve")
+    IDS = ("s10_bar1_driver", "s11_bar1_e2e", "s12_prefill_curve")
 
     def test_the_three_steps_exist(self):
         for step_id in self.IDS:
@@ -166,7 +166,7 @@ class TestBar1StepTable:
         driver there is no direct path, and without a run that provably went
         over it there is nothing to put on a curve."""
         assert STEPS_BY_ID["s11_bar1_e2e"].deps == ("s10_bar1_driver",)
-        assert STEPS_BY_ID["s12_prefill_kurve"].deps == ("s11_bar1_e2e",)
+        assert STEPS_BY_ID["s12_prefill_curve"].deps == ("s11_bar1_e2e",)
 
     def test_the_old_block_stays_independent(self):
         """s00-s09 must not gain a dependency on the BAR1 block -- the battery
@@ -178,7 +178,7 @@ class TestBar1StepTable:
 
     def test_the_curve_is_not_retryable(self):
         """Eight boots. A retry is not an unattended decision."""
-        assert not STEPS_BY_ID["s12_prefill_kurve"].retryable
+        assert not STEPS_BY_ID["s12_prefill_curve"].retryable
 
     def test_container_side_locks_are_taken(self):
         """The host locks are the step's own job; the container ones are
@@ -248,7 +248,7 @@ class TestBar1StepTable:
             "battery_host.sh",
             "_bar1_host_boot.sh",
             "s10_restore.sh",
-            "s12_prefill_kurve.py",
+            "s12_prefill_curve.py",
         ):
             assert os.path.exists(os.path.join(BATTERY, name)), name
 
@@ -568,7 +568,7 @@ class TestE2ECheck:
             ),
         )
         line = assert_stop(self.CHECK, tmp_path, self.STEP)
-        assert "blockiert" in line
+        assert "is_blocked" in line
         assert "Lock" in line
 
     def test_graph_gate_never_ran_is_stop(self, tmp_path):
@@ -1335,10 +1335,10 @@ KNOWN = {1: 1190.7, 4: 1143.7, 8: 1105.0, 16: 1122.4}
 def _curve(**over) -> dict:
     plan = [1, 4, 8, 16]
     ordering = []
-    folge = 0
+    step_sequence = 0
     for sessions in plan:
         for arm in ("bar1", "grundlinie"):
-            folge += 1
+            step_sequence += 1
             group_list = (
                 [
                     {"group": "tp:0", "requested": "bar1", "achieved": "bar1"},
@@ -1349,7 +1349,7 @@ def _curve(**over) -> dict:
             )
             ordering.append(
                 {
-                    "folge": folge,
+                    "step_sequence": step_sequence,
                     "arm": arm,
                     "sessions": sessions,
                     "zeit": "2026-07-30T04:00:00",
@@ -1364,10 +1364,10 @@ def _curve(**over) -> dict:
         "schema_version": 3,
         "arme": ["bar1", "grundlinie"],
         "sessions_geplant": plan,
-        "abbruch": None,
-        "host_erreichbar": True,
+        "abort_reason": None,
+        "host_reachable": True,
         "integration_vorhanden": True,
-        "punkte": 8,
+        "data_points": 8,
         "reihenfolge": ordering,
         "fatal": [],
         "fatal_ungeprueft": [],
@@ -1413,7 +1413,7 @@ def _write_curve(tmp_path, payload=None):
 
 
 class TestPrefillCurveCheck:
-    CHECK, STEP = "check_s12_prefill_kurve.py", "s12_prefill_kurve"
+    CHECK, STEP = "check_s12_prefill_kurve.py", "s12_prefill_curve"
 
     def test_pass_with_a_rising_curve(self, tmp_path):
         _write_curve(tmp_path)
@@ -1442,16 +1442,16 @@ class TestPrefillCurveCheck:
         assert_stop(self.CHECK, tmp_path, self.STEP)
 
     def test_unreachable_host_is_stop(self, tmp_path):
-        _write_curve(tmp_path, _curve(host_erreichbar=False))
+        _write_curve(tmp_path, _curve(host_reachable=False))
         assert_stop(self.CHECK, tmp_path, self.STEP)
 
     def test_blocked_step_is_stop(self, tmp_path):
-        payload = _curve(blockiert="Host-Locks fremd gehalten -- nicht gebrochen")
+        payload = _curve(is_blocked="Host-Locks fremd gehalten -- nicht gebrochen")
         payload["kurven"] = {"bar1": {}, "grundlinie": {}}
         payload["reihenfolge"] = []
         _write_curve(tmp_path, payload)
         line = assert_stop(self.CHECK, tmp_path, self.STEP)
-        assert "blockiert" in line
+        assert "is_blocked" in line
 
     def test_half_a_pair_is_fail(self, tmp_path):
         payload = _curve()
@@ -1466,7 +1466,7 @@ class TestPrefillCurveCheck:
         assert "grundlinie" in line
 
     def test_aborted_run_names_the_reason(self, tmp_path):
-        payload = _curve(abbruch="Messung bar1/8 rc=1")
+        payload = _curve(abort_reason="Messung bar1/8 rc=1")
         payload["kurven"]["bar1"].pop("8")
         payload["kurven"]["bar1"].pop("16")
         _write_curve(tmp_path, payload)
@@ -1514,7 +1514,7 @@ class TestPrefillCurveCheck:
         payload = _curve()
         payload["fatal"] = [
             {
-                "folge": 3,
+                "step_sequence": 3,
                 "arm": "bar1",
                 "sessions": 4,
                 "line": "logs/bar1_4.fatal.txt:1: torch.OutOfMemoryError: CUDA "
@@ -1527,7 +1527,7 @@ class TestPrefillCurveCheck:
 
     def test_boot_without_a_fatal_harvest_is_fail(self, tmp_path):
         payload = _curve()
-        payload["fatal_ungeprueft"] = [{"folge": 2, "arm": "grundlinie", "sessions": 1}]
+        payload["fatal_ungeprueft"] = [{"step_sequence": 2, "arm": "grundlinie", "sessions": 1}]
         _write_curve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "ohne Fatal-Ernte" in line
@@ -1571,24 +1571,24 @@ class TestPrefillCurveCheck:
 
 
 class TestPrefillCurveSummary:
-    """punkte.jsonl -> summary -> live table, without a server."""
+    """data_points.jsonl -> summary -> live table, without a server."""
 
     @staticmethod
-    def _points(tmp_path, punkte, belege=True, fatal=""):
-        with open(tmp_path / "punkte.jsonl", "w") as f:
-            for p in punkte:
+    def _points(tmp_path, data_points, evidence_items=True, fatal=""):
+        with open(tmp_path / "data_points.jsonl", "w") as f:
+            for p in data_points:
                 f.write(json.dumps(p) + "\n")
-        if belege:
-            os.makedirs(tmp_path / "belege", exist_ok=True)
+        if evidence_items:
+            os.makedirs(tmp_path / "evidence_items", exist_ok=True)
             os.makedirs(tmp_path / "logs", exist_ok=True)
-            for p in punkte:
-                name = f"{p['folge']}_{p['arm']}_{p['sessions']}.txt"
+            for p in data_points:
+                name = f"{p['step_sequence']}_{p['arm']}_{p['sessions']}.txt"
                 text = (
                     "\n".join([LOG_GROUP_OK, LOG_GROUP_OK_DCP])
                     if p["arm"] == "bar1"
                     else ""
                 )
-                (tmp_path / "belege" / name).write_text(text)
+                (tmp_path / "evidence_items" / name).write_text(text)
                 # The shell's grep leaves an EMPTY file behind when it found
                 # nothing -- that is the healthy case, not a missing harvest.
                 (
@@ -1597,9 +1597,9 @@ class TestPrefillCurveSummary:
         return tmp_path
 
     @staticmethod
-    def _punkt(folge, arm, sessions, rate):
+    def _punkt(step_sequence, arm, sessions, rate):
         return {
-            "folge": folge,
+            "step_sequence": step_sequence,
             "arm": arm,
             "sessions": sessions,
             "zeit": "2026-07-30T04:00:00",
@@ -1659,7 +1659,7 @@ class TestPrefillCurveSummary:
 
     def test_summary_marks_a_boot_without_a_harvest(self, tmp_path):
         """Nobody looked and nothing found must not read the same."""
-        self._points(tmp_path, [self._punkt(1, "bar1", 1, 1310.0)], belege=False)
+        self._points(tmp_path, [self._punkt(1, "bar1", 1, 1310.0)], evidence_items=False)
         payload = summarize(str(tmp_path), 5.0, [1])
         assert payload["fatal"] == []
         assert len(payload["fatal_ungeprueft"]) == 1
@@ -1696,7 +1696,7 @@ class TestBar1VerdictContract:
     CHECKS = (
         ("check_s10_bar1_driver.py", "s10_bar1_driver"),
         ("check_s11_bar1_e2e.py", "s11_bar1_e2e"),
-        ("check_s12_prefill_kurve.py", "s12_prefill_kurve"),
+        ("check_s12_prefill_kurve.py", "s12_prefill_curve"),
     )
 
     @pytest.mark.parametrize("check,step", CHECKS)

@@ -149,7 +149,7 @@ SHELL_HARVEST_MARKERS = {
         "BAR1 ledger of this card after group",
         "during a CUDA graph capture",
     ],
-    "s12_prefill_kurve.sh": [
+    "s12_prefill_curve.sh": [
         "barlink-BAR1: setup in",
         "during a CUDA graph capture",
     ],

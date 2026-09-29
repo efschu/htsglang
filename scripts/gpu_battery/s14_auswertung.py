@@ -88,7 +88,7 @@ def table_points(points: list) -> str:
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     counter: dict = {}
-    for p in sorted(points, key=lambda q: (q.get("arm", ""), q.get("folge", 0))):
+    for p in sorted(points, key=lambda q: (q.get("arm", ""), q.get("step_sequence", 0))):
         key = (p.get("arm"), p.get("bs"))
         counter[key] = counter.get(key, 0) + 1
         z.append(

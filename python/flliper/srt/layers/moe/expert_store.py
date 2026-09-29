@@ -320,12 +320,12 @@ def expert_map():
             roh = json.load(fh)
         from flliper.srt.layers.moe import expert_map as _em
 
-        grund = _em.refuse_if_inconsistent(roh)
-        if grund:
+        refuse_reason = _em.refuse_if_inconsistent(roh)
+        if refuse_reason:
             logging.getLogger(__name__).error(
                 "#107 EXPERTEN-KARTE %s VERWORFEN: %s -- dieser Lauf rechnet "
                 "wie vor der Karte, also koennen zwei Gruppen wieder "
-                "auseinanderlaufen", file_path, grund)
+                "auseinanderlaufen", file_path, refuse_reason)
         else:
             emap = roh
     except (OSError, ValueError, KeyError, TypeError) as exc:

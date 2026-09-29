@@ -17654,9 +17654,9 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
                               fr_pp=[float(x) for x in fr_pp],
                               fr_tp=[float(x) for x in fr_tp],
                               mirror=_mirror)
-        grund = _em.refuse_if_inconsistent(emap)
-        if grund:
-            log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % grund)
+        refuse_reason = _em.refuse_if_inconsistent(emap)
+        if refuse_reason:
+            log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % refuse_reason)
             return ""
         _refuse_unbuilt_platztausch_buffers(emap, chunk_layers=chunk_layers)
         os.makedirs(evidence_dir, exist_ok=True)

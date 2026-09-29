@@ -114,9 +114,9 @@ ARM_TABLE=(
 # A caller may narrow the list; the names must match column 1.
 S13_NUR="${S13_NUR:-}"
 
-mkdir -p "$DIR/belege" "$DIR/logs" "$DIR/wait"
+mkdir -p "$DIR/evidence_items" "$DIR/logs" "$DIR/wait"
 DIR_HOST="$(host_path "$DIR")" || exit 2
-DRIVER_HOST="$(host_path "$BATTERY_DIR/s12_prefill_kurve.py")" || exit 2
+DRIVER_HOST="$(host_path "$BATTERY_DIR/s12_prefill_curve.py")" || exit 2
 ANALYSE_HOST="$(host_path "$BATTERY_DIR/s12_log_analyse.py")" || exit 2
 
 if ! host_reachable; then
@@ -173,7 +173,7 @@ set -uo pipefail
   --mode messen --port $PORT --out-dir $DIR_HOST \\
   --point-seconds $POINT_S --warmup-seconds $WARMUP_S \\
   --prompt-tokens $PROMPT_TOKENS \\
-  --arm "\$1" --sessions "\$2" --folge "\$3" --server-log "\$4" \\
+  --arm "\$1" --sessions "\$2" --step_sequence "\$3" --server-log "\$4" \\
   --with-decode "\$5"
 EOF
 chmod +x "$DIR/remote_messen.sh"
@@ -246,7 +246,7 @@ for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
         # The prefill-graph lines go into the same file -- an arm that asks for
         # the prefill graph and silently does not get it would otherwise be
         # reported as a prefill-graph measurement.
-        host_grep_into "$HOSTLOG" "$DIR/belege/${ARM}.txt" \
+        host_grep_into "$HOSTLOG" "$DIR/evidence_items/${ARM}.txt" \
             "barlink enabled for group" \
             "ACHIEVED=" \
             "barlink-BAR1: setup in" \
@@ -278,7 +278,7 @@ for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
         # What comes back into the run directory is the aggregate, never the
         # log.
         host_ssh_for 300 "/spinning/miniforge3_local_install/bin/python3.12 \
-            $ANALYSE_HOST --log '$ARM:8:$HOSTLOG' --punkte $DIR_HOST/punkte.jsonl \
+            $ANALYSE_HOST --log '$ARM:8:$HOSTLOG' --data_points $DIR_HOST/data_points.jsonl \
             --json $DIR_HOST/wait/${ARM}.json" > "$DIR/wait/${ARM}.txt" 2>&1 || true
 
         host_tail_into "$HOSTLOG" "$DIR/logs/${ARM}.tail.txt" 120
@@ -308,7 +308,7 @@ cleanup
 trap - EXIT INT TERM
 
 if [ -n "$ABORT" ]; then
-    echo "aborted: $ABORT" | tee "$DIR/abbruch.txt"
+    echo "aborted: $ABORT" | tee "$DIR/abort_reason.txt"
     exit 1
 fi
 exit 0
