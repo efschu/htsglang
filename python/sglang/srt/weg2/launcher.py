@@ -20421,6 +20421,14 @@ def build_parser() -> argparse.ArgumentParser:
              "VOLLSTAENDIG gedeckt hat. 'off' ist byte-identisch zu vorher.",
     )
     ap.add_argument(
+        "--weg2-p-free-read-journal", choices=("on", "off"), default="off",
+        help="BOOTZEIT 3 (29.09., 27B-Auflage): jede Lesung des freien Kartenspeichers "
+             "durch P von 'P kv sized' bis zum ersten Wake als JSONL je Rang "
+             "(p_free_reads_<tag>/), fuer den Vergleich frueher gegen seriellen Start "
+             "(python -m sglang.srt.weg2.d_early_start EARLY SERIAL). Mit "
+             "--weg2-d-early-start on immer an. Nur Instrument, aendert keine Entscheidung.",
+    )
+    ap.add_argument(
         "--weg2-d-early-start", choices=("on", "off"), default="off",
         help="BOOTZEIT 3 (29.09.): 'on' startet Gruppe D ZUSAMMEN mit P statt "
              "nach P-READY + sleep(P) + D-Plan (z30r3: D-Init 30 s, davor 8 s "
@@ -23448,6 +23456,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for _old in os.listdir(_early_sized_dir):
             os.unlink(os.path.join(_early_sized_dir, _old))
         spec_p.env[_des.P_SIZED_DIR_ENV] = _early_sized_dir  # stage 0: P ranks report sized
+    if _d_early_start_armed(ns) or str(getattr(ns, "weg2_p_free_read_journal", "off")) == "on":
+        from sglang.srt.weg2 import d_early_start as _des
+
+        _journal_dir = os.path.join(os.path.dirname(os.path.abspath(state.logs["P"])),
+                                    f"p_free_reads_{ns.tag}")
+        spec_p.env[_des.FREE_READ_JOURNAL_ENV] = _journal_dir
+        log(f"{_des.FREE_READ_MARKER} P journals its free-memory reads -> {_journal_dir}")
     launch_group(spec_p, tree, log, dry)
     if dry:
         _dry_terms: List[Dict[str, object]] = []
@@ -23662,6 +23677,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"({'AT OR BELOW' if dc_p[c.uuid] <= exp + P_WINDOWS_MIB else 'ABOVE'} expectation; the launcher derives D from the MEASUREMENT, record 1f B6)"
         )
     state.dc_measured_p = dc_p
+    # BOOTZEIT 3: the free-read journal's cut (P's first sleep is over here) and,
+    # with an early D, D's bytes on each card measured per PID -- the known term
+    # a deviating P reader would have to carry (never an estimate).
+    _p_sleep_evt: Dict[str, object] = {"t": time.time(), "dc_p_mib": dict(dc_p)}
+    if _early_d is not None:
+        try:
+            _p_sleep_evt["d_early_foreign_mib"] = nvml_process_mib(session_pids(_early_d[0].pid))
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            _p_sleep_evt["d_early_foreign_mib"] = f"unmeasured ({type(e).__name__}: {e})"
+        log(f"BZ3 D-EARLY-FOREIGN after sleep(P): D per-PID MiB {_p_sleep_evt['d_early_foreign_mib']}")
+    boot_state_write(log, event=("p_first_sleep_done", _p_sleep_evt))
     for _ln in d_expect_check_lines(cards, getattr(ns, "_d_expect_other", None), dc_p):
         log(_ln)
 

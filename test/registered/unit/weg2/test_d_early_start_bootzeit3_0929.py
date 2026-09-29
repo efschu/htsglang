@@ -126,6 +126,57 @@ def test_stage0_verdict_waits_then_goes_and_refuses_on_taint():
     assert v is False and any("nvml1: D held 888 MiB" in l for l in lines)
 
 
+# --- free-read journal (27B follow-up): P's reads from stage 0 to first wake ---
+
+
+def _p_reader_under_test():
+    import torch
+
+    return torch.cuda.mem_get_info(0)
+
+
+def test_free_read_journal_records_the_call_site_and_restores(monkeypatch, tmp_path):
+    import torch
+
+    fake = lambda *a, **k: (512 << 20, 20480 << 20)  # noqa: E731
+    monkeypatch.setattr(torch.cuda, "mem_get_info", fake)
+    monkeypatch.delenv(des.FREE_READ_JOURNAL_ENV, raising=False)
+    assert des.start_free_read_journal(0, 0) is None  # off without the env
+    monkeypatch.setenv(des.FREE_READ_JOURNAL_ENV, str(tmp_path))
+    path = des.start_free_read_journal(1, 0)
+    assert _p_reader_under_test() == (512 << 20, 20480 << 20)  # value unchanged
+    des.stop_free_read_journal()
+    assert torch.cuda.mem_get_info is fake  # restored
+    rows = des.read_free_journal(path)
+    assert len(rows) == 1 and rows[0]["free_mib"] == 512 and rows[0]["total_mib"] == 20480
+    assert rows[0]["site"].endswith(":_p_reader_under_test")
+    _p_reader_under_test()  # after stop: not journaled
+    assert len(des.read_free_journal(path)) == 1
+
+
+def test_free_read_diff_flags_the_site_that_sees_d():
+    early = [{"site": "g.py:9:spendable", "via": "", "free_mib": 900},
+             {"site": "c.py:1:census", "via": "", "free_mib": 4000}]
+    serial = [{"site": "g.py:9:spendable", "via": "", "free_mib": 1382},
+              {"site": "c.py:1:census", "via": "", "free_mib": 4010}]
+    lines = des.free_read_diff(early, serial)
+    assert any(l.startswith("DEVIATES g.py:9:spendable") and "delta -482" in l for l in lines)
+    assert any(l.startswith("same c.py:1:census") for l in lines)
+    only = des.free_read_diff(early[:1], [])
+    assert only[0].startswith("DEVIATES") and "one boot only" in only[0]
+
+
+def test_journal_window_is_stage0_to_first_wake():
+    from sglang.srt.managers import scheduler as sch
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    init = inspect.getsource(sch.Scheduler.init_model_worker)
+    assert init.index("note_p_memory_sized(") < init.index("start_free_read_journal(")
+    resume = inspect.getsource(wu)
+    i = resume.index("def resume_memory_occupation(")
+    assert "stop_free_read_journal()" in resume[i:i + 400]
+
+
 def test_stage0_sits_before_the_first_cuda_call_and_p_reports_after_sizing():
     from sglang.srt.managers import scheduler as sch
 

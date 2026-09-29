@@ -125,6 +125,19 @@ def test_stage0_watch_refuses_when_d_held_vram_before_p_was_sized(tmp_path, monk
     assert any("nvml1: D held 888 MiB before P was sized" in l for l in lines)
 
 
+def test_journal_env_for_p_and_the_foreign_term_after_sleep():
+    ap = L.build_parser()
+    ns = ap.parse_known_args(["--tree", "t", "--tag", "x"])[0]
+    assert ns.weg2_p_free_read_journal == "off"
+    src = _main_src()
+    i_p = src.index("launch_group(spec_p, tree, log, dry)")
+    assert src.index("spec_p.env[_des.FREE_READ_JOURNAL_ENV]") < i_p
+    i_dc = src.index("state.dc_measured_p = dc_p")
+    tail = src[i_dc:i_dc + 1500]
+    assert '"p_first_sleep_done"' in tail and "d_early_foreign_mib" in tail
+    assert "nvml_process_mib(session_pids(_early_d[0].pid))" in tail  # per PID, measured
+
+
 def test_load_gate_needs_stage0_go_and_d_gets_both_gates():
     src = _main_src()
     v = src[src.index("def _d_early_verdict("):src.index("    # 5. group D\n")]

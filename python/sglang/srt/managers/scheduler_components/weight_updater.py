@@ -9434,6 +9434,9 @@ class SchedulerWeightUpdaterManager:
     @_weg2_group_stop_on_leg_failure
     @_vram_peak_leg("resume")
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        from sglang.srt.weg2.d_early_start import stop_free_read_journal
+
+        stop_free_read_journal()  # BOOTZEIT 3: journal window = stage 0 .. first wake
         # #1285: see the release leg.  This one is the sharper case -- the wake's
         # very first mutation below drops each tag from the offload set, which
         # raises KeyError on a repeat, so without this the retry kills the group.

@@ -2785,11 +2785,17 @@ class Scheduler(
         # BOOTZEIT 3 stage 0: every free-memory reading this rank's sizing
         # depends on is taken; an early-started D may create its context now
         # (no-op without SGLANG_WEG2_P_MEM_SIZED_DIR).
-        from sglang.srt.weg2.d_early_start import note_p_memory_sized
+        from sglang.srt.weg2.d_early_start import (
+            note_p_memory_sized,
+            start_free_read_journal,
+        )
 
         note_p_memory_sized(
             self.pp_rank, self.tp_rank, getattr(model_runner, "_weg2_used_by_me_gb", None)
         )
+        # ... and from here until the first wake every free-memory read of this
+        # rank is journaled (SGLANG_WEG2_FREE_READ_JOURNAL; early vs serial diff)
+        start_free_read_journal(self.pp_rank, self.tp_rank)
         # #485 residency census (env-gated, read-only): the same point, seen
         # from the CUT's side. note_post_capture_leftover above answers "how
         # much is left"; this answers "what is here, and who owns it", which
