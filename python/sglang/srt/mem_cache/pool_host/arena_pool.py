@@ -910,6 +910,16 @@ def _stage_layer_view(dev_stage, b: int, off_b: int, cell: int, dtype, H: int, D
     return dev_stage[:b, off_b:off_b + P * cell].reshape(-1).view(dtype).view(b * P, H, D)
 
 
+def _stage_layer_lanes(dev_stage, b: int, off_b: int, cell: int, dtype, H: int, D: int, P: int, lanes):
+    """F22: one layer's K (or V) cells of the owned ``lanes`` of the first
+    ``b`` staged pages, typed ``(b * len(lanes), H, D)`` in (page, lane)
+    order -- the order of the owner's compact device rows. The layer block of
+    a page is P contiguous cells, so ``(b, P, cell)`` is a view of the stage;
+    the lane selection is one device copy of only the owned cells."""
+    blk = dev_stage[:b, off_b:off_b + P * cell].view(b, P, cell)
+    return blk.index_select(1, lanes).reshape(-1).view(dtype).view(-1, H, D)
+
+
 def _arena_load_block_quota():
     """Task #3 (17.09.): the JIT gather's block quota for the ARENA -> device
     load. The kernel default (2 blocks = 64 warps in flight) is tuned for
@@ -1087,6 +1097,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # #239 S4b (F14): under the token cut the token offsets of a page this
         # rank owns (None: every other form -- the whole-page paths below)
         self._owner_tok: Optional[torch.Tensor] = None
+        # F22: (load key, leading rows the layer-0 whole-page load took) of the
+        # owner load in flight -- layers 1.. gather only the rest
+        self._owner_loaded: Optional[tuple] = None
         self.arena_k_ptrs = None
         self.arena_v_ptrs = None
 
@@ -1447,10 +1460,28 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
     def _load_arena(self, device_pool, rows, device_indices, layer_id) -> None:
         P = _psz(self)
         if _owner_tok_of(self) is not None:
-            # #239 S4b (F14): this rank's token rows of each page, never the
-            # whole-page path (it would write P rows per page into the compact
-            # device pool); the controller already masked host AND device ids
-            # by the owner rule (_dcp_kv_transfer_pairs).
+            # #239 S4b (F14): this rank's token rows of each page; the
+            # controller already masked host AND device ids by the owner rule
+            # (_dcp_kv_transfer_pairs).
+            #
+            # F22 (29.09.): whole owner groups take the whole-page load with a
+            # lane scatter on the device (`_owner_page_prefix_load`), every
+            # layer at layer 0 like TP0's page load; only what is left (a tail
+            # that is not whole groups, twin rows) takes the per-layer gather.
+            done = 0
+            if _arena_page_load_on() and getattr(self, "_page_view", None) is not None:
+                key = getattr(self, "_page_key_hint", None) or (
+                    id(rows), id(device_indices), int(rows.numel()), int(device_indices.numel()))
+                if layer_id == 0:
+                    done = self._owner_page_prefix_load(device_pool, rows, device_indices)
+                    self._owner_loaded = (key, done)
+                else:
+                    ol = self._owner_loaded
+                    done = ol[1] if ol is not None and ol[0] == key else 0
+            if done >= int(rows.numel()):
+                return
+            if done:
+                rows, device_indices = rows[done:], device_indices[done:]
             slots = rows // P
             self.pin_slots(torch.unique(slots))
             # the gather reads the arena through torch (host index + H2D), not
@@ -1510,20 +1541,79 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._transfer(device_pool, self.arena_k_refs[layer_id], self.arena_v_refs[layer_id],
                        rows, device_indices, layer_id)
 
-    def _load_pages_all_layers(self, device_pool, slots, device_indices) -> None:
+    def _owner_page_prefix_load(self, device_pool, rows, device_indices) -> int:
+        """F22 (29.09.): the owner rows of whole pages under the token cut, as
+        a whole-page load. Returns how many leading rows it loaded (all
+        layers); 0 = none, the caller gathers everything.
+
+        MEASURED (marker audit x178 / z30w-park / z30x2-kvdemand): after the
+        wake TP0's ``prepare_ms`` equals the slowest worker's START-LOADING
+        ``kv_issue_ms`` flip by flip (kvdemand 3717/3734, 1967/1988,
+        682/716 ms; z30w-park median 998/1033 ms) -- TP0 waits for the
+        workers' loadback, which ran ``_transfer_paged``: a CPU fancy-index
+        gather of (slot, token) cells per layer out of the mapped arena and a
+        blocking pageable H2D per K and V (TP1 213096 rows in 3.73 s). x178
+        without the cut: TP0 ``WEG2-ARENA-PAGE-LOAD mode=dma``, kv=5 ms.
+
+        A page-aligned loadback hands a worker exactly its owned lanes of
+        every page, in page order (``owner_page_tokens``, the same lanes in
+        every page). Such groups go through ``_load_pages_all_layers`` like
+        TP0's pages -- the whole page into the device stage, then only the
+        owned lanes scattered per layer, so the compact device pool gets
+        exactly its rows. The groups are checked, not assumed: the longest
+        leading run of whole groups is loaded; a tail and any other shape
+        (#1424 twin rows) stay with the gather. Unregistered slots take the
+        "cpu" stage (a kernel or DMA read needs the registration)."""
+        lanes = _owner_tok_of(self)
+        P = _psz(self)
+        m = 0 if lanes is None else int(lanes.numel())
+        n = int(rows.numel())
+        if m == 0 or P == 1 or n < m:
+            return 0
+        r = rows.to("cpu", dtype=torch.int64)
+        g = n // m
+        grp = r[:g * m].view(g, m)
+        lanes64 = lanes.to(dtype=torch.int64)
+        base = grp[:, 0] - lanes64[0]
+        ok = (base % P == 0) & (grp == base[:, None] + lanes64[None, :]).all(dim=1)
+        k = g if bool(ok.all()) else int(ok.to(torch.int8).argmin())
+        if k == 0:
+            return 0
+        slots = base[:k] // P
+        didx = device_indices[:k * m]
+        self.pin_slots(torch.unique(slots))
+        reg = self._all_pinned or bool(self._pinned[slots].all())
+        self._arena_load_guard(device_pool, slots, didx, 0, nrows=k * m, nmiss=0, need_pinned=False)
+        self._load_pages_all_layers(device_pool, slots, didx, lanes=lanes64,
+                                    mode=None if reg else "cpu")
+        return k * m
+
+    def _load_pages_all_layers(self, device_pool, slots, device_indices, lanes=None, mode=None) -> None:
         """Fetch whole pages (all layers of a token) in blocks into a device
         stage, then scatter each layer on the device. How a block reaches the
         stage is the mode (``_arena_page_load_mode``): "dma" copies runs of
         consecutive slots straight out of the registered arena, "kernel" lets
         the GPU gather the pages through the mapped arena, "cpu" gathers into
         two alternating pinned stages so the CPU gather of block i+1 overlaps
-        the DMA of block i."""
+        the DMA of block i.
+
+        F22: ``lanes`` (token offsets inside a page, the owner rows under the
+        token cut) scatters only those lanes of every staged page;
+        ``device_indices`` then holds ``len(lanes)`` rows per page. ``mode``
+        forces a mode for this load (the owner path's unregistered slots)."""
         n = int(slots.numel())
         if n == 0:
             return
         dev = device_pool.k_buffer[0].device
         pb = self._page_bytes
         B = _arena_page_load_block(pb)  # x65: a 256-MiB stage, not 8192 pages of any size
+        if lanes is not None and not os.environ.get(ARENA_PAGE_LOAD_BLOCK_ENV, "").strip():
+            # F22: the worker's stage is a quarter of TP0's (64 MiB of NF
+            # pages) -- below the 2 x rows x cell device temporaries per layer
+            # the gather it replaces allocated (TP1 kvdemand: 2 x 109 MB)
+            B = max(16, B // 4)
+        m = int(lanes.numel()) if lanes is not None else _psz(self)
+        _lanes_dev = lanes.to(device=dev, dtype=torch.int64) if lanes is not None else None
         H, D = int(self.head_num), int(self.head_dim)
         e = self.dtype.itemsize
         cell = H * D * e
@@ -1544,7 +1634,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # the GPU gather WHOLE PAGES straight from the mapped arena (the MLA
         # one-buffer kernel with element_dim = page bytes); "cpu" is the
         # pinned-stage form; the first kernel failure falls back to cpu.
-        mode = getattr(self, "_page_mode", None) or _arena_page_load_mode(pb)  # x66: no JIT build at the wake
+        mode = mode or getattr(self, "_page_mode", None) or _arena_page_load_mode(pb)  # x66: no JIT build at the wake
         if mode == "kernel" and dev.type != "cuda":
             mode = "cpu"
         if mode == "cpu":
@@ -1594,12 +1684,19 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             # of a page is P contiguous cells, so the stage slice scatters as
             # (b * P) rows.
             P = _psz(self)
+            # F22: m device rows per page -- P, or the owner's lanes
             if _async_idx:
-                dst = _dst_all[start * P:(start + b) * P]
+                dst = _dst_all[start * m:(start + b) * m]
             else:
-                dst = device_indices[start * P:(start + b) * P].to(device=dev, dtype=torch.int64)
+                dst = device_indices[start * m:(start + b) * m].to(device=dev, dtype=torch.int64)
             for l in range(L):
                 ko, vo = self._k_offs_b[l], self._v_offs_b[l]
+                if _lanes_dev is not None:
+                    device_pool.k_buffer[l].index_copy_(
+                        0, dst, _stage_layer_lanes(dev_stage, b, ko, cell, self.dtype, H, D, P, _lanes_dev))
+                    device_pool.v_buffer[l].index_copy_(
+                        0, dst, _stage_layer_lanes(dev_stage, b, vo, cell, self.dtype, H, D, P, _lanes_dev))
+                    continue
                 # 27B N4E / UNIFY S2: a view for P == 1, the copy for P > 1
                 device_pool.k_buffer[l].index_copy_(
                     0, dst, _stage_layer_view(dev_stage, b, ko, cell, self.dtype, H, D, P))
@@ -1625,6 +1722,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                      f" pinned_new={getattr(self, '_last_load_pinned_n', 0)}")
         if mode == "dma":
             _wall = f" runs={_runs} piece={self._dma_piece_pages}" + _wall
+        if lanes is not None:
+            _wall = f" owner_lanes={m}/{_psz(self)} rows={n * m}" + _wall
         if n_log <= 8 or n_log % 64 == 0 or _timing:
             logger.info("WEG2-ARENA-PAGE-LOAD n=%d rows=%d pages=%d block=%d bytes=%d mode=%s%s (whole pages, layers split on device)",
                         n_log, n, n, B, n * pb, mode, _wall)

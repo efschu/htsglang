@@ -6712,8 +6712,10 @@ class Scheduler(
             from sglang.srt.managers import cache_controller as _cc
             from sglang.srt.weg2 import handoff as _ho
             for _r in hold:
-                if getattr(_r, "_weg2_248_read_at_wake", False):
-                    continue  # #248: its read is issued now -- the keys serve it (park_l3.after_release)
+                if getattr(_r, "_weg2_248_read_at_wake", False) or getattr(_r, "_weg2_248_read_issued", False):
+                    # #248: its read is issued now -- or, F22 WAKE-READ-EARLY, was issued at
+                    # the legs' start -- the keys serve it (park_l3.after_release)
+                    continue
                 _rid = getattr(_r, "rid", None)
                 _cc.WEG2_HANDOFF_PAGE_KEYS.pop(_rid, None)
                 _cc.WEG2_HANDOFF_OFF.pop(_rid, None)
