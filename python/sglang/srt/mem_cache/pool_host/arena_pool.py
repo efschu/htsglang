@@ -1886,6 +1886,41 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         Returns the references dropped."""
         return ArenaMHAHostPool.release_queued_rows(self, host_indices)
 
+    def secure_rows_to_l3(self, host_indices) -> dict:
+        """W3-ARENA (kvs2 0929, P PP0 12:30:55): give every COMPLETE arena page
+        these host rows address an L3 copy -- the #257 (d) write
+        (``arena_secure_to_disk``) -- WITHOUT freeing the slot. The tree's
+        spill (``UnifiedRadixCache._w3_arena_spill``) calls it before it hands
+        its reference back: the clock (``_evict_for_claim``) takes only
+        UNREFERENCED slots, and every COMPLETE slot of a live tree carries the
+        tree's reference, so a page the tree still held could never reach L3
+        and the arena stayed full (74751x ARENA-DROP freed=0, written=0).
+
+        Rows of a pending (un-acked) write are not COMPLETE and are skipped
+        (``arena_ref_slots``' own rule). Returns ``{pages, on_disk, written,
+        lost}``; the caller releases the rows only when ``lost`` is 0."""
+        out = {"pages": 0, "on_disk": 0, "written": 0, "lost": 0}
+        arena = getattr(self, "arena", None)
+        if arena is None or host_indices is None:
+            return out
+        slots = arena_ref_slots(self, host_indices)
+        if not int(slots.numel()):
+            return out
+        out["pages"] = int(slots.numel())
+        secure = getattr(getattr(self, "_backend", None), "arena_secure_to_disk", None)
+        if not callable(secure):
+            out["lost"] = out["pages"]
+            return out
+        total = int(getattr(self, "_page_bytes", 0) or getattr(arena, "slot_bytes", 0) or 0)
+        # key 0/0: arena_secure_to_disk names the page by the slot header's
+        # stem (arena.slot_stem), the same name the clock evict writes under
+        sec = secure(arena, [(int(s), 0, 0, total) for s in slots.tolist()])
+        for k in ("on_disk", "written", "lost"):
+            out[k] = int(sec.get(k, 0))
+        ArenaMHAHostPool._257_written_to_l3 = (
+            getattr(ArenaMHAHostPool, "_257_written_to_l3", 0) + out["written"])
+        return out
+
     def _evict_for_claim(self, arena, need: int, claim_stem: Optional[str] = None) -> int:
         """H81 (27B 479f6eccb0): make room for a claim that found no free
         slot -- free the ``need`` oldest UNREFERENCED complete slots (the
