@@ -570,6 +570,44 @@ def _reap_orphan_claims(arena) -> list:
     return freed
 
 
+_RELEASE_N = [0, 0, 0]  # calls that kept a slot, slots kept, slots freed
+
+
+def _release_fresh(arena, slots, gens, site: str) -> None:
+    """#1427r: give up claims this rank took FRESH. A fresh claim is only
+    fresh for the rank that came first -- under the #239 token cut every rank
+    of the D group claims each page (the attention host of share 0 with no
+    extents, often first), the KV owners JOIN it. Freeing the slot whole moved
+    the generation under them: their merge came back LOST ('#1427 ARENA-COMPLETE
+    LOST ... recycled under the writer', z30n TP1/TP2 on the same slots, never
+    TP0) and a page they had completed already went with it. arena.c
+    arena_release_claims frees only a slot this rank alone claimed; a joined
+    or COMPLETE slot stays for its other writers. An arena without it (a
+    hermetic fake) frees as before."""
+    slots = [int(s) for s in slots]
+    if not slots:
+        return
+    rel = getattr(arena, "release_claims", None)
+    if not callable(rel):
+        arena.free_slots(slots)
+        return
+    st = rel(slots, [int(g) for g in gens])
+    kept = sum(1 for x in st if x == 1)
+    if kept:
+        freed = sum(1 for x in st if x == 0)
+        _RELEASE_N[0] += 1
+        _RELEASE_N[1] += kept
+        _RELEASE_N[2] += freed
+        k = _RELEASE_N[0]
+        if k <= 16 or (k & (k - 1)) == 0:
+            logger.warning(
+                "#1427r CLAIM-RELEASE site=%s fresh=%d freed=%d kept=%d stale=%d n=%d kept_total=%d "
+                "(a claim this rank took first and gave up before its ack: the slots other writers "
+                "joined or completed stay theirs -- before #1427r they were freed and their merge "
+                "came back LOST)", site, len(slots), freed, kept, len(slots) - freed - kept, k,
+                _RELEASE_N[1])
+
+
 def _page_slots(pool, rows: torch.Tensor) -> torch.Tensor:
     """x59: token rows of whole pages -> one slot per page (the P consecutive
     ids of each page, in order; anything else is a caller handing tokens of
@@ -1653,7 +1691,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             if bool(bad.any()):
                 fresh = slots[st == 0]
                 if fresh.size:
-                    arena.free_slots(fresh.tolist())
+                    _release_fresh(arena, fresh.tolist(), gens[st == 0].tolist(), "claim_refused")
                 joins = np.nonzero(st == 1)[0]
                 if joins.size and hasattr(arena, "unclaim"):
                     arena.unclaim(slots[joins].tolist(), gens[joins].tolist())  # #231
@@ -1927,9 +1965,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 done = [slot for slot, st, _ in got if st == 2]
                 if done:
                     arena.ref_slots(done, -1)   # #1424f: taken above, the claim is refused
-                fresh = [s for s, st, _ in got if st == 0]
+                fresh = [(s, g) for s, st, g in got if st == 0]
                 if fresh:
-                    arena.free_slots(fresh)
+                    _release_fresh(arena, [s for s, _ in fresh], [g for _, g in fresh], "claim_refused")
                 joins = [(s, g) for s, st, g in got if st == 1]
                 if joins and hasattr(arena, "unclaim"):
                     arena.unclaim([s for s, _ in joins], [g for _, g in joins])  # #231
@@ -2319,13 +2357,13 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         references taken on complete pages."""
         if self.arena is None:
             return
-        fresh, refd, joined, jgens = [], [], [], []
+        fresh, fgens, refd, joined, jgens = [], [], [], [], []
         if self._pending_mask is not None:
             all_t = torch.as_tensor([s for s in self._slots_of(host_indices) if s >= 0], dtype=torch.int64)
             if all_t.numel():
                 m, sel, g, fr = self._pend_take(all_t)
                 refd = all_t[~m].tolist()
-                fresh = sel[fr].tolist()
+                fresh, fgens = sel[fr].tolist(), g[fr].tolist()
                 joined, jgens = sel[~fr].tolist(), g[~fr].tolist()
         else:
             for s in self._slots_of(host_indices):
@@ -2336,13 +2374,14 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     refd.append(s)
                 elif p[1]:
                     fresh.append(s)
+                    fgens.append(p[0])
                 else:
                     joined.append(s)
                     jgens.append(p[0])
         if joined and hasattr(self.arena, "unclaim"):
             self.arena.unclaim(joined, jgens)   # #231: this writer is no longer open on the slot
         if fresh:
-            self.arena.free_slots(fresh)
+            _release_fresh(self.arena, fresh, fgens, "abort_write")
         if refd:
             self.arena.ref_slots(refd, -1)
         if self.row_slot is not None:
@@ -2417,23 +2456,24 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 if bool((~fr).any()) and hasattr(self.arena, "unclaim"):
                     self.arena.unclaim(sel[~fr].tolist(), _g[~fr].tolist())   # #231
                 if fresh:
-                    self.arena.free_slots(fresh)
+                    _release_fresh(self.arena, fresh, _g[fr].tolist(), "free_pending")
                 slots = st_[~m].tolist()
             else:
                 pend = [s for s in slots if s in self._pending]
                 if pend:
-                    fresh, joined, jgens = [], [], []
+                    fresh, fgens, joined, jgens = [], [], [], []
                     for s in pend:
                         p = self._pend_pop(s)
                         if p[1]:
                             fresh.append(s)
+                            fgens.append(p[0])
                         else:
                             joined.append(s)
                             jgens.append(p[0])
                     if joined and hasattr(self.arena, "unclaim"):
                         self.arena.unclaim(joined, jgens)   # #231: a join freed unwritten is no longer open
                     if fresh:
-                        self.arena.free_slots(fresh)
+                        _release_fresh(self.arena, fresh, fgens, "free_pending")
                     slots = [s for s in slots if s not in pend]
             if slots:
                 self.arena.ref_slots(slots, -1)
