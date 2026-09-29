@@ -2681,6 +2681,12 @@ class Envs:
     #   bs2 x 128k, every other wake S0, needle MATCH, no death). Inert without a
     #   stage form (< 2 stage tokens): the 27B never gets one.
     SGLANG_WEG2_D_KV_STAGE_BY_DEMAND = EnvBool(True)
+    # 29.09. (Nutzer 12:35Z, Grundgesetz): KV stages BELOW the booked S0 at this
+    #   granularity (floor, 2 x floor, ... < S0, e.g. 32768). The plan still
+    #   books S0; the KV between the floor and S0 is born unmapped and funds
+    #   expert rows that the wake / the D-MEM-SCHED tick turn off as the known
+    #   tokens grow. 0 = no stage below S0, byte-identical.
+    SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS = EnvInt(0)
     # #254: how a prefill forward that overflows the scratch region is split.
     #   "token"  (default) -- waves are disjoint TOKEN subsets; every wave
     #     re-fetches the spill experts its tokens need, so a spill expert is
