@@ -2837,7 +2837,8 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
     ns._d_kv_stage_written = {"host": host_rank, "rows": tab.rows, "seat_raw": seat_raw,
                               "op_max": op_raw if op_max is not None else None,
                               "worker_rows": {int(t.host_rank): int(t.rows)
-                                              for t in worker_tabs}}
+                                              for t in worker_tabs},
+                              "cut_workers": [int(r) for r in cut_workers]}
     if waves_to is not None:
         ns._d_kv_stage_written["waves_raw"] = env.get(er.POOL_OVERFLOW_WAVES_ENV)
     caps = " ".join("n=%d:%s" % (i + 1, "/".join(str(c) for c in cs))
@@ -4662,7 +4663,16 @@ def refuse_flip_under_token_cut(ns, boot_form) -> Optional[str]:
     tier is the wired form: the line names what carries the cut and is
     returned. A flip boot without one is refused by name (a dry run prints
     the line with 'would refuse' and returns it; a real boot raises
-    :class:`Weg2TokenCutFlipNotWired`)."""
+    :class:`Weg2TokenCutFlipNotWired`).
+
+    The KV stages (29.09., S3h lifted where S3g holds): ONE operator-named
+    stage passes as before. Stages the operator does not name are the
+    launcher's to write (#251c + S3g: stage rows per KV rank, each from its
+    own trim cell) -- this riegel runs before the plan, so it lets them
+    through provisionally and ``refuse_flip_stage_form_without_trim_cells``
+    decides after the FRACTION-SOLVE. More than one operator-named stage stays
+    refused: the launcher writes no per-rank rows for them, a KV worker would
+    meet the top stage untrimmed."""
     if boot_form is None or boot_form.kv != "qsa_forma_dcp" or getattr(ns, "d_only", False):
         return None
     from sglang.srt import rank_role
@@ -4678,13 +4688,14 @@ def refuse_flip_under_token_cut(ns, boot_form) -> Optional[str]:
             "arena L2 and the canonical store (the D workers read their owner "
             "rows of P's pages), and this boot has neither")
     stages = d_kv_stage_tokens_named(ns)
-    if stages is None or len(stages) != 1:
+    if stages is not None and len(stages) != 1:
         why.append(
-            "the D KV stage form is %s -- under the cut exactly ONE stage "
-            "(--env-d %s=<tokens>): #251c raises max_total to the top stage on "
-            "every rank and a KV-holding worker would build its pool for it "
-            "(S3g open)" % ("not named" if stages is None else "%d stages %s" % (len(stages), list(stages)),
-                            D_KV_STAGE_KEYS[0]))
+            "the D KV stage form is operator-named with %d stages %s -- the "
+            "launcher writes no stage rows per KV rank for it (S3g: each KV "
+            "worker trims only with its own trim cell in the plan), a KV-holding "
+            "worker would build its pool for the top stage; name ONE stage "
+            "(--env-d %s=<tokens>) or leave it to the launcher"
+            % (len(stages), list(stages), D_KV_STAGE_KEYS[0]))
     if why:
         msg = (f"{KV_TOKEN_CUT_FLIP_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} "
                "(form kv=qsa_forma_dcp) in a FLIP boot refused -- "
@@ -4693,16 +4704,74 @@ def refuse_flip_under_token_cut(ns, boot_form) -> Optional[str]:
             print(msg + " (dry run: would refuse)", flush=True)
             return msg
         raise Weg2TokenCutFlipNotWired(msg)
+    stage_text = (
+        f"({D_KV_STAGE_KEYS[0]}={stages[0]}) " if stages is not None else
+        "(KV-Stufen vom Launcher: Stufenzeilen je KV-Rang aus seiner Trim-Zelle, "
+        "S3g -- Entscheid nach dem FRACTION-SOLVE, ohne Trim-Zelle je KV-Worker "
+        "benannte Verweigerung) ")
     msg = (f"{KV_TOKEN_CUT_FLIP_MARKER} ERLAUBT: --d-kv-token-cut {ns.d_kv_token_cut} "
-           f"({D_KV_STAGE_KEYS[0]}={stages[0]}) "
+           + stage_text +
            "im Flip-Boot -- Traeger: das eine Arena-L2 und der kanonische "
            "Seitenspeicher (P schreibt ganze Seiten, die KV-Worker lesen ihre "
            "Owner-Zeilen, Tail-Adopt je Owner), Claim = Gruppen-MIN (Worker nur "
-           "im MIN-Arm), Wake-Kredit je Rang gegen die eigene Karte, eine "
-           "KV-Stufe (#251c-Stufenform aus bis S3g). Metall-Marker: "
+           "im MIN-Arm), Wake-Kredit je Rang gegen die eigene Karte. Metall-Marker: "
            "'#239 F14 KV-WORKER-WINDOW' auf TP1/TP2, 'WEG2-WAKE-KV-FIRST' je Rang, "
            "kein 'DRAFT-DISAGREE'.")
     print(msg, flush=True)
+    return msg
+
+
+def refuse_flip_stage_form_without_trim_cells(ns, boot_form, log) -> Optional[str]:
+    """#239 S3h after the FRACTION-SOLVE (29.09.): the flip boot under the
+    token cut whose KV stages the operator left to the launcher.
+
+    Called right before every flip D start (dry run, real), after the last
+    D solve wrote -- or dropped -- the stage form. None for every other form,
+    for ``--d-only`` and for an operator-named stage (the pre-plan riegel
+    decided those). Otherwise every rank the cut gives FA KV must carry its
+    own stage rows in the written form (``_d_kv_stage_written``: the rows
+    from its trim cell, ``kv_stage_trim_cell``); a dropped form or a KV
+    worker without rows is refused by name -- the flip boot does not fall
+    back to fixed tokens silently. A dry run prints 'would refuse' and returns
+    the line; a real boot raises :class:`Weg2TokenCutFlipNotWired`."""
+    if boot_form is None or boot_form.kv != "qsa_forma_dcp" or getattr(ns, "d_only", False):
+        return None
+    w = getattr(ns, "_d_kv_stage_written", None)
+    if not w and d_kv_stage_tokens_named(ns) is not None:
+        return None  # operator-named (one stage, the riegel let it through)
+    why = None
+    if not w:
+        why = ("keine Stufenform geschrieben (Zeile 'D-KV-STUFEN (#251c): entfaellt' im "
+               "FRACTION-SOLVE nennt den Grund) -- die KV-Worker haben keine Trim-Zelle im "
+               "Plan; feste Token nur mit genau EINER benannten Stufe (--env-d %s=<tokens>)"
+               % D_KV_STAGE_KEYS[0])
+    else:
+        cut = [int(r) for r in (w.get("cut_workers") or ())]
+        rows = {int(r): int(x) for r, x in (w.get("worker_rows") or {}).items()}
+        if -1 in cut:
+            why = "der Schnitt ist ungeloest -- welche Worker KV halten, ist nicht bekannt"
+        else:
+            lacking = [r for r in cut if rows.get(r, 0) <= 0]
+            if lacking:
+                why = ("KV-Worker Rang %s ohne eigene Stufenzeilen (Trim-Zelle) in der "
+                       "geschriebenen Form %s -- er baute seinen FA-KV-Pool auf der obersten "
+                       "Stufe ungetrimmt" % (",".join(str(r) for r in lacking), rows))
+    if why:
+        msg = (f"{KV_TOKEN_CUT_FLIP_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} "
+               "(form kv=qsa_forma_dcp) in a FLIP boot refused -- KV-Stufen: " + why
+               + ". The cut boots with --d-only either way.")
+        if getattr(ns, "dry_run", False):
+            log(msg + " (dry run: would refuse)")
+            return msg
+        raise Weg2TokenCutFlipNotWired(msg)
+    per_rank = " ".join("rang%d: %d" % (r, rows[r]) for r in sorted(rows))
+    msg = (f"{KV_TOKEN_CUT_FLIP_MARKER} STUFEN ERLAUBT: jeder KV-Worker %s traegt seine "
+           "Stufenzeilen aus der eigenen Trim-Zelle (%s; TP0 %d) -- S3g greift im Flip-Boot. "
+           "Metall-Marker: '#251c KV-STAGE form=' mit trims_here=True auf TP0 UND den "
+           "KV-Workern, 'D-KV-STUFEN RESIDENZ (#239 S3g) rang1/rang2' im FRACTION-SOLVE, "
+           "kein 'Weg2DSeatVramRefused ... holds full-attention KV', kein W171."
+           % (",".join(str(r) for r in cut), per_rank, int(w["rows"])))
+    log(msg)
     return msg
 
 
@@ -23174,6 +23243,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_ratio.op_line)
         log(d_tokvec.line)
+        refuse_flip_stage_form_without_trim_cells(ns, getattr(ns, "weg2_boot_form", None), log)
         refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
         env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
@@ -23303,6 +23373,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.line)
     log(d_ratio.op_line)
     log(d_tokvec.line)
+    refuse_flip_stage_form_without_trim_cells(ns, getattr(ns, "weg2_boot_form", None), log)
     refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
     env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
