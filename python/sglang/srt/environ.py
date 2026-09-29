@@ -869,6 +869,13 @@ class Envs:
     # set, no swap, no fence; graphed rounds print 'split unavailable:
     # graph-replay-reader-off'. Per rank env (set it in group D).
     SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES = EnvBool(False)
+    # DECODE ROUND DEPTH (#239 S3f A/B, 29.09.): the 'Decode rank batch' line
+    # carries ', depth: min/median/max' -- the KV length of every running
+    # request (prompt + output tokens, host-side lists only) -- so rounds
+    # can be compared at equal bs AND depth ('#full token' of 'Decode batch'
+    # is pool occupancy incl. the radix cache, not a request's depth). No
+    # device work, no graph change; off: one attribute test per round.
+    SGLANG_DEBUG_DECODE_ROUND_DEPTH = EnvBool(False)
     # LRU_WARM_FROM_HANDOFF (H29b): after rearm_after_wake the free LRU rows
     # of every pool layer are filled with P's most-routed experts of the last
     # LRU_WARM_TOKENS prompt tokens (no new VRAM: only rows the reinit left
@@ -2629,6 +2636,15 @@ class Envs:
     # the counters at the wake. Unset (default) = off: no tensor, no op, the
     # captured graph is unchanged. Input of the planner's hot-set stage.
     SGLANG_DEBUG_MOE_HEAT = EnvStr(None)
+    # #239 S3f miss record (layers/moe/pool_miss_cost.py): the records root
+    # of the line (``.../records/<line>``, IPC plan section 2.2 req. 7 / VRAM
+    # contract M3) turns it on. Each D rank sums the pool.fetch device ms of
+    # its split decode rounds and the rows every pool layer missed, and writes
+    # one JSON record per rank at its sleep into ``<root>/<model_id>/owned_miss/``
+    # (next to the #276 heat record). The launcher's owned solve reads the same
+    # directory and prices a missed row with it instead of the seed. Unset
+    # (default) = off: one cached bool test per round and per pool sync.
+    SGLANG_WEG2_OWNED_MISS_RECORD = EnvStr(None)
     # H95c (Nutzer 26.09.: "1,6gb experten cache kostet es nur bei tatsaechlich
     # 6 sitzen"): D's per-seat posts are PHYSICALLY backed only for the seats
     # the phase occupies (n = d_seats.phase_seats of the wake's handoff_n); the

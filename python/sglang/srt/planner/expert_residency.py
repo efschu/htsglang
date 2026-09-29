@@ -866,6 +866,174 @@ def owned_cut_request(kv_token_shares) -> Tuple[bool, Optional[Tuple[float, ...]
 #: replaces it (RECORD > BUILTIN > UNMEASURED, H94).
 OWNED_MISS_MS_PER_ROW_SEED: Tuple[float, float] = (0.1, 0.2)
 OWNED_MISS_MS_SOURCE_SEED = "Saat UNMEASURED (plan_s3_251 §1, H29/x138)"
+#: #239 S3f miss record (29.09., z30w: the round rule moved misses from the
+#: 5090 to TP1 and the round got slower at bs1/bs2 -- the solve steered on
+#: the seed). The measured cost of one missed row per MoE layer and card:
+#:
+#: * RECORD -- written by the D RANKS themselves at their sleep
+#:   (``layers.moe.pool_miss_cost``, ``SGLANG_WEG2_OWNED_MISS_RECORD=<dir>``):
+#:   pool.fetch device ms / missed rows of every pool layer, per rank;
+#: * LOG-BOOTSTRAP -- ``weg2.tools.owned_miss_record`` from one D log, the
+#:   TRANSITION ("aus Log (Uebergang)") until the first rank record exists;
+#:   it ranks under every rank record and is dropped once one is there;
+#: * BUILTIN -- the profile constant ``OWNED_MISS_MS``;
+#: * UNMEASURED -- the seed above (H94 rule, one tier more).
+OWNED_MISS_KIND = "owned_miss_ms"
+OWNED_MISS_RANK_KIND = "owned_miss_rank"
+OWNED_MISS_RECORD = "RECORD"
+OWNED_MISS_LOG_BOOTSTRAP = "LOG-BOOTSTRAP"
+OWNED_MISS_BUILTIN = "BUILTIN"
+OWNED_MISS_UNMEASURED = "UNMEASURED"
+OWNED_MISS_LOG_PROVENANCE = "aus Log (Uebergang)"
+#: rank records within this span before the youngest one form one measurement
+#: (a boot's phases); older ones belong to another form and are not mixed in
+OWNED_MISS_RANK_WINDOW_S = 6 * 3600.0
+
+
+def read_owned_miss_records(path: Optional[str]) -> List[Dict[str, object]]:
+    """The log-bootstrap entries (``owned_miss_ms``) of the sidecar; a missing
+    or broken sidecar is an ABSENCE (``[]``), never a zero."""
+    if not path:
+        return []
+    import json
+
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    entries = data.get("samples") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict) and e.get("kind") == OWNED_MISS_KIND]
+
+
+def read_owned_miss_rank_records(directory: Optional[str]) -> List[Dict[str, object]]:
+    """The rank records the D ranks wrote (``pool_miss_cost.flush``); a missing
+    directory or an unreadable file is skipped, never read as a zero."""
+    if not directory:
+        return []
+    import json
+    import os
+
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        if not (name.startswith("owned_miss_") and name.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(directory, name)) as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and rec.get("kind") == OWNED_MISS_RANK_KIND:
+            out.append(rec)
+    return out
+
+
+def _owned_miss_pair(value: object) -> Optional[Tuple[float, float]]:
+    try:
+        pair = tuple(float(x) for x in value)  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return None
+    if len(pair) != 2 or not all(x > 0 for x in pair):
+        return None
+    return pair  # type: ignore[return-value]
+
+
+def _owned_miss_model_ok(model: Optional[str], entry_model: object) -> bool:
+    """H87: a record speaks for the checkpoint it was measured on, or for one
+    with the same memory footprint (``weg2.form.footprint_key``)."""
+    if entry_model is None or model is None:
+        return entry_model is None
+    if str(entry_model).rstrip("/") == str(model).rstrip("/"):
+        return True
+    import os
+
+    if os.path.basename(str(entry_model).rstrip("/")) == os.path.basename(str(model).rstrip("/")):
+        return True
+    try:
+        from sglang.srt.weg2 import form as _form
+
+        mine, _ = _form.footprint_key(str(model))
+        theirs, _ = _form.footprint_key(str(entry_model))
+    except Exception:  # noqa: BLE001 -- an unreadable checkpoint is no match
+        return False
+    return mine is not None and mine == theirs
+
+
+def owned_miss_from_rank_records(
+    records: Sequence[Mapping[str, object]], *, host: int, model: Optional[str] = None,
+) -> Optional[Tuple[Tuple[float, float], str]]:
+    """``((host ms, worker ms), source)`` from the ranks' own records of this
+    model -- the youngest window (``OWNED_MISS_RANK_WINDOW_S``), host = the
+    attention host's rank, worker = the miss-weighted cost of the others --
+    or ``None`` when the window lacks the host or every worker."""
+    mine = []
+    for r in records:
+        if r.get("kind") != OWNED_MISS_RANK_KIND or not _owned_miss_model_ok(model, r.get("model")):
+            continue
+        try:
+            t, rank = float(r["time_unix"]), int(r["rank"])
+            fetch, rows = float(r["fetch_ms"]), int(r["miss_rows"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if fetch > 0 and rows > 0:
+            mine.append((t, rank, fetch, rows))
+    if not mine:
+        return None
+    newest = max(t for t, *_ in mine)
+    window = [m for m in mine if m[0] >= newest - OWNED_MISS_RANK_WINDOW_S]
+    hf = sum(f for _, r, f, _ in window if r == int(host))
+    hr = sum(n for _, r, _, n in window if r == int(host))
+    wf = sum(f for _, r, f, _ in window if r != int(host))
+    wr = sum(n for _, r, _, n in window if r != int(host))
+    if hr <= 0 or wr <= 0:
+        return None
+    return (hf / hr, wf / wr), "RECORD Rang-Records (%d Phasen-Records, %d+%d Zeilen)" % (
+        len(window), hr, wr)
+
+
+def resolve_owned_miss_ms(
+    records: Sequence[Mapping[str, object]] = (),
+    *,
+    rank_records: Sequence[Mapping[str, object]] = (),
+    host: int = 0,
+    model: Optional[str] = None,
+    builtin: Optional[Sequence[float]] = None,
+    builtin_source: str = "",
+) -> Tuple[Tuple[float, float], str, str]:
+    """``(ms per missed row (host, worker), tier, source)`` for the owned
+    solve: the ranks' own RECORD, else the LOG-BOOTSTRAP (youngest log entry
+    of this model, named "aus Log (Uebergang)" -- ignored as soon as any rank
+    record exists), else the BUILTIN profile constant, else the seed, named
+    UNMEASURED. An entry without two positive costs is skipped, never read as
+    a zero."""
+    from_ranks = owned_miss_from_rank_records(rank_records, host=host, model=model)
+    if from_ranks is not None:
+        return from_ranks[0], OWNED_MISS_RECORD, from_ranks[1]
+    best: Optional[Tuple[str, Tuple[float, float], Mapping[str, object]]] = None
+    for e in records:
+        if e.get("kind", OWNED_MISS_KIND) != OWNED_MISS_KIND:
+            continue
+        pair = _owned_miss_pair(e.get("miss_ms_per_row"))
+        if pair is None or not _owned_miss_model_ok(model, e.get("model")):
+            continue
+        at = str(e.get("at") or "")
+        if best is None or at >= best[0]:
+            best = (at, pair, e)
+    if best is not None:
+        e = best[2]
+        return best[1], OWNED_MISS_LOG_BOOTSTRAP, "%s %s (%s, %s Runden)" % (
+            OWNED_MISS_LOG_PROVENANCE, e.get("source") or e.get("boot_tag") or "?",
+            best[0] or "?", e.get("rounds", "?"))
+    pair = _owned_miss_pair(builtin) if builtin is not None else None
+    if pair is not None:
+        return pair, OWNED_MISS_BUILTIN, "BUILTIN %s" % (builtin_source or "OWNED_MISS_MS")
+    return OWNED_MISS_MS_PER_ROW_SEED, OWNED_MISS_UNMEASURED, OWNED_MISS_MS_SOURCE_SEED
 #: #239 S3f (main 28.09.): the ATTENTION and LSE posts of T_r, named, SEED,
 #: UNMEASURED -- without them the solve saw only expert misses and put the
 #: whole FA-KV on one worker (desk probe 524k: cut 0/64/0). Per full-attention
@@ -3226,8 +3394,15 @@ def plan_d_residency(
     kv_token_shares: object = None,
     kv_dcp_cell_bytes: int = 0,
     kv_dtype_bytes: int = 0,
+    owned_miss_ms: Optional[Sequence[float]] = None,
+    owned_miss_source: str = "",
 ) -> DResidencyPlan:
     """Der D-FRACTION-SOLVE mit den Metallregeln, fuer ``launcher``.
+
+    #239 S3f Miss-Record (29.09.): ``owned_miss_ms`` = die Kosten je
+    verfehlter Expertenzeile (Host, Worker) aus :func:`resolve_owned_miss_ms`
+    mit ``owned_miss_source``; ohne sie rechnet der Eigentums-Solve mit der
+    Saat wie bisher (byte-gleich).
 
     #239: ``kv_token_shares`` + ``kv_dcp_cell_bytes`` bucht den Token-Schnitt
     der Voll-Attention-KV ueber die D-Raenge (uneven DCP unter Form A, siehe
@@ -3496,10 +3671,14 @@ def plan_d_residency(
             return tuple(int(c.ceiling_max_rows) for c in cs) if cs else None
 
         _x1_scope = owned_x1_scope()
+        _miss_ms = (tuple(float(x) for x in owned_miss_ms) if owned_miss_ms is not None
+                    else OWNED_MISS_MS_PER_ROW_SEED)
+        _miss_src = (owned_miss_source or "ohne Herkunft") if owned_miss_ms is not None \
+            else OWNED_MISS_MS_SOURCE_SEED
         sol = solve_owned_cut(
             lambda rat, sh: _solve(sh, None, rat), base_rat, host,
             num_experts=int(terms.num_experts), n_layers=int(terms.n_layers),
-            ids_per_step=ids, card_rows=_card_rows, fa_layers=fa_layers,
+            ids_per_step=ids, miss_ms=_miss_ms, card_rows=_card_rows, fa_layers=fa_layers,
             rows_per_round=int(verify), forced_shares=_forced_shares,
             x1_scope=_x1_scope)
         owner_record = (
@@ -3509,8 +3688,8 @@ def plan_d_residency(
             ("cut", list(sol.cut)),
             ("fractions", [round(x, 4) for x in sol.fractions]),
             ("round_ms", [round(x, 3) for x in sol.round_ms]),
-            ("miss_ms_per_row", list(OWNED_MISS_MS_PER_ROW_SEED)),
-            ("miss_ms_source", OWNED_MISS_MS_SOURCE_SEED),
+            ("miss_ms_per_row", list(_miss_ms)),
+            ("miss_ms_source", _miss_src),
             ("attn_ms_per_row", list(OWNED_ATTN_MS_PER_ROW_SEED)),
             ("attn_floor_ms", OWNED_ATTN_FLOOR_MS_SEED),
             ("lse_ms_per_layer", OWNED_LSE_MS_PER_LAYER_SEED),
@@ -3556,8 +3735,8 @@ def plan_d_residency(
                        else ""),
                    sol.candidates, OWNED_RATIO_STEP, sol.feasible, sol.solves,
                    sol.elapsed_s,
-                   "/".join("%g" % x for x in OWNED_MISS_MS_PER_ROW_SEED),
-                   OWNED_MISS_MS_SOURCE_SEED, ids, fa_layers, OWNED_ATTN_SOURCE_SEED,
+                   "/".join("%g" % x for x in _miss_ms),
+                   _miss_src, ids, fa_layers, OWNED_ATTN_SOURCE_SEED,
                    int(kv_tokens)),
             )
             if max(sol.round_ms) > max(sol.base_round_ms) + 1e-9:
@@ -3565,12 +3744,12 @@ def plan_d_residency(
                 # objective ends above Form A -- named, so the record keeps it
                 cut_lines = cut_lines + (
                     "%s FRACTION-SOLVE %s D-EIGENTUM (#239 S3f) ZIELFORM max T_r %.2f > "
-                    "Form A max %.2f: +%.2f ms je Runde bs1 (Rang %d, Saat UNMEASURED -- "
-                    "M1 misst); die beste Form des ganzen Suchraums (%d Kandidaten, Eigentum "
+                    "Form A max %.2f: +%.2f ms je Runde bs1 (Rang %d, Fehlgriff-Kosten %s); "
+                    "die beste Form des ganzen Suchraums (%d Kandidaten, Eigentum "
                     "in beide Richtungen) -- keine haelt x1 und Form A zugleich"
                     % (marker, label, max(sol.round_ms), max(sol.base_round_ms),
                        max(sol.round_ms) - max(sol.base_round_ms),
-                       sol.round_ms.index(max(sol.round_ms)), sol.candidates),
+                       sol.round_ms.index(max(sol.round_ms)), _miss_src, sol.candidates),
                 )
         else:
             owner_refusal = (

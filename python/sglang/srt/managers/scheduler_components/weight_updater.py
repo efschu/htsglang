@@ -8862,6 +8862,15 @@ class SchedulerWeightUpdaterManager:
                 rank=self._weg2_rank(), group="D", reason="sleep",
                 phase_index=_weg2_flip_index_of(getattr(recv_req, "epoch", None)),
             )
+            # #239 S3f: the rank's miss cost of this phase (off unless
+            # SGLANG_WEG2_OWNED_MISS_RECORD names a directory; never raises)
+            from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
+
+            _miss_cost.flush(
+                rank=self._weg2_rank(), group="D", reason="sleep",
+                model=getattr(self._weg2_server_args(), "model_path", None),
+                phase_index=_weg2_flip_index_of(getattr(recv_req, "epoch", None)),
+            )
 
         assert (
             self._weg2_sleep_idle()

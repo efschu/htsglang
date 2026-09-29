@@ -12948,6 +12948,38 @@ def d_activation_record(profile: Optional[str] = None) -> Tuple[Optional[List[Op
     return [None if v is None else float(v) for v in vals], _pconst_boots("D_ACTIVATION_MIB", profile)
 
 
+def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
+                    ) -> Tuple[Optional[Tuple[float, float]], str]:
+    """#239 S3f Miss-Record (29.09.): the owned solve's cost per missed expert
+    row (host, worker). RECORD = the D ranks' own records in group D's
+    ``SGLANG_WEG2_OWNED_MISS_RECORD`` directory (``layers.moe.pool_miss_cost``)
+    > LOG-BOOTSTRAP (sidecar entry of ``weg2.tools.owned_miss_record``, "aus
+    Log (Uebergang)", dropped once a rank record exists) > BUILTIN (profile
+    constant ``OWNED_MISS_MS``) > UNMEASURED. The env names the records root
+    of the line; the records of this model lie in its
+    ``<model_id>/owned_miss`` (``pool_miss_cost.record_dir_for``). ``(None, "")`` when nothing is
+    measured -- the solve then keeps its seed, byte-identical."""
+    from sglang.srt.planner import expert_residency as _er
+
+    profile = ns.profile
+    try:
+        builtin = list(_pconst("OWNED_MISS_MS", profile))
+        builtin_src = _pconst_boots("OWNED_MISS_MS", profile)
+    except (KeyError, TypeError):
+        builtin, builtin_src = None, ""
+    from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
+
+    root = str(env_d.get("SGLANG_WEG2_OWNED_MISS_RECORD", "") or "").strip()
+    rank_dir = _miss_cost.record_dir_for(root, ns.model) if root else None
+    ms, tier, src = _er.resolve_owned_miss_ms(
+        _er.read_owned_miss_records(measured_record_path()),
+        rank_records=_er.read_owned_miss_rank_records(rank_dir), host=int(host),
+        model=ns.model, builtin=builtin, builtin_source=builtin_src)
+    if tier == _er.OWNED_MISS_UNMEASURED:
+        return None, ""
+    return ms, src
+
+
 def d_overshoot_record(profile: Optional[str] = None) -> Tuple[Optional[List[int]], str]:
     """``D_OVERSHOOT_MIB`` (peak - budget, the qwen27b record), or ``(None, "")``
     for a profile that prices D's awake excess as ``D_AWAKE_REST_MIB`` instead
@@ -17437,6 +17469,14 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     _act_rec, _act_src = (d_activation_record(ns.profile) if card_terms is not None
                           else (None, ""))
     _derive_waves = bool(getattr(ns, "d_pool_waves_derived", False))
+    # #239 S3f Miss-Record: measured cost per missed expert row, else the seed
+    _miss_ms, _miss_src = d_owned_miss_ms(
+        ns, env_d=_env_d,
+        host=next((i for i, v in enumerate(tp_ratio) if float(v) > 0), 0))
+    if _miss_ms is not None:
+        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN (#239 S3f): "
+            f"{_miss_ms[0]:g}/{_miss_ms[1]:g} ms je Zeile (Host/Worker) aus {_miss_src} "
+            f"statt der Saat")
     # #239: the token cut of the full-attention KV (None = off, byte-identical)
     _kv_cut = d_kv_token_cut(ns)
     _pinned = getattr(ns, "_d_map_form", None)
@@ -17488,6 +17528,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             activation_record_mib=_act_rec,
             activation_record_source=_act_src,
             derive_waves=_derive_waves,
+            owned_miss_ms=_miss_ms,
+            owned_miss_source=_miss_src,
             **_kv_cut_kw,
         )
         if _ledger is not None and plan.refusal is not None and plan.fits:
@@ -17525,6 +17567,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                     activation_record_mib=_act_rec,
                     activation_record_source=_act_src,
                     derive_waves=_derive_waves,
+                    owned_miss_ms=_miss_ms,
+                    owned_miss_source=_miss_src,
                     **_kv_cut_kw,
                 )
         if d_stated_seats(ns) is not None:
@@ -17616,6 +17660,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             activation_record_mib=_act_rec,
             activation_record_source=_act_src,
             derive_waves=_derive_waves,
+            owned_miss_ms=_miss_ms,
+            owned_miss_source=_miss_src,
             **_seat_cut_kw,
     ), label):
         log(_ln)
