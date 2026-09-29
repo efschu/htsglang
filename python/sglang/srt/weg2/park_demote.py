@@ -81,13 +81,19 @@ def demote_once(backend, pools: Iterable, *, state: Optional[dict] = None, batch
             if state.get(key):
                 continue
             t0 = time.perf_counter()
-            tot = {"written": 0, "on_disk": 0, "absent": 0, "bytes": 0}
+            tot = {"written": 0, "on_disk": 0, "absent": 0, "missing": 0, "busy": 0, "bytes": 0}
             for i in range(0, len(stems), batch):
                 r = copy(arena, stems[i:i + batch])
                 for k in tot:
                     tot[k] += int(r.get(k, 0))
             l3 = tot["written"] + tot["on_disk"]
             full = l3 >= len(stems)
+            if prole == "anchor" and not full:
+                # the anchor pool keeps ANCHOR_TAIL_KEYS candidate pages and the
+                # end anchor sits on exactly one of them: the other one has no
+                # slot at all (`missing`), it is not a page to copy. Done once
+                # the existing one is on disk and nothing is merely busy.
+                full = l3 >= 1 and tot["busy"] == 0 and l3 + tot["missing"] >= len(stems)
             if full:
                 state[key] = True
             if tot["written"] or full:
@@ -97,9 +103,11 @@ def demote_once(backend, pools: Iterable, *, state: Optional[dict] = None, batch
                 if tot["written"]:
                     logger.info(
                         "#248 PARK-DEMOTE rid=%s role=%s pool=%s pages=%d written=%d l3_pages=%d absent=%d "
-                        "bytes=%d ms=%.0f (kept span copied to L3 without a free: a claim may now take it "
-                        "without I/O, the wake reads it back)", rid, role, prole, len(stems), tot["written"],
-                        l3, tot["absent"], tot["bytes"], rec["ms"])
+                        "(missing=%d busy=%d) complete=%d bytes=%d ms=%.0f (kept span copied to L3 without a "
+                        "free: a claim may now take it without I/O, the wake reads it back; anchor pool: one "
+                        "of its two candidate pages has no slot by design)", rid, role, prole, len(stems),
+                        tot["written"], l3, tot["absent"], tot["missing"], tot["busy"], int(full),
+                        tot["bytes"], rec["ms"])
     for k in [k for k in state if k not in live]:
         state.pop(k, None)
     return done_now
