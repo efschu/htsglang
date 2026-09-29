@@ -473,9 +473,10 @@ class ModelProfile:
     #: world_pool 559232 -> 557472).
     driver_carve_min_total_mib: int = 0
     #: Fix B (weg2/p_row_authority.py): SGLANG_WEG2_P_ROW_AUTHORITY, the #631
-    #: row form on group P. OFF on every row (operator 27.09.: the default turns
-    #: only after a clean metal proof under agent load); a proof boot switches
-    #: it on per docker profile (profiles/27b-row-authority.env, ``_form``).
+    #: row form on group P (effective on pp>1 only). Operator 27.09.: the
+    #: default turns only after a clean metal proof under agent load -- met by
+    #: w109290020 (29.09.), qwen27b on since; nextflash off. An explicit env
+    #: wins (=0 turns the 27B row off).
     p_row_authority: bool = False
     #: 27B row 24h (HG): :data:`HG_SWITCHES` on as ONE bundle -- they were
     #: measured only together: dkr27bint8dhgbar1dhg109261456 against
@@ -694,6 +695,14 @@ PROFILES: Dict[str, ModelProfile] = {
         # drq preset has no A/B of its own -- inventory class b).
         d_token_placement="bandwidth",
         d_token_placement_formats=("int8",),
+        # Fix B (#631): the agent-load proof w109290020 (dkr27browauthority
+        # bar1w109290020, bb82fbcb68, 29.09. 00:20-00:54Z): K0 RowAuthority
+        # Incomplete/PpChainRecvStalled/proxy frame 0, SLOT DISAGREEMENT/W27/
+        # UNEXECUTABLE 0; K1 P-ROW-AUTHORITY armed 3, ROW-DELIVER 300, DISABLED
+        # 0; K2 P-ROW-COST PP2 plan_ms p50 1.7 / p90 6.3, drained = delivered =
+        # 840, vanish 0; K3 PACED-ADMIT 24. RISK: z30x2 died under it at the
+        # P->D flip (write-through drain); its fix 4e15b21564 awaits z30x3.
+        p_row_authority=True,
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,

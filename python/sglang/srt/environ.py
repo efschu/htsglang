@@ -3232,8 +3232,8 @@ class Envs:
     # so the group votes 2 and the extend is skipped again. Off = the refusal.
     SGLANG_WEG2_ENABLE_CUT_WORKER_END = EnvBool(False)
     # Fix B (weg2/p_row_authority.py): the #631 row form on group P
-    # (ModelProfile.p_row_authority: off on every row until the metal proof);
-    # the proof boot sets it per docker profile (27b-row-authority.env).
+    # (ModelProfile.p_row_authority: qwen27b on since the agent-load proof
+    # w109290020 29.09., nextflash off); explicit wins, no form off.
     SGLANG_WEG2_P_ROW_AUTHORITY = EnvBool(_profile_default("SGLANG_WEG2_P_ROW_AUTHORITY", False))
     # H91d: the L2 bound of those buffers per rank (MiB). A FLIP park whose
     # buffer would pass it goes to L3 (a file under

@@ -41,8 +41,9 @@ class Switches(unittest.TestCase):
     def test_registry_rows_off_and_profile_default_followed(self):
         from sglang.srt.weg2 import form as F
 
-        for pid, row in F.PROFILES.items():
-            self.assertIs(row.switch_defaults()[PR.ENV], False, pid)
+        # 29.09.: qwen27b on after the agent-load proof w109290020; NF off.
+        self.assertIs(F.PROFILES["qwen27b"].switch_defaults()[PR.ENV], True)
+        self.assertIs(F.PROFILES["nextflash"].switch_defaults()[PR.ENV], False)
         with mock.patch.object(F, "profile_switch_default", lambda name, fb, env=None: name == PR.ENV):
             self.assertTrue(PR.enabled({}))
             self.assertFalse(PR.enabled({PR.ENV: "0"}), "an explicit env wins")
