@@ -184,6 +184,40 @@ def _start_ref_census(arena: "ShmArena") -> None:
         th.start()
 
 
+# #1427s: ARENA-FREE per reason -> [calls, slots] (process-wide, for the throttle)
+_FREE_BY_REASON: dict = {}
+
+
+def _note_free(reason: str, slots) -> None:
+    """#1427s (operator order after z30p): EVERY slot free names its reason
+    -- 'who frees the slot' took a boot to answer because ARENA-FREE only
+    logged its first 16 calls with a stack. One line per reason, throttled
+    per reason (the first 8 calls, then every power of two), with the
+    reason's running call and slot totals; an ``unnamed`` caller still gets
+    the xsn328 stack so the missing name can be found."""
+    n = len(slots)
+    cnt = _FREE_BY_REASON.setdefault(reason, [0, 0])
+    cnt[0] += 1
+    cnt[1] += n
+    k = cnt[0]
+    if k <= 8 or (k & (k - 1)) == 0:
+        caller = ""
+        if reason == "unnamed":
+            import traceback as _tb
+            caller = " caller=" + "".join(_tb.format_stack(limit=5)[:-2]).strip().replace("\n", " | ")[-300:]
+        logger.info("ARENA-FREE reason=%s slots=%d first=%s calls=%d slots_total=%d%s",
+                    reason, n, (list(slots)[:4] if n else []), k, cnt[1], caller)
+
+
+def free_named(arena, slots, reason: str) -> None:
+    """#1427s: ``arena.free_slots(slots, reason=reason)`` for every caller; a
+    hermetic fake arena without the keyword frees as before."""
+    try:
+        arena.free_slots(slots, reason=reason)
+    except TypeError:
+        arena.free_slots(slots)
+
+
 def _ledger_for(path: str, slots: int) -> RefLedger:
     key = (os.path.realpath(path), int(slots))
     with _lock:
@@ -256,6 +290,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_unclaim.argtypes = [p_u8, i64, p_i64, p_i64]
             lib.arena_release_claims.restype = i64
             lib.arena_release_claims.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
+            lib.arena_ival_cap.restype = i64
+            lib.arena_ival_cap.argtypes = [p_u8]
             lib.arena_stats.restype = None
             lib.arena_stats.argtypes = [p_u8, p_i64]
             lib.arena_find_slots.restype = i64
@@ -713,19 +749,22 @@ class ShmArena:
         off = int(self._lib.arena_slot_ptr(self._base, int(slot))) - int(self._base.value)
         return memoryview(self._mm)[off:off + int(nbytes)]
 
-    def free_slots(self, slots: Sequence[int]) -> None:
-        # xsn328: who frees which slots (D's dormant re-reads found P's pages FREE/CLAIMED again)
-        _fn = getattr(type(self), "_free_log_n", 0) + 1
-        type(self)._free_log_n = _fn
-        if _fn <= 16 or _fn % 256 == 0:
-            import traceback as _tb
-            _caller = "".join(_tb.format_stack(limit=4)[:-1]).strip().replace("\n", " | ")[-300:]
-            logger.info("ARENA-FREE n=%d slots=%d first=%s caller=%s", _fn, len(slots), (list(slots)[:3] if slots else []), _caller)
+    def free_slots(self, slots: Sequence[int], reason: str = "unnamed") -> None:
+        """Free ``slots`` (any state) -- the generation moves on, a writer
+        still holding the old one gets status 3 at its completion. Every
+        free names its ``reason`` (#1427s, see _note_free)."""
         n = len(slots)
+        _note_free(reason, slots)
         if n == 0:
             return
         c = (ctypes.c_int64 * n)(*[int(s) for s in slots])
         self._lib.arena_free_slots(self._base, n, c)
+
+    @property
+    def ival_cap(self) -> int:
+        """#1427s: coverage intervals one slot can hold before its completion
+        overflows (arena.c ival_cap_for)."""
+        return int(self._lib.arena_ival_cap(self._base))
 
     def drop_unreferenced(self, slots: Sequence[int]) -> int:
         """fnFL2 H19: free the COMPLETE slots nobody references any more --
@@ -759,7 +798,8 @@ class ShmArena:
         cg = (ctypes.c_int64 * n)(*[int(g) for g in gens])
         return int(self._lib.arena_unclaim(self._base, n, cs, cg))
 
-    def release_claims(self, slots: Sequence[int], gens: Sequence[int]) -> list[int]:
+    def release_claims(self, slots: Sequence[int], gens: Sequence[int],
+                       reason: str = "release") -> list[int]:
         """#1427r: a direct writer gives up claims it took FRESH. A slot is
         freed only when this writer was its sole claimant (status 0); a slot
         other writers joined -- or already completed -- stays theirs and only
@@ -772,7 +812,11 @@ class ShmArena:
         cg = (ctypes.c_int64 * n)(*[int(g) for g in gens])
         st = (ctypes.c_int8 * n)()
         self._lib.arena_release_claims(self._base, n, cs, cg, st)
-        return list(st)
+        out = list(st)
+        freed = [int(slots[i]) for i, x in enumerate(out) if x == 0]
+        if freed:
+            _note_free(reason, freed)
+        return out
 
     def stats(self) -> dict:
         out = (ctypes.c_int64 * 4)()

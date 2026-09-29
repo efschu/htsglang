@@ -37,6 +37,7 @@ from sglang.jit_kernel.hicache import (
 )
 
 from sglang.srt.mem_cache.pool_host.base import NO_KV_RANK_TOKENS
+from sglang.srt.mem_cache.storage.file.hicache_arena import free_named
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2 import handoff_pending as _handoff_pending
@@ -589,9 +590,12 @@ def _release_fresh(arena, slots, gens, site: str) -> None:
         return
     rel = getattr(arena, "release_claims", None)
     if not callable(rel):
-        arena.free_slots(slots)
+        free_named(arena, slots, site)
         return
-    st = rel(slots, [int(g) for g in gens])
+    try:
+        st = rel(slots, [int(g) for g in gens], reason=site)
+    except TypeError:  # a hermetic fake without the reason keyword
+        st = rel(slots, [int(g) for g in gens])
     kept = sum(1 for x in st if x == 1)
     if kept:
         freed = sum(1 for x in st if x == 0)
@@ -606,6 +610,78 @@ def _release_fresh(arena, slots, gens, site: str) -> None:
                 "joined or completed stay theirs -- before #1427r they were freed and their merge "
                 "came back LOST)", site, len(slots), freed, kept, len(slots) - freed - kept, k,
                 _RELEASE_N[1])
+
+
+_COMPLETE_LOST = {3: 0, 4: 0, 5: 0}  # arena_complete status -> slots lost, process-wide
+_COMPLETE_LOST_CALLS = [0]
+_LOST_NAMES = {3: "recycled", 4: "not_claimed", 5: "overflow"}
+
+
+def _note_complete_lost(st, slots, site: str) -> int:
+    """#1427s: a completion the arena refused, by NAMED reason -- 3 = the
+    slot was recycled under the writer (generation moved), 4 = it is no
+    longer CLAIMED in this generation, 5 = the page's coverage-interval list
+    overflowed (arena.c ival_cap_for; z30n/z30p: every page D's token-cut
+    owners wrote, 768 intervals against a cap of 64, was logged as
+    'recycled under the writer' and never became readable). Returns the
+    number of lost slots; one throttled line per call that lost any."""
+    by = {}
+    bad = []
+    for s_, r in zip(slots, st):
+        r = int(r)
+        if r >= 3:
+            by[r] = by.get(r, 0) + 1
+            bad.append(int(s_))
+    if not bad:
+        return 0
+    for r, c in by.items():
+        _COMPLETE_LOST[r] = _COMPLETE_LOST.get(r, 0) + c
+    _COMPLETE_LOST_CALLS[0] += 1
+    k = _COMPLETE_LOST_CALLS[0]
+    if k <= 8 or (k & (k - 1)) == 0 or 5 in by:
+        (logger.error if 5 in by else logger.warning)(
+            "#1427 ARENA-COMPLETE LOST site=%s recycled=%d not_claimed=%d overflow=%d slots=%s "
+            "calls=%d totals=recycled:%d,not_claimed:%d,overflow:%d",
+            site, by.get(3, 0), by.get(4, 0), by.get(5, 0), bad[:4], k,
+            _COMPLETE_LOST[3], _COMPLETE_LOST[4], _COMPLETE_LOST[5])
+    return len(bad)
+
+
+_COVERAGE_SEEN = set()
+
+
+def _check_owner_row_coverage(arena, window, owner_rows, own, layers: int) -> None:
+    """#1427s: under the #239 token cut a page's coverage list must hold the
+    owners' interleaved token rows until the last owner completes it. The
+    worst moment is one row of every two missing in every (K|V, layer) block:
+    2 x L x ceil(P / 2) intervals (NF D, P=64, 12 attention layers: 768).
+    The arena's per-slot capacity (arena.c ival_cap_for) must cover that and
+    this rank's own extents, or no page this rank writes can ever complete
+    -- refused by name at bind instead of a boot of 'ARENA-COMPLETE LOST'.
+    An arena without the capacity accessor (a hermetic fake) is not checked."""
+    cap_of = getattr(type(arena), "ival_cap", None)
+    if cap_of is None:
+        return
+    cap = int(arena.ival_cap)
+    P = int(owner_rows[0])
+    merged = 0
+    end = None
+    for o, l in sorted(own or []):
+        if end is None or o > end:
+            merged += 1
+        end = max(end or 0, o + l)
+    need = max(merged, 2 * int(layers) * ((P + 1) // 2))
+    key = (getattr(arena, "path", id(arena)), tuple(int(x) for x in owner_rows))
+    if need > cap:
+        raise RuntimeError(
+            f"#1427s OWNER-ROWS COVERAGE REFUSED rows={tuple(owner_rows)} extents={merged} "
+            f"need={need} cap={cap} page_bytes={int(window.total_bytes)}: the arena slot's "
+            "coverage list cannot hold the token-cut owners' interleaved rows -- every "
+            "page this rank writes would stay CLAIMED (unreadable) for ever")
+    if key not in _COVERAGE_SEEN:
+        _COVERAGE_SEEN.add(key)
+        logger.info("#1427s OWNER-ROWS COVERAGE rows=%s extents=%d need=%d cap=%d page_bytes=%d verdict=ok",
+                    tuple(owner_rows), merged, need, cap, int(window.total_bytes))
 
 
 def _page_slots(pool, rows: torch.Tensor) -> torch.Tensor:
@@ -1075,6 +1151,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 else [(int(o), int(l)) for o, l in window.extents]
             )
             owner_tok = owner_page_tokens(owner_rows)
+            _check_owner_row_coverage(arena, window, owner_rows, own, int(self.layer_num))
         else:
             ext = [(int(o), int(l)) for o, l in window.extents]
         if len(ext) == 1 and ext[0][0] == 0 and ext[0][1] == int(window.total_bytes):
@@ -1883,7 +1960,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     l3_state[2] += int(sec.get("lost", 0))
                 else:
                     l3_state[2] += len(cands)
-                arena.free_slots([c[0] for c in cands])
+                free_named(arena, [c[0] for c in cands], "claim_room")
                 stems = getattr(arena, "_stems", None)
                 if isinstance(stems, dict):
                     for c in cands:
@@ -2053,16 +2130,13 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 # PP2 -- the dict is empty once the mask carries the state)
                 _m, sel, gens_t, _f = self._pend_take(sl)
                 st_np = self.arena.complete_slots_np(sel.numpy(), gens_t.numpy(), self._own_extents)
-                lost = int((st_np == 3).sum())
+                _note_complete_lost(st_np.tolist(), sel.tolist(), "producer")
             else:
                 gens = [self._pending[s][0] for s in sl.tolist()]
                 st = self.arena.complete_slots(sl.tolist(), gens, self._own_extents)
-                lost = 0
-                for s, r in zip(sl.tolist(), st):
+                for s in sl.tolist():
                     self._pend_pop(s)
-                    lost += int(r == 3)
-            if lost:
-                logger.warning("#1427 ARENA-COMPLETE LOST %d draft page(s) under the producer", lost)
+                _note_complete_lost(st, sl.tolist(), "producer")
         if complete_idx:
             # _claim took a reader reference on already-complete pages; the
             # producer holds none.
@@ -2323,14 +2397,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             if sel.numel() == 0:
                 return 0
             st = self.arena.complete_slots_np(sel.numpy(), gens.numpy(), self._own_extents)
-            lost = int((st == 3).sum())
-            if lost:
-                k = getattr(ArenaMHAHostPool, "_1427_lost_n", 0) + lost
-                ArenaMHAHostPool._1427_lost_n = k
-                if k <= 8 or k % 256 < lost:
-                    logger.warning("#1427 ARENA-COMPLETE LOST slots=%s (recycled under the writer) n=%d",
-                                   sel.numpy()[st == 3][:4].tolist(), k)
-            keep = sel.numpy()[st != 3]
+            _note_complete_lost(st.tolist(), sel.tolist(), "complete_write")
+            keep = sel.numpy()[st <= 2]
             if keep.size:
                 self.arena.ref_slots(keep.tolist(), +1)
             return int((st == 1).sum())
@@ -2342,14 +2410,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         done = 0
         for s, r in zip(slots, st):
             self._pend_pop(s)
-            if r == 3:
-                k = getattr(ArenaMHAHostPool, "_1427_lost_n", 0) + 1
-                ArenaMHAHostPool._1427_lost_n = k
-                if k <= 8 or k % 256 == 0:
-                    logger.warning("#1427 ARENA-COMPLETE LOST slot=%d (recycled under the writer) n=%d", s, k)
-                continue
             done += int(r == 1)
-        self.arena.ref_slots([s for s, r in zip(slots, st) if r != 3], +1)
+        _note_complete_lost(st, slots, "complete_write")
+        self.arena.ref_slots([s for s, r in zip(slots, st) if r <= 2], +1)
         return done
 
     def abort_write(self, host_indices: torch.Tensor) -> None:

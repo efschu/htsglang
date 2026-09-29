@@ -35,6 +35,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _free_named(arena, slots, reason: str) -> None:
+    """#1427s: ARENA-FREE with a named reason (hicache_arena.free_named;
+    imported here, the storage.file package imports this module)."""
+    from sglang.srt.mem_cache.storage.file.hicache_arena import free_named
+
+    free_named(arena, slots, reason)
+
 #: HICACHE-DRAFT-TIER (user order 2026-09-24, see environ.py): the one
 #: rank-side reader of the switch. Measured reason (boot weg2xsn420, the P
 #: side without a draft producer): the draft arena (720896 slots x 10240 B =
@@ -3078,7 +3086,7 @@ class HiCacheFile(HiCacheStorage):
             _stop = next((i for i, _st in cand if out[i] is None and i not in _mine), n)
             _past = [t[1] for t in todo if t[0] > _stop]
             if _past:
-                arena.free_slots(_past)
+                _free_named(arena, _past, "l3fill_past_prefix")
                 todo = [t for t in todo if t[0] < _stop]
             for i, _st in cand:
                 if i > _stop:
@@ -3103,7 +3111,7 @@ class HiCacheFile(HiCacheStorage):
                 else:
                     bad.append(todo[k][1])
         if bad:
-            arena.free_slots(bad)
+            _free_named(arena, bad, "l3fill_complete_refused")
         k = getattr(self, "_1433_n", 0) + 1
         self._1433_n = k
         if k <= 8 or k % 256 == 0:
@@ -3131,7 +3139,7 @@ class HiCacheFile(HiCacheStorage):
         if not cands:
             return 0
         moved = self.arena_secure_to_disk(arena, cands)["written"]
-        arena.free_slots([c[0] for c in cands])
+        _free_named(arena, [c[0] for c in cands], "evict_to_disk")
         arena.reap_stale()
         stems = getattr(arena, "_stems", {})
         for c in cands:
