@@ -2106,7 +2106,8 @@ def named_error_chunk(path: str, message: str) -> bytes:
     """TN: one error event in the wire of ``path`` (Anthropic ``event: error``,
     else an OpenAI-style ``data: {"error": ...}`` chunk)."""
     if path == "/v1/messages":
-        body = {"type": "error", "error": {"type": "overloaded_error", "message": message}}
+        # W88/W50 529: the 503 type, never overloaded_error (= 529 to the client)
+        body = {"type": "error", "error": {"type": STATE_REFUSAL_ANTHROPIC_TYPE, "message": message}}
         return b"event: error\ndata: " + json.dumps(body).encode() + b"\n\n"
     body = {"error": {"message": message, "type": "overloaded_error", "code": 503}}
     return b"data: " + json.dumps(body).encode() + b"\n\n"
@@ -2117,6 +2118,35 @@ def named_error_chunk(path: str, message: str) -> bytes:
 #: re-offer loop). One flip pair clears most of those; the number is a hint in
 #: the Retry-After header, never a bound the front enforces.
 STATE_REFUSAL_RETRY_AFTER_S = 5
+
+
+#: W88/W50 529 (29.09., NF dauer09290232 front 03:21:06 weg2-122-144/-126-148
+#: ``LEG2-TERMINAL-NAMED reason=error:W88 ... error_event=forwarded``, 03:22:09
+#: weg2-116-141 ``reason=W50``; D: "Forwarding upstream stream error
+#: (overloaded_error): W88 ...", "... terminal, answered 503"): on the Anthropic
+#: wire ``overloaded_error`` IS the 529 -- Claude Code classifies an error by
+#: that type (a stream has no status to read), reads it as "API overloaded" and
+#: gives up. A state or read refusal is a 503 with Retry-After, so on this wire
+#: it carries Anthropic's 5xx type. ``overloaded_error`` is never a W-code's.
+STATE_REFUSAL_ANTHROPIC_TYPE = "api_error"
+
+_OVERLOADED_TYPE_RE = re.compile(rb'("type"\s*:\s*)"overloaded_error"')
+
+
+def restate_inband_refusal(chunk: bytes, path: str) -> bytes:
+    """W88/W50 529: D's NAMED refusal on the Anthropic wire (an ``event: error``
+    whose message carries a W-code) leaves the front as the 503 type
+    (``STATE_REFUSAL_ANTHROPIC_TYPE``), never ``overloaded_error`` (529).
+    Anything else -- content, an unnamed error, the OpenAI wire -- passes
+    byte for byte."""
+    if path != "/v1/messages" or not chunk or b"overloaded_error" not in chunk:
+        return chunk
+    if b"event: error" not in chunk and b'"type":"error"' not in chunk and b'"type": "error"' not in chunk:
+        return chunk
+    if not _W_CODE_RE.search(chunk.decode(errors="replace")):
+        return chunk
+    return _OVERLOADED_TYPE_RE.sub(
+        lambda m: m.group(1) + b'"' + STATE_REFUSAL_ANTHROPIC_TYPE.encode() + b'"', chunk)
 
 
 def refusal_status(measured_tokens: Optional[int], static_capacity: int) -> int:
@@ -2145,7 +2175,8 @@ def refusal_response(path: str, code: str, detail: str, status: int,
     if path == "/v1/messages":
         body: Dict[str, object] = {
             "type": "error",
-            "error": {"type": "request_too_large" if status == 413 else "overloaded_error",
+            "error": {"type": ("request_too_large" if status == 413
+                               else STATE_REFUSAL_ANTHROPIC_TYPE),
                       "message": detail},
             "code": code}
     else:
@@ -7349,10 +7380,11 @@ class Front:
                             rid, request.path, _eb[:300])
                         return web.json_response(
                             {"type": "error",
-                             "error": {"type": "api_error",
+                             "error": {"type": STATE_REFUSAL_ANTHROPIC_TYPE,
                                        "message": f"WEG2 group D refused rid={rid} before any content: "
                                                   f"{_eb[:400]}"}},
-                            status=503)
+                            status=503,
+                            headers={"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)})
                 _has_content = (stream and r.status == 200 and early_body is None
                                 and stream_has_content(first_chunk, request.path))
                 if _has_content:
@@ -7385,7 +7417,10 @@ class Front:
                         self._x_exact_reprice_queue("inflight")
                     self.counters["span_inflight_credited"] += 1
                 if stream:
-                    resp = web.StreamResponse(status=r.status)
+                    resp = web.StreamResponse(
+                        status=r.status,
+                        headers=({"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)}
+                                 if r.status == 503 else None))
                     resp.content_type = r.content_type
                     await resp.prepare(request)
                     tail = bytearray()
@@ -7482,18 +7517,19 @@ class Front:
 
                     if early_body is not None:
                         # A non-200 whose body this method already consumed
-                        # for the refusal test: forward it verbatim.
-                        await _push(early_body)
+                        # for the refusal test: forward it (W88/W50 529: a
+                        # named refusal restated as the 503 type).
+                        await _push(restate_inband_refusal(early_body, request.path))
                     else:
                         if first_chunk is not None:
-                            await _push(first_chunk)
+                            await _push(restate_inband_refusal(first_chunk, request.path))
                         while True:
                             chunk = await _next_d_chunk()
                             if not chunk:
                                 break
                             if getattr(self, "_rvp_p_done", None) and rid in self._rvp_p_done:
                                 self._rvp_resumed(rid)
-                            await _push(chunk)
+                            await _push(restate_inband_refusal(chunk, request.path))
                     if client_io["gone"] and not client_io["finished"]:
                         # The client left and D's stream ended without an end
                         # marker: not served, exactly as before H61b.
@@ -7707,6 +7743,12 @@ class Front:
                     self.counters["cross_group_prefix_hits"] += 1
                 if not self.identity_checked and pending is not None:
                     self.check_identity()
+                if r.status == 503:
+                    # W88/W50 529: D's non-stream refusal leaves as a 503 with
+                    # Retry-After and the 503 type, never as overloaded_error.
+                    return web.Response(body=restate_inband_refusal(body, request.path),
+                                        status=503, content_type=r.content_type,
+                                        headers={"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)})
                 return web.Response(body=body, status=r.status, content_type=r.content_type)
         except Weg2Stop:
             raise
