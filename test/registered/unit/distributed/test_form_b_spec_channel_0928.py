@@ -78,6 +78,18 @@ def _run(rank, port, out, partition):
             res["bad_k"] = "W186" in str(e)
         res["sizes"] = sizes
         fbs._broadcast = real
+        # F15 (5e): the DFLASH lane accept under Form B -- a head that is not
+        # the lead passes its OWN accept and gets the lead's back (and must adopt)
+        import types as _t
+
+        from sglang.srt.speculative import dflash_worker_v2 as dw
+
+        stub = _t.SimpleNamespace(device="cpu", tp_rank=rank)
+        mine = (torch.tensor([rank, rank]), torch.tensor([10 + rank, 10 + rank]))
+        acc, bon = dw.DFlashWorkerV2._lane_accept_broadcast(
+            stub, 2, *(mine if rank in (0, 1) else (None, None)))
+        res["lane_accept"] = (acc.tolist(), bon.tolist())
+        res["follower"] = dw._form_b_accept_follower(stub)
         fbs.set_spec_k_max(None)
     with open(os.path.join(out, f"{rank}.pkl"), "wb") as f:
         pickle.dump(res, f)
@@ -113,6 +125,9 @@ def test_spec_channel_publishes_k_first_and_keeps_a_fixed_form():
         assert {s[0].split(":")[0] for s in sizes} == {"dcp"} and {s[2] for s in sizes} == {0}
         assert [s[1] for s in sizes] == [1, 6, 18] * 3 + [1]
     assert res[0]["sizes"] == res[1]["sizes"] == res[2]["sizes"]
+    for r in range(3):
+        assert res[r]["lane_accept"] == ([0, 0], [10, 10])        # the lead's, everywhere
+    assert [res[r]["follower"] for r in range(3)] == [False, True, True]
 
 
 def test_without_a_partition_the_channel_is_off():

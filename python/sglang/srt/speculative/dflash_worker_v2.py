@@ -181,6 +181,16 @@ class _DflashDraftSampler:
         self.out[: tokens.shape[0]].copy_(tokens)
 
 
+def _form_b_accept_follower(worker) -> bool:
+    """F15 (5e): a Form B head that is not the lead (it computed an accept of
+    its own and must take the lead's). False on the lane and every other boot."""
+    from sglang.srt.speculative import form_b_spec as fbs
+
+    if not fbs.form_b_spec_active():
+        return False
+    return int(worker.tp_rank) != int(fbs.form_b_lead())
+
+
 def _solo_src_in(group, solo_tp_rank: int) -> int:
     """The solo draft rank (a TP-group rank) as a rank IN ``group``. Classic
     (group IS the TP group) that is ``solo_tp_rank`` itself; under Form B the
@@ -4101,7 +4111,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
 
         if _lane == "head":
-            self._lane_accept_broadcast(bs, accept_len, bonus)
+            _acc, _bon = self._lane_accept_broadcast(bs, accept_len, bonus)
+            # F15 (5e): under Form B there is more than one head; every head but
+            # the LEAD receives here and must ADOPT the lead's decision (its own
+            # near-tie argmax may differ -- the #622 class), then re-derive the
+            # committed block from it. The lane has one head, the sender: its
+            # own values stand, byte-identical.
+            if _form_b_accept_follower(self):
+                accept_len = _acc.to(accept_len.dtype)
+                bonus = _bon.to(bonus.dtype)
+                out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+                new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
 
         # === DFLASH AUDIT (env-gated) ===
         self._audit_mark("accept")
