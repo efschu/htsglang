@@ -390,6 +390,8 @@ PRODUKT_STATUS = ("fertig+aktiv", "im Image aber aus", "Desk", "offen", "unbeleg
 KREUZ_ACHSEN = (("tp", "uneven TP"), ("dcp", "uneven DCP / Token-Schnitt"),
                 ("moe", "uneven Experten-Shard (--rank-moe-ratio)"), ("pp", "PP-Schnitt uneven"),
                 ("forma", "Form A host/worker"), ("kvonly", "KV-only-Rang"))
+# "Soll erreicht?" (Koordinator 29.09.) is separate from the status: fertig+aktiv only says it runs.
+SOLL_ERREICHT = ("ja", "teilweise", "nein")
 KREUZ_STATUS = ("am Metall belegt", "unterstützt", "nur Desk", "nein", "unbelegt")
 _KREUZ_KEYS = [k for k, _ in KREUZ_ACHSEN]
 
@@ -417,6 +419,8 @@ def validate_produkt(prod: list, baustein_ids) -> list:
                 out.append("Produkt %s: ist-Modell %r nicht 27B/NF" % (pid, m))
             elif (x or {}).get("status") not in PRODUKT_STATUS:
                 out.append("Produkt %s: %s status %r nicht %s" % (pid, m, (x or {}).get("status"), "/".join(PRODUKT_STATUS)))
+            elif (x or {}).get("erreicht") and x["erreicht"] not in SOLL_ERREICHT:
+                out.append("Produkt %s: %s erreicht %r nicht %s" % (pid, m, x["erreicht"], "/".join(SOLL_ERREICHT)))
             elif (x or {}).get("belegt_am") and belegt_ts(x["belegt_am"]) is None:
                 out.append("Produkt %s: %s belegt_am %r (ISO, z. B. 2026-09-29T07:10Z)" % (pid, m, x["belegt_am"]))
         for b in p.get("bausteine") or []:
@@ -718,7 +722,7 @@ def produkt_view(prod: list, bausteine: dict, boot_start: Optional[dict] = None)
         for m in MODELS:
             x = (p.get("ist") or {}).get(m) or {}
             ist[m] = {k: _clean(x.get(k)) for k in ("wert", "status", "grund", "beleg", "status_text", "quelle",
-                                                    "belegt_am")}
+                                                    "belegt_am", "erreicht", "erreicht_grund")}
             ist[m]["status"] = ist[m]["status"] or "unbelegt"
             if ist[m]["status"] != "unbelegt" or ist[m]["wert"]:
                 _alter(ist[m], boot_start.get(m))

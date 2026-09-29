@@ -177,6 +177,7 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
 .prod .stale-note { color: var(--warn); font-weight: 650; font-size: 11px; }
 .prod .am { color: var(--muted); font-size: 10.5px; }
 .pill.p-fertig-aktiv { color: var(--good); } .pill.p-im-image-aber-aus { color: var(--warn); } .pill.p-desk { color: var(--bar); }
+.pill.e-ja { color: var(--good); } .pill.e-teilweise { color: var(--warn); } .pill.e-nein { color: var(--bad); }
 .pill.p-offen { color: var(--bad); } .pill.p-unbelegt, .pill.p-entfaellt { color: var(--muted); }
 .kz td, .mx td { font-size: 11.5px; text-align: center; }
 .kz td:first-child, .mx td:first-child, .mx td:nth-child(2) { text-align: left; }
@@ -862,12 +863,16 @@ function prodHtml(d) {
   const achsen = fv.kreuz_achsen || [];
   const nStale = fv.produkt.reduce((n, p) => n + PROD_MODELS.filter((m) => (p.ist[m] || {}).veraltet).length, 0);
   return `<div class="muted" style="margin:-4px 0 8px">${fv.produkt.length} Features &middot; ${nStale} Ist-Zellen veraltet (Beleg &auml;lter als der letzte Boot)</div><div class="tablewrap"><table class="prod">
-    <tr><th>#</th><th>Feature</th><th>Soll</th><th>Ist 27B</th><th>Ist NF</th><th>Status</th><th>Beleg</th><th>Wert im aktuellen Boot</th><th>Bausteine</th></tr>`
+    <tr><th>#</th><th>Feature</th><th>Soll</th><th>Ist 27B</th><th>Ist NF</th><th>Soll erreicht?</th><th>Status</th><th>Beleg</th><th>Wert im aktuellen Boot</th><th>Bausteine</th></tr>`
     + fv.produkt.map((p) => {
       const ist = p.ist || {};
       const st = PROD_MODELS.map((m) => {
         const x = ist[m] || {};
         return `<div>${m}: <span class="pill p-${prodSlug(x.status)}" title="${esc(x.status_text || x.grund || "")}">${esc(x.status || "unbelegt")}</span>${x.grund ? `<div class="am">${esc(x.grund)}</div>` : ""}</div>`;
+      }).join("");
+      const erc = PROD_MODELS.map((m) => {
+        const x = ist[m] || {};
+        return `<div>${m}: ${x.erreicht ? `<span class="pill e-${esc(x.erreicht)}">${esc(x.erreicht)}</span>` : `<span class="muted">&mdash;</span>`}${x.erreicht_grund ? `<div class="am">${esc(x.erreicht_grund)}</div>` : ""}</div>`;
       }).join("");
       const bel = PROD_MODELS.filter((m) => (ist[m] || {}).beleg).map((m) => `<div><b>${m}:</b> ${esc(ist[m].beleg)}${ist[m].quelle ? ` <span class="am">(${esc(ist[m].quelle)})</span>` : ""}</div>`).join("") || `<span class="muted">&mdash;</span>`;
       const akt = PROD_MODELS.map((m) => `<div><b>${m}:</b> ${prodAkt((p.aktuell || {})[m])}</div>`).join("");
@@ -878,8 +883,8 @@ function prodHtml(d) {
         p.marker ? `<details id="pr-${esc(p.id)}"><summary>Instrument-Marker</summary>${Object.entries(p.marker).map(([m, x]) => `<div class="am"><b>${m}:</b> ${esc(x.marker)} &middot; ${Object.entries(x.je_format || {}).map(([f, v]) => esc(f + ": " + v)).join(" &middot; ")}</div>`).join("")}</details>` : "",
       ].join("");
       return `<tr><td class="mono">${esc(p.nr || "")}</td><td><b>${esc(p.titel)}</b></td><td class="soll">${esc(p.soll)}</td>
-        <td class="ist">${prodIst(ist["27B"] || {})}</td><td class="ist">${prodIst(ist.NF || {})}</td><td>${st}</td><td class="bel">${bel}</td><td class="akt">${akt}</td><td>${prodBausteine(p)}</td></tr>`
-        + (extra ? `<tr><td></td><td colspan="8">${extra}</td></tr>` : "");
+        <td class="ist">${prodIst(ist["27B"] || {})}</td><td class="ist">${prodIst(ist.NF || {})}</td><td>${erc}</td><td>${st}</td><td class="bel">${bel}</td><td class="akt">${akt}</td><td>${prodBausteine(p)}</td></tr>`
+        + (extra ? `<tr><td></td><td colspan="9">${extra}</td></tr>` : "");
     }).join("") + `</table></div>`;
 }
 function featHtml(d) {

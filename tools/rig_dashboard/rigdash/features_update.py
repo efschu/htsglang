@@ -150,6 +150,13 @@ def main(argv=None) -> int:
     pi.add_argument("--belegt-am", default=None,
                     help="wann der Beleg entstand (ISO, z. B. 2026-09-29T07:10Z); Default jetzt. Älter als der "
                          "letzte Boot des Modells = 'Ist veraltet, neu messen'")
+    pi.add_argument("--erreicht", choices=features.SOLL_ERREICHT, help="Soll erreicht? (getrennt vom Status)")
+    pi.add_argument("--erreicht-grund", default="")
+    er = sub.add_parser("erreicht", help="nur 'Soll erreicht?' eines Modells setzen, der Rest der Zelle bleibt")
+    er.add_argument("--id", required=True)
+    er.add_argument("--modell", required=True, choices=features.MODELS)
+    er.add_argument("--wert", required=True, choices=features.SOLL_ERREICHT)
+    er.add_argument("--grund", default="", help="woran gemessen, z. B. '119 s gegen Soll ~21 s'")
     kz = sub.add_parser("kreuz", help="Zelle der Kreuztabelle (Feature F2) setzen")
     kz.add_argument("--id", default="F2")
     kz.add_argument("--modell", required=True, choices=features.MODELS)
@@ -264,7 +271,15 @@ def main(argv=None) -> int:
             p = _find_produkt(d, a.id)
             p.setdefault("ist", {})[a.modell] = {k: v for k, v in (
                 ("status", a.status), ("wert", a.wert), ("grund", a.grund), ("beleg", a.beleg),
-                ("belegt_am", _belegt_am(a.belegt_am))) if v}
+                ("belegt_am", _belegt_am(a.belegt_am)), ("erreicht", a.erreicht),
+                ("erreicht_grund", a.erreicht_grund)) if v}
+        elif a.cmd == "erreicht":
+            x = _find_produkt(d, a.id).setdefault("ist", {}).setdefault(a.modell, {"status": "unbelegt"})
+            x["erreicht"] = a.wert
+            if a.grund:
+                x["erreicht_grund"] = a.grund
+            else:
+                x.pop("erreicht_grund", None)
         elif a.cmd == "kreuz":
             p = _find_produkt(d, a.id)
             cells = p.setdefault("kreuztabelle", {}).setdefault("zellen", {}).setdefault(a.modell, {})
@@ -483,8 +498,8 @@ def markdown(view: dict) -> str:
         out.append("- %s-Boot: %s, REV %s, %s%s" % (m, b.get("rc") or b.get("boot_id") or "—", b.get("rev") or "—",
                                                   b.get("lifecycle") or "—",
                                                   " (Override: %s)" % b["override_beleg"] if b.get("override_beleg") else ""))
-    out += ["", "| # | Feature | Soll | Ist 27B | Ist NF | Status 27B / NF | Beleg | Wert im aktuellen Boot 27B / NF | Bausteine |",
-            "|---|---|---|---|---|---|---|---|---|"]
+    out += ["", "| # | Feature | Soll | Ist 27B | Ist NF | Soll erreicht? 27B / NF | Status 27B / NF | Beleg | Wert im aktuellen Boot 27B / NF | Bausteine |",
+            "|---|---|---|---|---|---|---|---|---|---|"]
     for p in view.get("produkt") or []:
         ist = p["ist"]
 
@@ -505,8 +520,12 @@ def markdown(view: dict) -> str:
         for r in p["bausteine"]:
             nf = (r["je_modell"] or {}).get("NF") or next(iter((r["je_modell"] or {}).values()), None)
             bs.append("%s%s" % (r["id"], " [%s/%s]" % (nf["im_image"]["state"], nf["aktiv"]) if nf else ""))
-        out.append("| %s | %s | %s | %s | %s | 27B: %s / NF: %s | %s | 27B: %s / NF: %s | %s |" % (
-            p.get("nr") or "", _cell(p["titel"]), _cell(p["soll"]), val("27B"), val("NF"), st("27B"), st("NF"),
+        def er(m):
+            x = ist[m]
+            return _cell((x.get("erreicht") or "—") + (" (%s)" % x["erreicht_grund"] if x.get("erreicht_grund") else ""))
+        out.append("| %s | %s | %s | %s | %s | 27B: %s / NF: %s | 27B: %s / NF: %s | %s | 27B: %s / NF: %s | %s |" % (
+            p.get("nr") or "", _cell(p["titel"]), _cell(p["soll"]), val("27B"), val("NF"), er("27B"), er("NF"),
+            st("27B"), st("NF"),
             _cell(beleg) or "—", _cell(_aktuell(p, "27B")), _cell(_aktuell(p, "NF")), _cell(", ".join(bs)) or "—"))
     mk = [(p, m, x) for p in view.get("produkt") or [] for m, x in (p.get("marker") or {}).items()]
     if mk:

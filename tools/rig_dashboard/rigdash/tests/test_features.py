@@ -389,6 +389,32 @@ class ProduktCase(unittest.TestCase):
             self.assertIn("## F24 Decode-Matrix 27B", text)
             self.assertIn("alle Zellen ungemessen", text)
 
+    def test_soll_erreicht_is_separate_from_status(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = os.path.join(t, "f.json")
+            with open(p, "w") as fh:
+                json.dump(_prod_doc(), fh)
+            run = lambda *a: features_update.main(["--file", p, *a])
+            run("produkt-ist", "--id", "F1", "--modell", "NF", "--status", "fertig+aktiv", "--wert", "7,06 s",
+                "--beleg", "z30u", "--erreicht", "nein", "--erreicht-grund", "7,06 s gegen Soll <= 3 s")
+            run("erreicht", "--id", "F2", "--modell", "27B", "--wert", "teilweise", "--grund", "KV-only nur Desk")
+            with self.assertRaises(SystemExit):
+                run("erreicht", "--id", "F2", "--modell", "27B", "--wert", "vielleicht")
+            with open(p) as fh:
+                d = json.load(fh)
+            P = {x["id"]: x for x in d["produkt"]}
+            self.assertEqual((P["F1"]["ist"]["NF"]["status"], P["F1"]["ist"]["NF"]["erreicht"]), ("fertig+aktiv", "nein"))
+            self.assertEqual(P["F2"]["ist"]["27B"], {"status": "unbelegt", "erreicht": "teilweise",
+                                                     "erreicht_grund": "KV-only nur Desk"})
+            d["produkt"][0]["ist"]["NF"]["erreicht"] = "fast"
+            self.assertTrue(any("erreicht" in x for x in features.validate_doc(d)))
+            v = features.produkt_view([P["F1"]], {})
+            self.assertEqual(v[0]["ist"]["NF"]["erreicht_grund"], "7,06 s gegen Soll <= 3 s")
+            out = os.path.join(t, "o.md")
+            run("md", "--out", out, "--live-url", "")
+            self.assertIn("Soll erreicht? 27B / NF", open(out).read())
+            self.assertIn("NF: nein (7,06 s gegen Soll <= 3 s)", open(out).read())
+
 
 if __name__ == "__main__":
     unittest.main()
