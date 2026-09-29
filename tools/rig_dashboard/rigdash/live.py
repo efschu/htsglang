@@ -24,7 +24,7 @@ import threading
 import time
 from typing import Dict, List, Optional
 
-from . import parse, redact, stops
+from . import ipcstate, parse, redact, stops
 
 DEFAULT_LOG_GLOBS = [
     "/spinning/docker-acceptance/*/evidence/boot_*.log",
@@ -1343,7 +1343,8 @@ class LiveLogs:
         self.lock = threading.Lock()
         self._last_scan = 0.0
         self.scan_s = 10.0
-        self.harness = stops.HarnessLogs()   # planned stop vs death (stops.py)
+        self.harness = stops.HarnessLogs()   # planned stop vs death (stops.py), boots without a state dir
+        self.ipc = ipcstate.IpcStates()       # the boots' state dirs (IPC §2.2): read before any log
 
     def scan(self, now: Optional[float] = None):
         now = now or time.time()
@@ -1387,6 +1388,7 @@ class LiveLogs:
                         break
                     b.poll()
         self.harness.poll([b.dir for b in boots])
+        self.ipc.poll(now)
 
     def snapshot(self, with_series: bool = True, max_boots: int = 10) -> List[dict]:
         now = time.time()
@@ -1402,8 +1404,13 @@ class LiveLogs:
                 v = b.view(now, with_series and primary)
             v["primary"] = primary
             last_line = max([t for t in b._last_t.values() if t] or [0]) or None
-            v["end"] = stops.classify(b.stem, b.first_t, last_line or b.newest_mtime or None,
-                                      self.harness.for_dir(b.dir))
+            v["ipc"] = self.ipc.for_tag((b.meta or {}).get("tag"), now)
+            if v["ipc"]:
+                v["end"] = stops.classify_ipc(v["ipc"])
+            else:
+                v["end"] = stops.classify(b.stem, b.first_t, last_line or b.newest_mtime or None,
+                                          self.harness.for_dir(b.dir))
+                v["end"]["src"] = "Harness-Log (Übergang)"
             views.append(v)
         views.sort(key=lambda v: (not v["live"], not v["primary"],
                                   v["age_s"] if v["age_s"] is not None else 1e12))

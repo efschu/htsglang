@@ -121,13 +121,16 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     # 4. queued work, no progress
     fr = b.get("front") or {}
     q_front = fr.get("queue")
-    outstanding = sum((fr.get("outstanding") or {}).values()) if fr.get("outstanding") else 0
+    o = fr.get("outstanding")
+    # /weg2/state keeps it per group, the state.json mirror as one number (IPC §2.2 H4)
+    outstanding = (sum(o.values()) if isinstance(o, dict) else int(o or 0)) if o else 0
     q_log = (b.get("queue") or {}).get("queue") if b.get("queue") else None
     q_log_age = _age(now, (b.get("queue") or {}).get("t")) if b.get("queue") else None
     queued = None
     src = None
     if q_front is not None:
-        queued, src = (q_front or 0) + outstanding, "Front /weg2/state (queue %s + outstanding %s)" % (q_front, outstanding)
+        queued, src = (q_front or 0) + outstanding, "%s (queue %s + outstanding %s)" % (
+            fr.get("src") or "Front /weg2/state", q_front, outstanding)
     elif q_log is not None and q_log_age is not None and q_log_age < 600:
         queued, src = q_log, "letzte WEG2-ROUTE-Zeile"
     idle = _age(now, b.get("last_activity_any"))

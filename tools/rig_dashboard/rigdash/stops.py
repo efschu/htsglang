@@ -106,6 +106,37 @@ def classify(stem: str, first_t: Optional[float], last_t: Optional[float], marke
     return out
 
 
+def classify_ipc(ipc: dict) -> dict:
+    """Same answer as ``classify``, from the boot's state dir (IPC §2.2) instead of the
+    harness log: ``lifecycle`` + ``cause``, the events ``deadman_verdict`` / ``front_stop``
+    and ``stop_request.json``.  A death always wins over a planned stop.  Pure, unit-tested."""
+    out = {"planned": None, "death": None, "src": "state.json"}
+    lc, cause = ipc.get("lifecycle"), ipc.get("cause") or {}
+    since = ipc.get("lifecycle_since")
+    code = cause.get("code")
+
+    def death(t, text):
+        if t is not None and (out["death"] is None or t < out["death"]["t"]):
+            out["death"] = {"t": t, "text": text, "src": "state.json"}
+
+    if lc == "dead":
+        death(since, "state.json dead: %s (origin %s, rc %s)" % (code, cause.get("origin"), cause.get("rc")))
+    ev = ipc.get("events") or {}
+    for e in ev.get("deadman_verdict") or ():
+        d = e.get("data") or {}
+        death(e.get("ts"), "event deadman_verdict: %s" % (d.get("tier") or e.get("code")))
+    for e in ev.get("front_stop") or ():
+        d = e.get("data") or {}
+        death(e.get("ts"), "event front_stop: %s" % (d.get("name") or e.get("code")))
+    sr = ipc.get("stop_request")
+    if sr and out["death"] is None:
+        death(ipc.get("stopping_ts") or since, "stop_request.json: %s (origin %s)" % (sr.get("code"), sr.get("origin")))
+    if out["death"] is None and lc in ("stopping", "stopped_clean"):
+        t = ipc.get("stopping_ts") or since
+        out["planned"] = {"t": t, "text": "state.json %s: %s" % (lc, code), "src": "state.json"}
+    return out
+
+
 class HarnessLogs:
     """Tails ``<model dir>/abnahme_cu130.log`` for every model dir with boots."""
 

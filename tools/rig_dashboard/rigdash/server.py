@@ -74,7 +74,8 @@ def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: flo
             death = (b.get("end") or {}).get("death")
             if death:
                 # the harness named it a death (deadman verdict / hold end "Container-tot")
-                reason = "tot (%s)" % ("Deadman" if death.get("src") == "deadman" else "Container-tot")
+                reason = "tot (%s)" % ({"deadman": "Deadman", "state.json": death.get("text") or "state.json"}
+                                       .get(death.get("src"), "Container-tot"))
     keys = [k for k in ser if k.endswith("_tps")]
     if gap_from is not None:
         for k in keys:
@@ -190,6 +191,10 @@ class App:
         fronts = {k: v for k, v in sv.items() if k.startswith("front:")}
         for b in boots:
             b["front"] = sources.front_for_boot(fronts, b["meta"].get("tag"))
+            ipc = b.get("ipc") or {}
+            if b["front"] is None and ipc.get("front") and not ipc.get("terminal"):
+                # the front's own /weg2/state is unreachable: the host's mirror in state.json, not a log line
+                b["front"] = dict(ipc["front"], src="state.json front (Host-Spiegel)")
             b["alarm"] = health.assess(b, now)
         gser = self.src.gpu_series() if with_series else None
         for b in boots:
