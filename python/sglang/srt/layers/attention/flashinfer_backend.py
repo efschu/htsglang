@@ -496,12 +496,27 @@ def _local_attn_head_counts(model_runner: "ModelRunner") -> tuple:
     from sglang.srt.distributed.utils import (
         attn_q_partition_groups,
         attn_q_partition_units,
+        weightless_dcp_head_counts,
+        weightless_kv_active,
     )
 
     mc = model_runner.model_config
     tp_size = get_parallel().attn_tp_size
     tp_rank = get_parallel().attn_tp_rank
     _total_kv = mc.get_total_num_kv_heads()
+    if weightless_kv_active() and not getattr(model_runner, "is_draft_worker", False):
+        # 29.09. (09291353, a3_formb SIGFPE in flashinfer plan): on the
+        # weightless lane / Form B a rank's layers are NOT built by the global
+        # plan over attn_tp_size -- the lane head builds TP=1 (all heads), a
+        # Form B weight rank as one of |W|, a KV worker with 0 heads. The
+        # numbers the layers carry are the lane's head vector
+        # (weightless_dcp_head_counts, the same the DCP merge uses); the global
+        # plan gave the lane head (8, 1) instead of (24, 4), the Form B lead
+        # (18, 2) instead of (18, 3) and the KV-only rank (0, 1) -> a ragged
+        # plan with 0 q heads (integer division by zero in plan()). Same
+        # predicate as FlashInferAttnBackend.weightless_kv.
+        q, kv = weightless_dcp_head_counts(mc.num_attention_heads, _total_kv, tp_size)
+        return int(q[tp_rank]), int(kv[tp_rank])
     num_qo_heads = tp_partition_size(
         mc.num_attention_heads,
         tp_size,
@@ -517,6 +532,31 @@ def _local_attn_head_counts(model_runner: "ModelRunner") -> tuple:
     )
     num_kv_heads = mc.get_num_kv_heads(tp_size, rank=tp_rank)
     return num_qo_heads, num_kv_heads
+
+
+def ragged_plan_needed(uneven_dcp: bool, local_qo_heads: int) -> bool:
+    """Whether the prefill updater plans the RAGGED (current-chunk) wrapper.
+    Off only for an uneven-DCP rank that holds no local head (the weightless
+    KV worker): it never runs that attention, and flashinfer's plan() divides
+    by the head counts (29.09., 09291353 SIGFPE)."""
+    return not (uneven_dcp and int(local_qo_heads) == 0)
+
+
+def flashinfer_plan_head_counts(model_runner: "ModelRunner", uneven_dcp: bool) -> dict:
+    """Every (num_qo_heads, num_kv_heads) pair THIS rank's flashinfer backend
+    hands to a wrapper's plan(), by wrapper -- the numbers the backend's
+    __init__ and its updaters derive (same functions, same order), for a
+    boot-free check (dry run: every planned pair must be > 0 or absent).
+    ``uneven_dcp`` is the backend's own predicate; the full counts it plans
+    the paged/decode wrappers with are the model's totals."""
+    local_q, local_kv = _local_attn_head_counts(model_runner)
+    mc = model_runner.model_config
+    full = (int(mc.num_attention_heads), int(mc.get_total_num_kv_heads()))
+    paged = full if uneven_dcp else (local_q, local_kv)
+    out = {"local": (local_q, local_kv), "decode": paged, "prefill_paged": paged}
+    if ragged_plan_needed(uneven_dcp, local_q):
+        out["prefill_ragged"] = (local_q, local_kv)
+    return out
 
 
 # Use as a fast path to override the indptr in flashinfer's plan function
@@ -880,6 +920,12 @@ class FlashInferAttnBackend(AttentionBackend):
         # (--rank-tp-ratio) picks the decode kernel path from the actual
         # per-rank q/kv shapes (see _local_attn_head_counts).
         _num_qo_heads, _num_kv_heads = _local_attn_head_counts(model_runner)
+        if _num_qo_heads == 0:
+            # A weightless KV worker holds no head: its only wrappers (paged
+            # prefix, decode) are planned with the FULL gathered counts, so the
+            # tensor-core choice follows those (0 // 0 would raise here).
+            _num_qo_heads = model_runner.model_config.num_attention_heads
+            _num_kv_heads = model_runner.model_config.get_total_num_kv_heads()
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=_num_qo_heads,
@@ -8559,7 +8605,13 @@ class FlashInferIndicesUpdaterPrefill:
                 )
 
         # extend part
-        if use_ragged:
+        # 29.09. (09291353): a rank with NO local head (the weightless KV worker
+        # of the lane / Form B) never runs the ragged current-chunk attention
+        # (forward_extend_weightless_worker step 2 skips it); planning it with
+        # 0 q heads is an integer division by zero inside flashinfer's plan().
+        if use_ragged and ragged_plan_needed(
+            self.attn_backend.uneven_dcp, self.dcp_local_qo_heads
+        ):
             # Uneven-DCP: the current chunk is attended with this rank's LOCAL
             # head-sharded q/kv (the full replicated kv-head gather happens only
             # for the paged prefix read + the KV write, not the ragged chunk).

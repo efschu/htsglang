@@ -512,7 +512,7 @@ SEAM_LIST: Tuple[Seam, ...] = (
             ("server_args.py", 11134, "Form B IS the weightless-KV lane with a head SET W"),
             ("rank_form.py", 833, "def install_weightless_heads"),
             ("managers/scheduler.py", 21733, "install_weightless_heads(server_args)"),
-            ("model_executor/model_runner.py", 2873,
+            ("model_executor/model_runner.py", 2890,
              "form_b_build_context(self.tp_rank)"),
         ),
     ),

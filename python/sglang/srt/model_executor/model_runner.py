@@ -437,6 +437,23 @@ def compute_draft_solo_role(server_args, is_draft_worker, tp_rank):
     return tp_rank == solo_rank, tp_rank != solo_rank
 
 
+def draft_solo_host_geometry_ctx(runner):
+    """The weight-TP=1 parallel override a solo draft HOST runner is built
+    under (load_model), for every later phase that derives head/vocab geometry
+    from get_parallel() -- its attention backend first of all. nullcontext for
+    target runners, split placement and shadows (a shadow builds no backend)."""
+    if not getattr(runner, "is_draft_solo_host", False):
+        return contextlib.nullcontext()
+    return get_parallel().override(
+        tp_size=1,
+        tp_rank=0,
+        moe_tp_size=1,
+        moe_tp_rank=0,
+        attn_tp_size=1,
+        attn_tp_rank=0,
+    )
+
+
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
 
@@ -4251,6 +4268,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
+        # 29.09. (09291353, a3_lane: "32 is not divisible by 3" in the DFLASH
+        # draft's flashinfer backend): the solo draft HOST's model is built
+        # under a weight-TP=1 override (load_model), so its backend must read
+        # the same geometry -- outside the override it split the draft's 32
+        # heads over the serving TP=3 (lane) or planned 24/6 for a 32/8 draft
+        # (Form B, ratio plan 77,23,0). Same override as the build and as
+        # eagle_worker_v2._solo_build_ctx; nullcontext for every other runner.
+        with draft_solo_host_geometry_ctx(self):
+            self._init_attention_backend_in_geometry()
+
+    def _init_attention_backend_in_geometry(self):
         if getattr(self, "is_form_a_worker", False):
             # FORM A (fnFA7 20.09.) / #239 S3c: a worker builds no real
             # attention backend -- unless it owns a token range of the
