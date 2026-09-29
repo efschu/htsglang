@@ -167,7 +167,14 @@ class TestZ30wCensus(CustomTestCase):
                                cg_current_bytes=int(1.09 * GIB), cg_ceiling_bytes=84 * GIB)
         a1 = host_ledger.price(int(125.70 * GIB), int(101.96 * GIB), 1, 600, **RING_KW,
                                cg_current_bytes=int(1.09 * GIB), cg_ceiling_bytes=84 * GIB, census=self.t)
-        self.assertAlmostEqual(a1.predicted_run_peak_gib() - a0.predicted_run_peak_gib(), 9.40, delta=0.03)
+        # 29.09. NF 09291634: the run peak also carries 66c46ba763's two
+        # measured shmem posts (this record: arena file 5.78 vs arena priced 0).
+        four = sum(a1.terms[k] for k in ("nonrank_anon_gib", "seq_ring_gib", "arena_sidecar_gib",
+                                         "arena_handoff_gib"))
+        self.assertAlmostEqual(four, 9.40, delta=0.03)
+        self.assertAlmostEqual(a1.predicted_run_peak_gib() - a0.predicted_run_peak_gib(),
+                               four + a1.terms["arena_census_excess_gib"] + a1.terms["unposted_shm_gib"],
+                               delta=1e-6)
         line = host_ledger.arm_terms_line(a1)
         for k in ("nonrank_anon=", "seq_ring=", "arena_sidecar=", "arena_handoff="):
             self.assertIn(k, line)

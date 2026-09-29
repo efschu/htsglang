@@ -3197,12 +3197,41 @@ def census_posts_gib(charges: Optional[Mapping[str, object]]) -> float:
     return sum(max(0.0, float((charges or {}).get(k, 0.0) or 0.0)) for k in CENSUS_POST_KEYS)
 
 
+#: 29.09. NF 09291634 (W21: run peak 101.02 vs 82.53, origin 25.35 from the
+#: z30y2 09291559 D record, stored 39.65): the NAMED tmpfs files this module
+#: charges as their own posts -- the tmpfs expert store (cold_tier_shm 38.97),
+#: the L2 arena file (5.75) and the persistent L3 index. eb73b011d1 changed the
+#: sampler's image instrument from RssShmem (which counted every mapped shmem
+#: page, store and arena included, in every process: NF image 140 GiB,
+#: residual -99) to ``pss_anon_shared`` (anonymous shared mappings only, "named
+#: tmpfs files have their own posts"). From then on these files sit INSIDE the
+#: residual the sampler writes -- and the sampler never subtracts them (its
+#: charge_terms call carries neither store nor arena nor index), so a reader
+#: that charges them as terms counts them twice: 39.65 - 14.30 census = 25.35,
+#: of which 38.97 + 5.75 are the store and the arena the same arm charges again.
+NAMED_SHM_POST_KEYS = ("cold_tier_shm_gib", "arena_gib", "l3_index_gib")
+#: the image instrument whose residual holds the named tmpfs files (above)
+IMAGE_INSTRUMENT_PSS_ANON_SHARED = "pss_anon_shared"
+
+
+def named_shm_posts_gib(charges: Optional[Mapping[str, object]]) -> float:
+    """The named tmpfs posts of one charge dict, summed (0.0 when absent)."""
+    return sum(max(0.0, float((charges or {}).get(k, 0.0) or 0.0)) for k in NAMED_SHM_POST_KEYS)
+
+
 def run_origin_gib(
     cg_nonreclaim_gib: Optional[float], record: Optional[Dict[str, dict]] = None,
     reference_model_ok: Optional[bool] = None, reference_model_why: str = "",
     census_now_gib: float = 0.0,
+    named_shm_now_gib: float = 0.0,
 ) -> Tuple[Optional[float], str]:
     """The origin the RUN PEAK is predicted from, and where it came from.
+
+    ``named_shm_now_gib`` (29.09., :data:`NAMED_SHM_POST_KEYS`): the store,
+    arena and L3-index posts this arm charges. A record sampled with the
+    ``pss_anon_shared`` image instrument holds them inside its residual, so
+    they leave the floor exactly like the census posts; a RssShmem-era record
+    (no ``image_instrument``) subtracted them with its image and is untouched.
 
     THE FIX-8 CORRECTION: the launch-moment reading is a FLOOR, not the origin.
     Measured on two boots one night apart -- weg2dk6 launched into 46.80 GiB and
@@ -3338,10 +3367,17 @@ def run_origin_gib(
     # written before the census existed); what this boot charges above that is
     # taken out of the floor here, so the run peak adds it exactly once.
     _census_out: Dict[int, float] = {}
+    _named_out: Dict[int, float] = {}
     for (_v, _c), _g, _e in _repriced:
         if _v is not None:
             _census_out[id(_e)] = max(
                 0.0, float(census_now_gib or 0.0) - float(_e.get("residual_census_gib") or 0.0))
+            # 29.09. NF 09291634: the named tmpfs posts, once (see
+            # NAMED_SHM_POST_KEYS). Only the instrument that left them in.
+            if _e.get("image_instrument") == IMAGE_INSTRUMENT_PSS_ANON_SHARED:
+                _named_out[id(_e)] = max(0.0, float(named_shm_now_gib or 0.0))
+    for _k, _n in _named_out.items():
+        _census_out[_k] = _census_out.get(_k, 0.0) + _n
     residuals = [
         (v - _census_out.get(id(e), 0.0), g, e, corr)
         for (v, corr), g, e in _repriced if v is not None
@@ -3366,6 +3402,9 @@ def run_origin_gib(
             )
             + (
                 f", -{_census_out[id(entry)]:.2f} census posts charged as their own terms"
+                + (f" (of which {_named_out[id(entry)]:.2f} store+arena+L3-index, "
+                   f"image_instrument={IMAGE_INSTRUMENT_PSS_ANON_SHARED})"
+                   if _named_out.get(id(entry)) else "")
                 if _census_out.get(id(entry)) else ""
             )
             + ")"
@@ -4772,6 +4811,7 @@ def price(
         reference_model_ok=reference_model_ok,
         reference_model_why=reference_model_why,
         census_now_gib=census_posts_gib(charges),
+        named_shm_now_gib=named_shm_posts_gib(charges),
     )
     arm = Arm(
         s_gb=s_gb,
@@ -4859,6 +4899,12 @@ def price(
         "arena_sidecar_gib": float(charges.get("arena_sidecar_gib", 0.0) or 0.0),
         "arena_handoff_gib": float(charges.get("arena_handoff_gib", 0.0) or 0.0),
         "unbooked_shm_gib": float(charges.get("unbooked_shm_gib", 0.0) or 0.0),
+        # 29.09. NF 09291634 (W21 101.02): 66c46ba763's two measured shmem
+        # posts reached `charges` (and so both moments) but not this fresh
+        # literal -- the run peak never carried them (NF 4.90, 27B 2.79 GiB)
+        # while `census_now_gib` netted them out of the residual floor.
+        "arena_census_excess_gib": float(charges.get("arena_census_excess_gib", 0.0) or 0.0),
+        "unposted_shm_gib": float(charges.get("unposted_shm_gib", 0.0) or 0.0),
         "census_source": str(charges.get("census_source", "") or ""),
         "memhist_run_only": bool(charges.get("memhist_run_only", False)),
         "overhead_gib": overhead_gib,
@@ -6014,7 +6060,8 @@ def arm_terms_line(arm) -> str:
            if float(t.get('memhist_gib') or 0.0) else "")
         + (f"l3_index={_g('l3_index_gib')} " if float(t.get('l3_index_gib') or 0.0) else "")
         + (f"cold_tier_shm={_g('cold_tier_shm_gib')} " if float(t.get('cold_tier_shm_gib') or 0.0) else "")
-        + "".join(f"{_k[:-4]}={_g(_k)} " for _k in ("nonrank_anon_gib", "seq_ring_gib", "arena_sidecar_gib", "arena_handoff_gib") if float(t.get(_k) or 0.0))
+        + "".join(f"{_k[:-4]}={_g(_k)} " for _k in ("nonrank_anon_gib", "seq_ring_gib", "arena_sidecar_gib", "arena_handoff_gib",
+                                                     "arena_census_excess_gib", "unposted_shm_gib") if float(t.get(_k) or 0.0))
         + f"overhead={_g('overhead_gib')} xchg_bounce={_g('xchg_bounce_gib')} "
         f"host_weights={_g('host_ring_gib')} "
         f"ratchet_charged={_g('flip_ratchet_charged_gib')} "
