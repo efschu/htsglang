@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-CI_REGISTER_PATH = REPO_ROOT / "python" / "sglang" / "test" / "ci" / "ci_register.py"
+CI_REGISTER_PATH = REPO_ROOT / "python" / "flliper" / "test" / "ci" / "ci_register.py"
 VERSION_HELPER_PATH = REPO_ROOT / "python" / "tools" / "get_version_tag.py"
 PYPROJECT_PATHS = [
     REPO_ROOT / "python" / "pyproject.toml",
@@ -13,7 +13,7 @@ PYPROJECT_PATHS = [
     REPO_ROOT / "python" / "pyproject_npu.toml",
     REPO_ROOT / "python" / "pyproject_other.toml",
     REPO_ROOT / "python" / "pyproject_xpu.toml",
-    REPO_ROOT / "3rdparty" / "amd" / "wheel" / "sglang" / "pyproject.toml",
+    REPO_ROOT / "3rdparty" / "amd" / "wheel" / "flliper" / "pyproject.toml",
 ]
 DESCRIBE_COMMAND = (
     'git_describe_command = ["python3", "python/tools/get_version_tag.py"]'
@@ -102,7 +102,7 @@ class TestGetVersionTag(unittest.TestCase):
 
 class TestFlliperReleaseTags(unittest.TestCase):
     """fLLiper release item 3 (28.09.): a dev install of the fork read 0.5.21.dev6428 -- the
-    version came from UPSTREAM sglang tags. It must come from fLLiper's own release tags
+    version came from UPSTREAM flliper tags. It must come from fLLiper's own release tags
     (annotated, subject 'fLLiper ...'), and an untagged tree is <NEXT_RELEASE>.dev<N>+g<sha>."""
 
     @classmethod

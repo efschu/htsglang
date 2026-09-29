@@ -21,14 +21,14 @@ the first test here and the one that protects every existing caller.
 
 import unittest
 
-from sglang.srt.mem_ledger.boot_history import (
+from flliper.srt.mem_ledger.boot_history import (
     POST_HARDWARE_RESIDUAL,
     POST_LOAD_TRANSIENT,
     BootHistory,
     HistoryBand,
 )
-from sglang.srt.mem_ledger.calibration import CalibrationProfile, CardResidual
-from sglang.srt.mem_ledger.engine import (
+from flliper.srt.mem_ledger.calibration import CalibrationProfile, CardResidual
+from flliper.srt.mem_ledger.engine import (
     LOAD_TRANSIENT_REFERENCE_MIB,
     TERM_HARDWARE_RESIDUAL,
     TERM_LOAD_TRANSIENT,

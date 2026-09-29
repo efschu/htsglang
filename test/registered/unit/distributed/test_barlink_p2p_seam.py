@@ -36,8 +36,8 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.distributed.device_communicators.barlink_bar1 import geometry
-from sglang.srt.distributed.device_communicators.barlink_bar1_p2p import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import geometry
+from flliper.srt.distributed.device_communicators.barlink_bar1_p2p import (
     P2P_LINE_BYTES,
     P2pUnavailable,
     capture_safety,
@@ -48,7 +48,7 @@ from sglang.srt.distributed.device_communicators.barlink_bar1_p2p import (
     p2p_region_bytes,
     p2p_slot_index,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestDirectedSlotAlgebra(CustomTestCase):

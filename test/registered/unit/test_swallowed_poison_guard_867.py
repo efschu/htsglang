@@ -44,7 +44,7 @@ barlink_matrix.py, barlink_ucx.py, mem_cache/kv_vmm_backing.py -- are covered by
 it only to the extent their handlers meet condition 2 directly.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -53,10 +53,10 @@ import pathlib
 import tempfile
 import unittest
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-_PKG = _REPO_ROOT / "python" / "sglang" / "srt"
+_PKG = _REPO_ROOT / "python" / "flliper" / "srt"
 
 #: Tokens whose presence in a guarded body means "this can touch the device".
 #: Attribute names and bare names both count. Kept tight on purpose: every entry
@@ -102,18 +102,18 @@ _COVERED_TOKENS = frozenset({"is_poison_error", "record_poison"})
 #: without anyone reading 117 handlers, which is the point of building it.
 _ACCEPTED: frozenset = frozenset(
     {
-        "python/sglang/srt/debug_utils/spec_state_hash.py:356",
-        "python/sglang/srt/disaggregation/encode_server.py:2112",
-        "python/sglang/srt/distributed/device_communicators/barlink.py:598",
-        "python/sglang/srt/distributed/device_communicators/barlink_bar1.py:4903",
-        "python/sglang/srt/distributed/device_communicators/barlink_device.py:1469",
-        "python/sglang/srt/distributed/device_communicators/barlink_ucx.py:1964",
-        "python/sglang/srt/distributed/device_communicators/barlink_ucx.py:1972",
-        "python/sglang/srt/managers/cache_controller.py:1340",
-        "python/sglang/srt/managers/kv_session_spill_destination.py:914",
-        "python/sglang/srt/managers/phase_flip_seam_census.py:174",
-        "python/sglang/srt/managers/scheduler.py:1619",
-        "python/sglang/srt/utils/common.py:724",
+        "python/flliper/srt/debug_utils/spec_state_hash.py:356",
+        "python/flliper/srt/disaggregation/encode_server.py:2112",
+        "python/flliper/srt/distributed/device_communicators/barlink.py:598",
+        "python/flliper/srt/distributed/device_communicators/barlink_bar1.py:4903",
+        "python/flliper/srt/distributed/device_communicators/barlink_device.py:1469",
+        "python/flliper/srt/distributed/device_communicators/barlink_ucx.py:1964",
+        "python/flliper/srt/distributed/device_communicators/barlink_ucx.py:1972",
+        "python/flliper/srt/managers/cache_controller.py:1340",
+        "python/flliper/srt/managers/kv_session_spill_destination.py:914",
+        "python/flliper/srt/managers/phase_flip_seam_census.py:174",
+        "python/flliper/srt/managers/scheduler.py:1619",
+        "python/flliper/srt/utils/common.py:724",
     }
 )
 

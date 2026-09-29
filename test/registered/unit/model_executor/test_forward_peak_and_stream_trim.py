@@ -19,14 +19,14 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sglang.srt.model_executor.forward_peak import (
+from flliper.srt.model_executor.forward_peak import (
     ForwardPeakTracker,
     maybe_create,
     peak_scope,
 )
-from sglang.srt.model_loader.gguf_shards import ProgressCoupledTrim
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_loader.gguf_shards import ProgressCoupledTrim
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -57,12 +57,12 @@ class _EnvMixin:
 
 class TestForwardPeakTracker(_EnvMixin, CustomTestCase):
     def test_off_by_default(self):
-        self._set("SGLANG_FORWARD_PEAK_PATH", None)
+        self._set("FLLIPER_FORWARD_PEAK_PATH", None)
         self.assertIsNone(maybe_create("tp0"))
 
     def test_on_when_asked(self):
         with tempfile.TemporaryDirectory() as d:
-            self._set("SGLANG_FORWARD_PEAK_PATH", os.path.join(d, "peak"))
+            self._set("FLLIPER_FORWARD_PEAK_PATH", os.path.join(d, "peak"))
             self.assertIsNotNone(maybe_create("tp0"))
 
     def test_records_peak_per_phase_and_bucket(self):
@@ -210,7 +210,7 @@ class TestForwardPeakTracker(_EnvMixin, CustomTestCase):
 
 class TestProgressCoupledTrim(_EnvMixin, CustomTestCase):
     def test_off_by_default(self):
-        self._set("SGLANG_GGUF_STREAM_TRIM_SOFT_GIB", None)
+        self._set("FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB", None)
         t = ProgressCoupledTrim()
         self.assertFalse(t.enabled)
         t.maybe_trim()
@@ -219,7 +219,7 @@ class TestProgressCoupledTrim(_EnvMixin, CustomTestCase):
     def test_refuses_when_swap_is_configured(self):
         """The safety argument -- reclaim cannot touch anon on a swapless box --
         is a property of the HOST, so it is checked rather than assumed."""
-        self._set("SGLANG_GGUF_STREAM_TRIM_SOFT_GIB", 90)
+        self._set("FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB", 90)
         with mock.patch.object(
             ProgressCoupledTrim, "_swapless", staticmethod(lambda: False)
         ):
@@ -230,8 +230,8 @@ class TestProgressCoupledTrim(_EnvMixin, CustomTestCase):
             self.assertTrue(ProgressCoupledTrim().enabled)
 
     def test_quiet_below_the_watermark_and_acts_above_it(self):
-        self._set("SGLANG_GGUF_STREAM_TRIM_SOFT_GIB", 90)
-        self._set("SGLANG_GGUF_STREAM_TRIM_TARGET_GIB", 80)
+        self._set("FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB", 90)
+        self._set("FLLIPER_GGUF_STREAM_TRIM_TARGET_GIB", 80)
         gib = 1 << 30
         with mock.patch.object(
             ProgressCoupledTrim, "_swapless", staticmethod(lambda: True)
@@ -255,8 +255,8 @@ class TestProgressCoupledTrim(_EnvMixin, CustomTestCase):
 
     def test_target_defaults_below_soft(self):
         """A target at or above the soft mark would reclaim on every call."""
-        self._set("SGLANG_GGUF_STREAM_TRIM_SOFT_GIB", 90)
-        self._set("SGLANG_GGUF_STREAM_TRIM_TARGET_GIB", None)
+        self._set("FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB", 90)
+        self._set("FLLIPER_GGUF_STREAM_TRIM_TARGET_GIB", None)
         with mock.patch.object(
             ProgressCoupledTrim, "_swapless", staticmethod(lambda: True)
         ):
@@ -265,7 +265,7 @@ class TestProgressCoupledTrim(_EnvMixin, CustomTestCase):
 
     def test_disables_itself_when_reclaim_is_unavailable(self):
         """A probe must never be the reason a load fails."""
-        self._set("SGLANG_GGUF_STREAM_TRIM_SOFT_GIB", 90)
+        self._set("FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB", 90)
         gib = 1 << 30
         with mock.patch.object(
             ProgressCoupledTrim, "_swapless", staticmethod(lambda: True)
@@ -355,9 +355,9 @@ class TestStreamTrimBudgetModel(_EnvMixin, CustomTestCase):
     """
 
     def _armed_trim(self, *, soft=96, target=90, headroom=None):
-        self._set("SGLANG_GGUF_STREAM_TRIM_SOFT_GIB", soft)
-        self._set("SGLANG_GGUF_STREAM_TRIM_TARGET_GIB", target)
-        self._set("SGLANG_GGUF_STREAM_TRIM_HEADROOM_GIB", headroom)
+        self._set("FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB", soft)
+        self._set("FLLIPER_GGUF_STREAM_TRIM_TARGET_GIB", target)
+        self._set("FLLIPER_GGUF_STREAM_TRIM_HEADROOM_GIB", headroom)
         with mock.patch.object(
             ProgressCoupledTrim, "_swapless", staticmethod(lambda: True)
         ):

@@ -5,7 +5,7 @@ Hermetic: no CUDA, no torch, no distributed backend required.
 
 import unittest
 
-from sglang.srt.distributed.collective_census import (
+from flliper.srt.distributed.collective_census import (
     CollectiveCensus,
     format_local_history,
 )
@@ -16,7 +16,7 @@ class TestRingBufferBounds(unittest.TestCase):
     entries."""
 
     def test_n_plus_10_keeps_only_last_n(self):
-        from sglang.srt.distributed.collective_census import DEFAULT_HISTORY_LEN
+        from flliper.srt.distributed.collective_census import DEFAULT_HISTORY_LEN
 
         c = CollectiveCensus()
         first_family = "alpha"
@@ -123,7 +123,7 @@ class TestModuleLevelFormatLocalHistory(unittest.TestCase):
 
     def setUp(self):
         # Import the singleton to clear it for each test.
-        from sglang.srt.distributed import collective_census as cc
+        from flliper.srt.distributed import collective_census as cc
 
         self._cc = cc
         cc._CENSUS._counts.clear()

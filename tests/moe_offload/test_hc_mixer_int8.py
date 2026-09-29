@@ -7,7 +7,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import torch
 import torch.nn as nn
 
-from sglang.srt.layers import hyperconnection as hc
+from flliper.srt.layers import hyperconnection as hc
 
 
 class _StubQuantLinear(nn.Module):
@@ -34,8 +34,8 @@ def _cfg():
 
 def test_quantized_mixers_match_the_dense_math(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
-    monkeypatch.setenv("SGLANG_HC_MIXER_INT8", "1")
-    import sglang.srt.layers.linear as lin
+    monkeypatch.setenv("FLLIPER_HC_MIXER_INT8", "1")
+    import flliper.srt.layers.linear as lin
 
     monkeypatch.setattr(lin, "ReplicatedLinear", _StubQuantLinear)
     _StubQuantLinear.made.clear()
@@ -45,7 +45,7 @@ def test_quantized_mixers_match_the_dense_math(monkeypatch):
         "model.language_model.layers.3.attn_hyper_connection.input_mix_weight_down",
         "model.language_model.layers.3.attn_hyper_connection.input_mix_weight_up",
     ]
-    monkeypatch.setenv("SGLANG_HC_MIXER_INT8", "0")
+    monkeypatch.setenv("FLLIPER_HC_MIXER_INT8", "0")
     d = hc.GatedResidual(_cfg(), use_mix=True, use_combine=False)
     assert not d._mix_quantized and isinstance(d.input_mix_weight_down, nn.Linear)
     with torch.no_grad():
@@ -61,9 +61,9 @@ def test_quantized_mixers_match_the_dense_math(monkeypatch):
 
 
 def test_switch_semantics(monkeypatch):
-    monkeypatch.setenv("SGLANG_HC_MIXER_INT8", "1")
+    monkeypatch.setenv("FLLIPER_HC_MIXER_INT8", "1")
     assert hc.hc_mixer_int8_on(object()) and not hc.hc_mixer_int8_on(None)
-    monkeypatch.setenv("SGLANG_HC_MIXER_INT8", "0")
+    monkeypatch.setenv("FLLIPER_HC_MIXER_INT8", "0")
     assert not hc.hc_mixer_int8_on(object())
-    monkeypatch.delenv("SGLANG_HC_MIXER_INT8")
+    monkeypatch.delenv("FLLIPER_HC_MIXER_INT8")
     assert not hc.hc_mixer_int8_on(object())

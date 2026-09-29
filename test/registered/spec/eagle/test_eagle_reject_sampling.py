@@ -3,11 +3,11 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -43,7 +43,7 @@ class TestQwen35EagleRS(CustomTestCase):
             "0.8",
             "--disable-radix-cache",
         ]
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
+        with envs.FLLIPER_ENABLE_ASYNC_ASSERT.override(True):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

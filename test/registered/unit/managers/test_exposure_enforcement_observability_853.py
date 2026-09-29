@@ -38,9 +38,9 @@ import sys
 import types
 import unittest
 
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
-SPILL_MODULE = "sglang.srt.managers.phase_flip_spill"
+SPILL_MODULE = "flliper.srt.managers.phase_flip_spill"
 
 
 class _Rung:
@@ -61,7 +61,7 @@ class _Rung:
 def _runtime(rung=None):
     r = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
     if rung is not None:
-        from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+        from flliper.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
 
         sched = types.SimpleNamespace()
         setattr(sched, KV_BACKING_RELIEF_ATTR, rung)
@@ -74,7 +74,7 @@ def _runtime(rung=None):
 class EverySeamEvaluationIsOnTheRecord(unittest.TestCase):
     def _run(self, runtime, when="pp_to_tp cutover"):
         with self.assertLogs(
-            "sglang.srt.managers.phase_flip_runtime", level=logging.DEBUG
+            "flliper.srt.managers.phase_flip_runtime", level=logging.DEBUG
         ) as caught:
             withdrawn = runtime._enforce_exposure_at_seam(when)
         return withdrawn, "\n".join(caught.output)
@@ -105,7 +105,7 @@ class EverySeamEvaluationIsOnTheRecord(unittest.TestCase):
         """W24 ran at INFO. The old handler logged this at DEBUG, so a clamp
         that threw on every seam would have left no trace in the boot log."""
         with self.assertLogs(
-            "sglang.srt.managers.phase_flip_runtime", level=logging.INFO
+            "flliper.srt.managers.phase_flip_runtime", level=logging.INFO
         ) as caught:
             withdrawn = PhaseFlipRuntime._enforce_exposure_at_seam(
                 _runtime(_Rung(raises=True)), "tp_to_pp cutover"
@@ -146,7 +146,7 @@ class EverySeamEvaluationIsOnTheRecord(unittest.TestCase):
         _, outs["EXPOSURE ENFORCED"] = self._run(_runtime(_Rung(withdrawn=3)))
         _, outs["EXPOSURE NOT ENFORCEABLE"] = self._run(_runtime(None))
         with self.assertLogs(
-            "sglang.srt.managers.phase_flip_runtime", level=logging.INFO
+            "flliper.srt.managers.phase_flip_runtime", level=logging.INFO
         ) as caught:
             PhaseFlipRuntime._enforce_exposure_at_seam(
                 _runtime(_Rung(raises=True)), "x"
@@ -179,7 +179,7 @@ class TheSeamNamesTheEventItEvaluated(unittest.TestCase):
             (_runtime(_Rung(raises=True)), logging.INFO),
         ):
             with self.assertLogs(
-                "sglang.srt.managers.phase_flip_runtime", level=level
+                "flliper.srt.managers.phase_flip_runtime", level=level
             ) as caught:
                 PhaseFlipRuntime._enforce_exposure_at_seam(runtime, "tp_to_pp arm")
             self.assertIn("tp_to_pp arm", "\n".join(caught.output))

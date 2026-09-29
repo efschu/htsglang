@@ -28,8 +28,8 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.distributed.collective_census import CollectiveCensus
-from sglang.srt.distributed.parallel_state import (
+from flliper.srt.distributed.collective_census import CollectiveCensus
+from flliper.srt.distributed.parallel_state import (
     GroupCoordinator,
     collective_clock_families,
 )
@@ -91,13 +91,13 @@ def _drive(census, *, broadcasts, all_to_alls, declare=True):
         _declare(census)
     tensor = torch.zeros(2, dtype=torch.int64)
     with mock.patch(
-        "sglang.srt.distributed.parallel_state._CENSUS", census
+        "flliper.srt.distributed.parallel_state._CENSUS", census
     ), mock.patch(
-        "sglang.srt.distributed.parallel_state._CENSUS_ON", True
+        "flliper.srt.distributed.parallel_state._CENSUS_ON", True
     ), mock.patch(
         "torch.distributed.broadcast"
     ), mock.patch(
-        "sglang.srt.distributed.parallel_state.reg_all_to_all_single"
+        "flliper.srt.distributed.parallel_state.reg_all_to_all_single"
     ):
         for _ in range(broadcasts):
             g.broadcast(tensor, src=0)
@@ -166,9 +166,9 @@ class TestTheDispatchSitesCount(unittest.TestCase):
         g = _coordinator()
         tensor = torch.zeros(2, dtype=torch.int64)
         with mock.patch(
-            "sglang.srt.distributed.parallel_state._CENSUS", c
+            "flliper.srt.distributed.parallel_state._CENSUS", c
         ), mock.patch(
-            "sglang.srt.distributed.parallel_state._CENSUS_ON", True
+            "flliper.srt.distributed.parallel_state._CENSUS_ON", True
         ), mock.patch(
             "torch.distributed.all_to_all_single"
         ):

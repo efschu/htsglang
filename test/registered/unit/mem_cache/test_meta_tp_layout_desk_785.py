@@ -62,22 +62,22 @@ def _free_port() -> int:
 def _worker(rank: int, world: int, port: str) -> None:
     import torch
 
-    from sglang.srt.configs.load_config import LoadConfig
-    from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed import parallel_state as ps
-    from sglang.srt.distributed.utils import scoped_tp_partition_ratios
-    from sglang.srt.layers.dp_attention import initialize_dp_attention
-    from sglang.srt.managers.arena_tail_probe import plan_meta_layout
-    from sglang.srt.managers.phase_flip_boot import checkpoint_param_dict
-    from sglang.srt.model_loader.loader import (
+    from flliper.srt.configs.load_config import LoadConfig
+    from flliper.srt.configs.model_config import ModelConfig
+    from flliper.srt.distributed import parallel_state as ps
+    from flliper.srt.distributed.utils import scoped_tp_partition_ratios
+    from flliper.srt.layers.dp_attention import initialize_dp_attention
+    from flliper.srt.managers.arena_tail_probe import plan_meta_layout
+    from flliper.srt.managers.phase_flip_boot import checkpoint_param_dict
+    from flliper.srt.model_loader.loader import (
         _get_quantization_config,
         _initialize_model,
         set_default_torch_dtype,
     )
-    from sglang.srt.runtime_context import get_context
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.runtime_context import get_context
+    from flliper.srt.server_args import ServerArgs
 
-    import sglang.srt.server_args as SA
+    import flliper.srt.server_args as SA
 
     # DESK FIXTURES, and none of the three touches layout arithmetic:
     #  - is_cuda() gates FLA/mamba SUPPORT in argument validation

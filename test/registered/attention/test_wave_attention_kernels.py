@@ -3,26 +3,26 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.decode_attention import (
+from flliper.kernels.ops.attention.decode_attention import (
     decode_attention_fwd_grouped as triton_decode_attention_fwd_grouped,
 )
-from sglang.kernels.ops.attention.extend_attention import (
+from flliper.kernels.ops.attention.extend_attention import (
     extend_attention_fwd,
     redundant_attention,
 )
-from sglang.kernels.ops.attention.prefill_attention import (
+from flliper.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.layers.attention.wave_ops.decode_attention import (
+from flliper.srt.layers.attention.wave_ops.decode_attention import (
     decode_attention_intermediate_arrays_shapes,
     decode_attention_wave,
 )
-from sglang.srt.layers.attention.wave_ops.extend_attention import extend_attention_wave
-from sglang.srt.layers.attention.wave_ops.prefill_attention import (
+from flliper.srt.layers.attention.wave_ops.extend_attention import extend_attention_wave
+from flliper.srt.layers.attention.wave_ops.prefill_attention import (
     prefill_attention_wave,
 )
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci
+from flliper.srt.utils import get_device
+from flliper.test.ci.ci_register import register_amd_ci
 
 # Wave attention kernel unit tests (AMD only - requires wave_lang)
 register_amd_ci(est_time=60, suite="stage-a-test-1-gpu-small-amd")

@@ -183,7 +183,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60)
 
@@ -287,7 +287,7 @@ def _make_holder(rank: int, wire: _RingWire, chain_group):
     the two existing single-channel test patterns
     (test_pp_chain_flush_deadlock_788.py's chain holder and
     test_pp_admission_wraparound_never_blocks.py's decision holder)."""
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     ps = types.SimpleNamespace(
         pp_rank=rank,
@@ -389,13 +389,13 @@ def _worker(rank, init_file, out_dir, variant, n_passes):
     SAME shipped `send_typed_tensor_dict`/`recv_typed_tensor_dict` functions
     `PpGroupLink` uses, on the SAME `wire`/`pp_group` instance the decision
     channel already shares, one demultiplexer, as in production)."""
-    from sglang.srt.distributed.pp_typed_channel import (
+    from flliper.srt.distributed.pp_typed_channel import (
         CROSSING_KIND,
         recv_typed_tensor_dict,
         send_typed_tensor_dict,
     )
-    from sglang.srt.managers.pp_admission_congruence import PPAdmissionDecision
-    from sglang.srt.managers.scheduler_pp_mixin import _PP_ADMISSION_PENDING_SENDS_CAP
+    from flliper.srt.managers.pp_admission_congruence import PPAdmissionDecision
+    from flliper.srt.managers.scheduler_pp_mixin import _PP_ADMISSION_PENDING_SENDS_CAP
 
     broken = variant == "broken"
     with_crossing = variant == "fixed_with_crossing"

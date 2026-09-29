@@ -17,15 +17,15 @@ Everything is CPU arithmetic. No torch, no device.
 
 import unittest
 
-from sglang.srt.planner.cost_model import Provenance, Rate
-from sglang.srt.video_enhance.frame_math import (
+from flliper.srt.planner.cost_model import Provenance, Rate
+from flliper.srt.video_enhance.frame_math import (
     R4K,
     R8K,
     R1080P,
     PixelFormat,
     Resolution,
 )
-from sglang.srt.video_enhance.stage_pipeline import (
+from flliper.srt.video_enhance.stage_pipeline import (
     EIGHT_K_FP16_MIB,
     UNPRICED_CHAIN_STAGES,
     CardProfile,
@@ -42,8 +42,8 @@ from sglang.srt.video_enhance.stage_pipeline import (
     split_shares,
     stage_table,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

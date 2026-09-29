@@ -27,7 +27,7 @@ import time
 import types
 import unittest
 
-from sglang.srt.managers import phase_purity as pp
+from flliper.srt.managers import phase_purity as pp
 
 SLO = 45.0
 

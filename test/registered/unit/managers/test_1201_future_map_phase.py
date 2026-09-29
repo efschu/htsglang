@@ -30,7 +30,7 @@ frozen NONE and gathers ``output_tokens_buf[batch.req_pool_indices]`` into
 ``batch.input_ids`` on a batch whose input ids the spec worker owns.
 
 THE DANGEROUS DIRECTION IS SILENT.  The only thing that could shout is
-``_assert_nonneg_and_invalidate``, gated on ``SGLANG_IS_IN_CI``
+``_assert_nonneg_and_invalidate``, gated on ``FLLIPER_IS_IN_CI``
 (overlap_utils.py:72), which is OFF on the rig.  So the failure is not a raise:
 it is a decode round fed input ids nobody meant to relay.  The test that matters
 most here is therefore the one asserting the WRONG BRANCH IS NOT TAKEN, not one
@@ -52,9 +52,9 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.memory_pool import ReqToTokenPool
+from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
+from flliper.test.test_utils import CustomTestCase
 
 NONE = SpeculativeAlgorithm.from_string(None)
 EAGLE = SpeculativeAlgorithm.from_string("EAGLE")
@@ -106,13 +106,13 @@ class TestFutureMapIsBuiltForThePhase(CustomTestCase):
     """The builder exists, is callable outside ``Scheduler``, and reads NOW."""
 
     def test_the_construction_is_extractable_from_init_overlap(self):
-        from sglang.srt.managers.overlap_utils import build_future_map
+        from flliper.srt.managers.overlap_utils import build_future_map
 
         fm = build_future_map(_scheduler(_pool(), EAGLE))
         self.assertIs(fm.spec_algo, EAGLE)
 
     def test_the_map_carries_the_schedulers_algorithm_at_call_time(self):
-        from sglang.srt.managers.overlap_utils import build_future_map
+        from flliper.srt.managers.overlap_utils import build_future_map
 
         sched = _scheduler(_pool(), NONE)
         self.assertTrue(build_future_map(sched).spec_algo.is_none())
@@ -120,7 +120,7 @@ class TestFutureMapIsBuiltForThePhase(CustomTestCase):
         self.assertFalse(build_future_map(sched).spec_algo.is_none())
 
     def test_the_map_names_the_schedulers_pool_at_call_time(self):
-        from sglang.srt.managers.overlap_utils import build_future_map
+        from flliper.srt.managers.overlap_utils import build_future_map
 
         pp_pool, tp_pool = _pool(size=4), _pool(size=4)
         sched = _scheduler(pp_pool, NONE)
@@ -132,7 +132,7 @@ class TestFutureMapIsBuiltForThePhase(CustomTestCase):
         """Parity with scheduler.py:2248-2254: the draft worker's declared
         backends win over the target's, and a worker without the override falls
         back to target-only."""
-        from sglang.srt.managers.overlap_utils import build_future_map
+        from flliper.srt.managers.overlap_utils import build_future_map
 
         draft = types.SimpleNamespace(
             spec_v2_attn_backends=(_backend(needs_cpu_seq_lens=False),)
@@ -150,7 +150,7 @@ class TestFutureMapIsBuiltForThePhase(CustomTestCase):
 class TestThePpMapIsNotTheMapTheTpPhaseConsults(CustomTestCase):
 
     def test_the_cutover_produces_a_different_object(self):
-        from sglang.srt.managers.overlap_utils import build_future_map
+        from flliper.srt.managers.overlap_utils import build_future_map
 
         pp_pool, tp_pool = _pool(), _pool()
         sched = _scheduler(pp_pool, NONE)
@@ -175,7 +175,7 @@ class TestThePpMapIsNotTheMapTheTpPhaseConsults(CustomTestCase):
         ``batch.input_ids``.  With the phase's own map it leaves them alone --
         the V2 worker owns them.  Nothing raises in either case.
         """
-        from sglang.srt.managers.overlap_utils import (
+        from flliper.srt.managers.overlap_utils import (
             build_future_map,
             resolve_forward_inputs,
         )
@@ -210,7 +210,7 @@ class TestThePpMapIsNotTheMapTheTpPhaseConsults(CustomTestCase):
         """Default-path parity: a genuinely non-speculative phase must keep
         relaying.  The cut must not turn the gather off, only stop it from
         firing under a stale stamp."""
-        from sglang.srt.managers.overlap_utils import (
+        from flliper.srt.managers.overlap_utils import (
             build_future_map,
             resolve_forward_inputs,
         )
@@ -228,7 +228,7 @@ class TestTheIdentityAssertion(CustomTestCase):
     """The registry's second obligation: a probe that the hook actually ran."""
 
     def test_a_stale_algorithm_stamp_is_refused(self):
-        from sglang.srt.managers.overlap_utils import (
+        from flliper.srt.managers.overlap_utils import (
             FutureMapPhaseMismatch,
             assert_future_map_identity,
             build_future_map,
@@ -241,7 +241,7 @@ class TestTheIdentityAssertion(CustomTestCase):
             assert_future_map_identity(sched)
 
     def test_a_stale_pool_stamp_is_refused(self):
-        from sglang.srt.managers.overlap_utils import (
+        from flliper.srt.managers.overlap_utils import (
             FutureMapPhaseMismatch,
             assert_future_map_identity,
             build_future_map,
@@ -254,7 +254,7 @@ class TestTheIdentityAssertion(CustomTestCase):
             assert_future_map_identity(sched)
 
     def test_a_rebuilt_map_passes(self):
-        from sglang.srt.managers.overlap_utils import (
+        from flliper.srt.managers.overlap_utils import (
             assert_future_map_identity,
             build_future_map,
         )
@@ -278,7 +278,7 @@ class TestTheIdentityAssertion(CustomTestCase):
         on nothing. This pins the fact so the next reader does not mistake the
         green for coverage -- and it is the reason `previous` exists.
         """
-        from sglang.srt.managers.overlap_utils import (
+        from flliper.srt.managers.overlap_utils import (
             FutureMapPhaseMismatch,
             assert_future_map_identity,
             build_future_map,
@@ -304,7 +304,7 @@ class TestTheIdentityAssertion(CustomTestCase):
         built from the scheduler's fields always matches the scheduler's
         fields. The object identity is the only seam-time evidence.
         """
-        from sglang.srt.managers.overlap_utils import (
+        from flliper.srt.managers.overlap_utils import (
             FutureMapPhaseMismatch,
             assert_future_map_identity,
             build_future_map,
@@ -328,7 +328,7 @@ class TestTheIdentityAssertion(CustomTestCase):
         import pathlib
 
         src = pathlib.Path(
-            "/spinning/wt-weg1/python/sglang/srt/managers/phase_flip_runtime.py"
+            "/spinning/wt-weg1/python/flliper/srt/managers/phase_flip_runtime.py"
         ).read_text()
         self.assertIn(
             "assert_future_map_identity(scheduler, previous=_old_map)",
@@ -339,7 +339,7 @@ class TestTheIdentityAssertion(CustomTestCase):
     def test_a_scheduler_without_a_future_map_is_not_an_error(self):
         """Default-path parity, duck-typed like assert_req_pool_identity: an
         instance that never built one is not a divergence."""
-        from sglang.srt.managers.overlap_utils import assert_future_map_identity
+        from flliper.srt.managers.overlap_utils import assert_future_map_identity
 
         assert_future_map_identity(types.SimpleNamespace())
         assert_future_map_identity(types.SimpleNamespace(future_map=None))
@@ -349,7 +349,7 @@ class TestTheSeamDeclaresIt(CustomTestCase):
     """#859: what this list forgets, a boot finds."""
 
     def test_the_holder_is_no_longer_an_open_gap(self):
-        from sglang.srt.managers.cutover_participants import REGISTRY
+        from flliper.srt.managers.cutover_participants import REGISTRY
 
         entry = next(p for p in REGISTRY if p.name == "future_map_req_pool_holder")
         self.assertIsNotNone(entry.hook, "the rebuild is the hook")
@@ -357,7 +357,7 @@ class TestTheSeamDeclaresIt(CustomTestCase):
         self.assertIsNone(entry.gap)
 
     def test_the_future_map_is_declared_mutated_state(self):
-        from sglang.srt.managers.cutover_participants import (
+        from flliper.srt.managers.cutover_participants import (
             MUTATED_STATE,
             ReadWindow,
         )
@@ -373,7 +373,7 @@ class TestTheSeamDeclaresIt(CustomTestCase):
         import pathlib
 
         src = pathlib.Path(
-            "/spinning/wt-weg1/python/sglang/srt/managers/phase_flip_runtime.py"
+            "/spinning/wt-weg1/python/flliper/srt/managers/phase_flip_runtime.py"
         ).read_text()
         swap = src.index("scheduler.spec_algorithm = want_spec_algo")
         rebind = src.index('rebind_req_pool_for_cutover(scheduler, "tp" if tp_phase')

@@ -1,10 +1,10 @@
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import MMLUMixin
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.eval_accuracy_kit import MMLUMixin
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -23,7 +23,7 @@ class TestCppRadixCache(CustomTestCase, MMLUMixin):
 
     @classmethod
     def setUpClass(cls):
-        envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.set(True)
+        envs.FLLIPER_EXPERIMENTAL_CPP_RADIX_TREE.set(True)
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(

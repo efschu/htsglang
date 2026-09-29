@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Launch a 2-node 1P1D disaggregation benchmark on the AMD MI355X `amd-sglang`
+# Launch a 2-node 1P1D disaggregation benchmark on the AMD MI355X `amd-flliper`
 # Slurm cluster, then emit per-concurrency result JSONs that
 # scripts/ci/slurm/process_result.py aggregates.
 #
 # salloc's (prefill_workers + decode_workers) nodes -- one server per node --
 # and runs the Docker harness: prefill server(s) on the first nodes, decode
 # server(s) on the rest, a standalone load balancer on the prefill node, then an
-# sglang.bench_serving concurrency sweep over MORI. Default recipe is 1P1D (2
+# flliper.bench_serving concurrency sweep over MORI. Default recipe is 1P1D (2
 # nodes); see the drive.sh note on reserving 2P2D / 1P3D / 3P1D.
 #
 # Required environment variables (set by the GitHub Actions workflow):
@@ -20,13 +20,13 @@
 #   GITHUB_WORKSPACE   - set by GitHub Actions; where result JSONs are written
 # Optional:
 #   MODEL_PATH         - local snapshot dir (preferred over downloading MODEL)
-#   SLURM_PARTITION    - default: amd-sglang
+#   SLURM_PARTITION    - default: amd-flliper
 #   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
 #   SLURM_EXCLUDE      - optional comma-separated nodes to keep the scheduler
 #                        off (e.g. hosts with a broken RDMA driver)
-#   SGLANG_USE_CHECKOUT_RUNTIME
+#   FLLIPER_USE_CHECKOUT_RUNTIME
 #                      - default 1. Reinstall this workflow checkout's Python
-#                        sglang package inside each runtime container, and the
+#                        flliper package inside each runtime container, and the
 #                        checkout sglang-router package inside the bench
 #                        container, before launching servers/bench. Set 0 to
 #                        use the image's baked-in packages.
@@ -55,13 +55,13 @@ set -x
 : "${MATRIX_CONFIG_NAME:?}"
 : "${GITHUB_WORKSPACE:?}"
 
-SLURM_PARTITION="${SLURM_PARTITION:-amd-sglang}"
+SLURM_PARTITION="${SLURM_PARTITION:-amd-flliper}"
 TIME_LIMIT="${TIME_LIMIT:-02:30:00}"
 MODEL_PATH="${MODEL_PATH:-${MODEL:-}}"
-SGLANG_USE_CHECKOUT_RUNTIME="${SGLANG_USE_CHECKOUT_RUNTIME:-1}"
-case "${SGLANG_USE_CHECKOUT_RUNTIME,,}" in
-    0|false|no|off) SGLANG_USE_CHECKOUT_RUNTIME=0 ;;
-    *) SGLANG_USE_CHECKOUT_RUNTIME=1 ;;
+FLLIPER_USE_CHECKOUT_RUNTIME="${FLLIPER_USE_CHECKOUT_RUNTIME:-1}"
+case "${FLLIPER_USE_CHECKOUT_RUNTIME,,}" in
+    0|false|no|off) FLLIPER_USE_CHECKOUT_RUNTIME=0 ;;
+    *) FLLIPER_USE_CHECKOUT_RUNTIME=1 ;;
 esac
 
 if [[ -z "$MODEL_PATH" ]]; then
@@ -103,7 +103,7 @@ python3 -c 'import yaml' 2>/dev/null || pip install pyyaml -q 2>/dev/null \
 RECIPE_VARS="$(python3 - "$CONFIG_FILE" <<'PY'
 import sys, yaml
 r = yaml.safe_load(open(sys.argv[1]))
-rt = r["runtime"]; b = r["backend"]["sglang_config"]; bn = r["bench"]
+rt = r["runtime"]; b = r["backend"]["flliper_config"]; bn = r["bench"]
 res = r.get("resources", {})
 def emit(k, v): print(f"{k}={v}")
 emit("IMAGE", rt["image"])
@@ -178,8 +178,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Stage the workflow checkout on shared NFS so Slurm compute-node containers can
 # reinstall the same code SHA the workflow checked out. The container gets a
 # read-only mount and copies it to /tmp before mutating pyproject.toml.
-CHECKOUT_DOCKER_ARGS="-e SGLANG_USE_CHECKOUT_RUNTIME=$SGLANG_USE_CHECKOUT_RUNTIME"
-if [[ "$SGLANG_USE_CHECKOUT_RUNTIME" == "1" ]]; then
+CHECKOUT_DOCKER_ARGS="-e FLLIPER_USE_CHECKOUT_RUNTIME=$FLLIPER_USE_CHECKOUT_RUNTIME"
+if [[ "$FLLIPER_USE_CHECKOUT_RUNTIME" == "1" ]]; then
     CHECKOUT_STAGE="$WORKDIR/checkout"
     CHECKOUT_SHA="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
     echo "Staging checkout runtime: sha=$CHECKOUT_SHA -> $CHECKOUT_STAGE"
@@ -187,9 +187,9 @@ if [[ "$SGLANG_USE_CHECKOUT_RUNTIME" == "1" ]]; then
     mkdir -p "$CHECKOUT_STAGE"
     tar --exclude='__pycache__' --exclude='*.pyc' --exclude='.git/config' \
         -C "$GITHUB_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -
-    CHECKOUT_DOCKER_ARGS="$CHECKOUT_DOCKER_ARGS -e SGLANG_CHECKOUT_SHA=$CHECKOUT_SHA -v $CHECKOUT_STAGE:/sglang-checkout:ro"
+    CHECKOUT_DOCKER_ARGS="$CHECKOUT_DOCKER_ARGS -e FLLIPER_CHECKOUT_SHA=$CHECKOUT_SHA -v $CHECKOUT_STAGE:/flliper-checkout:ro"
 else
-    echo "SGLANG_USE_CHECKOUT_RUNTIME=0; using sglang package baked into image."
+    echo "FLLIPER_USE_CHECKOUT_RUNTIME=0; using flliper package baked into image."
 fi
 
 # Accuracy-gate helpers (written when enabled). Pre-stage the GSM8K test set on
@@ -210,24 +210,24 @@ PY
 fi
 
 # DSV4 load-bearing env (see test/registered/amd/test_deepseek_v4_flash_fp8.py).
-# SGLANG_DSV4_FP4_EXPERTS is precision-driven: true for fp4 weights, false for fp8.
+# FLLIPER_DSV4_FP4_EXPERTS is precision-driven: true for fp4 weights, false for fp8.
 if [[ "$PRECISION" == "fp4" ]]; then
     FP4_EXPERTS=true
 else
     FP4_EXPERTS=false
 fi
 DSV4_ENV=(
-  -e SGLANG_DEFAULT_THINKING=1 -e SGLANG_DSV4_REASONING_EFFORT=max
-  -e SGLANG_OPT_DEEPGEMM_HC_PRENORM=false -e SGLANG_USE_AITER=1
-  -e SGLANG_USE_ROCM700A=1 -e SGLANG_OPT_USE_FUSED_COMPRESS=true
-  -e SGLANG_OPT_USE_FUSED_COMPRESS_TRITON=true
-  -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
-  -e SGLANG_OPT_FP8_WO_A_GEMM=false -e SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
-  -e SGLANG_OPT_USE_TOPK_V2=false -e SGLANG_OPT_USE_AITER_INDEXER=true
-  -e SGLANG_OPT_USE_TILELANG_INDEXER=false -e SGLANG_OPT_USE_TILELANG_MHC_PRE=false
-  -e SGLANG_OPT_USE_TILELANG_MHC_POST=false -e SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
-  -e SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false -e SGLANG_ROCM_USE_MULTI_STREAM=false
-  -e AITER_BF16_FP8_MOE_BOUND=0 -e SGLANG_DSV4_FP4_EXPERTS=$FP4_EXPERTS
+  -e FLLIPER_DEFAULT_THINKING=1 -e FLLIPER_DSV4_REASONING_EFFORT=max
+  -e FLLIPER_OPT_DEEPGEMM_HC_PRENORM=false -e FLLIPER_USE_AITER=1
+  -e FLLIPER_USE_ROCM700A=1 -e FLLIPER_OPT_USE_FUSED_COMPRESS=true
+  -e FLLIPER_OPT_USE_FUSED_COMPRESS_TRITON=true
+  -e FLLIPER_HACK_FLASHMLA_BACKEND=unified_kv_triton
+  -e FLLIPER_OPT_FP8_WO_A_GEMM=false -e FLLIPER_OPT_USE_JIT_INDEXER_METADATA=false
+  -e FLLIPER_OPT_USE_TOPK_V2=false -e FLLIPER_OPT_USE_AITER_INDEXER=true
+  -e FLLIPER_OPT_USE_TILELANG_INDEXER=false -e FLLIPER_OPT_USE_TILELANG_MHC_PRE=false
+  -e FLLIPER_OPT_USE_TILELANG_MHC_POST=false -e FLLIPER_FP8_PAGED_MQA_LOGITS_TORCH=1
+  -e FLLIPER_OPT_USE_MULTI_STREAM_OVERLAP=false -e FLLIPER_ROCM_USE_MULTI_STREAM=false
+  -e AITER_BF16_FP8_MOE_BOUND=0 -e FLLIPER_DSV4_FP4_EXPERTS=$FP4_EXPERTS
 )
 DSV4_ENV_STR="${DSV4_ENV[*]}"
 # A recipe carrying a `model:` block supplies its OWN docker env (below), so the
@@ -235,7 +235,7 @@ DSV4_ENV_STR="${DSV4_ENV[*]}"
 [[ "$HAS_MODEL" == "1" ]] && DSV4_ENV_STR=""
 MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"
 
-# Model-specific docker `-e` env + sglang server args from the recipe's optional
+# Model-specific docker `-e` env + flliper server args from the recipe's optional
 # `model:` block, written as bash arrays to model_flags.sh (sourced by
 # prefill.sh/decode.sh). DSV4 recipes have no `model:` block -> empty arrays, so
 # their generated docker argv is unchanged. Each server arg + its value MUST be a
@@ -247,7 +247,7 @@ model = r.get("model", {}) or {}
 env = model.get("env", {}) or {}
 server_args = model.get("server_args", []) or []
 # YAML true/false parse to Python bool; render lowercase so env values stay
-# byte-identical to shell (`=false`, not `=False`) -- SGLang parsing is
+# byte-identical to shell (`=false`, not `=False`) -- fLLiper parsing is
 # case-sensitive for some of these.
 def fmt(v):
     if isinstance(v, bool):
@@ -322,26 +322,26 @@ DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
 # `${MODEL_SERVER_ARGS[@]}` refs are backslash-escaped to survive into the script
 # and expand after `source`. For DSV4 those arrays are empty and $DSV4_ENV_STR is
 # set, so the resulting docker argv is byte-identical to the pre-Kimi launcher.
-cat > "$WORKDIR/install_checkout_sglang.sh" <<'EOF'
+cat > "$WORKDIR/install_checkout_flliper.sh" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
-case "${SGLANG_USE_CHECKOUT_RUNTIME:-1}" in
+case "${FLLIPER_USE_CHECKOUT_RUNTIME:-1}" in
   0|false|False|FALSE|no|No|NO|off|Off|OFF)
-    echo "[checkout-sglang] disabled; using image-baked sglang"
+    echo "[checkout-flliper] disabled; using image-baked flliper"
     exit 0
     ;;
 esac
 
-CHECKOUT_SRC="${CHECKOUT_SRC:-/sglang-checkout}"
-RUNTIME_CHECKOUT="${RUNTIME_CHECKOUT:-/tmp/sglang-checkout-runtime}"
+CHECKOUT_SRC="${CHECKOUT_SRC:-/flliper-checkout}"
+RUNTIME_CHECKOUT="${RUNTIME_CHECKOUT:-/tmp/flliper-checkout-runtime}"
 
-if [[ ! -f "$CHECKOUT_SRC/python/sglang/version.py" ]]; then
-  echo "[checkout-sglang] ERROR: invalid checkout mount: $CHECKOUT_SRC" >&2
+if [[ ! -f "$CHECKOUT_SRC/python/flliper/version.py" ]]; then
+  echo "[checkout-flliper] ERROR: invalid checkout mount: $CHECKOUT_SRC" >&2
   exit 1
 fi
 
-echo "[checkout-sglang] reinstalling sglang from $CHECKOUT_SRC"
+echo "[checkout-flliper] reinstalling flliper from $CHECKOUT_SRC"
 rm -rf "$RUNTIME_CHECKOUT"
 mkdir -p "$RUNTIME_CHECKOUT"
 tar --exclude='__pycache__' --exclude='*.pyc' \
@@ -359,7 +359,7 @@ for f in README.md LICENSE; do
   fi
 done
 
-python3 -m pip uninstall -y sglang || true
+python3 -m pip uninstall -y flliper || true
 python3 -m pip install --no-deps --no-build-isolation -e "$RUNTIME_CHECKOUT/python"
 
 export RUNTIME_CHECKOUT
@@ -368,23 +368,23 @@ python3 - <<'PY'
 import importlib.metadata
 import os
 import subprocess
-import sglang
+import flliper
 
 checkout = os.environ["RUNTIME_CHECKOUT"]
-expected = os.path.realpath(os.path.join(checkout, "python", "sglang")) + os.sep
-actual = os.path.realpath(os.path.dirname(sglang.__file__)) + os.sep
+expected = os.path.realpath(os.path.join(checkout, "python", "flliper")) + os.sep
+actual = os.path.realpath(os.path.dirname(flliper.__file__)) + os.sep
 try:
     sha = subprocess.check_output(
         ["git", "-C", checkout, "rev-parse", "HEAD"], text=True
     ).strip()
 except Exception:
-    sha = os.environ.get("SGLANG_CHECKOUT_SHA", "unknown")
+    sha = os.environ.get("FLLIPER_CHECKOUT_SHA", "unknown")
 
-print(f"[checkout-sglang] sha={sha}")
-print(f"[checkout-sglang] sglang_file={sglang.__file__}")
-print(f"[checkout-sglang] sglang_version={importlib.metadata.version('sglang')}")
+print(f"[checkout-flliper] sha={sha}")
+print(f"[checkout-flliper] flliper_file={flliper.__file__}")
+print(f"[checkout-flliper] flliper_version={importlib.metadata.version('flliper')}")
 if not actual.startswith(expected):
-    raise SystemExit(f"sglang did not import from checkout: {sglang.__file__}")
+    raise SystemExit(f"flliper did not import from checkout: {flliper.__file__}")
 PY
 EOF
 
@@ -392,7 +392,7 @@ cat > "$WORKDIR/install_checkout_router.sh" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
-case "${SGLANG_USE_CHECKOUT_RUNTIME:-1}" in
+case "${FLLIPER_USE_CHECKOUT_RUNTIME:-1}" in
   0|false|False|FALSE|no|No|NO|off|Off|OFF)
     echo "[checkout-router] disabled; using image-baked sglang-router"
     python3 - <<'PY' || true
@@ -415,9 +415,9 @@ PY
     ;;
 esac
 
-RUNTIME_CHECKOUT="${RUNTIME_CHECKOUT:-/tmp/sglang-checkout-runtime}"
+RUNTIME_CHECKOUT="${RUNTIME_CHECKOUT:-/tmp/flliper-checkout-runtime}"
 ROUTER_SRC="$RUNTIME_CHECKOUT/sgl-model-gateway/bindings/python"
-WHEEL_DIR="${SGLANG_ROUTER_WHEEL_DIR:-/tmp/sglang-router-wheels}"
+WHEEL_DIR="${FLLIPER_ROUTER_WHEEL_DIR:-/tmp/sglang-router-wheels}"
 
 if [[ ! -f "$ROUTER_SRC/pyproject.toml" ]]; then
   echo "[checkout-router] ERROR: invalid router checkout: $ROUTER_SRC" >&2
@@ -467,11 +467,11 @@ cat > "$WORKDIR/prefill_entry.sh" <<EOF
 set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
-bash "\$CIDIR/install_checkout_sglang.sh"
-if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
-  export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+bash "\$CIDIR/install_checkout_flliper.sh"
+if [[ "\${FLLIPER_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
+  export PYTHONPATH=/tmp/flliper-checkout-runtime/python:\${PYTHONPATH:-}
 fi
-exec python3 -m sglang.launch_server \
+exec python3 -m flliper.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
   $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
   --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
@@ -482,11 +482,11 @@ cat > "$WORKDIR/decode_entry.sh" <<EOF
 set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
-bash "\$CIDIR/install_checkout_sglang.sh"
-if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
-  export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+bash "\$CIDIR/install_checkout_flliper.sh"
+if [[ "\${FLLIPER_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
+  export PYTHONPATH=/tmp/flliper-checkout-runtime/python:\${PYTHONPATH:-}
 fi
-exec python3 -m sglang.launch_server \
+exec python3 -m flliper.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
   $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
   --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
@@ -536,9 +536,9 @@ docker run $DOCKER_COMMON --name mi355x_bench \
   -e PIP=\$PIP -e DIP=\$DIP \
   $IMAGE bash -lc '
     CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
-    bash \$CIDIR/install_checkout_sglang.sh
-    if [ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]; then
-      export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+    bash \$CIDIR/install_checkout_flliper.sh
+    if [ "\${FLLIPER_USE_CHECKOUT_RUNTIME:-1}" != "0" ]; then
+      export PYTHONPATH=/tmp/flliper-checkout-runtime/python:\${PYTHONPATH:-}
     else
       export PYTHONPATH=/sgl-workspace/sglang/python:\${PYTHONPATH:-}
     fi
@@ -565,7 +565,7 @@ docker run $DOCKER_COMMON --name mi355x_bench \
       echo "=== GSM8K accuracy gate (num_questions=$ACC_NQ shots=$ACC_SHOTS) ==="
       DP_ARG=""
       [ -s \$CIDIR/gsm8k_test.jsonl ] && DP_ARG="--data-path \$CIDIR/gsm8k_test.jsonl"
-      python3 -m sglang.test.few_shot_gsm8k \
+      python3 -m flliper.test.few_shot_gsm8k \
         --num-shots $ACC_SHOTS --num-questions $ACC_NQ --parallel $MAXREQ \
         --max-new-tokens 512 --host http://127.0.0.1 --port $LBPORT \
         \$DP_ARG 2>&1 | tee \$CIDIR/gsm8k.log
@@ -577,7 +577,7 @@ docker run $DOCKER_COMMON --name mi355x_bench \
       echo "=== concurrency=\$C ==="
       OUT=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/raw_conc\${C}.json
       rm -f \$OUT
-      python3 -m sglang.bench_serving --backend sglang \
+      python3 -m flliper.bench_serving --backend flliper \
         --host 127.0.0.1 --port $LBPORT --model $MODEL_PATH \
         --dataset-name random --random-input-len $ISL --random-output-len $OSL \
         --random-range-ratio $RRR --max-concurrency \$C \

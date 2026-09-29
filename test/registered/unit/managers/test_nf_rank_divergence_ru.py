@@ -5,12 +5,12 @@ Two deaths under real agent load on the NF D group (TP3, --rank-tp-ratio
 1,0,0, dcp_size=1 -- TP0 on the arena host pool, TP1/TP2 on zero-width plain
 pools):
 
-* rc9k (dkrnfbar1final09260301, rid weg2-21-19): TP0 ``#915 PREFETCH REFUSED
+* rc9k (dkrnfbar1final09260301, rid pdflip-21-19): TP0 ``#915 PREFETCH REFUSED
   reason=too_short need=192``, TP1/TP2 ``#904 match-census verdict=refused
   ... MambaComponent:absent=29888`` and a registered prefetch; TP1/TP2 then
   sat in ``can_terminate_prefetch`` (3 x int32) while TP0 posted the packed
   int64 MIN of ``_update_uniform_pool_budget`` -> gloo ``248 vs 4``.
-* rc9i (dkrnfbar1agent09252237, rid weg2-32-26): TP1/TP2 ``[#928 anchor]
+* rc9i (dkrnfbar1agent09252237, rid pdflip-32-26): TP1/TP2 ``[#928 anchor]
   REFUSING resume ... host_hit=0``, TP0 ``host_hit=18112`` + #988 LOADBACK +
   tail skip-extend -> different forwards -> TP0 hung in chain-recv, watchdog.
 
@@ -33,15 +33,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache import unified_radix_cache as urc
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+from flliper.srt.mem_cache import unified_radix_cache as urc
+from flliper.srt.mem_cache.base_prefix_cache import MatchResult
+from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 #: The attribute the fix plants on the tree for one plan call. Written by
 #: name here so this file COLLECTS and runs on the unfixed tree too, where
@@ -136,7 +136,7 @@ EVEN_RATIO = types.SimpleNamespace(rank_tp_ratio=[1, 1, 1], hicache_size=4)
 def _patched_form(server_args, dcp_uneven: bool):
     return (
         mock.patch(
-            "sglang.srt.runtime_context.get_server_args", return_value=server_args
+            "flliper.srt.runtime_context.get_server_args", return_value=server_args
         ),
         mock.patch.object(urc, "uneven_dcp_active", return_value=dcp_uneven),
     )
@@ -266,7 +266,7 @@ def _prefetch_carrier(rank: int, group: MockGlooGroup):
         "_prefetch_line_terms",
         "_log_prefetch_refused",
         "_log_prefetch_truncated",
-        "_weg2_extent_topup",
+        "_pdflip_extent_topup",
         "_hicache_prefetch_symmetric",
         "check_prefetch_progress",
         "can_terminate_prefetch",
@@ -386,7 +386,7 @@ def _group_usable(votes: Dict[int, int]) -> Optional[Dict[str, int]]:
     """What the fixed scheduler plants: the MIN-reduced usable-match arm.
     On the unfixed tree the arm does not exist -> nothing is planted."""
     try:
-        from sglang.srt.managers import tp_match_floor
+        from flliper.srt.managers import tp_match_floor
     except ImportError:
         return None
     canonical = [RID9I]
@@ -401,7 +401,7 @@ def _group_usable(votes: Dict[int, int]) -> Optional[Dict[str, int]]:
     return tp_match_floor.decode_group_usable(canonical, reduced)
 
 
-RID9I = "weg2-32-26"
+RID9I = "pdflip-32-26"
 
 
 def _rc9i_rank(rank: int, planted: Optional[Dict[str, int]]):
@@ -423,7 +423,7 @@ def _rc9i_votes() -> Dict[int, int]:
         n = len(out.device_indices) + int(out.host_hit_length)
         req.best_match_node = out.best_match_node
         try:
-            from sglang.srt.managers import tp_match_floor
+            from flliper.srt.managers import tp_match_floor
 
             n = tp_match_floor.local_usable_matches(tree, {RID9I: req}, {RID9I: n})[RID9I]
         except ImportError:
@@ -471,7 +471,7 @@ class TestRc9iAnchorVerdictSplit(unittest.TestCase):
 
 class TestFloorVerdictPure(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.managers import tp_match_floor
+        from flliper.srt.managers import tp_match_floor
 
         self.m = tp_match_floor
 
@@ -501,7 +501,7 @@ class TestFloorVerdictPure(unittest.TestCase):
     def test_usable_arm_sits_before_the_tail_indexed_ballot(self):
         import inspect
 
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler._update_uniform_pool_budget)
         self.assertLess(

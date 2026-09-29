@@ -26,7 +26,7 @@ That relaxation is deliberate and is implemented as an explicit branch, never
 as a silent difference -- both directions are pinned below.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -34,13 +34,13 @@ import inspect
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.mem_cache.mamba_ckpt_utils import (
+from flliper.srt.mem_cache.mamba_ckpt_utils import (
     floor_to_interval,
     is_on_interval,
     is_resume_candidate,
     protect_deepest_anchors,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 #: The cadence #747 documents: 8192 tokens = 16 x chunked_prefill_size(512).
 CADENCE = 8192
@@ -130,15 +130,15 @@ class TestBothLineagesCallTheSameRule(CustomTestCase):
     This is the pin that would have caught the original drift."""
 
     def test_mamba_radix_cache_imports_the_shared_rules(self):
-        from sglang.srt.mem_cache import mamba_radix_cache
+        from flliper.srt.mem_cache import mamba_radix_cache
 
         src = inspect.getsource(mamba_radix_cache)
-        self.assertIn("from sglang.srt.mem_cache.mamba_ckpt_utils import", src)
+        self.assertIn("from flliper.srt.mem_cache.mamba_ckpt_utils import", src)
 
     def test_neither_lineage_reimplements_the_modulo(self):
         """`pos % interval == 0` must appear only in the shared helper."""
-        from sglang.srt.mem_cache import mamba_ckpt_utils, mamba_radix_cache
-        from sglang.srt.mem_cache.unified_cache_components import mamba_component
+        from flliper.srt.mem_cache import mamba_ckpt_utils, mamba_radix_cache
+        from flliper.srt.mem_cache.unified_cache_components import mamba_component
 
         for mod in (mamba_radix_cache, mamba_component):
             with self.subTest(module=mod.__name__):
@@ -149,7 +149,7 @@ class TestBothLineagesCallTheSameRule(CustomTestCase):
     def test_the_device_lineage_calls_the_eviction_rule(self):
         """Pin the CALL inside the evicting function, not the import -- an
         import alone satisfied two pins earlier today."""
-        from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+        from flliper.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
         src = inspect.getsource(MambaRadixCache.evict_mamba)
         self.assertIn("protect_deepest_anchors(", src)
@@ -158,7 +158,7 @@ class TestBothLineagesCallTheSameRule(CustomTestCase):
         """mamba_radix_cache.py:1600 prefers the interval over the chunk size;
         the unified component must make the same choice, or a configured grid
         is silently ignored on that lineage -- the #747 defect itself."""
-        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+        from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
             MambaComponent,
         )
 
@@ -229,13 +229,13 @@ class TestBothWalksCallTheAnchorRule(CustomTestCase):
     the compound decision must not be re-implemented per lineage."""
 
     def test_the_device_walk_calls_it(self):
-        from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+        from flliper.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
         src = inspect.getsource(MambaRadixCache._match_prefix_helper)
         self.assertIn("is_resume_candidate(", src)
 
     def test_the_unified_validator_calls_it(self):
-        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+        from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
             MambaComponent,
         )
 
@@ -246,7 +246,7 @@ class TestBothWalksCallTheAnchorRule(CustomTestCase):
         """The unified walk never knew a node's absolute token depth -- that
         is WHY its component could not gate on the grid. Pin the depth
         accumulator so a refactor cannot silently drop it."""
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         src = inspect.getsource(UnifiedRadixCache._match_prefix_helper)
         self.assertIn("cum_tokens", src)
@@ -258,7 +258,7 @@ class TestUnifiedValidatorBehaviour(CustomTestCase):
 
     @staticmethod
     def _component(interval):
-        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+        from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
             MambaComponent,
         )
 
@@ -278,7 +278,7 @@ class TestUnifiedValidatorBehaviour(CustomTestCase):
 
     @staticmethod
     def _node(value=None, host_value=None):
-        from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+        from flliper.srt.mem_cache.unified_cache_components.tree_component import (
             ComponentType,
         )
 
@@ -317,7 +317,7 @@ class TestRetentionAndCacheLenSeams(CustomTestCase):
     :652-659/:795-809 no_buffer arms in one method)."""
 
     def _prepare_src(self):
-        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+        from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
             MambaComponent,
         )
 
@@ -339,7 +339,7 @@ class TestRetentionAndCacheLenSeams(CustomTestCase):
         """`prepare_for_caching_req` is not the only insert producer (session
         restore paths build InsertParams too). The commit site refuses an
         off-grid leaf so no producer can plant an off-grid anchor."""
-        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+        from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
             MambaComponent,
         )
 
@@ -349,21 +349,21 @@ class TestRetentionAndCacheLenSeams(CustomTestCase):
 
 
 class TestStrictResumeMirror(CustomTestCase):
-    """`SGLANG_MAMBA_CKPT_STRICT_RESUME` (`mamba_radix_cache.py:1590-1601`)
+    """`FLLIPER_MAMBA_CKPT_STRICT_RESUME` (`mamba_radix_cache.py:1590-1601`)
     must not become a silently-inert env on the unified lineage -- the #742
     defect class. It is mirrored where the chunk sums are exact."""
 
     def test_the_component_reads_the_flag_at_init(self):
-        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+        from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
             MambaComponent,
         )
 
         src = inspect.getsource(MambaComponent.__init__)
-        self.assertIn("SGLANG_MAMBA_CKPT_STRICT_RESUME", src)
+        self.assertIn("FLLIPER_MAMBA_CKPT_STRICT_RESUME", src)
         self.assertIn("mamba_checkpoint_interval", src)
 
     def test_finalize_zeroes_through_the_shared_helper(self):
-        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+        from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
             MambaComponent,
         )
 

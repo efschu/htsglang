@@ -13,10 +13,10 @@ import unittest
 import aiohttp
 import requests
 
-from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import is_hip, kill_process_tree
+from flliper.srt.utils.hf_transformers_utils import get_tokenizer
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,

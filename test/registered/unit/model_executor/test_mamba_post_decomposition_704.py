@@ -25,7 +25,7 @@ Hermetic: pure arithmetic, no CUDA.
 
 import pytest
 
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     MAMBA_BUDGET_POST,
     decompose_mamba_budget_post,
 )
@@ -115,7 +115,7 @@ def test_the_lump_label_still_names_all_three_parts():
 
 
 def test_the_post_total_survives_decomposition():
-    from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
         mamba_post_total_gb,
     )
 
@@ -132,7 +132,7 @@ def test_the_post_total_survives_decomposition():
 
 
 def test_unrelated_posts_are_not_counted_into_the_post_total():
-    from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
         mamba_post_total_gb,
     )
 
@@ -148,7 +148,7 @@ def test_unrelated_posts_are_not_counted_into_the_post_total():
 
 def test_the_part_names_match_what_the_decomposition_emits():
     """Keeps the two lists from drifting apart, which is how the hint broke."""
-    from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
         MAMBA_POST_PART_NAMES,
     )
 

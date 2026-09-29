@@ -1,7 +1,7 @@
 """NF-Bootzeit: the O_DIRECT stream's anon instrument must not bound the load.
 
 MEASURED (rc12z15 dkrnfh91dprsavisodirectbar1dauer09281011, P.log line 1283):
-PP0 ``WEG2 LOAD-PROFILE 1192 samples over 73.4 s -- weight_utils.py:1586
+PP0 ``PDFLIP LOAD-PROFILE 1192 samples over 73.4 s -- weight_utils.py:1586
 _rss_anon_bytes 46.8%; weight_utils.py:1587 _rss_anon_bytes 22.4%`` -- one
 /proc/self/status read per tensor over 135 032 NF tensors (median 25.6 KB),
 the stream ran at 0.59 GB/s while the same reader does 2.36 GB/s without it.
@@ -20,7 +20,7 @@ from unittest import mock
 import torch
 from safetensors.torch import save_file
 
-from sglang.srt.model_loader import weight_utils as W
+from flliper.srt.model_loader import weight_utils as W
 
 
 class TestAnonSampling(unittest.TestCase):

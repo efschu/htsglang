@@ -33,9 +33,9 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
-from sglang.srt.server_args import ServerArgs, registered_storage_backends
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.storage.backend_factory import StorageBackendFactory
+from flliper.srt.server_args import ServerArgs, registered_storage_backends
+from flliper.test.test_utils import CustomTestCase
 
 
 def _arg_metadata(name: str):

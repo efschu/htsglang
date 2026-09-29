@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from sglang.srt.layers.attention.qsa import sparse_attn as sa
+from flliper.srt.layers.attention.qsa import sparse_attn as sa
 
 
 def test_compact_owned_rows_sorts_owned_first_and_counts():
@@ -27,14 +27,14 @@ def test_the_kernel_bounds_the_loop_by_counts():
 
 
 def test_the_backend_switch_defaults_on(monkeypatch):
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as qb
 
     for raw, want in (("", True), ("0", False), ("1", True)):
         qb._QSA_ROWS_COMPACT["on"] = None
         if raw == "":
-            monkeypatch.delenv("SGLANG_QSA_ROWS_COMPACT", raising=False)
+            monkeypatch.delenv("FLLIPER_QSA_ROWS_COMPACT", raising=False)
         else:
-            monkeypatch.setenv("SGLANG_QSA_ROWS_COMPACT", raw)
+            monkeypatch.setenv("FLLIPER_QSA_ROWS_COMPACT", raw)
         assert qb._qsa_rows_compact_on() is want, raw
     qb._QSA_ROWS_COMPACT["on"] = None
 

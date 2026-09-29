@@ -8,13 +8,13 @@ import sys
 import numpy as np
 import torch
 
-import sglang.jit_kernel.dsa.cutedsl_paged_mqa_logits  # noqa: F401
-from sglang.jit_kernel.dsa import pick_dsl_expand
-from sglang.srt.layers.attention.dsa.utils import (
+import flliper.jit_kernel.dsa.cutedsl_paged_mqa_logits  # noqa: F401
+from flliper.jit_kernel.dsa import pick_dsl_expand
+from flliper.srt.layers.attention.dsa.utils import (
     fp8_mqa_logits_ceil_to_ue8m0,
     fp8_mqa_logits_make_fused_kv,
 )
-from sglang.srt.utils import is_sm100_supported
+from flliper.srt.utils import is_sm100_supported
 
 
 def _generate_bench_data(
@@ -97,7 +97,7 @@ def benchmark(
 ):
     """Benchmark CuTe DSL FP8 paged MQA logits vs DeepGEMM.
 
-    The "DSL" column uses the SAME picker SGLang runs at runtime
+    The "DSL" column uses the SAME picker fLLiper runs at runtime
     (``pick_dsl_expand``), so the table reflects the shipped path. For
     next_n=6 / num_heads<=42 that picker selects the native single-launch
     expansion (factor=1, atom=next_n, weights-in-SMEM) once there is enough
@@ -106,7 +106,7 @@ def benchmark(
     The "native" column force-runs the native expansion (factor=1,
     atom=next_n) whenever it fits TMEM (``next_n*num_heads <= 256``), so the
     native path is always visible even on shapes where the picker prefers a
-    split. ``use_cuda_graph=True`` matches SGLang's runtime decode path.
+    split. ``use_cuda_graph=True`` matches fLLiper's runtime decode path.
     """
     import deep_gemm
     from flashinfer.testing.utils import bench_gpu_time
@@ -129,7 +129,7 @@ def benchmark(
         f"{'DG-nat(us)':>11s} {'DG/DSL':>7s}"
     )
     print(hdr)
-    print("  DSL    = production picker (pick_dsl_expand) — exactly what SGLang runs")
+    print("  DSL    = production picker (pick_dsl_expand) — exactly what fLLiper runs")
     print("  pick   = chosen factor/atom (1/6 = native single-launch; 2/3 = split)")
     print("  native = forced native expansion (factor=1, atom=next_n); '-' if N>256")
     print("  DG-nat = deep_gemm native (q=[B,next_n,H,D]) — TRT-LLM's path")
@@ -189,7 +189,7 @@ def benchmark(
                         data=data,
                         epi_dtype=epi_dtype,
                     ):
-                        torch.ops.sglang.cute_dsl_fp8_paged_mqa_logits(
+                        torch.ops.flliper.cute_dsl_fp8_paged_mqa_logits(
                             t["q"],
                             data["kv_fused"],
                             data["weights"],
@@ -204,7 +204,7 @@ def benchmark(
 
                     return _dsl
 
-                # Production pick — exactly what SGLang's runtime selects. The op
+                # Production pick — exactly what fLLiper's runtime selects. The op
                 # then auto-tunes the epilogue (incl. max_w_in_reg=8 for native).
                 factor, atom = pick_dsl_expand(
                     next_n, batch_size, context_len, num_sms, num_heads=num_heads
@@ -329,7 +329,7 @@ def main():
         type=int,
         default=64,
         choices=[32, 64, 128],
-        help="Cache page size in tokens (default: 64 — matches SGLang NSA).",
+        help="Cache page size in tokens (default: 64 — matches fLLiper NSA).",
     )
     parser.add_argument(
         "--no-cuda-graph",

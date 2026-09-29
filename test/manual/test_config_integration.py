@@ -1,5 +1,5 @@
 """
-Test script to verify SGLang config file integration.
+Test script to verify fLLiper config file integration.
 """
 
 import argparse
@@ -10,8 +10,8 @@ import tempfile
 import pytest
 import yaml
 
-from sglang.srt.server_args import ServerArgs, prepare_server_args
-from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+from flliper.srt.server_args import ServerArgs, prepare_server_args
+from flliper.srt.server_args_config_parser import ConfigArgumentMerger
 
 
 @pytest.fixture

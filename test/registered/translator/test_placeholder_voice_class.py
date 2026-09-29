@@ -30,8 +30,8 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.translator.backends import AudioChunk
-from sglang.srt.translator.voices import VoiceClass, estimate_median_f0
+from flliper.srt.translator.backends import AudioChunk
+from flliper.srt.translator.voices import VoiceClass, estimate_median_f0
 
 
 RATE = 16000
@@ -70,7 +70,7 @@ class TestTheFirstTurnIsClassified(unittest.IsolatedAsyncioTestCase):
     """The two field cases, as tests."""
 
     def _pool_class(self, f0_hz):
-        from sglang.srt.translator.voices import F0VoiceClassifier
+        from flliper.srt.translator.voices import F0VoiceClassifier
 
         return F0VoiceClassifier().classify(voiced(f0_hz))
 

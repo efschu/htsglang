@@ -27,12 +27,12 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.managers.session_checkpoint import (
+from flliper.srt.managers.session_checkpoint import (
     SessionCheckpointError,
     SessionCheckpointRuntime,
 )
-from sglang.srt.managers.session_handover import MANIFEST_VERSION
-from sglang.srt.managers.session_portable import export_bundle
+from flliper.srt.managers.session_handover import MANIFEST_VERSION
+from flliper.srt.managers.session_portable import export_bundle
 
 IDENTITY = "modelhash-abc"
 GEOMETRY = {"tp_size": 1, "page_size": 1, "dcp_owner_mode": False}
@@ -102,7 +102,7 @@ class _Runtime(unittest.TestCase):
 
         # backend_exists_fn(tree) is patched to read our fake store, so
         # verify_restore judges what the import actually materialised.
-        import sglang.srt.managers.session_checkpoint as m
+        import flliper.srt.managers.session_checkpoint as m
 
         self._orig_exists = m.backend_exists_fn
         m.backend_exists_fn = lambda tree: lambda key: key in self.store

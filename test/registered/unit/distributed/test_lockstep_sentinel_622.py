@@ -42,14 +42,14 @@ def _feed(sentinel, n: int) -> None:
 def _worker(rank: int, init_file: str, out_dir: str, fault_mode: str) -> None:
     import torch.distributed as dist
 
-    from sglang.srt.distributed.device_communicators.lockstep_sentinel import (
+    from flliper.srt.distributed.device_communicators.lockstep_sentinel import (
         LockstepSentinel,
     )
 
     if fault_mode:
-        os.environ["SGLANG_SENTINEL_FAULT"] = f"{FAULT_RANK}:{FAULT_SEQ}:{fault_mode}"
+        os.environ["FLLIPER_SENTINEL_FAULT"] = f"{FAULT_RANK}:{FAULT_SEQ}:{fault_mode}"
     else:
-        os.environ.pop("SGLANG_SENTINEL_FAULT", None)
+        os.environ.pop("FLLIPER_SENTINEL_FAULT", None)
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=WORLD
     )

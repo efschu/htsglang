@@ -5,7 +5,7 @@ WHAT THE METAL SHOWED.  weg2rc6gg (RC6 f1c3c25ff5, F1 in) flipped D->P cleanly
 (every P own-tag census unmapped=0, every COVER row OVERHANG) and died on the
 first flip back, at P's release_memory_occupation:
 
-    W106 Weg2XchgWakeSourceGapRefused: group=P rank=1 tag=weights
+    W106 PdFlipXchgWakeSourceGapRefused: group=P rank=1 tag=weights
     expected_bytes=178257920: ... this rank's own plan carries zero
     descriptors for it on the source side
 
@@ -33,11 +33,11 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.linear import MergedColumnParallelLinear
-from sglang.srt.layers.quantization import gguf as G
-from sglang.srt.managers import weg2_memory_saver as ms
-from sglang.srt.model_loader import loader as loader_mod
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.linear import MergedColumnParallelLinear
+from flliper.srt.layers.quantization import gguf as G
+from flliper.srt.managers import pdflip_memory_saver as ms
+from flliper.srt.model_loader import loader as loader_mod
+from flliper.test.test_utils import CustomTestCase
 
 from test_gguf_postload_chunk_scope_0925 import (  # same directory, no package
     K_IN,

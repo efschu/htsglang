@@ -44,15 +44,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4 import indexer as indexer_mod
-from sglang.srt.layers.attention.dsv4.indexer import (
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.dsv4 import indexer as indexer_mod
+from flliper.srt.layers.attention.dsv4.indexer import (
     FP8_DTYPE,
     fp8_paged_mqa_logits_torch,
     fp8_paged_mqa_logits_torch_sm120,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -201,7 +201,7 @@ def _query_env():
     unfixed tree (one B-tall gather) instead of erroring at import -- an
     ImportError is not evidence that the peak is unbounded.
     """
-    return getattr(envs, "SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB", None)
+    return getattr(envs, "FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB", None)
 
 
 def _chunk_rows_fn():
@@ -214,7 +214,7 @@ def _step_bytes_fn():
 
 def _run(inputs, *, budget_mib, seq_chunk=None):
     """Run the production path with both chunk knobs pinned."""
-    seq_env = envs.SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK
+    seq_env = envs.FLLIPER_DSV4_INDEXER_LOGITS_SEQ_CHUNK
     q_env = _query_env()
     seq_chunk = seq_env.get() if seq_chunk is None else seq_chunk
     if q_env is None:

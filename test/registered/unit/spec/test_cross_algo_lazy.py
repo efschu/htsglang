@@ -1,7 +1,7 @@
 """Unit tests for #156-4: cross-algo lazy single capture + ctx retirement.
 
 CPU-only tests of the pure decision logic in
-``sglang.srt.speculative.cross_algo_lazy``:
+``flliper.srt.speculative.cross_algo_lazy``:
 
 * the ctx-collapse RETIREMENT rule, including the ctx-vs-content
   distinction that keeps a prose passage from killing DFLASH for later code,
@@ -25,15 +25,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload, relay_field
-from sglang.srt.speculative.adaptive_spec_params import RungMetrics
-from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.cross_algo_utils import (
+from flliper.srt.managers.overlap_utils import FutureMap, RelayPayload, relay_field
+from flliper.srt.speculative.adaptive_spec_params import RungMetrics
+from flliper.srt.speculative.draft_worker_common import make_draft_input_v2
+from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
+from flliper.srt.speculative.cross_algo_utils import (
     _resolve_lazy_stash,
     _resolve_retire_stash,
 )
-from sglang.srt.speculative.cross_algo_lazy import (
+from flliper.srt.speculative.cross_algo_lazy import (
     DECIDE_END_MEASURE,
     DECIDE_ENTER_MEASURE,
     DECIDE_RETIRE_EVICT,
@@ -55,8 +55,8 @@ from sglang.srt.speculative.cross_algo_lazy import (
     resolve_retire_policy,
     retire_verdict,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -180,26 +180,26 @@ class TestRetireResolution(CustomTestCase):
         # NO GUESSED DEFAULT: the collapse point is unmeasured, so 'auto'
         # without an explicit factor must degrade to today's behavior and
         # SAY so, never to a made-up number.
-        os.environ.pop("SGLANG_CROSS_RETIRE_CTX_FACTOR", None)
+        os.environ.pop("FLLIPER_CROSS_RETIRE_CTX_FACTOR", None)
         pol = resolve_retire_policy("auto", 2048)
         self.assertFalse(pol.enabled)
         self.assertIn("UNMEASURED", pol.source)
 
     def test_auto_with_factor_derives_from_the_sliding_window(self):
-        os.environ["SGLANG_CROSS_RETIRE_CTX_FACTOR"] = "4.5"
+        os.environ["FLLIPER_CROSS_RETIRE_CTX_FACTOR"] = "4.5"
         try:
             pol = resolve_retire_policy("auto", 2048)
         finally:
-            del os.environ["SGLANG_CROSS_RETIRE_CTX_FACTOR"]
+            del os.environ["FLLIPER_CROSS_RETIRE_CTX_FACTOR"]
         self.assertEqual(pol.collapse_ctx, 9216)
         self.assertEqual(pol.band_low, int(0.8 * 9216))
 
     def test_auto_without_a_sliding_window_stays_disabled(self):
-        os.environ["SGLANG_CROSS_RETIRE_CTX_FACTOR"] = "4.5"
+        os.environ["FLLIPER_CROSS_RETIRE_CTX_FACTOR"] = "4.5"
         try:
             pol = resolve_retire_policy("auto", None)
         finally:
-            del os.environ["SGLANG_CROSS_RETIRE_CTX_FACTOR"]
+            del os.environ["FLLIPER_CROSS_RETIRE_CTX_FACTOR"]
         self.assertFalse(pol.enabled)
 
     def test_explicit_token_count(self):
@@ -664,12 +664,12 @@ class TestArgResolution(CustomTestCase):
         self.assertEqual(cfg.warmup_rounds, LazyCaptureConfig().warmup_rounds)
 
     def test_lazy_stash_seeds_the_round_knobs_from_the_bandit_config(self):
-        os.environ["SGLANG_CROSS_BANDIT_MIN_DWELL_ROUNDS"] = "123"
+        os.environ["FLLIPER_CROSS_BANDIT_MIN_DWELL_ROUNDS"] = "123"
         args = SimpleNamespace(speculative_cross_algorithm_lazy_capture=True)
         try:
             stash = _resolve_lazy_stash(args, "auto")
         finally:
-            del os.environ["SGLANG_CROSS_BANDIT_MIN_DWELL_ROUNDS"]
+            del os.environ["FLLIPER_CROSS_BANDIT_MIN_DWELL_ROUNDS"]
         self.assertEqual(stash["min_dwell_rounds"], 123)
 
     def test_lazy_requires_force_auto(self):
@@ -690,7 +690,7 @@ class TestWorkerWiring(CustomTestCase):
     capture/eager pointer discipline."""
 
     def _shell(self, lazy=None, retire=None, retired=False):
-        from sglang.srt.speculative.cross_algo_worker import CrossAlgoWorker
+        from flliper.srt.speculative.cross_algo_worker import CrossAlgoWorker
 
         w = object.__new__(CrossAlgoWorker)
         w._lazy = lazy
@@ -870,7 +870,7 @@ class TestOverlapRelayAcrossFamilyTransition(CustomTestCase):
         cleanly and the last real NEXTN seeds must survive."""
         idx = torch.tensor([0])
         with mock.patch(
-            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            "flliper.srt.speculative.spec_utils.spec_need_hidden_states",
             return_value=True,
         ):
             fm = self._future_map()
@@ -896,7 +896,7 @@ class TestOverlapRelayAcrossFamilyTransition(CustomTestCase):
         DFLASH segment does not draft from pre-segment seeds."""
         idx = torch.tensor([0])
         with mock.patch(
-            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            "flliper.srt.speculative.spec_utils.spec_need_hidden_states",
             return_value=True,
         ):
             fm = self._future_map()
@@ -921,7 +921,7 @@ class TestOverlapRelayAcrossFamilyTransition(CustomTestCase):
         later and much harder to read."""
         idx = torch.tensor([0])
         with mock.patch(
-            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            "flliper.srt.speculative.spec_utils.spec_need_hidden_states",
             return_value=True,
         ):
             fm = self._future_map()
@@ -944,7 +944,7 @@ class TestOverlapRelayAcrossFamilyTransition(CustomTestCase):
         needs an explicit assertion."""
         idx = torch.tensor([0])
         with mock.patch(
-            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            "flliper.srt.speculative.spec_utils.spec_need_hidden_states",
             return_value=True,
         ):
             nextn_first = self._future_map()
@@ -971,7 +971,7 @@ class TestOverlapRelayAcrossFamilyTransition(CustomTestCase):
         was already tolerated and must stay tolerated."""
         idx = torch.tensor([0])
         with mock.patch(
-            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            "flliper.srt.speculative.spec_utils.spec_need_hidden_states",
             return_value=True,
         ):
             fm = self._future_map()

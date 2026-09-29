@@ -51,7 +51,7 @@
 }
 ```
 
-### used for vLLM and SGLang
+### used for vLLM and fLLiper
 
 ```
 {

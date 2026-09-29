@@ -42,8 +42,8 @@ import pathlib
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -115,7 +115,7 @@ _NAME_MAP = {
 
 def _emitted(path):
     """{name: tensor} for everything the iterator yields."""
-    from sglang.srt.model_loader.weight_utils import gguf_quant_weights_iterator
+    from flliper.srt.model_loader.weight_utils import gguf_quant_weights_iterator
 
     return dict(gguf_quant_weights_iterator(path, dict(_NAME_MAP)))
 
@@ -134,7 +134,7 @@ class HazardTest(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.models import qwen3_moe
+        from flliper.srt.models import qwen3_moe
 
         src = inspect.getsource(qwen3_moe.Qwen3MoeSparseMoeBlock.__init__)
         self.assertIn(
@@ -164,7 +164,7 @@ class HazardTest(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.models import qwen2_moe
+        from flliper.srt.models import qwen2_moe
 
         src = inspect.getsource(qwen2_moe.Qwen2MoeSparseMoeBlock.__init__)
         self.assertIn(
@@ -182,7 +182,7 @@ class HazardTest(CustomTestCase):
         """
         import gguf
 
-        from sglang.srt.layers.quantization.gguf import UNQUANTIZED_TYPES
+        from flliper.srt.layers.quantization.gguf import UNQUANTIZED_TYPES
 
         layer_view = {t.name for t in UNQUANTIZED_TYPES}
         self.assertEqual(layer_view, {"F32", "F16", "BF16"})

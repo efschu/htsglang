@@ -13,7 +13,7 @@ The budget keeps the ceiled charge; only the log counters change.
 
 import inspect
 
-from sglang.srt.managers.schedule_policy import PrefillAdder
+from flliper.srt.managers.schedule_policy import PrefillAdder
 
 
 def _adder(page=64):

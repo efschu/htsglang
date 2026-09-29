@@ -1,4 +1,4 @@
-"""fnFL2 H40 (SGLANG_QWEN4_PLE_DECODE_PREAD): the verify round's PLE rows,
+"""fnFL2 H40 (FLLIPER_QWEN4_PLE_DECODE_PREAD): the verify round's PLE rows,
 read by pread worker processes before the replay, served from a host stage.
 
 Desk only (CPU, real worker processes, real files; the kernel runs in the
@@ -46,12 +46,12 @@ from unittest import mock
 import torch
 from triton.runtime.interpreter import InterpretedFunction
 
-from sglang.srt.environ import envs
-from sglang.srt.models import qwen4_exp_ple_decode_pread as dp
-from sglang.srt.models import qwen4_exp_ple_prefetch as pf
-from sglang.srt.models import qwen4_exp_ple_table as pt
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.models import qwen4_exp_ple_decode_pread as dp
+from flliper.srt.models import qwen4_exp_ple_prefetch as pf
+from flliper.srt.models import qwen4_exp_ple_table as pt
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
@@ -62,14 +62,14 @@ DIM = 160
 RB = DIM * 2
 HEADER = 100
 EOS = 7
-LOGGER = "sglang.srt.models.qwen4_exp_ple_decode_pread"
+LOGGER = "flliper.srt.models.qwen4_exp_ple_decode_pread"
 SRC = pathlib.Path(dp.__file__).resolve().parents[1]
 
 STAGED = InterpretedFunction(dp._gather_ple_embedding_staged_kernel.fn)
 
 
 def _plain_kernel():
-    from sglang.srt.models import qwen4_exp as q
+    from flliper.srt.models import qwen4_exp as q
 
     return InterpretedFunction(q._gather_ple_embedding_from_shards_kernel.fn)
 
@@ -112,7 +112,7 @@ def _same(a, b):
 
 def _emb(seed=7, eos=EOS, sizes=None):
     """A Qwen4ExpNGramEmbedding stand-in: ngram 3, 8 heads per n-gram."""
-    from sglang.srt.models import qwen4_exp as q
+    from flliper.srt.models import qwen4_exp as q
 
     g = torch.Generator().manual_seed(seed)
     if sizes is None:
@@ -134,7 +134,7 @@ def _small_emb():
 
 def _model_ids(emb, ctx):
     """The model's ids for [bs, hist + w]: cat(history, row).unfold -> _hash_contexts."""
-    from sglang.srt.models import qwen4_exp as q
+    from flliper.srt.models import qwen4_exp as q
 
     pool = types.SimpleNamespace(ple_window_cache=None)
     windows = ctx.unfold(1, 3, 1).reshape(-1, 3)
@@ -524,9 +524,9 @@ class TestSwitch(CustomTestCase):
         with tempfile.TemporaryDirectory() as d:
             f = _Files(d)
             fn = functools.partial(pf.PleHashParams.of, _small_emb())
-            with envs.SGLANG_QWEN4_PLE_DECODE_PREAD.override(False):
+            with envs.FLLIPER_QWEN4_PLE_DECODE_PREAD.override(False):
                 self.assertIsNone(dp.make_ple_decode_stager(f.table, fn, vocab_start=0, vocab_end=TOTAL))
-            with envs.SGLANG_QWEN4_PLE_DECODE_PREAD.override(True):
+            with envs.FLLIPER_QWEN4_PLE_DECODE_PREAD.override(True):
                 self.assertIsNone(dp.make_ple_decode_stager(f.table, None, vocab_start=0, vocab_end=TOTAL))
                 st = dp.make_ple_decode_stager(f.table, fn, vocab_start=0, vocab_end=TOTAL, device=torch.device("cpu"))
                 try:
@@ -543,7 +543,7 @@ class TestSwitch(CustomTestCase):
                     self.assertEqual(made[0].tolist(), [st.stage_ids.data_ptr(), st.stage_rows.data_ptr()])
                 finally:
                     st.close()
-        self.assertTrue(envs.SGLANG_QWEN4_PLE_DECODE_PREAD.get())  # default on
+        self.assertTrue(envs.FLLIPER_QWEN4_PLE_DECODE_PREAD.get())  # default on
 
     def test_oversized_gather_keeps_the_plain_kernel(self):
         with tempfile.TemporaryDirectory() as d:
@@ -573,7 +573,7 @@ class TestWiring(CustomTestCase):
     def _gather(self, stager):
         """``Qwen4ExpPinnedHostEmbedding.gather`` on a checkpoint table, the
         plain kernel replaced by a recorder."""
-        from sglang.srt.models import qwen4_exp as q
+        from flliper.srt.models import qwen4_exp as q
 
         calls = []
 

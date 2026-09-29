@@ -2,16 +2,16 @@ import unittest
 
 import openai
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.matched_stop_kit import MatchedStopMixin
-from sglang.test.kits.radix_cache_server_kit import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import is_hip, kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.kits.matched_stop_kit import MatchedStopMixin
+from flliper.test.kits.radix_cache_server_kit import (
     gen_radix_tree,
     run_radix_attention_test,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
     DEFAULT_TARGET_MODEL_DFLASH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -63,10 +63,10 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
             launch_args.append("--disable-overlap-schedule")
         launch_args.extend(cls.other_launch_args)
         with (
-            envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.override(cls.overlap_plan_stream),
-            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
-            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),
-            envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True),
+            envs.FLLIPER_ENABLE_OVERLAP_PLAN_STREAM.override(cls.overlap_plan_stream),
+            envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+            envs.FLLIPER_ENABLE_ASYNC_ASSERT.override(True),
+            envs.FLLIPER_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True),
         ):
             cls.process = popen_launch_server(
                 cls.model,

@@ -1,4 +1,4 @@
-"""H97 (rc9m, boot dkrnfbar1rc9m09260642, rid weg2-18-15): the group must
+"""H97 (rc9m, boot dkrnfbar1rc9m09260642, rid pdflip-18-15): the group must
 admit a depth EVERY rank can realize.
 
 MEASURED (D log lines 53969-54036, 06:57:28): TP0 voted 18112 (host anchor
@@ -20,17 +20,17 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+from flliper.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
 
 FLOOR_ATTR = "_tp_match_floor_group"
-RID = "weg2-18-15"
+RID = "pdflip-18-15"
 SLOTS = 8
 
 
@@ -96,7 +96,7 @@ def _req():
 def _group(trees):
     """What the fixed scheduler plants: MIN arm, MAX arm, and -- on skew -- the
     realizability MIN, each reduced over the three ranks."""
-    from sglang.srt.managers import tp_match_floor as m
+    from flliper.srt.managers import tp_match_floor as m
 
     canonical = [RID]
     local = {r: {RID: t.depth} for r, t in trees.items()}
@@ -145,13 +145,13 @@ class TestRc9mSkewNeverKills(unittest.TestCase):
         self.assertEqual({_admit(t, planted) for t in trees.values()}, {16384})
 
     def test_no_skew_no_second_round(self):
-        from sglang.srt.managers import tp_match_floor as m
+        from flliper.srt.managers import tp_match_floor as m
 
         self.assertEqual(m.skewed_rids({RID: 16384}, {RID: 16384}), {})
         self.assertEqual(m.skewed_rids({RID: 0}, {RID: 19712}), {})  # zero verdict owns it
 
     def test_max_arm_is_min_neutral_for_absent(self):
-        from sglang.srt.managers import tp_match_floor as m
+        from flliper.srt.managers import tp_match_floor as m
 
         p = m.build_usable_max_payload([RID, "other"], {RID: 100}, 4)
         self.assertEqual(p[0], -100)
@@ -162,7 +162,7 @@ class TestRc9mSkewNeverKills(unittest.TestCase):
         # pass without skew keeps the old single-reduce shape on every rank.
         import inspect
 
-        from sglang.srt.managers import scheduler as s
+        from flliper.srt.managers import scheduler as s
 
         src = inspect.getsource(s)
         i = src.index("_usable_skew = tp_match_floor.skewed_rids(")

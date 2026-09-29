@@ -51,12 +51,12 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.scheduler_components.invariant_checker import (
+from flliper.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
-from sglang.srt.mem_cache.allocator import mamba as mamba_allocator_module
-from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.allocator import mamba as mamba_allocator_module
+from flliper.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from flliper.test.ci.ci_register import register_cpu_ci
 
 #: Resolved rather than imported so that a tree WITHOUT the wache fails these
 #: tests one by one -- a collection error would collapse the allocator half and
@@ -132,7 +132,7 @@ class TestTheAllocatorRefusesTheSecondRelease(unittest.TestCase):
         taken = alloc.alloc(1)
         alloc.free(taken)
         with self.assertLogs(
-            "sglang.srt.mem_cache.allocator.mamba", level="ERROR"
+            "flliper.srt.mem_cache.allocator.mamba", level="ERROR"
         ) as logs:
             with self.assertRaises(MambaSlotDoubleFree):
                 alloc.free(taken)
@@ -140,7 +140,7 @@ class TestTheAllocatorRefusesTheSecondRelease(unittest.TestCase):
         self.assertIn("#924", line)
         self.assertIn("DOUBLE FREE", line)
 
-    def test_an_alloc_group_returns_its_remainder_without_tripping_the_wache(self):
+    def test_an_alloc_group_returns_its_remainder_without_tripping_the_guard(self):
         alloc = MambaSlotAllocator(size=SPECIMEN_TOTAL, device="cpu")
         alloc.alloc_group_begin(4)
         alloc.alloc(1)
@@ -201,7 +201,7 @@ class TestTheMambaLedgerNamesTheDuplicate(unittest.TestCase):
 
     @staticmethod
     def _checker(free_list, *, tree, evictable=0, published=None):
-        from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+        from flliper.srt.managers.scheduler_components.pool_stats_observer import (
             PoolStats,
         )
 

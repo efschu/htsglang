@@ -13,9 +13,9 @@ import tempfile
 import threading
 import time
 
-from sglang.srt.planner import split_probe as sp
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import split_probe as sp
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -138,7 +138,7 @@ class TestLaunchCommand(CustomTestCase):
         self.assertIn("--enable-metrics", cmd)
         self.assertIn("--enable-metrics-for-all-schedulers", cmd)
         env = sp.launch_env(base={})
-        self.assertEqual(env["SGLANG_ENABLE_METRICS_DEVICE_TIMER"], "1")
+        self.assertEqual(env["FLLIPER_ENABLE_METRICS_DEVICE_TIMER"], "1")
 
     def test_auto_pins_no_vector_and_a_candidate_pins_exactly_its_own(self):
         self.assertNotIn("--rank-mlp-ratio", sp.launch_command("/m", "auto", [1], 1))
@@ -146,8 +146,8 @@ class TestLaunchCommand(CustomTestCase):
         self.assertEqual(cmd[cmd.index("--rank-mlp-ratio") + 1], "6,1,1")
 
     def test_an_inherited_vector_override_cannot_win_over_the_pinned_one(self):
-        env = sp.launch_env(base={"SGLANG_UNEVEN_MLP_VECTOR": "9,1,1"})
-        self.assertNotIn("SGLANG_UNEVEN_MLP_VECTOR", env)
+        env = sp.launch_env(base={"FLLIPER_UNEVEN_MLP_VECTOR": "9,1,1"})
+        self.assertNotIn("FLLIPER_UNEVEN_MLP_VECTOR", env)
 
 
 class TestPrefillLineParsing(CustomTestCase):

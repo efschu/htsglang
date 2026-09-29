@@ -12,11 +12,11 @@ and full-vocab.
 ========================  THE SEAM (r2 GPU wiring)  ========================
 ``run_case_config(case, which)`` must, per boot:
 
-1.  BOOT: launch ``python -m sglang.launch_server`` (or Engine API) with the
+1.  BOOT: launch ``python -m flliper.launch_server`` (or Engine API) with the
     row's server args (``case.test_config`` / ``reference_config``) INCLUDING
-    the pinned ``random_seed`` -- never let sglang randomize it -- and the
+    the pinned ``random_seed`` -- never let flliper randomize it -- and the
     row's env baked into the MAIN process environment before launch. Do NOT
-    rely on worker-side env toggles: sglang scrubs custom env for scheduler
+    rely on worker-side env toggles: flliper scrubs custom env for scheduler
     TP workers, making them silent no-ops (memory ``full-perf-testen``).
     Model path comes from a ``model_role -> local path`` map resolved at the
     GPU window (dense_lane / moe_fp8 / moe_marlin vehicles).
@@ -149,11 +149,11 @@ _GPU_ARGS: Dict[int, List[str]] = {
     3: ["--rank-gpu-id", "0,1,2", "--rank-gpu-memory-mib", "26000,17000,17000"],
 }
 
-_PORT = int(os.environ.get("SGLANG_DET_PORT", "30124"))
-_WORKDIR = Path(os.environ.get("SGLANG_DET_WORKDIR", "/tmp/det124"))
-_HEALTH_TIMEOUT_S = int(os.environ.get("SGLANG_DET_HEALTH_TIMEOUT_S", "2400"))
-_GPU_WAIT_S = int(os.environ.get("SGLANG_DET_GPU_WAIT_S", "1800"))
-_GEN_TIMEOUT_S = int(os.environ.get("SGLANG_DET_GEN_TIMEOUT_S", "1800"))
+_PORT = int(os.environ.get("FLLIPER_DET_PORT", "30124"))
+_WORKDIR = Path(os.environ.get("FLLIPER_DET_WORKDIR", "/tmp/det124"))
+_HEALTH_TIMEOUT_S = int(os.environ.get("FLLIPER_DET_HEALTH_TIMEOUT_S", "2400"))
+_GPU_WAIT_S = int(os.environ.get("FLLIPER_DET_GPU_WAIT_S", "1800"))
+_GEN_TIMEOUT_S = int(os.environ.get("FLLIPER_DET_GEN_TIMEOUT_S", "1800"))
 
 # Fixed gate prompts (plain constants -> identical across every arm/boot).
 #
@@ -410,7 +410,7 @@ def _ensure_server(case: CaseSpec, which: str) -> _Server:
     log_path = boot_dir / "server.log"
 
     cmd = [
-        sys.executable, "-m", "sglang.launch_server",
+        sys.executable, "-m", "flliper.launch_server",
         "--model-path", role["model_path"],
     ]
     if role["tokenizer_path"]:
@@ -465,12 +465,12 @@ def _ensure_server(case: CaseSpec, which: str) -> _Server:
     # If this arm claims MoE offload, verify it actually engaged (a silently
     # ignored env would make offload-vs-no-offload compare base-vs-base --
     # the exact silent-no-op failure mode memory full-perf-testen warns about).
-    frac = env_extra.get("SGLANG_MOE_RESIDENT_EXPERT_FRACTION")
+    frac = env_extra.get("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION")
     if frac is not None and float(frac) < 1.0:
         if "expert-offload installed" not in log_path.read_text():
             teardown_server()
             raise RuntimeError(
-                f"{case.case_id}:{which}: SGLANG_MOE_RESIDENT_EXPERT_FRACTION="
+                f"{case.case_id}:{which}: FLLIPER_MOE_RESIDENT_EXPERT_FRACTION="
                 f"{frac} was set but the boot log never reported 'expert-"
                 f"offload installed' -- the env did not reach the model "
                 f"runner; refusing to compare base-vs-base."

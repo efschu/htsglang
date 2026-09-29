@@ -4,12 +4,12 @@ from typing import Dict, List, TypedDict
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_dtype_str
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+from flliper.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_dtype_str
+from flliper.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     get_config_file_name,
 )
-from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.hf_transformers_utils import get_config
+from flliper.srt.utils import is_gfx95_supported, is_hip
+from flliper.srt.utils.hf_transformers_utils import get_config
 
 
 class BenchmarkConfig(TypedDict):

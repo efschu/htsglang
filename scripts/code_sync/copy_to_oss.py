@@ -164,7 +164,7 @@ def get_oss_repo(dry_run):
             return
 
     temp_dir = tempfile.mkdtemp()
-    oss_root = os.path.join(temp_dir, "sglang")
+    oss_root = os.path.join(temp_dir, "flliper")
     print(f"\nCreated temporary directory for OSS repo: {temp_dir}")
 
     repo_url = f"https://{gh_token}@github.com/sgl-project/sglang.git"
@@ -514,7 +514,7 @@ def main():
         # 2. Get the OSS repo
         oss_root, temp_dir = get_oss_repo(args.dry_run)
 
-        # 3. Find the latest OSS commit that was synced into sglang-private.
+        # 3. Find the latest OSS commit that was synced into flliper-private.
         #    This is the correct base for our patch, since the private repo's
         #    code is based on this sync point.
         base_oss_commit = find_latest_oss_sync_commit()

@@ -1,13 +1,13 @@
-"""Unit tests for ``sglang.srt.configs.locate_anything.LocateAnythingConfig``."""
+"""Unit tests for ``flliper.srt.configs.locate_anything.LocateAnythingConfig``."""
 
 import unittest
 
 from transformers.models.qwen2 import Qwen2Config
 
-from sglang.srt.configs import LocateAnythingConfig
-from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.configs import LocateAnythingConfig
+from flliper.srt.configs.kimi_vl_moonvit import MoonViTConfig
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -52,8 +52,8 @@ class TestLocateAnythingConfig(CustomTestCase):
         self.assertIs(cfg.text_config, text)
 
     def test_registered_in_config_registry(self):
-        """``model_type`` resolves to the config class via SGLang's registry."""
-        from sglang.srt.utils.hf_transformers.common import _CONFIG_REGISTRY
+        """``model_type`` resolves to the config class via fLLiper's registry."""
+        from flliper.srt.utils.hf_transformers.common import _CONFIG_REGISTRY
 
         self.assertIs(_CONFIG_REGISTRY.get("locateanything"), LocateAnythingConfig)
 

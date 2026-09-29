@@ -7,7 +7,7 @@ C``: Form A D bs2 needed scratch 80 on the 3080 workers (residency 0.29/0.30
 instead of 0.51/0.48), bs6 240 ids -- not representable.
 
 WHAT MUST HOLD.
-(1) SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES=N >= 2: the capture bound is
+(1) FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES=N >= 2: the capture bound is
     ``min(ids, E - R) <= N x C``; wave 1 spills what it cannot hold instead of
     setting the sticky error, the next wave serves exactly those lanes; every
     (token, k) lane is computed in exactly one wave, from a row that holds its
@@ -21,7 +21,7 @@ WHAT MUST HOLD.
     carries seats 1..6 with two waves.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -38,9 +38,9 @@ from typing import NamedTuple
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe import expert_pool_device as ep
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.layers.moe import expert_pool_device as ep
+from flliper.test.test_utils import CustomTestCase
 
 
 def _tables(E, R, C, S, width=256, demand=False, pad=None):
@@ -169,7 +169,7 @@ class TestRunPoolWaves(CustomTestCase):
     bank the way the Marlin MoE does -- by route, weighted, summed over k."""
 
     def _cache(self, E, R, C, S, pad):
-        from sglang.srt.layers.moe.expert_offload import MoEExpertOffloadCache
+        from flliper.srt.layers.moe.expert_offload import MoEExpertOffloadCache
 
         t, b, hot = _tables(E, R, C, S, width=256, pad=pad)
         value = [float((e * 7) % 13 + 1) for e in range(E)]
@@ -240,11 +240,11 @@ class TestRunPoolWaves(CustomTestCase):
 
 class TestSwitch(CustomTestCase):
     def test_default_is_off(self):
-        self.assertEqual(envs.SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES.get(), 0)
-        self.assertEqual(envs.SGLANG_DEBUG_MOE_POOL_DEMAND.get(), 0)
+        self.assertEqual(envs.FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES.get(), 0)
+        self.assertEqual(envs.FLLIPER_DEBUG_MOE_POOL_DEMAND.get(), 0)
 
     def test_pool_waves_off_is_one_and_on_is_the_ceiling(self):
-        from sglang.srt.layers.moe.expert_offload import MoEExpertOffloadCache
+        from flliper.srt.layers.moe.expert_offload import MoEExpertOffloadCache
 
         t, b, _ = _tables(E=177, R=85, C=48, S=12)
         cache = object.__new__(MoEExpertOffloadCache)
@@ -252,10 +252,10 @@ class TestSwitch(CustomTestCase):
         cache._pool_waves_seen = {}
         cache.layer = types.SimpleNamespace(layer_id=0)
         self.assertEqual(cache.pool_waves(240), 1)
-        with envs.SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES.override(2):
+        with envs.FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES.override(2):
             self.assertEqual(cache.pool_waves(240), 2)
             self.assertEqual(cache.pool_waves(40), 1)  # bs1 captures one wave
-        with envs.SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES.override(1):
+        with envs.FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES.override(1):
             self.assertEqual(cache.pool_waves(240), 1)
 
     def test_off_tables_carry_no_demand_counters(self):
@@ -285,7 +285,7 @@ class TestDemandProbe(CustomTestCase):
         self.assertEqual(ep.take_demand_report(t), (0, 0, 0))
 
     def test_the_report_line(self):
-        from sglang.srt.layers.moe import pool_demand_probe as p
+        from flliper.srt.layers.moe import pool_demand_probe as p
 
         line = p.demand_line([(0, 20, 0, 64, 48, 2), (23, 51, 3, 64, 48, 2),
                               (47, 30, 0, 64, 48, 2)], replays=64)
@@ -300,7 +300,7 @@ _INTERP = r'''
 import os, random, sys
 os.environ["TRITON_INTERPRET"] = "1"
 import torch
-from sglang.srt.layers.moe import expert_pool_device as ep
+from flliper.srt.layers.moe import expert_pool_device as ep
 
 def snap(t, b):
     out = {}
@@ -357,7 +357,7 @@ class TestPlannerWaves(CustomTestCase):
         return types.SimpleNamespace(rank=rank, local_experts=E, resident_rows=R, scratch_rows=S)
 
     def test_x177_scratch_carries_seats_one_to_six_with_two_waves(self):
-        from sglang.srt.planner import expert_residency as er
+        from flliper.srt.planner import expert_residency as er
 
         fits = [self._fit(0, 193, 12, 118), self._fit(1, 145, 74, 48), self._fit(2, 177, 85, 48)]
         for seats in range(1, 7):
@@ -374,14 +374,14 @@ class TestPlannerWaves(CustomTestCase):
         _l, refusal = er.pool_step_rows_check(
             [self._fit(0, 193, 12, 40)], seats=6, verify_tokens=4, top_k=10,
             pool_mode=True, marker="M", label="D", waves=2)
-        self.assertIn("SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES", refusal)
+        self.assertIn("FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES", refusal)
 
     def test_the_wave_cap_is_read_off_group_d_env(self):
-        from sglang.srt.planner import expert_residency as er
+        from flliper.srt.planner import expert_residency as er
 
         self.assertEqual(er.pool_overflow_waves({}), 1)
-        self.assertEqual(er.pool_overflow_waves({"SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES": "0"}), 1)
-        self.assertEqual(er.pool_overflow_waves({"SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES": "2"}), 2)
+        self.assertEqual(er.pool_overflow_waves({"FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES": "0"}), 1)
+        self.assertEqual(er.pool_overflow_waves({"FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES": "2"}), 2)
 
 
 if __name__ == "__main__":

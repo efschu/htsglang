@@ -12,9 +12,9 @@ import sys
 import types
 import uuid
 
-from sglang.srt.plugins.hook_registry import HookRegistry, HookType, plugin_hook
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.plugins.hook_registry import HookRegistry, HookType, plugin_hook
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -329,7 +329,7 @@ class TestCrossTargetConflict(_HookTestCase):
 
         HookRegistry.register(f"{name}.Original.foo", method_repl, HookType.REPLACE)
 
-        with self.assertLogs("sglang.srt.plugins.hook_registry", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.plugins.hook_registry", level="WARNING") as cm:
             HookRegistry.apply_hooks()
 
         self.assertTrue(any("will override" in msg for msg in cm.output))

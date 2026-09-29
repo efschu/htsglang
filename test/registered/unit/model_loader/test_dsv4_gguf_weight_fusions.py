@@ -5,7 +5,7 @@
 handing them to a parameter:
 
 * ``compressor.wkv`` + ``compressor.wgate`` -> ``compressor.wkv_gate``
-* ``wq_a`` + ``wkv`` -> ``wqkv_a`` (under ``SGLANG_OPT_FUSE_WQA_WKV``)
+* ``wq_a`` + ``wkv`` -> ``wqkv_a`` (under ``FLLIPER_OPT_FUSE_WQA_WKV``)
 
 Both sites used to select their inputs by a ``.weight`` SUFFIX while the
 compressor branch was GUARDED by the ``.compressor.w`` substring. On a GGUF
@@ -43,14 +43,14 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.models.deepseek_v4 import (
+from flliper.srt.environ import envs
+from flliper.srt.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
     _is_wqkv_a_fusion_input,
     _split_compressor_weight_name,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -141,8 +141,8 @@ def _run_load(
         name: _CapturingParam(name, sink, dtype) for name, dtype in param_specs.items()
     }
     stub = _make_stub(quant_name, params)
-    with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
-        with envs.SGLANG_OPT_FUSE_WQA_WKV.override(fuse_wqa_wkv):
+    with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
+        with envs.FLLIPER_OPT_FUSE_WQA_WKV.override(fuse_wqa_wkv):
             DeepseekV4ForCausalLM.load_weights(stub, iter(stream))
     sink.pop("__lock__", None)
     return sink
@@ -221,7 +221,7 @@ class TestCompressorFusionOnGguf(CustomTestCase):
             _COMPRESSOR_PARAM: _CapturingParam(_COMPRESSOR_PARAM, sink, torch.bfloat16)
         }
         stub = _make_stub("gguf", params)
-        with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
+        with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
             with self.assertRaises(AssertionError):
                 DeepseekV4ForCausalLM.load_weights(stub, iter(stream[:3]))
 
@@ -407,7 +407,7 @@ class TestWqkvAFusionOnGguf(CustomTestCase):
         self.assertIn(f"{_WQKV_A}.qweight_type", message)
         self.assertIn("Q8_0", message)
         self.assertIn("Q5_0", message)
-        self.assertIn("SGLANG_OPT_FUSE_WQA_WKV=0", message)
+        self.assertIn("FLLIPER_OPT_FUSE_WQA_WKV=0", message)
 
     def test_refusal_fires_on_the_markers_before_any_payload_is_read(self):
         """Both markers arrive in the iterator's first pass; refuse there."""
@@ -425,7 +425,7 @@ class TestWqkvAFusionOnGguf(CustomTestCase):
             for name in (f"{_WQKV_A}.qweight", f"{_WQKV_A}.qweight_type")
         }
         stub = _make_stub("gguf", params)
-        with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
+        with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
             with self.assertRaises(ValueError):
                 DeepseekV4ForCausalLM.load_weights(stub, probe())
 

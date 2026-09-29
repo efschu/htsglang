@@ -3,7 +3,7 @@
 
 Consumes what the run already writes -- no new instrument:
 
-* ``SGLANG_FORWARD_PEAK_PATH`` per-rank JSON (``model_executor/forward_peak.py``):
+* ``FLLIPER_FORWARD_PEAK_PATH`` per-rank JSON (``model_executor/forward_peak.py``):
   ``peak_bytes_max`` is torch's own per-forward peak and
   ``nvml_free_bytes_min`` is the driver's, both per phase and token bucket.
 * the corridor CSV written by ``sample_corridor.sh``.
@@ -82,7 +82,7 @@ def main() -> int:
     off, on = _peaks(args.off), _peaks(args.on)
     if not off or not on:
         print(
-            "NO DATA -- forward_peak wrote nothing. Was SGLANG_FORWARD_PEAK_PATH set "
+            "NO DATA -- forward_peak wrote nothing. Was FLLIPER_FORWARD_PEAK_PATH set "
             "in BOTH arms, and did the ranks exit cleanly (the dump is at exit)?"
         )
         return 2

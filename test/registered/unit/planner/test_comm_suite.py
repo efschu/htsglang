@@ -27,8 +27,8 @@ import time
 import unittest
 from unittest import mock
 
-from sglang.srt.planner import comm_suite, rig_artifact, rig_profile_source
-from sglang.srt.planner.comm_suite import (
+from flliper.srt.planner import comm_suite, rig_artifact, rig_profile_source
+from flliper.srt.planner.comm_suite import (
     ARMS,
     ArmResult,
     CommSuiteJobStore,
@@ -317,7 +317,7 @@ class GpuArmShapeTest(unittest.TestCase):
                        "bandwidth_gbs": 4.44,
                        "transport": "host staging (pinned)"}],
         }
-        with mock.patch("sglang.srt.rigmon.card_probe._run_probe_subprocess",
+        with mock.patch("flliper.srt.rigmon.card_probe._run_probe_subprocess",
                         return_value=(profile, "/tmp/x.json")):
             res = comm_suite._arm_card_probe(
                 comm_suite._RunCtx(job=mock.MagicMock()))
@@ -500,7 +500,7 @@ class WebuiEndpointTest(unittest.TestCase):
     """The share ENDPOINTS must not be a way around the preview rule."""
 
     def test_submit_refuses_without_a_previewed_report(self):
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         out = webui.share_rig_submit_payload({"confirmed": True,
                                               "token": "ghp_x" * 6})
@@ -508,7 +508,7 @@ class WebuiEndpointTest(unittest.TestCase):
         self.assertIn("preview first", out["error"])
 
     def test_submit_refuses_without_confirmation_and_posts_nothing(self):
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         calls = []
 
@@ -527,7 +527,7 @@ class WebuiEndpointTest(unittest.TestCase):
         self.assertTrue(spy.called)
 
     def test_preview_says_so_when_there_is_nothing_to_share(self):
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         with mock.patch.object(rig_profile_source, "to_sections",
                                side_effect=AssertionError("must not be called")):
@@ -536,7 +536,7 @@ class WebuiEndpointTest(unittest.TestCase):
         self.assertIn("nothing to share", out["error"])
 
     def test_token_endpoint_never_returns_the_token(self):
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp},
@@ -550,7 +550,7 @@ class WebuiEndpointTest(unittest.TestCase):
                 self.assertFalse(out["token_stored"])
 
     def test_the_arm_catalogue_endpoint_measures_nothing(self):
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         with mock.patch.object(comm_suite.JOBS, "start",
                                side_effect=AssertionError("must not start")):

@@ -70,8 +70,8 @@ nothing" from "the cache was never asked".
 
 import unittest
 
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

@@ -28,7 +28,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_dequant_gemv import (
+from flliper.srt.layers.quantization.fp8_dequant_gemv import (
     FUSED_GEMV_MAX_ROWS,
     fused_block_dequant_gemv,
     fused_channel_dequant_gemv,
@@ -36,7 +36,7 @@ from sglang.srt.layers.quantization.fp8_dequant_gemv import (
     fused_gemv_applicable,
     fused_gemv_enabled,
 )
-from sglang.srt.layers.quantization.fp8_utils import (
+from flliper.srt.layers.quantization.fp8_utils import (
     dequant_fp8_block_weight,
     dequant_fp8_weight,
 )
@@ -390,37 +390,37 @@ class TestChannelPurity(unittest.TestCase):
 
 
 class TestFusedGemvEnvSwitch(unittest.TestCase):
-    """``SGLANG_FP8_FUSED_GEMV=0`` must switch off BOTH variants.
+    """``FLLIPER_FP8_FUSED_GEMV=0`` must switch off BOTH variants.
 
     It exists for same-session A/B measurement; a flag that covered only one
     variant would compare two different things on two different checkpoints.
     """
 
     def setUp(self):
-        self._saved = os.environ.get("SGLANG_FP8_FUSED_GEMV")
+        self._saved = os.environ.get("FLLIPER_FP8_FUSED_GEMV")
         fused_gemv_enabled.cache_clear()
 
     def tearDown(self):
         if self._saved is None:
-            os.environ.pop("SGLANG_FP8_FUSED_GEMV", None)
+            os.environ.pop("FLLIPER_FP8_FUSED_GEMV", None)
         else:
-            os.environ["SGLANG_FP8_FUSED_GEMV"] = self._saved
+            os.environ["FLLIPER_FP8_FUSED_GEMV"] = self._saved
         fused_gemv_enabled.cache_clear()
 
     def test_default_is_on(self):
-        os.environ.pop("SGLANG_FP8_FUSED_GEMV", None)
+        os.environ.pop("FLLIPER_FP8_FUSED_GEMV", None)
         fused_gemv_enabled.cache_clear()
         self.assertTrue(fused_gemv_enabled())
 
     def test_falsy_spellings_all_disable(self):
         for v in ("0", "false", "False", "off", "no"):
-            os.environ["SGLANG_FP8_FUSED_GEMV"] = v
+            os.environ["FLLIPER_FP8_FUSED_GEMV"] = v
             fused_gemv_enabled.cache_clear()
             self.assertFalse(fused_gemv_enabled(), f"{v!r} should disable")
 
     @unittest.skipUnless(CUDA, "needs a GPU")
     def test_zero_disables_both_variants(self):
-        os.environ["SGLANG_FP8_FUSED_GEMV"] = "0"
+        os.environ["FLLIPER_FP8_FUSED_GEMV"] = "0"
         fused_gemv_enabled.cache_clear()
 
         wb, sb, bn, bk = _mk()
@@ -437,7 +437,7 @@ class TestFusedGemvEnvSwitch(unittest.TestCase):
 
     @unittest.skipUnless(CUDA, "needs a GPU")
     def test_default_leaves_both_variants_live(self):
-        os.environ.pop("SGLANG_FP8_FUSED_GEMV", None)
+        os.environ.pop("FLLIPER_FP8_FUSED_GEMV", None)
         fused_gemv_enabled.cache_clear()
         wb, sb, bn, bk = _mk()
         xb = torch.randn(wb.shape[1], device="cuda", dtype=torch.bfloat16)
@@ -465,7 +465,7 @@ class TestRowGateCoversADraftBlock(unittest.TestCase):
     """
 
     def test_the_gate_admits_a_full_draft_block(self):
-        from sglang.srt.models.dflash import DEFAULT_DFLASH_BLOCK_SIZE
+        from flliper.srt.models.dflash import DEFAULT_DFLASH_BLOCK_SIZE
 
         self.assertGreaterEqual(
             FUSED_GEMV_MAX_ROWS,
@@ -483,7 +483,7 @@ class TestRowGateCoversADraftBlock(unittest.TestCase):
         """
         import inspect
 
-        import sglang.srt.layers.quantization.fp8_dequant_gemv as mod
+        import flliper.srt.layers.quantization.fp8_dequant_gemv as mod
 
         src = inspect.getsource(mod)
         block_ms = {
@@ -497,7 +497,7 @@ class TestRowGateCoversADraftBlock(unittest.TestCase):
 
     @unittest.skipUnless(CUDA, "needs a GPU")
     def test_a_draft_block_dispatches_to_the_fused_path(self):
-        from sglang.srt.models.dflash import DEFAULT_DFLASH_BLOCK_SIZE
+        from flliper.srt.models.dflash import DEFAULT_DFLASH_BLOCK_SIZE
 
         w, _s, K = _mk()[0], None, 256
         w = torch.randn(512, K, device="cuda").to(torch.float8_e4m3fn)

@@ -159,7 +159,7 @@ def parse_decode(lines) -> list:
     return out
 
 
-def parse_bar1_geometrie(lines) -> dict | None:
+def parse_bar1_geometry(lines) -> dict | None:
     """The BAR1 slot geometry of the FIRST setup line, or None.
 
     First and not last on purpose: a boot builds one region per communicator
@@ -181,7 +181,7 @@ def parse_bar1_geometrie(lines) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def kollektiv_bytes(new_token: int, hidden: int, elem_bytes: int = 2) -> int:
+def collective_bytes(new_token: int, hidden: int, elem_bytes: int = 2) -> int:
     """Bytes of ONE tensor-parallel all_reduce for a batch of that size.
 
     The reduction after attention output projection and after the MLP down
@@ -217,7 +217,7 @@ def runden(payload_bytes: int, slot_bytes: int, welt: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def punkt_fenster(
+def point_window(
     rows: list, requests: int, min_new_token: int = LARGE_BATCH_TOKEN
 ) -> dict:
     """The last ``requests`` large batches per rank -- the measured point.
@@ -237,7 +237,7 @@ def punkt_fenster(
     return per_rank
 
 
-def wait_aggregat(batches: list) -> dict:
+def wait_aggregate(batches: list) -> dict:
     """compute / wait of one rank over one window. Medians plus the share.
 
     The share is built from SUMS, not from the median of the per-batch shares:
@@ -260,7 +260,7 @@ def wait_aggregat(batches: list) -> dict:
     }
 
 
-def im_fenster(rows: list, start: float, end: float) -> list:
+def in_window(rows: list, start: float, end: float) -> list:
     """Rows whose log timestamp falls into [start, end], both epoch seconds.
 
     The scheduler stamps whole LOCAL seconds, so the window is widened by one
@@ -277,7 +277,7 @@ def im_fenster(rows: list, start: float, end: float) -> list:
     return out
 
 
-def belegung(batches: list) -> dict:
+def occupancy(batches: list) -> dict:
     """Sum of per-batch gpu-ms against the wall clock the batches span.
 
     Over 100 % is not a rounding error, it is the finding: batches that
@@ -300,7 +300,7 @@ def belegung(batches: list) -> dict:
     }
 
 
-def decode_tick_aggregat(
+def decode_tick_aggregate(
     ticks: list, running_req: int | None = None, min_tok_s: float = WARMUP_TICK_TOK_S
 ) -> dict:
     """Accept length and generation rate per TICK, not per request.
@@ -344,7 +344,7 @@ def decode_tick_aggregat(
 # ---------------------------------------------------------------------------
 
 
-def lade_punkte(path: str) -> dict:
+def load_points(path: str) -> dict:
     """(arm, sessions) -> the point, from punkte.jsonl."""
     out: dict = {}
     if not path or not os.path.exists(path):
@@ -362,7 +362,7 @@ def lade_punkte(path: str) -> dict:
     return out
 
 
-def auswerten(sources: list, points: dict, hidden: int, welt: int) -> dict:
+def evaluate(sources: list, points: dict, hidden: int, welt: int) -> dict:
     """sources: [(arm, sessions, path)] -> one payload with every table in it."""
     lines_per_point = {}
     geo = None
@@ -370,21 +370,21 @@ def auswerten(sources: list, points: dict, hidden: int, welt: int) -> dict:
         with open(path, errors="replace") as f:
             lines = f.readlines()
         lines_per_point[(arm, sessions)] = lines
-        geo = geo or parse_bar1_geometrie(lines)
+        geo = geo or parse_bar1_geometry(lines)
 
     wait: list = []
     sizes: list = []
     decode: list = []
     #: The WINDOW BASIS of each point, for the work-match check below.
-    fenster_basis: dict = {}
+    window_basis: dict = {}
     for (arm, sessions), lines in sorted(lines_per_point.items()):
         point = points.get((arm, sessions)) or {}
         requests = ((point.get("prefill") or {}).get("requests")) or 0
-        fenster_basis[f"{arm}:{sessions}"] = requests
+        window_basis[f"{arm}:{sessions}"] = requests
         batches = parse_prefill_rang(lines)
-        window = punkt_fenster(batches, requests)
+        window = point_window(batches, requests)
         for rank in sorted(window):
-            agg = wait_aggregat(window[rank])
+            agg = wait_aggregate(window[rank])
             agg.update({"arm": arm, "sessions": sessions, "rang": rank})
             wait.append(agg)
         all_tp0 = [b for b in batches if b["rang"] == 0]
@@ -404,13 +404,13 @@ def auswerten(sources: list, points: dict, hidden: int, welt: int) -> dict:
                     "kleine_batches": len(
                         [b for b in all_tp0 if b["new_token"] < 1000]
                     ),
-                    "nutzlast_bytes": kollektiv_bytes(nt_max, hidden),
+                    "nutzlast_bytes": collective_bytes(nt_max, hidden),
                 }
             )
-            sizes[-1].update(belegung(large))
+            sizes[-1].update(occupancy(large))
         ticks = parse_decode(lines)
         for bs in sorted({t["running_req"] for t in ticks}):
-            d = decode_tick_aggregat(ticks, bs)
+            d = decode_tick_aggregate(ticks, bs)
             d.update({"arm": arm, "sessions": sessions, "running_req": bs})
             decode.append(d)
 
@@ -441,12 +441,12 @@ def auswerten(sources: list, points: dict, hidden: int, welt: int) -> dict:
         "wait": wait,
         "groessen": sizes,
         "decode": decode,
-        "fenster_basis": fenster_basis,
-        "fenster_basis_warnungen": fenster_basis_pruefen(fenster_basis),
+        "fenster_basis": window_basis,
+        "fenster_basis_warnungen": check_window_basis(window_basis),
     }
 
 
-def fenster_basis_pruefen(fenster_basis: dict) -> list:
+def check_window_basis(window_basis: dict) -> list:
     """Work-match check for s12, and it is a NARROWER one than #482's (#523).
 
     The rule of #482 governs counters that ACCUMULATE over a run: two arms may
@@ -474,40 +474,40 @@ def fenster_basis_pruefen(fenster_basis: dict) -> list:
     verdict to the report. What it may not do is stay quiet about it.
     """
     per_sessions: dict = {}
-    for key, requests in fenster_basis.items():
+    for key, requests in window_basis.items():
         arm, _, sessions = key.rpartition(":")
         per_sessions.setdefault(sessions, {})[arm] = requests
-    warnungen = []
+    warnings = []
     for sessions in sorted(per_sessions):
-        arme = per_sessions[sessions]
-        if len(arme) < 2:
+        arms = per_sessions[sessions]
+        if len(arms) < 2:
             continue
-        basen = set(arme.values())
-        if basen == {0}:
-            warnungen.append(
+        bases = set(arms.values())
+        if bases == {0}:
+            warnings.append(
                 f"sessions={sessions}: NO window basis for any arm "
-                f"({', '.join(sorted(arme))}) -- punkte.jsonl carried no "
+                f"({', '.join(sorted(arms))}) -- punkte.jsonl carried no "
                 "request count, so every arm aggregates its whole log "
                 "INCLUDING the warmup. The medians are comparable only if the "
                 "warmup share happens to match, which nothing here checks."
             )
-        elif len(basen) > 1:
-            detail = ", ".join(f"{arm}={arme[arm]}" for arm in sorted(arme))
-            warnungen.append(
+        elif len(bases) > 1:
+            detail = ", ".join(f"{arm}={arms[arm]}" for arm in sorted(arms))
+            warnings.append(
                 f"sessions={sessions}: the arms were aggregated over "
                 f"DIFFERENT window bases ({detail}"
-                + (", 0 = the whole log incl. warmup" if 0 in basen else "")
+                + (", 0 = the whole log incl. warmup" if 0 in bases else "")
                 + "). They did not do the same work; read the batch counts in "
                 "the table before comparing the rows."
             )
-    return warnungen
+    return warnings
 
 
 def _f(v, nk=1):
     return "-" if v is None else format(v, f".{nk}f")
 
 
-def tabellen(payload: dict) -> str:
+def tables(payload: dict) -> str:
     # The heading is kept verbatim: test_s12_log_analyse.py asserts the
     # substring "compute/wait je Rang" against this script's stdout, and the
     # validation doc quotes the section by that name.
@@ -585,14 +585,14 @@ def main() -> int:
         print("no --log given", file=sys.stderr)
         return 2
 
-    payload = auswerten(sources, lade_punkte(args.punkte), args.hidden, args.welt)
-    for warnung in payload["fenster_basis_warnungen"]:
-        print(f"WINDOW BASIS: {warnung}", file=sys.stderr)
+    payload = evaluate(sources, load_points(args.punkte), args.hidden, args.welt)
+    for warning in payload["fenster_basis_warnungen"]:
+        print(f"WINDOW BASIS: {warning}", file=sys.stderr)
     if args.json:
         with open(args.json, "w") as f:
             json.dump(payload, f, indent=2)
             f.write("\n")
-    print(tabellen(payload), end="")
+    print(tables(payload), end="")
     return 0
 
 

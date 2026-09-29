@@ -36,7 +36,7 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.pp_admission_congruence import build_pp_admission_decision
+from flliper.srt.managers.pp_admission_congruence import build_pp_admission_decision
 
 
 def _req(rid, prefix_indices, extend_input_len=7):
@@ -118,7 +118,7 @@ class PPAdmissionTracePrefixIndicesTensor796(unittest.TestCase):
     """
 
     def _trace_holder(self, lines):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         h = types.SimpleNamespace(
             token_to_kv_pool_allocator=types.SimpleNamespace(
@@ -147,7 +147,7 @@ class PPAdmissionTracePrefixIndicesTensor796(unittest.TestCase):
             def emit(self, record):
                 records.append(record)
 
-        logger = logging.getLogger("sglang.srt.managers.scheduler")
+        logger = logging.getLogger("flliper.srt.managers.scheduler")
         handler = _Grab()
         logger.addHandler(handler)
         prior = logger.level
@@ -190,7 +190,7 @@ class PPAdmissionTracePrefixIndicesTensor796(unittest.TestCase):
             def emit(self, record):
                 records.append(record)
 
-        logger = logging.getLogger("sglang.srt.managers.scheduler")
+        logger = logging.getLogger("flliper.srt.managers.scheduler")
         handler = _Grab()
         logger.addHandler(handler)
         prior = logger.level

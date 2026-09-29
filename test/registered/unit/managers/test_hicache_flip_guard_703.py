@@ -28,11 +28,11 @@ only stopped anyone from reaching them.
 
 from types import SimpleNamespace
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _sched(**server_args_over):
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from flliper.srt.disaggregation.utils import DisaggregationMode
 
     sa = dict(
         enable_hierarchical_cache=False,
@@ -51,7 +51,7 @@ def _sched(**server_args_over):
 
 
 def _hicache_guards(sched):
-    from sglang.srt.managers.phase_flip_runtime import flip_blocking_guards
+    from flliper.srt.managers.phase_flip_runtime import flip_blocking_guards
 
     return [g for g in flip_blocking_guards(sched) if "630" in g or "ierarchical" in g]
 
@@ -78,8 +78,8 @@ class TestHiCacheFlipGuard703(CustomTestCase):
         """CAN-FAIL PROOF. Removing the HiCache clause must not have neutered
         the function. A change that returned [] unconditionally would pass
         every assertion above and fail here."""
-        from sglang.srt.disaggregation.utils import DisaggregationMode
-        from sglang.srt.managers.phase_flip_runtime import flip_blocking_guards
+        from flliper.srt.disaggregation.utils import DisaggregationMode
+        from flliper.srt.managers.phase_flip_runtime import flip_blocking_guards
 
         sched = _sched(dual_group_lane=True)
         self.assertTrue(
@@ -114,7 +114,7 @@ class TestHiCacheFlipV1Blocker703(CustomTestCase):
     """
 
     def _blockers(self, **over):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         sa = ServerArgs.__new__(ServerArgs)
         sa.enable_phase_flip = True
@@ -171,17 +171,17 @@ class TestDiskTierFirstArmWarning703(CustomTestCase):
     """
 
     def setUp(self):
-        from sglang.srt.managers import phase_flip_runtime
+        from flliper.srt.managers import phase_flip_runtime
 
         phase_flip_runtime._DISK_TIER_ARM_WARNED = False
 
     def _arm(self, sched):
-        from sglang.srt.managers.phase_flip_runtime import flip_blocking_guards
+        from flliper.srt.managers.phase_flip_runtime import flip_blocking_guards
 
         return flip_blocking_guards(sched)
 
     def test_warns_once_and_does_not_block(self):
-        from sglang.srt.managers import phase_flip_runtime
+        from flliper.srt.managers import phase_flip_runtime
 
         sched = _sched(enable_hierarchical_cache=True, hicache_storage_backend="file")
         with self.assertLogs(phase_flip_runtime.logger, level="WARNING") as cm:
@@ -204,7 +204,7 @@ class TestDiskTierFirstArmWarning703(CustomTestCase):
     def test_silent_without_a_disk_tier(self):
         """CAN-FAIL BOUNDARY: host-only HiCache must not trip the disk warning.
         A version that warned unconditionally passes the test above."""
-        from sglang.srt.managers import phase_flip_runtime
+        from flliper.srt.managers import phase_flip_runtime
 
         for backend in (None, ""):
             with self.subTest(backend=backend):
@@ -218,7 +218,7 @@ class TestDiskTierFirstArmWarning703(CustomTestCase):
                 self.assertEqual([r for r in cm.output if "#630" in r], [])
 
     def test_silent_when_hierarchical_cache_is_off(self):
-        from sglang.srt.managers import phase_flip_runtime
+        from flliper.srt.managers import phase_flip_runtime
 
         sched = _sched(enable_hierarchical_cache=False, hicache_storage_backend="file")
         with self.assertLogs(phase_flip_runtime.logger, level="WARNING") as cm:

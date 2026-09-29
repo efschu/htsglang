@@ -8,7 +8,7 @@ id width) to a handful, and the freed rows become LRU cache."""
 import pytest
 import torch
 
-from sglang.srt.layers.moe import expert_pool_device as ep
+from flliper.srt.layers.moe import expert_pool_device as ep
 
 
 def _pool(E=12, R=2, lru=3, staging=2):

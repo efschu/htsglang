@@ -105,7 +105,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60)
 
@@ -232,7 +232,7 @@ def _victim(rank, wire, out_dir, case):
     pattern). ``pp_flip_counters`` is a stub whose ``sent`` either always
     reads 0 (the two-idle-upstream constellation under test) or reads a
     live file the upstream writes (the healthy-path regression case)."""
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     state = {"consumed": 0}
     if case == "healthy_upstream_sends":
@@ -317,7 +317,7 @@ def _worker(rank, init_file, out_dir, case, readiness_budget_env):
                 res["ok"] = True
             elif case == "shipped_no_upstream":
                 if readiness_budget_env is not None:
-                    from sglang.srt.managers.scheduler_pp_mixin import (
+                    from flliper.srt.managers.scheduler_pp_mixin import (
                         ENV_PROXY_READINESS_BUDGET,
                     )
 
@@ -510,7 +510,7 @@ class PPProxyReadinessNoOpWithoutCounters(unittest.TestCase):
         This gate must be a true no-op there: no multiprocessing needed to
         prove it, since the shipped function returns before touching
         anything else on ``self`` at all."""
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         h = types.SimpleNamespace(pp_flip_counters=None)
         h._pp_wait_for_proxy_readiness = types.MethodType(

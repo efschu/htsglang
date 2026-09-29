@@ -3,14 +3,14 @@ import unittest
 import torch
 from tqdm import tqdm
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsQuantInfo
-from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.activation import SiluAndMul
+from flliper.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from flliper.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsQuantInfo
+from flliper.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from flliper.srt.layers.moe.topk import TopK, TopKOutputFormat
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
 

@@ -15,7 +15,7 @@ pin down the four properties that make the reclaim real instead of incidental:
     graph-capture reserve.
 
 No GPU, no distributed init: collectives and the memory readings are patched,
-and `sgl_kernel` is stubbed before the sglang imports.
+and `sgl_kernel` is stubbed before the flliper imports.
 """
 
 import sys
@@ -48,17 +48,17 @@ _install_sgl_kernel_stub()
 
 import torch  # noqa: E402
 
-import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin  # noqa: E402
-from sglang.srt.environ import envs  # noqa: E402
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+import flliper.srt.model_executor.model_runner_kv_cache_mixin as mixin  # noqa: E402
+from flliper.srt.environ import envs  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     ExpertOffloadRelease,
     expert_offload_release_totals,
     expert_offload_released_device_bytes,
     record_expert_offload_release,
     reset_expert_offload_release,
 )
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -144,8 +144,8 @@ class TestLaneGate(CustomTestCase):
     """Both gate terms are env vars, hence world-uniform by construction."""
 
     def _active(self, *, regain, fraction):
-        with envs.SGLANG_MOE_OFFLOAD_KV_REGAIN.override(regain), (
-            envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.override(fraction)
+        with envs.FLLIPER_MOE_OFFLOAD_KV_REGAIN.override(regain), (
+            envs.FLLIPER_MOE_RESIDENT_EXPERT_FRACTION.override(fraction)
         ):
             return MIXIN._expert_offload_lane_active(SimpleNamespace())
 
@@ -236,9 +236,9 @@ class _StubMoE:
 
 
 def _stub_fused_moe_module():
-    mod = types.ModuleType("sglang.srt.layers.moe.fused_moe_triton.layer")
+    mod = types.ModuleType("flliper.srt.layers.moe.fused_moe_triton.layer")
     mod.FusedMoE = _StubMoE
-    return {"sglang.srt.layers.moe.fused_moe_triton.layer": mod}
+    return {"flliper.srt.layers.moe.fused_moe_triton.layer": mod}
 
 
 class TestInstallOrderingInvariant(CustomTestCase):
@@ -261,7 +261,7 @@ class TestInstallOrderingInvariant(CustomTestCase):
         msg = str(ctx.exception)
         self.assertIn("[7]", msg)
         self.assertIn("before the KV pool is sized", msg)
-        self.assertIn("SGLANG_MOE_OFFLOAD_KV_REGAIN=0", msg)
+        self.assertIn("FLLIPER_MOE_OFFLOAD_KV_REGAIN=0", msg)
 
     def test_offload_disabled_layer_is_not_pending(self):
         self._check([_StubMoE(0, enabled=False, installed=False)])
@@ -328,8 +328,8 @@ class TestProfileAvailableBytes(CustomTestCase):
             order.append("read")
             return available_gb
 
-        with envs.SGLANG_MOE_OFFLOAD_KV_REGAIN.override(regain), (
-            envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.override(fraction)
+        with envs.FLLIPER_MOE_OFFLOAD_KV_REGAIN.override(regain), (
+            envs.FLLIPER_MOE_RESIDENT_EXPERT_FRACTION.override(fraction)
         ), patch.object(
             mixin, "get_world_group", return_value=_fake_group(world_size)
         ), patch.object(
@@ -418,7 +418,7 @@ class TestProfileAvailableBytes(CustomTestCase):
                 _gguf_dequant_scratch_gb=lambda: 0.0,
             )
         )
-        with envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.override(0.25), patch.object(
+        with envs.FLLIPER_MOE_RESIDENT_EXPERT_FRACTION.override(0.25), patch.object(
             mixin, "get_world_group", return_value=_fake_group(1)
         ), patch.object(
             mixin,

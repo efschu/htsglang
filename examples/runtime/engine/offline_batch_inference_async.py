@@ -12,8 +12,8 @@ import asyncio
 import dataclasses
 import time
 
-import sglang as sgl
-from sglang.srt.server_args import ServerArgs
+import flliper as sgl
+from flliper.srt.server_args import ServerArgs
 
 
 class InferenceEngine:

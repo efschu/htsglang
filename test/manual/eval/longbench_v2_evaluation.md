@@ -2,7 +2,7 @@
 
 ## Overview
 
-LongBench-v2 is a benchmark designed to assess the ability of Large Language Models (LLMs) to handle long-context problems requiring deep understanding and reasoning across real-world multitasks. This guide explains how to use SGLang's LongBench-v2 evaluation utilities.
+LongBench-v2 is a benchmark designed to assess the ability of Large Language Models (LLMs) to handle long-context problems requiring deep understanding and reasoning across real-world multitasks. This guide explains how to use fLLiper's LongBench-v2 evaluation utilities.
 
 ## Features
 
@@ -25,8 +25,8 @@ LongBench-v2 is a benchmark designed to assess the ability of Large Language Mod
 ### Basic Usage
 
 ```python
-from sglang.test.simple_eval_longbench_v2 import LongBenchV2Eval
-from sglang.test.simple_eval_common import ChatCompletionSampler
+from flliper.test.simple_eval_longbench_v2 import LongBenchV2Eval
+from flliper.test.simple_eval_common import ChatCompletionSampler
 
 # Initialize evaluator with HuggingFace dataset
 eval_obj = LongBenchV2Eval(
@@ -35,7 +35,7 @@ eval_obj = LongBenchV2Eval(
     num_threads=4
 )
 
-# Create sampler (pointing to your SGLang server)
+# Create sampler (pointing to your fLLiper server)
 sampler = ChatCompletionSampler(
     base_url="http://localhost:30000/v1",
     model="your-model-name"
@@ -51,19 +51,19 @@ print(f"Metrics: {result.metrics}")
 
 ```bash
 # Basic evaluation
-python -m sglang.test.run_eval \
+python -m flliper.test.run_eval \
     --eval-name longbench_v2 \
     --port 30000 \
     --num-examples 50
 
 # Evaluate specific categories
-python -m sglang.test.run_eval \
+python -m flliper.test.run_eval \
     --eval-name longbench_v2 \
     --categories "single_document_qa,multi_document_qa" \
     --port 30000
 
 # Filter by context length
-python -m sglang.test.run_eval \
+python -m flliper.test.run_eval \
     --eval-name longbench_v2 \
     --max-context-length 100000 \
     --min-context-length 10000 \

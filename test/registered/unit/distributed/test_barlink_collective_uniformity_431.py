@@ -34,22 +34,22 @@ CPU only: nothing here allocates on a device or builds a process group.
 import os
 import unittest
 
-from sglang.srt.distributed.device_communicators import barlink_uniformity as uniformity
-from sglang.srt.distributed.device_communicators.barlink import (
+from flliper.srt.distributed.device_communicators import barlink_uniformity as uniformity
+from flliper.srt.distributed.device_communicators.barlink import (
     BarlinkCommunicator,
 )
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     BarlinkBar1Transport,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 D = uniformity.CollectiveDecision
 
 #: One BAR1 a2a slot in the #424 arms' dcp group. The group ran with
-#: SGLANG_BARLINK_BAR1_WINDOW_MIB_DCP=32, which is why the slot is small
+#: FLLIPER_BARLINK_BAR1_WINDOW_MIB_DCP=32, which is why the slot is small
 #: enough for the round limit to be reachable by real payloads at all.
 SLOT = 1 << 20
 AG_MAX_ROUNDS = 16
@@ -378,7 +378,7 @@ class TestBar1Fp8UnevenDcpNotice(CustomTestCase):
             # recommended INT8 operating point.
             {"quantization": "w8a8_int8"},
             {"quantization": "compressed-tensors"},
-            # fp8 over stock NCCL: the SGLANG_BARLINK block unset.
+            # fp8 over stock NCCL: the FLLIPER_BARLINK block unset.
             {"barlink_enabled": False},
             # fp8 over a non-BAR1 barlink transport.
             {"transport": "device"},
@@ -489,10 +489,10 @@ class TestModelRunnerNoticeIsWired(CustomTestCase):
     itself is executed at least once outside a GPU window.
     """
 
-    RUNNER_LOGGER = "sglang.srt.model_executor.model_runner"
+    RUNNER_LOGGER = "flliper.srt.model_executor.model_runner"
 
     def _runner(self, quantization, uneven=True, dcp_size=3):
-        from sglang.srt.model_executor.model_runner import ModelRunner
+        from flliper.srt.model_executor.model_runner import ModelRunner
 
         class _Args:
             def uneven_weighted_dcp_enabled(self):
@@ -515,8 +515,8 @@ class TestModelRunnerNoticeIsWired(CustomTestCase):
         env = dict(os.environ)
         env.pop(uniformity.ENV_ALLOW_FP8_UNEVEN_DCP_BAR1, None)
         env.pop(uniformity.ENV_REFUSE_FP8_UNEVEN_DCP_BAR1, None)
-        env["SGLANG_BARLINK"] = "1"
-        env["SGLANG_BARLINK_TRANSPORT"] = "bar1"
+        env["FLLIPER_BARLINK"] = "1"
+        env["FLLIPER_BARLINK_TRANSPORT"] = "bar1"
         env.update(extra)
         return mock.patch.dict(os.environ, env, clear=True)
 

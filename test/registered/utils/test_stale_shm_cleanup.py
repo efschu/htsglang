@@ -5,12 +5,12 @@ import unittest
 from multiprocessing import shared_memory
 from unittest.mock import patch
 
-from sglang.srt.utils.stale_shm_cleanup import (
+from flliper.srt.utils.stale_shm_cleanup import (
     _creator_pid,
     cleanup_stale_shm,
     make_shm_name,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -62,7 +62,7 @@ class TestCleanupStaleShm(unittest.TestCase):
         # must never touch them even when their creator is dead.
         foreign = self._make_segment("psm_testforeign")
 
-        with patch.dict(os.environ, {"SGLANG_IS_IN_CI": "true"}):
+        with patch.dict(os.environ, {"FLLIPER_IS_IN_CI": "true"}):
             cleanup_stale_shm()
 
         self.assertFalse(os.path.exists(f"/dev/shm/{stale}"))
@@ -73,7 +73,7 @@ class TestCleanupStaleShm(unittest.TestCase):
         dead_pid = _spawn_dead_pid()
         stale = self._make_segment(f"sgl_shm_mq_{dead_pid}_cccc0000")
 
-        with patch.dict(os.environ, {"SGLANG_IS_IN_CI": "false"}):
+        with patch.dict(os.environ, {"FLLIPER_IS_IN_CI": "false"}):
             cleanup_stale_shm()
 
         self.assertTrue(os.path.exists(f"/dev/shm/{stale}"))
@@ -81,7 +81,7 @@ class TestCleanupStaleShm(unittest.TestCase):
     def test_shm_ring_buffer_uses_reclaimable_name(self):
         """Bind the production call site: ShmRingBuffer must emit a
         pid-stamped name, or the leak this module fixes silently returns."""
-        from sglang.srt.distributed.device_communicators.shm_broadcast import (
+        from flliper.srt.distributed.device_communicators.shm_broadcast import (
             ShmRingBuffer,
         )
 
@@ -92,16 +92,16 @@ class TestCleanupStaleShm(unittest.TestCase):
             buf.shared_memory.close()
             buf.shared_memory.unlink()
 
-    def test_run_by_path_without_sglang_importable(self):
+    def test_run_by_path_without_flliper_importable(self):
         """ci_install_dependency.sh runs the module by file path before
-        sglang is installed; it must work with an empty PYTHONPATH."""
-        import sglang.srt.utils.stale_shm_cleanup as mod
+        flliper is installed; it must work with an empty PYTHONPATH."""
+        import flliper.srt.utils.stale_shm_cleanup as mod
 
         dead_pid = _spawn_dead_pid()
         stale = self._make_segment(f"sgl_shm_mm_{dead_pid}_eeee0000")
 
         env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-        env["SGLANG_IS_IN_CI"] = "true"
+        env["FLLIPER_IS_IN_CI"] = "true"
         result = subprocess.run(
             [sys.executable, mod.__file__],
             env=env,
@@ -116,7 +116,7 @@ class TestCleanupStaleShm(unittest.TestCase):
         dead_pid = _spawn_dead_pid()
         stale = self._make_segment(f"multi_tokenizer_args_{dead_pid}")
 
-        with patch.dict(os.environ, {"SGLANG_IS_IN_CI": "true"}):
+        with patch.dict(os.environ, {"FLLIPER_IS_IN_CI": "true"}):
             cleanup_stale_shm()
 
         self.assertFalse(os.path.exists(f"/dev/shm/{stale}"))

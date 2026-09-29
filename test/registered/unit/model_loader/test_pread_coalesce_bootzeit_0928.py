@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """BOOTZEIT (A) 0928: the O_DIRECT stream reads offset-coalesced RUNS instead of
-one pread per tensor (SGLANG_WEIGHT_LOADER_COALESCE_MIB).
+one pread per tensor (FLLIPER_WEIGHT_LOADER_COALESCE_MIB).
 
 Metal (NF rc12z30c): 135 032 tensors per load, name order jumps between the
 dtype sections of a safetensors file on every tensor, PP0 read 0,56 GB/s against
@@ -19,7 +19,7 @@ from unittest import mock
 import torch
 from safetensors.torch import save_file
 
-from sglang.srt.model_loader import weight_utils as W
+from flliper.srt.model_loader import weight_utils as W
 
 MIB = 1 << 20
 

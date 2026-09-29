@@ -15,7 +15,7 @@
 # at the same time. The check gives it its own wording so nobody has to read a
 # log to tell it apart from a boot that simply died.
 #
-# Gate first: benchmark/bar1_graph_check.py. SGLANG_BARLINK_GRAPH_ENABLE=1
+# Gate first: benchmark/bar1_graph_check.py. FLLIPER_BARLINK_GRAPH_ENABLE=1
 # without that evidence is a run whose numbers nobody can defend.
 #
 # The server log stays on the HOST. What comes into the run directory is the
@@ -90,7 +90,7 @@ cd \$W
 PYTHONPATH=\$W/python:\$V/lib/python3.12/site-packages \\
 LD_LIBRARY_PATH=\$V/lib/python3.12/site-packages/nvidia/cu13/lib \\
 CUDA_HOME=\$V/lib/python3.12/site-packages/nvidia/cu13 \\
-SGLANG_BARLINK_BAR1_NV_SOURCE=\$N \\
+FLLIPER_BARLINK_BAR1_NV_SOURCE=\$N \\
 TORCH_EXTENSIONS_DIR=$(host_path "$BAR1_EXTCACHE") \\
 TORCH_CUDA_ARCH_LIST="8.6;12.0" MAX_JOBS=4 \\
   /spinning/miniforge3_local_install/bin/python3.12 benchmark/bar1_graph_check.py 0,1,2

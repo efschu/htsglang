@@ -23,7 +23,7 @@ These tests are written against that measured pair BEFORE the module exists.
 
 import pytest
 
-from sglang.srt.managers import tree_congruence as tc
+from flliper.srt.managers import tree_congruence as tc
 
 
 # --------------------------------------------------------------------------
@@ -236,7 +236,7 @@ def test_digest_is_stable_across_processes_with_different_hash_seeds():
     import sys
 
     prog = (
-        "from sglang.srt.managers import tree_congruence as tc;"
+        "from flliper.srt.managers import tree_congruence as tc;"
         "print(tc.fold_digest([tc.node_fingerprint((1,2,3)),"
         "tc.node_fingerprint((4,5,6))]))"
     )

@@ -2,7 +2,7 @@ import io
 import re
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=103, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=106, suite="stage-b-test-1-gpu-small-amd-mi35x")
@@ -11,10 +11,10 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.common import is_cuda_alike, mxfp_supported
-from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.srt.utils.common import is_cuda_alike, mxfp_supported
+from flliper.test.few_shot_gsm8k import run_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,

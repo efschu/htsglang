@@ -38,12 +38,12 @@ from unittest.mock import MagicMock
 # and take the mechanism test down with it. The mechanism test must be able to
 # RUN on the unfixed tree -- that it passes there is the evidence that the
 # trap is real and that nothing was refusing it.
-from sglang.srt.managers.schedule_policy import PrefillAdder
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.managers.schedule_policy import PrefillAdder
+from flliper.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
 def _adder(rem_chunk_tokens, page_size=1):
@@ -80,7 +80,7 @@ def _adder(rem_chunk_tokens, page_size=1):
 
 def _req(n_tokens):
     """A fresh request of `n_tokens` prompt tokens with no cached prefix."""
-    from sglang.srt.managers.schedule_batch import Req
+    from flliper.srt.managers.schedule_batch import Req
 
     req = MagicMock(spec=Req)
     req.rid = "c30"
@@ -150,7 +150,7 @@ def test_a_chunk_budget_below_the_alignment_refuses_every_long_request():
 def test_truncation_align_admission_error_names_the_numbers():
     """The guard itself: it must fire on the wedging config and stay silent on
     every configuration that can actually admit."""
-    from sglang.srt.managers.schedule_policy import truncation_align_admission_error
+    from flliper.srt.managers.schedule_policy import truncation_align_admission_error
 
     def _err(*a, **k):
         return truncation_align_admission_error(*a, **k)[0]
@@ -211,7 +211,7 @@ def test_the_scheduler_refuses_at_boot_for_both_alignment_sources():
     final alignment is known -- server_args cannot see it without restating
     the lcm.
     """
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     def _run(**kw):
         sa = SimpleNamespace(

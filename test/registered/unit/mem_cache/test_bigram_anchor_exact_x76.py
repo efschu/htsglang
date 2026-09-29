@@ -20,10 +20,10 @@ from types import SimpleNamespace
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import (  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.mamba_component import (  # noqa: E402
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_radix_cache import (  # noqa: E402
+from flliper.srt.mem_cache.unified_radix_cache import (  # noqa: E402
     UnifiedRadixCache,
     bigram_anchor_ids,
     bigram_anchor_key,

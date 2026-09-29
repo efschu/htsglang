@@ -32,7 +32,7 @@ Algorithm
        least one has an unhonoured def site in scope.
 
 Usage:
-    python3 /tmp/a421/detC.py <tree_root> --env SGLANG_FOO [--scope inherit|import|refonly]
+    python3 /tmp/a421/detC.py <tree_root> --env FLLIPER_FOO [--scope inherit|import|refonly]
     python3 /tmp/a421/detC.py <tree_root> --auto          # every fork env
 """
 
@@ -70,7 +70,7 @@ per via out off out_of set unset flag env environment variable value values
 path paths file files line lines code codes name names class classes module
 modules function functions method methods param params arg args kwargs return
 returns type types int str bool float list dict tuple optional sequence
-gguf cuda nvml torch python sglang srt test tests note noqa pragma todo fixme
+gguf cuda nvml torch python flliper srt test tests note noqa pragma todo fixme
 one two three four rank ranks world size sizes group groups layer layers
 model models load loads loading weight weights tensor tensors quant config
 configs enable enabled disable disabled use uses used using build built
@@ -330,9 +330,9 @@ def fork_envs(idx):
     for rel, src in idx.files.items():
         if is_test_path(rel) or not is_fork_file(rel):
             continue
-        envs |= set(re.findall(r"\bSGLANG_[A-Z0-9_]{3,}\b", src))
+        envs |= set(re.findall(r"\bFLLIPER_[A-Z0-9_]{3,}\b", src))
     # plus envs added to inherited files by the fork: cheap approximation --
-    # every SGLANG_ env whose *only* references are in fork files
+    # every FLLIPER_ env whose *only* references are in fork files
     return sorted(envs)
 
 

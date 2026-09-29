@@ -7,9 +7,9 @@ import sys
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -118,7 +118,7 @@ class TestVLMPiecewiseCudaGraph(CustomTestCase):
             if custom_env:
                 process_env.update(custom_env)
             # if test vlm with cuda_ipc feature, open this env_var
-            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
+            process_env["FLLIPER_USE_CUDA_IPC_TRANSPORT"] = "1"
 
             # Prepare stdout/stderr redirection if needed
             stdout_file = None

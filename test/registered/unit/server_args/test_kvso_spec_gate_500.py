@@ -54,8 +54,8 @@ import os
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -68,7 +68,7 @@ def _flag_help(option: str) -> str:
     """The help argparse would print for ``option`` -- read off the built
     parser, not off the dataclass annotation, so this asserts what an operator
     actually sees from ``--help``."""
-    parser = argparse.ArgumentParser(prog="sglang.launch_server")
+    parser = argparse.ArgumentParser(prog="flliper.launch_server")
     ServerArgs.add_cli_args(parser)
     for action in parser._actions:
         if option in action.option_strings:
@@ -167,14 +167,14 @@ class TestResumeUnderSpecIsAFirstClassSurface(unittest.TestCase):
 
     def _no_resume_env(self):
         return patch.dict(
-            os.environ, {"KVSO_ALLOW_SPEC": "1", "SGLANG_KVSO_RESUME": "0"}
+            os.environ, {"KVSO_ALLOW_SPEC": "1", "FLLIPER_KVSO_RESUME": "0"}
         )
 
     def test_the_flag_exists_and_is_discoverable(self):
         help_text = _flag_help("--kv-session-offload-resume-under-spec")
         self.assertTrue(help_text)
         # It must name its env twin, so the two surfaces are known to be one.
-        self.assertIn("SGLANG_KVSO_RESUME", help_text)
+        self.assertIn("FLLIPER_KVSO_RESUME", help_text)
         # ...and it must say the default is a decision, not an omission.
         self.assertIn("NAMED decision", help_text)
 
@@ -189,7 +189,7 @@ class TestResumeUnderSpecIsAFirstClassSurface(unittest.TestCase):
 
     def test_the_env_twin_arms_the_flag(self):
         with patch.dict(
-            os.environ, {"KVSO_ALLOW_SPEC": "1", "SGLANG_KVSO_RESUME": "1"}
+            os.environ, {"KVSO_ALLOW_SPEC": "1", "FLLIPER_KVSO_RESUME": "1"}
         ):
             args = make_args(
                 enable_kv_session_offload=True, speculative_algorithm="NEXTN"
@@ -200,7 +200,7 @@ class TestResumeUnderSpecIsAFirstClassSurface(unittest.TestCase):
     def test_the_legacy_alias_still_arms_it(self):
         """Existing boot-matrix arms and tickets export the bare name."""
         env = dict(os.environ)
-        env.pop("SGLANG_KVSO_RESUME", None)
+        env.pop("FLLIPER_KVSO_RESUME", None)
         env["KVSO_ALLOW_SPEC"] = "1"
         env["KVSO_RESUME"] = "1"
         with patch.dict(os.environ, env, clear=True):
@@ -241,14 +241,14 @@ class TestResumeUnderSpecIsAFirstClassSurface(unittest.TestCase):
     def test_the_runtime_predicate_agrees_with_the_flag(self):
         """The gate the runtime reads and the flag the operator sets must be
         the same switch -- otherwise --help documents a lie."""
-        from sglang.srt.managers.kv_session_offload import resume_under_spec_enabled
+        from flliper.srt.managers.kv_session_offload import resume_under_spec_enabled
 
         env = dict(os.environ)
-        env.pop("SGLANG_KVSO_RESUME", None)
+        env.pop("FLLIPER_KVSO_RESUME", None)
         env.pop("KVSO_RESUME", None)
         with patch.dict(os.environ, env, clear=True):
             self.assertIs(resume_under_spec_enabled(), False)
-        with patch.dict(os.environ, {"SGLANG_KVSO_RESUME": "1"}):
+        with patch.dict(os.environ, {"FLLIPER_KVSO_RESUME": "1"}):
             self.assertIs(resume_under_spec_enabled(), True)
 
 

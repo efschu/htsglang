@@ -24,8 +24,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.device_communicators.barlink import BarlinkCommunicator
-from sglang.srt.distributed.device_communicators.barlink_path_dispatcher import (
+from flliper.srt.distributed.device_communicators.barlink import BarlinkCommunicator
+from flliper.srt.distributed.device_communicators.barlink_path_dispatcher import (
     HINT_GLOO,
     HINT_TRANSPORT,
     PROVENANCE_MEASURED,
@@ -38,7 +38,7 @@ from sglang.srt.distributed.device_communicators.barlink_path_dispatcher import 
     maybe_build_dispatcher,
     refine_transport_choice,
 )
-from sglang.srt.distributed.device_communicators.barlink_path_rates import (
+from flliper.srt.distributed.device_communicators.barlink_path_rates import (
     GDR_TSV_COLUMNS,
     NCCL_REFERENCE_ROW_FIELDS,
     LoadResult,
@@ -51,10 +51,10 @@ from sglang.srt.distributed.device_communicators.barlink_path_rates import (
     new_nccl_reference_envelope,
     placeholder_profile,
 )
-from sglang.srt.model_executor.offload_bus_budget import BusBudgetArbiter
-from sglang.srt.model_executor.offload_register import OffloadRegister
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.offload_bus_budget import BusBudgetArbiter
+from flliper.srt.model_executor.offload_register import OffloadRegister
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -117,7 +117,7 @@ class TestPlaceholderNeutrality(CustomTestCase):
         d = PathDispatcher()
         d.register_path(measured("fast", 0.1))
         with self.assertLogs(
-            "sglang.srt.distributed.device_communicators.barlink_path_dispatcher",
+            "flliper.srt.distributed.device_communicators.barlink_path_dispatcher",
             level="WARNING",
         ):
             d.register_path(placeholder_profile("unmeasured"))
@@ -183,10 +183,10 @@ class TestPlaceholderNeutrality(CustomTestCase):
 
     def test_flag_gates_construction(self):
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_BARLINK_PATH_DISPATCHER", None)
+            os.environ.pop("FLLIPER_BARLINK_PATH_DISPATCHER", None)
             self.assertIsNone(maybe_build_dispatcher())
         with mock.patch.dict(
-            os.environ, {"SGLANG_BARLINK_PATH_DISPATCHER": "1"}
+            os.environ, {"FLLIPER_BARLINK_PATH_DISPATCHER": "1"}
         ):
             d = maybe_build_dispatcher()
             self.assertIsInstance(d, PathDispatcher)
@@ -293,7 +293,7 @@ class TestBoundariesAndCapture(CustomTestCase):
         d.begin_capture()
         d.set_saturation_sensor(lambda name: 1.0 if name == "fast" else 0.0)
         with self.assertLogs(
-            "sglang.srt.distributed.device_communicators.barlink_path_dispatcher",
+            "flliper.srt.distributed.device_communicators.barlink_path_dispatcher",
             level="WARNING",
         ):
             d.round_boundary()
@@ -417,7 +417,7 @@ class TestRefineTransportChoice(CustomTestCase):
         d = self._measured_dispatcher(None)
         sentinel = object()
         with self.assertLogs(
-            "sglang.srt.distributed.device_communicators.barlink_path_dispatcher",
+            "flliper.srt.distributed.device_communicators.barlink_path_dispatcher",
             level="WARNING",
         ):
             self.assertIs(
@@ -658,7 +658,7 @@ class TestNcclReferenceSchema(CustomTestCase):
 class TestLoadRateTables(CustomTestCase):
     def test_missing_sources_are_loud_and_yield_nothing_measured(self):
         with self.assertLogs(
-            "sglang.srt.distributed.device_communicators.barlink_path_rates",
+            "flliper.srt.distributed.device_communicators.barlink_path_rates",
             level="WARNING",
         ) as logs:
             res = load_rate_tables()
@@ -706,7 +706,7 @@ class TestLoadRateTables(CustomTestCase):
                     f,
                 )
             with self.assertLogs(
-                "sglang.srt.distributed.device_communicators.barlink_path_rates",
+                "flliper.srt.distributed.device_communicators.barlink_path_rates",
                 level="WARNING",
             ):  # the two still-missing sources stay loud
                 res = load_rate_tables(p2p_capability_json=cap, p2p_d2d_json=d2d)
@@ -721,7 +721,7 @@ class TestLoadRateTables(CustomTestCase):
             with open(bad, "w") as f:
                 f.write("{not json")
             with self.assertLogs(
-                "sglang.srt.distributed.device_communicators.barlink_path_rates",
+                "flliper.srt.distributed.device_communicators.barlink_path_rates",
                 level="WARNING",
             ):
                 res = load_rate_tables(p2p_capability_json=bad)

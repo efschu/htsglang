@@ -59,8 +59,8 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.managers import phase_purity
-from sglang.srt.managers.phase_policy import PHASE_PP, PHASE_TP, PP_TO_TP, TP_TO_PP
+from flliper.srt.managers import phase_purity
+from flliper.srt.managers.phase_policy import PHASE_PP, PHASE_TP, PP_TO_TP, TP_TO_PP
 
 
 class _Args:
@@ -167,7 +167,7 @@ class AStoodDownFlipMustNotStarveTheWorkClassTest(unittest.TestCase):
     def test_the_threshold_is_inside_the_health_check_timeout(self):
         """It must fire before /health does, or it has changed nothing.
 
-        The health probe times out at 20 s (SGLANG_HEALTH_CHECK_TIMEOUT) and a
+        The health probe times out at 20 s (FLLIPER_HEALTH_CHECK_TIMEOUT) and a
         refused round costs about 3 s on this rig, so the bound has to be
         small enough that the valve opens first.
         """

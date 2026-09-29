@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P2P readiness re-probe: one call, a few minutes, no sglang boots.
+# P2P readiness re-probe: one call, a few minutes, no flliper boots.
 #
 #   bash run_all.sh [--results-dir DIR] [--baseline OLD_NCCL_JSON] [--dry-run]
 #

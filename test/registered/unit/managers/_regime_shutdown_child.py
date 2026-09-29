@@ -6,7 +6,7 @@ import time
 
 sys.path.insert(0, os.environ["REGIME_PY"])
 
-from sglang.srt.managers.regime_runtime import (  # noqa: E402
+from flliper.srt.managers.regime_runtime import (  # noqa: E402
     MODE_OBSERVE,
     RegimeObserver,
     close_regime_trace,

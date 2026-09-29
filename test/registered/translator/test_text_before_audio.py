@@ -30,7 +30,7 @@ test runner is a flake generator; the journal sequence is exact.
 import asyncio
 import unittest
 
-from sglang.srt.translator.session import EventKind
+from flliper.srt.translator.session import EventKind
 from test_session import (  # noqa: E402  - sibling helper module
     VOICE_A_HZ,
     conversation_audio,

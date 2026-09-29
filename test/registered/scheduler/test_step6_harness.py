@@ -16,8 +16,8 @@ import unittest
 from pathlib import Path
 
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -50,7 +50,7 @@ class TestFlipStatsParserAgainstRealFormat(CustomTestCase):
         records = []
         handler = logging.Handler()
         handler.emit = lambda rec: records.append(rec.getMessage())
-        logger = logging.getLogger("sglang.srt.managers.phase_flip_runtime")
+        logger = logging.getLogger("flliper.srt.managers.phase_flip_runtime")
         logger.addHandler(handler)
         old_level = logger.level
         logger.setLevel(logging.INFO)

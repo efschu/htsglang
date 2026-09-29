@@ -18,7 +18,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.managers.phase_flip_seam_reserve import (
+from flliper.srt.managers.phase_flip_seam_reserve import (
     DEFAULT_MARGIN_MIB,
     ENV_MARGIN_MIB,
     SeamReserve,
@@ -26,7 +26,7 @@ from sglang.srt.managers.phase_flip_seam_reserve import (
     seam_allowed_tokens,
     seam_margin_bytes,
 )
-from sglang.srt.uneven_perf import measured_kv_budget_fingerprint_fields
+from flliper.srt.uneven_perf import measured_kv_budget_fingerprint_fields
 
 MIB = 1 << 20
 

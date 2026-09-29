@@ -2,7 +2,7 @@
 # #631 section 2.1: same-boot A/B of the row-blocked seam.
 #
 # One boot, every block count, floor arm FIRST -- the tune file
-# (SGLANG_FLIP_SEAM_TUNE_FILE) is re-read per flip, so the curve is not
+# (FLLIPER_FLIP_SEAM_TUNE_FILE) is re-read per flip, so the curve is not
 # assembled across boots where boot-to-boot variance would be
 # indistinguishable from the knob.
 #

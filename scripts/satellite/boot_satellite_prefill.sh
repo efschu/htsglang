@@ -12,7 +12,7 @@
 # --disaggregation-ib-device <hca> when both arms sit on the fast line.
 #
 # Env (all have defaults; override on the command line):
-#   SAT_SGLANG_SRC   python tree to run (PYTHONPATH)
+#   SAT_FLLIPER_SRC   python tree to run (PYTHONPATH)
 #   SAT_VENV_PY      interpreter
 #   SAT_MODEL        model path -- MUST be the same checkpoint as the decode arm
 #   SAT_PORT         http port          (default 31212)
@@ -21,7 +21,7 @@
 #   SAT_CUDART12     directory holding libcudart.so.12 for the mooncake wheel
 set -euo pipefail
 
-SAT_SGLANG_SRC="${SAT_SGLANG_SRC:-<SATELLITE_SGLANG_SRC>}"
+SAT_FLLIPER_SRC="${SAT_FLLIPER_SRC:-<SATELLITE_FLLIPER_SRC>}"
 SAT_VENV_PY="${SAT_VENV_PY:-<SATELLITE_PYTHON>}"
 SAT_MODEL="${SAT_MODEL:-<SATELLITE_MODEL_DIR>}"
 SAT_PORT="${SAT_PORT:-31212}"
@@ -51,7 +51,7 @@ SAT_CHUNK="${SAT_CHUNK:-512}"
 # checkpoint's bfloat16 and the two would exchange KV bytes of different
 # widths. The pair is fp16 because the weakest member is.
 
-export PYTHONPATH="$SAT_SGLANG_SRC"
+export PYTHONPATH="$SAT_FLLIPER_SRC"
 # The mooncake transfer-engine wheel links CUDA 12 while the torch stack here
 # is CUDA 13; without this the import dies on libcudart.so.12 and the PD arm
 # falls back to no transport at all.
@@ -59,9 +59,9 @@ if [ -n "$SAT_CUDART12" ]; then
   export LD_LIBRARY_PATH="$SAT_CUDART12:${LD_LIBRARY_PATH:-}"
 fi
 # Turing has no bfloat16; the SSM state is the one tensor that must stay wide.
-export SGLANG_MAMBA_SSM_DTYPE="${SGLANG_MAMBA_SSM_DTYPE:-float32}"
+export FLLIPER_MAMBA_SSM_DTYPE="${FLLIPER_MAMBA_SSM_DTYPE:-float32}"
 
-exec "$SAT_VENV_PY" -u -m sglang.launch_server \
+exec "$SAT_VENV_PY" -u -m flliper.launch_server \
   --model-path "$SAT_MODEL" \
   --served-model-name "$SAT_SERVED_NAME" \
   --tp-size 1 --base-gpu-id 0 \

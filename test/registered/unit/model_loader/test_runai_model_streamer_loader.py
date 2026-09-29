@@ -6,14 +6,14 @@ from unittest.mock import patch
 
 import torch
 
-import sglang.srt.model_loader.loader as loader_mod
-import sglang.srt.model_loader.weight_utils as weight_utils
-from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.models.deepseek_common import deepseek_weight_loader
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.model_loader.loader as loader_mod
+import flliper.srt.model_loader.weight_utils as weight_utils
+from flliper.srt.configs.device_config import DeviceConfig
+from flliper.srt.configs.load_config import LoadConfig, LoadFormat
+from flliper.srt.configs.model_config import ModelConfig
+from flliper.srt.models.deepseek_common import deepseek_weight_loader
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 

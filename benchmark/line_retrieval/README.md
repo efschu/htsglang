@@ -7,13 +7,13 @@ python3 gen_data.py --number 1000
 
 ## Run benchmark
 
-### Benchmark sglang
+### Benchmark flliper
 ```
-python3 -m sglang.launch_server --model-path codellama/CodeLlama-7b-hf --port 30000
+python3 -m flliper.launch_server --model-path codellama/CodeLlama-7b-hf --port 30000
 ```
 
 ```
-python3 bench_sglang.py --src-index 600 --num-q 50 --parallel 1
+python3 bench_flliper.py --src-index 600 --num-q 50 --parallel 1
 ```
 
 

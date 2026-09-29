@@ -7,15 +7,15 @@ import unittest
 from pathlib import Path
 from typing import ClassVar, Optional
 
-from sglang.bench_one_batch_server import (
+from flliper.bench_one_batch_server import (
     BenchArgs,
     BenchOneCaseResult,
     run_benchmark_internal,
 )
-from sglang.srt.entrypoints.http_server import launch_server
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
+from flliper.srt.entrypoints.http_server import launch_server
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 
 # CUDA-only: this self-bench asserts a 1.0% kv_canary overhead budget tuned on
 # the CUDA (H100) runner. On ROCm the measured overhead is ~1.26%, so the
@@ -26,7 +26,7 @@ register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-large")
 _QWEN3_MODEL = "Qwen/Qwen3-30B-A3B"
 _QWEN3_SCENARIO_MODEL = "qwen3-30b-a3b"
 
-_PROFILE_DIR_ENV = "SGLANG_KV_CANARY_PROFILE_DIR"
+_PROFILE_DIR_ENV = "FLLIPER_KV_CANARY_PROFILE_DIR"
 _PROFILE_STEPS = 30
 _PROFILE_NO_GRAPH_OUTPUT_LEN = 3
 # start_profile blocks until num_steps server steps complete, so it must be <= actual decode steps.

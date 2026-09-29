@@ -3,7 +3,7 @@
 # #657 successor 39: the confirmation window for ALLOCATION STEERING.
 #
 # The ship configuration, byte-identical to s38's, PLUS one armed mechanism:
-# SGLANG_CORRIDOR_STEERING=1. Everything else -- margin 512, delay budget 2,
+# FLLIPER_CORRIDOR_STEERING=1. Everything else -- margin 512, delay budget 2,
 # lender OFF, arming floor 1536, corridor law 1024 -- is what s38 shipped, so
 # any axis that moves is attributable to the steer and to nothing else.
 #
@@ -39,14 +39,14 @@ mkdir -p "$OUT"
 
 LOG="$LOG" SELF=656-successor39 \
 ARGV_SRC=/tmp/s33_argv.txt ENV_SRC=/tmp/s30_env.txt \
-EXTRA_ENV='SGLANG_UNEVEN_TOKEN_VECTOR=14,10,8
-SGLANG_CORRIDOR_FLOOR_MIB=1536
-SGLANG_KV_BACKING_RELIEF=1
-SGLANG_FLIP_SEAM_CHUNK_MIB=8
-SGLANG_CORRIDOR_REBALANCE=0
-SGLANG_SEAM_ENTRY_MARGIN_MIB=512
-SGLANG_SEAM_ENTRY_DELAY_BUDGET=2
-SGLANG_CORRIDOR_STEERING=1' bash "$WT/scripts/s33_boot_from_capture.sh" || exit 3
+EXTRA_ENV='FLLIPER_UNEVEN_TOKEN_VECTOR=14,10,8
+FLLIPER_CORRIDOR_FLOOR_MIB=1536
+FLLIPER_KV_BACKING_RELIEF=1
+FLLIPER_FLIP_SEAM_CHUNK_MIB=8
+FLLIPER_CORRIDOR_REBALANCE=0
+FLLIPER_SEAM_ENTRY_MARGIN_MIB=512
+FLLIPER_SEAM_ENTRY_DELAY_BUDGET=2
+FLLIPER_CORRIDOR_STEERING=1' bash "$WT/scripts/s33_boot_from_capture.sh" || exit 3
 
 for _ in $(seq 1 90); do
   [ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:30030/health)" = "200" ] && break

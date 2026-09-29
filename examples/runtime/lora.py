@@ -1,8 +1,8 @@
 """
-OpenAI-compatible LoRA adapter usage with SGLang.
+OpenAI-compatible LoRA adapter usage with fLLiper.
 
 Server Setup:
-    python -m sglang.launch_server \\
+    python -m flliper.launch_server \\
         --model meta-llama/Llama-3.1-8B-Instruct \\
         --enable-lora \\
         --lora-paths sql=/path/to/sql python=/path/to/python
@@ -14,7 +14,7 @@ client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
 
 
 def main():
-    print("SGLang OpenAI-Compatible LoRA Examples\n")
+    print("fLLiper OpenAI-Compatible LoRA Examples\n")
 
     # Example 1: NEW - Adapter in model parameter (OpenAI-compatible)
     print("1. Chat with LoRA adapter in model parameter:")
@@ -63,5 +63,5 @@ if __name__ == "__main__":
         print(f"Error: {e}")
         print(
             "\nEnsure server is running:\n"
-            "  python -m sglang.launch_server --model ... --enable-lora --lora-paths ..."
+            "  python -m flliper.launch_server --model ... --enable-lora --lora-paths ..."
         )

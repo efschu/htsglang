@@ -1,9 +1,9 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -48,7 +48,7 @@ class TestGQACP2TP2EP2(CustomTestCase):
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
-            env={"SGLANG_ENABLE_CP_V2": "1"},
+            env={"FLLIPER_ENABLE_CP_V2": "1"},
         )
 
     @classmethod
@@ -107,7 +107,7 @@ class TestGQACPTP2CP2EP4(CustomTestCase):
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
-            env={"SGLANG_ENABLE_CP_V2": "1"},
+            env={"FLLIPER_ENABLE_CP_V2": "1"},
         )
 
     @classmethod

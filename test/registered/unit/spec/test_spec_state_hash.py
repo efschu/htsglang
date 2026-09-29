@@ -11,24 +11,24 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.debug_utils import spec_state_hash
-from sglang.srt.debug_utils.spec_state_hash import (
+from flliper.srt.debug_utils import spec_state_hash
+from flliper.srt.debug_utils.spec_state_hash import (
     collect_state_entries,
     hash_tensor,
     maybe_dump_on_request_finish,
 )
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 # Traverse into this test module's classes plus torch.nn containers.
-_PREFIXES = (__name__, "torch.nn.", "sglang.")
+_PREFIXES = (__name__, "torch.nn.", "flliper.")
 
 
 class _SglNode:
-    """Node whose type claims an sglang module: traversed under the DEFAULT
+    """Node whose type claims an flliper module: traversed under the DEFAULT
     prefixes (for tests that exercise _build_roots / reset_probe end-to-end).
     """
 
@@ -36,7 +36,7 @@ class _SglNode:
         self.__dict__.update(kw)
 
 
-_SglNode.__module__ = "sglang.srt.test_fake"
+_SglNode.__module__ = "flliper.srt.test_fake"
 
 
 class _Node:
@@ -159,7 +159,7 @@ class TestCollectStateEntries(CustomTestCase):
         self.assertEqual(n_tensors, 1)
 
     def test_untraversable_foreign_objects_are_leaves(self):
-        class Foreign:  # simulate non-sglang module by prefix filter
+        class Foreign:  # simulate non-flliper module by prefix filter
             pass
 
         f = Foreign()
@@ -185,7 +185,7 @@ class TestCollectStateEntries(CustomTestCase):
         class FakeBackend:
             pass
 
-        FakeBackend.__module__ = "sglang.srt.test_fake"
+        FakeBackend.__module__ = "flliper.srt.test_fake"
         root = FakeBackend()
         root.wrapper = w
         entries, n_tensors, _ = collect_state_entries({"r": root})
@@ -208,9 +208,9 @@ class TestRequestFinishHook(CustomTestCase):
         finished = SimpleNamespace(
             reqs=[SimpleNamespace(finished=lambda: True)]
         )
-        logger_name = "sglang.srt.debug_utils.spec_state_hash"
+        logger_name = "flliper.srt.debug_utils.spec_state_hash"
         # Unfinished batch: no dump lines.
-        with envs.SGLANG_SPEC_STATE_HASH.override(True), self.assertLogs(
+        with envs.FLLIPER_SPEC_STATE_HASH.override(True), self.assertLogs(
             logger_name, level="INFO"
         ) as cm:
             maybe_dump_on_request_finish(sched, running)
@@ -218,7 +218,7 @@ class TestRequestFinishHook(CustomTestCase):
         text = "\n".join(cm.output)
         self.assertIn("SPEC_STATE_HASH BEGIN tag=req_end_1 rank=0", text)
         self.assertEqual(text.count("BEGIN"), 1)
-        with envs.SGLANG_SPEC_STATE_HASH.override(True), self.assertLogs(
+        with envs.FLLIPER_SPEC_STATE_HASH.override(True), self.assertLogs(
             logger_name, level="INFO"
         ) as cm2:
             maybe_dump_on_request_finish(sched, finished)
@@ -232,7 +232,7 @@ class TestRequestFinishHook(CustomTestCase):
         class FakeScheduler:
             pass
 
-        FakeScheduler.__module__ = "sglang.srt.test_fake"
+        FakeScheduler.__module__ = "flliper.srt.test_fake"
         sched = FakeScheduler()
         sched.tp_rank = 0
         sched.draft_worker = _SglNode(buf=torch.zeros(2))
@@ -260,7 +260,7 @@ class TestResetProbe(CustomTestCase):
         w._kv_lens_buffer = torch.ones(4, dtype=torch.int32)
         w._max_kv_len = 123  # python scalar: must be left alone
 
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             CudaGraphBufferRegistry,
             GraphSlot,
         )
@@ -276,7 +276,7 @@ class TestResetProbe(CustomTestCase):
         class FakeScheduler:
             pass
 
-        FakeScheduler.__module__ = "sglang.srt.test_fake"
+        FakeScheduler.__module__ = "flliper.srt.test_fake"
         sched = FakeScheduler()
         sched.tp_rank = 0
         sched.draft_worker = _SglNode(wrapper=w, registry=reg)
@@ -299,12 +299,12 @@ class TestResetProbe(CustomTestCase):
 
     def test_name_filter_restricts_wipe_and_logs_counts(self):
         # Round-10 bisection support: only attribute names matching the
-        # fnmatch globs are zeroed (protects sglang-owned buffers aliased as
+        # fnmatch globs are zeroed (protects flliper-owned buffers aliased as
         # _qo_indptr_buf/_paged_kv_*_buf in non-graph mode), and the log line
         # carries per-name counts so every boot documents what was wiped.
         sched, w, _ = self._make_sched()
-        logger_name = "sglang.srt.debug_utils.spec_state_hash"
-        with envs.SGLANG_SPEC_RESET_PROBE_FILTER.override(
+        logger_name = "flliper.srt.debug_utils.spec_state_hash"
+        with envs.FLLIPER_SPEC_RESET_PROBE_FILTER.override(
             "_int_workspace*"
         ), self.assertLogs(logger_name, level="INFO") as cm:
             spec_state_hash.reset_probe(sched, {"flashinfer"})
@@ -320,8 +320,8 @@ class TestResetProbe(CustomTestCase):
         finished = SimpleNamespace(
             reqs=[SimpleNamespace(finished=lambda: True)]
         )
-        logger_name = "sglang.srt.debug_utils.spec_state_hash"
-        with envs.SGLANG_SPEC_RESET_PROBE.override(
+        logger_name = "flliper.srt.debug_utils.spec_state_hash"
+        with envs.FLLIPER_SPEC_RESET_PROBE.override(
             "flashinfer"
         ), self.assertLogs(logger_name, level="INFO") as cm:
             maybe_dump_on_request_finish(sched, finished)

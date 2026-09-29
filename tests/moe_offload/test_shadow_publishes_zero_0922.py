@@ -2,7 +2,7 @@
 
 fnFL2w38, 05:15:36Z: der Flip stirbt auf allen drei D-Raengen an
 
-    W106 Weg2XchgWakeSourceGapRefused: group=D rank=0 tag=weights_draft
+    W106 PdFlipXchgWakeSourceGapRefused: group=D rank=0 tag=weights_draft
     expected_bytes=5593104384: weights_cpu_backup_armed()=False, the
     exchange's own join carries zero descriptors for it on this leg, AND
     the disk-reload fallback (#1394) is undefined on this
@@ -18,10 +18,10 @@ und kein Disk-Reload. Es scheitert allein daran, dass der Join nur EINE
 Karte sieht: die beiden Experten-Worker sind meta-Schatten, und #76
 (21.09., mein eigener Fix) laesst sie GAR KEIN Manifest schreiben:
 
-    WEG2-XCHG-MANIFEST-WRITE group=D rank=1 region_tag=weights_draft
+    PDFLIP-XCHG-MANIFEST-WRITE group=D rank=1 region_tag=weights_draft
       shadow_pieces=19 of 19 dropped -- meta tensors hold no bytes and
       are not published as holders (#76)
-    WEG2-XCHG-MANIFEST-WRITE group=D rank=1 pieces=0
+    PDFLIP-XCHG-MANIFEST-WRITE group=D rank=1 pieces=0
       reason=all-meta-shadow -- no manifest written
 
 #76 war richtig (ein Schatten traegt die UNREPACKTE Form und widerspricht
@@ -35,7 +35,7 @@ NICHTS -- also Breite 0, was #102s Halter-Karte genau liest.
 
 import pytest
 
-from sglang.srt.weg2 import xchg_manifest as xm
+from flliper.srt.pdflip import xchg_manifest as xm
 
 
 def _piece(name, rows=4096, cols=1024):
@@ -53,7 +53,7 @@ def _man(group, rank, card, pieces):
 NAME = "model.layers.0.mtp.fc.weight"
 
 
-def test_leeres_manifest_haelt_den_rang_im_join():
+def test_empty_manifest_keeps_rank_in_join():
     """DER FALL, DER w38 TOETETE: nur Rang 0 haelt den Draft."""
     mans = [
         _man("D", 0, 0, [_piece(NAME)]),   # der Halter
@@ -71,7 +71,7 @@ def test_leeres_manifest_haelt_den_rang_im_join():
         "die Schatten halten NICHTS -- Breite 0, nicht 'fehlt'")
 
 
-def test_ohne_die_schatten_sieht_der_join_nur_eine_karte():
+def test_without_shadows_join_sees_one_card():
     """Die Gegenprobe: genau so sieht es heute aus, und genau das bricht."""
     mans = [
         _man("D", 0, 0, [_piece(NAME)]),
@@ -83,7 +83,7 @@ def test_ohne_die_schatten_sieht_der_join_nur_eine_karte():
         "der w38-Zustand, und er fuehrt in refuse_diagonal_layout")
 
 
-def test_der_leg_filter_wirft_den_schatten_nicht_weg():
+def test_leg_filter_keeps_the_shadow():
     """#104 (fnFL2w40): #103 allein war WIRKUNGSLOS.
 
     w40 schrieb die drei Manifeste korrekt (`pieces=0 bytes=0`, Datei da),
@@ -96,7 +96,7 @@ def test_der_leg_filter_wirft_den_schatten_nicht_weg():
     REGIONSFILTER entfernt hat (raus), und eines, das SCHON LEER ANKAM
     (bleibt, als Breite-0-Halter).
     """
-    from sglang.srt.weg2 import xchg_manifest as xm
+    from flliper.srt.pdflip import xchg_manifest as xm
     # Nachbau der Filterzeile: drei D-Manifeste, zwei davon leer angekommen
     original = [_man("D", 0, 0, [_piece(NAME)]),
                 _man("D", 1, 1, []),
@@ -118,7 +118,7 @@ def test_der_leg_filter_wirft_den_schatten_nicht_weg():
 #
 # w41 belegte, dass #104 greift -- der Join baut den Draft-Plan KORREKT:
 #
-#     TP0  WEG2-XCHG-PLAN dir=d2h waves=1 descs=34 coalesced=34
+#     TP0  PDFLIP-XCHG-PLAN dir=d2h waves=1 descs=34 coalesced=34
 #
 # und verweigerte trotzdem auf den beiden Schatten-Raengen:
 #
@@ -137,23 +137,23 @@ def _leg(rank, mans):
                                  manifests=mans, region_tag="weights_draft")
 
 
-def _drei_raenge():
+def _three_ranks():
     return [_man("D", 0, 0, [_piece(NAME)]),
             _man("D", 1, 1, []),
             _man("D", 2, 2, []),
             _man("P", 2, 2, [_piece(NAME)])]
 
 
-def test_der_halter_bekommt_seine_descriptors():
-    leg, refusal = _leg(0, _drei_raenge())
+def test_holder_gets_its_descriptors():
+    leg, refusal = _leg(0, _three_ranks())
     assert refusal == "", refusal
     assert len(leg.descs) == 1, "Rang 0 haelt den Draft und bewegt ihn"
 
 
 @pytest.mark.parametrize("rank", [1, 2])
-def test_ein_schatten_geht_leer_aus_statt_zu_verweigern(rank):
+def test_shadow_gets_empty_instead_of_refusing(rank):
     """DER FALL, DER w41 TOETETE."""
-    leg, refusal = _leg(rank, _drei_raenge())
+    leg, refusal = _leg(rank, _three_ranks())
     assert refusal == "", (
         f"Rang {rank} publiziert ein LEERES Manifest -- er haelt nichts, "
         f"also sind null Descriptors die richtige Antwort: {refusal}")
@@ -161,12 +161,12 @@ def test_ein_schatten_geht_leer_aus_statt_zu_verweigern(rank):
     assert leg.card == rank, "der LegPlan gehoert weiter diesem Rang"
 
 
-def test_ein_rang_ohne_manifest_verweigert_weiter():
+def test_rank_without_manifest_still_refuses():
     """DIE GEGENPROBE: der Fix darf die Regel nicht abschaffen.
 
     Wer gar kein Manifest publiziert hat, hat nichts BEHAUPTET -- fuer ihn
     ist "keine Descriptors" weiter ein stiller Verlust, kein Schatten.
     """
-    leg, refusal = _leg(7, _drei_raenge())
+    leg, refusal = _leg(7, _three_ranks())
     assert leg is None
     assert "no-descriptors-for-rank" in refusal

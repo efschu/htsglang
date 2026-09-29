@@ -41,7 +41,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sglang.srt.distributed.device_communicators.barlink_peer_transport import (
+from flliper.srt.distributed.device_communicators.barlink_peer_transport import (
     FAST_EDGE_LANES,
     PeerBinding,
     PeerTransport,
@@ -51,16 +51,16 @@ from sglang.srt.distributed.device_communicators.barlink_peer_transport import (
     parse_peer_map_override,
     resolve_peer_transports,
 )
-from sglang.srt.registry import nvml as registry_nvml
-from sglang.srt.registry.nvml import DeviceInfo
+from flliper.srt.registry import nvml as registry_nvml
+from flliper.srt.registry.nvml import DeviceInfo
 
 # Imported at module scope on purpose. Pulling this in from inside a test body
 # re-triggers a torch autotune-artifact registration under CustomTestCase's
 # retry ("Artifact of type=autotune already registered"), which surfaces as an
 # unrelated retry-exhausted error. Once, at collection, is safe.
-from sglang.srt.layers.moe import expert_offload as _expert_offload
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.moe import expert_offload as _expert_offload
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -70,7 +70,7 @@ _REPO = Path(__file__).resolve().parents[4]
 _TRANSPORT_SRC = (
     _REPO
     / "python"
-    / "sglang"
+    / "flliper"
     / "srt"
     / "distributed"
     / "device_communicators"
@@ -307,7 +307,7 @@ class ConsolidationTests(_RigCase):
         self.assertTrue(imported, "parser must actually find imports")
         offenders = [m for m in imported if "layers.moe" in m or "expert_offload" in m]
         self.assertEqual(offenders, [], f"world build must not pull moe: {offenders}")
-        self.assertIn("sglang.srt.registry.nvml", imported)
+        self.assertIn("flliper.srt.registry.nvml", imported)
 
 
 # ===========================================================================

@@ -16,16 +16,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.srt.training import feasibility as feas
-from sglang.srt.training.backends import RunSpec, RunStatus, get_backend
-from sglang.srt.training.backends.llamafactory import (
+from flliper.srt.training import feasibility as feas
+from flliper.srt.training.backends import RunSpec, RunStatus, get_backend
+from flliper.srt.training.backends.llamafactory import (
     build_config,
     detect_records_style,
     latest_checkpoint,
     parse_log_line,
 )
-from sglang.srt.training.backends.mock import MockBackend
-from sglang.srt.training.feasibility import (
+from flliper.srt.training.backends.mock import MockBackend
+from flliper.srt.training.feasibility import (
     GIB,
     LADDER,
     CardResources,
@@ -34,13 +34,13 @@ from sglang.srt.training.feasibility import (
     TrainingDemandSpec,
     TrainingMethod,
 )
-from sglang.srt.training.service import (
+from flliper.srt.training.service import (
     TenantDisabled,
     TrainingService,
     TrainingServiceConfig,
     parse_extension,
 )
-from sglang.srt.training.store import (
+from flliper.srt.training.store import (
     FileStore,
     InvalidFile,
     JobStatus,
@@ -48,8 +48,8 @@ from sglang.srt.training.store import (
     TenantState,
     validate_jsonl,
 )
-from sglang.srt.training.tenant import DemandSample, IdleMonitor
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.training.tenant import DemandSample, IdleMonitor
+from flliper.test.ci.ci_register import register_cpu_ci
 
 # No card is touched anywhere in this file; that is the point of it.
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
@@ -600,7 +600,7 @@ class TenantPreemptResumeTest(unittest.IsolatedAsyncioTestCase):
 
 class JobStoreTest(unittest.TestCase):
     def test_event_cursor_pagination(self):
-        from sglang.srt.training.store import Hyperparameters, TrainingJob, new_id
+        from flliper.srt.training.store import Hyperparameters, TrainingJob, new_id
 
         store = JobStore()
         job = store.create(

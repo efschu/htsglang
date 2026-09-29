@@ -30,7 +30,7 @@ the table is all a fourth member needs.
 import types
 
 
-from sglang.srt.managers.phase_flip_draft_bootstrap import (
+from flliper.srt.managers.phase_flip_draft_bootstrap import (
     STALE_BATCH_FLAGS,
     reset_stale_batch_flags,
 )
@@ -114,7 +114,7 @@ def test_a_fourth_member_would_be_handled_automatically(monkeypatch):
 
     This is what makes it a class fix rather than a third instance fix.
     """
-    import sglang.srt.managers.phase_flip_draft_bootstrap as mod
+    import flliper.srt.managers.phase_flip_draft_bootstrap as mod
 
     monkeypatch.setitem(mod.STALE_BATCH_FLAGS, "some_future_latch", False)
     b = FakeBatch(batch_is_full=True)
@@ -156,7 +156,7 @@ def test_can_fail_the_reset_is_not_a_tautology():
 
 def test_the_reach_is_reported_so_a_ZERO_can_be_read():
     """Reach N with nothing cleared is an all-clear; reach 0 proves nothing."""
-    from sglang.srt.managers.phase_flip_draft_bootstrap import (
+    from flliper.srt.managers.phase_flip_draft_bootstrap import (
         reachable_batch_count,
     )
 
@@ -177,7 +177,7 @@ def test_the_two_numbers_describe_the_SAME_set():
     unreadable in the direction that matters (a clear that came from a batch
     the probe never counted).
     """
-    from sglang.srt.managers.phase_flip_draft_bootstrap import (
+    from flliper.srt.managers.phase_flip_draft_bootstrap import (
         reachable_batch_count,
     )
 
@@ -193,7 +193,7 @@ def test_the_two_numbers_describe_the_SAME_set():
 
 def test_can_fail_a_blind_seam_is_not_reported_as_an_all_clear():
     """The failure mode the probe exists for, asserted rather than described."""
-    from sglang.srt.managers.phase_flip_draft_bootstrap import (
+    from flliper.srt.managers.phase_flip_draft_bootstrap import (
         reachable_batch_count,
     )
 

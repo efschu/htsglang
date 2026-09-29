@@ -3,10 +3,10 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_npu_ci
+from flliper.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -57,8 +57,8 @@ class TestAscendDeepEP(CustomTestCase):
 
         cls.extra_envs = {
             "HCCL_BUFFSIZE": "1000",
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
-            "SGLANG_NPU_USE_MLAPO": "1",
+            "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
+            "FLLIPER_NPU_USE_MLAPO": "1",
             "TRANSFORMERS_VERBOSITY": "error",
             "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
         }

@@ -1,8 +1,8 @@
-"""GPU-free import/registry tests for the ``sglang.kernels`` namespace.
+"""GPU-free import/registry tests for the ``flliper.kernels`` namespace.
 
 Part of RFC #29630, Phase 2. These tests exercise the public namespace, the
 kernel registry, and the heuristic selector without touching a GPU or importing
-any kernel backend (``sgl_kernel`` / ``sglang.jit_kernel``). They run in the CPU
+any kernel backend (``sgl_kernel`` / ``flliper.jit_kernel``). They run in the CPU
 CI lane.
 """
 
@@ -10,7 +10,7 @@ import subprocess
 import sys
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -68,37 +68,37 @@ EXPECTED_OPS = {
 
 # Public wrapper callables that each populated group must expose.
 EXPECTED_WRAPPERS = {
-    "sglang.kernels.ops.layernorm": [
+    "flliper.kernels.ops.layernorm": [
         "rmsnorm",
         "fused_add_rmsnorm",
         "gemma_rmsnorm",
         "gemma_fused_add_rmsnorm",
     ],
-    "sglang.kernels.ops.activation": [
+    "flliper.kernels.ops.activation": [
         "silu_and_mul",
         "gelu_and_mul",
         "gelu_tanh_and_mul",
     ],
-    "sglang.kernels.ops.gemm": [
+    "flliper.kernels.ops.gemm": [
         "fp8_scaled_mm",
         "dsv3_fused_a_gemm",
         "dsv3_router_gemm",
     ],
-    "sglang.kernels.ops.quantization": [
+    "flliper.kernels.ops.quantization": [
         "sgl_per_token_quant_fp8",
         "sgl_per_token_group_quant_8bit",
         "sgl_per_token_group_quant_fp8",
         "sgl_per_token_group_quant_int8",
     ],
-    "sglang.kernels.ops.moe": ["moe_align_block_size", "topk_softmax"],
-    "sglang.kernels.ops.kvcache": ["reshape_and_cache_flash"],
-    "sglang.kernels.ops.sampling": ["top_k_renorm_probs", "top_p_renorm_probs"],
-    "sglang.kernels.ops.spatial": [
+    "flliper.kernels.ops.moe": ["moe_align_block_size", "topk_softmax"],
+    "flliper.kernels.ops.kvcache": ["reshape_and_cache_flash"],
+    "flliper.kernels.ops.sampling": ["top_k_renorm_probs", "top_p_renorm_probs"],
+    "flliper.kernels.ops.spatial": [
         "get_sm_available",
         "create_greenctx_stream_by_value",
     ],
-    "sglang.kernels.ops.mamba": ["causal_conv1d_fwd", "causal_conv1d_update"],
-    "sglang.kernels.ops.diffusion": [
+    "flliper.kernels.ops.mamba": ["causal_conv1d_fwd", "causal_conv1d_update"],
+    "flliper.kernels.ops.diffusion": [
         "apply_group_norm_silu",
         "residual_gate_add",
         "fused_inplace_qknorm_rope",
@@ -129,10 +129,10 @@ class TestKernelsNamespace(unittest.TestCase):
     def setUp(self):
         import importlib
 
-        import sglang.kernels
-        import sglang.kernels.ops  # populate the registry
+        import flliper.kernels
+        import flliper.kernels.ops  # populate the registry
 
-        self.K = sglang.kernels
+        self.K = flliper.kernels
         self.importlib = importlib
 
     def test_top_level_exports(self):
@@ -150,7 +150,7 @@ class TestKernelsNamespace(unittest.TestCase):
 
     def test_all_groups_importable(self):
         for group in ALL_GROUPS:
-            mod = self.importlib.import_module(f"sglang.kernels.ops.{group}")
+            mod = self.importlib.import_module(f"flliper.kernels.ops.{group}")
             self.assertTrue(hasattr(mod, "__all__"))
 
     def test_registry_contents(self):
@@ -200,7 +200,7 @@ class TestKernelsNamespace(unittest.TestCase):
             "layernorm.rmsnorm", backend=self.K.KernelBackend.CUDA_JIT
         )
         self.assertEqual(
-            spec.target, "sglang.kernels.ops.layernorm:_RMSNORM.forward_cuda_jit"
+            spec.target, "flliper.kernels.ops.layernorm:_RMSNORM.forward_cuda_jit"
         )
 
     def test_selector_unknown_op_raises(self):
@@ -236,11 +236,11 @@ class TestKernelsNamespace(unittest.TestCase):
 
     def test_import_does_not_load_kernel_backends(self):
         # Importing the namespace must stay metadata-only: no sgl_kernel or
-        # sglang.jit_kernel import, and no JIT compilation, on a CPU box.
+        # flliper.jit_kernel import, and no JIT compilation, on a CPU box.
         code = (
-            "import sys; import sglang.kernels.ops; "
+            "import sys; import flliper.kernels.ops; "
             "backend = ('sgl_kernel' in sys.modules) or "
-            "any(m.startswith('sglang.jit_kernel') for m in sys.modules); "
+            "any(m.startswith('flliper.jit_kernel') for m in sys.modules); "
             "print('BACKEND_IMPORTED' if backend else 'CLEAN')"
         )
         result = subprocess.run(

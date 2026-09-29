@@ -10,8 +10,8 @@ import unittest
 
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large")
@@ -47,7 +47,7 @@ class HiCacheStorage3FSBackendBaseMixin(HiCacheStorageBaseMixin):
 
         # Set the environment variable to point to our config file
         env_vars = {
-            "SGLANG_HICACHE_HF3FS_CONFIG_PATH": config_file,
+            "FLLIPER_HICACHE_HF3FS_CONFIG_PATH": config_file,
         }
 
         return server_args, env_vars

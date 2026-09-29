@@ -1,7 +1,7 @@
 """
-Regression test for MoE LoRA parity between SGLang and vLLM.
+Regression test for MoE LoRA parity between fLLiper and vLLM.
 
-This test compares SGLang's logprobs and output strings against a hardcoded
+This test compares fLLiper's logprobs and output strings against a hardcoded
 baseline (VLLM_CACHED_RESULTS) generated using vLLM. It enforces strict
 numerical accuracy by asserting that the maximum and mean logprob
 divergences do not exceed the reference thresholds (REFERENCE_STATS).
@@ -16,13 +16,13 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.lora_utils import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.lora_utils import (
     MOE_BASE_MODEL_PATH,
     MOE_LORA_PATH,
     MOE_LORA_TEST_PROMPTS,
 )
-from sglang.test.runners import SRTRunner
+from flliper.test.runners import SRTRunner
 
 register_cuda_ci(
     est_time=50,
@@ -285,7 +285,7 @@ REFERENCE_STATS = {
 
 class TestMoELoraRegression(unittest.TestCase):
 
-    def test_sglang_moe_parity_strict(self):
+    def test_flliper_moe_parity_strict(self):
 
         with SRTRunner(
             model_path=MOE_BASE_MODEL_PATH,

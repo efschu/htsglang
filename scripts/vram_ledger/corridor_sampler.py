@@ -21,7 +21,7 @@ the serving ranks nothing at all -- no thread, no lock, no import -- and needs
 no call site inside the scheduler, which matters when the scheduler belongs to
 another shift.
 
-The in-process :mod:`sglang.srt.mem_ledger.corridor_trace` remains the richer
+The in-process :mod:`flliper.srt.mem_ledger.corridor_trace` remains the richer
 instrument: it can also see torch's counters and the KV arena's committed
 watermark per rank. This script is the half that can be run today, against an
 unmodified serving process, and it shares that module's reduction so the two
@@ -63,7 +63,7 @@ def sample_cards(seconds: float, period_ms: int, corridor_mib: int) -> dict:
     point of reporting ``duty_pct`` is that a reader can reject the reading if
     the instrument was too expensive on THEIR machine.
     """
-    from sglang.srt.registry.nvml import _decode, nvml_session
+    from flliper.srt.registry.nvml import _decode, nvml_session
 
     period_s = period_ms / 1000.0
     cost_total_us = 0.0

@@ -33,13 +33,13 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.uneven_perf import (
+from flliper.srt.uneven_perf import (
     GEMM_FAMILY_ATTN_GDN,
     GEMM_FAMILY_MLP,
     GEMM_FAMILY_VOCAB,
     _per_family_formats,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _ct(groups, ignore=()):
@@ -150,7 +150,7 @@ class TestTheContractConsumersRelyOn(CustomTestCase):
     """#324 reads these values as _FORMAT_LANES keys."""
 
     def test_every_reported_value_is_a_known_format_key(self):
-        from sglang.srt.uneven_perf import _FORMAT_LANES
+        from flliper.srt.uneven_perf import _FORMAT_LANES
 
         qc = _ct(
             {"group_0": _group_for(["re:.*mlp.*"])},
@@ -245,12 +245,12 @@ class TestKnownFormatsWithoutALane(CustomTestCase):
     """
 
     def test_int8_a16_is_declared_known_but_unmeasured(self):
-        from sglang.srt.uneven_perf import FORMATS_WITHOUT_LANES
+        from flliper.srt.uneven_perf import FORMATS_WITHOUT_LANES
 
         self.assertIn("int8_a16", FORMATS_WITHOUT_LANES)
 
     def test_it_is_not_in_the_lane_table(self):
-        from sglang.srt.uneven_perf import _FORMAT_LANES
+        from flliper.srt.uneven_perf import _FORMAT_LANES
 
         self.assertNotIn(
             "int8_a16",
@@ -259,7 +259,7 @@ class TestKnownFormatsWithoutALane(CustomTestCase):
         )
 
     def test_the_warning_names_it_as_unmeasured_not_unknown(self):
-        from sglang.srt.uneven_perf import rank_gemm_scores
+        from flliper.srt.uneven_perf import rank_gemm_scores
 
         entries = [{"gemm_tflops": 100.0}]
         _scores, _labels, warnings = rank_gemm_scores(entries, "int8_a16")
@@ -280,7 +280,7 @@ class TestTheRealCheckpointNowReports(CustomTestCase):
             self.skipTest("serving checkpoint not on this box")
 
     def _report(self):
-        from sglang.srt.uneven_perf import checkpoint_compute_format_families
+        from flliper.srt.uneven_perf import checkpoint_compute_format_families
 
         return checkpoint_compute_format_families(self.CKPT)
 

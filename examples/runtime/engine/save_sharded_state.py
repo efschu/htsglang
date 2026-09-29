@@ -28,7 +28,7 @@ import shutil
 from argparse import ArgumentParser
 from pathlib import Path
 
-from sglang import Engine, ServerArgs
+from flliper import Engine, ServerArgs
 
 parser = ArgumentParser()
 ServerArgs.add_cli_args(parser)

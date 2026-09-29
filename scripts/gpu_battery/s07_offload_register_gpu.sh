@@ -10,7 +10,7 @@ DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR missing -- start via run_step.sh}"
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTHONPATH="$WT/python:${PYTHONPATH:-}"
-export SGLANG_OFFLOAD_REGISTER=1
+export FLLIPER_OFFLOAD_REGISTER=1
 
 # The plan phase is the probe itself against FakeDeviceOps: same policies,
 # same register, same three routes, no card. A probe that cannot cycle

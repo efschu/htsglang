@@ -38,14 +38,14 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     MoEExpertOffloadCache,
     presplit_expert_offload_after_repack,
     reset_expert_offload_release,
     resident_slot_count,
 )
 
-FRACTION_ENV = "SGLANG_MOE_RESIDENT_EXPERT_FRACTION"
+FRACTION_ENV = "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"
 
 needs_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -84,7 +84,7 @@ def _scheme():
     ``__new__`` skips ``_init_kernel``, which would import the GPU marlin
     kernels; create_weights never touches ``self.kernel``.
     """
-    from sglang.srt.layers.quantization.awq.schemes.awq_moe import AWQMoEScheme
+    from flliper.srt.layers.quantization.awq.schemes.awq_moe import AWQMoEScheme
 
     scheme = AWQMoEScheme.__new__(AWQMoEScheme)
     scheme.quant_config = _StubAWQConfig()
@@ -244,8 +244,8 @@ def test_weight_attrs_survive_the_device_change(monkeypatch, fraction_025):
 def test_repack_runs_before_the_presplit(monkeypatch):
     """Order gate: the marlin repack replaces every expert tensor, so it has to
     be finished when the presplit stages them."""
-    from sglang.srt.layers.moe import expert_offload as eo_mod
-    from sglang.srt.layers.quantization.awq.schemes.awq_moe import AWQMoEScheme
+    from flliper.srt.layers.moe import expert_offload as eo_mod
+    from flliper.srt.layers.quantization.awq.schemes.awq_moe import AWQMoEScheme
 
     scheme = AWQMoEScheme.__new__(AWQMoEScheme)
     scheme.quant_config = _StubAWQConfig()

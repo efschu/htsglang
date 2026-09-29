@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Standalone validation script for LongBench-v2 implementation.
-Tests core functionality without requiring full SGLang dependencies.
+Tests core functionality without requiring full fLLiper dependencies.
 """
 
 import json
@@ -251,7 +251,7 @@ def generate_validation_report() -> None:
     print("  • Robust answer extraction with fallback patterns")
     print("  • Category-based evaluation filtering")
     print("  • Context length range filtering")
-    print("  • SGLang evaluation framework integration")
+    print("  • fLLiper evaluation framework integration")
     print("  • Comprehensive error handling")
 
     print("\n📋 FORMAT COMPATIBILITY:")
@@ -262,10 +262,10 @@ def generate_validation_report() -> None:
 
     print("\n🚀 USAGE EXAMPLES:")
     print("  # Command line usage:")
-    print("  python -m sglang.test.run_eval --eval-name longbench_v2 --port 30000")
+    print("  python -m flliper.test.run_eval --eval-name longbench_v2 --port 30000")
     print("  ")
     print("  # Python API usage:")
-    print("  from sglang.test.simple_eval_longbench_v2 import LongBenchV2Eval")
+    print("  from flliper.test.simple_eval_longbench_v2 import LongBenchV2Eval")
     print("  eval_obj = LongBenchV2Eval(data_source='THUDM/LongBench-v2')")
     print("  result = eval_obj(sampler)")
 

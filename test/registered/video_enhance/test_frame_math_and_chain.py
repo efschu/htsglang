@@ -8,7 +8,7 @@ stops gating.
 
 import unittest
 
-from sglang.srt.video_enhance.chain import (
+from flliper.srt.video_enhance.chain import (
     CANONICAL_ORDER,
     ChainError,
     ChainRequest,
@@ -16,7 +16,7 @@ from sglang.srt.video_enhance.chain import (
     build_chain,
     validate_chain,
 )
-from sglang.srt.video_enhance.frame_math import (
+from flliper.srt.video_enhance.frame_math import (
     GIB,
     MIB,
     R4K,
@@ -34,8 +34,8 @@ from sglang.srt.video_enhance.frame_math import (
     sr_footprint,
     sr_reserved_bytes,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

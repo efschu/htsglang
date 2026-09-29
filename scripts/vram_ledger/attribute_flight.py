@@ -35,7 +35,7 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python")
 )
 
-from sglang.srt.mem_ledger.flight_recorder import (  # noqa: E402
+from flliper.srt.mem_ledger.flight_recorder import (  # noqa: E402
     MIB,
     churn_attribution,
     list_boots,
@@ -43,7 +43,7 @@ from sglang.srt.mem_ledger.flight_recorder import (  # noqa: E402
     read_marks,
     resident_attribution,
 )
-from sglang.srt.mem_ledger.reconcile import (  # noqa: E402
+from flliper.srt.mem_ledger.reconcile import (  # noqa: E402
     ReconcileRefusal,
     reconcile,
 )
@@ -126,7 +126,7 @@ def _phases(args) -> int:
     by_rank = read_marks(args.directory, boot=getattr(args, "boot", None))
     if not by_rank:
         print(f"No flight marks under {args.directory}.")
-        print("Boot with SGLANG_VRAM_FLIGHT_DIR=<dir> to produce them.")
+        print("Boot with FLLIPER_VRAM_FLIGHT_DIR=<dir> to produce them.")
         return 1
     # Keyed by pid: under PP the TP rank collides across processes, so the
     # rank is read off the marks rather than used as the grouping key.

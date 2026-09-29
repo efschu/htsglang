@@ -53,8 +53,8 @@ import torch.multiprocessing as mp
 
 # AT MODULE SCOPE ON PURPOSE (#825) -- do not push this back into ``_holder``.
 # The note under ``_pay_import_cost`` explains what that costs.
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60)
 
@@ -62,7 +62,7 @@ WORLD = 3
 ROUNDS = 2
 TIMEOUT_S = 5.0
 
-_IMPORT_COST_ENV = "SGLANG_TEST_630_IMPORT_DELAY_S"
+_IMPORT_COST_ENV = "FLLIPER_TEST_630_IMPORT_DELAY_S"
 
 
 def _pay_import_cost():
@@ -70,7 +70,7 @@ def _pay_import_cost():
     import is paid -- so that moving one moves the other.
 
     #825, MEASURED 2026-08-23 (hermetic, CVD=""): importing
-    ``sglang.srt.mem_cache.unified_radix_cache`` costs **7.38 s cold** and
+    ``flliper.srt.mem_cache.unified_radix_cache`` costs **7.38 s cold** and
     5.3-6.0 s warm, and pulls 6081 modules. Two arbitrary branch states of this
     tree differ from each other by ~0.5 s warm, because the import graph is
     exactly what a branch changes.
@@ -234,7 +234,7 @@ class TheBoundStillFires(unittest.TestCase):
     """
 
     def test_a_dead_peer_still_raises_a_named_bounded_error(self):
-        from sglang.srt.mem_cache.hicache_collective import (
+        from flliper.srt.mem_cache.hicache_collective import (
             HiCacheCollectiveTimeoutError,
         )
 
@@ -265,7 +265,7 @@ class TheMarginMustNotDependOnImportCost(unittest.TestCase):
         # assertTrue, not assertIn: assertIn renders the container on failure,
         # and that container is sys.modules -- 264 KB of dict into the CI log.
         self.assertTrue(
-            "sglang.srt.mem_cache.unified_radix_cache" in sys.modules,
+            "flliper.srt.mem_cache.unified_radix_cache" in sys.modules,
             "the subject must be imported at module scope, before any process "
             "group exists -- see _pay_import_cost (#825)",
         )
@@ -281,7 +281,7 @@ class TheMarginMustNotDependOnImportCost(unittest.TestCase):
         module scope it cannot, because ``init_process_group`` is itself the
         rendezvous and absorbs it.
         """
-        from sglang.srt.mem_cache.hicache_collective import (
+        from flliper.srt.mem_cache.hicache_collective import (
             HiCacheCollectiveTimeoutError,
         )
 

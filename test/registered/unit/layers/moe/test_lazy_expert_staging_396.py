@@ -27,11 +27,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     ExpertStagingPlan,
     stage_experts_into_tiers,
 )
-from sglang.srt.layers.moe.lazy_expert_staging import (  # noqa: E402
+from flliper.srt.layers.moe.lazy_expert_staging import (  # noqa: E402
     ExpertFileRef,
     LazyExpertUnavailable,
     LazySpillPool,
@@ -84,13 +84,13 @@ class _RecordingSource:
 
 @pytest.fixture
 def gate_off(monkeypatch):
-    monkeypatch.setenv("SGLANG_EXPERT_LAZY_STAGING", "0")
+    monkeypatch.setenv("FLLIPER_EXPERT_LAZY_STAGING", "0")
     yield
 
 
 @pytest.fixture
 def gate_on(monkeypatch):
-    monkeypatch.setenv("SGLANG_EXPERT_LAZY_STAGING", "1")
+    monkeypatch.setenv("FLLIPER_EXPERT_LAZY_STAGING", "1")
     yield
 
 
@@ -100,7 +100,7 @@ def gate_on(monkeypatch):
 
 
 def test_gate_defaults_off(monkeypatch):
-    monkeypatch.delenv("SGLANG_EXPERT_LAZY_STAGING", raising=False)
+    monkeypatch.delenv("FLLIPER_EXPERT_LAZY_STAGING", raising=False)
     assert lazy_expert_staging_enabled() is False
 
 
@@ -348,7 +348,7 @@ def test_the_cuda_graph_uva_view_refuses_a_lazy_pool_by_name():
     this is the falsifier for it: if the refusal is ever removed, this test
     stops raising and the silent-garbage path is live again.
     """
-    from sglang.srt.layers.moe.expert_offload import device_view_of_pinned
+    from flliper.srt.layers.moe.expert_offload import device_view_of_pinned
 
     with tempfile.TemporaryDirectory() as tmp:
         pool = _lazy_pool(_checkpoint(tmp))

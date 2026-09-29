@@ -63,7 +63,7 @@ So the fix is two-layered, and the layers are not interchangeable:
   for driver OOM. Providers are rank-local by contract because by then the
   group has committed to a batch and a collective would hang.
 
-THE 45s WINDOW IS THE AMPLIFIER. SGLANG_PHASE_POLICY_PP_WINDOW_S=45 is live and
+THE 45s WINDOW IS THE AMPLIFIER. FLLIPER_PHASE_POLICY_PP_WINDOW_S=45 is live and
 admits roughly three times the concurrent prefills the 15s regime did, so the
 pool reaches zero far more often. Nothing here depends on the window length:
 the guard is a function of what the pool can fund at the moment of scheduling,
@@ -74,7 +74,7 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.mem_cache import common as mc
+from flliper.srt.mem_cache import common as mc
 
 PAGE = 64
 CHUNK = 512
@@ -300,7 +300,7 @@ class TheWiringIsPinnedTest(unittest.TestCase):
     def test_add_chunked_req_consults_the_pool_before_scheduling(self):
         import inspect
 
-        from sglang.srt.managers.schedule_policy import PrefillAdder
+        from flliper.srt.managers.schedule_policy import PrefillAdder
 
         src = inspect.getsource(PrefillAdder.add_chunked_req)
         self.assertIn("chunk_tokens_the_pool_can_fund", src)
@@ -310,7 +310,7 @@ class TheWiringIsPinnedTest(unittest.TestCase):
         """The exact line that killed the instance must not come back."""
         import inspect
 
-        from sglang.srt.managers.schedule_policy import PrefillAdder
+        from flliper.srt.managers.schedule_policy import PrefillAdder
 
         src = inspect.getsource(PrefillAdder.add_chunked_req)
         self.assertNotIn(
@@ -324,7 +324,7 @@ class TheWiringIsPinnedTest(unittest.TestCase):
         extend_range.end == len(prefix_indices), i.e. nothing new to cache."""
         import inspect
 
-        from sglang.srt.managers.schedule_policy import PrefillAdder
+        from flliper.srt.managers.schedule_policy import PrefillAdder
 
         src = inspect.getsource(PrefillAdder.add_chunked_req)
         self.assertIn("set_extend_range(", src)

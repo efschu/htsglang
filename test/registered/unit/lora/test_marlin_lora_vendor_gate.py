@@ -14,7 +14,7 @@ is never constructed and no kernel is launched.
 import inspect
 import unittest
 
-from sglang.srt.lora import lora_moe_runner_marlin as mod
+from flliper.srt.lora import lora_moe_runner_marlin as mod
 
 
 class TestMarlinLoraGateIsVendorFirst(unittest.TestCase):

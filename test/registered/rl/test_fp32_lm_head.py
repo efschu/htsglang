@@ -6,14 +6,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.runtime_context import get_server_args
-from sglang.srt.server_args import (
+from flliper.srt.layers.logits_processor import LogitsProcessor
+from flliper.srt.runtime_context import get_server_args
+from flliper.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.utils import get_device
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")

@@ -10,15 +10,15 @@ import torch.nn.functional as F
 import triton.testing
 from sgl_kernel import dsv3_fused_a_gemm as sgl_kernel_dsv3_fused_a_gemm
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import (
+from flliper.jit_kernel.benchmark import marker
+from flliper.jit_kernel.cutedsl_dsv3_fused_a_gemm import (
     dsv3_fused_a_gemm as cutedsl_dsv3_fused_a_gemm,
 )
-from sglang.jit_kernel.dsv3_fused_a_gemm import dsv3_fused_a_gemm
-from sglang.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
-from sglang.srt.utils.common import is_sm120_supported
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
+from flliper.jit_kernel.dsv3_fused_a_gemm import dsv3_fused_a_gemm
+from flliper.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
+from flliper.srt.utils.common import is_sm120_supported
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.utils import is_in_ci
 
 register_cuda_ci(
     est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

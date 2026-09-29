@@ -3,19 +3,19 @@ import unittest
 import torch
 from torch import nn
 
-from sglang.srt.debug_utils.tensor_dump_forward_hook import (
+from flliper.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
-from sglang.srt.distributed.parallel_state import (
+from flliper.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import LinearBase
-from sglang.srt.models.qwen2 import Qwen2MLP
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import add_prefix
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.layers.layernorm import RMSNorm
+from flliper.srt.layers.linear import LinearBase
+from flliper.srt.models.qwen2 import Qwen2MLP
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.utils import add_prefix
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=9,
@@ -90,7 +90,7 @@ def test_model_forward_dump(tmp_path):
     model.apply(init_weights)
     model = model.cuda().bfloat16()
     dumper = register_forward_hook_for_model(
-        model, tmp_path / "sglang_dump", [0], 0, 0, 0
+        model, tmp_path / "flliper_dump", [0], 0, 0, 0
     )
 
     dir_path = dumper.get_dump_dir()

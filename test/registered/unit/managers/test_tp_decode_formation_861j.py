@@ -56,43 +56,43 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.managers.phase_policy import PhasePolicyState
-from sglang.srt.managers.phase_policy import config_from_env as policy_config_from_env
-from sglang.srt.managers.phase_purity import (
+from flliper.srt.disaggregation.utils import DisaggregationMode
+from flliper.srt.distributed.parallel_state_wrapper import ParallelState
+from flliper.srt.managers.phase_policy import PhasePolicyState
+from flliper.srt.managers.phase_policy import config_from_env as policy_config_from_env
+from flliper.srt.managers.phase_purity import (
     SEAM_READMIT_ATTR,
     parse_purity,
     prefill_blocked_here,
 )
-from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.managers.schedule_batch import NextBatchPlan, Req
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.chunk_cache import ChunkCache
+from flliper.srt.sampling.sampling_params import SamplingParams
 
 # The metal policy environment, from the boot's own armed line:
 #   "PHASE-POLICY armed: N=7004 tok (break-even 3.2s / (1/1681 - 1/7245.5)),
 #    min dwell 3s, idle dwell 3s, pp window 15s, tp decode floor 10s ..."
 # plus --phase-policy-drain-mode-strict from boot_w37f2.sh.
 _METAL_ENV = {
-    "SGLANG_PHASE_POLICY_TP_TOK_S": "1681",
-    "SGLANG_PHASE_POLICY_PP_TOK_S": "7245.5",
-    "SGLANG_PHASE_POLICY_FLIP_COST_S": "3.2",
-    "SGLANG_PHASE_POLICY_DRAIN_MODE_STRICT": "1",
-    "SGLANG_PHASE_POLICY_PP_WINDOW_S": "15",
-    "SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S": "10",
-    "SGLANG_PHASE_POLICY_MIN_DWELL_S": "3",
-    "SGLANG_PHASE_POLICY_IDLE_DWELL_S": "3",
+    "FLLIPER_PHASE_POLICY_TP_TOK_S": "1681",
+    "FLLIPER_PHASE_POLICY_PP_TOK_S": "7245.5",
+    "FLLIPER_PHASE_POLICY_FLIP_COST_S": "3.2",
+    "FLLIPER_PHASE_POLICY_DRAIN_MODE_STRICT": "1",
+    "FLLIPER_PHASE_POLICY_PP_WINDOW_S": "15",
+    "FLLIPER_PHASE_POLICY_TP_DECODE_FLOOR_S": "10",
+    "FLLIPER_PHASE_POLICY_MIN_DWELL_S": "3",
+    "FLLIPER_PHASE_POLICY_IDLE_DWELL_S": "3",
 }
 # Env that must NOT leak in from the invoking shell.
-_MUST_BE_UNSET = ("SGLANG_PHASE_POLICY_FLIP_TOKENS", "SGLANG_PHASE_POLICY_DRAIN_MODE")
+_MUST_BE_UNSET = ("FLLIPER_PHASE_POLICY_FLIP_TOKENS", "FLLIPER_PHASE_POLICY_DRAIN_MODE")
 
 
 def _metal_policy_cfg():
@@ -433,7 +433,7 @@ class TestDarkRadixTransportIsLoud(CustomTestCase):
     reachable from the real emit path."""
 
     def _reporter(self):
-        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+        from flliper.srt.managers.scheduler_components.metrics_reporter import (
             SchedulerMetricsReporter,
         )
 
@@ -489,8 +489,8 @@ class TestDarkRadixTransportIsLoud(CustomTestCase):
     def _emit(self, *, new_tokens, cached_tokens, transport, in_tp=True):
         from unittest.mock import patch as _patch
 
-        from sglang.srt.managers import layout_conformance
-        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+        from flliper.srt.managers import layout_conformance
+        from flliper.srt.managers.scheduler_components.metrics_reporter import (
             PrefillStats,
         )
 
@@ -510,7 +510,7 @@ class TestDarkRadixTransportIsLoud(CustomTestCase):
             num_new_seqs=3,
         )
         with _patch(
-            "sglang.srt.distributed.parallel_state.phase_flip_tp_routing_active",
+            "flliper.srt.distributed.parallel_state.phase_flip_tp_routing_active",
             return_value=in_tp,
         ):
             reporter.report_prefill_stats(batch, stats, can_run_cuda_graph=False)

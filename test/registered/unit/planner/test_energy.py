@@ -15,8 +15,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sglang.srt.planner import jtok_counter as jc
-from sglang.srt.planner.energy import (
+from flliper.srt.planner import jtok_counter as jc
+from flliper.srt.planner.energy import (
     BucketMeasurement,
     MeasurementConfig,
     MeasurementResult,
@@ -24,7 +24,7 @@ from sglang.srt.planner.energy import (
     _fold_into_jtok_counter,
     validation_config,
 )
-from sglang.srt.planner.results_store import ResultsStore
+from flliper.srt.planner.results_store import ResultsStore
 
 
 def _bm(workload, bucket, jpre, jdec, ncards=3):
@@ -206,7 +206,7 @@ class TestConfig(unittest.TestCase):
 
 class TestMtpConfig(unittest.TestCase):
     def test_mtp_launch_command_has_spec_stack(self):
-        from sglang.srt.planner.energy import mtp_config
+        from flliper.srt.planner.energy import mtp_config
 
         joined = " ".join(mtp_config().launch_command())
         self.assertIn("--speculative-algorithm NEXTN", joined)
@@ -219,7 +219,7 @@ class TestMtpConfig(unittest.TestCase):
         self.assertEqual(mtp_config().label, "MTP+adaptive")
 
     def test_spec_entry_carries_label_and_accept(self):
-        from sglang.srt.planner.energy import mtp_config
+        from flliper.srt.planner.energy import mtp_config
 
         cfg = mtp_config()
         bm = _bm("code", 1, 0.5, 6.8)
@@ -242,7 +242,7 @@ class TestMtpConfig(unittest.TestCase):
         self.assertEqual(e.spec_accept_length_by_bucket, {1: 3.1})
 
     def test_compare_summary_reports_multiplier(self):
-        from sglang.srt.planner.energy import compare_summary, validation_config
+        from flliper.srt.planner.energy import compare_summary, validation_config
 
         def result(label, dec):
             bm = _bm("code", 1, 0.4, 4.0)

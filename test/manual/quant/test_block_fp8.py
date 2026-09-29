@@ -4,23 +4,23 @@ from functools import lru_cache
 
 import torch
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.layers.quantization.fp8_kernel import (
+from flliper.srt.layers.activation import SiluAndMul
+from flliper.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+from flliper.srt.layers.moe.topk import TopKConfig, select_experts
+from flliper.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
-from sglang.srt.layers.quantization.fp8_utils import (
+from flliper.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
     triton_mxfp8_blockscaled_linear,
 )
-from sglang.srt.utils import is_sm100_supported, is_sm120_supported
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils import is_sm100_supported, is_sm120_supported
+from flliper.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
 

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.srt.models import qwen3_5_mtp as m
+from flliper.srt.models import qwen3_5_mtp as m
 
 
 def _index(tmp_path, keys):

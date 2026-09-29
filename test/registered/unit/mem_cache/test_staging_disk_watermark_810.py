@@ -36,15 +36,15 @@ import unittest
 from unittest import mock
 
 try:
-    from sglang.test.ci.ci_register import register_cpu_ci
+    from flliper.test.ci.ci_register import register_cpu_ci
 except ImportError:  # pragma: no cover - registration is a CI-time marker
 
     def register_cpu_ci(*args, **kwargs):
         return None
 
 
-from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -69,8 +69,8 @@ class StagingRequiresABoundedFileTierTest(CustomTestCase):
         self._env = mock.patch.dict(
             os.environ,
             {
-                "SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE": "",
-                "SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE": "",
+                "FLLIPER_HICACHE_FILE_BACKEND_MAX_SIZE": "",
+                "FLLIPER_HICACHE_FILE_BACKEND_MIN_FREE_SPACE": "",
             },
         )
         self._env.start()
@@ -108,7 +108,7 @@ class StagingRequiresABoundedFileTierTest(CustomTestCase):
         """The env vars are the documented second source. A check that only
         read ``extra_config`` would refuse a correctly configured launch."""
         with mock.patch.dict(
-            os.environ, {"SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE": "1G"}
+            os.environ, {"FLLIPER_HICACHE_FILE_BACKEND_MAX_SIZE": "1G"}
         ):
             evictor = _evictor(self.tmpdir, require_watermark=True)
         self.assertTrue(evictor._eviction_configured)
@@ -119,7 +119,7 @@ class StagingRequiresABoundedFileTierTest(CustomTestCase):
         DISARMS a knob the environment had set. A parse-time check that merely
         OR-ed the two sources would pass this launch and leave it unbounded."""
         with mock.patch.dict(
-            os.environ, {"SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE": "1G"}
+            os.environ, {"FLLIPER_HICACHE_FILE_BACKEND_MAX_SIZE": "1G"}
         ):
             with self.assertRaises(ValueError):
                 _evictor(
@@ -156,7 +156,7 @@ class TheBackendPassesTheRoleTest(CustomTestCase):
 
     @staticmethod
     def _config(host_role, tmpdir):
-        from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+        from flliper.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 
         return HiCacheStorageConfig(
             tp_rank=0,
@@ -178,9 +178,9 @@ class TheBackendPassesTheRoleTest(CustomTestCase):
         self._env = mock.patch.dict(
             os.environ,
             {
-                "SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE": "",
-                "SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE": "",
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "",
+                "FLLIPER_HICACHE_FILE_BACKEND_MAX_SIZE": "",
+                "FLLIPER_HICACHE_FILE_BACKEND_MIN_FREE_SPACE": "",
+                "FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": "",
             },
         )
         self._env.start()
@@ -190,13 +190,13 @@ class TheBackendPassesTheRoleTest(CustomTestCase):
         self._tmp.cleanup()
 
     def test_the_default_role_builds_an_unbounded_backend_as_before(self):
-        from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+        from flliper.srt.mem_cache.hicache_storage import HiCacheFile
 
         store = HiCacheFile(self._config("retention", self.tmpdir), self.tmpdir)
         self.assertFalse(store._evictor._eviction_configured)
 
     def test_a_staging_role_refuses_to_build_an_unbounded_backend(self):
-        from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+        from flliper.srt.mem_cache.hicache_storage import HiCacheFile
 
         with self.assertRaises(ValueError):
             HiCacheFile(self._config("staging", self.tmpdir), self.tmpdir)
@@ -205,7 +205,7 @@ class TheBackendPassesTheRoleTest(CustomTestCase):
         """Every other construction site of ``HiCacheStorageConfig`` is
         unchanged because the field is defaulted."""
         self.assertEqual(self._config("retention", self.tmpdir).host_role, "retention")
-        from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+        from flliper.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 
         self.assertEqual(
             HiCacheStorageConfig.__dataclass_fields__["host_role"].default,
@@ -224,7 +224,7 @@ class TheControllerCarriesTheRoleTest(CustomTestCase):
     def _generate(self, server_args):
         import types
 
-        from sglang.srt.managers import cache_controller as cc_mod
+        from flliper.srt.managers import cache_controller as cc_mod
 
         controller = types.SimpleNamespace(
             mem_pool_device=object(),

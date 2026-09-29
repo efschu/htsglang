@@ -3,12 +3,12 @@ that could never become COMPLETE.
 
 A slot is COMPLETE only when every writer rank merged its extents. The P
 ranks decide their anchor claims locally -- PP0 reads the store and finds a
-node already backed, PP1/PP2 publish it (MAMBA-ARENA weg2-0-11: PP0 written=1,
+node already backed, PP1/PP2 publish it (MAMBA-ARENA pdflip-0-11: PP0 written=1,
 PP1/PP2 written=3) -- so a stem PP1/PP2 claimed and wrote but PP0 never joined
 stays CLAIMED: no reader may use it, no evictor may take it, and it is not
 FREE. Census 12:00 -> 12:15: complete 29 -> 5 while every claim found no
 free slot; from 12:13:14 every END anchor was refused (end_anchor=missing),
-D resumed short (weg2-18-64: deliverable 37248, deepest anchor 17536,
+D resumed short (pdflip-18-64: deliverable 37248, deepest anchor 17536,
 shortfall 19712) or not at all (#928 'no recurrent state'), W50, P prefilled
 again.
 
@@ -27,9 +27,9 @@ import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost  # noqa: E402
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost  # noqa: E402
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 SLOT = 4096
 HALF = SLOT // 2
@@ -49,7 +49,7 @@ def arena(path):
 
 @pytest.fixture
 def fast_reap(monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_ARENA_PARTIAL_REAP_S", "0.05")
+    monkeypatch.setenv("FLLIPER_PDFLIP_ARENA_PARTIAL_REAP_S", "0.05")
 
 
 def _mamba_room(arena, need=1):
@@ -151,7 +151,7 @@ def test_a_writer_given_up_by_abort_makes_the_slot_an_orphan(arena, fast_reap):
 
 
 def test_a_recent_orphan_waits_for_the_age(arena, monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_ARENA_PARTIAL_REAP_S", "30")
+    monkeypatch.setenv("FLLIPER_PDFLIP_ARENA_PARTIAL_REAP_S", "30")
     for i in range(4):
         _orphan(arena, f"fresh{i}")
     assert _mamba_room(arena) == 0
@@ -159,7 +159,7 @@ def test_a_recent_orphan_waits_for_the_age(arena, monkeypatch):
 
 
 def test_the_reap_can_be_switched_off(arena, monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_ARENA_PARTIAL_REAP_S", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_ARENA_PARTIAL_REAP_S", "0")
     for i in range(4):
         _orphan(arena, f"off{i}")
     time.sleep(0.05)

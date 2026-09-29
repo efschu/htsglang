@@ -5,7 +5,7 @@
 set -u
 
 ROOT=/spinning/wt-770-solver
-MOD=$ROOT/python/sglang/srt/managers/kv_backing_relief.py
+MOD=$ROOT/python/flliper/srt/managers/kv_backing_relief.py
 PY=/spinning/htsglang-gpu/.venv/bin/python
 BAK=$(mktemp)
 cp "$MOD" "$BAK"

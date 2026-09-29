@@ -10,15 +10,15 @@ from openai.types.responses import (
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from utils import make_serving
 
-from sglang.srt.entrypoints.context import SimpleContext
-from sglang.srt.entrypoints.openai.protocol import (
+from flliper.srt.entrypoints.context import SimpleContext
+from flliper.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
     RequestResponseMetadata,
     ResponsesRequest,
 )
-from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
-from sglang.srt.function_call.core_types import ToolCallItem
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from flliper.srt.function_call.core_types import ToolCallItem
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -396,7 +396,7 @@ class OutputItemsTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
+            "flliper.srt.entrypoints.openai.serving_responses.FunctionCallParser"
         ) as parser_cls:
             instance = parser_cls.return_value
             instance.has_tool_call.return_value = True
@@ -428,7 +428,7 @@ class OutputItemsTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
+            "flliper.srt.entrypoints.openai.serving_responses.FunctionCallParser"
         ) as parser_cls:
             instance = parser_cls.return_value
             instance.has_tool_call.return_value = True
@@ -494,7 +494,7 @@ class OutputItemsTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
+            "flliper.srt.entrypoints.openai.serving_responses.FunctionCallParser"
         ) as parser_cls:
             output_items = serving._make_response_output_items(
                 request, "just a plain answer", tokenizer=Mock()
@@ -507,8 +507,8 @@ class OutputItemsTestCase(unittest.TestCase):
 
 class HarmonyResponsesTestCase(unittest.TestCase):
     def test_developer_message_skips_unsupported_tool_types(self):
-        from sglang.srt.entrypoints.harmony_utils import get_developer_message
-        from sglang.srt.entrypoints.openai.protocol import ResponseTool
+        from flliper.srt.entrypoints.harmony_utils import get_developer_message
+        from flliper.srt.entrypoints.openai.protocol import ResponseTool
 
         tools = [
             ResponseTool(

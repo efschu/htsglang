@@ -40,16 +40,16 @@ from pathlib import Path
 
 import torch
 
-import sglang.kernels.ops.kvcache.cache_move as cache_move
-import sglang.srt.mem_cache.memory_pool as memory_pool
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache.memory_pool import (
+import flliper.kernels.ops.kvcache.cache_move as cache_move
+import flliper.srt.mem_cache.memory_pool as memory_pool
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache.memory_pool import (
     graph_safe_store_bound,
     kv_bound_check_enabled,
     kv_store_bound,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -312,7 +312,7 @@ class TestBoundCheckSwitch(CustomTestCase):
         self.assertTrue(kv_bound_check_enabled())
 
     def test_env_turns_it_off_and_back_on(self):
-        with envs.SGLANG_DISABLE_KV_MASKED_BOUND_CHECK.override(True):
+        with envs.FLLIPER_DISABLE_KV_MASKED_BOUND_CHECK.override(True):
             self.assertFalse(kv_bound_check_enabled())
         self.assertTrue(kv_bound_check_enabled())
 

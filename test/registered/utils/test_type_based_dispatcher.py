@@ -7,9 +7,9 @@ Tests real-world scenarios with actual request types.
 import timeit
 import unittest
 
-from sglang.srt.managers.io_struct import SamplingParams
-from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
-from sglang.utils import TypeBasedDispatcher
+from flliper.srt.managers.io_struct import SamplingParams
+from flliper.test.ci.ci_register import register_amd_ci, register_cpu_ci
+from flliper.utils import TypeBasedDispatcher
 
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
@@ -23,7 +23,7 @@ class TestTypeBasedDispatcher(unittest.TestCase):
         print("E2E Performance Test for TypeBasedDispatcher")
         print("=" * 50)
 
-        from sglang.srt.managers.io_struct import (
+        from flliper.srt.managers.io_struct import (
             AbortReq,
             BatchTokenizedEmbeddingReqInput,
             BatchTokenizedGenerateReqInput,

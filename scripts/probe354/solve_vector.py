@@ -22,7 +22,7 @@ def main() -> int:
     model_path = sys.argv[1]
     extra = sys.argv[2:]
 
-    from sglang.srt.server_args import ServerArgs, prepare_server_args
+    from flliper.srt.server_args import ServerArgs, prepare_server_args
 
     argv = [
         "--model-path",

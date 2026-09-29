@@ -3,7 +3,7 @@ und wer eine Region nicht fuehrt, ist kein fehlender Halter.
 
 fnFL2w2 erreichte den ersten Flip und starb am Wake mit
 
-    W68 Weg2XchgPlanDisagree: model.layers.0.mlp.experts.w13_weight_packed:
+    W68 PdFlipXchgPlanDisagree: model.layers.0.mlp.experts.w13_weight_packed:
     the PP side holds (81920, 2560) and the TP rows hold
     [(81920, 2560), (163840, 1280), (163840, 1280)]
 
@@ -24,8 +24,8 @@ Gewichte allein traegt.
 
 import pytest
 
-from sglang.srt.weg2 import xchg_manifest as xm
-from sglang.srt.weg2 import weight_exchange as wx
+from flliper.srt.pdflip import xchg_manifest as xm
+from flliper.srt.pdflip import weight_exchange as wx
 
 
 class _FakeTensor:
@@ -34,7 +34,7 @@ class _FakeTensor:
 
 
 def test_a_meta_tensor_is_not_a_holder():
-    from sglang.srt.weg2.weight_exchange import _tensor_is_meta
+    from flliper.srt.pdflip.weight_exchange import _tensor_is_meta
 
     assert _tensor_is_meta(_FakeTensor("meta")) is True
     assert _tensor_is_meta(_FakeTensor("cuda")) is False
@@ -45,7 +45,7 @@ def test_what_it_cannot_read_stays_in_the_manifest():
     """Die Irrtumsrichtung: ein Tensor, den dieser Test nicht lesen kann,
     bleibt drin. Ihn fallen zu lassen wuerde den Austausch still verengen;
     ihn zu behalten faellt spaetestens im Join auf."""
-    from sglang.srt.weg2.weight_exchange import _tensor_is_meta
+    from flliper.srt.pdflip.weight_exchange import _tensor_is_meta
 
     assert _tensor_is_meta(object()) is False
     assert _tensor_is_meta(None) is False
@@ -98,7 +98,7 @@ def test_a_missing_piece_of_a_REAL_CUT_is_still_refused():
         _man("D", 1, [_piece(DENSE, 100, 8)]),   # Rang 2 fehlt sein Drittel
         _man("D", 2, [_piece("x.norm.weight", 1, 8)]),
     ]
-    with pytest.raises(wx.Weg2XchgSourceMissing):
+    with pytest.raises(wx.PdFlipXchgSourceMissing):
         xm.join_manifests(pp + tp)
 
 
@@ -127,5 +127,5 @@ def test_the_measured_shadow_shapes_no_longer_meet_in_the_join():
     whole = _piece(DRAFT, 81920, 2560)
     cut = [_piece(DRAFT, 81920, 2560), _piece(DRAFT, 163840, 1280),
            _piece(DRAFT, 163840, 1280)]
-    with pytest.raises(wx.Weg2XchgPlanDisagree):
+    with pytest.raises(wx.PdFlipXchgPlanDisagree):
         xm._axis_of(DRAFT, whole, cut)

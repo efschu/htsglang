@@ -1,8 +1,8 @@
 """
-Logprobs Accuracy Test for SGLang
+Logprobs Accuracy Test for fLLiper
 
 ======================
-With deterministic/batch invariant kernels, we can ensure that SGLang produces exactly the same
+With deterministic/batch invariant kernels, we can ensure that fLLiper produces exactly the same
 logprobs results for identical inputs. However, logprobs are highly sensitive to GPU hardware,
 kernels, torch versions, and other factors, so we cannot maintain a unified logprobs baseline
 across different machines.
@@ -14,7 +14,7 @@ When submitting changes that affect logprobs computation, please:
 2. Run test
 3. Submit results
 
-We really appreciate your effort and contribution to SGLang!
+We really appreciate your effort and contribution to fLLiper!
 
 ======================
 What does this test do?
@@ -55,8 +55,8 @@ import requests
 import torch
 from transformers import AutoTokenizer
 
-import sglang as sgl
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+import flliper as sgl
+from flliper.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 # Configuration
 DENSE_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -82,7 +82,7 @@ TEMPERATURE = 1.0
 MAX_LEN = 20000
 
 # Default output files
-DEFAULT_BASELINE_PKL = "sglang_baseline_local.pkl"
+DEFAULT_BASELINE_PKL = "flliper_baseline_local.pkl"
 DEFAULT_META_JSON = "baseline_meta_preview.json"
 
 # Default engine configuration
@@ -108,7 +108,7 @@ def generate_baseline(
         meta_file: Path to save the metadata preview JSON file
         num_samples: Number of samples to generate
     """
-    print(f"SGLang version: {sgl.__version__}")
+    print(f"fLLiper version: {sgl.__version__}")
     print("Downloading ShareGPT dataset...")
 
     # Download ShareGPT dataset
@@ -142,7 +142,7 @@ def generate_baseline(
 
     rng = np.random.default_rng(42)
 
-    print(f"Launching SGLang Engine with {DENSE_MODEL_NAME}...")
+    print(f"Launching fLLiper Engine with {DENSE_MODEL_NAME}...")
     engine = sgl.Engine(
         model_path=DENSE_MODEL_NAME,
         attention_backend="flashinfer",
@@ -222,7 +222,7 @@ class TestLogprobsDense(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Set up the test class - initialize the engine once for all tests."""
-        print(f"Launching SGLang Engine with {DENSE_MODEL_NAME}...")
+        print(f"Launching fLLiper Engine with {DENSE_MODEL_NAME}...")
         cls.engine = sgl.Engine(**DEFAULT_ENGINE_CONFIG)
 
     @classmethod
@@ -242,10 +242,10 @@ class TestLogprobsDense(unittest.TestCase):
         chunk_size = kwargs.pop("chunk_size", None)
         if chunk_size is not None:
             print(f"Setting chunk size to {chunk_size}")
-            os.environ["SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"] = "True"
-            os.environ["SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"] = str(chunk_size)
+            os.environ["FLLIPER_ENABLE_LOGITS_PROCESSER_CHUNK"] = "True"
+            os.environ["FLLIPER_LOGITS_PROCESSER_CHUNK_SIZE"] = str(chunk_size)
         else:
-            os.environ["SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"] = "False"
+            os.environ["FLLIPER_ENABLE_LOGITS_PROCESSER_CHUNK"] = "False"
 
         # Create engine with merged configuration
         engine_config = {**DEFAULT_ENGINE_CONFIG, **kwargs}
@@ -270,22 +270,22 @@ class TestLogprobsDense(unittest.TestCase):
         except (IOError, pickle.PickleError) as e:
             raise Exception(f"Failed to load local baseline: {e}") from e
 
-    def compare_meta(self, baseline_meta, sglang_meta):
+    def compare_meta(self, baseline_meta, flliper_meta):
         """Compare metadata between two outputs and return max and mean differences."""
         diffs = []
         for key in ["input_top_logprobs", "output_top_logprobs"]:
-            baseline_logprobs, sglang_logprobs = baseline_meta[key], sglang_meta[key]
+            baseline_logprobs, flliper_logprobs = baseline_meta[key], flliper_meta[key]
             self.assertEqual(
                 len(baseline_logprobs),
-                len(sglang_logprobs),
-                f"Length of {key} is not equal, sglang did not return the correct number of log probs(should be top 20)",
+                len(flliper_logprobs),
+                f"Length of {key} is not equal, flliper did not return the correct number of log probs(should be top 20)",
             )
-            for baseline_entry, sglang_entry in zip(baseline_logprobs, sglang_logprobs):
-                if not baseline_entry or not sglang_entry:
+            for baseline_entry, flliper_entry in zip(baseline_logprobs, flliper_logprobs):
+                if not baseline_entry or not flliper_entry:
                     continue
                 baseline_token_map = {tid: lp for lp, tid, _ in baseline_entry}
-                sglang_token_map = {tid: lp for lp, tid, _ in sglang_entry}
-                common_tokens = baseline_token_map.keys() & sglang_token_map.keys()
+                flliper_token_map = {tid: lp for lp, tid, _ in flliper_entry}
+                common_tokens = baseline_token_map.keys() & flliper_token_map.keys()
                 self.assertGreaterEqual(
                     len(common_tokens),
                     TOP_K,
@@ -293,7 +293,7 @@ class TestLogprobsDense(unittest.TestCase):
                 )
                 for token_id in common_tokens:
                     diffs.append(
-                        abs(baseline_token_map[token_id] - sglang_token_map[token_id])
+                        abs(baseline_token_map[token_id] - flliper_token_map[token_id])
                     )
         if not diffs:
             return 0.0, 0.0
@@ -405,10 +405,10 @@ class TestLogprobsDense(unittest.TestCase):
                             f"return_logprob enabled on this sample, but input_top_logprobs is None (length: {len(input_top_logprobs) if input_top_logprobs is not None else 'N/A'})",
                         )
                         baseline_meta = rec["meta"]
-                        sglang_meta = meta_info
+                        flliper_meta = meta_info
 
                         max_diff, mean_diff = self.compare_meta(
-                            baseline_meta, sglang_meta
+                            baseline_meta, flliper_meta
                         )
                         all_max.append(max_diff)
                         all_mean.append(mean_diff)
@@ -479,7 +479,7 @@ class TestLogprobsDense(unittest.TestCase):
 def main():
     """Main function to handle command line arguments and run either generation or testing."""
     parser = argparse.ArgumentParser(
-        description="SGLang Logprobs Test and Baseline Generation"
+        description="fLLiper Logprobs Test and Baseline Generation"
     )
     parser.add_argument(
         "mode",

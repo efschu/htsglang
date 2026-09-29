@@ -21,7 +21,7 @@ worth a boot:
 
 import pytest
 
-from sglang.srt.managers.phase_flip_output_trace import (
+from flliper.srt.managers.phase_flip_output_trace import (
     EmitContinuity,
     OutputTrace,
     snapshot_rows,
@@ -52,13 +52,13 @@ class _Scheduler:
 
 @pytest.fixture(autouse=True)
 def _enable_trace(monkeypatch):
-    monkeypatch.setenv("SGLANG_PHASE_FLIP_OUTPUT_TRACE", "1")
+    monkeypatch.setenv("FLLIPER_PHASE_FLIP_OUTPUT_TRACE", "1")
 
 
 @pytest.fixture
 def patched_live(monkeypatch):
     """Route the module's resident-request lookup at the fake scheduler."""
-    import sglang.srt.managers.phase_flip_output_trace as mod
+    import flliper.srt.managers.phase_flip_output_trace as mod
 
     monkeypatch.setattr(mod, "_resident_reqs", lambda sched: sched._reqs)
     return mod
@@ -87,7 +87,7 @@ def test_tick_does_not_enumerate_requests_while_no_flip_is_pending(monkeypatch):
     """THE COST PIN. Outside an armed window and outside the post-cutover
     countdown the tick must not touch the resident set at all -- it runs
     on the round hook of a serving instance, once per pass, for ever."""
-    import sglang.srt.managers.phase_flip_output_trace as mod
+    import flliper.srt.managers.phase_flip_output_trace as mod
 
     def _boom(_sched):
         raise AssertionError("the resident set was enumerated on an idle pass")
@@ -97,8 +97,8 @@ def test_tick_does_not_enumerate_requests_while_no_flip_is_pending(monkeypatch):
 
 
 def test_tick_is_a_no_op_when_the_env_switch_is_off(monkeypatch):
-    monkeypatch.setenv("SGLANG_PHASE_FLIP_OUTPUT_TRACE", "0")
-    import sglang.srt.managers.phase_flip_output_trace as mod
+    monkeypatch.setenv("FLLIPER_PHASE_FLIP_OUTPUT_TRACE", "0")
+    import flliper.srt.managers.phase_flip_output_trace as mod
 
     def _boom(_sched):
         raise AssertionError("tracing ran with the switch off")
@@ -211,7 +211,7 @@ def test_continuity_is_tracked_per_request():
 def test_emit_hook_is_inert_outside_the_post_cutover_window(patched_live, caplog):
     """The emit hook sits in the output streamer, on every decode pass of
     every request. Outside the window it must not log a line."""
-    import sglang.srt.managers.phase_flip_output_trace as mod
+    import flliper.srt.managers.phase_flip_output_trace as mod
 
     mod._ACTIVE_TRACE = None
     with caplog.at_level("INFO"):

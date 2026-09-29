@@ -22,7 +22,7 @@ import socket
 
 import pytest
 
-from sglang.srt.distributed.device_communicators.barlink_liveness import (
+from flliper.srt.distributed.device_communicators.barlink_liveness import (
     ALIVE,
     DEAD,
     ENV_ENABLE,
@@ -221,7 +221,7 @@ class TestPidAlive:
 class TestBootMarker:
     def test_own_pid_returns_non_empty(self):
         """On Linux /proc is available, so our own pid yields a marker."""
-        from sglang.srt.distributed.device_communicators.barlink_liveness import (
+        from flliper.srt.distributed.device_communicators.barlink_liveness import (
             _boot_marker,
         )
 
@@ -230,7 +230,7 @@ class TestBootMarker:
         assert len(marker) > 0
 
     def test_impossible_pid_returns_empty(self):
-        from sglang.srt.distributed.device_communicators.barlink_liveness import (
+        from flliper.srt.distributed.device_communicators.barlink_liveness import (
             _boot_marker,
         )
 

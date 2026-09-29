@@ -6,7 +6,7 @@ a first-class ``thinking_budget`` must arrive at the scheduler as an attached
 built-in processor, and must run without --enable-custom-logit-processor.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -15,19 +15,19 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.sampling.sampling_batch_info import uses_custom_logit_processor
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.thinking_budget import (
+from flliper.srt.managers.io_struct import GenerateReqInput
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.tokenizer_manager import TokenizerManager
+from flliper.srt.sampling.sampling_batch_info import uses_custom_logit_processor
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.sampling.thinking_budget import (
     THINKING_BUDGET_INTERNAL_KEY,
     THINKING_BUDGET_KEY,
     THINKING_BUDGET_TOKEN_IDS_KEY,
     ThinkingBudgetUnsupportedError,
     internal_thinking_budget_processor_str,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 QWEN36_THINK_START_ID = 248068
 QWEN36_THINK_END_ID = 248069

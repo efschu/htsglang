@@ -15,9 +15,9 @@ from urllib.parse import urlparse
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -50,7 +50,7 @@ class AccuracyTwoPassMixin:
     l3_prefetch_max_uncached_tokens: int = None
 
     def _run_gsm8k(self):
-        from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
+        from flliper.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
 
         url = urlparse(self.base_url)
         args = SimpleNamespace(
@@ -114,7 +114,7 @@ class AccuracyTwoPassMixin:
         self._two_pass("GSM8K", self._run_gsm8k, self.gsm8k_threshold)
 
     def test_l3_prefetch_full_prefix_hit_after_flush(self):
-        from sglang.test.kl_test_utils import _flush_cache, _generate
+        from flliper.test.kl_test_utils import _flush_cache, _generate
 
         page = int(self.l3_prefetch_page_size)
         n_tokens = page * int(self.l3_prefetch_prompt_pages)
@@ -177,7 +177,7 @@ class TestGLM5HiRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
                 "file",
             ],
             env={
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
+                "FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
             },
         )
 
@@ -225,8 +225,8 @@ class TestGLM5UnifiedRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
                 "file",
             ],
             env={
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
+                "FLLIPER_ENABLE_UNIFIED_RADIX_TREE": "1",
             },
         )
 

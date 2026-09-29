@@ -27,13 +27,13 @@ import logging
 import random
 import unittest
 
-from sglang.srt.distributed.device_communicators import barlink_round_census as rc
-from sglang.srt.distributed.device_communicators import barlink_bar1_ext as ext
-from sglang.srt.environ import envs
-from sglang.srt.form_a_worker_forward import publish_moe_input, receive_moe_input
-from sglang.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
-from sglang.srt.utils.collective_clock import ClockBackend, CollectiveClock, collective_clock
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.distributed.device_communicators import barlink_round_census as rc
+from flliper.srt.distributed.device_communicators import barlink_bar1_ext as ext
+from flliper.srt.environ import envs
+from flliper.srt.form_a_worker_forward import publish_moe_input, receive_moe_input
+from flliper.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
+from flliper.srt.utils.collective_clock import ClockBackend, CollectiveClock, collective_clock
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="stage-a-cpu")
 
@@ -106,7 +106,7 @@ class _Bar1Like:
 
 
 def _census(on: bool):
-    return envs.SGLANG_WEG2_AR_ROUND_CENSUS.override(on)
+    return envs.FLLIPER_PDFLIP_AR_ROUND_CENSUS.override(on)
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +173,7 @@ class RoundCensusFoldTest(unittest.TestCase):
             for _ in range(60):
                 self.assertIsNone(rc.on_decode_round(0, self._x138_split_round()))
         self.assertEqual(rc._CENSUS, {})
-        with _census(True), envs.SGLANG_WEG2_AR_ROUND_CENSUS_EVERY.override(3):
+        with _census(True), envs.FLLIPER_PDFLIP_AR_ROUND_CENSUS_EVERY.override(3):
             out = [rc.on_decode_round(0, self._x138_split_round()) for _ in range(3)]
             out2 = [rc.on_decode_round(2, self._x138_split_round()) for _ in range(2)]
         self.assertIsNotNone(out[-1])
@@ -204,7 +204,7 @@ class CapturedClassesTest(unittest.TestCase):
     def test_barlink_records_only_while_capturing(self):
         """The communicator's hook sits behind graph_capture_running(): on a
         CPU-only desk that is False, so an eager all_reduce records nothing."""
-        from sglang.srt.distributed.device_communicators import barlink as bl
+        from flliper.srt.distributed.device_communicators import barlink as bl
 
         self.assertFalse(bl.graph_capture_running())
         src = open(bl.__file__).read()
@@ -227,8 +227,8 @@ class CarrierLabelEndToEndTest(unittest.TestCase):
         self.log = DecodeRoundLog(clock=self.clock, rank=0)
         self.cap = _Capture()
         for name in (
-            "sglang.srt.managers.scheduler_components.decode_round_log",
-            "sglang.srt.distributed.device_communicators.barlink_round_census",
+            "flliper.srt.managers.scheduler_components.decode_round_log",
+            "flliper.srt.distributed.device_communicators.barlink_round_census",
         ):
             lg = logging.getLogger(name)
             lg.addHandler(self.cap)
@@ -290,7 +290,7 @@ class CarrierLabelEndToEndTest(unittest.TestCase):
         for host_side in (True, False):
             self.cap.lines.clear()
             rc._reset_rounds()
-            with _census(True), envs.SGLANG_WEG2_AR_ROUND_CENSUS_EVERY.override(2):
+            with _census(True), envs.FLLIPER_PDFLIP_AR_ROUND_CENSUS_EVERY.override(2):
                 for _ in range(3):
                     self._layer_round(host_side=host_side)
                 self.log.end_round()

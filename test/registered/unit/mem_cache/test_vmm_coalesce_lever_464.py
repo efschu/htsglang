@@ -26,9 +26,9 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.mem_cache.kv_vmm_backing import resolve_coalesce_resume
+from flliper.srt.mem_cache.kv_vmm_backing import resolve_coalesce_resume
 
-_ENV = "SGLANG_VMM_COALESCE_RESUME"
+_ENV = "FLLIPER_VMM_COALESCE_RESUME"
 
 
 class TestTheLeverDefaultsOff(unittest.TestCase):
@@ -78,7 +78,7 @@ class TestTheArenaReadsTheLever(unittest.TestCase):
     def test_init_resolves_through_the_helper(self):
         import inspect
 
-        from sglang.srt.mem_cache.kv_vmm_backing import KvVmmArena
+        from flliper.srt.mem_cache.kv_vmm_backing import KvVmmArena
 
         src = inspect.getsource(KvVmmArena.__init__)
         self.assertIn("resolve_coalesce_resume", src)
@@ -86,7 +86,7 @@ class TestTheArenaReadsTheLever(unittest.TestCase):
     def test_the_default_is_none_so_the_env_can_be_seen(self):
         import inspect
 
-        from sglang.srt.mem_cache.kv_vmm_backing import KvVmmArena
+        from flliper.srt.mem_cache.kv_vmm_backing import KvVmmArena
 
         sig = inspect.signature(KvVmmArena.__init__)
         # A hard False default would swallow the environment for every caller

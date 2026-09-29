@@ -26,8 +26,8 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from sglang.srt.video_enhance import reservation as reservation_module
-from sglang.srt.video_enhance.reservation import (
+from flliper.srt.video_enhance import reservation as reservation_module
+from flliper.srt.video_enhance.reservation import (
     DEFAULT_CORRIDOR_BYTES,
     MIB,
     CardBusyError,
@@ -38,7 +38,7 @@ from sglang.srt.video_enhance.reservation import (
     available_bytes,
     default_store_root,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 # Filesystem and process-level tests only; no device is touched.
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
@@ -70,7 +70,7 @@ def dead_pid():
 def child_script(body):
     """A standalone child that loads the ledger module straight from its file.
 
-    Importing ``sglang.srt.video_enhance.reservation`` the normal way drags in
+    Importing ``flliper.srt.video_enhance.reservation`` the normal way drags in
     the whole package for a child whose only job is to take a lock, so the
     child loads the single file instead. Registering it in ``sys.modules``
     before executing it is required: ``@dataclass`` resolves annotations
@@ -669,7 +669,7 @@ class TestNvmlIdentitySeam(unittest.TestCase):
             sys.modules["pynvml"] = self._saved
 
     def test_devices_carry_uuid_name_total_and_bus(self):
-        from sglang.srt.video_enhance import nvml
+        from flliper.srt.video_enhance import nvml
 
         devices = nvml.list_devices()
         self.assertEqual(
@@ -680,7 +680,7 @@ class TestNvmlIdentitySeam(unittest.TestCase):
         self.assertEqual(self.fake.init_calls, self.fake.shutdown_calls)
 
     def test_name_fragment_resolves_a_unique_card_and_refuses_an_ambiguous_one(self):
-        from sglang.srt.video_enhance import nvml
+        from flliper.srt.video_enhance import nvml
 
         self.assertEqual(nvml.resolve_index_by_name_fragment("5090"), 1)
         with self.assertRaises(nvml.DeviceNotFoundError) as ctx:
@@ -690,7 +690,7 @@ class TestNvmlIdentitySeam(unittest.TestCase):
             nvml.resolve_index_by_name_fragment("Radeon")
 
     def test_a_uuid_pinning_answers_itself(self):
-        from sglang.srt.video_enhance import nvml
+        from flliper.srt.video_enhance import nvml
 
         with unittest.mock.patch.dict(
             os.environ, {"CUDA_VISIBLE_DEVICES": "GPU-cccc"}
@@ -706,7 +706,7 @@ class TestNvmlIdentitySeam(unittest.TestCase):
         test/registered/registry/test_current_device_uuid_589.py for the
         falsifier on a rig whose two orders actually diverge.
         """
-        from sglang.srt.video_enhance import nvml
+        from flliper.srt.video_enhance import nvml
 
         with unittest.mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "1"}):
             os.environ.pop("CUDA_DEVICE_ORDER", None)
@@ -716,7 +716,7 @@ class TestNvmlIdentitySeam(unittest.TestCase):
 
     def test_a_declared_pci_bus_order_makes_the_index_readable(self):
         """The one environment in which the literal reading is true."""
-        from sglang.srt.video_enhance import nvml
+        from flliper.srt.video_enhance import nvml
 
         with unittest.mock.patch.dict(
             os.environ,
@@ -725,7 +725,7 @@ class TestNvmlIdentitySeam(unittest.TestCase):
             self.assertEqual(nvml.current_device_uuid(), "GPU-bbbb")
 
     def test_out_of_range_pinning_is_named(self):
-        from sglang.srt.video_enhance import nvml
+        from flliper.srt.video_enhance import nvml
 
         with unittest.mock.patch.dict(
             os.environ,
@@ -766,7 +766,7 @@ class TestNvmlAbsent(unittest.TestCase):
         saved = sys.modules.pop("pynvml", None)
         try:
             with unittest.mock.patch.object(builtins, "__import__", blocked):
-                from sglang.srt.video_enhance import nvml
+                from flliper.srt.video_enhance import nvml
 
                 self.assertFalse(nvml.is_available())
                 for call in (

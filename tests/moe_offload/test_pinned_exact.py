@@ -13,7 +13,7 @@ import mmap
 import pytest
 import torch
 
-from sglang.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_offload as eo
 
 
 def _fake_cuda(monkeypatch, calls):

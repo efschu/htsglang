@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 
-from sglang.srt.model_loader.loader import _LoadSampler
+from flliper.srt.model_loader.loader import _LoadSampler
 
 
 class _Sink(logging.Logger):
@@ -38,7 +38,7 @@ def test_the_presplit_thread_gets_its_own_line():
     s.report(sink, 0.2)
     stop.set()
     th.join(1.0)
-    pre = [l for l in sink.lines if "WEG2 LOAD-PROFILE presplit" in l]
+    pre = [l for l in sink.lines if "PDFLIP LOAD-PROFILE presplit" in l]
     assert len(pre) == 1, sink.lines
     assert "_spin" in pre[0]
     # the consumer line stays the consumers' own

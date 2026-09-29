@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.managers.regime_runtime import (
+from flliper.srt.managers.regime_runtime import (
     _VECTOR_MATCH_TOLERANCE,
     _match_declared_vector,
     _shares,
@@ -152,7 +152,7 @@ class TestTheSolverSurfacesItsOwnSplit(unittest.TestCase):
     """The other half: key_solver must actually hand the split over."""
 
     def test_candidate_to_json_carries_per_rank_kv_tokens(self):
-        from sglang.srt.planner.key_solver import Candidate
+        from flliper.srt.planner.key_solver import Candidate
 
         c = Candidate(
             units=[1, 1, 1],
@@ -168,7 +168,7 @@ class TestTheSolverSurfacesItsOwnSplit(unittest.TestCase):
         self.assertEqual(c.to_json()["per_rank_kv_tokens"], [90, 110, 100])
 
     def test_an_infeasible_candidate_carries_none_not_a_guess(self):
-        from sglang.srt.planner.key_solver import Candidate
+        from flliper.srt.planner.key_solver import Candidate
 
         c = Candidate(
             units=[1, 1, 1],
@@ -188,7 +188,7 @@ class TestTheSolverSurfacesItsOwnSplit(unittest.TestCase):
         cap["p"], rounded, and nothing else."""
         import inspect
 
-        from sglang.srt.planner import key_solver
+        from flliper.srt.planner import key_solver
 
         src = inspect.getsource(key_solver._predict_all)
         self.assertIn('cells["maxkv"]["per_rank_tokens"]', src)

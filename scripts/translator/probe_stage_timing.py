@@ -79,7 +79,7 @@ def main() -> int:
     import soundfile as sf
     import torch
 
-    from sglang.srt.translator.inprocess_tts import (
+    from flliper.srt.translator.inprocess_tts import (
         InProcessQwen3Tts,
         InProcessTtsConfig,
     )

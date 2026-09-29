@@ -69,7 +69,7 @@ from pathlib import Path
 
 DEFAULT_CLIENT = (
     Path(__file__).resolve().parents[2]
-    / "python/sglang/srt/translator/client/index.html"
+    / "python/flliper/srt/translator/client/index.html"
 )
 VIEWPORT = {"width": 390, "height": 720}
 

@@ -37,11 +37,11 @@ from unittest import mock
 
 import torch
 
-import sglang.srt.layers.dcp.comm as dcp_comm
-from sglang.srt.layers.dcp.comm import cp_lse_ag_out_rs_mla
-from sglang.srt.layers.dcp.kernels import CPTritonContext, correct_attn_out
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.layers.dcp.comm as dcp_comm
+from flliper.srt.layers.dcp.comm import cp_lse_ag_out_rs_mla
+from flliper.srt.layers.dcp.kernels import CPTritonContext, correct_attn_out
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -236,7 +236,7 @@ class TestTheMlaCallSiteAsksTheBackend(CustomTestCase):
     call site must be the place that decides."""
 
     def test_forward_mla_derives_the_flag_from_current_attention_backend(self):
-        from sglang.srt.models.deepseek_common.attention_forward_methods import (
+        from flliper.srt.models.deepseek_common.attention_forward_methods import (
             forward_mla,
         )
 

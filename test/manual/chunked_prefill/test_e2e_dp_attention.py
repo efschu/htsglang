@@ -1,7 +1,7 @@
 import unittest
 
-from sglang.test.chunked_prefill_test_utils import ChunkedTestBase
-from sglang.test.test_utils import DEFAULT_MLA_MODEL_NAME_FOR_TEST
+from flliper.test.chunked_prefill_test_utils import ChunkedTestBase
+from flliper.test.test_utils import DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
 
 class TestChunkedFeatureDPAttention(ChunkedTestBase):

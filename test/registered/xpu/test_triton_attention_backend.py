@@ -6,8 +6,8 @@ python3 -m unittest test_triton_attention_backend.TestTritonAttentionBackend.tes
 import unittest
 from functools import wraps
 
-from sglang.test.ci.ci_register import register_xpu_ci
-from sglang.test.test_utils import (
+from flliper.test.ci.ci_register import register_xpu_ci
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
     CustomTestCase,
     run_bench_serving,

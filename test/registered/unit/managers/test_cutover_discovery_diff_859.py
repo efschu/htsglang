@@ -20,7 +20,7 @@ import ast
 import inspect
 
 
-from sglang.srt.managers.cutover_participants import (
+from flliper.srt.managers.cutover_participants import (
     COHERENT_ACCESSORS,
     MUTATED_STATE,
     NOT_PARTICIPANTS,
@@ -31,7 +31,7 @@ from sglang.srt.managers.cutover_participants import (
 
 
 def _cutover_source() -> str:
-    import sglang.srt.managers.phase_flip_runtime as rt
+    import flliper.srt.managers.phase_flip_runtime as rt
 
     return inspect.getsource(rt)
 
@@ -92,7 +92,7 @@ def test_policy_terms_that_fire_on_zero_use_a_coherent_accessor():
     starved dwell-bypass, and the flip-threshold shortcuts. Each must read
     through a coherent accessor rather than the raw field.
     """
-    import sglang.srt.managers.phase_policy as pp
+    import flliper.srt.managers.phase_policy as pp
 
     src = inspect.getsource(pp)
     tree = ast.parse(src)
@@ -127,8 +127,8 @@ def test_policy_terms_that_fire_on_zero_use_a_coherent_accessor():
 
 
 def test_coherent_accessors_exist():
-    import sglang.srt.managers.phase_policy as pp
-    from sglang.srt.managers.scheduler import Scheduler
+    import flliper.srt.managers.phase_policy as pp
+    from flliper.srt.managers.scheduler import Scheduler
 
     assert hasattr(pp.PhasePolicyInputs, "decode_work_bs")
     assert hasattr(pp.PhasePolicyInputs, "demand_prefill_tokens")

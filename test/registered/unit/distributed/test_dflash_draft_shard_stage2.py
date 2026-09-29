@@ -44,17 +44,17 @@ from unittest.mock import patch
 
 import torch
 
-import sglang.srt.layers.linear as linear_mod
-import sglang.srt.layers.vocab_parallel_embedding as vpe_mod
-from sglang.srt.distributed.utils import (
+import flliper.srt.layers.linear as linear_mod
+import flliper.srt.layers.vocab_parallel_embedding as vpe_mod
+from flliper.srt.distributed.utils import (
     set_tp_partition_ratios,
     tp_partition_sizes,
 )
-from sglang.srt.layers.linear import RowParallelLinear
-from sglang.srt.models.dflash import CandidateSelector, DFlashGroupedConv
-from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.linear import RowParallelLinear
+from flliper.srt.models.dflash import CandidateSelector, DFlashGroupedConv
+from flliper.srt.runtime_context import get_context, get_parallel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 

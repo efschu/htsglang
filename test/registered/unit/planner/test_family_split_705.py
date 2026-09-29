@@ -27,7 +27,7 @@ Hermetic: pure arithmetic, no CUDA.
 
 import pytest
 
-from sglang.srt.planner.family_split import (
+from flliper.srt.planner.family_split import (
     CollectiveCost,
     FamilySpec,
     RankHardware,

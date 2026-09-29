@@ -14,7 +14,7 @@ import sys
 import time
 
 # Ensure AITER is enabled
-os.environ["SGLANG_USE_AITER"] = "1"
+os.environ["FLLIPER_USE_AITER"] = "1"
 
 
 def warmup_aiter_kernels():

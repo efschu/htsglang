@@ -20,7 +20,7 @@ uneven-TP machinery coarsens the split at plan time.
 Pure functions, no GPU, no server.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -28,24 +28,24 @@ import math
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     ACTIVATION_VEC_ELEMS,
     set_tp_partition_ratios,
     tp_partition_sizes,
 )
-from sglang.srt.layers.linear import _quant_block_aligned_units
-from sglang.srt.layers.moe.fused_moe_triton.layer import moe_uneven_tp_units
-from sglang.srt.layers.quantization.awq.awq import (
+from flliper.srt.layers.linear import _quant_block_aligned_units
+from flliper.srt.layers.moe.fused_moe_triton.layer import moe_uneven_tp_units
+from flliper.srt.layers.quantization.awq.awq import (
     AWQConfig,
     AWQMarlinConfig,
     awq_uneven_tp_block,
 )
-from sglang.srt.layers.quantization.marlin_utils import (
+from flliper.srt.layers.quantization.marlin_utils import (
     GPTQ_MARLIN_MIN_THREAD_K,
     GPTQ_MARLIN_MIN_THREAD_N,
     verify_marlin_supports_shape,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # Huihui-Qwen3.6-27B-abliterated-AWQ-MTP, AWQ 4-bit group 128.
 INTERMEDIATE = 17408
@@ -79,7 +79,7 @@ def _awq_marlin_config(group_size: int = GROUP_SIZE) -> AWQMarlinConfig:
     # which no CPU test host can satisfy. The shard plan does not depend on
     # it, so stub it out rather than gate this file behind a GPU.
     with mock.patch(
-        "sglang.srt.layers.quantization.awq.awq.verify_marlin_supported"
+        "flliper.srt.layers.quantization.awq.awq.verify_marlin_supported"
     ):
         return AWQMarlinConfig(
             weight_bits=4,
@@ -92,7 +92,7 @@ def _awq_marlin_config(group_size: int = GROUP_SIZE) -> AWQMarlinConfig:
 
 
 def _mlp_units(intermediate: int, quant_config) -> int:
-    """Mirrors the derivation in sglang.srt.models.qwen2_moe.Qwen2MoeMLP."""
+    """Mirrors the derivation in flliper.srt.models.qwen2_moe.Qwen2MoeMLP."""
     units = intermediate // math.gcd(intermediate, 16)
     return _quant_block_aligned_units(intermediate, units, quant_config, 1)
 
@@ -335,7 +335,7 @@ class TestMoEGrainUnchanged(CustomTestCase):
         # this test guards is unchanged -- the AWQ/dense block must not hijack
         # the unquantized lane -- and 32 is still far finer than the 128-tile
         # grain above.
-        from sglang.srt.distributed.utils import ACTIVATION_VEC_ELEMS
+        from flliper.srt.distributed.utils import ACTIVATION_VEC_ELEMS
 
         self.assertEqual(moe_uneven_tp_units(512, None), 512 // ACTIVATION_VEC_ELEMS)
         self.assertNotEqual(

@@ -9,7 +9,7 @@ import re
 import torch
 from safetensors.torch import load_file, save_file
 
-from sglang.srt.model_loader.weight_utils import (
+from flliper.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     pread_safetensors_file,
     read_safetensors_header,

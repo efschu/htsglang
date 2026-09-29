@@ -4,12 +4,12 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
+from flliper.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     run_mla_attention_case,
 )
@@ -45,7 +45,7 @@ def _supported() -> tuple[bool, str]:
 _SUPPORTED, _SKIP_REASON = _supported()
 
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")

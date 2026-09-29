@@ -11,14 +11,14 @@ same multiplication; they are replaced with named hard errors after the primary
 fix makes total_kv_head_num always present.
 
 Reachability: the code path is gated behind
-SGLANG_DISAGG_STAGING_BUFFER (default False, environ.py:919).
+FLLIPER_DISAGG_STAGING_BUFFER (default False, environ.py:919).
 With staging disabled the multiplication is never reached -- LATENT, not LIVE.
 """
 
 import types
 import unittest
 
-from sglang.srt.disaggregation.common.staging_buffer import (
+from flliper.srt.disaggregation.common.staging_buffer import (
     compute_head_slice_params,
     resolve_total_kv_heads,
 )

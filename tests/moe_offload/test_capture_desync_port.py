@@ -46,9 +46,9 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.environ import envs  # noqa: E402
-from sglang.srt.layers.moe import offload_capture_gate  # noqa: E402
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.environ import envs  # noqa: E402
+from flliper.srt.layers.moe import offload_capture_gate  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     ExpertResidencyPlanner,
     MoEExpertOffloadCache,
     build_capturable_luts,
@@ -583,9 +583,9 @@ def test_the_replay_boundary_does_not_import_the_offload_stack():
 
     probe = (
         "import sys; "
-        "import sglang.srt.model_executor.runner_backend.full_cuda_graph_backend; "
-        "print(int('sglang.srt.layers.moe.offload_capture_gate' in sys.modules), "
-        "int('sglang.srt.layers.moe.expert_offload' in sys.modules))"
+        "import flliper.srt.model_executor.runner_backend.full_cuda_graph_backend; "
+        "print(int('flliper.srt.layers.moe.offload_capture_gate' in sys.modules), "
+        "int('flliper.srt.layers.moe.expert_offload' in sys.modules))"
     )
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="99")
     env["PYTHONPATH"] = os.pathsep.join(
@@ -618,19 +618,19 @@ def test_a_cache_without_the_hook_is_ignored():
 
 
 def test_the_cold_tier_capture_combination_refuses_by_default():
-    with envs.SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE.override(False):
+    with envs.FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE.override(False):
         with pytest.raises(RuntimeError) as excinfo:
             refuse_capturable_cold_tier(128)
     message = str(excinfo.value)
     # Both gaps must be named. A refusal that names only the pointer would send
     # the next reader looking for a hardware problem they do not have.
-    assert "SGLANG_MOE_COLD_TIER_SHM" in message
+    assert "FLLIPER_MOE_COLD_TIER_SHM" in message
     assert "delegated expert has no row" in message
     assert "cudaHostRegister" in message
 
 
 def test_the_development_seam_warns_instead_of_refusing():
-    with envs.SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE.override(True):
+    with envs.FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE.override(True):
         with mock.patch("logging.Logger.warning") as warn:
             refuse_capturable_cold_tier(128)
     assert warn.call_count == 1
@@ -682,7 +682,7 @@ class _StubMoELayer:
 
 
 def _bind_layer_methods():
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     _StubMoELayer._run_moe_core_with_offload = FusedMoE._run_moe_core_with_offload
     _StubMoELayer._run_moe_core_offload_capturable = (
@@ -693,7 +693,7 @@ def _bind_layer_methods():
 def _dispatch_output(ids):
     from typing import NamedTuple
 
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from flliper.srt.layers.moe.topk import StandardTopKOutput
 
     class _Dispatch(NamedTuple):
         hidden_states: torch.Tensor
@@ -711,7 +711,7 @@ def _dispatch_output(ids):
 @contextlib.contextmanager
 def _capture_mode(capturing):
     with mock.patch(
-        "sglang.srt.model_executor.runner_utils.capture_mode.get_is_capture_mode",
+        "flliper.srt.model_executor.runner_utils.capture_mode.get_is_capture_mode",
         return_value=capturing,
     ):
         yield
@@ -720,7 +720,7 @@ def _capture_mode(capturing):
 #: A layer-level fixture whose cold set FITS the scratch region -- i.e. the
 #: capture-eligible shape. E=40/R=32 leaves 8 cold experts for 8 slots, which
 #: is the configuration the V4 recipe's ``--rank-moe-resident-fraction`` and
-#: ``SGLANG_MOE_SCRATCH_SLOTS`` are chosen to produce.
+#: ``FLLIPER_MOE_SCRATCH_SLOTS`` are chosen to produce.
 _CAPTURABLE_SHAPE = dict(E=40, R=32, C=8)
 
 
@@ -744,7 +744,7 @@ def test_the_capturable_branch_is_taken_only_under_capture(capturing):
 
 
 def test_without_the_opt_in_capture_never_reaches_the_ported_step():
-    """``SGLANG_MOE_OFFLOAD_CUDA_GRAPH`` off must keep the pre-#443 behaviour.
+    """``FLLIPER_MOE_OFFLOAD_CUDA_GRAPH`` off must keep the pre-#443 behaviour.
 
     The default launch is the one that must not change: even under capture the
     dispatch has to fall through to ``run_waves``, whose host read is what the
@@ -774,7 +774,7 @@ def test_the_routing_trace_is_structurally_off_under_capture():
         layer = _StubMoELayer(cache, graph_mode=True, trace_path="/dev/null")
         with _capture_mode(capturing):
             with mock.patch(
-                "sglang.srt.layers.moe.expert_offload.write_routing_trace"
+                "flliper.srt.layers.moe.expert_offload.write_routing_trace"
             ) as trace:
                 with mock.patch.object(MoEExpertOffloadCache, "run_waves", create=True):
                     cache.run_waves = mock.Mock()

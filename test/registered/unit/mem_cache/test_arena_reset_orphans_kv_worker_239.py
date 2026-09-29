@@ -26,7 +26,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup  # noqa: E402
+from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup  # noqa: E402
 
 _G = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_arena_reset_orphans_1424g.py")
 _spec = importlib.util.spec_from_file_location("_g1424_harness", _G)
@@ -59,7 +59,7 @@ def test_kv_worker_reset_gives_back_what_no_holder_names(arena):
     t.root_node = types.SimpleNamespace(
         children={1: g._node(FULL, 1, g._resolve(arena, slot_of, g.PREFIX))})
     assert arena.ref_slots([slot_of["a2"]], +1) == 1     # a reference no class names
-    assert "gap=1" in t.weg2_arena_holder_census(arena)
+    assert "gap=1" in t.pdflip_arena_holder_census(arena)
     t._reset_full()
     assert g._refs(arena) == [0] * g.SLOTS
     assert g._own(arena) == 0

@@ -16,7 +16,7 @@ soup.  What had to change is the build.
 import inspect
 import types
 
-from sglang.srt.models import qwen4_exp, qwen4_exp_mtp
+from flliper.srt.models import qwen4_exp, qwen4_exp_mtp
 
 
 def test_the_mtp_constructor_does_NOT_set_it():
@@ -31,7 +31,7 @@ def test_the_mtp_constructor_does_NOT_set_it():
 
 
 def test_the_producer_rebuilds_the_vocab_under_the_target_config():
-    from sglang.srt.speculative import draft_kv_producer as dkp
+    from flliper.srt.speculative import draft_kv_producer as dkp
 
     src = inspect.getsource(dkp.DraftKvProducer.load_resident_embedding)
     assert "target_model.quant_config" in src or 'getattr(target_model, "quant_config"' in src

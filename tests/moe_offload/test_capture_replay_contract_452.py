@@ -385,7 +385,7 @@ def test_the_measured_multiplier_follows_from_the_static_index_length():
     # The static length is the whole cause: the index the gather is given has
     # shape [C] no matter what the routing was.
     cache = _fresh(seed=29)
-    from sglang.srt.layers.moe.expert_offload import prepare_capturable_remap
+    from flliper.srt.layers.moe.expert_offload import prepare_capturable_remap
 
     for n_spill in range(0, C + 1):
         ids = _routing(n_spill, cache=cache, seed=400 + n_spill)
@@ -414,7 +414,7 @@ def test_the_captured_path_has_no_copy_stream_to_overlap_with():
     """
     import inspect
 
-    from sglang.srt.layers.moe.expert_offload import MoEExpertOffloadCache
+    from flliper.srt.layers.moe.expert_offload import MoEExpertOffloadCache
 
     eager_src = inspect.getsource(MoEExpertOffloadCache._fetch)
     captured_src = inspect.getsource(MoEExpertOffloadCache._issue_fetch_capturable)

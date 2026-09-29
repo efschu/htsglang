@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.test.chunked_prefill_test_utils import ChunkedTestBase
+from flliper.test.chunked_prefill_test_utils import ChunkedTestBase
 
 
 class TestChunkedFeatureSpec(ChunkedTestBase):

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PhasePolicyConfig,
     PhasePolicyInputs,
     PhasePolicyState,

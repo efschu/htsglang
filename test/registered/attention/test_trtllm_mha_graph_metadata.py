@@ -11,16 +11,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sglang.srt.layers.attention.trtllm_mha_backend as trtllm_mha_backend
-from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
+import flliper.srt.layers.attention.trtllm_mha_backend as trtllm_mha_backend
+from flliper.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     Q_MODE_CUMSUM,
     Q_MODE_NONE,
     Q_MODE_STRIDED,
     update_trtllm_mha_graph_metadata,
 )
-from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.test.ci.ci_register import register_cuda_ci
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -121,8 +121,8 @@ def test_hybrid_wrappers_forward_in_graph_hook():
     """Hybrid wrappers must forward init_forward_metadata_in_graph to the
     wrapped backend(s) — the inherited no-op would leave the fused metadata
     rebuild out of the captured graph (stale page table on every replay)."""
-    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
-    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    from flliper.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+    from flliper.srt.layers.attention.hybrid_linear_attn_backend import (
         HybridLinearAttnBackend,
     )
 

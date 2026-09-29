@@ -28,7 +28,7 @@ class Test1008HeldPredicate(unittest.TestCase):
 
     @staticmethod
     def _held(result_queue, batch):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         fake = types.SimpleNamespace(result_queue=result_queue)
         return Scheduler._1008_held_indices(fake, batch)
@@ -64,7 +64,7 @@ class Test1008HeldPredicate(unittest.TestCase):
     def test_no_result_queue_attribute(self):
         # PP loops build their own structures; a scheduler without the
         # attribute must fall back to the pre-#1012 behaviour, not crash.
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         fake = types.SimpleNamespace()
         self.assertEqual(Scheduler._1008_held_indices(fake, _Batch([_Req("a")])), [0])
@@ -74,7 +74,7 @@ class TestFinishedRetentionWithoutTrackedPosition(unittest.TestCase):
     """No tracked mamba position must not empty the full-attention cache."""
 
     def _component(self):
-        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+        from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
             MambaComponent,
         )
 
@@ -95,7 +95,7 @@ class TestFinishedRetentionWithoutTrackedPosition(unittest.TestCase):
         )
 
     def test_no_tracked_position_declines_the_anchor_not_the_length(self):
-        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from flliper.srt.mem_cache.base_prefix_cache import InsertParams
 
         comp = self._component()
         params = InsertParams()
@@ -118,7 +118,7 @@ class TestFinishedRetentionWithoutTrackedPosition(unittest.TestCase):
         # The other half of #783 and the direction that must NOT move: an
         # unfinished step inserts and immediately re-matches, and an anchorless
         # node is unmatchable, so retaining there loses the rows instead.
-        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from flliper.srt.mem_cache.base_prefix_cache import InsertParams
 
         comp = self._component()
         params = InsertParams()
@@ -135,7 +135,7 @@ class TestFinishedRetentionWithoutTrackedPosition(unittest.TestCase):
         # the branch an over-retaining edit there would silently flip. An
         # unfinished step that retained an anchorless node would hand the tree
         # rows the request keeps using and later frees.
-        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from flliper.srt.mem_cache.base_prefix_cache import InsertParams
 
         comp = self._component()
         params = InsertParams()
@@ -148,7 +148,7 @@ class TestFinishedRetentionWithoutTrackedPosition(unittest.TestCase):
         self.assertEqual(out, 0)
 
     def test_off_grid_tracked_position_unchanged(self):
-        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from flliper.srt.mem_cache.base_prefix_cache import InsertParams
 
         comp = self._component()
         params = InsertParams()

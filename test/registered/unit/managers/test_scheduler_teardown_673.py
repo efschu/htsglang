@@ -13,7 +13,7 @@ because there never was one.
 The omission is provable by inspection and torch reports it in every boot log:
 ``destroy_distributed_environment`` / ``cleanup_dist_env_and_memory`` are
 defined in ``distributed/parallel_state.py`` and, across all of
-``python/sglang/srt``, called by nobody.
+``python/flliper/srt``, called by nobody.
 
 WHAT IS PINNED HERE, and why each one can fail:
 
@@ -39,8 +39,8 @@ import sys
 import types
 import unittest
 
-from sglang.srt.managers import scheduler_teardown
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers import scheduler_teardown
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Args:
@@ -58,7 +58,7 @@ class _Recorder(types.ModuleType):
     """Stands in for parallel_state, recording the destroy sequence."""
 
     def __init__(self, *, fail=None):
-        super().__init__("sglang.srt.distributed.parallel_state")
+        super().__init__("flliper.srt.distributed.parallel_state")
         self.calls = []
         self._fail = fail or set()
 
@@ -77,15 +77,15 @@ class TestSchedulerTeardown(CustomTestCase):
     def _install(self, recorder):
         """Swap the recorder in where the code LOOKS THE NAME UP.
 
-        ``from sglang.srt.distributed import parallel_state`` resolves the
+        ``from flliper.srt.distributed import parallel_state`` resolves the
         package ATTRIBUTE, not ``sys.modules``, so patching sys.modules alone
         leaves the real module in place -- and the real destroy then runs
         inside the test process, quietly succeeding because nothing is
         initialised. Both are patched, so the test cannot pass by accident.
         """
-        import sglang.srt.distributed as package
+        import flliper.srt.distributed as package
 
-        name = "sglang.srt.distributed.parallel_state"
+        name = "flliper.srt.distributed.parallel_state"
         real_module = sys.modules.get(name)
         real_attr = getattr(package, "parallel_state", None)
         sys.modules[name] = recorder

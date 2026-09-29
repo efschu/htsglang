@@ -5,7 +5,7 @@ on Arm64 via aarch64/moe.cpp (PR #16045). Additional quantization paths
 (BF16, INT4) will be added here as Arm kernels land.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
@@ -21,8 +21,8 @@ import torch
 # Add parent dir (test/srt/cpu/) to path for utils import
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from sglang.srt.layers.amx_utils import CPUQuantMethod
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.amx_utils import CPUQuantMethod
+from flliper.test.test_utils import CustomTestCase
 
 kernel = torch.ops.sgl_kernel
 IS_ARM64 = platform.machine().lower() in ("aarch64", "arm64")

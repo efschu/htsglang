@@ -26,7 +26,7 @@ import pytest
 
 # Import shim for the #249 default-device collection leak: an earlier
 # collected module may leave ``torch.set_default_device(<accelerator>)``
-# active, which crashes this module's sglang import chain (it reaches the
+# active, which crashes this module's flliper import chain (it reaches the
 # ``compressed_tensors`` site package, whose import constructs tensors) on a
 # box without that accelerator. Skip the module instead of erroring; the
 # side effects on the process are identical to the crash, so the fate of
@@ -34,13 +34,13 @@ import pytest
 # accelerator exists (the registered CI runners) the import succeeds and
 # the tests run normally.
 try:
-    from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    from flliper.srt.managers.scheduler_components.metrics_reporter import (
         RankPrefillLog,
         SchedulerMetricsReporter,
     )
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.utils.collective_clock import CollectiveClock, Slot
-    from sglang.test.ci.ci_register import register_cpu_ci
+    from flliper.srt.model_executor.forward_batch_info import ForwardMode
+    from flliper.srt.utils.collective_clock import CollectiveClock, Slot
+    from flliper.test.ci.ci_register import register_cpu_ci
 except RuntimeError as _import_err:  # pragma: no cover - leak-dependent
     pytest.skip(
         f"#249 default-device collection leak broke the import chain: {_import_err}",
@@ -49,7 +49,7 @@ except RuntimeError as _import_err:  # pragma: no cover - leak-dependent
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-LOGGER_NAME = "sglang.srt.managers.scheduler_components.metrics_reporter"
+LOGGER_NAME = "flliper.srt.managers.scheduler_components.metrics_reporter"
 
 
 class FakeTimer:
@@ -99,7 +99,7 @@ class FakeClock:
         self.values = list(values)
 
     def harvest_detail(self, slot):
-        from sglang.srt.utils.collective_clock import HarvestResult
+        from flliper.srt.utils.collective_clock import HarvestResult
 
         v = self.values.pop(0)
         if v is None:
@@ -540,7 +540,7 @@ class TestFamilyLabelDerivation(unittest.TestCase):
     """The four dispatch sites must carry the family of THEIR group."""
 
     def test_families_are_derived_from_the_group_name(self):
-        from sglang.srt.distributed.parallel_state import collective_clock_families
+        from flliper.srt.distributed.parallel_state import collective_clock_families
 
         # #583 appended two CENSUS-ONLY families (no clock span at their
         # dispatch sites): the 2026-08-06 desync hid in exactly the families
@@ -573,7 +573,7 @@ class TestFamilyLabelDerivation(unittest.TestCase):
                     )
                 ),
                 "python",
-                "sglang",
+                "flliper",
                 "srt",
                 "distributed",
                 "parallel_state.py",
@@ -616,7 +616,7 @@ class TestWaitByFamilyLogLine(unittest.TestCase):
         return cm.output[0]
 
     def test_families_are_appended_after_the_split(self):
-        from sglang.srt.utils.collective_clock import FamilyStat
+        from flliper.srt.utils.collective_clock import FamilyStat
 
         log, timer = self._make(
             [
@@ -661,7 +661,7 @@ class TestWaitByFamilyLogLine(unittest.TestCase):
 
     def test_graph_covered_forward_reports_no_families(self):
         """No split means no decomposition either -- never a fake zero."""
-        from sglang.srt.utils.collective_clock import FamilyStat
+        from flliper.srt.utils.collective_clock import FamilyStat
 
         log, timer = self._make([(0.05, {"tp.all_reduce": FamilyStat(40.0, 2, 30.0)})])
         line = self._emit(log, timer, [(64, 3, True)], [(0.25, Slot())])
@@ -669,7 +669,7 @@ class TestWaitByFamilyLogLine(unittest.TestCase):
         self.assertNotIn("compute", line)
 
     def test_families_merge_across_chunks_folded_into_one_line(self):
-        from sglang.srt.utils.collective_clock import FamilyStat
+        from flliper.srt.utils.collective_clock import FamilyStat
 
         log, timer = self._make(
             [

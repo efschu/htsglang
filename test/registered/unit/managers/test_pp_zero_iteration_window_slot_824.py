@@ -57,7 +57,7 @@ def _tick_harness(armed=True, enabled=True, loop_size=3):
     so the tick takes its counter-free path and this test measures the slot
     decision alone.
     """
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     class S:
         pass

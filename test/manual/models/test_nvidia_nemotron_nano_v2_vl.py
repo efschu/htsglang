@@ -1,9 +1,9 @@
 import unittest
 
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
-from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.kits.mmmu_vlm_kit import MMMUMixin
+from flliper.test.server_fixtures.default_fixture import DefaultServerBase
+from flliper.test.server_fixtures.mmmu_fixture import MMMUServerBase
 
 # NVIDIA Nemotron Nano V2 VL model tests (CUDA only)
 # GSM8k + MMMU evaluation

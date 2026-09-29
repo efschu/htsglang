@@ -63,9 +63,9 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 from test_phase_flip_runtime import (  # noqa: E402  (sibling harness)
     MAP_625,
@@ -451,7 +451,7 @@ class TheFreeListOrderIsNormalisedEvenWhenTheCountsAgreeTest(CustomTestCase):
 
     def test_collective_cap_target_returns_none_exactly_when_level(self):
         """The gap, stated as the arithmetic that produces it."""
-        from sglang.srt.managers.kv_backing_relief import collective_cap_target
+        from flliper.srt.managers.kv_backing_relief import collective_cap_target
 
         # capable=1000, floor=10, every rank exposed at 1000: LEVEL.
         self.assertIsNone(collective_cap_target([1000, -10, 1000, -1000]))
@@ -461,8 +461,8 @@ class TheFreeListOrderIsNormalisedEvenWhenTheCountsAgreeTest(CustomTestCase):
 
     def test_the_rung_normalises_the_order_on_a_level_group(self):
         """So the rung must sort ANYWAY, and this is the proof it does."""
-        from sglang.srt.managers import phase_flip_spill as pfs
-        from sglang.srt.managers.kv_backing_relief import CAP_ABSTAIN
+        from flliper.srt.managers import phase_flip_spill as pfs
+        from flliper.srt.managers.kv_backing_relief import CAP_ABSTAIN
 
         sorted_calls = []
 
@@ -502,8 +502,8 @@ class TheFreeListOrderIsNormalisedEvenWhenTheCountsAgreeTest(CustomTestCase):
 
     def test_the_rung_payload_carries_the_slot_ballot(self):
         """12 fields, not 8, and the last four decode to the verdict."""
-        from sglang.srt.managers import phase_flip_spill as pfs
-        from sglang.srt.managers.kv_backing_relief import collective_slot_ballot
+        from flliper.srt.managers import phase_flip_spill as pfs
+        from flliper.srt.managers.kv_backing_relief import collective_slot_ballot
 
         seen = []
 

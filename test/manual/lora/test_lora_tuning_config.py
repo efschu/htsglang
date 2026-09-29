@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from sglang.kernels.ops.gemm.lora_tuning_config import (
+from flliper.kernels.ops.gemm.lora_tuning_config import (
     DEFAULT_EXPAND_CONFIG,
     DEFAULT_SHRINK_CONFIG,
     get_lora_config_file_name,
@@ -15,7 +15,7 @@ from sglang.kernels.ops.gemm.lora_tuning_config import (
     get_lora_shrink_config,
 )
 
-_MODULE = "sglang.kernels.ops.gemm.lora_tuning_config"
+_MODULE = "flliper.kernels.ops.gemm.lora_tuning_config"
 
 # Shared fixture
 _TUNED_CONFIGS = {
@@ -61,20 +61,20 @@ class TestLoraConfigLoading(unittest.TestCase):
 
         # Exact match
         mock_triton.__version__ = "3.5.1"
-        with patch.dict(os.environ, {"SGLANG_LORA_CONFIG_DIR": self.tmpdir}):
+        with patch.dict(os.environ, {"FLLIPER_LORA_CONFIG_DIR": self.tmpdir}):
             result = get_lora_configs("shrink", 1024, 64, 3)
         self.assertEqual(result[32]["BLOCK_N"], 32)
 
         # Fallback from newer version
         get_lora_configs.cache_clear()
         mock_triton.__version__ = "3.6.0"
-        with patch.dict(os.environ, {"SGLANG_LORA_CONFIG_DIR": self.tmpdir}):
+        with patch.dict(os.environ, {"FLLIPER_LORA_CONFIG_DIR": self.tmpdir}):
             result = get_lora_configs("shrink", 1024, 64, 3)
         self.assertIsNotNone(result)
 
         # Missing config returns None
         get_lora_configs.cache_clear()
-        with patch.dict(os.environ, {"SGLANG_LORA_CONFIG_DIR": self.tmpdir}):
+        with patch.dict(os.environ, {"FLLIPER_LORA_CONFIG_DIR": self.tmpdir}):
             self.assertIsNone(get_lora_configs("shrink", 9999, 64, 1))
 
 
@@ -88,7 +88,7 @@ class TestConfigSelection(unittest.TestCase):
 
     def setUp(self):
         get_lora_configs.cache_clear()
-        from sglang.kernels.ops.gemm import lora_tuning_config
+        from flliper.kernels.ops.gemm import lora_tuning_config
 
         lora_tuning_config._logged_configs.clear()
 

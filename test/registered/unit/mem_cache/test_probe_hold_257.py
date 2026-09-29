@@ -1,4 +1,4 @@
-"""#257 caching (i), vision boot 0928 (P PP0 06:20:28, weg2-4-27): the store
+"""#257 caching (i), vision boot 0928 (P PP0 06:20:28, pdflip-4-27): the store
 probe reported 813 of 830 pages and took no reference; the read, batch by
 batch, found page 219 neither COMPLETE in the arena nor on disk and ended there
 (completed=14016, 0.04 s into a 52.8 s budget) -- the prompt was prefilled
@@ -25,11 +25,11 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.managers import cache_controller as _cc  # noqa: E402
-from sglang.srt.managers.cache_controller import HiCacheController  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.managers import cache_controller as _cc  # noqa: E402
+from flliper.srt.managers.cache_controller import HiCacheController  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -63,7 +63,7 @@ class _Backend:
 
 
 class _Op:
-    request_id = "weg2-4-27"
+    request_id = "pdflip-4-27"
 
     def __init__(self):
         self.completed_tokens = 0
@@ -115,13 +115,13 @@ def _read(c, op, hashes, host):
 
 def _release_rest(c, op):
     try:
-        from sglang.srt.mem_cache import probe_hold
+        from flliper.srt.mem_cache import probe_hold
     except ImportError:
         return
     probe_hold.release(op, c.mem_pool_host, 0, reason="read-end")
 
 
-def test_weg2_4_27_a_claim_between_probe_and_read_no_longer_cuts_the_read(tmp_path):
+def test_pdflip_4_27_a_claim_between_probe_and_read_no_longer_cuts_the_read(tmp_path):
     """RED on a9e3a842ae: after the first 219 pages are read, a claim under
     pressure frees the 594 unreferenced pages the probe had reported (no free
     slot, no copy); the read ends at 219. GREEN: the probe holds them, the
@@ -155,7 +155,7 @@ def test_holds_above_the_group_min_and_after_the_read_go_back(tmp_path):
     """A hold is a reference like any read's: what the read did not take is
     released (group MIN trim, read end); the arena ends with only the read's
     own references."""
-    from sglang.srt.mem_cache import probe_hold
+    from flliper.srt.mem_cache import probe_hold
 
     p, arena = _pool(tmp_path, slots=32)
     p.arena = None
@@ -176,7 +176,7 @@ def test_holds_above_the_group_min_and_after_the_read_go_back(tmp_path):
 
 
 def test_a_stale_hold_is_released_by_name(tmp_path):
-    from sglang.srt.mem_cache import probe_hold
+    from flliper.srt.mem_cache import probe_hold
 
     p, arena = _pool(tmp_path, slots=8)
     p.arena = None
@@ -266,10 +266,10 @@ def _l3p_backend(tmp_path, monkeypatch):
     ``LRUFileEvictor`` as the one bookkeeper, and the real #1459 stem index,
     seeded from the directory (``_l3p_seed_index``) -- a stem the index does
     not name is NOT on disk."""
-    from sglang.srt.mem_cache.storage.file.l3_index import L3Index
-    from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+    from flliper.srt.mem_cache.storage.file.l3_index import L3Index
+    from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
-    monkeypatch.setenv("SGLANG_WEG2_L3_PERSIST", "1")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_PERSIST", "1")
     root = tmp_path / "store" / "nf-identity"
     root.mkdir(parents=True)
     (root / "L3_IDENTITY.json").write_text("{}")

@@ -32,14 +32,14 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+from flliper.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Int8,
 )
-from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+from flliper.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
+from flliper.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 
 # Verbatim from Qwen3.8-27B-INT8-gdncov/config.json. The only delta against the
 # incumbent Qwen3.8-27B-INT8 is the last two ignore entries replacing the single
@@ -247,7 +247,7 @@ class TestGdnOutProjScaleNotSharded(unittest.TestCase):
     """
 
     def test_channel_scale_is_output_dim_only(self):
-        from sglang.srt.layers.parameter import (
+        from flliper.srt.layers.parameter import (
             ChannelQuantScaleParameter,
             RowvLLMParameter,
             _ColumnvLLMParameter,
@@ -264,7 +264,7 @@ class TestGdnOutProjScaleNotSharded(unittest.TestCase):
         """`RowParallelLinear.weight_loader_v2` narrows only for RowvLLMParameter;
         everything else falls through to the base full-copy loader. Pin which
         implementation the channel scale inherits."""
-        from sglang.srt.layers.parameter import (
+        from flliper.srt.layers.parameter import (
             BasevLLMParameter,
             ChannelQuantScaleParameter,
         )
@@ -282,7 +282,7 @@ class TestGdnOutProjScaleNotSharded(unittest.TestCase):
         the allocation is TP-invariant."""
         import inspect
 
-        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        from flliper.srt.layers.quantization.compressed_tensors.schemes import (
             compressed_tensors_w8a8_int8 as mod,
         )
 

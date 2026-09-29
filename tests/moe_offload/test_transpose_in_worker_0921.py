@@ -1,7 +1,7 @@
 """#66 (21.09.): die Transposition der Experten-Shards wandert aus dem
 Hauptthread in die Datei-Worker.
 
-GEMESSEN fnFL2v84/v85 (SGLANG_LOAD_PROFILE=1, drei Raenge einig): 43-50 % der
+GEMESSEN fnFL2v84/v85 (FLLIPER_LOAD_PROFILE=1, drei Raenge einig): 43-50 % der
 Ladezeit stehen in layer.py `loaded_weight.t().contiguous()`, seriell, waehrend
 die acht Worker in threading.wait stehen und die NVMe bei Queue-Tiefe 0,64 nur
 40-60 % Leselast meldet.
@@ -16,8 +16,8 @@ import types
 import pytest
 import torch
 
-from sglang.srt.models import qwen4_exp as qx
-from sglang.srt.layers.moe.fused_moe_triton import layer as fml
+from flliper.srt.models import qwen4_exp as qx
+from flliper.srt.layers.moe.fused_moe_triton import layer as fml
 
 
 class _CT:
@@ -25,28 +25,28 @@ class _CT:
     __class__ = type("CompressedTensorsConfig", (), {})
 
 
-def _experts_modul(transponierend=True):
+def _experts_module(transposing=True):
     """Ein FusedMoE-artiges Modul: die transponierende Methode haengt am
     SCHEMA, nicht an `quant_method` -- genau die Form des Checkpoints, an
     dem w59 starb."""
     m = types.SimpleNamespace(quant_method=object())
-    if transponierend:
+    if transposing:
         m.scheme = type("CompressedTensorsWNA16MarlinMoE", (), {})()
     return m
 
 
-def _model(quant="CompressedTensorsConfig", transponierend=True):
+def _model(quant="CompressedTensorsConfig", transposing=True):
     """Ein Modell, das `get_submodule` beantwortet -- ohne das findet der
     Worker den Layer nicht und antwortet False, und der Test prueft dann
     nur noch seine eigene Attrappe (die Luecke, durch die w59 fiel)."""
     qc = type(quant, (), {})()
-    experts = _experts_modul(transponierend and quant == "CompressedTensorsConfig")
+    experts = _experts_module(transposing and quant == "CompressedTensorsConfig")
 
     class _M(types.SimpleNamespace):
-        def get_submodule(self, pfad):
-            if pfad.endswith(".experts"):
+        def get_submodule(self, file_path):
+            if file_path.endswith(".experts"):
                 return experts
-            raise AttributeError(pfad)
+            raise AttributeError(file_path)
 
     return _M(quant_config=qc)
 
@@ -54,23 +54,23 @@ def _model(quant="CompressedTensorsConfig", transponierend=True):
 # -- der Schalter -----------------------------------------------------------
 
 def test_off_by_default(monkeypatch):
-    monkeypatch.delenv("SGLANG_LOAD_TRANSPOSE_IN_WORKER", raising=False)
+    monkeypatch.delenv("FLLIPER_LOAD_TRANSPOSE_IN_WORKER", raising=False)
     assert qx._transpose_in_worker() is False
 
 
-def test_die_env_schaltet_nur_den_worker(monkeypatch):
+def test_env_switches_only_the_worker(monkeypatch):
     """#68e: die Env aktiviert den Worker. Ob der Verbraucher seine eigene
     Transposition auslaesst, entscheidet NICHT sie, sondern die Quittung am
     Layer -- sonst ueberspringt er auch dort, wo der Worker nichts getan
     hat (fnFL2w59, "2560 vs 80")."""
     for raw, want in (("1", True), ("0", False), ("", False), ("ja", False)):
-        monkeypatch.setenv("SGLANG_LOAD_TRANSPOSE_IN_WORKER", raw)
+        monkeypatch.setenv("FLLIPER_LOAD_TRANSPOSE_IN_WORKER", raw)
         assert qx._transpose_in_worker() is want, raw
         # die Env allein quittiert NICHTS
         assert fml.transpose_done_in_worker(types.SimpleNamespace()) is False, raw
 
 
-def test_die_quittung_steht_am_layer():
+def test_ack_is_on_the_layer():
     leer = types.SimpleNamespace()
     assert fml.transpose_done_in_worker(leer) is False
     setattr(leer, fml.CT_WORKER_TRANSPOSED_ATTR, True)
@@ -98,7 +98,7 @@ def test_only_compressed_tensors_expert_shards(monkeypatch):
 
 
 def test_a_non_compressed_tensors_model_is_never_touched():
-    m = _model(quant="AWQConfig", transponierend=False)
+    m = _model(quant="AWQConfig", transposing=False)
     assert qx._is_ct_wna16_expert_shard(
         "model.layers.0.mlp.experts.3.gate_proj.weight_packed", m
     ) is False
@@ -107,7 +107,7 @@ def test_a_non_compressed_tensors_model_is_never_touched():
 
 # -- die Eigenschaft: genau einmal -----------------------------------------
 
-def test_der_worker_transponiert_genau_einmal_und_quittiert(monkeypatch):
+def test_worker_transposes_once_and_acks(monkeypatch):
     """Die Verriegelung von fnFL2v87 ist mit #68a gefallen: beide Seiten
     fragen dieselbe Methode (#68d), und der Verbraucher liest die Quittung
     am Layer statt einer Env (#68e). Was bleibt, ist die Eigenschaft --
@@ -115,7 +115,7 @@ def test_der_worker_transponiert_genau_einmal_und_quittiert(monkeypatch):
     src = torch.arange(2560 * 80, dtype=torch.int32).reshape(2560, 80)
     name = "model.layers.0.mlp.experts.3.gate_proj.weight_packed"
 
-    monkeypatch.setenv("SGLANG_LOAD_TRANSPOSE_IN_WORKER", "1")
+    monkeypatch.setenv("FLLIPER_LOAD_TRANSPOSE_IN_WORKER", "1")
     m = _model()
     out = qx.Qwen4ExpForConditionalGeneration.weight_post_load(m, name, src)
     assert out.shape == (80, 2560)
@@ -124,7 +124,7 @@ def test_der_worker_transponiert_genau_einmal_und_quittiert(monkeypatch):
     layer = m.get_submodule("model.layers.0.mlp.experts")
     assert fml.transpose_done_in_worker(layer) is True
 
-    monkeypatch.setenv("SGLANG_LOAD_TRANSPOSE_IN_WORKER", "0")
+    monkeypatch.setenv("FLLIPER_LOAD_TRANSPOSE_IN_WORKER", "0")
     m2 = _model()
     out2 = qx.Qwen4ExpForConditionalGeneration.weight_post_load(m2, name, src)
     assert out2 is src                                    # aus: unveraendert
@@ -132,13 +132,13 @@ def test_der_worker_transponiert_genau_einmal_und_quittiert(monkeypatch):
     assert fml.transpose_done_in_worker(layer2) is False  # -> Verbraucher tut es
 
 
-def test_keine_quittung_wenn_der_worker_nichts_tat(monkeypatch):
+def test_no_ack_when_worker_did_nothing(monkeypatch):
     """Die Asymmetrie, an der w59 starb: sagt der Worker fuer diesen Layer
     nein, darf der Verbraucher NICHT ueberspringen -- auch nicht, wenn die
     Env an ist."""
-    monkeypatch.setenv("SGLANG_LOAD_TRANSPOSE_IN_WORKER", "1")
+    monkeypatch.setenv("FLLIPER_LOAD_TRANSPOSE_IN_WORKER", "1")
     src = torch.arange(2560 * 80, dtype=torch.int32).reshape(2560, 80)
-    m = _model(transponierend=False)   # Layer da, Methode transponiert nicht
+    m = _model(transposing=False)   # Layer da, Methode transponiert nicht
     out = qx.Qwen4ExpForConditionalGeneration.weight_post_load(
         m, "model.layers.0.mlp.experts.3.gate_proj.weight_packed", src
     )
@@ -161,10 +161,10 @@ def test_the_consumer_reads_the_switch_at_the_right_place():
     assert "loaded_weight.t() if _needs_ct_transpose else loaded_weight" in src
 
 
-def test_ein_fremder_name_wird_nie_angefasst(monkeypatch):
+def test_foreign_name_is_never_touched(monkeypatch):
     """Was kein Experten-Tensor ist, geht unveraendert durch -- auch bei
     eingeschaltetem Schalter."""
-    monkeypatch.setenv("SGLANG_LOAD_TRANSPOSE_IN_WORKER", "1")
+    monkeypatch.setenv("FLLIPER_LOAD_TRANSPOSE_IN_WORKER", "1")
     t = torch.arange(8, dtype=torch.int32)
     out = qx.Qwen4ExpForConditionalGeneration.weight_post_load(
         _model(), "irgendein.name.ohne.experts", t
@@ -177,7 +177,7 @@ def test_ein_fremder_name_wird_nie_angefasst(monkeypatch):
 def test_the_loader_applies_it_in_the_worker():
     import inspect
 
-    from sglang.srt.model_loader import weight_utils as wu
+    from flliper.srt.model_loader import weight_utils as wu
 
     src = inspect.getsource(wu.buffered_multi_thread_safetensors_weights_iterator)
     assert "post_load" in src
@@ -198,7 +198,7 @@ def test_the_loader_applies_it_in_the_worker():
 def test_the_loader_hands_the_models_hook_over():
     import inspect
 
-    from sglang.srt.model_loader import loader as ld
+    from flliper.srt.model_loader import loader as ld
 
     src = inspect.getsource(ld.DefaultModelLoader._get_all_weights)
     assert 'self._weight_post_load = getattr(model, "weight_post_load", None)' in src

@@ -81,7 +81,7 @@ import pytest
 # The stall bound is configured by environment, not by a new call
 # signature, so that this exact test body is runnable against the
 # pre-fix tree (where it hangs) and the post-fix tree (where it passes).
-STALL_ENV = "SGLANG_PP_CHAIN_RECV_STALL_S"
+STALL_ENV = "FLLIPER_PP_CHAIN_RECV_STALL_S"
 STALL_S = "3.0"
 
 ADMISSION_TAG = 77
@@ -118,7 +118,7 @@ def _stalled_exc_type():
     instead of erroring. That is the RED this test is built to show.
     """
     try:
-        from sglang.srt.managers.pp_chain_receiver import PpChainRecvStalled
+        from flliper.srt.managers.pp_chain_receiver import PpChainRecvStalled
 
         return PpChainRecvStalled
     except ImportError:
@@ -157,7 +157,7 @@ def _pp0(port, q):
         import torch
         import torch.distributed as dist
 
-        from sglang.srt.utils import point_to_point_pyobj
+        from flliper.srt.utils import point_to_point_pyobj
 
         _init(0, port)
         out = {}
@@ -192,8 +192,8 @@ def _pp1(port, q):
         import torch
         import torch.distributed as dist
 
-        from sglang.srt.managers.pp_chain_receiver import PpChainReceiver
-        from sglang.srt.utils import point_to_point_pyobj
+        from flliper.srt.managers.pp_chain_receiver import PpChainReceiver
+        from flliper.srt.utils import point_to_point_pyobj
 
         _init(1, port)
         out = {}
@@ -240,7 +240,7 @@ def _pp2(port, q):
     try:
         import torch.distributed as dist
 
-        from sglang.srt.managers.pp_chain_receiver import PpChainReceiver
+        from flliper.srt.managers.pp_chain_receiver import PpChainReceiver
 
         _init(2, port)
         out = {}
@@ -311,11 +311,11 @@ def _run_ring():
             results.setdefault(name, value)
         except Exception:  # noqa: BLE001 - empty queue
             pass
-    exitcodes = {}
+    exit_codes = {}
     for name, p in procs.items():
         p.join(timeout=5.0)
-        exitcodes[name] = p.exitcode
-    results["_exitcodes"] = exitcodes
+        exit_codes[name] = p.exitcode
+    results["_exitcodes"] = exit_codes
 
     if env_backup is None:
         os.environ.pop(STALL_ENV, None)

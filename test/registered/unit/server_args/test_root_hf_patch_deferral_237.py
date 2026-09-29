@@ -1,10 +1,10 @@
-"""#237 root ticket: ``import sglang`` must not drag transformers into a process.
+"""#237 root ticket: ``import flliper`` must not drag transformers into a process.
 
-THE DEFECT. ``sglang/__init__.py`` called ``apply_all()`` on the transformers
+THE DEFECT. ``flliper/__init__.py`` called ``apply_all()`` on the transformers
 compatibility patches at import time -- which meant importing transformers in
 EVERY process. transformers reaches ``torch._dynamo``
 (``transformers/masking_utils.py``), which imports triton. So a process that
-merely imported sglang loaded a graph compiler and a GPU kernel compiler. On a
+merely imported flliper loaded a graph compiler and a GPU kernel compiler. On a
 swapless box that is host RAM, not cosmetics (#721 family).
 
 THE FIX. The root ARMS the patches instead of applying them: a post-import hook
@@ -16,14 +16,14 @@ only touch transformers internals.
 
 WHAT THIS BUYS, AND WHAT IT DOES NOT. Measured, fresh subprocesses:
 
-    import sglang           4320 mod / 783 MB  ->  1897 mod / 611 MB
+    import flliper           4320 mod / 783 MB  ->  1897 mod / 611 MB
     server_args             5114 / 826         ->  5115 / 825
     tokenizer_manager       6760 / 962         ->  6761 / 953
     detokenizer_manager     6764 / 953         ->  6765 / 953
     http_server             7325 / 986         ->  7326 / 982
     scheduler               6991 / 965         ->  6992 / 965
 
-The win lands on processes that import sglang WITHOUT touching a tokenizer.
+The win lands on processes that import flliper WITHOUT touching a tokenizer.
 The tokenizer and detokenizer managers are unchanged, and that is not a
 shortfall of the fix: they import ``hf_transformers_utils`` themselves, because
 tokenising IS what they do. transformers is a genuine dependency there, not a
@@ -37,7 +37,7 @@ import sys
 import textwrap
 import unittest
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _probe(script: str) -> str:
@@ -58,24 +58,24 @@ def _probe(script: str) -> str:
 
 
 class TestRootDoesNotImportTransformers(CustomTestCase):
-    def test_a_bare_import_sglang_pulls_neither_transformers_nor_triton(self):
+    def test_a_bare_import_flliper_pulls_neither_transformers_nor_triton(self):
         """The headline pin. RED before the root was changed to arm."""
         answer = _probe("""
             import sys
-            import sglang
+            import flliper
             print(sorted(m for m in ('transformers', 'triton') if m in sys.modules))
             """)
         self.assertEqual(
             answer,
             "[]",
-            "importing sglang pulled transformers and/or triton; the root is "
+            "importing flliper pulled transformers and/or triton; the root is "
             "supposed to ARM the compatibility patches, not apply them",
         )
 
     def test_the_root_arms_the_hook(self):
         answer = _probe("""
-            import sglang
-            from sglang.srt.utils import post_import_hook
+            import flliper
+            from flliper.srt.utils import post_import_hook
             print(post_import_hook.is_armed('transformers'))
             """)
         self.assertEqual(answer, "True")
@@ -86,9 +86,9 @@ class TestPatchesStillLandBeforeUse(CustomTestCase):
 
     def test_importing_transformers_applies_the_patches(self):
         answer = _probe("""
-            import sglang
+            import flliper
             import transformers
-            from sglang.srt.utils.hf_transformers_patches import _applied
+            from flliper.srt.utils.hf_transformers_patches import _applied
             print(_applied)
             """)
         self.assertEqual(
@@ -104,9 +104,9 @@ class TestPatchesStillLandBeforeUse(CustomTestCase):
         ``import transformers`` must already see a patched module. This is what
         a model process relies on."""
         answer = _probe("""
-            import sglang
+            import flliper
             import transformers
-            from sglang.srt.utils.hf_transformers_patches import _applied as a1
+            from flliper.srt.utils.hf_transformers_patches import _applied as a1
             print(a1)
             """)
         self.assertEqual(answer, "True")
@@ -116,9 +116,9 @@ class TestPatchesStillLandBeforeUse(CustomTestCase):
         the hook fires there too -- a consumer cannot slip in through a
         submodule."""
         answer = _probe("""
-            import sglang
+            import flliper
             import transformers.utils  # noqa: F401
-            from sglang.srt.utils.hf_transformers_patches import _applied
+            from flliper.srt.utils.hf_transformers_patches import _applied
             print(_applied)
             """)
         self.assertEqual(answer, "True")
@@ -128,10 +128,10 @@ class TestPatchesStillLandBeforeUse(CustomTestCase):
         transformers would leave the patches unapplied. Uses the patch module
         directly, with the hook uninstalled."""
         answer = _probe("""
-            import sglang
-            from sglang.srt.utils import post_import_hook
+            import flliper
+            from flliper.srt.utils import post_import_hook
             post_import_hook.uninstall('transformers')
-            import sglang.srt.utils.hf_transformers_patches as p
+            import flliper.srt.utils.hf_transformers_patches as p
             p._applied = False
             import transformers  # noqa: F401
             print(p._applied)
@@ -153,23 +153,23 @@ class TestMeasuredScope(CustomTestCase):
         honest scope of the fix depends on it."""
         answer = _probe("""
             import sys
-            import sglang.srt.managers.detokenizer_manager  # noqa: F401
+            import flliper.srt.managers.detokenizer_manager  # noqa: F401
             print('transformers' in sys.modules)
             """)
         self.assertEqual(answer, "True")
 
     def test_a_frontend_process_stays_light(self):
-        """The class of process the fix is FOR: imports sglang, never
+        """The class of process the fix is FOR: imports flliper, never
         tokenises."""
         answer = _probe("""
             import sys
-            import sglang
+            import flliper
             print(len(sys.modules) < 3000)
             """)
         self.assertEqual(
             answer,
             "True",
-            "a bare `import sglang` grew past 3000 modules; the root is "
+            "a bare `import flliper` grew past 3000 modules; the root is "
             "supposed to stay light for processes that never load a model",
         )
 

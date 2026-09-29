@@ -12,21 +12,21 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.dsv4 import attn_metadata_kernels
-from sglang.srt.speculative import ragged_verify_kernels
-from sglang.srt.speculative.dspark_components.dspark_planner import (
+from flliper.srt.layers.attention.dsv4 import attn_metadata_kernels
+from flliper.srt.speculative import ragged_verify_kernels
+from flliper.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
 )
-from sglang.srt.speculative.dspark_components.kernels import (
+from flliper.srt.speculative.dspark_components.kernels import (
     dspark_accept,
     dspark_attn_metadata,
     dspark_draft_model,
     dspark_schedule,
     dspark_verify_window,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.speculative.ragged_verify import RaggedVerifyLayout
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 

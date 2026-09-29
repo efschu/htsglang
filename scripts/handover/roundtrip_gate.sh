@@ -45,14 +45,14 @@ EOF
   "$PY" "$REPO/scripts/handover/roundtrip_store.py" "$arm" "$a"
 
   echo "=== $arm: forward TP=1 -> TP=3"
-  "$PY" -m sglang.srt.mem_cache.hicache_migrate \
+  "$PY" -m flliper.srt.mem_cache.hicache_migrate \
     --source-dir "$a" --target-dir "$b" \
     --target-tp-size 3 --target-ratios "$RATIOS" \
     --model-config "$WORK/$arm/config.json" \
     --num-linear-layers "$layers" --gdn-units "$units" --verify
 
   echo "=== $arm: reverse TP=3 -> TP=1"
-  "$PY" -m sglang.srt.mem_cache.hicache_migrate --reverse \
+  "$PY" -m flliper.srt.mem_cache.hicache_migrate --reverse \
     --source-dir "$b" --target-dir "$c" \
     --source-tp-size 3 --source-ratios "$RATIOS" \
     --model-config "$WORK/$arm/config.json" \

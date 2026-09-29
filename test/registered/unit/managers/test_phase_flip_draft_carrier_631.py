@@ -59,8 +59,8 @@ import unittest
 import torch
 import torch.nn as nn
 
-from sglang.srt.managers import phase_flip_spill as spill
-from sglang.srt.model_executor.weights_arena import allocate_arena, bind_arena_views
+from flliper.srt.managers import phase_flip_spill as spill
+from flliper.srt.model_executor.weights_arena import allocate_arena, bind_arena_views
 
 _SCRIBBLE = 0xA5
 
@@ -165,7 +165,7 @@ class CarrierAddressStabilityTest(unittest.TestCase):
         # become vacuous and must be rewritten, not deleted.
         model = _DraftModel()
         named = dict(model.named_parameters())
-        from sglang.srt.model_executor.weights_arena import plan_arena_layout
+        from flliper.srt.model_executor.weights_arena import plan_arena_layout
 
         layout = plan_arena_layout(named)
         before = _ptrs(model)
@@ -377,7 +377,7 @@ class AffordabilityGatePricesTheRestoreTest(unittest.TestCase):
     """
 
     def _runtime_stub(self, worker):
-        from sglang.srt.managers import phase_flip_runtime as rt
+        from flliper.srt.managers import phase_flip_runtime as rt
 
         stub = object.__new__(rt.PhaseFlipRuntime)
         stub._census_scheduler = type(
@@ -412,7 +412,7 @@ class AffordabilityGatePricesTheRestoreTest(unittest.TestCase):
         self.assertEqual(stub._draft_restore_bytes(rt.PP_TO_TP), 0)
 
     def test_no_scheduler_does_not_raise_inside_the_gate(self):
-        from sglang.srt.managers import phase_flip_runtime as rt
+        from flliper.srt.managers import phase_flip_runtime as rt
 
         stub = object.__new__(rt.PhaseFlipRuntime)
         stub._census_scheduler = None
@@ -421,7 +421,7 @@ class AffordabilityGatePricesTheRestoreTest(unittest.TestCase):
     def test_a_broken_scheduler_degrades_to_the_wave_peak(self):
         # A gate that cannot price the restore must not also refuse the flip:
         # the pre-rung-2 behaviour is the safe fallback, not an abort.
-        from sglang.srt.managers import phase_flip_runtime as rt
+        from flliper.srt.managers import phase_flip_runtime as rt
 
         class _Boom:
             @property

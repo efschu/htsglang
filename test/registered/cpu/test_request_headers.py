@@ -4,8 +4,8 @@ from types import SimpleNamespace
 from fastapi import HTTPException
 from starlette.datastructures import Headers
 
-from sglang.srt.entrypoints.request_headers import apply_header_overrides
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.entrypoints.request_headers import apply_header_overrides
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 

@@ -10,13 +10,13 @@ import requests
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
-from sglang.benchmark.utils import download_and_cache_hf_file
-from sglang.srt.state_capturer.routed_experts import (
+from flliper.benchmark.utils import download_and_cache_hf_file
+from flliper.srt.state_capturer.routed_experts import (
     extract_routed_experts_from_meta_info,
 )
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,

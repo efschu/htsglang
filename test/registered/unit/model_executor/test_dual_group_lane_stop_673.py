@@ -34,9 +34,9 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
-LANE_MOD = "sglang.srt.model_executor.dual_group_lane"
+LANE_MOD = "flliper.srt.model_executor.dual_group_lane"
 
 
 class _StuckWorker:
@@ -52,7 +52,7 @@ class _StuckWorker:
 
 def _lane(worker_target=None, lane_id=7):
     """A real DualGroupLane carrying only what the stop path touches."""
-    from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+    from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
     lane = DualGroupLane.__new__(DualGroupLane)
     lane.lane_id = lane_id
@@ -148,7 +148,7 @@ class TestTheCleanPath(CustomTestCase):
         self.assertEqual(lane.stop_worker(timeout_s=2.0), "already stopped")
 
     def test_a_lane_that_never_started_is_safe(self):
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         lane = DualGroupLane.__new__(DualGroupLane)
         lane._thread = None
@@ -161,7 +161,7 @@ class TestTheDeadline(CustomTestCase):
         seconds, and the kvso sibling settled on 2 s."""
         import inspect
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         default = inspect.signature(DualGroupLane.stop_worker).parameters[
             "timeout_s"
@@ -186,7 +186,7 @@ class TestTheComponentSeam(CustomTestCase):
     counterpart."""
 
     def test_stop_dual_group_lanes_stops_every_lane(self):
-        from sglang.srt.model_executor.dual_group_lane import stop_dual_group_lanes
+        from flliper.srt.model_executor.dual_group_lane import stop_dual_group_lanes
 
         lanes = [_lane(lane_id=i) for i in range(3)]
         out = stop_dual_group_lanes(SimpleNamespace(dual_group_lanes=lanes))
@@ -195,7 +195,7 @@ class TestTheComponentSeam(CustomTestCase):
             self.assertIsNone(lane._thread)
 
     def test_one_failing_lane_does_not_strand_the_others(self):
-        from sglang.srt.model_executor.dual_group_lane import stop_dual_group_lanes
+        from flliper.srt.model_executor.dual_group_lane import stop_dual_group_lanes
 
         class Boom:
             def stop_worker(self, timeout_s=None):
@@ -209,7 +209,7 @@ class TestTheComponentSeam(CustomTestCase):
         self.assertIn("joined", out)
 
     def test_no_lanes_is_a_quiet_no_op(self):
-        from sglang.srt.model_executor.dual_group_lane import stop_dual_group_lanes
+        from flliper.srt.model_executor.dual_group_lane import stop_dual_group_lanes
 
         self.assertEqual(stop_dual_group_lanes(SimpleNamespace()), [])
         self.assertEqual(
@@ -219,7 +219,7 @@ class TestTheComponentSeam(CustomTestCase):
 
 class TestTheTeardownWiring(CustomTestCase):
     def test_graceful_teardown_stops_the_lanes(self):
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         lanes = [_lane()]
         out = td.release_dual_group_lanes(
@@ -229,7 +229,7 @@ class TestTheTeardownWiring(CustomTestCase):
         self.assertIsNone(lanes[0]._thread)
 
     def test_the_exception_path_leaves_them_alone(self):
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         lanes = [_lane()]
         try:
@@ -243,14 +243,14 @@ class TestTheTeardownWiring(CustomTestCase):
             lanes[0].stop_worker(timeout_s=2.0)
 
     def test_no_lanes_is_a_no_op(self):
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         self.assertIsNone(
             td.release_dual_group_lanes(SimpleNamespace(), graceful=True)
         )
 
     def test_it_NEVER_RAISES(self):
-        from sglang.srt.managers import scheduler_teardown as td
+        from flliper.srt.managers import scheduler_teardown as td
 
         class Hostile:
             @property
@@ -267,7 +267,7 @@ class TestTheStopPathIsACTUALLYCALLED(CustomTestCase):
         import ast
         import inspect
 
-        from sglang.srt.managers import scheduler as sched_mod
+        from flliper.srt.managers import scheduler as sched_mod
 
         tree = ast.parse(inspect.getsource(sched_mod))
         called = {
@@ -284,7 +284,7 @@ class TestTheStopPathIsACTUALLYCALLED(CustomTestCase):
     def test_it_is_gated_on_the_graceful_flag(self):
         import inspect
 
-        from sglang.srt.managers import scheduler as sched_mod
+        from flliper.srt.managers import scheduler as sched_mod
 
         src = inspect.getsource(sched_mod)
         idx = src.index("release_dual_group_lanes(")

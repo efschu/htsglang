@@ -38,8 +38,8 @@ what rescues a broken one.
 import unittest
 import unittest.mock
 
-from sglang.srt.managers import phase_policy as pp
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import phase_policy as pp
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -134,7 +134,7 @@ class NoPrefillRunsInTp(unittest.TestCase):
         nothing -- the lesson the #684 serving-mark tick paid for."""
         import inspect
 
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         src = inspect.getsource(phase_purity)
         self.assertIn("prefill_suppressed_in_tp", src)
@@ -241,7 +241,7 @@ class TheGateIsReachableFromABoot(unittest.TestCase):
         name the Scheduler actually sets (`phase_policy_cfg`)."""
         import types
 
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         stub = types.SimpleNamespace(
             phase_policy_cfg=_cfg(),
@@ -257,7 +257,7 @@ class TheGateIsReachableFromABoot(unittest.TestCase):
     def test_without_drain_mode_the_hook_defers_to_purity_as_before(self):
         import types
 
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         stub = types.SimpleNamespace(phase_policy_cfg=_cfg(drain_mode=False))
         with (
@@ -386,7 +386,7 @@ class TheValveOutranksDrainModeSuppression(unittest.TestCase):
         refusal counter was blind to -- must let the TP layout prefill."""
         import types
 
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         rt = types.SimpleNamespace(
             _seam_abandons_in_a_row={"tp_to_pp": 17}, blocking_guards=()
@@ -410,7 +410,7 @@ class TheValveOutranksDrainModeSuppression(unittest.TestCase):
         """Wedge #2 must not regress now that the counter changed."""
         import types
 
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         rt = types.SimpleNamespace(_seam_abandons_in_a_row={}, blocking_guards=())
         sched = types.SimpleNamespace(
@@ -429,7 +429,7 @@ class TheValveOutranksDrainModeSuppression(unittest.TestCase):
         """The user's semantics are the DEFAULT and must survive all this."""
         import types
 
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         rt = types.SimpleNamespace(_seam_abandons_in_a_row={}, blocking_guards=())
         sched = types.SimpleNamespace(
@@ -490,7 +490,7 @@ class SuppressionNeedsABundleToProtect(unittest.TestCase):
         hook is never told about is a condition that never fires."""
         import inspect as _inspect
 
-        from sglang.srt.managers import scheduler as _sched
+        from flliper.srt.managers import scheduler as _sched
 
         src = _inspect.getsource(_sched.Scheduler.get_next_batch_to_run)
         self.assertIn("phase_prefill_blocked_here(", src)
@@ -499,7 +499,7 @@ class SuppressionNeedsABundleToProtect(unittest.TestCase):
     def test_the_hook_forwards_it(self):
         import inspect as _inspect
 
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         src = _inspect.getsource(phase_purity.prefill_blocked_here)
         self.assertIn("running_bs=running_bs", src)

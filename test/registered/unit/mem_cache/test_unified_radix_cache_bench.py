@@ -19,26 +19,26 @@ from typing import Callable
 
 import torch
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.swa_radix_cache import SWARadixCache
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.utils import get_device
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
@@ -139,7 +139,7 @@ def create_bench_cache(
 
     mamba2_cache_params = None
     if has_mamba:
-        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+        with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
             shape = Mamba2StateShape.create(
                 tp_world_size=1,
                 intermediate_size=256,
@@ -168,7 +168,7 @@ def create_bench_cache(
             speculative_num_draft_tokens=3,
         )
     else:
-        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from flliper.srt.mem_cache.memory_pool import ReqToTokenPool
 
         req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs,
@@ -179,8 +179,8 @@ def create_bench_cache(
 
     # --- KV pool + allocator ---
     if has_swa:
-        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from flliper.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+        from flliper.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         pool = SWAKVPool(
             size=kv_size,
@@ -239,8 +239,8 @@ def create_bench_cache(
     _rid = [0]
 
     def make_req():
-        from sglang.srt.managers.schedule_batch import Req
-        from sglang.srt.sampling.sampling_params import SamplingParams
+        from flliper.srt.managers.schedule_batch import Req
+        from flliper.srt.sampling.sampling_params import SamplingParams
 
         req = Req(
             rid=_rid[0],

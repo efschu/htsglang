@@ -17,8 +17,8 @@ sys.path.insert(0, dirname(__file__))
 
 from test_pp_family_cut_485 import _inputs  # noqa: E402  (real fixture, reused)
 
-from sglang.srt.planner import pp_cut  # noqa: E402
-from sglang.srt.planner.boot_layout import (  # noqa: E402
+from flliper.srt.planner import pp_cut  # noqa: E402
+from flliper.srt.planner.boot_layout import (  # noqa: E402
     PHASE_PP_PREFILL,
     PRICED_FAMILIES,
     UNFUNDED_FAMILIES,
@@ -65,7 +65,7 @@ class TestItChangesNothing(unittest.TestCase):
         """No second solver -- the rescope's acceptance condition."""
         import inspect
 
-        from sglang.srt.planner import boot_layout
+        from flliper.srt.planner import boot_layout
 
         src = inspect.getsource(boot_layout)
         self.assertNotIn("solve_pp_cut(", src)
@@ -153,7 +153,7 @@ class TestTheEnumerationGapIsNamedNotInvented(unittest.TestCase):
     def test_no_cost_term_was_invented_for_an_unfunded_family(self):
         import inspect
 
-        from sglang.srt.planner import boot_layout
+        from flliper.srt.planner import boot_layout
 
         src = inspect.getsource(boot_layout)
         for bad in ("expert_layer_weight_bytes", "vocab_weight_bytes",

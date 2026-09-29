@@ -16,7 +16,7 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.model_loader import loader as loader_mod
+from flliper.srt.model_loader import loader as loader_mod
 
 
 class _CfgNoHook:
@@ -113,7 +113,7 @@ class TestCapabilityFloorIsVendorFirst(unittest.TestCase):
     def test_base_config_default_is_unknown_not_supported(self):
         """A config that cannot answer for its vendor must return None, never
         True -- claiming support by default is the dangerous direction."""
-        from sglang.srt.layers.quantization.base_config import QuantizationConfig
+        from flliper.srt.layers.quantization.base_config import QuantizationConfig
 
         self.assertIsNone(
             QuantizationConfig.supports_current_device(object())

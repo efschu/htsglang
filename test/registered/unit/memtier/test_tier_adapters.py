@@ -30,18 +30,18 @@ Four laws, each with a falsifier below:
 
 import unittest
 
-from sglang.srt.memtier.adapters import (
+from flliper.srt.memtier.adapters import (
     ARTIFACT_ROUTES,
     apply_outcomes,
     from_capability_matrix,
     from_card_probe,
     from_rig_artifact,
 )
-from sglang.srt.memtier.bootstrap import bootstrap_tiers
-from sglang.srt.memtier.probe import ProbeTarget, probe_by_id
-from sglang.srt.memtier.profile import CardFact, FilesystemFact, LocalFacts
-from sglang.srt.planner.cost_model import Provenance
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.memtier.bootstrap import bootstrap_tiers
+from flliper.srt.memtier.probe import ProbeTarget, probe_by_id
+from flliper.srt.memtier.profile import CardFact, FilesystemFact, LocalFacts
+from flliper.srt.planner.cost_model import Provenance
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

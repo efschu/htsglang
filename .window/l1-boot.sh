@@ -24,7 +24,7 @@ BOOTSTRAP_PORT=8998
 
 export PYTHONPATH="$WT/python"
 export LD_LIBRARY_PATH=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 
 mkdir -p "$LOGDIR"
 
@@ -49,7 +49,7 @@ wait_healthy() {
 }
 
 echo "== launching prefill arm on GPU ${SMALL[0]} =="
-CUDA_VISIBLE_DEVICES="${SMALL[0]}" setsid "$PY" -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES="${SMALL[0]}" setsid "$PY" -m flliper.launch_server \
     --model-path "$MODEL" --trust-remote-code \
     --disaggregation-mode prefill \
     --disaggregation-transfer-backend mooncake \
@@ -59,7 +59,7 @@ CUDA_VISIBLE_DEVICES="${SMALL[0]}" setsid "$PY" -m sglang.launch_server \
     > "$LOGDIR/prefill_L1.log" 2>&1 &
 
 echo "== launching decode arm TP=2/DCP=2 on GPUs $BIG,${SMALL[1]} =="
-SGLANG_UNEVEN_DCP=1 CUDA_VISIBLE_DEVICES="$BIG,${SMALL[1]}" setsid "$PY" -m sglang.launch_server \
+FLLIPER_UNEVEN_DCP=1 CUDA_VISIBLE_DEVICES="$BIG,${SMALL[1]}" setsid "$PY" -m flliper.launch_server \
     --model-path "$MODEL" --trust-remote-code \
     --disaggregation-mode decode \
     --disaggregation-transfer-backend mooncake \
@@ -71,7 +71,7 @@ wait_healthy "http://127.0.0.1:$PREFILL_PORT" prefill "$LOGDIR/prefill_L1.log"
 wait_healthy "http://127.0.0.1:$DECODE_PORT" decode "$LOGDIR/decode_L1.log"
 
 echo "== launching PD proxy =="
-setsid "$PY" -m sglang.srt.disaggregation.local_proxy \
+setsid "$PY" -m flliper.srt.disaggregation.local_proxy \
     --prefill "http://127.0.0.1:$PREFILL_PORT" \
     --decode "http://127.0.0.1:$DECODE_PORT" \
     --bootstrap-port "$BOOTSTRAP_PORT" \

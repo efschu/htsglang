@@ -23,11 +23,11 @@ import glob
 import os
 import unittest
 
-from sglang.srt.planner.feasibility import plan
-from sglang.srt.planner.hardware import hardware_from_manual
-from sglang.srt.planner.model import list_gguf_options, resolve_model_ref
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner.feasibility import plan
+from flliper.srt.planner.hardware import hardware_from_manual
+from flliper.srt.planner.model import list_gguf_options, resolve_model_ref
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 

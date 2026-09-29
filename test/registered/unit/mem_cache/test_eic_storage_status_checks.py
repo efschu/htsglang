@@ -11,8 +11,8 @@ import types
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -24,10 +24,10 @@ class _StatusCode:
 
 
 def _install_eic_stub():
-    if "eic" in sys.modules and getattr(sys.modules["eic"], "_sglang_stub", False):
+    if "eic" in sys.modules and getattr(sys.modules["eic"], "_flliper_stub", False):
         return sys.modules["eic"]
     stub = types.ModuleType("eic")
-    stub._sglang_stub = True
+    stub._flliper_stub = True
     stub.StatusCode = _StatusCode
     stub.StringVector = list
 
@@ -60,7 +60,7 @@ def _install_eic_stub():
 
 _install_eic_stub()
 
-from sglang.srt.mem_cache.storage.eic.eic_storage import EICStorage  # noqa: E402
+from flliper.srt.mem_cache.storage.eic.eic_storage import EICStorage  # noqa: E402
 
 
 class FakeConnection:

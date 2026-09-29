@@ -17,7 +17,7 @@
 # VERSION PARITY is mandatory: UCX peers must run the same release or endpoint
 # creation fails with the useless 'invalid bandwidth 0.00'. The main rig ships
 # 1.18.1 while the second rig ships 1.16.0, so rank 0 is pointed at the
-# side-by-side 1.16.0 build via SGLANG_BARLINK_UCX_LIB. The transport checks this
+# side-by-side 1.16.0 build via FLLIPER_BARLINK_UCX_LIB. The transport checks this
 # itself at rendezvous and refuses with instructions; --mismatch exercises that.
 #
 # Hosts, keys and interpreter paths are read from the environment
@@ -30,7 +30,7 @@
 #   ./l1_ucx_crossrig.sh              # correctness + throughput over RDMA
 #   ./l1_ucx_crossrig.sh --mismatch   # prove the parity check rejects 1.18 vs 1.16
 #   ./l1_ucx_crossrig.sh --reps 5     # extra args go to both ranks
-#   EXTRA_ENV=SGLANG_BARLINK_UCX_PIPELINE=0 ./l1_ucx_crossrig.sh   # A/B control
+#   EXTRA_ENV=FLLIPER_BARLINK_UCX_PIPELINE=0 ./l1_ucx_crossrig.sh   # A/B control
 set -uo pipefail
 
 # Site-specific values come from the environment, never from a default baked
@@ -38,7 +38,7 @@ set -uo pipefail
 # fallbacks below are placeholders, so an unsourced run fails visibly instead
 # of talking to whatever host happened to be hard-coded here.
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-COMM_SRC="$REPO_ROOT/python/sglang/srt/distributed/device_communicators"
+COMM_SRC="$REPO_ROOT/python/flliper/srt/distributed/device_communicators"
 DRIVER="$REPO_ROOT/scripts/nordstern/l1_ucx_crossrig.py"
 
 # --- rank 0: main rig ------------------------------------------------------
@@ -74,7 +74,7 @@ fi
 # Anything left on the command line goes to BOTH ranks (e.g. --reps 5).
 EXTRA_ARGS=("$@")
 # EXTRA_ENV is applied to both ranks identically -- the A/B control for the
-# pipelining measurement is EXTRA_ENV="SGLANG_BARLINK_UCX_PIPELINE=0". Both
+# pipelining measurement is EXTRA_ENV="FLLIPER_BARLINK_UCX_PIPELINE=0". Both
 # sides must agree: the two paths post the same tags in the same order, but
 # only a group that is uniformly configured is a meaningful measurement.
 EXTRA_ENV="${EXTRA_ENV:-}"
@@ -103,7 +103,7 @@ sleep 4
 
 echo "== rank 0 (main rig, <RDMA_NET>.1) =="
 R0_LIB_ENV=""
-[[ -n "$R0_UCX_LIB" ]] && R0_LIB_ENV="SGLANG_BARLINK_UCX_LIB=$R0_UCX_LIB"
+[[ -n "$R0_UCX_LIB" ]] && R0_LIB_ENV="FLLIPER_BARLINK_UCX_LIB=$R0_UCX_LIB"
 "${R0_SSH[@]}" "cd $STAGE && env \
   GLOO_SOCKET_IFNAME=$R0_LAN_IF UCX_TLS=rc,self,sm UCX_IB_GID_INDEX=3 UCX_NET_DEVICES=$R0_IB \
   $R0_LIB_ENV $EXTRA_ENV \

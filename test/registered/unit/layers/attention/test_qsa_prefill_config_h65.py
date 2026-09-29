@@ -1,7 +1,7 @@
-"""fnFL2 H65 (F2 of H58): SGLANG_WEG2_QSA_PREFILL_CONFIG -- the launch config
+"""fnFL2 H65 (F2 of H58): FLLIPER_PDFLIP_QSA_PREFILL_CONFIG -- the launch config
 of the prefix-free QSA prefill kernel (_sparse_gqa_prefill: the first chunk of
 every prompt and every short prefill), in the grammar of H58's
-SGLANG_FORCE_QSA_ROWS_CONFIG. The device-name-keyed table gives the rig's
+FLLIPER_FORCE_QSA_ROWS_CONFIG. The device-name-keyed table gives the rig's
 3080 and 5090 (16, 1, 2) above 512 rows: offline compiled for head_dim 256
 and top-k width 2051, REG 255 (STACK 24-32 B) in 24.6 KB smem per 1-warp CTA
 = 3 warps per SM on sm86 and sm120.
@@ -15,9 +15,9 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.qsa import sparse_attn as sa
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.qsa import sparse_attn as sa
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -34,7 +34,7 @@ class _RecordedKernel:
 
 
 class PrefillConfigTest(unittest.TestCase):
-    """F2 of H58: SGLANG_WEG2_QSA_PREFILL_CONFIG moves only the prefix-free
+    """F2 of H58: FLLIPER_PDFLIP_QSA_PREFILL_CONFIG moves only the prefix-free
     prefill launch; the rows knob and this one never cross."""
 
     def setUp(self):
@@ -50,8 +50,8 @@ class PrefillConfigTest(unittest.TestCase):
         k = torch.zeros(total_q, 2, 8, dtype=torch.bfloat16)
         idx = torch.zeros(total_q, 4, dtype=torch.int32)
         cu = torch.tensor([0, total_q], dtype=torch.int32)
-        with envs.SGLANG_WEG2_QSA_PREFILL_CONFIG.override(prefill), \
-                envs.SGLANG_FORCE_QSA_ROWS_CONFIG.override(rows), \
+        with envs.FLLIPER_PDFLIP_QSA_PREFILL_CONFIG.override(prefill), \
+                envs.FLLIPER_FORCE_QSA_ROWS_CONFIG.override(rows), \
                 mock.patch.object(sa, "_sparse_gqa_prefill", rec), \
                 mock.patch.object(sa.torch.cuda, "get_device_capability", lambda *a: capability), \
                 mock.patch.object(sa.torch.cuda, "get_device_name", lambda *a: "NVIDIA GeForce RTX 5090"):
@@ -61,7 +61,7 @@ class PrefillConfigTest(unittest.TestCase):
         return kw["BLOCK_N"], kw["num_warps"], kw["num_stages"]
 
     def test_default_is_the_table(self):
-        self.assertEqual(envs.SGLANG_WEG2_QSA_PREFILL_CONFIG.get(), "")
+        self.assertEqual(envs.FLLIPER_PDFLIP_QSA_PREFILL_CONFIG.get(), "")
         self.assertEqual(self._launch((8, 6)), (16, 1, 2))
         self.assertEqual(self._launch((12, 0)), (16, 1, 2))
 
@@ -87,7 +87,7 @@ class RowsLaunchCrosstalkTest(unittest.TestCase):
         q = torch.zeros(16384, 24, 8, dtype=torch.bfloat16)
         k = torch.zeros(32, 2, 8, dtype=torch.bfloat16)
         rows = torch.zeros(16384, 4, dtype=torch.int32)
-        with envs.SGLANG_WEG2_QSA_PREFILL_CONFIG.override("inf=64/8/2"), \
+        with envs.FLLIPER_PDFLIP_QSA_PREFILL_CONFIG.override("inf=64/8/2"), \
                 mock.patch.object(sa, "_sparse_attn_rows_fwd", rec), \
                 mock.patch.object(sa.torch.cuda, "get_device_capability", lambda *a: (8, 6)), \
                 mock.patch.object(sa.torch.cuda, "get_device_name", lambda *a: "NVIDIA GeForce RTX 3080"):
@@ -108,10 +108,10 @@ class MetalTest(unittest.TestCase):
         j = torch.arange(topk, device="cuda").unsqueeze(0)
         idx = torch.where(j <= r, r - j, torch.full_like(r - j, -1)).to(torch.int32)
         cu = torch.tensor([0, tq], dtype=torch.int32, device="cuda")
-        with envs.SGLANG_WEG2_QSA_PREFILL_CONFIG.override(""):
+        with envs.FLLIPER_PDFLIP_QSA_PREFILL_CONFIG.override(""):
             base = sa.sparse_gqa_fwd_interface_triton(q, k, v, tq, idx, cu, 0.0625)
         for config in ("inf=32/8/2", "inf=64/8/2", "inf=32/4/2"):
-            with envs.SGLANG_WEG2_QSA_PREFILL_CONFIG.override(config):
+            with envs.FLLIPER_PDFLIP_QSA_PREFILL_CONFIG.override(config):
                 out = sa.sparse_gqa_fwd_interface_triton(q, k, v, tq, idx, cu, 0.0625)
             self.assertTrue(torch.allclose(out.float(), base.float(), atol=2e-2, rtol=2e-2), config)
 

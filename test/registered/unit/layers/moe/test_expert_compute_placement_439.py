@@ -39,9 +39,9 @@ injected.
 
 import unittest
 
-from sglang.srt.distributed.device_communicators import barlink_uniformity as uniformity
-from sglang.srt.distributed.utils import partition_units
-from sglang.srt.layers.moe.expert_compute_placement import (
+from flliper.srt.distributed.device_communicators import barlink_uniformity as uniformity
+from flliper.srt.distributed.utils import partition_units
+from flliper.srt.layers.moe.expert_compute_placement import (
     COMPUTE_PLACEMENT_LINK,
     COMPUTE_PLACEMENT_LINK_CALIBRATED,
     COMPUTE_PLACEMENT_SYMBOLS,
@@ -51,8 +51,8 @@ from sglang.srt.layers.moe.expert_compute_placement import (
     cold_traffic_coefficients_from_measurement,
     solve_link_proportional_expert_vector,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -308,8 +308,8 @@ class TestTheMeasuredCalibration(CustomTestCase):
     def test_the_coefficient_env_is_length_checked_and_registered(self):
         import os
 
-        from sglang.srt.environ import envs
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.environ import envs
+        from flliper.srt.layers.moe.expert_compute_placement import (
             TRAFFIC_COEFFICIENT_ENV,
             _traffic_coefficients_from_env,
         )
@@ -530,12 +530,12 @@ class TestTheFlagContract(CustomTestCase):
     """The launch surface: one symbol, one resolution point, no silent path."""
 
     def test_server_args_and_the_solver_spell_the_symbol_the_same_way(self):
-        from sglang.srt import server_args as sa
+        from flliper.srt import server_args as sa
 
         self.assertEqual(sa._COMPUTE_PLACEMENT_LINK, COMPUTE_PLACEMENT_LINK)
 
     def test_the_flag_parser_accepts_the_symbol_and_a_vector(self):
-        from sglang.srt.server_args import _parse_rank_moe_ratio
+        from flliper.srt.server_args import _parse_rank_moe_ratio
 
         self.assertEqual(_parse_rank_moe_ratio("link"), COMPUTE_PLACEMENT_LINK)
         self.assertEqual(_parse_rank_moe_ratio(" link "), COMPUTE_PLACEMENT_LINK)
@@ -552,7 +552,7 @@ class TestTheFlagContract(CustomTestCase):
         import pathlib
 
         root = pathlib.Path(__file__).resolve().parents[5]
-        source = (root / "python/sglang/srt/entrypoints/engine.py").read_text()
+        source = (root / "python/flliper/srt/entrypoints/engine.py").read_text()
         tree = ast.parse(source)
         called = [
             node.lineno
@@ -581,7 +581,7 @@ class TestTheFlagContract(CustomTestCase):
         which for a symbolic value means "serve the base plan and say nothing".
         Exercised rather than grepped: the point is the behaviour.
         """
-        from sglang.srt.managers.scheduler import uneven_family_plans
+        from flliper.srt.managers.scheduler import uneven_family_plans
 
         class _Args:
             rank_mlp_ratio = None
@@ -596,7 +596,7 @@ class TestTheFlagContract(CustomTestCase):
 
     def test_a_resolved_vector_installs_normally(self):
         """The other half of the guard: lists still reach the plan installer."""
-        from sglang.srt.managers.scheduler import uneven_family_plans
+        from flliper.srt.managers.scheduler import uneven_family_plans
 
         class _Args:
             rank_mlp_ratio = None
@@ -608,10 +608,10 @@ class TestTheFlagContract(CustomTestCase):
     def test_the_environment_channel_refuses_the_symbol_by_name(self):
         import os
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
-        previous = os.environ.get("SGLANG_UNEVEN_MOE_VECTOR")
-        os.environ["SGLANG_UNEVEN_MOE_VECTOR"] = "link"
+        previous = os.environ.get("FLLIPER_UNEVEN_MOE_VECTOR")
+        os.environ["FLLIPER_UNEVEN_MOE_VECTOR"] = "link"
         try:
             args = ServerArgs.__new__(ServerArgs)
             args.rank_tp_ratio = [1, 1]
@@ -626,9 +626,9 @@ class TestTheFlagContract(CustomTestCase):
             self.assertIn("explicit vector only", str(caught.exception))
         finally:
             if previous is None:
-                os.environ.pop("SGLANG_UNEVEN_MOE_VECTOR", None)
+                os.environ.pop("FLLIPER_UNEVEN_MOE_VECTOR", None)
             else:
-                os.environ["SGLANG_UNEVEN_MOE_VECTOR"] = previous
+                os.environ["FLLIPER_UNEVEN_MOE_VECTOR"] = previous
 
     def test_the_symbol_passes_family_validation_without_a_length_check(self):
         """A symbol is not a vector; validating its length would reject 'link'.
@@ -648,7 +648,7 @@ class TestTheFlagContract(CustomTestCase):
 
     @staticmethod
     def _args_with(rank_tp_ratio, tp_size):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         args = ServerArgs.__new__(ServerArgs)
         args.rank_tp_ratio = rank_tp_ratio
@@ -672,10 +672,10 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
     """
 
     _ENVS = (
-        "SGLANG_RANK_CARD_UUIDS",
-        "SGLANG_MOE_HOST_SHARD_RATIO",
-        "SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
-        "SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS",
+        "FLLIPER_RANK_CARD_UUIDS",
+        "FLLIPER_MOE_HOST_SHARD_RATIO",
+        "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION",
+        "FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS",
         COMPUTE_POLICY_ENV,
     )
 
@@ -684,10 +684,10 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
         import os
 
         self._saved = {k: os.environ.get(k) for k in self._ENVS}
-        os.environ["SGLANG_RANK_CARD_UUIDS"] = "GPU-aaa,GPU-bbb,GPU-ccc"
-        os.environ["SGLANG_MOE_HOST_SHARD_RATIO"] = "14.42,6.45,13.41"
-        os.environ["SGLANG_MOE_RESIDENT_EXPERT_FRACTION"] = "0.485,0.42,0.42"
-        os.environ.pop("SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS", None)
+        os.environ["FLLIPER_RANK_CARD_UUIDS"] = "GPU-aaa,GPU-bbb,GPU-ccc"
+        os.environ["FLLIPER_MOE_HOST_SHARD_RATIO"] = "14.42,6.45,13.41"
+        os.environ["FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"] = "0.485,0.42,0.42"
+        os.environ.pop("FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS", None)
         os.environ.pop(COMPUTE_POLICY_ENV, None)
 
     def tearDown(self):
@@ -723,7 +723,7 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
     def test_the_resolver_installs_an_explicit_vector_and_names_its_policy(self):
         import os
 
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
@@ -739,7 +739,7 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
         self.assertLess(_shares(args.rank_moe_ratio)[1], _shares([400, 256, 344])[1])
 
     def test_the_resolver_is_a_no_op_without_the_symbol(self):
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
@@ -754,13 +754,13 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
     def test_the_calibrated_run_labels_itself_differently(self):
         import os
 
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
         plain = resolve_moe_compute_placement_flag(self._args())
 
-        os.environ["SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS"] = "1.1251,1.0726,0.8023"
+        os.environ["FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS"] = "1.1251,1.0726,0.8023"
         calibrated = resolve_moe_compute_placement_flag(
             self._args(rank_moe_ratio=COMPUTE_PLACEMENT_LINK_CALIBRATED)
         )
@@ -768,7 +768,7 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
         self.assertEqual(os.environ[COMPUTE_POLICY_ENV], "link-proportional-calibrated")
 
     def test_expert_parallelism_is_refused_by_name(self):
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
@@ -777,7 +777,7 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
         self.assertIn("ep_size=2", str(caught.exception))
 
     def test_a_missing_base_plan_is_refused_by_name(self):
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
@@ -788,11 +788,11 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
     def test_offload_off_is_refused_through_the_resolver_too(self):
         import os
 
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
-        os.environ["SGLANG_MOE_RESIDENT_EXPERT_FRACTION"] = "1.0"
+        os.environ["FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"] = "1.0"
         with self.assertRaises(NoComputeLever) as caught:
             resolve_moe_compute_placement_flag(self._args())
         self.assertIn("nothing to move", str(caught.exception))
@@ -800,11 +800,11 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
     def test_an_absent_card_vector_is_refused_not_guessed(self):
         import os
 
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
-        os.environ.pop("SGLANG_RANK_CARD_UUIDS")
+        os.environ.pop("FLLIPER_RANK_CARD_UUIDS")
         with self.assertRaises(NoComputeLever) as caught:
             resolve_moe_compute_placement_flag(self._args())
         self.assertIn("physical card", str(caught.exception))
@@ -812,7 +812,7 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
     def test_an_explicitly_equal_ratio_env_warns_loudly(self):
         """The one configuration trap this flag has.
 
-        ``SGLANG_MOE_HOST_SHARD_RATIO`` is both the strongest source of the
+        ``FLLIPER_MOE_HOST_SHARD_RATIO`` is both the strongest source of the
         link weights AND the way an arm holds cold-tier byte ownership at the
         baseline. Pinning it equal for the second reason hands this solve a
         uniform link profile, and the result is not the base plan either -- it
@@ -822,18 +822,18 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
         """
         import os
 
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
-        os.environ["SGLANG_MOE_HOST_SHARD_RATIO"] = "1,1,1"
+        os.environ["FLLIPER_MOE_HOST_SHARD_RATIO"] = "1,1,1"
         with self.assertLogs(
-            "sglang.srt.layers.moe.expert_compute_placement", level="WARNING"
+            "flliper.srt.layers.moe.expert_compute_placement", level="WARNING"
         ) as logs:
             placement = resolve_moe_compute_placement_flag(self._args())
         text = "\n".join(logs.output)
-        self.assertIn("SGLANG_MOE_HOST_SHARD_RATIO", text)
-        self.assertIn("SGLANG_MOE_COLD_TIER_SHM", text)
+        self.assertIn("FLLIPER_MOE_HOST_SHARD_RATIO", text)
+        self.assertIn("FLLIPER_MOE_COLD_TIER_SHM", text)
         # And the vector it produced really is the third thing: equal cold mass
         # rather than either the base plan or a link-weighted split.
         cold = placement.cold_shares
@@ -845,11 +845,11 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
         """Can-fail control: the warning must not fire on a real profile."""
         import logging
 
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
-        logger = logging.getLogger("sglang.srt.layers.moe.expert_compute_placement")
+        logger = logging.getLogger("flliper.srt.layers.moe.expert_compute_placement")
         records = []
         handler = logging.Handler()
         handler.emit = records.append
@@ -867,7 +867,7 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
         """Pin the fix in the proof-window script, since it is not importable.
 
         The compute arms must hold byte ownership at the baseline through
-        ``SGLANG_MOE_COLD_TIER_SHM``, not through an equal ratio -- the latter
+        ``FLLIPER_MOE_COLD_TIER_SHM``, not through an equal ratio -- the latter
         would neuter their own treatment.
         """
         import pathlib
@@ -875,18 +875,18 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
         root = pathlib.Path(__file__).resolve().parents[5]
         script = (root / "scripts/dev/394_s2_proof/boot_ab.sh").read_text()
         arm = script.split("compute|compute-cal)", 1)[1].split(";;", 1)[0]
-        self.assertIn("unset SGLANG_MOE_HOST_SHARD_RATIO", arm)
-        self.assertNotIn("export SGLANG_MOE_HOST_SHARD_RATIO", arm)
+        self.assertIn("unset FLLIPER_MOE_HOST_SHARD_RATIO", arm)
+        self.assertNotIn("export FLLIPER_MOE_HOST_SHARD_RATIO", arm)
         self.assertIn("--rank-moe-ratio link", arm)
 
     def test_a_card_vector_of_the_wrong_length_is_refused(self):
         import os
 
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
-        os.environ["SGLANG_RANK_CARD_UUIDS"] = "GPU-aaa,GPU-bbb"
+        os.environ["FLLIPER_RANK_CARD_UUIDS"] = "GPU-aaa,GPU-bbb"
         with self.assertRaises(NoComputeLever):
             resolve_moe_compute_placement_flag(self._args())
 
@@ -905,7 +905,7 @@ class TestTheUncalibratedSolveIsTheDefault(TestTheResolverRunsEndToEnd):
     property of the rank, and it is a property of the owned range SIZE.
 
     Before this change the two solves were selected by an ENVIRONMENT VARIABLE:
-    ``link`` plus a set ``SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS`` silently
+    ``link`` plus a set ``FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS`` silently
     produced the calibrated policy. So a coefficient export left over from one
     arm turned the next arm into the falsified solve without touching the
     command line. The symbol the operator typed now decides, and nothing else
@@ -918,7 +918,7 @@ class TestTheUncalibratedSolveIsTheDefault(TestTheResolverRunsEndToEnd):
     def test_the_bare_symbol_resolves_to_the_uncalibrated_solve(self):
         import os
 
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
@@ -938,13 +938,13 @@ class TestTheUncalibratedSolveIsTheDefault(TestTheResolverRunsEndToEnd):
         """
         import os
 
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
         uncalibrated = resolve_moe_compute_placement_flag(self._args())
 
-        os.environ["SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS"] = "1.0705,0.9709,0.9586"
+        os.environ["FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS"] = "1.0705,0.9709,0.9586"
         with self.assertRaises(NoComputeLever) as caught:
             resolve_moe_compute_placement_flag(self._args())
         message = str(caught.exception)
@@ -963,7 +963,7 @@ class TestTheUncalibratedSolveIsTheDefault(TestTheResolverRunsEndToEnd):
         self.assertNotEqual(uncalibrated.weights, calibrated.weights)
 
     def test_the_experimental_symbol_refuses_without_coefficients(self):
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
@@ -981,9 +981,9 @@ class TestTheUncalibratedSolveIsTheDefault(TestTheResolverRunsEndToEnd):
         """
         import argparse
 
-        from sglang.srt.layers.moe import expert_compute_placement as module
-        from sglang.srt.planner import rejected as rejmod
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.layers.moe import expert_compute_placement as module
+        from flliper.srt.planner import rejected as rejmod
+        from flliper.srt.server_args import ServerArgs
 
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -1027,8 +1027,8 @@ class TestTheUncalibratedSolveIsTheDefault(TestTheResolverRunsEndToEnd):
         validator, and the worker refusal."""
         import argparse
 
-        from sglang.srt.managers.scheduler import uneven_family_plans
-        from sglang.srt.server_args import ServerArgs, _parse_rank_moe_ratio
+        from flliper.srt.managers.scheduler import uneven_family_plans
+        from flliper.srt.server_args import ServerArgs, _parse_rank_moe_ratio
 
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -1059,7 +1059,7 @@ class TestTheArmCanIdentifyItself(CustomTestCase):
     def test_the_policy_label_defaults_to_the_base_plan(self):
         import os
 
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             compute_policy_label,
         )
 
@@ -1074,7 +1074,7 @@ class TestTheArmCanIdentifyItself(CustomTestCase):
                 os.environ[COMPUTE_POLICY_ENV] = previous
 
     def test_the_dump_carries_the_compute_policy_and_vector(self):
-        from sglang.srt.layers.moe import expert_stats
+        from flliper.srt.layers.moe import expert_stats
 
         collector = expert_stats.ExpertStatsCollector(path="/dev/null", rank_tag="tp0")
         payload = collector.snapshot(reason="test")
@@ -1082,7 +1082,7 @@ class TestTheArmCanIdentifyItself(CustomTestCase):
         self.assertIn("moe_compute_vector", payload["totals"])
 
     def test_the_policy_env_is_registered(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         self.assertIn(COMPUTE_POLICY_ENV, dir(envs))
 
@@ -1130,12 +1130,12 @@ class TestTheResolverReadsTheLaunchFLAG(CustomTestCase):
     """
 
     _ENVS = (
-        "SGLANG_RANK_CARD_UUIDS",
-        "SGLANG_MOE_HOST_SHARD_RATIO",
-        "SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
-        "SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS",
+        "FLLIPER_RANK_CARD_UUIDS",
+        "FLLIPER_MOE_HOST_SHARD_RATIO",
+        "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION",
+        "FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS",
         COMPUTE_POLICY_ENV,
-        "SGLANG_MOE_COMPUTE_BASE_PLAN",
+        "FLLIPER_MOE_COMPUTE_BASE_PLAN",
     )
 
     def setUp(self):
@@ -1143,17 +1143,17 @@ class TestTheResolverReadsTheLaunchFLAG(CustomTestCase):
         import os
 
         self._saved = {k: os.environ.get(k) for k in self._ENVS}
-        os.environ["SGLANG_RANK_CARD_UUIDS"] = "GPU-aaa,GPU-bbb,GPU-ccc"
-        os.environ["SGLANG_MOE_HOST_SHARD_RATIO"] = ",".join(
+        os.environ["FLLIPER_RANK_CARD_UUIDS"] = "GPU-aaa,GPU-bbb,GPU-ccc"
+        os.environ["FLLIPER_MOE_HOST_SHARD_RATIO"] = ",".join(
             str(w) for w in BATTERY_LINKS
         )
         # The defect's precondition: NOTHING in the environment. The launch
         # carries the fraction on the flag only, which is how the battery ran.
         for key in (
-            "SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
-            "SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS",
+            "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION",
+            "FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS",
             COMPUTE_POLICY_ENV,
-            "SGLANG_MOE_COMPUTE_BASE_PLAN",
+            "FLLIPER_MOE_COMPUTE_BASE_PLAN",
         ):
             os.environ.pop(key, None)
 
@@ -1189,7 +1189,7 @@ class TestTheResolverReadsTheLaunchFLAG(CustomTestCase):
 
     def test_the_context_really_is_unpublished_here(self):
         """The defect's precondition, asserted rather than assumed."""
-        from sglang.srt.runtime_context import get_context
+        from flliper.srt.runtime_context import get_context
 
         with self.assertRaises(ValueError) as caught:
             get_context().server_args
@@ -1202,7 +1202,7 @@ class TestTheResolverReadsTheLaunchFLAG(CustomTestCase):
         this process, and 1.0 is the honest answer -- the bug was asking the
         question that way from a caller that HELD the object.
         """
-        from sglang.srt.layers.moe.resident_fraction import (
+        from flliper.srt.layers.moe.resident_fraction import (
             _from_flag,
             resident_fraction_vector,
         )
@@ -1211,7 +1211,7 @@ class TestTheResolverReadsTheLaunchFLAG(CustomTestCase):
         self.assertEqual(resident_fraction_vector(tp_size=3), (1.0, 1.0, 1.0))
 
     def test_the_resolver_reads_the_per_rank_fractions_off_the_launch_args(self):
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             _resident_fraction_vector,
         )
 
@@ -1225,7 +1225,7 @@ class TestTheResolverReadsTheLaunchFLAG(CustomTestCase):
         after hand-setting the environment variable as a workaround, so a
         different answer here means the fix resolved something else.
         """
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resolve_moe_compute_placement_flag,
         )
 
@@ -1236,7 +1236,7 @@ class TestTheResolverReadsTheLaunchFLAG(CustomTestCase):
         self.assertEqual(args.rank_moe_ratio, [160, 79, 119])
 
     def test_a_scalar_flag_broadcasts_to_every_rank(self):
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             _resident_fraction_vector,
         )
 
@@ -1251,11 +1251,11 @@ class TestTheResolverReadsTheLaunchFLAG(CustomTestCase):
         """
         import os
 
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             _resident_fraction_vector,
         )
 
-        os.environ["SGLANG_MOE_RESIDENT_EXPERT_FRACTION"] = "0.3,0.3,0.3"
+        os.environ["FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"] = "0.3,0.3,0.3"
         with self.assertRaises(ValueError) as caught:
             _resident_fraction_vector(self._args(), 3)
         self.assertIn("disagree", str(caught.exception))
@@ -1263,7 +1263,7 @@ class TestTheResolverReadsTheLaunchFLAG(CustomTestCase):
     def test_the_launcher_publishes_the_base_plan_for_the_workers(self):
         import os
 
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             COMPUTE_BASE_PLAN_ENV,
             compute_base_plan,
             resolve_moe_compute_placement_flag,
@@ -1314,30 +1314,30 @@ class TestResidencyIsHeldAtTheBasePlan(CustomTestCase):
         super().setUp()
         import os
 
-        from sglang.srt.distributed import utils as du
+        from flliper.srt.distributed import utils as du
 
-        self._saved_plan = os.environ.get("SGLANG_MOE_COMPUTE_BASE_PLAN")
+        self._saved_plan = os.environ.get("FLLIPER_MOE_COMPUTE_BASE_PLAN")
         self._saved_ratios = (du._TP_PARTITION_RATIOS, du._TP_PARTITION_FAMILIES)
 
     def tearDown(self):
         import os
 
-        from sglang.srt.distributed import utils as du
+        from flliper.srt.distributed import utils as du
 
         du._TP_PARTITION_RATIOS, du._TP_PARTITION_FAMILIES = self._saved_ratios
         if self._saved_plan is None:
-            os.environ.pop("SGLANG_MOE_COMPUTE_BASE_PLAN", None)
+            os.environ.pop("FLLIPER_MOE_COMPUTE_BASE_PLAN", None)
         else:
-            os.environ["SGLANG_MOE_COMPUTE_BASE_PLAN"] = self._saved_plan
+            os.environ["FLLIPER_MOE_COMPUTE_BASE_PLAN"] = self._saved_plan
         super().tearDown()
 
     @staticmethod
     def _install(base_plan, installed):
         import os
 
-        from sglang.srt.distributed.utils import set_tp_partition_ratios
+        from flliper.srt.distributed.utils import set_tp_partition_ratios
 
-        os.environ["SGLANG_MOE_COMPUTE_BASE_PLAN"] = ",".join(str(b) for b in base_plan)
+        os.environ["FLLIPER_MOE_COMPUTE_BASE_PLAN"] = ",".join(str(b) for b in base_plan)
         set_tp_partition_ratios(list(base_plan), {"moe": list(installed)})
 
     @staticmethod
@@ -1349,8 +1349,8 @@ class TestResidencyIsHeldAtTheBasePlan(CustomTestCase):
         ``FusedMoE._gguf_owned_expert_count`` derives them under the #82
         expert-dim shard.
         """
-        from sglang.srt.distributed.utils import partition_units
-        from sglang.srt.layers.moe.expert_offload import plan_load_time_staging
+        from flliper.srt.distributed.utils import partition_units
+        from flliper.srt.layers.moe.expert_offload import plan_load_time_staging
 
         count = partition_units(num_experts, list(vector))[rank] + 1
         return plan_load_time_staging(
@@ -1358,7 +1358,7 @@ class TestResidencyIsHeldAtTheBasePlan(CustomTestCase):
         )
 
     def _corrected(self, rank, fraction, num_experts=BATTERY_EXPERTS, world=3):
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             resident_fraction_held_at_base_plan,
         )
 
@@ -1452,9 +1452,9 @@ class TestResidencyIsHeldAtTheBasePlan(CustomTestCase):
         """
         import os
 
-        from sglang.srt.distributed.utils import set_tp_partition_ratios
+        from flliper.srt.distributed.utils import set_tp_partition_ratios
 
-        os.environ.pop("SGLANG_MOE_COMPUTE_BASE_PLAN", None)
+        os.environ.pop("FLLIPER_MOE_COMPUTE_BASE_PLAN", None)
         set_tp_partition_ratios(list(BATTERY_BASE_PLAN), {"moe": [160, 79, 119]})
         for rank, fraction in enumerate(BATTERY_FRACTIONS):
             self.assertEqual(self._corrected(rank, fraction), fraction)
@@ -1486,10 +1486,10 @@ class TestResidencyIsHeldAtTheBasePlan(CustomTestCase):
         residual becomes invisible. Uncorrected, the same case is off by the
         full width ratio.
         """
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             vram_neutral_resident_fraction,
         )
-        from sglang.srt.layers.moe.expert_offload import resident_slot_count
+        from flliper.srt.layers.moe.expert_offload import resident_slot_count
 
         experts, base_w, link_w = 64, 1024, 1536
         fraction = 0.5
@@ -1519,22 +1519,22 @@ class TestResidencyIsHeldAtTheBasePlan(CustomTestCase):
         """
         self._install([3, 1], [1, 3])
         with self.assertLogs(
-            "sglang.srt.layers.moe.expert_compute_placement", level="WARNING"
+            "flliper.srt.layers.moe.expert_compute_placement", level="WARNING"
         ) as logs:
             corrected = self._corrected(0, 0.9, num_experts=8, world=2)
         text = "\n".join(logs.output)
         self.assertIn("cannot be held at the base plan on rank 0", text)
         self.assertIn("not VRAM-neutral", text)
         # Clamped to everything this rank still owns, never above it.
-        from sglang.srt.distributed.utils import partition_units
-        from sglang.srt.layers.moe.expert_offload import resident_slot_count
+        from flliper.srt.distributed.utils import partition_units
+        from flliper.srt.layers.moe.expert_offload import resident_slot_count
 
         local = partition_units(8, [1, 3])[0] + 1
         self.assertEqual(resident_slot_count(local, corrected), local)
 
     def test_the_correction_never_leaves_the_unit_interval(self):
         """Swept, because a fraction outside (0, 1] is refused downstream."""
-        from sglang.srt.layers.moe.expert_compute_placement import (
+        from flliper.srt.layers.moe.expert_compute_placement import (
             vram_neutral_resident_fraction,
         )
 
@@ -1559,7 +1559,7 @@ class TestResidencyIsHeldAtTheBasePlan(CustomTestCase):
 
         root = pathlib.Path(__file__).resolve().parents[5]
         source = (
-            root / "python/sglang/srt/layers/moe/fused_moe_triton/layer.py"
+            root / "python/flliper/srt/layers/moe/fused_moe_triton/layer.py"
         ).read_text()
         tree = ast.parse(source)
         calls = [

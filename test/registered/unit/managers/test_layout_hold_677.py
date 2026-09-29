@@ -22,11 +22,11 @@ decode side's.
 
 import unittest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     LAYOUT_HOLD_MAX_ROUNDS,
     layout_hold_verdict,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestLayoutHold677(CustomTestCase):
@@ -156,20 +156,20 @@ class TestHoldCounterLifecycle677(CustomTestCase):
     """
 
     def test_counter_resets_on_phase_change(self):
-        from sglang.srt.managers.phase_policy import next_hold_rounds
+        from flliper.srt.managers.phase_policy import next_hold_rounds
 
         self.assertEqual(next_hold_rounds(7, "pp", "tp", 22), 0)
         self.assertEqual(next_hold_rounds(7, "tp", "pp", 22), 0)
 
     def test_counter_resets_when_nothing_pends(self):
-        from sglang.srt.managers.phase_policy import next_hold_rounds
+        from flliper.srt.managers.phase_policy import next_hold_rounds
 
         self.assertEqual(next_hold_rounds(7, "pp", "pp", 0), 0)
 
     def test_counter_advances_within_an_episode(self):
         """CAN-FAIL: a counter that always reset would make the hold unbounded,
         which is the starvation direction the bound exists to prevent."""
-        from sglang.srt.managers.phase_policy import next_hold_rounds
+        from flliper.srt.managers.phase_policy import next_hold_rounds
 
         n = 0
         for _ in range(5):
@@ -179,7 +179,7 @@ class TestHoldCounterLifecycle677(CustomTestCase):
     def test_a_stale_counter_would_start_the_next_episode_exhausted(self):
         """The defect the reset prevents, stated as a test: carrying 8 across a
         phase change would release the very first hold of the next episode."""
-        from sglang.srt.managers.phase_policy import next_hold_rounds
+        from flliper.srt.managers.phase_policy import next_hold_rounds
 
         stale = LAYOUT_HOLD_MAX_ROUNDS
         self.assertTrue(layout_hold_verdict("pp", 22, 0, hold_rounds_so_far=stale)[0])
@@ -202,7 +202,7 @@ class TestHoldCounterActuallyAdvances677(CustomTestCase):
     """
 
     def _round(self, state, phase, pending, running, now):
-        from sglang.srt.managers.phase_policy import PhasePolicyInputs, observe_idle
+        from flliper.srt.managers.phase_policy import PhasePolicyInputs, observe_idle
 
         inp = PhasePolicyInputs(
             phase=phase,
@@ -214,7 +214,7 @@ class TestHoldCounterActuallyAdvances677(CustomTestCase):
         return inp
 
     def test_hold_rounds_reaches_N_under_a_live_hold(self):
-        from sglang.srt.managers.phase_policy import PhasePolicyState
+        from flliper.srt.managers.phase_policy import PhasePolicyState
 
         st = PhasePolicyState()
         for i in range(5):
@@ -227,7 +227,7 @@ class TestHoldCounterActuallyAdvances677(CustomTestCase):
 
     def test_exhausted_is_reachable_by_running_the_bound(self):
         """The EXHAUSTED path must be REACHABLE, not merely written."""
-        from sglang.srt.managers.phase_policy import PhasePolicyState
+        from flliper.srt.managers.phase_policy import PhasePolicyState
 
         st = PhasePolicyState()
         for i in range(LAYOUT_HOLD_MAX_ROUNDS):
@@ -239,7 +239,7 @@ class TestHoldCounterActuallyAdvances677(CustomTestCase):
         self.assertIn("EXHAUSTED", why)
 
     def test_counter_resets_on_a_real_phase_change(self):
-        from sglang.srt.managers.phase_policy import PhasePolicyState
+        from flliper.srt.managers.phase_policy import PhasePolicyState
 
         st = PhasePolicyState()
         for i in range(4):
@@ -249,7 +249,7 @@ class TestHoldCounterActuallyAdvances677(CustomTestCase):
         self.assertEqual(getattr(st, "hold_rounds", 0), 0, "phase change resets")
 
     def test_counter_resets_when_the_work_drains(self):
-        from sglang.srt.managers.phase_policy import PhasePolicyState
+        from flliper.srt.managers.phase_policy import PhasePolicyState
 
         st = PhasePolicyState()
         for i in range(4):

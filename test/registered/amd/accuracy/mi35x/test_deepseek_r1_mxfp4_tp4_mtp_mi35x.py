@@ -16,15 +16,15 @@ from typing import Tuple
 
 import numpy as np
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
+from flliper.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=3600,
@@ -69,8 +69,8 @@ def run_gsm8k_benchmark(
     num_shots: int = 5,
     parallel: int = 64,
 ) -> Tuple[float, float, float]:
-    import sglang as sgl
-    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+    import flliper as sgl
+    from flliper.lang.backend.runtime_endpoint import RuntimeEndpoint
 
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
     data_path = download_and_cache_file(url)
@@ -122,19 +122,19 @@ class TestDeepSeekR1MXFP4TP4MTPMI35x(unittest.TestCase):
         env = os.environ.copy()
         env.update(
             {
-                "SGLANG_USE_AITER": "1",
-                "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+                "FLLIPER_USE_AITER": "1",
+                "FLLIPER_ENABLE_OVERLAP_PLAN_STREAM": "1",
                 # Retired on current main, but kept to mirror the reported launch.
-                "SGLANG_ENABLE_SPEC_V2": "1",
+                "FLLIPER_ENABLE_SPEC_V2": "1",
                 "ROCM_QUICK_REDUCE_QUANTIZATION": "NONE",
-                "SGLANG_AITER_FP8_PREFILL_ATTN": "1",
-                "SGLANG_AITER_MLA_PERSIST": "1",
+                "FLLIPER_AITER_FP8_PREFILL_ATTN": "1",
+                "FLLIPER_AITER_MLA_PERSIST": "1",
                 "AITER_MXFP4_MOE_SF": "1",
-                "SGLANG_INT4_WEIGHT": "0",
-                "SGLANG_MOE_PADDING": "1",
-                "SGLANG_SET_CPU_AFFINITY": "1",
-                "SGLANG_ROCM_FUSED_DECODE_MLA": "1",
-                "SGLANG_USE_ROCM700A": "1",
+                "FLLIPER_INT4_WEIGHT": "0",
+                "FLLIPER_MOE_PADDING": "1",
+                "FLLIPER_SET_CPU_AFFINITY": "1",
+                "FLLIPER_ROCM_FUSED_DECODE_MLA": "1",
+                "FLLIPER_USE_ROCM700A": "1",
             }
         )
 

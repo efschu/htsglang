@@ -58,7 +58,7 @@ import unittest
 
 import torch
 
-from sglang.srt.managers import kv_backing_relief as kbr
+from flliper.srt.managers import kv_backing_relief as kbr
 
 MIB = 1024 * 1024
 

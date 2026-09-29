@@ -23,22 +23,22 @@ CPU only: nothing here builds a transport, a communicator, or touches a device.
 import logging
 import unittest
 
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     BarlinkBar1Transport,
 )
-from sglang.srt.distributed.device_communicators.barlink_env_guard import (
+from flliper.srt.distributed.device_communicators.barlink_env_guard import (
     RETIRED_ENV_VARS,
     RetiredEnvVarError,
     check_retired_env_vars,
 )
-from sglang.srt.layers.moe.token_dispatcher import bar1ep as bar1ep_mod
-from sglang.srt.layers.moe.token_dispatcher.bar1ep import (
+from flliper.srt.layers.moe.token_dispatcher import bar1ep as bar1ep_mod
+from flliper.srt.layers.moe.token_dispatcher.bar1ep import (
     TRANSPORT_A2A_ATTRS,
     bar1ep_available,
     bar1ep_transport,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -151,11 +151,11 @@ class TestDeclineIsAnnounced(CustomTestCase):
 
     def test_absent_communicator_is_logged(self):
         _, logged = self._decline(_Group(None))
-        self.assertIn("SGLANG_BARLINK", logged)
+        self.assertIn("FLLIPER_BARLINK", logged)
 
     def test_absent_transport_is_logged(self):
         _, logged = self._decline(_Group(_Comm(None)))
-        self.assertIn("SGLANG_BARLINK_TRANSPORT", logged)
+        self.assertIn("FLLIPER_BARLINK_TRANSPORT", logged)
 
     def test_disabled_communicator_is_logged(self):
         _, logged = self._decline(_Group(_Comm(_RealNamedTransport(), disabled=True)))
@@ -187,37 +187,37 @@ class TestDeclineIsAnnounced(CustomTestCase):
 
 
 class TestTheSelftestSwitchWasRenamedLoudly(CustomTestCase):
-    """``SGLANG_BAR1EP_SELBSTTEST`` -> ``SGLANG_BAR1EP_SELFTEST``.
+    """``FLLIPER_BAR1EP_SELBSTTEST`` -> ``FLLIPER_BAR1EP_SELFTEST``.
 
     The switch turns off bar1ep's byte proof. Ignoring a stale spelling would
     silently turn the proof back ON for someone who meant to skip it, or --
     worse, once the polarity of such a switch ever changes -- off for someone
-    who did not. It never carried the ``SGLANG_HTCCL`` prefix, so the guard's
+    who did not. It never carried the ``FLLIPER_HTCCL`` prefix, so the guard's
     prefix scan alone did not see it.
     """
 
     def test_the_old_spelling_is_retired_to_the_new_one(self):
         self.assertEqual(
-            RETIRED_ENV_VARS.get("SGLANG_BAR1EP_SELBSTTEST"),
-            "SGLANG_BAR1EP_SELFTEST",
+            RETIRED_ENV_VARS.get("FLLIPER_BAR1EP_SELBSTTEST"),
+            "FLLIPER_BAR1EP_SELFTEST",
         )
 
     def test_a_stale_launch_script_fails_at_startup(self):
         with self.assertRaises(RetiredEnvVarError) as caught:
-            check_retired_env_vars({"SGLANG_BAR1EP_SELBSTTEST": "0"})
+            check_retired_env_vars({"FLLIPER_BAR1EP_SELBSTTEST": "0"})
         message = str(caught.exception)
-        self.assertIn("SGLANG_BAR1EP_SELBSTTEST", message)
-        self.assertIn("SGLANG_BAR1EP_SELFTEST", message)
+        self.assertIn("FLLIPER_BAR1EP_SELBSTTEST", message)
+        self.assertIn("FLLIPER_BAR1EP_SELFTEST", message)
 
     def test_the_current_spelling_passes(self):
-        check_retired_env_vars({"SGLANG_BAR1EP_SELFTEST": "0"})
+        check_retired_env_vars({"FLLIPER_BAR1EP_SELFTEST": "0"})
 
     def test_the_source_reads_only_the_current_spelling(self):
         import inspect
 
         source = inspect.getsource(bar1ep_mod)
-        self.assertIn("SGLANG_BAR1EP_SELFTEST", source)
-        self.assertNotIn("SGLANG_BAR1EP_SELBSTTEST", source)
+        self.assertIn("FLLIPER_BAR1EP_SELFTEST", source)
+        self.assertNotIn("FLLIPER_BAR1EP_SELBSTTEST", source)
 
     def test_no_live_variable_is_listed_as_retired(self):
         """The exact-match branch turns every table key into a hard failure.

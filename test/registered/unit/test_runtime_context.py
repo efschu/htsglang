@@ -1,6 +1,6 @@
 """Unit tests for runtime_context: delegation, singletons, and override()."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -9,9 +9,9 @@ import os
 import unittest
 from unittest.mock import patch
 
-import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups.arg_utils import A, Arg
-from sglang.srt.runtime_context import (
+import flliper.srt.server_args as server_args_module
+from flliper.srt.arg_groups.arg_utils import A, Arg
+from flliper.srt.runtime_context import (
     Flags,
     ParallelContext,
     RuntimeContext,
@@ -22,10 +22,10 @@ from sglang.srt.runtime_context import (
     get_server_args,
     reset_context,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
-_PS = "sglang.srt.distributed.parallel_state"
-_DP = "sglang.srt.layers.dp_attention"
+_PS = "flliper.srt.distributed.parallel_state"
+_DP = "flliper.srt.layers.dp_attention"
 
 SIZE_RANK_DELEGATIONS = [
     ("world_size", f"{_PS}.get_world_size"),
@@ -178,7 +178,7 @@ class TestParallelDCP(_IsolatedOverrides):
     def test_dcp_enablement_is_platform_agnostic(self):
         with (
             patch(f"{_PS}.get_dcp_group_no_assert", return_value=object()),
-            patch("sglang.srt.utils.is_cuda", return_value=False) as is_cuda,
+            patch("flliper.srt.utils.is_cuda", return_value=False) as is_cuda,
             patch(f"{_PS}.get_dcp_world_size", return_value=8),
             patch(f"{_PS}.get_dcp_rank", return_value=3),
         ):
@@ -385,7 +385,7 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
     def _init(self, **kw):
         from types import SimpleNamespace
 
-        from sglang.srt.layers.moe.utils import initialize_moe_config
+        from flliper.srt.layers.moe.utils import initialize_moe_config
 
         defaults = dict(
             moe_a2a_backend="none",
@@ -404,7 +404,7 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         initialize_moe_config(SimpleNamespace(**defaults))
 
     def test_lazy_defaults_before_initialize(self):
-        from sglang.srt.layers.moe.utils import (
+        from flliper.srt.layers.moe.utils import (
             get_moe_a2a_backend,
             get_moe_runner_backend,
             is_tbo_enabled,
@@ -416,7 +416,7 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertFalse(is_tbo_enabled())
 
     def test_initialize_materializes_group(self):
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend, is_tbo_enabled
+        from flliper.srt.layers.moe.utils import get_moe_a2a_backend, is_tbo_enabled
 
         self._init(moe_a2a_backend="deepep", enable_two_batch_overlap=True)
         self.assertTrue(get_moe_a2a_backend().is_deepep())
@@ -424,7 +424,7 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertEqual(get_flags().moe.deepep_config, "")
 
     def test_speculative_swap_and_restore(self):
-        from sglang.srt.layers.moe.utils import (
+        from flliper.srt.layers.moe.utils import (
             get_moe_a2a_backend,
             get_moe_runner_backend,
             speculative_moe_a2a_backend_context,
@@ -447,7 +447,7 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertFalse(get_flags().moe.disable_fp4_allgather)
 
     def test_swap_restores_on_exception(self):
-        from sglang.srt.layers.moe.utils import (
+        from flliper.srt.layers.moe.utils import (
             get_moe_runner_backend,
             speculative_moe_backend_context,
         )
@@ -464,7 +464,7 @@ class TestDpFlagsGroup(_IsolatedServerArgs):
     thin shim over the group leaf."""
 
     def test_shim_reads_the_leaf(self):
-        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+        from flliper.srt.layers.dp_attention import is_dp_attention_enabled
 
         reset_context()
         self.assertFalse(is_dp_attention_enabled())
@@ -472,7 +472,7 @@ class TestDpFlagsGroup(_IsolatedServerArgs):
         self.assertTrue(is_dp_attention_enabled())
 
     def test_scoped_override_forces_the_predicate(self):
-        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+        from flliper.srt.layers.dp_attention import is_dp_attention_enabled
 
         reset_context()
         with get_flags().dp.override(enabled=True):
@@ -487,7 +487,7 @@ class TestResources(_IsolatedServerArgs):
     def test_graph_pool_lazy_create_and_reuse(self):
         from types import SimpleNamespace
 
-        from sglang.srt.model_executor.runner_utils.pool import (
+        from flliper.srt.model_executor.runner_utils.pool import (
             get_global_graph_memory_pool,
             get_or_create_global_graph_memory_pool,
         )
@@ -499,10 +499,10 @@ class TestResources(_IsolatedServerArgs):
         self.assertIs(get_or_create_global_graph_memory_pool(dev), handle)
 
     def test_expert_recorder_noop_default_and_injection(self):
-        from sglang.srt.eplb.expert_distribution import (
+        from flliper.srt.eplb.expert_distribution import (
             get_global_expert_distribution_recorder,
         )
-        from sglang.srt.runtime_context import get_resources
+        from flliper.srt.runtime_context import get_resources
 
         reset_context()
         self.assertEqual(
@@ -513,7 +513,7 @@ class TestResources(_IsolatedServerArgs):
             self.assertEqual(get_global_expert_distribution_recorder(), "mock")
 
     def test_expert_location_metadata_publish_once_until_reset(self):
-        from sglang.srt.eplb.expert_location import (
+        from flliper.srt.eplb.expert_location import (
             get_global_expert_location_metadata,
             set_global_expert_location_metadata,
         )
@@ -576,11 +576,11 @@ class TestNamedStreams(_IsolatedServerArgs):
         self.assertEqual(get_context().resources.streams, {})
 
     def test_capturer_slots_roundtrip_and_reset(self):
-        from sglang.srt.state_capturer.indexer_topk import (
+        from flliper.srt.state_capturer.indexer_topk import (
             get_global_indexer_capturer,
             set_global_indexer_capturer,
         )
-        from sglang.srt.state_capturer.routed_experts import (
+        from flliper.srt.state_capturer.routed_experts import (
             get_global_experts_capturer,
             set_global_experts_capturer,
         )
@@ -598,7 +598,7 @@ class TestNamedStreams(_IsolatedServerArgs):
         self.assertIsNone(get_global_experts_capturer())
 
     def test_tcp_store_slot_roundtrip_and_reset(self):
-        from sglang.srt.distributed.utils import (
+        from flliper.srt.distributed.utils import (
             get_global_tcp_store,
             set_global_tcp_store,
         )
@@ -612,19 +612,19 @@ class TestNamedStreams(_IsolatedServerArgs):
         self.assertIsNone(get_global_tcp_store())
 
     def test_trace_level_env_seeded_lazy_default(self):
-        from sglang.srt.observability.trace import (
+        from flliper.srt.observability.trace import (
             get_global_trace_level,
             set_global_trace_level,
         )
 
         reset_context()
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_TRACE_LEVEL", None)
+            os.environ.pop("FLLIPER_TRACE_LEVEL", None)
             self.assertEqual(get_global_trace_level(), 3)
         set_global_trace_level(5)
         self.assertEqual(get_global_trace_level(), 5)
         reset_context()
-        with patch.dict(os.environ, {"SGLANG_TRACE_LEVEL": "1"}):
+        with patch.dict(os.environ, {"FLLIPER_TRACE_LEVEL": "1"}):
             self.assertEqual(get_global_trace_level(), 1)
 
 
@@ -634,7 +634,7 @@ class TestEpBufferState(_IsolatedServerArgs):
 
     def test_deepep_dispatch_mode_transitions_and_reset(self):
         try:
-            from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+            from flliper.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
         except ImportError:
             self.skipTest("deep_ep not installed")
 
@@ -670,7 +670,7 @@ class TestForwardFlags(_IsolatedServerArgs):
     threads see defaults."""
 
     def test_scoped_set_restore_and_nesting(self):
-        from sglang.srt.runtime_context import get_forward
+        from flliper.srt.runtime_context import get_forward
 
         reset_context()
         fwd = get_forward()
@@ -683,7 +683,7 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertFalse(fwd.multi_stream)
 
     def test_scoped_restores_on_exception_and_validates_keys(self):
-        from sglang.srt.runtime_context import get_forward
+        from flliper.srt.runtime_context import get_forward
 
         reset_context()
         fwd = get_forward()
@@ -700,7 +700,7 @@ class TestForwardFlags(_IsolatedServerArgs):
     def test_threads_see_defaults(self):
         import threading
 
-        from sglang.srt.runtime_context import get_forward
+        from flliper.srt.runtime_context import get_forward
 
         reset_context()
         fwd = get_forward()
@@ -722,7 +722,7 @@ class TestForwardFlags(_IsolatedServerArgs):
         # any graph break back into a failure.
         import torch
 
-        from sglang.srt.runtime_context import get_forward
+        from flliper.srt.runtime_context import get_forward
 
         reset_context()
 
@@ -761,7 +761,7 @@ class TestForwardFlags(_IsolatedServerArgs):
         # tier), so another thread sees the current value, not the default.
         import threading
 
-        from sglang.srt.runtime_context import get_forward
+        from flliper.srt.runtime_context import get_forward
 
         reset_context()
         seen = {}
@@ -777,7 +777,7 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertFalse(get_forward().attn_input_scattered)
 
     def test_multi_stream_shims(self):
-        from sglang.srt.utils.multi_stream_utils import (
+        from flliper.srt.utils.multi_stream_utils import (
             do_multi_stream,
             with_multi_stream,
         )
@@ -791,8 +791,8 @@ class TestForwardFlags(_IsolatedServerArgs):
     def test_attn_tp_context_per_forward_slots(self):
         from types import SimpleNamespace
 
-        from sglang.srt.layers.communicator import get_attn_tp_context
-        from sglang.srt.runtime_context import get_forward
+        from flliper.srt.layers.communicator import get_attn_tp_context
+        from flliper.srt.runtime_context import get_forward
 
         reset_context()
         ctx = get_attn_tp_context()
@@ -815,8 +815,8 @@ class TestForwardFlags(_IsolatedServerArgs):
     def test_dp_buffer_state_split(self):
         import torch
 
-        from sglang.srt.layers.dp_attention import _DpGatheredBufferWrapper as wrapper
-        from sglang.srt.layers.dp_attention import (
+        from flliper.srt.layers.dp_attention import _DpGatheredBufferWrapper as wrapper
+        from flliper.srt.layers.dp_attention import (
             get_dp_dtype,
             get_dp_global_num_tokens,
             get_global_dp_buffer_len,
@@ -840,7 +840,7 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertIsNone(get_dp_dtype())
 
     def test_is_extend_in_batch_sticky_within_thread(self):
-        from sglang.srt.layers.dp_attention import (
+        from flliper.srt.layers.dp_attention import (
             get_is_extend_in_batch,
             set_is_extend_in_batch,
         )
@@ -853,8 +853,8 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertFalse(get_is_extend_in_batch())
 
     def test_moe_output_buffer_ctx(self):
-        from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
-        from sglang.srt.runtime_context import get_forward
+        from flliper.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
+        from flliper.srt.runtime_context import get_forward
 
         reset_context()
         sentinel = object()
@@ -864,11 +864,11 @@ class TestForwardFlags(_IsolatedServerArgs):
 
     def test_mlp_comm_forward_flags(self):
         """Decoder-published MLP collective flags: scoped restore + skip helpers."""
-        from sglang.srt.layers.moe.utils import (
+        from flliper.srt.layers.moe.utils import (
             should_skip_mlp_all_reduce,
             should_skip_post_experts_all_reduce,
         )
-        from sglang.srt.runtime_context import get_forward
+        from flliper.srt.runtime_context import get_forward
 
         reset_context()
         fwd = get_forward()
@@ -917,14 +917,14 @@ class TestPublishLifecycle(_IsolatedServerArgs):
         self.assertFalse(get_flags().capture.enable_torch_compile)
 
     def test_declare_load_time_override_writes_through(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
+        from flliper.srt.arg_groups.overrides import declare_load_time_override
 
         args = self._publish(page_size=1)
         declare_load_time_override("model.load_time", {"page_size": 64})
         self.assertEqual(args.page_size, 64)
 
     def test_declare_load_time_override_validates_whitelist(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
+        from flliper.srt.arg_groups.overrides import declare_load_time_override
 
         args = self._publish(page_size=1)
         with self.assertRaises(ValueError):
@@ -932,8 +932,8 @@ class TestPublishLifecycle(_IsolatedServerArgs):
         self.assertEqual(args.page_size, 1)
 
     def test_declare_load_time_override_records_provenance(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.arg_groups.overrides import declare_load_time_override
+        from flliper.srt.server_args import ServerArgs
 
         class _Args(_FakeResolvedArgs):
             override = ServerArgs.override

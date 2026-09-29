@@ -6,13 +6,13 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-import sglang as sgl
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.test_utils import (
-    add_common_sglang_args_and_parse,
-    select_sglang_backend,
+import flliper as sgl
+from flliper.srt.utils.hf_transformers_utils import get_tokenizer
+from flliper.test.test_utils import (
+    add_common_flliper_args_and_parse,
+    select_flliper_backend,
 )
-from sglang.utils import dump_state_text
+from flliper.utils import dump_state_text
 
 
 def gen_prompt(tokenizer, token_num):
@@ -23,8 +23,8 @@ def gen_prompt(tokenizer, token_num):
 
 
 def get_cache_path(args):
-    # Create cache directory under ~/.cache/sglang
-    cache_dir = Path.home() / ".cache" / "sglang"
+    # Create cache directory under ~/.cache/flliper
+    cache_dir = Path.home() / ".cache" / "flliper"
 
     # Create a unique cache filename based on the arguments that affect generation
     cache_key = f"qa_{args.num_qa}_{args.turns}_{args.system_prompt_len}_{args.len_q}_{args.len_a}_{args.tokenizer.replace('/', '_')}.json"
@@ -82,7 +82,7 @@ def main(args):
 
     multi_qas = gen_arguments(args, tokenizer)
 
-    backend = select_sglang_backend(args)
+    backend = select_flliper_backend(args)
 
     tic = time.perf_counter()
     states = multi_turns.run_batch(
@@ -123,7 +123,7 @@ if __name__ == "__main__":
         "--tokenizer", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct"
     )
     parser.add_argument("--trust-remote-code", action="store_true")
-    args = add_common_sglang_args_and_parse(parser)
+    args = add_common_flliper_args_and_parse(parser)
 
     print(args)
     main(args)

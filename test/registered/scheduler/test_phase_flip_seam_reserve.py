@@ -20,7 +20,7 @@ import os
 
 import pytest
 
-from sglang.srt.managers import phase_flip_seam_reserve as sr
+from flliper.srt.managers import phase_flip_seam_reserve as sr
 
 MIB = 1 << 20
 
@@ -217,7 +217,7 @@ def test_every_symbol_the_callers_import_exists():
     metal."""
     import importlib
 
-    m = importlib.import_module("sglang.srt.managers.phase_flip_seam_reserve")
+    m = importlib.import_module("flliper.srt.managers.phase_flip_seam_reserve")
     # scheduler._phase_flip_on_round
     assert callable(m.measure_and_record)
     # model_runner_kv_cache_mixin._seam_reserve / _seam_adjusted_budget
@@ -350,7 +350,7 @@ class _PayingSched:
 def test_a_boot_that_will_have_a_paying_rung_need_not_hold_the_fixed_floor(
     monkeypatch,
 ):
-    import sglang.srt.managers.kv_backing_relief as kbr
+    import flliper.srt.managers.kv_backing_relief as kbr
 
     monkeypatch.setattr(kbr, "row_geometry", lambda pool: (15 * 1024, 56))
     arena, fixed = 1456 * MIB, 139 * MIB
@@ -360,15 +360,15 @@ def test_a_boot_that_will_have_a_paying_rung_need_not_hold_the_fixed_floor(
 
 def test_the_env_switch_is_the_can_fail_arm(monkeypatch):
     """With the rung off, the reserve must charge what it always charged."""
-    import sglang.srt.managers.kv_backing_relief as kbr
+    import flliper.srt.managers.kv_backing_relief as kbr
 
     monkeypatch.setattr(kbr, "row_geometry", lambda pool: (15 * 1024, 56))
-    monkeypatch.setenv("SGLANG_KV_BACKING_RELIEF", "0")
+    monkeypatch.setenv("FLLIPER_KV_BACKING_RELIEF", "0")
     assert sr._rung_fundable_for_seam(_PayingSched(), 1456 * MIB, 139 * MIB) == 0
 
 
 def test_a_chunkless_arena_cannot_promise_anything(monkeypatch):
-    import sglang.srt.managers.kv_backing_relief as kbr
+    import flliper.srt.managers.kv_backing_relief as kbr
 
     monkeypatch.setattr(kbr, "row_geometry", lambda pool: (15 * 1024, 56))
     sched = _PayingSched()

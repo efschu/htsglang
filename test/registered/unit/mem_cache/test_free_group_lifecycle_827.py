@@ -70,7 +70,7 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from flliper.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
 #: One granule, the shortfall each rank showed in the specimen.
 GRANULE = 8192

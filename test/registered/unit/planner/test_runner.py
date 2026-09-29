@@ -1,15 +1,15 @@
 """CPU unit tests for the scenario executor (#218 follow-up).
 
 No GPU, no server boot, no benchmark: every external dependency of
-:class:`sglang.srt.planner.runner.Study` is injected, which is the property
+:class:`flliper.srt.planner.runner.Study` is injected, which is the property
 that makes the executor testable at all.
 """
 
 import types
 import unittest
 
-from sglang.srt.planner.comparison import UNKNOWN, VERDICTS, NoiseFloor, WindowResult
-from sglang.srt.planner.runner import (
+from flliper.srt.planner.comparison import UNKNOWN, VERDICTS, NoiseFloor, WindowResult
+from flliper.srt.planner.runner import (
     DEFAULT_WINDOW,
     Arm,
     HarnessOutcome,
@@ -32,9 +32,9 @@ from sglang.srt.planner.runner import (
     window_metrics,
     window_plan,
 )
-from sglang.srt.planner.scenarios import SCENARIOS
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner.scenarios import SCENARIOS
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -300,7 +300,7 @@ class TestWindowPlan(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestKvBudgetNeutralisation(CustomTestCase):
+class TestKvBudgetNeutralization(CustomTestCase):
     def test_reset_clears_every_budget_file(self):
         removed = []
         out = neutralise_kv_budget(
@@ -322,7 +322,7 @@ class TestKvBudgetNeutralisation(CustomTestCase):
         )
         self.assertEqual(out["strategy"], "pinned")
         self.assertEqual(touched, [])
-        self.assertEqual(out["env"]["SGLANG_UNEVEN_TOKEN_VECTOR"], "3,2,2")
+        self.assertEqual(out["env"]["FLLIPER_UNEVEN_TOKEN_VECTOR"], "3,2,2")
 
     def test_a_failing_reset_is_recorded_not_swallowed(self):
         def boom(path):
@@ -341,7 +341,7 @@ class TestKvBudgetNeutralisation(CustomTestCase):
         calls = []
         study = a_study()
         study.kv_cache_dir = "/nowhere"
-        import sglang.srt.planner.runner as mod
+        import flliper.srt.planner.runner as mod
 
         original = mod.neutralise_kv_budget
         try:
@@ -438,7 +438,7 @@ class TestWindowMetrics(CustomTestCase):
         after = FakeEngineSample({"generation_tokens_total": 100.0}, {})
         metrics, _, notes = window_metrics(before, after, 10.0)
         self.assertNotIn("ms_per_verify_round", metrics)
-        self.assertTrue(any("SGLANG_ENABLE_METRICS_DEVICE_TIMER" in n for n in notes))
+        self.assertTrue(any("FLLIPER_ENABLE_METRICS_DEVICE_TIMER" in n for n in notes))
 
     def test_harness_fields_are_bound_by_the_scenario_mapping(self):
         before = FakeEngineSample({}, {})
@@ -507,7 +507,7 @@ class TestNoiseFloor(CustomTestCase):
         self.assertIsNotNone(floor.for_metric("ms_per_verify_round"))
 
     def test_a_metric_without_a_floor_makes_the_comparison_unknown(self):
-        from sglang.srt.planner.comparison import ArmResult, compare_metric
+        from flliper.srt.planner.comparison import ArmResult, compare_metric
 
         floor = noise_floor_from_points([point(tok_s=100.0)])
 
@@ -704,13 +704,13 @@ class TestStudy(CustomTestCase):
     def test_preflight_names_the_device_timer_switch(self):
         study = a_study()
         self.assertTrue(
-            any("SGLANG_ENABLE_METRICS_DEVICE_TIMER" in p for p in study.preflight())
+            any("FLLIPER_ENABLE_METRICS_DEVICE_TIMER" in p for p in study.preflight())
         )
 
     def test_preflight_is_quiet_about_it_once_it_is_set(self):
         study = a_study(
             policy=RunPolicy(
-                settle_s=0, env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"}
+                settle_s=0, env={"FLLIPER_ENABLE_METRICS_DEVICE_TIMER": "1"}
             )
         )
         self.assertFalse(any("will be ABSENT" in p for p in study.preflight()))
@@ -735,7 +735,7 @@ class TestStudy(CustomTestCase):
         self.assertTrue(transient.note)
 
     def test_the_transient_window_never_becomes_a_headline(self):
-        from sglang.srt.planner.comparison import HeadlineRefused, headline
+        from flliper.srt.planner.comparison import HeadlineRefused, headline
 
         study = Study(
             SPILL,
@@ -781,7 +781,7 @@ class TestDryRun(CustomTestCase):
         self.assertIn("host or server controls", dry["arms"][0]["reason"])
 
     def test_rendering_names_the_yardstick_and_the_windows(self):
-        from sglang.srt.planner.runner import render_dry_run_text
+        from flliper.srt.planner.runner import render_dry_run_text
 
         text = render_dry_run_text(a_study().dry_run())
         self.assertIn("ms_per_verify_round", text)

@@ -73,11 +73,11 @@ if before == after:
 PY
 }
 
-CE=python/sglang/srt/weg2/launcher.py
-RT=python/sglang/srt/weg2/launcher.py
-T="test/registered/unit/weg2/test_weg2_w19_form_residue_1273.py
-test/registered/unit/weg2/test_weg2_xchg_reserve_1273.py
-test/registered/unit/weg2/test_weg2_corridor_budget_1257.py"
+CE=python/flliper/srt/pdflip/launcher.py
+RT=python/flliper/srt/pdflip/launcher.py
+T="test/registered/unit/pdflip/test_pdflip_w19_form_residue_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_reserve_1273.py
+test/registered/unit/pdflip/test_pdflip_corridor_budget_1257.py"
 
 if [ "${1:-}" = "--selfcheck" ]; then
   PLANT="# MUTANT-HARNESS-SELFCHECK-PLANTED-$$"
@@ -134,7 +134,7 @@ m "M6 the measured triple drifts from the boot" "$CE" \
   'DC_MEASURED_D_XCHG_MIB = (2588, 3084, 2588)' \
   'DC_MEASURED_D_XCHG_MIB = (2588, 3080, 2588)'
 m "M7 main stops going through the one selector" "$CE" \
-  '        c.uuid: dc_measured_d_mib(c, ns.weg2_weight_source) + slack_mib' \
+  '        c.uuid: dc_measured_d_mib(c, ns.pdflip_weight_source) + slack_mib' \
   '        c.uuid: (DC_MEASURED_D_5090_MIB if "5090" in c.name else DC_MEASURED_D_3080_MIB) + slack_mib'
 m "M8 the residual is folded into the priced value" "$CE" \
   '        residual[c.uuid] = int(measured) - int(out[c.uuid])' \

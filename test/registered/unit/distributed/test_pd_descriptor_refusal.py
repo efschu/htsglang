@@ -11,15 +11,15 @@ buffers rather than failing.
 Both paths now go through one rule, so the two cannot drift apart.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import inspect
 import unittest
 
-from sglang.srt.distributed.utils import refuse_noncontiguous_layer_descriptor
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.utils import refuse_noncontiguous_layer_descriptor
+from flliper.test.test_utils import CustomTestCase
 
 FA_STAGE = [35, 39, 43, 47, 51, 55, 59, 63]
 
@@ -47,13 +47,13 @@ class TestTheSharedRefusal(CustomTestCase):
 
 class TestBothPathsUseTheOneRule(CustomTestCase):
     def test_the_layer_shard_path_delegates(self):
-        from sglang.srt.mem_cache import dsa_cache_layer_split
+        from flliper.srt.mem_cache import dsa_cache_layer_split
 
         src = inspect.getsource(dsa_cache_layer_split.shard_start_global)
         self.assertIn("refuse_noncontiguous_layer_descriptor", src)
 
     def test_the_layer_shard_path_still_refuses(self):
-        from sglang.srt.mem_cache.dsa_cache_layer_split import shard_start_global
+        from flliper.srt.mem_cache.dsa_cache_layer_split import shard_start_global
 
         self.assertEqual(shard_start_global(22, 4, None), 26)
         with self.assertRaises(NotImplementedError):
@@ -64,7 +64,7 @@ class TestBothPathsUseTheOneRule(CustomTestCase):
         module: pinning the module passed even with the call deleted, because
         the import line alone satisfied it. A pin must state the invariant --
         "this function calls the rule" -- not count mentions of a name."""
-        from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
+        from flliper.srt.disaggregation.prefill import PrefillBootstrapQueue
 
         src = inspect.getsource(PrefillBootstrapQueue._init_kv_manager)
         self.assertIn("refuse_noncontiguous_layer_descriptor(", src)

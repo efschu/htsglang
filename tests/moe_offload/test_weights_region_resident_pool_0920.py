@@ -4,7 +4,7 @@ a private pool stay reserved through torch.cuda.empty_cache() (metal probe:
 1.8 GiB freed inside a MemPool, still reserved; PP1 13.05 GiB reserved vs
 5.97 allocated -> KV sizing refused). The tag is still published."""
 
-from sglang.srt.managers import weg2_memory_saver as ws
+from flliper.srt.managers import pdflip_memory_saver as ws
 
 
 class _Adapter:

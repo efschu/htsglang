@@ -37,7 +37,7 @@ from pathlib import Path
 
 DEFAULT_CLIENT = (
     Path(__file__).resolve().parents[2]
-    / "python/sglang/srt/translator/client/index.html"
+    / "python/flliper/srt/translator/client/index.html"
 )
 #: A phone, and it must be a TOUCH context or the page gets mouse semantics.
 VIEWPORT = {"width": 390, "height": 720}

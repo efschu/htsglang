@@ -4,7 +4,7 @@ Launches TP=4 with Marlin FP4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Also covers SGLANG_DSV4_FP4_DEQUANT=1 (TP=8): FP4 experts dequantized to FP8
+Also covers FLLIPER_DSV4_FP4_DEQUANT=1 (TP=8): FP4 experts dequantized to FP8
 during loading and served through the plain FP8 MoE path.
 
 Registry: base-c-test-deepep-8-gpu-h200 (per-commit, 8x H200)
@@ -12,12 +12,12 @@ Registry: base-c-test-deepep-8-gpu-h200 (per-commit, 8x H200)
 
 import unittest
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.kits.spec_decoding_kit import SpecDecodingMixin
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -176,7 +176,7 @@ class TestDSV4FlashFP4NonMTPH200(
 class TestDSV4FlashFP4DequantTP8H200(
     BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
 ):
-    """SGLANG_DSV4_FP4_DEQUANT=1: TP=8, FP4 experts dequantized to FP8 during
+    """FLLIPER_DSV4_FP4_DEQUANT=1: TP=8, FP4 experts dequantized to FP8 during
     loading, then served through the plain FP8 MoE path (no mxfp4 runner)."""
 
     gsm8k_accuracy_thres = 0.93
@@ -204,7 +204,7 @@ class TestDSV4FlashFP4DequantTP8H200(
                 "--watchdog-timeout",
                 "900",
             ],
-            env={"SGLANG_DSV4_FP4_DEQUANT": "1"},
+            env={"FLLIPER_DSV4_FP4_DEQUANT": "1"},
         )
 
     @classmethod

@@ -78,8 +78,8 @@ WHAT THIS CANNOT SEE -- read before quoting a zero:
     and is reported by `--cardinality`, a separate, weaker check.
 
 USAGE
-    classD_resource_release.py --root python/sglang/srt --sweep
-    classD_resource_release.py --root python/sglang/srt \
+    classD_resource_release.py --root python/flliper/srt --sweep
+    classD_resource_release.py --root python/flliper/srt \
         --grant alloc_req_slots --release req_to_token_pool.free \
         --layouts-preset flip --cuts-preset pp-strict
     classD_resource_release.py --selftest      # can-fire proof, both ways
@@ -848,7 +848,7 @@ def run_granularity(
 ) -> int:
     """GRANULARITY mode -- the #1189 rule, runnable as written.
 
-        classD_resource_release.py --root python/sglang/srt \
+        classD_resource_release.py --root python/flliper/srt \
             --granularity --grant-scope merge_batch
 
     Reports every container mutated PER ENTRY inside a scope whose qualname
@@ -1004,7 +1004,7 @@ def _selftest() -> int:
 
 def main(argv: Sequence[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--root", default="python/sglang/srt")
+    ap.add_argument("--root", default="python/flliper/srt")
     ap.add_argument("--grant")
     ap.add_argument("--release")
     ap.add_argument("--layout", action="append", default=[])

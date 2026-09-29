@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.test.gpt_oss_common import BaseTestGptOss
+from flliper.test.gpt_oss_common import BaseTestGptOss
 
 
 class TestGptOss1Gpu(BaseTestGptOss):

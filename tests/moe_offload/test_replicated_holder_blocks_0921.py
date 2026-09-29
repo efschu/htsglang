@@ -19,7 +19,7 @@ sieht im Test aus wie ein Fix.
 
 import pytest
 
-from sglang.srt.weg2 import weight_exchange as wx
+from flliper.srt.pdflip import weight_exchange as wx
 
 
 class _Layout:
@@ -91,6 +91,6 @@ def test_the_source_side_is_untouched():
 def test_a_width_vector_of_the_wrong_length_is_refused():
     """Drei Raenge, zwei Breiten: welcher Rang haelt den dritten Eintrag?
     Raten waere wieder eine Lane, die niemand bedient."""
-    with pytest.raises(wx.Weg2XchgPlanDisagree) as ei:
+    with pytest.raises(wx.PdFlipXchgPlanDisagree) as ei:
         _blocks(_Geom(dst_widths=(384, 0)))
     assert "W68" in str(ei.value)

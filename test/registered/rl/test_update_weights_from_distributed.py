@@ -1,4 +1,4 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 """Test distributed weight updates.
 
@@ -28,10 +28,10 @@ import torch
 import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
-import sglang as sgl
-from sglang.srt.utils import init_custom_process_group
-from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
-from sglang.test.test_utils import (
+import flliper as sgl
+from flliper.srt.utils import init_custom_process_group
+from flliper.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -41,7 +41,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
-from sglang.utils import terminate_process
+from flliper.utils import terminate_process
 
 register_cuda_ci(est_time=137, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=400, suite="stage-b-test-2-gpu-large-amd")

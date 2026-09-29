@@ -11,8 +11,8 @@ import dataclasses
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.congruent_lane import CongruentPrefillLane
-from sglang.srt.disaggregation.topology import (
+from flliper.srt.disaggregation.congruent_lane import CongruentPrefillLane
+from flliper.srt.disaggregation.topology import (
     TOPOLOGY_COLOCATED_CONGRUENT,
     TOPOLOGY_COLOCATED_PROCESS,
     TOPOLOGY_DISJOINT,
@@ -22,8 +22,8 @@ from sglang.srt.disaggregation.topology import (
     plan_pd_topology,
     validate_pd_topology_args,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -362,7 +362,7 @@ class TestPlanAndFeasibility(CustomTestCase):
 
 class TestProcessColocationGate(CustomTestCase):
     def _probe_env(self, nccl_raw, mps_present):
-        from sglang.srt.rigmon.capabilities import ProbeEnv
+        from flliper.srt.rigmon.capabilities import ProbeEnv
 
         return ProbeEnv(
             exists=lambda p: mps_present,
@@ -409,9 +409,9 @@ class TestApplyNormalization(CustomTestCase):
         )
         self.assertIsNotNone(plan)
         self.assertEqual(args.pp_size, 2)
-        self.assertEqual(env["SGLANG_PP_LAYER_PARTITION"], "36,12")
+        self.assertEqual(env["FLLIPER_PP_LAYER_PARTITION"], "36,12")
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "2,0")
-        self.assertEqual(env["SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS"], "1")
+        self.assertEqual(env["FLLIPER_ONE_VISIBLE_DEVICE_PER_PROCESS"], "1")
 
     def test_existing_cvd_restriction_is_respected(self):
         args = _args(
@@ -454,7 +454,7 @@ class TestApplyNormalization(CustomTestCase):
             card = plan.card(gpu)
             self.assertTrue(card.weights_shared)
             self.assertEqual(card.prefill_weight_mib, 0)
-        self.assertEqual(env["SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS"], "1")
+        self.assertEqual(env["FLLIPER_ONE_VISIBLE_DEVICE_PER_PROCESS"], "1")
 
     def test_infeasible_topology_rejected_at_apply(self):
         args = _args(
@@ -477,7 +477,7 @@ class TestApplyNormalization(CustomTestCase):
             )
 
     def _good_probe_env(self):
-        from sglang.srt.rigmon.capabilities import ProbeEnv
+        from flliper.srt.rigmon.capabilities import ProbeEnv
 
         return ProbeEnv(
             exists=lambda p: True,
@@ -579,7 +579,7 @@ class TestCudaOrderReindex(CustomTestCase):
     def test_fastest_first_rig_mapping(self):
         # This rig, measured: NVML order 3080/5090/3080, CUDA FASTEST_FIRST
         # puts the 5090 first. cuda:0 must get the 5090's total.
-        from sglang.srt.disaggregation.topology import reindex_totals_cuda_order
+        from flliper.srt.disaggregation.topology import reindex_totals_cuda_order
 
         nvml = {0: 20480, 1: 32607, 2: 20480}
         cuda_to_nvml = {0: 1, 1: 0, 2: 2}
@@ -593,7 +593,7 @@ class TestCudaOrderReindex(CustomTestCase):
         # On a rig where they do not, that hands the feasibility check
         # another card's capacity. The falsifier lives in
         # test_pd_topology_device_order_505.py.
-        from sglang.srt.disaggregation.topology import reindex_totals_cuda_order
+        from flliper.srt.disaggregation.topology import reindex_totals_cuda_order
 
         nvml = {0: 1, 1: 2}
         self.assertIsNone(reindex_totals_cuda_order(nvml, {}))
@@ -601,7 +601,7 @@ class TestCudaOrderReindex(CustomTestCase):
 
 class TestServerArgsSurface(CustomTestCase):
     def test_flags_exist_in_the_disaggregation_block_and_default_off(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         fields = {f.name: f for f in dataclasses.fields(ServerArgs)}
         for name in (
@@ -619,7 +619,7 @@ class TestServerArgsSurface(CustomTestCase):
         # does not set the topology flag (byte-identical default).
         import inspect
 
-        from sglang.srt.managers import scheduler as scheduler_mod
+        from flliper.srt.managers import scheduler as scheduler_mod
 
         src = inspect.getsource(scheduler_mod.Scheduler)
         self.assertIn("self.congruent_prefill_lane = None", src)

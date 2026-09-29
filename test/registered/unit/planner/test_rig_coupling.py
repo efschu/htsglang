@@ -29,8 +29,8 @@ import unittest
 import urllib.request
 from unittest import mock
 
-from sglang.srt.planner import rejected as rejectedmod
-from sglang.srt.planner import rig_coupling as rc
+from flliper.srt.planner import rejected as rejectedmod
+from flliper.srt.planner import rig_coupling as rc
 
 IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
@@ -126,7 +126,7 @@ class TestGate(NoNetwork):
         return {r.key: r for r in rc.gate(local, far, **kw)}
 
     def test_verdict_vocabulary_matches_rigmon_compat(self):
-        from sglang.srt.rigmon import compat
+        from flliper.srt.rigmon import compat
 
         self.assertEqual((rc.OK, rc.WARN, rc.BLOCK),
                          (compat.OK, compat.WARN, compat.BLOCK))
@@ -204,7 +204,7 @@ class TestGate(NoNetwork):
                    **VERSIONS)
         row = {r.key: r for r in rc.gate(local, far)}["vendor_mixed"]
         self.assertEqual(row.verdict, rc.WARN)
-        self.assertIn("SGLANG_BARLINK", row.remedy)
+        self.assertIn("FLLIPER_BARLINK", row.remedy)
 
     def test_transport_row_names_the_broken_verbs_path(self):
         row = self._gate()["transport_available"]
@@ -500,12 +500,12 @@ class TestCouple(NoNetwork):
 class TestWebuiAdapter(NoNetwork):
     def setUp(self):
         super().setUp()
-        from sglang.srt.planner import webui
+        from flliper.srt.planner import webui
 
         self.webui = webui
         # No cached probe, so the adapter's optional inputs are exercised in
         # their absent form rather than against this machine's cache.
-        p = mock.patch("sglang.srt.rigmon.card_probe.load_card_probe",
+        p = mock.patch("flliper.srt.rigmon.card_probe.load_card_probe",
                        return_value=None)
         p.start()
         self.addCleanup(p.stop)
@@ -539,7 +539,7 @@ class TestWebuiAdapter(NoNetwork):
         self.assertIn("no such pairing session", out["error"])
 
     def test_a_session_that_has_not_reached_yet_is_refused_with_the_remedy(self):
-        from sglang.srt.rigmon import pairing
+        from flliper.srt.rigmon import pairing
 
         local, _ = self._artifacts()
         store = pairing.PairingStore()
@@ -551,7 +551,7 @@ class TestWebuiAdapter(NoNetwork):
         self.assertIn("never contacts", out["remedy"])
 
     def test_a_reached_session_feeds_the_plan_without_re_fetching(self):
-        from sglang.srt.rigmon import pairing
+        from flliper.srt.rigmon import pairing
 
         local, _ = self._artifacts()
         store = pairing.PairingStore()

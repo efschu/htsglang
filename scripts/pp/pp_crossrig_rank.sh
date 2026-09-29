@@ -47,13 +47,13 @@ DTYPE=${DTYPE:-float16}
 ATTN_MAIN=${ATTN_MAIN:-triton}
 ATTN_SECOND=${ATTN_SECOND:-triton}
 
-export SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION=1
-export SGLANG_PP_BOUNDARY_STATS=$BOUNDARY_STATS
+export FLLIPER_KILLPG_ON_SCHEDULER_EXCEPTION=1
+export FLLIPER_PP_BOUNDARY_STATS=$BOUNDARY_STATS
 # #201 slice 3: metadata shape cache at the stage boundary. Must be set to
 # the SAME value on BOTH nodes (the wire format differs with it); this
 # script pins it explicitly on every rank for exactly that reason.
-export SGLANG_PP_SHAPE_CACHE=${SGLANG_PP_SHAPE_CACHE:-0}
-export SGLANG_MAMBA_SSM_DTYPE=${SGLANG_MAMBA_SSM_DTYPE:-float32}
+export FLLIPER_PP_SHAPE_CACHE=${FLLIPER_PP_SHAPE_CACHE:-0}
+export FLLIPER_MAMBA_SSM_DTYPE=${FLLIPER_MAMBA_SSM_DTYPE:-float32}
 export TORCHDYNAMO_DISABLE=1
 export MAX_JOBS=4
 export PP_CROSSRIG_RUN_TAG=${PP_CROSSRIG_RUN_TAG:-pp-crossrig-$$}
@@ -97,7 +97,7 @@ if [ "$SIDE" = main ]; then
   export PATH=$CUDA_HOME/bin:$PATH
   export CPATH=$CUDA_HOME/include:${CPATH:-}
   PY=/spinning/miniforge3_local_install/bin/python3.12
-  # Worktree FIRST so it wins over the venv's editable sglang install.
+  # Worktree FIRST so it wins over the venv's editable flliper install.
   # #201 slice-3 validation: the worktree name is overridable so the same
   # launcher can drive the slice-2 tree (wt-201) and the slice-3 merge
   # worktree (wt-201-slice3) without editing paths.
@@ -112,14 +112,14 @@ else
   [ "$NCCL_IB" = 1 ] && export NCCL_IB_HCA=${NCCL_IB_HCA_SECOND:-rocep1s0f1}
   export CPATH=/root/venv-cuda/lib/python3.12/site-packages/nvidia/cu13/include:${CPATH:-}
   PY=/root/venv-cuda/bin/python
-  export PYTHONPATH=/root/sglang-src
+  export PYTHONPATH=/root/flliper-src
   ATTN=$ATTN_SECOND
   cd /root
 fi
 
-# Do NOT exec and do NOT orphan: sglang's scheduler signals its PARENT with
+# Do NOT exec and do NOT orphan: flliper's scheduler signals its PARENT with
 # SIGQUIT on a crash. Orphaned, that parent is PID 1.
-"$PY" -u -m sglang.launch_server \
+"$PY" -u -m flliper.launch_server \
   --model-path "$MODEL" --dtype "$DTYPE" \
   --tp-size 1 --pp-size 2 "${RATIO_FLAG:---pp-layer-ratio}" "$RATIO" \
   --nnodes 2 --node-rank "$NODE" --dist-init-addr "$MASTER:$PORT" \

@@ -43,7 +43,7 @@ LANGUAGE_NAMES = {
     "ko": "korean", "zh": "chinese",
 }
 
-from sglang.srt.translator.voice_presets import (  # noqa: E402
+from flliper.srt.translator.voice_presets import (  # noqa: E402
     PRESET_DESCRIPTORS,
     VOICE_DESIGN_MODEL,
     VOICE_DESIGN_REVISION,
@@ -114,7 +114,7 @@ def main(argv=None) -> int:
     import soundfile
     import torch
 
-    from sglang.srt.translator.qwen3_tts_compat import (  # noqa: E402
+    from flliper.srt.translator.qwen3_tts_compat import (  # noqa: E402
         ensure_qwen3_tts_importable,
         refresh_rotary_buffers,
         restore_cache_position,
@@ -195,7 +195,7 @@ def main(argv=None) -> int:
 
     print(f"done: {written} written, {skipped} already present")
     print("verify the pool loads and is not thin:")
-    print("  python -c \"from sglang.srt.translator.voices import VoicePool; "
+    print("  python -c \"from flliper.srt.translator.voices import VoicePool; "
           f"p=VoicePool.from_directory('{args.pool_root}'); "
           "print(len(p), p.counts_by_class(), p.thin_classes())\"")
     return 0

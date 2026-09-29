@@ -27,32 +27,32 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     ENV_DECODE_STALL_SLO,
     LOG_PREFIX,
     config_from_env,
 )
 
-#: Every SGLANG_PHASE_POLICY_* name config_from_env reads. Cleared for every
+#: Every FLLIPER_PHASE_POLICY_* name config_from_env reads. Cleared for every
 #: case so a stray var in the developer's shell cannot turn a "default" run
 #: into an "env" run -- which is precisely the confusion #781 was filed for.
 _POLICY_ENV = (
-    "SGLANG_PHASE_POLICY_MIN_DWELL_S",
-    "SGLANG_PHASE_POLICY_IDLE_DWELL_S",
-    "SGLANG_PHASE_POLICY_PP_WINDOW_S",
-    "SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S",
-    "SGLANG_PHASE_POLICY_FLIP_COST_S",
-    "SGLANG_PHASE_POLICY_FLIP_TOKENS",
-    "SGLANG_PHASE_POLICY_DECODE_STRAND_WEIGHT",
-    "SGLANG_PHASE_POLICY_DECODE_CONTENTION",
+    "FLLIPER_PHASE_POLICY_MIN_DWELL_S",
+    "FLLIPER_PHASE_POLICY_IDLE_DWELL_S",
+    "FLLIPER_PHASE_POLICY_PP_WINDOW_S",
+    "FLLIPER_PHASE_POLICY_TP_DECODE_FLOOR_S",
+    "FLLIPER_PHASE_POLICY_FLIP_COST_S",
+    "FLLIPER_PHASE_POLICY_FLIP_TOKENS",
+    "FLLIPER_PHASE_POLICY_DECODE_STRAND_WEIGHT",
+    "FLLIPER_PHASE_POLICY_DECODE_CONTENTION",
     ENV_DECODE_STALL_SLO,
-    "SGLANG_PHASE_POLICY_DRAIN_MODE",
-    "SGLANG_PHASE_POLICY_DRAIN_MODE_STRICT",
-    "SGLANG_PHASE_POLICY_TP_TOK_S",
-    "SGLANG_PHASE_POLICY_PP_TOK_S",
-    "SGLANG_PHASE_POLICY_PP_EXIT_TOKENS",
-    "SGLANG_PHASE_POLICY_REFUSAL_BACKOFF_CAP_S",
-    "SGLANG_PHASE_POLICY_REFUSAL_DEGRADE_AFTER",
+    "FLLIPER_PHASE_POLICY_DRAIN_MODE",
+    "FLLIPER_PHASE_POLICY_DRAIN_MODE_STRICT",
+    "FLLIPER_PHASE_POLICY_TP_TOK_S",
+    "FLLIPER_PHASE_POLICY_PP_TOK_S",
+    "FLLIPER_PHASE_POLICY_PP_EXIT_TOKENS",
+    "FLLIPER_PHASE_POLICY_REFUSAL_BACKOFF_CAP_S",
+    "FLLIPER_PHASE_POLICY_REFUSAL_DEGRADE_AFTER",
     "HTSGLANG_PHASE_IDLE_STATE",
 )
 
@@ -102,7 +102,7 @@ class TestPhasePolicyKnobProvenance896(unittest.TestCase):
                 if k not in env:
                     os.environ.pop(k, None)
             with self.assertLogs(
-                "sglang.srt.managers.phase_policy", level="WARNING"
+                "flliper.srt.managers.phase_policy", level="WARNING"
             ) as caught:
                 config_from_env(enabled=True, server_args=args or _Args())
         lines = [m for m in caught.output if "knob provenance" in m]
@@ -145,7 +145,7 @@ class TestPhasePolicyKnobProvenance896(unittest.TestCase):
         (idle dwell, seam seed, strand weight) run through ``_env_source``
         rather than ``_flag_or_env``, so the empty-string case has to be held
         in both places or half the line can still name a phantom source."""
-        line = self._provenance_line(env={"SGLANG_PHASE_POLICY_IDLE_DWELL_S": ""})
+        line = self._provenance_line(env={"FLLIPER_PHASE_POLICY_IDLE_DWELL_S": ""})
         self.assertIn("idle_dwell_s=3 from default", line)
         self.assertNotIn("idle_dwell_s=3 from env", line)
 
@@ -181,9 +181,9 @@ class TestPhasePolicyKnobProvenance896(unittest.TestCase):
         """flip_cost_s has two provenances and both govern: where the SEED came
         from, and whether the estimator still sits on it. Printing only the
         first reads as 'measured' when nothing has been measured."""
-        line = self._provenance_line(env={"SGLANG_PHASE_POLICY_FLIP_COST_S": "5.918"})
+        line = self._provenance_line(env={"FLLIPER_PHASE_POLICY_FLIP_COST_S": "5.918"})
         self.assertIn(
-            "flip_cost_s=5.918 from env SGLANG_PHASE_POLICY_FLIP_COST_S", line
+            "flip_cost_s=5.918 from env FLLIPER_PHASE_POLICY_FLIP_COST_S", line
         )
         seam = line.split("flip_cost_s=", 1)[1]
         self.assertIn(
@@ -195,11 +195,11 @@ class TestPhasePolicyKnobProvenance896(unittest.TestCase):
         take effect is noise, and the arming line is already gated the same way."""
         with mock.patch.dict(os.environ, {}, clear=False):
             with self.assertLogs(
-                "sglang.srt.managers.phase_policy", level="WARNING"
+                "flliper.srt.managers.phase_policy", level="WARNING"
             ) as caught:
                 import logging
 
-                logging.getLogger("sglang.srt.managers.phase_policy").warning("probe")
+                logging.getLogger("flliper.srt.managers.phase_policy").warning("probe")
                 config_from_env(enabled=False, server_args=_Args())
         self.assertEqual([m for m in caught.output if "knob provenance" in m], [])
 

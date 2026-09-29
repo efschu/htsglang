@@ -13,7 +13,7 @@ out-of-bounds write (specimen pp_proxy_mispair_20260809T0626Z).
 
 HOW IT FORCES THE STRAND. Three ingredients, all required:
 
-  1. a SHORT park deadline on the server (SGLANG_PHASE_FLIP_PARK_DEADLINE_S,
+  1. a SHORT park deadline on the server (FLLIPER_PHASE_FLIP_PARK_DEADLINE_S,
      5 s in the recorded runs) so an armed flip gives up quickly;
   2. sustained decode traffic, so a request is always resident and every
      ``pp_to_tp`` arm therefore PARKS and then ABANDONS rather than

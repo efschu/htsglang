@@ -26,13 +26,13 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.distributed.utils import get_cp_token_ratios, set_cp_token_ratios
-from sglang.srt.layers.dcp.owner import (
+from flliper.srt.distributed.utils import get_cp_token_ratios, set_cp_token_ratios
+from flliper.srt.layers.dcp.owner import (
     dcp_even_write_mask,
     dcp_weighted_owner_bounds,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -91,7 +91,7 @@ class TestDcpPadPositionsEvenLane(CustomTestCase):
     """The EVEN modulo lane -- the one upstream #33253 fixed."""
 
     def _drive_triton(self, forward_batch):
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+        from flliper.srt.layers.attention.triton_backend import TritonAttnBackend
 
         pool = _RecordingPool()
         fake = SimpleNamespace(
@@ -108,7 +108,7 @@ class TestDcpPadPositionsEvenLane(CustomTestCase):
         return pool
 
     def _drive_flashinfer(self, forward_batch):
-        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+        from flliper.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
         pool = _RecordingPool()
         fake = SimpleNamespace(
@@ -155,7 +155,7 @@ class TestDcpPadPositionsEvenLane(CustomTestCase):
 
     def test_even_lane_after_wrapper_narrowing(self):
         """End-to-end pin: the PCG wrapper's narrowing feeds a correct mask."""
-        from sglang.srt.layers.radix_attention import narrow_pcg_token_views
+        from flliper.srt.layers.radix_attention import narrow_pcg_token_views
 
         for drive in (self._drive_triton, self._drive_flashinfer):
             with self.subTest(drive=drive.__name__):
@@ -228,7 +228,7 @@ class TestDcpPadPositionsWeightedLane(CustomTestCase):
         set_cp_token_ratios(self._saved)
 
     def _drive_triton_weighted(self, forward_batch, rank):
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+        from flliper.srt.layers.attention.triton_backend import TritonAttnBackend
 
         cp_S, cp_lo, cp_hi, cp_ratio = dcp_weighted_owner_bounds(len(self.PLAN), rank)
         pool = _RecordingPool()
@@ -293,7 +293,7 @@ class TestDcpPadPositionsWeightedLane(CustomTestCase):
 class TestPiecewiseWrapperNarrowsPositions(CustomTestCase):
     """The wrapper's token-axis narrowing: what the backend is handed under PCG.
 
-    The custom ops themselves (``sglang::unified_attention_with_output`` and
+    The custom ops themselves (``flliper::unified_attention_with_output`` and
     friends) are registered for the CUDA dispatch key only, so they cannot be
     driven on CPU. What IS hermetically drivable is the pair the ops delegate
     to; the ratchet below pins that every op under the piecewise context keeps
@@ -301,7 +301,7 @@ class TestPiecewiseWrapperNarrowsPositions(CustomTestCase):
     """
 
     def test_narrow_covers_positions_and_out_cache_loc(self):
-        from sglang.srt.layers.radix_attention import (
+        from flliper.srt.layers.radix_attention import (
             narrow_pcg_token_views,
             restore_pcg_token_views,
         )
@@ -317,7 +317,7 @@ class TestPiecewiseWrapperNarrowsPositions(CustomTestCase):
         self.assertEqual(fb.out_cache_loc.numel(), PADDED_TOKENS)
 
     def test_narrow_tolerates_absent_positions(self):
-        from sglang.srt.layers.radix_attention import (
+        from flliper.srt.layers.radix_attention import (
             narrow_pcg_token_views,
             restore_pcg_token_views,
         )
@@ -334,7 +334,7 @@ class TestPiecewiseWrapperNarrowsPositions(CustomTestCase):
         import ast
         import inspect
 
-        from sglang.srt.layers import radix_attention, radix_linear_attention
+        from flliper.srt.layers import radix_attention, radix_linear_attention
 
         owners = {"narrow_pcg_token_views", "restore_pcg_token_views"}
         for module in (radix_attention, radix_linear_attention):

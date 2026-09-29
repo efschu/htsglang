@@ -38,7 +38,7 @@ boot() {
   local arm="$1"; shift
   local log="$OUT/boot_${arm}.log"
   echo "=== booting arm $arm -> $log"
-  setsid "$VENV/bin/python" -m sglang.launch_server \
+  setsid "$VENV/bin/python" -m flliper.launch_server \
     --model-path "$MODEL" \
     --served-model-name default \
     --tp-size 1 \

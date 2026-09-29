@@ -72,13 +72,13 @@ from pathlib import Path
 
 import pytest
 
-from sglang.srt.managers.pp_admission_congruence import (
+from flliper.srt.managers.pp_admission_congruence import (
     UNRESOLVED_DEFER_CAP,
     PPAdmissionCongruenceGuard,
     PPAdmissionDecision,
     PPAdmissionEntry,
 )
-from sglang.srt.managers.scheduler_pp_mixin import (
+from flliper.srt.managers.scheduler_pp_mixin import (
     REFETCH_DECLINE_CAP,
     _PREMISE_DEAD_STAMP,
     pp_apply_dead_premise_at_chunk_boundary,
@@ -441,7 +441,7 @@ def _source_without_comments(path: Path) -> str:
 
 
 def _managers_dir() -> Path:
-    spec = importlib.util.find_spec("sglang.srt.managers.scheduler")
+    spec = importlib.util.find_spec("flliper.srt.managers.scheduler")
     assert spec is not None and spec.origin is not None
     return Path(spec.origin).parent
 

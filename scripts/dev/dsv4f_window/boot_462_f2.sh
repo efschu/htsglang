@@ -11,7 +11,7 @@
 #   ARM=breakable_clean ./boot_462_f2.sh   # breakable, probe OFF (§5 A/B)
 #
 # ROUTE ON = env AND flags, both:
-#   SGLANG_MOE_OFFLOAD_GRAPH_MODE=breakable
+#   FLLIPER_MOE_OFFLOAD_GRAPH_MODE=breakable
 #   --cuda-graph-backend-decode=breakable --cuda-graph-backend-prefill=disabled
 # validate_breakable_boot (layers/moe/offload_capture_gate.py:311-420) refuses
 # the boot if the resolved decode backend is not 'breakable' or prefill is not
@@ -19,7 +19,7 @@
 # one place it deliberately departs from the base recipe, and it is the exact
 # mechanism under test.
 #
-# NEVER set SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1 or GRAPH_MODE=capturable: both are
+# NEVER set FLLIPER_MOE_OFFLOAD_CUDA_GRAPH=1 or GRAPH_MODE=capturable: both are
 # refused by name as the REFUTED path (measured 6.60x slower than eager).
 # export_base_env() unsets them defensively on every arm.
 #
@@ -77,7 +77,7 @@ assert_chat_template
 rammon_start "$ARM"
 
 export_base_env "$ARM"
-export SGLANG_MOE_HOST_SHARD_RATIO=1,1,1     # TICKET_462 §1
+export FLLIPER_MOE_HOST_SHARD_RATIO=1,1,1     # TICKET_462 §1
 
 BOOT_LOG="$RUN/boot_${ARM}.log"
 
@@ -98,26 +98,26 @@ BOOT_ARGS=(
 )
 
 if [ "$ROUTE_ON" = "1" ]; then
-    export SGLANG_MOE_OFFLOAD_GRAPH_MODE=breakable
+    export FLLIPER_MOE_OFFLOAD_GRAPH_MODE=breakable
     # Scratch sizing, TICKET_462 §1: the bound is
     #   min(max_captured_bs x top_k, E_local - R)
     # and it counts graph-PADDED rows, which carry real routed ids. top_k = 6;
     # E_local 114/71/71, R 56/30/30 at this geometry, so the cold set is
     # 58/41/41. At --cuda-graph-bs-decode 1, C = 6 -- which is exactly the
-    # SGLANG_MOE_SCRATCH_SLOTS=6 the base env already sets. Raising the
+    # FLLIPER_MOE_SCRATCH_SLOTS=6 the base env already sets. Raising the
     # captured bs raises C and therefore resident VRAM: a corridor decision,
     # not a free knob. Undersizing surfaces as a named BreakableScratchOverflow,
     # never as a wrong answer.
     BOOT_ARGS+=(--cuda-graph-bs-decode "${CAPTURED_BS:-1}")
 else
-    unset SGLANG_MOE_OFFLOAD_GRAPH_MODE || true
+    unset FLLIPER_MOE_OFFLOAD_GRAPH_MODE || true
 fi
 
 if [ "$PROBE_ON" = "1" ]; then
-    # #494 instrument. SGLANG_BREAK_COST_PATH is DELIBERATELY LEFT UNSET.
+    # #494 instrument. FLLIPER_BREAK_COST_PATH is DELIBERATELY LEFT UNSET.
     #
     # CONTRADICTION, resolved in favour of the code: both the briefing
-    # ('SGLANG_BREAK_COST_PATH="$RUN/break_cost"') and TICKET_462 §3
+    # ('FLLIPER_BREAK_COST_PATH="$RUN/break_cost"') and TICKET_462 §3
     # ('"$RUN/break_cost.jsonl" # becomes one file per rank') assume the path
     # is expanded per rank. It is NOT. break_cost_clock.py:513 reads
     #     path = os.environ.get(ENV_PATH) or f"/tmp/break_cost.{rank_tag}.jsonl"
@@ -129,26 +129,26 @@ if [ "$PROBE_ON" = "1" ]; then
     # Leaving it unset gives the documented per-rank default, which is the
     # shape everything downstream expects; the files are copied into $RUN
     # after the run so the artifact still survives with the window.
-    unset SGLANG_BREAK_COST_PATH || true
-    export SGLANG_BREAK_COST_PROBE=1
-    export SGLANG_BREAK_COST_DEFER_ROUNDS="${SGLANG_BREAK_COST_DEFER_ROUNDS:-2}"
-    export SGLANG_BREAK_COST_WARMUP_ROUNDS="${SGLANG_BREAK_COST_WARMUP_ROUNDS:-20}"
-    export SGLANG_BREAK_COST_DETAIL="${SGLANG_BREAK_COST_DETAIL:-1}"
+    unset FLLIPER_BREAK_COST_PATH || true
+    export FLLIPER_BREAK_COST_PROBE=1
+    export FLLIPER_BREAK_COST_DEFER_ROUNDS="${FLLIPER_BREAK_COST_DEFER_ROUNDS:-2}"
+    export FLLIPER_BREAK_COST_WARMUP_ROUNDS="${FLLIPER_BREAK_COST_WARMUP_ROUNDS:-20}"
+    export FLLIPER_BREAK_COST_DETAIL="${FLLIPER_BREAK_COST_DETAIL:-1}"
     # Stale records from an earlier run would silently pollute the table.
     rm -f /tmp/break_cost.rank*.jsonl
     # Second, independent count of the 43 crossings: DEBUG on exactly one
     # module. See logging_break_debug.json for why this is not --log-level debug.
-    export SGLANG_LOGGING_CONFIG_PATH="${SGLANG_LOGGING_CONFIG_PATH:-$HERE/logging_break_debug.json}"
+    export FLLIPER_LOGGING_CONFIG_PATH="${FLLIPER_LOGGING_CONFIG_PATH:-$HERE/logging_break_debug.json}"
     log "break-cost probe ARMED; per-rank files land in /tmp and are copied to $RUN"
 else
-    unset SGLANG_BREAK_COST_PROBE SGLANG_BREAK_COST_PATH SGLANG_LOGGING_CONFIG_PATH || true
+    unset FLLIPER_BREAK_COST_PROBE FLLIPER_BREAK_COST_PATH FLLIPER_LOGGING_CONFIG_PATH || true
     log "break-cost probe OFF (its per-round harvest cost, probe_sink_ms, must not sit inside a §5 A/B number)"
 fi
 
 assert_metrics_flag "${BOOT_ARGS[@]}"
 
 log "launching ${ARM}"
-setsid "$PY" -u -m sglang.launch_server "${BOOT_ARGS[@]}" \
+setsid "$PY" -u -m flliper.launch_server "${BOOT_ARGS[@]}" \
     > "$BOOT_LOG" 2>&1 < /dev/null &
 record_pids "$ARM" $!
 
@@ -169,7 +169,7 @@ SELFID="$RUN/selfid_${ARM}.txt"
     printf 'capture unsupported: %s\n' "$(count_log "$BOOT_LOG" 'cudaErrorStreamCaptureUnsupported')"
     printf 'capture invalidated: %s\n' "$(count_log "$BOOT_LOG" 'cudaErrorStreamCaptureInvalidated')"
     printf 'REFUTED mentions  : %s\n' "$(count_log "$BOOT_LOG" 'REFUTED')"
-    printf 'UNSAFE mentions   : %s\n' "$(count_log "$BOOT_LOG" 'SGLANG_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE')"
+    printf 'UNSAFE mentions   : %s\n' "$(count_log "$BOOT_LOG" 'FLLIPER_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE')"
     printf 'moe-staging-trace : %s\n' "$(count_log "$BOOT_LOG" '[moe-staging-trace]')"
     printf 'break-graph DEBUG : %s\n' "$(count_log "$BOOT_LOG" 'Break graph due to function: _moe_offload_fetch_step')"
     printf -- '--- resolved cuda_graph_config (the only post-cascade view) ---\n'
@@ -183,7 +183,7 @@ assert_log_absent "$BOOT_LOG" "cudaErrorStreamCaptureUnsupported" \
     "a capture error voids the arm"
 assert_log_absent "$BOOT_LOG" "cudaErrorStreamCaptureInvalidated" \
     "a capture error voids the arm"
-assert_log_absent "$BOOT_LOG" "SGLANG_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE" \
+assert_log_absent "$BOOT_LOG" "FLLIPER_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE" \
     "the REFUTED path must not be involved"
 assert_log_contains "$BOOT_LOG" "[moe-staging-trace]" \
     "expert offload is not ON, so there is nothing for this route to be about"
@@ -222,7 +222,7 @@ if [ "$PROBE_ON" = "1" ]; then
         || log "WARNING: no /tmp/break_cost.rank*.jsonl to copy -- the probe never armed, or no captured decode step ran"
     if ls "$RUN"/break_cost.rank*.jsonl >/dev/null 2>&1; then
         "$PY" "$WT/scripts/dev/494_break_cost/summarise.py" \
-            --drop-rounds "${SGLANG_BREAK_COST_WARMUP_ROUNDS:-20}" \
+            --drop-rounds "${FLLIPER_BREAK_COST_WARMUP_ROUNDS:-20}" \
             "$RUN"/break_cost.rank*.jsonl | tee "$RUN/F2_break_cost.txt"
 
         # Assert crossings/round == 43, and cross-check it against the
@@ -251,7 +251,7 @@ PYEOF
         printf 'INDEPENDENT DEBUG COUNT: %s occurrences of "Break graph due to function: _moe_offload_fetch_step"\n' \
             "${DEBUG_BREAKS:-0}" | tee -a "$RUN/F2_break_cost.txt"
         if [ "${DEBUG_BREAKS:-0}" -eq 0 ]; then
-            log "WARNING: the DEBUG cross-check counted 0 breaks. Either SGLANG_LOGGING_CONFIG_PATH did not take, or the break never fired. The summariser's count alone is ONE instrument, not two -- say so in the report."
+            log "WARNING: the DEBUG cross-check counted 0 breaks. Either FLLIPER_LOGGING_CONFIG_PATH did not take, or the break never fired. The summariser's count alone is ONE instrument, not two -- say so in the report."
         fi
     else
         log "WARNING: no break-cost records at all. F2 has no left-hand side; §4 and §5 must not be run on this arm."

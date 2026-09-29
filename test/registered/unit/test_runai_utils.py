@@ -1,9 +1,9 @@
 import unittest
 from pathlib import Path
 
-from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")

@@ -4,9 +4,9 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.jit_kernel.utils import get_ci_test_range
+from flliper.srt.utils import is_hip
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=240, suite="nightly-kernel-1-gpu", nightly=True)
@@ -18,14 +18,14 @@ DEVICE = "cuda"
 DTYPES = [torch.float16, torch.bfloat16]
 
 
-def sglang_jit_rmsnorm(
+def flliper_jit_rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
     *,
     output: torch.Tensor | None = None,
     eps: float = EPS,
 ) -> None:
-    from sglang.jit_kernel.norm import rmsnorm
+    from flliper.jit_kernel.norm import rmsnorm
 
     rmsnorm(input, weight, out=output, eps=eps)
 
@@ -115,18 +115,18 @@ def test_rmsnorm(
     reference_rmsnorm(input_ref, weight, output=output_ref)
 
     if specify_out:
-        output_sglang = torch.empty_like(input)
-        sglang_jit_rmsnorm(input, weight, output=output_sglang)
+        output_flliper = torch.empty_like(input)
+        flliper_jit_rmsnorm(input, weight, output=output_flliper)
     else:
-        output_sglang = input.clone()
-        sglang_jit_rmsnorm(output_sglang, weight, output=output_sglang)
+        output_flliper = input.clone()
+        flliper_jit_rmsnorm(output_flliper, weight, output=output_flliper)
 
-    torch.testing.assert_close(output_sglang, output_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(output_flliper, output_ref, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 8192, 8704, 16384])
 def test_rmsnorm_hidden_size_support(hidden_size: int) -> None:
-    from sglang.jit_kernel.norm import _is_supported_rmsnorm_hidden_size
+    from flliper.jit_kernel.norm import _is_supported_rmsnorm_hidden_size
 
     assert _is_supported_rmsnorm_hidden_size(hidden_size)
 
@@ -147,7 +147,7 @@ def test_rmsnorm_hidden_size_support(hidden_size: int) -> None:
     ],
 )
 def test_rmsnorm_kernel_dispatch(hidden_size: int, expected: str) -> None:
-    from sglang.jit_kernel.norm import _rmsnorm_kernel_class
+    from flliper.jit_kernel.norm import _rmsnorm_kernel_class
 
     assert _rmsnorm_kernel_class(hidden_size) == expected
 

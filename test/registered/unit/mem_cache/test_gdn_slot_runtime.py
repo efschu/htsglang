@@ -15,7 +15,7 @@ state read as this one's.
 No CUDA, no server: the driver is fed hand-built request stand-ins.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -24,8 +24,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.gdn_slot_runtime import GdnSlotRuntime
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.gdn_slot_runtime import GdnSlotRuntime
+from flliper.test.test_utils import CustomTestCase
 
 NUM_LAYERS = 2
 
@@ -69,7 +69,7 @@ def _batch(reqs):
 
 class Harness:
     def __init__(self, slots=2):
-        from sglang.srt.mem_cache.memory_pool import MambaPool
+        from flliper.srt.mem_cache.memory_pool import MambaPool
 
         g = torch.Generator().manual_seed(11)
         conv = [torch.randn(NUM_LAYERS, slots + 1, 3, 4, generator=g)]
@@ -199,7 +199,7 @@ class TestRebind(CustomTestCase):
 
 class TestBuilder(CustomTestCase):
     def test_a_model_without_a_state_pool_is_a_named_no_op(self):
-        from sglang.srt.managers.gdn_slot_runtime import build_gdn_slot_executor
+        from flliper.srt.managers.gdn_slot_runtime import build_gdn_slot_executor
 
         scheduler = SimpleNamespace(
             req_to_token_pool=SimpleNamespace(mamba_pool=None, mamba_allocator=None)
@@ -239,7 +239,7 @@ class TestParkedSessionsAreVisibleToTheLadder(CustomTestCase):
     """
 
     def _manager(self, spilled, parked):
-        from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+        from flliper.srt.managers.kv_session_offload import KVSessionOffloadManager
 
         mgr = KVSessionOffloadManager.__new__(KVSessionOffloadManager)
         mgr.spills = {
@@ -267,7 +267,7 @@ class TestParkedSessionsAreVisibleToTheLadder(CustomTestCase):
         self.assertEqual([r.rid for r in mgr.live_offload_reqs()], ["s"])
 
     def test_the_builder_sees_a_parked_session(self):
-        from sglang.srt.managers.gdn_slot_runtime import build_gdn_slot_executor
+        from flliper.srt.managers.gdn_slot_runtime import build_gdn_slot_executor
 
         h = Harness(slots=2)
         spilled = _req("s", arrival=1, req_pool_idx=0)
@@ -289,7 +289,7 @@ class TestParkedSessionsAreVisibleToTheLadder(CustomTestCase):
         )
 
     def test_no_offload_manager_is_still_an_empty_inventory(self):
-        from sglang.srt.managers.gdn_slot_runtime import build_gdn_slot_executor
+        from flliper.srt.managers.gdn_slot_runtime import build_gdn_slot_executor
 
         h = Harness(slots=2)
         scheduler = SimpleNamespace(

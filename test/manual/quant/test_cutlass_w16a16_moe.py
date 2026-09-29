@@ -3,9 +3,9 @@ import pytest
 import torch
 from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.layers.activation import SiluAndMul
+from flliper.srt.layers.moe.topk import TopKConfig, select_experts
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 MNK_FACTORS = [
     (2, 1024, 1024),

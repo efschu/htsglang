@@ -5,7 +5,7 @@ WHY THIS EXISTS ON TOP OF latch_clear_reachability.py
 -----------------------------------------------------
 The stage-A/B rule (/spinning/gpu-arb/devtools/latch_clear_reachability.py,
 2026-09-04) is sound but wide: on this tree it reports 307 candidates over
-python/sglang/srt.  A 307-line list is a triage list, not a finding list, and
+python/flliper/srt.  A 307-line list is a triage list, not a finding list, and
 SWEEP_UNREACHABLE_CLEAR_0828 had to hand-judge its way down from 107 raw sites
 to 22 verdicts for exactly this reason.
 
@@ -48,7 +48,7 @@ USAGE
                                 [--fail-on BEHAVIOURAL]
 
     # the finding list this sweep was built from
-    classC_latch_rule.py python/sglang/srt/managers
+    classC_latch_rule.py python/flliper/srt/managers
 
 Exit 0 unless --fail-on is given; then exit 1 if any candidate reaches that
 class.  That is the ratchet form: a new work-gating latch with no unconditional
@@ -255,7 +255,7 @@ def rank(root: str, only_attr: str | None, include_log_only: bool):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("path", nargs="?", default="python/sglang/srt/managers")
+    ap.add_argument("path", nargs="?", default="python/flliper/srt/managers")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--attr", default=None)
     ap.add_argument("--include-log-only", action="store_true")

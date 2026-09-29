@@ -18,11 +18,11 @@ required anywhere: NVML is a fake object and the CUDA bridge is injected.
 import unittest
 from unittest import mock
 
-from sglang.srt.planner import device_map
-from sglang.srt.registry import nvml as registry_nvml
-from sglang.srt.registry.nvml import DeviceOrderUnresolvedError
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import device_map
+from flliper.srt.registry import nvml as registry_nvml
+from flliper.srt.registry.nvml import DeviceOrderUnresolvedError
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

@@ -9,14 +9,14 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.model_loader.loader import get_model_loader
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.configs.device_config import DeviceConfig
+from flliper.srt.configs.load_config import LoadConfig
+from flliper.srt.configs.model_config import ModelConfig
+from flliper.srt.model_loader.loader import get_model_loader
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,

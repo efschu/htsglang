@@ -50,14 +50,14 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.hicache_collective import (
+from flliper.srt.mem_cache.hicache_collective import (
     DEFAULT_PG_TIMEOUT_S,
     HiCacheCollectiveError,
     HiCacheCollectiveTimeoutError,
     assert_bound_is_discriminable,
     bounded_wait,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=40)
 
@@ -282,7 +282,7 @@ class TheGuard(unittest.TestCase):
             msg = str(caught.exception)
             self.assertIn("7200", msg)
             self.assertIn(f"{bad:g}", msg)
-            self.assertIn("SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S", msg)
+            self.assertIn("FLLIPER_HICACHE_COLLECTIVE_TIMEOUT_S", msg)
 
     def test_the_documented_fallback_is_the_group_default(self):
         """An unreadable group must not silently disable the guard."""

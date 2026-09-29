@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from sglang.test.ci.ci_register import register_amd_ci
+from flliper.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=120, stage="sgl-kernel-unit", runner_config="2-gpu-amd")
 

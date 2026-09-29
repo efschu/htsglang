@@ -51,25 +51,25 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.managers import wedge_status
-from sglang.srt.managers.corridor_admission import (
+from flliper.srt.managers import wedge_status
+from flliper.srt.managers.corridor_admission import (
     REASON_HEADROOM_SUFFICIENT,
     REASON_NO_GUARD,
     PrefillAdmissionGate,
 )
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.invariant_checker import (
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.managers.scheduler_components.invariant_checker import (
     AdmissionWedgeRecovery,
     _rank_label,
     make_admission_wedge_poller,
 )
-from sglang.srt.managers.wedge_recovery import (
+from flliper.srt.managers.wedge_recovery import (
     STATE_INERT,
     STATE_NOT_APPLICABLE,
     get_recovery_channel,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

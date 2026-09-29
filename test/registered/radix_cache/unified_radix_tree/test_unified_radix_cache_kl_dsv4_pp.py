@@ -2,7 +2,7 @@ import unittest
 
 import test_unified_radix_cache_kl_dsv4 as dsv4_kl
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=900, stage="extra-b", runner_config="8-gpu-h200")
 

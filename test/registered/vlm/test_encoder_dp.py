@@ -3,9 +3,9 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.mmmu_vlm_kit import MMMUMultiModelTestBase
-from sglang.test.test_utils import is_in_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kits.mmmu_vlm_kit import MMMUMultiModelTestBase
+from flliper.test.test_utils import is_in_ci
 
 register_cuda_ci(est_time=500, suite="nightly-4-gpu", nightly=True)
 register_amd_ci(est_time=500, suite="nightly-amd-4-gpu", nightly=True)

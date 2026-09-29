@@ -49,7 +49,7 @@ no CUDA, no boot.
 
 import unittest
 
-from sglang.srt.managers.kv_backing_relief import (
+from flliper.srt.managers.kv_backing_relief import (
     KvBackingRelief,
     lawful_reservation_rows,
 )

@@ -17,7 +17,7 @@ ALL gates evaluated together. A state vetoed everywhere is a latent deadlock.
 
 import pytest
 
-from sglang.srt.managers.servability_matrix import (
+from flliper.srt.managers.servability_matrix import (
     PP,
     REQUEST_STATES,
     TP,

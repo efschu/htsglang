@@ -14,7 +14,7 @@ Two properties are pinned here because both fail silently in production:
 import unittest
 from fractions import Fraction
 
-from sglang.srt.video_enhance.mux import (
+from flliper.srt.video_enhance.mux import (
     FRAGMENTED_MP4_FLAGS,
     MOV_TEXT_EMPTY_SAMPLE,
     AlignmentReport,
@@ -28,8 +28,8 @@ from sglang.srt.video_enhance.mux import (
     retimed_rate,
     strip_empty_mov_text,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

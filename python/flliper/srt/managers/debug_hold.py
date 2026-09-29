@@ -1,0 +1,753 @@
+"""#1223 HOLD AT THE WALL -- inspect a dying rank instead of re-booting it.
+
+THE DEFECT THIS CLOSES. At a wall whose traceback does not show the root --
+the canonical shape is a group STOP on a MIN-reduced slot, where the rank that
+voted 0 and the reason it voted 0 live only in that rank's state seconds
+earlier -- today the rank raises, prints the traceback, and exits. The cards go
+free, the state is gone, and the only way to learn one more fact is another
+boot with one more log line. That loop costs a boot per fact.
+
+In hold mode the same boot, with one env flag, does three things at the fatal
+exception instead of exiting:
+
+  1. dumps the locals of every frame of the exception's traceback AND the
+     current stack of every other Python thread to a file,
+  2. opens a localhost-only TCP port with a stdlib ``pdb`` behind it, so the
+     operator gets the normal console (``p`` / ``pp`` / ``w`` / ``up`` /
+     ``down`` / ``l``) on every rank independently, and
+  3. WAITS -- bounded -- instead of unwinding into the SIGQUIT that ends the
+     group.
+
+WHAT THIS IS NOT. It does not single-step the scheduler, it is not cuda-gdb,
+and ``c`` does not resume serving: by the time this runs the exception has
+already unwound the event loop, so continuing returns into ``run_scheduler_
+process``'s except block, not into the loop. ``c`` and ``q`` are therefore
+both "release the hold"; the distinction is only recorded in the release line.
+
+DEFAULT OFF, AND OFF MEANS OFF. ``maybe_hold`` reads exactly one environment
+variable and returns on the very first statement when it is unset -- no
+socket, no file, no import of anything below, no log line. The off-path is
+pinned by test, not by inspection.
+
+THE HOLD IS BOUNDED BY CONSTRUCTION. ``FLLIPER_DEBUG_HOLD_S`` (default 1800)
+is a deadline, not a hint: when it passes, ``maybe_hold`` returns and the rank
+continues down exactly the path it would have taken without the flag -- the
+census emitters, the allocation dump, the SIGQUIT to the parent. A forgotten
+hold ends by itself; it can never turn a debug boot into a permanently wedged
+rig.
+
+WHAT A HELD RANK BREAKS -- read before using it on a boot that measures
+anything. A held rank answers no collective, feeds no watchdog and serves no
+request. Every timing figure in a hold-mode boot is meaningless, and the
+scheduler watchdog (``--watchdog-timeout``, default 300 s) will SIGQUIT the
+PARENT and take the group down while a rank is held unless it is raised past
+the hold. ``DEBUG_HOLD=1`` in the launcher does that lifting and prints the
+list; see ``devtools/DEBUG-HOLD-1223.md``.
+"""
+
+from __future__ import annotations
+
+import os
+
+# ---------------------------------------------------------------------------
+# Env contract. Names are read HERE and nowhere else so the launcher and the
+# docs have exactly one place to agree with.
+# ---------------------------------------------------------------------------
+HOLD_ENV = "FLLIPER_DEBUG_HOLD"
+HOLD_S_ENV = "FLLIPER_DEBUG_HOLD_S"
+HOLD_PORT_BASE_ENV = "FLLIPER_DEBUG_HOLD_PORT_BASE"
+HOLD_INJECT_ENV = "FLLIPER_DEBUG_HOLD_INJECT"
+HOLD_INJECT_RANK_ENV = "FLLIPER_DEBUG_HOLD_INJECT_RANK"
+HOLD_INJECT_DIR_ENV = "FLLIPER_DEBUG_HOLD_INJECT_DIR"
+HOLD_INJECT_NTH_ENV = "FLLIPER_DEBUG_HOLD_INJECT_NTH"
+HOLD_INJECT_MIN_FILL_ENV = "FLLIPER_DEBUG_HOLD_INJECT_MIN_FILL"
+HOLD_DIR_ENV = "FLLIPER_DEBUG_HOLD_DIR"
+TAG_ENV = "FLLIPER_DEBUG_HOLD_TAG"
+
+DEFAULT_HOLD_S = 1800.0
+DEFAULT_PORT_BASE = 5000
+DEFAULT_DUMP_DIR = "/spinning/gpu-arb/debug_hold"
+
+#: Per-value repr cap in the dump. A frame local can be a 200k-entry list or a
+#: whole batch object; an uncapped repr turns the dump into the thing nobody
+#: reads. The cap is per VALUE, so a frame with fifty locals still shows all
+#: fifty names -- names are the half you cannot reconstruct later.
+MAX_VALUE_CHARS = 2000
+#: Elements of a small tensor printed inline. A tensor is summarised as
+#: shape/dtype/device ALWAYS; the values are a courtesy for scalars and tiny
+#: vectors (the MIN-reduced slot vote is exactly this shape) and are never
+#: printed for anything larger.
+MAX_TENSOR_ELEMS = 8
+
+MARKER = "#1223 DEBUG-HOLD"
+INJECT_MESSAGE = "#1223 INJECTED WALL"
+
+
+def hold_enabled() -> bool:
+    """The one gate. Everything else in this module is downstream of it."""
+    return os.environ.get(HOLD_ENV) == "1"
+
+
+def _hold_seconds() -> float:
+    raw = os.environ.get(HOLD_S_ENV)
+    if not raw:
+        return DEFAULT_HOLD_S
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_HOLD_S
+
+
+def _port_base() -> int:
+    raw = os.environ.get(HOLD_PORT_BASE_ENV)
+    if not raw:
+        return DEFAULT_PORT_BASE
+    try:
+        return int(raw)
+    except ValueError:
+        return DEFAULT_PORT_BASE
+
+
+def resolve_rank_and_source(scheduler, fallback_pp=None, fallback_tp=None):
+    """(rank, source) -- PROCESS IDENTITY, not the active phase's topology.
+
+    MEASURED DEFECT, weg1holdg1 run 1 (2026-09-06). The first version read
+    ``scheduler.ps.pp_rank`` first. All three ranks resolved to 0, all three
+    went for port 5000, two lost the bind and did not hold, and their normal
+    death path took the one rank that WAS holding down with it.
+
+    THE CAUSE IS NOT IN THIS FILE, and that is why it has to be written down
+    here. ``scheduler.ps`` IS PHASE STATE, NOT PROCESS IDENTITY: on a flip
+    boot the cutover rebinds it at
+    ``phase_flip_runtime.py:3329`` (step 3, "Scheduler topology snapshot")::
+
+        scheduler.ps = _dc.replace(boot_ps, tp_rank=world_rank, tp_size=n,
+                                   pp_rank=0, pp_size=1, ...)
+
+    ``pp_rank=0`` is hardcoded there, on EVERY rank, because in the TP phase
+    there is no PP axis. Run 1's wall (``ReqPoolRebindRefused``) was raised
+    later inside that same ``_cutover``, so by then ``ps.pp_rank`` was 0 on
+    all three ranks -- a correct read of the wrong authority. Run 2's wall
+    (a #924 pool-leak check) was NOT inside a cutover, ``ps`` was still
+    ``boot_ps``, and the identical code resolved 0/1/2 correctly. That is the
+    whole difference between the two runs.
+
+    COROLLARY, recorded so it is not re-learned: the boot driver's local patch
+    (order ``ps.pp_rank`` -> caller pp -> ``ps.tp_rank`` -> caller tp) does NOT
+    fix this. ``ps.pp_rank`` still answers 0 first at a cutover wall, so that
+    order collapses exactly as run 1 did; it passed run 2 only because run 2's
+    wall was outside a cutover.
+
+    THE AUTHORITY IS THE CALLER'S PARAMETER. ``run_scheduler_process``'s own
+    ``pp_rank``/``tp_rank`` arguments are bound once at process start and are
+    never reassigned (verified over the whole function body), so they are
+    phase-independent by construction -- which is exactly what a port number
+    and a dump filename need. ``ps`` is consulted only when the caller could
+    not supply one, which is no longer possible from the scheduler hook but
+    remains true for any other caller.
+
+    (ba2e88fe -- "read tp_rank from Scheduler.ps, not the flat attribute" --
+    is still correct about ``scheduler.pp_rank`` not existing. It was measured
+    on a TP boot, where ``ps`` is not rebound. It is not an identity rule for
+    a flip boot, and citing it as one was the error.)
+    """
+    ps = getattr(scheduler, "ps", None)
+    candidates = (
+        ("caller.pp_rank", fallback_pp),
+        ("caller.tp_rank", fallback_tp),
+        ("ps.pp_rank", getattr(ps, "pp_rank", None)),
+        ("ps.tp_rank", getattr(ps, "tp_rank", None)),
+    )
+    for source, value in candidates:
+        # bool is an int subclass and would silently pass as rank 0/1.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value, source
+    return 0, "default"
+
+
+def resolve_rank(scheduler, fallback_pp=None, fallback_tp=None) -> int:
+    return resolve_rank_and_source(scheduler, fallback_pp, fallback_tp)[0]
+
+
+def _summarise(value) -> str:
+    """One line for one local, with tensors summarised and never dumped.
+
+    A full tensor repr is both useless (thousands of numbers) and dangerous
+    (a CUDA tensor's repr copies it to host, which can itself fail on the rank
+    that just died of OOM). Shape/dtype/device is the part that answers
+    questions; the values are added only when there are few enough to read.
+    """
+    try:
+        if _is_tensor(value):
+            head = (
+                f"<tensor shape={tuple(value.shape)} dtype={value.dtype} "
+                f"device={value.device}"
+            )
+            try:
+                if value.numel() <= MAX_TENSOR_ELEMS:
+                    head += f" values={value.detach().cpu().tolist()}"
+            except Exception as exc:  # noqa: BLE001 - a dump may not raise
+                head += f" values=<unreadable: {type(exc).__name__}>"
+            return head + ">"
+        text = repr(value)
+    except Exception as exc:  # noqa: BLE001 - a __repr__ may itself be broken
+        return f"<repr failed: {type(exc).__name__}: {exc}>"
+    if len(text) > MAX_VALUE_CHARS:
+        return text[:MAX_VALUE_CHARS] + f"... <truncated, {len(text)} chars>"
+    return text
+
+
+def _is_tensor(value) -> bool:
+    """Duck-typed on purpose: importing torch here would be an import in a
+    crash handler, and this module must work in a hermetic test with no torch."""
+    return (
+        hasattr(value, "shape")
+        and hasattr(value, "dtype")
+        and hasattr(value, "device")
+        and hasattr(value, "numel")
+    )
+
+
+def _frame_locals_block(frame, out) -> None:
+    for name, value in sorted(frame.f_locals.items()):
+        out.append(f"      {name} = {_summarise(value)}")
+
+
+def write_dump(exc: BaseException, rank: int, path: str) -> str:
+    """Traceback + every frame's locals + every other thread's stack, to a file.
+
+    The other threads are in here because the interesting ones are not on the
+    raising stack: the watchdog thread, the HiCache write-back thread and the
+    transfer threads all hold state that explains a group STOP, and none of
+    them appears in ``exc.__traceback__``.
+    """
+    import datetime
+    import sys
+    import threading
+    import traceback
+
+    out = []
+    out.append(f"{MARKER} rank={rank}")
+    out.append(f"utc: {datetime.datetime.now(datetime.timezone.utc).isoformat()}")
+    out.append(f"pid: {os.getpid()}")
+    out.append(f"exception: {type(exc).__name__}: {exc}")
+    out.append("")
+    out.append("=== TRACEBACK ===")
+    out.extend(
+        "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        ).splitlines()
+    )
+    out.append("")
+    out.append("=== FRAMES OF THE RAISING STACK (locals) ===")
+    tb = exc.__traceback__
+    depth = 0
+    while tb is not None:
+        frame = tb.tb_frame
+        code = frame.f_code
+        out.append(f"  [{depth}] {code.co_name} at {code.co_filename}:{tb.tb_lineno}")
+        _frame_locals_block(frame, out)
+        tb = tb.tb_next
+        depth += 1
+
+    out.append("")
+    out.append("=== OTHER PYTHON THREADS (current stacks) ===")
+    try:
+        names = {t.ident: t.name for t in threading.enumerate()}
+        this_thread = threading.get_ident()
+        for ident, frame in sys._current_frames().items():
+            if ident == this_thread:
+                continue
+            out.append(f"  --- thread {names.get(ident, '?')} (id={ident}) ---")
+            for entry in traceback.format_stack(frame):
+                out.extend("    " + ln for ln in entry.rstrip().splitlines())
+            out.append("    locals of innermost frame:")
+            _frame_locals_block(frame, out)
+    except Exception as exc2:  # noqa: BLE001 - a dump may not raise
+        out.append(f"  <thread walk failed: {type(exc2).__name__}: {exc2}>")
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write("\n".join(out) + "\n")
+    return path
+
+
+def dump_path_for(rank: int, port=None) -> str:
+    """A name that cannot collide between two ranks of the same boot.
+
+    MEASURED (weg1holdg1 run 1): with only ``<TAG>_rank<N>_<UTC-seconds>`` two
+    ranks that resolved the same N in the same second produced the SAME path,
+    and PP2's dump silently overwrote PP1's -- the evidence from one of the
+    three ranks was destroyed by the tool that exists to preserve it. The pid
+    makes it unique per process even when the rank resolution is wrong again,
+    which is the case that matters: a naming scheme must not depend on the
+    correctness of the thing it is naming.
+    """
+    import datetime
+
+    tag = os.environ.get(TAG_ENV) or "hold"
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    directory = os.environ.get(HOLD_DIR_ENV) or DEFAULT_DUMP_DIR
+    port_part = f"port{port}" if port is not None else "portnone"
+    return os.path.join(
+        directory,
+        f"{tag}_rank{rank}_pid{os.getpid()}_{port_part}_{stamp}.txt",
+    )
+
+
+def _make_hold_pdb(conn_in, conn_out):
+    """A pdb whose EXIT REASON is recoverable by the caller.
+
+    MEASURED (weg1holdg1 run 1/2): the first version left the accept loop
+    whenever ``interaction`` returned, and it returns on ``q``, on ``c`` AND on
+    EOF alike. A scripted ``printf '...' | nc`` therefore released the rank the
+    instant the pipe closed, which is the normal way to script an attach; the
+    boot driver had to work around it with a FIFO-backed connection. A
+    disconnect is not a decision -- only an explicit ``q``/``quit`` is.
+    """
+    import pdb
+
+    class _HoldPdb(pdb.Pdb):
+        release_requested = False
+
+        def do_quit(self, arg):
+            self.release_requested = True
+            return super().do_quit(arg)
+
+        do_q = do_quit
+        do_exit = do_quit
+
+    debugger = _HoldPdb(stdin=conn_in, stdout=conn_out)
+    debugger.use_rawinput = False
+    debugger.prompt = "(hold-pdb) "
+    return debugger
+
+
+def _serve_pdb(sock, exc: BaseException) -> bool:
+    """One pdb console on one accepted connection. True iff ``q`` was typed.
+
+    ``pdb.Pdb(stdin=..., stdout=...)`` is the stdlib way to put a console on a
+    file-like object; this venv is Python 3.12, which has no ``pdb -p``
+    attach mode, and adding a pip dependency for a debug path is not on the
+    table. ``interaction(None, tb)`` is post-mortem: the console starts at the
+    frame that raised, so ``w`` / ``up`` / ``down`` walk the real stack rather
+    than this helper's.
+    """
+    conn_in = sock.makefile("r")
+    conn_out = sock.makefile("w")
+    try:
+        debugger = _make_hold_pdb(conn_in, conn_out)
+        conn_out.write(
+            f"{MARKER}: post-mortem console on {type(exc).__name__}: {exc}\n"
+            "  w / up / down / l / p <expr> / pp <expr>\n"
+            "  ONLY q (or quit) releases this rank; disconnecting keeps it held.\n"
+        )
+        conn_out.flush()
+        debugger.reset()
+        debugger.interaction(None, exc.__traceback__)
+        return bool(debugger.release_requested)
+    finally:
+        for handle in (conn_in, conn_out):
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001 - teardown may not raise
+                pass
+
+
+def maybe_hold(exc: BaseException, scheduler=None, pp_rank=None, tp_rank=None) -> bool:
+    """Hold this rank at the wall. Returns True if a hold actually ran.
+
+    OFF-PATH CONTRACT: when ``FLLIPER_DEBUG_HOLD`` is not exactly "1" this
+    returns False on the first statement, having imported nothing, opened
+    nothing and logged nothing. That is the property the off-path test pins.
+    """
+    if not hold_enabled():
+        return False
+    return _hold(exc, scheduler, pp_rank, tp_rank)
+
+
+def _hold(exc: BaseException, scheduler, pp_rank, tp_rank) -> bool:
+    """The whole hold, behind the gate. Never raises: a debug aid that can
+    replace the exception it is diagnosing is worse than no debug aid."""
+    import logging
+    import socket
+    import time
+
+    logger = logging.getLogger(__name__)
+    rank, rank_source = resolve_rank_and_source(scheduler, pp_rank, tp_rank)
+    hold_s = _hold_seconds()
+    wanted_port = _port_base() + rank
+
+    # BIND FIRST, DUMP SECOND -- the dump filename carries the real port, and
+    # the real port is only known after the bind (it may be ephemeral).
+    #
+    # A BIND FAILURE MUST NEVER COST THE HOLD (measured, weg1holdg1 run 1): two
+    # ranks lost the race for port 5000, returned False, and fell through to
+    # the normal death path -- whose SIGQUIT to the parent then tore down the
+    # third rank, which was holding correctly 67 s in. The operator lost all
+    # three. A port collision is a naming problem; it is not a reason to
+    # destroy the state the operator came for. So: fall back to an ephemeral
+    # port and hold anyway, and say loudly which port that turned out to be.
+    listener = None
+    port = None
+    for attempt_port in (wanted_port, 0):
+        try:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # 127.0.0.1 ONLY. This is an unauthenticated Python console on a
+            # process holding the model; it must never be reachable off-box.
+            listener.bind(("127.0.0.1", attempt_port))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            if attempt_port == 0:
+                logger.error(
+                    "%s rank=%d could not bind its assigned port %d -- HOLDING "
+                    "ANYWAY on EPHEMERAL port %d. Attach there: nc 127.0.0.1 %d",
+                    MARKER,
+                    rank,
+                    wanted_port,
+                    port,
+                    port,
+                )
+            break
+        except Exception as bind_exc:  # noqa: BLE001
+            if listener is not None:
+                try:
+                    listener.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                listener = None
+            logger.warning(
+                "%s rank=%d bind on port %d failed (%s: %s)",
+                MARKER,
+                rank,
+                attempt_port,
+                type(bind_exc).__name__,
+                bind_exc,
+            )
+
+    try:
+        path = write_dump(exc, rank, dump_path_for(rank, port))
+    except Exception as dump_exc:  # noqa: BLE001 - the hold matters more
+        path = f"<dump failed: {type(dump_exc).__name__}: {dump_exc}>"
+
+    if listener is None:
+        # Even with no port at all the dump is written and we still WAIT, so
+        # the peers that did get a port are not torn down by this rank racing
+        # ahead into the death path.
+        logger.error(
+            "%s rank=%d holding on %s: %s — NO PORT (both the assigned port %d "
+            "and an ephemeral port failed to bind); dump: %s ; hold ends in %.0f s",
+            MARKER,
+            rank,
+            type(exc).__name__,
+            str(exc)[:120],
+            wanted_port,
+            path,
+            hold_s,
+        )
+        time.sleep(hold_s)
+        logger.error("%s rank=%d released: timeout (never had a port)", MARKER, rank)
+        return True
+
+    message = str(exc)[:120]
+    logger.error(
+        "%s rank=%d holding on %s: %s — attach: nc 127.0.0.1 %d ; dump: %s ; "
+        "hold ends in %.0f s (rank source: %s; pid %d)",
+        MARKER,
+        rank,
+        type(exc).__name__,
+        message,
+        port,
+        path,
+        hold_s,
+        rank_source,
+        os.getpid(),
+    )
+
+    deadline = time.monotonic() + hold_s
+    outcome = "timeout"
+    attached = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # A bounded accept, not a blocking one: the deadline must be able
+            # to end the hold even when nobody ever attaches. This is the
+            # clock that makes a forgotten hold self-limiting.
+            listener.settimeout(min(remaining, 5.0))
+            try:
+                conn, _addr = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            attached = True
+            try:
+                # ONLY an explicit q/quit ends the hold. A closed pipe is not a
+                # decision: `printf 'w\np x\n' | nc` is the normal way to script
+                # an attach, and treating its EOF as "released" ended the hold
+                # after one scripted block (measured, weg1holdg1). We loop back
+                # to accept() instead, so the operator can attach again.
+                if _serve_pdb(conn, exc):
+                    outcome = "quit"
+                    break
+                logger.warning(
+                    "%s rank=%d session ended without q -- STILL HOLDING, "
+                    "attach again on port %d",
+                    MARKER,
+                    rank,
+                    port,
+                )
+            except Exception as session_exc:  # noqa: BLE001
+                logger.warning(
+                    "%s rank=%d pdb session ended abnormally (%s: %s) -- still holding",
+                    MARKER,
+                    rank,
+                    type(session_exc).__name__,
+                    session_exc,
+                )
+            finally:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+    finally:
+        try:
+            listener.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if outcome == "timeout" and attached:
+        outcome = "attached"
+    logger.error("%s rank=%d released: %s", MARKER, rank, outcome)
+    return True
+
+
+#: The inject sites this build knows. Named here so a typo in the env is a
+#: loud refusal at the first site reached rather than a boot that quietly
+#: never holds -- an absent wall and a misspelled marker look identical
+#: otherwise, and that is a whole wasted window.
+KNOWN_INJECT_MARKERS = ("cutover", "last_chunk", "last_chunk_done", "abandon")
+
+#: How many times each marker has passed every filter. Module state, because
+#: the nth-filter has to count firings across event-loop rounds.
+_INJECT_FIRINGS = {}
+
+
+def _int_env(name):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+#: The largest fill seen so far by any chunk site this process reached. The
+#: payload gate for a site that cannot see a request (``abandon``) reads this
+#: LATCH, which is what "the precondition must already hold" means.
+_MAX_FILL_SEEN = [0]
+
+
+def inject_rank_filter():
+    """Which ranks the inject is for (a set), or None for every rank.
+
+    A LIST, not a scalar: the third boot's plan holds BOTH followers and never
+    PP0 -- a held PP0 stalls the ring and manufactures exactly the teardown
+    that ended run 2. `FLLIPER_DEBUG_HOLD_INJECT_RANK=1,2`.
+    """
+    raw = os.environ.get(HOLD_INJECT_RANK_ENV)
+    if raw is None or raw == "":
+        return None
+    ranks = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ranks.add(int(part))
+        except ValueError:
+            continue
+    return ranks or None
+
+
+def inject_min_fill():
+    """Minimum request size (tokens) the inject requires, or None."""
+    return _int_env(HOLD_INJECT_MIN_FILL_ENV)
+
+
+def max_fill_tokens(reqs):
+    """Largest ``full_untruncated_fill_ids`` length among these requests.
+
+    Same field the #788 admission line prints as ``fill_lens``, so the gate is
+    expressed in the units the operator reads in the log.
+    """
+    best = 0
+    for req in reqs or ():
+        try:
+            n = len(getattr(req, "full_untruncated_fill_ids", ()) or ())
+        except Exception:  # noqa: BLE001 - a filter may not raise
+            n = 0
+        if n > best:
+            best = n
+    return best
+
+
+def note_fill(n):
+    """Record the largest payload this process has seen (the gate's latch)."""
+    try:
+        if int(n) > _MAX_FILL_SEEN[0]:
+            _MAX_FILL_SEEN[0] = int(n)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def inject_direction_filter():
+    """Which flip direction the inject is for, or None for either.
+
+    MEASURED (boot A2, weg1holdg1i2b): `abandon` fires on the FIRST abandon the
+    rank reaches, and that was a `tp_to_pp` one -- while the #1225 orphan
+    sequence lives on the `pp_to_tp` leg. The hold was perfectly good and
+    inspected the wrong leg, which costs a whole window. A flip site has two
+    directions and they are different events; the filter says which.
+    """
+    raw = os.environ.get(HOLD_INJECT_DIR_ENV)
+    return raw or None
+
+
+def boot_world_rank():
+    """This process's rank from the WORLD group -- a BOOT CONSTANT.
+
+    THE ONLY IDENTITY THAT SURVIVES A CUTOVER. `_WORLD` is set once at
+    `init_world_group` and never rebound, so `rank_in_group` is fixed for the
+    life of the process. `scheduler.ps` is NOT: the cutover replaces it with
+    `pp_rank=0` on every rank (`phase_flip_runtime.py:3329`), which is exactly
+    how run 1 collapsed three ranks onto one port -- and Block E of boot A2
+    then measured `scheduler.ps.pp_rank == 0` on all three ranks at the abandon
+    wall, confirming it on metal.
+
+    Used for the inject RANK FILTER so no site has to have a boot-constant
+    rank in scope to be filterable. Returns None if the group is not up yet,
+    in which case the filter cannot select and the caller keeps its own value.
+    """
+    try:
+        from flliper.srt.distributed import parallel_state as _ps
+
+        return int(_ps.get_world_group().rank_in_group)
+    except Exception:  # noqa: BLE001 - a filter may not raise
+        return None
+
+
+def _inject_rank(pp_rank, tp_rank):
+    """The rank the FILTER compares against. NEVER ps-derived.
+
+    Explicit boot constants from the call site win (the cutover's `world_rank`,
+    `PhaseFlipRuntime._rank`); otherwise the world group answers. `scheduler.ps`
+    is deliberately not consulted at all here -- a filter that reads it selects
+    rank 0 on every rank inside a cutover and silently never fires for the
+    follower that was asked for.
+    """
+    for value in (pp_rank, tp_rank):
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return boot_world_rank()
+
+
+def maybe_inject(
+    marker: str,
+    scheduler=None,
+    pp_rank=None,
+    tp_rank=None,
+    direction=None,
+    fill=None,
+) -> None:
+    """Raise the injected wall at a named phase point.
+
+    REFUSES WITHOUT THE HOLD FLAG. An inject env that fires on a boot with no
+    hold behind it is a boot-killer wearing a debug label: it would take the
+    group down and leave nothing to attach to. The refusal is loud, not
+    silent, so a mistyped launcher does not read as "the inject site was never
+    reached".
+
+    CALLERS MUST PLACE THIS OUTSIDE ANY `except Exception` THAT SWALLOWS.
+    Two of the sites sit next to instrument guards whose whole job is to never
+    let a diagnostic kill the scheduler; a `raise` inside one of those is eaten
+    and the wall silently never happens. See the #788 admission site.
+
+    THE FILTERS, in the order they are applied -- each one exists because a
+    hold without it landed on the wrong event and cost a window:
+      * marker   -- which site.
+      * direction -- which flip LEG (boot A2 held at a `tp_to_pp` abandon while
+        the sequence under investigation lives on `pp_to_tp`).
+      * rank     -- which process(es), from a BOOT CONSTANT, never from `ps`.
+      * min-fill -- how BIG the request must be. Both earlier holds caught the
+        95-token acceptance probe; the #1225 orphan needs the 13225-token
+        B-probe. A site with no request of its own (`abandon`) reads the latch
+        instead, which is what "the precondition must already hold" means.
+      * nth      -- skip the first n-1 firings, for a site that is reached many
+        times before the interesting one.
+    """
+    if fill is not None:
+        note_fill(fill)
+    wanted = os.environ.get(HOLD_INJECT_ENV)
+    if not wanted or wanted != marker:
+        return
+    if not hold_enabled():
+        import logging
+
+        logging.getLogger(__name__).error(
+            "%s REFUSED: %s=%s is set but %s is not 1. The inject exists only to "
+            "prove the hold; firing it without a hold would kill the group and "
+            "leave nothing to attach to. Not raising.",
+            MARKER,
+            HOLD_INJECT_ENV,
+            wanted,
+            HOLD_ENV,
+        )
+        return
+
+    want_dir = inject_direction_filter()
+    if want_dir is not None and direction is not None and direction != want_dir:
+        return
+
+    only = inject_rank_filter()
+    if only is not None:
+        rank = _inject_rank(pp_rank, tp_rank)
+        # An unresolvable rank must NOT fire: firing everywhere is how three
+        # ranks end up held when one was asked for -- and a held PP0 stalls the
+        # ring, which is how run 2 was torn down.
+        if rank is None or rank not in only:
+            return
+
+    min_fill = inject_min_fill()
+    if min_fill is not None:
+        # `fill` when the site sees a request; the latch when it does not.
+        seen = fill if fill is not None else _MAX_FILL_SEEN[0]
+        if seen < min_fill:
+            return
+
+    nth = _int_env(HOLD_INJECT_NTH_ENV)
+    if nth is not None and nth > 1:
+        seen = _INJECT_FIRINGS.get(marker, 0) + 1
+        _INJECT_FIRINGS[marker] = seen
+        if seen < nth:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "%s inject %s: firing %d of %d skipped (%s=%d)",
+                MARKER,
+                marker,
+                seen,
+                nth,
+                HOLD_INJECT_NTH_ENV,
+                nth,
+            )
+            return
+
+    detail = f"marker={marker}"
+    if direction is not None:
+        detail += f", direction={direction}"
+    raise RuntimeError(f"{INJECT_MESSAGE} ({detail})")

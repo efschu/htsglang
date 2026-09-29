@@ -1,4 +1,4 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd-mi35x")
@@ -8,7 +8,7 @@ import unittest
 import torch
 
 try:
-    from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    from flliper.srt.layers.attention.mamba.mamba_state_scatter_triton import (
         fused_mamba_state_scatter_with_mask,
     )
 

@@ -27,10 +27,10 @@ Hermetic: no CUDA, no scheduler boot.
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.srt.managers.schedule_policy import PrefillAdder
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.planner.chunked_admission import ChunkedCommitmentLedger
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.managers.schedule_policy import PrefillAdder
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.planner.chunked_admission import ChunkedCommitmentLedger
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
 def _bare_scheduler() -> Scheduler:

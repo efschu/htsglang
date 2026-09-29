@@ -3,9 +3,9 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8,
     DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8_REVISION,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

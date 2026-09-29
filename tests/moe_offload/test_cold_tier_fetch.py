@@ -42,10 +42,10 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe import cold_tier_fetch as ctf  # noqa: E402
-from sglang.srt.layers.moe import cold_tier_shm as cts  # noqa: E402
-from sglang.srt.layers.moe import expert_offload as eo  # noqa: E402
-from sglang.srt.layers.moe.cold_tier_fetch import (  # noqa: E402
+from flliper.srt.layers.moe import cold_tier_fetch as ctf  # noqa: E402
+from flliper.srt.layers.moe import cold_tier_shm as cts  # noqa: E402
+from flliper.srt.layers.moe import expert_offload as eo  # noqa: E402
+from flliper.srt.layers.moe.cold_tier_fetch import (  # noqa: E402
     COLD_TIER_INSTANCE_ENV,
     ColdTierAssignment,
     ColdTierOwner,
@@ -56,7 +56,7 @@ from sglang.srt.layers.moe.cold_tier_fetch import (  # noqa: E402
     instance_id,
     publish_cold_tier_instance,
 )
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     HOST_SHARD_SOURCE_EQUAL,
     HOST_SHARD_SOURCE_PROBE,
     ExpertResidencyPlanner,
@@ -78,11 +78,11 @@ WEAK_RANK = 1
 
 @pytest.fixture(autouse=True)
 def _tier(tmp_path, monkeypatch):
-    monkeypatch.setenv("SGLANG_MOE_COLD_TIER_SHM_DIR", str(tmp_path))
-    monkeypatch.setenv("SGLANG_MOE_COLD_TIER_SHM", "1")
+    monkeypatch.setenv("FLLIPER_MOE_COLD_TIER_SHM_DIR", str(tmp_path))
+    monkeypatch.setenv("FLLIPER_MOE_COLD_TIER_SHM", "1")
     monkeypatch.setenv(COLD_TIER_INSTANCE_ENV, INSTANCE)
-    monkeypatch.delenv("SGLANG_MOE_HOST_SHARD_RATIO", raising=False)
-    monkeypatch.delenv("SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE", raising=False)
+    monkeypatch.delenv("FLLIPER_MOE_HOST_SHARD_RATIO", raising=False)
+    monkeypatch.delenv("FLLIPER_MOE_HOST_SHARD_MIN_PROVENANCE", raising=False)
     # Verify the redirection instead of trusting it. This file creates real
     # segments with real mmaps; the ONE path on which that is not hermetic is
     # the module default, ``/dev/shm``, which on a shared box is a live
@@ -515,8 +515,8 @@ def test_the_wired_fetch_pin_can_fail(monkeypatch):
 def test_the_dump_row_says_how_a_delegated_expert_is_reached(monkeypatch):
     """A proportional arm and a proportional arm whose tier never attached must
     not look the same in the #390 dump."""
-    monkeypatch.setenv("SGLANG_EXPERT_STATS", "1")
-    from sglang.srt.layers.moe import expert_stats as es
+    monkeypatch.setenv("FLLIPER_EXPERT_STATS", "1")
+    from flliper.srt.layers.moe import expert_stats as es
 
     es.reset_for_tests()
     try:
@@ -532,9 +532,9 @@ def test_the_dump_carries_the_fields_the_arm_readout_reads(tmp_path, monkeypatch
     """``scripts/dev/394_s2_proof/read_arm.py`` reads four keys out of
     ``totals``. Pin them here, or the proof window discovers at 3 a.m. that the
     readout was written against fields nobody emits."""
-    monkeypatch.setenv("SGLANG_EXPERT_STATS", "1")
-    monkeypatch.setenv("SGLANG_EXPERT_STATS_PATH", str(tmp_path / "stats"))
-    from sglang.srt.layers.moe import expert_stats as es
+    monkeypatch.setenv("FLLIPER_EXPERT_STATS", "1")
+    monkeypatch.setenv("FLLIPER_EXPERT_STATS_PATH", str(tmp_path / "stats"))
+    from flliper.srt.layers.moe import expert_stats as es
 
     es.reset_for_tests()
     try:
@@ -576,7 +576,7 @@ def test_a_plan_that_disagrees_with_the_assignment_is_refused_at_install():
 
 
 def test_with_the_tier_off_nothing_here_is_reachable(monkeypatch):
-    monkeypatch.delenv("SGLANG_MOE_COLD_TIER_SHM", raising=False)
+    monkeypatch.delenv("FLLIPER_MOE_COLD_TIER_SHM", raising=False)
 
     assert cold_tier_enabled() is False
     assert ctf.owner_for_layer("L0", 0, WORLD, CARDS) is None
@@ -629,13 +629,13 @@ def test_the_planner_refusal_is_unchanged_without_a_tier():
 def test_the_capturable_installer_refuses_a_peer_backed_pool(monkeypatch):
     """Graph seam, BOOT-PENDING: the refusal must name the missing pointer and
     the flag that develops it, not merely fail."""
-    monkeypatch.delenv("SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE", raising=False)
+    monkeypatch.delenv("FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE", raising=False)
 
     with pytest.raises(RuntimeError, match="cudaHostRegister"):
         eo.refuse_capturable_cold_tier(64)
 
 
 def test_the_graph_seam_can_be_opened_for_a_card_window(monkeypatch):
-    monkeypatch.setenv("SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE", "1")
+    monkeypatch.setenv("FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE", "1")
 
     assert eo.refuse_capturable_cold_tier(64) is None

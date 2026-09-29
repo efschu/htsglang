@@ -34,16 +34,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
-from sglang.srt.registry.arbiter import (  # noqa: E402
+from flliper.srt.registry.arbiter import (  # noqa: E402
     EngineRegistry,
     PromotionRejected,
     RegistrationRejected,
     card_totals_from_nvml,
     free_bytes_from_nvml,
 )
-from sglang.srt.registry.ledger import MIB, ReservationStore  # noqa: E402
-from sglang.srt.registry.nvml import list_devices, memory_info_for_uuid  # noqa: E402
-from sglang.srt.registry.spec import (  # noqa: E402
+from flliper.srt.registry.ledger import MIB, ReservationStore  # noqa: E402
+from flliper.srt.registry.nvml import list_devices, memory_info_for_uuid  # noqa: E402
+from flliper.srt.registry.spec import (  # noqa: E402
     EngineClass,
     EngineSpec,
     ResidencyState,

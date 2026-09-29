@@ -5,7 +5,7 @@ python3 streaming.py
 
 import asyncio
 
-import sglang as sgl
+import flliper as sgl
 
 
 @sgl.function

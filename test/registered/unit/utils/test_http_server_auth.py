@@ -7,14 +7,14 @@ Usage:
 
 import unittest
 
-from sglang.srt.utils.auth import (
+from flliper.srt.utils.auth import (
     AuthLevel,
     _get_auth_level_from_app_and_scope,
     app_has_admin_force_endpoints,
     auth_level,
     decide_request_auth,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -318,7 +318,7 @@ class TestAuthLevelRouteIntrospection(unittest.TestCase):
     represented, on some FastAPI versions, as a single aggregate route that
     matches its whole sub-tree but exposes neither `.path` nor `.endpoint`
     directly (see the sibling `AttributeError` fix for
-    `sglang.srt.utils.common._get_fastapi_request_path`). Before the fix,
+    `flliper.srt.utils.common._get_fastapi_request_path`). Before the fix,
     that silently made `@auth_level(...)`-decorated endpoints behind
     `include_router()` fall back to `AuthLevel.NORMAL` -- a silent
     privilege *widening*, not a crash, which is why it's covered

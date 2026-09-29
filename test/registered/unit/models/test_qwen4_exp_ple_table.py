@@ -20,7 +20,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.models.qwen4_exp_ple_table import (
+from flliper.srt.models.qwen4_exp_ple_table import (
     PleFilePrefetcher,
     PleFileRssTrimmer,
     _mapping_rss_bytes,
@@ -31,8 +31,8 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
     ple_table_file_name,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -87,7 +87,7 @@ class TestPleFileTableAllocator(CustomTestCase):
             )
 
     def test_default_dir_is_per_checkpoint(self):
-        with mock.patch.dict(os.environ, {"SGLANG_QWEN4_PLE_FILE_DIR": "/cache/ple"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_QWEN4_PLE_FILE_DIR": "/cache/ple"}):
             a = default_ple_table_dir("RadixArk/Qwen3.8-Flash-Next-NVFP4")
             b = default_ple_table_dir("/root/.cache/huggingface/flashnext-fp8/")
             self.assertEqual(a, "/cache/ple/RadixArk_Qwen3.8-Flash-Next-NVFP4")
@@ -207,7 +207,7 @@ class TestPleFileRssTrimmerConfig(CustomTestCase):
         with tempfile.TemporaryDirectory() as d:
             table = allocate_ple_host_table((64, 32), torch.bfloat16, "file", d)
             with mock.patch.dict(
-                os.environ, {"SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB": "0"}
+                os.environ, {"FLLIPER_QWEN4_PLE_FILE_RSS_BUDGET_GB": "0"}
             ):
                 self.assertIsNone(make_ple_file_rss_trimmer(table))
 
@@ -281,8 +281,8 @@ class TestPleFileRssTrimmer(CustomTestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB": "1",
-                    "SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S": "3600",
+                    "FLLIPER_QWEN4_PLE_FILE_RSS_BUDGET_GB": "1",
+                    "FLLIPER_QWEN4_PLE_FILE_RSS_INTERVAL_S": "3600",
                 },
             ):
                 trimmer = make_ple_file_rss_trimmer(table)
@@ -303,7 +303,7 @@ class TestPleFileTableGatherOnDevice(CustomTestCase):
     def test_triton_gather_reads_file_backed_table(self):
         import triton
 
-        from sglang.srt.models.qwen4_exp import (
+        from flliper.srt.models.qwen4_exp import (
             _gather_ple_embedding_from_pinned_kernel,
         )
 

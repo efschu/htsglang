@@ -31,23 +31,23 @@ pytestmark = pytest.mark.skipif(
 )
 
 if torch.cuda.is_available():
-    from sglang.srt.runtime_context import get_context
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.runtime_context import get_context
+    from flliper.srt.server_args import ServerArgs
 
     if get_context()._server_args is None:
         get_context().set_server_args(ServerArgs(model_path="dummy"))
 
-    from sglang.srt.environ import envs
-    from sglang.srt.layers.moe.expert_offload import MoEExpertOffloadCache
-    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+    from flliper.srt.environ import envs
+    from flliper.srt.layers.moe.expert_offload import MoEExpertOffloadCache
+    from flliper.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from flliper.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         fused_experts_impl,
     )
-    from sglang.srt.layers.moe.token_dispatcher.standard import (
+    from flliper.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from flliper.srt.layers.moe.topk import StandardTopKOutput
 
 DEV = "cuda"
 FP8_OK = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
@@ -122,7 +122,7 @@ def _build(seed=0):
 
 def _run(order, disp):
     layer, _ = _build()
-    with envs.SGLANG_MOE_OFFLOAD_WAVE_ORDER.override(order):
+    with envs.FLLIPER_MOE_OFFLOAD_WAVE_ORDER.override(order):
         cache = MoEExpertOffloadCache(layer, R_FRAC)
     cache.install()
     out = cache.run_waves(disp, layer.apply)

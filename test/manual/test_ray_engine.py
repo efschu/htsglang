@@ -3,7 +3,7 @@
 Tests the Ray actor scheduler backend:
   - Offline inference via Engine(use_ray=True) inside a Ray actor on a placement group
   - Data parallel (DP) and DP attention support
-  - Custom placement_group and SGLANG_RAY_BUNDLE_INDICES for fine-grained bundle control
+  - Custom placement_group and FLLIPER_RAY_BUNDLE_INDICES for fine-grained bundle control
   - Error paths in RayEngine._launch_scheduler_processes()
   - HTTP server launched via --use-ray flag
 
@@ -30,15 +30,15 @@ import unittest
 
 import torch
 
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from flliper.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 # Allow overriding the model via env var for environments without gated access
-_MODEL = os.environ.get("SGLANG_TEST_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+_MODEL = os.environ.get("FLLIPER_TEST_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
 # DP attention requires a model whose num_kv_heads divides evenly across the
 # attention-TP dimension.  Qwen2.5-0.5B (kv_heads=2, attn_heads=14) hits a
 # shape mismatch in the KV cache, so we use a larger model here.
-_DP_ATTN_MODEL = os.environ.get("SGLANG_TEST_DP_ATTN_MODEL", "Qwen/Qwen3-8B")
+_DP_ATTN_MODEL = os.environ.get("FLLIPER_TEST_DP_ATTN_MODEL", "Qwen/Qwen3-8B")
 
 try:
     import ray
@@ -86,7 +86,7 @@ def _create_engine_on_pg(
     @ray.remote
     class EngineActor:
         def __init__(self, **kwargs):
-            from sglang.srt.ray.engine import RayEngine
+            from flliper.srt.ray.engine import RayEngine
 
             self.engine = RayEngine(**kwargs)
 
@@ -362,7 +362,7 @@ class TestRayEngineErrors(unittest.TestCase):
 
         @ray.remote(num_gpus=1)
         def _try_create_without_pg():
-            from sglang.srt.ray.engine import RayEngine
+            from flliper.srt.ray.engine import RayEngine
 
             try:
                 RayEngine(
@@ -425,8 +425,8 @@ class TestRayHTTPServerTP1(unittest.TestCase):
         # Launch server as a Ray task (blocks until server exits)
         @ray.remote
         def _launch(**kwargs):
-            from sglang.srt.ray.http_server import launch_server
-            from sglang.srt.server_args import ServerArgs
+            from flliper.srt.ray.http_server import launch_server
+            from flliper.srt.server_args import ServerArgs
 
             launch_server(ServerArgs(**kwargs))
 
@@ -520,14 +520,14 @@ class TestRayHTTPServerTP1(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Tests: Custom placement_group and SGLANG_RAY_BUNDLE_INDICES
+# Tests: Custom placement_group and FLLIPER_RAY_BUNDLE_INDICES
 # ---------------------------------------------------------------------------
 
 
 @unittest.skipUnless(_has_ray, "ray is not installed")
 @unittest.skipUnless(_NUM_GPUS >= 2, "requires at least 2 GPUs")
 class TestRayEnginePlacementGroup(unittest.TestCase):
-    """Test RayEngine with custom placement_group and SGLANG_RAY_BUNDLE_INDICES."""
+    """Test RayEngine with custom placement_group and FLLIPER_RAY_BUNDLE_INDICES."""
 
     @classmethod
     def setUpClass(cls):
@@ -540,7 +540,7 @@ class TestRayEnginePlacementGroup(unittest.TestCase):
 
     def test_custom_pg_dp1_tp2(self):
         """Test custom placement_group with dp_size=1, tp_size=2."""
-        from sglang.srt.ray.engine import RayEngine
+        from flliper.srt.ray.engine import RayEngine
 
         pg = placement_group([{"GPU": 1}] * 2, strategy="STRICT_PACK")
         ray.get(pg.ready())
@@ -561,10 +561,10 @@ class TestRayEnginePlacementGroup(unittest.TestCase):
         ray.util.remove_placement_group(pg)
 
     def test_bundle_indices_dp1_tp2(self):
-        """Test SGLANG_RAY_BUNDLE_INDICES with dp_size=1, tp_size=2."""
-        from sglang.srt.ray.engine import RayEngine
+        """Test FLLIPER_RAY_BUNDLE_INDICES with dp_size=1, tp_size=2."""
+        from flliper.srt.ray.engine import RayEngine
 
-        os.environ["SGLANG_RAY_BUNDLE_INDICES"] = "0,1"
+        os.environ["FLLIPER_RAY_BUNDLE_INDICES"] = "0,1"
 
         pg = placement_group([{"GPU": 1}] * 2, strategy="STRICT_PACK")
         ray.get(pg.ready())
@@ -583,11 +583,11 @@ class TestRayEnginePlacementGroup(unittest.TestCase):
 
         engine.shutdown()
         ray.util.remove_placement_group(pg)
-        del os.environ["SGLANG_RAY_BUNDLE_INDICES"]
+        del os.environ["FLLIPER_RAY_BUNDLE_INDICES"]
 
     def test_custom_pg_dp2_tp1(self):
         """Test custom placement_group with dp_size=2, tp_size=1."""
-        from sglang.srt.ray.engine import RayEngine
+        from flliper.srt.ray.engine import RayEngine
 
         pg = placement_group([{"GPU": 1}] * 2, strategy="STRICT_PACK")
         ray.get(pg.ready())
@@ -610,9 +610,9 @@ class TestRayEnginePlacementGroup(unittest.TestCase):
 
     def test_bundle_indices_skip_bundle(self):
         """Test skipping unhealthy GPU by using bundle_indices."""
-        from sglang.srt.ray.engine import RayEngine
+        from flliper.srt.ray.engine import RayEngine
 
-        os.environ["SGLANG_RAY_BUNDLE_INDICES"] = "1"  # Skip bundle 0
+        os.environ["FLLIPER_RAY_BUNDLE_INDICES"] = "1"  # Skip bundle 0
 
         pg = placement_group([{"GPU": 1}] * 2, strategy="STRICT_PACK")
         ray.get(pg.ready())
@@ -631,11 +631,11 @@ class TestRayEnginePlacementGroup(unittest.TestCase):
 
         engine.shutdown()
         ray.util.remove_placement_group(pg)
-        del os.environ["SGLANG_RAY_BUNDLE_INDICES"]
+        del os.environ["FLLIPER_RAY_BUNDLE_INDICES"]
 
     def test_custom_pg_dp_attention(self):
         """Test custom placement_group with enable_dp_attention=True."""
-        from sglang.srt.ray.engine import RayEngine
+        from flliper.srt.ray.engine import RayEngine
 
         pg = placement_group([{"GPU": 1}] * 2, strategy="STRICT_PACK")
         ray.get(pg.ready())
@@ -679,7 +679,7 @@ class TestRayEnginePlacementGroupErrors(unittest.TestCase):
             pg = placement_group([{"GPU": 2}], strategy="STRICT_PACK")
             ray.get(pg.ready())
 
-            from sglang.srt.ray.engine import RayEngine
+            from flliper.srt.ray.engine import RayEngine
 
             try:
                 RayEngine(
@@ -699,18 +699,18 @@ class TestRayEnginePlacementGroupErrors(unittest.TestCase):
         self.assertIn("exactly 1 GPU per bundle", error_msg)
 
     def test_invalid_bundle_index_raises_error(self):
-        """SGLANG_RAY_BUNDLE_INDICES with invalid index should raise an error."""
+        """FLLIPER_RAY_BUNDLE_INDICES with invalid index should raise an error."""
 
         @ray.remote(num_gpus=0)
         def _try_invalid_bundle_index():
             import os
 
-            os.environ["SGLANG_RAY_BUNDLE_INDICES"] = "0,10"
+            os.environ["FLLIPER_RAY_BUNDLE_INDICES"] = "0,10"
 
             pg = placement_group([{"GPU": 1}] * 2, strategy="STRICT_PACK")
             ray.get(pg.ready())
 
-            from sglang.srt.ray.engine import RayEngine
+            from flliper.srt.ray.engine import RayEngine
 
             try:
                 RayEngine(
@@ -723,7 +723,7 @@ class TestRayEnginePlacementGroupErrors(unittest.TestCase):
             except Exception as e:
                 return str(e)
             finally:
-                os.environ.pop("SGLANG_RAY_BUNDLE_INDICES", None)
+                os.environ.pop("FLLIPER_RAY_BUNDLE_INDICES", None)
                 ray.util.remove_placement_group(pg)
 
         error_msg = ray.get(_try_invalid_bundle_index.remote(), timeout=120)

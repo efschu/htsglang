@@ -17,14 +17,14 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.distributed.corridor_vector import solve_token_vector
-from sglang.srt.distributed.utils import get_cp_token_ratios, set_cp_token_ratios
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.distributed.corridor_vector import solve_token_vector
+from flliper.srt.distributed.utils import get_cp_token_ratios, set_cp_token_ratios
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     corridor_mode_active,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -149,15 +149,15 @@ def _run_ranks(server_args, *, allow_install=True, dcp_size=3):
             parallel = mock.Mock(attn_dcp_rank=rank)
             with (
                 mock.patch(
-                    "sglang.srt.model_executor.model_runner_kv_cache_mixin.get_world_group",
+                    "flliper.srt.model_executor.model_runner_kv_cache_mixin.get_world_group",
                     return_value=world_group,
                 ),
                 mock.patch(
-                    "sglang.srt.model_executor.model_runner_kv_cache_mixin.get_parallel",
+                    "flliper.srt.model_executor.model_runner_kv_cache_mixin.get_parallel",
                     return_value=parallel,
                 ),
                 mock.patch(
-                    "sglang.srt.model_executor.pool_configurator.create_memory_pool_configurator",
+                    "flliper.srt.model_executor.pool_configurator.create_memory_pool_configurator",
                     side_effect=lambda mr: _StubConfigurator(
                         _CELL_BYTES, PROFILED[mr.tp_rank]
                     ),

@@ -16,7 +16,7 @@ from it in load-bearing ways:
 
     pp-stage-ratio         2,1,1              live: 14,10,8
     rank-gpu-memory-mib    22700,11920,11970  live: 31800,17400,17450
-    SGLANG_UNEVEN_TOKEN_VECTOR  28,26,20      live: 14,10,8
+    FLLIPER_UNEVEN_TOKEN_VECTOR  28,26,20      live: 14,10,8
     PHASE_FLIP_PURITY      off                live: strict
 
 So "replay the captured boot with one variable moved" would have booted a
@@ -57,7 +57,7 @@ CAPTURE_DIR = "/spinning/evidence-631/boot-captures"
 
 # Regenerated per boot by the runtime; replaying a stale one would make two
 # boots claim the same phase-flip instance id.
-DROP_ENV = {"SGLANG_PHASE_FLIP_INSTANCE"}
+DROP_ENV = {"FLLIPER_PHASE_FLIP_INSTANCE"}
 
 # Set by whatever shell launched the previous boot; carrying it forward
 # pins a stale interpreter path into the replay.
@@ -80,13 +80,13 @@ def find_live_server(port: str = "30030") -> int:
                 argv = fh.read().split(b"\0")
         except OSError:
             continue
-        if not argv or b"sglang.launch_server" not in b" ".join(argv):
+        if not argv or b"flliper.launch_server" not in b" ".join(argv):
             continue
         if b"--port" in argv and argv[argv.index(b"--port") + 1] == port.encode():
             hits.append(int(entry))
     if not hits:
         raise SystemExit(
-            f"no live sglang.launch_server on port {port}. Boot one with "
+            f"no live flliper.launch_server on port {port}. Boot one with "
             f"PROD_BRINGUP_BENCH.md section 7 first, or pass "
             f"--from-capture <cmdline> <env> and accept that the baseline "
             f"is whatever those files happen to hold."
@@ -140,7 +140,7 @@ def read_replay_record(path: str):
     # A "line ending in a colon" heuristic looked equivalent and was not:
     # PATH-like values end in ':' all the time, so the first such variable
     # was read as a section header and every variable after it was dropped.
-    # Caught by a --dry-run that reported SGLANG_BOOT_COMMIT as "(absent)"
+    # Caught by a --dry-run that reported FLLIPER_BOOT_COMMIT as "(absent)"
     # on a record that plainly contains it.
     sections = {"substitutions", "baseline argv", "replay argv",
                 "baseline env", "replay env"}
@@ -360,7 +360,7 @@ def main():
                     cmd = fh.read()
             except OSError:
                 continue
-            if b"sglang::scheduler_PP" in cmd or b"sglang::detokenizer" in cmd:
+            if b"flliper::scheduler_PP" in cmd or b"flliper::detokenizer" in cmd:
                 stragglers.append(int(entry))
         for spid in stragglers:
             print(f"straggler {spid} still holding a card; SIGKILL by pid")

@@ -2,7 +2,7 @@
 #
 # Consumed by:
 #   * scripts/ci/slurm/process_result.py reads `resources` and
-#     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
+#     `backend.flliper_config` (TP/EP/DP + worker counts) for the summary table.
 #   * scripts/ci/slurm/launch_mi355x.sh reads `runtime`, `bench`, and `mtp`.
 
 resources:
@@ -10,7 +10,7 @@ resources:
   decode_workers: 1
 
 backend:
-  sglang_config:
+  flliper_config:
     prefill:
       tensor-parallel-size: 8
       expert-parallel-size: 8

@@ -34,8 +34,8 @@ import unittest
 
 import torch
 
-import sglang.srt.managers.pp_admission_congruence as congruence
-from sglang.srt.managers.pp_admission_congruence import (
+import flliper.srt.managers.pp_admission_congruence as congruence
+from flliper.srt.managers.pp_admission_congruence import (
     PPScheduleRefused,
     execute_scheduled_prefix,
     schedule_refusal_reason,
@@ -220,7 +220,7 @@ class StorePresenceRefuter968(unittest.TestCase):
         return types.SimpleNamespace(tree_cache=tree)
 
     def test_all_tiers_refute_stands_the_premise_down(self):
-        from sglang.srt.managers.phase_purity import seam_store_presence_refuted
+        from flliper.srt.managers.phase_purity import seam_store_presence_refuted
 
         refuted, detail = seam_store_presence_refuted(
             self._scheduler(children={}, avail=100, size=100, storage_on=False)
@@ -229,7 +229,7 @@ class StorePresenceRefuter968(unittest.TestCase):
         self.assertIn("tree_empty=True", detail)
 
     def test_host_content_blocks_refutation(self):
-        from sglang.srt.managers.phase_purity import seam_store_presence_refuted
+        from flliper.srt.managers.phase_purity import seam_store_presence_refuted
 
         refuted, _ = seam_store_presence_refuted(
             self._scheduler(children={}, avail=50, size=100, storage_on=False)
@@ -237,7 +237,7 @@ class StorePresenceRefuter968(unittest.TestCase):
         self.assertFalse(refuted)
 
     def test_storage_on_blocks_refutation(self):
-        from sglang.srt.managers.phase_purity import seam_store_presence_refuted
+        from flliper.srt.managers.phase_purity import seam_store_presence_refuted
 
         refuted, _ = seam_store_presence_refuted(
             self._scheduler(children={}, avail=100, size=100, storage_on=True)
@@ -246,7 +246,7 @@ class StorePresenceRefuter968(unittest.TestCase):
 
     def test_unreadable_probes_never_refute(self):
         """Denominator law: unknown is not empty."""
-        from sglang.srt.managers.phase_purity import seam_store_presence_refuted
+        from flliper.srt.managers.phase_purity import seam_store_presence_refuted
 
         refuted, detail = seam_store_presence_refuted(
             types.SimpleNamespace(tree_cache=None)
@@ -259,7 +259,7 @@ class StorePresenceRefuter968(unittest.TestCase):
         True while every tier was provably empty -- the W30 arm then flipped
         into a layout that could only re-prefill cold (four 2026-09-01 logs:
         0 premise refusals beside total re-prefill)."""
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         req = types.SimpleNamespace(
             cached_prompt_tokens_at_retract=4096, cache_protected_len=0
@@ -279,7 +279,7 @@ class StorePresenceRefuter968(unittest.TestCase):
         retract credit', store read reaped unprobed, P=0. The premise now
         reads the re-admission's own prefetch state; a long stamped request
         with no registered or answered store read is cold."""
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         req = types.SimpleNamespace(
             rid="r968",
@@ -297,7 +297,7 @@ class StorePresenceRefuter968(unittest.TestCase):
         """#1157: the same request with its store prefetch REGISTERED on the
         tree is a restore in progress; the exemption is held open for it
         (admission itself waits on the drained verdict)."""
-        from sglang.srt.managers import phase_purity
+        from flliper.srt.managers import phase_purity
 
         req = types.SimpleNamespace(
             rid="r968",
@@ -316,7 +316,7 @@ class StorePresenceRefuter968(unittest.TestCase):
         """Upstream-minimal: the dead boot-static `seam_readmit_available`
         knob must not grow back (its hardcoded True made the W30 refusal
         unreachable for its whole life)."""
-        from sglang.srt.managers.phase_policy import PhasePolicyConfig
+        from flliper.srt.managers.phase_policy import PhasePolicyConfig
 
         self.assertNotIn(
             "seam_readmit_available",
@@ -328,12 +328,12 @@ class RecvAbortProvider968(unittest.TestCase):
     """P2: dynamic abort bound for the parked recv."""
 
     def tearDown(self):
-        from sglang.srt.distributed.pp_object_recv import set_recv_abort_provider
+        from flliper.srt.distributed.pp_object_recv import set_recv_abort_provider
 
         set_recv_abort_provider(None)
 
     def test_merge_semantics_tighter_positive_bound_wins(self):
-        from sglang.srt.distributed import pp_object_recv as m
+        from flliper.srt.distributed import pp_object_recv as m
 
         m.set_recv_abort_provider(None)
         self.assertEqual(m.effective_abort_after_s(0.0), 0.0)
@@ -345,7 +345,7 @@ class RecvAbortProvider968(unittest.TestCase):
         self.assertEqual(m.effective_abort_after_s(7.0), 3.0)
 
     def test_provider_error_reads_as_no_bound(self):
-        from sglang.srt.distributed import pp_object_recv as m
+        from flliper.srt.distributed import pp_object_recv as m
 
         def boom() -> float:
             raise ValueError("provider broke")
@@ -355,7 +355,7 @@ class RecvAbortProvider968(unittest.TestCase):
         self.assertEqual(m.effective_abort_after_s(9.0), 9.0)
 
     def test_flip_hold_bound_is_deadline_plus_slack_only_while_armed(self):
-        from sglang.srt.managers.phase_flip_runtime import (
+        from flliper.srt.managers.phase_flip_runtime import (
             DEFAULT_FLIP_HOLD_RECV_SLACK_S,
             pp0_flip_hold_recv_bound_s,
         )
@@ -393,7 +393,7 @@ class Feeders968(unittest.TestCase):
         """#1065: measured best-case store rate ~0.32 s/KiToken; the linear
         default must price at or above it and the max must not clip a 16k
         readmit."""
-        from sglang.srt.mem_cache.hicache_storage import PrefetchTimeoutConfig
+        from flliper.srt.mem_cache.hicache_storage import PrefetchTimeoutConfig
 
         cfg = PrefetchTimeoutConfig()
         self.assertGreaterEqual(cfg.per_ki_token, 0.32)

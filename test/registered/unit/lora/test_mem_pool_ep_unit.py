@@ -13,7 +13,7 @@ Usage:
     python -m pytest test/registered/unit/lora/test_mem_pool_ep_unit.py -v
 """
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
@@ -25,7 +25,7 @@ import unittest.mock as mock
 
 import torch
 
-from sglang.srt.lora.mem_pool import (
+from flliper.srt.lora.mem_pool import (
     LoRAMemoryPool,
     _get_moe_ep_context,
     _get_moe_tp_context,
@@ -378,15 +378,15 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
         """
         with (
             mock.patch(
-                "sglang.srt.lora.mem_pool._get_moe_ep_context",
+                "flliper.srt.lora.mem_pool._get_moe_ep_context",
                 return_value=(ep_size, ep_rank),
             ),
             mock.patch(
-                "sglang.srt.lora.mem_pool._get_moe_tp_context",
+                "flliper.srt.lora.mem_pool._get_moe_tp_context",
                 return_value=(moe_tp_size, moe_tp_rank),
             ),
             mock.patch(
-                "sglang.srt.lora.mem_pool._moe_runner_keeps_global_expert_ids",
+                "flliper.srt.lora.mem_pool._moe_runner_keeps_global_expert_ids",
                 return_value=keeps_global,
             ),
             mock.patch.object(LoRAMemoryPool, "init_buffers", lambda self, _m: None),
@@ -468,7 +468,7 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
 def _fake_base_model_with_hidden_dim(num_experts: int) -> torch.nn.Module:
     """Fake base model that implements `get_hidden_dim` for MoE + attention
     modules. Matches the signatures `LoRAMemoryPool.get_lora_{A,B}_shape`
-    call through `sglang.srt.lora.utils.get_hidden_dim`.
+    call through `flliper.srt.lora.utils.get_hidden_dim`.
     """
 
     class _Model(torch.nn.Module):
@@ -655,7 +655,7 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
         shapes the test does not provide)."""
 
     def test_moe_tp_rank_used_for_slicing_when_ep_lt_tp(self):
-        from sglang.srt.lora.layers import FusedMoEWithLoRA
+        from flliper.srt.lora.layers import FusedMoEWithLoRA
 
         # tp=4 ep=2 → moe_tp_size=2. Pick OUTER rank 3 so moe_tp_rank=1.
         # The two values differ; the bug would surface on this exact rank.

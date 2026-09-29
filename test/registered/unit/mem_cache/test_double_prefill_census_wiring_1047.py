@@ -17,7 +17,7 @@ import ast
 import pathlib
 
 import pytest
-from sglang.srt.mem_cache import producer_phase_census as pc
+from flliper.srt.mem_cache import producer_phase_census as pc
 
 
 class _Log:

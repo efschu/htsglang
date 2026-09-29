@@ -11,9 +11,9 @@ import unittest
 
 import torch
 
-from sglang.kernels.spec import KernelBackend
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.kernels.spec import KernelBackend
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
@@ -43,7 +43,7 @@ class TestFusedOpGpuParity(CustomTestCase):
         torch.testing.assert_close(got, ref, **_TOLERANCE[dtype], msg=msg)
 
     def test_rmsnorm_backends_match_native(self):
-        from sglang.kernels.ops.layernorm import _RMSNORM
+        from flliper.kernels.ops.layernorm import _RMSNORM
 
         for dtype in (torch.float16, torch.bfloat16):
             for shape in ((1, 4096), (128, 4096), (7, 2048)):
@@ -57,7 +57,7 @@ class TestFusedOpGpuParity(CustomTestCase):
                     )
 
     def test_fused_add_rmsnorm_backends_match_native(self):
-        from sglang.kernels.ops.layernorm import _FUSED_ADD_RMSNORM
+        from flliper.kernels.ops.layernorm import _FUSED_ADD_RMSNORM
 
         for dtype in (torch.float16, torch.bfloat16):
             for shape in ((1, 4096), (128, 4096)):
@@ -74,7 +74,7 @@ class TestFusedOpGpuParity(CustomTestCase):
                     self._assert_close(r, r_ref, dtype, label + " (residual)")
 
     def test_gemma_rmsnorm_backends_match_native(self):
-        from sglang.kernels.ops.layernorm import _GEMMA_RMSNORM
+        from flliper.kernels.ops.layernorm import _GEMMA_RMSNORM
 
         for dtype in (torch.float16, torch.bfloat16):
             x = torch.randn(64, 2048, dtype=dtype, device=_DEVICE)
@@ -87,7 +87,7 @@ class TestFusedOpGpuParity(CustomTestCase):
                 )
 
     def test_gemma_fused_add_rmsnorm_backends_match_native(self):
-        from sglang.kernels.ops.layernorm import _GEMMA_FUSED_ADD_RMSNORM
+        from flliper.kernels.ops.layernorm import _GEMMA_FUSED_ADD_RMSNORM
 
         for dtype in (torch.float16, torch.bfloat16):
             x0 = torch.randn(64, 2048, dtype=dtype, device=_DEVICE)
@@ -103,7 +103,7 @@ class TestFusedOpGpuParity(CustomTestCase):
                 self._assert_close(r, r_ref, dtype, label + " (residual)")
 
     def test_gated_activation_backends_match_native(self):
-        from sglang.kernels.ops.activation import (
+        from flliper.kernels.ops.activation import (
             _GELU_AND_MUL,
             _GELU_TANH_AND_MUL,
             _SILU_AND_MUL,

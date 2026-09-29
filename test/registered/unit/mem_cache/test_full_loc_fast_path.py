@@ -37,13 +37,13 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _loc_info(virtual_loc, swa_phys=None, full_phys=None):
-    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+    from flliper.srt.mem_cache.memory_pool import KVWriteLoc
 
     return KVWriteLoc(virtual_loc, swa_phys, full_phys)
 
@@ -64,7 +64,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
     write metadata; the pool never translates."""
 
     def _make_bare_pool(self):
-        from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+        from flliper.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 
         # Bypass the heavy __init__; set only the attributes set_kv_buffer reads.
         pool = object.__new__(UnifiedSWAKVPool)
@@ -155,7 +155,7 @@ class TestHybridLinearFullLocRouting(unittest.TestCase):
     already-physical `loc` (static pool). No translate, no `already_physical`."""
 
     def _make_bare_pool(self):
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         pool = object.__new__(HybridLinearKVPool)
         pool.full_kv_pool = _RecordingPool()

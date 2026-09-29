@@ -1,0 +1,2194 @@
+# SPDX-License-Identifier: Apache-2.0
+"""#1330 B4n -- THE PER-RANK PLACEMENT MANIFEST, and the CROSS-GROUP JOIN.
+
+THE DEFECT THIS CLOSES, measured on boot weg2xsn20 and verified in the tree at
+``15cf96c7ab``.  All 24 injection legs read ``verdict=NO-COMPARE`` with
+``W74 PdFlipXchgSourceMissing ... has no source pointer ... src_resolved=0/N
+dst_resolved=N/N``: the lane never assembled a single layer on metal.  The
+cause is NOT a bug in the resolver.  ``weight_exchange_shadow.derive_leg_plan``
+defines ``ptr_of`` (``:3336-3344``) so that it answers ONLY for this rank of
+this group, and which group is asked for the SOURCE side is chosen two frames
+up from the hook (``:3329-3331``): on ``hook=destination`` and
+``hook=authoritative`` the source IS the peer, so ``weight_exchange.py:1811``
+sets ``src_ptr=None`` on every descriptor, by construction.  A rank cannot read
+another process's ``data_ptr()``, and no amount of repair inside that function
+can change it.
+
+A SECOND FINDING OF THE SAME READING, and it is the larger one: **the product
+has never built a cross-group plan at all.**  The inventory is
+``shard_axis=wx.REPLICATED, shard_total=0`` (``:3237``) and BOTH
+``GroupLayout``s are ``tp_size=1`` (``:3332-3334``) -- the PP form on both
+sides, i.e. the on-card DIAGONAL.  ``derive_leg_plan``'s own docstring says so
+(``:3121``): *"It is not the full cross-group exchange plan.  That one needs
+BOTH groups' shard vectors and the unsharded extent of every parameter, which
+is cross-group knowledge no single rank holds."*
+
+THIS MODULE IS THAT CROSS-GROUP KNOWLEDGE, and it is WRITTEN DOWN rather than
+derived twice.  Each rank records what its OWN LOADER already decided, after
+materialisation -- no second placement engine, no header arithmetic, no
+duplicated repack rule.  The join then reads the six files and answers the two
+questions no single rank can:
+
+* **which P stage holds the source** of a given tensor (P's manifest names the
+  holder);
+* **how the tensor is cut across D** (D's three rows give the per-rank extents,
+  and their SUM is the unsharded extent the plan needs).
+
+The shard AXIS is likewise not guessed: it is READ OFF the join.  If every D
+row has the same column count and the row counts sum to P's, the cut is on
+ROWS; the mirror case is COLS; identical rows on every side is REPLICATED;
+anything else is a shape contradiction and is refused by name.
+
+**THE IDENTITY IS NOT A NEW ONE.**  Every piece is keyed by
+``weight_exchange_shadow.manifest_entry(param_name, tensor_class, rows_full,
+cols_full, itemsize)`` -- the same tuple the card manifest publishes
+(``card_manifest_entries``, ``:2918``) and the same one ``seam_digest`` keys on
+(``:474``).  One identity, three readers.
+
+**NO NEW W-CODE** (plan record 2026-09-11: "W23/W39 stay free").  A tensor the
+destination holds and no source covers is ``W74 PdFlipXchgSourceMissing``, which
+is that class's own sentence; a shape the two groups cannot both be right about
+is ``W68 PdFlipXchgPlanDisagree``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from flliper.srt.pdflip import weight_exchange as wx
+from flliper.srt.pdflip import weight_exchange_region as xr
+
+#: The file name, derived exactly as ``lane_coverage.dump_filename`` derives
+#: the coverage dump's (#1292).  NOT a second naming scheme: P and D are
+#: independently launched process groups sharing ONE dump directory, and
+#: ``rank`` is unique only WITHIN a group -- #1292 already paid for that, with
+#: P silently overwriting D's dump.
+MANIFEST_PREFIX = "phase_manifest"
+
+#: One schema version, written into every file and checked on read.  A manifest
+#: from an older boot in the same directory is a WRONG ANSWER, not a missing
+#: one, so it is refused rather than merged.
+MANIFEST_VERSION = 1
+
+JOIN_LINE_PREFIX = "PDFLIP-XCHG-MANIFEST"
+
+
+def group_rank(tp_rank: int, pp_rank: int, tp_size: int = 1) -> int:
+    """The rank's index WITHIN ITS GROUP, unique for any (tp, pp) form.
+
+    ``tp_size * pp_rank + tp_rank`` -- the tree's OWN formula, already used at
+    ``model_executor/model_runner.py:998`` to build a rank id from the two
+    axes. Imported as arithmetic rather than invented, because a second
+    spelling of "which rank am I" is how the two would drift.
+
+    BOOT weg2xsn22 MEASURED WHAT ITS ABSENCE COSTS. The manifest was keyed on
+    ``tp_rank`` alone (``model_runner.py:2566`` passes ``rank=self.tp_rank``).
+    Group P runs ``--tp-size 1 --pp-size 3``, so ALL THREE PP ranks have
+    ``tp_rank == 0``: four ``PDFLIP-XCHG-MANIFEST-WRITE rank=0 card=0`` lines
+    with pieces 515/505/893 landed on ONE file, the join read
+    ``join-manifest-missing: 2 of 6``, no plan was produced, and every leg read
+    ``ran=no why=no-plan`` -- ``hook=destination`` fired 0 times and
+    ``phase=collect`` was unreachable. Group D (``tp=3``) wrote its three files
+    correctly from the SAME code path, which is why the defect was invisible on
+    one half of the boot.
+
+    The docstring of :func:`manifest_filename` had closed the GROUP collision
+    (#1292: P overwriting D) and said nothing about the RANK collision inside
+    one group -- a check written against the last incident rather than against
+    the shape.
+    """
+    return int(tp_size) * int(pp_rank) + int(tp_rank)
+
+
+def manifest_filename(rank: int, group: str = "", region_tag: str = "",
+                      *, tp_rank: Optional[int] = None,
+                      pp_rank: Optional[int] = None) -> str:
+    """``phase_manifest_{GROUP}_rank{TP}x{PP}_{REGION_TAG}.json``.
+
+    THREE AXES, EACH FOR A MEASURED COLLISION:
+
+    * ``GROUP`` -- #1292: P and D are independently launched process groups
+      sharing one dump directory and P (booted second) silently overwrote D's.
+    * ``{TP}x{PP}`` -- boot weg2xsn22: keyed on ``tp_rank`` alone, group P's
+      three PP ranks all wrote ``rank0`` (see :func:`group_rank`). BOTH axes
+      are carried rather than "the one that happens to vary in this form", so a
+      future ``tp>1 pp>1`` group cannot collide either -- the fix is against
+      the SHAPE, not against this incident.
+    * ``REGION_TAG`` -- weg2xsn20: one rank runs two runners (main model and
+      drafter) through this same site with different tags.
+
+    ``rank`` stays the GROUP-UNIQUE index the join keys on; the two axes are
+    the provenance the name needs. Passing neither axis falls back to the
+    legacy single-number shape, which only the hermetic callers use.
+    """
+    grp = f"{group}_" if group else ""
+    reg = f"_{region_tag}" if region_tag else ""
+    if tp_rank is None and pp_rank is None:
+        axes = str(int(rank))
+    else:
+        axes = f"{int(tp_rank or 0)}x{int(pp_rank or 0)}"
+    return f"{MANIFEST_PREFIX}_{grp}rank{axes}{reg}.json"
+
+
+def _flat_table_from_json(raw) -> Optional[object]:
+    """G1: a piece's ``flat_segments`` entry as a ``FlatTable`` (``None`` when
+    absent -- every tensor that is not a flat container)."""
+    if raw is None:
+        return None
+    from flliper.srt.pdflip.xchg_flat_segments import FlatTable
+
+    return FlatTable.from_json(raw)
+
+
+@dataclass(frozen=True)
+class ManifestPiece:
+    """One tensor as THIS rank's loader actually materialised it.
+
+    ``rows_full``/``cols_full`` are this rank's LOCAL storage extents, read
+    through ``ParamGeom``/``StorageGeom`` from ``stride()`` rather than
+    ``shape`` -- the ``.t()``-view rule of spec section 2.4 -- so a
+    column-parallel class is recorded in the space a copy primitive names.
+    They are deliberately NOT the unsharded extent: a rank does not know that
+    one, and writing down a number it had to infer is exactly the second
+    bookkeeping this module exists to remove.  The join adds them up instead.
+    """
+
+    param_name: str
+    tensor_class: str
+    rows_full: int
+    cols_full: int
+    itemsize: int
+    tag: str
+    nbytes: int
+    #: #1384: this rank's DECLARED (q, k, v, ...) row split of a fused
+    #: parameter, straight off ``ParamGeom.component_rows`` -- itself read off
+    #: the module that already computed the sizes (``linear.py``
+    #: ``q_proj_shard_size`` and friends), never re-derived. ``()`` (default)
+    #: is "no declared split", which is every manifest written before #1384
+    #: and every non-fused tensor -- both round-trip unchanged.
+    component_rows: Tuple[int, ...] = ()
+    #: G1: this rank's DECLARED flat container (``xchg_flat_segments.FlatTable``)
+    #: -- the segments the loader laid into one byte buffer, straight off the
+    #: parameter (``ParamGeom.flat_table``). ``None`` (default, and absent from
+    #: the JSON) for every other tensor, so every manifest written before G1
+    #: round-trips byte for byte.
+    flat_table: Optional[object] = None
+
+    @property
+    def key(self) -> Tuple[int, int, int, int, int]:
+        """The PUBLISHED identity -- ``manifest_entry``, not a private tuple."""
+        from flliper.srt.pdflip import weight_exchange_shadow as sh
+
+        return sh.manifest_entry(self.param_name, self.tensor_class,
+                                 self.rows_full, self.cols_full, self.itemsize,
+                                 region=region_of_tag(self.tag))
+
+    def as_json(self) -> Dict[str, object]:
+        return {
+            "param_name": self.param_name,
+            "tensor_class": self.tensor_class,
+            "rows_full": int(self.rows_full),
+            "cols_full": int(self.cols_full),
+            "itemsize": int(self.itemsize),
+            "tag": self.tag,
+            "nbytes": int(self.nbytes),
+            "component_rows": [int(x) for x in self.component_rows],
+            **({} if self.flat_table is None
+               else {"flat_segments": self.flat_table.as_json()}),
+        }
+
+    @classmethod
+    def from_json(cls, raw: Dict[str, object]) -> ManifestPiece:
+        return cls(
+            param_name=str(raw["param_name"]),
+            tensor_class=str(raw["tensor_class"]),
+            rows_full=int(raw["rows_full"]),
+            cols_full=int(raw["cols_full"]),
+            itemsize=int(raw["itemsize"]),
+            tag=str(raw.get("tag", "")),
+            nbytes=int(raw.get("nbytes", 0)),
+            # ABSENT means a pre-#1384 manifest or a non-fused tensor --
+            # both are "no declared split", not a shape to guess at.
+            component_rows=tuple(int(x) for x in raw.get("component_rows", ())),
+            flat_table=_flat_table_from_json(raw.get("flat_segments")),
+        )
+
+
+@dataclass(frozen=True)
+class RankManifest:
+    """One rank's whole record, plus the provenance that makes it comparable."""
+
+    group: str
+    #: THE GROUP-UNIQUE index -- `group_rank(tp_rank, pp_rank, tp_size)`, not
+    #: `tp_rank`. Boot weg2xsn22 lost every leg to that distinction.
+    rank: int
+    card: int
+    region_tag: str
+    boot_token: str
+    pieces: Tuple[ManifestPiece, ...]
+    #: The two axes, carried so the FILE NAME cannot collide in any (tp, pp)
+    #: form and so a reader can see which rank of which axis wrote this.
+    tp_rank: int = 0
+    pp_rank: int = 0
+
+    @property
+    def by_name(self) -> Dict[str, ManifestPiece]:
+        return {p.param_name: p for p in self.pieces}
+
+    @property
+    def by_region_name(self) -> Dict[Tuple[str, str], ManifestPiece]:
+        """THE IDENTITY MAP. `by_name` cannot be one once two runners of a
+        rank share a parameter name, which weg2xsn25 measured eight times."""
+        return {(region_of_tag(p.tag), p.param_name): p for p in self.pieces}
+
+    def as_json(self) -> Dict[str, object]:
+        return {
+            "version": MANIFEST_VERSION,
+            "group": self.group,
+            "rank": int(self.rank),
+            "card": int(self.card),
+            "region_tag": self.region_tag,
+            "boot_token": self.boot_token,
+            "tp_rank": int(self.tp_rank),
+            "pp_rank": int(self.pp_rank),
+            "pieces": [p.as_json() for p in self.pieces],
+        }
+
+    @classmethod
+    def from_json(cls, raw: Dict[str, object], *, path: str = "") -> RankManifest:
+        version = int(raw.get("version", -1))
+        if version != MANIFEST_VERSION:
+            raise wx.PdFlipXchgPlanDisagree(
+                f"W68 PdFlipXchgPlanDisagree: manifest {path or '<memory>'} "
+                f"carries schema version {version}, this reader is "
+                f"{MANIFEST_VERSION}. A manifest from another boot in the same "
+                f"directory is a WRONG answer, not a missing one, so it is "
+                f"refused rather than merged into a plan."
+            )
+        return cls(
+            group=str(raw["group"]),
+            rank=int(raw["rank"]),
+            card=int(raw["card"]),
+            region_tag=str(raw.get("region_tag", "")),
+            boot_token=str(raw.get("boot_token", "")),
+            tp_rank=int(raw.get("tp_rank", 0)),
+            pp_rank=int(raw.get("pp_rank", 0)),
+            pieces=tuple(ManifestPiece.from_json(p) for p in raw.get("pieces", ())),
+        )
+
+
+def pieces_from_inventory(inventory: Iterable[object]) -> Tuple[ManifestPiece, ...]:
+    """``ParamGeom`` records -> manifest pieces, sorted by name.
+
+    Sorted because two processes build their lists in different orders (the
+    C++ side iterates an ``unordered_map``; ``build_plan:1949`` says why), and
+    the join compares SETS.  The geometries come from the caller's own
+    inventory walk -- this function invents none and reads no tensor.
+    """
+    out: List[ManifestPiece] = []
+    from flliper.srt.pdflip import weight_exchange_shadow as sh
+
+    for geom in inventory:
+        name = str(getattr(geom, "name", ""))
+        rows = int(getattr(geom, "rows_full", 0))
+        cols = int(getattr(geom, "cols_full", 0))
+        item = int(getattr(geom, "itemsize", 0))
+        comp = tuple(int(x) for x in getattr(geom, "component_rows", ()) or ())
+        # weg2xsn258: the module declares its components in OUTPUT units
+        # (q_proj_shard_size etc.); a pack-quantized weight_packed stores
+        # `pack` of them per storage column ([K/16, N*pack], Marlin), so the
+        # declaration is scaled by the factor the tensor's own extent states.
+        # Untouched when the sum already IS a storage axis (bf16 weights,
+        # weight_scale); never a guess when nothing divides.
+        _s = sum(comp)
+        if comp and _s > 0 and _s not in (rows, cols):
+            if cols > 0 and cols % _s == 0:
+                comp = tuple(int(x) * (cols // _s) for x in comp)
+            elif rows > 0 and rows % _s == 0:
+                comp = tuple(int(x) * (rows // _s) for x in comp)
+        out.append(
+            ManifestPiece(
+                param_name=name,
+                tensor_class=sh.tensor_class(name),
+                rows_full=rows,
+                cols_full=cols,
+                itemsize=item,
+                tag=str(getattr(geom, "tag", "")),
+                nbytes=rows * cols * item,
+                component_rows=comp,
+                flat_table=getattr(geom, "flat_table", None),
+            )
+        )
+    return tuple(sorted(out, key=lambda p: p.param_name))
+
+
+def write_rank_manifest(manifest: RankManifest, dump_dir: str, *,
+                        supersede: bool = False) -> str:
+    """Write one rank's manifest atomically; return the path.
+
+    ATOMIC because the reader is another process on the same box and a
+    half-written file is indistinguishable from a short one: the join would
+    then refuse a tensor that IS placed, which is the false-red direction.
+
+    ``supersede``: the SAME writer replaces its own load-time manifest
+    (fnFL2x10: the drafter's post-load share/rebuild changed its parameters
+    after the load-time write). Allowed only when the prior file carries the
+    same identity (group, rank, tp_rank, pp_rank); weg2xsn22's collision --
+    two ranks resolving to one name -- differs exactly there and still
+    refuses.
+    """
+    os.makedirs(dump_dir, exist_ok=True)
+    path = os.path.join(dump_dir, manifest_filename(
+        manifest.rank, manifest.group, manifest.region_tag,
+        tp_rank=manifest.tp_rank, pp_rank=manifest.pp_rank))
+    # THE RATCHET AGAINST weg2xsn22's OWN DEFECT, at the only place that can
+    # see it: a file of THIS boot already here, carrying a DIFFERENT inventory,
+    # means two writers resolved to one name. That is the collision, and it
+    # must be a refusal rather than a last-writer-wins overwrite -- which is
+    # exactly what produced four `rank=0` lines with pieces 515/505/893 on one
+    # file and then `join-manifest-missing: 2 of 6`.
+    #
+    # SAME token AND same piece set is a legitimate re-write (a rank that ran
+    # the site twice for one runner); it is allowed and silent.
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                prior = RankManifest.from_json(json.load(fh), path=path)
+        except BaseException:  # noqa: BLE001 -- an unreadable file is replaced
+            prior = None
+        _same_writer = (
+            prior is not None
+            and (str(prior.group), int(prior.rank), prior.tp_rank, prior.pp_rank)
+            == (str(manifest.group), int(manifest.rank), manifest.tp_rank,
+                manifest.pp_rank))
+        if (prior is not None
+                and prior.boot_token == manifest.boot_token
+                and not (supersede and _same_writer)
+                and tuple(p.key for p in prior.pieces)
+                != tuple(p.key for p in manifest.pieces)):
+            raise wx.PdFlipXchgPlanDisagree(
+                f"W68 PdFlipXchgPlanDisagree: {path} already holds a manifest of "
+                f"this boot with a DIFFERENT inventory "
+                f"({len(prior.pieces)} pieces, tp_rank={prior.tp_rank} "
+                f"pp_rank={prior.pp_rank}) than the one being written "
+                f"({len(manifest.pieces)} pieces, tp_rank={manifest.tp_rank} "
+                f"pp_rank={manifest.pp_rank}). Two writers resolved to ONE "
+                f"file name, so one rank's placement would stand for another's "
+                f"-- boot weg2xsn22 lost every leg to exactly this. Refusing "
+                f"instead of overwriting.")
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(manifest.as_json(), fh, sort_keys=True)
+    os.replace(tmp, path)
+    return path
+
+
+def load_manifests(dump_dir: str, *, boot_token: str = "") -> Tuple[RankManifest, ...]:
+    """Every manifest in a directory, newest-boot only.
+
+    ``boot_token`` is a FILTER and not a hope: a stale file from a previous
+    boot in the same evidence directory would join silently and the resulting
+    plan would name extents no rank holds.  With a token given, a file that
+    does not carry it is skipped and COUNTED by the caller's line; without
+    one, everything present is read (the hermetic path).
+    """
+    try:
+        names = sorted(f for f in os.listdir(dump_dir)
+                       if f.startswith(MANIFEST_PREFIX + "_") and f.endswith(".json"))
+    except OSError:
+        return ()
+    out: List[RankManifest] = []
+    for fname in names:
+        path = os.path.join(dump_dir, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        man = RankManifest.from_json(raw, path=path)
+        if boot_token and man.boot_token != boot_token:
+            continue
+        out.append(man)
+    return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# THE JOIN -- the cross-group knowledge, read off the two groups' own records.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class JoinedTensor:
+    """One tensor, as BOTH groups together describe it.
+
+    GROUP-ORIENTED, NOT ROLE-ORIENTED, and that is the whole reason this
+    dataclass names ``pp_stage``/``tp_widths`` instead of ``src``/``dst``: a
+    flip goes BOTH ways, and the two directions must come out of ONE join or
+    they are two derivations of one fact again.  Which side is the source is
+    the DIRECTION's business (:func:`plan_from_join`), never the join's.
+
+    ``rows_full``/``cols_full`` are the UNSHARDED extents -- the TP side's rows
+    summed on the sharded axis -- which is precisely the number
+    ``derive_leg_plan``'s docstring says no single rank holds (``:3121``).
+    """
+
+    param_name: str
+    tensor_class: str
+    tag: str
+    itemsize: int
+    rows_full: int
+    cols_full: int
+    shard_axis: int
+    #: Which rank of the PP group holds this tensor WHOLE.
+    pp_stage: int
+    #: The TP group's per-rank extent on the sharded axis, in rank order.
+    tp_widths: Tuple[int, ...]
+    pp_card: int
+    #: DECLARED PAD on the sharded axis (weg2xsn23): the vocabulary is padded
+    #: PER RANK to a multiple of `vocab_pad_unit()`, so the TP side holds more
+    #: rows than the checkpoint has. They exist on no source and are ZEROFILL
+    #: by design -- `ParamGeom.content_units` and `_emit`'s pad branch already
+    #: own that, so this is DECLARED here and clipped nowhere.
+    pad_units: int = 0
+    #: #1384: for a MIXED_FUSED tensor, the RESOLVED per-component
+    #: ``(axis, whole_rows)`` pairs -- straight off ``_mixed_fused_axis``'s
+    #: own resolution, never recomputed. ``()`` for every one of the five
+    #: ordinary classes.
+    component_axes: Tuple[int, ...] = ()
+    component_whole_rows: Tuple[int, ...] = ()
+    #: #1384: ``component_rank_rows[i][r]`` is TP rank ``r``'s declared row
+    #: count of component ``i`` -- ``cut``'s own ``component_rows``, read off
+    #: by the join and carried through untouched.
+    component_rank_rows: Tuple[Tuple[int, ...], ...] = ()
+    #: G1: the joined flat-container declarations (``FlatJoin``) of a
+    #: ``FLAT_SEGMENTS`` tensor; ``None`` for every other class.
+    flat_join: Optional[object] = None
+
+    @property
+    def sharded(self) -> bool:
+        return self.shard_axis != wx.REPLICATED
+
+    def geom(self, *, tp_is_dst: bool) -> wx.ParamGeom:
+        """The ``ParamGeom`` the plan consumes.  No tensor is read.
+
+        ``family`` IS THE PARAMETER'S OWN NAME, and that is the hinge that
+        makes the mirror direction work at all.  ``_blocks_of`` honours a
+        per-tensor width vector ONLY on the destination
+        (``weight_exchange.py:1575``: ``if is_dst and geom.dst_widths is not
+        None``); the SOURCE side with ``tp_size > 1`` goes through
+        ``layout.ratios_for(geom.family)`` (``:1594``), which is a GROUP-level
+        lookup.  Under ``tp_to_pp`` the TP group is the source, so a plan that
+        only filled ``dst_widths`` would have fallen back to an even split on
+        the very side that is unevenly cut -- silently, on both ends equally,
+        which is the #1275 class.  Keying ``family_ratios`` by the parameter
+        name turns that group-level lookup into a per-tensor one without a new
+        field in ``ParamGeom`` and without touching ``_blocks_of``.
+
+        THE VOCABULARY LAW IS NOT BYPASSED, IT IS SUPERSEDED BY MEASUREMENT.
+        ``ratios_for`` (``:510``) exists so the vocabulary keeps the even split
+        under an uneven base plan.  Here the widths are not a plan at all --
+        they are what the two groups' loaders ACTUALLY DID, read back off their
+        own manifests.  Whatever ``VocabParallelEmbedding`` chose for
+        ``embed_tokens`` is the vector this returns for ``embed_tokens``, so
+        the law is satisfied by construction rather than by a family taxonomy
+        that has to be kept in step with the loader.
+        """
+        geom = wx.ParamGeom(
+            name=self.param_name,
+            tag=self.tag,
+            shard_axis=self.shard_axis,
+            rows_full=int(self.rows_full),
+            cols_full=int(self.cols_full),
+            itemsize=int(self.itemsize),
+            stage=int(self.pp_stage),
+            pad_units=int(self.pad_units),
+            family=(None if not self.sharded else str(self.param_name)),
+            # `dst_widths` is the ORDINARY seeded-ROWS mechanism and does not
+            # apply to MIXED_FUSED: `_blocks_of`'s MIXED_FUSED branch never
+            # reads it, and the OUTER per-rank totals in `tp_widths` do not
+            # sum to `rows_full` for this axis by construction (they double-
+            # count the replicated components) -- `validate()`'s ordinary
+            # dst_widths check would refuse a perfectly good MIXED_FUSED geom
+            # on that mismatch alone.
+            # #80 (fnFL2w7, 21.09.): EIN NICHT-HALTER IST KEIN ZIEL, auch
+            # wenn die Form REPLIZIERT heisst. Seit #76 darf eine Teilmenge
+            # der TP-Gruppe einen Tensor halten, solange alle Halter ihn GANZ
+            # tragen -- das ist unter Form A der Normalfall: der
+            # Attention-Host haelt jedes Dense-Gewicht, die Experten-Worker
+            # keins. Der Breitenvektor sagt das (w, 0, 0), aber er erreichte
+            # `_blocks_of` nie, weil `self.sharded` bei REPLICATED falsch ist
+            # -- also fiel der Plan auf den gleichmaessigen Split ueber ALLE
+            # Raenge zurueck und adressierte Karten, die den Tensor nicht
+            # haben.
+            #
+            # GEMESSEN an fnFL2w7: P wartete auf lane=c1 (descs=37,
+            # 81.466.808 B) und lane=c2 (descs=113, 237.381.840 B) auf
+            # `layers.29/42.attn_hyper_connection.block_inject_weight.weight`
+            # -- und die Manifeste desselben Boots sagen: D rank1 = 0 solche
+            # Tensoren, D rank2 = 0, D rank0 = 384. Der Collect lief in sein
+            # volles Budget, dann W29 auf resume_memory_occupation, 0/6.
+            #
+            # Eine Null-Breite ist also eine ECHTE Aussage ueber das Ziel und
+            # muss durch, gerade bei REPLICATED. MIXED_FUSED bleibt aussen vor
+            # (siehe unten) und ein Vektor ohne Null aendert nichts.
+            dst_widths=(tuple(int(w) for w in self.tp_widths)
+                        if (tp_is_dst
+                            and self.shard_axis not in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS,
+                                                        wx.FLAT_SEGMENTS)
+                            and (self.sharded
+                                 or any(int(w) == 0 for w in self.tp_widths)))
+                        else None),
+            # #102 (fnFL2w36/w37): DIESELBE KARTE, WENN DIE TP-GRUPPE DIE
+            # QUELLE IST. Bedingung woertlich die des Ziels, nur die
+            # Richtung gespiegelt -- eine Null-Breite ist auch hier eine
+            # ECHTE Aussage, naemlich "dieser Rang haelt den Tensor nicht".
+            # Ohne sie shardet die Quellseite generisch ueber alle Raenge
+            # und verlangt Layer-29-Dense von D-Rang 1, dessen Adressbuch
+            # nur `mlp.experts.*` fuehrt: "33 of 37 descs have no address
+            # on the side this rank owns" (w37, 01:45:34Z), Lane nie
+            # deponiert, P 90 s im Zeitbudget, alle drei PP-Raenge tot.
+            src_widths=(tuple(int(w) for w in self.tp_widths)
+                        if ((not tp_is_dst)
+                            and self.shard_axis not in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS,
+                                                        wx.FLAT_SEGMENTS)
+                            and (self.sharded
+                                 or any(int(w) == 0 for w in self.tp_widths)))
+                        else None),
+            flat_join=(self.flat_join if self.shard_axis == wx.FLAT_SEGMENTS else None),
+            # #1384: MIXED_FUSED needs its declared components on the geom
+            # regardless of `tp_is_dst` -- `_blocks_of` is called once per
+            # SIDE (source and destination) for the same geom, and the TP
+            # group can be either side depending on direction.
+            component_rows=(self.component_whole_rows
+                            if self.shard_axis in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS) else ()),
+            component_axes=(self.component_axes
+                            if self.shard_axis in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS) else ()),
+            component_rank_rows=(self.component_rank_rows
+                                 if self.shard_axis in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS) else ()),
+        )
+        geom.validate()
+        return geom
+
+
+@dataclass(frozen=True)
+class ManifestJoin:
+    """The joined placement of ONE BOOT -- both directions, one derivation."""
+
+    pp_group: str
+    tp_group: str
+    cards: Tuple[int, ...]
+    tensors: Tuple[JoinedTensor, ...]
+    #: ALWAYS empty on a successful join (they are W74); kept so a caller can
+    #: print the census rather than infer it from an exception.
+    unsourced: Tuple[str, ...]
+    pp_ranks: int
+    tp_ranks: int
+
+    @property
+    def by_name(self) -> Dict[str, JoinedTensor]:
+        return {t.param_name: t for t in self.tensors}
+
+    @property
+    def n_sharded(self) -> int:
+        return sum(1 for t in self.tensors if t.sharded)
+
+    def family_ratios(self) -> Dict[str, Tuple[int, ...]]:
+        """The TP group's per-tensor width vector, keyed by parameter name."""
+        return {t.param_name: tuple(int(w) for w in t.tp_widths)
+                for t in self.tensors if t.sharded}
+
+    def line(self, direction: str = "") -> str:
+        """Every number with its denominator (the denominator law)."""
+        classes = sorted({t.tensor_class for t in self.tensors})
+        return (
+            f"{JOIN_LINE_PREFIX} pp={self.pp_group} tp={self.tp_group} "
+            f"{('direction=' + direction + ' ') if direction else ''}"
+            f"pp_ranks={self.pp_ranks} tp_ranks={self.tp_ranks} "
+            f"tensors={len(self.tensors)} "
+            f"sharded={self.n_sharded}/{len(self.tensors)} "
+            f"unsourced={len(self.unsourced)} "
+            f"padded={sum(1 for t in self.tensors if t.pad_units)} "
+            f"classes={len(classes)} "
+            f"-- extents are the JOIN's (the TP side's rows summed), not any "
+            f"one rank's reading; the direction chooses roles, not extents"
+        )
+
+
+def vocab_pad_unit() -> int:
+    """The vocabulary's padding granularity, READ FROM THE TREE.
+
+    ``layers/vocab_parallel_embedding.DEFAULT_VOCAB_PADDING_SIZE``, imported
+    rather than written as 64 here: it is the number ``pad_vocab_size`` rounds
+    to, ``VocabParallelEmbedding``/``ParallelLMHead`` take as their
+    ``padding_size`` default, and the loader actually padded with. A literal
+    would be a second copy of a constant the loader owns, and the two would
+    part company the day anyone passes a different ``padding_size``.
+    """
+    from flliper.srt.layers.vocab_parallel_embedding import (
+        DEFAULT_VOCAB_PADDING_SIZE,
+    )
+
+    return int(DEFAULT_VOCAB_PADDING_SIZE)
+
+
+def _pad_vocab_size(n: int) -> int:
+    """``pad_vocab_size`` from the tree -- the loader's OWN rounding."""
+    from flliper.srt.layers.vocab_parallel_embedding import pad_vocab_size
+
+    return int(pad_vocab_size(int(n)))
+
+
+def _mixed_fused_axis(
+    whole: ManifestPiece, cut: Sequence[ManifestPiece],
+    axis: str = "rows",
+) -> Optional[Tuple[Tuple[int, int, Tuple[int, ...]], ...]]:
+    """Per-component ``(axis, rows_full, per_rank_rows)`` for a declared
+    mixed-fused tensor.  ``per_rank_rows`` is ``cut``'s OWN declared values
+    for that component, in ``cut``'s order -- read, not recomputed; #1384's
+    ``JoinedTensor``/``ParamGeom`` carry it onward so the actual byte
+    copy/compare (``weight_exchange.mixed_fused_blocks``) never has to
+    re-derive a boundary either.
+
+    ``None`` means "this is not (provably) a mixed-fused tensor" -- the
+    caller's ``_axis_of`` then falls through to the ordinary W68 refusal, the
+    same as if this function did not exist.  Every early return here is a
+    REFUSAL TO GUESS, not a relaxed check:
+
+    * no declared components on the whole side -> ``None`` (pre-#1384
+      manifest, or a tensor nobody declared a split for -- most tensors);
+    * a different NUMBER of components declared on one side than another, or
+      a side whose own components do not sum to its own reported row count
+      -> ``None``.  A self-inconsistent declaration is not evidence of
+      anything and is treated exactly like no declaration: the outer W68
+      still fires, naming the outer disagreement.
+    * any ONE component that is neither REPLICATED (equal on every rank,
+      equal to the whole's) nor a plain ROWS cut (summing to the whole's) ->
+      ``None``, immediately -- a real per-component divergence must not be
+      swallowed by treating the other, agreeing components as proof enough.
+      This is the mutant this function is built against: a corrupted
+      replica on one rank must refuse, not classify.
+    * every component agreeing on the SAME single axis -> ``None`` also.
+      That tensor already has an outer-arithmetic answer (one of the five
+      cases above would have returned it already had the caller reached
+      here without them all failing first), so this function is never the
+      reason a single-axis tensor classifies -- keeping the "five outer
+      cases, no silent sixth" claim true for every tensor that already
+      worked, and confining MIXED_FUSED to tensors that are STRUCTURALLY a
+      mix of at least two axes.
+    """
+    # weg2xsn258: `axis="cols"` reads the SAME declaration against the
+    # column extent -- compressed-tensors pack-quantized (Marlin) stores a
+    # column-parallel weight as [K/16, N*pack], so the fused q|k|v boundaries
+    # live on the storage COLUMN axis (see weight_exchange.MIXED_FUSED_COLS).
+    _total = ((lambda p: int(p.cols_full)) if axis == "cols"
+              else (lambda p: int(p.rows_full)))
+    w_comp = tuple(int(x) for x in whole.component_rows)
+    # #1378 xsn74: TWO OR MORE declared components is the whole condition.
+    # The first form also demanded two DIFFERENT axes among them, so a fused
+    # tensor whose components are all ratio-split (gate_up_proj [gate|up],
+    # in_proj_qkvz [q|k|v|z], in_proj_ba [b|a], conv1d [k|k|v], and QKV
+    # itself once kv >= tp) fell through to the plain ROWS cut -- which lays
+    # rank 0's [c0_0|c1_0] before rank 1's [c0_1|c1_1] where the whole is
+    # [c0_0 c0_1 .. | c1_0 c1_1 ..]. The first SEAM-DIGEST verdict ever
+    # reached (weg2xsn74) read exactly those tensors as content-changed with
+    # placement identical.
+    if len(w_comp) < 2 or sum(w_comp) != _total(whole):
+        return None
+    cut_comp: List[Tuple[int, ...]] = []
+    for piece in cut:
+        c = tuple(int(x) for x in piece.component_rows)
+        if len(c) != len(w_comp) or sum(c) != _total(piece):
+            return None
+        cut_comp.append(c)
+
+    axes: List[Tuple[int, int, Tuple[int, ...]]] = []
+    for i, w_i in enumerate(w_comp):
+        rows_i = tuple(c[i] for c in cut_comp)
+        if len(set(rows_i)) == 1 and rows_i[0] == w_i:
+            axes.append((wx.REPLICATED, w_i, rows_i))
+        elif sum(rows_i) == w_i:
+            axes.append((wx.ROWS, w_i, rows_i))
+        else:
+            return None
+    return tuple(axes)
+
+
+def _axis_of(name: str, whole: ManifestPiece,
+             cut: Sequence[ManifestPiece],
+             ) -> Tuple[int, int, int, Tuple[int, ...], int]:
+    """``(shard_axis, rows_full, cols_full, tp_widths, pad_units)`` -- READ.
+
+    FIVE cases read off the OUTER tensor, plus one MORE that is read off its
+    DECLARED COMPONENTS rather than invented here (#1384, ``W68`` on
+    ``qkv_proj``-style tensors): a fused row tensor whose components do not
+    all share one axis, e.g. ``QKVParallelLinear`` under
+    ``attn_kv_replicated`` (#62/#116) -- Q ratio-split across TP while K/V are
+    FULLY REPLICATED on every rank once ``kv_heads < tp_size`` (#1382).  The
+    outer row counts alone (e.g. D ranks ``3072/2048/2048`` against a P whole
+    of ``5120``) satisfy none of the five outer tests, because the KV rows
+    are counted once on P and ``tp_size`` times across D's ranks -- that is
+    not a shape disagreement, it is two different axes concatenated in one
+    tensor.  ``MIXED_FUSED`` is not a SIXTH GUESS from row-count arithmetic
+    (the danger direction here is exactly that: a wrong guess would compare
+    the wrong bytes and could still report MATCH); it fires only when every
+    side has DECLARED the same component boundaries (``component_rows``,
+    read off the module that already computed them -- ``linear.py``
+    ``q_proj_shard_size``/``kv_proj_shard_size``/``v_proj_shard_size`` --
+    never re-derived here) and EACH declared component independently passes
+    one of the five tests below.  A tensor with no declared components, or
+    whose components do not independently resolve, still raises exactly the
+    W68 below -- the guard stays sharp for genuine disagreement.  See
+    :func:`_mixed_fused_axis`.
+
+    The sixth outer-arithmetic guess the docstring used to warn against is
+    still refused: a silent ``REPLICATED`` for everything unmatched, which is
+    the tree's OLD answer (``weight_exchange_shadow.py:3237``) and the reason
+    the shard cut was invisible since S2 -- a plan that calls every tensor
+    replicated moves whole tensors between differently-shaped groups and
+    calls that agreement.
+
+    ``whole`` is the PP side (one stage holds the tensor entire) and ``cut`` the
+    TP side's rows.  Both are read off manifests, so this is a comparison of
+    two measurements and not an inference from either.
+
+    **THE PADDED CUT IS ITS OWN CLASS, and boot weg2xsn23 is why.**  The exact
+    test ("rows sum to the whole") refused ``lm_head.weight`` 9 legs out of 9::
+
+        W68 ... lm_head.weight: the PP side holds (248320, 5120) and the TP
+        rows hold [(82816, 5120), (82816, 5120), (82816, 5120)]
+
+    3 x 82816 = 248448 = 248320 + 128.  The vocabulary is padded PER RANK to a
+    multiple of :func:`vocab_pad_unit` (``pad_vocab_size``: ceil(248320/3) =
+    82774 -> 82816), so the TP side legitimately holds MORE rows than the
+    checkpoint has.  Those 128 rows exist on no card's source and in no
+    checkpoint -- ``ParamGeom``'s own docstring already names this exact case
+    ("128 rows exist on no card and in no checkpoint and are ZEROFILL by
+    design", spec section 2.2).
+
+    SO THE PAD IS NOT CLIPPED HERE.  It is DECLARED: ``rows_full`` becomes the
+    padded total and ``pad_units`` the excess, which is precisely what
+    ``ParamGeom.content_units`` and ``_emit``'s pad branch already consume --
+    the destination's trailing rows become ZEROFILL descriptors with no source,
+    and the source side's ``content_units`` stays the checkpoint's extent.
+    Re-implementing a clip here would be a second answer to a question the plan
+    machinery already answers.
+
+    THE BOUND IS THE DANGER DIRECTION.  Accepting any surplus would turn a
+    genuinely disagreeing pair into a "padded" one and move the wrong bytes, so
+    the excess must be smaller than ``len(cut) * pad_unit`` -- the most any
+    correct per-rank rounding can add.  Anything larger is still refused.
+    """
+    rows = [int(p.rows_full) for p in cut]
+    cols = [int(p.cols_full) for p in cut]
+    w_rows, w_cols = int(whole.rows_full), int(whole.cols_full)
+
+    # G1: A DECLARED FLAT CONTAINER IS READ OFF ITS DECLARATIONS, FIRST. Its
+    # extent is one byte row per rank; the outer tests below would refuse it
+    # (every rank pads for itself) or -- when the byte totals add up by
+    # coincidence -- read a plain column cut and copy rank 0's segments over the
+    # whole's first bytes. Both sides must declare, or neither.
+    # (read with getattr: a piece from before G1 -- or a duck-typed one -- has
+    # no declaration, which is exactly "not a flat container")
+    w_flat = getattr(whole, "flat_table", None)
+    c_flat = [getattr(p, "flat_table", None) for p in cut]
+    declared = [t is not None for t in c_flat]
+    if w_flat is not None or any(declared):
+        if w_flat is None or not all(declared):
+            raise wx.PdFlipXchgPlanDisagree(
+                f"W68 PdFlipXchgPlanDisagree: {name}: the PP side "
+                f"{'declares' if w_flat is not None else 'does not declare'} "
+                f"a flat container and the TP ranks declare {declared} -- one "
+                f"tensor cannot be a segment container on one side only."
+            )
+        from flliper.srt.pdflip import xchg_flat_segments as _fs
+
+        _fs.join_tables(name, w_flat, c_flat)
+        return (wx.FLAT_SEGMENTS, w_rows, w_cols,
+                tuple(int(t.nbytes) for t in c_flat), 0)
+
+    same_cols = len(set(cols)) == 1 and cols[0] == w_cols
+    same_rows = len(set(rows)) == 1 and rows[0] == w_rows
+
+    if same_rows and same_cols:
+        return wx.REPLICATED, w_rows, w_cols, tuple(rows), 0
+    # #1378 xsn74: DECLARED COMPONENTS WIN OVER THE PLAIN ROW CUT. A fused
+    # column-parallel tensor whose components are all ratio-split satisfies
+    # `sum(rows) == w_rows` exactly, and the plain cut then concatenates the
+    # ranks' [c0_r|c1_r] blocks -- the whole is [c0_all|c1_all]. Both sides
+    # declare the same component count and their sums match the row counts,
+    # or this returns None and the outer tests below decide as before.
+    if same_cols and _mixed_fused_axis(whole, cut) is not None:
+        return wx.MIXED_FUSED, w_rows, w_cols, tuple(rows), 0
+    if same_cols and sum(rows) == w_rows:
+        return wx.ROWS, w_rows, w_cols, tuple(rows), 0
+    # weg2xsn258 (W90 on lued): a column cut whose declared components
+    # each resolve on the column axis is MIXED_FUSED_COLS, never a plain
+    # COLS cut -- the plain cut copies rank 0's [q|k|v] shard onto the
+    # whole's first N/2 columns (measured: moved=52 on PP1).
+    if same_rows and _mixed_fused_axis(whole, cut, axis="cols") is not None:
+        return wx.MIXED_FUSED_COLS, w_rows, w_cols, tuple(cols), 0
+    if same_rows and sum(cols) == w_cols:
+        return wx.COLS, w_rows, w_cols, tuple(cols), 0
+
+    # THE PADDED CUTS.  Same shape as the exact ones, plus a DECLARED pad.
+    #
+    # THE PREDICATE IS THE TREE'S OWN ROUNDING, NOT A TOLERANCE, and that
+    # correction came from this slice's own test: a first draft accepted any
+    # surplus below ``tp_size * pad_unit`` and immediately swallowed a
+    # THREE-ROW skew on ``qkv_proj`` -- a genuine disagreement read as padding,
+    # which is precisely the danger direction the refusal text below names. A
+    # width band is not a predicate; ``pad_vocab_size`` is.
+    #
+    # So a padded cut is recognised only when every rank holds EXACTLY what
+    # ``pad_vocab_size(ceil(full / n))`` produces -- equal widths, the tree's
+    # own rounding, no slack. weg2xsn23: ceil(248320/3) = 82774 -> 82816 on
+    # all three, total 248448, declared pad 128.
+    def _padded(total_full: int, widths: Sequence[int], pack: int = 1) -> bool:
+        if len(set(widths)) != 1 or widths[0] <= 0:
+            return False
+        n = len(widths)
+        if pack > 1 and (int(total_full) % pack or int(widths[0]) % pack):
+            return False
+        total_u, width_u = int(total_full) // pack, int(widths[0]) // pack
+        expect = _pad_vocab_size((total_u + n - 1) // n)
+        return width_u == int(expect) and n * int(expect) > total_u
+
+    if same_cols and _padded(w_rows, rows):
+        return wx.ROWS, sum(rows), w_cols, tuple(rows), sum(rows) - w_rows
+    # 27B line, RadixArk NVFP4 (lm_head NVFP4 on Marlin under --fp8-uniform-
+    # marlin): a Marlin-packed vocab-parallel head keeps the vocabulary on its
+    # COLUMN axis, ``pack`` int32 columns per vocab entry (int32 [K/16, 2V] for
+    # 4-bit, [K/16, 4V] for 8-bit; Marlin's 64-wide tiles keep a vocab slice a
+    # contiguous column range). The per-rank vocab padding is then read in
+    # VOCAB units, i.e. the columns divided by the pack -- only for an int32
+    # container (itemsize 4), the one a Marlin weight has, and with the same
+    # exact-rounding test as the unpacked case, so the danger bound holds.
+    _packs = (1,) + ((2, 4) if int(whole.itemsize) == 4 else ())
+    for _pack in _packs:
+        if same_rows and _padded(w_cols, cols, _pack):
+            return wx.COLS, w_rows, sum(cols), tuple(cols), sum(cols) - w_cols
+
+    # THE ZERO PAD EXPERT (#74, fnFL2w1).  The expert-dim shard carries ONE
+    # extra local row per rank, and it is not a skew -- it is this tree's own
+    # convention, written down in `expert_store.global_rows`:
+    #
+    #     ``pad=True`` is the generic expert-dim shard: local 0 is the zero
+    #     pad expert (no row), local i >= 1 is global ``lo + i - 1``.
+    #     ``pad=False`` is an unsharded layer (a PP stage holding every
+    #     expert): local i is global ``lo + i``.
+    #
+    # So the two groups describe the SAME tensor correctly and differently:
+    # group P runs the layer unsharded (pad=False) and holds the whole expert
+    # count; group D shards the expert dim (pad=True) and every rank holds its
+    # slice PLUS the zero row at local 0. Measured fnFL2w1 on
+    # `model.layers.0.mlp.experts.w13_weight_shape`: P (512, 2) against
+    # [(61, 2), (227, 2), (227, 2)] -- 61+227+227 = 515 = 512 + 3 ranks, at a
+    # cut of 60,226,226 (`--rank-moe-ratio`). The join refused, the wake
+    # refused behind it, and the whole flip died at the first wake.
+    #
+    # A PREDICATE, NOT A BAND -- the same discipline `_padded` above states
+    # for the vocab pad: EXACTLY one surplus row per rank, nothing else
+    # passes. A two-row surplus on one rank is still a genuine disagreement
+    # and still refuses. Two further conditions keep it from over-reaching:
+    #
+    #   * only on an EXPERT tensor (``.experts.`` in the name) -- the pad
+    #     convention is the expert shard's, and nothing else in the tree
+    #     carries it;
+    #   * every rank must hold at least 2 rows (one real expert + the pad),
+    #     because a rank of width 1 would be all pad and no payload, which is
+    #     not a cut this can vouch for.
+    def _expert_pad_cut(nm: str, total_full: int, widths: Sequence[int]) -> bool:
+        if ".experts." not in str(nm):
+            return False
+        if len(widths) < 2 or any(int(w) < 2 for w in widths):
+            return False
+        return sum(int(w) for w in widths) - len(widths) == int(total_full)
+
+    if same_cols and _expert_pad_cut(name, w_rows, rows):
+        # declared pad = one row per rank, which is exactly the surplus
+        return wx.ROWS, sum(rows), w_cols, tuple(rows), len(rows)
+
+    # THE MIXED-FUSED FALLBACK (#1384).  Only reached once all five outer
+    # tests above have already failed, so every geometry that used to
+    # classify (kv >= tp: Q and KV split TOGETHER, no replication skew, the
+    # plain ROWS test above already returns) is BYTE-IDENTICAL to before --
+    # this code cannot run for them.
+    if same_cols and _mixed_fused_axis(whole, cut) is not None:
+        return wx.MIXED_FUSED, w_rows, w_cols, tuple(rows), 0
+
+    raise wx.PdFlipXchgPlanDisagree(
+        f"W68 PdFlipXchgPlanDisagree: {name}: the PP side holds "
+        f"({w_rows}, {w_cols}) and the TP rows hold {list(zip(rows, cols))}. "
+        f"That is neither a row cut (equal columns, rows summing to the "
+        f"whole), nor a column cut, nor a replica, nor a PADDED cut (every "
+        f"rank would have to hold exactly pad_vocab_size(ceil(full/"
+        f"{len(cut)})) = {_pad_vocab_size((w_rows + len(cut) - 1) // len(cut))} "
+        f"rows or {_pad_vocab_size((w_cols + len(cut) - 1) // len(cut))} "
+        f"columns, the tree's OWN per-rank rounding at pad unit "
+        f"{vocab_pad_unit()}; a tolerance band here would read a genuine "
+        f"disagreement as padding) -- so the "
+        f"two groups cannot both be describing the same tensor. Guessing "
+        f"REPLICATED here is what made the shard cut invisible; the join "
+        f"refuses instead."
+    )
+
+
+def merge_region_tags(manifests: Iterable[RankManifest]) -> List[RankManifest]:
+    """One record per RANK, unioning that rank's region-tag files.
+
+    A rank publishes one manifest per RUNNER (main model, drafter), because
+    ``arm_coverage_at_load`` fires once per runner with that runner's own region
+    tag.  The join's unit is the RANK -- what bytes rank *n* holds -- so the
+    files of one rank are unioned here rather than being three separate rows
+    that would break the contiguous-rank check and, worse, let one runner's
+    view stand for the rank's.
+
+    A parameter NAME claimed by two region tags of one rank with DIFFERENT
+    identities is refused: that is two runners disagreeing about one tensor, and
+    picking either would be the rank-local derivation this module removes.
+    ``region_tag`` on the merged record becomes the sorted join of the tags it
+    covers, so the provenance stays readable.
+    """
+    by_rank: Dict[int, List[RankManifest]] = {}
+    for man in manifests:
+        by_rank.setdefault(int(man.rank), []).append(man)
+    out: List[RankManifest] = []
+    for rank in sorted(by_rank):
+        rows = sorted(by_rank[rank], key=lambda m: m.region_tag)
+        # KEYED BY (REGION, NAME), NOT BY NAME. Measured on weg2xsn25: the
+        # drafter is a one-layer Qwen3_5 block, so EIGHT of P rank 0's
+        # nineteen draft pieces carry the SAME param_name as main-model
+        # tensors (`model.embed_tokens.weight`,
+        # `model.layers.0.input_layernorm.weight`, ...). Keyed by name alone
+        # the merge silently kept ONE of each pair -- and when the two
+        # geometries happened to agree, not even the refusal below fired. A
+        # name is not an identity across runners.
+        pieces: Dict[Tuple[str, str], ManifestPiece] = {}
+        for man in rows:
+            for piece in man.pieces:
+                pkey = (region_of_tag(piece.tag), piece.param_name)
+                prior = pieces.get(pkey)
+                if prior is not None and prior.key != piece.key:
+                    raise wx.PdFlipXchgPlanDisagree(
+                        f"W68 PdFlipXchgPlanDisagree: {piece.param_name} is "
+                        f"published twice by {man.group} rank {rank} IN ONE "
+                        f"REGION ({pkey[0]}) with DIFFERENT identities "
+                        f"{prior.key} vs {piece.key}. Two writers of one "
+                        f"region disagree about one tensor, and picking "
+                        f"either would be exactly the rank-local derivation "
+                        f"the manifest replaces. (The same NAME in two "
+                        f"different regions is normal and is kept apart.)"
+                    )
+                pieces.setdefault(pkey, piece)
+        head = rows[0]
+        out.append(RankManifest(
+            group=head.group, rank=rank, card=head.card,
+            region_tag="+".join(sorted({m.region_tag for m in rows if m.region_tag})),
+            boot_token=head.boot_token,
+            pieces=tuple(sorted(pieces.values(), key=lambda p: p.param_name)),
+        ))
+    return out
+
+
+def _other_expert_spelling(name: str) -> str:
+    """The same expert stack under the OTHER representation: the Platztausch
+    buffer (``...experts.pdflip_experts_<attr>``) <-> the plain stack
+    (``...experts.<attr>``). Pure string work on the last component."""
+    from flliper.srt.managers.pdflip_memory_saver import EXPERT_BUFFER_ATTR_PREFIX
+
+    head, _, last = str(name).rpartition(".")
+    if last.startswith(EXPERT_BUFFER_ATTR_PREFIX):
+        last = last[len(EXPERT_BUFFER_ATTR_PREFIX):]
+    else:
+        last = EXPERT_BUFFER_ATTR_PREFIX + last
+    return f"{head}.{last}" if head else last
+
+
+def _refuse_one_sided_expert_buffers(
+    *,
+    tp: Sequence[RankManifest],
+    pp: Sequence[RankManifest],
+    tp_only: Sequence[Tuple[str, str]],
+    pp_only: Sequence[Tuple[str, str]],
+    pp_group: str,
+    tp_group: str,
+) -> None:
+    """W74 for a Platztausch expert buffer only ONE group publishes.
+
+    fnFL2x100 (FR_P 0.45/0.95/1.0): P's last stage held all 512 experts, so
+    ``plan_load_time_staging`` built it NO Platztausch buffer and it
+    published the plain ``mlp.experts.w13_weight_packed`` [512, ...] stack for
+    layers 40-47, while every D rank published ``pdflip_experts_*``. The join
+    dropped D's 32 buffers (3.69 GB) as "destination-only names ... come back
+    from the disk-reload fallback" -- a fallback this INT4 checkpoint does not
+    have (W4) -- and never looked at P's 32 plain stacks at all. D TP1's plan
+    lost ``weights_14``/``weights_15`` whole and died at W106 in the flip;
+    D TP2 kept those tags only through the replicated ``mlp.gate.weight``, so
+    its own 1.1 GB per tag would have been released with no depositor.
+
+    A Platztausch buffer's prefix has ONE mover, the exchange (no dense
+    fallback, user decision 22.09.), so a buffer without a counterpart is
+    never "the disk-reload fallback's business": it is refused here, on every
+    rank alike (the join is a pure function of the same files), before the
+    first deposit. Other one-sided names keep their existing treatment.
+    """
+    from flliper.srt.managers.pdflip_memory_saver import is_expert_buffer_attr
+
+    sides = ((tp_group, tp, tp_only), (pp_group, pp, pp_only))
+    found = []
+    for group, mans, only in sides:
+        keys = {k for k in only if is_expert_buffer_attr(k[1])}
+        for man in mans:
+            for pc in man.pieces:
+                nkey = (region_of_tag(pc.tag), pc.param_name)
+                if nkey in keys:
+                    found.append((group, int(man.rank), pc))
+    if not found:
+        return
+    other_names = {
+        g: {pc.param_name for man in mans for pc in man.pieces}
+        for g, mans, _only in sides}
+    nbytes = sum(int(pc.nbytes) for _g, _r, pc in found)
+    tags = sorted({str(pc.tag) for _g, _r, pc in found},
+                  key=lambda t: (len(t), t))
+    holders = sorted({f"{g} rank {r}" for g, r, _pc in found})
+    first_group, first_rank, first = found[0]
+    peer = pp_group if first_group == tp_group else tp_group
+    spelled = _other_expert_spelling(first.param_name)
+    counterpart = (
+        f"; {peer} publishes the SAME stack as {spelled!r} instead -- one "
+        f"group holds a Platztausch buffer, the other the plain stack (a "
+        f"stage/rank whose resident fraction leaves < 2 scratch rows builds "
+        f"no buffer: W120)"
+        if spelled in other_names[peer] else "")
+    raise wx.PdFlipXchgSourceMissing(
+        f"W74 PdFlipXchgSourceMissing: {len(found)} Platztausch expert "
+        f"buffer piece(s) ({nbytes} bytes, tags {','.join(tags)}) held by "
+        f"{', '.join(holders)} have no counterpart in the other group "
+        f"(first: {first.param_name!r} on {first_group} rank {first_rank})"
+        f"{counterpart}. The exchange is the only mover of a buffer's "
+        f"prefix; planning around these would release them at sleep with "
+        f"nobody depositing them (x100: W106 on D TP1 weights_14).")
+
+
+def _join_manifests_uncached(
+    manifests: Sequence[RankManifest],
+    *,
+    pp_group: str = "P",
+    tp_group: str = "D",
+) -> ManifestJoin:
+    """Join the two groups' manifests over ``param_name``.  Never a default.
+
+    ONE JOIN SERVES BOTH DIRECTIONS.  It is deliberately not parameterised by
+    source and destination: a flip runs ``pp_to_tp`` and ``tp_to_pp`` and both
+    must come out of the same derivation, or the campaign has two answers to
+    one placement again.
+
+    THE CROSS-GROUP ANSWER IS THE POINT: a rank asks "which rank of the other
+    group holds the bytes I need, and how is this tensor cut over there", and
+    the answer comes from FILES THOSE RANKS WROTE -- not from a pointer the
+    asking process structurally cannot read (``weight_exchange_shadow.py:3336``).
+    """
+    pp = merge_region_tags(m for m in manifests if m.group == pp_group)
+    tp = merge_region_tags(m for m in manifests if m.group == tp_group)
+    if not pp or not tp:
+        raise wx.PdFlipXchgSourceMissing(
+            f"W74 PdFlipXchgSourceMissing: the join needs both groups' "
+            f"manifests and has {len(pp)} for {pp_group!r} and {len(tp)} for "
+            f"{tp_group!r}. An absent manifest is an absent SOURCE in one of "
+            f"the two directions, and planning over the ranks that did publish "
+            f"would silently narrow the exchange to whatever was on disk."
+        )
+    # #1378 xsn80: THE RANK VECTOR IS AN AXIS ONLY ON THE TP SIDE. A TP rank's
+    # position in the vector IS its shard boundary, so that side must publish
+    # 0..n-1 without a gap. A PP stage holds every tensor it publishes WHOLE
+    # and is keyed by (region, name) with its own card below, so a region
+    # that lives on ONE stage -- the MTP drafter on P's last stage, manifest
+    # rank=2 card=2 once it carried the process's place -- is a legitimate
+    # publication of ranks [2]. Insisting on [0] there refused the draft
+    # region on both sides (D: PDFLIP-XCHG-DRAFT-PLAN-SKIPPED, then W106) the
+    # moment the manifest stopped lying about where the drafter lives.
+    # Duplicates are still refused on the PP side: two stages claiming one
+    # rank would leave the plan free to pick either.
+    tp_ranks = [m.rank for m in tp]
+    if tp_ranks != list(range(len(tp))):
+        raise wx.PdFlipXchgPlanDisagree(
+            f"W68 PdFlipXchgPlanDisagree: group {tp_group!r} published ranks "
+            f"{tp_ranks}, which is not a contiguous 0..n-1 range. The "
+            f"per-rank extents are a VECTOR in rank order; a gap in it would "
+            f"shift every shard boundary."
+        )
+    pp_ranks = [m.rank for m in pp]
+    if len(set(pp_ranks)) != len(pp_ranks):
+        raise wx.PdFlipXchgPlanDisagree(
+            f"W68 PdFlipXchgPlanDisagree: group {pp_group!r} published ranks "
+            f"{pp_ranks} with a duplicate. Under the PP form one stage holds "
+            f"a tensor whole; two stages claiming one rank leave the plan free "
+            f"to pick either."
+        )
+
+    # KEYED BY (REGION, NAME) at this site too, so all four share ONE key
+    # type. With the region cut running before the join this is belt and
+    # braces on the product path -- and it is the site that makes the key
+    # honest for any caller that joins unfiltered manifests (the replay's own
+    # cost pass does exactly that).
+    pp_by_name: Dict[Tuple[str, str], Tuple[int, ManifestPiece]] = {}
+    pp_card_by_rank = {m.rank: m.card for m in pp}
+    for man in pp:
+        for piece in man.pieces:
+            nkey = (region_of_tag(piece.tag), piece.param_name)
+            prior = pp_by_name.get(nkey)
+            if prior is not None and prior[1].key != piece.key:
+                raise wx.PdFlipXchgPlanDisagree(
+                    f"W68 PdFlipXchgPlanDisagree: {piece.param_name} is "
+                    f"published by {pp_group} ranks {prior[0]} and {man.rank} "
+                    f"with DIFFERENT identities {prior[1].key} vs {piece.key}. "
+                    f"Under the PP form one stage holds a tensor whole; two "
+                    f"disagreeing holders leave the plan free to pick either."
+                )
+            if prior is None:
+                pp_by_name[nkey] = (man.rank, piece)
+
+    # #1378 xsn53 (DER W74-INSTRUMENTS-DEFEKT, am weg2xsn53-Boot gemessen):
+    # the loader returns ONE RankManifest PER (rank, region_tag), not one per
+    # rank -- the measured boot carried 1249 weights pieces PLUS a 20-piece
+    # draft manifest for the same rank.  A rows lookup that walks the group's
+    # manifests one-per-rank therefore asks the DRAFT manifest for weights
+    # names, misses, and reports EVERY cross-region name as unsourced -- 912
+    # of 1249, first `model.layers.0.input_layernorm.weight`, which both
+    # sides publish byte-identically (P rows=1 cols=5120 itemsize=2
+    # tag=weights_0 == D).  The lookup is per RANK, taking whichever of that
+    # rank's manifests carries the name.
+    tp_by_rank: Dict[int, List[RankManifest]] = {}
+    for man in tp:
+        tp_by_rank.setdefault(int(man.rank), []).append(man)
+    # #76 (fnFL2w2, 21.09.): WER EINE REGION NICHT FUEHRT, IST KEIN FEHLENDER
+    # HALTER. Unter Form A haelt nur der Attention-Host den MTP-Drafter; die
+    # Experten-Worker bauen einen meta-Schatten und publizieren ihn seit
+    # `_tensor_is_meta` nicht mehr. Ohne diese Unterscheidung kippte genau
+    # dieser Fix W68 in W74: die Schleife unten haette fuer jeden der 34
+    # Draft-Tensoren zwei None-Zeilen gesehen und ALLE als unsourced gemeldet.
+    # Der Diskriminator ist die REGION, nicht die Anzahl: fuehrt ein Rang die
+    # Region und fehlt ihm nur DIESER Tensor, bleibt es eine Verweigerung --
+    # das ist der Zwist, den dieser Join benennen soll.
+    tp_region_ranks: Dict[str, List[int]] = {}
+    for man in tp:
+        for pc in man.pieces:
+            reg = region_of_tag(pc.tag)
+            lst = tp_region_ranks.setdefault(reg, [])
+            if int(man.rank) not in lst:
+                lst.append(int(man.rank))
+    for _reg in tp_region_ranks:
+        tp_region_ranks[_reg].sort()
+    _all_tp_ranks = sorted(tp_by_rank)
+    names: List[Tuple[str, str]] = []
+    seen = set()
+    for man in tp:
+        for piece in man.pieces:
+            nkey = (region_of_tag(piece.tag), piece.param_name)
+            if nkey not in seen:
+                seen.add(nkey)
+                names.append(nkey)
+    # #1378 xsn53 (DIE RICHTUNG, gemessen am weg2xsn53-Boot): planning over
+    # the destination's WHOLE name set refused 912 of 1249 names that the
+    # source cannot supply -- while the source's own 893 names are ALL held
+    # by the destination (measured: |P|=893, |D|=1249, P subset D, only-P=0).
+    # A name the destination holds and the source does not is the
+    # disk-reload fallback's business, not a refusal: it is named here with
+    # its byte count, and the plan covers the INTERSECTION.  A name the
+    # source holds and the destination does not would be the real W74 -- it
+    # is caught by the per-card guard above and by the planner's own
+    # destination check.
+    pp_keys = {(region_of_tag(pc.tag), pc.param_name)
+               for man in pp for pc in man.pieces}
+    _my_region = wx.GPU_MEMORY_TYPE_WEIGHTS
+    dst_only = sorted(n for n in names if n not in pp_keys)
+    _refuse_one_sided_expert_buffers(
+        tp=tp, pp=pp, tp_only=dst_only,
+        pp_only=sorted(pp_keys - set(names)),
+        pp_group=pp_group, tp_group=tp_group)
+    if dst_only:
+        _db = sum(int(pc.nbytes) for man in tp for pc in man.pieces
+                  if (region_of_tag(pc.tag), pc.param_name) in set(dst_only))
+        _line = (f"PDFLIP-XCHG-PLAN region={_my_region} "
+                 f"destination-only-names={len(dst_only)} "
+                 f"bytes={_db} first={dst_only[0][1]!r} -- the exchange does "
+                 f"not supply these; they come back from the disk-reload "
+                 f"fallback (#1394), never silently")
+        # join_manifests takes no log hook (the plan builder above does), so
+        # the audit line goes through the module logger -- one producer, one
+        # channel, always emitted.
+        import logging as _logging
+        _logging.getLogger(__name__).info("%s", _line)
+        names = [n for n in names if n in pp_keys]
+    names.sort()
+
+    tensors: List[JoinedTensor] = []
+    unsourced: List[str] = []
+    solo_names: List[str] = []
+    for nkey in names:
+        region, name = nkey
+        holders = tp_region_ranks.get(region) or _all_tp_ranks
+        rows = []
+        held_ranks: List[int] = []
+        for rank in holders:
+            piece = None
+            for man in tp_by_rank[rank]:
+                piece = man.by_region_name.get(nkey)
+                if piece is not None:
+                    break
+            if piece is not None:
+                rows.append(piece)
+                held_ranks.append(rank)
+        if not rows:
+            unsourced.append(name)
+            continue
+        found = pp_by_name.get(nkey)
+        if found is None:
+            unsourced.append(name)
+            continue
+        stage, whole = found
+        if len(held_ranks) != len(_all_tp_ranks):
+            # #76 (fnFL2w2, 21.09.): EINE TEILMENGE IST NUR OHNE SCHNITTKANTE
+            # HARMLOS. Bisher galt hier "a tensor only SOME TP ranks hold is
+            # not a cut this plan can name" ohne Ausnahme -- unter Form A ist
+            # das aber das LAYOUT, nicht der Defekt: der Attention-Host haelt
+            # alle Dense-Gewichte allein, die Experten-Worker tragen an ihrer
+            # Stelle HostOnlyModule-Platzhalter. Gemessen an fnFL2w2 sind das
+            # 1603 von 1853 Tensoren, also praktisch der ganze Flip.
+            #
+            # Die Gefahr, vor der die alte Klausel schuetzte, bleibt bestehen
+            # und bleibt verweigert: fehlt einem Rang sein Stueck eines
+            # ECHTEN SCHNITTS (weil sein Manifest nicht geschrieben wurde),
+            # verschiebt ein Plan ueber die uebrigen Raenge jede Shard-Grenze
+            # und verliert still ein Drittel der Bytes. Der Diskriminator ist
+            # deshalb nicht die ANZAHL der Halter, sondern ob zwischen ihnen
+            # ueberhaupt eine Grenze liegt: halten alle Halter die Form der
+            # PP-Seite GANZ, gibt es keine Kante, die verrutschen koennte --
+            # ein Nicht-Halter bekommt dann schlicht keine Kopie, was genau
+            # der Wahrheit auf seiner Karte entspricht.
+            _whole_shape = (int(whole.rows_full), int(whole.cols_full))
+            if any((int(p.rows_full), int(p.cols_full)) != _whole_shape
+                   for p in rows):
+                unsourced.append(name)
+                continue
+        if int(whole.itemsize) != int(rows[0].itemsize):
+            raise wx.PdFlipXchgPlanDisagree(
+                f"W68 PdFlipXchgPlanDisagree: {name}: itemsize "
+                f"{whole.itemsize} on {pp_group} rank {stage} against "
+                f"{rows[0].itemsize} on {tp_group}. The two groups loaded this "
+                f"tensor at different element widths, so no descriptor can "
+                f"name both."
+            )
+        axis, rows_full, cols_full, widths, pad = _axis_of(name, whole, rows)
+        # #76: der Breitenvektor bleibt in RANGORDNUNG ueber die GANZE Gruppe.
+        # Ein Rang, der die Region nicht fuehrt, haelt null Zeilen -- das ist
+        # sein Eintrag, nicht sein Fehlen. So sagt `dst_widths` weiter fuer
+        # jeden Rang etwas aus, statt einen kurzen Vektor zu liefern, den
+        # `_blocks_of` gegen die falschen Raenge legen wuerde.
+        if widths and len(held_ranks) != len(_all_tp_ranks):
+            _by_rank = dict(zip(held_ranks, widths))
+            widths = tuple(int(_by_rank.get(r, 0)) for r in _all_tp_ranks)
+        # #1384: the SAME pure function _axis_of already ran once to decide
+        # MIXED_FUSED at all -- called again here for its full per-component
+        # breakdown rather than threading a 6th return value through
+        # _axis_of's tuple (which every existing caller unpacks positionally).
+        # Not a second derivation: same inputs, same deterministic function.
+        comp_axes: Tuple[int, ...] = ()
+        comp_whole: Tuple[int, ...] = ()
+        comp_rank: Tuple[Tuple[int, ...], ...] = ()
+        if axis in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS):
+            comps = _mixed_fused_axis(
+                whole, rows,
+                axis=("cols" if axis == wx.MIXED_FUSED_COLS else "rows"))
+            assert comps is not None, (
+                "W68 internal: _axis_of returned MIXED_FUSED but "
+                "_mixed_fused_axis(whole, rows) returned None on the same "
+                "inputs -- the two must agree, this is not a user-facing "
+                "refusal")
+            comp_axes = tuple(a for a, _w, _r in comps)
+            comp_whole = tuple(w for _a, w, _r in comps)
+            comp_rank = tuple(r for _a, _w, r in comps)
+        flat_join = None
+        if axis == wx.FLAT_SEGMENTS:
+            from flliper.srt.pdflip import xchg_flat_segments as _fs
+
+            flat_join = _fs.join_tables(
+                name, getattr(whole, "flat_table", None),
+                [getattr(p, "flat_table", None) for p in rows])
+        tensors.append(
+            JoinedTensor(
+                param_name=name,
+                tensor_class=whole.tensor_class,
+                tag=str(rows[0].tag or whole.tag),
+                itemsize=int(whole.itemsize),
+                rows_full=rows_full,
+                cols_full=cols_full,
+                shard_axis=axis,
+                pp_stage=int(stage),
+                tp_widths=widths,
+                pp_card=int(pp_card_by_rank.get(stage, stage)),
+                pad_units=int(pad),
+                component_axes=comp_axes,
+                component_whole_rows=comp_whole,
+                component_rank_rows=comp_rank,
+                flat_join=flat_join,
+            )
+        )
+
+    if solo_names:
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "PDFLIP-XCHG-PLAN region=%s solo-held-names=%d first=%r -- held whole "
+            "by %s rank(s) %s only (solo draft host); the other ranks get no "
+            "block of them",
+            _my_region, len(solo_names), solo_names[0], tp_group,
+            sorted({r for t in tensors if t.param_name in set(solo_names)
+                    for r, w in enumerate(t.tp_widths) if int(w) > 0}))
+    if unsourced:
+        raise wx.PdFlipXchgSourceMissing(
+            f"W74 PdFlipXchgSourceMissing: {len(unsourced)} of {len(names)} "
+            f"tensors held by {tp_group} have no counterpart in {pp_group}'s "
+            f"manifest (first: {unsourced[0]!r}). Assembly stages a source, it "
+            f"does not create one -- planning the rest would serve those slices "
+            f"with undefined bytes."
+        )
+
+    return ManifestJoin(
+        pp_group=str(pp_group), tp_group=str(tp_group),
+        cards=tuple(m.card for m in tp), tensors=tuple(tensors),
+        unsourced=(), pp_ranks=len(pp), tp_ranks=len(tp),
+    )
+
+
+# ---------------------------------------------------------------------------
+# THE JOIN, ONCE PER PROCESS (fnFL2x40).
+# ---------------------------------------------------------------------------
+
+#: fnFL2x40 (23.09.): the first flip of the boot spent 6.3-7.7 s in the FIRST
+#: deposit of every rank and 0.1-0.4 s in every later tag; the bytes were not
+#: it (D's first collect moved its whole tag in 92 ms). The join is a pure
+#: function of the boot's manifest files, and the first leg recomputed it on
+#: its critical path once per region in the hook and once more in every lane
+#: thread of the first tag (``_pdflip_seq_lane_descs``), all under one GIL.
+#: Measured on x40's own manifests, CPU only: one join 0.55-0.57 s, three
+#: concurrent joins 2.09 s wall.
+#:
+#: Keyed on the manifests' CONTENT (every type here is a frozen dataclass), so
+#: a rewritten manifest -- the drafter's post-load rewrite -- is another key,
+#: never a stale hit. Concurrent callers of one key wait for the first one.
+JOIN_MEMO_MAX = 8
+_JOIN_MEMO: Dict[tuple, ManifestJoin] = {}
+_JOIN_INFLIGHT: Dict[tuple, threading.Event] = {}
+_JOIN_LOCK = threading.Lock()
+_JOIN_STATS: Dict[str, int] = {"hit": 0, "miss": 0, "wait": 0}
+
+
+def join_memo_stats() -> Dict[str, int]:
+    """``{"hit", "miss", "wait"}`` since the process started (the line reads)."""
+    with _JOIN_LOCK:
+        return dict(_JOIN_STATS)
+
+
+def clear_join_memo() -> None:
+    """Forget every stored join. The join's audit lines (destination-only
+    names, solo-held names) are written when a join is COMPUTED, so a caller
+    that needs them again clears first."""
+    with _JOIN_LOCK:
+        _JOIN_MEMO.clear()
+
+
+def join_manifests(
+    manifests: Sequence[RankManifest],
+    *,
+    pp_group: str = "P",
+    tp_group: str = "D",
+) -> ManifestJoin:
+    """:func:`_join_manifests_uncached`, computed once per distinct input.
+
+    A caller that finds the same input already being joined by another
+    thread waits for that result instead of joining it a second time. A join
+    that raises is not stored; a waiter then joins it itself and gets the same
+    refusal from its own call.
+    """
+    mans = tuple(manifests)
+    key = (str(pp_group), str(tp_group), mans)
+    while True:
+        with _JOIN_LOCK:
+            hit = _JOIN_MEMO.get(key)
+            if hit is not None:
+                _JOIN_STATS["hit"] += 1
+                return hit
+            event = _JOIN_INFLIGHT.get(key)
+            owner = event is None
+            if owner:
+                event = threading.Event()
+                _JOIN_INFLIGHT[key] = event
+                _JOIN_STATS["miss"] += 1
+            else:
+                _JOIN_STATS["wait"] += 1
+        if not owner:
+            event.wait()
+            continue
+        try:
+            joined = _join_manifests_uncached(mans, pp_group=pp_group,
+                                              tp_group=tp_group)
+        except BaseException:
+            with _JOIN_LOCK:
+                _JOIN_INFLIGHT.pop(key, None)
+            event.set()
+            raise
+        with _JOIN_LOCK:
+            if len(_JOIN_MEMO) >= JOIN_MEMO_MAX:
+                _JOIN_MEMO.clear()
+            _JOIN_MEMO[key] = joined
+            _JOIN_INFLIGHT.pop(key, None)
+        event.set()
+        return joined
+
+
+def manifest_files_signature(dump_dir: str = "") -> Tuple[Tuple[str, int, int], ...]:
+    """``(name, mtime_ns, size)`` of every manifest file in the directory.
+
+    What the boot-time warm-up waits on: the drafter rewrites its manifest
+    after the load, so the files are only final once this has stopped moving.
+    """
+    directory = dump_dir or manifest_dir()
+    if not directory:
+        return ()
+    try:
+        names = sorted(f for f in os.listdir(directory)
+                       if f.startswith(MANIFEST_PREFIX + "_") and f.endswith(".json"))
+    except OSError:
+        return ()
+    out = []
+    for fname in names:
+        try:
+            st = os.stat(os.path.join(directory, fname))
+        except OSError:
+            continue
+        out.append((fname, int(st.st_mtime_ns), int(st.st_size)))
+    return tuple(out)
+
+
+def prewarm_joins(*, pp_group: str = "P", tp_group: str = "D",
+                  region_tags: Sequence[str] = ("",)) -> Dict[str, float]:
+    """Join this boot's manifests ahead of the first flip; ``{what: ms}``.
+
+    Computes the two inputs the first leg would otherwise join on its
+    critical path: the WHOLE manifest set (the lane derivation) and the
+    region-narrowed set of every tag in ``region_tags`` (the hook's
+    :func:`leg_plan_from_join`, ``""`` being the main weights region).
+    ``{}`` when this boot's manifests are not all present yet.
+    """
+    import time as _time
+
+    mans, _why = manifests_for_boot(pp_group=pp_group, tp_group=tp_group)
+    if mans is None:
+        return {}
+    out: Dict[str, float] = {}
+    t0 = _time.perf_counter()
+    join_manifests(mans, pp_group=pp_group, tp_group=tp_group)
+    out["full"] = (_time.perf_counter() - t0) * 1000.0
+    for region_tag in region_tags:
+        t0 = _time.perf_counter()
+        narrowed, _n, _b, _r = narrow_manifests_to_region(
+            mans, region_tag=str(region_tag))
+        if any(m.pieces for m in narrowed):
+            join_manifests(narrowed, pp_group=pp_group, tp_group=tp_group)
+        out[f"region:{region_tag or wx.GPU_MEMORY_TYPE_WEIGHTS}"] = (
+            _time.perf_counter() - t0) * 1000.0
+    return out
+
+
+# ---------------------------------------------------------------------------
+# THE PROVIDER -- the join turned into descriptors, in EITHER direction.
+# ---------------------------------------------------------------------------
+
+
+def plan_from_join(
+    join: ManifestJoin,
+    *,
+    direction: str = "",
+    waves: Optional[Sequence[Sequence[str]]] = None,
+    src_addr=None,
+    dst_addr=None,
+) -> wx.XchgPlan:
+    """Build the CROSS-GROUP plan for one direction out of the ONE join.
+
+    BOTH DIRECTIONS ARE EQUAL CITIZENS.  ``pp_to_tp`` makes the PP group the
+    source and the TP group the destination; ``tp_to_pp`` mirrors it.  Neither
+    is a special case: the extents, the axis and the holder come from the same
+    join, and only the ROLES change.
+
+    THE TP SIDE IS A REAL TP GROUP IN BOTH OF THEM, which is the half a
+    ``src_ptr`` patch would have missed.  ``tp_size=len(cards)`` with the
+    join's own per-tensor vector makes ``_blocks_of`` cut the shards; with
+    ``tp_size=1`` the same descriptors come out whole and ``src_resolved=N/N``
+    would be green on a plan that moves nothing correctly.
+    :func:`refuse_diagonal_layout` is the guard and it runs here.
+
+    **THE ADDRESS CONTRACT, stated so the next wiring does not re-decide it.**
+    ``src_addr(name, rank)`` and ``dst_addr(name, rank)`` are the caller's, and
+    what this module supplies is the IDENTITY -- which piece of which holder
+    covers which destination slice.  The intended resolution is:
+
+    * the SOURCE hook, on the rank that holds the bytes, answers with its OWN
+      DEVICE ADDRESS (it knows it; it is in its own manifest) and deposits its
+      pieces into the bounce slot;
+    * the DESTINATION side resolves the source to the BOUNCE SLOT OFFSET (host
+      staging) -- never to a peer device address, which no process can read,
+      and never to the ring.
+
+    THE RING IS THE COUNTER-PROOF, NEVER THE SOURCE, at this stage.  Reading
+    the source side out of the ring would be the ring restore through another
+    door, and the goal it defeats -- zero layer bytes resident in host RAM --
+    is the whole point of the exchange.  ``pointer_profile`` counts both
+    resolutions the same way (it asks only whether ``src_ptr`` is set), so
+    ``src_resolved`` is honest under either hook.
+    """
+    direction = str(direction or wx.LEGS_PP_TO_TP)
+    if direction not in (wx.LEGS_PP_TO_TP, wx.LEGS_TP_TO_PP):
+        raise wx.PdFlipXchgPlanDisagree(
+            f"W68 PdFlipXchgPlanDisagree: {direction!r} is not a flip direction. "
+            f"The two are {wx.LEGS_PP_TO_TP!r} and {wx.LEGS_TP_TO_PP!r} "
+            f"(layers/dcp/phase_flip_plan.py), and a third spelling would "
+            f"plan one of them under the other's name."
+        )
+    cards = tuple(join.cards)
+    refuse_diagonal_layout(len(cards), tp_group=join.tp_group)
+    tp_is_dst = direction == wx.LEGS_PP_TO_TP
+
+    ratios = join.family_ratios()
+    pp = wx.GroupLayout(name=join.pp_group, cards=cards, tp_size=1,
+                        base=(0 if tp_is_dst else len(cards)))
+    tp = wx.GroupLayout(name=join.tp_group, cards=cards, tp_size=len(cards),
+                        family_ratios=ratios,
+                        base=(len(cards) if tp_is_dst else 0))
+    src, dst = (pp, tp) if tp_is_dst else (tp, pp)
+
+    inventory = [t.geom(tp_is_dst=tp_is_dst) for t in join.tensors]
+    if waves is None:
+        waves = [sorted({str(g.tag) for g in inventory})]
+
+    def ptr_of(group: str, rank: int, name: str) -> Optional[int]:
+        if group == src.name:
+            return None if src_addr is None else src_addr(name, int(rank))
+        if group == dst.name:
+            return None if dst_addr is None else dst_addr(name, int(rank))
+        return None
+
+    return wx.build_plan(inventory, src, dst, waves=waves, ptr_of=ptr_of)
+
+
+def refuse_diagonal_layout(tp_size: int, *, tp_group: str) -> None:
+    """A TP group planned at ``tp_size=1`` is the diagonal, and is refused.
+
+    Operator ruling 2026-09-12: ``src_resolved=N/N`` on a diagonal plan does
+    not count.  The tree's product path builds exactly that layout
+    (``weight_exchange_shadow.py:3332-3334``, BOTH groups ``tp_size=1``), so
+    without this refusal the slice's own acceptance number could be satisfied
+    by the very shape the slice exists to replace.
+    """
+    if int(tp_size) <= 1:
+        raise wx.PdFlipXchgPlanDisagree(
+            f"W68 PdFlipXchgPlanDisagree: group {tp_group!r} would be planned at "
+            f"tp_size={tp_size}, which is the PP form on BOTH sides -- the "
+            f"on-card diagonal, not the cross-group exchange. A plan built that "
+            f"way resolves both pointer sides and still cuts no shard, so its "
+            f"src_resolved=N/N would grade a plan that moves whole tensors "
+            f"between two differently shaped groups."
+        )
+
+
+def refuse_on_materialisation_drift(piece: ManifestPiece, live) -> None:
+    """The manifest against the tensor that came out of the loader.
+
+    Sharp from commit 1 (operator ruling): a manifest that has drifted from the
+    hardware is worse than no manifest, because every downstream reader trusts
+    it.  Reads the storage geometry through ``StorageGeom`` -- ``stride()``,
+    never ``shape`` -- so a ``.t()`` view is compared in the space the plan
+    uses.  RAISES; it does not return a bool, because a bool is the swallowed
+    refusal this campaign has paid for.
+    """
+    got = wx.StorageGeom.of(live)
+    if (int(got.rows) != int(piece.rows_full)
+            or int(got.cols) != int(piece.cols_full)
+            or int(got.itemsize) != int(piece.itemsize)):
+        raise wx.PdFlipXchgPlanDisagree(
+            f"W68 PdFlipXchgPlanDisagree: {piece.param_name}: the manifest "
+            f"records ({piece.rows_full}, {piece.cols_full}) itemsize "
+            f"{piece.itemsize} and the materialised tensor holds "
+            f"({got.rows}, {got.cols}) itemsize {got.itemsize}. The manifest "
+            f"is what every other reader plans from, so a drifted one is a "
+            f"wrong answer rather than a missing one."
+        )
+
+
+def n_cards_default() -> int:
+    """The card count, from the module that owns it -- never a literal here."""
+    return int(xr.N_CARDS)
+
+
+# ---------------------------------------------------------------------------
+# THE WRITE SITE -- after materialisation, on the path that is proven to run.
+# ---------------------------------------------------------------------------
+#
+# NO SECOND DIRECTORY AUTHORITY AND NO SECOND TOKEN.  The manifests land in the
+# dump directory the phase footprint and the #1292/#1348 coverage dumps already
+# share (``FLLIPER_PHASE_FOOTPRINT_DUMP``), and the boot token is the region's
+# OWN nonce (``weight_exchange_region.ENV_REGION_BOOT``), which the launcher
+# already publishes to both groups.  Inventing a third env pair for the same
+# two facts is the second-bookkeeping defect this whole slice is an instance
+# of removing.
+
+#: MEASURED, not chosen by taste.  This was ``FLLIPER_PHASE_FOOTPRINT_DUMP``
+#: first, so that the manifests would share the #1292/#1348 dump directory and
+#: no new name would exist -- and that was WRONG in the one way that matters:
+#: ``pdflip/launcher.py``'s ``coverage_dump_dir`` only puts that variable into a
+#: rank's environment under ``--xchg-coverage-diff`` and returns ``""``
+#: otherwise, so a writer keyed on it finds nothing on every boot that does not
+#: also arm the coverage tracer.  It would have written no file and logged no
+#: line: built, green at the desk, never executed.  One new name for a fact
+#: that had none.
+#:
+#: THE TOKEN IS STILL NOT NEW: the boot nonce is the region's own
+#: (``weight_exchange_region.ENV_REGION_BOOT``), already published to both
+#: groups, so a stale manifest from a previous boot in the same evidence
+#: directory is filtered rather than merged.
+DIR_ENV = "FLLIPER_PDFLIP_XCHG_MANIFEST_DIR"
+
+#: Read as a FALLBACK only, for a process that has the coverage dump directory
+#: and not this one (the hermetic tools).  Never the primary: see above.
+FALLBACK_DIR_ENV = "FLLIPER_PHASE_FOOTPRINT_DUMP"
+
+
+def manifest_dir(default: str = "") -> str:
+    """Where this boot's manifests go, or ``default``.  Two env reads."""
+    return str(os.environ.get(DIR_ENV, "")
+               or os.environ.get(FALLBACK_DIR_ENV, "")
+               or default)
+
+
+def boot_token() -> str:
+    """This boot's region nonce -- already published to both groups."""
+    return str(os.environ.get(xr.ENV_REGION_BOOT, "") or "")
+
+
+def write_this_rank(
+    inventory: Iterable[object],
+    *,
+    group: str,
+    rank: int,
+    card: int,
+    region_tag: str,
+    dump_dir: str = "",
+    token: str = "",
+) -> Optional[str]:
+    """Record what THIS rank's loader decided.  ``None`` when unarmed.
+
+    ``inventory`` is the caller's OWN ``ParamGeom`` walk -- the one it already
+    built to plan and to grade coverage with.  Nothing is re-walked and no
+    tensor is re-read here: the whole point of the write-along is that the
+    loader's decision is written down rather than reconstructed, so a second
+    walk would reintroduce the drift in the same commit that removes it.
+    """
+    directory = dump_dir or manifest_dir()
+    if not directory or not group or int(rank) < 0:
+        return None
+    manifest = RankManifest(
+        group=str(group),
+        rank=int(rank),
+        card=int(card),
+        region_tag=str(region_tag),
+        boot_token=str(token or boot_token()),
+        pieces=pieces_from_inventory(inventory),
+    )
+    return write_rank_manifest(manifest, directory)
+
+
+def written_line(path: str, manifest: RankManifest) -> str:
+    """The acceptance line, every number with its denominator."""
+    return (
+        f"{JOIN_LINE_PREFIX}-WRITE group={manifest.group} rank={manifest.rank} "
+        f"card={manifest.card} region_tag={manifest.region_tag} "
+        f"pieces={len(manifest.pieces)} "
+        f"bytes={sum(p.nbytes for p in manifest.pieces)} "
+        f"boot_token={manifest.boot_token or 'unset'} path={path} "
+        f"-- this rank's loader decision, written down, not reconstructed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# THE PRODUCT ENTRY POINT -- one leg's plan, from the six manifests.
+# ---------------------------------------------------------------------------
+
+#: The provenance string a join-derived plan carries, so a reader can tell at a
+#: glance WHICH producer answered.  The derivation's own is
+#: ``weight_exchange_shadow.PLAN_SOURCE`` and names ``walk_live_tensors`` +
+#: ``build_plan`` over THIS rank's model; this one names the manifests.  Two
+#: producers for one leg would be the defect, so the line says which ran.
+JOIN_PLAN_SOURCE = (
+    "pdflip/xchg_manifest.load_manifests+merge_region_tags+join_manifests"
+    "(six per-rank manifests, written by each rank's own loader),"
+    "weight_exchange.build_plan,weight_exchange_region.N_CARDS"
+)
+
+
+#: #1330 B4n SLICE 1 of the region cut (operator ruling 2026-09-12, Option 2).
+#:
+#: A LEG PLANS ONLY ITS OWN REGION'S TENSORS. Boot weg2xsn25 proved by
+#: arithmetic why: P rank 0 wrote TWO manifests -- `region_tag=weights`
+#: pieces=893 and `region_tag=weights_draft` pieces=19 -- and the leg read
+#: `dst_resolved=893/904`. 893 IS EXACTLY THE MAIN RUNNER'S PIECE COUNT, so
+#: the eleven unresolved descriptors were the draft head's, and the address
+#: book only ever had one runner's tensors.
+#:
+#: The join must still UNION the runner files -- that is where the extents and
+#: the shard vector come from -- but the LEG may not be asked to address pages
+#: that belong to another runner. The drafter gets its own leg (slice 2), from
+#: its own `arm_coverage_at_load`.
+#:
+#: OPTION 1 WAS REJECTED BY THE OPERATOR AND THE REASON IS RECORDED: a second
+#: accessor path to `self.draft_worker` is a second way to find one runner,
+#: which is the shape this campaign keeps deleting.
+def region_of_tag(tag: str) -> str:
+    """Which REGION a tag belongs to -- the drafter's, or the main weights'.
+
+    The chunk tags (`weights_0` ... `weights_N`) and the base tag all live in
+    the main runner's region; only the draft tag is its own. Read from
+    `weight_exchange`'s constant, never spelled here.
+    """
+    return (wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT
+            if str(tag) == wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT
+            else wx.GPU_MEMORY_TYPE_WEIGHTS)
+
+
+def refusal(reason: str, detail: str = "") -> str:
+    """The one shape a refused join prints, so the log carries one spelling."""
+    return f"join-{reason}" + (f": {detail}" if detail else "")
+
+
+def manifests_for_boot(
+    *,
+    pp_group: str = "P",
+    tp_group: str = "D",
+    dump_dir: str = "",
+    token: str = "",
+) -> Tuple[Optional[Tuple[RankManifest, ...]], str]:
+    """Every rank's manifest for THIS boot, or a NAMED refusal.
+
+    **NO FALLBACK, AND THE FILE NAME IS IN THE REFUSAL.**  A missing peer
+    manifest used to be answered by deriving the plan from this rank's own
+    model -- which is the on-card DIAGONAL
+    (``weight_exchange_shadow.py:3332-3334``, both groups ``tp_size=1``), the
+    shape that produced ``src_resolved=0/N`` on all 24 legs of weg2xsn20.  It
+    may never step in silently again, so this returns the EXPECTED PATH of
+    what it could not find and the caller refuses on it.
+    """
+    directory = dump_dir or manifest_dir()
+    if not directory:
+        return None, refusal("no-dump-dir",
+                             f"{DIR_ENV} is unset, so no rank published a "
+                             f"manifest and none can be read")
+    tok = token or boot_token()
+    found = load_manifests(directory, boot_token=tok)
+    have = {(m.group, m.rank) for m in found}
+    n_cards = n_cards_default()
+    # The EXPECTED PATH, with the region tag left as a glob: a rank publishes
+    # one file per RUNNER (main model and drafter), so the name carries a tag
+    # this reader cannot know in advance -- and printing a path that never
+    # exists would send an operator hunting for the wrong file.
+    missing = [
+        os.path.join(directory,
+                     f"{MANIFEST_PREFIX}_{g}_rank*_*.json (group rank {r})")
+        for g in (pp_group, tp_group)
+        for r in range(n_cards)
+        if (g, r) not in have
+    ]
+    if missing:
+        return None, refusal(
+            "manifest-missing",
+            f"{len(missing)} of {2 * n_cards} rank manifests absent for "
+            f"boot_token={tok or 'unset'} (first expected path: "
+            f"{missing[0]}). Refusing: deriving this rank's own view "
+            f"instead is the on-card diagonal, which resolves no source and "
+            f"is what this slice replaces")
+    return found, ""
+
+
+def narrow_manifests_to_region(
+    manifests: Sequence[RankManifest],
+    *,
+    region_tag: str = "",
+    skip_names: Optional[frozenset] = None,
+    log=None,
+):
+    """``(manifests, excluded, excluded_bytes, excluded_regions)``: every
+    manifest cut to ONE region's pieces -- the input :func:`leg_plan_from_join`
+    joins, and the one :func:`prewarm_joins` must reproduce exactly so the
+    boot-time join is the same memo key as the first flip's."""
+    my_region = (region_of_tag(region_tag) if region_tag
+                 else wx.GPU_MEMORY_TYPE_WEIGHTS)
+    excluded = 0
+    excluded_bytes = 0
+    excluded_regions = set()
+    narrowed = []
+    skipped = frozenset(skip_names or ())
+    for man in manifests:
+        keep_p, drop_p = [], []
+        for piece in man.pieces:
+            if (str(piece.param_name) in skipped
+                    and region_of_tag(piece.tag) == my_region):
+                # The caller's PROVEN one-sided name (weight_updater's
+                # measured target-share for the draft's lm_head): dropped BY
+                # NAME, in THIS region, with the line a reader can audit.
+                # Every other absence still reaches the W74 refusal below.
+                if log is not None:
+                    log(f"PDFLIP-XCHG-JOIN-SKIP name={piece.param_name} "
+                        f"region={my_region} group={man.group} "
+                        f"rank={man.rank} -- proven one-sided (target "
+                        f"share), excluded from this join by the caller")
+                continue
+            (keep_p if region_of_tag(piece.tag) == my_region
+             else drop_p).append(piece)
+        excluded += len(drop_p)
+        excluded_bytes += sum(int(p.nbytes) for p in drop_p)
+        excluded_regions |= {region_of_tag(p.tag) for p in drop_p}
+        narrowed.append(RankManifest(
+            group=man.group, rank=man.rank, card=man.card,
+            region_tag=man.region_tag, boot_token=man.boot_token,
+            tp_rank=man.tp_rank, pp_rank=man.pp_rank,
+            pieces=tuple(keep_p)))
+    # #104 (fnFL2w40): ZWEI FAELLE, DIE DIESER FILTER VERMISCHTE.
+    # `if m.pieces` warf bisher beides weg:
+    #   (a) ein Manifest, dessen Stuecke der REGIONSFILTER oben entfernt hat
+    #       -- es gehoert einem anderen Runner und muss raus;
+    #   (b) ein Manifest, das SCHON LEER ANKAM -- der Meta-Schatten aus #103,
+    #       der genau sagen will "diesen Rang gibt es, er haelt nichts".
+    # (b) ist die Breite-0-Aussage, die #102s Halter-Karte liest. Ohne sie
+    # zaehlt `join_manifests` eine Karte statt drei, `refuse_diagonal_layout`
+    # liest die Gruppe als PP-Form und wirft W68 -- gemessen an w40: die drei
+    # Manifeste lagen vor (`pieces=0 bytes=0`, Datei geschrieben), und der
+    # Join meldete TROTZDEM `tp_size=1`. #103 allein war damit wirkungslos:
+    # ein Riegel hinter dem, was er sichern sollte.
+    # (group, rank) als Schluessel, nicht rank allein: `narrowed` traegt
+    # BEIDE Gruppen, und P-Rang 1 ist nicht D-Rang 1.
+    _empty_on_arrival = {(str(m.group), int(m.rank))
+                         for m in manifests if not m.pieces}
+    kept = [m for m in narrowed
+            if m.pieces
+            or (str(m.group), int(m.rank)) in _empty_on_arrival]
+    return kept, excluded, excluded_bytes, excluded_regions
+
+
+def leg_plan_from_join(
+    *,
+    hook: str,
+    group: str,
+    rank: int,
+    manifests: Sequence[RankManifest],
+    src_addr=None,
+    dst_addr=None,
+    pp_group: str = "P",
+    tp_group: str = "D",
+    #: THIS RANK'S LIVE MODEL, for the materialisation check below.  Optional
+    #: only so the hermetic callers that have no model can drive the join.
+    model=None,
+    #: THE REGION THIS LEG BELONGS TO. Empty means the main weights region,
+    #: which is what every caller without a drafter has.
+    region_tag: str = "",
+    #: NAMES dropped from THIS JOIN, before any counterpart is looked up.
+    #: The caller owns the proof (weight_updater's measured target-share for
+    #: the draft's lm_head); a name dropped here is LOGGED by name, and the
+    #: W74 "no counterpart" refusal still guards every other name -- this is
+    #: a narrow, proven exclusion, never a general absence amnesty.
+    skip_names: Optional[frozenset] = None,
+    log=None,
+):
+    """ONE leg's :class:`~weight_exchange_shadow.LegPlan`, from the manifests.
+
+    THE DIRECTION IS DERIVED, NOT PASSED: ``weight_exchange.leg_direction``
+    already answers it from ``(hook, group)`` -- ``source`` exports, every
+    other hook imports -- so a second answer here could disagree with the one
+    the leg knob gates on.
+
+    THE PLAN IS NARROWED TO THIS RANK'S ROLE, and that is what makes
+    ``src_resolved`` readable per leg rather than per boot: a source-hook leg
+    carries the descriptors THIS rank must supply (``src_rank == rank``), a
+    destination-hook leg the ones it must receive (``dst_rank == rank``).  The
+    full cross-group plan is built first, because ``build_plan``'s tiling
+    check (``_check_tiles``) is a statement about EVERY destination rank and
+    would pass vacuously on a pre-filtered inventory.
+    """
+    from flliper.srt.pdflip import weight_exchange_shadow as sh
+    from flliper.srt.managers import pdflip_memory_saver as ms
+
+    direction = wx.leg_direction(str(hook), str(group))
+
+    # THE REGION CUT, AND IT RUNS BEFORE THE JOIN -- that ordering is the fix.
+    #
+    # Cutting AFTER the join was not enough: the join keys on `param_name`, and
+    # weg2xsn25 measured eight names carried by BOTH runners of P rank 0 (the
+    # drafter is a one-layer block, so its parameters are `model.layers.0.*`
+    # too). By the time a post-join cut ran, one runner had already displaced
+    # the other and the surviving geometry could be the wrong one -- the desk
+    # replay read `tensors_bad=2 verdict=MISMATCH` on exactly that.
+    #
+    # Filtering the PIECES first means only one region's tensors ever reach the
+    # join, so the collision cannot happen at all. The drafter's tensors are
+    # not lost: they get their own leg from their own `arm_coverage_at_load`.
+    my_region = (region_of_tag(region_tag) if region_tag
+                 else wx.GPU_MEMORY_TYPE_WEIGHTS)
+    manifests, excluded, excluded_bytes, excluded_regions = (
+        narrow_manifests_to_region(manifests, region_tag=region_tag,
+                                   skip_names=skip_names, log=log))
+    if not any(m.pieces for m in manifests):
+        return None, refusal(
+            "no-tensors-in-region",
+            f"region={my_region}: no manifest carries a piece of this leg's "
+            f"region. A leg with nothing of its own to move is a plan defect, "
+            f"not an empty one")
+    if excluded:
+        line = (
+            f"PDFLIP-XCHG-PLAN region={my_region} "
+            f"excluded={'+'.join(sorted(excluded_regions))} "
+            f"pieces={excluded} bytes={excluded_bytes} reason=other-runner "
+            f"-- those tensors belong to a runner this leg cannot address; "
+            f"they get their own leg from their own arm_coverage_at_load "
+            f"(weg2xsn25: eleven of them read as dst_resolved=893/904 and "
+            f"refused the whole leg)")
+        if log is not None:
+            log(line)
+        else:
+            import logging as _logging
+
+            _logging.getLogger(__name__).info("%s", line)
+
+    try:
+        join = join_manifests(manifests, pp_group=pp_group, tp_group=tp_group)
+    except (wx.PdFlipXchgSourceMissing, wx.PdFlipXchgPlanDisagree) as exc:
+        return None, refusal("unjoinable", f"{type(exc).__name__}: {exc}")
+
+    # (the region cut ran before the join -- see above)
+    # #1378 xsn52 (DER PLAN-CONTENT-WAECHTER): per co-located card, the two
+    # groups' tag sets for this leg's region must match, or the deposit
+    # posts bands nobody reads and the collect waits for bands nobody
+    # posts (the W68 family, measured on weg2xsn43: the deposit leg
+    # carried 9 tags on D rank0, the collect leg 6 tags on P rank0 -- the
+    # TP/PP phase asymmetry means the per-rank tag sets CANNOT match by
+    # construction, so the exchange scope must be the INTERSECTION,
+    # narrowed BEFORE the bands are derived).
+    # THE SOURCE IS THE GROUP plan_from_join exports FROM: pp for
+    # pp_to_tp, tp for tp_to_pp. The old line had the two arms swapped
+    # relative to plan_from_join's own `src, dst = (pp, tp) if
+    # tp_is_dst else (tp, pp)`, which is the same direction defect the
+    # W74 side had.
+    _src_g, _dst_g = ((tp_group, pp_group) if direction == wx.LEGS_TP_TO_PP
+                      else (pp_group, tp_group))
+    _per_card = {}
+    for man in manifests:
+        for pc in man.pieces:
+            if region_of_tag(pc.tag) != my_region: continue
+            # #1378 xsn54: NAMES, not TAGS.  The tag records WHERE the bytes
+            # were loaded (the chunk the loader used), and under PP x TP the
+            # source group holds tags the destination group never loads --
+            # measured both ways (sleep: source 6 tags vs destination 9;
+            # wake: source 9 vs destination 6), so a tag-set comparison
+            # refuses in BOTH directions on this topology.  What the
+            # exchange actually moves is bounded by NAMES, and the measured
+            # name scope is P subset D (|P|=893, |D|=1249, only-P=0): a
+            # source name the destination lacks is the only real defect.
+            _per_card.setdefault(man.card, {}).setdefault(man.group, set()).add(
+                str(pc.param_name))
+    for card_id, groups in sorted(_per_card.items()):
+        if len(groups) < 2: continue
+        tag_sets = [names for _g, names in sorted(groups.items())]
+        # #1378 xsn54 (DIE ACHSE, DIE BEIDE RICHTUNGEN UEBLEBT): a subset
+        # check refuses in both directions on this topology.  Measured:
+        #   sleep (pp_to_tp): source P 6 tags / 893 names, destination D 9/1249
+        #   wake  (tp_to_pp): source D 9 tags / 1249 names, destination P 6/893
+        # The source legitimately holds names the destination never loads --
+        # the TP side holds every layer, the PP side only its stage's.  What
+        # the exchange moves is the NAME INTERSECTION (measured 893, P subset
+        # D, only-P=0), and the destination-only names are the disk-reload
+        # fallback's business (#1394).  The one defect this guard CAN still
+        # catch is a card whose two groups share NO name in this region: a
+        # deposit and a collect that would never meet, the W68 shape.
+        common = tag_sets[0] & tag_sets[1]
+        if not common:
+            only_src = sorted(tag_sets[0] - tag_sets[1])[:8]
+            only_dst = sorted(tag_sets[1] - tag_sets[0])[:8]
+            return None, refusal(
+                "plan-name-divergence",
+                f"card {card_id}: the two groups share NO name for region "
+                f"{my_region} (source {len(tag_sets[0])} names, destination "
+                f"{len(tag_sets[1])}, intersection 0; source-only {only_src} "
+                f"destination-only {only_dst}) -- a deposit and a collect on "
+                f"this card would never meet (the W68 family, measured on "
+                f"weg2xsn43).")
+    try:
+        plan = plan_from_join(join, direction=direction,
+                              src_addr=src_addr, dst_addr=dst_addr)
+    except (wx.PdFlipXchgSourceMissing, wx.PdFlipXchgPlanDisagree) as exc:
+        return None, refusal("plan-refused", f"{type(exc).__name__}: {exc}")
+
+    # THE MATERIALISATION CHECK, AT THE MOMENT IT IS NOT TAUTOLOGICAL.
+    #
+    # Re-reading the tensor at WRITE time would compare `ParamGeom.of`'s output
+    # against the tensor it was just read from -- true by construction and
+    # worth nothing.  Here it is a real question: the manifest was written at
+    # the END OF WEIGHT LOADING and this runs at the FLIP, after pauses,
+    # resumes and (once AMENDMENT 8 lands) a remap of the very pages it
+    # describes.  A manifest that has drifted from the hardware is worse than
+    # no manifest, because the join and every downstream reader trust it.
+    #
+    # Only THIS RANK'S OWN pieces, because they are the only ones whose tensor
+    # this process can look at -- which is the same boundary the whole slice
+    # rests on.
+    if model is not None:
+        mine_manifest = next(
+            (m for m in manifests
+             if m.group == str(group) and int(m.rank) == int(rank)), None)
+        if mine_manifest is not None:
+            try:
+                live = {str(n): t for n, t in model.named_parameters()}
+            except BaseException:  # noqa: BLE001 -- an observer never raises
+                live = {}
+            for piece in mine_manifest.pieces:
+                # ONLY THIS LEG'S REGION: a piece of another runner has no
+                # tensor here by construction, and checking it would refuse on
+                # the very asymmetry the region cut exists to remove.
+                if region_of_tag(piece.tag) != my_region:
+                    continue
+                tensor = live.get(piece.param_name)
+                if tensor is None:
+                    continue
+                try:
+                    refuse_on_materialisation_drift(piece, tensor)
+                except wx.PdFlipXchgPlanDisagree as exc:
+                    return None, refusal("materialisation-drift", str(exc))
+
+    is_source = str(hook) == sh.HOOK_SOURCE
+    side = "src_rank" if is_source else "dst_rank"
+    mine = tuple(d for d in plan.descs
+                 if int(getattr(d, side, -1)) == int(rank))
+    if not mine:
+        # #105 (fnFL2w41): EIN SCHATTEN HAELT NICHTS -- "keine Descriptors"
+        # ist fuer ihn die RICHTIGE Antwort, kein Defekt.
+        # Die Regel selbst bleibt: ein Rang, der Bytes halten SOLLTE und
+        # keine bewegt, ist ein stiller Verlust, und genau davor schuetzt
+        # sie. Aber unter `--speculative-draft-placement solo` tragen die
+        # Experten-Worker einen META-Drafter ohne ein einziges Byte; sie
+        # haben ihr leeres Manifest bewusst publiziert (#103), es hat den
+        # Leg-Filter bewusst ueberlebt (#104) -- und hier wurde daraus
+        # wieder ein Abbruch. Gemessen an w41: der Join baut den Plan
+        # KORREKT mit allen 34 Draft-Descriptors auf Rang 0
+        # ("PDFLIP-XCHG-PLAN dir=d2h descs=34"), und die Meldung sagt es
+        # selbst: "the joined plan has 34 descriptors and none with
+        # src_rank=2". Das ist die richtige Verteilung, nicht ihr Fehlen.
+        #
+        # Die Unterscheidung ist dieselbe wie in #104: haelt dieser Rang in
+        # DIESER Region ueberhaupt etwas? Sein eigenes Manifest sagt es.
+        _mine_man = next((m for m in manifests
+                          if str(m.group) == str(group)
+                          and int(m.rank) == int(rank)), None)
+        _is_shadow = _mine_man is not None and not _mine_man.pieces
+        if not _is_shadow:
+            return None, refusal(
+                "no-descriptors-for-rank",
+                f"hook={hook} group={group} rank={rank} "
+                f"direction={direction}: the joined plan has "
+                f"{len(plan.descs)} descriptors and none with {side}={rank}. "
+                f"A leg that moves nothing would report a flip that moved no "
+                f"weights")
+        # Schatten: weiter mit leerem `mine` -- der LegPlan unten wird ganz
+        # normal gebaut, nur mit `descs=()`. Kein Sonderobjekt hier: der
+        # Erfolgspfad kennt facts, tags, classes und card_digest, dieser
+        # Zweig nicht, und ein halb gebauter LegPlan waere ein zweiter
+        # Wahrheitsstand neben dem einen, den :1812 baut.
+
+    # The acceptance line and the pointer profile, at the frame that holds the
+    # XchgPlan -- the #1342 lesson: `PDFLIP-XCHG-PLAN` describes an XchgPlan and
+    # the LegPlan below has no `plan_id` at all.  Wrapped, because an
+    # instrument may never take a derivation down.
+    emit = log if log is not None else None
+    try:
+        wx.emit_plan_line(plan, direction=("d2h" if is_source else "h2d"))
+    except BaseException as exc:  # noqa: BLE001
+        import logging as _logging
+
+        _logging.getLogger(__name__).info(
+            "PDFLIP-XCHG-PLAN emit failed: %s: %s", type(exc).__name__, exc)
+    try:
+        profile = wx.pointer_profile(mine)
+        wx.record_pointer_profile(profile)
+        line = wx.pointer_profile_line(profile, hook=str(hook),
+                                       is_source=is_source)
+        if emit is not None:
+            emit(line)
+        else:
+            import logging as _logging
+
+            _logging.getLogger(__name__).info("%s", line)
+    except BaseException as exc:  # noqa: BLE001
+        import logging as _logging
+
+        _logging.getLogger(__name__).info(
+            "PDFLIP-XCHG-POINTER-PROFILE emit failed: %s: %s",
+            type(exc).__name__, exc)
+
+    tags = tuple(sorted({str(d.tag) for d in mine}))
+    # #1391 (DESK10): THE ONE LINE A BOOT LOG NEVER CARRIED. Boot weg2xsn31's
+    # own trace named the wedge (P PP0's collect finding zero descriptors for
+    # weights_0/weights_1 while D's three ranks deposited real bands there)
+    # from a DEBUG_HOLD frame dump plus a hand-rolled ctypes sem_getvalue --
+    # two boots of forensics for a fact this leg already holds at construction
+    # time and never printed: WHICH tags this rank's OWN filtered descriptor
+    # set (`mine`) actually carries, beside the full family's tag set. A
+    # mismatch here (this rank's tags missing an entry the OTHER side's own
+    # line, for the SAME (boot, direction), carries for a matching src/dst)
+    # is exactly the #1391 shape, readable from two boot-log lines instead of
+    # a DEBUG_HOLD dump: no new derivation, this is `tags`/`family_tags`
+    # (computed two lines below either way), printed rather than only stored
+    # on the `LegPlan` this function already returns.
+    family_tags = tuple(sorted({str(t.tag) for t in join.tensors}))
+    _tag_line = (
+        f"PDFLIP-XCHG-LEG-TAGS hook={hook} group={group} rank={rank} "
+        f"direction={direction} descs={len(mine)} tags={','.join(tags) or '-'} "
+        f"family_tags={','.join(family_tags) or '-'} "
+        "-- this rank's OWN tag set out of the full family; a tag missing "
+        "here that a peer's deposit/collect line carries for the matching "
+        "src/dst is an empty per-tag plan beside real bytes (#1391), not a "
+        "legitimate #1233 'this stage owns no layers of that chunk'")
+    if emit is not None:
+        emit(_tag_line)
+    else:
+        import logging as _logging
+
+        _logging.getLogger(__name__).info("%s", _tag_line)
+    classes = tuple(sorted({t.tensor_class for t in join.tensors}))
+    chunk_layers, chunk_count = ms.weight_chunk_geometry()
+    facts = sh.LegPlanFacts(
+        chunk_layers=int(chunk_layers), chunk_count=int(chunk_count),
+        family_tags=family_tags,
+        waves=tuple(tuple(w) for w in plan.waves),
+        cards=tuple(join.cards), classes=classes,
+        # THE PROVENANCE IS THE MANIFESTS', and it must NOT read as the
+        # derivation's: two producers for one leg is the defect, so the line a
+        # reader sees says which one answered.
+        source=JOIN_PLAN_SOURCE)
+    leg = sh.LegPlan(
+        facts=facts, descs=tuple(mine), card=int(rank), tags=tags,
+        # The card digest is over the JOIN's geometry for this rank, computed
+        # by the same function the derivation uses -- one hash, one owner.
+        card_digest=sh.card_geometry_digest(
+            [t.geom(tp_is_dst=(direction == wx.LEGS_PP_TO_TP))
+             for t in join.tensors], classes),
+        agreed_state=sh.MANIFEST_NOT_ASKED,
+        population=len(join.tensors), planned=len(join.tensors))
+    return leg, ""

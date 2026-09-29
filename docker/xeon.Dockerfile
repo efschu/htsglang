@@ -1,8 +1,8 @@
 FROM ubuntu:24.04
 SHELL ["/bin/bash", "-c"]
 
-ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
-ARG VER_SGLANG=main
+ARG FLLIPER_REPO=https://github.com/sgl-project/sglang.git
+ARG VER_FLLIPER=main
 
 RUN apt-get update && \
     apt-get full-upgrade -y && \
@@ -34,9 +34,9 @@ ENV UV_CONFIG_FILE=/opt/.venv/uv.toml
 
 WORKDIR /sgl-workspace
 RUN source /opt/.venv/bin/activate && \
-    git clone ${SGLANG_REPO} sglang && \
-    cd sglang && \
-    git checkout ${VER_SGLANG} && \
+    git clone ${FLLIPER_REPO} flliper && \
+    cd flliper && \
+    git checkout ${VER_FLLIPER} && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install . && \
@@ -44,7 +44,7 @@ RUN source /opt/.venv/bin/activate && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install .
 
-ENV SGLANG_USE_CPU_ENGINE=1
+ENV FLLIPER_USE_CPU_ENGINE=1
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4:/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:/opt/.venv/lib/libiomp5.so
 ENV PATH="/opt/.venv/bin:$PATH"
 RUN echo 'source /opt/.venv/bin/activate' >> /root/.bashrc

@@ -5,9 +5,9 @@ import torch
 from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
 from torch.nn import functional as F
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.layers.activation import SiluAndMul
+from flliper.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
+from flliper.test.ci.ci_register import register_cuda_ci
 
 try:
     from flashinfer import CuteDslMoEWrapper

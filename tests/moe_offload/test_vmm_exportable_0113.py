@@ -11,12 +11,12 @@ im Launcher. Genau diese Gegenprobe hat heute zweimal gefehlt.
 """
 import pathlib
 
-_ROOT = pathlib.Path(__file__).resolve().parents[2] / "python" / "sglang"
-_UTILS_ROH = (_ROOT / "srt/weg2/tms_csrc/utils.h").read_text()
-_LAUNCHER_ROH = (_ROOT / "srt/weg2/launcher.py").read_text()
+_ROOT = pathlib.Path(__file__).resolve().parents[2] / "python" / "flliper"
+_UTILS_ROH = (_ROOT / "srt/pdflip/tms_csrc/utils.h").read_text()
+_LAUNCHER_ROH = (_ROOT / "srt/pdflip/launcher.py").read_text()
 
 
-def _ohne_kommentare(text: str, marker: str) -> str:
+def _strip_comments(text: str, marker: str) -> str:
     """Nur der CODE. Die erste Fassung dieser Tests fand jeden Begriff im
     ERKLAERTEXT und blieb gruen, waehrend der Code etwas anderes tat -- am
     selben Tag zum zweiten Mal (siehe test_repack_adoption_0922)."""
@@ -25,23 +25,23 @@ def _ohne_kommentare(text: str, marker: str) -> str:
     )
 
 
-_UTILS = _ohne_kommentare(_UTILS_ROH, "//")
-_LAUNCHER = _ohne_kommentare(_LAUNCHER_ROH, "#")
+_UTILS = _strip_comments(_UTILS_ROH, "//")
+_LAUNCHER = _strip_comments(_LAUNCHER_ROH, "#")
 
-ENV = "SGLANG_WEG2_VMM_EXPORTABLE"
+ENV = "FLLIPER_PDFLIP_VMM_EXPORTABLE"
 
 
-def test_der_leser_existiert():
+def test_reader_exists():
     assert ENV in _UTILS
     assert "CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR" in _UTILS
 
 
-def test_der_schreiber_existiert():
+def test_writer_exists():
     # Die Klasse, die heute zehnmal auftrat: ein Leser, den niemand bedient.
     assert f'xchg_env["{ENV}"]' in _LAUNCHER
 
 
-def test_die_env_geht_an_BEIDE_gruppen():
+def test_env_goes_to_both_groups():
     # xchg_env erreicht P und D. Stuende sie in env_p oder env_d, koennte der
     # Besitzer exportierbar anlegen und der Peer trotzdem nicht importieren.
     i = _LAUNCHER.index(f'xchg_env["{ENV}"]')
@@ -55,7 +55,7 @@ def test_default_aus():
     assert "[0] == '1'" in block, "die Env wird nicht auf '1' geprueft"
 
 
-def test_ein_refused_export_toetet_den_boot_nicht():
+def test_refused_export_does_not_kill_the_boot():
     # Ein Feature, das sich nicht anschalten laesst, darf kein Feature sein,
     # das nicht bootet.
     i = _UTILS.index(ENV)

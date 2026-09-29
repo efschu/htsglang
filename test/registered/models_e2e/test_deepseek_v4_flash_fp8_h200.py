@@ -1,7 +1,7 @@
 """H200 per-commit CI: DeepSeek-V4-Flash FP8 (LowLatency recipe).
 
 Launches TP=4 with DeepEP a2a backend + EAGLE speculative decoding,
-with FP4 experts disabled via SGLANG_DSV4_FP4_EXPERTS=0.
+with FP4 experts disabled via FLLIPER_DSV4_FP4_EXPERTS=0.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
@@ -10,12 +10,12 @@ Registry: extra-b-test-deepep-8-gpu-h200 (label-gated, 8x H200 — only 4 used b
 
 import unittest
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.kits.spec_decoding_kit import SpecDecodingMixin
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -76,8 +76,8 @@ class TestDSV4FlashFP8H200(
                 "900",
             ],
             env={
-                "SGLANG_DSV4_FP4_EXPERTS": "0",
-                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+                "FLLIPER_DSV4_FP4_EXPERTS": "0",
+                "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
             },
         )
 

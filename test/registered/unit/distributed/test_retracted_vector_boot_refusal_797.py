@@ -14,8 +14,8 @@ import types
 
 import pytest
 
-from sglang.srt.distributed.utils import resolve_cp_token_ratios
-from sglang.srt.planner.retracted import RetractedProvenanceError
+from flliper.srt.distributed.utils import resolve_cp_token_ratios
+from flliper.srt.planner.retracted import RetractedProvenanceError
 
 SHIPPED = "29,19,16"
 MEASURED = "29,17,18"
@@ -41,9 +41,9 @@ def _clean_env(monkeypatch):
     """These env twins outrank the flags, so a value left by another test (or
     by the developer's shell) would decide the outcome instead of the case."""
     for name in (
-        "SGLANG_UNEVEN_TOKEN_VECTOR",
-        "SGLANG_UNEVEN_TOKEN_VECTOR_ROLE",
-        "SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE",
+        "FLLIPER_UNEVEN_TOKEN_VECTOR",
+        "FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE",
+        "FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE",
     ):
         monkeypatch.delenv(name, raising=False)
     yield
@@ -54,7 +54,7 @@ class TestThePinnedShippedVectorIsRefused797:
     branch of resolve_cp_token_ratios and both env tests go red. Verified."""
 
     def test_env_pinned_shipped_vector_is_refused(self, monkeypatch):
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", SHIPPED)
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", SHIPPED)
         with pytest.raises(RetractedProvenanceError) as exc:
             resolve_cp_token_ratios(_args())
         text = str(exc.value)
@@ -64,7 +64,7 @@ class TestThePinnedShippedVectorIsRefused797:
         assert "--uneven-token-vector-role seed" in text
 
     def test_a_scaled_spelling_is_refused_too(self, monkeypatch):
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", "58,38,32")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", "58,38,32")
         with pytest.raises(RetractedProvenanceError):
             resolve_cp_token_ratios(_args())
 
@@ -76,12 +76,12 @@ class TestThePinnedShippedVectorIsRefused797:
 
 class TestWhatMustNotBeRefused797:
     def test_the_measured_vector_boots(self, monkeypatch):
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", MEASURED)
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", MEASURED)
         assert resolve_cp_token_ratios(_args()) == [29, 17, 18]
 
     def test_a_declared_clean_provenance_boots(self, monkeypatch):
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", SHIPPED)
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE", "measured")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", SHIPPED)
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE", "measured")
         assert resolve_cp_token_ratios(_args()) == [29, 19, 16]
 
     def test_no_vector_at_all_is_untouched(self):
@@ -97,13 +97,13 @@ class TestSeedIsPermittedButWarned797:
     and test_seed_warns goes red. Verified."""
 
     def test_seed_boots_rather_than_refusing(self, monkeypatch):
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", SHIPPED)
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_ROLE", "seed")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", SHIPPED)
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE", "seed")
         assert resolve_cp_token_ratios(_args()) == [29, 19, 16]
 
     def test_seed_warns_and_names_the_investigation(self, monkeypatch, caplog):
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", SHIPPED)
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_ROLE", "seed")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", SHIPPED)
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE", "seed")
         with caplog.at_level("WARNING"):
             resolve_cp_token_ratios(_args())
         joined = " ".join(r.getMessage() for r in caplog.records)
@@ -113,8 +113,8 @@ class TestSeedIsPermittedButWarned797:
     def test_the_env_role_outranks_a_pin_flag(self, monkeypatch):
         # The env is what survives into the flip's second stack build, so it
         # has to win; a stale 'pin' on the args must not re-arm the refusal.
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", SHIPPED)
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_ROLE", "seed")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", SHIPPED)
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE", "seed")
         assert resolve_cp_token_ratios(_args(uneven_token_vector_role="pin")) == [
             29,
             19,
@@ -123,7 +123,7 @@ class TestSeedIsPermittedButWarned797:
 
 
 class TestAnEmptyRoleOverrideDoesNotDisarmTheGate797:
-    """The 2026-08-19 incident: an empty SGLANG_UNEVEN_TOKEN_VECTOR override
+    """The 2026-08-19 incident: an empty FLLIPER_UNEVEN_TOKEN_VECTOR override
     rode along for days because empty read as 'unset' somewhere it should not
     have. An empty ROLE must mean 'not stated here, ask the flag' -- never a
     silent 'pin', and never a silent 'seed'.
@@ -133,8 +133,8 @@ class TestAnEmptyRoleOverrideDoesNotDisarmTheGate797:
     goes red. Verified."""
 
     def test_empty_role_env_defers_to_a_seed_flag(self, monkeypatch):
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", SHIPPED)
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_ROLE", "")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", SHIPPED)
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE", "")
         # The flag says seed; an empty env override must not overrule it into
         # a refusal.
         assert resolve_cp_token_ratios(_args(uneven_token_vector_role="seed")) == [
@@ -144,15 +144,15 @@ class TestAnEmptyRoleOverrideDoesNotDisarmTheGate797:
         ]
 
     def test_empty_role_env_with_a_pin_flag_still_refuses(self, monkeypatch):
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", SHIPPED)
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_ROLE", "")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", SHIPPED)
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE", "")
         with pytest.raises(RetractedProvenanceError):
             resolve_cp_token_ratios(_args(uneven_token_vector_role="pin"))
 
     def test_empty_provenance_env_arms_the_value_match(self, monkeypatch):
         # Empty provenance is "unstated", which is what turns ON the fallback
         # value match -- not "stated as clean", which would turn it off.
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", SHIPPED)
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE", "")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", SHIPPED)
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE", "")
         with pytest.raises(RetractedProvenanceError):
             resolve_cp_token_ratios(_args())

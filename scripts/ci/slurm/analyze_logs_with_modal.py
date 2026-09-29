@@ -174,7 +174,7 @@ def prepare_log_dir(args: argparse.Namespace) -> tuple[Path, Path | None]:
     if not args.tarball.is_file():
         raise FileNotFoundError(f"tarball not found: {args.tarball}")
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="sglang_logs_"))
+    temp_dir = Path(tempfile.mkdtemp(prefix="flliper_logs_"))
     extract_tarball(args.tarball, temp_dir)
     return temp_dir.resolve(), temp_dir
 
@@ -261,7 +261,7 @@ def run_opencode_analysis(
     modal_secret_name: str,
 ) -> str:
     prompt = build_prompt(job_id, repo_urls)
-    app = modal.App.lookup("sglang-log-analyzer", create_if_missing=True)
+    app = modal.App.lookup("flliper-log-analyzer", create_if_missing=True)
     sandbox = modal.Sandbox.create(
         app=app,
         image=build_sandbox_image(),

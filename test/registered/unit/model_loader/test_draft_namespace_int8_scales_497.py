@@ -35,7 +35,7 @@ The comment is pinned here as well as the behaviour, because a claim in a
 comment that the code does not implement is exactly what let this through.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -44,15 +44,15 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.configs.model_config import (
+from flliper.srt.configs.model_config import (
     _IN_CHECKPOINT_DRAFT_PREFIXES,
     _draft_checkpoint_is_dense,
 )
-from sglang.srt.utils.common import (
+from flliper.srt.utils.common import (
     _PACKED_WEIGHT_MARKERS,
     checkpoint_namespace_is_dense,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 #: The 15 tensors Qwen3.6-27B-INT8-W8A8 stores under `mtp.` -- all dense, no
 #: scale of any kind. Its `ignore` list carries `re:.*mtp.*`.

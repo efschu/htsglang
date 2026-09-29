@@ -15,7 +15,7 @@ pool call site.  The desk tests all passed ``owned=`` explicitly and never
 walked the lookup.
 
 THE FIX pinned here: ``current_stage_layer_set()`` no longer needs the
-attribute.  When ``SGLANG_PP_LAYER_SET`` is present, the layer count is
+attribute.  When ``FLLIPER_PP_LAYER_SET`` is present, the layer count is
 recovered from the set string itself -- ``parse_pp_layer_sets`` enforces full
 cover of ``[0, N)``, so ``N == max(layer) + 1`` exactly.
 
@@ -27,15 +27,15 @@ import os
 import unittest
 from unittest import mock
 
-import sglang.srt.distributed.utils as dist_utils
-from sglang.srt.distributed.utils import (
+import flliper.srt.distributed.utils as dist_utils
+from flliper.srt.distributed.utils import (
     PP_CROSSING_WIRE_ENV,
     PP_LAYER_SET_ENV,
     current_stage_layer_set,
     stage_owned_layer_ids,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -67,7 +67,7 @@ class _StageEnv:
         self._patches = [
             mock.patch.dict(os.environ, self._env),
             mock.patch(
-                "sglang.srt.distributed.get_pp_group", return_value=self._group
+                "flliper.srt.distributed.get_pp_group", return_value=self._group
             ),
         ]
         for p in self._patches:
@@ -114,7 +114,7 @@ class TestTheContiguousPathIsUntouched(CustomTestCase):
         env = {k: v for k, v in os.environ.items() if k != PP_LAYER_SET_ENV}
         with mock.patch.dict(os.environ, env, clear=True):
             with mock.patch(
-                "sglang.srt.distributed.get_pp_group",
+                "flliper.srt.distributed.get_pp_group",
                 side_effect=AssertionError("group must not be consulted"),
             ):
                 self.assertIsNone(current_stage_layer_set())
@@ -129,7 +129,7 @@ class TestTheContiguousPathIsUntouched(CustomTestCase):
             group = _GroupWithoutTheAttribute(0, 3)
             group.num_hidden_layers = 64
             with mock.patch(
-                "sglang.srt.distributed.get_pp_group", return_value=group
+                "flliper.srt.distributed.get_pp_group", return_value=group
             ):
                 self.assertEqual(current_stage_layer_set(), PP0_OWNED)
 

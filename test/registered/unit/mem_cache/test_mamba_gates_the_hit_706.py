@@ -36,16 +36,16 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
-from sglang.srt.mem_cache.canonical_page_store import window_for_layers
-from sglang.srt.mem_cache.hicache_storage import (
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_page_store import window_for_layers
+from flliper.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 ATTN_LAYER_IDS = list(range(3, 64, 4))
 CELL = 64

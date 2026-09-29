@@ -25,8 +25,8 @@ when it goes wrong, never a flip.
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers import phase_flip_seam_census as census
-from sglang.srt.managers.phase_flip_boot import PhaseFlipStacks
+from flliper.srt.managers import phase_flip_seam_census as census
+from flliper.srt.managers.phase_flip_boot import PhaseFlipStacks
 
 MIB = 1024 * 1024
 

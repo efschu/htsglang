@@ -35,12 +35,12 @@ would not mean writing bytes whose host state does not exist.
 import logging
 import unittest
 
-from sglang.srt.mem_cache.hicache_flip_writeback import (
+from flliper.srt.mem_cache.hicache_flip_writeback import (
     FlipWritebackReport,
     _mamba_pin_skipped,
     flip_writeback,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Node:
@@ -234,7 +234,7 @@ class TestTheFenceSaysSoOutLoud(CustomTestCase):
 
     def test_a_refusal_draws_a_warning_that_names_the_other_paths(self):
         with self.assertLogs(
-            "sglang.srt.mem_cache.hicache_flip_writeback", level=logging.WARNING
+            "flliper.srt.mem_cache.hicache_flip_writeback", level=logging.WARNING
         ) as caught:
             flip_writeback(_r7_nine_eight(), deadline_s=1.0)
         text = "\n".join(caught.output)
@@ -242,7 +242,7 @@ class TestTheFenceSaysSoOutLoud(CustomTestCase):
         self.assertIn("unified_radix_cache.py:2210", text)
 
     def test_a_clean_fence_draws_no_refusal_warning(self):
-        logger = logging.getLogger("sglang.srt.mem_cache.hicache_flip_writeback")
+        logger = logging.getLogger("flliper.srt.mem_cache.hicache_flip_writeback")
         with self.assertLogs(logger, level=logging.INFO) as caught:
             flip_writeback(_r7_five_five(), deadline_s=1.0)
         self.assertNotIn(

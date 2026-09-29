@@ -7,14 +7,14 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.rigmon.bootwatch import (
+from flliper.srt.rigmon.bootwatch import (
     SIGNATURES,
     STAGES,
     classify_boot,
     read_boot_log,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -28,7 +28,7 @@ KV_DONE = ["[2026-07-26 14:41:02] KV Cache is allocated. #tokens: 98328"]
 READY = ["[2026-07-26 14:41:44] The server is fired up and ready to roll!"]
 
 OOM = [
-    "  File \"python/sglang/srt/mem_cache/memory_pool.py\", line 1904",
+    "  File \"python/flliper/srt/mem_cache/memory_pool.py\", line 1904",
     "    torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)",
     "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 514.00 MiB. "
     "GPU 0 has a total capacity of 31.34 GiB of which 63.19 MiB is free.",

@@ -140,7 +140,7 @@ class _Pool:
 
 
 def _dial(pool, n):
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 
     return MHATokenToKVPool.runtime_set_backing_tokens(pool, n)
 

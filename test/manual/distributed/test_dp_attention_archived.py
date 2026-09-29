@@ -10,12 +10,12 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
-from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
-from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
+from flliper.test.kits.json_constrained_kit import JSONConstrainedMixin
+from flliper.test.kits.regex_constrained_kit import RegexConstrainedMixin
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

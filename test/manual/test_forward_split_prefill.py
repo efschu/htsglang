@@ -13,17 +13,17 @@ from array import array
 import numpy as np
 import torch
 
-from sglang.benchmark.one_batch import TreeCacheNamespace
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import get_device
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+from flliper.benchmark.one_batch import TreeCacheNamespace
+from flliper.srt.configs.model_config import ModelConfig
+from flliper.srt.managers.schedule_batch import Req, ScheduleBatch
+from flliper.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from flliper.srt.model_executor.model_runner import ModelRunner
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.server_args import PortArgs, ServerArgs
+from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
+from flliper.srt.utils import get_device
+from flliper.srt.utils.hf_transformers_utils import get_tokenizer
+from flliper.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
 class TestForwardSplitPrefill(CustomTestCase):

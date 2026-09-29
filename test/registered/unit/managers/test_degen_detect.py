@@ -1,9 +1,9 @@
 """DEGEN-SUSPECT (managers/degen_detect.py): the decode-tail repetition
 instrument, stage 1 = log only.
 
-27B boot ...dkr27breleasedraftbar1w109281340 (D, 13:44-13:51): rid weg2-1-13
+27B boot ...dkr27breleasedraftbar1w109281340 (D, 13:44-13:51): rid pdflip-1-13
 generated for minutes at ~190 tok/s and held the D->P drain. That boot's logs
-carry NO output ids or text of weg2-1-13 (only '#1469 RETAIN ...
+carry NO output ids or text of pdflip-1-13 (only '#1469 RETAIN ...
 token_ids_len=43548' and the front's route/refill lines), so the positive case
 here is synthetic: a reasoning loop of one 37-token pattern.
 
@@ -21,7 +21,7 @@ import types
 
 import pytest
 
-from sglang.srt.managers import degen_detect as dd
+from flliper.srt.managers import degen_detect as dd
 
 THINK_END = 151668
 
@@ -54,11 +54,11 @@ def test_a_reasoning_loop_is_named_once_with_its_period(caplog):
     pattern = _rand(37, seed=7)
     ids = _rand(300) + pattern * 60 + pattern[:11]        # 2531 ids
     with caplog.at_level(logging.WARNING, logger=dd.logger.name):
-        hits = _stream(det, "weg2-1-13", ids)
-        hits += _stream(det, "weg2-1-13", pattern * 80)   # it keeps looping
+        hits = _stream(det, "pdflip-1-13", ids)
+        hits += _stream(det, "pdflip-1-13", pattern * 80)   # it keeps looping
     lines = _lines(caplog)
     assert len(lines) == 1, lines                         # once per rid and period
-    assert "rid=weg2-1-13 part=reasoning period=37 " in lines[0], lines[0]
+    assert "rid=pdflip-1-13 part=reasoning period=37 " in lines[0], lines[0]
     reps = int(lines[0].split("reps=")[1].split()[0])
     assert reps >= dd.MIN_REPS and "stop=off" in lines[0] and "tok_s=" in lines[0]
     assert hits and hits[0][0] == 37
@@ -128,8 +128,8 @@ def test_cost_per_token_is_small_and_off_the_decode_round():
     # the decode round never calls it: only the detokenizer does
     import inspect
 
-    from sglang.srt.managers import detokenizer_manager, scheduler
-    from sglang.srt.managers.scheduler_components import output_streamer
+    from flliper.srt.managers import detokenizer_manager, scheduler
+    from flliper.srt.managers.scheduler_components import output_streamer
 
     assert "degen_detect" not in inspect.getsource(scheduler)
     assert "degen_detect" not in inspect.getsource(output_streamer)
@@ -137,7 +137,7 @@ def test_cost_per_token_is_small_and_off_the_decode_round():
 
 
 def test_the_detokenizer_hook_feeds_ids_and_skips_the_prompt_surround(caplog):
-    from sglang.srt.managers.detokenizer_manager import DetokenizerManager
+    from flliper.srt.managers.detokenizer_manager import DetokenizerManager
 
     mgr = types.SimpleNamespace(degen=dd.DegenDetector(think_end_id=THINK_END))
     pattern = _rand(13, seed=31)
@@ -155,10 +155,10 @@ def test_the_detokenizer_hook_feeds_ids_and_skips_the_prompt_surround(caplog):
 
 
 def test_stage_two_is_off_by_default_and_only_a_hook():
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
-    assert envs.SGLANG_WEG2_DEGEN_DETECT.get() is True
-    assert envs.SGLANG_WEG2_DEGEN_STOP.get() is False
+    assert envs.FLLIPER_PDFLIP_DEGEN_DETECT.get() is True
+    assert envs.FLLIPER_PDFLIP_DEGEN_STOP.get() is False
     called = []
     det = dd.DegenDetector(stop=True, on_stop=lambda *a: called.append(a))
     _stream(det, "r-stop", _rand(7, seed=2) * 200)

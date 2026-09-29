@@ -15,12 +15,12 @@
 import multiprocessing as mp
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.lora_utils import (
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.lora_utils import (
     LORA_MODELS_QWEN3,
     run_lora_multiple_batch_on_model_cases,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_amd_ci(
     est_time=30,

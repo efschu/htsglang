@@ -3,7 +3,7 @@
 
 Emits a mapping `CI suite -> [HuggingFace model ids]` so the models a stage
 exercises can be pre-warmed into a runner cache. The mapping is produced by
-*static analysis* of the registered test files (no GPU, no sglang import), so
+*static analysis* of the registered test files (no GPU, no flliper import), so
 it can run on a plain runner and stays fresh per commit.
 
 How `suite -> files` is resolved
@@ -14,7 +14,7 @@ How `suite -> files` is resolved
     legacy single-string `suite=` when `stage=`/`runner_config=` are unset).
 
 How `file -> models` is resolved (best effort, recall-favoring)
-    - A constant table built from `python/sglang/test/**/*.py` module-level
+    - A constant table built from `python/flliper/test/**/*.py` module-level
       assignments (`DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/..."`, including
       tuple/list values) plus each test file's own module-level constants.
     - Inline HuggingFace-id string literals in the file (f-string fragments are
@@ -210,7 +210,7 @@ def extract_models_from_source(
 def build_global_constant_table(
     repo_root: str, deny: Optional[Set[str]] = None
 ) -> Tuple[Dict[str, Set[str]], Dict[str, str]]:
-    """Constant table from every module under ``python/sglang/test/``.
+    """Constant table from every module under ``python/flliper/test/``.
 
     These shared helpers (e.g. test_utils, lora_utils) define the ``DEFAULT_*``
     model constants test files reference by name. Returns ``(table, errors)``
@@ -220,7 +220,7 @@ def build_global_constant_table(
     """
     table: Dict[str, Set[str]] = {}
     errors: Dict[str, str] = {}
-    pattern = os.path.join(repo_root, "python", "sglang", "test", "**", "*.py")
+    pattern = os.path.join(repo_root, "python", "flliper", "test", "**", "*.py")
     for path in glob.glob(pattern, recursive=True):
         try:
             with open(path, encoding="utf-8") as f:
@@ -241,10 +241,10 @@ def build_global_constant_table(
 
 
 def _load_ci_register(repo_root: str):
-    """Import ci_register.py by path, sidestepping the heavy `sglang` package."""
+    """Import ci_register.py by path, sidestepping the heavy `flliper` package."""
     spec = importlib.util.spec_from_file_location(
         "ci_register",
-        os.path.join(repo_root, "python", "sglang", "test", "ci", "ci_register.py"),
+        os.path.join(repo_root, "python", "flliper", "test", "ci", "ci_register.py"),
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

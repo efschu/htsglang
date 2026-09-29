@@ -51,12 +51,12 @@ while [ "$(date +%s)" -lt "$END" ]; do
   # carry a seam leak; rank order follows the pid order they were spawned
   # in, which is rank 0,1,2 for this boot recipe.
   rss=($(ps -eo rss,cmd --no-headers 2>/dev/null \
-          | grep -F "sglang::scheduler" | grep -v grep \
+          | grep -F "flliper::scheduler" | grep -v grep \
           | awk '{print $1}' | head -3))
   if [ "${#rss[@]}" -lt 3 ]; then
     # Fall back to any launch_server-descended python holding a CUDA ctx.
     rss=($(ps -eo rss,cmd --no-headers 2>/dev/null \
-            | grep -E "sglang(\.launch_server|::)" | grep -v grep \
+            | grep -E "flliper(\.launch_server|::)" | grep -v grep \
             | sort -rn | awk '{print $1}' | head -3))
   fi
   r0=${rss[0]:-0}; r1=${rss[1]:-0}; r2=${rss[2]:-0}

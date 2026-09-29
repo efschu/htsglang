@@ -7,7 +7,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.layers.moe import expert_pool_device as ep
+from flliper.srt.layers.moe import expert_pool_device as ep
 
 E, ROWS, R, S = 8, 7, 2, 3  # residents 0,1 in rows 0,1; LRU rows 2,3; staging 4,5,6
 HOST = [-1, -1, 0, 1, 2, 3, 4, 5]
@@ -99,7 +99,7 @@ def test_allocation_refuses_a_resident_with_a_host_row_and_an_empty_lru():
 
 
 def test_pool_mode_is_selected_by_name_and_only_with_an_offload(monkeypatch):
-    from sglang.srt.layers.moe import offload_capture_gate as g
+    from flliper.srt.layers.moe import offload_capture_gate as g
 
     monkeypatch.setenv(g.ENV_GRAPH_MODE, "pool")
     assert g.resolve_offload_graph_mode(0.5, False) == g.MODE_POOL
@@ -117,7 +117,7 @@ def test_take_report_counts_misses_since_the_last_report_and_resets():
 
 
 def test_hotset_path_template_names_the_ranks_own_file():
-    from sglang.srt.layers.moe.expert_offload import hotset_path_for_rank
+    from flliper.srt.layers.moe.expert_offload import hotset_path_for_rank
 
     assert hotset_path_for_rank("/x/hot_tp{rank}.json", 2) == "/x/hot_tp2.json"
     assert hotset_path_for_rank("/x/hot.json", 2) == "/x/hot.json"
@@ -128,9 +128,9 @@ def test_hotset_file_never_covers_a_draft_layer():
     # split) the local expert count with the target's layer 0.
     from types import SimpleNamespace
 
-    from sglang.srt.layers.moe.expert_offload import hotset_covers_layer
+    from flliper.srt.layers.moe.expert_offload import hotset_covers_layer
 
-    assert hotset_covers_layer(SimpleNamespace(_sglang_prefix="model.layers.0.mlp.experts"))
+    assert hotset_covers_layer(SimpleNamespace(_flliper_prefix="model.layers.0.mlp.experts"))
     assert hotset_covers_layer(SimpleNamespace())
-    assert not hotset_covers_layer(SimpleNamespace(_sglang_prefix="mtp.layers.0.mlp.experts"))
-    assert not hotset_covers_layer(SimpleNamespace(_sglang_prefix="model.mtp.layers.0.mlp"))
+    assert not hotset_covers_layer(SimpleNamespace(_flliper_prefix="mtp.layers.0.mlp.experts"))
+    assert not hotset_covers_layer(SimpleNamespace(_flliper_prefix="model.mtp.layers.0.mlp"))

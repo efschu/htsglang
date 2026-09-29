@@ -2,9 +2,9 @@ import unittest
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.server_fixtures.ngram_fixture import NgramServerBase
 
 # Extra: Triton + Flashinfer NGRAM backends + non-overlap (sync V2) variant.
 # Sibling per-commit file (test_spec_ngram.py) keeps the Paged variant.

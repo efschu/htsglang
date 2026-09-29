@@ -16,15 +16,15 @@ import os
 import unittest
 from unittest.mock import patch
 
-import sglang.srt.server_args as server_args_module
-from sglang.srt.distributed.utils import get_pp_indices
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.server_args as server_args_module
+from flliper.srt.distributed.utils import get_pp_indices
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
-PARTITION_ENV = "SGLANG_PP_LAYER_PARTITION"
+PARTITION_ENV = "FLLIPER_PP_LAYER_PARTITION"
 
 # Qwen3.6-27B geometry: 64 backbone layers, full_attention_interval 4, so
 # every 4th layer (1-based) is full attention -> 16 full, 48 linear (GDN).
@@ -72,7 +72,7 @@ def run_uneven_tp(args):
 
 
 class PartitionEnvTestCase(CustomTestCase):
-    """Base class that keeps SGLANG_PP_LAYER_PARTITION out of the ambient
+    """Base class that keeps FLLIPER_PP_LAYER_PARTITION out of the ambient
     environment -- both handlers and get_pp_indices read it globally."""
 
     def setUp(self):
@@ -215,7 +215,7 @@ class TestPpLayerRatioValidation(PartitionEnvTestCase):
             self.handler(pp_size=2, pp_layer_ratio=[70, -6])
 
     def test_conflicts_with_the_pd_prefill_layer_split(self):
-        with self.assertRaisesRegex(ValueError, "SGLANG_PP_LAYER_PARTITION"):
+        with self.assertRaisesRegex(ValueError, "FLLIPER_PP_LAYER_PARTITION"):
             self.handler(
                 pp_size=2,
                 pp_layer_ratio=[52, 12],

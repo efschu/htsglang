@@ -5,7 +5,7 @@ does not exist in that generator's scope -- NameError at the first boot with
 _get_all_weights for the primary read and cleared afterwards."""
 from types import SimpleNamespace
 
-from sglang.srt.model_loader.loader import DefaultModelLoader
+from flliper.srt.model_loader.loader import DefaultModelLoader
 
 
 def _loader():
@@ -49,7 +49,7 @@ def test_the_prefetch_branch_never_names_a_bare_model_config():
     config lives on self._loading_model_config (5bce92590e)."""
     import inspect
 
-    from sglang.srt.model_loader import loader as ld
+    from flliper.srt.model_loader import loader as ld
 
     src = inspect.getsource(ld.DefaultModelLoader._get_weights_iterator)
     assert 'getattr(model_config, "is_draft_model"' not in src

@@ -2,10 +2,10 @@
 
 Boot weg2rc5gg (27B line, RC5 5f13f1aad9, 2026-09-25), first flip D->P:
 
-    [05:41:05 PP0] WEG2-RESUME-PTRATTR tag=weights_5 ... own_tag=weights_5 mapped=22
+    [05:41:05 PP0] PDFLIP-RESUME-PTRATTR tag=weights_5 ... own_tag=weights_5 mapped=22
         unmapped=8 first_unmapped=model.layers.40.linear_attn.in_proj_qkvz.qweight
         (44564480B,type=0)
-    [05:41:08 PP1] WEG2-BAR1 mapped lane=p0 phase=collect seq=0-weights_5 ...
+    [05:41:08 PP1] PDFLIP-BAR1 mapped lane=p0 phase=collect seq=0-weights_5 ...
     Fatal Python error: Segmentation fault
       weight_exchange_transport.py:852 memcpy_async <- bar1_lanes.py:1112
       _run_bar1_tag_streamed (cuMemcpyAsync)
@@ -17,7 +17,7 @@ bytes -- and grows the dequant workspace. ``DefaultModelLoader`` runs that pass
 inside ``weight_chunk_scope(layer_id_from_module_name(name))``, so a post-load
 allocation lands in the chunk tag its layer is paused and resumed under.
 ``GGUFModelLoader`` ran it bare: everything was born under the BASE ``weights``
-tag (WEG2-XCHG-COVER on PP0: ``weights`` tms 7766 MiB against a walk of 521;
+tag (PDFLIP-XCHG-COVER on PP0: ``weights`` tms 7766 MiB against a walk of 521;
 ``weights_0..5`` tms 122-522 against 477-1804). The wake resumes the chunks first
 and the base tag last, so the collect of ``weights_5`` wrote into pages no tag
 had remapped yet, and the driver took the unknown destination for pageable host
@@ -42,12 +42,12 @@ from unittest import mock
 
 import torch
 
-import sglang.srt.managers.weg2_memory_saver as ms
-import sglang.srt.model_loader.loader as loader_mod
-from sglang.srt.layers.linear import MergedColumnParallelLinear
-from sglang.srt.layers.quantization import gguf as G
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.managers.pdflip_memory_saver as ms
+import flliper.srt.model_loader.loader as loader_mod
+from flliper.srt.layers.linear import MergedColumnParallelLinear
+from flliper.srt.layers.quantization import gguf as G
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -169,7 +169,7 @@ class GgufPostLoadChunkScope(CustomTestCase):
 
 # ---------------------------------------------------------------------------
 # The real GGUF weight path on CPU tensors (the fixture shape of
-# test_weg2_gguf_flat_declaration_g1): which tag is current at each
+# test_pdflip_gguf_flat_declaration_g1): which tag is current at each
 # ALLOCATION of a qweight -- the flat container, a single-shard qweight -- and of
 # the shared dequant workspace.
 # ---------------------------------------------------------------------------

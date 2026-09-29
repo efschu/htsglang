@@ -50,7 +50,7 @@ from s11_bar1_e2e import (  # noqa: E402
     parse_log_evidence,
     parse_smoke,
 )
-from s12_prefill_kurve import tabelle, zusammenfassen  # noqa: E402
+from s12_prefill_kurve import table, summarize  # noqa: E402
 
 # The lines the code really writes -- built from the ACTUAL format strings in
 # parallel_state.py / barlink.py / barlink_bar1.py / benchmark/bar1_graph_check.py
@@ -73,7 +73,7 @@ LOG_GROUP_FALLBACK_DCP = "418:[2026-07-30 03:11:02] " + _src.render_group_fallba
     reason="Bar1Unavailable: the holder reports ENOMEM",
 )
 LOG_SETUP = "400:[2026-07-30 03:11:01] " + _src.render_setup_line(
-    dauer_ms=27, peer_targets=2, region_mib=24.0, slots_desc="8 slots",
+    duration_ms=27, peer_targets=2, region_mib=24.0, slots_desc="8 slots",
     slot_kib=512, payload_kib=20480, flags_bytes=256, export="dma-buf",
 )
 LOG_LEDGER_TP = "401:[2026-07-30 03:11:01] " + _src.render_ledger_line(
@@ -101,7 +101,7 @@ GRAPH_CHECK_FALLEN = _src.render_graph_check_transcript(
 SMOKE_TEXT = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20."
 #: Die Fortsetzung, die /generate auf "1 2 3 4" liefern muss. Ab 5, weil die
 #: ersten vier im Prompt stehen und nichts belegen.
-SMOKE_FORTSETZUNG = " " + " ".join(str(i) for i in range(5, 26))
+SMOKE_CONTINUATION = " " + " ".join(str(i) for i in range(5, 26))
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +198,7 @@ class TestBar1StepTable:
     ):
         """The comparison IS the difference between the arms. Generating both
         from one template makes that testable: anything but the arm label and
-        the SGLANG_BARLINK* array showing up in the diff means the two boots
+        the FLLIPER_BARLINK* array showing up in the diff means the two boots
         differ in something nobody intended."""
         script = tmp_path / "gen.sh"
         script.write_text(
@@ -217,17 +217,17 @@ class TestBar1StepTable:
         a = (tmp_path / "a.sh").read_text().splitlines()
         b = (tmp_path / "b.sh").read_text().splitlines()
         assert len(a) == len(b)
-        unterschiede = [(x, y) for x, y in zip(a, b) if x != y]
-        assert len(unterschiede) == 2, unterschiede
+        diffs = [(x, y) for x, y in zip(a, b) if x != y]
+        assert len(diffs) == 2, diffs
         assert all(
-            "arm" in x or "BARLINK_ENV" in x for x, _ in unterschiede
-        ), unterschiede
-        arm_a = next(x for x, _ in unterschiede if "BARLINK_ENV" in x)
-        arm_b = next(y for _, y in unterschiede if "BARLINK_ENV" in y)
+            "arm" in x or "BARLINK_ENV" in x for x, _ in diffs
+        ), diffs
+        arm_a = next(x for x, _ in diffs if "BARLINK_ENV" in x)
+        arm_b = next(y for _, y in diffs if "BARLINK_ENV" in y)
         for var in (
-            "SGLANG_BARLINK=1",
-            "SGLANG_BARLINK_TRANSPORT=bar1",
-            "SGLANG_BARLINK_GRAPH_ENABLE=1",
+            "FLLIPER_BARLINK=1",
+            "FLLIPER_BARLINK_TRANSPORT=bar1",
+            "FLLIPER_BARLINK_GRAPH_ENABLE=1",
         ):
             assert var in arm_a
             assert var not in arm_b
@@ -501,7 +501,7 @@ def _e2e(**over) -> dict:
         "smoke": {
             "present": True,
             "endpunkt": "generate",
-            "content_prefix": SMOKE_FORTSETZUNG,
+            "content_prefix": SMOKE_CONTINUATION,
             "spec_accept_length": 2.9,
             "spec_verify_ct": 41,
             "finish_reason": "length",
@@ -638,7 +638,7 @@ class TestE2ECheck:
         assert "dcp:0" in line
         assert "a mixed run" in line
 
-    def test_no_erreicht_line_at_all_is_fail(self, tmp_path):
+    def test_no_reached_line_at_all_is_fail(self, tmp_path):
         _write_e2e(tmp_path, _e2e(groups=[], groups_on_bar1=[]))
         assert_fail(self.CHECK, tmp_path, self.STEP)
 
@@ -671,7 +671,7 @@ class TestE2ECheck:
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "schema_version" in line
 
-    def test_missing_log_quellen_at_the_right_schema_is_a_stop(self, tmp_path):
+    def test_missing_log_sources_at_the_right_schema_is_a_stop(self, tmp_path):
         """Belt and braces: the field is what the check reads, not the number."""
         payload = _e2e()
         del payload["log_sources"]
@@ -1051,7 +1051,7 @@ class TestAgainstTheGreenTransportRun:
 #: die Tokenschleifen-Pruefung und beweist damit nichts ueber die Bedingung,
 #: die sie eigentlich isolieren wollte. Beim ersten Anlauf dieser Tests ist
 #: genau das passiert.
-_PROSA = " ".join(
+_PROSE = " ".join(
     f"Der {w} Gedanke fuehrt uns zu einer weiteren Betrachtung ueber {z}."
     for w, z in zip(
         "erste zweite dritte vierte fuenfte sechste siebte achte neunte "
@@ -1077,7 +1077,7 @@ class TestGenerateSmoke:
     an unbidden forum post is a perfectly intact language-model result.
     """
 
-    def _schreibe(self, tmp_path, text, meta=None):
+    def _write(self, tmp_path, text, meta=None):
         write_json(
             tmp_path / "smoke.json",
             {"text": text, "meta_info": meta if meta is not None else {}},
@@ -1085,9 +1085,9 @@ class TestGenerateSmoke:
         return parse_smoke(str(tmp_path))
 
     def test_a_clean_continuation_is_intact(self, tmp_path):
-        out = self._schreibe(
+        out = self._write(
             tmp_path,
-            SMOKE_FORTSETZUNG,
+            SMOKE_CONTINUATION,
             {"spec_accept_length": 2.87, "spec_verify_ct": 41,
              "finish_reason": {"type": "length"}},
         )
@@ -1101,8 +1101,8 @@ class TestGenerateSmoke:
 
     def test_drift_after_a_good_anchor_passes(self, tmp_path):
         """The whole point of the rework, in miniature."""
-        out = self._schreibe(
-            tmp_path, " 5 6 7 8 9 10 " + _PROSA,
+        out = self._write(
+            tmp_path, " 5 6 7 8 9 10 " + _PROSE,
             {"finish_reason": {"type": "length"}},
         )
         assert out["anker_zahlen"] == 6
@@ -1111,8 +1111,8 @@ class TestGenerateSmoke:
 
     def test_finish_reason_length_alone_is_not_a_failure(self, tmp_path):
         """A continuation prompt has no reason to stop -- `length` is normal."""
-        out = self._schreibe(
-            tmp_path, SMOKE_FORTSETZUNG, {"finish_reason": {"type": "length"}}
+        out = self._write(
+            tmp_path, SMOKE_CONTINUATION, {"finish_reason": {"type": "length"}}
         )
         assert out["lm_intakt"] is True
 
@@ -1123,7 +1123,7 @@ class TestGenerateSmoke:
         that is how it reported 10 for attempt 4 and 3 for the thinking
         preamble. The anchor starts at character one.
         """
-        out = self._schreibe(tmp_path, _PROSA + " 5 6 7 8 9 10")
+        out = self._write(tmp_path, _PROSE + " 5 6 7 8 9 10")
         assert out["anker_zahlen"] == 0
         assert out["lm_intakt"] is False
 
@@ -1133,19 +1133,19 @@ class TestGenerateSmoke:
         Verbatim from attempt 4: the drift begins with "10 0/10". A search
         that skips ahead would score that as a hit.
         """
-        out = self._schreibe(tmp_path, " 5 6 7 8 9 10 0/10 " + _PROSA)
+        out = self._write(tmp_path, " 5 6 7 8 9 10 0/10 " + _PROSE)
         assert out["anker_zahlen"] == 6
 
     def test_the_prompt_numbers_do_not_count(self, tmp_path):
         """Echoing "1 2 3 4" proves nothing -- the anchor starts at 5."""
-        out = self._schreibe(tmp_path, "1 2 3 4 " + _PROSA)
+        out = self._write(tmp_path, "1 2 3 4 " + _PROSE)
         assert out["anker_zahlen"] == 0
         assert out["lm_intakt"] is False
 
     # -- Negativkontrollen: jede isoliert EINE Bedingung ------------------
 
     def test_a_token_loop_is_garbage_even_with_a_good_anchor(self, tmp_path):
-        out = self._schreibe(tmp_path, " 5 6 7 8 9 10 " + "ja ja " * 100)
+        out = self._write(tmp_path, " 5 6 7 8 9 10 " + "ja ja " * 100)
         assert out["anker_zahlen"] == 6
         assert out["lm_intakt"] is False
         assert any("Tokenschleife" in b for b in out["muell_befunde"])
@@ -1155,22 +1155,22 @@ class TestGenerateSmoke:
         import random
 
         rnd = random.Random(7)
-        rauschen = "".join(chr(rnd.randrange(1, 32)) for _ in range(400))
-        out = self._schreibe(tmp_path, " 5 6 7 8 9 10 " + rauschen)
+        noise = "".join(chr(rnd.randrange(1, 32)) for _ in range(400))
+        out = self._write(tmp_path, " 5 6 7 8 9 10 " + noise)
         assert out["lm_intakt"] is False
         assert any("druckbare" in b for b in out["muell_befunde"])
 
     def test_low_vocabulary_is_garbage(self, tmp_path):
         """Isolated: printable, no immediate loop, but almost no vocabulary."""
-        worte = ["alpha", "beta"] * 60
+        words = ["alpha", "beta"] * 60
         # Umgestellt, damit sich keine kurze Einheit UNMITTELBAR wiederholt.
-        text = " ".join(worte[::2] + worte[1::2])
-        out = self._schreibe(tmp_path, " 5 6 7 8 9 10 " + text)
+        text = " ".join(words[::2] + words[1::2])
+        out = self._write(tmp_path, " 5 6 7 8 9 10 " + text)
         assert out["lm_intakt"] is False
         assert any("Wortvielfalt" in b for b in out["muell_befunde"])
 
     def test_an_empty_answer_is_garbage(self, tmp_path):
-        out = self._schreibe(tmp_path, "")
+        out = self._write(tmp_path, "")
         assert out["lm_intakt"] is False
         assert out["muell_befunde"]
 
@@ -1181,30 +1181,30 @@ class TestGenerateSmoke:
         report no garbage -- otherwise the garbage tests are just a second,
         vaguer way of saying the same thing.
         """
-        out = self._schreibe(tmp_path, _PROSA)
+        out = self._write(tmp_path, _PROSE)
         assert out["muell_befunde"] == []
         assert out["anker_zahlen"] == 0
         assert out["lm_intakt"] is False
 
     def test_the_named_under_provisioned_state(self, tmp_path):
         """Coherent text, budget spent, the numbers never started."""
-        out = self._schreibe(
-            tmp_path, _PROSA, {"finish_reason": {"type": "length"}}
+        out = self._write(
+            tmp_path, _PROSE, {"finish_reason": {"type": "length"}}
         )
         assert out["lm_intakt"] is False
         assert out["unterprovisioniert"] is True
 
     def test_garbage_is_never_called_under_provisioned(self, tmp_path):
         """The reassuring name must not cover a real fault."""
-        out = self._schreibe(
+        out = self._write(
             tmp_path, "ja ja " * 100, {"finish_reason": {"type": "length"}}
         )
         assert out["unterprovisioniert"] is False
 
     def test_a_good_anchor_is_never_called_under_provisioned(self, tmp_path):
         """Attempt 4 must not be filed under "budget went elsewhere"."""
-        out = self._schreibe(
-            tmp_path, " 5 6 7 8 9 10 " + _PROSA,
+        out = self._write(
+            tmp_path, " 5 6 7 8 9 10 " + _PROSE,
             {"finish_reason": {"type": "length"}},
         )
         assert out["unterprovisioniert"] is False
@@ -1212,8 +1212,8 @@ class TestGenerateSmoke:
     def test_the_accept_length_comes_from_meta_info_only(self, tmp_path):
         """NOT spec_ema_accept_len -- a smoothed curve, not this request's
         acceptance length, and confusing the two is a known trap."""
-        out = self._schreibe(
-            tmp_path, SMOKE_FORTSETZUNG, {"spec_ema_accept_len": 3.4}
+        out = self._write(
+            tmp_path, SMOKE_CONTINUATION, {"spec_ema_accept_len": 3.4}
         )
         assert out["spec_accept_length"] is None
 
@@ -1285,7 +1285,7 @@ class TestSmokeContractWithTheStepScript:
 
     SHELL = os.path.join(BATTERY, "s11_bar1_e2e.sh")
 
-    def _befehle(self) -> str:
+    def _commands(self) -> str:
         """Die Schrittdatei OHNE Kommentare.
 
         Der Kommentar ueber dem Request nennt /v1/chat/completions -- als
@@ -1299,19 +1299,19 @@ class TestSmokeContractWithTheStepScript:
         return "\n".join(lines)
 
     def test_the_shell_sends_the_prompt_the_parser_expects(self):
-        from s11_bar1_e2e import SMOKE_PROMPT, ZAHLEN_VON
+        from s11_bar1_e2e import SMOKE_PROMPT, COUNT_FROM
 
-        text = self._befehle()
+        text = self._commands()
         assert f'\\"text\\": \\"{SMOKE_PROMPT}\\"' in text, (
             "der Fortsetzungs-Prompt in s11_bar1_e2e.sh und SMOKE_PROMPT "
             "sind auseinandergelaufen"
         )
         # Und die Zaehlung setzt genau dahinter an.
-        letzte = int(SMOKE_PROMPT.split()[-1])
-        assert ZAHLEN_VON == letzte + 1
+        last = int(SMOKE_PROMPT.split()[-1])
+        assert COUNT_FROM == last + 1
 
     def test_the_shell_uses_generate_and_not_the_chat_endpoint(self):
-        text = self._befehle()
+        text = self._commands()
         assert "/generate" in text
         assert "/v1/chat/completions" not in text
 
@@ -1319,27 +1319,27 @@ class TestSmokeContractWithTheStepScript:
         """128 Token waren der Grund, warum die Zahlen nie drankamen."""
         import re
 
-        text = self._befehle()
-        treffer = re.search(r'max_new_tokens\\":\s*(\d+)', text)
-        assert treffer, "kein max_new_tokens im Smoke-Request"
-        assert int(treffer.group(1)) >= 512
+        text = self._commands()
+        hits = re.search(r'max_new_tokens\\":\s*(\d+)', text)
+        assert hits, "kein max_new_tokens im Smoke-Request"
+        assert int(hits.group(1)) >= 512
 
 
 # ---------------------------------------------------------------------------
 # s12 prefill curve
 # ---------------------------------------------------------------------------
 
-BEKANNT = {1: 1190.7, 4: 1143.7, 8: 1105.0, 16: 1122.4}
+KNOWN = {1: 1190.7, 4: 1143.7, 8: 1105.0, 16: 1122.4}
 
 
-def _kurve(**over) -> dict:
+def _curve(**over) -> dict:
     plan = [1, 4, 8, 16]
-    reihenfolge = []
+    ordering = []
     folge = 0
     for sessions in plan:
         for arm in ("bar1", "grundlinie"):
             folge += 1
-            gruppen = (
+            group_list = (
                 [
                     {"group": "tp:0", "requested": "bar1", "achieved": "bar1"},
                     {"group": "dcp:0", "requested": "bar1", "achieved": "bar1"},
@@ -1347,14 +1347,14 @@ def _kurve(**over) -> dict:
                 if arm == "bar1"
                 else []
             )
-            reihenfolge.append(
+            ordering.append(
                 {
                     "folge": folge,
                     "arm": arm,
                     "sessions": sessions,
                     "zeit": "2026-07-30T04:00:00",
                     "evidence_present": True,
-                    "groups": gruppen,
+                    "groups": group_list,
                     "fatal_erhoben": True,
                     "fatal": None,
                 }
@@ -1368,12 +1368,12 @@ def _kurve(**over) -> dict:
         "host_erreichbar": True,
         "integration_vorhanden": True,
         "punkte": 8,
-        "reihenfolge": reihenfolge,
+        "reihenfolge": ordering,
         "fatal": [],
         "fatal_ungeprueft": [],
         "kurven": {
             "bar1": {"1": 1310.0, "4": 1520.0, "8": 1690.0, "16": 1740.0},
-            "grundlinie": {str(k): v for k, v in BEKANNT.items()},
+            "grundlinie": {str(k): v for k, v in KNOWN.items()},
         },
         "decode": [
             {
@@ -1389,9 +1389,9 @@ def _kurve(**over) -> dict:
             for arm in ("bar1", "grundlinie")
             for batch in (1, 16)
         ],
-        "grundlinie_bekannt": {str(k): v for k, v in BEKANNT.items()},
+        "grundlinie_bekannt": {str(k): v for k, v in KNOWN.items()},
         "grundlinie_quelle": "MESSUNG_PREFILL_ANTEIL.md",
-        "grundlinie_abweichung_pct": {str(k): 0.0 for k in BEKANNT},
+        "grundlinie_abweichung_pct": {str(k): 0.0 for k in KNOWN},
         "toleranz_pct": 5.0,
         "verhaeltnis_bar1_zu_grundlinie": {"1": 1.10, "4": 1.33, "8": 1.53, "16": 1.55},
         "output_samples": {
@@ -1405,24 +1405,24 @@ def _kurve(**over) -> dict:
     return payload
 
 
-def _write_kurve(tmp_path, payload=None):
+def _write_curve(tmp_path, payload=None):
     write_json(
-        tmp_path / "prefill_kurve.json", payload if payload is not None else _kurve()
+        tmp_path / "prefill_kurve.json", payload if payload is not None else _curve()
     )
     return tmp_path
 
 
-class TestPrefillKurveCheck:
+class TestPrefillCurveCheck:
     CHECK, STEP = "check_s12_prefill_kurve.py", "s12_prefill_kurve"
 
     def test_pass_with_a_rising_curve(self, tmp_path):
-        _write_kurve(tmp_path)
+        _write_curve(tmp_path)
         assert_pass(self.CHECK, tmp_path, self.STEP)
 
     def test_pass_with_a_flat_curve_too(self, tmp_path):
         """Flat is a result. A check that only passed a rising curve would be
         deciding the question the step exists to ask."""
-        payload = _kurve()
+        payload = _curve()
         payload["kurven"]["bar1"] = {
             "1": 1195.0,
             "4": 1150.0,
@@ -1435,83 +1435,83 @@ class TestPrefillKurveCheck:
             "8": 1.005,
             "16": 1.002,
         }
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         assert_pass(self.CHECK, tmp_path, self.STEP)
 
     def test_missing_artifact_is_stop(self, tmp_path):
         assert_stop(self.CHECK, tmp_path, self.STEP)
 
     def test_unreachable_host_is_stop(self, tmp_path):
-        _write_kurve(tmp_path, _kurve(host_erreichbar=False))
+        _write_curve(tmp_path, _curve(host_erreichbar=False))
         assert_stop(self.CHECK, tmp_path, self.STEP)
 
     def test_blocked_step_is_stop(self, tmp_path):
-        payload = _kurve(blockiert="Host-Locks fremd gehalten -- nicht gebrochen")
+        payload = _curve(blockiert="Host-Locks fremd gehalten -- nicht gebrochen")
         payload["kurven"] = {"bar1": {}, "grundlinie": {}}
         payload["reihenfolge"] = []
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_stop(self.CHECK, tmp_path, self.STEP)
         assert "blockiert" in line
 
     def test_half_a_pair_is_fail(self, tmp_path):
-        payload = _kurve()
+        payload = _curve()
         del payload["kurven"]["grundlinie"]["8"]
         payload["reihenfolge"] = [
             r
             for r in payload["reihenfolge"]
             if not (r["arm"] == "grundlinie" and r["sessions"] == 8)
         ]
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "grundlinie" in line
 
     def test_aborted_run_names_the_reason(self, tmp_path):
-        payload = _kurve(abbruch="Messung bar1/8 rc=1")
+        payload = _curve(abbruch="Messung bar1/8 rc=1")
         payload["kurven"]["bar1"].pop("8")
         payload["kurven"]["bar1"].pop("16")
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "rc=1" in line
 
     def test_blockwise_measurement_is_fail(self, tmp_path):
         """A,A,A,A,B,B,B,B is two afternoons in one window, not a comparison."""
-        payload = _kurve()
+        payload = _curve()
         payload["reihenfolge"] = sorted(
             payload["reihenfolge"], key=lambda r: (r["arm"], r["sessions"])
         )
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "blockweise" in line
 
     def test_bar1_point_with_a_gloo_group_is_fail(self, tmp_path):
-        payload = _kurve()
+        payload = _curve()
         payload["reihenfolge"][0]["groups"][1]["achieved"] = "gloo"
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "mixed point" in line
 
     def test_baseline_point_with_barlink_is_fail(self, tmp_path):
         """The baseline arm differs in exactly three variables; if it sees
         barlink at all, the two arms are not the two arms."""
-        payload = _kurve()
+        payload = _curve()
         payload["reihenfolge"][1]["groups"] = [
             {"group": "tp:0", "requested": "bar1", "achieved": "bar1"}
         ]
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "Grundlinie" in line
 
     def test_missing_transport_evidence_is_fail(self, tmp_path):
-        payload = _kurve()
+        payload = _curve()
         payload["reihenfolge"][0]["evidence_present"] = False
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "Beleg" in line
 
     def test_boot_with_a_fatal_is_fail(self, tmp_path):
         """Eight boots that each died in a prefill OOM still hand in a
         throughput table, and without this gate it looks like a healthy one."""
-        payload = _kurve()
+        payload = _curve()
         payload["fatal"] = [
             {
                 "folge": 3,
@@ -1521,60 +1521,60 @@ class TestPrefillKurveCheck:
                 "out of memory",
             }
         ]
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "OutOfMemoryError" in line
 
     def test_boot_without_a_fatal_harvest_is_fail(self, tmp_path):
-        payload = _kurve()
+        payload = _curve()
         payload["fatal_ungeprueft"] = [{"folge": 2, "arm": "grundlinie", "sessions": 1}]
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "ohne Fatal-Ernte" in line
 
     def test_artifact_without_a_fatal_field_is_fail(self, tmp_path):
         """A producer that never harvested must not read like a clean run."""
-        payload = _kurve()
+        payload = _curve()
         del payload["fatal"]
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "fatal" in line
 
     def test_missing_decode_point_is_fail(self, tmp_path):
-        payload = _kurve()
+        payload = _curve()
         payload["decode"] = [d for d in payload["decode"] if d["batch"] != 16]
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "bs=16" in line
 
     def test_missing_output_sample_is_fail(self, tmp_path):
-        payload = _kurve()
+        payload = _curve()
         payload["output_samples"]["bar1"] = None
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "Sample" in line
 
     def test_baseline_that_does_not_reproduce_is_stop(self, tmp_path):
-        payload = _kurve()
+        payload = _curve()
         payload["kurven"]["grundlinie"]["8"] = 900.0
         payload["grundlinie_abweichung_pct"]["8"] = -18.6
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         line = assert_stop(self.CHECK, tmp_path, self.STEP)
         assert "reproduziert nicht" in line
 
     def test_small_baseline_drift_still_passes(self, tmp_path):
-        payload = _kurve()
+        payload = _curve()
         payload["kurven"]["grundlinie"]["8"] = 1060.0
         payload["grundlinie_abweichung_pct"]["8"] = -4.1
-        _write_kurve(tmp_path, payload)
+        _write_curve(tmp_path, payload)
         assert_pass(self.CHECK, tmp_path, self.STEP)
 
 
-class TestPrefillKurveSummary:
+class TestPrefillCurveSummary:
     """punkte.jsonl -> summary -> live table, without a server."""
 
     @staticmethod
-    def _punkte(tmp_path, punkte, belege=True, fatal=""):
+    def _points(tmp_path, punkte, belege=True, fatal=""):
         with open(tmp_path / "punkte.jsonl", "w") as f:
             for p in punkte:
                 f.write(json.dumps(p) + "\n")
@@ -1623,14 +1623,14 @@ class TestPrefillKurveSummary:
         }
 
     def test_summary_joins_arms_and_reads_the_evidence(self, tmp_path):
-        self._punkte(
+        self._points(
             tmp_path,
             [
                 self._punkt(1, "bar1", 1, 1310.0),
                 self._punkt(2, "grundlinie", 1, 1190.0),
             ],
         )
-        payload = zusammenfassen(str(tmp_path), 5.0, [1])
+        payload = summarize(str(tmp_path), 5.0, [1])
         assert payload["kurven"]["bar1"]["1"] == 1310.0
         assert payload["verhaeltnis_bar1_zu_grundlinie"]["1"] == pytest.approx(
             1310.0 / 1190.0
@@ -1644,7 +1644,7 @@ class TestPrefillKurveSummary:
     def test_summary_surfaces_a_boot_that_died(self, tmp_path):
         """The harvest existed on disk from the start; nothing read it, so
         eight boots that each died in a prefill OOM still handed in numbers."""
-        self._punkte(
+        self._points(
             tmp_path,
             [
                 self._punkt(1, "bar1", 1, 1310.0),
@@ -1652,28 +1652,28 @@ class TestPrefillKurveSummary:
             ],
             fatal="884:torch.OutOfMemoryError: CUDA out of memory. Tried 2.00 GiB\n",
         )
-        payload = zusammenfassen(str(tmp_path), 5.0, [1])
+        payload = summarize(str(tmp_path), 5.0, [1])
         assert len(payload["fatal"]) == 2
         assert "OutOfMemoryError" in payload["fatal"][0]["line"]
         assert payload["fatal_ungeprueft"] == []
 
     def test_summary_marks_a_boot_without_a_harvest(self, tmp_path):
         """Nobody looked and nothing found must not read the same."""
-        self._punkte(tmp_path, [self._punkt(1, "bar1", 1, 1310.0)], belege=False)
-        payload = zusammenfassen(str(tmp_path), 5.0, [1])
+        self._points(tmp_path, [self._punkt(1, "bar1", 1, 1310.0)], belege=False)
+        payload = summarize(str(tmp_path), 5.0, [1])
         assert payload["fatal"] == []
         assert len(payload["fatal_ungeprueft"]) == 1
 
     def test_table_renders_both_arms_without_judging(self, tmp_path):
-        self._punkte(
+        self._points(
             tmp_path,
             [
                 self._punkt(1, "bar1", 1, 1310.0),
                 self._punkt(2, "grundlinie", 1, 1190.0),
             ],
         )
-        payload = zusammenfassen(str(tmp_path), 5.0, [1])
-        text = tabelle(payload)
+        payload = summarize(str(tmp_path), 5.0, [1])
+        text = table(payload)
         assert "| 1 | 1310.0 | 1190.0 | 1.101 |" in text
         for verdict in ("gut", "schlecht", "besser", "Gewinn", "!"):
             assert verdict not in text
@@ -1681,10 +1681,10 @@ class TestPrefillKurveSummary:
     def test_incomplete_run_summarises_what_is_there(self, tmp_path):
         """The live table has to work after the FIRST point, or nobody can
         watch a run that takes over an hour."""
-        self._punkte(tmp_path, [self._punkt(1, "bar1", 1, 1310.0)])
-        payload = zusammenfassen(str(tmp_path), 5.0, [1, 4])
+        self._points(tmp_path, [self._punkt(1, "bar1", 1, 1310.0)])
+        payload = summarize(str(tmp_path), 5.0, [1, 4])
         assert payload["kurven"]["grundlinie"] == {}
-        assert "| 1 | 1310.0 | None |" in tabelle(payload)
+        assert "| 1 | 1310.0 | None |" in table(payload)
 
 
 # ---------------------------------------------------------------------------

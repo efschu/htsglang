@@ -32,7 +32,7 @@ Contract pinned here:
   no manifest to be short of.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -41,8 +41,8 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.distributed.utils import _checkpoint_size_mib
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.utils import _checkpoint_size_mib
+from flliper.test.test_utils import CustomTestCase
 
 SHARD_BYTES = 4 * 2**20  # 4 MiB per stand-in shard
 N_SHARDS = 18
@@ -95,7 +95,7 @@ class TestPartialCheckpointIsNotSizedAsWhole(CustomTestCase):
         with tempfile.TemporaryDirectory() as d:
             _write(d, range(1, 5))
             with self.assertLogs(
-                "sglang.srt.distributed.utils", level="WARNING"
+                "flliper.srt.distributed.utils", level="WARNING"
             ) as cm:
                 _checkpoint_size_mib(d)
             blob = "\n".join(cm.output)

@@ -22,8 +22,8 @@ at call time, the number that comes OUT must still be the full-model one.
 import types
 import unittest
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -189,7 +189,7 @@ class TestReserveIsDecidedFromTheResolvedProfile(unittest.TestCase):
         """Window 8 logged a REFUSES line naming 6 terms. With the ordering
         fixed there is nothing to refuse."""
         stub = _WindowEightStub()
-        with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
+        with self.assertNoLogs("flliper.srt.server_args", level="WARNING"):
             stub.reserve_demand_per_gpu(GPU_MEM, {1: 1})
 
     def test_resolution_is_idempotent_and_does_not_overwrite_explicit_values(self):
@@ -223,7 +223,7 @@ class TestWhyNotTheOtherTwoDirections(unittest.TestCase):
     """
 
     def test_the_profile_digest_still_depends_on_decode_max_bs(self):
-        from sglang.srt.mem_ledger.activation import ActivationProfile, profile_key
+        from flliper.srt.mem_ledger.activation import ActivationProfile, profile_key
 
         base = dict(
             architectures=("Qwen3_5ForConditionalGeneration",),
@@ -241,7 +241,7 @@ class TestWhyNotTheOtherTwoDirections(unittest.TestCase):
         )
 
     def test_the_profile_digest_still_depends_on_chunked_prefill_size(self):
-        from sglang.srt.mem_ledger.activation import ActivationProfile, profile_key
+        from flliper.srt.mem_ledger.activation import ActivationProfile, profile_key
 
         base = dict(
             architectures=("Qwen3_5ForConditionalGeneration",),

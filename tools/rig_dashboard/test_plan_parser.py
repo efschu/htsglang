@@ -28,7 +28,7 @@ def test_awq_full_plan():
     assert p["mlp_vector"] == [5, 1, 1]
     assert p["mlp_units"] == [388, 78, 78]
     assert p["rank_vocab_ratio"] == [13, 6, 6]
-    # active per-64 token ownership (NOT the SGLANG_UNEVEN_TOKEN_VECTOR hint)
+    # active per-64 token ownership (NOT the FLLIPER_UNEVEN_TOKEN_VECTOR hint)
     assert p["token_vector"] == [30, 17, 17]
     assert p["token_units"] == 64
     assert p["profiled_capacity"] == [235938, 158388, 201452]
@@ -73,11 +73,11 @@ def test_v1_minimal():
 
 
 def test_token_vector_uses_active_not_recommendation():
-    # guard: the log line contains BOTH SGLANG_UNEVEN_TOKEN_VECTOR=21,19,24
+    # guard: the log line contains BOTH FLLIPER_UNEVEN_TOKEN_VECTOR=21,19,24
     # (a restart hint) and active vector [30,17,17]; we must take the active one.
     line = (
         "[2026-07-17 05:20:13 TP0] Uneven DCP: restart with "
-        "SGLANG_UNEVEN_TOKEN_VECTOR=21,19,24 to raise max_total_num_tokens from "
+        "FLLIPER_UNEVEN_TOKEN_VECTOR=21,19,24 to raise max_total_num_tokens from "
         "441536 to ~630784 (per-rank profiled capacity [206995, 189558, 240912]; "
         "active vector [30, 17, 17] leaves ranks idle)."
     )

@@ -19,11 +19,11 @@ import argparse
 import torch
 import triton
 
-from sglang.kernels.ops.attention.extend_attention import (
+from flliper.kernels.ops.attention.extend_attention import (
     extend_attention_fwd,
 )
-from sglang.kernels.ops.attention.verify_splitkv import verify_splitkv_fwd
-from sglang.srt.utils import is_gfx95_supported
+from flliper.kernels.ops.attention.verify_splitkv import verify_splitkv_fwd
+from flliper.srt.utils import is_gfx95_supported
 
 
 def build_inputs(prefix_len, l_ext, h_q, h_kv, head_dim, v_head_dim, dtype, device):

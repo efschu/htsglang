@@ -5,7 +5,7 @@ xsn405 (20.09. 16:18Z, tree ``desk/dflash2-pick 0012cbe911``) armed cleanly,
 served text, routed the image request to P -- and then produced this, which is
 the whole reason this file exists::
 
-    W105 Weg2VisionNoRoom rid= -- VisionStageNoRoom: transient vision stage
+    W105 PdFlipVisionNoRoom rid= -- VisionStageNoRoom: transient vision stage
     needs 1.199 GiB and no card can hold it (evictions FORBIDDEN by the
     caller): . Best card is short by nan GiB.
 
@@ -20,7 +20,7 @@ Three things are wrong in that one line and each has a test below:
 2. **``rid=`` is empty**, so the refusal cannot be tied to a request.
 3. **The request continued into the prefill anyway** and ``_require_visual``
    raised inside the scheduler thread on PP0/PP1/PP2 -- the front logged
-   ``W17 Weg2GroupDead``.  One refused image killed the group.
+   ``W17 PdFlipGroupDead``.  One refused image killed the group.
 
 And a fourth, found while fixing them: the acceptance line of design §6 row (e)
 was BUILT (``VisionStageResult.log_line``) and never EMITTED.
@@ -35,7 +35,7 @@ from typing import Optional
 
 import pytest
 
-from sglang.srt.planner.vision_stage import (
+from flliper.srt.planner.vision_stage import (
     GIB,
     MIB,
     CardAir,
@@ -43,7 +43,7 @@ from sglang.srt.planner.vision_stage import (
     VisionStageNoRoom,
     plan_vision_stage,
 )
-from sglang.srt.weg2 import vision_stage_service as vss
+from flliper.srt.pdflip import vision_stage_service as vss
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +295,7 @@ class TestTheSuccessLineReachesTheLog:
             out = svc.encode_items([_Item()], rid="req-ok")
         assert out.ok is True, out.detail
         # Exactly what the metal test greps for.
-        assert "W102 Weg2VisionStage card=" in caplog.text
+        assert "W102 PdFlipVisionStage card=" in caplog.text
         for field in (
             "rows=",
             "displaced=[]",
@@ -314,13 +314,13 @@ class TestTheSuccessLineReachesTheLog:
         Correction to this file's own first draft: ``log_line()`` WAS already
         emitted, by ``vision_stage_runtime.py:350``.  Adding a second emitter
         in the service doubled it, and a metal test that counts ``W102
-        Weg2VisionStage card=`` would then have read two stages where one ran.
+        PdFlipVisionStage card=`` would then have read two stages where one ran.
         The rid was threaded into the runtime's line instead.
         """
         svc = _service(_snapshot(free_gib=(8.0, 0.6, 2.0)))
         with caplog.at_level(logging.INFO):
             svc.encode_items([_Item()], rid="req-once")
-        assert caplog.text.count("W102 Weg2VisionStage card=") == 1
+        assert caplog.text.count("W102 PdFlipVisionStage card=") == 1
 
     def test_a_missing_rid_is_visible_rather_than_an_empty_field(self, caplog):
         vss.set_request_rid("")
@@ -343,16 +343,16 @@ class TestRefusalTerminatesTheRequest:
             "it must be a ValueError: that is the class every entrypoint route "
             "already catches, so the alternative is an unhandled 500"
         )
-        assert exc.weg2_http_status == 501
+        assert exc.pdflip_http_status == 501
         assert vss.W_NO_ROOM in str(exc)
         assert "rid=r1" in str(exc)
 
     def test_http_layer_answers_501_for_it(self):
-        """The status is read off the exception; no weg2 import in the route."""
+        """The status is read off the exception; no pdflip import in the route."""
         out = vss.VisionStageOutcome(ok=False, code=vss.W_NO_ROOM, detail="x")
         exc = vss.VisionStageRequestRefused(out)
-        assert int(getattr(exc, "weg2_http_status")) == 501
-        assert getattr(ValueError("plain"), "weg2_http_status", None) is None
+        assert int(getattr(exc, "pdflip_http_status")) == 501
+        assert getattr(ValueError("plain"), "pdflip_http_status", None) is None
 
     def test_the_processor_seam_raises_instead_of_letting_items_through(self):
         """THE xsn405 BOOT KILLER, at the seam that let it happen."""
@@ -379,7 +379,7 @@ class TestRefusalTerminatesTheRequest:
         with pytest.raises(vss.VisionStageUnstaged) as ei:
             vss.assert_nothing_unstaged(items, rid="r-quiet")
         assert isinstance(ei.value, ValueError)
-        assert ei.value.weg2_http_status == 501
+        assert ei.value.pdflip_http_status == 501
         assert "_require_visual" in str(ei.value)
 
     def test_the_text_path_never_reaches_the_check(self, monkeypatch):
@@ -403,7 +403,7 @@ class TestTheRealSeamIsWired:
     def test_base_processor_raises_on_a_non_ok_outcome(self):
         import inspect
 
-        from sglang.srt.multimodal.processors import base_processor
+        from flliper.srt.multimodal.processors import base_processor
 
         src = inspect.getsource(base_processor.BaseMultimodalProcessor.
                                 process_and_combine_mm_data)
@@ -416,15 +416,15 @@ class TestTheRealSeamIsWired:
     def test_http_server_reads_the_status_off_the_exception(self):
         import inspect
 
-        from sglang.srt.entrypoints import http_server
+        from flliper.srt.entrypoints import http_server
 
         src = inspect.getsource(http_server._create_error_response)
-        assert "weg2_http_status" in src
+        assert "pdflip_http_status" in src
 
     def test_tokenizer_manager_publishes_the_rid(self):
         import inspect
 
-        from sglang.srt.managers import tokenizer_manager
+        from flliper.srt.managers import tokenizer_manager
 
         src = inspect.getsource(tokenizer_manager)
-        assert "_weg2_set_vision_rid(obj.rid)" in src
+        assert "_pdflip_set_vision_rid(obj.rid)" in src

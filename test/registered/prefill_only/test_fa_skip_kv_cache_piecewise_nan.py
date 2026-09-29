@@ -33,10 +33,10 @@ import unittest
 
 import torch
 
-from sglang import Engine
-from sglang.srt.utils import get_device_sm
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper import Engine
+from flliper.srt.utils import get_device_sm
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 # Route to the nightly 1-GPU suite, which runs on the H100 pool (1-gpu-h100, SM90).
 # FA3 + the piecewise embedding path this regression covers only runs on
@@ -51,7 +51,7 @@ register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 _FA3_SM_MIN, _FA3_SM_MAX = 80, 90
 
 # Overridable so the test can run against a locally-mounted model in dev.
-MODEL_PATH = os.environ.get("SGLANG_TEST_EMB_MODEL", "Qwen/Qwen3-Embedding-0.6B")
+MODEL_PATH = os.environ.get("FLLIPER_TEST_EMB_MODEL", "Qwen/Qwen3-Embedding-0.6B")
 
 _WORDS = [
     "the",

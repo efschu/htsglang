@@ -9,25 +9,25 @@ of the system turn (depth 3876 / 4655, stored ``(13, 248046)`` = ".<|im_end|>",
 new ``(13, 198)`` = ".\\n" -- the "\\n".join of the hoist), census
 ``MambaComponent:absent``, W31, X-REQUEUE, one P epoch per such turn.
 
-``SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE=1`` renders non-leading inline system
+``FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE=1`` renders non-leading inline system
 messages in place as a user turn, so turn N stays a prefix of turn N+1.
 """
 
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
 import jinja2  # noqa: E402
 
-from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+from flliper.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessagesRequest,
 )
-from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
-from sglang.srt.environ import envs  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from flliper.srt.environ import envs  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -107,7 +107,7 @@ TURN_N1 = TURN_N + [
 
 class TestInlineSystemInPlace(unittest.TestCase):
     def _serving(self, template, on):
-        with envs.SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.override(on):
+        with envs.FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.override(on):
             return AnthropicServing(_FakeChat(template))
 
     def test_default_off_hoists_and_breaks_the_prefix(self):

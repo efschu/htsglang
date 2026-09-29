@@ -54,9 +54,9 @@ def build_arg_tokens(
 ) -> list[str]:
     image_tag = select_tag(tag_config, cuda, version, date, short_sha)
     build_args = {
-        "SGLANG_BUILD_COMMIT": build_commit,
-        "SGLANG_BUILD_URL": build_url,
-        "SGLANG_IMAGE_TAG": f"{image_repo}:{image_tag}",
+        "FLLIPER_BUILD_COMMIT": build_commit,
+        "FLLIPER_BUILD_URL": build_url,
+        "FLLIPER_IMAGE_TAG": f"{image_repo}:{image_tag}",
     }
 
     tokens = []
@@ -67,12 +67,12 @@ def build_arg_tokens(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Emit docker build arguments for SGLang image metadata."
+        description="Emit docker build arguments for fLLiper image metadata."
     )
     parser.add_argument("--cuda", required=True, help="CUDA variant from tag_config.")
     parser.add_argument("--tag-config", required=True, help="Docker tag JSON config.")
     parser.add_argument("--image-repo", required=True, help="Docker image repository.")
-    parser.add_argument("--sgl-version", default="", help="SGLang release version.")
+    parser.add_argument("--sgl-version", default="", help="fLLiper release version.")
     parser.add_argument(
         "--build-commit",
         required=True,

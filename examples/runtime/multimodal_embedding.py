@@ -1,5 +1,5 @@
 # launch server
-# python -m sglang.launch_server --model-path Alibaba-NLP/gme-Qwen2-VL-2B-Instruct --is-embedding
+# python -m flliper.launch_server --model-path Alibaba-NLP/gme-Qwen2-VL-2B-Instruct --is-embedding
 
 import requests
 

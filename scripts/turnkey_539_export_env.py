@@ -8,7 +8,7 @@
 WHY THIS EXISTS, measured 2026-08-12. scripts/route_a_631_prod_boot.sh kept
 its own hand-maintained copy of the ship environment. It had drifted from the
 capture in seven keys -- five dropped, one added, and
-SGLANG_UNEVEN_TOKEN_VECTOR set to 28,26,20 where the ship process carried
+FLLIPER_UNEVEN_TOKEN_VECTOR set to 28,26,20 where the ship process carried
 14,10,8 -- and the instance it booted came up, answered /model_info with 200
 and never answered /generate. Nothing in the tree could turn a capture into
 something a boot script could SOURCE, so every consumer wrote the values out
@@ -27,7 +27,7 @@ a quote or a `$`. The ship argv already carries {"preserve_thinking": true};
 the env is one calibration away from carrying something similar. shlex.quote
 removes the whole question.
 
-WHAT IS AND IS NOT POLICED. The stack owns SGLANG_*, HTSGLANG_* and PYTORCH_*
+WHAT IS AND IS NOT POLICED. The stack owns FLLIPER_*, HTSGLANG_* and PYTORCH_*
 plus PYTHONPATH, LD_LIBRARY_PATH and CUDA_VISIBLE_DEVICES. A gate that also
 policed HOME, TERM and LS_COLORS would be unusable from an interactive shell
 and would be bypassed within a week, and a bypassed gate is worse than none.
@@ -55,13 +55,13 @@ PER_BOOT_KEYS: Dict[str, str] = {
                   "roots the stack in the canonical checkout",
     "CUDA_VISIBLE_DEVICES": "derived from the card UUIDs at boot (same value, "
                             "different provenance)",
-    "SGLANG_PHASE_FLIP_INSTANCE": "per-boot identity; the capture embeds the "
+    "FLLIPER_PHASE_FLIP_INSTANCE": "per-boot identity; the capture embeds the "
                                   "dead pid 3940356",
-    "SGLANG_BOOT_COMMIT": "provenance, measured from the repo at boot",
+    "FLLIPER_BOOT_COMMIT": "provenance, measured from the repo at boot",
 }
 
 #: Prefixes the stack owns outright.
-GOVERNED_PREFIXES = ("SGLANG_", "HTSGLANG_", "PYTORCH_")
+GOVERNED_PREFIXES = ("FLLIPER_", "HTSGLANG_", "PYTORCH_")
 #: Keys the stack owns that carry no prefix. Same list the parity proof uses.
 GOVERNED_EXACT = frozenset({"PYTHONPATH", "LD_LIBRARY_PATH",
                             "CUDA_VISIBLE_DEVICES"})
@@ -118,7 +118,7 @@ def render_exports(capture: Mapping[str, str], governed_only: bool = False,
                    source: str = "") -> str:
     """Render the capture as shell a boot script can source.
 
-    Per-boot keys are skipped: emitting the capture's SGLANG_BOOT_COMMIT would
+    Per-boot keys are skipped: emitting the capture's FLLIPER_BOOT_COMMIT would
     make every boot claim to be a commit it is not.
     """
     lines = [
@@ -230,7 +230,7 @@ def main(argv=None) -> int:
                     help="with --check: this ONE key may diverge. Repeatable. "
                          "Per key by design; there is no --allow-all.")
     ap.add_argument("--governed-only", action="store_true",
-                    help="export only keys the stack owns (SGLANG_*, "
+                    help="export only keys the stack owns (FLLIPER_*, "
                          "HTSGLANG_*, PYTORCH_*, PYTHONPATH, LD_LIBRARY_PATH, "
                          "CUDA_VISIBLE_DEVICES)")
     ap.add_argument("--all-keys", action="store_true",

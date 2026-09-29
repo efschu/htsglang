@@ -14,10 +14,10 @@ import numpy as np
 import requests
 import yaml
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.kits.lm_eval_kit import LMEvalMixin
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.kits.lm_eval_kit import LMEvalMixin
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -58,7 +58,7 @@ class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
             "1200",
         ]
         env = os.environ.copy()
-        env["SGLANG_USE_AITER"] = "1"
+        env["FLLIPER_USE_AITER"] = "1"
 
         process = popen_launch_server(
             QWEN35_MODEL_PATH,

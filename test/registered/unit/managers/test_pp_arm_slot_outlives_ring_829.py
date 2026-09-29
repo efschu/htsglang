@@ -98,7 +98,7 @@ def _tick_harness(loop_size=3, epoch=5, enabled=True):
     ``pp_flip_drain_leftover_dicts``, so #757's drain can be asserted to
     still run rather than assumed.
     """
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     class S:
         pass
@@ -207,7 +207,7 @@ def test_forgetting_ring_scoped_slots_clears_all_three_and_only_those():
     makes the next tick take the falling edge, where #757's leftover
     drain lives.
     """
-    from sglang.srt.managers.scheduler_pp_mixin import (
+    from flliper.srt.managers.scheduler_pp_mixin import (
         pp_flip_forget_ring_scoped_slots,
     )
 
@@ -233,7 +233,7 @@ def test_a_holder_without_the_attributes_gains_them_as_none():
     """Plain assignment, not delattr -- every reader treats None as
     'nothing recorded', and an AttributeError here would break the boot
     path that calls init_pp_loop_state before any flip has ever armed."""
-    from sglang.srt.managers.scheduler_pp_mixin import (
+    from flliper.srt.managers.scheduler_pp_mixin import (
         pp_flip_forget_ring_scoped_slots,
     )
 
@@ -257,7 +257,7 @@ def test_the_ring_rebuild_actually_calls_the_helper():
     """
     import inspect
 
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     src = inspect.getsource(SchedulerPPMixin.init_pp_loop_state)
     assert "pp_flip_forget_ring_scoped_slots(self)" in src, (

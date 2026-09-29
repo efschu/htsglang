@@ -1,4 +1,4 @@
-"""Benchmark MXFP4 MoE kernels on H100/H200: SGLang Marlin vs FlashInfer cutlass.
+"""Benchmark MXFP4 MoE kernels on H100/H200: fLLiper Marlin vs FlashInfer cutlass.
 
 Compares per-call latency of:
 
@@ -15,7 +15,7 @@ Run on H100/H200:
 
     cd /sgl-workspace/sglang_dev3 && \\
     PYTHONPATH=python:/sgl-workspace/flashinfer FLASHINFER_DISABLE_VERSION_CHECK=1 \\
-    python python/sglang/test/bench_mxfp4_sm90_kernels.py
+    python python/flliper/test/bench_mxfp4_sm90_kernels.py
 """
 
 from __future__ import annotations
@@ -35,14 +35,14 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.fused_moe.core import ActivationType
 
-# ---- SGLang Marlin ----
-from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
-from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
-from sglang.srt.layers.quantization.marlin_utils import (
+# ---- fLLiper Marlin ----
+from flliper.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+from flliper.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+from flliper.srt.layers.quantization.marlin_utils import (
     marlin_make_workspace,
     marlin_permute_scales,
 )
-from sglang.srt.layers.quantization.marlin_utils_fp4 import mxfp4_marlin_process_scales
+from flliper.srt.layers.quantization.marlin_utils_fp4 import mxfp4_marlin_process_scales
 
 GROUP_SIZE = 32
 
@@ -197,7 +197,7 @@ def make_flashinfer_runner(
 
 
 # ---------------------------------------------------------------------------
-# SGLang Marlin path
+# fLLiper Marlin path
 # ---------------------------------------------------------------------------
 
 
@@ -337,13 +337,13 @@ def run_one_shape(shape: Shape, run_marlin: bool):
             )
             ml_med, ml_min = time_call(ml_call)
             print(
-                f"  SGLang Marlin:                     median={ml_med:.3f} ms  "
+                f"  fLLiper Marlin:                     median={ml_med:.3f} ms  "
                 f"min={ml_min:.3f} ms"
             )
             print(f"  speedup (Marlin / FI autotune):    {ml_med / fi_at_med:.2f}x")
             print(f"  speedup (Marlin / FI AT no-bias):  {ml_med / fi_at_nb_med:.2f}x")
         except Exception as exc:  # pylint: disable=broad-except
-            print(f"  SGLang Marlin: SKIPPED ({type(exc).__name__}: {exc})")
+            print(f"  fLLiper Marlin: SKIPPED ({type(exc).__name__}: {exc})")
 
 
 def main():

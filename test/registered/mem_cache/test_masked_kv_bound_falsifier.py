@@ -15,7 +15,7 @@ about a later case. Structure:
 * ``test_out_of_range_loc_is_refused_by_name`` -- the guard fires and the
   message names the writer.
 * ``test_without_the_guard_the_same_write_corrupts_silently`` -- the SAME
-  launch with ``SGLANG_DISABLE_KV_MASKED_BOUND_CHECK=1`` returns exit 0 and a
+  launch with ``FLLIPER_DISABLE_KV_MASKED_BOUND_CHECK=1`` returns exit 0 and a
   row that should not have been touched now holds the written value. This is
   the defect being closed; the test asserts the defect is real, so a future
   regression that quietly drops the guard fails here too.
@@ -36,8 +36,8 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu")
 
@@ -51,7 +51,7 @@ OOB_LOC = 100  # inside the allocation, outside the bound: the silent case
 _PRELUDE = textwrap.dedent(
     f"""
     import torch
-    from sglang.srt.mem_cache.memory_pool import (
+    from flliper.srt.mem_cache.memory_pool import (
         masked_set_kv_buffer_kernel, kv_bound_check_enabled,
     )
 
@@ -129,7 +129,7 @@ class TestMaskedKvBoundFalsifier(CustomTestCase):
             corrupted = float(kbuf[{OOB_LOC}, 0, 0])
             print("SILENT", corrupted)
             """,
-            env_extra={"SGLANG_DISABLE_KV_MASKED_BOUND_CHECK": "1"},
+            env_extra={"FLLIPER_DISABLE_KV_MASKED_BOUND_CHECK": "1"},
         )
         self.assertEqual(r.returncode, 0, r.stderr[-4000:])
         self.assertIn(
@@ -144,7 +144,7 @@ class TestMaskedKvBoundFalsifier(CustomTestCase):
         r = _run(
             """
             from types import SimpleNamespace
-            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+            from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 
             pool = MHATokenToKVPool(
                 size=ROWS - 1, page_size=1, dtype=torch.bfloat16,

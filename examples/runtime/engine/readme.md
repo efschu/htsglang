@@ -1,6 +1,6 @@
-# SGLang Engine
+# fLLiper Engine
 
-SGLang provides a direct inference engine without the need for an HTTP server. There are generally these use cases:
+fLLiper provides a direct inference engine without the need for an HTTP server. There are generally these use cases:
 
 - [Offline Batch Inference](#offline-batch-inference)
 - [Embedding Generation](#embedding-generation)
@@ -12,15 +12,15 @@ SGLang provides a direct inference engine without the need for an HTTP server. T
 
 ### [Offline Batch Inference](./offline_batch_inference.py)
 
-In this example, we launch an SGLang engine and feed a batch of inputs for inference. If you provide a very large batch, the engine will intelligently schedule the requests to process efficiently and prevent OOM (Out of Memory) errors.
+In this example, we launch an fLLiper engine and feed a batch of inputs for inference. If you provide a very large batch, the engine will intelligently schedule the requests to process efficiently and prevent OOM (Out of Memory) errors.
 
 ### [Embedding Generation](./embedding.py)
 
-In this example, we launch an SGLang engine and feed a batch of inputs for embedding generation.
+In this example, we launch an fLLiper engine and feed a batch of inputs for embedding generation.
 
 ### [Custom Server](./custom_server.py)
 
-This example demonstrates how to create a custom server on top of the SGLang Engine. We use [Sanic](https://sanic.dev/en/) as an example. The server supports both non-streaming and streaming endpoints.
+This example demonstrates how to create a custom server on top of the fLLiper Engine. We use [Sanic](https://sanic.dev/en/) as an example. The server supports both non-streaming and streaming endpoints.
 
 #### Steps
 
@@ -47,8 +47,8 @@ This example demonstrates how to create a custom server on top of the SGLang Eng
 
 ### [Token-In-Token-Out for RLHF](../token_in_token_out)
 
-In this example, we launch an SGLang engine, feed tokens as input and generate tokens as output.
+In this example, we launch an fLLiper engine, feed tokens as input and generate tokens as output.
 
 ### [Inference Using FastAPI](fastapi_engine_inference.py)
 
-This example demonstrates how to create a FastAPI server that uses the SGLang engine for text generation.
+This example demonstrates how to create a FastAPI server that uses the fLLiper engine for text generation.

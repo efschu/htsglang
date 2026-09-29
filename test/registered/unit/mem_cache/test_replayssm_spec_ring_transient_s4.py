@@ -26,19 +26,19 @@ import unittest
 
 import torch
 
-from sglang.srt.configs.mamba_utils import (
+from flliper.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateDType,
     Mamba2StateShape,
 )
-from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.offload_gdn_states import (
+from flliper.srt.mem_cache.memory_pool import MambaPool
+from flliper.srt.model_executor.offload_gdn_states import (
     mamba_state_set_nbytes,
     transient_state_fields,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
@@ -163,23 +163,23 @@ _WORKER = textwrap.dedent(
 
     import torch
 
-    from sglang.srt.configs.mamba_utils import (
+    from flliper.srt.configs.mamba_utils import (
         Mamba2CacheParams,
         Mamba2StateDType,
         Mamba2StateShape,
     )
-    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    from flliper.srt.layers.attention.hybrid_linear_attn_backend import (
         HybridLinearAttnBackend,
         MambaAttnBackendBase,
     )
-    from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
-    from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+    from flliper.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+    from flliper.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+    from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
-    import sglang.srt.layers.attention.hybrid_linear_attn_backend as hlab
+    import flliper.srt.layers.attention.hybrid_linear_attn_backend as hlab
 
 
     def _ref_scatter(dst, src, dst_idx, steps):

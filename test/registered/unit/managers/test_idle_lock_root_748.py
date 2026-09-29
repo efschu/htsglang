@@ -60,9 +60,9 @@ at once, and a backlog at or above the break-even still arms immediately.
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.phase_policy import IDLE_LOCKED
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.phase_policy import IDLE_LOCKED
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -78,13 +78,13 @@ FLIP_TOKENS = 7004  # the break-even the specimen lines print
 
 
 def _purity(mode="prefill_in_tp"):
-    from sglang.srt.managers.phase_purity import parse_purity
+    from flliper.srt.managers.phase_purity import parse_purity
 
     return parse_purity(mode)
 
 
 def _policy_cfg(**over):
-    from sglang.srt.managers.phase_policy import PhasePolicyConfig
+    from flliper.srt.managers.phase_policy import PhasePolicyConfig
 
     base = dict(
         enabled=True,
@@ -109,7 +109,7 @@ def _sched(
     had -- a resolved purity rule and a policy config. #713's own fixture omits
     both, and that test file pins the omitted case as unchanged.
     """
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     s = Scheduler.__new__(Scheduler)
     s.server_args = SimpleNamespace(
@@ -199,7 +199,7 @@ class TestTheDamperCouldNotSeeTheLock748(CustomTestCase):
     """RED-FIRST on finding (2): #759's clock is never stamped on this path."""
 
     def _observe(self, **kw):
-        from sglang.srt.managers.phase_policy import (
+        from flliper.srt.managers.phase_policy import (
             PhasePolicyInputs,
             PhasePolicyState,
             observe_idle,
@@ -238,7 +238,7 @@ class TestTheDamperCouldNotSeeTheLock748(CustomTestCase):
         self.assertEqual(state.nothing_can_run_since, 1000.0)
 
     def test_the_lock_clock_clears_when_the_lock_does(self):
-        from sglang.srt.managers.phase_policy import PhasePolicyInputs, observe_idle
+        from flliper.srt.managers.phase_policy import PhasePolicyInputs, observe_idle
 
         state = self._observe(
             phase="pp",
@@ -265,7 +265,7 @@ class TestTheDamperCouldNotSeeTheLock748(CustomTestCase):
     def test_a_freshly_seen_lock_below_break_even_is_not_armed(self):
         """OBSERVE THEN DECIDE, which is the order the scheduler uses and the
         order #759's fixtures never exercised."""
-        from sglang.srt.managers.phase_policy import (
+        from flliper.srt.managers.phase_policy import (
             PhasePolicyInputs,
             PhasePolicyState,
             decide,
@@ -291,7 +291,7 @@ class TestTheDamperCouldNotSeeTheLock748(CustomTestCase):
 
     def test_a_persistent_lock_below_break_even_still_escapes(self):
         """#689's guarantee. The delay is bounded, never a refusal."""
-        from sglang.srt.managers.phase_policy import (
+        from flliper.srt.managers.phase_policy import (
             PhasePolicyInputs,
             PhasePolicyState,
             decide,
@@ -319,7 +319,7 @@ class TestTheDamperCouldNotSeeTheLock748(CustomTestCase):
     def test_an_unobserved_lock_still_arms_immediately(self):
         """#689's invariant, unmodified: no observation is not evidence of
         transience, so the escape is not delayed."""
-        from sglang.srt.managers.phase_policy import (
+        from flliper.srt.managers.phase_policy import (
             PhasePolicyInputs,
             PhasePolicyState,
             decide,
@@ -342,7 +342,7 @@ class TestTheDamperCouldNotSeeTheLock748(CustomTestCase):
 
     def test_gate_b_a_real_backlog_still_arms_immediately(self):
         """Above the break-even the persistence question is never asked."""
-        from sglang.srt.managers.phase_policy import (
+        from flliper.srt.managers.phase_policy import (
             PhasePolicyInputs,
             PhasePolicyState,
             decide,
@@ -368,7 +368,7 @@ class TestTheDamperCouldNotSeeTheLock748(CustomTestCase):
 
     def test_a_completed_cutover_clears_the_lock_clock(self):
         """A lock measured in a layout that no longer exists is not evidence."""
-        from sglang.srt.managers.phase_policy import (
+        from flliper.srt.managers.phase_policy import (
             PhasePolicyState,
             note_flip_completed,
         )

@@ -26,7 +26,7 @@ and the rotation refuses loudly with the arena declared undefined instead. That
 is the price of the single-layout RAM budget the design is built on.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -35,17 +35,17 @@ import unittest
 
 import torch
 
-from sglang.srt.model_executor.rotation_executor import (
+from flliper.srt.model_executor.rotation_executor import (
     RotationHazard,
     allocate_rotation_image,
 )
-from sglang.srt.model_executor.weights_arena import (
+from flliper.srt.model_executor.weights_arena import (
     _CHECKSUM_BYTES,
     image_from_tensors,
     plan_arena_layout,
     uint8_checksum,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 PP_TO_TP = "pp_to_tp"
 TP_TO_PP = "tp_to_pp"
@@ -84,8 +84,8 @@ class TestBootHoldsOneImageNotTwo(CustomTestCase):
         # ONE image. Field absence was a proxy for that, and the proxy stopped
         # tracking the property. Asserting the fields are gone would now forbid
         # a scheme that satisfies the memory rule the guard exists to enforce.
-        import sglang.srt.model_executor.weights_arena as _wa
-        from sglang.srt.managers.phase_flip_boot import PhaseFlipStacks
+        import flliper.srt.model_executor.weights_arena as _wa
+        from flliper.srt.managers.phase_flip_boot import PhaseFlipStacks
 
         names = {f.name for f in dataclasses.fields(PhaseFlipStacks)}
         self.assertIn("rotation_image", names)
@@ -102,10 +102,10 @@ class TestBootHoldsOneImageNotTwo(CustomTestCase):
         # make it a pin. This is the can-fail half: drop the refusal in
         # `require_two_file_preconditions` and the dual pin becomes reachable
         # again, which is the whole content of the original assertion.
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(False):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_TWO_FILE.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(False):
                 with self.assertRaises(_wa.WeightsArenaError):
                     _wa.require_two_file_preconditions()
 
@@ -169,7 +169,7 @@ class TestImageFromTensorsCanFillTheSharedBuffer(CustomTestCase):
 
 def _stacks(direction_holds="tp"):
     """A PhaseFlipStacks carrying only what refill() touches, on CPU."""
-    from sglang.srt.managers.phase_flip_boot import PhaseFlipStacks
+    from flliper.srt.managers.phase_flip_boot import PhaseFlipStacks
 
     pp_named, pp, tp_named, tp = _layouts()
     arena = torch.zeros(max(pp.total_bytes, tp.total_bytes), dtype=torch.uint8)
@@ -266,7 +266,7 @@ class TestThePrimingFillIsTheSameCallWithNothingToKeep(CustomTestCase):
     """One path. The priming fill is `outgoing_bytes=0`, not a second branch."""
 
     def test_priming_fills_the_arena_and_keeps_its_own_record(self):
-        from sglang.srt.managers.phase_flip_boot import prime_arena_from_image
+        from flliper.srt.managers.phase_flip_boot import prime_arena_from_image
 
         s, pp_named, pp, _tp_named, tp = _stacks()
         pp_img = image_from_tensors(pp_named, pp, pin=False, out=s.rotation_image)
@@ -282,7 +282,7 @@ class TestThePrimingFillIsTheSameCallWithNothingToKeep(CustomTestCase):
         )
 
     def test_priming_and_a_warm_rotation_do_not_share_a_record(self):
-        from sglang.srt.managers.phase_flip_boot import prime_arena_from_image
+        from flliper.srt.managers.phase_flip_boot import prime_arena_from_image
 
         s, pp_named, pp, tp_named, tp = _stacks()
         image_from_tensors(pp_named, pp, pin=False, out=s.rotation_image)

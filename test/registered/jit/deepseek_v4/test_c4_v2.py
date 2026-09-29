@@ -7,8 +7,8 @@ import pytest
 import torch
 import triton
 
-from sglang.jit_kernel.dsv4 import compress_forward
-from sglang.jit_kernel.tests.deepseek_v4.common import (
+from flliper.jit_kernel.dsv4 import compress_forward
+from flliper.jit_kernel.tests.deepseek_v4.common import (
     LegacyContext,
     PagedContext,
     make_legacy_context,
@@ -16,7 +16,7 @@ from sglang.jit_kernel.tests.deepseek_v4.common import (
     make_state_pool,
     to_seq_extend,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, suite="nightly-kernel-1-gpu", nightly=True)

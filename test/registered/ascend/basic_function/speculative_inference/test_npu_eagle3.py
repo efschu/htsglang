@@ -1,13 +1,13 @@
 import os
 import unittest
 
-from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
-from sglang.test.ascend.test_ascend_utils import (
+from flliper.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
+from flliper.test.ascend.test_ascend_utils import (
     QWEN3_8B_EAGLE3_WEIGHTS_PATH,
     QWEN3_8B_WEIGHTS_PATH,
 )
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_npu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
@@ -51,7 +51,7 @@ class TestNpuEagle3(GSM8KAscendMixin, CustomTestCase):
 
     env = {
         **os.environ,
-        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+        "FLLIPER_ENABLE_OVERLAP_PLAN_STREAM": "1",
     }
 
     accuracy = 0.81

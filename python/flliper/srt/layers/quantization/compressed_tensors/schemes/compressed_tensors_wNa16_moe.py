@@ -1,0 +1,1003 @@
+from __future__ import annotations
+
+import enum
+import logging
+from enum import Enum
+from typing import TYPE_CHECKING
+
+import torch
+from compressed_tensors import CompressionFormat
+
+from flliper.srt.hardware_backend.gpu.quantization.gptq_kernels import (
+    gptq_marlin_moe_repack,
+)
+from flliper.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW4A16Int4DynamicMoEMethod,
+)
+from flliper.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from flliper.srt.layers.quantization.compressed_tensors.schemes import (
+    WNA16_SUPPORTED_BITS,
+    CompressedTensorsMoEScheme,
+)
+from flliper.srt.layers.quantization.marlin_utils import (
+    marlin_make_workspace,
+    marlin_moe_permute_scales,
+    moe_awq_to_marlin_zero_points,
+)
+from flliper.srt.layers.quantization.utils import replace_parameter
+from flliper.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
+
+if TYPE_CHECKING:
+    from compressed_tensors.quantization import QuantizationArgs
+
+    from flliper.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
+    from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+
+__all__ = [
+    "CompressedTensorsWNA16MoE",
+    "CompressedTensorsWNA16TritonMoE",
+    "NPUCompressedTensorsW4A16Int4DynamicMoE",
+]
+
+_is_hip = is_hip()
+_is_cuda = is_cuda()
+
+_use_aiter = get_bool_env_var("FLLIPER_USE_AITER") and _is_hip
+
+if _use_aiter:
+    pass
+
+
+logger = logging.getLogger(__name__)
+
+
+def _moe_offload_active() -> bool:
+    """Is MoE expert offload on anywhere in the group? (group-wide on purpose,
+    see awq_moe._moe_offload_active; imported lazily to keep this module's
+    import graph unchanged)."""
+    from flliper.srt.layers.moe.resident_fraction import offload_active
+
+    return offload_active()
+
+
+def _rang_karte(layer) -> torch.device:
+    """Die CUDA-Karte, auf der DIESER Rang rechnet (#112/4).
+
+    Nicht `irgendein_gewicht.device`: unter Offload (Residenz-Fraction <
+    1.0) liegen die expert-major Tensoren auf dem HOST, und unter der
+    Erstboot-Adoption sind sie Platzhalter. Beides sind legitime Zustaende,
+    in denen `.device` `cpu` sagt und der Rang trotzdem auf einer Karte
+    rechnet.
+    """
+    _t = getattr(layer, "w13_weight_packed", None)
+    _d = getattr(_t, "device", None)
+    if _d is not None and _d.type == "cuda":
+        return _d
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+class GPTQMarlinState(Enum):
+    REPACK = enum.auto()
+    READY = enum.auto()
+
+
+class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
+
+    def __init__(
+        self,
+        quant_config: CompressedTensorsConfig,
+        weight_quant: QuantizationArgs,
+        num_gpu_experts: int = -1,
+    ):
+        self.quant_config = quant_config
+        # Per-layer scheme already resolved by get_moe_scheme(); reuse it directly
+        # (mixed-precision MoE has no "Linear" config group to fall back on).
+        config = weight_quant
+        self.num_bits = config.num_bits
+        self.packed_factor = 32 // config.num_bits
+        self.strategy = config.strategy
+        self.group_size = config.group_size
+        self.actorder = config.actorder
+        self.sym = config.symmetric
+
+        if not (
+            self.quant_config.quant_format == CompressionFormat.pack_quantized.value
+            and self.num_bits in WNA16_SUPPORTED_BITS
+        ):
+            raise ValueError(
+                "For Fused MoE layers, only ",
+                f"{CompressionFormat.pack_quantized.value} ",
+                "is supported for the following bits: ",
+                f"{WNA16_SUPPORTED_BITS}",
+            )
+        self.num_gpu_experts = num_gpu_experts
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        # ampere and up
+        return 80
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        # Will transpose the loaded weight along the
+        # intermediate and hidden dim sizes. Will
+        # shard for TP along the transposed dims
+        extra_weight_attrs.update(
+            {"is_transposed": True, "quant_method": self.strategy}
+        )
+
+        # WP2 (Qwen3.8-Flash-Next, compressed-tensors AWQ/GPTQ INT4): the
+        # load-time half of the per-expert MoE offload, the same construction
+        # awq_moe.create_weights / gptq_moe.create_weights use. With a
+        # resident-expert fraction < 1.0 every expert-major tensor (packed
+        # weights, group scales, asymmetric zero points) is built on the host,
+        # so the full [E, ...] stack never sits on the card at once; the
+        # marlin repack still runs on GPU under the loader's
+        # device_loading_context, and presplit_expert_offload_after_repack
+        # then keeps only the [R+C] resident slots there (see
+        # process_weights_after_loading). fraction >= 1.0 -> _moe_dev is None
+        # -> byte-identical stock path.
+        _moe_dev = (
+            "cpu"
+            if not getattr(layer, "_moe_offload_excluded", False)
+            and _moe_offload_active()
+            else None
+        )
+
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size // self.packed_factor,
+                2 * intermediate_size_per_partition,
+                dtype=torch.int32,
+                device=_moe_dev,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_packed", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition // self.packed_factor,
+                hidden_size,
+                dtype=torch.int32,
+                device=_moe_dev,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_packed", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # In the case where we have actorder/g_idx,
+        # we do not partition the w2 scales
+        load_full_w2 = (
+            self.actorder is not None
+            and self.actorder != "static"
+            and self.group_size != -1
+        )
+
+        if load_full_w2:
+            w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
+        else:
+            w2_scales_size = intermediate_size_per_partition
+
+        self.is_k_full = (not self.actorder) or layer.moe_tp_size == 1
+
+        if self.strategy == "channel":
+            num_groups_w2 = num_groups_w13 = 1
+            self.group_size = -1
+        else:
+            num_groups_w2 = w2_scales_size // self.group_size
+            num_groups_w13 = hidden_size // self.group_size
+
+        w13_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                num_groups_w13,
+                2 * intermediate_size_per_partition,
+                dtype=params_dtype,
+                device=_moe_dev,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_scale)
+        set_weight_attrs(w13_scale, extra_weight_attrs)
+
+        w2_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                num_groups_w2,
+                hidden_size,
+                dtype=params_dtype,
+                device=_moe_dev,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_scale)
+        set_weight_attrs(w2_scale, extra_weight_attrs)
+        set_weight_attrs(w2_scale, {"load_full_w2": load_full_w2})
+
+        w2_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts, 2), requires_grad=False
+        )
+        layer.register_parameter("w2_weight_shape", w2_weight_shape)
+        set_weight_attrs(w2_weight_shape, extra_weight_attrs)
+        w13_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts, 2), requires_grad=False
+        )
+
+        layer.register_parameter("w13_weight_shape", w13_weight_shape)
+        set_weight_attrs(w13_weight_shape, extra_weight_attrs)
+
+        # add zero param
+        if not self.sym:
+            w13_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w13,
+                    2 * intermediate_size_per_partition // self.packed_factor,
+                    dtype=torch.int32,
+                    device=_moe_dev,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_zero_point", w13_qzeros)
+            set_weight_attrs(w13_qzeros, extra_weight_attrs)
+
+            w2_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w2,
+                    hidden_size // self.packed_factor,
+                    dtype=torch.int32,
+                    device=_moe_dev,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_zero_point", w2_qzeros)
+            set_weight_attrs(w2_qzeros, extra_weight_attrs)
+
+        w13_g_idx = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_g_idx", w13_g_idx)
+        set_weight_attrs(w13_g_idx, extra_weight_attrs)
+
+        w2_g_idx = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_g_idx", w2_g_idx)
+        set_weight_attrs(w2_g_idx, extra_weight_attrs)
+
+        w13_g_idx_sort_indices = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_g_idx_sort_indices", w13_g_idx_sort_indices)
+        set_weight_attrs(w13_g_idx_sort_indices, extra_weight_attrs)
+
+        w2_g_idx_sort_indices = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
+        set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
+
+        layer.a13_scale = None
+        layer.a2_scale = None
+        layer.marlin_state = GPTQMarlinState.REPACK
+
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
+
+        # Force record: these are the target GPTQ shapes for rollback.
+        layer._original_shapes["w13_weight_packed"] = tuple(w13_weight.shape)
+        layer._original_shapes["w2_weight_packed"] = tuple(w2_weight.shape)
+
+        # Also record the shapes of the scales.
+        layer._original_shapes["w2_weight_scale"] = tuple(w2_scale.shape)
+        layer._original_shapes["w13_weight_scale"] = tuple(w13_scale.shape)
+
+        if not self.sym:
+            layer._original_shapes["w13_weight_zero_point"] = w13_qzeros.shape
+            layer._original_shapes["w2_weight_zero_point"] = tuple(w2_qzeros.shape)
+
+        # WP1: arm the per-layer early presplit (FusedMoE._ct_stream_note).
+        # Only with the host allocation above AND a CUDA ambient device: the
+        # repack needs a card, and without the offload there is nothing to
+        # bound. Expected shard counts: w13-type params get gate and up
+        # (two shards per expert), w2-type params one.
+        if _moe_dev == "cpu":
+            import threading
+
+            ambient = torch.empty(0).device
+            if ambient.type == "cuda":
+                # under the generic expert shard only the OWNED experts arrive
+                # (the pad expert never does)
+                owned = int(getattr(layer, "_expert_shard_owned", num_experts))
+                expected = {
+                    "w13_weight_packed": 2 * owned,
+                    "w2_weight_packed": owned,
+                    "w13_weight_scale": 2 * owned,
+                    "w2_weight_scale": owned,
+                }
+                if not self.sym:
+                    expected["w13_weight_zero_point"] = 2 * owned
+                    expected["w2_weight_zero_point"] = owned
+                # NF-Bootzeit H2b: group D does not read the experts P already
+                # put into the shared store -- they never arrive here, so the
+                # counter must not wait for them (else the layer's host stack
+                # is never dropped: rc12z15 memcg-OOM). Symmetric, no act-order
+                # only: then every expert-major tensor is presplit and a vetoed
+                # expert leaves nothing behind that the kernel reads.
+                if self.sym and self.actorder is None:
+                    from flliper.srt.layers.moe import store_adopt as _sa
+
+                    expected = _sa.discount_expected(layer, expected, owned)
+                layer._ct_stream_presplit = {
+                    "expected": expected,
+                    "names": {id(getattr(layer, n)): n for n in expected},
+                    "seen": {},
+                    "lock": threading.Lock(),
+                    "done": False,
+                    "device": ambient,
+                }
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+
+        # Skip if the layer is already converted to Marlin format to prevent double-packing.
+        if getattr(layer, "is_marlin_converted", False):
+            return
+
+        # fnFL2x2 (22.09.): der Repack laeuft im DEFAULT-Pool. Seine Ausgaben
+        # (repackter Stapel, permutierte Scales) werden in den bestehenden
+        # Parameter-Speicher kopiert oder vom Presplit ersetzt -- sie sind
+        # Transienten, und im lebenden Tag-Pool blieben sie als tote Segmente
+        # liegen (Draft-Pool 1,35 GiB inaktiv, Basis-Pool 4,2-5,5 GiB je
+        # P-Stufe). Wer ueberlebt, wird mit `back_into_tag_pool` im Tag-Pool
+        # geboren: Workspace, g_idx-Sortierung, die Presplit-Puffer.
+        from flliper.srt.managers.pdflip_memory_saver import outside_tag_pool
+
+        with outside_tag_pool(reason="ct-moe-repack"):
+            self._repack_to_marlin(layer)
+
+    def _repack_to_marlin(self, layer: torch.nn.Module) -> None:
+        from flliper.srt.managers.pdflip_memory_saver import back_into_tag_pool
+
+        # WP3a generic expert shard: the pad expert contributes zero (scales 0)
+        zero_pad = getattr(layer, "zero_expert_shard_pad", None)
+        if callable(zero_pad):
+            zero_pad()
+
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
+
+        def replace_tensor(name, new_t):
+            target_attr = getattr(layer, name)
+
+            # Only save if the key doesn't exist to prevent overwriting with Marlin shapes.
+            if name not in layer._original_shapes:
+                # This is a safety check; `create_weights` usually handles this already.
+                layer._original_shapes[name] = tuple(target_attr.shape)
+
+            # It is important to use resize_() here since it ensures
+            # the same buffer is reused. Grows it anyway, the new storage is
+            # a survivor and belongs in the tag pool (fnFL2x2).
+            with back_into_tag_pool():
+                target_attr.resize_(new_t.shape)
+            target_attr.copy_(new_t)
+            del new_t
+
+        num_experts = layer.w13_weight_g_idx.shape[0]
+        device = layer.w13_weight_g_idx.device
+
+        # when running models with grouped act order,
+        # resort to g_idx values provided in checkpoint
+        if self.actorder == "group":
+            # Ueberlebende Indizes -- im Tag-Pool, auch wenn der Repack
+            # ausserhalb laeuft (ct-stream-presplit, fnFL2x2).
+            with back_into_tag_pool():
+                w13_g_idx_sort_indices = torch.empty_like(layer.w13_weight_g_idx)
+                w2_g_idx_sort_indices = torch.empty_like(layer.w2_weight_g_idx)
+                w13_sorted_g_idx = torch.empty_like(layer.w13_weight_g_idx)
+                w2_sorted_g_idx = torch.empty_like(layer.w2_weight_g_idx)
+
+            for e in range(num_experts):
+                w13_g_idx_sort_indices[e] = torch.argsort(layer.w13_weight_g_idx[e]).to(
+                    torch.int32
+                )
+                w2_g_idx_sort_indices[e] = torch.argsort(layer.w2_weight_g_idx[e]).to(
+                    torch.int32
+                )
+                w13_sorted_g_idx[e] = layer.w13_weight_g_idx[e][
+                    w13_g_idx_sort_indices[e]
+                ]
+                w2_sorted_g_idx[e] = layer.w2_weight_g_idx[e][w2_g_idx_sort_indices[e]]
+
+            replace_parameter(layer, "w13_weight_g_idx", w13_sorted_g_idx)
+            replace_parameter(layer, "w2_weight_g_idx", w2_sorted_g_idx)
+            replace_parameter(layer, "w13_g_idx_sort_indices", w13_g_idx_sort_indices)
+            replace_parameter(layer, "w2_g_idx_sort_indices", w2_g_idx_sort_indices)
+
+        else:
+            layer.w13_weight_g_idx = torch.nn.Parameter(
+                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                requires_grad=False,
+            )
+            layer.w2_weight_g_idx = torch.nn.Parameter(
+                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                requires_grad=False,
+            )
+            layer.w13_g_idx_sort_indices = torch.nn.Parameter(
+                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                requires_grad=False,
+            )
+            layer.w2_g_idx_sort_indices = torch.nn.Parameter(
+                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                requires_grad=False,
+            )
+
+        # #112 ERSTBOOT-ADOPTION: KEIN REPACK AUF PLATZHALTERN.
+        #
+        # WAS fnFL2w53 UND w54 GETOETET HAT, beide Male in dieser Zeile:
+        #
+        #     Current thread (D-TP0 und D-TP1 gleichzeitig):
+        #       gptq_marlin_repack.py:37   in gptq_marlin_repack
+        #       gptq_kernels.py:81         in gptq_marlin_moe_repack
+        #     Fatal Python error: Segmentation fault
+        #
+        # `--load-format dummy` ruft `initialize_dummy_weights`, und das
+        # fuellt JEDEN Parameter mit Zufall -- auch `w13_g_idx_sort_indices`
+        # und `w2_g_idx_sort_indices`, die der Marlin-Repack als INDIZES in
+        # die Gewichtszeilen benutzt. Zufaellige Indizes sind Zugriffe
+        # ausserhalb des Tensors; ein CUDA-Kernel quittiert das nicht mit
+        # einer Exception, sondern mit einem zerstoerten Kontext, und der
+        # naechste Zugriff faellt -- in w53 traf es den Sampler-Thread, in
+        # w54 den MainThread. EINE Ursache, zwei verschiedene Opfer; deshalb
+        # sah w53 aus wie ein Instrumentenfehler und war keiner.
+        #
+        # UND ER IST UNTER ADOPTION AUCH SINNLOS: D uebernimmt von P Bytes,
+        # die BEREITS im Marlin-Layout liegen (P hat genau diesen Repack
+        # gerechnet, bevor es sie in den geteilten Store schrieb). Ein
+        # Repack der Zufallswerte wirft das Ergebnis ohnehin weg.
+        #
+        # Die STRUKTUR bleibt: `replace_tensor` setzt unten die
+        # marlin-geformten Puffer, damit Pool-Geometrie und Presplit
+        # identisch zum Plattenweg entstehen -- nur eben leer statt aus
+        # Zufall gerechnet.
+        try:
+            from flliper.srt.pdflip import adopt as _pdflip_adopt
+
+            _platzhalter = _pdflip_adopt.weights_are_placeholder()
+        except ImportError:
+            _platzhalter = False
+        if _platzhalter:
+            import logging as _lg
+
+            _lg.getLogger(__name__).info(
+                "#112 REPACK UEBERSPRUNGEN: dieser Rang haelt Platzhalter "
+                "(%s). Die g_idx-Sortierindizes sind Zufall und wuerden den "
+                "Marlin-Repack ausserhalb der Tensoren indizieren; die "
+                "echten Bytes kommen bereits marlin-geformt aus dem "
+                "geteilten Store (#109) bzw. ueber die Legs.",
+                _pdflip_adopt.placeholder_reason() or "dummy-load",
+            )
+            # #112/2 (fnFL2w57): DAS DEVICE KOMMT VON DER KARTE, NICHT VOM
+            # PARAMETER. Unter `--load-format dummy` liegt
+            # `w13_weight_packed` auf CPU; meine leeren Puffer erbten das,
+            # und der nachfolgende `marlin_make_workspace(...)` bekam es
+            # weitergereicht:
+            #     marlin_utils.py:296 in marlin_make_workspace
+            #     ValueError: Expected a cuda device, but got: cpu
+            # Der Boot kam damit weiter als jeder davor (#112 hat gegriffen,
+            # `#112 REPACK UEBERSPRUNGEN` steht im Log) und starb an der
+            # naechsten Stelle -- die Kette einzeln abarbeiten.
+            _dev = layer.w13_weight_packed.device
+            if _dev.type != "cuda":
+                _dev = torch.device("cuda", torch.cuda.current_device())
+            _leer13 = torch.empty(
+                (
+                    layer.w13_weight_packed.shape[0],
+                    layer.w13_weight_packed.shape[1] * self.packed_factor // 16,
+                    layer.w13_weight_packed.shape[2] * (self.num_bits // 2),
+                ),
+                device=_dev,
+                dtype=layer.w13_weight_packed.dtype,
+            )
+            replace_tensor("w13_weight_packed", _leer13)
+            _leer2 = torch.empty(
+                (
+                    layer.w2_weight_packed.shape[0],
+                    layer.w2_weight_packed.shape[1] * self.packed_factor // 16,
+                    layer.w2_weight_packed.shape[2] * (self.num_bits // 2),
+                ),
+                device=_dev,
+                dtype=layer.w2_weight_packed.dtype,
+            )
+            replace_tensor("w2_weight_packed", _leer2)
+        else:
+            import time as _time
+
+            from flliper.srt.layers.moe.expert_offload import _STORE_CLOCK
+            from flliper.srt.layers.moe.store_adopt import repack_rows
+
+            _rows = repack_rows(layer, num_experts)
+            _t_marlin = _time.perf_counter()
+            marlin_w13_qweight = gptq_marlin_moe_repack(
+                layer.w13_weight_packed,
+                layer.w13_g_idx_sort_indices,
+                layer.w13_weight_packed.shape[1] * self.packed_factor,
+                layer.w13_weight_packed.shape[2],
+                self.num_bits,
+                rows=_rows,
+            )
+            replace_tensor("w13_weight_packed", marlin_w13_qweight)
+            marlin_w2_qweight = gptq_marlin_moe_repack(
+                layer.w2_weight_packed,
+                layer.w2_g_idx_sort_indices,
+                layer.w2_weight_packed.shape[1] * self.packed_factor,
+                layer.w2_weight_packed.shape[2],
+                self.num_bits,
+                rows=_rows,
+            )
+            replace_tensor("w2_weight_packed", marlin_w2_qweight)
+            _STORE_CLOCK["marlin_s"] += _time.perf_counter() - _t_marlin
+            _STORE_CLOCK["rows_repacked"] += num_experts if _rows is None else len(_rows)
+            _STORE_CLOCK["rows_total"] += num_experts
+        # Repack scales
+        # #112/3 DIESELBE HOST-ALLOKATION, DIESELBE BEHANDLUNG.
+        #
+        # `create_weights` baut JEDEN expert-major Tensor auf dem HOST,
+        # wenn die Residenz-Fraction < 1.0 ist ("the full [E, ...] stack
+        # never sits on the card at once") -- packed weights, group scales
+        # UND zero points. Auf dem Plattenweg zieht der
+        # `device_loading_context` des Loaders sie fuer den Repack auf die
+        # Karte; mein Adoptionszweig laeuft daran vorbei, also muessen die
+        # Scales hier selbst hinueber. Sonst erbt
+        # `marlin_moe_permute_scales` das Host-Device und der Fehler
+        # wandert nur eine Zeile weiter (fnFL2w57 war die erste).
+        #
+        # Nur unter Platzhaltern: auf dem Plattenweg liegen sie zu diesem
+        # Zeitpunkt bereits auf der Karte, und ein `.to()` waere dort eine
+        # zusaetzliche Kopie ueber 48 Layer.
+        if _platzhalter:
+            _dev2 = torch.device("cuda", torch.cuda.current_device())
+            for _attr in (
+                "w13_weight_scale",
+                "w2_weight_scale",
+                "w13_weight_zero_point",
+                "w2_weight_zero_point",
+            ):
+                _t = getattr(layer, _attr, None)
+                if _t is not None and _t.device.type != "cuda":
+                    replace_tensor(_attr, _t.data.to(_dev2))
+
+        import time as _time
+
+        from flliper.srt.layers.moe.expert_offload import _STORE_CLOCK
+
+        _t_scales = _time.perf_counter()
+        marlin_w13_scales = marlin_moe_permute_scales(
+            layer.w13_weight_scale,
+            layer.w13_weight_packed.shape[2],
+            layer.w13_weight_scale.shape[2],
+            self.group_size,
+        )
+        replace_tensor("w13_weight_scale", marlin_w13_scales)
+
+        marlin_w2_scales = marlin_moe_permute_scales(
+            layer.w2_weight_scale,
+            layer.w2_weight_scale.shape[1]
+            * (self.group_size if self.group_size != -1 else self.packed_factor),
+            layer.w2_weight_scale.shape[2],
+            self.group_size,
+        )
+        replace_tensor("w2_weight_scale", marlin_w2_scales)
+        _STORE_CLOCK["scales_s"] += _time.perf_counter() - _t_scales
+
+        # Repack zero
+        if not self.sym:
+            marlin_w13_zp = moe_awq_to_marlin_zero_points(
+                layer.w13_weight_zero_point,
+                size_k=layer.w13_weight_zero_point.shape[1],
+                size_n=layer.w13_weight_zero_point.shape[2] * self.packed_factor,
+                num_bits=self.num_bits,
+            )
+            replace_tensor("w13_weight_zero_point", marlin_w13_zp)
+
+            marlin_w2_zp = moe_awq_to_marlin_zero_points(
+                layer.w2_weight_zero_point,
+                size_k=layer.w2_weight_zero_point.shape[1],
+                size_n=layer.w2_weight_zero_point.shape[2] * self.packed_factor,
+                num_bits=self.num_bits,
+            )
+            replace_tensor("w2_weight_zero_point", marlin_w2_zp)
+
+        # #112/4: DAS WORKSPACE GEHOERT DER KARTE, NICHT DEM TENSOR.
+        #
+        # `marlin_make_workspace` fragt `get_device_properties(device)` und
+        # wirft "Expected a cuda device, but got: cpu". Genau das passierte
+        # fnFL2w60 auf TP1: bei Residenz-Fraction < 1.0 baut `create_weights`
+        # JEDEN expert-major Tensor auf dem HOST -- `w13_weight_packed.device`
+        # ist dann `cpu`, und der Rang starb, nachdem P schon stand.
+        #
+        # Das Device eines Gewichtstensors sagt, wo dieses Gewicht LIEGT. Es
+        # sagt nichts darueber, auf welcher Karte dieser Rang rechnet. Fuer
+        # ein Marlin-Workspace ist nur Letzteres die richtige Frage.
+        # Ein Ueberlebender: laeuft der Repack ausserhalb des Tag-Pools
+        # (ct-stream-presplit, fnFL2x2), gehoert das Workspace trotzdem hinein.
+        with back_into_tag_pool():
+            layer.workspace = marlin_make_workspace(_rang_karte(layer), 4)
+        layer.is_marlin_converted = True
+
+        # WP2: after the marlin repack, split into the fixed-resident GPU
+        # buffer + pinned-host spill so the full [E] expert stack never gets
+        # pinned back to host (load-time RAM cap). No-op unless
+        # FLLIPER_MOE_RESIDENT_EXPERT_FRACTION < 1.0. No ``cold_shard=`` here
+        # (#421 F8), like every other repack door.
+        from flliper.srt.layers.moe.expert_offload import (
+            presplit_expert_offload_after_repack,
+        )
+
+        _t_presplit = _time.perf_counter()
+        presplit_expert_offload_after_repack(layer)
+        _STORE_CLOCK["presplit_s"] += _time.perf_counter() - _t_presplit
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module):
+        """Forcibly resize parameters back to their original shapes (e.g., GPTQ format) before loading weights."""
+
+        if not hasattr(layer, "_original_shapes"):
+            return
+
+        for name, orig_shape in layer._original_shapes.items():
+            param = getattr(layer, name, None)
+
+            if param is not None and param.shape != orig_shape:
+                param.resize_(orig_shape)
+
+        layer.is_marlin_converted = False
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+
+    def get_marlin_quant_info(self, layer):
+        from flliper.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+        return MarlinMoeQuantInfo(
+            w13_qweight=layer.w13_weight_packed,
+            w2_qweight=layer.w2_weight_packed,
+            w13_scales=layer.w13_weight_scale,
+            w2_scales=layer.w2_weight_scale,
+            w13_g_idx_sort_indices=getattr(layer, "w13_g_idx_sort_indices", None),
+            w2_g_idx_sort_indices=getattr(layer, "w2_g_idx_sort_indices", None),
+            weight_bits=self.num_bits,
+            w13_g_idx=getattr(layer, "w13_weight_g_idx", None),
+            w2_g_idx=getattr(layer, "w2_weight_g_idx", None),
+            is_k_full=self.is_k_full,
+            w13_qzeros=layer.w13_weight_zero_point if not self.sym else None,
+            w2_qzeros=layer.w2_weight_zero_point if not self.sym else None,
+        )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from flliper.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
+        from flliper.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert self.moe_runner_config.activation in (
+            "silu",
+            "gelu",
+        ), "Only SiLU/GeLU activations are supported."
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        topk_weights, topk_ids, router_logits = topk_output
+
+        # Get expert_map for EP support
+        expert_map = None
+        global_num_experts = -1
+        if hasattr(layer, "dispatcher") and hasattr(
+            layer.dispatcher, "local_expert_mapping"
+        ):
+            expert_map = layer.dispatcher.local_expert_mapping
+            if expert_map is not None:
+                global_num_experts = self.moe_runner_config.num_experts
+
+        output = fused_marlin_moe(
+            x,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            g_idx1=layer.w13_weight_g_idx,
+            g_idx2=layer.w2_weight_g_idx,
+            sort_indices1=layer.w13_g_idx_sort_indices,
+            sort_indices2=layer.w2_g_idx_sort_indices,
+            w1_zeros=layer.w13_weight_zero_point if not self.sym else None,
+            w2_zeros=layer.w2_weight_zero_point if not self.sym else None,
+            num_bits=self.num_bits,
+            is_k_full=self.is_k_full,
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+            clamp_limit=self.moe_runner_config.swiglu_limit,
+            workspace=layer.workspace,
+            activation=self.moe_runner_config.activation,
+            is_gated=self.moe_runner_config.is_gated,
+        )
+        return StandardCombineInput(hidden_states=output)
+
+
+class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
+    """ROCm/HIP-compatible W4A16 MoE method using Triton kernels instead of Marlin.
+
+    Inherits weight creation from CompressedTensorsWNA16MoE but converts
+    weights to the uint8-packed format expected by the Triton fused MoE kernel
+    instead of the Marlin-specific format.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "is_triton_converted", False):
+            return
+
+        num_experts = layer.w13_weight_packed.shape[0]
+
+        # Convert w13 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8
+        w13 = layer.w13_weight_packed.data
+        w13 = w13.transpose(1, 2).contiguous().view(torch.uint8)
+        layer.w13_weight_packed = torch.nn.Parameter(w13, requires_grad=False)
+
+        # Convert w2 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8
+        w2 = layer.w2_weight_packed.data
+        w2 = w2.transpose(1, 2).contiguous().view(torch.uint8)
+        layer.w2_weight_packed = torch.nn.Parameter(w2, requires_grad=False)
+
+        # Convert w13 scales: [E, K//group_size, N] -> [E, N, K//group_size]
+        w13_scale = layer.w13_weight_scale.data
+        w13_scale = w13_scale.transpose(1, 2).contiguous()
+        layer.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
+
+        # Convert w2 scales: [E, K//group_size, N] -> [E, N, K//group_size]
+        w2_scale = layer.w2_weight_scale.data
+        w2_scale = w2_scale.transpose(1, 2).contiguous()
+        layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
+
+        layer.is_triton_converted = True
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
+    def get_triton_quant_info(self, layer):
+        from flliper.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight_packed,
+            w2_weight=layer.w2_weight_packed,
+            use_int4_w4a16=True,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            block_shape=[0, self.group_size],
+        )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        assert self.moe_runner_config.activation in (
+            "silu",
+            "gelu",
+        ), "Only SiLU/GeLU activations are supported."
+
+        quant_info = self.get_triton_quant_info(layer)
+        return self.runner.run(dispatch_output, quant_info)
+
+
+class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
+
+    def __init__(self, quantization_config) -> None:
+        self.pack_factor = 8  # weight dtype is int4,  but use int32 to create
+        target = (
+            "MoEGMM" if "MoEGMM" in quantization_config.target_scheme_map else "Linear"
+        )
+        if target in quantization_config.target_scheme_map:
+            self.group_size = quantization_config.target_scheme_map[target][
+                "weights"
+            ].group_size
+        else:
+            self.group_size = 128
+
+        self.kernel = NPUW4A16Int4DynamicMoEMethod()
+
+    # TODO: See if we can merge this method's logic
+    # with CompressedTensorsWNA16MoE. Need more models and tests.
+    # @OrangeRedeng @TamirBaydasov
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        from flliper.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        self.num_experts = num_experts
+        if (
+            extra_weight_attrs.get(
+                "moe_intermediate_size", intermediate_size_per_partition
+            )
+            // intermediate_size_per_partition
+            > 1
+        ):
+            quant_method = FusedMoeWeightScaleSupported.GROUP.value
+        else:
+            quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
+        extra_weight_attrs.update({"quant_method": quant_method})
+        # weight
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # scale
+        weight_scale_dtype = torch.bfloat16
+        w13_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.group_size,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        w2_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.group_size,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # offset
+        w13_weight_offset = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.group_size,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_offset", w13_weight_offset)
+        set_weight_attrs(w13_weight_offset, extra_weight_attrs)
+
+        w2_weight_offset = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.group_size,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_offset", w2_weight_offset)
+        set_weight_attrs(w2_weight_offset, extra_weight_attrs)
+
+        w13_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts, 2), requires_grad=False
+        )
+        layer.register_parameter("w13_weight_shape", w13_weight_shape)
+        set_weight_attrs(w13_weight_shape, extra_weight_attrs)
+
+        w2_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts, 2), requires_grad=False
+        )
+        layer.register_parameter("w2_weight_shape", w2_weight_shape)
+        set_weight_attrs(w2_weight_shape, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.kernel.process_weights_after_loading(layer)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        return self.kernel.apply(layer, dispatch_output)
+
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ):
+        return self.kernel.apply_without_routing_weights(
+            layer,
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
+        )

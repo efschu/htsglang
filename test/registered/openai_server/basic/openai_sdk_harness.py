@@ -4,7 +4,7 @@
 
 The point of this harness is that everything between the socket and the
 scheduler is real: the real FastAPI app from
-``sglang.srt.entrypoints.http_server``, the real routes, the real exception
+``flliper.srt.entrypoints.http_server``, the real routes, the real exception
 handlers, the real serving classes, the real protocol models, served by a real
 uvicorn over a real TCP port. Only ``TokenizerManager.generate_request`` --
 the one thing that needs a GPU -- is replaced.
@@ -87,7 +87,7 @@ def build_mock_tokenizer_manager(tokenizer, *, embedding_dim: int = 4) -> MagicM
     a mocked ``server_args`` returns a truthy Mock for every unknown attribute
     and silently drives the opposite branch.
     """
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     tm = MagicMock()
     tm.tokenizer = tokenizer
@@ -178,20 +178,20 @@ def live_server(
     """
     import uvicorn
 
-    from sglang.srt.entrypoints import http_server
-    from sglang.srt.entrypoints.openai.registry_view import RegistryView
-    from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-    from sglang.srt.entrypoints.openai.serving_completions import (
+    from flliper.srt.entrypoints import http_server
+    from flliper.srt.entrypoints.openai.registry_view import RegistryView
+    from flliper.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+    from flliper.srt.entrypoints.openai.serving_completions import (
         OpenAIServingCompletion,
     )
-    from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
-    from sglang.srt.entrypoints.openai.serving_files import OpenAIServingFiles
-    from sglang.srt.entrypoints.openai.serving_finetune import (
+    from flliper.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
+    from flliper.srt.entrypoints.openai.serving_files import OpenAIServingFiles
+    from flliper.srt.entrypoints.openai.serving_finetune import (
         OpenAIServingFineTuning,
     )
-    from sglang.srt.entrypoints.openai.serving_images import OpenAIServingImages
-    from sglang.srt.entrypoints.openai.serving_speech import OpenAIServingSpeech
-    from sglang.srt.entrypoints.openai.serving_transcription import (
+    from flliper.srt.entrypoints.openai.serving_images import OpenAIServingImages
+    from flliper.srt.entrypoints.openai.serving_speech import OpenAIServingSpeech
+    from flliper.srt.entrypoints.openai.serving_transcription import (
         OpenAIServingTranscription,
     )
 
@@ -226,7 +226,7 @@ def live_server(
     )
 
     if training_service is None:
-        from sglang.srt.training.service import (
+        from flliper.srt.training.service import (
             TrainingService,
             TrainingServiceConfig,
         )
@@ -245,8 +245,8 @@ def live_server(
     app.state.openai_serving_fine_tuning = OpenAIServingFineTuning(training_service)
 
     if workbench_service is None:
-        from sglang.srt.workbench.scheduler import WorkbenchConfig
-        from sglang.srt.workbench.service import WorkbenchService
+        from flliper.srt.workbench.scheduler import WorkbenchConfig
+        from flliper.srt.workbench.service import WorkbenchService
 
         # Disabled by default, same reasoning as the training service above.
         workbench_service = WorkbenchService(
@@ -258,7 +258,7 @@ def live_server(
     app.state.workbench_service = workbench_service
     # The Ollama emulation rides the same lanes; it is served by the same app
     # and therefore covered by the same harness.
-    from sglang.srt.entrypoints.ollama.serving import OllamaServing  # noqa: PLC0415
+    from flliper.srt.entrypoints.ollama.serving import OllamaServing  # noqa: PLC0415
 
     app.state.ollama_serving = OllamaServing(tm)
 

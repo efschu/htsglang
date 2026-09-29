@@ -23,9 +23,9 @@ import requests
 import torch
 import torch.multiprocessing as mp
 
-import sglang as sgl
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+import flliper as sgl
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
-from sglang.utils import terminate_process
+from flliper.utils import terminate_process
 
 mp.set_start_method("spawn", force=True)
 

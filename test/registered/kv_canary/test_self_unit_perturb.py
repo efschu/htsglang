@@ -7,38 +7,38 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import RealKvSource
-from sglang.srt.kv_canary.buffer_group import PoolKind
-from sglang.srt.kv_canary.perturb import (
+from flliper.jit_kernel.kv_canary.verify import RealKvSource
+from flliper.srt.kv_canary.buffer_group import PoolKind
+from flliper.srt.kv_canary.perturb import (
     real_kv_post_forward,
 )
-from sglang.srt.kv_canary.perturb import (
+from flliper.srt.kv_canary.perturb import (
     real_kv_unused_cache as real_kv_unused_cache_module,
 )
-from sglang.srt.kv_canary.perturb.config import (
+from flliper.srt.kv_canary.perturb.config import (
     PerturbConfig,
     TargetGroupKind,
     _parse_target_group_kind,
 )
-from sglang.srt.kv_canary.perturb.manager import PerturbManager
-from sglang.srt.kv_canary.perturb.slot_picker import collect_active_slots
-from sglang.srt.kv_canary.perturb.utils import (
+from flliper.srt.kv_canary.perturb.manager import PerturbManager
+from flliper.srt.kv_canary.perturb.slot_picker import collect_active_slots
+from flliper.srt.kv_canary.perturb.utils import (
     WarmupGate,
     flip_first_byte_in_source,
     pick_target_group,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.fixtures import (
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
     make_buffer_group,
     make_forward_batch,
     make_radix_cache,
     make_req_to_token_pool,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from flliper.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="extra-a-test-1-gpu-small-amd")
@@ -69,7 +69,7 @@ class TestParseTargetGroupKind(CustomTestCase):
         for raw in [None, "", "any", " Any "]:
             with self.subTest(raw=raw):
                 with self.assertRaisesRegex(
-                    ValueError, "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP"
+                    ValueError, "FLLIPER_KV_CANARY_PERTURB_TARGET_GROUP"
                 ):
                     _parse_target_group_kind(raw)
 
@@ -80,14 +80,14 @@ class TestParseTargetGroupKind(CustomTestCase):
         with patch.dict(
             os.environ,
             {
-                "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0",
-                "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0",
-                "SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0",
-                "SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB": "0",
+                "FLLIPER_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0",
+                "FLLIPER_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0",
+                "FLLIPER_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0",
+                "FLLIPER_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB": "0",
             },
             clear=False,
         ):
-            os.environ.pop("SGLANG_KV_CANARY_PERTURB_TARGET_GROUP", None)
+            os.environ.pop("FLLIPER_KV_CANARY_PERTURB_TARGET_GROUP", None)
             config = PerturbConfig.from_env()
 
         self.assertIsNone(config.target_group_kind)

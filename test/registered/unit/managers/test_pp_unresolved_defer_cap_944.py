@@ -57,7 +57,7 @@ honourable without a measurement, so it is the only available terminator.
 import logging
 import unittest
 
-from sglang.srt.managers.pp_admission_congruence import (
+from flliper.srt.managers.pp_admission_congruence import (
     UNKNOWN_MATCH,
     UNRESOLVED_DEFER_CAP,
     PPAdmissionCongruenceGuard,
@@ -65,7 +65,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     PPAdmissionEntry,
     reconcile_pp_admission_decision,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20)
 
@@ -218,7 +218,7 @@ class TheUnresolvedDeferIsCapped(unittest.TestCase):
         g = self._guard()
         self._reoffer(g, UNRESOLVED_DEFER_CAP)
         catcher = _Catcher(logging.ERROR)
-        log = logging.getLogger("sglang.srt.managers.pp_admission_congruence")
+        log = logging.getLogger("flliper.srt.managers.pp_admission_congruence")
         log.addHandler(catcher)
         try:
             g.prefix_len_for(RID, 4096)
@@ -242,7 +242,7 @@ class TheUnresolvedDeferIsCapped(unittest.TestCase):
         g = self._guard()
         self._reoffer(g, UNRESOLVED_DEFER_CAP)
         catcher = _Catcher(logging.ERROR)
-        log = logging.getLogger("sglang.srt.managers.pp_admission_congruence")
+        log = logging.getLogger("flliper.srt.managers.pp_admission_congruence")
         log.addHandler(catcher)
         try:
             for _ in range(5):
@@ -350,7 +350,7 @@ class TheCompensatorMustBeONTheDefectsPATH(unittest.TestCase):
     """
 
     def _build(self, guard, req, pp_size=WORLD):
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             build_pp_admission_decision,
         )
 
@@ -411,7 +411,7 @@ class TheCompensatorMustBeONTheDefectsPATH(unittest.TestCase):
         g = PPAdmissionCongruenceGuard()
         req = _CanRunListReq(RID, prefix_len=8192, extend_len=512)
         catcher = _Catcher(logging.ERROR)
-        log = logging.getLogger("sglang.srt.managers.pp_admission_congruence")
+        log = logging.getLogger("flliper.srt.managers.pp_admission_congruence")
         log.addHandler(catcher)
         try:
             for _ in range(UNRESOLVED_DEFER_CAP + 4):
@@ -438,7 +438,7 @@ class TheCompensatorMustBeONTheDefectsPATH(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.managers import pp_admission_congruence as pac
+        from flliper.srt.managers import pp_admission_congruence as pac
 
         src = inspect.getsource(pac.build_pp_admission_decision)
         sites = src.count("PPAdmissionEntry(")
@@ -469,9 +469,9 @@ class TheCompensatorMustBeONTheDefectsPATH(unittest.TestCase):
         """
         import pathlib
 
-        import sglang
+        import flliper
 
-        root = pathlib.Path(sglang.__file__).resolve().parent
+        root = pathlib.Path(flliper.__file__).resolve().parent
         home = root / "srt/mem_cache/unified_radix_cache.py"
         self.assertTrue(home.exists())
         text = home.read_text(encoding="utf-8", errors="replace")
@@ -531,8 +531,8 @@ class TheConsumerSweepRatchet(unittest.TestCase):
     # every edit above them and would make this a nuisance rather than a
     # ratchet.
     EXPECTED_OBSERVED_LOCAL_READERS = {
-        "sglang/srt/managers/pp_admission_congruence.py",
-        "sglang/srt/managers/scheduler_pp_mixin.py",
+        "flliper/srt/managers/pp_admission_congruence.py",
+        "flliper/srt/managers/scheduler_pp_mixin.py",
         # #1058c, and the ratchet caught it rather than a human noticing:
         # the told-vs-local census gained its observation point here after
         # its only previous caller turned out to sit in the one arm of the
@@ -545,7 +545,7 @@ class TheConsumerSweepRatchet(unittest.TestCase):
         # `agree`/`told_over`/`told_under`, and its reading rule is printed
         # beside the numbers -- `told_over=0` counts only when
         # (evaluated - absent) > 0. A miss stays a miss.
-        "sglang/srt/managers/scheduler.py",
+        "flliper/srt/managers/scheduler.py",
     }
 
     #: The TEST readers, pinned separately and deliberately. A value's meaning
@@ -596,9 +596,9 @@ class TheConsumerSweepRatchet(unittest.TestCase):
     def _tree(self):
         import pathlib
 
-        import sglang
+        import flliper
 
-        return pathlib.Path(sglang.__file__).resolve().parents[1]
+        return pathlib.Path(flliper.__file__).resolve().parents[1]
 
     def _readers(self, needle, root=None):
         import re
@@ -648,8 +648,8 @@ class TheConsumerSweepRatchet(unittest.TestCase):
         self.assertEqual(
             found,
             {
-                "sglang/srt/managers/pp_admission_congruence.py",
-                "sglang/srt/managers/scheduler_pp_mixin.py",
+                "flliper/srt/managers/pp_admission_congruence.py",
+                "flliper/srt/managers/scheduler_pp_mixin.py",
             },
             "The UNKNOWN sentinel must stay INSIDE the resolution path. It "
             "escaping into a third module is how it would reach a reader that "

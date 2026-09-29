@@ -1,0 +1,1262 @@
+# SPDX-License-Identifier: Apache-2.0
+# Ported 19.09.2026 from vLLM PR #56177 (01554/vllm, lab/upstream-pool-standalone-
+# rebased, expert_pool/tables.py + copy.py, Apache-2.0) into this fork's
+# per-layer MoE expert offload. Adapted, not copied: one bank per layer (the
+# layer's existing [R+C] slot arena), a FIXED resident region [0, R) that is
+# never a victim (no host copy of the resident experts is needed), a device-LRU
+# region [R, R+C-S) and S staging rows; the host source is the layer's pinned
+# SPILL pool addressed through a static ``host_row`` table.
+"""Device-planned expert pool: the decode step and the row copies run entirely
+on the device with fixed shapes and addresses, so a decode CUDA graph captures
+them and every replay plans afresh -- no host readback between the router and
+the GEMM (the breakable route paid 48 of them per token).
+
+``step_reference`` (torch, synchronizing) defines the semantics; the desk
+tests run it and the Triton program must match it exactly.
+
+SPECULATIVE PREFETCH (``prefetch=True``, FLLIPER_MOE_POOL_PREFETCH=1)
+--------------------------------------------------------------------
+Mixtral-Offloading (Eliseev/Mazur 2023) observed that the residual stream
+changes slowly across layers, so layer L+1's router applied to layer L's MoE
+input predicts L+1's experts well. We use that to hide the row copies: while
+the main stream computes layer L's experts, a side stream runs THIS SAME
+program over layer L+1's tables with the predicted ids and copies the rows it
+is missing. Layer L+1 then waits on one event and plans for real -- a correct
+prediction is now a plain hit, a wrong one is a synchronous miss exactly as
+today.
+
+The prefetch runs on the NEXT layer's tables, never on the running layer's, so
+it can by construction not evict a row layer L is computing from: the pools
+are per layer and disjoint. Inside the target layer the two accesses are kept
+apart by ONE rule, which is the same expression the real step already uses --
+``row_use >= clock`` is never a victim:
+
+* the prefetch does NOT advance the clock, so the rows the target layer's LAST
+  real step stamped (``row_use == clock``) are excluded from prefetch eviction.
+  Those are the previous round's working set, i.e. exactly the rows a good
+  prediction wants to keep;
+* a row the prefetch just filled is stamped ``row_use = clock`` too, so two
+  predicted misses in one prefetch cannot evict each other;
+* the real step then advances the clock to ``clock + 1``, which un-protects the
+  prefetched rows: a MISPREDICTED row is evictable again immediately and never
+  outranks a row the real step used.
+
+Prefetched rows go into the ordinary LRU region, not a separate prefetch
+region. Numbers (rank 0 of the Qwen3.8-Flash-Next TP=3 target form, 19.09.):
+LRU = 126 rows, staging = 30, top-k = 10 and 3-4 misses per layer per verify.
+A reserved prefetch region would have to be >= the predicted-miss count (~10
+rows) and would be dead capacity in every round the prediction is right --
+while taken out of the very LRU pool whose depth is the measured recency lever
+(fn5t: 18 more LRU rows took rank 0 from 5.4 to 3.3 misses per verify forward).
+In the LRU region a correct prediction IS the cache line the next round wants,
+and a wrong one costs a single LRU slot out of 126 for one round. Staging is
+never used by the prefetch: staging rows are per-step scratch that the target
+layer's own real step overwrites in the same round.
+
+H95 OVERFLOW WAVES (FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES=N, default 0 = off)
+------------------------------------------------------------------------
+The step is exact whenever the step's DISTINCT NON-RESIDENT ids fit the
+layer's rows above the residents, ``D_nr <= C`` (C = LRU + staging): every
+such expert is an LRU hit, takes an LRU victim not used in this step, or a
+staging row -- ``misses + lru_hits = D_nr`` and ``victims + staging =
+C - lru_hits``. Task #40 / H91b booked the WORST case of that at capture
+(``min(ids, E - R) <= C``), which makes C grow with the batch (bs2: 80 rows,
+bs6: 240 ids, not representable on a 3080 worker).
+
+With waves the bound is split over up to N pool steps of the SAME batch.
+Wave 1 is the ordinary step with ``spill=True``: an expert that finds neither
+a victim nor a staging row does not set the sticky error, it keeps route -1
+and its LANES are recomputed by the next wave. Wave k+1 is an ordinary step
+(``wave=True``: the clock advances, which releases the previous wave's rows
+-- their GEMM is ordered before it on the same stream -- and ``forwards`` is
+not counted twice) over exactly the lanes wave k could not serve. Wave k
+serves ``min(D_k, C)`` distinct experts, so N waves serve ``N x C``: the
+capture-time bound becomes ``min(ids, E - R) <= N x C`` -- the scratch C
+stays that of bs1, the WAVE COUNT carries the batch. Each lane is computed in
+exactly one wave (the caller zeroes its weight in every other wave and points
+its route at a resident row), each expert's bytes are read in one wave only,
+and a step with ``D_nr <= C`` runs wave 1 exactly as without waves; the later
+waves then route nothing and copy nothing.
+
+H95 DEMAND PROBE (FLLIPER_DEBUG_MOE_POOL_DEMAND=N replays, default 0 = off)
+-------------------------------------------------------------------------
+``demand`` = [max D_nr of one step, steps with D_nr > C, steps] since the last
+``take_demand_report``: the measured quantity the bound above is about, per
+layer, instead of the worst case.
+
+H95c SEAT ROWS (``seat_rows`` = X > 0, FLLIPER_OPT_PDFLIP_D_SEAT_VRAM, default 0)
+----------------------------------------------------------------------------
+D's per-seat posts are backed only for the phase's n occupied seats; the VRAM
+the unoccupied seats leave is handed to X extra LRU rows at the END of the
+bank (pdflip/d_seat_vram.py maps their pages per phase, the virtual range --
+and every captured graph address -- is fixed). So that the mapped part of an
+expert tensor stays ONE prefix ``[0, rows_boot + k)`` (the cap form maps
+exactly the rows it mapped before), the seat form moves the S staging rows to
+the FRONT of the scratch block::
+
+    [0, R)            residents               (R = ``resident_rows``)
+    [R, R+S)          staging                 (below ``lru_start`` = R+S: never scanned)
+    [R+S, R+C)        LRU
+    [R+C, R+C+k)      seat rows ON            (ordinary LRU rows this phase)
+    [R+C+k, R+C+X)    seat rows OFF           (unmapped pages)
+
+An OFF row is a DEVICE VALUE, not a kernel constant: ``row_key`` = SEAT_OFF_KEY
+(an occupied row) and ``row_use`` = ROW_USE_NEVER, so the scan's "free first"
+rule never picks it and "use >= clock" never makes it a victim; no expert is
+ever routed there, so the step never reads or writes its bytes. Switching k is
+a table write (:func:`set_seat_rows_on`), never a recapture. The capture-time
+bound and the wave count use C at k = 0 (:func:`pool_row_capacity`), i.e. the
+phase with every seat occupied; a phase with more rows only needs fewer waves.
+The kernel's own DEMAND probe counts OFF rows into its C (probe only).
+With ``seat_rows`` = 0 every table, bound and layout is the one before H95c.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import msgspec
+
+ROW_USE_NEVER = 0x7FFFFFFFFFFFFFFF
+PLAN_WIDTH = 64
+COPY_PROGRAMS = 32
+COPY_WORDS = 4096  # int32 words per program iteration (16 KiB)
+#: H95c: ``row_key`` of an OFF seat row -- an OCCUPIED key (>= 0) that is no
+#: expert id (>= E for every E this pool can hold), with ``row_use`` NEVER.
+SEAT_OFF_KEY = 0x7FFFFFFF
+
+
+@dataclass
+class PoolTables:
+    """One layer's device state; every tensor has a fixed address."""
+
+    num_experts: int
+    pool_rows: int  # rows [0, pool_rows) = resident + LRU; staging follows
+    lru_start: int  # rows [0, lru_start) are fixed residents, never victims
+    hot_phys: Any  # [E] int32 expert -> bank row / -1
+    host_row: Any  # [E] int32 expert -> pinned spill row / -1 (static)
+    row_key: Any  # [pool_rows + staging] int32 row -> expert / -1
+    row_use: Any  # [pool_rows + staging] int64 clock of last selection
+    clock: Any  # [1] int64
+    gate: Any  # [1] int32 promotions allowed
+    error: Any  # [1] int32 sticky device error
+    promote_limit: Any  # [1] int32 (0 = unlimited)
+    promote_interval: Any  # [1] int32
+    forwards: Any  # [1] int32
+    promote_min_misses: Any  # [1] int32
+    protect_recent: Any  # [1] int32
+    miss_count: Any  # [E] int32
+    staging_rows: Any  # [S] int32
+    misses_total: Any  # [1] int64 misses (promoted + staged) since the last report
+    pf_row: Any  # [pool_rows + staging] int64 clock at which a prefetch filled the row
+    pf_counts: Any  # [4] int64 predicted, fetched, hits, skipped (no victim)
+    # H95: [3] int64 max distinct non-resident ids of one step, steps with
+    # more of them than LRU + staging rows, steps -- None unless probed
+    demand: Any = None
+    # H95c seat form (module docstring): the TRUE resident count R when the
+    # staging block sits below ``lru_start`` (None = ``lru_start``), the first
+    # seat row, the seat rows reserved (X) and the ones ON this phase (k).
+    resident_rows: Optional[int] = None
+    seat_base: int = 0
+    seat_rows: int = 0
+    seat_on: int = 0
+
+
+def resident_count(tables: PoolTables) -> int:
+    """H95c: R, the fixed residents -- ``lru_start`` outside the seat form."""
+    r = tables.resident_rows
+    return int(tables.lru_start if r is None else r)
+
+
+def seat_off_range(tables: PoolTables) -> Optional[Tuple[int, int]]:
+    """H95c: the rows [lo, hi) that are OFF this phase, or None."""
+    if not tables.seat_rows:
+        return None
+    lo = int(tables.seat_base) + int(tables.seat_on)
+    hi = int(tables.seat_base) + int(tables.seat_rows)
+    return (lo, hi) if hi > lo else None
+
+
+def _staging_first(tables: PoolTables) -> int:
+    """First staging row: after the LRU region, or (seat form) after R."""
+    if tables.seat_rows:
+        return resident_count(tables)
+    return int(tables.pool_rows)
+
+
+@dataclass
+class StepBuffers:
+    gather_src: Any  # [W] int32 host rows
+    gather_dst: Any  # [W] int32 bank rows
+    gather_count: Any  # [1] int32
+    routes: Any  # [W] int32 physical row per ids lane, -1 padding
+    staged_expert: Any  # [W] int32
+    staged_row: Any  # [W] int32
+    staged_count: Any  # [1] int32
+    promoted_count: Any  # [1] int32
+    step_map: Any  # [E] int32
+    ids: Any  # [W] int32 the step's OWN copy of its ids (the prefetch reads it
+    # on the side stream; a caller temporary could be recycled by the capture
+    # stream before that read -- see MoEExpertOffloadCache.prefetch_pool)
+
+
+def allocate_pool_tables(
+    device, num_experts: int, rows: int, lru_start: int, staging: int,
+    hot_slot_of: Dict[int, int], host_row: Sequence[int], demand: bool = False,
+    seat_rows: int = 0,
+) -> PoolTables:
+    """``rows`` = R + C of the layer's arena; the last ``staging`` of them are
+    staging rows, the ones in [lru_start, rows - staging) the LRU region.
+    ``hot_slot_of`` = expert -> row for every initially resident expert.
+    ``demand`` (H95 probe) allocates the per-step demand counters.
+
+    ``seat_rows`` = X > 0 (H95c): ``rows`` = R + C + X and the layout is the
+    seat form of the module docstring -- staging [R, R+S), LRU [R+S, R+C),
+    X seat rows at the end, all OFF (the cap form, k = 0)."""
+    if int(seat_rows) > 0:
+        return _allocate_seat_tables(
+            device, num_experts, rows, lru_start, staging, hot_slot_of, host_row,
+            demand=demand, seat_rows=int(seat_rows))
+    import torch
+
+    if staging < 1 or not 0 <= lru_start < rows - staging:
+        raise ValueError("pool needs staging rows and a non-empty LRU region")
+    if len(host_row) != num_experts:
+        raise ValueError("host_row must have one entry per expert")
+    pool_rows = rows - staging
+    hot = torch.full((num_experts,), -1, dtype=torch.int32)
+    key = torch.full((rows,), -1, dtype=torch.int32)
+    use = torch.zeros(rows, dtype=torch.int64)
+    for e, r in hot_slot_of.items():
+        if not 0 <= r < pool_rows:
+            raise ValueError(f"expert {e} placed outside the pool at row {r}")
+        hot[e] = r
+        key[r] = e
+    use[:lru_start] = ROW_USE_NEVER
+    use[pool_rows:] = ROW_USE_NEVER
+    hr = torch.tensor(list(host_row), dtype=torch.int32)
+    bad = [(e, r) for e, r in hot_slot_of.items() if int(hr[e]) >= 0]
+    if bad:
+        raise ValueError(f"resident experts must carry host_row -1: {bad[:3]}")
+
+    def one(v, dtype=torch.int32):
+        return torch.full((1,), v, dtype=dtype, device=device)
+
+    return PoolTables(
+        num_experts=num_experts, pool_rows=pool_rows, lru_start=lru_start,
+        hot_phys=hot.to(device), host_row=hr.to(device), row_key=key.to(device),
+        row_use=use.to(device), clock=one(0, torch.int64), gate=one(1), error=one(0),
+        promote_limit=one(0), promote_interval=one(1), forwards=one(0),
+        promote_min_misses=one(1), protect_recent=one(0),
+        miss_count=torch.zeros(num_experts, dtype=torch.int32, device=device),
+        staging_rows=torch.arange(pool_rows, rows, dtype=torch.int32, device=device),
+        misses_total=one(0, torch.int64),
+        pf_row=torch.full((rows,), -1, dtype=torch.int64, device=device),
+        pf_counts=torch.zeros(4, dtype=torch.int64, device=device),
+        demand=torch.zeros(3, dtype=torch.int64, device=device) if demand else None,
+    )
+
+
+def _allocate_seat_tables(
+    device, num_experts: int, rows: int, resident: int, staging: int,
+    hot_slot_of: Dict[int, int], host_row: Sequence[int], *, demand: bool,
+    seat_rows: int,
+) -> PoolTables:
+    """H95c: :func:`allocate_pool_tables` in the seat form, k = 0."""
+    import torch
+
+    R, S, X = int(resident), int(staging), int(seat_rows)
+    C = int(rows) - X - R
+    if S < 1 or R < 0 or C - S < 1:
+        raise ValueError("pool needs staging rows and a non-empty LRU region")
+    if len(host_row) != num_experts:
+        raise ValueError("host_row must have one entry per expert")
+    lru_start = R + S
+    hot = torch.full((num_experts,), -1, dtype=torch.int32)
+    key = torch.full((rows,), -1, dtype=torch.int32)
+    use = torch.zeros(rows, dtype=torch.int64)
+    for e, r in hot_slot_of.items():
+        if not 0 <= r < R:
+            raise ValueError(f"expert {e} placed outside the residents at row {r}")
+        hot[e] = r
+        key[r] = e
+    use[:lru_start] = ROW_USE_NEVER
+    key[R + C:] = SEAT_OFF_KEY
+    use[R + C:] = ROW_USE_NEVER
+    hr = torch.tensor(list(host_row), dtype=torch.int32)
+    bad = [(e, r) for e, r in hot_slot_of.items() if int(hr[e]) >= 0]
+    if bad:
+        raise ValueError(f"resident experts must carry host_row -1: {bad[:3]}")
+
+    def one(v, dtype=torch.int32):
+        return torch.full((1,), v, dtype=dtype, device=device)
+
+    return PoolTables(
+        num_experts=num_experts, pool_rows=int(rows), lru_start=lru_start,
+        hot_phys=hot.to(device), host_row=hr.to(device), row_key=key.to(device),
+        row_use=use.to(device), clock=one(0, torch.int64), gate=one(1), error=one(0),
+        promote_limit=one(0), promote_interval=one(1), forwards=one(0),
+        promote_min_misses=one(1), protect_recent=one(0),
+        miss_count=torch.zeros(num_experts, dtype=torch.int32, device=device),
+        staging_rows=torch.arange(R, R + S, dtype=torch.int32, device=device),
+        misses_total=one(0, torch.int64),
+        pf_row=torch.full((rows,), -1, dtype=torch.int64, device=device),
+        pf_counts=torch.zeros(4, dtype=torch.int64, device=device),
+        demand=torch.zeros(3, dtype=torch.int64, device=device) if demand else None,
+        resident_rows=R, seat_base=R + C, seat_rows=X, seat_on=0,
+    )
+
+
+def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True) -> int:
+    """H95c: turn the first ``k`` seat rows ON (ordinary free LRU rows) and
+    the rest OFF. ``device_write=False`` only records k on the host (the next
+    :func:`reinit_pool_tables` -- the wake's rearm -- writes the layout);
+    ``True`` writes the rows now, stream-ordered, IN PLACE: a row turned ON
+    becomes free (key -1, use 0), a row turned OFF drops the expert it held
+    (``hot_phys`` -> -1, the next miss fetches it again) and becomes OFF.
+    Returns the previous k. A table without seat rows accepts only k = 0."""
+    k = int(k)
+    X = int(tables.seat_rows)
+    if not 0 <= k <= X:
+        raise ValueError(f"seat rows on {k} outside [0, {X}]")
+    old = int(tables.seat_on)
+    tables.seat_on = k
+    if not device_write or k == old:
+        return old
+    base = int(tables.seat_base)
+    if k > old:
+        lo, hi = base + old, base + k
+        tables.row_key[lo:hi].fill_(-1)
+        tables.row_use[lo:hi].fill_(0)
+        tables.pf_row[lo:hi].fill_(-1)
+        return old
+    lo, hi = base + k, base + old
+    keys = tables.row_key[lo:hi].cpu()
+    hot = tables.hot_phys.cpu()
+    E = int(tables.num_experts)
+    for i, e in enumerate(keys.tolist()):
+        if 0 <= e < E and int(hot[e]) == lo + i:
+            hot[e] = -1
+    tables.hot_phys.copy_(hot.to(tables.hot_phys.device))
+    tables.row_key[lo:hi].fill_(SEAT_OFF_KEY)
+    tables.row_use[lo:hi].fill_(ROW_USE_NEVER)
+    tables.pf_row[lo:hi].fill_(-1)
+    return old
+
+
+def plan_width_for(max_step_ids: Optional[int]) -> int:
+    """H91b: the step buffers' width (the kernel's ``WIDTH`` constexpr, a
+    power of two) for the widest captured step. One bs1 MTP verify routes
+    4 rows x top-10 = 40 ids and fits the historic 64; n seats route n x 40
+    (H95: n = 1..--d-bs; bs2/3 = 128, bs4..6 = 256 lanes). Never below
+    ``PLAN_WIDTH``, so a bs1 form keeps its exact width (and its kernel).
+    The width is lanes, not rows: H95's overflow waves keep the ROWS at the
+    bs1 scratch; every wave plans the same ``n x 40`` lanes."""
+    if max_step_ids is None or int(max_step_ids) <= PLAN_WIDTH:
+        return PLAN_WIDTH
+    return _next_power_of_two(int(max_step_ids))
+
+
+def pool_max_step_ids(
+    *,
+    graph_bs: Optional[Sequence[int]],
+    max_graph_bs: Optional[int],
+    max_running: Optional[int],
+    verify_tokens: Optional[int],
+    top_k: Optional[int],
+) -> Optional[int]:
+    """The widest step a captured decode graph can route: the largest captured
+    batch x the rows each request carries (the MTP verify window, else 1) x
+    top_k. ``None`` when top_k is unknown (the caller keeps ``PLAN_WIDTH``)."""
+    if not top_k:
+        return None
+    if graph_bs:
+        bs = max(int(b) for b in graph_bs)
+    elif max_graph_bs:
+        bs = int(max_graph_bs)
+    elif max_running:
+        bs = int(max_running)
+    else:
+        return None
+    return int(bs) * max(1, int(verify_tokens or 1)) * int(top_k)
+
+
+def step_row_demand(n_ids: int, num_experts: int, n_resident: int) -> int:
+    """H91b: the rows one step can demand beyond the residents -- the Task #40
+    bound, tightened by the fact that a step can touch at most every
+    NON-resident expert once: ``min(ids, E - R)``. With scratch clamped to
+    ``E - R`` (every non-resident expert has a row) the old ``ids``-only form
+    refused steps that cannot overflow."""
+    return int(min(int(n_ids), max(int(num_experts) - int(n_resident), 0)))
+
+
+def pool_row_capacity(tables: PoolTables, capture_rows_on: int = 0) -> int:
+    """H95: C = LRU + staging rows -- the distinct non-resident experts ONE
+    pool step can serve (module docstring). H95c: OFF seat rows are no rows.
+
+    #251c ``capture_rows_on``: a CAPTURED step counts at least that many seat
+    rows ON -- the fewest rows ON in any phase whose batch can replay this
+    graph (``d_seat_vram.capture_floor_rows``); the bank is born with every
+    seat row OFF, and the graph only ever replays in such a phase. 0 = the
+    live count, byte-identical."""
+    off = seat_off_range(tables)
+    c = int(tables.pool_rows - tables.lru_start + int(tables.staging_rows.shape[0])) - (
+        0 if off is None else off[1] - off[0])
+    if capture_rows_on and tables.seat_rows:
+        c += max(0, min(int(capture_rows_on), int(tables.seat_rows)) - int(tables.seat_on))
+    return c
+
+
+def pool_waves_for(n_ids: int, num_experts: int, n_resident: int, capacity: int) -> int:
+    """H95: how many waves a step of ``n_ids`` routed ids needs so that the
+    worst case ``min(ids, E - R)`` is served -- ``ceil(demand / C)``, at least
+    1. One wave is today's step."""
+    need = step_row_demand(n_ids, num_experts, n_resident)
+    cap = max(1, int(capacity))
+    return max(1, -(-need // cap))
+
+
+def allocate_step_buffers(device, num_experts: int, width: int = PLAN_WIDTH) -> StepBuffers:
+    import torch
+
+    def ints(n):
+        return torch.zeros(n, dtype=torch.int32, device=device)
+
+    return StepBuffers(
+        gather_src=ints(width), gather_dst=ints(width), gather_count=ints(1),
+        routes=torch.full((width,), -1, dtype=torch.int32, device=device),
+        staged_expert=ints(width), staged_row=ints(width), staged_count=ints(1),
+        promoted_count=ints(1),
+        step_map=torch.full((num_experts,), -1, dtype=torch.int32, device=device),
+        ids=torch.full((width,), -1, dtype=torch.int32, device=device),
+    )
+
+
+@dataclass
+class PoolLayout:
+    """A table layout already on the tables' device: what ``reinit`` writes.
+    fnFL2 H31b keeps one per deferred layer so the later promotion is four
+    device-to-device copies on the forward stream, no host round trip."""
+
+    hot_phys: Any
+    host_row: Any
+    row_key: Any
+    row_use: Any
+
+
+def pool_layout_tensors(tables: PoolTables, hot_slot_of: Dict[int, int],
+                        host_row: Sequence[int]) -> PoolLayout:
+    """The layout ``allocate_pool_tables`` would build for these residents, as
+    device tensors next to ``tables`` (validated exactly as there)."""
+    import torch
+
+    E, rows = tables.num_experts, int(tables.row_key.shape[0])
+    pool_rows = tables.pool_rows
+    if len(host_row) != E:
+        raise ValueError("host_row must have one entry per expert")
+    hot = torch.full((E,), -1, dtype=torch.int32)
+    key = torch.full((rows,), -1, dtype=torch.int32)
+    use = torch.zeros(rows, dtype=torch.int64)
+    for e, r in hot_slot_of.items():
+        if not 0 <= r < pool_rows:
+            raise ValueError(f"expert {e} placed outside the pool at row {r}")
+        hot[e] = r
+        key[r] = e
+    use[: tables.lru_start] = ROW_USE_NEVER
+    use[pool_rows:] = ROW_USE_NEVER
+    off = seat_off_range(tables)
+    if off is not None:
+        key[off[0]:off[1]] = SEAT_OFF_KEY
+        use[off[0]:off[1]] = ROW_USE_NEVER
+    dev = tables.hot_phys.device
+    return PoolLayout(
+        hot_phys=hot.to(dev),
+        host_row=torch.tensor(list(host_row), dtype=torch.int32).to(dev),
+        row_key=key.to(dev), row_use=use.to(dev))
+
+
+def apply_pool_layout(tables: PoolTables, layout: PoolLayout) -> None:
+    """Write ``layout`` into the tables IN PLACE and reset every counter --
+    device ops only, stream-ordered on the current stream."""
+    import torch
+
+    dev = tables.hot_phys.device
+    tables.hot_phys.copy_(layout.hot_phys)
+    tables.host_row.copy_(layout.host_row)
+    tables.row_key.copy_(layout.row_key)
+    tables.row_use.copy_(layout.row_use)
+    tables.clock.fill_(0)
+    tables.gate.fill_(1)
+    tables.error.fill_(0)
+    tables.promote_limit.fill_(0)
+    tables.promote_interval.fill_(1)
+    tables.forwards.fill_(0)
+    tables.promote_min_misses.fill_(1)
+    tables.protect_recent.fill_(0)
+    tables.miss_count.zero_()
+    s0 = _staging_first(tables)
+    tables.staging_rows.copy_(torch.arange(
+        s0, s0 + int(tables.staging_rows.shape[0]), dtype=torch.int32, device=dev))
+    tables.misses_total.fill_(0)
+    tables.pf_row.fill_(-1)
+    tables.pf_counts.zero_()
+
+
+def reinit_pool_tables(tables: PoolTables, hot_slot_of: Dict[int, int],
+                       host_row: Sequence[int]) -> None:
+    """Die Tabellen IN PLACE auf den Zustand von ``allocate_pool_tables``
+    zuruecksetzen -- dieselben Adressen, denn die Decode-Graphen haben genau
+    diese Zeiger aufgenommen (Platztausch, Wake).
+
+    Nach einem Flip halten die LRU-Zeilen Reste der anderen Gruppe, und lagen
+    die Tabellen unter einem pausierten Tag, sind auch die Residenten-Eintraege
+    Muell. Neu schreiben ist billiger als herauszufinden, welcher Fall vorliegt.
+    """
+    apply_pool_layout(tables, pool_layout_tensors(tables, hot_slot_of, host_row))
+
+
+class SyncReport(msgspec.Struct, frozen=True):
+    """What ``sync_tables`` left behind: LRU rows that own an expert, and the
+    twin rows it freed so that every expert has exactly one owner."""
+
+    owned: int
+    twins_freed: int
+
+
+def sync_tables(
+    tables: PoolTables, lru_holds: Dict[int, int], keep_unwritten: bool = False
+) -> SyncReport:
+    """After an EAGER forward rewrote the LRU rows (run_waves' fetches): the
+    device tables take the host's truth. ``lru_holds`` = row -> expert for the
+    rows the eager pass wrote (``_fetch`` records EVERY row it writes, so a row
+    absent from it was not touched). Staging rows are never owned. Residents
+    [0, lru_start) are untouched.
+
+    ``keep_unwritten=False`` (the old form): every LRU row the eager pass did
+    not write becomes free (-1) -- the decode working set is dropped at every
+    extend and every eager verify.
+
+    ``keep_unwritten=True`` (FLLIPER_OPT_MOE_POOL_KEEP_LRU): a row the eager
+    pass did not write keeps its expert and its ``row_use``; its bytes did not
+    change, so the mapping is still true.
+
+    ONE OWNER PER EXPERT, in both forms (Blocker #104, fnFL2x44-x50). The step
+    lives on ``row_key[r] == e`` iff ``hot_phys[e] == r`` over the LRU rows. A
+    token-major eager forward fetches every wave's spill experts into the rows
+    [R, R + n_wave) in sorted order, so an expert routed in two waves lands in
+    two DIFFERENT rows, and a row a later, smaller wave does not reach keeps
+    its earlier expert: ``lru_holds`` then names the same expert twice (D TP0,
+    x50: 8-9 waves per extend layer). Under keep, a kept row may also still
+    hold an expert the eager pass wrote into a new row. Every such row carries
+    the expert's bytes, but evicting the row ``hot_phys`` does not point at
+    clears ``hot_phys[e]`` in the very step that hits ``e`` in the other row,
+    and ``e`` is routed to -1 -- the marlin MoE runs without an expert map
+    here, so a -1 block reads the expert BEFORE the bank: the first graph
+    verify after every multi-wave extend. An eager verify (one wave, no twin)
+    healed it, which is what FLLIPER_SPEC_EAGER_VERIFY=first bought. The last
+    row the holds name for an expert owns it; every other row is freed."""
+    import torch
+
+    E, lo, hi = tables.num_experts, tables.lru_start, tables.pool_rows
+    hot = tables.hot_phys.cpu()
+    key = tables.row_key.cpu()
+    use = tables.row_use.cpu()
+    host_row = tables.host_row.cpu()
+    pf_row = tables.pf_row.cpu()
+    clock = int(tables.clock[0])
+    rows = int(key.shape[0])
+    written = {r for r in lru_holds if lo <= r < rows}
+    off = seat_off_range(tables)
+    for r in range(lo, rows):
+        # staging rows are never owned; a written LRU row loses its old expert;
+        # without keep every LRU row is cleared
+        if keep_unwritten and r < hi and r not in written:
+            continue
+        if off is not None and off[0] <= r < off[1]:
+            continue  # H95c: an OFF seat row has no pages and stays OFF
+        old = int(key[r])
+        if old >= 0 and int(hot[old]) == r:
+            hot[old] = -1
+        key[r] = -1
+        pf_row[r] = -1
+    # no expert may point at a row that no longer names it
+    at = hot.long()
+    dangling = (at >= lo) & (at < rows)
+    dangling &= key[at.clamp(0, rows - 1)].long() != torch.arange(E)
+    hot[dangling] = -1
+    twins = 0
+    for r, e in lru_holds.items():
+        if not (lo <= r < hi and 0 <= e < E and int(host_row[e]) >= 0):
+            continue
+        if off is not None and off[0] <= r < off[1]:
+            continue
+        twin = int(hot[e])
+        if twin >= lo and twin != r:
+            # e is in a kept row or was written twice: one owner only
+            key[twin] = -1
+            pf_row[twin] = -1
+            twins += 1
+        hot[e] = r
+        key[r] = e
+        use[r] = clock
+    dev = tables.hot_phys.device
+    tables.hot_phys.copy_(hot.to(dev))
+    tables.row_key.copy_(key.to(dev))
+    tables.row_use.copy_(use.to(dev))
+    # The eager pass rewrote these rows behind the prefetch's back: every
+    # prefetch mark on them is stale and would count a later hit as a
+    # prefetch hit it never was.
+    tables.pf_row.copy_(pf_row.to(dev))
+    if off is None:
+        owned = int((key[lo:hi] >= 0).sum())
+    else:
+        owned = int(((key[lo:hi] >= 0) & (key[lo:hi] < E)).sum())
+    return SyncReport(owned=owned, twins_freed=twins)
+
+
+def seed_lru_rows(tables: PoolTables, experts: Sequence[int],
+                  limit: int = 0) -> List[Tuple[int, int]]:
+    """fnFL2 H29b: hand FREE LRU rows to ``experts`` (most wanted first) and
+    return the ``(host_row, bank_row)`` pairs whose bytes the caller must copy
+    BEFORE the next step reads the tables.
+
+    Only rows that own no expert are taken (after ``reinit_pool_tables`` that
+    is the whole LRU region); a resident expert (``host_row == -1``), an
+    expert that already owns a row, an id outside ``[0, E)`` and a repeat are
+    skipped. ``limit`` > 0 caps the pairs. Each taken row is stamped with the
+    current clock, like a row the last step used, so the next step's victim
+    choice treats it as the freshest working set. The bijection
+    ``row_key[r] == e`` iff ``hot_phys[e] == r`` holds by construction.
+    One host read and one write-back of three tables; call it outside any
+    capture and before the next replay."""
+    E, lo, hi = tables.num_experts, tables.lru_start, tables.pool_rows
+    hot = tables.hot_phys.cpu()
+    key = tables.row_key.cpu()
+    use = tables.row_use.cpu()
+    host_row = tables.host_row.cpu()
+    clock = int(tables.clock[0])
+    free = [r for r in range(lo, hi) if int(key[r]) < 0]
+    pairs: List[Tuple[int, int]] = []
+    seen = set()
+    for e in experts:
+        e = int(e)
+        if limit > 0 and len(pairs) >= limit:
+            break
+        if not free:
+            break
+        if e in seen or not 0 <= e < E:
+            continue
+        seen.add(e)
+        if int(host_row[e]) < 0 or int(hot[e]) >= 0:
+            continue
+        r = free.pop(0)
+        hot[e] = r
+        key[r] = e
+        use[r] = clock
+        pairs.append((int(host_row[e]), r))
+    if pairs:
+        dev = tables.hot_phys.device
+        tables.hot_phys.copy_(hot.to(dev))
+        tables.row_key.copy_(key.to(dev))
+        tables.row_use.copy_(use.to(dev))
+    return pairs
+
+
+def bijection_breaks(tables: PoolTables) -> int:
+    """LRU rows that break ``row_key[r] == e`` iff ``hot_phys[e] == r``: a row
+    naming an expert whose ``hot_phys`` points elsewhere, or an expert pointing
+    at an LRU row that names someone else. 0 is the only state the step is
+    written for (#104 census field ``pool.bijection_breaks``). One host read."""
+    lo, hi = tables.lru_start, tables.pool_rows
+    hot = tables.hot_phys.tolist()
+    key = tables.row_key.tolist()
+    E = len(hot)
+    breaks = sum(1 for r in range(lo, hi) if 0 <= key[r] < E and hot[key[r]] != r)
+    breaks += sum(1 for e, r in enumerate(hot) if lo <= r < hi and key[r] != e)
+    return breaks
+
+
+def check_pool_error(tables: PoolTables, where: str = "") -> None:
+    """Raise if a step set the sticky device error: an id outside [0, E) or a
+    miss that found neither an LRU victim nor a staging row -- either means a
+    routed expert did not reach the row it was computed from."""
+    if int(tables.error[0]) != 0:
+        raise RuntimeError(
+            f"MoE expert pool: sticky device error set{(' at ' + where) if where else ''} "
+            "(an id outside [0, E) or a miss with neither an LRU victim nor a "
+            "staging row); the routed output cannot be trusted"
+        )
+
+
+def take_report(tables: PoolTables) -> Tuple[int, int]:
+    """(forwards, misses) since the last report; both reset. One host read."""
+    f, m = int(tables.forwards[0]), int(tables.misses_total[0])
+    tables.forwards.fill_(0)
+    tables.misses_total.fill_(0)
+    return f, m
+
+
+def take_prefetch_report(tables: PoolTables) -> Tuple[int, int, int, int]:
+    """(predicted, fetched, hits, skipped) since the last report; all reset.
+
+    ``predicted`` = distinct valid ids the next layer's router proposed,
+    ``fetched`` = rows the prefetch actually copied in, ``hits`` = fetched rows
+    the target layer's next real step genuinely needed, ``skipped`` = predicted
+    misses that found no evictable LRU row. ``fetched - hits`` is the wasted
+    prefetch. One host read."""
+    v = [int(x) for x in tables.pf_counts.tolist()]
+    tables.pf_counts.zero_()
+    return v[0], v[1], v[2], v[3]
+
+
+def take_demand_report(tables: PoolTables) -> Optional[Tuple[int, int, int]]:
+    """H95 probe: (max distinct non-resident ids of one step, steps whose
+    count exceeded LRU + staging, steps) since the last report; reset. None
+    when the tables were built without the probe. One host read."""
+    if tables.demand is None:
+        return None
+    v = [int(x) for x in tables.demand.tolist()]
+    tables.demand.zero_()
+    return v[0], v[1], v[2]
+
+
+def step_reference(
+    tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False,
+    spill: bool = False, wave: bool = False, waves: int = 1, capture_rows_on: int = 0,
+) -> Tuple[List[Tuple[int, int]], Any]:
+    """Plan and flip one step on the host (torch, synchronizing).
+
+    Returns (gathers, step_map): gathers = (host row, bank row) in copy order,
+    promotions first, then staged misses. Distinct valid ids in first
+    occurrence order; hits in the LRU region are stamped with the clock; each
+    miss takes the LRU row with the smallest (row_use, row) among rows not
+    used this step, a FREE row (key -1, use -1) before any occupied one;
+    without a victim it is staged for this step only. Residents never move.
+
+    ``prefetch=True`` is the speculative pass described in the module
+    docstring: same victim rule and same promotion writes, but it does not
+    advance the clock, does not stamp hits (a prediction is not a use), does
+    not count misses, never stages (a predicted miss with no victim is simply
+    dropped -- the real step will stage it), and writes neither ``routes`` nor
+    ``step_map``. It marks every row it fills in ``pf_row`` with the current
+    clock; the next real step, which advances the clock by one, counts a hit on
+    a row whose ``pf_row`` is ``clock - 1`` as a prefetch hit.
+
+    H95 (module docstring, OVERFLOW WAVES): ``spill=True`` -- a miss with
+    neither a victim nor a staging row keeps route -1 WITHOUT the sticky
+    error (the caller's next wave serves its lanes); ``wave=True`` -- a later
+    wave of the same batch: the clock advances, ``forwards`` does not, the
+    promote interval does not throttle it, and the demand probe does not
+    count it; ``waves`` -- how many waves the caller runs for this batch, the
+    capture-time bound becomes ``min(ids, E - R) <= waves x (LRU + staging)``.
+    With the defaults the step is byte-identical to the one before H95."""
+    import torch
+
+    E = tables.num_experts
+    hot = tables.hot_phys.tolist()
+    host_row = tables.host_row.tolist()
+    row_key = tables.row_key.tolist()
+    row_use = tables.row_use.tolist()
+    staging_rows = tables.staging_rows.tolist()
+    gate = bool(int(tables.gate[0]))
+    raw = [int(v) for v in ids.reshape(-1).tolist()]
+    if len(raw) > buffers.gather_src.shape[0]:
+        raise ValueError("Step ids exceed the plan width")
+    if step_row_demand(len(raw), E, resident_count(tables)) > max(1, int(waves)) * (
+        pool_row_capacity(tables, capture_rows_on)
+    ):
+        # Overflow-impossible bound (Task #40): a miss takes an LRU victim
+        # (rows not used this step) or a staging row; hits protect at most
+        # `len(raw)` LRU rows, so victims + staging >= lru + staging - hits
+        # >= misses whenever len(raw) <= lru + staging. H95: every wave serves
+        # min(D_k, lru + staging) distinct experts, so `waves` of them serve
+        # waves x (lru + staging).
+        raise ValueError("Step ids exceed the LRU rows plus the staging rows")
+    error = bool(int(tables.error[0]))
+    selected: List[int] = []
+    for v in raw:
+        if v == -1:
+            continue
+        if not 0 <= v < E:
+            error = True
+            continue
+        if v not in selected:
+            selected.append(v)
+    clock = int(tables.clock[0])
+    forwards = int(tables.forwards[0])
+    pf_row = tables.pf_row.tolist()
+    pf_counts = [int(v) for v in tables.pf_counts.tolist()]
+    demand = None
+    if tables.demand is not None and not prefetch and not wave:
+        # H95 probe: distinct ids that are not FIXED residents -- what the
+        # rows above the residents have to hold in this step (LRU hits too).
+        nonres = sum(1 for e in selected if not 0 <= hot[e] < tables.lru_start)
+        cap = pool_row_capacity(tables)
+        demand = [int(v) for v in tables.demand.tolist()]
+        demand[0] = max(demand[0], nonres)
+        demand[1] += 1 if nonres > cap else 0
+        demand[2] += 1
+    if gate and not prefetch:
+        clock += 1
+        if not wave:
+            forwards += 1
+        for e in selected:
+            r = hot[e]
+            if r >= tables.lru_start:
+                if pf_row[r] == clock - 1:
+                    pf_counts[2] += 1
+                row_use[r] = clock
+    if prefetch:
+        pf_counts[0] += len(selected)
+    limit = int(tables.promote_limit[0])
+    interval = int(tables.promote_interval[0])
+    min_misses = int(tables.promote_min_misses[0])
+    protect = int(tables.protect_recent[0])
+    miss_count = tables.miss_count.tolist()
+    # The prefetch is not throttled by the promote interval / min-miss ramp:
+    # those damp thrash between real forwards, and a speculative pass that
+    # waited for them would never fetch anything.
+    promote_ok = gate if (prefetch or wave) else (gate and (forwards - 1) % interval == 0)
+    gathers: List[Tuple[int, int]] = []
+    staged: List[Tuple[int, int]] = []
+    for e in selected:
+        if hot[e] >= 0:
+            continue
+        if gate and not prefetch:
+            miss_count[e] += 1
+        victim = -1
+        if promote_ok and (limit == 0 or len(gathers) < limit) and (
+            prefetch or miss_count[e] >= min_misses
+        ):
+            best = None
+            for r in range(tables.lru_start, tables.pool_rows):
+                if row_key[r] < 0:
+                    cand = (-1, r)
+                elif row_use[r] < clock and (protect == 0 or row_use[r] < clock - protect):
+                    cand = (row_use[r], r)
+                else:
+                    continue
+                if best is None or cand < best:
+                    best = cand
+            if best is not None:
+                victim = best[1]
+        if victim < 0:
+            if prefetch:
+                # No evictable row: drop the prediction. The real step will
+                # take this expert as an ordinary miss and stage it.
+                pf_counts[3] += 1
+                continue
+            if len(staged) >= len(staging_rows):
+                # Cannot happen under the bound above (protect_recent=0); with
+                # protect_recent it can, and the sticky error says so instead
+                # of routing the expert to a row it never reached. H95: under
+                # ``spill`` the next wave serves it -- route -1, no error.
+                if not spill:
+                    error = True
+                continue
+            staged.append((e, staging_rows[len(staged)]))
+            continue
+        old = row_key[victim]
+        # #104: only the row that OWNS ``old`` unmaps it. A stale twin (a row
+        # still naming ``old`` while ``hot_phys[old]`` points at another row)
+        # must not route ``old`` to -1 when it is evicted.
+        if old >= 0 and hot[old] == victim:
+            hot[old] = -1
+        hot[e] = victim
+        row_key[victim] = e
+        row_use[victim] = clock
+        miss_count[e] = 0
+        if prefetch:
+            pf_row[victim] = clock
+            pf_counts[1] += 1
+        gathers.append((host_row[e], victim))
+    step_map = list(hot)
+    for e, row in staged:
+        step_map[e] = row
+    routes = [-1] * buffers.routes.shape[0]
+    for i, v in enumerate(raw):
+        if 0 <= v < E:
+            routes[i] = step_map[v]
+    dev = tables.hot_phys.device
+
+    def write(t, values, dtype):
+        t.copy_(torch.tensor(values, dtype=dtype, device=dev))
+
+    write(tables.hot_phys, hot, torch.int32)
+    write(tables.row_key, row_key, torch.int32)
+    write(tables.row_use, row_use, torch.int64)
+    tables.clock.fill_(clock)
+    tables.forwards.fill_(forwards)
+    write(tables.miss_count, miss_count, torch.int32)
+    write(tables.pf_row, pf_row, torch.int64)
+    write(tables.pf_counts, pf_counts, torch.int64)
+    if demand is not None:
+        write(tables.demand, demand, torch.int64)
+    tables.error.fill_(1 if error else 0)
+    pairs = gathers + [(host_row[e], row) for e, row in staged]
+    buffers.gather_count.fill_(len(pairs))
+    if not prefetch:
+        tables.misses_total.add_(len(pairs))
+    buffers.promoted_count.fill_(len(gathers))
+    buffers.staged_count.fill_(len(staged))
+    for i, (s, d) in enumerate(pairs):
+        buffers.gather_src[i], buffers.gather_dst[i] = s, d
+    for i, (e, row) in enumerate(staged):
+        buffers.staged_expert[i], buffers.staged_row[i] = e, row
+    if prefetch:
+        # The speculative pass routes nothing: it has no compute of its own,
+        # and the target layer's real step publishes step_map/routes.
+        return pairs, buffers.step_map
+    write(buffers.step_map, step_map, torch.int32)
+    write(buffers.routes, routes, torch.int32)
+    return pairs, buffers.step_map
+
+
+def step(tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False,
+         spill: bool = False, wave: bool = False, waves: int = 1,
+         capture_rows_on: int = 0) -> None:
+    """Plan and flip one step: Triton on CUDA, the reference elsewhere.
+
+    ``prefetch=True`` runs the speculative pass (module docstring); it needs
+    its OWN ``buffers``, because its gather list must survive on the side
+    stream until the copy is done while the target layer's real step writes
+    the layer's normal buffers. ``spill``/``wave``/``waves``: H95 overflow
+    waves (``step_reference``); the defaults are the step before H95.
+    ``capture_rows_on``: #251c, the bound of a captured step
+    (:func:`pool_row_capacity`)."""
+    if tables.hot_phys.device.type != "cuda":
+        step_reference(tables, ids, buffers, prefetch=prefetch, spill=spill,
+                       wave=wave, waves=waves, capture_rows_on=capture_rows_on)
+        return
+    flat = ids.reshape(-1)
+    if not flat.is_contiguous():
+        flat = flat.contiguous()
+    width = buffers.gather_src.shape[0]
+    if flat.numel() > width:
+        raise ValueError("Step ids exceed the plan width")
+    if step_row_demand(flat.numel(), tables.num_experts, resident_count(tables)) > max(
+        1, int(waves)
+    ) * pool_row_capacity(tables, capture_rows_on):
+        raise ValueError("Step ids exceed the LRU rows plus the staging rows")
+    _launch_step_kernel(tables, flat, buffers, prefetch=prefetch, spill=spill, wave=wave)
+
+
+def _launch_step_kernel(tables: PoolTables, flat, buffers: StepBuffers,
+                        prefetch: bool = False, spill: bool = False,
+                        wave: bool = False) -> None:
+    """The Triton launch of one step (no host checks; ``step`` makes them).
+    H95: ``DEMAND`` counts only a real first-wave step, and the demand
+    pointer is a live int64 word of the tables when the probe is off (the
+    constexpr drops every access to it)."""
+    demand = tables.demand
+    probe = demand is not None and not prefetch and not wave
+    _step_kernel()[(1,)](
+        flat, flat.numel(),
+        tables.hot_phys, tables.host_row, tables.row_key, tables.row_use,
+        tables.clock, tables.gate, tables.error, tables.promote_limit,
+        tables.promote_interval, tables.forwards, tables.promote_min_misses,
+        tables.protect_recent, tables.miss_count, tables.staging_rows,
+        tables.misses_total, tables.pf_row, tables.pf_counts,
+        demand if demand is not None else tables.misses_total,
+        buffers.gather_src, buffers.gather_dst, buffers.gather_count,
+        buffers.routes, buffers.staged_expert, buffers.staged_row,
+        buffers.staged_count, buffers.promoted_count, buffers.step_map,
+        tables.num_experts, tables.pool_rows, tables.lru_start,
+        int(tables.staging_rows.shape[0]),
+        WIDTH=buffers.gather_src.shape[0], BLOCK_R=_next_power_of_two(tables.pool_rows),
+        MAP_BLOCK=1024, PREFETCH=bool(prefetch), DEMAND=bool(probe),
+        SPILL=bool(spill), WAVE=bool(wave), num_warps=8,
+    )
+
+
+def _next_power_of_two(value: int) -> int:
+    return 1 << max(int(value) - 1, 0).bit_length()
+
+
+_KERNELS: Dict[str, Any] = {}
+
+
+def _step_kernel():
+    if "step" in _KERNELS:
+        return _KERNELS["step"]
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def pool_step(
+        ids_ptr, n,
+        hot_phys_ptr, host_row_ptr, row_key_ptr, row_use_ptr,
+        clock_ptr, gate_ptr, error_ptr, limit_ptr, interval_ptr, forwards_ptr,
+        min_misses_ptr, protect_ptr, miss_count_ptr, staging_ptr, misses_total_ptr,
+        pf_row_ptr, pf_counts_ptr, demand_ptr,
+        gather_src_ptr, gather_dst_ptr, gather_count_ptr, routes_ptr,
+        staged_expert_ptr, staged_row_ptr, staged_count_ptr, promoted_count_ptr,
+        step_map_ptr, num_experts, pool_rows, lru_start, n_staging,
+        WIDTH: tl.constexpr, BLOCK_R: tl.constexpr, MAP_BLOCK: tl.constexpr,
+        PREFETCH: tl.constexpr, DEMAND: tl.constexpr, SPILL: tl.constexpr,
+        WAVE: tl.constexpr,
+    ):
+        never = 0x7FFFFFFFFFFFFFFF
+        lane = tl.arange(0, WIDTH)
+        present = lane < n
+        raw = tl.load(ids_ptr + lane, mask=present, other=-1).to(tl.int64)
+        valid = present & (raw >= 0) & (raw < num_experts)
+        bad = present & (raw != -1) & (~valid)
+        if tl.sum(bad.to(tl.int32), 0) > 0:
+            tl.store(error_ptr, 1)
+        safe = tl.where(valid, raw, 0)
+        same = safe[:, None] == safe[None, :]
+        earlier = lane[None, :] < lane[:, None]
+        duplicate = tl.sum((same & earlier & valid[None, :]).to(tl.int32), 1) > 0
+        distinct = valid & (duplicate == 0)
+        resident = tl.load(hot_phys_ptr + safe, mask=distinct, other=-1).to(tl.int64)
+        hit = distinct & (resident >= 0)
+        gate = tl.load(gate_ptr) != 0
+        clock = tl.load(clock_ptr)
+        forwards = tl.load(forwards_ptr)
+        if DEMAND:
+            # H95 probe: distinct ids that are not FIXED residents -- the rows
+            # above the residents this step needs (LRU hits included).
+            fixed = hit & (resident < lru_start)
+            nonres = tl.sum((distinct & (~fixed)).to(tl.int32), 0).to(tl.int64)
+            tl.store(demand_ptr, tl.maximum(tl.load(demand_ptr), nonres))
+            over = nonres > (pool_rows - lru_start + n_staging)
+            tl.store(demand_ptr + 1, tl.load(demand_ptr + 1) + over.to(tl.int64))
+            tl.store(demand_ptr + 2, tl.load(demand_ptr + 2) + 1)
+        if PREFETCH:
+            # The speculative pass leaves the clock where it is: that is what
+            # protects the target layer's last real working set from being
+            # evicted by a prediction, and what un-protects a mispredicted row
+            # as soon as the real step advances the clock.
+            tl.store(
+                pf_counts_ptr,
+                tl.load(pf_counts_ptr) + tl.sum(distinct.to(tl.int32), 0).to(tl.int64),
+            )
+        else:
+            if gate:
+                clock = clock + 1
+                tl.store(clock_ptr, clock)
+                if WAVE == 0:
+                    forwards = forwards + 1
+                    tl.store(forwards_ptr, forwards)
+                stamp = hit & (resident >= lru_start)
+                marked = tl.load(
+                    pf_row_ptr + tl.where(stamp, resident, 0), mask=stamp, other=-1
+                )
+                pf_hits = tl.sum((stamp & (marked == clock - 1)).to(tl.int32), 0)
+                tl.store(
+                    pf_counts_ptr + 2,
+                    tl.load(pf_counts_ptr + 2) + pf_hits.to(tl.int64),
+                )
+                tl.store(row_use_ptr + tl.where(stamp, resident, 0), clock, mask=stamp)
+        limit = tl.load(limit_ptr)
+        interval = tl.load(interval_ptr)
+        min_misses = tl.load(min_misses_ptr)
+        protect = tl.load(protect_ptr).to(tl.int64)
+        if PREFETCH:
+            promote_ok = gate
+        elif WAVE:
+            # H95: a later wave of the same batch is not a forward of its own
+            promote_ok = gate
+        else:
+            promote_ok = gate & (((forwards - 1) % interval) == 0)
+        tl.debug_barrier()
+        offs_r = tl.arange(0, BLOCK_R)
+        in_lru = (offs_r >= lru_start) & (offs_r < pool_rows)
+        misses = tl.sum((distinct & (~hit)).to(tl.int32), 0)
+        scan = promote_ok & (misses > 0)
+        use = tl.full((BLOCK_R,), never, tl.int64)
+        if scan:
+            use = tl.load(row_use_ptr + offs_r, mask=in_lru, other=never)
+            key = tl.load(row_key_ptr + offs_r, mask=in_lru, other=0)
+            occupied = in_lru & (key >= 0)
+            # a used-this-step row (stamped with clock) is never a victim
+            use = tl.where(occupied & (use >= clock), never, use)
+            if protect > 0:
+                use = tl.where(occupied & (use >= clock - protect), never, use)
+            # a free row goes first
+            use = tl.where(in_lru & (key < 0), -1, use)
+        promoted = 0
+        staged = 0
+        if WAVE:
+            # H95: a wave that routes no miss (the usual later wave) skips
+            # the per-lane loop instead of paying WIDTH serial iterations
+            n_loop = tl.where(misses > 0, WIDTH, 0)
+        else:
+            n_loop = WIDTH
+        for i in range(0, n_loop):
+            is_miss = tl.sum(tl.where(lane == i, (distinct & (~hit)).to(tl.int32), 0), 0)
+            if is_miss > 0:
+                # From the registers, never a second load: the ids buffer is
+                # read exactly once (``raw`` above), so a writer racing this
+                # kernel can at worst mis-route, never index the tables with
+                # a value ``valid`` did not screen.
+                expert = tl.sum(tl.where(lane == i, safe, 0), 0)
+                victim_row = tl.full((), -1, tl.int64)
+                misses_so_far = tl.load(miss_count_ptr + expert)
+                if not PREFETCH:
+                    if gate:
+                        misses_so_far = misses_so_far + 1
+                        tl.store(miss_count_ptr + expert, misses_so_far)
+                room = promote_ok & ((limit == 0) | (promoted < limit))
+                if PREFETCH:
+                    may_promote = room
+                else:
+                    may_promote = room & (misses_so_far >= min_misses)
+                if may_promote:
+                    best = tl.min(use, 0)
+                    if best != never:
+                        victim_row = tl.min(tl.where(use == best, offs_r.to(tl.int64), never), 0)
+                src = tl.load(host_row_ptr + expert)
+                if victim_row >= 0:
+                    old = tl.load(row_key_ptr + victim_row).to(tl.int64)
+                    if old >= 0:
+                        # #104: a stale twin never unmaps the owner's row
+                        owner = tl.load(hot_phys_ptr + old).to(tl.int64)
+                        if owner == victim_row:
+                            tl.store(hot_phys_ptr + old, -1)
+                    tl.store(hot_phys_ptr + expert, victim_row.to(tl.int32))
+                    tl.store(row_key_ptr + victim_row, expert.to(tl.int32))
+                    tl.store(row_use_ptr + victim_row, clock)
+                    tl.store(miss_count_ptr + expert, 0)
+                    if PREFETCH:
+                        tl.store(pf_row_ptr + victim_row, clock)
+                    tl.store(gather_src_ptr + promoted, src)
+                    tl.store(gather_dst_ptr + promoted, victim_row.to(tl.int32))
+                    use = tl.where(offs_r.to(tl.int64) == victim_row, never, use)
+                    promoted += 1
+                else:
+                    if PREFETCH:
+                        # no evictable row: drop it, the real step will stage it
+                        tl.store(pf_counts_ptr + 3, tl.load(pf_counts_ptr + 3) + 1)
+                    else:
+                        if staged < n_staging:
+                            tl.store(staged_expert_ptr + staged, expert.to(tl.int32))
+                            tl.store(staged_row_ptr + staged, tl.load(staging_ptr + staged))
+                            staged += 1
+                        else:
+                            # no victim and no staging row left: never write
+                            # past the staging table; the sticky error is
+                            # read at the next host rendezvous. H95: under
+                            # SPILL the lane keeps route -1 and the caller's
+                            # next wave serves it.
+                            if SPILL == 0:
+                                tl.store(error_ptr, 1)
+            tl.debug_barrier()
+        tl.store(promoted_count_ptr, promoted)
+        if PREFETCH:
+            # The speculative pass never stages and has no compute to route:
+            # it leaves step_map/routes/misses_total to the real step.
+            tl.store(staged_count_ptr, 0)
+            tl.store(gather_count_ptr, promoted)
+            tl.store(pf_counts_ptr + 1, tl.load(pf_counts_ptr + 1) + promoted.to(tl.int64))
+        else:
+            tl.store(staged_count_ptr, staged)
+            tl.store(gather_count_ptr, promoted + staged)
+            tl.store(misses_total_ptr, tl.load(misses_total_ptr) + (promoted + staged).to(tl.int64))
+            tl.debug_barrier()
+            for i in range(0, staged):
+                e = tl.load(staged_expert_ptr + i)
+                tl.store(gather_src_ptr + promoted + i, tl.load(host_row_ptr + e))
+                tl.store(gather_dst_ptr + promoted + i, tl.load(staged_row_ptr + i))
+            for start in range(0, num_experts, MAP_BLOCK):
+                offs = start + tl.arange(0, MAP_BLOCK)
+                in_range = offs < num_experts
+                rows = tl.load(hot_phys_ptr + offs, mask=in_range, other=-1)
+                tl.store(step_map_ptr + offs, rows, mask=in_range)
+            tl.debug_barrier()
+            for i in range(0, staged):
+                e = tl.load(staged_expert_ptr + i)
+                tl.store(step_map_ptr + e, tl.load(staged_row_ptr + i))
+            tl.debug_barrier()
+            route = tl.load(step_map_ptr + safe, mask=valid, other=-1)
+            tl.store(routes_ptr + lane, tl.where(valid, route, -1), mask=lane < WIDTH)
+
+    _KERNELS["step"] = pool_step
+    return pool_step
+
+
+# ---- row copies ------------------------------------------------------------
+def copy_rows_reference(sources, destinations, pairs) -> None:
+    for s, d in pairs:
+        for src, dst in zip(sources, destinations):
+            dst[d].copy_(src[s])
+
+
+def _word_rows(tensor):
+    """The bank as ``[rows, words]`` for the copy kernel: int32 words whenever
+    a row is a multiple of 4 bytes (every expert tensor before H68b -- the
+    launch is byte-identical to before), else the widest word that divides it.
+    H68b: the NVFP4 Marlin global scales are ``[E, 1]`` bf16, 2 bytes a row;
+    ``view(torch.int32)`` refuses that, and the pool step would die at the
+    first captured decode on exactly the tensors the kernel indexes by slot."""
+    import torch
+
+    if not tensor.is_contiguous():
+        raise ValueError("pool copies require contiguous rows")
+    rows = tensor.view(torch.uint8).reshape(tensor.shape[0], -1)
+    row_bytes = rows.shape[1]
+    if row_bytes % 4 == 0:
+        return rows.view(torch.int32)
+    if row_bytes % 2 == 0:
+        return rows.view(torch.int16)
+    return rows
+
+
+def copy_rows(sources, destinations, src_rows, dst_rows, count) -> None:
+    """Copy ``count`` (src, dst) row pairs of every tensor; ``count`` is a
+    device scalar read by a fixed small grid (one launch per tensor), so an
+    empty step costs a few programs and nothing synchronizes."""
+    if destinations[0].device.type != "cuda":
+        n = int(count.reshape(-1)[0].item())
+        pairs = [(int(src_rows[i]), int(dst_rows[i])) for i in range(n)]
+        copy_rows_reference(sources, destinations, pairs)
+        return
+    kern = _copy_kernel()
+    for src, dst in zip(sources, destinations):
+        s, d = _word_rows(src), _word_rows(dst)
+        if s.shape[1] != d.shape[1]:
+            raise ValueError("pool copy: row size differs between source and bank")
+        kern[(COPY_PROGRAMS,)](
+            s, d, src_rows, dst_rows, count, d.shape[1], s.stride(0), d.stride(0),
+            PROGRAMS=COPY_PROGRAMS, BLOCK=COPY_WORDS, num_warps=4,
+        )
+
+
+def _copy_kernel():
+    if "copy" in _KERNELS:
+        return _KERNELS["copy"]
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def pool_copy(src, dst, src_rows_ptr, dst_rows_ptr, count_ptr, words, sstride, dstride,
+                  PROGRAMS: tl.constexpr, BLOCK: tl.constexpr):
+        stripe = tl.program_id(0)
+        count = tl.load(count_ptr)
+        for lane in range(0, count):
+            src_row = tl.load(src_rows_ptr + lane).to(tl.int64)
+            dst_row = tl.load(dst_rows_ptr + lane).to(tl.int64)
+            src_base = src + src_row * sstride
+            dst_base = dst + dst_row * dstride
+            for start in range(stripe * BLOCK, words, PROGRAMS * BLOCK):
+                offsets = start + tl.arange(0, BLOCK)
+                mask = offsets < words
+                tl.store(dst_base + offsets, tl.load(src_base + offsets, mask=mask), mask=mask)
+
+    _KERNELS["copy"] = pool_copy
+    return pool_copy
+
+
+__all__ = [
+    "PLAN_WIDTH", "ROW_USE_NEVER", "PoolTables", "StepBuffers", "SyncReport",
+    "allocate_pool_tables", "allocate_step_buffers", "copy_rows",
+    "plan_width_for", "pool_max_step_ids", "step_row_demand",
+    "bijection_breaks", "copy_rows_reference", "seed_lru_rows", "step", "step_reference", "sync_tables",
+    "take_report",
+    "take_prefetch_report",
+    "take_demand_report",
+    "pool_row_capacity",
+    "pool_waves_for",
+    "check_pool_error",
+]

@@ -29,9 +29,9 @@ opening genuinely does. Unfixed, the pipeline routes that turn as English.
 
 import unittest
 
-from sglang.srt.translator.asr_backends import constrained_language_choice
-from sglang.srt.translator.backends import Transcript
-from sglang.srt.translator.session import run_conversation
+from flliper.srt.translator.asr_backends import constrained_language_choice
+from flliper.srt.translator.backends import Transcript
+from flliper.srt.translator.session import run_conversation
 from test_session import (  # noqa: E402  - sibling helper module
     VOICE_A_HZ,
     conversation_audio,

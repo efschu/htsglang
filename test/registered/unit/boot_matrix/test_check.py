@@ -12,11 +12,11 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.boot_matrix.arms import Arm, arm_by_name
-from sglang.srt.boot_matrix.check import FAIL, PASS, STOP, _scan_fatals, check_arm
-from sglang.srt.boot_matrix.effective import READY_MARKER
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.boot_matrix.arms import Arm, arm_by_name
+from flliper.srt.boot_matrix.check import FAIL, PASS, STOP, _scan_fatals, check_arm
+from flliper.srt.boot_matrix.effective import READY_MARKER
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -251,7 +251,7 @@ class TestRejectArm(CustomTestCase):
             log = (
                 _args_dump()
                 + "\n[2026-08-01 07:23:08] Ignore import error when loading "
-                "sglang.srt.multimodal.processors.mimo_audio: Could not load "
+                "flliper.srt.multimodal.processors.mimo_audio: Could not load "
                 "libtorchcodec. Likely causes:\n"
                 "        The following exceptions were raised as we tried to "
                 "load libtorchcodec:\n"
@@ -283,7 +283,7 @@ class TestRejectArm(CustomTestCase):
             log = (
                 _args_dump()
                 + "\n[2026-08-01 07:23:08] Ignore import error when loading "
-                "sglang.srt.multimodal.processors.mimo_audio: nope\n"
+                "flliper.srt.multimodal.processors.mimo_audio: nope\n"
                 "Traceback (most recent call last):\n"
                 "[2026-08-01 07:23:10] Load weight begin.\n"
                 + READY_MARKER

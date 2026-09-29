@@ -20,20 +20,20 @@ gate is cleared; what is missing is a card window.
 
 Three boots. The recipe is the one `2026-08-02_439_arm3` used — DSV4-Flash GGUF,
 uneven TP=3, eager offload path (`--disable-cuda-graph`, the shipped path per
-#452), `SGLANG_EXPERT_STATS=1`, `RESERVE_MIB=auto`, barlink transport per the
+#452), `FLLIPER_EXPERT_STATS=1`, `RESERVE_MIB=auto`, barlink transport per the
 standing default.
 
 | # | arm | added env | what it establishes |
 |---|---|---|---|
 | 0 | `floor` | none (baseline boot) | **A-vs-A floor, taken first.** 3 x 450-token generations inside this one boot, same prompt, before any delta is quoted. |
 | 1 | `static` | none | control: the shipped static residency, hit rate + decode + H2D. This is arm 0's boot continued, not a separate one. |
-| 2 | `heat` | `SGLANG_MOE_HEAT_MIGRATION=1` | the treatment. Same recipe, same prompts, same order. |
+| 2 | `heat` | `FLLIPER_MOE_HEAT_MIGRATION=1` | the treatment. Same recipe, same prompts, same order. |
 
 Arms 0 and 1 share a boot on purpose: the floor must come from the same process
 whose numbers it is used to judge. Arm 2 is a separate boot because the feature
 is resolved once per layer at cache construction.
 
-Optional fourth boot if the window has room: `SGLANG_MOE_HOT_RESIDENCY=1`
+Optional fourth boot if the window has room: `FLLIPER_MOE_HOT_RESIDENCY=1`
 (Stage-1, one-shot freeze). It separates "re-ranking helps" from "any non-static
 choice helps", which the desk data cannot separate and which is the most
 plausible alternative explanation for a positive arm 2.
@@ -44,7 +44,7 @@ Defaults ship as `period=512`, `decay=0.5`, `hysteresis=0.25`, `min_gain=8.0`,
 `max_swaps=4`. For a first window use the defaults unchanged — a window that
 tunes and measures at the same time cannot attribute its own result. If arm 2
 records `heat_rounds > 0` but `heat_swaps == 0`, the margins are too tight for
-this workload and a second boot at `SGLANG_MOE_HEAT_MIN_GAIN=2` is the follow-up,
+this workload and a second boot at `FLLIPER_MOE_HEAT_MIN_GAIN=2` is the follow-up,
 reported as a separate arm rather than as a correction to the first.
 
 ## 3. What is read, and from where
@@ -71,7 +71,7 @@ and a hit-rate lift that lands only on the fast card moves nothing.
 * **Hit rate up, decode flat or worse.** Falsifies the *economic* claim, not the
   mechanism. Most likely cause would be the migration's own PCIe traffic or the
   two `cuda.synchronize()` calls in the round; both are measurable separately
-  (`heat_h2d_bytes`, and a boot at `SGLANG_MOE_HEAT_PERIOD=100000` which keeps
+  (`heat_h2d_bytes`, and a boot at `FLLIPER_MOE_HEAT_PERIOD=100000` which keeps
   the accounting and never migrates).
 * **Residency size moved.** Would falsify the VRAM-neutrality invariant that the
   hermetic tests pin. Read `resident_count` per layer in both dumps; they must

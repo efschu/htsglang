@@ -35,7 +35,7 @@ from typing import List
 
 import requests
 
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
 )
 
@@ -105,7 +105,7 @@ def launch_node(
     cmd = [
         sys.executable,
         "-m",
-        "sglang.launch_server",
+        "flliper.launch_server",
         "--model-path",
         model_path,
         "--tp",

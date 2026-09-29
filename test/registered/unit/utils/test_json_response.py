@@ -3,12 +3,12 @@ import unittest
 import numpy as np
 import orjson
 
-from sglang.srt.utils.json_response import (
-    SGLangORJSONResponse,
+from flliper.srt.utils.json_response import (
+    FlliperORJSONResponse,
     dumps_json,
     orjson_response,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -45,8 +45,8 @@ class TestJSONResponseUtils(unittest.TestCase):
         self.assertEqual(response.media_type, "application/json")
         self.assertIsNone(parsed["value"])
 
-    def test_sglang_orjson_response_serializes_with_shared_options(self):
-        response = SGLangORJSONResponse(content={"value": float("-inf")})
+    def test_flliper_orjson_response_serializes_with_shared_options(self):
+        response = FlliperORJSONResponse(content={"value": float("-inf")})
         parsed = orjson.loads(response.body)
 
         self.assertIsNone(parsed["value"])

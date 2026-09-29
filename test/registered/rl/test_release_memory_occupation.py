@@ -1,8 +1,8 @@
-"""Test memory release and resume operations for SGLang engine in hybrid RL training.
+"""Test memory release and resume operations for fLLiper engine in hybrid RL training.
 
-This test suite evaluates the SGLang engine's memory management capabilities, focusing
+This test suite evaluates the fLLiper engine's memory management capabilities, focusing
 on releasing and resuming memory occupation for KV cache and model weights. It simulates
-an RL workflow where the SGLang engine acts as a rollout engine for experience collection.
+an RL workflow where the fLLiper engine acts as a rollout engine for experience collection.
 The process involves initializing the engine, sending a small number of requests to simulate
 rollout, releasing memory to mimic offloading during RL training, resuming memory occupation,
 updating weights with a trained HuggingFace model, and verifying the updated weights.
@@ -33,15 +33,15 @@ import unittest
 
 from transformers import AutoModelForCausalLM
 
-import sglang as sgl
-from sglang.srt.constants import (
+import flliper as sgl
+from flliper.srt.constants import (
     GPU_MEMORY_TYPE_CUDA_GRAPH,
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import get_device
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
@@ -75,7 +75,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
     ):
         """Common setup for engine and HF model."""
 
-        os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1"
+        os.environ["FLLIPER_MEMORY_SAVER_CUDA_GRAPH"] = "1"
         engine = sgl.Engine(
             model_path=model_name,
             random_seed=42,
@@ -234,7 +234,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
                 continue
 
             print(f"Testing tp_size={tp_size} for test_multi_stage_release_and_resume")
-            os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1"
+            os.environ["FLLIPER_MEMORY_SAVER_CUDA_GRAPH"] = "1"
             engine = sgl.Engine(
                 model_path=model_name,
                 random_seed=42,

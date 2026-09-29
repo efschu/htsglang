@@ -1,4 +1,4 @@
-"""Integration test: the EPD encoder server exports sglang:encoder_* metrics."""
+"""Integration test: the EPD encoder server exports flliper:encoder_* metrics."""
 
 import unittest
 import uuid
@@ -10,11 +10,11 @@ import zmq
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
-from sglang.srt.disaggregation.encode_server import MINIMUM_PNG_PICTURE_BASE64
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.network import get_zmq_socket_on_host
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.disaggregation.encode_server import MINIMUM_PNG_PICTURE_BASE64
+from flliper.srt.utils import kill_process_tree
+from flliper.srt.utils.network import get_zmq_socket_on_host
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -86,11 +86,11 @@ class TestEncoderServerMetrics(CustomTestCase):
             self.assertEqual(metrics_response.status_code, 200)
             metrics_text = metrics_response.text
 
-            self.assertIn("sglang:encoder_requests_received_total", metrics_text)
+            self.assertIn("flliper:encoder_requests_received_total", metrics_text)
             self.assertIn(f'model_name="{_MODEL_NAME}"', metrics_text)
 
             metrics = _parse_prometheus_metrics(metrics_text)
-            received = metrics.get("sglang:encoder_requests_received_total", [])
+            received = metrics.get("flliper:encoder_requests_received_total", [])
             self.assertGreater(sum(s.value for s in received), 0)
         finally:
             recv_socket.close()

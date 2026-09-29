@@ -26,7 +26,7 @@ the thing that must be counted. Pure state machine, no scheduler, no CUDA.
 
 import unittest
 
-from sglang.srt.managers.kv_session_offload import (
+from flliper.srt.managers.kv_session_offload import (
     DEFAULT_RESTORE_DEFER_LIMIT,
     RestoreHysteresis,
 )
@@ -149,7 +149,7 @@ class TestTheCallSiteIsWired(unittest.TestCase):
     def setUp(self):
         import inspect
 
-        from sglang.srt.managers import kv_session_offload as m
+        from flliper.srt.managers import kv_session_offload as m
 
         self.src = inspect.getsource(m.KVSessionOffloadManager._maybe_restore_flow)
 

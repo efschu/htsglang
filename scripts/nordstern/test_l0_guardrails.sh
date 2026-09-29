@@ -1,5 +1,5 @@
 #!/bin/bash
-# CPU-level tests for the L0 guardrails. NO GPU, NO model, NO sglang: the ranks
+# CPU-level tests for the L0 guardrails. NO GPU, NO model, NO flliper: the ranks
 # are fakes, so the launcher's CONTROL FLOW is what gets exercised. The boot
 # proof belongs to a GPU window; this proves the logic that must hold before one
 # is worth spending.
@@ -133,8 +133,8 @@ echo "== 7. l0_rank.sh supervises rather than execs =="
 grep -q '^exec .*launch_server' "$HERE/l0_rank.sh" \
     && bad "l0_rank.sh still execs the server (server would be reparented)" \
     || ok "l0_rank.sh does not exec the server"
-grep -q 'SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION=1' "$HERE/l0_rank.sh" \
-    && ok "SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION is set" || bad "killpg env not set"
+grep -q 'FLLIPER_KILLPG_ON_SCHEDULER_EXCEPTION=1' "$HERE/l0_rank.sh" \
+    && ok "FLLIPER_KILLPG_ON_SCHEDULER_EXCEPTION is set" || bad "killpg env not set"
 grep -q 'REPARENTED TO INIT' "$HERE/l0_rank.sh" \
     && ok "per-rank live orphan watchdog present" || bad "no per-rank orphan watchdog"
 grep -q 'setsid' "$HERE/l0_launch.sh" && \

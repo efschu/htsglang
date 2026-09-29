@@ -26,7 +26,7 @@ Hermetic: pure logic, no CUDA.
 """
 
 
-from sglang.srt.planner.gated_capability import (
+from flliper.srt.planner.gated_capability import (
     GatedCapability,
     QualityGate,
     decide_capability,

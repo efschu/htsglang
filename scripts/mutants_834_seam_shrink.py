@@ -34,8 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-RUNTIME = ROOT / "python/sglang/srt/managers/phase_flip_runtime.py"
-SPILL = ROOT / "python/sglang/srt/managers/phase_flip_spill.py"
+RUNTIME = ROOT / "python/flliper/srt/managers/phase_flip_runtime.py"
+SPILL = ROOT / "python/flliper/srt/managers/phase_flip_spill.py"
 
 SCHED_TESTS = ROOT / "test/registered/scheduler"
 MEM_TESTS = ROOT / "test/registered/unit/mem_cache"

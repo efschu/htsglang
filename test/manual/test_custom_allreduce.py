@@ -8,17 +8,17 @@ import ray
 import torch
 import torch.distributed as dist
 
-from sglang.srt.distributed import init_distributed_environment
-from sglang.srt.distributed.communication_op import (  # noqa
+from flliper.srt.distributed import init_distributed_environment
+from flliper.srt.distributed.communication_op import (  # noqa
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import (
+from flliper.srt.distributed.parallel_state import (
     get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.test_utils import CustomTestCase
 
 
 def get_open_port() -> int:

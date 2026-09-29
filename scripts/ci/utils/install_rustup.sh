@@ -1,6 +1,6 @@
 #!/bin/bash
 # Ensure a Rust toolchain (rustc/cargo) is installed for crates built from
-# source, e.g. the native gRPC extension bundled into the sglang wheel via
+# source, e.g. the native gRPC extension bundled into the flliper wheel via
 # setuptools-rust. Minimum supported version is 1.85 (edition 2024).
 set -euxo pipefail
 

@@ -4,8 +4,8 @@
 
 WHY
 ===
-The host transport (`SGLANG_BARLINK_TRANSPORT=host`, see
-python/sglang/srt/distributed/device_communicators/barlink_host.py) moves the
+The host transport (`FLLIPER_BARLINK_TRANSPORT=host`, see
+python/flliper/srt/distributed/device_communicators/barlink_host.py) moves the
 payload over ONE pinned, portable host segment and is driven entirely by two
 kernels -- no host sync, no allocation in the hot path, completion signaled
 via flags in pinned memory. On this rig the plain pinned host path measured
@@ -111,7 +111,7 @@ os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 #: 20 KiB, 80 KiB, 1 MiB, 4 MiB, 16 MiB.
 DEFAULT_SIZES = "20480,81920,1048576,4194304,16777216"
 
-#: name -> (SGLANG_BARLINK_TRANSPORT value, expected transport class). The class
+#: name -> (FLLIPER_BARLINK_TRANSPORT value, expected transport class). The class
 #: name is the probe against the silent fallback: barlink.py lets an unknown or
 #: failed transport drop to the gloo inline layer, and then you measure gloo
 #: and call it "host".
@@ -263,8 +263,8 @@ def run_rank(a: argparse.Namespace) -> int:
     print(f"# rank{rank} -> cuda:{dev_ord} {p.name} sm_{p.major}{p.minor}", flush=True)
 
     # ---------------- build the barlink communicators ----------------
-    sys.path.insert(0, a.sglang_python)
-    import sglang.srt.distributed.device_communicators.barlink as barlink_mod
+    sys.path.insert(0, a.flliper_python)
+    import flliper.srt.distributed.device_communicators.barlink as barlink_mod
 
     comms: dict[str, object] = {}
     dead: dict[str, str] = {}
@@ -278,7 +278,7 @@ def run_rank(a: argparse.Namespace) -> int:
         try:
             # In barlink.py the transport name comes from the module variable
             # `_TRANSPORT`, filled once at import time from
-            # SGLANG_BARLINK_TRANSPORT; a single process therefore cannot see
+            # FLLIPER_BARLINK_TRANSPORT; a single process therefore cannot see
             # the env var with two different values. Setting `_TRANSPORT` is
             # exactly the value the variable would have produced -- same code
             # path.
@@ -638,8 +638,8 @@ def run_rank(a: argparse.Namespace) -> int:
             "rounds": a.rounds,
             "warmup_s_per_cell": a.warmup,
             "measure_s_per_cell": a.secs,
-            "barlink_slot_mib": os.environ.get("SGLANG_BARLINK_SLOT_MIB", "64 (default)"),
-            "barlink_host_blocks": os.environ.get("SGLANG_BARLINK_HOST_BLOCKS",
+            "barlink_slot_mib": os.environ.get("FLLIPER_BARLINK_SLOT_MIB", "64 (default)"),
+            "barlink_host_blocks": os.environ.get("FLLIPER_BARLINK_HOST_BLOCKS",
                                                 "32 (default)"),
             "world": world,
             "op": a.op,
@@ -844,10 +844,10 @@ def main() -> int:
                     help="completion signal in the measured path, the same "
                          "for every backend")
     ap.add_argument("--slot-mib", type=int, default=32,
-                    help="SGLANG_BARLINK_SLOT_MIB for the child processes; must "
+                    help="FLLIPER_BARLINK_SLOT_MIB for the child processes; must "
                          "hold at least the largest payload")
     ap.add_argument("--bar1-window-mib", type=int, default=0,
-                    help="SGLANG_BARLINK_BAR1_WINDOW_MIB for the child "
+                    help="FLLIPER_BARLINK_BAR1_WINDOW_MIB for the child "
                          "processes (0 = the module default, 96). The a2a "
                          "slot per directed pair is roughly window/(6(R-1)); "
                          "a skewed block above that makes the direct path "
@@ -856,7 +856,7 @@ def main() -> int:
                     help="hard watchdog per rank")
     ap.add_argument("--pg-timeout", type=float, default=180.0)
     ap.add_argument("--port", type=int, default=29593)
-    ap.add_argument("--sglang-python", default="/spinning/wt-gdr-loadsym/python")
+    ap.add_argument("--flliper-python", default="/spinning/wt-gdr-loadsym/python")
     ap.add_argument("--out", default="")
     ap.add_argument("--max-used-mib", type=int, default=64)
     a = ap.parse_args()
@@ -899,11 +899,11 @@ def main() -> int:
            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
            "MASTER_ADDR": "127.0.0.1",
            "MASTER_PORT": str(a.port),
-           "SGLANG_BARLINK_SLOT_MIB": str(a.slot_mib),
-           "PYTHONPATH": a.sglang_python + ":" + os.environ.get("PYTHONPATH", ""),
+           "FLLIPER_BARLINK_SLOT_MIB": str(a.slot_mib),
+           "PYTHONPATH": a.flliper_python + ":" + os.environ.get("PYTHONPATH", ""),
            "PYTHONUNBUFFERED": "1"}
     if a.bar1_window_mib:
-        env["SGLANG_BARLINK_BAR1_WINDOW_MIB"] = str(a.bar1_window_mib)
+        env["FLLIPER_BARLINK_BAR1_WINDOW_MIB"] = str(a.bar1_window_mib)
     base = [sys.executable, os.path.abspath(__file__)]
     for k, v in vars(a).items():
         if k == "rank":

@@ -1,5 +1,5 @@
 """
-Unit tests for sglang.srt.constrained.utils.
+Unit tests for flliper.srt.constrained.utils.
 
 Test Coverage:
 - is_legacy_structural_tag: legacy format detection, new format detection,
@@ -11,8 +11,8 @@ Usage:
 
 import unittest
 
-from sglang.srt.constrained.utils import is_legacy_structural_tag
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.constrained.utils import is_legacy_structural_tag
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")

@@ -1,4 +1,4 @@
-# Benchmarks SGLang fused layernorm/rmsnorm scale shift kernels
+# Benchmarks fLLiper fused layernorm/rmsnorm scale shift kernels
 # 1. fused_norm_scale_shift
 # 2. fused_scale_residual_norm_scale_shift
 import itertools
@@ -8,15 +8,15 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
-from sglang.multimodal_gen.runtime.layers.layernorm import (
+from flliper.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
+from flliper.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNormScaleShift,
     ScaleResidualLayerNormScaleShift,
     ScaleResidualRMSNormScaleShift,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.utils import is_in_ci
 
 register_cuda_ci(
     est_time=17,
@@ -36,7 +36,7 @@ DTYPE = torch.bfloat16
 DEVICE = "cuda"
 EPS = 1e-5
 LINE_VALS = ["native", "cuda"]
-LINE_NAMES = ["SGLang Native", "SGLang Fused"]
+LINE_NAMES = ["fLLiper Native", "fLLiper Fused"]
 STYLES = [("red", "-"), ("blue", "--")]
 config = list(
     itertools.product(B_RANGE, S_RANGE, D_RANGE, NORM_TYPE_RANGE, AFFINE_RANGE)

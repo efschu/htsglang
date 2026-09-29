@@ -26,7 +26,7 @@ import importlib
 
 import pytest
 
-from sglang.srt.managers.cutover_participants import (
+from flliper.srt.managers.cutover_participants import (
     LOG,
     REGISTRY,
     Participant,
@@ -136,7 +136,7 @@ def test_can_fail_a_hook_that_does_not_exist():
     bad = Participant(
         name="x",
         what="y",
-        hook="sglang.srt.managers.cutover_participants.no_such_symbol",
+        hook="flliper.srt.managers.cutover_participants.no_such_symbol",
         probe="log:whatever",
         ticket="#0",
     )

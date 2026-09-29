@@ -23,8 +23,8 @@ from unittest import mock
 
 import test_nf_form_a_prefetch_span_h99 as h99
 
-from sglang.srt import rank_role
-from sglang.srt.mem_cache import unified_radix_cache as urc
+from flliper.srt import rank_role
+from flliper.srt.mem_cache import unified_radix_cache as urc
 
 END = 33600
 PROMPT = list(range(END))
@@ -56,7 +56,7 @@ class _Env27B:
         self.prev = (rank_role._INSTALLED_PLAN, rank_role._INSTALLED_RANK)
         rank_role._INSTALLED_PLAN, rank_role._INSTALLED_RANK = None, None
         for p in (
-            mock.patch("sglang.srt.runtime_context.get_server_args", return_value=B27_D),
+            mock.patch("flliper.srt.runtime_context.get_server_args", return_value=B27_D),
             mock.patch.object(urc, "uneven_dcp_active", return_value=True),
             mock.patch.object(rank_role, "this_rank_is_form_a_worker", lambda: False),
         ):
@@ -100,8 +100,8 @@ def _named(errors):
 
 class Hp1OffFormAIsTheLengthVote(unittest.TestCase):
     def test_span_base_changes_no_collective_and_no_registration(self):
-        c0, r0, e0, g0 = _intake(EVEN, "weg2-27b-1", span_base=False)
-        c1, r1, e1, g1 = _intake(EVEN, "weg2-27b-1", span_base=True)
+        c0, r0, e0, g0 = _intake(EVEN, "pdflip-27b-1", span_base=False)
+        c1, r1, e1, g1 = _intake(EVEN, "pdflip-27b-1", span_base=True)
         self.assertEqual((e0, e1, g0.errors, g1.errors), ({}, {}, [], []))
         self.assertEqual(r0, {r: (29504, 29504) for r in range(h99.WORLD)})
         self.assertEqual(r1, r0, "span_base moved a 27B registration")
@@ -116,17 +116,17 @@ class Hp1OffFormAIsTheLengthVote(unittest.TestCase):
         )
         for r in c1:
             self.assertIsNone(
-                getattr(c1[r], "_hp1_end_base_by_rid", {}).get("weg2-27b-1"),
+                getattr(c1[r], "_hp1_end_base_by_rid", {}).get("pdflip-27b-1"),
                 "an END base was recorded off Form A",
             )
 
     def test_skewed_spans_stay_the_named_w65_stop(self):
-        _c0, r0, e0, g0 = _intake(SKEWED, "weg2-27b-2", span_base=False)
-        _c1, r1, e1, g1 = _intake(SKEWED, "weg2-27b-2", span_base=True)
+        _c0, r0, e0, g0 = _intake(SKEWED, "pdflip-27b-2", span_base=False)
+        _c1, r1, e1, g1 = _intake(SKEWED, "pdflip-27b-2", span_base=True)
         self.assertEqual(set(e0), set(range(h99.WORLD)), "27B's W65 must stop every rank")
         for _r, (name, msg) in _named(e0).items():
             self.assertEqual(name, "HiCacheCollectiveDesyncError")
-            self.assertIn("W65 Weg2PrefetchSpanSplit", msg)
+            self.assertIn("W65 PdFlipPrefetchSpanSplit", msg)
             self.assertIn("min=896 max=33600", msg)
         self.assertEqual(_named(e1), _named(e0), "span_base changed 27B's W65 stop")
         self.assertEqual(g1.payloads, g0.payloads)

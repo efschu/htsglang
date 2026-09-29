@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Update the wheel index for PR SGLang releases.
+Update the wheel index for PR fLLiper releases.
 
 This script generates a single PyPI-compatible index.html file at pr/index.html
 containing all PR builds, ordered by PR number and commit count (newest first).
@@ -48,16 +48,16 @@ def update_wheel_index(
     release_tag = f"pr-{pr_number}-{build_date}-{commit_hash}"
 
     # Create pr directory structure following PEP 503
-    # /pr/index.html -> links to sglang/
-    # /pr/sglang/index.html -> contains wheel links
+    # /pr/index.html -> links to flliper/
+    # /pr/flliper/index.html -> contains wheel links
     pr_dir = whl_repo_dir / "pr"
     pr_dir.mkdir(parents=True, exist_ok=True)
 
-    sglang_dir = pr_dir / "sglang"
-    sglang_dir.mkdir(parents=True, exist_ok=True)
+    flliper_dir = pr_dir / "flliper"
+    flliper_dir.mkdir(parents=True, exist_ok=True)
 
     root_index = pr_dir / "index.html"
-    package_index = sglang_dir / "index.html"
+    package_index = flliper_dir / "index.html"
 
     print(f"\nUpdating PR wheel index")
     print(f"  Root index: {root_index}")
@@ -109,17 +109,17 @@ def update_wheel_index(
                 seen.add(filename)
                 unique_links.append(link)
 
-    # Write root index (links to sglang package directory)
+    # Write root index (links to flliper package directory)
     with open(root_index, "w") as f:
         f.write("<!DOCTYPE html>\n")
-        f.write('<a href="sglang/">sglang</a>\n')
+        f.write('<a href="flliper/">flliper</a>\n')
 
     print(f"  Written root index: {root_index}")
 
     # Write package index in minimal format
     with open(package_index, "w") as f:
         f.write("<!DOCTYPE html>\n")
-        f.write("<h1>SGLang PR Wheels</h1>\n")
+        f.write("<h1>fLLiper PR Wheels</h1>\n")
         # Write links only
         f.write("\n".join(unique_links))
         f.write("\n")
@@ -127,7 +127,7 @@ def update_wheel_index(
     print(f"  Written {len(unique_links)} total wheels to {package_index}")
     print(f"\nDone! Users can install with:")
     print(
-        f"  pip install sglang --pre --extra-index-url https://sgl-project.github.io/whl/pr/"
+        f"  pip install flliper --pre --extra-index-url https://sgl-project.github.io/whl/pr/"
     )
     print(f"\nOr install specific PR #{pr_number} wheel directly:")
     if new_links:
@@ -139,7 +139,7 @@ def update_wheel_index(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Update wheel index for PR SGLang releases"
+        description="Update wheel index for PR fLLiper releases"
     )
     parser.add_argument(
         "--pr-number",

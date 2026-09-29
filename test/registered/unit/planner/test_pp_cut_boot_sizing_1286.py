@@ -56,7 +56,7 @@ import unittest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.planner.pp_cut import (
+from flliper.srt.planner.pp_cut import (
     LAYER_FAMILY_ATTENTION,
     LAYER_FAMILY_LINEAR,
     PhasePoolModel,
@@ -65,7 +65,7 @@ from sglang.srt.planner.pp_cut import (
     pp_phase_pool,
     stage_pp_capacities,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 GIB = 1024.0
 
@@ -429,7 +429,7 @@ class TestUnfundedPostsAreNamedNotSilent(CustomTestCase):
         self.assertEqual(funded_model().unfunded_posts, ())
 
     def test_the_launcher_seam_refuses_an_unfunded_model(self):
-        from sglang.srt.planner.pp_cut_launch import PPCutRefused, refuse_unfunded_posts
+        from flliper.srt.planner.pp_cut_launch import PPCutRefused, refuse_unfunded_posts
 
         refuse_unfunded_posts(funded_model())  # must not raise
         with self.assertRaises(PPCutRefused) as cm:
@@ -477,7 +477,7 @@ class TestOneFunctionPricesEveryObjective(CustomTestCase):
     """
 
     def _decide(self, objective: str):
-        from sglang.srt.planner.pp_cut_launch import solve_launch_cut
+        from flliper.srt.planner.pp_cut_launch import solve_launch_cut
 
         return solve_launch_cut(
             layer_families=FAMILIES,
@@ -533,8 +533,8 @@ class TestOneFunctionPricesEveryObjective(CustomTestCase):
 # edited to satisfy it.
 # ---------------------------------------------------------------------------
 
-RUNTIME_SIZING_SRC = "python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py"
-LAUNCHER_SRC = "python/sglang/srt/weg2/launcher.py"
+RUNTIME_SIZING_SRC = "python/flliper/srt/model_executor/model_runner_kv_cache_mixin.py"
+LAUNCHER_SRC = "python/flliper/srt/pdflip/launcher.py"
 
 
 def _repo_source(relpath: str) -> str:
@@ -657,7 +657,7 @@ class TestZeroPostsMustBeSaidNotAssumed(CustomTestCase):
     def test_the_seam_refuses_it(self):
         import dataclasses
 
-        from sglang.srt.planner.pp_cut_launch import PPCutRefused, refuse_unfunded_posts
+        from flliper.srt.planner.pp_cut_launch import PPCutRefused, refuse_unfunded_posts
 
         with self.assertRaises(PPCutRefused) as cm:
             refuse_unfunded_posts(
@@ -745,7 +745,7 @@ class TestGeometryErrorsGetTheirOwnSentence(CustomTestCase):
     def test_the_seam_names_the_flag_and_the_lengths(self):
         import dataclasses
 
-        from sglang.srt.planner.pp_cut_launch import (
+        from flliper.srt.planner.pp_cut_launch import (
             PPCutRefused,
             refuse_pool_model_geometry,
         )
@@ -832,7 +832,7 @@ class TestCapacityIsIntegerArithmetic(CustomTestCase):
             )
 
     def test_the_capacity_helper_is_integer_typed(self):
-        from sglang.srt.planner.pp_cut import stage_capacity_tokens
+        from flliper.srt.planner.pp_cut import stage_capacity_tokens
 
         got = stage_capacity_tokens(6544.0, 11, funded_model())
         self.assertIsInstance(got, int)
@@ -848,7 +848,7 @@ class TestTheMakespanWinnerSurvivesTheReprice(CustomTestCase):
     """
 
     def _decide(self, model, objective="makespan"):
-        from sglang.srt.planner.pp_cut_launch import solve_launch_cut
+        from flliper.srt.planner.pp_cut_launch import solve_launch_cut
 
         return solve_launch_cut(
             layer_families=FAMILIES,
@@ -913,7 +913,7 @@ class TestActivationReserveRiskIsPricedAsARisk(CustomTestCase):
 
     def test_the_heuristic_is_computed_from_the_runtimes_own_method(self):
         try:
-            from sglang.srt.weg2.launcher import (
+            from flliper.srt.pdflip.launcher import (
                 P_PREFILL_ACTIVATION_RESERVE_MIB,
                 p_activation_reserve_provenance,
             )

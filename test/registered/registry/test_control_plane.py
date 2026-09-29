@@ -12,10 +12,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.srt.registry.arbiter import EngineRegistry
-from sglang.srt.registry.http_api import build_app
-from sglang.srt.registry.ledger import MIB, ReservationStore
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.registry.arbiter import EngineRegistry
+from flliper.srt.registry.http_api import build_app
+from flliper.srt.registry.ledger import MIB, ReservationStore
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

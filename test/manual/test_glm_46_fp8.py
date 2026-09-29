@@ -1,9 +1,9 @@
 import unittest
 
-from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.performance_test_runner import PerformanceTestParams
-from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings
+from flliper.test.accuracy_test_runner import AccuracyTestParams
+from flliper.test.performance_test_runner import PerformanceTestParams
+from flliper.test.run_combined_tests import run_combined_tests
+from flliper.test.test_utils import ModelLaunchSettings
 
 GLM_4_6_FP8_MODEL_PATH = "zai-org/GLM-4.6-FP8"
 

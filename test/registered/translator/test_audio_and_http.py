@@ -17,7 +17,7 @@ import unittest
 import numpy as np
 from fastapi.testclient import TestClient
 
-from sglang.srt.translator.audio import (
+from flliper.srt.translator.audio import (
     PIPELINE_SAMPLE_RATE,
     CodecError,
     Pcm16Codec,
@@ -29,15 +29,15 @@ from sglang.srt.translator.audio import (
     resample,
     to_pcm16_bytes,
 )
-from sglang.srt.translator.backends import (
+from flliper.srt.translator.backends import (
     AudioChunk,
     FakeAsr,
     FakeEmbedder,
     FakeMt,
     FakeTts,
 )
-from sglang.srt.translator.config import TranslatorConfig, TtsConfig
-from sglang.srt.translator.server import Stack, TranslatorService, build_app
+from flliper.srt.translator.config import TranslatorConfig, TtsConfig
+from flliper.srt.translator.server import Stack, TranslatorService, build_app
 
 LANG_A = "aa"
 LANG_B = "bb"
@@ -402,7 +402,7 @@ class TestWebSocketProtocol(unittest.TestCase):
 
     def test_a_cursor_below_the_floor_produces_an_explicit_gap(self):
         session = self.service.open_session([LANG_A, LANG_B], "s2")
-        from sglang.srt.translator.session import EventKind
+        from flliper.srt.translator.session import EventKind
 
         for _ in range(300):
             session.journal.append(EventKind.SESSION_STATE, {"tick": True})

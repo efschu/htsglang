@@ -14,7 +14,7 @@ from typing import Annotated, List, Optional, Union
 
 from pydantic import PlainValidator, TypeAdapter
 
-from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
+from flliper.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 
 
 @dataclass

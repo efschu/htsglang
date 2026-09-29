@@ -33,8 +33,8 @@ from pathlib import Path
 
 from fastapi.responses import StreamingResponse
 
-from sglang.srt.entrypoints.openai import request_binding
-from sglang.srt.entrypoints.openai.request_binding import (
+from flliper.srt.entrypoints.openai import request_binding
+from flliper.srt.entrypoints.openai.request_binding import (
     BindingRefused,
     HttpBinder,
     InProcessBinder,
@@ -42,19 +42,19 @@ from sglang.srt.entrypoints.openai.request_binding import (
     disable_binding,
     enable_binding,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
-from sglang.srt.registry import ladder
-from sglang.srt.registry.adapter import Health, register_adapter
-from sglang.srt.registry.arbiter import EngineRegistry
-from sglang.srt.registry.ladder import COLD, HOT, TEIL_HOT, WARM
-from sglang.srt.registry.ledger import MIB, ReservationStore
-from sglang.srt.registry.spec import (
+from flliper.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from flliper.srt.registry import ladder
+from flliper.srt.registry.adapter import Health, register_adapter
+from flliper.srt.registry.arbiter import EngineRegistry
+from flliper.srt.registry.ladder import COLD, HOT, PART_HOT, WARM
+from flliper.srt.registry.ledger import MIB, ReservationStore
+from flliper.srt.registry.spec import (
     EngineClass,
     EngineSpec,
     ResidencyState,
     ResourceProfile,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -67,14 +67,14 @@ BIND_NO_WAY_UP = "bind_no_way_up"  # HOT / WARM / COLD, so TEIL_HOT -> HOT is un
 
 ladder.declare_class(
     BIND_FULL,
-    {HOT, TEIL_HOT, COLD},
+    {HOT, PART_HOT, COLD},
     absent_because={WARM: "test double shaped like class1_srt: no host image"},
     replace=True,
 )
 ladder.declare_class(
     BIND_NO_WAY_UP,
     {HOT, WARM, COLD},
-    absent_because={TEIL_HOT: "test double shaped like class2_diffusion"},
+    absent_because={PART_HOT: "test double shaped like class2_diffusion"},
     replace=True,
 )
 
@@ -426,7 +426,7 @@ class TestRefusalsAreNamedAndImmediate(BindingTestCase):
         refusal = self._refuse("diffuse")
         self.assertEqual(refusal.status_code, 409)
         self.assertEqual(refusal.code, "ladder_edge_unbuilt")
-        self.assertIn(TEIL_HOT, refusal.message)
+        self.assertIn(PART_HOT, refusal.message)
 
     def test_a_refusal_becomes_the_right_http_status_on_the_serving_path(self):
         self.add("qwen")
@@ -528,7 +528,7 @@ class TestTheHttpBinderCarriesTheControlPlanesVerdict(BindingTestCase):
 
         binder = self._binder(opener)
         with self.assertLogs(
-            "sglang.srt.entrypoints.openai.request_binding", level="WARNING"
+            "flliper.srt.entrypoints.openai.request_binding", level="WARNING"
         ):
             binder.release_after_request("qwen")
 
@@ -540,7 +540,7 @@ class TestTheControlPlaneRoutes(BindingTestCase):
     def _client(self):
         from fastapi.testclient import TestClient
 
-        from sglang.srt.registry.http_api import build_app
+        from flliper.srt.registry.http_api import build_app
 
         return TestClient(build_app(self.registry))
 
@@ -589,7 +589,7 @@ class TestTheControlPlaneRoutes(BindingTestCase):
         body = client.post("/registry/tick", json={}).json()
         self.assertEqual(body["changed"], ["qwen"])
         self.assertEqual(self.registry.instance("qwen").state, ResidencyState.WARM_GPU)
-        self.assertEqual(body["decisions"][0]["dst_rung"], TEIL_HOT)
+        self.assertEqual(body["decisions"][0]["dst_rung"], PART_HOT)
 
 
 if __name__ == "__main__":

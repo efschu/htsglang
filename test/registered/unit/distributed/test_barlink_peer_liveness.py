@@ -40,9 +40,9 @@ import time
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.device_communicators import barlink_liveness as live
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.device_communicators import barlink_liveness as live
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -57,7 +57,7 @@ class _EnvGuard:
     The feature switch is PINNED rather than inherited unless the test names
     it. A test that asserts a deadline fires must not silently take the
     disabled path when the ambient environment happens to carry
-    ``SGLANG_BARLINK_PEER_LIVENESS=0`` -- that path is an unbounded loop, so
+    ``FLLIPER_BARLINK_PEER_LIVENESS=0`` -- that path is an unbounded loop, so
     such a test does not fail, it hangs the whole run. That is the same
     "wedge instead of a verdict" shape this module exists to remove, and it
     is worth spending three lines to keep out of the test harness too.
@@ -219,7 +219,7 @@ class TestPeerTable(LivenessTestBase):
 
 class TestBoundedPollDeadline(LivenessTestBase):
     def test_deadline_fires_and_names_the_wait(self):
-        with _EnvGuard(SGLANG_BARLINK_PEER_TIMEOUT_S=0.3, SGLANG_BARLINK_PEER_PROBE_S=0.05):
+        with _EnvGuard(FLLIPER_BARLINK_PEER_TIMEOUT_S=0.3, FLLIPER_BARLINK_PEER_PROBE_S=0.05):
             started = time.monotonic()
             with self.assertRaises(live.CollectiveTimeoutError) as ctx:
                 live.bounded_poll(lambda: False, "never-ready")
@@ -230,7 +230,7 @@ class TestBoundedPollDeadline(LivenessTestBase):
         self.assertGreaterEqual(waited, 0.25)
 
     def test_deadline_error_names_the_knob_to_change(self):
-        with _EnvGuard(SGLANG_BARLINK_PEER_TIMEOUT_S=0.2):
+        with _EnvGuard(FLLIPER_BARLINK_PEER_TIMEOUT_S=0.2):
             with self.assertRaises(live.CollectiveTimeoutError) as ctx:
                 live.bounded_poll(lambda: False, "never-ready")
         self.assertIn(live.ENV_TIMEOUT_S, str(ctx.exception))
@@ -239,7 +239,7 @@ class TestBoundedPollDeadline(LivenessTestBase):
     def test_a_wait_that_resolves_late_still_succeeds(self):
         deadline = time.monotonic() + 0.2
         with _EnvGuard(
-            SGLANG_BARLINK_PEER_TIMEOUT_S=10.0, SGLANG_BARLINK_PEER_PROBE_S=0.05
+            FLLIPER_BARLINK_PEER_TIMEOUT_S=10.0, FLLIPER_BARLINK_PEER_PROBE_S=0.05
         ):
             live.bounded_poll(lambda: time.monotonic() >= deadline, "slow-but-healthy")
 
@@ -252,7 +252,7 @@ class TestBoundedPollDeadline(LivenessTestBase):
             boot=live._boot_marker(proc.pid),
         )
         table = self.table_with([self.me(0), peer], self_rank=0)
-        with _EnvGuard(SGLANG_BARLINK_PEER_TIMEOUT_S=0.2, SGLANG_BARLINK_PEER_PROBE_S=0.05):
+        with _EnvGuard(FLLIPER_BARLINK_PEER_TIMEOUT_S=0.2, FLLIPER_BARLINK_PEER_PROBE_S=0.05):
             with self.assertRaises(live.CollectiveTimeoutError) as ctx:
                 live.bounded_poll(lambda: False, "wedged", table=table)
         self.assertIn("Peer census", str(ctx.exception))
@@ -277,7 +277,7 @@ class TestBoundedPollPeerLoss(LivenessTestBase):
         # A deadline far beyond the 60 s criterion, so only the liveness
         # check can end this wait.
         with _EnvGuard(
-            SGLANG_BARLINK_PEER_TIMEOUT_S=600.0, SGLANG_BARLINK_PEER_PROBE_S=0.05
+            FLLIPER_BARLINK_PEER_TIMEOUT_S=600.0, FLLIPER_BARLINK_PEER_PROBE_S=0.05
         ):
             started = time.monotonic()
             with self.assertRaises(live.PeerLostError) as ctx:
@@ -299,7 +299,7 @@ class TestBoundedPollPeerLoss(LivenessTestBase):
         peer = live.PeerIdentity(rank=1, host=live._hostname(), pid=4194305, boot="")
         table = self.table_with([self.me(0), peer], self_rank=0)
         with _EnvGuard(
-            SGLANG_BARLINK_PEER_TIMEOUT_S=600.0, SGLANG_BARLINK_PEER_PROBE_S=0.0
+            FLLIPER_BARLINK_PEER_TIMEOUT_S=600.0, FLLIPER_BARLINK_PEER_PROBE_S=0.0
         ):
             with self.assertRaises(live.PeerLostError):
                 live.bounded_poll(lambda: False, "mesh barrier", table=table)
@@ -311,7 +311,7 @@ class TestBoundedPollPeerLoss(LivenessTestBase):
         peer = live.PeerIdentity(rank=1, host=live._hostname(), pid=4194305, boot="")
         table = self.table_with([self.me(0), peer], self_rank=0)
         with _EnvGuard(
-            SGLANG_BARLINK_PEER_TIMEOUT_S=600.0, SGLANG_BARLINK_PEER_PROBE_S=0.0
+            FLLIPER_BARLINK_PEER_TIMEOUT_S=600.0, FLLIPER_BARLINK_PEER_PROBE_S=0.0
         ):
             with self.assertRaises(live.PeerLostError):
                 live.bounded_poll(
@@ -373,7 +373,7 @@ class TestSuccessPathCost(LivenessTestBase):
             live.bounded_poll(ready, "briefly-not-ready")
 
     def test_the_probe_is_rate_limited_not_per_iteration(self):
-        """Cost ceiling: at most one census per SGLANG_BARLINK_PEER_PROBE_S.
+        """Cost ceiling: at most one census per FLLIPER_BARLINK_PEER_PROBE_S.
 
         A per-iteration ``kill(pid, 0)`` would put a syscall in the middle of
         a spin loop; this pins the rate down instead of trusting the comment.
@@ -395,7 +395,7 @@ class TestSuccessPathCost(LivenessTestBase):
 
         with mock.patch.object(live, "pid_alive", counting):
             with _EnvGuard(
-                SGLANG_BARLINK_PEER_TIMEOUT_S=0.6, SGLANG_BARLINK_PEER_PROBE_S=0.2
+                FLLIPER_BARLINK_PEER_TIMEOUT_S=0.6, FLLIPER_BARLINK_PEER_PROBE_S=0.2
             ):
                 with self.assertRaises(live.CollectiveTimeoutError):
                     live.bounded_poll(lambda: False, "wedged", table=table)
@@ -413,7 +413,7 @@ class TestKillSwitch(LivenessTestBase):
             state["n"] += 1
             return state["n"] > 50
 
-        with _EnvGuard(SGLANG_BARLINK_PEER_LIVENESS=0, SGLANG_BARLINK_PEER_TIMEOUT_S=0.001):
+        with _EnvGuard(FLLIPER_BARLINK_PEER_LIVENESS=0, FLLIPER_BARLINK_PEER_TIMEOUT_S=0.001):
             self.assertFalse(live.liveness_enabled())
             # No deadline can fire: the disabled path is the old bare loop.
             live.bounded_poll(ready, "disabled")
@@ -422,7 +422,7 @@ class TestKillSwitch(LivenessTestBase):
     def test_disabled_never_raises_on_a_dead_peer(self):
         peer = live.PeerIdentity(rank=1, host=live._hostname(), pid=4194305, boot="")
         table = self.table_with([self.me(0), peer], self_rank=0)
-        with _EnvGuard(SGLANG_BARLINK_PEER_LIVENESS=0):
+        with _EnvGuard(FLLIPER_BARLINK_PEER_LIVENESS=0):
             live.check_peers("disabled", table=table)
 
     def test_zero_timeout_also_means_unbounded(self):
@@ -432,17 +432,17 @@ class TestKillSwitch(LivenessTestBase):
             state["n"] += 1
             return state["n"] > 10
 
-        with _EnvGuard(SGLANG_BARLINK_PEER_TIMEOUT_S=0):
+        with _EnvGuard(FLLIPER_BARLINK_PEER_TIMEOUT_S=0):
             live.bounded_poll(ready, "no-deadline")
         self.assertEqual(state["n"], 11)
 
     def test_install_returns_none_when_disabled(self):
-        with _EnvGuard(SGLANG_BARLINK_PEER_LIVENESS=0):
+        with _EnvGuard(FLLIPER_BARLINK_PEER_LIVENESS=0):
             self.assertIsNone(live.install(object()))
         self.assertEqual(live.registered_tables(), [])
 
     def test_watchdog_is_separately_switchable(self):
-        with _EnvGuard(SGLANG_BARLINK_PEER_LIVENESS=1, SGLANG_BARLINK_PEER_WATCHDOG=0):
+        with _EnvGuard(FLLIPER_BARLINK_PEER_LIVENESS=1, FLLIPER_BARLINK_PEER_WATCHDOG=0):
             self.assertTrue(live.liveness_enabled())
             self.assertFalse(live.watchdog_enabled())
             self.assertIsNone(live.ensure_watchdog())
@@ -457,10 +457,10 @@ class TestColdBuildWindow(LivenessTestBase):
     """
 
     def test_deadline_is_scaled_inside_the_window(self):
-        from sglang.srt.utils import jit_cold_build
+        from flliper.srt.utils import jit_cold_build
 
         with _EnvGuard(
-            SGLANG_BARLINK_PEER_TIMEOUT_S=100.0, SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT=7
+            FLLIPER_BARLINK_PEER_TIMEOUT_S=100.0, FLLIPER_JIT_COLD_BUILD_TIMEOUT_MULT=7
         ):
             self.assertEqual(live.wait_timeout_s(), 100.0)
             with jit_cold_build.cold_build_window("test"):
@@ -473,14 +473,14 @@ class TestColdBuildWindow(LivenessTestBase):
         Death is a fact, not a duration -- the whole point of the check is
         that it is decidable while the deadline is not.
         """
-        from sglang.srt.utils import jit_cold_build
+        from flliper.srt.utils import jit_cold_build
 
         peer = live.PeerIdentity(rank=1, host=live._hostname(), pid=4194305, boot="")
         table = self.table_with([self.me(0), peer], self_rank=0)
         with _EnvGuard(
-            SGLANG_BARLINK_PEER_TIMEOUT_S=600.0,
-            SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT=40,
-            SGLANG_BARLINK_PEER_PROBE_S=0.0,
+            FLLIPER_BARLINK_PEER_TIMEOUT_S=600.0,
+            FLLIPER_JIT_COLD_BUILD_TIMEOUT_MULT=40,
+            FLLIPER_BARLINK_PEER_PROBE_S=0.0,
         ):
             with jit_cold_build.cold_build_window("test"):
                 started = time.monotonic()
@@ -633,28 +633,28 @@ class TestWatchdog(LivenessTestBase):
 class TestConfigSurface(LivenessTestBase):
     def test_every_knob_is_registered_in_environ(self):
         """A knob the operator cannot find is a knob that does not exist."""
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         for name in (
-            "SGLANG_BARLINK_PEER_LIVENESS",
-            "SGLANG_BARLINK_PEER_TIMEOUT_S",
-            "SGLANG_BARLINK_PEER_PROBE_S",
-            "SGLANG_BARLINK_PEER_WATCHDOG",
+            "FLLIPER_BARLINK_PEER_LIVENESS",
+            "FLLIPER_BARLINK_PEER_TIMEOUT_S",
+            "FLLIPER_BARLINK_PEER_PROBE_S",
+            "FLLIPER_BARLINK_PEER_WATCHDOG",
         ):
             self.assertTrue(hasattr(envs, name), f"{name} missing from environ.py")
 
     def test_env_names_match_the_module_constants(self):
-        self.assertEqual(live.ENV_ENABLE, "SGLANG_BARLINK_PEER_LIVENESS")
-        self.assertEqual(live.ENV_TIMEOUT_S, "SGLANG_BARLINK_PEER_TIMEOUT_S")
-        self.assertEqual(live.ENV_PROBE_S, "SGLANG_BARLINK_PEER_PROBE_S")
-        self.assertEqual(live.ENV_WATCHDOG, "SGLANG_BARLINK_PEER_WATCHDOG")
+        self.assertEqual(live.ENV_ENABLE, "FLLIPER_BARLINK_PEER_LIVENESS")
+        self.assertEqual(live.ENV_TIMEOUT_S, "FLLIPER_BARLINK_PEER_TIMEOUT_S")
+        self.assertEqual(live.ENV_PROBE_S, "FLLIPER_BARLINK_PEER_PROBE_S")
+        self.assertEqual(live.ENV_WATCHDOG, "FLLIPER_BARLINK_PEER_WATCHDOG")
 
     def test_defaults_are_the_documented_ones(self):
         with _EnvGuard(
-            SGLANG_BARLINK_PEER_LIVENESS=None,
-            SGLANG_BARLINK_PEER_TIMEOUT_S=None,
-            SGLANG_BARLINK_PEER_PROBE_S=None,
-            SGLANG_BARLINK_PEER_WATCHDOG=None,
+            FLLIPER_BARLINK_PEER_LIVENESS=None,
+            FLLIPER_BARLINK_PEER_TIMEOUT_S=None,
+            FLLIPER_BARLINK_PEER_PROBE_S=None,
+            FLLIPER_BARLINK_PEER_WATCHDOG=None,
         ):
             self.assertTrue(live.liveness_enabled())
             self.assertEqual(live.wait_timeout_s(), 120.0)
@@ -662,7 +662,7 @@ class TestConfigSurface(LivenessTestBase):
             self.assertTrue(live.watchdog_enabled())
 
     def test_a_garbage_value_falls_back_to_the_default(self):
-        with _EnvGuard(SGLANG_BARLINK_PEER_TIMEOUT_S="not-a-number"):
+        with _EnvGuard(FLLIPER_BARLINK_PEER_TIMEOUT_S="not-a-number"):
             self.assertEqual(live.wait_timeout_s(), 120.0)
 
     def test_describe_config_names_all_four_knobs(self):

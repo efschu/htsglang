@@ -46,7 +46,7 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 _HAS_CUDA = torch.cuda.is_available()
 _DEV = "cuda" if _HAS_CUDA else "cpu"
@@ -68,7 +68,7 @@ def _make_pool(
     """Build a minimal 2-sub-pool ``UnifiedKVPool`` (a small MHA grow-up peer
     + the Mamba grow-down pool under test) sized to hold >= ``want_slots`` Mamba
     slots, and return ``(pool, mamba_spec)``."""
-    from sglang.srt.mem_cache.unified_memory_pool import (
+    from flliper.srt.mem_cache.unified_memory_pool import (
         MambaSubPoolSpec,
         MHASubPoolSpec,
         UnifiedKVPool,

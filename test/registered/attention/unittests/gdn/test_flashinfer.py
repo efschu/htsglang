@@ -4,26 +4,26 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_flashinfer_available
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.srt.utils import is_flashinfer_available
+from flliper.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
     make_gdn_cases,
     run_gdn_attention_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
+from flliper.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_gdn_cuda_graph_decode_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
+from flliper.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
     run_gdn_eagle_verify_case,
     run_gdn_eagle_verify_cuda_graph_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
+from flliper.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_gdn_split_op_extend_case,
 )
 

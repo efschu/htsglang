@@ -19,14 +19,14 @@ from typing import Any, Dict, List
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.lora_utils import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.lora_utils import (
     MOE_BASE_MODEL_PATH,
     MOE_LORA_PATH,
     MOE_LORA_TEST_PROMPTS,
 )
-from sglang.test.runners import SRTRunner
-from sglang.test.test_utils import (
+from flliper.test.runners import SRTRunner
+from flliper.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     CustomTestCase,
     is_in_ci,
@@ -38,7 +38,7 @@ LOGPROB_THRESHOLD = 5e-04
 MAX_NEW_TOKENS = 10
 
 
-def _run_sglang_moe_lora(
+def _run_flliper_moe_lora(
     tp_size: int,
     prompts: List[str],
     port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
@@ -84,14 +84,14 @@ class TestMoELoRATP2Logprobs(CustomTestCase):
         print(f"  {label}: running TP=1")
         print(f"{'=' * 100}")
 
-        tp1 = _run_sglang_moe_lora(tp_size=1, prompts=prompts)
+        tp1 = _run_flliper_moe_lora(tp_size=1, prompts=prompts)
         torch.cuda.empty_cache()
 
         print(f"\n{'=' * 100}")
         print(f"  {label}: running TP=2")
         print(f"{'=' * 100}")
 
-        tp2 = _run_sglang_moe_lora(tp_size=2, prompts=prompts)
+        tp2 = _run_flliper_moe_lora(tp_size=2, prompts=prompts)
 
         print(f"\n{'=' * 100}")
         print(

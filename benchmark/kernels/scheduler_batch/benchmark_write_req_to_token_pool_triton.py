@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.benchmark.bench_utils import run_bench
+from flliper.benchmark.bench_utils import run_bench
 
 
 @triton.jit

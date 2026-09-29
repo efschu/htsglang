@@ -4,13 +4,13 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator  # noqa: E402
-from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from flliper.srt.managers.hisparse_coordinator import HiSparseCoordinator  # noqa: E402
+from flliper.srt.managers.scheduler import Scheduler  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -52,7 +52,7 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         ]
 
         with patch(
-            "sglang.srt.managers.scheduler.SamplingBatchInfo.from_schedule_batch",
+            "flliper.srt.managers.scheduler.SamplingBatchInfo.from_schedule_batch",
             return_value=MagicMock(),
         ):
             batch = scheduler._build_hisparse_decode_batch(reqs)

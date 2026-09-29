@@ -27,12 +27,12 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID, also RTX 5090 0a:00.0 und RTX 3080 0b:00.0 --
 beide am CPU-Root-Port). Backends:
 
     nccl           torch.distributed ueber die NCCL-Prozessgruppe
-    barlink:device   BarlinkCommunicator, SGLANG_BARLINK_TRANSPORT=device
-    barlink:shm      BarlinkCommunicator, SGLANG_BARLINK_TRANSPORT=shm
+    barlink:device   BarlinkCommunicator, FLLIPER_BARLINK_TRANSPORT=device
+    barlink:shm      BarlinkCommunicator, FLLIPER_BARLINK_TRANSPORT=shm
 
 Beide barlink-Transporte werden IM SELBEN PROZESS aufgebaut. Der Transportname
 kommt in barlink.py aus der Modulvariablen `_TRANSPORT`, die beim Import einmal
-aus SGLANG_BARLINK_TRANSPORT gefuellt und in BarlinkCommunicator.__init__ gelesen
+aus FLLIPER_BARLINK_TRANSPORT gefuellt und in BarlinkCommunicator.__init__ gelesen
 wird; ein Prozess kann die Umgebungsvariable also nicht zweimal verschieden
 sehen. Deshalb wird `_TRANSPORT` vor jeder Konstruktion gesetzt -- exakt der
 Wert, den die Umgebungsvariable gesetzt haette, gleicher Codepfad.
@@ -174,8 +174,8 @@ def run_rank(a: argparse.Namespace) -> int:
     log(f"# rank{rank} -> cuda:{dev_ord} {props.name} sm_{props.major}{props.minor}")
 
     # ---------------- barlink-Kommunikatoren aufbauen ----------------
-    sys.path.insert(0, a.sglang_python)
-    import sglang.srt.distributed.device_communicators.barlink as barlink_mod
+    sys.path.insert(0, a.flliper_python)
+    import flliper.srt.distributed.device_communicators.barlink as barlink_mod
 
     comms: dict[str, object] = {}
     fail_reason: dict[str, str] = {}
@@ -187,7 +187,7 @@ def run_rank(a: argparse.Namespace) -> int:
         obj = None
         t0 = time.time()
         try:
-            barlink_mod._TRANSPORT = name  # == SGLANG_BARLINK_TRANSPORT=<name>
+            barlink_mod._TRANSPORT = name  # == FLLIPER_BARLINK_TRANSPORT=<name>
             obj = barlink_mod.BarlinkCommunicator(cpu_group=gloo_pg, device=dev)
             # Der Communicator faellt bei einem nicht verfuegbaren Transport
             # still auf die inline-gloo-Ebene zurueck. Das waere dann NICHT
@@ -325,7 +325,7 @@ def run_rank(a: argparse.Namespace) -> int:
             "torch": torch.__version__,
             "rounds": a.rounds,
             "failed_backends": fail_reason,
-            "barlink_slot_mib": os.environ.get("SGLANG_BARLINK_SLOT_MIB", "64 (Vorgabe)"),
+            "barlink_slot_mib": os.environ.get("FLLIPER_BARLINK_SLOT_MIB", "64 (Vorgabe)"),
         }
         for r, o in enumerate([int(x) for x in a.devices.split(",")]):
             p = torch.cuda.get_device_properties(o)
@@ -477,7 +477,7 @@ def main() -> int:
                     help="harter Watchdog je Rang")
     ap.add_argument("--pg-timeout", type=float, default=120.0)
     ap.add_argument("--port", type=int, default=29591)
-    ap.add_argument("--sglang-python",
+    ap.add_argument("--flliper-python",
                     default="/spinning/wt-gdr-loadsym/python")
     ap.add_argument("--out", default="")
     ap.add_argument("--max-used-mib", type=int, default=64)
@@ -495,7 +495,7 @@ def main() -> int:
            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
            "MASTER_ADDR": "127.0.0.1",
            "MASTER_PORT": str(a.port),
-           "PYTHONPATH": a.sglang_python + ":" + os.environ.get("PYTHONPATH", ""),
+           "PYTHONPATH": a.flliper_python + ":" + os.environ.get("PYTHONPATH", ""),
            "PYTHONUNBUFFERED": "1"}
     base = [sys.executable, os.path.abspath(__file__)]
     for k, v in vars(a).items():

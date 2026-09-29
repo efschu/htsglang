@@ -31,16 +31,16 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+from flliper.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessagesRequest,
 )
-from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -132,22 +132,22 @@ class TestEffortPassthrough(CustomTestCase):
     def test_the_collapse_survives_as_an_opt_in(self):
         """A deployment whose template names its top tier 'max' can restore the
         old behaviour -- explicitly, and it is logged."""
-        with patch.dict(os.environ, {"SGLANG_ANTHROPIC_XHIGH_EFFORT": "max"}):
+        with patch.dict(os.environ, {"FLLIPER_ANTHROPIC_XHIGH_EFFORT": "max"}):
             chat = self._convert(output_config={"effort": "xhigh"})
         self.assertEqual(chat.reasoning_effort, "max")
 
     def test_the_opt_in_collapse_is_logged_by_name(self):
-        with patch.dict(os.environ, {"SGLANG_ANTHROPIC_XHIGH_EFFORT": "max"}):
+        with patch.dict(os.environ, {"FLLIPER_ANTHROPIC_XHIGH_EFFORT": "max"}):
             with self.assertLogs(
-                "sglang.srt.entrypoints.anthropic.serving", level="INFO"
+                "flliper.srt.entrypoints.anthropic.serving", level="INFO"
             ) as captured:
                 self._convert(output_config={"effort": "xhigh"})
         joined = "\n".join(captured.output)
-        self.assertIn("SGLANG_ANTHROPIC_XHIGH_EFFORT", joined)
+        self.assertIn("FLLIPER_ANTHROPIC_XHIGH_EFFORT", joined)
 
     def test_an_empty_override_does_not_blank_the_effort(self):
         """An unset-but-present env var must not turn into an empty effort."""
-        with patch.dict(os.environ, {"SGLANG_ANTHROPIC_XHIGH_EFFORT": ""}):
+        with patch.dict(os.environ, {"FLLIPER_ANTHROPIC_XHIGH_EFFORT": ""}):
             chat = self._convert(output_config={"effort": "xhigh"})
         self.assertEqual(chat.reasoning_effort, "xhigh")
 

@@ -3,16 +3,16 @@ import sys
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+from flliper.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     ModelOptFp8LinearMethod,
 )
-from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
-from sglang.srt.layers.quantization.fp8_utils import (
+from flliper.srt.layers.quantization.fp8_kernel import static_quant_fp8
+from flliper.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     input_to_float8,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=80, suite="nightly-kernel-1-gpu", nightly=True)

@@ -11,19 +11,19 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+from flliper.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
     fused_append_remap_shared_experts_deepep,
     fused_append_shared_experts,
 )
-from sglang.srt.layers.moe.topk import (
+from flliper.srt.layers.moe.topk import (
     TopKConfig,
     _use_aiter,
     remap_topk_for_per_rank_shared_slots,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.runtime_context import get_parallel
+from flliper.srt.utils import get_device
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")

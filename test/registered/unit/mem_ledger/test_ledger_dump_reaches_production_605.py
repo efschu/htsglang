@@ -28,14 +28,14 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.mem_ledger.engine import CardFacts, DemandInputs, build_card_ledgers
-from sglang.srt.mem_ledger.flight_recorder import (
+from flliper.srt.mem_ledger.engine import CardFacts, DemandInputs, build_card_ledgers
+from flliper.srt.mem_ledger.flight_recorder import (
     BOOT_ID_ENV,
     DIR_ENV,
     dump_ledger,
     publish_boot_id,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -78,7 +78,7 @@ class TestDumpSitsAtTheConstructor(unittest.TestCase):
         self.dir = tempfile.mkdtemp()
         os.environ[DIR_ENV] = self.dir
         os.environ[BOOT_ID_ENV] = "bootTEST"
-        import sglang.srt.mem_ledger.flight_recorder as fr
+        import flliper.srt.mem_ledger.flight_recorder as fr
 
         fr._boot_id = "bootTEST"
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self.env)))
@@ -144,7 +144,7 @@ class TestLauncherAndRanksAgree(unittest.TestCase):
         os.environ.pop(BOOT_ID_ENV, None)
 
     def test_the_launcher_publishes_and_a_rank_inherits_it(self):
-        import sglang.srt.mem_ledger.flight_recorder as fr
+        import flliper.srt.mem_ledger.flight_recorder as fr
 
         fr._boot_id = None
         launcher = publish_boot_id()
@@ -153,7 +153,7 @@ class TestLauncherAndRanksAgree(unittest.TestCase):
         self.assertEqual(fr.boot_id(), launcher)
 
     def test_publishing_twice_does_not_rename_the_boot(self):
-        import sglang.srt.mem_ledger.flight_recorder as fr
+        import flliper.srt.mem_ledger.flight_recorder as fr
 
         fr._boot_id = None
         first = publish_boot_id()
@@ -162,7 +162,7 @@ class TestLauncherAndRanksAgree(unittest.TestCase):
 
     def test_the_ledger_and_the_marks_land_under_one_id(self):
         """The end-to-end property the reconciliation depends on."""
-        import sglang.srt.mem_ledger.flight_recorder as fr
+        import flliper.srt.mem_ledger.flight_recorder as fr
 
         with tempfile.TemporaryDirectory() as d:
             os.environ[DIR_ENV] = d
@@ -189,7 +189,7 @@ class TestNoFlagGate(unittest.TestCase):
         """The shipped defect, pinned at the source: enforce_boot_contract is
         behind vram_ledger_enabled(), so nothing needed for Stage 1 may live
         there alone."""
-        import sglang.srt.mem_ledger.contract as contract
+        import flliper.srt.mem_ledger.contract as contract
 
         source = open(contract.__file__).read()
         self.assertNotIn("dump_ledger", source)

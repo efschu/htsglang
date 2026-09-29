@@ -20,9 +20,9 @@ import torch
 import torch.distributed as dist
 from cuda.bindings import driver as drv
 
-from sglang.jit_kernel.tests.utils import multigpu_pytest_main
-from sglang.jit_kernel.utils import cache_once
-from sglang.srt.distributed.device_communicators.vmm_utils import (
+from flliper.jit_kernel.tests.utils import multigpu_pytest_main
+from flliper.jit_kernel.utils import cache_once
+from flliper.srt.distributed.device_communicators.vmm_utils import (
     check_drv,
     exchange_posix_fds,
     export_shareable_handles,
@@ -31,7 +31,7 @@ from sglang.srt.distributed.device_communicators.vmm_utils import (
     map_chunk_into_span,
     release_mappings,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="2-gpu-large")
 

@@ -15,24 +15,24 @@ vllm                      0.2.5
 outlines                  0.0.22
 ```
 
-### Benchmark sglang
+### Benchmark flliper
 
 Run Llama-7B
 
 ```
-python3 -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python3 -m flliper.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 ```
 
 Run Mixtral-8x7B
 
 ```
-python3 -m sglang.launch_server --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 --port 30000 --tp-size 8
+python3 -m flliper.launch_server --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 --port 30000 --tp-size 8
 ```
 
 Benchmark
 
 ```
-python3 bench_sglang.py --num-questions 10
+python3 bench_flliper.py --num-questions 10
 ```
 
 

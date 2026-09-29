@@ -11,11 +11,11 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
-from sglang.srt.disaggregation.common.utils import pack_int_lists
-from sglang.srt.disaggregation.nixl.conn import (
+from flliper.srt.disaggregation.base.conn import KVPoll
+from flliper.srt.disaggregation.common.conn import CommonKVManager
+from flliper.srt.disaggregation.common.staging_handler import PrefillStagingContext
+from flliper.srt.disaggregation.common.utils import pack_int_lists
+from flliper.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
     NixlKVManager,
     NixlKVReceiver,
@@ -24,8 +24,8 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferKVChunk,
     TransferStatus,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 
@@ -97,7 +97,7 @@ class FakeStagingAllocator:
 
 
 def _fake_staging_buffer_module(mock_gather=None):
-    module = types.ModuleType("sglang.srt.disaggregation.common.staging_buffer")
+    module = types.ModuleType("flliper.srt.disaggregation.common.staging_buffer")
     module.StagingAllocator = FakeStagingAllocator
     module.compute_head_slice_params = lambda *args: (0, 1, 0, 1)
     module.compute_staging_layout = lambda *args: (2, [256, 256], 512)
@@ -427,7 +427,7 @@ class TestNixlReceiverPoll(CustomTestCase):
             self.assertEqual(receiver.poll(), terminal_status)
             self.assertEqual(receiver.conclude_state, terminal_status)
 
-    @patch("sglang.srt.disaggregation.nixl.conn.time.time")
+    @patch("flliper.srt.disaggregation.nixl.conn.time.time")
     def test_waiting_timeout_records_failure(self, mock_time):
         mock_time.return_value = 20.0
         receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
@@ -439,7 +439,7 @@ class TestNixlReceiverPoll(CustomTestCase):
         self.assertIn("timed out", mgr.record_failure.call_args[0][1])
         mgr.update_status.assert_called_once_with(11, KVPoll.Failed)
 
-    @patch("sglang.srt.disaggregation.nixl.conn.time.time")
+    @patch("flliper.srt.disaggregation.nixl.conn.time.time")
     def test_transfer_done_returns_success_and_cleans_room_state(self, mock_time):
         mock_time.return_value = 12.0
         receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
@@ -629,7 +629,7 @@ class TestNixlStaging(CustomTestCase):
         with patch.dict(
             sys.modules,
             {
-                "sglang.srt.disaggregation.common.staging_buffer": (
+                "flliper.srt.disaggregation.common.staging_buffer": (
                     _fake_staging_buffer_module()
                 )
             },
@@ -671,7 +671,7 @@ class TestNixlStaging(CustomTestCase):
             with patch.dict(
                 sys.modules,
                 {
-                    "sglang.srt.disaggregation.common.staging_buffer": (
+                    "flliper.srt.disaggregation.common.staging_buffer": (
                         _fake_staging_buffer_module()
                     )
                 },
@@ -747,7 +747,7 @@ class TestNixlStaging(CustomTestCase):
         with patch.dict(
             sys.modules,
             {
-                "sglang.srt.disaggregation.common.staging_buffer": (
+                "flliper.srt.disaggregation.common.staging_buffer": (
                     _fake_staging_buffer_module(mock_gather)
                 )
             },
@@ -794,7 +794,7 @@ class TestNixlStaging(CustomTestCase):
         with patch.dict(
             sys.modules,
             {
-                "sglang.srt.disaggregation.common.staging_buffer": (
+                "flliper.srt.disaggregation.common.staging_buffer": (
                     _fake_staging_buffer_module()
                 )
             },

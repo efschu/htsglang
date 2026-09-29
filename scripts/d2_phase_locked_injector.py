@@ -72,7 +72,7 @@ is reported separately for that reason; the report prints the pending sequence
 rather than one number so the two shapes stay distinguishable.
 
 Mechanism, from the code rather than from the logs
-(python/sglang/srt/managers/phase_policy.py, IDLE_LOCKED branch):
+(python/flliper/srt/managers/phase_policy.py, IDLE_LOCKED branch):
 
   * The branch sits ABOVE the min-dwell check and deliberately bypasses it, on
     the strength of a written claim: "IT CANNOT OSCILLATE ... After the flip

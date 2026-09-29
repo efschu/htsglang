@@ -4,12 +4,12 @@
     15:28:40-15:36:12 (deadman BUSY-STARVED). Under H105b only the attention
     host runs the load-back; the workers read its verdict first. The host's
     load-back was refused by the group floor and drained ITS evictable leaves
-    (xsn285 WEG2-LOADBACK-EVICT: 116416 at 15:28:40, 97152 at 15:28:52) -- the
+    (xsn285 PDFLIP-LOADBACK-EVICT: 116416 at 15:28:40, 97152 at 15:28:52) -- the
     workers never did. ``#1045 FLOOR PUBLISHED floor=30336 max=243904
     pools_equal=False``: max - floor = 213568 = 116416 + 97152; the workers'
     H105 local_budget 243904 = 30336 free + 213568 evictable; the host's
     budget 48576 = floor 30336 + own evictable 18240 < price 79176 -> the head
-    weg2-14-33 was refused 8920 times with 0 running, nothing ever drained the
+    pdflip-14-33 was refused 8920 times with 0 running, nothing ever drained the
     workers, the floor never rose.
 
     Fix: the host's drain rides the H105 verdict it sends anyway; every worker
@@ -17,7 +17,7 @@
     fund with nothing running stops by name (FormAAdmissionDeadlock).
 
 (2) rc12z22-dwell30 7d507357b9, boot ...dwell30bar1dauer09281540, D 15:51:41,
-    all three ranks: ``SEAT-AGE DISPLACE rid_out=weg2-6-33 ... trigger=kv``
+    all three ranks: ``SEAT-AGE DISPLACE rid_out=pdflip-6-33 ... trigger=kv``
     requeued the youngest running request AFTER the pass's #580 prefetch
     drain; the admission loop reached it and ``_prefetch_done_for`` raised
     ('the queue was mutated in between'). Fix: the displaced rid is excluded
@@ -41,23 +41,23 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch
 
-from sglang.srt.managers import schedule_policy as sp
-from sglang.srt.managers import tp_match_floor as m
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.managers import schedule_policy as sp
+from flliper.srt.managers import tp_match_floor as m
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
-#: weg2-14-33 geometry (D log 15:28:40-15:36:12).
-RID = "weg2-14-33"
+#: pdflip-14-33 geometry (D log 15:28:40-15:36:12).
+RID = "pdflip-14-33"
 DEVICE_PREFIX = 18240
 HOST_EXTENT = 75008 - DEVICE_PREFIX
 FILL = 75016
-HOST_DRAINED = 116416  # WEG2-LOADBACK-EVICT 15:28:40 (TP0 only)
+HOST_DRAINED = 116416  # PDFLIP-LOADBACK-EVICT 15:28:40 (TP0 only)
 WORKER_EVICTABLE = 116416  # the same leaves, still on the workers
 AVAILABLE = 200_000  # the pre-lock gate passes; the load-back floor refuses
 
@@ -104,8 +104,8 @@ def _tree_cache(*, adopts: bool, drain: int = 0, evictable: int = 0):
     tc.swa_evictable_size.return_value = 0
     tc.disable = False
     tc.uniform_avail_floor = None
-    tc._weg2_loadback_no_room = 0
-    tc._weg2_loadback_drained_total = 0
+    tc._pdflip_loadback_no_room = 0
+    tc._pdflip_loadback_drained_total = 0
     tc.inc_lock_ref.return_value = IncLockRefResult()
     tc.dec_lock_ref.return_value = DecLockRefResult()
     tc.evict.return_value = SimpleNamespace(num_tokens_evicted=evictable)
@@ -114,7 +114,7 @@ def _tree_cache(*, adopts: bool, drain: int = 0, evictable: int = 0):
         # TP0: the group floor refuses, xsn285 drains THIS rank's leaves and
         # counts them; the mamba restore adopted the anchor -> the WAIT branch.
         if adopts:
-            tc._weg2_loadback_drained_total += drain
+            tc._pdflip_loadback_drained_total += drain
             params.req.mamba_loadback_anchor_adopted = True
         return torch.arange(0, dtype=torch.int64), params.req.last_node
 
@@ -178,7 +178,7 @@ class HostDrainRidesTheVerdictTest(unittest.TestCase):
         ):
             adder.form_a_admission_follow = sched._form_a_admission_follow_fn()
         with patch.object(sp, "_pp_load_back_extent", return_value=extent), patch(
-            "sglang.srt.mem_cache.common.release_admission_acquired_mamba_slot"
+            "flliper.srt.mem_cache.common.release_admission_acquired_mamba_slot"
         ):
             return adder.add_one_req(_req(), truncation_align_size=None)
 
@@ -255,7 +255,7 @@ class NamedDeadlockStopTest(unittest.TestCase):
 
 
 class DisplacedAfterTheDrainTest(unittest.TestCase):
-    """rc12z22-dwell30 15:51:41: SEAT-AGE DISPLACE weg2-6-33 after the drain."""
+    """rc12z22-dwell30 15:51:41: SEAT-AGE DISPLACE pdflip-6-33 after the drain."""
 
     def _sched(self, victim, older):
         s = SimpleNamespace(
@@ -268,31 +268,31 @@ class DisplacedAfterTheDrainTest(unittest.TestCase):
         return s
 
     def _displace(self, s, victim):
-        from sglang.srt.weg2 import d_park_runtime as dpr
+        from flliper.srt.pdflip import d_park_runtime as dpr
 
         rb = MagicMock()
         rb.reqs = [victim]
         rb.spec_algorithm = None
-        with patch("sglang.srt.weg2.seat_age.enabled", return_value=True), patch.object(
+        with patch("flliper.srt.pdflip.seat_age.enabled", return_value=True), patch.object(
             dpr.d_seats, "d_flip_park_active", return_value=True
         ), patch.object(dpr, "seat_cap", return_value=1), patch(
-            "sglang.srt.weg2.seat_age.displace_victim",
-            return_value=("weg2-6-31", "weg2-6-33"),
+            "flliper.srt.pdflip.seat_age.displace_victim",
+            return_value=("pdflip-6-31", "pdflip-6-33"),
         ), patch.object(dpr.d_seats, "mark_parked"), patch.object(
             dpr.d_seats, "park_site", return_value=None
         ), patch.object(dpr, "_partial_keep", return_value="0"):
             return dpr.displace_for_age(s, rb)
 
     def test_dwell30_the_displaced_rid_sits_out_this_pass(self):
-        older = SimpleNamespace(rid="weg2-6-31")
-        victim = SimpleNamespace(rid="weg2-6-33")
+        older = SimpleNamespace(rid="pdflip-6-31")
+        victim = SimpleNamespace(rid="pdflip-6-33")
         s = self._sched(victim, older)
-        verdicts = {"weg2-6-31": True}  # the pass's #580 drain, before SA
-        self.assertEqual(self._displace(s, victim), "weg2-6-33")
+        verdicts = {"pdflip-6-31": True}  # the pass's #580 drain, before SA
+        self.assertEqual(self._displace(s, victim), "pdflip-6-33")
         self.assertIn(victim, s.waiting_queue)
-        from sglang.srt.weg2 import d_park_runtime as dpr
+        from flliper.srt.pdflip import d_park_runtime as dpr
 
-        self.assertEqual(dpr.exclude_displaced(s, verdicts), "weg2-6-33")
+        self.assertEqual(dpr.exclude_displaced(s, verdicts), "pdflip-6-33")
         # the admission loop reads a not-done verdict instead of raising
         self.assertFalse(s._prefetch_done_for(victim, verdicts))
         self.assertTrue(s._prefetch_done_for(older, verdicts))

@@ -52,9 +52,9 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt import uneven_perf
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import uneven_perf
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -569,14 +569,14 @@ _REFERENCE_RIG_VECTORS = (
     (16, 2, 3),
 )
 
-_SOLVE_PATH = "python/sglang/srt/uneven_perf.py"
+_SOLVE_PATH = "python/flliper/srt/uneven_perf.py"
 
 
 def _repo_root():
     here = os.path.abspath(__file__)
     for _ in range(8):
         here = os.path.dirname(here)
-        if os.path.isdir(os.path.join(here, "python", "sglang")):
+        if os.path.isdir(os.path.join(here, "python", "flliper")):
             return here
     raise AssertionError("could not locate the repository root from the test file")
 
@@ -801,7 +801,7 @@ class TestTheCapacityFirstDefaultNamesItsAlternative(CustomTestCase):
     """
 
     def test_the_notice_names_the_flag_and_the_targets(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         notice = ServerArgs.CAPACITY_FIRST_DEFAULT_NOTICE
         self.assertIn("auto-performance", notice)
@@ -813,7 +813,7 @@ class TestTheCapacityFirstDefaultNamesItsAlternative(CustomTestCase):
         self.assertIn("operating point", notice)
 
     def test_plain_auto_emits_the_notice(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         view = types.SimpleNamespace(
             rank_tp_ratio=[3, 2, 2],
@@ -821,13 +821,13 @@ class TestTheCapacityFirstDefaultNamesItsAlternative(CustomTestCase):
             rank_vocab_ratio=None,
             rank_moe_ratio=None,
         )
-        with mock.patch("sglang.srt.server_args.logger") as log:
+        with mock.patch("flliper.srt.server_args.logger") as log:
             ServerArgs._announce_capacity_first_default(view)
         emitted = "\n".join(str(call) for call in log.info.call_args_list)
         self.assertIn("auto-performance", emitted)
 
     def test_a_pinned_family_vector_is_called_out(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         view = types.SimpleNamespace(
             rank_tp_ratio=[3, 2, 2],
@@ -835,7 +835,7 @@ class TestTheCapacityFirstDefaultNamesItsAlternative(CustomTestCase):
             rank_vocab_ratio=None,
             rank_moe_ratio=None,
         )
-        with mock.patch("sglang.srt.server_args.logger") as log:
+        with mock.patch("flliper.srt.server_args.logger") as log:
             ServerArgs._announce_capacity_first_default(view)
         emitted = "\n".join(str(call) for call in log.info.call_args_list)
         self.assertIn("--rank-mlp-ratio", emitted)

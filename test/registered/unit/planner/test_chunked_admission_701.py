@@ -31,7 +31,7 @@ Hermetic: pure arithmetic, no CUDA, no scheduler import.
 """
 
 import pytest
-from sglang.srt.planner.chunked_admission import (
+from flliper.srt.planner.chunked_admission import (
     ChunkedCommitmentLedger,
     PoolState,
     decide_chunked_admission,

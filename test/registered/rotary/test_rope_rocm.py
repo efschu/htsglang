@@ -2,17 +2,17 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.rotary_embedding import RotaryEmbedding
-from sglang.srt.utils import get_bool_env_var, is_hip
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.rotary_embedding import RotaryEmbedding
+from flliper.srt.utils import get_bool_env_var, is_hip
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=3, suite="stage-b-test-1-gpu-small-amd")
 
 torch.manual_seed(0)
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("FLLIPER_USE_AITER") and _is_hip
 
 
 _CASES = [
@@ -25,7 +25,7 @@ _CASES = [
 ]
 
 
-@unittest.skipIf(_use_aiter, reason="SGLANG_USE_AITER=1 will not use vllm path.")
+@unittest.skipIf(_use_aiter, reason="FLLIPER_USE_AITER=1 will not use vllm path.")
 class TestRotaryEmbeddingNative(CustomTestCase):
     # Compare RotaryEmbedding.forward_hip() to forward_native().
     def _run_case(
@@ -70,7 +70,7 @@ class TestRotaryEmbeddingNative(CustomTestCase):
                 self._run_case(*case)
 
 
-@unittest.skipIf(not _use_aiter, reason="Requires AMD GPU plus SGLANG_USE_AITER=1")
+@unittest.skipIf(not _use_aiter, reason="Requires AMD GPU plus FLLIPER_USE_AITER=1")
 class TestRotaryEmbeddingAITer(CustomTestCase):
     # NOTE: Slightly relaxed tolerance (2e-2 vs 1e-2) for AITER RoPE kernel.
     # Minor precision differences under investigation.

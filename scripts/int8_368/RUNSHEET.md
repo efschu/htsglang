@@ -10,7 +10,7 @@ numbers into the next task (or into closing #368).
 linear layer and nothing else:
 
 ```
-python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8.py
+python/flliper/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8.py
   :213   x_q, x_scale = per_token_quant_int8(x)          # Triton, one program per token row
   :215   int8_scaled_mm(x_q, layer.weight, x_scale,      # CUTLASS, sgl_kernel
                         layer.weight_scale, out_dtype=x.dtype, bias=bias)
@@ -60,7 +60,7 @@ derives and measures both; identical GEMMs are measured once and attributed
 to every plan that produces them.
 
 All derived from the checkpoint config, cross-checked against
-`sglang.srt.distributed.utils._partition_units_raw`.
+`flliper.srt.distributed.utils._partition_units_raw`.
 
 | shape | N (out) | K (in) | layers/token | plans | module |
 |---|---:|---:|---:|---|---|

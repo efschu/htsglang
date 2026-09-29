@@ -22,7 +22,7 @@ and an escalation, and a dead peer walks past both:
     produces INTERMITTENT expiries: the specimen logged 20 CUMULATIVE
     expiries in ~36 s and never escalated.
   * ``defer_stall_for_building_peer`` can extend the wait to
-    ``SGLANG_BARLINK_BUILD_WINDOW_CAP_S`` (900 s) off a published build
+    ``FLLIPER_BARLINK_BUILD_WINDOW_CAP_S`` (900 s) off a published build
     marker. A process that no longer exists is not building anything.
 
 So the fix is not a shorter timeout. It is a DIFFERENT QUESTION, asked at the
@@ -40,7 +40,7 @@ kills:
     passes case 1 and dies here;
  4. a published build window does NOT forgive a dead peer -- placing the
     check after ``defer_stall_for_building_peer`` passes case 1 and dies here;
- 5. ``SGLANG_BARLINK_PEER_LIVENESS=0`` restores the previous behaviour
+ 5. ``FLLIPER_BARLINK_PEER_LIVENESS=0`` restores the previous behaviour
     exactly, so the escape hatch the message advertises actually exists;
  6. the deadline-0 branch, which blocks in the driver with no timeout at all,
     asks before it enters;
@@ -62,15 +62,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.distributed.device_communicators import barlink_liveness as live
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators import barlink_liveness as live
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     Bar1CollectiveStalled,
     Bar1PeerLost,
     BarlinkBar1Transport,
     raise_if_peer_lost,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -156,9 +156,9 @@ class AbortGateLivenessTest(CustomTestCase):
         self._env = mock.patch.dict(
             os.environ,
             {
-                "SGLANG_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS": "40",
-                "SGLANG_BARLINK_PEER_PROBE_S": "0.01",
-                "SGLANG_BARLINK_PEER_LIVENESS": "1",
+                "FLLIPER_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS": "40",
+                "FLLIPER_BARLINK_PEER_PROBE_S": "0.01",
+                "FLLIPER_BARLINK_PEER_LIVENESS": "1",
             },
         )
         self._env.start()
@@ -214,7 +214,7 @@ class AbortGateLivenessTest(CustomTestCase):
         raised at 10 ms, and the counter was 0.
         """
         t = _transport(table=self._table(dead=True))
-        with mock.patch.dict(os.environ, {"SGLANG_BARLINK_PEER_PROBE_S": "10"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_BARLINK_PEER_PROBE_S": "10"}):
             with self.assertRaises(Bar1PeerLost):
                 t._wait_ctl_event()
         # The point is not merely that it raised, but that it raised WITHOUT
@@ -264,9 +264,9 @@ class AbortGateLivenessTest(CustomTestCase):
         # Probe interval longer than the deadline, so this case reaches the
         # deferral's own gate on the EXPIRY path rather than being short-cut
         # by the in-loop probe -- otherwise it would pass for the wrong reason.
-        with mock.patch.dict(os.environ, {"SGLANG_BARLINK_PEER_PROBE_S": "10"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_BARLINK_PEER_PROBE_S": "10"}):
             with mock.patch(
-                "sglang.srt.distributed.device_communicators.barlink_bar1"
+                "flliper.srt.distributed.device_communicators.barlink_bar1"
                 ".defer_stall_for_building_peer",
                 return_value=True,
             ) as deferral:
@@ -284,7 +284,7 @@ class AbortGateLivenessTest(CustomTestCase):
         """
         t = _transport(table=self._table(dead=True))
         t._ctl_stall_run = 0
-        with mock.patch.dict(os.environ, {"SGLANG_BARLINK_PEER_LIVENESS": "0"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_BARLINK_PEER_LIVENESS": "0"}):
             self.assertFalse(t._wait_ctl_event())
             # and the pre-existing escalation still works untouched
             t._ctl_stall_run = 10_000
@@ -301,7 +301,7 @@ class AbortGateLivenessTest(CustomTestCase):
         ev = _ScriptedEvent(never=True)
         t = _transport(event=ev, table=self._table(dead=True))
         with mock.patch.dict(
-            os.environ, {"SGLANG_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS": "0"}
+            os.environ, {"FLLIPER_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS": "0"}
         ):
             with self.assertRaises(Bar1PeerLost):
                 t._wait_ctl_event()
@@ -316,7 +316,7 @@ class AbortGateLivenessTest(CustomTestCase):
         """
         t = _transport(table=self._table(dead=True))
         with mock.patch.dict(
-            os.environ, {"SGLANG_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS": "30000"}
+            os.environ, {"FLLIPER_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS": "30000"}
         ):
             t0 = time.monotonic()
             with self.assertRaises(Bar1PeerLost):

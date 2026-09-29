@@ -1,4 +1,4 @@
-"""R5 (rc12z2 e8a2cd2dc5, P 03:26:41, rid weg2-44-76): the told-fidelity probe
+"""R5 (rc12z2 e8a2cd2dc5, P 03:26:41, rid pdflip-44-76): the told-fidelity probe
 must ask PP0's tree with the tree's own key form.
 
 THE DEATH. PP0 read 47168 tokens (8x #1433 L3->L2 fill), clamped the told to
@@ -7,7 +7,7 @@ own match then reached 37952 with no recurrent state there
 (``#904 ... refused=37952 why=MambaComponent:absent``, ``[#928 anchor]
 REFUSING resume``) -> PP0 admitted at 0, PP2 likewise; PP1 resumed at 37952
 (``#988 LOADBACK ... mamba_restored``) -> ``#1233 W27 ... cause=START-SPLIT``
-(sender 32768.. vs receiver 70720..). TF (``weg2_told_fidelity``, default on)
+(sender 32768.. vs receiver 70720..). TF (``pdflip_told_fidelity``, default on)
 exists for exactly this -- PP0 asks its own tree before the Admit and retells
 0 for every rank -- but every probe on that boot died in ``RadixKey.match``:
 ``#TF told-fidelity probe skipped ... AssertionError((<class 'array.array'>,
@@ -23,9 +23,9 @@ from __future__ import annotations
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.managers import weg2_store_told as m
-from sglang.srt.managers import weg2_told_fidelity as tf
-from sglang.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.managers import pdflip_store_told as m
+from flliper.srt.managers import pdflip_told_fidelity as tf
+from flliper.srt.mem_cache.radix_cache import RadixKey
 
 TOLD = 37952
 PROMPT = 79688
@@ -53,7 +53,7 @@ class _ArrayTree:
 
 
 def _req():
-    return SimpleNamespace(rid="weg2-44-76", origin_input_ids=list(range(PROMPT)),
+    return SimpleNamespace(rid="pdflip-44-76", origin_input_ids=list(range(PROMPT)),
                            full_untruncated_fill_ids=list(range(PROMPT)), extra_key=None,
                            _prefetch_registered_prefix_len=0)
 
@@ -86,7 +86,7 @@ def test_the_probe_key_is_the_tree_key_form():
 def test_the_anchor_clamp_hashes_the_same_pages():
     """The #1416d clamp shares the probe key: an array key hashes exactly as
     the list key did (the store's page keys do not move)."""
-    from sglang.srt.mem_cache.utils import get_hash_str
+    from flliper.srt.mem_cache.utils import get_hash_str
 
     ids = list(range(4 * 64 + 1))
     lst = get_hash_str(RadixKey(ids, is_bigram=True), None, page_size=64)

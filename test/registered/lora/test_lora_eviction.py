@@ -19,9 +19,9 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.runners import SRTRunner
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.runners import SRTRunner
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=263, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=224, suite="stage-b-test-1-gpu-small-amd")

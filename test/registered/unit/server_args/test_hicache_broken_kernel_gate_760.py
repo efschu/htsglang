@@ -23,9 +23,9 @@ runs and no argument changes meaning.
 import unittest
 from unittest import mock
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -42,7 +42,7 @@ def _resolved(cuda=True, **kwargs):
     base = dict(enable_hierarchical_cache=True, hicache_storage_backend="file")
     base.update(kwargs)
     args = ServerArgs(model_path="dummy", **base)
-    with mock.patch("sglang.srt.server_args.is_cuda", return_value=cuda):
+    with mock.patch("flliper.srt.server_args.is_cuda", return_value=cuda):
         args._handle_hicache()
     return args
 
@@ -107,7 +107,7 @@ class TestHicacheBrokenKernelGate(CustomTestCase):
             hicache_mem_layout="page_first_direct",
             hicache_io_backend="direct",
         )
-        with mock.patch("sglang.srt.server_args.is_cuda", return_value=True):
+        with mock.patch("flliper.srt.server_args.is_cuda", return_value=True):
             args._handle_hicache()
         self.assertEqual(args.hicache_mem_layout, "page_first_direct")
 
@@ -149,14 +149,14 @@ class TestMambaPoolHostAcceptsLayerFirst(CustomTestCase):
 
     def _layout_check(self, layout):
         """Drive only the layout guard, with no torch pools involved."""
-        from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost
+        from flliper.srt.mem_cache.memory_pool_host import MambaPoolHost
 
         return MambaPoolHost.__init__(
             mock.Mock(), mock.Mock(), 2.0, 1, layout=layout
         )
 
     def test_page_first_is_still_refused(self):
-        from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost
+        from flliper.srt.mem_cache.memory_pool_host import MambaPoolHost
 
         with self.assertRaises(ValueError) as ctx:
             self._layout_check("page_first")

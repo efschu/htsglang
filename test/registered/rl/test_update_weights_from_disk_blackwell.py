@@ -1,4 +1,4 @@
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=320, stage="extra-b", runner_config="4-gpu-b200")
 
@@ -7,8 +7,8 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,

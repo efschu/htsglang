@@ -106,7 +106,7 @@ class _Pool:
 
 class _Rank:
     def __init__(self, name, rows, clamp_at=None, raise_at=None):
-        from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+        from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
         self.name = name
         self.pool = _Pool(rows, RESERVATION, clamp_at=clamp_at, raise_at=raise_at)
@@ -184,7 +184,7 @@ class EveryExitIsNamed(unittest.TestCase):
             self.assertTrue(callable(getattr(rung, name, None)), f"missing {name}")
 
     def test_no_group_verdict_is_named(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         rung = _group()["PP1"].relief
         gap, reason = rung.floor_need_verdict()
@@ -193,7 +193,7 @@ class EveryExitIsNamed(unittest.TestCase):
         self.assertEqual(_exits(_group()["PP1"]) or {}, {})  # fresh rank, no exits yet
 
     def test_the_abstain_sentinel_lands_on_no_group_verdict_not_a_bare_zero(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _group()
         rung = ranks["PP1"].relief
@@ -202,7 +202,7 @@ class EveryExitIsNamed(unittest.TestCase):
         self.assertEqual(rung.floor_need_verdict()[1], K.FLOOR_NEED_NO_GROUP_VERDICT)
 
     def test_group_fits_is_named(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _group()
         rung = ranks["PP1"].relief
@@ -211,7 +211,7 @@ class EveryExitIsNamed(unittest.TestCase):
         self.assertEqual(rung.floor_need_verdict()[1], K.FLOOR_NEED_GROUP_FITS)
 
     def test_not_the_floor_is_named(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _group()
         _ballot(ranks, close=False)
@@ -221,7 +221,7 @@ class EveryExitIsNamed(unittest.TestCase):
             self.assertEqual(reason, K.FLOOR_NEED_NOT_THE_FLOOR)
 
     def test_gap_is_named(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _group()
         _ballot(ranks, close=False)
@@ -229,7 +229,7 @@ class EveryExitIsNamed(unittest.TestCase):
         self.assertEqual((gap, reason), (W6_GAP, K.FLOOR_NEED_GAP))
 
     def test_stale_arena_is_named(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _group()
         _ballot(ranks, close=False)
@@ -276,7 +276,7 @@ class AClampingPoolIsNamed(unittest.TestCase):
         )
 
     def test_the_clamp_has_its_own_exit_name(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = self._clamped()
         _ballot(ranks, close=False)
@@ -304,7 +304,7 @@ class AClampingPoolIsNamed(unittest.TestCase):
         This is the whole lesson: window 6 could not tell them apart, or tell
         either from 'there was no gap'.
         """
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         clamp = self._clamped()
         _ballot(clamp, close=False)
@@ -352,7 +352,7 @@ class AClampingPoolIsNamed(unittest.TestCase):
 
     def test_the_metal_case_zero_growth_is_named_and_refused(self):
         """clamp_at == floor: the commit is accepted and the pool does not move."""
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _group()
         ranks["PP1"] = _Rank("PP1", W6_BACKED["PP1"], clamp_at=W6_FLOOR)
@@ -375,7 +375,7 @@ class TheHealthyPathStillConverges(unittest.TestCase):
             self.assertEqual(r.exposed(), W6_LIVE_SPAN, f"{name}")
 
     def test_the_grow_exit_is_named_too(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _group()
         _ballot(ranks, close=False)
@@ -423,7 +423,7 @@ class TheExitSetIsExhaustive(unittest.TestCase):
     """A name nobody can reach is a name that lies about coverage."""
 
     def test_every_declared_exit_is_reachable_by_this_suite(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         seen = set()
         # healthy: GAP + GROWN + NOT-THE-FLOOR (+ GROUP-FITS once converged)

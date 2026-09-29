@@ -35,7 +35,7 @@ lane, not a better shard plan. Those three points are fixtures below.
 CPU-only: pure tensor arithmetic and mocked backend resolution.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -45,13 +45,13 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.linear import LinearBase
-from sglang.srt.layers.quantization import fp4_utils
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+from flliper.srt.layers.linear import LinearBase
+from flliper.srt.layers.quantization import fp4_utils
+from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
     CompressedTensorsLinearMethod,
 )
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+from flliper.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Fp4Dequant,
     CompressedTensorsW8A16Fp8,
@@ -59,14 +59,14 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     nvfp4_native_unpackable_reason,
     nvfp4_unpackable_reason,
 )
-from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4 import (
+from flliper.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4 import (
     NVFP4_BLOCK_SIZE,
     NVFP4_NATIVE_MIN_N,
     dequantize_nvfp4,
 )
-from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
-from sglang.srt.layers.quantization.marlin_utils import GPTQ_MARLIN_MIN_THREAD_N
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+from flliper.srt.layers.quantization.marlin_utils import GPTQ_MARLIN_MIN_THREAD_N
+from flliper.test.test_utils import CustomTestCase
 
 HIDDEN = 5120
 #: Qwen3.5/3.6 gated-delta-net: in_proj_b and in_proj_a, 48 rows each.
@@ -306,7 +306,7 @@ class TestTheRouting(CustomTestCase):
     def test_the_lane_change_is_announced_by_name(self):
         with _fp4_backend(Fp4GemmRunnerBackend.MARLIN):
             with self.assertLogs(
-                "sglang.srt.layers.quantization.compressed_tensors."
+                "flliper.srt.layers.quantization.compressed_tensors."
                 "compressed_tensors",
                 level=logging.WARNING,
             ) as captured:
@@ -324,7 +324,7 @@ class TestTheRouting(CustomTestCase):
         """Per layer, not warning_once: 48 gates cost 48 lines, by design."""
         with _fp4_backend(Fp4GemmRunnerBackend.MARLIN):
             with self.assertLogs(
-                "sglang.srt.layers.quantization.compressed_tensors."
+                "flliper.srt.layers.quantization.compressed_tensors."
                 "compressed_tensors",
                 level=logging.WARNING,
             ) as captured:
@@ -692,7 +692,7 @@ class TestTheLateRouting(CustomTestCase):
 
     def test_the_swap_is_announced_with_the_layer_name(self):
         with self.assertLogs(
-            "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors",
+            "flliper.srt.layers.quantization.compressed_tensors.compressed_tensors",
             level=logging.WARNING,
         ) as captured:
             self._run(Fp4GemmRunnerBackend.CUTLASS, [42])

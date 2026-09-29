@@ -18,10 +18,10 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from unittest import mock
 
-from sglang.srt.planner import self_update as su
-from sglang.srt.planner import webui
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import self_update as su
+from flliper.srt.planner import webui
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -231,7 +231,7 @@ class TestDataSchemaGuard(CustomTestCase):
         with open(os.path.join(self.data, su.SCHEMA_STAMP_NAME), "w") as f:
             json.dump({"schema_version": su.DATA_SCHEMA_VERSION + 1}, f)
         with mock.patch.dict(
-            os.environ, {"SGLANG_PLANNER_DATA_DIR": self.data}
+            os.environ, {"FLLIPER_PLANNER_DATA_DIR": self.data}
         ):
             d = webui.config_profiles_save(
                 {"name": "x", "settings": {"model": "m"}}
@@ -301,11 +301,11 @@ class TestCodeDataSeparation(CustomTestCase):
             self.assertTrue(os.path.exists(legacy))
 
     def test_default_store_paths_live_outside_the_code_tree(self):
-        import sglang.srt.planner as planner_pkg
+        import flliper.srt.planner as planner_pkg
 
         pkg_root = os.path.dirname(os.path.abspath(planner_pkg.__file__))
-        from sglang.srt.planner.energy import DEFAULT_RESULTS_STORE
-        from sglang.srt.planner.hicache_savings import DEFAULT_HICACHE_STORE
+        from flliper.srt.planner.energy import DEFAULT_RESULTS_STORE
+        from flliper.srt.planner.hicache_savings import DEFAULT_HICACHE_STORE
 
         for p in (DEFAULT_HICACHE_STORE, DEFAULT_RESULTS_STORE):
             self.assertFalse(
@@ -323,8 +323,8 @@ class TestVersionRoutes(CustomTestCase):
         self.env = mock.patch.dict(
             os.environ,
             {
-                "SGLANG_DASHBOARD_HOME": self.home,
-                "SGLANG_PLANNER_DATA_DIR": os.path.join(self._tmp.name, "data"),
+                "FLLIPER_DASHBOARD_HOME": self.home,
+                "FLLIPER_PLANNER_DATA_DIR": os.path.join(self._tmp.name, "data"),
             },
         )
         self.env.start()
@@ -361,7 +361,7 @@ class TestVersionRoutes(CustomTestCase):
         _fake_install(store, "v1")
         _fake_install(store, "v2")
         store.set_current("v1")
-        with mock.patch.dict(os.environ, {"SGLANG_DASHBOARD_SUPERVISED": "1"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_DASHBOARD_SUPERVISED": "1"}):
             d = webui.version_switch_payload(
                 {"action": "switch", "version": "v1", "confirmed": True}
             )
@@ -449,7 +449,7 @@ class TestSupervisorHelpers(CustomTestCase):
         self.assertFalse(ok)
 
     def test_serve_supervised_flag_parses(self):
-        from sglang.srt.planner.cli import build_parser
+        from flliper.srt.planner.cli import build_parser
 
         args = build_parser().parse_args(["--serve-supervised", "--port", "1234"])
         self.assertTrue(args.serve_supervised)

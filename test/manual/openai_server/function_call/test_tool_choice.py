@@ -1,5 +1,5 @@
 """
-Test script for tool_choice functionality in SGLang
+Test script for tool_choice functionality in fLLiper
 Tests: required, auto, and specific function choices in both streaming and non-streaming modes
 
 # To run the tests, use the following command:
@@ -12,9 +12,9 @@ import unittest
 
 import openai
 
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.srt.utils.hf_transformers_utils import get_tokenizer
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,

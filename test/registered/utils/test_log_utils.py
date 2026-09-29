@@ -7,8 +7,8 @@ import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from sglang.srt.utils.log_utils import create_log_targets, log_json
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.utils.log_utils import create_log_targets, log_json
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")

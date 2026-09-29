@@ -50,26 +50,26 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.hicache_phase_binding import binding_state
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.hicache_phase_binding import binding_state
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from flliper.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
-from sglang.srt.mem_cache.unified_radix_cache import (
+from flliper.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 # ~4s: one tiny CPU-only radix tree plus two tiny CPU host pools. No
 # accelerator, no group, no boot.
@@ -275,7 +275,7 @@ class TestTheGuardIsWiredToTheRealAuthority(CustomTestCase):
     def test_the_insert_is_gated_on_the_same_predicate_as_the_free(self):
         import inspect
 
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         src = inspect.getsource(UnifiedRadixCache.check_prefetch_progress)
         # The #905 free-side authority, reused rather than re-invented.

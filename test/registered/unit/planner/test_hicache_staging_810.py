@@ -18,7 +18,7 @@ WHAT THESE TESTS PIN, beyond the arithmetic:
 
 import unittest
 
-from sglang.srt.planner.hicache_staging import (
+from flliper.srt.planner.hicache_staging import (
     BYTES_PER_GB,
     DEFAULT_BURST_MARGIN,
     MIN_STAGING_GB,
@@ -28,8 +28,8 @@ from sglang.srt.planner.hicache_staging import (
     sustainable,
     write_staging_bytes,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -166,7 +166,7 @@ class TheDerivationTouchesNoBudgetRegistryTest(CustomTestCase):
     """
 
     def test_deriving_a_size_registers_nothing(self):
-        from sglang.srt.mem_cache.pinned_host_budget import (
+        from flliper.srt.mem_cache.pinned_host_budget import (
             clear_registered_posts,
             registered_posts,
         )
@@ -200,7 +200,7 @@ class TheDerivationTouchesNoBudgetRegistryTest(CustomTestCase):
         """The removed name, pinned. A future reader reaching for it is sent to
         `ServerArgs._post_hicache_staging_host_ledger`, which prices the posts
         jointly and by the RANK PRODUCT rather than per rank."""
-        import sglang.srt.planner.hicache_staging as mod
+        import flliper.srt.planner.hicache_staging as mod
 
         self.assertFalse(
             hasattr(mod, "fits_pinned_host_budget"),

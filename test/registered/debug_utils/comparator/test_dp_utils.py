@@ -3,23 +3,23 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis
-from sglang.srt.debug_utils.comparator.dp_utils import (
+from flliper.srt.debug_utils.comparator.dims_spec import ParallelAxis
+from flliper.srt.debug_utils.comparator.dp_utils import (
     _extract_dp_info,
     _group_has_data,
     filter_to_non_empty_dp_rank,
 )
-from sglang.srt.debug_utils.dump_loader import ValueWithMeta
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.dump_loader import ValueWithMeta
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
 
 
-def _make_sglang_meta(
+def _make_flliper_meta(
     *, tp_rank: int = 0, tp_size: int = 1, dp_rank: int = 0, dp_size: int = 1
 ) -> dict:
     return {
-        "sglang_parallel_info": {
+        "flliper_parallel_info": {
             "tp_rank": tp_rank,
             "tp_size": tp_size,
             "dp_rank": dp_rank,
@@ -51,8 +51,8 @@ def _make_item(value: object, meta: dict) -> ValueWithMeta:
 
 
 class TestExtractDpInfo:
-    def test_sglang_dp(self) -> None:
-        meta: dict = _make_sglang_meta(dp_rank=1, dp_size=4)
+    def test_flliper_dp(self) -> None:
+        meta: dict = _make_flliper_meta(dp_rank=1, dp_size=4)
         assert _extract_dp_info(meta, dp_axis=ParallelAxis.DP) == (1, 4)
 
     def test_megatron_dp(self) -> None:
@@ -63,7 +63,7 @@ class TestExtractDpInfo:
         assert _extract_dp_info({}, dp_axis=ParallelAxis.DP) is None
 
     def test_no_dp_fields(self) -> None:
-        meta: dict = {"sglang_parallel_info": {"tp_rank": 0, "tp_size": 2}}
+        meta: dict = {"flliper_parallel_info": {"tp_rank": 0, "tp_size": 2}}
         assert _extract_dp_info(meta, dp_axis=ParallelAxis.DP) is None
 
 
@@ -99,7 +99,7 @@ class TestFilterToNonEmptyDpRank:
         items: list[ValueWithMeta] = [
             _make_item(
                 value=torch.tensor([1.0]),
-                meta=_make_sglang_meta(dp_size=1),
+                meta=_make_flliper_meta(dp_size=1),
             ),
         ]
         result: list[ValueWithMeta] = filter_to_non_empty_dp_rank(
@@ -127,11 +127,11 @@ class TestFilterToNonEmptyDpRank:
         items: list[ValueWithMeta] = [
             _make_item(
                 value=["req_A"],
-                meta=_make_sglang_meta(dp_rank=0, dp_size=2),
+                meta=_make_flliper_meta(dp_rank=0, dp_size=2),
             ),
             _make_item(
                 value=["req_A"],
-                meta=_make_sglang_meta(dp_rank=1, dp_size=2),
+                meta=_make_flliper_meta(dp_rank=1, dp_size=2),
             ),
         ]
 
@@ -141,16 +141,16 @@ class TestFilterToNonEmptyDpRank:
 
         assert result is items
 
-    def test_dp2_one_empty_one_nonempty_sglang(self) -> None:
+    def test_dp2_one_empty_one_nonempty_flliper(self) -> None:
         """DP=2, rank 0 has data, rank 1 has empty tensor."""
         items: list[ValueWithMeta] = [
             _make_item(
                 value=torch.tensor([1.0, 2.0]),
-                meta=_make_sglang_meta(dp_rank=0, dp_size=2),
+                meta=_make_flliper_meta(dp_rank=0, dp_size=2),
             ),
             _make_item(
                 value=torch.tensor([]),
-                meta=_make_sglang_meta(dp_rank=1, dp_size=2),
+                meta=_make_flliper_meta(dp_rank=1, dp_size=2),
             ),
         ]
 
@@ -186,11 +186,11 @@ class TestFilterToNonEmptyDpRank:
         items: list[ValueWithMeta] = [
             _make_item(
                 value=torch.tensor([1.0]),
-                meta=_make_sglang_meta(dp_rank=0, dp_size=2),
+                meta=_make_flliper_meta(dp_rank=0, dp_size=2),
             ),
             _make_item(
                 value=torch.tensor([2.0]),
-                meta=_make_sglang_meta(dp_rank=1, dp_size=2),
+                meta=_make_flliper_meta(dp_rank=1, dp_size=2),
             ),
         ]
 
@@ -204,19 +204,19 @@ class TestFilterToNonEmptyDpRank:
         items: list[ValueWithMeta] = [
             _make_item(
                 value=torch.tensor([1.0]),
-                meta=_make_sglang_meta(tp_rank=0, tp_size=2, dp_rank=0, dp_size=2),
+                meta=_make_flliper_meta(tp_rank=0, tp_size=2, dp_rank=0, dp_size=2),
             ),
             _make_item(
                 value=torch.tensor([2.0]),
-                meta=_make_sglang_meta(tp_rank=1, tp_size=2, dp_rank=0, dp_size=2),
+                meta=_make_flliper_meta(tp_rank=1, tp_size=2, dp_rank=0, dp_size=2),
             ),
             _make_item(
                 value=torch.tensor([]),
-                meta=_make_sglang_meta(tp_rank=0, tp_size=2, dp_rank=1, dp_size=2),
+                meta=_make_flliper_meta(tp_rank=0, tp_size=2, dp_rank=1, dp_size=2),
             ),
             _make_item(
                 value=torch.tensor([]),
-                meta=_make_sglang_meta(tp_rank=1, tp_size=2, dp_rank=1, dp_size=2),
+                meta=_make_flliper_meta(tp_rank=1, tp_size=2, dp_rank=1, dp_size=2),
             ),
         ]
 
@@ -237,7 +237,7 @@ class TestFilterToNonEmptyDpRank:
 class TestExtractDpInfoWithAxis:
     def test_moe_dp_axis_found(self) -> None:
         meta: dict = {
-            "sglang_parallel_info": {
+            "flliper_parallel_info": {
                 "dp_rank": 0,
                 "dp_size": 2,
                 "moe_dp_rank": 1,
@@ -247,11 +247,11 @@ class TestExtractDpInfoWithAxis:
         assert _extract_dp_info(meta, dp_axis=ParallelAxis.MOE_DP) == (1, 4)
 
     def test_moe_dp_axis_not_found_returns_none(self) -> None:
-        meta: dict = _make_sglang_meta(dp_rank=0, dp_size=2)
+        meta: dict = _make_flliper_meta(dp_rank=0, dp_size=2)
         assert _extract_dp_info(meta, dp_axis=ParallelAxis.MOE_DP) is None
 
     def test_dp_axis_uses_default_fields(self) -> None:
-        meta: dict = _make_sglang_meta(dp_rank=1, dp_size=4)
+        meta: dict = _make_flliper_meta(dp_rank=1, dp_size=4)
         assert _extract_dp_info(meta, dp_axis=ParallelAxis.DP) == (1, 4)
 
 
@@ -261,11 +261,11 @@ class TestFilterToNonEmptyDpRankWithAxis:
         items: list[ValueWithMeta] = [
             _make_item(
                 value=torch.tensor([1.0, 2.0]),
-                meta=_make_sglang_meta(dp_rank=0, dp_size=2),
+                meta=_make_flliper_meta(dp_rank=0, dp_size=2),
             ),
             _make_item(
                 value=torch.tensor([]),
-                meta=_make_sglang_meta(dp_rank=1, dp_size=2),
+                meta=_make_flliper_meta(dp_rank=1, dp_size=2),
             ),
         ]
 
@@ -281,11 +281,11 @@ class TestFilterToNonEmptyDpRankWithAxis:
         items: list[ValueWithMeta] = [
             _make_item(
                 value=torch.tensor([1.0]),
-                meta=_make_sglang_meta(dp_rank=0, dp_size=2),
+                meta=_make_flliper_meta(dp_rank=0, dp_size=2),
             ),
             _make_item(
                 value=torch.tensor([2.0]),
-                meta=_make_sglang_meta(dp_rank=1, dp_size=2),
+                meta=_make_flliper_meta(dp_rank=1, dp_size=2),
             ),
         ]
 
@@ -298,7 +298,7 @@ class TestFilterToNonEmptyDpRankWithAxis:
     def test_moe_dp_axis_size_1_noop(self) -> None:
         """MOE_DP axis present but size=1 → noop."""
         meta: dict = {
-            "sglang_parallel_info": {
+            "flliper_parallel_info": {
                 "dp_rank": 0,
                 "dp_size": 2,
                 "moe_dp_rank": 0,
@@ -318,7 +318,7 @@ class TestFilterToNonEmptyDpRankWithAxis:
     def test_moe_dp_axis_filters_correctly(self) -> None:
         """MOE_DP axis size=2, one empty rank → correctly filters."""
         meta_rank0: dict = {
-            "sglang_parallel_info": {
+            "flliper_parallel_info": {
                 "dp_rank": 0,
                 "dp_size": 2,
                 "moe_dp_rank": 0,
@@ -326,7 +326,7 @@ class TestFilterToNonEmptyDpRankWithAxis:
             }
         }
         meta_rank1: dict = {
-            "sglang_parallel_info": {
+            "flliper_parallel_info": {
                 "dp_rank": 0,
                 "dp_size": 2,
                 "moe_dp_rank": 1,

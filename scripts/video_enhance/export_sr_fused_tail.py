@@ -40,7 +40,7 @@ import json
 import sys
 from pathlib import Path
 
-from sglang.srt.video_enhance.frame_math import Resolution
+from flliper.srt.video_enhance.frame_math import Resolution
 
 
 def _cpu_session(onnx_path: Path):
@@ -82,7 +82,7 @@ def grade_on_cpu(
     """
     import torch
 
-    from sglang.srt.video_enhance.fused_tail import grade_fused_tail
+    from flliper.srt.video_enhance.fused_tail import grade_fused_tail
 
     reference_session = _cpu_session(source_onnx)
     candidate_session = _cpu_session(fused_onnx)
@@ -126,12 +126,12 @@ def grade_on_cpu(
 
 
 def main(argv: list[str] | None = None) -> int:
-    from sglang.srt.video_enhance.fused_tail import (
+    from flliper.srt.video_enhance.fused_tail import (
         FUSED_TAIL_SUFFIX,
         TAIL_KINDS,
         fuse_tail,
     )
-    from sglang.srt.video_enhance.sr import REALESR_GENERAL_WDN_X4V3, fetch_model
+    from flliper.srt.video_enhance.sr import REALESR_GENERAL_WDN_X4V3, fetch_model
 
     parser = argparse.ArgumentParser(description="#457 fused-tail SR artifact + parity")
     parser.add_argument("--model-dir", default="/spinning/llm_stuff/k3-models/sr")

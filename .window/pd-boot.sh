@@ -13,8 +13,8 @@
 # "GPU-<uuid>" in CUDA_VISIBLE_DEVICES, which is ordering-independent, so that
 # is what is used.
 #
-# ENV. SGLANG_BARLINK=0 is kept only to match production and explains
-# NOTHING: environ.py:688 declares SGLANG_BARLINK = EnvBool(False), so it is
+# ENV. FLLIPER_BARLINK=0 is kept only to match production and explains
+# NOTHING: environ.py:688 declares FLLIPER_BARLINK = EnvBool(False), so it is
 # already the default, and on this rig barlink was additionally forced off
 # rig-wide by /spinning/COUNTERTEST_NCCL. An earlier version of this header
 # credited it with clearing a decode wedge. That was wrong.
@@ -25,9 +25,9 @@
 # (TP0 [..,16,19] vs TP1 [..,16,24] -> hang; identical lists -> served). Fixed
 # in base_cuda_graph_runner.py by min-reducing that bound across the TP group.
 #
-# SGLANG_UNEVEN_DCP_WEIGHTED=1 does have a mechanism -- the WEIGHTED owner rule
+# FLLIPER_UNEVEN_DCP_WEIGHTED=1 does have a mechanism -- the WEIGHTED owner rule
 # never reaches dcp_even_write_mask -- and is required by --draft-kv-layout dcp.
-# SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 is required because a decode TP
+# FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 is required because a decode TP
 # group spanning a 5090 and a 3080 is deliberately unbalanced.
 set -euo pipefail
 
@@ -44,10 +44,10 @@ BOOTSTRAP_PORT=8998
 
 export PYTHONPATH="$WT/python"
 export LD_LIBRARY_PATH=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 # barlink is deliberately NOT pinned here. An earlier version of this script
-# exported SGLANG_BARLINK=0, which was wrong twice over: it is a no-op
-# (environ.py:688 declares SGLANG_BARLINK = EnvBool(False)), and hardcoding it
+# exported FLLIPER_BARLINK=0, which was wrong twice over: it is a no-op
+# (environ.py:688 declares FLLIPER_BARLINK = EnvBool(False)), and hardcoding it
 # contradicts the standing order recorded in docs/rig-runbook.md sec 4 --
 # barlink is the collective transport for recipes on this rig, and pinning a
 # recipe to NCCL is exactly the "NCCL-Ausweich" that order forbids.
@@ -56,16 +56,16 @@ export SGLANG_MAMBA_SSM_DTYPE=bfloat16
 # with barlink OFF, because the rig-wide counter-test flag /spinning/COUNTERTEST_NCCL
 # was forcing the NCCL transport at the time. Route A x barlink is therefore
 # UNVALIDATED, not "known good" -- run it once the counter-test is lifted.
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-# The decode arm's TP group deliberately spans a 5090 and a 3080. sglang's
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+# The decode arm's TP group deliberately spans a 5090 and a 3080. flliper's
 # TP memory-balance check (model_runner.py:1880-1890) treats that as "some
 # GPUs may be occupied by other processes" and aborts -- it assumes a TP group
 # is homogeneous, which is the assumption this fork's uneven-TP path exists to
 # break. The imbalance is the CONFIGURATION here, expressed by
 # --rank-tp-ratio, not a symptom, so the check is downgraded to its warning
 # form via its own documented toggle rather than worked around.
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 
 mkdir -p "$LOGDIR"
 
@@ -132,7 +132,7 @@ elif [[ "$RUNG" == routea* ]]; then
     #
     # NCCL >= 2.30 IS required for two ranks on one card; the venv ships
     # 2.28.9, which sets NCCL_MULTI_RANK_GPU_ENABLE=1, ignores it, and fails at
-    # communicator build with "Duplicate GPU detected". SGLANG_NCCL_SO_PATH
+    # communicator build with "Duplicate GPU detected". FLLIPER_NCCL_SO_PATH
     # (pynccl_wrapper.py:48, read in the worker, which inherits this env)
     # points the DECODE server at a 2.30.7 libnccl.
     NCCL230="$WT/.deps/nccl2307/nvidia/nccl/lib/libnccl.so.2"
@@ -153,7 +153,7 @@ elif [[ "$RUNG" == routea* ]]; then
     echo "rung=$RUNG model=$MODEL ratio=$RATIO (4 ranks: PP=2 prefill + TP=2 co-located decode)"
 
     echo "== prefill arm PP=2 over both 3080s =="
-    setsid "$PY" -m sglang.launch_server \
+    setsid "$PY" -m flliper.launch_server \
         --model-path "$MODEL" --trust-remote-code \
         --disaggregation-mode prefill \
         --disaggregation-transfer-backend mooncake \
@@ -164,7 +164,7 @@ elif [[ "$RUNG" == routea* ]]; then
         > "$LOGDIR/prefill_$RUNG.log" 2>&1 &
 
     echo "== decode arm TP=2 / DCP=2, BOTH ranks co-located on the 5090 =="
-    SGLANG_NCCL_SO_PATH="$NCCL230" setsid "$PY" -m sglang.launch_server \
+    FLLIPER_NCCL_SO_PATH="$NCCL230" setsid "$PY" -m flliper.launch_server \
         --model-path "$MODEL" --trust-remote-code \
         --disaggregation-mode decode \
         --disaggregation-transfer-backend mooncake \
@@ -176,7 +176,7 @@ elif [[ "$RUNG" == routea* ]]; then
 
     wait_healthy "http://127.0.0.1:$PREFILL_PORT" prefill "$LOGDIR/prefill_$RUNG.log"
     wait_healthy "http://127.0.0.1:$DECODE_PORT" decode "$LOGDIR/decode_$RUNG.log"
-    setsid "$PY" -m sglang.srt.disaggregation.local_proxy \
+    setsid "$PY" -m flliper.srt.disaggregation.local_proxy \
         --prefill "http://127.0.0.1:$PREFILL_PORT" \
         --decode "http://127.0.0.1:$DECODE_PORT" \
         --bootstrap-port "$BOOTSTRAP_PORT" \
@@ -206,7 +206,7 @@ wait_healthy() {
 }
 
 echo "== prefill arm =="
-CUDA_VISIBLE_DEVICES="$PREFILL_DEV" setsid "$PY" -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES="$PREFILL_DEV" setsid "$PY" -m flliper.launch_server \
     --model-path "$MODEL" --trust-remote-code \
     --disaggregation-mode prefill \
     --disaggregation-transfer-backend mooncake \
@@ -216,7 +216,7 @@ CUDA_VISIBLE_DEVICES="$PREFILL_DEV" setsid "$PY" -m sglang.launch_server \
     > "$LOGDIR/prefill_$RUNG.log" 2>&1 &
 
 echo "== decode arm TP=2 / DCP=2 =="
-CUDA_VISIBLE_DEVICES="$DECODE_DEV" setsid "$PY" -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES="$DECODE_DEV" setsid "$PY" -m flliper.launch_server \
     --model-path "$MODEL" --trust-remote-code \
     --disaggregation-mode decode \
     --disaggregation-transfer-backend mooncake \
@@ -229,7 +229,7 @@ wait_healthy "http://127.0.0.1:$PREFILL_PORT" prefill "$LOGDIR/prefill_$RUNG.log
 wait_healthy "http://127.0.0.1:$DECODE_PORT" decode "$LOGDIR/decode_$RUNG.log"
 
 echo "== PD proxy =="
-setsid "$PY" -m sglang.srt.disaggregation.local_proxy \
+setsid "$PY" -m flliper.srt.disaggregation.local_proxy \
     --prefill "http://127.0.0.1:$PREFILL_PORT" \
     --decode "http://127.0.0.1:$DECODE_PORT" \
     --bootstrap-port "$BOOTSTRAP_PORT" \
@@ -240,7 +240,7 @@ wait_healthy "http://127.0.0.1:$PROXY_PORT" proxy "$LOGDIR/proxy_$RUNG.log"
 echo "Route A $RUNG up on http://127.0.0.1:$PROXY_PORT"
 
 # NOTE (found 2026-08-07, separate slice): dcp_size is auto-set from
-# SGLANG_UNEVEN_DCP=1 + a non-uniform --rank-tp-ratio rather than passed as
+# FLLIPER_UNEVEN_DCP=1 + a non-uniform --rank-tp-ratio rather than passed as
 # --dcp-size. That is production's path, and it also SIDESTEPS a latent
 # ordering bug this rung exposed:
 #

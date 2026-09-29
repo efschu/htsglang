@@ -3,15 +3,15 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import DSAIndexerPoolHost
-from sglang.srt.mem_cache.pool_host.common import (
+from flliper.srt.mem_cache.memory_pool import DSATokenToKVPool
+from flliper.srt.mem_cache.memory_pool_host import DSAIndexerPoolHost
+from flliper.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from flliper.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")

@@ -41,7 +41,7 @@ the layout's own evidence that work is queued which nothing is making runnable
 
 import unittest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PHASE_TP,
     TP_TO_PP,
     PhasePolicyConfig,
@@ -49,7 +49,7 @@ from sglang.srt.managers.phase_policy import (
     PhasePolicyState,
     decide,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2)
 
@@ -63,7 +63,7 @@ def _cfg(**kw):
     # It was #713's post-cutover settle, and this file set it to 0.0 to hold the
     # knob OUT of the way while the reason strings below are read. That field no
     # longer exists: 4a16043d1a reverted 97cb40bba4 whole, with no successor
-    # knob (`grep settle python/sglang/srt/managers/phase_policy.py` is empty).
+    # knob (`grep settle python/flliper/srt/managers/phase_policy.py` is empty).
     #
     # THE HISTORY IS A MERGE CONFLUENCE, NOT A MISSED UPDATE, and the difference
     # matters to whoever merges next. This file was green when it was written:

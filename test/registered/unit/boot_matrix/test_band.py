@@ -31,12 +31,12 @@ import unittest
 from unittest import mock
 from typing import Dict, List, Optional
 
-from sglang.srt.boot_matrix.arms import arm_by_name
-from sglang.srt.boot_matrix.check import FAIL, PASS, Verdict
-from sglang.srt.boot_matrix.coherence import CoherenceResult, ProbeResult
-from sglang.srt.boot_matrix.sweep import BAND_ARM, _measure_band
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.boot_matrix.arms import arm_by_name
+from flliper.srt.boot_matrix.check import FAIL, PASS, Verdict
+from flliper.srt.boot_matrix.coherence import CoherenceResult, ProbeResult
+from flliper.srt.boot_matrix.sweep import BAND_ARM, _measure_band
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -218,7 +218,7 @@ class TestTheBandActuallyGates(CustomTestCase):
         )
 
     def test_check_fails_an_arm_whose_coherence_missed(self):
-        from sglang.srt.boot_matrix.check import Verdict as V
+        from flliper.srt.boot_matrix.check import Verdict as V
 
         v = V(FAIL, "E_barlink", "coherence below the measured A-vs-A band",
               coherence=self._graded(score=3, floor=7))
@@ -248,7 +248,7 @@ class TestVramReleaseWait(CustomTestCase):
     def _run(self, outputs, **kw):
         import subprocess as sp
 
-        from sglang.srt.boot_matrix import sweep as sweep_mod
+        from flliper.srt.boot_matrix import sweep as sweep_mod
 
         seen = {"n": 0}
 
@@ -291,7 +291,7 @@ class TestVramReleaseWait(CustomTestCase):
 
     def test_the_idle_threshold_is_not_zero(self):
         """The driver keeps a few MiB of context; zero would never be reached."""
-        from sglang.srt.boot_matrix import sweep as sweep_mod
+        from flliper.srt.boot_matrix import sweep as sweep_mod
 
         self.assertGreater(sweep_mod.VRAM_IDLE_MIB, 0)
         ok, _ = self._run([f"{sweep_mod.VRAM_IDLE_MIB - 1}\n"])

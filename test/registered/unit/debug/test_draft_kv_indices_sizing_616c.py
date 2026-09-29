@@ -5,7 +5,7 @@ Pure-Python, hermetic unit tests -- no CUDA, no torch.
 
 import pytest
 
-from sglang.srt.speculative.spec_utils import (
+from flliper.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
 )

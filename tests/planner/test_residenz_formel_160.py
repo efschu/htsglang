@@ -25,18 +25,18 @@ haengt am VRAM-Sizing (#439-Latch) und hat Konsumenten, die Karte nicht.
 import math
 import unittest
 
-from sglang.srt.layers.moe.expert_map import (
+from flliper.srt.layers.moe.expert_map import (
     bounds,
     build,
     resident_sharded,
     resident_unsharded,
     scaled_spans,
 )
-from sglang.srt.layers.moe.expert_offload import resident_slot_count
+from flliper.srt.layers.moe.expert_offload import resident_slot_count
 
 
 # Die Fraktionen, die am 22.09. wirklich gefahren wurden (Arm + Boot-Logs).
-ECHTE_FAELLE = [
+REAL_CASES = [
     ("P Stufe 0, w133", 512, 0.459),
     ("P uniform, w132", 512, 0.309),
     ("D Rang 0, w133", 192, 0.400),
@@ -47,21 +47,21 @@ ECHTE_FAELLE = [
 ]
 
 
-class TestEineFormelFuerBeideSeiten(unittest.TestCase):
-    def test_unsharded_zaehlt_wie_der_rang(self):
+class TestOneFormulaForBothSides(unittest.TestCase):
+    def test_unsharded_counts_like_the_rank(self):
         """P: die Karte schreibt genau so viele resident wie der Rang haelt."""
-        for name, total, f in [(n, t, x) for n, t, x in ECHTE_FAELLE if t == 512]:
+        for name, total, f in [(n, t, x) for n, t, x in REAL_CASES if t == 512]:
             with self.subTest(name):
-                karte = resident_unsharded([f], total)[0]
+                emap = resident_unsharded([f], total)[0]
                 self.assertEqual(
-                    len(karte),
+                    len(emap),
                     resident_slot_count(total, f),
-                    f"{name}: Karte {len(karte)} != Rang "
+                    f"{name}: Karte {len(emap)} != Rang "
                     f"{resident_slot_count(total, f)} -- die eine Id "
                     f"dazwischen ist im Rang resident und in der Karte kalt",
                 )
 
-    def test_sharded_zaehlt_je_rang_wie_der_rang(self):
+    def test_sharded_counts_per_rank_like_the_rank(self):
         """D: dasselbe je Band, gegen die SKALIERTEN Spans."""
         ratios, fr = [183, 137, 168], [0.400, 0.545, 0.449]
         spans = scaled_spans(ratios, 512)
@@ -70,7 +70,7 @@ class TestEineFormelFuerBeideSeiten(unittest.TestCase):
             with self.subTest(rang=i, span=span, f=f):
                 self.assertEqual(len(res[i]), resident_slot_count(span, f))
 
-    def test_die_formel_wird_geteilt_nicht_nachgebaut(self):
+    def test_formula_is_shared_not_copied(self):
         """Der Riegel gegen den Rueckfall: expert_map RUFT die Funktion.
 
         Ein Test auf Zahlengleichheit allein wuerde eine nachgebaute
@@ -79,12 +79,12 @@ class TestEineFormelFuerBeideSeiten(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.layers.moe import expert_map as em
+        from flliper.srt.layers.moe import expert_map as em
 
-        quelle = inspect.getsource(em)
+        source = inspect.getsource(em)
         self.assertIn(
             "resident_slot_count",
-            quelle,
+            source,
             "expert_map muss die Zaehlung des Rangs AUFRUFEN, nicht nachbauen",
         )
         for fn in (em.resident_sharded, em.resident_unsharded):
@@ -94,7 +94,7 @@ class TestEineFormelFuerBeideSeiten(unittest.TestCase):
                 f"{fn.__name__} rundet noch selbst statt zu fragen",
             )
 
-    def test_untergrenze_eins_wandert_mit(self):
+    def test_lower_bound_one_moves_along(self):
         """`max(1, ...)`: FR_D[0]=0.006 ueber 183 -> der Rang haelt 2, nie 0.
 
         Die alte Kartenformel gab hier 1; ein Rang, der 2 haelt, hatte
@@ -103,7 +103,7 @@ class TestEineFormelFuerBeideSeiten(unittest.TestCase):
         self.assertEqual(len(resident_sharded([183, 137, 168], [0.006, 0.5, 0.5], 512)[0]),
                          resident_slot_count(scaled_spans([183, 137, 168], 512)[0], 0.006))
 
-    def test_karte_bleibt_in_sich_geschlossen(self):
+    def test_map_stays_self_consistent(self):
         """Nach dem Umbau muss die Karte weiter aufgehen: resident + slots."""
         k = build(512, [183, 137, 168], 0.459, [0.400, 0.545, 0.449])
         for phase in ("P", "D"):
@@ -116,10 +116,10 @@ class TestEineFormelFuerBeideSeiten(unittest.TestCase):
                     f"{phase}/{i}: {len(überlappung)} Ids sind resident UND im Store",
                 )
 
-    def test_mutant_round_stirbt(self):
+    def test_mutant_round_dies(self):
         """Gegenprobe: mit `round` divergieren die echten Faelle wieder."""
         divergent = [
-            name for name, n, f in ECHTE_FAELLE
+            name for name, n, f in REAL_CASES
             if round(n * f) != resident_slot_count(n, f)
         ]
         self.assertGreaterEqual(

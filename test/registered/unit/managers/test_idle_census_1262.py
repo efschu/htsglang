@@ -17,7 +17,7 @@ THE SPECIMEN (record /spinning/gpu-arb/weg2/BOOT_weg2t2a_0908.md, six py-spy
 dumps in BOOT_weg2t2a_killer_context.txt). First full three-group READY of
 either Weg-2 train, every gate green, then::
 
-    [2026-09-08 11:57:07,109] INFO weg2.front: WEG2-FLIP begin epoch=0
+    [2026-09-08 11:57:07,109] INFO pdflip.front: PDFLIP-FLIP begin epoch=0
         sleep=D wake=P outstanding=0 queue=1
 
 never completed. Seven minutes later: ``state=flipping epoch=0 flips=0``. All
@@ -71,25 +71,25 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.scheduler_components.idle_census_cadence import (
+from flliper.srt.managers.scheduler_components.idle_census_cadence import (
     IDLE_CENSUS_LOG_EVERY,
     IdleCensusCadence,
 )
-from sglang.srt.managers.scheduler_components.idle_sleeper import IDLE_POLL_CAP_MS
-from sglang.srt.managers.scheduler_components.invariant_checker import (
+from flliper.srt.managers.scheduler_components.idle_sleeper import IDLE_POLL_CAP_MS
+from flliper.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
-from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from flliper.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 #: PP2's pool on the boot that wedged, and on the boot before it. Both measured
 #: (BOOT_weg2t2a_0908.md, gate 7). The ratio 2.53 is the whole "why now".
-ROWS_WEG2T2A = 410_857
-ROWS_WEG2TR2 = 162_435
+ROWS_PDFLIPT2A = 410_857
+ROWS_PDFLIPTR2 = 162_435
 
 
 class _Alloc(BaseTokenToKVPoolAllocator):
@@ -227,7 +227,7 @@ class TestCountersAgreeMeansNoEnumeration1262(CustomTestCase):
     """A balanced ledger must not touch a single row."""
 
     def setUp(self):
-        import sglang.srt.managers.scheduler_components.invariant_checker as mod
+        import flliper.srt.managers.scheduler_components.invariant_checker as mod
 
         self.mod = mod
         self.spy = _CountingRead(mod.read_free_rows)
@@ -281,11 +281,11 @@ class TestCountersAgreeMeansNoEnumeration1262(CustomTestCase):
         the allocator so a future rewrite that makes it enumerate is caught
         here rather than on metal.
         """
-        alloc = _Alloc(ROWS_WEG2T2A)
+        alloc = _Alloc(ROWS_PDFLIPT2A)
         src = inspect.getsource(type(alloc).available_size)
         self.assertIn("len(self.free_pages)", src)
         self.assertNotIn("tolist", src)
-        self.assertEqual(alloc.available_size(), ROWS_WEG2T2A)
+        self.assertEqual(alloc.available_size(), ROWS_PDFLIPT2A)
 
     def test_wiring_the_ledger_runs_before_the_census_in_the_real_source(self):
         """Regression guard on the ORDER, not just on the primitives.
@@ -309,7 +309,7 @@ class TestCountersDisagreeMeansEnumerateOnce1262(CustomTestCase):
     """#912's job, preserved exactly: a SURPLUS is the census's question."""
 
     def setUp(self):
-        import sglang.srt.managers.scheduler_components.invariant_checker as mod
+        import flliper.srt.managers.scheduler_components.invariant_checker as mod
 
         self.mod = mod
         self.spy = _CountingRead(mod.read_free_rows)
@@ -401,7 +401,7 @@ class TestCountersDisagreeMeansEnumerateOnce1262(CustomTestCase):
     def test_the_cadence_reopens_after_the_derived_interval(self):
         clock = _FakeClock()
         cadence = IdleCensusCadence(max_duty=0.05, clock=clock)
-        cadence.record(rows=ROWS_WEG2T2A, cost_ms=100.0)
+        cadence.record(rows=ROWS_PDFLIPT2A, cost_ms=100.0)
         # duty 5% of a 100 ms pass -> 1900 ms before the next one is allowed.
         self.assertAlmostEqual(cadence.seconds_until_allowed(), 1.9, places=6)
         clock.advance(1.89)
@@ -432,7 +432,7 @@ class TestDutyCycleIsPoolSizeIndependent1262(CustomTestCase):
     def test_mutant_a_duty_of_one_is_the_pre_fix_behaviour(self):
         clock = _FakeClock()
         cadence = IdleCensusCadence(max_duty=1.0, clock=clock)
-        cadence.record(rows=ROWS_WEG2T2A, cost_ms=101.2)
+        cadence.record(rows=ROWS_PDFLIPT2A, cost_ms=101.2)
         self.assertEqual(
             cadence.seconds_until_allowed(),
             0.0,
@@ -456,10 +456,10 @@ class TestDutyCycleIsPoolSizeIndependent1262(CustomTestCase):
 class TestTheInstrumentNamesRowsAndMs1262(CustomTestCase):
     def test_the_line_carries_rows_and_wall_ms(self):
         cadence = IdleCensusCadence(clock=_FakeClock())
-        emitted = cadence.record(rows=ROWS_WEG2T2A, cost_ms=101.2)
+        emitted = cadence.record(rows=ROWS_PDFLIPT2A, cost_ms=101.2)
         self.assertIsNotNone(emitted, "the FIRST enumerating pass is never sampled away")
         is_warning, line = emitted
-        self.assertIn(f"rows={ROWS_WEG2T2A}", line)
+        self.assertIn(f"rows={ROWS_PDFLIPT2A}", line)
         self.assertIn("wall=101.2 ms", line)
         self.assertTrue(
             is_warning,
@@ -553,7 +553,7 @@ class _StubLoop:
     """
 
     def __init__(self, receiver, checker, stats):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         self.request_receiver = receiver
         self.invariant_checker = checker
@@ -582,7 +582,7 @@ class _StubLoop:
 
 class TestControlMessageOutranksTheCensus1262(CustomTestCase):
     def setUp(self):
-        import sglang.srt.managers.scheduler_components.invariant_checker as mod
+        import flliper.srt.managers.scheduler_components.invariant_checker as mod
 
         self.mod = mod
         self.spy = _CountingRead(mod.read_free_rows)
@@ -606,7 +606,7 @@ class TestControlMessageOutranksTheCensus1262(CustomTestCase):
             self.spy.calls,
             0,
             "the census must yield to a queued control message -- weg2t2a's "
-            "WEG2-FLIP begin waited behind exactly this",
+            "PDFLIP-FLIP begin waited behind exactly this",
         )
         self.assertEqual(self.cadence.deferred_control, 1)
         self.assertEqual(loop.handled, [])
@@ -720,7 +720,7 @@ class TestControlMessageOutranksTheCensus1262(CustomTestCase):
         Answering True would be the failure this whole clause must not have:
         a probe that cannot answer silently disarming the diagnostic.
         """
-        from sglang.srt.managers.scheduler_components.request_receiver import (
+        from flliper.srt.managers.scheduler_components.request_receiver import (
             SchedulerRequestReceiver,
         )
 
@@ -761,7 +761,7 @@ class TestTheWiringIsPresentInScheduler1262(CustomTestCase):
     """Delivery, not presence: the fix must be REACHED by on_idle."""
 
     def test_on_idle_gates_the_census_on_the_control_hold(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler.on_idle)
         self.assertIn("_idle_census_control_hold()", src)
@@ -773,7 +773,7 @@ class TestTheWiringIsPresentInScheduler1262(CustomTestCase):
         )
 
     def test_process_input_requests_clears_the_hold_unconditionally(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler.process_input_requests)
         head = src[: src.index("drain_recovery_request")]

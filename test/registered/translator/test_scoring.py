@@ -23,7 +23,7 @@ codes.
 
 import unittest
 
-from sglang.srt.translator.scoring import (
+from flliper.srt.translator.scoring import (
     normalize_for_wer,
     word_error_rate,
     worst_of,

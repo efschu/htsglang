@@ -8,7 +8,7 @@ whose cards are busy.
 What it locks down:
   1. the hand-transcribed ``ucp_request_param_t`` layout -- a wrong offset
      here corrupts a UCX call in a way no higher-level test would localise,
-  2. the module imports with NO sglang and NO torch (the second rig runs it
+  2. the module imports with NO flliper and NO torch (the second rig runs it
      out of a bare python3, and the version-parity check has to work there),
   3. a real send/recv round trip, both below and above the eager/rendezvous
      threshold,
@@ -21,23 +21,23 @@ import pathlib
 import sys
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _BINDINGS = (
     pathlib.Path(__file__).resolve().parents[4]
-    / "python" / "sglang" / "srt" / "distributed" / "device_communicators"
+    / "python" / "flliper" / "srt" / "distributed" / "device_communicators"
     / "barlink_ucx_bindings.py"
 )
 
 
 def _load_bare():
-    """Import the bindings by path, WITHOUT importing sglang.
+    """Import the bindings by path, WITHOUT importing flliper.
 
-    Deliberately not `from sglang.srt... import`: the cross-rig harness loads
-    this module on a host that has no sglang installed, so a dependency
+    Deliberately not `from flliper.srt... import`: the cross-rig harness loads
+    this module on a host that has no flliper installed, so a dependency
     sneaking into it must fail here rather than at 3am on the second rig.
     """
     spec = importlib.util.spec_from_file_location("_barlink_ucx_bind_test", _BINDINGS)
@@ -47,7 +47,7 @@ def _load_bare():
 
 
 class TestUcxBindingLayout(CustomTestCase):
-    def test_module_imports_without_sglang_or_torch(self):
+    def test_module_imports_without_flliper_or_torch(self):
         before = set(sys.modules)
         mod = _load_bare()
         newly = set(sys.modules) - before

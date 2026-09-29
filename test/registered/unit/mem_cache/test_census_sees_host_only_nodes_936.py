@@ -57,7 +57,7 @@ is what stops the next reader spending a day on it again.
 Hermetic: real `UnifiedRadixCache` on CPU, real allocator. No CUDA.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -65,10 +65,10 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.test.test_utils import CustomTestCase
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
@@ -209,7 +209,7 @@ class WhatThisRulesOut936(CustomTestCase):
     def test_the_only_base_tombstone_is_preceded_by_a_free(self):
         import inspect
 
-        from sglang.srt.mem_cache.unified_cache_components.full_component import (
+        from flliper.srt.mem_cache.unified_cache_components.full_component import (
             FullComponent,
         )
 

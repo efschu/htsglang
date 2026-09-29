@@ -22,7 +22,7 @@ OUT="${2:-/tmp/hostmem_$(date -u +%H%M%S).csv}"
 INTERVAL="${INTERVAL:-1}"
 # Match the rank processes by their argv-visible comm. NEVER pattern-kill on
 # this -- it is a read-only join key.
-RANK_COMM="${RANK_COMM:-sglang::schedul}"
+RANK_COMM="${RANK_COMM:-flliper::schedul}"
 
 CG=/sys/fs/cgroup
 [ -r "$CG/.lxc/memory.stat" ] && CG="$CG/.lxc"

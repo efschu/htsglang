@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.chunk_cache import PureSWAChunkCache
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

@@ -1,11 +1,11 @@
-"""Unit tests for SGLANG_RADIX_FORCE_MISS.
+"""Unit tests for FLLIPER_RADIX_FORCE_MISS.
 
 The flag is gated at the scheduler boundary, so we test the helper directly
 plus an end-to-end check of `match_prefix_for_req` driving a populated
 RadixCache.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -15,15 +15,15 @@ from array import array
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_policy import match_prefix_for_req
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.environ import envs
+from flliper.srt.managers.schedule_policy import match_prefix_for_req
+from flliper.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
     MatchResult,
     zero_match_result,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from flliper.srt.mem_cache.radix_cache import RadixCache, RadixKey
 
 
 class _StubReq:
@@ -88,14 +88,14 @@ class TestMatchPrefixForReqForceMiss(unittest.TestCase):
 
         # Sanity: without the flag, the same lookup hits.
         baseline_req = _StubReq([10, 11, 12, 13, 99, 100])
-        with envs.SGLANG_RADIX_FORCE_MISS.override(False):
+        with envs.FLLIPER_RADIX_FORCE_MISS.override(False):
             match_prefix_for_req(tree, baseline_req)
         self.assertGreater(int(baseline_req.prefix_indices.numel()), 0)
         self.assertIsNot(baseline_req.last_node, tree.root_node)
 
         # With the flag, the same lookup is forced to miss.
         forced_req = _StubReq([10, 11, 12, 13, 99, 100])
-        with envs.SGLANG_RADIX_FORCE_MISS.override(True):
+        with envs.FLLIPER_RADIX_FORCE_MISS.override(True):
             match_prefix_for_req(tree, forced_req)
         self.assertEqual(int(forced_req.prefix_indices.numel()), 0)
         self.assertIs(forced_req.last_node, tree.root_node)

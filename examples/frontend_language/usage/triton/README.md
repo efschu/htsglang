@@ -1,24 +1,24 @@
-# sglang_triton
+# flliper_triton
 
 Build the docker image:
 ```
-docker build -t sglang-triton .
+docker build -t flliper-triton .
 ```
 
 Then do:
 ```
-docker run -ti --gpus=all --network=host --name sglang-triton -v ./models:/mnt/models sglang-triton
+docker run -ti --gpus=all --network=host --name flliper-triton -v ./models:/mnt/models flliper-triton
 ```
 
 inside the docker container:
 ```
-cd sglang
-python3 -m sglang.launch_server --model-path mistralai/Mistral-7B-Instruct-v0.2 --port 30000 --mem-fraction-static 0.9
+cd flliper
+python3 -m flliper.launch_server --model-path mistralai/Mistral-7B-Instruct-v0.2 --port 30000 --mem-fraction-static 0.9
 ```
 
 with another shell, inside the docker container:
 ```
-docker exec -ti sglang-triton /bin/bash
+docker exec -ti flliper-triton /bin/bash
 cd /mnt
 tritonserver --model-repository=/mnt/models
 ```

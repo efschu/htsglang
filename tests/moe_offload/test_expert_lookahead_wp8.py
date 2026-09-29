@@ -5,7 +5,7 @@ spill experts while the current block computes).
 Desk-provable parts: the sticky slot resolve, the prefetch into free scratch
 slots with the holds map kept by every fetch, the merged rendezvous of
 run_waves, the block chaining. The overlap itself is a stream property and
-is measured on the metal (A/B, SGLANG_MOE_EXPERT_LOOKAHEAD=0/1/2)."""
+is measured on the metal (A/B, FLLIPER_MOE_EXPERT_LOOKAHEAD=0/1/2)."""
 
 from collections import namedtuple
 from types import SimpleNamespace
@@ -13,8 +13,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe.topk import StandardTopKOutput
 
 E, R, C, W = 12, 4, 3, 4  # experts, resident, scratch, row width
 
@@ -47,8 +47,8 @@ def test_resolve_sticky_refuses_scratch_overflow_like_resolve():
 
 
 def _cache(monkeypatch, lookahead=True):
-    monkeypatch.setenv("SGLANG_MOE_EXPERT_LOOKAHEAD", "1" if lookahead else "0")
-    monkeypatch.setenv("SGLANG_MOE_SCRATCH_SLOTS", str(C))
+    monkeypatch.setenv("FLLIPER_MOE_EXPERT_LOOKAHEAD", "1" if lookahead else "0")
+    monkeypatch.setenv("FLLIPER_MOE_SCRATCH_SLOTS", str(C))
     layer = SimpleNamespace(num_local_experts=E, layer_id=0)
     cache = eo.MoEExpertOffloadCache(layer, R / E)
     assert cache.resident_count == R and cache.scratch == C
@@ -156,7 +156,7 @@ def test_without_the_switch_the_deterministic_layout_is_untouched(monkeypatch):
 
 
 def test_link_moe_lookahead_chains_moe_blocks_at_the_distance(monkeypatch):
-    from sglang.srt.models.qwen2_moe import link_moe_lookahead
+    from flliper.srt.models.qwen2_moe import link_moe_lookahead
 
     def blk():
         return SimpleNamespace(lookahead_next=None, gate=object(), experts=object())
@@ -176,12 +176,12 @@ def test_link_moe_lookahead_chains_moe_blocks_at_the_distance(monkeypatch):
     assert link_moe_lookahead(layers, distance=2) == 1
     assert layers[0].mlp.lookahead_next is None
     assert layers[1].mlp.lookahead_next is layers[3].mlp
-    monkeypatch.setenv("SGLANG_MOE_EXPERT_LOOKAHEAD", "0")
+    monkeypatch.setenv("FLLIPER_MOE_EXPERT_LOOKAHEAD", "0")
     assert link_moe_lookahead(layers) == 0
 
 
 def test_fused_moe_hands_the_pending_lookahead_to_exactly_one_forward():
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     me = SimpleNamespace(_lookahead_pending=None, _expert_offload=SimpleNamespace(planner=SimpleNamespace(stats=eo.ResidencyStats())))
     nxt = SimpleNamespace(_expert_offload="next-cache")

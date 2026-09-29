@@ -1,13 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-# Start the Intel XPU CI container (ci_sglang_xpu) using the intel/sglang-dev:latest
+# Start the Intel XPU CI container (ci_flliper_xpu) using the intel/sglang-dev:latest
 # image published by .github/workflows/release-docker-intel-xpu-nightly.yml.
 #
 # Pulls the :latest tag and starts a long-running container that subsequent
 # steps `docker exec` into.
 
-CONTAINER_NAME="ci_sglang_xpu"
+CONTAINER_NAME="ci_flliper_xpu"
 IMAGE_REPO="intel/sglang-dev"
 IMAGE_TAG="latest"
 CUSTOM_IMAGE=""
@@ -77,7 +77,7 @@ retry_with_backoff 6 docker pull "${IMAGE}"
 
 # Export the resolved image so the cleanup step can rmi the exact tag used.
 if [[ -n "${GITHUB_ENV:-}" ]]; then
-  echo "CI_SGLANG_XPU_IMAGE=${IMAGE}" >> "${GITHUB_ENV}"
+  echo "CI_FLLIPER_XPU_IMAGE=${IMAGE}" >> "${GITHUB_ENV}"
 fi
 
 # Remove any stale container of the same name so re-runs are idempotent.
@@ -106,11 +106,11 @@ docker run -dt \
   --device /dev/dri \
   -v /dev/dri/by-path:/dev/dri/by-path \
   -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
-  -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
+  -v "${GITHUB_WORKSPACE:-$PWD}:/flliper-checkout" \
   -e HF_TOKEN="${HF_TOKEN_VALUE}" \
   --name "${CONTAINER_NAME}" \
   "${IMAGE}"
 
 # Mark the workspace mount as a safe directory so git operations as root
 # inside the container don't trip the cross-user repo guard.
-docker exec "${CONTAINER_NAME}" git config --global --add safe.directory /sglang-checkout || true
+docker exec "${CONTAINER_NAME}" git config --global --add safe.directory /flliper-checkout || true

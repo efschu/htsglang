@@ -41,14 +41,14 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 # THE REAL MODULE, imported -- never re-implemented here. A private copy in
 # the test would keep these assertions green across a revert of the fix.
-from sglang.srt.utils.jit_cold_build import (  # noqa: E402
+from flliper.srt.utils.jit_cold_build import (  # noqa: E402
     ColdBuildWindowError,
     cold_build_window,
     in_cold_build_window,
@@ -81,14 +81,14 @@ class TestColdBuildWindow(CustomTestCase):
 
     def test_multiplier_is_read_from_the_environment_at_call_time(self):
         with mock.patch.dict(
-            os.environ, {"SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT": "7"}, clear=False
+            os.environ, {"FLLIPER_JIT_COLD_BUILD_TIMEOUT_MULT": "7"}, clear=False
         ):
             with cold_build_window("unit test"):
                 self.assertEqual(resolve_timeout_cycles(_BASE), _BASE * 7)
         # An explicit 1 is the documented escape hatch back to the old
         # behaviour -- it must be honoured even inside the window.
         with mock.patch.dict(
-            os.environ, {"SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT": "1"}, clear=False
+            os.environ, {"FLLIPER_JIT_COLD_BUILD_TIMEOUT_MULT": "1"}, clear=False
         ):
             with cold_build_window("unit test"):
                 self.assertEqual(resolve_timeout_cycles(_BASE), _BASE)
@@ -329,7 +329,7 @@ class TestOnlySymptomsAreRelabelled(CustomTestCase):
         Exception: Capture cuda graph failed: Failure inside the JIT
         cold-build window (cuda-graph capture warmup). ... Warm the cache
         (boot once with --disable-cuda-graph), raise
-        SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT (currently 40) ...
+        FLLIPER_JIT_COLD_BUILD_TIMEOUT_MULT (currently 40) ...
         Possible solutions:
         1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)
         ...
@@ -425,7 +425,7 @@ class TestOnlySymptomsAreRelabelled(CustomTestCase):
 
     def test_int8_arm_refusal_passes_through_unmasked(self):
         """#384's instance stays fixed even where it originally fired."""
-        from sglang.srt.layers.quantization.w8a8_int8 import require_int8_arm
+        from flliper.srt.layers.quantization.w8a8_int8 import require_int8_arm
 
         def boom():
             require_int8_arm("w8a8_int8", available=False)
@@ -475,7 +475,7 @@ class TestOnlySymptomsAreRelabelled(CustomTestCase):
 
     def test_the_collective_deadline_is_still_a_symptom(self):
         """The window's own instrument: a bounded wait that expired here."""
-        from sglang.srt.distributed.device_communicators.barlink_liveness import (
+        from flliper.srt.distributed.device_communicators.barlink_liveness import (
             CollectiveTimeoutError,
             PeerLostError,
         )
@@ -503,7 +503,7 @@ class TestCallSites(CustomTestCase):
     """
 
     def test_barlink_device_collectives_resolve_their_deadline(self):
-        from sglang.srt.distributed.device_communicators import barlink_device
+        from flliper.srt.distributed.device_communicators import barlink_device
 
         src = inspect.getsource(barlink_device)
         self.assertIn("resolve_timeout_cycles", src)
@@ -518,7 +518,7 @@ class TestCallSites(CustomTestCase):
                 )
 
     def test_graph_backends_use_the_shared_warmup_loop(self):
-        from sglang.srt.model_executor.runner_backend import (
+        from flliper.srt.model_executor.runner_backend import (
             breakable_cuda_graph_backend,
             full_cuda_graph_backend,
             tc_piecewise_cuda_graph_backend,

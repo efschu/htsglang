@@ -6,10 +6,10 @@ import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scripted_runtime import background_http_poster as bg_poster
-from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.scripted_runtime import background_http_poster as bg_poster
+from flliper.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 

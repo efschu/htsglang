@@ -1,7 +1,7 @@
 """#96: steht die globale Residenzmenge, braucht die Slot-Zahl KEINE Vektoren.
 
 fnFL2w26 starb wie w24 -- D wollte 512 Slots, obwohl
-SGLANG_MOE_EXPERT_STORE_RESIDENT_IDS gesetzt war und im --env-d ankam.
+FLLIPER_MOE_EXPERT_STORE_RESIDENT_IDS gesetzt war und im --env-d ankam.
 Die Ursache steht eine Zeile ueber dem #95-Fix:
 
     if _ratios and _fracs:          # <- der GANZE Slot-Block haengt daran
@@ -22,14 +22,14 @@ import os
 
 import pytest
 
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.srt.layers.moe import expert_store as es
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_store as es
 
 
 class _Layer:
     num_experts = 512
     layer_id = 0
-    _sglang_prefix = "model.layers.0.mlp"
+    _flliper_prefix = "model.layers.0.mlp"
 
     def __init__(self, rank, lo, n, moe_ratio=None):
         self.moe_tp_rank = rank
@@ -51,9 +51,9 @@ def _welt(tmp_path, monkeypatch):
     p = tmp_path / "global.json"
     p.write_text(json.dumps(res))
     monkeypatch.setenv(es.RESIDENT_IDS_ENV, str(p))
-    monkeypatch.setenv("SGLANG_MOE_EXPERT_STORE_DIR", str(tmp_path))
-    monkeypatch.setenv("SGLANG_MOE_EXPERT_STORE_SLOT_FRACTION", "0.82")
-    monkeypatch.delenv("SGLANG_MOE_HOTSET_FILE", raising=False)
+    monkeypatch.setenv("FLLIPER_MOE_EXPERT_STORE_DIR", str(tmp_path))
+    monkeypatch.setenv("FLLIPER_MOE_EXPERT_STORE_SLOT_FRACTION", "0.82")
+    monkeypatch.delenv("FLLIPER_MOE_HOTSET_FILE", raising=False)
     return res
 
 
@@ -64,7 +64,7 @@ def _slots(layer, res):
     return None if r is None else r[3]
 
 
-def test_ohne_moe_ratio_trotzdem_324(_welt, monkeypatch):
+def test_without_moe_ratio_still_324(_welt, monkeypatch):
     """DER FALL, DEN w27 GEMESSEN HAT -- die #96-Zeile woertlich:
 
         ratios=None fracs=None global_res=188 | SLOTS=None
@@ -75,24 +75,24 @@ def test_ohne_moe_ratio_trotzdem_324(_welt, monkeypatch):
     greift nicht, `moe_ratio` fehlt auf dem Layer -> None.
     Der Fallback wird hier ABGESCHALTET, damit der Test den Boot abbildet.
     """
-    import sglang.srt.layers.moe.expert_offload as _eo
+    import flliper.srt.layers.moe.expert_offload as _eo
     monkeypatch.setattr(_eo, "_rank_moe_ratio_vector", lambda layer: None)
     lay = _Layer(1, 192, 137)          # lo=192, wie w27 es gedruckt hat
     assert _slots(lay, _welt) == 324
 
 
-def test_mit_vektor_dieselbe_zahl(_welt):
+def test_with_vector_same_count(_welt):
     lay = _Layer(1, 183, 137, moe_ratio=[183, 137, 168])
     assert _slots(lay, _welt) == 324
 
 
-def test_alle_raenge_einig(_welt):
+def test_all_ranks_agree(_welt):
     z = {_slots(_Layer(r, lo, n), _welt)
          for r, (lo, n) in enumerate([(0, 183), (183, 137), (320, 168)])}
     assert z == {324}, f"die Raenge sind uneins: {z}"
 
 
-def test_ohne_env_bleibt_es_beim_alten_weg(_welt, monkeypatch):
+def test_without_env_old_path_stays(_welt, monkeypatch):
     monkeypatch.delenv(es.RESIDENT_IDS_ENV)
     lay = _Layer(1, 183, 137)
     assert _slots(lay, _welt) != 324, "ohne globale Menge darf nichts geraten werden"

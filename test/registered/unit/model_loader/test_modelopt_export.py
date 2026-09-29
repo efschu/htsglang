@@ -1,7 +1,7 @@
 """
-Unit tests for ModelOpt export functionality in SGLang.
+Unit tests for ModelOpt export functionality in fLLiper.
 
-These tests verify the integration of ModelOpt export API with SGLang's model loading
+These tests verify the integration of ModelOpt export API with fLLiper's model loading
 and quantization workflow.
 """
 
@@ -13,11 +13,11 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.model_loader.loader import ModelOptModelLoader
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.configs.device_config import DeviceConfig
+from flliper.srt.configs.load_config import LoadConfig
+from flliper.srt.configs.model_config import ModelConfig
+from flliper.srt.model_loader.loader import ModelOptModelLoader
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
@@ -40,27 +40,27 @@ class TestModelOptExport(unittest.TestCase):
         """Set up test fixtures."""
         # Mock distributed functionality to avoid initialization errors
         self.mock_tp_rank = patch(
-            "sglang.srt.distributed.parallel_state.get_tensor_model_parallel_rank",
+            "flliper.srt.distributed.parallel_state.get_tensor_model_parallel_rank",
             return_value=0,
         )
         self.mock_tp_rank.start()
 
-        self.mock_rank0_log = patch("sglang.srt.model_loader.loader.rank0_log")
+        self.mock_rank0_log = patch("flliper.srt.model_loader.loader.rank0_log")
         self.mock_rank0_log.start()
 
         # Mock logger to avoid issues
-        self.mock_logger = patch("sglang.srt.model_loader.loader.logger")
+        self.mock_logger = patch("flliper.srt.model_loader.loader.logger")
         self.mock_logger.start()
 
         # Mock all distributed functions that might be called
         self.mock_get_tp_group = patch(
-            "sglang.srt.distributed.parallel_state.get_tp_group"
+            "flliper.srt.distributed.parallel_state.get_tp_group"
         )
         self.mock_get_tp_group.start()
 
         # Mock model parallel initialization check
         self.mock_mp_is_initialized = patch(
-            "sglang.srt.distributed.parallel_state.model_parallel_is_initialized",
+            "flliper.srt.distributed.parallel_state.model_parallel_is_initialized",
             return_value=True,
         )
         self.mock_mp_is_initialized.start()
@@ -121,7 +121,7 @@ class TestModelOptExport(unittest.TestCase):
             f.write("mock_model_data")
 
     @unittest.skipIf(not MODELOPT_AVAILABLE, "nvidia-modelopt not available")
-    @patch("sglang.srt.model_loader.loader.os.makedirs")
+    @patch("flliper.srt.model_loader.loader.os.makedirs")
     @patch("modelopt.torch.export.export_hf_checkpoint")
     def test_export_modelopt_checkpoint_success(self, mock_export, mock_makedirs):
         """Test successful model export."""
@@ -272,7 +272,7 @@ class TestModelOptExportIntegration(unittest.TestCase):
 
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    @patch("sglang.srt.model_loader.loader.get_model_architecture")
+    @patch("flliper.srt.model_loader.loader.get_model_architecture")
     @patch("transformers.AutoTokenizer.from_pretrained")
     @patch("transformers.AutoModelForCausalLM.from_pretrained")
     def test_full_workflow_with_export(self, mock_model, mock_tokenizer, mock_arch):

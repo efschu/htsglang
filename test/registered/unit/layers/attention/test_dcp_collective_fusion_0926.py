@@ -3,11 +3,11 @@
 
 Two switches, both default off (code path unchanged):
 
-* ``SGLANG_DCP_FUSE_KVQ_GATHER=1`` -- the KV write gather (A) and the q-head
+* ``FLLIPER_DCP_FUSE_KVQ_GATHER=1`` -- the KV write gather (A) and the q-head
   gather (B) of one full-attention layer become ONE all-gather
   (``comm.cp_all_gather_kvq_heads_uneven``). Pure data movement, so the
   gathered k/v/q must be BIT-identical to the two gathers.
-* ``SGLANG_DCP_LSE_MERGE_FUSED=1`` (with ``SGLANG_DCP_LSE_MERGE=a2a``) -- the
+* ``FLLIPER_DCP_LSE_MERGE_FUSED=1`` (with ``FLLIPER_DCP_LSE_MERGE=a2a``) -- the
   LSE all-gather (C) rides inside the head all_to_all (D); the receiver does
   the logsumexp/scale/sum. Same arithmetic on the same values, so on one
   device class it must be bit-identical to the two-collective a2a body.
@@ -26,12 +26,12 @@ from unittest import mock
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
-from sglang.srt.layers.dcp import comm  # noqa: E402
+from flliper.srt.layers.dcp import comm  # noqa: E402
 
 
 class _Rendezvous:
@@ -197,7 +197,7 @@ class TestFusedLseMerge(CustomTestCase):
         _reset()
 
     def _both(self, w, return_lse, env_extra=None):
-        env = {"SGLANG_DCP_LSE_MERGE": "a2a"}
+        env = {"FLLIPER_DCP_LSE_MERGE": "a2a"}
         env.update(env_extra or {})
 
         def call(r, grp):
@@ -205,10 +205,10 @@ class TestFusedLseMerge(CustomTestCase):
                 w.o[r], w.lse[r], grp, w.counts, return_lse=return_lse)
 
         with mock.patch.dict(os.environ, env):
-            os.environ.pop("SGLANG_DCP_LSE_MERGE_FUSED", None)
+            os.environ.pop("FLLIPER_DCP_LSE_MERGE_FUSED", None)
             _reset()
             base, log_base = _run_world(w.W, call)
-            os.environ["SGLANG_DCP_LSE_MERGE_FUSED"] = "1"
+            os.environ["FLLIPER_DCP_LSE_MERGE_FUSED"] = "1"
             _reset()
             fused, log_fused = _run_world(w.W, call)
         return base, fused, log_base, log_fused
@@ -249,14 +249,14 @@ class TestFusedLseMerge(CustomTestCase):
     def test_bf16_wire_keeps_two_collectives(self):
         w = _MergeWorld([12, 6, 6], T=8, seed=1)
         _b, _f, _lb, log_fused = self._both(
-            w, True, env_extra={"SGLANG_DCP_LSE_MERGE_DTYPE": "bf16"})
+            w, True, env_extra={"FLLIPER_DCP_LSE_MERGE_DTYPE": "bf16"})
         for r in range(w.W):
             self.assertEqual([o[0] for o in log_fused[r]], ["all_gather", "a2a"])
 
     def test_wide_forward_keeps_two_collectives(self):
         w = _MergeWorld([12, 6, 6], T=8, seed=8)
         base, fused, _lb, log_fused = self._both(
-            w, True, env_extra={"SGLANG_DCP_FUSE_MAX_ROWS": "4"})
+            w, True, env_extra={"FLLIPER_DCP_FUSE_MAX_ROWS": "4"})
         for r in range(w.W):
             self.assertEqual([o[0] for o in log_fused[r]], ["all_gather", "a2a"])
             for x, y in zip(fused[r], base[r]):
@@ -270,11 +270,11 @@ class TestFusedLseMerge(CustomTestCase):
                 comm.cp_lse_ag_out_a2a_mha_uneven, w.o[r], w.lse[r], grp, w.counts,
                 return_lse=True, block_tokens=4)
 
-        with mock.patch.dict(os.environ, {"SGLANG_DCP_LSE_MERGE": "a2a"}):
-            os.environ.pop("SGLANG_DCP_LSE_MERGE_FUSED", None)
+        with mock.patch.dict(os.environ, {"FLLIPER_DCP_LSE_MERGE": "a2a"}):
+            os.environ.pop("FLLIPER_DCP_LSE_MERGE_FUSED", None)
             _reset()
             base, _ = _run_world(3, call)
-            os.environ["SGLANG_DCP_LSE_MERGE_FUSED"] = "1"
+            os.environ["FLLIPER_DCP_LSE_MERGE_FUSED"] = "1"
             _reset()
             fused, logs = _run_world(3, call)
         for r in range(3):
@@ -292,16 +292,16 @@ class TestDefaultsOff(CustomTestCase):
 
     def test_env_defaults(self):
         with mock.patch.dict(os.environ, {}, clear=False):
-            for k in ("SGLANG_DCP_FUSE_KVQ_GATHER", "SGLANG_DCP_LSE_MERGE_FUSED"):
+            for k in ("FLLIPER_DCP_FUSE_KVQ_GATHER", "FLLIPER_DCP_LSE_MERGE_FUSED"):
                 os.environ.pop(k, None)
             _reset()
             self.assertFalse(comm.dcp_fuse_kvq_gather())
             self.assertFalse(comm.lse_merge_fused())
 
     def test_clock_a2a_default_off(self):
-        from sglang.srt.distributed import parallel_state as ps
+        from flliper.srt.distributed import parallel_state as ps
 
-        if "SGLANG_COLLECTIVE_CLOCK_A2A" not in os.environ:
+        if "FLLIPER_COLLECTIVE_CLOCK_A2A" not in os.environ:
             self.assertFalse(ps._CLOCK_A2A)
         src = inspect.getsource(ps.GroupCoordinator.all_to_all_single_v)
         self.assertIn("_CLOCK_A2A and _COLLECTIVE_CLOCK.armed", src)
@@ -322,7 +322,7 @@ class TestBackendGate(CustomTestCase):
         _reset()
 
     def _gate(self, env="1", **attrs):
-        from sglang.srt.layers.attention import flashinfer_backend as fb
+        from flliper.srt.layers.attention import flashinfer_backend as fb
 
         stub = type("S", (), {})()
         stub.uneven_dcp = attrs.get("uneven_dcp", True)
@@ -330,7 +330,7 @@ class TestBackendGate(CustomTestCase):
         stub.weightless_kv = attrs.get("weightless", False)
         k = torch.zeros(8, 1, 16, dtype=attrs.get("kdtype", torch.bfloat16))
         q = torch.zeros(8, 6, 16, dtype=torch.bfloat16)
-        with mock.patch.dict(os.environ, {"SGLANG_DCP_FUSE_KVQ_GATHER": env}):
+        with mock.patch.dict(os.environ, {"FLLIPER_DCP_FUSE_KVQ_GATHER": env}):
             _reset()
             return fb.FlashInferAttnBackend._dcp_kvq_fusable(stub, _Layer(), k, k, q)
 
@@ -341,13 +341,13 @@ class TestBackendGate(CustomTestCase):
         self.assertFalse(self._gate(replicated=True))
         self.assertFalse(self._gate(weightless=True))
         self.assertFalse(self._gate(kdtype=torch.float16))
-        with mock.patch.dict(os.environ, {"SGLANG_DCP_FUSE_MAX_ROWS": "4"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_DCP_FUSE_MAX_ROWS": "4"}):
             comm._KVQ_FUSE["max_rows"] = None
             self.assertFalse(self._gate())  # 8 rows > 4
         comm._KVQ_FUSE["max_rows"] = None
 
     def test_wiring(self):
-        from sglang.srt.layers.attention import flashinfer_backend as fb
+        from flliper.srt.layers.attention import flashinfer_backend as fb
 
         dec = inspect.getsource(fb.FlashInferAttnBackend._forward_decode_dcp)
         self.assertIn("self._dcp_kvq_fusable(layer, k, v, q_local)", dec)

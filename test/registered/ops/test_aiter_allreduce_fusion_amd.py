@@ -11,10 +11,10 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers import communicator as comm
+from flliper.srt.layers.communicator import LayerCommunicator, ScatterMode
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=240, suite="stage-c-test-large-8-gpu-amd")
 
@@ -39,10 +39,10 @@ def _run_residual_accuracy_check():
     """
     import torch.distributed as dist
 
-    from sglang.srt.distributed.communication_op import (
+    from flliper.srt.distributed.communication_op import (
         tensor_model_parallel_fused_allreduce_rmsnorm,
     )
-    from sglang.srt.distributed.parallel_state import (
+    from flliper.srt.distributed.parallel_state import (
         destroy_distributed_environment,
         destroy_model_parallel,
         init_distributed_environment,
@@ -420,7 +420,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
             stack.enter_context(
                 mock.patch.object(comm, "get_server_args", lambda: server_args)
             )
-            from sglang.srt.runtime_context import get_flags
+            from flliper.srt.runtime_context import get_flags
 
             stack.enter_context(get_flags().dp.override(enabled=dp_attention))
             stack.enter_context(

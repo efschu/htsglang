@@ -4,18 +4,18 @@ from pathlib import Path
 
 import torch
 
-from sglang.benchmark.dspark_sts_fit import (
+from flliper.benchmark.dspark_sts_fit import (
     default_temperature_grid,
     expected_calibration_error,
     fit_sts_temperatures,
 )
-from sglang.srt.models.dspark import DSparkConfidenceHead
-from sglang.srt.speculative.dspark_components.dspark_sts import (
+from flliper.srt.models.dspark import DSparkConfidenceHead
+from flliper.srt.speculative.dspark_components.dspark_sts import (
     DSparkStsCalibration,
     StsDataRecorder,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

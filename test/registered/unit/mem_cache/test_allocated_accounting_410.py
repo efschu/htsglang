@@ -35,9 +35,9 @@ import tempfile
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
-from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+from flliper.test.test_utils import CustomTestCase
 
 IDENTITY = "sha256:410alloc"
 

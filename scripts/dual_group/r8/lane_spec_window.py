@@ -104,7 +104,7 @@ def _row(res: Dict[str, Any]) -> Dict[str, Any]:
         "head_graph_forwards": res.get("head_graph_forwards"),
         "prefill_ms": res.get("prefill_ms"),
         "output_ids": res.get("output_ids"),
-        # Present only under SGLANG_LANE_MARGIN_PROBE=1 on the server. Carried
+        # Present only under FLLIPER_LANE_MARGIN_PROBE=1 on the server. Carried
         # through so the r12 margin verdict can run off THIS window's arms
         # instead of needing a second boot (#284's named follow-on).
         "margins": res.get("margins"),

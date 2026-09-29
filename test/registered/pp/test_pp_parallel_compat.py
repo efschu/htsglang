@@ -1,9 +1,9 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -90,7 +90,7 @@ class TestQwen3MoePPxCP(_Qwen3MoePPCompatMixin, CustomTestCase):
         "--cp-strategy",
         "zigzag",
     ]
-    server_env = {"SGLANG_ENABLE_CP_V2": "1"}
+    server_env = {"FLLIPER_ENABLE_CP_V2": "1"}
 
 
 class TestQwen3MoePPxDP(_Qwen3MoePPCompatMixin, CustomTestCase):

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import MagicMock
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -98,7 +98,7 @@ def make_indices(indices):
 @unittest.skipUnless(HAS_MORI, "mori.umbp not available (AMD/ROCm only)")
 class TestUMBPStore(unittest.TestCase):
     def test_basic_set_get(self):
-        from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
+        from flliper.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
         config = MockStorageConfig(
             extra_config={"dram_capacity_bytes": 1024 * 1024, "ssd_enabled": False}
@@ -133,7 +133,7 @@ class TestUMBPStore(unittest.TestCase):
         self.assertEqual(v_data, bytes([ord("B")] * 512), "V data mismatch")
 
     def test_batch_set_get_multiple_pages(self):
-        from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
+        from flliper.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
         config = MockStorageConfig(
             extra_config={"dram_capacity_bytes": 4 * 1024 * 1024, "ssd_enabled": False}
@@ -170,7 +170,7 @@ class TestUMBPStore(unittest.TestCase):
             self.assertEqual(v[0], ord("a") + i, f"Page {i} V mismatch")
 
     def test_batch_exists(self):
-        from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
+        from flliper.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
         config = MockStorageConfig(
             extra_config={"dram_capacity_bytes": 1024 * 1024, "ssd_enabled": False}
@@ -194,7 +194,7 @@ class TestUMBPStore(unittest.TestCase):
         self.assertEqual(count, 2, f"Expected 2 consecutive, got {count}")
 
     def test_dedup_on_set(self):
-        from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
+        from flliper.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
         config = MockStorageConfig(
             extra_config={"dram_capacity_bytes": 1024 * 1024, "ssd_enabled": False}
@@ -223,7 +223,7 @@ class TestUMBPStore(unittest.TestCase):
         self.assertEqual(k[0], ord("A"), f"Expected original data 'A', got {chr(k[0])}")
 
     def test_clear(self):
-        from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
+        from flliper.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
         config = MockStorageConfig(
             extra_config={"dram_capacity_bytes": 1024 * 1024, "ssd_enabled": False}
@@ -241,7 +241,7 @@ class TestUMBPStore(unittest.TestCase):
         self.assertFalse(store.exists("clear_key_0_k"))
 
     def test_legacy_interface(self):
-        from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
+        from flliper.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
         config = MockStorageConfig(
             extra_config={"dram_capacity_bytes": 1024 * 1024, "ssd_enabled": False}
@@ -263,7 +263,7 @@ class TestUMBPStore(unittest.TestCase):
         self.assertEqual(buf[0], b"Z")
 
     def test_segmented_layout_basic(self):
-        from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
+        from flliper.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
         with tempfile.TemporaryDirectory(prefix="umbp_segmented_") as ssd_dir:
             config = MockStorageConfig(

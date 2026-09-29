@@ -22,9 +22,9 @@ refusal can be lifted with evidence rather than by guess.
 import inspect
 import unittest
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -123,7 +123,7 @@ class TheMechanismBehindTheRefusalTest(CustomTestCase):
     leaving a refusal in place whose reason nobody can re-derive."""
 
     def test_no_chunk_cache_can_enumerate_its_values(self):
-        from sglang.srt.mem_cache.chunk_cache import (
+        from flliper.srt.mem_cache.chunk_cache import (
             ChunkCache,
             PureSWAChunkCache,
             SWAChunkCache,
@@ -140,14 +140,14 @@ class TheMechanismBehindTheRefusalTest(CustomTestCase):
     def test_the_radix_caches_do_enumerate(self):
         """The other direction: the refusal must not be a claim about every
         cache, or it would be refusing something that is not the problem."""
-        from sglang.srt.mem_cache.radix_cache import RadixCache
+        from flliper.srt.mem_cache.radix_cache import RadixCache
 
         self.assertTrue(hasattr(RadixCache, "all_values_flatten"))
 
     def test_the_flip_guard_still_tests_for_that_method(self):
         """The refusal is a shortcut for a runtime guard. If the guard stops
         keying on this method the shortcut is no longer equivalent."""
-        from sglang.srt.managers import phase_flip_runtime
+        from flliper.srt.managers import phase_flip_runtime
 
         source = inspect.getsource(phase_flip_runtime)
         self.assertIn('hasattr(scheduler.tree_cache, "all_values_flatten")', source)

@@ -13,7 +13,7 @@ writes it to L3 through the claim's own disk half
 not once per rank.
 
 Hermetic: the H19 harness (one real shared arena, three P rank pools, real
-``UnifiedRadixCache._weg2_mamba_claim``) on the L3P store of #257 (d) (real
+``UnifiedRadixCache._pdflip_mamba_claim``) on the L3P store of #257 (d) (real
 ``LRUFileEvictor``, real #1459 index, ``_l3p_seed_index``); every rank writes
 its own extent of each anchor blob."""
 from __future__ import annotations
@@ -26,8 +26,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest  # noqa: E402
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -41,7 +41,7 @@ def _load(name, rel):
     return mod
 
 
-h19 = _load("_t_h19", "../weg2/test_weg2_mamba_arena_displace_h19.py")
+h19 = _load("_t_h19", "../pdflip/test_pdflip_mamba_arena_displace_h19.py")
 d257 = _load("_t_257d", "test_probe_hold_257.py")
 
 CAP = 2
@@ -65,7 +65,7 @@ class _Rank(h19._Rank):
     def sweep(self):
         while self.unbacked:
             n, h = self.unbacked[0]
-            rows = self.cache._weg2_mamba_claim(n, self.mp, h)
+            rows = self.cache._pdflip_mamba_claim(n, self.mp, h)
             if rows is None:
                 return False
             slot = int(rows[0]) - self.mp.staging_rows

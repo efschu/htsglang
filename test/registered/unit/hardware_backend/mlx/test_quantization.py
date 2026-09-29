@@ -17,7 +17,7 @@ import importlib.util
 import platform
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from flliper.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
 # Registered on the CPU suite but skipped wherever mlx is absent; runs for real
 # only on Apple Silicon. Also registered under stage-b-e2e-mlx, not stage-a:
@@ -68,7 +68,7 @@ class TestMlxQuantization(unittest.TestCase):
         mx.clear_cache()
 
     def _build_runner(self, model_path: str, quantization: str | None):
-        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
+        from flliper.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
         return MlxModelRunner(
             model_path=model_path,

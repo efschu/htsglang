@@ -27,8 +27,8 @@ def main() -> int:
         argv = argv[:i]
     model_path, vecs = argv[0], argv[1:]
 
-    from sglang.srt.server_args import prepare_server_args
-    from sglang.srt import uneven_perf as up
+    from flliper.srt.server_args import prepare_server_args
+    from flliper.srt import uneven_perf as up
 
     base_argv = [
         "--model-path",

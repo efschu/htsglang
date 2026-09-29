@@ -1,16 +1,16 @@
 import os
 import unittest
 
-from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
+from flliper.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
-from sglang.test.ascend.e2e.test_npu_performance_utils import (
+from flliper.test.ascend.e2e.test_npu_performance_utils import (
     BENCHMARK_TOOL_DEFAULT,
     MINIMAX_M2_5_EAGLE3_MODEL_PATH,
     MINIMAX_M2_5_W8A8_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
-from sglang.test.ci.ci_register import register_npu_ci
+from flliper.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
@@ -25,14 +25,14 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "TASK_QUEUE_ENABLE": "1",
     "ASCEND_USE_FIA": "1",
-    "SGLANG_SET_CPU_AFFINITY": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_NPU_FUSED_MOE_MODE": "2",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "140000",
+    "FLLIPER_SET_CPU_AFFINITY": "1",
+    "FLLIPER_ENABLE_SPEC_V2": "1",
+    "FLLIPER_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "FLLIPER_NPU_FUSED_MOE_MODE": "2",
+    "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "140000",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "HCCL_BUFFSIZE": "1024",
-    "SGLANG_EXTERNAL_MODEL_PACKAGE": "custom_eagle3",
+    "FLLIPER_EXTERNAL_MODEL_PACKAGE": "custom_eagle3",
     "PYTHONPATH": f"{MINIMAX_M2_5_EAGLE3_MODEL_PATH}:{os.environ.get('PYTHONPATH', '')}",
 }
 

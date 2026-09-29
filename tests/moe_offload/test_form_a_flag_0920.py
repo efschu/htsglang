@@ -26,7 +26,7 @@ What is pinned:
 
 import pytest
 
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.server_args import ServerArgs
 
 
 def _args(**kw):
@@ -116,7 +116,7 @@ def test_a_bad_role_vector_is_refused_through_the_flag():
 
 
 def test_the_flag_parser_and_the_runtime_share_one_definition():
-    from sglang.srt.server_args import _parse_rank_role
+    from flliper.srt.server_args import _parse_rank_role
 
     assert _parse_rank_role("host, worker ,WORKER") == FORM_A
     with pytest.raises(Exception, match="must be one of"):

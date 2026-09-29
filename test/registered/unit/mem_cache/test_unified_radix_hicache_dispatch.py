@@ -1,9 +1,9 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
-from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+from flliper.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
+from flliper.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+from flliper.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _STRATEGIES,
     StackBuildResult,
     StackStrategy,
@@ -17,8 +17,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _SwaStrategy,
     register_stack_strategy,
 )
-from sglang.srt.mem_cache.unified_cache_components import ComponentType
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.unified_cache_components import ComponentType
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -43,7 +43,7 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         self.assertEqual(order[-1], _PlainKvStrategy)
 
     def test_deepseek_v4_full_swa(self):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        from flliper.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4TokenToKVPool,
         )
 
@@ -52,28 +52,28 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         self.assertIsInstance(strategy, _DeepSeekV4Strategy)
 
     def test_mamba(self):
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         kvcache = _mock_kvcache(HybridLinearKVPool)
         strategy = _select_strategy(kvcache, {FULL, MAMBA})
         self.assertIsInstance(strategy, _MambaStrategy)
 
     def test_swa(self):
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from flliper.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         kvcache = _mock_kvcache(SWAKVPool)
         strategy = _select_strategy(kvcache, {FULL, SWA})
         self.assertIsInstance(strategy, _SwaStrategy)
 
     def test_dsa(self):
-        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+        from flliper.srt.mem_cache.memory_pool import DSATokenToKVPool
 
         kvcache = _mock_kvcache(DSATokenToKVPool)
         strategy = _select_strategy(kvcache, {FULL})
         self.assertIsInstance(strategy, _DsaStrategy)
 
     def test_minimax_sparse(self):
-        from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+        from flliper.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
         kvcache = _mock_kvcache(MiniMaxSparseKVPool)
         strategy = _select_strategy(kvcache, {FULL})
@@ -124,24 +124,24 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         self.assertEqual(result.sidecars[0].indices_from_pool, PoolName.KV)
 
     def test_plain_kv_fallback(self):
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         kvcache = _mock_kvcache(MHATokenToKVPool)
         strategy = _select_strategy(kvcache, {FULL})
         self.assertIsInstance(strategy, _PlainKvStrategy)
 
     def test_mla_routes_to_plain(self):
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from flliper.srt.mem_cache.memory_pool import MLATokenToKVPool
 
         kvcache = _mock_kvcache(MLATokenToKVPool)
         strategy = _select_strategy(kvcache, {FULL})
         self.assertIsInstance(strategy, _PlainKvStrategy)
 
     def test_unknown_combo_raises(self):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        from flliper.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4TokenToKVPool,
         )
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from flliper.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         # #614: the refusal class changed from AssertionError to ValueError and
         # the wording from two Python identifiers to a named refusal. Both are
@@ -170,7 +170,7 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         original = list(hybrid_pool_assembler._STRATEGIES)
         try:
             register_stack_strategy(custom)
-            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+            from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 
             kvcache = _mock_kvcache(MHATokenToKVPool)
             self.assertIs(_select_strategy(kvcache, {FULL}), custom)

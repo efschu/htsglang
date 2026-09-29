@@ -2,7 +2,7 @@
 
 import unittest
 
-from sglang.srt.rigmon.rates import (
+from flliper.srt.rigmon.rates import (
     PeakCapability,
     engine_rank_rates,
     group_throughput,
@@ -13,9 +13,9 @@ from sglang.srt.rigmon.rates import (
     rank_shares,
     round_time,
 )
-from sglang.srt.rigmon.sources import CardSample
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.rigmon.sources import CardSample
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

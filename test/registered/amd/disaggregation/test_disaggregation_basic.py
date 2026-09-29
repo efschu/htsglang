@@ -7,12 +7,12 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
@@ -25,14 +25,14 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         # Configure ROCm RDMA environment
-        os.environ["SGLANG_USE_AITER"] = "1"
-        rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
+        os.environ["FLLIPER_USE_AITER"] = "1"
+        rdma_env = os.environ.get("FLLIPER_TEST_RDMA_DEVICE")
 
         if rdma_env:
             cls.rdma_devices = ["--disaggregation-ib-device", rdma_env]
             print(f"Found RDMA devices in env: {rdma_env}")
         else:
-            print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
+            print("FLLIPER_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
         cls.model = "Qwen/Qwen3-8B"
@@ -221,14 +221,14 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         # Configure ROCm RDMA environment
-        os.environ["SGLANG_USE_AITER"] = "1"
-        rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
+        os.environ["FLLIPER_USE_AITER"] = "1"
+        rdma_env = os.environ.get("FLLIPER_TEST_RDMA_DEVICE")
 
         if rdma_env:
             cls.rdma_devices = ["--disaggregation-ib-device", rdma_env]
             print(f"Found RDMA devices in env: {rdma_env}")
         else:
-            print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
+            print("FLLIPER_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
         # set DISAGGREGATION_TEST_FAILURE_PROB to simulate failure
@@ -335,17 +335,17 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         # Configure ROCm RDMA environment
-        os.environ["SGLANG_USE_AITER"] = "1"
-        rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
+        os.environ["FLLIPER_USE_AITER"] = "1"
+        rdma_env = os.environ.get("FLLIPER_TEST_RDMA_DEVICE")
 
         if rdma_env:
             cls.rdma_devices = ["--disaggregation-ib-device", rdma_env]
             print(f"Found RDMA devices in env: {rdma_env}")
         else:
-            print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
+            print("FLLIPER_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        os.environ["SGLANG_TEST_RETRACT"] = "true"
+        os.environ["FLLIPER_TEST_RETRACT"] = "true"
         cls.model = "Qwen/Qwen3-8B"
 
         # Non blocking start servers
@@ -360,7 +360,7 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("SGLANG_TEST_RETRACT")
+        os.environ.pop("FLLIPER_TEST_RETRACT")
         super().tearDownClass()
 
     @classmethod

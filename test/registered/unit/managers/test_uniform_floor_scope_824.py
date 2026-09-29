@@ -47,8 +47,8 @@ the gap legible while that is decided.
 
 import unittest
 
-from sglang.srt.managers import uniform_floor_scope as scope
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import uniform_floor_scope as scope
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -151,7 +151,7 @@ class TheWiringDelegatesTheDecision(unittest.TestCase):
     def _source(self):
         import inspect
 
-        from sglang.srt.managers import uniform_floor_scope as m
+        from flliper.srt.managers import uniform_floor_scope as m
 
         return inspect.getsource(m.report_scope)
 
@@ -178,7 +178,7 @@ class TheWiringDelegatesTheDecision(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler._update_uniform_pool_budget)
         code = "\n".join(

@@ -85,7 +85,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60)
 
@@ -156,7 +156,7 @@ def _proxy(stamp, rows):
 
 def _victim(rank, wire, epoch):
     """The SHIPPED mixin methods, bound to a holder (the 630/757 pattern)."""
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         pp_group=wire,
@@ -273,7 +273,7 @@ def _blind_worker(rank, init_file, out_dir, case):
     depended on the fix rather than that the fix is present. A wholesale
     revert would prove neither.
     """
-    from sglang.srt.managers import scheduler_pp_mixin as m
+    from flliper.srt.managers import scheduler_pp_mixin as m
 
     m.pp_proxy_stamp_epoch = lambda stamp: None
     return _worker(rank, init_file, out_dir, case)

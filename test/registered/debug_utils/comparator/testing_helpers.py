@@ -8,7 +8,7 @@ from typing import Optional
 
 from rich.console import Console
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(
     est_time=0,
@@ -17,7 +17,7 @@ register_cpu_ci(
     disabled="helper module, no tests",
 )
 
-from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
+from flliper.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorInfo,
     TensorStats,

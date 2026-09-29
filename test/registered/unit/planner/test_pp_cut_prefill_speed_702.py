@@ -29,7 +29,7 @@ import unittest
 
 import pytest
 
-from sglang.srt.planner.pp_cut import (
+from flliper.srt.planner.pp_cut import (
     pipelined_prefill_ms,
     prefill_timing_from_measurement,
     serial_prefill_ms,
@@ -210,7 +210,7 @@ class TheCoSolveClaimsAfterTheModelChange(unittest.TestCase):
     """The surviving half of the six, against PhasePoolModel."""
 
     def _model(self):
-        from sglang.srt.planner.pp_cut import PhasePoolModel
+        from flliper.srt.planner.pp_cut import PhasePoolModel
 
         return PhasePoolModel(
             free_mib=(20000.0, 12000.0, 12000.0),
@@ -228,7 +228,7 @@ class TheCoSolveClaimsAfterTheModelChange(unittest.TestCase):
         rank is the pool and a per-rank cap CAN bind it -- the opposite of the
         old claim, which is why that test could not be carried over.
         """
-        from sglang.srt.planner.pp_cut import pp_phase_pool, stage_pp_capacities
+        from flliper.srt.planner.pp_cut import pp_phase_pool, stage_pp_capacities
 
         model = self._model()
         counts, attn = (32, 16, 16), (8, 4, 4)
@@ -244,7 +244,7 @@ class TheCoSolveClaimsAfterTheModelChange(unittest.TestCase):
         independent of any PP cut, so it is pinned as cut-independence rather
         than as a vector shift.
         """
-        from sglang.srt.planner.pp_cut import tp_phase_pool
+        from flliper.srt.planner.pp_cut import tp_phase_pool
 
         model = self._model()
         self.assertEqual(tp_phase_pool(16, 3, model), tp_phase_pool(16, 3, model))
@@ -257,7 +257,7 @@ class TheCoSolveClaimsAfterTheModelChange(unittest.TestCase):
         pins it as test_weight_overflow_is_refused_by_name. Cross-checked here
         so this file records that it was carried, not dropped.
         """
-        from sglang.srt.planner.pp_cut import stage_pp_capacities
+        from flliper.srt.planner.pp_cut import stage_pp_capacities
 
         with self.assertRaises(ValueError):
             stage_pp_capacities((64, 0, 0), (16, 0, 0), self._model())

@@ -4,7 +4,7 @@ import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.parser.template_detection import (
+from flliper.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
     ReasoningToggleConfig,
@@ -13,7 +13,7 @@ from sglang.srt.parser.template_detection import (
     detect_tool_call_parser,
     resolve_auto_parsers,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
 
@@ -28,7 +28,7 @@ class _DummyTokenizer:
 
 
 def _patch_hf_transformers_utils(get_tokenizer, get_config=None):
-    module = ModuleType("sglang.srt.utils.hf_transformers_utils")
+    module = ModuleType("flliper.srt.utils.hf_transformers_utils")
     module.get_tokenizer = get_tokenizer
     if get_config is not None:
         module.get_config = get_config

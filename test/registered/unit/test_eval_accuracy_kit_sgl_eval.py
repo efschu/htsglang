@@ -18,10 +18,10 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.kits import eval_accuracy_kit as kit
-from sglang.test.kits.eval_accuracy_kit import GPQAMixin, GSM8KMixin
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.kits import eval_accuracy_kit as kit
+from flliper.test.kits.eval_accuracy_kit import GPQAMixin, GSM8KMixin
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

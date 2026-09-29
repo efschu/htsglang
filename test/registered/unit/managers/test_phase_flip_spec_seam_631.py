@@ -41,12 +41,12 @@ import types
 import pytest
 import torch
 
-from sglang.srt.managers.phase_flip_draft_bootstrap import (
+from flliper.srt.managers.phase_flip_draft_bootstrap import (
     _reachable_batches,
     clear_spec_info_for_unspeculated_phase,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.speculative.eagle_info import EagleDraftInput
+from flliper.srt.managers.schedule_batch import ScheduleBatch
+from flliper.srt.speculative.eagle_info import EagleDraftInput
 
 
 # --------------------------------------------------------------------------

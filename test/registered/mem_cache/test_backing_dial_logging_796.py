@@ -20,18 +20,18 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu")
 
-LOGGER_NAME = "sglang.srt.mem_cache.memory_pool"
+LOGGER_NAME = "flliper.srt.mem_cache.memory_pool"
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA (driver VMM API)")
 class TestBackingDialLogging(CustomTestCase):
     def _pool(self, size):
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         return MHATokenToKVPool(
             size=size,

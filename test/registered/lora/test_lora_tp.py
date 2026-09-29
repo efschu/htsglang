@@ -17,8 +17,8 @@ import os
 import unittest
 from typing import List, Optional
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.lora_utils import (
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
     CI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,
@@ -27,7 +27,7 @@ from sglang.test.lora_utils import (
     LoRAModelCase,
     run_lora_test_one_by_one,
 )
-from sglang.test.test_utils import CustomTestCase, is_in_ci
+from flliper.test.test_utils import CustomTestCase, is_in_ci
 
 register_cuda_ci(
     est_time=230,

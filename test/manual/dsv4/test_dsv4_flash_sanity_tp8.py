@@ -2,9 +2,9 @@
 
 import unittest
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -14,8 +14,8 @@ from sglang.test.test_utils import (
 DSV4_FLASH_MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
 
 DSV4_FLASH_ENV = {
-    "SGLANG_DSV4_FP4_EXPERTS": "0",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+    "FLLIPER_DSV4_FP4_EXPERTS": "0",
+    "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
 }
 
 

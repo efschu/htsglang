@@ -23,7 +23,7 @@ Hermetic: pure arithmetic, no CUDA.
 """
 
 import pytest
-from sglang.srt.planner.decoupled_kv import (
+from flliper.srt.planner.decoupled_kv import (
     DecoupledKvError,
     KvGeometry,
     collective_bytes_per_chunk,
@@ -208,7 +208,7 @@ def test_structural_uniformity_is_separable_from_vector_identity():
     second costs depth. A design that conflates them would pay for both or
     neither.
     """
-    from sglang.srt.planner.decoupled_kv import seam_rebalance_bytes
+    from flliper.srt.planner.decoupled_kv import seam_rebalance_bytes
 
     # Same structure, different shares -> a rebalance, not a re-layout.
     moved = seam_rebalance_bytes(
@@ -255,7 +255,7 @@ def test_one_fixed_vector_serves_every_rung_and_moves_no_rows():
     per-rank constraint is feasible at all of them -- and a fixed vector makes a
     rung change move ZERO KV rows, which is what the ladder needs.
     """
-    from sglang.srt.planner.decoupled_kv import fixed_vector_for_ladder
+    from flliper.srt.planner.decoupled_kv import fixed_vector_for_ladder
 
     vec = fixed_vector_for_ladder([_free_for(c) for c in LADDER], POOL_TOKENS, GEO)
     for cut in LADDER:
@@ -266,14 +266,14 @@ def test_one_fixed_vector_serves_every_rung_and_moves_no_rows():
         assert fit.world_pool_tokens > POOL_TOKENS
 
     # Held fixed, a rung change moves nothing.
-    from sglang.srt.planner.decoupled_kv import seam_rebalance_bytes
+    from flliper.srt.planner.decoupled_kv import seam_rebalance_bytes
 
     assert seam_rebalance_bytes(vec, vec, POOL_TOKENS, GEO) == 0
 
 
 def test_a_per_rung_vector_would_pay_a_rebalance_on_every_step():
     """The cost avoided, quantified, so the choice is not a matter of taste."""
-    from sglang.srt.planner.decoupled_kv import seam_rebalance_bytes
+    from flliper.srt.planner.decoupled_kv import seam_rebalance_bytes
 
     GiB_ = 1024**3
     total = 0
@@ -304,7 +304,7 @@ def test_the_binding_rank_differs_by_rung_which_is_why_the_minimum_is_per_rank()
 
 
 def test_an_impossible_ladder_is_refused():
-    from sglang.srt.planner.decoupled_kv import fixed_vector_for_ladder
+    from flliper.srt.planner.decoupled_kv import fixed_vector_for_ladder
 
     with pytest.raises(DecoupledKvError, match="no rungs"):
         fixed_vector_for_ladder([], POOL_TOKENS, GEO)
@@ -323,7 +323,7 @@ def test_an_impossible_ladder_is_refused():
 
 
 def test_quantised_ratios_sum_to_the_period_and_realize_the_shares():
-    from sglang.srt.planner.decoupled_kv import quantize_shares
+    from flliper.srt.planner.decoupled_kv import quantize_shares
 
     target = (0.135, 0.483, 0.382)
     q = quantize_shares(
@@ -340,7 +340,7 @@ def test_quantised_ratios_sum_to_the_period_and_realize_the_shares():
 
 
 def test_a_finer_period_tracks_the_target_more_closely():
-    from sglang.srt.planner.decoupled_kv import quantize_shares
+    from flliper.srt.planner.decoupled_kv import quantize_shares
 
     target = (0.135, 0.483, 0.382)
     free = _free_for((44, 10, 10))
@@ -356,7 +356,7 @@ def test_rounding_may_not_push_a_tight_rank_over_its_free_memory():
     Rounding that share UP buys rows rank0 cannot hold, and the resulting OOM
     would look like a decoupling bug rather than a rounding bug.
     """
-    from sglang.srt.planner.decoupled_kv import quantize_shares
+    from flliper.srt.planner.decoupled_kv import quantize_shares
 
     free = _free_for((44, 10, 10))
     q = quantize_shares((0.135, 0.483, 0.382), 32, free, POOL_TOKENS, GEO)
@@ -365,7 +365,7 @@ def test_rounding_may_not_push_a_tight_rank_over_its_free_memory():
 
 
 def test_an_infeasible_target_is_refused_rather_than_rounded_into_place():
-    from sglang.srt.planner.decoupled_kv import quantize_shares
+    from flliper.srt.planner.decoupled_kv import quantize_shares
 
     # Demand almost everything on rank0, which has the least free memory.
     with pytest.raises(DecoupledKvError, match="feasible"):
@@ -378,7 +378,7 @@ def test_a_rank_quantising_to_zero_slots_is_refused_not_silently_dropped():
     """A zero-slot rank holds no rows but would still be asked for Q and a
     partial output, paying full collective cost for nothing. If a rank is meant
     to be out of the shard set, the caller must say so explicitly."""
-    from sglang.srt.planner.decoupled_kv import quantize_shares
+    from flliper.srt.planner.decoupled_kv import quantize_shares
 
     with pytest.raises(DecoupledKvError, match="zero slots"):
         quantize_shares((0.98, 0.01, 0.01), 4, (100.0, 100.0, 100.0), POOL_TOKENS, GEO)
@@ -388,7 +388,7 @@ def test_the_even_split_round_trips_exactly():
     """All-equal ratios are the classic even-DCP fast path, which
     distributed/utils.py keeps bit-identical. Quantising an even target must
     not perturb it."""
-    from sglang.srt.planner.decoupled_kv import quantize_shares
+    from flliper.srt.planner.decoupled_kv import quantize_shares
 
     q = quantize_shares(
         (1 / 3, 1 / 3, 1 / 3), 3, (100.0, 100.0, 100.0), POOL_TOKENS, GEO
@@ -405,7 +405,7 @@ def test_kv_placement_is_a_real_cost_the_coupled_layout_does_not_pay():
     produced for a token the computing stage does not own must be shipped --
     traffic that simply does not exist when KV stays with its layer.
     """
-    from sglang.srt.planner.decoupled_kv import kv_placement_bytes_per_chunk
+    from flliper.srt.planner.decoupled_kv import kv_placement_bytes_per_chunk
 
     shares = (0.135, 0.483, 0.382)
     attn_per_stage = (7, 5, 4)  # interval-4 split of [44,10,10]-class cuts
@@ -423,7 +423,7 @@ def test_kv_placement_is_a_real_cost_the_coupled_layout_does_not_pay():
 
 
 def test_placement_traffic_scales_with_the_chunk():
-    from sglang.srt.planner.decoupled_kv import kv_placement_bytes_per_chunk
+    from flliper.srt.planner.decoupled_kv import kv_placement_bytes_per_chunk
 
     a = kv_placement_bytes_per_chunk(GEO, (7, 5, 4), (0.135, 0.483, 0.382), 512)
     b = kv_placement_bytes_per_chunk(GEO, (7, 5, 4), (0.135, 0.483, 0.382), 1024)
@@ -431,7 +431,7 @@ def test_placement_traffic_scales_with_the_chunk():
 
 
 def test_placement_refuses_a_stage_share_mismatch():
-    from sglang.srt.planner.decoupled_kv import kv_placement_bytes_per_chunk
+    from flliper.srt.planner.decoupled_kv import kv_placement_bytes_per_chunk
 
     with pytest.raises(DecoupledKvError, match="stages"):
         kv_placement_bytes_per_chunk(GEO, (7, 5), (0.1, 0.5, 0.4), 512)

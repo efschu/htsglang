@@ -32,11 +32,11 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.managers.tenant_mover import (
+from flliper.srt.managers.tenant_mover import (
     TenantMover,
     UnknownTenant,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 #: Distinct from None, which this stub uses for "not specified". A route that

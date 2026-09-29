@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci
+from flliper.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=180, suite="stage-c-test-large-8-gpu-amd")
 

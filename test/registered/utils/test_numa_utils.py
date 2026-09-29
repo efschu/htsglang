@@ -4,7 +4,7 @@ import unittest
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.utils.numa_utils import (
+from flliper.srt.utils.numa_utils import (
     _handle_numa_bind_failure,
     _is_numa_available,
     _node_cpus,
@@ -16,7 +16,7 @@ from sglang.srt.utils.numa_utils import (
     get_numa_node_if_available,
     numa_bind_to_node,
 )
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb300")
@@ -26,36 +26,36 @@ register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-b200")
 class TestIsNumaAvailable(unittest.TestCase):
     """Tests for _is_numa_available on both NUMA and non-NUMA systems."""
 
-    @patch("sglang.srt.utils.numa_utils._is_cuda", False)
+    @patch("flliper.srt.utils.numa_utils._is_cuda", False)
     def test_returns_false_when_not_cuda(self):
         self.assertFalse(_is_numa_available())
 
-    @patch("sglang.srt.utils.numa_utils._is_cuda", True)
+    @patch("flliper.srt.utils.numa_utils._is_cuda", True)
     @patch("os.path.isdir", return_value=False)
     def test_returns_false_when_no_numa_nodes(self, _mock_isdir):
         self.assertFalse(_is_numa_available())
 
-    @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=True)
-    @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
-    @patch("sglang.srt.utils.numa_utils._is_cuda", True)
+    @patch("flliper.srt.utils.numa_utils._can_set_mempolicy", return_value=True)
+    @patch("flliper.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
+    @patch("flliper.srt.utils.numa_utils._is_cuda", True)
     @patch("os.path.isdir", return_value=True)
     def test_returns_true_on_numa_system(
         self, _mock_isdir, _mock_which, _mock_mempolicy
     ):
         self.assertTrue(_is_numa_available())
 
-    @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=False)
-    @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
-    @patch("sglang.srt.utils.numa_utils._is_cuda", True)
+    @patch("flliper.srt.utils.numa_utils._can_set_mempolicy", return_value=False)
+    @patch("flliper.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
+    @patch("flliper.srt.utils.numa_utils._is_cuda", True)
     @patch("os.path.isdir", return_value=True)
     def test_returns_false_when_mempolicy_not_permitted(
         self, _mock_isdir, _mock_which, _mock_mempolicy
     ):
         self.assertFalse(_is_numa_available())
 
-    @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=True)
-    @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
-    @patch("sglang.srt.utils.numa_utils._is_cuda", True)
+    @patch("flliper.srt.utils.numa_utils._can_set_mempolicy", return_value=True)
+    @patch("flliper.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
+    @patch("flliper.srt.utils.numa_utils._is_cuda", True)
     @patch("os.path.isdir", return_value=True)
     def test_isdir_called_with_node1_path(
         self, mock_isdir, _mock_which, _mock_mempolicy
@@ -68,7 +68,7 @@ class TestQueryNumaNodeForGpu(unittest.TestCase):
     """Tests for _query_numa_node_for_gpu with mocked pynvml."""
 
     @patch(
-        "sglang.srt.utils.numa_utils.glob.glob",
+        "flliper.srt.utils.numa_utils.glob.glob",
         return_value=[
             "/sys/devices/system/node/node0",
             "/sys/devices/system/node/node1",
@@ -91,7 +91,7 @@ class TestQueryNumaNodeForGpu(unittest.TestCase):
         mock_pynvml.nvmlShutdown.assert_called_once()
 
     @patch(
-        "sglang.srt.utils.numa_utils.glob.glob",
+        "flliper.srt.utils.numa_utils.glob.glob",
         return_value=[
             "/sys/devices/system/node/node0",
             "/sys/devices/system/node/node1",
@@ -111,7 +111,7 @@ class TestQueryNumaNodeForGpu(unittest.TestCase):
         self.assertEqual(result, [1])
 
     @patch(
-        "sglang.srt.utils.numa_utils.glob.glob",
+        "flliper.srt.utils.numa_utils.glob.glob",
         return_value=[
             "/sys/devices/system/node/node0",
             "/sys/devices/system/node/node1",
@@ -133,7 +133,7 @@ class TestQueryNumaNodeForGpu(unittest.TestCase):
         self.assertEqual(result, [1, 3])
 
     @patch(
-        "sglang.srt.utils.numa_utils.glob.glob",
+        "flliper.srt.utils.numa_utils.glob.glob",
         return_value=[
             "/sys/devices/system/node/node0",
             "/sys/devices/system/node/node1",
@@ -152,7 +152,7 @@ class TestQueryNumaNodeForGpu(unittest.TestCase):
         self.assertEqual(result, [])
 
     @patch(
-        "sglang.srt.utils.numa_utils.glob.glob",
+        "flliper.srt.utils.numa_utils.glob.glob",
         return_value=[
             "/sys/devices/system/node/node0",
             "/sys/devices/system/node/node1",
@@ -185,39 +185,39 @@ class TestGetNumaNodeIfAvailable(unittest.TestCase):
         self.assertEqual(get_numa_node_if_available(args, 2), 0)
         self.assertEqual(get_numa_node_if_available(args, 3), 1)
 
-    @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=False)
+    @patch("flliper.srt.utils.numa_utils._is_numa_available", return_value=False)
     def test_returns_none_when_numa_not_available(self, _mock_avail):
         args = self._make_server_args(numa_node=None)
         self.assertIsNone(get_numa_node_if_available(args, 0))
 
-    @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[])
-    @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=True)
+    @patch("flliper.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[])
+    @patch("flliper.srt.utils.numa_utils._is_numa_available", return_value=True)
     def test_returns_none_when_query_returns_empty(self, _mock_avail, _mock_gpu):
         args = self._make_server_args(numa_node=None)
         self.assertIsNone(get_numa_node_if_available(args, 0))
 
-    @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[1])
-    @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=True)
+    @patch("flliper.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[1])
+    @patch("flliper.srt.utils.numa_utils._is_numa_available", return_value=True)
     def test_returns_queried_single_node(self, _mock_avail, _mock_gpu):
         args = self._make_server_args(numa_node=None)
         self.assertEqual(get_numa_node_if_available(args, 0), 1)
 
-    @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[0, 2])
-    @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=True)
+    @patch("flliper.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[0, 2])
+    @patch("flliper.srt.utils.numa_utils._is_numa_available", return_value=True)
     def test_returns_first_node_when_multiple_found(self, _mock_avail, _mock_gpu):
         args = self._make_server_args(numa_node=None)
         self.assertEqual(get_numa_node_if_available(args, 0), 0)
 
-    @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[0, 2])
-    @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=True)
+    @patch("flliper.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[0, 2])
+    @patch("flliper.srt.utils.numa_utils._is_numa_available", return_value=True)
     def test_logs_warning_when_multiple_nodes(self, _mock_avail, _mock_gpu):
         args = self._make_server_args(numa_node=None)
-        with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.utils.numa_utils", level="WARNING") as cm:
             get_numa_node_if_available(args, 0)
         self.assertTrue(any("Multiple NUMA nodes" in msg for msg in cm.output))
 
-    @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=True)
-    @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[1])
+    @patch("flliper.srt.utils.numa_utils._is_numa_available", return_value=True)
+    @patch("flliper.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[1])
     def test_explicit_server_args_takes_precedence(self, _mock_gpu, _mock_avail):
         args = self._make_server_args(numa_node=[5, 6])
         result = get_numa_node_if_available(args, 0)
@@ -294,17 +294,17 @@ class TestNumaBindIntersection(unittest.TestCase):
     """Tests for constraint-aware NUMA binding (node CPUs intersected with the
     process's allowed CPUs)."""
 
-    @patch("sglang.srt.utils.numa_utils.get_libnuma", return_value=None)
+    @patch("flliper.srt.utils.numa_utils.get_libnuma", return_value=None)
     def test_node_cpus_no_libnuma_returns_empty(self, _mock_lib):
         self.assertEqual(_node_cpus(0), set())
 
     @patch("os.sched_getaffinity", return_value=set(range(72)))
-    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    @patch("flliper.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
     def test_numactl_args_unconstrained_uses_cpunodebind(self, _cpus, _aff):
         self.assertEqual(_numactl_cpu_mem_args(0, 0), "--cpunodebind=0 --membind=0")
 
     @patch("os.sched_getaffinity", return_value={0} | set(range(21, 144)))
-    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    @patch("flliper.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
     def test_numactl_args_constrained_uses_physcpubind(self, _cpus, _aff):
         expected_cpus = ",".join(str(c) for c in [0] + list(range(21, 72)))
         self.assertEqual(
@@ -312,23 +312,23 @@ class TestNumaBindIntersection(unittest.TestCase):
             f"--physcpubind={expected_cpus} --membind=0",
         )
 
-    @patch.dict(os.environ, {"SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "0"})
+    @patch.dict(os.environ, {"FLLIPER_CRASH_ON_NUMA_BIND_FAILURE": "0"})
     @patch("os.sched_getaffinity", return_value=set(range(72, 144)))
-    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    @patch("flliper.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
     def test_numactl_args_empty_intersection_returns_none(self, _cpus, _aff):
         self.assertIsNone(_numactl_cpu_mem_args(0, 0))
 
-    @patch.dict(os.environ, {"SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "1"})
+    @patch.dict(os.environ, {"FLLIPER_CRASH_ON_NUMA_BIND_FAILURE": "1"})
     @patch("os.sched_getaffinity", return_value=set(range(72, 144)))
-    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    @patch("flliper.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
     def test_numactl_args_empty_intersection_crashes_when_enabled(self, _cpus, _aff):
         with self.assertRaises(RuntimeError):
             _numactl_cpu_mem_args(0, 0)
 
     @patch("os.sched_setaffinity")
     @patch("os.sched_getaffinity", return_value={0} | set(range(21, 144)))
-    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
-    @patch("sglang.srt.utils.numa_utils.get_libnuma")
+    @patch("flliper.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    @patch("flliper.srt.utils.numa_utils.get_libnuma")
     def test_numa_bind_to_node_constrained_sets_intersection(
         self, mock_libnuma, _cpus, _aff, mock_setaff
     ):
@@ -342,11 +342,11 @@ class TestNumaBindIntersection(unittest.TestCase):
         lib.numa_set_preferred.assert_called_once()
         lib.numa_run_on_node.assert_not_called()
 
-    @patch.dict(os.environ, {"SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "0"})
+    @patch.dict(os.environ, {"FLLIPER_CRASH_ON_NUMA_BIND_FAILURE": "0"})
     @patch("os.sched_setaffinity")
     @patch("os.sched_getaffinity", return_value=set(range(72, 144)))
-    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
-    @patch("sglang.srt.utils.numa_utils.get_libnuma")
+    @patch("flliper.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    @patch("flliper.srt.utils.numa_utils.get_libnuma")
     def test_numa_bind_to_node_empty_intersection_skips(
         self, mock_libnuma, _cpus, _aff, mock_setaff
     ):
@@ -359,14 +359,14 @@ class TestNumaBindIntersection(unittest.TestCase):
         mock_setaff.assert_not_called()
         lib.numa_set_preferred.assert_not_called()
 
-    @patch.dict(os.environ, {"SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "1"})
+    @patch.dict(os.environ, {"FLLIPER_CRASH_ON_NUMA_BIND_FAILURE": "1"})
     def test_handle_failure_raises_when_enabled(self):
         with self.assertRaises(RuntimeError):
             _handle_numa_bind_failure(0, {72, 73})
 
-    @patch.dict(os.environ, {"SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "0"})
+    @patch.dict(os.environ, {"FLLIPER_CRASH_ON_NUMA_BIND_FAILURE": "0"})
     def test_handle_failure_warns_when_disabled(self):
-        with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING"):
+        with self.assertLogs("flliper.srt.utils.numa_utils", level="WARNING"):
             _handle_numa_bind_failure(0, {72, 73})
 
 
@@ -386,7 +386,7 @@ class TestProbeNumactlArgs(unittest.TestCase):
     subprocess.run is mocked and orchestrated by returncode; no real numactl or
     GPU is required. Returns ``(args, last_stderr)``."""
 
-    @patch("sglang.srt.utils.numa_utils.subprocess.run")
+    @patch("flliper.srt.utils.numa_utils.subprocess.run")
     def test_membind_probe_succeeds_returns_original(self, mock_run):
         # The requested binding works on the first probe.
         mock_run.side_effect = [_run_result(0)]
@@ -394,11 +394,11 @@ class TestProbeNumactlArgs(unittest.TestCase):
         self.assertEqual(_probe_numactl_args(args), (args, ""))
         self.assertEqual(mock_run.call_count, 1)
 
-    @patch("sglang.srt.utils.numa_utils.subprocess.run")
+    @patch("flliper.srt.utils.numa_utils.subprocess.run")
     def test_membind_fails_preferred_succeeds(self, mock_run):
         # --membind rejected, --preferred accepted.
         mock_run.side_effect = [_run_result(1), _run_result(0)]
-        with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.utils.numa_utils", level="WARNING") as cm:
             result = _probe_numactl_args("--cpunodebind=0 --membind=0")
         self.assertEqual(result, ("--cpunodebind=0 --preferred=0", ""))
         self.assertTrue(any("preferred" in msg for msg in cm.output))
@@ -407,11 +407,11 @@ class TestProbeNumactlArgs(unittest.TestCase):
         self.assertIn("--preferred=0", second_call_argv)
         self.assertNotIn("--membind=0", second_call_argv)
 
-    @patch("sglang.srt.utils.numa_utils.subprocess.run")
+    @patch("flliper.srt.utils.numa_utils.subprocess.run")
     def test_membind_and_preferred_fail_cpu_only_succeeds(self, mock_run):
         # --membind and --preferred rejected, CPU-only accepted.
         mock_run.side_effect = [_run_result(1), _run_result(1), _run_result(0)]
-        with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.utils.numa_utils", level="WARNING") as cm:
             result = _probe_numactl_args("--physcpubind=0,21,22 --membind=0")
         self.assertEqual(result, ("--physcpubind=0,21,22", ""))
         self.assertTrue(any("CPU-only" in msg for msg in cm.output))
@@ -419,7 +419,7 @@ class TestProbeNumactlArgs(unittest.TestCase):
         self.assertNotIn("--membind=0", third_call_argv)
         self.assertNotIn("--preferred=0", third_call_argv)
 
-    @patch("sglang.srt.utils.numa_utils.subprocess.run")
+    @patch("flliper.srt.utils.numa_utils.subprocess.run")
     def test_all_probes_fail_returns_none_with_last_stderr(self, mock_run):
         # Every binding, down to CPU-only, is rejected; the returned stderr is the
         # CPU-only (last / strongest-attempted) rejection reason.
@@ -433,7 +433,7 @@ class TestProbeNumactlArgs(unittest.TestCase):
         self.assertIn("cpunodebind", err)
         self.assertEqual(mock_run.call_count, 3)
 
-    @patch("sglang.srt.utils.numa_utils.subprocess.run")
+    @patch("flliper.srt.utils.numa_utils.subprocess.run")
     def test_cpu_only_input_failure_returns_none(self, mock_run):
         # No --membind in the input: the requested args are already CPU-only, so
         # step 1 is the only probe and on failure we skip --preferred / strip.
@@ -445,14 +445,14 @@ class TestProbeNumactlArgs(unittest.TestCase):
         self.assertIn("cpunodebind", err)
         self.assertEqual(mock_run.call_count, 1)
 
-    @patch("sglang.srt.utils.numa_utils.subprocess.run")
+    @patch("flliper.srt.utils.numa_utils.subprocess.run")
     def test_numactl_missing_returns_none(self, mock_run):
         # numactl not installed / raises: probe must not propagate, returns None.
         mock_run.side_effect = FileNotFoundError("numactl")
         args, _err = _probe_numactl_args("--cpunodebind=0 --membind=0")
         self.assertIsNone(args)
 
-    @patch("sglang.srt.utils.numa_utils.subprocess.run")
+    @patch("flliper.srt.utils.numa_utils.subprocess.run")
     def test_rejection_stderr_surfaces_in_fallback_warning(self, mock_run):
         # numactl prints the precise rejection reason to stderr (e.g.
         # "setting membind: Invalid argument"); the fallback warning must
@@ -461,7 +461,7 @@ class TestProbeNumactlArgs(unittest.TestCase):
             _run_result(1, stderr=b"numactl: setting membind: Invalid argument"),
             _run_result(0),
         ]
-        with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.utils.numa_utils", level="WARNING") as cm:
             result = _probe_numactl_args("--cpunodebind=0 --membind=0")
         self.assertEqual(result, ("--cpunodebind=0 --preferred=0", ""))
         self.assertTrue(
@@ -490,7 +490,7 @@ class TestStripMemoryArgs(unittest.TestCase):
 class TestConfigureSubprocessProbeFailure(unittest.TestCase):
     """Tests the wiring in configure_subprocess when _probe_numactl_args gives up
     (returns None): the worker must start unbound (warn-and-yield) by default, or
-    raise before yielding when SGLANG_CRASH_ON_NUMA_BIND_FAILURE=1.
+    raise before yielding when FLLIPER_CRASH_ON_NUMA_BIND_FAILURE=1.
 
     get_numa_node_if_available / _numactl_cpu_mem_args / _probe_numactl_args are
     mocked to drive the probe-failure branch directly; _create_numactl_executable
@@ -500,34 +500,34 @@ class TestConfigureSubprocessProbeFailure(unittest.TestCase):
     def _common_patches(self):
         return [
             patch(
-                "sglang.srt.utils.numa_utils.get_numa_node_if_available",
+                "flliper.srt.utils.numa_utils.get_numa_node_if_available",
                 return_value=0,
             ),
             patch(
-                "sglang.srt.utils.numa_utils._numactl_cpu_mem_args",
+                "flliper.srt.utils.numa_utils._numactl_cpu_mem_args",
                 return_value="--cpunodebind=0 --membind=0",
             ),
             patch(
-                "sglang.srt.utils.numa_utils._probe_numactl_args",
+                "flliper.srt.utils.numa_utils._probe_numactl_args",
                 return_value=(
                     None,
                     "numactl: setting membind: Invalid argument",
                 ),
             ),
-            patch("sglang.srt.utils.numa_utils._create_numactl_executable"),
-            patch("sglang.srt.utils.numa_utils._mp_set_executable"),
+            patch("flliper.srt.utils.numa_utils._create_numactl_executable"),
+            patch("flliper.srt.utils.numa_utils._mp_set_executable"),
         ]
 
     @patch.dict(
         os.environ,
-        {"SGLANG_NUMA_BIND_V2": "1", "SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "0"},
+        {"FLLIPER_NUMA_BIND_V2": "1", "FLLIPER_CRASH_ON_NUMA_BIND_FAILURE": "0"},
     )
     def test_probe_none_warns_and_yields_unbound(self):
         with ExitStack() as stack:
             mocks = [stack.enter_context(p) for p in self._common_patches()]
             _mock_get, _mock_args, _mock_probe, mock_create, mock_mp = mocks
             server_args = MagicMock()
-            with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING") as cm:
+            with self.assertLogs("flliper.srt.utils.numa_utils", level="WARNING") as cm:
                 with configure_subprocess(server_args, 0):
                     pass  # worker would start unbound here
             # The probe-failure path reuses #26983's failure helper (warn) and
@@ -546,7 +546,7 @@ class TestConfigureSubprocessProbeFailure(unittest.TestCase):
 
     @patch.dict(
         os.environ,
-        {"SGLANG_NUMA_BIND_V2": "1", "SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "1"},
+        {"FLLIPER_NUMA_BIND_V2": "1", "FLLIPER_CRASH_ON_NUMA_BIND_FAILURE": "1"},
     )
     def test_probe_none_raises_before_yield_when_crash_enabled(self):
         with ExitStack() as stack:

@@ -308,18 +308,18 @@ class TestLaneMarginProbe(unittest.TestCase):
             import torch  # noqa: F401
         except ImportError:  # pragma: no cover - torch is a hard dep here
             self.skipTest("torch not importable")
-        from sglang.srt.model_executor import dual_group_lane as dgl
+        from flliper.srt.model_executor import dual_group_lane as dgl
 
         self.dgl = dgl
         self.lane = dgl.DualGroupLane.__new__(dgl.DualGroupLane)
 
     def tearDown(self):
-        os.environ.pop("SGLANG_LANE_MARGIN_PROBE", None)
+        os.environ.pop("FLLIPER_LANE_MARGIN_PROBE", None)
 
     def test_it_is_off_unless_the_env_var_is_set(self):
-        os.environ.pop("SGLANG_LANE_MARGIN_PROBE", None)
+        os.environ.pop("FLLIPER_LANE_MARGIN_PROBE", None)
         self.assertFalse(self.lane._margin_probe_on())
-        os.environ["SGLANG_LANE_MARGIN_PROBE"] = "1"
+        os.environ["FLLIPER_LANE_MARGIN_PROBE"] = "1"
         self.assertTrue(self.lane._margin_probe_on())
 
     def test_the_margin_is_the_gap_between_the_two_best_logits(self):
@@ -372,14 +372,14 @@ class TestVerifyMarginsCoverTheEmittedBlock(unittest.TestCase):
             import torch  # noqa: F401
         except ImportError:  # pragma: no cover - torch is a hard dep here
             self.skipTest("torch not importable")
-        from sglang.srt.model_executor import dual_group_lane as dgl
+        from flliper.srt.model_executor import dual_group_lane as dgl
 
         self.dgl = dgl
         self.lane = dgl.DualGroupLane.__new__(dgl.DualGroupLane)
-        os.environ["SGLANG_LANE_MARGIN_PROBE"] = "1"
+        os.environ["FLLIPER_LANE_MARGIN_PROBE"] = "1"
 
     def tearDown(self):
-        os.environ.pop("SGLANG_LANE_MARGIN_PROBE", None)
+        os.environ.pop("FLLIPER_LANE_MARGIN_PROBE", None)
 
     @staticmethod
     def _logits():
@@ -430,7 +430,7 @@ class TestVerifyMarginsCoverTheEmittedBlock(unittest.TestCase):
         self.assertEqual(len(job["_margins"]), emitted)
 
     def test_it_records_nothing_when_the_probe_is_off(self):
-        os.environ.pop("SGLANG_LANE_MARGIN_PROBE", None)
+        os.environ.pop("FLLIPER_LANE_MARGIN_PROBE", None)
         job = {}
         self.lane._record_verify_margins(job, self._logits(), 4)
         self.assertNotIn("_margins", job)
@@ -468,7 +468,7 @@ class TestEveryCommittingPathRecordsAMargin(unittest.TestCase):
         import ast
         import inspect
 
-        from sglang.srt.model_executor import dual_group_lane as dgl
+        from flliper.srt.model_executor import dual_group_lane as dgl
 
         self.ast = ast
         self.tree = ast.parse(inspect.getsource(dgl))

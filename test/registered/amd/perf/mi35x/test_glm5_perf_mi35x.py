@@ -9,10 +9,10 @@ import os
 import unittest
 from typing import List
 
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.nightly_bench_utils import BenchmarkResult
-from sglang.test.nightly_utils import NightlyBenchmarkRunner
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.nightly_bench_utils import BenchmarkResult
+from flliper.test.nightly_utils import NightlyBenchmarkRunner
+from flliper.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 register_amd_ci(est_time=5400, suite="nightly-perf-8-gpu-mi35x-glm5", nightly=True)
 
@@ -87,13 +87,13 @@ class TestGLM5PerfMI35x(unittest.TestCase):
                 "1200",
             ],
             "env_vars": {
-                "SGLANG_ROCM_FUSED_DECODE_MLA": "0",
+                "FLLIPER_ROCM_FUSED_DECODE_MLA": "0",
                 "ROCM_QUICK_REDUCE_QUANTIZATION": "INT4",
                 "SAFETENSORS_FAST_GPU": "1",
             },
         }
 
-        os.environ.setdefault("SGLANG_BENCH_TIMEOUT", "3600")
+        os.environ.setdefault("FLLIPER_BENCH_TIMEOUT", "3600")
         cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
         cls.runner.setup_profile_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"

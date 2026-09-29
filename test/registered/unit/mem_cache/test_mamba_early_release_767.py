@@ -37,7 +37,7 @@ class _Base:
     mamba_slot_reorder = True
     root_node = None
 
-    from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+    from flliper.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
     _mamba_early_release_admissible = MambaRadixCache._mamba_early_release_admissible
     _mamba_host_copy_complete = MambaRadixCache._mamba_host_copy_complete
@@ -46,7 +46,7 @@ class _Base:
 class _Hier(_Base):
     """The hierarchical pool: publishes the value when the copy is QUEUED."""
 
-    from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
+    from flliper.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
 
     _mamba_host_copy_complete = HiMambaRadixCache._mamba_host_copy_complete
 

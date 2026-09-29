@@ -3,7 +3,7 @@
 import time
 import unittest
 
-from sglang.srt.planner.crossover import (
+from flliper.srt.planner.crossover import (
     MEASURED,
     MEASURED_HERE,
     MODELLED,
@@ -11,7 +11,7 @@ from sglang.srt.planner.crossover import (
     CrossoverFinding,
     RigDescriptor,
 )
-from sglang.srt.planner.levers import (
+from flliper.srt.planner.levers import (
     LEVERS,
     RATES_KNOWN,
     STRUCTURE_ONLY,
@@ -24,8 +24,8 @@ from sglang.srt.planner.levers import (
     render_levers_text,
     suggest_levers,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

@@ -7,15 +7,15 @@ from typing import ClassVar, Dict, List
 
 import requests
 
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.violation_log_utils import assert_no_violation_in_log
-from sglang.test.mock_model.utils import (
+from flliper.srt.utils import is_hip
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.violation_log_utils import assert_no_violation_in_log
+from flliper.test.mock_model.utils import (
     MOCK_MODEL_PATH,
     mock_model_server_args,
     mock_model_server_env,
 )
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 

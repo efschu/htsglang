@@ -17,7 +17,7 @@ import math
 
 import pytest
 
-from sglang.srt.speculative.adaptive_graph_memory import LadderRungPost
+from flliper.srt.speculative.adaptive_graph_memory import LadderRungPost
 
 
 def post(**kw):
@@ -41,7 +41,7 @@ def test_a_measured_post_says_so():
 
 
 def test_demand_is_estimate_only_if_any_post_is():
-    from sglang.srt.speculative.adaptive_graph_memory import LadderReserveDemand
+    from flliper.srt.speculative.adaptive_graph_memory import LadderReserveDemand
 
     measured = post(measured=True, mib_per_captured_token=6.67)
     est = post(measured=False)
@@ -64,7 +64,7 @@ def test_the_old_coefficient_is_no_longer_hardcoded_in_the_sizing_call():
     from a literal in the expression."""
     import inspect
 
-    from sglang.srt.speculative import adaptive_graph_memory as agm
+    from flliper.srt.speculative import adaptive_graph_memory as agm
 
     src = inspect.getsource(agm.estimate_ladder_reserve_demand)
     assert "capture_mib_per_token" in src
@@ -87,7 +87,7 @@ def test_measured_coefficient_scales_the_rung_cost():
 
 
 def test_measured_coefficient_is_derived_from_a_calibration_not_a_constant():
-    from sglang.srt.mem_ledger.activation import (
+    from flliper.srt.mem_ledger.activation import (
         REFERENCE_WINDOW_FINGERPRINT,
         ActivationProfile,
         measured_capture_mib_per_token,
@@ -117,7 +117,7 @@ def test_measured_coefficient_is_derived_from_a_calibration_not_a_constant():
 
 
 def test_no_calibration_yields_None_never_two():
-    from sglang.srt.mem_ledger.activation import (
+    from flliper.srt.mem_ledger.activation import (
         ActivationProfile,
         measured_capture_mib_per_token,
     )
@@ -141,7 +141,7 @@ def test_no_calibration_yields_None_never_two():
 
 
 def test_zero_boot_tokens_yields_None_rather_than_dividing():
-    from sglang.srt.mem_ledger.activation import (
+    from flliper.srt.mem_ledger.activation import (
         REFERENCE_WINDOW_FINGERPRINT,
         ActivationProfile,
         measured_capture_mib_per_token,

@@ -51,7 +51,7 @@ def main() -> int:
         print("FAIL: no CUDA")
         return 2
 
-    from sglang.srt.mem_cache.kv_vmm_backing import KvVmmArena, align_up
+    from flliper.srt.mem_cache.kv_vmm_backing import KvVmmArena, align_up
 
     # TORCH INDICES ARE NOT NVML INDICES. Observed on this rig: nvidia-smi
     # index 1 is the 5090 (32607 MiB) while torch device 1 is a 3080 (19.58

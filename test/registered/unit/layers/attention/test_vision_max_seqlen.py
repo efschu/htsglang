@@ -3,9 +3,9 @@ import sys
 import torch
 from torch import nn
 
-from sglang.srt.layers.attention import vision
-from sglang.srt.models.kimi_k25 import MoonViTEncoderLayer
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.attention import vision
+from flliper.srt.models.kimi_k25 import MoonViTEncoderLayer
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 

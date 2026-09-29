@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refresh est_time literals from sglang-ci-stats/model.json.
+"""Refresh est_time literals from flliper-ci-stats/model.json.
 
 Usage:
     python scripts/ci/update_est_time.py [--dry-run] \\
@@ -19,7 +19,7 @@ DEFAULT_MODEL_URL = (
     "https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/main/model.json"
 )
 
-# AMD / NPU live in separate workflows and are not scraped by sglang-ci-stats.
+# AMD / NPU live in separate workflows and are not scraped by flliper-ci-stats.
 BACKENDS = ("cuda", "cpu")
 
 # A change is "significant" if |delta| >= this many seconds AND the relative
@@ -150,7 +150,7 @@ def main():
     parser.add_argument(
         "--model-url",
         default=DEFAULT_MODEL_URL,
-        help="URL of model.json from sglang-ci-stats (file:// is OK for testing)",
+        help="URL of model.json from flliper-ci-stats (file:// is OK for testing)",
     )
     parser.add_argument(
         "--dry-run",

@@ -28,13 +28,13 @@ import unittest
 
 import torch
 
-from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+from flliper.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_executor.runner import prefill_cuda_graph_runner as pcgr
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from flliper.srt.model_executor.runner import prefill_cuda_graph_runner as pcgr
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

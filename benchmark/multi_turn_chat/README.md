@@ -1,28 +1,28 @@
-### Benchmark sglang
+### Benchmark flliper
 
 Run Llama-7B
 
 ```
-python3 -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python3 -m flliper.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 ```
 
 Run Mixtral-8x7B
 (When there is a CUDA out-of-memory error, try to reduce the `--mem-fraction-static`)
 
 ```
-python3 -m sglang.launch_server --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 --port 30000 --tp-size 8
+python3 -m flliper.launch_server --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 --port 30000 --tp-size 8
 ```
 
 Benchmark(short output)
 
 ```
-python3 bench_sglang.py --tokenizer meta-llama/Llama-2-7b-chat-hf
+python3 bench_flliper.py --tokenizer meta-llama/Llama-2-7b-chat-hf
 ```
 
 Benchmark(long output)
 
 ```
-python3 bench_sglang.py --tokenizer meta-llama/Llama-2-7b-chat-hf --long
+python3 bench_flliper.py --tokenizer meta-llama/Llama-2-7b-chat-hf --long
 ```
 
 ### Benchmark vLLM

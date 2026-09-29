@@ -8,7 +8,7 @@ import types
 import pytest
 import torch.distributed as dist
 
-from sglang.srt.model_executor.runner import base_cuda_graph_runner as bcr
+from flliper.srt.model_executor.runner import base_cuda_graph_runner as bcr
 
 
 class _Reduced(Exception):
@@ -51,7 +51,7 @@ def test_solo_draft_host_keeps_its_ladder_local(three_ranks):
 
 
 def test_a_group_member_still_agrees_with_its_peers(three_ranks, monkeypatch):
-    from sglang.srt import distributed as d
+    from flliper.srt import distributed as d
 
     monkeypatch.setattr(
         d, "get_tp_group", lambda: types.SimpleNamespace(cpu_group=object()), raising=False

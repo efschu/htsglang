@@ -8,8 +8,8 @@ test_pcg_with_speculative_decoding_extra.py.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 
 register_cuda_ci(est_time=531, suite="nightly-4-gpu", nightly=True)
 
@@ -37,7 +37,7 @@ class TestPCGWithEAGLE3(PCGSpecBase, unittest.TestCase):
         "8",
     ]
     timeout_mult = 3
-    server_env = {"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"}
+    server_env = {"FLLIPER_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"}
     accuracy_threshold = 0.75
 
 

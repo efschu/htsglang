@@ -23,18 +23,18 @@ import os
 import pathlib
 import unittest
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-_ENV_KEYS = ("SGLANG_COLLECTIVE_NET_SMALL", "SGLANG_COLLECTIVE_NET_BULK")
+_ENV_KEYS = ("FLLIPER_COLLECTIVE_NET_SMALL", "FLLIPER_COLLECTIVE_NET_BULK")
 
 _BINDINGS = (
     pathlib.Path(__file__).resolve().parents[4]
     / "python"
-    / "sglang"
+    / "flliper"
     / "srt"
     / "distributed"
     / "device_communicators"
@@ -87,7 +87,7 @@ class TestCollectiveNetServerArgs(CustomTestCase):
         dev = _a_local_device()
         sa = _bare_server_args(small=f"{dev}:1")
         sa._handle_collective_net_env()
-        self.assertEqual(os.environ["SGLANG_COLLECTIVE_NET_SMALL"], f"{dev}:1")
+        self.assertEqual(os.environ["FLLIPER_COLLECTIVE_NET_SMALL"], f"{dev}:1")
         # SMALL must not reach into the bulk transport.
         self.assertIsNone(sa.disaggregation_ib_device)
 
@@ -106,10 +106,10 @@ class TestCollectiveNetServerArgs(CustomTestCase):
 
     def test_an_explicit_environment_value_wins_over_the_flag(self):
         dev = _a_local_device()
-        os.environ["SGLANG_COLLECTIVE_NET_SMALL"] = "preset"
+        os.environ["FLLIPER_COLLECTIVE_NET_SMALL"] = "preset"
         sa = _bare_server_args(small=dev)
         sa._handle_collective_net_env()
-        self.assertEqual(os.environ["SGLANG_COLLECTIVE_NET_SMALL"], "preset")
+        self.assertEqual(os.environ["FLLIPER_COLLECTIVE_NET_SMALL"], "preset")
 
     def test_unknown_device_is_rejected_by_name(self):
         sa = _bare_server_args(small="definitely_not_a_device:1")
@@ -127,7 +127,7 @@ class TestCollectiveNetServerArgs(CustomTestCase):
     def test_all_is_passed_through(self):
         sa = _bare_server_args(small="all")
         sa._handle_collective_net_env()
-        self.assertEqual(os.environ["SGLANG_COLLECTIVE_NET_SMALL"], "all")
+        self.assertEqual(os.environ["FLLIPER_COLLECTIVE_NET_SMALL"], "all")
 
 
 class TestUcxNetDeviceReachesUcx(CustomTestCase):

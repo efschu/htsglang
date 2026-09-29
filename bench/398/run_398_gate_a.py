@@ -18,7 +18,7 @@ THREE HAZARDS IT ENCODES, each of which has already bitten this ticket once:
 1. THE FALSIFIER'S SECOND ARM IS ``True / False / False``, NOT
    ``False / False / False`` (the #519 correction). The first value is
    ``hasattr(torch.ops.sgl_kernel, "ggml_mxfp4_native")`` -- a property of
-   which objects are on disk, i.e. of the WHEEL. ``SGLANG_GGUF_MXFP4_NATIVE``
+   which objects are on disk, i.e. of the WHEEL. ``FLLIPER_GGUF_MXFP4_NATIVE``
    is read one level up in ``gguf.mxfp4_native()``, which returns False before
    it ever reaches the hasattr. So the lever flips the two DERIVED answers and
    must leave the marker alone. A runner that expected all three to flip would
@@ -105,7 +105,7 @@ FALSIFIER_ARMS: Tuple[FalsifierArm, ...] = (
     ),
     FalsifierArm(
         name="lever-off",
-        env={"SGLANG_GGUF_MXFP4_NATIVE": "0"},
+        env={"FLLIPER_GGUF_MXFP4_NATIVE": "0"},
         expected=(True, False, False),
         why=(
             "the lever is read above the hasattr, so it flips the two derived "
@@ -121,7 +121,7 @@ import json
 import torch
 import sgl_kernel  # noqa: F401  -- registers the ops; MUST precede the probe
 marker = hasattr(torch.ops.sgl_kernel, "ggml_mxfp4_native")
-from sglang.srt.layers.quantization.gguf import MXFP4_NATIVE, MMVQ_QUANT_TYPES
+from flliper.srt.layers.quantization.gguf import MXFP4_NATIVE, MMVQ_QUANT_TYPES
 print("@@" + json.dumps({
     "marker": bool(marker),
     "mxfp4_native": bool(MXFP4_NATIVE),
@@ -344,7 +344,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         import torch
 
-        from sglang.srt.registry.nvml import identity_map
+        from flliper.srt.registry.nvml import identity_map
     except Exception as exc:  # pragma: no cover - environment
         print(f"cannot run: {exc}")
         return 2

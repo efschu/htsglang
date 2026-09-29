@@ -21,13 +21,13 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.dsv4.indexer import (
+from flliper.srt.layers.attention.dsv4.indexer import (
     FP8_DTYPE,
     fp8_paged_mqa_logits_torch,
     fp8_paged_mqa_logits_torch_sm120,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 

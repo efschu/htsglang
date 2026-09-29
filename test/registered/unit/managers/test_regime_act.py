@@ -23,11 +23,11 @@ import tempfile
 import types
 import unittest
 
-from sglang.srt.managers.regime_act import (
+from flliper.srt.managers.regime_act import (
     ARM_SOURCE,
     RegimeActuator,
 )
-from sglang.srt.managers.regime_classifier import (
+from flliper.srt.managers.regime_classifier import (
     REGIME_DECODE_HEAVY,
     REGIME_KV_PRESSURE,
     REGIME_PREFILL_HEAVY,
@@ -35,7 +35,7 @@ from sglang.srt.managers.regime_classifier import (
     RegimeError,
     Stage,
 )
-from sglang.srt.managers.regime_runtime import (
+from flliper.srt.managers.regime_runtime import (
     MODE_ACT,
     MODE_OBSERVE,
     MODE_OFF,
@@ -43,7 +43,7 @@ from sglang.srt.managers.regime_runtime import (
     RegimeObserver,
     resolve_mode,
 )
-from sglang.srt.managers.regime_stages import (
+from flliper.srt.managers.regime_stages import (
     GATE_ITEMS,
     REACH_BOOTED,
     REACH_NO_WEIGHT_MOVER,
@@ -56,8 +56,8 @@ from sglang.srt.managers.regime_stages import (
     planner_candidates,
     reachability,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -283,7 +283,7 @@ class TestPlannerFeed(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.managers import regime_runtime
+        from flliper.srt.managers import regime_runtime
 
         src = inspect.getsource(regime_runtime.build_regime_stage_table)
         self.assertIn("solve_fn", src)
@@ -414,7 +414,7 @@ def _args(**kw):
 
 
 def _validate(args):
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     ServerArgs._handle_regime_controller(args)
 
@@ -494,7 +494,7 @@ class TestModeResolution(CustomTestCase):
     def test_the_env_override_can_only_turn_observation_on(self):
         from unittest import mock
 
-        from sglang.srt.managers.regime_runtime import ENV_MODE
+        from flliper.srt.managers.regime_runtime import ENV_MODE
 
         with mock.patch.dict(os.environ, {ENV_MODE: "1"}):
             self.assertEqual(resolve_mode(_args()), MODE_OBSERVE)
@@ -504,7 +504,7 @@ class TestModeResolution(CustomTestCase):
     def test_the_env_override_cannot_ask_for_act(self):
         from unittest import mock
 
-        from sglang.srt.managers.regime_runtime import ENV_MODE
+        from flliper.srt.managers.regime_runtime import ENV_MODE
 
         with mock.patch.dict(os.environ, {ENV_MODE: "act"}):
             with self.assertRaises(ValueError) as cm:
@@ -732,7 +732,7 @@ class TestActInterlocks(CustomTestCase):
         self.assertTrue(any("380000" in r["reason"] for r in records))
 
     def test_a_disputed_verdict_vetoes_the_flip(self):
-        from sglang.srt.managers.regime_classifier import REGIME_CODES
+        from flliper.srt.managers.regime_classifier import REGIME_CODES
 
         def channel(payload):
             peer = list(payload)
@@ -801,7 +801,7 @@ class TestObserveStillCannotAct(CustomTestCase):
     def test_the_observer_module_imports_no_actuator_at_module_scope(self):
         import ast
 
-        import sglang.srt.managers.regime_runtime as mod
+        import flliper.srt.managers.regime_runtime as mod
 
         mods, tree = self._imports(mod)
         # Module-scope imports only: the act branch of build_regime_observer
@@ -827,7 +827,7 @@ class TestObserveStillCannotAct(CustomTestCase):
         import ast
         import pathlib
 
-        import sglang.srt.managers.regime_runtime as mod
+        import flliper.srt.managers.regime_runtime as mod
 
         tree = ast.parse(pathlib.Path(mod.__file__).read_text())
         called = {
@@ -869,7 +869,7 @@ class TestObserveStillCannotAct(CustomTestCase):
         import ast
         import pathlib
 
-        import sglang.srt.managers.regime_act as mod
+        import flliper.srt.managers.regime_act as mod
 
         tree = ast.parse(pathlib.Path(mod.__file__).read_text())
         called = {
@@ -982,7 +982,7 @@ class TestPlannerFeedAcceptance578(CustomTestCase):
     def test_production_call_site_passes_a_real_solve_fn(self):
         import inspect
 
-        from sglang.srt.managers import regime_runtime
+        from flliper.srt.managers import regime_runtime
 
         src = inspect.getsource(regime_runtime.build_regime_stage_table)
         self.assertIn("_planner_solve_fn", src)
@@ -993,7 +993,7 @@ class TestPlannerFeedAcceptance578(CustomTestCase):
         Silence is what #578 was. The closure raises PlannerFeedUnavailable
         with a reason, and planner_candidates turns it into a note.
         """
-        from sglang.srt.managers.regime_runtime import _planner_solve_fn
+        from flliper.srt.managers.regime_runtime import _planner_solve_fn
 
         scheduler = types.SimpleNamespace(
             server_args=types.SimpleNamespace(rank_gpu_memory_mib=None)

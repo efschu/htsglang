@@ -22,7 +22,7 @@ sys.path.insert(
     ),
 )
 
-from sglang.srt.mem_cache import producer_phase_census as ppc  # noqa: E402
+from flliper.srt.mem_cache import producer_phase_census as ppc  # noqa: E402
 
 
 class _Chunked:
@@ -47,8 +47,8 @@ class WaveEmission(unittest.TestCase):
     def setUp(self):
         # Arm the shared #904 knob at its DEFAULT 64 -- the value the boot
         # ran with. Arming it at 1 would hide the very defect under test.
-        self._saved = os.environ.get("SGLANG_MATCH_REFUSAL_CENSUS_EVERY")
-        os.environ["SGLANG_MATCH_REFUSAL_CENSUS_EVERY"] = "64"
+        self._saved = os.environ.get("FLLIPER_MATCH_REFUSAL_CENSUS_EVERY")
+        os.environ["FLLIPER_MATCH_REFUSAL_CENSUS_EVERY"] = "64"
         if hasattr(ppc.census_armed, "cache_clear"):
             ppc.census_armed.cache_clear()
         ppc.reset_double_prefill_census()
@@ -57,9 +57,9 @@ class WaveEmission(unittest.TestCase):
 
     def tearDown(self):
         if self._saved is None:
-            os.environ.pop("SGLANG_MATCH_REFUSAL_CENSUS_EVERY", None)
+            os.environ.pop("FLLIPER_MATCH_REFUSAL_CENSUS_EVERY", None)
         else:
-            os.environ["SGLANG_MATCH_REFUSAL_CENSUS_EVERY"] = self._saved
+            os.environ["FLLIPER_MATCH_REFUSAL_CENSUS_EVERY"] = self._saved
         ppc.reset_double_prefill_census()
 
     def _wave(self, log, n, tag):

@@ -22,9 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch  # noqa: E402
 
 import n4d_decode_bench as B  # noqa: E402
-from sglang.jit_kernel import nvfp4_w4a8_decode as dec  # noqa: E402
-from sglang.jit_kernel.nvfp4_w4a8 import nvfp4_w4a8_quantize_activation  # noqa: E402
-from sglang.srt.layers.quantization import nvfp4_native_mixed as nm  # noqa: E402
+from flliper.jit_kernel import nvfp4_w4a8_decode as dec  # noqa: E402
+from flliper.jit_kernel.nvfp4_w4a8 import nvfp4_w4a8_quantize_activation  # noqa: E402
+from flliper.srt.layers.quantization import nvfp4_native_mixed as nm  # noqa: E402
 
 
 def main():

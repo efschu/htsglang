@@ -3,7 +3,7 @@
 This folder covers absorb-style DeepSeek MLA attention. The actual path writes
 latent KV through `get_token_to_kv_pool()` before calling `attn_mqa`; expected
 outputs come from a separate HF-style PyTorch MLA reference with copied random
-weights and no SGLang backend calls.
+weights and no fLLiper backend calls.
 
 ## Coverage Matrix
 
@@ -47,12 +47,12 @@ multi-step draft backends and cannot ever appear at runtime.
 
 - **FlashInfer MLA tree verify / draft-extend with `topk > 1`** — raised by
   `FlashInferMLAMultiStepDraftBackend.__init__` at
-  `python/sglang/srt/layers/attention/flashinfer_mla_backend.py:910-913`:
+  `python/flliper/srt/layers/attention/flashinfer_mla_backend.py:910-913`:
   `if topk > 1: raise ValueError("Currently Flashinfer MLA only supports topk=1
   for speculative decoding")`. Dispatcher: `draft_utils.py:126-132`.
 - **FlashMLA tree verify / draft-extend with `topk > 1`** — raised by
   `FlashMLAMultiStepDraftBackend.__init__` at
-  `python/sglang/srt/layers/attention/flashmla_backend.py:555-558`. Dispatcher:
+  `python/flliper/srt/layers/attention/flashmla_backend.py:555-558`. Dispatcher:
   `draft_utils.py:173-180`.
 - **TRT-LLM MLA tree verify / draft-extend with `topk > 1`** —
   `TRTLLMMLAMultiStepDraftBackend` inherits from

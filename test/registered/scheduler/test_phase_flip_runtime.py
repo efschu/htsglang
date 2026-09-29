@@ -30,21 +30,21 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.phase_flip_plan import (
+from flliper.srt.layers.dcp.phase_flip_plan import (
     PP_TO_TP,
     TP_TO_PP,
     default_wave_count,
 )
-from sglang.srt.layers.dcp.reshard_plan import KvReshardError, owner_of, rows_of
-from sglang.srt.managers.kv_reshard import KvPoolView
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.layers.dcp.reshard_plan import KvReshardError, owner_of, rows_of
+from flliper.srt.managers.kv_reshard import KvPoolView
+from flliper.srt.managers.phase_flip_runtime import (
     PHASE_PP,
     PHASE_TP,
     PhaseFlipRuntime,
     WavedBackingSwap,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 from seam_census_double import bind_census_schedulers  # noqa: E402 (sibling)
 
@@ -659,7 +659,7 @@ class TestSchedulerSideHelpers(CustomTestCase):
             kv_session_offload=None,
             is_dual_group_lane=False,
         )
-        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from flliper.srt.disaggregation.utils import DisaggregationMode
 
         sched.disaggregation_mode = DisaggregationMode.NULL
         for k, v in over.items():
@@ -674,14 +674,14 @@ class TestSchedulerSideHelpers(CustomTestCase):
                 reqs=[SimpleNamespace(seqlen=3, req_pool_idx=0)]
             )
         )
-        from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
+        from flliper.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
 
         self.assertTrue(build_flip_quiescence_fn(sched)())
 
     def test_quiescence_false_on_inflight_state(self):
         from types import SimpleNamespace
 
-        from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
+        from flliper.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
 
         for over in (
             {"chunked_req": object()},
@@ -728,7 +728,7 @@ class TestSchedulerSideHelpers(CustomTestCase):
         """
         from types import SimpleNamespace
 
-        from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
+        from flliper.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
 
         req = SimpleNamespace(seqlen=3, req_pool_idx=0, rid="r0")
         running = SimpleNamespace(reqs=[req])
@@ -757,11 +757,11 @@ class TestSchedulerSideHelpers(CustomTestCase):
         """
         from types import SimpleNamespace
 
-        from sglang.srt.managers.phase_flip_runtime import (
+        from flliper.srt.managers.phase_flip_runtime import (
             PP_TO_TP,
             build_flip_quiescence_fn,
         )
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
         req = SimpleNamespace(seqlen=3, req_pool_idx=0, rid="r0")
         running = SimpleNamespace(reqs=[req])
@@ -807,7 +807,7 @@ class TestSchedulerSideHelpers(CustomTestCase):
         """
         from types import SimpleNamespace
 
-        from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
+        from flliper.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
 
         sched = self._fake_scheduler(
             mbs=[None, None, None],
@@ -822,7 +822,7 @@ class TestSchedulerSideHelpers(CustomTestCase):
     def test_live_slots_union_tree_and_parked_rows(self):
         from types import SimpleNamespace
 
-        from sglang.srt.managers.phase_flip_runtime import build_flip_live_slots_fn
+        from flliper.srt.managers.phase_flip_runtime import build_flip_live_slots_fn
 
         # req 0 parked with 3 tokens at rows 7, 8, 9 (row 7 also in tree).
         req_to_token = torch.zeros(4, 10, dtype=torch.int64)
@@ -837,7 +837,7 @@ class TestSchedulerSideHelpers(CustomTestCase):
         self.assertEqual(live.tolist(), [2, 5, 7, 8, 9])
 
     def test_guards(self):
-        from sglang.srt.managers.phase_flip_runtime import flip_blocking_guards
+        from flliper.srt.managers.phase_flip_runtime import flip_blocking_guards
 
         self.assertEqual(flip_blocking_guards(self._fake_scheduler()), [])
         # #703: the HiCache clause is REMOVED, in both of its copies. It was
@@ -861,7 +861,7 @@ class TestAbortDeferral(CustomTestCase):
     """Pin 4 (DESIGN_631 3.6a): parked-request disconnect during a flip."""
 
     def test_window_defers_then_drains_in_order(self):
-        from sglang.srt.managers.phase_flip_runtime import AbortDeferralWindow
+        from flliper.srt.managers.phase_flip_runtime import AbortDeferralWindow
 
         window = AbortDeferralWindow()
         ran = []
@@ -1051,7 +1051,7 @@ class TestAbortDeferral(CustomTestCase):
         # WITH deferral: the disconnect arrives mid-flip on rank 0, is
         # QUEUED, the flip commits cleanly on every rank, and the abort work
         # runs afterwards.
-        from sglang.srt.managers.phase_flip_runtime import AbortDeferralWindow
+        from flliper.srt.managers.phase_flip_runtime import AbortDeferralWindow
 
         _ref, live, _pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
             MAP_625, VEC, 140, seed=33
@@ -1347,7 +1347,7 @@ class TestParkDeadline(CustomTestCase):
         # group-agreed answer is to abandon.
         clock.advance(5.0)
         with self.assertLogs(
-            "sglang.srt.managers.phase_flip_runtime", level="ERROR"
+            "flliper.srt.managers.phase_flip_runtime", level="ERROR"
         ) as log:
             self.assertIsNone(rt.on_round(require_armed_and_parked=True))
         self.assertEqual(len(calls), 1, "expired rank must enter the consensus once")
@@ -1899,7 +1899,7 @@ class TestUnwavedSeamOrdering(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import WavedBackingSwap
+        from flliper.srt.managers.phase_flip_runtime import WavedBackingSwap
 
         src = inspect.getsource(WavedBackingSwap.__call__)
         self.assertIn("src.release_backing()", src)
@@ -2082,7 +2082,7 @@ class TestStreamedSeamPrerequisites(CustomTestCase):
     ``commit_span``/``decommit_span`` raise unless the arena was built with
     a commit chunk (``_require_chunk``), because ``cuMemUnmap`` only takes
     whole mappings and a monolithic per-buffer extent can therefore only be
-    released all-or-nothing. ``SGLANG_FLIP_SEAM_CHUNK_MIB`` defaults to 0,
+    released all-or-nothing. ``FLLIPER_FLIP_SEAM_CHUNK_MIB`` defaults to 0,
     so on a default boot the span API is present and non-functional -- and
     ``hasattr`` cannot tell those apart. The raise would land inside the
     flip's no-return region.
@@ -2127,7 +2127,7 @@ class TestSeamChunkRetentionDecoupled(CustomTestCase):
     """
 
     def test_chunk_alone_does_not_turn_retention_on(self):
-        from sglang.srt.mem_cache.memory_pool import seam_chunk_and_retention
+        from flliper.srt.mem_cache.memory_pool import seam_chunk_and_retention
 
         chunk, retain = seam_chunk_and_retention(64, swappable=True, retain_env="")
         self.assertEqual(chunk, 64 << 20)
@@ -2138,14 +2138,14 @@ class TestSeamChunkRetentionDecoupled(CustomTestCase):
         )
 
     def test_retention_is_still_reachable_on_purpose(self):
-        from sglang.srt.mem_cache.memory_pool import seam_chunk_and_retention
+        from flliper.srt.mem_cache.memory_pool import seam_chunk_and_retention
 
         chunk, retain = seam_chunk_and_retention(64, swappable=True, retain_env="1")
         self.assertEqual(chunk, 64 << 20)
         self.assertTrue(retain)
 
     def test_no_chunk_means_no_chunk_and_no_retention(self):
-        from sglang.srt.mem_cache.memory_pool import seam_chunk_and_retention
+        from flliper.srt.mem_cache.memory_pool import seam_chunk_and_retention
 
         self.assertEqual(
             seam_chunk_and_retention(0, swappable=True, retain_env="1"), (None, False)
@@ -2361,7 +2361,7 @@ class TestTheWrapperCannotDropTheSpanSurface(CustomTestCase):
     )
 
     def test_the_hybrid_wrapper_forwards_every_span_member(self):
-        from sglang.srt.mem_cache.memory_pool import (
+        from flliper.srt.mem_cache.memory_pool import (
             HybridLinearKVPool,
             MHATokenToKVPool,
         )
@@ -2381,7 +2381,7 @@ class TestTheWrapperCannotDropTheSpanSurface(CustomTestCase):
     def test_forwarding_reaches_the_sub_pool(self):
         from types import SimpleNamespace as NS
 
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         calls = []
         w = HybridLinearKVPool.__new__(HybridLinearKVPool)
@@ -2401,7 +2401,7 @@ class TestTheWrapperCannotDropTheSpanSurface(CustomTestCase):
         """Can-fail proof: the forward must not manufacture a yes."""
         from types import SimpleNamespace as NS
 
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         w = HybridLinearKVPool.__new__(HybridLinearKVPool)
         w.full_kv_pool = NS()

@@ -28,12 +28,12 @@ directly -- no device, no process group, no ModelRunner.
 
 import unittest
 
-from sglang.srt.layers.attention.triton_backend import (
+from flliper.srt.layers.attention.triton_backend import (
     reject_unsupported_dcp_geometry,
     total_swa_kv_heads,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -391,7 +391,7 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
         """
         import pathlib
 
-        import sglang.srt.layers.attention.triton_backend as tb
+        import flliper.srt.layers.attention.triton_backend as tb
 
         src = pathlib.Path(tb.__file__).read_text()
         self.assertIn("reject_unsupported_dcp_geometry(", src)

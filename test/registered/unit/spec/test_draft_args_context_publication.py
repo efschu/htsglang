@@ -26,12 +26,12 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-import sglang.srt.speculative.draft_worker_common as dwc
-from sglang.srt.layers.moe.resident_fraction import resident_fraction_vector
-from sglang.srt.runtime_context import get_context, get_server_args
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.speculative.draft_worker_common as dwc
+from flliper.srt.layers.moe.resident_fraction import resident_fraction_vector
+from flliper.srt.runtime_context import get_context, get_server_args
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

@@ -60,7 +60,7 @@ wrong frame; the unliftable cap is the defect.
 import unittest
 from typing import Optional
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -95,7 +95,7 @@ class _FakeVmmPool:
 
 
 def _relief(pool: _FakeVmmPool, *, free_mib: int, rows_at_boot: Optional[int]):
-    from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+    from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
     relief = KvBackingRelief(
         pool,

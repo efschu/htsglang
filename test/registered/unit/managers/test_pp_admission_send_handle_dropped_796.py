@@ -193,7 +193,7 @@ class _FakeP2PWork:
 
 def _decision_holder(is_last_rank: bool, works):
     """Minimal holder for the shipped send/commit pair."""
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     sent = []
 
@@ -263,7 +263,7 @@ class PPAdmissionSendHandleDropped796(unittest.TestCase):
 
     def test_send_retains_the_work_handle(self):
         """The fix itself: the returned handles must survive the call."""
-        from sglang.srt.managers.pp_admission_congruence import PPAdmissionDecision
+        from flliper.srt.managers.pp_admission_congruence import PPAdmissionDecision
 
         works = [_FakeP2PWork(), _FakeP2PWork()]
         h, sent = _decision_holder(is_last_rank=False, works=works)
@@ -279,7 +279,7 @@ class PPAdmissionSendHandleDropped796(unittest.TestCase):
     def test_commit_waits_on_every_handle_and_clears(self):
         """The other half: a retained handle that is never reaped would just
         trade a lost message for an ever-growing list of live isends."""
-        from sglang.srt.managers.pp_admission_congruence import PPAdmissionDecision
+        from flliper.srt.managers.pp_admission_congruence import PPAdmissionDecision
 
         works = [_FakeP2PWork(), _FakeP2PWork()]
         h, _sent = _decision_holder(is_last_rank=False, works=works)
@@ -297,7 +297,7 @@ class PPAdmissionSendHandleDropped796(unittest.TestCase):
         receive that is skipped whenever the slot is empty), and one
         unmatched message per pass is the bounded-recv corpse this tree
         already refuses for the proxy under a gapped wire."""
-        from sglang.srt.managers.pp_admission_congruence import PPAdmissionDecision
+        from flliper.srt.managers.pp_admission_congruence import PPAdmissionDecision
 
         h, sent = _decision_holder(is_last_rank=True, works=[_FakeP2PWork()])
         h._pp_send_admission_decision(PPAdmissionDecision(mb_id=0, entries=()))
@@ -309,7 +309,7 @@ class PPAdmissionSendHandleDropped796(unittest.TestCase):
     def test_commit_is_a_no_op_without_loop_state(self):
         """#787's stand-in convention: a holder that never ran
         `init_pp_loop_state` must not raise here."""
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         h = types.SimpleNamespace()
         h._pp_commit_admission_send_work = types.MethodType(

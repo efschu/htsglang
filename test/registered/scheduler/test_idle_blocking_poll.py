@@ -24,7 +24,7 @@ import unittest
 
 import zmq
 
-from sglang.srt.managers.scheduler_components.idle_sleeper import (
+from flliper.srt.managers.scheduler_components.idle_sleeper import (
     IDLE_POLL_CAP_MS,
     IDLE_POLL_LADDER,
     idle_poll_timeout_ms,
@@ -132,7 +132,7 @@ class TestIdleSleeperReset(unittest.TestCase):
         self.tmpdir.cleanup()
 
     def _make_sleeper(self):
-        from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
+        from flliper.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 
         sleeper = IdleSleeper(sockets=[self.sock])
         polls = []

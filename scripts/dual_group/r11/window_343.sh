@@ -10,7 +10,7 @@
 #
 #   That is as far as a token stream can take it. This window opens the
 #   forward pass instead: the layer fingerprint tap
-#   (sglang.srt.model_executor.layer_fingerprint) records a hash of every
+#   (flliper.srt.model_executor.layer_fingerprint) records a hash of every
 #   decoder layer's output per forward step, on every rank, and the comparison
 #   names the first tensor whose hash stops matching the TP=1 reference.
 #
@@ -74,15 +74,15 @@ REF_FRAC="${REF_FRAC:-0.70}"
 unset CUDA_VISIBLE_DEVICES
 export PYTHONPATH="$WT/python"
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 # The second gate of the layer tap. Full tensors only for astep 1 -- the first
 # decode step, the one under investigation; the prefill step's verdict comes
 # from its hashes, which is the same verdict for a fraction of the bytes.
-export SGLANG_DETERMINISM_LAYER_FINGERPRINT=1
-export SGLANG_DETERMINISM_LAYER_FULL_STEPS="${SGLANG_DETERMINISM_LAYER_FULL_STEPS:-1}"
+export FLLIPER_DETERMINISM_LAYER_FINGERPRINT=1
+export FLLIPER_DETERMINISM_LAYER_FULL_STEPS="${FLLIPER_DETERMINISM_LAYER_FULL_STEPS:-1}"
 
 mkdir -p "$RES/logs"
 SUMMARY="$RES/window_summary.txt"
@@ -231,14 +231,14 @@ launch() {  # $1 = label, $2 = CUDA_VISIBLE_DEVICES ("-" for unset), rest = flag
   local server_log="$RES/logs/${label}.server.log"
   CUR_LABEL="$label"
   if is_dry; then
-    echo "DRY RUN launch: CUDA_VISIBLE_DEVICES=${cvd} $PY -m sglang.launch_server $*"
+    echo "DRY RUN launch: CUDA_VISIBLE_DEVICES=${cvd} $PY -m flliper.launch_server $*"
     return 0
   fi
   cd "$WT" || return 1
   if [ "$cvd" = "-" ]; then
-    setsid "$PY" -m sglang.launch_server "$@" > "$server_log" 2>&1 &
+    setsid "$PY" -m flliper.launch_server "$@" > "$server_log" 2>&1 &
   else
-    CUDA_VISIBLE_DEVICES="$cvd" setsid "$PY" -m sglang.launch_server "$@" \
+    CUDA_VISIBLE_DEVICES="$cvd" setsid "$PY" -m flliper.launch_server "$@" \
       > "$server_log" 2>&1 &
   fi
   SRV_PID=$!
@@ -319,7 +319,7 @@ arm_uneven31_b() { _uneven31 uneven31_b; }
 arm_uneven31_nodcp() {
   # SEPARATES THE TWO THINGS --rank-tp-ratio TURNS ON AT ONCE.
   #
-  # With SGLANG_UNEVEN_DCP=1 in the environment (which the #340 harness env
+  # With FLLIPER_UNEVEN_DCP=1 in the environment (which the #340 harness env
   # sets, and this window inherited), installing a ratio plan ALSO switches
   # the full-attention KV cache to the uneven-DCP geometry: dcp_size becomes
   # tp_size, the KV is TOKEN-sharded across the ranks, and each rank's local
@@ -332,11 +332,11 @@ arm_uneven31_nodcp() {
   # belongs to the uneven head split; if it vanishes, it belongs to the
   # uneven-DCP KV path, which is also the only one of the two that is a
   # decode-time mechanism -- prefill runs the ragged path over local tokens.
-  local prev="${SGLANG_UNEVEN_DCP:-}"
-  export SGLANG_UNEVEN_DCP=0
+  local prev="${FLLIPER_UNEVEN_DCP:-}"
+  export FLLIPER_UNEVEN_DCP=0
   _uneven31 uneven31_nodcp
   local rc=$?
-  export SGLANG_UNEVEN_DCP="$prev"
+  export FLLIPER_UNEVEN_DCP="$prev"
   return $rc
 }
 
@@ -345,18 +345,18 @@ arm_uneven31_dcp_unweighted() {
   # the replicated-kv-head geometry (uneven_dcp_kv_replicated is true as soon
   # as a ratio plan is installed); what differs is the OWNER RULE:
   #
-  #   WEIGHTED   (SGLANG_UNEVEN_DCP_WEIGHTED=1) a [3,1] token vector, so a
+  #   WEIGHTED   (FLLIPER_UNEVEN_DCP_WEIGHTED=1) a [3,1] token vector, so a
   #              global slot L is owned by the rank whose prefix range covers
   #              L % 4, and its compact slot is (L // 4) * width + (L % 4 - lo).
   #   UNWEIGHTED even modulo: L % 2 == rank, compact slot L // 2.
   #
   # If unweighted is correct and weighted is not, the defect is the weighted
   # prefix-range compaction, not DCP-with-uneven-TP as such.
-  local prev="${SGLANG_UNEVEN_DCP_WEIGHTED:-}"
-  export SGLANG_UNEVEN_DCP_WEIGHTED=0
+  local prev="${FLLIPER_UNEVEN_DCP_WEIGHTED:-}"
+  export FLLIPER_UNEVEN_DCP_WEIGHTED=0
   _uneven31 uneven31_dcp_unweighted
   local rc=$?
-  export SGLANG_UNEVEN_DCP_WEIGHTED="$prev"
+  export FLLIPER_UNEVEN_DCP_WEIGHTED="$prev"
   return $rc
 }
 

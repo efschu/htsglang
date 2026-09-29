@@ -32,21 +32,21 @@ card is involved.
 
 import unittest
 
-from sglang.srt.planner.key_solver import (
+from flliper.srt.planner.key_solver import (
     ENERGY_PRICEABLE_GOALS,
     _busy_seconds,
     _energy_objective_value,
     _objective_value,
 )
-from sglang.srt.planner.objective import (
+from flliper.srt.planner.objective import (
     EnergyModel,
     Provenance,
     RankPower,
     energy_per_work,
     energy_rate,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

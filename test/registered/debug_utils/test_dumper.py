@@ -14,7 +14,7 @@ import requests
 import torch
 import torch.distributed as dist
 
-from sglang.srt.debug_utils.dumper import (
+from flliper.srt.debug_utils.dumper import (
     DumperConfig,
     _collect_parallel_rank_tags,
     _collective_with_timeout,
@@ -33,16 +33,16 @@ from sglang.srt.debug_utils.dumper import (
     _obj_to_dict,
     _RecomputeStatus,
     _register_forward_hook_or_replace_fn,
-    _SGLangPlugin,
+    _FlliperPlugin,
     _torch_save,
     dumper,
     get_tensor_info,
     get_truncated_value,
 )
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.common import temp_set_env
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.srt.utils.common import temp_set_env
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     find_available_port,
@@ -808,8 +808,8 @@ class TestStaticMetadata:
         assert meta1 is meta2
 
     def test_parallel_info_graceful_fallback(self):
-        sglang_info = _SGLangPlugin().collect_parallel_info()
-        assert isinstance(sglang_info, dict)
+        flliper_info = _FlliperPlugin().collect_parallel_info()
+        assert isinstance(flliper_info, dict)
 
         megatron_info = _MegatronPlugin().collect_parallel_info()
         assert isinstance(megatron_info, dict)
@@ -1240,7 +1240,7 @@ class TestParallelRankInFilename:
             {"collect_parallel_info": lambda self: {"tp_rank": 2, "cp_rank": 3}},
         )()
         monkeypatch.setattr(
-            "sglang.srt.debug_utils.dumper._plugins", [plugin_a, plugin_b]
+            "flliper.srt.debug_utils.dumper._plugins", [plugin_a, plugin_b]
         )
 
         tags = _collect_parallel_rank_tags()
@@ -1255,7 +1255,7 @@ class TestParallelRankInFilename:
             "PluginB", (), {"collect_parallel_info": lambda self: {"pp_rank": 7}}
         )()
         monkeypatch.setattr(
-            "sglang.srt.debug_utils.dumper._plugins", [plugin_a, plugin_b]
+            "flliper.srt.debug_utils.dumper._plugins", [plugin_a, plugin_b]
         )
 
         assert _collect_parallel_rank_tags() == {"pp_rank": 1}
@@ -1269,7 +1269,7 @@ class TestParallelRankInFilename:
             "PluginReal", (), {"collect_parallel_info": lambda self: {"tp_rank": 4}}
         )()
         monkeypatch.setattr(
-            "sglang.srt.debug_utils.dumper._plugins", [plugin_empty, plugin_real]
+            "flliper.srt.debug_utils.dumper._plugins", [plugin_empty, plugin_real]
         )
 
         assert _collect_parallel_rank_tags() == {"tp_rank": 4}
@@ -1277,7 +1277,7 @@ class TestParallelRankInFilename:
     def test_disabled_filename_has_no_rank_tags(self, tmp_path, monkeypatch):
         """When disabled, dump filenames do not include parallel-rank tags."""
         monkeypatch.setattr(
-            _SGLangPlugin,
+            _FlliperPlugin,
             "collect_parallel_info",
             lambda self: {"pp_rank": 2, "tp_rank": 3},
         )
@@ -1292,7 +1292,7 @@ class TestParallelRankInFilename:
     def test_enabled_filename_includes_rank_tags(self, tmp_path, monkeypatch):
         """When enabled, dump filenames include the collected parallel-rank tags."""
         monkeypatch.setattr(
-            _SGLangPlugin,
+            _FlliperPlugin,
             "collect_parallel_info",
             lambda self: {"pp_rank": 2, "tp_rank": 3},
         )
@@ -1307,7 +1307,7 @@ class TestParallelRankInFilename:
 class TestTransformModelParamName:
     def test_base_plugin_returns_none(self):
         """The default plugin hook keeps the original name (returns None)."""
-        plugin = _SGLangPlugin()
+        plugin = _FlliperPlugin()
         assert (
             plugin.transform_model_param_name(torch.nn.Linear(2, 2), "layers.0.weight")
             is None
@@ -1333,7 +1333,7 @@ class TestTransformModelParamName:
                 r"layers\.(\d+)", lambda m: f"layers.{int(m.group(1)) + 4}", param_name
             )
 
-        monkeypatch.setattr(_SGLangPlugin, "transform_model_param_name", _shift_layers)
+        monkeypatch.setattr(_FlliperPlugin, "transform_model_param_name", _shift_layers)
 
         model = torch.nn.Module()
         model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2, bias=False)])
@@ -1668,9 +1668,9 @@ class TestZmqPortIsolation:
 
 
 class TestDumperHttp:
-    """Test /dumper/* HTTP control — parametrized over standalone vs sglang server."""
+    """Test /dumper/* HTTP control — parametrized over standalone vs flliper server."""
 
-    @pytest.fixture(scope="class", params=["standalone", "sglang"])
+    @pytest.fixture(scope="class", params=["standalone", "flliper"])
     def dumper_http_url(self, request):
         if request.param == "standalone":
             http_port = find_available_port(40000)
@@ -2128,7 +2128,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
 
 
 def _make_forward_batch():
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from flliper.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
     return ForwardBatch(
         forward_mode=ForwardMode.DECODE,
@@ -2264,7 +2264,7 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
         assert "layer_id" not in captured[root_key]["meta"]
 
     def test_layer_id_from_layer_id_attr(self, tmp_path):
-        """SGLang style: module has layer_id attribute directly."""
+        """fLLiper style: module has layer_id attribute directly."""
 
         class Layer(torch.nn.Module):
             def __init__(self, layer_id: int):
@@ -2417,7 +2417,7 @@ class TestDumperE2E:
             assert "rank" in loaded["meta"]
             assert "step" in loaded["meta"]
 
-            par = loaded["meta"].get("sglang_parallel_info", {})
+            par = loaded["meta"].get("flliper_parallel_info", {})
             expected_keys = [
                 "tp_rank",
                 "tp_size",
@@ -2440,7 +2440,7 @@ class TestDumperE2E:
             for key in expected_keys:
                 assert (
                     key in par
-                ), f"Missing {key} in sglang_parallel_info, got: {sorted(par)}"
+                ), f"Missing {key} in flliper_parallel_info, got: {sorted(par)}"
 
             rids_files = [f for f in dump_files if "name=rids" in f.name]
             rids_loaded = torch.load(
@@ -2544,8 +2544,8 @@ class TestRegisterForwardHook:
 
 
 class TestPluginCoreFields:
-    def test_sglang_core_fields(self):
-        plugin = _SGLangPlugin()
+    def test_flliper_core_fields(self):
+        plugin = _FlliperPlugin()
         assert plugin.core_fields() == frozenset(
             {"input_ids", "positions", "seq_lens", "req_pool_indices", "rids"}
         )
@@ -2832,7 +2832,7 @@ class TestRecomputeStatus:
         assert raw["meta"]["recompute_status"] == "disabled"
 
     def test_recompute_status_recompute(self, tmp_path: Path, monkeypatch) -> None:
-        import sglang.srt.debug_utils.dumper as dumper_mod
+        import flliper.srt.debug_utils.dumper as dumper_mod
 
         monkeypatch.setattr(
             dumper_mod, "_detect_recompute_status", lambda: _RecomputeStatus.RECOMPUTE
@@ -2852,7 +2852,7 @@ class TestRecomputeStatus:
         assert raw["meta"]["recompute_pseudo_size"] == 2
 
     def test_recompute_status_original(self, tmp_path: Path, monkeypatch) -> None:
-        import sglang.srt.debug_utils.dumper as dumper_mod
+        import flliper.srt.debug_utils.dumper as dumper_mod
 
         monkeypatch.setattr(
             dumper_mod,
@@ -3342,12 +3342,12 @@ def _graft_split_worker_entry(
         # Set per-role env BEFORE we (re)build the module-level `dumper`. The
         # parent left DUMPER_GRAFTER_ENABLE/ROLE unset because they vary per
         # child; we set them here, then rebuild the global so that worker
-        # code can simply call `from sglang.srt.debug_utils.dumper import dumper`
+        # code can simply call `from flliper.srt.debug_utils.dumper import dumper`
         # and get a properly-configured Grafter — exactly mirroring how
         # production code uses the global.
         os.environ["DUMPER_GRAFTER_ENABLE"] = "1"
         os.environ["DUMPER_GRAFTER_ROLE"] = role
-        import sglang.srt.debug_utils.dumper as _dumper_module
+        import flliper.srt.debug_utils.dumper as _dumper_module
 
         _dumper_module.dumper = _dumper_module._Dumper(
             config=_dumper_module.DumperConfig.from_env()
@@ -4349,10 +4349,10 @@ class TestGrafterE2eExample:
 
     @staticmethod
     def _worker_baseline():
-        # In production code, callers just `from sglang.srt.debug_utils.dumper
+        # In production code, callers just `from flliper.srt.debug_utils.dumper
         # import dumper` and call `dumper.dump(name, value)` — the env
         # configures the global Grafter for them. We do the same here.
-        from sglang.srt.debug_utils.dumper import dumper
+        from flliper.srt.debug_utils.dumper import dumper
 
         # Step 1: graft input. target sends its q to baseline; baseline's
         # `_e2e_transform` runs on the recv side, asserts the dummy extras
@@ -4378,7 +4378,7 @@ class TestGrafterE2eExample:
 
     @staticmethod
     def _worker_target():
-        from sglang.srt.debug_utils.dumper import dumper
+        from flliper.srt.debug_utils.dumper import dumper
 
         # Step 1: graft input. target sends its real q to baseline along
         # with a dummy extras key the recv-side transform will assert on.

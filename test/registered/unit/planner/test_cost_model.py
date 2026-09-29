@@ -27,8 +27,8 @@ Three things are pinned here, in the order they matter:
 import math
 import unittest
 
-from sglang.srt.planner import cost_model as cm
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.planner import cost_model as cm
+from flliper.test.ci.ci_register import register_cpu_ci
 
 # Pure arithmetic over inlined probe fixtures; no device, no NVML, no network.
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -496,7 +496,7 @@ class TestDivergenceIsCaught(unittest.TestCase):
         self.assertFalse(hasattr(cm, "ABSENT_LINK_ASSUMED_GBS"))
         self.assertIn("not priced", cm.ABSENT_LINK_COMPUTE_ONLY_REASON)
 
-        from sglang.srt.planner import lever_profiles
+        from flliper.srt.planner import lever_profiles
 
         self.assertFalse(hasattr(lever_profiles, "_FALLBACK_LINK_GBS"))
 
@@ -562,7 +562,7 @@ class TestCostSources(unittest.TestCase):
         5090 and the bf16 fallback on the 3080s without deriving anything --
         and the directed hop for the dispatch/combine collective.
         """
-        from sglang.srt import uneven_perf
+        from flliper.srt import uneven_perf
 
         sources = cm.load_cost_sources(
             _UUIDS,

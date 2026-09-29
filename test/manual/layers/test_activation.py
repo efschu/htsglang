@@ -3,9 +3,9 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.activation import GeluAndMul, QuickGELU
-from sglang.srt.utils import is_hip
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.activation import GeluAndMul, QuickGELU
+from flliper.srt.utils import is_hip
+from flliper.test.test_utils import CustomTestCase
 
 _is_hip = is_hip()
 

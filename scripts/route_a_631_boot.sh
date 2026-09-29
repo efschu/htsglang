@@ -14,7 +14,7 @@
 # L3 is the shape the ticket asks for, and it needs six ranks on three
 # cards, i.e. two processes sharing a physical GPU. That is refused on this
 # host's venv, verified by running the probe rather than by reading about
-# it (sglang.srt.disaggregation.topology.check_process_colocation_prerequisites):
+# it (flliper.srt.disaggregation.topology.check_process_colocation_prerequisites):
 #
 #   NCCL multi-rank per GPU: runtime NCCL is 2.28.9 (from libnccl.so.2),
 #     below 2.30 ... Needs NCCL >= 2.30
@@ -39,7 +39,7 @@
 #     ServerArgs default, so this line documents an invariant the recipe
 #     depends on; the boot-time guard added with this script refuses the
 #     other two rather than letting the first transfer discover it.
-# SGLANG_UNEVEN_DCP / --rank-tp-ratio on the DECODE arm only
+# FLLIPER_UNEVEN_DCP / --rank-tp-ratio on the DECODE arm only
 #     Together these resolve dcp_size to tp_size and install the uneven-TP
 #     replicated-KV layout. Without the layout, decode.py:1131-1137 refuses
 #     stock head-sharded DCP receive -- now hoisted to boot.
@@ -115,7 +115,7 @@ if [[ "$RUNG" == "probe" ]]; then
     echo
     echo "== colocated-process prerequisites (gates L3) =="
     CUDA_VISIBLE_DEVICES=99 "$PY" - <<'EOF'
-from sglang.srt.disaggregation.topology import check_process_colocation_prerequisites
+from flliper.srt.disaggregation.topology import check_process_colocation_prerequisites
 try:
     check_process_colocation_prerequisites()
     print("ACCEPTED: L3 can run in this environment")
@@ -153,7 +153,7 @@ L1)
     DECODE_CARDS="$BIG,${SMALL[1]}"
     # Token ratio follows capacity, not card count: the 5090 carries more.
     RATIO="8,5"
-    CUDA_VISIBLE_DEVICES="$PREFILL_CARDS" setsid "$PY" -m sglang.launch_server \
+    CUDA_VISIBLE_DEVICES="$PREFILL_CARDS" setsid "$PY" -m flliper.launch_server \
         --model-path "$MODEL" --trust-remote-code \
         --disaggregation-mode prefill \
         --disaggregation-transfer-backend mooncake \
@@ -162,8 +162,8 @@ L1)
         --enable-metrics --host 127.0.0.1 --port "$PREFILL_PORT" \
         > "$LOGDIR/prefill_L1.log" 2>&1 &
 
-    SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 \
-    CUDA_VISIBLE_DEVICES="$DECODE_CARDS" setsid "$PY" -m sglang.launch_server \
+    FLLIPER_UNEVEN_DCP=1 FLLIPER_UNEVEN_DCP_WEIGHTED=1 \
+    CUDA_VISIBLE_DEVICES="$DECODE_CARDS" setsid "$PY" -m flliper.launch_server \
         --model-path "$MODEL" --trust-remote-code \
         --disaggregation-mode decode \
         --disaggregation-transfer-backend mooncake \
@@ -179,7 +179,7 @@ L2)
     # in the handshake and the multi-stage sender fan-in.
     PREFILL_CARDS="${SMALL[0]},${SMALL[1]}"
     DECODE_CARDS="$BIG"
-    CUDA_VISIBLE_DEVICES="$PREFILL_CARDS" setsid "$PY" -m sglang.launch_server \
+    CUDA_VISIBLE_DEVICES="$PREFILL_CARDS" setsid "$PY" -m flliper.launch_server \
         --model-path "$MODEL" --trust-remote-code \
         --disaggregation-mode prefill \
         --disaggregation-transfer-backend mooncake \
@@ -188,7 +188,7 @@ L2)
         --enable-metrics --host 127.0.0.1 --port "$PREFILL_PORT" \
         > "$LOGDIR/prefill_L2.log" 2>&1 &
 
-    CUDA_VISIBLE_DEVICES="$DECODE_CARDS" setsid "$PY" -m sglang.launch_server \
+    CUDA_VISIBLE_DEVICES="$DECODE_CARDS" setsid "$PY" -m flliper.launch_server \
         --model-path "$MODEL" --trust-remote-code \
         --disaggregation-mode decode \
         --disaggregation-transfer-backend mooncake \
@@ -202,7 +202,7 @@ L3)
     echo "daemon. Run '$0 probe' first: it refuses with the exact reason" >&2
     echo "when this environment cannot host two processes per card." >&2
     CUDA_VISIBLE_DEVICES=99 "$PY" - <<'EOF'
-from sglang.srt.disaggregation.topology import check_process_colocation_prerequisites
+from flliper.srt.disaggregation.topology import check_process_colocation_prerequisites
 check_process_colocation_prerequisites()
 print("colocated-process prerequisites satisfied")
 EOF
@@ -216,7 +216,7 @@ esac
 wait_healthy "http://127.0.0.1:$PREFILL_PORT" prefill
 wait_healthy "http://127.0.0.1:$DECODE_PORT" decode
 
-setsid "$PY" -m sglang.srt.disaggregation.local_proxy \
+setsid "$PY" -m flliper.srt.disaggregation.local_proxy \
     --prefill "http://127.0.0.1:$PREFILL_PORT" \
     --decode "http://127.0.0.1:$DECODE_PORT" \
     --bootstrap-port "$BOOTSTRAP_PORT" \

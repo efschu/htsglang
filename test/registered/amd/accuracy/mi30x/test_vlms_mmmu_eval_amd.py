@@ -25,10 +25,10 @@ import unittest
 import warnings
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
@@ -200,9 +200,9 @@ class TestNightlyVLMMmmuEvalAMD(unittest.TestCase):
 
                 # Set AMD-specific environment variables
                 if model_path in TRITON_ATTENTION_MODELS:
-                    os.environ["SGLANG_USE_AITER"] = "0"
+                    os.environ["FLLIPER_USE_AITER"] = "0"
                 else:
-                    os.environ["SGLANG_USE_AITER"] = "1"
+                    os.environ["FLLIPER_USE_AITER"] = "1"
 
                 # Build launch args
                 other_args = list(extra_args)

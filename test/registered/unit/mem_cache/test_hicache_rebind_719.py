@@ -32,9 +32,9 @@ one explicitly -- which is exactly what a boot that built one would do.
 
 import unittest
 
-from sglang.srt.mem_cache import hicache_phase_binding as binding
-from sglang.srt.mem_cache import hicache_phase_guard as guard
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache import hicache_phase_binding as binding
+from flliper.srt.mem_cache import hicache_phase_guard as guard
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Pool:

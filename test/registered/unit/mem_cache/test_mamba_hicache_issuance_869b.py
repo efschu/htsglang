@@ -50,18 +50,18 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.hicache_storage import (
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     PoolHitPolicy,
     PoolName,
 )
-from sglang.srt.mem_cache.memory_pool_host import (
+from flliper.srt.mem_cache.memory_pool_host import (
     MambaBlobGeometryError,
     MambaPoolHost,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -326,7 +326,7 @@ class TestPerNodeGranularityIsTheDefault(unittest.TestCase):
     """
 
     def test_every_position_is_a_legal_anchor_without_an_interval(self):
-        from sglang.srt.mem_cache.mamba_ckpt_utils import is_on_interval
+        from flliper.srt.mem_cache.mamba_ckpt_utils import is_on_interval
 
         # Deliberately including the #873 census depths (45-49), the ones that
         # a grid of 8192 makes structurally impossible to anchor.
@@ -334,7 +334,7 @@ class TestPerNodeGranularityIsTheDefault(unittest.TestCase):
             self.assertTrue(is_on_interval(pos, None), f"position {pos}")
 
     def test_a_present_state_off_any_grid_is_a_resume_candidate(self):
-        from sglang.srt.mem_cache.mamba_ckpt_utils import is_resume_candidate
+        from flliper.srt.mem_cache.mamba_ckpt_utils import is_resume_candidate
 
         self.assertTrue(
             is_resume_candidate(47, None, has_device_value=True),
@@ -343,7 +343,7 @@ class TestPerNodeGranularityIsTheDefault(unittest.TestCase):
 
     def test_a_host_only_state_is_resumable_which_is_the_whole_ticket(self):
         """The HiCache half: an evicted anchor with a host copy still matches."""
-        from sglang.srt.mem_cache.mamba_ckpt_utils import is_resume_candidate
+        from flliper.srt.mem_cache.mamba_ckpt_utils import is_resume_candidate
 
         self.assertTrue(
             is_resume_candidate(
@@ -363,7 +363,7 @@ class TestPerNodeGranularityIsTheDefault(unittest.TestCase):
         OFF_GRID must be unreachable -- otherwise a reader is sent to a policy
         that is not in play.
         """
-        from sglang.srt.mem_cache.mamba_ckpt_utils import (
+        from flliper.srt.mem_cache.mamba_ckpt_utils import (
             RESUME_REFUSAL_ABSENT,
             resume_refusal_reason,
         )

@@ -4,7 +4,7 @@ Run with:
     python -m unittest tests.test_serving_completions_unit -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -16,11 +16,11 @@ from unittest.mock import AsyncMock, Mock
 
 from fastapi import Request
 
-from sglang.srt.entrypoints.openai.protocol import CompletionRequest
-from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.utils import get_or_create_event_loop
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.entrypoints.openai.protocol import CompletionRequest
+from flliper.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+from flliper.srt.managers.tokenizer_manager import TokenizerManager
+from flliper.srt.utils import get_or_create_event_loop
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 

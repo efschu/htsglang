@@ -1,10 +1,10 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
-from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.kits.mmmu_vlm_kit import MMMUMixin
+from flliper.test.server_fixtures.default_fixture import DefaultServerBase
+from flliper.test.server_fixtures.mmmu_fixture import MMMUServerBase
 
 register_cuda_ci(est_time=200, stage="extra-a", runner_config="2-gpu-large")
 

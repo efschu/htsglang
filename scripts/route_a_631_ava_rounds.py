@@ -4,7 +4,7 @@
 WHY NOT THE USUAL LINE. The "Prefill rank batch ... gpu-ms (compute, wait)"
 split is not installed at pp_size > 1 -- ``_install_rank_prefill_timer``
 returns early -- so under a PP=3 boot it carries no numbers, in EITHER tree.
-What every PP rank does emit, once ``SGLANG_ENABLE_METRICS_DEVICE_TIMER=1``
+What every PP rank does emit, once ``FLLIPER_ENABLE_METRICS_DEVICE_TIMER=1``
 is set, is ``fwd occupancy: X%`` on its own ``Prefill batch`` /
 ``Decode batch`` line: the device timer's GPU-busy time over the wall window.
 That is the compute fraction of the rank's round; the remainder is wait plus

@@ -17,13 +17,13 @@ import warnings
 from collections import Counter
 from pathlib import Path
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_SRT_DIR = _REPO_ROOT / "python" / "sglang" / "srt"
+_SRT_DIR = _REPO_ROOT / "python" / "flliper" / "srt"
 _SPECULATIVE_DIR = _SRT_DIR / "speculative"
 assert _SRT_DIR.is_dir(), f"srt dir not found: {_SRT_DIR}"
 
@@ -117,7 +117,7 @@ _OWNER_SITES = {
     (_LANE, "DualGroupLane._truncate_draft", "decode_batch_idx"): 1,
     (_LANE, "DualGroupLane._truncate_draft", "kv_committed_len"): 1,
     (_LANE, "DualGroupLane._truncate_draft", "kv_allocated_len"): 1,
-    # Debug probes, env-gated off by default (SGLANG_LANE_SPEC_ROW_ORACLE /
+    # Debug probes, env-gated off by default (FLLIPER_LANE_SPEC_ROW_ORACLE /
     # `_dbg_on`): both restore the counters to a value they already held.
     (_LANE, "DualGroupLane._dbg_rollback_one", "kv_committed_len"): 1,
     (_LANE, "DualGroupLane._dbg_rollback_one", "kv_allocated_len"): 1,

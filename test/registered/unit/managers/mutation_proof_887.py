@@ -26,7 +26,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[4]
-SRC = ROOT / "python" / "sglang" / "srt" / "managers"
+SRC = ROOT / "python" / "flliper" / "srt" / "managers"
 TESTS = ROOT / "test" / "registered" / "unit" / "managers"
 
 PURITY = SRC / "phase_purity.py"

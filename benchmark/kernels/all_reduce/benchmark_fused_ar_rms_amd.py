@@ -1,7 +1,7 @@
 """
 Benchmark fused allreduce+rmsnorm on AMD with correctness checks.
 
-This script targets the same fused op used by SGLang:
+This script targets the same fused op used by fLLiper:
 `tensor_model_parallel_fused_allreduce_rmsnorm`.
 
 It reports:
@@ -29,11 +29,11 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from sglang.srt.distributed.communication_op import (
+from flliper.srt.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
 )
-from sglang.srt.distributed.parallel_state import (
+from flliper.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
     graph_capture,

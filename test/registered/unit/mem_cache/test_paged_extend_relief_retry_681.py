@@ -33,7 +33,7 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache import common as mc
+from flliper.srt.mem_cache import common as mc
 
 
 class _Alloc:

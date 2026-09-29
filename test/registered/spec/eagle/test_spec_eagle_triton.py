@@ -5,17 +5,17 @@ triton runs everywhere, so this stays on the cheap (5090) runner.
 
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.matched_stop_kit import MatchedStopMixin
-from sglang.test.kits.spec_server_kits import (
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.matched_stop_kit import MatchedStopMixin
+from flliper.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecFeatureKit,
     SpecHiddenStatesKit,
     SpecLogprobKit,
     SpecPenaltyKit,
 )
-from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
+from flliper.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
 register_cuda_ci(est_time=480, stage="base-b", runner_config="1-gpu-small")
 
@@ -35,7 +35,7 @@ class TestEagle3Triton(
     cuda_graph_max_bs_decode = 64
     gsm8k_num_examples = 1000
     gsm8k_check_accept_len = False
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+    env_overrides = ((envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 class TestEagleLlama2Triton(
@@ -49,7 +49,7 @@ class TestEagleLlama2Triton(
 
     attention_backend = "triton"
     enable_return_hidden_states = True
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+    env_overrides = ((envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 if __name__ == "__main__":

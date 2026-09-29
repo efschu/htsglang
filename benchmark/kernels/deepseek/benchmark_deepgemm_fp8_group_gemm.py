@@ -8,8 +8,8 @@ from deep_gemm import calc_diff
 from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
 
 # Import shared functionality from the regular GEMM benchmark
-from sglang.benchmark.bench_utils import run_bench
-from sglang.benchmark.kernels.deepseek.benchmark_deepgemm_fp8_gemm import (
+from flliper.benchmark.bench_utils import run_bench
+from flliper.benchmark.kernels.deepseek.benchmark_deepgemm_fp8_gemm import (
     per_block_cast_to_fp8,
     per_token_cast_to_fp8,
 )
@@ -80,7 +80,7 @@ def construct_grouped_and_flat_fp8(
     return x_fp8_grouped, y_fp8_grouped, x_fp8_flat, y_fp8_flat, out, ref_out
 
 
-# Since we don't have a group gemm kernel in SGLang/vLLM, we implemented a
+# Since we don't have a group gemm kernel in fLLiper/vLLM, we implemented a
 # custom kernel based on the Triton tutorial.
 # https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
 @triton.jit

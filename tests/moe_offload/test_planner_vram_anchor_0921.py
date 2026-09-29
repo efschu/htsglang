@@ -1,4 +1,4 @@
-"""#48: the weg2 launcher anchors group D's capacity model to the last boot.
+"""#48: the pdflip launcher anchors group D's capacity model to the last boot.
 
 Every number asserted here is read out of a REAL boot log that reached
 D READY -- ``/spinning/evidence-665-f1/boot_weg2_fnFL2v72_...D.log`` and its
@@ -20,7 +20,7 @@ import os
 
 import pytest
 
-from sglang.srt.planner.measured_anchor import (
+from flliper.srt.planner.measured_anchor import (
     GIB,
     MIB,
     MeasuredAnchorRefused,
@@ -259,7 +259,7 @@ def test_the_readback_guard_also_requires_a_uniform_cell():
     """
     import inspect
 
-    from sglang.srt.weg2 import launcher
+    from flliper.srt.pdflip import launcher
 
     src = inspect.getsource(launcher.d_operating_point_rows)
     i = src.index('token_units = tuple(int(v) for v in cap["token_vector"])')
@@ -270,7 +270,7 @@ def test_the_readback_guard_also_requires_a_uniform_cell():
 
 
 def test_no_configured_reserve_means_no_anchor_and_says_so():
-    from sglang.srt.weg2 import launcher
+    from flliper.srt.pdflip import launcher
 
     anchor, note = launcher._d_measured_anchor(
         cards=[], budgets=[1, 1, 1], model="m", maxkv_weights=[1, 1, 1],
@@ -283,7 +283,7 @@ def test_no_configured_reserve_means_no_anchor_and_says_so():
 
 
 def test_a_missing_evidence_dir_is_a_note_not_a_crash():
-    from sglang.srt.weg2 import launcher
+    from flliper.srt.pdflip import launcher
 
     anchor, note = launcher._d_measured_anchor(
         cards=[], budgets=[1, 1, 1], model="m", maxkv_weights=[1, 1, 1],
@@ -300,7 +300,7 @@ def test_an_incomplete_newest_log_does_not_shadow_an_older_complete_one(tmp_path
     earlier states all of them.  Refusing outright at the newest candidate
     throws away a good measurement because a later attempt crashed.
     """
-    from sglang.srt.planner.measured_anchor import read_measured_anchor
+    from flliper.srt.planner.measured_anchor import read_measured_anchor
 
     argv = (
         "argv: --rank-gpu-memory-mib 29560,18512,18488 "
@@ -324,7 +324,7 @@ def test_an_incomplete_newest_log_does_not_shadow_an_older_complete_one(tmp_path
 
 
 def test_a_log_of_another_form_is_rejected_by_name(tmp_path):
-    from sglang.srt.planner.measured_anchor import (
+    from flliper.srt.planner.measured_anchor import (
         MeasuredAnchorRefused,
         read_measured_anchor,
     )
@@ -345,7 +345,7 @@ def test_a_log_of_another_form_is_rejected_by_name(tmp_path):
 
 def test_provenance_never_enters_the_refusal_contract():
     """``refusals`` decides what is FATAL; provenance must not ride in it."""
-    from sglang.srt.weg2 import launcher
+    from flliper.srt.pdflip import launcher
 
     notes = []
     rows, refusals = launcher.d_operating_point_rows(
@@ -388,8 +388,8 @@ def test_anchor_reproduces_the_measured_boots_own_pool():
     """
     if not os.path.exists(V72):
         pytest.skip("evidence log not on this box")
-    from sglang.srt.uneven_perf import PerfCostModel
-    from sglang.srt.weg2.launcher import _gcd_reduce, d_plan_inputs
+    from flliper.srt.uneven_perf import PerfCostModel
+    from flliper.srt.pdflip.launcher import _gcd_reduce, d_plan_inputs
 
     model = (
         "/spinning/llm_stuff/club-3090/models-cache/"

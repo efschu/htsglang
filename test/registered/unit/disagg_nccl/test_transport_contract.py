@@ -10,7 +10,7 @@ card-less host, before any wire exists.
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.nccl import (
+from flliper.srt.disaggregation.nccl import (
     IncompatiblePeer,
     MessageClass,
     Route,
@@ -21,8 +21,8 @@ from sglang.srt.disaggregation.nccl import (
     plan_blocks,
     resolve_route,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -110,7 +110,7 @@ class TestIdentityHandshake(CustomTestCase):
     def test_identity_from_args_reuses_the_hicache_hash(self):
         """One function answers 'same model and byte format' for both the
         storage key and the transport handshake. Two answers is how they drift."""
-        from sglang.srt.mem_cache.hicache_storage import compute_model_identity_hash
+        from flliper.srt.mem_cache.hicache_storage import compute_model_identity_hash
 
         sa = SimpleNamespace(
             model_path="/models/m",
@@ -132,7 +132,7 @@ class TestIdentityHandshake(CustomTestCase):
     def test_a_kv_dtype_change_changes_the_hash(self):
         """The falsifier for #241: two runs differing only in kv-cache-dtype
         must not look like the same peer."""
-        from sglang.srt.mem_cache.hicache_storage import compute_model_identity_hash
+        from flliper.srt.mem_cache.hicache_storage import compute_model_identity_hash
 
         a = SimpleNamespace(
             model_path="/m",
@@ -286,7 +286,7 @@ class TestPlanFeedsTheLink(CustomTestCase):
         )
         dst = (ctypes.c_ubyte * (row * rows))(*([0] * (row * rows)))
 
-        from sglang.srt.disaggregation.nccl import LoopbackLink, MemoryRegion
+        from flliper.srt.disaggregation.nccl import LoopbackLink, MemoryRegion
 
         link = LoopbackLink()
         link.setup(session_id="s", is_sender=True, peer="p")

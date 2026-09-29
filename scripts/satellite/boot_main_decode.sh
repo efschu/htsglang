@@ -10,8 +10,8 @@
 # WHY THE HOST AND NOT THE DEV CONTAINER. The container has no interface on
 # the cross-rig subnet, so a decode arm running there can only reach the
 # satellite over the slow LAN, and the measurement then reports that LAN
-# rather than the feature. MAIN_HOST_IP below is what sglang's
-# get_local_ip_auto returns (SGLANG_HOST_IP) and therefore the address
+# rather than the feature. MAIN_HOST_IP below is what flliper's
+# get_local_ip_auto returns (FLLIPER_HOST_IP) and therefore the address
 # mooncake advertises -- it decides which wire the KV bulk rides. Set it to
 # this host's address on the fast line.
 #
@@ -74,15 +74,15 @@ docker run -d --name "$NAME" --network host --ipc host \
   -v "$MAIN_MODEL_HOST":"$MAIN_MODEL_IN":ro \
   -v "$MAIN_WTPY":/wtpy:ro \
   -e PYTHONPATH=/wtpy \
-  -e SGLANG_HOST_IP="$MAIN_HOST_IP" \
-  -e SGLANG_MAMBA_SSM_DTYPE="${SGLANG_MAMBA_SSM_DTYPE:-float32}" \
+  -e FLLIPER_HOST_IP="$MAIN_HOST_IP" \
+  -e FLLIPER_MAMBA_SSM_DTYPE="${FLLIPER_MAMBA_SSM_DTYPE:-float32}" \
   -e MC_FORCE_TCP=1 \
   --entrypoint bash \
   "$MAIN_IMAGE" -lc "
     (apt-get update -qq && apt-get install -y -qq libibverbs1 librdmacm1) >/dev/null 2>&1
     pip install -q mooncake-transfer-engine==0.3.11.post1 nvidia-cuda-runtime-cu12 2>&1 | tail -2
     export LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cuda_runtime/lib:\${LD_LIBRARY_PATH:-}
-    exec python3 -u -m sglang.launch_server \
+    exec python3 -u -m flliper.launch_server \
       --model-path $MAIN_MODEL_IN \
       --served-model-name $MAIN_SERVED_NAME \
       --dtype $MAIN_DTYPE \

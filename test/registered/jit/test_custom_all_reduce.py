@@ -30,19 +30,19 @@ import torch
 import torch.distributed as dist
 import triton
 
-import sglang.srt.distributed.parallel_state as ps
-from sglang.jit_kernel.all_reduce import (
+import flliper.srt.distributed.parallel_state as ps
+from flliper.jit_kernel.all_reduce import (
     AllReduceAlgo,
     _jit_custom_all_reduce_pull_module,
     _jit_custom_all_reduce_push_module,
 )
-from sglang.jit_kernel.mp import register_comm_cleanup
-from sglang.jit_kernel.tests.utils import multigpu_pytest_main
-from sglang.jit_kernel.utils import cache_once, get_ci_test_range
-from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+from flliper.jit_kernel.mp import register_comm_cleanup
+from flliper.jit_kernel.tests.utils import multigpu_pytest_main
+from flliper.jit_kernel.utils import cache_once, get_ci_test_range
+from flliper.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=300,

@@ -33,18 +33,18 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4 import indexer_arch
-from sglang.srt.layers.attention.dsv4.indexer import (
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.dsv4 import indexer_arch
+from flliper.srt.layers.attention.dsv4.indexer import (
     FP8_DTYPE,
     fp8_paged_mqa_logits_torch,
     fp8_paged_mqa_logits_torch_sm120,
     select_paged_mqa_logits_fn,
     topk_transform_512_pytorch_vectorized,
 )
-from sglang.srt.layers.attention.dsv4.indexer_arch import deepgemm_indexer_supported
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.attention.dsv4.indexer_arch import deepgemm_indexer_supported
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -223,7 +223,7 @@ class TestTheDispatchCannotPickTheUnmaskedOne(CustomTestCase):
             indexer_arch,
             is_cuda=lambda: True,
             get_device_capability_no_init=lambda device_id: capability,
-        ), envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(torch_impl):
+        ), envs.FLLIPER_FP8_PAGED_MQA_LOGITS_TORCH.override(torch_impl):
             return select_paged_mqa_logits_fn(
                 device=torch.device("cuda", 0), use_fp4_indexer=False
             )

@@ -62,9 +62,9 @@ WHAT EACH TEST HOLDS DOWN
 import logging
 import unittest
 
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-_LOGGER = "sglang.srt.mem_cache.unified_radix_cache"
+_LOGGER = "flliper.srt.mem_cache.unified_radix_cache"
 
 
 class _Req:

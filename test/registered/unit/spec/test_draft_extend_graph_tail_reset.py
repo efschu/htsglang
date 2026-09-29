@@ -18,13 +18,13 @@ import unittest
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+from flliper.srt.environ import envs
+from flliper.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EagleDraftExtendInputBuffers,
     reset_replay_tail_buffers,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -95,13 +95,13 @@ class TestDraftExtendTailReset(CustomTestCase):
 
     def test_poison_falsifier_fills_loud_junk(self):
         buffers = _make_buffers(fill=9)
-        with envs.SGLANG_POISON_GRAPH_PAD.override(True):
+        with envs.FLLIPER_POISON_GRAPH_PAD.override(True):
             reset_replay_tail_buffers(buffers, SEQ_LEN_FILL, NUM_TOKENS_PER_BS)
         self.assertTrue(torch.all(buffers.input_ids == 100))
         self.assertTrue(torch.all(buffers.hidden_states == 1024.0))
         # Poison must still be residue-independent (deterministic junk).
         other = _make_buffers(fill=3)
-        with envs.SGLANG_POISON_GRAPH_PAD.override(True):
+        with envs.FLLIPER_POISON_GRAPH_PAD.override(True):
             reset_replay_tail_buffers(other, SEQ_LEN_FILL, NUM_TOKENS_PER_BS)
         self.assertTrue(torch.equal(buffers.input_ids, other.input_ids))
         self.assertTrue(torch.equal(buffers.hidden_states, other.hidden_states))

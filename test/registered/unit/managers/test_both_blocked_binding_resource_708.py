@@ -20,13 +20,13 @@ which resource binds. Only the diagnosis is derived.
 
 import unittest
 
-from sglang.srt.managers.phase_policy import BOTH_BLOCKED
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.phase_policy import BOTH_BLOCKED
+from flliper.test.test_utils import CustomTestCase
 
 
 def _decline_text(avail, pending=97922, phase="tp"):
     """Drive the real policy branch and return the decline reason."""
-    from sglang.srt.managers import phase_policy as pp
+    from flliper.srt.managers import phase_policy as pp
 
     inp = pp.PhasePolicyInputs(
         phase=phase,
@@ -96,7 +96,7 @@ class TestSchedulerSuppliesTheMeasurement708(CustomTestCase):
         contract, and a rank-dependent value here is the #616g divergence."""
         import inspect
 
-        from sglang.srt.managers import scheduler as scheduler_mod
+        from flliper.srt.managers import scheduler as scheduler_mod
 
         src = inspect.getsource(scheduler_mod.Scheduler._uniform_kv_available)
         self.assertIn("uniform_avail_for_evict", src)
@@ -105,7 +105,7 @@ class TestSchedulerSuppliesTheMeasurement708(CustomTestCase):
     def test_helper_returns_none_instead_of_raising(self):
         from types import SimpleNamespace
 
-        from sglang.srt.managers import scheduler as scheduler_mod
+        from flliper.srt.managers import scheduler as scheduler_mod
 
         stub = SimpleNamespace(tree_cache=None)
         self.assertIsNone(scheduler_mod.Scheduler._uniform_kv_available(stub))

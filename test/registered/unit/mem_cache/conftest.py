@@ -77,8 +77,8 @@ as a skip so the test suite is not held hostage to it.
 import importlib
 import unittest
 
-import sglang.srt.utils as _utils
-from sglang.srt.utils import common as _common
+import flliper.srt.utils as _utils
+from flliper.srt.utils import common as _common
 
 _REAL_GET_DEVICE = _common.get_device
 
@@ -94,9 +94,9 @@ _KVCACHEIO_SYMBOLS = (
 )
 
 _KVCACHEIO_MODULES = (
-    "sglang.srt.mem_cache.memory_pool_host",
-    "sglang.srt.mem_cache.pool_host.mha",
-    "sglang.srt.mem_cache.pool_host.mla",
+    "flliper.srt.mem_cache.memory_pool_host",
+    "flliper.srt.mem_cache.pool_host.mha",
+    "flliper.srt.mem_cache.pool_host.mla",
 )
 
 _KVCACHEIO_SKIP_REASON = (
@@ -135,7 +135,7 @@ if not _accelerator_present():
         return "cpu"
 
     # Patched on BOTH the defining module and the package namespace: the test
-    # modules bind the name at import time (``from sglang.srt.utils import
+    # modules bind the name at import time (``from flliper.srt.utils import
     # get_device``), and conftest is imported before them, so both spellings
     # must already point at the CPU-returning version.
     _common.get_device = _get_device_cpu

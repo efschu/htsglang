@@ -27,7 +27,7 @@ Three properties, all hermetic (``CUDA_VISIBLE_DEVICES=99``, no kernel runs):
    consumer uint8 block bytes, 17 or 22 per 32 values.
 
 Trace this pins, source of every step:
-  ``layers/quantization/gguf.py:269``   ``SGLANG_GGUF_MXFP4_NATIVE`` kill switch
+  ``layers/quantization/gguf.py:269``   ``FLLIPER_GGUF_MXFP4_NATIVE`` kill switch
   ``layers/quantization/gguf.py:276``   wheel marker ``ggml_mxfp4_native``
   ``layers/quantization/gguf.py:281``   ``MXFP4_NATIVE``, evaluated once at import
   ``layers/quantization/gguf.py:282``   type 39 joins DEQUANT/MMVQ/MMQ
@@ -189,17 +189,17 @@ class TestMixedPairDispatch(unittest.TestCase):
     """Which kernel the (IQ, MXFP4) pair actually reaches, in both arms."""
 
     def setUp(self):
-        self._env = os.environ.get("SGLANG_GGUF_MXFP4_NATIVE")
+        self._env = os.environ.get("FLLIPER_GGUF_MXFP4_NATIVE")
 
     def tearDown(self):
         if self._env is None:
-            os.environ.pop("SGLANG_GGUF_MXFP4_NATIVE", None)
+            os.environ.pop("FLLIPER_GGUF_MXFP4_NATIVE", None)
         else:
-            os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = self._env
+            os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = self._env
         _reload_gguf()
 
     def test_native_arm_passes_type_39_straight_into_the_moe_mmvq_kernel(self):
-        os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = "1"
+        os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = "1"
         with _FakeNativeOp():
             g = _reload_gguf()
             self.assertTrue(g.MXFP4_NATIVE)
@@ -219,7 +219,7 @@ class TestMixedPairDispatch(unittest.TestCase):
 
     def test_repack_arm_reaches_the_same_branch_with_q5_0(self):
         """Kernels absent: the loader already replaced 39 with Q5_0."""
-        os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = "0"
+        os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = "0"
         g = _reload_gguf()
         self.assertFalse(g.MXFP4_NATIVE)
         for w13_type, _ in DRIVER_MXFP4_LAYERS.values():
@@ -238,7 +238,7 @@ class TestMixedPairDispatch(unittest.TestCase):
         ``x.shape[0] > 64`` condition can never carry the pair into the MMQ
         branch -- not even at prefill batch sizes. The spy raises if it does.
         """
-        os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = "1"
+        os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = "1"
         with _FakeNativeOp():
             g = _reload_gguf()
             for w13_type, w2_type in DRIVER_MXFP4_LAYERS.values():
@@ -252,11 +252,11 @@ class TestMixedPairDispatch(unittest.TestCase):
     def test_an_unrepacked_type_39_on_a_non_native_build_raises(self):
         """The only remaining combination, and it is loud.
 
-        ``SGLANG_GGUF_MXFP4_NATIVE=0`` plus a payload that was never repacked
+        ``FLLIPER_GGUF_MXFP4_NATIVE=0`` plus a payload that was never repacked
         falls out of both fast branches into the per-expert loop, and that loop
         refuses the type by name instead of producing numbers.
         """
-        os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = "0"
+        os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = "0"
         g = _reload_gguf()
         for w13_type in (t for t, _ in DRIVER_MXFP4_LAYERS.values()):
             with self.assertRaises(NotImplementedError):
@@ -274,25 +274,25 @@ class TestLoadPathNeverMaterialisesFloats(unittest.TestCase):
     """
 
     def setUp(self):
-        self._env = os.environ.get("SGLANG_GGUF_MXFP4_NATIVE")
+        self._env = os.environ.get("FLLIPER_GGUF_MXFP4_NATIVE")
 
     def tearDown(self):
         if self._env is None:
-            os.environ.pop("SGLANG_GGUF_MXFP4_NATIVE", None)
+            os.environ.pop("FLLIPER_GGUF_MXFP4_NATIVE", None)
         else:
-            os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = self._env
+            os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = self._env
         _reload_gguf()
-        from sglang.srt.model_loader import gguf_mxfp4_repack as r
+        from flliper.srt.model_loader import gguf_mxfp4_repack as r
 
         importlib.reload(r)
 
     def _repack_module(self):
-        from sglang.srt.model_loader import gguf_mxfp4_repack as r
+        from flliper.srt.model_loader import gguf_mxfp4_repack as r
 
         return importlib.reload(r)
 
     def test_native_arm_is_byte_identity_and_stays_uint8(self):
-        os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = "1"
+        os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = "1"
         with _FakeNativeOp():
             _reload_gguf()
             r = self._repack_module()
@@ -307,7 +307,7 @@ class TestLoadPathNeverMaterialisesFloats(unittest.TestCase):
             )
 
     def test_repack_arm_grows_to_22_bytes_and_stays_uint8(self):
-        os.environ["SGLANG_GGUF_MXFP4_NATIVE"] = "0"
+        os.environ["FLLIPER_GGUF_MXFP4_NATIVE"] = "0"
         _reload_gguf()
         r = self._repack_module()
         blocks = synthetic_blocks(64).reshape(1, -1)

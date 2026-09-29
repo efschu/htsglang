@@ -9,7 +9,7 @@ priority=999999 would emit "999999" and priority=None would
 emit "None" — both of which break cardinality guarantees.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -17,7 +17,7 @@ register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.srt.observability.metrics_collector import QueueCount
+from flliper.srt.observability.metrics_collector import QueueCount
 
 
 class FakeReq:
@@ -98,7 +98,7 @@ class TestPriorityLabelEmission(unittest.TestCase):
         """The gauge labels() call must receive the capped string, not the raw value."""
         # Import the method implementation directly via the module to avoid
         # constructing the full collector.
-        from sglang.srt.observability.metrics_collector import (
+        from flliper.srt.observability.metrics_collector import (
             SchedulerMetricsCollector,
         )
 
@@ -139,7 +139,7 @@ class TestPriorityLabelEmission(unittest.TestCase):
 
     def test_emitted_label_for_none_priority(self):
         """Verify None priority produces 'UNKNOWN' label, not 'None'."""
-        from sglang.srt.observability.metrics_collector import (
+        from flliper.srt.observability.metrics_collector import (
             SchedulerMetricsCollector,
         )
 
@@ -176,7 +176,7 @@ class TestPriorityLabelCardinalityBound(unittest.TestCase):
     MAX_DISTINCT_LABELS = 3 + 31
 
     def _emitted_labels(self, priorities):
-        from sglang.srt.observability.metrics_collector import (
+        from flliper.srt.observability.metrics_collector import (
             SchedulerMetricsCollector,
         )
 

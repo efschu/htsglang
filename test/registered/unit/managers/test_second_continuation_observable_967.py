@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.managers import schedule_policy as sp
+from flliper.srt.managers import schedule_policy as sp
 
 
 @pytest.fixture(autouse=True)

@@ -16,7 +16,7 @@ caution: the data path never touches the host, the round number lives in a
 device word (``barlink_bar1_ext.py``, header comment), and the peer pointers
 are fixed from bootstrap on -- capturable **by construction**. What was
 missing was the proof. This program supplies it, and only after it passes
-may ``SGLANG_BARLINK_GRAPH_ENABLE=1`` be set.
+may ``FLLIPER_BARLINK_GRAPH_ENABLE=1`` be set.
 
 What exactly is checked
 -------------------------
@@ -34,7 +34,7 @@ What exactly is checked
    or a ring slot delivers correctly the first time and wrong afterward --
    that is the whole point.
 
-3. **Multiple graphs.** sglang captures one graph per batch size. Case
+3. **Multiple graphs.** flliper captures one graph per batch size. Case
    ``two-graphs`` captures two and replays them ALTERNATING. That exposes
    two captures sharing the same flag or result slot.
 
@@ -92,12 +92,12 @@ WIEDERGABEN = 5
 #
 # `umgebung` ("environment") is set BEFORE building the transport -- the
 # knob values are read once by `BarlinkBar1Transport.__init__`.
-FAELLE = [
+CASES = [
     {
         "name": "1blk-small",
         "zweck": "The ordinary launch, small payload. If this fails, "
                  "bar1 is fundamentally done with graphs.",
-        "umgebung": {"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
+        "umgebung": {"FLLIPER_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
         "groessen": [64 << 10],
         "gate": True,
     },
@@ -105,7 +105,7 @@ FAELLE = [
         "name": "1blk-large",
         "zweck": "The same launch above the grid threshold, so size, "
                  "not variant, is the variable.",
-        "umgebung": {"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
+        "umgebung": {"FLLIPER_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
         "groessen": [8 << 20],
         "gate": True,
     },
@@ -114,8 +114,8 @@ FAELLE = [
         "zweck": "cudaLaunchCooperativeKernel UNDER capture. The one "
                  "question that could not be settled without free cards.",
         "umgebung": {
-            "SGLANG_BARLINK_BAR1_GRID_THRESHOLD": "0",
-            "SGLANG_BARLINK_BAR1_GRAPH_GRID": "1",
+            "FLLIPER_BARLINK_BAR1_GRID_THRESHOLD": "0",
+            "FLLIPER_BARLINK_BAR1_GRAPH_GRID": "1",
         },
         "groessen": [64 << 10, 8 << 20],
         # NOT a gate: if this fails, that is not a reason against bar1 --
@@ -126,15 +126,15 @@ FAELLE = [
     {
         "name": "reservation",
         "zweck": "Above the threshold, but with "
-                 "SGLANG_BARLINK_BAR1_GRAPH_GRID=0: _kernel must fall back "
+                 "FLLIPER_BARLINK_BAR1_GRAPH_GRID=0: _kernel must fall back "
                  "to 1blk under capture instead of failing.",
         # The 0 is EXPLICITLY there, ever since the default started coming
-        # from SGLANG_BARLINK_GRAPH_ENABLE. Without it, this case would
+        # from FLLIPER_BARLINK_GRAPH_ENABLE. Without it, this case would
         # depend on whether the release is set in the caller's environment
         # -- and a case that checks something different depending on the
         # environment checks nothing.
-        "umgebung": {"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": "0",
-                     "SGLANG_BARLINK_BAR1_GRAPH_GRID": "0"},
+        "umgebung": {"FLLIPER_BARLINK_BAR1_GRID_THRESHOLD": "0",
+                     "FLLIPER_BARLINK_BAR1_GRAPH_GRID": "0"},
         "groessen": [64 << 10, 8 << 20],
         "gate": True,
     },
@@ -142,7 +142,7 @@ FAELLE = [
         "name": "two-graphs",
         "zweck": "Two captures, replayed alternately. Exposes shared "
                  "flag or result slots.",
-        "umgebung": {"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
+        "umgebung": {"FLLIPER_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
         "groessen": [64 << 10, 256 << 10],
         "verschraenkt": True,
         "gate": True,
@@ -153,9 +153,9 @@ FAELLE = [
                  "under capture; this checks that the direct=0 path "
                  "carries.",
         "umgebung": {
-            "SGLANG_BARLINK_BAR1_PIPE": "1",
-            "SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40),
-            "SGLANG_BARLINK_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
+            "FLLIPER_BARLINK_BAR1_PIPE": "1",
+            "FLLIPER_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40),
+            "FLLIPER_BARLINK_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
         },
         # Between pipe_from (256 KiB) and ring_from (1 MiB) -- only there does
         # `algorithm_for` pick mesh_pipe at all.
@@ -170,17 +170,17 @@ FAELLE = [
                  "device) and proves the result tensor really sits in "
                  "the BAR1 window.",
         "umgebung": {
-            "SGLANG_BARLINK_BAR1_PIPE": "1",
-            "SGLANG_BARLINK_BAR1_PIPE_DIRECT": "1",
-            "SGLANG_BARLINK_BAR1_PIPE_DIRECT_GRAPH": "1",
+            "FLLIPER_BARLINK_BAR1_PIPE": "1",
+            "FLLIPER_BARLINK_BAR1_PIPE_DIRECT": "1",
+            "FLLIPER_BARLINK_BAR1_PIPE_DIRECT_GRAPH": "1",
             # 2 eager + 3 graph slots. Without the three above, the pool
             # would be empty and every captured call would fall back to
             # direct=0 -- the case would then pass without ever having
             # run direct mode. That is why `direkt` below verifies the
             # result tensor's location afterward.
-            "SGLANG_BARLINK_BAR1_PIPE_RESULT_RING": "5",
-            "SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40),
-            "SGLANG_BARLINK_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
+            "FLLIPER_BARLINK_BAR1_PIPE_RESULT_RING": "5",
+            "FLLIPER_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40),
+            "FLLIPER_BARLINK_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
         },
         "groessen": [512 << 10, 640 << 10, 768 << 10],
         "verschraenkt": True,
@@ -195,12 +195,12 @@ FAELLE = [
                  "right bytes -- a fallback that delivers wrong numbers "
                  "would be worse than none at all.",
         "umgebung": {
-            "SGLANG_BARLINK_BAR1_PIPE": "1",
-            "SGLANG_BARLINK_BAR1_PIPE_DIRECT": "1",
-            "SGLANG_BARLINK_BAR1_PIPE_DIRECT_GRAPH": "1",
-            "SGLANG_BARLINK_BAR1_PIPE_RESULT_RING": "2",
-            "SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40),
-            "SGLANG_BARLINK_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
+            "FLLIPER_BARLINK_BAR1_PIPE": "1",
+            "FLLIPER_BARLINK_BAR1_PIPE_DIRECT": "1",
+            "FLLIPER_BARLINK_BAR1_PIPE_DIRECT_GRAPH": "1",
+            "FLLIPER_BARLINK_BAR1_PIPE_RESULT_RING": "2",
+            "FLLIPER_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40),
+            "FLLIPER_BARLINK_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
         },
         "groessen": [512 << 10, 768 << 10],
         "verschraenkt": True,
@@ -213,7 +213,7 @@ FAELLE = [
         "zweck": "The cases from the standard run: 12- and 128-byte "
                  "broadcast in the draft graph. Every rank once as the "
                  "source, so no edge is left unchecked.",
-        "umgebung": {"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
+        "umgebung": {"FLLIPER_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
         # 12 comes first, and not out of tidiness: the first attempt
         # covered 128 and rejected 12 (floor of 16), and because the gate
         # only ran 128, it passed green while the standard run aborted. A
@@ -227,7 +227,7 @@ FAELLE = [
         "kollektiv": "broadcast",
         "zweck": "Two broadcast captures, replayed alternately. A "
                  "shared slot or a baked-in half only shows up here.",
-        "umgebung": {"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
+        "umgebung": {"FLLIPER_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
         "groessen": [12, 128, 64 << 10],
         "verschraenkt": True,
         "gate": True,
@@ -240,7 +240,7 @@ FAELLE = [
 # ===========================================================================
 
 
-def _muster(n: int, rang: int, round: int, geraet) -> torch.Tensor:
+def _pattern(n: int, rang: int, round: int, dev) -> torch.Tensor:
     """The input of rank ``rang`` in replay ``round``.
 
     float32 with small integers: the sum over up to eight ranks stays well
@@ -252,25 +252,25 @@ def _muster(n: int, rang: int, round: int, geraet) -> torch.Tensor:
     decomposition that skips or shifts a range would otherwise not show
     up, because all elements would look the same.
     """
-    i = torch.arange(n, dtype=torch.float32, device=geraet)
+    i = torch.arange(n, dtype=torch.float32, device=dev)
     return (rang + 1) * 1000.0 + round * 7.0 + (i % 97)
 
 
-def _soll(n: int, welt: int, round: int, geraet) -> torch.Tensor:
-    i = torch.arange(n, dtype=torch.float32, device=geraet)
-    kopf = sum((r + 1) * 1000.0 for r in range(welt))
-    return kopf + welt * (round * 7.0 + (i % 97))
+def _expected_tensor(n: int, welt: int, round: int, dev) -> torch.Tensor:
+    i = torch.arange(n, dtype=torch.float32, device=dev)
+    header = sum((r + 1) * 1000.0 for r in range(welt))
+    return header + welt * (round * 7.0 + (i % 97))
 
 
-def _vergleiche(actual: torch.Tensor, soll: torch.Tensor) -> tuple[int, str]:
-    falsch = torch.ne(actual, soll)
-    n = int(falsch.sum().item())
+def _compare(actual: torch.Tensor, want: torch.Tensor) -> tuple[int, str]:
+    wrong = torch.ne(actual, want)
+    n = int(wrong.sum().item())
     if n == 0:
         return 0, ""
-    erste = int(falsch.nonzero()[0].item())
+    first_bad = int(wrong.nonzero()[0].item())
     return n, (
-        f"{n} of {actual.numel()} elements wrong, first at {erste}: "
-        f"actual {float(actual[erste]):.1f}, expected {float(soll[erste]):.1f}"
+        f"{n} of {actual.numel()} elements wrong, first at {first_bad}: "
+        f"actual {float(actual[first_bad]):.1f}, expected {float(want[first_bad]):.1f}"
     )
 
 
@@ -279,7 +279,7 @@ def _vergleiche(actual: torch.Tensor, soll: torch.Tensor) -> tuple[int, str]:
 # ===========================================================================
 
 
-def _zeichne_auf(t, n: int, rang: int, geraet):
+def _record(t, n: int, rang: int, dev):
     """Warm up, capture, return ``(graph, input, output)``.
 
     The warmup runs on a side stream -- the usual prescription for
@@ -291,26 +291,26 @@ def _zeichne_auf(t, n: int, rang: int, geraet):
     inside the capture, otherwise the program would be checking something
     other than the hot path.
     """
-    eingabe = _muster(n, rang, 0, geraet)
+    input = _pattern(n, rang, 0, dev)
 
-    strom = torch.cuda.Stream(device=geraet)
-    strom.wait_stream(torch.cuda.current_stream(geraet))
+    strom = torch.cuda.Stream(device=dev)
+    strom.wait_stream(torch.cuda.current_stream(dev))
     with torch.cuda.stream(strom):
         for _ in range(3):
-            t.barlink_all_reduce(None, eingabe)
-    torch.cuda.current_stream(geraet).wait_stream(strom)
-    torch.cuda.synchronize(geraet)
+            t.barlink_all_reduce(None, input)
+    torch.cuda.current_stream(dev).wait_stream(strom)
+    torch.cuda.synchronize(dev)
     dist.barrier()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        ausgabe = t.barlink_all_reduce(None, eingabe)
-    torch.cuda.synchronize(geraet)
+        output = t.barlink_all_reduce(None, input)
+    torch.cuda.synchronize(dev)
     dist.barrier()
-    return graph, eingabe, ausgabe
+    return graph, input, output
 
 
-def _zeichne_auf_broadcast(t, n: int, rang: int, geraet, src: int):
+def _record_broadcast(t, n: int, rang: int, dev, src: int):
     """Same thing for ``broadcast`` -- and it is IN PLACE.
 
     Input and output are the same buffer, because the seam promises
@@ -324,26 +324,26 @@ def _zeichne_auf_broadcast(t, n: int, rang: int, geraet, src: int):
     -- that is the condition under which a broadcast can be captured at
     all.
     """
-    puffer = _muster(n, rang, 0, geraet)
+    buffer = _pattern(n, rang, 0, dev)
 
-    strom = torch.cuda.Stream(device=geraet)
-    strom.wait_stream(torch.cuda.current_stream(geraet))
+    strom = torch.cuda.Stream(device=dev)
+    strom.wait_stream(torch.cuda.current_stream(dev))
     with torch.cuda.stream(strom):
         for _ in range(3):
-            t.barlink_broadcast(None, puffer, src)
-    torch.cuda.current_stream(geraet).wait_stream(strom)
-    torch.cuda.synchronize(geraet)
+            t.barlink_broadcast(None, buffer, src)
+    torch.cuda.current_stream(dev).wait_stream(strom)
+    torch.cuda.synchronize(dev)
     dist.barrier()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        t.barlink_broadcast(None, puffer, src)
-    torch.cuda.synchronize(geraet)
+        t.barlink_broadcast(None, buffer, src)
+    torch.cuda.synchronize(dev)
     dist.barrier()
-    return graph, puffer
+    return graph, buffer
 
 
-def _im_fenster(t, tensor) -> bool:
+def _in_window(t, tensor) -> bool:
     """Does ``tensor`` sit in this rank's exported result ring?
 
     That is the answer to "did direct mode really run". The transport
@@ -357,12 +357,12 @@ def _im_fenster(t, tensor) -> bool:
     window = t.result_window()
     if window is None:
         return False
-    anfang, length = window
+    start, length = window
     p = int(tensor.data_ptr())
-    return anfang <= p < anfang + length
+    return start <= p < start + length
 
 
-def _rueckgelesen_ueber_host(ausgabe, soll_cpu) -> tuple[int, str]:
+def _read_back_via_host(output, want_cpu) -> tuple[int, str]:
     """Byte proof over a DIFFERENT read path than the one written.
 
     Measurement discipline, rule 3: "Write a pattern, read it back over a
@@ -380,21 +380,21 @@ def _rueckgelesen_ueber_host(ausgabe, soll_cpu) -> tuple[int, str]:
     The expected value comes in as a CPU tensor, so computing the
     expectation does not itself run over the card again.
     """
-    actual = ausgabe.detach().to("cpu", copy=True)
-    falsch = torch.ne(actual, soll_cpu)
-    n = int(falsch.sum().item())
+    actual = output.detach().to("cpu", copy=True)
+    wrong = torch.ne(actual, want_cpu)
+    n = int(wrong.sum().item())
     if n == 0:
         return 0, ""
-    erste = int(falsch.nonzero()[0].item())
+    first_bad = int(wrong.nonzero()[0].item())
     return n, (
         f"host read-back: {n} of {actual.numel()} elements wrong, first "
-        f"at {erste}: actual {float(actual[erste]):.1f}, expected "
-        f"{float(soll_cpu[erste]):.1f}"
+        f"at {first_bad}: actual {float(actual[first_bad]):.1f}, expected "
+        f"{float(want_cpu[first_bad]):.1f}"
     )
 
 
-def _pruefe_graphen(t, groessen, verschraenkt, rang, welt, geraet, protokoll,
-                    kollektiv: str = "all_reduce", direkt_erwartung=None):
+def _check_graphs(t, sizes, interleaved, rang, welt, dev, log_lines,
+                    collective: str = "all_reduce", direct_expectation=None):
     """Capture, replay, prove after EVERY replay.
 
     ``kollektiv`` selects WHAT is captured. The replay-and-proof loop is
@@ -407,103 +407,103 @@ def _pruefe_graphen(t, groessen, verschraenkt, rang, welt, geraet, protokoll,
     replay has run -- a case that never actually achieved direct mode
     should not only show up at the end.
     """
-    graphen = []
-    for n_bytes in groessen:
+    graphs = []
+    for n_bytes in sizes:
         n = n_bytes // 4                       # float32
-        if not t.handles(kollektiv, n_bytes):
-            protokoll.append(
-                f"SKIPPED {n_bytes} bytes ({kollektiv}): handles() -> "
+        if not t.handles(collective, n_bytes):
+            log_lines.append(
+                f"SKIPPED {n_bytes} bytes ({collective}): handles() -> "
                 f"False (window {t.window_minimum()} bytes, max_bytes "
                 f"{t.max_bytes} bytes, min_bytes {t.min_bytes}). Not a "
                 f"finding, just a size this path does not carry."
             )
             continue
-        if kollektiv == "broadcast":
+        if collective == "broadcast":
             # Every rank once as the source: otherwise exactly the edge
             # the draft pick uses in production would stay unchecked.
             for src in range(welt):
-                graph, puffer = _zeichne_auf_broadcast(t, n, rang, geraet, src)
-                protokoll.append(
+                graph, buffer = _record_broadcast(t, n, rang, dev, src)
+                log_lines.append(
                     f"captured: broadcast, {n_bytes} bytes, src={src}, "
                     f"{t.bc_rounds(n_bytes)} rounds"
                 )
-                graphen.append((n_bytes, n, graph, puffer, puffer, src))
+                graphs.append((n_bytes, n, graph, buffer, buffer, src))
             continue
         algo = t.algorithm_for(n_bytes)
-        graph, eingabe, ausgabe = _zeichne_auf(t, n, rang, geraet)
-        im_fenster = _im_fenster(t, ausgabe)
-        protokoll.append(
+        graph, input, output = _record(t, n, rang, dev)
+        in_window = _in_window(t, output)
+        log_lines.append(
             f"captured: {n_bytes} bytes, algorithm {algo!r}, "
-            f"result tensor {'IN' if im_fenster else 'NOT in'} the BAR1 window"
+            f"result tensor {'IN' if in_window else 'NOT in'} the BAR1 window"
         )
-        if direkt_erwartung == "all" and not im_fenster:
+        if direct_expectation == "all" and not in_window:
             raise AssertionError(
                 f"{n_bytes} bytes: the result tensor is NOT in the BAR1 "
                 f"window, so direct mode did not run. This case would "
                 f"have measured and passed the direct=0 control path "
                 f"without answering the question. Check the cause: the "
                 f"result ring's graph pool "
-                f"(SGLANG_BARLINK_BAR1_PIPE_RESULT_RING), "
-                f"SGLANG_BARLINK_BAR1_PIPE_DIRECT_GRAPH."
+                f"(FLLIPER_BARLINK_BAR1_PIPE_RESULT_RING), "
+                f"FLLIPER_BARLINK_BAR1_PIPE_DIRECT_GRAPH."
             )
-        if direkt_erwartung == "none" and im_fenster:
+        if direct_expectation == "none" and in_window:
             raise AssertionError(
                 f"{n_bytes} bytes: the result tensor sits in the BAR1 "
                 f"window, even though the graph pool should be empty. "
                 f"The result ring's split is wrong."
             )
-        graphen.append((n_bytes, n, graph, eingabe, ausgabe, None))
+        graphs.append((n_bytes, n, graph, input, output, None))
 
-    if not graphen:
+    if not graphs:
         raise RuntimeError(
-            f"not a single graph captured ({kollektiv}) -- every size in "
+            f"not a single graph captured ({collective}) -- every size in "
             f"this case was rejected by handles()"
         )
 
     # Replay. Interleaved means: round by round, ALL graphs, so that a
     # slot shared between two captures shows up. Otherwise each graph on
     # its own, so a finding can be attributed to one graph.
-    folgen = ([[(round, g) for g in graphen] for round in range(1, WIEDERGABEN + 1)]
-              if verschraenkt
+    sequences = ([[(round, g) for g in graphs] for round in range(1, WIEDERGABEN + 1)]
+              if interleaved
               else [[(round, g) for round in range(1, WIEDERGABEN + 1)]
-                    for g in graphen])
+                    for g in graphs])
 
-    for folge in folgen:
-        for round, (n_bytes, n, graph, eingabe, ausgabe, src) in folge:
-            eingabe.copy_(_muster(n, rang, round, geraet))
+    for folge in sequences:
+        for round, (n_bytes, n, graph, input, output, src) in folge:
+            input.copy_(_pattern(n, rang, round, dev))
             if src is None:
-                soll = _soll(n, welt, round, geraet)
-                soll_cpu = _soll(n, welt, round, "cpu")
+                want = _expected_tensor(n, welt, round, dev)
+                want_cpu = _expected_tensor(n, welt, round, "cpu")
                 wer = ""
             else:
-                soll = _muster(n, src, round, geraet)
-                soll_cpu = _muster(n, src, round, "cpu")
+                want = _pattern(n, src, round, dev)
+                want_cpu = _pattern(n, src, round, "cpu")
                 wer = f", src={src}"
-            torch.cuda.synchronize(geraet)
+            torch.cuda.synchronize(dev)
             dist.barrier()
             graph.replay()
-            torch.cuda.synchronize(geraet)
-            schlecht, text = _vergleiche(ausgabe, soll)
-            if schlecht:
+            torch.cuda.synchronize(dev)
+            bad, text = _compare(output, want)
+            if bad:
                 raise AssertionError(
                     f"replay {round} of {n_bytes} bytes{wer}: {text}"
                 )
             path_used = "device"
-            if direkt_erwartung is not None:
-                schlecht, text = _rueckgelesen_ueber_host(ausgabe, soll_cpu)
-                if schlecht:
+            if direct_expectation is not None:
+                bad, text = _read_back_via_host(output, want_cpu)
+                if bad:
                     raise AssertionError(
                         f"replay {round} of {n_bytes} bytes{wer}: {text}"
                     )
                 path_used = "device+host"
-            protokoll.append(
+            log_lines.append(
                 f"replay {round}, {n_bytes} bytes{wer}: 0 of {n} "
                 f"elements wrong ({path_used})"
             )
             dist.barrier()
 
-    for eintrag in graphen:
-        del eintrag
+    for entry in graphs:
+        del entry
 
 
 # ===========================================================================
@@ -511,7 +511,7 @@ def _pruefe_graphen(t, groessen, verschraenkt, rang, welt, geraet, protokoll,
 # ===========================================================================
 
 
-def worker(local_rank: int, devs: list, port: str, fall: dict, ablage: str) -> None:
+def worker(local_rank: int, devs: list, port: str, fall: dict, store: str) -> None:
     rang = local_rank
     welt = len(devs)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -531,23 +531,23 @@ def worker(local_rank: int, devs: list, port: str, fall: dict, ablage: str) -> N
 
     dist.init_process_group("gloo", rank=rang, world_size=welt)
     torch.cuda.set_device(devs[rang])
-    geraet = torch.device("cuda", devs[rang])
+    dev = torch.device("cuda", devs[rang])
     torch.cuda.init()
-    torch.zeros(1, device=geraet)
+    torch.zeros(1, device=dev)
 
-    from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+    from flliper.srt.distributed.device_communicators.barlink_bar1 import (
         BarlinkBar1Transport,
     )
-    from sglang.srt.distributed.device_communicators.barlink_matrix_transport import (
+    from flliper.srt.distributed.device_communicators.barlink_matrix_transport import (
         _window_bytes,
     )
 
-    protokoll: list[str] = []
-    ergebnis = {"fall": fall["name"], "rang": rang, "ok": False,
-                "grund": "", "protokoll": protokoll}
+    log_lines: list[str] = []
+    result = {"fall": fall["name"], "rang": rang, "ok": False,
+                "grund": "", "protokoll": log_lines}
     t = None
     try:
-        t = BarlinkBar1Transport(dist.group.WORLD, geraet, _window_bytes())
+        t = BarlinkBar1Transport(dist.group.WORLD, dev, _window_bytes())
         belege = t.byte_proof_all()
         if not all(belege.values()):
             raise RuntimeError(
@@ -560,8 +560,8 @@ def worker(local_rank: int, devs: list, port: str, fall: dict, ablage: str) -> N
                 "mesh_pipe byte proof failed -- this case needs it, "
                 "otherwise algorithm_for never picks mesh_pipe at all"
             )
-        kollektiv = fall.get("kollektiv", "all_reduce")
-        if kollektiv == "broadcast":
+        collective = fall.get("kollektiv", "all_reduce")
+        if collective == "broadcast":
             # The transport is built directly here, not via `build_bar1`
             # -- so the proofs the factory otherwise runs are not in place
             # yet. broadcast depends on both: the a2a proof (same kernel,
@@ -576,13 +576,13 @@ def worker(local_rank: int, devs: list, port: str, fall: dict, ablage: str) -> N
                     "broadcast byte proof failed -- a graph over a path "
                     "that loses bytes proves nothing"
                 )
-        _pruefe_graphen(
+        _check_graphs(
             t, fall["groessen"], fall.get("verschraenkt", False),
-            rang, welt, geraet, protokoll, kollektiv, fall.get("direkt"),
+            rang, welt, dev, log_lines, collective, fall.get("direkt"),
         )
-        ergebnis["ok"] = True
+        result["ok"] = True
     except BaseException as e:
-        ergebnis["grund"] = f"{type(e).__name__}: {e}"
+        result["grund"] = f"{type(e).__name__}: {e}"
         sys.stderr.write(
             f"\n===== [r{rang}] CASE {fall['name']!r} FAILED =====\n"
         )
@@ -594,14 +594,14 @@ def worker(local_rank: int, devs: list, port: str, fall: dict, ablage: str) -> N
                 t.close()
         except Exception:
             pass
-        pathlib.Path(ablage, f"r{rang}.json").write_text(
-            json.dumps(ergebnis, indent=1)
+        pathlib.Path(store, f"r{rang}.json").write_text(
+            json.dumps(result, indent=1)
         )
         try:
             dist.destroy_process_group()
         except Exception:
             pass
-    if not ergebnis["ok"]:
+    if not result["ok"]:
         os._exit(1)
 
 
@@ -620,32 +620,32 @@ def main() -> int:
           f"{WIEDERGABEN} replays per graph.\n")
 
     stand = []
-    for i, fall in enumerate(FAELLE):
+    for i, fall in enumerate(CASES):
         if nur and fall["name"] not in nur:
             continue
         print(f"--- case {fall['name']!r} " + "-" * 40)
         print(f"    {fall['zweck']}")
         print(f"    environment: {fall.get('umgebung', {})}")
-        with tempfile.TemporaryDirectory() as ablage:
+        with tempfile.TemporaryDirectory() as store:
             try:
                 mp.spawn(
                     worker,
-                    args=(devs, str(port + i), fall, ablage),
+                    args=(devs, str(port + i), fall, store),
                     nprocs=len(devs), join=True,
                 )
                 ok, grund = True, ""
             except Exception as e:
                 ok, grund = False, str(e)
-            zeilen = []
+            row_list = []
             for r in range(len(devs)):
-                p = pathlib.Path(ablage, f"r{r}.json")
+                p = pathlib.Path(store, f"r{r}.json")
                 if p.is_file():
                     d = json.loads(p.read_text())
-                    zeilen.append(d)
+                    row_list.append(d)
                     if not d["ok"]:
                         ok = False
                         grund = grund or d["grund"]
-        for d in zeilen:
+        for d in row_list:
             for z in d["protokoll"]:
                 print(f"    [r{d['rang']}] {z}")
         # NOTE: "PASSED"/"FAILED" is a cross-file marker text, regex-parsed
@@ -668,17 +668,17 @@ def main() -> int:
               + (f"  -- {grund[:80]}" if grund else ""))
 
     gates = [(n, ok) for n, gate, ok, _ in stand if gate]
-    fehlend = [n for n, ok in gates if not ok]
+    absent = [n for n, ok in gates if not ok]
     print()
     if not gates:
         print("No gate case ran -- that is NOT a release.")
         return 2
-    if fehlend:
-        print(f"Failed gate cases: {', '.join(fehlend)}.")
-        print("SGLANG_BARLINK_GRAPH_ENABLE stays OFF.")
+    if absent:
+        print(f"Failed gate cases: {', '.join(absent)}.")
+        print("FLLIPER_BARLINK_GRAPH_ENABLE stays OFF.")
         return 1
     print("All gate cases passed.")
-    print("Only now may SGLANG_BARLINK_GRAPH_ENABLE=1 be set;")
+    print("Only now may FLLIPER_BARLINK_GRAPH_ENABLE=1 be set;")
     print("bar1/matrix then count as capturable in parallel_state.")
     info = [(n, ok) for n, gate, ok, _ in stand if not gate]
     for n, ok in info:
@@ -687,8 +687,8 @@ def main() -> int:
             print("Also: case 'grid' passed -- the cooperative launch can "
                   "be captured on this rig. That makes the reservation in "
                   "BarlinkBar1Transport._kernel moot on its own: its default "
-                  "depends on SGLANG_BARLINK_GRAPH_ENABLE. To bring it back "
-                  "individually, set SGLANG_BARLINK_BAR1_GRAPH_GRID=0.")
+                  "depends on FLLIPER_BARLINK_GRAPH_ENABLE. To bring it back "
+                  "individually, set FLLIPER_BARLINK_BAR1_GRAPH_GRID=0.")
     return 0
 
 

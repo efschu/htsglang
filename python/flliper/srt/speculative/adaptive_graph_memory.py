@@ -1,0 +1,1632 @@
+"""Physical-memory offload for adaptive speculative-decoding runtime states.
+
+DESIGN (Task #93) -- reserve = max(one state), not sum(all states)
+==================================================================
+
+Problem
+-------
+Adaptive draft-length (``--speculative-adaptive``) pre-builds one complete
+runtime state (attention backends + CUDA graphs) per candidate step count k.
+Every state beyond the baseline costs ~1.1-1.35 GB of VRAM that sits idle
+whenever that k is not active: on a 20 GB RTX 3080 rig, two extra states cost
++2.4 GB of graph reserve and shrank KV capacity from 261k to 39k tokens
+(T75 GPU validation).
+
+Key observation (user-originated, conceptually validated): the per-state
+buffers are SCRATCH. Their content is disposable between decode steps -- only
+the KV cache carries state, and the KV cache is shared across all k-states,
+never duplicated. CUDA graphs bake in fixed VIRTUAL addresses, so the buffers
+may never move; but the PHYSICAL pages behind them can be unmapped while a
+state is inactive and remapped when it becomes active again.
+
+Mechanism
+---------
+torch_memory_saver (an existing flliper dependency, the engine behind
+``--enable-memory-saver``) allocates tagged regions through the CUDA
+VirtualMemory API: ``pause(tag)`` unmaps and releases the physical pages
+behind every allocation carrying that tag while keeping the virtual address
+reservation intact; ``resume(tag)`` maps fresh physical pages at the same
+virtual addresses. Captured CUDA graphs replay unchanged afterwards because
+they only reference the (stable) virtual addresses.
+
+torch_memory_saver has no API for mapping ONE physical allocation behind
+MULTIPLE virtual ranges, so the literal "one shared physical pool, N virtual
+aliases" variant is not directly expressible. pause/resume achieves the same
+steady-state footprint -- only the active state's pages are mapped -- at the
+cost of a physical map/unmap per swap instead of an access switch. Measured
+swap rate is ~0.1/s (T75), so a ms-scale swap is irrelevant against the
+~us pointer swap it replaces.
+
+What is tagged (paused/resumed), what stays resident, what lives in RAM
+-----------------------------------------------------------------------
+Tagged per state (the dominant VRAM cost; each allocation is >= MiB-scale so
+it occupies its own caching-allocator segment -- see "Isolation" below):
+
+* the state's private flashinfer float workspace(s)
+  (``init_new_workspace=True`` allocations, 384-512 MiB each),
+* the flashinfer CUDA-graph state buffers allocated by
+  ``init_cuda_graph_state``: ``cuda_graph_kv_indices`` (per wrapper /
+  per draft step), ``cuda_graph_custom_mask``.
+
+Resident (small, or shared with the static path, or not tensor memory):
+
+* the process-global flashinfer workspace (time-multiplexed by ALL states
+  and the non-spec path; never paused),
+* static graph input buffers (EagleDraftInputBuffers / DecodeInputBuffers,
+  few MiB; DecodeInputBuffers also references the SHARED logits buffer),
+* small indptr / last-page-len buffers and their clones (KiB),
+* flashinfer wrapper objects and their int workspaces (~8 MiB each),
+* cudaGraphExec_t instantiation memory (driver-owned, not interceptable).
+
+Host RAM: everything needed to re-activate a state is either already
+host-resident (wrapper objects, host-side plan state inside flashinfer's
+indices updaters, pinned staging buffers) or re-derivable on the device
+(see re-init below). Nothing is copied device-to-host at swap time
+(``enable_cpu_backup`` stays False): pause DISCARDS the tagged content.
+
+Re-initialization on resume ("what needs re-init and why")
+----------------------------------------------------------
+After ``resume(tag)`` the tagged buffers contain undefined data. Exactly two
+content classes live there, and both have a cheap deterministic re-init:
+
+1. Float workspaces: the #50 investigation established that flashinfer's
+   split-KV kernels read workspace regions the current forward did not write,
+   and the validated contract is a ZEROED workspace (restored at request
+   boundaries by ``zero_flashinfer_workspaces``). Zeroing on resume restores
+   exactly the boot-state contract. (While a workspace is paused, the
+   request-boundary zeroing must skip it -- see ``is_paused_tensor`` -- its
+   zero happens at resume instead.)
+2. Graph-state index/mask buffers: every replay's
+   ``init_forward_metadata_replay_cuda_graph`` / draft ``common_template``
+   rewrites the lanes its graph reads before launch, and plan data is
+   re-planned from host state every forward. Zeroing on resume gives padded /
+   not-yet-rewritten lanes a safe value (page index 0 is always a valid pool
+   page), identical to the fresh-boot state before the first replay.
+
+flashinfer plan buffers and semaphores live in the wrapper int workspaces,
+which stay RESIDENT -- they are never paused, so no re-init is needed;
+re-planning happens per forward exactly as on the static path.
+
+Swap sequence (offload mode)
+----------------------------
+``torch.cuda.synchronize()`` (no in-flight kernel of the old state; the
+existing swap sites run between scheduler steps, but attr-rebinding alone
+never guaranteed quiescence -- the synchronize does), then ``pause(old)``,
+then ``resume(new)`` + zero of the new state's noted tensors, then the
+worker's ordinary pointer swap. Pausing BEFORE resuming guarantees the
+physical pages freed by the outgoing state are available to the incoming one,
+which combined with the boot-time reserve check makes a swap-time OOM
+impossible (see below).
+
+Reserve rule and the no-OOM-on-swap guarantee
+---------------------------------------------
+* resident mode: reserve = SUM of all built states (status quo).
+* offload mode: reserve = MAX over the built states. Enforced at boot:
+  states are built LARGEST k FIRST, each state is paused as soon as its build
+  completes (so the boot peak is ~one state, not the sum), and after all
+  builds ``finalize_boot`` verifies -- with every built state paused -- that
+  free device memory >= the largest state's tagged bytes. Since at most one
+  built state is ever resumed, and pause precedes resume on every swap, the
+  physical pool is max-state-sized from boot onward: no lazy growth, no
+  swap-time allocation beyond what pause just released. A failed check is a
+  fatal, actionable error (raise the graph reserve or use resident mode).
+  One erosion channel remains at runtime: resume() maps FRESH physical
+  pages, and serving transients (deep chunked-prefill peaks) leave
+  freed-but-cached segments in the torch caching allocator that the driver
+  cannot see -- so ``ensure_active`` reclaims those (empty_cache) whenever
+  driver-free is short of the incoming tag's measured footprint, before
+  resuming (``_reclaim_driver_free_for_resume``).
+
+Isolation / audit (G4 evolution)
+--------------------------------
+Virtual addresses are NEVER shared across states in this design, so the
+existing ``assert_runtime_state_isolation`` (M16/#50) applies unchanged.
+The new hazard class is PHYSICAL: pausing tag A must not unmap memory that
+another state (or the static path) still uses. Two structural guarantees plus
+one audit close it:
+
+* Every tag allocates from its own private ``torch.cuda.MemPool``. This is
+  the load-bearing guarantee: ``pause(tag)`` unmaps a tag's segments
+  wholesale INCLUDING their free tails, and the caching allocator both
+  packs 1-10 MiB allocations into shared 20 MiB segments (kLargeBuffer) and
+  serves any large-enough free block regardless of who created the segment
+  -- so with a shared pool, one tag's buffer can be placed into another
+  (paused) tag's segment tail and fault on first touch (observed live on
+  the 5-state boot). Per-tag pools confine a tag's free space to that tag,
+  whose allocations happen only during its own build. Additionally only
+  individually-noted, never-freed allocations >= MIN_TAGGED_BYTES are
+  tagged; smaller ones stay resident in the default pool.
+* Tags are only pausable through this manager, which enforces "at most one
+  built state resumed".
+* ``finalize_boot`` audits via ``torch.cuda.memory_snapshot()`` that every
+  noted tensor of every tag lies in a segment created during THAT tag's build
+  window; any cross-tag placement is a fatal error (fallback: resident mode).
+
+Rank determinism
+----------------
+The swap decision is a pure function of rank-invariant inputs (rank-0
+broadcast accept counts + batch size; AST-ratcheted in
+test_draft_pick_rank_sync.py), so every TP/DCP rank performs the same
+pause/resume on the same decode step. ``FLLIPER_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC=1``
+additionally all-gathers (swap ordinal, target steps) across the TP CPU group
+on every swap and asserts equality (stress/debug tool; a diverged rank turns
+silent corruption into an immediate failure).
+
+Stage 2 (Task #102) -- capture pools and int workspaces
+-------------------------------------------------------
+Stage 1 (above) pauses only the explicitly noted scratch (float workspaces,
+kv_indices, custom_mask): ~0.4 GiB/state. Each state still left ~1-1.5 GiB
+of UNTAGGED residue: (a) the CUDA-graph capture-pool allocations (activation
+/ intermediate tensors the captured graphs reference at fixed VAs), (b) the
+flashinfer wrapper int workspaces (8 MiB each; graph-mode wrappers are
+created PER CAPTURED SHAPE, so a state carries dozens), (c) static IO
+buffers and driver-owned cudaGraphExec memory. Stage 2 makes (a) and (b)
+pauseable:
+
+* Capture pools: every state's graph captures run against a PRIVATE
+  ``torch.cuda.graph_pool_handle()`` (one per tag -- the same cross-tag
+  free-list-isolation argument as the Stage-1 per-tag MemPools) and the
+  capture body executes inside the torch_memory_saver region for that tag
+  (upstream precedent: ``TorchMemorySaver.cuda_graph``), so every segment
+  the caching allocator creates for capture-time allocations is tagged and
+  unmapped with the state. Replay rewrites every capture-pool tensor before
+  any kernel reads it (a replay re-executes the full captured DAG; graph
+  inputs are the static IO buffers, which stay resident); the graph is never
+  replayed while its pool is paused (only-active-state replay, enforced by
+  ``ensure_active`` running before the worker pointer swap).
+  ``FLLIPER_ADAPTIVE_CAPTURE_CPU_BACKUP=1`` additionally round-trips the
+  capture-pool bytes through host RAM on pause/resume (exact content
+  restore -- fallback if garbage-on-resume ever falsifies the
+  rewrite-before-read property).
+* Int workspaces: flashinfer re-plans on every forward (host plan state ->
+  pinned buffer -> device int-workspace copy), so the int workspace carries
+  no state a forward does not rewrite, except its boot contract of
+  fresh-cudaMalloc zero pages (#50 note). Each wrapper built during a
+  Stage-2 state build gets a tagged replacement int workspace via the public
+  ``reset_workspace_buffer`` API, noted for zero-on-resume.
+* Still resident, documented: the shared logits buffer and the
+  process-wide-pooled IO buffers (cross-state ALIASED via
+  ``share_input_buffer``'s (name,numel,dtype,device) key -- tagging them
+  would unmap memory other states alias, KiB-to-few-MiB scale anyway) and
+  cudaGraphExec_t instantiation memory (driver-owned, not interceptable).
+
+The boot reserve check consequently measures a state's footprint as the
+free-memory delta released by ``pause`` (covers noted tensors AND capture
+pool segments) instead of summing noted tensors, and additionally enforces
+a SERVING margin on top of the largest state's mapped footprint
+(``FLLIPER_ADAPTIVE_SERVING_MARGIN_MIB``): forwards run while a state is
+mapped, and the eager paths (mamba chunked-prefill recompute etc.)
+allocate transients from the same free pool -- T102 measured 148 MiB of
+post-map free memory OOMing at a 24k deep prefill and 1367 MiB surviving.
+
+T102 GPU validation (rig: 5090 + 2x3080, Qwen3.6-27B-FP8 NEXTN TP=3
+uneven): per-state untagged residue 1.0-1.5 GB -> 0.18-0.22 GB (pauseable
+k5 footprint 960 MiB = scratch 424 + int-ws 184 + capture pool 352); in
+THAT geometry (this rig, NEXTN TP=3 uneven, TP-SPLIT draft, the default
+KV vector) the high-accept [1..5] profile boots at the standard reserve
+with KV capacity identical to the static/default-set number (261120 vs
+38848 at +2400 MiB reserve before); ~2315 forced swaps/rank with TP
+rank-sync asserts clean; 9/9 byte-identity vs Stage-1 offload at matched
+KV/DCP geometry, vs the pre-Stage-2 default-set artifact, and for the
+untouched adaptive-OFF path. Swap latency: organic avg 40-51 ms, max
+85 ms (vs 14 ms Stage-1 -- the price of remapping+zeroing ~1 GB per swap;
+~0.5% overhead at the 0.1/s organic swap rate).
+
+"Boots at the standard reserve" is a statement about that geometry, not a
+property of the profile. The 2026-07-30 #707 window falsified it for
+KV 7,3,3 + ``--chunked-prefill-size 2048`` +
+``--speculative-draft-placement solo`` on rank 0: the same [1..5] profile
+missed this check by 54 MiB at the standard bar1_hi reserve (1376 MiB free
+vs 918 MiB adaptive_state_k5 + 512 MiB margin) and wanted ~700 MiB more on
+the rank holding the solo draft. Two terms that geometry adds and the T102
+one does not: the solo rank carries the UNSHARDED draft plus every
+draft-family graph set of every rung, and a 7,3,3 KV vector concentrates
+the pool on that same rank. The reserve a ladder needs is therefore
+per-geometry and is now DERIVED rather than assumed -- see
+``estimate_ladder_reserve_demand`` below, which ``--rank-auto-reserve-mib
+auto`` charges to the GPU hosting the solo draft rank.
+
+Modes
+-----
+``--speculative-adaptive-graph-memory {auto,resident,offload,offload-scratch}``:
+
+* ``resident``: status quo -- all states fully materialized, ~us pointer
+  swaps, sum-of-states reserve. First-class mode for rigs with VRAM to spare.
+* ``offload``: Stage 2 -- scratch + capture pools + int workspaces of
+  inactive states are unmapped; ms-scale swaps, max-state reserve.
+* ``offload-scratch``: Stage 1 exactly -- only the noted scratch is
+  unmapped, captures go to the shared global graph pool. Fallback knob.
+* ``auto`` (default): offload when the prerequisites hold (CUDA device,
+  flashinfer attention backend, torch_memory_saver importable, no
+  expandable_segments, decode cuda-graph backend 'full', no
+  FLLIPER_MEMORY_SAVER_CUDA_GRAPH), degrading to offload-scratch when only
+  the Stage-2-specific prerequisites fail, else resident. Explicit
+  ``offload`` / ``offload-scratch`` with missing prerequisites is a hard
+  error, ``auto`` degrades with a log line.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import time
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from flliper.srt.server_args import ServerArgs
+
+# Only allocations at least this large are tagged. Large allocations receive
+# dedicated caching-allocator segments, which is what makes per-tag
+# pause/resume safe (a tagged segment hosts exactly one noted tensor); small
+# allocations would share segments across tags and stay resident instead.
+MIN_TAGGED_BYTES = 2 * 1024 * 1024
+
+# Headroom on top of a tag's measured physical footprint when deciding
+# whether a resume must reclaim allocator-cached segments first (covers
+# cu_mem 2 MiB granularity and mem_get_info jitter; NOT a tuning knob for
+# transient budgets -- those are the registered safety/tag posts).
+_RESUME_RECLAIM_HEADROOM_BYTES = 32 * (1 << 20)
+
+#: Swap-cost prior in ms, used before this rank has measured one of its own.
+#: Measured on boot fn8s4 (Qwen3.8 Next Flash 32k form, 2026-09-20): 1270
+#: swaps, mean 33.46 ms -- 38.9 ms for a resume (map ~494 MiB + zero it),
+#: 27.8 ms for a bare unmap. Against a ~38 ms decode round, one swap costs
+#: very nearly one whole round.
+_SWAP_MS_PRIOR = 33.5
+
+_MODES = ("auto", "resident", "offload", "offload-scratch")
+
+# Modes in which inactive states are physically unmapped (either stage).
+OFFLOAD_MODES = ("offload", "offload-scratch")
+
+# Process-wide active manager. One scheduler process owns at most one
+# AdaptiveController and therefore one manager; the flashinfer wrap sites
+# (tagged_state_alloc / note calls) and zero_flashinfer_workspaces reach it
+# through this module handle.
+_ACTIVE_MANAGER: Optional["AdaptiveGraphMemoryManager"] = None
+
+
+def _decode_graph_backend(server_args: "ServerArgs") -> str:
+    """The decode-phase cuda-graph backend selector, from server args only
+    (mirrors resolve_decode_backend without touching runtime flags, so it is
+    computable in the launcher process)."""
+    override = getattr(server_args, "cuda_graph_backend_decode", None)
+    if override:
+        return override
+    cfg = getattr(server_args, "cuda_graph_config", None)
+    decode = getattr(cfg, "decode", None)
+    return getattr(decode, "backend", None) or "full"
+
+
+def resolve_adaptive_graph_memory_mode(server_args: "ServerArgs") -> str:
+    """Resolve {auto,resident,offload,offload-scratch} ->
+    {resident,offload,offload-scratch}.
+
+    Must be computable identically in the launcher process (which decides
+    whether to spawn schedulers with the torch_memory_saver LD_PRELOAD hook)
+    and in the scheduler process (which builds the manager), so it only looks
+    at server args, imports, and inherited environment -- never CUDA state.
+    """
+    requested = getattr(server_args, "speculative_adaptive_graph_memory", "auto")
+    if requested not in _MODES:
+        raise ValueError(
+            f"speculative_adaptive_graph_memory must be one of {_MODES}, "
+            f"got {requested!r}"
+        )
+    # T156 stage 2: --speculative-cross-algorithm keeps an INACTIVE algorithm
+    # rung resident; its graph set is offloadable through the same manager
+    # even when the k-ladder controller (speculative_adaptive) is off, so the
+    # cross gate is offload-eligible on its own. The launcher uses this same
+    # resolution to decide the torch_memory_saver LD_PRELOAD hook.
+    if not server_args.speculative_adaptive and not getattr(
+        server_args, "speculative_cross_algorithm", False
+    ):
+        return "resident"
+    if requested == "resident":
+        return "resident"
+
+    def _fail_or_resident(reason: str) -> str:
+        if requested in OFFLOAD_MODES:
+            raise ValueError(
+                f"--speculative-adaptive-graph-memory {requested} is not "
+                f"usable: {reason}. Use 'resident' (all states stay "
+                "materialized in VRAM) or fix the prerequisite."
+            )
+        logger.info("Adaptive graph memory: auto-resolving to 'resident' (%s).", reason)
+        return "resident"
+
+    if server_args.device not in (None, "cuda"):
+        return _fail_or_resident(f"device={server_args.device} is not CUDA")
+    # The offload wrap sites live in the flashinfer backend; other attention
+    # backends would yield zero tagged bytes (silent no-op), so require it.
+    attn_backend = (
+        server_args.attention_backend
+        or server_args.decode_attention_backend
+        or "flashinfer"
+    )
+    if attn_backend != "flashinfer":
+        return _fail_or_resident(
+            f"attention backend {attn_backend!r} has no offload wrap sites "
+            "(flashinfer required)"
+        )
+    if "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+        return _fail_or_resident(
+            "PYTORCH_CUDA_ALLOC_CONF expandable_segments is incompatible with "
+            "torch_memory_saver"
+        )
+    try:
+        import torch_memory_saver  # noqa: F401
+    except ImportError as e:
+        return _fail_or_resident(f"torch_memory_saver is not importable ({e})")
+    if requested == "offload-scratch":
+        return "offload-scratch"
+
+    # Stage-2 (capture-pool) prerequisites. When only these fail, 'auto'
+    # degrades to Stage-1 offload-scratch rather than resident.
+    def _fail_or_scratch(reason: str) -> str:
+        if requested == "offload":
+            raise ValueError(
+                "--speculative-adaptive-graph-memory offload (Stage 2, "
+                f"capture-pool offload) is not usable: {reason}. Use "
+                "'offload-scratch' (Stage 1: scratch-only offload) or "
+                "'resident', or fix the prerequisite."
+            )
+        logger.info(
+            "Adaptive graph memory: auto-resolving to 'offload-scratch' (%s).",
+            reason,
+        )
+        return "offload-scratch"
+
+    decode_backend = _decode_graph_backend(server_args)
+    if decode_backend not in ("full", "disabled"):
+        return _fail_or_scratch(
+            f"decode cuda-graph backend {decode_backend!r} has no per-state "
+            "capture-pool routing (backend 'full' required)"
+        )
+    from flliper.srt.environ import envs
+
+    if envs.FLLIPER_MEMORY_SAVER_CUDA_GRAPH.get():
+        return _fail_or_scratch(
+            "FLLIPER_MEMORY_SAVER_CUDA_GRAPH already routes captures through "
+            "its own memory-saver tag"
+        )
+    return "offload"
+
+
+# ----------------------------------------------------------------------
+# Reserve demand of the ladder itself (#313)
+# ----------------------------------------------------------------------
+
+
+def plan_residency(
+    target: Optional[str],
+    resident: Sequence[str],
+    sizes: Mapping[str, int],
+    budget_bytes: int,
+    max_resident: int = 0,
+) -> list[str]:
+    """Tags to unmap so *target* can be mapped, keeping the rest resident.
+
+    The swap path used to pause the outgoing state unconditionally before
+    resuming the incoming one.  That is only *necessary* when the incoming
+    state needs the outgoing one's pages; charging it on every activation made
+    the common case -- alternating between two states that both fit -- cost two
+    unmap/map cycles per alternation for no memory benefit at all.
+
+    Measured on boot fn8s4 (Qwen3.8 Next Flash, 32k form, 2026-09-20): of 1270
+    swaps, 630 had ``target=<baseline>``, i.e. they unmapped a tagged state to
+    make room for the *untagged* baseline -- which needs no room whatsoever.
+    Those 630 cost 17.5 s (mean 27.8 ms) and freed memory nobody asked for; the
+    631 swaps back then paid another 24.5 s to map exactly what had just been
+    unmapped.  All three states together are 1478 MiB and the tightest rank had
+    3535 MiB free with everything paused.
+
+    So residency is a budget question, not a one-at-a-time invariant:
+
+    * ``target=None`` (the untagged baseline) evicts nothing -- it is always
+      mapped and consumes no tagged budget.
+    * A target already resident evicts nothing.
+    * Otherwise evict, in the caller's order (least-recently-used first), only
+      until the target fits.
+
+    *budget_bytes* is the measured envelope from ``finalize_boot``: device-free
+    with every state paused, minus the serving-transient margin.  It is not a
+    new reserve -- the boot check already proves that much memory is free and
+    that a mapped state may occupy it; this only declines to hand it back.
+
+    *max_resident* (> 0) additionally caps the COUNT of mapped tagged states
+    at that number, target included -- ``1`` is #93/#102's original rule
+    "reserve max(one state), not sum".  The budget alone is measured once, at
+    ``finalize_boot``; it cannot see memory taken later by anything that is
+    not a ladder state.  fnFA25/26/27 (Form A, 2026-09-20) died identically
+    on it: swap #2 kept k1 AND k2 mapped (budget said both fit), and the next
+    prefill's GDN chunk transient found 82 MiB free on the 5090.  Under a
+    Weg-2 flip the boot-time reading is staler still: the card changes hands
+    between P and D every flip.
+
+    Returns the tags to unmap, in eviction order.  Never evicts *target*.
+    """
+    resident_list = [t for t in resident if t != target]
+    if target is None:
+        return []
+    need = int(sizes.get(target, 0))
+    if need <= 0:
+        return []
+    budget = int(budget_bytes)
+    used = sum(int(sizes.get(t, 0)) for t in resident_list)
+    cap = int(max_resident) if max_resident and int(max_resident) > 0 else None
+    evict: list[str] = []
+    kept = len(resident_list)
+    for tag in resident_list:
+        over_budget = used + need > budget
+        over_count = cap is not None and kept + 1 > cap
+        if not over_budget and not over_count:
+            break
+        evict.append(tag)
+        used -= int(sizes.get(tag, 0))
+        kept -= 1
+    return evict
+
+
+@dataclass(frozen=True)
+class LadderRungPost:
+    """Estimated pauseable VRAM of ONE ladder rung, itemized.
+
+    The two items are the only ones an operator-visible constant already
+    covers, and they are the two that dominate the measured decomposition
+    (T102, k5: scratch 424 MiB of which 384 is the workspace, int-ws 184,
+    capture pool 352):
+
+    * ``workspace_mib`` -- the rung's PRIVATE flashinfer float workspace
+      (``init_new_workspace=True``), sized by
+      ``FLLIPER_FLASHINFER_WORKSPACE_SIZE``. One per rung: the draft and
+      target backends of a rung share the registered buffer.
+    * ``capture_mib`` -- the rung's captured tokens at the #68 coefficient
+      of 2 MiB per captured token, i.e. the same graph-memory model
+      ``derived_rank_auto_reserve_mib`` charges for the boot rung, applied
+      at this rung's draft-token width.
+
+    NOT itemized, deliberately: the per-rung int workspaces (8 MiB per
+    (backend, role, wrapper-slot), a count that only exists once the
+    backends are built) and the kv_indices / custom_mask buffers. Adding
+    them would mean reverse-engineering constants from two measurements,
+    which is the defect ``pinned_reserve_shortfall_note`` exists to expose.
+    The estimate is therefore a FLOOR of the true rung footprint; what
+    lifts the total over the observed need is the serving margin, which is
+    charged once on top (see LadderReserveDemand).
+    """
+
+    rung: int
+    workspace_mib: int
+    capture_mib: int
+    #: MiB per captured token this post was priced at. The inherited value is
+    #: the literal 2 (#68); a calibrated rig supplies a measured coefficient
+    #: instead. Recorded per post so a ledger line can say which it used.
+    mib_per_captured_token: float = 2.0
+    #: True when ``mib_per_captured_token`` came from a measurement. False
+    #: means the post carries the inherited estimate, which the 2026-08-05
+    #: window measured 3.3-3.8x LOW -- an under-charge, i.e. the direction
+    #: that OOMs. A caller that must not under-charge has to check this.
+    measured: bool = False
+
+    @property
+    def total_mib(self) -> int:
+        return self.workspace_mib + self.capture_mib
+
+
+@dataclass(frozen=True)
+class LadderReserveDemand:
+    """What the adaptive ladder itself needs on top of the boot rung.
+
+    ``posts`` covers the rungs the controller BUILDS, i.e. the candidate
+    set minus the boot rung: the boot rung's graph set is the statically
+    registered one that ``derived_rank_auto_reserve_mib`` already charges
+    through its captured-token term, so charging it again here would
+    double-count it.
+
+    The reduction rule follows the mode's reserve rule (see the module
+    docstring): offload maps at most ONE built rung at a time and
+    ``finalize_boot`` additionally demands the serving margin on top of it,
+    so the demand is max(rung) + margin; resident keeps every built rung
+    materialized, so it is the sum and there is no boot-time margin check.
+    """
+
+    posts: tuple
+    boot_rung: int
+    margin_mib: int
+    resident: bool
+
+    @property
+    def estimate_only(self) -> bool:
+        """True when ANY post was priced at the inherited 2 MiB/token rather
+        than a measured coefficient.
+
+        The ledger refuses on this: an estimate-only ladder demand is an
+        under-charge of unknown size in the direction that OOMs. The legacy
+        reserve path keeps using it, unchanged, and says so.
+        """
+        return any(not p.measured for p in self.posts)
+
+    @property
+    def peak(self) -> Optional[LadderRungPost]:
+        return max(self.posts, key=lambda p: p.total_mib) if self.posts else None
+
+    @property
+    def total_mib(self) -> int:
+        if not self.posts:
+            return 0
+        if self.resident:
+            return sum(p.total_mib for p in self.posts) + self.margin_mib
+        peak = self.peak
+        return peak.total_mib + self.margin_mib
+
+    def ledger(self) -> str:
+        """One-line itemization, #260 style: every post named with its
+        number, so the log says WHY the reserve grew and by how much."""
+        if not self.posts:
+            return "adaptive ladder: no rung beyond the boot rung, +0 MiB"
+        rungs = ", ".join(f"k{p.rung}={p.total_mib}" for p in self.posts)
+        if self.resident:
+            body = (
+                f"sum of all built rungs ({rungs}) "
+                f"= {sum(p.total_mib for p in self.posts)} MiB"
+            )
+        else:
+            peak = self.peak
+            body = (
+                f"peak built rung k{peak.rung} = {peak.total_mib} MiB "
+                f"(flashinfer workspace {peak.workspace_mib} + graph capture "
+                f"{peak.capture_mib}); other built rungs {rungs}"
+            )
+        return (
+            f"adaptive ladder: +{self.total_mib} MiB = {body} + serving "
+            f"margin {self.margin_mib} MiB "
+            f"(FLLIPER_ADAPTIVE_SERVING_MARGIN_MIB); boot rung k{self.boot_rung} "
+            "is already charged by the captured-token term"
+        )
+
+
+def estimate_ladder_reserve_demand(
+    server_args: ServerArgs,
+    colocated_ranks: int = 1,
+    capture_mib_per_token: Optional[float] = None,
+) -> Optional[LadderReserveDemand]:
+    """The ladder's own reserve demand, or None when there is no ladder.
+
+    Called from the sizing path (``--rank-auto-reserve-mib auto``, #68)
+    BEFORE any GPU work, so it may only read server args and environment --
+    the same constraint ``resolve_adaptive_graph_memory_mode`` runs under.
+
+    The mode is read from the REQUESTED flag rather than resolved: the
+    resolution depends on args that are still unset this early (the
+    attention backend most of all), and reading it here would make the
+    reserve depend on argument-handler ordering. 'auto' is modelled as
+    offload, the mode it reaches whenever its prerequisites hold; a boot
+    that degrades to resident gets a demand that UNDERSTATES the sum rule,
+    which is the pre-#313 situation (ladder charged nothing at all) and
+    never a regression against it.
+    """
+    if not getattr(server_args, "speculative_adaptive", False):
+        return None
+    from flliper.srt.speculative.adaptive_spec_params import (
+        adaptive_algorithm_key,
+        resolve_candidate_steps_from_config,
+    )
+
+    rungs = resolve_candidate_steps_from_config(
+        cfg_path=server_args.speculative_adaptive_config,
+        algorithm=adaptive_algorithm_key(server_args),
+    )
+    boot_rung = int(server_args.speculative_num_steps or 0)
+    built = [k for k in rungs if k != boot_rung]
+    if not built:
+        return None
+
+    from flliper.srt.environ import envs
+
+    workspace_mib = envs.FLLIPER_FLASHINFER_WORKSPACE_SIZE.get() >> 20
+    if getattr(server_args, "enable_deterministic_inference", False):
+        # The flashinfer backend raises the workspace to 2 GiB for
+        # deterministic inference (it calls envs...set() at backend init,
+        # i.e. long after this estimate); mirror the same rule here so the
+        # reserve does not silently miss 1.6 GiB per rung.
+        workspace_mib = max(workspace_mib, 2048)
+    # #586: price the rung's capture pool at a MEASURED MiB-per-captured-token
+    # coefficient when the rig has one. The inherited literal 2 (#68) was
+    # measured 3.3-3.8x low on 2026-08-05, and every rung inherits that error.
+    # When nothing is calibrated the literal stands -- the legacy reserve path
+    # must keep booting -- but the post is marked estimate-only so the ledger
+    # can refuse rather than silently carry an under-charge.
+    coefficient = float(capture_mib_per_token) if capture_mib_per_token else 2.0
+    measured = bool(capture_mib_per_token)
+    posts = tuple(
+        LadderRungPost(
+            rung=k,
+            workspace_mib=workspace_mib,
+            capture_mib=int(
+                math.ceil(
+                    server_args.speculative_capture_tokens(num_draft_tokens=k + 1)
+                    * coefficient
+                    * colocated_ranks
+                )
+            ),
+            mib_per_captured_token=coefficient,
+            measured=measured,
+        )
+        for k in built
+    )
+    resident = (
+        getattr(server_args, "speculative_adaptive_graph_memory", "auto") == "resident"
+    )
+    margin_mib = 0 if resident else envs.FLLIPER_ADAPTIVE_SERVING_MARGIN_MIB.get()
+    return LadderReserveDemand(
+        posts=posts,
+        boot_rung=boot_rung,
+        margin_mib=margin_mib,
+        resident=resident,
+    )
+
+
+@dataclass
+class _StateRecord:
+    tag: str
+    steps: "int | tuple"  # rung key: k-ladder int or (algorithm, k) tuple
+    tensors: list = field(default_factory=list)
+    # Parallel to `tensors`: what each noted tensor is ("scratch" Stage-1
+    # buffers, "int_ws" flashinfer int workspaces) -- for the itemized logs.
+    tensor_kinds: list = field(default_factory=list)
+    # [start, end) virtual-address ranges of allocator segments that appeared
+    # during this state's build window (for the finalize_boot audit).
+    segment_ranges: list = field(default_factory=list)
+    # Free-memory delta released by pause_after_build (page-granular; covers
+    # noted tensors AND the state's private capture pool). 0 = not measured.
+    paused_bytes: int = 0
+    # Stage-2 shared int workspaces: {share_key: tensor}. Per-batch-bucket
+    # graph-mode flashinfer wrappers are mutually exclusive per forward (one
+    # bucket replays per forward, and its plan rewrites the workspace right
+    # before), so all buckets of one (backend, role, wrapper-slot) share ONE
+    # tagged buffer instead of 12 -- this cut k5's int-ws bytes ~4x, which
+    # is what makes the high-accept set fit the standard reserve.
+    shared_tensors: dict = field(default_factory=dict)
+
+    @property
+    def nbytes(self) -> int:
+        return sum(t.untyped_storage().nbytes() for t in self.tensors)
+
+    def kind_nbytes(self, kind: str) -> int:
+        return sum(
+            t.untyped_storage().nbytes()
+            for t, k in zip(self.tensors, self.tensor_kinds)
+            if k == kind
+        )
+
+    @property
+    def footprint_bytes(self) -> int:
+        """Best-known pauseable footprint (measured when available)."""
+        return self.paused_bytes or self.nbytes
+
+
+def _snapshot_segment_addrs() -> dict[int, int]:
+    """{segment start address: total size} from the caching allocator."""
+    out = {}
+    try:
+        for seg in torch.cuda.memory_snapshot():
+            addr = seg.get("address")
+            size = seg.get("total_size")
+            if addr is not None and size:
+                out[addr] = size
+    except Exception:  # pragma: no cover - snapshot is diagnostics-only
+        logger.warning("torch.cuda.memory_snapshot failed", exc_info=True)
+    return out
+
+
+class AdaptiveGraphMemoryManager:
+    """Owns the per-k-state tagged memory and the pause/resume swap path.
+
+    In ``resident`` mode every method is a cheap no-op, preserving the
+    pre-existing behavior bit-for-bit (states stay materialized, activation
+    is a pure pointer swap in the worker).
+    """
+
+    #: Cap on mapped tagged states (0 = budget only); class default so a
+    #: manager built without __init__ (tests) reads the pre-H27 behaviour.
+    _max_resident: int = 0
+
+    def __init__(self, mode: str, tp_cpu_group=None, server_args=None):
+        assert mode in ("resident",) + OFFLOAD_MODES, mode
+        self.mode = mode
+        # Optional, diagnostics only: lets the boot reserve check name the
+        # DERIVED demand for this rank instead of only the shortfall (#313).
+        self._server_args = server_args
+        self._states: dict[str, _StateRecord] = {}
+        self._pools: dict[str, "torch.cuda.MemPool"] = {}
+        # Stage 2: per-tag PRIVATE cuda-graph capture pools (graph_pool_handle
+        # tokens). Private per tag for the same reason as the MemPools above:
+        # pause(tag) unmaps a tag's segments wholesale, so no other tag may
+        # ever be served from their free space.
+        self._capture_pools: dict[str, object] = {}
+        self._paused: set[str] = set()
+        self._resumed_tag: Optional[str] = None  # at most one built tag mapped
+        self._build_tag: Optional[str] = None
+        self._in_capture_region = False
+        self._pre_build_segments: Optional[dict[int, int]] = None
+        self._finalized = False
+        self._swap_ordinal = 0
+        #: Counts EVERY activation, swap or not. The rank-sync payload uses
+        #: this, never _swap_ordinal: with budget-driven residency the swap
+        #: count legitimately differs per rank (the ranks have different
+        #: amounts of free memory -- 3535/4001/5720 MiB on the fn8s4 rig), so
+        #: comparing swap counts would report divergence where there is none.
+        self._activation_ordinal = 0
+        #: Tags currently mapped, least-recently-activated first.
+        self._resident: list[str] = []
+        #: Bytes of mapped tagged state this rank may hold at once. Measured in
+        #: finalize_boot; 0 until then, which reproduces the strict
+        #: one-state-at-a-time behaviour during the build phase.
+        self._resident_budget_bytes = 0
+        # fnFL2 H27: cap on the number of mapped tagged states (0 = the
+        # budget alone decides); see plan_residency.
+        from flliper.srt.environ import envs as _envs
+
+        self._max_resident = max(
+            0, int(_envs.FLLIPER_ADAPTIVE_GRAPH_MEMORY_MAX_RESIDENT.get())
+        )
+        self.last_swap_ms: Optional[float] = None
+        #: Duration of the last activation that actually did driver work.
+        #: Distinct from last_swap_ms, which is 0.0 after a free activation.
+        self._last_real_swap_ms: Optional[float] = None
+        self._tp_cpu_group = tp_cpu_group
+        self._adapter = None
+        if self.offload_enabled:
+            ld_preload = os.environ.get("LD_PRELOAD", "")
+            if "torch_memory_saver" not in ld_preload:
+                raise RuntimeError(
+                    "Adaptive graph-memory offload requires the "
+                    "torch_memory_saver preload hook, but LD_PRELOAD does not "
+                    "contain it. The flliper launcher injects it automatically "
+                    "when the offload mode resolves before scheduler spawn; "
+                    "for direct scheduler runs set LD_PRELOAD to the "
+                    "torch_memory_saver_hook_mode_preload library, or use "
+                    "--speculative-adaptive-graph-memory resident."
+                )
+            from flliper.srt.utils.torch_memory_saver_adapter import (
+                TorchMemorySaverAdapter,
+            )
+
+            self._adapter = TorchMemorySaverAdapter.create(enable=True)
+
+        global _ACTIVE_MANAGER
+        _ACTIVE_MANAGER = self
+
+    @property
+    def offload_enabled(self) -> bool:
+        """True for both offload stages (inactive states are unmapped)."""
+        return self.mode in OFFLOAD_MODES
+
+    @property
+    def capture_offload(self) -> bool:
+        """True when Stage 2 (per-state capture pools) is active."""
+        return self.mode == "offload"
+
+    # ------------------------------------------------------------------
+    # Build phase
+    # ------------------------------------------------------------------
+    @staticmethod
+    def tag_for_steps(steps) -> str:
+        """Tag for a rung key.
+
+        The key is an ``int`` for the classic k-ladder (tag unchanged:
+        ``adaptive_state_k<k>``) or a ``(algorithm, k)`` tuple for a
+        cross-algorithm rung (T156 stage 2), e.g. ``("DFLASH", 16)`` ->
+        ``adaptive_state_DFLASH_k16``. Kept under the historical name so the
+        existing k-ladder call sites and tests stay untouched.
+        """
+        if isinstance(steps, tuple):
+            algo, k = steps
+            return f"adaptive_state_{algo}_k{k}"
+        return f"adaptive_state_k{steps}"
+
+    @contextmanager
+    def build_state(self, steps):
+        """Scope one candidate state's build. Wrap sites tag allocations
+        only while a build scope is active (static-path init never is)."""
+        if not self.offload_enabled:
+            yield
+            return
+        tag = self.tag_for_steps(steps)
+        assert self._build_tag is None, "nested adaptive state builds"
+        assert tag not in self._states, f"state {tag} built twice"
+        rec = _StateRecord(tag=tag, steps=steps)
+        self._states[tag] = rec
+        self._pre_build_segments = _snapshot_segment_addrs()
+        self._build_tag = tag
+        try:
+            yield
+        finally:
+            self._build_tag = None
+            post = _snapshot_segment_addrs()
+            pre = self._pre_build_segments or {}
+            self._pre_build_segments = None
+            rec.segment_ranges = [
+                (addr, addr + size) for addr, size in post.items() if addr not in pre
+            ]
+        logger.info(
+            "Adaptive graph memory: built %s, tagged %.1f MiB in %d buffers",
+            tag,
+            rec.nbytes / (1 << 20),
+            len(rec.tensors),
+        )
+
+    @contextmanager
+    def _tagged_region(self):
+        if not self.offload_enabled or self._build_tag is None:
+            yield
+            return
+        if self._in_capture_region:
+            # Already inside the capture-wide region_config for this tag
+            # (Stage 2): allocations are routed to the tag's capture pool and
+            # tagged by the ambient region; nesting region_config would trip
+            # its non-reentrancy assert.
+            yield
+            return
+        # One private MemPool PER TAG -- a hard correctness requirement, not
+        # an optimization. pause(tag) unmaps a tag's segments wholesale,
+        # including their free tails, and the caching allocator packs
+        # 1-10 MiB allocations into shared 20 MiB segments (kLargeBuffer)
+        # and serves any sufficiently large free block regardless of which
+        # region entry created the segment. With a single shared pool, one
+        # tag's allocation can land in another (already paused) tag's
+        # segment tail -> illegal memory access on first touch (observed
+        # live: state k2's multistep kv_indices landed in paused k4's 20 MiB
+        # segment at 0x208af00000). Per-tag pools make cross-tag free-list
+        # reuse structurally impossible: a tag's free space is only visible
+        # to allocations of that same tag, which happen only during its own
+        # build. The pools stay alive for the process lifetime.
+        tag = self._build_tag
+        pool = self._pools.get(tag)
+        if pool is None:
+            pool = self._pools[tag] = torch.cuda.MemPool()
+        with torch.cuda.use_mem_pool(pool):
+            with self._adapter.region_config(tag=tag):
+                yield
+
+    def note_tensor(self, t: Optional[torch.Tensor], kind: str = "scratch") -> None:
+        if not self.offload_enabled or self._build_tag is None or t is None:
+            return
+        if os.environ.get("FLLIPER_ADAPTIVE_ALIAS_DEBUG"):
+            logger.info(
+                "AGM-DEBUG note %s ptr=0x%x nbytes=%d kind=%s",
+                self._build_tag,
+                t.data_ptr(),
+                t.untyped_storage().nbytes(),
+                kind,
+            )
+        rec = self._states[self._build_tag]
+        rec.tensors.append(t)
+        rec.tensor_kinds.append(kind)
+
+    def get_shared_state_tensor(self, share_key) -> Optional[torch.Tensor]:
+        """The already-allocated shared tensor for *share_key* in the state
+        being built, or None. See _StateRecord.shared_tensors."""
+        if not self.offload_enabled or self._build_tag is None:
+            return None
+        return self._states[self._build_tag].shared_tensors.get(share_key)
+
+    def put_shared_state_tensor(self, share_key, t: torch.Tensor) -> None:
+        if not self.offload_enabled or self._build_tag is None:
+            return
+        self._states[self._build_tag].shared_tensors[share_key] = t
+
+    # ------------------------------------------------------------------
+    # Stage 2: per-state capture pools
+    # ------------------------------------------------------------------
+    def capture_pool_for_build(self):
+        """The private cuda-graph capture pool of the state being built, or
+        None outside a Stage-2 build scope. Consumed by the graph backend's
+        capture_session so every capture of this state's runners lands in the
+        state's own (pauseable) pool instead of the shared global pool."""
+        if not self.capture_offload or self._build_tag is None:
+            return None
+        tag = self._build_tag
+        pool = self._capture_pools.get(tag)
+        if pool is None:
+            pool = self._capture_pools[tag] = torch.cuda.graph_pool_handle()
+        return pool
+
+    @contextmanager
+    def capture_graph(self, default_graph_ctx, *, cuda_graph, pool, stream):
+        """Wrap one graph capture. Outside a Stage-2 build scope this defers
+        to *default_graph_ctx* untouched. Inside, the capture runs against
+        the state's private pool with the tag's torch_memory_saver region
+        active, so capture-time segment allocations (cudaMalloc from the
+        caching allocator growing the capture pool) become pauseable with
+        the state -- the same mechanism as TorchMemorySaver.cuda_graph.
+
+        NOTE (content contract): no re-init happens for capture-pool memory
+        on resume. A replay re-executes the full captured kernel DAG, so
+        every capture-pool tensor a kernel reads was written earlier in the
+        SAME replay (graph inputs live in the resident IO buffers, persistent
+        kernel workspaces in the tagged-and-zeroed float/int workspaces).
+        FLLIPER_ADAPTIVE_CAPTURE_CPU_BACKUP=1 switches to exact byte
+        restoration through host RAM instead (fallback falsifier knob).
+        """
+        tag = self._build_tag
+        if not self.capture_offload or tag is None:
+            with default_graph_ctx(cuda_graph=cuda_graph, pool=pool, stream=stream):
+                yield
+            return
+        assert pool == self._capture_pools.get(tag), (
+            "Stage-2 capture must use the build tag's private pool "
+            "(capture_session did not pick up capture_pool_for_build)"
+        )
+        from flliper.srt.environ import envs
+
+        cpu_backup = envs.FLLIPER_ADAPTIVE_CAPTURE_CPU_BACKUP.get()
+        with torch.cuda.graph(cuda_graph, pool=pool, stream=stream):
+            with self._adapter.region_config(tag=tag, enable_cpu_backup=cpu_backup):
+                self._in_capture_region = True
+                try:
+                    yield
+                finally:
+                    self._in_capture_region = False
+
+    def pause_after_build(self, steps) -> None:
+        """Pause a freshly built state so boot peak stays ~one state."""
+        if not self.offload_enabled:
+            return
+        tag = self.tag_for_steps(steps)
+        rec = self._states.get(tag)
+        if rec is None or (not rec.tensors and tag not in self._capture_pools):
+            return
+        torch.cuda.synchronize()
+        # Return freed temp segments to the driver between builds.
+        torch.cuda.empty_cache()
+        if os.environ.get("FLLIPER_ADAPTIVE_ALIAS_DEBUG"):
+            logger.info(
+                "AGM-DEBUG pause %s segments=%s tensors=%s",
+                tag,
+                [(hex(lo), hex(hi)) for lo, hi in rec.segment_ranges],
+                [
+                    (hex(t.data_ptr()), t.untyped_storage().nbytes())
+                    for t in rec.tensors
+                ],
+            )
+        free_before, _ = torch.cuda.mem_get_info()
+        self._adapter.pause(tag)
+        self._paused.add(tag)
+        free_after, _ = torch.cuda.mem_get_info()
+        # Page-granular measured footprint of everything the tag unmaps
+        # (noted tensors AND the Stage-2 capture pool). Drives the boot
+        # reserve check and the itemized residue accounting.
+        rec.paused_bytes = max(0, free_after - free_before)
+        scratch = rec.kind_nbytes("scratch")
+        int_ws = rec.kind_nbytes("int_ws")
+        logger.info(
+            "Adaptive graph memory: paused %s, released %.1f MiB "
+            "(scratch %.1f MiB, int workspaces %.1f MiB, capture pool "
+            "~%.1f MiB)",
+            tag,
+            rec.paused_bytes / (1 << 20),
+            scratch / (1 << 20),
+            int_ws / (1 << 20),
+            max(0, rec.paused_bytes - scratch - int_ws) / (1 << 20),
+        )
+
+    # ------------------------------------------------------------------
+    # Boot finalize: audit + max-state reserve guarantee
+    # ------------------------------------------------------------------
+    def finalize_boot(self, initial_steps: int) -> None:
+        """Audit tag/segment isolation, verify the max-state reserve, and
+        bring the initial state up. Idempotence not needed (called once)."""
+        if not self.offload_enabled:
+            return
+        self._audit_segment_isolation()
+
+        # Pause anything still mapped (defensive; builds already pause).
+        for tag, rec in self._states.items():
+            if tag not in self._paused and (rec.tensors or tag in self._capture_pools):
+                torch.cuda.synchronize()
+                self._adapter.pause(tag)
+                self._paused.add(tag)
+
+        sizes = {
+            t: r.footprint_bytes
+            for t, r in self._states.items()
+            if r.tensors or t in self._capture_pools
+        }
+        max_tag, max_bytes = (
+            max(sizes.items(), key=lambda kv: kv[1]) if sizes else (None, 0)
+        )
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        logger.info(
+            "Adaptive graph memory (%s): states=%s; reserve rule "
+            "max(one state)=%.1f MiB (resident mode would keep the sum "
+            "%.1f MiB mapped); free after pausing all states: %.1f MiB",
+            self.mode,
+            {t: f"{b / (1 << 20):.1f} MiB" for t, b in sizes.items()},
+            max_bytes / (1 << 20),
+            sum(sizes.values()) / (1 << 20),
+            free_bytes / (1 << 20),
+        )
+        # No-OOM guarantee, two terms:
+        # 1. Swap term (max_bytes): with every built state unmapped, the
+        #    driver must be able to back the largest one. At most one built
+        #    state is ever resumed and pause precedes resume on every swap;
+        #    additionally ensure_active reclaims allocator-cached transient
+        #    segments before each resume (_reclaim_driver_free_for_resume)
+        #    -- without that reclaim, serving transients retained by the
+        #    caching allocator erode driver-free below this boot-time level
+        #    and a later resume dies in cu_mem_create.
+        # 2. Serving-margin term: forwards run WHILE a state is mapped, and
+        #    the eager paths (mamba chunked-prefill recompute etc.) allocate
+        #    transient tensors from the same free pool. Measured on the T102
+        #    rig: 1367 MiB of post-map free memory survived KV-full deep
+        #    prefill (T93 stage-1), 148 MiB OOM'd in fla/wy_fast
+        #    recompute_w_u_fwd. Without this term the boot "succeeds" into a
+        #    guaranteed runtime OOM; with it, an under-reserved config fails
+        #    fast here with the measured numbers.
+        from flliper.srt.environ import envs
+
+        margin_bytes = envs.FLLIPER_ADAPTIVE_SERVING_MARGIN_MIB.get() << 20
+        if free_bytes < max_bytes + margin_bytes:
+            shortfall_mib = int(
+                math.ceil((max_bytes + margin_bytes - free_bytes) / (1 << 20))
+            )
+            raise RuntimeError(
+                "Adaptive graph memory offload: free device memory with all "
+                f"candidate states paused ({free_bytes / (1 << 20):.0f} MiB) "
+                "is below the largest state's mapped footprint "
+                f"({max_bytes / (1 << 20):.0f} MiB, {max_tag}) plus the "
+                f"serving transient margin ({margin_bytes / (1 << 20):.0f} "
+                "MiB, FLLIPER_ADAPTIVE_SERVING_MARGIN_MIB). Serving with that "
+                "state mapped would leave "
+                f"{max(0, free_bytes - max_bytes) / (1 << 20):.0f} MiB for "
+                "eager-forward transients -> late runtime OOM instead of "
+                "this early error. Increase the graph/KV reserve by at least "
+                f"{shortfall_mib} MiB, shrink the candidate set, or use "
+                "--speculative-adaptive-graph-memory resident."
+                + self._reserve_suggestion(shortfall_mib)
+            )
+        # Residency budget: the memory this check just PROVED is free and
+        # usable by a mapped state, less the serving-transient margin it
+        # reserved for eager forwards. Holding more than one state inside this
+        # envelope adds no risk the check did not already accept -- the
+        # guarantee is "free_bytes >= <mapped states> + margin", and it is
+        # satisfied for any subset of states whose sum fits here. This is not a
+        # new reserve: nothing is set aside, memory already measured free is
+        # simply not handed back and re-taken every round.
+        self._resident_budget_bytes = max(0, free_bytes - margin_bytes)
+        self._resident = []
+        fits_all = sum(sizes.values()) <= self._resident_budget_bytes and (
+            self._max_resident <= 0 or len(sizes) <= self._max_resident
+        )
+        if self._max_resident > 0:
+            logger.info(
+                "Adaptive graph memory: at most %d tagged state(s) mapped at "
+                "once (FLLIPER_ADAPTIVE_GRAPH_MEMORY_MAX_RESIDENT) -- reserve "
+                "max(one state)=%.1f MiB, not the budget's sum",
+                self._max_resident,
+                max_bytes / (1 << 20),
+            )
+        logger.info(
+            "Adaptive graph memory: residency budget %.1f MiB (free %.1f - "
+            "margin %.1f); all %d state(s) sum to %.1f MiB -> %s",
+            self._resident_budget_bytes / (1 << 20),
+            free_bytes / (1 << 20),
+            margin_bytes / (1 << 20),
+            len(sizes),
+            sum(sizes.values()) / (1 << 20),
+            (
+                "every state stays mapped, swaps only on eviction pressure"
+                if fits_all
+                else "least-recently-used states are evicted on demand"
+            ),
+        )
+        self._finalized = True
+        # Map the initial state (a registered baseline has no tag and needs
+        # no resume; a BUILT initial state does).
+        self.ensure_active(initial_steps)
+
+    def _reserve_suggestion(self, shortfall_mib: int) -> str:
+        """Trailing sentence for the boot reserve error that names the
+        DERIVED reserve demand of this rank, or "" when it is not knowable
+        here (#313). Never raises: a diagnostic must not replace the error
+        it decorates."""
+        if self._server_args is None:
+            return ""
+        try:
+            from flliper.srt.distributed import get_tensor_model_parallel_rank
+
+            tp_rank = get_tensor_model_parallel_rank()
+        except Exception:  # pragma: no cover - no process group in unit tests
+            tp_rank = None
+        try:
+            note = self._server_args.ladder_reserve_boot_suggestion(
+                shortfall_mib, tp_rank
+            )
+        except Exception as e:  # pragma: no cover - advisory only
+            logger.debug("Could not build the reserve suggestion: %s", e)
+            return ""
+        return f" {note}" if note else ""
+
+    def _audit_segment_isolation(self) -> None:
+        """Every noted tensor must live in a segment created during its own
+        tag's build window (G4-evolution physical-isolation audit).
+
+        Only windows whose segments STILL exist participate: a segment freed
+        after a build (empty_cache between builds) can have its virtual range
+        recycled by a later build, which must not count as cross-tag
+        placement."""
+        live = _snapshot_segment_addrs()
+        live_ranges = {
+            tag: [(lo, hi) for lo, hi in rec.segment_ranges if live.get(lo) == hi - lo]
+            for tag, rec in self._states.items()
+        }
+        for tag, rec in self._states.items():
+            for t in rec.tensors:
+                ptr = t.data_ptr()
+                home = None
+                for other_tag, ranges in live_ranges.items():
+                    if any(lo <= ptr < hi for lo, hi in ranges):
+                        home = other_tag
+                        break
+                if home is not None and home != tag:
+                    raise RuntimeError(
+                        "Adaptive graph memory offload: tagged buffer of "
+                        f"{tag} (ptr 0x{ptr:x}, {t.untyped_storage().nbytes()}"
+                        f" bytes) lies in a segment created during {home}'s "
+                        "build window. Pausing one state would unmap another "
+                        "state's memory. This is a bug in the tagged-alloc "
+                        "wrap sites; falling back to "
+                        "--speculative-adaptive-graph-memory resident is safe."
+                    )
+                if home is None:
+                    # Not fatal by itself (snapshot attribution can miss a
+                    # segment) but worth surfacing: the disjointness proof
+                    # does not cover this tensor.
+                    logger.warning(
+                        "Adaptive graph memory: could not attribute tagged "
+                        "buffer of %s (ptr 0x%x) to a build-window segment; "
+                        "physical-isolation audit incomplete for it.",
+                        tag,
+                        ptr,
+                    )
+
+    # ------------------------------------------------------------------
+    # Swap path
+    # ------------------------------------------------------------------
+    def ensure_active(self, steps) -> None:
+        """Make the state for *steps* the (only) mapped built state.
+
+        Called on every runtime-state activation, BEFORE the worker's
+        pointer swap. No-op in resident mode and when the target is already
+        mapped (including registered baseline states, which are never
+        tagged and always resident).
+        """
+        if not self.offload_enabled:
+            return
+        # Unconditionally FIRST, before any branch that depends on this rank's
+        # residency: the guard is itself a collective (all_gather_object), so
+        # reaching it on only some ranks does not detect divergence, it *is* a
+        # divergence. Boot fn8s4 deadlocked exactly there -- TP0 entered
+        # _maybe_verify_rank_sync from the swap path at round 859 while TP1/TP2
+        # had finished the round and were already in the next request
+        # broadcast. Hoisting it above the branching makes every rank post the
+        # same collective on the same activation, so a divergent `steps` now
+        # raises the intended error instead of hanging.
+        self._activation_ordinal += 1
+        self._maybe_verify_rank_sync(steps)
+
+        tag = self.tag_for_steps(steps)
+        rec = self._states.get(tag)
+        target = (
+            tag
+            if (rec is not None and (rec.tensors or tag in self._capture_pools))
+            else None
+        )
+        if target is None:
+            # The untagged baseline occupies no tagged pages, so nothing has
+            # to be unmapped for it. Pausing the outgoing state here (as this
+            # path used to) freed memory for a state that needs none: 630 of
+            # fn8s4's 1270 swaps, 17.5 s, pure loss.
+            self._resumed_tag = None
+            # This activation did no driver work. Say so: cross_algo_worker
+            # reads last_swap_ms straight after ensure_active to charge the
+            # switch, and a stale value from an earlier real swap would bill a
+            # free activation ~33 ms.
+            self.last_swap_ms = 0.0
+            return
+        if target in self._resident:
+            # Already mapped: activation is a pointer swap, no driver work and
+            # no re-zeroing. Not re-zeroing is not a relaxation -- a state that
+            # was never unmapped keeps its pages, which is precisely what
+            # 'resident' mode does on every activation. The zero_ below exists
+            # only because pause/resume hands back FRESH physical pages.
+            self._resumed_tag = target
+            self._touch_resident(target)
+            self.last_swap_ms = 0.0
+            return
+
+        evict = plan_residency(
+            target=target,
+            resident=list(self._resident),
+            sizes={
+                t: r.footprint_bytes
+                for t, r in self._states.items()
+                if r.tensors or t in self._capture_pools
+            },
+            budget_bytes=self._resident_budget_bytes,
+            max_resident=self._max_resident,
+        )
+
+        tic = time.perf_counter()
+        # Quiescence: attr-rebinding never required this, but unmapping a
+        # state's pages under in-flight kernels (e.g. the previous step's
+        # draft_extend still queued) would be use-after-unmap.
+        torch.cuda.synchronize()
+        for victim in evict:
+            self._adapter.pause(victim)
+            self._paused.add(victim)
+            self._resident.remove(victim)
+            if self._resumed_tag == victim:
+                self._resumed_tag = None
+        self._reclaim_driver_free_for_resume(rec)
+        self._adapter.resume(target)
+        self._paused.discard(target)
+        self._resident.append(target)
+        self._resumed_tag = target
+        # Re-init: restore the boot-state content contract (zeroed
+        # workspaces per #50; zeroed index/mask buffers == fresh-boot
+        # pre-first-replay state). Plan data is host-side and re-planned
+        # per forward; nothing else is stateful. See module docstring.
+        for t in rec.tensors:
+            t.zero_()
+        torch.cuda.synchronize()
+        self.last_swap_ms = (time.perf_counter() - tic) * 1e3
+        self._last_real_swap_ms = self.last_swap_ms
+        self._swap_ordinal += 1
+        logger.info(
+            "Adaptive graph memory swap #%d: mapped=%s evicted=%s "
+            "resident=%s (%.2f ms)",
+            self._swap_ordinal,
+            target,
+            evict or "[]",
+            list(self._resident),
+            self.last_swap_ms,
+        )
+
+    def pause_resident(self, keep: Optional[str] = None) -> int:
+        """Unmap every mapped tagged state except *keep*; return bytes freed.
+
+        Only safe once no worker pointer references the victims, i.e. after
+        the caller activated *keep* (or the untagged baseline). Used by
+        ``AdaptiveController.park`` ahead of a Weg-2 group sleep.
+        """
+        if not self.offload_enabled or not self._finalized:
+            return 0
+        victims = [t for t in list(self._resident) if t != keep]
+        if not victims:
+            return 0
+        torch.cuda.synchronize()
+        freed = 0
+        for victim in victims:
+            rec = self._states.get(victim)
+            self._adapter.pause(victim)
+            self._paused.add(victim)
+            self._resident.remove(victim)
+            if self._resumed_tag == victim:
+                self._resumed_tag = None
+            if rec is not None:
+                freed += int(rec.footprint_bytes)
+        logger.info(
+            "Adaptive graph memory park: unmapped %s (%.1f MiB), resident=%s",
+            victims,
+            freed / (1 << 20),
+            list(self._resident),
+        )
+        return freed
+
+    def _touch_resident(self, tag: str) -> None:
+        """Move *tag* to the most-recently-used end of the residency list."""
+        try:
+            self._resident.remove(tag)
+        except ValueError:
+            pass
+        self._resident.append(tag)
+
+    def swap_ms_for(self, steps) -> float:
+        """Estimated swap cost of activating *steps* right now, in ms.
+
+        0.0 when the activation needs no driver work (the untagged baseline,
+        or an already-resident tag) -- which, with budget-driven residency, is
+        the common case. Feeds the chain policy's break-even gate so it only
+        charges a switch that will actually be paid for.
+        """
+        if not self.offload_enabled:
+            return 0.0
+        tag = self.tag_for_steps(steps)
+        rec = self._states.get(tag)
+        if rec is None or not (rec.tensors or tag in self._capture_pools):
+            return 0.0
+        if tag in self._resident:
+            return 0.0
+        # last_swap_ms is 0.0 after a no-op activation, which says nothing
+        # about what a REAL swap to this tag would cost -- fall back to the
+        # measured prior rather than reporting a genuine swap as free.
+        return float(self._last_real_swap_ms or _SWAP_MS_PRIOR)
+
+    def _reclaim_driver_free_for_resume(self, rec: "_StateRecord") -> None:
+        """Guarantee DRIVER-visible free memory for resume's cu_mem_create.
+
+        ``resume(tag)`` backs the tag with fresh physical pages, so it draws
+        exclusively on driver-free memory. Serving transients (deep
+        chunked-prefill activation peaks in particular) leave freed-but-
+        cached segments behind in the torch caching allocator; the allocator
+        never returns them to the driver on its own, so driver-free memory
+        decays over serving time even though Python-side memory looks fine.
+        cu_mem_create cannot recruit those cached bytes -- it dies with a
+        native "CUresult error: 2" abort (exit 1, no Python traceback).
+        Measured 2026-07-22 on the tp3 uneven rig: after one 10k-prefill
+        turn a 3080 shadow rank had retained >430 MiB of cached prefill
+        transients, and the next baseline->rung switch -- a PURE resume of
+        the 634 MiB EAGLE_k3 tag, with nothing paused before it because the
+        baseline is untagged -- killed the rank.
+
+        The swap path's peak demand IS a registered post (the measured
+        max-paused-tag bytes in the KV-budget registry / finalize_boot
+        reserve check); what erodes is its driver-level backing. So when
+        driver-free is short of the incoming tag's measured footprint,
+        return the allocator's cached free blocks to the driver (the same
+        empty_cache the boot flow runs between builds) and re-check. Tag
+        MemPools hold no cached free blocks at swap time (runtime never
+        allocates into them), so this only touches default-pool transient
+        segments; CUDA-graph capture pools are pinned by their graphs and
+        unaffected. If memory is genuinely short even after reclaim, raise
+        a diagnosable error instead of the native abort."""
+        needed = rec.footprint_bytes
+        free, _ = torch.cuda.mem_get_info()
+        if free >= needed + _RESUME_RECLAIM_HEADROOM_BYTES:
+            return
+        torch.cuda.empty_cache()
+        free_after, _ = torch.cuda.mem_get_info()
+        logger.info(
+            "Adaptive graph memory: reclaimed %.1f MiB of allocator-cached "
+            "transient segments before resuming %s (driver-free %.1f -> "
+            "%.1f MiB, tag footprint %.1f MiB).",
+            (free_after - free) / (1 << 20),
+            rec.tag,
+            free / (1 << 20),
+            free_after / (1 << 20),
+            needed / (1 << 20),
+        )
+        if free_after < needed:
+            raise RuntimeError(
+                "Adaptive graph memory: resuming "
+                f"{rec.tag} needs {needed / (1 << 20):.0f} MiB of "
+                "driver-free memory but only "
+                f"{free_after / (1 << 20):.0f} MiB remain after reclaiming "
+                "allocator caches. Live allocations are holding device "
+                "memory beyond the registered serving-transient safety "
+                "post; raise FLLIPER_MEASURED_KV_BUDGET_SAFETY_MIB for this "
+                "rank (or shrink the rung candidate set). Failing the swap "
+                "with a readable error instead of the native cu_mem_create "
+                "abort."
+            )
+
+    def resume_shortfall_bytes(self, steps) -> int:
+        """Driver-free shortfall a swap to *steps* would face, or 0 when it
+        fits (also 0 for guaranteed no-ops: resident mode, already-mapped
+        target, untagged baseline -- those only PAUSE, which frees memory).
+
+        Pre-swap probe for the first-boot swap guard (cross_algo_worker):
+        on a fresh configuration the measured-KV registry has no
+        corrections yet, the blind sizing can leave less driver-free than
+        the incoming tag's footprint, and the resume would die in
+        _reclaim_driver_free_for_resume's readable error (or worse, the
+        native cu_mem_create abort). The guard asks first and REFUSES the
+        switch instead. Runs the same allocator-cache reclaim the real
+        resume would (idempotent; skipped when free already suffices)."""
+        if not self.offload_enabled:
+            return 0
+        tag = self.tag_for_steps(steps)
+        rec = self._states.get(tag)
+        if rec is None or not (rec.tensors or tag in self._capture_pools):
+            return 0
+        if tag in self._resident:
+            return 0
+        needed = rec.footprint_bytes
+        # Whatever residency planning would evict is paused (physically
+        # released) before the resume, so those footprints count as available.
+        sizes = {
+            t: r.footprint_bytes
+            for t, r in self._states.items()
+            if r.tensors or t in self._capture_pools
+        }
+        outgoing = sum(
+            int(sizes.get(t, 0))
+            for t in plan_residency(
+                target=tag,
+                resident=list(self._resident),
+                sizes=sizes,
+                budget_bytes=self._resident_budget_bytes,
+                max_resident=self._max_resident,
+            )
+        )
+        free, _ = torch.cuda.mem_get_info()
+        if free + outgoing >= needed:
+            return 0
+        torch.cuda.empty_cache()
+        free, _ = torch.cuda.mem_get_info()
+        return max(0, int(needed) - (int(free) + outgoing))
+
+    def note_resident_activation(self, steps) -> None:
+        """Resident mode returns from ``ensure_active`` before the rank-sync
+        check. The controller calls this on every activation instead, so a
+        rank-divergent choice (the per-round chain policy decides locally on
+        each rank) fails loudly under
+        FLLIPER_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC=1 instead of deadlocking in
+        the next collective with different graphs on different ranks.
+
+        Offload mode runs the same check at the top of ``ensure_active``,
+        where every rank reaches it on every activation regardless of what its
+        own residency happens to be."""
+        if self.offload_enabled:
+            return
+        self._activation_ordinal += 1
+        self._maybe_verify_rank_sync(steps)
+
+    def _maybe_verify_rank_sync(self, steps) -> None:
+        from flliper.srt.environ import envs
+
+        if not envs.FLLIPER_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC.get():
+            return
+        try:
+            import torch.distributed as dist
+
+            if not dist.is_initialized() or dist.get_world_size() == 1:
+                return
+            if self._tp_cpu_group is None:
+                from flliper.srt.distributed import get_tp_group
+
+                self._tp_cpu_group = get_tp_group().cpu_group
+            payload = (self._activation_ordinal, steps)
+            gathered: list = [None] * dist.get_world_size(self._tp_cpu_group)
+            dist.all_gather_object(gathered, payload, group=self._tp_cpu_group)
+            if any(g != payload for g in gathered):
+                raise RuntimeError(
+                    "Adaptive graph memory: rank-divergent swap detected: "
+                    f"local={payload}, all={gathered}. The swap decision must "
+                    "be a pure function of rank-invariant inputs (#50/G5)."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            logger.warning(
+                "FLLIPER_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC check skipped",
+                exc_info=True,
+            )
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+    def is_paused_tensor(self, t: torch.Tensor) -> bool:
+        if not self.offload_enabled:
+            return False
+        for tag in self._paused:
+            rec = self._states.get(tag)
+            if rec is not None and any(x is t for x in rec.tensors):
+                return True
+        return False
+
+    @property
+    def swap_count(self) -> int:
+        """Activations that actually did driver work (unmap and/or map)."""
+        return self._swap_ordinal
+
+    @property
+    def activation_count(self) -> int:
+        """Activations, swapped or not. Resident mode never swaps, so this is
+        the only counter that moves there; in offload mode the gap between the
+        two is exactly what budget-driven residency saved."""
+        return self._activation_ordinal
+
+    @property
+    def resident_tags(self) -> list[str]:
+        """Currently mapped tags, least-recently-activated first."""
+        return list(self._resident)
+
+
+# ----------------------------------------------------------------------
+# Module-level hooks for the (backend-side) wrap sites
+# ----------------------------------------------------------------------
+def get_active_manager() -> Optional["AdaptiveGraphMemoryManager"]:
+    """The process-wide manager, if one exists (created by the first
+    AdaptiveController). CrossAlgoWorker uses it to build the inactive
+    algorithm rung's resources as a pauseable state (T156 stage 2)."""
+    return _ACTIVE_MANAGER
+
+
+def tagged_state_alloc(nbytes: Optional[int] = None):
+    """Context manager: route the enclosed allocation to the current
+    adaptive build tag's pauseable region. No-op outside a build scope
+    (static path), in resident mode, or -- CRITICALLY -- when *nbytes*
+    is below MIN_TAGGED_BYTES.
+
+    The size gate is a correctness requirement, not an optimization: the
+    caching allocator SPLITS large blocks, so a tagged segment can carry a
+    free tail of up to ~2 MiB. A later sub-2MiB allocation in another tag's
+    region could be served from that tail -- and once the first tag is
+    paused, the tail is UNMAPPED, so first touch is an illegal memory
+    access (observed live on the 5-state high-accept boot: state k2's
+    ~1.5 MiB custom_mask landed in paused k5's segment tail). Allocations
+    >= MIN_TAGGED_BYTES always get their own segment, closing the hole;
+    smaller ones stay resident in the default pool.
+    """
+    mgr = _ACTIVE_MANAGER
+    if mgr is None:
+        return nullcontext()
+    if nbytes is not None and nbytes < MIN_TAGGED_BYTES:
+        return nullcontext()
+    return mgr._tagged_region()
+
+
+def note_state_tensor(t: Optional[torch.Tensor], kind: str = "scratch") -> None:
+    """Register *t* as pauseable scratch of the state currently being built
+    (zeroed on every resume). Only call for tensors allocated inside
+    ``tagged_state_alloc``. Sub-MIN_TAGGED_BYTES tensors are skipped (they
+    were allocated OUTSIDE the tagged region by the size gate above and
+    must stay resident)."""
+    mgr = _ACTIVE_MANAGER
+    if mgr is not None and t is not None:
+        if t.untyped_storage().nbytes() < MIN_TAGGED_BYTES:
+            return
+        mgr.note_tensor(t, kind=kind)
+
+
+def in_offload_build() -> bool:
+    """True while an offload-mode adaptive state build scope is active."""
+    mgr = _ACTIVE_MANAGER
+    return mgr is not None and mgr.offload_enabled and mgr._build_tag is not None
+
+
+def in_capture_offload_build() -> bool:
+    """True while a STAGE-2 (capture-pool) adaptive build scope is active
+    (gates the Stage-2-only wrap sites, e.g. int-workspace retagging)."""
+    mgr = _ACTIVE_MANAGER
+    return mgr is not None and mgr.capture_offload and mgr._build_tag is not None
+
+
+def capture_pool_override():
+    """Per-state capture pool for the build in progress, or None (use the
+    shared global graph pool). Called by the cuda-graph backend's
+    capture_session."""
+    mgr = _ACTIVE_MANAGER
+    if mgr is None:
+        return None
+    return mgr.capture_pool_for_build()
+
+
+def capture_graph_ctx(default_graph_ctx, *, cuda_graph, pool, stream):
+    """Context manager for one graph capture; defers to *default_graph_ctx*
+    outside a Stage-2 build scope. See AdaptiveGraphMemoryManager.capture_graph."""
+    mgr = _ACTIVE_MANAGER
+    if mgr is None:
+        return default_graph_ctx(cuda_graph=cuda_graph, pool=pool, stream=stream)
+    return mgr.capture_graph(
+        default_graph_ctx, cuda_graph=cuda_graph, pool=pool, stream=stream
+    )
+
+
+def is_paused_tensor(t: torch.Tensor) -> bool:
+    """True if *t* is currently unmapped scratch of an inactive adaptive
+    state (its content contract is restored at resume; request-boundary
+    zeroing must skip it)."""
+    mgr = _ACTIVE_MANAGER
+    return mgr is not None and mgr.is_paused_tensor(t)

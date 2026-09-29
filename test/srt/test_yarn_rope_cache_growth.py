@@ -18,11 +18,11 @@ makes reachable.
 import pytest
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.rotary_embedding import lazy_cos_sin_cache
-from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
-from sglang.srt.runtime_context import get_context
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.environ import envs
+from flliper.srt.layers.rotary_embedding import lazy_cos_sin_cache
+from flliper.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
+from flliper.srt.runtime_context import get_context
+from flliper.srt.server_args import ServerArgs
 
 # RotaryEmbedding.__init__ reads the process-wide ServerArgs. These tests
 # construct the layer directly, outside a server, so install a minimal one.
@@ -43,9 +43,9 @@ SCALING_FACTOR = 4.0
 @pytest.fixture(params=["eager", "lazy"], autouse=True)
 def rope_mode(request):
     with (
-        envs.SGLANG_ROPE_LAZY_CACHE.override(request.param == "lazy"),
-        envs.SGLANG_ROPE_LAZY_CHUNK_ROWS.override(128),
-        envs.SGLANG_ROPE_LAZY_MIN_ROWS.override(64),
+        envs.FLLIPER_ROPE_LAZY_CACHE.override(request.param == "lazy"),
+        envs.FLLIPER_ROPE_LAZY_CHUNK_ROWS.override(128),
+        envs.FLLIPER_ROPE_LAZY_MIN_ROWS.override(64),
     ):
         yield request.param
     for module in list(lazy_cos_sin_cache._LAZY_MODULES):

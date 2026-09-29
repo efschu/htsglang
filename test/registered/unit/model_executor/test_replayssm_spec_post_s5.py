@@ -4,7 +4,7 @@
 --enable-linear-replayssm-spec the mamba budget post "speculative intermediate
 state" must price what the pool allocates per request row -- the conv verify
 windows plus the ring -- instead of D full per-draft states, and the D-group
-planner (uneven_perf.PerfCostModel, which --rank-tp-ratio auto and the weg2
+planner (uneven_perf.PerfCostModel, which --rank-tp-ratio auto and the pdflip
 launcher's D pricing read) must say the same, or the dry run prices group D
 with ~0.4 GiB per rank that the boot then hands to KV. Pinned:
 
@@ -27,19 +27,19 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.configs.mamba_utils import (
+from flliper.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateDType,
     Mamba2StateShape,
 )
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _spec_workspace_draft_units,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.uneven_perf import PerfCostModel, PlanInputs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -89,7 +89,7 @@ class _Base(CustomTestCase):
 
 class TestWorkspaceIsTheAllocation(_Base):
     def test_per_row_bytes_match_the_pool(self):
-        from sglang.srt.mem_cache import memory_pool as mp
+        from flliper.srt.mem_cache import memory_pool as mp
 
         for hv, hk in ((18, 6), (15, 5)):
             with self.subTest(hv=hv, hk=hk):

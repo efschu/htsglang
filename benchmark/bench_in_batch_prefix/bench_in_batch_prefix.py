@@ -1,7 +1,7 @@
 # Benchmark with lots of common prefixes. Used to benchmark prefix caching performance.
 #
 # Launch a server:
-# python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --log-level-http warning
+# python -m flliper.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --log-level-http warning
 
 import random
 import string
@@ -10,9 +10,9 @@ import time
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-import sglang as sgl
-from sglang import set_default_backend
-from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+import flliper as sgl
+from flliper import set_default_backend
+from flliper.lang.backend.runtime_endpoint import RuntimeEndpoint
 
 
 def generate_random_string(token_length: int) -> str:

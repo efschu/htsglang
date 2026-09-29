@@ -1,11 +1,11 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -70,7 +70,7 @@ class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
     def setUpClass(cls):
         cls.model = NEMOTRON_3_SUPER_NVFP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0):
+        with envs.FLLIPER_ENABLE_ASYNC_ASSERT.override(0):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -91,7 +91,7 @@ class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):
     def setUpClass(cls):
         cls.model = NEMOTRON_3_SUPER_NVFP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0):
+        with envs.FLLIPER_ENABLE_ASYNC_ASSERT.override(0):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

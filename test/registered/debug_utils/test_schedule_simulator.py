@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 
-from sglang.srt.debug_utils.schedule_simulator import (
+from flliper.srt.debug_utils.schedule_simulator import (
     AttentionComputeBalancednessRecorder,
     BatchSizeBalancednessRecorder,
     FIFOScheduler,
@@ -22,8 +22,8 @@ from sglang.srt.debug_utils.schedule_simulator import (
     load_from_request_logger,
     main,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=120, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=338, suite="base-c-test-cpu")
@@ -485,7 +485,7 @@ class TestSimulator(CustomTestCase):
 class TestCLI(CustomTestCase):
     def _run_cli(self, *args):
         return subprocess.run(
-            [sys.executable, "-m", "sglang.srt.debug_utils.schedule_simulator", *args],
+            [sys.executable, "-m", "flliper.srt.debug_utils.schedule_simulator", *args],
             capture_output=True,
             text=True,
         )

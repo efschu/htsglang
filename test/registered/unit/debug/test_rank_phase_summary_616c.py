@@ -6,7 +6,7 @@ import textwrap
 
 import pytest
 
-from sglang.srt.debug_utils.rank_phase_summary import (
+from flliper.srt.debug_utils.rank_phase_summary import (
     main,
     parse_rank_batch_line,
     report,

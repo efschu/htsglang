@@ -29,9 +29,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sglang.srt.mem_cache.producer_phase_census as m
-from sglang.srt.mem_cache.hicache_phase_binding import binding_state
-from sglang.srt.mem_cache.producer_phase_census import (
+import flliper.srt.mem_cache.producer_phase_census as m
+from flliper.srt.mem_cache.hicache_phase_binding import binding_state
+from flliper.srt.mem_cache.producer_phase_census import (
     AdoptionSource,
     ProducerPhase,
     ProducerPhaseCensus,
@@ -56,7 +56,7 @@ def _clean():
 
 
 def _arm(monkeypatch, every=1):
-    monkeypatch.setenv("SGLANG_MATCH_REFUSAL_CENSUS_EVERY", str(every))
+    monkeypatch.setenv("FLLIPER_MATCH_REFUSAL_CENSUS_EVERY", str(every))
 
 
 # -- the ledger writer (glue + the backup thread's call site) ------------
@@ -94,7 +94,7 @@ def test_backup_thread_stamps_keys_with_the_operation_stamp(monkeypatch):
     the dequeue is the #1061 stamp. Killing the call site (mutant M3) makes
     the ledger stay empty and this test red.
     """
-    from sglang.srt.managers.cache_controller import (
+    from flliper.srt.managers.cache_controller import (
         HiCacheController,
         StorageOperation,
     )
@@ -240,11 +240,11 @@ def test_real_walk_emits_the_acceptance_line(monkeypatch, caplog):
     were stamped under pp/gen0, flip to tp, walk, and read the #631 line
     with ok, denom and the producer partition off the log. Mutants M1/M2
     (walk feed removed / walk+emit removed) go red here."""
-    from sglang.srt.mem_cache.base_prefix_cache import (
+    from flliper.srt.mem_cache.base_prefix_cache import (
         InsertParams,
         MatchPrefixParams,
     )
-    from sglang.srt.mem_cache.radix_cache import RadixKey
+    from flliper.srt.mem_cache.radix_cache import RadixKey
 
     from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
@@ -283,11 +283,11 @@ def test_real_walk_emits_the_acceptance_line(monkeypatch, caplog):
 def test_disarmed_walk_emits_nothing_and_feeds_nothing(caplog):
     """INDIKATOR-GESETZ floor: with the knob at its default the walk must not
     even build the census -- no line, no ledger reads, byte-identical path."""
-    from sglang.srt.mem_cache.base_prefix_cache import (
+    from flliper.srt.mem_cache.base_prefix_cache import (
         InsertParams,
         MatchPrefixParams,
     )
-    from sglang.srt.mem_cache.radix_cache import RadixKey
+    from flliper.srt.mem_cache.radix_cache import RadixKey
 
     from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 

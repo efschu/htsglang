@@ -4,7 +4,7 @@ Disaggregation integration test for the NIXL transfer backend on Intel XPU.
 Launches a prefill server, a decode server, and a load-balancer using the
 NIXL KV-transfer backend, then verifies that basic text completion works
 end-to-end.  This exercises the np.uint64 pointer-arithmetic fix in
-python/sglang/srt/disaggregation/nixl/conn.py, which is required on
+python/flliper/srt/disaggregation/nixl/conn.py, which is required on
 Intel XPU where device addresses have bit 63 set (e.g. 0xffff81ab54e01000)
 and would overflow np.int64.
 
@@ -18,11 +18,11 @@ import unittest
 import requests
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
+from flliper.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
 register_cuda_ci(
     est_time=300,

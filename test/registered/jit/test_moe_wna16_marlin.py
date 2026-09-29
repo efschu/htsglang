@@ -6,15 +6,15 @@ import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
-from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
-from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
-from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
-from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+from flliper.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
+from flliper.srt.layers.moe.fused_moe_triton import moe_align_block_size
+from flliper.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+from flliper.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,
 )
-from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_marlin_utils import (
+from flliper.srt.utils.common import is_sm80_supported, is_sm90_supported
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_marlin_utils import (
     awq_marlin_quantize,
     make_nvfp4_weight_and_ref,
     marlin_quantize,

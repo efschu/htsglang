@@ -44,14 +44,14 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
-from sglang.srt.managers.phase_flip_runtime import PHASE_PP, PhaseFlipRuntime
-from sglang.srt.model_executor.weights_arena import (
+from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP
+from flliper.srt.managers.phase_flip_runtime import PHASE_PP, PhaseFlipRuntime
+from flliper.srt.model_executor.weights_arena import (
     checksum_is_representable,
     uint8_checksum,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 from seam_census_double import bind_census_schedulers  # noqa: E402 (sibling)
 from test_phase_flip_runtime import (  # noqa: E402  (sibling harness)
@@ -330,7 +330,7 @@ class TestFrameDivergence(CustomTestCase):
 
         The live-slot agreement reconciles ONE of the three framing terms.
         Diverge another -- the wave partition, which ``_flip_waves`` derives
-        rank-locally from ``SGLANG_FLIP_SEAM_WAVES`` and ``_pools_alias``,
+        rank-locally from ``FLLIPER_FLIP_SEAM_WAVES`` and ``_pools_alias``,
         both of its own documented gaps -- and the ballot must still refuse
         before a byte moves, with nothing stubbed out.
         """

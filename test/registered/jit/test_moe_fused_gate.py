@@ -21,10 +21,10 @@ from typing import Tuple
 import pytest
 import torch
 
-from sglang.jit_kernel.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
-from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
+from flliper.jit_kernel.utils import get_ci_test_range
+from flliper.srt.layers.moe.topk import biased_grouped_topk_impl
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -423,13 +423,13 @@ def test_grouped_dispatch_flag_matches_default(
     topk: int,
     num_fused_shared_experts: int,
 ) -> None:
-    """The opt-in SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK dispatch must match the
+    """The opt-in FLLIPER_OPT_USE_JIT_KERNEL_GROUPED_TOPK dispatch must match the
     default grouped path (flashinfer/AOT) that biased_grouped_topk_gpu selects when
     the flag is off. This covers the wiring, not just the raw kernel — validated
     bit-exact on DeepSeek-V3.2 e2e; here we assert parity against the default path.
     """
-    from sglang.srt.environ import envs
-    from sglang.srt.layers.moe.topk import biased_grouped_topk_gpu
+    from flliper.srt.environ import envs
+    from flliper.srt.layers.moe.topk import biased_grouped_topk_gpu
 
     M = 256
     torch.manual_seed(num_experts * 3 + num_expert_group * 5 + topk)
@@ -447,11 +447,11 @@ def test_grouped_dispatch_flag_matches_default(
         routed_scaling_factor=2.5,
         apply_routed_scaling_factor_on_output=False,
     )
-    with envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False):
+    with envs.FLLIPER_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False):
         def_w, def_i = biased_grouped_topk_gpu(
             hidden, gating, bias, topk, True, **kwargs
         )
-    with envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(True):
+    with envs.FLLIPER_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(True):
         jit_w, jit_i = biased_grouped_topk_gpu(
             hidden, gating, bias, topk, True, **kwargs
         )

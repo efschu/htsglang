@@ -57,8 +57,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from s11_bar1_e2e import RE_GROUP  # noqa: E402  one regex, one place
 from s12_log_analyse import (  # noqa: E402  one parser, one place
-    decode_tick_aggregat,
-    im_fenster,
+    decode_tick_aggregate,
+    in_window,
     parse_decode,
 )
 
@@ -421,7 +421,7 @@ def floor_from_points(points: list) -> list:
     return out
 
 
-def ernte_ticks(server_log: str, start: float, end: float, batch: int) -> dict:
+def harvest_ticks(server_log: str, start: float, end: float, batch: int) -> dict:
     """The scheduler's own decode ticks for the window a decode point ran in.
 
     Why this exists at all. The request level and the tick level answer two
@@ -454,7 +454,7 @@ def ernte_ticks(server_log: str, start: float, end: float, batch: int) -> dict:
     # Prefixed, because `ms_pro_token` exists on both levels and an unprefixed
     # merge would silently replace the request-level number with the tick one --
     # exactly the conflation this fix is about.
-    agg = decode_tick_aggregat(im_fenster(ticks, start, end), batch)
+    agg = decode_tick_aggregate(in_window(ticks, start, end), batch)
     out.update({f"tick_{k}": v for k, v in agg.items()})
     return out
 
@@ -670,7 +670,7 @@ def mode_measure(args) -> int:
         for batch in _decode_batches(args):
             start = time.time()
             point_decode = measure_decode(args.port, batch, args.point_seconds)
-            point_decode.update(ernte_ticks(args.server_log, start, time.time(), batch))
+            point_decode.update(harvest_ticks(args.server_log, start, time.time(), batch))
             decode.append(point_decode)
 
     rc = 0
@@ -822,7 +822,7 @@ def load_fatal(step_dir: str, arm, sessions) -> dict:
     return {"fatal_erhoben": True, "fatal": None}
 
 
-def zusammenfassen(step_dir: str, tol_pct: float, plan: list) -> dict:
+def summarize(step_dir: str, tol_pct: float, plan: list) -> dict:
     points = load_points(step_dir)
     curves: dict = {arm: {} for arm in ARMS}
     decode_points: list = []
@@ -947,7 +947,7 @@ def _num(v, nk: int) -> str:
     return "None" if not isinstance(v, (int, float)) else format(v, f".{nk}f")
 
 
-def tabelle(payload: dict) -> str:
+def table(payload: dict) -> str:
     """The live table, rendered from the persisted points. Pure presentation:
     no marking, no comparison with an expectation, no verdict."""
     lines = [
@@ -996,11 +996,11 @@ def tabelle(payload: dict) -> str:
 def mode_summarize(args) -> int:
     os.makedirs(args.step_dir, exist_ok=True)
     plan = [int(x) for x in str(args.sessions_plan).replace(",", " ").split()]
-    payload = zusammenfassen(args.step_dir, args.tol_pct, plan)
+    payload = summarize(args.step_dir, args.tol_pct, plan)
     with open(os.path.join(args.step_dir, "prefill_kurve.json"), "w") as f:
         json.dump(payload, f, indent=2)
         f.write("\n")
-    text = tabelle(payload)
+    text = table(payload)
     with open(os.path.join(args.step_dir, "zwischentabelle.md"), "w") as f:
         f.write(text)
     print(text, end="")

@@ -13,7 +13,7 @@
 # ==============================================================================
 """Unit tests for the dashboard server-manager control-plane.
 
-NO GPU boot and NO real sglang server: the supervisor lifecycle is exercised
+NO GPU boot and NO real flliper server: the supervisor lifecycle is exercised
 with a FAKE child process (a trivial ``python3 -c "... time.sleep"``), and every
 NVML / huggingface_hub touch is injected/mocked so the suite is hermetic and
 network-free.
@@ -30,11 +30,11 @@ import time
 import unittest
 from unittest import mock
 
-from sglang.srt.planner.server_manager import (
+from flliper.srt.planner.server_manager import (
     DEFAULT_MODEL_ROOTS,
     DownloadInfo,
     LaunchSettings,
-    SglangSupervisor,
+    FlliperSupervisor,
     SupervisorBusyError,
     _tail_lines,
     available_downloads,
@@ -137,11 +137,11 @@ class TestTailLines(unittest.TestCase):
         )
 
     def test_log_tail_uses_tail_lines(self):
-        """SglangSupervisor.log_tail() delegates to _tail_lines (the poll-hot
+        """FlliperSupervisor.log_tail() delegates to _tail_lines (the poll-hot
         O(file size) regression this guards is exactly the earlier
         f.readlines()[-n:] implementation of log_tail itself)."""
         path = self._write("sup.log", [f"line {i}\n" for i in range(200)])
-        sup = SglangSupervisor.__new__(SglangSupervisor)
+        sup = FlliperSupervisor.__new__(FlliperSupervisor)
         sup._log_path = path
         self.assertEqual(sup.log_tail(10), "".join([f"line {i}\n" for i in range(190, 200)]))
 
@@ -243,44 +243,44 @@ class TestDiscovery(unittest.TestCase):
 
     def test_default_roots_constant(self):
         # Without either env var the defaults are the generic locations.
-        from sglang.srt.planner.server_manager import _model_roots_from_env
+        from flliper.srt.planner.server_manager import _model_roots_from_env
 
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_MODEL_ROOTS", None)
-            os.environ.pop("SGLANG_PLANNER_MODEL_ROOTS", None)
+            os.environ.pop("FLLIPER_MODEL_ROOTS", None)
+            os.environ.pop("FLLIPER_PLANNER_MODEL_ROOTS", None)
             self.assertEqual(
                 _model_roots_from_env(),
                 ("~/.cache/huggingface/hub", "./models"))
 
     def test_model_roots_env_override(self):
-        # SGLANG_MODEL_ROOTS (colon-separated) replaces the generic defaults.
-        from sglang.srt.planner.server_manager import _model_roots_from_env
+        # FLLIPER_MODEL_ROOTS (colon-separated) replaces the generic defaults.
+        from flliper.srt.planner.server_manager import _model_roots_from_env
 
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_PLANNER_MODEL_ROOTS", None)
-            os.environ["SGLANG_MODEL_ROOTS"] = "/a/models:/b/cache"
+            os.environ.pop("FLLIPER_PLANNER_MODEL_ROOTS", None)
+            os.environ["FLLIPER_MODEL_ROOTS"] = "/a/models:/b/cache"
             self.assertEqual(_model_roots_from_env(), ("/a/models", "/b/cache"))
 
     def test_planner_env_var_wins_over_legacy(self):
-        # SGLANG_PLANNER_MODEL_ROOTS is the documented name; the older
-        # SGLANG_MODEL_ROOTS stays accepted but loses when both are set.
-        from sglang.srt.planner.server_manager import _model_roots_from_env
+        # FLLIPER_PLANNER_MODEL_ROOTS is the documented name; the older
+        # FLLIPER_MODEL_ROOTS stays accepted but loses when both are set.
+        from flliper.srt.planner.server_manager import _model_roots_from_env
 
         with mock.patch.dict(
             os.environ,
-            {"SGLANG_PLANNER_MODEL_ROOTS": "/new", "SGLANG_MODEL_ROOTS": "/old"},
+            {"FLLIPER_PLANNER_MODEL_ROOTS": "/new", "FLLIPER_MODEL_ROOTS": "/old"},
         ):
             self.assertEqual(_model_roots_from_env(), ("/new",))
 
     def test_set_model_roots_override_and_clear(self):
         # --model-root wins over the env vars; clearing restores the env layer.
-        from sglang.srt.planner.server_manager import (
+        from flliper.srt.planner.server_manager import (
             model_roots,
             set_model_roots,
         )
 
         with mock.patch.dict(
-            os.environ, {"SGLANG_PLANNER_MODEL_ROOTS": "/from/env"}
+            os.environ, {"FLLIPER_PLANNER_MODEL_ROOTS": "/from/env"}
         ):
             try:
                 set_model_roots(["/from/flag", "/second"])
@@ -379,28 +379,28 @@ class TestLaunchSettings(unittest.TestCase):
     def test_extra_env_wins_over_supervisor_defaults(self):
         # A profile's launch env (flags.profile_env) must override the
         # supervisor defaults so a launched profile matches its reference
-        # command exactly (PYTHONPATH / LD_LIBRARY_PATH / SGLANG_UNEVEN_*).
-        from sglang.srt.planner.server_manager import SglangSupervisor
+        # command exactly (PYTHONPATH / LD_LIBRARY_PATH / FLLIPER_UNEVEN_*).
+        from flliper.srt.planner.server_manager import FlliperSupervisor
 
-        sup = SglangSupervisor(nvml=object())
+        sup = FlliperSupervisor(nvml=object())
         s = LaunchSettings(
             model_path="/m",
-            extra_env={"SGLANG_UNEVEN_DCP": "1", "PYTHONPATH": "/custom"},
+            extra_env={"FLLIPER_UNEVEN_DCP": "1", "PYTHONPATH": "/custom"},
         )
         env = sup._build_env(s)
-        self.assertEqual(env["SGLANG_UNEVEN_DCP"], "1")
+        self.assertEqual(env["FLLIPER_UNEVEN_DCP"], "1")
         self.assertEqual(env["PYTHONPATH"], "/custom")
 
     def test_no_extra_env_keeps_default_behavior(self):
-        from sglang.srt.planner.server_manager import SglangSupervisor
+        from flliper.srt.planner.server_manager import FlliperSupervisor
 
-        sup = SglangSupervisor(nvml=object())
+        sup = FlliperSupervisor(nvml=object())
         env = sup._build_env(LaunchSettings(model_path="/m"))
         self.assertIn("PYTHONPATH", env)
 
 
 # ===========================================================================
-# Supervisor lifecycle with a FAKE child (never a real sglang boot).
+# Supervisor lifecycle with a FAKE child (never a real flliper boot).
 # ===========================================================================
 def _fake_child_settings(port):
     # A harmless real LaunchSettings; the actual argv is overridden in start().
@@ -429,7 +429,7 @@ def _pgid_alive(pgid):
 class TestSupervisorLifecycle(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="sup_")
-        self.sup = SglangSupervisor(log_dir=self.tmp)
+        self.sup = FlliperSupervisor(log_dir=self.tmp)
         self._siblings = []
 
     def tearDown(self):
@@ -615,7 +615,7 @@ class TestVramGuard(unittest.TestCase):
 
     def test_vram_recovers_true(self):
         nvml = _FakeNvml(baseline_free_mib=20000, recover_after=1)
-        sup = SglangSupervisor(log_dir=self.tmp, nvml=nvml)
+        sup = FlliperSupervisor(log_dir=self.tmp, nvml=nvml)
         s = LaunchSettings(model_path="/fake", tp_size=1, rank_gpu_id=[0],
                            port=39100)
         sup.start(s, argv=_sleep_argv(), wait_ready=False)
@@ -626,7 +626,7 @@ class TestVramGuard(unittest.TestCase):
     def test_vram_no_indices_returns_none(self):
         # No rank_gpu_id -> nothing to poll -> None (can't judge).
         nvml = _FakeNvml(baseline_free_mib=20000)
-        sup = SglangSupervisor(log_dir=self.tmp, nvml=nvml)
+        sup = FlliperSupervisor(log_dir=self.tmp, nvml=nvml)
         s = LaunchSettings(model_path="/fake", tp_size=1, port=39101)
         sup.start(s, argv=_sleep_argv(), wait_ready=False)
         rep = sup.stop(wait_vram=True, vram_timeout_s=2)
@@ -723,7 +723,7 @@ class TestDownloads(unittest.TestCase):
             return "/x"
 
         with mock.patch(
-            "sglang.srt.planner.server_manager.model_root_writable",
+            "flliper.srt.planner.server_manager.model_root_writable",
             return_value=False,
         ):
             with self.assertRaises(PermissionError):
@@ -785,7 +785,7 @@ class TestDownloads(unittest.TestCase):
 
 class TestHfHubImportable(unittest.TestCase):
     def test_huggingface_hub_present(self):
-        import huggingface_hub  # sglang dependency; download layer needs it
+        import huggingface_hub  # flliper dependency; download layer needs it
 
         self.assertTrue(hasattr(huggingface_hub, "hf_hub_download"))
 

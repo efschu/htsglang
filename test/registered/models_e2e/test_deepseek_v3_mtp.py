@@ -1,10 +1,10 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.send_one import BenchArgs, send_one_prompt
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
-from sglang.test.test_utils import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.send_one import BenchArgs, send_one_prompt
+from flliper.test.server_fixtures.default_fixture import DefaultServerBase
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     is_in_amd_ci,
     is_in_ci,

@@ -18,7 +18,7 @@ flat pair array, or the forward stops being byte-identical. The cases pin:
 * 'MOE-PLAN-ROUTE' is logged on change only.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -28,8 +28,8 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.test.test_utils import CustomTestCase
 
 E, K = 512, 10
 
@@ -140,15 +140,15 @@ class TestVectorRoute(CustomTestCase):
 
 
 class TestNanGuardKeepsTheVectorRoute(CustomTestCase):
-    """x136 (24.09.): SGLANG_MOE_OFFLOAD_PLAN_VECTOR=1 on P, and PP0's
+    """x136 (24.09.): FLLIPER_MOE_OFFLOAD_PLAN_VECTOR=1 on P, and PP0's
     moe_plan_ms stayed at 1078-1696 ms per 16k chunk (x135 without the switch:
-    1044-1669). The Bestform P env carries SGLANG_NAN_GUARD=1, and the H20b
+    1044-1669). The Bestform P env carries FLLIPER_NAN_GUARD=1, and the H20b
     eligibility shut the route whenever the guard was on -- the NaN trace
     held the Python list. The trace reads rows by index, which a [T, K]
     array answers the same way; the guard must not close the route."""
 
     def setUp(self):
-        from sglang.srt.layers import nan_guard
+        from flliper.srt.layers import nan_guard
 
         self._saved = dict(nan_guard._STATE)
         nan_guard._STATE["on"] = True
@@ -166,7 +166,7 @@ class TestNanGuardKeepsTheVectorRoute(CustomTestCase):
         np.testing.assert_array_equal(rows, ids.astype(np.int64))
 
     def test_disc2_reads_the_array_like_the_list(self):
-        from sglang.srt.layers.moe import nan_disc2
+        from flliper.srt.layers.moe import nan_disc2
 
         ids = _ids(256, seed=9, pad_every=5)
         arr = ids.astype(np.int64)

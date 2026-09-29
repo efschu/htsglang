@@ -38,8 +38,8 @@ import tarfile
 import tempfile
 import unittest
 
-from sglang.srt.managers.session_handover import MANIFEST_VERSION
-from sglang.srt.managers.session_portable import (
+from flliper.srt.managers.session_handover import MANIFEST_VERSION
+from flliper.srt.managers.session_portable import (
     IDENTITY_LAYOUT_GAP,
     MANIFEST_MEMBER,
     PAGE_PREFIX,
@@ -261,7 +261,7 @@ class TestTheGatesAreDelegatedNotReimplemented(unittest.TestCase):
     def test_check_compatibility_calls_both_existing_gates(self):
         import inspect
 
-        from sglang.srt.managers import session_portable as m
+        from flliper.srt.managers import session_portable as m
 
         src = inspect.getsource(m.check_compatibility)
         self.assertIn(

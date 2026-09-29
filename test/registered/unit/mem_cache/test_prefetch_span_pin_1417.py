@@ -5,7 +5,7 @@ import os
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 class _Node:

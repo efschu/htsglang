@@ -9,7 +9,7 @@ WHY, measured on this rig 2026-08-12. All five units hardcoded
 ``/spinning/htsglang-gpu`` for PYTHONPATH and for the interpreter, and the
 installer copied them byte for byte (cmp/install, no substitution). That
 checkout predates the turnkey merge, so every unit died with ``No module named
-sglang.srt.turnkey`` and the serving unit died on the failed dependency.
+flliper.srt.turnkey`` and the serving unit died on the failed dependency.
 ``[stack].repo`` reads as the single source of truth for where the stack lives
 and was not one: nothing connected it to what the units actually executed, and
 the divergence stayed silent right up to the import error.
@@ -36,7 +36,7 @@ from typing import Dict, Iterable, Mapping
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 
-from sglang.srt.turnkey import config as C            # noqa: E402
+from flliper.srt.turnkey import config as C            # noqa: E402
 
 #: Every placeholder a unit may use, with what it means. A unit using anything
 #: else is a typo that would otherwise reach /etc.

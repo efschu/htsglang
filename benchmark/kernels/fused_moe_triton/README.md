@@ -88,7 +88,7 @@ if hidden_states.shape[0] >= 4096 and get_tensor_model_parallel_rank() == 0:
     self.save_idx += 1
 ```
 
-Launch sglang server and send request using `benchmark/kernels/fused_moe_triton/tuning_client.py`
+Launch flliper server and send request using `benchmark/kernels/fused_moe_triton/tuning_client.py`
 ```bash
 python benchmark/kernels/fused_moe_triton/tuning_client.py --port 8000
 ```
@@ -151,7 +151,7 @@ After tuning, configuration files will be generated:
 - **Standard tuning**: `E=64,N=640,device_name=NVIDIA_GeForce_RTX_4090,dtype=fp8_w8a8.json`
 - **Separate kernel tuning**: Two files for up/down kernels with TMA optimization flags
 
-Move these files to `sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_version/` directory to use them in SGLang.
+Move these files to `flliper/srt/layers/moe/moe_runner/triton_utils/configs/triton_version/` directory to use them in fLLiper.
 
 ### Supported Models
 
@@ -180,31 +180,31 @@ Move these files to `sglang/srt/layers/moe/moe_runner/triton_utils/configs/trito
 
 ### Performance Comparison Tool
 
-- `benchmark_vllm_vs_sglang_fused_moe_triton.py`: A tool for comparing the performance of fused MoE kernels between vllm and sglang implementations. Supports various model architectures and data types.
+- `benchmark_vllm_vs_flliper_fused_moe_triton.py`: A tool for comparing the performance of fused MoE kernels between vllm and flliper implementations. Supports various model architectures and data types.
 
 Example usage:
 ```bash
 # Compare with default settings (Mixtral model)
-python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py
+python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_flliper_fused_moe_triton.py
 
 # Compare with FP8 mode for Qwen2-57B
-python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py \
+python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_flliper_fused_moe_triton.py \
     --model Qwen/Qwen2-57B-A14B-Instruct \
     --use-fp8-w8a8
 
 # Compare with custom TP size
-python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py \
+python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_flliper_fused_moe_triton.py \
     --model deepseek-ai/DeepSeek-V3-0324 \
     --tp-size 8
 
 # Compare with custom TP size
-python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py \
+python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_flliper_fused_moe_triton.py \
     --model deepseek-ai/DeepSeek-V3-0324 \
     --tp-size 8
 ```
 
-The benchmark results will be saved as plots and data files in the specified output directory (default: `./configs/benchmark_ops/vllm_sglang_fused_moe/`).
+The benchmark results will be saved as plots and data files in the specified output directory (default: `./configs/benchmark_ops/vllm_flliper_fused_moe/`).
 
 - `benchmark_torch_compile_fused_moe.py`: A tool for benchmarking the performance of the fused MoE kernel with `torch.compile` and original fused MoE kernel.
 
-Usage is similar to `benchmark_vllm_vs_sglang_fused_moe_triton.py`, note that `torch.compile` does not support `fp8_w8a8` and `int8_w8a8` fused_moe_kernel. Both tools now support EP mode with `--ep-size` parameter.
+Usage is similar to `benchmark_vllm_vs_flliper_fused_moe_triton.py`, note that `torch.compile` does not support `fp8_w8a8` and `int8_w8a8` fused_moe_kernel. Both tools now support EP mode with `--ep-size` parameter.

@@ -22,8 +22,8 @@ real ``StreamingSession`` bodies -- no reimplementation of the logic under test.
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
+from flliper.srt.mem_cache.memory_pool import ReqToTokenPool
+from flliper.srt.session.streaming_session import SessionSlot, StreamingSession
 
 
 def _make_pool(size: int = 4, max_context_len: int = 16) -> ReqToTokenPool:
@@ -319,7 +319,7 @@ class AllocRollbackTest(unittest.TestCase):
         self.assertEqual(first.req_pool_idx, held, "the reusing req keeps it")
 
     def test_rollback_keeps_a_chunked_continuation_row(self):
-        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
         pool = object.__new__(HybridReqToTokenPool)
         pool.free_slots = [3, 4]
@@ -351,7 +351,7 @@ class AllocRollbackTest(unittest.TestCase):
         )
 
     def test_rollback_refuses_to_return_an_already_free_row(self):
-        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
         pool = object.__new__(HybridReqToTokenPool)
         pool.free_slots = [2, 3, 4]

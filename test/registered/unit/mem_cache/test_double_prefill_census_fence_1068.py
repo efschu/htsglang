@@ -19,9 +19,9 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.mem_cache import producer_phase_census as pc
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache import producer_phase_census as pc
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -50,7 +50,7 @@ class TestTheCensusCarriesFenceProceeds(CustomTestCase):
     def test_a_module_level_proceed_seeds_the_next_wave(self):
         # ORDER: fence proceed -> reset (previous wave ends) -> readmit wave
         # records. The proceed belongs to the wave being re-admitted.
-        with mock.patch.dict(os.environ, {"SGLANG_MATCH_REFUSAL_CENSUS_EVERY": "1"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_MATCH_REFUSAL_CENSUS_EVERY": "1"}):
             pc.note_fence_proceed()
             pc.reset_double_prefill_census()
             pc.note_double_prefill("r1", already_computed=4096, recovered=4096)
@@ -66,7 +66,7 @@ class TestTheCensusCarriesFenceProceeds(CustomTestCase):
     def test_a_proceed_for_a_wave_that_never_came_does_not_leak(self):
         # cutover A proceeds, re-admits nothing (no census); cutover B does
         # not proceed and re-admits: B's census must read 0, not A's 1.
-        with mock.patch.dict(os.environ, {"SGLANG_MATCH_REFUSAL_CENSUS_EVERY": "1"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_MATCH_REFUSAL_CENSUS_EVERY": "1"}):
             pc.note_fence_proceed()
             pc.reset_double_prefill_census()
             # no readmit in wave A

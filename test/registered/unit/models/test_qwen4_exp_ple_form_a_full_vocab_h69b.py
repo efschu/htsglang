@@ -1,4 +1,4 @@
-"""fnFL2 H69b (SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB): under Form A the host's PLE
+"""fnFL2 H69b (FLLIPER_PDFLIP_FORM_A_PLE_FULL_VOCAB): under Form A the host's PLE
 n-gram table must cover the WHOLE n-gram id space, as F13 already does for
 ``embed_tokens``.
 
@@ -31,14 +31,14 @@ from unittest import mock
 
 import torch
 
-from sglang.srt import rank_role
-from sglang.srt.environ import envs
-from sglang.srt.layers import vocab_parallel_embedding as vpe
-from sglang.srt.models import qwen4_exp as q
-from sglang.srt.models import qwen4_exp_ple_decode_pread as dp
-from sglang.srt.models import qwen4_exp_ple_prefetch as pf
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import rank_role
+from flliper.srt.environ import envs
+from flliper.srt.layers import vocab_parallel_embedding as vpe
+from flliper.srt.models import qwen4_exp as q
+from flliper.srt.models import qwen4_exp_ple_decode_pread as dp
+from flliper.srt.models import qwen4_exp_ple_prefetch as pf
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -86,7 +86,7 @@ def _covered(emb, n_ctx=64, seed=3):
 
 class TestFormAFullVocab(CustomTestCase):
     def test_off_the_host_holds_a_third_and_reads_the_rest_as_zero_rows(self):
-        with envs.SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB.override(False), _d_host():
+        with envs.FLLIPER_PDFLIP_FORM_A_PLE_FULL_VOCAB.override(False), _d_host():
             emb = _emb(_config())
         e = emb.ngram_embedding
         self.assertEqual(e.tp_size, 3)
@@ -100,7 +100,7 @@ class TestFormAFullVocab(CustomTestCase):
             self.assertTrue(rank_role.form_a_dense_is_unsharded())
 
     def test_on_the_host_holds_every_row(self):
-        with envs.SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB.override(True), _d_host():
+        with envs.FLLIPER_PDFLIP_FORM_A_PLE_FULL_VOCAB.override(True), _d_host():
             emb = _emb(_config())
         e = emb.ngram_embedding
         self.assertEqual(e.tp_size, 1)
@@ -113,19 +113,19 @@ class TestFormAFullVocab(CustomTestCase):
         self.assertEqual(e.weight.device.type, "meta")  # nothing materialized
 
     def test_on_without_form_a_or_with_a_copying_backend_is_unchanged(self):
-        with envs.SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB.override(True), _d_host(form_a=False):
+        with envs.FLLIPER_PDFLIP_FORM_A_PLE_FULL_VOCAB.override(True), _d_host(form_a=False):
             self.assertEqual(_emb(_config()).ngram_embedding.tp_size, 3)
-        with envs.SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB.override(True), _d_host():
+        with envs.FLLIPER_PDFLIP_FORM_A_PLE_FULL_VOCAB.override(True), _d_host():
             with self.assertLogs(q.logger, "WARNING") as cm:
                 emb = _emb(_config(backend="pinned"))
         self.assertEqual(emb.ngram_embedding.tp_size, 3)
-        self.assertTrue(any("SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB refused" in r for r in cm.output))
+        self.assertTrue(any("FLLIPER_PDFLIP_FORM_A_PLE_FULL_VOCAB refused" in r for r in cm.output))
 
     def test_kwargs_and_default(self):
-        self.assertFalse(envs.SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB.get())
+        self.assertFalse(envs.FLLIPER_PDFLIP_FORM_A_PLE_FULL_VOCAB.get())
         with _d_host():
             self.assertEqual(q.ple_ngram_vocab_tp_kwargs(_config(), False), {})
-            with envs.SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB.override(True):
+            with envs.FLLIPER_PDFLIP_FORM_A_PLE_FULL_VOCAB.override(True):
                 self.assertEqual(q.ple_ngram_vocab_tp_kwargs(_config(), False), {"enable_tp": False})
                 # attention-TP n-gram lookups (DP attention) keep their own layout
                 self.assertEqual(q.ple_ngram_vocab_tp_kwargs(_config(), True), {})

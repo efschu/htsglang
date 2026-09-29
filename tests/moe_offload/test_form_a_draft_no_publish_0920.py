@@ -5,7 +5,7 @@ carrier all-reduce has no second participant (Bar1CollectiveAborted)."""
 import inspect
 import types
 
-from sglang.srt.models import qwen4_exp as q
+from flliper.srt.models import qwen4_exp as q
 
 
 def test_layers_remember_is_nextn():

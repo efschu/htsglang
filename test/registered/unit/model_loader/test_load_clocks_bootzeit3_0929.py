@@ -8,7 +8,7 @@ clocks below split it; the next boot names the lever:
 
 * ``ExpertLoadPool``: wait_slots_s (blocked on a consumer slot), deferred_s
   (running the per-layer presplit), drain_wait_s (waiting for the tail);
-* ``WEG2-LOAD-COALESCE``: wait_read_s (a read had not landed) versus
+* ``PDFLIP-LOAD-COALESCE``: wait_read_s (a read had not landed) versus
   consume_s (the consumer held the tensor).
 """
 
@@ -23,8 +23,8 @@ from unittest import mock
 import torch
 from safetensors.torch import save_file
 
-from sglang.srt.model_loader import load_consumer as lc
-from sglang.srt.model_loader import weight_utils as W
+from flliper.srt.model_loader import load_consumer as lc
+from flliper.srt.model_loader import weight_utils as W
 
 
 class TestPoolClocks(unittest.TestCase):

@@ -32,7 +32,7 @@ Plan-time arithmetic plus one pass through the real
 `GPTQMarlinLinearScheme.create_weights`; no GPU, no server.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -43,29 +43,29 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     ACTIVATION_VEC_ELEMS,
     set_tp_partition_ratios,
     tp_loaded_shard_start,
     tp_partition_sizes,
 )
-from sglang.srt.layers.linear import _quant_block_aligned_units
-from sglang.srt.layers.moe.fused_moe_triton.layer import moe_uneven_tp_units
-from sglang.srt.layers.quantization.gptq.gptq import (
+from flliper.srt.layers.linear import _quant_block_aligned_units
+from flliper.srt.layers.moe.fused_moe_triton.layer import moe_uneven_tp_units
+from flliper.srt.layers.quantization.gptq.gptq import (
     GPTQConfig,
     GPTQMarlinConfig,
     gptq_uneven_tp_block,
 )
-from sglang.srt.layers.quantization.gptq.schemes.gptq_marlin import (
+from flliper.srt.layers.quantization.gptq.schemes.gptq_marlin import (
     GPTQMarlinLinearScheme,
 )
-from sglang.srt.layers.quantization.marlin_utils import (
+from flliper.srt.layers.quantization.marlin_utils import (
     GPTQ_MARLIN_MIN_THREAD_K,
     GPTQ_MARLIN_MIN_THREAD_N,
     verify_marlin_supports_shape,
 )
-from sglang.srt.layers.quantization.utils import get_dynamic_override
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization.utils import get_dynamic_override
+from flliper.test.test_utils import CustomTestCase
 
 # Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4:
 # dense, GPTQ 4-bit group 128, desc_act False.
@@ -133,7 +133,7 @@ def _without_the_block(config):
 
 
 def _mlp_units(intermediate: int, quant_config) -> int:
-    """Mirrors the derivation in sglang.srt.models.qwen2_moe.Qwen2MoeMLP."""
+    """Mirrors the derivation in flliper.srt.models.qwen2_moe.Qwen2MoeMLP."""
     units = intermediate // math.gcd(intermediate, ACTIVATION_VEC_ELEMS)
     return _quant_block_aligned_units(intermediate, units, quant_config, 1)
 
@@ -144,7 +144,7 @@ def _marlin_scheme(config) -> GPTQMarlinLinearScheme:
     imports the CUDA backend. Neither takes part in weight creation."""
     with (
         mock.patch(
-            "sglang.srt.layers.quantization.gptq.schemes.gptq_marlin.verify_marlin_supported"
+            "flliper.srt.layers.quantization.gptq.schemes.gptq_marlin.verify_marlin_supported"
         ),
         mock.patch.object(
             GPTQMarlinLinearScheme, "_init_kernel", return_value=mock.MagicMock()
@@ -528,7 +528,7 @@ class TestMoEGrainUnchangedForSiblingConfigs(CustomTestCase):
         # kernel's vector width. The property this class exists for holds
         # either way: the GPTQ dense block does not reach the unquantized
         # lane, and 32 units are still finer than any quant grain.
-        from sglang.srt.distributed.utils import ACTIVATION_VEC_ELEMS
+        from flliper.srt.distributed.utils import ACTIVATION_VEC_ELEMS
 
         self.assertEqual(moe_uneven_tp_units(512, None), 512 // ACTIVATION_VEC_ELEMS)
 

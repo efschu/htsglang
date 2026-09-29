@@ -6,17 +6,17 @@ import pytest
 import torch
 from torch import nn
 
-from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
-from sglang.srt.layers.vocab_parallel_embedding import (
+from flliper.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from flliper.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
-from sglang.srt.models import qwen4_exp as qwen4_exp_module
-from sglang.srt.models.qwen4_exp import (
+from flliper.srt.models import qwen4_exp as qwen4_exp_module
+from flliper.srt.models.qwen4_exp import (
     Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLELayer,
 )
-from sglang.srt.utils import set_weight_attrs
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.utils import set_weight_attrs
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -192,7 +192,7 @@ def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
 
 
 def _file_backend_supported() -> bool:
-    from sglang.srt.models.qwen4_exp_ple_table import device_uses_host_page_tables
+    from flliper.srt.models.qwen4_exp_ple_table import device_uses_host_page_tables
 
     return (
         torch.cuda.is_available()

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Example: ModelOpt Quantization and Export with SGLang
+Example: ModelOpt Quantization and Export with fLLiper
 
 This example demonstrates the streamlined workflow for quantizing a model with
-ModelOpt and automatically exporting it for deployment with SGLang.
+ModelOpt and automatically exporting it for deployment with fLLiper.
 """
 
 import argparse
@@ -12,15 +12,15 @@ from typing import Optional
 
 import torch
 
-import sglang as sgl
-from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state import (
+import flliper as sgl
+from flliper.srt.configs.device_config import DeviceConfig
+from flliper.srt.configs.load_config import LoadConfig
+from flliper.srt.configs.model_config import ModelConfig
+from flliper.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.model_loader.loader import get_model_loader
+from flliper.srt.model_loader.loader import get_model_loader
 
 
 def _validate_export(export_dir: str) -> bool:
@@ -83,7 +83,7 @@ def quantize_and_export_model(
     device: str = "cuda",
 ) -> None:
     """
-    Quantize a model with ModelOpt and export it for SGLang deployment.
+    Quantize a model with ModelOpt and export it for fLLiper deployment.
 
     Args:
         model_path: Path to the original model
@@ -164,10 +164,10 @@ def quantize_and_export_model(
     print(f"📁 Quantized model exported to: {export_dir}")
     print("\n🚀 To use the exported model:")
     print(
-        f"   python -m sglang.launch_server --model-path {export_dir} --quantization modelopt"
+        f"   python -m flliper.launch_server --model-path {export_dir} --quantization modelopt"
     )
     print("\n   # Or in Python:")
-    print("   import sglang as sgl")
+    print("   import flliper as sgl")
     print(f"   llm = sgl.Engine(model_path='{export_dir}', quantization='modelopt')")
     print("   # Note: 'modelopt' auto-detects FP4/FP8 from model config")
 
@@ -178,7 +178,7 @@ def deploy_exported_model(
     port: int = 30000,
 ) -> None:
     """
-    Deploy an exported ModelOpt quantized model with SGLang.
+    Deploy an exported ModelOpt quantized model with fLLiper.
 
     Args:
         export_dir: Directory containing the exported model
@@ -193,7 +193,7 @@ def deploy_exported_model(
         return
 
     try:
-        # Launch SGLang engine with the exported model
+        # Launch fLLiper engine with the exported model
         # Using generic "modelopt" for auto-detection of FP4/FP8
         llm = sgl.Engine(
             model_path=export_dir,
@@ -223,7 +223,7 @@ def deploy_exported_model(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ModelOpt Quantization and Export with SGLang",
+        description="ModelOpt Quantization and Export with fLLiper",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

@@ -41,12 +41,12 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.session_checkpoint import (
+from flliper.srt.managers.session_checkpoint import (
     PinCoverageIncomplete,
     pin_imported_pages,
 )
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from flliper.test.test_utils import CustomTestCase
 
 IDENTITY = "sha256:411importpin"
 PAGE = torch.arange(512, dtype=torch.uint8)
@@ -148,7 +148,7 @@ class TestTheImportPathTakesThePin(CustomTestCase):
     def _src(self):
         import inspect
 
-        from sglang.srt.managers.session_checkpoint import SessionCheckpointRuntime
+        from flliper.srt.managers.session_checkpoint import SessionCheckpointRuntime
 
         return inspect.getsource(SessionCheckpointRuntime.import_bundle_and_seed)
 

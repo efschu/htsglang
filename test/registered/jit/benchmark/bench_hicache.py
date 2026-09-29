@@ -25,13 +25,13 @@ import triton
 import triton.testing
 from sgl_kernel import transfer_kv_all_layer, transfer_kv_per_layer
 
-from sglang.jit_kernel.benchmark.utils import DEFAULT_QUANTILES, get_benchmark_range
-from sglang.jit_kernel.hicache import (
+from flliper.jit_kernel.benchmark.utils import DEFAULT_QUANTILES, get_benchmark_range
+from flliper.jit_kernel.hicache import (
     can_use_hicache_jit_kernel,
     transfer_hicache_all_layer,
     transfer_hicache_one_layer,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=29, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -82,7 +82,7 @@ def gen_indices(
     return (indices[:, None] * page_size + offsets).flatten().cuda()[:size]
 
 
-def sglang_aot_transfer_one(
+def flliper_aot_transfer_one(
     k_cache_dst: torch.Tensor,
     v_cache_dst: torch.Tensor,
     indices_dst: torch.Tensor,
@@ -103,7 +103,7 @@ def sglang_aot_transfer_one(
     )
 
 
-def sglang_jit_transfer_one(
+def flliper_jit_transfer_one(
     k_cache_dst: torch.Tensor,
     v_cache_dst: torch.Tensor,
     indices_dst: torch.Tensor,
@@ -124,7 +124,7 @@ def sglang_jit_transfer_one(
     )
 
 
-def sglang_aot_transfer_all(
+def flliper_aot_transfer_all(
     k_ptrs_dst: torch.Tensor,
     v_ptrs_dst: torch.Tensor,
     indices_dst: torch.Tensor,
@@ -147,7 +147,7 @@ def sglang_aot_transfer_all(
     )
 
 
-def sglang_jit_transfer_all(
+def flliper_jit_transfer_all(
     k_ptrs_dst: torch.Tensor,
     v_ptrs_dst: torch.Tensor,
     indices_dst: torch.Tensor,
@@ -245,7 +245,7 @@ def benchmark_one_layer_h2d(
 
     FN_MAP = {
         "aot": lambda: [
-            sglang_aot_transfer_one(
+            flliper_aot_transfer_one(
                 k_cache_dst[i],
                 v_cache_dst[i],
                 indices_dst_gpu,
@@ -257,7 +257,7 @@ def benchmark_one_layer_h2d(
             for i in range(NUM_LAYERS)
         ],
         "jit": lambda: [
-            sglang_jit_transfer_one(
+            flliper_jit_transfer_one(
                 k_cache_dst[i],
                 v_cache_dst[i],
                 indices_dst_gpu,
@@ -352,7 +352,7 @@ def benchmark_all_layer_d2h(
     v_ptrs_dst = _create_ptr_tensor([v_caches_dst[i] for i in range(NUM_LAYERS)])
 
     FN_MAP = {
-        "aot": lambda: sglang_aot_transfer_all(
+        "aot": lambda: flliper_aot_transfer_all(
             k_ptrs_dst,
             v_ptrs_dst,
             indices_dst_gpu,
@@ -362,7 +362,7 @@ def benchmark_all_layer_d2h(
             element_bytes,
             NUM_LAYERS,
         ),
-        "jit": lambda: sglang_jit_transfer_all(
+        "jit": lambda: flliper_jit_transfer_all(
             k_ptrs_dst,
             v_ptrs_dst,
             indices_dst_gpu,

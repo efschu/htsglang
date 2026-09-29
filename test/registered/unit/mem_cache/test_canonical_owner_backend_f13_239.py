@@ -22,12 +22,12 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
-from sglang.srt.mem_cache.canonical_page_store import (
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_page_store import (
     CanonicalAbstainWindow,
     CanonicalPageWindow,
 )
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
 
 PAGE = 64
 LAYERS = 4
@@ -140,7 +140,7 @@ class TestControllerOwnerRows(unittest.TestCase):
         )
 
     def test_owner_rows_only_for_the_paged_owner_form(self):
-        from sglang.srt.managers.cache_controller import canonical_kv_owner_rows_for as f
+        from flliper.srt.managers.cache_controller import canonical_kv_owner_rows_for as f
 
         self.assertEqual(f((64, 46, 64), PAGE, WHOLE), (64, 64, 46, 64))
         self.assertEqual(f((64, 0, 0), PAGE, WHOLE), (64, 64, 0, 0))
@@ -149,7 +149,7 @@ class TestControllerOwnerRows(unittest.TestCase):
         self.assertIsNone(f((64, 0, 46), PAGE, None))
 
     def test_no_page_mask_under_the_paged_owner_form(self):
-        from sglang.srt.managers.cache_controller import HiCacheController as H
+        from flliper.srt.managers.cache_controller import HiCacheController as H
 
         self.assertEqual(H.page_owner_mask_ctx(self._ctl((3, 1, 2))), (3, 1, 2))
         self.assertIsNone(H.page_owner_mask_ctx(self._ctl((64, 0, 46), owner_rows=W1)))
@@ -162,8 +162,8 @@ class _StopAfterChecks(Exception):
 
 class TestAttachLiftsPage1OnlyForOwnerRows(unittest.TestCase):
     def _attach(self, owner_rows, *, worker=False, holds_kv=False):
-        from sglang.srt.managers import cache_controller as cc
-        from sglang.srt import rank_role
+        from flliper.srt.managers import cache_controller as cc
+        from flliper.srt import rank_role
 
         ctl = object.__new__(cc.HiCacheController)
         ctl.enable_storage = False
@@ -187,11 +187,11 @@ class TestAttachLiftsPage1OnlyForOwnerRows(unittest.TestCase):
 
         null = mock.MagicMock(side_effect=_StopAfterChecks)
         with mock.patch(
-            "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend", _create
+            "flliper.srt.mem_cache.storage.StorageBackendFactory.create_backend", _create
         ), mock.patch.object(rank_role, "this_rank_is_form_a_worker", lambda: worker), mock.patch.object(
             rank_role, "form_a_worker_holds_kv", lambda: holds_kv
         ), mock.patch(
-            "sglang.srt.mem_cache.hicache_storage.FormAWorkerNullStorage", null
+            "flliper.srt.mem_cache.hicache_storage.FormAWorkerNullStorage", null
         ):
             with self.assertRaises(_StopAfterChecks):
                 ctl.attach_storage_backend("file")
@@ -202,7 +202,7 @@ class TestAttachLiftsPage1OnlyForOwnerRows(unittest.TestCase):
         self.assertEqual(made, ["factory"])
 
     def test_page64_owner_mode_without_owner_rows_is_still_refused(self):
-        from sglang.srt.managers import cache_controller as cc
+        from flliper.srt.managers import cache_controller as cc
 
         ctl = object.__new__(cc.HiCacheController)
         ctl.enable_storage = False

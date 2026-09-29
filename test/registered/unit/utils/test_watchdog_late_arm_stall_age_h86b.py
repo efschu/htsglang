@@ -22,7 +22,7 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.utils import watchdog as W
+from flliper.srt.utils import watchdog as W
 
 T = 300.0
 PERF_OFFSET = 1.0e6
@@ -94,7 +94,7 @@ def _run_once(wd, clock, extra_patches=()):
 # --------------------------------------------------------------------------------------------------------------
 
 def _build_real(scheduler):
-    from sglang.srt.managers.scheduler_components import invariant_checker as ic
+    from flliper.srt.managers.scheduler_components import invariant_checker as ic
 
     captured = {}
 

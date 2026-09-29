@@ -15,7 +15,7 @@ peak needed 3968 MiB that boot would have died.
 
 import pytest
 
-from sglang.srt.mem_ledger.activation import (
+from flliper.srt.mem_ledger.activation import (
     REFERENCE_WINDOW_FINGERPRINT,
     ActivationProfile,
     FootprintProvenance,
@@ -26,14 +26,14 @@ from sglang.srt.mem_ledger.activation import (
     resolve_phase_footprint,
     save_footprints,
 )
-from sglang.srt.mem_ledger.engine import (
+from flliper.srt.mem_ledger.engine import (
     TERM_ACTIVATION,
     TERM_GRAPH_CAPTURE,
     CardFacts,
     DemandInputs,
     build_card_ledgers,
 )
-from sglang.srt.mem_ledger.terms import (
+from flliper.srt.mem_ledger.terms import (
     DEFAULT_USER_RESERVE_MIB,
     LedgerOvercommit,
     Provenance,
@@ -131,7 +131,7 @@ def test_uncalibrated_activation_refuses_and_names_the_probe():
     assert x.unbounded
     assert not x.fits
     with pytest.raises(LedgerOvercommit) as excinfo:
-        from sglang.srt.mem_ledger.contract import enforce_boot_contract
+        from flliper.srt.mem_ledger.contract import enforce_boot_contract
 
         enforce_boot_contract([x], log=False)
     text = str(excinfo.value)
@@ -149,7 +149,7 @@ def test_uncalibrated_activation_is_not_silently_zero():
 def test_a_calibrated_term_without_a_fingerprint_is_rejected():
     """No 'unknown' sentinel: an un-invalidatable calibrated number is a
     literal wearing a label."""
-    from sglang.srt.mem_ledger.terms import LedgerError
+    from flliper.srt.mem_ledger.terms import LedgerError
 
     with pytest.raises(LedgerError):
         build_card_ledgers(

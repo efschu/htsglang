@@ -29,7 +29,7 @@ F1b  ONE SOURCE OF TRUTH. The parse pops its defaults FROM
      `PrefetchTimeoutConfig`; the attached tree's effective base equals the
      config's with no extra config and the override with one; no other
      numeric default for ``prefetch_timeout_base`` exists under
-     python/sglang/srt; the effective pair is printed at attach.
+     python/flliper/srt; the effective pair is printed at attach.
 F1c  THE REAP IS A LINE. Driving the real `check_prefetch_progress` over an
      unprobed, timed-out operation (the #937 harness: a real CPU
      `UnifiedRadixCache`, a real host pool, a real `PrefetchOperation`)
@@ -59,26 +59,26 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.managers.cache_controller import (
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.managers.cache_controller import (
     PrefetchOperation as BasePrefetchOperation,
 )
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.hicache_phase_binding import binding_state
-from sglang.srt.mem_cache.hicache_storage import PrefetchOutcome, PrefetchTimeoutConfig
-from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.hicache_phase_binding import binding_state
+from flliper.srt.mem_cache.hicache_storage import PrefetchOutcome, PrefetchTimeoutConfig
+from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from flliper.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
-from sglang.srt.mem_cache.unified_radix_cache import (
+from flliper.srt.mem_cache.unified_radix_cache import (
     _POOL_SLOT_COUNT,
     _REAP_PACKED_LEN,
     _REAP_SLOT_ANCHOR,
@@ -89,9 +89,9 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -99,7 +99,7 @@ REQUESTED_TOKENS = 84_026  # the LONG re-admission of boot weg1b3, page_size=1
 PROBED_PAGES = 6009  # c4e85437's probed hit on the same cutover (log 100171)
 PAGE_SIZE = 1
 SRT_ROOT = os.path.join(
-    os.path.dirname(__file__), "..", "..", "..", "..", "python", "sglang", "srt"
+    os.path.dirname(__file__), "..", "..", "..", "..", "python", "flliper", "srt"
 )
 
 
@@ -213,7 +213,7 @@ class F1bOneSourceOfTruthForTheTimeout(CustomTestCase):
 
     def test_no_second_numeric_default_exists_under_srt(self):
         """The grep the operator named: exactly one default definition. Every
-        line under python/sglang/srt naming `prefetch_timeout_base` beside a
+        line under python/flliper/srt naming `prefetch_timeout_base` beside a
         numeric literal is a second default; there must be none (the config
         field is `base`)."""
         offenders = []
@@ -239,7 +239,7 @@ class F1bOneSourceOfTruthForTheTimeout(CustomTestCase):
             extra_metric_labels=None,
         )
         apply = UnifiedRadixCache._apply_storage_runtime_config.__get__(stub)
-        with self.assertLogs("sglang.srt.mem_cache.unified_radix_cache", "INFO") as cm:
+        with self.assertLogs("flliper.srt.mem_cache.unified_radix_cache", "INFO") as cm:
             apply(
                 storage_backend="file",
                 prefetch_threshold=256,
@@ -389,7 +389,7 @@ class F1cTheReapIsALine(CustomTestCase):
     def test_a_timed_out_unprobed_operation_prints_the_reap(self):
         """THE MATCHED CHECK: the line with probed=False and the numbers."""
         cache, _ = _reap_scenario(probed=False)
-        with self.assertLogs("sglang.srt.mem_cache.unified_radix_cache", "WARNING") as cm:
+        with self.assertLogs("flliper.srt.mem_cache.unified_radix_cache", "WARNING") as cm:
             self.assertTrue(cache.check_prefetch_progress(REAP_REQ))
         out = "\n".join(cm.output)
         self.assertIn(
@@ -425,7 +425,7 @@ class F1cTheReapIsALine(CustomTestCase):
     def test_a_completed_probed_operation_is_not_a_reap(self):
         """CAN-FAIL COUNTERWEIGHT: the line is per reap, not per completion."""
         cache, _ = _reap_scenario(probed=True)
-        with self.assertLogs("sglang.srt.mem_cache.unified_radix_cache", "INFO") as cm:
+        with self.assertLogs("flliper.srt.mem_cache.unified_radix_cache", "INFO") as cm:
             self.assertTrue(cache.check_prefetch_progress(REAP_REQ))
         out = "\n".join(cm.output)
         self.assertNotIn("#1157 PREFETCH REAPED", out)
@@ -524,7 +524,7 @@ class N1TheReapAnnotationIsRankUniform(CustomTestCase):
             packed[_REAP_SLOT_HIT_TOKENS] = 0
 
         cache._all_reduce_attn_groups = _peer_min
-        with self.assertLogs("sglang.srt.mem_cache.unified_radix_cache", "WARNING") as cm:
+        with self.assertLogs("flliper.srt.mem_cache.unified_radix_cache", "WARNING") as cm:
             self.assertTrue(cache.check_prefetch_progress(REAP_REQ))
         self.assertEqual(seen["len"], _REAP_PACKED_LEN)
         self.assertEqual(seen["proposed"], (1, REAP_TOKENS))

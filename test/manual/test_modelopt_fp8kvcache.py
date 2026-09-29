@@ -1,11 +1,11 @@
 import unittest
 
-from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.modelopt_quant import (
+from flliper.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from flliper.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     ModelOptFp8KVCacheMethod,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestModelOptFp8KVCacheMethod(CustomTestCase):

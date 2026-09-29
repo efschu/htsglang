@@ -1,4 +1,4 @@
-# htsglang runtime image — uneven-TP sglang fork.
+# htsglang runtime image — uneven-TP flliper fork.
 #
 # Features baked in:
 #   - uneven Tensor Parallelism (--rank-tp-ratio auto, --rank-gpu-memory-mib)
@@ -13,7 +13,7 @@
 #     -> needs libucx0 at runtime (ctypes dlopen of libucp.so.0).
 #   - the planner / rigmon GUI (MODE=planner in the entrypoint). The planner's
 #     web UI is stdlib http.server — no fastapi/uvicorn/jinja needed — but its
-#     quality-benchmark tab pulls the `sglang[planner]` extra, which needs
+#     quality-benchmark tab pulls the `flliper[planner]` extra, which needs
 #     libcairo2 at runtime.
 #
 # Strategy: reproduce the validated host venv via pip (torch 2.11.0,
@@ -44,7 +44,7 @@
 #
 # sm_75 (Turing, RTX 2080 Ti) therefore runs WITHOUT sgl-kernel. That is a
 # supported configuration of this fork, not an accident: `sgl_kernel_runnable()`
-# in python/sglang/srt/utils/common.py compares the live device capability
+# in python/flliper/srt/utils/common.py compares the live device capability
 # against SGL_KERNEL_MIN_CUDA_CC = (8, 0) and routes to `forward_native` /
 # Triton / the torch-native sampler when the card is below it. So a Turing rank
 # works whether the wheel is installed or not; installing it merely wastes
@@ -62,17 +62,17 @@
 #
 #   barlink BAR1 (peer-VRAM transport). Compiles against the open-kernel-module
 #   headers at barlink_bar1_ext.py NV_SOURCE_DEFAULT=/spinning/nvidia-open-595,
-#   overridable via SGLANG_BARLINK_BAR1_NV_SOURCE. It additionally needs a
+#   overridable via FLLIPER_BARLINK_BAR1_NV_SOURCE. It additionally needs a
 #   patched out-of-tree driver and /dev/dmabuf_holder on the host, so vendoring
 #   the headers alone would not make it work. DECISION: the image ships without
 #   it. Expected behaviour is the named refusal at barlink_bar1_ext.py:2098-2103
-#   ("... cannot be called. Set the path via SGLANG_BARLINK_BAR1_NV_SOURCE"),
+#   ("... cannot be called. Set the path via FLLIPER_BARLINK_BAR1_NV_SOURCE"),
 #   logged at INFO, and a fall back to the other barlink transports -- never a
 #   silent switch to NCCL. To enable it, mount the headers and set the env.
 #
 #   GDR crossover probe. planner/comm_suite.py _GDR_CROSSOVER_DEFAULT_BIN
 #   points at /spinning/gdr-uebergabe/gpurdma_04_bench, overridable via
-#   SGLANG_GDR_CROSSOVER_BIN. The binary is MIT but version-locked to the
+#   FLLIPER_GDR_CROSSOVER_BIN. The binary is MIT but version-locked to the
 #   installed driver's ioctl layout, which is why it is never vendored.
 #   DECISION: the arm is expected ABSENT in the image. The suite must report it
 #   as absent; an absent probe reported as a zero would be a false measurement.
@@ -91,7 +91,7 @@ ARG FLASHINFER_VERSION=0.6.14
 ARG TRITON_VERSION=3.6.0
 ARG NCCL_VERSION=2.30.7
 ARG NCCL_PACKAGE=nvidia-nccl-cu13
-ARG SGLANG_SCM_VERSION=0.0.0.dev15138
+ARG FLLIPER_SCM_VERSION=0.0.0.dev15138
 
 # Feature toggles.
 #   INSTALL_SGL_KERNEL=0 -> Turing-only slim image (see the arch block above).
@@ -141,7 +141,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=htsglang-apt \
 #
 # UCX refuses to interoperate across releases with a different UCP wire address
 # format. Running the SAME image on both nodes is what guarantees parity; if
-# the second node runs UCX from the host instead, point SGLANG_BARLINK_UCX_LIB at
+# the second node runs UCX from the host instead, point FLLIPER_BARLINK_UCX_LIB at
 # a matching build on both sides.
 ARG INSTALL_UCX
 RUN --mount=type=cache,target=/var/cache/apt,id=htsglang-apt \
@@ -200,13 +200,13 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
 COPY python /sgl-workspace/sglang/python
 COPY rust /sgl-workspace/sglang/rust
 COPY proto /sgl-workspace/sglang/proto
-ARG SGLANG_SCM_VERSION
+ARG FLLIPER_SCM_VERSION
 ARG NCCL_PACKAGE
 ARG NCCL_VERSION
 RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
     --mount=type=cache,target=/root/.cargo/registry,id=htsglang-cargo \
     cd /sgl-workspace/sglang/python \
-    && SETUPTOOLS_SCM_PRETEND_VERSION="${SGLANG_SCM_VERSION}" \
+    && SETUPTOOLS_SCM_PRETEND_VERSION="${FLLIPER_SCM_VERSION}" \
        python3 -m pip install -c /sgl-workspace/constraints.txt -e "." \
     && python3 -m pip install --no-deps --force-reinstall \
        "${NCCL_PACKAGE}==${NCCL_VERSION}"
@@ -231,7 +231,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
 #     therefore stdlib-only and reads dist-info RECORDs plus the ELF objects
 #     directly -- the same file-inspection route the runbook itself uses to
 #     verify an installed wheel without importing it. It is invoked by PATH
-#     with `python3 -I`, so it neither imports nor needs the `sglang` package.
+#     with `python3 -I`, so it neither imports nor needs the `flliper` package.
 #
 #     DEFAULTS PRESERVE TODAY'S IMAGE. With no build args, nothing is
 #     installed and nothing is required beyond "exactly one distribution
@@ -245,7 +245,7 @@ ARG REQUIRE_INT8_ARM=0
 COPY docker/kernel-wheel /tmp/htsglang-wheels
 RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
     set -eu; \
-    GUARD=/sgl-workspace/sglang/python/sglang/srt/utils/kernel_dist_guard.py; \
+    GUARD=/sgl-workspace/sglang/python/flliper/srt/utils/kernel_dist_guard.py; \
     test -f "${GUARD}" || { echo "FATAL: kernel guard missing from the fork source"; exit 1; }; \
     if [ "${INSTALL_SGL_KERNEL}" != "1" ]; then \
       echo "INSTALL_SGL_KERNEL=0 -> no sgl_kernel in this image; provenance gate skipped"; \
@@ -283,7 +283,7 @@ RUN set -eu; \
     strings "${NCCL_LIB}" | grep -qF "${NCCL_VERSION}" \
       && echo "NCCL ${NCCL_VERSION} confirmed" \
       || { echo "FATAL: bundled NCCL is not ${NCCL_VERSION}"; exit 1; }; \
-    test -f /sgl-workspace/sglang/python/sglang/srt/entrypoints/engine.py \
+    test -f /sgl-workspace/sglang/python/flliper/srt/entrypoints/engine.py \
       && echo "fork source present" \
       || { echo "FATAL: fork source missing"; exit 1; }
 
@@ -303,8 +303,8 @@ COPY --chmod=0755 docker/htsglang-entrypoint.sh /usr/local/bin/htsglang-entrypoi
 #    so an UNMOUNTED run still works (it just loses the cache on exit).
 #    See docker/htsglang.env.example for what each one holds.
 RUN mkdir -p \
-      /root/.cache/sglang \
-      /root/.cache/sglang/rigmon \
+      /root/.cache/flliper \
+      /root/.cache/flliper/rigmon \
       /root/.cache/flashinfer \
       /root/.cache/torch_extensions \
       /root/.triton \
@@ -316,21 +316,21 @@ RUN mkdir -p \
 # CHAT_TEMPLATE is deliberately NOT set here: the froggeric v21.3 template is
 # Qwen-specific, and a baked-in default would silently apply it to every model.
 # The compose files set it explicitly.
-# SGLANG_BARLINK_LAUNCH_DUMP=0 closes AUDIT-251 section 3.2's first flag. The
+# FLLIPER_BARLINK_LAUNCH_DUMP=0 closes AUDIT-251 section 3.2's first flag. The
 # #603b launch sampler is ON by default and writes one line per live transport
 # per second, forever, to /spinning/wedge-catch-603b -- a rig directory that
 # does not exist in this image. The default stays ON in the tree deliberately
 # (the #631 wedge hunt is reading those files, and an audit branch is not where
 # another strand's instrument gets switched off), so the image is the correct
 # place to turn it off. Flip this to 1 only to debug a wedge INSIDE a
-# container, and give it a writable SGLANG_BARLINK_LAUNCH_DUMP_DIR if you do.
+# container, and give it a writable FLLIPER_BARLINK_LAUNCH_DUMP_DIR if you do.
 ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}" \
-    SGLANG_BARLINK_LAUNCH_DUMP=0 \
+    FLLIPER_BARLINK_LAUNCH_DUMP=0 \
     HICACHE_STORAGE_DIR=/var/lib/htsglang/hicache \
     TRITON_CACHE_DIR=/root/.triton \
     TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
-    SGLANG_PLANNER_PROFILES=/root/.cache/sglang/planner_profiles.json \
-    SGLANG_PLANNER_GRAPH_ANCHORS=/root/.cache/sglang/graph_mem_anchors.json
+    FLLIPER_PLANNER_PROFILES=/root/.cache/flliper/planner_profiles.json \
+    FLLIPER_PLANNER_GRAPH_ANCHORS=/root/.cache/flliper/graph_mem_anchors.json
 
 # 30000 = OpenAI-compatible server; 8780 = planner web UI (MODE=planner);
 # 8770 = rigmon aggregator, if it is started manually.

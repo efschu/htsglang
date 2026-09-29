@@ -34,9 +34,9 @@ fi
 
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$WT/python"
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 
 cd "$WT" || exit 1
 : > "$LOG"
@@ -45,7 +45,7 @@ cd "$WT" || exit 1
 # what makes the auto table inventory a relief rung at all -- without it the
 # ladder is base-only and nothing can flip. --enable-kv-session-offload arms
 # the second one, so the run exercises both wired reliefs.
-setsid "$VENV/bin/python" -u -m sglang.launch_server \
+setsid "$VENV/bin/python" -u -m flliper.launch_server \
   --model-path "$MODEL" \
   --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
   --rank-auto-reserve-mib 5500,3800,3800 \

@@ -1,0 +1,1242 @@
+"""fnFL2 H18 (E1 of H17): hand the END of a finished P prompt to D.
+
+THE COST THIS REMOVES (fnFL2x132, rid pdflip-0-4, N=97841, page 64). P cut the
+last chunk on the page grid (``_pdflip_end_anchor_split``, grain = page under
+QSA), the radix tree keeps whole pages only, and the GDN anchor sits on the
+64-token grid. D resumed at 97792 and extended 49 tokens through all 48
+layers -- a nearly full expert sweep (0.20 GiB H2D per layer, 840-968 ms),
+the critical path of the flip.
+
+THE HAND-OFF. P cuts the last-but-one chunk at ``c = floor_r(N-1)`` with r
+the QSA compress ratio (4): QSA only refuses a prefix that splits a group
+(qwen_sparse_attn_backend ``prefix_lens % ratio == 0``). The tree node and
+its GDN anchor stay at ``floor_page(c)`` (the chunk [X, c) tracks its anchor
+through the upstream "unaligned -> retrieve from h" path). What exists only
+on P is captured per PP rank:
+
+* the GDN working slot after the chunk [X, c) -- the recurrent state after
+  EXACTLY c tokens -- copied on the forward stream at the stash of that chunk,
+  i.e. after its forward and before the forward of the final chunk
+  (``capture_state``);
+* the KV rows and the QSA compressed rows of the partial page
+  [floor_page(c), c), read at ``cache_finished_req`` before the unaligned
+  tail is freed (``publish_rows``).
+
+Both land as one part file per rank in ``<arena dir>/handoff`` beside the
+#1442 hand-off, with a small JSON header (``TailHeader``) carrying the key,
+the covered global layer ids, the row shapes and a digest per section. The
+key is a hash of the token ids [0, c) and the extra key: token-exact, so a
+part can never be applied to another prompt (needle safety).
+
+D takes the parts over in pdflip/tail_adopt.py (H21): a group MIN vote in the
+prefetch-progress collective, the partial page as a request-owned page at the
+admission commit, rows + state written at the extend's first GDN layer,
+extend [c, N).
+
+E2 (H24, ``FLLIPER_PDFLIP_TAIL_SKIP_EXTEND``). P has computed the final chunk
+[c, N) itself and sampled the first output token (leg 1 is
+``max_new_tokens=1``), so at ``cache_finished_req`` it also owns the END
+state: the KV rows [floor_page(c), N), the QSA pending-ring rows of the open
+group [floor_r(N), N) (plus their RoPE positions), the GDN working slot after
+all N tokens, and ``req.output_ids[-1]``. The same part file carries them as
+an ``end`` section (``EndHeader`` + payload key ``"end"``), gathered on the
+FORWARD STREAM after that chunk's forward (no host sync on P) and written by
+the publish thread once the gather's event fired. D then needs no extend
+forward at all (pdflip/tail_adopt.py, "SKIP").
+"""
+
+from __future__ import annotations
+
+from array import array
+import contextlib
+import glob
+import hashlib
+import itertools
+import logging
+import os
+import threading
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+import msgspec
+import torch
+
+from flliper.srt.environ import envs
+from flliper.srt.pdflip import ple_state
+
+logger = logging.getLogger(__name__)
+
+#: rids whose part files P keeps (older ones are removed at the next publish);
+#: one 97k prompt is ~78 MiB of GDN state across the P ranks (host RAM law).
+KEEP_RIDS = 2
+#: fnFL2 H42: with several END-ANCHOR tails per pass
+#: (FLLIPER_PDFLIP_ENABLE_P_MULTI_ANCHOR_TAILS) one P phase leaves one capture and
+#: one part-file set PER OPEN REQUEST -- bounded by P's --max-running-requests
+#: (the request slots P holds until the flip). Fallback when the server args are
+#: unreadable (a desk test): the p_bs-4 form. ~26 MiB of GDN state per rid and
+#: rank either way (host RAM law: grows with p_bs, not with the prompt).
+KEEP_CAPTURES_MULTI_TAIL = 4
+
+
+def capture_keep() -> int:
+    """How many rids' captures and part files P keeps (fnFL2 H42)."""
+    if not envs.FLLIPER_PDFLIP_ENABLE_P_MULTI_ANCHOR_TAILS.get():
+        return KEEP_RIDS
+    try:
+        from flliper.srt.runtime_context import get_server_args
+
+        mrr = int(get_server_args().max_running_requests or 0)
+    except Exception:  # noqa: BLE001 -- no server args (desk): the p_bs-4 form
+        mrr = KEEP_CAPTURES_MULTI_TAIL
+    if mrr <= 0:  # unset: the p_bs-4 form
+        mrr = KEEP_CAPTURES_MULTI_TAIL
+    return max(KEEP_RIDS, mrr)
+
+
+def enabled() -> bool:
+    return bool(envs.FLLIPER_PDFLIP_TAIL_HANDOFF.get())
+
+
+def skip_extend_enabled() -> bool:
+    """E2 (H24): FLLIPER_PDFLIP_TAIL_SKIP_EXTEND under TAIL_HANDOFF + TAIL_ADOPT."""
+    return (
+        enabled()
+        and bool(envs.FLLIPER_PDFLIP_TAIL_ADOPT.get())
+        and bool(envs.FLLIPER_PDFLIP_TAIL_SKIP_EXTEND.get())
+    )
+
+
+def fold_enabled() -> bool:
+    """H63: FLLIPER_PDFLIP_ENABLE_P_TAIL_FOLD, only on top of E2 (the END
+    section is then the whole hand-off)."""
+    return bool(envs.FLLIPER_PDFLIP_ENABLE_P_TAIL_FOLD.get()) and skip_extend_enabled()
+
+
+def fold_applies(n_tokens: int, page_size: int) -> bool:
+    """H63: may the tail of an N-token prompt run inside its last chunk?
+    Only where the last chunk's extra_buffer track lands on the same page
+    anchor the cut would give, floor_page(N) == floor_page(N-1), i.e. N not a
+    page multiple; at N % page == 0 the fold would anchor at N (one token
+    deeper than any reader may claim) and the cut stays."""
+    page = int(page_size or 1)
+    return fold_enabled() and page > 1 and int(n_tokens) % page != 0
+
+
+# -- geometry (pure) -------------------------------------------------------------
+def anchor_grain(page_size: int, qsa_ratio: Optional[int]) -> int:
+    """Where the end-of-prefill cut may land. 1 without QSA (unchanged);
+    under QSA the compress ratio when the tail hand-off is on (a prefix may
+    not split a compressed group), else the page (fnFL2x14 form)."""
+    if int(page_size or 1) <= 1 or qsa_ratio is None:
+        return 1
+    return int(qsa_ratio) if enabled() else int(page_size)
+
+
+def tail_cut(n_tokens: int, grain: int) -> int:
+    """c = floor_grain(N-1): the deepest position a reader may claim."""
+    return (int(n_tokens) - 1) // int(grain) * int(grain)
+
+
+def page_floor(pos: int, page_size: int) -> int:
+    return int(pos) // int(page_size) * int(page_size)
+
+
+#: F4 (#259 4c): the part name prefix of a D-park END part ("dpark<tp>-<pid>").
+PARK_PART = "dpark"
+
+
+def is_park_part(part: str) -> bool:
+    return str(part).startswith(PARK_PART)
+
+
+def _is_park_file(path: str) -> bool:
+    return f".tail.{PARK_PART}" in os.path.basename(path)
+
+
+def park_end_enabled() -> bool:
+    """F4, default off (FLLIPER_PDFLIP_ENABLE_D_PARK_END), on top of E2 (the
+    resume of a parked request is the skip of its END state)."""
+    return bool(envs.FLLIPER_PDFLIP_ENABLE_D_PARK_END.get()) and skip_extend_enabled()
+
+
+def park_ids(req) -> List[int]:
+    """The tokens a running D request has CONSUMED: its prompt and every
+    output token but the last (sampled, not yet fed to the model)."""
+    out = list(req.output_ids or ())
+    return list(req.origin_input_ids) + out[:-1]
+
+
+def park_spec(rid: str, ids: Sequence[int], extra_key: Optional[str], window_from: int,
+              grain: int) -> Optional[TailSpec]:
+    """F4: the END hand-off of a parked request -- the state after all
+    ``len(ids)`` consumed tokens, the KV rows from ``window_from`` (a page
+    boundary the resume re-enters at or after, D's #59b anchor) to the end.
+    None when nothing lies between (the resume is already short)."""
+    n = len(ids)
+    if n < 2 or int(grain) < 1:
+        return None
+    cut = tail_cut(n, grain)
+    prefix = int(window_from)
+    if prefix < 0 or cut <= prefix:
+        return None
+    return TailSpec(rid=str(rid), n_tokens=n, page_prefix=prefix, cut=cut, key=tail_key(ids, cut, extra_key))
+
+
+def tail_key(ids: Sequence[int], cut: int, extra_key: Optional[str]) -> str:
+    """Token-exact key of the prefix [0, cut) (+ extra key)."""
+    h = hashlib.sha256()
+    h.update(str(extra_key or "").encode())
+    h.update(b"\0")
+    h.update(array("q", ids[:cut]).tobytes())
+    return h.hexdigest()[:32]
+
+
+class TailSpec(msgspec.Struct, frozen=True):
+    rid: str
+    n_tokens: int
+    page_prefix: int
+    cut: int
+    key: str
+
+    @property
+    def rows(self) -> int:
+        return self.cut - self.page_prefix
+
+    @property
+    def extend(self) -> int:
+        return self.n_tokens - self.cut
+
+
+def spec_for(rid: str, ids: Sequence[int], extra_key: Optional[str], page_size: int, grain: int) -> Optional[TailSpec]:
+    """The hand-off of a prompt of len(ids) tokens, or None when there is
+    nothing to hand over (no partial page below the cut, or no grain gain)."""
+    n = len(ids)
+    if n < 2 or int(grain) >= int(page_size):
+        return None
+    cut = tail_cut(n, grain)
+    prefix = page_floor(cut, page_size)
+    if cut <= prefix:
+        return None
+    return TailSpec(rid=str(rid), n_tokens=n, page_prefix=prefix, cut=cut, key=tail_key(ids, cut, extra_key))
+
+
+def extend_range(spec: TailSpec) -> Tuple[int, int]:
+    """D's extend after an adopted tail: [c, N)."""
+    return spec.cut, spec.n_tokens
+
+
+def end_geometry(spec: TailSpec, ratio: int) -> Tuple[int, int, int]:
+    """E2: (rows, complete_groups, ring_rows) of the END section -- the rows
+    [page_prefix, N), the QSA groups in them that are complete (their
+    compressed row exists), and the open group's members [floor_r(N), N)
+    that live only in the per-request pending ring. ratio 0 = no QSA."""
+    rows = spec.n_tokens - spec.page_prefix
+    if not ratio:
+        return rows, 0, 0
+    return rows, rows // int(ratio), spec.n_tokens % int(ratio)
+
+
+def agree_cut(page_prefix: int, cut: int, local_ok: bool, reduce_min: Callable[[int], int]) -> int:
+    """The group's resume depth: c only when EVERY rank can serve it (a rank
+    without GDN/KV layers answers 1, like FormAWorkerNullStorage), else the
+    page prefix. ``reduce_min`` is the MIN all-reduce over the whole tp group
+    (identity on a single rank)."""
+    return int(cut) if int(reduce_min(1 if local_ok else 0)) == 1 else int(page_prefix)
+
+
+def digest(tensors: Sequence[torch.Tensor]) -> str:
+    """SEAM-digest style: sha1 over the raw bytes of CPU tensors, in order."""
+    h = hashlib.sha1()
+    for t in tensors:
+        h.update(t.detach().contiguous().view(torch.uint8).numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+# -- file layout -----------------------------------------------------------------
+class EndHeader(msgspec.Struct, frozen=True):
+    """E2: the END section of a part -- state after all N tokens."""
+
+    first_token: int
+    key: str  # tail_key(ids, N): the section belongs to exactly this prompt
+    rows: int  # N - page_prefix KV rows
+    groups: int  # complete QSA groups among them (0 without QSA)
+    ring_rows: int  # N % ratio open-group members (0 without QSA)
+    fa_digest: str
+    gdn_digest: str
+    ring_digest: str
+    nbytes: int
+    #: H63c: digest of the PLE rows after N ('' = none carried)
+    ple_digest: str = ""
+
+
+class EndPayload(msgspec.Struct):
+    """E2 payload of one rank, host tensors once ``event`` fired. fa: gid ->
+    (K, V[, compressed]) rows; gdn: gid -> (temporal, conv...) after N; ring:
+    gid -> (index-K pending rows,); rope: [ring_rows, 3] or None."""
+
+    first_token: int
+    key: str
+    rows: int
+    groups: int
+    ring_rows: int
+    fa: Dict[int, Tuple[torch.Tensor, ...]]
+    gdn: Dict[int, Tuple[torch.Tensor, ...]]
+    ring: Dict[int, Tuple[torch.Tensor, ...]]
+    rope: Optional[torch.Tensor]
+    event: object = None
+    #: H63c: the PLE side-state rows after N (pdflip/ple_state.py), or None
+    ple: Optional[Dict[str, torch.Tensor]] = None
+
+
+def ring_order(ring: Dict[int, Tuple[torch.Tensor, ...]], rope: Optional[torch.Tensor]) -> List[torch.Tensor]:
+    return _fa_order(ring) + ([rope] if rope is not None else [])
+
+
+class TailHeader(msgspec.Struct, frozen=True):
+    spec: TailSpec
+    part: str
+    fa_layers: List[int]
+    gdn_layers: List[int]
+    fa_row_shapes: Dict[str, List[int]]
+    gdn_row_shapes: Dict[str, List[int]]
+    fa_digest: str
+    gdn_digest: str
+    nbytes: int
+    end: Optional[EndHeader] = None
+    #: H45: how many parts P publishes for this rid (its PP size); every part
+    #: names the whole manifest, so D can tell "2 of 3 written so far" from
+    #: "complete". 0 = a pre-H45 header (the count is unknown).
+    n_parts: int = 0
+    #: H63 (tail fold): False = an END-only part. The E1 payload is empty (its
+    #: digests are those of nothing), the layer lists and row shapes above
+    #: describe the END section, and D can serve it as E2 (skip) or not at
+    #: all -- there is no state at c. True = every pre-H63 header.
+    e1: bool = True
+    #: H63c: digest of the E1 PLE rows (state at c; '' = none carried)
+    ple_digest: str = ""
+
+
+def _dir() -> str:
+    base = os.environ.get("FLLIPER_HICACHE_ARENA_DIR", "").strip()
+    return os.path.join(base, "handoff") if base else ""
+
+
+def part_paths(rid: str, part: str) -> Tuple[str, str]:
+    d = _dir()
+    stem = os.path.join(d, f"{rid}.tail.{part}")
+    return f"{stem}.json", f"{stem}.pt"
+
+
+def _part_index(part: str) -> str:
+    """'pp2-266044' -> 'pp2': the publishing PP rank (the pid is per boot)."""
+    return part.split("-", 1)[0]
+
+
+# -- H81: a part file under write is never another writer's or a pruner's ------
+#: fnNV4f2 P PP0 05:08:43: the publish thread of pdflip-8-14 (its second leg 1,
+#: a requeue) died at `os.replace(tmp, ppath)` with FileNotFoundError -- the
+#: publish thread of pdflip-8-12, one second earlier, had pruned "pdflip-8-14" as
+#: an OLD rid (its only header was the first leg's, 05:08:22) and `remove`
+#: globbed `pdflip-8-14.tail.*`, the in-flight `...pt.267295.tmp` included. The
+#: temp name was `<path>.<pid>.tmp`, so two writers of one part in one process
+#: would have shared it too. Now: one temp name per WRITE, a temp file is never
+#: removed by `remove`/`_remove_consumed`, a rid under write (a temp file on any
+#: rank, or a writer of this process) is the NEWEST rid for the prune, and the
+#: writers of one (rid, part) in this process take turns so the payload and the
+#: header they leave belong together.
+_TMP_SEQ = itertools.count()
+_WRITERS_GUARD = threading.Lock()
+_WRITERS: Dict[Tuple[str, str], list] = {}  # (rid, part) -> [RLock, writers]
+_INFLIGHT: Dict[str, int] = {}  # rid -> writers of this process
+
+
+def _tmp_path(path: str) -> str:
+    """H81: the temp name of ONE write: pid, thread and a process-wide
+    sequence number -- two writers never share it."""
+    return f"{path}.{os.getpid()}.{threading.get_ident()}.{next(_TMP_SEQ)}.tmp"
+
+
+def _is_tmp(path: str) -> bool:
+    return path.endswith(".tmp")
+
+
+@contextlib.contextmanager
+def _writing(rid: str, part: str):
+    """H81: this process writes (rid, part) -- writers of the same part take
+    turns, and `_prune` of this process never picks the rid meanwhile."""
+    key = (str(rid), str(part))
+    with _WRITERS_GUARD:
+        ent = _WRITERS.get(key)
+        if ent is None:
+            ent = _WRITERS[key] = [threading.RLock(), 0]
+        ent[1] += 1
+        _INFLIGHT[key[0]] = _INFLIGHT.get(key[0], 0) + 1
+    ent[0].acquire()
+    try:
+        yield
+    finally:
+        ent[0].release()
+        with _WRITERS_GUARD:
+            ent[1] -= 1
+            if ent[1] <= 0 and _WRITERS.get(key) is ent:
+                del _WRITERS[key]
+            n = _INFLIGHT.get(key[0], 0) - 1
+            if n > 0:
+                _INFLIGHT[key[0]] = n
+            else:
+                _INFLIGHT.pop(key[0], None)
+
+
+def _inflight_rids() -> set:
+    with _WRITERS_GUARD:
+        return set(_INFLIGHT)
+
+
+def manifest_state(headers: Sequence[TailHeader]) -> Tuple[str, int, int]:
+    """H45: (state, have, want) of the parts D sees for one rid -- 'none'
+    (no header yet), 'partial' (fewer PP ranks than the manifest names:
+    P's publish threads are still writing), 'complete', 'excess' (more
+    headers than P publishes: a stale part), 'differs' (the parts disagree
+    on the count) or 'legacy' (pre-H45 headers without a count: taken as
+    they are, the H21 form)."""
+    have = len(headers)
+    if not have:
+        return "none", 0, 0
+    wants = {int(h.n_parts) for h in headers}
+    if len(wants) > 1:
+        return "differs", have, max(wants)
+    want = wants.pop()
+    if want <= 0:
+        return "legacy", have, 0
+    if have > want:
+        return "excess", have, want
+    if len({_part_index(h.part) for h in headers}) < want:
+        return "partial", have, want
+    return "complete", have, want
+
+
+def headers_for(rid: str) -> List[TailHeader]:
+    d = _dir()
+    if not d:
+        return []
+    out = []
+    for p in sorted(glob.glob(os.path.join(d, f"{glob.escape(rid)}.tail.*.json"))):
+        try:
+            with open(p, "rb") as f:
+                out.append(msgspec.json.decode(f.read(), type=TailHeader))
+        except (OSError, msgspec.DecodeError):
+            logger.warning("PDFLIP-TAIL header unreadable: %s", p, exc_info=True)
+    return out
+
+
+def _fa_order(bundle_fa: Dict[int, Tuple[torch.Tensor, ...]]) -> List[torch.Tensor]:
+    return [t for gid in sorted(bundle_fa) for t in bundle_fa[gid]]
+
+
+def _gdn_order(bundle_gdn: Dict[int, Tuple[torch.Tensor, ...]]) -> List[torch.Tensor]:
+    return [t for gid in sorted(bundle_gdn) for t in bundle_gdn[gid]]
+
+
+def _nbytes(tensors: Sequence[torch.Tensor]) -> int:
+    return sum(int(t.numel() * t.element_size()) for t in tensors)
+
+
+def _end_header(end: EndPayload) -> EndHeader:
+    fa_t, gdn_t, ring_t = _fa_order(end.fa), _gdn_order(end.gdn), ring_order(end.ring, end.rope)
+    return EndHeader(
+        first_token=int(end.first_token), key=end.key, rows=int(end.rows), groups=int(end.groups),
+        ring_rows=int(end.ring_rows), fa_digest=digest(fa_t), gdn_digest=digest(gdn_t),
+        ring_digest=digest(ring_t), nbytes=_nbytes(fa_t + gdn_t + ring_t),
+        ple_digest=ple_state.digest(end.ple),
+    )
+
+
+def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]],
+               gdn: Dict[int, Tuple[torch.Tensor, ...]], end: Optional[EndPayload] = None,
+               n_parts: int = 0, e1: bool = True,
+               ple: Optional[Dict[str, torch.Tensor]] = None) -> Optional[TailHeader]:
+    """Atomically write one rank's part (payload first, header last: a
+    present header means a complete payload). ``end`` (E2) rides along as
+    payload key "end" and header field ``end``; ``n_parts`` (H45) is the
+    number of parts P publishes for the rid (its PP size). ``e1=False``
+    (H63 tail fold): an END-only part -- ``fa``/``gdn`` must be empty, the
+    layer lists and row shapes are taken from the END section."""
+    if not _dir():
+        return None
+    if not e1 and (end is None or fa or gdn):
+        raise ValueError("an END-only part (e1=False) carries the END section and no E1 payload")
+    fa_t, gdn_t = _fa_order(fa), _gdn_order(gdn)
+    lay_fa, lay_gdn = (fa, gdn) if e1 else (end.fa, end.gdn)
+    header = TailHeader(
+        spec=spec, part=part, fa_layers=sorted(lay_fa), gdn_layers=sorted(lay_gdn),
+        fa_row_shapes={str(g): list(lay_fa[g][0].shape[1:]) for g in sorted(lay_fa)},
+        gdn_row_shapes={str(g): list(lay_gdn[g][0].shape[1:]) for g in sorted(lay_gdn)},
+        fa_digest=digest(fa_t), gdn_digest=digest(gdn_t),
+        nbytes=_nbytes(fa_t + gdn_t),
+        end=_end_header(end) if end is not None else None,
+        n_parts=int(n_parts),
+        e1=bool(e1),
+        ple_digest=ple_state.digest(ple) if e1 else "",
+    )
+    jpath, ppath = part_paths(spec.rid, part)
+    os.makedirs(os.path.dirname(jpath), exist_ok=True)
+    bundle = {"fa": fa, "gdn": gdn}
+    if ple is not None and e1:
+        bundle["ple"] = ple  # H63c: E1's PLE rows (state at c)
+    if end is not None:
+        bundle["end"] = {"fa": end.fa, "gdn": end.gdn, "ring": end.ring, "rope": end.rope}
+        if end.ple is not None:
+            bundle["end"]["ple"] = end.ple  # H63c: the PLE rows after N
+    with _writing(spec.rid, part):  # H81: this writer's own temp names, one writer per part
+        tmp = _tmp_path(ppath)
+        try:
+            torch.save(bundle, tmp)
+            os.replace(tmp, ppath)
+            tmp = _tmp_path(jpath)
+            with open(tmp, "wb") as f:
+                f.write(msgspec.json.encode(header))
+            os.replace(tmp, jpath)
+        finally:
+            if os.path.exists(tmp):  # a write that failed half-way leaves no temp file
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    return header
+
+
+def read_part(header: TailHeader, check_digest: bool = True) -> Tuple[Optional[dict], str]:
+    """Load a part; with ``check_digest`` compare both sections against the
+    publish digests. (bundle, '') or (None, reason) -- 'unreadable' or
+    'digest_MISMATCH' (the reader then keeps the page-prefix resume: a wrong
+    row is never applied)."""
+    _j, ppath = part_paths(header.spec.rid, header.part)
+    try:
+        bundle = torch.load(ppath, map_location="cpu")
+    except (OSError, RuntimeError, EOFError):
+        logger.warning("PDFLIP-TAIL part unreadable: %s", ppath, exc_info=True)
+        return None, "unreadable"
+    if check_digest and (
+        digest(_fa_order(bundle["fa"])) != header.fa_digest
+        or digest(_gdn_order(bundle["gdn"])) != header.gdn_digest
+    ):
+        logger.warning("PDFLIP-TAIL DIGEST MISMATCH rid=%s part=%s", header.spec.rid, header.part)
+        return None, "digest_MISMATCH"
+    return bundle, ""
+
+
+def end_digest_refusal(header: TailHeader, bundle: dict) -> str:
+    """E2: '' when the bundle's END section matches its header digests,
+    else 'end_missing' | 'end_digest_MISMATCH' (the E1 section is unaffected)."""
+    end, sec = header.end, bundle.get("end")
+    if end is None or sec is None:
+        return "end_missing"
+    if (
+        digest(_fa_order(sec["fa"])) != end.fa_digest
+        or digest(_gdn_order(sec["gdn"])) != end.gdn_digest
+        or digest(ring_order(sec["ring"], sec["rope"])) != end.ring_digest
+    ):
+        logger.warning("PDFLIP-TAIL END DIGEST MISMATCH rid=%s part=%s", header.spec.rid, header.part)
+        return "end_digest_MISMATCH"
+    return ""
+
+
+def verify_part(header: TailHeader) -> Optional[dict]:
+    """``read_part`` with both digests checked; None on any refusal."""
+    return read_part(header, check_digest=True)[0]
+
+
+def remove(rid: str, parks: bool = False) -> None:
+    """Remove the FINISHED part files of `rid`. A ``*.tmp`` is a write in
+    flight on some rank -- its writer renames it or removes it itself; taking
+    it away is the fnNV4f2 FileNotFoundError (H81). F4: a D-park part stays
+    unless ``parks`` (P's prune never takes D's park across its phase)."""
+    d = _dir()
+    if not d:
+        return
+    for p in glob.glob(os.path.join(d, f"{glob.escape(rid)}.tail.*")):
+        if _is_tmp(p) or (_is_park_file(p) and not parks):
+            continue
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def keep_budget_bytes() -> int:
+    """H63b: FLLIPER_PDFLIP_TAIL_KEEP_MIB in bytes; 0 = the count rule."""
+    return max(0, int(envs.FLLIPER_PDFLIP_TAIL_KEEP_MIB.get())) << 20
+
+
+def census(d: str) -> Tuple[Dict[str, float], Dict[str, int]]:
+    """H63b: rid -> newest mtime and rid -> bytes of its finished part files
+    in ``d``. A ``*.tmp`` is a part some rank is writing right now: it costs
+    no bytes yet, but its mtime makes the rid NEW (H81) -- a rid under write
+    is never the oldest one a prune picks (fnNV4f2: pdflip-8-14's second leg 1
+    was pruned as the first leg's old parts)."""
+    newest: Dict[str, float] = {}
+    size: Dict[str, int] = {}
+    for p in glob.glob(os.path.join(d, "*.tail.*")):
+        if _is_park_file(p):
+            continue  # F4: a D-park part is D's own, never aged by P's budget
+        rid = os.path.basename(p).split(".tail.", 1)[0]
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        newest[rid] = max(newest.get(rid, 0.0), float(st.st_mtime))
+        if not _is_tmp(p):
+            size[rid] = size.get(rid, 0) + int(st.st_size)
+    return newest, size
+
+
+def prune_victims(newest: Dict[str, float], size: Dict[str, int], keep_rid: str, keep_min: int,
+                  budget: int) -> List[str]:
+    """Pure (H63b): the rids to remove, oldest first. Newest first, the rid
+    just written and the ``keep_min`` newest others always stay (the count
+    rule's set -- never fewer than today); every further rid stays while the
+    kept parts together fit ``budget`` bytes."""
+    order = sorted((r for r in newest if r != keep_rid), key=lambda r: newest[r], reverse=True)
+    total = size.get(keep_rid, 0)
+    victims: List[str] = []
+    for i, rid in enumerate(order):
+        n = size.get(rid, 0)
+        if i < keep_min or total + n <= budget:
+            total += n
+        else:
+            victims.append(rid)
+    return victims[::-1]
+
+
+_KEEP_N = [0]
+
+
+def _prune(keep_rid: str, part: str = "") -> None:
+    """Keep the part files of the ``capture_keep()`` newest rids (by mtime);
+    under FLLIPER_PDFLIP_TAIL_KEEP_MIB also every older rid that still fits the
+    budget (H63b; D removes what it consumed, ``consumed``)."""
+    d = _dir()
+    if not d:
+        return
+    busy = _inflight_rids()  # H81: a rid this process is writing is never a victim
+    budget = keep_budget_bytes()
+    if budget > 0:
+        newest, size = census(d)
+        victims = [r for r in prune_victims(newest, size, keep_rid, capture_keep() - 1, budget)
+                   if r not in busy]
+        for rid in victims:
+            remove(rid)
+        if part.startswith("pp0"):
+            _KEEP_N[0] += 1
+            kept = [r for r in newest if r not in victims]
+            logger.info(
+                "PDFLIP-TAIL-KEEP rid=%s kept=%d kept_mib=%.1f budget_mib=%d removed=%d%s (n=%d)",
+                keep_rid, len(kept), sum(size.get(r, 0) for r in kept) / 1048576.0, budget >> 20,
+                len(victims), f" removed_rids={','.join(victims)}" if victims else "", _KEEP_N[0],
+            )
+        return
+    # H81: every file of a rid counts for its age -- a header of the rid's
+    # PREVIOUS leg 1 is old, but the temp file (or fresh payload) of its
+    # current write is not (fnNV4f2 pdflip-8-14: pruned by its old header while
+    # its second leg 1 was being written)
+    newest, _size = census(d)
+    newest.pop(keep_rid, None)
+    for rid in sorted(newest, key=newest.get, reverse=True)[capture_keep() - 1:]:
+        if rid not in busy:
+            remove(rid)
+
+
+_CONSUMED_N = [0]
+
+
+def consumed(rid: str) -> bool:
+    """D's consumption receipt (H63b): the group has agreed on ``rid`` --
+    every rank staged its parts or gave up, and nothing reads them after
+    that -- so they leave the store now instead of at P's next prune. Only
+    under FLLIPER_PDFLIP_TAIL_KEEP_MIB; the removal runs off the scheduler
+    thread (tmpfs unlink of ~60-120 MB). True = a removal was started."""
+    if keep_budget_bytes() <= 0 or not _dir():
+        return False
+    threading.Thread(target=_remove_consumed, args=(str(rid),), daemon=True, name="pdflip-tail-consumed").start()
+    return True
+
+
+def _remove_consumed(rid: str) -> None:
+    d = _dir()
+    n = 0
+    for p in glob.glob(os.path.join(d, f"{glob.escape(rid)}.tail.*")):
+        if _is_tmp(p):
+            continue  # H81: a write in flight (P republishing the rid) is its writer's
+        try:
+            os.remove(p)
+            n += 1
+        except OSError:
+            pass  # another rank of the group removed it first
+    if n:
+        _CONSUMED_N[0] += 1
+        logger.info("PDFLIP-TAIL-CONSUMED rid=%s removed_files=%d (n=%d)", rid, n, _CONSUMED_N[0])
+
+
+# -- P side: capture + publish -----------------------------------------------------
+class _Capture(msgspec.Struct):
+    spec: TailSpec
+    gdn: Dict[int, Tuple[torch.Tensor, ...]]
+    event: object
+    #: the scheduler's forward stream (E2 gathers the end state on it)
+    stream: object = None
+    #: H63: False = a fold capture (no state at c was taken; the part is
+    #: END-only)
+    e1: bool = True
+    #: H63c: the PLE side-state rows at c (pdflip/ple_state.py), or None
+    ple: Optional[Dict[str, torch.Tensor]] = None
+
+
+_CAPTURES: Dict[str, _Capture] = {}
+_PUBLISH_N = [0]
+
+
+def _grain_of(allocator, page_size: int) -> int:
+    from flliper.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+    kv = allocator.get_kvcache()
+    ratio = int(kv.qsa_compress_ratio) if isinstance(kv, QSATokenToKVPool) else None
+    return anchor_grain(page_size, ratio)
+
+
+def _is_p_request(req) -> bool:
+    from flliper.srt.managers.schedule_policy import _PDFLIP_END_ANCHOR
+
+    return enabled() and _PDFLIP_END_ANCHOR and str(req.rid).startswith("pdflip-") and bool(_dir())
+
+
+def capture_state(req, req_to_token_pool, allocator, page_size: int, stream) -> bool:
+    """Scheduler entry (stash of a chunk): never raises into the scheduler."""
+    try:
+        return _capture_state(req, req_to_token_pool, allocator, page_size, stream)
+    except Exception as exc:  # noqa: BLE001 -- a failed capture is the page-prefix resume, named
+        logger.warning("PDFLIP-TAIL capture failed rid=%s (%s: %s)", req.rid, type(exc).__name__, exc)
+        _CAPTURES.pop(str(req.rid), None)
+        return False
+
+
+def _capture_state(req, req_to_token_pool, allocator, page_size: int, stream) -> bool:
+    """At the stash of the chunk that ended at c: copy this rank's GDN
+    working slot (the state after exactly c tokens) to pinned host memory ON
+    THE FORWARD STREAM -- after that chunk's forward, before the final
+    chunk's. True = a capture was taken."""
+    from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+    if not _is_p_request(req) or not isinstance(req_to_token_pool, HybridReqToTokenPool):
+        return False
+    if req.mamba_pool_idx is None:
+        return False
+    ids = req.origin_input_ids
+    spec = spec_for(req.rid, ids, req.extra_key, page_size, _grain_of(allocator, page_size))
+    if spec is None or int(req.extend_range.end) != spec.cut or len(req.full_untruncated_fill_ids) != spec.n_tokens:
+        return False
+    ctx = torch.cuda.stream(stream) if stream is not None else _null_ctx()
+    with ctx:
+        gdn = _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx)
+        ple = _ple_rows(req_to_token_pool, req.mamba_pool_idx)
+        event = _record(stream)
+    _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn=gdn, event=event, stream=stream, ple=ple)
+    while len(_CAPTURES) > capture_keep():  # an aborted prompt never publishes: drop the oldest
+        _CAPTURES.pop(next(iter(_CAPTURES)))
+    return True
+
+
+_FOLD_N = [0]
+
+
+def arm_fold(reqs, allocator, page_size: int, stream) -> int:
+    """Scheduler entry (every extend batch, before its forward; H63): under
+    the tail fold register an END-only capture for each request whose extend
+    reaches the end of its prompt -- its last chunk carries the tail, so no
+    stash at c ever happens and ``publish_rows`` needs the capture (and the
+    forward stream the END gather is ordered on) from here. Never raises into
+    the scheduler; returns how many were registered."""
+    if not fold_enabled():
+        return 0
+    n = 0
+    for req in reqs:
+        try:
+            if _arm_fold_one(req, allocator, page_size, stream):
+                n += 1
+        except Exception as exc:  # noqa: BLE001 -- no capture = no part = D's page resume, named
+            logger.warning("PDFLIP-TAIL-FOLD arm failed rid=%s (%s: %s)", getattr(req, "rid", "?"),
+                           type(exc).__name__, exc)
+    return n
+
+
+def _arm_fold_one(req, allocator, page_size: int, stream) -> bool:
+    if not _is_p_request(req) or getattr(req, "extend_range", None) is None:
+        return False
+    fill = req.full_untruncated_fill_ids
+    if int(req.extend_range.end) != len(fill) or not fold_applies(len(fill), page_size):
+        return False
+    spec = spec_for(req.rid, req.origin_input_ids, req.extra_key, page_size, _grain_of(allocator, page_size))
+    if spec is None or spec.n_tokens != len(fill):
+        return False
+    _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn={}, event=None, stream=stream, e1=False)
+    while len(_CAPTURES) > capture_keep():  # an aborted prompt never publishes: drop the oldest
+        _CAPTURES.pop(next(iter(_CAPTURES)))
+    _FOLD_N[0] += 1
+    if _FOLD_N[0] <= 8 or _FOLD_N[0] % 64 == 0:
+        logger.info(
+            "PDFLIP-TAIL-FOLD rid=%s n_tokens=%d page_prefix=%d cut=%d: the tail runs in the last chunk "
+            "[%d, %d), END-only part at its finish (n=%d)",
+            spec.rid, spec.n_tokens, spec.page_prefix, spec.cut, int(getattr(req.extend_range, "start", -1)),
+            int(req.extend_range.end), _FOLD_N[0],
+        )
+    return True
+
+
+def _to_host(t: torch.Tensor) -> torch.Tensor:
+    """Async D2H into pinned memory on the current stream (CPU: a copy)."""
+    pin = t.is_cuda
+    h = torch.empty(t.shape, dtype=t.dtype, pin_memory=pin)
+    h.copy_(t, non_blocking=pin)
+    return h
+
+
+def _record(stream) -> object:
+    if not torch.cuda.is_available():
+        return None
+    event = torch.cuda.Event()
+    event.record(stream if stream is not None else torch.cuda.current_stream())
+    return event
+
+
+def _gdn_slot_to_host(pool, mamba_pool_idx: torch.Tensor) -> Dict[int, Tuple[torch.Tensor, ...]]:
+    """Every local GDN layer's temporal + conv state of one request slot,
+    gathered on the CURRENT stream into host tensors (keyed by global id)."""
+    cache = pool.mamba_pool.mamba_cache
+    phys = pool.translate_mamba_indices(mamba_pool_idx.reshape(1).to(torch.int64))
+    phys = phys.to(cache.temporal.device, non_blocking=True)
+    gdn: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    for gid, local in sorted(pool.mamba_map.items()):
+        parts = [cache.temporal[local].index_select(0, phys)] + [c[local].index_select(0, phys) for c in cache.conv]
+        gdn[int(gid)] = tuple(_to_host(t) for t in parts)
+    return gdn
+
+
+def _ple_rows(pool, mamba_pool_idx) -> Optional[Dict[str, torch.Tensor]]:
+    """H63c: the PLE side-state rows of one request slot on the CURRENT
+    stream (armed, and only on the rank that runs a PLE layer), else None."""
+    if not ple_state.enabled() or mamba_pool_idx is None:
+        return None
+    phys = pool.translate_mamba_indices(mamba_pool_idx.reshape(1).to(torch.int64))
+    return ple_state.snapshot(pool, phys)
+
+
+class _null_ctx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def group_slots(rows: torch.Tensor, ratio: int, groups: Optional[int] = None) -> torch.Tensor:
+    """Compressed slots (slot // ratio) of the first ``groups`` groups of the
+    page-aligned token slots ``rows`` (all rows//ratio groups when None)."""
+    n = len(rows) // int(ratio) if groups is None else int(groups)
+    return rows[: n * int(ratio) : int(ratio)] // int(ratio)
+
+
+def _fa_rows(kvpool, rows: torch.Tensor, groups: Optional[int] = None,
+             host: Callable[[torch.Tensor], torch.Tensor] = torch.Tensor.cpu) -> Dict[int, Tuple[torch.Tensor, ...]]:
+    """K, V (and the QSA compressed index rows of the first ``groups``
+    complete groups) of every full-attention layer of this rank at the device
+    token slots ``rows``; ``host`` moves each gathered tensor off the card."""
+    full = kvpool.full_kv_pool
+    ratio = _qsa_ratio(kvpool)
+    out: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    for gid, local in sorted(kvpool.full_attention_layer_id_mapping.items()):
+        dev_rows = rows.to(full.k_buffer[local].device)
+        k = host(full.k_buffer[local].index_select(0, dev_rows))
+        v = host(full.v_buffer[local].index_select(0, dev_rows))
+        if ratio:
+            slots = group_slots(dev_rows, ratio, groups)
+            c = host(kvpool.qsa_compressed_k_buffer_pool[local].index_select(0, slots))
+            out[int(gid)] = (k, v, c)
+        else:
+            out[int(gid)] = (k, v)
+    return out
+
+
+def _fa_rows_owned(kvpool, rows: torch.Tensor, groups: Optional[int], owner,
+                   host: Callable[[torch.Tensor], torch.Tensor] = None) -> Dict[int, Tuple[torch.Tensor, ...]]:
+    """F4b: ``_fa_rows`` under the Form A token cut. K and V of the GLOBAL
+    slots ``rows`` in P's full-row layout, filled at the rows this rank OWNS
+    (read from their compact slot, ``tail_adopt.owner_rows`` -- the backends'
+    write rule) and zero elsewhere, so the group's parts OR together into the
+    full rows; the QSA compressed groups only where the pool keeps them (the
+    indexer's rank)."""
+    from flliper.srt.pdflip.tail_adopt import owner_rows
+
+    host = host or _to_host
+    full = kvpool.full_kv_pool
+    compressed = bool(getattr(kvpool, "qsa_compressed_k_buffer_pool", None))
+    ratio = _qsa_ratio(kvpool) if compressed else 0
+    loc, keep = owner_rows(rows, owner)
+    out: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    for gid, local in sorted(kvpool.full_attention_layer_id_mapping.items()):
+        parts = []
+        for buf in (full.k_buffer[local], full.v_buffer[local]):
+            t = torch.zeros((int(rows.numel()),) + tuple(buf.shape[1:]), dtype=buf.dtype, device=buf.device)
+            if int(loc.numel()):
+                tb = t.view(torch.uint8)
+                tb[keep.to(buf.device)] = buf.view(torch.uint8).index_select(0, loc.to(buf.device))
+            parts.append(host(t))
+        if ratio:
+            slots = group_slots(rows.to(full.k_buffer[local].device), ratio, groups)
+            parts.append(host(kvpool.qsa_compressed_k_buffer_pool[local].index_select(0, slots)))
+        out[int(gid)] = tuple(parts)
+    return out
+
+
+def publish_rows(req, kv_indices: torch.Tensor, allocator, part: str, req_to_token_pool=None,
+                 n_parts: int = 0) -> None:
+    """cache_finished_req entry: never raises into the tree. ``n_parts``:
+    how many ranks publish a part of this rid (P's PP size, H45)."""
+    if not _CAPTURES:
+        return
+    try:
+        _publish_rows(req, kv_indices, allocator, part, req_to_token_pool, n_parts)
+    except Exception as exc:  # noqa: BLE001 -- a failed publish is the page-prefix resume, named
+        logger.warning("PDFLIP-TAIL-PUBLISH failed rid=%s (%s: %s)", req.rid, type(exc).__name__, exc)
+        _CAPTURES.pop(str(req.rid), None)
+
+
+def _publish_rows(req, kv_indices: torch.Tensor, allocator, part: str, req_to_token_pool, n_parts: int = 0) -> None:
+    """At cache_finished_req, before the unaligned tail is freed: read the
+    partial page's rows, join the state capture, write this rank's part."""
+    cap = _CAPTURES.pop(str(req.rid), None)
+    if cap is None:
+        return None
+    spec = cap.spec
+    if int(kv_indices.numel()) < spec.cut:
+        logger.warning("PDFLIP-TAIL-PUBLISH refused rid=%s: kv rows %d < cut %d", spec.rid, int(kv_indices.numel()), spec.cut)
+        return
+    # E2 first: enqueued on the forward stream BEHIND the final chunk's
+    # forward, never a host wait here (P's next microbatch may be running)
+    try:
+        end = _capture_end(req, kv_indices, allocator, req_to_token_pool, cap)
+    except Exception as exc:  # noqa: BLE001 -- a failed END capture is E1, named
+        logger.warning("PDFLIP-TAIL-PUBLISH end=none rid=%s reason=raised:%s: %s", spec.rid, type(exc).__name__, exc)
+        end = None
+    if not cap.e1:
+        # H63 tail fold: no state at c exists, so a part without its END
+        # section would hand D nothing; D waits NO_PARTS_WAIT_S, then resumes
+        # at the page anchor (today's extend)
+        if end is None:
+            logger.info("PDFLIP-TAIL-PUBLISH fold rid=%s: END refused, no part (D resumes at page_prefix=%d)",
+                        spec.rid, spec.page_prefix)
+            return
+        threading.Thread(target=_write_and_log, args=(spec, part, {}, {}, end, n_parts, False), daemon=True,
+                         name="pdflip-tail-publish").start()
+        return
+    if cap.event is not None:
+        # recorded on the forward stream after the chunk [X, c): once it has
+        # fired, that chunk's KV rows are written too (stream order)
+        cap.event.synchronize()
+    fa = _fa_rows(allocator.get_kvcache(), kv_indices[spec.page_prefix:spec.cut].to(torch.int64))
+    threading.Thread(target=_write_and_log, args=(spec, part, fa, cap.gdn, end, n_parts, True, cap.ple),
+                     daemon=True, name="pdflip-tail-publish").start()
+
+
+def end_refusal(req, kv_rows: int, spec: TailSpec) -> str:
+    """E2 on P: '' when this finished request can hand over its END state,
+    else why not (named in the publish line; D then adopts E1)."""
+    if not skip_extend_enabled():
+        return "off"
+    if kv_rows < spec.n_tokens:
+        return f"kv_rows:{kv_rows}<{spec.n_tokens}"
+    if not req.output_ids:
+        return "no_sampled_token"
+    if req.return_logprob or req.return_hidden_states:
+        return "logprob_or_hidden_requested"
+    return ""
+
+
+def _capture_end(req, kv_indices: torch.Tensor, allocator, req_to_token_pool, cap: _Capture) -> Optional[EndPayload]:
+    """E2: gather rows [page_prefix, N), the open group's pending-ring rows
+    and the GDN slot (state after N) on the forward stream; None + a named
+    reason when the END state cannot be handed over."""
+    from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+    spec = cap.spec
+    if not skip_extend_enabled():
+        return None
+    if not isinstance(req_to_token_pool, HybridReqToTokenPool) or req.mamba_pool_idx is None:
+        why = "no_mamba_slot"
+    else:
+        why = end_refusal(req, int(kv_indices.numel()), spec)
+    if why:
+        logger.info("PDFLIP-TAIL-PUBLISH end=none rid=%s reason=%s", spec.rid, why)
+        return None
+    kvpool = allocator.get_kvcache()
+    ratio = _qsa_ratio(kvpool)
+    rows, groups, ring_rows = end_geometry(spec, ratio)
+    ctx = torch.cuda.stream(cap.stream) if cap.stream is not None else _null_ctx()
+    with ctx:
+        fa = _fa_rows(kvpool, kv_indices[spec.page_prefix:spec.n_tokens].to(torch.int64), groups=groups, host=_to_host)
+        ring, rope = _ring_rows(kvpool, req.req_pool_idx, ring_rows)
+        gdn = _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx)
+        ple = _ple_rows(req_to_token_pool, req.mamba_pool_idx)
+        event = _record(cap.stream)
+    return EndPayload(
+        first_token=int(req.output_ids[-1]), key=tail_key(req.origin_input_ids, spec.n_tokens, req.extra_key),
+        rows=rows, groups=groups, ring_rows=ring_rows, fa=fa, gdn=gdn, ring=ring, rope=rope, event=event,
+        ple=ple,
+    )
+
+
+def _qsa_ratio(kvpool) -> int:
+    from flliper.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+    return int(kvpool.qsa_compress_ratio) if isinstance(kvpool, QSATokenToKVPool) else 0
+
+
+def ring_slots(req_pool_idx: int, ratio: int, ring_rows: int) -> torch.Tensor:
+    """Pending-ring rows of the open group: ``req_pool_idx * ratio +
+    position % ratio`` for positions [floor_r(N), N) = offsets [0, N % r)."""
+    return int(req_pool_idx) * int(ratio) + torch.arange(int(ring_rows), dtype=torch.int64)
+
+
+def _ring_rows(kvpool, req_pool_idx: int, ring_rows: int):
+    """(gid -> (index-K ring rows,), rope rows) of the open QSA group."""
+    ratio = _qsa_ratio(kvpool)
+    if not ratio:
+        return {}, None
+    idx = ring_slots(req_pool_idx, ratio, ring_rows).to(kvpool.qsa_rope_position_buffer.device)
+    ring = {
+        int(gid): (_to_host(kvpool.qsa_key_state_buffer_pool[local].index_select(0, idx)),)
+        for gid, local in sorted(kvpool.full_attention_layer_id_mapping.items())
+    }
+    return ring, _to_host(kvpool.qsa_rope_position_buffer.index_select(0, idx))
+
+
+def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload] = None, n_parts: int = 0,
+                   e1: bool = True, ple: Optional[Dict[str, torch.Tensor]] = None) -> None:
+    try:
+        if end is not None and end.event is not None:
+            end.event.synchronize()  # the forward-stream gather has landed
+        header = write_part(spec, part, fa, gdn, end=end, n_parts=n_parts, e1=e1, ple=ple)
+        if not is_park_part(part):  # F4: D's park never prunes P's hand-offs
+            _prune(spec.rid, part)
+        # H63c: the PLE rows as P handed them over (D prints the same digest)
+        if ple is not None and e1:
+            ple_state.log_state("P", "e1", spec.rid, spec.cut, ple)
+        if end is not None and end.ple is not None:
+            ple_state.log_state("P", "end", spec.rid, spec.n_tokens, end.ple)
+    except Exception:  # noqa: BLE001 -- a hand-off that fails is the page-prefix resume
+        logger.warning("PDFLIP-TAIL-PUBLISH write failed rid=%s", spec.rid, exc_info=True)
+        return
+    if header is None:
+        return
+    _PUBLISH_N[0] += 1
+    if header.end is None:
+        logger.info(
+            "PDFLIP-TAIL-PUBLISH rid=%s page_prefix=%d tail_rows=%d state_at=%d n_tokens=%d part=%s of=%d "
+            "fa_layers=%d gdn_layers=%d bytes=%d key=%s fa_digest=%s gdn_digest=%s (n=%d)",
+            spec.rid, spec.page_prefix, spec.rows, spec.cut, spec.n_tokens, part, header.n_parts, len(header.fa_layers),
+            len(header.gdn_layers), header.nbytes, spec.key, header.fa_digest, header.gdn_digest, _PUBLISH_N[0],
+        )
+        return
+    e = header.end
+    if not header.e1:
+        logger.info(
+            "PDFLIP-TAIL-PUBLISH rid=%s page_prefix=%d tail_rows=%d state_at=%d first_token=%d n_tokens=%d part=%s "
+            "of=%d fa_layers=%d gdn_layers=%d groups=%d ring_rows=%d bytes=%d end_key=%s end_digests=%s/%s/%s "
+            "| E1 absent (fold): cut=%d key=%s (n=%d)",
+            spec.rid, spec.page_prefix, e.rows, spec.n_tokens, e.first_token, spec.n_tokens, part, header.n_parts,
+            len(header.fa_layers), len(header.gdn_layers), e.groups, e.ring_rows, e.nbytes, e.key, e.fa_digest,
+            e.gdn_digest, e.ring_digest, spec.cut, spec.key, _PUBLISH_N[0],
+        )
+        return
+    logger.info(
+        "PDFLIP-TAIL-PUBLISH rid=%s page_prefix=%d tail_rows=%d state_at=%d first_token=%d n_tokens=%d part=%s "
+        "of=%d fa_layers=%d gdn_layers=%d groups=%d ring_rows=%d bytes=%d end_key=%s end_digests=%s/%s/%s "
+        "| E1 tail_rows=%d state_at=%d bytes=%d key=%s fa_digest=%s gdn_digest=%s (n=%d)",
+        spec.rid, spec.page_prefix, e.rows, spec.n_tokens, e.first_token, spec.n_tokens, part, header.n_parts,
+        len(header.fa_layers), len(header.gdn_layers), e.groups, e.ring_rows, e.nbytes, e.key, e.fa_digest,
+        e.gdn_digest, e.ring_digest, spec.rows, spec.cut, header.nbytes, spec.key, header.fa_digest,
+        header.gdn_digest, _PUBLISH_N[0],
+    )
+
+
+_PARK_N = [0]
+
+
+def park_end_refusal(req, owner=None, page_size: int = 0) -> str:
+    """F4: '' when this running request's END state can be parked, else why
+    not (named in the park line; the resume then extends as today).
+    ``owner``: this rank's token-cut owner rows (tail_adopt.cut_owner), the
+    same on every rank in its presence."""
+    from flliper.srt.distributed.utils import uneven_dcp_active
+    from flliper.srt.pdflip import tail_adopt
+
+    if not park_end_enabled():
+        return "off"
+    if not req.output_ids:
+        return "no_sampled_token"
+    if req.return_logprob or req.return_hidden_states:
+        return "logprob_or_hidden_requested"
+    if bool(uneven_dcp_active()):
+        # uneven DCP compacts KV rows per rank: only under the Form A token
+        # cut, whose owner rows the resume takes the E2 way (F4b)
+        if owner is None:
+            return "uneven_dcp"
+        if not tail_adopt.cut_worker_end_enabled():
+            return "cut_worker_end_off"
+        if int(page_size or 1) % int(owner[0]):
+            # a token's owner is its slot % S: stable across the park only
+            # while S divides the page (slot = page base + token % page)
+            return f"cut_period:{int(owner[0])}"
+    if req.mamba_pool_idx is None or req.req_pool_idx is None:
+        return "no_slots"
+    return ""
+
+
+def publish_park_end(req, req_to_token_pool, allocator, page_size: int, part: str, n_parts: int,
+                     window_tokens: int) -> Tuple[str, object]:
+    """F4 (#259 4c), D's park_running, BEFORE the retaining retraction frees
+    the request's slots: gather this rank's END state of a running request --
+    the KV (+ complete QSA groups) rows from ``floor_page(cut) - window`` to the
+    last consumed token, the open group's ring rows, the GDN/PLE slot (state
+    after every consumed token) -- on the current stream, and write it as an
+    END-only part of the rid from a background thread (P's hand-off format and
+    directory). The resume is then E2's skip: no tail extend. Only the layers
+    this rank HOLDS are written (a Form-A expert worker writes an empty part,
+    so the manifest completes). Never raises; returns ('' or the refusal, the
+    gather's event)."""
+    try:
+        from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from flliper.srt.pdflip import tail_adopt
+
+        if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+            return "no_mamba_pool", None
+        kvpool = allocator.get_kvcache()
+        held = tail_adopt.held_shapes(kvpool, req_to_token_pool)
+        why = park_end_refusal(req, held.owner, page_size)
+        if why:
+            return why, None
+        ids = park_ids(req)
+        page = int(page_size or 1)
+        grain = _grain_of(allocator, page)
+        cut = tail_cut(len(ids), grain)
+        window_from = max(0, page_floor(cut, page) - page_floor(int(window_tokens), page))
+        spec = park_spec(str(req.rid), ids, req.extra_key, window_from, grain)
+        if spec is None:
+            return "no_tail", None
+        ratio = _qsa_ratio(kvpool)
+        rows, groups, ring_rows = end_geometry(spec, ratio)
+        kv = req_to_token_pool.req_to_token[int(req.req_pool_idx), spec.page_prefix:spec.n_tokens].to(torch.int64)
+        fa: Dict[int, Tuple[torch.Tensor, ...]] = {}
+        ring: Dict[int, Tuple[torch.Tensor, ...]] = {}
+        rope = None
+        # a Form-A expert worker holds no attention rows (0-head pool, no
+        # indexer); under the token cut (F4b) it holds its owned K/V rows and
+        # the ring/groups are the indexer rank's alone
+        indexer = held.owner is None or bool(held.qsa_ratio)
+        if held.fa and held.owner is not None:
+            fa = {g: t for g, t in _fa_rows_owned(kvpool, kv, groups, held.owner).items() if g in held.fa}
+        elif held.fa:
+            fa = {g: t for g, t in _fa_rows(kvpool, kv, groups=groups, host=_to_host).items() if g in held.fa}
+        if held.fa and indexer:
+            ring, rope = _ring_rows(kvpool, req.req_pool_idx, ring_rows)
+            ring = {g: t for g, t in ring.items() if g in held.fa}
+            if not ring:
+                rope = None
+        gdn: Dict[int, Tuple[torch.Tensor, ...]] = {}
+        if held.gdn:
+            gdn = {g: t for g, t in _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx).items()
+                   if g in held.gdn}
+        ple = _ple_rows(req_to_token_pool, req.mamba_pool_idx) if held.gdn else None
+        event = _record(None)
+        end = EndPayload(
+            first_token=int(req.output_ids[-1]), key=tail_key(ids, spec.n_tokens, req.extra_key),
+            rows=rows, groups=groups, ring_rows=ring_rows, fa=fa, gdn=gdn, ring=ring, rope=rope,
+            event=event, ple=ple,
+        )
+        _clear_for_park(spec.rid, _part_index(part))
+        threading.Thread(target=_write_and_log, args=(spec, part, {}, {}, end, int(n_parts), False),
+                         daemon=True, name="pdflip-park-end").start()
+        _PARK_N[0] += 1
+        logger.info(
+            "F4 PARK-END rid=%s n_tokens=%d rows_from=%d cut=%d rows=%d groups=%d ring_rows=%d "
+            "first_token=%d fa_layers=%d gdn_layers=%d part=%s of=%d (n=%d)",
+            spec.rid, spec.n_tokens, spec.page_prefix, spec.cut, rows, groups, ring_rows, end.first_token,
+            len(fa), len(gdn), part, int(n_parts), _PARK_N[0],
+        )
+        return "", event
+    except Exception as exc:  # noqa: BLE001 -- no park part = the resume extends as today
+        logger.warning("F4 PARK-END failed rid=%s (%s: %s)", getattr(req, "rid", "?"), type(exc).__name__, exc)
+        return f"raised:{type(exc).__name__}", None
+
+
+def park_end_barrier(events) -> float:
+    """F4: the gathers are enqueued on the stream the park's retraction and
+    the sleep's release follow; the rows must be on the host before the
+    D->P flip frees them. Waits for the recorded events and returns the
+    milliseconds (named in the park line: a measured wait, ~ms per request)."""
+    import time as _time
+
+    t = _time.perf_counter()
+    for ev in events:
+        if ev is not None:
+            ev.synchronize()
+    return (_time.perf_counter() - t) * 1000.0
+
+
+def _clear_for_park(rid: str, own_index: str) -> None:
+    """F4: before a park part of ``rid`` is written, P's leftover parts and
+    THIS rank's own earlier park part go (either would mix into the
+    manifest). Another rank's park part is never touched: it may be the one
+    it just wrote for this very park."""
+    d = _dir()
+    if not d:
+        return
+    own = f".tail.{own_index}-"
+    for p in glob.glob(os.path.join(d, f"{glob.escape(rid)}.tail.*")):
+        if _is_tmp(p) or (_is_park_file(p) and own not in os.path.basename(p)):
+            continue
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def remove_park(rid: str) -> None:
+    """F4: the group decided on the rid's park parts -- nothing reads them again."""
+    threading.Thread(target=remove, args=(str(rid),), kwargs={"parks": True}, daemon=True,
+                     name="pdflip-park-end-rm").start()
+
+
+# -- D side: readiness (the adoption itself lives in pdflip/tail_adopt.py) -------------
+def local_readiness(spec: TailSpec, headers: Sequence[TailHeader], need_fa: Dict[int, List[int]],
+                    need_gdn: Dict[int, List[int]]) -> str:
+    """'' when the parts cover every layer this rank HOLDS with matching row
+    shapes and one agreed spec; otherwise the first reason it cannot serve.
+    ``need_*`` carry only held layers (pdflip/tail_adopt.held_shapes drops a
+    layer whose rows are empty, e.g. a Form-A worker's 0-head attention pool:
+    fnFL2x133 TP1/TP2 'fa_shape:3:[2, 256]!=[0, 256]')."""
+    if not headers:
+        return "no_parts"
+    for h in headers:
+        if h.spec != spec:
+            return f"spec_differs:{h.part}"
+    have_fa = {g: h.fa_row_shapes[str(g)] for h in headers for g in h.fa_layers}
+    have_gdn = {g: h.gdn_row_shapes[str(g)] for h in headers for g in h.gdn_layers}
+    for g, shape in need_fa.items():
+        if g not in have_fa:
+            return f"fa_layer_missing:{g}"
+        if list(have_fa[g]) != list(shape):
+            return f"fa_shape:{g}:{have_fa[g]}!={list(shape)}"
+    for g, shape in need_gdn.items():
+        if g not in have_gdn:
+            return f"gdn_layer_missing:{g}"
+        if list(have_gdn[g]) != list(shape):
+            return f"gdn_shape:{g}:{have_gdn[g]}!={list(shape)}"
+    return ""

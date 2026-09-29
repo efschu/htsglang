@@ -24,7 +24,7 @@ import torch
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
+from flliper.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
 
 
 class _Arena:
@@ -60,15 +60,15 @@ def _pool(*, layers, heads, head_dim, staging_rows=8):
 
 def _bind(p, extents, total, slots=4):
     arena = _Arena(slots, total)
-    monkey_env = os.environ.get("SGLANG_HICACHE_ARENA_PREPIN")
-    os.environ["SGLANG_HICACHE_ARENA_PREPIN"] = "0"
+    monkey_env = os.environ.get("FLLIPER_HICACHE_ARENA_PREPIN")
+    os.environ["FLLIPER_HICACHE_ARENA_PREPIN"] = "0"
     try:
         p.bind(arena, _Window(extents, total), role="draft", pin=False)
     finally:
         if monkey_env is None:
-            os.environ.pop("SGLANG_HICACHE_ARENA_PREPIN", None)
+            os.environ.pop("FLLIPER_HICACHE_ARENA_PREPIN", None)
         else:
-            os.environ["SGLANG_HICACHE_ARENA_PREPIN"] = monkey_env
+            os.environ["FLLIPER_HICACHE_ARENA_PREPIN"] = monkey_env
     return arena
 
 

@@ -29,9 +29,9 @@ import logging
 import types
 import unittest
 
-from sglang.srt.planner.runner import own_vram_gate
-from sglang.srt.registry.nvml import _memory_info
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.planner.runner import own_vram_gate
+from flliper.srt.registry.nvml import _memory_info
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -92,7 +92,7 @@ class TestMemoryInfoNoV2(unittest.TestCase):
     """Case (a): pynvml lacks nvmlMemory_v2 or the v2 call raises."""
 
     def _reset_flag(self):
-        import sglang.srt.registry.nvml as mod
+        import flliper.srt.registry.nvml as mod
 
         mod._nv2_warning_emitted = False
 
@@ -100,11 +100,11 @@ class TestMemoryInfoNoV2(unittest.TestCase):
         self._reset_flag()
         self.handler = _WarningCapture()
         self.handler.setLevel(logging.WARNING)
-        logger = logging.getLogger("sglang.srt.registry.nvml")
+        logger = logging.getLogger("flliper.srt.registry.nvml")
         logger.addHandler(self.handler)
 
     def tearDown(self):
-        logger = logging.getLogger("sglang.srt.registry.nvml")
+        logger = logging.getLogger("flliper.srt.registry.nvml")
         logger.removeHandler(self.handler)
         self._reset_flag()
 
@@ -147,7 +147,7 @@ class TestMemoryInfoV2HappyPath(unittest.TestCase):
     """Case (a) reversed: v2 is available and has ``reserved``."""
 
     def _reset_flag(self):
-        import sglang.srt.registry.nvml as mod
+        import flliper.srt.registry.nvml as mod
 
         mod._nv2_warning_emitted = False
 
@@ -155,11 +155,11 @@ class TestMemoryInfoV2HappyPath(unittest.TestCase):
         self._reset_flag()
         self.handler = _WarningCapture()
         self.handler.setLevel(logging.WARNING)
-        logger = logging.getLogger("sglang.srt.registry.nvml")
+        logger = logging.getLogger("flliper.srt.registry.nvml")
         logger.addHandler(self.handler)
 
     def tearDown(self):
-        logger = logging.getLogger("sglang.srt.registry.nvml")
+        logger = logging.getLogger("flliper.srt.registry.nvml")
         logger.removeHandler(self.handler)
         self._reset_flag()
 
@@ -182,7 +182,7 @@ class TestMemoryInfoV2MissingReserved(unittest.TestCase):
     """Case (b): v2 struct exists but lacks the ``reserved`` attribute."""
 
     def _reset_flag(self):
-        import sglang.srt.registry.nvml as mod
+        import flliper.srt.registry.nvml as mod
 
         mod._nv2_warning_emitted = False
 
@@ -311,14 +311,14 @@ class TestHttpApiReservedBytesNone(unittest.TestCase):
 
     def test_coerce_bytes_handles_none_same_as_zero(self):
         """Regression: coerce_bytes(None) must equal coerce_bytes(0)."""
-        from sglang.srt.registry.rungs import coerce_bytes
+        from flliper.srt.registry.rungs import coerce_bytes
 
         self.assertEqual(coerce_bytes(None), coerce_bytes(0))
         self.assertEqual(coerce_bytes(None), 0)
 
     def test_rung_of_accepts_none_reserved_bytes(self):
         """rung_of must not crash when reserved_bytes is None."""
-        from sglang.srt.registry.rungs import rung_of
+        from flliper.srt.registry.rungs import rung_of
 
         result = rung_of("COLD", ever_staged=False, reserved_bytes=None)
         # With None/0 and ever_staged=False, the engine is REGISTERED.

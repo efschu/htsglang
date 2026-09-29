@@ -26,12 +26,12 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from sglang.srt.translator.backends import AudioChunk  # noqa: E402
-from sglang.srt.translator.segmenter import (  # noqa: E402
+from flliper.srt.translator.backends import AudioChunk  # noqa: E402
+from flliper.srt.translator.segmenter import (  # noqa: E402
     Segment,
     SegmentReason,
 )
-from sglang.srt.translator.session import EventKind, run_conversation  # noqa: E402
+from flliper.srt.translator.session import EventKind, run_conversation  # noqa: E402
 from test_session import (  # noqa: E402
     LANG_A,
     LANG_B,
@@ -247,7 +247,7 @@ class TestThePromptCarriesTheContext(unittest.IsolatedAsyncioTestCase):
     """The real backend puts the pairs on the wire, as dialogue turns."""
 
     def test_context_becomes_user_assistant_pairs(self):
-        from sglang.srt.translator.mt import OpenAiMt
+        from flliper.srt.translator.mt import OpenAiMt
 
         backend = OpenAiMt()
         messages = backend._messages(
@@ -268,7 +268,7 @@ class TestThePromptCarriesTheContext(unittest.IsolatedAsyncioTestCase):
 
     def test_without_context_the_prompt_is_system_plus_one_turn(self):
         """THE CONTROL: the shape every existing MT test was written against."""
-        from sglang.srt.translator.mt import OpenAiMt
+        from flliper.srt.translator.mt import OpenAiMt
 
         backend = OpenAiMt()
         messages = backend._messages("und weiter", "de", "es", None)
@@ -281,7 +281,7 @@ class TestThePromptCarriesTheContext(unittest.IsolatedAsyncioTestCase):
         Asserted structurally rather than behaviourally, because the failure
         mode is a field that quietly comes back.
         """
-        from sglang.srt.translator.mt import MtConfig, OpenAiMt
+        from flliper.srt.translator.mt import MtConfig, OpenAiMt
 
         backend = OpenAiMt()
         self.assertFalse(hasattr(backend, "_history"))

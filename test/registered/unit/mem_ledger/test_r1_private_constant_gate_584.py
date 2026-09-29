@@ -42,7 +42,7 @@ import pathlib
 import re
 import unittest
 
-SRT = pathlib.Path(__file__).resolve().parents[4] / "python" / "sglang" / "srt"
+SRT = pathlib.Path(__file__).resolve().parents[4] / "python" / "flliper" / "srt"
 
 #: MiB/MB/GiB/GB scale only -- the VRAM DEMAND scale. Byte-scale constants
 #: (header widths, probe sizes) are not what R1 is about.
@@ -206,10 +206,10 @@ KNOWN = {
         "for it being an instrument tolerance rather than a demand term. "
         "That is exactly the call this gate wants made deliberately, and it "
         "belongs to the #662-F4 owner, not to a merge train. Env-overridable "
-        "via SGLANG_PHASE_FLIP_ARMING_MARGIN_MIB, so it is at least not a "
+        "via FLLIPER_PHASE_FLIP_ARMING_MARGIN_MIB, so it is at least not a "
         "silent constant."
     ),
-    "weg2/launcher.py::D_AWAKE_OVERSHOOT_MIB": (
+    "pdflip/launcher.py::D_AWAKE_OVERSHOOT_MIB": (
         "NOT A DEMAND DECISION, a MEASUREMENT of this form (#1257c). Group D's "
         "awake consumption that sits OUTSIDE the --rank-gpu-memory-mib "
         "fraction -- CUDA context and BAR1 windows -- measured at 404 MiB on "
@@ -221,7 +221,7 @@ KNOWN = {
         "change at all. Named here so the split is visible rather than "
         "arriving as a new unpinned constant."
     ),
-    "weg2/launcher.py::P_CORRIDOR_HOLDBACK_MIB": (
+    "pdflip/launcher.py::P_CORRIDOR_HOLDBACK_MIB": (
         "NOT A DEMAND DECISION, a TRANSCRIPTION of one the runtime already "
         "made (#1286). It is the boot's own 'gapped corridor holdback' post, "
         "read off the success-path line model_runner_kv_cache_mixin.py:1174 "
@@ -236,7 +236,7 @@ KNOWN = {
         "constant is what the expression returns at reserve 1024, which is "
         "the value both reference boots measured."
     ),
-    "weg2/corridor_budget.py::BUDGET_ALIGN_MIB": (
+    "pdflip/corridor_budget.py::BUDGET_ALIGN_MIB": (
         "NOT A DEMAND DECISION and not a VRAM SCALE at all (#1257c). It is "
         "the 8 MiB GRANULARITY that `budgets_from_dc` already floors every "
         "budget to; the corridor cut rounds UP to the same multiple so the "
@@ -245,7 +245,7 @@ KNOWN = {
         "already expressed on. Pinned here because the name ends in _MIB and "
         "the gate reads names, not roles."
     ),
-    "weg2/launcher.py::P_PREFILL_ACTIVATION_RESERVE_MIB": (
+    "pdflip/launcher.py::P_PREFILL_ACTIVATION_RESERVE_MIB": (
         "NOT A DEMAND DECISION, a TRANSCRIPTION of one the runtime already "
         "made (#1286). It is the boot's own 'prefill activation reserve' "
         "post, from the same emitted line, measured at 1.000 GiB on every "
@@ -339,7 +339,7 @@ class TestTheRecordedViolationStaysVisible(unittest.TestCase):
         self.assertEqual(values, {1536})
 
     def test_the_ledger_has_the_term_this_should_resolve_through(self):
-        from sglang.srt.mem_ledger.engine import TERM_HARDWARE_RESIDUAL
+        from flliper.srt.mem_ledger.engine import TERM_HARDWARE_RESIDUAL
 
         self.assertTrue(TERM_HARDWARE_RESIDUAL)
 

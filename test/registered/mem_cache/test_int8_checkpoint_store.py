@@ -12,11 +12,11 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.mamba_checkpoint_pool import (
+from flliper.srt.mem_cache.mamba_checkpoint_pool import (
     Int8CheckpointStore,
     MambaCheckpointPool,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 # These are CPU codec / store / pool unit tests (the single CUDA decode-error
 # case self-skips when no GPU is present), so they run on the cheapest CI tier.
@@ -126,7 +126,7 @@ class TestInt8CheckpointCodec(unittest.TestCase):
 class TestInt8CheckpointDecodeError(unittest.TestCase):
     def test_decode_error_within_bound(self):
         try:
-            from sglang.srt.layers.attention.fla.kda import fused_recurrent_kda
+            from flliper.srt.layers.attention.fla.kda import fused_recurrent_kda
         except (ImportError, ModuleNotFoundError) as e:
             self.skipTest(f"fla kernels unavailable: {e}")
 

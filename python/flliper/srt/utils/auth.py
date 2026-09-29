@@ -1,0 +1,296 @@
+"""Auth utilities for HTTP servers.
+
+This module is intentionally lightweight (no torch import) so it can be used in unit tests.
+"""
+
+from __future__ import annotations
+
+import logging
+import secrets
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Optional
+
+
+@dataclass(frozen=True)
+class AuthDecision:
+    allowed: bool
+    error_status_code: int = 401  # Only meaningful when allowed=False
+
+
+class AuthLevel(str, Enum):
+    """Per-endpoint auth level (attached to endpoint function via `@auth_level`)."""
+
+    NORMAL = "normal"
+    ADMIN_OPTIONAL = "admin_optional"
+    ADMIN_FORCE = "admin_force"
+
+
+def auth_level(level: AuthLevel):
+    """Mark endpoint with auth level (stored in endpoint metadata)."""
+
+    def decorator(func):
+        func._auth_level = level
+        return func
+
+    return decorator
+
+
+def _iter_effective_routes(routes: Any) -> Any:
+    """Expand routes registered via `include_router()` into their leaf routes.
+
+    Some FastAPI versions represent an `include_router()`-registered
+    sub-router as a single aggregate route object (a private
+    `_IncludedRouter`) that matches its whole sub-tree but does not itself
+    expose `.endpoint`/`.path`. Such routes do expose a public
+    `effective_route_contexts()` method that yields the fully-resolved leaf
+    routes, so duck-type on that instead of hard-coding any private class
+    name. Duplicated (rather than imported) from
+    `flliper.srt.utils.common._iter_effective_routes` to keep this module's
+    documented zero-torch-import, unit-test-friendly footprint.
+    """
+    for route in routes:
+        effective_route_contexts = getattr(route, "effective_route_contexts", None)
+        if callable(effective_route_contexts):
+            yield from effective_route_contexts()
+        else:
+            yield route
+
+
+def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
+    """Best-effort resolve auth level by matching the request to a route."""
+    # Import lazily to keep this module unit-test friendly (FastAPI/Starlette are not
+    # required unless you actually use the middleware / route matching).
+    from starlette.routing import Match
+
+    # Prefer app.router.routes when available; fall back to app.routes.
+    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
+        app, "routes", []
+    )
+
+    for route in _iter_effective_routes(routes):
+        try:
+            match, child_scope = route.matches(scope)
+        except Exception:
+            continue
+        if match == Match.FULL:
+            endpoint = child_scope.get("endpoint") or getattr(route, "endpoint", None)
+            level = getattr(endpoint, "_auth_level", None)
+            return level if isinstance(level, AuthLevel) else AuthLevel.NORMAL
+
+    return AuthLevel.NORMAL
+
+
+def app_has_admin_force_endpoints(app: Any) -> bool:
+    """Return True if any route endpoint is marked as ADMIN_FORCE."""
+    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
+        app, "routes", []
+    )
+    for route in _iter_effective_routes(routes):
+        endpoint = getattr(route, "endpoint", None)
+        if getattr(endpoint, "_auth_level", None) == AuthLevel.ADMIN_FORCE:
+            return True
+    return False
+
+
+#: #1288: loopback peers this server trusts without a bearer. Compared against
+#: the TRANSPORT peer address only -- never a header.
+LOOPBACK_PEERS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
+
+
+def peer_is_loopback(peer_host: Optional[str]) -> bool:
+    """True iff the TRANSPORT peer is this machine (#1288).
+
+    THE ARGUMENT MUST COME FROM THE ASGI SCOPE'S ``client`` TUPLE, which is
+    the address the kernel accepted the connection from. It is NEVER derived
+    from ``X-Forwarded-For``, ``X-Real-IP`` or ``Host``: those are strings the
+    caller chooses, so honouring them would let any remote request claim
+    loopback and take the admin routes. There is no reverse proxy in front of
+    these ports, so there is also nothing legitimate to learn from them.
+
+    A ``None`` peer (a non-network transport, or a scope without ``client``)
+    is NOT loopback: unknown must not read as trusted.
+    """
+    if not peer_host:
+        return False
+    return peer_host in LOOPBACK_PEERS
+
+
+def decide_request_auth(
+    *,
+    method: str,
+    path: str,
+    authorization_header: Optional[str],
+    api_key: Optional[str],
+    admin_api_key: Optional[str],
+    auth_level: AuthLevel,
+    peer_host: Optional[str] = None,
+) -> AuthDecision:
+    """Pure auth decision function (easy to unit test).
+
+    Auth levels:
+    - NORMAL: legacy behavior (api_key protects all endpoints when configured)
+    - ADMIN_OPTIONAL: can be accessed without any key (if no keys configured),
+      or with api_key/admin_api_key depending on server config.
+    - ADMIN_FORCE: requires admin_api_key; if admin_api_key is NOT configured,
+      it must be rejected (403) even if api_key is provided.
+
+    NOTE :
+    - Health/metrics endpoints are always allowed (even when api_key/admin_api_key is set),
+      to support k8s/liveness/readiness and Prometheus scraping without embedding secrets.
+    - We match them by prefix to cover common variants like /health_generate.
+    """
+    if method == "OPTIONS":
+        return AuthDecision(allowed=True)
+
+    if path.startswith("/health") or path.startswith("/metrics"):
+        return AuthDecision(allowed=True)
+
+    # #1288: LOOPBACK IS TRUSTED FOR THE ADMIN LEVELS (user decision
+    # 2026-09-09). Every port of this deployment binds 127.0.0.1, and the
+    # processes that drive the admin routes -- the pdflip front's flip legs and
+    # its own `/server_info` reads -- are on this host by construction. Making
+    # each of them carry a bearer is a second copy of the key with a second
+    # way to get it wrong, and it got it wrong: #1275 fix 5 moved
+    # `/server_info` to ADMIN_OPTIONAL and the front's internal read kept
+    # sending nothing, so group D answered 401 to 180 of 181 reads on boot
+    # weg2sb5f and the #915 admission gate priced blind for the whole run.
+    # sb5d's 503s were the same shape with a different producer (a dtype 500
+    # on the same read): a read with no fallback whose consumer turns
+    # "unknown" into a verdict.
+    #
+    # NON-LOOPBACK PEERS ARE UNCHANGED and still need the key -- defence in
+    # depth if anyone ever passes `--host 0.0.0.0`, which nothing does today.
+    #
+    # THE COST, stated rather than waved past: this reopens the browser-CSRF
+    # vector `cors_policy` describes (audit #506/#510, A2-F3) -- a page in a
+    # browser ON THIS HOST could POST to the admin routes with no key. The
+    # assumption that makes it acceptable is that this LXC runs no browser;
+    # if that ever changes, this trust must go with it.
+    if auth_level in (AuthLevel.ADMIN_OPTIONAL, AuthLevel.ADMIN_FORCE) \
+            and peer_is_loopback(peer_host):
+        return AuthDecision(allowed=True)
+
+    def _check_bearer_token(
+        authorization_header: Optional[str], expected_token: str
+    ) -> bool:
+        """Check bearer token with constant-time comparison."""
+        if not authorization_header:
+            return False
+        parts = authorization_header.split(" ", 1)
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            return False
+        return secrets.compare_digest(parts[1], expected_token)
+
+    # Force-auth endpoints: only admin_api_key can unlock them; if admin_api_key is unset,
+    # reject them unconditionally (explicitly "not allowed").
+    if auth_level == AuthLevel.ADMIN_FORCE:
+        if not admin_api_key:
+            return AuthDecision(allowed=False, error_status_code=403)
+        if not _check_bearer_token(authorization_header, admin_api_key):
+            return AuthDecision(allowed=False)
+        return AuthDecision(allowed=True)
+
+    # Optional-auth endpoints:
+    # - no keys configured: allow
+    # - only api_key: require api_key
+    # - only admin_api_key: require admin_api_key
+    # - both: require admin_api_key (api_key is NOT accepted)
+    if auth_level == AuthLevel.ADMIN_OPTIONAL:
+        if admin_api_key:
+            return AuthDecision(
+                allowed=_check_bearer_token(authorization_header, admin_api_key)
+            )
+        elif api_key:
+            return AuthDecision(
+                allowed=_check_bearer_token(authorization_header, api_key)
+            )
+        else:
+            return AuthDecision(allowed=True)
+
+    # Normal endpoints:
+    # - if api_key is configured, require api_key (even if admin_api_key is also configured)
+    # - otherwise allow (including the "admin_api_key only" case)
+    if api_key:
+        return AuthDecision(allowed=_check_bearer_token(authorization_header, api_key))
+
+    return AuthDecision(allowed=True)
+
+
+def add_api_key_middleware(
+    app,
+    *,
+    api_key: Optional[str],
+    admin_api_key: Optional[str],
+):
+    """Add middleware for three endpoint auth levels: normal/admin_optional/admin_force."""
+    # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
+    from fastapi.responses import ORJSONResponse
+    from starlette.requests import Request
+
+    class _ApiKeyASGIMiddleware:
+        """ASGI-native middleware to preserve client disconnect events."""
+
+        def __init__(self, app, *, api_key, admin_api_key, fastapi_app):
+            self.app = app
+            self.api_key = api_key
+            self.admin_api_key = admin_api_key
+            self.fastapi_app = fastapi_app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                await self.app(scope, receive, send)
+                return
+
+            request = Request(scope, receive=receive)
+            path = request.url.path
+            authz = request.headers.get("Authorization")
+            level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
+            # #1288: THE PEER COMES FROM THE SCOPE, NOT FROM A HEADER.
+            # `scope["client"]` is the address the kernel accepted the
+            # connection from; `request.headers` are strings the caller
+            # chooses. Reading X-Forwarded-For / X-Real-IP here would let any
+            # remote caller claim loopback and take the admin routes.
+            client = scope.get("client")
+            peer_host = client[0] if client else None
+            decision = decide_request_auth(
+                method=request.method,
+                path=path,
+                authorization_header=authz,
+                api_key=self.api_key,
+                admin_api_key=self.admin_api_key,
+                auth_level=level,
+                peer_host=peer_host,
+            )
+
+            if not decision.allowed:
+                response = ORJSONResponse(
+                    content={
+                        "error": (
+                            "Unauthorized"
+                            if decision.error_status_code == 401
+                            else "Forbidden"
+                        )
+                    },
+                    status_code=decision.error_status_code,
+                )
+                await response(scope, receive, send)
+                return
+
+            await self.app(scope, receive, send)
+
+    # #1288: ONE grep-able line per process saying which policy is in force.
+    # A trust decision that is only visible in the source is a trust decision
+    # nobody audits from a boot log.
+    logging.getLogger(__name__).info(
+        "PDFLIP-AUTH loopback=trusted bearer=required-for-remote "
+        "(peer from the ASGI scope client tuple only, never "
+        "X-Forwarded-For/X-Real-IP/Host; admin_api_key=%s api_key=%s; #1288)",
+        "set" if admin_api_key else "unset", "set" if api_key else "unset",
+    )
+    app.add_middleware(
+        _ApiKeyASGIMiddleware,
+        api_key=api_key,
+        admin_api_key=admin_api_key,
+        fastapi_app=app,
+    )

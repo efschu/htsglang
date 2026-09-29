@@ -3,7 +3,7 @@
 DER BEFUND, gemessen an fnFL2w67 (9a50ccbb34):
 
     MANIFEST-WRITE group=P rank=0 pieces=1103 bytes=3005657056   (3,0 GB)
-    WEG2-XCHG-COVER  18 Chunk-Tags, zusammen 3,59 GiB
+    PDFLIP-XCHG-COVER  18 Chunk-Tags, zusammen 3,59 GiB
 
 gegen 13/20/13 GB Kartenbelegung. Der Presplit ersetzt den Experten-
 Parameter durch einen 0-Zeilen-Platzhalter und haelt die Bytes im
@@ -21,8 +21,8 @@ import torch
 
 import pytest
 
-from sglang.srt.managers import weg2_memory_saver as ms
-from sglang.srt.weg2 import weight_exchange_shadow as sh
+from flliper.srt.managers import pdflip_memory_saver as ms
+from flliper.srt.pdflip import weight_exchange_shadow as sh
 
 
 @pytest.fixture
@@ -33,12 +33,12 @@ def chunks(monkeypatch):
     monkeypatch.delenv(ms.EXPERT_BAND_ENV_COUNT, raising=False)
 
 
-def _modell(puffer=None, layer_id=7):
+def _model(buffer=None, layer_id=7):
     experts = torch.nn.Module()
     experts.w13_weight_packed = torch.nn.Parameter(
         torch.zeros(0, 4), requires_grad=False)     # der 0-Zeilen-Platzhalter
-    if puffer is not None:
-        setattr(experts, ms.expert_buffer_attr_name("w13_weight_packed"), puffer)
+    if buffer is not None:
+        setattr(experts, ms.expert_buffer_attr_name("w13_weight_packed"), buffer)
     mlp = torch.nn.Module(); mlp.experts = experts
     lay = torch.nn.Module(); lay.mlp = mlp
     layers = torch.nn.ModuleList(
@@ -50,9 +50,9 @@ def _modell(puffer=None, layer_id=7):
 
 # --- die Namens-Naht: eine Stelle schreibt, eine liest --------------------
 
-def test_name_und_erkennung_gehoeren_zusammen():
+def test_name_and_detection_belong_together():
     n = ms.expert_buffer_attr_name("w13_weight_packed")
-    assert n == "weg2_experts_w13_weight_packed"
+    assert n == "pdflip_experts_w13_weight_packed"
     assert ms.is_expert_buffer_attr(n)
     assert ms.is_expert_buffer_attr("model.layers.7.mlp.experts." + n)
     assert not ms.is_expert_buffer_attr("w13_weight_packed")
@@ -61,24 +61,24 @@ def test_name_und_erkennung_gehoeren_zusammen():
 
 # --- ohne Puffer: unveraendert -------------------------------------------
 
-def test_ohne_puffer_aendert_sich_nichts(chunks):
-    inv, skipped, walked, reason = sh.card_inventory(rank=0, model=_modell())
-    namen = [g.name for g, _t in (inv or [])]
-    assert not [n for n in namen if "weg2_experts" in n]
+def test_without_buffer_nothing_changes(chunks):
+    inv, skipped, walked, reason = sh.card_inventory(rank=0, model=_model())
+    names = [g.name for g, _t in (inv or [])]
+    assert not [n for n in names if "pdflip_experts" in n]
 
 
 # --- mit Puffer: er ist drin, mit den RICHTIGEN Bytes --------------------
 
-def test_der_puffer_steht_im_inventar_mit_seinen_echten_bytes(chunks):
+def test_buffer_is_in_inventory_with_real_bytes(chunks):
     # [220 Slots, 160, 2560] int32 -- die Form, die w67 am Metall hatte
     buf = torch.zeros(220, 16, 64, dtype=torch.int32)
-    inv, skipped, walked, reason = sh.card_inventory(rank=0, model=_modell(buf))
+    inv, skipped, walked, reason = sh.card_inventory(rank=0, model=_model(buf))
     assert inv, reason
-    treffer = [g for g, _t in inv if "weg2_experts" in g.name]
-    assert len(treffer) == 1, [g.name for g, _t in inv]
-    g = treffer[0]
+    hits = [g for g, _t in inv if "pdflip_experts" in g.name]
+    assert len(hits) == 1, [g.name for g, _t in inv]
+    g = hits[0]
     assert g.name == ("model.layers.7.mlp.experts."
-                      "weg2_experts_w13_weight_packed")
+                      "pdflip_experts_w13_weight_packed")
     # Layer 7 -> Chunk 7//3 = 2. Der CHUNK-Tag, nicht ein Band-Tag: die
     # Feinheit kommt aus der Shard-Achse, nicht aus dem Namen.
     assert g.tag == "weights_2"
@@ -88,10 +88,10 @@ def test_der_puffer_steht_im_inventar_mit_seinen_echten_bytes(chunks):
     assert g.rows_full == 220 * 16 and g.cols_full == 64
 
 
-def test_der_puffer_reist_mit_seinem_tensor(chunks):
+def test_buffer_travels_with_its_tensor(chunks):
     buf = torch.zeros(8, 4, 16, dtype=torch.int32)
-    inv, _s, _w, _r = sh.card_inventory(rank=0, model=_modell(buf))
-    paar = [(g, t) for g, t in inv if "weg2_experts" in g.name]
+    inv, _s, _w, _r = sh.card_inventory(rank=0, model=_model(buf))
+    paar = [(g, t) for g, t in inv if "pdflip_experts" in g.name]
     assert len(paar) == 1
     _g, t = paar[0]
     assert t.data_ptr() == buf.data_ptr(), (
@@ -100,9 +100,9 @@ def test_der_puffer_reist_mit_seinem_tensor(chunks):
     )
 
 
-def test_ein_leerer_puffer_kommt_NICHT_ins_inventar(chunks):
+def test_empty_buffer_is_not_inventoried(chunks):
     """0 Zeilen = kein Byte zu bewegen; im Inventar waere es ein Parameter
-    ohne Deskriptor -> W74 Weg2XchgSourceMissing.
+    ohne Deskriptor -> W74 PdFlipXchgSourceMissing.
 
     ZWEI SICHERUNGEN, und der Mutantenlauf hat das gezeigt statt es zu
     behaupten: die `numel() == 0`-Pruefung in der Schleife ueberlebt ihre
@@ -114,32 +114,32 @@ def test_ein_leerer_puffer_kommt_NICHT_ins_inventar(chunks):
     Dieser Test bindet das ERGEBNIS, und der naechste bindet die Herkunft.
     """
     buf = torch.zeros(0, 4, 16, dtype=torch.int32)
-    inv, skipped, _w, _r = sh.card_inventory(rank=0, model=_modell(buf))
-    assert not [g for g, _t in (inv or []) if "weg2_experts" in g.name]
-    assert not [n for n, _why in skipped if "weg2_experts" in n], (
+    inv, skipped, _w, _r = sh.card_inventory(rank=0, model=_model(buf))
+    assert not [g for g, _t in (inv or []) if "pdflip_experts" in g.name]
+    assert not [n for n, _why in skipped if "pdflip_experts" in n], (
         "der leere Puffer landete in der Skip-Liste statt frueh auszusteigen "
         "-- dann zaehlt jeder Boot 48x4 erwartete Formen als Defekt"
     )
 
 
-def test_die_bytes_des_manifests_stimmen_mit_dem_tensor(chunks):
+def test_manifest_bytes_match_the_tensor(chunks):
     """Bis ins Manifest durchgerechnet: pieces_from_inventory nimmt
     rows*cols*itemsize AUS DER GEOMETRIE -- genau die Stelle, an der der
     View-Weg (Storage) falsch gerechnet haette."""
-    from sglang.srt.weg2 import xchg_manifest as xm
+    from flliper.srt.pdflip import xchg_manifest as xm
 
     buf = torch.zeros(220, 16, 64, dtype=torch.int32)
-    inv, _s, _w, _r = sh.card_inventory(rank=0, model=_modell(buf))
-    stuecke = xm.pieces_from_inventory([g for g, _t in inv])
-    meins = [p for p in stuecke if "weg2_experts" in p.param_name]
-    assert len(meins) == 1
-    assert meins[0].nbytes == buf.numel() * buf.element_size() == 220 * 16 * 64 * 4
-    assert meins[0].tag == "weights_2"
+    inv, _s, _w, _r = sh.card_inventory(rank=0, model=_model(buf))
+    pieces = xm.pieces_from_inventory([g for g, _t in inv])
+    mine = [p for p in pieces if "pdflip_experts" in p.param_name]
+    assert len(mine) == 1
+    assert mine[0].nbytes == buf.numel() * buf.element_size() == 220 * 16 * 64 * 4
+    assert mine[0].tag == "weights_2"
 
 
 # --- #136: BEIDE Inventare lesen dieselbe Quelle ---------------------------
 
-def test_plan_und_manifest_sehen_DENSELBEN_puffer(chunks):
+def test_plan_and_manifest_see_same_buffer(chunks):
     """fnFL2w68: das Manifest trug die Experten (43,34 GB statt 5,19 GB),
     der PLAN nicht -- `derive_leg_plan` hatte eine EIGENE
     `named_parameters()`-Schleife. Die Coverage haelt den Plan gegen die
@@ -148,22 +148,22 @@ def test_plan_und_manifest_sehen_DENSELBEN_puffer(chunks):
     laufen -- genau die Klasse, vor der `card_inventory`s Docstring warnt.
     """
     buf = torch.zeros(220, 16, 64, dtype=torch.int32)
-    model = _modell(buf)
+    model = _model(buf)
     # Die EINE Quelle, die beide lesen:
-    aus_der_quelle = dict(sh.expert_buffer_tensors(model))
-    assert len(aus_der_quelle) == 1
-    name = next(iter(aus_der_quelle))
-    assert name.endswith("weg2_experts_w13_weight_packed")
-    assert aus_der_quelle[name].data_ptr() == buf.data_ptr()
+    from_source = dict(sh.expert_buffer_tensors(model))
+    assert len(from_source) == 1
+    name = next(iter(from_source))
+    assert name.endswith("pdflip_experts_w13_weight_packed")
+    assert from_source[name].data_ptr() == buf.data_ptr()
 
     inv, _s, _w, _r = sh.card_inventory(rank=0, model=model)
-    im_inventar = {g.name for g, _t in inv}
-    assert name in im_inventar, (
+    in_inventory = {g.name for g, _t in inv}
+    assert name in in_inventory, (
         "das Manifest-Inventar sieht den Puffer nicht"
     )
 
 
-def test_der_helfer_ist_die_einzige_stelle(chunks):
+def test_helper_is_the_only_site(chunks):
     """Gegenprobe gegen die Rueckkehr der zweiten Buchhaltung: beide
     Inventare muessen `expert_buffer_tensors` RUFEN, nicht eine eigene
     Schleife ueber `vars(module)` fuehren."""
@@ -188,7 +188,7 @@ def test_der_helfer_ist_die_einzige_stelle(chunks):
 
 # --- #137: die Verengung auf das co-lokierte Paar -------------------------
 
-def test_experten_puffer_ueberleben_die_paar_verengung():
+def test_expert_buffers_survive_pair_narrowing():
     """fnFL2w69: `reconcile_card_manifest` verengt den Plan auf die
     Schnittmenge der Manifest-IDENTITAETEN des co-lokierten Paares, und eine
     Identitaet enthaelt `rows_full`. Ein Experten-Puffer hat je Gruppe eine
@@ -218,38 +218,38 @@ def test_experten_puffer_ueberleben_die_paar_verengung():
 
 # --- #138: die PLAN-PARAM-Zeile sieht den Puffer ---------------------------
 
-def test_plan_param_zeile_findet_den_experten_puffer(chunks):
+def test_plan_param_line_finds_expert_buffer(chunks):
     """fnFL2w70: DERSELBE Rang meldete in DERSELBEN Runde (gleicher
     Zeitstempel) denselben Namen als UNCOVERED -- der Walk sieht ihn -- und
     als `verdict=absent live_tag=- shape=[]`. Ursache war der Filter
     `kind == PARAMETER`: der Presplit ersetzt den Experten-Parameter durch
     einen 0-Zeilen-Platzhalter, der Puffer ist seither ein ATTRIBUT.
     """
-    from sglang.srt.weg2.weight_exchange import plan_param_lines
+    from flliper.srt.pdflip.weight_exchange import plan_param_lines
 
     buf = torch.zeros(8, 4, 16, dtype=torch.int32)
-    model = _modell(buf)
-    name = "model.layers.7.mlp.experts.weg2_experts_w13_weight_packed"
-    zeilen = plan_param_lines(
+    model = _model(buf)
+    name = "model.layers.7.mlp.experts.pdflip_experts_w13_weight_packed"
+    row_list = plan_param_lines(
         model, rank=0, tag="weights_2",
         planned_bytes_by_tag={"weights_2": {name: buf.numel() * 4}},
     )
-    assert zeilen, "keine Zeile gedruckt"
-    z = zeilen[0]
+    assert row_list, "keine Zeile gedruckt"
+    z = row_list[0]
     assert "verdict=absent" not in z, (
         f"der Puffer gilt als abwesend, obwohl der Walk ihn liefert: {z}"
     )
     assert "verdict=here" in z and "live_tag=weights_2" in z, z
 
 
-def test_ein_gewoehnliches_attribut_bleibt_draussen(chunks):
+def test_ordinary_attribute_stays_out(chunks):
     """Die Einschraenkung auf Parameter bleibt sonst: eine PLAN-Zeile druckt
     je geplantem PARAMETER, nicht je Tensor am Modul."""
-    from sglang.srt.weg2.weight_exchange import plan_param_lines
+    from flliper.srt.pdflip.weight_exchange import plan_param_lines
 
-    model = _modell()
+    model = _model()
     experts = model.model.layers[7].mlp.experts
-    experts.irgendein_puffer = torch.zeros(4, 4)
+    experts.some_buffer = torch.zeros(4, 4)
     name = "model.layers.7.mlp.experts.irgendein_puffer"
     z = plan_param_lines(model, rank=0, tag="weights_2",
                          planned_bytes_by_tag={"weights_2": {name: 64}})[0]
@@ -260,17 +260,17 @@ def test_ein_gewoehnliches_attribut_bleibt_draussen(chunks):
 
 # --- #139: die Stelle, die die REFUSAL steuert ----------------------------
 
-def test_der_puffer_zaehlt_als_gesehener_plan_parameter(chunks):
+def test_buffer_counts_as_seen_plan_parameter(chunks):
     """w69/w70/w71 meldeten unveraendert uncovered=12 UND missing=12 -- und
     #138 half nicht, weil es die DRUCKZEILE heilte. `seen_names` wird nur im
     PARAMETER-Zweig gefuellt, und `missing = planned - seen_names`; ein
     geplanter Tensor, der als ATTRIBUT lebt, kann dort nie ankommen.
     """
-    from sglang.srt.weg2.weight_exchange import arm_coverage
+    from flliper.srt.pdflip.weight_exchange import arm_coverage
 
     buf = torch.zeros(8, 4, 16, dtype=torch.int32)
-    model = _modell(buf)
-    name = "model.layers.7.mlp.experts.weg2_experts_w13_weight_packed"
+    model = _model(buf)
+    name = "model.layers.7.mlp.experts.pdflip_experts_w13_weight_packed"
     vote = arm_coverage(
         model, rank=0,
         planned_bytes_by_tag={"weights_2": {name: buf.numel() * 4}},
@@ -279,7 +279,7 @@ def test_der_puffer_zaehlt_als_gesehener_plan_parameter(chunks):
     row = vote.rows.get("weights_2")
     assert row is not None, sorted(vote.rows)
     assert not row.missing, f"missing={row.missing}"
-    assert not [t for t in row.uncovered if "weg2_experts" in t.name], (
+    assert not [t for t in row.uncovered if "pdflip_experts" in t.name], (
         f"uncovered={[t.name for t in row.uncovered]}"
     )
     assert row.ok, row

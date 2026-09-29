@@ -12,7 +12,7 @@ if str(PARENT_DIR) not in sys.path:
 
 from auto_benchmark import AutoBenchmarkTestCase
 
-from sglang.auto_benchmark_lib import (
+from flliper.auto_benchmark_lib import (
     append_jsonl,
     build_qps_plan,
     build_server_candidates,
@@ -26,7 +26,7 @@ from sglang.auto_benchmark_lib import (
     rendered_launch_command,
     resolve_max_candidates,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=6, suite="stage-b-test-1-gpu-small-amd")
@@ -247,7 +247,7 @@ class TestAutoBenchmarkSearchTools(AutoBenchmarkTestCase):
             return SimpleNamespace(returncode=0, stdout=stdout)
 
         with mock.patch(
-            "sglang.auto_benchmark_lib.subprocess.run", side_effect=fake_run
+            "flliper.auto_benchmark_lib.subprocess.run", side_effect=fake_run
         ):
             self.assertEqual(collect_stale_server_pids(30000), [123, 456])
 
@@ -278,7 +278,7 @@ class TestAutoBenchmarkSearchTools(AutoBenchmarkTestCase):
                     "output_throughput": 1867.28,
                     "mean_ttft_ms": 99.58,
                     "mean_tpot_ms": 21.09,
-                    "launch_command": "python -m sglang.launch_server --port 30000",
+                    "launch_command": "python -m flliper.launch_server --port 30000",
                 },
                 {
                     "scenario_name": "summarization",
@@ -288,7 +288,7 @@ class TestAutoBenchmarkSearchTools(AutoBenchmarkTestCase):
                     "output_throughput": 537.17,
                     "mean_ttft_ms": 709.99,
                     "mean_tpot_ms": 26.89,
-                    "launch_command": "python -m sglang.launch_server --port 30001",
+                    "launch_command": "python -m flliper.launch_server --port 30001",
                 },
             ]
         )

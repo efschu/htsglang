@@ -4,8 +4,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from sglang.srt.debug_utils.dump_loader import read_tokenizer_path
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.dump_loader import read_tokenizer_path
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 

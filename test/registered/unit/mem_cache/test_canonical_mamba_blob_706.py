@@ -28,16 +28,16 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError
-from sglang.srt.mem_cache.canonical_page_store import (
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageError
+from flliper.srt.mem_cache.canonical_page_store import (
     CanonicalExtentWindow,
     build_mamba_window,
     page_is_complete,
     read_extents,
     write_extents,
 )
-from sglang.srt.mem_cache.hicache_migrate import MambaBlobSpec, layer_extents
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.hicache_migrate import MambaBlobSpec, layer_extents
+from flliper.test.test_utils import CustomTestCase
 
 # Small, exact, and deliberately asymmetric: temporal and conv layer sizes
 # differ, so a cut that confuses the two regions cannot pass by coincidence.
@@ -281,7 +281,7 @@ class TestRuntimeDerivation(CustomTestCase):
     MAMBA_LAYER_IDS = [i for i in range(64) if i % 4 != 3]
 
     def test_layer_range_comes_from_the_global_map(self):
-        from sglang.srt.mem_cache.canonical_page_store import local_mamba_layer_range
+        from flliper.srt.mem_cache.canonical_page_store import local_mamba_layer_range
 
         stage_ids = [i for i in self.MAMBA_LAYER_IDS if 28 <= i < 48]
         lo, hi = local_mamba_layer_range(_HybridPool(stage_ids), self.MAMBA_LAYER_IDS)
@@ -289,7 +289,7 @@ class TestRuntimeDerivation(CustomTestCase):
         self.assertEqual(self.MAMBA_LAYER_IDS[lo:hi], stage_ids)
 
     def test_a_pool_without_the_map_is_refused(self):
-        from sglang.srt.mem_cache.canonical_page_store import local_mamba_layer_range
+        from flliper.srt.mem_cache.canonical_page_store import local_mamba_layer_range
 
         class _Bare:
             pass
@@ -298,13 +298,13 @@ class TestRuntimeDerivation(CustomTestCase):
             local_mamba_layer_range(_Bare(), self.MAMBA_LAYER_IDS)
 
     def test_non_contiguous_gdn_layers_are_refused(self):
-        from sglang.srt.mem_cache.canonical_page_store import local_mamba_layer_range
+        from flliper.srt.mem_cache.canonical_page_store import local_mamba_layer_range
 
         with self.assertRaises(CanonicalPageError):
             local_mamba_layer_range(_HybridPool([0, 1, 30]), self.MAMBA_LAYER_IDS)
 
     def test_spec_is_derived_from_config_and_pool_dtypes(self):
-        from sglang.srt.mem_cache.canonical_page_store import derive_mamba_blob_spec
+        from flliper.srt.mem_cache.canonical_page_store import derive_mamba_blob_spec
 
         spec = derive_mamba_blob_spec(
             _ModelConfig(), _MambaPool(), num_linear_layers=48
@@ -321,7 +321,7 @@ class TestRuntimeDerivation(CustomTestCase):
     def test_a_config_without_the_gdn_fields_is_refused(self):
         """Another linear-attention family needs its own spec before its blob
         can be made phase-uniform. Refused by name, not approximated."""
-        from sglang.srt.mem_cache.canonical_page_store import derive_mamba_blob_spec
+        from flliper.srt.mem_cache.canonical_page_store import derive_mamba_blob_spec
 
         class _Other:
             linear_num_value_heads = 8
@@ -339,7 +339,7 @@ class TestRuntimeDerivation(CustomTestCase):
         list, so this cannot happen today -- but if it ever did, the page would
         be [temporal][conv0][conv1] against a spec of [temporal][conv0] and
         every extent past the first conv region would silently mis-cut."""
-        from sglang.srt.mem_cache.canonical_page_store import derive_mamba_blob_spec
+        from flliper.srt.mem_cache.canonical_page_store import derive_mamba_blob_spec
 
         pool = _MambaPool()
         pool.mamba_cache.conv = [
@@ -350,7 +350,7 @@ class TestRuntimeDerivation(CustomTestCase):
             derive_mamba_blob_spec(_ModelConfig(), pool, num_linear_layers=48)
 
     def test_a_pool_without_dtypes_is_refused(self):
-        from sglang.srt.mem_cache.canonical_page_store import derive_mamba_blob_spec
+        from flliper.srt.mem_cache.canonical_page_store import derive_mamba_blob_spec
 
         class _Bare:
             pass

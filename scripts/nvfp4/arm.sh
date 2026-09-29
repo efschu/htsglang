@@ -42,7 +42,7 @@ echo "ts_utc,gpu_index,name,mem_used_mib,mem_total_mib,util_pct,power_w" > "$VRA
 SAMPLER=$!
 
 cd "$WT"
-setsid "$PY" -m sglang.launch_server \
+setsid "$PY" -m flliper.launch_server \
   --model-path "$MODEL" \
   --served-model-name Qwen3.6-27B-NVFP4 \
   --trust-remote-code --enable-metrics \

@@ -19,14 +19,14 @@ import os
 import unittest
 from unittest.mock import patch
 
-import sglang.srt.server_args as server_args_module
-from sglang.srt.distributed.utils import (
+import flliper.srt.server_args as server_args_module
+from flliper.srt.distributed.utils import (
     cp_token_context_budget,
     cp_token_speed_vector,
 )
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -34,9 +34,9 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 FAKE_GPU_MEMORY = {0: (32768, 30000), 1: (20480, 19000), 2: (20480, 19000)}
 
 _UNEVEN_ENVS = (
-    "SGLANG_UNEVEN_DCP",
-    "SGLANG_UNEVEN_DCP_WEIGHTED",
-    "SGLANG_UNEVEN_TOKEN_VECTOR",
+    "FLLIPER_UNEVEN_DCP",
+    "FLLIPER_UNEVEN_DCP_WEIGHTED",
+    "FLLIPER_UNEVEN_TOKEN_VECTOR",
 )
 
 # The measured shape of the #210 vehicle: the FAST card (rank 0, a 5090) has

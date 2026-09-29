@@ -24,8 +24,8 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python")
 )
 
-from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule  # noqa: E402
-from sglang.srt.layers.attention.fla.fused_gdn_gating import (  # noqa: E402
+from flliper.srt.layers.attention.fla.chunk import chunk_gated_delta_rule  # noqa: E402
+from flliper.srt.layers.attention.fla.fused_gdn_gating import (  # noqa: E402
     fused_gdn_gating,
 )
 

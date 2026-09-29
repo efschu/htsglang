@@ -54,24 +54,24 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.phase_flip_runtime import drop_prefix_tree_returning_rows
-from sglang.srt.mem_cache.allocator import (
+from flliper.srt.managers.phase_flip_runtime import drop_prefix_tree_returning_rows
+from flliper.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.hicache_phase_binding import PhasePools, _stamp
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.hicache_phase_binding import PhasePools, _stamp
+from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 # ~3s: two tiny CPU-only KV pools, no accelerator, no group, no boot.
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -346,7 +346,7 @@ class TestTheUnownedProbeCanReachTheOtherPhasesPool(CustomTestCase):
 
     @staticmethod
     def _candidates(sched):
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         probe = PhaseFlipRuntime._unenumerated_owner_candidates
         holder = types.SimpleNamespace(_census_scheduler=sched)
@@ -396,7 +396,7 @@ class TestTheUnownedProbeCanReachTheOtherPhasesPool(CustomTestCase):
         self.assertNotIn("pp_stack_allocator", names)
 
     def test_the_verdict_stops_saying_no_second_pool_is_reachable(self):
-        from sglang.srt.mem_cache.kv_row_ownership import unenumerated_owner_verdict
+        from flliper.srt.mem_cache.kv_row_ownership import unenumerated_owner_verdict
 
         pp, tp = _pp_allocator(), _tp_allocator()
         cands = self._candidates(
@@ -429,7 +429,7 @@ class TestTheCoherenceCheckCannotSeeThisBinding(CustomTestCase):
     is a fourth, so the check is green in precisely the state this file reds."""
 
     def test_the_named_readers_are_coherent_while_the_free_path_is_not(self):
-        from sglang.srt.mem_cache.hicache_phase_binding import _STATE, coherence_check
+        from flliper.srt.mem_cache.hicache_phase_binding import _STATE, coherence_check
 
         pp, tp = _pp_allocator(), _tp_allocator()
         cache = _cache(pp)

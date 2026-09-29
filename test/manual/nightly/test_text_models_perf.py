@@ -1,7 +1,7 @@
 import unittest
 
-from sglang.test.nightly_utils import NightlyBenchmarkRunner
-from sglang.test.test_utils import (
+from flliper.test.nightly_utils import NightlyBenchmarkRunner
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
     _parse_int_list_env,

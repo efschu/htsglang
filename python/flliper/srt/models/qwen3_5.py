@@ -1,0 +1,2999 @@
+# Copyright 2025 Qwen Team
+# Copyright 2025 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
+
+import os
+import logging
+from functools import lru_cache
+from typing import Iterable, Optional, Set, Tuple, Union
+
+import torch
+import torch.nn as nn
+import triton
+
+from flliper.jit_kernel.triton.gdn_fused_proj import (
+    fused_qkvzba_split_reshape_cat_contiguous,
+    qwen3_5_gdn_prefill_projection_views,
+)
+
+# Configs
+from flliper.srt.configs.qwen3_5 import (
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
+    Qwen3_5TextConfig,
+)
+
+# Distributed
+from flliper.srt.distributed import get_pp_group
+from flliper.srt.pdflip import attn_head_split as _ah_split_mod
+from flliper.srt.distributed.utils import (
+    attn_kv_replicated,
+    attn_replicated_kv_local_head,
+    attn_q_partition_groups,
+    attn_q_partition_units,
+    tp_partition_size,
+    tp_plan_active,
+)
+from flliper.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from flliper.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+# Layers - Attention
+from flliper.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from flliper.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
+from flliper.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from flliper.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
+from flliper.srt.layers.elementwise import fused_sigmoid_mul
+
+# Layers - Others
+from flliper.srt.layers.layernorm import GemmaRMSNorm
+
+# Layers - Linear
+from flliper.srt.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+    _quant_block_aligned_units,
+)
+from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from flliper.srt.layers.parameter import (
+    BlockQuantScaleParameter,
+    PerTensorScaleParameter,
+)
+from flliper.srt.layers.quantization.base_config import QuantizationConfig
+from flliper.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    bf16_gemm_dispatch,
+)
+from flliper.srt.layers.radix_attention import RadixAttention
+from flliper.srt.layers.radix_linear_attention import RadixLinearAttention
+from flliper.srt.layers.rotary_embedding import get_rope
+from flliper.srt.layers.utils import PPMissingLayer, get_layer_id
+from flliper.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from flliper.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
+from flliper.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from flliper.srt.model_executor.runner import get_is_capture_mode
+from flliper.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    sharded_weight_loader,
+)
+from flliper.srt.models.qwen2_moe import (
+    Qwen2MoeMLP,
+    Qwen2MoeSparseMoeBlock,
+    can_fuse_shared_expert,
+)
+
+# Models
+from flliper.srt.models.mtp_vocab_share import (
+    MtpEmbedDeferred,
+    embed_from_target_requested,
+    mtp_builds_own_embed,
+)
+from flliper.srt.models.qwen3_vl import (
+    Qwen3VLForConditionalGeneration,
+    skip_vision_weight,
+)
+from flliper.srt.models.utils import (
+    fused_qk_gemma_rmsnorm,
+    fused_qk_gemma_rmsnorm_with_gate,
+)
+from flliper.srt.runtime_context import (
+    get_forward,
+    get_lora,
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
+
+# Utils
+from flliper.srt.utils import (
+    LazyValue,
+    add_prefix,
+    cpu_has_amx_support,
+    get_bool_env_var,
+    is_cpu,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_xpu,
+    make_layers,
+    owned_layer_ids,
+    set_weight_attrs,
+)
+from flliper.srt.utils.hf_transformers_utils import get_processor, get_rope_config
+
+logger = logging.getLogger(__name__)
+
+#: #753 INSTRUMENT. One line per layer on the FIRST forward only, naming the
+#: GLOBAL layer id, so two runs with DIFFERENT stage layouts but the same
+#: checkpoint can be diffed layer by layer to find the first divergence. That
+#: is what localizes a silently-wrong forward to a seam instead of guessing at
+#: one. Off unless the env is set, and then it costs one .item() per layer once.
+#:
+#: The shipped ``--debug-tensor-dump-output-folder`` machinery was considered
+#: first and is the wrong tool here: it writes whole tensors, and a 64-layer
+#: sweep across two boots is gigabytes to move for a scalar comparison.
+_LAYER_NORM_TRACE = os.getenv("FLLIPER_LAYER_NORM_TRACE", "") not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
+_layer_norm_traced: dict = {}
+#: How many passes per layer to trace. The FIRST forward of a boot is the KV
+#: memory-profiling dummy -- on a PP layout its later stages receive zeros, so
+#: a one-pass trace records `h=0.000000` for every layer past stage 0 and can
+#: localize nothing. Tracing more than one pass lets the profiling forward be
+#: pass=0 and the actual probe prompt be pass=1, which is the one to diff.
+_LAYER_NORM_TRACE_PASSES = max(1, int(os.getenv("FLLIPER_LAYER_NORM_TRACE_PASSES", "1")))
+
+
+def _trace_layer_norms(layer_idx: int, hidden_states, residual) -> None:
+    """Log this layer's output norms. Never raises into the forward."""
+    seen = _layer_norm_traced.get(layer_idx, 0)
+    if seen >= _LAYER_NORM_TRACE_PASSES:
+        return
+    # A norm is a .item(), i.e. a device-to-host sync, which is ILLEGAL inside a
+    # CUDA graph capture and invalidates it (cudaErrorStreamCaptureInvalidated,
+    # taking the boot down with it). The original one-pass trace never met a
+    # capture because the profiling forward precedes it; a multi-pass trace does.
+    # Skipping a captured pass costs nothing -- capture replays a shape, it is
+    # not the forward whose numerics we are localizing.
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:  # noqa: BLE001 - an instrument may not break a boot
+        pass
+    _layer_norm_traced[layer_idx] = seen + 1
+
+    def _n(t):
+        try:
+            if t is None or t.shape[0] == 0:
+                return float("nan")
+            return float(t[0].float().norm().item())
+        except Exception:  # noqa: BLE001 - an instrument may not break a boot
+            return float("nan")
+
+    try:
+        rows = -1 if hidden_states is None else int(hidden_states.shape[0])
+        logger.info(
+            "LAYERTRACE pass=%d layer=%d rows=%d h=%.6f r=%.6f",
+            seen,
+            layer_idx,
+            rows,
+            _n(hidden_states),
+            _n(residual),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.info("LAYERTRACE layer=%d unavailable: %s", layer_idx, e)
+_is_cuda = is_cuda()
+_is_npu = is_npu()
+_is_cpu = is_cpu()
+_is_gfx95 = is_gfx95_supported()
+_is_hip = is_hip()
+_QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
+_is_xpu = is_xpu()
+_use_aiter = get_bool_env_var("FLLIPER_USE_AITER") and _is_hip
+_hip_use_alt_stream = get_bool_env_var("FLLIPER_ALT_STREAM") and _is_hip
+_gdn_use_alt_stream = _is_cuda or (
+    get_bool_env_var("FLLIPER_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
+)
+_qknorm_use_alt_stream = _is_cuda or (
+    get_bool_env_var("FLLIPER_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
+)
+_is_amx_available = cpu_has_amx_support()
+
+# Head-group ratios (num_v_heads // num_k_heads) served by the fused
+# split/reshape/cat Triton kernel. Upstream #34859: on CUDA the ratio-3 dense
+# 27B layout is handled by the kernel's per-head walk (the CPU fused op still
+# requires a power-of-two group), replacing the split + 2x .contiguous() +
+# torch.cat (+ z copy) of the unfused fallback on every decode/verify step.
+_GDN_FUSED_QKVZBA_RATIOS = (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
+
+cached_get_processor = lru_cache(get_processor)
+
+
+def _disable_shared_experts_fusion() -> bool:
+    # Resolved lazily: the global server args is not set at module import time
+    # (e.g. when this module is imported by unit tests).
+    return get_server_args().disable_shared_experts_fusion
+
+
+if _is_cuda:
+    from flliper.srt.layers.fused_qk_rmsnorm_rope_gate import (
+        fused_qk_gemma_rmsnorm_rope_gate,
+    )
+
+if _is_cpu:
+    fused_sigmoid_mul = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+    fused_qk_gemma_rmsnorm = torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_cpu
+    fused_qk_gemma_rmsnorm_with_gate = (
+        torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_with_gate_cpu
+    )
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+        split_qkvgate_gemma_rmsnorm_rope,
+    )
+
+
+def _p_layer_split_swing(model) -> frozenset:
+    """--p-layer-split dynamic: the swing layers this stage built beyond its
+    home interval (their weights load like home ones); empty under static."""
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        layers = getattr(getattr(model, "model", None), "layers", None)
+    return getattr(layers, "swing_layers", None) or frozenset()
+
+
+class Qwen3_5GatedDeltaNet(nn.Module):
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.hidden_size = config.hidden_size
+        self.num_v_heads = (
+            config.linear_num_value_heads
+            if not _is_cpu
+            else config.linear_num_value_heads_cpu
+        )
+        self.num_k_heads = (
+            config.linear_num_key_heads
+            if not _is_cpu
+            else config.linear_num_key_heads_cpu
+        )
+        self.head_k_dim = config.linear_key_head_dim
+        self.head_v_dim = config.linear_value_head_dim
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+        self.alt_stream = alt_stream
+
+        # Uneven-TP unit family for ALL coupled GDN projections. Normally the
+        # k heads are the indivisible unit (v heads are a fixed multiple). For a
+        # weight-quantized checkpoint whose block does not divide a head (GGUF
+        # K-quant: block 256 = 2*head_dim), that unit is coarsened so every
+        # rank's shard of the packed out_proj input still lands on a quant block
+        # — and crucially the SAME coarsened unit is used for the head counts
+        # and every projection, so the model and the GGUF loader agree (mirrors
+        # the vLLM plugin's global group_size=256 family). FP8 (block 128 =
+        # head_dim) and unquantized checkpoints pass through unchanged.
+        self.gdn_tp_units = _quant_block_aligned_units(
+            self.value_dim, self.num_k_heads, quant_config, 1
+        )
+        # Expose the coarsened unit to the mamba/conv state-cache shape
+        # derivation (config.mamba2_cache_params -> Mamba2StateShape.create),
+        # so the per-rank state cache uses the SAME uneven-TP split as these
+        # layers. Same text-config object as the runner's mambaish_config.
+        config.gdn_tp_units = self.gdn_tp_units
+
+        # Per-rank (local) GDN head counts. Even TP: total // tp_size, exactly
+        # as before. Uneven TP (--rank-tp-ratio): this rank's share of the shard
+        # plan, in whole gdn_tp_units.
+        self.local_num_k_heads = tp_partition_size(
+            self.num_k_heads, self.attn_tp_size, self.attn_tp_rank, self.gdn_tp_units
+        )
+        self.local_num_v_heads = tp_partition_size(
+            self.num_v_heads, self.attn_tp_size, self.attn_tp_rank, self.gdn_tp_units
+        )
+
+        self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.layer_id = layer_id
+        self.activation = config.hidden_act
+        self.output_gate_type = config.output_gate_type
+        self.layer_norm_epsilon = config.rms_norm_eps
+
+        # Conv1d layer
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv1d = ColumnParallelLinear(
+            input_size=self.conv_kernel_size,
+            output_size=self.conv_dim,
+            bias=False,
+            quant_config=None,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+            prefix=add_prefix("conv1d", prefix),
+            # Uneven TP: conv channels are partitioned in whole k-head
+            # units (each unit carries 2*head_k_dim + ratio*head_v_dim
+            # channels). Ignored on the default path.
+            tp_units=self.gdn_tp_units,
+        )
+        self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
+
+        # projection of the input hidden states
+        self.in_proj_qkvz = self.create_qkvz_proj(
+            hidden_size=self.hidden_size,
+            key_dim=self.key_dim,
+            value_dim=self.value_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("in_proj_qkvz", prefix),
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+        )
+
+        self.in_proj_ba = self.create_ba_proj(
+            hidden_size=self.hidden_size,
+            num_v_heads=self.num_v_heads,
+            quant_config=quant_config,
+            prefix=add_prefix("in_proj_ba", prefix),
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+        )
+
+        # Override weight loaders for packed checkpoint format.
+        # Important: for FP8, this must cover not only `.weight` but also
+        # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
+        self._bind_packed_weight_loaders(self.in_proj_qkvz)
+        if layer_id == 0:  # #1483 instrument
+            logger.info("#1483 GDN-PROJ layer0 qkvz=%s ba=%s out=%s prefix=%s quant=%s",
+                        type(self.in_proj_qkvz.quant_method).__name__, type(self.in_proj_ba.quant_method).__name__,
+                        type(self.out_proj.quant_method).__name__ if hasattr(self, "out_proj") else "n/a",
+                        prefix, None if quant_config is None else quant_config.get_name())
+        self._bind_packed_weight_loaders(self.in_proj_ba)
+        self._fused_in_proj_weight: Optional[torch.Tensor] = None
+        self._fused_in_proj_qkvz_width = 0
+        self._fused_input_proj_cpu_enabled = LazyValue(
+            lambda: (
+                _is_cpu
+                and self.in_proj_qkvz._parameters.get("weight") is not None
+                and self.in_proj_ba._parameters.get("weight") is not None
+                and self.in_proj_qkvz._parameters["weight"].dtype == torch.bfloat16
+                and self.in_proj_ba._parameters["weight"].dtype == torch.bfloat16
+                and self.in_proj_qkvz.bias is None
+                and self.in_proj_ba.bias is None
+                and use_intel_amx_backend(self.in_proj_qkvz)
+                and use_intel_amx_backend(self.in_proj_ba)
+                and (
+                    self.in_proj_qkvz.weight.size(0) % 32 == 0
+                    and self.in_proj_ba.weight.size(0) % 32 == 0
+                )
+            )
+        )
+
+        # Conv1d weight loader setup
+        query_key_settings = (self.key_dim, 0, False)
+        value_settings = (self.value_dim, 0, False)
+
+        self._override_weight_loader(
+            self.conv1d.weight,
+            mamba_v2_sharded_weight_loader(
+                [
+                    query_key_settings,
+                    query_key_settings,
+                    value_settings,
+                ],
+                self.attn_tp_size,
+                self.attn_tp_rank,
+                # Uneven TP: partition every conv group in whole k-head
+                # units. None (default path) keeps the classic
+                # full_dim // tp_size split.
+                tp_units=self.gdn_tp_units,
+            ),
+        )
+
+        # State parameters
+        self.dt_bias = nn.Parameter(
+            torch.ones(self.local_num_v_heads),
+        )
+        self.A_log = nn.Parameter(
+            torch.empty(self.local_num_v_heads, dtype=torch.float32),
+        )
+
+        set_weight_attrs(
+            self.A_log,
+            {"weight_loader": sharded_weight_loader(0), "tp_units": self.gdn_tp_units},
+        )
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0), "tp_units": self.gdn_tp_units},
+        )
+
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        self.attn = RadixLinearAttention(
+            layer_id=layer_id,
+            num_q_heads=self.local_num_k_heads,
+            num_k_heads=self.local_num_k_heads,
+            num_v_heads=self.local_num_v_heads,
+            head_q_dim=self.head_k_dim,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            conv_weights=conv_weights,
+            bias=self.conv1d.bias,
+            activation=self.activation,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+        )
+
+        self.norm = RMSNormGated(
+            self.head_v_dim,
+            eps=self.layer_norm_epsilon,
+            group_size=None,
+            norm_before_gate=True,
+            device=torch.get_device_module().current_device(),
+            dtype=config.torch_dtype,
+            **(
+                {"activation": self.output_gate_type}
+                if self.output_gate_type is not None
+                else {}
+            ),
+        )
+
+        self.out_proj = RowParallelLinear(
+            self.value_dim,
+            self.hidden_size,
+            bias=False,
+            input_is_parallel=True,
+            reduce_results=False,
+            quant_config=quant_config,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+            prefix=add_prefix("out_proj", prefix),
+            # Uneven TP: the input (value) dim is partitioned in whole
+            # k-head units, matching the in_proj/conv1d split.
+            tp_units=self.gdn_tp_units,
+        )
+
+    @staticmethod
+    def _override_weight_loader(param, loader):
+        """Robustly override loader for:
+        1) BasevLLMParameter subclasses: real storage is `_weight_loader`
+        2) regular Parameters that already have mutable `weight_loader`
+        3) regular Parameters without `weight_loader` yet
+        """
+        if hasattr(param, "_weight_loader"):
+            # FP8 / quantized BasevLLMParameter path
+            param._weight_loader = loader
+            return
+
+        if hasattr(param, "weight_loader"):
+            # Regular parameter/tensor that already has a mutable attr.
+            # Do NOT call set_weight_attrs here, because it asserts when
+            # overwriting an existing attribute.
+            param.weight_loader = loader
+            return
+
+        # Fresh attribute on a normal tensor/Parameter
+        set_weight_attrs(param, {"weight_loader": loader})
+
+    def _bind_packed_weight_loaders(self, module):
+        """Bind packed-checkpoint-aware loaders to all relevant params of a merged module."""
+        for attr_name in ("weight", "weight_scale_inv", "weight_scale", "input_scale"):
+            param = getattr(module, attr_name, None)
+            if param is None:
+                continue
+            original_loader = getattr(param, "weight_loader", None)
+            if original_loader is None:
+                continue
+            wrapped_loader = self._make_packed_weight_loader(module, original_loader)
+            self._override_weight_loader(param, wrapped_loader)
+
+    @staticmethod
+    def _get_split_sizes_for_param(module, param, loaded_shard_id):
+        """Return checkpoint-side split sizes for this param type."""
+        if isinstance(param, BlockQuantScaleParameter):
+            # Split by output blocks, not raw output sizes.
+            block_n, _ = module.quant_method.quant_config.weight_block_size
+            block_n = 1 if getattr(param, "format_ue8m0", False) else block_n
+            return [
+                (module.output_sizes[idx] + block_n - 1) // block_n
+                for idx in loaded_shard_id
+            ]
+
+        if isinstance(param, PerTensorScaleParameter):
+            # One logical scale per logical shard.
+            return [1 for _ in loaded_shard_id]
+
+        # Normal weight / non-block quant tensor
+        return [module.output_sizes[idx] for idx in loaded_shard_id]
+
+    @classmethod
+    def _make_packed_weight_loader(cls, module, original_weight_loader):
+        """Wrap the param's original loader so split checkpoints:
+          - in_proj_qkv + in_proj_z -> merged in_proj_qkvz
+          - in_proj_b + in_proj_a   -> merged in_proj_ba
+        can load correctly for both normal and FP8 params.
+        """
+
+        def weight_loader(param, loaded_weight, loaded_shard_id=None):
+            # Only intercept split-checkpoint tuple shards.
+            # int shard_id and None should preserve original behavior.
+            if isinstance(loaded_shard_id, tuple):
+                split_sizes = cls._get_split_sizes_for_param(
+                    module, param, loaded_shard_id
+                )
+
+                if loaded_weight.numel() == 1:
+                    # Single-element tensor (scalar or [1]):
+                    # broadcast to each logical shard.
+                    chunks = [loaded_weight.view(-1)] * len(loaded_shard_id)
+                else:
+                    split_dim = getattr(param, "output_dim", 0)
+                    if _is_cpu:
+                        cpu_split_sizes = []
+                        split_size_sum = sum(split_sizes)
+                        target_size_sim = loaded_weight.size(split_dim)
+                        for i in range(len(split_sizes)):
+                            cpu_split_sizes.append(
+                                int(target_size_sim * split_sizes[i] / split_size_sum)
+                            )
+                        assert (
+                            sum(cpu_split_sizes) == target_size_sim
+                        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {cpu_split_sizes} to {target_size_sim}"
+                        chunks = loaded_weight.split(cpu_split_sizes, dim=split_dim)
+                    else:
+                        chunks = loaded_weight.split(split_sizes, dim=split_dim)
+
+                assert len(chunks) == len(loaded_shard_id), (
+                    f"Chunk/shard mismatch: {len(chunks)=}, "
+                    f"{len(loaded_shard_id)=}, {split_sizes=}"
+                )
+
+                for idx, chunk in zip(loaded_shard_id, chunks):
+                    # Delegate each chunk to the param's original int-shard loader.
+                    original_weight_loader(param, chunk, idx)
+                return
+
+            return original_weight_loader(param, loaded_weight, loaded_shard_id)
+
+        return weight_loader
+
+    def create_qkvz_proj(
+        self,
+        hidden_size: int,
+        key_dim: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
+    ) -> MergedColumnParallelLinear:
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[key_dim, key_dim, value_dim, value_dim],
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            # Uneven TP: q/k/v/z are partitioned in whole k-head units so
+            # all four packed outputs stay aligned per rank.
+            tp_units=self.gdn_tp_units,
+        )
+
+    def create_ba_proj(
+        self,
+        hidden_size: int,
+        num_v_heads: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
+    ) -> MergedColumnParallelLinear:
+        # Qwen3.5 has separate in_proj_b and in_proj_a weights in the
+        # checkpoint, which are loaded into the fused in_proj_ba parameter
+        # via stacked_params_mapping with shard_id 0 and 1 respectively.
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[num_v_heads, num_v_heads],
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            # Uneven TP: b/a are per-v-head scalars, partitioned in whole
+            # k-head units to stay aligned with the qkvz split.
+            tp_units=self.gdn_tp_units,
+        )
+
+    def fix_query_key_value_ordering(
+        self,
+        mixed_qkvz: torch.Tensor,
+        mixed_ba: torch.Tensor,
+    ):
+        """
+        Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
+        """
+        k_tp = self.local_num_k_heads * self.head_k_dim
+        v_tp = self.local_num_v_heads * self.head_v_dim
+        nv_tp = self.local_num_v_heads
+
+        # Directly split, no head group reshape
+        query, key, value, z = mixed_qkvz.split([k_tp, k_tp, v_tp, v_tp], dim=-1)
+        b, a = mixed_ba.split([nv_tp, nv_tp], dim=-1)
+
+        # value / z reshape to (seq, num_v_heads/tp, head_v_dim)
+        value = value.reshape(value.size(0), -1, self.head_v_dim)
+        z = z.reshape(z.size(0), -1, self.head_v_dim)
+
+        return query, key, value, z, b, a
+
+    def finalize_fused_in_proj(self) -> str:
+        """Stack in_proj_qkvz + in_proj_ba into one GEMM weight;
+        the module weights become row views of it,
+        so weight reload and dtype checks still see them.
+
+        H79 (fnNV4f1, 25.09.): the block is allocated in THIS LAYER'S BAND
+        (``weight_chunk_scope``), like every other allocation of the layer.
+        This runs at the end of ``load_weights``, outside any band, so the cat
+        landed in the BASE ``weights`` tag -- measured on fnNV4f1: the base
+        tag pool held 2.91/0.63/1.67 GiB active on PP0/1/2 against
+        0.60/0.00/0.61 on the unfused INT4 boot fnFL2x176, i.e. one 80.47 MiB
+        block per GDN layer -- while the plan and the coverage walk address
+        ``in_proj_*`` BY NAME in the layer's band. In the band, the tag the
+        flip pauses and resumes is the tag the names say. Outside a Weg-2
+        chunked weights region the scope is a no-op and this is the upstream
+        function unchanged; an unfused layer (INT4/FP8 qkvz) returns before
+        anything is allocated or scoped.
+
+        H79 (A), operator decision 25.09.: a Weg-2 FLIP RANK (group P or D,
+        ``pdflip_group_name``) does NOT fuse. The cat cannot reuse the storage
+        it replaces -- the block (80.47 MiB) is larger than qkvz's own 80 MiB
+        segment, and a tag pool never hands a freed block back -- so every
+        fused layer left an 80 MiB hole in its band (fnNV4f1: band
+        ``inactive_gib`` 0.18-0.26 against 0.00-0.01 unfused; 22/8/6 layers on
+        P, 36 on D-TP0 = 1.73/0.63/0.47 and 2.83 GiB) for a decode gain of
+        0.15-0.6 %. That VRAM goes to experts: qkvz/ba keep the storages they
+        were built with, in their band, and nothing is allocated. Asked only
+        for a layer that WOULD fuse, so the census names the real reason for
+        every other one. Outside Weg-2 (no group) upstream is unchanged.
+
+        Returns a status word for the loader's census line
+        (``fused@<tag>``, ``fused@-`` = no band scope, ``already``,
+        ``skip:<why>``, ``skip:pdflip-flip``).
+        """
+        if not _is_cuda:
+            return "skip:not-cuda"
+        if self._fused_in_proj_weight is not None:
+            return "already"
+        if get_lora().enable_lora or get_lora().lora_paths:
+            # LoRA wraps the individual Linear modules; the fused GEMM would
+            # bypass their adapters.
+            return "skip:lora"
+        qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
+        if not (
+            isinstance(qkvz.quant_method, UnquantizedLinearMethod)
+            and isinstance(ba.quant_method, UnquantizedLinearMethod)
+        ):
+            return (
+                f"skip:qkvz={type(qkvz.quant_method).__name__}"
+                f"/ba={type(ba.quant_method).__name__}"
+            )
+        if not (
+            qkvz.weight.dtype == torch.bfloat16
+            and ba.weight.dtype == torch.bfloat16
+            and qkvz.bias is None
+            and ba.bias is None
+        ):
+            return "skip:dtype-or-bias"
+        from flliper.srt.managers import pdflip_memory_saver as _wms
+
+        if _wms.pdflip_group_name():
+            return "skip:pdflip-flip"
+        with _wms.weight_chunk_scope(getattr(self, "layer_id", None)) as band:
+            fused = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
+        self._fused_in_proj_qkvz_width = qkvz.weight.shape[0]
+        qkvz.weight.data = fused[: self._fused_in_proj_qkvz_width]
+        ba.weight.data = fused[self._fused_in_proj_qkvz_width :]
+        self._fused_in_proj_weight = fused
+        return f"fused@{band or '-'}"
+
+    @staticmethod
+    def fused_in_proj_census_line(statuses: Iterable[str]) -> str:
+        """H79: one line per rank over ``finalize_fused_in_proj``'s statuses.
+
+        ``unbanded`` = blocks fused OUTSIDE their layer's band (no Weg-2 chunk
+        scope); ``reason`` = the skip reasons with counts (``pdflip-flip`` is the
+        flip form declining a layer that would fuse); ``tags`` = the bands the
+        fused blocks were allocated in.
+        """
+        counts: dict = {}
+        for s in statuses:
+            s = str(s or "none")
+            counts[s] = counts.get(s, 0) + 1
+        fused = {k[len("fused@"):]: v for k, v in counts.items()
+                 if k.startswith("fused@")}
+        skipped = {k[len("skip:"):]: v for k, v in counts.items()
+                   if k.startswith("skip:")}
+
+        def _join(d):
+            return ",".join(f"{k}:{v}" for k, v in sorted(d.items())) or "-"
+
+        return (
+            f"#H79 GDN-FUSED-IN-PROJ gdn={sum(counts.values())} "
+            f"fused={sum(fused.values())} skipped={sum(skipped.values())} "
+            f"already={counts.get('already', 0)} unbanded={fused.get('-', 0)} "
+            f"reason={_join(skipped)} tags={_join(fused)}"
+        )
+
+    def _forward_input_proj(self, hidden_states: torch.Tensor):
+        if (
+            self._fused_in_proj_weight is not None
+            and hidden_states.dtype == torch.bfloat16
+            # Measured on cuBLAS above ~1k rows:
+            # the merged (m, 4120) GEMM is ~10% slower than the two separate GEMMs.
+            and hidden_states.shape[0] <= 1024
+        ):
+            fused_out = bf16_gemm_dispatch(
+                hidden_states, self._fused_in_proj_weight, None
+            )
+            return (
+                fused_out[:, : self._fused_in_proj_qkvz_width],
+                fused_out[:, self._fused_in_proj_qkvz_width :],
+            )
+
+        if (
+            _is_cpu
+            or _is_npu
+            or check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+        ):
+            DUAL_STREAM_TOKEN_THRESHOLD = 0
+        else:
+            DUAL_STREAM_TOKEN_THRESHOLD = 1024
+
+        seq_len, _ = hidden_states.shape
+        if (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
+            and _gdn_use_alt_stream
+        ):
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            with torch.cuda.stream(self.alt_stream):
+                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        return projected_states_qkvz, projected_states_ba
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """
+        Forward pass with three parts:
+        1. Input projection
+        2. Core attention (custom op)
+        3. Output projection
+        """
+        projected_states_qkvz, projected_states_ba = self._forward_input_proj(
+            hidden_states
+        )
+
+        # Upstream #36267: prefill (extend without speculative verify) reads
+        # the block-contiguous in_proj output through strided views -- no
+        # split/cat copy of q/k/v, no b/a copies and no z copy before the
+        # gated norm. Decode/verify keep the per-token split below. Any v/k
+        # head ratio (the 27B's is 3); the head counts are rank-local.
+        use_strided_prefill_z = (
+            _is_cuda
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+        if use_strided_prefill_z:
+            mixed_qkv, z, b, a = qwen3_5_gdn_prefill_projection_views(
+                projected_states_qkvz,
+                projected_states_ba,
+                self.local_num_k_heads,
+                self.local_num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+        elif (
+            self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
+            and not _is_cpu
+            and not _is_npu
+        ):
+            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+                projected_states_qkvz,
+                projected_states_ba,
+                self.local_num_k_heads,
+                self.local_num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+        elif _is_cpu and _is_amx_available:
+            mixed_qkv, z, b, a = (
+                torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    self.local_num_k_heads,
+                    self.local_num_v_heads,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
+            )
+        else:
+            query, key, value, z, b, a = self.fix_query_key_value_ordering(
+                projected_states_qkvz, projected_states_ba
+            )
+            b = b.contiguous()
+            a = a.contiguous()
+
+            query, key, value = map(
+                lambda x: x.reshape(x.shape[0], -1), (query, key, value)
+            )
+            mixed_qkv = torch.cat((query, key, value), dim=-1)
+
+        core_attn_out = self.attn(
+            forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+        )
+
+        z_shape_og = z.shape
+        # reshape input data into 2D tensor
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        if use_strided_prefill_z:
+            # the gated norm reads the strided [T, Hv, Dv] gate in place
+            z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
+        else:
+            z = z.reshape(-1, z.shape[-1])
+            z_flat_shape = z.shape
+
+        # Add padding for DP-Attn
+        if core_attn_out.shape != z_flat_shape:
+            core_attn_out_pad = z.new_zeros(z_flat_shape)
+            core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
+            core_attn_out = core_attn_out_pad
+
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+
+        output, _ = self.out_proj(core_attn_out)
+        return output
+
+
+class Qwen3_5LinearDecoderLayer(nn.Module):
+    """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+
+        linear_attn_quant_config = (
+            None
+            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            else quant_config
+        )
+        # FORM A (F3, construction half -- slice 6a): a worker rank holds
+        # experts and its router and nothing else. The GDN block is the
+        # single biggest dense post per layer after the mixer, and building
+        # it on a worker does two bad things at once: it allocates the
+        # tensors the loader veto already refused to fill, and its shard
+        # width is 0 there, which is what the F11 backstop fires on. Inert
+        # on a classic boot (no role plan installed -> skip_on_worker is
+        # None), so the default path constructs exactly as before.
+        from flliper.srt.form_a_construction import skip_on_worker
+
+        _la_ph = skip_on_worker("linear_attn", prefix)
+        self.linear_attn = _la_ph if _la_ph is not None else Qwen3_5GatedDeltaNet(
+            config, layer_id, linear_attn_quant_config, alt_stream, prefix
+        )
+
+        # NOTE: Determine the MLP type based on the model type
+        # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
+        if config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
+            self.mlp = Qwen2MoeSparseMoeBlock(
+                layer_id=layer_id,
+                config=config,
+                quant_config=quant_config,
+                alt_stream=(
+                    alt_stream
+                    if (_is_cuda or _disable_shared_experts_fusion())
+                    else None
+                ),
+                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                is_nextn=is_nextn,
+                support_shared_expert_fusion=(
+                    not _disable_shared_experts_fusion()
+                    and (quant_config is None or quant_config.get_name() != "gguf")
+                ),
+            )
+            is_layer_sparse = True
+            is_previous_layer_sparse = True
+            is_next_layer_sparse = True
+        elif config.model_type == "qwen3_5_text":
+            self.mlp = Qwen2MoeMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+            )
+            is_layer_sparse = False
+            is_previous_layer_sparse = False
+            is_next_layer_sparse = False
+        else:
+            raise ValueError(f"Invalid model type: {config.model_type}")
+
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
+        )
+
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        **kwargs,
+    ):
+        forward_batch = kwargs.get("forward_batch", None)
+
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=kwargs.get(
+                    "captured_last_layer_outputs", None
+                ),
+            )
+        )
+
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = self.linear_attn(
+                hidden_states,
+                forward_batch,
+            )
+
+        # Fully Connected
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        fuse_mlp_allreduce = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                )
+            else:
+                hidden_states = self.mlp(hidden_states)
+        if fuse_mlp_allreduce:
+            hidden_states._flliper_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+
+        return hidden_states, residual
+
+
+def select_rank_local_kv_head(
+    k: torch.Tensor, v: torch.Tensor, num_kv_heads: int, head_dim: int, head: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Keep only kv head ``head`` of flat ``[T, num_kv_heads*head_dim]`` k/v
+    (REPLICATED-KV rank-local attention, see attn_replicated_kv_local_head)."""
+    rows = k.shape[0]
+    k = k.reshape(rows, num_kv_heads, head_dim)[:, head].contiguous()
+    v = v.reshape(rows, num_kv_heads, head_dim)[:, head].contiguous()
+    return k, v
+
+
+class Qwen3_5AttentionDecoderLayer(nn.Module):
+    """Qwen3.5 Decoder Layer with Full Attention."""
+
+    #: AH, --p-attn-head-split (pdflip/attn_head_split.py): set on the owner's
+    #: delegated layers only; False = the stock attention call.
+    _ah_split = False
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.total_num_heads = config.num_attention_heads
+        self.total_num_kv_heads = config.num_key_value_heads
+        if tp_plan_active(self.attn_tp_size):
+            # Uneven TP (--rank-tp-ratio): heads follow the shard plan,
+            # matching the split in QKVParallelLinear. Normal mode: kv
+            # heads as indivisible units (whole GQA groups per rank).
+            # REPLICATED-KV mode (TP > num_kv_heads, task #62): ALL kv
+            # heads on every rank, q split in kv_total-sized units — the
+            # unit count is attn_q_partition_units(q, kv, tp).
+            self._kv_replicated = attn_kv_replicated(
+                self.attn_tp_size, self.total_num_kv_heads
+            )
+            _q_units = attn_q_partition_units(
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                self.attn_tp_size,
+            )
+            # kv-boundary alignment for the q split (task #116): THE single
+            # source shared by qkv_proj (q_shard_groups) and o_proj
+            # (tp_q_groups), so their per-rank q-head counts agree.
+            _q_groups = attn_q_partition_groups(
+                self.total_num_kv_heads, self.attn_tp_size
+            )
+            self.num_heads = tp_partition_size(
+                self.total_num_heads,
+                self.attn_tp_size,
+                self.attn_tp_rank,
+                _q_units,
+                groups=_q_groups,
+            )
+            if self._kv_replicated:
+                self.num_kv_heads = self.total_num_kv_heads
+                # No KV-cache duplication only under the uneven-DCP
+                # token-sharded pool (owner rule) — fail fast without it.
+                # The NEXTN draft is exempt by design: its single-layer
+                # full-context pool is intentionally replicated (non-DCP).
+                # fnFA2 (20.09.): under Form A the host owns EVERY head
+                # (base plan 1,0,0) -- the kv heads are not replicated
+                # across ranks but held once, so no token-sharded pool is
+                # needed; a worker never attends at all (skip_on_worker).
+                from flliper.srt.rank_role import form_a_dense_is_unsharded
+
+                if (
+                    not is_nextn
+                    and not form_a_dense_is_unsharded()
+                    and get_parallel().attn_dcp_size != self.attn_tp_size
+                ):
+                    raise ValueError(
+                        f"TP > num_kv_heads: layer {layer_id} has "
+                        f"{self.total_num_kv_heads} kv heads for "
+                        f"{self.attn_tp_size} ranks, which requires the "
+                        "REPLICATED-KV geometry with token-sharded KV "
+                        "(uneven DCP). Enable it with FLLIPER_UNEVEN_DCP=1 "
+                        "(and FLLIPER_UNEVEN_DCP_WEIGHTED=1 for the "
+                        "weighted owner rule) so dcp_size == tp_size."
+                    )
+                logger.info(
+                    "REPLICATED-KV geometry active for attention layer %d%s: "
+                    "kv_heads=%d < tp_size=%d; all kv heads on every rank, "
+                    "q heads split %s (units of %d).",
+                    layer_id,
+                    " (NEXTN draft)" if is_nextn else "",
+                    self.total_num_kv_heads,
+                    self.attn_tp_size,
+                    [
+                        tp_partition_size(
+                            self.total_num_heads,
+                            self.attn_tp_size,
+                            r,
+                            _q_units,
+                            groups=_q_groups,
+                        )
+                        for r in range(self.attn_tp_size)
+                    ],
+                    self.total_num_kv_heads,
+                )
+            else:
+                self.num_kv_heads = tp_partition_size(
+                    self.total_num_kv_heads,
+                    self.attn_tp_size,
+                    self.attn_tp_rank,
+                    self.total_num_kv_heads,
+                )
+            # The fallback head_dim must not depend on the per-rank head
+            # count under uneven TP.
+            self.head_dim = config.head_dim or (
+                self.hidden_size // self.total_num_heads
+            )
+        else:
+            self._kv_replicated = False
+            _q_units = self.total_num_kv_heads
+            _q_groups = None
+            assert self.total_num_heads % self.attn_tp_size == 0
+            self.num_heads = self.total_num_heads // self.attn_tp_size
+            if self.total_num_kv_heads >= self.attn_tp_size:
+                assert self.total_num_kv_heads % self.attn_tp_size == 0
+            else:
+                assert self.attn_tp_size % self.total_num_kv_heads == 0
+            self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
+            self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
+        self._attn_q_units = _q_units
+        self._attn_q_groups = _q_groups
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        # fn5m 19.09.: the NEXTN draft runs rank-local (replicated pool, no
+        # DCP head gather), so under REPLICATED-KV its attention sees ONLY
+        # the kv head its q heads belong to; the projection still computes
+        # all kv heads (qkv_proj / k_norm are unchanged), the slice happens
+        # in _prepare_qkv_gate and the pool holds one head (model_config
+        # get_num_kv_heads -> 1 for the draft).
+        self._rank_local_kv_head = (
+            attn_replicated_kv_local_head(
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                self.attn_tp_size,
+                self.attn_tp_rank,
+            )
+            if (self._kv_replicated and is_nextn)
+            else None
+        )
+        self.attn_num_kv_heads = (
+            1 if self._rank_local_kv_head is not None else self.num_kv_heads
+        )
+        self.scaling = self.head_dim**-0.5
+        self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+
+        self.rope_theta, rope_scaling = get_rope_config(config)
+        self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        self.layer_id = layer_id
+
+        # If rope_scaling doesn't specify a scaling type, treat as no scaling
+        if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
+            rope_scaling = None
+
+        self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        if self.attn_output_gate:
+            logger.warning_once("using attn output gate!")
+
+        self.rotary_emb = get_rope(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=self.max_position_embeddings,
+            rope_scaling=rope_scaling,
+            base=self.rope_theta,
+            partial_rotary_factor=self.partial_rotary_factor,
+            is_neox_style=True,
+            dtype=torch.get_default_dtype(),
+        )
+
+        attn_quant_config = (
+            None
+            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            else quant_config
+        )
+
+        # FORM A (F3, construction half -- slice 6a): qkv_proj / o_proj /
+        # attn are the attention host's alone. On a worker each of them
+        # would be built with shard width 0 (the F11 backstop), and `attn`
+        # additionally registers a layer with the KV pool a worker does not
+        # have (F4). All three are skipped together, because a half-built
+        # attention block is worse than none: it would pass construction
+        # and fail at the first forward with a shape.
+        from flliper.srt.form_a_construction import skip_on_worker
+
+        _qkv_ph = skip_on_worker("self_attn", add_prefix("qkv_proj", prefix))
+        self.qkv_proj = _qkv_ph if _qkv_ph is not None else QKVParallelLinear(
+            config.hidden_size,
+            self.head_dim,
+            self.total_num_heads * (1 + self.attn_output_gate),
+            self.total_num_kv_heads,
+            bias=False,
+            quant_config=attn_quant_config,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+            prefix=add_prefix("qkv_proj", prefix),
+            # REPLICATED-KV mode only: the q(+gate) block's unit COUNT.
+            # The fused q+gate slot count would halve the unit size, so
+            # the real q-head-based count is passed explicitly (ignored
+            # in normal mode).
+            q_shard_unit_count=self._attn_q_units,
+            # kv-boundary alignment (task #116): same source as o_proj below.
+            q_shard_groups=self._attn_q_groups,
+        )
+
+        _o_ph = skip_on_worker("o_proj", add_prefix("o_proj", prefix))
+        self.o_proj = _o_ph if _o_ph is not None else RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            config.hidden_size,
+            bias=False,
+            quant_config=attn_quant_config,
+            reduce_results=False,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+            prefix=add_prefix("o_proj", prefix),
+            # Uneven TP: the o_proj input dim is partitioned like the q
+            # heads in qkv_proj (kv-head units normally; kv_total-sized
+            # q-head units in REPLICATED-KV mode). Ignored on the default
+            # path (no shard plan installed).
+            tp_units=self._attn_q_units,
+            # kv-boundary alignment (task #116): SAME value as qkv q_shard_groups
+            # so the per-rank q-head split matches (mismatch mis-shards o_proj).
+            tp_q_groups=self._attn_q_groups,
+        )
+
+        _attn_ph = skip_on_worker("self_attn", f"{prefix}.attn")
+        self.attn = _attn_ph if _attn_ph is not None else RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.attn_num_kv_heads,
+            layer_id=layer_id,
+            prefix=f"{prefix}.attn",
+        )
+
+        # Dense MLP for non-MoE variant
+        if config.model_type == "qwen3_5_text":
+            self.mlp = Qwen2MoeMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+            )
+            is_layer_sparse = False
+            is_previous_layer_sparse = False
+            is_next_layer_sparse = False
+        elif config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
+            self.mlp = Qwen2MoeSparseMoeBlock(
+                layer_id=layer_id,
+                config=config,
+                quant_config=quant_config,
+                alt_stream=(
+                    alt_stream
+                    if (_is_cuda or _disable_shared_experts_fusion())
+                    else None
+                ),
+                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                is_nextn=is_nextn,
+                # GGUF: the shared expert is NOT fusable as an extra MoE
+                # expert — the GGUF adapter/loader feed it as dense
+                # shared_expert.* linears, and the expert-dim uneven
+                # sharding (fused_moe_triton) only covers routed experts.
+                support_shared_expert_fusion=(
+                    not _disable_shared_experts_fusion()
+                    and (quant_config is None or quant_config.get_name() != "gguf")
+                ),
+            )
+            is_layer_sparse = True
+            is_previous_layer_sparse = True
+            is_next_layer_sparse = True
+        else:
+            raise ValueError(f"Invalid model type: {config.model_type}")
+
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
+        )
+
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+        )
+
+        self.alt_stream = alt_stream
+
+    def _apply_qk_norm(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply Q/K normalization with optional alt_stream overlap."""
+        if (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and _qknorm_use_alt_stream
+        ):
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            q_by_head = q.reshape(-1, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            with torch.cuda.stream(self.alt_stream):
+                k_by_head = k.reshape(-1, self.head_dim)
+                k_by_head = self.k_norm(k_by_head)
+            current_stream.wait_stream(self.alt_stream)
+        elif _is_hip or _is_xpu or _is_cpu:
+            q_by_head, k_by_head = fused_qk_gemma_rmsnorm(
+                q,
+                k,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.q_norm.variance_epsilon,
+                self.head_dim,
+            )
+        else:
+            q_by_head = q.reshape(-1, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            k_by_head = k.reshape(-1, self.head_dim)
+            k_by_head = self.k_norm(k_by_head)
+        q = q_by_head.view(q.shape)
+        k = k_by_head.view(k.shape)
+        return q, k
+
+    def forward_prepare_cuda_fused(self, positions, hidden_states):
+        """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
+        qkv, _ = self.qkv_proj(hidden_states)
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+        else:
+            q_gate, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q_out, k_out, gate_out = fused_qk_gemma_rmsnorm_rope_gate(
+            q_gate,
+            k,
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            self.q_norm.variance_epsilon,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_emb.rotary_dim,
+            has_gate=self.attn_output_gate,
+            # Upstream #34446: [3, T] mrope positions (Qwen3_5ForConditional-
+            # Generation passes forward_batch.mrope_positions) need the axis
+            # map, or height/width are dropped for every image token. A 2-D
+            # positions tensor on a rope without the map fails the kernel's
+            # assertion instead of silently rotating by the temporal row.
+            mrope_axis_map=(
+                getattr(self.rotary_emb, "axis_map", None)
+                if positions.dim() == 2
+                else None
+            ),
+        )
+        seq_len = hidden_states.shape[0]
+        q = q_out.view(seq_len, -1)
+        k = k_out.view(seq_len, -1)
+        gate = gate_out.view(seq_len, -1) if gate_out is not None else None
+        return q, k, v, gate
+
+    def forward_prepare_native(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+            orig_shape = q_gate.shape[:-1]
+            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+            q, gate = torch.chunk(q_gate, 2, dim=-1)
+            q = q.reshape(*orig_shape, -1)
+            # gate stays as 3D strided view; fused_sigmoid_mul handles it directly
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            gate = None
+
+        q, k = self._apply_qk_norm(q, k)
+        q, k = self.rotary_emb(positions, q, k)
+        return q, k, v, gate
+
+    def forward_prepare_fused_gate(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+            seq_len = q_gate.shape[0]
+            q_flat, k_flat, gate_flat = fused_qk_gemma_rmsnorm_with_gate(
+                q_gate,
+                k,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.q_norm.variance_epsilon,
+                self.head_dim,
+                self.num_heads,
+            )
+            q = q_flat.view(seq_len, -1)
+            k = k_flat.view(seq_len, -1)
+            gate = gate_flat.view(seq_len, -1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            gate = None
+            q, k = self._apply_qk_norm(q, k)
+
+        q, k = self.rotary_emb(positions, q, k)
+        return q, k, v, gate
+
+    def forward_prepare_npu(self, positions, hidden_states, forward_batch):
+        qkv, _ = self.qkv_proj(hidden_states)
+        # Calculate first full attention layer ID based on config
+        if self.attn.layer_id == (self.config.full_attention_interval - 1):
+            self.rotary_emb.get_cos_sin_with_position(positions)
+
+        q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
+            qkv,
+            self.rotary_emb.position_sin,
+            self.rotary_emb.position_cos,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            int(self.head_dim * self.partial_rotary_factor),
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+        )
+        return q, k, v, gate
+
+    def _prepare_qkv_gate(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        q, k, v, gate = self._prepare_qkv_gate_all_kv(
+            positions, hidden_states, forward_batch
+        )
+        if self._rank_local_kv_head is not None:
+            k, v = select_rank_local_kv_head(
+                k, v, self.num_kv_heads, self.head_dim, self._rank_local_kv_head
+            )
+        return q, k, v, gate
+
+    def _prepare_qkv_gate_all_kv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        if _is_cuda and self.attn_output_gate:
+            return self.forward_prepare_cuda_fused(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        if (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
+            return self.forward_prepare_fused_gate(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        if (
+            not _is_npu
+            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or not self.attn_output_gate
+        ):
+            return self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        return self.forward_prepare_npu(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
+    def self_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Full attention forward pass."""
+        q, k, v, gate = self._prepare_qkv_gate(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
+        if self._ah_split and _ah_split_mod.owner_split_now(self.layer_id):
+            # AH: this chunk's attention of the delegated kv groups runs on the
+            # helper stage; own heads here, same [w, heads * D] output layout.
+            attn_output = _ah_split_mod.runtime().owner_attention(
+                self.attn, q, k, v, forward_batch
+            )
+        else:
+            attn_output = self.attn(q, k, v, forward_batch)
+
+        if self.attn_output_gate:
+            if not _is_npu:
+                attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+            else:
+                gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+                attn_output.mul_(torch.sigmoid(gate_val))
+
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
+        **kwargs,
+    ):
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
+        )
+
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = self.self_attention(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        # Fully Connected
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        fuse_mlp_allreduce = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                )
+            else:
+                hidden_states = self.mlp(hidden_states)
+        if fuse_mlp_allreduce:
+            hidden_states._flliper_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+
+        return hidden_states, residual
+
+
+ALL_DECODER_LAYER_TYPES = {
+    "attention": Qwen3_5AttentionDecoderLayer,
+    "linear_attention": Qwen3_5LinearDecoderLayer,
+}
+
+
+class Qwen3_5ForCausalLM(nn.Module):
+    """Qwen3.5 Model with support for dense variant."""
+
+    decoder_layer_types = ALL_DECODER_LAYER_TYPES
+
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    }
+
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "out_proj",
+        "in_proj_qkvz",
+        "gate_up_proj",
+        "down_proj",
+        "lm_head",
+    ]
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        config = self.config
+        head_dim = config.head_dim or (config.hidden_size // config.num_attention_heads)
+
+        if module_name == "qkv_proj":
+            attn_output_gate = getattr(config, "attn_output_gate", True)
+            q_heads = config.num_attention_heads * (2 if attn_output_gate else 1)
+            return (
+                config.hidden_size,
+                head_dim * (q_heads + config.num_key_value_heads * 2),
+            )
+        elif module_name == "o_proj":
+            return config.num_attention_heads * head_dim, config.hidden_size
+        elif module_name == "out_proj":
+            value_dim = config.linear_value_head_dim * config.linear_num_value_heads
+            return value_dim, config.hidden_size
+        elif module_name == "in_proj_qkvz":
+            key_dim = config.linear_key_head_dim * config.linear_num_key_heads
+            value_dim = config.linear_value_head_dim * config.linear_num_value_heads
+            return config.hidden_size, key_dim * 2 + value_dim * 2
+        elif module_name == "gate_up_proj":
+            # MoE: shared expert uses shared_expert_intermediate_size
+            # Dense: regular MLP uses intermediate_size
+            is_moe = config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES
+            if is_moe:
+                inter = config.shared_expert_intermediate_size
+            else:
+                inter = config.intermediate_size
+            return config.hidden_size, inter * 2
+        elif module_name == "down_proj":
+            is_moe = config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES
+            if is_moe:
+                inter = config.shared_expert_intermediate_size
+            else:
+                inter = config.intermediate_size
+            return inter, config.hidden_size
+        elif module_name == "gate_up_proj_moe":
+            return config.hidden_size, config.moe_intermediate_size * 2
+        elif module_name == "down_proj_moe":
+            return config.moe_intermediate_size, config.hidden_size
+        elif module_name == "embed_tokens":
+            return config.vocab_size, config.hidden_size
+        elif module_name == "lm_head":
+            return config.hidden_size, config.vocab_size
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
+
+    def _maybe_autodisable_shared_experts_fusion(self, config, quant_config):
+        # Auto-disable fusion when the checkpoint can't fuse (e.g. MXFP4 Qwen3.5)
+        # so the model still gets the #25885 multi-streaming path. ROCm-only.
+        if (
+            config.model_type == "qwen3_5_moe_text"
+            and not get_server_args().disable_shared_experts_fusion
+            and not can_fuse_shared_expert(config, quant_config)
+        ):
+            from flliper.srt.arg_groups.overrides import declare_load_time_override
+
+            declare_load_time_override(
+                "Qwen3_5ForCausalLM._maybe_autodisable_shared_experts_fusion",
+                {"disable_shared_experts_fusion": True},
+            )
+            logger.info(
+                "Qwen3.5: shared-expert fusion not supported for this checkpoint; "
+                "auto-disabling (multi-streaming #25885 still applies)."
+            )
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        is_nextn: bool = False,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.pp_group = get_pp_group()
+
+        if _is_hip:
+            self._maybe_autodisable_shared_experts_fusion(config, quant_config)
+
+        alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
+
+        # fnFL2 H1b: an MTP draft built under embed_from_target() gets NO
+        # embedding table of its own -- the worker shares the target's module
+        # in (mtp_vocab_share.py). Decided here, once, for every
+        # `_build_embed_tokens` override (Qwen4-Exp's included); the target
+        # itself (is_nextn=False) is never deferred.
+        self._defer_embed = bool(is_nextn) and not mtp_builds_own_embed(
+            embed_from_target_requested(),
+            getattr(config, "tie_word_embeddings", False),
+        )
+        if is_nextn:
+            import threading as _th
+
+            logger.info(
+                "H1b MTP-EMBED baut_eigenen=%s | from_target=%s "
+                "tie_word_embeddings=%s | thread=%s -- baut_eigenen=True heisst: "
+                "eine eigene [vocab,hidden] Eingabetabelle wird im Draft-Tag "
+                "ALLOZIERT, auch wenn sie danach vom Ziel ersetzt wird",
+                not self._defer_embed,
+                embed_from_target_requested(),
+                getattr(config, "tie_word_embeddings", False),
+                _th.current_thread().name,
+            )
+
+        # Embedding layer
+        self.embed_tokens = self._build_embed_tokens(config, quant_config, prefix)
+
+        # Decoder layers
+        def get_layer(idx: int, prefix: str):
+            layer_type = config.layers_block_type[idx]
+            layer_class = self.decoder_layer_types[layer_type]
+            if layer_type == "attention":
+                prefix = add_prefix("self_attn", prefix)
+            else:
+                prefix = add_prefix("linear_attn", prefix)
+            return layer_class(
+                config=config,
+                layer_id=idx,
+                quant_config=quant_config,
+                prefix=prefix,
+                alt_stream=alt_stream,
+                is_nextn=is_nextn,
+            )
+
+        self.layers, self._start_layer, self._end_layer = make_layers(
+            config.num_hidden_layers,
+            get_layer,
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix=f"{prefix}.layers",
+        )
+        # WP8 expert lookahead (FLLIPER_MOE_EXPERT_LOOKAHEAD, 0 = off): chain the
+        # MoE blocks so each can run a later block's router on its own stream.
+        from flliper.srt.environ import envs as _envs
+        from flliper.srt.models.qwen2_moe import link_moe_lookahead
+
+        n_links = link_moe_lookahead(self.layers)
+        if n_links:
+            logger.info(
+                "[moe-lookahead] distance %s: %d MoE blocks linked",
+                _envs.FLLIPER_MOE_EXPERT_LOOKAHEAD.get(),
+                n_links,
+            )
+        # FLLIPER_MOE_POOL_PREFETCH=1: chain each MoE block to the NEXT one so
+        # it can prefetch that block's predicted expert rows while its own
+        # experts compute (0 links when the switch is off).
+        from flliper.srt.models.qwen2_moe import link_moe_pool_prefetch
+
+        n_pf = link_moe_pool_prefetch(self.layers)
+        if n_pf:
+            logger.info(
+                "[moe-pool-prefetch] %d MoE blocks linked (distance 1)", n_pf
+            )
+
+        # #753: the mid-loop crossing wire. NoCrossingWire unless a layer set
+        # is configured AND FLLIPER_PP_CROSSING_WIRE is on, so the default path
+        # gets a null object whose hooks are identity -- byte-identical, and
+        # with no branch in the loop below that could drift from the wired one.
+        from flliper.srt.distributed.pp_crossing_wire import build_wire_for_model
+
+        self.pp_crossing_wire = build_wire_for_model(config, self.pp_group)
+        # --p-layer-split dynamic: the stage's split runtime when THIS stack is
+        # the armed target model on this stage (make_layers installed it) --
+        # also on a stage without a window: its executed range shrinks when
+        # the upstream boundary rises, and it sends pulls. None otherwise
+        # (static, a draft's one-layer stack, group D): every hook in
+        # forward() below is then skipped.
+        from flliper.srt.pdflip.p_layer_split_runtime import active as _pls_active
+
+        _rt = _pls_active()
+        self._p_layer_split = (
+            _rt
+            if _rt is not None
+            and int(config.num_hidden_layers) == _rt.geom.num_layers
+            and int(self.pp_group.rank_in_group) == _rt.stage
+            and int(self.pp_group.world_size) == _rt.stages
+            else None
+        )
+
+        # Final normalization
+        if self.pp_group.is_last_rank:
+            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
+
+        self.layers_to_capture = []
+
+    def _build_embed_tokens(
+        self,
+        config: Qwen3_5TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> nn.Module:
+        """Embedding sharding hook for models reusing this backbone. The
+        base backbone keeps its embedding dense (no quant_config), as it
+        always did for the Qwen3.5/3.6/3.8-27B checkpoints; a subclass whose
+        checkpoint packs the vocab (Qwen4-Exp / Minachist) passes them on."""
+        if not self.pp_group.is_first_rank:
+            return PPMissingLayer()
+        if self._defer_embed:
+            return MtpEmbedDeferred()
+        # GGUF only: build embed_tokens QUANTIZED-RESIDENT (packed
+        # `qweight` via GGUFEmbeddingMethod) instead of the dense bf16
+        # materialization -- saves ~1.1 GiB/rank on a 248k vocab. Every
+        # non-GGUF quantization keeps quant_config=None here, i.e. the
+        # default path is byte-identical. FLLIPER_GGUF_DENSE_VOCAB=1
+        # restores the legacy dense embed for GGUF too.
+        from flliper.srt.layers.quantization.compressed_tensors.ct_embedding import (
+            is_compressed_tensors_config,
+        )
+
+        embedding_quant_config = None
+        if quant_config is not None and quant_config.get_name() == "gguf":
+            from flliper.srt.model_loader.gguf_qwen35 import gguf_dense_vocab
+
+            if not gguf_dense_vocab():
+                embedding_quant_config = quant_config
+        elif is_compressed_tensors_config(quant_config):
+            # #727: only when the checkpoint ACTUALLY quantized the vocab.
+            # Every checkpoint we serve today lists embed_tokens in
+            # quantization_config.ignore, so this stays None and the dense
+            # BF16 path runs byte-identically. A requantized checkpoint
+            # (tools/requant_vocab_int8.py) drops that entry, and then the
+            # int8 rows are dequantized on gather instead of materialized.
+            #
+            # #763: the family test used to be a bare == "compressed-tensors"
+            # here, but the config names itself "compressed_tensors", so it
+            # never matched and a requantized checkpoint silently took the
+            # dense path -- int8 rows into a BF16 embedding, scales orphaned
+            # ("weight_scale not found in params_dict"), output = token soup.
+            from flliper.srt.layers.quantization.compressed_tensors.ct_embedding import (
+                vocab_is_quantized,
+            )
+
+            _model_path = None
+            try:
+                from flliper.srt.runtime_context import get_server_args
+
+                _model_path = getattr(get_server_args(), "model_path", None)
+            except Exception:  # noqa: BLE001 -- no runtime context: ignore-list reading
+                _model_path = None
+            # #1482: the tensor file decides (weight_scale beside the vocab);
+            # the ignore list is only the fallback -- see vocab_is_quantized.
+            if vocab_is_quantized(
+                getattr(quant_config, "config", None) or {},
+                add_prefix("embed_tokens", prefix),
+                _model_path,
+            ):
+                embedding_quant_config = quant_config
+        return VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            enable_tp=not is_dp_attention_enabled(),
+            quant_config=embedding_quant_config,
+            prefix=add_prefix("embed_tokens", prefix),
+        )
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+        if getattr(self, "_p_layer_split", None) is not None:
+            # swing modules may already be detached from self.layers
+            self._p_layer_split.mark_capture(layers_to_capture)
+
+    @property
+    def start_layer(self) -> int:
+        return self._start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self._end_layer
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_deepstack_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        # Initialize hidden states
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
+        elif pp_proxy_tensors is not None:
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+        elif self.pp_crossing_wire.provides_entry_activations:
+            # #753 GAPPED ENTRY. On a gapped cut this rank's first owned layer
+            # is itself a crossing target, so its entry activations arrive over
+            # the wire inside the loop rather than as a stage-boundary handoff
+            # before it. There is deliberately nothing to seed here: the very
+            # first ``before_layer`` REPLACES both values, and seeding a zero
+            # tensor instead would make a missing crossing look like a valid
+            # forward over zeros -- silently wrong output, which is the exact
+            # failure #753 exists to eliminate.
+            hidden_states = None
+            residual = None
+        else:
+            raise AssertionError(
+                "a non-first PP stage entered the forward loop with neither "
+                "pp_proxy_tensors nor a crossing wire that delivers its entry "
+                "activations. Under contiguous ownership the stage-boundary "
+                "handoff is the only source and it did not arrive; under a "
+                "gapped layer set the wire must own the entry, which means "
+                "this rank's first owned layer is not a crossing target and "
+                "the schedule disagrees with the ownership map."
+            )
+
+        aux_hidden_states = []
+        # DFlash-family capture across PP stages (pp_aux_capture): remember
+        # WHICH layer each captured tensor belongs to, so the last stage can
+        # assemble every stage's captures in layer-id order.
+        captured_layer_ids = []
+        # Pass through decoder layers
+        # --p-layer-split dynamic: THIS forward's executed layers (home
+        # extended by swing layers, or home minus the head an upstream stage
+        # ran), decided by PP0 and adopted from the row; None = static, the
+        # loop below is exactly the owned iteration.
+        _pls = self._p_layer_split
+        _layer_iter = owned_layer_ids(self.layers, self.start_layer, self.end_layer)
+        if _pls is not None:
+            _layer_iter = _pls.layer_ids(_layer_iter)
+        for layer_idx in _layer_iter:
+            layer = (
+                self.layers[layer_idx]
+                if _pls is None
+                else _pls.module(layer_idx, self.layers[layer_idx])
+            )
+            if _pls is not None:
+                _pls.before_layer(layer_idx)
+            # #753: receive whatever a peer computed since this rank's last
+            # layer. Identity on the contiguous path.
+            hidden_states, residual = self.pp_crossing_wire.before_layer(
+                layer_idx, hidden_states, residual
+            )
+            is_capture_layer = bool(getattr(layer, "_is_layer_to_capture", False))
+            with get_global_expert_distribution_recorder().with_current_layer(
+                layer_idx
+            ):
+                hidden_states, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    forward_batch=forward_batch,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states if is_capture_layer else None
+                    ),
+                )
+            if is_capture_layer and len(aux_hidden_states) > len(captured_layer_ids):
+                captured_layer_ids.append(layer_idx)
+
+            # Process deepstack embeddings if provided
+            if (
+                input_deepstack_embeds is not None
+                and input_deepstack_embeds.numel() > 0
+                and layer_idx < 3
+            ):
+                sep = self.hidden_size * layer_idx
+                hidden_states.add_(
+                    input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                )
+
+            # #753: hand the result to whoever owns the next layer. After the
+            # deepstack add, so the peer receives the same tensor this rank
+            # would have carried forward itself. Identity on the contiguous
+            # path.
+            self.pp_crossing_wire.after_layer(layer_idx, hidden_states, residual)
+            if _pls is not None:
+                _pls.after_layer(layer_idx)
+
+            if _LAYER_NORM_TRACE:
+                _trace_layer_norms(layer_idx, hidden_states, residual)
+
+        # DFlash-family capture under PP: every stage captured at its OWN
+        # layers above. The captures RIDE THE PIPELINE PROXY to the next
+        # stage (aux_layer_<id> entries beside hidden_states/residual); the
+        # last stage assembles received + own in layer-id order. weg2xsn261:
+        # a separate cross-stage send from inside this forward deadlocked
+        # the pipeline (see pp_aux_capture). One stage: identity.
+        aux_carry = {}
+        if self.layers_to_capture and int(self.pp_group.world_size) > 1:
+            from flliper.srt.distributed.pp_aux_capture import (
+                assemble_aux_on_last_stage,
+                carry_aux_forward,
+            )
+
+            if len(captured_layer_ids) != len(aux_hidden_states):
+                raise RuntimeError(
+                    "aux capture bookkeeping disagrees with the layer loop: "
+                    f"{len(captured_layer_ids)} capture layer(s) but "
+                    f"{len(aux_hidden_states)} tensor(s) on pp_rank "
+                    f"{self.pp_group.rank_in_group}"
+                )
+            _received = (pp_proxy_tensors.tensors
+                         if pp_proxy_tensors is not None else None)
+            _own = dict(zip(captured_layer_ids, aux_hidden_states))
+            _stage = int(self.pp_group.rank_in_group)
+            if not self.pp_group.is_last_rank:
+                aux_carry = carry_aux_forward(
+                    received=_received, captured=_own, stage=_stage)
+            else:
+                aux_hidden_states = assemble_aux_on_last_stage(
+                    received=_received, captured=_own, stage=_stage)
+
+        # Return intermediate tensors for pipeline parallelism
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    **aux_carry,
+                }
+            )
+
+        # Apply final normalization
+        if hidden_states.shape[0] != 0:
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+            # GDN
+            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvz.", "in_proj_z.", 3),
+            ("in_proj_ba.", "in_proj_b.", 0),
+            ("in_proj_ba.", "in_proj_a.", 1),
+        ]
+
+        loaded_params: Set[str] = set()
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if "mtp" in name:
+                continue
+            if "visual" in name:
+                continue
+            if "language_model" in name:
+                name = name.replace(r"model.language_model.", r"model.")
+            if ".self_attn." in name:
+                name = name.replace(".self_attn", "")
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self, "start_layer")
+                and (layer_id < self.start_layer or layer_id >= self.end_layer)
+                and layer_id not in _p_layer_split_swing(self)
+            ):
+                continue
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+
+                if "mlp.experts" in name:
+                    continue
+
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip layers on other devices.
+                # if is_pp_missing_parameter(name, self):
+                #     continue
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader")
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    logger.warning(f"Parameter {name} not found in params_dict")
+                    continue
+                param = params_dict[name]
+
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=None,
+        )
+
+
+class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+            # GDN
+            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvz.", "in_proj_z.", 3),
+            ("in_proj_ba.", "in_proj_b.", 0),
+            ("in_proj_ba.", "in_proj_a.", 1),
+        ]
+
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+
+        # Skip loading extra parameters for GPTQ/modelopt models.
+        ignore_suffixes = (
+            ".bias",
+            "_bias",
+            ".k_scale",
+            "_k_scale",
+            ".v_scale",
+            "_v_scale",
+            ".weight_scale",
+            "_weight_scale",
+            ".input_scale",
+            "_input_scale",
+        )
+
+        is_fused_expert = False
+        fused_expert_params_mapping = [
+            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
+            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
+        ]
+
+        num_experts = self.config.num_experts
+
+        def load_fused_expert_weights(
+            name: str,
+            params_dict: dict,
+            loaded_weight: torch.Tensor,
+            shard_id: str,
+            num_experts: int,
+        ):
+            if name not in params_dict:
+                return False
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
+            for expert_id in range(num_experts):
+                curr_expert_weight = loaded_weight[expert_id]
+                weight_loader(
+                    param,
+                    curr_expert_weight,
+                    name,
+                    shard_id,
+                    expert_id,
+                )
+            return True
+
+        loaded_params: Set[str] = set()
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if "mtp" in name:
+                continue
+            if "visual" in name:
+                continue
+            if "language_model" in name:
+                name = name.replace(r"model.language_model.", r"model.")
+            if ".self_attn." in name:
+                name = name.replace(".self_attn", "")
+
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self, "start_layer")
+                and (layer_id < self.start_layer or layer_id >= self.end_layer)
+                and layer_id not in _p_layer_split_swing(self)
+            ):
+                continue
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
+                    is_fused_expert = True
+                    expert_params_mapping = fused_expert_params_mapping
+
+                # Skip non-stacked layers and experts (experts handled below).
+                if weight_name not in name:
+                    continue
+
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if "mlp.experts" in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra parameters for GPTQ/modelopt models.
+                if name.endswith(ignore_suffixes) and name not in params_dict:
+                    continue
+
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Track if this is an expert weight to enable early skipping
+                is_expert_weight = False
+
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    # Anyway, this is an expert weight and should not be
+                    # attempted to load as other weights later
+                    is_expert_weight = True
+                    name_mapped = name.replace(weight_name, param_name)
+                    if is_fused_expert:
+                        if "experts.gate_up_proj" in name:
+                            loaded_weight = loaded_weight.chunk(2, dim=-2)
+                            load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight[0],
+                                "w1",
+                                num_experts,
+                            )
+                            load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight[1],
+                                "w3",
+                                num_experts,
+                            )
+                        else:
+                            load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight,
+                                shard_id,
+                                num_experts,
+                            )
+                    else:
+                        # Skip loading extra parameters for GPTQ/modelopt models.
+                        if (
+                            name_mapped.endswith(ignore_suffixes)
+                            and name_mapped not in params_dict
+                        ):
+                            continue
+                        param = params_dict[name_mapped]
+                        # We should ask the weight loader to return success or
+                        # not here since otherwise we may skip experts with
+                        # # other available replicas.
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                    name = name_mapped
+                    break
+                else:
+                    if is_expert_weight:
+                        # This is an expert weight but not mapped to this rank, skip all remaining processing
+                        continue
+
+                    # Skip loading extra parameters for GPTQ/modelopt models.
+                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                        continue
+
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                    else:
+                        logger.warning(f"Parameter {name} not found in params_dict")
+            loaded_params.add(name)
+
+        return loaded_params
+
+
+class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+    hf_to_flliper_mapper = None
+
+    supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
+
+    def __init__(
+        self,
+        config: Qwen3_5Config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        language_model_cls=Qwen3_5ForCausalLM,
+    ):
+        super().__init__(config, quant_config, prefix, language_model_cls)
+
+        rope_config = getattr(self.config, "rope_parameters", None) or getattr(
+            self.config, "rope_scaling", {}
+        )
+        self.is_mrope_enabled = "mrope_section" in rope_config
+
+        # #1356 slice 2: the tower may not exist (--no-enable-multimodal);
+        # the indexes come from the config the tower itself reads them from.
+        self.deepstack_visual_indexes = (
+            self.visual.deepstack_visual_indexes
+            if self.visual is not None
+            else config.vision_config.deepstack_visual_indexes
+        )
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return module_name.startswith("model.layers.")
+
+    @property
+    def start_layer(self) -> int:
+        return getattr(getattr(self, "model", None), "start_layer", 0)
+
+    @property
+    def end_layer(self) -> int:
+        model = getattr(self, "model", None)
+        end_layer = getattr(model, "end_layer", None)
+        if end_layer is not None:
+            return end_layer
+        cfg = getattr(model, "config", None)
+        return int(getattr(cfg, "num_hidden_layers", 0))
+
+    def get_embed_and_head(self):
+        embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
+        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        return embed, head
+
+    def set_embed_and_head(self, embed, head):
+        if self.pp_group.is_first_rank and embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if self.pp_group.is_last_rank and head is not None:
+            del self.lm_head.weight
+            self.lm_head.weight = head
+        if _is_xpu:
+            torch.xpu.empty_cache()
+            torch.xpu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+            # GDN fused projections
+            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvz.", "in_proj_z.", 3),
+            ("in_proj_ba.", "in_proj_b.", 0),
+            ("in_proj_ba.", "in_proj_a.", 1),
+        ]
+
+        loaded_params: Set[str] = set()
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if "mtp" in name:
+                continue
+            if skip_vision_weight(name, self.visual):
+                # #1356 slice 2: no tower built, the checkpoint's tower
+                # tensors have no parameter to land in.
+                continue
+            if "language_model" in name:
+                name = name.replace(r"model.language_model.", r"model.")
+            if ".self_attn." in name:
+                name = name.replace(".self_attn", "")
+            if (
+                self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+            ):
+                if "lm_head.weight" in params_dict:
+                    lm_head_param = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        lm_head_param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(lm_head_param, loaded_weight)
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self, "start_layer")
+                and (layer_id < self.start_layer or layer_id >= self.end_layer)
+                and layer_id not in _p_layer_split_swing(self)
+            ):
+                continue
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+
+                if "visual" in name or "mlp.experts" in name:
+                    continue
+
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip layers on other devices.
+                # if is_pp_missing_parameter(name, self):
+                #     continue
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader")
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                if "visual" in name:
+                    # adapt to VisionAttention
+                    name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+                    name = name.replace(r"model.visual.", r"visual.")
+
+                # print(name, loaded_weight.shape)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    logger.warning(f"Parameter {name} not found in params_dict")
+                    continue
+                param = params_dict[name]
+
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                if (
+                    self.config.tie_word_embeddings
+                    and name == "model.embed_tokens.weight"
+                    and (_is_cpu and _is_amx_available)
+                ):
+                    param_lm_head = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        param_lm_head, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param_lm_head, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
+
+class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    """Qwen3.5 MoE Vision-Language Model."""
+
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+    hf_to_flliper_mapper = None
+
+    supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
+
+    def __init__(
+        self,
+        config: Qwen3_5MoeConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        language_model_cls=Qwen3_5MoeForCausalLM,
+    ) -> None:
+        super().__init__(config, quant_config, prefix, language_model_cls)
+        rope_config = getattr(self.config, "rope_parameters", None) or getattr(
+            self.config, "rope_scaling", {}
+        )
+        self.is_mrope_enabled = "mrope_section" in rope_config
+
+        # #1356 slice 2: the tower may not exist (--no-enable-multimodal);
+        # the indexes come from the config the tower itself reads them from.
+        self.deepstack_visual_indexes = (
+            self.visual.deepstack_visual_indexes
+            if self.visual is not None
+            else config.vision_config.deepstack_visual_indexes
+        )
+        self.num_fused_shared_experts = 0
+        if _use_aiter and not _disable_shared_experts_fusion():
+            self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        # Accept all language model layer modules (attention, linear_attn, mlp).
+        return module_name.startswith("model.layers.")
+
+    def _get_num_fused_shared_experts(self):
+        if not (
+            hasattr(self.model, "layers")
+            and len(self.model.layers) > 0
+            and hasattr(self.model.layers[0].mlp, "num_fused_shared_experts")
+        ):
+            return 0
+        return self.model.layers[0].mlp.num_fused_shared_experts
+
+    def get_embed_and_head(self):
+        embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
+        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        return embed, head
+
+    def set_embed_and_head(self, embed, head):
+        if self.pp_group.is_first_rank and embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if self.pp_group.is_last_rank and head is not None:
+            del self.lm_head.weight
+            self.lm_head.weight = head
+        if _is_xpu:
+            torch.xpu.empty_cache()
+            torch.xpu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+            # GDN fused projections
+            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvz.", "in_proj_z.", 3),
+            ("in_proj_ba.", "in_proj_b.", 0),
+            ("in_proj_ba.", "in_proj_a.", 1),
+        ]
+
+        num_experts = self.config.num_experts
+
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=(
+                num_experts
+                if not self.enable_shared_expert_fusion
+                else num_experts + self.num_fused_shared_experts
+            ),
+        )
+
+        # Skip loading extra parameters for GPTQ/modelopt models.
+        ignore_suffixes = (
+            ".bias",
+            "_bias",
+            ".k_scale",
+            "_k_scale",
+            ".v_scale",
+            "_v_scale",
+            "_weight_scale",
+            "_input_scale",
+        )
+
+        is_fused_expert = False
+        fused_expert_params_mapping = [
+            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
+            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
+        ]
+
+        if self.enable_shared_expert_fusion:
+            """
+            When shared experts are fused, we need to map the shared experts to routed experts.
+
+            mlp.share_expert.gate_up_proj.weight  --> experts.512.gate_up_proj.weight -> experts.w13_weight, expert_id = 512
+            mlp.share_expert.down_proj.weight  --> experts.512.down_proj.weight -> experts.w2_weight, expert_id = 512
+            """
+            fused_expert_params_mapping += [
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_up_proj.",
+                    num_experts,
+                    "w1",
+                ),
+                (
+                    "experts.w2_",
+                    f"experts.{num_experts}.down_proj.",
+                    num_experts,
+                    "w2",
+                ),
+                ## shared experts may contain gate_proj and up_proj instead of gate_up_proj
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_proj.",
+                    num_experts,
+                    "w1",
+                ),
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.up_proj.",
+                    num_experts,
+                    "w3",
+                ),
+            ]
+
+        def load_fused_expert_weights(
+            name: str,
+            params_dict: dict,
+            loaded_weight: torch.Tensor,
+            shard_id: str,
+            num_experts: int,
+        ):
+            if name not in params_dict:
+                return False
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
+            for expert_id in range(num_experts):
+                curr_expert_weight = loaded_weight[expert_id]
+                weight_loader(
+                    param,
+                    curr_expert_weight,
+                    name,
+                    shard_id,
+                    expert_id,
+                )
+            return True
+
+        loaded_params: Set[str] = set()
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if "mtp" in name:
+                continue
+            if skip_vision_weight(name, self.visual):
+                continue  # #1356 slice 2, see the dense loader above
+            if "language_model" in name:
+                name = name.replace(r"model.language_model.", r"model.")
+            if ".self_attn." in name:
+                name = name.replace(".self_attn", "")
+            if (
+                self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+            ):
+                if "lm_head.weight" in params_dict:
+                    lm_head_param = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        lm_head_param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(lm_head_param, loaded_weight)
+
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self, "start_layer")
+                and (layer_id < self.start_layer or layer_id >= self.end_layer)
+                and layer_id not in _p_layer_split_swing(self)
+            ):
+                continue
+
+            if self.enable_shared_expert_fusion:
+                if "mlp.shared_expert." in name:
+                    # Firstly map mlp.shared_expert.xx_proj to mlp.experts.512.xx_proj
+                    name = name.replace(
+                        "mlp.shared_expert.",
+                        f"mlp.experts.{num_experts}.",
+                    )
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if name.endswith("experts.gate_up_proj") or name.endswith(
+                    "experts.down_proj"
+                ):
+                    is_fused_expert = True
+                    expert_params_mapping = fused_expert_params_mapping
+
+                # Skip non-stacked layers and experts (experts handled below).
+                if weight_name not in name:
+                    continue
+                if "visual" in name:
+                    continue
+
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if "mlp.experts" in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra parameters for GPTQ/modelopt models.
+                if name.endswith(ignore_suffixes) and name not in params_dict:
+                    continue
+
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Track if this is an expert weight to enable early skipping
+                is_expert_weight = False
+
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    if "visual" in name or self.config.encoder_only:
+                        continue
+                    # Anyway, this is an expert weight and should not be
+                    # attempted to load as other weights later
+                    is_expert_weight = True
+                    name_mapped = name.replace(weight_name, param_name)
+                    if is_fused_expert:
+                        # is_fused_expert is True, the checkpoint contains gate_up_proj and down_proj for each expert
+                        if "experts.gate_up_proj" in name:
+                            # experts.gate_up_proj contains all 512 routed experts, excluding shared experts
+                            # split into w1 and w3
+                            loaded_weight = loaded_weight.chunk(2, dim=-2)
+                            load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight[0],
+                                "w1",
+                                num_experts,
+                            )
+                            load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight[1],
+                                "w3",
+                                num_experts,
+                            )
+                        elif "experts.down_proj" in name:
+                            # experts.down_proj contains all 512 routed experts, excluding shared experts
+                            load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight,
+                                shard_id,
+                                num_experts,
+                            )
+                        elif self.enable_shared_expert_fusion:
+                            # shared experts should be loaded to experts.w13_weight and experts.w2_weight
+                            param = params_dict[name_mapped]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            param = params_dict[name_mapped]
+                            if f"{num_experts}.gate_up_proj" in name:
+                                # split into w1 and w3
+                                loaded_weight = loaded_weight.chunk(2, dim=-2)
+                                # load to experts.w13_weight, shard_id = w1, expert_id = 512
+                                weight_loader(
+                                    param,
+                                    loaded_weight[0],
+                                    name_mapped,
+                                    "w1",
+                                    expert_id,
+                                )
+                                # load to experts.w13_weight, shard_id = w3, expert_id = 512
+                                weight_loader(
+                                    param,
+                                    loaded_weight[1],
+                                    name_mapped,
+                                    "w3",
+                                    expert_id,
+                                )
+                            else:
+                                # load down_proj to experts.w2_weight, shard_id = w2, expert_id = 512
+                                # Or load gate_proj and up_proj to experts.w13_weight, shard_id = w1/w3, expert_id = 512
+                                weight_loader(
+                                    param,
+                                    loaded_weight,
+                                    name_mapped,
+                                    shard_id,
+                                    expert_id,
+                                )
+                    else:
+                        # Skip loading extra parameters for GPTQ models.
+                        if (
+                            name_mapped.endswith(ignore_suffixes)
+                            and name_mapped not in params_dict
+                        ):
+                            continue
+                        param = params_dict[name_mapped]
+                        # We should ask the weight loader to return success or
+                        # not here since otherwise we may skip experts with
+                        # # other available replicas.
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                    name = name_mapped
+                    break
+                else:
+                    if is_expert_weight:
+                        # This is an expert weight but not mapped to this rank, skip all remaining processing
+                        continue
+
+                    if "visual" in name:
+                        # adapt to VisionAttention
+                        name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+                        name = name.replace(r"model.visual.", r"visual.")
+
+                    # Skip loading extra parameters for GPTQ/modelopt models.
+                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                        continue
+
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                    else:
+                        logger.warning(f"Parameter {name} not found in params_dict")
+            loaded_params.add(name)
+
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+            }
+        )
+
+        return loaded_params
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        text_config = getattr(config, "text_config", config)
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.num_experts,
+            num_groups=None,
+        )
+
+
+def _qwen3_5_shared_experts_fusion_disable_reason(hf_config, quant_config):
+    """Why this Qwen3.5 checkpoint cannot fuse its shared expert, or None.
+
+    ROCm-only: an MXFP4 checkpoint cannot fuse, and the model still wants the
+    #25885 multi-streaming path. Asked by the loader before any layer is built,
+    so it resolves the text config itself -- the loader hands over whichever
+    config the entry class takes.
+    """
+    if not _is_hip:
+        return None
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if text_config.model_type not in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
+        return None
+    if can_fuse_shared_expert(text_config, quant_config):
+        return None
+    return (
+        "Qwen3.5: shared-expert fusion not supported for this checkpoint "
+        "(multi-streaming #25885 still applies)."
+    )
+
+
+# Every class the loader may instantiate for a Qwen3.5 checkpoint answers the
+# fusion question the same way.
+for _entry_class in (
+    Qwen3_5ForCausalLM,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForConditionalGeneration,
+):
+    _entry_class.shared_experts_fusion_disable_reason = staticmethod(
+        _qwen3_5_shared_experts_fusion_disable_reason
+    )
+
+
+EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

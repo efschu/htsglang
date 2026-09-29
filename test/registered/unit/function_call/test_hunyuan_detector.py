@@ -3,10 +3,10 @@
 import json
 import unittest
 
-from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.entrypoints.openai.protocol import Function, Tool
+from flliper.srt.function_call.hunyuan_detector import HunyuanDetector
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -611,13 +611,13 @@ class TestHunyuanDetectorFunctionCallParser(CustomTestCase):
         self.tools = _make_tools()
 
     def test_parser_registry(self):
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from flliper.srt.function_call.function_call_parser import FunctionCallParser
 
         parser = FunctionCallParser(self.tools, "hunyuan")
         self.assertIsInstance(parser.detector, HunyuanDetector)
 
     def test_parse_non_stream(self):
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from flliper.srt.function_call.function_call_parser import FunctionCallParser
 
         parser = FunctionCallParser(self.tools, "hunyuan")
         text = (
@@ -632,7 +632,7 @@ class TestHunyuanDetectorFunctionCallParser(CustomTestCase):
         self.assertEqual(json.loads(calls[0].parameters)["city"], "Tokyo")
 
     def test_parse_stream_chunks(self):
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from flliper.srt.function_call.function_call_parser import FunctionCallParser
 
         parser = FunctionCallParser(self.tools, "hunyuan")
         chunks = [
@@ -651,7 +651,7 @@ class TestHunyuanDetectorFunctionCallParser(CustomTestCase):
         self.assertEqual(json.loads(collected[0]["parameters"]), {})
 
     def test_has_tool_call_through_parser(self):
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from flliper.srt.function_call.function_call_parser import FunctionCallParser
 
         parser = FunctionCallParser(self.tools, "hunyuan")
         self.assertTrue(parser.has_tool_call("<tool_calls>foo</tool_calls>"))

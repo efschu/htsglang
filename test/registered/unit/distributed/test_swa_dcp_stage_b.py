@@ -30,20 +30,20 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     get_tp_partition_ratios,
     set_tp_partition_ratios,
 )
-from sglang.srt.layers.dcp.owner import (
+from flliper.srt.layers.dcp.owner import (
     dcp_compact_pool_rows,
     dcp_token_sharded_layer,
     dcp_weighted_owner_bounds,
     dcp_weighted_write_slots,
     swa_hybrid_dcp_lane,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.swa_memory_pool import SWAKVPool
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -108,7 +108,7 @@ class TestCompactPoolRows(CustomTestCase):
         """The rows come from (cp_S, cp_ratio) of dcp_weighted_owner_bounds, so
         a pool sized from one derivation and written through another cannot
         happen. Pinned by deriving both from the same installed vector."""
-        from sglang.srt.distributed.utils import set_cp_token_ratios
+        from flliper.srt.distributed.utils import set_cp_token_ratios
 
         saved = get_tp_partition_ratios()
         try:
@@ -185,7 +185,7 @@ class TestPerLayerDispatch(CustomTestCase):
         SAME question. A future edit that re-routes one of them (say, leaves the
         decode branch on a bare ``dcp_size > 1``) would give a layer whose KV was
         written unsharded a sharded read -- silently wrong output, no crash."""
-        import sglang.srt.layers.attention.triton_backend as tb
+        import flliper.srt.layers.attention.triton_backend as tb
 
         src = pathlib.Path(tb.__file__).read_text()
         self.assertEqual(
@@ -226,7 +226,7 @@ class TestPerLayerDispatch(CustomTestCase):
         mask the window layer's kernel is not indexed for -- cannot happen
         silently.
         """
-        import sglang.srt.layers.attention.triton_backend as tb
+        import flliper.srt.layers.attention.triton_backend as tb
 
         src = pathlib.Path(tb.__file__).read_text()
         for marker in (
@@ -270,7 +270,7 @@ class TestSwaWriteNeverCarriesAnOwnerMask(CustomTestCase):
         return pool
 
     def test_the_full_layer_forwards_the_mask(self):
-        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+        from flliper.srt.mem_cache.memory_pool import KVWriteLoc
 
         pool = self._pool()
         mask = torch.tensor([True, False])
@@ -290,7 +290,7 @@ class TestSwaWriteNeverCarriesAnOwnerMask(CustomTestCase):
     def test_without_a_mask_the_kwarg_is_not_even_passed(self):
         """Sub-pool classes without a dcp_kv_mask parameter (NPU / compress
         variants) must keep their exact signature off the lane."""
-        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+        from flliper.srt.mem_cache.memory_pool import KVWriteLoc
 
         pool = self._pool()
         SWAKVPool.set_kv_buffer(
@@ -303,7 +303,7 @@ class TestSwaWriteNeverCarriesAnOwnerMask(CustomTestCase):
         self.assertNotIn("dcp_kv_mask", pool.full_kv_pool.calls[0])
 
     def test_an_swa_layer_with_a_mask_is_an_assertion_not_a_write(self):
-        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+        from flliper.srt.mem_cache.memory_pool import KVWriteLoc
 
         pool = self._pool()
         with self.assertRaises(AssertionError) as ctx:
@@ -339,7 +339,7 @@ class TestGroupQHeadCountsMustPartition(CustomTestCase):
         set_tp_partition_ratios(self._saved)
 
     def _counts(self, rank, total_kv, swa_kv=None):
-        import sglang.srt.layers.attention.triton_backend as tb
+        import flliper.srt.layers.attention.triton_backend as tb
 
         cfg = SimpleNamespace(
             num_attention_heads=self.TOTAL_Q,
@@ -356,7 +356,7 @@ class TestGroupQHeadCountsMustPartition(CustomTestCase):
     def test_the_two_bases_of_a_hybrid_really_do_disagree(self):
         """The premise, verified against the partition helpers rather than
         assumed: 32 q heads over [5,3,2] split differently for kv=16 and kv=8."""
-        from sglang.srt.distributed.utils import (
+        from flliper.srt.distributed.utils import (
             attn_q_partition_groups,
             attn_q_partition_units,
             tp_partition_size,
@@ -403,7 +403,7 @@ class TestGroupQHeadCountsMustPartition(CustomTestCase):
     def test_a_non_exhaustive_partition_is_refused_loudly(self):
         """The assertion that would have caught the max() bug at the first
         forward instead of inside a collective."""
-        import sglang.srt.layers.attention.triton_backend as tb
+        import flliper.srt.layers.attention.triton_backend as tb
 
         cfg = SimpleNamespace(
             # 33 q heads cannot be split into kv-head units of 16
@@ -420,7 +420,7 @@ class TestGroupQHeadCountsMustPartition(CustomTestCase):
             tb.get_parallel = saved
 
     def test_no_plan_and_dcp_off_stay_pure_identities(self):
-        import sglang.srt.layers.attention.triton_backend as tb
+        import flliper.srt.layers.attention.triton_backend as tb
 
         cfg = SimpleNamespace(
             num_attention_heads=self.TOTAL_Q,
@@ -448,7 +448,7 @@ class TestPostCaptureCannotResizeTheShardedPool(CustomTestCase):
         GLOBAL context C, undoing the compact sizing. It is unreachable because
         post-capture sizing is only planned at dcp_size == 1 -- pinned here, so a
         future relaxation of that condition fails a test instead of a rank."""
-        import sglang.srt.server_args as sa_mod
+        import flliper.srt.server_args as sa_mod
 
         src = pathlib.Path(sa_mod.__file__).read_text()
         block = src.split("def post_capture_kv_sizing_planned")[1].split("def ")[0]

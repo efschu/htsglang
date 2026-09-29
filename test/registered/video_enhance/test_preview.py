@@ -15,10 +15,10 @@ decidable here and is measured on cards by
 import asyncio
 import unittest
 
-from sglang.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
-from sglang.srt.video_enhance.frame_math import PixelFormat, Resolution
-from sglang.srt.video_enhance.frames import Frame
-from sglang.srt.video_enhance.preview import (
+from flliper.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
+from flliper.srt.video_enhance.frame_math import PixelFormat, Resolution
+from flliper.srt.video_enhance.frames import Frame
+from flliper.srt.video_enhance.preview import (
     PreviewConfig,
     PreviewError,
     PreviewLanes,
@@ -27,8 +27,8 @@ from sglang.srt.video_enhance.preview import (
     build_preview_lanes,
     output_tap_stage,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -104,8 +104,8 @@ class StalledViewerCostsOnlyPreviewFramesTest(CustomTestCase):
     """
 
     def _run_chain(self, tap):
-        from sglang.srt.video_enhance.pipeline import PipelineExecutor
-        from sglang.srt.video_enhance.ring import OverloadPolicy
+        from flliper.srt.video_enhance.pipeline import PipelineExecutor
+        from flliper.srt.video_enhance.ring import OverloadPolicy
 
         # Resize-only: one enhancement so the chain is legal, arity 1
         # everywhere so the encoded count equals the source count and the
@@ -201,8 +201,8 @@ class StalledViewerCostsOnlyPreviewFramesTest(CustomTestCase):
         Every earlier test in this file drove ``PreviewTap`` directly and so
         could not see it. This one drives what the server actually builds.
         """
-        from sglang.srt.video_enhance.pipeline import PipelineExecutor
-        from sglang.srt.video_enhance.ring import OverloadPolicy
+        from flliper.srt.video_enhance.pipeline import PipelineExecutor
+        from flliper.srt.video_enhance.ring import OverloadPolicy
 
         request = ChainRequest(
             source=Resolution(128, 128),

@@ -36,8 +36,8 @@ Hermetic: no torch, no CUDA, no driver. The #93 mover is faked; the real
 
 import unittest
 
-from sglang.srt.memtier.registry import TierQuery, TierRegistry
-from sglang.srt.memtier.tiers import (
+from flliper.srt.memtier.registry import TierQuery, TierRegistry
+from flliper.srt.memtier.tiers import (
     PayloadClass,
     TierCapacity,
     TierCaps,
@@ -50,14 +50,14 @@ from sglang.srt.memtier.tiers import (
     filesystem_tier_id,
     host_tier_id,
 )
-from sglang.srt.model_executor.offload_register import (
+from flliper.srt.model_executor.offload_register import (
     OFFLOAD_CLASSES,
     ClassPolicy,
     OffloadRefused,
     OffloadRegister,
     resolve_class_policies,
 )
-from sglang.srt.model_executor.short_term_offload_register import (
+from flliper.srt.model_executor.short_term_offload_register import (
     ASSET_CLASSES,
     GROUND_CAPTURE_ACTIVE,
     GROUND_GRAPH_ADDRESSED,
@@ -80,8 +80,8 @@ from sglang.srt.model_executor.short_term_offload_register import (
     set_capture_probe,
     set_graph_reference_probe,
 )
-from sglang.srt.planner.cost_model import Provenance, Rate
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.planner.cost_model import Provenance, Rate
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -740,7 +740,7 @@ class MemTierIsNowWiredTest(unittest.TestCase):
         import ast
         import pathlib
 
-        import sglang.srt.model_executor.short_term_offload_register as module
+        import flliper.srt.model_executor.short_term_offload_register as module
 
         tree = ast.parse(pathlib.Path(module.__file__).read_text())
         imported = {
@@ -748,13 +748,13 @@ class MemTierIsNowWiredTest(unittest.TestCase):
             for node in ast.walk(tree)
             if isinstance(node, ast.ImportFrom) and node.module
         }
-        self.assertIn("sglang.srt.memtier.registry", imported)
-        self.assertIn("sglang.srt.memtier.tiers", imported)
+        self.assertIn("flliper.srt.memtier.registry", imported)
+        self.assertIn("flliper.srt.memtier.tiers", imported)
 
     def test_the_target_comes_from_the_registry_not_from_park_targets(self):
         """``offload_register.PARK_TARGETS`` is three hand-written strings.
         A priced target is a TierId, and it must not be one of them."""
-        from sglang.srt.model_executor.offload_register import PARK_TARGETS
+        from flliper.srt.model_executor.offload_register import PARK_TARGETS
 
         priced = price_park_target(
             _registry(), offload_class="graph_rungs", bytes_needed=GIB, origin=ORIGIN
@@ -787,7 +787,7 @@ class GraphFamilyRegisterTest(unittest.TestCase):
         """Three producers share the ``graph_rungs`` id space: the per-lane
         spec ladder, the KV pressure ladder, and this one. A collision would
         re-bind an item rather than raise."""
-        from sglang.srt.model_executor.kv_pressure_ladder import graph_rung_item_id
+        from flliper.srt.model_executor.kv_pressure_ladder import graph_rung_item_id
 
         self.assertNotEqual(graph_family_item_id("s0"), graph_rung_item_id("s0"))
         self.assertTrue(graph_family_item_id("s0").startswith("graph_family/"))
@@ -853,7 +853,7 @@ class GraphFamilyRegisterTest(unittest.TestCase):
         families = GraphFamilyRegister(mover=FakeGraphStateMover(), register=None)
         with self.assertRaises(RuntimeError) as ctx:
             families.register_family("layout_a", "tag_a", size_bytes=GIB)
-        self.assertIn("SGLANG_OFFLOAD_REGISTER", str(ctx.exception))
+        self.assertIn("FLLIPER_OFFLOAD_REGISTER", str(ctx.exception))
 
     def test_size_source_resolves_a_102_state_record(self):
         """``offload_sizes`` already understands ``footprint_bytes`` -- the
@@ -993,7 +993,7 @@ class AdaptiveMoverTest(unittest.TestCase):
         self.assertIn("adaptive-graph-memory", str(ctx.exception))
 
     def test_the_base_mover_reports_unknown_size_as_zero_not_free(self):
-        from sglang.srt.model_executor.short_term_offload_register import (
+        from flliper.srt.model_executor.short_term_offload_register import (
             GraphStateMover,
         )
 
@@ -1086,7 +1086,7 @@ class GdnStateClassificationTest(unittest.TestCase):
         import ast
         import pathlib
 
-        import sglang.srt.model_executor.offload_gdn_states as ladder
+        import flliper.srt.model_executor.offload_gdn_states as ladder
 
         self.assertTrue(describe_class("gdn_state_sets").va_stable_required)
         source = pathlib.Path(ladder.__file__).read_text()

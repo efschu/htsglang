@@ -9,7 +9,7 @@ THE SPECIMEN. boot_943bx_dc4895e1dc_0828_000240.log and ..._001113.log, pin
 dc4895e1dc, two boots, both dead at exactly 7 batches with no CUDA error
 involved:
 
-    File "sglang/srt/managers/scheduler.py", line 9286, in _get_new_batch_prefill_raw
+    File "flliper/srt/managers/scheduler.py", line 9286, in _get_new_batch_prefill_raw
       assert self.chunked_req is None
     AssertionError
 
@@ -65,7 +65,7 @@ serves nothing at all, which is a worse failure than the one it fixes.
 import types
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20)
 
@@ -129,8 +129,8 @@ def _holder(
     chunked_req=None,
 ):
     """A scheduler stand-in that runs the SHIPPED `get_next_batch_to_run`."""
-    from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         ps=types.SimpleNamespace(pp_rank=pp_rank, pp_size=pp_size),
@@ -170,7 +170,7 @@ def _holder(
         ),
     )
     h.process_pending_chunked_abort = lambda: None
-    h.process_pending_weg2_park = lambda: None  # Punkt 2 (18.09.): the park hook at the step head
+    h.process_pending_pdflip_park = lambda: None  # Punkt 2 (18.09.): the park hook at the step head
     h._abort_on_waiting_timeout = lambda: None
     h._abort_on_running_timeout = lambda rb: None
     h._update_uniform_pool_budget = lambda: None
@@ -207,7 +207,7 @@ def _patch_prefill_blocked(value=False):
     """`phase_prefill_blocked_here` is #631's strict-purity gate and sits
     between the void guard and the formation. It is not what this file is
     about, so it is pinned open -- pinning it SHUT would hide the defect."""
-    from sglang.srt.managers import scheduler as sched_mod
+    from flliper.srt.managers import scheduler as sched_mod
 
     saved = sched_mod.phase_prefill_blocked_here
     sched_mod.phase_prefill_blocked_here = lambda *a, **k: value
@@ -233,7 +233,7 @@ class PPUpstreamVoidBeforeFormation951(unittest.TestCase):
     """
 
     def test_a_pass_whose_upstream_did_not_launch_is_no_longer_refused(self):
-        from sglang.srt.managers import scheduler_pp_mixin as mixin_mod
+        from flliper.srt.managers import scheduler_pp_mixin as mixin_mod
 
         mod, saved = _patch_prefill_blocked(False)
         try:
@@ -248,7 +248,7 @@ class PPUpstreamVoidBeforeFormation951(unittest.TestCase):
         """The retirement is total: no shape of the flag re-arms a
         downstream refusal (a partial retirement would bring back the
         pp3solo stall on exactly that shape)."""
-        from sglang.srt.managers import scheduler_pp_mixin as mixin_mod
+        from flliper.srt.managers import scheduler_pp_mixin as mixin_mod
 
         for launched in (False, True):
             for gapped in (False, True):
@@ -337,8 +337,8 @@ class PPUpstreamVoidGuardMatchesTheVoid951(unittest.TestCase):
     def test_both_sites_read_the_same_predicate(self):
         import inspect
 
-        from sglang.srt.managers import scheduler as sched_mod
-        from sglang.srt.managers import scheduler_pp_mixin as mixin_mod
+        from flliper.srt.managers import scheduler as sched_mod
+        from flliper.srt.managers import scheduler_pp_mixin as mixin_mod
 
         name = "pp_upstream_void_pending"
         self.assertTrue(
@@ -400,7 +400,7 @@ class _VoidHolder:
     def bind(self):
         import types as _t
 
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         self._pp_void_pass_without_upstream_launch = _t.MethodType(
             SchedulerPPMixin._pp_void_pass_without_upstream_launch, self

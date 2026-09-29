@@ -30,13 +30,13 @@ Hermetic: no CUDA, no process group. The reduction is driven through a fake.
 import unittest
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers import communicator as comm  # noqa: E402
-from sglang.srt.layers.communicator import (  # noqa: E402
+from flliper.srt.layers import communicator as comm  # noqa: E402
+from flliper.srt.layers.communicator import (  # noqa: E402
     ar_fusion_arch_supported,
     decide_ar_fusion_arch,
     reset_ar_fusion_arch,

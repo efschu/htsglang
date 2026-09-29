@@ -39,7 +39,7 @@ Hermetic: pure arithmetic, no CUDA.
 
 import pytest
 
-from sglang.srt.planner.pp_cut import (
+from flliper.srt.planner.pp_cut import (
     PhasePoolModel,
     pp_phase_pool,
     stage_pp_capacities,

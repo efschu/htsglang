@@ -6,13 +6,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.test.test_utils import dump_metric
+from flliper.test.test_utils import dump_metric
 
 
 class TestDumpMetric(unittest.TestCase):
     """Test suite for dump_metric() function."""
 
-    _ENV_KEYS_TO_CLEAN = ["SGLANG_TEST_METRICS_OUTPUT", "PYTEST_CURRENT_TEST"]
+    _ENV_KEYS_TO_CLEAN = ["FLLIPER_TEST_METRICS_OUTPUT", "PYTEST_CURRENT_TEST"]
 
     def setUp(self):
         """Clean up env vars before each test."""
@@ -28,7 +28,7 @@ class TestDumpMetric(unittest.TestCase):
         """Test that dump_metric writes one valid JSON line when env is set."""
         with tempfile.TemporaryDirectory() as tmpdir:
             base_path = os.path.join(tmpdir, "metrics")
-            os.environ["SGLANG_TEST_METRICS_OUTPUT"] = base_path
+            os.environ["FLLIPER_TEST_METRICS_OUTPUT"] = base_path
 
             dump_metric("test_accuracy", 0.95, labels={"model": "llama"})
 
@@ -69,7 +69,7 @@ class TestDumpMetric(unittest.TestCase):
         """Test that non-serializable labels are stringified."""
         with tempfile.TemporaryDirectory() as tmpdir:
             base_path = os.path.join(tmpdir, "metrics")
-            os.environ["SGLANG_TEST_METRICS_OUTPUT"] = base_path
+            os.environ["FLLIPER_TEST_METRICS_OUTPUT"] = base_path
 
             # Non-serializable label
             class NonSerializable:
@@ -90,7 +90,7 @@ class TestDumpMetric(unittest.TestCase):
         """Test that bool values are converted to int."""
         with tempfile.TemporaryDirectory() as tmpdir:
             base_path = os.path.join(tmpdir, "metrics")
-            os.environ["SGLANG_TEST_METRICS_OUTPUT"] = base_path
+            os.environ["FLLIPER_TEST_METRICS_OUTPUT"] = base_path
 
             dump_metric("bool_true", True)
             dump_metric("bool_false", False)
@@ -111,7 +111,7 @@ class TestDumpMetric(unittest.TestCase):
         """Test PYTEST_CURRENT_TEST parsing for test_case."""
         with tempfile.TemporaryDirectory() as tmpdir:
             base_path = os.path.join(tmpdir, "metrics")
-            os.environ["SGLANG_TEST_METRICS_OUTPUT"] = base_path
+            os.environ["FLLIPER_TEST_METRICS_OUTPUT"] = base_path
             os.environ["PYTEST_CURRENT_TEST"] = (
                 "test/srt/test_example.py::TestClass::test_method (call)"
             )

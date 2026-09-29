@@ -4,10 +4,10 @@ import unittest
 import requests
 import torch
 
-from sglang.srt.server_args import set_global_server_args_for_scheduler
-from sglang.srt.utils import get_device, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.server_args import set_global_server_args_for_scheduler
+from flliper.srt.utils import get_device, kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -18,17 +18,17 @@ register_cuda_ci(est_time=100, stage="extra-a", runner_config="1-gpu-large")
 
 
 def check_quant_method(model_path: str, use_marlin_kernel: bool):
-    from sglang.srt.configs.device_config import DeviceConfig
-    from sglang.srt.configs.load_config import LoadConfig
-    from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed import (
+    from flliper.srt.configs.device_config import DeviceConfig
+    from flliper.srt.configs.load_config import LoadConfig
+    from flliper.srt.configs.model_config import ModelConfig
+    from flliper.srt.distributed import (
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-    from sglang.srt.layers.quantization.utils import get_dynamic_override
-    from sglang.srt.model_loader import get_model
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+    from flliper.srt.layers.quantization.utils import get_dynamic_override
+    from flliper.srt.model_loader import get_model
+    from flliper.srt.server_args import ServerArgs
 
     try:
         init_distributed_environment(
@@ -54,11 +54,11 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
         model_config=model_config, load_config=load_config, device_config=device_config
     )
 
-    from sglang.srt.layers.quantization.gptq import (
+    from flliper.srt.layers.quantization.gptq import (
         GPTQLinearMethod,
         GPTQMarlinLinearMethod,
     )
-    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+    from flliper.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
     linear_method_cls = (
         GPTQMarlinLinearMethod if use_marlin_kernel else (GPTQLinearMethod)

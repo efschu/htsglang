@@ -4,20 +4,20 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.base.conn import KVArgs, StateType
-from sglang.srt.disaggregation.common.utils import (
+from flliper.srt.disaggregation.base.conn import KVArgs, StateType
+from flliper.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
     pack_int_lists,
     pack_list_of_buffers,
     unpack_int_lists,
     unpack_list_of_buffers,
 )
-from sglang.srt.disaggregation.utils import (
+from flliper.srt.disaggregation.utils import (
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reusable determinism-diff harness for byte-identity gates (#128, seeds #124).
 
-Parameterized client-side tool against a RUNNING sglang server. Three modes:
+Parameterized client-side tool against a RUNNING flliper server. Three modes:
 
   capture   Run a fixed greedy prompt set once, record the full decode
             trajectory (token ids + per-token output logprobs, optionally
@@ -13,8 +13,8 @@ Parameterized client-side tool against a RUNNING sglang server. Three modes:
             and require all runs bitwise-identical (self-determinism N/N).
 
 Typical #128 gate (same build, kill-switch A/B, SAME execution mode):
-  SGLANG_DCP_COMM_OVERLAP=0 server -> capture baseline.json
-  SGLANG_DCP_COMM_OVERLAP=1 server -> capture overlap.json
+  FLLIPER_DCP_COMM_OVERLAP=0 server -> capture baseline.json
+  FLLIPER_DCP_COMM_OVERLAP=1 server -> capture overlap.json
   determinism_diff.py diff baseline.json overlap.json --tol 0.0
   determinism_diff.py selfdet --url ... --runs 5
 

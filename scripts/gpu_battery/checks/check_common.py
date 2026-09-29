@@ -158,12 +158,12 @@ FATAL_LOG_MARKERS = (
 # re-emitted:
 #   1. the emitter's own marker, prefixed to every quoted line
 #      (uneven_perf.QUOTED_SUBLOG_PREFIX -- keep the two literals in step);
-#   2. structurally: sglang stamps its own lines with "[YYYY-MM-DD HH:MM:SS]",
+#   2. structurally: flliper stamps its own lines with "[YYYY-MM-DD HH:MM:SS]",
 #      so a block that starts at a line announcing a handled subprocess failure
 #      and runs until the next stamped line is quoted material.
 QUOTED_SUBLOG_PREFIX = "[probe-subprocess] "
 
-#: Substrings that OPEN a quoted subprocess block in an sglang server log.
+#: Substrings that OPEN a quoted subprocess block in an flliper server log.
 QUOTED_SUBLOG_OPENERS = ("auto-performance: hardware probe failed",)
 
 _SERVER_LOG_STAMP = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^\]]*\]")

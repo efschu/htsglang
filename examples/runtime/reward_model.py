@@ -1,5 +1,5 @@
 # launch server
-# python -m sglang.launch_server --model LxzGordon/URM-LLaMa-3.1-8B --is-embedding
+# python -m flliper.launch_server --model LxzGordon/URM-LLaMa-3.1-8B --is-embedding
 
 import requests
 

@@ -9,9 +9,9 @@ corrupt a phase or silently keep both copies.
 import pytest
 import torch
 
-from sglang.srt.model_executor.weights_arena import plan_arena_layout
-from sglang.srt.weg2 import union_arena as ua
-from sglang.srt.weg2 import union_arena_bind as ub
+from flliper.srt.model_executor.weights_arena import plan_arena_layout
+from flliper.srt.pdflip import union_arena as ua
+from flliper.srt.pdflip import union_arena_bind as ub
 
 
 def _owner_manifest(named, phase=ua.PHASE_P, card="GPU-aaaabbbbcccc"):
@@ -75,9 +75,9 @@ def test_the_hook_is_off_unless_both_switches_are_set(monkeypatch):
     assert ub.maybe_union_image(object(), device=0) is None  # mode still off
     monkeypatch.setenv(ub.UNION_MODE_ENV, "bind")
     monkeypatch.setattr(
-        "sglang.srt.managers.weg2_memory_saver.weg2_group_name", lambda: ""
+        "flliper.srt.managers.pdflip_memory_saver.pdflip_group_name", lambda: ""
     )
-    assert ub.maybe_union_image(object(), device=0) is None  # not a weg2 rank
+    assert ub.maybe_union_image(object(), device=0) is None  # not a pdflip rank
 
 
 def test_an_unknown_mode_is_refused_not_ignored(monkeypatch):
@@ -92,7 +92,7 @@ def test_the_boot_hook_is_not_wrapped_in_a_swallowing_except():
     OOMs later; the census may be swallowed, this may not."""
     import inspect
 
-    from sglang.srt.model_executor import model_runner
+    from flliper.srt.model_executor import model_runner
 
     src = inspect.getsource(model_runner)
     call = src.index("maybe_union_image(")

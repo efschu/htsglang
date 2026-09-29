@@ -20,7 +20,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from flliper.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_mlx_ci(est_time=5, suite="stage-a-unit-test-mlx")
@@ -38,7 +38,7 @@ class TestApplyMetalProfilerPatches(unittest.TestCase):
         import torch
 
         self._original_profile = getattr(
-            torch.profiler.profile, "_sglang_original_profile", None
+            torch.profiler.profile, "_flliper_original_profile", None
         )
 
     def tearDown(self):
@@ -50,20 +50,20 @@ class TestApplyMetalProfilerPatches(unittest.TestCase):
     def test_patch_replaces_profile(self):
         import torch
 
-        from sglang.srt.hardware_backend.mlx.profiler import (
+        from flliper.srt.hardware_backend.mlx.profiler import (
             MetalTorchProfiler,
             apply_metal_profiler_patches,
         )
 
         apply_metal_profiler_patches()
-        self.assertTrue(getattr(torch.profiler.profile, "_sglang_metal_patched", False))
+        self.assertTrue(getattr(torch.profiler.profile, "_flliper_metal_patched", False))
         p = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
         self.assertIsInstance(p, MetalTorchProfiler)
 
     def test_patch_is_idempotent(self):
         import torch
 
-        from sglang.srt.hardware_backend.mlx.profiler import (
+        from flliper.srt.hardware_backend.mlx.profiler import (
             apply_metal_profiler_patches,
         )
 
@@ -75,7 +75,7 @@ class TestApplyMetalProfilerPatches(unittest.TestCase):
     def test_no_cuda_activity_uses_original(self):
         import torch
 
-        from sglang.srt.hardware_backend.mlx.profiler import (
+        from flliper.srt.hardware_backend.mlx.profiler import (
             MetalTorchProfiler,
             apply_metal_profiler_patches,
         )
@@ -92,7 +92,7 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
     def test_start_mlx_success(self):
         import mlx.core as mx
 
-        from sglang.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
+        from flliper.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
 
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "test.gputrace"
@@ -109,7 +109,7 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
     def test_start_mlx_runtime_error_returns_failure(self):
         import mlx.core as mx
 
-        from sglang.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
+        from flliper.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
 
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "test.gputrace"
@@ -127,7 +127,7 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
     def test_stop_calls_stop_capture(self):
         import mlx.core as mx
 
-        from sglang.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
+        from flliper.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
 
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "test.gputrace"
@@ -146,7 +146,7 @@ class TestMetalCaptureProfilerMPS(unittest.TestCase):
     def test_start_mps_success(self):
         import torch
 
-        from sglang.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
+        from flliper.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
 
         mock_ctx = MagicMock()
         mock_ctx.__enter__ = MagicMock(return_value=mock_ctx)
@@ -167,7 +167,7 @@ class TestMetalCaptureProfilerMPS(unittest.TestCase):
     def test_start_mps_runtime_error_returns_failure(self):
         import torch
 
-        from sglang.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
+        from flliper.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
 
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "test.gputrace"
@@ -188,7 +188,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
     """SchedulerProfilerManager._start_profile handles Metal capture failures."""
 
     def _make_manager(self, output_dir):
-        from sglang.srt.managers.scheduler_components.profiler_manager import (
+        from flliper.srt.managers.scheduler_components.profiler_manager import (
             SchedulerProfilerManager,
         )
 
@@ -206,7 +206,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
     def test_start_profile_failure_does_not_crash(self):
         import mlx.core as mx
 
-        from sglang.srt.hardware_backend.mlx.profiler import (
+        from flliper.srt.hardware_backend.mlx.profiler import (
             apply_metal_profiler_patches,
         )
 
@@ -230,7 +230,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
 
         import mlx.core as mx
 
-        from sglang.srt.hardware_backend.mlx.profiler import (
+        from flliper.srt.hardware_backend.mlx.profiler import (
             apply_metal_profiler_patches,
         )
 

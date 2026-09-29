@@ -2,16 +2,16 @@ import unittest
 
 import torch
 
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.moe.topk import (
+from flliper.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from flliper.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
-from sglang.srt.layers.moe.topk import biased_topk_impl as native_biased_topk
-from sglang.srt.layers.moe.topk import fused_topk_torch_native as native_fused_topk
-from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
-from sglang.srt.models.llama4 import Llama4MoE
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.moe.topk import biased_topk_impl as native_biased_topk
+from flliper.srt.layers.moe.topk import fused_topk_torch_native as native_fused_topk
+from flliper.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
+from flliper.srt.models.llama4 import Llama4MoE
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")

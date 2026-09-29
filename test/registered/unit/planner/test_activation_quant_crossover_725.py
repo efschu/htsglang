@@ -20,7 +20,7 @@ table's whole risk is that a borrowed number gets treated as a local law:
 
 import unittest
 
-from sglang.srt.planner import activation_quant_crossover as aqc
+from flliper.srt.planner import activation_quant_crossover as aqc
 
 
 class TestTheTableMatchesTheSource(unittest.TestCase):
@@ -129,7 +129,7 @@ class TestTheCorroborationThatMotivatesTheHarvest(unittest.TestCase):
     def test_our_own_aspect_gate_separates_the_same_family(self):
         """``N >= K`` is the shipped separator; it must still put the two
         agreed-losing shapes on the materialise side."""
-        from sglang.srt.layers.quantization.fp8_dequant_gemv import (  # noqa: F401
+        from flliper.srt.layers.quantization.fp8_dequant_gemv import (  # noqa: F401
             fused_gemv_applicable,
         )
 

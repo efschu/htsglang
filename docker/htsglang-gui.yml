@@ -1,5 +1,5 @@
 # htsglang GUI mode — the planner is the only process started; it launches
-# sglang itself, inside this same container.
+# flliper itself, inside this same container.
 #
 #   cp docker/htsglang.env.example .env
 #   docker compose -f docker/htsglang-gui.yml up
@@ -7,7 +7,7 @@
 #
 # How this differs from htsglang.yml: no MODEL_PATH, no TP flags, no
 # speculative flags. The planner UI collects all of that and builds the
-# `python3 -m sglang.launch_server` command line itself, spawns it in its own
+# `python3 -m flliper.launch_server` command line itself, spawns it in its own
 # process group, waits for /get_model_info, and can stop and restart it. The
 # generated command line is shown in the UI response, not written to a file.
 #
@@ -39,17 +39,17 @@ services:
     ports:
       # Planner web UI. 127.0.0.1 only — see the security note above.
       - "127.0.0.1:${PLANNER_PUBLISH_PORT:-8780}:8780"
-      # The sglang server the planner starts. It defaults to binding
+      # The flliper server the planner starts. It defaults to binding
       # 127.0.0.1 INSIDE the container, which is not reachable from here — set
       # the host field in the UI to 0.0.0.0 if you want to use this mapping.
       - "${BIND_HOST:-127.0.0.1}:${PUBLISH_PORT:-30000}:30000"
       # rigmon aggregator, if you start one manually inside the container
-      # (`docker exec ... python3 -m sglang.srt.rigmon serve --host 0.0.0.0
+      # (`docker exec ... python3 -m flliper.srt.rigmon serve --host 0.0.0.0
       # --port 8770 --token <token>`). It REFUSES a non-loopback bind without
       # a token.
       - "127.0.0.1:${RIGMON_PUBLISH_PORT:-8770}:8770"
     volumes:
-      # Model roots the UI scans. SGLANG_MODEL_ROOTS below must list exactly
+      # Model roots the UI scans. FLLIPER_MODEL_ROOTS below must list exactly
       # these container-side paths.
       # MISSING -> the model dropdown is empty and you can only type paths.
       - ${MODEL_DIR:?set MODEL_DIR in .env}:/models:ro
@@ -66,15 +66,15 @@ services:
       # gguf_headers/ (ranged GGUF header slices, up to 256 MiB each), and
       # rigmon/node_tokens.json.
       # MISSING -> saved profiles and calibration are lost on every restart.
-      - ${SGLANG_CACHE_DIR:-./state/sglang-cache}:/root/.cache/sglang
+      - ${FLLIPER_CACHE_DIR:-./state/flliper-cache}:/root/.cache/flliper
       - ${FLASHINFER_CACHE_DIR:-./state/flashinfer}:/root/.cache/flashinfer
       - ${TORCH_EXT_CACHE_DIR:-./state/torch-extensions}:/root/.cache/torch_extensions
       - ${TRITON_CACHE_DIR_HOST:-./state/triton}:/root/.triton
 
       # The planner's supervisor writes the launched server's stdout/stderr to
-      # /tmp/sglang_boot_<port>.log, and the graph-memory anchor scraper reads
+      # /tmp/flliper_boot_<port>.log, and the graph-memory anchor scraper reads
       # those logs back by glob. The path is hardcoded in GUI mode (the webui
-      # constructs SglangSupervisor() with no log_dir argument), so /tmp is the
+      # constructs FlliperSupervisor() with no log_dir argument), so /tmp is the
       # only place it can go.
       # MISSING -> the UI still tails the current boot, but log history is
       # lost on restart and graph-memory anchors cannot be re-derived.
@@ -89,17 +89,17 @@ services:
       - MODE=planner
       - PLANNER_HOST=0.0.0.0
       - PLANNER_PORT=8780
-      # Extra `python3 -m sglang.planner` arguments, e.g.
+      # Extra `python3 -m flliper.planner` arguments, e.g.
       #   --results-store /var/lib/htsglang/planner-results/measured_results.jsonl
       # which is the supported way to move the package-internal result store.
       - PLANNER_ARGS=${PLANNER_ARGS:---results-store /var/lib/htsglang/planner-results/measured_results.jsonl}
       # Where the UI looks for models. os.pathsep-separated.
-      - SGLANG_MODEL_ROOTS=${SGLANG_MODEL_ROOTS:-/models:/draft}
+      - FLLIPER_MODEL_ROOTS=${FLLIPER_MODEL_ROOTS:-/models:/draft}
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
-      # Read by the sglang server the planner spawns.
+      # Read by the flliper server the planner spawns.
       - HICACHE_STORAGE_DIR=/var/lib/htsglang/hicache
-      - SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/var/lib/htsglang/hicache
+      - FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR=/var/lib/htsglang/hicache
       # HF token for the UI's model-download button. Leave empty for public
       # repos only.
       - HF_TOKEN=${HF_TOKEN:-}

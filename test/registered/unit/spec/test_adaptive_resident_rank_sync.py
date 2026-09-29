@@ -1,6 +1,6 @@
 """20.09.: the per-round chain policy (adaptive_chain) activates a runtime
 state on every rank locally. In offload mode ensure_active runs the
-SGLANG_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC check after the swap; in resident
+FLLIPER_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC check after the swap; in resident
 mode it returned before the check, so a rank-divergent activation would
 have deadlocked in the next collective instead of failing loudly. The
 controller now calls note_resident_activation on every activation."""
@@ -8,8 +8,8 @@ controller now calls note_resident_activation on every activation."""
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.speculative.adaptive_graph_memory import AdaptiveGraphMemoryManager
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.speculative.adaptive_graph_memory import AdaptiveGraphMemoryManager
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="stage-a-cpu")
 
@@ -52,7 +52,7 @@ class TestResidentRankSync(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=False):
             import os
 
-            os.environ.pop("SGLANG_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC", None)
+            os.environ.pop("FLLIPER_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC", None)
             mgr.note_resident_activation(2)
         self.assertEqual(mgr.activation_count, 1)
 

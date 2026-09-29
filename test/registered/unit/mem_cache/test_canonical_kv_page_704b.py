@@ -31,7 +31,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from sglang.srt.mem_cache.canonical_kv_page import (
+from flliper.srt.mem_cache.canonical_kv_page import (
     CanonicalPageError,
     CanonicalPageSpec,
     PageCompleteness,

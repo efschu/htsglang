@@ -72,7 +72,7 @@ import unittest
 
 import torch
 
-from sglang.srt.managers import kv_backing_relief as kbr
+from flliper.srt.managers import kv_backing_relief as kbr
 
 MIB = 1024 * 1024
 
@@ -498,7 +498,7 @@ class ItRidesTheExistingReductionAndAddsNoneTest(unittest.TestCase):
         return fleet
 
     def test_one_reduction_carries_both_decisions_and_levels_the_group(self):
-        from sglang.srt.managers import phase_flip_spill as spill
+        from flliper.srt.managers import phase_flip_spill as spill
 
         fleet = self._fleet_and_channel()
         sent = []
@@ -591,7 +591,7 @@ class TheRecoveryMustLevelToTheGroupTest(unittest.TestCase):
         return [rich[0], poor, rich[1]]
 
     def _recover_all(self, fleet):
-        from sglang.srt.managers import phase_flip_spill as pfs
+        from flliper.srt.managers import phase_flip_spill as pfs
 
         for relief in fleet:
             sched = type("S", (), {})()
@@ -628,7 +628,7 @@ class TheRecoveryMustLevelToTheGroupTest(unittest.TestCase):
         ``test_residency_cap_flip_levelling_792.py`` for what the two-field
         payload agreed to on metal.
         """
-        from sglang.srt.managers import phase_flip_spill as pfs
+        from flliper.srt.managers import phase_flip_spill as pfs
 
         fleet = self._fleet()
         backed = self._recover_all(fleet)
@@ -678,7 +678,7 @@ class TheRecoveryMustLevelToTheGroupTest(unittest.TestCase):
         owed a recovery, which ``recover`` needs (it returns 0 immediately on
         a None). The level has to be able to rise again as soon as the
         poorest rank can fund it."""
-        from sglang.srt.managers import phase_flip_spill as pfs
+        from flliper.srt.managers import phase_flip_spill as pfs
 
         rich, pool, card = _rank(
             free_mib=1024 + 200_000, backed=500_000, rows=BOOT_ROWS_E

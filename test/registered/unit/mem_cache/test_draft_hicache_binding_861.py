@@ -34,8 +34,8 @@ tautology is visible.
 
 import pytest
 
-from sglang.srt.mem_cache import hicache_phase_binding as binding
-from sglang.srt.mem_cache.kv_cache_builder import (
+from flliper.srt.mem_cache import hicache_phase_binding as binding
+from flliper.srt.mem_cache.kv_cache_builder import (
     DRAFT_OWNER_PHASE_FLIP,
     drafter_identity_hash,
     resolve_draft_registration,
@@ -205,7 +205,7 @@ def test_the_boot_time_entry_point_registers_nothing_on_a_flip_boot():
     #631 nulls on purpose, and at boot the process is in the PP phase -- the
     phase that must NOT have an armed draft half.
     """
-    from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
+    from flliper.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
 
     sched = FakeScheduler(flip=True)
     maybe_register_hicache_draft(
@@ -222,7 +222,7 @@ def test_the_boot_time_entry_point_registers_nothing_on_a_flip_boot():
 def test_the_cutover_leg_registers_the_flip_stacks_drafter(monkeypatch):
     """THE FIX, end to end. RED on base: neither the function nor the route
     exists there, so a flip boot reaches the TP phase with has_draft False."""
-    from sglang.srt.mem_cache import kv_cache_builder as kcb
+    from flliper.srt.mem_cache import kv_cache_builder as kcb
 
     host = type("Host", (), {"size": 4096, "layer_num": 1})()
     monkeypatch.setattr(kcb, "_build_draft_host_pool", lambda **kw: host)
@@ -239,7 +239,7 @@ def test_the_cutover_leg_registers_the_flip_stacks_drafter(monkeypatch):
 
 
 def test_the_tp_to_pp_leg_disarms_rather_than_registering(monkeypatch):
-    from sglang.srt.mem_cache import kv_cache_builder as kcb
+    from flliper.srt.mem_cache import kv_cache_builder as kcb
 
     monkeypatch.setattr(
         kcb, "_build_draft_host_pool", lambda **kw: pytest.fail("must not allocate")
@@ -253,7 +253,7 @@ def test_the_tp_to_pp_leg_disarms_rather_than_registering(monkeypatch):
 def test_the_host_pool_is_allocated_once_and_restamped(monkeypatch):
     """A pinned host pool per flip would charge the host budget every time, and
     on this box that budget binds (DESIGN_706 C1)."""
-    from sglang.srt.mem_cache import kv_cache_builder as kcb
+    from flliper.srt.mem_cache import kv_cache_builder as kcb
 
     calls = []
     host = type("Host", (), {"size": 4096, "layer_num": 1})()
@@ -287,7 +287,7 @@ def test_a_smaller_draft_pool_is_refused_loudly(monkeypatch):
     hand out is addressable in the draft pool. LARGER is fine; only SMALLER is
     the #345 class.
     """
-    from sglang.srt.mem_cache import kv_cache_builder as kcb
+    from flliper.srt.mem_cache import kv_cache_builder as kcb
 
     host = type("Host", (), {"size": 4096, "layer_num": 1})()
     monkeypatch.setattr(kcb, "_build_draft_host_pool", lambda **kw: host)

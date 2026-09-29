@@ -6,7 +6,7 @@ is spent driving it. Nothing here boots or checks; it reads the tuple.
 
 import unittest
 
-from sglang.srt.boot_matrix.arms import (
+from flliper.srt.boot_matrix.arms import (
     ARMS,
     BASE_EXPECT,
     DFLASH_DRAFT_MODEL,
@@ -15,8 +15,8 @@ from sglang.srt.boot_matrix.arms import (
     Arm,
     arm_by_name,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -307,7 +307,7 @@ class TestSweep2ArmRepairs(CustomTestCase):
     def test_the_declared_lane_ratio_actually_nests(self):
         """Pins the derivation itself, so a model or geometry change that
         breaks 2,1,1 fails here instead of in the window."""
-        from sglang.srt.distributed.dual_group import (
+        from flliper.srt.distributed.dual_group import (
             derive_nested_plan,
             nesting_failures,
             transformer_nesting_probes,

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """``DeepseekV4ForCausalLM.load_weights`` must stay a generator on GGUF (#391).
 
-With ``SGLANG_OPT_FP8_WO_A_GEMM`` off -- which is the only reachable setting
+With ``FLLIPER_OPT_FP8_WO_A_GEMM`` off -- which is the only reachable setting
 for a GGUF checkpoint, since forcing it on raises ``NotImplementedError`` in
 ``DeepseekV4AttentionMHC`` -- ``load_weights`` used to open with::
 
@@ -34,11 +34,11 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.models import deepseek_v4
-from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.models import deepseek_v4
+from flliper.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -144,7 +144,7 @@ def _run_load(
         if not name.endswith(".wo_a.scale")
     }
     stub = _make_stub(quant_name, params)
-    with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
+    with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
         DeepseekV4ForCausalLM.load_weights(stub, probe.stream())
     return probe, calls
 
@@ -217,7 +217,7 @@ class TestGgufWoAScaleIsRefused(CustomTestCase):
             if not name.endswith(".wo_a.scale")
         }
         stub = _make_stub("gguf", params)
-        with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
+        with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
             with self.assertRaises(ValueError):
                 DeepseekV4ForCausalLM.load_weights(stub, probe.stream())
 

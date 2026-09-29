@@ -18,9 +18,9 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.planner import pp_cut_calibration as cal
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import pp_cut_calibration as cal
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -59,7 +59,7 @@ class TestCalibrationRefusals(CustomTestCase):
     def test_missing_directory_is_refused(self):
         with self.assertRaises(cal.PPCutCalibrationError) as cm:
             cal.load_census_calibration("/nonexistent/census/dir")
-        self.assertIn("SGLANG_RESIDENCY_CENSUS", str(cm.exception))
+        self.assertIn("FLLIPER_RESIDENCY_CENSUS", str(cm.exception))
 
     def test_empty_directory_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
@@ -125,7 +125,7 @@ class TestDefaultPathUnchanged(CustomTestCase):
     def test_unset_touches_nothing(self):
         # THE REGRESSION THAT MATTERS. With the flag unset the handler must
         # return before reading a config, touching NVML, or setting a ratio.
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         args = ServerArgs.__new__(ServerArgs)
         args.pp_solve_cut = None
@@ -138,7 +138,7 @@ class TestDefaultPathUnchanged(CustomTestCase):
         self.assertIsNone(args.pp_layer_ratio)
 
     def test_explicit_overrides_refuse_to_be_overruled(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         for field in ("pp_layer_ratio", "pp_stage_ratio"):
             args = ServerArgs.__new__(ServerArgs)
@@ -152,7 +152,7 @@ class TestDefaultPathUnchanged(CustomTestCase):
             self.assertIn(field.replace("_", "-"), str(cm.exception))
 
     def test_no_pipeline_is_refused(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         args = ServerArgs.__new__(ServerArgs)
         args.pp_solve_cut = "/tmp/whatever"
@@ -224,7 +224,7 @@ class TestTheTransientTravelsInTheCensus(CustomTestCase):
         # built RankResources without a transient, so the field took its 0.0
         # default and a demand measured at 1346-3148 MiB was priced as free
         # memory. The wired path admitted the cut metal breached.
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         args = ServerArgs.__new__(ServerArgs)
         args.pp_size = 3
@@ -232,11 +232,11 @@ class TestTheTransientTravelsInTheCensus(CustomTestCase):
         with self.assertRaises(ValueError) as cm:
             ServerArgs._pp_cut_transients(args, calibration, "/tmp/census")
         message = str(cm.exception)
-        self.assertIn("SGLANG_TRANSIENT_CENSUS=1", message)
+        self.assertIn("FLLIPER_TRANSIENT_CENSUS=1", message)
         self.assertIn("worst", message.lower())
 
     def test_the_wiring_accepts_a_complete_transient_census(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         d = self._dir()
         _transient(d, 0, {"EXTEND": 1989.0})

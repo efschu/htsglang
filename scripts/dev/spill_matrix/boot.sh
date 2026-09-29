@@ -31,13 +31,13 @@ LOG=/spinning/spill-matrix-${RECIPE}.boot.log
 
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$WT/python"
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 # Diagnostic-only and explicitly byte-identical when the adaptive regulator is
 # off (kv_session_offload.py:520-528). It is the ONLY per-tick observable of a
 # spilled session's host tail draining, so every kvso arm arms it.
-export SGLANG_KVSO_TICK_TRACE=${SGLANG_KVSO_TICK_TRACE:-1}
+export FLLIPER_KVSO_TICK_TRACE=${FLLIPER_KVSO_TICK_TRACE:-1}
 
 # --- common spine (shared by every recipe) --------------------------------
 # Matches production on: model, TP=3 + rank-gpu-id, auto-performance ratio,
@@ -114,7 +114,7 @@ case "$RECIPE" in
   K3)
     # Spill-graph path on top of the K2 recipe.
     export KVSO_ALLOW_SPEC=1
-    export SGLANG_KVSO_SPILL_GRAPH=1
+    export FLLIPER_KVSO_SPILL_GRAPH=1
     ARGS=("${COMMON[@]}" "${PRESSURE[@]}" "${KVSO[@]}"
           --speculative-algorithm NEXTN --speculative-num-steps 3
           --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
@@ -186,10 +186,10 @@ esac
 
 if [ "$DRY" = "1" ]; then
     printf 'recipe=%s port=%s log=%s\n' "$RECIPE" "$PORT" "$LOG"
-    printf '%s\n' "${VENV}/bin/python -m sglang.launch_server ${ARGS[*]}"
+    printf '%s\n' "${VENV}/bin/python -m flliper.launch_server ${ARGS[*]}"
     exit 0
 fi
 
 cd "$WT"
-setsid "$VENV/bin/python" -m sglang.launch_server "${ARGS[@]}" > "$LOG" 2>&1 &
+setsid "$VENV/bin/python" -m flliper.launch_server "${ARGS[@]}" > "$LOG" 2>&1 &
 echo "recipe=$RECIPE pgid=$! port=$PORT log=$LOG"

@@ -4,16 +4,16 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import get_device_sm
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+from flliper.srt.layers.attention.tbo_backend import TboAttnBackend
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.srt.utils import get_device_sm
+from flliper.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.attention_unittest.attention_methods.dense_attention import (
     DENSE_ATOL,
     DENSE_RTOL,
     DenseAttentionCase,
@@ -22,7 +22,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dense_attention impor
     replace_backend,
     run_dense_fixture_eager,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
+from flliper.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
     _prepare_spec_verify_batch,
 )
 
@@ -153,7 +153,7 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
-        from sglang.srt.batch_overlap.two_batch_overlap import (
+        from flliper.srt.batch_overlap.two_batch_overlap import (
             compute_split_indices_for_cuda_graph_replay,
         )
 

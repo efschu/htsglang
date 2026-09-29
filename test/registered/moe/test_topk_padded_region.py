@@ -2,8 +2,8 @@ import unittest
 
 import torch
 
-import sglang.srt.layers.moe.topk as topk_mod
-from sglang.srt.layers.moe.topk import (
+import flliper.srt.layers.moe.topk as topk_mod
+from flliper.srt.layers.moe.topk import (
     TopKConfig,
     _can_fuse_padded_region,
     _fill_padded_rows,
@@ -11,9 +11,9 @@ from sglang.srt.layers.moe.topk import (
     _post_process_topk_ids,
     _zero_topk_weights_padded_region,
 )
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils import is_hip
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=60, stage="stage-b", runner_config="1-gpu-small-amd")

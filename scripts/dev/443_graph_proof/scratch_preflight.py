@@ -34,7 +34,7 @@ sys.path.insert(
     ),
 )
 
-from sglang.srt.layers.moe.expert_offload import worst_case_unique_spill  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import worst_case_unique_spill  # noqa: E402
 
 
 def _csv_ints(text: str):
@@ -77,12 +77,12 @@ def main() -> int:
         worst = max(worst, need)
         print(f"{rank:>4}  {e:>7}  {r:>7}  {e - r:>4}  {need:>12}")
 
-    print(f"\nbinding requirement: SGLANG_MOE_SCRATCH_SLOTS >= {worst}")
+    print(f"\nbinding requirement: FLLIPER_MOE_SCRATCH_SLOTS >= {worst}")
     if args.scratch_slots < worst:
         print(
-            f"FAIL SGLANG_MOE_SCRATCH_SLOTS={args.scratch_slots} < {worst}. Either "
+            f"FAIL FLLIPER_MOE_SCRATCH_SLOTS={args.scratch_slots} < {worst}. Either "
             f"raise it (costs {worst - args.scratch_slots} more resident slots of "
-            f"VRAM per layer) or lower SGLANG_MOE_OFFLOAD_MAX_GRAPH_BS. Note the "
+            f"VRAM per layer) or lower FLLIPER_MOE_OFFLOAD_MAX_GRAPH_BS. Note the "
             f"corridor rule before raising it: the extra slots come out of the KV "
             f"pool, and free VRAM must stay >= 400 MiB per card.",
             file=sys.stderr,

@@ -15,14 +15,14 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.dspark_components.dspark_solo import (
+from flliper.srt.speculative.dspark_components.dspark_solo import (
     DsparkSoloRoundCodec,
     committed_prefix,
     refuse_solo_nongreedy_round,
     validate_verify_lens,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -268,7 +268,7 @@ class TestSoloLimits(CustomTestCase):
     def test_markov_w2_tp_shard_disabled_under_solo(self):
         # Default-ON optimization: solo switches it OFF (it would skip the very
         # all_gather the shadows sit in) rather than refusing the config.
-        from sglang.srt.speculative.dspark_components.dspark_solo import (
+        from flliper.srt.speculative.dspark_components.dspark_solo import (
             apply_solo_dspark_overrides,
         )
 
@@ -279,7 +279,7 @@ class TestSoloLimits(CustomTestCase):
         self.assertIsNone(model.markov_head._tp_shard)
 
     def test_override_is_a_noop_when_already_off(self):
-        from sglang.srt.speculative.dspark_components.dspark_solo import (
+        from flliper.srt.speculative.dspark_components.dspark_solo import (
             apply_solo_dspark_overrides,
         )
 

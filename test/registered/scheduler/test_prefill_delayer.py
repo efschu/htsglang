@@ -11,12 +11,12 @@ import openai
 import requests
 import torch
 
-from sglang.benchmark.serving import run_benchmark
-from sglang.srt.managers.prefill_delayer import PrefillDelayer
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.benchmark.serving import run_benchmark
+from flliper.srt.managers.prefill_delayer import PrefillDelayer
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -33,7 +33,7 @@ register_cuda_ci(
     disabled="Temporarily disabled",
 )
 
-WORLD_SIZE = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")
+WORLD_SIZE = os.environ.get("FLLIPER_TEST_WORLD_SIZE", "8")
 
 # ============================ Unit Tests ============================
 
@@ -533,7 +533,7 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
         # The kv cache size here is deliberately small, thus we use smaller token usage
         self._run(token_usage_low_watermark=0.5)
 
-    # TODO: re-enable once sglang/sglang#22511 (DP-attention detokenizer
+    # TODO: re-enable once flliper/flliper#22511 (DP-attention detokenizer
     # hang on H200 in CI) is fixed.
     @unittest.skip("blocked by sgl-project/sglang#22511")
     def test_2_without_low_watermark(self):
@@ -660,7 +660,7 @@ def _launch_server(
     max_delay_passes: int = 100,
     token_usage_low_watermark: float = None,
 ):
-    os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
+    os.environ["FLLIPER_PREFILL_DELAYER_DEBUG_LOG"] = "1"
 
     return popen_launch_server(
         model,
@@ -705,9 +705,9 @@ def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool) -> str:
     for line in prefill_delayer_metrics:
         print(line)
     if expect_metrics:
-        assert "sglang:prefill_delayer_wait_forward_passes" in metrics_text
-        assert "sglang:prefill_delayer_wait_seconds" in metrics_text
-        assert "sglang:prefill_delayer_outcomes_total" in metrics_text
+        assert "flliper:prefill_delayer_wait_forward_passes" in metrics_text
+        assert "flliper:prefill_delayer_wait_seconds" in metrics_text
+        assert "flliper:prefill_delayer_outcomes_total" in metrics_text
     return metrics_text
 
 

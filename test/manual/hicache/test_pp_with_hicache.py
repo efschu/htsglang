@@ -12,9 +12,9 @@ from urllib.parse import urlparse
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     find_available_port,
@@ -141,7 +141,7 @@ class TestPPWithHiCache(unittest.TestCase):
             "MOONCAKE_DEVICE": "",
             "MOONCAKE_TE_META_DATA_SERVER": f"http://127.0.0.1:{cls._mooncake_metadata_port}/metadata",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4294967296",
-            "SGLANG_ENABLE_DETERMINISTIC_INFERENCE": "1",
+            "FLLIPER_ENABLE_DETERMINISTIC_INFERENCE": "1",
         }
 
     @classmethod

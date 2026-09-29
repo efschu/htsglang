@@ -1,7 +1,7 @@
 """The round cap is DERIVED, not a hand constant -- and coverage is priced.
 
 Why this file exists (boot ``weg2zr2`` @ ``7e3a9150b4``, group D). Two
-individually safe changes crossed one policy constant. ``weg2/launcher.py``
+individually safe changes crossed one policy constant. ``pdflip/launcher.py``
 shrank the ``dcp:0`` BAR1 window from the flip launcher's 32 MiB to 24 MiB so
 two process groups fit one 3080 aperture, and ``--chunked-prefill-size`` is
 4096. At a 24-MiB window ``max_payload`` yields ``chunk_max = 2 093 056`` B --
@@ -34,10 +34,10 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.device_communicators.barlink import (
+from flliper.srt.distributed.device_communicators.barlink import (
     BarlinkCommunicator,
 )
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     DEFAULT_NEXT_RUNG_GBPS,
     DEFAULT_ROUND_US,
     DEFAULT_WIRE_GBPS,
@@ -49,8 +49,8 @@ from sglang.srt.distributed.device_communicators.barlink_bar1 import (
     round_budget,
     wire_bytes_for,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -78,7 +78,7 @@ AG_Q_FULL_SHARD = 23068672
 
 #: The calibration that SHIPS, read off the module rather than typed: the
 #: stub must grade what the boot runs. Measured 2026-09-07 by
-#: ``scripts/weg2/barlink_round_bench.py`` (artifact
+#: ``scripts/pdflip/barlink_round_bench.py`` (artifact
 #: ``roundbench_fixed_0907.json``, 323.2 us / 6.02 GB/s, residual max
 #: 0.052 ms over four rows including a 33-round decomposition).
 #: The tests pin the DECISION, not these numbers -- see ``round_budget``.
@@ -300,7 +300,7 @@ class TestPhysicalRefusalsUntouched(CustomTestCase):
         # it fire is to hand handles() a plan that disagrees with the slot --
         # which is exactly the seam the check exists to catch.
         with mock.patch(
-            "sglang.srt.distributed.device_communicators.barlink_bar1.ar_plan",
+            "flliper.srt.distributed.device_communicators.barlink_bar1.ar_plan",
             return_value=[(0, 1048576)],
         ):
             self.assertFalse(
@@ -338,22 +338,22 @@ class TestPinnedReproducesToday(CustomTestCase):
 
     def test_t5b_the_env_parses_to_auto_by_default_and_to_int_when_set(self):
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_BARLINK_BAR1_AR_MAX_ROUNDS", None)
+            os.environ.pop("FLLIPER_BARLINK_BAR1_AR_MAX_ROUNDS", None)
             self.assertEqual(
-                parse_round_cap("SGLANG_BARLINK_BAR1_AR_MAX_ROUNDS"),
+                parse_round_cap("FLLIPER_BARLINK_BAR1_AR_MAX_ROUNDS"),
                 ROUND_CAP_AUTO,
             )
         with mock.patch.dict(
-            os.environ, {"SGLANG_BARLINK_BAR1_AR_MAX_ROUNDS": "16"}
+            os.environ, {"FLLIPER_BARLINK_BAR1_AR_MAX_ROUNDS": "16"}
         ):
             self.assertEqual(
-                parse_round_cap("SGLANG_BARLINK_BAR1_AR_MAX_ROUNDS"), 16
+                parse_round_cap("FLLIPER_BARLINK_BAR1_AR_MAX_ROUNDS"), 16
             )
         with mock.patch.dict(
-            os.environ, {"SGLANG_BARLINK_BAR1_AR_MAX_ROUNDS": "auto"}
+            os.environ, {"FLLIPER_BARLINK_BAR1_AR_MAX_ROUNDS": "auto"}
         ):
             self.assertEqual(
-                parse_round_cap("SGLANG_BARLINK_BAR1_AR_MAX_ROUNDS"),
+                parse_round_cap("FLLIPER_BARLINK_BAR1_AR_MAX_ROUNDS"),
                 ROUND_CAP_AUTO,
             )
 
@@ -437,7 +437,7 @@ class TestSeamPolicy(CustomTestCase):
         t = _stub(ar_max_rounds=16)
         c = _comm(t, uncovered="warn")
         with self.assertLogs(
-            "sglang.srt.distributed.device_communicators.barlink", "WARNING"
+            "flliper.srt.distributed.device_communicators.barlink", "WARNING"
         ) as cm:
             self.assertIsNone(c._select("all_reduce", DCP_AR_BYTES))
         text = "\n".join(cm.output)
@@ -536,7 +536,7 @@ class TestLauncherAgreesWithTheTransport(CustomTestCase):
     """T11: C1's window and the transport's arithmetic are the same fact."""
 
     def test_t11_argv_d_carries_dcp_40_and_that_is_ten_rounds(self):
-        from sglang.srt.weg2.launcher import argv_d
+        from flliper.srt.pdflip.launcher import argv_d
 
         argv = argv_d("py", "/model", [1, 2, 3], 8, 1024, 8.0, [])
         self.assertIn("--barlink-bar1-window-mib", argv)
@@ -549,7 +549,7 @@ class TestLauncherAgreesWithTheTransport(CustomTestCase):
         )
 
     def test_t11b_group_d_opts_into_the_refusal(self):
-        from sglang.srt.weg2.launcher import argv_d
+        from flliper.srt.pdflip.launcher import argv_d
 
         argv = argv_d("py", "/model", [1, 2, 3], 8, 1024, 8.0, [])
         self.assertIn("--barlink-uncovered-class", argv)
@@ -558,7 +558,7 @@ class TestLauncherAgreesWithTheTransport(CustomTestCase):
         )
 
     def test_t11c_group_p_is_unchanged(self):
-        from sglang.srt.weg2.launcher import argv_p
+        from flliper.srt.pdflip.launcher import argv_p
 
         argv = argv_p("py", "/model", [1, 2, 3], 8, 1024, 8.0, [])
         window = argv[argv.index("--barlink-bar1-window-mib") + 1]
@@ -570,18 +570,18 @@ class TestNcclDevelopmentMode(CustomTestCase):
     the default."""
 
     def test_bar1_is_the_default_and_keeps_the_reserve_slack(self):
-        from sglang.srt.weg2 import launcher
+        from flliper.srt.pdflip import launcher
 
         self.assertEqual(launcher.DC_RESERVE_SLACK_MIB, 64)
         self.assertEqual(launcher.reserve_slack_mib("bar1"), 64)
 
     def test_nccl_raises_the_slack_with_its_measured_reason(self):
-        from sglang.srt.weg2 import launcher
+        from flliper.srt.pdflip import launcher
 
         self.assertEqual(launcher.reserve_slack_mib("nccl"), 192)
 
     def test_nccl_strips_the_barlink_flags(self):
-        from sglang.srt.weg2.launcher import argv_d, strip_barlink_flags
+        from flliper.srt.pdflip.launcher import argv_d, strip_barlink_flags
 
         argv = strip_barlink_flags(
             argv_d("py", "/model", [1, 2, 3], 8, 1024, 8.0, [])
@@ -600,7 +600,7 @@ class TestServerArgsFlag(CustomTestCase):
     """C5: the flag exists, defaults to warn, and reaches the seam by env."""
 
     def test_default_is_warn_not_refuse(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         self.assertIn("barlink_uncovered_class", ServerArgs.__dataclass_fields__)
         self.assertIsNone(
@@ -641,7 +641,7 @@ class TestRefusalScopeIsItsReason(CustomTestCase):
         t = _stub()
         c = _comm(t, uncovered="refuse")
         with self.assertLogs(
-            "sglang.srt.distributed.device_communicators.barlink", "WARNING"
+            "flliper.srt.distributed.device_communicators.barlink", "WARNING"
         ) as cm:
             self.assertIsNone(c._select("all_reduce", 16))
         self.assertIn("does NOT cover", "\n".join(cm.output))
@@ -650,7 +650,7 @@ class TestRefusalScopeIsItsReason(CustomTestCase):
         t = _stub()
         c = _comm(t, uncovered="refuse")
         with self.assertLogs(
-            "sglang.srt.distributed.device_communicators.barlink", "WARNING"
+            "flliper.srt.distributed.device_communicators.barlink", "WARNING"
         ):
             self.assertIsNone(c._select("all_reduce", 4104))
 
@@ -658,7 +658,7 @@ class TestRefusalScopeIsItsReason(CustomTestCase):
         t = _stub(min_bytes=16)
         c = _comm(t, uncovered="refuse")
         with self.assertLogs(
-            "sglang.srt.distributed.device_communicators.barlink", "WARNING"
+            "flliper.srt.distributed.device_communicators.barlink", "WARNING"
         ):
             self.assertIsNone(c._select("all_reduce", 32))
 
@@ -727,7 +727,7 @@ class TestRefusalScopeIsItsReason(CustomTestCase):
             ):
                 try:
                     with self.assertLogs(
-                        "sglang.srt.distributed.device_communicators.barlink",
+                        "flliper.srt.distributed.device_communicators.barlink",
                         "WARNING",
                     ):
                         c._select("all_reduce", DCP_AR_BYTES)
@@ -743,7 +743,7 @@ class TestRefusalScopeIsItsReason(CustomTestCase):
             BarlinkBar1Transport, "uncovered_refusal_kind", None
         ):
             with self.assertLogs(
-                "sglang.srt.distributed.device_communicators.barlink",
+                "flliper.srt.distributed.device_communicators.barlink",
                 "WARNING",
             ):
                 self.assertIsNone(c._select("all_reduce", DCP_AR_BYTES))
@@ -762,7 +762,7 @@ class TestCalibrationIsMeasured(CustomTestCase):
     """
 
     def _predict(self, rounds, wire_bytes):
-        from sglang.srt.distributed.device_communicators import barlink_bar1
+        from flliper.srt.distributed.device_communicators import barlink_bar1
         return (
             barlink_bar1.DEFAULT_ROUND_US / 1e3 * rounds
             + wire_bytes / (barlink_bar1.DEFAULT_WIRE_GBPS * 1e9) * 1e3
@@ -783,7 +783,7 @@ class TestCalibrationIsMeasured(CustomTestCase):
 
     def test_f7b_the_isolated_per_round_term_brackets_the_shipped_one(self):
         """Deliverable 1: dt/dR at a fixed byte count, no regression."""
-        from sglang.srt.distributed.device_communicators import barlink_bar1
+        from flliper.srt.distributed.device_communicators import barlink_bar1
 
         by_bytes = {}
         for wmib, nbytes, rounds, wire, measured in BENCH_ROWS:
@@ -801,7 +801,7 @@ class TestCalibrationIsMeasured(CustomTestCase):
         hand constant with extra words. The block must name the run."""
         import inspect
 
-        from sglang.srt.distributed.device_communicators import barlink_bar1
+        from flliper.srt.distributed.device_communicators import barlink_bar1
 
         src = inspect.getsource(barlink_bar1)
         start = src.index("ROUND_CAP_AUTO = ")

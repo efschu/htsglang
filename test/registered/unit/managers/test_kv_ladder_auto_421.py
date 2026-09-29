@@ -21,15 +21,15 @@ flip fires under real KV pressure on a real model. That lives in
 import unittest
 from unittest import mock
 
-from sglang.srt.managers.kv_ladder_auto import (
+from flliper.srt.managers.kv_ladder_auto import (
     auto_ladder_table_fn,
     build_auto_ladder_profile,
     wired_relief_features,
 )
-from sglang.srt.managers.kv_pressure_runtime import build_kv_pressure_runtime
-from sglang.srt.model_executor.kv_pressure_ladder import STEP_BASE
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.kv_pressure_runtime import build_kv_pressure_runtime
+from flliper.srt.model_executor.kv_pressure_ladder import STEP_BASE
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -103,10 +103,10 @@ def _patch_nvml(devices, uuids=None):
     """Patch the two identity sources the bridge is allowed to read."""
     by_uuid = {d.uuid: d for d in devices}
     return (
-        mock.patch("sglang.srt.registry.nvml.list_devices", lambda: list(devices)),
-        mock.patch("sglang.srt.registry.nvml.device_by_uuid", lambda u: by_uuid[u]),
+        mock.patch("flliper.srt.registry.nvml.list_devices", lambda: list(devices)),
+        mock.patch("flliper.srt.registry.nvml.device_by_uuid", lambda u: by_uuid[u]),
         mock.patch(
-            "sglang.srt.registry.rank_cards.rank_card_uuids",
+            "flliper.srt.registry.rank_cards.rank_card_uuids",
             lambda world_size=None: uuids,
         ),
     )
@@ -149,7 +149,7 @@ class TestAutoLadderReachesTheRuntime(CustomTestCase):
             raise AssertionError("the table source must not be evaluated")
 
         with mock.patch(
-            "sglang.srt.managers.kv_ladder_auto.auto_ladder_table_fn",
+            "flliper.srt.managers.kv_ladder_auto.auto_ladder_table_fn",
             lambda _sa: _boom,
         ):
             self.assertIsNone(build_kv_pressure_runtime(_Scheduler(sa)))
@@ -216,7 +216,7 @@ class TestAutoProfileIsRankUniformAndHonest(CustomTestCase):
                 build_auto_ladder_profile(sa)
         msg = str(ctx.exception)
         self.assertIn("--rank-gpu-id", msg)
-        self.assertIn("SGLANG_RANK_CARD_PROBE_CUDA", msg)
+        self.assertIn("FLLIPER_RANK_CARD_PROBE_CUDA", msg)
 
     def test_homogeneous_node_without_a_card_vector_is_allowed(self):
         """Indistinguishable cards make the mapping immaterial."""

@@ -14,17 +14,17 @@ arithmetic do not.
 
 import unittest
 
-from sglang.srt.planner.cost_model import (
+from flliper.srt.planner.cost_model import (
     AbsentRate,
     Provenance,
     StageRateTable,
     stage_rates_from_reports,
     stage_rates_from_samples,
 )
-from sglang.srt.video_enhance.frame_math import Resolution
-from sglang.srt.video_enhance.shard_plan import MissingRateError, RateTable, StageKind
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.video_enhance.frame_math import Resolution
+from flliper.srt.video_enhance.shard_plan import MissingRateError, RateTable, StageKind
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

@@ -6,20 +6,20 @@ import os
 
 import pytest
 
-from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
+from flliper.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     DiffusionServerBase,
     diffusion_server,
 )
-from sglang.multimodal_gen.test.server.test_server_utils import (
+from flliper.multimodal_gen.test.server.test_server_utils import (
     ServerContext,
     get_generate_fn,
 )
-from sglang.multimodal_gen.test.server.testcase_configs import (
+from flliper.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
 )
-from sglang.test.ci.ci_register import register_amd_ci
+from flliper.test.ci.ci_register import register_amd_ci
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ CLIP_SCORE_THRESHOLD = 0.20
 
 
 ARTIFACT_DIR = os.environ.get(
-    "SGLANG_DIFFUSION_ARTIFACT_DIR", "/tmp/diffusion-artifacts"
+    "FLLIPER_DIFFUSION_ARTIFACT_DIR", "/tmp/diffusion-artifacts"
 )
 
 

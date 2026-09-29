@@ -8,10 +8,10 @@ import torch
 # ==============================================================================
 # IMPORT PREBUILT KERNEL
 # ==============================================================================
-from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
-from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
-from sglang.srt.utils import set_random_seed
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.moe_lora_align import moe_lora_align_block_size
+from flliper.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
+from flliper.srt.utils import set_random_seed
+from flliper.test.ci.ci_register import register_cuda_ci
 
 # ==============================================================================
 

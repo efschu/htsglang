@@ -5,25 +5,25 @@ import pytest
 import torch
 import triton
 
-from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.utils import get_ci_test_range
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
-def sglang_jit_qknorm_across_heads(
+def flliper_jit_qknorm_across_heads(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
 ) -> None:
-    from sglang.jit_kernel.norm import fused_inplace_qknorm_across_heads
+    from flliper.jit_kernel.norm import fused_inplace_qknorm_across_heads
 
     fused_inplace_qknorm_across_heads(q, k, q_weight, k_weight)
 
 
-def sglang_aot_qknorm_across_heads(
+def flliper_aot_qknorm_across_heads(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
@@ -72,8 +72,8 @@ def test_qknorm_across_heads(batch_size: int, hidden_dim: int) -> None:
     q_k_jit = (q.clone(), k.clone())
     q_k_aot = (q.clone(), k.clone())
 
-    sglang_jit_qknorm_across_heads(q_k_jit[0], q_k_jit[1], q_weight, k_weight)
-    sglang_aot_qknorm_across_heads(q_k_aot[0], q_k_aot[1], q_weight, k_weight)
+    flliper_jit_qknorm_across_heads(q_k_jit[0], q_k_jit[1], q_weight, k_weight)
+    flliper_aot_qknorm_across_heads(q_k_aot[0], q_k_aot[1], q_weight, k_weight)
 
     triton.testing.assert_close(q_k_jit[0], q_k_aot[0], atol=1e-2, rtol=1e-2)
     triton.testing.assert_close(q_k_jit[1], q_k_aot[1], atol=1e-2, rtol=1e-2)

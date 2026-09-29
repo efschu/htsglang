@@ -21,7 +21,7 @@ auf ihrer Diagonalen nichts abzulegen.
 
 import pytest
 
-from sglang.srt.managers.scheduler_components.weight_updater import (
+from flliper.srt.managers.scheduler_components.weight_updater import (
     _diagonal_card_of,
 )
 

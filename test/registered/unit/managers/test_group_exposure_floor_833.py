@@ -66,13 +66,13 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.kv_backing_relief import (
+from flliper.srt.managers.kv_backing_relief import (
     GROUP_FLOOR_UNKNOWN,
     collective_slot_ballot,
     group_exposure_ceiling,
     slot_proposal,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8)
 
@@ -106,7 +106,7 @@ class _FakeVmmPool:
 
 
 def _relief(pool, *, alloc=None, free_mib: int = 8192, live_rows=()):
-    from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+    from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
     return KvBackingRelief(
         pool,
@@ -352,7 +352,7 @@ class TheClampHonoursTheGroupFloor(unittest.TestCase):
         relief = self._pp0(live_rows=(live,))
         relief.note_group_backing_floor(W3_BACKED["PP1"])
         with self.assertLogs(
-            "sglang.srt.managers.kv_backing_relief", level="WARNING"
+            "flliper.srt.managers.kv_backing_relief", level="WARNING"
         ) as caught:
             relief.clamp_exposure_to_backing("hermetic")
         self.assertFalse(
@@ -382,7 +382,7 @@ class TheBallotFeedsTheClamp(unittest.TestCase):
         import inspect
         import textwrap
 
-        from sglang.srt.managers import phase_flip_spill
+        from flliper.srt.managers import phase_flip_spill
 
         tree = ast.parse(textwrap.dedent(inspect.getsource(phase_flip_spill)))
         named = {
@@ -403,7 +403,7 @@ class TheBallotFeedsTheClamp(unittest.TestCase):
         """An inert path must say so -- the W9 '105 silent fallbacks' lesson."""
         import inspect
 
-        from sglang.srt.managers import phase_flip_spill
+        from flliper.srt.managers import phase_flip_spill
 
         src = inspect.getsource(phase_flip_spill.collective_kv_backing_relief)
         self.assertIn("cannot take the group backing floor", src)

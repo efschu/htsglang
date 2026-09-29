@@ -9,8 +9,8 @@ change. CPU-only.
 import pytest
 import torch
 
-import sglang.srt.layers.moe.expert_offload as eo
-from sglang.srt.layers.moe.router_nan_probe import (
+import flliper.srt.layers.moe.expert_offload as eo
+from flliper.srt.layers.moe.router_nan_probe import (
     ENV_RENORM_GUARD,
     RENORM_EPS,
     ROUTER_LEVELS,
@@ -139,7 +139,7 @@ def test_topk_module_actually_uses_the_guard():
 
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
-    import sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe as fmm
+    import flliper.srt.layers.moe.fused_moe_triton.fused_marlin_moe as fmm
 
     fmm._PROBE_LEVEL["n"] = None
     fmm._C_SENTINEL["on"] = None
@@ -152,7 +152,7 @@ def _reset(monkeypatch):
 
 
 def test_probe_is_silent_below_level_2(monkeypatch, caplog):
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "1")
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", "1")
     w = torch.full((4, 2), float("nan"))
     with caplog.at_level("ERROR"):
         eo._router_probe(None, w, w.reshape(-1, 1), 4, 2)
@@ -160,7 +160,7 @@ def test_probe_is_silent_below_level_2(monkeypatch, caplog):
 
 
 def test_probe_names_the_renorm_case(monkeypatch, caplog):
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "2")
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", "2")
     logits = torch.zeros(4, 8)
     w = torch.tensor([[0.5, 0.5], [float("nan")] * 2, [0.5, 0.5], [0.5, 0.5]])
     with caplog.at_level("ERROR"):
@@ -175,7 +175,7 @@ def test_probe_names_the_renorm_case(monkeypatch, caplog):
 def test_probe_names_the_gate_when_the_logits_are_already_gone(
     monkeypatch, caplog
 ):
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "2")
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", "2")
     logits = torch.zeros(3, 8)
     logits[1, 0] = float("inf")
     w = torch.tensor([[0.5, 0.5], [float("nan")] * 2, [0.5, 0.5]])
@@ -185,7 +185,7 @@ def test_probe_names_the_gate_when_the_logits_are_already_gone(
 
 
 def test_probe_is_silent_when_everything_is_finite(monkeypatch, caplog):
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "2")
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", "2")
     w = torch.full((4, 2), 0.5)
     with caplog.at_level("ERROR"):
         eo._router_probe(torch.zeros(4, 8), w, w.reshape(-1, 1), 4, 2)
@@ -193,7 +193,7 @@ def test_probe_is_silent_when_everything_is_finite(monkeypatch, caplog):
 
 
 def test_probe_respects_its_budget(monkeypatch, caplog):
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "2")
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", "2")
     w = torch.full((2, 2), float("nan"))
     with caplog.at_level("ERROR"):
         for _ in range(eo._ROUTER_PROBE_BUDGET + 5):
@@ -202,7 +202,7 @@ def test_probe_respects_its_budget(monkeypatch, caplog):
 
 
 def test_probe_survives_junk(monkeypatch, caplog):
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "2")
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", "2")
     with caplog.at_level("ERROR"):
         eo._router_probe(None, "not a tensor", None, 4, 2)
     assert "ROUTER-ORIGIN" not in caplog.text

@@ -9,7 +9,7 @@ production decode (20.09.: Runden/s 26,0 -> 24,4..27,1).
 
 Contract pinned here:
 
-* default (``SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES`` unset) = OFF: no
+* default (``FLLIPER_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES`` unset) = OFF: no
   node, no event created, nothing bound, ZERO SetEvent calls and zero event
   records per replay;
 * ON = today's behaviour, same swap count as test_decode_graph_event_sets_0920;
@@ -37,13 +37,13 @@ from test_decode_graph_event_sets_0920 import (  # noqa: E402
     State,
 )
 
-from sglang.srt.debug_utils.rank_phase_summary import parse_unsplit_line  # noqa: E402
-from sglang.srt.utils.collective_clock import CollectiveClock  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.debug_utils.rank_phase_summary import parse_unsplit_line  # noqa: E402
+from flliper.srt.utils.collective_clock import CollectiveClock  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="stage-a-cpu")
 
-ENV = "SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES"
+ENV = "FLLIPER_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES"
 
 
 class CountingBackend(Backend):
@@ -124,18 +124,18 @@ class ReaderSwitchTest(unittest.TestCase):
         self.assertEqual(h.clock.graph_node_counts[:2], (0, 0))
 
     def test_explicit_off_via_env(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES.override(False):
+        with envs.FLLIPER_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES.override(False):
             h = H(ring=2)
             h.cycle(replays=3)
         self.assertEqual(h.be.binder.set_calls, 0)
         self.assertEqual(h.clock._graph_reader_off_captures, 1)
 
     def test_on_is_todays_behaviour(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES.override(True):
+        with envs.FLLIPER_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES.override(True):
             h = H(ring=2)
             bound = h.cycle(replays=5)
         self.assertTrue(bound)
@@ -146,12 +146,12 @@ class ReaderSwitchTest(unittest.TestCase):
         self.assertEqual(h.clock.graph_node_counts[:2], (1, 4))
 
     def test_state_is_fixed_at_first_capture(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES.override(False):
+        with envs.FLLIPER_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES.override(False):
             h = H(ring=2)
             h.capture("a", ["all_reduce"])
-        with envs.SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES.override(True):
+        with envs.FLLIPER_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES.override(True):
             h.capture("b", ["all_reduce"])  # same process, same form
         self.assertIsNone(h.clock.captured_graph("b"))
 
@@ -187,7 +187,7 @@ class ReaderSwitchTest(unittest.TestCase):
         self.assertEqual(r.split_refused, "graph-replay-no-event-nodes")
 
     def test_one_boot_line_names_the_state_and_the_census(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         records = []
 
@@ -195,13 +195,13 @@ class ReaderSwitchTest(unittest.TestCase):
             def emit(self, record):
                 records.append((record.levelno, record.getMessage()))
 
-        lg = logging.getLogger("sglang.srt.utils.collective_clock")
+        lg = logging.getLogger("flliper.srt.utils.collective_clock")
         handler = Cap()
         lg.addHandler(handler)
         old = lg.level
         lg.setLevel(logging.INFO)
         try:
-            with _env_unset(), envs.SGLANG_WEG2_AR_ROUND_CENSUS.override(True):
+            with _env_unset(), envs.FLLIPER_PDFLIP_AR_ROUND_CENSUS.override(True):
                 h = H(ring=2)
                 h.capture("a", ["all_reduce"])
                 h.capture("b", ["all_reduce"])

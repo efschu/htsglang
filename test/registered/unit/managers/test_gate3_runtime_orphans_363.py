@@ -43,8 +43,8 @@ import sys
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -129,7 +129,7 @@ class TestBlockingSetCarriesNoRuntimeOrphan(CustomTestCase):
             "bogus",
             1.0,
             "decode_share",
-            runtime_site="sglang.srt.managers.regime_classifier:NO_SUCH_SYMBOL_363",
+            runtime_site="flliper.srt.managers.regime_classifier:NO_SUCH_SYMBOL_363",
         )
         self.assertTrue(bogus.blocking_eligible)
         mod_name, _, sym = bogus.runtime_site.partition(":")
@@ -140,7 +140,7 @@ class TestBlockingSetCarriesNoRuntimeOrphan(CustomTestCase):
             "drifted",
             0.123456,
             "occupancy",
-            runtime_site="sglang.srt.managers.regime_classifier:KV_ASCEND_MARK",
+            runtime_site="flliper.srt.managers.regime_classifier:KV_ASCEND_MARK",
         )
         mod_name, _, sym = drifted.runtime_site.partition(":")
         live = getattr(importlib.import_module(mod_name), sym)

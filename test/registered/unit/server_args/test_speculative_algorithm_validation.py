@@ -25,13 +25,13 @@ bare instance, so no server and no model config is involved.
 
 import unittest
 
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import (
+from flliper.srt.server_args import ServerArgs
+from flliper.srt.speculative.spec_info import (
     SPECULATIVE_ALGORITHM_ALIASES,
     SpeculativeAlgorithm,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -146,7 +146,7 @@ class TestOneSourceOfTruth(CustomTestCase):
     def test_known_names_reflects_a_plugin_registered_later(self):
         # Read live, not snapshotted: a plugin registering during import must
         # be visible to a validator that runs after it.
-        from sglang.srt.speculative import spec_registry
+        from flliper.srt.speculative import spec_registry
 
         before = set(SpeculativeAlgorithm.known_names())
         self.assertNotIn("ZZ_TEST_ALGO", before)
@@ -160,7 +160,7 @@ class TestOneSourceOfTruth(CustomTestCase):
         # planner/flags.py keeps a deliberately NARROWER UI pick-list. It is
         # not a validation list, but it must never offer something the server
         # would then reject.
-        from sglang.srt.planner.flags import _CURATED
+        from flliper.srt.planner.flags import _CURATED
 
         allowed = _CURATED["speculative_algorithm"]["allowed"]
         known = set(SpeculativeAlgorithm.known_names())

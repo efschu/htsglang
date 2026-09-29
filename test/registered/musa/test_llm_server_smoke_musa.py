@@ -4,8 +4,8 @@ import unittest
 import requests
 import torch
 
-from sglang.test.ci.ci_register import register_musa_ci
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
+from flliper.test.ci.ci_register import register_musa_ci
+from flliper.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_musa_ci(est_time=1200, suite="nightly-musa-1-gpu", nightly=True)
 
@@ -20,7 +20,7 @@ _REQUEST_TIMEOUT = 60
 class TestMusaDeepSeekV2LiteChatServerSmoke(DefaultServerBase):
     """MUSA LLM server sanity check: launch, health check, and non-empty generation."""
 
-    model = os.getenv("SGLANG_MUSA_LLM_MODEL", "deepseek-ai/DeepSeek-V2-Lite-Chat")
+    model = os.getenv("FLLIPER_MUSA_LLM_MODEL", "deepseek-ai/DeepSeek-V2-Lite-Chat")
     served_model_name = "deepseek-v2-lite-chat"
     other_args = [
         "--trust-remote-code",

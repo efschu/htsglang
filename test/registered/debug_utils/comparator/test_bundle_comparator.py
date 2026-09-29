@@ -5,15 +5,15 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.bundle_comparator import (
+from flliper.srt.debug_utils.comparator.bundle_comparator import (
     _build_skip_from_one_empty_side,
     _load_all_values,
 )
-from sglang.srt.debug_utils.comparator.log_sink import LogSink
-from sglang.srt.debug_utils.comparator.output_types import ErrorLog
-from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.srt.debug_utils.dump_loader import ValueWithMeta
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.log_sink import LogSink
+from flliper.srt.debug_utils.comparator.output_types import ErrorLog
+from flliper.srt.debug_utils.comparator.utils import Pair
+from flliper.srt.debug_utils.dump_loader import ValueWithMeta
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
 
@@ -40,7 +40,7 @@ class TestLoadAllValues:
         sink = LogSink()
         with sink.context() as warnings:
             with patch(
-                "sglang.srt.debug_utils.comparator.bundle_comparator.log_sink",
+                "flliper.srt.debug_utils.comparator.bundle_comparator.log_sink",
                 sink,
             ):
                 result = _load_all_values(filenames=[fn0, fn1], base_path=tmp_path)
@@ -58,7 +58,7 @@ class TestLoadAllValues:
         sink = LogSink()
         with sink.context() as warnings:
             with patch(
-                "sglang.srt.debug_utils.comparator.bundle_comparator.log_sink",
+                "flliper.srt.debug_utils.comparator.bundle_comparator.log_sink",
                 sink,
             ):
                 result = _load_all_values(
@@ -81,7 +81,7 @@ class TestLoadAllValues:
         sink = LogSink()
         with sink.context() as warnings:
             with patch(
-                "sglang.srt.debug_utils.comparator.bundle_comparator.log_sink",
+                "flliper.srt.debug_utils.comparator.bundle_comparator.log_sink",
                 sink,
             ):
                 result = _load_all_values(filenames=[fn0, fn1], base_path=tmp_path)
@@ -97,7 +97,7 @@ def _tensor_item(value: torch.Tensor, rank: int = 0) -> ValueWithMeta:
         meta={
             "rank": rank,
             "dims": "b s",
-            "sglang_parallel_info": {},
+            "flliper_parallel_info": {},
             "megatron_parallel_info": {},
             "filename": f"rank_{rank}.pt",
         },

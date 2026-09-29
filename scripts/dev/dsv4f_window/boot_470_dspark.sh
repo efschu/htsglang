@@ -95,10 +95,10 @@ rammon_start "$ARM"
 
 export_base_env "$ARM"
 
-# SGLANG_DSV4_FP4_DEQUANT must be unset/0. At 1 it asserts against a non-auto
+# FLLIPER_DSV4_FP4_DEQUANT must be unset/0. At 1 it asserts against a non-auto
 # runner backend and inflates the head to 18.6 GiB (TICKET_470 §3).
-unset SGLANG_DSV4_FP4_DEQUANT || true
-export SGLANG_DSV4_FP4_DEQUANT=0
+unset FLLIPER_DSV4_FP4_DEQUANT || true
+export FLLIPER_DSV4_FP4_DEQUANT=0
 
 BOOT_LOG="$RUN/boot_${ARM}.log"
 
@@ -155,7 +155,7 @@ fi
 assert_metrics_flag "${BOOT_ARGS[@]}"
 
 log "launching ${ARM}"
-setsid "$PY" -u -m sglang.launch_server "${BOOT_ARGS[@]}" \
+setsid "$PY" -u -m flliper.launch_server "${BOOT_ARGS[@]}" \
     > "$BOOT_LOG" 2>&1 < /dev/null &
 record_pids "$ARM" $!
 
@@ -182,18 +182,18 @@ if [ "$WITH_DRAFT" = "1" ]; then
         "no rank reported itself a shadow, so the draft was not placed solo (model_runner.py:544)"
 
     # 2 -- the markov_w2 TP-shard optimisation must be off under solo.
-    if ! grep -qiE "markov_w2.*(disabled|disabling|off)|SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD" "$BOOT_LOG"; then
+    if ! grep -qiE "markov_w2.*(disabled|disabling|off)|FLLIPER_DSPARK_OPT_MARKOV_W2_TP_SHARD" "$BOOT_LOG"; then
         log "WARNING: §3.1 check 2 (markov_w2 TP-shard disabled under solo) found no matching log line. NOT failing the arm on it -- the exact wording of that line is not pinned anywhere in this tree, so its absence may be a log-string mismatch rather than a wiring failure. Read the log and record which it was."
     fi
 
     # 3 -- the marlin runner backend actually reached the draft's expert
     # layers. Exact string verified at
-    # python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py:133.
+    # python/flliper/srt/layers/quantization/mxfp4_marlin_moe.py:133.
     assert_log_contains "$BOOT_LOG" "Preparing MXFP4 experts for Marlin backend" \
         "--speculative-moe-runner-backend marlin did NOT reach the draft build (the draft_worker_common.py flag wiring did not take). Everything after this would measure the wrong kernel, so the arm is void."
 
     # The refuted graph paths must not be anywhere near this boot.
-    assert_log_absent "$BOOT_LOG" "SGLANG_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE" \
+    assert_log_absent "$BOOT_LOG" "FLLIPER_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE" \
         "the REFUTED capturable path must not be involved"
 fi
 
@@ -216,7 +216,7 @@ if [ "$WITH_DRAFT" = "1" ]; then
     "$PY" "$HERE/probes.py" idem-compare "${PROBE_ARGS[@]}" \
         --reference "$RUN/idem_reference_470_a_cut.json"
     log "ANALYSE_447 §2.4 answered behaviourally above. The static half is a read of"
-    log "  python/sglang/srt/layers/attention/dsv4/compressor_v2.py:516-596"
+    log "  python/flliper/srt/layers/attention/dsv4/compressor_v2.py:516-596"
     log "  (forward_unified writes state_pool.kv_score_buffer.kv_score and, when"
     log "   online_c128_mtp is present, write_prefix_states) -- do that read and put"
     log "  both halves in the report. A DIVERGENCE verdict is a STOP AND REPORT."

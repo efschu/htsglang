@@ -59,7 +59,7 @@ def _watchdog():
     The suspension decision under test is the REAL method; only the device
     call it guards is stubbed, so a change to that decision fails this test.
     """
-    from sglang.srt.distributed.device_communicators import barlink_liveness
+    from flliper.srt.distributed.device_communicators import barlink_liveness
 
     wd = barlink_liveness.PeerWatchdog.__new__(barlink_liveness.PeerWatchdog)
     rec = _Recorder()
@@ -69,7 +69,7 @@ def _watchdog():
 
 class AbortPollStandsAsideForColdBuilds1073(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.utils import jit_cold_build
+        from flliper.srt.utils import jit_cold_build
 
         # A leaked depth from another test would make (a) pass for the wrong
         # reason, so the precondition is asserted rather than assumed.
@@ -91,7 +91,7 @@ class AbortPollStandsAsideForColdBuilds1073(unittest.TestCase):
 
     # -- (b) ---------------------------------------------------------------
     def test_the_poll_stands_aside_inside_a_cold_build_window(self):
-        from sglang.srt.utils.jit_cold_build import cold_build_window
+        from flliper.srt.utils.jit_cold_build import cold_build_window
 
         wd, _ = _watchdog()
         with cold_build_window("test: pretend nvcc"):
@@ -108,7 +108,7 @@ class AbortPollStandsAsideForColdBuilds1073(unittest.TestCase):
         silence reads as health. The window closes in a `finally`, and the
         suspension is re-decided every round rather than latched, so an
         abnormal end must resume it with no cleanup path involved."""
-        from sglang.srt.utils.jit_cold_build import cold_build_window
+        from flliper.srt.utils.jit_cold_build import cold_build_window
 
         wd, _ = _watchdog()
 
@@ -129,14 +129,14 @@ class AbortPollStandsAsideForColdBuilds1073(unittest.TestCase):
 
     def test_the_poll_resumes_when_the_window_outlives_the_peer_cap(self):
         """The second bound, and it is the frist the PEERS already honour
-        (`SGLANG_BARLINK_BUILD_WINDOW_CAP_S`), not a second timer for the same
+        (`FLLIPER_BARLINK_BUILD_WINDOW_CAP_S`), not a second timer for the same
         deadline. `in_cold_build_window()` is a bare depth counter with no
         clock, so a leaked depth would otherwise blind this thread for the life
         of the process."""
         import os
 
-        from sglang.srt.distributed.device_communicators import barlink_build_window
-        from sglang.srt.utils.jit_cold_build import cold_build_window
+        from flliper.srt.distributed.device_communicators import barlink_build_window
+        from flliper.srt.utils.jit_cold_build import cold_build_window
 
         wd, _ = _watchdog()
         prev = os.environ.get(barlink_build_window.ENV_CAP_S)
@@ -166,7 +166,7 @@ class AbortPollStandsAsideForColdBuilds1073(unittest.TestCase):
         watchdog would go fully blind inside every window and this says so."""
         import inspect
 
-        from sglang.srt.distributed.device_communicators import barlink_liveness
+        from flliper.srt.distributed.device_communicators import barlink_liveness
 
         run_src = inspect.getsource(barlink_liveness.PeerWatchdog._run)
         probe_line = next(
@@ -186,7 +186,7 @@ class AbortPollStandsAsideForColdBuilds1073(unittest.TestCase):
         benign zero -- this strand has produced four of those today."""
         import inspect
 
-        from sglang.srt.distributed.device_communicators import barlink_liveness
+        from flliper.srt.distributed.device_communicators import barlink_liveness
 
         src = inspect.getsource(barlink_liveness.PeerWatchdog._run)
         self.assertIn("_abort_poll_skipped", src)

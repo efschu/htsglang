@@ -8,8 +8,8 @@ container whose review boot also carries hicache and mamba host posts. The
 pin buys one thing: ``arena_refill``'s H2D copy at flip time is a DMA
 (#690 measured the refill at 9,614.9 MiB per rank).
 
-THE ARM. ``SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED=1`` (with
-``SGLANG_PHASE_FLIP_IMAGE_DIR`` pointing at persistent storage) allocates the
+THE ARM. ``FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED=1`` (with
+``FLLIPER_PHASE_FLIP_IMAGE_DIR`` pointing at persistent storage) allocates the
 image as a file-backed shared mapping instead: the pages are page cache --
 written back and RECLAIMED under memory pressure, refaulted from disk at the
 next flip. The flip then pays a pageable H2D copy (no DMA pin) plus, when the
@@ -39,10 +39,10 @@ import unittest
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.model_executor import weights_arena
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.model_executor import weights_arena
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -87,15 +87,15 @@ class TestDefaultStaysPinned(CustomTestCase):
         self.routing = _Routing().install(self)
 
     def test_default_routes_to_the_exact_pin_path_and_registers(self):
-        envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.clear()
-        envs.SGLANG_PHASE_FLIP_EXACT_PIN.clear()
+        envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.clear()
+        envs.FLLIPER_PHASE_FLIP_EXACT_PIN.clear()
         out = weights_arena._alloc_host_image(123456, pin=True)
         self.assertEqual(self.routing.exact, [123456])
         self.assertEqual(self.routing.posts, [123456])
         self.assertEqual(out.numel(), 123456)
 
     def test_mode_string_reports_pinned(self):
-        envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.clear()
+        envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.clear()
         self.assertEqual(weights_arena.host_image_mode(), "pinned")
 
 
@@ -113,8 +113,8 @@ class TestTheFileBackedArm(CustomTestCase):
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def test_opt_in_allocates_a_reclaimable_file_mapping(self):
-        with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_DIR.override(self.dir):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_DIR.override(self.dir):
                 out = weights_arena._alloc_host_image(65536, pin=True)
         self.assertEqual(out.numel(), 65536)
         # None of the pinned machinery ran.
@@ -124,8 +124,8 @@ class TestTheFileBackedArm(CustomTestCase):
     def test_the_file_is_unlinked_after_mapping(self):
         """No stale multi-GiB files after a crash: the mapping holds the
         inode, the namespace does not."""
-        with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_DIR.override(self.dir):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_DIR.override(self.dir):
                 out = weights_arena._alloc_host_image(4096, pin=True)
         self.assertEqual(os.listdir(self.dir), [])
         del out
@@ -133,8 +133,8 @@ class TestTheFileBackedArm(CustomTestCase):
     def test_the_mapping_arrives_zeroed(self):
         """The checksum contract: alignment-gap bytes must be zero, and a
         fresh file's pages read back zero by the filesystem's own rule."""
-        with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_DIR.override(self.dir):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_DIR.override(self.dir):
                 out = weights_arena._alloc_host_image(8192, pin=True)
         self.assertEqual(int(out.sum().item()), 0)
 
@@ -142,28 +142,28 @@ class TestTheFileBackedArm(CustomTestCase):
         """The registry sums NON-reclaimable bytes; charging a reclaimable
         image would re-create the 122.7G-on-118G ledger verdict this arm
         exists to dissolve."""
-        with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_DIR.override(self.dir):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_DIR.override(self.dir):
                 weights_arena._alloc_host_image(4096, pin=True)
         self.assertEqual(self.routing.posts, [])
 
     def test_unpinned_path_is_untouched_by_the_flag(self):
-        with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_DIR.override(self.dir):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_DIR.override(self.dir):
                 out = weights_arena._alloc_host_image(2048, pin=False)
         self.assertEqual(os.listdir(self.dir), [])
         self.assertEqual(out.numel(), 2048)
 
     def test_mode_string_reports_file_backed(self):
-        with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
             self.assertEqual(weights_arena.host_image_mode(), "file-backed reclaimable")
 
     def test_the_env_is_read_per_call(self):
-        envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.clear()
+        envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.clear()
         weights_arena._alloc_host_image(1024, pin=True)
         self.assertEqual(self.routing.exact, [1024])
-        with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_DIR.override(self.dir):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_DIR.override(self.dir):
                 weights_arena._alloc_host_image(2048, pin=True)
         self.assertEqual(self.routing.exact, [1024])
 
@@ -176,26 +176,26 @@ class TestTheOptInNeverLies(CustomTestCase):
         self.routing = _Routing().install(self)
 
     def test_enabled_without_a_directory_refuses(self):
-        with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_DIR.override(""):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_DIR.override(""):
                 with self.assertRaises(weights_arena.WeightsArenaError) as ctx:
                     weights_arena._alloc_host_image(4096, pin=True)
-        self.assertIn("SGLANG_PHASE_FLIP_IMAGE_DIR", str(ctx.exception))
+        self.assertIn("FLLIPER_PHASE_FLIP_IMAGE_DIR", str(ctx.exception))
 
     def test_a_tmpfs_directory_refuses_with_the_fs_named(self):
         """RAM-backed files are exactly the non-reclaimable post this arm
         exists to remove; /dev/shm must be refused, by name."""
         if not os.path.isdir("/dev/shm"):
             self.skipTest("no /dev/shm on this box")
-        with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_DIR.override("/dev/shm"):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_DIR.override("/dev/shm"):
                 with self.assertRaises(weights_arena.WeightsArenaError) as ctx:
                     weights_arena._alloc_host_image(4096, pin=True)
         self.assertIn("tmpfs", str(ctx.exception))
 
     def test_a_missing_directory_refuses(self):
-        with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_DIR.override("/nonexistent-dir-746"):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_DIR.override("/nonexistent-dir-746"):
                 with self.assertRaises(weights_arena.WeightsArenaError):
                     weights_arena._alloc_host_image(4096, pin=True)
 
@@ -208,7 +208,7 @@ class TestTheImageRoundTrips(CustomTestCase):
     def test_snapshot_refill_roundtrip(self):
         import tempfile
 
-        from sglang.srt.model_executor.weights_arena import (
+        from flliper.srt.model_executor.weights_arena import (
             arena_refill,
             image_from_tensors,
             plan_arena_layout,
@@ -220,8 +220,8 @@ class TestTheImageRoundTrips(CustomTestCase):
         }
         layout = plan_arena_layout(named)
         with tempfile.TemporaryDirectory(prefix="flip-img-rt-") as d:
-            with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-                with envs.SGLANG_PHASE_FLIP_IMAGE_DIR.override(d):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+                with envs.FLLIPER_PHASE_FLIP_IMAGE_DIR.override(d):
                     image = image_from_tensors(named, layout, pin=True)
             arena = torch.zeros(layout.total_bytes, dtype=torch.uint8)
             arena_refill(arena, layout, image)

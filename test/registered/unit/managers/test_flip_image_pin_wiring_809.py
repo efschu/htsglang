@@ -42,9 +42,9 @@ import unittest
 
 import torch
 
-from sglang.srt.model_executor import weights_arena
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor import weights_arena
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -94,7 +94,7 @@ def _stacks(image_pp=None, image_tp=None):
     ``_runtime``): the dataclass's remaining fields are a tp_worker, an arena
     and two layouts, none of which the image accessors touch.
     """
-    from sglang.srt.managers import phase_flip_boot as boot
+    from flliper.srt.managers import phase_flip_boot as boot
 
     stacks = boot.PhaseFlipStacks.__new__(boot.PhaseFlipStacks)
     stacks.image_pp = image_pp
@@ -122,7 +122,7 @@ class TestTheIncomingLayoutIsTheOneReadAhead(CustomTestCase):
         LEAVE, every leg refuses it as stale, and the boot log still shows an
         armed pin and a registered post.
         """
-        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+        from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
 
         img_pp, img_tp = _image(), _image()
         stacks = _stacks(image_pp=img_pp, image_tp=img_tp)
@@ -169,8 +169,8 @@ class TestTheIncomingLayoutIsTheOneReadAhead(CustomTestCase):
         incoming one, and the layout it refills must be that phase's layout.
         A swap of either argument breaks the identity.
         """
-        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
-        from sglang.srt.managers import phase_flip_boot as boot
+        from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+        from flliper.srt.managers import phase_flip_boot as boot
 
         img_pp, img_tp = _image(), _image()
         stacks = _stacks(image_pp=img_pp, image_tp=img_tp)
@@ -227,7 +227,7 @@ class TestTheIncomingLayoutIsTheOneReadAhead(CustomTestCase):
         not, so a missing ``two_file_arm`` guard would arm the reader on the
         single rotating buffer's image -- the one every leg rewrites.
         """
-        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
+        from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP
 
         pin = _StubPin()
         weights_arena.install_flip_image_pin(pin)
@@ -237,7 +237,7 @@ class TestTheIncomingLayoutIsTheOneReadAhead(CustomTestCase):
         self.assertEqual(pin.started, [])
 
     def test_with_no_pin_installed_the_arm_says_so(self):
-        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
+        from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP
 
         self.assertIsNone(weights_arena.flip_image_pin())
         stacks = _stacks(image_pp=_image(), image_tp=_image())
@@ -245,7 +245,7 @@ class TestTheIncomingLayoutIsTheOneReadAhead(CustomTestCase):
 
     def test_a_reader_that_cannot_start_does_not_break_the_arm(self):
         """A read-ahead never refuses a flip: the file is still the carrier."""
-        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
+        from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP
 
         pin = _RaisingPin()
         weights_arena.install_flip_image_pin(pin)
@@ -256,7 +256,7 @@ class TestTheIncomingLayoutIsTheOneReadAhead(CustomTestCase):
 
 def _armed_runtime(stacks):
     """A ``PhaseFlipRuntime`` carrying only what ``_enter_armed_state`` reads."""
-    from sglang.srt.managers import phase_flip_runtime as m
+    from flliper.srt.managers import phase_flip_runtime as m
 
     class _Scheduler:
         pass
@@ -280,7 +280,7 @@ class TestTheArmStartsTheReadAhead(CustomTestCase):
     read starts. Without this the whole slice is inert in a boot."""
 
     def test_entering_the_armed_state_starts_the_read_ahead(self):
-        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
+        from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP
 
         seen = []
         stacks = _stacks(image_pp=_image(), image_tp=_image())
@@ -303,7 +303,7 @@ class TestTheArmStartsTheReadAhead(CustomTestCase):
         the alternative is one rank refusing an arm the group already took,
         which is the divergence this site's own comment forbids.
         """
-        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
+        from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP
 
         rt = _armed_runtime(None)
         rt._enter_armed_state(PP_TO_TP)
@@ -317,7 +317,7 @@ class TestTheAbandonStopsTheReadAhead(CustomTestCase):
         super().setUp()
         import logging
 
-        from sglang.srt.managers import phase_flip_runtime as m
+        from flliper.srt.managers import phase_flip_runtime as m
 
         # The abandon logs at ERROR by design. Silencing it is local to this
         # class, but the logger is process-global, so the level is restored
@@ -330,7 +330,7 @@ class TestTheAbandonStopsTheReadAhead(CustomTestCase):
         self.addCleanup(weights_arena.install_flip_image_pin, None)
 
     def _parked(self):
-        from sglang.srt.managers import phase_flip_runtime as m
+        from flliper.srt.managers import phase_flip_runtime as m
 
         rt = m.PhaseFlipRuntime.__new__(m.PhaseFlipRuntime)
         rt._pending = m.PP_TO_TP
@@ -396,7 +396,7 @@ def _dedented_tree(func):
 
 def _boot_stack_tree():
     """The AST of ``build_phase_flip_tp_stack``, dedented so it parses alone."""
-    from sglang.srt.managers import phase_flip_boot
+    from flliper.srt.managers import phase_flip_boot
 
     return _dedented_tree(phase_flip_boot.build_phase_flip_tp_stack)
 

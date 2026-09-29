@@ -19,7 +19,7 @@ correctly obeying a cap of one.
 
 import unittest
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestPPMicroBatchCap701(CustomTestCase):
@@ -33,7 +33,7 @@ class TestPPMicroBatchCap701(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.managers import scheduler as scheduler_mod
+        from flliper.srt.managers import scheduler as scheduler_mod
 
         src = inspect.getsource(scheduler_mod.Scheduler.init_model_worker)
         self.assertIn("default_pp_micro_batch_size", src)
@@ -48,7 +48,7 @@ class TestPPMicroBatchCap701(CustomTestCase):
         above is satisfied by dead code."""
         import inspect
 
-        from sglang.srt.managers import scheduler as scheduler_mod
+        from flliper.srt.managers import scheduler as scheduler_mod
 
         self.assertIn(
             "init_model_worker",

@@ -34,7 +34,7 @@ Hermetic: mocks only, no CUDA.
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.srt.mem_cache.common import (
+from flliper.srt.mem_cache.common import (
     evict_from_tree_cache,
     note_uniform_admitted,
     uniform_avail_for_evict,
@@ -143,24 +143,24 @@ class BothLedgerReadsShareOneGuard(unittest.TestCase):
     """
 
     def test_the_helper_treats_a_mock_as_zero(self):
-        from sglang.srt.mem_cache.common import _ledger_tokens
+        from flliper.srt.mem_cache.common import _ledger_tokens
 
         self.assertEqual(_ledger_tokens(MagicMock()), 0)
 
     def test_the_helper_passes_real_ints_through(self):
-        from sglang.srt.mem_cache.common import _ledger_tokens
+        from flliper.srt.mem_cache.common import _ledger_tokens
 
         self.assertEqual(_ledger_tokens(4096), 4096)
         self.assertEqual(_ledger_tokens(0), 0)
 
     def test_the_helper_rejects_bool_which_is_an_int_subclass(self):
-        from sglang.srt.mem_cache.common import _ledger_tokens
+        from flliper.srt.mem_cache.common import _ledger_tokens
 
         self.assertEqual(_ledger_tokens(True), 0)
 
     def test_the_host_ledger_is_guarded_too(self):
         """The sibling fix: an unconfigured double must not move the host floor."""
-        from sglang.srt.mem_cache.common import uniform_host_avail_for_backup
+        from flliper.srt.mem_cache.common import uniform_host_avail_for_backup
 
         tc = MagicMock()
         tc.uniform_host_avail_floor = 500
@@ -170,7 +170,7 @@ class BothLedgerReadsShareOneGuard(unittest.TestCase):
         self.assertEqual(uniform_host_avail_for_backup(tc, host), 500)
 
     def test_the_host_ledger_still_charges_a_real_value(self):
-        from sglang.srt.mem_cache.common import uniform_host_avail_for_backup
+        from flliper.srt.mem_cache.common import uniform_host_avail_for_backup
 
         tc = MagicMock()
         tc.uniform_host_avail_floor = 500

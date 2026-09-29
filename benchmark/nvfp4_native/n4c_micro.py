@@ -37,14 +37,14 @@ def dump():
         json.dump(res, f, indent=1)
 
 
-from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack  # noqa: E402
-from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi  # noqa: E402
-from sglang.srt.layers.quantization import nvfp4_native_mixed as nm  # noqa: E402
-from sglang.srt.layers.quantization.marlin_utils import (  # noqa: E402
+from flliper.jit_kernel.gptq_marlin_repack import gptq_marlin_repack  # noqa: E402
+from flliper.srt.layers.quantization import nvfp4_marlin_inplace as mi  # noqa: E402
+from flliper.srt.layers.quantization import nvfp4_native_mixed as nm  # noqa: E402
+from flliper.srt.layers.quantization.marlin_utils import (  # noqa: E402
     marlin_make_workspace,
     marlin_permute_scales,
 )
-from sglang.srt.layers.quantization.marlin_utils_fp4 import (  # noqa: E402
+from flliper.srt.layers.quantization.marlin_utils_fp4 import (  # noqa: E402
     apply_fp4_marlin_linear,
     nvfp4_marlin_process_global_scale,
     nvfp4_marlin_process_scales,
@@ -214,10 +214,10 @@ def main():
 
 
 def sm12x():
-    from sglang.srt.layers.quantization import fp4_utils
-    from sglang.srt.layers.quantization import nvfp4_sm12x_w4a16 as f
-    from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
-    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config, ModelOptFp4LinearMethod
+    from flliper.srt.layers.quantization import fp4_utils
+    from flliper.srt.layers.quantization import nvfp4_sm12x_w4a16 as f
+    from flliper.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+    from flliper.srt.layers.quantization.modelopt_quant import ModelOptFp4Config, ModelOptFp4LinearMethod
 
     fp4_utils.FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend.CUTLASS
     fp4_utils.FP4_NATIVE_MIXED = True

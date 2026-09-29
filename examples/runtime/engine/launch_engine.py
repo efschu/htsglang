@@ -2,7 +2,7 @@
 This example demonstrates how to launch the offline engine.
 """
 
-import sglang as sgl
+import flliper as sgl
 
 
 def main():

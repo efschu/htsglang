@@ -42,7 +42,7 @@ phase that permits decode must never yield at all.
 
 import unittest
 
-from sglang.srt.managers.parked_carrier_relief import (
+from flliper.srt.managers.parked_carrier_relief import (
     BINDER_KV_TOKEN,
     BINDER_MAMBA_SLOT,
     BINDER_NONE,
@@ -55,7 +55,7 @@ from sglang.srt.managers.parked_carrier_relief import (
     parked_carrier_relief_enabled,
     relief_receipt,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10)
 

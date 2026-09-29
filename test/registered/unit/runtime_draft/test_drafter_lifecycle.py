@@ -12,7 +12,7 @@ as a spec-less boot.
 
 import unittest
 
-from sglang.srt.speculative.runtime_draft import (
+from flliper.srt.speculative.runtime_draft import (
     DrafterBusy,
     DrafterLifecycle,
     DrafterState,
@@ -20,8 +20,8 @@ from sglang.srt.speculative.runtime_draft import (
     DrafterUnsupported,
     QuiesceReport,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

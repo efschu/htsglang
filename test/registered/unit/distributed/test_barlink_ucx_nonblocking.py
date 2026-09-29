@@ -21,11 +21,11 @@ import unittest
 
 import torch
 
-from sglang.srt.distributed.device_communicators.barlink_ucx import (
+from flliper.srt.distributed.device_communicators.barlink_ucx import (
     BarlinkUcxTransport,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 

@@ -19,20 +19,20 @@ import unittest
 
 import torch
 
-from sglang.srt.distributed.device_communicators.barlink import (
+from flliper.srt.distributed.device_communicators.barlink import (
     TRANSPORT_REGISTRY,
     _NO_FALLBACK,
     BarlinkCommunicator,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 
 def _ucx_available():
     try:
-        from sglang.srt.distributed.device_communicators.barlink_ucx_bindings import (
+        from flliper.srt.distributed.device_communicators.barlink_ucx_bindings import (
             UcpLibrary,
         )
 
@@ -63,7 +63,7 @@ def _worker(rank, world, store, q):
             backend="gloo", init_method=f"file://{store}",
             rank=rank, world_size=world,
         )
-        from sglang.srt.distributed.device_communicators.barlink_ucx import (
+        from flliper.srt.distributed.device_communicators.barlink_ucx import (
             BarlinkUcxTransport,
         )
 
@@ -358,7 +358,7 @@ class TestUcxRegistryWiring(CustomTestCase):
         or over gloo, and the group would hang with half of it waiting on a tag
         the other half never sends.
         """
-        from sglang.srt.distributed.device_communicators.barlink_ucx import (
+        from flliper.srt.distributed.device_communicators.barlink_ucx import (
             BarlinkUcxTransport,
         )
 
@@ -371,7 +371,7 @@ class TestUcxRegistryWiring(CustomTestCase):
 
     def test_dispatch_selects_ucx(self):
         """A registered transport is dispatchable without touching call sites."""
-        from sglang.srt.distributed.device_communicators.barlink_ucx import (
+        from flliper.srt.distributed.device_communicators.barlink_ucx import (
             BarlinkUcxTransport,
         )
 
@@ -386,7 +386,7 @@ class TestUcxVersionParity(CustomTestCase):
     """The mismatch this transport exists to diagnose."""
 
     def _check(self, gathered):
-        from sglang.srt.distributed.device_communicators.barlink_ucx import (
+        from flliper.srt.distributed.device_communicators.barlink_ucx import (
             BarlinkUcxTransport,
         )
 
@@ -407,7 +407,7 @@ class TestUcxVersionParity(CustomTestCase):
         self._check([self._rank(0, (1, 16, 0)), self._rank(1, (1, 16, 0))])
 
     def test_mismatch_rejected_with_actionable_message(self):
-        from sglang.srt.distributed.device_communicators.barlink_ucx_bindings import (
+        from flliper.srt.distributed.device_communicators.barlink_ucx_bindings import (
             UcxVersionMismatch,
         )
 
@@ -421,12 +421,12 @@ class TestUcxVersionParity(CustomTestCase):
         # failure ('invalid bandwidth 0.00') identifies neither.
         self.assertIn("1.18.1", msg)
         self.assertIn("1.16.0", msg)
-        self.assertIn("SGLANG_BARLINK_UCX_LIB", msg)
+        self.assertIn("FLLIPER_BARLINK_UCX_LIB", msg)
         self.assertIn("/opt/ucx116/lib/libucp.so.0", msg)
 
     def test_patch_level_mismatch_also_rejected(self):
         """UCX's wire format is not guaranteed stable across patch levels."""
-        from sglang.srt.distributed.device_communicators.barlink_ucx_bindings import (
+        from flliper.srt.distributed.device_communicators.barlink_ucx_bindings import (
             UcxVersionMismatch,
         )
 

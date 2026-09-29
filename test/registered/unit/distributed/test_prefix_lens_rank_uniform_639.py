@@ -48,22 +48,22 @@ from unittest import mock
 import torch
 
 try:
-    from sglang.test.ci.ci_register import register_cpu_ci
+    from flliper.test.ci.ci_register import register_cpu_ci
 except ImportError:  # pragma: no cover - registration is a CI-time marker
 
     def register_cpu_ci(*args, **kwargs):
         return None
 
 
-from sglang.srt.layers.dcp import prefix_lens_check
-from sglang.srt.layers.dcp.lockstep import (
+from flliper.srt.layers.dcp import prefix_lens_check
+from flliper.srt.layers.dcp.lockstep import (
     PrefixLensRankDivergence,
     format_prefix_lens_divergence,
     prefix_lens_ballot,
     prefix_lens_ballot_agrees,
     weightless_has_prefix,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -140,7 +140,7 @@ class PrefixLensBallotTest(CustomTestCase):
         src = inspect.getsource(prefix_lens_ballot)
         digest_src = inspect.getsource(
             __import__(
-                "sglang.srt.layers.dcp.lockstep", fromlist=["_prefix_lens_digest"]
+                "flliper.srt.layers.dcp.lockstep", fromlist=["_prefix_lens_digest"]
             )._prefix_lens_digest
         )
         self.assertNotIn("hash(", src)
@@ -216,7 +216,7 @@ class PrefixLensDetectorTest(CustomTestCase):
         """Deletion falsifier: the call must sit at the line that MATERIALISES
         the vector, not somewhere the forward has already entered a collective
         it cannot leave."""
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from flliper.srt.managers.schedule_batch import ScheduleBatch
 
         src = inspect.getsource(ScheduleBatch.prepare_for_extend)
         self.assertIn("assert_prefix_lens_rank_uniform(prefix_lens)", src)

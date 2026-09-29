@@ -1,0 +1,697 @@
+from __future__ import annotations
+
+import logging
+import time
+
+from flliper.srt.managers.pdflip_pass_timer import timed as _pass_timed
+from dataclasses import dataclass
+from http import HTTPStatus
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
+
+import zmq
+from torch.distributed import barrier
+
+from flliper.srt.disaggregation.utils import prepare_abort
+from flliper.srt.managers.io_struct import (
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+    sock_recv,
+)
+from flliper.srt.managers.mm_utils import (
+    has_shm_features,
+    unwrap_shm_features,
+)
+from flliper.srt.managers.utils import is_health_check_generate_req
+from flliper.srt.utils import (
+    broadcast_pyobj,
+    point_to_point_pyobj,
+)
+from flliper.srt.utils.nvtx_utils import scheduler_nvtx_method
+
+from flliper.srt.mem_cache import form_a_host_shadow as _r12
+
+logger = logging.getLogger(__name__)
+
+#: #1028d one-shot for the broadcast-stamp banner (see _stamped_broadcast).
+_BCAST_STAMP_LOGGED = False
+
+if TYPE_CHECKING:
+    from flliper.srt.configs.model_config import ModelConfig
+    from flliper.srt.distributed.parallel_state_wrapper import ParallelState
+    from flliper.srt.server_args import ServerArgs
+    from flliper.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
+    from flliper.test.scripted_runtime.tokenizer_recv_proxy import (
+        ScriptedTokenizerRecvProxy,
+    )
+
+
+@dataclass(kw_only=True, slots=True, frozen=True)
+class SchedulerRequestReceiver:
+    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy]
+    recv_from_rpc: Optional[zmq.Socket]
+    recv_skipper: Any
+    input_blocker: Any
+    mm_receiver: Any
+    ps: ParallelState
+    tp_group: Any
+    tp_cpu_group: Any
+    attn_tp_group: Any
+    attn_tp_cpu_group: Any
+    attn_cp_group: Any
+    attn_cp_cpu_group: Any
+    world_group: Any
+    server_args: ServerArgs
+    model_config: ModelConfig
+    max_recv_per_poll: int
+    stream_output: Callable[..., None]
+    get_last_forward_mode: Callable[[], Any]
+    scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    # #631: returns a PhaseFlipReqInput when the automatic phase policy
+    # wants a flip, else None. Optional and defaulted so every existing
+    # construction is unchanged and the default path costs one compare.
+    phase_policy_hook: Optional[Callable[..., Any]] = None
+    # #631: the single owner of this rank's request-chain receive stream
+    # (PpChainReceiver), installed only when the phase flip is enabled.
+    # None restores the direct point_to_point_pyobj call, i.e. the exact
+    # upstream behaviour for every boot without the flip.
+    chain_receiver: Optional[Any] = None
+    # #631: True while a phase flip is armed on this rank. An armed rank
+    # must not take on new work and must not block on the chain -- see
+    # _pull_raw_reqs.
+    phase_flip_armed_hook: Optional[Callable[[], bool]] = None
+    # #969 §W3: returns PP0's pending flip decision exactly once, or None.
+    # Called only on the request ORIGIN, right beside the policy arm hook, so
+    # the decision travels on the same stream the arm does -- the chain
+    # forward in the PP phase, the TP broadcast in the TP phase. No new arc,
+    # no new collective (which is recorded fatal on this path).
+    phase_flip_decision_hook: Optional[Callable[[], Any]] = None
+    # #824 W5(b): called as on_blocked_recv(arm, since) around the DIRECT
+    # chain receive below, and with (None, None) when it returns. Without
+    # it that call is a blocking PP receive that records nothing, so the
+    # watchdog cannot name it -- the same blind spot #821 left on the
+    # chain_receiver path, which is where two of three ranks wedged on
+    # boot_827. The PpChainReceiver path stamps its own marker instead.
+    on_blocked_recv: Optional[Callable[[Optional[str], Optional[float]], None]] = None
+    # #824 W4a: run one drain turn when the chain receive reports a CLOSED
+    # RING (PpChainRecvStalled), then resume the SAME posted receive. None
+    # keeps the pre-#824 behaviour of letting the stall propagate.
+    pp_chain_stall_service: Optional[Callable[[], Any]] = None
+    # #1158 ONE DISPOSAL, AT THE ORIGIN, BEFORE RELAY. Returns
+    # (idle, queue_len, running_len) for the request origin's health-probe
+    # verdict; None leaves health-check requests untouched (a receiver built
+    # without a scheduler behind it). The scheduler wires it on every boot.
+    health_check_gate: Optional[Callable[[], Tuple[bool, int, int]]] = None
+    # The ipc of a dropped probe goes back through this so the tokenizer's
+    # /health_generate still gets its answer (the scheduler's deque).
+    return_health_check_ipc: Optional[Callable[[Any], None]] = None
+    # PDFLIP VISION (in-rank stage): returns the origin's own requests to add to
+    # this pass -- the named aborts of a refused vision stage on PP0 -- so
+    # they ride the SAME relay the tokenizer's requests do and every rank
+    # applies them in the same pass. Called only on the request origin.
+    # None (every other boot) leaves the intake exactly as it was.
+    origin_extra_reqs_hook: Optional[Callable[[], List[Any]]] = None
+
+    #: How many drain turns one chain receive may trigger before the stall
+    #: is allowed to propagate. A closed ring is cut by the FIRST turn; a
+    #: second means the drain did not release the peer, and spinning on it
+    #: would replace a loud wedge with a quiet one.
+    MAX_STALL_SERVICE_TURNS = 2
+
+    def _recv_chain_breaking_closed_rings(self):
+        """#824 W4a: the blocking chain receive, plus the ring-cut.
+
+        ``PpChainRecvStalled`` does not mean "give up". It means the chain
+        receive has PROVEN the ring is closed -- this rank's CHAN_DICT
+        upstream has entered a send it cannot finish until this rank drains
+        it -- and the receive is still posted and still framed. So the
+        answer is to drain that wire and come back to the same receive,
+        which is what the resumability of ParkedWait exists for.
+
+        The stall is re-raised rather than swallowed if servicing does not
+        clear it, because at that point the ring is closed for a reason this
+        code does not model, and a caller that keeps retrying would turn a
+        diagnosable wedge into an invisible one.
+        """
+        from flliper.srt.managers.pp_chain_receiver import PpChainRecvStalled
+
+        for turn in range(self.MAX_STALL_SERVICE_TURNS + 1):
+            try:
+                return self.chain_receiver.recv()
+            except PpChainRecvStalled:
+                if self.pp_chain_stall_service is None or turn >= self.MAX_STALL_SERVICE_TURNS:
+                    raise
+                logger.warning(
+                    "PP-CHAIN-RECV closed ring detected on the request "
+                    "chain; running drain turn %d to release the upstream's "
+                    "dict send, then resuming the same posted receive.",
+                    turn + 1,
+                )
+                self.pp_chain_stall_service()
+
+    def recv_limit_reached(self, num_recv_reqs: int) -> bool:
+        if self.max_recv_per_poll < 0:
+            return False
+        return num_recv_reqs >= self.max_recv_per_poll
+
+    def control_message_pending(self) -> bool:
+        """#1262 (2): is a frame ALREADY readable on this rank's own intake?
+
+        O(1) and side-effect free -- a zero-timeout ``zmq.Socket.poll``, which
+        is a ``getsockopt(ZMQ_EVENTS)``; nothing is received, nothing is
+        consumed, no ordering is disturbed. The caller (``Scheduler.on_idle``)
+        uses it to give a queued message priority over the idle pool census,
+        which is the half of #1262 the O(1) ledger does not cover: at 410 857
+        rows the census cost the weg2t2a schedulers their flip, and a flip
+        request that arrives DURING such a pass has to wait it out.
+
+        Scope, named rather than implied: the sockets exist on the REQUEST
+        ORIGIN (``pp_rank == 0``, ``attn_tp_rank == 0``); downstream stages
+        receive over the PP chain / TP broadcast and answer ``False`` here.
+        That is the right shape and not a gap -- the origin is where a
+        ``/release_memory_occupation`` enters the group at all, so an origin
+        that cannot be interrupted is the thing that stops the flip; the
+        downstream stages are protected by the O(1) ledger of #1262 (1), which
+        applies on every rank.
+
+        ``recv_from_tokenizer`` may be a ``ScriptedTokenizerRecvProxy`` with no
+        ``poll``; that answers ``False`` rather than raising. A probe that
+        cannot answer must never be read as "a message is waiting" -- that
+        would disarm the census permanently, which is the #606 shape.
+        """
+        for sock in (
+            getattr(self, "recv_from_tokenizer", None),
+            getattr(self, "recv_from_rpc", None),
+        ):
+            if sock is None:
+                continue
+            poll = getattr(sock, "poll", None)
+            if not callable(poll):
+                continue
+            try:
+                if poll(0, zmq.POLLIN):
+                    return True
+            except Exception:  # noqa: BLE001 -- a probe, never a gate
+                continue
+        return False
+
+    @scheduler_nvtx_method("scheduler.recv_requests")
+    @_pass_timed("_1466_recv_ms")  # #1466: the pass's recv phase
+    def recv_requests(
+        self,
+    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
+        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+
+        if self.scripted_scheduler_hook is not None:
+            self.scripted_scheduler_hook.step()
+
+        if self.recv_skipper is not None:
+            if not self.recv_skipper.handle(self.get_last_forward_mode()):
+                return []
+
+        recv_reqs = self._pull_raw_reqs()
+        # #1458: ms-stamped arrival of the Weg-2 control requests on EVERY rank
+        # (boot weg2xsn214: PP0 waited 789 ms in the KV-release fence for the
+        # followers; second-granular logs could not say where they were).
+        try:
+            for _r in (recv_reqs or ()):
+                _k = type(_r).__name__
+                if _k in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
+                          "ResumeMemoryOccupationReqInput"):
+                    logger.info("#1458 CTRL-RECV kind=%s pp_rank=%s tp_rank=%s t=%.3f",
+                                _k, self.ps.pp_rank, self.ps.attn_tp_rank, time.time())
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the intake
+            pass
+
+        # #631 automatic phase policy. The arm rides the SAME chain a
+        # manual POST /phase_flip uses, because forwarding it is what
+        # WAKES the downstream stages out of their blocking chain recv --
+        # see maybe_arm_phase_policy. The ordering that makes it safe is
+        # DELIVERY-BEFORE-BLOCK, enforced in scheduler_pp_mixin.
+        #
+        # THE GUARD IS THE ZMQ-INTAKE TEST, never "did I get a list". In
+        # the PP phase _pull_raw_reqs returns a list on EVERY stage --
+        # rank 0 from zmq, ranks 1..n-1 from point_to_point_pyobj -- so a
+        # list-based guard is true everywhere and every stage injects its
+        # own arm. Measured 2026-08-08: 1/2/3 arms on PP0/PP1/PP2, a
+        # 12765-line capture-census flood, and a self-kill.
+        is_request_origin = (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        )
+        # #1158: the health-probe disposal happens HERE, once, before the
+        # policy hook reads the list, before the TP broadcast and before the
+        # PP chain forward. Everything below relays exactly what survives.
+        if is_request_origin and recv_reqs:
+            recv_reqs = self._dispose_health_checks_at_origin(recv_reqs)
+        if (
+            is_request_origin
+            and recv_reqs is not None
+            and self.phase_policy_hook is not None
+        ):
+            # #713: hand the policy the batch it is riding in. It evaluates
+            # BEFORE these requests are queued (scheduler.py:4089), so without
+            # them it asks "is there prefill work?" of a queue that has not
+            # been told yet, reads 0, and declines the flip toward the very
+            # work that woke it -- measured at 31.64 s TTFT for a ten-token
+            # prompt on an idle box. The ordering itself is load-bearing
+            # (DELIVERY-BEFORE-BLOCK) and is deliberately NOT changed here.
+            policy_req = self.phase_policy_hook(recv_reqs)
+            if policy_req is not None:
+                recv_reqs.append(policy_req)
+
+        # #969 §W3: PP0's flip decision rides the SAME stream as the arm, one
+        # position behind it, on the same origin test. In the PP phase this
+        # list is chain-forwarded to every stage; in the TP phase the cutover
+        # has rewritten `ps` to tp_size=n and the broadcast below carries it.
+        # Appended AFTER the arm so a decision can never overtake the arm it
+        # belongs to on the wire.
+        if (
+            is_request_origin
+            and recv_reqs is not None
+            and self.phase_flip_decision_hook is not None
+        ):
+            decision = self.phase_flip_decision_hook()
+            if decision is not None:
+                recv_reqs.append(decision)
+
+        if (
+            is_request_origin
+            and recv_reqs is not None
+            and self.origin_extra_reqs_hook is not None
+        ):
+            recv_reqs.extend(self.origin_extra_reqs_hook() or ())
+
+        if self.input_blocker is not None:
+            recv_reqs = self.input_blocker.handle(recv_reqs)
+
+        # R12 (mem_cache/form_a_host_shadow.py): on a Form A D group TP0's own
+        # host decisions of the last pass ride THIS broadcast (first in the
+        # list, the #969 W3 pattern: no new arc, no new collective), and every
+        # rank applies them right after it, before any request of the pass.
+        _r12_wire = _r12.wire_active(self.server_args, self.ps)
+        if _r12_wire and is_request_origin and recv_reqs is not None:
+            recv_reqs = _r12.attach(recv_reqs)
+
+        recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
+
+        if _r12_wire:
+            recv_reqs = _r12.consume(recv_reqs)
+
+        if self.ps.pp_rank == 0:
+            self.unwrap_pickle_wrapper(recv_reqs)
+
+        recv_reqs = self._apply_mm_receiver(recv_reqs)
+
+        self._finalize_shm_features(recv_reqs)
+
+        return recv_reqs
+
+    def _dispose_health_checks_at_origin(self, recv_reqs: List) -> List:
+        """#1158: THE ONE disposal of a health-check request, at the origin.
+
+        Upstream skips a `/health_generate` probe while the server is busy,
+        with a rank-local idle predicate evaluated in every rank's dispatch
+        loop. Under replicated queues that reads the same everywhere; the
+        fork's #631 row-authority special case then let rank 0 DROP a probe
+        while its PP followers ENQUEUED it, after the list had already been
+        broadcast to the TP peers and forwarded down the chain. Measured on
+        boot weg1b3 (23:54:18): PP0 queue=6 vs PP1/PP2 queue=7, a +1
+        occupant through five seams, '#969C ... rid=HEALTH_C' on the
+        followers only, and the #791b ballot void on every pass until the
+        rank-local prefetch verdicts split at 23:59:54.
+
+        So the verdict moves to where the list is BORN: the origin decides
+        busy/idle once, a dropped probe never leaves this process (its ipc is
+        answered from here), and a kept probe is enqueued on EVERY rank by the
+        ordinary relay. No rank-conditional branch exists downstream any more
+        (scheduler.process_input_requests dispatches whatever it receives).
+
+        Same list, same order, for everything that is not a health probe. A
+        second probe behind a kept one in the same intake is busy by
+        construction -- the kept one will occupy the queue -- which is also
+        what upstream's per-request predicate read.
+        """
+        if self.health_check_gate is None:
+            return recv_reqs
+        kept: List = []
+        verdict: Optional[Tuple[bool, int, int]] = None
+        kept_probe = False
+        for req in recv_reqs:
+            if not is_health_check_generate_req(req):
+                kept.append(req)
+                continue
+            if verdict is None:
+                verdict = self.health_check_gate()
+            idle, queue_len, running = verdict
+            if idle and not kept_probe:
+                kept_probe = True
+                kept.append(req)
+                continue
+            if self.return_health_check_ipc is not None:
+                self.return_health_check_ipc(getattr(req, "http_worker_ipc", None))
+            # The two numbers are the gate's own reading (the queue and the
+            # running batch at the moment the verdict was taken); a probe
+            # dropped behind a KEPT probe in the same intake prints the same
+            # reading -- the kept probe is not in the queue yet, it is busy
+            # by construction (see the docstring).
+            logger.info(
+                "#1158 HEALTH-CHECK dropped at origin before broadcast rid=%s "
+                "busy queue=%d running=%d",
+                getattr(req, "rid", None),
+                queue_len,
+                running,
+            )
+        return kept
+
+    def _phase_flip_armed(self) -> bool:
+        if self.phase_flip_armed_hook is None:
+            return False
+        try:
+            return bool(self.phase_flip_armed_hook())
+        except Exception:  # noqa: BLE001 - never let a probe break intake
+            return False
+
+    def _pull_raw_reqs(self) -> Optional[List]:
+        # #631 THE ARMED INTAKE RULE. A rank with a flip armed admits NO
+        # new work and BLOCKS ON NOTHING:
+        #
+        #   rank 0    leaves its requests in the zmq socket. Not reading
+        #             them is what buffers them -- there is no queue to
+        #             manage and nothing can be lost.
+        #   rank k>0  keeps CONSUMING the chain -- greedily, and bounded by
+        #             transfer time rather than by peer scheduling, because
+        #             the upstream's published counter proves each message
+        #             exists before the blocking receive is made (#631 G).
+        #             Consuming is not optional: boot 18 measured what
+        #             happens when an armed rank stops. Rank 2 armed and
+        #             stopped reading, so rank 1's ordinary top-of-pass
+        #             commit of the previous forward blocked in work.wait()
+        #             BEFORE rank 1 could announce presence. The gate never
+        #             assembled and rank 0 sat in the reduction alone.
+        #             The blocking point preceded the gate, so the gate
+        #             could never have covered it -- the fix has to be
+        #             here, at the obligation itself.
+        #
+        # THE SERVICE TURN RUNS ON EVERY RANK, rank 0 included. Its consume
+        # half is a no-op there (no upstream chain) but its flush half is
+        # not: rank 0 still owes the reaping of the forward it issued in
+        # the pass it armed, and while that handle is unreaped it "owes a
+        # send" and withholds presence for ever.
+        #
+        # Both halves return an EMPTY list rather than None: empty means
+        # "no new work this pass", which every downstream step already
+        # handles, whereas None means "not the intake rank".
+        # #969 §W3: THE ARMED INTAKE RULE, REDUCED TO ITS ONE REAL TERM.
+        #
+        # Only the ZMQ INTAKE is suspended while armed, and only on the rank
+        # that has one: not reading the socket is what buffers new work, and
+        # there is no queue to manage and nothing to lose. Everything else
+        # about the pass is unchanged -- ranks below PP0 take their ordinary
+        # chain receive, and every non-last rank forwards, because THAT ARC IS
+        # WHAT CARRIES PP0's DECISION (io_struct.PhaseFlipDecision).
+        #
+        # WHAT WAS HERE BEFORE, and why it went: an armed rank returned []
+        # WITHOUT receiving, and ran a "service turn" instead. That closed the
+        # request chain for the whole armed window, which is exactly why the
+        # flip then needed a presence channel, a quorum spin and two drains to
+        # find out what its peers were doing -- a private protocol invented to
+        # replace the arc the same code had just switched off. With the arc
+        # left running there is nothing to reinvent: PP0 forwards its decision
+        # and the ranks below execute it (#969 §W3, follower semantics).
+        #
+        # In the TP phase `ps.pp_size` is 1 on every rank, so this branch is
+        # taken by all of them: rank 0 buffers its socket and the others fall
+        # through to `recv_reqs = None` and are served by the TP broadcast.
+        if self._phase_flip_armed() and self.ps.pp_rank == 0:
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                return []
+            return None
+
+        if self.ps.pp_rank == 0:
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                recv_reqs = []
+
+                while True:
+                    try:
+                        if self.recv_limit_reached(len(recv_reqs)):
+                            break
+                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
+                    except zmq.ZMQError:
+                        break
+                    recv_reqs.append(recv_req)
+
+                while True:
+                    try:
+                        if self.recv_limit_reached(len(recv_reqs)):
+                            break
+                        recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
+                    except zmq.ZMQError:
+                        break
+                    recv_reqs.append(recv_rpc)
+            else:
+                recv_reqs = None
+        else:
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                dp_offset = (
+                    self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+                )
+                if self.chain_receiver is not None:
+                    # #631: ONE owner of this stream. The receiver drains
+                    # its inbox first, so messages it absorbed while a
+                    # flip was armed are handed over here in arrival
+                    # order before anything new is taken off the wire.
+                    # Routing the blocking path through it as well is
+                    # what keeps a half-received message from being
+                    # misframed by a second, competing irecv.
+                    recv_reqs = self._recv_chain_breaking_closed_rings()
+                else:
+                    src = (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset
+                    if self.on_blocked_recv is not None:
+                        self.on_blocked_recv(
+                            f"request-chain/point_to_point<-{src}", time.monotonic()
+                        )
+                    try:
+                        recv_reqs = point_to_point_pyobj(
+                            [],
+                            self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                            self.world_group.cpu_group,
+                            src,
+                            self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                        )
+                    finally:
+                        # Cleared even when the receive RAISES, so a dead
+                        # peer's "Connection closed by peer" cannot leave a
+                        # stale timestamp that later reads as a wedge.
+                        if self.on_blocked_recv is not None:
+                            self.on_blocked_recv(None, None)
+            else:
+                recv_reqs = None
+        return recv_reqs
+
+    def _stamped_broadcast(self, site: str, *args, **kwargs):
+        """``broadcast_pyobj`` under the #824 W5(b) blocked-recv stamp.
+
+        #1028d COVERAGE, not a new mechanism. The stamp already exists and is
+        already applied around the DIRECT chain receive (:323-340). It was
+        never applied around the broadcasts below, and the omission has a
+        measured cost: on 2026-08-30 PP1 and PP2 sat in ``broadcast_pyobj``
+        from this function for minutes while the group was dead, and the
+        watchdog could not name the site -- the wedge was only locatable with
+        py-spy. That is word for word what the hook's own comment
+        (:89-95) predicts of an unstamped blocking receive: "a blocking PP
+        receive that records nothing, so the watchdog cannot name it -- the
+        same blind spot #821 left on the chain_receiver path".
+
+        Deliberately NOT in this cut: any deadline, timeout or actuator. This
+        only makes the wait NAMEABLE. Turning a named wait into CRASH/STOP is
+        the rank-law half and needs the other side's diagnosis (what rank 0 is
+        doing), which is a separate, reported piece.
+
+        The ``finally`` mirrors the chain-receive site exactly, and for the
+        same reason recorded there: cleared even when the call RAISES, so a
+        dead peer cannot leave a stale timestamp that later reads as a wedge.
+        """
+        global _BCAST_STAMP_LOGGED
+        if self.on_blocked_recv is not None:
+            # MODULE-level one-shot, NOT an attribute: this class is
+            # `@dataclass(kw_only=True, slots=True, frozen=True)` (:49), so
+            # `self.<new attr> = ...` raises inside the frozen __setattr__.
+            # I wrote it as an instance flag first and it killed boot
+            # stamp1028d at request_receiver.py:370 -- the constraint is
+            # declared at the top of this same file. Per-process is also the
+            # correct scope for a "say it once" line.
+            if not _BCAST_STAMP_LOGGED:
+                _BCAST_STAMP_LOGGED = True
+                logger.info(
+                    "#1028d request-broadcast stamping ACTIVE: blocking "
+                    "broadcasts in _broadcast_reqs_across_ranks now record "
+                    "their site for the watchdog (first site: %s). Coverage "
+                    "only -- no deadline is armed by this change.",
+                    site,
+                )
+            self.on_blocked_recv(site, time.monotonic())
+        try:
+            return broadcast_pyobj(*args, **kwargs)
+        finally:
+            if self.on_blocked_recv is not None:
+                self.on_blocked_recv(None, None)
+
+    def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
+        if self.server_args.enable_dp_attention:
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
+            else:
+                work_reqs = None
+                control_reqs = None
+
+            if self.ps.attn_tp_size != 1:
+                work_reqs = self._stamped_broadcast(
+                    "request-broadcast/attn_tp<-work",
+                    work_reqs,
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
+                )
+
+            if self.ps.attn_cp_size != 1:
+                work_reqs = self._stamped_broadcast(
+                    "request-broadcast/attn_cp<-work",
+                    work_reqs,
+                    self.attn_cp_group.rank,
+                    self.attn_cp_cpu_group,
+                    src=self.attn_cp_group.ranks[0],
+                )
+
+            # When dp_attention_local_control_broadcast is enabled, each DP
+            # group leader already receives control messages from the DP
+            # controller, so we broadcast within attn_tp_group + attn_cp_group
+            # instead of the full tp_group.  This avoids an expensive
+            # all-ranks gloo sync.
+            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
+            if _local_ctrl:
+                if self.ps.attn_tp_size != 1:
+                    control_reqs = self._stamped_broadcast(
+                        "request-broadcast/attn_tp<-control",
+                        control_reqs,
+                        self.attn_tp_group.rank,
+                        self.attn_tp_cpu_group,
+                        src=self.attn_tp_group.ranks[0],
+                    )
+                if self.ps.attn_cp_size != 1:
+                    control_reqs = self._stamped_broadcast(
+                        "request-broadcast/attn_cp<-control",
+                        control_reqs,
+                        self.attn_cp_group.rank,
+                        self.attn_cp_cpu_group,
+                        src=self.attn_cp_group.ranks[0],
+                    )
+            elif self.ps.tp_size != 1:
+                control_reqs = self._stamped_broadcast(
+                    "request-broadcast/tp<-control",
+                    control_reqs,
+                    self.tp_group.rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
+                )
+            recv_reqs = work_reqs + control_reqs
+        elif self.ps.tp_size != 1:
+            recv_reqs = self._stamped_broadcast(
+                "request-broadcast/tp<-reqs",
+                recv_reqs,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+        return recv_reqs
+
+    def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
+        if not recv_reqs:
+            return
+
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                req.unwrap_pickle_fields()
+            elif isinstance(
+                req, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+            ):
+                for sub_req in req:
+                    sub_req.unwrap_pickle_fields()
+
+    def _apply_mm_receiver(self, recv_reqs: List) -> List:
+        # Process MM requests under EPD-disaggregation mode
+        if (
+            self.ps.pp_rank == 0
+            and self.server_args.language_only
+            and self.server_args.encoder_transfer_backend
+            in ["zmq_to_scheduler", "mooncake"]
+        ):
+            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            for req, error_msg, error_code in abort_reqs:
+                status_code = (
+                    HTTPStatus.BAD_REQUEST
+                    if error_code == 400
+                    else HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                prepare_abort(req, error_msg, status_code=status_code)
+                self.stream_output([req], req.return_logprob)
+        return recv_reqs
+
+    def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:
+        # Unwrap shared memory features AFTER all broadcasts complete,
+        # so that ShmPointerMMData metadata (not full tensor data) is what
+        # gets serialized during broadcast_pyobj.
+        if recv_reqs:
+            if self.model_config.is_multimodal and has_shm_features(recv_reqs):
+                # The broadcast source returns with its original objects while
+                # peer ranks may still be unpickling ShmPointerMMData
+                # (-> shm_open).  Synchronize the same CPU groups that carried
+                # SHM-backed work requests before materialize() unlinks them.
+                if self.server_args.enable_dp_attention:
+                    if self.ps.attn_tp_size > 1:
+                        barrier(group=self.attn_tp_cpu_group)
+                    if self.ps.attn_cp_size > 1:
+                        barrier(group=self.attn_cp_cpu_group)
+                elif self.ps.tp_size > 1:
+                    barrier(group=self.tp_cpu_group)
+            for req in recv_reqs:
+                unwrap_shm_features(req)
+
+    def _split_work_and_control_reqs(self, recv_reqs: List):
+        work_reqs = [
+            req
+            for req in recv_reqs
+            if isinstance(
+                req,
+                (
+                    TokenizedGenerateReqInput,
+                    TokenizedEmbeddingReqInput,
+                    BatchTokenizedGenerateReqInput,
+                    BatchTokenizedEmbeddingReqInput,
+                ),
+            )
+        ]
+        control_reqs = [
+            req
+            for req in recv_reqs
+            if not isinstance(
+                req,
+                (
+                    TokenizedGenerateReqInput,
+                    TokenizedEmbeddingReqInput,
+                    BatchTokenizedGenerateReqInput,
+                    BatchTokenizedEmbeddingReqInput,
+                ),
+            )
+        ]
+        return work_reqs, control_reqs

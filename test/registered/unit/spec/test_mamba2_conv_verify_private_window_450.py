@@ -82,10 +82,10 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.attention.mamba import mamba as mamba_mod
-from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.attention.mamba import mamba as mamba_mod
+from flliper.srt.layers.attention.mamba.mamba import MambaMixer2
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -512,7 +512,7 @@ class TestBackendOwnsOneBufferForAllLayers(CustomTestCase):
     def test_backend_declares_the_window_and_forward_passes_it(self):
         import inspect
 
-        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        from flliper.srt.layers.attention.hybrid_linear_attn_backend import (
             Mamba2AttnBackend,
         )
 

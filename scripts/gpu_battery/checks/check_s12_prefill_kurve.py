@@ -148,7 +148,7 @@ def check(step_dir: str) -> None:
                 raise CheckFail(
                     f"Grundlinie boot at {entry.get('sessions')} sessions reports "
                     f"barlink groups {[g.get('group') for g in groups]} -- the "
-                    "baseline must not see a single SGLANG_BARLINK* variable"
+                    "baseline must not see a single FLLIPER_BARLINK* variable"
                 )
             continue
         if not groups:

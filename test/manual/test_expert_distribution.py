@@ -5,9 +5,9 @@ from pathlib import Path
 import requests
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -31,7 +31,7 @@ class TestExpertDistribution(CustomTestCase):
     def _execute_core(self, model_path: str, mode: str = "stat", tp_size: int = 1):
         """Test expert distribution record endpoints"""
         with tempfile.TemporaryDirectory() as tmp_dir:
-            envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.set(tmp_dir)
+            envs.FLLIPER_EXPERT_DISTRIBUTION_RECORDER_DIR.set(tmp_dir)
 
             process = popen_launch_server(
                 model_path,

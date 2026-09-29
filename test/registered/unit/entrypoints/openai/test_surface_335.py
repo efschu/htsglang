@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from sglang.srt.entrypoints.openai.errors import (
+from flliper.srt.entrypoints.openai.errors import (
     EXTENSION_KEY,
     LaneUnavailable,
     error_message_of,
@@ -25,8 +25,8 @@ from sglang.srt.entrypoints.openai.errors import (
     openai_error_dict,
     parse_error_body,
 )
-from sglang.srt.entrypoints.openai.protocol import ErrorResponse, UsageInfo
-from sglang.srt.entrypoints.openai.registry_view import (
+from flliper.srt.entrypoints.openai.protocol import ErrorResponse, UsageInfo
+from flliper.srt.entrypoints.openai.registry_view import (
     RegisteredEngine,
     RegistryView,
     _parse,
@@ -34,10 +34,10 @@ from sglang.srt.entrypoints.openai.registry_view import (
     registry_base_url,
     reset_cache,
 )
-from sglang.srt.entrypoints.openai.serving_embedding import encode_embedding
-from sglang.srt.entrypoints.openai.serving_images import _reject_no_lane
-from sglang.srt.entrypoints.openai.transcription_adapters import matched_adapter_key
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.entrypoints.openai.serving_embedding import encode_embedding
+from flliper.srt.entrypoints.openai.serving_images import _reject_no_lane
+from flliper.srt.entrypoints.openai.transcription_adapters import matched_adapter_key
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -115,18 +115,18 @@ class RegistryViewTest(unittest.TestCase):
         reset_cache()
 
     def test_empty_env_disables_the_lookup(self):
-        with patch.dict("os.environ", {"SGLANG_REGISTRY_URL": ""}):
+        with patch.dict("os.environ", {"FLLIPER_REGISTRY_URL": ""}):
             self.assertEqual(registry_base_url(), "")
             view = fetch_registry_view()
         self.assertFalse(view.reachable)
         self.assertEqual(view.engines, ())
 
     def test_bare_host_port_is_normalized(self):
-        with patch.dict("os.environ", {"SGLANG_REGISTRY_URL": "10.0.0.5:9000"}):
+        with patch.dict("os.environ", {"FLLIPER_REGISTRY_URL": "10.0.0.5:9000"}):
             self.assertEqual(registry_base_url(), "http://10.0.0.5:9000")
 
     def test_unreachable_registry_is_an_empty_view_not_an_exception(self):
-        with patch.dict("os.environ", {"SGLANG_REGISTRY_URL": "http://127.0.0.1:1"}):
+        with patch.dict("os.environ", {"FLLIPER_REGISTRY_URL": "http://127.0.0.1:1"}):
             view = fetch_registry_view()
         self.assertFalse(view.reachable)
         self.assertIsNotNone(view.error)

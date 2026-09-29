@@ -1,6 +1,6 @@
 """Unit tests for startup_func_log_and_timer.py — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -10,8 +10,8 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-import sglang.srt.observability.startup_func_log_and_timer as mod
-from sglang.srt.observability.startup_func_log_and_timer import (
+import flliper.srt.observability.startup_func_log_and_timer as mod
+from flliper.srt.observability.startup_func_log_and_timer import (
     enable_startup_timer,
     get_max_duration,
     reset_startup_timers,
@@ -290,7 +290,7 @@ class TestStartupTimerWiringContract(unittest.TestCase):
 
     @staticmethod
     def _srt_path(*parts):
-        # sglang.srt is a namespace package (__file__ is None), so anchor on
+        # flliper.srt is a namespace package (__file__ is None), so anchor on
         # the module under test: .../srt/observability/startup_func_log_and_timer.py
         srt_root = os.path.dirname(os.path.dirname(os.path.abspath(mod.__file__)))
         return os.path.join(srt_root, *parts)

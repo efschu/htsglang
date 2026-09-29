@@ -34,8 +34,8 @@ import sys
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -114,7 +114,7 @@ class TestSummaryLandsOnEveryStopPath(CustomTestCase):
 
 class TestHelperContract(CustomTestCase):
     def test_it_never_raises_on_a_scheduler_without_an_observer(self):
-        from sglang.srt.managers.regime_runtime import close_regime_trace
+        from flliper.srt.managers.regime_runtime import close_regime_trace
 
         class _Bare:
             pass
@@ -124,7 +124,7 @@ class TestHelperContract(CustomTestCase):
     def test_it_never_raises_when_the_observer_throws(self):
         """A teardown helper that can throw turns a clean shutdown into a
         confusing one, and an already-failing one into a lost traceback."""
-        from sglang.srt.managers.regime_runtime import close_regime_trace
+        from flliper.srt.managers.regime_runtime import close_regime_trace
 
         class _Boom:
             def close_trace(self):
@@ -140,7 +140,7 @@ class TestHelperContract(CustomTestCase):
         nothing to flush and must not touch the process's signal disposition."""
         import signal
 
-        from sglang.srt.managers.regime_runtime import (
+        from flliper.srt.managers.regime_runtime import (
             MODE_OBSERVE,
             RegimeObserver,
             install_trace_shutdown_hook,
@@ -160,7 +160,7 @@ class TestSchedulerWiring(CustomTestCase):
     def _src():
         import pathlib
 
-        import sglang.srt.managers.scheduler as mod
+        import flliper.srt.managers.scheduler as mod
 
         return pathlib.Path(mod.__file__).read_text()
 
@@ -185,7 +185,7 @@ class TestSchedulerWiring(CustomTestCase):
         import ast
         import pathlib
 
-        import sglang.srt.managers.regime_runtime as mod
+        import flliper.srt.managers.regime_runtime as mod
 
         tree = ast.parse(pathlib.Path(mod.__file__).read_text())
         fn = next(

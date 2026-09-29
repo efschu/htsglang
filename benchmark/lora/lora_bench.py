@@ -28,15 +28,15 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from sglang.bench_serving import (
+from flliper.bench_serving import (
     RequestFuncInput,
     RequestFuncOutput,
     _create_bench_client_session,
     calculate_metrics,
     get_request,
 )
-from sglang.benchmark.datasets.random import sample_random_requests
-from sglang.benchmark.utils import get_tokenizer, remove_prefix
+from flliper.benchmark.datasets.random import sample_random_requests
+from flliper.benchmark.utils import get_tokenizer, remove_prefix
 
 DEFAULT_BASE_MODEL_PATH = "meta-llama/Llama-2-7b-hf"
 DEFAULT_NUM_LORAS = 4
@@ -142,7 +142,7 @@ async def async_request_openai_completions(
 
 
 ASYNC_REQUEST_FUNCS = {
-    "sglang": async_request_openai_completions,
+    "flliper": async_request_openai_completions,
 }
 
 
@@ -364,7 +364,7 @@ def run_benchmark(args_: argparse.Namespace):
     # Set url
     if args.port is None:
         args.port = {
-            "sglang": 30000,
+            "flliper": 30000,
         }.get(args.backend, 30000)
 
     # api_url = (
@@ -442,7 +442,7 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
-        default="sglang",
+        default="flliper",
         help="Must specify a backend, depending on the LLM Inference Engine.",
     )
     parser.add_argument(

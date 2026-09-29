@@ -51,7 +51,7 @@ to the measured link weights:
 per-rank cold-traffic coefficient, and under `link` it is 1.0 on every rank —
 the symbol decides, not an environment variable. `link-calibrated` is the only
 way to spend measured coefficients, it requires
-`SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS`, and plain `link` REFUSES while that
+`FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS`, and plain `link` REFUSES while that
 variable is set rather than quietly solving something else (#458). Before that
 split, a coefficient export left over from one arm silently turned the next arm
 into the calibrated one with the command line still reading `link`.
@@ -77,7 +77,7 @@ computed is already wrong.
   plan. Its inputs are untouched, so the vector is solved once, from the rig.
 * The RUNTIME holds residency at the pre-link baseline: rank `r` keeps exactly
   `resident_slot_count(base_extent_r, f_r)` slots, sized off the base plan the
-  launcher publishes on `SGLANG_MOE_COMPUTE_BASE_PLAN`.
+  launcher publishes on `FLLIPER_MOE_COMPUTE_BASE_PLAN`.
 * That correction is expressed as a DERIVED per-rank fraction on a channel the
   solve never reads (`resident_fraction_held_at_base_plan`). Nothing feeds
   back; there is no second solve and no fixed-point iteration.
@@ -559,12 +559,12 @@ this arm exists to move.
 
 ## One trap, named
 
-`SGLANG_MOE_HOST_SHARD_RATIO` does double duty: it is the strongest source of
+`FLLIPER_MOE_HOST_SHARD_RATIO` does double duty: it is the strongest source of
 the link weights AND, when equal, the switch that turns cold-expert delegation
 off. The equal arm sets it to `1,1,1` for the second reason. **The slice-3 arms
 must NOT**, because the first reason would hand the solve a uniform link
 profile and turn the treatment into the baseline. They hold byte ownership at
-the baseline by leaving `SGLANG_MOE_COLD_TIER_SHM` unset instead, which is the
+the baseline by leaving `FLLIPER_MOE_COLD_TIER_SHM` unset instead, which is the
 switch that actually governs delegation. The solve logs a WARNING naming this
 variable whenever it resolves to the identity, which is what that mistake looks
 like from the boot log.
@@ -595,7 +595,7 @@ itself judged on a post-boot snapshot and is red at peak** — see the corridor
 section above for the measurement and the repaired reserve. Host DRAM is where the
 mass moves; total pinned bytes are unchanged, but the PER-RANK host pool grows
 on tp0/tp2 and shrinks on tp1, so re-run `preflight.sh` for the `/dev/shm`
-headroom if arm 3 is combined with `SGLANG_MOE_COLD_TIER_SHM=1`. Arm 3 does not
+headroom if arm 3 is combined with `FLLIPER_MOE_COLD_TIER_SHM=1`. Arm 3 does not
 require the shared tier: it moves compute to the bytes rather than bytes to the
 compute, and the two compose but are independent.
 
@@ -641,16 +641,16 @@ from the EQUAL arm's own dump and pass the experimental symbol:
 
 ```
 python3 -c "
-from sglang.srt.layers.moe.expert_compute_placement import (
+from flliper.srt.layers.moe.expert_compute_placement import (
     cold_traffic_coefficients_from_measurement as c)
 print(','.join(f'{x:.4f}' for x in c([B0,B1,B2],[0.485,0.42,0.42],[H0,H1,H2])))"
-ARM=compute-cal SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS=<that> \
+ARM=compute-cal FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS=<that> \
   bash scripts/dev/394_s2_proof/boot_ab.sh      # -> --rank-moe-ratio link-calibrated
 ```
 
 `H0,H1,H2` are the equal arm's per-rank `h2d_bytes` and `B0,B1,B2` the base plan
 THAT arm ran — read both off its own boot log, never assume them. Plain `link`
-refuses while `SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS` is exported, so the two
+refuses while `FLLIPER_MOE_COLD_TRAFFIC_COEFFICIENTS` is exported, so the two
 arms cannot be confused for one another.
 
 ## Status
@@ -693,8 +693,8 @@ All three were confirmed fixed on hardware by the confirmation window's Gates
 
 Hermetically tested: `test/registered/unit/layers/moe/test_expert_compute_placement_439.py`,
 92 tests + 143 subtests, including an execution smoke of the full resolver path
-with the hardware facts injected through `SGLANG_RANK_CARD_UUIDS` +
-`SGLANG_MOE_HOST_SHARD_RATIO`, and eight proven can-fail arms (solve ignores the
+with the hardware facts injected through `FLLIPER_RANK_CARD_UUIDS` +
+`FLLIPER_MOE_HOST_SHARD_RATIO`, and eight proven can-fail arms (solve ignores the
 links; resident mass allowed to float; launcher call removed; worker refusal
 removed; a stale coefficient export silently recalibrating the solve; plus the
 three above). The reserve infeasibility has its own hermetic reproduction in

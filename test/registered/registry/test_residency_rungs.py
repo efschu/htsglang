@@ -19,8 +19,8 @@ Hermetic: pure functions over the state enum, no server, no card.
 
 import unittest
 
-from sglang.srt.registry.ledger import TenantState
-from sglang.srt.registry.rungs import (
+from flliper.srt.registry.ledger import TenantState
+from flliper.srt.registry.rungs import (
     LADDER,
     Rung,
     cross_geometry_label,
@@ -30,8 +30,8 @@ from sglang.srt.registry.rungs import (
     rung_of,
     transition_refusal,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -39,15 +39,15 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class TestRungMapping(CustomTestCase):
     def test_the_four_registry_states_map_onto_the_ladder(self):
         self.assertEqual(rung_of(TenantState.HOT), Rung.HOT)
-        self.assertEqual(rung_of(TenantState.WARM_GPU), Rung.TEIL_HOT)
+        self.assertEqual(rung_of(TenantState.WARM_GPU), Rung.PART_HOT)
         self.assertEqual(rung_of(TenantState.WARM_HOST), Rung.WARM)
         self.assertEqual(rung_of(TenantState.COLD), Rung.COLD)
 
-    def test_warm_gpu_is_the_teil_hot_rung(self):
+    def test_warm_gpu_is_the_part_hot_rung(self):
         # The design's TEIL-HOT is "weights resident, pools reduced" -- the
         # state that still holds device memory without serving.
         ext = rung_extension(TenantState.WARM_GPU)
-        self.assertEqual(ext["rung"], Rung.TEIL_HOT)
+        self.assertEqual(ext["rung"], Rung.PART_HOT)
         self.assertTrue(ext["gpu_resident"])
 
     def test_warm_host_holds_no_device_memory(self):
@@ -91,17 +91,17 @@ class TestTheFifthState(CustomTestCase):
 
 class TestPromoteCostClass(CustomTestCase):
     def test_every_rung_has_a_cost_with_a_basis(self):
-        for rung in (Rung.HOT, Rung.TEIL_HOT, Rung.WARM, Rung.COLD,
+        for rung in (Rung.HOT, Rung.PART_HOT, Rung.WARM, Rung.COLD,
                      Rung.REGISTERED):
             cost = promote_cost_of(rung)
             self.assertTrue(cost.basis, f"{rung} has no stated basis")
             self.assertTrue(cost.seconds)
 
     def test_the_costs_are_the_ladders_measured_record(self):
-        self.assertEqual(promote_cost_of(Rung.TEIL_HOT).seconds, "<1")
+        self.assertEqual(promote_cost_of(Rung.PART_HOT).seconds, "<1")
         self.assertEqual(promote_cost_of(Rung.WARM).seconds, "3-6")
         self.assertEqual(promote_cost_of(Rung.COLD).seconds, "12-20")
-        self.assertIn("#297", promote_cost_of(Rung.TEIL_HOT).basis)
+        self.assertIn("#297", promote_cost_of(Rung.PART_HOT).basis)
         self.assertIn("#89", promote_cost_of(Rung.COLD).basis)
 
     def test_a_class_is_never_marked_measured(self):
@@ -157,7 +157,7 @@ class TestPinContract(CustomTestCase):
         )
 
     def test_pinning_a_resident_engine_is_honoured(self):
-        for rung in (Rung.HOT, Rung.TEIL_HOT):
+        for rung in (Rung.HOT, Rung.PART_HOT):
             self.assertIsNone(
                 pin_refusal_reason(rung=rung, pinned=True, can_fund=False)
             )
@@ -198,12 +198,12 @@ class TestNoMovementAdvertised(CustomTestCase):
 
     def test_every_target_names_the_cut_that_would_implement_it(self):
         self.assertIn("cut 2", transition_refusal(Rung.HOT))
-        self.assertIn("cut 2", transition_refusal(Rung.TEIL_HOT))
+        self.assertIn("cut 2", transition_refusal(Rung.PART_HOT))
         self.assertIn("cut 3", transition_refusal(Rung.WARM))
         self.assertIn("cut 5", transition_refusal(Rung.COLD))
 
     def test_the_refusal_names_the_instrument_for_cut_2(self):
-        msg = transition_refusal(Rung.TEIL_HOT)
+        msg = transition_refusal(Rung.PART_HOT)
         self.assertIn("#330", msg)
         self.assertIn("#309", msg)
 

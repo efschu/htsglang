@@ -22,14 +22,14 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.attention import flash_mla_arch
-from sglang.srt.layers.attention.flash_mla_arch import (
+from flliper.srt.layers.attention import flash_mla_arch
+from flliper.srt.layers.attention.flash_mla_arch import (
     flash_mla_cuda_kernel_supported,
     flash_mla_sparse_fwd_supported,
     resolve_flashmla_fallback_backend,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -133,7 +133,7 @@ class TestFallbackBackendResolution(_CapabilityMixin, CustomTestCase):
     def _with_env(self, value, is_set):
         return mock.patch.object(
             flash_mla_arch.envs,
-            "SGLANG_SM120_FLASHMLA_BACKEND",
+            "FLLIPER_SM120_FLASHMLA_BACKEND",
             SimpleNamespace(get=lambda: value, is_set=lambda: is_set),
         )
 
@@ -171,7 +171,7 @@ class TestFallbackBackendResolution(_CapabilityMixin, CustomTestCase):
             )
 
     def test_resolution_is_per_device_not_per_process(self):
-        """The regression this replaces: `SGLANG_SM120_FLASHMLA_BACKEND` used to
+        """The regression this replaces: `FLLIPER_SM120_FLASHMLA_BACKEND` used to
         be read once into a module global at import, so every rank of a mixed
         group got whichever card imported first."""
         per_device = {0: (12, 0), 1: (8, 6)}
@@ -185,7 +185,7 @@ class TestPortableEntryPointDispatch(CustomTestCase):
     """`flash_mla_with_kvcache_sm120` must consult the resolver per call."""
 
     def _call(self, backend):
-        from sglang.srt.layers.attention import flash_mla_sm120
+        from flliper.srt.layers.attention import flash_mla_sm120
 
         kwargs = dict(
             q=torch.zeros(1, 1, 1, 8, dtype=torch.bfloat16),
@@ -202,7 +202,7 @@ class TestPortableEntryPointDispatch(CustomTestCase):
             return flash_mla_sm120.flash_mla_with_kvcache_sm120(**kwargs)
 
     def test_flashinfer_branch(self):
-        from sglang.srt.layers.attention import flash_mla_sm120
+        from flliper.srt.layers.attention import flash_mla_sm120
 
         sentinel = object()
         with mock.patch.object(
@@ -211,7 +211,7 @@ class TestPortableEntryPointDispatch(CustomTestCase):
             self.assertIs(self._call("flashinfer"), sentinel)
 
     def test_torch_branch(self):
-        from sglang.srt.layers.attention import flash_mla_sm120
+        from flliper.srt.layers.attention import flash_mla_sm120
 
         with mock.patch.object(
             flash_mla_sm120,
@@ -221,7 +221,7 @@ class TestPortableEntryPointDispatch(CustomTestCase):
             self.assertEqual(self._call("torch"), ("out", "lse"))
 
     def test_triton_branch(self):
-        import sglang.srt.layers.attention.flash_mla_sm120_triton as triton_mod
+        import flliper.srt.layers.attention.flash_mla_sm120_triton as triton_mod
 
         with mock.patch.object(
             triton_mod,
@@ -232,7 +232,7 @@ class TestPortableEntryPointDispatch(CustomTestCase):
 
     def test_no_module_level_backend_global_remains(self):
         """The frozen global is the bug; its absence is the fix."""
-        from sglang.srt.layers.attention import flash_mla_sm120
+        from flliper.srt.layers.attention import flash_mla_sm120
 
         self.assertFalse(
             hasattr(flash_mla_sm120, "_sm120_default_backend"),
@@ -250,7 +250,7 @@ class TestBackendImportSmoke(CustomTestCase):
     """
 
     def test_backend_imports_without_cuda(self):
-        import sglang.srt.layers.attention.deepseek_v4_backend as backend
+        import flliper.srt.layers.attention.deepseek_v4_backend as backend
 
         self.assertTrue(hasattr(backend, "DeepseekV4AttnBackend"))
         self.assertIs(
@@ -261,7 +261,7 @@ class TestBackendImportSmoke(CustomTestCase):
         )
 
     def test_dsv4_kv_kernels_import_without_cuda(self):
-        from sglang.srt.layers.attention.dsv4 import (  # noqa: F401
+        from flliper.srt.layers.attention.dsv4 import (  # noqa: F401
             dequant_k_cache,
             index_buf_accessor,
             quant_k_cache,

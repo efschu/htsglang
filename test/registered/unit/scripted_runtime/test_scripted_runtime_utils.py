@@ -5,9 +5,9 @@ import os
 import sys
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scripted_runtime.utils import ensure_script_importable, resolve_fn
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.scripted_runtime.utils import ensure_script_importable, resolve_fn
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -38,7 +38,7 @@ class TestResolveFn(CustomTestCase):
 
     def test_propagates_missing_module_error(self):
         with self.assertRaises(ModuleNotFoundError):
-            resolve_fn("sglang_no_such_module_zzz:foo")
+            resolve_fn("flliper_no_such_module_zzz:foo")
 
     def test_propagates_missing_attribute_error(self):
         with self.assertRaises(AttributeError):

@@ -14,14 +14,14 @@ Measured, boot_798_0822_0629.log. At the TP-stack sizing site all three ranks
 logged ``allow_install=True role='seed' dcp_size=3
 active_vector=[29, 19, 16]`` and no SKIP -- the calibration ran to completion,
 computed the better vector, and still printed "restart with
-SGLANG_UNEVEN_TOKEN_VECTOR=30,17,17". The PINNED-VECTOR warning did not fire,
+FLLIPER_UNEVEN_TOKEN_VECTOR=30,17,17". The PINNED-VECTOR warning did not fire,
 so ``pinned_vector`` was False and ``seed_role`` True, leaving the draft
 conjunct as the only one that could have been False.
 """
 
 from test_uneven_token_vector_role_797 import _run
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # Deliberately unequal, so the capacity-proportional optimum differs from the
 # active vector and an install has something to do.

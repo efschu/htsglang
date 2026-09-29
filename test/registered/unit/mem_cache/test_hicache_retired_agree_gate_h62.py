@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """H62 (NF D rounds, 24.09.): the SECOND HiCache CPU collective of a D round on a
-rank-uniform cadence, behind SGLANG_HICACHE_RETIRED_AGREE_EVERY (default off).
+rank-uniform cadence, behind FLLIPER_HICACHE_RETIRED_AGREE_EVERY (default off).
 
 MEASURED (boot fnFL2x165, D = TP 3, all 72 DECODE-HOST-PERIOD windows):
 allreduce_n = 2 x hicache_calls (128/64 ... 134/67), while hicache_ms ~= drain_ms
 ~= 0.4-0.5 ms and allreduce_ms = 0.9-1.0 ms. One HiCache collective sits inside
 ``check_hicache_events`` (the storage-queue agreement, gated by
-SGLANG_HICACHE_DRAIN_AGREE_EVERY since 0619f1280f) and one OUTSIDE it: the #939
+FLLIPER_HICACHE_DRAIN_AGREE_EVERY since 0619f1280f) and one OUTSIDE it: the #939
 retired-prefetch agreement ``UnifiedRadixCache.drain_retired_prefetch``, called
 once per scheduler iteration from ``Scheduler._drain_prefetch_progress`` (TP
 loop: ``_update_uniform_pool_budget``). The retired list was empty on every rank
@@ -34,14 +34,14 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache import unified_radix_cache as u
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache import unified_radix_cache as u
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
-ENV = "SGLANG_HICACHE_RETIRED_AGREE_EVERY"
+ENV = "FLLIPER_HICACHE_RETIRED_AGREE_EVERY"
 LABEL = "drain_retired_prefetch"
 SPAN = 4
 _TIMEOUT_S = 5.0
@@ -182,7 +182,7 @@ class TheDefaultIsTheUnchangedPath(CustomTestCase):
             self.assertFalse(hasattr(c, "_retired_gate_round"))
 
     def test_every_1_is_the_default(self):
-        with envs.SGLANG_HICACHE_RETIRED_AGREE_EVERY.override("1"):
+        with envs.FLLIPER_HICACHE_RETIRED_AGREE_EVERY.override("1"):
             outcome, logs, _c = _run(_idle, rounds=5)
         self.assertEqual(outcome, ["ok"] * 3)
         self.assertEqual(_entered(logs[0]), [1, 2, 3, 4, 5])
@@ -191,15 +191,15 @@ class TheDefaultIsTheUnchangedPath(CustomTestCase):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for v in ("x", "0", "-3", ""):
-                with envs.SGLANG_HICACHE_RETIRED_AGREE_EVERY.override(v):
+                with envs.FLLIPER_HICACHE_RETIRED_AGREE_EVERY.override(v):
                     self.assertEqual(u._hicache_retired_agree_every(), 1, v)
-        with envs.SGLANG_HICACHE_RETIRED_AGREE_EVERY.override("8"):
+        with envs.FLLIPER_HICACHE_RETIRED_AGREE_EVERY.override("8"):
             self.assertEqual(u._hicache_retired_agree_every(), 8)
 
     def test_a_group_without_a_collective_never_engages_the_gate(self):
         """Group P (TP 1 / PP 3): the agreement reduces over nobody, so the
         cadence never engages there, even with the variable in its env."""
-        with envs.SGLANG_HICACHE_RETIRED_AGREE_EVERY.override("8"):
+        with envs.FLLIPER_HICACHE_RETIRED_AGREE_EVERY.override("8"):
             outcome, logs, caches = _run(_idle, rounds=9, world=1, tp_world_size=1)
         self.assertEqual(outcome, ["ok"])
         self.assertFalse(caches[0]._drain_agreement_is_collective())
@@ -212,7 +212,7 @@ class TheCadenceIsRankUniform(CustomTestCase):
 
     def setUp(self):
         super().setUp()
-        self._override = envs.SGLANG_HICACHE_RETIRED_AGREE_EVERY.override("8")
+        self._override = envs.FLLIPER_HICACHE_RETIRED_AGREE_EVERY.override("8")
         self._override.__enter__()
 
     def tearDown(self):

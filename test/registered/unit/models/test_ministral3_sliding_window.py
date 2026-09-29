@@ -3,7 +3,7 @@
 
 THE DEFECT, as it stood
 ``ministral3.py`` read ``config.sliding_window`` and then executed a bare
-``pass``, under a comment asserting "RadixAttention in sglang handles this
+``pass``, under a comment asserting "RadixAttention in flliper handles this
 mostly via logic in forward/flashinfer". It does not. Three independent gates
 missed at once, and each is checked below so a regression in ANY of them
 fails here:
@@ -27,10 +27,10 @@ against it rather than against a number invented here.
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.configs.model_config import is_hybrid_swa_model
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.configs.model_config import is_hybrid_swa_model
+from flliper.srt.layers.radix_attention import RadixAttention
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -56,7 +56,7 @@ class TestTheGatesThatMissed(CustomTestCase):
         # byte-identical.
         import inspect
 
-        from sglang.srt.models.llama import LlamaAttention
+        from flliper.srt.models.llama import LlamaAttention
 
         params = inspect.signature(LlamaAttention.__init__).parameters
         self.assertIn("sliding_window_size", params)
@@ -64,7 +64,7 @@ class TestTheGatesThatMissed(CustomTestCase):
 
     def test_ministral3_provides_the_runner_hook(self):
         # Gate 2's fix: the hook ModelRunner asks for first.
-        from sglang.srt.models.ministral3 import Ministral3ForCausalLM
+        from flliper.srt.models.ministral3 import Ministral3ForCausalLM
 
         self.assertTrue(
             hasattr(Ministral3ForCausalLM, "get_attention_sliding_window_size")
@@ -73,10 +73,10 @@ class TestTheGatesThatMissed(CustomTestCase):
     def test_the_hook_matches_gemma4s_convention(self):
         # Both report the maximum ATTENDED DISTANCE (window - 1), not the
         # window width. A mismatch here is an off-by-one in the backend.
-        from sglang.srt.models.gemma4_causal import (
+        from flliper.srt.models.gemma4_causal import (
             get_attention_sliding_window_size as gemma4_window,
         )
-        from sglang.srt.models.ministral3 import Ministral3ForCausalLM
+        from flliper.srt.models.ministral3 import Ministral3ForCausalLM
 
         cfg = SimpleNamespace(sliding_window=WINDOW)
         stub = Ministral3ForCausalLM.__new__(Ministral3ForCausalLM)
@@ -88,7 +88,7 @@ class TestTheGatesThatMissed(CustomTestCase):
 
     def test_no_window_in_the_config_reports_none(self):
         # A checkpoint without a window must leave the runner where it was.
-        from sglang.srt.models.ministral3 import Ministral3ForCausalLM
+        from flliper.srt.models.ministral3 import Ministral3ForCausalLM
 
         stub = Ministral3ForCausalLM.__new__(Ministral3ForCausalLM)
         stub.config = SimpleNamespace(sliding_window=None)

@@ -3,7 +3,7 @@
 The translation half of this work (`KVCache.local_slot`) fixed global -> local
 INDEXING. This is the other half: ITERATION. `for i in range(self.start_layer,
 self.end_layer)` is correct only while ownership is an interval. Under
-`SGLANG_PP_LAYER_SET` the span is wider than the ownership -- a stage owning
+`FLLIPER_PP_LAYER_SET` the span is wider than the ownership -- a stage owning
 [35, 39, ..., 63] has start 35 and end 64, so the range yields 29 ids of which
 21 are not owned.
 
@@ -17,7 +17,7 @@ where the loop can reach one. That is corrected here at the source: the loop
 iterates ownership, so a placeholder is still never invoked.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -25,9 +25,9 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.utils.common import PPMissingLayer
-from sglang.srt.utils.common import owned_layer_ids
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.utils.common import PPMissingLayer
+from flliper.srt.utils.common import owned_layer_ids
+from flliper.test.test_utils import CustomTestCase
 
 #: The family plan's second full-attention stage: 8 owned layers spanning 29.
 FA_STAGE = [35, 39, 43, 47, 51, 55, 59, 63]
@@ -126,7 +126,7 @@ class TestTheFamilyModelLoopIteratesOwnership(CustomTestCase):
     def test_qwen3_5_forward_does_not_iterate_the_raw_span(self):
         import inspect
 
-        from sglang.srt.models import qwen3_5
+        from flliper.srt.models import qwen3_5
 
         src = inspect.getsource(qwen3_5)
         self.assertNotIn("range(self.start_layer, self.end_layer)", src)

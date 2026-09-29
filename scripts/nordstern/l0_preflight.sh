@@ -4,7 +4,7 @@
 # window; it should be all-green first.
 #
 # Site-specific values come from the environment (RIG2_HOST, RIG2_KEY,
-# MASTER_ADDR, MODEL_ROOT, RIG2_MODEL_DIR, RIG2_SGLANG_SRC, REPO_ROOT); source
+# MASTER_ADDR, MODEL_ROOT, RIG2_MODEL_DIR, RIG2_FLLIPER_SRC, REPO_ROOT); source
 # your local rig env file first. Unset variables fall back to placeholders so
 # an unsourced run fails loudly instead of probing some other machine.
 set -u
@@ -16,7 +16,7 @@ MASTER=${MASTER:-${MASTER_ADDR:-<MASTER_ADDR>}}
 PORT=${PORT:-31900}
 MODEL_MAIN=${MODEL_MAIN:-${MODEL_ROOT:-<MODEL_ROOT>}/Llama-3.1-8B-Instruct}
 MODEL_SECOND=${MODEL_SECOND:-${RIG2_MODEL_DIR:-<RIG2_MODEL_DIR>}/llama-3.1-8b}
-SECOND_SRC=${RIG2_SGLANG_SRC:-<RIG2_SGLANG_SRC>}
+SECOND_SRC=${RIG2_FLLIPER_SRC:-<RIG2_FLLIPER_SRC>}
 fail=0
 ok(){ echo "  OK   $*"; }; bad(){ echo "  FAIL $*"; fail=1; }
 
@@ -41,9 +41,9 @@ $SSH root@$SECOND "[ -d $MODEL_SECOND ]" 2>/dev/null && ok "second: $MODEL_SECON
   bad "second: $MODEL_SECOND missing -- copy it first (see l0_copy_model.sh)"
 
 echo "== 5. same code on both sides =="
-for f in python/sglang/srt/distributed/utils.py python/sglang/srt/layers/quantization/fp8.py; do
+for f in python/flliper/srt/distributed/utils.py python/flliper/srt/layers/quantization/fp8.py; do
   a=$(md5sum "$REPO_ROOT/$f" 2>/dev/null | cut -d' ' -f1)
-  b=$($SSH root@$SECOND "md5sum $SECOND_SRC/sglang/${f#python/sglang/}" 2>/dev/null | cut -d' ' -f1)
+  b=$($SSH root@$SECOND "md5sum $SECOND_SRC/flliper/${f#python/flliper/}" 2>/dev/null | cut -d' ' -f1)
   [ -n "$a" ] && [ "$a" = "$b" ] && ok "$(basename $f) identical" || bad "$(basename $f) DIFFERS (a=$a b=$b)"
 done
 

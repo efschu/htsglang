@@ -65,7 +65,7 @@ WHAT EACH TEST HOLDS DOWN
 
 import unittest
 
-from sglang.srt.managers.phase_flip_runtime import owned_row_extent
+from flliper.srt.managers.phase_flip_runtime import owned_row_extent
 
 
 class _Req:
@@ -131,7 +131,7 @@ class TestTheCensusExcludesTheStaleCell922(unittest.TestCase):
     """The defect, at the reader that feeds the on_idle ledger."""
 
     def _census(self, req, pool, page_size=1):
-        from sglang.srt.managers import phase_flip_runtime as pfr
+        from flliper.srt.managers import phase_flip_runtime as pfr
 
         class _ReqPool:
             req_to_token = pool

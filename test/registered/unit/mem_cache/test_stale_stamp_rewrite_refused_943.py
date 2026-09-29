@@ -43,13 +43,13 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.cache_controller import PrefetchOperation, StorageOperation
-from sglang.srt.mem_cache.hicache_phase_binding import (
+from flliper.srt.managers.cache_controller import PrefetchOperation, StorageOperation
+from flliper.srt.mem_cache.hicache_phase_binding import (
     current_generation,
     write_back_stamp_is_current,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 # ~1s: constructs a handful of plain Python objects. No pool, no accelerator.
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -64,7 +64,7 @@ def _rewrite_error():
     family already paid for that distinction (#938: "The new reader is resolved
     at CALL time so that red is behavioural rather than an ImportError").
     """
-    from sglang.srt.managers import cache_controller
+    from flliper.srt.managers import cache_controller
 
     err = getattr(cache_controller, "StaleStampRewrite", None)
     if err is None:

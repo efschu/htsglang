@@ -50,7 +50,7 @@ import unittest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.planner.pp_cut import (
+from flliper.srt.planner.pp_cut import (
     LAYER_FAMILY_ATTENTION,
     LAYER_FAMILY_LINEAR,
     PhasePoolModel,
@@ -59,7 +59,7 @@ from sglang.srt.planner.pp_cut import (
     pp_phase_pool,
     stage_pp_capacities,
 )
-from sglang.srt.planner.pp_cut_launch import (
+from flliper.srt.planner.pp_cut_launch import (
     FRONTIER_MAX_POINTS,
     CutCandidate,
     CutDecision,
@@ -67,7 +67,7 @@ from sglang.srt.planner.pp_cut_launch import (
     pareto_frontier,
     solve_launch_cut,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # ---------------------------------------------------------------------------
 # THE POOL AXIS -- boot weg2sb5f's own inputs, the same fixture as
@@ -430,7 +430,7 @@ class TestTheRefusalIsNamedAndCarriesTheFrontier(CustomTestCase):
         with self.assertRaises(PPCutRefused) as ctx:
             solve(pool_floor=ceiling + 5_000_000)
         msg = str(ctx.exception)
-        self.assertIn("W40 Weg2PPCutRefused", msg)
+        self.assertIn("W40 PdFlipPPCutRefused", msg)
         self.assertIn("--pp-solve-pool-floor", msg)
         # It must NOT be answerable by moving --max-kv-per-request: that is a
         # different floor and naming it here would send the operator to the
@@ -639,12 +639,12 @@ class TestTheLauncherSeam(CustomTestCase):
     """
 
     def _parser(self):
-        from sglang.srt.weg2.launcher import build_parser
+        from flliper.srt.pdflip.launcher import build_parser
 
         return build_parser()
 
     def _launcher_source(self):
-        import sglang.srt.weg2.launcher as mod
+        import flliper.srt.pdflip.launcher as mod
 
         with open(mod.__file__, "r", encoding="utf-8") as fh:
             return fh.read()
@@ -699,7 +699,7 @@ class TestTheLauncherSeam(CustomTestCase):
         weights are loaded, which is a spent window -- and a source scan cannot
         see it. ``shipped_line`` is pure for exactly this reason.
         """
-        from sglang.srt.weg2.launcher import (
+        from flliper.srt.pdflip.launcher import (
             incumbent_candidate,
             pick_shipped_cut,
             shipped_line,

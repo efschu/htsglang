@@ -538,8 +538,8 @@ _RUNNER_LABEL_ALT_RE = re.compile(r"linux-(mi\w+?)-gpu-(\d+)")
 def _runner_label_sort_key(label: str) -> tuple:
     """Sort key for natural ordering: GPU type first, then GPU count.
 
-    linux-mi325-1gpu-sglang  -> ('mi325', 1, 'linux-mi325-1gpu-sglang')
-    linux-mi35x-8gpu-sglang  -> ('mi35x', 8, 'linux-mi35x-8gpu-sglang')
+    linux-mi325-1gpu-flliper  -> ('mi325', 1, 'linux-mi325-1gpu-flliper')
+    linux-mi35x-8gpu-flliper  -> ('mi35x', 8, 'linux-mi35x-8gpu-flliper')
     linux-mi35x-gpu-8.fabric -> ('mi35x', 8, 'linux-mi35x-gpu-8.fabric')
     """
     m = _RUNNER_LABEL_RE.search(label)

@@ -6,7 +6,7 @@ import torch
 
 
 def test_draft_extend_input_carries_num_front_tokens_default_zero():
-    from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+    from flliper.srt.speculative.eagle_info import EagleDraftExtendInput
 
     si = EagleDraftExtendInput(
         num_correct_drafts=torch.tensor([1, 0]),
@@ -25,7 +25,7 @@ def test_draft_extend_input_matches_the_upstream_field_set():
     #37500 MTP port reads them: num_front_tokens, select_index, ...)."""
     import dataclasses
 
-    from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+    from flliper.srt.speculative.eagle_info import EagleDraftExtendInput
 
     ours = {f.name for f in dataclasses.fields(EagleDraftExtendInput)}
     upstream = {

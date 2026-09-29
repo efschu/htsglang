@@ -41,7 +41,7 @@ _PY = os.path.join(
 if _PY not in sys.path:
     sys.path.insert(0, _PY)
 
-from sglang.srt.managers.pp_admission_congruence import (  # noqa: E402
+from flliper.srt.managers.pp_admission_congruence import (  # noqa: E402
     LOAD_BACK_EXTENT_ATTR,
     clear_state_aligned_extent_undistributable,
     pp_row_carrier_present,
@@ -176,7 +176,7 @@ def test_gate_lifts_itself_when_a_carrier_exists():
 def test_the_instrument_counts_events_not_visits():
     """DENOMINATOR LAW: a visit that carried no extent is not an event, and
     counting it would make the boot-log occurrence number meaningless."""
-    from sglang.srt.managers import pp_admission_congruence as pac
+    from flliper.srt.managers import pp_admission_congruence as pac
 
     before = pac._1042_LIFECYCLE["undistributable"]
     empty = _Req(RID_FRESH, FRESH_LEN, 0, None)
@@ -194,7 +194,7 @@ def test_state_align_raises_the_extent_to_an_anchor_the_key_match_reaches():
     load-back applies 4095; an extent of 4031 is the #968 OFF-EXTENT stop.
     The extent must be the anchor when the key match reaches it."""
     from types import SimpleNamespace
-    from sglang.srt.managers.pp_admission_congruence import state_aligned_load_back_len
+    from flliper.srt.managers.pp_admission_congruence import state_aligned_load_back_len
     r = SimpleNamespace(rid="ca49dc53", host_hit_length=4031, state_anchor_depth=4095,
                         prefix_indices=None, key_match_depth=4095)
     assert state_aligned_load_back_len(r) == 4095

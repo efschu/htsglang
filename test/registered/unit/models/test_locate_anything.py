@@ -9,15 +9,15 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.configs import LocateAnythingConfig
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.locate_anything import (
+from flliper.srt.configs import LocateAnythingConfig
+from flliper.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from flliper.srt.models.locate_anything import (
     LocateAnythingBoxGrammarLogitProcessor,
     LocateAnythingForConditionalGeneration,
     LocateAnythingMultiModalProjector,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

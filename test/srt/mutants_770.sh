@@ -8,7 +8,7 @@
 set -u
 
 ROOT=/spinning/wt-770-solver
-MOD=$ROOT/python/sglang/srt/managers/funding_authority.py
+MOD=$ROOT/python/flliper/srt/managers/funding_authority.py
 BAK=$(mktemp)
 cp "$MOD" "$BAK"
 trap 'cp "$BAK" "$MOD"; rm -f "$BAK"' EXIT

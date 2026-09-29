@@ -9,20 +9,20 @@ import ray
 import torch
 import torch.distributed as dist
 
-import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
-from sglang.srt.distributed import init_distributed_environment
-from sglang.srt.distributed.communication_op import (  # noqa
+import flliper.srt.distributed.device_communicators.custom_all_reduce_ops as ops
+from flliper.srt.distributed import init_distributed_environment
+from flliper.srt.distributed.communication_op import (  # noqa
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+from flliper.srt.distributed.device_communicators.quick_all_reduce import (
     qr_rocm_arch_available,
 )
-from sglang.srt.distributed.parallel_state import (
+from flliper.srt.distributed.parallel_state import (
     get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 torch.manual_seed(42)
 random.seed(44)  # keep the deterministic seed

@@ -24,7 +24,7 @@ import random
 import re
 import unittest
 
-from sglang.srt.planner.bench_suite import (
+from flliper.srt.planner.bench_suite import (
     CLIFF2_TESTS,
     Capabilities,
     HttpResult,
@@ -47,7 +47,7 @@ from sglang.srt.planner.bench_suite import (
     request_tool_prefill,
     run_suite,
 )
-from sglang.srt.planner.live_metrics import SPEC_EMA_ACCEPT_LEN_METRIC
+from flliper.srt.planner.live_metrics import SPEC_EMA_ACCEPT_LEN_METRIC
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +424,7 @@ class TestVerdicts(unittest.TestCase):
 
     def test_mtp_acceptance_from_pinned_gauge(self):
         metrics = (f"{SPEC_EMA_ACCEPT_LEN_METRIC} 2.85\n"
-                   "sglang:spec_accept_rate 0.71\n")
+                   "flliper:spec_accept_rate 0.71\n")
         http = FakeHttp(lambda b, s: chat_response("1\n2\n3"),
                         metrics_text=metrics)
         r = run_one(7, full_caps(), http)
@@ -437,7 +437,7 @@ class TestVerdicts(unittest.TestCase):
         self.assertEqual(run_one(7, full_caps(), http)["status"], "fail")
         # gauge absent -> skip, not fail
         http = FakeHttp(lambda b, s: chat_response("1"),
-                        metrics_text="sglang:gen_throughput 12\n")
+                        metrics_text="flliper:gen_throughput 12\n")
         self.assertEqual(run_one(7, full_caps(), http)["status"], "skip")
 
     def test_reasoning_heavy_token_gate(self):

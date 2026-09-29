@@ -36,12 +36,12 @@ matched-shape fast path is byte-identical.
 
 import unittest
 
-from sglang.srt.mem_cache.kv_transfer_guard import (
+from flliper.srt.mem_cache.kv_transfer_guard import (
     KvTransferShapeMismatch,
     validate_kv_transfer,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 

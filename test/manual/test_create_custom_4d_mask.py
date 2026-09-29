@@ -77,7 +77,7 @@ def _create_custom_4d_mask_reference(
 # ---------------------------------------------------------------------------
 # New vectorised implementation (copy of the production code for self-contained
 # testing — keep in sync with CustomQwen2ModelInner._create_custom_4d_mask in
-# python/sglang/srt/models/deepseek_ocr.py)
+# python/flliper/srt/models/deepseek_ocr.py)
 # ---------------------------------------------------------------------------
 
 

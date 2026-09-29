@@ -15,11 +15,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.utils.cp_utils import (
+from flliper.srt.layers.utils.cp_utils import (
     ContextParallelMetadata,
     cp_attn_forward_extend,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
 

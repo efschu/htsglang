@@ -38,13 +38,13 @@ MEASUREMENT, not by flag, which is the right gate for a term whose whole
 justification is that it was measured.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PHASE_TP,
     TP_TO_PP,
     PhasePolicyConfig,
@@ -54,7 +54,7 @@ from sglang.srt.managers.phase_policy import (
     effective_flip_threshold,
     observe_idle,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _cfg(**kw):
@@ -146,14 +146,14 @@ class TestTheRestingLayout(CustomTestCase):
     """
 
     def test_default_rest_phase_is_tp(self):
-        from sglang.srt.managers.phase_policy import PHASE_TP, REST_DECODE
+        from flliper.srt.managers.phase_policy import PHASE_TP, REST_DECODE
 
         cfg = PhasePolicyConfig(enabled=True, flip_tokens=7004)
         self.assertEqual(cfg.rest_state, REST_DECODE)
         self.assertEqual(cfg.rest_phase, PHASE_TP)
 
     def test_it_stays_configurable_for_large_prompt_traffic(self):
-        from sglang.srt.managers.phase_policy import PHASE_PP, REST_PREFILL
+        from flliper.srt.managers.phase_policy import PHASE_PP, REST_PREFILL
 
         cfg = PhasePolicyConfig(enabled=True, flip_tokens=7004, rest_state=REST_PREFILL)
         self.assertEqual(cfg.rest_phase, PHASE_PP)

@@ -1,5 +1,5 @@
 """#1424f (rc12p fced72cf5b, P-PP0 15:15:51 node 999 and 15:21:05 node 1109,
-P-Log Z. 150760 / 164056): "WEG2 PUBLISH-SWEEP write_backup raised ...
+P-Log Z. 150760 / 164056): "PDFLIP PUBLISH-SWEEP write_backup raised ...
 RuntimeError: #1424 paged arena load: a page's token rows are not consecutive
 from its first id" -- on the WRITE side, caught by the sweep.
 
@@ -37,8 +37,8 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 P = 4
 SLOTS = 4
@@ -48,7 +48,7 @@ S = 5
 
 @pytest.fixture
 def arena(tmp_path, monkeypatch):
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_QUEUE_REFS", "1")
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_QUEUE_REFS", "1")
     a = ShmArena(str(tmp_path / "arena-kv-race.bin"), SLOT_BYTES, SLOTS)
     yield a
     a.close()
@@ -90,8 +90,8 @@ def _foreign_ref(arena, slot):
 def _refs(arena):
     out = (ctypes.c_int64 * 6)()
     arena._lib.arena_layout(arena.slots, arena.slot_bytes, out)
-    hb, hoff = int(out[0]), int(out[3])
-    u32 = np.frombuffer(arena._mm, dtype=np.uint32, count=arena.slots * hb // 4, offset=hoff)
+    hb, hope = int(out[0]), int(out[3])
+    u32 = np.frombuffer(arena._mm, dtype=np.uint32, count=arena.slots * hb // 4, offset=hope)
     return u32.reshape(arena.slots, hb // 4)[:, 1].astype(np.int64).tolist()
 
 
@@ -167,7 +167,7 @@ def test_a_write_that_raises_gives_its_claim_back(arena):
     and the claimed pages stayed PENDING for good (no ack, no abort; the KV
     arena has no orphan reap). Now the claim goes back (fresh slots freed,
     found references released) and the error still propagates to the sweep."""
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     slot_of = _publish(arena, ["page-a"])
     base = _refs(arena)
@@ -181,7 +181,7 @@ def test_a_write_that_raises_gives_its_claim_back(arena):
     t = object.__new__(UnifiedRadixCache)
     t.cache_controller = types.SimpleNamespace(write=_raise, mem_pool_host=pool, mem_pool_host_draft=None)
     node = types.SimpleNamespace(id=999)
-    helper = getattr(t, "_weg2_write_or_abort", None)
+    helper = getattr(t, "_pdflip_write_or_abort", None)
     assert helper is not None, "the controller write has no abort path"
     with pytest.raises(RuntimeError, match="not consecutive"):
         helper(node, torch.arange(2 * P), [], pre, None)

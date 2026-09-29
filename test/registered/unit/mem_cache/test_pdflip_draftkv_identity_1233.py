@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Weg 2 draft KV across the flip (#1233, spec T12): the drafter identity.
+
+``--speculative-draft-kv-only`` decides whether the drafter PROPOSES, not
+what a draft KV byte MEANS, so it is deliberately absent from the identity
+hash: group P (producer) and group D (proposer) compute the same identity by
+construction (W5).
+
+Since 2026-09-21 the CHAIN GEOMETRY is absent for the same reason (user
+question on adaptive draft length): ``speculative_num_steps`` /
+``speculative_eagle_topk`` / ``speculative_num_draft_tokens`` decide how many
+tokens a round proposes, never what a stored row means, and
+``--speculative-adaptive`` changes them per round.
+"""
+
+import types
+import unittest
+
+from flliper.srt.mem_cache.kv_cache_builder import drafter_identity_hash
+from flliper.test.test_utils import CustomTestCase
+
+
+def _args(**kw):
+    # the live values after the speculative hook resolved NEXTN -> EAGLE
+    base = dict(
+        speculative_algorithm="EAGLE",
+        speculative_draft_model_path=None,
+        speculative_draft_model_revision=None,
+        speculative_num_steps=2,
+        speculative_eagle_topk=1,
+        speculative_num_draft_tokens=3,
+        draft_kv_layout="replicated",
+        speculative_draft_kv_only=False,
+    )
+    base.update(kw)
+    return types.SimpleNamespace(**base)
+
+
+class TestDrafterIdentity(CustomTestCase):
+    def test_t12_identity_ignores_the_producer_flag_and_pins_the_live_value(self):
+        self.assertEqual(drafter_identity_hash(_args()), "b53f8c336da51155")
+        self.assertEqual(
+            drafter_identity_hash(_args(speculative_draft_kv_only=True)),
+            drafter_identity_hash(_args(speculative_draft_kv_only=False)),
+        )
+        self.assertNotEqual(
+            drafter_identity_hash(_args(draft_kv_layout="dcp")), "b53f8c336da51155"
+        )
+        # The chain geometry no longer moves the identity: an adaptive
+        # controller that switches k mid-run must keep reading the pages it
+        # already wrote.
+        self.assertEqual(
+            drafter_identity_hash(_args(speculative_num_steps=5)), "b53f8c336da51155"
+        )
+        self.assertEqual(
+            drafter_identity_hash(_args(speculative_num_draft_tokens=6)), "b53f8c336da51155"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

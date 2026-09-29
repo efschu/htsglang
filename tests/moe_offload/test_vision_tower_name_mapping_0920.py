@@ -4,7 +4,7 @@
 Metal boot xsn406 (20.09. 16:49Z, tree e964a25983) got past the census fix --
 placement ran, no ``W105``, the image request reached the tower -- and then::
 
-    W106 Weg2VisionLoadFailed rid=weg2-8-27 -- VisionStageLoadRefused: the
+    W106 PdFlipVisionLoadFailed rid=pdflip-8-27 -- VisionStageLoadRefused: the
     tower module has 54 unfilled parameter(s) after loading
     (first: ['blocks.0.attn.qkv_proj.weight', 'blocks.0.attn.qkv_proj.bias',
              'blocks.1.attn.qkv_proj.weight'])
@@ -14,7 +14,7 @@ placement ran, no ``W105``, the image request reached the tower -- and then::
 ``qwen3_vl.py:205``) calls the same parameter ``attn.qkv_proj``.
 ``strip_checkpoint_prefix`` stripped the prefix and stopped -- the rename was
 never applied, although ``Qwen3VLForConditionalGeneration`` carries it twice
-(``hf_to_sglang_mapper``, ``qwen3_vl.py:1253``, and its own loader, ``:1649``).
+(``hf_to_flliper_mapper``, ``qwen3_vl.py:1253``, and its own loader, ``:1649``).
 
 WHY THESE TESTS READ THE CHECKPOINT INDEX AND NOT THE MODULE
 ------------------------------------------------------------
@@ -45,7 +45,7 @@ import struct
 
 import pytest
 
-from sglang.srt.planner.vision_stage_load import (
+from flliper.srt.planner.vision_stage_load import (
     TOWER_SUBSTR_RENAMES,
     VisionStageLoadRefused,
     map_tower_param_name,
@@ -188,10 +188,10 @@ class TestTheMapIsSoundAndMatchesUpstream:
         If upstream renames the parameter again, this fails at the desk -- the
         alternative is another 54-unfilled refusal on a booked GPU window.
         """
-        from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+        from flliper.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
         upstream = dict(
-            Qwen3VLForConditionalGeneration.hf_to_sglang_mapper.orig_to_new_substr
+            Qwen3VLForConditionalGeneration.hf_to_flliper_mapper.orig_to_new_substr
         )
         assert upstream == {"attn.qkv": "attn.qkv_proj"}, upstream
         # Ours is the same rename in the idempotent (dotted) spelling.
@@ -203,7 +203,7 @@ class TestTheMapIsSoundAndMatchesUpstream:
         """``qwen3_vl.py:1649`` does the replace literally; pin that source."""
         import inspect
 
-        from sglang.srt.models import qwen3_vl
+        from flliper.srt.models import qwen3_vl
 
         src = inspect.getsource(qwen3_vl)
         assert 'name.replace(r"attn.qkv.", r"attn.qkv_proj.")' in src

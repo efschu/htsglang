@@ -7,7 +7,7 @@ D TP0 (Form-A host) and every P stage hold their arena host pool inside a
 that is not in the arena with ``pool._page_bytes`` -- on the group that fell to
 ``__getattr__`` and raised ``AttributeError: _page_bytes``; #1033d refused the
 whole read (``PREFETCH IO REFUSED``), TP0 delivered 0 of 69888 tokens while the
-workers (bare arena pools) delivered 69568, and weg2-24-93 was re-prefilled in
+workers (bare arena pools) delivered 69568, and pdflip-24-93 was re-prefilled in
 full on P, where PP0 failed the same way.
 
 Real objects: the C arena on a temp file, a bound ArenaMHAHostPool inside a
@@ -25,12 +25,12 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
-from sglang.srt.mem_cache.storage.file import hicache_arena as ha
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+from flliper.srt.mem_cache.storage.file import hicache_arena as ha
+from flliper.test.test_utils import CustomTestCase
 
 PAGE = 64  # 1 layer x 1 head x 16 dims x bf16, K and V
 S = 16     # staging rows
@@ -132,7 +132,7 @@ class L3FillThroughTheGroup(CustomTestCase):
         self.assertIs(group.arena, pool.arena)
 
     def test_a_page_evicted_to_disk_comes_back_through_the_group(self):
-        """rc12z weg2-24-93: before the fix AttributeError: _page_bytes (the
+        """rc12z pdflip-24-93: before the fix AttributeError: _page_bytes (the
         caller's #1033d refused the read, 0 delivered)."""
         backend, arena, pool, group, cc, hashes = self._evicted_pages()
         hi = pool.alloc_read(len(hashes))

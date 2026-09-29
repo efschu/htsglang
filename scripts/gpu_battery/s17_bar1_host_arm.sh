@@ -14,7 +14,7 @@
 # the host: .venv/bin/python3.12 is a symlink to /bin/python3.12 and the host
 # has only 3.11 and 3.13. Nothing is installed on the host to fix that -- the
 # container's own interpreter at <subvol>/usr/bin/python3.12 executes natively
-# on the host kernel and supplies torch 2.11.0+cu130, sglang and sgl_kernel.
+# on the host kernel and supplies torch 2.11.0+cu130, flliper and sgl_kernel.
 # Running it bare is NOT enough though; see the H_SHIM comment below.
 #
 # WHY THE PATHS ARE DOUBLED. The container root is the host's
@@ -105,26 +105,26 @@ export LD_LIBRARY_PATH="$H_SP/nvidia/cu13/lib"
 export PATH="$SUB/usr/local/cuda-12.9/bin:$SUB$VENV/bin:\$PATH"
 export CUDA_HOME="$SUB/usr/local/cuda-12.9"
 export TORCH_EXTENSIONS_DIR="$H_EXTCACHE"
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
-export SGLANG_BARLINK=1
-export SGLANG_BARLINK_TRANSPORT=bar1
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_BARLINK=1
+export FLLIPER_BARLINK_TRANSPORT=bar1
 # Explicit, though it is the default since #369 released the graph gate
 # (2026-08-01, bar1_graph_check.py 10/10). Without capture, a bar1 number is
 # not comparable to #354's graph-mode NCCL baseline.
-export SGLANG_BARLINK_GRAPH_ENABLE=1
-export SGLANG_BARLINK_BAR1_NV_SOURCE="$H_NVSRC"
-# Two communicator groups exist under SGLANG_UNEVEN_DCP (tp and dcp) and they
+export FLLIPER_BARLINK_GRAPH_ENABLE=1
+export FLLIPER_BARLINK_BAR1_NV_SOURCE="$H_NVSRC"
+# Two communicator groups exist under FLLIPER_UNEVEN_DCP (tp and dcp) and they
 # share one aperture. The 3080s have 256 MiB of BAR1 gross; at the 96 MiB
 # default the tp group takes its window first and dcp gets a bare ENOMEM from
 # the holder and silently falls back -- which is exactly the mixed run the
 # gate below exists to catch. 64 + 32 MiB fits both with room for RM's own
 # use, and neither window throttles: the tp group's actual prefill payload is
 # ~20 MiB (chunked_prefill_size 2048 x hidden 5120 x 2 B) and dcp carries less.
-export SGLANG_BARLINK_BAR1_WINDOW_MIB=64
-export SGLANG_BARLINK_BAR1_WINDOW_MIB_DCP=32
-setsid "$H_PY" -m sglang.launch_server \
+export FLLIPER_BARLINK_BAR1_WINDOW_MIB=64
+export FLLIPER_BARLINK_BAR1_WINDOW_MIB_DCP=32
+setsid "$H_PY" -m flliper.launch_server \
   --model-path "$H_MODEL" \
   --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto \
   --rank-auto-reserve-mib "$RESERVE" \

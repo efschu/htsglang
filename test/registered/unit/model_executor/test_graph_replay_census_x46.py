@@ -11,10 +11,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.model_executor.runner import graph_replay_census as grc
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.model_executor.runner import graph_replay_census as grc
+from flliper.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="stage-a-weg2-unit")
+register_cpu_ci(est_time=3, suite="stage-a-pdflip-unit")
 
 
 class _Mode:

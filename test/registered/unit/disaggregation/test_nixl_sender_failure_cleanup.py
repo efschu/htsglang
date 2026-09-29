@@ -2,9 +2,9 @@ import threading
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.nixl.conn import NixlKVSender
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.disaggregation.base.conn import KVPoll
+from flliper.srt.disaggregation.nixl.conn import NixlKVSender
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

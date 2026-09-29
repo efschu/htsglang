@@ -35,7 +35,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers import prefetch_ballot
+from flliper.srt.managers import prefetch_ballot
 
 # THE REAL KEY TYPES, not stand-ins for them. Two of this module's routes cross
 # a package boundary to reach the dict key they index with, and an import that
@@ -44,10 +44,10 @@ from sglang.srt.managers import prefetch_ballot
 # them got from the tree. Driving the real `ComponentType.MAMBA` and
 # `PoolName.MAMBA` is what makes "the route resolves" an assertion instead of
 # an assumption.
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
-from sglang.srt.mem_cache.unified_cache_components import ComponentType
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from flliper.srt.mem_cache.unified_cache_components import ComponentType
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8)
 
@@ -293,7 +293,7 @@ class TheDigestPairIsTheUniformityCheck(unittest.TestCase):
         documents and the one that makes this a group STOP rather than a
         rank-local one.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         agree = pdv.phase_domain_digest(["kv", "mamba"])
         odd = pdv.phase_domain_digest(["kv"])
@@ -339,7 +339,7 @@ class TheDigestPairIsTheUniformityCheck(unittest.TestCase):
         line renders `per_rank=[none] census_width=0`: the failing term's own
         row or none at all, never another term's row under this term's name.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         locals_ = [
             {"loader_covers_own_layers": 1},
@@ -395,7 +395,7 @@ class AnAndSlotStopCarriesTheRanksOwnNumbers(unittest.TestCase):
     def _rebind_votes(self, votes):
         """One local-terms mapping per rank: this rank's slot-15 vote, and the
         same vote written into ITS OWN position of slot 15's census."""
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         mappings = []
         for rank, vote in enumerate(votes):
@@ -425,7 +425,7 @@ class AnAndSlotStopCarriesTheRanksOwnNumbers(unittest.TestCase):
     def test_a_two_of_three_refusal_prints_a_group_max_of_one(self):
         """The MAX is packed as its own slot, so it is a real MAX over the
         ranks and not the minimum wearing a second name."""
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         locals_ = self._rebind_votes([0, 0, 1])
         reduced = _reduce_min([pdv.pack_phase_domain_payload(t) for t in locals_])
@@ -444,7 +444,7 @@ class AnAndSlotStopCarriesTheRanksOwnNumbers(unittest.TestCase):
         """MUST-NOT-FIRE PARTNER. A max that is always 1 would be as useless
         as a max that is always the min: the number has to MOVE with the
         votes, so the unanimous case is driven too."""
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         locals_ = self._rebind_votes([0, 0, 0])
         reduced = _reduce_min([pdv.pack_phase_domain_payload(t) for t in locals_])
@@ -457,7 +457,7 @@ class AnAndSlotStopCarriesTheRanksOwnNumbers(unittest.TestCase):
     def test_the_stop_prints_the_failing_terms_own_per_rank_row(self):
         """`per_rank` is slot 15's census, so it agrees with the `local=`
         values the three ranks print -- [0,0,1], not the loadback row."""
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         locals_ = self._rebind_votes([0, 0, 1])
         reduced = _reduce_min([pdv.pack_phase_domain_payload(t) for t in locals_])
@@ -475,7 +475,7 @@ class AnAndSlotStopCarriesTheRanksOwnNumbers(unittest.TestCase):
         """The loader-coverage slot has no per-rank census on this bus. Its
         STOP line says so instead of printing the loadback census under its
         own name, which is the shape the metal line had."""
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         locals_ = [
             {"loader_covers_own_layers": 1},
@@ -496,7 +496,7 @@ class AnAndSlotStopCarriesTheRanksOwnNumbers(unittest.TestCase):
         """MUST-NOT-FIRE PARTNER for the row above: the term the census
         BELONGS to keeps printing it, so the fix removes a borrowed row rather
         than the mechanism."""
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         locals_ = []
         for rank, vote in enumerate([1, 1, 0]):
@@ -518,7 +518,7 @@ class AnAndSlotStopCarriesTheRanksOwnNumbers(unittest.TestCase):
         """THE PRODUCER, not only the rendering: a census nobody fills renders
         the neutral row on every rank and is indistinguishable from a healthy
         group -- the absence that made the metal line unreadable."""
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         # domain 4 against a counter of 9: this rank's slot-15 vote is 0.
         refusing = pdv.build_phase_domain_payload(
@@ -544,7 +544,7 @@ class AnAndSlotStopCarriesTheRanksOwnNumbers(unittest.TestCase):
         healthy group for as long as the term never refuses, which on this bus
         is the whole of B1 -- the same never-actually-read shape T-46 arm 4
         exists for."""
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         scheduler = _with_group(_StandInGroup(domain=4), tp_rank=1, layers=4)
         setattr(
@@ -609,7 +609,7 @@ class TheWidthIsDerivedAndCheckedBothWays(unittest.TestCase):
     """T-45 -- the WIDTH invariant."""
 
     def test_payload_width_matches_the_derived_constant(self):
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         # DERIVED, never typed: re-derive it here off the declared layout, so
         # this assertion follows a term added to the table instead of pinning
@@ -681,7 +681,7 @@ class TheWidthIsDerivedAndCheckedBothWays(unittest.TestCase):
         the total is derived from them, so a row added to the table moves both
         halves together.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         self.assertEqual(
             pdv.index_of("census_rebind"),
@@ -725,7 +725,7 @@ class TheWidthIsDerivedAndCheckedBothWays(unittest.TestCase):
         """
         import ast
 
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         with open(pdv.__file__) as handle:
             module = ast.parse(handle.read())
@@ -792,7 +792,7 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
     """
 
     def test_a_payload_with_no_producers_raises_nothing(self):
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         # Arms 1-3: three identical stand-in ranks, every term absent.
         payloads = [pdv.build_phase_domain_payload(_bare(r)) for r in range(3)]
@@ -833,7 +833,7 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
         assertion for the whole of B1..B5, because a hard-coded `1` and a real
         read of `1` are indistinguishable while the value never moves.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         group = _StandInGroup(discard_ok=0, backup_width=3)
         scheduler = _with_group(group)
@@ -880,7 +880,7 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
         implementations apart at all -- measured: it passes under read-and-zero
         -- which is why the race is modelled instead of described.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         group = _RacingGroup(arrivals=[2])
         scheduler = _with_group(group)
@@ -908,8 +908,8 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
         `HostPoolGroup.expected_transfer_layer_domain` is S1-C18's and does not
         exist yet. It becomes wrong-answer-bearing at B6.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
-        from sglang.srt.mem_cache import hicache_phase_binding as hpb
+        from flliper.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.mem_cache import hicache_phase_binding as hpb
 
         # The counter's width is 4, so the phase whose row is 4 is GOOD and the
         # phase whose row is 9 is a mismatch. Both rows are non-neutral, so a
@@ -946,7 +946,7 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
         Six DISTINCT values, so a term wired to the wrong slot cannot pass by
         reading its neighbour's count.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         host_pool = _StandInHostPool(geom=6)
         group = _StandInGroup(entry_map={PoolName.MAMBA: _StandInEntry(host_pool)})
@@ -1028,7 +1028,7 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
         death without adding a `raise` statement of its own -- which is what
         the next arm asserts over the module's own source.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         # (b) THE TWO D-68 ATTRIBUTES -- no default, so a group-shaped holder
         # that does not declare them dies naming both facts.
@@ -1162,7 +1162,7 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
         with no failing assertion anywhere else in this file, because every
         other fixture declares its counters on the instance.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         class _ClassCounterPool:
             """S5-C6's declaration form: the counter lives in the class body."""
@@ -1203,7 +1203,7 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         source = inspect.getsource(pdv)
         self.assertNotIn("PHASE-DOMAIN ROUTE STOP", source)
@@ -1237,7 +1237,7 @@ class ThePerRankCensusIsWhatTheStopPrints(unittest.TestCase):
     """
 
     def _rank(self, tp_rank, *, incomplete=False):
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         controller = _StandInController(None)
         if incomplete:
@@ -1277,7 +1277,7 @@ class ThePerRankCensusIsWhatTheStopPrints(unittest.TestCase):
         on both branches: the reduce, the three rendering cases, and the STOP
         field itself.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         def _own_row(rank, vote):
             row = [1] * pdv.PHASE_DOMAIN_CENSUS_SLOTS
@@ -1358,7 +1358,7 @@ class ThePerRankCensusIsWhatTheStopPrints(unittest.TestCase):
         the poisoned pair rides the same payload as the thing a wrong offset
         would read instead.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         payload = pdv.pack_phase_domain_payload(
             {
@@ -1385,7 +1385,7 @@ class ThePerRankCensusIsWhatTheStopPrints(unittest.TestCase):
         which deletes `#1206 LOADBACK COVERAGE INCOMPLETE` and every census
         value with it.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         controller = _StandInController(None)
         setattr(controller, pdv.LOADBACK_INCOMPLETE_ATTR, True)
@@ -1460,7 +1460,7 @@ class TheTwoS7ConsumersAreWrittenAtB1(unittest.TestCase):
         and printing the divergence sentence would send a reader after a
         disagreement that is not there.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         payloads = [
             pdv.pack_phase_domain_payload({"host_ring_discarded": 0} if r == 1 else {})
@@ -1529,7 +1529,7 @@ class TheTwoS7ConsumersAreWrittenAtB1(unittest.TestCase):
         term-by-term and a consumer copied onto the second one is not caught by
         an arm that drives the first.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         for name in ("d_geom", "d_backup_width"):
             for label, counts in (
@@ -1562,7 +1562,7 @@ class TheTwoS7ConsumersAreWrittenAtB1(unittest.TestCase):
         message build that dict by hand, and the two calls at the seam read
         only the census.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         # Six DISTINCT values, so a reader that lands on a neighbouring slot
         # cannot pass by answering the neighbour's count.
@@ -1585,7 +1585,7 @@ class TheBootReduceLayoutIsDeclaredOnceAndDerived(unittest.TestCase):
     """T-53 -- the boot bus's T-45 and T-46 in one."""
 
     def test_the_boot_reduce_layout_is_thirteen_wide_and_neutral_when_unfilled(self):
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         derived = sum(row.width for row in pdv.BOOT_REDUCE_LAYOUT)
         self.assertEqual(pdv.PHASE_BOOT_REDUCE_SLOTS, derived)
@@ -1639,7 +1639,7 @@ class TheBootReduceLayoutIsDeclaredOnceAndDerived(unittest.TestCase):
         DISAGREEMENT must raise on every rank (a disabled predicate makes it
         silent).
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         agree = pdv.phase_domain_digest(["kv", "mamba"])
         odd = pdv.phase_domain_digest(["kv"])
@@ -1677,7 +1677,7 @@ class TheBootReduceLayoutIsDeclaredOnceAndDerived(unittest.TestCase):
         line. The rank that recorded the failure prints its own message; a
         healthy rank says so and points at the peer's log.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import phase_domain_verdict as pdv
 
         failed = {
             "host_pool_build_ok": 0,
@@ -1784,8 +1784,8 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
     """
 
     def test_the_payload_is_built_once_per_reduce_and_not_once_per_pass(self):
-        from sglang.srt.managers import phase_domain_verdict as pdv
-        from sglang.srt.managers import scheduler as scheduler_mod
+        from flliper.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import scheduler as scheduler_mod
 
         reduces = []
         builds = []
@@ -1815,7 +1815,7 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
             # this symbol on every call, and a sibling suite in the same
             # process leaves it permanently replaced: measured, running
             # `test_collective_family_siblings_610.py` first turns
-            # `sglang.srt.distributed.utils.uneven_dcp_active` from the
+            # `flliper.srt.distributed.utils.uneven_dcp_active` from the
             # function into a `lambda *a: True` that outlives the test (its
             # `mock.patch` runs inside `run_ranks`' THREADS, and overlapping
             # patch/restore pairs on one global restore a mock rather than the
@@ -1826,7 +1826,7 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
             # neighbour: it goes RED with an AttributeError on the stand-in's
             # `tree_cache`, and S0 mutants 4 and 6 lose their named killer at
             # exactly the moment the desk gate runs the suites together.
-            "sglang.srt.distributed.utils.uneven_dcp_active",
+            "flliper.srt.distributed.utils.uneven_dcp_active",
             lambda *a, **k: False,
         ), mock.patch.object(
             pdv,
@@ -1877,8 +1877,8 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
         all three denominators, because a STOP that names none is a STOP whose
         reader cannot tell WHICH width was wrong.
         """
-        from sglang.srt.managers import phase_domain_verdict as pdv
-        from sglang.srt.managers import scheduler as scheduler_mod
+        from flliper.srt.managers import phase_domain_verdict as pdv
+        from flliper.srt.managers import scheduler as scheduler_mod
 
         standin = _ReduceCarryingSchedulerStandIn(tp_rank=1, phase="tp_decode")
 
@@ -1889,7 +1889,7 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
         ), mock.patch.object(
             scheduler_mod.uniform_floor_scope, "report_scope", lambda *a, **k: None
         ), mock.patch(
-            "sglang.srt.distributed.utils.uneven_dcp_active",
+            "flliper.srt.distributed.utils.uneven_dcp_active",
             lambda *a, **k: False,
         ), mock.patch.object(
             pdv, "unpack_phase_domain", lambda *a, **k: None

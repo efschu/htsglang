@@ -35,15 +35,15 @@ REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..")
 )
 BARLINK_BAR1_PY = os.path.join(
-    REPO_ROOT, "python", "sglang", "srt", "distributed", "device_communicators",
+    REPO_ROOT, "python", "flliper", "srt", "distributed", "device_communicators",
     "barlink_bar1.py",
 )
 BARLINK_PY = os.path.join(
-    REPO_ROOT, "python", "sglang", "srt", "distributed", "device_communicators",
+    REPO_ROOT, "python", "flliper", "srt", "distributed", "device_communicators",
     "barlink.py",
 )
 PARALLEL_STATE_PY = os.path.join(
-    REPO_ROOT, "python", "sglang", "srt", "distributed", "parallel_state.py"
+    REPO_ROOT, "python", "flliper", "srt", "distributed", "parallel_state.py"
 )
 GRAPH_CHECK_PY = os.path.join(REPO_ROOT, "benchmark", "bar1_graph_check.py")
 
@@ -201,7 +201,7 @@ def bar1_unavailable_class_name() -> str:
 
 
 def render_setup_line(
-    dauer_ms: float = 46,
+    duration_ms: float = 46,
     peer_targets: int = 2,
     region_mib: float = 96.0,
     slots_desc: str = "12 slots (of which 2(R-1) for all_to_all)",
@@ -213,7 +213,7 @@ def render_setup_line(
     """``barlink-BAR1: setup in ...`` -- one BAR1 region actually built."""
     tmpl = _percent_template(_tree(BARLINK_BAR1_PY), MARK_BAR1_SETUP, BARLINK_BAR1_PY)
     return tmpl % (
-        dauer_ms, peer_targets, region_mib, slots_desc, slot_kib, payload_kib,
+        duration_ms, peer_targets, region_mib, slots_desc, slot_kib, payload_kib,
         flags_bytes, export,
     )
 
@@ -291,7 +291,7 @@ def render_graph_check_header(devs: list = None, replays: int = 5) -> str:
     tree = _tree(GRAPH_CHECK_PY)
     # WIEDERGABEN is a module-level constant; read it the same way the
     # header f-string does rather than hardcoding it a second time.
-    wiedergaben = None
+    replay_count = None
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Assign)
@@ -300,13 +300,13 @@ def render_graph_check_header(devs: list = None, replays: int = 5) -> str:
             and node.targets[0].id == "WIEDERGABEN"
             and isinstance(node.value, ast.Constant)
         ):
-            wiedergaben = node.value.value
-    assert wiedergaben is not None, (
+            replay_count = node.value.value
+    assert replay_count is not None, (
         f"{GRAPH_CHECK_PY}: WIEDERGABEN constant not found"
     )
     return _render_fstring(
         tree, MARK_GRAPH_CHECK_HEADER, GRAPH_CHECK_PY,
-        devs=devs, WIEDERGABEN=wiedergaben,
+        devs=devs, WIEDERGABEN=replay_count,
     )
 
 
@@ -325,10 +325,10 @@ def render_graph_check_case_line(
     )
 
 
-def render_graph_check_failed_gates(fehlend: list) -> str:
+def render_graph_check_failed_gates(absent: list) -> str:
     return _render_fstring(
         _tree(GRAPH_CHECK_PY), MARK_GRAPH_CHECK_FAILED_GATES, GRAPH_CHECK_PY,
-        fehlend=fehlend,
+        absent=absent,
     )
 
 

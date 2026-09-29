@@ -25,7 +25,7 @@
 # process (deploy/turnkey/ship_env.capture) and is verified against that
 # capture immediately before exec. This script used to keep its own copy of
 # those keys, and on 2026-08-12 that copy had drifted in seven of them --
-# five dropped, PYTORCH_CUDA_ALLOC_CONF added, and SGLANG_UNEVEN_TOKEN_VECTOR
+# five dropped, PYTORCH_CUDA_ALLOC_CONF added, and FLLIPER_UNEVEN_TOKEN_VECTOR
 # at 28,26,20 where the ship process carried 14,10,8. The instance it booted
 # came up, answered /model_info with 200 and never answered /generate.
 #
@@ -42,7 +42,7 @@
 # script refuses one step earlier, so nobody spends a GPU window on it.
 #
 # NOT SWEPT BY DELETING FLAGS, deliberately. Everything below is shaped by
-# the flip: the SGLANG_PHASE_POLICY_* tunables, the 30,17,17 TP vector, and
+# the flip: the FLLIPER_PHASE_POLICY_* tunables, the 30,17,17 TP vector, and
 # the BAR1 aperture split that exists because the flip builds flip_tp:0 and
 # flip_dcp:0 beside world:0 and pp:0. Stripping five argv lines would leave a
 # recipe that boots something nobody sized. The non-flip recipe of the same
@@ -75,15 +75,15 @@ DRY_RUN="${DRY_RUN:-0}"
 # stale variable in somebody's shell": a governed key that arrives set and is
 # NOT on this list is a stray, and the gate refuses the boot over it.
 OPERATOR_TUNABLE_KEYS=(
-    SGLANG_FLIP_SEAM_CHUNK_MIB
-    SGLANG_UNEVEN_TOKEN_VECTOR
-    SGLANG_BARLINK_BAR1_WINDOW_MIB
-    SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0
-    SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0
-    SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0
-    SGLANG_COLLECTIVE_CENSUS_INTERVAL
-    SGLANG_MAMBA_PIN_TRACE
-    SGLANG_VRAM_FLIGHT_DIR
+    FLLIPER_FLIP_SEAM_CHUNK_MIB
+    FLLIPER_UNEVEN_TOKEN_VECTOR
+    FLLIPER_BARLINK_BAR1_WINDOW_MIB
+    FLLIPER_BARLINK_BAR1_WINDOW_MIB_PP_0
+    FLLIPER_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0
+    FLLIPER_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0
+    FLLIPER_COLLECTIVE_CENSUS_INTERVAL
+    FLLIPER_MAMBA_PIN_TRACE
+    FLLIPER_VRAM_FLIGHT_DIR
 )
 declare -A OPERATOR_SET=()
 for _k in "${OPERATOR_TUNABLE_KEYS[@]}"; do
@@ -159,7 +159,7 @@ HOST="${HOST:-0.0.0.0}"
 # measured distance from the floor under this same load, twice. Note the
 # 5090 still shows ~1800 MiB of headroom -- rank 0 can go up, but raising
 # it alone does not raise max_total_num_tokens while rank 1 is the
-# min-reducing rank (see SGLANG_UNEVEN_TOKEN_VECTOR below).
+# min-reducing rank (see FLLIPER_UNEVEN_TOKEN_VECTOR below).
 #
 # DO NOT raise any entry without re-sampling under the acceptance load,
 # and do not try to buy corridor by LOWERING these: measured on this rig,
@@ -271,7 +271,7 @@ if [ "$DRY_RUN" != 1 ]; then
 
   # Single-instance guard (the 19:44 Bar1Failed was a second boot racing a
   # live instance for the aperture).
-  if pgrep -f "sglang.launch_server.*--port $PORT" >/dev/null 2>&1; then
+  if pgrep -f "flliper.launch_server.*--port $PORT" >/dev/null 2>&1; then
     echo "REFUSE: a serving instance for port $PORT is already running." >&2
     echo "Read /spinning/gpu-arb/holder for the owner; stop it with" >&2
     echo "kill -TERM -- -<pgid> before rebooting." >&2
@@ -326,8 +326,8 @@ override_env LD_LIBRARY_PATH \
 override_env PYTORCH_CUDA_ALLOC_CONF \
   "${OP_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
   "corridor: the 5090 goes from 1400 breaches to 0 under this allocator"
-# SGLANG_MAMBA_SSM_DTYPE, SGLANG_UNEVEN_DCP, SGLANG_UNEVEN_DCP_WEIGHTED and
-# SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK were re-declared here and all four
+# FLLIPER_MAMBA_SSM_DTYPE, FLLIPER_UNEVEN_DCP, FLLIPER_UNEVEN_DCP_WEIGHTED and
+# FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK were re-declared here and all four
 # already match the capture; they now arrive with it. The reasons stay: the
 # boot builder REFUSES without the weighted uneven-DCP pair
 # (phase_flip_boot), and a mixed 5090+3080 group is the CONFIGURATION rather
@@ -353,8 +353,8 @@ override_env PYTORCH_CUDA_ALLOC_CONF \
 # 8 MiB it is ~15285 rows (~230 MiB/rank), the right size against a gate
 # asking a few hundred MiB. Measured on metal 2026-08-11 at exactly that:
 # 2016 / 1440 / 1152 MiB released on the three ranks in one shrink.
-set_tunable SGLANG_FLIP_SEAM_CHUNK_MIB \
-  "${OPERATOR_SET[SGLANG_FLIP_SEAM_CHUNK_MIB]:-8}" \
+set_tunable FLLIPER_FLIP_SEAM_CHUNK_MIB \
+  "${OPERATOR_SET[FLLIPER_FLIP_SEAM_CHUNK_MIB]:-8}" \
   "operator-supplied KV arena commit chunk"
 
 # #631: the phase-flip presence rendezvous tag. Set ONCE here so every
@@ -363,7 +363,7 @@ set_tunable SGLANG_FLIP_SEAM_CHUNK_MIB \
 # because the flags are a rendezvous, unique per boot because a colliding
 # tag let boot 15 read boot 14's leftover markers and open the entry gate
 # on peers that were not there.
-export SGLANG_PHASE_FLIP_INSTANCE="${SGLANG_PHASE_FLIP_INSTANCE:-$(date +%s)-$$}"
+export FLLIPER_PHASE_FLIP_INSTANCE="${FLLIPER_PHASE_FLIP_INSTANCE:-$(date +%s)-$$}"
 
 # #631 phase policy tuning. Exported only when set, so an unset knob keeps
 # the module default rather than exporting an empty string that the
@@ -371,17 +371,17 @@ export SGLANG_PHASE_FLIP_INSTANCE="${SGLANG_PHASE_FLIP_INSTANCE:-$(date +%s)-$$}
 # The three the capture already carries go through set_tunable: an unchanged
 # default is not a divergence, a changed one is announced. The other four are
 # absent from the capture, so setting them at all is a declared addition.
-[ -n "$PHASE_POLICY_MIN_DWELL_S" ] && set_tunable SGLANG_PHASE_POLICY_MIN_DWELL_S \
+[ -n "$PHASE_POLICY_MIN_DWELL_S" ] && set_tunable FLLIPER_PHASE_POLICY_MIN_DWELL_S \
     "$PHASE_POLICY_MIN_DWELL_S" "PHASE_POLICY_MIN_DWELL_S was set for this boot"
-[ -n "$PHASE_POLICY_PP_WINDOW_S" ] && set_tunable SGLANG_PHASE_POLICY_PP_WINDOW_S \
+[ -n "$PHASE_POLICY_PP_WINDOW_S" ] && set_tunable FLLIPER_PHASE_POLICY_PP_WINDOW_S \
     "$PHASE_POLICY_PP_WINDOW_S" "PHASE_POLICY_PP_WINDOW_S was set for this boot"
-[ -n "$PHASE_POLICY_TP_DECODE_FLOOR_S" ] && set_tunable SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S \
+[ -n "$PHASE_POLICY_TP_DECODE_FLOOR_S" ] && set_tunable FLLIPER_PHASE_POLICY_TP_DECODE_FLOOR_S \
     "$PHASE_POLICY_TP_DECODE_FLOOR_S" "PHASE_POLICY_TP_DECODE_FLOOR_S was set for this boot"
-[ -n "$PHASE_POLICY_TP_TOK_S" ] && override_env SGLANG_PHASE_POLICY_TP_TOK_S \
+[ -n "$PHASE_POLICY_TP_TOK_S" ] && override_env FLLIPER_PHASE_POLICY_TP_TOK_S \
     "$PHASE_POLICY_TP_TOK_S" "measured TP-phase prefill threshold, not captured"
-[ -n "$PHASE_POLICY_FLIP_TOKENS" ] && override_env SGLANG_PHASE_POLICY_FLIP_TOKENS \
+[ -n "$PHASE_POLICY_FLIP_TOKENS" ] && override_env FLLIPER_PHASE_POLICY_FLIP_TOKENS \
     "$PHASE_POLICY_FLIP_TOKENS" "explicit flip threshold, not captured"
-[ -n "$PHASE_POLICY_IDLE_DWELL_S" ] && override_env SGLANG_PHASE_POLICY_IDLE_DWELL_S \
+[ -n "$PHASE_POLICY_IDLE_DWELL_S" ] && override_env FLLIPER_PHASE_POLICY_IDLE_DWELL_S \
     "$PHASE_POLICY_IDLE_DWELL_S" "idle dwell was set for this boot, not captured"
 [ -n "$PHASE_IDLE_STATE" ] && override_env HTSGLANG_PHASE_IDLE_STATE \
     "$PHASE_IDLE_STATE" "idle resting layout was set for this boot, not captured"
@@ -409,18 +409,18 @@ export SGLANG_PHASE_FLIP_INSTANCE="${SGLANG_PHASE_FLIP_INSTANCE:-$(date +%s)-$$}
 # 14,10,8. The vector is the uneven-DCP KV token OWNERSHIP split, so it is
 # coupled to the layout the argv asks for; a value invented next to the flag
 # it must agree with is exactly how the two came apart. An operator who has
-# measured a different split sets SGLANG_UNEVEN_TOKEN_VECTOR in the
+# measured a different split sets FLLIPER_UNEVEN_TOKEN_VECTOR in the
 # environment and gets it announced as an override.
-if [ -n "${OPERATOR_SET[SGLANG_UNEVEN_TOKEN_VECTOR]+set}" ]; then
-  override_env SGLANG_UNEVEN_TOKEN_VECTOR \
-    "${OPERATOR_SET[SGLANG_UNEVEN_TOKEN_VECTOR]}" \
+if [ -n "${OPERATOR_SET[FLLIPER_UNEVEN_TOKEN_VECTOR]+set}" ]; then
+  override_env FLLIPER_UNEVEN_TOKEN_VECTOR \
+    "${OPERATOR_SET[FLLIPER_UNEVEN_TOKEN_VECTOR]}" \
     "operator-supplied KV token split (must match the layout in argv)"
 fi
 
 # --- transport ---------------------------------------------------------------
 # barlink is the standing default transport: defects are fixed forward,
 # never worked around by falling back to NCCL. Note that the #631
-# acceptance boots ran with SGLANG_BARLINK UNSET, i.e. on NCCL -- the
+# acceptance boots ran with FLLIPER_BARLINK UNSET, i.e. on NCCL -- the
 # barlink build-window lines in those logs come from build_window_enabled()
 # which defaults True independently of the transport, so they do not
 # evidence barlink. Production therefore runs a transport the acceptance
@@ -430,12 +430,12 @@ fi
 BARLINK="${BARLINK:-1}"
 if [ "$BARLINK" = "1" ]; then
   if [ "$DRY_RUN" != 1 ] && [ ! -e /dev/dmabuf_holder ]; then
-    echo "REFUSE: SGLANG_BARLINK_TRANSPORT=bar1 requested but" >&2
+    echo "REFUSE: FLLIPER_BARLINK_TRANSPORT=bar1 requested but" >&2
     echo "/dev/dmabuf_holder is missing. Run /root/smallbar_reload.sh on the" >&2
     echo "Proxmox host (never silent-degrade to the device sub-transport)." >&2
     exit 1
   fi
-  # SGLANG_BARLINK, SGLANG_BARLINK_TRANSPORT and the #603b cap cycles all
+  # FLLIPER_BARLINK, FLLIPER_BARLINK_TRANSPORT and the #603b cap cycles all
   # arrive from the capture, which carries 1 / bar1 / 300000000000.
 
   # --- BAR1 aperture budget (REQUIRED with --enable-phase-flip) ------------
@@ -474,37 +474,37 @@ if [ "$BARLINK" = "1" ]; then
   # a group, this budget must be recomputed, not widened by reflex.
   # The capture carries 24 / 96 / 48 / 32, i.e. the budget above. Only an
   # operator value differing from it becomes a declared override.
-  set_tunable SGLANG_BARLINK_BAR1_WINDOW_MIB \
-    "${OPERATOR_SET[SGLANG_BARLINK_BAR1_WINDOW_MIB]:-24}" \
+  set_tunable FLLIPER_BARLINK_BAR1_WINDOW_MIB \
+    "${OPERATOR_SET[FLLIPER_BARLINK_BAR1_WINDOW_MIB]:-24}" \
     "operator-supplied world:0 aperture window"
-  set_tunable SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0 \
-    "${OPERATOR_SET[SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0]:-96}" \
+  set_tunable FLLIPER_BARLINK_BAR1_WINDOW_MIB_PP_0 \
+    "${OPERATOR_SET[FLLIPER_BARLINK_BAR1_WINDOW_MIB_PP_0]:-96}" \
     "operator-supplied pp:0 aperture window"
-  set_tunable SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0 \
-    "${OPERATOR_SET[SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0]:-48}" \
+  set_tunable FLLIPER_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0 \
+    "${OPERATOR_SET[FLLIPER_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0]:-48}" \
     "operator-supplied flip_tp:0 aperture window"
-  set_tunable SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0 \
-    "${OPERATOR_SET[SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0]:-32}" \
+  set_tunable FLLIPER_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0 \
+    "${OPERATOR_SET[FLLIPER_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0]:-32}" \
     "operator-supplied flip_dcp:0 aperture window"
 else
-  override_env SGLANG_BARLINK 0 "BARLINK=0: NCCL transport for this boot"
-  drop_env SGLANG_BARLINK_TRANSPORT "BARLINK=0: no bar1 sub-transport"
+  override_env FLLIPER_BARLINK 0 "BARLINK=0: NCCL transport for this boot"
+  drop_env FLLIPER_BARLINK_TRANSPORT "BARLINK=0: no bar1 sub-transport"
   echo "NOTE: barlink DISABLED for this boot (NCCL transport), BARLINK=0." >&2
 fi
 
 # Census cadence back to the near-free default (the cadence-1 diagnostic
 # window is closed, #650).
-set_tunable SGLANG_COLLECTIVE_CENSUS_INTERVAL \
-  "${OPERATOR_SET[SGLANG_COLLECTIVE_CENSUS_INTERVAL]:-50}" \
+set_tunable FLLIPER_COLLECTIVE_CENSUS_INTERVAL \
+  "${OPERATOR_SET[FLLIPER_COLLECTIVE_CENSUS_INTERVAL]:-50}" \
   "operator-supplied collective census cadence"
 # #581 standing falsifier: ack_write must stay ~0 in idle.
-set_tunable SGLANG_MAMBA_PIN_TRACE \
-  "${OPERATOR_SET[SGLANG_MAMBA_PIN_TRACE]:-50}" \
+set_tunable FLLIPER_MAMBA_PIN_TRACE \
+  "${OPERATOR_SET[FLLIPER_MAMBA_PIN_TRACE]:-50}" \
   "operator-supplied mamba pin trace cadence"
 # #605 VRAM flight-recorder marks are permanently armed (budgets computed,
 # not guessed).
-set_tunable SGLANG_VRAM_FLIGHT_DIR \
-  "${OPERATOR_SET[SGLANG_VRAM_FLIGHT_DIR]:-/spinning/flight_605}" \
+set_tunable FLLIPER_VRAM_FLIGHT_DIR \
+  "${OPERATOR_SET[FLLIPER_VRAM_FLIGHT_DIR]:-/spinning/flight_605}" \
   "operator-supplied VRAM flight-recorder directory"
 
 # --- resolve cards by NAME -> UUID, 5090 FIRST -------------------------------
@@ -540,7 +540,7 @@ BOOT_COMMIT="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 BOOT_BRANCH="$(git -C "$WT" branch --show-current 2>/dev/null || echo detached)"
 BOOT_DIRTY="$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
 # Per-boot provenance key: measured from the tree that is about to boot.
-export SGLANG_BOOT_COMMIT="$BOOT_COMMIT"
+export FLLIPER_BOOT_COMMIT="$BOOT_COMMIT"
 # Per-boot device identity, exported rather than prefixed onto the launch so
 # the gate below sees the environment the server will actually get.
 export CUDA_VISIBLE_DEVICES="$BIG_UUID,${SMALL_UUID[0]},${SMALL_UUID[1]}"
@@ -549,7 +549,7 @@ export CUDA_VISIBLE_DEVICES="$BIG_UUID,${SMALL_UUID[0]},${SMALL_UUID[1]}"
   printf 'tree=%s commit=%s branch=%s dirty_files=%s\n' \
          "$WT" "$BOOT_COMMIT" "$BOOT_BRANCH" "$BOOT_DIRTY"
   printf 'barlink=%s transport=%s rank_mib=%s ctx=%s max_running=%s\n' \
-         "$BARLINK" "${SGLANG_BARLINK_TRANSPORT:-nccl}" "$RANK_MIB" "$CTX" "$MAX_RUNNING"
+         "$BARLINK" "${FLLIPER_BARLINK_TRANSPORT:-nccl}" "$RANK_MIB" "$CTX" "$MAX_RUNNING"
   printf 'cuda:0=5090=%s\ncuda:1=3080a=%s\ncuda:2=3080b=%s\n' \
          "$BIG_UUID" "${SMALL_UUID[0]}" "${SMALL_UUID[1]}"
 } >> "$LOG"
@@ -558,7 +558,7 @@ cd "$WT"
 # Built as an array rather than an inline command line so the same tokens can
 # be PRINTED (DRY_RUN) and launched. The `# ...` command substitutions expand
 # to nothing and word-split away exactly as they did on the command line.
-ARGV=( "$PY" -m sglang.launch_server \
+ARGV=( "$PY" -m flliper.launch_server \
     --model-path "$MODEL" --trust-remote-code \
     --served-model-name Qwen3.6-27B \
     --tp-size 1 --pp-size 3 \
@@ -636,7 +636,7 @@ fi
 
 if [ "$DRY_RUN" = 1 ]; then
     echo "=== DRY RUN ENV ==="
-    env | grep -E '^(SGLANG_|HTSGLANG_|PYTORCH_|PYTHONPATH=|LD_LIBRARY_PATH=|CUDA_VISIBLE_DEVICES=)' \
+    env | grep -E '^(FLLIPER_|HTSGLANG_|PYTORCH_|PYTHONPATH=|LD_LIBRARY_PATH=|CUDA_VISIBLE_DEVICES=)' \
         | sort || true
     echo "=== DRY RUN ARGV ==="
     printf '%s\n' "${ARGV[@]}"

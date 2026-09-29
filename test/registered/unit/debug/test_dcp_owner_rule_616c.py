@@ -21,7 +21,7 @@ explicit hand-computed expected values -- no CUDA, no collectives.
 import pytest
 import torch
 
-from sglang.srt.layers.dcp.owner import (
+from flliper.srt.layers.dcp.owner import (
     dcp_weighted_owned_lengths,
     dcp_weighted_read_slots,
 )

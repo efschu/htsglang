@@ -35,17 +35,17 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     get_tp_partition_ratios,
     set_tp_partition_ratios,
 )
-from sglang.srt.layers.attention.triton_backend import (
+from flliper.srt.layers.attention.triton_backend import (
     TritonAttnBackend,
     _plan_aware_dcp_group_q_head_counts,
 )
-from sglang.srt.layers.dcp import cp_local_head_bounds
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.dcp import cp_local_head_bounds
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -124,7 +124,7 @@ class TestTritonDcpHeadGather(CustomTestCase):
     def setUp(self):
         self._saved = get_tp_partition_ratios()
         self._patch = mock.patch(
-            "sglang.srt.layers.attention.triton_backend.get_parallel",
+            "flliper.srt.layers.attention.triton_backend.get_parallel",
             return_value=_Parallel(),
         )
         self._patch.start()

@@ -5,12 +5,12 @@ launch) vs the unfused path (GemmaRMSNorm(q) + GemmaRMSNorm(k) + rotary_emb,
 
 import torch
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.minimax_qknorm_rope import (
+from flliper.jit_kernel.benchmark import marker
+from flliper.jit_kernel.minimax_qknorm_rope import (
     minimax_qknorm_rope,
     minimax_qknorm_rope_grouped,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

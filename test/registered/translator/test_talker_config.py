@@ -21,7 +21,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.srt.translator.talker_config import (
+from flliper.srt.translator.talker_config import (
     CHECKPOINT_INTERLEAVED_KEY,
     FACTORY_INTERLEAVED_KEY,
     MRopeMappingError,

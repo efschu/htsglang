@@ -69,7 +69,7 @@ import pytest
 
 
 def _req_class():
-    from sglang.srt.managers.schedule_batch import Req
+    from flliper.srt.managers.schedule_batch import Req
 
     return Req
 
@@ -198,12 +198,12 @@ class TestTheContractCoversTheWholeTuple:
         return found
 
     def _schedule_batch_path(self):
-        from sglang.srt.managers import schedule_batch
+        from flliper.srt.managers import schedule_batch
 
         return pathlib.Path(schedule_batch.__file__)
 
     def _schedule_policy_path(self):
-        from sglang.srt.managers import schedule_policy
+        from flliper.srt.managers import schedule_policy
 
         return pathlib.Path(schedule_policy.__file__)
 

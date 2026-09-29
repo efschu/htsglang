@@ -2,16 +2,16 @@ import unittest
 
 import torch
 
-from sglang.srt.distributed import init_distributed_environment
-from sglang.srt.distributed.parallel_state import (
+from flliper.srt.distributed import init_distributed_environment
+from flliper.srt.distributed.parallel_state import (
     get_tp_group,
     initialize_model_parallel,
 )
-from sglang.srt.layers.dp_attention import set_dp_buffer_len
-from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
-from sglang.srt.layers.moe.utils import initialize_moe_config
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.dp_attention import set_dp_buffer_len
+from flliper.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+from flliper.srt.layers.moe.utils import initialize_moe_config
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestFlashinferDispatcher(CustomTestCase):
@@ -90,7 +90,7 @@ class TestFlashinferDispatcher(CustomTestCase):
             (num_tokens, router_topk), dtype=torch.float32, device="cuda"
         )
 
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        from flliper.srt.layers.moe.topk import StandardTopKOutput
 
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None
@@ -189,7 +189,7 @@ class TestFlashinferDispatcher(CustomTestCase):
                 (num_tokens, router_topk), dtype=torch.float32, device="cuda"
             )
 
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        from flliper.srt.layers.moe.topk import StandardTopKOutput
 
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None
@@ -282,7 +282,7 @@ class TestFlashinferDispatcher(CustomTestCase):
             (num_tokens, router_topk), dtype=torch.float32, device="cuda"
         )
 
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        from flliper.srt.layers.moe.topk import StandardTopKOutput
 
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None

@@ -21,9 +21,9 @@ import unittest
 
 import torch
 
-from sglang.srt.models.zaya import mod_blend, mod_premask_experts
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.models.zaya import mod_blend, mod_premask_experts
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

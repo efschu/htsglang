@@ -1,16 +1,16 @@
 import unittest
 
-from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
+from flliper.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
 )
-from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
-from sglang.test.ascend.e2e.test_npu_performance_utils import (
+from flliper.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
+from flliper.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
     GLM_5_1_W4A8_MODEL_PATH,
     TestNpuPerfMultiNodePdSepTestCaseBase,
 )
-from sglang.test.ci.ci_register import register_npu_ci
+from flliper.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
@@ -20,11 +20,11 @@ register_npu_ci(
 )
 
 GLM_5_1_PD_SEP_PREFILL_ENVS = {
-    "SGLANG_SET_CPU_AFFINITY": "1",
+    "FLLIPER_SET_CPU_AFFINITY": "1",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
-    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1200",
-    "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1200",
+    "FLLIPER_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1200",
+    "FLLIPER_DISAGGREGATION_WAITING_TIMEOUT": "1200",
     "HCCL_BUFFSIZE": "1200",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "72",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "1024",
@@ -37,16 +37,16 @@ GLM_5_1_PD_SEP_PREFILL_ENVS = {
 }
 
 GLM_5_1_PD_SEP_DECODE_ENVS = {
-    "SGLANG_SET_CPU_AFFINITY": "1",
+    "FLLIPER_SET_CPU_AFFINITY": "1",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
-    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1200",
-    "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1200",
-    "SGLANG_SPEC_ENABLE_OVERLAP_REFLOW": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
+    "FLLIPER_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1200",
+    "FLLIPER_DISAGGREGATION_WAITING_TIMEOUT": "1200",
+    "FLLIPER_SPEC_ENABLE_OVERLAP_REFLOW": "1",
+    "FLLIPER_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "FLLIPER_ENABLE_SPEC_V2": "1",
     "HCCL_BUFFSIZE": "200",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "16",
+    "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "16",
     "TASK_QUEUE_ENABLE": "0",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,

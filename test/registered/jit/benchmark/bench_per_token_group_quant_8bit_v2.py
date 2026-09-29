@@ -1,18 +1,18 @@
 import torch
 from sgl_kernel import sgl_per_token_group_quant_8bit
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import create_random
-from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
+from flliper.jit_kernel.benchmark import marker
+from flliper.jit_kernel.benchmark.utils import create_random
+from flliper.jit_kernel.per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
+from flliper.srt.layers.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,
     fp8_min,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

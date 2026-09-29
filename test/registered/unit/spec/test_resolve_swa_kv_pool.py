@@ -3,13 +3,13 @@
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
-from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from flliper.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from flliper.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from flliper.srt.mem_cache.swa_memory_pool import SWAKVPool
+from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-large-amd")

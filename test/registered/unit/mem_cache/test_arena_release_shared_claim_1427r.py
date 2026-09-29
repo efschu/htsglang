@@ -10,7 +10,7 @@ joined owners, their merge came back 3 -- ``#1427 ARENA-COMPLETE LOST ...
 (recycled under the writer)``, 75 lines on TP1/TP2 of the z30n D log, the
 same slots on both, never on TP0 -- and a page the owners had ALREADY
 completed was freed without a line. The D decode tail the park wrote never
-became readable (store_hit stopped at P's hand-off, weg2-36-56 77184 of
+became readable (store_hit stopped at P's hand-off, pdflip-36-56 77184 of
 77568) and the wake re-computed 3.7-6.8k tokens per request.
 
 Hermetic: the real C arena (one mapping per rank would share the same
@@ -23,8 +23,8 @@ import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.pool_host import arena_pool  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache.pool_host import arena_pool  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 SLOT = 4096
 HALF = SLOT // 2

@@ -2,9 +2,9 @@ import unittest
 
 import openai
 
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.srt.utils.hf_transformers_utils import get_tokenizer
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,

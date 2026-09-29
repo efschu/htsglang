@@ -51,7 +51,7 @@ WHAT EACH TEST HOLDS DOWN
 
 import unittest
 
-from sglang.srt.mem_cache.kv_row_ownership import (
+from flliper.srt.mem_cache.kv_row_ownership import (
     CANDIDATE_ABSENT,
     CANDIDATE_COVERS,
     CANDIDATE_DISJOINT,
@@ -150,14 +150,14 @@ class TestTheCensusPrintsTheCandidate919(unittest.TestCase):
     artefact. A pure verdict function nobody calls answers nothing."""
 
     def _runtime(self, sched):
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         rt = object.__new__(PhaseFlipRuntime)
         rt._census_scheduler = sched
         return rt
 
     def _unowned(self, rows=4096, sample=_RERUN_SAMPLE):
-        from sglang.srt.mem_cache.kv_row_ownership import (
+        from flliper.srt.mem_cache.kv_row_ownership import (
             EXCLUSIVITY_UNOWNED,
             Law,
             Violation,
@@ -174,7 +174,7 @@ class TestTheCensusPrintsTheCandidate919(unittest.TestCase):
     def test_a_synthetic_census_prints_the_covers_line(self):
         rt = self._runtime(_Sched(draft_size=4096))
         with self.assertLogs(
-            "sglang.srt.managers.phase_flip_runtime", level="WARNING"
+            "flliper.srt.managers.phase_flip_runtime", level="WARNING"
         ) as cm:
             rt._note_unenumerated_owner([self._unowned()])
         blob = "\n".join(cm.output)
@@ -186,7 +186,7 @@ class TestTheCensusPrintsTheCandidate919(unittest.TestCase):
         """The answer that keeps the reset_tree hunt alive."""
         rt = self._runtime(_Sched(draft_size=None))
         with self.assertLogs(
-            "sglang.srt.managers.phase_flip_runtime", level="WARNING"
+            "flliper.srt.managers.phase_flip_runtime", level="WARNING"
         ) as cm:
             rt._note_unenumerated_owner([self._unowned()])
         self.assertIn(CANDIDATE_ABSENT, "\n".join(cm.output))
@@ -195,7 +195,7 @@ class TestTheCensusPrintsTheCandidate919(unittest.TestCase):
         """MUTANT GUARD on reach: the probe is about the UNOWNED shape only.
         #916 showed the doubled shape is a different question with a different
         (already amended) answer."""
-        from sglang.srt.mem_cache.kv_row_ownership import (
+        from flliper.srt.mem_cache.kv_row_ownership import (
             EXCLUSIVITY_DOUBLED,
             Law,
             Violation,
@@ -210,7 +210,7 @@ class TestTheCensusPrintsTheCandidate919(unittest.TestCase):
         )
         rt = self._runtime(_Sched(draft_size=4096))
         with self.assertNoLogs(
-            "sglang.srt.managers.phase_flip_runtime", level="WARNING"
+            "flliper.srt.managers.phase_flip_runtime", level="WARNING"
         ):
             rt._note_unenumerated_owner([doubled])
 

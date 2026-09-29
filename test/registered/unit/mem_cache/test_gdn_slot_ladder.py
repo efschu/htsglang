@@ -21,14 +21,14 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.gdn_slot_ladder import (
+from flliper.srt.mem_cache.gdn_slot_ladder import (
     cap_is_binding,
     effective_state_slots,
     freed_state_bytes,
     vacate_plan,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -152,7 +152,7 @@ class TestStateBlobRoundTrip(CustomTestCase):
         the state container is assembled directly and the REAL methods are
         bound to it -- the methods are what this test is about.
         """
-        from sglang.srt.mem_cache.memory_pool import MambaPool
+        from flliper.srt.mem_cache.memory_pool import MambaPool
 
         g = torch.Generator().manual_seed(1234)
         conv = [
@@ -258,13 +258,13 @@ class TestDefaultPathUnchanged(CustomTestCase):
     def test_server_arg_defaults_to_unset(self):
         # Read the dataclass field rather than constructing ServerArgs: a
         # full construction resolves a device and cannot run CPU-only.
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         field = ServerArgs.__dataclass_fields__["gdn_resident_state_slots"]
         self.assertIsNone(field.default)
 
     def test_a_zero_cap_is_rejected_at_argument_time(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         args = ServerArgs.__new__(ServerArgs)
         args.gdn_resident_state_slots = 0

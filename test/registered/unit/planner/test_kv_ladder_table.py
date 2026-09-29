@@ -8,7 +8,7 @@ labelling wherever the profile does not carry an input.
 
 import unittest
 
-from sglang.srt.model_executor.kv_pressure_ladder import (
+from flliper.srt.model_executor.kv_pressure_ladder import (
     HANDOVER_BACKGROUND_MIGRATE,
     HANDOVER_NONE,
     HANDOVER_SPILL_RELOAD,
@@ -21,7 +21,7 @@ from sglang.srt.model_executor.kv_pressure_ladder import (
     KvPressureLadder,
     KvPressureSensor,
 )
-from sglang.srt.planner.kv_ladder_table import (
+from flliper.srt.planner.kv_ladder_table import (
     MIB,
     CardSpec,
     ExternalRungSpec,
@@ -32,7 +32,7 @@ from sglang.srt.planner.kv_ladder_table import (
     check_geometry_family,
     solver_capacity_tokens,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -348,7 +348,7 @@ class TestBuildLadderTable(unittest.TestCase):
                 horizon_rounds=1,
             ),
         )
-        from sglang.srt.model_executor.kv_pressure_ladder import (
+        from flliper.srt.model_executor.kv_pressure_ladder import (
             PHASE_FLIP,
             OccupancySample,
         )

@@ -8,13 +8,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_SRT = _REPO_ROOT / "python" / "sglang" / "srt"
+_SRT = _REPO_ROOT / "python" / "flliper" / "srt"
 
 
 def _args(**kw) -> ServerArgs:
@@ -113,7 +113,7 @@ class TestPoolDimensioning(unittest.TestCase):
 
     @staticmethod
     def _resolve(sa, token_capacity=100_000, dp_size=1):
-        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+        from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
             ModelRunnerKVCacheMixin,
         )
 
@@ -214,11 +214,11 @@ class TestSchedulerWiring(unittest.TestCase):
         self.assertIn('ret["admission_limiter"]', self.src)
 
     def test_load_snapshot_reports_the_effective_limit(self):
-        from sglang.srt.managers.admission_limiter import (
+        from flliper.srt.managers.admission_limiter import (
             AdmissionLimiter,
             admission_limiter_scope,
         )
-        from sglang.srt.managers.scheduler_components.load_inquirer import (
+        from flliper.srt.managers.scheduler_components.load_inquirer import (
             SchedulerLoadInquirer,
         )
 

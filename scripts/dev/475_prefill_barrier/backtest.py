@@ -54,7 +54,7 @@ ARMS = (
 
 
 def build(model_path):
-    from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+    from flliper.srt.uneven_perf import PerfCostModel, PlanInputs
 
     pi = PlanInputs(
         tp_size=3, model_path=model_path, kv_cache_dtype="fp8_e4m3",

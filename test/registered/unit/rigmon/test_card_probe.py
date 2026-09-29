@@ -14,10 +14,10 @@ import tempfile
 import time
 import unittest
 
-from sglang.srt.rigmon import card_probe as cp
-from sglang.srt.rigmon.probe import MEASURED
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.rigmon import card_probe as cp
+from flliper.srt.rigmon.probe import MEASURED
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -423,7 +423,7 @@ class TestRunOrchestration(CustomTestCase):
         self.assertEqual(seen[-1], (4, 4, "done"))
 
     def test_budget_estimate_covers_this_rig(self):
-        from sglang.srt.rigmon.probe import estimate_budget
+        from flliper.srt.rigmon.probe import estimate_budget
 
         b = estimate_budget(3)
         self.assertLessEqual(b.estimate_s, cp.DEFAULT_MAX_AGE_S)

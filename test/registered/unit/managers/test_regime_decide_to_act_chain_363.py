@@ -36,7 +36,7 @@ instead of a named refusal -- #363 goes back to the state #578 found, and the
 next reader would have to re-derive all of this to notice.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -44,8 +44,8 @@ import inspect
 import types
 import unittest
 
-from sglang.srt.managers import regime_act, regime_runtime
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers import regime_act, regime_runtime
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestTheDeciderReachesTheActuator(CustomTestCase):

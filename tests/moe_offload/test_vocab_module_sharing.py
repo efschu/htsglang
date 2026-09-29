@@ -5,7 +5,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 from types import SimpleNamespace
 
-from sglang.srt.speculative.eagle_worker_v2 import target_shares_vocab_modules
+from flliper.srt.speculative.eagle_worker_v2 import target_shares_vocab_modules
 
 
 def test_dense_target_hands_over_tensors():

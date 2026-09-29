@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from flliper.srt.layers.rotary_embedding import MRotaryEmbedding
 
 
 # -----------------------------

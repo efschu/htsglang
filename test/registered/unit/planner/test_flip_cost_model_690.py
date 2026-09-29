@@ -24,7 +24,7 @@ Hermetic: pure arithmetic, no CUDA, no server.
 """
 
 import pytest
-from sglang.srt.planner.flip_cost_model import (
+from flliper.srt.planner.flip_cost_model import (
     FlipComponents,
     FlipCostError,
     Lever,

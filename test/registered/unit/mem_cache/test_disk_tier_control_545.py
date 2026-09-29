@@ -4,7 +4,7 @@ Hermetic: pure accounting over injected collaborators, no filesystem, no CUDA.
 """
 
 import pytest
-from sglang.srt.mem_cache.disk_tier_control import (
+from flliper.srt.mem_cache.disk_tier_control import (
     DetachRefused,
     DiskTierController,
     DiskTierError,

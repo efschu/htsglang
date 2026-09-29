@@ -134,16 +134,16 @@ import pathlib
 import types
 import unittest
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.schedule_batch import ScheduleBatch
+from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 MIXIN = (
     pathlib.Path(__file__).resolve().parents[4]
     / "python"
-    / "sglang"
+    / "flliper"
     / "srt"
     / "managers"
     / "scheduler_pp_mixin.py"
@@ -1205,7 +1205,7 @@ class LapBOutcomeIsAClearedSlotRecord(_OutcomeFixture):
     never-true wrapper leaves character-identical. Measured 2026-09-04 on a
     full scratch copy of this tree (``/tmp/weg1_mut``; golden
     ``scheduler_pp_mixin.py`` md5 ``33901a5d10fc251d0f3708716eb6fb24``, mutant
-    verified applied by unified diff before the run, ``sglang.__file__``
+    verified applied by unified diff before the run, ``flliper.__file__``
     checked to resolve inside the scratch tree): wrapping that write in ``if
     getattr(self, '_lapb_enabled', False):`` -- behaviourally identical to
     DELETING it, which gives 3 failures -- left the whole suite at

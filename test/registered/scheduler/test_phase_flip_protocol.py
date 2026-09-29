@@ -28,20 +28,20 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.distributed import parallel_state
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.distributed.utils import set_cp_token_ratios
-from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
-from sglang.srt.layers.dcp.reshard_plan import KvReshardError
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.distributed import parallel_state
+from flliper.srt.distributed.parallel_state_wrapper import ParallelState
+from flliper.srt.distributed.utils import set_cp_token_ratios
+from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP
+from flliper.srt.layers.dcp.reshard_plan import KvReshardError
+from flliper.srt.managers.phase_flip_runtime import (
     PHASE_PP,
     build_gdn_flip_guard,
     build_production_flip_cutover,
     derive_pp_full_attn_layer_map,
 )
-from sglang.srt.runtime_context import get_context, get_server_args
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.runtime_context import get_context, get_server_args
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -54,17 +54,17 @@ MAP_625 = ((0, 1, 2, 3, 4, 5, 6, 7), (8, 9, 10, 11), (12, 13, 14, 15))
 
 class TestLayerMapDerivation(CustomTestCase):
     def setUp(self):
-        self._saved_env = os.environ.pop("SGLANG_PP_LAYER_PARTITION", None)
+        self._saved_env = os.environ.pop("FLLIPER_PP_LAYER_PARTITION", None)
 
     def tearDown(self):
-        os.environ.pop("SGLANG_PP_LAYER_PARTITION", None)
+        os.environ.pop("FLLIPER_PP_LAYER_PARTITION", None)
         if self._saved_env is not None:
-            os.environ["SGLANG_PP_LAYER_PARTITION"] = self._saved_env
+            os.environ["FLLIPER_PP_LAYER_PARTITION"] = self._saved_env
 
     def test_recipe_split_gives_8_4_4(self):
         """The measured #625 recipe (32/16/16 layers) owns 8/4/4 of the 16
         full-attention ordinals -- the design section 2 numbers."""
-        os.environ["SGLANG_PP_LAYER_PARTITION"] = "32,16,16"
+        os.environ["FLLIPER_PP_LAYER_PARTITION"] = "32,16,16"
         layer_map = derive_pp_full_attn_layer_map(FULL_IDS, N_HIDDEN, 3)
         self.assertEqual(layer_map, MAP_625)
 
@@ -83,7 +83,7 @@ class TestLayerMapDerivation(CustomTestCase):
             derive_pp_full_attn_layer_map([3, 7, 64], N_HIDDEN, 3)
 
     def test_can_fail_bad_partition_env_refused(self):
-        os.environ["SGLANG_PP_LAYER_PARTITION"] = "32,16,15"  # sums to 63
+        os.environ["FLLIPER_PP_LAYER_PARTITION"] = "32,16,15"  # sums to 63
         with self.assertRaises(ValueError):
             derive_pp_full_attn_layer_map(FULL_IDS, N_HIDDEN, 3)
 
@@ -131,7 +131,7 @@ class _StubScheduler:
             tp_worker=SimpleNamespace(name=f"tp_worker[{rank}]"),
             vector=VEC,
             # The KV token vector. Equal to the weight vector unless
-            # SGLANG_UNEVEN_TOKEN_VECTOR overrides it; the cutover's owner
+            # FLLIPER_UNEVEN_TOKEN_VECTOR overrides it; the cutover's owner
             # rule and the transition plan both read THIS one.
             token_vector=VEC,
             refill=lambda direction: self.log.append(("refill", direction)),
@@ -140,12 +140,12 @@ class _StubScheduler:
         )
         # Speculation is a TP-decode-phase capability; the boot (PP) state
         # is the same one an instance without speculation has.
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.spec_algorithm = SpeculativeAlgorithm.from_string(None)
         self.flip_spec_algorithm = SpeculativeAlgorithm.from_string(None)
         self.draft_worker = None
-        from sglang.srt.managers.phase_flip_runtime import AbortDeferralWindow
+        from flliper.srt.managers.phase_flip_runtime import AbortDeferralWindow
 
         self.phase_flip_abort_window = AbortDeferralWindow()
         self.phase_flip_active_stack = PHASE_PP
@@ -302,7 +302,7 @@ class TestSpeculationIsTpDecodePhaseOnly(CustomTestCase):
         set_cp_token_ratios(None)
 
     def _armed_stub(self):
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
         sched = _StubScheduler(0)
         # "NEXTN" is a CLI alias the arg hook resolves before the enum

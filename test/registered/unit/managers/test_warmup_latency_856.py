@@ -16,20 +16,20 @@ nothing was compared, "has not flipped" must not fold into "has flipped and
 settled", and the summary must say plainly when it has nothing to say.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers.warmup_latency import (
+from flliper.srt.managers.warmup_latency import (
     BANDS,
     NO_FLIP,
     STEADY,
     WarmupLatencyLedger,
     band_for,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestTheBandsPartitionCleanly(CustomTestCase):

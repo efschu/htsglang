@@ -4,7 +4,7 @@ THE CRASH THIS CLOSES, measured on metal 2026-08-23 06:07:06 (boot
 boot_816_core_0823_0601, rank PP0, which took the whole instance with it --
 PP1 and PP2 died seconds later of gloo "Connection closed by peer")::
 
-    File "python/sglang/srt/mem_cache/unified_radix_cache.py", line 1204,
+    File "python/flliper/srt/mem_cache/unified_radix_cache.py", line 1204,
       in cache_unfinished_req
     assert req.cache_protected_len <= len(new_indices) + self.page_size - 1
     AssertionError: req.cache_protected_len=16384, len(new_indices)=8192,
@@ -60,14 +60,14 @@ the decision lives in ``mamba_ckpt_utils.py`` as pure integer arithmetic and
 both call it, exactly as #747 did for the grid rules.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.mem_cache.mamba_ckpt_utils import retention_shrinks_protected
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.mamba_ckpt_utils import retention_shrinks_protected
+from flliper.test.test_utils import CustomTestCase
 
 #: The pair measured on metal, 2026-08-23 06:07:06.
 PROTECTED = 16384

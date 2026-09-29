@@ -3,7 +3,7 @@
 
 ``gguf-split`` puts the KV block in the first part and the tensors in the later
 ones -- for a large export the first part holds ZERO tensors. Every reader in
-sglang's GGUF path used to open exactly the one file it was handed, so pointing
+flliper's GGUF path used to open exactly the one file it was handed, so pointing
 ``--model-path`` at part 1 produced a correctly-shaped model with nothing loaded
 into it, and pointing it at a later part produced "unknown architecture".
 
@@ -34,13 +34,13 @@ from typing import List, Optional
 import gguf
 import numpy as np
 
-from sglang.srt.model_loader.gguf_shards import (
+from flliper.srt.model_loader.gguf_shards import (
     gguf_metadata_path,
     gguf_tensor_names,
     iter_gguf_tensors,
     resolve_gguf_shard_paths,
 )
-from sglang.srt.model_loader.weight_utils import (
+from flliper.srt.model_loader.weight_utils import (
     get_gguf_extra_tensor_names,
     gguf_quant_weights_iterator,
 )
@@ -106,7 +106,7 @@ class _ShardSetFixture(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
         # The resolver caches by abspath and tempdir names are unique per test,
         # but clearing keeps a long test session's cache from growing.
-        from sglang.srt.model_loader import gguf_shards
+        from flliper.srt.model_loader import gguf_shards
 
         gguf_shards._RESOLVED_CACHE.clear()
 
@@ -163,12 +163,12 @@ class TestShardSetRefusals(_ShardSetFixture):
         # Rebuild part 4 with no tensors at all, keeping its split.* KV intact
         # is not possible through the writer, so drop a tensor instead and
         # verify the declared total is what the iterator compares against.
-        from sglang.srt.model_loader.gguf_shards import declared_tensor_count
+        from flliper.srt.model_loader.gguf_shards import declared_tensor_count
 
         self.assertEqual(declared_tensor_count(self.parts[0]), len(TENSOR_NAMES))
 
         name_map = {name: name for name in TENSOR_NAMES}
-        import sglang.srt.model_loader.gguf_shards as shards_mod
+        import flliper.srt.model_loader.gguf_shards as shards_mod
 
         real_resolve = shards_mod.resolve_gguf_shard_paths
         try:
@@ -229,7 +229,7 @@ class TestAdapterAuditOverTheUnion(_ShardSetFixture):
         num_hidden_layers = 5
 
     def _adapter(self, path: str):
-        from sglang.srt.model_loader.gguf_deepseek4 import Deepseek4GGUFAdapter
+        from flliper.srt.model_loader.gguf_deepseek4 import Deepseek4GGUFAdapter
 
         return Deepseek4GGUFAdapter(self._Cfg(), path)
 
@@ -264,7 +264,7 @@ class TestSiblingConfigReconciliationAcrossShards(_ShardSetFixture):
             self.vocab_size = vocab_size
 
     def test_vocab_mismatch_is_detected_from_a_later_part(self):
-        from sglang.srt.model_loader.gguf_registry import reconcile_sibling_config
+        from flliper.srt.model_loader.gguf_registry import reconcile_sibling_config
 
         config = self._TextCfg(vocab_size=999)
         with self.assertRaises(ValueError) as ctx:
@@ -274,7 +274,7 @@ class TestSiblingConfigReconciliationAcrossShards(_ShardSetFixture):
         self.assertIn("999", message)
 
     def test_matching_vocab_passes(self):
-        from sglang.srt.model_loader.gguf_registry import reconcile_sibling_config
+        from flliper.srt.model_loader.gguf_registry import reconcile_sibling_config
 
         config = self._TextCfg(vocab_size=32)
         reconcile_sibling_config(config, self.parts[0], ARCH)

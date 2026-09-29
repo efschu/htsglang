@@ -33,17 +33,17 @@ sized by the heuristic before and is refused now. That refusal is the ledger
 working as designed; it is still a behaviour change that a boot must validate.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import inspect
 import unittest
 
-from sglang.srt.mem_ledger.contract import enforce_boot_contract
-from sglang.srt.mem_ledger.terms import CardVramLedger, LedgerOvercommit
-from sglang.srt.server_args import ServerArgs
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_ledger.contract import enforce_boot_contract
+from flliper.srt.mem_ledger.terms import CardVramLedger, LedgerOvercommit
+from flliper.srt.server_args import ServerArgs
+from flliper.test.test_utils import CustomTestCase
 
 
 def _args(**kw):
@@ -167,7 +167,7 @@ class TestTheInheritedTransientAnnouncesItself(CustomTestCase):
     that cannot match a live fingerprint (#612); what was missing was a log."""
 
     def test_the_fallback_warns_once_per_process(self):
-        from sglang.srt.mem_ledger import engine
+        from flliper.srt.mem_ledger import engine
 
         engine._LoadTransientFallback.announced = False
         self.assertFalse(engine._LoadTransientFallback.announced)
@@ -176,7 +176,7 @@ class TestTheInheritedTransientAnnouncesItself(CustomTestCase):
         """Deliberately a class attribute: a module-level latch is what made
         test_ledger_pool_wiring_590 order-dependent, and the module-state
         ratchet forbids new ones."""
-        from sglang.srt.mem_ledger import engine
+        from flliper.srt.mem_ledger import engine
 
         self.assertTrue(hasattr(engine._LoadTransientFallback, "announced"))
         self.assertNotIn("global _load_transient", inspect.getsource(engine))
@@ -191,7 +191,7 @@ class TestTheGraphCoefficientIsACitationNotABudget(CustomTestCase):
     """
 
     def test_it_is_never_added_to_a_ledger_term(self):
-        from sglang.srt.mem_ledger import engine
+        from flliper.srt.mem_ledger import engine
 
         src = inspect.getsource(engine)
         # The only arithmetic use is the illustrative "~est MiB here" figure
@@ -199,13 +199,13 @@ class TestTheGraphCoefficientIsACitationNotABudget(CustomTestCase):
         self.assertIn("does NOT fall back to", src)
 
     def test_the_uncalibrated_graph_term_refuses(self):
-        from sglang.srt.mem_ledger import engine
+        from flliper.srt.mem_ledger import engine
 
         src = inspect.getsource(engine)
         self.assertIn("REFUSAL, not the token estimate", src)
 
     def test_the_constant_still_quotes_the_stock_value(self):
-        from sglang.srt.mem_ledger.engine import GRAPH_MIB_PER_CAPTURED_TOKEN
+        from flliper.srt.mem_ledger.engine import GRAPH_MIB_PER_CAPTURED_TOKEN
 
         self.assertEqual(
             GRAPH_MIB_PER_CAPTURED_TOKEN,

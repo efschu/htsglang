@@ -14,13 +14,13 @@ own. These tests separate the two.
 
 import torch
 
-from sglang.srt.managers.arena_tail_probe import (
+from flliper.srt.managers.arena_tail_probe import (
     arena_tail_bytes,
     grade_derivation,
     plan_meta_layout,
     storage_alias_relation,
 )
-from sglang.srt.model_executor.weights_arena import plan_arena_layout
+from flliper.srt.model_executor.weights_arena import plan_arena_layout
 
 
 def _independent(device):

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Install protoc and a Rust toolchain (rustup/cargo). Required by setuptools-rust
 # to build the bundled native gRPC extension (rust/sglang-grpc) when installing
-# the main `sglang` wheel from source. Idempotent — both helpers no-op if
+# the main `flliper` wheel from source. Idempotent — both helpers no-op if
 # already installed.
 #
 # protoc installs system-wide (/usr/local) and apt deps, so it needs root.

@@ -2,7 +2,7 @@
 """
 Compute dynamic partitions for diffusion CI tests.
 
-This script runs on lightweight CI runners without sglang dependencies and uses
+This script runs on lightweight CI runners without flliper dependencies and uses
 AST parsing to extract parametrized cases plus standalone files from source.
 """
 
@@ -25,7 +25,7 @@ from diffusion_case_parser import (
 
 def _load_partitioning_helpers():
     repo_root = Path(__file__).resolve().parents[4]
-    helper_path = repo_root / "python/sglang/multimodal_gen/test/partitioning.py"
+    helper_path = repo_root / "python/flliper/multimodal_gen/test/partitioning.py"
     spec = importlib.util.spec_from_file_location(
         "diffusion_test_partitioning", helper_path
     )
@@ -270,7 +270,7 @@ def main():
         if USE_NPU_CONFIGS:
             case_config_path = (
                 repo_root
-                / "python/sglang/multimodal_gen/test/server/ascend/testcase_configs_npu.py"
+                / "python/flliper/multimodal_gen/test/server/ascend/testcase_configs_npu.py"
             )
         else:
             case_config_path = resolve_case_config_path(repo_root, run_suite_path)

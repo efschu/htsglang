@@ -1,12 +1,12 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.kits.spec_decoding_kit import SpecDecodingMixin
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
     try_cached_model,
@@ -19,8 +19,8 @@ DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 DSV4_FLASH_ENV = {
-    "SGLANG_DSV4_FP4_EXPERTS": "0",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+    "FLLIPER_DSV4_FP4_EXPERTS": "0",
+    "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
 }
 
 _EAGLE_SPEC_ARGS = [

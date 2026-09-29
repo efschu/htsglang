@@ -13,7 +13,7 @@ These tests drive the reserve rule directly. No server, no GPU, no scheduler.
 
 import unittest
 
-from sglang.srt.managers.fast_lane_reserve import (
+from flliper.srt.managers.fast_lane_reserve import (
     PROV_ABSENT,
     PROV_CHUNK,
     PROV_DECLARED,
@@ -174,7 +174,7 @@ class TestTheCombinedInvariantWith552(unittest.TestCase):
     def test_552_never_promotes_a_heavy_request_above_the_fast_tier(self):
         import inspect
 
-        from sglang.srt.managers import schedule_policy
+        from flliper.srt.managers import schedule_policy
 
         # Whitespace-normalised: the docstring wraps this sentence across two
         # lines (schedule_policy.py:398-399), and a contiguous-string pin fails
@@ -204,7 +204,7 @@ class TestTheCombinedInvariantWith552(unittest.TestCase):
         knows nothing about the pool."""
         import inspect
 
-        from sglang.srt.managers import fast_lane_reserve
+        from flliper.srt.managers import fast_lane_reserve
 
         src = inspect.getsource(fast_lane_reserve)
         for ordering_word in ("sort(", "wait_queue_entry_time", "priority_sign"):

@@ -34,8 +34,8 @@ import json
 import logging
 import unittest
 
-from sglang.srt.distributed.utils import derive_pp_layer_split
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.distributed.utils import derive_pp_layer_split
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -76,7 +76,7 @@ class TheDecouplingExists(unittest.TestCase):
 
 class TheSubstitutionIsAnnounced(unittest.TestCase):
     def _warn(self, scores, attn=None):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         args = ServerArgs.__new__(ServerArgs)
         args.pp_stage_ratio = list(scores)
@@ -84,7 +84,7 @@ class TheSubstitutionIsAnnounced(unittest.TestCase):
         args.pp_layer_ratio = None
         args.pp_size = 3
         args.model_path = MODEL
-        with self.assertLogs("sglang.srt.server_args", level=logging.INFO) as cm:
+        with self.assertLogs("flliper.srt.server_args", level=logging.INFO) as cm:
             args._handle_pp_stage_ratio()
         return args, [r for r in cm.output if r.startswith("WARNING")]
 

@@ -66,7 +66,7 @@ fi
 PYTHONPATH="$WT/python" "$VENV/bin/python" - "$NEED_GIB" <<'PY'
 import sys
 
-from sglang.srt.layers.moe.cold_tier_shm import preflight
+from flliper.srt.layers.moe.cold_tier_shm import preflight
 
 need = int(float(sys.argv[1]) * 2**30)
 print("       cold_tier_shm.preflight:", preflight(need))
@@ -86,7 +86,7 @@ fi
 
 # --- 3. rank -> card, via NVML ---------------------------------------------
 PYTHONPATH="$WT/python" "$VENV/bin/python" - <<'PY'
-from sglang.srt.registry.nvml import identity_map
+from flliper.srt.registry.nvml import identity_map
 
 imap = identity_map()
 print("       NVML index -> card (derive --rank-gpu-id from THIS, not from a guess)")
@@ -99,11 +99,11 @@ PY
 
 # --- 4. measured H2D provenance --------------------------------------------
 PYTHONPATH="$WT/python" "$VENV/bin/python" - <<'PY'
-from sglang.srt.layers.moe.expert_offload import (
+from flliper.srt.layers.moe.expert_offload import (
     HOST_SHARD_SOURCE_PROBE,
     resolve_host_shard_ratio,
 )
-from sglang.srt.registry.nvml import identity_map
+from flliper.srt.registry.nvml import identity_map
 
 uuids = tuple(
     c.uuid for c in sorted(identity_map().cards, key=lambda c: c.cuda_ordinal)

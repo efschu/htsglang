@@ -2,7 +2,7 @@
 """Task #343: which layer stops matching, and on which forward step.
 
 Reads two ``layers_rank*.jsonl`` traces written by
-``sglang.srt.model_executor.layer_fingerprint`` and joins them on ``astep``
+``flliper.srt.model_executor.layer_fingerprint`` and joins them on ``astep``
 (the forward index counted from the arming point, so boot warmups cannot shift
 one trace against the other) and on the tensor name.
 

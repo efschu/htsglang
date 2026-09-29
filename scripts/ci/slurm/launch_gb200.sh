@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Launch a dynamo-sglang benchmark job on the GB200 cluster via srt-slurm.
+# Launch a dynamo-flliper benchmark job on the GB200 cluster via srt-slurm.
 #
 # Required environment variables (set by the GitHub Actions workflow):
-#   FRAMEWORK         - must be "dynamo-sglang"
+#   FRAMEWORK         - must be "dynamo-flliper"
 #   MODEL             - HuggingFace model ID (used as fallback if no local path)
 #   MODEL_PREFIX      - short prefix: "dsr1"
 #   PRECISION         - "fp8" or "fp4"
@@ -11,10 +11,10 @@
 #   CONFIG_FILE       - path relative to srt-slurm repo root (e.g. recipes/gb200-fp8/1k1k/low-latency.yaml)
 #   RESULT_FILENAME   - prefix for output JSON filenames
 #   RUNNER_NAME       - GitHub Actions runner name (used to tag the Slurm job)
-#   SQUASH_FILE       - path to pre-imported sglang enroot squash file on Lustre
+#   SQUASH_FILE       - path to pre-imported flliper enroot squash file on Lustre
 #   NGINX_SQUASH_FILE - path to pre-imported nginx enroot squash file on Lustre
 #   SLURM_PARTITION   - Slurm partition (default: batch)
-#   SLURM_ACCOUNT     - Slurm account  (default: sglang)
+#   SLURM_ACCOUNT     - Slurm account  (default: flliper)
 #   SRT_SLURM_BRANCH  - branch of srt-slurm repo to check out
 #   GITHUB_WORKSPACE  - set automatically by GitHub Actions
 #   MATRIX_CONFIG_NAME- matrix entry name (e.g. dsr1-fp4-1k1k-mid-curve); used in S3 prefix
@@ -42,8 +42,8 @@ set -x
 : "${GITHUB_WORKSPACE:?}"
 
 SLURM_PARTITION="${SLURM_PARTITION:-batch}"
-SLURM_ACCOUNT="${SLURM_ACCOUNT:-sglang}"
-SRT_SLURM_BRANCH="${SRT_SLURM_BRANCH:-sglang-nightly-regression}"
+SLURM_ACCOUNT="${SLURM_ACCOUNT:-flliper}"
+SRT_SLURM_BRANCH="${SRT_SLURM_BRANCH:-flliper-nightly-regression}"
 
 # ---------------------------------------------------------------------------
 # Resolve local model paths on Lustre (avoids re-downloading on each run)
@@ -63,7 +63,7 @@ fi
 # Set up per-runner Lustre workspace (cleaned before each run, accessible
 # to both the runner and compute nodes)
 # ---------------------------------------------------------------------------
-LUSTRE_WORKSPACE="/mnt/lustre01/users-public/sglang-ci/workspace/${RUNNER_NAME}"
+LUSTRE_WORKSPACE="/mnt/lustre01/users-public/flliper-ci/workspace/${RUNNER_NAME}"
 rm -rf "$LUSTRE_WORKSPACE"
 mkdir -p "$LUSTRE_WORKSPACE"
 
@@ -121,7 +121,7 @@ SEQ_LEN="$(fmt_seq_len "$ISL")$(fmt_seq_len "$OSL")"
 S3_PREFIX="${TRIGGER}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${SEQ_LEN}/${MATRIX_CONFIG_NAME}"
 
 cat > srtslurm.yaml <<EOF
-# SRT SLURM configuration for SGLang GB200 nightly CI
+# SRT SLURM configuration for fLLiper GB200 nightly CI
 default_account: "${SLURM_ACCOUNT}"
 default_partition: "${SLURM_PARTITION}"
 default_time_limit: "6:00:00"
@@ -135,7 +135,7 @@ model_paths:
   "${SRT_SLURM_MODEL_PREFIX}": "${MODEL_PATH}"
 
 containers:
-  dynamo-sglang: ${SQUASH_FILE}
+  dynamo-flliper: ${SQUASH_FILE}
   nginx: ${NGINX_SQUASH_FILE}
   nginx-sqsh: ${NGINX_SQUASH_FILE}
 
@@ -161,7 +161,7 @@ make setup ARCH=aarch64
 sed -i "s/^name:.*/name: \"${RUNNER_NAME}\"/" "$CONFIG_FILE"
 
 SRTCTL_OUTPUT=$(srtctl apply -f "$CONFIG_FILE" \
-    --tags "gb200,${MODEL_PREFIX},${PRECISION},${ISL}x${OSL},sglang-nightly-$(date +%Y%m%d)" \
+    --tags "gb200,${MODEL_PREFIX},${PRECISION},${ISL}x${OSL},flliper-nightly-$(date +%Y%m%d)" \
     --setup-script install-torchao.sh 2>&1)
 echo "$SRTCTL_OUTPUT"
 

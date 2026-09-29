@@ -22,7 +22,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.phase_flip_plan import (
+from flliper.srt.layers.dcp.phase_flip_plan import (
     PP_TO_TP,
     TP_TO_PP,
     build_phase_flip_transition,
@@ -33,9 +33,9 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
     seam_transient_peaks,
     validate_layer_map,
 )
-from sglang.srt.layers.dcp.reshard_plan import KvReshardError, owner_of, rows_of
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.dcp.reshard_plan import KvReshardError, owner_of, rows_of
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 

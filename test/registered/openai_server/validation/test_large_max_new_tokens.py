@@ -9,10 +9,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import openai
 
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.srt.utils.hf_transformers_utils import get_tokenizer
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -49,7 +49,7 @@ class TestLargeMaxNewTokens(CustomTestCase):
                 "--decode-log-interval",
                 "2",
             ),
-            env={"SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION": "256", **os.environ},
+            env={"FLLIPER_CLIP_MAX_NEW_TOKENS_ESTIMATION": "256", **os.environ},
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
         cls.base_url += "/v1"

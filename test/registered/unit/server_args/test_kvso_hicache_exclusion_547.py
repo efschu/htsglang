@@ -63,17 +63,17 @@ import re
 import unittest
 from unittest import mock
 
-from sglang.srt.mem_cache.pinned_host_budget import (
+from flliper.srt.mem_cache.pinned_host_budget import (
     PinnedHostPost,
     hicache_configured_host_bytes,
     joint_pinned_host_error,
 )
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
-_SRT = pathlib.Path(__file__).resolve().parents[4] / "python" / "sglang" / "srt"
+_SRT = pathlib.Path(__file__).resolve().parents[4] / "python" / "flliper" / "srt"
 
 _GIB = 1024**3
 
@@ -246,7 +246,7 @@ class TestParseTimePricing(unittest.TestCase):
         """
         fixed = (120 * _GIB, 100 * _GIB)
         with mock.patch(
-            "sglang.srt.memtier.profile.host_memory_bytes_for_pinning",
+            "flliper.srt.memtier.profile.host_memory_bytes_for_pinning",
             return_value=fixed,
         ):
             msg = _handle(

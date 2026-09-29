@@ -11,7 +11,7 @@ import test_deepep_low_latency
 import torch
 import torch.distributed as dist
 
-from sglang.test.test_deepep_utils import (
+from flliper.test.test_deepep_utils import (
     bench,
     calc_diff,
     create_grouped_scores,

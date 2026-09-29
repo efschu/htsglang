@@ -30,7 +30,7 @@ the wrong ping-pong buffer.
 import types
 import unittest
 
-from sglang.srt.managers.scheduler_pp_mixin import _release_dynamic_chunk_probe
+from flliper.srt.managers.scheduler_pp_mixin import _release_dynamic_chunk_probe
 
 
 class _Req:

@@ -31,8 +31,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from sglang.srt.translator.backends import Transcript  # noqa: E402
-from sglang.srt.translator.session import EventKind  # noqa: E402
+from flliper.srt.translator.backends import Transcript  # noqa: E402
+from flliper.srt.translator.session import EventKind  # noqa: E402
 from test_session import LANG_A, LANG_B, make_session  # noqa: E402
 
 
@@ -167,7 +167,7 @@ class TestReadBackDoesNotRewriteHistory(unittest.IsolatedAsyncioTestCase):
         """The end-to-end property: the poisoning path is closed."""
         import numpy as np
 
-        from sglang.srt.translator.backends import AudioChunk
+        from flliper.srt.translator.backends import AudioChunk
 
         session, _asr, _mt, _tts = make_session()
         audio = AudioChunk(np.zeros(32000, dtype=np.float32), 16000)
@@ -189,7 +189,7 @@ class TestReadBackDoesNotRewriteHistory(unittest.IsolatedAsyncioTestCase):
         """THE CONTROL: genuine speech in a new language still counts."""
         import numpy as np
 
-        from sglang.srt.translator.backends import AudioChunk
+        from flliper.srt.translator.backends import AudioChunk
 
         session, _asr, _mt, _tts = make_session()
         audio = AudioChunk(np.zeros(32000, dtype=np.float32), 16000)
@@ -218,7 +218,7 @@ class TestTheManualDecisionRecordsItsPin(unittest.IsolatedAsyncioTestCase):
     async def test_a_manual_attribution_records_the_pin_it_acted_on(self):
         import numpy as np
 
-        from sglang.srt.translator.backends import AudioChunk
+        from flliper.srt.translator.backends import AudioChunk
 
         session, _asr, _mt, _tts = make_session()
         audio = AudioChunk(np.zeros(32000, dtype=np.float32), 16000)

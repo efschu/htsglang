@@ -4,7 +4,7 @@ The 2026-08-04 window reached graph capture on the breakable route and died in
 the buffer layer:
 
     TypeError: Unsupported BCG output type:
-        <class 'sglang.srt.layers.logits_processor.LogitsProcessorOutput'>
+        <class 'flliper.srt.layers.logits_processor.LogitsProcessorOutput'>
 
 The branch was deliberately NOT written in-window, and the reason was the
 failure mode rather than the effort (``TICKET_462_RESULT_f2_blocked.md`` §2):
@@ -30,14 +30,14 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+from flliper.srt.layers.logits_processor import LogitsProcessorOutput
+from flliper.srt.model_executor.forward_batch_info import PPProxyTensors
+from flliper.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     _LPO_TOKEN_DIM_FIELDS,
     BreakableCudaGraphBackend,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -290,7 +290,7 @@ class _FakeCapture:
 class BcgCaptureSmokeTest(CustomTestCase):
     """Mock-side smoke over the whole capture->store->replay path.
 
-    Same lesson as the window's ``mock_sglang.py``: the pure helpers above were
+    Same lesson as the window's ``mock_flliper.py``: the pure helpers above were
     what the previous desk pass validated, and the path that WIRES them is
     where the defects were. Here that path is ``capture_one``: it decides the
     row budget, allocates the shared buffer once, and stores a VIEW per shape.
@@ -311,7 +311,7 @@ class BcgCaptureSmokeTest(CustomTestCase):
             def __eq__(self, other):
                 return self.size == other.size
 
-        mod = "sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend"
+        mod = "flliper.srt.model_executor.runner_backend.breakable_cuda_graph_backend"
         with _mock.patch(f"{mod}.run_capture_warmups", lambda fn, **kw: fn()), (
             _mock.patch(f"{mod}.BreakableCUDAGraph", _FakeGraph)
         ), _mock.patch(f"{mod}.BreakableCUDAGraphCapture", _FakeCapture):

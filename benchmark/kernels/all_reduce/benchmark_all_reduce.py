@@ -1,5 +1,5 @@
 """
-Benchmark SGLang custom all-reduce vs Torch symm-mem all-reduce across message sizes.
+Benchmark fLLiper custom all-reduce vs Torch symm-mem all-reduce across message sizes.
 Usage:
     torchrun --nproc_per_node=2 benchmark_all_reduce.py
     torchrun --nproc_per_node=4 benchmark_all_reduce.py
@@ -15,7 +15,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from sglang.srt.distributed.parallel_state import (
+from flliper.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
     init_distributed_environment,
@@ -25,7 +25,7 @@ from sglang.srt.distributed.parallel_state import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Benchmark SGLang custom all-reduce vs Torch symm-mem all-reduce across message sizes."
+        description="Benchmark fLLiper custom all-reduce vs Torch symm-mem all-reduce across message sizes."
     )
     parser.add_argument(
         "--backend",
@@ -233,21 +233,21 @@ def main():
 
     # Import after dist init; some libs query torch dist state on import
     torch_symm_mem_comm = None
-    HAVE_SGLANG_CUSTOM = False
+    HAVE_FLLIPER_CUSTOM = False
     HAVE_TORCH_SYMM_MEM = False
 
     try:
-        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        from flliper.srt.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce as SGLCustomAllreduce,
         )
 
-        HAVE_SGLANG_CUSTOM = True
+        HAVE_FLLIPER_CUSTOM = True
     except Exception as e:
         if rank == 0:
-            print(f"SGLang CustomAllreduce import failed: {e}", file=sys.stderr)
+            print(f"fLLiper CustomAllreduce import failed: {e}", file=sys.stderr)
 
     try:
-        from sglang.srt.distributed.device_communicators.torch_symm_mem import (
+        from flliper.srt.distributed.device_communicators.torch_symm_mem import (
             TorchSymmMemCommunicator as TorchSymmMemAllreduce,
         )
 
@@ -260,13 +260,13 @@ def main():
         print(f"Initialized PG backend={args.backend} world_size={world_size}")
         print(f"Device: {device.type}:{device.index}")
         print(
-            f"SGLang Custom available: {HAVE_SGLANG_CUSTOM}, Torch Symm-Mem available: {HAVE_TORCH_SYMM_MEM}"
+            f"fLLiper Custom available: {HAVE_FLLIPER_CUSTOM}, Torch Symm-Mem available: {HAVE_TORCH_SYMM_MEM}"
         )
 
     sizes = get_message_sizes()
     max_size = max(sizes) if sizes else (128 * 1024 * 1024)
 
-    if HAVE_SGLANG_CUSTOM:
+    if HAVE_FLLIPER_CUSTOM:
         try:
             sgl_custom_comm = SGLCustomAllreduce(
                 group=group, device=device, max_size=max_size
@@ -274,7 +274,7 @@ def main():
         except Exception as e:
             if rank == 0:
                 print(
-                    f"Failed to construct SGLangCustomAllreduce: {e}", file=sys.stderr
+                    f"Failed to construct FlliperCustomAllreduce: {e}", file=sys.stderr
                 )
             sgl_custom_comm = None
 
@@ -293,7 +293,7 @@ def main():
 
     if sgl_custom_comm is not None:
         sgl_custom_results = bench_impl(
-            name="SGLangCustom",
+            name="FlliperCustom",
             comm=sgl_custom_comm,
             sizes=sizes,
             device=device,

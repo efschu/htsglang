@@ -1,9 +1,9 @@
 import unittest
 
-from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.performance_test_runner import PerformanceTestParams
-from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
+from flliper.test.accuracy_test_runner import AccuracyTestParams
+from flliper.test.performance_test_runner import PerformanceTestParams
+from flliper.test.run_combined_tests import run_combined_tests
+from flliper.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 QWEN3_235B_FP8_MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
 QWEN3_235B_EAGLE3_MODEL_PATH = (

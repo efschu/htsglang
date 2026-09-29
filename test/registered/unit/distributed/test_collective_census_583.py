@@ -29,13 +29,13 @@ driven through a fake that behaves like ``all_gather_object``.
 import unittest
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.distributed import collective_census as cc  # noqa: E402
-from sglang.srt.distributed.collective_census import (  # noqa: E402
+from flliper.srt.distributed import collective_census as cc  # noqa: E402
+from flliper.srt.distributed.collective_census import (  # noqa: E402
     CollectiveCensus,
     census_enabled,
     census_heartbeat,

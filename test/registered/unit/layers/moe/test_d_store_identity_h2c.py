@@ -24,14 +24,14 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sglang.srt.layers.moe import expert_store as es
+from flliper.srt.layers.moe import expert_store as es
 
 try:
-    from sglang.srt.layers.moe import store_adopt as sa
+    from flliper.srt.layers.moe import store_adopt as sa
 except ImportError:  # pragma: no cover
     sa = None
 
-IDENT_ENV = "SGLANG_MOE_EXPERT_STORE_IDENTITY"
+IDENT_ENV = "FLLIPER_MOE_EXPERT_STORE_IDENTITY"
 
 
 def _ckpt(root, config=b'{"num_experts": 512}', shard_size=10):
@@ -148,7 +148,7 @@ class TestAdoptNeedsIdentity(unittest.TestCase):
         self.assertIsNotNone(sa)
         sa.reset_for_tests()
         self.store = tempfile.mkdtemp(prefix="h2c_adopt_")
-        self._map = mock.patch("sglang.srt.layers.moe.expert_store.expert_map",
+        self._map = mock.patch("flliper.srt.layers.moe.expert_store.expert_map",
                                return_value=KARTE)
         self._map.start()
 
@@ -165,7 +165,7 @@ class TestAdoptNeedsIdentity(unittest.TestCase):
                 json.dump(data, fh)
 
     def _env(self, identity):
-        env = {"SGLANG_WEG2_GROUP": "D", "SGLANG_MOE_EXPERT_STORE_DIR": self.store}
+        env = {"FLLIPER_PDFLIP_GROUP": "D", "FLLIPER_MOE_EXPERT_STORE_DIR": self.store}
         if identity is not None:
             env[IDENT_ENV] = identity
         base = {k: v for k, v in os.environ.items() if k != IDENT_ENV}
@@ -193,7 +193,7 @@ class TestAdoptNeedsIdentity(unittest.TestCase):
 
 class TestLauncherPublishesIdentity(unittest.TestCase):
     def _build(self, **kw):
-        from sglang.srt.weg2 import launcher
+        from flliper.srt.pdflip import launcher
 
         return launcher.build_env(tree="/tmp/t", venv="/tmp/v", cvd="0", store_dir="/tmp/s",
                                   debug_hold=False, tag="probe", **kw)
@@ -210,16 +210,16 @@ class TestLauncherPublishesIdentity(unittest.TestCase):
         self.assertNotIn(IDENT_ENV, env)
 
     def test_publish_store_identity_logs_the_marker(self):
-        from sglang.srt.weg2 import launcher
+        from flliper.srt.pdflip import launcher
 
         tmp = tempfile.mkdtemp(prefix="h2c_launch_")
         model = _ckpt(os.path.join(tmp, "m"))
-        karte = os.path.join(tmp, "k.json")
-        with open(karte, "w") as fh:
+        emap = os.path.join(tmp, "k.json")
+        with open(emap, "w") as fh:
             fh.write("{}")
         lines = []
-        ident = launcher.publish_store_identity(model, karte, lines.append)
-        self.assertEqual(ident, es.compute_identity(model, karte))
+        ident = launcher.publish_store_identity(model, emap, lines.append)
+        self.assertEqual(ident, es.compute_identity(model, emap))
         self.assertTrue(any("H2c STORE-IDENTITY id=" + ident in l for l in lines))
         self.assertEqual(launcher.publish_store_identity(model, "", lines.append), "")
 

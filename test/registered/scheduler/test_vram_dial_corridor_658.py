@@ -38,14 +38,14 @@ own capacity arithmetic is asked for the residual.
 
 import unittest
 
-from sglang.srt.managers.vram_dial import (
+from flliper.srt.managers.vram_dial import (
     MIB,
     KvCapacityRuntime,
     RankState,
     corridor_law_floor_bytes,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

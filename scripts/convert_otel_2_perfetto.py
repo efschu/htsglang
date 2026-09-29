@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 parser = argparse.ArgumentParser(
-    description="Convert SGLang OTEL trace files to Perfetto format.",
+    description="Convert fLLiper OTEL trace files to Perfetto format.",
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 )
 parser.add_argument(
@@ -23,7 +23,7 @@ parser.add_argument(
     "--output",
     dest="output_file",
     type=str,
-    default="sglang_trace_perfetto.json",
+    default="flliper_trace_perfetto.json",
     help="Path to the output Perfetto JSON file.",
 )
 parser.add_argument(
@@ -140,13 +140,13 @@ def extract_all_otel_spans(otel_data):
     smg_otel_spans = []
     for line_data in otel_data:
         for resource_spans in line_data["resourceSpans"]:
-            # filter: only keep spans which service.name is 'sglang' or 'smg'
+            # filter: only keep spans which service.name is 'flliper' or 'smg'
             service_name = ""
             for attr in resource_spans["resource"]["attributes"]:
                 if attr["key"] == "service.name":
                     service_name = attr["value"]["stringValue"]
 
-            if service_name == "sglang":
+            if service_name == "flliper":
                 spans_ref = engine_otel_spans
             elif service_name == "smg":
                 spans_ref = smg_otel_spans
@@ -179,7 +179,7 @@ def build_otel_span_tree(otel_spans):
     for span in otel_spans:
         parent_span_id = span.get("parentSpanId", "")
         module_name = span.get("attributes", {}).get("module", "")
-        if module_name == "sglang::request" or module_name == "sglang::mooncake":
+        if module_name == "flliper::request" or module_name == "flliper::mooncake":
             root_spans.append(span)
         elif parent_span_id in span_id_map:
             parent_span = span_id_map[parent_span_id]
@@ -213,7 +213,7 @@ def __convert_to_perfetto_span(span, rid, bootstrap_room, pid, host_id):
     perfetto_span = {
         "ph": "X",
         "name": span.get("name", "unknown"),
-        "cat": "sglang",
+        "cat": "flliper",
         "ts": (ts - baseline) / 1000.0,
         "dur": dur / 1000.0,
         "pid": pid,
@@ -319,7 +319,7 @@ def __convert_to_perfetto_events(span):
             }
             perfetto_event = {
                 "ph": "i",
-                "cat": "sglang",
+                "cat": "flliper",
                 "ts": (int(event["timeUnixNano"]) - baseline) / 1000.0,
                 "pid": span["perfetto_span"]["pid"],
                 "tid": span["perfetto_span"]["tid"],

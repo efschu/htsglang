@@ -52,8 +52,8 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.managers import corridor_guard as cg
-from sglang.srt.managers import corridor_rebalance as crb
+from flliper.srt.managers import corridor_guard as cg
+from flliper.srt.managers import corridor_rebalance as crb
 
 MIB = 1024 * 1024
 

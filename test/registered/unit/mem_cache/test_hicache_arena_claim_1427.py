@@ -8,7 +8,7 @@ import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
 SLOT = 4096
 
@@ -79,7 +79,7 @@ def test_a_full_arena_refuses_in_constant_time_and_free_restores_the_counters(ar
 def test_find_by_stem_hashes_in_c_and_agrees_with_the_python_key(arena):
     """#1439: arena_find_stems computes key128 in C; the answer must equal the
     Python-hashed path for present and absent stems alike."""
-    from sglang.srt.mem_cache.storage.file.hicache_arena import key128
+    from flliper.srt.mem_cache.storage.file.hicache_arena import key128
     stems = [f"cafe{i:02d}_Qwen.kv" for i in range(6)] + ["nope.mamba"]
     got = arena.claim_slots(stems[:4], [SLOT] * 4)
     arena.complete_slots([s for s, _, _ in got], [g for _, _, g in got], [(0, SLOT)])

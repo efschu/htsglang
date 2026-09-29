@@ -42,8 +42,8 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.distributed.utils import get_cp_token_ratios, set_cp_token_ratios
-from sglang.srt.layers.dcp.owner import (
+from flliper.srt.distributed.utils import get_cp_token_ratios, set_cp_token_ratios
+from flliper.srt.layers.dcp.owner import (
     dcp_verify_mask_mode,
     dcp_verify_paged_lens,
     dcp_verify_window_is_disjoint,
@@ -51,8 +51,8 @@ from sglang.srt.layers.dcp.owner import (
     dcp_weighted_owner_bounds,
     dcp_weighted_read_slots,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -85,7 +85,7 @@ def _verify_index_build(req_to_token, req_pool_indices, seq_lens, plan, rank):
 
 
 def _numpy_verify_reference(table, reqs, seq_lens, plan, rank):
-    """The rule as prose, in numpy, with no sglang function in the path.
+    """The rule as prose, in numpy, with no flliper function in the path.
 
     For each request, for each COMMITTED position p in [0, seq_len): the global
     slot L = table[req, p] belongs to this rank iff (L % S) lies in
@@ -181,7 +181,7 @@ class TestTritonDcpSpecVerify(CustomTestCase):
         """
         import inspect
 
-        import sglang.srt.layers.attention.triton_backend as tb
+        import flliper.srt.layers.attention.triton_backend as tb
 
         gate = tb._reject_stale_verify_window
         self.assertIn(
@@ -211,7 +211,7 @@ class TestTritonDcpSpecVerify(CustomTestCase):
 
         A wrong indptr makes one draft token attend another request's context,
         which under greedy spec shows up as a collapsed accept rate -- never as
-        a crash. Hence a reference with no sglang function in it.
+        a crash. Hence a reference with no flliper function in it.
         """
         rng = np.random.default_rng(180)
         n_req, width = 4, 96
@@ -414,7 +414,7 @@ class TestTritonDcpSpecVerify(CustomTestCase):
         dcp_verify_mask_mode is the backend's. They must classify identically,
         or a config refused by one is served by the other.
         """
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         for topk, dflash in ((None, False), (1, False), (2, False), (1, True)):
             with self.subTest(topk=topk, dflash=dflash):
@@ -436,7 +436,7 @@ class TestTritonDcpSpecVerify(CustomTestCase):
         go through the SHARED builder rather than a verify-private copy, and it
         must feed it the committed lengths through dcp_verify_paged_lens.
         """
-        import sglang.srt.layers.attention.triton_backend as tb
+        import flliper.srt.layers.attention.triton_backend as tb
 
         src = pathlib.Path(tb.__file__).read_text()
         self.assertIn("dcp_verify_paged_lens(", src)
@@ -461,9 +461,9 @@ class TestTritonDcpSpecVerify(CustomTestCase):
         """
         import pathlib
 
-        import sglang.srt.layers.attention.flashinfer_backend as fb
-        import sglang.srt.layers.attention.triton_backend as tb
-        from sglang.srt.speculative.spec_info import SpecInputType
+        import flliper.srt.layers.attention.flashinfer_backend as fb
+        import flliper.srt.layers.attention.triton_backend as tb
+        from flliper.srt.speculative.spec_info import SpecInputType
 
         self.assertEqual(
             tb._DCP_VERIFY_SPEC_INPUT_TYPES,
@@ -495,7 +495,7 @@ class TestTritonDcpSpecVerify(CustomTestCase):
         context, not a crash. So the verify buffer update must pass the buffer
         in, exactly as the decode one does.
         """
-        import sglang.srt.layers.attention.triton_backend as tb
+        import flliper.srt.layers.attention.triton_backend as tb
 
         src = pathlib.Path(tb.__file__).read_text()
         body = src.split("def _update_target_verify_buffers(", 1)[1].split(
@@ -513,7 +513,7 @@ class TestTritonDcpSpecVerify(CustomTestCase):
         come FIRST. A check placed after them would be dead code that still
         reads as a fix.
         """
-        import sglang.srt.layers.attention.triton_backend as tb
+        import flliper.srt.layers.attention.triton_backend as tb
 
         src = pathlib.Path(tb.__file__).read_text()
         body = src.split("def _dcp_batch_has_prefix(", 1)[1].split("\n    def ", 1)[0]

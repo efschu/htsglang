@@ -18,8 +18,8 @@ injectable power profile. No torch, no server, no card.
 
 import unittest
 
-from sglang.srt.planner.cost_model import Provenance, Rate
-from sglang.srt.planner.objective import (
+from flliper.srt.planner.cost_model import Provenance, Rate
+from flliper.srt.planner.objective import (
     Objective,
     combine_provenance,
     objective_value,
@@ -27,8 +27,8 @@ from sglang.srt.planner.objective import (
     resolve_objective,
     work_per_joule,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -237,7 +237,7 @@ class TestObjectiveSelection(CustomTestCase):
             resolve_objective(SimpleNamespace(objective="cheapest"))
 
     def test_server_args_default_and_validation(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         field = ServerArgs.__dataclass_fields__["objective"]
         self.assertEqual(field.default, "throughput")

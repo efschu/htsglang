@@ -8,10 +8,10 @@ from utils import (
     precision,
 )
 
-from sglang.srt.layers.quantization.fp8_utils import input_to_float8
-from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization.fp8_utils import input_to_float8
+from flliper.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 

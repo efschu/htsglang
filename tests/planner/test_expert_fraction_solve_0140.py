@@ -10,10 +10,10 @@ danach bleiben 4,93 GB und der Draft-KV-Produzent stirbt still im C++
 """
 import pytest
 
-from sglang.srt.planner.pp_cut import solve_expert_fraction_per_stage
+from flliper.srt.planner.pp_cut import solve_expert_fraction_per_stage
 
 
-def test_die_loesung_passt_genau_ins_budget():
+def test_solution_fits_budget_exactly():
     # Eine Stufe, 10 Layer, 100 MiB dense + 1000 MiB Experten je Layer,
     # Budget 6000 MiB -> (6000 - 1000) / 10000 = 0.5
     f = solve_expert_fraction_per_stage(
@@ -25,11 +25,11 @@ def test_die_loesung_passt_genau_ins_budget():
     assert 10 * (100.0 + 1000.0 * f[0]) == 6000.0
 
 
-def test_die_reserve_geht_ab_und_das_ist_der_ganze_punkt():
+def test_reserve_is_deducted_which_is_the_point():
     """Ohne Reserve ist das Ergebnis die DECKE, nicht die Empfehlung -- der
     Draft, das KV und die Aktivierungen stehen noch aus. w73 starb genau in
     dieser Luecke."""
-    ohne = solve_expert_fraction_per_stage(
+    without = solve_expert_fraction_per_stage(
         budgets_mib=[6000], stage_layers=[10], mean_layer_mib=100.0,
         expert_layer_mib=1000.0, num_experts=512, lru_rows=[0],
     )[0]
@@ -38,10 +38,10 @@ def test_die_reserve_geht_ab_und_das_ist_der_ganze_punkt():
         expert_layer_mib=1000.0, num_experts=512, lru_rows=[0],
         reserve_mib_by_stage=[2000],
     )[0]
-    assert mit < ohne and mit == pytest.approx(0.3)
+    assert mit < without and mit == pytest.approx(0.3)
 
 
-def test_lru_zeilen_kosten_mit():
+def test_lru_rows_are_charged():
     f = solve_expert_fraction_per_stage(
         budgets_mib=[6000], stage_layers=[10], mean_layer_mib=100.0,
         expert_layer_mib=1024.0, num_experts=512, lru_rows=[32],
@@ -50,7 +50,7 @@ def test_lru_zeilen_kosten_mit():
     assert f == pytest.approx((6000 - 10 * (100 + 64)) / (10 * 1024))
 
 
-def test_eine_stufe_die_nicht_mal_dense_traegt_gibt_null():
+def test_stage_that_cannot_carry_dense_gives_zero():
     """Geklemmt, aber der Aufrufer soll es benennen: 0.0 heisst hier NICHT
     'passt knapp', sondern 'diese Stufe traegt ihre Dense-Gewichte nicht'."""
     f = solve_expert_fraction_per_stage(
@@ -60,7 +60,7 @@ def test_eine_stufe_die_nicht_mal_dense_traegt_gibt_null():
     assert f == [0.0]
 
 
-def test_ueber_eins_wird_geklemmt():
+def test_above_one_is_clamped():
     f = solve_expert_fraction_per_stage(
         budgets_mib=[999999], stage_layers=[1], mean_layer_mib=1.0,
         expert_layer_mib=10.0, num_experts=512, lru_rows=[0],
@@ -68,7 +68,7 @@ def test_ueber_eins_wird_geklemmt():
     assert f == [1.0]
 
 
-def test_halbe_geometrie_wird_verweigert():
+def test_half_geometry_is_refused():
     with pytest.raises(ValueError, match="halbe Geometrie"):
         solve_expert_fraction_per_stage(
             budgets_mib=[1000, 1000], stage_layers=[10, 10, 10],
@@ -77,7 +77,7 @@ def test_halbe_geometrie_wird_verweigert():
         )
 
 
-def test_die_w73_form_je_stufe():
+def test_w73_form_per_stage():
     """Die echte Form: PP-Cut 29/11/8, Budgets aus dem Arm (BUD_P
     25900/16000/15600 MiB), 512 Experten. Kein Urteil ueber die Zahlen --
     der Test haelt fest, dass je Stufe EINE eigene Decke herauskommt und
@@ -106,16 +106,16 @@ def test_die_w73_form_je_stufe():
     # Stufe 2 (8 Layer auf 15,6 GB) haelt ihre volle Residenz bis ~11 GB
     # Reserve. Der Test bindet die MONOTONIE und die Richtung, nicht eine
     # Zahl, die ich nicht gemessen habe.
-    vorher = f
+    before = f
     for r in (2000, 5000, 8000, 11000):
-        jetzt = solve_expert_fraction_per_stage(
+        now = solve_expert_fraction_per_stage(
             budgets_mib=[25900, 16000, 15600], stage_layers=[29, 11, 8],
             mean_layer_mib=60.0, expert_layer_mib=800.0, num_experts=512,
             lru_rows=[32, 32, 32], reserve_mib_by_stage=[r, r, r],
         )
-        assert all(a <= b for a, b in zip(jetzt, vorher)), (r, jetzt, vorher)
-        vorher = jetzt
-    assert vorher[2] < 0.95, (
+        assert all(a <= b for a, b in zip(now, before)), (r, now, before)
+        before = now
+    assert before[2] < 0.95, (
         f"bei 11 GB Reserve muss auch die kleinste Stufe unter die "
-        f"gefahrenen 0.95 fallen: {vorher}"
+        f"gefahrenen 0.95 fallen: {before}"
     )

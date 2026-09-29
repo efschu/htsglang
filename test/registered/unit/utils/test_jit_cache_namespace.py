@@ -6,7 +6,7 @@ baton, #208 the architecture confusion). The new case, from the welle-2 card
 probe:
 
     fp8 Marlin GEMM did not run: RuntimeError: Runtime check failed at
-    /spinning/wt-merge-probe/python/sglang/jit_kernel/csrc/gemm/marlin/
+    /spinning/wt-merge-probe/python/flliper/jit_kernel/csrc/gemm/marlin/
     gptq_marlin_repack.cuh:355: CUDA error: no kernel image is available for
     execution on the device
 
@@ -43,14 +43,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 # THE REAL MODULE, imported -- not re-implemented here.
-from sglang.jit_kernel import utils as jit_utils  # noqa: E402
-from sglang.jit_kernel.utils import (  # noqa: E402
+from flliper.jit_kernel import utils as jit_utils  # noqa: E402
+from flliper.jit_kernel.utils import (  # noqa: E402
     PROVENANCE_NAME,
     PROVENANCE_VERSION,
     ArchInfo,
@@ -307,7 +307,7 @@ class TestCheckProvenance(CustomTestCase):
             "build_hash": "0123456789ab",
             "target_archs": ["8.6"],
             "vendor": "cuda",
-            "source_tree": "/spinning/wt-final/python/sglang/jit_kernel",
+            "source_tree": "/spinning/wt-final/python/flliper/jit_kernel",
         }
         record.update(overrides)
         return record
@@ -336,7 +336,7 @@ class TestCheckProvenance(CustomTestCase):
         """
         with TemporaryDirectory() as tmp:
             foreign = self._record(
-                source_tree="/spinning/wt-merge-probe/python/sglang/jit_kernel",
+                source_tree="/spinning/wt-merge-probe/python/flliper/jit_kernel",
                 host="other-host",
                 pid=4242,
             )
@@ -481,7 +481,7 @@ class TestLoadJitNamespaceEndToEnd(CustomTestCase):
             entry = self._only_entry(tmp)
             path = entry / PROVENANCE_NAME
             record = json.loads(path.read_text())
-            record["source_tree"] = "/spinning/wt-merge-probe/python/sglang/jit_kernel"
+            record["source_tree"] = "/spinning/wt-merge-probe/python/flliper/jit_kernel"
             record["host"] = "another-host"
             path.write_text(json.dumps(record))
             self._run(tmp, "namespace_probe_c", built)
@@ -498,11 +498,11 @@ class TestLoadJitNamespaceEndToEnd(CustomTestCase):
             path = entry / PROVENANCE_NAME
             record = json.loads(path.read_text())
             record["source_hash"] = "ffffffffffffffff"
-            record["source_tree"] = "/spinning/wt-merge-probe/python/sglang/jit_kernel"
+            record["source_tree"] = "/spinning/wt-merge-probe/python/flliper/jit_kernel"
             path.write_text(json.dumps(record))
             (entry / "cuda_0.o.d").write_text("cuda_0.o: cuda.cu\n")
 
-            with self.assertLogs("sglang.jit_kernel.utils", level="WARNING") as logs:
+            with self.assertLogs("flliper.jit_kernel.utils", level="WARNING") as logs:
                 self._run(tmp, "namespace_probe_d", built)
             entry = self._only_entry(tmp)
             names = {p.name for p in entry.iterdir()}
@@ -531,20 +531,20 @@ class TestLoadJitNamespaceEndToEnd(CustomTestCase):
             record["target_archs"] = ["12.0"]
             path.write_text(json.dumps(record))
 
-            with self.assertLogs("sglang.jit_kernel.utils", level="WARNING") as logs:
+            with self.assertLogs("flliper.jit_kernel.utils", level="WARNING") as logs:
                 self._run(tmp, "namespace_probe_e", built)
         self.assertEqual(len(built), 2, "the cross-arch artefact was reused")
         self.assertTrue(any("architecture mismatch" in m for m in logs.output))
 
     def test_the_check_can_be_turned_off_in_place(self):
-        """The operator lever, matching SGLANG_JIT_CACHE_SELFHEAL."""
+        """The operator lever, matching FLLIPER_JIT_CACHE_SELFHEAL."""
         built = []
         with TemporaryDirectory() as tmp:
             self._run(tmp, "namespace_probe_h", built)
             entry = self._only_entry(tmp)
             (entry / PROVENANCE_NAME).unlink()
             with mock.patch.dict(
-                os.environ, {"SGLANG_JIT_PROVENANCE_CHECK": "0"}, clear=False
+                os.environ, {"FLLIPER_JIT_PROVENANCE_CHECK": "0"}, clear=False
             ):
                 self._run(tmp, "namespace_probe_h", built)
         self.assertEqual(len(built), 1, "the kill switch did not disable the check")
@@ -556,7 +556,7 @@ class TestLoadJitNamespaceEndToEnd(CustomTestCase):
             entry = self._only_entry(tmp)
             (entry / PROVENANCE_NAME).unlink()
 
-            with self.assertLogs("sglang.jit_kernel.utils", level="WARNING") as logs:
+            with self.assertLogs("flliper.jit_kernel.utils", level="WARNING") as logs:
                 self._run(tmp, "namespace_probe_f", built)
         self.assertEqual(len(built), 2, "an unverifiable entry was reused")
         self.assertTrue(any("no provenance record" in m for m in logs.output))

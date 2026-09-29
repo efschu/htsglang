@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import inspect
 
-from sglang.srt.managers.phase_flip_runtime import chunk_blocks_quiescence
+from flliper.srt.managers.phase_flip_runtime import chunk_blocks_quiescence
 
 
 class _Chunked:
@@ -78,7 +78,7 @@ def test_the_runnability_oracle_is_gone():
     Two oracles, one question, opposite answers -> hold without exit. The
     builder's gate (``phase_purity.prefill_blocked_here``) is the ONE
     surviving oracle."""
-    import sglang.srt.managers.phase_flip_runtime as pfr
+    import flliper.srt.managers.phase_flip_runtime as pfr
 
     assert not hasattr(pfr, "prefill_runnable_in_current_layout")
 
@@ -110,7 +110,7 @@ def test_quiescence_does_not_consult_the_carry_orphan_query():
     helper."""
     import inspect
 
-    from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
+    from flliper.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
 
     src = inspect.getsource(build_flip_quiescence_fn)
     assert "orphan_resident_reqs(" not in src, (
@@ -142,7 +142,7 @@ def test_live_reqs_still_reads_last_mbs_and_last_batch():
     import inspect
     import textwrap
 
-    from sglang.srt.managers.phase_flip_runtime import _live_reqs
+    from flliper.srt.managers.phase_flip_runtime import _live_reqs
 
     fn = ast.parse(textwrap.dedent(inspect.getsource(_live_reqs))).body[0]
     body = fn.body
@@ -177,13 +177,13 @@ def test_the_post_cutover_readmit_consumes_the_stash_once():
     side."""
     import inspect as _i
 
-    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+    from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
     assert hasattr(PhaseFlipRuntime, "_post_cutover_readmit")
     body = _i.getsource(PhaseFlipRuntime._post_cutover_readmit)
     assert "_pending_seam_readmit" in body
     assert "self._pending_seam_readmit = None" in body, "one-shot clear missing"
-    import sglang.srt.managers.phase_flip_runtime as pfr
+    import flliper.srt.managers.phase_flip_runtime as pfr
 
     src = _i.getsource(pfr)
     assert src.count("self._pending_seam_readmit = (") == 1, "exactly one stasher"
@@ -195,7 +195,7 @@ def test_the_sweep_instrument_exists():
     desk-written-never-executed waiting to happen."""
     import inspect as _i
 
-    import sglang.srt.managers.phase_flip_runtime as pfr
+    import flliper.srt.managers.phase_flip_runtime as pfr
 
     assert "#1066 POST-CUTOVER FRESH-FETCH" in _i.getsource(pfr)
 
@@ -213,7 +213,7 @@ def test_pp0_holds_and_followers_never_do():
     and no second prefetch-pending skip variant gates followers."""
     import inspect as _i
 
-    import sglang.srt.managers.scheduler as sched
+    import flliper.srt.managers.scheduler as sched
 
     src = _i.getsource(sched)
     assert src.count('_note_skip("prefetch_pending_pp0"') == 1
@@ -254,7 +254,7 @@ def test_the_fence_store_scan_is_time_budgeted():
     declared sample) instead of holding the seam."""
     import inspect as _i
 
-    from sglang.srt.mem_cache.hicache_flip_writeback import _1063_record_fence
+    from flliper.srt.mem_cache.hicache_flip_writeback import _1063_record_fence
 
     body = _i.getsource(_1063_record_fence)
     assert "_scan_deadline" in body, "the hard time budget is gone"
@@ -273,7 +273,7 @@ def test_the_capped_scan_returns_within_budget(monkeypatch):
     capped walk must return in ~2 s and still record a fence snapshot."""
     import time as _t
 
-    import sglang.srt.mem_cache.hicache_flip_writeback as fwb
+    import flliper.srt.mem_cache.hicache_flip_writeback as fwb
 
     class _Node:
         def __init__(self, i):
@@ -315,7 +315,7 @@ def test_the_group_vote_is_gone():
     the cached=0 double-prefill motor. The upstream-equivalent hold is
     per-request: admission waits on ``check_prefetch_progress(req_id)``
     exactly as for any new arrival."""
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     assert not hasattr(UnifiedRadixCache, "take_agreed_reissue")
 
@@ -335,7 +335,7 @@ def test_the_resident_requeue_left_the_release_path():
     module no longer calls the requeue directly."""
     import inspect as _i
 
-    import sglang.srt.managers.phase_flip_runtime as pfr
+    import flliper.srt.managers.phase_flip_runtime as pfr
 
     src = _i.getsource(pfr)
     assert "_pending_seam_readmit" in src, "deferred requeue carrier missing"
@@ -354,7 +354,7 @@ def test_retracted_equals_readmitted_survives_the_move():
     request is owned by nobody, which is the W31 defect verbatim."""
     import inspect as _i
 
-    import sglang.srt.managers.phase_flip_runtime as pfr
+    import flliper.srt.managers.phase_flip_runtime as pfr
 
     assert "readmitted != " in _i.getsource(pfr)
 
@@ -365,7 +365,7 @@ def test_the_outgoing_binding_reissue_shim_is_gone():
     compensation for the sequencing defect, not a mechanism. With the requeue
     deferred behind the rebind (a), the first issue already lands on the
     incoming binding and the shim is objectless."""
-    import sglang.srt.managers.phase_flip_runtime as pfr
+    import flliper.srt.managers.phase_flip_runtime as pfr
 
     assert not hasattr(pfr, "reissue_seam_prefetch")
 
@@ -377,7 +377,7 @@ def test_the_owed_ledger_is_gone():
     the rot the upstream-minimal law names."""
     import inspect as _i
 
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
 
     src = _i.getsource(urc)
     assert "_reissue_pending" not in src
@@ -422,7 +422,7 @@ def test_1069_sinking_cohort_pending_is_bundle_progress():
     RISING must not. This is the exact 1068cap failure inverted: windows 2+3
     fired 'set has not shrunk for 51.8s' at a member whose prefix was
     actively growing."""
-    from sglang.srt.managers import phase_policy as pp
+    from flliper.srt.managers import phase_policy as pp
 
     state = pp.PhasePolicyState()
     # t=100: phase entry -- baseline, marker None, stamp comes from entry.
@@ -454,7 +454,7 @@ def test_1069_phase_entry_resets_the_cohort_marker():
     """A cutover ZEROES the cohort accounting; comparing across the phase
     boundary would credit that zeroing as service progress. The marker must
     restart with the phase (same law as last_running_bs / #833)."""
-    from sglang.srt.managers import phase_policy as pp
+    from flliper.srt.managers import phase_policy as pp
 
     state = pp.PhasePolicyState()
     pp.observe_idle(state, _ObserveStub("tp", 100.0, 8000))
@@ -478,7 +478,7 @@ def test_1069_dwell_holds_the_ppward_arm_and_is_bounded():
     SEAM_COHORT_DWELL_ROUNDS, so the hold can never become the W37-E wedge."""
     import inspect as _i
 
-    from sglang.srt.managers import phase_policy as pp
+    from flliper.srt.managers import phase_policy as pp
 
     src = _i.getsource(pp._decide_from_load)
     assert "seam cohort in service (#1069)" in src, (
@@ -521,7 +521,7 @@ def _defer_arm_slice():
     not) up to the arm's `_trace("defer_rid")`."""
     import inspect as _i
 
-    from sglang.srt.managers import scheduler_pp_mixin as mixin
+    from flliper.srt.managers import scheduler_pp_mixin as mixin
 
     src = _i.getsource(mixin.SchedulerPPMixin._pp_proxy_frame_pending)
     start = src.index('"defer_rid"')
@@ -557,7 +557,7 @@ def test_the_rank_local_shortfall_verdict_is_gone():
     deadman (1068cap 07:34:09, 1069cohort 08:00:55). Its own docstring named
     the return trip that made it safe; #969 CUT V had already deleted that
     emitter. The verdict is deleted, not repaired."""
-    from sglang.srt.managers import scheduler_pp_mixin as mixin
+    from flliper.srt.managers import scheduler_pp_mixin as mixin
 
     assert not hasattr(mixin.SchedulerPPMixin, "_pp_void_retracted_pass"), (
         "the rank-local shortfall void grew back: a downstream rank may not "
@@ -587,8 +587,8 @@ def test_the_told_local_comparison_mints_no_verdict():
     import ast as _ast
     import inspect as _i
 
-    from sglang.srt.managers import pp_admission_congruence as cong
-    from sglang.srt.managers import scheduler_pp_mixin as mixin
+    from flliper.srt.managers import pp_admission_congruence as cong
+    from flliper.srt.managers import scheduler_pp_mixin as mixin
 
     fn = next(
         n
@@ -624,7 +624,7 @@ def test_Aii_chain_recv_is_counter_bounded():
     way its sibling already is."""
     import inspect as _i
 
-    from sglang.srt.managers import pp_chain_receiver as pcr
+    from flliper.srt.managers import pp_chain_receiver as pcr
 
     src = _i.getsource(pcr.PpChainReceiver.recv)
     assert any(k in src for k in ("self.consumed", "sent", "max_messages")), (
@@ -693,7 +693,7 @@ def _occupant_throttle_sources():
     import inspect as _i
     import textwrap as _t
 
-    from sglang.srt.managers import scheduler_pp_mixin as mixin
+    from flliper.srt.managers import scheduler_pp_mixin as mixin
 
     src = _t.dedent(_i.getsource(mixin.SchedulerPPMixin._event_loop_pp_body))
     tree = _ast.parse(src)
@@ -810,7 +810,7 @@ def _void_relay_census():
     import ast as _ast
     import inspect as _i
 
-    from sglang.srt.managers import scheduler_pp_mixin as mixin
+    from flliper.srt.managers import scheduler_pp_mixin as mixin
 
     src = open(_i.getsourcefile(mixin)).read()
     tree = _ast.parse(src)
@@ -949,7 +949,7 @@ def _idle_branch_test_source():
     import inspect as _i
     import textwrap as _t
 
-    from sglang.srt.managers import scheduler_pp_mixin as mixin
+    from flliper.srt.managers import scheduler_pp_mixin as mixin
 
     src = _t.dedent(_i.getsource(mixin.SchedulerPPMixin._event_loop_pp_body))
     tree = _ast.parse(src)
@@ -1060,7 +1060,7 @@ def test_1079_the_horizon_instrument_moved_with_the_mechanism():
     their own throttles below it), but outside the candidate set."""
     import inspect as _i
 
-    from sglang.srt.managers import scheduler_pp_mixin as mixin
+    from flliper.srt.managers import scheduler_pp_mixin as mixin
 
     src = _i.getsource(mixin.SchedulerPPMixin._pp_occupant_horizon_message)
     assert "four-term" not in src, (

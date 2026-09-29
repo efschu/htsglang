@@ -78,14 +78,14 @@ from unittest import mock
 import torch
 
 try:
-    from sglang.test.ci.ci_register import register_cpu_ci
+    from flliper.test.ci.ci_register import register_cpu_ci
 except ImportError:  # pragma: no cover - registration is a CI-time marker
 
     def register_cpu_ci(*args, **kwargs):
         return None
 
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -248,8 +248,8 @@ class _RankFixture:
 def _run_backup(fixture, kv_tokens=CHUNK):
     """Run the REAL ``UnifiedRadixCache.write_backup`` on this rank and report
     whether the node was admitted to the host tier."""
-    from sglang.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from flliper.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     node = _FakeNode(BASE_COMPONENT_TYPE, kv_tokens, fixture.root_node)
     written = UnifiedRadixCache.write_backup(fixture, node)
@@ -257,7 +257,7 @@ def _run_backup(fixture, kv_tokens=CHUNK):
 
 
 def _build_group(floor_active=True, host_free=None, leaf_sets=None):
-    from sglang.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
+    from flliper.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
 
     host_free = LATE_RUN_HOST_FREE if host_free is None else host_free
     leaf_sets = BOOT_HOST_LEAF_SETS if leaf_sets is None else leaf_sets
@@ -342,7 +342,7 @@ def _build_hiradix_group(floor_active=True, host_free=None, floor=None):
 
 def _run_hiradix_backup(fixture, kv_tokens=CHUNK):
     """Run the REAL ``HiRadixCache.write_backup`` and report admission."""
-    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+    from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
 
     node = _HiRadixNode(kv_tokens, fixture.root_node)
     return HiRadixCache.write_backup(fixture, node) > 0
@@ -479,7 +479,7 @@ class UniformHostEvictFloorTest(CustomTestCase):
             return int(tree.uniform_host_avail_floor)
 
         with mock.patch(
-            "sglang.srt.mem_cache.unified_radix_cache.uniform_host_avail_for_backup",
+            "flliper.srt.mem_cache.unified_radix_cache.uniform_host_avail_for_backup",
             stale,
         ):
             counts = self._admissions_over_one_iteration()
@@ -668,7 +668,7 @@ class UniformHostEvictFloorTest(CustomTestCase):
         ``_evict_host_leaf`` stops removing the node from its parent, the
         chain this pin closes no longer exists and the justification would
         have to be rewritten rather than silently kept."""
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         src = inspect.getsource(UnifiedRadixCache._evict_host_leaf)
         self.assertIn(
@@ -685,7 +685,7 @@ class UniformHostEvictFloorTest(CustomTestCase):
         two ranks select the same nodes out of two different candidate sets,
         so 'push the floor into evict_host' is not an available fix.
         """
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         src = inspect.getsource(UnifiedRadixCache._is_host_leaf)
         self.assertIn(
@@ -705,8 +705,8 @@ class UniformHostEvictFloorTest(CustomTestCase):
         ``impl=UnifiedRadixCache``; ``HiRadixCache`` carries the same defect
         at its own ``evict_host`` retry and is fixed with it.
         """
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         for func, name in (
             (UnifiedRadixCache.write_backup, "UnifiedRadixCache.write_backup"),

@@ -96,7 +96,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=90)
 
@@ -156,7 +156,7 @@ class _GlooWire:
 def _pp0_decision():
     """PP0's verdict, exactly as instr17 logged it: two requests, one of them
     resting on a 16896-token prefix PP0 has and the victim does not."""
-    from sglang.srt.managers.pp_admission_congruence import (
+    from flliper.srt.managers.pp_admission_congruence import (
         PPAdmissionDecision,
         PPAdmissionEntry,
     )
@@ -191,7 +191,7 @@ def _proxy(rows):
 
 def _victim(wire, pp_rank=VICTIM):
     """The SHIPPED mixin methods, bound to a holder (the 630/757/795 pattern)."""
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         pp_group=wire,
@@ -232,7 +232,7 @@ def _reconcile_and_note(h, decision, local_match_lens, pp_rank=VICTIM):
     stubbed out is the tree-cache lookup that PRODUCES `local_match_lens`; the
     verdict it feeds, and the recording of that verdict, are shipped code.
     """
-    from sglang.srt.managers.pp_admission_congruence import (
+    from flliper.srt.managers.pp_admission_congruence import (
         reconcile_pp_admission_decision,
     )
 
@@ -260,7 +260,7 @@ def _worker(rank, init_file, out_dir, case):
             "gloo", init_method=f"file://{init_file}", rank=rank, world_size=WORLD
         )
         if rank == UPSTREAM:
-            from sglang.srt.managers.scheduler_pp_mixin import (
+            from flliper.srt.managers.scheduler_pp_mixin import (
                 pp_admission_decision_to_wire,
             )
 
@@ -275,7 +275,7 @@ def _worker(rank, init_file, out_dir, case):
             rows = VICTIM_TOKENS if case == "same_width" else UPSTREAM_ROWS
             wire.send_tensor_dict(_proxy(rows))
         elif rank == VICTIM:
-            from sglang.srt.managers.scheduler_pp_mixin import (
+            from flliper.srt.managers.scheduler_pp_mixin import (
                 pp_admission_decision_from_wire,
             )
 
@@ -290,7 +290,7 @@ def _worker(rank, init_file, out_dir, case):
                 # therefore NOT this rank's own narrowing.
                 from dataclasses import replace
 
-                from sglang.srt.managers.pp_admission_congruence import (
+                from flliper.srt.managers.pp_admission_congruence import (
                     PPAdmissionDecision,
                 )
 
@@ -345,7 +345,7 @@ def _blind_worker(rank, init_file, out_dir, case):
     mean the harness never depended on the fix rather than that the fix is
     present. A wholesale revert would prove neither.
     """
-    from sglang.srt.managers import scheduler_pp_mixin as m
+    from flliper.srt.managers import scheduler_pp_mixin as m
 
     m.entries_retracted_by_rank = lambda decision, rank: ()
     return _worker(rank, init_file, out_dir, case)

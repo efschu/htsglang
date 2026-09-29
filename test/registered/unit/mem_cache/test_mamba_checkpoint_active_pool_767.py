@@ -29,7 +29,7 @@ def _pool(tag):
 
 class TestTheHelperResolvesTheActivePool(unittest.TestCase):
     def _helper(self):
-        from sglang.srt.mem_cache.mamba_state_pool import active_mamba_state_pool
+        from flliper.srt.mem_cache.mamba_state_pool import active_mamba_state_pool
 
         return active_mamba_state_pool
 
@@ -67,7 +67,7 @@ class TestTheFlipBootInstallsTheResolver(unittest.TestCase):
         ), pp_pool, tp_pool
 
     def _install(self, scheduler):
-        from sglang.srt.managers.gdn_flip_mover import (
+        from flliper.srt.managers.gdn_flip_mover import (
             install_phase_aware_mamba_state_pool,
         )
 
@@ -111,13 +111,13 @@ class TestTheCheckpointCopySitesUseTheHelper(unittest.TestCase):
 
     def test_the_unified_component_routes_through_the_helper(self):
         src = self._source(
-            "sglang.srt.mem_cache.unified_cache_components.mamba_component"
+            "flliper.srt.mem_cache.unified_cache_components.mamba_component"
         )
         self.assertIn("active_mamba_state_pool", src)
         self.assertNotIn("req_to_token_pool.mamba_pool.copy_from", src)
 
     def test_the_mamba_radix_cache_routes_through_the_helper(self):
-        src = self._source("sglang.srt.mem_cache.mamba_radix_cache")
+        src = self._source("flliper.srt.mem_cache.mamba_radix_cache")
         self.assertIn("active_mamba_state_pool", src)
         self.assertNotIn("req_to_token_pool.mamba_pool.copy_from", src)
 

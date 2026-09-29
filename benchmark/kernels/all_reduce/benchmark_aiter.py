@@ -1,5 +1,5 @@
 """
-Benchmark SGLang vs Aiter custom all-reduce across message sizes.
+Benchmark fLLiper vs Aiter custom all-reduce across message sizes.
 Usage:
     torchrun --nproc_per_node=2 benchmark_aiter.py
     torchrun --nproc_per_node=4 benchmark_aiter.py
@@ -18,7 +18,7 @@ import torch.distributed as dist
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Benchmark SGLang vs Aiter custom all-reduce across message sizes."
+        description="Benchmark fLLiper vs Aiter custom all-reduce across message sizes."
     )
     parser.add_argument(
         "--backend",
@@ -215,18 +215,18 @@ def main():
     # Import after dist init; some libs query torch dist state on import
     sgl_comm = None
     aiter_comm = None
-    HAVE_SGLANG = False
+    HAVE_FLLIPER = False
     HAVE_AITER = False
 
     try:
-        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        from flliper.srt.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce as SGLCustomAllreduce,
         )
 
-        HAVE_SGLANG = True
+        HAVE_FLLIPER = True
     except Exception as e:
         if rank == 0:
-            print(f"SGLang CustomAllreduce import failed: {e}", file=sys.stderr)
+            print(f"fLLiper CustomAllreduce import failed: {e}", file=sys.stderr)
 
     try:
         from aiter.dist.device_communicators.custom_all_reduce import (
@@ -241,19 +241,19 @@ def main():
     if rank == 0:
         print(f"Initialized PG backend={args.backend} world_size={world_size}")
         print(f"Device: {device.type}:{device.index}")
-        print(f"SGLang available: {HAVE_SGLANG}, Aiter available: {HAVE_AITER}")
+        print(f"fLLiper available: {HAVE_FLLIPER}, Aiter available: {HAVE_AITER}")
 
     pg = dist.group.WORLD
     sizes = get_message_sizes()
     max_size = max(sizes) if sizes else (64 * 1024 * 1024)
 
-    if HAVE_SGLANG:
+    if HAVE_FLLIPER:
         try:
             sgl_comm = SGLCustomAllreduce(group=pg, device=device, max_size=max_size)
         except Exception as e:
             if rank == 0:
                 print(
-                    f"Failed to construct SGLang CustomAllreduce: {e}", file=sys.stderr
+                    f"Failed to construct fLLiper CustomAllreduce: {e}", file=sys.stderr
                 )
             sgl_comm = None
 
@@ -274,7 +274,7 @@ def main():
 
     if sgl_comm is not None:
         sgl_results = bench_impl(
-            name="SGLang",
+            name="fLLiper",
             comm=sgl_comm,
             sizes=sizes,
             device=device,
@@ -307,7 +307,7 @@ def main():
 
     if dist.get_rank() == 0:
         print("\nResults (avg ms across ranks; None = disabled/unavailable):")
-        header = f"{'Size':>8}  {'SGLang(ms)':>12}  {'Aiter(ms)':>11}"
+        header = f"{'Size':>8}  {'fLLiper(ms)':>12}  {'Aiter(ms)':>11}"
         print(header)
         print("-" * len(header))
 

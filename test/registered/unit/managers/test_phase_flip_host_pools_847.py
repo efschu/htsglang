@@ -23,16 +23,16 @@ What changes is that the pool can now EXIST and is PRICED: a small staging pin
 and the floor never does.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 import types
 import unittest
 
-from sglang.srt.managers.phase_flip_boot import build_phase_flip_host_pools
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.phase_flip_boot import build_phase_flip_host_pools
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.test.test_utils import CustomTestCase
 
 
 #: The Boot-2 pp pool (WEG1_BUILD_SPEC_0901 section 5): 366211 rows of
@@ -172,13 +172,13 @@ def _build_patched(sched, builder=None):
     builder = builder if builder is not None else _FakeBuildKVHostPool()
     with (
         mock.patch(
-            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.build_kv_host_pool",
+            "flliper.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.build_kv_host_pool",
             new=builder,
         ),
         mock.patch(
-            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.build_pool_entry"
+            "flliper.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.build_pool_entry"
         ) as entry,
-        mock.patch("sglang.srt.mem_cache.memory_pool_host.HostPoolGroup") as grp,
+        mock.patch("flliper.srt.mem_cache.memory_pool_host.HostPoolGroup") as grp,
     ):
         entry.side_effect = lambda **kw: types.SimpleNamespace(**kw)
         grp.side_effect = lambda entries: types.SimpleNamespace(
@@ -257,7 +257,7 @@ def _build_hybrid(sched, mamba=None):
     import unittest.mock as mock
 
     mamba = mamba if mamba is not None else _FakeMambaPoolHost()
-    with mock.patch("sglang.srt.mem_cache.memory_pool_host.MambaPoolHost", new=mamba):
+    with mock.patch("flliper.srt.mem_cache.memory_pool_host.MambaPoolHost", new=mamba):
         pools, builder = _build_patched(sched)
     return pools, builder, mamba
 
@@ -384,7 +384,7 @@ class TestTheTpPinIsRowCoupledToThePpPool(CustomTestCase):
         # log rather than silently skipped: 30518 rows would be refused under
         # any positive chunk, and the operator must be able to see why not.
         s = _sched(pp_host=_PPHost(_PPKVHost(size=30518)), chunked_prefill_size=-1)
-        with self.assertLogs("sglang.srt.managers.phase_flip_boot", level="WARNING") as logs:
+        with self.assertLogs("flliper.srt.managers.phase_flip_boot", level="WARNING") as logs:
             pools, _ = _build_patched(s)
         self.assertIn("tp", pools)
         self.assertTrue(
@@ -519,7 +519,7 @@ class TestTheRefusalIsCONVERTEDNotDeleted(CustomTestCase):
         # THE REAL GUARD, not a restatement. This is the W32 failure exactly,
         # and it must remain reachable -- the point of #847 is that the pool
         # can now exist, never that the check was removed.
-        from sglang.srt.mem_cache.hicache_phase_binding import (
+        from flliper.srt.mem_cache.hicache_phase_binding import (
             RebindRefused,
             phase_pools_for,
         )
@@ -545,7 +545,7 @@ class TestTheBootWiresIt(CustomTestCase):
     def test_the_ledger_post_is_named(self):
         import inspect
 
-        from sglang.srt.managers import phase_flip_boot
+        from flliper.srt.managers import phase_flip_boot
 
         src = inspect.getsource(phase_flip_boot.build_phase_flip_host_pools)
         self.assertIn("HOST-LEDGER POST", src)
@@ -575,7 +575,7 @@ class TestTheHostTierAccessorKnowsTheLiveTree(CustomTestCase):
     """
 
     def test_the_direct_attribute_route(self):
-        from sglang.srt.managers.phase_flip_boot import host_tier_of
+        from flliper.srt.managers.phase_flip_boot import host_tier_of
 
         pool = object()
         self.assertIs(
@@ -583,7 +583,7 @@ class TestTheHostTierAccessorKnowsTheLiveTree(CustomTestCase):
         )
 
     def test_the_cache_controller_route_the_live_tree_uses(self):
-        from sglang.srt.managers.phase_flip_boot import host_tier_of
+        from flliper.srt.managers.phase_flip_boot import host_tier_of
 
         pool = object()
         tree = types.SimpleNamespace(
@@ -593,7 +593,7 @@ class TestTheHostTierAccessorKnowsTheLiveTree(CustomTestCase):
         self.assertIs(host_tier_of(tree), pool)
 
     def test_absent_is_absent_not_a_route_i_forgot_to_look_at(self):
-        from sglang.srt.managers.phase_flip_boot import host_tier_of
+        from flliper.srt.managers.phase_flip_boot import host_tier_of
 
         self.assertIsNone(host_tier_of(types.SimpleNamespace()))
         self.assertIsNone(host_tier_of(None))
@@ -605,7 +605,7 @@ class TestTheHostTierAccessorKnowsTheLiveTree(CustomTestCase):
         # route that only some trees have, which is the whole defect.
         import inspect
 
-        from sglang.srt.mem_cache import unified_radix_cache
+        from flliper.srt.mem_cache import unified_radix_cache
 
         src = inspect.getsource(unified_radix_cache)
         self.assertNotIn(
@@ -618,7 +618,7 @@ class TestTheHostTierAccessorKnowsTheLiveTree(CustomTestCase):
     def test_the_writer_uses_the_named_accessor(self):
         import inspect
 
-        from sglang.srt.managers import phase_flip_boot
+        from flliper.srt.managers import phase_flip_boot
 
         src = inspect.getsource(phase_flip_boot.build_phase_flip_host_pools)
         self.assertIn("host_tier_of(tree)", src)
@@ -656,8 +656,8 @@ class TestTheDevicePoolIsUnwrappedLikeTheConsumerDoes(CustomTestCase):
     def test_the_writer_unwraps_the_same_field_the_consumer_does(self):
         import inspect
 
-        from sglang.srt.managers import phase_flip_boot
-        from sglang.srt.mem_cache import hicache_phase_binding
+        from flliper.srt.managers import phase_flip_boot
+        from flliper.srt.mem_cache import hicache_phase_binding
 
         writer = inspect.getsource(phase_flip_boot.build_phase_flip_host_pools)
         consumer = inspect.getsource(hicache_phase_binding.phase_pools_for)
@@ -676,7 +676,7 @@ class TestTheCompositeCanStateItsLayerCount(CustomTestCase):
     (this fork's live shape) the check could only read None and refuse."""
 
     def test_the_group_delegates_layer_num_to_its_anchor(self):
-        from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+        from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup
 
         self.assertTrue(
             isinstance(getattr(HostPoolGroup, "layer_num", None), property),
@@ -688,7 +688,7 @@ class TestTheCompositeCanStateItsLayerCount(CustomTestCase):
         # kind of question and must not be answered differently.
         import inspect
 
-        from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+        from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup
 
         src = inspect.getsource(HostPoolGroup)
         self.assertIn("self.anchor_entry.host_pool.layer_num", src)

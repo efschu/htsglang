@@ -14,9 +14,9 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.read_buffer_pool import ReadBufferPool
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.mem_cache.read_buffer_pool import ReadBufferPool
 
 PAGE = 64
 
@@ -165,7 +165,7 @@ def test_a_raised_read_returns_the_borrowed_buffers():
 
 
 def _mha_pool(layout, page_size, layer_num=4, head_num=2, head_dim=8, size=64):
-    from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+    from flliper.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
     pool = object.__new__(MHATokenToKVPoolHost)
     pool.layout = layout

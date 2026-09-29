@@ -6,16 +6,16 @@ import tempfile
 import time
 import unittest
 
-from sglang.srt.rigmon.kvbudget import describe_budget, list_budget_files, reset_budget
-from sglang.srt.rigmon.provenance import (
+from flliper.srt.rigmon.kvbudget import describe_budget, list_budget_files, reset_budget
+from flliper.srt.rigmon.provenance import (
     RunRecord,
     capture_provenance,
     compare_runs,
     model_fingerprint,
     state_summary,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -161,7 +161,7 @@ class TestProvenance(CustomTestCase):
     def test_command_line_is_copyable(self):
         p = capture_provenance(["--model", "/m", "--tp-size", "3"], env={})
         self.assertEqual(
-            p.command_line(), "python -m sglang.launch_server --model /m --tp-size 3"
+            p.command_line(), "python -m flliper.launch_server --model /m --tp-size 3"
         )
 
     def test_model_fingerprint_changes_with_the_checkpoint(self):

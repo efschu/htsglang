@@ -7,9 +7,9 @@ import unittest
 
 import torch
 
-from sglang.srt.utils import get_cuda_driver_bindings, is_flashinfer_available
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils import get_cuda_driver_bindings, is_flashinfer_available
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="2-gpu-large")
 
@@ -43,7 +43,7 @@ def _run_rank(rank, world_size, port, scenario, result_q):
         )
         cpu_group = dist.group.WORLD
 
-        from sglang.srt.layers.flashinfer_comm_fusion import (
+        from flliper.srt.layers.flashinfer_comm_fusion import (
             _make_flashinfer_workspace_allocation_prop,
             _preflight_check_workspace_memory,
         )
@@ -132,7 +132,7 @@ class TestFlashInferPreflightDistributed(CustomTestCase):
         if not is_flashinfer_available():
             raise unittest.SkipTest("FlashInfer is not available")
         try:
-            from sglang.srt.layers.flashinfer_comm_fusion import (
+            from flliper.srt.layers.flashinfer_comm_fusion import (
                 _make_flashinfer_workspace_allocation_prop,
             )
 

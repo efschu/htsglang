@@ -34,8 +34,8 @@ import sys
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -46,7 +46,7 @@ _BOOT = _REPO / "scripts" / "gpu_battery" / "_bar1_host_boot.sh"
 #: Verbatim what the boot script echoes last, and the reason the pid was dirty.
 _BOOT_CHATTER = "gestartet, pid 1962637"
 
-_TREIBER = r"""
+_DRIVER = r"""
 set -uo pipefail
 
 : "${STUB_PIDFILE_INHALT=1962637}"     # OHNE Doppelpunkt: eine ausdruecklich
@@ -126,38 +126,38 @@ esac
 """
 
 
-def _lauf(unterbefehl, *args, **env):
+def _run(unterbefehl, *args, **env):
     """Run the driver under `bash -u` with a fresh protocol file."""
     with tempfile.TemporaryDirectory() as tmp:
         d = pathlib.Path(tmp)
-        treiber = d / "treiber.sh"
-        treiber.write_text(
-            _TREIBER.replace("@@BOOT@@", str(_BOOT))
+        driver = d / "treiber.sh"
+        driver.write_text(
+            _DRIVER.replace("@@BOOT@@", str(_BOOT))
             .replace("@@CHATTER@@", _BOOT_CHATTER)
         )
-        protokoll = d / "protokoll.txt"
-        protokoll.write_text("")
-        umgebung = {
+        log_lines = d / "protokoll.txt"
+        log_lines.write_text("")
+        env_vars = {
             "PATH": "/usr/bin:/bin",
             "HOME": str(d),
-            "PROTOKOLL": str(protokoll),
+            "PROTOKOLL": str(log_lines),
             # Auch wenn auf dieser Maschine eine Karte laege: keine wird angefasst.
             "CUDA_VISIBLE_DEVICES": "99",
         }
-        umgebung.update({k: str(v) for k, v in env.items()})
-        fertig = subprocess.run(
-            ["bash", "-u", str(treiber), unterbefehl, *args],
-            env=umgebung, capture_output=True, text=True, timeout=60,
+        env_vars.update({k: str(v) for k, v in env.items()})
+        done = subprocess.run(
+            ["bash", "-u", str(driver), unterbefehl, *args],
+            env=env_vars, capture_output=True, text=True, timeout=60,
         )
-        return fertig, protokoll.read_text()
+        return done, log_lines.read_text()
 
 
 class TestPidOnStdoutOnly(CustomTestCase):
     """The falsifier. Without the `>&2` this test goes red."""
 
     def test_boot_start_returns_the_bare_pid(self):
-        fertig, _ = _lauf("boot_start")
-        self.assertIn("PID[1962637]", fertig.stdout, msg=fertig.stdout)
+        done, _ = _run("boot_start")
+        self.assertIn("PID[1962637]", done.stdout, msg=done.stdout)
 
     def test_the_boot_chatter_does_not_reach_stdout(self):
         """It has to go SOMEWHERE -- stderr -- not disappear.
@@ -165,20 +165,20 @@ class TestPidOnStdoutOnly(CustomTestCase):
         Silencing the boot message would trade one fault for another: the
         step's log is where a failed boot is read from.
         """
-        fertig, _ = _lauf("boot_start")
-        self.assertNotIn(_BOOT_CHATTER, fertig.stdout)
-        self.assertIn(_BOOT_CHATTER, fertig.stderr)
+        done, _ = _run("boot_start")
+        self.assertNotIn(_BOOT_CHATTER, done.stdout)
+        self.assertIn(_BOOT_CHATTER, done.stderr)
 
     def test_a_pidfile_with_noise_still_yields_a_bare_pid(self):
         """The file is filtered too -- belt and braces, the file is the
         second source the cleanup path falls back to."""
-        fertig, _ = _lauf("boot_start", STUB_PIDFILE_INHALT="pid: 4242\n")
-        self.assertIn("PID[4242]", fertig.stdout, msg=fertig.stdout)
+        done, _ = _run("boot_start", STUB_PIDFILE_INHALT="pid: 4242\n")
+        self.assertIn("PID[4242]", done.stdout, msg=done.stdout)
 
     def test_an_empty_pidfile_is_a_failure_not_an_empty_pid(self):
-        fertig, _ = _lauf("boot_start", STUB_PIDFILE_INHALT="")
-        self.assertIn("PID[<rc!=0>]", fertig.stdout, msg=fertig.stdout)
-        self.assertIn("kein brauchbarer Host-pid", fertig.stderr)
+        done, _ = _run("boot_start", STUB_PIDFILE_INHALT="")
+        self.assertIn("PID[<rc!=0>]", done.stdout, msg=done.stdout)
+        self.assertIn("kein brauchbarer Host-pid", done.stderr)
 
 
 class TestPidValidation(CustomTestCase):
@@ -186,11 +186,11 @@ class TestPidValidation(CustomTestCase):
 
     def test_accepts_a_plain_number(self):
         for gut in ("1", "42", "1962637"):
-            fertig, _ = _lauf("pid_ok", gut)
-            self.assertEqual(fertig.stdout.strip(), "OK", msg=gut)
+            done, _ = _run("pid_ok", gut)
+            self.assertEqual(done.stdout.strip(), "OK", msg=gut)
 
     def test_rejects_everything_else(self):
-        schlecht = [
+        bad = [
             "",
             "0",
             "gestartet, pid 1962637",
@@ -200,17 +200,17 @@ class TestPidValidation(CustomTestCase):
             "12.5",
             _BOOT_CHATTER + "\n1962637",
         ]
-        for wert in schlecht:
-            fertig, _ = _lauf("pid_ok", wert)
-            self.assertEqual(fertig.stdout.strip(), "NEIN", msg=repr(wert))
+        for value in bad:
+            done, _ = _run("pid_ok", value)
+            self.assertEqual(done.stdout.strip(), "NEIN", msg=repr(value))
 
 
 class TestCleanupReallyKills(CustomTestCase):
     """Two sources for the pid, and a look afterwards."""
 
     def test_a_valid_pid_is_killed(self):
-        _, protokoll = _lauf("kill_server", "4242")
-        self.assertIn("DUMP_AND_KILL[4242]", protokoll)
+        _, log_lines = _run("kill_server", "4242")
+        self.assertIn("DUMP_AND_KILL[4242]", log_lines)
 
     def test_a_junk_pid_falls_back_to_the_host_pidfile(self):
         """The regression, exactly.
@@ -219,17 +219,17 @@ class TestCleanupReallyKills(CustomTestCase):
         all. Now the pidfile the boot script wrote is the second source --
         which also covers a step that died between boot and assignment.
         """
-        _, protokoll = _lauf("kill_server", _BOOT_CHATTER, STUB_PIDFILE_INHALT="777")
-        self.assertIn("DUMP_AND_KILL[777]", protokoll)
+        _, log_lines = _run("kill_server", _BOOT_CHATTER, STUB_PIDFILE_INHALT="777")
+        self.assertIn("DUMP_AND_KILL[777]", log_lines)
 
     def test_an_empty_variable_falls_back_too(self):
-        _, protokoll = _lauf("kill_server", "", STUB_PIDFILE_INHALT="888")
-        self.assertIn("DUMP_AND_KILL[888]", protokoll)
+        _, log_lines = _run("kill_server", "", STUB_PIDFILE_INHALT="888")
+        self.assertIn("DUMP_AND_KILL[888]", log_lines)
 
     def test_nothing_anywhere_kills_nothing(self):
         """Negative control: no pid must not become a kill of something else."""
-        _, protokoll = _lauf("kill_server", "", STUB_PIDFILE_INHALT="")
-        self.assertEqual(protokoll.strip(), "")
+        _, log_lines = _run("kill_server", "", STUB_PIDFILE_INHALT="")
+        self.assertEqual(log_lines.strip(), "")
 
     def test_a_survivor_is_reported_loudly(self):
         """A kill nobody checked is an intention, and the intention was
@@ -238,21 +238,21 @@ class TestCleanupReallyKills(CustomTestCase):
         Timeout/poll shrunk to keep this fast -- the bound itself (its
         default 15s/1s) is exercised by TestBoundedKillNachschau below.
         """
-        fertig, protokoll = _lauf(
+        done, log_lines = _run(
             "kill_server", "4242", STUB_KILL0_RC=0,
             BAR1_KILL_NACHSCHAU_TIMEOUT_S=1, BAR1_KILL_NACHSCHAU_POLL_S=1,
         )
-        self.assertIn("DUMP_AND_KILL[4242]", protokoll)
-        self.assertIn("lebt nach dem Abraeumen noch", fertig.stderr)
-        self.assertIn("RC!=0", fertig.stdout)
+        self.assertIn("DUMP_AND_KILL[4242]", log_lines)
+        self.assertIn("lebt nach dem Abraeumen noch", done.stderr)
+        self.assertIn("RC!=0", done.stdout)
 
     def test_a_dead_process_is_reported_as_cleaned(self):
-        fertig, _ = _lauf("kill_server", "4242", STUB_KILL0_RC=1)
-        self.assertIn("abgeraeumt", fertig.stdout)
-        self.assertNotIn("RC!=0", fertig.stdout)
+        done, _ = _run("kill_server", "4242", STUB_KILL0_RC=1)
+        self.assertIn("abgeraeumt", done.stdout)
+        self.assertNotIn("RC!=0", done.stdout)
 
 
-class TestBoundedKillNachschau(CustomTestCase):
+class TestBoundedKillRecheck(CustomTestCase):
     """The race from 2026-07-30, reproduced through the pid, not the host.
 
     A single, instant ``kill -0`` right after the kill is blind to the
@@ -265,14 +265,14 @@ class TestBoundedKillNachschau(CustomTestCase):
     def test_a_delayed_death_within_the_bound_still_counts_as_cleaned(self):
         """Kill sent, process dies delayed: the verdict stays a clean
         "abgeraeumt", not a survivor report."""
-        fertig, protokoll = _lauf(
+        done, log_lines = _run(
             "kill_server", "4242", STUB_KILL0_SEQ="0,0,1",
             BAR1_KILL_NACHSCHAU_TIMEOUT_S=5, BAR1_KILL_NACHSCHAU_POLL_S=1,
         )
-        self.assertIn("DUMP_AND_KILL[4242]", protokoll)
-        self.assertIn("abgeraeumt", fertig.stdout, msg=fertig.stdout + fertig.stderr)
-        self.assertNotIn("RC!=0", fertig.stdout)
-        self.assertNotIn("lebt nach dem Abraeumen noch", fertig.stderr)
+        self.assertIn("DUMP_AND_KILL[4242]", log_lines)
+        self.assertIn("abgeraeumt", done.stdout, msg=done.stdout + done.stderr)
+        self.assertNotIn("RC!=0", done.stdout)
+        self.assertNotIn("lebt nach dem Abraeumen noch", done.stderr)
 
     def test_a_process_that_never_dies_is_reported_as_its_own_state(self):
         """Not within the bound: an honest "Aufraeumen unvollstaendig" state
@@ -281,14 +281,14 @@ class TestBoundedKillNachschau(CustomTestCase):
         caller (s11/s12 cleanup()) already treats this as non-fatal
         (`|| true`); this test pins that the message itself never claims
         "Altlast"."""
-        fertig, protokoll = _lauf(
+        done, log_lines = _run(
             "kill_server", "4242", STUB_KILL0_SEQ="0,0,0,0,0",
             BAR1_KILL_NACHSCHAU_TIMEOUT_S=2, BAR1_KILL_NACHSCHAU_POLL_S=1,
         )
-        self.assertIn("DUMP_AND_KILL[4242]", protokoll)
-        self.assertIn("lebt nach dem Abraeumen noch", fertig.stderr)
-        self.assertNotIn("STOP: Altlast von einem vorherigen Anlauf", fertig.stderr)
-        self.assertIn("RC!=0", fertig.stdout)
+        self.assertIn("DUMP_AND_KILL[4242]", log_lines)
+        self.assertIn("lebt nach dem Abraeumen noch", done.stderr)
+        self.assertNotIn("STOP: Altlast von einem vorherigen Anlauf", done.stderr)
+        self.assertIn("RC!=0", done.stdout)
 
 
 class TestLeftoverDetection(CustomTestCase):
@@ -300,50 +300,50 @@ class TestLeftoverDetection(CustomTestCase):
     holds it -- which is exactly the condition the BAR1 setup depends on.
     """
 
-    SAUBER = "PORT=0\nPROC=0\nVRAM=12, 8, 10,\n"
+    CLEAN = "PORT=0\nPROC=0\nVRAM=12, 8, 10,\n"
 
     def test_a_clean_host_passes(self):
-        fertig, _ = _lauf("altlast", STUB_ALTLAST=self.SAUBER)
-        self.assertIn("FREI", fertig.stdout, msg=fertig.stdout + fertig.stderr)
+        done, _ = _run("altlast", STUB_ALTLAST=self.CLEAN)
+        self.assertIn("FREI", done.stdout, msg=done.stdout + done.stderr)
 
     def test_a_busy_port_aborts(self):
-        fertig, _ = _lauf("altlast", STUB_ALTLAST="PORT=1\nPROC=0\nVRAM=12, 8, 10,\n")
-        self.assertIn("ALTLAST", fertig.stdout)
-        self.assertIn("Port-30030-belegt", fertig.stderr)
+        done, _ = _run("altlast", STUB_ALTLAST="PORT=1\nPROC=0\nVRAM=12, 8, 10,\n")
+        self.assertIn("ALTLAST", done.stdout)
+        self.assertIn("Port-30030-belegt", done.stderr)
 
     def test_a_live_launch_server_aborts(self):
-        fertig, _ = _lauf("altlast", STUB_ALTLAST="PORT=0\nPROC=4\nVRAM=12, 8, 10,\n")
-        self.assertIn("ALTLAST", fertig.stdout)
-        self.assertIn("launch_server-Prozesse=4", fertig.stderr)
+        done, _ = _run("altlast", STUB_ALTLAST="PORT=0\nPROC=4\nVRAM=12, 8, 10,\n")
+        self.assertIn("ALTLAST", done.stdout)
+        self.assertIn("launch_server-Prozesse=4", done.stderr)
 
     def test_occupied_vram_aborts_and_names_the_card(self):
         """The one that actually fired: the holder returned ENOMEM because
         the cards were still full, and the gate read as a bar1 fault."""
-        fertig, _ = _lauf(
+        done, _ = _run(
             "altlast", STUB_ALTLAST="PORT=0\nPROC=0\nVRAM=12, 19850, 10,\n"
         )
-        self.assertIn("ALTLAST", fertig.stdout)
-        self.assertIn("GPU1=19850MiB", fertig.stderr)
+        self.assertIn("ALTLAST", done.stdout)
+        self.assertIn("GPU1=19850MiB", done.stderr)
 
     def test_the_threshold_is_adjustable_and_respected(self):
-        fertig, _ = _lauf(
+        done, _ = _run(
             "altlast",
             STUB_ALTLAST="PORT=0\nPROC=0\nVRAM=12, 2500, 10,\n",
             BAR1_ALTLAST_MIB=4000,
         )
-        self.assertIn("FREI", fertig.stdout, msg=fertig.stdout + fertig.stderr)
+        self.assertIn("FREI", done.stdout, msg=done.stdout + done.stderr)
 
     def test_the_check_never_kills(self):
         """It only names what it finds. What runs on those cards need not be
         ours, and a broad pkill is exactly the blast radius the rig rules
         rule out."""
-        _, protokoll = _lauf(
+        _, log_lines = _run(
             "altlast", STUB_ALTLAST="PORT=1\nPROC=9\nVRAM=20000, 20000, 20000,\n"
         )
-        self.assertEqual(protokoll.strip(), "")
+        self.assertEqual(log_lines.strip(), "")
 
 
-class TestStaleBerichtDoesNotSurviveACleanPass(CustomTestCase):
+class TestStaleReportDoesNotSurviveACleanPass(CustomTestCase):
     """The 2026-07-30 finding, exactly: Anlauf 5 wrote 'Altlast:
     launch_server-Prozesse=4' to blocked.txt. Ten minutes later Anlauf 6 ran
     completely clean -- but compose() still read that same, never-cleared
@@ -352,42 +352,42 @@ class TestStaleBerichtDoesNotSurviveACleanPass(CustomTestCase):
     THAT step's own artifacts, never a leftover from a different attempt.
     """
 
-    def _bericht_pfad(self):
+    def _report_path(self):
         return pathlib.Path("/tmp/blocked")
 
     def test_a_stale_report_does_not_survive_a_clean_pass(self):
-        bericht = self._bericht_pfad()
-        bericht.write_text("Altlast:launch_server-Prozesse=4\n")
+        report = self._report_path()
+        report.write_text("Altlast:launch_server-Prozesse=4\n")
         try:
-            fertig, _ = _lauf(
+            done, _ = _run(
                 "altlast",
                 STUB_ALTLAST="PORT=0\nPROC=0\nVRAM=12, 8, 10,\n",
             )
-            self.assertIn("FREI", fertig.stdout, msg=fertig.stdout + fertig.stderr)
+            self.assertIn("FREI", done.stdout, msg=done.stdout + done.stderr)
             self.assertFalse(
-                bericht.exists(),
+                report.exists(),
                 msg="ein sauberer Durchlauf muss den alten Bericht loeschen, "
                     "nicht liegen lassen",
             )
         finally:
-            bericht.unlink(missing_ok=True)
+            report.unlink(missing_ok=True)
 
     def test_a_failing_pass_overwrites_a_stale_report_with_its_own_finding(self):
         """The file must still do its job for a run that IS blocked -- just
         with THIS run's own finding, not a mix with an older one."""
-        bericht = self._bericht_pfad()
-        bericht.write_text("Altlast:GPU2=30000MiB\n")
+        report = self._report_path()
+        report.write_text("Altlast:GPU2=30000MiB\n")
         try:
-            fertig, _ = _lauf(
+            done, _ = _run(
                 "altlast",
                 STUB_ALTLAST="PORT=0\nPROC=4\nVRAM=12, 8, 10,\n",
             )
-            self.assertIn("ALTLAST", fertig.stdout)
-            inhalt = bericht.read_text()
-            self.assertIn("launch_server-Prozesse=4", inhalt)
-            self.assertNotIn("GPU2=30000MiB", inhalt)
+            self.assertIn("ALTLAST", done.stdout)
+            content = report.read_text()
+            self.assertIn("launch_server-Prozesse=4", content)
+            self.assertNotIn("GPU2=30000MiB", content)
         finally:
-            bericht.unlink(missing_ok=True)
+            report.unlink(missing_ok=True)
 
 
 class TestPgrepSelfMatchTrap(CustomTestCase):
@@ -406,8 +406,8 @@ class TestPgrepSelfMatchTrap(CustomTestCase):
     ``bash -c`` -- no ssh, no host, no card, same as the rest of this file.
     """
 
-    def _lauf_real(self, **env):
-        return _lauf("altlast", STUB_ALTLAST_REAL="1", **env)
+    def _run_real(self, **env):
+        return _run("altlast", STUB_ALTLAST_REAL="1", **env)
 
     @staticmethod
     def _real_launch_servers() -> int:
@@ -450,40 +450,40 @@ class TestPgrepSelfMatchTrap(CustomTestCase):
         original bug, and it is still caught here whether the host is idle or
         busy.
         """
-        vorher = self._real_launch_servers()
-        fertig, _ = self._lauf_real()
-        ausgabe = fertig.stdout + fertig.stderr
-        treffer = re.search(r"launch_server-Prozesse=(\d+)", ausgabe)
+        before = self._real_launch_servers()
+        done, _ = self._run_real()
+        output = done.stdout + done.stderr
+        hits = re.search(r"launch_server-Prozesse=(\d+)", output)
         self.assertIsNotNone(
-            treffer, msg=f"no process count in the output at all: {ausgabe}"
+            hits, msg=f"no process count in the output at all: {output}"
         )
-        gemeldet = int(treffer.group(1))
-        nachher = self._real_launch_servers()
+        reported = int(hits.group(1))
+        after = self._real_launch_servers()
         # The oracle is sampled either side so a process starting or stopping
         # mid-run widens the window instead of flaking the assertion.
         self.assertIn(
-            gemeldet, {vorher, nachher},
-            msg=(f"script reported {gemeldet} launch_server process(es), "
-                 f"/proc says {vorher}..{nachher}. One MORE than the oracle "
+            reported, {before, after},
+            msg=(f"script reported {reported} launch_server process(es), "
+                 f"/proc says {before}..{after}. One MORE than the oracle "
                  f"is the self-match bug: the checking shell counted its own "
-                 f"command line.\n{ausgabe}"),
+                 f"command line.\n{output}"),
         )
 
     def test_a_real_launch_server_named_process_is_still_counted(self):
         """Positive control: an actual process whose command line carries
         the un-bracketed name must still be found -- the fix must not trade
         a false positive for a false negative."""
-        attrappe = subprocess.Popen(
+        dummy = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(10)",
-             "sglang.launch_server"],
+             "flliper.launch_server"],
         )
         try:
-            fertig, _ = self._lauf_real()
-            self.assertIn("ALTLAST", fertig.stdout, msg=fertig.stdout + fertig.stderr)
-            self.assertIn("launch_server-Prozesse=", fertig.stderr)
+            done, _ = self._run_real()
+            self.assertIn("ALTLAST", done.stdout, msg=done.stdout + done.stderr)
+            self.assertIn("launch_server-Prozesse=", done.stderr)
         finally:
-            attrappe.terminate()
-            attrappe.wait(timeout=5)
+            dummy.terminate()
+            dummy.wait(timeout=5)
 
 
 class TestBothStepsUseIt(CustomTestCase):
@@ -493,26 +493,26 @@ class TestBothStepsUseIt(CustomTestCase):
         return (_REPO / "scripts" / "gpu_battery" / name).read_text(encoding="utf-8")
 
     def test_both_steps_check_for_leftovers_before_booting(self):
-        for schritt in ("s11_bar1_e2e.sh", "s12_prefill_kurve.sh"):
-            self.assertIn("bar1_altlast_pruefen", self._text(schritt), msg=schritt)
+        for step in ("s11_bar1_e2e.sh", "s12_prefill_kurve.sh"):
+            self.assertIn("bar1_altlast_pruefen", self._text(step), msg=step)
 
     def test_both_steps_clean_up_through_the_checked_path(self):
-        for schritt in ("s11_bar1_e2e.sh", "s12_prefill_kurve.sh"):
-            text = self._text(schritt)
-            self.assertIn("bar1_kill_host_server", text, msg=schritt)
-            self.assertIn("trap cleanup EXIT INT TERM", text, msg=schritt)
+        for step in ("s11_bar1_e2e.sh", "s12_prefill_kurve.sh"):
+            text = self._text(step)
+            self.assertIn("bar1_kill_host_server", text, msg=step)
+            self.assertIn("trap cleanup EXIT INT TERM", text, msg=step)
 
     def test_no_step_kills_through_the_unchecked_helper_any_more(self):
         """`host_dump_and_kill` is still the mechanism -- but it is reached
         through `bar1_kill_host_server`, which validates the pid, falls back
         to the pidfile and looks afterwards. A direct call would skip all
         three."""
-        for schritt in ("s11_bar1_e2e.sh", "s12_prefill_kurve.sh"):
-            zeilen = [
-                z for z in self._text(schritt).splitlines()
+        for step in ("s11_bar1_e2e.sh", "s12_prefill_kurve.sh"):
+            row_list = [
+                z for z in self._text(step).splitlines()
                 if "host_dump_and_kill" in z and not z.lstrip().startswith("#")
             ]
-            self.assertEqual(zeilen, [], msg=f"{schritt}: {zeilen}")
+            self.assertEqual(row_list, [], msg=f"{step}: {row_list}")
 
     def test_the_boot_wrapper_redirects_the_transport_chatter(self):
         """The one-line root fix, pinned at the source.

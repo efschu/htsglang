@@ -154,7 +154,7 @@ def _foreign_launch(host: int, foreign: int, guard: bool) -> float:
 
 
 def _lane_shell(host: int, foreign: int) -> float:
-    from sglang.srt.model_executor.dual_group_lane import LaneColumnParallelShell
+    from flliper.srt.model_executor.dual_group_lane import LaneColumnParallelShell
 
     x, w = _sample(2 * N_PART)
     parts = [

@@ -15,14 +15,14 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.planner import flags
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import flags
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 try:  # guarded: a bare-CPU env without the full srt deps can still run
-    from sglang.srt.server_args import ServerArgs as _ServerArgs
+    from flliper.srt.server_args import ServerArgs as _ServerArgs
 
     _HAVE_SERVER_ARGS = True
 except Exception:  # pragma: no cover - env-dependent
@@ -222,8 +222,8 @@ class TestCatalog(CustomTestCase):
             "rank_kv_ratio",
             "weightless_kv_fastlane",
             "hibernate_dir",
-            "SGLANG_UNEVEN_TOKEN_VECTOR",
-            "SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
+            "FLLIPER_UNEVEN_TOKEN_VECTOR",
+            "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION",
         ):
             self.assertIn(fid, cat, fid)
             self.assertIn(cat[fid].source, ("fork", "env"), fid)
@@ -237,7 +237,7 @@ class TestCatalog(CustomTestCase):
 
 class TestExclusion(CustomTestCase):
     def test_mem_fraction_disabled_by_rank_mode(self):
-        # rank_gpu_memory_mib vs the global mem_fraction_static (sglang's
+        # rank_gpu_memory_mib vs the global mem_fraction_static (flliper's
         # analogue of vLLM --gpu-memory-utilization) are mutually exclusive.
         res = flags.resolve(
             {
@@ -395,7 +395,7 @@ class TestModelCompat(CustomTestCase):
 
     def test_moe_env_incompatible_on_dense(self):
         cat = flags.catalog()
-        ok, _ = cat["SGLANG_MOE_RESIDENT_EXPERT_FRACTION"].model_compat(
+        ok, _ = cat["FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"].model_compat(
             _DENSE_CFG
         )
         self.assertFalse(ok)
@@ -485,7 +485,7 @@ class TestProfiles(CustomTestCase):
 
 
 # The three REAL local draft-model naming shapes on the reference box (plain
-# dir, sglang-suffixed dir, HF-cache snapshot resolved to org/name) plus
+# dir, flliper-suffixed dir, HF-cache snapshot resolved to org/name) plus
 # non-draft distractors of the same family.
 def _dm(name, path=None, error=None):
     return SimpleNamespace(name=name, path=path or "/models/" + name,
@@ -494,7 +494,7 @@ def _dm(name, path=None, error=None):
 
 _GEMMA_DRAFTS = [
     _dm("Gemma-4-31B-Eagle3"),
-    _dm("gemma-4-31B-it-Eagle3-sglang"),
+    _dm("gemma-4-31B-it-Eagle3-flliper"),
     _dm(
         "RedHatAI/gemma-4-31B-it-speculator.eagle3",
         path="/hf/models--RedHatAI--gemma-4-31B-it-speculator.eagle3/"
@@ -727,14 +727,14 @@ class TestCrossConstraints(CustomTestCase):
             _DENSE_CFG,
         )
         self.assertIsNotNone(res["dcp_size"]["error"])
-        self.assertIn("SGLANG_UNEVEN_DCP", res["dcp_size"]["error"])
+        self.assertIn("FLLIPER_UNEVEN_DCP", res["dcp_size"]["error"])
         # ... except on the full uneven-weighted condition (env pair +
         # non-uniform ratio + dcp == tp), which server_args allows.
         res = flags.resolve(
             {"tp_size": 2, "dcp_size": 2, "speculative_algorithm": "NEXTN",
              "rank_gpu_id": [0, 1], "rank_gpu_memory_mib": [20000, 10000],
-             "rank_tp_ratio": [2, 1], "SGLANG_UNEVEN_DCP": True,
-             "SGLANG_UNEVEN_DCP_WEIGHTED": True},
+             "rank_tp_ratio": [2, 1], "FLLIPER_UNEVEN_DCP": True,
+             "FLLIPER_UNEVEN_DCP_WEIGHTED": True},
             _DENSE_CFG,
         )
         self.assertIsNone(res["dcp_size"]["error"])
@@ -761,8 +761,8 @@ class TestCrossConstraints(CustomTestCase):
     def test_raw_env_pair_and_adaptive_rules(self):
         # cross_field_errors on RAW settings (no auto-set masking).
         errs = dict(flags.cross_field_errors(
-            {"SGLANG_UNEVEN_DCP_WEIGHTED": True}))
-        self.assertIn("SGLANG_UNEVEN_DCP_WEIGHTED", errs)
+            {"FLLIPER_UNEVEN_DCP_WEIGHTED": True}))
+        self.assertIn("FLLIPER_UNEVEN_DCP_WEIGHTED", errs)
         errs = dict(flags.cross_field_errors({"speculative_adaptive": True}))
         self.assertIn("speculative_adaptive", errs)
         # and validate_profile enforces them on a saved profile as-is.
@@ -826,20 +826,20 @@ class TestProfileArgvEnv(CustomTestCase):
         prof = flags.Profile(
             "t", "custom",
             settings={
-                "SGLANG_UNEVEN_DCP": True,
-                "SGLANG_UNEVEN_DCP_WEIGHTED": True,
-                "SGLANG_UNEVEN_TOKEN_VECTOR": [3, 1, 2],
-                "SGLANG_MAMBA_SSM_DTYPE": "bfloat16",
+                "FLLIPER_UNEVEN_DCP": True,
+                "FLLIPER_UNEVEN_DCP_WEIGHTED": True,
+                "FLLIPER_UNEVEN_TOKEN_VECTOR": [3, 1, 2],
+                "FLLIPER_MAMBA_SSM_DTYPE": "bfloat16",
             },
             env={"LD_LIBRARY_PATH": "/x/lib"},
         )
         self.assertEqual(
             flags.profile_env(prof),
             {
-                "SGLANG_UNEVEN_DCP": "1",
-                "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
-                "SGLANG_UNEVEN_TOKEN_VECTOR": "3,1,2",
-                "SGLANG_MAMBA_SSM_DTYPE": "bfloat16",
+                "FLLIPER_UNEVEN_DCP": "1",
+                "FLLIPER_UNEVEN_DCP_WEIGHTED": "1",
+                "FLLIPER_UNEVEN_TOKEN_VECTOR": "3,1,2",
+                "FLLIPER_MAMBA_SSM_DTYPE": "bfloat16",
                 "LD_LIBRARY_PATH": "/x/lib",
             },
         )
@@ -852,7 +852,7 @@ class TestProfileArgvEnv(CustomTestCase):
                 "tp_size": 2,
                 "trust_remote_code": True,
                 "host": "127.0.0.1",  # equals the default: still pinned
-                "SGLANG_UNEVEN_DCP": True,  # env-typed: NEVER in argv
+                "FLLIPER_UNEVEN_DCP": True,  # env-typed: NEVER in argv
             },
         )
         argv = flags.profile_argv(prof)
@@ -861,7 +861,7 @@ class TestProfileArgvEnv(CustomTestCase):
             ["--model-path", "/m", "--tp-size", "2", "--trust-remote-code",
              "--host", "127.0.0.1", "--port", "30000"],
         )
-        self.assertNotIn("SGLANG_UNEVEN_DCP", " ".join(argv))
+        self.assertNotIn("FLLIPER_UNEVEN_DCP", " ".join(argv))
 
     def test_profile_json_roundtrip_with_env(self):
         prof = flags.Profile(
@@ -917,7 +917,7 @@ class TestReferenceProfile(CustomTestCase):
             self.assertEqual(prof.settings["max_running_requests"], 2)
 
     def test_reference_env_exact(self):
-        import sglang
+        import flliper
 
         with tempfile.TemporaryDirectory() as d:
             profs, libdirs = self._gen(d)
@@ -925,13 +925,13 @@ class TestReferenceProfile(CustomTestCase):
             self.assertEqual(
                 env,
                 {
-                    "SGLANG_UNEVEN_DCP": "1",
-                    "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
-                    "SGLANG_UNEVEN_TOKEN_VECTOR": "33,13,18",
-                    "SGLANG_MAMBA_SSM_DTYPE": "bfloat16",
+                    "FLLIPER_UNEVEN_DCP": "1",
+                    "FLLIPER_UNEVEN_DCP_WEIGHTED": "1",
+                    "FLLIPER_UNEVEN_TOKEN_VECTOR": "33,13,18",
+                    "FLLIPER_MAMBA_SSM_DTYPE": "bfloat16",
                     "LD_LIBRARY_PATH": os.pathsep.join(libdirs),
                     "PYTHONPATH": os.path.dirname(
-                        os.path.dirname(os.path.abspath(sglang.__file__))
+                        os.path.dirname(os.path.abspath(flliper.__file__))
                     ),
                 },
             )
@@ -948,7 +948,7 @@ class TestReferenceProfile(CustomTestCase):
                 for p in flags.profiles(awq_cfg, _REF_RIG, python_exe=exe)
             }
             s = profs["uneven-max-perf"].settings
-            self.assertEqual(s["SGLANG_UNEVEN_TOKEN_VECTOR"], [31, 15, 18])
+            self.assertEqual(s["FLLIPER_UNEVEN_TOKEN_VECTOR"], [31, 15, 18])
             self.assertEqual(s["rank_auto_reserve_mib"], "1500")
             self.assertEqual(s["quantization"], "compressed-tensors")
         nocal_cfg = dict(_REF_CFG)
@@ -960,7 +960,7 @@ class TestReferenceProfile(CustomTestCase):
                 for p in flags.profiles(nocal_cfg, _REF_RIG, python_exe=exe)
             }
             prof = profs["uneven-max-perf"]
-            self.assertIsNone(prof.settings["SGLANG_UNEVEN_TOKEN_VECTOR"])
+            self.assertIsNone(prof.settings["FLLIPER_UNEVEN_TOKEN_VECTOR"])
             self.assertTrue(
                 any("NO measured calibration" in i for i in prof.info),
                 prof.info,
@@ -985,7 +985,7 @@ class TestReferenceProfile(CustomTestCase):
                 }
                 s = profs["uneven-max-perf"].settings
                 self.assertEqual(
-                    s["SGLANG_UNEVEN_TOKEN_VECTOR"], [33, 13, 18], perm
+                    s["FLLIPER_UNEVEN_TOKEN_VECTOR"], [33, 13, 18], perm
                 )
                 self.assertEqual(
                     s["rank_auto_reserve_mib"], "3000,2200,2200", perm
@@ -1011,7 +1011,7 @@ class TestReferenceProfile(CustomTestCase):
                 }
                 prof = profs["uneven-max-perf"]
                 self.assertIsNone(
-                    prof.settings["SGLANG_UNEVEN_TOKEN_VECTOR"], rig
+                    prof.settings["FLLIPER_UNEVEN_TOKEN_VECTOR"], rig
                 )
                 self.assertTrue(
                     any("NO measured calibration" in i for i in prof.info),
@@ -1204,7 +1204,7 @@ class TestCapacityRules(CustomTestCase):
 
 
 @unittest.skipUnless(
-    _HAVE_SERVER_ARGS, "sglang.srt.server_args not importable in this env"
+    _HAVE_SERVER_ARGS, "flliper.srt.server_args not importable in this env"
 )
 class TestParseThroughServerArgs(CustomTestCase):
     """Every generated profile's argv must parse through the REAL ServerArgs
@@ -1422,7 +1422,7 @@ class TestStockSubsetPresets(CustomTestCase):
         # stock-only shape: no fork flags active.
         self.assertFalse(pair.settings.get("rank_gpu_id"))
         self.assertFalse(pair.settings.get("rank_tp_ratio"))
-        self.assertFalse(pair.settings.get("SGLANG_UNEVEN_DCP"))
+        self.assertFalse(pair.settings.get("FLLIPER_UNEVEN_DCP"))
         # the identical-VRAM 3080 pair is picked, named in the info.
         self.assertTrue(any("Identical-VRAM" in i for i in pair.info))
         # kv=4 (_REF_CFG): tp=2 divides -> legal by the stock rule.

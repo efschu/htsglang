@@ -69,19 +69,19 @@ def main() -> int:
 
     from transformers import PretrainedConfig
 
-    from sglang.srt.runtime_context import _CONTEXT, get_parallel
+    from flliper.srt.runtime_context import _CONTEXT, get_parallel
 
     if getattr(_CONTEXT, "_server_args", None) is None:
         # RotaryEmbedding reads exactly one field during construction.
         _CONTEXT._server_args = types.SimpleNamespace(rl_on_policy_target=None)
 
-    from sglang.srt.layers.quantization.gguf import GGUFConfig
-    from sglang.srt.model_loader.gguf_dflash import (
+    from flliper.srt.layers.quantization.gguf import GGUFConfig
+    from flliper.srt.model_loader.gguf_dflash import (
         build_dflash_name_map,
         dflash_unquantized_module_prefixes,
     )
-    from sglang.srt.model_loader.weight_utils import gguf_quant_weights_iterator
-    from sglang.srt.models.dflash import DFlashDraftModel
+    from flliper.srt.model_loader.weight_utils import gguf_quant_weights_iterator
+    from flliper.srt.models.dflash import DFlashDraftModel
 
     with open(os.path.join(os.path.dirname(args.gguf), "config.json")) as f:
         cfg = PretrainedConfig(**json.load(f))

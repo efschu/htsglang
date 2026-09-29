@@ -1,0 +1,6599 @@
+"""The #721 host ledger for the Weg-2 six-process shape, priced at BOTH moments.
+
+Every term below is NAMED with its provenance, printed by :func:`format_lines`,
+and none of them is a spec number copied blind: they are the measured posts of
+the campaigns of 2026-09-06 (WEG2_BUILD_DECISIONS_0906.md section 1d/1e and
+CAMPAIGN_b0_0906.md / CAMPAIGN_a_0906.md) or the standing #721 constants the
+line already runs under (``planner/weg1_host_sizing.py``).
+
+Two moments (record section 1c B2, spec section 4.2.3):
+
+* ``launch`` -- group D is loading (LOAD_TRANSIENT charged) while group P is
+  already dormant with its cpu-backup image resident.
+* ``run`` -- both groups exist, the DORMANT group's cpu backup is resident and
+  the awake group runs at its serving heap.  With the #1233 one-backup flip
+  (record 1h: the patched torch_memory_saver frees a chunk's host image on
+  resume, and the front interleaves ``src.pause(weights_k)`` with
+  ``dst.resume(weights_k)``) the run moment used to be charged ONE image plus
+  ONE chunk.  C19 (2026-09-07, WEG2_FLIPCOST_SPEC_0907 R7/section 7) REPLACES
+  that with the SHARED HOST RING, and the replacement is what deletes three
+  terms rather than adding a fourth:
+
+  * ``BACKUP_P_BYTES`` / ``BACKUP_D_BYTES`` -- two #809-census constants,
+    measured stale by ~3.4 GiB against the per-card table the boots actually
+    log, and encoding a model (one private pinned image per group) that the
+    ring removes.  DELETED.
+  * ``chunk_gib`` (``image / N``) -- the residency proxy for "one chunk in
+    flight".  With one shared region there is no chunk beside the image: the
+    region IS the whole host weights cost and it is charged once.  DELETED.
+
+  What is charged instead, per :mod:`flliper.srt.pdflip.ring_table`:
+
+  * launch = ``Sigma span1`` = ``Sigma image_P(c)``, because the launcher's
+    ``sleep(P)`` is the first pause and only span 1 is registered then (R7:
+    registering ``Sigma H`` at the launch moment costs the M=1200 arm 2.98 GiB
+    it does not have and the ladder falls to M=600).
+  * run = ``Sigma H`` = ``Sigma max_g image_g(c)``.
+
+  Both come from the PREVIOUS boot's own lines with a provenance string; there
+  is no fallback constant, because a constant is exactly what the campaign
+  measured wrong twice.
+
+FIX 5 (2026-09-07, after boot weg2dk5's host cgroup OOM) contributed two of
+those deletions' siblings, and both survive the move onto the ring:
+
+* the DENOMINATOR: ``base`` is now the tighter of the meminfo reading and the
+  CGROUP reading (``ceiling - memory.current - cli_reserve``), and the printed
+  line names which one bound.  The reaper watches ``memory.current``; weg2dk5
+  was reaped with ``MemAvailable`` at 23.96 GB, above the #721 floor, so the
+  quantity this ledger measured was never the quantity that governs;
+
+  FIX 6 (2026-09-07) repairs that SAME denominator once more, in the other
+  direction: ``memory.current`` counts the page cache, which the kernel hands
+  back under pressure instead of killing for, so charging the whole reading as
+  spent refuses room nobody occupies.  Measured twice on metal: at weg2dk5's
+  OWN launch readings the whole ladder refused (the branch could not launch
+  from the state its last boot launched from), and on the live box the chosen
+  arm moved S=1 M=1200 -> M=600 unannounced.  What is charged now is the
+  NON-RECLAIMABLE part of the reading -- ``memory.current`` minus
+  :func:`cg_reclaimable_bytes` -- with both the reclaimable term and the
+  resulting base printed by name, and the same correction runs inside
+  :meth:`Arm.predicted_run_peak_gib`: an origin that carries cache and a
+  watermark that does not are not comparable quantities;
+* ``HOST_HEADROOM_GIB`` (#1232) is DELETED, not shrunk: it was a constant
+  fitted to the gap between the #721 floor and the level at which this box
+  actually OOMs, i.e. a compensation layer for the wrong denominator, and the
+  upstream-minimal law makes a defect found in a compensation layer a deletion
+  candidate rather than a repair order.
+
+Fix 5's THIRD change -- the run moment priced as ``one image + the measured
+FLIP TRANSIENT`` -- does NOT survive, and its removal is C19's, not a
+regression.  It priced the per-allocation flip, where the interleave's peak was
+both images partially resident at once.  The shared host ring removes that
+quantity: the region is preallocated at ``Sigma H`` and the legs copy THROUGH
+it, so ``run`` charges ``Sigma H`` ONCE and that IS the peak.  Charging both
+would be the same bytes twice.  :data:`FLIP_HOST_TRANSIENT_GIB` survives as the
+MEASURED DATUM of the old form (it is what A1-3 compares against), never again
+as a term.
+
+FIX 8 (2026-09-08, after boot weg2dk7's Q2 measurement) changes WHERE the image
+term comes from and WHICH quantity picks the arm:
+
+* the IMAGE TERM IS MEASURED, not summed from the weight tags.  weg2dk7 sampled
+  the dormant group's per-rank ``RssShmem`` with P asleep and D awake:
+  **38.63 GiB against the 28.83 GiB this ledger charged**, a +9.80 GiB (+34 %)
+  under-charge on a single image.  The cause is named rather than fitted:
+  everything with ``enable_cpu_backup`` is in the image (draft weights, graph
+  pools, workspaces, embeddings), not only the ``weights_*`` tags the #809
+  census counted.  :func:`resolve_image_terms` takes the previous boot's own
+  measurement when one exists, falls back to that named dk7 reading for P, and
+  REFUSES to claim a smaller image for D than the one measured for P.  ON THE
+  RING that measurement is not charged directly: it is what SIZES H(c), and
+  :func:`price` charges the resulting ``Sigma H`` once.  Same measurement, one
+  charge -- :mod:`flliper.srt.pdflip.ring_table` reads this module's sidecar for
+  it, so there is ONE reader of the dormant image on the line;
+* the RUN PEAK IS THE ARM SELECTOR (W21 ``PdFlipHostRunPeakRefused``), not an
+  advisory beside it.  Two boots died and one could not flip while the advisory
+  said "below";
+* the ORIGIN of that prediction is the RUN moment, not the launch moment.
+  ``memory.current`` at launch is a FLOOR: weg2dk7 launched into 15.36 GiB, was
+  handed the bigger arm for it, and idled at 90.1-94.6 GiB with an EMPTY store,
+  while weg2dk6 launched into 46.80 GiB, took the smaller arm and died at 96.06.
+  A quieter launch bought the tighter boot -- the selector was anti-correlated
+  with safety.  :func:`run_origin_gib` charges the LARGER of the launch reading
+  and the measured run-moment residual (what the box holds that this ledger's
+  own term list does not name).
+
+The arm ladder (record section 1c B2: "if the ledger refuses at S=2 the
+launcher sizes S=1 and prints why; if it refuses at S=1 the boot REFUSES") is
+extended by the mamba host pool ``M`` in the same spirit: every arm is printed,
+the first fundable one is taken, and a shrink is never silent.  If no arm funds
+the store floor the launch is refused by name (W20 ``PdFlipHostLedgerRefused``);
+if an arm funds both moments but its predicted run peak is not below the
+observed reap point, the refusal is W21 (:class:`PdFlipHostRunPeakRefused`).
+
+USER RULING 2026-09-07 06:2xZ (record section 1g): the canonical page store --
+the ONE carrier -- lives on a RAM-backed filesystem sized by this ledger's
+leftover.  The operator's own count was "118 GiB minus 55 GiB of backups, the
+L2 pools, ~10 GiB of Claude CLIs and the 16 GiB floor -> ~20 GiB".  That count
+carries no heap term; the measured heaps (b0: 3.385 GiB per awake rank, (a):
+2.36 GiB per dormant rank) are 17.2 GiB for six ranks and this ledger charges
+them, which is why the printed leftover is smaller than the expectation.  A
+ledger that omitted a measured term to match an expectation would be the
+indicator-law violation the record forbids.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from flliper.srt.compat_shims import operator_dir as _operator_dir  # host dir kept through the rename
+
+GIB = float(2**30)
+GB = 1e9
+
+#: #721 floor (host_ledger_preflight.sh FLOOR_G, weg1_host_sizing.FLOOR_BYTES).
+FLOOR_GIB = 16.0
+#: HOST_HEADROOM_GIB (#1232, 16 GiB) IS DELETED HERE, fix 5, and the deletion
+#: is the fix -- not a shrink.  Its own docstring named it "the measured gap"
+#: between the #721 floor and the level at which the box actually OOMs, i.e. a
+#: compensation constant for the fact that this ledger was reading the wrong
+#: denominator: /proc/meminfo, which the reaper does not watch.  Boot weg2dk5
+#: (2026-09-07) reaped six processes with MemAvailable still at 23.96 GB --
+#: 7.9 GiB ABOVE the #721 floor alone -- so the floor never bound and the
+#: headroom on top of it was fitted to a quantity that does not govern.  What
+#: governs is ``memory.current`` against the cgroup's ceiling, and both are
+#: readable (:func:`read_cgroup`).  Upstream-minimal law: a compensation layer
+#: whose defect is found is a deletion candidate, not a repair order -- the
+#: gap is now measured directly instead of estimated once and carried.
+#: Operator list, record section 1g: "the Claude CLIs (~10 GiB)".  Charged
+#: ONCE against MemTotal (they are live RSS, so MemAvailable already nets out
+#: whatever they hold right now; the term keeps their room when they grow).
+CLI_RESERVE_GIB = 10.0
+#: b0: awake steady RssAnon peaks 3.385 / 3.038 / 2.996 GiB (L-bf2), max taken.
+#:
+#: RE-CHECKED 2026-09-08 against the live sb4 base and CONFIRMED CORRECT -- the
+#: ~6.5 GiB/rank figure that circulated in the weg-2 briefings is NOT in this
+#: ledger and must not be put back. That figure was an INSTRUMENT ERROR: CUDA
+#: pinned host memory maps `/dev/zero` MAP_SHARED and the kernel counts it as
+#: RssShmem, NOT RssAnon, so anon + pinned + heap were being summed as "anon".
+#: Measured on the six live ranks: RssAnon 3395 / 3014 / 2346 MiB (P) and
+#: 3240 / 2959 / 2896 MiB (D) -- i.e. 2.3-3.4 GiB, which is exactly what this
+#: constant already carries.
+#:
+#: NO TERM DOUBLE-COUNTS, checked rather than assumed: the pinned half lives in
+#: the `/dev/zero` shmem mappings and is priced HERE as `rings` + `anchors`
+#: (RING_*_MULT_GB_PER_S, ANCHORS_AT_2400_BYTES), and the host weights image as
+#: `Sigma H` (ring_bytes). Those are shmem currency; this constant is anon
+#: currency. Summing them is correct; replacing this one with 6.5 would charge
+#: the pinned buffers twice.
+HEAP_AWAKE_GIB = 3.385
+#: Campaign (a): RssAnon "flat at 2.36 GiB" on the dormant tp=1 rank.
+HEAP_DORMANT_GIB = 2.36
+#: BACKUP_P_BYTES / BACKUP_D_BYTES ARE DELETED HERE (C19), and the deletion is
+#: the fix.  They were #809-census constants for a model -- one private pinned
+#: image per group -- that the shared host ring removes; they were also stale by
+#: ~3.4 GiB against the per-card table every boot logs for itself.  The host
+#: weights cost now enters :func:`price` as ``ring_bytes`` / ``ring_span1_bytes``,
+#: solved by :mod:`flliper.srt.pdflip.ring_table` from the previous boot's own
+#: PDFLIP-CHUNK-BYTES / PDFLIP-FLIP-TAG lines and printed with its provenance.
+#: There is deliberately NO fallback constant: a boot with no measured table
+#: refuses (W20) rather than pricing the flip from a number nobody measured.
+
+#: #1233 boot weg2dk5 (2026-09-07): THE FLIP'S OWN HOST TRANSIENT OF THE OLD,
+#: PER-ALLOCATION FORM.  NOT A TERM OF :func:`price` -- C19's shared host ring
+#: removed the quantity it measures, and charging it beside ``Sigma H`` would
+#: charge the same bytes twice.  It is kept because it is a MEASUREMENT of this
+#: box with its population named, and because it is the figure FLIPCOST A1-3
+#: compares the ring against (image + transient ~48.7 GiB vs Sigma H ~36 GiB).
+
+#: Spec section 2.6, #809 FLIP IMAGE PREFETCH census: PP image 30.96 GB,
+#: TP image 29.15 GB per group.
+#:
+#: FIX 8 RENAME, and the rename IS the finding: these are the WEIGHT-TAG byte
+#: sums, and the dormant image is NOT that.  Boot weg2dk7 measured the sleeping
+#: group's per-rank ``RssShmem`` at 38.63 GiB against the 28.83 GiB this pair
+#: priced -- everything built with ``enable_cpu_backup`` is in the image (draft
+#: weights, cuda-graph pools, workspaces, embeddings), while the census counted
+#: the ``weights_*`` tags alone.  They are KEPT (the derivation is a real
+#: census, not a hand number) and they are no longer CHARGED as the image: they
+#: are the reference the measured ``extra`` term is stated against, so a reader
+#: sees both halves of the correction instead of one replaced number.
+WEIGHT_TAGS_P_BYTES = 30.96 * GB
+WEIGHT_TAGS_D_BYTES = 29.15 * GB
+#: MEASURED, boot weg2dk7 (`/spinning/gpu-arb/weg2/BOOT_weg2dk7_0907.md`, the
+#: attributed quiet rows 00:29:02Z and 00:31:07Z, tip 402a2df856): with group P
+#: ASLEEP and group D AWAKE, the sum of ``RssShmem`` over P's five worker pids
+#: was **38.63 GiB** in both rows.  The same rows carry cgroup ``shmem``
+#: 48.33 GiB of which **44.56 GiB has no backing file** -- torch_memory_saver's
+#: CPU backup is anonymous ``MAP_SHARED``, so ``df``/``du`` on /dev/shm see
+#: nothing and an attribution that looks for the image AS A FILE concludes it is
+#: not resident.  This is the dormant image of a PP group on this checkpoint.
+DK7_DORMANT_IMAGE_P_GIB = 38.63
+#: The same boot's quiet ``memory.current`` (row 00:29:02Z), with the store
+#: tmpfs holding 0.00 GiB of its 9 GiB and ZERO flips run.  Used to derive the
+#: RUN-MOMENT residual below.  The row carries no reclaimable column; charging
+#: the whole reading as non-reclaimable makes the derived residual LARGER, i.e.
+#: the conservative direction, and that is stated rather than assumed.
+DK7_QUIET_CG_CURRENT_GIB = 90.10
+DK7_QUIET_STORE_USED_GIB = 0.00
+#: The arm weg2dk7 actually ran while measuring the two figures above.
+DK7_ARM_S_GB = 1
+DK7_ARM_M_MIB = 1200
+DK7_PROVENANCE = (
+    "BOOT_weg2dk7_0907.md quiet row 2026-09-08T00:29:02Z (boot weg2dk7 @ 402a2df856), "
+    "per-rank RssShmem of the SLEEPING group"
+)
+#: H87: THE CHECKPOINT every built-in reference of this module was measured on.
+#: weg2dk5/dk6/dk7 (reap point, dk7 residual and image), weg2xsn20..25 (the
+#: ratchet series), weg2rg2/rg3/sb4/rg6/sb5c (ring-era transient and residual
+#: rows): all ran ``--model-path .../Qwen3.8-27B-INT8-gdncov-vocabembed`` (front
+#: logs in /spinning/evidence-665-f1, checked 2026-09-26). A boot of ANOTHER
+#: checkpoint may not be priced from them silently: the NVFP4 D-only container
+#: boot (rc2.1c2, dkrnfdnvfp4dbar109251235) took the dk7 residual 24.50 GiB as
+#: its run origin and the xsn series 8.70 GiB as its ratchet, both 27B figures.
+#: The identity is the MEMORY FOOTPRINT (``pdflip_form.reference_model_verdict``),
+#: not the directory name.
+REFERENCE_MODEL = "Qwen3.8-27B-INT8-gdncov-vocabembed"
+#: The marker every H87 fallback line carries, so a reader (and a test) finds
+#: each place a built-in reference was NOT applied to this boot's model.
+FOREIGN_REFERENCE_TAG = "PDFLIP-HOST-REFERENCE-MODEL"
+#:
+#: The old term was ``backup_resident / weight_chunks`` -- "one chunk in flight"
+#: -- a RESIDENCY model of an interleave whose PEAK is both images partially
+#: resident plus the wake's anon working set.  Same "peak is not residency"
+#: class (CONTRADICTIONS_REGISTER C32, #631 seam-peak table) that fix 4 closed
+#: on the DEVICE axis; this closes it on the HOST axis.
+#:
+#: MEASURED, with its population and its denominator named: for each of the TEN
+#: ``PDFLIP-FLIP begin`` windows of boot weg2dk5, ``cg_current`` at the interleave
+#: peak minus the minimum ``cg_current`` in the 30 s quiet window before that
+#: begin line (``/spinning/gpu-arb/memts_weg2_weg2dk5.csv``, 5 s cadence):
+#:   0.03 / 9.20 / 3.39 / 6.12 / 6.83 / 9.97 / 4.32 / 5.21 / 3.81 / 8.58 GiB.
+#: A PEAK term takes the MAX of its population, never the mean -> 9.97 GiB.
+#: (Flip 0's 0.03 is the 5 s sampler missing that interleave's peak, not a free
+#: flip; it is left in the population rather than dropped, and it cannot move a
+#: max.)
+#:
+#: THE FIXED-vs-CUMULATIVE DISCRIMINATOR IS SETTLED BY THIS SERIES, so the next
+#: boot does not have to spend itself on it (BOOT_weg2dk5_0907.md fix shape 3):
+#: the transient does NOT grow with flip index (flip 5 is the max, flips 6-9 are
+#: 4.32/5.21/3.81/8.58) -- it is per-flip FIXED.  What DOES creep is the quiet
+#: baseline, 83.72 -> 87.98 GiB over the boot, and that creep is the store tmpfs
+#: filling (quiet Shmem 47.73 -> 52.68 GiB = +4.95, against 5.1 GiB of store
+#: content at the death): a standing cost the ledger budgeted as ``store_gib``
+#: at the time, not a leak.  #1236 RETIRED that budget line: the store is on
+#: disk now, so this creep is a property of the tmpfs form that no longer runs
+#: -- the reading is kept because the FLIP TRANSIENT it measures is still the
+#: subject of this constant, but the store half of its explanation is history.
+FLIP_HOST_TRANSIENT_GIB = 9.97
+#: ...AND IT IS THE PRE-RING VALUE. With the shared registered host ring the
+#: transient collapses, because the legs copy THROUGH a preallocated region
+#: instead of each tag allocating a fresh cudaMallocHost:
+#:   weg2rg2 (2026-09-08 03:00Z, 8c7f5d8d00)  +1.10 GiB  "drops from +9.97 to +1.1"
+#:   weg2rg3 (2026-09-08 04:5xZ)              +2.88 GiB  13 flips; the record calls
+#:                                                       its 10 s sampler a LOWER bound
+#: The MAX is taken, not the mean: the margin must cover the worst recorded flip
+#: of this form, and rg3's is explicitly a lower bound, so this term is itself a
+#: lower bound on the true worst case.
+#:
+RING_ERA_FLIP_TRANSIENT_GIB = {"weg2rg2": 1.10, "weg2rg3": 2.88}
+
+#: #1325b -- THE SAME QUANTITY, MEASURED IN THE CURRENCY THE BOUND IS IN.
+#: RECORDED, NOT PRICED, and the split is the whole point of this table.
+#:
+#: Both rows ABOVE were read off RAW ``memory.current`` -- the instrument
+#: #1309 forbids for a host verdict, because it counts the reclaimable page
+#: cache -- and rg3's own record states its +2.88 as "net of store growth
+#: (+3.81 gross)" at a 10 s cadence against a 2.9 s interleave
+#: (WEG2_BUILD_DECISIONS_0906.md:3552).  The growth it charged is the STORE
+#: TMPFS, which #1236 moved to disk, so the binding row prices bytes the run
+#: moment no longer holds in this cgroup at all.  Measured in the bound's own
+#: currency (``anon+shmem+slab_unreclaimable``, the 1 Hz
+#: ``gpu-arb/weg2/hostsample_weg2xsn*.csv`` series), the LOCAL transient reads
+#: at or below zero:
+#:   weg2rg6  (2026-09-08, 20 flips) "Transient: no rise detected" (its record)
+#:   weg2xsn19 (2026-09-11, 8 flips) max LOCAL transient **-0.019 GiB**
+#:   weg2xsn20 (2026-09-11, 8 flips) max LOCAL transient **-0.023 GiB**
+#: LOCAL = max inside the flip window minus the HIGHER of its two 12 s
+#: shoulders, per flip.  NEGATIVE ON 16 OF 16 FLIPS.
+#:
+#: #1350 WITHDRAWS THE SENTENCE THIS COMMENT USED TO DRAW FROM THOSE ROWS.
+#: It read "the flip transient is GONE, exactly as C19 predicts -- the region
+#: is preallocated at Sigma H and the legs copy through it, so a flip allocates
+#: nothing", and its own last clause ("the series is a slow monotone creep and
+#: no flip spikes above it") named the defect: the LOCAL instrument subtracts
+#: the HIGHER of the two shoulders, so against a STAIRCASE it reads negative BY
+#: CONSTRUCTION -- the trailing shoulder already sits on the new step.  The
+#: quantity is not gone, it is invisible to this instrument, which is an
+#: INDIKATOR-GESETZ violation and not a measurement.  Measured CUMULATIVELY on
+#: the very boot this table carries at -0.023 (ANALYSE_1350_HOST_TERM_0912.md
+#: SS1.3, same 1 Hz series, same currency): weg2xsn20 rises 84.336 -> 88.084
+#: GiB over eight flips and never returns, i.e. **+4.462 GiB**, and 34 of 37
+#: flip-event deltas across the five 0912 boots are >= 0.  The rows above are
+#: therefore kept as WHAT THE LOCAL INSTRUMENT SAID, never as a statement that
+#: a flip costs nothing; the cumulative quantity is
+#: :data:`FLIP_RATCHET_CUMULATIVE_GIB` and it is CHARGED (as
+#: ``flip_ratchet_gib``) rather than left to the margin.
+#:
+#: WHY THE TERM IS NOT RETIRED HERE, stated rather than done quietly.
+#: Retiring rg3 RAISES the hard bound from 87.30 to 90.18 GiB -- it FUNDS arms
+#: that are refused today, which is the danger direction of the whole ledger,
+#: and eight tests in five other tickets (#1233 fix 8 / host budget /
+#: reclaimable, #1317n, #1317) are ratchets ON that bound and go red the
+#: moment it moves.  It is therefore a PLAN decision with its own red-first,
+#: not a side effect of a netting fix, and #1325b does not need it: the
+#: netting correction alone takes weg2xsn21's cheapest rung from run_peak
+#: 91.99 to 85.15 GiB, below the UNCHANGED 87.30 bound.  The honest limit of
+#: the measurement above belongs with it: 1 Hz against a ~2.9 s interleave is
+#: 2-3 samples per leg, so a sub-second spike is not excluded by it.
+FLIP_TRANSIENT_IN_CURRENCY_GIB = {
+    "weg2rg6": 0.0, "weg2xsn19": -0.019, "weg2xsn20": -0.023,
+}
+
+#: #1350 -- THE SAME FLIP, MEASURED CUMULATIVELY INSTEAD OF LOCALLY.
+#: RECORDED, NOT PRICED: the priced term is read from the sidecar record
+#: (:func:`resolve_flip_ratchet_gib`), never from this table, because a
+#: constant cannot follow a form that changes between boots.  These rows exist
+#: so a reader can check the resolver's answer against the five boots the term
+#: was attributed on, and so the contradiction with
+#: :data:`FLIP_TRANSIENT_IN_CURRENCY_GIB` is on the page rather than in a
+#: ticket.
+#:
+#: ``peak``   = measured non-reclaimable peak MINUS the reading at the
+#:              ``PDFLIP-FLIP begin epoch=0`` timestamp.  The whole staircase.
+#: ``pair``   = the reading at ``PDFLIP-FLIP done epoch=2`` minus the same
+#:              origin: ONE full flip PAIR (one D->P leg + one P->D leg), which
+#:              is what :func:`resolve_flip_ratchet_gib` prices.
+#: Both from the 1 Hz ``anon+shmem+slab_unreclaimable`` series of that boot,
+#: never ``memory.current`` (ANALYSE_1350_HOST_TERM_0912.md SS1.3).
+#:
+#: weg2xsn21b HAS NO ``pair`` AND THAT IS THE POINT: group D died in the second
+#: leg (W85), so the boot never logged ``PDFLIP-FLIP done epoch=2`` and its 1 Hz
+#: CSV is not on this box any more.  Its 1.865 below is the SUM OF THE TWO LEG
+#: DELTAS the analysis published (+0.302 D->P, +1.563 P->D), marked as such --
+#: a boot that does not complete a pair writes no ``flip_ratchet_gib`` and the
+#: next arm REFUSES by name (W94) rather than inventing one.
+FLIP_RATCHET_CUMULATIVE_GIB = {
+    #    boot          peak-origin   first pair
+    "weg2xsn20":  (4.462, 3.161),
+    "weg2xsn21b": (2.594, 1.865),   # pair = leg deltas, no `done epoch=2`
+    "weg2xsn22":  (2.994, 1.870),
+    "weg2xsn23":  (3.350, 2.062),
+    "weg2xsn24":  (4.280, 4.049),
+}
+
+#: How many flip PAIRS one run window is priced for when the record does not
+#: say.  ONE, and the assumption is printed on the ARM line rather than hidden:
+#: the ratchet SATURATES -- ANALYSE_1350_HOST_TERM_0912.md SS2 item 4 measures
+#: 3.16 of weg2xsn20's 4.46 GiB in the first two legs of eight flips -- so it
+#: is a one-time surcharge at the first waking of each group, not a per-flip
+#: leak, and multiplying it by a flip count would over-charge.  The ledger
+#: carries NO expected-flip-count for the run window (the drift term integrates
+#: MINUTES, not flips), so there is nothing else to multiply by either.
+FLIP_RATCHET_FLIPS_PRICED_DEFAULT = 1
+
+#: #1350g -- THE TERM PRICED FROM THE MEASURED SERIES, because the measurement
+#: that was supposed to replace it CANNOT HAPPEN.  boot weg2xsn25 died of a host
+#: OOM (`oom_kill` 0 -> 1, group D) after ONE complete flip, so
+#: `PDFLIP-FLIP-RATCHET post epoch=2` was never written and the next boot would
+#: run on the SEED again -- the measurement that closes the ratchet never comes,
+#: because the boot dies first.  That is a loop, and pricing from the series is
+#: how it is broken.
+#:
+#: EACH ROW IS "WHAT MUST BE ADDED TO THAT BOOT'S UN-RATCHETED PREDICTION SO THE
+#: PREDICTION REACHES ITS OWN MEASURED PEAK".  For weg2xsn20..xsn24 the
+#: prediction carried NO ratchet term, so the row is simply
+#: ``peak - predicted``.  For weg2xsn25 the prediction ALREADY charged 4.05 GiB
+#: (the seed) and still under-shot by 4.647, so its row is 4.05 + 4.647 = 8.697
+#: -- the total the term would have had to be.  Mixing the two forms without
+#: that correction is the arithmetic error this comment exists to prevent.
+#:
+#:   boot        predicted   measured peak   charged   row
+#:   weg2xsn20     87.15        88.798        0.000   1.648
+#:   weg2xsn21b    85.30        86.995        0.000   1.695
+#:   weg2xsn22     86.25        88.495        0.000   2.245
+#:   weg2xsn23     85.24        88.210        0.000   2.970
+#:   weg2xsn24     86.38        90.475        0.000   4.095
+#:   weg2xsn25     90.43        95.077        4.050   8.697
+#:
+#: THE RULE IS MAX, not a trend fit, and the choice is stated rather than
+#: defaulted.  MAX is the rule this module already applies to every other
+#: measured population (REAP_SAMPLES_GIB, RING_ERA_FLIP_TRANSIENT_GIB,
+#: RUN_PEAK_RESIDUAL_GIB): the margin must cover the worst recorded instance of
+#: the form.  Here MAX happens to be the LATEST row, because the last four rows
+#: rise monotonically (2.245 -> 2.970 -> 4.095 -> 8.697) -- so a trend fit would
+#: price HIGHER than MAX, not lower, and MAX is therefore the CONSERVATIVE of
+#: the two available rules rather than the lazy one.  If a seventh row lands
+#: above 8.697 the rule moves on its own; if one lands below, MAX holds the
+#: bound where the worst boot put it.
+FLIP_RATCHET_SERIES_GIB = {
+    "weg2xsn20": 1.648, "weg2xsn21b": 1.695, "weg2xsn22": 2.245,
+    "weg2xsn23": 2.970, "weg2xsn24": 4.095, "weg2xsn25": 8.697,
+}
+
+#: Per boot: (predicted run peak, measured non-reclaimable peak) in GiB, so a
+#: ring provenance line can show the next seat how the SOURCE boot's own
+#: prediction compared with its metal.  #1325b: a ledger that re-prices a form
+#: from a source boot must show that source boot's own error, or the reader
+#: cannot tell an over-estimate from an under-estimate.  Absence stays absence
+#: -- :func:`source_metal_deviation` returns "" for a boot not in here.
+SOURCE_BOOT_METAL_GIB = {
+    #    boot          predicted  measured non-reclaimable peak (1 Hz series)
+    "weg2xsn19": (87.09, 88.794),
+    "weg2xsn20": (87.17, 88.798),
+}
+
+
+def source_metal_deviation(boot_tag: str) -> str:
+    """``predicted X -> metal Y (+Z)`` for a source boot, or "" if unknown."""
+    row = SOURCE_BOOT_METAL_GIB.get(str(boot_tag or ""))
+    if row is None:
+        return ""
+    pred, meas = float(row[0]), float(row[1])
+    return (
+        f"source boot's OWN metal check: predicted run peak {pred:.2f} GiB, "
+        f"MEASURED non-reclaimable peak {meas:.2f} GiB "
+        f"({meas - pred:+.2f} GiB; instrument anon+shmem+slab_unreclaimable, "
+        f"1 Hz)"
+    )
+
+#: RUN-PEAK UNDER-PREDICTION, the term the pre-ring transient was accidentally
+#: standing in for. The estimator does not miss the flip; it misses the STEADY
+#: STATE, and that is what actually killed the boots:
+#:   weg2dk5  predicted 92.89, reached 95.90               +3.01   (pre-ring)
+#:   weg2dk6  predicted 91.23, sampled 96.06 / peak 98.90  +4.83 / +7.67 (pre-ring)
+#:   weg2rg6  predicted 93.66, peak 93.55                  -0.11   (ring era)
+#:   weg2sb4  predicted 91.44, idled 96.03-96.60           +5.16   (ring era)
+#: Only the RING-ERA rows are used -- the form is what the bound is for -- so the
+#: term is sb4's +5.16. Measured over sb4's own idle window (boot 16:29Z, 96.60
+#: reached ~17:30Z, ~60 min), which is why the drift term below is charged only
+#: for the window length BEYOND that.
+#:
+#: THIS TERM IS AN EMPIRICAL CATCH-ALL. It is (measured - predicted), so it
+#: already contains the idle anon drift of those boots, the foreign desk load
+#: those boots carried, and the estimator's own error. Re-adding any of those in
+#: full would double-charge; that is why the drift term is charged only on the
+#: EXCESS window and the foreign term is measured and PRINTED but not re-added.
+#: FIX 4 adds the FIRST HONEST RING-ERA SAMPLE: weg2sb5c predicted 86.18 and
+#: measured 87.72 non-reclaimable = +1.54, and unlike every earlier row BOTH
+#: sides are in the same currency (sb4's +5.16 compares a prediction against a
+#: raw memory.current that happened to carry ~0 file cache at idle -- true, but
+#: true by luck rather than by construction). The rule is MAX-over-samples, so
+#: the term does not move: 5.16 still binds. It is recorded because the next
+#: in-currency sample is what will eventually retire the sb4 row, and because a
+#: provenance table that only keeps the maximum cannot show that the estimator
+#: is improving.
+RUN_PEAK_RESIDUAL_GIB = {"weg2sb4": 5.16, "weg2rg6": -0.11, "weg2sb5c": 1.54}
+
+#: #1350e THE SAME QUANTITY, RE-MEASURED ON RATCHET-PRICED PREDICTIONS.
+#: ``measured peak - (predicted peak + charged flip ratchet)`` for the five
+#: boots #1350 attributed the term on -- the only rows in existence whose
+#: prediction carries it. NOT a hand-edit of the table above: that one stays
+#: exactly as it was and still binds every arm that does not charge the ratchet.
+RUN_PEAK_RESIDUAL_RATCHET_GIB = {
+    "weg2xsn20": -1.513, "weg2xsn21b": -0.170, "weg2xsn22": 0.375,
+    "weg2xsn23": 0.908, "weg2xsn24": 0.046,
+}
+#: Measured STEADY-STATE drift (#1276), MiB/min, MAX of the recorded 0.01..0.07
+#: band. Two orders below IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT because that one
+#: is the sb4 LOAD-era default; this is the quiet serving rate the ratchet-era
+#: residual's own window has to be integrated over.
+RATCHET_RESIDUAL_DRIFT_MIB_PER_MIN = 0.07
+
+#: #1350f: THE #1317n LAUNCH WORST CASE HAS ITS OWN MARGIN, and the split is the
+#: whole point. That gate asks "and if the page-cache class assignment is
+#: WRONG?" -- it compares the launch leftover with the ENTIRE load transient
+#: charged as non-reclaimable against a reserve. The reap margin answers a
+#: different question (how much room the reap watermark needs) and is now
+#: RE-MEASURED on ratchet-priced arms (#1350e), which took it 8.60 -> 1.47 GiB.
+#: Sharing one number made the two move together, with OPPOSITE sensitivity:
+#: shrinking the reap margin in the funding direction TIGHTENED this gate from
+#: -8.60 to -1.47 and refused an arm whose run peak funds with 4.00 GiB of room
+#: (measured, xsn25 form M=150: launch_sum -6.33, run_peak 90.43 vs 94.43).
+#:
+#: THE VALUE IS THE ONE THIS GATE ACTUALLY HAD, not a new one: 8.60 GiB is the
+#: pre-#1350e boot margin (transient 2.88 + residual 5.16 + drift 0.56 + foreign
+#: 0.00) that this conjunct was written against and passed under for its whole
+#: life. Pinning it here changes NO verdict that was taken before #1350e; it
+#: only stops the reap margin's re-measurement from silently re-scoring a gate
+#: that never asked that question.
+LAUNCH_WORST_CASE_MARGIN_GIB = 8.60
+LAUNCH_WORST_CASE_MARGIN_SOURCE = (
+    "#1350f: the pre-#1350e boot margin this conjunct was written against "
+    "(transient 2.88 + residual 5.16 + drift 0.56 + foreign 0.00 = 8.60 GiB), "
+    "pinned as its OWN term so the reap margin's ratchet-era re-measurement "
+    "cannot re-score a gate that asks a different question (page-cache class "
+    "assignment wrong?), which it did: 8.60 -> 1.47 refused an arm whose run "
+    "peak funds with 4.00 GiB to spare"
+)
+RESIDUAL_WINDOW_MIN = 60.0
+
+#: #1269 / user order 2026-09-08 ("kein uebertreten mehr der schwelle. fuehrt
+#: nur zum absturz"): THE REAP WATERMARK IS A HARD BOUND WITH A NAMED MARGIN.
+#:
+#: WHICH SAMPLES COUNT. A reap sample is a reading where the KERNEL reaped --
+#: an `oom_kill` delta in the same row. Two qualify and one does not:
+#:   weg2dk5  95.90 GiB  oom_kill 18 -> 24, /proc/vmstat 60 -> 66   COUNTS
+#:   weg2dk6  96.06 GiB sampled / 98.90 kernel peak, "died the same death"
+#:                                                                 COUNTS
+#:   weg2sb4  96.60 GiB  NO kernel OOM -- the OPERATOR killed it    DOES NOT
+#: sb4 is evidence that the box is unhappy above the mark, not evidence of
+#: where the kernel reaps; counting a human's patience as a kernel threshold
+#: would move the watermark UP on the strength of a boot that never reaped.
+#: The bound is the LOWEST kernel sample, so dk5 remains authoritative.
+REAP_SAMPLES_GIB = {
+    "weg2dk5": 95.90,   # oom_kill 18 -> 24 in the same memts row
+    "weg2dk6": 96.06,   # sampled; 98.90 kernel peak; same death
+}
+REAP_SAMPLE_EXCLUDED = {
+    "weg2sb4": (96.60, "operator kill, no kernel OOM -- not a reap sample"),
+}
+
+#: One ring granule: the smallest unit a flip copy moves (ring_table's C3/C4
+#: form issues 2 MiB granules). It is the FLOOR of the transient term, so the
+#: margin can never collapse to zero when a record is missing.
+RING_GRANULE_GIB = 2.0 / 1024.0
+
+#: Idle anon drift, MiB/min, used until a boot carries PDFLIP-IDLE-CENSUS
+#: `d_anon_mib_per_min`. Conservative default from the sb4 table measured
+#: 2026-09-08 over two /proc samples 140 s apart: P PP0 +5.4, PP1 +5.4,
+#: PP2 +0.0, each D rank +2.8 => +19.0 MiB/min over the six ranks, against an
+#: independently observed +21.3 MiB/min. The SUM is the right term: the drift
+#: is charged to one cgroup, not per rank.
+IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT = 19.0
+
+#: Planned window length in minutes that the drift is integrated over. The
+#: operator hands out 90-minute windows (GPU-Fenster-Rotation), so a boot is
+#: expected to stand for at least that long without crossing the mark.
+PLANNED_WINDOW_MIN_DEFAULT = 90.0
+
+
+@dataclass(frozen=True)
+class Margin:
+    """The named margin between the predicted peak and the reap watermark.
+
+    NOT a hand number and NOT a safety factor. Three measured terms, and the
+    care is in what is NOT added twice:
+
+    ``transient``  the worst recorded flip transient OF THIS FORM. Ring-era, so
+                   ~2.9 GiB, not the 9.97 GiB of the per-allocation form.
+    ``residual``   max (measured peak - predicted peak) over the ring-era boots.
+                   An EMPIRICAL CATCH-ALL: it already contains those boots' idle
+                   drift, their foreign desk load, and the estimator's error.
+    ``drift``      charged ONLY on the window BEYOND the one the residual was
+                   measured over, because inside that window it is already in
+                   the residual.
+    ``foreign``    reserve for desk load ARRIVING AFTER arm time. Default 0, and
+                   that is deliberate -- see below.
+
+    WHY ``foreign`` DEFAULTS TO ZERO, which is the opposite of a hand-wave. The
+    cgroup that reaps is shared with the Claude sessions, their pytest runs,
+    worktrees and dry-runs, and that load is real (measured on the sb4 base:
+    cgroup anon 33.49 GiB against 21.78 GiB of flliper RssAnon = 11.71 GiB
+    foreign, which independently validates the 10 GiB CLI_RESERVE_GIB the
+    ledger already carried -- in the WRONG denominator, against MemTotal rather
+    than against the cgroup the reaper watches).
+
+    But that load AT ARM TIME IS ALREADY IN THE ORIGIN: :func:`run_origin_gib`
+    returns a ``memory.current`` reading, and a cgroup reading counts every
+    process in the cgroup, Claude included. Re-adding it as a margin term would
+    charge it twice. What is NOT in the origin is desk work that arrives LATER,
+    and that is unbounded by construction -- a boot cannot reserve against how
+    much an operator will run tomorrow. So it is MEASURED and PRINTED (so a
+    breach can be attributed) and left to the RUNTIME guard, which is what a
+    guard is for: the boot bound reserves what is predictable, W22 catches what
+    is not.
+    """
+
+    transient_gib: float
+    residual_gib: float
+    drift_gib: float
+    foreign_gib: float
+    drift_mib_per_min: float
+    window_min: float
+    transient_source: str
+    residual_source: str
+    drift_source: str
+    foreign_source: str
+    #: #1350 (patch C). FALSE once the prediction CHARGES the flip ratchet.
+    #: The transient term reserves for what a flip spends; a prediction that
+    #: charges `flip_ratchet_gib` has already spent it, and subtracting it from
+    #: the bound as well is the same double deduction #1269 fix 4 removed for
+    #: the residual one layer up. It STAYS in `runtime_total_gib`: W22 grades a
+    #: live reading, and at the moment of that reading the NEXT flip has not
+    #: happened yet, so its step is still future spend the box must have room
+    #: for. Default True, so every caller that does not charge the ratchet is
+    #: byte-identical.
+    transient_in_boot: bool = True
+
+    @property
+    def total_gib(self) -> float:
+        """The BOOT margin. Kept as the default name because W21 and the store
+        sizing -- the two callers that grade a PREDICTION -- are its users."""
+        return self.boot_total_gib
+
+    @property
+    def boot_total_gib(self) -> float:
+        return (
+            (self.transient_gib if self.transient_in_boot else 0.0)
+            + self.residual_gib + self.drift_gib + self.foreign_gib
+        )
+
+    @property
+    def runtime_total_gib(self) -> float:
+        """The RUNTIME margin: the boot margin MINUS the model-error term.
+
+        #1269 FIX 4, and it is a design correction rather than a relaxation.
+        ``residual`` is (measured - predicted): it exists to cover how wrong the
+        PREDICTION can be. W21 grades a prediction, so it must carry it. W22
+        grades a MEASUREMENT -- `memory.current` net of reclaimable cache, the
+        real number -- and a measurement has already realised whatever error the
+        residual was reserving for. Charging it there subtracts the same error
+        twice and refuses a box that is nowhere near the reap point.
+
+        Boot weg2sb5c is what made this concrete: it was refused at
+        87.67 GiB non-reclaimable against the 87.30 boot bound -- crossed by
+        0.37 -- while the actual reap point sat **8.2 GiB** away. The transient
+        and the drift still belong here: neither has happened yet at the moment
+        of the reading, so both are still future spend the box must have room
+        for.
+        """
+        return self.transient_gib + self.drift_gib + self.foreign_gib
+
+    def _drift_note(self) -> str:
+        return (
+            f"{self.drift_mib_per_min:.1f} MiB/min x "
+            f"{max(0.0, self.window_min - RESIDUAL_WINDOW_MIN):.0f} min beyond the "
+            f"residual's own {RESIDUAL_WINDOW_MIN:.0f} min, {self.drift_source}"
+        )
+
+    def terms(self, scope: str = "boot") -> str:
+        """The terms of one bound. ``scope`` is 'boot' or 'runtime'; the runtime
+        form OMITS the residual and says so, so a reader of a W22 line can see
+        that the omission was deliberate and not a missing term."""
+        head = (
+            f"transient {self.transient_gib:.2f} [{self.transient_source}] "
+            f"+ drift {self.drift_gib:.2f} [{self._drift_note()}] "
+            f"+ foreign {self.foreign_gib:.2f} [{self.foreign_source}]"
+        )
+        if scope == "runtime":
+            return (
+                head + f" GiB; residual {self.residual_gib:.2f} DELIBERATELY NOT "
+                "CHARGED here -- it is model error and this bound grades a "
+                "MEASUREMENT, not a prediction (#1269 fix 4)"
+            )
+        if not self.transient_in_boot:
+            # #1350 patch C: the transient is OMITTED here and the line says so,
+            # exactly as the runtime form says it about the residual. A reader
+            # of an ARM line must be able to see that the omission was decided,
+            # not that a term went missing.
+            return (
+                f"residual {self.residual_gib:.2f} [{self.residual_source}] "
+                f"+ drift {self.drift_gib:.2f} [{self._drift_note()}] "
+                f"+ foreign {self.foreign_gib:.2f} [{self.foreign_source}] GiB; "
+                f"transient {self.transient_gib:.2f} [{self.transient_source}] "
+                "DELIBERATELY NOT CHARGED here -- #1350 charges the flip's "
+                "PERMANENT step as `flip_ratchet_gib` inside the prediction, and a "
+                "bound may not deduct for what the prediction already spent. It "
+                "REMAINS in the runtime margin, where the next flip is still future"
+            )
+        return (
+            f"transient {self.transient_gib:.2f} [{self.transient_source}] "
+            f"+ residual {self.residual_gib:.2f} [{self.residual_source}] "
+            f"+ drift {self.drift_gib:.2f} [{self._drift_note()}] "
+            f"+ foreign {self.foreign_gib:.2f} [{self.foreign_source}] GiB"
+        )
+
+
+#: #1392: the box's own QUIET reading, measured 2026-09-14 (`cat
+#: /sys/fs/cgroup/memory.current` on this line's own container, no boot, no
+#: local gate, no suite running) -- the SAME snapshot
+#: test_pdflip_hicache_disabled_1386.py's `_fake_quiet_host` fixture pins for
+#: `choose_host_ledger`'s own meminfo/cgroup seam (#1390), reused here as the
+#: PRODUCTION reference rather than invented fresh: a second, unrelated
+#: "quiet" number for the same box would be the next reader's #1341 (two
+#: numbers, one fact, destined to disagree).  Like every other measured
+#: constant in this module (`RUN_PEAK_RESIDUAL_GIB`,
+#: `IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT`), it is a BASELINE subject to
+#: re-measurement, not a law of physics -- it names what "quiet" meant on the
+#: day it was taken, not what it will always mean.
+QUIET_BASELINE_CG_CURRENT_GIB = 13.10
+
+#: #1392: the dry-run-misst-die-live-box incident, 2026-09-13 (Ledger-Sitz
+#: [22-fix2]): the SAME serving argv worked to the ARM line (run_peak
+#: 95.18 GiB) on a quiet box and was refused (W97, 97.67 GiB) when a parallel
+#: pytest suite added ~2.5 GiB to `memory.current`. This is the one MEASURED
+#: magnitude of "how much a concurrent suite can move this box", not a
+#: guessed safety factor -- crossing it is the signal that THIS reading may
+#: be a box artifact rather than a fact about the form, in EITHER verdict
+#: direction (a refusal may be the box, not the form; a FUNDABLE may not
+#: survive to actual boot time if the box gets noisier still).
+FOREIGN_LOAD_PROVISIONAL_THRESHOLD_GIB = 2.5
+
+
+def foreign_load_now_gib(cg_current_bytes: Optional[int]) -> Optional[float]:
+    """How far ABOVE the quiet baseline this box reads RIGHT NOW, or ``None``
+    when the reading itself is unreadable.
+
+    Not a margin term and not summed into any bound -- `cg_current_bytes` is
+    already fully priced into the origin (:class:`Margin`'s own
+    ``foreign_gib`` docstring: "that load AT ARM TIME IS ALREADY IN THE
+    ORIGIN"). This is PRINT-ONLY evidence for the ARM line's own honesty
+    about which box state its verdict was measured against -- never a second
+    gate answering the question the peak/cushion checks already answer.
+    """
+    if cg_current_bytes is None:
+        return None
+    return max(0.0, float(cg_current_bytes) / GIB - QUIET_BASELINE_CG_CURRENT_GIB)
+
+
+def measure_foreign_anon(
+    cgroup_anon_bytes: Optional[int], own_pids: Sequence[int]
+) -> Tuple[Optional[float], float, str]:
+    """Non-flliper anon in the shared cgroup: (foreign GiB, flliper GiB, source).
+
+    ``cgroup anon - sum(RssAnon of the boot's own pids)``. The cgroup that reaps
+    is shared with the Claude sessions and their desk work, and that share is
+    NOT small: the boot agent counted 9 ``.lxc`` oom_kills that were Claude
+    CLIs, and a single desk probe reading the checkpoint added +815 MiB inside
+    sb4's own idle window. A breach that this term explains is a breach the
+    operator caused, and it must be named as such rather than charged to flliper.
+    """
+    own = 0
+    seen = 0
+    for pid in own_pids:
+        try:
+            with open(f"/proc/{pid}/status", "rb") as fh:
+                for raw in fh:
+                    if raw.startswith(b"RssAnon:"):
+                        own += int(raw.split()[1]) * 1024
+                        seen += 1
+                        break
+        except OSError:
+            continue
+    own_gib = own / GIB
+    if cgroup_anon_bytes is None:
+        return None, own_gib, "cgroup memory.stat anon unreadable -- foreign share unknown"
+    foreign = float(cgroup_anon_bytes) / GIB - own_gib
+    return (
+        foreign,
+        own_gib,
+        f"cgroup anon {float(cgroup_anon_bytes) / GIB:.2f} GiB - flliper RssAnon "
+        f"{own_gib:.2f} GiB over {seen}/{len(own_pids)} readable pids",
+    )
+
+
+def split_by_baseline(
+    anon_now_bytes: Optional[int], anon_preboot_bytes: Optional[int]
+) -> Tuple[Optional[float], Optional[float], str]:
+    """(flliper GiB, foreign GiB, source) from the PRE-BOOT anon baseline.
+
+    #1269 fix 3. The previous form, ``cgroup anon - sum(RssAnon of own pids)``,
+    is ARITHMETICALLY INVALID, and boot weg2sb5b printed the proof:
+
+        SPLIT flliper=61.48 foreign=-30.91 GiB anon
+              [cgroup anon 30.57 - flliper RssAnon 61.48 over 111/111 pids]
+
+    ``cgroup anon`` counts each physical page ONCE; ``sum(RssAnon)`` counts a
+    shared page once PER PROCESS that maps it, and six ranks plus ~105 forked
+    workers share a great deal. The two are not subtractable, the difference
+    went negative -- which is impossible -- and so the line's conclusion
+    ("flliper dominates") was unsupported even if it happened to be true.
+
+    The pre-boot reading IS subtractable, being the same quantity at an earlier
+    time: whatever anon the cgroup held before this boot existed is foreign to
+    it, and the rise since is the boot's. sb5b measured 10.05 GiB pre-boot,
+    exactly as its checklist asked, and the guard did not use it.
+
+    HONEST LIMIT, stated rather than papered over: this attributes by TIME, not
+    by OWNER. Desk work started after the baseline is charged to flliper. That is
+    the conservative direction for a guard whose job is to tear down -- it never
+    under-reports the boot's own share -- but it is not an ownership
+    measurement, and a later foreign spike cannot be separated from the boot's
+    own growth by this instrument.
+    """
+    if anon_now_bytes is None or anon_preboot_bytes is None:
+        return None, None, "no pre-boot anon baseline -- split not computable"
+    foreign = float(anon_preboot_bytes) / GIB
+    flliper = float(anon_now_bytes) / GIB - foreign
+    if flliper < 0.0:
+        return (
+            0.0,
+            float(anon_now_bytes) / GIB,
+            f"anon fell BELOW the pre-boot baseline {foreign:.2f} GiB (foreign "
+            "work exited); the boot's own share is not separable here",
+        )
+    return (
+        flliper,
+        foreign,
+        f"cgroup anon now {float(anon_now_bytes) / GIB:.2f} GiB vs pre-boot "
+        f"baseline {foreign:.2f} GiB (attribution by TIME, not by owner)",
+    )
+
+
+def cushion_floor_reserve_gib(bounce_total_gib: float) -> float:
+    """#1358: the cushion the arm must LEAVE, not merely predict.
+
+    THE MEASUREMENT: boot weg2xsn28 armed at run_peak 86.79 against reap 95.90
+    -- 9.11 GiB of room, no W97, the first xsn2x arm that funded itself -- and
+    then latched W98 NINE SECONDS after `state=serving`, before any flip, with
+    cushion 0.99 against the floor 1.50. It was short 0.51 GiB.
+
+    The bytes it was short of were on the box already: five assemble buffers,
+    7.044 GiB of tmpfs, of which the arm had charged 2.16. An arm cannot lose
+    at the run moment what it never counted at the launch moment, so the
+    correction is TWO-SIDED and this is the second side:
+
+      * `BounceTerms.total_bytes` now charges per lane, so the peak is honest;
+      * and the cushion floor becomes a RESERVED TERM, so the arm may not
+        spend the page cache the latch is going to demand back.
+
+    THE FLOOR IS IMPORTED, NEVER RESTATED: `RATE_LATCH_CUSHION_FLOOR_GIB` is
+    the same 1.50 the [21b] guard reads at runtime. Two spellings of one
+    threshold is how an arm funds a boot the guard then tears down -- the
+    #1361 [23a] lesson (one number, three causes) in the other direction.
+
+    The bounce is named as the argument rather than read here, because WHICH
+    allocations sit in shmem at serving time is the caller's knowledge and this
+    function must stay a pure floor.
+    """
+    return float(RATE_LATCH_CUSHION_FLOOR_GIB) + max(0.0, float(bounce_total_gib))
+
+
+def refuse_sleep_leg_deficit(
+    cushion_gib: Optional[float],
+    need_gib: Optional[float],
+    *,
+    margin_gib: float = 0.0,
+    source: str = "unknown",
+    group: str = "?",
+) -> Optional[str]:
+    """Refuse a sleep leg whose write does not fit in the reclaim cushion.
+
+    Returns ``None`` when the leg may proceed, and RAISES
+    :class:`PdFlipSleepLegCushionDeficit` when it may not. It never returns a
+    "would refuse" string: a gate that reports instead of stopping is the
+    latch we already have, and the latch is what this exists to supersede.
+
+    EITHER TERM UNREADABLE -> NO VERDICT. `None` is not zero on either side. An
+    unreadable cushion is not "no cushion left" and an unknown write size is
+    not "writes nothing"; both would turn a blind gate into a boot killer, and
+    the sleep leg is the one moment where a wrong refusal costs the whole
+    window. The caller gets `None` and proceeds exactly as before this ticket,
+    which is also what keeps every pre-fix6 call site byte-identical.
+    """
+    if cushion_gib is None or need_gib is None:
+        return None
+    have = float(cushion_gib)
+    want = float(need_gib) + float(margin_gib)
+    if have >= want:
+        return None
+    raise PdFlipSleepLegCushionDeficit(
+        f"W100 PdFlipSleepLegCushionDeficit: group {group}'s sleep leg would "
+        f"write need_gib={float(need_gib):.2f} GiB of page cache and only "
+        f"cushion_gib={have:.2f} GiB is reclaimable "
+        f"(margin={float(margin_gib):.2f}, source={source}) -- deficit "
+        f"{want - have:.2f} GiB. The cushion is `file` MINUS `shmem` from the "
+        f"SAME cgroup reading the rate latch grades, so the two can never "
+        f"disagree about the moment they describe. REFUSED BEFORE THE FIRST "
+        f"BYTE, because after it there is no lever: boot weg2xsn25 latched W98 "
+        f"4 s before its first OOM kill and prevented nothing -- the STOP stops "
+        f"ADMISSION while the bytes came from the leg itself, already 3.3 s "
+        f"into a 5.6 s RPC. Its cushion was 2.70 GiB against a 4.32 GiB write, "
+        f"and that deficit was knowable ~3 s earlier. Widening the latch floor "
+        f"does not help and was measured: 1.0 through 2.69 GiB all latch on the "
+        f"SAME sample with the same 4.1 s lead, because the cushion is flat for "
+        f"a minute and then vertical inside one 0.5 s tick."
+    )
+
+
+def resolve_margin(
+    flip_transient_gib: Optional[float] = None,
+    drift_mib_per_min: Optional[float] = None,
+    window_min: float = PLANNED_WINDOW_MIN_DEFAULT,
+    residual_gib: Optional[float] = None,
+    foreign_headroom_gib: float = 0.0,
+    foreign_source: str = "",
+    flip_ratchet_charged_gib: Optional[float] = None,
+) -> Margin:
+    """Build the margin from measurements, naming every source.
+
+    The transient is read from the RING-ERA records of this form (max over the
+    recorded flips); the pre-ring :data:`FLIP_HOST_TRANSIENT_GIB` is used only
+    when no ring-era sample exists, and the line says which one was used.
+
+    #1350 -- ``flip_ratchet_charged_gib`` IS A DECLARATION, NOT A TERM. It is
+    the GiB the PREDICTION now charges for the flip's permanent step; passing
+    it does two things and neither of them is an addition to this margin:
+
+    * the transient leaves ``boot_total_gib`` (it stays in
+      ``runtime_total_gib``) -- patch C, the same argument #1269 fix 4 made for
+      the residual: a bound may not deduct for what the prediction spent;
+    * the RESIDUAL IS NOT NETTED. :data:`RUN_PEAK_RESIDUAL_GIB`'s rows were
+      measured as ``(measured peak - predicted peak)`` on boots where the
+      ratchet was NOT charged, so each row CONTAINS it. They are kept WHOLE
+      here -- over-reserving is the safe direction and the binding row (sb4
+      5.16, a 60-minute idle window) is not replaceable by the 0912 boots'
+      ten-minute windows -- and the source string says so. The forbidden move
+      is the other one: subtracting the charged ratchet from a legacy row to
+      "correct" it. That is the hand-edit #1350 rules out, and it is refused by
+      name (:class:`PdFlipHostRatchetDoubleCharged`) rather than commented
+      against.
+
+    ``None`` (every pre-#1350 caller) is byte-identical to the old behaviour.
+    """
+    if flip_ratchet_charged_gib is not None and residual_gib is not None:
+        raise PdFlipHostRatchetDoubleCharged(
+            "W95 PdFlipHostRatchetDoubleCharged: a caller-supplied residual "
+            f"({float(residual_gib):.2f} GiB) was combined with a charged flip "
+            f"ratchet ({float(flip_ratchet_charged_gib):.2f} GiB). The residual is "
+            "(measured peak - predicted peak) of boots whose prediction did NOT "
+            "carry the ratchet, so it already contains it; hand-supplying one here "
+            "beside the charged term is exactly the netting #1350 forbids. Let this "
+            "function resolve the residual, or do not charge the ratchet."
+        )
+    if flip_transient_gib is not None:
+        transient, t_src = float(flip_transient_gib), "caller-supplied measured transient"
+    elif RING_ERA_FLIP_TRANSIENT_GIB:
+        boot, transient = max(RING_ERA_FLIP_TRANSIENT_GIB.items(), key=lambda kv: kv[1])
+        # #1325b: the binding row is printed WITH the in-currency rows that
+        # contradict it. The term does not move here -- eight ratchets in five
+        # other tickets sit on this bound -- but a reader must not have to
+        # re-derive from scratch that the binding sample is out of currency.
+        t_src = (
+            f"RING-ERA max over {sorted(RING_ERA_FLIP_TRANSIENT_GIB)}, binding "
+            f"{boot} -- priced on raw memory.current (#1309), in-currency "
+            f"{'/'.join(f'{v:+.3f}' for _b, v in sorted(FLIP_TRANSIENT_IN_CURRENCY_GIB.items()))}"
+            f" on {sorted(FLIP_TRANSIENT_IN_CURRENCY_GIB)}, NOT PRICED (#1325b)"
+            if FLIP_TRANSIENT_IN_CURRENCY_GIB else
+            f"RING-ERA max over {sorted(RING_ERA_FLIP_TRANSIENT_GIB)}, binding {boot}"
+        )
+    else:
+        transient, t_src = FLIP_HOST_TRANSIENT_GIB, "PRE-RING fallback, no ring-era sample exists"
+    if transient < RING_GRANULE_GIB:
+        transient, t_src = RING_GRANULE_GIB, f"floored at one ring granule ({t_src} was smaller)"
+
+    if residual_gib is not None:
+        residual, r_src = float(residual_gib), "caller-supplied measured residual"
+    else:
+        rb, residual = max(RUN_PEAK_RESIDUAL_GIB.items(), key=lambda kv: kv[1])
+        residual = max(0.0, residual)
+        r_src = f"RING-ERA max (measured peak - predicted) over {sorted(RUN_PEAK_RESIDUAL_GIB)}, binding {rb}"
+        if flip_ratchet_charged_gib is not None:
+            # #1350e: ON A RATCHET-PRICED ARM THE RESIDUAL IS RE-MEASURED, and
+            # the rows it is measured from are the ONLY ones in existence that
+            # were graded against a prediction carrying the ratchet: the five
+            # 0912 replays (xsn20 -1.513, xsn21b -0.170, xsn22 +0.375, xsn23
+            # +0.908, xsn24 +0.046). MAX over them, clamped at >= 0, exactly the
+            # rule the sb4 row is chosen by. sb4's 5.16 stays for every arm that
+            # does NOT charge the ratchet -- it was measured with the ratchet
+            # UNCHARGED and therefore contains it, which is why summing the two
+            # is refused by name (W95).
+            #
+            # Its own window is added rather than assumed away: sb4's row came
+            # from a 60-minute idle window, these came from ~10-minute boots, so
+            # the measured STEADY-STATE drift (#1276: 0.01..0.07 MiB/min; the
+            # MAX is taken) is integrated over the PLANNED window and printed
+            # with both factors. At 0.07 MiB/min x 45 min that is 0.003 GiB --
+            # small, and stated rather than dropped, because a term omitted for
+            # being small is how the ratchet itself stayed invisible.
+            residual = max(0.0, max(RUN_PEAK_RESIDUAL_RATCHET_GIB.values()))
+            _drift_gib = (
+                RATCHET_RESIDUAL_DRIFT_MIB_PER_MIN * float(window_min) / 1024.0
+            )
+            residual += _drift_gib
+            r_src = (
+                f"RATCHET-PRICED: max over the five #1350 replays "
+                f"{ {k: round(v, 3) for k, v in sorted(RUN_PEAK_RESIDUAL_RATCHET_GIB.items())} } "
+                f"= {max(RUN_PEAK_RESIDUAL_RATCHET_GIB.values()):+.3f} GiB, the only "
+                f"rows graded against a prediction that CHARGED the ratchet, plus "
+                f"measured steady-state drift {RATCHET_RESIDUAL_DRIFT_MIB_PER_MIN:.2f} "
+                f"MiB/min (#1276 max) x {float(window_min):.0f} min planned window = "
+                f"{_drift_gib:.3f} GiB. The pre-ratchet rows "
+                f"{sorted(RUN_PEAK_RESIDUAL_GIB)} (binding weg2sb4 5.16) are "
+                f"DELIBERATELY NOT USED here: each was measured with the ratchet "
+                f"UNCHARGED and therefore contains it, and summing them with the "
+                f"charged term is refused by name (W95)"
+            )
+            # #1350: RE-DERIVED, AND THE DERIVATION SAYS WHY IT DOES NOT MOVE.
+            # Under ratchet pricing each 0912 boot's residual falls by the
+            # charged term (weg2xsn20 +1.648 -> -1.513, xsn21b +1.695 -> -0.170,
+            # xsn22 +2.245 -> +0.375, xsn23 +2.970 -> +0.908, xsn24 +4.095 ->
+            # +0.046), so NONE of them exceeds the binding sb4 row and the max
+            # rule leaves it where it is. sb4 is also not replaceable by them:
+            # it was measured over a 60-minute idle window
+            # (RESIDUAL_WINDOW_MIN), which is what lets the drift term be
+            # charged only BEYOND that hour, while the 0912 boots ran ~10
+            # minutes each. The row is kept WHOLE rather than netted by the
+            # charged ratchet -- over-reserving is the safe direction, netting
+            # a row measured in another era is the double count.
+            r_src += (
+                f" -- KEPT WHOLE under #1350 ratchet pricing "
+                f"({float(flip_ratchet_charged_gib):.2f} GiB charged): the row was "
+                "measured with the ratchet UNCHARGED and therefore contains it; it "
+                "is NOT netted, because netting a 60-min idle row by a flip term "
+                "measured on 10-min boots would charge the correction twice. "
+                "Re-derived 0912 residuals under this pricing: xsn20 -1.513, "
+                "xsn21b -0.170, xsn22 +0.375, xsn23 +0.908, xsn24 +0.046 -- none "
+                "binds"
+            )
+
+    if drift_mib_per_min is None:
+        drift_rate, d_src = IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT, "sb4 default, no PDFLIP-IDLE-CENSUS yet"
+    else:
+        drift_rate, d_src = float(drift_mib_per_min), "PDFLIP-IDLE-CENSUS d_anon_mib_per_min"
+    excess_min = max(0.0, float(window_min) - RESIDUAL_WINDOW_MIN)
+    return Margin(
+        transient_gib=transient,
+        residual_gib=residual,
+        drift_gib=drift_rate * excess_min / 1024.0,
+        foreign_gib=float(foreign_headroom_gib),
+        drift_mib_per_min=drift_rate,
+        window_min=float(window_min),
+        transient_source=t_src,
+        residual_source=r_src,
+        drift_source=d_src,
+        transient_in_boot=(flip_ratchet_charged_gib is None),
+        foreign_source=foreign_source
+        or "0 by design: arm-time foreign load is already in the origin; later "
+        "desk load is unbounded and is the RUNTIME guard's job (W22)",
+    )
+
+
+def watermark_provenance(margin: Optional[Margin] = None,
+                         watermark_gib: Optional[float] = None, *,
+                         refuse_unreadable: bool = False) -> str:
+    """`PDFLIP-HOST WATERMARK=<v> source=<events> margin=<v> (terms)`.
+
+    RC7 (Docker host acceptance 2026-09-25 07:21Z): with ``-v /sys:/sys`` the
+    container read the HOST's root cgroup, which has ``memory.stat`` but no
+    ``memory.current``; ``read_cgroup_pressure`` then took its sum FALLBACK
+    (``nonreclaim_gib`` set, ``current_gib`` None) and this line died formatting
+    ``None:.2f`` -- a TypeError where the ledger owed a named refusal. A missing
+    ``memory.current`` is never formatted: the ledger (``choose``,
+    ``refuse_unreadable=True``) REFUSES by name -- its currency is that file --
+    and every other caller (the front's periodic line) prints that it is
+    unreadable.
+    """
+    m = margin if margin is not None else resolve_margin()
+    w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    events = ", ".join(f"{k} {v:.2f}" for k, v in sorted(REAP_SAMPLES_GIB.items()))
+    excl = ", ".join(f"{k} {v:.2f} EXCLUDED ({why})"
+                     for k, (v, why) in sorted(REAP_SAMPLE_EXCLUDED.items()))
+    live = read_cgroup_pressure()
+    if live.get("current_gib") is None:
+        if refuse_unreadable:
+            raise PdFlipHostLedgerRefused(
+                "W20 PdFlipHostLedgerRefused: memory.current is unreadable under "
+                "/sys/fs/cgroup -- the ledger prices in that file's currency (the "
+                "reaper acts on it) and refuses to price without it rather than "
+                f"guess from memory.stat [{live.get('source')}]. In a container, "
+                "mount the process's own cgroup (not the host's /sys) or run "
+                "where /sys/fs/cgroup/memory.current exists."
+            )
+        cur = (f" LIVE memory.current unreadable [{live.get('source')}] -- no "
+               f"live reading formatted")
+    elif live.get("nonreclaim_gib") is not None and live.get("file_reclaimable_gib") is not None:
+        cur = (
+            f" LIVE nonreclaim={live['nonreclaim_gib']:.2f} "
+            f"raw_current={live['current_gib']:.2f} "
+            f"file_reclaimable={live['file_reclaimable_gib']:.2f} GiB "
+            f"[{live['source']}]"
+        )
+    else:
+        cur = f" LIVE unreadable [{live.get('source')}]"
+    return (
+        f"PDFLIP-HOST WATERMARK={w:.2f} GiB CURRENCY=non-reclaimable "
+        f"(= memory.current at a reap, because the kernel has ALREADY reclaimed the "
+        f"file cache by then: dk5's own reap row carries 0.03 GiB of it; dk6's "
+        f"memory.stat was not captured, so that half is inference from one row) "
+        f"source=[{events}] "
+        f"BOOT bound = {w - m.boot_total_gib:.2f} GiB (margin {m.boot_total_gib:.2f}: "
+        f"{m.terms()}) | RUNTIME bound = {w - m.runtime_total_gib:.2f} GiB "
+        f"(margin {m.runtime_total_gib:.2f}: {m.terms('runtime')}); "
+        f"excluded=[{excl}].{cur}"
+    )
+
+
+class PdFlipHostWatermarkBreached(RuntimeError):
+    """W22: the RUNTIME breach. cgroup memory.current crossed the hard bound
+    while serving. The response is a CONTROLLED teardown down the killer path,
+    never "accept the risk" and never a silent restart -- the user's standing
+    order of 2026-09-08, given after exactly that offer was taken and the box
+    went into the OOM anyway."""
+
+
+class PdFlipHostRateLatched(RuntimeError):
+    """W98 (#1361): the PROJECTED non-reclaimable reading crosses the reap mark.
+
+    WHY A PROJECTION AND NOT A LEVEL.  Boot weg2xsn26b was killed by the GLOBAL
+    host OOM killer (measured: ``/.lxc`` ``memory.events`` ``max 0 high 0``,
+    ``oom_kill`` 1 -> 3, so no cgroup limit was ever hit) while the level guard
+    at 93.0 GiB never fired -- and it never fired because the series it reads
+    STOPPED DELIVERING.  The 1 Hz sampler's own gaps at the death were 19 / 25 /
+    18 s, and the last reading before the blind window was 82.28 GiB while
+    ``memory.peak`` moved to 95.86.  In the final measured seconds ``shmem``
+    was climbing at **2.4-3.3 GiB/s** (50.157 -> 53.415 -> 55.847 in two
+    samples), so the 13.6 GiB to the mark is FOUR TO SIX SECONDS of that slope.
+    A level guard sampled at 1 Hz cannot see it; a level guard whose sampler is
+    starved by the very thrashing it should catch cannot see anything at all.
+
+    So this latch fires on ``nonreclaim + rate x lookahead``, on its OWN
+    cadence, and the line carries ``rate=`` and ``projected=`` so the next
+    reader can check the projection instead of trusting it.  A SAMPLER GAP is
+    itself a finding and gets its own line (``gap_s=``): during a leg, a hole
+    longer than :data:`RATE_LATCH_GAP_S` is the signature that preceded this
+    death, and a guard that goes quiet must SAY that it went quiet.
+
+    NOT A SECOND CURRENCY.  The currency stays ``anon+shmem+slab_unreclaimable``
+    -- the #1361 analysis refuted the file-backed hypothesis outright (at the
+    last sample ``file - shmem`` was **0.008 GiB**; there was no page cache to
+    blame).  What was wrong was the CADENCE and the blindness, not the unit.
+    """
+
+
+#: #1361: how far ahead the latch projects, seconds.  FIVE, because the
+#: measured climb that killed weg2xsn26b covered its remaining 13.6 GiB in 4-6 s
+#: at 2.4-3.3 GiB/s -- a lookahead shorter than the event it must pre-empt is
+#: decoration, and one much longer latches on noise.
+RATE_LATCH_LOOKAHEAD_S = 5.0
+#: The window the rate is fitted over.  Long enough that one jittery pair does
+#: not latch, short enough to see a 3 GiB/s ramp: at that slope 3 s of window
+#: still carries ~9 GiB of signal.
+RATE_LATCH_WINDOW_S = 3.0
+#: A hole in the reader's own series longer than this is REPORTED as a finding.
+#: The deaths' own gaps were 19 / 25 / 18 s, so 3 s is far inside the signature
+#: and still above normal scheduling jitter at a 200-500 ms cadence.
+RATE_LATCH_GAP_S = 3.0
+#: #1361b THE RECLAIM CUSHION FLOOR, GiB.  ``cushion = file - shmem`` from
+#: memory.stat: the page cache the kernel can still trade away to absorb the
+#: next shmem write.  MEASURED on the two boots that decide this number, over
+#: their WHOLE runtime and with the gate a live latch actually has:
+#:   weg2xsn24 SURVIVED -- minimum cushion while shmem was rising **2.67 GiB**,
+#:                         and ZERO samples under this floor in the whole boot;
+#:   weg2xsn27 DIED     -- 0.01 GiB with 16.17 GiB still to write, first sample
+#:                         under the floor at 00:13:03.631 (cushion 1.02);
+#:   weg2xsn26b DIED    -- same shape, first at 23:23:47 (cushion 0.02).
+#: 1.5 sits 1.17 GiB below the survivor's worst and 0.48 above the first firing
+#: sample of a dead boot.  It is NOT a safety factor: it is the midpoint of a
+#: measured separation of 2.66 GiB between a boot that flipped and two that the
+#: kernel reaped.
+RATE_LATCH_CUSHION_FLOOR_GIB = 1.5
+#: How much shmem must grow between two readings to count as "the fill is
+#: RUNNING".  The gate is deliberately this and not ``fill_remaining > x``:
+#: a remaining-bytes gate needs a TARGET, the latch has none, and the target
+#: taken from the ``PDFLIP-XCHG-PLAN`` line over-states it -- weg2xsn24 planned
+#: 27.15 GiB of d2h and landed 14.80 in shmem, so a plan-based remainder fires
+#: on the boot that survived.  Third over-pricing of the same quantity, after
+#: ``now + remaining`` and ``cushion as a stock``; this one is measured.
+RATE_LATCH_FILL_RISING_GIB = 0.01
+#: #1378 xsn64/xsn65: HOW CLOSE TO THE MARK THE CUSHION TEST IS A VERDICT AT
+#: ALL, GiB of headroom (``reap_mark - nonreclaim``).  The cushion is the page
+#: cache the kernel trades away to absorb a shmem write ONCE THE FREE POOL IS
+#: GONE; with 86 GiB of free pool the write lands in free pages and no cache
+#: is traded.  MEASURED: the two boots that decide the floor were at 13.6 GiB
+#: (weg2xsn26b) and ~14-18 GiB (weg2xsn27, 16.17 still to write) of headroom
+#: when they died, the survivor weg2xsn24 at ~4; weg2xsn65 latched W98 at
+#: cushion=0.43 with now=9.89 against 95.90 -- **86.0 GiB of headroom**,
+#: shmem=0.04, after a cold-cache launch (memory.current 5.3 GiB vs 40.4 on
+#: weg2xsn63 an hour earlier, same form).  Nothing this form writes to the
+#: host at once comes near that: the pinned lane (xchg_bounce, 15.75 GiB in
+#: the ARM line) plus the flip transient (~10 GiB) plus the floor is ~27; 32
+#: rounds it up and still sits far outside every measured death.  Inside the
+#: bound the cushion test is unchanged.  Outside it the reading is PRINTED
+#: ONCE and not latched -- a guard that tears a boot down on a cold cache
+#: while 86 GiB are free is not pre-empting a reap, it is the reap.
+RATE_LATCH_CUSHION_RELEVANCE_GIB = 32.0
+
+#: fnFL2 v14 (21.09.): the shared expert store (59 GiB tmpfs) makes ``file -
+#: shmem`` ~0 for the WHOLE boot while 29 GiB of the pool are plain free
+#: pages -- the latch tore D down at nonreclaim 88.98 with headroom 6.92 and
+#: cushion 0.14, exactly the weg2xsn65 shape but INSIDE the relevance bound.
+#: The page cache is not the only thing that absorbs a write: free pages do,
+#: first. With at least this many GiB free (MemFree, the container's own
+#: reading through lxcfs) the reading is printed once and not latched.
+RATE_LATCH_FREE_POOL_GIB = 3.0
+
+
+def launch_moment_peak_gib(
+    anon_load_peak_gib: float,
+    ring_fill_gib: float,
+    origin_gib: float,
+) -> Tuple[float, str]:
+    """#1361c: the LAUNCH moment charges the two SIMULTANEOUSLY, not in sequence.
+
+    Boot weg2xsn27 predicted ``run_peak=93.93`` with ``excess -0.50`` and named
+    ``run moment`` as the binding one -- and then died at the LAUNCH moment,
+    before a single flip, at roughly 96 GiB.  The measurement says why: group
+    D's three ranks were loading weights (anon 17.8 -> 23.0 GiB) WHILE the same
+    ranks wrote their dormant image into the ring (shmem 49.4 -> 60.4 GiB), and
+    the two overlap completely -- nonreclaim went 67.2 -> 82.5 in THIRTEEN
+    SECONDS, and `R1 READY group=D` only arrived 38 s after the kill.
+
+    The ledger's launch term takes them in sequence: the load transient is
+    charged against a base that does not yet hold the ring, and the ring is
+    charged at a moment when the load transient is assumed gone.  On a startup
+    sleep leg they are the same seconds.  This returns the SUM with its
+    provenance, so a caller prices the real peak instead of the larger of two
+    halves.
+    """
+    peak = float(origin_gib) + float(anon_load_peak_gib) + float(ring_fill_gib)
+    return peak, (
+        f"launch_peak={peak:.2f} GiB = origin {float(origin_gib):.2f} + "
+        f"anon_load_peak {float(anon_load_peak_gib):.2f} + ring_fill "
+        f"{float(ring_fill_gib):.2f} -- SIMULTANEOUS, not sequential (#1361c). "
+        f"Boot weg2xsn27 measured both in the SAME thirteen seconds: D's ranks "
+        f"loaded weights (anon 17.8 -> 23.0) while writing the ring (shmem "
+        f"49.4 -> 60.4), nonreclaim 67.2 -> 82.5, and READY came 38 s after the "
+        f"kill. A model that charges them one after the other names the RUN "
+        f"moment as binding and lets the LAUNCH moment kill the boot"
+    )
+
+
+def reap_model_line(
+    memtotal_bytes: int,
+    memavailable_bytes: Optional[int],
+    root_current_bytes: Optional[int],
+) -> str:
+    """#1361 (2): the reap mark MEASURED, with the constant as a cross-check.
+
+    :data:`OBSERVED_REAP_NONRECLAIM_BYTES` is 95.90 GiB because two boots were
+    reaped there.  It is NOT a property of the box: it is
+    ``host RAM minus whatever is OUTSIDE this cgroup at that moment``, and the
+    outside term is real and large.  Measured on this rig at idle: ZFS ARC held
+    **5.01 GiB** (``c_max`` 5.00) while the container's own ``Cached`` read
+    1.65 GiB and the cgroup's ``file`` 1.58 -- the ARC appears in NO container
+    figure, because it is host kernel memory charged to no cgroup at all.  Cap
+    it and the mark moves, with nothing in our own instruments changing.
+
+    So the mark is DERIVED here and the constant is printed BESIDE it as the
+    cross-check it has become.  ``outside`` is what neither this cgroup nor the
+    free pool holds; an unreadable term prints ``unreadable`` and the line falls
+    back to the constant, saying so, rather than inventing a mark.
+    """
+    total = memtotal_bytes / GIB
+    if memavailable_bytes is None or root_current_bytes is None:
+        return (
+            f"PDFLIP-HOST REAP MODEL: MemTotal={total:.2f} GiB outside=unreadable "
+            f"reap_mark=FALLBACK {OBSERVED_REAP_NONRECLAIM_BYTES / GIB:.2f} GiB "
+            f"(the recorded constant; MemAvailable or the root cgroup reading was "
+            f"absent, and an absent term is never priced as zero)"
+        )
+    avail = memavailable_bytes / GIB
+    cur = root_current_bytes / GIB
+    outside = total - avail - cur
+    if outside < 0.0:
+        # THE TWO TERMS OVERLAP, and clamping it to zero would hide that.
+        # `MemAvailable` already counts reclaimable pages that the cgroup's own
+        # `file` also counts, so on a QUIET box the subtraction goes negative --
+        # measured on this rig at idle: 118.05 - 117.67 - 7.56 = -7.18 GiB. A
+        # negative `outside` is therefore not "nothing outside", it is "this
+        # arithmetic does not separate the two here", and the honest answer is
+        # to say so and keep the constant rather than to publish a mark that is
+        # too HIGH -- which is the funding direction.
+        return (
+            f"PDFLIP-HOST REAP MODEL: MemTotal={total:.2f} MemAvailable={avail:.2f} "
+            f"root_current={cur:.2f} -> outside=OVERLAP {outside:.2f} GiB "
+            f"reap_mark=FALLBACK {OBSERVED_REAP_NONRECLAIM_BYTES / GIB:.2f} GiB. "
+            f"MemAvailable already counts reclaimable pages this cgroup also "
+            f"counts, so the difference does not separate them on a quiet box "
+            f"(measured idle here: 118.05 - 117.67 - 7.56 = -7.18). The model "
+            f"needs the terms taken UNDER LOAD, where the cgroup holds anon and "
+            f"shmem that MemAvailable cannot count -- and it REFUSES to publish a "
+            f"mark it cannot derive rather than publishing one that is too high"
+        )
+    mark = total - outside
+    const = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    return (
+        f"PDFLIP-HOST REAP MODEL: MemTotal={total:.2f} outside={outside:.2f} "
+        f"reap_mark={mark:.2f} GiB (outside = MemTotal - MemAvailable {avail:.2f} "
+        f"- root cgroup memory.current {cur:.2f}: everything holding host RAM that "
+        f"is NOT this cgroup and NOT free -- ZFS ARC above all, measured 5.01 GiB "
+        f"against this container's Cached 1.65, charged to no cgroup and invisible "
+        f"to every figure we print). CROSS-CHECK: the recorded constant is "
+        f"{const:.2f} GiB from two kernel reaps (weg2dk5 95.90, weg2dk6 96.06); "
+        f"delta {mark - const:+.2f} GiB. The constant is a CROSS-CHECK, not the "
+        f"actuator -- boot weg2xsn26b was killed by the GLOBAL host OOM killer "
+        f"(cgroup memory.events max 0 / high 0), so the mark a boot must respect "
+        f"is the host's, not a cgroup limit"
+    )
+
+
+class RateLatch:
+    """#1361 (1): the sampler-independent projection latch.  PURE but for its clock.
+
+    ``observe`` is fed ``(t_s, nonreclaim_gib)`` by a caller on its OWN cadence
+    (200-500 ms) and returns a LINE when something must be said -- a gap, or a
+    latch -- and ``None`` otherwise.  It never raises and never tears anything
+    down: the caller owns that decision, and this class owns the arithmetic and
+    the words.  That split is what makes it testable without a box.
+    """
+
+    def __init__(
+        self,
+        reap_mark_gib: float,
+        lookahead_s: float = RATE_LATCH_LOOKAHEAD_S,
+        window_s: float = RATE_LATCH_WINDOW_S,
+        gap_s: float = RATE_LATCH_GAP_S,
+    ) -> None:
+        self.reap_mark_gib = float(reap_mark_gib)
+        self.lookahead_s = float(lookahead_s)
+        self.window_s = float(window_s)
+        self.gap_s = float(gap_s)
+        self.samples: List[Tuple[float, float]] = []
+        #: #1361b: previous shmem reading, for the "fill is running" gate.
+        self._last_shmem: Optional[float] = None
+        self.latched = False
+        self.gaps: List[float] = []
+        #: #1378: the far-from-the-mark cushion reading is said ONCE per latch.
+        self._cushion_far_noted = False
+        self._free_pool_noted = False
+
+    def rate_gib_per_s(self) -> Optional[float]:
+        """The WORST consecutive slope inside the trailing window, or ``None``.
+
+        MAX OVER PAIRS, not the endpoint slope, and the difference is the whole
+        latch.  Fitted end-to-end over 3 s, weg2xsn26b's own ramp
+        (49.923 -> 50.157 -> 53.415 -> 55.847) averages to **1.98 GiB/s**
+        because its first second was nearly flat (+0.234) -- and 1.98 x 5 s
+        leaves the projection 3.7 GiB BELOW the mark, i.e. the guard would have
+        watched the boot die exactly as the level guard did.  The worst pair of
+        that same window is **3.26 GiB/s**, which projects past the mark.
+        Averaging is what smooths away a ramp ONSET, and the onset is the only
+        part there is still time to act on.  Same MAX-over-samples rule this
+        module applies to the reap samples and the ring-era transient.
+        """
+        if len(self.samples) < 2:
+            return None
+        t_now = self.samples[-1][0]
+        win = [s for s in self.samples if t_now - s[0] <= self.window_s]
+        if len(win) < 2:
+            win = self.samples[-2:]
+        best = None
+        for (t0, v0), (t1, v1) in zip(win, win[1:]):
+            dt = t1 - t0
+            if dt <= 0:
+                continue
+            r = (v1 - v0) / dt
+            if best is None or r > best:
+                best = r
+        return best
+
+    def projected_gib(self) -> Optional[float]:
+        r = self.rate_gib_per_s()
+        if r is None:
+            return None
+        # A FALLING reading projects to itself, never below: the latch exists to
+        # pre-empt a climb, and crediting a dip as future headroom is how a
+        # guard talks itself out of firing.
+        return self.samples[-1][1] + max(0.0, r) * self.lookahead_s
+
+    def observe(
+        self,
+        t_s: float,
+        nonreclaim_gib: float,
+        cushion_gib: Optional[float] = None,
+        shmem_gib: Optional[float] = None,
+        free_gib: Optional[float] = None,
+    ) -> Optional[str]:
+        """#1361b: the CUSHION test replaces the remaining-bytes one, measured.
+
+        ``free_gib`` (MemFree): free pages absorb a write before the page
+        cache does; at or above RATE_LATCH_FREE_POOL_GIB the cushion reading
+        is noted once and never latched (fnFL2 v14).
+
+        ``remaining_leg_gib`` IS DELETED, not left beside this -- a parameter
+        that no longer decides anything is the present-but-unwired state this
+        line has paid for three times.  What it tried to express (can this leg
+        finish in the room left) was refuted on the negative control: at the
+        true leg start weg2xsn24 read 68.29 + 27.15 = 95.44 and weg2xsn27
+        67.24 + 27.20 = 94.44 against a 95.90 mark -- the SURVIVOR closer to
+        firing than the boot that died.
+
+        WHAT ACTUALLY SEPARATES THEM is the reclaim cushion, and it is a FLOW
+        rather than a stock.  weg2xsn24 traded 20.54 GiB of page cache away to
+        absorb 14.80 GiB of shmem and its ``memory.current`` did not move
+        (91.80 -> 91.36); weg2xsn27 had 11.33 to absorb 11.03, ran the cushion
+        to 0.01 with 16.17 GiB still to write, and ``current`` climbed 4.51 GiB
+        before the kernel reaped it inside a 33 s stall.
+
+        So: ``shmem is rising`` AND ``cushion < floor`` -> latch.  The rising
+        gate is what a live latch can actually evaluate -- it needs no target,
+        and it structurally excludes the one-sample dip at a leg's END, where
+        shmem stops rising.  That exclusion was a judgement call in the analysis
+        (it is why this file's first draft read 4.25 instead of the live 2.67)
+        and is now a property of the code.
+
+        ``cushion_gib=None`` keeps the pre-#1361b rate path for a caller with no
+        memory.stat to hand.
+        """
+        gap = None
+        if self.samples:
+            d = t_s - self.samples[-1][0]
+            if d > self.gap_s:
+                gap = d
+                self.gaps.append(d)
+        self.samples.append((float(t_s), float(nonreclaim_gib)))
+        if len(self.samples) > 64:
+            del self.samples[:-64]
+        if gap is not None:
+            return (
+                f"PDFLIP-HOST RATE-GAP gap_s={gap:.1f} nonreclaim={nonreclaim_gib:.2f} "
+                f"GiB -- this reader went blind for {gap:.1f} s. Boot weg2xsn26b died "
+                f"inside gaps of 19/25/18 s with its last reading 13.6 GiB below the "
+                f"mark; a hole during a leg is a FINDING, not silence"
+            )
+        if self.latched:
+            return None
+        proj = self.projected_gib()
+        rate = self.rate_gib_per_s() or 0.0
+        _bounded = ""
+        # #1361b THE CUSHION TEST, ahead of the rate one: it fires on the
+        # measured separation, the rate only covers the case with no cushion
+        # reading at all.
+        if cushion_gib is not None:
+            rising = (
+                shmem_gib is not None and self._last_shmem is not None
+                and float(shmem_gib) - self._last_shmem > RATE_LATCH_FILL_RISING_GIB
+            )
+            if shmem_gib is not None:
+                self._last_shmem = float(shmem_gib)
+            headroom = self.reap_mark_gib - float(nonreclaim_gib)
+            if rising and float(cushion_gib) < RATE_LATCH_CUSHION_FLOOR_GIB:
+                if free_gib is not None and float(free_gib) >= RATE_LATCH_FREE_POOL_GIB:
+                    if not self._free_pool_noted:
+                        self._free_pool_noted = True
+                        return (
+                            f"PDFLIP-HOST CUSHION-BELOW-FLOOR FREE-POOL-ABSORBS: cushion="
+                            f"{float(cushion_gib):.2f} GiB < floor "
+                            f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} while shmem rises "
+                            f"(shmem={float(shmem_gib):.2f}) but MemFree={float(free_gib):.2f} "
+                            f"GiB >= {RATE_LATCH_FREE_POOL_GIB:.2f} (now={nonreclaim_gib:.2f}, "
+                            f"mark={self.reap_mark_gib:.2f}, headroom={headroom:.2f}) -- the "
+                            f"next write lands in free pages, not in a page cache the shared "
+                            f"expert store (tmpfs) has already displaced (fnFL2 v14 was torn "
+                            f"down on this reading); printed once"
+                        )
+                elif headroom > RATE_LATCH_CUSHION_RELEVANCE_GIB:
+                    # #1378 xsn65: cold cache, 86 GiB of free pool -- the
+                    # write this cushion would absorb lands in free pages.
+                    # Said once, never latched; the rate path below still
+                    # covers a real climb toward the mark.
+                    if not self._cushion_far_noted:
+                        self._cushion_far_noted = True
+                        return (
+                        f"PDFLIP-HOST CUSHION-BELOW-FLOOR NOT-LATCHED: cushion="
+                        f"{float(cushion_gib):.2f} GiB < floor "
+                        f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} while shmem rises "
+                        f"(shmem={float(shmem_gib):.2f}) but headroom="
+                        f"{headroom:.2f} GiB (now={nonreclaim_gib:.2f}, mark="
+                        f"{self.reap_mark_gib:.2f}) is ABOVE the relevance bound "
+                        f"{RATE_LATCH_CUSHION_RELEVANCE_GIB:.2f} -- the free pool, "
+                        f"not the page cache, absorbs the next write here "
+                        f"(weg2xsn65 was torn down on exactly this reading, "
+                        f"cushion 0.43 at 9.89 of 95.90, after a cold-cache "
+                            f"launch); printed once"
+                        )
+                else:
+                    self.latched = True
+                    return (
+                        f"W98 PdFlipHostRateLatched: cushion={float(cushion_gib):.2f} "
+                        f"GiB BELOW the floor {RATE_LATCH_CUSHION_FLOOR_GIB:.2f} "
+                        f"while shmem is STILL RISING (now={nonreclaim_gib:.2f} "
+                        f"GiB, shmem={float(shmem_gib):.2f}, headroom="
+                        f"{headroom:.2f} GiB <= relevance "
+                        f"{RATE_LATCH_CUSHION_RELEVANCE_GIB:.2f}, gaps_seen="
+                        f"{len(self.gaps)}) -- the page cache the kernel trades "
+                        f"away to absorb the next write is spent, and the write "
+                        f"has not stopped. MEASURED separation: weg2xsn24 flipped "
+                        f"with a worst cushion of 2.67 GiB and ZERO samples under "
+                        f"this floor in its whole boot; weg2xsn27 hit 0.01 with "
+                        f"16.17 GiB still to write and was reaped inside a 33 s "
+                        f"stall, weg2xsn26b the same shape. Controlled teardown, "
+                        f"never a kernel kill"
+                    )
+            # With a cushion reading present the cushion test is the ONLY
+            # verdict, inside the bound (#1361b: it replaced the projection
+            # there, measured on xsn24/xsn27) AND outside it. The first form
+            # of this commit fell through to the projection outside the bound
+            # -- "the rate path stays armed" -- and weg2xsn72 paid for it:
+            # the D group's weight load climbed the host at +11.22 GiB/s
+            # for a few seconds at now=51.32 GiB, the 5 s lookahead projected
+            # 107.39 against 95.90, and the boot was torn down 34 s after the
+            # D launch with 44.6 GiB of headroom. The projection latch was
+            # calibrated on a death slope (xsn26b) NEAR the mark and has no
+            # notion of a load burst that stops by itself; #1361b retired it
+            # wherever a cushion reading exists, and that stands.
+            return None
+        if proj is None or proj < self.reap_mark_gib:
+            return None
+        self.latched = True
+        return (
+            f"W98 PdFlipHostRateLatched: projected={proj:.2f} GiB "
+            f"reap_mark={self.reap_mark_gib:.2f} GiB rate={rate:+.2f} GiB/s "
+            f"lookahead_s={self.lookahead_s:.0f} now={nonreclaim_gib:.2f} GiB "
+            f"gaps_seen={len(self.gaps)}{_bounded} -- the LEVEL is still below the mark and "
+            f"the SLOPE reaches it within the lookahead. Boot weg2xsn26b's last "
+            f"measured slope was 2.4-3.3 GiB/s, which covers 13.6 GiB in 4-6 s: a "
+            f"level guard at 1 Hz cannot pre-empt that, and its sampler was starved "
+            f"by the same thrashing. Currency is anon+shmem+slab_unreclaimable "
+            f"(unchanged -- the file-backed hypothesis was refuted: file - shmem was "
+            f"0.008 GiB at the death). Controlled teardown, never a kernel kill"
+        )
+
+
+def watermark_breach_verdict(
+    current_bytes: int,
+    margin: Optional[Margin] = None,
+    watermark_gib: Optional[float] = None,
+    cgroup_anon_bytes: Optional[int] = None,
+    own_pids: Sequence[int] = (),
+    nonreclaim_gib: Optional[float] = None,
+    file_reclaimable_gib: Optional[float] = None,
+    anon_preboot_bytes: Optional[int] = None,
+    composition: Optional[Dict[str, Optional[float]]] = None,
+) -> Optional[str]:
+    """The runtime check, in NON-RECLAIMABLE currency (#1269 fix 3).
+
+    Returns the verdict LINE when the bound is crossed, else None. Pure, so it
+    is testable against a synthetic memory.stat with no processes involved.
+
+    ``nonreclaim_gib`` is what the bound is tested against; the raw reading is
+    printed beside it so the line carries BOTH currencies and the next boot can
+    see which one bites. With no non-reclaimable reading available the raw one
+    is used and the line SAYS SO -- conservative (it can only over-report
+    pressure), but it is exactly the comparison that refused weg2sb5b 28 GiB
+    below danger, so it is never silent about which currency it used.
+
+    The split comes from the PRE-BOOT anon baseline (:func:`split_by_baseline`),
+    never from ``cgroup anon - sum(RssAnon)``: that subtraction is invalid and
+    printed a negative foreign term on sb5b. ``cgroup_anon_bytes`` /
+    ``own_pids`` are kept in the signature for callers that still pass them,
+    but ``own_pids`` no longer participates in the arithmetic.
+    """
+    m = margin if margin is not None else resolve_margin()
+    w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    # #1269 FIX 4: the RUNTIME bound, which carries no model-error term. This
+    # call grades a MEASUREMENT; the residual reserves for how wrong a
+    # PREDICTION can be, and the measurement has already realised that error.
+    # Boot weg2sb5c was refused at 87.67 against the boot bound 87.30 with the
+    # reap point 8.2 GiB away -- that refusal was the double-charge, not danger.
+    bound = w - m.runtime_total_gib
+    boot_bound = w - m.boot_total_gib
+    current = float(current_bytes) / GIB
+    if nonreclaim_gib is not None:
+        tested = float(nonreclaim_gib)
+        currency = "non-reclaimable"
+    else:
+        tested = current
+        currency = "RAW memory.current -- INCLUDES reclaimable cache, no memory.stat"
+    if tested <= bound:
+        return None
+    cache = (
+        f" file_reclaimable={file_reclaimable_gib:.2f}"
+        if file_reclaimable_gib is not None
+        else ""
+    )
+    if composition:
+        cache += " STAT " + " ".join(
+            f"{k}={v:.2f}" for k, v in sorted(composition.items()) if v is not None
+        )
+    split = ""
+    if cgroup_anon_bytes is not None and anon_preboot_bytes is not None:
+        sg, fo, src = split_by_baseline(cgroup_anon_bytes, anon_preboot_bytes)
+        if sg is not None and fo is not None:
+            split = (
+                f" SPLIT flliper={sg:.2f} foreign={fo:.2f} GiB anon [{src}]"
+                f" -- {'FOREIGN desk load' if fo > sg else 'flliper'} dominates."
+            )
+    return (
+        f"W22 PdFlipHostWatermarkBreached current={tested:.2f} watermark={w:.2f} "
+        f"margin={m.runtime_total_gib:.2f} ({m.terms('runtime')}); "
+        f"graded against the RUNTIME bound {bound:.2f} GiB "
+        f"(the BOOT bound is {boot_bound:.2f}, and it is NOT what this line "
+        f"grades: W21 grades predictions, W22 grades measurements) "
+        f"crossed by {tested - bound:.2f} GiB in {currency} currency "
+        f"[raw memory.current={current:.2f}{cache}].{split} CONTROLLED TEARDOWN "
+        "down the killer path. Standing order 2026-09-08: the threshold is never "
+        "crossed; crossing only ends in a crash, so there is no 'accept the risk'."
+    )
+
+#: #1233 boot weg2dk5: the OBSERVED REAP POINT of this box's cgroup -- the
+#: memts row at 21:15:30Z, ``cg_current_b=102,998,904,832`` with ``oom_kill``
+#: 18 -> 24 in the same row (and /proc/vmstat 60 -> 66 independently, same
+#: delta +6).  ADVISORY ONLY, never a refusal: one boot's death is a watermark,
+#: not a limit, and this cgroup publishes no finite ``memory.max`` to check
+#: against.  It is printed beside each arm's PREDICTED run-peak ``cg_current``
+#: so a configuration that is about to repeat weg2dk5 says so BEFORE the boot.
+OBSERVED_REAP_CURRENT_BYTES = 102_998_904_832
+#: The same watermark in the currency fix 6 budgets in: the NON-RECLAIMABLE
+#: part of that reading.  The memts row of the reap (21:15:30Z) carries
+#: ``cached_kb=55,231,500`` and ``shmem_kb=55,202,584``, i.e.
+#: ``pagecache_ex_shmem_kb=28,916`` -- 0.03 GiB.  At the moment of the kill the
+#: box's page cache was ALREADY almost pure shmem (the store tmpfs and the
+#: shm-backed cpu images), so the watermark barely moves; stating that is what
+#: makes the comparison against a non-reclaimable origin legitimate rather than
+#: lucky.
+#:
+#: THE DIRECTION OF THE ONE TERM THAT IS MISSING (#1233 fix 7 -- fix 6 wrote
+#: "tighter" here and had the sign backwards).  ``slab_reclaimable`` is not in
+#: the sampler's columns, so it is charged as spent and NOT subtracted.  Not
+#: subtracting a reclaimable term leaves the watermark HIGHER, and a higher
+#: watermark makes the advisory's "ABOVE" verdict LESS likely: this constant is
+#: an UPPER BOUND on the reap point in fix 6's currency, and the advisory
+#: UNDER-warns by at most the unsampled slab term.  How big that is, measured
+#: on this box rather than guessed -- ``/sys/fs/cgroup/memory.stat
+#: slab_reclaimable`` = 564,459,544 B = 0.53 GiB (2026-09-07T23:57:35Z, idle
+#: box) and 0.73 GiB at the pre-fix-6 reading recorded in
+#: :func:`cg_reclaimable_bytes`.  So the under-warn is bounded by ~0.5-0.7 GiB
+#: against a 95.90 GiB watermark, an order of magnitude under the advisory's
+#: own 3.01 GiB under-prediction of weg2dk5 -- it does not move that boot's
+#: verdict, and it is stated rather than corrected by a hand constant, because
+#: the reap row itself carries no slab column to correct it WITH.
+OBSERVED_REAP_NONRECLAIM_BYTES = OBSERVED_REAP_CURRENT_BYTES - 28_916 * 1024
+#: cgroup-v2 semantics MEASURED on this box (2026-09-07, before fix 6) rather
+#: than recalled -- the two readings a wrong formula would silently invert:
+#:   /sys/fs/cgroup/memory.stat file  = 51,171,528,704 B
+#:   /proc/meminfo Cached  = 49,972,196 kB = 51,171,528,704 B  (equal, to the byte)
+#:   /sys/fs/cgroup/memory.stat shmem = 20,425,609,216 B
+#:   /proc/meminfo Shmem   = 19,946,884 kB = 20,425,609,216 B  (equal, to the byte)
+#:   /proc/meminfo SwapTotal = 0 kB
+#: So v2's ``file`` INCLUDES ``shmem`` exactly as ``Cached`` includes ``Shmem``,
+#: and with no swap shmem cannot be evicted at all -- it can only be deleted.
+#: ``current - file`` would therefore hand back the tmpfs page store, THE
+#: CARRIER, as if it were free memory.
+CGROUP_V2_FILE_INCLUDES_SHMEM_PROOF = (
+    "memory.stat file=51,171,528,704 B == /proc/meminfo Cached 49,972,196 kB; "
+    "memory.stat shmem=20,425,609,216 B == /proc/meminfo Shmem 19,946,884 kB; "
+    "SwapTotal=0 kB (this box, 2026-09-07): v2 `file` includes `shmem`, and "
+    "shmem is unevictable without swap"
+)
+#: The loader's transient while group D loads next to dormant P, charged at
+#: the launch moment only.  #721's constant is 27 GiB
+#: (weg1_host_sizing.LOAD_TRANSIENT_BYTES, page cache + staging); on THIS
+#: launcher it is MEASURED smaller: memts of boot weg2ls1b2 (2026-09-07
+#: 07:09:44Z, first sample, right after D READY) read MemAvailable 48.0 GB
+#: against 60.0 GB once the load's page cache had been reclaimed (07:10:1xZ),
+#: i.e. 12 GB of the load's cache was not counted as available.  The in-load
+#: PEAK was not sampled (the sampler started after D was ready; this
+#: launcher now starts it before group P) -- what IS metal-proven is that the
+#: launch moment of that boot (same shape: P image resident, D loading,
+#: memavail 107.6 GiB) passed with no OOM while the 27 GiB constant plus the
+#: #1232 headroom would price it at -7.4 GiB, so the constant over-charges
+#: this loader by at least that much.  12 GiB is the measured residual; the
+#: next boot's memts series replaces it if the in-load peak reads higher.
+LOAD_TRANSIENT_GIB = 12.0
+#: #1317n THE TRANSIENT, SPLIT BY MEMORY CLASS -- because the ledger already
+#: has two currencies and this constant was being spent in the wrong one.
+#:
+#: THE TWO CURRENCIES, both already in this module. The reap watermark counts
+#: NON-RECLAIMABLE memory only: :func:`cg_reclaimable_bytes` is
+#: ``(file - shmem) + slab_reclaimable`` and its docstring states "anon and
+#: unevictable are never subtracted: both are exactly what the reaper kills to
+#: recover". MemAvailable is the other currency, and it genuinely UNDER-REPORTS
+#: active page cache.
+#:
+#: WHICH CLASS THE 12 GiB IS, from this constant's own provenance above: "12 GB
+#: of THE LOAD'S PAGE CACHE was not counted as available", reclaimed ~30 s
+#: after D READY (weg2ls1b2: MemAvailable 48.0 GB during the load against 60.0
+#: GB once it had been reclaimed). Page cache. Not anon, not shmem.
+#:
+#: WHAT THAT MEANS FOR EACH BARRIER, one currency per barrier and no mixing:
+#: against a MemAvailable-derived base the whole transient IS charged -- the
+#: launcher samples BEFORE the groups start, so the depression is a real
+#: forward-looking cost of that reading. Against the REAP-derived base
+#: (``ceiling - non-reclaimable memory.current``) the page-cache half may NOT
+#: be charged, because that base does not contain page cache in the first
+#: place; charging it there books a quantity the reaper never kills for.
+#:
+#: MEASURED ON boot weg2sn6r, both forms, so the difference is a number and not
+#: an argument: launch leftover **-2.78 GiB** charged as a SUM (what refused
+#: the boot) against **+9.2 GiB** charged by class. The run moment funds either
+#: way (leftover 7.75 GiB).
+LOAD_TRANSIENT_PAGECACHE_GIB = 12.0
+#: The anon/shmem half. ZERO, and the zero is asserted with provenance rather
+#: than assumed: the ls1b2 measurement does NOT separate anon from page cache
+#: -- it reads MemAvailable before and after a reclaim -- so what is proven is
+#: that the residual DISAPPEARED on reclaim, and only page cache does that.
+#: An anon staging buffer would have survived it. If a later memts series
+#: separates the two, this is where the anon part goes, and it stays charged
+#: against BOTH barriers.
+LOAD_TRANSIENT_ANON_GIB = 0.0
+LOAD_TRANSIENT_SPLIT_PROVENANCE = (
+    "weg2ls1b2 (#721): MemAvailable 48.0 GB during D's load against 60.0 GB "
+    "once the load's PAGE CACHE had been reclaimed ~30 s after READY. The "
+    "residual vanished on reclaim, which only page cache does -- an anon "
+    "staging buffer would have survived it -- so the split is 12.0 page cache "
+    "/ 0.0 anon. The measurement does not separate the two directly; this line "
+    "IS the provenance the zero rests on."
+)
+if abs(
+    (LOAD_TRANSIENT_PAGECACHE_GIB + LOAD_TRANSIENT_ANON_GIB) - LOAD_TRANSIENT_GIB
+) > 1e-9 or not LOAD_TRANSIENT_SPLIT_PROVENANCE:
+    raise RuntimeError(
+        "#1317n the load transient's class split must sum to the measured "
+        f"total ({LOAD_TRANSIENT_GIB}) and must carry a provenance line: got "
+        f"{LOAD_TRANSIENT_PAGECACHE_GIB} + {LOAD_TRANSIENT_ANON_GIB}. An "
+        "unproven split would let the launch moment be priced in a currency "
+        "nobody measured, which is the defect this split exists to fix."
+    )
+#: b0: 10.19 GB MEASURED for six (rank x phase) anchor pools at m_mib=2400
+#: (2.55/1.49/1.06 + 2.55/1.27/1.27 GB).  Scaled linearly with M.
+ANCHORS_AT_2400_BYTES = 10.19 * GB
+#: The SAME measurement, split the way it was measured: three (rank x phase)
+#: pools per group.  Kept beside the total so the two can never say different
+#: things -- ``non_backup_host_bytes`` needs the per-group half and
+#: :func:`price` needs the sum, and a second hand-typed total is how they drift.
+ANCHORS_P_AT_2400_BYTES = (2.55 + 1.49 + 1.06) * GB
+ANCHORS_D_AT_2400_BYTES = (2.55 + 1.27 + 1.27) * GB
+ANCHORS_REFERENCE_M_MIB = 2400
+#: #1318 THE RING MULTIPLIERS ARE DERIVED, NOT MEASURED TWICE.
+#:
+#: WHAT WAS WRONG.  b0 read "8xS ring = 16.00 GB at S=2" off a boot log and
+#: split it by eye into "PP pool 2.00/1.00/1.00 GB (2xS)" for group P and
+#: "TP pool 4.00 GB x3 (6xS)" for group D.  Boot ``weg2sn5w`` measured the
+#: pools themselves and the D half is 2x over-booked: D's log prints
+#: ``HiCache host pool (30518 tokens)`` on all three ranks at 32,768 B per
+#: token, so the group holds 30,518 x 32,768 x 3 = 3.00 GB per S -- against
+#: 6.0 charged.  A 3.0 GB/S over-charge at S=2 is 6.0 GB the store never got,
+#: and it is what held the shipped store at 9 GiB with a 244,140-token bound
+#: still in force below the 262,144 context.
+#:
+#: WHY A FORMULA AND NOT A SECOND PAIR OF CONSTANTS.  A hand-typed pair is a
+#: second bookkeeping beside a quantity the pool already knows, and it drifts
+#: the moment the cell size or the rank layout moves (which is exactly what
+#: uneven DCP does to group P).  The ring cost of one GB of
+#: ``--hicache-size`` is
+#:
+#:      rows_per_rank x sum(cell_bytes over the group's ranks)
+#:
+#: because ``pool_host/base.py sync_fixed_hicache_size`` MIN-syncs the ROW
+#: COUNT across the group, so every rank holds the same number of rows and
+#: the row count is set by the rank with the LARGEST cell:
+#:      rows_per_rank(S=1 GB) = GB / max(cell_bytes)
+#: and each rank then pays its own cell size for those rows.  Linear in S.
+#:
+#: PROVENANCE, both groups, boot ``weg2sn5w`` (front/P/D logs under
+#: /spinning/evidence-665-f1, pattern ``boot_weg2_weg2sn5w_*``):
+#:   * group P, ``--tp-size 1 --pp-size 3``, uneven DCP: cells 18,432 /
+#:     8,192 / 6,144 B; rows MIN-sync to 1e9/18432 = 54,254 (P log:
+#:     ``host KV pool 54254``); ring = 54,254 x 32,768 = 1.78 GB per S.
+#:     The 2.0 charged before over-charges by 0.22 GB/S -- small, and in the
+#:     conservative direction, which is why it was never caught.
+#:   * group D, ``--tp-size 3`` even: cells 32,768 B x 3; rows =
+#:     1e9/32768 = 30,518 (D log: ``HiCache host pool (30518 tokens)``);
+#:     ring = 30,518 x 98,304 = 3.00 GB per S.  This is the 2x.
+#: Derived total 4.78xS against b0's 8xS reading: the derivation may never
+#: come out ABOVE the reading it replaces, and :func:`_ring_mult_gb_per_s`
+#: refuses if it does rather than silently under-charging the host.
+CELL_BYTES_P_PER_RANK = (18432, 8192, 6144)
+CELL_BYTES_D_PER_RANK = (32768, 32768, 32768)
+#: The b0 reading the derivation replaces, kept ONLY as the refusal ceiling
+#: above.  Never charged.
+RING_B0_TOTAL_MULT_GB_PER_S = 8.0
+
+
+def _ring_mult_gb_per_s(cells: tuple) -> float:
+    """GB of host ring per GB of ``--hicache-size``, for one group.
+
+    ``rows_per_rank = GB / max(cells)`` is ``sync_fixed_hicache_size``'s
+    MIN-sync stated as arithmetic; every rank then pays its own cell size for
+    those rows, so the group's bytes are ``rows * sum(cells)``.
+    """
+    if not cells or min(cells) <= 0:
+        raise ValueError(f"cell byte sizes must all be positive, got {cells!r}")
+    rows_per_rank = GB / float(max(cells))
+    return rows_per_rank * float(sum(cells)) / GB
+
+
+RING_P_MULT_GB_PER_S = _ring_mult_gb_per_s(CELL_BYTES_P_PER_RANK)
+RING_D_MULT_GB_PER_S = _ring_mult_gb_per_s(CELL_BYTES_D_PER_RANK)
+if RING_P_MULT_GB_PER_S + RING_D_MULT_GB_PER_S > RING_B0_TOTAL_MULT_GB_PER_S:
+    raise RuntimeError(
+        "#1318 host ring derivation came out ABOVE the b0 reading it replaces "
+        f"({RING_P_MULT_GB_PER_S:.3f}+{RING_D_MULT_GB_PER_S:.3f} = "
+        f"{RING_P_MULT_GB_PER_S + RING_D_MULT_GB_PER_S:.3f} > "
+        f"{RING_B0_TOTAL_MULT_GB_PER_S:.3f} xS): a derivation that charges the "
+        "host LESS than the measurement is a free store, and one that charges "
+        "MORE means the cell sizes or the rank layout above no longer describe "
+        "this boot. Re-measure the pools; do not relax this check."
+    )
+#: b0 U14: the unattributed residual is 1.006 GiB = ~4 % on top of the
+#: host-pool posts (rings + anchors).  Charged as +4 % on those posts.
+HOST_POOL_OVERHEAD = 0.04
+
+#: #1233 draft KV across the flip (C17). Pinned host DRAFT pools, one row per
+#: target host slot (``kv_cache_builder._build_draft_host_pool``: "same slot
+#: count as the target host pool"), 2048 B/token for the NEXTN head (1 layer
+#: x 4 kv heads x 256 head_dim x 2 (K,V) x 1 B fp8).  Group P: the producer
+#: on the last stage, 61,037 slots (P log weg2zr2: host KV pool 61,036 + the
+#: page-alignment slot) -> 119.2 MiB.  Group D: 30,519 slots x this rank's
+#: head share {1024, 512, 512} B (2/1/1 heads over the three ranks) -> 59.6
+#: MiB in total.  Both are pinned at launch and charged at BOTH moments; D's
+#: term used to sit implicitly inside RING_D_MULT_GB_PER_S and is explicit
+#: from here on.
+#: #1264 ``--draft-kv-on-p off`` DOES NOT REACH THIS TERM, deliberately, and
+#: the reason is named here rather than left for a reader to rediscover.  Under
+#: ``off`` group P builds no draft host pool at all, so ``draft_host_p_gib``
+#: (119.2 MiB = 0.116 GiB) is charged against a pool that does not exist.  It
+#: is left charged because the error is CONSERVATIVE in the only direction that
+#: matters: an over-charge makes the ledger stricter (a smaller store, an
+#: earlier refusal), never looser, and 0.116 GiB against a ~90 GiB idle boot is
+#: below the resolution of every arm decision the ladder makes.  Threading the
+#: predicate through ``charge_terms`` -> ``price`` -> ``choose`` for it would
+#: put a boolean in three signatures that ``predicted_run_peak_gib`` and
+#: ``dk7_run_residual_gib`` must then agree about -- the second-bookkeeping
+#: shape, for a term smaller than the rounding.  The ledger DOES follow the
+#: switch where it is material, and through the ring rather than a flag: an
+#: ``off`` boot's ring is 643 MiB smaller (Sigma H 38306 -> 37663 MiB, measured
+#: dry-run 2026-09-08), and the ledger hands that back as store 8 -> 9 GiB.
+#: If this term is ever made switch-aware, make it aware in ``charge_terms``
+#: only, so those three call sites keep their single authority.
+DRAFT_PAGE_BYTES = 2048
+DRAFT_HOST_SLOTS_P = 61037
+DRAFT_HOST_SLOTS_D = 30519
+DRAFT_HOST_P_MIB = DRAFT_HOST_SLOTS_P * DRAFT_PAGE_BYTES / float(2**20)
+DRAFT_HOST_D_MIB = DRAFT_HOST_SLOTS_D * (1024 + 512 + 512) / float(2**20)
+#: The draft tier of the STORE: 2048 B per token beside the 32768 B canonical
+#: KV page (16 attention layers x 2048 B) = 1/16.  Unchanged in bytes versus
+#: the three per-rank shards it replaces (1024+512+512 = 2048), inodes / 3.
+STORE_DRAFT_FRACTION = DRAFT_PAGE_BYTES / 32768.0
+
+#: The arm ladder: (S GB per --hicache-size, M MiB per --hicache-mamba-host-mib).
+DEFAULT_ARMS: Tuple[Tuple[int, int], ...] = ((1, 2400), (1, 1200), (1, 600))
+
+
+class PdFlipHostLedgerRefused(RuntimeError):
+    """W20: no arm of the ladder funds both moments plus the store floor."""
+
+
+class PdFlipXchgLanesUnmeasured(PdFlipHostLedgerRefused):
+    """W102 (#1358): no lane count was ever measured for this cut."""
+
+
+#: #1358 THE LANE COUNT IS MEASURED, NOT DERIVED -- the same class as Sigma H.
+#:
+#: One assemble buffer exists per LANE (`bounce_path`: a directed card pair, or
+#: the diagonal's card), and the set is built at the RANK at runtime by
+#: `group_descs_by_pair` over descs that carry pointers. It does not exist at
+#: the arm in any form: the xchg census carries `cards` and `waves` and no
+#: (src,dst) structure (checked, not assumed), and deriving it from the P-cut
+#: would be a second expression of an enumeration the lane already owns --
+#: which is the defect this ticket exists to remove, not to repeat.
+#:
+#: SO IT IS LEARNED FROM A BOOT, like every other number of this kind, and the
+#: source is the boot's own `PDFLIP-XCHG-HOST-SLOT` lines: the count of DISTINCT
+#: `path=` values among `event=alloc` entries. That is the file set itself, not
+#: a proxy for it.
+#:
+#: KEYED ON THE CUT, NOT THE FORM KEY, and the difference decides whether
+#: weg2xsn29 may use this seed: the lane set follows from WHICH card sends to
+#: which, i.e. the P-cut plus the D-vector plus the legs. Text-only (#1356)
+#: changes the form key and does NOT change the cut, so the xsn28 measurement
+#: carries to xsn29. A form key here would have forced a needless re-measure.
+XCHG_LANES_BY_CUT: Dict[str, Dict[str, object]] = {
+    "pp=39,13,12;d=tp3;legs=both": {
+        "lanes": 5,
+        "boot": "weg2xsn28",
+        "at": "2026-09-13T10:37:53Z",
+        "paths": ("bounce.bin.c0", "bounce.bin.c1", "bounce.bin.p1",
+                  "bounce.bin.p2", "bounce.bin.p4"),
+    },
+}
+
+
+def xchg_cut_key(pp_stage_ratio: str, d_vector: str = "tp3",
+                 legs: str = "both") -> str:
+    """The key the lane count is recorded under. The CUT, never the form."""
+    return (f"pp={str(pp_stage_ratio).strip()};"
+            f"d={str(d_vector).strip()};legs={str(legs).strip()}")
+
+
+def resolve_xchg_lanes(cut_key: str) -> Tuple[int, str]:
+    """``(lanes, provenance)`` for this cut, or W102 by name.
+
+    NEVER A DEFAULT. An unmeasured cut gets a refusal, not a 1: pricing one
+    buffer where the boot creates five is exactly the 5.64 GiB under-charge
+    that made weg2xsn28 latch W98 nine seconds after `serving` with 0.51 GiB
+    missing. A guessed lane count is that defect with a comment in front of it.
+    """
+    rec = XCHG_LANES_BY_CUT.get(str(cut_key))
+    if not rec:
+        # #1358 [bootstrap] FIRST BOOT OF THIS CUT IS A STATE, NOT A FAULT --
+        # the same correction W99 needed, applied here in the same commit so
+        # the class does not cost a fourth window.
+        #
+        # A cut with no record has never been booted, so no boot can have
+        # measured its lanes; refusing it means the boot that would PRODUCE the
+        # measurement can never run. Instead the arm prices the WORST CASE the
+        # region itself defines -- every directed cross pair plus every
+        # diagonal -- and says so. That is conservative (it over-charges a cut
+        # that uses fewer lanes, never under-charges), it is derived from
+        # `weight_exchange_region`'s own vocabulary rather than a literal, and
+        # it RETIRES at the first boot: the #1358 reader lifts the real count
+        # from that boot's HOST-SLOT lines and it is recorded per cut.
+        #
+        # W102 IS NOT DELETED, AND SINCE #1358 [W102-wired] IT IS RAISED: the
+        # leg driver (weight_updater.py, the `group_descs_by_pair` guard)
+        # refuses with it when a RECORDED count is below what the leg actually
+        # creates, before the first allocation. Until that commit this comment
+        # claimed a refusal that existed nowhere in the tree -- an intention
+        # written as a state, which is what a W-code census reads as covered.
+        from flliper.srt.pdflip import weight_exchange_region as _xr
+
+        _worst = int(_xr.N_PAIRS) + int(_xr.N_CARDS)
+        return _worst, (
+            f"PDFLIP-XCHG-LANES cut={cut_key} lanes={_worst} source=WORST-CASE "
+            f"(bootstrap: no boot of this cut has measured one) -- "
+            f"N_PAIRS {int(_xr.N_PAIRS)} + N_CARDS {int(_xr.N_CARDS)} from "
+            f"weight_exchange_region, the most lanes this region can carry. "
+            f"CONSERVATIVE BY CONSTRUCTION: a cut that uses fewer is "
+            f"over-charged, never under-charged. Retires at this boot's own "
+            f"HOST-SLOT lines -- record the measured count per cut and this "
+            f"branch is not reached again. Known cuts: "
+            f"{sorted(XCHG_LANES_BY_CUT) or '(none)'}"
+        )
+    return int(rec["lanes"]), (
+        f"PDFLIP-XCHG-LANES cut={cut_key} lanes={int(rec['lanes'])} "
+        f"source=measured boot={rec.get('boot', '?')} at={rec.get('at', '?')} "
+        f"paths={','.join(rec.get('paths', ()) or ())} -- distinct alloc paths "
+        f"in that boot's own HOST-SLOT lines; the arm charges "
+        f"buffer_bytes x this"
+    )
+
+
+# ---------------------------------------------------------------------------
+# H44 (Task #17): DER POSTEN 'LANES' -- die On-card-Host-Lanes des
+# sequenziellen Transports (/dev/shm/pdflip-seq-<boot>/c<k>[_s1]_*.bin).
+#
+# ZENSUS-LUECKE bis hierher: kein Term dieses Ledgers kannte sie; sie standen
+# nur implizit im GEMESSENEN ``flip_ratchet_gib`` (die Lanes sind ab dem
+# ersten Flip boot-lang resident), und die Notiz host-ram-posten-nf-0923
+# schaetzte sie von Hand ("Lanes ~9"). x148 gemessen: 3,18 GiB (sechs
+# Dateien, Tiefe 2, je Lane der groesste Tag).
+#
+# DIE RINGFORM PREIST SICH SELBST: je Karte und Pufferslot hoechstens EINE
+# Ringdatei ``hdr + slots x slot_bytes``, und nur, wenn ein Tag den Host-Weg
+# nimmt (IPC-Staging verweigert). Der Ganz-Tag-Rueckfall (Collector nicht
+# bereit) bleibt eine Laufzeitgroesse -- er steht in der Zensuszeile als
+# ``whole=`` neben dem Preis, statt geschaetzt zu werden. NICHT in die
+# Arm-Summe (``charge_terms``): der gemessene flip_ratchet eines Vorgaenger-
+# boots enthaelt die Lanes bereits, ein zweiter Term waere
+# PdFlipHostRatchetDoubleCharged.
+# ---------------------------------------------------------------------------
+
+#: Kopf einer Ringdatei, identisch mit ``weight_exchange_bounce.SEQ_RING_HDR_BYTES``
+#: (ein Test haelt die beiden gleich; hier ohne Import, das Ledger laeuft im
+#: Launcher ohne die Transportmodule).
+SEQ_RING_HDR_BYTES = 4096
+LANES_MARKER = "PDFLIP-HOST-LEDGER LANES"
+
+
+def seq_lanes_priced_bytes(*, ring_on: bool, cards: int, depth: int,
+                           slots: int, slot_bytes: int) -> int:
+    """Obergrenze der Ringform: ``cards x depth x (hdr + slots x slot_bytes)``.
+    Ohne Ring gibt es keinen Preis aus der Geometrie (je Lane der groesste
+    Tag, erst am Join bekannt) -> 0 und die Zeile sagt ``priced=unpriced``."""
+    if not ring_on:
+        return 0
+    return int(cards) * max(1, int(depth)) * (
+        SEQ_RING_HDR_BYTES + int(slots) * int(slot_bytes))
+
+
+def lanes_ledger_line(*, event: str, lane_key: str, file: str, nbytes: int,
+                      files: int, ring_bytes: int, whole_bytes: int,
+                      priced_bytes: int) -> str:
+    """Eine Zeile je neuem/gewachsenem Lane-File. ``held`` ist die Summe der
+    Lane-Dateien im Verzeichnis (tmpfs, je Datei einmal), ``priced`` der
+    Ring-Preis; ``over`` > 0 heisst: ein Ganz-Tag-Rueckfall haelt mehr als
+    der Ring kostet (die Zeile davor nennt den Grund)."""
+    held = int(ring_bytes) + int(whole_bytes)
+    _p = (f"{priced_bytes / GIB:.3f} GiB" if priced_bytes > 0 else "unpriced")
+    over = held - int(priced_bytes) if priced_bytes > 0 else 0
+    return (f"{LANES_MARKER} event={event} lane={lane_key} file={file} "
+            f"bytes={int(nbytes)} files={int(files)} "
+            f"held={held / GIB:.3f} GiB (ring={int(ring_bytes) / GIB:.3f} "
+            f"whole={int(whole_bytes) / GIB:.3f}) priced={_p} "
+            f"over={max(0, over) / GIB:.3f} GiB -- tmpfs, gepinnt, boot-lang "
+            f"(der Posten 'Lanes'; im flip_ratchet gemessen, nicht in der Arm-Summe)")
+
+
+class PdFlipSleepLegCushionDeficit(PdFlipHostLedgerRefused):
+    """W100 (#1361 fix6): this sleep leg needs more page cache than is left.
+
+    THE MEASUREMENT THIS EXISTS FOR, boot weg2xsn25 on 2026-09-13:
+
+        07:00:50..07:01:09   cushion FLAT at 2.697 GiB, PSI 0.00
+        ~07:01:07.6          D's sleep leg starts (/release_memory_occupation)
+        07:01:10.0 -> .5     cushion 2.591 -> 0.548 in ONE 0.5 s tick,
+                             shmem +2.26 GiB
+        07:01:10.870         W98 latches, front issues PDFLIP STOP
+        07:01:13.188         the sleep RPC RETURNS (ms=5572)
+        07:01:14.6..24.8     first rank killed, global host OOM
+
+    W98 FIRED 4 SECONDS BEFORE THE FIRST KILL AND PREVENTED NOTHING, and the
+    reason is structural rather than a tuning failure: the STOP stops
+    ADMISSION, and the bytes that spent the cushion were D's own sleep leg,
+    already 3.3 s into a 5.6 s RPC when the latch fired. You cannot recall
+    bytes being written by refusing new requests.
+
+    THE FLOOR IS NOT THE LEVER EITHER, measured on the same curve: floors of
+    1.0, 1.5, 2.0, 2.5, 2.60 and 2.69 GiB ALL latch on the SAME sample with the
+    SAME 4.1 s lead. The cushion is flat for a minute and then vertical inside
+    one tick -- there is no slope to catch it on. Only 3.0 moves it one tick,
+    and 5.0 buys 46 s while firing 8 times on the SURVIVING boot weg2xsn24.
+
+    So the lever belongs HERE, at the START of the leg, where the arithmetic is
+    still ordinary: at 07:01:08.484 the cushion was 2.697 GiB and the write
+    that followed added 4.32 GiB of shmem. The deficit was 1.62 GiB and it was
+    knowable ~3 seconds BEFORE the first byte, because the size of what this
+    group is about to write is a quantity the sidecar already measured on the
+    boot that wrote the plan.
+
+    NOT A NEW THRESHOLD: there is no tunable number in this refusal. It
+    compares two measured quantities and refuses when one does not cover the
+    other, with `margin_gib` supplied by the caller and printed rather than
+    chosen here.
+    """
+
+
+class PdFlipModelIdentityMismatch(PdFlipHostLedgerRefused):
+    """W99 (#1362): a recorded number belongs to a DIFFERENT model.
+
+    THE FOSSIL, found at the desk on the 4B-FP8 transition vehicle
+    (RedHatAI/Qwen3.5-4B-FP8-dynamic, 7.48 GiB): every host number this line
+    carries was measured on the 27B and none of them says so.  Sigma H is
+    solved from the PREVIOUS BOOT's census -- ``Sigma H 48240 MiB = per card
+    the LARGER of [tag census 47512, measured dormant image 48672]``, digit for
+    digit weg2xsn25's -- so a 7.48 GiB model is handed a 47 GiB ring and dies
+    in W48 plus three W51 without ever saying why.
+
+    THAT IS A HEN-AND-EGG BY CONSTRUCTION: the only way to get a record of the
+    new model is to boot it, and it cannot boot because it is priced from the
+    old one.  So a recorded figure may only be spent on the model it was
+    measured on; where the digests differ the ledger refuses BY NAME and says
+    which measurement is missing, instead of reaching for a foreign number and
+    letting a ring-form mismatch three layers down be the message.
+    """
+
+
+class PdFlipHostFlipRatchetUnmeasured(PdFlipHostLedgerRefused):
+    """W94 (#1350): no record of this form carries ``flip_ratchet_gib``.
+
+    THE TERM THIS CLASS EXISTS FOR is the one five formgleiche boots
+    under-predicted by +1.65 / +1.70 / +2.25 / +2.97 / +4.10 GiB while every
+    stationary term of the ledger got MORE accurate
+    (ANALYSE_1350_HOST_TERM_0912.md): what the FIRST waking of each group adds
+    to ``anon`` and never gives back -- +1.18..1.73 GiB on the P->D leg,
+    +0.28..0.30 on D->P, monotone in 34 of 37 measured flip deltas.
+
+    It is a REFUSAL and not a default, for the reason :func:`run_origin_gib`
+    refuses without a cgroup sample and :func:`price` refuses without a ring
+    table: a term whose measurement is missing must not be priced at zero.  A
+    zero here is the #606 class -- the ledger would report FUNDABLE for an arm
+    whose peak it has knowingly stopped modelling, which is the exact direction
+    that kills a boot.
+    """
+
+
+class PdFlipHostDeviationRefused(PdFlipHostLedgerRefused):
+    """W97 (#1360): the named deviation is itself not admissible.
+
+    The user's standing rule of 2026-09-12 makes the reap watermark SOFT: a
+    boot may cross the ledger's bound with a NAMED reason and a RUNTIME LATCH,
+    never silently.  This class is the "never silently" half, and it refuses
+    three shapes rather than arguing about them:
+
+    * a reason without a latch, or a latch without a reason -- a deviation with
+      no number is exactly the silent crossing the rule forbids, and a latch
+      with no reason leaves the next reader without the why;
+    * a latch AT OR ABOVE the hard bound -- a latch above the bound it is meant
+      to catch a breach beneath can never fire before the bound is already
+      crossed, so it is decoration;
+    * a predicted peak AT OR ABOVE the REAP WATERMARK itself.  The bound is
+      soft; the watermark is where the kernel actually reaped (weg2dk5 95.90,
+      weg2dk6 96.06).  Accepting a prediction that is already at the reap point
+      is not a deviation, it is booting into the killer -- which boot weg2xsn25
+      did on a prediction 5 GiB below it.
+    """
+
+
+class PdFlipPriorCushionArgsIncomplete(PdFlipHostLedgerRefused):
+    """W105 (#1378 Stage 2): ``prior_cushion_min_gib``/``prior_bounce_gib`` are
+    BOTH OR NEITHER, exactly like ``deviation_reason``/``riegel_gib`` (W97).
+
+    ``cushion_headroom_gib`` takes three arguments and returns ``None`` only
+    when the FIRST is ``None`` -- a caller that supplies ``prior_cushion_min``
+    alone would silently divide by an un-cited ``prior_bounce_gib`` of 0.0 (or
+    crash on ``float(None)``), and either way the printed line would show a
+    number that looks measured but rests on a guessed half of its own inputs.
+    That is the #1386 failure class one layer down: an unenforced half of a
+    switch reads as the whole switch to the next boot-seat.
+    """
+
+
+class PdFlipHostRatchetDoubleCharged(PdFlipHostLedgerRefused):
+    """W95 (#1350): the flip ratchet would be charged TWICE in one prediction.
+
+    ``predicted_run_peak = run_origin + charges + Sigma H``.  The origin is
+    ``max(launch reading, MEASURED run-moment residual floor)``
+    (:func:`run_origin_gib`), and that floor is sampled by the front at a
+    group's first sleep -- i.e. DURING a flip.  ANALYSE_1350_HOST_TERM_0912.md
+    SS2 measured the consequence: ``run-moment residual ... stored=`` walks
+    2.31 -> 2.34 -> 4.09 -> 5.28 GiB over the 0912 boots precisely because the
+    sample is taken after the second leg and therefore ALREADY CONTAINS the
+    ratchet.  The launch reading (6.44-6.47) still wins today, "but at 5.28 and
+    +1 GiB per boot the floor binds in one to two boots".
+
+    The moment it binds, adding ``flip_ratchet_gib`` on top charges the same
+    bytes a second time.  This class makes that impossible BY CONSTRUCTION
+    instead of by a comment: an origin that came from a record which itself
+    carries a ratchet measurement may not be combined with a charged ratchet
+    term, and the arm refuses by name rather than silently over-predicting.
+
+    Over-prediction is the safe direction and could have been left alone --
+    it is refused anyway, because a ledger that is wrong in the safe direction
+    still refuses arms the box can carry, and #1317n's whole finding was that
+    such a refusal is indistinguishable from a real one to the next reader.
+    """
+
+
+class PdFlipHostRunPeakRefused(RuntimeError):
+    """W21 (fix 8): an arm funds both moments, and its RUN PEAK does not.
+
+    The term this class exists for is the one two boots died on while the
+    advisory said "below": the predicted non-reclaimable ``memory.current`` at
+    the run peak against :data:`OBSERVED_REAP_NONRECLAIM_BYTES`.  It is a
+    SEPARATE class from W20 so the log says which quantity refused -- a store
+    floor and a reap watermark are different findings with different levers.
+    """
+
+
+# --------------------------------------------------------------------------
+# FIX 8: the image term, measured
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ImageTerms:
+    """The dormant host image of each group, with WHERE each number came from.
+
+    ``p_measured`` / ``d_measured`` are False for a value that is a recorded
+    reading of ANOTHER boot or a BOUND -- the printed line says so, because a
+    bound that reads like a measurement is exactly how 28.83 GiB survived three
+    boots.
+    """
+
+    p_gib: float
+    d_gib: float
+    p_source: str
+    d_source: str
+    p_measured: bool
+    d_measured: bool
+    extra_p_gib: float
+    extra_d_gib: float
+
+
+def refuse_foreign_image(
+    entry: Dict[str, object], want: str, form_key_match: bool = False
+) -> Optional[str]:
+    """#1362: a dormant image may only be spent on the model it was measured on.
+
+    THE FOSSIL THIS CLOSES, measured at the desk on the 4B-FP8 vehicle: Sigma H
+    is solved from the previous boot's census, and the 4B would have been handed
+    ``Sigma H 48240 MiB = per card the LARGER of [tag census 47512, measured
+    dormant image 48672]`` -- weg2xsn25's figures, digit for digit, for a model
+    a sixth the size.  The boot then dies in W48 plus three W51, none of which
+    says "wrong model".
+
+    AN EMPTY DIGEST IS UNKNOWN, NOT MATCHING.  Records written before #1362
+    carry none, and treating those as "same model" would re-open the hole for
+    exactly the boots most likely to hit it.  The refusal names the measurement
+    that is missing, because the fix is one boot of the new model -- not a
+    smaller number.
+    """
+    got = str(entry.get("model_digest") or "")
+    if got == str(want):
+        return None
+    if not form_key_match:
+        # #1362 [bootstrap] A RECORD OF ANOTHER FORM IS NOT EVIDENCE ABOUT THIS
+        # ONE -- it is neither a match nor a foreign model, it simply does not
+        # apply, and raising W99 on it confused "wrong model" with "no record
+        # yet". THIRD INSTANCE of the class on this rig (#1358 lanes, #1356
+        # ring, this): a form change invalidates every inherited record, and a
+        # reader that cannot say "first boot of this form" turns the FIRST boot
+        # of every new form into a refusal -- including the boot that would
+        # have written the record it demands.
+        #
+        # Measured on e50ac74b7c: text-only moved the P form key to
+        # 2b66740bedf9, weg2xsn25's image no longer matched, and the default
+        # arm died W99 before the ledger -- so the bootstrap could not run
+        # either.
+        #
+        # The caller SKIPS this entry (it must not price another form's image)
+        # and prices the named fallback instead. This boot then writes its own
+        # record, stamped with its digest, and the next boot of this form
+        # compares digests normally.
+        return (
+            f"PDFLIP-MODEL-IDENTITY BOOTSTRAP record={entry.get('boot_tag', '?')} "
+            f"form=OTHER skipped -- this record was measured on a DIFFERENT "
+            f"group-P form, so it is not this form's image and is not priced. "
+            f"FIRST BOOT OF THIS FORM: no inherited image exists yet, which is "
+            f"a state and not a fault. This boot writes its own record stamped "
+            f"with {str(want)[:16]}...; the next boot of this form compares "
+            f"digests. A record of another form is never evidence about this "
+            f"one -- neither for it nor against it."
+        )
+    if not got and form_key_match:
+        # #1362 [22-fix2] THE TRANSITION PATH, and it exists because the strict
+        # rule bricked the standing serving form. Every record on this box was
+        # written before #1362 and carries no digest, so "empty = unknown" --
+        # right as a danger direction -- refused the very model that WROTE
+        # those records. Measured: the gdncov dry run stopped at W99 on
+        # weg2xsn27's own image, which is the same hen-and-egg #1362 set out to
+        # close, re-created by its own fix.
+        #
+        # A legacy record is admitted ONLY when the form key matches, and the
+        # line says plainly that identity is then carried by the FORM KEY alone
+        # -- Klasse A: the instrument states what it can and cannot prove. The
+        # form key contains `--model-path` and excludes labels (#1362, pinned by
+        # the train seat's test_pdflip_form_key_label_1362), so a matching key IS
+        # evidence of the same checkpoint path; it is weaker than a content
+        # digest and never claims otherwise. It RETIRES on its own: (2) below
+        # stamps every record this boot writes, so the next boot compares
+        # digests and never reaches this branch.
+        #
+        # RETURNED, not logged here: a line nobody reads is an instrument
+        # without a reader. The caller prints it and a test asserts it.
+        return (
+            f"PDFLIP-MODEL-IDENTITY LEGACY record={entry.get('boot_tag', '?')} "
+            f"digest=absent form_key=match accepted -- this record predates "
+            f"#1362 and carries no model digest, so its identity is held by the "
+            f"FORM KEY ALONE (which contains --model-path and excludes labels). "
+            f"That is WEAKER than a content digest and is stated rather than "
+            f"implied; it retires as soon as this boot's own records are read, "
+            f"because every record written from here on is stamped with "
+            f"{str(want)[:16]}..."
+        )
+    raise PdFlipModelIdentityMismatch(
+        f"W99 PdFlipModelIdentityMismatch: the recorded dormant image of boot "
+        f"{entry.get('boot_tag', '?')} @ {entry.get('commit', '?')} carries "
+        + (f"model {got!r}" if got else "NO model digest (written before #1362)")
+        # #1362 [bootstrap]: the clause that used to sit here described
+        # "no digest AND the form key does not match" -- and that case no
+        # longer reaches this raise at all: a record of another form is
+        # skipped as BOOTSTRAP before it gets here. Leaving the sentence would
+        # have been prose about a branch that cannot occur, which is the
+        # instrument-lies class in its quietest form. What remains is the one
+        # no-digest case that DOES reach a refusal: none -- same form plus no
+        # digest is the LEGACY transition, and same form plus a foreign digest
+        # is named by `got` above.
+        + f", this boot runs {want!r}. A dormant image sizes Sigma H, and Sigma H "
+        f"is the ring: spending another model's image here hands this boot a ring "
+        f"measured for a different checkpoint -- on the 4B-FP8 vehicle that is a "
+        f"47 GiB ring for a 7.48 GiB model, and the boot dies in W48 + 3x W51 "
+        f"without ever naming the cause. There is no smaller number to fall back "
+        f"to: the fix is ONE boot of {want!r} to record its own image, or "
+        f"sigma_h_from_manifests with the printed {MANIFEST_CENSUS_SURCHARGE:.3f} "
+        f"surcharge ({MANIFEST_CENSUS_SURCHARGE_SOURCE})"
+    )
+
+
+#: #1362 [22-fix2]: legacy-admission lines raised during pricing, so the
+#: launcher can PRINT them and a test can READ them. A module-level sink and
+#: not a logger call, because `resolve_image_terms` is pure and its callers
+#: differ in how they emit; an instrument nobody reads is not an instrument.
+LEGACY_IDENTITY_LINES: List[str] = []
+
+
+def resolve_image_terms(
+    record: Optional[Dict[str, dict]] = None,
+    want_digest: str = "",
+    form_key_match: bool = False,
+    reference_model_ok: Optional[bool] = None,
+    reference_model_why: str = "",
+) -> ImageTerms:
+    """The dormant image per group, in the fix-8 precedence order.
+
+    (a) THIS LINE'S OWN PREVIOUS MEASUREMENT -- an entry written by
+        :func:`dormant_image_sample` at that group's first sleep (the launcher
+        for P, the front for D), carrying ``rss_shmem_gib`` plus the commit,
+        the boot tag and the timestamp it was taken at;
+    (b) absent a measurement for P: the named dk7 reading
+        (:data:`DK7_DORMANT_IMAGE_P_GIB`, :data:`DK7_PROVENANCE`);
+    (c) absent a measurement for D: a BOUND, never a claim.  D's dormant image
+        has NEVER been measured (dk7's 6.71 GiB is D AWAKE -- its live host
+        rings and anchors, not a backup), so the ledger refuses to price it
+        below the one image it HAS measured:
+        ``max(image_P, weight_tags_D + extra_P)``.  Both candidates are stated;
+        the ``extra`` term is what the weight-tag census misses, measured once
+        on P and carried to D because the mechanism (every ``enable_cpu_backup``
+        buffer, not only ``weights_*``) is the same on both groups.
+    """
+    wt_p = WEIGHT_TAGS_P_BYTES / GIB
+    wt_d = WEIGHT_TAGS_D_BYTES / GIB
+    rec = record or {}
+    p_entry = rec.get("P") or {}
+    d_entry = rec.get("D") or {}
+    # #1362 [22-fix] THE CONSUMER, wired. A dormant image sizes Sigma H and
+    # Sigma H IS the ring, so spending another model's image here hands this
+    # boot a ring measured for a different checkpoint. `want_digest=""` is the
+    # pre-#1362 caller and keeps its behaviour exactly; a caller that KNOWS its
+    # model gets the check, and the refusal names the missing measurement
+    # instead of letting W48 + 3x W51 three layers down be the message.
+    if want_digest:
+        # #1362 [bootstrap]: a BOOTSTRAP verdict drops the entry -- another
+        # form's image may not be priced as this form's. `p_entry`/`d_entry`
+        # are rebound to {} so every path below sees "no record", which is the
+        # state that already has a named fallback.
+        _kept = []
+        for _e in (p_entry, d_entry):
+            if not _e:
+                _kept.append(_e)
+                continue
+            _line = refuse_foreign_image(_e, want_digest, form_key_match)
+            # Bounded by the number of DISTINCT records, not by the number of
+            # pricing calls: the ladder prices one arm per rung and a
+            # long-lived caller may price many times.
+            if _line and _line not in LEGACY_IDENTITY_LINES:
+                LEGACY_IDENTITY_LINES.append(_line)
+            # A BOOTSTRAP verdict DROPS the entry: another form's image may not
+            # be priced as this form's. Rebinding to {} puts every path below
+            # into the "no record" state, which already has a named fallback.
+            _kept.append({} if (_line and "BOOTSTRAP" in _line) else _e)
+        p_entry, d_entry = _kept[0], _kept[1]
+    p_meas = p_entry.get("rss_shmem_gib")
+    d_meas = d_entry.get("rss_shmem_gib")
+
+    if p_meas is not None:
+        p_gib = float(p_meas)
+        p_source = (
+            f"MEASURED by this line: boot {p_entry.get('boot_tag', '?')} @ "
+            f"{p_entry.get('commit', '?')} at {p_entry.get('at', '?')} "
+            f"(RssShmem sum of the sleeping group's {len(p_entry.get('pids') or [])} pids)"
+        )
+        p_measured = True
+    else:
+        p_gib = DK7_DORMANT_IMAGE_P_GIB
+        p_source = f"RECORDED MEASUREMENT of another boot: {DK7_PROVENANCE}"
+        if reference_model_ok is False:
+            # H87: named, not silent. The image terms SIZE H(c) and bound D's
+            # image; they are not charged by `price` (the ring is). The value
+            # stays the conservative stand-in, and the source says whose it is.
+            p_source = (
+                f"{FOREIGN_REFERENCE_TAG} FOREIGN-MODEL stand-in (measured on "
+                f"{REFERENCE_MODEL}, not this checkpoint: "
+                f"{reference_model_why or 'identity not the reference'}): {DK7_PROVENANCE}"
+            )
+        p_measured = False
+    extra_p = p_gib - wt_p
+
+    if d_meas is not None:
+        d_gib = float(d_meas)
+        d_source = (
+            f"MEASURED by this line: boot {d_entry.get('boot_tag', '?')} @ "
+            f"{d_entry.get('commit', '?')} at {d_entry.get('at', '?')} "
+            f"(RssShmem sum of the sleeping group's {len(d_entry.get('pids') or [])} pids)"
+        )
+        d_measured = True
+    else:
+        candidate = wt_d + extra_p
+        d_gib = max(p_gib, candidate)
+        d_source = (
+            f"BOUND, NOT A MEASUREMENT: group D's dormant image has never been measured "
+            f"(dk7's 6.71 GiB is D AWAKE -- live host rings and anchors, not a backup). "
+            f"max(measured_P {p_gib:.2f}, weight_tags_D {wt_d:.2f} + extra_P {extra_p:.2f} "
+            f"= {candidate:.2f}) = {max(p_gib, candidate):.2f} GiB -- the ledger will not "
+            f"claim a SMALLER image for D than the one it has measured for P"
+        )
+        d_measured = False
+    return ImageTerms(
+        p_gib=p_gib,
+        d_gib=d_gib,
+        p_source=p_source,
+        d_source=d_source,
+        p_measured=p_measured,
+        d_measured=d_measured,
+        extra_p_gib=extra_p,
+        extra_d_gib=d_gib - wt_d,
+    )
+
+
+#: #1317n D's OWN L2 BUDGET, IN GB, DERIVED FROM THE REQUEST CAP.
+#:
+#: WHY THIS EXISTS AT ALL, and it is a deletion story rather than a feature.
+#: Upstream stages EVERY L3 read through the host pool (``batch_get`` into host
+#: pages; there is no disk->device path), and it sizes that pool so residency
+#: can never bind a read: ``pool_host/base.py`` takes ``ratio x device_pool``
+#: when ``--hicache-size`` is unset, with the ratio defaulting to 2.0, so
+#: L2 >= L1 by construction. This fork shipped ``--hicache-size 1`` -- a fixed
+#: 1 GB, 30,518 rows on group D -- which BROKE that invariant, and the whole
+#: #1317 window/chain/anchor layer was the compensation for the break. The user
+#: decided 2026-09-10 to delete the compensation and restore the invariant.
+#:
+#: WHY NOT SIMPLY UNSET THE FLAG, which would be the true upstream form:
+#: priced, and it does not fit. Group D's profiled per-rank device capacity on
+#: boot weg2sn6p was [188788, 262358, 260566] tokens; ``ratio 2.0`` against the
+#: largest is 524,716 host rows at 32,768 B = **17.2 GB on one rank, 51.5 GB
+#: across three**, against a box with 39 GiB MemAvailable and a reap mark at
+#: 95.90 GiB non-reclaimable. The ratio path is unaffordable on this rig, so
+#: the absolute flag stays -- but it is DERIVED from what one cap-sized read
+#: needs instead of pinned at a constant that no quantity justified.
+#:
+#: THE INVARIANT THAT IS ACTUALLY RESTORED, stated as the thing to test: a
+#: single store read of ``--max-kv-per-request`` tokens must fit in one
+#: prefetch, on every rank, without a window. That is
+#:     rows_needed = cap_tokens x max_rank_share
+#: and the pool must hold it BEHIND the load-pool fraction the controller
+#: applies (``HICACHE_LOAD_POOL_USAGE_FRACTION`` = 0.9), hence the division.
+#:
+#: WORKED, boot weg2sn6p: cap 262,144 x share 0.375 x 32,768 B / 0.9 / 1e9 =
+#: 3.58 -> **4 GB per rank** = 122,070 rows, of which the controller will lend
+#: 0.9 x 122,070 = 109,863 >= the 98,304 a cap-sized read needs. The old
+#: pinned 1 GB gave 30,518 rows and a limit of 27,466 -- which is where the
+#: 413 band and every window came from.
+def derive_d_hicache_size_gb(
+    cap_tokens: int,
+    max_rank_share: float,
+    cell_bytes: int,
+    fraction: float,
+) -> Dict[str, float]:
+    """S_D in GB plus every term that produced it. Never a bare number.
+
+    Returns the terms as well as the result so the launcher can print a
+    provenance line: a derived budget whose inputs are not printed is
+    indistinguishable from a pinned one to the next reader, and this fork has
+    paid for that confusion (a launcher census read 19 mamba slots as the KV
+    carrier and shipped a 17-token bound, boot weg2rg5).
+    """
+    cap_tokens = max(0, int(cap_tokens))
+    cell_bytes = max(1, int(cell_bytes))
+    share = float(max_rank_share)
+    fraction = float(fraction)
+    if not (0.0 < share <= 1.0):
+        raise ValueError(
+            f"max_rank_share must be in (0, 1]: {share!r}. It is max(v)/sum(v) "
+            "of group D's KV-token ownership vector, so it is a fraction by "
+            "construction; a value outside the interval means the vector was "
+            "misread, and sizing L2 against a misread share is how the 1 GB "
+            "constant survived unquestioned."
+        )
+    if not (0.0 < fraction <= 1.0):
+        raise ValueError(
+            f"fraction must be in (0, 1]: {fraction!r} "
+            "(HICACHE_LOAD_POOL_USAGE_FRACTION)"
+        )
+    rows_needed = int(-(-cap_tokens * share // 1))  # ceil, share is a fraction
+    gb_exact = rows_needed * cell_bytes / fraction / GB
+    s_gb = int(-(-gb_exact // 1))
+    rows = int(s_gb * GB // cell_bytes)
+    return {
+        "s_gb": float(s_gb),
+        "gb_exact": gb_exact,
+        "cap_tokens": float(cap_tokens),
+        "max_rank_share": share,
+        "cell_bytes": float(cell_bytes),
+        "fraction": fraction,
+        "rows_needed": float(rows_needed),
+        "rows": float(rows),
+        "rows_lendable": float(int(rows * fraction)),
+    }
+
+
+def d_hicache_provenance(terms: Dict[str, float], share_source: str) -> str:
+    """The one line that makes S_D auditable at the boot log."""
+    return (
+        f"PDFLIP-L2 D hicache_size={int(terms['s_gb'])} GB derived: "
+        f"cap={int(terms['cap_tokens'])} share={terms['max_rank_share']:.4f} "
+        f"({share_source}) fraction={terms['fraction']:.2f} "
+        f"cell={int(terms['cell_bytes'])} "
+        f"rows_needed={int(terms['rows_needed'])} rows={int(terms['rows'])} "
+        f"rows_lendable={int(terms['rows_lendable'])} "
+        f"exact={terms['gb_exact']:.2f} GB -- one cap-sized store read must fit "
+        f"in ONE prefetch on every rank, with no window and no chain (#1317n). "
+        f"Upstream sizes this as ratio x device_pool (pool_host/base.py, ratio "
+        f"2.0 -> L2 >= L1); that path costs 17.2 GB/rank on this rig's profiled "
+        f"D capacity and is unaffordable, so the absolute flag stays and is "
+        f"DERIVED here instead of pinned"
+    )
+
+
+def largest_fundable_d_cap(
+    priced_ok, cap_tokens: int, max_rank_share: float,
+    cell_bytes: int, fraction: float,
+) -> Optional[Dict[str, float]]:
+    """The biggest ``--max-kv-per-request`` some fundable S_D could serve.
+
+    ORDER ITEM 1, THE HALF THAT WAS MISSING: *"ist S_D nicht fundierbar ->
+    benannte Refusal am Launch, die den GROESSTEN FUNDIERBAREN CAP nennt (kein
+    stilles Verkleinern)"*. The first build shipped the refusal without the
+    number, so boot weg2sn6r got a correct W20 that named Sigma H and the rung
+    as its levers and could not say what cap WOULD fit -- leaving the operator
+    to invert the arithmetic by hand.
+
+    ``priced_ok`` is a callable ``s_gb_d -> bool`` (does an arm at that D budget
+    fund BOTH moments), so this function does no pricing of its own and cannot
+    drift from the ladder that refused.
+
+    Returns None when not even S_D=1 funds the moments -- then the D budget is
+    not the binding term and saying otherwise would send the operator after the
+    wrong lever.
+    """
+    share = float(max_rank_share)
+    cell = max(1, int(cell_bytes))
+    frac = float(fraction)
+    if share <= 0.0 or frac <= 0.0:
+        return None
+    best = None
+    for s_d in range(max(1, int(round(cap_tokens * share * cell / frac / GB))), 0, -1):
+        if priced_ok(s_d):
+            best = s_d
+            break
+    if best is None:
+        return None
+    rows = int(best * GB // cell)
+    lendable = int(rows * frac)
+    return {
+        "s_gb_d": float(best),
+        "rows": float(rows),
+        "rows_lendable": float(lendable),
+        "cap_tokens": float(int(lendable / share)),
+        "asked_cap": float(int(cap_tokens)),
+    }
+
+
+def _arm_s_d(arm) -> str:
+    """#1317n D's own L2 budget AS PRICED, or "=S" when it equals P's.
+
+    On the ARM line because the two budgets stopped being one number: D carries
+    a whole cap-sized read (4 GB) where P carries a staging tier (1 GB), which
+    is +8.38 GiB of rings. An ARM line printing one S while the boot runs two
+    is how an arm gets believed against a budget it was never scored on, and
+    the reap mark is what sits on the other side of that error.
+    """
+    v = (getattr(arm, "terms", None) or {}).get("s_gb_d")
+    return "=S" if v is None else str(int(v))
+
+# ---------------------------------------------------------------------------
+# RETIRED BY DESIGN (PLAN_S6_BOUNCE_0911 AMENDMENT 5, 2026-09-11).
+#
+# `xchg_bounce_bytes_per_card` and `xchg_bounce_bytes` charged the S6b on-card
+# deposit's CEILING -- `cards x ONCARD_SLOTS_MAX 8 x ONCARD_SLOT_BYTES_MAX` --
+# and were also the yardstick `deposit_refusal_reason` graded a deposit
+# against.  Under S6-BOUNCE the diagonal store-and-forward IS path (a)'s
+# staging for the co-located pairs, and it is priced ONCE, by
+# `xchg_bounce.bounce_terms`, as `N_CARDS x SLOTS_PER_PAIR x slot_bytes` from
+# the launcher's own published `--pdflip-xchg-oncard-slot-mib`.  One payload, one
+# term, one yardstick.
+#
+# DELETED RATHER THAN LEFT UNUSED, and that is the point: a function that still
+# returns a plausible number is how a second ledger comes back -- the next
+# reader finds it, it answers, and nothing points at the ruling.  The two
+# readers it had are converted, not redirected: the launcher's arm question is
+# now the boolean `xchg_bounce_arm_pins_host`, and the runtime budget
+# (`weight_updater._pdflip_shadow_host_budget`) reads
+# `xchg_bounce.staging_bytes_per_card(published slot)`.
+# `test_the_retired_ceiling_is_gone_from_the_ledger_path` is the ratchet.
+# ---------------------------------------------------------------------------
+
+
+def charge_terms(
+    s_gb: int, m_mib: int, ranks_per_group: int, images: ImageTerms,
+    s_gb_d: Optional[int] = None,
+    xchg_bounce_host_bytes: int = 0,
+    # #1350: NO DEFAULT ZAHLWERT. `None` is ABSENCE, not 0.0 -- the key is
+    # always present and carries `None`, so `_boot_charges_gib` can tell "not
+    # measured" from "measured at zero" and the consumers that grade against a
+    # bound refuse on the first rather than summing the second.
+    flip_ratchet_gib: Optional[float] = None,
+    # #1432: the arena IS the L2 (Stufe 3/4). Its shm files are a host term of
+    # their own; the per-rank pools behind S/M are fallback ranges now, so a
+    # caller that runs the arena passes their REAL sizes here instead of the
+    # ladder's S/M, which only name the argv arm.
+    arena_gib: float = 0.0,
+    staging_gb: Optional[float] = None,
+    anchor_mib: Optional[int] = None,
+    # #1386 [Minimalform HiCache switch]: OFF MEANS OFF, not a smaller S/M.
+    # True zeroes `anchors_gib`/`rings_gib` HERE, directly -- never by routing
+    # a 0 through `ANCHORS_AT_2400_BYTES`/`RING_*_MULT_GB_PER_S`, which would
+    # still "believe" a size and merely round it to nothing (the very
+    # gepreist-eine-Zahl/belegt-eine-andere shape #1385/#1386 cost three
+    # boots). The SAME bool reaches `launcher.common_flags`, which drops
+    # `--enable-hierarchical-cache` and every `--hicache-*` flag from BOTH
+    # groups' argv under the identical condition -- one switch, priced here
+    # and enforced there, never two.
+    hicache_disabled: bool = False,
+    # H25 (Nutzer-Order 24.09.): D's MTP draft parks in ONE pinned host image
+    # while P runs (pdflip/draft_park.py), allocated once per process and held
+    # for its life -- a permanent host post, charged at BOTH moments.
+    d_draft_host_gib: float = 0.0,
+    # H87: `--d-only` -- group D alone. There is no P process, so no dormant
+    # heap, no P host ring pool, no P draft host pool. False is byte-identical.
+    d_only: bool = False,
+    # rc12d: the torch allocation history (pdflip/memhist.py), booked. The
+    # lean form arms after the first sleep: RUN moment only.
+    memhist_gib: float = 0.0,
+    # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
+    l3_index_gib: float = 0.0,
+    memhist_run_only: bool = False,
+) -> Dict[str, object]:
+    """Everything the BOOT ITSELF adds to ``memory.current``, per term.
+
+    One authority for "what this arm charges": :func:`price` builds the arm
+    from it, :meth:`Arm.predicted_run_peak_gib` adds it to the run origin, and
+    :func:`dk7_run_residual_gib` subtracts it from a measured reading.  Three
+    call sites that used to be able to disagree about the same sum.
+
+    The image terms are NOT in here: which image is resident is a property of
+    the MOMENT (launch charges P's, the run moment charges the dormant one),
+    not of the arm.
+
+    ``xchg_bounce_host_bytes`` IS AN ARM PROPERTY and therefore is (#1273 S6):
+    it is 0 on ``--pdflip-weight-source ring`` -- the default and every boot that
+    has run -- and ``xchg_bounce.BounceTerms.total_bytes`` on the arms that
+    create the file (AMENDMENT 5: one term, priced by the launcher).
+    The KEY IS ALWAYS PRESENT, value 0.0 when unarmed, because the three
+    consumers of this dict must not be able to disagree about whether a term
+    exists; an unarmed boot prints ``xchg_bounce=0.00`` and says so rather than
+    leaving a reader to wonder whether it was priced.  The parameter is
+    deliberately NOT named after the module function that produces the value:
+    :func:`price`'s own fix-8 note records what a shadowed name costs.
+    """
+    _m_real = m_mib if anchor_mib is None else int(anchor_mib)
+    anchors_gib = 0.0 if hicache_disabled else (
+        (ANCHORS_AT_2400_BYTES * (_m_real / ANCHORS_REFERENCE_M_MIB)) / GIB
+    )
+    # #1317n THE TWO GROUPS ARE PRICED SEPARATELY, because they no longer carry
+    # the same budget: P only WRITES the store (its 1 GB staging tier is all it
+    # needs) while D must hold a whole cap-sized read. `s_gb_d` defaults to
+    # `s_gb`, so every pre-existing caller and every recorded arm is
+    # byte-identical; only a caller that passes a different D budget changes.
+    _s_d = s_gb if s_gb_d is None else int(s_gb_d)
+    if staging_gb is not None:  # #1432: both groups run staging-only pools beside the arena
+        _s_p, _s_d = float(staging_gb), float(staging_gb)
+    else:
+        _s_p = s_gb
+    rings_gib = 0.0 if hicache_disabled else (
+        ((0.0 if d_only else RING_P_MULT_GB_PER_S * _s_p)
+         + RING_D_MULT_GB_PER_S * _s_d) * GB / GIB
+    )
+    return {
+        # H87: one group, always awake, under --d-only.
+        "heaps_gib": ranks_per_group * (
+            HEAP_AWAKE_GIB + (0.0 if d_only else HEAP_DORMANT_GIB)),
+        "d_only": bool(d_only),
+        "anchors_gib": anchors_gib,
+        "rings_gib": rings_gib,
+        "arena_gib": 0.0 if hicache_disabled else float(arena_gib),
+        # #1386: the term dict is what `arm_terms_line` reads and what a test
+        # checks -- so the switch's OWN state rides here beside its effect,
+        # instead of a reader inferring "was it on?" from "are both 0.00?"
+        # (0.59 GiB of `anchors_gib` alone would round to 0.00 at M small
+        # enough; a 0.00 by itself is not evidence of the switch).
+        "hicache_disabled": bool(hicache_disabled),
+        # #1317n the D budget the rings were priced from, so the ARM line
+        # prints what it CHARGED rather than what it was asked for.
+        "s_gb_d": float(_s_d),
+        "overhead_gib": HOST_POOL_OVERHEAD * (anchors_gib + rings_gib),
+        "draft_host_p_gib": 0.0 if d_only else DRAFT_HOST_P_MIB / 1024.0,
+        "draft_host_d_gib": DRAFT_HOST_D_MIB / 1024.0,
+        # H25: the ledger post 'd_draft_host' (parked D draft weights).
+        "d_draft_host_gib": max(0.0, float(d_draft_host_gib)),
+        # rc12d: the ledger post 'memhist'; key always present (0.0 = off)
+        "memhist_gib": max(0.0, float(memhist_gib)),
+        "l3_index_gib": max(0.0, float(l3_index_gib)),
+        "memhist_run_only": bool(memhist_run_only),
+        "image_p_gib": images.p_gib,
+        "image_d_gib": images.d_gib,
+        "weight_tags_p_gib": WEIGHT_TAGS_P_BYTES / GIB,
+        "weight_tags_d_gib": WEIGHT_TAGS_D_BYTES / GIB,
+        "image_extra_p_gib": images.extra_p_gib,
+        "image_extra_d_gib": images.extra_d_gib,
+        "xchg_bounce_gib": max(0, int(xchg_bounce_host_bytes)) / GIB,
+        # #1350: what the first waking of EACH GROUP adds to the cgroup and
+        # NEVER gives back.  A MEASUREMENT (`resolve_flip_ratchet_gib`, read
+        # from the sidecar the front writes at `PDFLIP-FLIP done epoch=2`), never
+        # a model -- and `None` when no measurement reached this arm, which the
+        # consumers turn into a NAMED refusal (W94) and never into a 0.
+        "flip_ratchet_gib": (
+            None if flip_ratchet_gib is None else float(flip_ratchet_gib)
+        ),
+    }
+
+
+def _boot_charges_gib(terms: Dict[str, object]) -> float:
+    """The sum of the arm's own charges, image and store EXCLUDED.
+
+    #1350 ADDS ONE SUMMAND AND ONLY ONE PLACE TO ADD IT.  ``flip_ratchet_gib``
+    lands here rather than in :meth:`Arm.predicted_run_peak_gib`, so the three
+    consumers this function exists to reconcile (``price`` /
+    ``predicted_run_peak_gib`` / ``dk7_run_residual_gib``) cannot disagree about
+    whether the ratchet is in the sum -- the same argument the docstring of
+    :func:`charge_terms` already makes for every other term.
+
+    THE RATCHET IS NOT IN THIS SUM, and the exclusion is measured rather than
+    stylistic.  Every term here is charged at BOTH moments; the ratchet is what
+    the FIRST FLIP spends, and at the launch moment no flip has happened.
+    Putting it here took the pinned M=150 arm's launch leftover from +4.50 to
+    -0.19 GiB on a dry run of this tree -- turning a run-peak refusal (W21)
+    into a launch-moment one (W20) and naming the wrong binding term.  It lives
+    in :func:`_run_moment_charges_gib`, which is the ONE authority for the run
+    moment exactly as this function is for both.
+    """
+    return (
+        terms["heaps_gib"] + terms["anchors_gib"] + terms["rings_gib"]
+        + terms["overhead_gib"] + terms["draft_host_p_gib"] + terms["draft_host_d_gib"]
+        # #1273 S6: 0.00 on every ring-arm boot, so every existing number is
+        # unchanged; on an armed boot it is charged at BOTH moments, which is
+        # what makes `size_store_gib`'s leftover -- and therefore the store --
+        # shrink by exactly the deposit rather than by a note in a docstring.
+        + terms["xchg_bounce_gib"]
+        + float(terms.get("arena_gib", 0.0) or 0.0)  # #1432: the L2 arena's shm files
+        + float(terms.get("d_draft_host_gib", 0.0) or 0.0)  # H25: parked D draft
+        # rc12d: the history armed from rank start is there at both moments
+        + (0.0 if terms.get("memhist_run_only") else float(terms.get("memhist_gib", 0.0) or 0.0))
+        + float(terms.get("l3_index_gib", 0.0) or 0.0)  # 28.09.: the L3 index, every owner
+    )
+
+
+def _flip_ratchet_charge_gib(terms: Dict[str, object]) -> float:
+    """#1350: the charged ratchet of one arm, 0.0 when it was never measured.
+
+    THE KEY MUST EXIST.  ``terms["flip_ratchet_gib"]`` is indexed, not
+    ``.get``-ed: a dict that did not come from :func:`charge_terms` raises
+    KeyError here instead of being silently priced without the term (the #606
+    ``getattr``-default class, which this fork has paid for repeatedly).  Its
+    VALUE may be ``None`` -- a hermetic or legacy caller that was handed no
+    measurement -- and then it contributes 0.0 to the SUM while the arm records
+    the absence by name, so every consumer that grades against the reap bound
+    can refuse instead of reading it as zero.
+    """
+    ratchet = terms["flip_ratchet_gib"]
+    return 0.0 if ratchet is None else float(ratchet)
+
+
+def _run_moment_charges_gib(terms: Dict[str, object]) -> float:
+    """The arm's charges AT THE RUN MOMENT: both-moment charges plus the ratchet.
+
+    ONE addition point for the ratchet, for the same reason
+    :func:`_boot_charges_gib` is one for everything else: its two consumers --
+    ``price``'s ``run`` leftover and :meth:`Arm.predicted_run_peak_gib` -- must
+    not be able to disagree about whether the term is in the sum.  The three
+    consumers of the BOTH-moment sum (``price``'s ``common``,
+    :func:`dk7_run_residual_gib`, :func:`record_run_residual_gib`) deliberately
+    do NOT go through here: dk7 ran zero flips, and the two residual
+    re-derivations reconstruct what a SAMPLER subtracted, which never knew this
+    term -- subtracting it there and adding it back at prediction time would
+    make the term cancel itself and #1350's under-prediction would survive its
+    own fix.
+    """
+    return (
+        _boot_charges_gib(terms) + _flip_ratchet_charge_gib(terms)
+        # rc12d: the lean history arms after the first sleep -- run moment only
+        + (float(terms.get("memhist_gib", 0.0) or 0.0) if terms.get("memhist_run_only") else 0.0)
+    )
+
+
+def dk7_run_residual_gib() -> float:
+    """What boot weg2dk7 held at the RUN moment that this ledger does not name.
+
+    DERIVED, not a constant: the measured quiet reading
+    (:data:`DK7_QUIET_CG_CURRENT_GIB`) minus everything the ledger charges for
+    the arm that boot ran (:data:`DK7_ARM_S_GB` / :data:`DK7_ARM_M_MIB`), minus
+    the MEASURED image of the dormant group, minus the store's MEASURED content
+    (0.00 GiB -- the store was empty).  No flip transient: zero flips ran.
+
+    What is in it: the two server processes, the front, the launcher, the
+    sampler and every foreign process on the box -- the boot's 13 processes'
+    non-shmem working set beyond the six ranks' heaps this ledger charges, plus
+    whatever else shares the cgroup.  The ledger does not name those terms, so
+    the honest form is to measure the remainder instead of extending the term
+    list with estimates.
+    """
+    images = resolve_image_terms(None)
+    # #1350: EXPLICIT 0.0, NOT AN OMISSION. weg2dk7 ran ZERO FLIPS ("No flip
+    # transient: zero flips ran", above), so the ratchet is zero as a FACT
+    # about that boot rather than as a missing argument -- and this derivation
+    # uses `_boot_charges_gib`, which does not carry the term anyway. Passing
+    # it by name keeps the fact at the call site instead of in a ticket.
+    terms = charge_terms(DK7_ARM_S_GB, DK7_ARM_M_MIB, 3, images,
+                         flip_ratchet_gib=0.0)
+    return (
+        DK7_QUIET_CG_CURRENT_GIB
+        - _boot_charges_gib(terms)
+        - images.p_gib
+        - DK7_QUIET_STORE_USED_GIB
+    )
+
+
+def record_run_residual_gib(
+    entry: Dict[str, object], ranks_per_group: int = 3
+) -> Tuple[Optional[float], float]:
+    """One record's run residual RE-PRICED in the arm's own currency.
+
+    Returns ``(residual, correction)``; ``correction`` is what was removed, so
+    a caller can print it and 0.0 means "this record needed nothing".
+
+    #1325 -- WHY THE READER AND NOT ONLY THE SAMPLER. The sampler's own
+    subtraction was in the wrong currency (it omitted ``s_gb_d``, so D's rings
+    stayed inside the residual and the ledger then added them again at
+    prediction time). Fixing the sampler corrects records written from now on
+    -- and the record that BLOCKS the next boot is already on disk. The sidecar
+    is APPEND-ONLY because history is evidence, so it may not be rewritten;
+    the derivation therefore moves to the reader, where it corrects old and new
+    records alike from one place. ONE reader, ONE derivation, and the stored
+    ``run_residual_gib`` stays exactly as the boot wrote it.
+
+    THE CORRECTION IS COMPUTABLE FROM THE RECORD ALONE, which is what makes
+    this a re-derivation and not a guess. The stored residual is
+    ``nonreclaim - charges(arm without s_gb_d) - image``, so
+    ``nonreclaim = stored + charges_old + image`` and the corrected value is
+    ``stored - (charges_new - charges_old)``. Both charge figures come from
+    ``charge_terms`` with the record's OWN stored ``arm`` and ``rss_shmem_gib``
+    -- no new measurement, no constant.
+
+    MEASURED against the live sidecar
+    (``/spinning/evidence-665-f1/...``, 2026-09-10): every boot up to weg2sn6p
+    stored an arm of ``{s_gb: 1, m_mib: 600|1200}`` with NO ``s_gb_d`` and their
+    P residuals sit at 7.42-9.01 GiB. **weg2sn6s is the first and only record
+    carrying ``s_gb_d: 4``** -- it is the first boot on this line to give D its
+    own budget -- and its P residual jumps to **16.34**. Corrected: 16.34 -
+    8.7172 = **7.62**, i.e. back inside the band every other boot occupies, and
+    below sn6p's 9.01. That is the record whose 16.34 predicts ``run_peak
+    92.53`` against the 87.30 boot bound and fires ``W21
+    PdFlipHostRunPeakRefused`` on every dry run of this form.
+
+    ``None`` when the record has no residual, which stays an absence.
+    """
+    stored = entry.get("run_residual_gib")
+    if stored is None:
+        return None, 0.0
+    arm = entry.get("arm")
+    if not isinstance(arm, dict):
+        return float(stored), 0.0
+    # EVERY read of the arm is inside the guard, including this comparison.
+    # An arm carrying a non-numeric `s_gb` raised ValueError here while the
+    # try-block below was already written to swallow exactly that -- the guard
+    # was one line short of the thing it guarded (found by its own test).
+    try:
+        s_d = arm.get("s_gb_d")
+        bounce_gib = float(arm.get("xchg_bounce_gib", 0.0) or 0.0)
+        img_gib = float(entry.get("rss_shmem_gib") or 0.0)
+        images = ImageTerms(
+            p_gib=img_gib, d_gib=img_gib, p_source="record", d_source="record",
+            p_measured=True, d_measured=True, extra_p_gib=0.0, extra_d_gib=0.0,
+        )
+        # THE CORRECT SUM for the arm this record's boot actually ran: both
+        # currency terms, one signature, one call (#1325 rings + #1326 bounce).
+        new = _boot_charges_gib(
+            charge_terms(
+                int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images,
+                s_gb_d=None if s_d is None else int(s_d),
+                xchg_bounce_host_bytes=int(round(bounce_gib * GIB)),
+                # #1350 EXPLICIT 0.0 ON BOTH SIDES OF THE CORRECTION, and it
+                # is the load-bearing half of the no-double-count rule. This
+                # function re-derives what the WRITING SAMPLER subtracted; that
+                # sampler never knew the ratchet, so a non-zero here would move
+                # the stored run-moment residual DOWN by it -- and that residual
+                # is the origin FLOOR the prediction then adds the ratchet to.
+                # The term would be subtracted once and added once against the
+                # same bytes, and #1350's under-prediction would survive its own
+                # fix. The ratchet is a RUN-MOMENT arm charge
+                # (`_run_moment_charges_gib`), never a currency conversion of a
+                # historical record.
+                flip_ratchet_gib=0.0,
+            )
+        )
+        # WHAT THE WRITING SAMPLER SUBTRACTED. Read from the record when it
+        # says so (#1326 `residual_charges_gib`), and only RECONSTRUCTED for a
+        # record written before that field existed -- where the sampler
+        # provably passed neither term, so the pre-#1325 sum is exact rather
+        # than inferred. Preferring the stored figure is what keeps this sound
+        # across the NEXT currency change: a record that already subtracted
+        # correctly yields correction 0 without this function knowing anything
+        # about which terms exist.
+        stored_charges = entry.get("residual_charges_gib")
+        if stored_charges is None:
+            old = _boot_charges_gib(
+                charge_terms(int(arm["s_gb"]), int(arm["m_mib"]),
+                             ranks_per_group, images, flip_ratchet_gib=0.0)
+            )
+        else:
+            old = float(stored_charges)
+    except (KeyError, TypeError, ValueError):
+        # A record whose arm cannot be re-priced keeps its stored value. It is
+        # the CONSERVATIVE direction (the stored figure is the larger one) and
+        # never a silent 0.
+        return float(stored), 0.0
+    correction = new - old
+    if abs(correction) < 1e-9:
+        # Already in its own currency: every single-budget, unarmed record, and
+        # every record written by the corrected sampler. Byte-identical, and
+        # reported as exactly 0.0 so a caller's "was this re-priced" test is a
+        # comparison and not a tolerance.
+        return float(stored), 0.0
+    return float(stored) - correction, correction
+
+
+def run_origin_gib(
+    cg_nonreclaim_gib: Optional[float], record: Optional[Dict[str, dict]] = None,
+    reference_model_ok: Optional[bool] = None, reference_model_why: str = "",
+) -> Tuple[Optional[float], str]:
+    """The origin the RUN PEAK is predicted from, and where it came from.
+
+    THE FIX-8 CORRECTION: the launch-moment reading is a FLOOR, not the origin.
+    Measured on two boots one night apart -- weg2dk6 launched into 46.80 GiB and
+    took M=600, weg2dk7 launched into 15.36 GiB, was handed M=1200 and a 9 GiB
+    store for it, and idled at 90.1-94.6 GiB with the store EMPTY.  The quieter
+    launch bought the tighter boot, because the box at the run moment holds
+    terms that were simply not there yet at the launch moment.
+
+    So the origin is ``max(launch reading, measured run-moment residual)``: a
+    loaded box at launch still charges what it holds, and a quiet box may not
+    buy an arm the run moment cannot carry.  ``None`` (and the reason) when no
+    cgroup sample was passed -- a prediction without an origin is the reading
+    that made weg2dk5 look fundable.
+    """
+    if cg_nonreclaim_gib is None:
+        return None, "no cgroup sample passed -- no origin to add this arm's charges to"
+    # #1325: RE-PRICED ON READ, never taken as stored. `record_run_residual_gib`
+    # removes the double charge a two-budget record carries (D's rings sat
+    # inside the residual because the sampler's subtraction omitted `s_gb_d`),
+    # and is byte-identical for every single-budget record. The sidecar is
+    # append-only, so the reader is the only place this can be corrected for a
+    # record already on disk -- and the record blocking the next boot is one.
+    # #1350e: A MID-FLIP RUN-MOMENT SAMPLE IS NOT AN ORIGIN WHEN A LAUNCH
+    # READING EXISTS.  The front samples a group's residual at its FIRST SLEEP,
+    # i.e. inside a flip, so that reading has already realised the permanent
+    # step `flip_ratchet_gib` charges separately -- measured on weg2xsn24: the
+    # winning floor 7.49 GiB was taken at 19:44:31Z, THREE SECONDS before that
+    # boot's `PDFLIP-FLIP done epoch=2`.  Using it AND charging the ratchet is the
+    # double count W95 refuses; using the launch-moment reading instead is not a
+    # relaxation but the only reading of the two that is in the right moment --
+    # the origin is defined as what the box holds BEFORE this arm spends, and a
+    # mid-flip sample is after.  The rejected figure is PRINTED, never dropped.
+    _rejected: List[str] = []
+    _any_death = False
+    _repriced = []
+    # #1361 [22-fix5]: the LOWEST kill counter this record has seen PER BOOT --
+    # the closest thing to that boot's baseline that the sidecar actually
+    # holds. A sample whose own counter is ABOVE it was taken after something
+    # in this cgroup was killed. MIN and not max: taking the max compares a
+    # sample against itself and can never fire, which is how the first draft of
+    # this guard passed its own unit test while proving nothing.
+    _oom_floor: Dict[str, int] = {}
+    for _g2, _e2 in (record or {}).items():
+        if isinstance(_e2, dict) and _e2.get("cg_oom_kill") is not None:
+            _bt = str(_e2.get("boot_tag", "?"))
+            _v2 = int(_e2["cg_oom_kill"])
+            _oom_floor[_bt] = min(_oom_floor.get(_bt, _v2), _v2)
+    for g, e in (record or {}).items():
+        if not isinstance(e, dict) or e.get("run_residual_gib") is None:
+            continue
+        _ep = e.get("sampled_at_flip_epoch")
+        _mid = int(_ep) >= 1 if _ep is not None else bool(e.get("interleaved"))
+        if _mid and cg_nonreclaim_gib is not None:
+            _rejected.append(
+                f"{float(e['run_residual_gib']):.2f} (boot "
+                f"{e.get('boot_tag', '?')}, group {g}, "
+                + (f"sampled_at_flip_epoch={int(_ep)}" if _ep is not None
+                   else "interleaved=True")
+                + ")"
+            )
+            continue
+        # #1361 [22-fix5] THE DEATH-SAMPLE FILTER, and the evidence it reads was
+        # ALREADY IN EVERY RECORD -- it just had no consumer.
+        #
+        # [22-fix5b] PLACED AFTER THE #1350e CHECK ON PURPOSE. The two
+        # rejecters overlap: a fixture that passes `pids=[]` to
+        # `dormant_image_sample` gets a PRESENT and empty process set, exactly
+        # like the xsn25 death sample, so whichever runs first owns the printed
+        # reason. Four #1350 tests went red when this one ran first -- they
+        # assert the INTERLEAVED reason on mid-flip samples, and were getting a
+        # death reason instead. The established rejecter therefore keeps its
+        # samples, and this one judges only what #1350e lets through. That
+        # costs the xsn25 case nothing: its sample carries
+        # `sampled_at_flip_epoch=0`, so `_mid` is False and it reaches here.
+        # The older rule keeps its meaning; the new one adds a case rather than
+        # shadowing one.
+        #
+        # Boot weg2xsn25 wrote `run_residual_gib=34.61` at 07:03:59Z, three
+        # minutes into its own OOM cascade, with `load_class=idle` and
+        # **`pids=[]`, `pids_asked=[]`**. The load class was TRUE and
+        # meaningless: a box with no live ranks has no queue, so it measures
+        # `idle`. What the sample actually measured is whatever else was on the
+        # host, and the ledger then carried it as this line's run-moment floor:
+        # every arm gained +28 GiB and the next boot could not be priced at all
+        # (measured on three independent trees, 95.22 -> 123.23 GiB on one of
+        # them with no code change in between).
+        #
+        # A residual is a statement about THIS LINE's processes. With none of
+        # them alive there is nothing for it to be a statement about, so it is
+        # refused BY NAME rather than quietly outvoted -- the #1350b Sigma H
+        # guard and the #1350e flip filter, for the third number.
+        # THE KEY MUST BE PRESENT TO COUNT AS EVIDENCE. `e.get("pids") or []`
+        # reads an ABSENT field as an empty one, and [22-fix5b] shipped exactly
+        # that: every record written before `pids` existed -- and every fixture
+        # that omits it -- was refused as a death sample, which took the
+        # weg2sn6s origin from 7.63 GiB to 0.0 and broke the #1325 contract.
+        # That is absence of evidence scored as evidence of death, the same
+        # error [22-fix] made with an empty model digest and [22-fix2] had to
+        # undo. A sample that never recorded its process set says nothing about
+        # it; only a sampler that LOOKED and found none is a witness.
+        _has_pids = "pids" in e
+        _alive = len(e.get("pids") or [])
+        _asked = len(e.get("pids_asked") or [])
+        _death = ""
+        if _has_pids and _alive == 0:
+            _death = (
+                f"{float(e['run_residual_gib']):.2f} (boot "
+                f"{e.get('boot_tag', '?')}, group {g}, at {e.get('at', '?')}) "
+                f"DEATH-SAMPLE: NO live rank (pids=0 of {_asked} asked), so "
+                f"load_class={e.get('load_class', '?')} is true and empty -- a "
+                f"box with no ranks has no queue. A run-moment residual is a "
+                f"statement about THIS line's processes and there were none"
+            )
+        else:
+            _bt = str(e.get("boot_tag", "?"))
+            _own = e.get("cg_oom_kill")
+            if _own is not None and int(_own) > _oom_floor.get(_bt, int(_own)):
+                _death = (
+                    f"{float(e['run_residual_gib']):.2f} (boot {_bt}, group {g}, "
+                    f"at {e.get('at', '?')}) DEATH-SAMPLE: the cgroup kill "
+                    f"counter had risen to {int(_own)} by this sample, above "
+                    f"this boot's earlier {_oom_floor.get(_bt)} -- something in "
+                    f"this cgroup was killed before the reading was taken"
+                )
+        if _death and cg_nonreclaim_gib is not None:
+            _rejected.append(_death)
+            _any_death = True
+            continue
+        _repriced.append((record_run_residual_gib(e), g, e))
+    residuals = [
+        (v, g, e, corr) for (v, corr), g, e in _repriced if v is not None
+    ]
+    if residuals:
+        floor, group, entry, _corr = max(residuals, key=lambda r: r[0])
+        # #1325: the chosen floor NAMES ITS LOAD CLASS and its form. Not a
+        # selector -- the max() is unchanged -- but a boot whose origin came
+        # from a sample taken under load must SAY so on its own ARM line, or
+        # the next reader cannot tell an idle floor from a load peak and will
+        # re-derive the sn6s confusion from scratch. `?` for a pre-#1325
+        # record, which is a fact about the record and not a claim about the
+        # box.
+        floor_src = (
+            f"MEASURED run-moment residual of boot {entry.get('boot_tag', '?')} @ "
+            f"{entry.get('commit', '?')} ({entry.get('at', '?')}, group {group}, "
+            f"load_class={entry.get('load_class', '?')}, "
+            f"form={entry.get('form_key', '?')}, stored="
+            f"{float(entry['run_residual_gib']):.2f}"
+            + (
+                f", RE-PRICED -{_corr:.2f} for S_D (#1325)" if _corr else ""
+            )
+            + ")"
+        )
+        # #1350: THE FLOOR SAYS WHETHER IT ALREADY CONTAINS THE RATCHET.
+        # The front samples a group's run-moment residual at that group's FIRST
+        # SLEEP, i.e. inside a flip; such a reading has already realised the
+        # permanent step the flip adds. Marking it here -- at the one place
+        # that knows WHICH entry won the max() -- is what lets `price` refuse
+        # (W95) instead of adding the same bytes to the origin and to the
+        # charges.
+        # PRE-#1350 RECORDS ARE COVERED TOO, and they had to be: the record
+        # that WINS this max() today (weg2xsn24 group P, 2026-09-12T19:44:31Z,
+        # stored 7.49 GiB) was written before the stamp existed, and the
+        # launch-moment reading 6.44 GiB loses to it -- so the floor binds NOW,
+        # exactly as ANALYSE_1350_HOST_TERM_0912.md SS2 predicted ("bindet in
+        # ein bis zwei Boots"). A guard that only saw the new field would have
+        # been armed for a hazard that had already arrived.
+        #
+        # `interleaved` is the fact that was always there: the front sets it
+        # True for every sample it takes (a flip's sleep, with the destination
+        # resuming), and the launcher sets it False for P's first sleep, which
+        # happens before any flip exists. It is therefore the SAME distinction
+        # `sampled_at_flip_epoch` records, available on every historical
+        # record. The new field still wins where present, because it names the
+        # epoch and not just the fact.
+        _ep = entry.get("sampled_at_flip_epoch")
+        _mid_flip = (
+            int(_ep) >= 1 if _ep is not None else bool(entry.get("interleaved"))
+        )
+        if _mid_flip:
+            floor_src += (
+                f" {RUN_ORIGIN_RATCHET_MARKER} "
+                + (
+                    f"sampled_at_flip_epoch={int(_ep)}" if _ep is not None
+                    else "interleaved=True (pre-#1350 record: no epoch stamp, "
+                    "but the front only samples during a flip)"
+                )
+                + ": this floor was measured DURING a flip and therefore "
+                "already contains the permanent step `flip_ratchet_gib` prices"
+            )
+    elif _rejected:
+        # #1350e: A REJECTED SAMPLE IS NOT "NO SAMPLE". Falling through to the
+        # dk7 stand-in here would replace a 7.49 GiB mid-flip reading with a
+        # 24.50 GiB reading of ANOTHER BOOT -- a worse origin than the one just
+        # refused, and a silent one. This line HAS a launch reading (the branch
+        # above guarantees it) and that is the honest origin.
+        floor = cg_nonreclaim_gib
+        floor_src = (
+            "no run-moment residual survives: every stored sample of this line was "
+            "measured DURING a flip, so the launch-moment reading stands alone "
+            "(#1350e). The dk7 stand-in is NOT used here -- it answers 'no record "
+            "at all', not 'the record was refused', and at 24.50 GiB it would be a "
+            "worse origin than the reading just rejected"
+        )
+    elif reference_model_ok is False:
+        # H87: NO RECORD OF THIS MODEL, AND THE STAND-IN IS ANOTHER MODEL'S.
+        # The dk7 residual is a 27B boot's remainder (dkrnfdnvfp4dbar109251235,
+        # Qwen3.8-Flash-Next-NVFP4: run origin 24.50 GiB from weg2dk7 against a
+        # launch reading of 0.77). It is not priced here; the launch-moment
+        # reading stands alone -- the same origin #1350e takes when every
+        # record was refused -- and the line names both the foreign figure and
+        # why it does not apply. The first boot of this model writes its own
+        # run-moment record at its first sleep; from then on (a) answers.
+        floor = cg_nonreclaim_gib
+        floor_src = (
+            f"{FOREIGN_REFERENCE_TAG} FALLBACK run-origin: no run-moment residual of "
+            f"THIS model in the record, and the built-in stand-in "
+            f"{dk7_run_residual_gib():.2f} GiB [{DK7_PROVENANCE}] was measured on "
+            f"{REFERENCE_MODEL}, not on this boot's checkpoint "
+            f"({reference_model_why or 'identity not the reference'}) -- NOT priced; "
+            f"the launch-moment reading is the origin until this model's first "
+            f"boot records its own residual"
+        )
+    else:
+        floor = dk7_run_residual_gib()
+        floor_src = (
+            f"DERIVED from {DK7_PROVENANCE}: quiet memory.current "
+            f"{DK7_QUIET_CG_CURRENT_GIB:.2f} GiB minus that boot's own charges at "
+            f"S={DK7_ARM_S_GB} M={DK7_ARM_M_MIB} minus the measured image minus the "
+            f"store's measured content {DK7_QUIET_STORE_USED_GIB:.2f} GiB"
+        )
+    _rej = (
+        " -- run-moment sample(s) " + ", ".join(_rejected)
+        # #1361 [22-fix5b]: THE #1350e TAIL IS VERBATIM WHEN IT IS THE ONLY
+        # REASON. Four #1350 tests assert the literal "REJECTED: interleaved",
+        # and [22-fix5] rewrote this shared sentence for every caller -- the
+        # rejection BEHAVIOUR was untouched (origin 6.44, source=launch, the
+        # 7.49 still named) and only the prose moved, which is the cheapest
+        # possible way to break four green tests for nothing. Each rejected
+        # entry already carries its own reason in its own string; this tail
+        # only names the rule, so it names the rule that actually applied.
+        + (
+            " REJECTED: interleaved, i.e. measured DURING a flip, so they "
+            "already contain the permanent step `flip_ratchet_gib` charges "
+            "separately (#1350e)"
+            if not _any_death
+            else " REJECTED. An entry marked DEATH-SAMPLE was measured while "
+            "this line was not alive (#1361); any other is interleaved, i.e. "
+            "measured DURING a flip, so it already contains the permanent step "
+            "`flip_ratchet_gib` charges separately (#1350e)"
+        )
+        if _rejected else ""
+    )
+    if cg_nonreclaim_gib >= floor:
+        return cg_nonreclaim_gib, _rej and (
+            f"the launch-moment non-reclaimable reading {cg_nonreclaim_gib:.2f} GiB "
+            f"[source=launch]{_rej}; the remaining run-moment residual floor is "
+            f"{floor:.2f} GiB [{floor_src}]"
+        ) or (
+            f"the launch-moment non-reclaimable reading {cg_nonreclaim_gib:.2f} GiB, which is "
+            f"AT OR ABOVE the run-moment residual floor {floor:.2f} GiB [{floor_src}]"
+        )
+    return floor, (
+        f"the RUN-MOMENT RESIDUAL FLOOR {floor:.2f} GiB [{floor_src}] -- the launch-moment "
+        f"reading {cg_nonreclaim_gib:.2f} GiB is only a floor and a quieter launch does not "
+        f"buy a bigger arm (weg2dk6 46.80 GiB launch -> M=600 -> died at 96.06; weg2dk7 "
+        f"15.36 GiB launch -> M=1200 + 9 GiB store -> 90.1-94.6 GiB at IDLE, store EMPTY)"
+    )
+
+
+#: The marker :func:`run_origin_gib` appends to its source string when the
+#: floor it chose came from a record that ITSELF carries a ratchet measurement.
+#: A STRING marker rather than a third return value on purpose: that signature
+#: has four call sites and boot weg2sn6a died of a signature that had drifted
+#: between two of them.  The marker is machine-read in exactly one place
+#: (:func:`price`) and printed everywhere else, so a reader of an ARM line sees
+#: the same fact the guard acted on.
+RUN_ORIGIN_RATCHET_MARKER = "[FLOOR-INCLUDES-RATCHET]"
+
+
+@dataclass(frozen=True)
+class FlipRatchet:
+    """What the flip costs the host PERMANENTLY, and where that number is from.
+
+    ``per_flip_gib`` is ONE full pair (a D->P leg plus a P->D leg), measured as
+    the non-reclaimable reading at ``PDFLIP-FLIP done epoch=2`` minus the one at
+    ``PDFLIP-FLIP begin epoch=0``.  ``flips_priced`` is how many pairs the run
+    window is charged for, and it is printed rather than assumed -- see
+    :data:`FLIP_RATCHET_FLIPS_PRICED_DEFAULT` for why it is 1.
+    """
+
+    per_flip_gib: float
+    flips_priced: int
+    source: str
+    from_record: bool
+
+    @property
+    def charged_gib(self) -> float:
+        return float(self.per_flip_gib) * int(self.flips_priced)
+
+    def arm_fields(self) -> str:
+        """The four fields #1350 requires on the ARM line, in one place so the
+        launcher's line and a test read the SAME spelling."""
+        return (
+            f"ratchet_per_flip={self.per_flip_gib:.2f} "
+            f"flips_priced={self.flips_priced} "
+            f"ratchet_charged={self.charged_gib:.2f} "
+            f"source={self.source}"
+        )
+
+
+def flip_ratchet_record(
+    *,
+    pre_gib: Optional[float],
+    post_gib: Optional[float],
+    boot_tag: str,
+    commit: str,
+    at: str,
+    pre_at: str = "",
+    post_at: str = "",
+    form_key: str = "",
+    epochs: str = "begin epoch=0 -> done epoch=2",
+    cushion_min_gib: Optional[float] = None,
+    # #1378 Stage 2: THIS BOOT'S OWN PRICED BOUNCE, riding beside the cushion
+    # it was measured under -- the NEXT boot's `resolve_prior_cushion` needs
+    # both from the SAME record (mixing a winner's cushion_min with a
+    # different candidate's bounce would compare two boots that never
+    # coexisted). None (an older record, or a ring arm's caller that never
+    # threads it) means "not available for the cross-boot gate", never 0.0.
+    xchg_bounce_gib: Optional[float] = None,
+) -> Dict[str, object]:
+    """One sidecar entry carrying the MEASURED ratchet of this boot's first pair.
+
+    Written by the front through :func:`append_measured_record` -- the same
+    writer, the same file and the same reader as the dormant-image and
+    run-moment-residual entries, so #1350 adds a FIELD and not a second
+    bookkeeping.  ``group`` is ``"FLIP"`` because the quantity belongs to
+    neither group: :func:`resolve_image_terms` reads only ``"P"``/``"D"`` and
+    :func:`run_origin_gib` reads only entries carrying ``run_residual_gib``, so
+    this entry is invisible to both by construction.
+
+    Either reading ``None`` (an unreadable ``memory.stat``) yields
+    ``flip_ratchet_gib = None``: the entry is still written, because WHY a boot
+    could not measure is evidence, and the next arm then refuses by name
+    instead of reading the absence as zero.
+    """
+    ratchet = (
+        None if pre_gib is None or post_gib is None
+        else float(post_gib) - float(pre_gib)
+    )
+    return {
+        "group": "FLIP",
+        "at": at,
+        "boot_tag": boot_tag,
+        "commit": commit,
+        "form_key": form_key,
+        "flip_ratchet_gib": ratchet,
+        "flip_ratchet_epochs": epochs,
+        "pre_first_flip_nonreclaim_gib": None if pre_gib is None else float(pre_gib),
+        "post_second_leg_nonreclaim_gib": None if post_gib is None else float(post_gib),
+        "pre_first_flip_at": pre_at,
+        "post_second_leg_at": post_at,
+        # The currency, IN the record, because a figure whose instrument is not
+        # stored beside it is the one #1309 had to re-derive from a comment.
+        "instrument": "anon+shmem+slab_unreclaimable (memory.stat), NEVER memory.current",
+        # #1377 W11: the cushion MINIMUM of this boot, so the NEXT arm can
+        # predict the latch instead of meeting it. None when the sampler was
+        # not armed -- and None is a verdict of its own ("not measurable"),
+        # never a 0 that would refuse every arm on an unsampled box.
+        "cushion_min_gib": (None if cushion_min_gib is None
+                            else float(cushion_min_gib)),
+        "xchg_bounce_gib": (None if xchg_bounce_gib is None
+                            else float(xchg_bounce_gib)),
+    }
+
+
+def _config_path(model_path: str) -> str:
+    """The ``config.json`` describing ``model_path`` by the server's own rule
+    (``server_args.declared_config_path_for``: a GGUF file's config is its
+    sibling); the plain join when nothing is found, so the caller's open()
+    raises exactly what it raised before (27B line G2)."""
+    from flliper.srt.server_args import declared_config_path_for
+
+    return declared_config_path_for(model_path) or os.path.join(
+        model_path, "config.json"
+    )
+
+
+def _is_gguf_file(model_path: str) -> bool:
+    """The server's own GGUF predicate (``check_gguf_file``), for a path that
+    names a file; a directory is never one (and never imports anything)."""
+    if not model_path or not os.path.isfile(model_path):
+        return False
+    from flliper.srt.utils.hf_transformers_utils import check_gguf_file
+
+    return bool(check_gguf_file(model_path))
+
+
+@dataclass(frozen=True)
+class GgufTensorRow:
+    """One tensor of a GGUF split set, as its header states it (27B line G6):
+    no byte of tensor data is read. ``n_bytes`` is gguf-py's own count for the
+    tensor's ggml type (block size x type size for a quantized one), i.e. the
+    exact on-disk size of a mixed-quant tensor -- never dtype x shape."""
+
+    name: str
+    ggml_type: str  # GGMLQuantizationType name, e.g. "IQ4_XS", "Q8_0", "F32"
+    shape: Tuple[int, ...]  # gguf-py order (ne0 first)
+    n_bytes: int
+
+
+@dataclass(frozen=True)
+class GgufHeaderFacts:
+    """What the launch path needs from a GGUF checkpoint's header (27B line G2),
+    read ONCE per file per process: gguf-py parses every metadata field when it
+    opens a file -- measured 8.5 s for Qwen3.8-27B-UD-IQ4_XS.gguf (its 248,320
+    tokenizer strings), twice with the loader's split resolution -- and a launch
+    asks for the depth, the arch and the digest (five sites).
+
+    G6: the same single read also keeps every tensor's row (``tensors``), so the
+    weight readers -- P cut, ring stage weights, layer census -- price a GGUF
+    from its own header without opening it a second time."""
+
+    arch: str  # general.architecture of the metadata part, "" when absent
+    block_count: Optional[int]
+    nextn_predict_layers: Optional[int]
+    tensor_digest: str  # sha256 over the sorted name:ggml_type:shape rows
+    n_tensors: int
+    n_parts: int
+    #: every tensor of the split set in part order (G6); empty on a facts object
+    #: built by hand
+    tensors: Tuple[GgufTensorRow, ...] = ()
+
+    @property
+    def backbone_depth(self) -> Optional[int]:
+        """``block_count`` minus the NEXTN/MTP draft blocks it counts -- the
+        depth ``gguf_registry.reconcile_sibling_config`` compares and, on a
+        depth-only difference, loads."""
+        if self.block_count is None:
+            return None
+        return self.block_count - (self.nextn_predict_layers or 0)
+
+
+#: (realpath, size, mtime_ns) of the named file -> its facts. A split set is
+#: keyed by the part it was named by (bound: a later part replaced under a
+#: running launcher is not seen -- the loader's own resolution cache has the
+#: same one).
+_GGUF_HEADER_FACTS: Dict[Tuple[str, int, int], GgufHeaderFacts] = {}
+
+
+def _gguf_int(reader, key: str) -> Optional[int]:
+    field = reader.fields.get(key)
+    if field is None:
+        return None
+    try:
+        return int(field.contents())
+    except (TypeError, ValueError):
+        return None
+
+
+def gguf_header_facts(gguf_file: str) -> GgufHeaderFacts:
+    """The :class:`GgufHeaderFacts` of ``gguf_file``'s whole split set (the
+    loader's own ``resolve_gguf_shard_paths`` / ``gguf_metadata_path``). Header
+    only -- no tensor byte is read."""
+    st = os.stat(gguf_file)
+    key = (os.path.realpath(gguf_file), int(st.st_size), int(st.st_mtime_ns))
+    hit = _GGUF_HEADER_FACTS.get(key)
+    if hit is not None:
+        return hit
+    import gguf
+
+    from flliper.srt.model_loader.gguf_shards import (
+        gguf_metadata_path,
+        resolve_gguf_shard_paths,
+    )
+
+    parts = resolve_gguf_shard_paths(gguf_file)
+    meta = os.path.realpath(gguf_metadata_path(gguf_file))
+    arch, block_count, nextn, rows, seen_meta = "", None, None, [], False
+    tensors: List[GgufTensorRow] = []
+    for part in parts:
+        reader = gguf.GGUFReader(part, "r")
+        if os.path.realpath(part) == meta:
+            seen_meta = True
+            field = reader.fields.get("general.architecture")
+            arch = str(field.contents()) if field is not None else ""
+            if arch:
+                block_count = _gguf_int(reader, f"{arch}.block_count")
+                nextn = _gguf_int(reader, f"{arch}.nextn_predict_layers")
+        for t in reader.tensors:
+            row = GgufTensorRow(
+                name=str(t.name),
+                ggml_type=str(getattr(t.tensor_type, "name", t.tensor_type)),
+                shape=tuple(int(d) for d in t.shape),
+                n_bytes=int(t.n_bytes),
+            )
+            tensors.append(row)
+            rows.append(
+                "%s:%s:%s" % (row.name, row.ggml_type, "x".join(str(d) for d in row.shape))
+            )
+    if not seen_meta:
+        raise RuntimeError(
+            f"GGUF {gguf_file}: its metadata part {meta} is not in its own split "
+            f"set {parts}"
+        )
+    rows.sort()
+    facts = GgufHeaderFacts(
+        arch=arch,
+        block_count=block_count,
+        nextn_predict_layers=nextn,
+        tensor_digest=hashlib.sha256("\n".join(rows).encode()).hexdigest(),
+        n_tensors=len(rows),
+        n_parts=len(parts),
+        tensors=tuple(tensors),
+    )
+    _GGUF_HEADER_FACTS[key] = facts
+    return facts
+
+
+def _gguf_checkpoint_digest(model_path: str) -> Tuple[Optional[str], str]:
+    try:
+        with open(_config_path(model_path)) as f:
+            cfg = json.load(f)
+        tc = cfg.get("text_config", cfg)
+        c = hashlib.sha256(
+            json.dumps(tc, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        facts = gguf_header_facts(model_path)
+        g, n_tensors, n_parts = facts.tensor_digest, facts.n_tensors, facts.n_parts
+    except Exception as e:  # noqa: BLE001 -- gguf reader errors are not OSError
+        return None, (
+            f"checkpoint digest unavailable for {model_path}: {e!r}. A GGUF "
+            f"content digest needs the sibling config.json and a readable GGUF "
+            f"tensor directory; without them this boot has no stable model "
+            f"identity and every recorded figure must be treated as another "
+            f"model's"
+        )
+    return hashlib.sha256((c + g).encode()).hexdigest(), (
+        f"gguf content digest over the sibling config.text_config + the sorted "
+        f"(name, ggml type, shape) of {n_tensors} tensors in {n_parts} part(s) "
+        f"(config {c[:12]}..., tensors {g[:12]}...) -- snapshot-independent; "
+        f"types included because quantizations of one model share every name"
+    )
+
+
+def checkpoint_digest(model_path: str) -> Tuple[Optional[str], str]:
+    """#1362 [22-fix]: the model's CONTENT identity, or ``(None, why)``.
+
+    THE ALGORITHM IS THE BOOT SEAT'S, reproduced bit for bit rather than
+    re-invented -- `digest_inputs.algo` in the calibration record is the
+    authority and this function is its second implementation, so it is verified
+    against a real record instead of trusted:
+
+        sha256( sha256(json.dumps(config.text_config, sort_keys=True,
+                                  separators=(',',':')))
+              || sha256('\n'.join(sorted(index.weight_map.keys()))) )
+
+    NAMES ONLY, not (name, dtype, shape): ``model.safetensors.index.json``
+    carries neither dtype nor shape, which the boot seat found while measuring
+    and reported as a deviation from its own proposal rather than silently.
+
+    WHY NOT THE PATH.  :func:`model_digest` hashes the path, and on a
+    HuggingFace snapshot that is the COMMIT -- so the same checkpoint
+    re-downloaded under a new snapshot hash becomes a different model, and the
+    calibration recorded for it is orphaned.  Measured: the path form yields
+    ``397b7ba47a99...@138b30a8`` where the record is keyed
+    ``89dcd9c4195338...``; the launcher could not have found the file at all.
+    The path form stays as the launch-path fallback for a checkpoint whose
+    config or index cannot be read, and says which one it is wherever printed.
+
+    A GGUF FILE (27B line G2) has no index: its config is the sibling
+    ``config.json`` (the server's ``declared_config_path_for``) and its tensor
+    part is :attr:`GgufHeaderFacts.tensor_digest` -- names WITH their ggml types
+    and shapes, because two quantizations of one model (UD-IQ4_XS, UD-Q8_K_XL)
+    share every name and every config byte, and a names-only digest would hand
+    one the other's calibration. A directory digests exactly as before.
+    """
+    if _is_gguf_file(model_path):
+        return _gguf_checkpoint_digest(model_path)
+    try:
+        with open(_config_path(model_path)) as f:
+            cfg = json.load(f)
+        tc = cfg.get("text_config", cfg)
+        c = hashlib.sha256(
+            json.dumps(tc, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        with open(os.path.join(model_path, "model.safetensors.index.json")) as f:
+            idx = json.load(f)
+        i = hashlib.sha256(
+            "\n".join(sorted(idx["weight_map"].keys())).encode()
+        ).hexdigest()
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return None, (
+            f"checkpoint digest unavailable for {model_path}: {e}. A content "
+            f"digest needs config.json and model.safetensors.index.json; without "
+            f"them this boot has no stable model identity and every recorded "
+            f"figure must be treated as another model's"
+        )
+    return hashlib.sha256((c + i).encode()).hexdigest(), (
+        f"content digest over config.text_config + sorted tensor NAMES "
+        f"(config {c[:12]}..., index {i[:12]}...) -- snapshot-independent, the "
+        f"algorithm the calibration records are keyed by"
+    )
+
+
+def checkpoint_layers(model_path: str) -> Optional[int]:
+    """#1362 [22-fix]: the model's layer count from its own config, or ``None``.
+
+    The calibration constants are keyed to a DEPTH (64), so the check needs the
+    depth of the checkpoint actually being loaded -- not a launcher variable,
+    which does not exist at the site where the incumbent vector is handed over.
+    ``None`` when the config cannot be read, and the caller then keeps the
+    pre-#1362 behaviour rather than refusing on a number it does not have.
+    """
+    try:
+        with open(_config_path(model_path)) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    tc = cfg.get("text_config", cfg)
+    for key in ("num_hidden_layers", "n_layer", "num_layers"):
+        if isinstance(tc.get(key), int):
+            return int(tc[key])
+    return None
+
+
+def model_digest(model_path: str) -> str:
+    """#1362: a short, stable identity for the model a measurement belongs to.
+
+    Path-derived and deliberately cheap: basename plus a hash of the full path.
+    It does NOT read the checkpoint -- this runs on the launch path, a multi-GB
+    read would be a new cost, and the question it answers ("is this the same
+    model the recorded number came from") a path answers for every boot this
+    line has run.  A CONTENT digest over config.json + the tensor index is the
+    better identity and is what the calibration records carry; this one is the
+    launch-path fallback for records that predate them, and it says so wherever
+    it is printed rather than passing for the stronger thing.
+    """
+    p = str(model_path or "").rstrip("/")
+    base = os.path.basename(p) or "unknown"
+    return f"{base}@{hashlib.sha256(p.encode()).hexdigest()[:8]}"
+
+
+#: #1362 THE MEASURED SHORTFALL OF THE MANIFEST ANCHOR, named rather than
+#: silently adopted.  #1359 measured it on the 27B: per-card manifests sum to
+#: 32783 MiB against a 47512 MiB tag census -- ratio **1.449** -- because the
+#: manifests count TENSOR bytes while the saver backs up whole REGIONS.  The
+#: gap is real memory, so a manifest-sourced Sigma H without it sizes the ring
+#: 40 % short and ends in W31/W51 at the flip.
+#:
+#: IT IS BORROWED FROM ANOTHER MODEL, which is the very transfer this ticket
+#: refuses elsewhere.  Two things make it admissible and both are printed: it
+#: is the CONSERVATIVE direction (bigger ring, never smaller), and it is
+#: replaced by the model's OWN census after its first boot.
+MANIFEST_CENSUS_SURCHARGE = 1.449
+MANIFEST_CENSUS_SURCHARGE_SOURCE = (
+    "#1359 on the 27B: manifests 32783 MiB vs tag census 47512 = 1.449. "
+    "BORROWED from another model and printed as such; conservative direction "
+    "(bigger ring), retired by this model's own census after its first boot"
+)
+
+
+#: #1362: where a model's own PP calibration lives, one file per model, keyed
+#: by the CHECKPOINT digest the record carries -- not by the boot tag and not by
+#: the argv form key.  The form key answers "same boot form?"; this answers
+#: "same model?", and the fossil this closes is a 64-layer measurement being
+#: spent on a 32-layer model because nothing asked.
+#: Follows FLLIPER_PDFLIP_GPU_ARB like the launcher's GPU_ARB (docker plan, stage
+#: B); unset or empty -> byte-identical to the rig literal.
+CALIB_DIR = _operator_dir(os.environ.get('FLLIPER_PDFLIP_GPU_ARB') or '/spinning/gpu-arb', "calib")
+CALIB_SCHEMA = "weg2-pp-calib/1"
+
+
+def read_pp_calibration(
+    digest: str, calib_dir: str = CALIB_DIR
+) -> Tuple[Optional[Dict[str, object]], str]:
+    """One model's PP calibration, or ``(None, why)``.  Never another model's.
+
+    Returns the record only when its own ``model_digest`` matches the one asked
+    for.  A record that carries ``refused`` is an ABSENCE WITH A REASON -- the
+    measuring run happened and could not produce numbers -- and that reason is
+    handed back verbatim, because "the calibration refused for X" and "nobody
+    ever measured" are different states and only one of them is fixed by
+    booking a window.
+
+    ``measured_ms_per_layer`` and ``measured_counts`` are validated TOGETHER:
+    the solver consumes them as a pair, and a record carrying one without the
+    other is the second-bookkeeping shape that lets ms from one cut be divided
+    by layer counts from another.
+    """
+    path = os.path.join(calib_dir, f"{digest}.json")
+    try:
+        with open(path) as f:
+            rec = json.load(f)
+    except OSError:
+        return None, (
+            f"no PP calibration for model {digest}: {path} does not exist. The "
+            f"constants in this tree were measured on a 64-layer model and are "
+            f"NOT transferable -- a measuring run is needed, not a default"
+        )
+    except ValueError as e:
+        return None, f"PP calibration for {digest} is unreadable ({e})"
+    if str(rec.get("schema", "")) != CALIB_SCHEMA:
+        return None, (
+            f"PP calibration for {digest} carries schema "
+            f"{rec.get('schema')!r}, this reader speaks {CALIB_SCHEMA!r}"
+        )
+    got = str(rec.get("model_digest", ""))
+    if got != digest:
+        return None, (
+            f"PP calibration file {path} carries model_digest {got!r}, asked for "
+            f"{digest!r} -- a file named for one model holding another's numbers "
+            f"is exactly the transfer this check exists to stop"
+        )
+    if rec.get("refused"):
+        return None, (
+            f"PP calibration for {digest} REFUSED at measuring time: "
+            f"{rec['refused']}. That is an absence WITH a reason -- booking "
+            f"another window does not fix it until the reason is addressed"
+        )
+    ms = rec.get("measured_ms_per_layer")
+    counts = rec.get("measured_counts") or rec.get("stage_layer_counts")
+    attn = rec.get("measured_attn_counts") or rec.get("attn_counts")
+    missing = [n for n, v in (("measured_ms_per_layer", ms),
+                              ("measured_counts", counts),
+                              ("measured_attn_counts", attn)) if not v]
+    if missing:
+        return None, (
+            f"PP calibration for {digest} is incomplete: {missing} absent. The "
+            f"solver consumes ms and counts as a PAIR; a record with one half is "
+            f"how ms from one cut get divided by layer counts from another"
+        )
+    if not (len(ms) == len(counts) == len(attn)):
+        return None, (
+            f"PP calibration for {digest} disagrees with itself: "
+            f"{len(ms)} ms figures, {len(counts)} layer counts, {len(attn)} "
+            f"attention counts -- one per stage or the pair is not a pair"
+        )
+    return rec, (
+        f"MEASURED for model {digest}: ms/layer={list(ms)} counts={list(counts)} "
+        f"attn={list(attn)} at prefix "
+        f"{rec.get('calibration_prefix_tokens', '?')} tokens "
+        f"({rec.get('provenance', 'no provenance recorded')})"
+    )
+
+
+def refuse_foreign_calibration(digest: str, why: str) -> "PdFlipModelIdentityMismatch":
+    """The named refusal, so the message is the missing MEASUREMENT and not a
+    ValueError three layers down in the cut solver."""
+    return PdFlipModelIdentityMismatch(
+        f"W99 PdFlipModelIdentityMismatch: the PP calibration for model {digest} "
+        f"is not available and this tree's constants belong to ANOTHER MODEL. "
+        f"{why}. The 64-layer figures (P_PP_STAGE_RATIO_SCORES, "
+        f"MEASURED_MS_PER_LAYER) were taken on boot bsscale's 27B and carry no "
+        f"model reference at all; spending them on a different layer count is "
+        f"what produced a bare ValueError ('the anchor stage 1 holds 18 linear "
+        f"and 0 attention layers in the calibration cut') instead of a verdict. "
+        f"A measuring run for {digest} is the fix; there is no default and a "
+        f"default is what this refusal exists to prevent."
+    )
+
+
+def resolve_calibrated_stage_layer_counts(
+    model: str, override_csv: Optional[str],
+    calibration_layers: int,
+) -> Optional[List[int]]:
+    """#1362 [22-fix follow]: the SAME model-identity guard for EVERY consumer
+    of "the incumbent per-stage layer counts", not just :func:`launcher.argv_p`.
+
+    THE GAP THIS CLOSES.  ``argv_p`` (launcher.py ~L2746) already refuses a
+    foreign calibration before it ships ``--pp-stage-ratio`` to group P's own
+    argv.  ``solve_p_cut``'s ``incumbent`` (launcher.py ~L8460) is a SECOND,
+    UNGUARDED reader of the same concept -- it falls straight to
+    ``P_PP_STAGE_RATIO_SCORES`` (the 64-layer bsscale measurement) whenever
+    ``ns.pp_stage_ratio`` is unset, with no calibration lookup and no depth
+    check.  Measured live (DESK6, #1378, 2026-09-13): a dry-run for a
+    24-layer model WITH a valid, complete calibration record for its own
+    digest still crashed in
+    ``pp_cut.family_costs_from_measurement`` with the exact bare
+    ``ValueError`` :func:`refuse_foreign_calibration`'s own message quotes as
+    the failure this ticket exists to turn into a named refusal -- because
+    ``solve_p_cut`` runs BEFORE ``argv_p`` in ``main()`` and never consulted
+    the calibration record at all.
+
+    Returns ``None`` when the caller should keep its own fallback (no
+    override AND the checkpoint digest could not be read, OR the depth
+    matches ``calibration_layers`` so the bsscale incumbent is legitimate for
+    THIS checkpoint) -- never invents a vector. Raises
+    :func:`refuse_foreign_calibration` on the same conditions ``argv_p``
+    already refuses on, so a caller that reaches this function's exception
+    path gets IDENTICAL wording to the existing, tested refusal rather than a
+    parallel, drifting copy of the message.
+    """
+    if override_csv:
+        return None
+    dg, dg_why = checkpoint_digest(model)
+    if not dg:
+        return None
+    # CALIB_DIR passed EXPLICITLY, read fresh off the module global here --
+    # not left to read_pp_calibration's own bound default, which is captured
+    # once at function-definition time and would silently ignore a test (or
+    # any future caller) that patches the module-level constant afterwards.
+    calib, calib_why = read_pp_calibration(dg, CALIB_DIR)
+    depth = checkpoint_layers(model)
+    if calib is None and depth is not None and depth != calibration_layers:
+        raise refuse_foreign_calibration(dg, calib_why)
+    if calib is not None:
+        return [int(n) for n in calib["measured_counts"]]
+    return None
+
+
+def resolve_flip_ratchet_gib(
+    record: Optional[Dict[str, dict]] = None,
+    *,
+    flips_priced: Optional[int] = None,
+    seed_allowed: bool = True,
+    reference_model_ok: Optional[bool] = None,
+    reference_model_why: str = "",
+) -> FlipRatchet:
+    """The charged flip ratchet and its provenance, or W94.
+
+    PRECEDENCE, and every step says which one answered:
+
+    (a) a sidecar entry carrying ``flip_ratchet_gib`` -- this line's own
+        measurement, written by the front at ``PDFLIP-FLIP done epoch=2``.  The
+        MAX over such entries binds, which is the rule this module already
+        applies to the reap samples and to the ring-era transient: the margin
+        must cover the worst recorded instance of the form.
+    (b) absent that, and only while ``seed_allowed``: the RECORDED pair column
+        of :data:`FLIP_RATCHET_CUMULATIVE_GIB` -- the five 0912 boots this term
+        was attributed on, max (weg2xsn24, 4.049 GiB, the conservative
+        direction).  It is labelled SEED in the source string and it is NOT
+        this line's own record; it exists because no record on this box carries
+        the field yet, exactly as :func:`dk7_run_residual_gib` stands in for a
+        residual no record has written, and it RETIRES the first time (a)
+        answers.
+    (c) neither -> :class:`PdFlipHostFlipRatchetUnmeasured`.
+
+    ``seed_allowed=False`` is how a caller demands this line's OWN measurement
+    -- and it is the state the refusal is tested in, so the refusal is a
+    reachable path and not a decoration.
+    """
+    n = (
+        FLIP_RATCHET_FLIPS_PRICED_DEFAULT if flips_priced is None
+        else max(1, int(flips_priced))
+    )
+    rows = [
+        (float(e["flip_ratchet_gib"]), g, e)
+        for g, e in (record or {}).items()
+        if isinstance(e, dict) and e.get("flip_ratchet_gib") is not None
+    ]
+    if rows:
+        val, group, entry = max(rows, key=lambda r: r[0])
+        return FlipRatchet(
+            per_flip_gib=val,
+            flips_priced=n,
+            source=(
+                f"MEASURED first flip pair of boot {entry.get('boot_tag', '?')} @ "
+                f"{entry.get('commit', '?')} ({entry.get('at', '?')}, group {group}, "
+                f"{entry.get('flip_ratchet_epochs', '?')}, "
+                f"pre={entry.get('pre_first_flip_nonreclaim_gib')} "
+                f"post={entry.get('post_second_leg_nonreclaim_gib')}, MAX over "
+                f"{len(rows)} recorded pair(s))"
+            ),
+            from_record=True,
+        )
+    if seed_allowed and FLIP_RATCHET_SERIES_GIB:
+        # #1350g: THE SERIES, NOT THE SEED. The seed was one boot's first flip
+        # PAIR (4.049 GiB) and boot weg2xsn25 proved it too small by 4.647 GiB
+        # -- it predicted 90.43, reached 95.077 and the host reaped group D.
+        # The series prices what the term would have had to BE on each recorded
+        # boot, so it cannot under-shoot the population it is measured from.
+        boot, need = max(FLIP_RATCHET_SERIES_GIB.items(), key=lambda kv: kv[1])
+        rows = " ".join(
+            f"{b}:{v:+.3f}" for b, v in sorted(FLIP_RATCHET_SERIES_GIB.items())
+        )
+        # H87: the series is six Qwen3.8-27B-INT8 boots. For another checkpoint
+        # it stays the charged figure -- the conservative direction, and the
+        # first boot of a new model must be pricable -- but it is NAMED as a
+        # foreign stand-in, never passed off as this model's term.
+        _foreign = (
+            f"{FOREIGN_REFERENCE_TAG} FOREIGN-MODEL stand-in: the series was measured "
+            f"on {REFERENCE_MODEL}, not this checkpoint "
+            f"({reference_model_why or 'identity not the reference'}); charged as a "
+            f"conservative bound until this model's first flip pair writes "
+            f"flip_ratchet_gib -- "
+            if reference_model_ok is False else ""
+        )
+        return FlipRatchet(
+            per_flip_gib=float(need),
+            flips_priced=n,
+            source=_foreign + (
+                f"SERIES (NOT this line's own record, and NOT the retired "
+                f"first-pair seed): MAX over the measured 6-boot series [{rows}], "
+                f"binding {boot} {need:.3f} GiB. Each row is what that boot's "
+                f"UN-ratcheted prediction had to gain to reach its own measured "
+                f"non-reclaimable peak (weg2xsn25's row adds back the 4.050 GiB "
+                f"its prediction already charged). MAX is the rule, and it is the "
+                f"conservative of the two available: the last four rows rise "
+                f"monotonically, so a trend fit prices HIGHER. RETIRES as soon as "
+                f"one boot writes flip_ratchet_gib into the sidecar -- which needs "
+                f"a boot that completes TWO flips, the one weg2xsn25 died before"
+            ),
+            from_record=False,
+        )
+    unmeasured = sorted(
+        str(e.get("boot_tag", "?"))
+        for e in (record or {}).values()
+        if isinstance(e, dict) and "flip_ratchet_gib" in e
+        and e.get("flip_ratchet_gib") is None
+    )
+    raise PdFlipHostFlipRatchetUnmeasured(
+        "W94 PdFlipHostFlipRatchetUnmeasured: no record of this form carries "
+        "`flip_ratchet_gib`, and no seed is permitted here."
+        + (
+            f" Records that REACHED the measuring moment and could not read it: "
+            f"{unmeasured} -- an unreadable memory.stat, not a missing flip."
+            if unmeasured else ""
+        )
+        + " The term is what the "
+        "FIRST waking of each group adds to the cgroup and never returns "
+        "(+1.18..1.73 GiB on the P->D leg, +0.28..0.30 on D->P, measured on five "
+        "formgleiche boots, ANALYSE_1350_HOST_TERM_0912.md). It is REFUSED rather "
+        "than priced at 0, because a 0 would let this arm report FUNDABLE for a "
+        "peak the ledger has knowingly stopped modelling -- the direction that "
+        "kills a boot. The front writes the field at `PDFLIP-FLIP done epoch=2`; a "
+        "boot that never completes a first flip PAIR writes nothing, and a boot "
+        "whose predecessor wrote nothing must be priced from the recorded seed or "
+        "not at all."
+    )
+
+
+#: H87: the marker of a D-ONLY arm on every line that prices one.
+D_ONLY_TAG = "PDFLIP-HOST-LEDGER D-ONLY"
+
+
+def d_only_flip_ratchet() -> FlipRatchet:
+    """H87: the ratchet of a ``--d-only`` boot -- ZERO FLIPS, declared.
+
+    Not an absence (``None`` would print "NOT priced at 0" and read as a
+    missing measurement) and not :func:`resolve_flip_ratchet_gib` (whose
+    ``max(1, flips_priced)`` exists because a flip boot flips at least once).
+    A D-only boot starts group D alone, no P, no front, no flip: the permanent
+    step a flip adds never happens, so the run moment carries none of it.
+    Measured on the container boot dkrnfdnvfp4dbar109251235 (rc2.1c2, NVFP4
+    D-only): the ledger charged the 27B series 8.70 GiB for a flip that boot
+    cannot run and refused W87/W20 at run=-2.82 GiB.
+    """
+    return FlipRatchet(
+        per_flip_gib=0.0,
+        flips_priced=0,
+        source=(
+            f"{D_ONLY_TAG}: no flip arm -- --d-only starts group D alone (no P, no "
+            f"front, no flip), so no flip pair is priced and no series or record "
+            f"is consulted"
+        ),
+        from_record=False,
+    )
+
+
+@dataclass
+class Arm:
+    s_gb: int
+    m_mib: int
+    ranks_per_group: int
+    memtotal_bytes: int
+    memavail_bytes: int
+    terms: Dict[str, float] = field(default_factory=dict)
+    launch_leftover_gib: float = 0.0
+    run_leftover_gib: float = 0.0
+
+    @property
+    def launch_worst_case_gib(self) -> float:
+        """The launch leftover with the WHOLE load transient charged as
+        non-reclaimable -- i.e. as if the class split (#1317n) were wrong.
+
+        Kept as a first-class term rather than a comment because it is the
+        safety net of that split: the split says 12 GiB of the transient is
+        page cache and may not be booked against the reap bound, and this is
+        the number that answers "and if it isn't?".
+        """
+        t = self.terms or {}
+        v = t.get("launch_leftover_sum_gib")
+        return self.launch_leftover_gib if v is None else float(v)
+
+    @property
+    def fundable_moments(self) -> bool:
+        """Both moments fund, AND the worst case stays inside the margin.
+
+        #1317n THE THIRD CONJUNCT IS THE SPLIT'S SAFETY NET. Pricing the launch
+        moment in the reap currency (page cache not charged against a bound the
+        reaper does not enforce on page cache) turns weg2sn6r's -2.78 GiB into
+        +9.2 GiB. If that class assignment is ever wrong, the honest fallback is
+        not "boot anyway": the SUM form must still sit inside the named margin,
+        so a configuration that would breach the reap watermark even once the
+        page cache is reclaimed keeps being REFUSED. On sn6r the sum form is
+        -2.78 against a margin of 8.60, so it holds with 5.82 GiB to spare --
+        the split changes the verdict, and the worst case still has a floor.
+        """
+        if not (self.launch_leftover_gib >= 0.0 and self.run_leftover_gib >= 0.0):
+            return False
+        # #1350f: THIS GATE'S OWN MARGIN, not the reap one. See
+        # LAUNCH_WORST_CASE_MARGIN_GIB for why they were split.
+        margin = (self.terms or {}).get("launch_worst_case_margin_gib")
+        if margin is None:
+            margin = (self.terms or {}).get("margin_total_gib")
+        if margin is None:
+            return True
+        return self.launch_worst_case_gib >= -float(margin)
+
+    def predicted_run_peak_gib(self) -> Optional[float]:
+        """What ``memory.current`` this arm reaches at the RUN PEAK, or None.
+
+        #1236: THERE IS NO STORE TERM IN THIS SUM ANY MORE, and its absence is
+        the point rather than an omission.  The canonical page store was a
+        tmpfs, so every byte of it was ``shmem`` inside this cgroup -- charged
+        here in full, un-evictable (``SwapTotal`` 0 on this box), and therefore
+        a direct subtrahend of the room the reaper leaves.  It is a plain
+        directory on the ZFS dataset now (``launcher.STORE_ROOT``), so its cost
+        to the host is PAGE CACHE and ARC: reclaimable, outside this cgroup's
+        ``anon``, and not what the reaper kills for.  Charging it here would be
+        a phantom RAM post for bytes that are on a disk.
+
+        The sum of everything this arm actually charges to the cgroup -- the
+        reserves (``floor``) are deliberately NOT in it, because a reserve is
+        room kept free, not memory spent.  ``None`` when no cgroup sample was
+        passed: the prediction has no origin to add to, and a number without
+        its origin is exactly the reading that made weg2dk5 look fundable.
+
+        THE HOST WEIGHTS TERM HERE IS ``Sigma H`` AND IT APPEARS ONCE.  Fix 5
+        wrote this sum for the per-allocation form, where the run peak was one
+        resident image PLUS the interleave's transient; C19's shared host ring
+        makes those the same bytes -- the region is preallocated at ``Sigma H``
+        and the legs copy through it -- so summing both would double-charge the
+        very term this prediction exists to check.
+
+        FIX 6: the origin is the NON-RECLAIMABLE reading, the same denominator
+        :func:`price` budgets against.  Adding this arm's charges to a
+        ``memory.current`` that carries page cache compares an inflated origin
+        with :data:`OBSERVED_REAP_NONRECLAIM_BYTES`, a watermark that carries
+        almost none -- two different quantities wearing one unit.
+
+        FIX 8: that origin is the RUN-moment one (:func:`run_origin_gib`), and
+        this number now REFUSES arms (W21) instead of advising about them.
+
+        #1350: THE FLIP RATCHET IS IN ``_boot_charges_gib`` AND NOWHERE ELSE.
+        The sum gains no line here on purpose -- one addition point, three
+        consumers, the argument :func:`charge_terms` already makes.  What IS
+        here is the guard that the term cannot be charged twice: the origin may
+        be a run-moment residual floor sampled DURING a flip, and such a floor
+        has already realised the same permanent step.  That combination raises
+        :class:`PdFlipHostRatchetDoubleCharged` rather than returning a number
+        that is silently too high -- an over-prediction refuses arms the box
+        can carry, and #1317n's finding was that such a refusal is
+        indistinguishable from a real one to the next reader.
+        """
+        origin = self.terms.get("run_origin_gib")
+        if origin is None:
+            return None
+        t = self.terms
+        if (
+            t.get("flip_ratchet_gib") is not None
+            and RUN_ORIGIN_RATCHET_MARKER in str(t.get("run_origin_source") or "")
+        ):
+            raise PdFlipHostRatchetDoubleCharged(
+                "W95 PdFlipHostRatchetDoubleCharged: this arm charges "
+                f"flip_ratchet_gib={float(t['flip_ratchet_gib']):.2f} GiB AND takes its "
+                f"run origin from a measured run-moment residual floor that was sampled "
+                f"during a flip, so the floor already contains the same permanent step. "
+                f"origin={float(origin):.2f} GiB [{t.get('run_origin_source')}]. "
+                "The two may not be summed. Either re-measure the floor outside a flip "
+                "window, or price this arm from the launch-moment reading; the ledger "
+                "will not quietly count the same bytes twice in the direction that "
+                "refuses fundable arms."
+            )
+        return (
+            float(origin)
+            + _run_moment_charges_gib(t)
+            + t["host_ring_gib"]
+        )
+
+
+#: #1236: ``size_store_gib`` and ``StoreSizing`` ARE DELETED, not shrunk and
+#: not flagged.  They existed to answer "how much of the host RAM leftover may
+#: the store tmpfs take, bounded by the reap point" -- train fix 3's residual.
+#: The store is a directory on the ZFS dataset now and its size is the P KV
+#: pool's own bytes (``launcher.plan_store``), so that question has no subject
+#: left: there is no RAM residual to hand out, and a function that kept
+#: computing one would be a second bookkeeping beside a size the pool already
+#: fixes.  ``--store-min-gib`` went with it: a FLOOR on a RAM residual is
+#: meaningless once the store is not funded from RAM.  What replaced the floor
+#: is a HARD LAW instead of a knob -- ``max_size >= P pool bytes`` by
+#: construction (#1236), checked against the disk and refused by name (W52).
+
+
+def read_meminfo(path: str = "/proc/meminfo") -> Dict[str, int]:
+    """MemTotal/MemAvailable/Shmem in BYTES from /proc/meminfo."""
+    with open(path) as f:
+        text = f.read()
+    out: Dict[str, int] = {}
+    for key, val in re.findall(r"^(\w+):\s+(\d+) kB", text, re.M):
+        out[key] = int(val) * 1024
+    return out
+
+
+def non_backup_host_bytes(
+    group: str, s_gb: int, m_mib: int, s_gb_d: Optional[int] = None
+) -> int:
+    """The host bytes ONE group holds that are NOT the flip backup image.
+
+    FIX 1 (round 1) finding 3.  A sleeping group's RssShmem is its whole
+    shared-memory residency: the TMS backup image the ring must hold PLUS the
+    mamba anchor pools PLUS that group's half of the HiCache rings.  The last
+    two are posted by name in :func:`price` (``anchors_gib``, ``rings_gib``) and
+    charged against the same host budget, so a ring sized to an un-netted
+    RssShmem charges them twice -- Sigma H walks from ~32 to ~42 GiB and the
+    ledger W20-refuses at every rung, which is exactly A1-3's state for the old
+    form.  This is not a second bookkeeping: it reads the SAME constants
+    :func:`price` reads, and the split between the groups is the one those
+    constants were measured as.
+
+    * anchors: b0 measured six (rank x phase) pools at M=2400 as
+      ``2.55/1.49/1.06 + 2.55/1.27/1.27 GB`` -- three per group, so a group
+      holds its own triple, scaled linearly with M like :func:`price` does.
+    * rings: record 1e, "group P owns the 2xS half, group D the 6xS half".
+
+    ``group`` is ``"P"`` or ``"D"``; anything else raises rather than guessing.
+
+    #1325b -- ``s_gb_d`` IS THE THIRD CONSUMER OF #1325's CURRENCY, and it was
+    the one left unconverted.  #1325 fixed the sampler and the reader of
+    ``run_residual_gib``; this function is named in that very docstring
+    (:func:`read_measured_record`) as "the consumer that corrects it", and it
+    could not express the two-budget arm at all -- its only source was
+    ``ring_table.parse_chosen_arm``, a regex that sees ``S=`` and ``M=``.  So
+    on a source boot that ran ``S_D=4`` it took ``S_D == S`` worth of D's rings
+    out of that boot's measured ``RssShmem`` and left the rest inside the
+    netted image, where :func:`ring_table.solve` turns it into ``Sigma H`` and
+    :meth:`Arm.predicted_run_peak_gib` adds ``rings_gib`` -- AT ``S_D=4`` -- on
+    top of it.  The same bytes, twice, at the run moment.
+
+    MEASURED 2026-09-12, three instruments, one number:
+      * ``("D", 1, 1200)`` = 5499 MiB against ``s_gb_d=4`` = 14426 MiB:
+        **8.718 GiB** under-subtracted -- the #1325 figure exactly;
+      * source boot weg2xsn20 (``S_D=4``) leaves D 9092 MiB above its own
+        census, weg2sn5b (one budget) leaves 329 MiB: difference 8763 MiB;
+      * weg2xsn20's own group-D record carries ``run_residual_gib`` **-8.718**
+        GiB, and a residual defined as "what this term list does NOT name"
+        cannot be negative unless something is named twice.
+      Consequence on the refused boot weg2xsn21: ``Sigma H`` 51584 -> 44587
+      MiB, i.e. ``host_weights`` 50.38 -> 43.54 GiB.
+
+    ``s_gb_d`` is D's budget ALONE (#1317n): passing it must not move P's
+    subtrahend, because crediting D's rings to P would under-charge the box --
+    the danger direction of this whole correction.  ``None`` reproduces the
+    single-budget result byte for byte, so every pre-two-budget source boot
+    prices exactly as it did.
+
+    WHAT IS DELIBERATELY *NOT* IN THE SUBTRAHEND: the xchg bounce.  It IS an
+    arm charge (``charge_terms`` posts ``xchg_bounce_gib`` and
+    ``_boot_charges_gib`` sums it), so the symmetry argues for netting it too
+    -- but weg2xsn20, the source this correction was found on, NEVER MAPPED IT
+    (its record, item (c): ``bounce.bin`` ABSENT, the W74 refusal fires "before
+    the buffer is mapped").  Netting a term that is not in the sample is an
+    UNDER-charge, so it stays out until a source boot's own log proves the
+    buffer was mapped.  Stated here rather than left for a later reader to
+    "complete"; ``test_the_bounce_is_not_netted_off_the_image`` is the ratchet.
+
+    NOR is the host ring itself: the sample also counts the source boot's own
+    ring pages (:func:`read_measured_record` names that ratchet), but the
+    C19 ring is WHERE the backup lives, so subtracting it would cancel the
+    image this function exists to isolate.  Named, not netted, and in the
+    OVER-charging direction.
+    """
+    if group not in ("P", "D"):
+        raise ValueError(f"group must be 'P' or 'D', not {group!r}")
+    scale = m_mib / ANCHORS_REFERENCE_M_MIB
+    anchors = (ANCHORS_P_AT_2400_BYTES if group == "P" else ANCHORS_D_AT_2400_BYTES) * scale
+    ring_mult = RING_P_MULT_GB_PER_S if group == "P" else RING_D_MULT_GB_PER_S
+    # P keeps `s_gb`; only D's half of the rings is sized by the D budget.
+    ring_s = s_gb if (group == "P" or s_gb_d is None) else int(s_gb_d)
+    rings = ring_mult * ring_s * GB
+    # The pool overhead price() posts on top of anchors+rings is charged against
+    # the same bytes, so it belongs to the same subtrahend.
+    return int(round((anchors + rings) * (1.0 + HOST_POOL_OVERHEAD)))
+
+
+def cg_reclaimable_bytes(stat: Dict[str, int]) -> Optional[int]:
+    """The part of ``memory.current`` the kernel reclaims instead of killing for.
+
+    ``reclaimable = (file - shmem) + slab_reclaimable``, from a parsed
+    ``memory.stat``.  ``None`` -- never a guess and never 0 -- when any of the
+    three terms is absent: a missing reading must reach :func:`price` as an
+    absence so it can charge the WHOLE reading and say so.
+
+    Why not ``current - file``: in cgroup v2 ``file`` INCLUDES ``shmem``, so
+    that form gives back the tmpfs page store -- the canonical carrier -- as if
+    it were free.  Measured on this box rather than recalled, see
+    :data:`CGROUP_V2_FILE_INCLUDES_SHMEM_PROOF`: ``memory.stat file`` equals
+    /proc/meminfo ``Cached`` to the byte and ``memory.stat shmem`` equals
+    ``Shmem`` to the byte, with ``SwapTotal`` 0 -- so shmem cannot be evicted at
+    all here and is charged as spent, while ``slab_reclaimable`` (0.73 GiB at
+    that reading) is reclaimable by the same shrinker path as the page cache.
+    ``anon`` and ``unevictable`` are never subtracted: both are exactly what the
+    reaper kills to recover.
+    """
+    keys = ("file", "shmem", "slab_reclaimable")
+    if any(stat.get(k) is None for k in keys):
+        return None
+    page_cache_ex_shmem = max(0, int(stat["file"]) - int(stat["shmem"]))
+    return page_cache_ex_shmem + int(stat["slab_reclaimable"])
+
+
+def read_cgroup(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[int]]:
+    """The cgroup2 memory facts the REAPER acts on, in BYTES.
+
+    ``current`` / ``peak`` from ``memory.current`` / ``memory.peak``,
+    ``oom_kill`` from ``memory.events``, and ``max`` from ``memory.max`` --
+    ``None`` when that file says ``max``, i.e. when this cgroup publishes NO
+    finite ceiling.  Inside this LXC container it does say ``max``, and that
+    absence is a fact the caller must NAME (:func:`price` falls back to
+    MemTotal and says so) rather than paper over with a constant.
+
+    FIX 6 adds the ``memory.stat`` terms (``anon``, ``file``, ``shmem``,
+    ``unevictable``, ``slab_reclaimable``) and the derived ``reclaimable``:
+    ``memory.current`` alone cannot tell memory that is HELD from cache the
+    kernel will hand back, and the ledger must charge only the former.
+
+    Every key is ``None`` when its file is unreadable; an unreadable cgroup is
+    never silently priced as an empty one.
+    """
+
+    def _int(name: str) -> Optional[int]:
+        try:
+            with open(f"{root}/{name}") as f:
+                text = f.read().strip()
+        except OSError:
+            return None
+        if text == "max":
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+
+    oom: Optional[int] = None
+    try:
+        with open(f"{root}/memory.events") as f:
+            m = re.search(r"^oom_kill (\d+)", f.read(), re.M)
+        oom = int(m.group(1)) if m else None
+    except OSError:
+        oom = None
+
+    stat: Dict[str, int] = {}
+    try:
+        with open(f"{root}/memory.stat") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[1].lstrip("-").isdigit():
+                    stat[parts[0]] = int(parts[1])
+    except OSError:
+        stat = {}
+
+    out: Dict[str, Optional[int]] = {
+        "current": _int("memory.current"),
+        "peak": _int("memory.peak"),
+        "max": _int("memory.max"),
+        "oom_kill": oom,
+        "reclaimable": cg_reclaimable_bytes(stat),
+    }
+    for key in ("anon", "file", "shmem", "unevictable", "slab_reclaimable"):
+        out[key] = stat.get(key)
+    return out
+
+
+def price(
+    memtotal_bytes: int,
+    memavail_bytes: int,
+    s_gb: int,
+    m_mib: int,
+    *,
+    ranks_per_group: int = 3,
+    ring_bytes: int = 0,
+    ring_span1_bytes: int = 0,
+    ring_absent_by_design: bool = False,
+    cg_current_bytes: Optional[int] = None,
+    reclaimable_bytes: Optional[int] = None,
+    cg_ceiling_bytes: Optional[int] = None,
+    # #1317n D's own L2 budget. None = "same as P", which is every recorded
+    # arm and every pre-existing caller, so those are byte-identical.
+    s_gb_d: Optional[int] = None,
+    measured_record: Optional[Dict[str, dict]] = None,
+    xchg_bounce_host_bytes: int = 0,
+    # #1350 THE FLIP RATCHET, HANDED IN RATHER THAN RESOLVED HERE. Same shape
+    # as `xchg_bounce_host_bytes` and for the same reason: the ONE call site
+    # that already knows the boot resolves it (`resolve_flip_ratchet_gib`) and
+    # reaches the W94 refusal there; the ledger never opens the sidecar behind
+    # its caller's back. `None` = no measurement reached this arm, and it is
+    # recorded as ABSENT, never printed or summed as 0.
+    flip_ratchet: Optional["FlipRatchet"] = None,
+    # #1362 [22-fix]: the CHECKPOINT digest of the model this arm is for.
+    # Empty = the pre-#1362 caller, byte-identical; set = every recorded image
+    # must prove it belongs to this model or the arm refuses (W99).
+    model_digest_want: str = "",
+    # #1362 [22-fix2]: did THIS boot's group-P form key match the source boot's?
+    # The launcher already computes it for the ring solve; a legacy record
+    # (no digest, pre-#1362) is admitted only when it did.
+    form_key_matches: bool = False,
+    # #1386: forwarded to `charge_terms` unchanged -- see that function's
+    # docstring for why OFF must zero the term here, not shrink an input.
+    hicache_disabled: bool = False,
+    arena_gib: float = 0.0,
+    staging_gb: Optional[float] = None,
+    anchor_mib: Optional[int] = None,
+    d_draft_host_gib: float = 0.0,
+    memhist_gib: float = 0.0,
+    # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
+    l3_index_gib: float = 0.0,
+    memhist_run_only: bool = False,
+    # H87: see `charge_terms` (d_only) and `run_origin_gib`/`resolve_image_terms`
+    # (reference_model_ok). Defaults are byte-identical to every caller before.
+    d_only: bool = False,
+    reference_model_ok: Optional[bool] = None,
+    reference_model_why: str = "",
+) -> Arm:
+    """Price one arm at both moments.  Pure.
+
+    ``ring_bytes`` = ``Sigma_c H(c)`` and ``ring_span1_bytes`` = ``Sigma_c
+    image_P(c)`` are C19's replacement for the deleted backup constants, solved
+    from the previous boot by :func:`flliper.srt.pdflip.ring_table.solve`.  Both
+    must be positive: a zero is not "a free flip", it is a missing measurement,
+    and pricing it as zero is the shape that made boot weg2ls1b2 look fundable.
+
+    THE FLIP TRANSIENT IS NOT A TERM HERE, and its absence is the ring (C19 +
+    FLIPCOST A1-1/A1-3), not an omission.  Fix 5 replaced the "one chunk in
+    flight" endpoint proxy with ``FLIP_HOST_TRANSIENT_GIB`` = 9.97 GiB, the
+    measured PEAK of the old per-allocation flip.  The shared host ring removes
+    the quantity that constant measured: the region is preallocated at
+    ``Sigma H`` and the legs copy THROUGH it, so there is no transient stacked
+    on top of an image -- ``run`` charges ``Sigma H`` once and that IS the peak.
+    A1-3 is the same statement from the other side: the old form is infeasible
+    on this host budget (image + transient ~48.7 GiB against Sigma H ~36 GiB).
+
+    ``cg_current_bytes`` / ``cg_ceiling_bytes`` are the DENOMINATOR SWAP of
+    fix 5 (boot weg2dk5): the reaper watches ``memory.current`` against the
+    cgroup ceiling, not /proc/meminfo, so ``base`` is the TIGHTER of the two
+    readings and ``base_source`` names which one bound.  Both ``None`` (a
+    hermetic caller, or an unreadable cgroup) prices the meminfo arm alone and
+    says so in ``base_source`` -- it never invents a ceiling.
+
+    ``reclaimable_bytes`` is fix 6: what of that reading is page cache and
+    reclaimable slab (:func:`cg_reclaimable_bytes`).  Only ``current`` MINUS
+    that is charged, because only that is memory the reaper has to kill for.
+    ``None`` means the ``memory.stat`` terms were unreadable: the whole reading
+    is then charged -- the conservative direction -- and ``base_source`` names
+    the absence rather than assuming a cache share.  (FIX 8 renamed this
+    parameter: it used to be ``cg_reclaimable_bytes`` and SHADOWED the
+    module-level function of that name inside the very scope whose docstring
+    refers to it -- inert, and a loaded gun in the next edit.)
+
+    ``measured_record`` is fix 8: this line's own previously measured dormant
+    images and run-moment residuals (:func:`read_measured_record`).  ``None``
+    prices the named dk7 reading for P and a BOUND for D, and says which is
+    which -- see :func:`resolve_image_terms`.
+
+    ``xchg_bounce_host_bytes`` is #1273 S6: the weight exchange's own pinned
+    host carrier (``xchg_bounce.BounceTerms.total_bytes``, the assemble buffer
+    plus path (a)'s staging), 0 on the ring arm and therefore
+    on every boot that has run to date.  It is charged like any other term --
+    the flip transient's absence above is about the RING and says nothing about
+    a carrier the ring never had.
+    """
+    if s_gb < 1 or m_mib < 1:
+        raise ValueError(f"arm terms must be >= 1: S={s_gb} M={m_mib}")
+    # #1327 (S6 slice 2): ABSENCE OF A RING AND ABSENCE OF A MEASUREMENT ARE
+    # TWO FACTS, and until now they shared one spelling (`ring_bytes == 0`).
+    #
+    # Under `--pdflip-weight-source exchange` there IS no host weights ring: the
+    # launcher publishes no `TMS_HOST_RING_*`, Sigma H is 0 BY DESIGN, and the
+    # arming line says so (`ring_H_mib=0`). The refusal below is about a boot
+    # whose PREDECESSOR logged no ring table, i.e. a number the planner would
+    # have to guess -- and it must keep refusing that, because guessing is what
+    # C19 deleted. Loosening the guard to `< 0` would let the stale-table case
+    # through silently, which is the same defect one layer down.
+    #
+    # So the caller DECLARES the absence instead: `ring_absent_by_design` is
+    # decided at the ONE launcher call site that already knows the arm, exactly
+    # as `xchg_bounce_host_bytes` is ("a ledger that knew about arm names would
+    # be a second reader of a decision that already has one"). The ledger never
+    # reads the arm string.
+    #
+    # WHAT THIS RELEASES, and it is 2.7x what the S6 planning assumed: the
+    # weights ring is the `host_ring_gib` term, MEASURED 32.19 GiB on this rig
+    # at the run moment (`RUN MOMENT = the host weights term 32.19 GiB`), NOT
+    # the 12.83 GiB `rings_gib` term -- that one is the HiCache host pools
+    # (`RING_P_MULT_GB_PER_S * s_gb + RING_D_MULT_GB_PER_S * s_gb_d`) and the
+    # exchange does not touch it. Two different rings, and the S6 headroom
+    # claim was attached to the wrong one.
+    if ring_absent_by_design:
+        if ring_bytes or ring_span1_bytes:
+            raise ValueError(
+                "ring_absent_by_design with a non-zero ring "
+                f"(ring_bytes={ring_bytes}, ring_span1_bytes={ring_span1_bytes}): "
+                "the two inputs contradict each other, and a contradiction "
+                "resolved silently is how a charged term becomes invisible"
+            )
+    elif ring_bytes <= 0 or ring_span1_bytes <= 0:
+        raise PdFlipHostLedgerRefused(
+            "W20 PdFlipHostLedgerRefused: the host weights term has no measured source "
+            f"(ring_bytes={ring_bytes}, ring_span1_bytes={ring_span1_bytes}).  C19 "
+            "deleted BACKUP_P_BYTES / BACKUP_D_BYTES because they were stale "
+            "constants; the replacement is the previous boot's own per-card table "
+            "(ring_table.solve), and there is no third option.  A boot whose "
+            "predecessor logged no PDFLIP-CHUNK-BYTES / PDFLIP-FLIP-TAG lines cannot be "
+            "priced -- the planner REFUSES to guess (R22) rather than inventing a "
+            "number, and THIS BOOT REFUSES.  (FIX 2: this sentence used to name the "
+            "OLD serial form as the thing that would still run, which was false -- "
+            "that form is priced from the SAME table, one image plus one tag in "
+            "flight, so with no table there is nothing left to fall back to and the "
+            "launch stops here by name.)"
+        )
+    if ring_span1_bytes > ring_bytes:
+        raise ValueError(
+            f"span1 {ring_span1_bytes} > ring {ring_bytes}: span 1 is a PREFIX of the "
+            "region (image_P(c) <= H(c) by construction)"
+        )
+    base_meminfo_gib = min(memavail_bytes / GIB, memtotal_bytes / GIB - CLI_RESERVE_GIB)
+    base_cgroup_gib: Optional[float] = None
+    cg_nonreclaim_bytes: Optional[int] = None
+    stat_note = ""
+    if cg_current_bytes is not None:
+        # FIX 6: page cache inside ``memory.current`` is not spent memory.  The
+        # reclaimable share is CLAMPED into [0, current]: the two files are read
+        # microseconds apart, and a stat that momentarily exceeds the reading
+        # must not turn into free memory this box never had.
+        reclaim = 0
+        if reclaimable_bytes is None:
+            stat_note = (
+                " [memory.stat unreadable: the WHOLE reading is charged, the "
+                "conservative direction]"
+            )
+        else:
+            reclaim = max(0, min(int(reclaimable_bytes), int(cg_current_bytes)))
+        cg_nonreclaim_bytes = int(cg_current_bytes) - reclaim
+    if cg_nonreclaim_bytes is not None and cg_ceiling_bytes is not None:
+        # The CLI reserve is charged here too and for the same reason as on the
+        # meminfo arm: ``memory.current`` nets out what the CLIs hold RIGHT NOW,
+        # this term keeps the room they grow into.
+        base_cgroup_gib = (
+            (cg_ceiling_bytes - cg_nonreclaim_bytes) / GIB - CLI_RESERVE_GIB
+        )
+    if base_cgroup_gib is None:
+        base_gib = base_meminfo_gib
+        base_source = "meminfo (no cgroup sample passed)"
+    elif base_cgroup_gib <= base_meminfo_gib:
+        base_gib = base_cgroup_gib
+        base_source = (
+            "cgroup (ceiling - non-reclaimable memory.current - cli_reserve)"
+            + stat_note
+        )
+    else:
+        base_gib = base_meminfo_gib
+        base_source = "meminfo (min(memavail, memtotal-cli))"
+    # FIX 8's ONE AUTHORITY for what this arm charges beside the image -- the
+    # same dict predicted_run_peak_gib adds and dk7_run_residual_gib subtracts,
+    # so those three can no longer disagree about the same sum.  The draft tier
+    # is in it: a HOST tier of its own, charged at BOTH moments, allocated at
+    # load and outliving every flip (that is the point of carrying draft KV
+    # across the flip).  It is NOT part of the flip image -- the ring carries
+    # the weights, this carries the draft pages, never the same bytes.
+    # #1362 [22-fix]: the arm knows which model it prices, so the image check
+    # happens here rather than in a comment about who ought to do it.
+    images = resolve_image_terms(measured_record, want_digest=model_digest_want,
+                                form_key_match=form_key_matches,
+                                reference_model_ok=reference_model_ok,
+                                reference_model_why=reference_model_why)
+    charges = charge_terms(s_gb, m_mib, ranks_per_group, images, s_gb_d=s_gb_d,
+                           xchg_bounce_host_bytes=xchg_bounce_host_bytes,
+                           flip_ratchet_gib=(
+                               None if flip_ratchet is None
+                               else flip_ratchet.charged_gib
+                           ),
+                           hicache_disabled=hicache_disabled,
+                           arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
+                           d_draft_host_gib=d_draft_host_gib, d_only=d_only,
+                           memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
+                           l3_index_gib=l3_index_gib)
+    heaps_gib = charges["heaps_gib"]
+    anchors_gib = charges["anchors_gib"]
+    rings_gib = charges["rings_gib"]
+    overhead_gib = charges["overhead_gib"]
+    draft_host_p_gib = charges["draft_host_p_gib"]
+    draft_host_d_gib = charges["draft_host_d_gib"]
+    host_ring_gib = ring_bytes / GIB
+    host_ring_span1_gib = ring_span1_bytes / GIB
+    # THE MEASURED IMAGE IS REPORTED, NOT CHARGED A SECOND TIME (C19 x fix 8).
+    # fix 8's measurement is right and it is what A1-2 rules the image must come
+    # from -- but on the ring it enters through H(c): ring_table sizes each
+    # card's granule from this module's own sidecar and price charges the
+    # resulting Sigma H once.  Charging images.p/d here as well would charge the
+    # same RssShmem bytes twice, which is precisely the double-charge ring fix 1
+    # finding 3 removed.  They stay in the term list because A1-2 requires both
+    # numbers (measured image and weight-tag census) to print.
+    image_p_gib = images.p_gib
+    image_d_gib = images.d_gib
+    common = base_gib - FLOOR_GIB - _boot_charges_gib(charges)
+    # R7: at the launch moment only span 1 is registered (P's first pause is the
+    # launcher's sleep(P)); span 2 lands at D's first pause, when D's load
+    # transient is gone.  Charging Sigma H at launch is what turns the M=1200
+    # arm's leftover from +1.05 into -1.93 GiB.
+    # #1317n ONE CURRENCY PER BARRIER. `base_source` names which reading won
+    # the base, and that reading decides which half of the transient is a real
+    # cost against it. `launch_sum` is kept and printed either way as the
+    # WORST CASE (the whole transient non-reclaimable), and it is a hard gate
+    # below -- so this is a class assignment, never a sum->max trick.
+    launch_sum = common - host_ring_span1_gib - LOAD_TRANSIENT_GIB
+    launch_reap = common - host_ring_span1_gib - LOAD_TRANSIENT_ANON_GIB
+    _reap_currency = str(base_source or "").startswith("cgroup")
+    launch = launch_reap if _reap_currency else launch_sum
+    # Sigma H IS the run peak; there is no flip transient beside it (A1-1/A1-3).
+    # #1350: ...but the RATCHET is beside it, and only here. `common` carries
+    # the both-moment charges; the flip's permanent step is subtracted from the
+    # RUN leftover alone, because at the launch moment no flip has happened.
+    # Measured on a dry run of this tree: charging it at both moments took the
+    # pinned M=150 arm from launch +4.50 to -0.19 GiB and moved the refusal
+    # from the run peak (W21) to the launch moment (W20) -- a true refusal
+    # under a false name.
+    run = common - host_ring_gib - (
+        0.0 if flip_ratchet is None else flip_ratchet.charged_gib
+    )
+    origin_gib, origin_source = run_origin_gib(
+        None if cg_nonreclaim_bytes is None else cg_nonreclaim_bytes / GIB,
+        measured_record,
+        reference_model_ok=reference_model_ok,
+        reference_model_why=reference_model_why,
+    )
+    arm = Arm(
+        s_gb=s_gb,
+        m_mib=m_mib,
+        ranks_per_group=ranks_per_group,
+        memtotal_bytes=memtotal_bytes,
+        memavail_bytes=memavail_bytes,
+    )
+    arm.terms = {
+        "memtotal_gib": memtotal_bytes / GIB,
+        "memavail_gib": memavail_bytes / GIB,
+        "cli_reserve_gib": CLI_RESERVE_GIB,
+        "base_gib": base_gib,
+        "base_meminfo_gib": base_meminfo_gib,
+        "base_cgroup_gib": base_cgroup_gib,
+        "base_source": base_source,
+        "cg_current_gib": (
+            None if cg_current_bytes is None else cg_current_bytes / GIB
+        ),
+        "cg_reclaimable_gib": (
+            None if reclaimable_bytes is None or cg_current_bytes is None
+            else max(0, min(int(reclaimable_bytes), int(cg_current_bytes))) / GIB
+        ),
+        "cg_nonreclaim_gib": (
+            None if cg_nonreclaim_bytes is None else cg_nonreclaim_bytes / GIB
+        ),
+        "cg_ceiling_gib": (
+            None if cg_ceiling_bytes is None else cg_ceiling_bytes / GIB
+        ),
+        "floor_gib": FLOOR_GIB,
+        # #1317n THE LABEL DEFECT, and it was in the very line this ticket
+        # repaired. `arm.terms` is built here as a FRESH literal -- it is NOT
+        # `charge_terms()`'s return -- so the `s_gb_d` key added there never
+        # reached the ARM line, which then printed `S_D==S` while the ring
+        # term proved S_D=4 (12.83 GiB is unreachable at S_D=1: (1.7778+3.0)
+        # x0.931323 = 4.45). A correct price with a wrong label, i.e. exactly
+        # the instrument-text class this fork keeps paying for: the boot agent
+        # could verify the VALUE only by inverting the ring arithmetic.
+        "s_gb_d": float(s_gb if s_gb_d is None else s_gb_d),
+        "heaps_gib": heaps_gib,
+        "d_only": bool(d_only),
+        "host_ring_gib": host_ring_gib,
+        "host_ring_span1_gib": host_ring_span1_gib,
+        # #1327: WHY the term is 0, so a reader never has to guess whether
+        # a zero means "no ring" or "no measurement". An unarmed gate must
+        # never be readable as a passed one.
+        "ring_absent_by_design": bool(ring_absent_by_design),
+        "image_p_gib": image_p_gib,
+        "image_d_gib": image_d_gib,
+        "image_p_source": images.p_source,
+        "image_d_source": images.d_source,
+        "image_p_measured": images.p_measured,
+        "image_d_measured": images.d_measured,
+        "weight_tags_p_gib": charges["weight_tags_p_gib"],
+        "weight_tags_d_gib": charges["weight_tags_d_gib"],
+        "image_extra_p_gib": images.extra_p_gib,
+        "image_extra_d_gib": images.extra_d_gib,
+        "run_origin_gib": origin_gib,
+        "run_origin_source": origin_source,
+        # #1317n the margin the worst-case launch gate measures against. The
+        # DEFAULT resolution, so `price()` alone can enforce the gate; `choose`
+        # may pass a different Margin, and it re-reads the same field.
+        "margin_total_gib": resolve_margin(
+            flip_ratchet_charged_gib=(
+                None if flip_ratchet is None else flip_ratchet.charged_gib
+            )
+        ).boot_total_gib,
+        "launch_worst_case_margin_gib": LAUNCH_WORST_CASE_MARGIN_GIB,
+        "launch_worst_case_margin_source": LAUNCH_WORST_CASE_MARGIN_SOURCE,
+        "load_transient_gib": LOAD_TRANSIENT_GIB,
+        "load_transient_pagecache_gib": LOAD_TRANSIENT_PAGECACHE_GIB,
+        "load_transient_anon_gib": LOAD_TRANSIENT_ANON_GIB,
+        "launch_leftover_sum_gib": launch_sum,
+        "launch_leftover_reap_gib": launch_reap,
+        "launch_currency": "reap" if _reap_currency else "memavailable",
+        "anchors_gib": anchors_gib,
+        "rings_gib": rings_gib,
+        "arena_gib": float(charges.get("arena_gib", 0.0) or 0.0),  # #1432: in the Arm's own terms, so the run peak carries it
+        "d_draft_host_gib": float(charges.get("d_draft_host_gib", 0.0) or 0.0),  # H25
+        "memhist_gib": float(charges.get("memhist_gib", 0.0) or 0.0),  # rc12d
+        "l3_index_gib": float(charges.get("l3_index_gib", 0.0) or 0.0),  # 28.09.
+        "memhist_run_only": bool(charges.get("memhist_run_only", False)),
+        "overhead_gib": overhead_gib,
+        # #1386: SAME LABEL DEFECT the #1317n comment above names for
+        # `s_gb_d` -- `arm.terms` is a fresh literal, not `charges` itself,
+        # so a key added only in `charge_terms`'s return would never reach
+        # here (or the ARM line, or a test reading `arm.terms`).
+        "hicache_disabled": bool(charges["hicache_disabled"]),
+        "draft_host_p_gib": draft_host_p_gib,
+        "draft_host_d_gib": draft_host_d_gib,
+        # #1273 S6.  THE KEY IS ALWAYS HERE, 0.0 on the ring arm, because
+        # ``_boot_charges_gib`` indexes it and ``predicted_run_peak_gib`` sums
+        # that -- a key that can be absent is how the three consumers this
+        # dict exists to reconcile would start disagreeing again.
+        "xchg_bounce_gib": charges["xchg_bounce_gib"],
+        # #1350. THE KEY IS ALWAYS HERE and its value is `None` when no
+        # measurement reached this arm -- the one spelling this module does not
+        # allow for an absence is `0.00`, because an unpriced term and a term
+        # priced at zero would then be the same line. The four companion fields
+        # are what the ARM line prints, so a reader can see per-flip, count,
+        # product and provenance without inverting the arithmetic.
+        "flip_ratchet_gib": charges["flip_ratchet_gib"],
+        "flip_ratchet_per_flip_gib": (
+            None if flip_ratchet is None else flip_ratchet.per_flip_gib
+        ),
+        "flip_ratchet_flips_priced": (
+            0 if flip_ratchet is None else int(flip_ratchet.flips_priced)
+        ),
+        "flip_ratchet_source": (
+            "ABSENT: no measurement was handed to price() -- NOT priced at 0"
+            if flip_ratchet is None else flip_ratchet.source
+        ),
+        "flip_ratchet_from_record": bool(
+            flip_ratchet is not None and flip_ratchet.from_record
+        ),
+        "store_draft_fraction": STORE_DRAFT_FRACTION,
+    }
+    arm.launch_leftover_gib = launch
+    arm.run_leftover_gib = run
+    return arm
+
+
+# --------------------------------------------------------------------------
+# FIX 8: measuring the dormant image instead of summing tags for it
+# --------------------------------------------------------------------------
+
+#: The sidecar this line writes its own measurements into, under the launcher's
+#: log directory.  There was NO such mechanism before fix 8: the fix-5/6/7
+#: constants are literals in this module carrying their boot and timestamp in a
+#: comment, which is honest but cannot close the loop -- a boot could not hand
+#: its successor a number.  The sidecar is that loop, and it stores WHO measured
+#: (commit, boot tag, timestamp), never a bare figure.
+MEASURED_RECORD_NAME = "weg2_measured_record.json"
+
+
+def read_flip_currency_gib(root: str = "/sys/fs/cgroup") -> Optional[float]:
+    """``anon + shmem + slab_unreclaimable`` in GiB, or ``None``.
+
+    #1350.  THE SAME THREE TERMS THE 1 Hz OPERATOR SAMPLER SUMS
+    (``gpu-arb/weg2/hostsample_weg2xsn*.csv``), so a ``flip_ratchet_gib``
+    written by the front and the CSV the term was attributed on are the SAME
+    quantity and can be diffed row against row.
+
+    Deliberately NOT :func:`read_cgroup_pressure`, whose preferred form is
+    ``memory.current - inactive_file - active_file``: that is the better
+    instrument for a LEVEL against the reap watermark (it nets out kernel terms
+    the sum misses), but the ratchet is a DIFFERENCE of two readings minutes
+    apart, and the page-cache half of ``memory.current`` moves between them for
+    reasons that have nothing to do with the flip.  Two readings of the sum
+    subtract cleanly; two readings that each carry a different page-cache
+    residue do not.  ``memory.current`` itself is forbidden outright (#1309).
+
+    ``None`` when ``memory.stat`` is unreadable -- an absence, which the record
+    stores as ``flip_ratchet_gib: None`` and the next arm refuses on (W94).
+    """
+    try:
+        st: Dict[str, int] = {}
+        with open(f"{root}/memory.stat") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    st[parts[0]] = int(parts[1])
+    except OSError:
+        return None
+    if not st:
+        return None
+    total = st.get("anon", 0) + st.get("shmem", 0) + st.get("slab_unreclaimable", 0)
+    if swap_aware():
+        # SWAP-AWARE (off by default): pages swapped out of this cgroup leave
+        # ``anon``/``shmem`` without being freed; count them back in.
+        total += read_swap_current_bytes(root) or 0
+    return total / GIB
+
+
+def read_cgroup_pressure(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[float]]:
+    """NON-RECLAIMABLE PRESSURE in GiB, with the raw reading beside it.
+
+    #1269 fix 3 -- the defect that refused boot weg2sb5b 28 GiB below danger.
+    ``memory.current`` counts RECLAIMABLE page cache, which the kernel drops
+    before it ever OOMs; the run-peak model is built from anon + shmem. The two
+    cannot be compared during a load, and sb5b is the proof (launcher memts,
+    host-wide /proc/meminfo terms):
+
+        peak 18:57:01Z  memory.current 96.94 GiB
+                      = anon 27.72 + shmem 40.50 (rings+store)
+                      + page cache excl. shmem 28.08 + ~0.64 slab/kernel
+        NON-RECLAIMABLE 68.86 GiB; max over the boot 78.26 GiB
+
+    and that 28 GiB of cache was ALREADY RESIDENT BEFORE THE BOOT -- pre-boot
+    28.53 -> peak 28.08, it FELL. Foreign, reclaimable, and nothing the
+    checkpoint load put there; the boot's own growth was 57.4 GiB and entirely
+    anon + shmem. Against the 87.30 GiB bound the honest figure had 9.04 GiB of
+    room while the raw reading breached by 9.64.
+
+    WHY THE WATERMARK CARRIES OVER UNCHANGED, as a derivation with its
+    assumption rather than an assertion: at a real reap the kernel has ALREADY
+    reclaimed the file cache -- that is what reclaim IS, and it runs before the
+    OOM killer -- so ``memory.current`` at the moment of the kill is already
+    ~pure non-reclaimable. dk5's own reap row bears this out: its
+    ``pagecache_ex_shmem`` is 28,916 kB = 0.03 GiB. So 95.90 / 96.06 are
+    already non-reclaimable readings and need no restatement.
+    ASSUMPTION: that dk6's row behaves as dk5's did. dk6's memory.stat was not
+    captured, so this is inference from ONE measured row, not two.
+
+    Preferred formula ``current - inactive_file - active_file`` (the two file
+    LRUs are exactly what reclaim walks). The sum form
+    ``anon + shmem + slab_unreclaimable + unevictable`` is the fallback when
+    those fields are absent, and is reported as such: it can differ from the
+    first by kernel-internal terms.
+    """
+    out: Dict[str, Optional[float]] = {
+        "current_gib": None,
+        "nonreclaim_gib": None,
+        "file_reclaimable_gib": None,
+        "anon_gib": None,
+        "shmem_gib": None,
+        "memfree_gib": None,
+        "source": None,
+    }
+    st: Dict[str, int] = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemFree:"):
+                    out["memfree_gib"] = int(line.split()[1]) * 1024 / GIB
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open(f"{root}/memory.stat") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    st[parts[0]] = int(parts[1])
+    except OSError:
+        st = {}
+    try:
+        with open(f"{root}/memory.current") as f:
+            out["current_gib"] = int(f.read().strip()) / GIB
+    except (OSError, ValueError):
+        pass
+    if st:
+        out["anon_gib"] = st.get("anon", 0) / GIB
+        out["shmem_gib"] = st.get("shmem", 0) / GIB
+        # The memts sampler dumps these column names per row from the next boot
+        # on; carrying them VERBATIM is what lets acceptance diff the guard's
+        # line against the sampler without a translation table.
+        for k in (
+            "file", "slab_reclaimable", "slab_unreclaimable",
+            "inactive_file", "active_file", "unevictable",
+        ):
+            out[f"{k}_gib"] = st[k] / GIB if k in st else None
+    if out["current_gib"] is not None and "inactive_file" in st and "active_file" in st:
+        filec = (st["inactive_file"] + st["active_file"]) / GIB
+        out["file_reclaimable_gib"] = filec
+        out["nonreclaim_gib"] = out["current_gib"] - filec
+        out["source"] = "memory.current - inactive_file - active_file"
+    elif st:
+        out["nonreclaim_gib"] = (
+            st.get("anon", 0)
+            + st.get("shmem", 0)
+            + st.get("slab_unreclaimable", 0)
+            + st.get("unevictable", 0)
+        ) / GIB
+        if out["current_gib"] is not None:
+            out["file_reclaimable_gib"] = out["current_gib"] - out["nonreclaim_gib"]
+        out["source"] = (
+            "anon+shmem+slab_unreclaimable+unevictable FALLBACK "
+            "(inactive_file/active_file absent; may differ by kernel-internal terms)"
+        )
+    else:
+        out["source"] = "memory.stat unreadable -- no non-reclaimable reading"
+    sw = read_swap_current_bytes(root)
+    out["swap_gib"] = sw / GIB if sw is not None else None
+    if swap_aware() and sw and out["nonreclaim_gib"] is not None:
+        # cgroup v2 ``memory.current`` does NOT count swapped-out pages: without
+        # this term a swapping cgroup reads as "headroom" it bought by paging
+        # its own working set to disk.
+        out["nonreclaim_gib"] = out["nonreclaim_gib"] + sw / GIB
+        out["source"] = f"{out['source']} + memory.swap.current ({SWAP_AWARE_ENV}=1)"
+    return out
+
+
+#: SWAP READINESS (2026-09-26, /spinning/gpu-arb/docs/SWAP_READINESS_0926.md).
+#: Every currency in this module assumes the serving cgroup CANNOT swap: then
+#: shmem is unevictable and ``anon + shmem`` / ``memory.current`` hold every
+#: page the boot owns.  That holds while the EFFECTIVE ``memory.swap.max`` of an
+#: ancestor is 0 (CT999 ``swap: 0``; Docker ``--memory-swap == --memory``) --
+#: NOT because ``SwapTotal`` is 0.  Once pages do get swapped out they leave
+#: ``anon``/``shmem``/``memory.current`` (v2 counts swap separately in
+#: ``memory.swap.current``) and every figure here turns OPTIMISTIC.
+#: ``FLLIPER_PDFLIP_SWAP_AWARE=1`` adds ``memory.swap.current`` back into the flip
+#: currency and the non-reclaimable pressure; default 0 = bit-identical to the
+#: swapless form.  ``memory.zswap.current`` is REPORTED only: zswapped pages
+#: already sit in ``memory.swap.current`` at their full size, adding the
+#: compressed pool too would count them twice.
+#: TRAP: inside CT999 the visible cgroup root (``/.lxc``) reads
+#: ``memory.swap.max = max`` although the effective limit on ``lxc/999`` is 0
+#: (read live 2026-09-26 20:17Z) -- the visible ``swap.max`` is never evidence
+#: that swap is allowed; ``memory.swap.current`` is what actually moved.
+SWAP_AWARE_ENV = "FLLIPER_PDFLIP_SWAP_AWARE"
+
+
+def swap_aware() -> bool:
+    """``True`` when ``FLLIPER_PDFLIP_SWAP_AWARE=1`` (default off)."""
+    return os.environ.get(SWAP_AWARE_ENV, "0").strip() == "1"
+
+
+def _read_cg_int(path: str) -> Optional[int]:
+    try:
+        with open(path) as f:
+            text = f.read().strip()
+    except OSError:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def read_swap_current_bytes(root: str = "/sys/fs/cgroup") -> Optional[int]:
+    """``memory.swap.current`` in bytes, ``None`` when the file is absent."""
+    return _read_cg_int(f"{root}/memory.swap.current")
+
+
+def read_swap_state(
+    root: str = "/sys/fs/cgroup", meminfo_path: str = "/proc/meminfo"
+) -> Dict[str, Optional[object]]:
+    """The swap facts, raw: meminfo SwapTotal/SwapFree (bytes), this cgroup's
+    ``memory.swap.current`` / ``memory.zswap.current`` (bytes) and the VISIBLE
+    ``memory.swap.max`` as its text (``"max"`` is not evidence, see above).
+    Absent terms are ``None``, never 0."""
+    out: Dict[str, Optional[object]] = {
+        "swap_total": None, "swap_free": None,
+        "swap_current": read_swap_current_bytes(root),
+        "zswap_current": _read_cg_int(f"{root}/memory.zswap.current"),
+        "swap_max_visible": None,
+    }
+    try:
+        with open(meminfo_path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] in ("SwapTotal:", "SwapFree:"):
+                    key = "swap_total" if parts[0] == "SwapTotal:" else "swap_free"
+                    out[key] = int(parts[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(f"{root}/memory.swap.max") as f:
+            out["swap_max_visible"] = f.read().strip()
+    except OSError:
+        pass
+    return out
+
+
+def swap_state_line(
+    root: str = "/sys/fs/cgroup", meminfo_path: str = "/proc/meminfo"
+) -> Tuple[str, bool]:
+    """``(line, warn)`` for the preflight log.  ``warn`` is ``True`` when this
+    cgroup HAS swapped pages out (``memory.swap.current > 0``): the swapless
+    assumption of every currency in this module no longer carries."""
+    st = read_swap_state(root, meminfo_path)
+
+    def _g(v: Optional[object]) -> str:
+        return "absent" if v is None else f"{int(v) / GIB:.2f}"  # type: ignore[arg-type]
+
+    sc = st["swap_current"]
+    warn = sc is not None and int(sc) > 0  # type: ignore[arg-type]
+    line = (
+        f"PDFLIP-HOST SWAP: SwapTotal={_g(st['swap_total'])} GiB "
+        f"SwapFree={_g(st['swap_free'])} GiB "
+        f"cg swap.current={_g(sc)} GiB zswap.current={_g(st['zswap_current'])} GiB "
+        f"swap.max(visible)={st['swap_max_visible'] or 'absent'} "
+        f"{SWAP_AWARE_ENV}={'1' if swap_aware() else '0'}"
+    )
+    if warn:
+        line += (
+            " -- WARN: this cgroup HAS swapped pages out; the ledger's swapless "
+            "currency (anon+shmem, memory.current) under-reads by that amount"
+            + ("" if swap_aware() else f" (set {SWAP_AWARE_ENV}=1 to count it)")
+        )
+    return line, warn
+
+
+def read_cgroup_anon_bytes(root: str = "/sys/fs/cgroup") -> Optional[int]:
+    """``memory.stat anon`` in bytes, or ``None`` when unreadable.
+
+    The denominator :func:`measure_foreign_anon` splits: anon is the currency
+    the idle grower (#1269) and the desk load both move in, while the store and
+    the host ring sit in ``shmem`` and are flat.
+    """
+    try:
+        with open(f"{root}/memory.stat") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == "anon" and parts[1].isdigit():
+                    return int(parts[1])
+    except OSError:
+        return None
+    return None
+
+
+def read_cgroup_shmem_bytes(root: str = "/sys/fs/cgroup") -> Optional[int]:
+    """``memory.stat shmem`` in bytes, or ``None`` when unreadable.
+
+    This is the whole-cgroup figure the dk7 sampler measured 48.33 GiB of, and
+    it equals ``/proc/meminfo Shmem`` to the byte on this box (see
+    :data:`CGROUP_V2_FILE_INCLUDES_SHMEM_PROOF`).
+    """
+    try:
+        with open(f"{root}/memory.stat") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == "shmem" and parts[1].isdigit():
+                    return int(parts[1])
+    except OSError:
+        return None
+    return None
+
+
+def rss_shmem_bytes(pids: Iterable[int]) -> Tuple[int, List[int]]:
+    """Sum ``RssShmem`` over the given pids; return (bytes, the pids that answered).
+
+    ``RssShmem`` is where the TMS CPU backup IS visible: it is anonymous
+    ``MAP_SHARED``, so it has NO backing file and ``df``/``du`` on /dev/shm show
+    nothing (dk7: 44.56 GiB of 48.33 GiB of cgroup shmem had no file).  A pid
+    that has exited between the listing and the read is skipped and NOT counted
+    as zero -- the returned pid list is the denominator of the sum.
+    """
+    total = 0
+    seen: List[int] = []
+    for pid in pids:
+        try:
+            with open(f"/proc/{int(pid)}/status") as f:
+                text = f.read()
+        except OSError:
+            continue
+        m = re.search(r"^RssShmem:\s+(\d+) kB", text, re.M)
+        if m is None:
+            continue
+        total += int(m.group(1)) * 1024
+        seen.append(int(pid))
+    return total, seen
+
+
+def _cg_oom_kill_now() -> Optional[int]:
+    """``memory.events oom_kill`` for this cgroup, or ``None`` if unreadable.
+
+    #1361 [22-fix5]. THROUGH :func:`read_cgroup`, not through a second open()
+    of the same file: the PRIOR-ART GATE on this symbol found that the launcher
+    already reads this counter (`cg["oom_kill"]` -> `choose(cg_oom_kill=...)`,
+    printed as `oom_kill_baseline=` on the TERMS line). That reader is the
+    incumbent and this is a different MOMENT, not a different quantity -- the
+    launcher takes the pre-boot baseline, this takes the value at each group's
+    sleep, and the front writes D's sample in another process entirely, where
+    the launcher's baseline does not exist. Same file, same parse, one
+    implementation; a second regex over /sys would be the second bookkeeping
+    this fork keeps paying for.
+
+    ``None`` is an UNREADABLE counter and never a zero: a sample that could not
+    read it carries no evidence either way, and the reader treats it as "not
+    shown to be healthy", not as "shown to be fine".
+    """
+    try:
+        return read_cgroup().get("oom_kill")
+    except Exception:  # noqa: BLE001 - a sample must never fail to be written
+        return None
+
+
+def dormant_image_sample(
+    *,
+    group: str,
+    shmem_before_bytes: Optional[int],
+    shmem_after_bytes: Optional[int],
+    pids: Sequence[int],
+    weight_tags_gib: float,
+    interleaved: bool,
+    boot_tag: str,
+    commit: str,
+    at: Optional[str] = None,
+    cg_current_bytes: Optional[int] = None,
+    reclaimable_bytes: Optional[int] = None,
+    arm: Optional[Dict[str, float]] = None,
+    ranks_per_group: int = 3,
+    load_witness: Optional[Dict[str, int]] = None,
+    # #1350: the flip epoch this sample was taken IN, or None when it was not
+    # taken during a flip (the launcher's first sleep of P, before any flip
+    # exists). It is stored so `run_origin_gib` can say whether the floor it
+    # chose already CONTAINS the ratchet -- see `PdFlipHostRatchetDoubleCharged`.
+    sampled_at_flip_epoch: Optional[int] = None,
+    # #1362: WHICH MODEL these bytes are. Every host figure this line records
+    # was measured on the 27B and none of them said so, which is how a 7.48 GiB
+    # model would have been handed a 47 GiB ring.
+    model_digest_: str = "",
+    vram_residue_mib: Optional[Dict[str, int]] = None,
+    vram_residue_form: str = "",
+    vram_residue_capture_bs: Optional[int] = None,
+) -> Dict[str, object]:
+    """One group's dormant image, measured at its FIRST sleep.  Pure but for /proc.
+
+    TWO INSTRUMENTS, and they are not interchangeable:
+
+    * ``rss_shmem_gib`` -- the sum of the now-sleeping group's per-rank
+      ``RssShmem``.  This is the AUTHORITY and the term the ledger charges;
+    * ``shmem_delta_gib`` -- the cgroup ``shmem`` delta across the sleep.  A
+      CROSS-CHECK, and ``interleaved`` says when it is confounded: during a
+      flip the destination group is RESUMING (its own image is being freed by
+      the patched saver) while the source sleeps, so the delta is the
+      difference of two images and NOT this group's image.  The launcher's
+      first sleep of P is un-interleaved (D does not exist yet) and there the
+      two instruments are comparable.
+
+    ``run_residual_gib`` is derived only when the caller supplies the run
+    moment (a cgroup reading and the arm): what the box holds that this
+    ledger's term list does not name.  ``None`` with a stated reason
+    otherwise -- never 0.
+
+    #1236 REMOVED THE STORE FROM THIS SUBTRACTION, and it is the same finding
+    as in :meth:`Arm.predicted_run_peak_gib`, one layer down.  The store used
+    to be a tmpfs, so its content WAS inside ``cg_current_bytes`` as
+    un-evictable ``shmem`` and subtracting it was correct.  It is a directory
+    on the ZFS dataset now: its bytes are not in this cgroup at all, so
+    subtracting them would credit the residual with memory the reading never
+    contained and make an unexplained term look explained.  The caller's
+    ``store_used_bytes`` argument went with it -- on a shared dataset the
+    ``statvfs`` that produced it reports the WHOLE root filesystem's usage,
+    which is not this store and never was this quantity.
+    """
+    delta = (
+        None
+        if shmem_before_bytes is None or shmem_after_bytes is None
+        else (int(shmem_after_bytes) - int(shmem_before_bytes)) / GIB
+    )
+    rss, seen = rss_shmem_bytes(pids)
+    rss_gib = rss / GIB
+    residual: Optional[float] = None
+    # Initialised here and not only in the branch below: the record's
+    # `residual_charges_gib` reads it, and a name that exists on exactly one
+    # path is a NameError waiting for the next editor (#1326).
+    _charges_gib: Optional[float] = None
+    residual_note = ""
+    if cg_current_bytes is None or arm is None:
+        residual_note = (
+            "not the run moment (need a cgroup reading and the arm); NOT derived, "
+            "and not 0"
+        )
+    else:
+        reclaim = 0 if reclaimable_bytes is None else max(
+            0, min(int(reclaimable_bytes), int(cg_current_bytes))
+        )
+        nonreclaim_gib = (int(cg_current_bytes) - reclaim) / GIB
+        images = ImageTerms(
+            p_gib=rss_gib, d_gib=rss_gib, p_source="this sample", d_source="this sample",
+            p_measured=True, d_measured=True, extra_p_gib=0.0, extra_d_gib=0.0,
+        )
+        # #1325: THE SUBTRACTION MUST BE IN THE CURRENCY THE BOOT ACTUALLY RAN.
+        # This call omitted `s_gb_d`, so on a two-budget boot it subtracted the
+        # rings of an S_D == S arm while the boot held S_D=4 of them -- and the
+        # unsubtracted difference landed in `run_residual_gib`, i.e. in the one
+        # quantity whose entire definition is "what the box holds that this
+        # ledger's term list does NOT name". The ledger then adds those same
+        # rings back at prediction time, so they are charged twice.
+        #
+        # MEASURED with charge_terms itself, sn6s's arm (S=1 M=600 S_D=4,
+        # ranks=3): boot charges 24.5047 GiB without `s_gb_d` against 33.2219
+        # with it -- 8.7172 GiB under-subtracted. sn6s's recorded run residual
+        # of 16.34 GiB corrects to 7.62, BELOW sn6p's idle 9.01, so
+        # `run_origin_gib`'s max() keeps 9.01 and the arm prices exactly as it
+        # did when (g) passed. The uncorrected 16.34 is what predicts
+        # run_peak 92.53 against the 87.30 boot bound and fires W21
+        # PdFlipHostRunPeakRefused on EVERY dry run of this form.
+        #
+        # `arm` carries the key already (`price()` writes `s_gb_d` into its
+        # terms, host_ledger.py:1778), so nothing new is measured or plumbed --
+        # a value that was present at the call site was simply not passed.
+        # `.get` and not `[...]`: a pre-#1325 arm dict has no such key and must
+        # keep its single-budget subtraction, which is byte-identical because
+        # `charge_terms` defaults `_s_d` to `s_gb`.
+        #
+        # #1326 (the S6c merge): THE XCHG BOUNCE IS THE SECOND TERM OF THE SAME
+        # DEFECT, and it had to be added here in the same breath rather than
+        # left for a later ticket. `xchg_bounce_gib` is an ARM charge -- it is
+        # summed by `_boot_charges_gib` and added back by
+        # `predicted_run_peak_gib` -- so an armed boot whose sampler did not
+        # subtract it leaves the deposit inside `run_residual_gib` and the
+        # ledger charges it TWICE at the run moment, exactly as it did with D's
+        # rings. Nothing about the bounce being small makes that safe: the
+        # error is structural, not proportional. ONE currency, both terms, one
+        # signature (`charge_terms(..., s_gb_d=, xchg_bounce_host_bytes=)`) and
+        # one call path -- there is deliberately no second sampler arm for the
+        # armed case.
+        _arm_s_d = arm.get("s_gb_d")
+        _arm_bounce_bytes = int(round(float(arm.get("xchg_bounce_gib", 0.0) or 0.0) * GIB))
+        charges = charge_terms(
+            int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images,
+            s_gb_d=None if _arm_s_d is None else int(_arm_s_d),
+            xchg_bounce_host_bytes=_arm_bounce_bytes,
+            # #1350 EXPLICIT 0.0, AND IT IS THE OPPOSITE DIRECTION TO THE TWO
+            # TERMS ABOVE. S_D and the bounce had to be ADDED here because they
+            # are arm charges the ledger adds back at prediction time. The
+            # ratchet must NOT be subtracted here for exactly the same reason
+            # read the other way round: this residual becomes the origin FLOOR
+            # (`run_origin_gib`), and the prediction adds the ratchet ON TOP of
+            # that origin. Subtracting it here and adding it there would make
+            # the term cancel itself, and the under-prediction #1350 names would
+            # survive the fix. What the FLOOR then carries instead is guarded by
+            # `sampled_at_flip_epoch` below and refused by W95.
+            flip_ratchet_gib=0.0,
+        )
+        # STORED, so the reader never has to GUESS which currency wrote a
+        # record (#1326). `record_run_residual_gib` re-prices records that are
+        # already on disk, and it can only do that soundly if it knows the sum
+        # the writing sampler actually subtracted. Reconstructing that from the
+        # arm means encoding "which version of this function ran", which is a
+        # guess that goes stale on the next currency change -- and this is the
+        # second currency change in one day. A record that carries the figure
+        # needs no version inference at all: correction = stored_charges -
+        # correct_charges, and it is 0 for a record already in its own currency.
+        _charges_gib = _boot_charges_gib(charges)
+        residual = nonreclaim_gib - _charges_gib - rss_gib
+        residual_note = (
+            f"nonreclaimable {nonreclaim_gib:.2f} minus this boot's own charges "
+            f"{_charges_gib:.2f} (at S={int(arm['s_gb'])} "
+            f"S_D={int(_arm_s_d) if _arm_s_d is not None else int(arm['s_gb'])} "
+            f"M={int(arm['m_mib'])}, rings={charges['rings_gib']:.2f}, "
+            f"xchg_bounce={charges['xchg_bounce_gib']:.2f}) minus the "
+            f"measured image {rss_gib:.2f} (#1325/#1326: the subtraction carries "
+            f"S_D AND the xchg bounce; omitting either left an arm charge inside "
+            f"the residual, to be charged again at the run moment)"
+        )
+    return {
+        "group": group,
+        "at": at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "boot_tag": boot_tag,
+        "commit": commit,
+        "shmem_before_bytes": shmem_before_bytes,
+        "shmem_after_bytes": shmem_after_bytes,
+        "shmem_delta_gib": delta,
+        "rss_shmem_gib": rss_gib,
+        # #1350: WHEN, relative to the flips, this sample was taken. The
+        # run-moment residual of a sample taken during or after the first flip
+        # pair ALREADY CONTAINS the ratchet (measured: `stored=` walks
+        # 2.31 -> 2.34 -> 4.09 -> 5.28 over the 0912 boots), so a prediction
+        # that uses it as its origin AND charges `flip_ratchet_gib` would count
+        # the same bytes twice. `None` = not during a flip.
+        "sampled_at_flip_epoch": (
+            None if sampled_at_flip_epoch is None else int(sampled_at_flip_epoch)
+        ),
+        # #1362: the model these bytes belong to. Empty on records written
+        # before this commit -- and an EMPTY digest is an UNKNOWN model, never a
+        # matching one: the consumers treat it as "cannot be shown to be the
+        # same" and refuse rather than assume the tree's incumbent.
+        "model_digest": str(model_digest_ or ""),
+        "weight_tags_gib": weight_tags_gib,
+        "extra_gib": rss_gib - weight_tags_gib,
+        "pids": seen,
+        "pids_asked": [int(p) for p in pids],
+        # #1361 [22-fix5]: THE KILL COUNTER AT THE SAMPLING MOMENT, read here
+        # rather than passed in, so no caller has to be taught and no sample can
+        # be written without it. Absolute, not a delta: the sidecar is
+        # append-only, so a reader compares this boot's successive samples and
+        # sees a kill that happened BETWEEN them. A delta against a baseline the
+        # record does not carry would be a number nobody can check.
+        "cg_oom_kill": _cg_oom_kill_now(),
+        "interleaved": bool(interleaved),
+        "cg_current_bytes": cg_current_bytes,
+        "arm": arm,
+        "run_residual_gib": residual,
+        "run_residual_note": residual_note,
+        # #1326: THE SUM THIS SAMPLER SUBTRACTED, so a reader can re-price the
+        # record without inferring which version of this function wrote it.
+        # None when no run moment was available (the residual is None too).
+        "residual_charges_gib": _charges_gib,
+        # #1325: WHAT THE BOX WAS DOING WHEN THIS WAS SAMPLED, and WHICH
+        # SERVING FORM it speaks for. Both RECORDED, neither yet a selector of
+        # a different number -- and that ordering is deliberate. The reading
+        # itself was wrong (the S_D subtraction above), and a load-class or
+        # form-key rule layered on top of a wrong reading would have priced a
+        # corrected sample by a rule built for the uncorrected one.
+        #
+        # `load_class` is MEASURED, never inferred from the clock: the front
+        # passes the queue depth and the in-flight count it already holds at
+        # the sampling moment, and anything above zero is `loaded`. A sample
+        # taken at a flip under load is `loaded` by construction, which is
+        # exactly the sn6s case (its record was taken at 15:21:55Z, mid-load).
+        # `unknown` when no witness was passed -- never `idle`, because an
+        # absent witness is not a quiet box.
+        #
+        # `form_key` names the terms that fix the HOST posten and are
+        # independent of the arm being priced: the ranks per group and the
+        # measured weight-tag sum. It deliberately does NOT include the arm --
+        # the residual is already arm-normalised by the subtraction above, so
+        # keying selection on the arm would be circular (you would need the arm
+        # to find the record that prices the arm). Shadow/exchange forms do not
+        # change either term, so they share a key, which is what the operator's
+        # reading of the form requires.
+        "load_class": (
+            "unknown"
+            if not load_witness
+            else (
+                "loaded"
+                if sum(int(v or 0) for v in load_witness.values()) > 0
+                else "idle"
+            )
+        ),
+        "load_witness": dict(load_witness or {}),
+        "form_key": f"ranks={int(ranks_per_group)};wtags={weight_tags_gib:.2f}",
+        # #1444: the DEVICE-axis residue of this group at this sleep (NVML
+        # per-process MiB per card uuid) and the weight form it was measured
+        # under, so the next boot prices the MEASURED residue instead of a
+        # constant (launcher.dc_residue_from_record).  Empty when the caller
+        # measured none.
+        "vram_residue_mib": {str(k): int(v) for k, v in (vram_residue_mib or {}).items()},
+        "vram_residue_form": str(vram_residue_form or ""),
+        # RC1 (24.09.): the residue is a function of the group's CAPTURE SET
+        # too -- group D's --max-running-requests sizes the CUDA graphs that
+        # stay resident through its sleep (xsn439 at 32: 3206/2742/2740 MiB,
+        # at 6: 2096/1512/1512) -- so a D sample names it, and the launcher
+        # prices only a sample of its own capture set
+        # (launcher.d_residue_record_accept). Absent when not given.
+        **({"vram_residue_capture_bs": int(vram_residue_capture_bs)}
+           if vram_residue_capture_bs is not None else {}),
+    }
+
+
+def format_dormant_image(rec: Dict[str, object]) -> str:
+    """The one log line the next boot's ledger reads its image term from."""
+    delta = rec.get("shmem_delta_gib")
+    return (
+        f"PDFLIP DORMANT-IMAGE group={rec['group']} "
+        f"shmem_delta_gib={'unreadable' if delta is None else f'{float(delta):.2f}'} "
+        f"rss_shmem_gib={float(rec['rss_shmem_gib']):.2f} "
+        f"weight_tags_gib={float(rec['weight_tags_gib']):.2f} "
+        f"extra_gib={float(rec['extra_gib']):.2f} "
+        f"(pids {rec['pids']} of {rec['pids_asked']}; "
+        + (
+            "INTERLEAVED: the shmem delta is confounded -- the destination group was "
+            "resuming (freeing its own image) while this one slept, so only "
+            "rss_shmem_gib measures THIS group's image"
+            if rec.get("interleaved")
+            else "un-interleaved: no other group was resuming, so the two instruments "
+            "are comparable"
+        )
+        + "; run_residual_gib="
+        + (
+            f"{float(rec['run_residual_gib']):.2f}"
+            if rec.get("run_residual_gib") is not None
+            else f"none ({rec.get('run_residual_note', '')})"
+        )
+        + f"; boot {rec['boot_tag']} @ {rec['commit']} at {rec['at']})"
+    )
+
+
+def read_measured_record(
+    path: str,
+    boot_tag: Optional[str] = None,
+    accept: Optional[Callable[[dict], bool]] = None,
+) -> Dict[str, dict]:
+    """The newest entry per group from the sidecar, or ``{}``.
+
+    A malformed or missing file is an ABSENCE -- the ledger then prices the
+    named dk7 reading and says so -- never a silent zero.
+
+    ``boot_tag`` RESTRICTS THE ANSWER TO ONE BOOT'S SAMPLES, and #1264 (B) is
+    why the parameter exists. This sidecar is APPEND-ONLY across boots, so
+    "the newest entry" is a sample from whatever booted last -- while the
+    consumer that corrects it (:func:`non_backup_host_bytes`, fed by the arm
+    that :func:`ring_table.parse_chosen_arm` reads out of the SOURCE boot's own
+    front log) is keyed to a different boot entirely. Measured drift from that
+    mispaired join, three consecutive solves of the SAME source boot weg2rg6:
+    the nvml2 residual read 118.2 -> 901.2 -> 1344.2 MiB.
+
+    It is a RATCHET, not noise. The sample is the sleeping group's whole
+    ``RssShmem``, which includes the host ring's own MAP_SHARED pages; a bigger
+    ring makes a bigger sample, which sizes a bigger ring for the next boot.
+    Boot weg2t2a measured ``extra_gib`` 7.474, weg2t2b 8.995, on identical
+    ``weight_tags_gib`` 28.834. That is what walked Sigma span1 +2755 MiB
+    between two boots that were supposed to differ only in an idle census, took
+    the ledger from M=1200 to M=600, and left 0.74 GiB to the reap watermark.
+
+    Passing the tag makes sample and correction ONE boot's pair, which is what
+    the correction was always documented to be, and makes a re-solve from the
+    same source deterministic forever.
+
+    ``accept`` (PDFLIP-FORM, 24.09.) RESTRICTS THE ANSWER TO ONE CALIBRATION
+    IDENTITY -- in practice ``pdflip_form.same_model_sample``: the sidecar is
+    shared by every model this rig boots, and "the newest entry" handed a
+    Qwen3.8-27B boot the Next-Flash boot fnFL2x142's D residue and run sample
+    (xsn417). ``None`` (every caller before the form) keeps today's answer.
+    """
+    out: Dict[str, dict] = {}
+    for g, e in _measured_entries(path, boot_tag, accept):
+        if g not in out or str(e.get("at", "")) >= str(out[g].get("at", "")):
+            out[g] = e
+    return out
+
+
+def read_measured_records(
+    path: str,
+    group: str,
+    accept: Optional[Callable[[dict], bool]] = None,
+) -> List[dict]:
+    """EVERY entry of one group from the sidecar, oldest first, through the
+    same filter as :func:`read_measured_record` (entry shape, calibration
+    identity ``accept``). A malformed or missing file is an ABSENCE: ``[]``.
+
+    D-EXPECT (29.09.): the D expectation budget prices group P's dormant VRAM
+    residue as the MAXIMUM over the newest boots, not the newest one -- a
+    lucky low sample must not size the D form too large (27B review)."""
+    rows = [e for g, e in _measured_entries(path, None, accept) if g == str(group)]
+    rows.sort(key=lambda e: str(e.get("at", "")))
+    return rows
+
+
+def _measured_entries(
+    path: str,
+    boot_tag: Optional[str],
+    accept: Optional[Callable[[dict], bool]],
+):
+    """The one filter loop of the sidecar readers: ``(group, entry)`` pairs."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    entries = data.get("samples") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return
+    for e in entries:
+        # #1350: TWO ENTRY SHAPES, ONE READER. An image entry carries
+        # `rss_shmem_gib`; the flip-ratchet entry (group "FLIP", written by the
+        # front at `PDFLIP-FLIP done epoch=2`) carries `flip_ratchet_gib` and no
+        # image. Admitting the second here is what makes the ratchet readable
+        # by "the same reader that reads run_origin_gib" instead of adding a
+        # second sidecar reader beside this one. The two consumers stay
+        # separated by their own fields, not by this filter:
+        # `resolve_image_terms` reads only the "P"/"D" keys and
+        # `run_origin_gib` only entries carrying `run_residual_gib`, so neither
+        # can see the other's rows.
+        # KEY PRESENCE, not a non-None value: a boot that reached
+        # `done epoch=2` with an unreadable memory.stat writes the entry with
+        # `flip_ratchet_gib: None`, and that entry is EVIDENCE -- it lets the
+        # W94 refusal name the boot that could not measure instead of reporting
+        # the same emptiness as a boot that never flipped.
+        if not isinstance(e, dict) or (
+            e.get("rss_shmem_gib") is None and "flip_ratchet_gib" not in e
+        ):
+            continue
+        g = str(e.get("group", ""))
+        if not g:
+            continue
+        if boot_tag is not None and str(e.get("boot_tag", "")) != boot_tag:
+            continue
+        if accept is not None and not accept(e):
+            continue
+        yield g, e
+
+
+#: #1377 W11: where the v3 sampler's CSV is, published by whoever ARMS the
+#: sampler (the arm script), read by whoever writes the record. ONE name, so
+#: the path convention `<evidence>/<tag>_<date>/hostsample_<tag>.csv` is never
+#: re-derived in a second place -- re-deriving it is how a reader and a writer
+#: come to disagree about which boot they are describing.
+ENV_HOSTSAMPLE_CSV = "PDFLIP_HOSTSAMPLE_CSV"
+
+
+def cushion_min_and_reason(csv_path: str) -> Tuple[Optional[float], str]:
+    """The MINIMUM cushion of one boot, WITH its provenance.
+
+    #1378 Posten 4: the value and the reason come from ONE reading -- a
+    caller that wanted both would otherwise read the file twice, and the two
+    readings could disagree. Four cases, each NAMED:
+
+    * csv_path empty -> the sampler was never armed for this boot
+      (``PDFLIP_HOSTSAMPLE_CSV`` unset). This was every FLIP record's state
+      until 2026-09-14: the field existed (91d6df2e50), the env was never
+      published, and the record said null with no reason on any line.
+    * file unreadable -> the sampler was armed but wrote nothing readable
+      (the launcher publishes the path at launch, the sampler writes during
+      the boot, so an absent file at flip-done is possible and must say so).
+    * file readable but no usable ``cushion_gib`` column -> a pre-v3 sampler
+      output; named so a reader does not mistake it for "armed, flat line".
+    * values present -> the minimum and how many samples produced it.
+
+    None, never 0.0, for every absence: a missing measurement must not read
+    as "no cushion left", which would make the cross-boot gate look armed
+    while it reads nothing. The null in the RECORD stays (it is the honest
+    float answer); the NAMING is the reason string beside it, which the
+    front prints on the PDFLIP-FLIP-RATCHET line.
+    """
+    if not csv_path:
+        return None, ("sampler not armed: PDFLIP_HOSTSAMPLE_CSV is not set in "
+                      "this process's environment")
+    try:
+        import csv as _csv
+
+        with open(csv_path, newline="") as fh:
+            rows = list(_csv.DictReader(fh))
+    except OSError as e:
+        return None, f"hostsample CSV unreadable at {csv_path}: {e}"
+    vals: List[float] = []
+    for r in rows:
+        raw = str(r.get("cushion_gib", "")).strip()
+        if raw in ("", "n/a"):
+            continue
+        try:
+            vals.append(float(raw))
+        except ValueError:
+            continue
+    if not vals:
+        return None, (f"hostsample CSV carries no usable cushion_gib column: "
+                      f"{csv_path}")
+    v = min(vals)
+    return v, (f"cushion_min={v:.3f} GiB over {len(vals)} samples from "
+               f"{csv_path}")
+
+
+def cushion_min_of_this_boot() -> Tuple[Optional[float], str]:
+    """This boot's cushion minimum and its named provenance, ONE reading.
+
+    The value is None when the sampler was not armed or its output carries
+    no usable column -- a first-class answer: a boot without the sampler has
+    no cushion measurement, and the arm must say "not measurable" rather
+    than fund on an invented one or refuse on a zero. The REASON is the
+    second half of the answer and is not optional: the front prints it on
+    the PDFLIP-FLIP-RATCHET line, so a null in the record always has its case
+    named beside it.
+    """
+    return cushion_min_and_reason(os.environ.get(ENV_HOSTSAMPLE_CSV, ""))
+
+
+def cushion_min_from_sampler(csv_path: str) -> Optional[float]:
+    """#1377 W11: the MINIMUM cushion of one boot, out of the v3 sampler's own
+    column, or None when the file cannot supply it.
+
+    `cushion_gib` is `file - shmem`, a FLOW, and the minimum over a boot is the
+    only reduction that answers the question the latch asks ("did this boot
+    ever get within the floor"). A mean would hide exactly the dip that fires
+    W98, and a last-sample reading would hide it whenever the boot recovered.
+
+    None, never 0.0, when the column is absent or unparsable: a missing
+    measurement must not read as "no cushion left", which would refuse every
+    arm on a box whose sampler was not armed.
+
+    Value-only view of :func:`cushion_min_and_reason` -- use that one when
+    the reason matters (it is what the front prints).
+    """
+    return cushion_min_and_reason(csv_path)[0]
+
+
+def cushion_headroom_gib(cushion_min_gib: Optional[float],
+                         bounce_now_gib: float,
+                         bounce_then_gib: float) -> Optional[float]:
+    """What the NEXT boot's cushion will be, given how the bounce grew.
+
+    THE W11 ARITHMETIC, and it is NOT `predicted_peak + floor <= bound`. That
+    form was measured against both boots and funds them BOTH:
+        xsn31/2  90.66 + 1.50 = 92.16 <= 94.43 -> funds
+        xsn31/3  90.66 + 1.50 = 92.16 <= 94.43 -> funds  (and W98 fired)
+    The quantity that separates them is the cushion, because what consumed it
+    is PINNED SHM and not predicted peak:
+        xsn31/2 cushion_min 6.99  -  bounce growth (15.75 - 7.79 = 7.96)
+          = -0.97  <  floor 1.50   (the boot then measured cushion=0.20)
+
+    None in, None out: without a recorded cushion there is no prediction, and
+    the caller must say "not measurable" rather than invent one.
+    """
+    if cushion_min_gib is None:
+        return None
+    return float(cushion_min_gib) - (float(bounce_now_gib) - float(bounce_then_gib))
+
+
+def flip_ratchet_candidates(
+    path: str, form_key: str, accept: Optional[Callable[[dict], bool]] = None,
+) -> List[Dict[str, object]]:
+    """Every "FLIP" sidecar entry of the given FORM, in file order.
+
+    #1378 Stage 2 order: NOT :func:`read_measured_record`, which collapses to
+    the newest entry PER GROUP -- exactly the shortcut #1308 named as the
+    cause of two lost boots ("the newest record regardless of shape" let a
+    ring-table default pick an xchg-shadow boot's row). This reader keeps
+    every candidate so the caller can choose among them explicitly, and
+    matches ``form_key`` EXACTLY: a candidate of a different shape measures a
+    different weight-tag layout and is not a comparable prior boot.
+
+    A candidate missing either ``cushion_min_gib`` or ``xchg_bounce_gib``
+    (an older record, an unreadable sampler, a ring arm never threaded
+    through) is dropped -- the caller needs BOTH from the SAME boot, or
+    neither: mixing one candidate's cushion with a different boot's bounce
+    would compare two boots that never coexisted.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    entries = data.get("samples") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    out: List[Dict[str, object]] = []
+    for e in entries:
+        if not isinstance(e, dict) or str(e.get("group", "")) != "FLIP":
+            continue
+        if str(e.get("form_key", "")) != form_key:
+            continue
+        if e.get("cushion_min_gib") is None or e.get("xchg_bounce_gib") is None:
+            continue
+        # H87: `form_key` is `wtags=<N>` -- a weight-tag COUNT, which two
+        # checkpoints share by accident. The caller's model predicate (the
+        # same one `read_measured_record` takes) keeps another model's cushion
+        # out. None = every candidate, as before.
+        if accept is not None and not accept(e):
+            continue
+        out.append(e)
+    return out
+
+
+def resolve_prior_cushion(
+    path: str, form_key: str, accept: Optional[Callable[[dict], bool]] = None,
+) -> Tuple[Optional[float], Optional[float], str]:
+    """#1378 Stage 2: the PRIOR boot's own numbers, SELF-read from the
+    sidecar -- no operator has to type them.
+
+    THE MINIMUM, NOT THE NEWEST, over every candidate of THIS form (order
+    item 2). The direction is asymmetric: a prior cushion read too LOW
+    tightens the next boot's gate (safe -- it may refuse an arm that would
+    have been fine); a prior cushion read too HIGH loosens it (unsafe -- a
+    boot that happened to measure a slack cushion would soften every boot
+    after it, the #782 ratchet-from-the-free-column class, here in the
+    threshold direction rather than the capacity one). Taking the minimum
+    over all candidates of this form is the one reduction that cannot be
+    loosened by a lucky boot.
+
+    Returns ``(cushion_min_gib, bounce_gib, provenance)``. Both ``None``
+    with a NAMED reason when no candidate of this form exists -- never a
+    silent guess, and never a refusal: the caller's own "not measured" line
+    is what an absent auto-resolution produces.
+    """
+    candidates = flip_ratchet_candidates(path, form_key, accept=accept)
+    if not candidates:
+        return None, None, (
+            f"auto-resolve found no measured FLIP record of form_key="
+            f"{form_key!r} in {path} -- cannot self-read a prior boot's "
+            "cushion for this form"
+        )
+    winner = min(candidates, key=lambda e: float(e["cushion_min_gib"]))
+    return (
+        float(winner["cushion_min_gib"]),
+        float(winner["xchg_bounce_gib"]),
+        f"auto-resolved boot_tag={winner.get('boot_tag', '?')} "
+        f"form_key={form_key!r} cushion_min="
+        f"{float(winner['cushion_min_gib']):.2f} GiB bounce="
+        f"{float(winner['xchg_bounce_gib']):.2f} GiB -- MINIMUM cushion_min "
+        f"of {len(candidates)} candidate(s) of this form (never the newest)"
+    )
+
+
+def append_measured_record(path: str, rec: Dict[str, object]) -> None:
+    """Append one sample to the sidecar (append-only: history is evidence)."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        samples = data.get("samples") if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        samples = None
+    if not isinstance(samples, list):
+        samples = []
+    samples.append(rec)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump({"samples": samples}, f, indent=1, default=str)
+    os.replace(tmp, path)
+
+
+def resolve_cg_ceiling(
+    cgroup: Dict[str, Optional[int]], memtotal_bytes: int
+) -> Tuple[Optional[int], str]:
+    """The ceiling ``memory.current`` is budgeted against, and WHERE it came from.
+
+    A finite ``memory.max`` is the ceiling and says so.  When there is none --
+    the case inside this LXC container, where ``memory.max`` reads ``max`` --
+    the ceiling falls back to the container's lxcfs ``MemTotal`` and the source
+    string SAYS it is a fallback, because that fallback is knowably loose: boot
+    weg2dk5 was reaped at memory.current 95.93 GiB against a MemTotal of
+    118.05 GiB, i.e. ~22 GiB below this ceiling.  That looseness is why the
+    run-peak advisory (which compares against the OBSERVED reap point) exists
+    beside it rather than being folded into the ceiling as a fudge.
+    """
+    if cgroup.get("max") is not None:
+        return int(cgroup["max"]), "cgroup memory.max"
+    return (
+        int(memtotal_bytes),
+        "FALLBACK lxcfs MemTotal (memory.max is 'max': this cgroup publishes no "
+        "finite ceiling; loose by ~22 GiB against weg2dk5's observed reap point)",
+    )
+
+
+def _gib_or_none(value: Optional[float]) -> str:
+    """An absent reading prints as ``unreadable``, never as 0.00 GiB."""
+    return "unreadable" if value is None else f"{value:.2f} GiB"
+
+
+def _advisory_line(arm: Arm, chosen: bool) -> str:
+    """The RUN-PEAK line, printed for the CHOSEN arm or -- on a total refusal --
+    for the most frugal arm on the ladder.
+
+    FIX 8 prints it in BOTH cases on purpose: everything this line states about
+    the estimator (its residual on three boots, the watermark's own unsampled
+    slab term, the direction of both) is exactly what a reader of a REFUSAL
+    needs, and a refusal is the outcome on this box today.  Emitting it only on
+    success would delete the explanation at the moment it is wanted.
+    """
+    watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    predicted = arm.predicted_run_peak_gib()
+    subject = "this arm" if chosen else f"the most frugal arm (S={arm.s_gb} M={arm.m_mib})"
+    if predicted is None:
+        return (
+            "PDFLIP-HOST-LEDGER RUN-PEAK ADVISORY: not computed -- no cgroup sample was "
+            "passed, so there is no origin to add this arm's charges to. An absent "
+            "prediction is stated, never printed as a pass."
+        )
+    verdict = "ABOVE" if predicted > watermark_gib else "below"
+    return (
+        f"PDFLIP-HOST-LEDGER RUN-PEAK ADVISORY: {subject} predicts non-reclaimable memory.current="
+        f"{predicted:.2f} GiB at the run peak (run origin {_gib_or_none(arm.terms['run_origin_gib'])} "
+        f"[{arm.terms['run_origin_source']}] + heaps + anchors + rings + "
+        f"overhead + draft pools + the host ring Sigma H; the {FLOOR_GIB:.0f} GiB floor "
+        f"is a reserve and is NOT in this sum, and #1236 REMOVED the store term -- the "
+        f"page store is a directory on the ZFS dataset now, page cache and ARC, "
+        f"reclaimable, outside this cgroup's anon), "
+        f"which is {verdict} the OBSERVED REAP POINT {watermark_gib:.2f} GiB "
+        "(boot weg2dk5 21:15:30Z, memory.current 102,998,904,832 B minus the 28,916 kB "
+        "of that row that was still reclaimable, with oom_kill 18 -> 24 in the same row; "
+        "that row has NO slab_reclaimable column, so this watermark is an UPPER bound and "
+        "this verdict UNDER-warns by that unsampled term -- 0.53 GiB live on this box "
+        "2026-09-07T23:57:35Z, 0.73 GiB at the fix-6 reading). "
+        "FIX 8: THIS LINE IS NO LONGER ONLY ADVISORY -- an arm whose predicted peak is "
+        "not below the watermark is REFUSED by name (W21 PdFlipHostRunPeakRefused); the "
+        "sentence below is what that refusal is calibrated against. THE RESIDUAL SERIES, "
+        "all three boots side by side: weg2dk5 predicted 92.89 against 95.90 reached "
+        "(3.01 GiB UNDER-prediction); weg2dk6 predicted 91.23 against 96.06 sampled / 98.90 "
+        "kernel peak (4.83 / 7.67 GiB UNDER) and died the same death; weg2dk7 predicted "
+        "91.92 for the RUN peak and measured 90.10-94.57 GiB AT IDLE with an EMPTY store "
+        "and zero flips. dk7 also EXPLAINED that series rather than extending it: the "
+        "dormant image measures 38.63 GiB against the 28.83 GiB the weight-tag census "
+        "priced (+9.80 GiB on ONE image), which covers dk6's 4.83-7.67 GiB under-"
+        "prediction on its own and with no co-residency needed. That term is priced here "
+        "from this boot on, so this residual is the image correction's own test."
+    )
+
+
+def arm_terms_line(arm) -> str:
+    """#1361 [W97-terms]: the ARM line's TERM FIELDS, as one string.
+
+    ONE PRODUCER, because a refusal that names a different set of terms than
+    the ARM line is a refusal whose cause cannot be checked against the arm it
+    refused. The train's dry run (arm_def.log:112) printed only
+    `predicted 98.67 vs 95.90` -- true, and useless: nothing in it says WHICH
+    term carried the 98.67, so the reader cannot tell an honest arm from a
+    mispriced one without re-deriving the whole ladder by hand.
+
+    Used by the ARM line and by every W97 that reports a predicted peak, so the
+    two cannot drift -- the same rule `_TERM_FIELDS` exists for one layer down.
+    """
+    t = arm.terms or {}
+
+    def _g(k):
+        v = t.get(k)
+        return "n/a" if v is None else f"{float(v):.2f}"
+
+    return (
+        f"anchors={_g('anchors_gib')} rings={_g('rings_gib')} arena={_g('arena_gib')} "
+        f"d_draft_host={_g('d_draft_host_gib')} "
+        + (f"memhist={_g('memhist_gib')}{'(run)' if t.get('memhist_run_only') else ''} "
+           if float(t.get('memhist_gib') or 0.0) else "")
+        + (f"l3_index={_g('l3_index_gib')} " if float(t.get('l3_index_gib') or 0.0) else "")
+        + f"overhead={_g('overhead_gib')} xchg_bounce={_g('xchg_bounce_gib')} "
+        f"host_weights={_g('host_ring_gib')} "
+        f"ratchet_charged={_g('flip_ratchet_charged_gib')} "
+        f"source={str(t.get('flip_ratchet_source', '?')).split(' ')[0]}"
+    )
+
+
+def choose(
+    memtotal_bytes: int,
+    memavail_bytes: int,
+    *,
+    arms: Sequence[Tuple[int, int]] = DEFAULT_ARMS,
+    ranks_per_group: int = 3,
+    ring_bytes: int = 0,
+    ring_span1_bytes: int = 0,
+    ring_absent_by_design: bool = False,
+    ring_provenance: str = "",
+    cg_current_bytes: Optional[int] = None,
+    reclaimable_bytes: Optional[int] = None,
+    slab_reclaimable_bytes: Optional[int] = None,
+    cg_ceiling_bytes: Optional[int] = None,
+    cg_ceiling_source: str = "",
+    cg_oom_kill: Optional[int] = None,
+    # #1317n D's own L2 budget. It rides the SAME kwargs block the launcher
+    # hands to both `choose` and `price` -- boot weg2sn6a died of a price()
+    # call that had drifted from choose()'s keywords, so a term reaching only
+    # one of them is exactly the defect this signature exists to prevent.
+    s_gb_d: Optional[int] = None,
+    # #1317n the terms D's L2 was derived from, so a W20 can name the LARGEST
+    # FUNDABLE CAP instead of leaving the operator to invert the arithmetic
+    # (order item 1: "kein stilles Verkleinern" -- but also no silent silence).
+    d_cap_terms: Optional[Dict[str, float]] = None,
+    measured_record: Optional[Dict[str, dict]] = None,
+    margin: Optional[Margin] = None,
+    xchg_bounce_host_bytes: int = 0,
+    # #1350: resolved by the caller (`resolve_flip_ratchet_gib`) and handed in,
+    # like `xchg_bounce_host_bytes`. `None` keeps every pre-#1350 caller and
+    # every recorded arm byte-identical.
+    flip_ratchet: Optional["FlipRatchet"] = None,
+    model_digest_want: str = "",
+    form_key_matches: bool = False,
+    # #1361 [23a] PRINT-ONLY, and it deliberately stops at `choose`: the ARM
+    # line names the STATE the bounce was priced in. It never reaches `price`,
+    # because nothing here changes a number -- a term that only the printer
+    # needs must not be threaded through the pricing path, where a later reader
+    # would have to prove it does not move an arm.
+    xchg_bounce_prov: Optional[Dict[str, object]] = None,
+    # #1360: the NAMED deviation. Both or neither -- see
+    # `PdFlipHostDeviationRefused`. It converts the FUNDABILITY VERDICT and
+    # NOTHING ELSE: every term, the ring dimensioning, the manifest guard and
+    # the store sizing are computed exactly as without it, and the arm that
+    # comes back is the arm the ladder priced. The switch accepts a verdict; it
+    # never re-prices one.
+    deviation_reason: str = "",
+    guard_gib: Optional[float] = None,
+    # #1386: ONE bool, read once by the caller (launcher.main, beside
+    # `draft_kv_on_p`) and handed to every rung of the ladder here -- never
+    # re-derived per rung, so all `arms` price the identical switch state.
+    hicache_disabled: bool = False,
+    # #1378 Stage 2 (W105): the PRIOR boot's own recorded numbers -- the
+    # inputs `cushion_headroom_gib` needs and the two above (`cushion_ok`,
+    # W98's own floor) do not use. BOTH OR NEITHER, like `deviation_reason`/
+    # `riegel_gib`: a caller that names one and not the other has half a
+    # citation, which is worse than none (an operator would read the printed
+    # line as measured when it silently wasn't).
+    prior_cushion_min_gib: Optional[float] = None,
+    prior_bounce_gib: Optional[float] = None,
+    # #1392 (the missing half of the dry run): PRINT-ONLY, like
+    # `xchg_bounce_prov` above -- it never reaches `price`, because nothing
+    # here changes a number. `cg_current_bytes` already prices the box's
+    # CURRENT reading into every arm's origin (the safe-direction coupling:
+    # foreign load tightens the bound); what was missing was the ARM line
+    # ever SAYING which reading it was funded against, so a verdict measured
+    # on a quiet box and one measured under a parallel suite printed
+    # identically. `at_gib` is the wall-clock the box was read, `anon_bytes`/
+    # `shmem_bytes` are memory.stat's own two components of the same
+    # `cg_current_bytes` reading, printed so a reader does not have to
+    # `free -g` the box by hand (dry-run-misst-die-live-box, 2026-09-13).
+    box_state_at: str = "",
+    cg_anon_bytes: Optional[int] = None,
+    cg_shmem_bytes: Optional[int] = None,
+    arena_gib: float = 0.0,
+    staging_gb: Optional[float] = None,
+    anchor_mib: Optional[int] = None,
+    d_draft_host_gib: float = 0.0,
+    d_only: bool = False,
+    reference_model_ok: Optional[bool] = None,
+    reference_model_why: str = "",
+    memhist_gib: float = 0.0,
+    # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
+    l3_index_gib: float = 0.0,
+    memhist_run_only: bool = False,
+) -> Tuple[Arm, Optional[float], List[str]]:
+    """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
+
+    #1236 CHANGED THE MIDDLE OF THAT TUPLE, and the change is the whole point
+    of this pass: it used to be ``store_gib``, the size of the tmpfs the store
+    lived on, computed here as ``min(run leftover, reap bound)``.  The store is
+    a directory on the ZFS dataset now (``launcher.STORE_ROOT``) and is sized
+    from the P KV pool, not from host RAM, so this function no longer sizes it,
+    no longer charges it in :meth:`Arm.predicted_run_peak_gib`, and no longer
+    carries a ``--store-min-gib`` floor.  What comes back instead is the REAP
+    HEADROOM -- ``hard bound - predicted run peak`` for the chosen arm, or
+    ``None`` when no cgroup sample let a peak be predicted at all.  That is a
+    quantity this function actually computes, and it is what the caller needs
+    to price the one host-RAM risk the disk store does carry (the ZFS ARC).
+
+    ``slab_reclaimable_bytes`` is the LIVE ``memory.stat slab_reclaimable``
+    reading -- the term the reap watermark's own row lacked.  It is subtracted
+    from the watermark wherever the watermark is used as a bound, and an
+    unreadable one subtracts nothing and says so.
+
+    The cgroup arguments are fix 5's denominator (see :func:`price`).
+    ``cg_oom_kill`` is printed as the PRE-BOOT BASELINE of a counter that is
+    cumulative and carries no timestamps: a death can only ever be attributed
+    by baseline-vs-after diff, and taking that baseline here means no boot can
+    start without one.
+    """
+    lines: List[str] = []
+    # #1362 [22-fix2]: the ladder prices one arm per rung and every rung walks
+    # the same record, so the sink would otherwise carry the same legacy line
+    # once per arm. Cleared here, read below, deduped in order.
+    LEGACY_IDENTITY_LINES.clear()
+    # TRAIN FIX 3: the term the reap watermark's own row LACKED, read live by
+    # the caller from memory.stat and never a constant.  It is the only
+    # quantity subtracted when the store's reap bound is computed.
+    unsampled_gib = (
+        None if slab_reclaimable_bytes is None else slab_reclaimable_bytes / GIB
+    )
+    priced = [
+        price(
+            memtotal_bytes,
+            memavail_bytes,
+            s,
+            m,
+            ranks_per_group=ranks_per_group,
+            ring_bytes=ring_bytes,
+            ring_span1_bytes=ring_span1_bytes,
+            ring_absent_by_design=ring_absent_by_design,
+            cg_current_bytes=cg_current_bytes,
+            reclaimable_bytes=reclaimable_bytes,
+            cg_ceiling_bytes=cg_ceiling_bytes,
+            s_gb_d=s_gb_d,
+            measured_record=measured_record,
+            xchg_bounce_host_bytes=xchg_bounce_host_bytes,
+            flip_ratchet=flip_ratchet,
+            model_digest_want=model_digest_want,
+            form_key_matches=form_key_matches,
+            hicache_disabled=hicache_disabled,
+            arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
+            d_draft_host_gib=d_draft_host_gib,
+            d_only=d_only,
+            reference_model_ok=reference_model_ok,
+            reference_model_why=reference_model_why,
+            memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
+            l3_index_gib=l3_index_gib,
+        )
+        for s, m in arms
+    ]
+    t = priced[0].terms
+    # H87: the two new declarations are LOUD, one line each, before the terms.
+    if d_only:
+        lines.append(
+            f"{D_ONLY_TAG}: no flip arm -- --d-only starts group D alone (no P, no "
+            f"front, no flip). Charged: ONE awake group ({ranks_per_group}x"
+            f"{HEAP_AWAKE_GIB} heaps, no dormant {ranks_per_group}x{HEAP_DORMANT_GIB}), "
+            f"D's host rings only, no P draft host pool, flip ratchet "
+            f"{'0.00 (declared, zero flips)' if flip_ratchet is not None and flip_ratchet.flips_priced == 0 else 'AS HANDED IN'}. "
+            f"NOT a term of this ledger, flip or D-only: the MoE EXPERT STORE when it "
+            f"lives on a tmpfs charged to this cgroup (FLLIPER_MOE_EXPERT_STORE_DIR; "
+            f"NVFP4 D-only fnNV4d1 measured 76.2 GiB non-reclaimable with a 46 GiB "
+            f"store) -- a FUNDABLE here does not fund that store"
+        )
+    if reference_model_ok is not None:
+        lines.append(
+            f"{FOREIGN_REFERENCE_TAG} built-in references (dk7 residual/image, "
+            f"ratchet series) were measured on {REFERENCE_MODEL}: "
+            + ("APPLY to this boot" if reference_model_ok else
+               "do NOT apply to this boot -- every place that would have priced "
+               "one says FALLBACK/FOREIGN-MODEL on its own line")
+            + f" ({reference_model_why or 'no reason given'})"
+        )
+    # #1362 [22-fix2]: the transition path is LOUD. A legacy record admitted on
+    # a form-key match prints exactly one line naming the record it admitted --
+    # silent acceptance would make the pre-#1362 records indistinguishable from
+    # verified ones for as long as they survive.
+    for _ll in dict.fromkeys(LEGACY_IDENTITY_LINES):
+        lines.append(_ll)
+    lines.append(
+        "PDFLIP-HOST-LEDGER TERMS "
+        f"memtotal={t['memtotal_gib']:.2f} GiB memavail={t['memavail_gib']:.2f} GiB "
+        f"(live /proc/meminfo) cli_reserve={CLI_RESERVE_GIB:.0f} GiB (record 1g, "
+        f"charged once against MemTotal) "
+        f"cgroup memory.current={_gib_or_none(t['cg_current_gib'])} ceiling={_gib_or_none(t['cg_ceiling_gib'])}"
+        f"{(' [' + cg_ceiling_source + ']') if cg_ceiling_source else ''} "
+        f"oom_kill_baseline={'unreadable' if cg_oom_kill is None else cg_oom_kill} "
+        f"(#1233 fix 5, boot weg2dk5: the REAPER watches memory.current, not /proc/meminfo -- "
+        "it killed six ranks with MemAvailable still at 23.96 GB) "
+        f"of which reclaimable={_gib_or_none(t['cg_reclaimable_gib'])} "
+        "(memory.stat: (file - shmem) + slab_reclaimable; cgroup-v2 `file` INCLUDES `shmem` "
+        f"-- {CGROUP_V2_FILE_INCLUDES_SHMEM_PROOF} -- so `current - file` would hand back the "
+        "page store's own tmpfs as free) "
+        f"-> non-reclaimable={_gib_or_none(t['cg_nonreclaim_gib'])} charged "
+        "(#1233 fix 6: cache the kernel hands back is not memory the reaper kills for; "
+        "charging it refused weg2dk5's own launch state) "
+        f"unsampled_slab={_gib_or_none(unsampled_gib)} (train fix 3: the LIVE memory.stat "
+        "slab_reclaimable, the one column the reap row lacked -- the store's reap bound "
+        "subtracts it because the watermark over-states the reap point by exactly it; "
+        "unreadable means NOT subtracted and the bound is optimistic by that term) "
+        f"base_meminfo={t['base_meminfo_gib']:.2f} GiB base_cgroup={_gib_or_none(t['base_cgroup_gib'])} "
+        f"-> base={t['base_gib']:.2f} GiB bound by {t['base_source']} "
+        f"floor={FLOOR_GIB:.0f} GiB (#721; the #1232 host_headroom term is DELETED, "
+        "it was a compensation constant for this very denominator) "
+        f"heaps={t['heaps_gib']:.2f} GiB ({ranks_per_group}x{HEAP_AWAKE_GIB} awake b0 + "
+        f"{ranks_per_group}x{HEAP_DORMANT_GIB} dormant campaign (a)) "
+        f"UNPRICED RESIDUAL, named rather than folded in: `(file - shmem)` also credits file "
+        f"pages in the UNEVICTABLE LRU as reclaimable (measured on this box, fix-6 review: "
+        f"cgroup unevictable 16,384 B against /proc/meminfo Mlocked 309,682,176 B = 0.29 GiB) "
+        f"-- sub-GiB today and in the OPTIMISTIC direction, and this design keeps adding "
+        f"pinned host memory, so it is stated here rather than left to be discovered. "
+        f"image_P={t['image_p_gib']:.2f} GiB [{t['image_p_source']}] "
+        f"image_D={t['image_d_gib']:.2f} GiB [{t['image_d_source']}] "
+        f"weight_tags_P={t['weight_tags_p_gib']:.2f} GiB weight_tags_D={t['weight_tags_d_gib']:.2f} GiB "
+        f"(#809 census -- the tag byte sums, NOT the image) extra_P={t['image_extra_p_gib']:.2f} GiB "
+        f"extra_D={t['image_extra_d_gib']:.2f} GiB (#1233 fix 8: everything with enable_cpu_backup "
+        "is in the image -- draft weights, graph pools, workspaces, embeddings -- and boot weg2dk7 "
+        "measured the dormant group at 38.63 GiB against the 28.83 GiB the tag sum priced) "
+        f"run_origin={_gib_or_none(t['run_origin_gib'])} bound by {t['run_origin_source']} "
+        f"(the image terms above SIZE H(c); they are NOT charged here -- the ring is) "
+        + ("RING ABSENT BY DESIGN (Sigma H=0, reason=exchange): the weights ring "
+           "is not allocated on this arm, so both moments charge 0 for it -- "
+           "this is a DECLARED absence, not a missing measurement (#1327). " 
+           if t.get("ring_absent_by_design") else "")
+        + f"RUN MOMENT = the host weights term {t['host_ring_gib']:.2f} GiB "
+        f"(C19; BACKUP_P_BYTES / BACKUP_D_BYTES / chunk_gib are DELETED, not shrunk) "
+        f"LAUNCH MOMENT = ring span 1, Sigma image_P = {t['host_ring_span1_gib']:.2f} GiB (R7) + "
+        f"load_transient={LOAD_TRANSIENT_GIB:.0f} GiB (MEASURED residual of boot weg2ls1b2, #721 constant was 27; D loading while P is dormant) "
+        f"ring provenance: {ring_provenance or 'NOT NAMED -- caller passed none'} "
+        f"anchors@2400={ANCHORS_AT_2400_BYTES / GIB:.2f} GiB (b0 measured, scaled by M) "
+        f"rings=({RING_P_MULT_GB_PER_S:.0f}+{RING_D_MULT_GB_PER_S:.0f})xS GB (b0) "
+        f"overhead={HOST_POOL_OVERHEAD:.0%} of host-pool posts (b0 U14) "
+        f"draft_host_P={DRAFT_HOST_P_MIB:.1f} MiB draft_host_D={DRAFT_HOST_D_MIB:.1f} MiB "
+        f"(#1233 pinned draft host pools, both moments) "
+        f"store_draft_fraction={STORE_DRAFT_FRACTION:.4f} (2048 of 32768 B per token)"
+    )
+    # #1386 [Minimalform HiCache switch]: ALWAYS printed, on or off, so an
+    # absent line is never mistaken for "never checked" (the same rule
+    # `lanes_concurrent`'s own line follows). True means BOTH halves of the
+    # switch fired: `anchors_gib`/`rings_gib`/`overhead_gib` price at 0.00
+    # above (charge_terms, this module) AND `--enable-hierarchical-cache`
+    # plus every `--hicache-*` flag are omitted from both groups' argv
+    # (launcher.common_flags) -- one bool, read once by the launcher, never
+    # a second one that could disagree with it. APPENDED, not inserted
+    # before the TERMS line: existing readers of `lines[0]` (pre-#1386) must
+    # keep seeing that line first, byte-identical, when the switch is off.
+    lines.append(
+        f"PDFLIP-HICACHE-DISABLED hicache_disabled={hicache_disabled} -- "
+        "when True: anchors_gib=0.00 rings_gib=0.00 overhead_gib=0.00 above, "
+        "AND group P/D's argv carries no --enable-hierarchical-cache / "
+        "--hicache-* flag at all (launcher.py common_flags); for the "
+        "Minimalform's two manual flips + shadow compare, which serve 0 "
+        "requests and therefore reuse no prefix HiCache could have cached."
+    )
+    # #1369: user order 2026-09-14 ("DIE 48GB MUESSEN WEG"). ALWAYS printed,
+    # on or off, per the SAME rule the HiCache line above follows: an absent
+    # line is never "never checked". This is the GEGENPROBE the order asked
+    # for -- the boot MEASURES the zero from this line (host_ring_gib and the
+    # reason together) rather than believing a silent absence of the flag.
+    # `ring_absent_by_design` is TRUE exactly when `host_ring_gib` was
+    # charged 0 for this reason (`price()`'s own contradiction guard refuses
+    # any boot where the two disagree, so seeing both here is not a hope,
+    # it is what did not raise).
+    lines.append(
+        f"PDFLIP-WEIGHTS-CPU-BACKUP host_ring_gib={t['host_ring_gib']:.2f} "
+        f"ring_absent_by_design={bool(t.get('ring_absent_by_design'))} -- "
+        "when ring_absent_by_design is True: this term is 0.00 by "
+        "CONSTRUCTION (price()'s own contradiction guard refuses a boot "
+        "where a non-zero ring reaches it anyway), AND group P/D's argv "
+        "carries no --enable-weights-cpu-backup flag (launcher.py "
+        "common_flags/weight_exchange.weights_cpu_backup_armed) -- one "
+        "predicate, read once by the launcher, never a second one that "
+        "could disagree with it. `--pdflip-weights-cpu-backup auto` (default) "
+        "sets this True only under an ARMED, AUTHORITATIVE exchange, where "
+        "the exchange itself is the weight source at the wake seam and this "
+        "ring would be a Rueckfall nobody reads; under `ring` or "
+        "exchange+shadow the ring is still the source or the shadow leg's "
+        "ground truth and this stays False, byte-identical to every boot "
+        "before this flag existed."
+    )
+    # #1392: ALWAYS printed, on or off -- the missing half of the dry run.
+    # `cg_current_bytes` already prices whatever the box holds RIGHT NOW into
+    # every arm below (the origin, hence the peak): a parallel suite or boot
+    # TIGHTENS the bound, the safe direction. What was missing is this line
+    # ever SAYING so: "FUNDABLE, measured on a quiet box" and "FUNDABLE,
+    # measured under a parallel suite" printed identically, and the second
+    # kind is the one that does not survive to the ACTUAL boot if the box
+    # gets noisier still between this dry run and then. `at`, `memavail`,
+    # `anon`, `shmem` are the box's own numbers, not derived -- a reader who
+    # wants to judge whether this verdict is stale needs the raw reading,
+    # not a summary of it.
+    _fl_now = foreign_load_now_gib(cg_current_bytes)
+    _cg_anon_gib = None if cg_anon_bytes is None else float(cg_anon_bytes) / GIB
+    _cg_shmem_gib = None if cg_shmem_bytes is None else float(cg_shmem_bytes) / GIB
+    lines.append(
+        f"PDFLIP-DRY-RUN-BOX-STATE at={box_state_at or 'not stamped by the caller'} "
+        f"memavail={t['memavail_gib']:.2f} GiB anon={_gib_or_none(_cg_anon_gib)} "
+        f"shmem={_gib_or_none(_cg_shmem_gib)} (live /proc + cgroup memory.stat, "
+        "read once for this ladder, not per arm) "
+        f"foreign_load_now={_gib_or_none(_fl_now)} "
+        f"[= cg_current - {QUIET_BASELINE_CG_CURRENT_GIB:.2f} GiB quiet baseline "
+        "(measured 2026-09-14, this box, floored at 0)] "
+        + (
+            f"-- PROVISIONAL: this reading is {_fl_now:.2f} GiB above the "
+            f"{FOREIGN_LOAD_PROVISIONAL_THRESHOLD_GIB:.2f} GiB threshold "
+            "(dry-run-misst-die-live-box, 2026-09-13: +2.5 GiB memory.current "
+            "flipped ARM 95.18 to W97 97.67) -- a refusal below may be about "
+            "THIS box's transient state and not the form; a FUNDABLE below "
+            "should be RE-VERIFIED closer to the actual boot rather than "
+            "trusted as measured, because the box may look different by "
+            "then in EITHER direction"
+            if _fl_now is not None
+            and _fl_now > FOREIGN_LOAD_PROVISIONAL_THRESHOLD_GIB
+            else "-- measured on a quiet box (foreign_load_now at or below "
+            "the threshold, or unmeasured): this verdict's own box-state is "
+            "not stale-suspect by this instrument"
+        )
+    )
+    # FIX 6: origin and watermark in ONE currency -- both non-reclaimable.
+    watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    # #1269 / standing order 2026-09-08: the watermark alone is not the bound.
+    # The bound is the watermark MINUS a named margin -- the flip transient the
+    # box will actually spend and the idle anon drift it will actually
+    # accumulate over the planned window. Both WILL happen during the window,
+    # so an arm that has not left room for them is already lost.
+    margin = margin if margin is not None else resolve_margin(
+        flip_ratchet_charged_gib=(
+            None if flip_ratchet is None else flip_ratchet.charged_gib
+        )
+    )
+    hard_bound_gib = watermark_gib - margin.total_gib
+    # #1360: BOTH OR NEITHER, checked before a single arm is priced, so a
+    # half-armed deviation can never reach a verdict it would then convert.
+    _deviation_armed = bool(deviation_reason) and guard_gib is not None
+    if bool(deviation_reason) != (guard_gib is not None):
+        raise PdFlipHostDeviationRefused(
+            "W97 PdFlipHostDeviationRefused: --host-ledger-deviation and "
+            "--host-riegel-gib are BOTH OR NEITHER. "
+            + ("A reason was given with no runtime latch: a deviation without a "
+               "number is the silent crossing the user's 2026-09-12 rule forbids."
+               if deviation_reason else
+               "A latch was given with no reason: the next reader is left without "
+               "the why, which is the other half of the same rule.")
+        )
+    # #1378 Stage 2 (W105): BOTH OR NEITHER, checked here for the same reason
+    # as the deviation pair above -- before a single arm is priced, so a
+    # half-cited prior boot can never reach the printed line.
+    _prior_cited = prior_cushion_min_gib is not None and prior_bounce_gib is not None
+    if (prior_cushion_min_gib is not None) != (prior_bounce_gib is not None):
+        raise PdFlipPriorCushionArgsIncomplete(
+            "W105 PdFlipPriorCushionArgsIncomplete: prior_cushion_min_gib and "
+            "prior_bounce_gib are BOTH OR NEITHER -- one without the other is "
+            "a guessed half of cushion_headroom_gib's own inputs, printed as "
+            f"if it were measured (got prior_cushion_min_gib={prior_cushion_min_gib!r} "
+            f"prior_bounce_gib={prior_bounce_gib!r})."
+        )
+    lines.append(watermark_provenance(margin, watermark_gib, refuse_unreadable=True))
+    chosen: Optional[Arm] = None
+    peak_bound_any = False
+    # #1236: the STORE TERM IS GONE FROM THIS LOOP.  Train fix 3 sized it here
+    # as min(run leftover, reap bound) because it was a tmpfs and therefore
+    # un-evictable shmem inside this cgroup -- the one free term of the run
+    # peak.  It is a directory on the ZFS dataset now, so there is no RAM
+    # residual to hand out and no store floor to bind on: the arm table prices
+    # RAM, the store is priced against the DISK by launcher.plan_store, and the
+    # two no longer share a currency.  What the store USED to cost this sum is
+    # printed on the CHOSEN line as the freed delta, so the change is visible
+    # in the ledger's own output and not only in this comment.
+    for arm in priced:
+        moments_ok = arm.fundable_moments
+        predicted = arm.predicted_run_peak_gib()
+        # FIX 8: the run peak REFUSES.  Two boots died and one could not flip
+        # while this quantity was printed as an advisory beside the arm it had
+        # already condemned.
+        # #1269: against the HARD BOUND (watermark - margin), not the raw mark.
+        peak_ok = predicted is None or predicted <= hard_bound_gib
+        # #1377 (a) W11: THE CUSHION FLOOR IS AN ARM TERM, not a runtime-only
+        # threshold. Boot weg2xsn31/3 funded an arm at predicted 90.66 against
+        # a 94.43 bound and then latched W98 SIX SECONDS after the front's
+        # argv, inside D's startup sleep leg: `cushion=0.20 < 1.50 now=92.40
+        # shmem=67.51`, state=STOP at epoch=0. The latch was PREDICTABLE at
+        # launch and nothing predicted it, because two floors were kept in two
+        # places: this ladder bounded the peak, and `RATE_LATCH_CUSHION_FLOOR_GIB`
+        # bounded the cushion at RUNTIME, with no arithmetic joining them.
+        #
+        # ONE AUTHORITY: the runtime floor is IMPORTED here, never restated, so
+        # an arm that leaves less than the latch demands is refused BY NAME at
+        # the ARM with both numbers on the line -- instead of being funded and
+        # then stopped by its own watchdog before the first flip.
+        cushion_ok = (
+            predicted is None
+            or predicted + RATE_LATCH_CUSHION_FLOOR_GIB <= hard_bound_gib
+        )
+        # #1378 Stage 2 (W105): the CROSS-BOOT gate, wired at last.
+        # `cushion_ok` above is `predicted_run_peak + FLOOR <= bound` -- the
+        # form `cushion_headroom_gib`'s own docstring measured against both
+        # weg2xsn31/2 and /3 and found funds BOTH (92.16 <= 94.43 either way),
+        # because what actually consumed the cushion is PINNED SHM growth
+        # (the bounce, 7.79 -> 15.75 GiB), not the predicted peak. This is
+        # the arithmetic that separates them: `cushion_min` of the PRIOR
+        # boot, minus how much THIS arm's own bounce grew past the PRIOR
+        # boot's bounce.
+        #
+        # ONE-TERM MODEL, NAMED AS SUCH ON THE PRINTED LINE: only the bounce
+        # delta is charged against the prior cushion, every other shmem term
+        # is held constant, and the quantity was measured NON-MONOTONIC
+        # TWICE against real boots (weg2xsn31/5->6: bounce 16.905 -> 12.00
+        # GiB, cushion 0.85 -> 0.20 GiB fell WITH it, not against it) -- so
+        # a GREEN reading here is evidence for exactly one term, never a
+        # clearance for the boot. RED (a negative headroom) is a violated
+        # NECESSARY condition and MAY refuse; GREEN refuses nothing it did
+        # not already pass and FUNDS NOTHING BY ITSELF -- it can only ever
+        # make `ok` stricter (the `and` below), never looser.
+        cushion_headroom_this_arm_gib = (
+            cushion_headroom_gib(
+                prior_cushion_min_gib, arm.terms["xchg_bounce_gib"], prior_bounce_gib,
+            ) if _prior_cited else None
+        )
+        headroom_ok = (
+            cushion_headroom_this_arm_gib is None
+            or cushion_headroom_this_arm_gib >= RATE_LATCH_CUSHION_FLOOR_GIB
+        )
+        binding: List[str] = []
+        if arm.launch_leftover_gib < 0:
+            binding.append(f"launch moment ({arm.launch_leftover_gib:.2f} GiB)")
+        if arm.run_leftover_gib < 0:
+            binding.append(f"run moment ({arm.run_leftover_gib:.2f} GiB)")
+        if not peak_ok:
+            binding.append(
+                f"RUN PEAK ({predicted:.2f} > {hard_bound_gib:.2f} GiB hard bound "
+                f"= {watermark_gib:.2f} reap point - {margin.total_gib:.2f} margin "
+                f"[{margin.terms()}])"
+            )
+        if peak_ok and not cushion_ok:
+            # Named separately from the peak: an arm that fits the bound but
+            # not the bound MINUS the latch's own floor is a different verdict
+            # with a different remedy, and folding the two would hide which one
+            # bound this arm.
+            binding.append(
+                f"CUSHION FLOOR ({predicted:.2f} + "
+                f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} floor = "
+                f"{predicted + RATE_LATCH_CUSHION_FLOOR_GIB:.2f} > "
+                f"{hard_bound_gib:.2f} GiB hard bound -- the arm fits the bound "
+                f"and leaves less than W98 PdFlipHostRateLatched demands, so the "
+                f"latch fires on this boot before its first flip. Measured on "
+                f"weg2xsn31/3: funded at 90.66, latched `cushion=0.20 < 1.50` "
+                f"six seconds after the front's argv, inside D's startup sleep "
+                f"leg, state=STOP at epoch=0)"
+            )
+        if peak_ok and cushion_ok and not headroom_ok:
+            # Named separately again: this arm passes BOTH single-boot floors
+            # above and is refused only by the CROSS-BOOT term neither of them
+            # reads -- exactly the arm weg2xsn31/3 was (predicted 90.66,
+            # peak_ok and cushion_ok both true) had this term existed then.
+            binding.append(
+                f"CUSHION HEADROOM ({prior_cushion_min_gib:.2f} prior cushion_min - "
+                f"({arm.terms['xchg_bounce_gib']:.2f} this arm's bounce - "
+                f"{prior_bounce_gib:.2f} prior bounce) = "
+                f"{cushion_headroom_this_arm_gib:.2f} < "
+                f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} GiB floor -- ONE-TERM MODEL "
+                f"(bounce delta only, other shmem terms held constant, measured "
+                f"non-monotonic twice: weg2xsn31/5->6 bounce 16.905->12.00 fell "
+                f"WITH cushion 0.85->0.20). This is a violated NECESSARY "
+                f"condition, not a sufficient one -- it may refuse; it never "
+                f"funds by itself)"
+            )
+        ok = moments_ok and peak_ok and cushion_ok and headroom_ok
+        # #1360: the deviation converts THIS verdict, after it has been computed
+        # in full. `binding` is left exactly as it was so the DEVIATION line and
+        # the refusal it replaces name the same terms.
+        if not ok and _deviation_armed and predicted is not None:
+            if predicted >= watermark_gib:
+                raise PdFlipHostDeviationRefused(
+                    f"W97 PdFlipHostDeviationRefused: --host-ledger-deviation cannot "
+                    f"accept a predicted run peak of {predicted:.2f} GiB, which is AT "
+                    f"OR ABOVE the observed reap watermark {watermark_gib:.2f} GiB. "
+                    f"The hard bound is soft (user rule 2026-09-12); the WATERMARK is "
+                    f"where the kernel reaped. Boot weg2xsn25 died on a prediction "
+                    f"5 GiB below it -- accepting one at it is not a deviation. "
+                    # #1361 [W97-terms]: THE SAME TERMS THE ARM LINE PRINTS.
+                    # Without them this refusal said only `predicted X vs Y`,
+                    # which names the verdict and hides the cause: the reader
+                    # cannot tell WHICH term carried the peak, so an honest arm
+                    # and a mispriced one read identically (train dry run,
+                    # arm_def.log:112).
+                    f"TERMS (S={arm.s_gb} M={arm.m_mib} S_D={_arm_s_d(arm)}): "
+                    f"{arm_terms_line(arm)} -- these are the ARM line's own "
+                    f"fields, from the one producer, so the refusal and the arm "
+                    f"it refused can be compared field by field."
+                )
+            if float(guard_gib) >= hard_bound_gib:
+                raise PdFlipHostDeviationRefused(
+                    f"W97 PdFlipHostDeviationRefused: --host-riegel-gib "
+                    f"{float(guard_gib):.2f} is AT OR ABOVE the hard bound "
+                    f"{hard_bound_gib:.2f} GiB it is supposed to latch beneath. A "
+                    f"latch above the bound cannot fire before the bound is already "
+                    f"crossed; it is decoration, and the rule asks for a runtime "
+                    f"latch, not a number."
+                )
+            lines.append(
+                f"PDFLIP-HOST-LEDGER DEVIATION reason=\"{deviation_reason}\" "
+                f"predicted_run_peak={predicted:.2f} hard_bound={hard_bound_gib:.2f} "
+                f"reap={watermark_gib:.2f} excess={predicted - hard_bound_gib:.2f} "
+                f"riegel_gib={float(guard_gib):.2f} "
+                f"source={(arm.terms or {}).get('flip_ratchet_source', '?').split(' ')[0]} "
+                f"-- the ledger's verdict for this arm was REFUSED (binding: "
+                + ", ".join(binding) + f"); it is ACCEPTED under the user's standing "
+                f"rule of 2026-09-12 that the reap mark is soft and may be crossed "
+                f"WITH a number and a runtime latch, never silently. NOTHING IS "
+                f"RE-PRICED: every term above is the one the ladder computed, the "
+                f"ring dimensioning and the manifest guard are untouched, and the "
+                f"runtime guard (W22) still tears down at the latch."
+            )
+            ok = True
+        if moments_ok and not peak_ok:
+            peak_bound_any = True
+        lines.append(
+            # #1317n S_D IS APPENDED AFTER M, NOT INSERTED BETWEEN S AND M.
+            # Three suites match the literal substring `ARM S=<s> M=<m>` (two
+            # by `in`, one by a list comprehension that then indexes [0] and
+            # raised IndexError), so splitting that pair is a text change
+            # masquerading as a semantic one. The new term is additive and the
+            # old reading is byte-identical -- which is also the honest shape:
+            # nothing about S or M changed, D simply gained its own budget.
+            f"PDFLIP-HOST-LEDGER ARM S={arm.s_gb} M={arm.m_mib} S_D={_arm_s_d(arm)}"
+            # #1361 [23b]: WHICH INPUT PRODUCED S_D. The sizing record silently
+            # overrides `--d-cap-rank-share`, and the boot seat read S_D=1 off
+            # its own table while this line said S_D=2 -- effective and
+            # unprinted, the #896 class. `source=record` means a measured
+            # ownership vector won; `source=flag` means the argv value stood.
+            + (
+                f" (sd_share={float((d_cap_terms or {}).get('max_rank_share', 0.0)):.4f} "
+                f"source={(d_cap_terms or {}).get('max_rank_share_source', 'unknown')})"
+                if d_cap_terms else ""
+            )
+            + ": "
+            f"anchors={arm.terms['anchors_gib']:.2f} rings={arm.terms['rings_gib']:.2f} "
+            f"arena={float(arm.terms.get('arena_gib', 0.0) or 0.0):.2f} "
+            f"overhead={arm.terms['overhead_gib']:.2f} "
+            # #1273 S6: THE EXCHANGE'S PINNED HOST CARRIER, NAMED ON THE ARM
+            # LINE.  0.00 on the ring arm -- an unarmed boot says the term was
+            # priced at zero instead of leaving a reader to ask whether it was
+            # priced at all -- and `slots x slot_bytes x cards` of /dev/shm on
+            # the arms that create the file, charged at both moments.
+            f"xchg_bounce={arm.terms['xchg_bounce_gib']:.2f} "
+            # #1361 [23a]: the state the term was priced in, beside the term.
+            # THREE states cost 2.16 GiB (depth=1 comparing=True, depth=2
+            # comparing=False, depth=2 under the pre-#1335 expression), so the
+            # number alone has three readings. `absent` when the arm pins no
+            # bounce at all -- an unpriced state and a state priced at defaults
+            # must not share a spelling, the same rule the ratchet fields obey.
+            + (
+                f"bounce_depth={int(xchg_bounce_prov['depth'])} "
+                f"bounce_slots={int(xchg_bounce_prov['slots'])} "
+                f"bounce_inject={xchg_bounce_prov['inject_mode']} "
+                if xchg_bounce_prov else "bounce_state=absent "
+            )
+            +
+            # #1378 Stage 2 (W105): ALWAYS printed, on or off, so an absent
+            # reading is never mistaken for "never checked" (the same rule
+            # `lanes_concurrent`'s own line and #1386's switch line follow).
+            # The number and its own limitation are on THIS line together --
+            # a reader who sees only the number and not the caveat is a
+            # reader who can mistake a one-term model for a verdict.
+            (
+                f"cushion_headroom={cushion_headroom_this_arm_gib:.2f} GiB "
+                f"(prior cushion_min={prior_cushion_min_gib:.2f} - bounce delta "
+                f"[{arm.terms['xchg_bounce_gib']:.2f} this arm - "
+                f"{prior_bounce_gib:.2f} prior]) "
+                if _prior_cited else
+                "cushion_headroom=not measured (no --prior-cushion-min-gib / "
+                "--prior-bounce-gib passed) "
+            )
+            + "[#1378 Stage 2 ONE-TERM MODEL: bounce delta vs the PRIOR boot's "
+            "own cushion_min only, every other shmem term held constant; "
+            "measured NON-MONOTONIC TWICE against real boots (weg2xsn31/5->6: "
+            "bounce 16.905->12.00 GiB, cushion fell WITH it, 0.85->0.20). RED "
+            "(negative) is a violated necessary condition and MAY refuse this "
+            "arm (see CUSHION HEADROOM binding below); GREEN refuses nothing "
+            "and FUNDS NOTHING BY ITSELF -- it is an indicator, not a "
+            "Freibrief, and no boot-seat or operator may read it as one] "
+            +
+            # #1332 (S6 slice 1): THE TWO HOST-WEIGHT RESIDENCIES, SIDE BY
+            # SIDE ON ONE LINE. `host_weights` is Sigma H -- the region
+            # preallocated at the whole weight image, charged once and never
+            # shrinking for the life of the boot -- and `xchg_bounce` is the
+            # bounded buffer that is meant to replace it (user law 2026-09-11,
+            # spec section 10). The slice's entire acceptance is that the
+            # first goes to 0.00 while the second stands in for it, so they
+            # must be readable in ONE grep and must never be folded into one
+            # figure: a single number carrying both would make exactly that
+            # transition unobservable. Sigma H is also on the TERMS line, but
+            # that is a different line and a reader comparing two lines is a
+            # reader who can mismatch two boots.
+            f"host_weights={arm.terms['host_ring_gib']:.2f} "
+            # #1350 THE FOUR RATCHET FIELDS, ON THE SAME LINE AS THE TERMS THEY
+            # JOIN.  `ratchet_per_flip` is ONE full pair measured
+            # `FLIP begin epoch=0` -> `FLIP done epoch=2`, `flips_priced` is the
+            # assumption (1, because the step SATURATES at the first waking of
+            # each group -- 3.16 of weg2xsn20's 4.46 GiB fall in the first two
+            # legs of eight), `ratchet_charged` is their product and the term
+            # actually inside `run_peak`, and `source` says whether it is this
+            # line's own record or the recorded seed.  An arm that was handed no
+            # measurement prints ABSENT here, never 0.00: an unpriced term and a
+            # term priced at zero must not share a spelling.
+            + (
+                "ratchet_per_flip=ABSENT flips_priced=0 ratchet_charged=ABSENT "
+                f"source={arm.terms.get('flip_ratchet_source')} "
+                if arm.terms.get("flip_ratchet_gib") is None else
+                f"ratchet_per_flip={float(arm.terms['flip_ratchet_per_flip_gib']):.2f} "
+                f"flips_priced={int(arm.terms['flip_ratchet_flips_priced'])} "
+                f"ratchet_charged={float(arm.terms['flip_ratchet_gib']):.2f} "
+                f"source={arm.terms.get('flip_ratchet_source')} "
+            )
+            + f"-> "
+            f"leftover launch={arm.launch_leftover_gib:.2f} GiB "
+            # #1317n BOTH FORMS ON THE LINE, because the class assignment is
+            # the whole change and a reader must be able to see it rather than
+            # trust it: `launch` is priced in the currency `launch_cur` names,
+            # `launch_sum` is the worst case with the entire load transient
+            # charged as non-reclaimable, and the gap between them IS the page
+            # cache (boot weg2sn6r: -2.78 sum against +9.22 by class).
+            f"launch_sum={arm.launch_worst_case_gib:.2f} GiB "
+            f"launch_cur={(arm.terms or {}).get('launch_currency', '?')} "
+            # #1350f: the two terms the launch worst case is graded by, on the
+            # line, so a reader never has to know which margin applied.
+            f"load_transient={float(arm.terms.get('load_transient_gib', 0.0)):.2f} "
+            f"launch_wc_margin={float(arm.terms.get('launch_worst_case_margin_gib', 0.0)):.2f} "
+            f"[{arm.terms.get('launch_worst_case_margin_source', '?')}] "
+            f"run={arm.run_leftover_gib:.2f} GiB "
+            f"store=NOT CHARGED HERE (#1236: on disk under launcher.STORE_ROOT, "
+            f"page_cache=reclaimable, sized from the P KV pool -- see PDFLIP-STORE) "
+            f"unsampled_slab={_gib_or_none(unsampled_gib)} "
+            "run_peak="
+            + ("unreadable (no cgroup sample)" if predicted is None else f"{predicted:.2f} GiB")
+            + f" vs hard bound {hard_bound_gib:.2f} GiB (reap {watermark_gib:.2f} - "
+            f"margin {margin.total_gib:.2f}) "
+            # #1350 THE HONEST BOUND, PRINTED WHERE THE BOUND IS USED. Patch C
+            # takes the flip transient out of the BOOT margin -- the prediction
+            # now charges the flip's permanent step itself -- which moves the
+            # hard bound 87.30 -> 90.18 GiB and therefore FUNDS ARMS THAT ARE
+            # REFUSED TODAY. That is the danger direction of this whole ledger,
+            # so the line states the condition attached to it instead of
+            # letting a reader discover the move from two numbers:
+            # ANALYSE_1350_HOST_TERM_0912.md SS3 -- the rise is legitimate ONLY
+            # together with the CHARGED ratchet term, and the residual row it
+            # leaves standing (sb4 5.16) must be RE-MEASURED on ratchet-priced
+            # boots before it can be trusted at this bound. None exists yet.
+            + (
+                "[#1350/#1350e: transient OUT of the boot margin because run_peak "
+                f"now CHARGES the ratchet, and the residual is RE-MEASURED on "
+                f"ratchet-priced predictions -- bound {87.30:.2f} -> "
+                f"{hard_bound_gib:.2f} GiB. Both moves are one-way in the FUNDING "
+                "direction, so both are stated here: the residual rows are the "
+                "five #1350 replays (max +0.908, weg2xsn23) plus their own "
+                "measured steady-state drift, and the pre-ratchet weg2sb4 5.16 "
+                "row is deliberately not summed with the charged term (W95)] "
+                if not margin.transient_in_boot else ""
+            )
+            + "=> "
+            + ("FUNDABLE" if ok else "refused (binding: " + ", ".join(binding) + ")")
+        )
+        if ok and chosen is None:
+            chosen = arm
+    if chosen is None:
+        # The advisory's explanatory half belongs in the refusal too -- see
+        # :func:`_advisory_line`.  The most frugal arm is the ladder's last.
+        frugal = priced[-1]
+        lines.append(_advisory_line(frugal, chosen=False))
+        table = "\n".join(lines)
+        # THE HONEST OUTCOME (fix 8): on today's box every arm may refuse, and
+        # that IS the answer for this tree.  No term is shrunk to get an arm
+        # through -- the term that has to move is the flip transient, and it
+        # moves in the ring slice, not here.
+        outcome = (
+            "no arm funds a flip on this host budget.  The flip transient this sentence "
+            "used to name as the thing that had to move is ALREADY gone: the host ring "
+            "landed (C19), so the run moment charges Sigma H once and there is no "
+            "transient left to cut"
+        )
+        levers = (
+            "The levers are NAMED so this refusal is actionable, and #1236 changed which "
+            "ones exist: THE STORE IS NOT A LEVER ANY MORE IN EITHER DIRECTION. It is a "
+            "directory on the ZFS dataset, it is not charged to this sum, and "
+            "--store-min-gib is deleted -- a floor on a RAM residual is meaningless once "
+            "the store is not funded from RAM. The one lever left is the peak itself: cut "
+            "Sigma H -- the per-card host ring table, solved from the previous boot's own "
+            "measured dormant image (ring_table.solve), so a smaller image is a smaller "
+            "ring -- or take a lower arm of the ladder. Note the direction #1236 moves "
+            "this refusal: every arm's predicted peak is now LOWER by exactly the store "
+            "term it used to carry (6 GiB on boot weg2sb5g), so an arm that refused for "
+            "the store's sake alone no longer refuses at all."
+        )
+        if peak_bound_any:
+            raise PdFlipHostRunPeakRefused(
+                "W21 PdFlipHostRunPeakRefused: an arm funds both moments and the HARD BOUND "
+                f"{hard_bound_gib:.2f} GiB (reap point {watermark_gib:.2f} GiB minus margin "
+                f"{margin.total_gib:.2f} GiB = {margin.terms()}) still binds "
+                "it -- its predicted RUN PEAK is not below the hard bound, and #1236 "
+                "already removed the store term from that peak, so no store size can "
+                f"repair it and none is asked to. {outcome}. The binding "
+                "term is printed per arm below; the image term is now "
+                "MEASURED (boot weg2dk7: 38.63 GiB dormant against the 28.83 GiB the tag "
+                "census priced) and the origin is the RUN moment, not the launch moment. "
+                f"{levers}\n" + table
+            )
+        cap_advice = ""
+        if s_gb_d is not None and d_cap_terms:
+            def _ok(sd: int) -> bool:
+                try:
+                    a = price(
+                        memtotal_bytes, memavail_bytes, arms[0][0], arms[0][1],
+                        ranks_per_group=ranks_per_group, ring_bytes=ring_bytes,
+                        ring_span1_bytes=ring_span1_bytes,
+                        cg_current_bytes=cg_current_bytes,
+                        reclaimable_bytes=reclaimable_bytes,
+                        cg_ceiling_bytes=cg_ceiling_bytes, s_gb_d=sd,
+                        ring_absent_by_design=ring_absent_by_design,
+                        measured_record=measured_record,
+                        # #1350: the cap advice must be priced by the SAME model
+                        # the ladder was, or it would name a cap that only fits
+                        # an arm the ledger no longer offers.
+                        flip_ratchet=flip_ratchet,
+                        arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
+                        d_draft_host_gib=d_draft_host_gib,
+                        d_only=d_only,
+                        reference_model_ok=reference_model_ok,
+                        reference_model_why=reference_model_why,
+                        memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
+                        l3_index_gib=l3_index_gib,
+                    )
+                except Exception:  # noqa: BLE001 - advice may never mask the refusal
+                    return False
+                return bool(a.fundable_moments)
+
+            fit = largest_fundable_d_cap(
+                _ok,
+                int(d_cap_terms.get("cap_tokens", 0)),
+                float(d_cap_terms.get("max_rank_share", 0.0)),
+                int(d_cap_terms.get("cell_bytes", 1)),
+                float(d_cap_terms.get("fraction", 1.0)),
+            )
+            if fit is None:
+                cap_advice = (
+                    " LARGEST FUNDABLE CAP: none -- not even S_D=1 funds the "
+                    "moments, so group D's L2 budget is NOT the binding term "
+                    "here and lowering --max-kv-per-request will not help. "
+                    "Cut the term the binding moment names."
+                )
+            else:
+                cap_advice = (
+                    f" LARGEST FUNDABLE CAP: **{int(fit['cap_tokens'])} tokens** "
+                    f"at S_D={int(fit['s_gb_d'])} GB "
+                    f"({int(fit['rows'])} rows, {int(fit['rows_lendable'])} "
+                    f"lendable behind the load fraction), against the "
+                    f"{int(fit['asked_cap'])} asked for. So either lower "
+                    f"--max-kv-per-request to that, or free the term the "
+                    f"binding moment names below -- but do NOT lower "
+                    f"--hicache-size for D on its own: that reintroduces the "
+                    f"shortfall the #1317 window layer existed to compensate, "
+                    f"which is what this ticket deleted."
+                )
+        raise PdFlipHostLedgerRefused(
+            "W20 PdFlipHostLedgerRefused: no arm of the ladder funds both moments on this "
+            "box (the store is NOT in this test any more -- #1236 put it on disk) "
+            f"(host weights term = {priced[0].terms['host_ring_gib']:.2f} GiB at the run "
+            f"moment, span 1 = {priced[0].terms['host_ring_span1_gib']:.2f} GiB at the launch "
+            f"moment; {ring_provenance or 'no provenance passed'}). "
+            "The INT8 checkpoint has only the cpu-backup wake path (W4), and the ledger "
+            f"will not shrink another term silently. {outcome}. {levers}"
+            f"{cap_advice}\n"
+            + table
+        )
+    chosen_peak = chosen.predicted_run_peak_gib()
+    headroom = None if chosen_peak is None else hard_bound_gib - chosen_peak
+    lines.append(
+        f"PDFLIP-HOST-LEDGER CHOSEN S={chosen.s_gb} GB (--hicache-size, both groups) "
+        f"M={chosen.m_mib} MiB (--hicache-mamba-host-mib, both groups) "
+        f"store=ON DISK, NOT A RAM POST (#1236: launcher.STORE_ROOT on the ZFS dataset; "
+        f"its host cost is page_cache=reclaimable plus the ZFS ARC, neither of which the "
+        f"reaper kills for, and neither of which is in this arm's sum) "
+        f"launch_leftover={chosen.launch_leftover_gib:.2f} GiB "
+        f"run_leftover={chosen.run_leftover_gib:.2f} GiB "
+        f"reap_headroom={_gib_or_none(headroom)} (hard bound {hard_bound_gib:.2f} - "
+        f"predicted run peak {_gib_or_none(chosen_peak)}) -- provenance: every term "
+        "above; expectation from the operator (record 1g) was ~20 GiB without the "
+        f"heap term ({chosen.terms['heaps_gib']:.2f} GiB measured). THE #1236 DELTA: this "
+        "headroom is larger than the pre-#1236 form's by exactly the store term that "
+        "form charged -- 6 GiB on boot weg2sb5g, whose store was RAM-backed -- and "
+        "the launcher prints the delta against THIS boot's own store budget on the "
+        "PDFLIP-STORE line rather than repeating a recalled number here."
+    )
+    lines.append(_advisory_line(chosen, chosen=True))
+    return chosen, headroom, lines
+
+
+class WindowUnsolvable(RuntimeError):
+    """W21: no window fits this host pool, and the arithmetic says why.
+
+    A launch refusal, never a runtime fallback: a group that cannot hold one
+    window plus the write-through floor cannot read the store back in windows
+    at all, and discovering that at the first long prompt means the boot is
+    already serving.
+    """
+
+
+def solve_window(
+    pool_rows: int,
+    chunk: int,
+    chains: int,
+    ring_floor: int,
+    anchor_slots: int,
+) -> int:
+    """#1317 C10: the largest window, in tokens, one store read may hold.
+
+    THE QUANTITY.  A windowed store read holds, at any moment, ONE window of
+    host rows per concurrent chain plus whatever the write-through ring has
+    staged.  So
+
+        W = chunk * floor((pool_rows - ring_floor) / (chains * chunk))
+
+    ``chunk`` is the STATIC ``--chunked-prefill-size`` and never
+    ``dynamic_chunked_prefill_size``: a C that varies per rank at runtime is
+    the rank-divergent form the group vote exists to delete, and ``C | W`` is
+    load-bearing for the GDN anchors (one anchor per chunk node).
+
+    ``pool_rows`` is the group's OWN MIN-synced ``mem_pool_host.size``, read
+    in-process.  It is deliberately NOT transported from the launcher: group P
+    holds 54,254 rows and group D 30,518, and one launcher-solved W would
+    truncate every P prefetch to a D-sized window.
+
+    ``chains`` is ``--max-running-requests``: the pool is shared, and sizing W
+    as if one request existed is how a second concurrent read finds no room
+    and votes the first one down.
+
+    Raises :class:`WindowUnsolvable` (W21) with the arithmetic when no window
+    fits, or when the windows would need more resume anchors than the anchor
+    pool holds -- an anchor-starved chain stalls at window 2, which is a
+    launch-time fact and must be a launch-time refusal.
+
+    Worked, group D on boot ``weg2sn5w``: pool_rows=30,518, chunk=4,096,
+    chains=1, ring_floor=4,096, anchor_slots=37 ->
+    W = 4,096 * floor(26,422/4,096) = 4,096 * 6 = 24,576; live W + ring_floor
+    = 28,672 <= 30,518 (slack 1,846); anchors W//C + 1 = 7 of 37.
+    """
+    pool_rows = int(pool_rows)
+    chunk = int(chunk)
+    chains = max(1, int(chains))
+    ring_floor = int(ring_floor)
+    anchor_slots = int(anchor_slots)
+    if chunk <= 0:
+        raise WindowUnsolvable(
+            f"W21 window unsolvable: chunk (--chunked-prefill-size) is {chunk}, "
+            "which is not a length; a window is a whole number of chunks "
+            "because the GDN anchors are published one per chunk node."
+        )
+    room = pool_rows - ring_floor
+    windows = room // (chains * chunk) if room > 0 else 0
+    w = chunk * windows
+    if w < chunk:
+        raise WindowUnsolvable(
+            f"W21 window unsolvable: host pool {pool_rows} rows minus the "
+            f"write-through floor {ring_floor} leaves {room} rows, which is "
+            f"less than one chunk of {chunk} for each of {chains} concurrent "
+            f"chains (needs {chains * chunk}). This group cannot read the "
+            f"store back in windows at all. Raise --hicache-size, lower "
+            f"--max-running-requests, or lower --chunked-prefill-size."
+        )
+    anchors_live = w // chunk + 1
+    if anchors_live > anchor_slots:
+        raise WindowUnsolvable(
+            f"W21 window unsolvable: a window of {w} tokens needs "
+            f"{anchors_live} live resume anchors (W//C + 1: one per chunk node "
+            f"plus the head's own anchor, which must survive its window's "
+            f"recycle) but the anchor pool holds {anchor_slots}. The chain "
+            f"would stall at window 2 with an unmatchable node. Raise the "
+            f"anchor pool (--mamba-host-pool-mib) or lower "
+            f"--chunked-prefill-size."
+        )
+    return w
+
+
+def window_provenance(
+    pool_rows: int,
+    chunk: int,
+    chains: int,
+    ring_floor: int,
+    anchor_slots: int,
+    prompt_tokens: int = 0,
+) -> str:
+    """One line naming every term that produced W, for the launcher to print.
+
+    Prints the terms, not just the number: two groups printing the same W from
+    different pools would be a coincidence, and the reader of a boot log has
+    no other way to tell which pool answered.
+    """
+    w = solve_window(pool_rows, chunk, chains, ring_floor, anchor_slots)
+    n = -(-int(prompt_tokens) // w) if prompt_tokens > 0 else 0
+    return (
+        f"#1317 WINDOW W={w} chunk={chunk} chains={chains} "
+        f"pool_rows={pool_rows} ring_floor={ring_floor} "
+        f"live={w + ring_floor}<={pool_rows} slack={pool_rows - w - ring_floor} "
+        f"anchors={w // chunk + 1}/{anchor_slots} windows_for_{prompt_tokens}={n}"
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--meminfo", default="/proc/meminfo")
+    ap.add_argument("--ring-bytes", type=int, default=0, help="Sigma H, from ring_table.solve")
+    ap.add_argument("--ring-span1-bytes", type=int, default=0, help="Sigma image_P")
+    ap.add_argument("--ring-provenance", default="")
+    ap.add_argument("--cgroup", default="/sys/fs/cgroup")
+    ap.add_argument("--weight-chunks", type=int, default=0)
+    ap.add_argument("--measured-record", default="")
+    ns = ap.parse_args(argv)
+    mi = read_meminfo(ns.meminfo)
+    cg = read_cgroup(ns.cgroup)
+    ceiling, ceiling_source = resolve_cg_ceiling(cg, mi["MemTotal"])
+    try:
+        arm, headroom, lines = choose(
+            mi["MemTotal"],
+            mi["MemAvailable"],
+            ring_bytes=ns.ring_bytes,
+            ring_span1_bytes=ns.ring_span1_bytes,
+            ring_provenance=ns.ring_provenance,
+            cg_current_bytes=cg["current"],
+            reclaimable_bytes=cg["reclaimable"],
+            slab_reclaimable_bytes=cg["slab_reclaimable"],
+            cg_ceiling_bytes=ceiling,
+            cg_ceiling_source=ceiling_source,
+            cg_oom_kill=cg["oom_kill"],
+            measured_record=read_measured_record(ns.measured_record) if ns.measured_record else None,
+        )
+    except (PdFlipHostLedgerRefused, PdFlipHostRunPeakRefused) as e:
+        print(str(e))
+        return 2
+    print("\n".join(lines))
+    print(f"PDFLIP_S_GB={arm.s_gb}")
+    print(f"PDFLIP_M_MIB={arm.m_mib}")
+    # #1236: PDFLIP_STORE_GIB is GONE from this output rather than printed as 0.
+    # A key whose value became meaningless is deleted; a 0 would read as "the
+    # ledger sized a zero store", which is a different and false statement.
+    print("PDFLIP_REAP_HEADROOM_GIB=" + ("unreadable" if headroom is None else f"{headroom:.2f}"))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -8,9 +8,9 @@ Docker-based opentelemetry-collector and file I/O.
 import os
 
 # Configure OTLP exporter for faster test execution
-# Must be set before importing sglang trace module
-os.environ.setdefault("SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS", "50")
-os.environ.setdefault("SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE", "4")
+# Must be set before importing flliper trace module
+os.environ.setdefault("FLLIPER_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS", "50")
+os.environ.setdefault("FLLIPER_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE", "4")
 
 import logging
 import multiprocessing as mp
@@ -22,9 +22,9 @@ from typing import List, Optional, Union
 import requests
 import zmq
 
-from sglang import Engine
-from sglang.srt.observability.req_time_stats import RequestStage
-from sglang.srt.observability.trace import (
+from flliper import Engine
+from flliper.srt.observability.req_time_stats import RequestStage
+from flliper.srt.observability.trace import (
     TraceReqContext,
     TraceSliceContext,
     get_cur_time_ns,
@@ -32,10 +32,10 @@ from sglang.srt.observability.trace import (
     set_global_trace_level,
     trace_set_thread_info,
 )
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.network import get_zmq_socket
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.srt.utils.network import get_zmq_socket
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -54,7 +54,7 @@ register_amd_ci(est_time=113, suite="stage-b-test-1-gpu-small-amd")
 # Lightweight OTLP Collector (shared across tracing tests)
 # ============================================================================
 
-from sglang.test.otel_collector import LightweightOtlpCollector, Span  # noqa: F401
+from flliper.test.otel_collector import LightweightOtlpCollector, Span  # noqa: F401
 
 # ============================================================================
 # Test Helper Functions

@@ -10,7 +10,7 @@ shared-prefix percentage, the benchmark:
 1. Flushes the server KV cache.
 2. Builds prompts with an identical shared prefix and random unique suffixes.
 3. Warms only the shared prefix once.
-4. Benchmarks the full prompts through SGLang's native /generate endpoint.
+4. Benchmarks the full prompts through fLLiper's native /generate endpoint.
 
 Compared with the existing hicache shared-prefix benchmarks, this benchmark
 provides direct control over total length, shared-prefix length, and suffix
@@ -31,7 +31,7 @@ import numpy as np
 import requests
 from transformers import PreTrainedTokenizerBase
 
-from sglang.benchmark.utils import get_tokenizer, remove_prefix, set_ulimit
+from flliper.benchmark.utils import get_tokenizer, remove_prefix, set_ulimit
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 AIOHTTP_READ_BUFSIZE = 10 * 1024**2
@@ -94,7 +94,7 @@ def _create_bench_client_session() -> aiohttp.ClientSession:
     )
 
 
-async def async_request_sglang_generate(
+async def async_request_flliper_generate(
     api_url: str,
     input_ids: List[int],
     prompt_len: int,
@@ -186,7 +186,7 @@ async def run_batch(
 
     async def limited_request(prompt: Dict[str, Any]) -> RequestFuncOutput:
         if semaphore is None:
-            return await async_request_sglang_generate(
+            return await async_request_flliper_generate(
                 api_url=api_url,
                 input_ids=prompt["input_ids"],
                 prompt_len=prompt["prompt_len"],
@@ -194,7 +194,7 @@ async def run_batch(
                 pbar=pbar,
             )
         async with semaphore:
-            return await async_request_sglang_generate(
+            return await async_request_flliper_generate(
                 api_url=api_url,
                 input_ids=prompt["input_ids"],
                 prompt_len=prompt["prompt_len"],
@@ -246,7 +246,7 @@ async def warm_shared_prefix(api_url: str, shared_prefix_ids: List[int]) -> None
     if not shared_prefix_ids:
         return
 
-    warmup = await async_request_sglang_generate(
+    warmup = await async_request_flliper_generate(
         api_url=api_url,
         input_ids=shared_prefix_ids,
         prompt_len=len(shared_prefix_ids),
@@ -557,9 +557,9 @@ async def main() -> None:
     parser.add_argument(
         "--backend",
         type=str,
-        default="sglang",
-        choices=["sglang"],
-        help="Warm-cache benchmark currently supports the native SGLang /generate endpoint.",
+        default="flliper",
+        choices=["flliper"],
+        help="Warm-cache benchmark currently supports the native fLLiper /generate endpoint.",
     )
     parser.add_argument(
         "--base-url",

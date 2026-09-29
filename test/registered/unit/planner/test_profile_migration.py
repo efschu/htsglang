@@ -28,9 +28,9 @@ import time
 import unittest
 from unittest import mock
 
-from sglang.srt import uneven_perf
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import uneven_perf
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -251,12 +251,12 @@ class TestLazyTopUp(CustomTestCase):
         self.assertNotIn("gemm_lanes", profile["gpus"]["GPU-aaa"])
         note = profile[uneven_perf.PROFILE_NOTES_KEY]["gemm_lanes"]
         self.assertIn("rc=1", note)
-        self.assertIn("SGLANG_PERF_REPROBE", note)
+        self.assertIn("FLLIPER_PERF_REPROBE", note)
 
     def test_reprobe_forced_ignores_the_migration_entirely(self):
         with mock.patch.object(
             uneven_perf, "_run_probe_subprocess", side_effect=self._fake_probe()
-        ), mock.patch.dict(os.environ, {"SGLANG_PERF_REPROBE": "1"}):
+        ), mock.patch.dict(os.environ, {"FLLIPER_PERF_REPROBE": "1"}):
             _, source, _ = uneven_perf.get_hardware_profile()
         self.assertEqual(self.calls, [None])
         self.assertIn("fresh probe", source)
@@ -363,7 +363,7 @@ class TestLinkPhaseTimeCap(CustomTestCase):
         _, reason, _ = self._run_with_hung_link(0.3, reached=(0, 2))
         self.assertIn("[0, 2]", reason)
         self.assertIn("never arrived: [1]", reason)
-        self.assertIn("SGLANG_PERF_PROBE_LINK_TIMEOUT_S", reason)
+        self.assertIn("FLLIPER_PERF_PROBE_LINK_TIMEOUT_S", reason)
 
     def test_a_timed_out_link_phase_still_caches_the_card_measurements(self):
         import tempfile
@@ -398,7 +398,7 @@ class TestLinkPhaseTimeCap(CustomTestCase):
             ), mock.patch.object(
                 uneven_perf, "_probe_one_gpu", side_effect=lambda g, groups: {}
             ), mock.patch.dict(
-                os.environ, {"SGLANG_PERF_PROBE_SKIP_LINKS": "1"}
+                os.environ, {"FLLIPER_PERF_PROBE_SKIP_LINKS": "1"}
             ):
                 profile = uneven_perf.run_probe(out)
         self.assertEqual(profile["links"], {})

@@ -18,7 +18,7 @@ this file cannot rot into a test that passes whatever the code does.
 import types
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10)
 
@@ -26,9 +26,9 @@ register_cpu_ci(est_time=10)
 class PhaseField(unittest.TestCase):
     def _field(self, flip_enabled, tp_active):
         """Drive the SHIPPED helper with both authorities stubbed."""
-        from sglang.srt.managers.scheduler_components import metrics_reporter as mr
-        from sglang.srt import runtime_context as sa
-        from sglang.srt.distributed import parallel_state as ps
+        from flliper.srt.managers.scheduler_components import metrics_reporter as mr
+        from flliper.srt import runtime_context as sa
+        from flliper.srt.distributed import parallel_state as ps
 
         prev_args, prev_routing = sa.get_server_args, ps.phase_flip_tp_routing_active
         try:
@@ -56,8 +56,8 @@ class PhaseField(unittest.TestCase):
 
     def test_a_broken_authority_never_breaks_the_stats_line(self):
         """A label is not worth losing the throughput line over."""
-        from sglang.srt.managers.scheduler_components import metrics_reporter as mr
-        from sglang.srt import runtime_context as sa
+        from flliper.srt.managers.scheduler_components import metrics_reporter as mr
+        from flliper.srt import runtime_context as sa
 
         prev = sa.get_server_args
         try:
@@ -75,7 +75,7 @@ class PhaseField(unittest.TestCase):
         the way a refactor that 'tidied' the field away would -- and the phase
         assertions must fail. If this test ever passes while the others do
         too, the checks above have stopped checking anything."""
-        from sglang.srt.managers.scheduler_components import metrics_reporter as mr
+        from flliper.srt.managers.scheduler_components import metrics_reporter as mr
 
         prev = mr._active_phase_field
         try:

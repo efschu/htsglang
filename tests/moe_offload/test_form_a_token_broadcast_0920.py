@@ -6,8 +6,8 @@ broadcast on a verify step."""
 
 import inspect
 
-from sglang.srt import rank_role
-from sglang.srt.rank_role import HOST, WORKER, RankRolePlan, set_form_a_role_plan
+from flliper.srt import rank_role
+from flliper.srt.rank_role import HOST, WORKER, RankRolePlan, set_form_a_role_plan
 
 FORM_A = RankRolePlan((HOST, WORKER, WORKER))
 
@@ -28,7 +28,7 @@ def test_host_predicate_and_token_source():
 
 
 def test_generation_step_wires_worker_recv_and_host_send():
-    from sglang.srt.managers import tp_worker as tw
+    from flliper.srt.managers import tp_worker as tw
 
     src = inspect.getsource(tw.TpModelWorker.forward_batch_generation)
     recv = src.index("head_ids = broadcast_pyobj(")
@@ -41,7 +41,7 @@ def test_generation_step_wires_worker_recv_and_host_send():
 
 
 def test_verify_step_worker_receives_the_accept_broadcast():
-    from sglang.srt.speculative import eagle_worker_v2 as ew
+    from flliper.srt.speculative import eagle_worker_v2 as ew
 
     src = inspect.getsource(ew)
     i = src.index("weightless_recv=_wl_worker")

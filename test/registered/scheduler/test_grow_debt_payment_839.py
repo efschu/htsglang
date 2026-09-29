@@ -62,12 +62,12 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.layers.dcp.phase_flip_plan import TP_TO_PP
-from sglang.srt.managers import phase_flip_runtime as _rt
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
-from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.dcp.phase_flip_plan import TP_TO_PP
+from flliper.srt.managers import phase_flip_runtime as _rt
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 BYTES_PER_ROW = 32768
 LAW_FLOOR = 1024 * 1024 * 1024
@@ -104,7 +104,7 @@ class _FakeVmmPool:
 
 
 def _relief(backed_rows: int = W4B_BACKED):
-    from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+    from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
     pool = _FakeVmmPool(backed_rows, W4B_RESERVATION)
     return KvBackingRelief(
@@ -182,7 +182,7 @@ class TheDebtIsBookedAndCounted(unittest.TestCase):
             self.skipTest("debt patience is disabled in this configuration")
         rt._round = 1 + patience
         with self.assertLogs(
-            "sglang.srt.managers.phase_flip_runtime", level="ERROR"
+            "flliper.srt.managers.phase_flip_runtime", level="ERROR"
         ) as caught:
             rt._deferred_grow_debt_check()
         line = "\n".join(caught.output)
@@ -256,7 +256,7 @@ class TheDebtIsPaidWithoutACutover(CustomTestCase):
         rt._pay_deferred_grow()
         _ballot(relief, W4B_BACKED)
         rt._round = 1 + max(1, _rt.seam_shrink_grow_debt_rounds())
-        with self.assertNoLogs("sglang.srt.managers.phase_flip_runtime", level="ERROR"):
+        with self.assertNoLogs("flliper.srt.managers.phase_flip_runtime", level="ERROR"):
             rt._deferred_grow_debt_check()
         self.assertEqual(rt._deferred_grow_rows, 0)
 
@@ -347,7 +347,7 @@ class ThePaymentPathIsWired(CustomTestCase):
     def test_the_rung_reduction_publishes_the_group_level(self):
         import inspect
 
-        from sglang.srt.managers import phase_flip_spill
+        from flliper.srt.managers import phase_flip_spill
 
         src = inspect.getsource(phase_flip_spill.collective_kv_backing_relief)
         self.assertIn(
@@ -366,7 +366,7 @@ class ThePaymentPathIsWired(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+        from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
         src = inspect.getsource(KvBackingRelief.publish_group_exposure)
         for forbidden in ("reduce_fn", "all_reduce", "broadcast", "barrier"):

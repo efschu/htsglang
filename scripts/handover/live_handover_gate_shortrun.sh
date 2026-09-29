@@ -31,7 +31,7 @@
 #       --hicache-mem-layout page_first_direct
 #     A hybrid-GDN model has no choice: MambaPoolHost accepts
 #     page_first_direct only.
-#   * SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR set per server to its own store.
+#   * FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR set per server to its own store.
 #   * A held /spinning/gpu-arb claim. This script checks for one and refuses
 #     without it; it never creates or steals a claim.
 #
@@ -44,9 +44,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="${GATE:-$HERE/live_handover_gate.sh}"
 
 # --- 1. no shim, and say so if one was asked for -------------------------
-: "${SGLANG_HICACHE_HARNESS_SHIM:=}"
-if [[ -n "${SGLANG_HICACHE_HARNESS_SHIM}" ]]; then
-  echo "REFUSING: SGLANG_HICACHE_HARNESS_SHIM=${SGLANG_HICACHE_HARNESS_SHIM} is set." >&2
+: "${FLLIPER_HICACHE_HARNESS_SHIM:=}"
+if [[ -n "${FLLIPER_HICACHE_HARNESS_SHIM}" ]]; then
+  echo "REFUSING: FLLIPER_HICACHE_HARNESS_SHIM=${FLLIPER_HICACHE_HARNESS_SHIM} is set." >&2
   echo "  This run exists to prove the HiCache host tier. With the harness" >&2
   echo "  shim in place it would prove the shim instead. Unset it deliberately" >&2
   echo "  and re-run, so the choice is on the record." >&2

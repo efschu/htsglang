@@ -1,7 +1,7 @@
 """BOOTZEIT 3 (29.09., z30r3): the presplit's device -> store write in runs.
 
 z30r3 PP0: store_write 16.7 s of a 51.1 s presplit -- one synchronous D2H
-copy per expert row. With SGLANG_EXPERT_STORE_WRITE_RUNS the rows go in runs
+copy per expert row. With FLLIPER_EXPERT_STORE_WRITE_RUNS the rows go in runs
 where both the store rows and the source rows are consecutive: same bytes,
 same rows, a handful of copies per tensor.
 """
@@ -11,7 +11,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.moe import expert_store as es
+from flliper.srt.layers.moe import expert_store as es
 
 
 def test_runs_need_both_sides_consecutive():
@@ -38,17 +38,17 @@ def test_run_copy_writes_the_same_bytes_as_the_row_copy():
 
 
 def test_switch_off_keeps_the_per_row_path(monkeypatch):
-    monkeypatch.delenv("SGLANG_EXPERT_STORE_WRITE_RUNS", raising=False)
-    from sglang.srt.environ import envs
+    monkeypatch.delenv("FLLIPER_EXPERT_STORE_WRITE_RUNS", raising=False)
+    from flliper.srt.environ import envs
 
-    assert envs.SGLANG_EXPERT_STORE_WRITE_RUNS.get() is False
+    assert envs.FLLIPER_EXPERT_STORE_WRITE_RUNS.get() is False
     called = []
     monkeypatch.setattr(es, "_copy_row_runs", lambda *a, **k: called.append(1))
     store = torch.zeros(4, 2)
     src = torch.ones(4, 2)
     # a CPU source takes the index_copy_ branch in either mode; the run copy
     # belongs to the device branch only
-    with mock.patch.dict(os.environ, {"SGLANG_EXPERT_STORE_WRITE_RUNS": "1"}):
+    with mock.patch.dict(os.environ, {"FLLIPER_EXPERT_STORE_WRITE_RUNS": "1"}):
         es.write_rows(store, src, [0, 1], 0, rows={0: 0, 1: 1})
     assert called == []
     assert torch.equal(store[:2], torch.ones(2, 2))

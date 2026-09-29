@@ -6,14 +6,14 @@ import requests
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
-from sglang.srt.observability.metrics_collector import QueueCount
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import (
+from flliper.srt.observability.metrics_collector import QueueCount
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -127,7 +127,7 @@ class TestPriorityMetrics(CustomTestCase):
         metrics = _parse_prometheus_metrics(metrics_response.text)
 
         # Verify priority label exists on queue gauge metrics
-        for metric_name in ["sglang:num_running_reqs", "sglang:num_queue_reqs"]:
+        for metric_name in ["flliper:num_running_reqs", "flliper:num_queue_reqs"]:
             samples = _get_samples_by_name(metrics, metric_name)
             self.assertGreater(len(samples), 0, f"No samples found for {metric_name}")
 
@@ -161,8 +161,8 @@ class TestPriorityMetrics(CustomTestCase):
 
         # Check histogram metrics have priority label with per-priority breakdown
         histogram_metrics = [
-            "sglang:time_to_first_token_seconds",
-            "sglang:e2e_request_latency_seconds",
+            "flliper:time_to_first_token_seconds",
+            "flliper:e2e_request_latency_seconds",
         ]
         for metric_name in histogram_metrics:
             # Histogram metrics are emitted as _sum, _count, _bucket
@@ -213,7 +213,7 @@ class TestPriorityMetrics(CustomTestCase):
 
         # Check that e2e latency has samples with priority="0" (the default)
         e2e_count = _get_samples_by_name(
-            metrics, "sglang:e2e_request_latency_seconds_count"
+            metrics, "flliper:e2e_request_latency_seconds_count"
         )
         priority_values = {s.labels.get("priority", "") for s in e2e_count}
         self.assertIn(

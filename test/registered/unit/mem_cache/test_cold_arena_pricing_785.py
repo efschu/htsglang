@@ -14,8 +14,8 @@ reported as a derived zero rather than silently looking like a missing one.
 
 import dataclasses
 
-from sglang.srt.managers import phase_flip_seam_reserve as seam
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.managers import phase_flip_seam_reserve as seam
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
 

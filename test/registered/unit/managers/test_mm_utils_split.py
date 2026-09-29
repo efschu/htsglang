@@ -16,10 +16,10 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.mm_utils import get_new_expanded_mm_items
+from flliper.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

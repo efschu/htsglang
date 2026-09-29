@@ -10,9 +10,9 @@ import torch
 import torch.nn.functional as F
 import triton.testing
 
-from sglang.jit_kernel.diffusion.triton.group_norm_silu import triton_group_norm_silu
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
+from flliper.jit_kernel.diffusion.triton.group_norm_silu import triton_group_norm_silu
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.utils import is_in_ci
 
 register_cuda_ci(
     est_time=45,

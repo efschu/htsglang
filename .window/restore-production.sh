@@ -18,18 +18,18 @@ fi
 
 export PYTHONPATH="$PROD_WT/python"
 export LD_LIBRARY_PATH=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_BARLINK=0
-export SGLANG_BARLINK_BAR1_CAP_CYCLES=300000000000
-export SGLANG_BOOT_COMMIT=6c1e5cafb7
-export SGLANG_COLLECTIVE_CENSUS_INTERVAL=1
-export SGLANG_MAMBA_PIN_TRACE=50
-export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/spinning/hicache
-export SGLANG_VRAM_FLIGHT_DIR=/spinning/flight_605
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_BARLINK=0
+export FLLIPER_BARLINK_BAR1_CAP_CYCLES=300000000000
+export FLLIPER_BOOT_COMMIT=6c1e5cafb7
+export FLLIPER_COLLECTIVE_CENSUS_INTERVAL=1
+export FLLIPER_MAMBA_PIN_TRACE=50
+export FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR=/spinning/hicache
+export FLLIPER_VRAM_FLIGHT_DIR=/spinning/flight_605
 
-setsid "$VENV" -m sglang.launch_server \
+setsid "$VENV" -m flliper.launch_server \
     --model-path "$MODEL" \
     --served-model-name Qwen3.6-27B \
     --tp-size 3 \

@@ -31,14 +31,14 @@ CPU only: this tests the construction DECISION, not custom all-reduce itself.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 # THE REAL FUNCTION, imported -- not a re-implementation. See the sibling test
 # for why: a private copy kept four of five tests green across a revert.
-from sglang.srt.distributed.parallel_state import (
+from flliper.srt.distributed.parallel_state import (
     should_build_custom_allreduce as _should_build_ca,
 )
 
@@ -96,7 +96,7 @@ class TestBarlinkSuppressesCustomAllreduce(CustomTestCase):
         """The call site must go through the shared predicate."""
         import inspect
 
-        from sglang.srt.distributed import parallel_state
+        from flliper.srt.distributed import parallel_state
 
         src = inspect.getsource(parallel_state.GroupCoordinator.__init__)
         self.assertIn("should_build_custom_allreduce(", src)
@@ -113,8 +113,8 @@ class TestBarlinkSuppressesCustomAllreduce(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.distributed.device_communicators import custom_all_reduce
-        from sglang.srt.distributed.device_communicators import custom_all_reduce_utils
+        from flliper.srt.distributed.device_communicators import custom_all_reduce
+        from flliper.srt.distributed.device_communicators import custom_all_reduce_utils
 
         src = inspect.getsource(custom_all_reduce.CustomAllreduce.__init__)
         i_avail = src.find("IS_CUSTOM_AR_AVAILABLE")

@@ -9,7 +9,7 @@ so a stale number is visible as a stale boot tag.
 
 import pytest
 
-from sglang.srt.flip_nextflash_plan import (
+from flliper.srt.flip_nextflash_plan import (
     FORM_A_KV,
     FORM_A_PINNED_GIB,
     HOST_MARK_GIB,
@@ -18,9 +18,9 @@ from sglang.srt.flip_nextflash_plan import (
     CarriedState,
     HostPoolPost,
     KvLayout,
-    Weg2FlipDraftStateOrphaned,
-    Weg2FlipHostPoolDoubled,
-    Weg2FlipKvRelayInfeasible,
+    PdFlipDraftStateOrphaned,
+    PdFlipHostPoolDoubled,
+    PdFlipKvRelayInfeasible,
     solve_host_pool,
     solve_kv_relay,
     solve_state_carry,
@@ -78,16 +78,16 @@ def test_w113_when_the_host_is_too_small():
         avail_bytes=(2 * 1024**3, 2420113408, 2208301056),
         full_attn_per_rank=(12, 0, 0),
     )
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         solve_kv_relay(PP3_KV, starved, CONTEXT_262K)
     msg = str(exc.value)
-    assert "W113 Weg2FlipKvRelayInfeasible" in msg
+    assert "W113 PdFlipKvRelayInfeasible" in msg
     # The refusal must name the shortfall in GiB, not just say "no".
     assert "GiB" in msg and "262144" in msg
 
 
 def test_w113_rejects_a_ragged_layout():
-    with pytest.raises(Weg2FlipKvRelayInfeasible):
+    with pytest.raises(PdFlipKvRelayInfeasible):
         KvLayout(
             name="ragged",
             boot="synthetic",
@@ -98,7 +98,7 @@ def test_w113_rejects_a_ragged_layout():
 
 
 def test_w113_rejects_a_zero_context():
-    with pytest.raises(Weg2FlipKvRelayInfeasible):
+    with pytest.raises(PdFlipKvRelayInfeasible):
         solve_kv_relay(PP3_KV, FORM_A_KV, 0)
 
 
@@ -121,10 +121,10 @@ def test_measured_pinned_pools_match_the_boot_logs():
 
 
 def test_six_private_pools_blow_the_host_mark():
-    with pytest.raises(Weg2FlipHostPoolDoubled) as exc:
+    with pytest.raises(PdFlipHostPoolDoubled) as exc:
         solve_host_pool(_six_processes(), shared=False)
     msg = str(exc.value)
-    assert "W114 Weg2FlipHostPoolDoubled" in msg
+    assert "W114 PdFlipHostPoolDoubled" in msg
     assert "PER-PROCESS" in msg or "per-process" in msg.lower()
     # 31.88 + 38.86 = 70.74 GiB pinned, plus 6 x 6.5 = 39 GiB anon.
     assert "70.74" in msg
@@ -147,7 +147,7 @@ def test_sharing_alone_is_not_enough_at_the_measured_anon_term():
     assert ledger.total_gib == pytest.approx(79.97, abs=0.02)
     assert ledger.total_gib < HOST_MARK_GIB
     # One more GiB of anonymous footprint per rank and it is over.
-    with pytest.raises(Weg2FlipHostPoolDoubled) as exc:
+    with pytest.raises(PdFlipHostPoolDoubled) as exc:
         solve_host_pool(_six_processes(anon_gib=8.0), shared=True)
     assert "ALREADY shared" in str(exc.value)
 
@@ -158,7 +158,7 @@ def test_anon_never_shares():
 
 
 def test_w114_refuses_an_empty_ledger():
-    with pytest.raises(Weg2FlipHostPoolDoubled):
+    with pytest.raises(PdFlipHostPoolDoubled):
         solve_host_pool([], shared=True)
 
 
@@ -191,17 +191,17 @@ def test_next_flash_state_plan_prices_the_rebuild():
 def test_w115_a_solo_draft_declared_carried_is_refused():
     states = _next_flash_states()
     states[3] = CarriedState("mtp_draft_kv", "", "host", 512, "carried")
-    with pytest.raises(Weg2FlipDraftStateOrphaned) as exc:
+    with pytest.raises(PdFlipDraftStateOrphaned) as exc:
         solve_state_carry(states, prefill_tok_s=2729.0)
     msg = str(exc.value)
-    assert "W115 Weg2FlipDraftStateOrphaned" in msg
+    assert "W115 PdFlipDraftStateOrphaned" in msg
     assert "solo draft" in msg
 
 
 def test_w115_a_free_rebuild_is_an_undeclared_cost():
     states = _next_flash_states()
     states[3] = CarriedState("mtp_draft_kv", "", "host", 0, "rebuilt", rebuild_tokens=0)
-    with pytest.raises(Weg2FlipDraftStateOrphaned) as exc:
+    with pytest.raises(PdFlipDraftStateOrphaned) as exc:
         solve_state_carry(states, prefill_tok_s=2729.0)
     assert "undeclared cost" in str(exc.value)
 
@@ -209,7 +209,7 @@ def test_w115_a_free_rebuild_is_an_undeclared_cost():
 def test_w115_rejects_an_unknown_disposition():
     states = _next_flash_states()
     states[0] = CarriedState("gdn_conv_state", "pp-stage", "host", 1, "maybe")
-    with pytest.raises(Weg2FlipDraftStateOrphaned):
+    with pytest.raises(PdFlipDraftStateOrphaned):
         solve_state_carry(states, prefill_tok_s=2729.0)
 
 

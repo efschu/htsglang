@@ -1,0 +1,192 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
+import enum
+import logging
+from dataclasses import dataclass, field
+from typing import Any, List, Optional, Union
+
+import orjson
+
+from flliper.srt.configs.modelopt_config import ModelOptConfig
+from flliper.srt.utils import is_hip
+
+logger = logging.getLogger(__name__)
+
+
+class LoadFormat(str, enum.Enum):
+    AUTO = "auto"
+    PT = "pt"
+    SAFETENSORS = "safetensors"
+    NPCACHE = "npcache"
+    DUMMY = "dummy"
+    SHARDED_STATE = "sharded_state"
+    GGUF = "gguf"
+    BITSANDBYTES = "bitsandbytes"
+    MISTRAL = "mistral"
+    LAYERED = "layered"
+    FLASH_RL = "flash_rl"  # For RL training with quantized models
+    JAX = "jax"
+    REMOTE = "remote"
+    REMOTE_INSTANCE = "remote_instance"
+    RDMA = "rdma"
+    LOCAL_CACHED = "local_cached"
+    FASTSAFETENSORS = "fastsafetensors"
+    PRIVATE = "private"
+    RUNAI_STREAMER = "runai_streamer"
+    # #89: suspend-to-disk restore. Loads per-rank FINAL post-
+    # process_weights_after_loading tensors parked by --enable-weights-disk-
+    # backup, skipping the GGUFReader parse + name-map + flat-assembly derive.
+    HIBERNATE = "hibernate"
+
+
+@dataclass
+class LoadConfig:
+    """
+    download_dir: Directory to download and load the weights, default to the
+        default cache directory of huggingface.
+    load_format: The format of the model weights to load:
+        "auto" will try to load the weights in the safetensors format and
+            fall back to the pytorch bin format if safetensors format is
+            not available.
+        "pt" will load the weights in the pytorch bin format.
+        "safetensors" will load the weights in the safetensors format.
+        "npcache" will load the weights in pytorch format and store
+            a numpy cache to speed up the loading.
+        "dummy" will initialize the weights with random values, which is
+            mainly for profiling.
+        "bitsandbytes" will load nf4 type weights.
+        "flash_rl" will load weights with support for RL training
+            with quantized models, enabling efficient weight reloading.
+    ignore_patterns: The list of patterns to ignore when loading the model.
+        Default to "original/**/*" to avoid repeated loading of llama's
+        checkpoints.
+    decryption_key_file: If set, decrypts the output files with a password read
+        from this file (after PBKDF2).
+    decrypt_max_concurrency: The maximum number of concurrent processes to decrypt the safetensor files. -1 means no limit.
+
+    # ModelOpt-specific loading options
+    modelopt_checkpoint_restore_path: Optional[str] = None
+    modelopt_checkpoint_save_path: Optional[str] = None
+    modelopt_export_path: Optional[str] = None
+    """
+
+    load_format: Union[str, LoadFormat] = LoadFormat.AUTO
+    download_dir: Optional[str] = None
+    model_loader_extra_config: Optional[Union[str, dict]] = field(default_factory=dict)
+    ignore_patterns: Optional[Union[List[str], str]] = None
+    decryption_key_file: Optional[str] = None
+    decrypt_max_concurrency: int = -1
+    tp_rank: Optional[int] = None
+    # #89 hibernate: directory holding parked per-rank shards + manifest.
+    hibernate_dir: Optional[str] = None
+    remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
+    remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
+    remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
+    remote_instance_weight_loader_backend: Optional[str] = None
+    remote_instance_weight_loader_transfer_engine: Optional[Any] = None
+    remote_instance_weight_loader_transfer_engine_session_id: Optional[str] = None
+    modelexpress_url: Optional[str] = None
+    modelexpress_transport: str = "nixl"
+
+    # ModelOpt-specific loading options
+    modelopt_checkpoint_restore_path: Optional[str] = None
+    modelopt_checkpoint_save_path: Optional[str] = None
+    modelopt_export_path: Optional[str] = None
+
+    # ModelOpt configuration object
+    modelopt_config: Optional[ModelOptConfig] = None
+
+    # Inc-related loading options
+    inc_save_path: Optional[str] = None
+    inc_tuning_iters: Optional[int] = 0
+    inc_disable_opt_rtn: Optional[bool] = None
+
+    # QuantizedRL-specific options (for FlashRL-style quantization)
+    rl_quant_profile: Optional[str] = (
+        None  # Path to rollout quantization profile (e.g., /root/profile.7b.pt)
+    )
+
+    # For multi-layer MTP
+    draft_model_idx: Optional[int] = None
+
+    def __post_init__(self):
+        model_loader_extra_config = self.model_loader_extra_config or {}
+        if isinstance(model_loader_extra_config, str):
+            self.model_loader_extra_config = orjson.loads(model_loader_extra_config)
+        self._verify_load_format()
+
+        if self.ignore_patterns is not None and len(self.ignore_patterns) > 0:
+            logger.info(
+                "Ignoring the following patterns when downloading weights: %s",
+                self.ignore_patterns,
+            )
+        else:
+            self.ignore_patterns = ["original/**/*"]
+
+        # Create ModelOptConfig if not provided
+        if self.modelopt_config is None:
+            self.modelopt_config = ModelOptConfig(
+                checkpoint_restore_path=self.modelopt_checkpoint_restore_path,
+                checkpoint_save_path=self.modelopt_checkpoint_save_path,
+                export_path=self.modelopt_export_path,
+            )
+
+    def _verify_load_format(self) -> None:
+        if not isinstance(self.load_format, str):
+            return
+
+        load_format = self.load_format.lower()
+        self.load_format = LoadFormat(load_format)
+
+        rocm_not_supported_load_format: List[str] = []
+        if is_hip() and load_format in rocm_not_supported_load_format:
+            rocm_supported_load_format = [
+                f
+                for f in LoadFormat.__members__
+                if (f not in rocm_not_supported_load_format)
+            ]
+            raise ValueError(
+                f"load format '{load_format}' is not supported in ROCm. "
+                f"Supported load formats are "
+                f"{rocm_supported_load_format}"
+            )
+
+
+def resolve_draft_load_format(server_args: Any, draft_model_path: Optional[str]) -> Any:
+    """The load format of a runner that loads a DRAFT checkpoint.
+
+    * ``--speculative-draft-load-format``, when given, is the draft's own
+      statement and is returned as is.
+    * Otherwise the draft inherits the target's ``--load-format`` (upstream's
+      documented semantics) -- EXCEPT that a GGUF target's ``gguf`` is never
+      handed to a draft that is not a GGUF file. ``server_args.
+      _handle_load_format`` turns the TARGET's ``auto`` into ``gguf``
+      (``check_gguf_file`` on ``model_path``), and ``GGUFModelLoader.
+      _prepare_weights`` takes one ``.gguf`` FILE only, so an inherited
+      ``gguf`` dies on a draft DIRECTORY: ``ValueError: <draft> is not a
+      file`` (27B line, weg2rc4gg PP2, 2026-09-25 04:41Z: the DFlash2-lued-W8
+      safetensors draft beside the unsloth IQ4_XS target; the same class as
+      12ca175896 and TICKET_470 Fixed 2). Such a draft loads ``auto``.
+
+    ``draft_model_path`` is the path the draft ACTUALLY loads from (the
+    draft ``ModelConfig.model_path``; an in-checkpoint MTP head resolves to
+    the target file and keeps ``gguf``).
+
+    Byte-identical for every target that is not GGUF when the flag is unset:
+    the inherited object itself is returned, not a copy or a normalised form.
+    """
+    explicit = getattr(server_args, "speculative_draft_load_format", None)
+    if explicit is not None:
+        return explicit
+    inherited = getattr(server_args, "load_format", LoadFormat.AUTO)
+    name = getattr(inherited, "value", inherited)
+    if not isinstance(name, str) or name.lower() != LoadFormat.GGUF.value:
+        return inherited
+    if not draft_model_path:
+        return inherited
+    from flliper.srt.utils.hf_transformers_utils import check_gguf_file
+
+    if check_gguf_file(draft_model_path):
+        return inherited
+    return LoadFormat.AUTO.value

@@ -17,7 +17,7 @@ F2  `topk_transform_512` (the v1 wrapper, and the DEFAULT top-k on the serving
     path) documented no precondition on `seq_lens`, while both kernels behind
     it read the length as uint32 and take an illegal memory access on a
     negative value. `plan_topk_v2` already documented it. The wrapper now
-    documents it and, under SGLANG_DSV4_CHECK_TOPK_SEQ_LENS, refuses before
+    documents it and, under FLLIPER_DSV4_CHECK_TOPK_SEQ_LENS, refuses before
     the launch.
 
 F4  `build_page_table_positions` floored (`//`) where its triton twin
@@ -46,20 +46,20 @@ from unittest import mock
 
 import torch
 
-from sglang.jit_kernel.dsv4 import topk as topk_mod
-from sglang.jit_kernel.dsv4.compress import (
+from flliper.jit_kernel.dsv4 import topk as topk_mod
+from flliper.jit_kernel.dsv4.compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
 )
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4 import attn_metadata_kernels, compressor_v2
-from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.dsv4 import attn_metadata_kernels, compressor_v2
+from flliper.srt.layers.attention.dsv4.index_buf_accessor import (
     NopeFp8RopeBf16Pack,
     SetKAndS,
     fp8_dtype,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -187,7 +187,7 @@ class TestTopkV1SeqLenPrecondition(CustomTestCase):
         )
 
     def test_negative_seq_len_is_refused_before_the_kernel(self):
-        with envs.SGLANG_DSV4_CHECK_TOPK_SEQ_LENS.override(True), mock.patch.object(
+        with envs.FLLIPER_DSV4_CHECK_TOPK_SEQ_LENS.override(True), mock.patch.object(
             topk_mod, "_jit_topk_v1_module", _refuse_to_load
         ), mock.patch.object(topk_mod, "is_hip_runtime", lambda: False):
             with self.assertRaises(topk_mod.NegativeSeqLenError) as cm:
@@ -200,7 +200,7 @@ class TestTopkV1SeqLenPrecondition(CustomTestCase):
     def test_non_negative_seq_len_reaches_the_kernel(self):
         # Other direction: the guard must not be a blanket refusal, and zero
         # is the documented way to say "no tokens".
-        with envs.SGLANG_DSV4_CHECK_TOPK_SEQ_LENS.override(True), mock.patch.object(
+        with envs.FLLIPER_DSV4_CHECK_TOPK_SEQ_LENS.override(True), mock.patch.object(
             topk_mod, "_jit_topk_v1_module", _refuse_to_load
         ), mock.patch.object(topk_mod, "is_hip_runtime", lambda: False):
             with self.assertRaises(_KernelReached):
@@ -209,7 +209,7 @@ class TestTopkV1SeqLenPrecondition(CustomTestCase):
     def test_check_is_off_by_default(self):
         # It costs a device sync, so the serving default is off. Pinned so the
         # default cannot flip unnoticed.
-        self.assertFalse(envs.SGLANG_DSV4_CHECK_TOPK_SEQ_LENS.get())
+        self.assertFalse(envs.FLLIPER_DSV4_CHECK_TOPK_SEQ_LENS.get())
         with mock.patch.object(
             topk_mod, "_jit_topk_v1_module", _refuse_to_load
         ), mock.patch.object(topk_mod, "is_hip_runtime", lambda: False):
@@ -218,7 +218,7 @@ class TestTopkV1SeqLenPrecondition(CustomTestCase):
 
     def test_v2_wrappers_carry_the_same_guard(self):
         bad = torch.tensor([-1, 8], dtype=torch.int32)
-        with envs.SGLANG_DSV4_CHECK_TOPK_SEQ_LENS.override(True), mock.patch.object(
+        with envs.FLLIPER_DSV4_CHECK_TOPK_SEQ_LENS.override(True), mock.patch.object(
             topk_mod, "_jit_topk_v2_module", _refuse_to_load
         ):
             with self.assertRaises(topk_mod.NegativeSeqLenError):
@@ -275,7 +275,7 @@ class TestPageTablePositionsRounding(CustomTestCase):
         # The invariant the F4 verdict rests on: the pool is torch.zeros, so
         # columns past a request's seq_len -- which this kernel does read,
         # since it slices by max_seq_len -- are 0 or a stale positive slot id.
-        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from flliper.srt.mem_cache.memory_pool import ReqToTokenPool
 
         pool = ReqToTokenPool(
             size=4, max_context_len=8, device="cpu", enable_memory_saver=False

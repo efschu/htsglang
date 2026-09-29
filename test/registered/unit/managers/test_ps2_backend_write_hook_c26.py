@@ -34,7 +34,7 @@ that admits through the same function with the same other inputs.
 
 import unittest
 
-from sglang.srt.managers.kv_session_offload import (
+from flliper.srt.managers.kv_session_offload import (
     prefill_spill_deep_gate,
     prefill_spill_deep_reject_reason,
 )
@@ -117,7 +117,7 @@ class TheAllocatorRefusesToBuildSentinelsItCannotDivert(unittest.TestCase):
     """
 
     def _manager(self, mode):
-        from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+        from flliper.srt.managers.kv_session_offload import KVSessionOffloadManager
 
         mgr = KVSessionOffloadManager.__new__(KVSessionOffloadManager)
         mgr.mode = mode

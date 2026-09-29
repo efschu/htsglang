@@ -1,13 +1,13 @@
 import os
 import unittest
 
-from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
-from sglang.test.ascend.test_ascend_utils import (
+from flliper.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
+from flliper.test.ascend.test_ascend_utils import (
     QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_PATH,
 )
-from sglang.test.ascend.test_mmlu import TestMMLU
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ascend.test_mmlu import TestMMLU
+from flliper.test.ci.ci_register import register_npu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_npu_ci(
     est_time=200,
@@ -60,12 +60,12 @@ class TestQwen3Next(GSM8KAscendMixin, TestMMLU, CustomTestCase):
     env = {
         # In NPU scenarios, operators only support BF16 precision.
         # This environment variable needs to be set for quantizing weights.
-        "SGLANG_DEEPEP_BF16_DISPATCH": "1",
+        "FLLIPER_DEEPEP_BF16_DISPATCH": "1",
         "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
         "STREAMS_PER_DEVICE": "32",
         "HCCL_OP_EXPANSION_MODE": "AIV",
         "HCCL_ALGO": "level0:NA;level1:ring",
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "20",
+        "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "20",
         "HCCL_BUFFSIZE": "2000",
         "GDN_ATTN_BACKEND_TRITON": "1",
         **os.environ,

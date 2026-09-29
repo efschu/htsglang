@@ -17,8 +17,8 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.mem_ledger import measured
-from sglang.srt.mem_ledger.measured import (
+from flliper.srt.mem_ledger import measured
+from flliper.srt.mem_ledger.measured import (
     MIB,
     MIN_BOOTS,
     MeasuredPost,

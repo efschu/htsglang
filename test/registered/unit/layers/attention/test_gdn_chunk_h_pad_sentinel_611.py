@@ -56,8 +56,8 @@ import sys
 import textwrap
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -72,7 +72,7 @@ _WORKER = textwrap.dedent("""
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "99")
 
     import torch
-    from sglang.srt.layers.attention.fla.chunk_delta_h import (
+    from flliper.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE,
         chunk_gated_delta_rule_fwd_h,
         chunk_gated_delta_rule_fwd_kernel_h_blockdim64 as KERNEL,

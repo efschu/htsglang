@@ -27,8 +27,8 @@ there except the two that pin the pre-existing clean path.
 import types
 import unittest
 
-from sglang.srt.distributed.device_communicators import barlink_abort_gate
-from sglang.srt.managers.cache_controller import HiCacheController
+from flliper.srt.distributed.device_communicators import barlink_abort_gate
+from flliper.srt.managers.cache_controller import HiCacheController
 
 IMA = "CUDA error: an illegal memory access was encountered"
 
@@ -68,7 +68,7 @@ class TestTheDrainReportsWhatHappened(unittest.TestCase):
         would invalidate every existing reading of it.
         """
         calls = []
-        with self.assertLogs("sglang.srt.managers.cache_controller", "INFO") as cm:
+        with self.assertLogs("flliper.srt.managers.cache_controller", "INFO") as cm:
             HiCacheController.quiesce_device_io(_controller(calls), "test seam")
         self.assertEqual(calls, ["write", "load"])
         joined = "\n".join(cm.output)
@@ -81,7 +81,7 @@ class TestTheDrainReportsWhatHappened(unittest.TestCase):
         c = _controller(
             calls, write_raises=RuntimeError(IMA), load_raises=RuntimeError(IMA)
         )
-        with self.assertLogs("sglang.srt.managers.cache_controller", "ERROR") as cm:
+        with self.assertLogs("flliper.srt.managers.cache_controller", "ERROR") as cm:
             HiCacheController.quiesce_device_io(c, "phase flip pp_to_tp")
         joined = "\n".join(cm.output)
         self.assertIn("NOT quiesced", joined)
@@ -98,7 +98,7 @@ class TestTheDrainReportsWhatHappened(unittest.TestCase):
         """
         calls = []
         c = _controller(calls, load_raises=RuntimeError(IMA))
-        with self.assertLogs("sglang.srt.managers.cache_controller", "ERROR") as cm:
+        with self.assertLogs("flliper.srt.managers.cache_controller", "ERROR") as cm:
             HiCacheController.quiesce_device_io(c, "phase flip tp_to_pp")
         joined = "\n".join(cm.output)
         self.assertIn("NOT quiesced", joined)
@@ -182,7 +182,7 @@ class TestTheOutcomeReachesTheSecondEmitter(unittest.TestCase):
         self.assertEqual(c.last_quiesce_failed, ("load_stream",))
 
     def _runtime_shell(self, controller):
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         # The runtime reaches the drain through `getattr(controller,
         # "quiesce_device_io")`, so the fake has to expose the REAL method
@@ -203,7 +203,7 @@ class TestTheOutcomeReachesTheSecondEmitter(unittest.TestCase):
         calls = []
         c = _controller(calls, write_raises=RuntimeError(IMA))
         rt = self._runtime_shell(c)
-        with self.assertLogs("sglang.srt.managers.phase_flip_runtime", "ERROR") as cm:
+        with self.assertLogs("flliper.srt.managers.phase_flip_runtime", "ERROR") as cm:
             rt._quiesce_hicache("pp_to_tp")
         joined = "\n".join(cm.output)
         self.assertIn("did NOT", joined)
@@ -214,7 +214,7 @@ class TestTheOutcomeReachesTheSecondEmitter(unittest.TestCase):
         calls = []
         c = _controller(calls)
         rt = self._runtime_shell(c)
-        with self.assertLogs("sglang.srt.managers.phase_flip_runtime", "WARNING") as cm:
+        with self.assertLogs("flliper.srt.managers.phase_flip_runtime", "WARNING") as cm:
             rt._quiesce_hicache("tp_to_pp")
         joined = "\n".join(cm.output)
         self.assertIn("device-tier streams quiesced in", joined)
@@ -229,7 +229,7 @@ class TestTheOutcomeReachesTheSecondEmitter(unittest.TestCase):
         rt = self._runtime_shell(
             types.SimpleNamespace(quiesce_device_io=lambda reason: 0.001)
         )
-        with self.assertLogs("sglang.srt.managers.phase_flip_runtime", "WARNING") as cm:
+        with self.assertLogs("flliper.srt.managers.phase_flip_runtime", "WARNING") as cm:
             rt._quiesce_hicache("pp_to_tp")
         self.assertIn("device-tier streams quiesced in", "\n".join(cm.output))
 
@@ -270,7 +270,7 @@ class TestTheDrainCannotBeTheReasonAFlipDies(unittest.TestCase):
         `AttributeError` out of an exception handler on the no-return path --
         turning an instrument into the thing that kills the flip.
         """
-        from sglang.srt.managers import cache_controller
+        from flliper.srt.managers import cache_controller
 
         self.assertTrue(callable(cache_controller._record_quiesce_poison))
         self.assertFalse(

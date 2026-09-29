@@ -36,7 +36,7 @@ class FakeCudaTensor(torch.Tensor):
 @pytest.fixture
 def helpers_module():
     """Import the module that contains the two functions under test."""
-    from sglang.srt.speculative import spec_utils
+    from flliper.srt.speculative import spec_utils
 
     return spec_utils
 

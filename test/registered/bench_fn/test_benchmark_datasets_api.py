@@ -20,29 +20,29 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
-from sglang.benchmark.datasets import DATASET_MAPPING, get_dataset
-from sglang.benchmark.datasets.agentic_trace import (
+from flliper.benchmark.datasets import DATASET_MAPPING, get_dataset
+from flliper.benchmark.datasets.agentic_trace import (
     DEFAULT_AGENTIC_OUTPUT_LEN,
     AgenticTraceDataset,
 )
-from sglang.benchmark.datasets.common import DatasetRow, gen_mm_prompt
-from sglang.benchmark.datasets.custom import sample_custom_requests
-from sglang.benchmark.datasets.generated_shared_prefix import (
+from flliper.benchmark.datasets.common import DatasetRow, gen_mm_prompt
+from flliper.benchmark.datasets.custom import sample_custom_requests
+from flliper.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
     _zipf_group_probs,
     get_gen_prefix_cache_path,
     sample_generated_shared_prefix_requests,
 )
-from sglang.benchmark.datasets.image import (
+from flliper.benchmark.datasets.image import (
     parse_random_image_resolution,
     sample_image_requests,
 )
-from sglang.benchmark.datasets.mmmu import sample_mmmu_requests
-from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
-from sglang.benchmark.datasets.openai_dataset import sample_openai_requests
-from sglang.benchmark.datasets.random import sample_random_requests
-from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.benchmark.datasets.mmmu import sample_mmmu_requests
+from flliper.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from flliper.benchmark.datasets.openai_dataset import sample_openai_requests
+from flliper.benchmark.datasets.random import sample_random_requests
+from flliper.benchmark.datasets.sharegpt import sample_sharegpt_requests
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -140,7 +140,7 @@ def make_args(**overrides):
         "image_format": "png",
         "image_content": "blank",
         "image_resolution": "8x8",
-        "backend": "sglang",
+        "backend": "flliper",
         "gsp_num_groups": 2,
         "gsp_prompts_per_group": 2,
         "gsp_system_prompt_len": 8,
@@ -171,12 +171,12 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.tmpdir_path = Path(self.tmpdir.name)
         # Redirect ~ for the GSP on-disk cache to the per-test tempdir, so
-        # tests never read/write the real ~/.cache/sglang/benchmark. The Zipf
+        # tests never read/write the real ~/.cache/flliper/benchmark. The Zipf
         # tests in particular compare freshly generated rows against the
         # uniform path, and a stale cache file from prior runs would silently
         # short-circuit the uniform path and break that comparison.
         self._home_patch = patch(
-            "sglang.benchmark.datasets.generated_shared_prefix.Path.home",
+            "flliper.benchmark.datasets.generated_shared_prefix.Path.home",
             return_value=self.tmpdir_path,
         )
         self._home_patch.start()
@@ -419,7 +419,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             image_content="blank",
             image_format="png",
             image_resolution="8x8",
-            backend="sglang",
+            backend="flliper",
             random_image_count=False,
         )
         self.assertEqual(len(rows), 2)
@@ -459,7 +459,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
                 image_content="blank",
                 image_format="png",
                 image_resolution="random:8x16-16x32",
-                backend="sglang",
+                backend="flliper",
             )
         finally:
             np.random.set_state(state)
@@ -509,7 +509,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             return population[:k]
 
         with patch(
-            "sglang.benchmark.datasets.common.random.choices",
+            "flliper.benchmark.datasets.common.random.choices",
             side_effect=fake_choices,
         ):
             gen_mm_prompt(tokenizer, image_pad_id, token_num=8)
@@ -526,12 +526,12 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         ]
         fake_dataset = _FakeMMMUDataset(fake_records)
         with patch(
-            "sglang.benchmark.datasets.mmmu.load_dataset", return_value=fake_dataset
+            "flliper.benchmark.datasets.mmmu.load_dataset", return_value=fake_dataset
         ):
             rows = sample_mmmu_requests(
                 num_requests=2,
                 processor=self.processor,
-                backend="sglang",
+                backend="flliper",
                 fixed_output_len=6,
                 random_sample=False,
             )
@@ -554,7 +554,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             dataset_path=dataset_path,
             num_prompts=3,
         )
-        from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
+        from flliper.benchmark.datasets.speed_bench import SpeedBenchDataset
 
         dataset = SpeedBenchDataset.from_args(args)
         rows = dataset.load(self.tokenizer)
@@ -571,7 +571,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             num_prompts=2,
             speed_bench_category="low_entropy",
         )
-        from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
+        from flliper.benchmark.datasets.speed_bench import SpeedBenchDataset
 
         dataset = SpeedBenchDataset.from_args(args)
         rows = dataset.load(self.tokenizer)
@@ -587,7 +587,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             num_prompts=2,
             speed_bench_output_len=128,
         )
-        from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
+        from flliper.benchmark.datasets.speed_bench import SpeedBenchDataset
 
         dataset = SpeedBenchDataset.from_args(args)
         rows = dataset.load(self.tokenizer)
@@ -602,7 +602,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             num_prompts=1,
             speed_bench_category="nonexistent_category",
         )
-        from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
+        from flliper.benchmark.datasets.speed_bench import SpeedBenchDataset
 
         dataset = SpeedBenchDataset.from_args(args)
         with self.assertRaises(ValueError):
@@ -614,7 +614,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             dataset_path="",
             num_prompts=1,
         )
-        from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
+        from flliper.benchmark.datasets.speed_bench import SpeedBenchDataset
 
         with self.assertRaises(ValueError):
             SpeedBenchDataset.from_args(args)
@@ -721,7 +721,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertIsInstance(mooncake_rows[0], dict)
 
         with patch(
-            "sglang.benchmark.datasets.image.get_processor",
+            "flliper.benchmark.datasets.image.get_processor",
             return_value=self.processor,
         ):
             image_args = make_args(dataset_name="image")
@@ -733,11 +733,11 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         )
         with (
             patch(
-                "sglang.benchmark.datasets.mmmu.get_processor",
+                "flliper.benchmark.datasets.mmmu.get_processor",
                 return_value=self.processor,
             ),
             patch(
-                "sglang.benchmark.datasets.mmmu.load_dataset",
+                "flliper.benchmark.datasets.mmmu.load_dataset",
                 return_value=fake_mmmu_dataset,
             ),
         ):
@@ -858,7 +858,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         )
         self.assertTrue(path.name.startswith("gen_shared_prefix_7_3_4_16_8_4_"))
         self.assertTrue(path.name.endswith(".pkl"))
-        self.assertEqual(path.parent, Path.home() / ".cache" / "sglang" / "benchmark")
+        self.assertEqual(path.parent, Path.home() / ".cache" / "flliper" / "benchmark")
 
     def test_zipf_group_probs_helper(self):
         # Rank-based probability vector: weight(rank) = 1 / rank ** alpha,
@@ -991,7 +991,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         # The on-disk cache key includes group_distribution and zipf_alpha,
         # so uniform mode, zipf alpha=1.0, and zipf alpha=2.0 each get their
         # own file. Uniform mode never reads a zipf cache and vice versa.
-        from sglang.benchmark.datasets import generated_shared_prefix as gsp_mod
+        from flliper.benchmark.datasets import generated_shared_prefix as gsp_mod
 
         fake_home = self.tmpdir_path / "fakehome"
         fake_home.mkdir()
@@ -1157,7 +1157,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         # flags with the rank-based Zipf formula and the alpha constraint,
         # and argparse rejects an unknown distribution choice.
         help_res = subprocess.run(
-            [sys.executable, "-m", "sglang.benchmark.serving", "--help"],
+            [sys.executable, "-m", "flliper.benchmark.serving", "--help"],
             capture_output=True,
             text=True,
             timeout=90,
@@ -1177,7 +1177,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang.benchmark.serving",
+                "flliper.benchmark.serving",
                 "--dataset-name",
                 "generated-shared-prefix",
                 "--gsp-group-distribution",
@@ -1198,7 +1198,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang.benchmark.serving",
+                "flliper.benchmark.serving",
                 "--dataset-name",
                 "generated-shared-prefix",
                 "--gsp-group-distribution",
@@ -1233,7 +1233,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang.benchmark.serving",
+                "flliper.benchmark.serving",
                 "--dataset-name",
                 "generated-shared-prefix",
                 "--gsp-group-distribution",

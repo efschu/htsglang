@@ -19,7 +19,7 @@ Hermetic: a recording stub arena, no GPU, no driver.
 
 import unittest
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 PAGE = 16
 TOKENS_PER_ROW = 1
@@ -89,7 +89,7 @@ def _bare_owner(backing, n_buffers=2):
 
 class _Base(CustomTestCase):
     def setUp(self):
-        import sglang.srt.mem_cache.kv_vmm_backing as backing
+        import flliper.srt.mem_cache.kv_vmm_backing as backing
 
         self.backing = backing
         self.owner = _bare_owner(backing)

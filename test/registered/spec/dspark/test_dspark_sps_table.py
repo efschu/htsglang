@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from sglang.srt.speculative.dspark_components.dspark_sps import (
+from flliper.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
     build_uninitialized_sps_table,
@@ -11,8 +11,8 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
     load_sps_table_from_path,
     profile_sps_table,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -144,7 +144,7 @@ class TestProfileSpsTable(CustomTestCase):
 
 
 def _build_sps_cost_table_for(*, sps_table_path):
-    from sglang.srt.speculative.dspark_components.dspark_planner import (
+    from flliper.srt.speculative.dspark_components.dspark_planner import (
         build_sps_cost_table,
     )
 

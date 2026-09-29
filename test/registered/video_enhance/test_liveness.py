@@ -15,20 +15,20 @@ here is about a configured duration rather than about a state.
 import asyncio
 import unittest
 
-from sglang.srt.video_enhance.chain import StageKind
-from sglang.srt.video_enhance.frame_math import PixelFormat, Resolution
-from sglang.srt.video_enhance.frames import Frame, StageBase
-from sglang.srt.video_enhance.liveness import (
+from flliper.srt.video_enhance.chain import StageKind
+from flliper.srt.video_enhance.frame_math import PixelFormat, Resolution
+from flliper.srt.video_enhance.frames import Frame, StageBase
+from flliper.srt.video_enhance.liveness import (
     DEFAULT_TIMEOUTS_S,
     ConsumerWatchdog,
     EndpointClass,
     LivenessConfig,
     LivenessPolicy,
 )
-from sglang.srt.video_enhance.server import EnhanceRequestBody, VideoEnhanceService
-from sglang.srt.video_enhance.tenant import TenantConfig
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.video_enhance.server import EnhanceRequestBody, VideoEnhanceService
+from flliper.srt.video_enhance.tenant import TenantConfig
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

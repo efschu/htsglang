@@ -47,12 +47,12 @@ was the right call there.
 
 import unittest
 
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers.phase_flip_runtime import (
     seam_probe_reading_age,
     seam_probe_age_phrase,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 # ~1s: two pure functions, no torch, no scheduler, no accelerator.
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -118,7 +118,7 @@ class TestTheAgeIsActuallyWired(CustomTestCase):
     def _src(self, name):
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         return inspect.getsource(getattr(PhaseFlipRuntime, name))
 

@@ -5,7 +5,7 @@ the grouping rule is pinned independently of any checkpoint.
 
 The regression that motivates this file: the first version of the classifier
 identified attention layers by matching ``self_attn`` -- the name the
-CHECKPOINT uses. The loaded sglang module calls it ``attn``
+CHECKPOINT uses. The loaded flliper module calls it ``attn``
 (``RadixAttention``), so on the first real boot every attention layer was
 reported as unclassified and the census's own family split was silently
 wrong. It was caught because the numbers had to add up against the KV arena,
@@ -15,9 +15,9 @@ and exclusive on the other, and this file holds it there.
 
 import unittest
 
-from sglang.srt.planner import residency_census
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import residency_census
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -113,7 +113,7 @@ class TestTheTransientCensus(CustomTestCase):
     """#485/law 31: the per-load-state transient instrument."""
 
     def _census(self, baseline_mib=2038.0):
-        from sglang.srt.planner.transient_census import TransientCensus
+        from flliper.srt.planner.transient_census import TransientCensus
 
         return TransientCensus(0, "RTX 5090", int(baseline_mib * 1024 * 1024))
 
@@ -122,7 +122,7 @@ class TestTheTransientCensus(CustomTestCase):
         return int(n * 1024 * 1024)
 
     def test_it_is_off_by_default(self):
-        from sglang.srt.planner import transient_census
+        from flliper.srt.planner import transient_census
 
         self.assertFalse(transient_census.census_enabled())
         self.assertFalse(transient_census.ARMED)

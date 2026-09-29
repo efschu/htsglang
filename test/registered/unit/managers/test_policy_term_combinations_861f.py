@@ -23,7 +23,7 @@ term is not correct because it is correct alone.
 
 import pytest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     MIN_DECODE_STEPS_PER_PHASE,
     PhasePolicyInputs,
 )

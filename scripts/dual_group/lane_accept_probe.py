@@ -16,7 +16,7 @@ four rounds.
 Usage:
     python lane_accept_probe.py --port 30077 --tokens 192
 
-Requires ``SGLANG_ACCEPT_POSITION_PROBE=1`` in the server's environment for the
+Requires ``FLLIPER_ACCEPT_POSITION_PROBE=1`` in the server's environment for the
 serving-group side; the lane side always reports.
 """
 

@@ -6,7 +6,7 @@ The defect (boots fnFL2x80..x87, group P, ``--hicache-io-backend direct
 normalised every write op through ``move_hybrid_indices`` ->
 ``move_indices``, whose direct branch is ``device_indices.cpu()`` on the
 COMPUTE stream. The scheduler thread therefore waited for the card's queued
-forward inside every chunk publish: ``WEG2 CHUNK-PUBLISH ... 'ms'`` 544-1956
+forward inside every chunk publish: ``PDFLIP CHUNK-PUBLISH ... 'ms'`` 544-1956
 for the second chunk against 25-63 for a publish with nothing in flight --
 although the KV/mamba arena pools and the QSA sidecar pool all write from
 device indices. Hermetic: no CUDA; the "on card" indices are a stand-in that
@@ -23,19 +23,19 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache import hicache_write_path
-from sglang.srt.mem_cache import memory_pool_host
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache import hicache_write_path
+from flliper.srt.mem_cache import memory_pool_host
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from flliper.srt.mem_cache.hybrid_cache import hybrid_cache_controller
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
     HybridCacheController,
 )
-from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool, HostPoolGroup
-from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool, HostPoolGroup
+from flliper.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -134,7 +134,7 @@ def test_direct_backend_op_skips_the_host_normalisation():
     D2H that blocks on the forward in flight."""
     c, op = _controller(refusal="")
     c.move_hybrid_indices.side_effect = AssertionError("normalised an op every pool accepted")
-    with envs.SGLANG_OPT_HICACHE_DEVICE_INDEX_WRITE.override(True):
+    with envs.FLLIPER_OPT_HICACHE_DEVICE_INDEX_WRITE.override(True):
         delta = _run(c)
     c.move_hybrid_indices.assert_not_called()
     [(kind, host, dev, transfers)] = c.mem_pool_host.calls
@@ -147,12 +147,12 @@ def test_direct_backend_op_skips_the_host_normalisation():
 
 def test_a_refusing_pool_and_the_kill_switch_keep_the_normalisation():
     """Negative branches: a pool that cannot take card indices (a staging
-    row, an unbound arena) and SGLANG_OPT_HICACHE_DEVICE_INDEX_WRITE=0 both
+    row, an unbound arena) and FLLIPER_OPT_HICACHE_DEVICE_INDEX_WRITE=0 both
     take the old path, with its io backend, counted by reason."""
     for env_on, refusal, reason in ((True, "kv:staging_rows", "kv:staging_rows"),
                                     (False, "", "off")):
         c, _ = _controller(refusal=refusal)
-        with envs.SGLANG_OPT_HICACHE_DEVICE_INDEX_WRITE.override(env_on):
+        with envs.FLLIPER_OPT_HICACHE_DEVICE_INDEX_WRITE.override(env_on):
             delta = _run(c)
         c.move_hybrid_indices.assert_called_once()
         [(kind, _h, _d, io_backend)] = c.mem_pool_host.calls
@@ -164,7 +164,7 @@ def test_draft_and_dcp_veto_the_card_form():
     """The draft pool's backup and the uneven-DCP owner rule both need the
     normalised pairs; either armed must refuse even when every pool accepts."""
     c, op = _controller(refusal="")
-    with envs.SGLANG_OPT_HICACHE_DEVICE_INDEX_WRITE.override(True):
+    with envs.FLLIPER_OPT_HICACHE_DEVICE_INDEX_WRITE.override(True):
         c.draft_tier_armed = lambda direction: True
         assert c._device_index_write_refusal(op) == "draft"
         c.draft_tier_armed = lambda direction: False

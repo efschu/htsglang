@@ -32,8 +32,8 @@ import unittest
 
 import torch
 
-from sglang.srt.distributed.utils import set_weightless_kv_head_rank
-from sglang.srt.layers.dcp.role_kv_dtype import (
+from flliper.srt.distributed.utils import set_weightless_kv_head_rank
+from flliper.srt.layers.dcp.role_kv_dtype import (
     LOSSY_KV_CACHE_DTYPE_SPECS,
     WORKER_KV_CACHE_DTYPE_CHOICES,
     effective_kv_cache_dtype_spec,
@@ -41,9 +41,9 @@ from sglang.srt.layers.dcp.role_kv_dtype import (
     host_tier_stride_mismatch,
     worker_dtype_is_role_split,
 )
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -269,7 +269,7 @@ class TestWireDtypeIsNotStorageDtype(CustomTestCase):
     """
 
     def test_wl_dtype_follows_the_compute_dtype(self):
-        from sglang.srt.layers.attention import flashinfer_backend
+        from flliper.srt.layers.attention import flashinfer_backend
 
         src = inspect.getsource(flashinfer_backend.FlashInferAttnBackend.__init__)
         self.assertIn("self._wl_dtype = mc.dtype", src)
@@ -288,7 +288,7 @@ class TestRoleDtypeReachesTheResolver(CustomTestCase):
     """
 
     def test_no_branch_bypasses_the_resolved_spec(self):
-        from sglang.srt.model_executor import model_runner as mr_mod
+        from flliper.srt.model_executor import model_runner as mr_mod
 
         src = inspect.getsource(mr_mod.ModelRunner.configure_kv_cache_dtype)
         self.assertIn("effective_kv_cache_dtype_spec(", src)
@@ -332,8 +332,8 @@ class TestCellSizeMatchesTheAllocatedPool(CustomTestCase):
         from types import SimpleNamespace
         from unittest.mock import MagicMock, patch
 
-        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
-        from sglang.srt.runtime_context import get_parallel
+        from flliper.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+        from flliper.srt.runtime_context import get_parallel
 
         mr = MagicMock()
         mr.use_mla_backend = False

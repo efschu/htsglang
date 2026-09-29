@@ -11,10 +11,10 @@ import unittest
 
 import torch
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -35,7 +35,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA not available")
 
-        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+        from flliper.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             BreakableCUDAGraph,
             BreakableCUDAGraphCapture,
             eager_on_graph,
@@ -199,7 +199,7 @@ class TestCopyOutput(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA not available")
 
-        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+        from flliper.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             _copy_output,
         )
 
@@ -257,7 +257,7 @@ class TestBreakGraphHelper(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA not available")
 
-        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+        from flliper.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             BreakableCUDAGraph,
             BreakableCUDAGraphCapture,
             break_graph,

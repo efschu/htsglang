@@ -21,10 +21,10 @@ import types
 
 import pytest
 
-from sglang.srt.models import qwen3_vl as qv
-from sglang.srt.model_executor import vram_family_census as vfc
-from sglang.srt.weg2 import front as fr
-from sglang.srt.weg2 import launcher as lz
+from flliper.srt.models import qwen3_vl as qv
+from flliper.srt.model_executor import vram_family_census as vfc
+from flliper.srt.pdflip import front as fr
+from flliper.srt.pdflip import launcher as lz
 
 
 # --------------------------------------------------- slice 4: the launcher --
@@ -128,8 +128,8 @@ def test_an_image_refuses_under_off_and_the_message_names_both_ways_out():
     verdict, why = fr.vision_verdict(2, 0, "off")
     assert verdict == fr.VERDICT_REFUSE_IMAGE
     assert "TEXT-ONLY" in why
-    assert "--weg2-vision transient" in why
-    assert "--weg2-vision resident" in why
+    assert "--pdflip-vision transient" in why
+    assert "--pdflip-vision resident" in why
 
 
 def test_an_image_routes_under_resident():
@@ -188,13 +188,13 @@ def test_every_non_route_verdict_has_a_W_CODE_in_the_handler():
     )
     for v in refusals:
         assert f"VERDICT_{v.upper().replace('-', '_')}:" in src
-    assert "W101 Weg2VisionRefused" in src
-    assert "W103 Weg2VideoRefused" in src
-    assert "W104 Weg2VisionModeUnknown" in src
+    assert "W101 PdFlipVisionRefused" in src
+    assert "W103 PdFlipVideoRefused" in src
+    assert "W104 PdFlipVisionModeUnknown" in src
     generic = src.index("elif _verdict != VERDICT_ROUTE and _verdict != VERDICT_REFUSE_EMBEDS:")
     own = src.index("elif _verdict == VERDICT_REFUSE_EMBEDS:")
     assert generic < own  # the dict branch never sees the embeds verdict
-    assert "W125 Weg2InputEmbedsRefused" in src[own:]
+    assert "W125 PdFlipInputEmbedsRefused" in src[own:]
 
 
 def test_the_transient_mode_now_ROUTES_instead_of_refusing():
@@ -202,7 +202,7 @@ def test_the_transient_mode_now_ROUTES_instead_of_refusing():
     is_wired`, which pinned the round-2 state: `transient` answered 501 with
     "the group-side runtime is not wired yet".
 
-    It is wired now (`weg2/vision_stage_service.py`, called from
+    It is wired now (`pdflip/vision_stage_service.py`, called from
     `base_processor.process_and_combine_mm_data`), so the verdict STAGE falls
     through to routing and W102 is an INFO line on the way to P, not a
     refusal. The old assertion is kept here as its negation so the two states
@@ -213,7 +213,7 @@ def test_the_transient_mode_now_ROUTES_instead_of_refusing():
 
     src = inspect.getsource(fr.Front.handle_generate)
     assert "not wired yet" not in src
-    assert "W102 Weg2VisionStage" in src
+    assert "W102 PdFlipVisionStage" in src
     assert "routing to P" in src
     # STAGE is no longer in the REFUSAL dict -- it does still appear later,
     # in the force-to-P branch, which is the opposite of a refusal
@@ -236,7 +236,7 @@ def test_the_launcher_tells_the_front_its_mode():
 
     src = inspect.getsource(lz.front_argv_for)
     assert '"--vision"' in src
-    assert 'weg2_vision' in src
+    assert 'pdflip_vision' in src
 
 
 # -------------------------------------------- the loader veto (5.1 GiB/boot) --
@@ -282,14 +282,14 @@ def test_the_loader_looks_the_method_up_by_name():
     """The wiring is `getattr(model, "weight_name_needed", None)` at
     loader.py:763 -- there is no registration, so the method existing IS the
     wiring."""
-    from sglang.srt.model_loader import loader as ld
+    from flliper.srt.model_loader import loader as ld
     import inspect
 
     src = inspect.getsource(ld.DefaultModelLoader._get_all_weights)
     assert 'getattr(model, "weight_name_needed", None)' in src
     assert hasattr(qv.Qwen3VLForConditionalGeneration, "weight_name_needed")
     # and Qwen3_5, the serving arch, inherits it
-    from sglang.srt.models import qwen3_5 as q5
+    from flliper.srt.models import qwen3_5 as q5
 
     assert q5.Qwen3_5ForConditionalGeneration.weight_name_needed is (
         qv.Qwen3VLForConditionalGeneration.weight_name_needed
@@ -378,7 +378,7 @@ def test_argv_p_hands_the_vision_form_to_the_model_argv():
     refused to arm (W111). The P argv must carry the transient override and
     NOT the multimodal switch-off; ``off`` keeps the old argv; D stays
     text-only regardless."""
-    from sglang.srt.weg2 import launcher as lz
+    from flliper.srt.pdflip import launcher as lz
 
     def p_argv(vision):
         return lz.argv_p("py", "/models/Qwen3.8-27B-INT8-gdncov", [1, 1, 1], 4, 512,
@@ -400,7 +400,7 @@ def test_after_pools_census_reaches_the_idle_reading(monkeypatch):
     ever carried ``[vram-idle] after pools`` (acceptance (b), design §6)."""
     import torch
 
-    from sglang.srt.model_executor import vram_family_census as vc
+    from flliper.srt.model_executor import vram_family_census as vc
 
     seen = []
     monkeypatch.setattr(vc, "log_vram_idle", lambda runner, where, **kw: seen.append(where))

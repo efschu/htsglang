@@ -44,9 +44,9 @@ import ast
 import pathlib
 
 import pytest
-from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
-from sglang.srt.mem_cache import producer_phase_census as pc
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.phase_purity import SEAM_READMIT_ATTR
+from flliper.srt.mem_cache import producer_phase_census as pc
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

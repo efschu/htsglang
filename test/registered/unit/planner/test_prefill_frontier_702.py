@@ -17,11 +17,11 @@ Hermetic: pure arithmetic, no CUDA.
 """
 
 import pytest
-from sglang.srt.planner.prefill_frontier import (
+from flliper.srt.planner.prefill_frontier import (
     PrefillFrontierError,
     solve_prefill_frontier,
 )
-from sglang.srt.planner.seam_holdback import SeamRecord, available_bytes_for_cut
+from flliper.srt.planner.seam_holdback import SeamRecord, available_bytes_for_cut
 
 MIB = 1024 * 1024
 CELL = 2048

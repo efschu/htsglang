@@ -32,9 +32,9 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.prefetch_ballot import build_prefetch_ballot_payload
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.common import (
+from flliper.srt.managers.prefetch_ballot import build_prefetch_ballot_payload
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.common import (
     evict_from_tree_cache,
     uniform_avail_for_evict,
 )
@@ -350,8 +350,8 @@ class UniformEvictFloorTest(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         for func, name in (
             (UnifiedRadixCache.load_back, "UnifiedRadixCache.load_back"),
@@ -375,7 +375,7 @@ class UniformEvictFloorTest(unittest.TestCase):
     def test_the_attribute_is_declared_on_the_base_class(self):
         """Declared in the type, not conjured by whichever path happens to
         set it (#606): a reader must be able to see the pin exists."""
-        from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+        from flliper.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
         self.assertIn("uniform_avail_floor", BasePrefixCache.__annotations__)
         self.assertIsNone(BasePrefixCache.uniform_avail_floor)

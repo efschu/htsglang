@@ -334,7 +334,7 @@ def _nccl_cause(row: dict) -> str:
 def _check_loadable(cap: dict, d2d: dict, any_p2p: bool) -> None:
     add_repo_to_path()
     try:
-        from sglang.srt.distributed.device_communicators.barlink_path_rates import (
+        from flliper.srt.distributed.device_communicators.barlink_path_rates import (
             load_p2p_capability_matrix,
             load_p2p_d2d_bench,
         )

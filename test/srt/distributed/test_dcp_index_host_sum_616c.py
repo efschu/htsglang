@@ -22,11 +22,11 @@ from typing import Optional
 import pytest
 import torch
 
-from sglang.srt.layers.attention.flashinfer_backend import (
+from flliper.srt.layers.attention.flashinfer_backend import (
     FlashInferIndicesUpdaterPrefill,
     _dcp_host_total_tokens,
 )
-from sglang.srt.layers.dcp.owner import build_dcp_weighted_kv_indices
+from flliper.srt.layers.dcp.owner import build_dcp_weighted_kv_indices
 
 
 class _Sentinel(Exception):
@@ -124,7 +124,7 @@ def test_call_begin_forward_passes_total_tokens_to_the_index_build(monkeypatch):
     the build falls through to the blocking read."""
     captured = {}
     monkeypatch.setattr(
-        "sglang.srt.layers.attention.flashinfer_backend._build_dcp_weighted_kv_indices",
+        "flliper.srt.layers.attention.flashinfer_backend._build_dcp_weighted_kv_indices",
         _capturing_builder(captured),
     )
 

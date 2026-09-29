@@ -16,15 +16,15 @@ from unittest import mock
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestExtendLastLocSentinel(CustomTestCase):
     def _run_alloc_for_extend(self):
-        from sglang.srt.mem_cache import common
+        from flliper.srt.mem_cache import common
 
         captured = {}
 

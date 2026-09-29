@@ -34,7 +34,7 @@ import types
 
 import pytest
 
-from sglang.srt.managers.pp_admission_congruence import (
+from flliper.srt.managers.pp_admission_congruence import (
     pp_row_authority_enabled,
     pp_row_carrier_present,
 )
@@ -51,32 +51,32 @@ def _stand_in(pp_size: int, pp_rank: int, counters=None):
 
 def test_no_flip_form_has_no_carrier(monkeypatch):
     """The specimen form: PP=3, no pp_flip_counters -> PP0 may not withhold."""
-    monkeypatch.delenv("SGLANG_PP_ROW_AUTHORITY", raising=False)
+    monkeypatch.delenv("FLLIPER_PP_ROW_AUTHORITY", raising=False)
     pp0 = _stand_in(3, 0)
     assert pp_row_authority_enabled(pp0)  # the LAW is on ...
     assert pp_row_carrier_present(pp0) is False  # ... but cannot be executed
 
 
 def test_carrier_present_keeps_the_flip_form_terms(monkeypatch):
-    monkeypatch.delenv("SGLANG_PP_ROW_AUTHORITY", raising=False)
+    monkeypatch.delenv("FLLIPER_PP_ROW_AUTHORITY", raising=False)
     assert pp_row_carrier_present(_stand_in(3, 0, counters=object())) is True
 
 
 @pytest.mark.parametrize("env", ["0", "false"])
 def test_row_authority_kill_switch_removes_the_carrier(monkeypatch, env):
-    monkeypatch.setenv("SGLANG_PP_ROW_AUTHORITY", env)
+    monkeypatch.setenv("FLLIPER_PP_ROW_AUTHORITY", env)
     assert pp_row_carrier_present(_stand_in(3, 0, counters=object())) is False
 
 
 def test_single_stage_has_no_carrier(monkeypatch):
-    monkeypatch.delenv("SGLANG_PP_ROW_AUTHORITY", raising=False)
+    monkeypatch.delenv("FLLIPER_PP_ROW_AUTHORITY", raising=False)
     assert pp_row_carrier_present(_stand_in(1, 0, counters=object())) is False
 
 
 def test_admission_gate_keys_the_pp0_wait_on_the_carrier():
     """The consumer half: the `prefetch_pending_pp0` skip must sit under a
     branch guarded by the carrier, never under `pp_rank == 0` alone."""
-    origin = importlib.util.find_spec("sglang.srt.managers.scheduler").origin
+    origin = importlib.util.find_spec("flliper.srt.managers.scheduler").origin
     src = pathlib.Path(origin).read_text()
     assert "pp_row_carrier_present(self)" in src
     # the licensed wait is the `elif` that follows the disarmed branch

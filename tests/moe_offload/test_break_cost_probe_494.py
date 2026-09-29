@@ -53,7 +53,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.utils import break_cost_clock as bcc  # noqa: E402
+from flliper.srt.utils import break_cost_clock as bcc  # noqa: E402
 
 # --- the scripted fake ------------------------------------------------------
 
@@ -138,7 +138,7 @@ class FakeSegment:
 
 def _fixture_graph(log, phase_by_crossing=None):
     """A real BreakableCUDAGraph holding fake segments and named break fns."""
-    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    from flliper.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
         BreakableCUDAGraph,
     )
 
@@ -295,7 +295,7 @@ def test_crossings_are_named_after_the_break_function(armed):
 
 def test_the_moe_break_point_carries_its_label():
     """The name the probe reports comes from the real decorator, not the test."""
-    from sglang.srt.layers.moe.breakable_offload import breakable_moe_offload_fetch
+    from flliper.srt.layers.moe.breakable_offload import breakable_moe_offload_fetch
 
     assert callable(breakable_moe_offload_fetch)
     # eager_on_graph stamps break_name on the replay closure at capture time;
@@ -437,7 +437,7 @@ def test_default_replay_records_zero_events(monkeypatch, stream_stub):
 
     monkeypatch.setattr(torch.cuda, "Event", ExplodingEvent)
 
-    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    from flliper.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
         BreakableCUDAGraph,
     )
 
@@ -471,7 +471,7 @@ def test_disabled_prepare_breakable_runs_the_unmeasured_path(monkeypatch):
         )
         # The call sites import the symbol directly; assert the module-level
         # binding they use is the disabled one rather than re-importing.
-        from sglang.srt.layers.moe import expert_offload as eo
+        from flliper.srt.layers.moe import expert_offload as eo
 
         assert eo.break_cost_phase("planning") is bcc.NO_PHASE
     finally:
@@ -520,12 +520,12 @@ def test_the_f2_reader_consumes_what_the_probe_writes(armed, tmp_path, capsys):
 
 @pytest.fixture
 def no_scratch_env_leak():
-    """``t462._cache`` writes SGLANG_MOE_SCRATCH_SLOTS into the real
+    """``t462._cache`` writes FLLIPER_MOE_SCRATCH_SLOTS into the real
     environment, and ``scratch_slot_count`` reads it raw. Restore it, or this
     module changes what a later one measures -- test_planner's default-C
     assertion went red exactly this way (the sibling module carries the same
     guard for the same reason)."""
-    key = "SGLANG_MOE_SCRATCH_SLOTS"
+    key = "FLLIPER_MOE_SCRATCH_SLOTS"
     before = os.environ.get(key)
     try:
         yield

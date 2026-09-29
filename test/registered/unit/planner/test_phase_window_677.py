@@ -8,7 +8,7 @@ Hermetic: pure arithmetic, no CUDA.
 """
 
 import pytest
-from sglang.srt.planner.phase_window import (
+from flliper.srt.planner.phase_window import (
     PhaseWindowError,
     WindowInputs,
     batch_floor_s,

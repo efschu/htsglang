@@ -45,9 +45,9 @@ first transient sample.
 
 import unittest
 
-from sglang.srt.managers.phase_policy import IDLE_LOCKED
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.phase_policy import IDLE_LOCKED
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -55,7 +55,7 @@ FLIP_TOKENS = 4096
 
 
 def _cfg(**over):
-    from sglang.srt.managers.phase_policy import PhasePolicyConfig
+    from flliper.srt.managers.phase_policy import PhasePolicyConfig
 
     base = dict(
         enabled=True,
@@ -69,7 +69,7 @@ def _cfg(**over):
 
 def _decide(*, phase, pending, running_bs, idle_since, now=1000.0, cfg=None):
     """Drive the idle-lock branch with the specimen's own shape."""
-    from sglang.srt.managers.phase_policy import (
+    from flliper.srt.managers.phase_policy import (
         PhasePolicyInputs,
         PhasePolicyState,
         decide,

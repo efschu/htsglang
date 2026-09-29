@@ -1,6 +1,6 @@
 """Unit tests for FP4 KV cache quantization strategy pattern — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -8,12 +8,12 @@ import unittest
 
 import torch
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def skip_if_no_blackwell_nvfp4(func):
     """Skip test if Blackwell NVFP4 is not available."""
-    from sglang.srt.utils import is_blackwell
+    from flliper.srt.utils import is_blackwell
 
     return unittest.skipUnless(
         is_blackwell(), "Blackwell (SM100/SM120) with CUDA >= 12.8 is required"
@@ -24,7 +24,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
     """Test the registry and factory function."""
 
     def test_registry_contains_nvfp4_and_mxfp4(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        from flliper.srt.layers.quantization.fp4_kv_cache_quant_method import (
             FP4_KV_CACHE_QUANT_REGISTRY,
         )
 
@@ -32,7 +32,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertIn("blockfp4", FP4_KV_CACHE_QUANT_REGISTRY)
 
     def test_factory_nvfp4(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        from flliper.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVMethod,
             get_fp4_kv_cache_quant_method,
         )
@@ -44,7 +44,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertEqual(method.name, "nvfp4")
 
     def test_factory_mxfp4(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        from flliper.srt.layers.quantization.fp4_kv_cache_quant_method import (
             BlockFP4KVMethod,
             get_fp4_kv_cache_quant_method,
         )
@@ -54,7 +54,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertEqual(method.name, "blockfp4")
 
     def test_factory_unknown_raises(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        from flliper.srt.layers.quantization.fp4_kv_cache_quant_method import (
             get_fp4_kv_cache_quant_method,
         )
 
@@ -66,7 +66,7 @@ class TestNVFP4KVMethod(CustomTestCase):
     """Test NVFP4KVMethod buffer creation and properties."""
 
     def test_properties(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        from flliper.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVMethod,
         )
 
@@ -77,7 +77,7 @@ class TestNVFP4KVMethod(CustomTestCase):
         self.assertTrue(m.needs_global_scale())
 
     def test_create_buffers_shapes(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        from flliper.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVMethod,
         )
 
@@ -100,7 +100,7 @@ class TestNVFP4KVMethod(CustomTestCase):
         self.assertEqual(bufs["store_dtype"], torch.uint8)
 
     def test_compute_cell_size(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        from flliper.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVMethod,
         )
 
@@ -110,7 +110,7 @@ class TestNVFP4KVMethod(CustomTestCase):
         self.assertEqual(cell, 4096 + 512 + 2048)
 
     def test_scales_init(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        from flliper.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVMethod,
         )
 
@@ -123,7 +123,7 @@ class TestNVFP4KVMethod(CustomTestCase):
     @skip_if_no_blackwell_nvfp4
     def test_quantize_dequantize_roundtrip(self):
         """Test NVFP4 quantize→dequantize roundtrip on CUDA."""
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        from flliper.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVMethod,
         )
 
@@ -175,7 +175,7 @@ class TestBlockFP4KVMethod(CustomTestCase):
     """Test BlockFP4KVMethod buffer creation and roundtrip."""
 
     def test_properties(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        from flliper.srt.layers.quantization.fp4_kv_cache_quant_method import (
             BlockFP4KVMethod,
         )
 
@@ -185,7 +185,7 @@ class TestBlockFP4KVMethod(CustomTestCase):
         self.assertFalse(m.needs_global_scale())
 
     def test_create_buffers_shapes(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        from flliper.srt.layers.quantization.fp4_kv_cache_quant_method import (
             BlockFP4KVMethod,
         )
 
@@ -200,7 +200,7 @@ class TestBlockFP4KVMethod(CustomTestCase):
 
     def test_quantize_dequantize_roundtrip_cpu(self):
         """Test MXFP4 quantize→dequantize roundtrip on CPU."""
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        from flliper.srt.layers.quantization.fp4_kv_cache_quant_method import (
             BlockFP4KVMethod,
         )
 
@@ -238,7 +238,7 @@ class TestBlockFP4KVQuantizeUtil(CustomTestCase):
     """Test the existing MXFP4 BlockFP4KVQuantizeUtil roundtrip."""
 
     def test_roundtrip_cpu(self):
-        from sglang.srt.layers.quantization.kvfp4_tensor import BlockFP4KVQuantizeUtil
+        from flliper.srt.layers.quantization.kvfp4_tensor import BlockFP4KVQuantizeUtil
 
         x = torch.randn(4, 8, 128, dtype=torch.bfloat16)
         packed, scales = BlockFP4KVQuantizeUtil.batched_quantize(x)
@@ -255,7 +255,7 @@ class TestFP4KVCacheRecipe(CustomTestCase):
     """Test enum."""
 
     def test_enum_values(self):
-        from sglang.srt.layers.quantization.kvfp4_tensor import FP4KVCacheRecipe
+        from flliper.srt.layers.quantization.kvfp4_tensor import FP4KVCacheRecipe
 
         self.assertEqual(FP4KVCacheRecipe.MXFP4.value, 1)
         self.assertEqual(FP4KVCacheRecipe.NVFP4.value, 2)

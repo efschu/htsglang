@@ -52,7 +52,7 @@ def _scheduler(live_slots, tree_slots, tree_has_api=True):
 
 class TestTheFlipCarriesTreeCheckpoints(unittest.TestCase):
     def _slots(self, scheduler):
-        from sglang.srt.managers.gdn_flip_mover import flip_mamba_slots
+        from flliper.srt.managers.gdn_flip_mover import flip_mamba_slots
 
         return sorted(flip_mamba_slots(scheduler).tolist())
 
@@ -73,7 +73,7 @@ class TestTheFlipCarriesTreeCheckpoints(unittest.TestCase):
     def test_a_tree_without_the_mamba_api_refuses_loudly(self):
         # A tree cache that cannot report its mamba values under a flip
         # build is the silent-omission bug class; refuse, never no-op.
-        from sglang.srt.layers.dcp.reshard_plan import KvReshardError
+        from flliper.srt.layers.dcp.reshard_plan import KvReshardError
 
         s = _scheduler(live_slots=[1], tree_slots=[], tree_has_api=False)
         with self.assertRaises(KvReshardError):
@@ -82,7 +82,7 @@ class TestTheFlipCarriesTreeCheckpoints(unittest.TestCase):
     def test_a_live_request_without_a_slot_still_refuses(self):
         # Inherited contract of resident_mamba_slots: a live request with
         # no mamba slot means unmoved linear state -- refuse the flip.
-        from sglang.srt.layers.dcp.reshard_plan import KvReshardError
+        from flliper.srt.layers.dcp.reshard_plan import KvReshardError
 
         s = _scheduler(live_slots=[1], tree_slots=[2])
         s.running_batch.reqs.append(SimpleNamespace(rid="bad", mamba_pool_idx=None))

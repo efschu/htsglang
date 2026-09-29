@@ -2,7 +2,7 @@
 
 THE DEFECT, stated once. ``build_phase_flip_tp_stack`` parses a SEED vector
 (``parse_flip_token_vector``: --phase-flip-tp-vector, or
-SGLANG_UNEVEN_TOKEN_VECTOR), installs it process-globally, and then builds the
+FLLIPER_UNEVEN_TOKEN_VECTOR), installs it process-globally, and then builds the
 TP decode worker. That construction reaches the install-capable calibration
 site (``_resolve_memory_pool_config`` -> ``_maybe_suggest_dcp_token_vector``
 with ``allow_install=True``) and may replace the global vector with the
@@ -51,16 +51,16 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.distributed.utils import set_cp_token_ratios
-from sglang.srt.managers import phase_flip_boot as pfb
-from sglang.srt.planner.retracted import REGISTER, RetractedProvenanceError
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.utils import set_cp_token_ratios
+from flliper.srt.managers import phase_flip_boot as pfb
+from flliper.srt.planner.retracted import REGISTER, RetractedProvenanceError
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_ROLE_ENV = "SGLANG_UNEVEN_TOKEN_VECTOR_ROLE"
-_PROV_ENV = "SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE"
+_ROLE_ENV = "FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE"
+_PROV_ENV = "FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE"
 
 # A vector the retracted register really carries, taken from the register
 # itself rather than hardcoded -- a literal here would silently stop testing
@@ -168,7 +168,7 @@ class TestReadBackSeam(_EnvClean):
             wraps=pfb.resolve_effective_flip_token_vector,
         ):
             pfb.effective_flip_token_vector(_server_args(), [29, 19, 16])
-        from sglang.srt.distributed.utils import get_cp_token_ratios
+        from flliper.srt.distributed.utils import get_cp_token_ratios
 
         self.assertEqual(get_cp_token_ratios(), _CLEAN_VEC)
 

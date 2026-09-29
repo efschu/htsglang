@@ -12,7 +12,7 @@ split.
 
 No GPU, no distributed init: the layer classes accept explicit
 tp_rank/tp_size, and `sgl_kernel` (not installed in the CPU test env) is
-stubbed out before the sglang imports.
+stubbed out before the flliper imports.
 """
 
 import importlib.util
@@ -53,23 +53,23 @@ _install_sgl_kernel_stub()
 
 import torch  # noqa: E402
 
-from sglang.srt.distributed.utils import (  # noqa: E402
+from flliper.srt.distributed.utils import (  # noqa: E402
     set_tp_partition_ratios,
     tp_loaded_shard_start,
     tp_partition_sizes,
 )
-from sglang.srt.layers.attention.mamba.mamba import (  # noqa: E402
+from flliper.srt.layers.attention.mamba.mamba import (  # noqa: E402
     mamba_v2_sharded_weight_loader,
 )
-from sglang.srt.layers.linear import (  # noqa: E402
+from flliper.srt.layers.linear import (  # noqa: E402
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.parameter import ModelWeightParameter  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.srt.layers.parameter import ModelWeightParameter  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -545,7 +545,7 @@ class TestReplicatedKvAlignedQKV(UnevenTPTestCase):
         # (aligned) -> `qkv.split` sum mismatch at graph capture. Assert the
         # loader's q-shard equals the aligned __init__ q block on every rank.
         # Mirrors the fused q(+gate) block qwen3_5 builds (total_num_heads * 2).
-        from sglang.srt.distributed.utils import tp_partition_size
+        from flliper.srt.distributed.utils import tp_partition_size
 
         set_tp_partition_ratios(self.PLAN5)
         gated_q_heads = self.Q_HEADS * 2  # attn_output_gate fuses q + gate
@@ -740,7 +740,7 @@ class TestShardedWeightLoader(UnevenTPTestCase):
     """weight_utils.sharded_weight_loader (dt_bias / A_log path)."""
 
     def _run(self, plan, tp_units, rank, param_rows, full_rows):
-        import sglang.srt.model_loader.weight_utils as wu
+        import flliper.srt.model_loader.weight_utils as wu
 
         set_tp_partition_ratios(plan)
         full = torch.arange(full_rows, dtype=FP)
@@ -767,7 +767,7 @@ class TestShardedWeightLoader(UnevenTPTestCase):
 
 class TestVocabParallelEmbedding(UnevenTPTestCase):
     def _make(self, rank, vocab=1000, dim=8, plan=PLAN, tp_size=TP):
-        import sglang.srt.layers.vocab_parallel_embedding as vpe
+        import flliper.srt.layers.vocab_parallel_embedding as vpe
 
         set_tp_partition_ratios(plan)
         fake_parallel = SimpleNamespace(tp_rank=rank, tp_size=tp_size)
@@ -806,7 +806,7 @@ class TestVocabParallelEmbedding(UnevenTPTestCase):
 
 class TestModelConfigNumKvHeads(UnevenTPTestCase):
     def _mc(self, total_kv=8):
-        from sglang.srt.configs.model_config import ModelConfig
+        from flliper.srt.configs.model_config import ModelConfig
 
         mc = ModelConfig.__new__(ModelConfig)
         mc.hf_config = SimpleNamespace(model_type="llama")

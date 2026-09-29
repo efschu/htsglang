@@ -1,7 +1,7 @@
 """retry() must chain the cause, or every environmental failure reads as noise.
 
 Found during the mem_cache triage (#585). ``CustomTestCase._callTestMethod``
-wraps every test in ``sglang.srt.utils.common.retry``, and that helper re-raised
+wraps every test in ``flliper.srt.utils.common.retry``, and that helper re-raised
 a bare ``Exception("retry() exceed maximum number of retries.")`` with no
 ``from e``. The original error was discarded, so 841 of 944 hermetic mem_cache
 failures reported an opaque retry message instead of the one-line reason
@@ -21,7 +21,7 @@ Hermetic: pure Python, no CUDA.
 
 import pytest
 
-from sglang.srt.utils.common import retry
+from flliper.srt.utils.common import retry
 
 
 class _Distinctive(RuntimeError):

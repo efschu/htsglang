@@ -1,8 +1,8 @@
 import unittest
 
-from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
-from sglang.test.ascend.test_ascend_utils import GEMMA_4_26B_A4B_IT_WEIGHTS_PATH
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
+from flliper.test.ascend.test_ascend_utils import GEMMA_4_26B_A4B_IT_WEIGHTS_PATH
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestGemma426BA4BIt(GSM8KAscendMixin, CustomTestCase):

@@ -2,13 +2,13 @@
 
 The heterogeneous rank->GPU split (rank_tp_ratio / rank_mlp_ratio /
 rank_vocab_ratio / DCP token vector) is decided at boot time and printed to the
-sglang server log. Those materialized numbers do NOT live in ServerArgs, so
+flliper server log. Those materialized numbers do NOT live in ServerArgs, so
 ``/server_info`` cannot expose them (they are computed inside the TP worker
 processes). This module recovers them by parsing a boot log, which means the
 dashboard works against *any* server -- modified or stock -- as long as it has
 its log file.
 
-Pure stdlib, no sglang imports, so it is trivially unit-testable against the
+Pure stdlib, no flliper imports, so it is trivially unit-testable against the
 real logs under matrix_logs/ without a GPU.
 
 Public entry point: ``parse_plan(text) -> dict``.
@@ -59,7 +59,7 @@ def parse_plan(text: str) -> dict:
 
 
 def parse_plan_lines(lines) -> dict:
-    """Parse a full sglang boot log into a structured uneven-TP plan.
+    """Parse a full flliper boot log into a structured uneven-TP plan.
 
     Returns a dict with keys (any may be missing if the log predates that
     stage / is not an uneven-TP run):
@@ -149,9 +149,9 @@ def parse_plan_lines(lines) -> dict:
                 plan["rank_vocab_ratio"] = _ints(m.group(1))
             continue
 
-        if "Uneven DCP: restart with SGLANG_UNEVEN_TOKEN_VECTOR" in body:
+        if "Uneven DCP: restart with FLLIPER_UNEVEN_TOKEN_VECTOR" in body:
             # The "active vector [...]" is the CURRENTLY materialized per-64
-            # token ownership; the SGLANG_UNEVEN_TOKEN_VECTOR value is only a
+            # token ownership; the FLLIPER_UNEVEN_TOKEN_VECTOR value is only a
             # tuning *recommendation* for a future restart -- do not use it.
             av = re.search(r"active vector \[([\d,\s]+)\]", body)
             if av:

@@ -24,11 +24,11 @@ import inspect
 import types
 import unittest
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache import hicache_phase_binding as hpb
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache import hicache_phase_binding as hpb
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -133,7 +133,7 @@ class TestTheRingIsRebuiltAtRebind(CustomTestCase):
             server_args=types.SimpleNamespace(hicache_host_role="staging")
         )
         readers = {"scheduler": scheduler, "tree_cache": tree, "cache_controller": cc}
-        from sglang.srt.mem_cache import prefetch_budget
+        from flliper.srt.mem_cache import prefetch_budget
 
         with self.assertLogs(prefetch_budget.logger, level="INFO") as logs:
             hpb.rebuild_staging_ring_after_rebind(readers, scheduler)
@@ -154,8 +154,8 @@ class TestTheRingIsRebuiltAtRebind(CustomTestCase):
         ImportError on PREFETCH_CUTOVER_KEYS pre-empting the behaviour
         asserts; the constant is now read by name AFTER them, so a missing
         line reds on the line count first)."""
-        from sglang.srt.mem_cache import match_refusal_census as census
-        from sglang.srt.mem_cache.match_refusal_census import (
+        from flliper.srt.mem_cache import match_refusal_census as census
+        from flliper.srt.mem_cache.match_refusal_census import (
             PREFETCH_GATE_COUNTS,
             PREFETCH_INTAKE_PARTITION,
         )

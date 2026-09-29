@@ -25,8 +25,8 @@ import torch
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.distributed import pp_aux_capture as pac  # noqa: E402
-from sglang.srt.distributed.pp_aux_capture import (  # noqa: E402
+from flliper.srt.distributed import pp_aux_capture as pac  # noqa: E402
+from flliper.srt.distributed.pp_aux_capture import (  # noqa: E402
     AUX_KEY_PREFIX,
     PpAuxCaptureError,
     assemble_aux_on_last_stage,

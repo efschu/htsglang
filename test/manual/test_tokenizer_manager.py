@@ -17,15 +17,15 @@ import asyncio
 import unittest
 from unittest.mock import Mock, patch
 
-from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import (
+from flliper.srt.managers.io_struct import GenerateReqInput
+from flliper.srt.managers.tokenizer_manager import (
     InputFormat,
     ReqState,
     TokenizerManager,
 )
-from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
-from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from flliper.srt.observability.req_time_stats import APIServerReqTimeStats
+from flliper.srt.server_args import PortArgs, ServerArgs
+from flliper.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
 class TestInputFormatDetection(unittest.TestCase):
@@ -33,15 +33,15 @@ class TestInputFormatDetection(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        with patch("sglang.srt.utils.get_device", return_value="cpu"):
+        with patch("flliper.srt.utils.get_device", return_value="cpu"):
             self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
             self.port_args = PortArgs.init_new(self.server_args)
 
         with (
             patch("zmq.asyncio.Context"),
-            patch("sglang.srt.utils.network.get_zmq_socket"),
+            patch("flliper.srt.utils.network.get_zmq_socket"),
             patch(
-                "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
+                "flliper.srt.utils.hf_transformers_utils.get_tokenizer"
             ) as mock_tokenizer,
         ):
             mock_tokenizer.return_value = Mock(vocab_size=32000)
@@ -131,15 +131,15 @@ class TestTokenizerInputPreparation(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        with patch("sglang.srt.utils.get_device", return_value="cpu"):
+        with patch("flliper.srt.utils.get_device", return_value="cpu"):
             self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
             self.port_args = PortArgs.init_new(self.server_args)
 
         with (
             patch("zmq.asyncio.Context"),
-            patch("sglang.srt.utils.network.get_zmq_socket"),
+            patch("flliper.srt.utils.network.get_zmq_socket"),
             patch(
-                "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
+                "flliper.srt.utils.hf_transformers_utils.get_tokenizer"
             ) as mock_tokenizer,
         ):
             mock_tokenizer.return_value = Mock(vocab_size=32000)
@@ -191,15 +191,15 @@ class TestTokenizerResultExtraction(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        with patch("sglang.srt.utils.get_device", return_value="cpu"):
+        with patch("flliper.srt.utils.get_device", return_value="cpu"):
             self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
             self.port_args = PortArgs.init_new(self.server_args)
 
         with (
             patch("zmq.asyncio.Context"),
-            patch("sglang.srt.utils.network.get_zmq_socket"),
+            patch("flliper.srt.utils.network.get_zmq_socket"),
             patch(
-                "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
+                "flliper.srt.utils.hf_transformers_utils.get_tokenizer"
             ) as mock_tokenizer,
         ):
             mock_tokenizer.return_value = Mock(vocab_size=32000)
@@ -315,15 +315,15 @@ class TestTokenizerManagerIntegration(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        with patch("sglang.srt.utils.get_device", return_value="cpu"):
+        with patch("flliper.srt.utils.get_device", return_value="cpu"):
             self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
             self.port_args = PortArgs.init_new(self.server_args)
 
         with (
             patch("zmq.asyncio.Context"),
-            patch("sglang.srt.utils.network.get_zmq_socket"),
+            patch("flliper.srt.utils.network.get_zmq_socket"),
             patch(
-                "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
+                "flliper.srt.utils.hf_transformers_utils.get_tokenizer"
             ) as mock_tokenizer,
         ):
             mock_tokenizer.return_value = Mock(vocab_size=32000)

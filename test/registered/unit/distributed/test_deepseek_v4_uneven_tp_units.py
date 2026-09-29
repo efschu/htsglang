@@ -38,23 +38,23 @@ import os
 
 # Captured at import time by the DSV4 attention module; pinned so the test is
 # deterministic wherever it runs (the fp8 wo_a path is a separate vehicle).
-os.environ.setdefault("SGLANG_OPT_FP8_WO_A_GEMM", "0")
+os.environ.setdefault("FLLIPER_OPT_FP8_WO_A_GEMM", "0")
 
 import unittest
 
 import torch
 
-from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.distributed.utils import (
+from flliper.srt.configs.deepseek_v4 import DeepSeekV4Config
+from flliper.srt.distributed.utils import (
     get_tp_partition_ratios,
     partition_sizes,
     set_tp_partition_ratios,
 )
-from sglang.srt.layers.linear import ColumnParallelLinear
-from sglang.srt.models.deepseek_v4 import MqaAttentionBase
-from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.linear import ColumnParallelLinear
+from flliper.srt.models.deepseek_v4 import MqaAttentionBase
+from flliper.srt.runtime_context import get_context, get_parallel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -192,7 +192,7 @@ class TestUnevenAutoVector(_V4AttentionCase):
     def test_attn_sink_slice_follows_the_same_partition(self):
         """The per-rank sink slice is a prefix sum, not rank * width: under
         an uneven plan ranks 1 and 2 would otherwise read the wrong heads."""
-        from sglang.srt.distributed.utils import tp_partition_offset
+        from flliper.srt.distributed.utils import tp_partition_offset
 
         set_tp_partition_ratios(AUTO_WEIGHTS)
         mods = self._ranks(3)
@@ -300,7 +300,7 @@ class TestAutoPerformanceUnitGrid(unittest.TestCase):
     def _model(self, text, tp_size=3, base_plan=None):
         from unittest import mock
 
-        from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+        from flliper.srt.uneven_perf import PerfCostModel, PlanInputs
 
         base_plan = base_plan or AUTO_WEIGHTS
         inputs = PlanInputs(tp_size=tp_size, model_path="<fixture>")

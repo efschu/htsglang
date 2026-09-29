@@ -28,8 +28,8 @@ E = 2
 
 def _ct_layer(monkeypatch, sym=False):
     """A FusedMoE shell wired for the compressed-tensors WNA16 loader path."""
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16_moe import (
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16_moe import (
         CompressedTensorsWNA16MoE,
     )
 
@@ -66,7 +66,7 @@ def _ct_layer(monkeypatch, sym=False):
     layer.layer_id = 0
     layer.moe_tp_family = None
     layer.moe_tp_units = INTER // 128
-    monkeypatch.delenv("SGLANG_MOE_RESIDENT_EXPERT_FRACTION", raising=False)
+    monkeypatch.delenv("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", raising=False)
     with torch.device("cpu"):
         scheme.create_weights(
             layer,

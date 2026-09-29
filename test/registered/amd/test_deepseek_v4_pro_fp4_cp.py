@@ -11,10 +11,10 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -33,19 +33,19 @@ DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 5400
 
 # Common DeepSeek-V4 env vars, aligned with test_deepseek_v4_pro_fp4.py, except
-# SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton which the prefill-CP path requires.
+# FLLIPER_HACK_FLASHMLA_BACKEND=unified_kv_triton which the prefill-CP path requires.
 COMMON_ENV_VARS = {
-    "SGLANG_DEFAULT_THINKING": "1",
-    "SGLANG_DSV4_REASONING_EFFORT": "max",
-    "SGLANG_USE_ROCM700A": "0",
-    "SGLANG_DP_USE_GATHERV": "1",
-    "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
+    "FLLIPER_DEFAULT_THINKING": "1",
+    "FLLIPER_DSV4_REASONING_EFFORT": "max",
+    "FLLIPER_USE_ROCM700A": "0",
+    "FLLIPER_DP_USE_GATHERV": "1",
+    "FLLIPER_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
     "AITER_BF16_FP8_MOE_BOUND": "0",
 }
 
 # FP4 variant (matches test_deepseek_v4_pro_fp4.py; V4-Pro also auto-detects it).
 FP4_ENV_VARS = {
-    "SGLANG_DSV4_FP4_EXPERTS": "true",
+    "FLLIPER_DSV4_FP4_EXPERTS": "true",
 }
 
 

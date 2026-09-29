@@ -33,8 +33,8 @@ moves. That is asserted here rather than assumed.
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.srt.managers.schedule_policy import PrefillAdder
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.managers.schedule_policy import PrefillAdder
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
 def _tree_cache(*, evictable: int = 0, floor=None) -> MagicMock:
@@ -257,19 +257,19 @@ class TheCeilingCannotWedgeTheInstanceTest(unittest.TestCase):
     """
 
     def test_no_published_floor_means_no_ceiling(self):
-        from sglang.srt.mem_cache.common import published_fundable_floor
+        from flliper.srt.mem_cache.common import published_fundable_floor
 
         tc = _tree_cache(evictable=10, floor=None)
         tc.token_to_kv_pool_allocator = _allocator(available=10)
         self.assertIsNone(published_fundable_floor(tc))
 
     def test_a_missing_tree_cache_means_no_ceiling_rather_than_a_zero_one(self):
-        from sglang.srt.mem_cache.common import published_fundable_floor
+        from flliper.srt.mem_cache.common import published_fundable_floor
 
         self.assertIsNone(published_fundable_floor(None))
 
     def test_a_published_floor_is_returned(self):
-        from sglang.srt.mem_cache.common import published_fundable_floor
+        from flliper.srt.mem_cache.common import published_fundable_floor
 
         tc = _tree_cache(evictable=100, floor=400)
         tc.token_to_kv_pool_allocator = _allocator(available=999)
@@ -279,7 +279,7 @@ class TheCeilingCannotWedgeTheInstanceTest(unittest.TestCase):
         """The distinction is 'was a floor published', not 'is it non-zero'.
         A genuine group-wide zero must still bind, or the ticket's own crash
         state is exempt from the fix."""
-        from sglang.srt.mem_cache.common import published_fundable_floor
+        from flliper.srt.mem_cache.common import published_fundable_floor
 
         tc = _tree_cache(evictable=0, floor=0)
         tc.token_to_kv_pool_allocator = _allocator(available=0)
@@ -297,7 +297,7 @@ class TheWiringIsPinnedTest(unittest.TestCase):
     """
 
     def _scheduler_source(self) -> str:
-        import sglang.srt.managers.scheduler as scheduler_mod
+        import flliper.srt.managers.scheduler as scheduler_mod
 
         with open(scheduler_mod.__file__, "r", encoding="utf-8") as fh:
             return fh.read()
@@ -328,7 +328,7 @@ class TheWiringIsPinnedTest(unittest.TestCase):
         back through the back door."""
         import inspect
 
-        from sglang.srt.mem_cache.common import published_fundable_floor
+        from flliper.srt.mem_cache.common import published_fundable_floor
 
         self.assertIn(
             "fundable_extend_tokens",

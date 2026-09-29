@@ -10,7 +10,7 @@ authority:
     chain is env > MEASURED pinned H2D (rigmon card probe) > ESTIMATE (the NVML
     PCIe width x generation nameplate) > refusal, the label is derived from the
     source so the two cannot be set to disagree, and
-    ``SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE=measured`` makes the nameplate
+    ``FLLIPER_MOE_HOST_SHARD_MIN_PROVENANCE=measured`` makes the nameplate
     inadmissible. An ABSENT link yields an equal split in every setting.
   * **the rank -> card vector**, published by the launcher without a collective
     (#407 cut 2). Resolved through the #331 IdentityMap by CUDA ordinal, carried
@@ -35,8 +35,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe import expert_offload as eo  # noqa: E402
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe import expert_offload as eo  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     HOST_SHARD_MIN_PROVENANCE_ENV,
     HOST_SHARD_RATIO_ENV,
     HOST_SHARD_SOURCE_ENV,
@@ -50,7 +50,7 @@ from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
     reset_host_shard_log_latch,
     resolve_host_shard_ratio,
 )
-from sglang.srt.registry import rank_cards as rc  # noqa: E402
+from flliper.srt.registry import rank_cards as rc  # noqa: E402
 
 # This rig, ANALYSE_393 §7.2. NVML enumerates in bus order, CUDA defaults to
 # FASTEST_FIRST, so the 5090 is CUDA ordinal 0 and NVML index 1. The x4 slot --
@@ -71,7 +71,7 @@ X4_RANK = 1  # the rank behind the x4 slot, by BDF -- never assumed by index
 def _clean_env(monkeypatch):
     monkeypatch.delenv(HOST_SHARD_RATIO_ENV, raising=False)
     monkeypatch.delenv(HOST_SHARD_MIN_PROVENANCE_ENV, raising=False)
-    monkeypatch.setenv("SGLANG_MOE_RESIDENT_EXPERT_FRACTION", "0.25")
+    monkeypatch.setenv("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", "0.25")
     rc.clear_published_rank_cards()
     reset_card_probe_memo()
     reset_host_shard_log_latch()
@@ -105,7 +105,7 @@ class _FakePynvml:
 
 
 def _identity_map():
-    from sglang.srt.registry import nvml as nvml_mod
+    from flliper.srt.registry import nvml as nvml_mod
 
     return nvml_mod.IdentityMap(
         [
@@ -125,7 +125,7 @@ def _identity_map():
 @pytest.fixture
 def nvml_rig(monkeypatch):
     """The real derivation, against a fake driver."""
-    from sglang.srt.registry import nvml as nvml_mod
+    from flliper.srt.registry import nvml as nvml_mod
 
     fake = _FakePynvml(CARDS)
 
@@ -140,7 +140,7 @@ def nvml_rig(monkeypatch):
 
 def _probe_profile(h2d_by_uuid):
     """A CardProbeProfile carrying exactly these measured H2D rates."""
-    from sglang.srt.rigmon.card_probe import CardProbeMeasurement, CardProbeProfile
+    from flliper.srt.rigmon.card_probe import CardProbeMeasurement, CardProbeProfile
 
     return CardProbeProfile(
         cards=[
@@ -158,7 +158,7 @@ def _probe_profile(h2d_by_uuid):
 @pytest.fixture
 def card_probe(monkeypatch):
     """Install a probe cache and count how often it is read."""
-    from sglang.srt.rigmon import card_probe as probe_mod
+    from flliper.srt.rigmon import card_probe as probe_mod
 
     calls = {"load": 0}
 
@@ -260,7 +260,7 @@ def test_an_unselectable_min_provenance_is_a_hard_error(monkeypatch, raw):
 
 
 def test_provenance_is_derived_from_the_source_not_settable_beside_it():
-    from sglang.srt.layers.moe.expert_offload import HostShardRatio
+    from flliper.srt.layers.moe.expert_offload import HostShardRatio
 
     assert HostShardRatio((0.5, 0.5), HOST_SHARD_SOURCE_PROBE).provenance == "measured"
     assert HostShardRatio((0.5, 0.5), HOST_SHARD_SOURCE_NVML).provenance == "estimate"
@@ -273,7 +273,7 @@ def test_the_probe_is_read_once_per_process_and_never_triggers_a_measurement(
     nvml_rig, card_probe
 ):
     """40+ MoE layers must not each parse the cache, and none may probe."""
-    from sglang.srt.rigmon import card_probe as probe_mod
+    from flliper.srt.rigmon import card_probe as probe_mod
 
     calls = card_probe(MEASURED_H2D)
     ran = {"probe": 0}
@@ -366,7 +366,7 @@ def test_unequal_declared_links_produce_unequal_shares(nvml_rig, card_probe):
     card_probe(MEASURED_H2D)
     ratio = resolve_host_shard_ratio(3, UUID_BY_RANK)
 
-    from sglang.srt.layers.moe.expert_offload import partition_cold_experts
+    from flliper.srt.layers.moe.expert_offload import partition_cold_experts
 
     shares = partition_cold_experts(tuple(range(48)), ratio.weights)
     counts = [len(s) for s in shares]
@@ -385,7 +385,7 @@ def test_the_unequal_split_pin_can_fail():
     classic "wired but inert" regression -- the weights arrive and the
     apportionment splits evenly anyway. The property must notice.
     """
-    from sglang.srt.layers.moe.expert_offload import partition_cold_experts
+    from flliper.srt.layers.moe.expert_offload import partition_cold_experts
 
     planted_equal = (1 / 3, 1 / 3, 1 / 3)
     counts = [len(s) for s in partition_cold_experts(tuple(range(48)), planted_equal)]
@@ -456,7 +456,7 @@ def test_the_launcher_publishes_uuids_in_world_rank_order():
 
 def test_publication_is_an_environment_write_and_nothing_else(monkeypatch):
     """The channel must be inert: no collective, no torch, no CUDA."""
-    import sglang.srt.registry.nvml as nvml_mod
+    import flliper.srt.registry.nvml as nvml_mod
 
     monkeypatch.setattr(nvml_mod, "identity_map", lambda *a, **k: _identity_map())
 
@@ -508,7 +508,7 @@ def test_without_a_cuda_context_the_launcher_refuses_to_build_one(monkeypatch):
     vector = rc.resolve_rank_card_vector(_Args())
 
     assert not vector.present
-    assert "SGLANG_RANK_CARD_PROBE_CUDA" in vector.reason
+    assert "FLLIPER_RANK_CARD_PROBE_CUDA" in vector.reason
     assert "--rank-gpu-id" in vector.reason
 
 
@@ -586,11 +586,11 @@ def test_the_baseline_arm_says_so_rather_than_staying_silent():
 def test_the_row_reaches_the_expert_stats_dump(
     tmp_path, monkeypatch, nvml_rig, card_probe
 ):
-    from sglang.srt.layers.moe import expert_stats as es
+    from flliper.srt.layers.moe import expert_stats as es
 
     card_probe(MEASURED_H2D)
-    monkeypatch.setenv("SGLANG_EXPERT_STATS", "1")
-    monkeypatch.setenv("SGLANG_EXPERT_STATS_PATH", str(tmp_path / "stats"))
+    monkeypatch.setenv("FLLIPER_EXPERT_STATS", "1")
+    monkeypatch.setenv("FLLIPER_EXPERT_STATS_PATH", str(tmp_path / "stats"))
     es.reset_for_tests()
     try:
         ratio = resolve_host_shard_ratio(3, UUID_BY_RANK)
@@ -619,10 +619,10 @@ def test_the_row_reaches_the_expert_stats_dump(
 def test_layers_staged_under_different_ratios_stay_visible_as_mixed(
     tmp_path, monkeypatch
 ):
-    from sglang.srt.layers.moe import expert_stats as es
+    from flliper.srt.layers.moe import expert_stats as es
 
-    monkeypatch.setenv("SGLANG_EXPERT_STATS", "1")
-    monkeypatch.setenv("SGLANG_EXPERT_STATS_PATH", str(tmp_path / "stats"))
+    monkeypatch.setenv("FLLIPER_EXPERT_STATS", "1")
+    monkeypatch.setenv("FLLIPER_EXPERT_STATS_PATH", str(tmp_path / "stats"))
     es.reset_for_tests()
     try:
         for layer_id, policy in ((0, "equal"), (1, "link-proportional")):
@@ -677,7 +677,7 @@ def test_generation_still_comes_from_the_maximum_not_the_idle_link_state(nvml_ri
     is deliberate rather than an oversight. Pinned so a future "make both
     current" tidy-up has to argue with a test.
     """
-    from sglang.srt.layers.moe.expert_offload import _pcie_link_gbps_by_uuid
+    from flliper.srt.layers.moe.expert_offload import _pcie_link_gbps_by_uuid
 
     # gen 4 lane rate x the x4 slot: 1.969 * 4
     assert _pcie_link_gbps_by_uuid("GPU-3080-a") == pytest.approx(1.969 * 4)
@@ -694,8 +694,8 @@ def test_the_probe_path_is_keyed_on_nvml_not_on_the_process_cuda_view(monkeypatc
     not masked by that variable, so the full key is reconstructible -- this test
     pins that the reconstruction is what gets tried FIRST.
     """
-    from sglang.srt.registry import nvml as nvml_mod
-    from sglang.srt.rigmon import card_probe as probe_mod
+    from flliper.srt.registry import nvml as nvml_mod
+    from flliper.srt.rigmon import card_probe as probe_mod
 
     class _Dev:
         def __init__(self, uuid):

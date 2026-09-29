@@ -33,9 +33,9 @@ network.
 
 import pytest
 
-from sglang.srt.managers import phase_policy as pp
-from sglang.srt.managers.phase_policy import PhasePolicyInputs
-from sglang.srt.managers.phase_purity import seam_transport_deduction
+from flliper.srt.managers import phase_policy as pp
+from flliper.srt.managers.phase_policy import PhasePolicyInputs
+from flliper.srt.managers.phase_purity import seam_transport_deduction
 
 #: The live shape this is drawn from: one chunk, and a backlog just above it.
 PP_EXIT_TOKENS = 4096
@@ -173,7 +173,7 @@ def test_the_pre_869c_deduction_hid_the_stall():
     d = _stall_decision(deflated)
     # Asserted on the VERDICT, not on a substring of the reason: an earlier
     # draft of this test matched "stall" and hit
-    # SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S in an unrelated suggestion line.
+    # FLLIPER_PHASE_POLICY_DECODE_STALL_SLO_S in an unrelated suggestion line.
     assert not d.wants_flip, (
         "with pending deflated below one chunk nothing should arm -- the "
         f"escape's threshold is unreachable; got {d.direction!r} "

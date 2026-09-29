@@ -8,16 +8,16 @@ import requests
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
-from sglang.srt.environ import envs
-from sglang.srt.observability.metrics_collector import (
+from flliper.srt.environ import envs
+from flliper.srt.observability.metrics_collector import (
     ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
     STAT_LOGGER_ROLE_SCHEDULER,
     SchedulerMetricsCollector,
     compute_routing_key_stats,
 )
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -59,19 +59,19 @@ class TestEnableMetrics(CustomTestCase):
         def _verify_metrics_extra(metrics):
             metrics_to_check = [
                 (
-                    "sglang:dp_cooperation_realtime_tokens_total",
+                    "flliper:dp_cooperation_realtime_tokens_total",
                     {"mode": "prefill_compute"},
                 ),
                 (
-                    "sglang:dp_cooperation_realtime_tokens_total",
+                    "flliper:dp_cooperation_realtime_tokens_total",
                     {"mode": "decode"},
                 ),
                 (
-                    "sglang:dp_cooperation_forward_execution_seconds_total",
+                    "flliper:dp_cooperation_forward_execution_seconds_total",
                     {"category": "extend"},
                 ),
                 (
-                    "sglang:dp_cooperation_forward_execution_seconds_total",
+                    "flliper:dp_cooperation_forward_execution_seconds_total",
                     {"category": "decode"},
                 ),
             ]
@@ -79,7 +79,7 @@ class TestEnableMetrics(CustomTestCase):
 
             num_prefill_ranks_values = {
                 s.labels["num_prefill_ranks"]
-                for s in metrics["sglang:dp_cooperation_realtime_tokens_total"]
+                for s in metrics["flliper:dp_cooperation_realtime_tokens_total"]
             }
             self.assertIn("0", num_prefill_ranks_values)
             self.assertIn("1", num_prefill_ranks_values)
@@ -99,9 +99,9 @@ class TestEnableMetrics(CustomTestCase):
         enable_mfu_metrics: bool,
     ):
         with (
-            envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.override(True),
-            envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.override(True),
-            envs.SGLANG_TEST_RETRACT.override(True),
+            envs.FLLIPER_ENABLE_METRICS_DP_ATTENTION.override(True),
+            envs.FLLIPER_ENABLE_METRICS_DEVICE_TIMER.override(True),
+            envs.FLLIPER_TEST_RETRACT.override(True),
         ):
             launch_args = [
                 "--enable-metrics",
@@ -167,31 +167,31 @@ class TestEnableMetrics(CustomTestCase):
 
     def _verify_metrics_common(self, metrics_text, metrics, expect_mfu_metrics: bool):
         essential_metrics = [
-            "sglang:num_running_reqs",
-            "sglang:num_used_tokens",
-            "sglang:token_usage",
-            "sglang:gen_throughput",
-            "sglang:num_queue_reqs",
-            "sglang:num_grammar_queue_reqs",
-            "sglang:cache_hit_rate",
-            "sglang:spec_accept_length",
-            "sglang:prompt_tokens_total",
-            "sglang:generation_tokens_total",
-            "sglang:cached_tokens_total",
-            "sglang:num_requests_total",
-            "sglang:time_to_first_token_seconds",
-            "sglang:inter_token_latency_seconds",
-            "sglang:e2e_request_latency_seconds",
-            "sglang:http_requests_active",
-            "sglang:routing_keys_active",
-            "sglang:num_unique_running_routing_keys",
-            "sglang:routing_key_running_req_count",
-            "sglang:routing_key_all_req_count",
+            "flliper:num_running_reqs",
+            "flliper:num_used_tokens",
+            "flliper:token_usage",
+            "flliper:gen_throughput",
+            "flliper:num_queue_reqs",
+            "flliper:num_grammar_queue_reqs",
+            "flliper:cache_hit_rate",
+            "flliper:spec_accept_length",
+            "flliper:prompt_tokens_total",
+            "flliper:generation_tokens_total",
+            "flliper:cached_tokens_total",
+            "flliper:num_requests_total",
+            "flliper:time_to_first_token_seconds",
+            "flliper:inter_token_latency_seconds",
+            "flliper:e2e_request_latency_seconds",
+            "flliper:http_requests_active",
+            "flliper:routing_keys_active",
+            "flliper:num_unique_running_routing_keys",
+            "flliper:routing_key_running_req_count",
+            "flliper:routing_key_all_req_count",
         ]
         mfu_metrics = [
-            "sglang:estimated_flops_per_gpu_total",
-            "sglang:estimated_read_bytes_per_gpu_total",
-            "sglang:estimated_write_bytes_per_gpu_total",
+            "flliper:estimated_flops_per_gpu_total",
+            "flliper:estimated_read_bytes_per_gpu_total",
+            "flliper:estimated_write_bytes_per_gpu_total",
         ]
         if expect_mfu_metrics:
             essential_metrics.extend(mfu_metrics)
@@ -201,8 +201,8 @@ class TestEnableMetrics(CustomTestCase):
         # Verify routing key GaugeHistogram buckets
         expected_buckets = len(ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS) + 1
         for metric_name in [
-            "sglang:routing_key_running_req_count",
-            "sglang:routing_key_all_req_count",
+            "flliper:routing_key_running_req_count",
+            "flliper:routing_key_all_req_count",
         ]:
             gt_le_pairs = set()
             for sample in metrics.get(metric_name, []):
@@ -219,11 +219,11 @@ class TestEnableMetrics(CustomTestCase):
         self.assertIn("_bucket{", metrics_text)
 
         metrics_to_check = [
-            ("sglang:realtime_tokens_total", {"mode": "prefill_compute"}),
-            ("sglang:realtime_tokens_total", {"mode": "decode"}),
-            ("sglang:forward_execution_seconds_total", {"category": "extend"}),
-            ("sglang:forward_execution_seconds_total", {"category": "decode"}),
-            ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
+            ("flliper:realtime_tokens_total", {"mode": "prefill_compute"}),
+            ("flliper:realtime_tokens_total", {"mode": "decode"}),
+            ("flliper:forward_execution_seconds_total", {"category": "extend"}),
+            ("flliper:forward_execution_seconds_total", {"category": "decode"}),
+            ("flliper:process_cpu_seconds_total", {"component": "tokenizer"}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
 
@@ -284,7 +284,7 @@ def _check_metrics_positive(test_case, metrics, metrics_to_check):
         test_case.assertGreater(value, 0, f"{metric_name} {labels}")
 
 
-_DI_MARKER_PATH = "/tmp/sglang_di_test_marker"
+_DI_MARKER_PATH = "/tmp/flliper_di_test_marker"
 
 
 class _MarkingSchedulerCollector(SchedulerMetricsCollector):
@@ -308,7 +308,7 @@ class _MarkingSchedulerCollector(SchedulerMetricsCollector):
 # collector subclasses (instantiation-marker vs. emission-recording) cannot
 # stomp on each other when both tests run in the same CI shard.
 _DI_RECORDING_MARKER_PATH = os.path.join(
-    tempfile.gettempdir(), "sglang_stat_loggers_di_marker.jsonl"
+    tempfile.gettempdir(), "flliper_stat_loggers_di_marker.jsonl"
 )
 
 
@@ -316,7 +316,7 @@ class _FileRecordingMetric:
     """Module-level recording metric.
 
     Mirrors the ``FakeRayMetric`` from
-    ``sglang.test.observability.fake_ray`` (records ``(op, value, tags)``
+    ``flliper.test.observability.fake_ray`` (records ``(op, value, tags)``
     triples) but exposes the prometheus_client ``.labels(...).inc/.set/
     .observe(...)`` shape that ``SchedulerMetricsCollector`` calls into.
 
@@ -402,8 +402,8 @@ class _RecordingSchedulerCollector(SchedulerMetricsCollector):
     _summary_cls = _FileRecordingMetric
 
 
-def _clear_sglang_metrics_from_default_registry() -> None:
-    """Drop any ``sglang:`` metrics left in the process-global prometheus default
+def _clear_flliper_metrics_from_default_registry() -> None:
+    """Drop any ``flliper:`` metrics left in the process-global prometheus default
     REGISTRY by a prior in-process Engine boot. Without this, a second in-process
     ``sgl.Engine(enable_metrics=True)`` in the same test process re-registers the
     same Counters and raises "Duplicated timeseries in CollectorRegistry"."""
@@ -411,7 +411,7 @@ def _clear_sglang_metrics_from_default_registry() -> None:
 
     for collector in list(getattr(REGISTRY, "_collector_to_names", {})):
         names = REGISTRY._collector_to_names.get(collector, set())
-        if any(name.startswith("sglang:") for name in names):
+        if any(name.startswith("flliper:") for name in names):
             REGISTRY.unregister(collector)
 
 
@@ -421,7 +421,7 @@ class TestStatLoggersDI(CustomTestCase):
     scheduler subprocess."""
 
     def setUp(self) -> None:
-        _clear_sglang_metrics_from_default_registry()
+        _clear_flliper_metrics_from_default_registry()
         try:
             os.unlink(_DI_MARKER_PATH)
         except FileNotFoundError:
@@ -434,7 +434,7 @@ class TestStatLoggersDI(CustomTestCase):
             pass
 
     def test_engine_custom_scheduler_collector(self):
-        import sglang as sgl
+        import flliper as sgl
 
         engine = sgl.Engine(
             model_path=_MODEL_NAME,
@@ -472,7 +472,7 @@ class TestStatLoggersDIRecording(CustomTestCase):
     def setUp(self) -> None:
         # Avoid stale PROMETHEUS_MULTIPROC_DIR from prior in-process Engine boots.
         os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
-        _clear_sglang_metrics_from_default_registry()
+        _clear_flliper_metrics_from_default_registry()
         try:
             os.unlink(_DI_RECORDING_MARKER_PATH)
         except FileNotFoundError:
@@ -500,7 +500,7 @@ class TestStatLoggersDIRecording(CustomTestCase):
         return entries
 
     def test_engine_custom_scheduler_collector_emits_through_fake_metric(self):
-        import sglang as sgl
+        import flliper as sgl
 
         engine = sgl.Engine(
             model_path=_MODEL_NAME,
@@ -546,22 +546,22 @@ class TestStatLoggersDIRecording(CustomTestCase):
         #    stats tick. After one generation it should have at least one
         #    emission.
         self.assertIn(
-            "sglang:num_running_reqs",
+            "flliper:num_running_reqs",
             by_name,
             f"Expected num_running_reqs emissions, saw: {sorted(by_name)[:10]}",
         )
-        running_ops = {e["op"] for e in by_name["sglang:num_running_reqs"]}
+        running_ops = {e["op"] for e in by_name["flliper:num_running_reqs"]}
         self.assertIn("set", running_ops)
 
         # 2) num_queue_reqs: same shape, different metric. Two metrics from
         #    the same collector firing confirm the DI hook applied uniformly.
-        self.assertIn("sglang:num_queue_reqs", by_name)
-        queue_ops = {e["op"] for e in by_name["sglang:num_queue_reqs"]}
+        self.assertIn("flliper:num_queue_reqs", by_name)
+        queue_ops = {e["op"] for e in by_name["flliper:num_queue_reqs"]}
         self.assertIn("set", queue_ops)
 
         # 3) Tag propagation: every recorded emission must carry the labels
         #    keys the scheduler installed (model_name, engine_type, ...).
-        any_running = by_name["sglang:num_running_reqs"][0]
+        any_running = by_name["flliper:num_running_reqs"][0]
         self.assertIn("model_name", any_running["tags"])
         self.assertEqual(any_running["tags"]["model_name"], _MODEL_NAME)
 

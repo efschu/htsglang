@@ -38,14 +38,14 @@ import unittest
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache import memory_pool as mp
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache import memory_pool as mp
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_MODULE_LOGGER = "sglang.srt.mem_cache.memory_pool"
+_MODULE_LOGGER = "flliper.srt.mem_cache.memory_pool"
 
 
 class _HostReadError(AssertionError):
@@ -138,13 +138,13 @@ class TestTheGate(CustomTestCase):
 
     def test_silent_by_default(self):
         pool, req = _pool(), _req(_ExplodingTensor(torch.tensor([7])))
-        with envs.SGLANG_DEBUG_MAMBA_CARRY.override(False):
+        with envs.FLLIPER_DEBUG_MAMBA_CARRY.override(False):
             with self.assertNoLogs(_MODULE_LOGGER, level=logging.DEBUG):
                 mp.note_mamba_carry_without_copy(pool, req)
 
     def test_counters_increment_with_the_gate_off(self):
         pool, req = _pool(), _req(_ExplodingTensor(torch.tensor([7])))
-        with envs.SGLANG_DEBUG_MAMBA_CARRY.override(False):
+        with envs.FLLIPER_DEBUG_MAMBA_CARRY.override(False):
             for _ in range(4):
                 mp.note_mamba_carry_without_copy(pool, req)
         self.assertEqual(pool._m767_carry_total, 4)
@@ -152,7 +152,7 @@ class TestTheGate(CustomTestCase):
 
     def test_speaks_when_asked(self):
         pool, req = _pool(), _req(_ExplodingTensor(torch.tensor([7])))
-        with envs.SGLANG_DEBUG_MAMBA_CARRY.override(True):
+        with envs.FLLIPER_DEBUG_MAMBA_CARRY.override(True):
             with self.assertLogs(_MODULE_LOGGER, level=logging.WARNING) as cm:
                 mp.note_mamba_carry_without_copy(pool, req)
         self.assertIn("#767 carry-without-copy #1", cm.output[0])
@@ -162,7 +162,7 @@ class TestTheGate(CustomTestCase):
         # must stay sync-free behind the gate too. The record is formatted here
         # (assertLogs renders it), and the tensor would raise if touched.
         pool, req = _pool(), _req(_ExplodingTensor(torch.tensor([7])))
-        with envs.SGLANG_DEBUG_MAMBA_CARRY.override(True):
+        with envs.FLLIPER_DEBUG_MAMBA_CARRY.override(True):
             with self.assertLogs(_MODULE_LOGGER, level=logging.WARNING) as cm:
                 mp.note_mamba_carry_without_copy(pool, req)
         self.assertIn("<tensor shape=(1,)", cm.output[0])
@@ -170,7 +170,7 @@ class TestTheGate(CustomTestCase):
     def test_a_pending_copy_is_not_a_carry_without_copy(self):
         pool = _pool()
         req = _req(_ExplodingTensor(torch.tensor([7])), cow=object())
-        with envs.SGLANG_DEBUG_MAMBA_CARRY.override(True):
+        with envs.FLLIPER_DEBUG_MAMBA_CARRY.override(True):
             with self.assertNoLogs(_MODULE_LOGGER, level=logging.DEBUG):
                 mp.note_mamba_carry_without_copy(pool, req)
         self.assertEqual(pool._m767_carry_total, 1)
@@ -178,7 +178,7 @@ class TestTheGate(CustomTestCase):
 
     def test_the_rate_limit_survives_the_gate(self):
         pool, req = _pool(), _req(_ExplodingTensor(torch.tensor([7])))
-        with envs.SGLANG_DEBUG_MAMBA_CARRY.override(True):
+        with envs.FLLIPER_DEBUG_MAMBA_CARRY.override(True):
             with self.assertLogs(_MODULE_LOGGER, level=logging.WARNING) as cm:
                 for _ in range(10):
                     mp.note_mamba_carry_without_copy(pool, req)
@@ -203,7 +203,7 @@ class TestAdmissionPathIsClean(CustomTestCase):
 
     def test_the_instrument_is_gated_and_sync_free(self):
         src = inspect.getsource(mp.note_mamba_carry_without_copy)
-        self.assertIn("envs.SGLANG_DEBUG_MAMBA_CARRY.get()", src)
+        self.assertIn("envs.FLLIPER_DEBUG_MAMBA_CARRY.get()", src)
         self.assertIn("sync_free_tensor_repr(", src)
         # The tensor itself must never reach the format arguments.
         self.assertNotIn("req.mamba_pool_idx,", src)

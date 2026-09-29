@@ -35,9 +35,9 @@ model, and the per-barrier max is what makes them.
 import os
 import unittest
 
-from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.uneven_perf import PerfCostModel, PlanInputs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -187,7 +187,7 @@ class TestBarrierSkewIsTheMissingTerm(CustomTestCase):
     def test_the_plan_log_states_the_skew_it_charged(self):
         """A discount nobody can see is a discount nobody can refute: the
         per-candidate line names the skew as a share of the base step."""
-        from sglang.srt.uneven_perf import PerfCostModel as _P
+        from flliper.srt.uneven_perf import PerfCostModel as _P
 
         m = _model(_INT8)
         skew = m.prefill_barrier_skew([10, 1, 1], _GEMM_INT8)

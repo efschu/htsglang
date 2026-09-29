@@ -55,7 +55,7 @@ WHAT EACH TEST HOLDS DOWN
 
 import unittest
 
-from sglang.srt.managers.phase_purity import (
+from flliper.srt.managers.phase_purity import (
     SEAM_GRANT_CONSUMED_ATTR,
     SEAM_READMIT_ATTR,
     consume_seam_grant,

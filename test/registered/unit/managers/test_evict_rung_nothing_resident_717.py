@@ -23,7 +23,7 @@ leaves every flip funded by the raw seam budget alone.
 
 import unittest
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # the specimen, verbatim
 MAX_LIVE = 397_958
@@ -33,7 +33,7 @@ OBSERVED_FLOOR = 398_471  # == MAX_LIVE + 1 + margin + reserve, as logged
 
 def _relief(split, evict_rows=50_000):
     """A KvBackingRelief with only the attributes these two methods read."""
-    from sglang.srt.managers import kv_backing_relief as m
+    from flliper.srt.managers import kv_backing_relief as m
 
     r = m.KvBackingRelief.__new__(m.KvBackingRelief)
     r._pool = type("P", (), {"page_size": 1})()
@@ -47,17 +47,17 @@ def _relief(split, evict_rows=50_000):
 
 class TestNothingResidentIsNotUnknown717(CustomTestCase):
     def setUp(self):
-        from sglang.srt.managers import kv_backing_relief as m
+        from flliper.srt.managers import kv_backing_relief as m
 
         # price the watermark deterministically; the real one walks a tree
         self._orig = m.__dict__.get("_TEST_PATCHED", None)
-        import sglang.srt.managers.kv_radix_watermark as w
+        import flliper.srt.managers.kv_radix_watermark as w
 
         self._w_orig = w.evictable_rows_above
         w.evictable_rows_above = lambda tree, floor: (50_000, 1)
 
     def tearDown(self):
-        import sglang.srt.managers.kv_radix_watermark as w
+        import flliper.srt.managers.kv_radix_watermark as w
 
         w.evictable_rows_above = self._w_orig
 
@@ -126,7 +126,7 @@ class TestBothSidesAgreeOnTheBranch717(CustomTestCase):
     """
 
     def setUp(self):
-        import sglang.srt.managers.kv_radix_watermark as w
+        import flliper.srt.managers.kv_radix_watermark as w
 
         self._orig_evict = w.evict_rows_above
         self.calls = []
@@ -138,7 +138,7 @@ class TestBothSidesAgreeOnTheBranch717(CustomTestCase):
         w.evict_rows_above = _spy
 
     def tearDown(self):
-        import sglang.srt.managers.kv_radix_watermark as w
+        import flliper.srt.managers.kv_radix_watermark as w
 
         w.evict_rows_above = self._orig_evict
 

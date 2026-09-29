@@ -296,7 +296,7 @@ Small model (Qwen3.5-4B), one card, TP=1.
   from `/get_server_info` (argument validation is CPU-tested — what is new is
   that the values reach the scheduler); two identical greedy generations are
   identical (the ladders are supposed to be inert); ≥20 occupancy samples from
-  `sglang:token_usage` with a maximum > 0 (a flat zero line would mean the load
+  `flliper:token_usage` with a maximum > 0 (a flat zero line would mean the load
   never reached the pool); the sensor returns a reading with a verdict, a
   finite occupancy and a trend — and twice the same one from the same series.
 * **Explicitly NOT tested** the wiring of the sensor to scheduler occupancy,
@@ -383,10 +383,10 @@ whether it boots.
   working tree under test (`barlink_bar1.py`, `benchmark/bar1_graph_check.py`),
   otherwise STOP with a pointer to `BAR1_HOST_WT`.
 * **Command** `bash run_step.sh s11`
-* **Gate first** `benchmark/bar1_graph_check.py 0,1,2`. `SGLANG_BARLINK_GRAPH_ENABLE=1`
+* **Gate first** `benchmark/bar1_graph_check.py 0,1,2`. `FLLIPER_BARLINK_GRAPH_ENABLE=1`
   without that proof yields numbers from an operating point nobody can defend.
 * **Success** `check_s11_bar1_e2e.py`: all gate cases of the gate passed;
-  `ACHIEVED=bar1` **per group** — with `SGLANG_UNEVEN_DCP=1` there are two
+  `ACHIEVED=bar1` **per group** — with `FLLIPER_UNEVEN_DCP=1` there are two
   (`tp:0`, `dcp:0`), and one of them on gloo makes the run a mixed one (which
   happened exactly once and cost a whole measurement); per group one
   `barlink-BAR1: setup in` line; smoke answer coherent (the numbers 1..20 in
@@ -419,8 +419,8 @@ it.
   to back (A,B,A,B), then the next session count. Eight boots for four points
   per arm — that is the price of not comparing two different afternoons
   (measurement rule 5). Blockwise would be one boot per arm, and worthless.
-* **The arms differ in exactly three variables** (`SGLANG_BARLINK`,
-  `SGLANG_BARLINK_TRANSPORT`, `SGLANG_BARLINK_GRAPH_ENABLE`, plus the driver
+* **The arms differ in exactly three variables** (`FLLIPER_BARLINK`,
+  `FLLIPER_BARLINK_TRANSPORT`, `FLLIPER_BARLINK_GRAPH_ENABLE`, plus the driver
   source). Both boot scripts come from **one** template so they cannot drift
   apart; a test diffs them and allows exactly two lines of difference.
 * **What is measured** per arm and session count 1/4/8/16 one prefill point

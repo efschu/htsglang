@@ -4,10 +4,10 @@ image, or the group splits and hangs in its next collective."""
 
 import types
 
-from sglang.srt.managers.scheduler_components import weight_updater as wu
+from flliper.srt.managers.scheduler_components import weight_updater as wu
 
 CLS = wu.SchedulerWeightUpdaterManager
-VERDICT = CLS._weg2_kv_group_verdict
+VERDICT = CLS._pdflip_kv_group_verdict
 
 
 class _Adapter:
@@ -22,9 +22,9 @@ def _rank(mine_resumed_epoch=7):
     return types.SimpleNamespace(
         tp_cpu_group=object(),
         memory_saver_adapter=_Adapter(),
-        scheduler=types.SimpleNamespace(weg2_dormant=False),
-        _weg2_kv_resumed_epoch=mine_resumed_epoch,
-        _weg2_kv_deferred=False,
+        scheduler=types.SimpleNamespace(pdflip_dormant=False),
+        _pdflip_kv_resumed_epoch=mine_resumed_epoch,
+        _pdflip_kv_deferred=False,
     )
 
 
@@ -41,8 +41,8 @@ def test_all_ok_keeps_the_rank_resumed(monkeypatch):
     _wire(monkeypatch, [True, True, True])
     r = _rank()
     assert VERDICT(r, True, 7) is True
-    assert r.memory_saver_adapter.paused == [] and r.scheduler.weg2_dormant is False
-    assert r._weg2_kv_resumed_epoch == 7 and r._weg2_kv_deferred is False
+    assert r.memory_saver_adapter.paused == [] and r.scheduler.pdflip_dormant is False
+    assert r._pdflip_kv_resumed_epoch == 7 and r._pdflip_kv_deferred is False
 
 
 def test_one_refused_rank_pulls_a_resumed_rank_back_to_dormant(monkeypatch):
@@ -50,15 +50,15 @@ def test_one_refused_rank_pulls_a_resumed_rank_back_to_dormant(monkeypatch):
     r = _rank()
     assert VERDICT(r, True, 7) is False
     assert r.memory_saver_adapter.paused == [wu.GPU_MEMORY_TYPE_KV_CACHE]
-    assert r.scheduler.weg2_dormant is True
-    assert r._weg2_kv_resumed_epoch is None and r._weg2_kv_deferred is True
+    assert r.scheduler.pdflip_dormant is True
+    assert r._pdflip_kv_resumed_epoch is None and r._pdflip_kv_deferred is True
 
 
 def test_the_refused_rank_itself_pauses_nothing_and_stays_deferred(monkeypatch):
     _wire(monkeypatch, [True, False, True])
     r = _rank(mine_resumed_epoch=None)
     assert VERDICT(r, False, 7) is False
-    assert r.memory_saver_adapter.paused == [] and r._weg2_kv_deferred is True
+    assert r.memory_saver_adapter.paused == [] and r._pdflip_kv_deferred is True
 
 
 def test_world_size_one_is_the_own_verdict(monkeypatch):
@@ -71,24 +71,24 @@ def test_world_size_one_is_the_own_verdict(monkeypatch):
 def test_the_verdict_sits_between_the_resume_and_the_clear_half():
     """xsn410: after the clear half (xsn409's placement) the verdict deadlocked --
     the resumed ranks ran the clear half's own collective
-    (_weg2_release_dormant_hold -> _weg2_group_min_flags) while the refused
+    (_pdflip_release_dormant_hold -> _pdflip_group_min_flags) while the refused
     rank waited in the verdict's all_gather. Now: every exit of the resume
     half votes, and the clear half runs on no rank unless the group resumed."""
     import inspect
 
     src = inspect.getsource(CLS)
-    i_part = src.index("def _weg2_kv_resume_part():")
-    i_clear = src.index("def _weg2_kv_clear_part():", i_part)
+    i_part = src.index("def _pdflip_kv_resume_part():")
+    i_clear = src.index("def _pdflip_kv_clear_part():", i_part)
     part = src[i_part:i_clear]
     # the two refusals vote False; the landed resume votes True before the epoch mark
-    assert part.count("return self._weg2_kv_group_verdict(False, _kv_epoch)") == 2
-    i_yes = part.index("if not self._weg2_kv_group_verdict(True, _kv_epoch):")
-    i_mark = part.index("self._weg2_kv_resumed_epoch = _kv_epoch")
+    assert part.count("return self._pdflip_kv_group_verdict(False, _kv_epoch)") == 2
+    i_yes = part.index("if not self._pdflip_kv_group_verdict(True, _kv_epoch):")
+    i_mark = part.index("self._pdflip_kv_resumed_epoch = _kv_epoch")
     i_resume = part.index("self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)")
     assert i_resume < i_yes < i_mark
     # the late site no longer votes a second time
     late = src[i_clear:]
-    assert "_weg2_kv_group_verdict(bool(_weg2_kv_ok)" not in late
+    assert "_pdflip_kv_group_verdict(bool(_pdflip_kv_ok)" not in late
 
 
 def test_the_plan_and_the_mid_site_are_group_uniform():
@@ -97,13 +97,13 @@ def test_the_plan_and_the_mid_site_are_group_uniform():
     import inspect
 
     src = inspect.getsource(CLS)
-    assert 'self._weg2_kv_group_all(_fundable, "WAKE-KV-FIRST fundable")' in src
+    assert 'self._pdflip_kv_group_all(_fundable, "WAKE-KV-FIRST fundable")' in src
     assert "fundable=_fundable," in src
-    assert '_mid_ok = self._weg2_kv_group_all(bool(_mid_ok), "WAKE-KV-MID tag=%s" % (tag,))' in src
+    assert '_mid_ok = self._pdflip_kv_group_all(bool(_mid_ok), "WAKE-KV-MID tag=%s" % (tag,))' in src
 
 
 def test_group_all_is_an_and_over_the_votes(monkeypatch):
-    ALL = CLS._weg2_kv_group_all
+    ALL = CLS._pdflip_kv_group_all
     _wire(monkeypatch, [True, True, True])
     assert ALL(_rank(), True, "x") is True
     _wire(monkeypatch, [True, False, True])

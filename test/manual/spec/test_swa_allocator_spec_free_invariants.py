@@ -29,8 +29,8 @@ import random
 import pytest
 import torch
 
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from flliper.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from flliper.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 
 FULL_SIZE = 4096
 SWA_SIZE = 1024

@@ -1,10 +1,10 @@
 import unittest
 from typing import List
 
-from sglang.test.scripted_runtime.context import ScriptedContext
-from sglang.test.scripted_runtime.scheduler_hook import ScriptedBatchRecord
-from sglang.test.scripted_runtime.test_case import ScriptedTestCase
-from sglang.test.scripted_runtime_chunked_helpers import (
+from flliper.test.scripted_runtime.context import ScriptedContext
+from flliper.test.scripted_runtime.scheduler_hook import ScriptedBatchRecord
+from flliper.test.scripted_runtime.test_case import ScriptedTestCase
+from flliper.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     base_engine_kwargs,
     run_until,

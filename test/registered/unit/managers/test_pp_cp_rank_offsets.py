@@ -2,16 +2,16 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
-from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
+from flliper.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
+from flliper.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -82,7 +82,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
 
         receiver = _make_receiver(ps)
         with patch(
-            "sglang.srt.managers.scheduler_components.request_receiver."
+            "flliper.srt.managers.scheduler_components.request_receiver."
             "point_to_point_pyobj",
             side_effect=fake_point_to_point_pyobj,
         ):
@@ -107,11 +107,11 @@ class TestPPCPRankOffsets(unittest.TestCase):
 
         with (
             patch(
-                "sglang.srt.managers.scheduler_pp_mixin.point_to_point_pyobj",
+                "flliper.srt.managers.scheduler_pp_mixin.point_to_point_pyobj",
                 side_effect=fake_point_to_point_pyobj,
             ),
             patch(
-                "sglang.srt.managers.scheduler_pp_mixin.broadcast_pyobj",
+                "flliper.srt.managers.scheduler_pp_mixin.broadcast_pyobj",
                 side_effect=lambda data, *args, **kwargs: data,
             ),
         ):

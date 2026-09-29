@@ -1,12 +1,12 @@
 """PB (28.09.): the probe hold references its pages in ONE arena call.
 
-27B rc12z24 P (dkr27browauthoritybar1w109281556, bb84760576) PP0: weg2-0-13's
+27B rc12z24 P (dkr27browauthoritybar1w109281556, bb84760576) PP0: pdflip-0-13's
 store probe ended at 15:59:14 (``#1028B FETCH CAP ... claimed=45055``), its
 ``#257 PROBE-HOLD ... pages=45055 held=45055`` line came at 15:59:21, its read
-took 50 ms: ``WEG2-LOAD-DEVICE ... queue_ms=7809 read_ms=50``. The queue was
+took 50 ms: ``PDFLIP-LOAD-DEVICE ... queue_ms=7809 read_ms=50``. The queue was
 ``probe_hold.pin`` -- one ctypes ``ref_slots([slot], +1)`` per page, 45055 of
-them, on the prefetch thread. Same shape for weg2-0-6 (held=17031,
-queue_ms=5819) and weg2-0-5 (held=3022, 1255). Not the RO slots, not the
+them, on the prefetch thread. Same shape for pdflip-0-6 (held=17031,
+queue_ms=5819) and pdflip-0-5 (held=3022, 1255). Not the RO slots, not the
 wake workers, not the write-behind (its passes in that window: 49-73 ms).
 
 Pinned on the REAL C arena (temp file):
@@ -29,8 +29,8 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache import probe_hold  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache import probe_hold  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 

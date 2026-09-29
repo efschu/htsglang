@@ -39,12 +39,12 @@ import time
 from fractions import Fraction
 from pathlib import Path
 
-from sglang.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
-from sglang.srt.video_enhance.frame_math import Resolution
-from sglang.srt.video_enhance.mux import retimed_rate
-from sglang.srt.video_enhance.pipeline import PipelineExecutor
-from sglang.srt.video_enhance.preview import PreviewConfig, build_preview_lanes
-from sglang.srt.video_enhance.ring import OverloadPolicy
+from flliper.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
+from flliper.srt.video_enhance.frame_math import Resolution
+from flliper.srt.video_enhance.mux import retimed_rate
+from flliper.srt.video_enhance.pipeline import PipelineExecutor
+from flliper.srt.video_enhance.preview import PreviewConfig, build_preview_lanes
+from flliper.srt.video_enhance.ring import OverloadPolicy
 
 
 async def _as_async(decode):
@@ -55,10 +55,10 @@ async def _as_async(decode):
 
 def build_stages(chain, request: dict, source_url: str, device_id: int = 0):
     """The same chain the chunk worker builds, on ``cuda:0``."""
-    from sglang.srt.video_enhance import codec
-    from sglang.srt.video_enhance.resize import ResizeStage
-    from sglang.srt.video_enhance.rife import RifeStage, download_weights
-    from sglang.srt.video_enhance.sr import SuperResolutionStage
+    from flliper.srt.video_enhance import codec
+    from flliper.srt.video_enhance.resize import ResizeStage
+    from flliper.srt.video_enhance.rife import RifeStage, download_weights
+    from flliper.srt.video_enhance.sr import SuperResolutionStage
 
     source_res = Resolution.parse(request["source_resolution"])
     dtype = request.get("dtype", "fp16")
@@ -232,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.source:
         source = Path(args.source)
     else:
-        from sglang.srt.video_enhance.codec import make_test_clip
+        from flliper.srt.video_enhance.codec import make_test_clip
 
         source = workdir / "source.mp4"
         if not source.is_file():

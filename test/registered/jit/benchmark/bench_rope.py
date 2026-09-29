@@ -4,13 +4,13 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from flliper.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
     get_benchmark_range,
     run_benchmark,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -69,13 +69,13 @@ def flashinfer_rope(
     )
 
 
-def sglang_pos_enc_rope(
+def flliper_pos_enc_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.rope import rotary_embedding_with_key
+    from flliper.jit_kernel.rope import rotary_embedding_with_key
 
     head_size = q.shape[-1]
     rotary_embedding_with_key(
@@ -88,13 +88,13 @@ def sglang_pos_enc_rope(
     )
 
 
-def sglang_fused_rope(
+def flliper_fused_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.rope import apply_rope_inplace
+    from flliper.jit_kernel.rope import apply_rope_inplace
 
     apply_rope_inplace(q, k, COS_SIN_CACHE, positions, is_neox=is_neox)
 
@@ -114,8 +114,8 @@ def jit_rope_then_store(
     out_loc: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.kvcache import store_cache
-    from sglang.jit_kernel.rope import apply_rope_inplace
+    from flliper.jit_kernel.kvcache import store_cache
+    from flliper.jit_kernel.rope import apply_rope_inplace
 
     head_size = q.shape[-1]
     row_dim = k.shape[-2] * head_size
@@ -146,7 +146,7 @@ def jit_fused_rope_store(
     out_loc: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.rope import apply_rope_inplace_with_kvcache
+    from flliper.jit_kernel.rope import apply_rope_inplace_with_kvcache
 
     apply_rope_inplace_with_kvcache(
         q, k, v, k_cache, v_cache, COS_SIN_CACHE, positions, out_loc, is_neox=is_neox
@@ -223,8 +223,8 @@ def benchmark(batch_size: int, num_q_k_heads: str, is_neox: bool, provider: str)
 
     FN_MAP = {
         "flashinfer": flashinfer_rope,
-        "jit_pos_enc": sglang_pos_enc_rope,
-        "jit_fused_rope": sglang_fused_rope,
+        "jit_pos_enc": flliper_pos_enc_rope,
+        "jit_fused_rope": flliper_fused_rope,
     }
     fn = lambda: FN_MAP[provider](q, k, positions, is_neox)
     return run_benchmark(fn)

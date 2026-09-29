@@ -12,12 +12,12 @@ digest -- #1292's own W18 collision check cannot see this axis, since two
 boots of one form share one digest by construction) silently overwrites the
 first boot's dump the moment ``write_footprint_dump`` runs again.
 
-THE FIX, mirroring ``weg2.lane_coverage``'s own #1395 shape (extended, not
+THE FIX, mirroring ``pdflip.lane_coverage``'s own #1395 shape (extended, not
 rebuilt) one file over:
 
-1. ``activation_probe.boot_token()`` -- reads ``SGLANG_WEG2_BOOT_TOKEN``,
-   published UNCONDITIONALLY by ``weg2/launcher.py build_env``
-   (``weg2_boot_token(ns)``, memoised on the launcher's OWN namespace so
+1. ``activation_probe.boot_token()`` -- reads ``FLLIPER_PDFLIP_BOOT_TOKEN``,
+   published UNCONDITIONALLY by ``pdflip/launcher.py build_env``
+   (``pdflip_boot_token(ns)``, memoised on the launcher's OWN namespace so
    BOTH groups' ranks -- separate OS processes -- inherit the IDENTICAL
    value; see that function's docstring for why a per-process fallback
    alone breaks the #1292 "P and D share one directory" reading).
@@ -46,9 +46,9 @@ import importlib.util
 import json
 import os
 
-from sglang.srt.mem_ledger import activation_probe as ap
-from sglang.srt.mem_ledger.activation import ActivationProfile
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_ledger import activation_probe as ap
+from flliper.srt.mem_ledger.activation import ActivationProfile
+from flliper.test.test_utils import CustomTestCase
 
 _HERE = os.path.abspath(__file__)
 _ROOT = _HERE
@@ -169,7 +169,7 @@ class TwoBootsOfTheSameFormNeverCollideOnDisk(CustomTestCase):
             self.assertEqual(d1["boot_token"], "xsn31:1:100")
             self.assertEqual(d2["boot_token"], "xsn31:2:200")
 
-    def test_pflicht_mutant_the_old_flat_writer_would_have_destroyed_boot_1(self):
+    def test_required_mutant_the_old_flat_writer_would_have_destroyed_boot_1(self):
         """MUTANT: reproduce the PRE-#1395 write (flat, no subdirectory) by
         hand -- exactly what activation_probe.write_footprint_dump did
         before this fix. The second boot's write clobbers the first boot's
@@ -253,7 +253,7 @@ class TheReaderRefusesToSubstituteAForeignBoot(CustomTestCase):
                 "this as an absence, never hand back xsn31:7's dump",
             )
 
-    def test_pflicht_mutant_a_reader_that_globs_the_newest_subdir_is_the_danger(
+    def test_required_mutant_a_reader_that_globs_the_newest_subdir_is_the_danger(
         self,
     ):
         """MUTANT, reproduced by hand: a reader that, on a miss, falls back

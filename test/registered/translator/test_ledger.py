@@ -20,7 +20,7 @@ import unittest
 import torch
 from torch import nn
 
-from sglang.srt.translator.ledger import (
+from flliper.srt.translator.ledger import (
     OFFLOAD_CLASS,
     AudioAssetLedger,
     ParkError,
@@ -38,8 +38,8 @@ def tiny_module(in_features=64, out_features=128):
 
 class TestAssetClassIsDeclared(unittest.TestCase):
     def test_the_class_exists_in_the_runtime_register(self):
-        from sglang.srt.model_executor.offload_register import OFFLOAD_CLASSES
-        from sglang.srt.model_executor.short_term_offload_register import (
+        from flliper.srt.model_executor.offload_register import OFFLOAD_CLASSES
+        from flliper.srt.model_executor.short_term_offload_register import (
             ASSET_CLASSES,
             LadderRank,
         )
@@ -55,7 +55,7 @@ class TestAssetClassIsDeclared(unittest.TestCase):
         # The point of registering rather than tracking privately: the
         # translator's assets must be comparable against everything else on
         # the ONE ladder, not on a private victim list.
-        from sglang.srt.model_executor.short_term_offload_register import (
+        from flliper.srt.model_executor.short_term_offload_register import (
             ASSET_CLASSES,
             LadderRank,
         )

@@ -37,8 +37,8 @@ import inspect
 import textwrap
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -50,7 +50,7 @@ PARKED_TOP = 183_998
 def _runtime(pending=None, snapshot=None, live_split=None, live_raises=False):
     """A PhaseFlipRuntime carrying only what the tested methods read
     (the #717 stub idiom, as used by test_evict_rung_flip_park_744)."""
-    from sglang.srt.managers import phase_flip_runtime as m
+    from flliper.srt.managers import phase_flip_runtime as m
 
     rt = m.PhaseFlipRuntime.__new__(m.PhaseFlipRuntime)
     rt._pending = pending
@@ -73,7 +73,7 @@ def _runtime(pending=None, snapshot=None, live_split=None, live_raises=False):
 
 def _armable_runtime(live_split):
     """A stub complete enough to drive the REAL ``arm()`` end to end."""
-    from sglang.srt.managers import phase_flip_runtime as m
+    from flliper.srt.managers import phase_flip_runtime as m
 
     rt = _runtime(pending=None, snapshot=None, live_split=live_split)
     rt.blocking_guards = ()
@@ -91,7 +91,7 @@ class TestTheSnapshotIsMeasuredAtArm(CustomTestCase):
     ``arm()``, not through a paraphrase of it."""
 
     def test_arm_captures_the_extent_from_a_fresh_enumeration(self):
-        from sglang.srt.managers.phase_flip_runtime import PP_TO_TP
+        from flliper.srt.managers.phase_flip_runtime import PP_TO_TP
 
         rt = _armable_runtime(
             {"req_rows": PARKED_ROWS, "req_max": PARKED_TOP, "tree_rows": 0}
@@ -104,7 +104,7 @@ class TestTheSnapshotIsMeasuredAtArm(CustomTestCase):
         """Case 1 turns from "blocks" into "blocks exactly what it should":
         zero resident rows at arm is the EXACT answer (0, -1), never
         UNKNOWN."""
-        from sglang.srt.managers.phase_flip_runtime import PP_TO_TP
+        from flliper.srt.managers.phase_flip_runtime import PP_TO_TP
 
         rt = _armable_runtime({"req_rows": 0, "req_max": -1, "tree_rows": 5})
         ok, _msg = rt.arm(PP_TO_TP, source="test")
@@ -139,7 +139,7 @@ class TestTheSnapshotCannotOutliveItsFlip(CustomTestCase):
         )
 
     def test_accessor_answers_while_pending(self):
-        from sglang.srt.managers.phase_flip_runtime import PP_TO_TP
+        from flliper.srt.managers.phase_flip_runtime import PP_TO_TP
 
         rt = _runtime(pending=PP_TO_TP, snapshot=(PARKED_ROWS, PARKED_TOP))
         self.assertEqual(rt.parked_extent(), (PARKED_ROWS, PARKED_TOP))
@@ -149,7 +149,7 @@ class TestTheSnapshotCannotOutliveItsFlip(CustomTestCase):
         ``self._pending = None``) must also clear ``self._parked_extent`` --
         commit and all four abandon paths alike, parsed from the source so a
         future exit path cannot forget the clear without turning this red."""
-        from sglang.srt.managers import phase_flip_runtime as m
+        from flliper.srt.managers import phase_flip_runtime as m
 
         tree = ast.parse(
             textwrap.dedent(inspect.getsource(m.PhaseFlipRuntime))
@@ -202,7 +202,7 @@ class TestTheSnapshotCannotOutliveItsFlip(CustomTestCase):
         real rather than only parsed."""
         import logging
 
-        from sglang.srt.managers import phase_flip_runtime as m
+        from flliper.srt.managers import phase_flip_runtime as m
 
         # Silencing this module's abandon logging is local to this test, but
         # the logger is process-global: left at CRITICAL it also swallows the
@@ -249,13 +249,13 @@ class TestTheRungReadsTheSnapshot(CustomTestCase):
     must be GONE -- removed at writer and reader both, not half-retired."""
 
     def test_the_factory_reads_parked_extent(self):
-        from sglang.srt.managers import kv_backing_relief as m
+        from flliper.srt.managers import kv_backing_relief as m
 
         src = inspect.getsource(m.kv_backing_provider)
         self.assertIn("parked_extent", src)
 
     def test_the_sticky_channel_is_gone_from_the_reader(self):
-        from sglang.srt.managers import kv_backing_relief as m
+        from flliper.srt.managers import kv_backing_relief as m
 
         src = inspect.getsource(m.kv_backing_provider)
         self.assertNotIn(
@@ -266,7 +266,7 @@ class TestTheRungReadsTheSnapshot(CustomTestCase):
         )
 
     def test_the_sticky_channel_is_gone_from_the_writer(self):
-        from sglang.srt.managers import phase_flip_runtime as m
+        from flliper.srt.managers import phase_flip_runtime as m
 
         src = inspect.getsource(m.build_flip_live_slots_fn)
         self.assertNotIn(
@@ -281,7 +281,7 @@ class TestTheRungReadsTheSnapshot(CustomTestCase):
         EMPTY, the #744 axiom. A source-string pin cannot see this (the
         function would still mention ``parked_extent``), so the return
         tuples are parsed."""
-        from sglang.srt.managers import kv_backing_relief as m
+        from flliper.srt.managers import kv_backing_relief as m
 
         tree = ast.parse(textwrap.dedent(inspect.getsource(m.kv_backing_provider)))
         closure = next(
@@ -328,7 +328,7 @@ class TestTheRungReadsTheSnapshot(CustomTestCase):
         exact while armed with a snapshot, UNKNOWN while armed without one,
         inert outside a flip -- including with a STALE snapshot, which is the
         M5-analog at the reader."""
-        from sglang.srt.managers import phase_flip_runtime as pfr
+        from flliper.srt.managers import phase_flip_runtime as pfr
 
         class _Sched:
             phase_flip_runtime = None
@@ -372,7 +372,7 @@ class TestTheExclusionCeilingStands(CustomTestCase):
     which this test wires through a real runtime end to end."""
 
     def _rung(self, runtime):
-        from sglang.srt.managers import kv_backing_relief as m
+        from flliper.srt.managers import kv_backing_relief as m
 
         r = m.KvBackingRelief.__new__(m.KvBackingRelief)
 
@@ -392,13 +392,13 @@ class TestTheExclusionCeilingStands(CustomTestCase):
         return r
 
     def test_snapshot_feeds_the_ceiling(self):
-        from sglang.srt.managers import phase_flip_runtime as pfr
+        from flliper.srt.managers import phase_flip_runtime as pfr
 
         rt = _runtime(pending=pfr.PP_TO_TP, snapshot=(PARKED_ROWS, PARKED_TOP))
         self.assertEqual(self._rung(rt)._parked_ceiling(), PARKED_TOP)
 
     def test_unknown_snapshot_still_refuses_wholesale(self):
-        from sglang.srt.managers import phase_flip_runtime as pfr
+        from flliper.srt.managers import phase_flip_runtime as pfr
 
         rt = _runtime(pending=pfr.PP_TO_TP, snapshot=None)
         self.assertEqual(self._rung(rt)._parked_ceiling(), -2)

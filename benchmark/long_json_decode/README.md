@@ -1,12 +1,12 @@
 ## Run benchmark
 
-### Benchmark sglang
+### Benchmark flliper
 ```
-python3 -m sglang.launch_server --model-path codellama/CodeLlama-7b-instruct-hf --port 30000
+python3 -m flliper.launch_server --model-path codellama/CodeLlama-7b-instruct-hf --port 30000
 ```
 
 ```
-python3 bench_sglang.py --num-questions 5 --parallel 1
+python3 bench_flliper.py --num-questions 5 --parallel 1
 ```
 
 

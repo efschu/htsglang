@@ -1,8 +1,8 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.server_fixtures.default_fixture import DefaultServerBase
 
 # Per-commit: SymmetricMemory variant only.
 # - TestDeepseekV3FP4 (TRTLLM) archived to test/manual/quant/test_deepseek_v3_fp4_4gpu_trtllm.py

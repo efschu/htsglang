@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Arm K_bar1_graphs of the #349 boot matrix, run where it CAN run (#369).
 #
-# The sweep driver composes a plain `python -m sglang.launch_server` command
+# The sweep driver composes a plain `python -m flliper.launch_server` command
 # and runs it locally. Every other arm is fine with that; K is not. K crosses
 # the bar1 transport with CUDA graphs, and bar1 needs /dev/dmabuf_holder,
 # which CT999 has no device-cgroup entry for and cannot mknod (#361). So K
@@ -46,13 +46,13 @@ hssh 120 "setsid bash -c 'docker run --rm --name $NAME --network host \
  -v $SUB/spinning/llm_stuff/club-3090/models-cache/$MODEL_SUB:/model:ro \
  -e PYTHONPATH=/wt/python -e TORCH_EXTENSIONS_DIR=/extcache \
  -e TORCH_CUDA_ARCH_LIST=8.6\;12.0 \
- -e SGLANG_BARLINK_BAR1_NV_SOURCE=/nvsrc \
- -e SGLANG_UNEVEN_DCP=1 -e SGLANG_UNEVEN_DCP_WEIGHTED=1 \
- -e SGLANG_MAMBA_SSM_DTYPE=bfloat16 \
- -e SGLANG_BARLINK=1 -e SGLANG_BARLINK_TRANSPORT=bar1 \
- -e SGLANG_BARLINK_GRAPH_ENABLE=1 \
- -e SGLANG_BARLINK_BAR1_WINDOW_MIB=64 -e SGLANG_BARLINK_BAR1_WINDOW_MIB_DCP=32 \
- --entrypoint bash $IMG -c \"cd /wt && python3 -m sglang.launch_server \
+ -e FLLIPER_BARLINK_BAR1_NV_SOURCE=/nvsrc \
+ -e FLLIPER_UNEVEN_DCP=1 -e FLLIPER_UNEVEN_DCP_WEIGHTED=1 \
+ -e FLLIPER_MAMBA_SSM_DTYPE=bfloat16 \
+ -e FLLIPER_BARLINK=1 -e FLLIPER_BARLINK_TRANSPORT=bar1 \
+ -e FLLIPER_BARLINK_GRAPH_ENABLE=1 \
+ -e FLLIPER_BARLINK_BAR1_WINDOW_MIB=64 -e FLLIPER_BARLINK_BAR1_WINDOW_MIB_DCP=32 \
+ --entrypoint bash $IMG -c \"cd /wt && python3 -m flliper.launch_server \
    --model-path /model --host 127.0.0.1 --port $PORT \
    --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
    --rank-auto-reserve-mib 3000,2700,2700 \

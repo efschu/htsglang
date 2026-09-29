@@ -161,9 +161,9 @@ NOT_CROWDING_PROVABLE = {
 # NEEDS_DEVICE one. A module that calls `popen_launch_server` does not merely
 # want a card -- it starts a REAL server process out of process, loads a model
 # and talks HTTP to it. At the desk that is refused twice over: the hermetic
-# run has no card, and the `sglang` console script is not on the gate's PATH,
+# run has no card, and the `flliper` console script is not on the gate's PATH,
 # so the module dies in setUpClass with
-# `FileNotFoundError: No such file or directory: 'sglang'` before a single
+# `FileNotFoundError: No such file or directory: 'flliper'` before a single
 # assertion of its own runs.
 #
 # WHY IT MUST BE ITS OWN CLASS RATHER THAN FOLDED INTO NEEDS_DEVICE. The two
@@ -200,7 +200,7 @@ def needs_live_server(source: str) -> str | None:
 #
 # It inherits setUpClass from a sibling that launches a real server, so it
 # launches one too -- and the own-bytes probe would have ADMITTED it to a lane,
-# where it dies in setUpClass with the same `FileNotFoundError: 'sglang'` as the
+# where it dies in setUpClass with the same `FileNotFoundError: 'flliper'` as the
 # 7 it sits next to. A test-class inheritance edge crossing a module boundary is
 # invisible to the marker; the import that carries it is not.
 #

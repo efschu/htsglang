@@ -26,7 +26,7 @@ Usage:
         [--seconds-per-point 2.0] [--max-mib 1024] [--dry-run]
 
 Runtime: ~2 s x ~14 sizes x (6 directed pairs x 2 modes + arms) -- a few
-minutes. No sglang, no model, no server.
+minutes. No flliper, no model, no server.
 """
 
 import argparse

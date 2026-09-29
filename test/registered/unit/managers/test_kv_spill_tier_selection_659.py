@@ -19,7 +19,7 @@ declines cleanly -- never an unbudgeted pin.
 
 import unittest
 
-from sglang.srt.managers.kv_spill_tier_selection import (
+from flliper.srt.managers.kv_spill_tier_selection import (
     KV_SPILL_PAYLOAD,
     choose_kv_spill_tier,
     kv_spill_registry,
@@ -30,15 +30,15 @@ from sglang.srt.managers.kv_spill_tier_selection import (
     park_tier,
     refusal_report,
 )
-from sglang.srt.memtier.tiers import (
+from flliper.srt.memtier.tiers import (
     PayloadClass,
     TierCapacity,
     TierKind,
     Volatility,
 )
-from sglang.srt.planner.cost_model import Rate
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner.cost_model import Rate
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

@@ -3,12 +3,12 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.mmmu_vlm_kit import (
+from flliper.srt.utils import is_hip
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kits.mmmu_vlm_kit import (
     MMMUMultiModelTestBase,
 )
-from sglang.test.test_utils import is_in_amd_ci, is_in_ci
+from flliper.test.test_utils import is_in_amd_ci, is_in_ci
 
 # VLM (Vision Language Model) tests
 
@@ -50,7 +50,7 @@ class TestVLMModels(MMMUMultiModelTestBase):
                 # it there so greedy sampling falls back to torch.argmax.
                 custom_env = None
                 if is_in_amd_ci():
-                    custom_env = {"SGLANG_DISABLE_AITER_GREEDY_SAMPLE": "1"}
+                    custom_env = {"FLLIPER_DISABLE_AITER_GREEDY_SAMPLE": "1"}
                 self._run_vlm_mmmu_test(model, temp_dir, custom_env=custom_env)
 
 

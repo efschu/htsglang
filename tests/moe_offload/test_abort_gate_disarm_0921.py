@@ -22,10 +22,10 @@ hat ihn kein Test und kein Boot je betreten.
 
 import pytest
 
-from sglang.srt.distributed.device_communicators import barlink_abort_gate as gate
+from flliper.srt.distributed.device_communicators import barlink_abort_gate as gate
 
 
-class _KaputterTransport:
+class _BrokenTransport:
     """Sein Poll wirft -- genau der Fall, fuer den der Disarm gebaut ist."""
 
     def __init__(self):
@@ -38,9 +38,9 @@ class _KaputterTransport:
         self.disarmed_mit = grund
 
 
-def test_ein_gescheiterter_poll_disarmt_seinen_transport(monkeypatch):
+def test_failed_poll_disarms_its_transport(monkeypatch):
     """DER FALL, DER TP0 IN w30 TOETETE."""
-    t = _KaputterTransport()
+    t = _BrokenTransport()
     # `poll_status_words` steigt bei leerem `_transports` VOR der Schleife aus
     # und liest die Liste dann ueber `registered()`; beide muessen gesetzt sein,
     # sonst prueft der Test nichts (erster Lauf: rot aus dem falschen Grund).
@@ -53,12 +53,12 @@ def test_ein_gescheiterter_poll_disarmt_seinen_transport(monkeypatch):
     assert "poll" in t.disarmed_mit.lower()
 
 
-def test_ohne_disarm_methode_kein_absturz(monkeypatch):
+def test_without_disarm_method_no_crash(monkeypatch):
     """Ein Transport ohne die Methode ist zulaessig -- getattr(..., None)."""
-    class _Ohne:
+    class _Without:
         def poll_status_word(self):
             raise RuntimeError("kaputt")
-    o = _Ohne()
+    o = _Without()
     monkeypatch.setattr(gate, "_transports", [o])
     monkeypatch.setattr(gate, "registered", lambda: [o])
     monkeypatch.setattr(gate, "abort_check_enabled", lambda: True)
@@ -66,7 +66,7 @@ def test_ohne_disarm_methode_kein_absturz(monkeypatch):
     gate.poll_status_words()
 
 
-def test_gesunder_transport_wird_nicht_disarmt(monkeypatch):
+def test_healthy_transport_is_not_disarmed(monkeypatch):
     class _Heil:
         def __init__(self): self.disarmed_mit = None
         def poll_status_word(self): return 0
@@ -80,7 +80,7 @@ def test_gesunder_transport_wird_nicht_disarmt(monkeypatch):
     assert h.disarmed_mit is None
 
 
-class _ZaehlenderTransport:
+class _CountingTransport:
     """Zaehlt, ob er ueberhaupt gepollt wurde."""
 
     def __init__(self):
@@ -95,7 +95,7 @@ class _ZaehlenderTransport:
         self.disarmed_mit = grund
 
 
-def test_ein_gescheiterter_poll_beendet_die_ganze_runde(monkeypatch):
+def test_failed_poll_ends_the_whole_round(monkeypatch):
     """#100 (fnFL2w32/w33): der ZWEITE Poll riss den Prozess mit.
 
     Gemessen: der Poll scheiterte zweimal in derselben Runde -- einmal je
@@ -104,48 +104,48 @@ def test_ein_gescheiterter_poll_beendet_die_ganze_runde(monkeypatch):
     unbrauchbar zurueckliess; seine Signaturen stehen in keiner Gift-Liste,
     also lief die Schleife weiter auf einen beschaedigten Kontext.
     """
-    kaputt = _KaputterTransport()
-    danach = _ZaehlenderTransport()
-    monkeypatch.setattr(gate, "_transports", [kaputt, danach])
-    monkeypatch.setattr(gate, "registered", lambda: [kaputt, danach])
+    kaputt = _BrokenTransport()
+    after_state = _CountingTransport()
+    monkeypatch.setattr(gate, "_transports", [kaputt, after_state])
+    monkeypatch.setattr(gate, "registered", lambda: [kaputt, after_state])
     monkeypatch.setattr(gate, "abort_check_enabled", lambda: True)
     monkeypatch.setattr(gate, "polling_paused", lambda: False)
     gate.poll_status_words()
     assert kaputt.disarmed_mit is not None, "der Werfer wurde nicht stillgelegt"
-    assert danach.polls == 0, (
+    assert after_state.polls == 0, (
         "nach einem gescheiterten Poll wurde ein weiteres Geraet gelesen -- "
         "genau der zweite Zugriff, der TP0 in w32/w33 toetete"
     )
 
 
-def test_die_metall_signatur_gilt_nicht_als_gift_bricht_aber_ab(monkeypatch):
+def test_metal_signature_is_not_poison_but_aborts(monkeypatch):
     """Die Gegenprobe zur Marker-Liste: der Text taeuscht, das Verhalten nicht.
 
     `unknown parameter type` ist KEIN Gift-Marker (und soll keiner werden --
     die Liste haette die naechste Signatur wieder nicht). Der Abbruch darf
     deshalb nicht am Text haengen.
     """
-    class _Metall(_KaputterTransport):
+    class _Metall(_BrokenTransport):
         def poll_status_word(self):
             raise RuntimeError("unknown parameter type")
 
     kaputt = _Metall()
-    danach = _ZaehlenderTransport()
+    after_state = _CountingTransport()
     assert not gate.is_poison_error(RuntimeError("unknown parameter type")), (
         "wenn diese Signatur Gift WAERE, pruefte dieser Test den #100-Pfad nicht"
     )
-    monkeypatch.setattr(gate, "_transports", [kaputt, danach])
-    monkeypatch.setattr(gate, "registered", lambda: [kaputt, danach])
+    monkeypatch.setattr(gate, "_transports", [kaputt, after_state])
+    monkeypatch.setattr(gate, "registered", lambda: [kaputt, after_state])
     monkeypatch.setattr(gate, "abort_check_enabled", lambda: True)
     monkeypatch.setattr(gate, "polling_paused", lambda: False)
     gate.poll_status_words()
-    assert danach.polls == 0
+    assert after_state.polls == 0
 
 
-def test_ohne_fehler_werden_weiter_alle_transports_gepollt(monkeypatch):
+def test_without_error_all_transports_still_polled(monkeypatch):
     """Damit das `break` nicht den Normalfall abschneidet (sonst prueft #100 nichts)."""
-    a = _ZaehlenderTransport()
-    b = _ZaehlenderTransport()
+    a = _CountingTransport()
+    b = _CountingTransport()
     monkeypatch.setattr(gate, "_transports", [a, b])
     monkeypatch.setattr(gate, "registered", lambda: [a, b])
     monkeypatch.setattr(gate, "abort_check_enabled", lambda: True)

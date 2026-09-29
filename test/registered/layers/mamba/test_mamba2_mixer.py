@@ -6,16 +6,16 @@
 import pytest
 import torch
 
-from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+from flliper.srt.distributed.device_communicators.custom_all_reduce_utils import (
     update_environment_variables,
 )
-from sglang.srt.distributed.parallel_state import (
+from flliper.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_device, get_device_count
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.runtime_context import get_parallel
+from flliper.srt.utils import get_device, get_device_count
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=32, stage="base-b", runner_config="2-gpu-large")
 
@@ -107,7 +107,7 @@ def mixer2_gated_norm_tensor_parallel(
     hidden_states = torch.randn(batch_size, seq_len, hidden_size)
     gate_states = torch.randn(batch_size, seq_len, hidden_size)
 
-    import sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated as m2
+    import flliper.srt.layers.attention.mamba.mixer2_rms_norm_gated as m2
 
     # Force attn-TP rank through the context (the weight loader reads it via
     # get_parallel().attn_tp_rank); avoids calling initialize_dp_attention.

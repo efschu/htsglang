@@ -15,7 +15,7 @@
 """Fold measured NCCL communicator buffers into the ledger's cache.
 
     # 1. boot the target recipe with the instrumentation armed
-    SGLANG_NCCL_BUFFER_DUMP=/spinning/nccl_dumps <the usual launch>
+    FLLIPER_NCCL_BUFFER_DUMP=/spinning/nccl_dumps <the usual launch>
     # 2. once the ranks are up (the buffers are allocated at communicator
     #    init, so no traffic is needed), fold the dumps in
     python scripts/vram_ledger/probe_nccl.py ingest --dump-dir /spinning/nccl_dumps
@@ -42,7 +42,7 @@ REPO_PYTHON = os.path.join(
 if REPO_PYTHON not in sys.path:
     sys.path.insert(0, REPO_PYTHON)
 
-from sglang.srt.mem_ledger.nccl_probe import (  # noqa: E402
+from flliper.srt.mem_ledger.nccl_probe import (  # noqa: E402
     ingest_dumps,
     load_nccl_buffers,
     nccl_cache_path,
@@ -82,7 +82,7 @@ def cmd_show(args) -> int:
             print(f"  {uuid}  {mib:8.1f} MiB")
         return 0
 
-    from sglang.srt.rigmon.card_probe import CACHE_DIR
+    from flliper.srt.rigmon.card_probe import CACHE_DIR
 
     pattern = os.path.join(args.cache_dir or CACHE_DIR, "nccl_buffers-*.json")
     found = sorted(glob.glob(pattern))

@@ -7,7 +7,7 @@ are ``qweight``/``qzeros``/``scales``/``g_idx`` quadruples -- and the 15 under
 the AWQ and FP8 siblings of the same base model, wrote no
 ``modules_to_not_convert`` entry saying so.
 
-sglang then built the NEXTN drafter from the target's ``gptq`` method: a Marlin
+flliper then built the NEXTN drafter from the target's ``gptq`` method: a Marlin
 skeleton whose parameters are ``qweight``/``qzeros``/``scales``/``g_idx``, fed
 seven plain ``mtp.*.weight`` names per rank. Every one of them missed, each
 behind a deduplicated ``logger.warning_once`` on the CHECKPOINT-name side, and
@@ -37,13 +37,13 @@ import unittest
 
 import torch
 
-from sglang.srt.configs.model_config import (
+from flliper.srt.configs.model_config import (
     ModelConfig,
     _draft_checkpoint_is_dense,
     _quant_cfg_excludes_draft_namespace,
 )
-from sglang.srt.model_loader.weight_utils import raise_on_unloaded_draft_parameters
-from sglang.srt.utils.common import (
+from flliper.srt.model_loader.weight_utils import raise_on_unloaded_draft_parameters
+from flliper.srt.utils.common import (
     checkpoint_namespace_is_dense,
     checkpoint_weight_names,
 )
@@ -346,7 +346,7 @@ class TestTheDraftQuantizationDecision(unittest.TestCase):
 
 
 def _server_args(**kwargs):
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     sa = ServerArgs.__new__(ServerArgs)
     sa.tokenizer_path = "t"
@@ -373,7 +373,7 @@ class TestTheUnquantFlagIsRealNow(unittest.TestCase):
     """
 
     def _resolve(self, **kwargs):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         sa = _server_args(**kwargs)
         ServerArgs._handle_missing_default_values(sa)
@@ -481,7 +481,7 @@ class TestSkippedDraftParametersAreLoud(unittest.TestCase):
         rate near zero. The unchecked state stays permitted; it is now logged
         once per class.
         """
-        from sglang.srt.model_loader import weight_utils
+        from flliper.srt.model_loader import weight_utils
 
         weight_utils._DRAFT_LOAD_UNCHECKED_SEEN.clear()
         model = _Drafter(quantized=True)
@@ -508,7 +508,7 @@ class TestSkippedDraftParametersAreLoud(unittest.TestCase):
         mismatch is precisely the failure mode -- got no check at all."""
         import inspect
 
-        from sglang.srt.model_loader.loader import GGUFModelLoader
+        from flliper.srt.model_loader.loader import GGUFModelLoader
 
         import ast
         import textwrap
@@ -542,7 +542,7 @@ class TestSkippedDraftParametersAreLoud(unittest.TestCase):
         import ast
         import inspect
 
-        from sglang.srt.models import qwen3_next_mtp
+        from flliper.srt.models import qwen3_next_mtp
 
         tree = ast.parse(inspect.getsource(qwen3_next_mtp))
         handlers = [
@@ -576,17 +576,17 @@ class TestSkippedDraftParametersAreLoud(unittest.TestCase):
             )
 
     def test_the_escape_hatch_downgrades_the_error(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         model = _Drafter(quantized=True)
-        with envs.SGLANG_ALLOW_UNLOADED_DRAFT_PARAMS.override(True):
+        with envs.FLLIPER_ALLOW_UNLOADED_DRAFT_PARAMS.override(True):
             raise_on_unloaded_draft_parameters(model, {"norm"})
 
     def test_the_loader_only_checks_draft_models(self):
         """The target keeps loading exactly as before, reported or not."""
         import inspect
 
-        from sglang.srt.model_loader.loader import DefaultModelLoader
+        from flliper.srt.model_loader.loader import DefaultModelLoader
 
         source = inspect.getsource(DefaultModelLoader.load_weights_and_postprocess)
         self.assertIn("is_draft_model", source)
@@ -670,7 +670,7 @@ class TestTheRealNameMappingAgainstBothSkeletons(unittest.TestCase):
 
     @staticmethod
     def _replay(quantized: bool):
-        from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+        from flliper.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 
         drafter = _StubDrafter(quantized=quantized)
         loaded = Qwen3_5ForCausalLMMTP.load_weights(drafter, _mtp_weight_stream())

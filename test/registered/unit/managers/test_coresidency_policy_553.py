@@ -28,8 +28,8 @@ THE ASYMMETRY IS THE DESIGN:
 
 import unittest
 
-from sglang.srt.managers.coresidency_policy import cold_event, hot_event
-from sglang.srt.managers.coresidency_registry import (
+from flliper.srt.managers.coresidency_policy import cold_event, hot_event
+from flliper.srt.managers.coresidency_registry import (
     ORIGIN_ASSET,
     ORIGIN_DIAL,
     ReclaimSource,
@@ -97,7 +97,7 @@ class TestColdRefusesRatherThanPartiallyDrawing(unittest.TestCase):
         self.assertEqual(calls, [], "a refused event still actuated")
 
     def test_the_refusal_says_unavailable_bytes_do_not_count(self):
-        from sglang.srt.managers.coresidency_registry import Unavailable
+        from flliper.srt.managers.coresidency_registry import Unavailable
 
         result = cold_event(
             9000,
@@ -229,7 +229,7 @@ class TestNoNewActuator(unittest.TestCase):
     def test_the_module_introduces_no_actuator_of_its_own(self):
         import inspect
 
-        from sglang.srt.managers import coresidency_policy as m
+        from flliper.srt.managers import coresidency_policy as m
 
         src = inspect.getsource(m)
         for forbidden in ("torch.cuda", "cuMem", "set_active_prefix", "runtime_set_"):

@@ -16,7 +16,7 @@ reachable without hardware -- and here the interesting state, "never probed",
 is the one every new rig starts in.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -24,13 +24,13 @@ import dataclasses
 import types
 import unittest
 
-from sglang.srt.turnkey.config import PreflightSpec
-from sglang.srt.turnkey.preflight import (
+from flliper.srt.turnkey.config import PreflightSpec
+from flliper.srt.turnkey.preflight import (
     CalibrationObs,
     check_vram_calibration,
     default_probes,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _cfg(require: bool):
@@ -81,7 +81,7 @@ class TestTheCheckWhenRequired(CustomTestCase):
 
     def test_the_remedy_is_the_command_that_fixes_it(self):
         r = check_vram_calibration(_cfg(True), _probes(cached=False))
-        self.assertIn("sglang.srt.mem_ledger.probe", r.remedy)
+        self.assertIn("flliper.srt.mem_ledger.probe", r.remedy)
 
     def test_the_remedy_also_names_the_way_out(self):
         """An operator who cannot probe right now needs the escape hatch in
@@ -97,7 +97,7 @@ class TestItChecksAndNeverRepairs(CustomTestCase):
     def test_the_real_probe_only_loads_never_measures(self):
         import inspect
 
-        from sglang.srt.turnkey import preflight
+        from flliper.srt.turnkey import preflight
 
         src = inspect.getsource(preflight._real_vram_calibration)
         self.assertIn("load_calibration", src)

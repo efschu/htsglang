@@ -29,7 +29,7 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -121,11 +121,11 @@ def _worker(rank, port, cases, q_out):
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group("gloo", rank=rank, world_size=WORLD)
     try:
-        from sglang.srt import rank_role
-        from sglang.srt.distributed.utils import set_cp_token_ratios
-        from sglang.srt.layers.attention.qsa import form_a_dcp as fa
-        from sglang.srt.layers.dcp import comm as c
-        from sglang.srt.layers.dcp.owner import (
+        from flliper.srt import rank_role
+        from flliper.srt.distributed.utils import set_cp_token_ratios
+        from flliper.srt.layers.attention.qsa import form_a_dcp as fa
+        from flliper.srt.layers.dcp import comm as c
+        from flliper.srt.layers.dcp.owner import (
             dcp_compact_pool_rows,
             dcp_weighted_owner_bounds,
             dcp_weighted_read_slots,
@@ -267,7 +267,7 @@ def test_every_rank_issues_the_same_collectives(run, i):
 
 
 def test_the_backend_routes_through_the_form_a_step():
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as be
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as be
 
     src = inspect.getsource(be)
     assert "self._init_form_a_dcp(model_config, dcp_size, dcp_rank)" in src
@@ -286,13 +286,13 @@ def test_the_backend_takes_form_a_dcp_instead_of_refusing_it(rank):
     from types import SimpleNamespace
     from unittest import mock
 
-    from sglang.srt import rank_role
-    from sglang.srt.distributed.utils import (
+    from flliper.srt import rank_role
+    from flliper.srt.distributed.utils import (
         get_tp_partition_ratios,
         set_cp_token_ratios,
         set_tp_partition_ratios,
     )
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as be
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as be
 
     saved_tp = get_tp_partition_ratios()
     set_tp_partition_ratios([1, 0, 0], allow_zero=True)
@@ -308,7 +308,7 @@ def test_the_backend_takes_form_a_dcp_instead_of_refusing_it(rank):
         )
         par = SimpleNamespace(attn_dcp_size=3, attn_dcp_rank=rank, attn_tp_size=3)
         obj = object.__new__(be.QwenSparseAttnBackend)
-        with mock.patch("sglang.srt.runtime_context.get_parallel", return_value=par):
+        with mock.patch("flliper.srt.runtime_context.get_parallel", return_value=par):
             obj._init_dcp(SimpleNamespace(is_draft_worker=False, dtype=torch.bfloat16), cfg)
         assert obj.form_a_dcp is not None and obj.dcp_size == 3
         assert obj.uneven_dcp_weighted is True
@@ -324,7 +324,7 @@ def test_the_backend_takes_form_a_dcp_instead_of_refusing_it(rank):
 
 
 def test_the_geometry_is_host_only_heads():
-    from sglang.srt.layers.attention.qsa.form_a_dcp import FormADcpGeometry
+    from flliper.srt.layers.attention.qsa.form_a_dcp import FormADcpGeometry
 
     g = FormADcpGeometry(world=3, host_rank=0, rank=2, q_heads=24, kv_heads=2)
     assert g.q_counts == [24, 0, 0] and g.kv_counts == [2, 0, 0]
@@ -332,15 +332,15 @@ def test_the_geometry_is_host_only_heads():
 
 
 def test_without_a_role_plan_there_is_no_form_a_geometry():
-    from sglang.srt import rank_role
-    from sglang.srt.layers.attention.qsa.form_a_dcp import form_a_dcp_geometry
+    from flliper.srt import rank_role
+    from flliper.srt.layers.attention.qsa.form_a_dcp import form_a_dcp_geometry
 
     rank_role.set_form_a_role_plan(None, 0)
     assert form_a_dcp_geometry(24, 2, 3, 0) is None
 
 
 def test_the_seam_f5_is_wired():
-    from sglang.srt import rank_role
+    from flliper.srt import rank_role
 
     assert rank_role.SEAMS["F5"].wired is True
     assert "F5" not in rank_role.UNWIRED_ORDER

@@ -7,7 +7,7 @@ every page and moves nothing."""
 import inspect
 import types
 
-from sglang.srt.mem_cache import hicache_storage as hs
+from flliper.srt.mem_cache import hicache_storage as hs
 
 
 def test_null_backend_claims_everything_and_moves_nothing():
@@ -29,7 +29,7 @@ def test_null_backend_claims_everything_and_moves_nothing():
 
 
 def test_the_controller_routes_a_worker_to_the_null_tier():
-    from sglang.srt.managers import cache_controller as cc
+    from flliper.srt.managers import cache_controller as cc
 
     src = inspect.getsource(cc.HiCacheController.attach_storage_backend)
     assert "if this_rank_is_form_a_worker():" in src

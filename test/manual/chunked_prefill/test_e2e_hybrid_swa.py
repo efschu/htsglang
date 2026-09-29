@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.test.chunked_prefill_test_utils import (
+from flliper.test.chunked_prefill_test_utils import (
     LONG_PROMPT_NUM_SHOTS,
     ChunkedTestBase,
 )

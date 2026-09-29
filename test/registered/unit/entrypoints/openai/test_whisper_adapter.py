@@ -11,15 +11,15 @@ import re
 import unittest
 from typing import Any
 
-from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
-from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
+from flliper.srt.entrypoints.openai.protocol import TranscriptionRequest
+from flliper.srt.entrypoints.openai.transcription_adapters.whisper import (
     WHISPER_AUTODETECT_REGEX,
     WHISPER_AUTODETECT_TS_REGEX,
     WHISPER_LANG_TOKEN_CODES,
     WhisperAdapter,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -178,7 +178,7 @@ class TestWhisperLangTokenCoverage(CustomTestCase):
         # ``language=`` on a follow-up request. Before the fix,
         # ``normalize_language_to_code("yue")`` raised ValueError even
         # though verbose_json could report ``"yue"`` from the same server.
-        from sglang.srt.multimodal.processors.whisper import (
+        from flliper.srt.multimodal.processors.whisper import (
             normalize_language_to_code,
         )
 
@@ -194,7 +194,7 @@ class TestWhisperLangTokenCoverage(CustomTestCase):
         # and "returns unk_token_id" tokenizer behaviors.
         from unittest.mock import Mock
 
-        from sglang.srt.multimodal.processors.whisper import WhisperProcessor
+        from flliper.srt.multimodal.processors.whisper import WhisperProcessor
 
         proc = WhisperProcessor.__new__(WhisperProcessor)
         # Tokenizer where <|yue|> is not in the vocab → returns unk_id.
@@ -304,7 +304,7 @@ class TestWhisperBuildFusedAutodetectParams(CustomTestCase):
         # SamplingParams(**kwargs) → TypeError on any language=None +
         # timestamp_granularities request. Mirrors what the processor does
         # before constructing SamplingParams.
-        from sglang.srt.sampling.sampling_params import SamplingParams
+        from flliper.srt.sampling.sampling_params import SamplingParams
 
         req = self._request(timestamp_granularities=["segment"])
         params = WhisperAdapter().build_fused_autodetect_params(req)

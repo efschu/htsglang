@@ -9,7 +9,7 @@ import re
 import pytest
 import torch
 
-from sglang.srt.mem_cache import qsa_kv_pool as m
+from flliper.srt.mem_cache import qsa_kv_pool as m
 
 
 def test_pool_takes_the_global_slot_space_and_refuses_a_smaller_one():
@@ -21,7 +21,7 @@ def test_pool_takes_the_global_slot_space_and_refuses_a_smaller_one():
 
 
 def test_mixin_hands_the_pool_max_total_num_tokens():
-    from sglang.srt.model_executor import model_runner_kv_cache_mixin as mixin
+    from flliper.srt.model_executor import model_runner_kv_cache_mixin as mixin
 
     src = inspect.getsource(mixin)
     i = src.index("QSATokenToKVPool")

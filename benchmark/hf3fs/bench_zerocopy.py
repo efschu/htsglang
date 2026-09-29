@@ -4,19 +4,19 @@ import time
 import torch
 from tqdm import tqdm
 
-from sglang.srt.distributed import (
+from flliper.srt.distributed import (
     get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.managers.cache_controller import (
+from flliper.srt.managers.cache_controller import (
     HiCacheController,
     PrefetchOperation,
     StorageOperation,
 )
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
+from flliper.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 init_distributed_environment(
     world_size=1,

@@ -16,8 +16,8 @@ import types
 import pytest
 import torch
 
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
-from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+from flliper.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+from flliper.srt.speculative.multi_layer_eagle_worker_v2 import (
     MultiLayerEagleDraftWorker,
 )
 

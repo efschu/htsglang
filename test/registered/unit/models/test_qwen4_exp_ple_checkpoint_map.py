@@ -15,7 +15,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from sglang.srt.models.qwen4_exp_ple_table import (
+from flliper.srt.models.qwen4_exp_ple_table import (
     CheckpointMappedPleTable,
     map_ple_table_from_checkpoint,
 )
@@ -121,7 +121,7 @@ def test_checkpoint_prefetcher_warms_exactly_the_rows_pages(tmp_path):
     (file, page) pairs their bytes occupy -- across the shard and file
     boundaries the checkpoint layout has -- and touches them on a pool;
     decode-sized gathers are skipped."""
-    from sglang.srt.models.qwen4_exp_ple_table import PleCheckpointPrefetcher
+    from flliper.srt.models.qwen4_exp_ple_table import PleCheckpointPrefetcher
 
     _write_checkpoint(tmp_path)
     table = map_ple_table_from_checkpoint(

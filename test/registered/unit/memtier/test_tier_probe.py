@@ -26,7 +26,7 @@ Hermetic: records and stub probes only.
 
 import unittest
 
-from sglang.srt.memtier.probe import (
+from flliper.srt.memtier.probe import (
     PROBES,
     ProbeOutcome,
     ProbeTarget,
@@ -39,8 +39,8 @@ from sglang.srt.memtier.probe import (
     require_measured,
     run_probe,
 )
-from sglang.srt.memtier.profile import bundled_profile
-from sglang.srt.memtier.tiers import (
+from flliper.srt.memtier.profile import bundled_profile
+from flliper.srt.memtier.tiers import (
     TierCapacity,
     TierCaps,
     TierDescriptor,
@@ -49,8 +49,8 @@ from sglang.srt.memtier.tiers import (
     TierTransport,
     Volatility,
 )
-from sglang.srt.planner.cost_model import Rate
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.planner.cost_model import Rate
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

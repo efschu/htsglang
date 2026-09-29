@@ -16,7 +16,7 @@ and the card gets the whole shared amount back.
 import os, sys, time
 import torch, torch.nn as nn
 
-from sglang.srt.weg2.union_arena_bind import bind_image, own_image
+from flliper.srt.pdflip.union_arena_bind import bind_image, own_image
 
 MODE, DEV, DIR = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 CARD = str(torch.cuda.get_device_properties(DEV).uuid)

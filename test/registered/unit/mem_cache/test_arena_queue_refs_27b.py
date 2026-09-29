@@ -12,7 +12,7 @@ every arena id was dropped as a #718 stray and its reference was never returned
 referenced slot is never evicted: a long boot pins the arena until claims are
 refused.
 
-SGLANG_HICACHE_ARENA_QUEUE_REFS=1 (default off): the group hands arena ids back
+FLLIPER_HICACHE_ARENA_QUEUE_REFS=1 (default off): the group hands arena ids back
 (one reference per row, duplicates collapse, pending writes skipped), through a
 per-process RefLedger that refuses any release beyond this process's own
 references. Real objects throughout: the C arena on a temp file, a bound
@@ -36,16 +36,16 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import numpy as np
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache import unified_radix_cache as u
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import HybridCacheController
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
-from sglang.srt.mem_cache.storage.file import hicache_arena as ha
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache import unified_radix_cache as u
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import HybridCacheController
+from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+from flliper.srt.mem_cache.storage.file import hicache_arena as ha
+from flliper.test.test_utils import CustomTestCase
 
-ENV = "SGLANG_HICACHE_ARENA_QUEUE_REFS"  # literal: the parent tree has no constant
+ENV = "FLLIPER_HICACHE_ARENA_QUEUE_REFS"  # literal: the parent tree has no constant
 PAGE = 64  # 1 layer x 1 head x 16 dims x bf16, K and V
 S = 16     # staging rows
 
@@ -81,8 +81,8 @@ def _hdr(arena):
     """(state, refcount) arrays read from the slot headers."""
     out = (np.ctypeslib.ctypes.c_int64 * 6)()
     arena._lib.arena_layout(arena.slots, arena.slot_bytes, out)
-    hb, hoff = int(out[0]), int(out[3])
-    u32 = np.frombuffer(arena._mm, dtype=np.uint32, count=arena.slots * hb // 4, offset=hoff)
+    hb, hope = int(out[0]), int(out[3])
+    u32 = np.frombuffer(arena._mm, dtype=np.uint32, count=arena.slots * hb // 4, offset=hope)
     h = u32.reshape(arena.slots, hb // 4)
     return h[:, 0].copy(), h[:, 1].copy()
 
@@ -215,7 +215,7 @@ class TheQueueReturnsItsReferences(_ArenaCase):
         self.on()
         a = _Rank(self.path, self.SLOTS)
         hi = a.pool.alloc_read(6)  # never resolved (a revoke's span)
-        with mock.patch("sglang.srt.mem_cache.memory_pool_host.logger") as lg:
+        with mock.patch("flliper.srt.mem_cache.memory_pool_host.logger") as lg:
             a.group.free(hi)
         self.assertFalse(any("HICACHE-INDEX REFUSED" in str(c) for c in lg.error.call_args_list))
         self.assertEqual(a.group._queue_refs["placeholders"], 6)
@@ -354,7 +354,7 @@ def _scenario_pending_write(case):
 
 def _scenario_two_prefetches_one_drain(case):
     """#989b (rc11b, NF under agent load): two prefetches of ONE prefix each
-    take their own reader reference per page (weg2-16-31 and weg2-16-38 on
+    take their own reader reference per page (pdflip-16-31 and pdflip-16-38 on
     P PP0: unclaimed heads 2560 and 10752 tokens over the same arena pages);
     both heads reach the queue before ONE drain. Returns the reference counts
     left on the slots and whether the drain logged a #989 conflict."""

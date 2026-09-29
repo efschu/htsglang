@@ -18,15 +18,15 @@ flip as fully fenced while nothing was persisted -- the #606 defaulted-
 measurement shape, in the one place where believing it means losing KV.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import types
 import unittest
 
-from sglang.srt.managers.phase_flip_runtime import _writeback_fence_ms
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.phase_flip_runtime import _writeback_fence_ms
+from flliper.test.test_utils import CustomTestCase
 
 
 def _report(elapsed_s):

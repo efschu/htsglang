@@ -156,7 +156,7 @@ def print_missing_standalone_estimates_summary(
     print("\n" + "=" * 60)
     print(
         "Add standalone estimate(s) to "
-        "python/sglang/multimodal_gen/test/run_suite.py"
+        "python/flliper/multimodal_gen/test/run_suite.py"
     )
     print("=" * 60)
     print("The following standalone file(s) used fallback estimate 300.0s.")

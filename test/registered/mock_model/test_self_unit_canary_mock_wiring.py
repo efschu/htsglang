@@ -5,16 +5,16 @@ import unittest
 
 import torch
 
-from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
-from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
-from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
-from sglang.srt.model_executor.forward_batch_info import (
+from flliper.srt.kv_canary.expected_inputs import ExpectedInputs
+from flliper.srt.kv_canary.token_oracle.oracle import HashOracle
+from flliper.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
+from flliper.srt.model_executor.forward_batch_info import (
     ForwardMode,
     _stable_hash_str_to_i64,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.mock_model.utils import mock_model_server_args, mock_model_server_env
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.mock_model.utils import mock_model_server_args, mock_model_server_env
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=60, suite="extra-a-test-1-gpu-small-amd")
@@ -224,15 +224,15 @@ class TestMockModelServerLaunchHelpers(CustomTestCase):
         """Verify mock model launch env enables canary input checking by default."""
         env = mock_model_server_env()
 
-        self.assertEqual(env["SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT"], "1")
-        self.assertEqual(env["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"], "1")
+        self.assertEqual(env["FLLIPER_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT"], "1")
+        self.assertEqual(env["FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE"], "1")
 
     def test_mock_model_server_env_can_disable_input_check(self) -> None:
         """Verify mock model launch env can disable canary input checking."""
         env = mock_model_server_env(input_check_enabled=False)
 
-        self.assertEqual(env["SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT"], "0")
-        self.assertEqual(env["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"], "1")
+        self.assertEqual(env["FLLIPER_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT"], "0")
+        self.assertEqual(env["FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE"], "1")
 
 
 if __name__ == "__main__":

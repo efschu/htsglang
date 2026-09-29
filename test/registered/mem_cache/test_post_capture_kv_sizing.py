@@ -1,4 +1,4 @@
-"""E2E guard for SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.
+"""E2E guard for FLLIPER_ENABLE_POST_CAPTURE_KV_SIZING.
 
 Post-capture KV sizing reserves the KV pool as CUDA VMM virtual memory, captures
 CUDA graphs, then sizes and physically backs the pool from measured free memory.
@@ -15,10 +15,10 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -45,7 +45,7 @@ class TestPostCaptureKVSizing(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env={**os.environ, "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING": "1"},
+            env={**os.environ, "FLLIPER_ENABLE_POST_CAPTURE_KV_SIZING": "1"},
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
 

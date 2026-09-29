@@ -17,8 +17,8 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.mem_ledger import corridor_trace
-from sglang.srt.mem_ledger.corridor_trace import MIB, CorridorTrace, Sample
+from flliper.srt.mem_ledger import corridor_trace
+from flliper.srt.mem_ledger.corridor_trace import MIB, CorridorTrace, Sample
 
 
 def _sample(free_mib, backed_mib=0, t=0.0):

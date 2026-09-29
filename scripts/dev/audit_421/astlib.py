@@ -1,7 +1,7 @@
 """Shared AST index for the #421 sub-job A detectors (Detector B / Detector C).
 
 Pure static analysis: parses a *tree export* (see /tmp/a421/tree_*), never
-imports sglang, never touches a GPU.
+imports flliper, never touches a GPU.
 """
 
 import ast

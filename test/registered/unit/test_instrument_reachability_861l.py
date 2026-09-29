@@ -59,14 +59,14 @@ import re
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-_PKG = _REPO_ROOT / "python" / "sglang"
+_PKG = _REPO_ROOT / "python" / "flliper"
 
 #: What counts as an INSTRUMENT: a function whose name declares that it judges
 #: something rather than computes something. Deliberately name-based -- the
@@ -84,7 +84,7 @@ def _is_test_path(path: pathlib.Path) -> bool:
     return (
         rel.startswith("test/")
         or "/test/" in padded
-        # ``/tests/`` too: python/sglang/jit_kernel/tests/ is test support that
+        # ``/tests/`` too: python/flliper/jit_kernel/tests/ is test support that
         # the #421 helper's ``/test/`` check walks straight past. Excluded by
         # PATH rather than by an allowlist entry, because it is not a dark
         # instrument -- it is not production source at all, and allowlisting
@@ -162,25 +162,25 @@ def _sweep(root: pathlib.Path, repo_root: pathlib.Path = None):
 #: precisely the failure this file exists to catch.
 _DECLARED_DARK = {
     # ---- EXEMPT: matches the name pattern, is not an instrument -------------
-    "python/sglang/srt/layers/quantization/utils.py::assert_fp8_all_close": (
+    "python/flliper/srt/layers/quantization/utils.py::assert_fp8_all_close": (
         "EXEMPT. Upstream numerical debug helper for comparing two fp8 "
         "tensors by hand. It judges no production path and is not part of "
         "this fork's instrument surface."
     ),
-    "python/sglang/srt/model_loader/gguf_deepseek4.py::audit_name_map": (
+    "python/flliper/srt/model_loader/gguf_deepseek4.py::audit_name_map": (
         "EXEMPT BY DESIGN, and it says so: 'Exposed for the offline audit "
         "(test/registered/unit/model_loader/test_gguf_deepseek4_name_map.py): "
         "a machine with the file but without the kernels can still check that "
         "the mapping covers it.' A test-facing entry point is reached by the "
         "test that is its declared caller."
     ),
-    "python/sglang/srt/model_loader/gguf_dflash.py::audit_dflash_name_map": (
+    "python/flliper/srt/model_loader/gguf_dflash.py::audit_dflash_name_map": (
         "EXEMPT. Offline comparison tool, run by hand against a GGUF file "
         "during a port ('the round-7c lesson' in its docstring). Not on any "
         "serving path and not claimed to be."
     ),
     # ---- DARK: the class, filed with an owner ------------------------------
-    "python/sglang/srt/managers/progress_liveness.py::thrash_verdict": (
+    "python/flliper/srt/managers/progress_liveness.py::thrash_verdict": (
         "DARK -- #861e, owner: the strict-batch strand (#857/#861). The "
         "purest instance in the tree: before this gate existed it had exactly "
         "ONE reference repo-wide, its own def line, and no test either. Its "
@@ -190,7 +190,7 @@ _DECLARED_DARK = {
         "W37-G shape and the #857 acceptance discriminator (COMPLETIONS > 0), "
         "so the detector for the failure the strand is chasing has never run. "
         "Its whole module is dark with it: NOTHING in production imports "
-        "sglang.srt.managers.progress_liveness, so #699's assess(), "
+        "flliper.srt.managers.progress_liveness, so #699's assess(), "
         "sample_from_scheduler() and build_liveness_is_active() are dark too "
         "-- and that module exists because '/health answers is the process "
         "up, not is work moving' and 'the existing watchdog is blind to "
@@ -201,7 +201,7 @@ _DECLARED_DARK = {
         "the in-process one inert; that reconciliation is owed with the "
         "wiring."
     ),
-    "python/sglang/srt/managers/corridor_guard.py::phase_corridor_verdict": (
+    "python/flliper/srt/managers/corridor_guard.py::phase_corridor_verdict": (
         "DARK -- #784, owner: the VRAM-corridor strand. Seven test call sites "
         "in test_corridor_arming_credit_784.py and zero production callers. "
         "corridor_guard's CONSTANTS are imported widely (corridor_trace, "
@@ -210,38 +210,38 @@ _DECLARED_DARK = {
         "boot acceptance that #784 built after a boot was graded in the "
         "layout that sizes nothing -- is computed by no machine."
     ),
-    "python/sglang/srt/disaggregation/draft_kv_canonical.py::assert_compatible": (
+    "python/flliper/srt/disaggregation/draft_kv_canonical.py::assert_compatible": (
         "DARK -- owner: disaggregation. Raises DraftKvLayoutMismatch unless a "
         "peer means the same bytes ('Loud and specific'). Nothing calls it, "
         "so the draft-KV layout version is never actually refused."
     ),
-    "python/sglang/srt/disaggregation/nccl/contract.py::assert_compatible": (
+    "python/flliper/srt/disaggregation/nccl/contract.py::assert_compatible": (
         "DARK -- owner: disaggregation. Sibling of the above on the KV "
         "transport identity: raises IncompatiblePeer, and no handshake asks "
         "it to."
     ),
-    "python/sglang/srt/distributed/device_communicators/barlink_uniformity.py"
+    "python/flliper/srt/distributed/device_communicators/barlink_uniformity.py"
     "::assert_sequences_uniform": (
         "DARK -- owner: barlink. Raises CollectiveSequenceDivergence on the "
         "first mismatch between ranks' collective sequences. Divergence is "
         "the failure mode barlink is most exposed to, and the raiser is "
         "unreached; first_divergence() below it is the half that gets used."
     ),
-    "python/sglang/srt/parser/template_detection.py::detect_reasoning_parser": (
+    "python/flliper/srt/parser/template_detection.py::detect_reasoning_parser": (
         "DARK -- owner: parser. Auto-detection of the reasoning parser from "
         "the chat template is implemented and never consulted, so the "
         "auto path resolves by other means or not at all."
     ),
-    "python/sglang/srt/parser/template_detection.py::detect_tool_call_parser": (
+    "python/flliper/srt/parser/template_detection.py::detect_tool_call_parser": (
         "DARK -- owner: parser. Sibling of the above for the tool-call "
         "parser, same shape, same absence."
     ),
-    "python/sglang/srt/planner/lse_merge_gate.py::assert_deterministic": (
+    "python/flliper/srt/planner/lse_merge_gate.py::assert_deterministic": (
         "DARK -- owner: planner. Announces itself as 'GATE 1' and demands "
         "bit-identical results across runs to catch an order-dependent "
         "reduction. Gate 1 is not installed at any gate."
     ),
-    "python/sglang/srt/planner/replayssm_identity.py::gate_verdict": (
+    "python/flliper/srt/planner/replayssm_identity.py::gate_verdict": (
         "DARK -- owner: planner. 'Decide the enable, with a printable reason "
         "for every refusal' -- and nothing production-side asks for the "
         "decision."

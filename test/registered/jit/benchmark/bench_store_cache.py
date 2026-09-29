@@ -1,13 +1,13 @@
 import torch
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import (
+from flliper.jit_kernel.benchmark import marker
+from flliper.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
     create_empty,
     create_random,
 )
-from sglang.jit_kernel.kvcache import store_cache
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.jit_kernel.kvcache import store_cache
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=9, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

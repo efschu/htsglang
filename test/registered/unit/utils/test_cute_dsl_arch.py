@@ -7,7 +7,7 @@ one 5090 (sm120) and two 3080s (sm86). Boot dies in
       -> flashinfer.norm.rmsnorm_cute -> cutlass tvm_ffi
       -> RuntimeError: CUDA Error: cudaErrorNoKernelImageForDevice
 
-Root cause, in nvidia-cutlass-dsl, not in sglang:
+Root cause, in nvidia-cutlass-dsl, not in flliper:
 
     base_dsl/env_manager.py :: detect_gpu_arch()
       -> base_dsl/runtime/cuda.py :: get_compute_capability_major_minor(
@@ -17,7 +17,7 @@ Root cause, in nvidia-cutlass-dsl, not in sglang:
 and ``envar.arch`` is BOTH the codegen target (``compile_and_cache`` ->
 ``preprocess_pipeline``) AND part of the JIT cache key (``get_module_hash``
 hashes every ``envar`` attribute, and that hash names the on-disk entry).
-sglang TP ranks are separate processes, but only ``--rank-gpu-id`` gives each
+flliper TP ranks are separate processes, but only ``--rank-gpu-id`` gives each
 one a single visible GPU; without it, driver device 0 is the same card in
 every rank, so every rank compiles -- and files its cache entry -- under one
 architecture. That is why the 27B boots (they all pass ``--rank-gpu-id``) and
@@ -49,9 +49,9 @@ import types
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.utils.cute_dsl_arch import align_cute_dsl_arch, cute_dsl_arch_for_device
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils.cute_dsl_arch import align_cute_dsl_arch, cute_dsl_arch_for_device
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

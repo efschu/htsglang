@@ -21,10 +21,10 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -60,19 +60,19 @@ class TestDeepSeekR1HiCacheMI35x(CustomTestCase):
         cls.l3_storage_dir = tempfile.mkdtemp(prefix="dsr1-hicache-l3-")
 
         # cascade_dsr1_lite.sh on ROCm DSR1-0528 requires:
-        #   SGLANG_USE_AITER=1                  -> aiter prefill/decode path
+        #   FLLIPER_USE_AITER=1                  -> aiter prefill/decode path
         #   ROCM_QUICK_REDUCE_QUANTIZATION=NONE -> keep allreduce fp16/bf16
-        #   SGLANG_AITER_FP8_PREFILL_ATTN=0     -> disable PR #18528 FP8,
+        #   FLLIPER_AITER_FP8_PREFILL_ATTN=0     -> disable PR #18528 FP8,
         #                                          prefill kernel flash_attn_varlen_func
         #                                          which is incompatible with
         #                                          DSR1-0528 + page_size=64
         env = {
             **os.environ,
-            "SGLANG_USE_AITER": "1",
+            "FLLIPER_USE_AITER": "1",
             "ROCM_QUICK_REDUCE_QUANTIZATION": "NONE",
-            "SGLANG_AITER_FP8_PREFILL_ATTN": "0",
+            "FLLIPER_AITER_FP8_PREFILL_ATTN": "0",
             "SAFETENSORS_FAST_GPU": "1",
-            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.l3_storage_dir,
+            "FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.l3_storage_dir,
         }
 
         other_args = [
@@ -98,7 +98,7 @@ class TestDeepSeekR1HiCacheMI35x(CustomTestCase):
             "--enable-metrics",
             "--enable-cache-report",
             # HiCache hierarchy: L1 (GPU radix) + L2 (host pinned) + L3 (file).
-            # hicache-ratio=2 gives L2 = 2 * L1 (SGLang requires L1 <= L2).
+            # hicache-ratio=2 gives L2 = 2 * L1 (fLLiper requires L1 <= L2).
             "--enable-hierarchical-cache",
             "--hicache-ratio",
             "2",

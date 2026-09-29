@@ -3,13 +3,13 @@ import sys
 
 import pytest
 
-from sglang.srt.debug_utils.comparator.log_sink import LogSink
-from sglang.srt.debug_utils.comparator.output_types import (
+from flliper.srt.debug_utils.comparator.log_sink import LogSink
+from flliper.srt.debug_utils.comparator.output_types import (
     ErrorLog,
     InfoLog,
 )
-from sglang.srt.debug_utils.comparator.report_sink import report_sink
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.report_sink import report_sink
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")

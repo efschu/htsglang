@@ -3,12 +3,12 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
-from sglang.srt.tokenizer.tiktoken_tokenizer import (
+from flliper.srt.tokenizer.tiktoken_tokenizer import (
     CONTROL_TOKEN_TEXTS,
     DEFAULT_CONTROL_TOKENS,
     DEFAULT_SPECIAL_TOKENS,
@@ -51,7 +51,7 @@ class TestConstants(CustomTestCase):
 class TestTiktokenProcessor(CustomTestCase):
     def setUp(self):
         tokenizer_patcher = patch(
-            "sglang.srt.tokenizer.tiktoken_tokenizer.TiktokenTokenizer"
+            "flliper.srt.tokenizer.tiktoken_tokenizer.TiktokenTokenizer"
         )
         tokenizer_patcher.start()
         self.addCleanup(tokenizer_patcher.stop)

@@ -13,7 +13,7 @@ set -u
 
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 PY="${GATE_PY:-/spinning/htsglang-gpu/.venv/bin/python3}"
-FC="$WT/python/sglang/srt/mem_cache/unified_cache_components/full_component.py"
+FC="$WT/python/flliper/srt/mem_cache/unified_cache_components/full_component.py"
 T941="$WT/test/registered/unit/mem_cache/test_evict_frees_the_bound_allocator_941.py"
 
 cp "$FC" /tmp/941_fc.orig

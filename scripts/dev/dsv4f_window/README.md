@@ -59,7 +59,7 @@ and stop where the window ends.
 | 1 | **#478 quant swap** (`boot_478_quant.sh`) | nothing | Two boots, both must be in the SAME window at the SAME power state or the comparison is void. Highest information per boot. |
 | 2 | **#470 DSpark** (`boot_470_dspark.sh`) | Boot A before Boot B, enforced | Carries a **correctness** question (ANALYSE_447 §2.4) that outranks every perf number in the window. |
 | 3 | **#462 F2** (`boot_462_f2.sh`) | eager control → F2 → §5 A/B, enforced | Gates default-on for the breakable route and every performance claim about it. |
-| 4 | **#390/#394 expert stats** | — | **No boot of its own.** `SGLANG_EXPERT_STATS=1` is armed in EVERY arm's env by `export_base_env` because it is free; arm 4 is harvested from the other three boots. Each boot copies its dump to `*.preteardown` *before* teardown — the SIGTERM revision left on disk is not the headline artifact. |
+| 4 | **#390/#394 expert stats** | — | **No boot of its own.** `FLLIPER_EXPERT_STATS=1` is armed in EVERY arm's env by `export_base_env` because it is free; arm 4 is harvested from the other three boots. Each boot copies its dump to `*.preteardown` *before* teardown — the SIGTERM revision left on disk is not the headline artifact. |
 
 Standing rules that apply to every arm:
 
@@ -88,7 +88,7 @@ Standing rules that apply to every arm:
 | `lib.sh` | shared helpers: `preflight`, `power_tag`, `resolve_cards`, `wait_ready`, `stop_server`, `rammon_start/stop`, `arb_claim`/`arb_heartbeat_stop`, the index-space assertions |
 | `dsv4f_chat_template.jinja` | the model's chat template, **extracted from the GGUF metadata**, not written by hand |
 | `extract_chat_template.py` | extracts / verifies / self-tests that template |
-| `logging_break_debug.json` | `SGLANG_LOGGING_CONFIG_PATH` config: DEBUG on exactly one module, for the #462 independent break count |
+| `logging_break_debug.json` | `FLLIPER_LOGGING_CONFIG_PATH` config: DEBUG on exactly one module, for the #462 independent break count |
 | `boot_478_quant.sh` | arm 1 |
 | `boot_470_dspark.sh` | arm 2 (two-boot gate, ordering enforced) |
 | `boot_462_f2.sh` | arm 3 (§-order enforced) |
@@ -102,7 +102,7 @@ The briefing said the GGUF checkpoints carry no chat template and told me to
 *produce* one. Half right:
 
 * **TRUE**: neither quant dir's `tokenizer_config.json` has a `chat_template`
-  key (and both have empty `added_tokens_decoder`), so the tokenizer sglang
+  key (and both have empty `added_tokens_decoder`), so the tokenizer flliper
   loads carries none and `--chat-template` really is required.
 * **FALSE**: the GGUF files themselves **do** carry
   `tokenizer.chat_template` — 13698 bytes of Unsloth-fixed DeepSeek-V4 jinja,
@@ -223,7 +223,7 @@ python3 /spinning/wt-dsv4f-window/scripts/dev/494_break_cost/summarise.py \
 ```
 
 **Contradiction, resolved in favour of the code.** Both the briefing
-(`SGLANG_BREAK_COST_PATH="$RUN/break_cost"`) and TICKET_462 §3
+(`FLLIPER_BREAK_COST_PATH="$RUN/break_cost"`) and TICKET_462 §3
 (`"$RUN/break_cost.jsonl"  # becomes one file per rank`) assume the path is
 expanded per rank. **It is not.** `break_cost_clock.py:513` reads
 
@@ -234,7 +234,7 @@ path = os.environ.get(ENV_PATH) or f"/tmp/break_cost.{rank_tag}.jsonl"
 and uses a user-supplied value **verbatim** — no rank tag is interpolated. Set
 it and all three TP ranks append to one file, and the ticket's own glob
 `"$RUN"/break_cost.rank*.jsonl` matches nothing. So `boot_462_f2.sh` leaves
-`SGLANG_BREAK_COST_PATH` **unset**, takes the documented per-rank default in
+`FLLIPER_BREAK_COST_PATH` **unset**, takes the documented per-rank default in
 `/tmp`, clears stale files before the boot, and copies the results into `$RUN`
 afterwards.
 

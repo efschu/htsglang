@@ -64,9 +64,9 @@ import re
 import types
 import unittest
 
-from sglang.srt.mem_cache import hicache_flip_writeback
-from sglang.srt.mem_cache.hicache_flip_writeback import flip_writeback
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache import hicache_flip_writeback
+from flliper.srt.mem_cache.hicache_flip_writeback import flip_writeback
+from flliper.test.test_utils import CustomTestCase
 
 # The fence's drain is looked up under this name. It is spelled out here rather
 # than imported so that renaming the probe without renaming the implementations
@@ -82,9 +82,9 @@ def _bindable_cache_classes():
     """
     out = []
     for mod_name, cls_name in (
-        ("sglang.srt.mem_cache.unified_radix_cache", "UnifiedRadixCache"),
-        ("sglang.srt.mem_cache.hiradix_cache", "HiRadixCache"),
-        ("sglang.srt.mem_cache.hi_mamba_radix_cache", "HiMambaRadixCache"),
+        ("flliper.srt.mem_cache.unified_radix_cache", "UnifiedRadixCache"),
+        ("flliper.srt.mem_cache.hiradix_cache", "HiRadixCache"),
+        ("flliper.srt.mem_cache.hi_mamba_radix_cache", "HiMambaRadixCache"),
     ):
         try:
             mod = __import__(mod_name, fromlist=[cls_name])
@@ -127,7 +127,7 @@ def _provides(cls, name: str) -> bool:
 
 
 def _unified_radix_cache_cls():
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     return UnifiedRadixCache
 
@@ -275,7 +275,7 @@ class TestFlipWritebackDrainConformance(CustomTestCase):
         ``_local``, so the fence returned ``(0, before)`` without draining and
         every fence of every boot reported ``acked=0``.
         """
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         self.assertTrue(
             _provides(UnifiedRadixCache, LOCAL_DRAIN),

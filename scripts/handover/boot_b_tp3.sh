@@ -20,15 +20,15 @@ mkdir -p "$STORE"
 
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$WT/python"
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
-export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$STORE"
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR="$STORE"
 # --rank-gpu-id addresses the full device view; never set CUDA_VISIBLE_DEVICES.
 unset CUDA_VISIBLE_DEVICES
 
 cd "$WT"
-setsid "$VENV/bin/python" -m sglang.launch_server \
+setsid "$VENV/bin/python" -m flliper.launch_server \
   --model-path "$GGUF" \
   --tokenizer-path "$GGUF_DIR" \
   --load-format gguf --quantization gguf \

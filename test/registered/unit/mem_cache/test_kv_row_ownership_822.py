@@ -50,13 +50,13 @@ the specimen is caught BY that law and not incidentally by another one.
 
 import unittest
 
-from sglang.srt.mem_cache.kv_row_ownership import (
+from flliper.srt.mem_cache.kv_row_ownership import (
     Law,
     RowOwnershipAuthority,
     RowSpace,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -135,7 +135,7 @@ class TestExposureLaw(CustomTestCase):
         (#345/#352/#355: "one consumer never got the treatment"). Pin the reuse
         so a later refactor cannot quietly fork the definition.
         """
-        from sglang.srt.managers.kv_backing_relief import exposure_over_backing
+        from flliper.srt.managers.kv_backing_relief import exposure_over_backing
 
         for _, exposed, committed, unbacked in SPECIMEN_816:
             self.assertEqual(exposure_over_backing(exposed, committed), unbacked)
@@ -549,7 +549,7 @@ class TestTheFourthOwner(CustomTestCase):
     COMMITTED = SIZE + 1
 
     def _audit(self, resident_rows):
-        from sglang.srt.mem_cache.kv_row_ownership import (
+        from flliper.srt.mem_cache.kv_row_ownership import (
             RowOwnershipAuthority,
             audit_pool_census,
         )
@@ -617,7 +617,7 @@ class TestTheFourthOwner(CustomTestCase):
         auth, _ = self._audit({"requests": range(1, self.RESIDENT + 1)})
         self.assertIn("resident:requests", auth.owners())
 
-        from sglang.srt.mem_cache.kv_row_ownership import audit_pool_census
+        from flliper.srt.mem_cache.kv_row_ownership import audit_pool_census
 
         audit_pool_census(
             auth,
@@ -638,7 +638,7 @@ class TestTheFourthOwner(CustomTestCase):
         the same silent corruption as the free_list/radix_cache pair. Adding
         the fourth owner has to make that MORE visible, not less.
         """
-        from sglang.srt.mem_cache.kv_row_ownership import (
+        from flliper.srt.mem_cache.kv_row_ownership import (
             RowOwnershipAuthority,
             audit_pool_census,
         )
@@ -827,7 +827,7 @@ class TestCallSiteAdapters(CustomTestCase):
 
     def test_authority_is_attached_once(self):
         """One authority per rank. A privately constructed one is not authority."""
-        from sglang.srt.mem_cache.kv_row_ownership import AUTHORITY_ATTR, authority_for
+        from flliper.srt.mem_cache.kv_row_ownership import AUTHORITY_ATTR, authority_for
 
         class Host:
             pass
@@ -847,10 +847,10 @@ class TestCallSiteAdapters(CustomTestCase):
         2026-08-11 (kv_backing_relief.py:1180) and it would report the exact
         #816 state as sound.
         """
-        from sglang.srt.mem_cache.kv_row_ownership import audit_pool_census
+        from flliper.srt.mem_cache.kv_row_ownership import audit_pool_census
 
         auth = RowOwnershipAuthority(RowSpace(exposed=466994, committed=0))
-        with self.assertLogs("sglang.srt.mem_cache.kv_row_ownership", "WARNING") as log:
+        with self.assertLogs("flliper.srt.mem_cache.kv_row_ownership", "WARNING") as log:
             found = audit_pool_census(
                 auth,
                 exposed=466994,
@@ -866,7 +866,7 @@ class TestCallSiteAdapters(CustomTestCase):
 
     def test_census_shaped_input_reproduces_the_816_verdict(self):
         """Census sets in, named law out -- the PP1 numbers end to end."""
-        from sglang.srt.mem_cache.kv_row_ownership import audit_pool_census
+        from flliper.srt.mem_cache.kv_row_ownership import audit_pool_census
 
         auth = RowOwnershipAuthority(RowSpace(exposed=0, committed=0))
         found = audit_pool_census(
@@ -888,7 +888,7 @@ class TestCallSiteAdapters(CustomTestCase):
         the flip it is watching would just be an eighth crash root, so both are
         exercised here against a runtime whose scheduler is missing entirely.
         """
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         class Bare:
             """Only the attributes the two helpers touch."""
@@ -913,9 +913,9 @@ class TestCallSiteAdapters(CustomTestCase):
         scheduler shaped like the real one and asserts the audit actually
         reached the authority and the cutover actually retired the space.
         """
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
-        from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
-        from sglang.srt.mem_cache.kv_row_ownership import AUTHORITY_ATTR
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+        from flliper.srt.mem_cache.kv_row_ownership import AUTHORITY_ATTR
 
         class Relief:
             def _current_rows(self):
@@ -973,7 +973,7 @@ class TestCallSiteAdapters(CustomTestCase):
         """
         import torch
 
-        from sglang.srt.managers.phase_flip_runtime import _resident_rows
+        from flliper.srt.managers.phase_flip_runtime import _resident_rows
 
         # req_to_token[i, :n] -> the rows request i holds.
         table = torch.zeros((4, 8), dtype=torch.int64)
@@ -1007,7 +1007,7 @@ class TestCallSiteAdapters(CustomTestCase):
         every census on a scheduler without a pool report the whole working set
         as unowned, which is the #814 reading restored.
         """
-        from sglang.srt.managers.phase_flip_runtime import _resident_rows
+        from flliper.srt.managers.phase_flip_runtime import _resident_rows
 
         self.assertIsNone(_resident_rows(type("Sched", (), {})()))
 
@@ -1032,7 +1032,7 @@ class TestCallSiteAdapters(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         src = inspect.getsource(PhaseFlipRuntime._execute)
         retire = src.index('"_retire_row_id_space"')
@@ -1058,7 +1058,7 @@ class TestCallSiteAdapters(CustomTestCase):
         """
         import types
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         class Alloc:
             size = 64
@@ -1084,7 +1084,7 @@ class TestCallSiteAdapters(CustomTestCase):
         )
 
         with self.assertLogs(
-            "sglang.srt.managers.phase_flip_runtime", "WARNING"
+            "flliper.srt.managers.phase_flip_runtime", "WARNING"
         ) as log:
             PhaseFlipRuntime._pool_census(bare, "at-arm", "pp_to_tp")
         text = "".join(log.output)
@@ -1216,7 +1216,7 @@ class TestClampFiringRateIsAMetric(CustomTestCase):
 
     def test_parser_reads_a_firing(self):
         """Always runs, log or no log: the parser itself must be exercised."""
-        from sglang.srt.mem_cache.kv_row_ownership import parse_clamp_firings
+        from flliper.srt.mem_cache.kv_row_ownership import parse_clamp_firings
 
         line = (
             "[2026-08-23 06:14:21 PP1] KV-BACKING exposure clamp (after "
@@ -1237,7 +1237,7 @@ class TestClampFiringRateIsAMetric(CustomTestCase):
         directions -- it finds the firing above, and it finds nothing in lines
         that merely mention the same subsystem.
         """
-        from sglang.srt.mem_cache.kv_row_ownership import parse_clamp_firings
+        from flliper.srt.mem_cache.kv_row_ownership import parse_clamp_firings
 
         noise = [
             "[2026-08-23 06:14:21 PP1] KV-BACKING proposal rows current=407051",
@@ -1256,7 +1256,7 @@ class TestClampFiringRateIsAMetric(CustomTestCase):
         """
         import os
 
-        from sglang.srt.mem_cache.kv_row_ownership import (
+        from flliper.srt.mem_cache.kv_row_ownership import (
             CLAMP_BASELINE_0823,
             CLAMP_BASELINE_ROWS_0823,
             clamp_firing_census,
@@ -1289,7 +1289,7 @@ class TestClampFiringRateIsAMetric(CustomTestCase):
         twelve, one of them would be wrong and there would be no way to tell
         which -- which is the state this whole task exists to leave.
         """
-        from sglang.srt.mem_cache.kv_row_ownership import CLAMP_BASELINE_ROWS_0823
+        from flliper.srt.mem_cache.kv_row_ownership import CLAMP_BASELINE_ROWS_0823
 
         for rank, (exposed, committed, unbacked) in CLAMP_BASELINE_ROWS_0823.items():
             with self.subTest(rank=rank):

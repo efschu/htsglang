@@ -33,20 +33,20 @@ because under the prohibition a sub-N prompt would otherwise never run at
 all. This mode adds no threshold -- it re-enables the one already there.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers.phase_purity import (
+from flliper.srt.managers.phase_purity import (
     MODE_OFF,
     MODE_PREFILL_IN_TP,
     MODE_STRICT,
     PhasePurity,
     parse_purity,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestTheDefault(CustomTestCase):

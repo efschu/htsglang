@@ -4,17 +4,17 @@ import flashinfer
 import pytest
 import torch
 
-from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
-from sglang.multimodal_gen.runtime.layers.quantization import (
+from flliper.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
+from flliper.multimodal_gen.runtime.layers.quantization import (
     modelopt_quant as diffusion_modelopt_quant,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+from flliper.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.layers.quantization.modelopt_quant import pad_nvfp4_weight
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.multimodal_gen.runtime.platforms import current_platform
+from flliper.srt.layers.quantization.modelopt_quant import pad_nvfp4_weight
+from flliper.test.ci.ci_register import register_cuda_ci
 
 # B200-only correctness coverage for diffusion NVFP4 scaled mm.
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -119,10 +119,10 @@ def _set_diffusion_fp4_backend(
 ) -> None:
     if backend is None:
         monkeypatch.delenv(
-            "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND", raising=False
+            "FLLIPER_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND", raising=False
         )
     else:
-        monkeypatch.setenv("SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND", backend)
+        monkeypatch.setenv("FLLIPER_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND", backend)
 
     current_platform.__class__.get_modelopt_flashinfer_fp4_backend.cache_clear()
     current_platform.__class__.get_modelopt_fp4_gemm_op.cache_clear()

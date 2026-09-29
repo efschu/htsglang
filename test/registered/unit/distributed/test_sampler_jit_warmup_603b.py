@@ -30,11 +30,11 @@ import types
 
 import pytest
 
-from sglang.srt.layers.sampler_warmup import (
+from flliper.srt.layers.sampler_warmup import (
     sampling_backend_needs_jit_warmup,
     warm_sampling_backend_kernels,
 )
-from sglang.srt.utils import jit_cold_build
+from flliper.srt.utils import jit_cold_build
 
 
 class _RecordingGroup:
@@ -167,7 +167,7 @@ def test_scheduler_boot_actually_calls_the_warmup():
     """
     import inspect
 
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     src = inspect.getsource(Scheduler.init_model_worker)
     assert "warm_sampling_backend()" in src, (
@@ -196,7 +196,7 @@ def test_warmup_does_not_read_attributes_init_has_not_set_yet(stub_flashinfer):
     """
     import types
 
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     log = []
     stub_flashinfer(log)

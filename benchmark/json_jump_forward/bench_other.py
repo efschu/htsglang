@@ -7,8 +7,8 @@ from functools import partial
 import guidance
 from tqdm import tqdm
 
-from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
-from sglang.utils import dump_state_text, read_jsonl
+from flliper.test.test_utils import add_common_other_args_and_parse, get_call_generate
+from flliper.utils import dump_state_text, read_jsonl
 
 # there are some FSM bugs with json regex converted from pydantic model
 # here use a string regex instead

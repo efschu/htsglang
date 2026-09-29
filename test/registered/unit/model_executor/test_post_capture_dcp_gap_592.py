@@ -34,8 +34,8 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.layers.dcp.owner import dcp_compact_pool_rows
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.dcp.owner import dcp_compact_pool_rows
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -44,7 +44,7 @@ def _planned_args(**over):
     """A ServerArgs-shaped stub on which every OTHER condition of
     ``post_capture_kv_sizing_planned`` is satisfied, so a False answer can only
     come from the condition under test."""
-    from sglang.srt.server_args import Backend
+    from flliper.srt.server_args import Backend
 
     base = dict(
         device="cuda",
@@ -64,9 +64,9 @@ def _planned_args(**over):
 
 
 def _planned(args) -> bool:
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
-    with mock.patch.dict("os.environ", {"SGLANG_ENABLE_POST_CAPTURE_KV_SIZING": "1"}):
+    with mock.patch.dict("os.environ", {"FLLIPER_ENABLE_POST_CAPTURE_KV_SIZING": "1"}):
         return ServerArgs.post_capture_kv_sizing_planned(args)
 
 
@@ -80,10 +80,10 @@ class TestTheGateIsWhereTheDocumentationSaysItIs(unittest.TestCase):
         self.assertTrue(_planned(_planned_args(dcp_size=1)))
 
     def test_the_env_switch_still_dominates(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         with mock.patch.dict(
-            "os.environ", {"SGLANG_ENABLE_POST_CAPTURE_KV_SIZING": "0"}
+            "os.environ", {"FLLIPER_ENABLE_POST_CAPTURE_KV_SIZING": "0"}
         ):
             self.assertFalse(
                 ServerArgs.post_capture_kv_sizing_planned(_planned_args(dcp_size=1))
@@ -92,7 +92,7 @@ class TestTheGateIsWhereTheDocumentationSaysItIs(unittest.TestCase):
     def test_the_gate_carries_its_reason(self):
         """#592 exists because this condition had no comment for a year. The
         reason is now next to it and must stay there."""
-        from sglang.srt import server_args as sa
+        from flliper.srt import server_args as sa
 
         src = inspect.getsource(sa.ServerArgs.post_capture_kv_sizing_planned)
         self.assertIn("#592", src)
@@ -122,7 +122,7 @@ class TestTheMissingTranslation(unittest.TestCase):
     def test_finalize_backing_passes_the_global_context_untranslated(self):
         """Behavioural, not just textual: the real method is invoked against a
         recording stub, so the pin survives a refactor of the source text."""
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         seen = []
         stub = types.SimpleNamespace(
@@ -135,8 +135,8 @@ class TestTheMissingTranslation(unittest.TestCase):
     def test_construction_translates_where_the_resize_does_not(self):
         """The asymmetry itself. Five construction sites go through the
         translation; the resize path has none -- that is the whole gap."""
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-        from sglang.srt.model_executor import model_runner_kv_cache_mixin as mx
+        from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from flliper.srt.model_executor import model_runner_kv_cache_mixin as mx
 
         mixin_src = inspect.getsource(mx)
         self.assertGreaterEqual(
@@ -157,7 +157,7 @@ class TestTheMissingTranslation(unittest.TestCase):
         )
 
     def test_the_resize_primitive_names_the_assumption(self):
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         src = inspect.getsource(MHATokenToKVPool.finalize_backing)
         self.assertIn("#592", src)
@@ -179,7 +179,7 @@ class TestTheLemmasALiftMayBuildOn(unittest.TestCase):
         """`cap_tokens=self.max_total_num_tokens` is what bounds it; together
         with monotonicity above, a translated resize can never ask for more
         rows than the boot reserved."""
-        from sglang.srt.model_executor import model_runner_kv_cache_mixin as mx
+        from flliper.srt.model_executor import model_runner_kv_cache_mixin as mx
 
         src = inspect.getsource(mx.ModelRunnerKVCacheMixin.post_capture_resize_kv_pool)
         self.assertIn("cap_tokens=self.max_total_num_tokens", src)
@@ -187,7 +187,7 @@ class TestTheLemmasALiftMayBuildOn(unittest.TestCase):
     def test_the_weighted_owner_rule_does_not_depend_on_the_context(self):
         """So a C change post-capture cannot invalidate the owner mapping --
         only the row COUNT follows C, not who owns which slot."""
-        from sglang.srt.layers.dcp.owner import dcp_weighted_owner_bounds
+        from flliper.srt.layers.dcp.owner import dcp_weighted_owner_bounds
 
         params = list(inspect.signature(dcp_weighted_owner_bounds).parameters)
         self.assertEqual(params, ["dcp_size", "dcp_rank"])
@@ -196,7 +196,7 @@ class TestTheLemmasALiftMayBuildOn(unittest.TestCase):
         """The resize measures a rank-local budget but does NOT decide C
         rank-locally: it routes through the min-reduce in
         _apply_token_constraints."""
-        from sglang.srt.model_executor import model_runner_kv_cache_mixin as mx
+        from flliper.srt.model_executor import model_runner_kv_cache_mixin as mx
 
         resize = inspect.getsource(
             mx.ModelRunnerKVCacheMixin.post_capture_resize_kv_pool
@@ -213,7 +213,7 @@ class TestTheLemmasALiftMayBuildOn(unittest.TestCase):
     def test_backing_changes_are_graph_safe_by_address_stability(self):
         """Not by the size being frozen -- which is the property that makes a
         lift conceivable at all."""
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         src = inspect.getsource(MHATokenToKVPool.runtime_set_backing_tokens)
         self.assertIn("Addresses never move", src)

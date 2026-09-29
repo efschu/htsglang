@@ -1,8 +1,8 @@
 """#257 (b): a short read keeps only what a recurrent anchor can resume.
 
-Vision boot 0928 (P PP0 06:20:28, weg2-4-27): the read ended at 14016 of 52032
+Vision boot 0928 (P PP0 06:20:28, pdflip-4-27): the read ended at 14016 of 52032
 host tokens; the first recurrent (mamba) anchor of that prefix sat at 16384.
-The 14016 tokens were loaded to the device anyway (WEG2-LOAD-DEVICE 43 ms) and
+The 14016 tokens were loaded to the device anyway (PDFLIP-LOAD-DEVICE 43 ms) and
 inserted -- and the prefill started at 0, because a hybrid model resumes only
 from an anchor. The reap now asks the store for the deepest anchor inside the
 pages that landed (the same mamba presence question the probe asked,
@@ -19,9 +19,9 @@ import types
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.hicache_phase_binding import binding_state  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import PoolName  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.srt.mem_cache.hicache_phase_binding import binding_state  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import PoolName  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
     "_t_1157", os.path.join(os.path.dirname(__file__), "test_1157_reaper_prices_requested_span.py")
@@ -63,11 +63,11 @@ class BelowTheFirstAnchorNothingIsLoaded(CustomTestCase):
     def setUp(self):
         self.addCleanup(binding_state().reset)
 
-    def test_weg2_4_27_a_read_below_the_first_anchor_loads_nothing(self):
+    def test_pdflip_4_27_a_read_below_the_first_anchor_loads_nothing(self):
         """RED on a9e3a842ae: the 10 read tokens are claimed and loaded
         (the metal's 14016 below the anchor at 16384). GREEN: named, cut to 0."""
         cache, store = _short_read(anchor_pages=0)
-        with self.assertLogs("sglang.srt.mem_cache.unified_radix_cache", "WARNING") as cm:
+        with self.assertLogs("flliper.srt.mem_cache.unified_radix_cache", "WARNING") as cm:
             cache.check_prefetch_progress(REQ)
         self.assertEqual(int(cache.prefetch_loaded_tokens_by_reqid[REQ]), 0)
         self.assertIn("#257 PREFETCH BELOW-ANCHOR", "\n".join(cm.output))

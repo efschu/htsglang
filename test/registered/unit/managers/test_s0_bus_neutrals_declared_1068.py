@@ -34,10 +34,10 @@ CUDA_VISIBLE_DEVICES="".
 import dataclasses
 import unittest
 
-from sglang.srt.managers import phase_domain_verdict as pdv
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import phase_domain_verdict as pdv
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2)
 

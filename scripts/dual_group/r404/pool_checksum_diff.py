@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """#404: read the lane's per-round pool checksums and LOCALIZE a difference.
 
-The probe (``SGLANG_LANE_POOL_CHECKSUM=1``, ``dual_group_lane.py``) emits one
+The probe (``FLLIPER_LANE_POOL_CHECKSUM=1``, ``dual_group_lane.py``) emits one
 record per committed round with a digest of each surface a rejected speculative
 candidate could leave residue in. This module turns those records into the two
 statements the window needs, and it is deliberately importable as well as
@@ -426,7 +426,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     spec = load_records(args.spec)
     if not spec:
-        print("no records in --spec; was SGLANG_LANE_POOL_CHECKSUM=1 set?")
+        print("no records in --spec; was FLLIPER_LANE_POOL_CHECKSUM=1 set?")
         return 2
     ref = load_records(args.ref) if args.ref else None
     controls = [load_records(path) for path in args.control]

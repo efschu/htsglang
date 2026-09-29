@@ -18,7 +18,7 @@ Run:
 import pytest
 import torch
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+from flliper.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
     STAGE_ORDER,
     _bad_rows,
     _first,
@@ -30,7 +30,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
     marlin_probe_level,
     marlin_stage_probe_on,
 )
-import sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe as fmm
+import flliper.srt.layers.moe.fused_moe_triton.fused_marlin_moe as fmm
 
 
 @pytest.fixture(autouse=True)
@@ -52,9 +52,9 @@ def _reset_memos():
 )
 def test_probe_level_ladder(monkeypatch, raw, level):
     if raw is None:
-        monkeypatch.delenv("SGLANG_MOE_MARLIN_C_SENTINEL", raising=False)
+        monkeypatch.delenv("FLLIPER_MOE_MARLIN_C_SENTINEL", raising=False)
     else:
-        monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", raw)
+        monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", raw)
     assert marlin_probe_level() == level
     assert marlin_c_sentinel_on() is (level >= 1)
     assert marlin_stage_probe_on() is (level >= 2)
@@ -63,7 +63,7 @@ def test_probe_level_ladder(monkeypatch, raw, level):
 def test_level_1_still_means_exactly_what_it_meant(monkeypatch):
     """Every fn8ap/fn8aq/fn8ar/fn8as/fn8c* boot line said '=1'. Those boots must
     keep their exact meaning, or their logs stop being comparable."""
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "1")
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", "1")
     assert marlin_c_sentinel_on() is True
     assert marlin_stage_probe_on() is False
 
@@ -275,18 +275,18 @@ def not_capturing(monkeypatch):
 def test_stage_probe_is_off_under_capture(monkeypatch, capturing):
     """fn8c5 died here: every stage count is a device-to-host sync and all three
     ranks hit cudaErrorStreamCaptureInvalidated in capture_one_shape."""
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "2")
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", "2")
     assert marlin_stage_probe_on() is True, "the switch is still on ..."
     assert fmm.marlin_stage_probe_active() is False, "... but the probe is not"
 
 
 def test_stage_probe_is_on_outside_capture(monkeypatch, not_capturing):
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "2")
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", "2")
     assert fmm.marlin_stage_probe_active() is True
 
 
 def test_the_capture_skip_is_logged_exactly_once(monkeypatch, capturing, caplog):
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "2")
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", "2")
     with caplog.at_level("ERROR"):
         for _ in range(5):
             assert fmm.marlin_stage_probe_active() is False
@@ -338,7 +338,7 @@ def test_capture_is_false_without_cuda(monkeypatch):
 def test_level_1_is_unaffected_by_the_capture_gate(monkeypatch, capturing):
     """fn8ar/fn8c2 ran level 1 through capture without trouble; that must stay
     exactly true, or their logs stop being comparable to the next boot's."""
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "1")
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", "1")
     assert marlin_c_sentinel_on() is True
     assert fmm.marlin_stage_probe_active() is False
 

@@ -49,11 +49,11 @@ PROBE_MIB = 64
 
 
 def main() -> int:
-    os.environ["SGLANG_VRAM_FLIGHT_TRACE"] = "1"
+    os.environ["FLLIPER_VRAM_FLIGHT_TRACE"] = "1"
     directory = tempfile.mkdtemp(prefix="flight_selftest_")
-    os.environ["SGLANG_VRAM_FLIGHT_DIR"] = directory
+    os.environ["FLLIPER_VRAM_FLIGHT_DIR"] = directory
 
-    from sglang.srt.mem_ledger import flight_recorder as fr
+    from flliper.srt.mem_ledger import flight_recorder as fr
 
     failures = []
 
@@ -69,12 +69,12 @@ def main() -> int:
     # -- 1. arming happens before any CUDA context exists ---------------------
     #
     # The predicate is NVML's per-process list, not torch's is_initialized
-    # flag: importing any sglang.srt module flips that flag while binding
+    # flag: importing any flliper.srt module flips that flag while binding
     # nothing, so asserting on it tests the import graph rather than the card.
     # This test asserted on the flag in its first cut and reported four
     # failures against a correct instrument.
     def context_bytes():
-        from sglang.srt.registry import nvml as registry_nvml
+        from flliper.srt.registry import nvml as registry_nvml
 
         uuid = registry_nvml.current_device_uuid()
         return registry_nvml.process_bytes_on_uuid(uuid).get(os.getpid(), 0)

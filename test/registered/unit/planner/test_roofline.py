@@ -24,14 +24,14 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.planner.hardware import GpuDescriptor, HardwareSpec
-from sglang.srt.planner.card_library import CardSpec, CardLibrary
-from sglang.srt.planner.roofline import (
+from flliper.srt.planner.hardware import GpuDescriptor, HardwareSpec
+from flliper.srt.planner.card_library import CardSpec, CardLibrary
+from flliper.srt.planner.roofline import (
     ROOFLINE_PROVENANCE,
     RooflineEstimate,
     estimate_roofline,
 )
-from sglang.srt.uneven_perf import PlanInputs
+from flliper.srt.uneven_perf import PlanInputs
 
 
 def _tiny_model_dir(moe: bool = False) -> str:
@@ -183,7 +183,7 @@ class TestRooflineNeverMeasured(unittest.TestCase):
     stored as a measurement."""
 
     def test_rejected_by_results_store(self):
-        from sglang.srt.planner.results_store import (
+        from flliper.srt.planner.results_store import (
             IngestRejected,
             QuantDescriptor,
             ResultEntry,
@@ -217,7 +217,7 @@ class TestRooflineMoEOffload(unittest.TestCase):
     that lowers decode vs the same plan resident in VRAM."""
 
     def test_offload_lowers_decode(self):
-        from sglang.srt.planner.feasibility import OffloadAssessment
+        from flliper.srt.planner.feasibility import OffloadAssessment
 
         model = _tiny_model_dir(moe=True)
         hw, lib = _hardware(["C"], 1600.0, 300.0)

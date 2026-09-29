@@ -2,15 +2,15 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.eagle_utils import (
+from flliper.srt.speculative.eagle_utils import (
     SPEC_KERNEL_BACKEND_NATIVE,
     build_tree_kernel_efficient,
     organize_draft_results,
     reset_spec_kernel_backend,
     set_spec_kernel_backend,
 )
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.utils import get_device
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=3, suite="stage-b-test-1-gpu-small-amd")

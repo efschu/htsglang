@@ -61,16 +61,16 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.dcp.owner import refresh_all_owner_bounds
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from flliper.srt.layers.dcp.owner import refresh_all_owner_bounds
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
-_BOUNDS = "sglang.srt.distributed.utils.uneven_dcp_owner_bounds"
+_BOUNDS = "flliper.srt.distributed.utils.uneven_dcp_owner_bounds"
 
 # The rig's TP-phase decode geometry: token vector 29,19,16 -> S = 64, and this
 # rank owns [0, 29). A global context of C slots compacts to
@@ -220,7 +220,7 @@ class TestUnaddressableRowsAreSaidAndCounted(unittest.TestCase):
         with mock.patch(_BOUNDS, return_value=None):
             device = torch.tensor([200000], dtype=torch.int64)
             with self.assertLogs(
-                "sglang.srt.managers.cache_controller", level="ERROR"
+                "flliper.srt.managers.cache_controller", level="ERROR"
             ) as logs:
                 self.assertTrue(ctrl._refuse_unaddressable_kv_rows(device, "write"))
         line = "\n".join(logs.output)
@@ -273,7 +273,7 @@ class TestTheWriteRefusalReachesTheCaller(unittest.TestCase):
         with (
             mock.patch(_BOUNDS, return_value=None),
             mock.patch(
-                "sglang.srt.managers.cache_controller.device_tier_disarmed",
+                "flliper.srt.managers.cache_controller.device_tier_disarmed",
                 return_value=False,
             ),
         ):
@@ -288,7 +288,7 @@ class TestTheWriteRefusalReachesTheCaller(unittest.TestCase):
         with (
             mock.patch(_BOUNDS, return_value=None),
             mock.patch(
-                "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller."
+                "flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller."
                 "device_tier_disarmed",
                 return_value=False,
             ),
@@ -321,7 +321,7 @@ class TestTheSeamGuardNowCarriesTheCapacities(unittest.TestCase):
         return host_pool, device_pool
 
     def test_a_matched_transfer_still_passes(self):
-        from sglang.srt.mem_cache.pool_host.mha import _guard_kv_transfer
+        from flliper.srt.mem_cache.pool_host.mha import _guard_kv_transfer
 
         host_pool, device_pool = self._pools(4096, 4096)
         _guard_kv_transfer(
@@ -333,8 +333,8 @@ class TestTheSeamGuardNowCarriesTheCapacities(unittest.TestCase):
         )
 
     def test_an_out_of_range_device_row_is_named_instead_of_clamped(self):
-        from sglang.srt.mem_cache.kv_transfer_guard import KvTransferShapeMismatch
-        from sglang.srt.mem_cache.pool_host.mha import _guard_kv_transfer
+        from flliper.srt.mem_cache.kv_transfer_guard import KvTransferShapeMismatch
+        from flliper.srt.mem_cache.pool_host.mha import _guard_kv_transfer
 
         host_pool, device_pool = self._pools(4096, 4096)
         with self.assertRaises(KvTransferShapeMismatch) as caught:
@@ -351,7 +351,7 @@ class TestTheSeamGuardNowCarriesTheCapacities(unittest.TestCase):
         self.assertIn("4096", message)
 
     def test_a_paged_host_layout_still_fails_open_on_the_host_side(self):
-        from sglang.srt.mem_cache.pool_host.mha import _guard_kv_transfer
+        from flliper.srt.mem_cache.pool_host.mha import _guard_kv_transfer
 
         host_pool, device_pool = self._pools(4096, 8)
         host_pool.layout = "page_first"

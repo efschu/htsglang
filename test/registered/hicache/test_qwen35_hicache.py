@@ -8,14 +8,14 @@ import requests
 import zmq
 from msgspec.msgpack import Decoder
 
-from sglang.srt.disaggregation.kv_events import BlockStored, KVEventBatch
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.disaggregation.kv_events import BlockStored, KVEventBatch
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
 
 # This eval harness applies the chat_template, which is critical for qwen3.5
 # to get good accuracy on gsm8k
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -35,7 +35,7 @@ class TestQwen35WithHiCache(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.storage_dir = tempfile.mkdtemp(prefix="qwen35-hicache-")
         env = {
-            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.storage_dir,
+            "FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.storage_dir,
         }
         cls.process = popen_launch_server(
             cls.model,

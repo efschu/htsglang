@@ -14,7 +14,7 @@ again, and see serving carry on -- with the corridor law unbroken at every
 So this script is deliberately an EXTERNAL TENANT and nothing else. It talks
 to the same public endpoint a video lane or a training tenant would use
 (``POST /vram_budget``), reads NVML from outside the process, and never
-imports a single sglang symbol. A probe that reached inside would prove the
+imports a single flliper symbol. A probe that reached inside would prove the
 mechanism to itself.
 
 THE CORRIDOR SAMPLER IS THE JUDGE, NOT THIS SCRIPT. The law is a CONTINUOUS

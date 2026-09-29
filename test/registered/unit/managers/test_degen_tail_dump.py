@@ -1,6 +1,6 @@
 """TAIL DUMP at the DEGEN-SUSPECT hook (managers/degen_detect.py, EG 28.09.).
 
-27B boot ...dkr27breleasedraftbar1w109281340: weg2-0-8 / weg2-1-13 produced
+27B boot ...dkr27breleasedraftbar1w109281340: pdflip-0-8 / pdflip-1-13 produced
 35789 / 39729 completion tokens and NOTHING kept their text, so whether they
 were a loop or a legitimate long answer could not be decided afterwards.
 Pinned here: a DEGEN-SUSPECT and a finished request past DUMP_LONG hand the
@@ -13,7 +13,7 @@ import json
 import os
 import random
 
-from sglang.srt.managers import degen_detect as dd
+from flliper.srt.managers import degen_detect as dd
 
 
 class _Tok:
@@ -64,9 +64,9 @@ def test_dump_long_zero_is_off():
 
 def test_tail_dumper_writes_ids_and_text_and_respects_the_cap(tmp_path):
     d = dd.TailDumper(_Tok(), str(tmp_path), max_files=2, start=False)
-    p = d.write("weg2-1-13", "long", "reasoning", [1, 2, 3], {"out_len": 39729})
+    p = d.write("pdflip-1-13", "long", "reasoning", [1, 2, 3], {"out_len": 39729})
     body = json.load(open(p))
-    assert body["rid"] == "weg2-1-13" and body["text"] == "t1 t2 t3" and body["ids"] == [1, 2, 3]
+    assert body["rid"] == "pdflip-1-13" and body["text"] == "t1 t2 t3" and body["ids"] == [1, 2, 3]
     assert body["out_len"] == 39729 and body["part"] == "reasoning"
     d(rid="a", reason="long", part="c", ids=[1], meta={})   # queued (1 written + 1 queued = cap)
     d(rid="b", reason="long", part="c", ids=[1], meta={})   # over the cap -> dropped, counted
@@ -95,6 +95,6 @@ def test_a_failing_dump_hook_never_raises_into_the_detokenizer():
 
 
 def test_env_defaults():
-    from sglang.srt.environ import envs
-    assert envs.SGLANG_WEG2_DEGEN_DUMP_MAX.get() == 16
-    assert envs.SGLANG_WEG2_DEGEN_DUMP_LONG.get() == 16384
+    from flliper.srt.environ import envs
+    assert envs.FLLIPER_PDFLIP_DEGEN_DUMP_MAX.get() == 16
+    assert envs.FLLIPER_PDFLIP_DEGEN_DUMP_LONG.get() == 16384

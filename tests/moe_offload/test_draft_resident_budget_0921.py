@@ -3,7 +3,7 @@
 v71 got BOTH groups up (D READY after 432.7 s) and was then refused by the
 launcher's own gate:
 
-    W11 Weg2DraftResidentOverBudget: measured resident_mib=2202.6 vs budget
+    W11 PdFlipDraftResidentOverBudget: measured resident_mib=2202.6 vs budget
     1618.2+256 MiB
 
 The refusal was correct -- the build really is bigger now, for two reasons
@@ -11,7 +11,7 @@ fixed the same day, and the budget is a MEASURED constant the module itself
 says to replace ("The next boot's L2 resident_mib replaces 1618.2 here").
 """
 
-from sglang.srt.weg2 import launcher
+from flliper.srt.pdflip import launcher
 
 
 def test_the_budget_is_the_sum_of_the_measured_parts():
@@ -51,7 +51,7 @@ def test_w11b_counts_the_tag_pool_cache_as_a_named_term():
     """
     import inspect
 
-    from sglang.srt.speculative import draft_kv_producer as dkp
+    from flliper.srt.speculative import draft_kv_producer as dkp
 
     src = inspect.getsource(dkp.DraftKvProducer.load_resident_embedding)
     assert "after_pool - self._pool_inactive_before_mib" in src

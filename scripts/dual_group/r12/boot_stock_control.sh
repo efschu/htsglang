@@ -92,7 +92,7 @@ start_vram_sampler "$OUT/vram-$ARM.csv"
 
 cd "$WT" || exit 1
 launch_server "$LOG" "/tmp/r12-stock-$ARM.pid" \
-  "$VENV/bin/python" -m sglang.launch_server \
+  "$VENV/bin/python" -m flliper.launch_server \
   --model-path "$TARGET" \
   --tokenizer-path "$TARGET_DIR" \
   --tp-size 3 --rank-gpu-id 0,1,2 \

@@ -28,8 +28,8 @@ useless (grace too short to mean anything) or unbearable.
 
 import unittest
 
-from sglang.srt.translator.languages import ConversationLanguages
-from sglang.srt.translator.session import SessionManager
+from flliper.srt.translator.languages import ConversationLanguages
+from flliper.srt.translator.session import SessionManager
 from test_session import LANG_A, LANG_B, make_session
 
 
@@ -159,9 +159,9 @@ class TestCollection(unittest.TestCase):
         """
         session = self.mgr.open(self.conv)
         session.attach()
-        from sglang.srt.translator.segmenter import Segment, SegmentReason
+        from flliper.srt.translator.segmenter import Segment, SegmentReason
         from test_session import RATE, tone
-        from sglang.srt.translator.backends import AudioChunk
+        from flliper.srt.translator.backends import AudioChunk
 
         for i in range(2):
             session.enqueue(

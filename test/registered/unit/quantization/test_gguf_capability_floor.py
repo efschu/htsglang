@@ -30,8 +30,8 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.layers.quantization import gguf as gguf_mod
-from sglang.srt.model_loader import loader as loader_mod
+from flliper.srt.layers.quantization import gguf as gguf_mod
+from flliper.srt.model_loader import loader as loader_mod
 
 
 def _model_config(name="gguf"):

@@ -14,7 +14,7 @@ The OTHER refusals in that scope are real and must stay.
 
 import pytest
 
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.server_args import ServerArgs
 
 
 def _args(**over):
@@ -72,7 +72,7 @@ def test_the_producer_log_line_counts_a_whole_page():
     misreads the store by that factor."""
     import inspect
 
-    from sglang.srt.managers import scheduler as sch
+    from flliper.srt.managers import scheduler as sch
 
     src = inspect.getsource(sch.Scheduler._maybe_init_draft_kv_producer)
     assert 'getattr(self.server_args, "page_size", 1)' in src

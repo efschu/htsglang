@@ -11,7 +11,7 @@ import importlib.util
 import inspect
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from flliper.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
@@ -20,8 +20,8 @@ _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
 
 if _HAS_MLX:
-    from sglang.srt.hardware_backend.mlx.model_runner_stub import MlxModelRunnerStub
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from flliper.srt.hardware_backend.mlx.model_runner_stub import MlxModelRunnerStub
+    from flliper.srt.model_executor.model_runner import ModelRunner
 
 
 def _required_params_beyond_self(func) -> list[str]:

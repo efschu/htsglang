@@ -30,15 +30,15 @@ from typing import List, Optional
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 def _ensure_dist_initialized() -> None:
     """Set up a minimal single-rank gloo distributed environment plus the
-    SGLang model-parallel groups (TP=1, PP=1, EP=1). The CCA module reads
+    fLLiper model-parallel groups (TP=1, PP=1, EP=1). The CCA module reads
     ``get_tensor_model_parallel_rank()`` / ``get_tensor_model_parallel_world_size()``
     inside ``__init__`` to size its head-parallel projections, so the world
     group and model parallel groups must both be initialized before any CCA
@@ -50,7 +50,7 @@ def _ensure_dist_initialized() -> None:
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", "0")
 
-    from sglang.srt.distributed.parallel_state import (
+    from flliper.srt.distributed.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,
         model_parallel_is_initialized,
@@ -165,7 +165,7 @@ class _MockShortConvBackend:
         return slot_ids
 
     def conv_state_metadata(self, layer_id, forward_batch):
-        from sglang.srt.layers.attention.linear.short_conv_backend import (
+        from flliper.srt.layers.attention.linear.short_conv_backend import (
             ShortConvMetadata,
         )
 
@@ -188,7 +188,7 @@ class _MockShortConvBackend:
 def _mock_pool_context(pool: _MockReqToTokenPool):
     """Install a mock ``ForwardContext`` whose ``attn_backend`` exposes both
     ``req_to_token_pool`` and ``conv_state_metadata`` over ``pool``."""
-    from sglang.srt.model_executor.forward_context import (
+    from flliper.srt.model_executor.forward_context import (
         ForwardContext,
         set_forward_context,
     )
@@ -215,7 +215,7 @@ def _make_forward_batch(
     req_pool_indices,
     input_ids: torch.Tensor,
 ):
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
     mode = ForwardMode.DECODE if is_decode else ForwardMode.EXTEND
 
@@ -231,7 +231,7 @@ def _make_forward_batch(
 
 
 def _make_tiny_config(num_hidden_layers: int = 2):
-    from sglang.srt.configs.zaya import ZayaConfig
+    from flliper.srt.configs.zaya import ZayaConfig
 
     return ZayaConfig(
         hidden_size=16,
@@ -258,7 +258,7 @@ def _make_tiny_cca(
     layer_id: int = 0,
     config=None,
 ):
-    from sglang.srt.models.zaya import CCA
+    from flliper.srt.models.zaya import CCA
 
     if config is None:
         config = _make_tiny_config()
@@ -595,7 +595,7 @@ class TestZayaCCATensorParallel(CustomTestCase):
         only way TP correctness is exercised end-to-end.
         """
         ref_state = dict(ref_cca.state_dict())
-        from sglang.srt.model_loader.weight_utils import default_weight_loader
+        from flliper.srt.model_loader.weight_utils import default_weight_loader
 
         with torch.no_grad():
             for name, param in tp_cca.named_parameters():
@@ -805,7 +805,7 @@ class TestZayaCCATensorParallel(CustomTestCase):
         both num_q_heads and num_k_heads, since both grouped-mean and
         conv_qk.1 require each rank to hold whole K-head groups.
         """
-        from sglang.srt.models.zaya import CCA
+        from flliper.srt.models.zaya import CCA
 
         cfg = _make_tiny_config()
         # tiny config has num_query_groups=2; TP=4 cannot divide it cleanly.

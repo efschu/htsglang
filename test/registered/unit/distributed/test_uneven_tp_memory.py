@@ -8,7 +8,7 @@ shapes, and the auto rank resolution of model_config.get_num_kv_heads.
 
 No GPU, no distributed init: NVML is mocked like in the phase-1 args
 tests, torch.distributed collectives are patched, and `sgl_kernel` is
-stubbed before the sglang imports.
+stubbed before the flliper imports.
 """
 
 import importlib.util
@@ -47,14 +47,14 @@ _install_sgl_kernel_stub()
 
 import torch  # noqa: E402
 
-import sglang.srt.server_args as server_args_module  # noqa: E402
-from sglang.srt.configs.mamba_utils import Mamba2StateShape  # noqa: E402
-from sglang.srt.distributed.utils import (  # noqa: E402
+import flliper.srt.server_args as server_args_module  # noqa: E402
+from flliper.srt.configs.mamba_utils import Mamba2StateShape  # noqa: E402
+from flliper.srt.distributed.utils import (  # noqa: E402
     set_tp_partition_ratios,
 )
-from sglang.srt.server_args import ServerArgs  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.srt.server_args import ServerArgs  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -173,7 +173,7 @@ class TestTokenCapacitySync(UnevenTPTestCase):
     """_apply_token_constraints: min-sync gating for uneven budgets."""
 
     def _run(self, *, uneven, world_size, capacity, other_capacity, user_limit=None):
-        import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin
+        import flliper.srt.model_executor.model_runner_kv_cache_mixin as mixin
 
         fake_self = SimpleNamespace(
             server_args=SimpleNamespace(
@@ -352,7 +352,7 @@ class TestCustomAllReduceFallback(UnevenTPTestCase):
 
 class TestNumKvHeadsAutoRank(UnevenTPTestCase):
     def _mc(self, total_kv=8):
-        from sglang.srt.configs.model_config import ModelConfig
+        from flliper.srt.configs.model_config import ModelConfig
 
         mc = ModelConfig.__new__(ModelConfig)
         mc.hf_config = SimpleNamespace(model_type="llama")
@@ -362,7 +362,7 @@ class TestNumKvHeadsAutoRank(UnevenTPTestCase):
     def test_auto_resolves_rank_from_parallel_context(self):
         # Worker process: get_parallel().attn_tp_rank is available, so
         # pool/backends callers WITHOUT an explicit rank get THEIR share.
-        import sglang.srt.runtime_context as rc
+        import flliper.srt.runtime_context as rc
 
         set_tp_partition_ratios([2, 1, 1])
         mc = self._mc()
@@ -378,7 +378,7 @@ class TestNumKvHeadsAutoRank(UnevenTPTestCase):
         self.assertEqual(mc.get_num_kv_heads(3), 2)
 
     def test_explicit_rank_still_wins(self):
-        import sglang.srt.runtime_context as rc
+        import flliper.srt.runtime_context as rc
 
         set_tp_partition_ratios([2, 1, 1])
         mc = self._mc()
@@ -387,7 +387,7 @@ class TestNumKvHeadsAutoRank(UnevenTPTestCase):
             self.assertEqual(mc.get_num_kv_heads(3, rank=0), 4)
 
     def test_default_path_ignores_parallel_context(self):
-        import sglang.srt.runtime_context as rc
+        import flliper.srt.runtime_context as rc
 
         mc = self._mc()
         fake_parallel = SimpleNamespace(attn_tp_rank=0)
@@ -404,7 +404,7 @@ class TestNumKvHeadsAutoRank(UnevenTPTestCase):
         ``ModelConfig.get_num_kv_heads``, so a regression here would silently
         undersize the draft pool at kv < tp, not just miscompute the
         canonical window."""
-        import sglang.srt.runtime_context as rc
+        import flliper.srt.runtime_context as rc
 
         set_tp_partition_ratios([1, 1, 1])  # tp_plan_active(3) True, uniform
         mc = self._mc(total_kv=2)  # kv=2 < tp=3, e.g. Qwen3.5-2B under D=TP3
@@ -472,8 +472,8 @@ class TestMlpRebalanceHint(UnevenTPTestCase):
         budget_bytes=10 * (1 << 30),
         local_tokens=500_000,
     ):
-        import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin
-        import sglang.srt.model_executor.pool_configurator as pool_configurator
+        import flliper.srt.model_executor.model_runner_kv_cache_mixin as mixin
+        import flliper.srt.model_executor.pool_configurator as pool_configurator
 
         if plan:
             set_tp_partition_ratios(self.PLAN)
@@ -570,12 +570,12 @@ class TestMlpRebalanceHint(UnevenTPTestCase):
         self.assertEqual(len(gather_calls), 1)
         self.assertEqual(len(warnings_logged), 1)
         msg = warnings_logged[0]
-        self.assertIn("SGLANG_UNEVEN_MLP_VECTOR=", msg)
+        self.assertIn("FLLIPER_UNEVEN_MLP_VECTOR=", msg)
         self.assertIn("from 594999 to ~", msg)
         # The suggested vector conserves the units and sheds from TP1.
         vector = [
             int(v)
-            for v in msg.split("SGLANG_UNEVEN_MLP_VECTOR=")[1]
+            for v in msg.split("FLLIPER_UNEVEN_MLP_VECTOR=")[1]
             .split(" ")[0]
             .split(",")
         ]
@@ -585,7 +585,7 @@ class TestMlpRebalanceHint(UnevenTPTestCase):
     def test_moe_family_supplies_the_shiftable_mass(self):
         # MoE model: the dense-MLP family is tiny (its shiftable bytes
         # cannot unpin TP1) while the expert family carries the weight
-        # mass — the hint must rebalance via SGLANG_UNEVEN_MOE_VECTOR.
+        # mass — the hint must rebalance via FLLIPER_UNEVEN_MOE_VECTOR.
         GB = 1 << 30
         mlp_bpu = 3 * 512.0  # tiny shared expert
         moe_bpu = 48 * 3 * 5120.0 * 8  # expert weights dominate
@@ -602,10 +602,10 @@ class TestMlpRebalanceHint(UnevenTPTestCase):
         _, warnings_logged = self._run(gathered=gathered, with_moe=True)
         self.assertEqual(len(warnings_logged), 1)
         msg = warnings_logged[0]
-        self.assertIn("SGLANG_UNEVEN_MOE_VECTOR=", msg)
+        self.assertIn("FLLIPER_UNEVEN_MOE_VECTOR=", msg)
         moe_vector = [
             int(v)
-            for v in msg.split("SGLANG_UNEVEN_MOE_VECTOR=")[1]
+            for v in msg.split("FLLIPER_UNEVEN_MOE_VECTOR=")[1]
             .split(" ")[0]
             .split(",")
         ]

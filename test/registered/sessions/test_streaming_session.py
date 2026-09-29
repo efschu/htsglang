@@ -7,18 +7,18 @@ test_streaming_session_extra.py.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.streaming_session_kit import (
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kits.streaming_session_kit import (
     AbortLeakReproKitMixin,
     StreamingSessionKitMixin,
 )
-from sglang.test.server_fixtures.streaming_session_fixture import (
+from flliper.test.server_fixtures.streaming_session_fixture import (
     ABORT_REPRO_CHUNKED_PREFILL_SIZE,
     ABORT_REPRO_CONTEXT_LEN,
     ABORT_REPRO_PAGE_SIZE,
     StreamingSessionServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
@@ -57,8 +57,8 @@ class TestStreamingSessionEagleV2RetractLargePage(TestStreamingSession):
         "256",
     ]
     env_overrides = [
-        ("SGLANG_TEST_RETRACT", True),
-        ("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
+        ("FLLIPER_TEST_RETRACT", True),
+        ("FLLIPER_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
     ]
 
 

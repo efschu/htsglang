@@ -1,8 +1,8 @@
 """#1416g: the extra pools' pages of one prefetch are read in ONE batch.
 
-NF z30e (ca2a9706ec, boot ...stvsyncbar1dauer09282117), PP0 WEG2-READ-STAGES:
+NF z30e (ca2a9706ec, boot ...stvsyncbar1dauer09282117), PP0 PDFLIP-READ-STAGES:
 ``kv_ms`` 1-3 (the arena addresses the KV pages in place), ``extra_ms``
-35-695, linear in pages -- weg2-40-71 1275 pages 301 ms, weg2-16-41 256 pages
+35-695, linear in pages -- pdflip-40-71 1275 pages 301 ms, pdflip-16-41 256 pages
 55 ms (~0.22 ms/page). The QSA index sidecar went through ``_read_page`` one
 page at a time. Pinned here, on the real HiCacheFile and QSAPagedHostPool of
 the x56 byte test: the read goes through one ``batch_get`` (one arena call
@@ -21,11 +21,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_qsa_index_sidecar_bytes_x56 as x56  # noqa: E402
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, PoolName, PoolTransfer  # noqa: E402
-from sglang.srt.mem_cache.qsa_pool_host import QSAPagedHostPool  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile, PoolName, PoolTransfer  # noqa: E402
+from flliper.srt.mem_cache.qsa_pool_host import QSAPagedHostPool  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
-register_cpu_ci(est_time=6, suite="stage-a-weg2-unit")
+register_cpu_ci(est_time=6, suite="stage-a-pdflip-unit")
 
 TOKENS = torch.arange(x56.N_PAGES * x56.PAGE)
 
@@ -103,11 +103,11 @@ class ExtraPoolBatchRead(unittest.TestCase):
                 self.assertEqual(int(_layer_row(host, l, 1).abs().sum()), 0)
 
     def test_arena_pages_are_read_in_one_arena_call(self):
-        from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+        from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as adir, \
-                mock.patch.dict(os.environ, {"SGLANG_HICACHE_ARENA_DIR": adir,
-                                             "SGLANG_HICACHE_ARENA_GIB": "0.0625"}):
+                mock.patch.dict(os.environ, {"FLLIPER_HICACHE_ARENA_DIR": adir,
+                                             "FLLIPER_HICACHE_ARENA_GIB": "0.0625"}):
             _write_stages(root)
             be, host = _decode_backend(root)
             real_read = ShmArena.read

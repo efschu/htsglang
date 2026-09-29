@@ -2,13 +2,13 @@
 
 NOTE: This is an implementation for replaying a given trace for throughput/latency benchmark purposes. It is not an actual ReAct agent implementation.
 
-### Benchmark sglang
+### Benchmark flliper
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python -m flliper.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 ```
 
 ```
-python3 bench_sglang.py --num-questions 100
+python3 bench_flliper.py --num-questions 100
 ```
 
 

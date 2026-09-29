@@ -19,8 +19,8 @@ import sys
 import types
 import unittest
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -31,7 +31,7 @@ def _reset_refusal_latch():
     Not ``ServerArgs._ledger_reserve_refusal_named = False``. That name was
     bound at import time (pytest collection, before any test runs), and
     ``test/registered/unit/server_args/test_server_args.py:1256`` calls
-    ``importlib.reload`` on ``sglang.srt.server_args`` to rebuild the
+    ``importlib.reload`` on ``flliper.srt.server_args`` to rebuild the
     env-gated choice lists. A reload re-executes the module body and installs
     a BRAND NEW ``ServerArgs`` class object in the module dict, so from then on
     this file's imported name points at an orphan: ``setUp`` would reset a
@@ -44,14 +44,14 @@ def _reset_refusal_latch():
     fix belongs on this side: resolve the class the way the production code
     does, through the live module attribute.
     """
-    import sglang.srt.server_args as _live
+    import flliper.srt.server_args as _live
 
     _live.ServerArgs._ledger_reserve_refusal_named = False
 
 
 HEURISTIC_MIB = 3968.0
 CARD = "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d"
-ACTIVATION_MODULE = "sglang.srt.mem_ledger.activation"
+ACTIVATION_MODULE = "flliper.srt.mem_ledger.activation"
 
 
 class _Stub:
@@ -128,13 +128,13 @@ def install_ledger(monkey_target, footprint):
     activation = types.ModuleType(ACTIVATION_MODULE)
     activation.profile_from_server_args = lambda sa, arch: ("profile",)
     activation.resolve_phase_footprint = lambda uuid, **kw: footprint
-    calibration = types.ModuleType("sglang.srt.mem_ledger.calibration")
+    calibration = types.ModuleType("flliper.srt.mem_ledger.calibration")
     calibration.live_fingerprint = lambda: ("a191a0712717", [], "580")
-    engine = types.ModuleType("sglang.srt.mem_ledger.engine")
+    engine = types.ModuleType("flliper.srt.mem_ledger.engine")
     engine._model_architectures = lambda sa: ("Qwen3_5ForConditionalGeneration",)
     monkey_target[ACTIVATION_MODULE] = activation
-    monkey_target["sglang.srt.mem_ledger.calibration"] = calibration
-    monkey_target["sglang.srt.mem_ledger.engine"] = engine
+    monkey_target["flliper.srt.mem_ledger.calibration"] = calibration
+    monkey_target["flliper.srt.mem_ledger.engine"] = engine
 
 
 class LedgerModules:
@@ -148,8 +148,8 @@ class LedgerModules:
     def __enter__(self):
         names = [
             ACTIVATION_MODULE,
-            "sglang.srt.mem_ledger.calibration",
-            "sglang.srt.mem_ledger.engine",
+            "flliper.srt.mem_ledger.calibration",
+            "flliper.srt.mem_ledger.engine",
         ]
         for n in names:
             self.saved[n] = sys.modules.get(n)
@@ -223,7 +223,7 @@ class TestRefusalIsNamedNotSilent(unittest.TestCase):
         """Reachable refusal path: loud, attributed, still bootable."""
         stub = _Stub()
         with LedgerModules(footprint=None):
-            with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+            with self.assertLogs("flliper.srt.server_args", level="WARNING") as cm:
                 mib, source = runtime_reserve(stub, card_uuid=CARD)
         self.assertEqual((mib, source), (HEURISTIC_MIB, "heuristic:ledger-refused"))
         joined = "\n".join(cm.output)
@@ -233,7 +233,7 @@ class TestRefusalIsNamedNotSilent(unittest.TestCase):
     def test_the_refusal_is_named_once_per_process(self):
         stub = _Stub()
         with LedgerModules(footprint=None):
-            with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+            with self.assertLogs("flliper.srt.server_args", level="WARNING") as cm:
                 runtime_reserve(stub, card_uuid=CARD)
                 runtime_reserve(stub, card_uuid=CARD)
                 runtime_reserve(stub, card_uuid=CARD)
@@ -249,7 +249,7 @@ class TestLegacyPathsAreByteIdentical(unittest.TestCase):
     def test_no_ledger_module_is_silent_heuristic(self):
         stub = _Stub()
         with LedgerModules(absent=True):
-            with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
+            with self.assertNoLogs("flliper.srt.server_args", level="WARNING"):
                 mib, source = runtime_reserve(stub, card_uuid=CARD)
         self.assertEqual((mib, source), (HEURISTIC_MIB, "heuristic:no-ledger"))
 
@@ -257,7 +257,7 @@ class TestLegacyPathsAreByteIdentical(unittest.TestCase):
         """Every legacy caller and the planner call without a UUID."""
         stub = _Stub()
         with LedgerModules(footprint=_FakeFootprint(1766.0)):
-            with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
+            with self.assertNoLogs("flliper.srt.server_args", level="WARNING"):
                 mib, source = runtime_reserve(stub, card_uuid=None)
         self.assertEqual((mib, source), (HEURISTIC_MIB, "heuristic:not-asked"))
 
@@ -288,21 +288,21 @@ class TestPerGpuDemandCarriesTheIdentity(unittest.TestCase):
         activation = types.ModuleType(ACTIVATION_MODULE)
         activation.profile_from_server_args = lambda sa, arch: ("profile",)
         activation.resolve_phase_footprint = lambda uuid, **kw: per_card.get(uuid)
-        calibration = types.ModuleType("sglang.srt.mem_ledger.calibration")
+        calibration = types.ModuleType("flliper.srt.mem_ledger.calibration")
         calibration.live_fingerprint = lambda: ("a191a0712717", [], "580")
-        engine = types.ModuleType("sglang.srt.mem_ledger.engine")
+        engine = types.ModuleType("flliper.srt.mem_ledger.engine")
         engine._model_architectures = lambda sa: ("Qwen3_5ForConditionalGeneration",)
         saved = {
             n: sys.modules.get(n)
             for n in (
                 ACTIVATION_MODULE,
-                "sglang.srt.mem_ledger.calibration",
-                "sglang.srt.mem_ledger.engine",
+                "flliper.srt.mem_ledger.calibration",
+                "flliper.srt.mem_ledger.engine",
             )
         }
         sys.modules[ACTIVATION_MODULE] = activation
-        sys.modules["sglang.srt.mem_ledger.calibration"] = calibration
-        sys.modules["sglang.srt.mem_ledger.engine"] = engine
+        sys.modules["flliper.srt.mem_ledger.calibration"] = calibration
+        sys.modules["flliper.srt.mem_ledger.engine"] = engine
         try:
             out = ServerArgs.reserve_demand_per_gpu(stub, 20480, {0: 1, 1: 1})
         finally:

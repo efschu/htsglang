@@ -1,9 +1,9 @@
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kits.radix_cache_server_kit import run_radix_attention_test
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -88,6 +88,6 @@ class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
 
 
 if __name__ == "__main__":
-    envs.SGLANG_TEST_RETRACT.set(True)
-    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.set(1)
+    envs.FLLIPER_TEST_RETRACT.set(True)
+    envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.set(1)
     unittest.main()

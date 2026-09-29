@@ -46,9 +46,9 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 # ~35s: three spawned processes, a gloo group, and a deliberately hanging arm
 # that has to run out its own deadline. Spawns real ranks -> narrow lane.
@@ -73,7 +73,7 @@ def _free_port() -> int:
 
 
 def _make_record(req_id: str):
-    from sglang.srt.mem_cache.unified_radix_cache import _OngoingPrefetch
+    from flliper.srt.mem_cache.unified_radix_cache import _OngoingPrefetch
 
     operation = type(
         "_Op",

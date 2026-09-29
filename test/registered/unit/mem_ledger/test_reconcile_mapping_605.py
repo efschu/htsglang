@@ -30,13 +30,13 @@ The fixtures are the real marks of boot 1464299-1786612548, transcribed.
 
 import pytest
 
-from sglang.srt.mem_ledger.engine import (
+from flliper.srt.mem_ledger.engine import (
     TERM_GDN_SCRATCH,
     TERM_LOAD_TRANSIENT,
     TERM_NCCL_BUFFERS,
     TERM_WEIGHTS,
 )
-from sglang.srt.mem_ledger.reconcile import TERM_TO_POST, reconcile_card
+from flliper.srt.mem_ledger.reconcile import TERM_TO_POST, reconcile_card
 
 MIB = 1 << 20
 

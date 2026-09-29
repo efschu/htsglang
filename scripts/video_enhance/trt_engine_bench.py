@@ -56,8 +56,8 @@ import sys
 import time
 from pathlib import Path
 
-from sglang.srt.video_enhance.engine_cache import sha256_file
-from sglang.srt.video_enhance.frame_math import Resolution
+from flliper.srt.video_enhance.engine_cache import sha256_file
+from flliper.srt.video_enhance.frame_math import Resolution
 
 #: The SR input sizes the chain actually asks for. The profile is built from
 #: these rather than from round numbers, and the consumer matrix is checked
@@ -306,8 +306,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- parity against the fp32 ONNX on the CUDA provider -------------------
     if not args.skip_parity:
-        from sglang.srt.video_enhance.backends import OnnxRuntimeBackend
-        from sglang.srt.video_enhance.parity import grade as grade_pair
+        from flliper.srt.video_enhance.backends import OnnxRuntimeBackend
+        from flliper.srt.video_enhance.parity import grade as grade_pair
 
         reference = OnnxRuntimeBackend(
             fp32_onnx, provider="cuda", precision="fp32", device_id=0

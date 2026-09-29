@@ -6,11 +6,11 @@ import triton
 import triton.testing
 from sgl_kernel import rmsnorm
 
-from sglang.jit_kernel.benchmark.utils import run_benchmark
-from sglang.jit_kernel.norm import fused_inplace_qknorm_across_heads
-from sglang.srt.utils import get_current_device_stream_fast
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
+from flliper.jit_kernel.benchmark.utils import run_benchmark
+from flliper.jit_kernel.norm import fused_inplace_qknorm_across_heads
+from flliper.srt.utils import get_current_device_stream_fast
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.utils import is_in_ci
 
 register_cuda_ci(
     est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -21,7 +21,7 @@ IS_CI = is_in_ci()
 alt_stream = torch.cuda.Stream()
 
 
-def sglang_jit_qknorm_across_heads(
+def flliper_jit_qknorm_across_heads(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
@@ -31,7 +31,7 @@ def sglang_jit_qknorm_across_heads(
     fused_inplace_qknorm_across_heads(q, k, q_weight, k_weight)
 
 
-def sglang_aot_qknorm_across_heads(
+def flliper_aot_qknorm_across_heads(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
@@ -112,8 +112,8 @@ def benchmark(
     q_weight = torch.randn(hidden_dim, dtype=DTYPE, device=DEVICE)
     k_weight = torch.randn(hidden_dim, dtype=DTYPE, device=DEVICE)
     FN_MAP = {
-        "jit": sglang_jit_qknorm_across_heads,
-        "aot": sglang_aot_qknorm_across_heads,
+        "jit": flliper_jit_qknorm_across_heads,
+        "aot": flliper_aot_qknorm_across_heads,
         "flashinfer": flashinfer_qknorm_across_heads,
         "torch": torch_impl_qknorm_across_heads,
     }

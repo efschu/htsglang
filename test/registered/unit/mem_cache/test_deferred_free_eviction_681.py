@@ -48,9 +48,9 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.common import alloc_token_slots
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from flliper.srt.mem_cache.common import alloc_token_slots
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -235,12 +235,12 @@ class TheRealAllocatorCarriesTheFlush(unittest.TestCase):
     capability, on the base so every subclass inherits it."""
 
     def test_the_base_allocator_defines_flush_free_group(self):
-        from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+        from flliper.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
         self.assertTrue(hasattr(BaseTokenToKVPoolAllocator, "flush_free_group"))
 
     def test_the_flush_applies_and_keeps_the_group_open(self):
-        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+        from flliper.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 
         a = TokenToKVPoolAllocator.__new__(TokenToKVPoolAllocator)
         a.free_pages = torch.arange(4, dtype=torch.int64)

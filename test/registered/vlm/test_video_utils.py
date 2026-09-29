@@ -2,8 +2,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from sglang.srt.utils import sample_video_frames
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.utils import sample_video_frames
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")

@@ -43,7 +43,7 @@ for d in /proc/[0-9]*; do
   mapfile -d '' -t a < "$d/cmdline" 2>/dev/null || continue
   [ "${#a[@]}" -ge 4 ] || continue
   case "${a[0]}" in *python*) ;; *) continue ;; esac
-  [ "${a[2]}" = "sglang.launch_server" ] || continue
+  [ "${a[2]}" = "flliper.launch_server" ] || continue
   echo "REFUSE: pid ${d#/proc/} is already a live launch_server." >&2
   exit 4
 done

@@ -2,7 +2,7 @@
 
 This folder covers standard dense MHA/GQA/MQA attention through `RadixAttention`.
 Expected outputs come from independent HF-style PyTorch reference modules with
-copied random projection weights, not from another SGLang attention backend.
+copied random projection weights, not from another fLLiper attention backend.
 
 ## Coverage Matrix
 

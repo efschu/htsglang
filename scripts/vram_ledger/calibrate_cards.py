@@ -85,7 +85,7 @@ def resolve_cards(allow_cuda_init: bool = True) -> Tuple[List[dict], Optional[st
     rather than failing the run: the BDF is how a human recognises the card, not
     how this script addresses it.
     """
-    from sglang.srt.rigmon.card_probe import _inventory
+    from flliper.srt.rigmon.card_probe import _inventory
 
     gpus, driver = _inventory()
     if not gpus:
@@ -98,7 +98,7 @@ def resolve_cards(allow_cuda_init: bool = True) -> Tuple[List[dict], Optional[st
     bdf_by_uuid: Dict[str, str] = {}
     nvml_by_uuid: Dict[str, int] = {}
     try:
-        from sglang.srt.registry import nvml as registry_nvml
+        from flliper.srt.registry import nvml as registry_nvml
 
         imap = registry_nvml.identity_map(allow_cuda_init=allow_cuda_init)
         for card in imap.cards:
@@ -129,7 +129,7 @@ def resolve_cards(allow_cuda_init: bool = True) -> Tuple[List[dict], Optional[st
 
 def measure_child(uuid: str) -> int:
     """Measure the visible card and print one JSON object. Runs in the child."""
-    from sglang.srt.mem_ledger.calibration import _measure_one_card
+    from flliper.srt.mem_ledger.calibration import _measure_one_card
 
     try:
         import torch
@@ -298,7 +298,7 @@ def main(argv=None) -> int:
     if args.measure_child:
         return measure_child(args.measure_child)
 
-    from sglang.srt.mem_ledger.calibration import (
+    from flliper.srt.mem_ledger.calibration import (
         CalibrationProfile,
         CardResidual,
         _build_id,

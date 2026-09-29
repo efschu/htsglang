@@ -46,8 +46,8 @@ would undershoot by a whole arming floor and hold that VRAM free forever.
 
 import unittest
 
-from sglang.srt.managers.phase_flip_seam_reserve import solve_pool_tokens
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.phase_flip_seam_reserve import solve_pool_tokens
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

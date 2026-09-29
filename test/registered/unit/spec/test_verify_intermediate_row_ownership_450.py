@@ -67,8 +67,8 @@ from typing import List, Optional
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -300,7 +300,7 @@ class TestEachRunnerOwnsItsVerifyRowSpace(CustomTestCase):
     real."""
 
     def test_lane_runner_is_not_handed_the_host_pool(self):
-        from sglang.srt.model_executor import dual_group_lane
+        from flliper.srt.model_executor import dual_group_lane
 
         src = inspect.getsource(dual_group_lane._build_lane_under_scope)
         self.assertIn("ModelRunner(", src)
@@ -308,13 +308,13 @@ class TestEachRunnerOwnsItsVerifyRowSpace(CustomTestCase):
         self.assertIn("runner.alloc_memory_pool()", src)
 
     def test_runner_only_reuses_a_pool_it_was_handed(self):
-        from sglang.srt.model_executor import model_runner_kv_cache_mixin
+        from flliper.srt.model_executor import model_runner_kv_cache_mixin
 
         src = inspect.getsource(model_runner_kv_cache_mixin)
         self.assertIn("if self.req_to_token_pool is None:", src)
 
     def test_lane_gets_its_own_mamba_slot_count(self):
-        from sglang.srt.model_executor import dual_group_lane
+        from flliper.srt.model_executor import dual_group_lane
 
         src = inspect.getsource(dual_group_lane._lane_server_args_view)
         self.assertIn("view.max_mamba_cache_size = lane_requests + 1", src)
@@ -323,8 +323,8 @@ class TestEachRunnerOwnsItsVerifyRowSpace(CustomTestCase):
         """Neither the row tensor nor the #444/#450a private conv window may
         live at class or module scope -- that would reintroduce the sharing
         the separate pools are there to prevent."""
-        from sglang.srt.layers.attention import hybrid_linear_attn_backend as hlab
-        from sglang.srt.layers.attention.linear import gdn_backend as gdn
+        from flliper.srt.layers.attention import hybrid_linear_attn_backend as hlab
+        from flliper.srt.layers.attention.linear import gdn_backend as gdn
 
         for owner, names in (
             (

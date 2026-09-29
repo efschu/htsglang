@@ -9,7 +9,7 @@ treating symptoms" -- and the structural answer is a single
 ``srt/knob_resolution`` that resolves a knob's precedence ladder and prints
 the result, with the four sites as its callers.
 
-RED AT BASE (b5f3dcbd46). ``sglang.srt.knob_resolution`` does not exist
+RED AT BASE (b5f3dcbd46). ``flliper.srt.knob_resolution`` does not exist
 there, so every test below fails at import. That is the honest statement of
 red-first for a NEW authority, and it is why the suite does not stop at the
 module: the migration guards further down fail on a tree where the module
@@ -21,7 +21,7 @@ WHAT IS DELIBERATELY NOT ASSERTED
 =================================
 That the four sites resolve knobs in the SAME ORDER. They do not, and they
 must not. Env-over-flag is design in this fork -- the server logs "restart
-with SGLANG_...=" after a calibration run and the environment re-applies the
+with FLLIPER_...=" after a calibration run and the environment re-applies the
 measured value without re-parsing ServerArgs (SKILL.md Rule 6, rig-runbook
 section 2) -- while #781 deliberately made the flag authoritative for the
 phase-policy knobs. The authority takes the order as a parameter. A test
@@ -31,7 +31,7 @@ Hermetic: pure AST and pure-function plumbing. No device, no model, no
 server, no process group.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -40,12 +40,12 @@ import math
 import pathlib
 import unittest
 
-from sglang.srt import knob_resolution as K
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import knob_resolution as K
+from flliper.test.test_utils import CustomTestCase
 
 #  .../<root>/test/registered/unit/server_args/<this file>
 _ROOT = pathlib.Path(__file__).resolve().parents[4]
-_SRT = _ROOT / "python" / "sglang" / "srt"
+_SRT = _ROOT / "python" / "flliper" / "srt"
 _SERVER_ARGS = _SRT / "server_args.py"
 
 _AUTHORITY = _SRT / "knob_resolution.py"
@@ -53,7 +53,7 @@ _AUTHORITY = _SRT / "knob_resolution.py"
 #: THE MIGRATED SCOPE, pinned. Four reporters plus the authority itself.
 #:
 #: HONEST ABOUT ITS SIZE. Measured 2026-08-26 at b5f3dcbd46: 648
-#: ``os.environ`` reads in 209 files under ``python/sglang/srt``. This gate
+#: ``os.environ`` reads in 209 files under ``python/flliper/srt``. This gate
 #: covers five of them. A 209-file gate is not a stronger version of this
 #: one -- it would have to ship as an allowlist of hundreds of entries, which
 #: is a document rather than a guard, and every one of them would be reviewed
@@ -96,14 +96,14 @@ class TestTheLadderCarriesEveryShape(CustomTestCase):
         res = K.resolve_knob(
             [
                 K.KnobSource(K.flag_source("decode_stall_slo_s"), 180.0, present=True),
-                K.KnobSource(K.env_source("SGLANG_X"), 12.0, present=True),
+                K.KnobSource(K.env_source("FLLIPER_X"), 12.0, present=True),
                 K.KnobSource(K.PROVENANCE_DEFAULT, 0.0, present=True),
             ]
         )
         self.assertEqual(res.value, 180.0)
         self.assertEqual(res.source, "flag --decode-stall-slo-s")
         self.assertEqual(res.verdict, K.VERDICT_SUPERSEDED)
-        self.assertEqual(res.top_loser.source, "env SGLANG_X")
+        self.assertEqual(res.top_loser.source, "env FLLIPER_X")
 
     def test_a_vector_ladder_compares_with_the_sites_own_equivalence(self):
         """``6,2`` and ``3,1`` are the same ownership split (#897's gcd rule).
@@ -120,7 +120,7 @@ class TestTheLadderCarriesEveryShape(CustomTestCase):
         res = K.resolve_knob(
             [
                 K.KnobSource(
-                    K.env_source("SGLANG_UNEVEN_TOKEN_VECTOR"), [6, 2], present=True
+                    K.env_source("FLLIPER_UNEVEN_TOKEN_VECTOR"), [6, 2], present=True
                 ),
                 K.KnobSource(K.flag_source("rank_kv_ratio"), [3, 1], present=True),
             ],
@@ -133,7 +133,7 @@ class TestTheLadderCarriesEveryShape(CustomTestCase):
         lost = K.resolve_knob(
             [
                 K.KnobSource(
-                    K.env_source("SGLANG_UNEVEN_TOKEN_VECTOR"), [7, 3], present=True
+                    K.env_source("FLLIPER_UNEVEN_TOKEN_VECTOR"), [7, 3], present=True
                 ),
                 K.KnobSource(K.flag_source("rank_kv_ratio"), [3, 7], present=True),
             ],
@@ -294,13 +294,13 @@ class TestThePrintedForms(CustomTestCase):
     def test_every_remedy_says_remove_and_names_the_empty_string_trap(self):
         """One remedy, and the one mistake none of them may advise.
 
-        #894 S5 shipped "unset SGLANG_GGUF_MMQ_DECODE_THRESHOLD", which does
+        #894 S5 shipped "unset FLLIPER_GGUF_MMQ_DECODE_THRESHOLD", which does
         not close that site's own trap: its presence rule is ``is not None``,
         so ``export FOO=`` leaves the override present and still reading as
         OFF. An operator following the shorter advice would change nothing.
         """
-        remedy = K.removal_remedy("SGLANG_FOO")
-        self.assertIn("REMOVE SGLANG_FOO", remedy)
+        remedy = K.removal_remedy("FLLIPER_FOO")
+        self.assertIn("REMOVE FLLIPER_FOO", remedy)
         self.assertIn("not by setting it to an empty string", remedy)
         self.assertIn("server_args.py:5607", remedy)
 
@@ -372,13 +372,13 @@ def _imports_authority(path: pathlib.Path) -> bool:
     tree = ast.parse(path.read_text())
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module in (
-            "sglang.srt",
+            "flliper.srt",
             "srt",
         ):
             if any(a.name == "knob_resolution" for a in node.names):
                 return True
         if isinstance(node, ast.Import):
-            if any(a.name == "sglang.srt.knob_resolution" for a in node.names):
+            if any(a.name == "flliper.srt.knob_resolution" for a in node.names):
                 return True
     return False
 
@@ -419,10 +419,10 @@ class TestEveryMigratedSiteGoesThroughTheAuthority(CustomTestCase):
         importing any of them would recreate the dependency #897 refused."""
         src = _AUTHORITY.read_text()
         for forbidden in (
-            "sglang.srt.managers",
-            "sglang.srt.distributed",
-            "sglang.srt.layers",
-            "sglang.srt.server_args",
+            "flliper.srt.managers",
+            "flliper.srt.distributed",
+            "flliper.srt.layers",
+            "flliper.srt.server_args",
         ):
             self.assertNotIn(forbidden, src)
 
@@ -482,7 +482,7 @@ class TestThe781PublishIsSymmetric(CustomTestCase):
         # both spellings exist and can diverge -- the failure #786 named for
         # the barlink publish, one knob over.
         body = ast.get_source_segment(src, publisher)
-        self.assertNotIn('os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"]', body)
+        self.assertNotIn('os.environ["FLLIPER_UNEVEN_TOKEN_VECTOR"]', body)
 
     def test_the_role_publish_stays_unconditional(self):
         """Symmetry means both halves are VISITED, not that the role became
@@ -509,7 +509,7 @@ class TestThe781PublishIsSymmetric(CustomTestCase):
             and any(
                 isinstance(t, ast.Subscript)
                 and isinstance(t.slice, ast.Constant)
-                and t.slice.value == "SGLANG_UNEVEN_TOKEN_VECTOR_ROLE"
+                and t.slice.value == "FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE"
                 for t in n.targets
             )
         ]
@@ -542,15 +542,15 @@ def _server_args_fields(path: pathlib.Path):
 def flag_twin(env_name: str, fields) -> str:
     """The ServerArgs field an env var shadows, by this tree's own convention.
 
-    ``SGLANG_FOO_BAR`` <-> ``foo_bar``. Stated rather than implied: this is a
+    ``FLLIPER_FOO_BAR`` <-> ``foo_bar``. Stated rather than implied: this is a
     CONVENTION check, not a registry lookup, so a pair whose spellings differ
-    (``SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK`` vs
+    (``FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK`` vs
     ``enable_tp_memory_imbalance_check`` -- note the typo the env kept) is NOT
     detected and will not be caught. Saying so is the point: a guard whose
     reach is overstated is worse than a narrow one, because the next reader
     treats a green run as coverage it does not have.
     """
-    for prefix in ("SGLANG_", "HTSGLANG_", "SGL_"):
+    for prefix in ("FLLIPER_", "HTSGLANG_", "SGL_"):
         if env_name.startswith(prefix):
             candidate = env_name[len(prefix) :].lower()
             if candidate in fields:
@@ -641,7 +641,7 @@ class TestNoNewUnroutedTwinnedEnvRead(CustomTestCase):
             "a knob that has BOTH a --flag and an env var is a precedence "
             "decision, and reading it directly in a migrated module is how "
             "all four of the 2026-08-26 defects went silent. Route it through "
-            "sglang.srt.knob_resolution.resolve_knob, or add it to "
+            "flliper.srt.knob_resolution.resolve_knob, or add it to "
             "_ALLOWED_UNROUTED with a reason.",
         )
 
@@ -695,12 +695,12 @@ class TestNoNewUnroutedTwinnedEnvRead(CustomTestCase):
         probe = pathlib.Path(__file__).with_name("_probe_901.py")
         probe.write_text(
             "import os\n"
-            "_E = 'SGLANG_GGUF_MMQ_DECODE_THRESHOLD'\n"
-            "_UNTWINNED = 'SGLANG_NOT_A_FLAG_ANYWHERE_901'\n"
+            "_E = 'FLLIPER_GGUF_MMQ_DECODE_THRESHOLD'\n"
+            "_UNTWINNED = 'FLLIPER_NOT_A_FLAG_ANYWHERE_901'\n"
             "def by_constant():\n"
             "    return os.environ.get(_E)\n"
             "def by_literal():\n"
-            "    return os.environ['SGLANG_UNEVEN_TOKEN_VECTOR']\n"
+            "    return os.environ['FLLIPER_UNEVEN_TOKEN_VECTOR']\n"
             "def untwinned():\n"
             "    return os.environ.get(_UNTWINNED)\n"
         )
@@ -711,24 +711,24 @@ class TestNoNewUnroutedTwinnedEnvRead(CustomTestCase):
             probe.unlink()
         self.assertEqual(
             twinned,
-            ["SGLANG_GGUF_MMQ_DECODE_THRESHOLD", "SGLANG_UNEVEN_TOKEN_VECTOR"],
+            ["FLLIPER_GGUF_MMQ_DECODE_THRESHOLD", "FLLIPER_UNEVEN_TOKEN_VECTOR"],
         )
         # The untwinned name is seen by the walker and correctly NOT reported:
         # an env var with no flag is not a precedence decision.
-        self.assertIn("SGLANG_NOT_A_FLAG_ANYWHERE_901", {e for _, _, e in reads})
+        self.assertIn("FLLIPER_NOT_A_FLAG_ANYWHERE_901", {e for _, _, e in reads})
 
     def test_the_twin_convention_is_stated_and_bounded(self):
         fields = _server_args_fields(_SERVER_ARGS)
         self.assertEqual(
-            flag_twin("SGLANG_GGUF_MMQ_DECODE_THRESHOLD", fields),
+            flag_twin("FLLIPER_GGUF_MMQ_DECODE_THRESHOLD", fields),
             "gguf_mmq_decode_threshold",
         )
-        self.assertEqual(flag_twin("SGLANG_NO_SUCH_FLAG_901", fields), "")
+        self.assertEqual(flag_twin("FLLIPER_NO_SUCH_FLAG_901", fields), "")
         # The documented blind spot, asserted so it is a known bound rather
         # than an assumption: the env kept the "INBALANCE" typo, the field did
         # not, so the convention cannot pair them.
         self.assertEqual(
-            flag_twin("SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", fields), ""
+            flag_twin("FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK", fields), ""
         )
         self.assertIn("enable_tp_memory_imbalance_check", fields)
 

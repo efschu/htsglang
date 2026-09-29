@@ -19,14 +19,14 @@ import itertools
 
 import pytest
 
-from sglang.srt.form_a_symmetry import (
+from flliper.srt.form_a_symmetry import (
     CollectiveMismatch,
     RankTrace,
     check_symmetry,
     probe_form_a_boot,
     trace_layer,
 )
-from sglang.srt.rank_role import RankRolePlan
+from flliper.srt.rank_role import RankRolePlan
 
 FORM_A = RankRolePlan(("host", "worker", "worker"))
 
@@ -116,7 +116,7 @@ def test_symmetry_is_not_sufficiency_the_simple_form_needs_a_carrier():
     worker computes its experts on rows nobody ever sent it. Harmless to
     model on a classic boot (every rank derives the MoE input itself);
     fatal under Form A, where the value lives on one card."""
-    from sglang.srt.form_a_symmetry import FormAWorkerWithoutMoeInput
+    from flliper.srt.form_a_symmetry import FormAWorkerWithoutMoeInput
 
     with pytest.raises(FormAWorkerWithoutMoeInput) as e:
         _probe(True, False, True, carrier=None)

@@ -7,7 +7,7 @@ WEIGHT-LOAD time, i.e. before the KV budget is profiled -- that is the whole
 point of #63, and it is why the bytes it holds are charged correctly. But it
 refuses two classes of target:
 
-  * over the cap (`SGLANG_GGUF_DEQUANT_WS_CAP_MIB`, default 512 MiB), and
+  * over the cap (`FLLIPER_GGUF_DEQUANT_WS_CAP_MIB`, default 512 MiB), and
   * every target at all when the installed kernel has no `ggml_dequantize(
     ..., out=)` schema.
 
@@ -40,9 +40,9 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.quantization import gguf as G
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization import gguf as G
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -187,7 +187,7 @@ class BudgetSiteTest(_CleanRegistries):
         return r
 
     def _scratch_gb(self, runner):
-        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+        from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
             ModelRunnerKVCacheMixin,
         )
 
@@ -210,7 +210,7 @@ class BudgetSiteTest(_CleanRegistries):
         """
         import inspect
 
-        from sglang.srt.model_executor import model_runner_kv_cache_mixin as M
+        from flliper.srt.model_executor import model_runner_kv_cache_mixin as M
 
         src = inspect.getsource(M.ModelRunnerKVCacheMixin._profile_available_bytes)
         self.assertIn("gguf_scratch_gb = self._gguf_dequant_scratch_gb()", src)

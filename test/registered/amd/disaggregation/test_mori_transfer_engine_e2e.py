@@ -3,11 +3,11 @@ import unittest
 
 import requests
 
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
@@ -26,7 +26,7 @@ class MoriTransferEngineBase(PDDisaggregationServerBase):
 
     # Subclasses can override to pick a different model or pass extra args.
     model_default = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-    model_env_var = "SGLANG_MORI_E2E_TEST_MODEL"
+    model_env_var = "FLLIPER_MORI_E2E_TEST_MODEL"
     extra_prefill_args: list = []
     extra_decode_args: list = []
 
@@ -46,18 +46,18 @@ class MoriTransferEngineBase(PDDisaggregationServerBase):
 
         super().setUpClass()
 
-        cls._old_use_aiter = os.environ.get("SGLANG_USE_AITER")
-        os.environ["SGLANG_USE_AITER"] = "1"
+        cls._old_use_aiter = os.environ.get("FLLIPER_USE_AITER")
+        os.environ["FLLIPER_USE_AITER"] = "1"
 
         # The shared fixture defaults to Mooncake in CI; pin Mori explicitly here.
         cls.transfer_backend = ["--disaggregation-transfer-backend", "mori"]
 
-        rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
+        rdma_env = os.environ.get("FLLIPER_TEST_RDMA_DEVICE")
         if rdma_env:
             cls.rdma_devices = ["--disaggregation-ib-device", rdma_env]
             print(f"Found RDMA devices in env: {rdma_env}")
         else:
-            print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
+            print("FLLIPER_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
         cls._shift_ports()
@@ -83,9 +83,9 @@ class MoriTransferEngineBase(PDDisaggregationServerBase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "_old_use_aiter", None) is None:
-            os.environ.pop("SGLANG_USE_AITER", None)
+            os.environ.pop("FLLIPER_USE_AITER", None)
         else:
-            os.environ["SGLANG_USE_AITER"] = cls._old_use_aiter
+            os.environ["FLLIPER_USE_AITER"] = cls._old_use_aiter
         super().tearDownClass()
 
     @classmethod

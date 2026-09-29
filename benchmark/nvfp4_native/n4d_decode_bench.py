@@ -25,19 +25,19 @@ os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 import torch  # noqa: E402
 
-from sglang.jit_kernel import nvfp4_w4a8_decode as dec  # noqa: E402
-from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack  # noqa: E402
-from sglang.jit_kernel.nvfp4_w4a8 import (  # noqa: E402
+from flliper.jit_kernel import nvfp4_w4a8_decode as dec  # noqa: E402
+from flliper.jit_kernel.gptq_marlin_repack import gptq_marlin_repack  # noqa: E402
+from flliper.jit_kernel.nvfp4_w4a8 import (  # noqa: E402
     nvfp4_w4a8_gemm,
     nvfp4_w4a8_linear,
     nvfp4_w4a8_quantize_activation,
 )
-from sglang.srt.layers.quantization import nvfp4_native_mixed as nm  # noqa: E402
-from sglang.srt.layers.quantization.marlin_utils import (  # noqa: E402
+from flliper.srt.layers.quantization import nvfp4_native_mixed as nm  # noqa: E402
+from flliper.srt.layers.quantization.marlin_utils import (  # noqa: E402
     marlin_make_workspace,
     marlin_permute_scales,
 )
-from sglang.srt.layers.quantization.marlin_utils_fp4 import (  # noqa: E402
+from flliper.srt.layers.quantization.marlin_utils_fp4 import (  # noqa: E402
     apply_fp4_marlin_linear,
     nvfp4_marlin_process_global_scale,
     nvfp4_marlin_process_scales,

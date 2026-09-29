@@ -6,11 +6,11 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
-from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import sparse_mla_q8kv8_prefill_fwd
-from sglang.srt.utils import is_sm90_supported
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
+from flliper.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
+from flliper.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import sparse_mla_q8kv8_prefill_fwd
+from flliper.srt.utils import is_sm90_supported
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.utils import is_in_ci
 
 try:
     from sgl_kernel.flash_mla import flash_mla_sparse_fwd

@@ -23,7 +23,7 @@ server log into anybody's context; they grep and report.
 * `MODEL_ROOT`, `VENV`, `REPO_ROOT` set (or `/root/rig-env.sh` present).
 * `PORT` free; the scripts default to 30428 and fail fast if it is taken.
 * Kill only your own PIDs on the way out. The scripts write their PID to
-  `/tmp/428_<check>.pid` and use it; they never `pkill sglang`.
+  `/tmp/428_<check>.pid` and use it; they never `pkill flliper`.
 
 ## Reserve
 

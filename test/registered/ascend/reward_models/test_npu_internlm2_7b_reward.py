@@ -6,10 +6,10 @@ import unittest
 
 import torch
 
-from sglang.test.ascend.test_ascend_utils import INTERNLM2_7B_REWARD_WEIGHTS_PATH
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.runners import SRTRunner
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ascend.test_ascend_utils import INTERNLM2_7B_REWARD_WEIGHTS_PATH
+from flliper.test.ci.ci_register import register_npu_ci
+from flliper.test.runners import SRTRunner
+from flliper.test.test_utils import CustomTestCase
 
 register_npu_ci(
     est_time=400,
@@ -31,7 +31,7 @@ CONVS = [
 
 class TestInternlm2(CustomTestCase):
     """Testcase: This test case verifies that the Shanghai_AI_Laboratory/internlm2-7b-reward model can successfully generate reward
-    scores for different conversational responses using the SGLang framework, without comparing to a reference implementation.
+    scores for different conversational responses using the fLLiper framework, without comparing to a reference implementation.
 
     [Test Category] Model
     [Test Target] Shanghai_AI_Laboratory/internlm2-7b-reward

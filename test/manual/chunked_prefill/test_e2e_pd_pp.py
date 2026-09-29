@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.test.chunked_prefill_test_utils import ChunkedTestPDBase
+from flliper.test.chunked_prefill_test_utils import ChunkedTestPDBase
 
 
 class TestChunkedFeaturePDPP(ChunkedTestPDBase):

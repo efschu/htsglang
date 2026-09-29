@@ -30,13 +30,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.uneven_perf import (
+from flliper.srt.uneven_perf import (
     PerfCostModel,
     PlanInputs,
     _kv_cell_bytes_from_config,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -94,7 +94,7 @@ def make_model(*, solo: bool, budgets=(30000, 18000, 18000), draft_path=None):
         return DRAFT_CFG if draft_path and p == draft_path else CFG
 
     with patch.object(PerfCostModel, "_load_config", staticmethod(_cfg)), patch(
-        "sglang.srt.distributed.utils._checkpoint_size_mib",
+        "flliper.srt.distributed.utils._checkpoint_size_mib",
         lambda p: 3460 if p == draft_path else 0,
     ):
         return PerfCostModel(plan, base_plan=[1] * TP, budgets_mib=list(budgets))
@@ -281,7 +281,7 @@ class TestSoloHostRuntimeOverhead(CustomTestCase):
             with patch.object(
                 PerfCostModel, "_load_config", staticmethod(_cfg)
             ), patch(
-                "sglang.srt.distributed.utils._checkpoint_size_mib",
+                "flliper.srt.distributed.utils._checkpoint_size_mib",
                 lambda p: 3460 if p == "/nonexistent/dflash" else 0,
             ):
                 m = PerfCostModel(
@@ -307,7 +307,7 @@ class TestSoloHostRuntimeOverhead(CustomTestCase):
             return DRAFT_CFG if pth == "/nonexistent/dflash" else CFG
 
         with patch.object(PerfCostModel, "_load_config", staticmethod(_cfg)), patch(
-            "sglang.srt.distributed.utils._checkpoint_size_mib",
+            "flliper.srt.distributed.utils._checkpoint_size_mib",
             lambda pth: 3460 if pth == "/nonexistent/dflash" else 0,
         ):
             split_b = PerfCostModel(

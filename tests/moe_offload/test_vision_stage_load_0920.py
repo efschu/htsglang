@@ -32,8 +32,8 @@ import struct
 
 import pytest
 
-from sglang.srt.planner import vision_stage as vs
-from sglang.srt.planner import vision_stage_load as vsl
+from flliper.srt.planner import vision_stage as vs
+from flliper.srt.planner import vision_stage_load as vsl
 
 MODEL_DIR = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov"
 HAVE_CHECKPOINT = os.path.exists(

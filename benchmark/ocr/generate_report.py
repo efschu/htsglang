@@ -5,7 +5,7 @@ Requires results saved with --save-raw-outputs.
 
 Usage:
     # 1. Run benchmark with raw outputs saved
-    python benchmark/ocr/bench_sglang.py --port 30000 --split arxiv_math \\
+    python benchmark/ocr/bench_flliper.py --port 30000 --split arxiv_math \\
         --max-samples 20 --save-raw-outputs
 
     # 2. Generate HTML report for a single split

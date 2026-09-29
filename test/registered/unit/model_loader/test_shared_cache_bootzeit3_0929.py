@@ -3,7 +3,7 @@
 
 H2 (store adopt) lets group D take P's EXPERT rows from the host store; the
 dense/embed/lm_head/draft tensors were still read from disk by both groups.
-With SGLANG_WEIGHT_LOADER_SHARED_CACHE=keep (P) / drop (D) they travel through
+With FLLIPER_WEIGHT_LOADER_SHARED_CACHE=keep (P) / drop (D) they travel through
 the page cache: P leaves them there (budgeted), D reads them from there and
 drops each range right after. Off = the plan and the reads are unchanged.
 """
@@ -16,7 +16,7 @@ from unittest import mock
 import torch
 from safetensors.torch import save_file
 
-from sglang.srt.model_loader import weight_utils as W
+from flliper.srt.model_loader import weight_utils as W
 
 MIB = 1 << 20
 
@@ -38,7 +38,7 @@ def _mixed_file(root):
 
 def _collect(paths, mode, extra_env=None, log=False):
     env = {W.COALESCE_ENV: "8"}
-    env["SGLANG_WEIGHT_LOADER_SHARED_CACHE"] = mode
+    env["FLLIPER_WEIGHT_LOADER_SHARED_CACHE"] = mode
     env.update(extra_env or {})
     with mock.patch.dict(os.environ, env, clear=False):
         return list(W.pread_safetensors_stream(
@@ -59,9 +59,9 @@ class TestSharedCache(unittest.TestCase):
             self.assertTrue(torch.equal(x, y), n)
 
     def test_off_by_default(self):
-        with mock.patch.dict(os.environ, {"SGLANG_WEIGHT_LOADER_SHARED_CACHE": ""}):
+        with mock.patch.dict(os.environ, {"FLLIPER_WEIGHT_LOADER_SHARED_CACHE": ""}):
             self.assertEqual(W.shared_cache_mode(), "")
-        with mock.patch.dict(os.environ, {"SGLANG_WEIGHT_LOADER_SHARED_CACHE": "bogus"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_WEIGHT_LOADER_SHARED_CACHE": "bogus"}):
             self.assertEqual(W.shared_cache_mode(), "")
 
     def test_classifier_is_everything_but_experts(self):
@@ -113,7 +113,7 @@ class TestSharedCache(unittest.TestCase):
 
         fd = os.open(self.path, os.O_RDONLY)
         try:
-            with mock.patch.dict(os.environ, {"SGLANG_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB": "1"}):
+            with mock.patch.dict(os.environ, {"FLLIPER_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB": "1"}):
                 c = counters()
                 W._shared_cache_after_read(fd, 0, MIB // 2, "keep", c)
                 W._shared_cache_after_read(fd, 0, MIB, "keep", c)  # would pass 1 MiB

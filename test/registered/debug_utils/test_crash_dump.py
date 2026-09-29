@@ -7,14 +7,14 @@ import unittest
 
 import requests
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -35,7 +35,7 @@ class TestCrashDump(CustomTestCase):
     def setUpClass(cls):
         cls.crash_dump_folder = tempfile.mkdtemp(prefix="crash_dump_test_")
 
-        with envs.SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS.override(
+        with envs.FLLIPER_TEST_CRASH_AFTER_STREAM_OUTPUTS.override(
             cls.NUM_REQUESTS_BEFORE_CRASH * cls.MAX_NEW_TOKENS + 10
         ):
             cls.process = popen_launch_server(

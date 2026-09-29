@@ -57,9 +57,9 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt import uneven_perf
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import uneven_perf
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
@@ -162,7 +162,7 @@ def _profile():
 
 #: The #354 boots ran with the bf16 SSM state; the model reads it from the
 #: environment.
-_ENV = {"SGLANG_MAMBA_SSM_DTYPE": "bfloat16"}
+_ENV = {"FLLIPER_MAMBA_SSM_DTYPE": "bfloat16"}
 
 
 def _args(
@@ -525,7 +525,7 @@ class TestTheCapacityModeGateIsNotBlind(CustomTestCase):
         corridor is a decision, not an error. Forced here by setting the
         corridor so wide that the accepted vector must fall inside it."""
         with mock.patch.dict(
-            os.environ, {"SGLANG_PLANNER_CORRIDOR_MIB": "100000"}
+            os.environ, {"FLLIPER_PLANNER_CORRIDOR_MIB": "100000"}
         ):
             sa, log = _plan(model=_MODELS["fp8"], tune="phase-prefill")
         self.assertIn("CORRIDOR-TIGHT", log)
@@ -542,7 +542,7 @@ class TestTheFlagAcceptsTheArmsByName(CustomTestCase):
     are NOT phase arms must keep their side effects."""
 
     def test_both_arms_are_valid_perf_tune_targets(self):
-        from sglang.srt.server_args import _RANK_PERF_TUNE_CHOICES
+        from flliper.srt.server_args import _RANK_PERF_TUNE_CHOICES
 
         for tune in ("phase-prefill", "phase-decode"):
             self.assertIn(tune, _RANK_PERF_TUNE_CHOICES)
@@ -550,7 +550,7 @@ class TestTheFlagAcceptsTheArmsByName(CustomTestCase):
     def test_phase_decode_does_not_silently_switch_the_kv_mode(self):
         """``dec`` selects --rank-kv-ratio speed; ``phase-decode`` must not --
         the decode numbers #354 quotes are from a coupled-KV boot."""
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         for tune, expected in (
             ("dec", "speed"),
@@ -567,7 +567,7 @@ class TestTheFlagAcceptsTheArmsByName(CustomTestCase):
                 self.assertEqual(view.rank_kv_ratio, expected)
 
     def test_an_unknown_target_is_still_refused(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         view = types.SimpleNamespace(
             rank_perf_loose_ctx_percent=0.0,

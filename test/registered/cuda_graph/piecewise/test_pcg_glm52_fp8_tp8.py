@@ -1,10 +1,10 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -48,7 +48,7 @@ class TestBCGGlm52Fp8TP8(CustomTestCase):
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
             env={
-                "SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM": "1",
+                "FLLIPER_ENABLE_PCG_DSV2_DUAL_STREAM": "1",
             },
         )
 

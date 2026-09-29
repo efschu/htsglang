@@ -1,8 +1,8 @@
 import types
 import unittest
 
-from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 

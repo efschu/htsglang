@@ -9,15 +9,15 @@ case gets the red-first test; the rest pin that the default path did not move.
 
 import pytest
 
-from sglang.srt.distributed import parallel_state as ps
-from sglang.srt.mem_cache.decoupled_kv_arming import (
+from flliper.srt.distributed import parallel_state as ps
+from flliper.srt.mem_cache.decoupled_kv_arming import (
     DecoupledKvArmingError,
     arm_decoupled_kv,
     arm_for_cutover,
     record_pool_plan,
     reset_recorded_pool_plan,
 )
-from sglang.srt.mem_cache.decoupled_kv_pool_plan import (
+from flliper.srt.mem_cache.decoupled_kv_pool_plan import (
     DECOUPLED,
     STAGE_LOCAL,
     plan_for_rank,
@@ -194,7 +194,7 @@ def test_the_attention_merge_group_RESOLVES_PER_ACCESS(routes):
     it ever caches, arming would silently stop taking effect after the first
     read -- so pin the resolution, not just the value.
     """
-    from sglang.srt.runtime_context import get_parallel
+    from flliper.srt.runtime_context import get_parallel
 
     record_pool_plan(_decoupled())
     assert get_parallel().dcp_group.name == "primary"
@@ -231,7 +231,7 @@ def test_the_row_count_comes_from_dcp_compact_pool_rows():
     """CAN-FAIL: round(share * C) would floor here, and flooring is the
     off-by-one that already cost an out-of-bounds-scatter debugging round
     (owner.py:155-181). Chosen so the two rules DISAGREE."""
-    from sglang.srt.layers.dcp.owner import dcp_compact_pool_rows
+    from flliper.srt.layers.dcp.owner import dcp_compact_pool_rows
 
     # C divisible by the period is where the ceil is a WHOLE extra block and
     # the two rules are furthest apart: 200 exact rows vs 204 ceiled.
@@ -248,7 +248,7 @@ def test_the_row_count_comes_from_dcp_compact_pool_rows():
 def test_world_conservation_tolerates_the_ceil_but_not_a_lost_rank():
     """The ceil adds at most `period` rows across the world; a missing rank
     loses far more, and the check must still catch that."""
-    from sglang.srt.mem_cache.decoupled_kv_pool_plan import validate_world_conservation
+    from flliper.srt.mem_cache.decoupled_kv_pool_plan import validate_world_conservation
 
     bands = ((0, 2), (2, 7), (7, 16))
     plans = [
@@ -263,7 +263,7 @@ def test_world_conservation_tolerates_the_ceil_but_not_a_lost_rank():
 
 
 def test_ranks_disagreeing_about_the_period_are_caught():
-    from sglang.srt.mem_cache.decoupled_kv_pool_plan import validate_world_conservation
+    from flliper.srt.mem_cache.decoupled_kv_pool_plan import validate_world_conservation
 
     a = plan_for_rank(ATTN, 0, 28, T, CELL, armed=True, share=0.5, period=16)
     b = plan_for_rank(ATTN, 0, 28, T, CELL, armed=True, share=0.5, period=8)
@@ -280,9 +280,9 @@ def test_the_build_override_is_INERT_unless_explicitly_enabled(monkeypatch):
     than a reconstructed copy -- which is what makes 'unchanged' mean
     unchanged instead of 'recomputed the same way'.
     """
-    import sglang.srt.model_executor.model_runner_kv_cache_mixin as mx
+    import flliper.srt.model_executor.model_runner_kv_cache_mixin as mx
 
-    monkeypatch.delenv("SGLANG_DECOUPLED_KV", raising=False)
+    monkeypatch.delenv("FLLIPER_DECOUPLED_KV", raising=False)
     ids, size = mx.ModelRunnerKVCacheMixin._decoupled_kv_pool_override(
         object(), ATTN, 12345
     )
@@ -296,7 +296,7 @@ def test_the_build_site_uses_the_override_result(routes):
     import ast
     import inspect
 
-    import sglang.srt.model_executor.model_runner_kv_cache_mixin as mx
+    import flliper.srt.model_executor.model_runner_kv_cache_mixin as mx
 
     tree = ast.parse(inspect.getsource(mx))
     calls = [

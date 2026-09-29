@@ -7,7 +7,7 @@ Validates that:
 4. return_logprob path works with the aiter greedy branch
 
 The kernel is designed for production LLM inference (large vocab, bf16) and is
-used when SGLANG_USE_AITER=1 on ROCm.
+used when FLLIPER_USE_AITER=1 on ROCm.
 """
 
 import unittest
@@ -15,15 +15,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.utils.common import is_hip
-from sglang.test.ci.ci_register import register_amd_ci
+from flliper.srt.utils.common import is_hip
+from flliper.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 
 def _mock_global_server_args(backend="pytorch"):
-    from sglang.srt.layers import sampler as sampler_mod
-    from sglang.srt.server_args import (
+    from flliper.srt.layers import sampler as sampler_mod
+    from flliper.srt.server_args import (
         ServerArgs,
         set_global_server_args_for_scheduler,
     )
@@ -38,13 +38,13 @@ def _mock_global_server_args(backend="pytorch"):
         device_group = None
 
     sampler_mod.get_tp_group = lambda: _DummyTPGroup()
-    from sglang.srt.runtime_context import get_flags
+    from flliper.srt.runtime_context import get_flags
 
     get_flags().dp.enabled = False
 
 
 def _make_sampling_info(batch_size, vocab_size, device="cuda"):
-    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from flliper.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
     return SamplingBatchInfo(
         temperatures=torch.ones(batch_size, 1, device=device, dtype=torch.float),
@@ -186,8 +186,8 @@ class TestAiterGreedyIntegration(unittest.TestCase):
         torch.cuda.manual_seed_all(42)
 
     def _run_sampler(self, use_aiter, logits, sampling_info, return_logprob=False):
-        from sglang.srt.layers import sampler as sampler_mod
-        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from flliper.srt.layers import sampler as sampler_mod
+        from flliper.srt.layers.logits_processor import LogitsProcessorOutput
 
         _mock_global_server_args()
 

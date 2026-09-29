@@ -47,7 +47,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60)
 
@@ -98,7 +98,7 @@ def _worker(rank, init_file, out_dir, case):
         dist.init_process_group(
             "gloo", init_method=f"file://{init_file}", rank=rank, world_size=WORLD
         )
-        from sglang.srt.managers.gdn_flip_mover import agree_mamba_slots
+        from flliper.srt.managers.gdn_flip_mover import agree_mamba_slots
 
         if case == "diverging":
             local = torch.tensor(SETS[rank], dtype=torch.int64)

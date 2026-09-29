@@ -12,10 +12,10 @@ set -u
 
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 PY="${GATE_PY:-/spinning/htsglang-gpu/.venv/bin/python3}"
-URC="$WT/python/sglang/srt/mem_cache/unified_radix_cache.py"
-CC="$WT/python/sglang/srt/managers/cache_controller.py"
-HPB="$WT/python/sglang/srt/mem_cache/hicache_phase_binding.py"
-PPC="$WT/python/sglang/srt/mem_cache/producer_phase_census.py"
+URC="$WT/python/flliper/srt/mem_cache/unified_radix_cache.py"
+CC="$WT/python/flliper/srt/managers/cache_controller.py"
+HPB="$WT/python/flliper/srt/mem_cache/hicache_phase_binding.py"
+PPC="$WT/python/flliper/srt/mem_cache/producer_phase_census.py"
 T="$WT/test/registered/unit/mem_cache/test_producer_phase_census_wiring_1061.py"
 
 cp "$URC" /tmp/1061_urc.orig

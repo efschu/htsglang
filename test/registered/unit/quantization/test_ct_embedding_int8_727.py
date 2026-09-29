@@ -28,15 +28,15 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.base_config import (
+from flliper.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
-from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+from flliper.srt.layers.quantization.compressed_tensors.ct_embedding import (
     CompressedTensorsEmbeddingMethod,
     is_compressed_tensors_config,
     vocab_is_quantized,
 )
-from sglang.srt.layers.vocab_parallel_embedding import (
+from flliper.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     VocabParallelEmbeddingShardIndices,
 )
@@ -158,7 +158,7 @@ class TestTheFamilyGateActuallyMatches(unittest.TestCase):
     """
 
     def _real_config(self):
-        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
             CompressedTensorsConfig,
         )
 

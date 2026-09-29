@@ -4,16 +4,16 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_registry import (
+from flliper.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
+from flliper.srt.speculative.spec_registry import (
     _REGISTRY,
     CustomSpecAlgo,
     _assert_custom_spec_algo_conforms,
     _reserved_names,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -169,7 +169,7 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         # removed V1 path is surfaced as a deprecation warning at create time.
         server_args = MagicMock()
         server_args.disable_overlap_schedule = True
-        with self.assertLogs("sglang.srt.speculative.spec_registry", "WARNING") as logs:
+        with self.assertLogs("flliper.srt.speculative.spec_registry", "WARNING") as logs:
             self.algo.create_worker(server_args)
         self.assertTrue(any("deprecated" in line for line in logs.output))
 

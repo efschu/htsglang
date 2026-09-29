@@ -12,14 +12,14 @@ from bench_multiturn import (
 )
 from tqdm.asyncio import tqdm
 
-from sglang.benchmark.utils import get_tokenizer
-from sglang.test.kits.cache_hit_kit import async_request_sglang_generate
+from flliper.benchmark.utils import get_tokenizer
+from flliper.test.kits.cache_hit_kit import async_request_flliper_generate
 
 
 class ContextWorkloadGenerator(WorkloadGenerator):
     def __init__(self, args):
         self.url = f"http://{args.host}:{args.port}/generate"
-        self.request_func = async_request_sglang_generate
+        self.request_func = async_request_flliper_generate
 
         self.tokenizer = get_tokenizer(args.model_path)
         self.distribution = args.distribution

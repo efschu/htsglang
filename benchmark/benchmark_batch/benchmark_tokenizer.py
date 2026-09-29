@@ -5,7 +5,7 @@ from statistics import mean
 
 from transformers import AutoTokenizer
 
-from sglang.srt.utils.patch_tokenizer import patch_tokenizer
+from flliper.srt.utils.patch_tokenizer import patch_tokenizer
 
 
 def main():

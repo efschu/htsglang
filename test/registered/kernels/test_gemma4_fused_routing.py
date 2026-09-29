@@ -1,6 +1,6 @@
 """Correctness tests for ``gemma4_fused_routing``.
 
-Compares the Triton-fused routing kernel against the original SGLang
+Compares the Triton-fused routing kernel against the original fLLiper
 ``Gemma4MoE.routing_function`` reference (softmax-of-topk * per_expert_scale).
 Run with::
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def fused_routing():
-    from sglang.srt.layers.gemma4_fused_ops import gemma4_fused_routing
+    from flliper.srt.layers.gemma4_fused_ops import gemma4_fused_routing
 
     return gemma4_fused_routing
 

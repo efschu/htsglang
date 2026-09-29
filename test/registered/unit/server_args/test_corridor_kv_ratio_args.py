@@ -12,9 +12,9 @@ configurations it refuses, not how the ledger prices a card.
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.server_args import ServerArgs, _parse_rank_kv_ratio
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs, _parse_rank_kv_ratio
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

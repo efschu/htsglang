@@ -13,10 +13,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.speculative.dflash_utils import (
+from flliper.srt.speculative.dflash_utils import (
     build_dflash_verify_target_probs,
 )
-from sglang.srt.speculative.spec_info import (
+from flliper.srt.speculative.spec_info import (
     reject_frozen_kv_mtp_verify_under_dcp,
     reject_ngram_verify_under_dcp,
 )
@@ -107,7 +107,7 @@ def test_fused_context_kv_explicit_true_stays_true():
 )
 def test_dflash_model_class_flags(klass_name, expected):
     """Import the real model classes and verify their declared flags."""
-    from sglang.srt.models.dflash import (
+    from flliper.srt.models.dflash import (
         DFlashDraftModel,
         DFlashLagunaForCausalLM,
     )

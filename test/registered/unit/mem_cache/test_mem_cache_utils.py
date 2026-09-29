@@ -7,7 +7,7 @@ import unittest
 from array import array
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.evict_policy import (
+from flliper.srt.mem_cache.evict_policy import (
     FIFOStrategy,
     FILOStrategy,
     LFUStrategy,
@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.evict_policy import (
     PriorityStrategy,
     SLRUStrategy,
 )
-from sglang.srt.mem_cache.utils import (
+from flliper.srt.mem_cache.utils import (
     compute_node_hash_values,
     get_eviction_strategy,
     get_hash_str,
@@ -24,7 +24,7 @@ from sglang.srt.mem_cache.utils import (
     maybe_init_custom_mem_pool,
     split_node_hash_value,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -182,7 +182,7 @@ class TestGetEvictionStrategy(unittest.TestCase):
 
 
 class TestMaybeInitCustomMemPool(unittest.TestCase):
-    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
+    @patch("flliper.srt.mem_cache.utils.envs.FLLIPER_MOONCAKE_CUSTOM_MEM_POOL.get")
     def test_disabled_by_default(self, mock_env_get):
         mock_env_get.return_value = None
         enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
@@ -190,20 +190,20 @@ class TestMaybeInitCustomMemPool(unittest.TestCase):
         self.assertIsNone(pool)
         self.assertIsNone(pool_type)
 
-    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
+    @patch("flliper.srt.mem_cache.utils.envs.FLLIPER_MOONCAKE_CUSTOM_MEM_POOL.get")
     def test_enabled_via_env(self, mock_env_get):
         mock_env_get.return_value = "enabled"
         mock_init = MagicMock()
         mock_init.return_value = (True, "mock_pool_instance", "mooncake")
 
-        mooncake_pkg = types.ModuleType("sglang.srt.disaggregation.mooncake")
-        mooncake_utils = types.ModuleType("sglang.srt.disaggregation.mooncake.utils")
+        mooncake_pkg = types.ModuleType("flliper.srt.disaggregation.mooncake")
+        mooncake_utils = types.ModuleType("flliper.srt.disaggregation.mooncake.utils")
         mooncake_utils.init_mooncake_custom_mem_pool = mock_init
         with patch.dict(
             sys.modules,
             {
-                "sglang.srt.disaggregation.mooncake": mooncake_pkg,
-                "sglang.srt.disaggregation.mooncake.utils": mooncake_utils,
+                "flliper.srt.disaggregation.mooncake": mooncake_pkg,
+                "flliper.srt.disaggregation.mooncake.utils": mooncake_utils,
             },
         ):
             enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")

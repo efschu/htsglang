@@ -43,7 +43,7 @@ QUANTUM = 128  # what an AudioWorklet hands over per call
 
 CLIENT = (
     Path(__file__).resolve().parents[3]
-    / "python/sglang/srt/translator/client/index.html"
+    / "python/flliper/srt/translator/client/index.html"
 )
 
 

@@ -31,15 +31,15 @@ mkdir -p "$OUT"
 
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$WT/python"
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 
 MLP_FLAG=()
 [ "$MLP" != "auto" ] && MLP_FLAG=(--rank-mlp-ratio "$MLP")
 
 cd "$WT"
-setsid "$PY" -m sglang.launch_server \
+setsid "$PY" -m flliper.launch_server \
   --model-path "$MODEL" \
   --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
   --rank-perf-tune enc \

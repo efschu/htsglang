@@ -6,13 +6,13 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.pool_host.mha import (
+from flliper.srt.mem_cache.pool_host.mha import (
     AsymmetricMHATokenToKVPoolHost,
     MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -88,7 +88,7 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
 
         with mock.patch(
-            "sglang.srt.mem_cache.pool_host.mha.transfer_kv_per_layer_mla_pf_lf",
+            "flliper.srt.mem_cache.pool_host.mha.transfer_kv_per_layer_mla_pf_lf",
             create=True,
         ) as transfer:
             host.load_to_device_per_layer(
@@ -119,7 +119,7 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
 
         with mock.patch(
-            "sglang.srt.mem_cache.pool_host.mha.transfer_kv_all_layer_mla_lf_pf",
+            "flliper.srt.mem_cache.pool_host.mha.transfer_kv_all_layer_mla_lf_pf",
             create=True,
         ) as transfer:
             host.backup_from_device_all_layer(
@@ -146,7 +146,7 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
 
         with mock.patch(
-            "sglang.srt.mem_cache.pool_host.mha.transfer_kv_per_layer_direct_pf_lf",
+            "flliper.srt.mem_cache.pool_host.mha.transfer_kv_per_layer_direct_pf_lf",
             create=True,
         ) as transfer:
             host.load_to_device_per_layer(
@@ -175,7 +175,7 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
 
         with mock.patch(
-            "sglang.srt.mem_cache.pool_host.mha.transfer_kv_all_layer_direct_lf_pf",
+            "flliper.srt.mem_cache.pool_host.mha.transfer_kv_all_layer_direct_lf_pf",
             create=True,
         ) as transfer:
             host.backup_from_device_all_layer(

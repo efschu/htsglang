@@ -25,15 +25,15 @@ per-card memory read are all injected.
 import unittest
 from unittest.mock import patch
 
-import sglang.srt.server_args as server_args_module
-from sglang.srt.planner.feasibility import validate_plan_inputs
-from sglang.srt.planner.hardware import GpuDescriptor, HardwareSpec
-from sglang.srt.registry import nvml as registry_nvml
-from sglang.srt.registry.nvml import DeviceInfo, MemoryInfo
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.uneven_perf import PlanInputs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.server_args as server_args_module
+from flliper.srt.planner.feasibility import validate_plan_inputs
+from flliper.srt.planner.hardware import GpuDescriptor, HardwareSpec
+from flliper.srt.registry import nvml as registry_nvml
+from flliper.srt.registry.nvml import DeviceInfo, MemoryInfo
+from flliper.srt.server_args import ServerArgs
+from flliper.srt.uneven_perf import PlanInputs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

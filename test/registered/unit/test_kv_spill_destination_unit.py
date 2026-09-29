@@ -20,10 +20,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sglang.srt.managers.kv_session_spill_destination as kd
-from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
-from sglang.srt.managers.kv_session_spill_destination import (
+import flliper.srt.managers.kv_session_spill_destination as kd
+from flliper.srt.managers.kv_session_offload import KVSessionOffloadManager
+from flliper.srt.managers.schedule_batch import FINISH_ABORT
+from flliper.srt.managers.kv_session_spill_destination import (
     ALL_STORAGE_BACKENDS,
     DestinationTier,
     META_BLOB_BYTES,
@@ -93,7 +93,7 @@ def test_destinations_known_but_unsupported_backends_are_named():
 
 
 def test_backend_namespace_mirrors_factory_registry():
-    from sglang.srt.mem_cache.storage.backend_factory import (
+    from flliper.srt.mem_cache.storage.backend_factory import (
         StorageBackendFactory,
     )
 
@@ -783,8 +783,8 @@ def test_park_instead_of_demote_seam():
 
 
 def _file_tier(tmp_path):
-    os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = str(tmp_path)
-    from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+    os.environ["FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR"] = str(tmp_path)
+    from flliper.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 
     cfg = HiCacheStorageConfig(
         tp_rank=0,
@@ -804,7 +804,7 @@ def _file_tier(tmp_path):
             "file", storage_config=cfg, mem_pool_host=None, extra_config=None
         )
     finally:
-        del os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"]
+        del os.environ["FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR"]
 
 
 def test_park_unpark_roundtrip_real_file_backend(tmp_path):
@@ -884,7 +884,7 @@ def test_admission_reduce_consumes_flags_when_armed():
 
 
 def test_spill_slot_default_has_park_pending_false():
-    from sglang.srt.managers.kv_session_offload import SpillSlot
+    from flliper.srt.managers.kv_session_offload import SpillSlot
 
     slot = SpillSlot(
         req=SimpleNamespace(), region=0, spill_iter=0, wave=None, hysteresis=None
@@ -984,7 +984,7 @@ def _fake_server_args(**over):
 
 
 def _validate(ns):
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     ServerArgs._handle_kv_session_offload(ns)
 
@@ -996,7 +996,7 @@ def test_server_args_default_validates_without_destinations():
 def test_server_args_dataclass_defaults():
     import dataclasses
 
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     fields = {f.name: f for f in dataclasses.fields(ServerArgs)}
     assert fields["kv_session_offload_destinations"].default is None
@@ -1063,7 +1063,7 @@ def test_server_args_help_names_the_order_reality():
     # GDN residency decision.
     import typing
 
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     hints = typing.get_type_hints(ServerArgs, include_extras=True)
     (arg_meta,) = hints["kv_session_offload_destinations"].__metadata__

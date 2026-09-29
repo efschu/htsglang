@@ -6,8 +6,8 @@ python3 offline_batch_inference.py  --model meta-llama/Llama-3.1-8B-Instruct
 import argparse
 import dataclasses
 
-import sglang as sgl
-from sglang.srt.server_args import ServerArgs
+import flliper as sgl
+from flliper.srt.server_args import ServerArgs
 
 
 def main(

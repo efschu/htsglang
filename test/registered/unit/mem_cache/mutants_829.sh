@@ -6,7 +6,7 @@ set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Four levels up from test/registered/unit/mem_cache/ is the tree root.
 ROOT=${ROOT:-$(cd "$HERE/../../../.." && pwd)}
-MOD=$ROOT/python/sglang/srt/mem_cache/hicache_collective.py
+MOD=$ROOT/python/flliper/srt/mem_cache/hicache_collective.py
 PY=${PY:-/spinning/htsglang-gpu/.venv/bin/python}
 BAK=$(mktemp); cp "$MOD" "$BAK"
 trap 'cp "$BAK" "$MOD"; rm -f "$BAK"' EXIT

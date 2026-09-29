@@ -22,8 +22,8 @@ import unittest
 
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -42,12 +42,12 @@ def _worker(rank, store, q, salt_for_rank):
         # custom-AR gates are env-uniform (deliberately device-blind), so
         # a device-masked world would still construct them and die on the
         # cpu device. Mask the constructors, not the gate semantics.
-        import sglang.srt.distributed.parallel_state as _ps
+        import flliper.srt.distributed.parallel_state as _ps
 
         _ps.should_build_pynccl = lambda *a, **k: False
         _ps.should_build_custom_allreduce = lambda *a, **k: False
 
-        from sglang.srt.distributed.parallel_state import (
+        from flliper.srt.distributed.parallel_state import (
             get_pp_group,
             get_phase_flip_group,
             get_tp_group,

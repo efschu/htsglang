@@ -26,8 +26,8 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.translator.backends import AudioChunk
-from sglang.srt.translator.voices import PresetVoice, VoicePool, VoiceClass
+from flliper.srt.translator.backends import AudioChunk
+from flliper.srt.translator.voices import PresetVoice, VoicePool, VoiceClass
 from test_audio_and_http import (  # noqa: E402  - sibling helper module
     LANG_A,
     LANG_B,

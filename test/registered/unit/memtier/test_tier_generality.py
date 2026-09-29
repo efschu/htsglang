@@ -48,20 +48,20 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.srt.memtier import bootstrap, fingerprint as fp_mod
-from sglang.srt.memtier.bootstrap import BOOTSTRAP_PROFILE_ID, bootstrap_tiers
-from sglang.srt.memtier.fingerprint import MatchScope, fingerprint_from_facts
-from sglang.srt.memtier.profile import (
+from flliper.srt.memtier import bootstrap, fingerprint as fp_mod
+from flliper.srt.memtier.bootstrap import BOOTSTRAP_PROFILE_ID, bootstrap_tiers
+from flliper.srt.memtier.fingerprint import MatchScope, fingerprint_from_facts
+from flliper.srt.memtier.profile import (
     BUNDLED_PROFILE_PATH,
     CardFact,
     FilesystemFact,
     LocalFacts,
 )
-from sglang.srt.memtier.profile_store import select_profile
-from sglang.srt.memtier.registry import TierRegistry
-from sglang.srt.memtier.tiers import TierKind, Volatility
-from sglang.srt.planner.cost_model import Provenance
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.memtier.profile_store import select_profile
+from flliper.srt.memtier.registry import TierRegistry
+from flliper.srt.memtier.tiers import TierKind, Volatility
+from flliper.srt.planner.cost_model import Provenance
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

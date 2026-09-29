@@ -30,7 +30,7 @@ Hermetic: pure arithmetic, no CUDA.
 
 import pytest
 
-from sglang.srt.planner.calibration_coverage import (
+from flliper.srt.planner.calibration_coverage import (
     calibration_coverage,
     publishable_intercept,
     suggest_rank_moving_arm,

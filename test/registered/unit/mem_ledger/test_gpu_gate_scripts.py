@@ -79,7 +79,7 @@ def test_calibration_fingerprint_matches_what_the_boot_will_look_up(monkeypatch)
     live_fingerprint does, it would write a perfectly good calibration under a
     key the boot never looks up -- the cache would miss forever while a
     valid-looking file sat next to it."""
-    from sglang.srt.mem_ledger import calibration as calib
+    from flliper.srt.mem_ledger import calibration as calib
 
     inventory = (
         [
@@ -89,7 +89,7 @@ def test_calibration_fingerprint_matches_what_the_boot_will_look_up(monkeypatch)
         "580.00",
     )
     monkeypatch.setattr(calib, "_build_id", lambda: "torch2.9+cuda13")
-    monkeypatch.setattr("sglang.srt.rigmon.card_probe._inventory", lambda: inventory)
+    monkeypatch.setattr("flliper.srt.rigmon.card_probe._inventory", lambda: inventory)
 
     script = load("calibrate_cards.py")
     cards, driver = script.resolve_cards(allow_cuda_init=False)
@@ -102,14 +102,14 @@ def test_calibration_fingerprint_matches_what_the_boot_will_look_up(monkeypatch)
 def test_resolve_cards_survives_a_missing_identity_map(monkeypatch):
     """The BDF is how a human recognises a card, not how the script addresses
     it; losing the map must degrade the display, not the run."""
-    from sglang.srt.mem_ledger import calibration as calib  # noqa: F401
+    from flliper.srt.mem_ledger import calibration as calib  # noqa: F401
 
     monkeypatch.setattr(
-        "sglang.srt.rigmon.card_probe._inventory",
+        "flliper.srt.rigmon.card_probe._inventory",
         lambda: ([{"uuid": "GPU-aaa", "cuda_index": 0, "name": "RTX 5090"}], "580"),
     )
     monkeypatch.setattr(
-        "sglang.srt.registry.nvml.identity_map",
+        "flliper.srt.registry.nvml.identity_map",
         lambda **kw: (_ for _ in ()).throw(RuntimeError("no nvml")),
     )
     script = load("calibrate_cards.py")
@@ -120,7 +120,7 @@ def test_resolve_cards_survives_a_missing_identity_map(monkeypatch):
 
 
 def test_no_cards_is_a_named_failure_not_an_empty_success(monkeypatch):
-    monkeypatch.setattr("sglang.srt.rigmon.card_probe._inventory", lambda: ([], None))
+    monkeypatch.setattr("flliper.srt.rigmon.card_probe._inventory", lambda: ([], None))
     script = load("calibrate_cards.py")
     with pytest.raises(RuntimeError) as excinfo:
         script.resolve_cards(allow_cuda_init=False)
@@ -212,7 +212,7 @@ def test_a_partial_measurement_writes_nothing(calibrate, monkeypatch, tmp_path, 
     makes that card's term unbounded later, which reads as a ledger bug rather
     than as this incomplete run."""
     monkeypatch.setattr(
-        "sglang.srt.rigmon.card_probe._inventory",
+        "flliper.srt.rigmon.card_probe._inventory",
         lambda: (
             [
                 {"uuid": "GPU-aaa", "cuda_index": 0, "name": "RTX 5090"},
@@ -222,7 +222,7 @@ def test_a_partial_measurement_writes_nothing(calibrate, monkeypatch, tmp_path, 
         ),
     )
     monkeypatch.setattr(
-        "sglang.srt.registry.nvml.identity_map",
+        "flliper.srt.registry.nvml.identity_map",
         lambda **kw: (_ for _ in ()).throw(RuntimeError("no map")),
     )
 
@@ -251,11 +251,11 @@ def test_a_partial_measurement_writes_nothing(calibrate, monkeypatch, tmp_path, 
 
 def test_dry_run_touches_no_gpu(calibrate, monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(
-        "sglang.srt.rigmon.card_probe._inventory",
+        "flliper.srt.rigmon.card_probe._inventory",
         lambda: ([{"uuid": "GPU-aaa", "cuda_index": 0, "name": "RTX 5090"}], "580"),
     )
     monkeypatch.setattr(
-        "sglang.srt.registry.nvml.identity_map",
+        "flliper.srt.registry.nvml.identity_map",
         lambda **kw: (_ for _ in ()).throw(RuntimeError("no map")),
     )
 
@@ -458,14 +458,14 @@ def test_parser_round_trips_the_REAL_ledger_renderer(compare_mod, tmp_path):
     harness reports "no itemization" on a real ledger boot -- inside the GPU
     window, where there is no time to debug a regex.
     """
-    from sglang.srt.mem_ledger.engine import (
+    from flliper.srt.mem_ledger.engine import (
         TERM_ACTIVATION,
         TERM_HARDWARE_RESIDUAL,
         CardFacts,
         DemandInputs,
         build_card_ledgers,
     )
-    from sglang.srt.mem_ledger.terms import render_all
+    from flliper.srt.mem_ledger.terms import render_all
 
     class Residual:
         uuid = "GPU-bbb"
@@ -528,7 +528,7 @@ def test_unresolvable_cards_print_a_message_not_a_traceback(
     """An operator in a hermetic shell (CUDA_VISIBLE_DEVICES=99) must be told
     why, not handed a stack trace."""
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "99")
-    monkeypatch.setattr("sglang.srt.rigmon.card_probe._inventory", lambda: ([], None))
+    monkeypatch.setattr("flliper.srt.rigmon.card_probe._inventory", lambda: ([], None))
     rc = calibrate.main(["--dry-run", "--cache-dir", str(tmp_path)])
     out = capsys.readouterr().out
     assert rc == 1

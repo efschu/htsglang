@@ -82,7 +82,7 @@ Hermetic: CPU tensors, real ``ReqToTokenPool``, real
 ``rebind_req_pool_for_cutover``, no accelerator, no scheduler, no GPU.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -91,14 +91,14 @@ import pathlib
 import types
 import unittest
 
-from sglang.srt.managers import phase_flip_runtime as pfr
-from sglang.srt.managers import phase_req_pool_binding as prpb
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers import phase_flip_runtime as pfr
+from flliper.srt.managers import phase_req_pool_binding as prpb
+from flliper.srt.mem_cache.memory_pool import ReqToTokenPool
+from flliper.test.test_utils import CustomTestCase
 
 _REPO = pathlib.Path(__file__).resolve().parents[4]
 _RUNTIME_SRC = (
-    _REPO / "python" / "sglang" / "srt" / "managers" / "phase_flip_runtime.py"
+    _REPO / "python" / "flliper" / "srt" / "managers" / "phase_flip_runtime.py"
 )
 
 

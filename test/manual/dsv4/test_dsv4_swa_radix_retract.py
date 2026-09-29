@@ -4,7 +4,7 @@ Reproduces the assert in `swa_radix_cache.cache_unfinished_req`:
     assert old_prefix_len <= len(new_indices)
 
 Trip conditions (all required):
-  1. Fork-only SWA leaf early-release on (`SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1`)
+  1. Fork-only SWA leaf early-release on (`FLLIPER_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1`)
   2. Multiple requests share a long prefix (so one req's tombstoned leaf
      poisons match_prefix for others walking the same radix path).
   3. Memory pressure forces retract while at least one req has tombstoned
@@ -25,8 +25,8 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -86,11 +86,11 @@ class TestDSV4FlashSWARadixRetract(CustomTestCase):
             "0.7",
         ]
         env = {
-            "SGLANG_DSV4_FP4_EXPERTS": "0",
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
-            "SGLANG_OPT_SWA_RADIX_CACHE_COMPACT": "0",
-            "SGLANG_TEST_RETRACT": "1",
-            "SGLANG_TEST_RETRACT_INTERVAL": "3",
+            "FLLIPER_DSV4_FP4_EXPERTS": "0",
+            "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+            "FLLIPER_OPT_SWA_RADIX_CACHE_COMPACT": "0",
+            "FLLIPER_TEST_RETRACT": "1",
+            "FLLIPER_TEST_RETRACT_INTERVAL": "3",
         }
         cls.process = popen_launch_server(
             cls.model,

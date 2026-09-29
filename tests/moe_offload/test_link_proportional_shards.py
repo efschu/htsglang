@@ -42,7 +42,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     HOST_SHARD_RATIO_ENV,
     ColdShardContext,
     ExpertResidencyPlanner,
@@ -74,8 +74,8 @@ ROW = 12  # opaque bytes per expert row (stands in for ggml blocks)
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     monkeypatch.delenv(HOST_SHARD_RATIO_ENV, raising=False)
-    monkeypatch.setenv("SGLANG_MOE_RESIDENT_EXPERT_FRACTION", "0.25")
-    monkeypatch.delenv("SGLANG_MOE_SCRATCH_SLOTS", raising=False)
+    monkeypatch.setenv("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", "0.25")
+    monkeypatch.delenv("FLLIPER_MOE_SCRATCH_SLOTS", raising=False)
     reset_host_shard_log_latch()
     reset_expert_offload_release()
     yield
@@ -123,7 +123,7 @@ class _FakePynvml:
 @pytest.fixture
 def nvml_rig(monkeypatch):
     """Patch the registry so the real derivation runs against a fake driver."""
-    from sglang.srt.registry import nvml as nvml_mod
+    from flliper.srt.registry import nvml as nvml_mod
 
     cards = [
         nvml_mod.CardIdentity(
@@ -530,7 +530,7 @@ def test_the_cache_adopts_the_delegated_set_as_a_guard():
 def test_the_chosen_ratio_and_its_source_are_logged_at_staging_time(caplog):
     ctx = ColdShardContext(1, 3, HostShardRatio(_norm(MEASURED), "env", "measured H2D"))
 
-    with caplog.at_level("INFO", logger="sglang.srt.layers.moe.expert_offload"):
+    with caplog.at_level("INFO", logger="flliper.srt.layers.moe.expert_offload"):
         plan_load_time_staging(E, fraction=0.25, cold_shard=ctx)
 
     line = "\n".join(r.getMessage() for r in caplog.records)

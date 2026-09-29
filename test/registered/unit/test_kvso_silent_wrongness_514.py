@@ -42,12 +42,12 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from sglang.srt.managers.kv_session_offload import (
+from flliper.srt.managers.kv_session_offload import (
     KVSessionOffloadManager,
     owned_device_indices,
     spill_tail_rows_max_over_ranks,
 )
-from sglang.srt.mem_cache.multi_ended_allocator import (
+from flliper.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
     UnifiedSWATokenToKVPoolAllocator,
 )

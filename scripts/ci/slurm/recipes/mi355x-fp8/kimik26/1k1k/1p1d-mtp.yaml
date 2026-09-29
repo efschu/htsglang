@@ -9,7 +9,7 @@
 #
 # Consumed by:
 #   * scripts/ci/slurm/process_result.py reads `resources` and
-#     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
+#     `backend.flliper_config` (TP/EP/DP + worker counts) for the summary table.
 #   * scripts/ci/slurm/launch_mi355x.sh reads `runtime`, `bench`, `model`, `mtp`.
 
 resources:
@@ -17,7 +17,7 @@ resources:
   decode_workers: 1
 
 backend:
-  sglang_config:
+  flliper_config:
     prefill:
       tensor-parallel-size: 8
       expert-parallel-size: 1
@@ -27,12 +27,12 @@ backend:
       expert-parallel-size: 1
       data-parallel-size: 1
 
-# Model-specific docker env + sglang server args (written verbatim via
+# Model-specific docker env + flliper server args (written verbatim via
 # model_flags.sh). Each server arg + value is a SEPARATE list item.
 model:
   env:
-    SGLANG_USE_AITER: 1
-    SGLANG_ROCM_FUSED_DECODE_MLA: 0
+    FLLIPER_USE_AITER: 1
+    FLLIPER_ROCM_FUSED_DECODE_MLA: 0
   server_args:
     - --model-loader-extra-config
     - '{"enable_multithread_load": true}'

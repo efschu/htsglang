@@ -17,14 +17,14 @@ import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from sglang.benchmark.serving import (
+from flliper.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
     calculate_metrics,
     set_global_args,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -240,7 +240,7 @@ class TestBenchServingReasoningStream(CustomTestCase):
         self.assertEqual(out.output_len, 2)
 
     def test_null_reasoning_field_does_not_break(self):
-        # Mirrors sglang's _StreamDelta: reasoning_content is always emitted,
+        # Mirrors flliper's _StreamDelta: reasoning_content is always emitted,
         # serialized as null when only content is present.
         chunks = [
             {
@@ -321,7 +321,7 @@ class TestBenchServingReasoningNonStream(CustomTestCase):
             outputs=[out],
             dur_s=1.0,
             tokenizer=_StrictStringTokenizer(),
-            backend="sglang-oai-chat",
+            backend="flliper-oai-chat",
         )
         self.assertEqual(metrics.completed, 1)
         self.assertEqual(output_lens, [3])

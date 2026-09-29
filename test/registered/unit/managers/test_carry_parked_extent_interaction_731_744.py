@@ -31,8 +31,8 @@ change either enumeration or the carry needs this to fail if they break it.
 import types
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -82,7 +82,7 @@ def _enumerate(sched):
     file keeps pinning the #731 interaction against whatever the rung
     actually reads.
     """
-    from sglang.srt.managers.phase_flip_runtime import (
+    from flliper.srt.managers.phase_flip_runtime import (
         PhaseFlipRuntime,
         build_flip_live_slots_fn,
     )
@@ -141,7 +141,7 @@ class TestConsumeDoesNotNarrowTheParkedExtent(CustomTestCase):
 
     def test_the_real_consume_helper_produces_that_state(self):
         """Use #731's own helper rather than hand-building the after state."""
-        from sglang.srt.managers.phase_flip_resident_carry import (
+        from flliper.srt.managers.phase_flip_resident_carry import (
             _consume_carried_from_waiting_queue,
         )
 
@@ -175,7 +175,7 @@ class TestConsumeDoesNotNarrowTheParkedExtent(CustomTestCase):
         import ast
         import inspect
 
-        from sglang.srt.managers import phase_flip_runtime as m
+        from flliper.srt.managers import phase_flip_runtime as m
 
         src = inspect.getsource(m._live_reqs)
         names = {

@@ -38,13 +38,13 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.managers.relief_rung_executor import (
+from flliper.srt.managers.relief_rung_executor import (
     ReliefActuatorMissing,
     UnknownReliefFeature,
     apply_relief_rung,
 )
-from sglang.srt.model_executor.kv_pressure_ladder import RELIEF_FEATURES
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.kv_pressure_ladder import RELIEF_FEATURES
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Rung:
@@ -113,7 +113,7 @@ class TestTheVocabularyIsTheLadders(CustomTestCase):
     """The executor must not grow a sixth feature of its own."""
 
     def test_it_accepts_exactly_the_ladder_vocabulary(self):
-        from sglang.srt.managers.relief_rung_executor import supported_features
+        from flliper.srt.managers.relief_rung_executor import supported_features
 
         self.assertEqual(sorted(supported_features()), sorted(RELIEF_FEATURES))
 

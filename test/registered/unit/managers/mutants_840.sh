@@ -8,8 +8,8 @@ set -u
 ROOT=/spinning/wt-840-teardown
 PY=/spinning/htsglang-gpu/.venv/bin/python
 SUITE=test/registered/unit/managers/test_sigterm_drain_840.py
-TM=$ROOT/python/sglang/srt/managers/tokenizer_manager.py
-SG=$ROOT/python/sglang/srt/managers/shutdown_gate.py
+TM=$ROOT/python/flliper/srt/managers/tokenizer_manager.py
+SG=$ROOT/python/flliper/srt/managers/shutdown_gate.py
 
 run_suite() {
   ( cd "$ROOT" && timeout 300 env CUDA_VISIBLE_DEVICES="" \

@@ -28,11 +28,11 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.canonical_kv_page import (
+from flliper.srt.mem_cache.canonical_kv_page import (
     CanonicalPageError,
     CanonicalPageSpec,
 )
-from sglang.srt.mem_cache.canonical_page_store import (
+from flliper.srt.mem_cache.canonical_page_store import (
     CanonicalPageWindow,
     build_page_window,
     local_attention_layer_ids,
@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.canonical_page_store import (
     window_for_layers,
     write_slice,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # The live checkpoint: 64 layers, 16 of them full attention at 3, 7, ... 63
 # (uniform spacing 4), 2 * 4 kv_heads * 256 head_dim * 1 B = 2048 B per token
@@ -580,7 +580,7 @@ class TestPartialSweep(CustomTestCase):
         LOUD, never a silent wipe."""
         final, part, marker = self._deposit(age_s=7200)
         with self.assertLogs(
-            "sglang.srt.mem_cache.canonical_page_store", level="WARNING"
+            "flliper.srt.mem_cache.canonical_page_store", level="WARNING"
         ) as logs:
             reaped = sweep_partials(
                 self.root,

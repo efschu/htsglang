@@ -14,8 +14,8 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.translator.backends import AudioChunk, SpeakerEmbedding
-from sglang.srt.translator.speakers import (
+from flliper.srt.translator.backends import AudioChunk, SpeakerEmbedding
+from flliper.srt.translator.speakers import (
     ReferenceTooShort,
     SpeakerRegistry,
     SpeakerRegistryConfig,

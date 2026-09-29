@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
@@ -26,12 +26,12 @@ class TestBenchOneBatch1GPU(CustomTestCase):
 
     def test_bs1_default(self):
         env = os.environ.copy()
-        env["SGLANG_ENABLE_METRICS_DEVICE_TIMER"] = "1"
+        env["FLLIPER_ENABLE_METRICS_DEVICE_TIMER"] = "1"
 
         command = [
             "python3",
             "-m",
-            "sglang.benchmark.offline_throughput",
+            "flliper.benchmark.offline_throughput",
             "--num-prompts",
             "1",
             "--dataset-name",

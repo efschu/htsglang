@@ -163,7 +163,7 @@ result:
   layer's hot set is its own. #302a is per-layer for a measured reason, not a
   conservative default.
 * This does not refute a per-token cross-layer correlation, which these
-  artifacts cannot see. Measuring that needs `SGLANG_MOE_OFFLOAD_TRACE`
+  artifacts cannot see. Measuring that needs `FLLIPER_MOE_OFFLOAD_TRACE`
   (the per-layer routed-id log that already exists) and is a separate,
   cheap-to-collect desk item.
 

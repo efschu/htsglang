@@ -2,16 +2,16 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from flliper.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
     get_benchmark_range,
     run_benchmark_no_cudagraph,
 )
-from sglang.jit_kernel.ngram_embedding import (
+from flliper.jit_kernel.ngram_embedding import (
     update_token_table,
     update_token_table_decode,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

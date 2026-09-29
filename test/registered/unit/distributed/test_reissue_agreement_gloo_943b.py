@@ -28,9 +28,9 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 # ~40s: three spawned processes, a gloo group, and a deliberately hanging arm
 # observed to its deadline.

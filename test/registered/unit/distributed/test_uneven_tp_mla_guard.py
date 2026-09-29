@@ -12,13 +12,13 @@ CPU only: the guard runs before any collective or device work.
 
 import unittest
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     get_tp_partition_ratios,
     set_tp_partition_ratios,
 )
-from sglang.srt.layers.dcp.comm import _reject_uneven_tp_mla
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.dcp.comm import _reject_uneven_tp_mla
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

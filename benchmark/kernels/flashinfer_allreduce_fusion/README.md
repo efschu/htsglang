@@ -2,7 +2,7 @@
 
 This benchmark script is modified from the [original implementation](https://github.com/vllm-project/vllm/blob/237e1fb887c7f5a579420fa0295097f24b006594/benchmarks/kernels/benchmark_fused_collective.py) by the vLLM community. It aims to compare the performance differences between FlashInfer fused operators in SGLang (trtllm_allreduce_fusion: AllReduce + Residual Add + RMSNorm + optional quantization) and conventional implementations (standard `tensor_model_parallel_all_reduce` + separate RMSNorm/quantization). Specifically, this script tests the timing performance of two implementation paths: 1) Standard AllReduce and RMSNorm executed separately; 2) FlashInfer's fused operator combining AllReduce, Residual Add, RMSNorm, and optional quantization operations.
 
-This benchmark script helps us tune the ipc workspace size of the `flashinfer_allreduce_residual_rmsnorm` operator in SGLang and prepare for applications with FP8/FP4 quantized fused operators.
+This benchmark script helps us tune the ipc workspace size of the `flashinfer_allreduce_residual_rmsnorm` operator in fLLiper and prepare for applications with FP8/FP4 quantized fused operators.
 
 Script path: `benchmark/kernels/flashinfer_allreduce_fusion/benchmark_fused_collective.py`
 
@@ -19,7 +19,7 @@ Script path: `benchmark/kernels/flashinfer_allreduce_fusion/benchmark_fused_coll
 ## Runtime Environment and Prerequisites
 
 - At least 2 GPUs, and launch multi-process distributed training using `torchrun` (NCCL backend)
-- Properly install/compile sglang along with sgl-kernel and custom operators
+- Properly install/compile flliper along with sgl-kernel and custom operators
 
 ## Quick Start (Command Examples)
 
@@ -96,7 +96,7 @@ If `--output-file` is specified, all configurations will be summarized in Markdo
   - If not installed or interfaces are missing, the script will only run standard paths and provide prompts in the logs.
   - The fused operator internally uses "oneshot"/"twoshot" two trigger methods; oneshot is enabled by default and twoshot is tested simultaneously.
 - FP8/FP4:
-  - FP8 uses sglang's FP8 tools and dtype, with underlying platform selection of `e4m3`/`e4m3fnuz` etc.
+  - FP8 uses flliper's FP8 tools and dtype, with underlying platform selection of `e4m3`/`e4m3fnuz` etc.
   - FP4 uses sgl-kernel's `scaled_fp4_quant`, requiring corresponding platform support.
 - CUDA Graph:
-  - Uses sglang's `graph_capture()` to prepare capture-ready state for communication, then uses `torch.cuda.graph` to capture kernels, reducing measurement jitter.
+  - Uses flliper's `graph_capture()` to prepare capture-ready state for communication, then uses `torch.cuda.graph` to capture kernels, reducing measurement jitter.

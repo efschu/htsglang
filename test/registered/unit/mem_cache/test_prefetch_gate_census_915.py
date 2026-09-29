@@ -46,13 +46,13 @@ question.
 import logging
 import unittest
 
-from sglang.srt.mem_cache.match_refusal_census import (
+from flliper.srt.mem_cache.match_refusal_census import (
     PREFETCH_GATE_COUNTS,
     format_prefetch_gate,
     note_prefetch_gate,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -123,7 +123,7 @@ class TestTheGateIsWiredAndOrdered(CustomTestCase):
     def _src(self):
         import inspect
 
-        from sglang.srt.mem_cache import unified_radix_cache
+        from flliper.srt.mem_cache import unified_radix_cache
 
         return inspect.getsource(
             unified_radix_cache.UnifiedRadixCache.prefetch_from_storage
@@ -186,7 +186,7 @@ class TestTheAttributionOrderIsTheExtendedOne(CustomTestCase):
     and the #969C verdict string both read."""
 
     def test_the_attribution_order_is_the_extended_one(self):
-        from sglang.srt.mem_cache.match_refusal_census import (
+        from flliper.srt.mem_cache.match_refusal_census import (
             PREFETCH_DECLINE_ORDER,
         )
 
@@ -205,7 +205,7 @@ class TestTheAttributionOrderIsTheExtendedOne(CustomTestCase):
         )
 
     def test_the_first_tripped_term_in_order_is_the_verdict(self):
-        from sglang.srt.mem_cache.match_refusal_census import (
+        from flliper.srt.mem_cache.match_refusal_census import (
             gate_reason_since,
             gate_snapshot,
         )
@@ -254,8 +254,8 @@ import inspect
 import textwrap
 import types
 
-TREE_LOGGER = "sglang.srt.mem_cache.unified_radix_cache"
-SCHED_LOGGER = "sglang.srt.managers.scheduler"
+TREE_LOGGER = "flliper.srt.mem_cache.unified_radix_cache"
+SCHED_LOGGER = "flliper.srt.managers.scheduler"
 POOL_ROWS = 366211
 POOL_LIMIT = 329589
 
@@ -345,7 +345,7 @@ def _serving_tree(
     """A bare `UnifiedRadixCache` (the serving class) with only the
     collaborators `prefetch_from_storage` touches stubbed. Every method that
     runs is the real one on the real class."""
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     tree = UnifiedRadixCache.__new__(UnifiedRadixCache)
     tree.enable_storage = True
@@ -381,7 +381,7 @@ class TestEveryExitBehindTheGateIsNamed(_CleanCounts):
         """T16: the pool has no room at all -> refused, counted, ONE line with
         every term, and NOT registered. RED on 228a66db32: the exit was a bare
         `return` and the verdict read 'attempted_but_unregistered'."""
-        from sglang.srt.mem_cache.match_refusal_census import (
+        from flliper.srt.mem_cache.match_refusal_census import (
             gate_reason_since,
             gate_snapshot,
         )
@@ -455,7 +455,7 @@ class TestEveryExitBehindTheGateIsNamed(_CleanCounts):
     def test_host_alloc_failed_is_named(self):
         """Room reported, alloc refused anyway (a fragmented pool): the second
         exit of the truncation branch, by its own name."""
-        from sglang.srt.mem_cache.match_refusal_census import (
+        from flliper.srt.mem_cache.match_refusal_census import (
             gate_reason_since,
             gate_snapshot,
         )
@@ -478,7 +478,7 @@ class TestEveryExitBehindTheGateIsNamed(_CleanCounts):
         occurrence (the WARNING stays rate-limited), and the exit this call
         then leaves through (alloc_failed_post_vote) counts itself; the
         verdict names the CAUSE first."""
-        from sglang.srt.mem_cache.match_refusal_census import (
+        from flliper.srt.mem_cache.match_refusal_census import (
             gate_reason_since,
             gate_snapshot,
         )
@@ -501,7 +501,7 @@ class TestEveryExitBehindTheGateIsNamed(_CleanCounts):
     def test_a_negative_vote_is_named(self):
         """#580 symmetric form: a peer lowered the vote; this rank was ready.
         The exit is vote_negative, counted and spoken."""
-        from sglang.srt.mem_cache.match_refusal_census import (
+        from flliper.srt.mem_cache.match_refusal_census import (
             gate_reason_since,
             gate_snapshot,
         )
@@ -635,7 +635,7 @@ def f(reason, x):
         )
 
     def test_every_return_behind_the_gate_counts_a_term(self):
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         src = inspect.getsource(UnifiedRadixCache.prefetch_from_storage)
         unnamed, n = self.unnamed_returns(src)
@@ -673,7 +673,7 @@ class _TreeCache:
 
 
 def _sched(tree, enable=True):
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     s = Scheduler.__new__(Scheduler)
     s.enable_hicache_storage = enable
@@ -704,7 +704,7 @@ class TestTheIntakePartitionSums(_CleanCounts):
     every instant. RED on 228a66db32: the scheduler exits counted nothing."""
 
     def test_intake_partition_sums(self):
-        from sglang.srt.mem_cache.match_refusal_census import (
+        from flliper.srt.mem_cache.match_refusal_census import (
             PREFETCH_INTAKE_PARTITION,
         )
 

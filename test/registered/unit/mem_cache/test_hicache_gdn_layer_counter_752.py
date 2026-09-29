@@ -25,8 +25,8 @@ never a mamba slot id, and never a wait on a counter that has no mamba step.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -72,7 +72,7 @@ class _MambaPoolStub:
 
 
 def _hybrid_pool(counter, frame=None):
-    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
     pool = object.__new__(HybridReqToTokenPool)
     pool.mamba_map = {30: 0, 31: 1}
@@ -122,7 +122,7 @@ class TestMambaPathNeverUsesTheKvFrame(CustomTestCase):
         traceable from the read site."""
         import inspect
 
-        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
         src = inspect.getsource(HybridReqToTokenPool.mamba2_layer_cache)
         self.assertIn("752", src)
@@ -140,7 +140,7 @@ class TestKvPathStillWaits(CustomTestCase):
     def _kv_pool(self, counter):
         import torch
 
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         pool = object.__new__(MHATokenToKVPool)
         pool.layer_transfer_counter = counter

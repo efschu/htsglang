@@ -11,7 +11,7 @@ THE CENSUS, RE-VERIFIED AT THIS TREE (`/spinning/wt-weg1`, HEAD
 `1116175f6d`, re-derived once more on 1de7687ab7 after #1203 moved the sites) rather than taken from the sweep -- the briefing asked for
 exactly that:
 
-    grep -n '_uniform_min_avail' python/sglang/srt/managers/scheduler.py
+    grep -n '_uniform_min_avail' python/flliper/srt/managers/scheduler.py
       6851   self._uniform_min_avail = int(kvso.dcp_min_avail())      WRITE
       6854   self._publish_uniform_evict_floor(self._uniform_min_avail)  read
       6944   self._uniform_min_avail = local_avail                    WRITE
@@ -72,14 +72,14 @@ import pathlib
 import types
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 SCHEDULER = (
     pathlib.Path(__file__).resolve().parents[4]
     / "python"
-    / "sglang"
+    / "flliper"
     / "srt"
     / "managers"
     / "scheduler.py"
@@ -219,7 +219,7 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
         A round-scoped value would make round 2 raise exactly as round 0 did;
         today round 2 silently answers with round 1's number.
         """
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         sched = self._fake()
 
@@ -317,14 +317,14 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
         On one rank there is nothing to diverge from, so the live local
         `available_size()` is the correct answer and the STOP must not fire.
         """
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         sched = self._fake(tp_size=1, available=777)
         self.assertEqual(Scheduler.uniform_min_avail(sched), 777)
 
     def test_a_published_group_value_is_returned_not_the_local_one(self):
         """The reduced value outranks the local pool. Green today and after."""
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         sched = self._fake(tp_size=3, available=999999)
         sched._uniform_min_avail = 42

@@ -14,7 +14,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from sglang.srt.mem_cache.gdn_slot_executor import (
+from flliper.srt.mem_cache.gdn_slot_executor import (
     NON_RECONSTRUCTIBLE,
     RECONSTRUCTIBLE,
     LocalGdnBlobStore,

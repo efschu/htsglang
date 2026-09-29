@@ -16,11 +16,11 @@ from urllib.parse import urlparse
 
 import requests
 
-from sglang.benchmark.utils import get_tokenizer
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.benchmark.utils import get_tokenizer
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -29,7 +29,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
-from sglang.utils import wait_for_http_ready
+from flliper.utils import wait_for_http_ready
 
 register_cuda_ci(est_time=148, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
@@ -95,14 +95,14 @@ class HiCacheStorageBaseMixin:
     @classmethod
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
-        return {}, {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
+        return {}, {"FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
 
     @classmethod
     def _launch_server_with_hicache(cls):
         """Launch server with HiCache enabled"""
 
         additional_server_args, env_vars = cls._get_additional_server_args_and_env()
-        env_vars["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
+        env_vars["FLLIPER_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
         server_args = cls._get_base_server_args()
         if additional_server_args:
             server_args.update(additional_server_args)

@@ -118,7 +118,7 @@ class Rot:
 
 
 def make_layer(method, N, K, backend, fused):
-    from sglang.srt.layers.quantization import fp4_utils
+    from flliper.srt.layers.quantization import fp4_utils
 
     fp4_utils.FP4_GEMM_RUNNER_BACKEND = fp4_utils.Fp4GemmRunnerBackend(backend)
     layer = torch.nn.Module()
@@ -163,9 +163,9 @@ def main():
     from flashinfer import mm_bf16_fp4, mm_fp4
     from flashinfer.autotuner import autotune
 
-    from sglang.srt.layers.quantization import fp4_utils
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config, ModelOptFp4LinearMethod
+    from flliper.srt.layers.quantization import fp4_utils
+    from flliper.srt.layers.quantization.fp4_utils import fp4_quantize
+    from flliper.srt.layers.quantization.modelopt_quant import ModelOptFp4Config, ModelOptFp4LinearMethod
 
     dev = torch.cuda.current_device()
     meta = {

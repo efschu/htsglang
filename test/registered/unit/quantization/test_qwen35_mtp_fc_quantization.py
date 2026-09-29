@@ -34,16 +34,16 @@ miss ``re:.*mtp.*`` and build a quantised skeleton against the dense bf16
 tensors of the checkpoint production currently runs.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.models.qwen3_5_mtp import build_mtp_fc
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
+from flliper.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from flliper.srt.models.qwen3_5_mtp import build_mtp_fc
+from flliper.test.test_utils import CustomTestCase
 
 #: lokeshe09/Qwen3.8-27B-INT8, ``quantization_config.ignore`` verbatim.
 Q38_IGNORE = [

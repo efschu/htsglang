@@ -31,7 +31,7 @@ silenced the ledger would trade a diagnosis for a benchmark.
 
 CAN-FAIL
 --------
-Delete the ``SGLANG_PHASE_FLIP_EXACT_PIN`` check from ``_alloc_host_image``
+Delete the ``FLLIPER_PHASE_FLIP_EXACT_PIN`` check from ``_alloc_host_image``
 and ``test_opt_out_routes_to_the_torch_pinned_allocator``,
 ``test_opt_out_preserves_the_zero_false_empty_path`` and
 ``test_opt_out_still_registers_the_host_post`` all go red. Gate
@@ -44,9 +44,9 @@ import unittest
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.model_executor import weights_arena
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.environ import envs
+from flliper.srt.model_executor import weights_arena
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -97,7 +97,7 @@ class ExactPinOptOut(unittest.TestCase):
         """Unset env keeps the shipped behaviour. The memory result is proven
         under load; the latency question is not a reason to change the
         default before it is answered."""
-        envs.SGLANG_PHASE_FLIP_EXACT_PIN.clear()
+        envs.FLLIPER_PHASE_FLIP_EXACT_PIN.clear()
         out = weights_arena._alloc_host_image(1234567, pin=True)
         self.assertEqual(self.routing.exact, [1234567])
         self.assertEqual(self.routing.torch_zeros, [])
@@ -106,7 +106,7 @@ class ExactPinOptOut(unittest.TestCase):
     def test_opt_out_routes_to_the_torch_pinned_allocator(self):
         """=0 must reproduce the PRE-#695 allocation exactly, because the arm
         it builds is only a comparand if it is the old code path."""
-        with envs.SGLANG_PHASE_FLIP_EXACT_PIN.override(False):
+        with envs.FLLIPER_PHASE_FLIP_EXACT_PIN.override(False):
             out = weights_arena._alloc_host_image(1234567, pin=True)
         self.assertEqual(self.routing.exact, [])
         self.assertEqual(self.routing.torch_zeros, [1234567])
@@ -118,7 +118,7 @@ class ExactPinOptOut(unittest.TestCase):
         image that is about to be overwritten is exactly the boot-time cost
         the zero=False flag exists to avoid, so the opt-out arm must not
         quietly acquire it."""
-        with envs.SGLANG_PHASE_FLIP_EXACT_PIN.override(False):
+        with envs.FLLIPER_PHASE_FLIP_EXACT_PIN.override(False):
             weights_arena._alloc_host_image(4096, pin=True, zero=False)
         self.assertEqual(self.routing.torch_empty, [4096])
         self.assertEqual(self.routing.torch_zeros, [])
@@ -126,13 +126,13 @@ class ExactPinOptOut(unittest.TestCase):
     def test_opt_out_still_registers_the_host_post(self):
         """The ledger is not part of the arena hunk. Both arms must remain
         visible to the registry that sums pinned host posts."""
-        with envs.SGLANG_PHASE_FLIP_EXACT_PIN.override(False):
+        with envs.FLLIPER_PHASE_FLIP_EXACT_PIN.override(False):
             weights_arena._alloc_host_image(999, pin=True)
         self.assertEqual(self.routing.posts, [999])
 
     def test_opt_out_does_not_touch_the_unpinned_path(self):
         """pin=False is the CPU/unit path; neither arm may reach CUDA."""
-        with envs.SGLANG_PHASE_FLIP_EXACT_PIN.override(False):
+        with envs.FLLIPER_PHASE_FLIP_EXACT_PIN.override(False):
             out = weights_arena._alloc_host_image(4096, pin=False)
         self.assertEqual(self.routing.exact, [])
         self.assertEqual(self.routing.torch_zeros, [])
@@ -144,9 +144,9 @@ class ExactPinOptOut(unittest.TestCase):
         """The A/B sets the variable in the boot environment, but a value
         frozen at import time would also survive a test monkeypatch and give a
         silently single-armed measurement. Read it per call."""
-        with envs.SGLANG_PHASE_FLIP_EXACT_PIN.override(False):
+        with envs.FLLIPER_PHASE_FLIP_EXACT_PIN.override(False):
             weights_arena._alloc_host_image(11, pin=True)
-        with envs.SGLANG_PHASE_FLIP_EXACT_PIN.override(True):
+        with envs.FLLIPER_PHASE_FLIP_EXACT_PIN.override(True):
             weights_arena._alloc_host_image(22, pin=True)
         self.assertEqual(self.routing.torch_zeros, [11])
         self.assertEqual(self.routing.exact, [22])

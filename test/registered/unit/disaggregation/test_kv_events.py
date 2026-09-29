@@ -9,12 +9,12 @@ the router can subscribe per replica (the `dp_size` it reads from
 
 import unittest
 
-from sglang.srt.disaggregation.kv_events import (
+from flliper.srt.disaggregation.kv_events import (
     ZmqEventPublisher,
     select_kv_publisher_dp_rank,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

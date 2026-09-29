@@ -1,10 +1,10 @@
-"""Tests for sglang.srt.debug_utils.wedge_timeline."""
+"""Tests for flliper.srt.debug_utils.wedge_timeline."""
 
 from __future__ import annotations
 
 from _pytest.capture import CaptureFixture
 
-from sglang.srt.debug_utils.wedge_timeline import (
+from flliper.srt.debug_utils.wedge_timeline import (
     find_freeze_point,
     main,
     summarize,

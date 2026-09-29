@@ -6,7 +6,7 @@ gap=0. A snapshot a reset moved under is now named (``snapshot=torn``, gap
 ``-``) instead of being printed as a leak; a ledger that only moved during
 the walk is printed as ``own_drift``.
 
-Hermetic: the #1424g tree shell (real ``weg2_arena_holder_census``, real
+Hermetic: the #1424g tree shell (real ``pdflip_arena_holder_census``, real
 ``_reset_full``) on a real C arena."""
 from __future__ import annotations
 
@@ -41,12 +41,12 @@ def test_a_reset_during_the_walk_is_named_torn_not_a_gap(arena, monkeypatch):
             t._reset_full()
         return n
 
-    from sglang.srt.mem_cache.pool_host import arena_pool as ap_mod
+    from flliper.srt.mem_cache.pool_host import arena_pool as ap_mod
     monkeypatch.setattr(ap_mod, "arena_ref_pages", _pages_then_reset)
-    line = t.weg2_arena_holder_census(arena)
+    line = t.pdflip_arena_holder_census(arena)
     assert "snapshot=torn" in line and "gap=-" in line and "gap=-5" not in line, line
     monkeypatch.setattr(ap_mod, "arena_ref_pages", real)
-    assert "own_held=0 gap=0" in t.weg2_arena_holder_census(arena)
+    assert "own_held=0 gap=0" in t.pdflip_arena_holder_census(arena)
 
 
 def test_a_node_mid_write_through_names_no_page_it_holds_no_reference_for(arena):
@@ -63,11 +63,11 @@ def test_a_node_mid_write_through_names_no_page_it_holds_no_reference_for(arena)
     node = g._node(g._tree(arena, pool)[1], 9, g._rows([s]))
     node.write_through_pending_id = 7
     t.root_node.children[9] = node
-    line = t.weg2_arena_holder_census(arena)
+    line = t.pdflip_arena_holder_census(arena)
     assert "tree_in_use=0 " in line and "gap=0" in line, line
 
 
 def test_a_quiet_census_is_unchanged(arena):
     t, _, _ = g._parked_two_rids_same_prefix(arena)
-    line = t.weg2_arena_holder_census(arena)
+    line = t.pdflip_arena_holder_census(arena)
     assert "gap=0" in line and "snapshot=torn" not in line and "own_drift" not in line, line

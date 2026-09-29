@@ -31,16 +31,16 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.lockstep import (
+from flliper.srt.layers.dcp.lockstep import (
     dcp_forces_prefix,
     draft_extend_prefix_lens,
     weightless_has_prefix,
 )
-from sglang.srt.layers.dcp.owner import (
+from flliper.srt.layers.dcp.owner import (
     dcp_weighted_owner_bounds,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -170,7 +170,7 @@ class TestOwnerRuleIsSharedWithTheTargetSide(CustomTestCase):
         verify split uses. Drive it against an installed plan so the draft side
         cannot drift from the prose above.
         """
-        from sglang.srt.distributed.utils import (
+        from flliper.srt.distributed.utils import (
             get_cp_token_ratios,
             get_tp_partition_ratios,
             set_cp_token_ratios,
@@ -205,7 +205,7 @@ class TestSplitWiring(CustomTestCase):
     hermetic; the numeric behaviour is the GPU ticket's job."""
 
     def _backend_src(self):
-        from sglang.srt.layers.attention import flashinfer_backend
+        from flliper.srt.layers.attention import flashinfer_backend
 
         return inspect.getsource(flashinfer_backend)
 
@@ -226,7 +226,7 @@ class TestSplitWiring(CustomTestCase):
         self.assertGreaterEqual(src.count("_build_dcp_weighted_kv_indices("), 3)
 
     def test_force_prefix_goes_through_the_shared_rule(self):
-        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+        from flliper.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
         body = inspect.getsource(FlashInferAttnBackend.forward_extend)
         self.assertIn("dcp_forces_prefix(", body)
@@ -237,7 +237,7 @@ class TestSplitWiring(CustomTestCase):
         capture, so it needs fixed indptr buffers -- and its OWN per-bucket
         dict, because it shares bs with the verify graph but has a different
         qo stride."""
-        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+        from flliper.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
         self.assertTrue(
             hasattr(FlashInferAttnBackend, "_get_draft_extend_ragged_cg_wrapper")
@@ -258,7 +258,7 @@ class TestSplitWiring(CustomTestCase):
         """A draft-extend chain is plain causal, and topk > 1 cannot reach this
         layout (boot-refused). A mask buffer would silently select flashinfer's
         CUSTOM mode on every replay."""
-        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+        from flliper.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
         src = inspect.getsource(
             FlashInferAttnBackend._get_draft_extend_ragged_cg_wrapper
@@ -277,7 +277,7 @@ class TestReplicatedDefaultIsUntouched(CustomTestCase):
     def test_predicate_still_reads_the_default_as_replicated(self):
         from types import SimpleNamespace
 
-        from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
+        from flliper.srt.layers.dcp.owner import draft_pool_is_replicated
 
         for args in (
             None,
@@ -292,7 +292,7 @@ class TestReplicatedDefaultIsUntouched(CustomTestCase):
         """Nothing in the split may turn the layout on by itself -- the byte
         win is configuration-dependent (it only pays when ratio_r/S beats
         local_heads/total_heads), so the choice stays the user's."""
-        from sglang.srt.layers.attention import flashinfer_backend
+        from flliper.srt.layers.attention import flashinfer_backend
 
         src = inspect.getsource(flashinfer_backend)
         self.assertNotIn('draft_kv_layout = "dcp"', src)
@@ -302,7 +302,7 @@ class TestReplicatedDefaultIsUntouched(CustomTestCase):
         """A draft runner on the default layout has uneven_dcp False, so the
         branch is unreachable for it. Pinned because the gate is what keeps
         the default byte-identical."""
-        from sglang.srt.layers.attention import flashinfer_backend
+        from flliper.srt.layers.attention import flashinfer_backend
 
         src = inspect.getsource(flashinfer_backend)
         marker = "== SpecInputType.EAGLE_DRAFT_EXTEND"

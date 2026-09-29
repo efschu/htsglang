@@ -38,8 +38,8 @@ partitioner rather than against a hand-built example.
 
 import unittest
 
-from sglang.srt.planner.cost_model import Provenance, Rate
-from sglang.srt.planner.regime_switch import (
+from flliper.srt.planner.cost_model import Provenance, Rate
+from flliper.srt.planner.regime_switch import (
     DEFAULT_PAIR_TOLERANCE_PCT,
     GIB,
     MIB,
@@ -58,8 +58,8 @@ from sglang.srt.planner.regime_switch import (
     solve_layout_pair,
     unit_ranges,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -722,7 +722,7 @@ class TestPairObjective(CustomTestCase):
     def test_default_tolerance_is_below_the_measured_noise_floor(self):
         """Documented invariant: the secondary objective may only break ties,
         never knowingly trade measurable performance."""
-        from sglang.srt.planner import key_solver
+        from flliper.srt.planner import key_solver
 
         self.assertLess(DEFAULT_PAIR_TOLERANCE_PCT, key_solver.NOISE_FLOOR_PCT)
 
@@ -809,7 +809,7 @@ class TestPhaseTableJson(CustomTestCase):
         self.assertIs(r.verdict, Verdict.SWITCH_FULL)
         self.assertIn("FP8-27B", r.triple)
         # No explicit floor -> the key solver's own measured floor, sourced.
-        from sglang.srt.planner import key_solver
+        from flliper.srt.planner import key_solver
 
         self.assertEqual(r.numbers["noise_floor_pct"], key_solver.NOISE_FLOOR_PCT)
         self.assertEqual(
@@ -940,14 +940,14 @@ class TestSolverApiSurface(CustomTestCase):
         }
 
     def test_no_table_is_refused_with_a_reason(self):
-        from sglang.srt.planner.solver_api import regime_switch_payload
+        from flliper.srt.planner.solver_api import regime_switch_payload
 
         out = regime_switch_payload({})
         self.assertFalse(out["ok"])
         self.assertIn("no phase_table given", out["reasons"][0])
 
     def test_full_payload_with_geometry_and_ledger(self):
-        from sglang.srt.planner.solver_api import regime_switch_payload
+        from flliper.srt.planner.solver_api import regime_switch_payload
 
         out = regime_switch_payload(
             {
@@ -968,7 +968,7 @@ class TestSolverApiSurface(CustomTestCase):
         self.assertEqual(out["overlap"]["per_rank"][0]["extra_units_vs_larger"], 0)
 
     def test_a_ledger_without_a_geometry_is_refused(self):
-        from sglang.srt.planner.solver_api import regime_switch_payload
+        from flliper.srt.planner.solver_api import regime_switch_payload
 
         out = regime_switch_payload(
             {
@@ -983,7 +983,7 @@ class TestSolverApiSurface(CustomTestCase):
         self.assertIn("without a geometry", out["reasons"][0])
 
     def test_pair_mode_rides_along(self):
-        from sglang.srt.planner.solver_api import regime_switch_payload
+        from flliper.srt.planner.solver_api import regime_switch_payload
 
         out = regime_switch_payload(
             {
@@ -1012,7 +1012,7 @@ class TestSolverApiSurface(CustomTestCase):
         self.assertIn("overlap", out["pair"])
 
     def test_an_unsourced_pair_candidate_is_refused(self):
-        from sglang.srt.planner.solver_api import regime_switch_payload
+        from flliper.srt.planner.solver_api import regime_switch_payload
 
         out = regime_switch_payload(
             {
@@ -1035,7 +1035,7 @@ class TestSolverApiSurface(CustomTestCase):
         self.assertIn("no source", out["reasons"][0])
 
     def test_an_unknown_layout_name_is_refused(self):
-        from sglang.srt.planner.solver_api import regime_switch_payload
+        from flliper.srt.planner.solver_api import regime_switch_payload
 
         out = regime_switch_payload(
             {"phase_table": self._table_payload(), "decode_layout": "ghost"}
@@ -1057,7 +1057,7 @@ class TestPlanOutputWiring(CustomTestCase):
         import os
         import tempfile
 
-        from sglang.srt.planner.hardware import hardware_from_manual
+        from flliper.srt.planner.hardware import hardware_from_manual
 
         cls._tmp = tempfile.TemporaryDirectory()
         path = os.path.join(cls._tmp.name, "model")
@@ -1116,14 +1116,14 @@ class TestPlanOutputWiring(CustomTestCase):
 
     def test_default_plan_carries_no_verdict(self):
         """Opt-in: an existing caller's answer is unchanged."""
-        from sglang.srt.planner.feasibility import plan
+        from flliper.srt.planner.feasibility import plan
 
         result = plan(self.model, self.hw, tp_size=3)
         self.assertIsNone(result.regime)
 
     def test_plan_computes_the_verdict_on_its_own_ledger(self):
-        from sglang.srt.planner.feasibility import plan
-        from sglang.srt.planner.regime_switch import AutocheckResult
+        from flliper.srt.planner.feasibility import plan
+        from flliper.srt.planner.regime_switch import AutocheckResult
 
         result = plan(
             self.model,
@@ -1160,7 +1160,7 @@ class TestPlanOutputWiring(CustomTestCase):
             smaller cards hold disjoint ranges ... each" over-counts by one
             card.
         """
-        from sglang.srt.planner.feasibility import plan
+        from flliper.srt.planner.feasibility import plan
 
         result = plan(
             self.model,
@@ -1192,7 +1192,7 @@ class TestPlanOutputWiring(CustomTestCase):
         )
 
     def test_a_malformed_table_is_named_not_swallowed(self):
-        from sglang.srt.planner.feasibility import plan
+        from flliper.srt.planner.feasibility import plan
 
         bad = self._table_payload()
         bad["cells"][0]["source"] = ""
@@ -1200,7 +1200,7 @@ class TestPlanOutputWiring(CustomTestCase):
             plan(self.model, self.hw, tp_size=3, regime_phase_table=bad)
 
     def test_not_pre_captured_pins_rung_two(self):
-        from sglang.srt.planner.feasibility import plan
+        from flliper.srt.planner.feasibility import plan
 
         result = plan(
             self.model,
@@ -1215,8 +1215,8 @@ class TestPlanOutputWiring(CustomTestCase):
         import contextlib
         import io
 
-        from sglang.srt.planner.cli import _print_regime
-        from sglang.srt.planner.feasibility import plan
+        from flliper.srt.planner.cli import _print_regime
+        from flliper.srt.planner.feasibility import plan
 
         result = plan(
             self.model,
@@ -1236,8 +1236,8 @@ class TestPlanOutputWiring(CustomTestCase):
         import contextlib
         import io
 
-        from sglang.srt.planner.cli import _print_regime
-        from sglang.srt.planner.feasibility import plan
+        from flliper.srt.planner.cli import _print_regime
+        from flliper.srt.planner.feasibility import plan
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

@@ -20,11 +20,11 @@ or it is a different server that happens to start.
 Two classes of captured value are dropped rather than pinned, and both are
 identities of the dead boot rather than settings:
 
-``SGLANG_PHASE_FLIP_INSTANCE``
+``FLLIPER_PHASE_FLIP_INSTANCE``
     Its suffix is the pid of the captured process (``…-3940356``). Replaying
     it would stamp every future boot with a dead pid's rendezvous tag.
 
-``SGLANG_BOOT_COMMIT``
+``FLLIPER_BOOT_COMMIT``
     Provenance. It must be measured from the repo at boot, not asserted by a
     config file -- "which commit was that" is the first question asked of any
     measurement, and a pinned answer is a claim rather than an observation.
@@ -48,8 +48,8 @@ import sys
 
 #: Captured values that are identities of the captured boot, not settings.
 DROP_ENV = {
-    "SGLANG_PHASE_FLIP_INSTANCE",
-    "SGLANG_BOOT_COMMIT",
+    "FLLIPER_PHASE_FLIP_INSTANCE",
+    "FLLIPER_BOOT_COMMIT",
     "PYTHONPATH",
     "CUDA_VISIBLE_DEVICES",   # derived from the card UUIDs at boot
 }
@@ -57,7 +57,7 @@ DROP_ENV = {
 #: Prefixes worth carrying into the config. Everything else in a captured
 #: environ is the shell's, the agent's, or the container's -- inheriting it
 #: would make the boot depend on who launched the capture.
-KEEP_PREFIXES = ("SGLANG_", "HTSGLANG_", "PYTORCH_")
+KEEP_PREFIXES = ("FLLIPER_", "HTSGLANG_", "PYTORCH_")
 KEEP_EXACT = ("LD_LIBRARY_PATH",)
 
 
@@ -81,7 +81,7 @@ def nvml_cards():
     """(uuid, name, total_mib) per card, NVML order. No CUDA context."""
     sys.path.insert(0, os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
-    from sglang.srt.registry import nvml
+    from flliper.srt.registry import nvml
 
     return [(d.uuid, d.name, d.total_bytes // (1024 * 1024))
             for d in nvml.list_devices()]
@@ -144,8 +144,8 @@ def main(argv=None) -> int:
     W("allow_worktree = true")
     W("")
     W("# Environment carried from the captured ship process. PYTHONPATH,")
-    W("# CUDA_VISIBLE_DEVICES, SGLANG_PHASE_FLIP_INSTANCE and")
-    W("# SGLANG_BOOT_COMMIT are deliberately absent: the first two are derived")
+    W("# CUDA_VISIBLE_DEVICES, FLLIPER_PHASE_FLIP_INSTANCE and")
+    W("# FLLIPER_BOOT_COMMIT are deliberately absent: the first two are derived")
     W("# from [stack].repo and the card list, the last two are per-boot")
     W("# identities synthesized by the orchestrator.")
     W("[env]")
@@ -187,7 +187,7 @@ def main(argv=None) -> int:
     W("poll_s = 20")
     W("generation_probe_s = 120")
     W("# Reconciled with the server's own health budget: /health may take")
-    W("# SGLANG_HEALTH_CHECK_TIMEOUT (default 20 s). The generation probe is")
+    W("# FLLIPER_HEALTH_CHECK_TIMEOUT (default 20 s). The generation probe is")
     W("# a /generate call with its own explicit budget, well clear of it.")
     W("generation_timeout_s = 60")
     W("wedge_confirmations = 3")

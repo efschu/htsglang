@@ -14,7 +14,7 @@ A single end-to-end test (``test_simple_qa``) verifies the model boots
 on XPU and returns a coherent reply. On failure the assertion message
 includes the model's actual output.
 
-Server is started with ``sglang serve`` (``--model-impl sglang``).
+Server is started with ``flliper serve`` (``--model-impl flliper``).
 """
 
 from __future__ import annotations
@@ -25,9 +25,9 @@ import unittest
 import openai
 import torch
 
-from sglang.srt.utils.common import is_xpu
-from sglang.test.test_utils import CustomTestCase
-from sglang.test.vlm_utils import (
+from flliper.srt.utils.common import is_xpu
+from flliper.test.test_utils import CustomTestCase
+from flliper.test.vlm_utils import (
     DEFAULT_URL_FOR_TEST,
     kill_process_tree,
     popen_launch_server,
@@ -52,10 +52,10 @@ XPU_SERVER_ARGS = [
     "--attention-backend",
     "intel_xpu",
     "--model-impl",
-    "sglang",
+    "flliper",
 ]
 
-# Standard sglang e2e Q&A prompt (see test_openai_server.py::run_chat_completion).
+# Standard flliper e2e Q&A prompt (see test_openai_server.py::run_chat_completion).
 _SIMPLE_QA_PROMPT = "What is the capital of France? Answer in a few words."
 
 
@@ -83,7 +83,7 @@ class TestGemma4E2BXPU(CustomTestCase):
         cls.model = MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        os.environ["SGLANG_USE_SGL_XPU"] = "1"
+        os.environ["FLLIPER_USE_SGL_XPU"] = "1"
 
         _empty_xpu_cache()
         cls.process = popen_launch_server(
@@ -127,7 +127,7 @@ class TestGemma4E2BXPU(CustomTestCase):
         )
 
 
-from sglang.test.ci.ci_register import register_xpu_ci
+from flliper.test.ci.ci_register import register_xpu_ci
 
 # Single e2e test: boot + a short Q&A.
 register_xpu_ci(

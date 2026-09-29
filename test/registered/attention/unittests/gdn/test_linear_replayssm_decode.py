@@ -1,6 +1,6 @@
 """Correctness test for the buffered output-only linear-attention decode kernel
 (ReplaySSM Part A), implemented in
-``python/sglang/srt/layers/attention/fla/fused_recurrent_linear_replayssm.py``.
+``python/flliper/srt/layers/attention/fla/fused_recurrent_linear_replayssm.py``.
 
 One kernel, two gate granularities (selected by ``is_kda``):
   * GDN (``is_kda=False``): per-head SCALAR gate. Ground truth =
@@ -39,7 +39,7 @@ from pathlib import Path
 
 import torch
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # Mirror sibling GDN unittests: register for CUDA/AMD CI. This is a kernel-math
 # unit test; it lives with the other linear-attention kernel correctness tests.
@@ -47,7 +47,7 @@ from sglang.test.test_utils import CustomTestCase
 # tests hook parses them statically via AST and only scans top-level statements
 # -- a try/except wrapper hides them and fails the hook).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
@@ -98,11 +98,11 @@ class TestLinearReplaySSMDecode(CustomTestCase):
     L_SWEEP = (1, 4, 8, 16)
 
     def _run_one(self, cfg, L, dtype, force_flush_steps=(), is_kda=False):
-        from sglang.srt.layers.attention.fla.fused_recurrent import (
+        from flliper.srt.layers.attention.fla.fused_recurrent import (
             fused_recurrent_gated_delta_rule_packed_decode,
             fused_recurrent_kda_packed_decode,
         )
-        from sglang.srt.layers.attention.fla.fused_recurrent_linear_replayssm import (
+        from flliper.srt.layers.attention.fla.fused_recurrent_linear_replayssm import (
             fused_recurrent_linear_replayssm_decode,
         )
 

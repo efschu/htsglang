@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """WP3a: the GGUF uneven-TP expert-index shard (#82) generalized to every
 other quant path (compressed-tensors/AWQ/GPTQ Marlin) behind
-SGLANG_UNEVEN_MOE_EXPERT_SHARD=1. Each rank owns a plan-proportional range
+FLLIPER_UNEVEN_MOE_EXPERT_SHARD=1. Each rank owns a plan-proportional range
 of WHOLE experts at local indices 1..n_local; local index 0 is the all-zero
 pad expert every foreign topk id lands on (leading, so the static residency
 plan [0, R) always holds it); the TP all-reduce sums the disjoint owners.
@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE  # noqa: E402
+from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE  # noqa: E402
 
 E = 512
 
@@ -106,7 +106,7 @@ def test_zero_pad_is_a_noop_without_the_shard():
 def test_stream_presplit_expects_only_the_owned_experts(monkeypatch):
     """The pad expert never arrives from the checkpoint: the per-layer early
     presplit must count 2*owned / owned shards, not num_local_experts."""
-    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16_moe import (
+    from flliper.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16_moe import (
         CompressedTensorsWNA16MoE,
     )
 
@@ -114,7 +114,7 @@ def test_stream_presplit_expects_only_the_owned_experts(monkeypatch):
     scheme.quant_config = type("C", (), {"quant_format": "pack-quantized"})()
     scheme.num_bits, scheme.packed_factor, scheme.strategy = 4, 8, "group"
     scheme.group_size, scheme.actorder, scheme.sym, scheme.num_gpu_experts = 32, None, True, -1
-    monkeypatch.setenv("SGLANG_MOE_RESIDENT_EXPERT_FRACTION", "0.5")
+    monkeypatch.setenv("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", "0.5")
     layer = torch.nn.Module()
     layer.num_local_experts = 5
     layer.moe_tp_size = 1
@@ -145,7 +145,7 @@ def test_source_start_is_zero_along_the_intermediate_under_the_expert_shard():
     holds whole experts: the intermediate start is 0 on every rank."""
     from types import SimpleNamespace
 
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     me = SimpleNamespace(
         _gguf_expert_shard=True,
@@ -174,7 +174,7 @@ class _Q:
 def test_unquantized_experts_are_eligible_for_the_generic_shard():
     # fn4j 19.09.: the MTP draft's bf16 experts (quant_config None) must be
     # split like the target's, not replicated on every rank.
-    from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    from flliper.srt.layers.moe.fused_moe_triton.layer import (
         expert_shard_generic_eligible,
     )
 
@@ -187,11 +187,11 @@ def test_unquantized_experts_are_eligible_for_the_generic_shard():
 
 
 def test_offload_exclude_draft_switch(monkeypatch):
-    from sglang.srt.layers.moe.fused_moe_triton.layer import _offload_excludes_draft_layer
+    from flliper.srt.layers.moe.fused_moe_triton.layer import _offload_excludes_draft_layer
 
-    monkeypatch.delenv("SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT", raising=False)
+    monkeypatch.delenv("FLLIPER_MOE_OFFLOAD_EXCLUDE_DRAFT", raising=False)
     assert not _offload_excludes_draft_layer("mtp.layers.0.mlp.experts")
-    monkeypatch.setenv("SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT", "1")
+    monkeypatch.setenv("FLLIPER_MOE_OFFLOAD_EXCLUDE_DRAFT", "1")
     assert _offload_excludes_draft_layer("mtp.layers.0.mlp.experts")
     assert not _offload_excludes_draft_layer("model.layers.0.mlp.experts")
 
@@ -199,7 +199,7 @@ def test_offload_exclude_draft_switch(monkeypatch):
 def test_excluded_draft_layer_never_resolves_the_fraction_vector():
     """fn5j: solo-placed draft builds under tp_size=1; the 3-entry vector must
     not be parsed for an excluded layer."""
-    from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    from flliper.srt.layers.moe.fused_moe_triton.layer import (
         _expert_offload_fraction_for_layer,
     )
 
@@ -215,7 +215,7 @@ def test_excluded_draft_layer_never_resolves_the_fraction_vector():
 
 
 def test_scratch_slots_env_scalar_and_vector():
-    from sglang.srt.layers.moe.expert_offload import scratch_slots_from_env
+    from flliper.srt.layers.moe.expert_offload import scratch_slots_from_env
 
     assert scratch_slots_from_env("", (0, 3)) is None
     assert scratch_slots_from_env("48", (2, 3)) == 48

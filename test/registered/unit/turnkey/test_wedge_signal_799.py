@@ -36,11 +36,11 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.turnkey import config as C
-from sglang.srt.turnkey import runner as R
-from sglang.srt.turnkey import watchdog as W
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.turnkey import config as C
+from flliper.srt.turnkey import runner as R
+from flliper.srt.turnkey import watchdog as W
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -366,7 +366,7 @@ must_import = ["sgl_kernel"]
 
 [serving.ship]
 port = 30030
-argv = ["/bin/python", "-m", "sglang.launch_server"]
+argv = ["/bin/python", "-m", "flliper.launch_server"]
 cards = [0]
 boot_log = "/var/log/t/ship.log"
 """ % (_REPO.name, _REPO.name, U1)
@@ -403,7 +403,7 @@ class TestRestartTargetDrift(CustomTestCase):
         self.assertIsNone(restart_drift_of(None, "/m/A"))
 
     def test_argv_and_boot_log_extraction(self):
-        argv = ["/bin/python", "-m", "sglang.launch_server",
+        argv = ["/bin/python", "-m", "flliper.launch_server",
                 "--model-path", "/m/A", "--tp-size", "3"]
         self.assertEqual(R.argv_model_path(argv), "/m/A")
         with tempfile.TemporaryDirectory() as d:
@@ -460,7 +460,7 @@ class TestConfigReachesTheRunner(CustomTestCase):
         ``wedge_signal_enabled`` silently defaults to True and the config key
         becomes decoration, which is precisely the 'parsed and never read'
         defect ``_cmd_watch`` already documents for ``enabled``."""
-        from sglang.srt.turnkey import __main__ as M
+        from flliper.srt.turnkey import __main__ as M
 
         c = C.loads(_TOML + "\n[watchdog]\nwedge_signal_enabled = false\n"
                             'wedge_status_dir = "/run/x/wedge"\n')

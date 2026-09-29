@@ -43,7 +43,7 @@ GSM8K sanity knobs (env vars):
 Shared knobs:
     DSV4_SGL_EVAL_OUT_DIR         (default /tmp/sgl-eval-out -> --out-dir)
     DSV4_SGL_EVAL_BIN             (default "sgl-eval"; override path to the CLI)
-    DSV4_SERVER_LAUNCH_TIMEOUT    (default 3600s; the sglang 600s default is
+    DSV4_SERVER_LAUNCH_TIMEOUT    (default 3600s; the flliper 600s default is
                                    too short for DSV4 model load + DeepGEMM
                                    warmup. 1800s is also tight for the heavier
                                    recipes (DP-attn + DeepEP); 3600s is the
@@ -57,7 +57,7 @@ is unset, those classes ``SkipTest``):
 
 Always-on env (set by the base class for every recipe; per-recipe EXTRA_ENV
 wins on key conflict):
-    SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1   skip the slow DeepGEMM warmup grid
+    FLLIPER_JIT_DEEPGEMM_FAST_WARMUP=1   skip the slow DeepGEMM warmup grid
 """
 
 import json
@@ -68,8 +68,8 @@ import unittest
 from pathlib import Path
 from typing import ClassVar, Dict, List, Optional
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -78,7 +78,7 @@ from sglang.test.test_utils import (
 SGL_EVAL_BIN = os.environ.get("DSV4_SGL_EVAL_BIN", "sgl-eval")
 SGL_EVAL_OUT_DIR = os.environ.get("DSV4_SGL_EVAL_OUT_DIR", "/tmp/sgl-eval-out")
 
-# DSV4 server launch needs more than the 600s sglang default: model load alone
+# DSV4 server launch needs more than the 600s flliper default: model load alone
 # can take 5+ min and DeepGEMM warmup another ~5 min. First-run model download
 # adds ~10-30 min on top. 1800s covers steady-state; bump via env for downloads.
 SERVER_LAUNCH_TIMEOUT = int(os.environ.get("DSV4_SERVER_LAUNCH_TIMEOUT", "3600"))
@@ -88,7 +88,7 @@ SERVER_LAUNCH_TIMEOUT = int(os.environ.get("DSV4_SERVER_LAUNCH_TIMEOUT", "3600")
 BASE_ENV: Dict[str, str] = {
     # Skip the slow exhaustive DeepGEMM warmup grid; covers the shapes DSV4
     # actually hits and shaves several minutes off server startup.
-    "SGLANG_JIT_DEEPGEMM_FAST_WARMUP": "1",
+    "FLLIPER_JIT_DEEPGEMM_FAST_WARMUP": "1",
 }
 
 AIME25_NUM_REPEATS = int(os.environ.get("DSV4_AIME25_NUM_REPEATS", "16"))

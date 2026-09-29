@@ -32,7 +32,7 @@ import unittest
 from dataclasses import fields
 from pathlib import Path
 
-from sglang.srt.liveness import (
+from flliper.srt.liveness import (
     DEFAULT_TIMEOUT_RATIONALE,
     DEFAULT_TIMEOUTS_S,
     Attachment,
@@ -51,14 +51,14 @@ from sglang.srt.liveness import (
     guard_generate_stream,
     guarded_stream,
 )
-from sglang.srt.registry.ledger import (
+from flliper.srt.registry.ledger import (
     MIB,
     ReservationEntry,
     ReservationStore,
     TenantState,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -141,7 +141,7 @@ class PolicyTableTest(CustomTestCase):
 
     def test_the_registry_lease_default_matches_the_ledger(self):
         """Two numbers for one lease is a drift waiting to happen."""
-        from sglang.srt.registry.ledger import DEFAULT_LEASE_SECONDS
+        from flliper.srt.registry.ledger import DEFAULT_LEASE_SECONDS
 
         self.assertEqual(
             DEFAULT_TIMEOUTS_S[EndpointClass.REGISTRY_LEASE], DEFAULT_LEASE_SECONDS
@@ -196,7 +196,7 @@ class ConfigTest(CustomTestCase):
         self.assertEqual(set(described), {c.value for c in EndpointClass})
 
     def test_the_server_flags_exist_under_the_documented_names(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         names = {f.name for f in fields(ServerArgs)}
         for flag in (
@@ -1011,7 +1011,7 @@ class TimeToFirstTokenIsOutsideTheBudgetTest(CustomTestCase):
         import ast
         import inspect
 
-        from sglang.srt.entrypoints.openai import serving_chat, serving_completions
+        from flliper.srt.entrypoints.openai import serving_chat, serving_completions
 
         for module in (serving_chat, serving_completions):
             tree = ast.parse(inspect.getsource(module))
@@ -1062,7 +1062,7 @@ class TimeToFirstTokenIsOutsideTheBudgetTest(CustomTestCase):
         import ast
         import inspect
 
-        from sglang.srt.entrypoints.openai import serving_base
+        from flliper.srt.entrypoints.openai import serving_base
 
         tree = ast.parse(inspect.getsource(serving_base))
         awaits = [

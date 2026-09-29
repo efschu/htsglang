@@ -57,10 +57,10 @@ import asyncio
 import types
 import unittest
 
-from sglang.srt.managers import shutdown_gate
-from sglang.srt.managers.shutdown_gate import ServerShuttingDown
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers import shutdown_gate
+from flliper.srt.managers.shutdown_gate import ServerShuttingDown
+from flliper.srt.managers.tokenizer_manager import TokenizerManager
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Obj:
@@ -190,7 +190,7 @@ class DrainTerminationTest(CustomTestCase):
 
     def _run_drain(self, mgr, *, patches, wait_s=5.0):
         """Run ``sigterm_watchdog`` unbound, with the exit path neutralised."""
-        import sglang.srt.managers.tokenizer_manager as tm
+        import flliper.srt.managers.tokenizer_manager as tm
 
         saved = {name: getattr(tm, name) for name in patches}
         for name, value in patches.items():
@@ -242,7 +242,7 @@ class DrainTerminationTest(CustomTestCase):
             mgr.rid_to_state.clear()
 
         killed = []
-        import sglang.srt.managers.tokenizer_manager as tm
+        import flliper.srt.managers.tokenizer_manager as tm
 
         patches = self._exit_patches(killed)
         saved = {name: getattr(tm, name) for name in patches}

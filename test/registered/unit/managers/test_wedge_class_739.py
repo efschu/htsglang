@@ -20,19 +20,19 @@ shipped detector to a stand-in.
 import types
 import unittest
 
-from sglang.srt.managers.wedge_class import (
+from flliper.srt.managers.wedge_class import (
     CLASS_PIPELINE_DEAD,
     CLASS_POOL_SATURATED,
     CLASS_UNCLEAR,
     classify_wedge,
 )
-from sglang.srt.managers.wedge_recovery import (
+from flliper.srt.managers.wedge_recovery import (
     STATE_ACTUATED,
     STATE_NOT_APPLICABLE,
     STATE_PENDING,
     STATE_UNCONSUMED,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15)
 
@@ -133,7 +133,7 @@ class WedgeClassCallEdge(unittest.TestCase):
     """
 
     def _fire(self, forward_ct_seq):
-        from sglang.srt.managers.scheduler_components.invariant_checker import (
+        from flliper.srt.managers.scheduler_components.invariant_checker import (
             check_admission_wedge_once,
         )
 
@@ -159,7 +159,7 @@ class WedgeClassCallEdge(unittest.TestCase):
         self.assertIn("forward_delta=40", out[-1][1])
 
     def test_the_stamp_clears_when_the_alarm_clears(self):
-        from sglang.srt.managers.scheduler_components.invariant_checker import (
+        from flliper.srt.managers.scheduler_components.invariant_checker import (
             check_admission_wedge_once,
         )
 

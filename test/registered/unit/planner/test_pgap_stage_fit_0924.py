@@ -13,11 +13,11 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.planner import pgap_stage_fit as F
-from sglang.srt.planner import pp_cut as PC
-from sglang.srt.planner import pp_cut_launch as PL
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import pgap_stage_fit as F
+from flliper.srt.planner import pp_cut as PC
+from flliper.srt.planner import pp_cut_launch as PL
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -52,7 +52,7 @@ def _write_log(prompts=(40960, 81920), lines=LINES, extra=None, deep_from=0, dee
     fct = [0, 0, 0]
     out = [_server_args()]
     for i, p in enumerate(prompts):
-        rid = ("weg2-%d-%d" % (i, i))[:8]
+        rid = ("pdflip-%d-%d" % (i, i))[:8]
         prefix = 0
         chunks = []
         while prefix < p - 1:

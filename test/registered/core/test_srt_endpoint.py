@@ -15,11 +15,11 @@ from typing import Optional
 import numpy as np
 import requests
 
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from flliper.srt.utils import kill_process_tree
+from flliper.srt.utils.hf_transformers_utils import get_tokenizer
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=134, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=130, suite="stage-b-test-1-gpu-small-amd")
 
-SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
+SERVER_ENV = {"FLLIPER_USE_PICKLE_IPC": "0"}
 
 
 class TestSRTEndpoint(CustomTestCase):
@@ -448,7 +448,7 @@ class TestSRTEndpoint(CustomTestCase):
         """
         NOTE: This feature has a race condition bug.
         This line https://github.com/sgl-project/sglang/blob/ef8ec07b2ce4c70c2a33ec5acda4ce529bc3cda4/test/srt/test_srt_endpoint.py#L395-L396 can be accessed by two concurrent threads at the same time. The access order is not guaranteed.
-        In sglang, we use two python threads to overlap the GPU computation and CPU scheduling.
+        In flliper, we use two python threads to overlap the GPU computation and CPU scheduling.
         Thread 1 (the CPU scheduling thread) will update the `param_dict["__req__"].output_ids`.
         Thread 2 (the GPU computation thread) will call `DeterministicStatefulLogitProcessor` because sampling is considered as GPU computation.
         We can fix this by moving the call of DeterministicStatefulLogitProcessor to the CPU scheduling thread.
@@ -676,7 +676,7 @@ class TestTokenizeDetokenize(CustomTestCase):
         return r.json()
 
     def test_tokenize_various_inputs(self):
-        single = "Hello SGLang world! 123 😊, ಪರ್ವತದ ಮೇಲೆ ಹಿಮ."
+        single = "Hello fLLiper world! 123 😊, ಪರ್ವತದ ಮೇಲೆ ಹಿಮ."
         multi = ["First sentence.", "Second, with 中文."]
         scenarios = [
             {"prompt": single, "add_special_tokens": True},

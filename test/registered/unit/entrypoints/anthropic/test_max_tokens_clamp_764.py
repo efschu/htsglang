@@ -24,22 +24,22 @@ No GPU, no model load: run with CUDA_VISIBLE_DEVICES=99.
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
-from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+from flliper.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
-from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
-from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
+from flliper.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from flliper.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
 )
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat  # noqa: E402
-from sglang.srt.managers.io_struct import GenerateReqInput  # noqa: E402
-from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.entrypoints.openai.serving_chat import OpenAIServingChat  # noqa: E402
+from flliper.srt.managers.io_struct import GenerateReqInput  # noqa: E402
+from flliper.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 

@@ -35,12 +35,12 @@ import types
 import pytest
 import torch
 
-from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.models import gemma4_mm
-from sglang.srt.multimodal import lane_support
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.attention.triton_backend import TritonAttnBackend
+from flliper.srt.managers.tokenizer_manager import TokenizerManager
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.srt.models import gemma4_mm
+from flliper.srt.multimodal import lane_support
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 

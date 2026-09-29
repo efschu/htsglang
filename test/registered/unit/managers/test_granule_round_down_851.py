@@ -45,7 +45,7 @@ Fills the gap at ``test/srt/test_funding_authority_770.py:274-296``
 
 import unittest
 
-from sglang.srt.managers.funding_authority import MIB, FundingAuthority, Post
+from flliper.srt.managers.funding_authority import MIB, FundingAuthority, Post
 
 #: The shipped KV granule on this rig: 8192 rows x 32 KiB = 256 MiB.
 KV_GRANULE_BYTES = 256 * MIB

@@ -22,7 +22,7 @@ test for a pure bookkeeping defect).
 
 import unittest
 
-from sglang.srt.translator.asr_backends import FasterWhisperAsr, NemoStreamingAsr
+from flliper.srt.translator.asr_backends import FasterWhisperAsr, NemoStreamingAsr
 
 
 def _whisper(deployment=()):

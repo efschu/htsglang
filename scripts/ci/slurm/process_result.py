@@ -6,7 +6,7 @@ Usage (called once per result file):
 
 Required env vars:
     RESULT_FILENAME   - path to the result file without the .json extension
-    FRAMEWORK         - e.g. dynamo-sglang
+    FRAMEWORK         - e.g. dynamo-flliper
     PRECISION         - e.g. fp8, fp4
     MODEL_PREFIX      - short model label, e.g. dsr1
     ISL               - input sequence length
@@ -62,7 +62,7 @@ if recipe_file and Path(recipe_file).exists():
     prefill_num_workers = res.get("prefill_workers", 0)
     decode_num_workers = res.get("decode_workers", 0)
 
-    sgl = recipe.get("backend", {}).get("sglang_config", {})
+    sgl = recipe.get("backend", {}).get("flliper_config", {})
     p = sgl.get("prefill", {})
     d = sgl.get("decode", {})
 

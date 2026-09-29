@@ -57,7 +57,7 @@
 # immer aufsteigend nach PCI-Bus-Id sortiert ist).
 #
 # Kartenlocks: identisches Protokoll wie
-# python/sglang/srt/planner/comm_suite.py::_CardWindow (Runbook §7.1 v2) --
+# python/flliper/srt/planner/comm_suite.py::_CardWindow (Runbook §7.1 v2) --
 # gleiche Pfade, gleiches info-Dateiformat, damit dieses Skript mit der
 # bestehenden Fenster-Disziplin interoperiert statt ein Parallelschema
 # einzufuehren.

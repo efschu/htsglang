@@ -34,8 +34,8 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.io_struct import SessionCheckpointReqInput
-from sglang.srt.managers.session_checkpoint import (
+from flliper.srt.managers.io_struct import SessionCheckpointReqInput
+from flliper.srt.managers.session_checkpoint import (
     CHECKPOINT_ENVELOPE_VERSION,
     BranchAccounting,
     CheckpointLedger,
@@ -49,10 +49,10 @@ from sglang.srt.managers.session_checkpoint import (
     verify_geometry,
     verify_restore,
 )
-from sglang.srt.managers.session_handover import build_manifest, verify_import
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.memtier.registry import TierRegistry
-from sglang.srt.memtier.tiers import (
+from flliper.srt.managers.session_handover import build_manifest, verify_import
+from flliper.srt.mem_cache.base_prefix_cache import MatchResult
+from flliper.srt.memtier.registry import TierRegistry
+from flliper.srt.memtier.tiers import (
     TierCapacity,
     TierCaps,
     TierDescriptor,
@@ -61,9 +61,9 @@ from sglang.srt.memtier.tiers import (
     TierTransport,
     Volatility,
 )
-from sglang.srt.planner.cost_model import Rate
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner.cost_model import Rate
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

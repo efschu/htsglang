@@ -34,8 +34,8 @@ import sys
 import tempfile
 import unittest
 
-from sglang.srt.planner import pp_cut
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.planner import pp_cut
+from flliper.test.ci.ci_register import register_cpu_ci
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_pp_family_cut_485 as ref  # noqa: E402

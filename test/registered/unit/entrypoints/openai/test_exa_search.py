@@ -5,22 +5,22 @@ from unittest.mock import patch
 
 from utils import make_serving
 
-from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
-from sglang.srt.entrypoints.openai.tool_server import NativeToolServer
-from sglang.srt.entrypoints.search.exa_client import (
+from flliper.srt.entrypoints.openai.protocol import ResponsesRequest
+from flliper.srt.entrypoints.openai.tool_server import NativeToolServer
+from flliper.srt.entrypoints.search.exa_client import (
     EXA_INTEGRATION_HEADER,
     EXA_INTEGRATION_NAME,
     ExaClient,
     ExaSearchConfig,
 )
-from sglang.srt.entrypoints.tool import HarmonyBrowserTool
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.entrypoints.tool import HarmonyBrowserTool
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class ExaClientTestCase(unittest.TestCase):
-    def test_headers_include_sglang_integration_tag(self):
+    def test_headers_include_flliper_integration_tag(self):
         client = ExaClient("test-key")
 
         headers = client._headers()
@@ -32,7 +32,7 @@ class ExaClientTestCase(unittest.TestCase):
     def test_default_search_payload_uses_server_side_defaults(self):
         client = ExaClient("test-key")
 
-        payload = client._search_payload("SGLang native web search")
+        payload = client._search_payload("fLLiper native web search")
 
         self.assertEqual(payload["numResults"], 10)
         self.assertEqual(payload["type"], "auto")
@@ -49,9 +49,9 @@ class ExaClientTestCase(unittest.TestCase):
 
     def test_config_can_be_set_from_server_environment(self):
         env = {
-            "SGLANG_EXA_NUM_RESULTS": "7",
-            "SGLANG_EXA_SEARCH_TYPE": "fast",
-            "SGLANG_EXA_INCLUDE_HIGHLIGHTS": "false",
+            "FLLIPER_EXA_NUM_RESULTS": "7",
+            "FLLIPER_EXA_SEARCH_TYPE": "fast",
+            "FLLIPER_EXA_INCLUDE_HIGHLIGHTS": "false",
         }
         with patch.dict(os.environ, env, clear=False):
             config = ExaSearchConfig.from_env()
@@ -96,15 +96,15 @@ class ExaClientTestCase(unittest.TestCase):
 
         client = ExaClient("test-key")
         with patch(
-            "sglang.srt.entrypoints.search.exa_client.aiohttp.ClientSession",
+            "flliper.srt.entrypoints.search.exa_client.aiohttp.ClientSession",
             FakeSession,
         ):
-            result = asyncio.run(client._post("/search", {"query": "sglang"}))
+            result = asyncio.run(client._post("/search", {"query": "flliper"}))
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(captured["url"], "https://api.exa.ai/search")
-        self.assertEqual(captured["json"], {"query": "sglang"})
-        self.assertEqual(captured["headers"][EXA_INTEGRATION_HEADER], "sglang")
+        self.assertEqual(captured["json"], {"query": "flliper"})
+        self.assertEqual(captured["headers"][EXA_INTEGRATION_HEADER], "flliper")
 
 
 class ResponsesNativeWebSearchTestCase(unittest.TestCase):
@@ -152,9 +152,9 @@ class NativeWebSearchIntegrationTestCase(unittest.TestCase):
                         "requestId": "mock_req_search",
                         "results": [
                             {
-                                "title": "Mock SGLang Result",
+                                "title": "Mock fLLiper Result",
                                 "url": "https://example.com/sglang",
-                                "highlights": ["SGLang native web search via Exa."],
+                                "highlights": ["fLLiper native web search via Exa."],
                             }
                         ],
                     }
@@ -162,7 +162,7 @@ class NativeWebSearchIntegrationTestCase(unittest.TestCase):
                     "requestId": "mock_req_contents",
                     "results": [
                         {
-                            "title": "Mock SGLang Result",
+                            "title": "Mock fLLiper Result",
                             "url": self.payload["urls"][0],
                             "text": "Opened content returned through Exa contents.",
                         }
@@ -199,30 +199,30 @@ class NativeWebSearchIntegrationTestCase(unittest.TestCase):
             return search_result, open_result
 
         with (
-            patch.dict(os.environ, {"EXA_API_KEY": "mock-sglang-key"}, clear=False),
+            patch.dict(os.environ, {"EXA_API_KEY": "mock-flliper-key"}, clear=False),
             patch(
-                "sglang.srt.entrypoints.search.exa_client.aiohttp.ClientSession",
+                "flliper.srt.entrypoints.search.exa_client.aiohttp.ClientSession",
                 FakeSession,
             ),
         ):
             search_result, open_result = asyncio.run(run_tool_flow())
 
-        self.assertIn("Mock SGLang Result", search_result)
-        self.assertIn("SGLang native web search via Exa.", search_result)
+        self.assertIn("Mock fLLiper Result", search_result)
+        self.assertIn("fLLiper native web search via Exa.", search_result)
         self.assertIn("Opened content returned through Exa contents.", open_result)
         self.assertEqual(len(captured_calls), 2)
 
         search_call, contents_call = captured_calls
         self.assertEqual(search_call["url"], "https://api.exa.ai/search")
-        self.assertEqual(search_call["headers"]["x-api-key"], "mock-sglang-key")
-        self.assertEqual(search_call["headers"][EXA_INTEGRATION_HEADER], "sglang")
+        self.assertEqual(search_call["headers"]["x-api-key"], "mock-flliper-key")
+        self.assertEqual(search_call["headers"][EXA_INTEGRATION_HEADER], "flliper")
         self.assertEqual(search_call["json"]["numResults"], 10)
         self.assertEqual(search_call["json"]["type"], "auto")
         self.assertEqual(search_call["json"]["contents"], {"highlights": True})
 
         self.assertEqual(contents_call["url"], "https://api.exa.ai/contents")
-        self.assertEqual(contents_call["headers"]["x-api-key"], "mock-sglang-key")
-        self.assertEqual(contents_call["headers"][EXA_INTEGRATION_HEADER], "sglang")
+        self.assertEqual(contents_call["headers"]["x-api-key"], "mock-flliper-key")
+        self.assertEqual(contents_call["headers"][EXA_INTEGRATION_HEADER], "flliper")
         self.assertEqual(contents_call["json"]["urls"], ["https://example.com/sglang"])
         self.assertTrue(contents_call["json"]["text"])
         self.assertTrue(contents_call["json"]["highlights"])
@@ -239,7 +239,7 @@ class FakeExaClient:
             "requestId": "req_123",
             "results": [
                 {
-                    "title": "SGLang",
+                    "title": "fLLiper",
                     "url": "https://example.com/sglang",
                     "highlights": ["Native web search powered by Exa."],
                 }
@@ -251,9 +251,9 @@ class FakeExaClient:
         return {
             "results": [
                 {
-                    "title": "SGLang",
+                    "title": "fLLiper",
                     "url": urls[0],
-                    "text": "SGLang native web search uses Exa for retrieval.",
+                    "text": "fLLiper native web search uses Exa for retrieval.",
                     "highlights": ["Exa for retrieval."],
                 }
             ]
@@ -272,7 +272,7 @@ class HarmonyBrowserToolTestCase(unittest.TestCase):
 
         search_result = asyncio.run(
             tool._dispatch_browser_call(
-                context, "browser.search", {"query": "SGLang web search"}
+                context, "browser.search", {"query": "fLLiper web search"}
             )
         )
         open_result = asyncio.run(
@@ -286,17 +286,17 @@ class HarmonyBrowserToolTestCase(unittest.TestCase):
             )
         )
 
-        self.assertEqual(client.search_queries, ["SGLang web search"])
+        self.assertEqual(client.search_queries, ["fLLiper web search"])
         self.assertEqual(
             client.content_urls,
             [["https://example.com/sglang"], ["https://example.com/direct"]],
         )
         self.assertNotIn("req_123", search_result)
-        self.assertIn("[1] SGLang", search_result)
+        self.assertIn("[1] fLLiper", search_result)
         self.assertIn("Snippet: Native web search powered by Exa.", search_result)
-        self.assertIn("Opened page: SGLang", open_result)
-        self.assertIn("SGLang native web search uses Exa", open_result)
-        self.assertIn("SGLang native web search uses Exa", find_result)
+        self.assertIn("Opened page: fLLiper", open_result)
+        self.assertIn("fLLiper native web search uses Exa", open_result)
+        self.assertIn("fLLiper native web search uses Exa", find_result)
 
 
 if __name__ == "__main__":

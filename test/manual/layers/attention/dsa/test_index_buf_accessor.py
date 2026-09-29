@@ -13,7 +13,7 @@ Test coverage:
 import pytest
 import torch
 
-from sglang.srt.layers.attention.dsa.index_buf_accessor import GetK, GetKAndS, GetS
+from flliper.srt.layers.attention.dsa.index_buf_accessor import GetK, GetKAndS, GetS
 
 
 class MockDSATokenToKVPool:

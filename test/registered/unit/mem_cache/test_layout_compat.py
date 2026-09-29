@@ -29,7 +29,7 @@ CPU-only — no GPU / Triton needed.
     python -m pytest test/registered/unit/mem_cache/test_layout_compat.py -v
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -37,8 +37,8 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import move_kv_cache_native
-from sglang.srt.mem_cache.unified_memory_pool import (
+from flliper.srt.mem_cache.memory_pool import move_kv_cache_native
+from flliper.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
     UnifiedKVPool,

@@ -9,12 +9,12 @@
 #                              nightly-test-<runner>.yml workflow.
 # Never edit workflow YAML files directly for these changes.
 
-dsr1-fp8-gb200-dynamo-sglang:
+dsr1-fp8-gb200-dynamo-flliper:
   model: deepseek-ai/DeepSeek-R1-0528
   model-prefix: dsr1
   runner: gb200
   precision: fp8
-  framework: dynamo-sglang
+  framework: dynamo-flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -29,12 +29,12 @@ dsr1-fp8-gb200-dynamo-sglang:
           # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp8/1k1k/ultra-tpt.yaml
           config_file: recipes/gb200-fp8/1k1k/ultra-tpt.yaml
 
-dsr1-fp4-gb200-dynamo-sglang:
+dsr1-fp4-gb200-dynamo-flliper:
   model: nvidia/DeepSeek-R1-0528-NVFP4-v2
   model-prefix: dsr1
   runner: gb200
   precision: fp4
-  framework: dynamo-sglang
+  framework: dynamo-flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -54,13 +54,13 @@ dsr1-fp4-gb200-dynamo-sglang:
 #
 # model_path points at the shared NFS HuggingFace cache dir (models--org--name);
 # the launcher resolves the live snapshot via refs/main, so no hash is hardcoded.
-dsv4flash-fp8-mi355x-sglang:
+dsv4flash-fp8-mi355x-flliper:
   model: sgl-project/DeepSeek-V4-Flash-FP8
   model-prefix: dsv4flash
   model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
   runner: mi355x
   precision: fp8
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -70,13 +70,13 @@ dsv4flash-fp8-mi355x-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/1p1d.yaml
 
-dsv4pro-fp8-mi355x-sglang:
+dsv4pro-fp8-mi355x-flliper:
   model: sgl-project/DeepSeek-V4-Pro-FP8
   model-prefix: dsv4pro
   model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
   runner: mi355x
   precision: fp8
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -86,13 +86,13 @@ dsv4pro-fp8-mi355x-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d.yaml
 
-dsv4flash-fp4-mi355x-sglang:
+dsv4flash-fp4-mi355x-flliper:
   model: deepseek-ai/DeepSeek-V4-Flash
   model-prefix: dsv4flash
   model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
   runner: mi355x
   precision: fp4
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -102,13 +102,13 @@ dsv4flash-fp4-mi355x-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d.yaml
 
-dsv4pro-fp4-mi355x-sglang:
+dsv4pro-fp4-mi355x-flliper:
   model: deepseek-ai/DeepSeek-V4-Pro
   model-prefix: dsv4pro
   model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
   runner: mi355x
   precision: fp4
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -127,13 +127,13 @@ dsv4pro-fp4-mi355x-sglang:
 # launch_mi355x.sh reads expert-/data-parallel-size and the `mtp:` section to
 # append --ep-size / --enable-dp-attention --dp-size / --speculative-* flags.
 
-dsv4flash-fp8-mi355x-mtp-sglang:
+dsv4flash-fp8-mi355x-mtp-flliper:
   model: sgl-project/DeepSeek-V4-Flash-FP8
   model-prefix: dsv4flash
   model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
   runner: mi355x
   precision: fp8
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -143,13 +143,13 @@ dsv4flash-fp8-mi355x-mtp-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/1p1d-mtp.yaml
 
-dsv4flash-fp8-mi355x-dp8ep8-sglang:
+dsv4flash-fp8-mi355x-dp8ep8-flliper:
   model: sgl-project/DeepSeek-V4-Flash-FP8
   model-prefix: dsv4flash
   model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
   runner: mi355x
   precision: fp8
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -159,13 +159,13 @@ dsv4flash-fp8-mi355x-dp8ep8-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/1p1d-dp8ep8.yaml
 
-dsv4flash-fp8-mi355x-dp8ep8-mtp-sglang:
+dsv4flash-fp8-mi355x-dp8ep8-mtp-flliper:
   model: sgl-project/DeepSeek-V4-Flash-FP8
   model-prefix: dsv4flash
   model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
   runner: mi355x
   precision: fp8
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -175,13 +175,13 @@ dsv4flash-fp8-mi355x-dp8ep8-mtp-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/1p1d-dp8ep8-mtp.yaml
 
-dsv4pro-fp8-mi355x-mtp-sglang:
+dsv4pro-fp8-mi355x-mtp-flliper:
   model: sgl-project/DeepSeek-V4-Pro-FP8
   model-prefix: dsv4pro
   model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
   runner: mi355x
   precision: fp8
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -193,13 +193,13 @@ dsv4pro-fp8-mi355x-mtp-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d-mtp.yaml
 
-dsv4pro-fp8-mi355x-dp8ep8-sglang:
+dsv4pro-fp8-mi355x-dp8ep8-flliper:
   model: sgl-project/DeepSeek-V4-Pro-FP8
   model-prefix: dsv4pro
   model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
   runner: mi355x
   precision: fp8
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -209,13 +209,13 @@ dsv4pro-fp8-mi355x-dp8ep8-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d-dp8ep8.yaml
 
-dsv4pro-fp8-mi355x-dp8ep8-mtp-sglang:
+dsv4pro-fp8-mi355x-dp8ep8-mtp-flliper:
   model: sgl-project/DeepSeek-V4-Pro-FP8
   model-prefix: dsv4pro
   model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
   runner: mi355x
   precision: fp8
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -225,13 +225,13 @@ dsv4pro-fp8-mi355x-dp8ep8-mtp-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d-dp8ep8-mtp.yaml
 
-dsv4flash-fp4-mi355x-mtp-sglang:
+dsv4flash-fp4-mi355x-mtp-flliper:
   model: deepseek-ai/DeepSeek-V4-Flash
   model-prefix: dsv4flash
   model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
   runner: mi355x
   precision: fp4
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -241,13 +241,13 @@ dsv4flash-fp4-mi355x-mtp-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d-mtp.yaml
 
-dsv4flash-fp4-mi355x-dp8ep8-sglang:
+dsv4flash-fp4-mi355x-dp8ep8-flliper:
   model: deepseek-ai/DeepSeek-V4-Flash
   model-prefix: dsv4flash
   model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
   runner: mi355x
   precision: fp4
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -257,13 +257,13 @@ dsv4flash-fp4-mi355x-dp8ep8-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d-dp8ep8.yaml
 
-dsv4flash-fp4-mi355x-dp8ep8-mtp-sglang:
+dsv4flash-fp4-mi355x-dp8ep8-mtp-flliper:
   model: deepseek-ai/DeepSeek-V4-Flash
   model-prefix: dsv4flash
   model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
   runner: mi355x
   precision: fp4
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -273,13 +273,13 @@ dsv4flash-fp4-mi355x-dp8ep8-mtp-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d-dp8ep8-mtp.yaml
 
-dsv4pro-fp4-mi355x-mtp-sglang:
+dsv4pro-fp4-mi355x-mtp-flliper:
   model: deepseek-ai/DeepSeek-V4-Pro
   model-prefix: dsv4pro
   model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
   runner: mi355x
   precision: fp4
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -289,13 +289,13 @@ dsv4pro-fp4-mi355x-mtp-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/1p1d-mtp.yaml
 
-dsv4pro-fp4-mi355x-dp8ep8-sglang:
+dsv4pro-fp4-mi355x-dp8ep8-flliper:
   model: deepseek-ai/DeepSeek-V4-Pro
   model-prefix: dsv4pro
   model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
   runner: mi355x
   precision: fp4
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -305,13 +305,13 @@ dsv4pro-fp4-mi355x-dp8ep8-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/1p1d-dp8ep8.yaml
 
-dsv4pro-fp4-mi355x-dp8ep8-mtp-sglang:
+dsv4pro-fp4-mi355x-dp8ep8-mtp-flliper:
   model: deepseek-ai/DeepSeek-V4-Pro
   model-prefix: dsv4pro
   model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
   runner: mi355x
   precision: fp4
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -325,13 +325,13 @@ dsv4pro-fp4-mi355x-dp8ep8-mtp-sglang:
 # Kimi-specific config lives in the recipe's `model:` block + split attention
 # runtime, with nothing hardcoded in launch_mi355x.sh. Base + EAGLE3 MTP (the
 # MTP leg uses an external draft checkpoint via mtp.draft_model_path).
-kimik26-fp8-mi355x-sglang:
+kimik26-fp8-mi355x-flliper:
   model: moonshotai/Kimi-K2.6
   model-prefix: kimik26
   model_path: /it-share/model_coverage/models--moonshotai--Kimi-K2.6
   runner: mi355x
   precision: fp8
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:
@@ -341,13 +341,13 @@ kimik26-fp8-mi355x-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d.yaml
 
-kimik26-fp8-mi355x-mtp-sglang:
+kimik26-fp8-mi355x-mtp-flliper:
   model: moonshotai/Kimi-K2.6
   model-prefix: kimik26
   model_path: /it-share/model_coverage/models--moonshotai--Kimi-K2.6
   runner: mi355x
   precision: fp8
-  framework: sglang
+  framework: flliper
   multinode: true
   disagg: true
   seq-len-configs:

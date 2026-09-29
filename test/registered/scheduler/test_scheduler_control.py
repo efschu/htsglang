@@ -6,12 +6,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.abort_timeout_kit import AbortAllMixin, WaitingTimeoutMixin
-from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kits.abort_timeout_kit import AbortAllMixin, WaitingTimeoutMixin
+from flliper.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -213,13 +213,13 @@ class TestAbortAllWithRetraction(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        # Here's a small trick: in scheduler.py, when SGLANG_TEST_RETRACT is enabled,
+        # Here's a small trick: in scheduler.py, when FLLIPER_TEST_RETRACT is enabled,
         # retraction is triggered when the batch size reaches 10.
-        # However, since SGLANG_TEST_RETRACT_NO_PREFILL_BS is set to 6, the remaining 4
+        # However, since FLLIPER_TEST_RETRACT_NO_PREFILL_BS is set to 6, the remaining 4
         # requests will stay in the waiting queue.
         with (
-            envs.SGLANG_TEST_RETRACT.override(True),
-            envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.override(6),
+            envs.FLLIPER_TEST_RETRACT.override(True),
+            envs.FLLIPER_TEST_RETRACT_NO_PREFILL_BS.override(6),
         ):
             cls.process = popen_launch_server(
                 cls.model,
@@ -311,7 +311,7 @@ class TestAbortWithWaitingTimeout(WaitingTimeoutMixin, CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0.001):
+        with envs.FLLIPER_REQ_WAITING_TIMEOUT.override(0.001):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -332,8 +332,8 @@ class TestAbortWithRunningTimeout(CustomTestCase):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         with (
-            envs.SGLANG_REQ_RUNNING_TIMEOUT.override(0.001),
-            envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.override(False),
+            envs.FLLIPER_REQ_RUNNING_TIMEOUT.override(0.001),
+            envs.FLLIPER_ENABLE_HEALTH_ENDPOINT_GENERATION.override(False),
         ):
             cls.process = popen_launch_server(
                 cls.model,

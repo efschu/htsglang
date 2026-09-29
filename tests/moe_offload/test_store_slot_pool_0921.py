@@ -23,7 +23,7 @@ die ganze gehalten wird.
 
 import os
 
-from sglang.srt.layers.moe import expert_store as es
+from flliper.srt.layers.moe import expert_store as es
 
 
 def test_default_is_byte_identical_to_before(monkeypatch):
@@ -93,7 +93,7 @@ def test_only_cold_rows_reach_the_host():
     haelt die Entscheidung fest, damit sie nicht zurueckdriftet."""
     import inspect
 
-    from sglang.srt.layers.moe import expert_offload as eo
+    from flliper.srt.layers.moe import expert_offload as eo
 
     src = inspect.getsource(eo)
     assert "spill_ids = [e for e in range(E) if e not in resident_set]" in src
@@ -107,7 +107,7 @@ def test_the_store_is_big_because_of_reserved_slots_not_content():
     Datei ueber ALLE globalen Ids anlegt. Genau da setzt der Slot-Pool an."""
     import inspect
 
-    from sglang.srt.layers.moe import expert_store as es
+    from flliper.srt.layers.moe import expert_store as es
 
     src = inspect.getsource(es.open_store)
     assert "slots_for(int(num_experts))" in src

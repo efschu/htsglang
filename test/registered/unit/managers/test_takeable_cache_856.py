@@ -25,14 +25,14 @@ fix one caller by breaking the other's documented argument. Only the budget
 caller subtracts.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers.corridor_admission import takeable_cache_bytes
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.corridor_admission import takeable_cache_bytes
+from flliper.test.test_utils import CustomTestCase
 
 MIB = 1024 * 1024
 
@@ -83,7 +83,7 @@ class TestTheSharedFigureIsNotChanged(CustomTestCase):
     """The other caller's documented argument must survive."""
 
     def test_allocator_cache_bytes_is_still_its_own_method(self):
-        from sglang.srt.managers.corridor_admission import PrefillAdmissionGate
+        from flliper.srt.managers.corridor_admission import PrefillAdmissionGate
 
         self.assertTrue(hasattr(PrefillAdmissionGate, "_allocator_cache_bytes"))
         self.assertTrue(hasattr(PrefillAdmissionGate, "_takeable_cache_bytes"))
@@ -97,7 +97,7 @@ class TestTheSharedFigureIsNotChanged(CustomTestCase):
         # documented "overstating is safe here" argument silently changes.
         import inspect
 
-        from sglang.srt.managers.corridor_admission import PrefillAdmissionGate
+        from flliper.srt.managers.corridor_admission import PrefillAdmissionGate
 
         shared = inspect.getsource(PrefillAdmissionGate._allocator_cache_bytes)
         self.assertNotIn("graph_pool", shared)
@@ -130,7 +130,7 @@ class TestTheWiringIsLiveAndInertInTheRightPlaces(CustomTestCase):
         # Under CUDA_VISIBLE_DEVICES="" there is no device, so the segment
         # view cannot be read and the caller must keep exactly its previous
         # budget. This is what makes the change safe to land unvalidated.
-        from sglang.srt.managers.corridor_admission import PrefillAdmissionGate
+        from flliper.srt.managers.corridor_admission import PrefillAdmissionGate
 
         got = PrefillAdmissionGate._takeable_cache_bytes(self._gate(310))
         self.assertEqual(got, 310 * MIB)
@@ -138,7 +138,7 @@ class TestTheWiringIsLiveAndInertInTheRightPlaces(CustomTestCase):
     def test_an_injected_probe_actually_subtracts(self):
         # THE CAN-FAIL PARTNER of the test above: without this, "inert under
         # CVD=''" would be indistinguishable from "inert everywhere".
-        from sglang.srt.managers.corridor_admission import PrefillAdmissionGate
+        from flliper.srt.managers.corridor_admission import PrefillAdmissionGate
 
         got = PrefillAdmissionGate._takeable_cache_bytes(
             self._gate(310, probe=lambda: 88 * MIB)
@@ -148,7 +148,7 @@ class TestTheWiringIsLiveAndInertInTheRightPlaces(CustomTestCase):
     def test_a_raising_probe_falls_back_to_the_unadjusted_figure(self):
         # This sizes a prefill budget on the admission path; a probe that
         # throws may cost precision, never an admission.
-        from sglang.srt.managers.corridor_admission import PrefillAdmissionGate
+        from flliper.srt.managers.corridor_admission import PrefillAdmissionGate
 
         def _boom():
             raise RuntimeError("snapshot exploded")

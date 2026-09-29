@@ -4,14 +4,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.models.dflash import (
+from flliper.srt.models.dflash import (
     CandidateSelector,
     DFlash2DraftModel,
     _grouped_conv,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.runtime_context import get_parallel
+from flliper.srt.speculative.dflash_utils import parse_dflash_draft_config
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -145,11 +145,11 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
         _transform_unary_logits=lambda logits: logits.float(),
     )
     monkeypatch.setattr(
-        "sglang.srt.models.dflash.get_parallel",
+        "flliper.srt.models.dflash.get_parallel",
         lambda: SimpleNamespace(tp_size=1),
     )
     monkeypatch.setattr(
-        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
+        "flliper.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
     )
 
     candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
@@ -200,14 +200,14 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
         return torch.cat([rank0_ids.long(), x], dim=dim)
 
     monkeypatch.setattr(
-        "sglang.srt.models.dflash.get_parallel",
+        "flliper.srt.models.dflash.get_parallel",
         lambda: SimpleNamespace(tp_size=2),
     )
     monkeypatch.setattr(
-        "sglang.srt.models.dflash.tensor_model_parallel_all_gather", fake_all_gather
+        "flliper.srt.models.dflash.tensor_model_parallel_all_gather", fake_all_gather
     )
     monkeypatch.setattr(
-        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
+        "flliper.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
     )
 
     candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
@@ -225,7 +225,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     fallback -- a revert there keeps every compute_candidates test green, so
     the admission (and the rejection of an unsupported packed head) needs its
     own guard."""
-    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+    from flliper.srt.speculative import dflash_worker_v2 as worker_mod
 
     built = {}
     monkeypatch.setattr(

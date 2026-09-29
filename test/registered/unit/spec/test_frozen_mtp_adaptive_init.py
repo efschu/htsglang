@@ -14,16 +14,16 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.speculative.adaptive_runtime_state import AdaptiveController
-from sglang.srt.speculative.adaptive_spec_params import (
+from flliper.srt.speculative.adaptive_runtime_state import AdaptiveController
+from flliper.srt.speculative.adaptive_spec_params import (
     DEFAULT_ADAPTIVE_CONFIG,
     FROZEN_MTP_DEFAULT_ADAPTIVE_CONFIG,
     default_adaptive_config_for,
     resolve_candidate_steps_from_config,
 )
-from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPWorkerV2
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPWorkerV2
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -40,7 +40,7 @@ def _assert_supported(server_args):
     """Run the real init-time guard on a detached worker instance."""
     worker = object.__new__(FrozenKVMTPWorkerV2)
     with patch(
-        "sglang.srt.speculative.frozen_kv_mtp_worker_v2.adaptive_unsupported_reason",
+        "flliper.srt.speculative.frozen_kv_mtp_worker_v2.adaptive_unsupported_reason",
         return_value=None,
     ):
         FrozenKVMTPWorkerV2._assert_adaptive_supported(worker, server_args)

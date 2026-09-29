@@ -4,37 +4,37 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
-from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
-from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
-from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
-from sglang.srt.layers.attention.qsa.kernel import (
+from flliper.kernels.ops.attention import qwen38_qsa_sm121_varlen
+from flliper.srt.configs.qwen4_exp import Qwen4ExpConfig
+from flliper.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
+from flliper.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
+from flliper.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
     qsa_fast_topk,
     qsa_sparse_attention,
     torch_expand_qsa_block_indices,
     triton_expand_qsa_block_indices,
 )
-from sglang.srt.layers.attention.qsa.metadata import (
+from flliper.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
     build_qsa_row_ranges,
 )
-from sglang.srt.layers.attention.qsa.mqa import (
+from flliper.srt.layers.attention.qsa.mqa import (
     qsa_mqa_decode,
     qsa_mqa_prefill,
 )
-from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-from sglang.srt.layers.attention.qsa.sparse_attn import (
+from flliper.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+from flliper.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     sparse_gqa_fwd_interface_triton_ck,
 )
-from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+from flliper.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -103,7 +103,7 @@ def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
     [((12, 0), True), ((12, 1), False), ((10, 0), False)],
 )
 def test_is_sm120_matches_exact_capability(monkeypatch, capability, expected):
-    from sglang.srt.utils import common
+    from flliper.srt.utils import common
 
     common.is_sm120.cache_clear()
     monkeypatch.setattr(common, "is_cuda", lambda: True)
@@ -120,7 +120,7 @@ def test_is_sm120_matches_exact_capability(monkeypatch, capability, expected):
     [((12, 1), True), ((12, 0), False), ((10, 0), False)],
 )
 def test_is_sm121_matches_exact_capability(monkeypatch, capability, expected):
-    from sglang.srt.utils import common
+    from flliper.srt.utils import common
 
     common.is_sm121.cache_clear()
     monkeypatch.setattr(common, "is_cuda", lambda: True)
@@ -147,8 +147,8 @@ def test_qsa_trtllm_sparse_decode_arch_gate(
     flashinfer_decode = ModuleType("flashinfer.decode")
     flashinfer_decode.trtllm_batch_decode_with_kv_cache = trtllm_decode_func
 
-    monkeypatch.setattr("sglang.srt.utils.is_sm100_supported", lambda: sm100)
-    monkeypatch.setattr("sglang.srt.utils.is_sm120", lambda: sm120)
+    monkeypatch.setattr("flliper.srt.utils.is_sm100_supported", lambda: sm100)
+    monkeypatch.setattr("flliper.srt.utils.is_sm120", lambda: sm120)
     monkeypatch.setitem(sys.modules, flashinfer_decode.__name__, flashinfer_decode)
 
     try:
@@ -161,7 +161,7 @@ def test_qsa_trtllm_sparse_decode_arch_gate(
 def test_qsa_sm121_resolves_kda_varlen_kernel(monkeypatch):
     resolver = qsa_backend_module._resolve_flash_attn_varlen_func
     resolver.cache_clear()
-    monkeypatch.setattr("sglang.srt.utils.is_sm121", lambda: True)
+    monkeypatch.setattr("flliper.srt.utils.is_sm121", lambda: True)
 
     try:
         assert resolver() is qwen38_qsa_sm121_varlen
@@ -261,7 +261,7 @@ def _compressed_config_namespace(**overrides):
 
 
 def test_qsa_profile_parses_compressed_qwen4_exp_schema():
-    from sglang.srt.layers.attention.qsa.config import (
+    from flliper.srt.layers.attention.qsa.config import (
         is_qwen_qsa,
         parse_qsa_profile,
     )
@@ -296,7 +296,7 @@ def test_qsa_profile_parses_compressed_qwen4_exp_schema():
 
 
 def test_qsa_profile_rejects_malformed_compressed_schema():
-    from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+    from flliper.srt.layers.attention.qsa.config import parse_qsa_profile
 
     bad_configs = {
         "missing": _compressed_config_namespace(indexer_budget=None),
@@ -316,7 +316,7 @@ def test_qsa_profile_rejects_malformed_compressed_schema():
 
 
 def test_qsa_glue_builds_compressed_indexer(monkeypatch):
-    from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
+    from flliper.srt.layers.attention.qsa.glue import build_qsa_indexer
 
     recorded = {}
 
@@ -352,10 +352,10 @@ def test_qsa_glue_builds_compressed_indexer(monkeypatch):
 
 
 def test_qsa_glue_fetches_indexer_metadata_without_model_unwrap():
-    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    from flliper.srt.layers.attention.hybrid_linear_attn_backend import (
         HybridLinearAttnBackend,
     )
-    from sglang.srt.layers.attention.qsa.glue import get_qsa_indexer_metadata
+    from flliper.srt.layers.attention.qsa.glue import get_qsa_indexer_metadata
 
     full = SimpleNamespace(
         get_indexer_metadata=lambda layer_id, forward_batch: f"meta-{layer_id}",
@@ -383,8 +383,8 @@ def test_qsa_glue_fetches_indexer_metadata_without_model_unwrap():
 
 
 def test_qsa_draft_extend_backend_decision_follows_profile():
-    from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
-    from sglang.srt.speculative.draft_utils import DraftBackendFactory
+    from flliper.srt.layers.attention.qsa.config import parse_qsa_profile
+    from flliper.srt.speculative.draft_utils import DraftBackendFactory
 
     def factory(config):
         runner = SimpleNamespace(
@@ -1212,7 +1212,7 @@ def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
     """EagleDraftWorker.draft_forward gives each MTP draft step an out_cache_loc slice;
     the step's metadata must reference that slice, not the first batch_size slots.
     """
-    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    from flliper.srt.layers.attention.qwen_sparse_attn_backend import (
         QwenSparseMultiStepDraftBackend,
     )
 
@@ -1243,7 +1243,7 @@ def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
 def test_qsa_graph_metadata_kernels_match_legacy_host_path():
     """For decode rows and target-verify fan-out (boundary and non-boundary),
     replay kernels and the host refresh must build identical graph buffers."""
-    from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
+    from flliper.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
 
     device = "cuda"
     ratio, full_page = 4, 64
@@ -1407,7 +1407,7 @@ def _qsa_expected_graph_layout(
 def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
     """The layout kernel must rebuild speculative row fan-out and the padded dummy tail;
     the row-metadata kernel must derive compressed slots from those rows."""
-    from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
+    from flliper.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
 
     device = "cuda"
     ratio, full_page = 4, 64

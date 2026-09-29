@@ -6,7 +6,7 @@ the reset. #249 lets such a pool GROW its id space instead of refusing:
                        rows 353600 -> 436032 (+82432, 0 B each; synced 353600)
 
 Thirteen seconds later both workers died in the backup of the finished
-weg2-0-14 (``#1469 RETAIN ... token_ids_len=62091``):
+pdflip-0-14 (``#1469 RETAIN ... token_ids_len=62091``):
 
     KvTransferShapeMismatch: #760 ... dst indices out of bounds:
     max=365887 >= capacity 353600
@@ -36,8 +36,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.kv_transfer_guard import KvTransferShapeMismatch  # noqa: E402
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost  # noqa: E402
+from flliper.srt.mem_cache.kv_transfer_guard import KvTransferShapeMismatch  # noqa: E402
+from flliper.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost  # noqa: E402
 
 SYNCED = 353600      # the worker's synced size = TP0 staging 4096 + 5461 slots x 64
 GROW = 82432         # rc12z4-vis: 353600 -> 436032

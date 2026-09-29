@@ -32,7 +32,7 @@ geometry above, and it does not support 75 for this model on this rig:
 
 So mrr=75 is not merely off-balance for the 27B, it is not allocatable. The
 computed balance point lands at mrr 20-25 for short sessions (fp32 state) and
-30-41 with ``SGLANG_MAMBA_SSM_DTYPE=bfloat16``, falling to 12-15 at 32k
+30-41 with ``FLLIPER_MAMBA_SSM_DTYPE=bfloat16``, falling to 12-15 at 32k
 context. The "20 sessions" half of the cited pair does reproduce exactly: it
 is the reference boot's ``max_num_reqs`` at the default target 16.
 
@@ -47,9 +47,9 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.planner.feasibility import plan
-from sglang.srt.planner.hardware import hardware_from_manual
-from sglang.srt.planner.mrr_balance import (
+from flliper.srt.planner.feasibility import plan
+from flliper.srt.planner.hardware import hardware_from_manual
+from flliper.srt.planner.mrr_balance import (
     MAMBA_RATIO,
     MAMBA_SAFETY_MARGIN,
     PREDICTOR_TARGET_CLAMP,
@@ -57,8 +57,8 @@ from sglang.srt.planner.mrr_balance import (
     balance_report,
     state_slot_count,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -159,7 +159,7 @@ class TestSlotArithmetic(CustomTestCase):
         """placement._mamba_sessions now delegates here; it must stay the
         clamped variant, or the per-rank VRAM breakdown stops matching the
         cost model's pool bytes."""
-        from sglang.srt.planner.placement import _mamba_sessions
+        from flliper.srt.planner.placement import _mamba_sessions
 
         class _M:
             spec_active = True
@@ -222,17 +222,17 @@ class TestBalanceGeometry(CustomTestCase):
         self.assertAlmostEqual(bal.break_even_context_tokens, 29362, delta=5)
 
     def test_bf16_ssm_halves_the_state(self):
-        """SGLANG_MAMBA_SSM_DTYPE=bfloat16 (what the rig runbook exports)
+        """FLLIPER_MAMBA_SSM_DTYPE=bfloat16 (what the rig runbook exports)
         halves the SSM term -> 74.8 MiB/slot, break-even 2394 tokens/slot."""
-        prev = os.environ.get("SGLANG_MAMBA_SSM_DTYPE")
-        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = "bfloat16"
+        prev = os.environ.get("FLLIPER_MAMBA_SSM_DTYPE")
+        os.environ["FLLIPER_MAMBA_SSM_DTYPE"] = "bfloat16"
         try:
             bal = self._report().mrr_balance
         finally:
             if prev is None:
-                os.environ.pop("SGLANG_MAMBA_SSM_DTYPE", None)
+                os.environ.pop("FLLIPER_MAMBA_SSM_DTYPE", None)
             else:
-                os.environ["SGLANG_MAMBA_SSM_DTYPE"] = prev
+                os.environ["FLLIPER_MAMBA_SSM_DTYPE"] = prev
         self.assertAlmostEqual(bal.state_mib_per_slot, 74.8, delta=0.1)
         self.assertAlmostEqual(
             bal.state_mib_per_slot * 2**20 / bal.kv_cell_bytes, 2394, delta=2

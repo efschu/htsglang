@@ -1,5 +1,5 @@
 """
-Tests for the separate_reasoning functionality in sglang.
+Tests for the separate_reasoning functionality in flliper.
 
 Usage:
 python3 -m unittest test/lang/test_separate_reasoning.py
@@ -7,9 +7,9 @@ python3 -m unittest test/lang/test_separate_reasoning.py
 
 import unittest
 
-from sglang import gen, separate_reasoning
-from sglang.lang.ir import SglExprList, SglSeparateReasoning
-from sglang.test.test_utils import CustomTestCase
+from flliper import gen, separate_reasoning
+from flliper.lang.ir import SglExprList, SglSeparateReasoning
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestSeparateReasoning(CustomTestCase):

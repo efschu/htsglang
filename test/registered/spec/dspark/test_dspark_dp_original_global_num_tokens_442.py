@@ -33,7 +33,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
+from flliper.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
 
 # Two DP ranks with different token counts, so a scaled/unscaled mix-up is
 # visible rather than accidentally equal.
@@ -100,7 +100,7 @@ def _fill(forward_batch, proposer=None, *, ep: bool = False, batch=None):
     parameter of each test instead of an ambient one.
     """
     with patch(
-        "sglang.srt.speculative.dspark_components.dspark_draft."
+        "flliper.srt.speculative.dspark_components.dspark_draft."
         "enable_num_token_non_padded",
         return_value=ep,
     ):
@@ -158,7 +158,7 @@ class TestDsparkDpOriginalGlobalNumTokens(unittest.TestCase):
 
 
 class TestDsparkDpNumTokenNonPadded(unittest.TestCase):
-    """Upstream sglang #33098: the EP token accounting fields.
+    """Upstream flliper #33098: the EP token accounting fields.
 
     The global vectors above are what the DP all-reduce reads. The EXPERT
     parallel path reads something else entirely -- ``num_token_non_padded`` and

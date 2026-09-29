@@ -3,27 +3,27 @@ from typing import Any, Optional
 
 import pytest
 
-from sglang.srt.debug_utils.comparator.aligner.entrypoint.planner import (
+from flliper.srt.debug_utils.comparator.aligner.entrypoint.planner import (
     _compute_per_step_plans,
     compute_aligner_plan,
     compute_per_step_sub_plans,
 )
-from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
+from flliper.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
     AlignerPerStepSubPlan,
     AlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.reorderer.types import (
+from flliper.srt.debug_utils.comparator.aligner.reorderer.types import (
     ReordererPlan,
     ZigzagToNaturalThdParams,
 )
-from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.types import (
     CpThdConcatParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
-from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.dims_spec import TokenLayout
+from flliper.srt.debug_utils.comparator.utils import Pair
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")
@@ -50,7 +50,7 @@ def _make_meta(
     }
     if extra_parallel_info is not None:
         parallel_info.update(extra_parallel_info)
-    meta["sglang_parallel_info"] = parallel_info
+    meta["flliper_parallel_info"] = parallel_info
     return meta
 
 
@@ -157,7 +157,7 @@ class TestComputeAlignerPlan:
         assert plan.token_aligner_plan is None
 
     def test_preserves_token_aligner_plan(self) -> None:
-        from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
+        from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
             TokenAlignerPlan,
             TokenLocator,
         )

@@ -1,4 +1,4 @@
-"""fnFL2 H65: SGLANG_WEG2_QSA_FP8_DECODE -- the in-kernel fp8 decode of the QSA
+"""fnFL2 H65: FLLIPER_PDFLIP_QSA_FP8_DECODE -- the in-kernel fp8 decode of the QSA
 rows kernel (qsa/sparse_attn.py).
 
 The rows kernel decodes every selected fp8 K/V byte once per (query, kv head)
@@ -32,9 +32,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.qsa import sparse_attn as sa
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.qsa import sparse_attn as sa
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -313,8 +313,8 @@ class LaunchTest(unittest.TestCase):
         q = torch.zeros(total_q, 24, 8, dtype=torch.bfloat16)
         k = torch.zeros(32, 2, 8).to(kv_dtype)
         rows = torch.zeros(total_q, 4, dtype=torch.int32)
-        with envs.SGLANG_WEG2_QSA_FP8_DECODE.override(decode), \
-                envs.SGLANG_FORCE_QSA_ROWS_CONFIG.override(config), \
+        with envs.FLLIPER_PDFLIP_QSA_FP8_DECODE.override(decode), \
+                envs.FLLIPER_FORCE_QSA_ROWS_CONFIG.override(config), \
                 mock.patch.object(sa, "_sparse_attn_rows_fwd", rec), \
                 mock.patch.object(sa.torch.cuda, "get_device_capability", lambda *a: capability), \
                 mock.patch.object(sa.torch.cuda, "get_device_name", lambda *a: "NVIDIA GeForce RTX 3080"):
@@ -325,7 +325,7 @@ class LaunchTest(unittest.TestCase):
         return kw
 
     def test_default_launch_is_the_exp2_decode_and_the_table(self):
-        self.assertEqual(envs.SGLANG_WEG2_QSA_FP8_DECODE.get(), "")
+        self.assertEqual(envs.FLLIPER_PDFLIP_QSA_FP8_DECODE.get(), "")
         # H101: sm120's default table replaces the >512-row entry (16, 1, 2)
         # with the spill-free (64, 8, 2); sm86 keeps the L20 table.
         for cap, cfg in (((8, 6), (16, 1, 2)), ((12, 0), (64, 8, 2))):
@@ -358,7 +358,7 @@ class LaunchTest(unittest.TestCase):
         lines = [r.getMessage() for r in logs.records if "QSA-ROWS-LAUNCH" in r.getMessage()]
         self.assertEqual(len(lines), 1)
         self.assertIn("arch=sm86 kv=fp8 decode=ptx cfg=64/8/2 first_total_q=16384", lines[0])
-        self.assertIn("SGLANG_WEG2_QSA_FP8_DECODE='sm86:ptx'", lines[0])
+        self.assertIn("FLLIPER_PDFLIP_QSA_FP8_DECODE='sm86:ptx'", lines[0])
 
     def test_kernel_default_is_the_exp2_branch(self):
         """The kernel's own default (FP8_DECODE=0) runs the unchanged exp2
@@ -420,8 +420,8 @@ class MetalTest(unittest.TestCase):
         for config in ("", "inf=64/8/2", "inf=32/4/2"):
             outs = {}
             for decode in ("exp2", "bits", "ptx"):
-                with envs.SGLANG_WEG2_QSA_FP8_DECODE.override(decode), \
-                        envs.SGLANG_FORCE_QSA_ROWS_CONFIG.override(config):
+                with envs.FLLIPER_PDFLIP_QSA_FP8_DECODE.override(decode), \
+                        envs.FLLIPER_FORCE_QSA_ROWS_CONFIG.override(config):
                     outs[decode] = sa.sparse_attn_rows_triton(q, k, v, rows, 0.0625)
             for decode in ("bits", "ptx"):
                 self.assertTrue(torch.equal(outs[decode][0], outs["exp2"][0]), (config, decode))

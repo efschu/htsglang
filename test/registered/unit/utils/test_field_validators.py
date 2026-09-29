@@ -1,11 +1,11 @@
 import unittest
 
-from sglang.srt.utils.field_validators import (
+from flliper.srt.utils.field_validators import (
     validate_list_i64_1d,
     validate_optional_list_i64_1d_2d,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

@@ -24,7 +24,7 @@ import re
 
 import pytest
 
-from sglang.jit_kernel.marlin_switches import (
+from flliper.jit_kernel.marlin_switches import (
     ENV_ARCH_OVERRIDE,
     ENV_EPILOGUE_SYNC,
     ENV_NO_K_SPLIT,
@@ -43,11 +43,11 @@ from sglang.jit_kernel.marlin_switches import (
 
 CUH = (
     pathlib.Path(__file__).resolve().parents[2]
-    / "python/sglang/jit_kernel/csrc/gemm/marlin_moe/moe_wna16_marlin.cuh"
+    / "python/flliper/jit_kernel/csrc/gemm/marlin_moe/moe_wna16_marlin.cuh"
 )
 TEMPLATE = (
     pathlib.Path(__file__).resolve().parents[2]
-    / "python/sglang/jit_kernel/csrc/gemm/marlin_moe/marlin_template.h"
+    / "python/flliper/jit_kernel/csrc/gemm/marlin_moe/marlin_template.h"
 )
 
 
@@ -219,7 +219,7 @@ def test_no_override_emits_no_extra_flag():
 def test_arch_override_lands_in_the_jit_cache_key():
     """The build directory name carries the arch, so the overridden module and
     the native sm_120 module cannot share a cache entry."""
-    from sglang.jit_kernel.utils import _jit_build_dir_name, override_jit_cuda_arch
+    from flliper.jit_kernel.utils import _jit_build_dir_name, override_jit_cuda_arch
 
     with override_jit_cuda_arch(12, 0):
         native = _jit_build_dir_name("m", "b0")
@@ -302,7 +302,7 @@ def test_override_is_refused_on_a_device_older_than_its_ptx():
     """fn8c4 died exactly here: both sm_86 ranks built compute_90 and hit
     'no kernel image is available for execution on the device' at the first
     Marlin launch. PTX is forward-compatible only."""
-    from sglang.jit_kernel.marlin_switches import arch_override_applies
+    from flliper.jit_kernel.marlin_switches import arch_override_applies
 
     ov = parse_arch_override("9.0")
     assert arch_override_applies(ov, 12, 0) == (True, "applies")
@@ -311,7 +311,7 @@ def test_override_is_refused_on_a_device_older_than_its_ptx():
 
 
 def test_override_is_refused_when_the_capability_is_unknown():
-    from sglang.jit_kernel.marlin_switches import arch_override_applies
+    from flliper.jit_kernel.marlin_switches import arch_override_applies
 
     assert arch_override_applies(parse_arch_override("9.0"), None, None) == (
         False,
@@ -320,13 +320,13 @@ def test_override_is_refused_when_the_capability_is_unknown():
 
 
 def test_no_override_is_never_applied():
-    from sglang.jit_kernel.marlin_switches import arch_override_applies
+    from flliper.jit_kernel.marlin_switches import arch_override_applies
 
     assert arch_override_applies(None, 12, 0) == (False, "unset")
 
 
 def test_explicit_gate_restricts_to_one_capability():
-    from sglang.jit_kernel.marlin_switches import arch_override_applies
+    from flliper.jit_kernel.marlin_switches import arch_override_applies
 
     ov = parse_arch_override("9.0@12.0")
     assert ov.only_on == (12, 0)
@@ -375,7 +375,7 @@ def test_ptx_flag_is_what_the_fn8c4_build_actually_used():
 
 # --- fn8c6/fn8c7: does NO_K_SPLIT actually reach slice_count == 1? ----------
 
-from sglang.jit_kernel.marlin_switches import marlin_slice_census
+from flliper.jit_kernel.marlin_switches import marlin_slice_census
 
 #: The fn8c6 shapes. Qwen3.8-Flash-Next: hidden 2560, moe_intermediate 640,
 #: block_size_m 64 -> thread_m_blocks 4 -> large_batch_thread_configs[0] =
@@ -429,7 +429,7 @@ def test_slice_census_rejects_nonsense():
 
 def test_bare_no_k_split_still_applies_everywhere():
     """Backward compatible: fn8c7's spelling keeps fn8c7's meaning."""
-    from sglang.jit_kernel.marlin_switches import no_k_split_on
+    from flliper.jit_kernel.marlin_switches import no_k_split_on
 
     assert no_k_split_on({ENV_NO_K_SPLIT: "1"}, (12, 0)) is True
     assert no_k_split_on({ENV_NO_K_SPLIT: "1"}, (8, 6)) is True
@@ -440,7 +440,7 @@ def test_gated_no_k_split_touches_only_the_named_capability():
     this form with ~1 % of card headroom (card free 0.17-0.37 GiB of 19.58 in
     BOTH fn8c6 and fn8c7), so moving their kernel timing is enough to tip
     self_attention into CUDA OOM."""
-    from sglang.jit_kernel.marlin_switches import no_k_split_on
+    from flliper.jit_kernel.marlin_switches import no_k_split_on
 
     env = {ENV_NO_K_SPLIT: "1@12.0"}
     assert no_k_split_on(env, (12, 0)) is True
@@ -450,7 +450,7 @@ def test_gated_no_k_split_touches_only_the_named_capability():
 
 @pytest.mark.parametrize("gate", ["1@120", "1@12.0"])
 def test_both_gate_spellings_parse(gate):
-    from sglang.jit_kernel.marlin_switches import parse_gate
+    from flliper.jit_kernel.marlin_switches import parse_gate
 
     assert parse_gate(gate) == (True, (12, 0))
 
@@ -458,7 +458,7 @@ def test_both_gate_spellings_parse(gate):
 @pytest.mark.parametrize("raw", ["1@twelve", "1@", "1@x.y"])
 def test_a_malformed_gate_disables_rather_than_widens(raw):
     """The dangerous failure is 'gate unparsable -> apply everywhere'."""
-    from sglang.jit_kernel.marlin_switches import no_k_split_on
+    from flliper.jit_kernel.marlin_switches import no_k_split_on
 
     assert no_k_split_on({ENV_NO_K_SPLIT: raw}, (12, 0)) is False
 

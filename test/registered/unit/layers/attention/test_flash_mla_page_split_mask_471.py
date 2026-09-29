@@ -45,13 +45,13 @@ import unittest  # noqa: E402
 
 import torch  # noqa: E402
 
-from sglang.srt.layers.attention import flash_mla_sm120 as fmod  # noqa: E402
+from flliper.srt.layers.attention import flash_mla_sm120 as fmod  # noqa: E402
 
 # #527: the plain import above only recompiles the kernels as interpreted if
 # THIS is the first time the process imports flash_mla_sm120. Triton's
 # ``@triton.jit`` reads ``TRITON_INTERPRET`` at decoration time (module import
 # time) and Python then caches the resulting module object -- both in
-# ``sys.modules`` and as an attribute of the ``sglang.srt.layers.attention``
+# ``sys.modules`` and as an attribute of the ``flliper.srt.layers.attention``
 # package -- for the rest of the process. ``test_flash_mla_sm120_topk_buckets
 # .py`` imports this same module without setting the env var (it replaces the
 # kernel calls with recorders instead, so it does not need the interpreter),
@@ -76,7 +76,7 @@ _PBS_SRC = fmod._PBS_SRC
 _SCALE_STRIDE = fmod._SCALE_STRIDE
 _split_kv_pages_to_64 = fmod._split_kv_pages_to_64
 
-from sglang.srt.runtime_context import get_resources  # noqa: E402
+from flliper.srt.runtime_context import get_resources  # noqa: E402
 
 _BYTES_PER_TOKEN = _NOPE_ROPE_STRIDE + _SCALE_STRIDE  # 584
 _RATIO = _PBS_SRC // _PBS_DST  # 4

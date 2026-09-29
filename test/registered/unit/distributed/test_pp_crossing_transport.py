@@ -25,17 +25,17 @@ Rank -> card, fixed by the fixture:
 import logging
 import unittest
 
-from sglang.srt.distributed.device_communicators.barlink_peer_transport import (
+from flliper.srt.distributed.device_communicators.barlink_peer_transport import (
     PeerTransport,
     resolve_peer_transports,
 )
-from sglang.srt.distributed.pp_crossing_schedule import (
+from flliper.srt.distributed.pp_crossing_schedule import (
     Crossing,
     LoopbackLink,
     crossing_schedule,
     schedule_cost,
 )
-from sglang.srt.distributed.pp_crossing_transport import (
+from flliper.srt.distributed.pp_crossing_transport import (
     MEASURED_GBPS_BY_LANES,
     RoutedLink,
     UnroutableCrossing,
@@ -43,8 +43,8 @@ from sglang.srt.distributed.pp_crossing_transport import (
     per_pair_us_from_map,
     route_schedule,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

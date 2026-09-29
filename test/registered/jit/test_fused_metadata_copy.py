@@ -14,7 +14,7 @@ import time
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=100, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=400, suite="nightly-kernel-1-gpu", nightly=True)
@@ -218,7 +218,7 @@ def test_fused_metadata_copy_dtype_validation():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from sglang.jit_kernel.fused_metadata_copy import fused_metadata_copy_cuda
+    from flliper.jit_kernel.fused_metadata_copy import fused_metadata_copy_cuda
 
     bs = 2
     max_len = 128
@@ -331,7 +331,7 @@ def test_fused_metadata_copy(bs, forward_mode, has_real_page_table, has_flashmla
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from sglang.jit_kernel.fused_metadata_copy import fused_metadata_copy_cuda
+    from flliper.jit_kernel.fused_metadata_copy import fused_metadata_copy_cuda
 
     max_len = 128
     max_seqlen_k = 256
@@ -432,7 +432,7 @@ def test_fused_metadata_copy_large_batch(bs):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from sglang.jit_kernel.fused_metadata_copy import fused_metadata_copy_cuda
+    from flliper.jit_kernel.fused_metadata_copy import fused_metadata_copy_cuda
 
     forward_mode = 0  # DECODE
     max_len = 128
@@ -627,7 +627,7 @@ def test_fused_metadata_copy_multi_dtype_validation():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from sglang.jit_kernel.fused_metadata_copy import fused_metadata_copy_multi_cuda
+    from flliper.jit_kernel.fused_metadata_copy import fused_metadata_copy_multi_cuda
 
     bs = 2
     max_len = 128
@@ -722,7 +722,7 @@ def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from sglang.jit_kernel.fused_metadata_copy import fused_metadata_copy_multi_cuda
+    from flliper.jit_kernel.fused_metadata_copy import fused_metadata_copy_multi_cuda
 
     max_len = 128
     seqlens_expanded_size = bs
@@ -924,7 +924,7 @@ def test_fused_metadata_copy_multi_large_batch(bs):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from sglang.jit_kernel.fused_metadata_copy import fused_metadata_copy_multi_cuda
+    from flliper.jit_kernel.fused_metadata_copy import fused_metadata_copy_multi_cuda
 
     max_len = 128
     seqlens_expanded_size = bs

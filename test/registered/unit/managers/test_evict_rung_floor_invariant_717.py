@@ -40,7 +40,7 @@ import unittest
 
 import torch
 
-from sglang.srt.managers import kv_backing_relief as m
+from flliper.srt.managers import kv_backing_relief as m
 
 # The crash, verbatim.
 CRASH_LIVE_ROW = 233_289

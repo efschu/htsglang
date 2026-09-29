@@ -36,13 +36,13 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-PARTITION_ENV = "SGLANG_PP_LAYER_PARTITION"
+PARTITION_ENV = "FLLIPER_PP_LAYER_PARTITION"
 
 
 def _write_config(directory: str, num_layers: int) -> str:
@@ -172,7 +172,7 @@ class TestResidentFractionWorldLength(CustomTestCase):
         self.assertNotIn("world", str(ctx.exception).lower())
 
     def test_the_consumer_indexes_a_world_vector_by_world_rank(self):
-        from sglang.srt.layers.moe import resident_fraction as rf
+        from flliper.srt.layers.moe import resident_fraction as rf
 
         vec = (0.5, 0.5, 0.4, 0.4)
         with patch.object(rf, "_from_flag", return_value=vec), patch.object(
@@ -195,7 +195,7 @@ class TestResidentFractionWorldLength(CustomTestCase):
 
     def test_a_stage_length_vector_still_broadcasts_across_stages(self):
         """Neutrality for the shape that already worked."""
-        from sglang.srt.layers.moe import resident_fraction as rf
+        from flliper.srt.layers.moe import resident_fraction as rf
 
         vec = (0.5, 0.4)
         with patch.object(rf, "_from_flag", return_value=vec), patch.object(
@@ -212,7 +212,7 @@ class TestResidentFractionWorldLength(CustomTestCase):
                     self.assertEqual(rf.resident_fraction_for_rank(), expected)
 
     def test_without_pp_the_vector_is_indexed_exactly_as_before(self):
-        from sglang.srt.layers.moe import resident_fraction as rf
+        from flliper.srt.layers.moe import resident_fraction as rf
 
         vec = (0.5, 0.4, 0.3)
         with patch.object(rf, "_from_flag", return_value=vec), patch.object(
@@ -233,7 +233,7 @@ class TestExpertStatsRankTag(CustomTestCase):
     """(c) the dump tag must separate pipeline stages."""
 
     def test_stages_get_distinct_tags(self):
-        from sglang.srt.layers.moe.expert_stats import moe_rank_tag
+        from flliper.srt.layers.moe.expert_stats import moe_rank_tag
 
         self.assertEqual(
             moe_rank_tag(moe_tp_rank=0, moe_ep_rank=0, pp_rank=0, pp_size=2),
@@ -250,7 +250,7 @@ class TestExpertStatsRankTag(CustomTestCase):
 
     def test_without_pp_the_tag_is_byte_identical_to_the_old_one(self):
         """Neutrality: existing dump filenames must not move."""
-        from sglang.srt.layers.moe.expert_stats import moe_rank_tag
+        from flliper.srt.layers.moe.expert_stats import moe_rank_tag
 
         for tp_rank in range(3):
             for ep_rank in range(2):
@@ -262,7 +262,7 @@ class TestExpertStatsRankTag(CustomTestCase):
                 )
 
     def test_the_tag_reaches_the_output_path(self):
-        from sglang.srt.layers.moe.expert_stats import ExpertStatsCollector
+        from flliper.srt.layers.moe.expert_stats import ExpertStatsCollector
 
         first = ExpertStatsCollector(
             path="/tmp/stats", rank_tag="pp0tp0ep0"
@@ -280,7 +280,7 @@ class TestExpertStatsRankTag(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.layers.moe import expert_offload
+        from flliper.srt.layers.moe import expert_offload
 
         source = inspect.getsource(expert_offload.MoEExpertOffloadCache.__init__)
         self.assertTrue(

@@ -6,7 +6,7 @@ endpoint is a direct `@app.get`/`@app.post` on the top-level `app`. Some
 FastAPI versions represent an `include_router()`-registered route as a
 single aggregate route object (a private `_IncludedRouter`) that matches
 its whole sub-tree but does not itself expose a per-request `.path`
-attribute. `_get_fastapi_request_path()` in `sglang.srt.utils.common`
+attribute. `_get_fastapi_request_path()` in `flliper.srt.utils.common`
 (used by the request-tracking Prometheus middleware, which runs before
 routing on every request) used to assume every top-level route exposes
 `.path`, so it crashed with:
@@ -37,11 +37,11 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 from starlette.routing import Match
 
-from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
-from sglang.srt.managers.load_snapshot import LoadSnapshot
-from sglang.srt.utils.common import _get_fastapi_request_path
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from flliper.srt.entrypoints.v1_loads import router as v1_loads_router
+from flliper.srt.managers.load_snapshot import LoadSnapshot
+from flliper.srt.utils.common import _get_fastapi_request_path
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -178,7 +178,7 @@ class TestV1LoadsEndToEnd(CustomTestCase):
         self.app = _build_app()
 
     def test_get_v1_loads_returns_200_with_plausible_body(self):
-        from sglang.srt.entrypoints import v1_loads
+        from flliper.srt.entrypoints import v1_loads
 
         fake_manager = _FakeTokenizerManager(
             [

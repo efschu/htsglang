@@ -39,11 +39,11 @@ import unittest
 # path the way pytest's own rootdir insertion would.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from sglang.srt.planner import crossover, flags
-from sglang.srt.planner import lever_profiles as lp
-from sglang.srt.uneven_perf import PerfCalibration
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import crossover, flags
+from flliper.srt.planner import lever_profiles as lp
+from flliper.srt.uneven_perf import PerfCalibration
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -212,7 +212,7 @@ class TestTheBorrowedNoticeReachesThePlanLog(CustomTestCase):
             _sa, log = _plan(model, _mix_cards())
         self.assertIn("calibration BORROWED", log)
         self.assertIn("decode_gemv_residual_exp", log)
-        self.assertIn("SGLANG_PERF_", log)
+        self.assertIn("FLLIPER_PERF_", log)
 
 
 if __name__ == "__main__":

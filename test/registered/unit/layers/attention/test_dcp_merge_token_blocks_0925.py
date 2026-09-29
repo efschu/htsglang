@@ -37,12 +37,12 @@ from unittest import mock
 import torch
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
-from sglang.srt.layers.dcp import comm  # noqa: E402
+from flliper.srt.layers.dcp import comm  # noqa: E402
 
 
 def _reset_merge_cache():
@@ -128,7 +128,7 @@ def _worker(rank, world, port, cases, q):
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
-        from sglang.srt.layers.dcp import comm as c
+        from flliper.srt.layers.dcp import comm as c
 
         res = []
         for idx, (mode, wire, counts, T, blk) in enumerate(cases):
@@ -360,7 +360,7 @@ class TestDerivedWidth(CustomTestCase):
         _reset_merge_cache()
 
     def test_27b_tp0_geometry(self):
-        with mock.patch.dict(os.environ, {"SGLANG_DCP_LSE_MERGE_DTYPE": "fp32"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_DCP_LSE_MERGE_DTYPE": "fp32"}):
             _reset_merge_cache()
             a2a = comm.lse_merge_block_tokens(4096, [12, 6, 6], 256, 2, "a2a")
             ar = comm.lse_merge_block_tokens(4096, [12, 6, 6], 256, 2, "ar")
@@ -457,7 +457,7 @@ class TestDerivedWidth(CustomTestCase):
 
 class TestFinalMergeBlocks(CustomTestCase):
     def test_blocked_final_merge_is_byte_identical(self):
-        from sglang.srt.layers.attention import flashinfer_backend as fb
+        from flliper.srt.layers.attention import flashinfer_backend as fb
 
         class _L:
             tp_q_head_num, head_dim = 3, 8
@@ -483,7 +483,7 @@ class TestFinalMergeBlocks(CustomTestCase):
             self.assertTrue(torch.equal(a, b), T)
 
     def test_one_block_is_the_old_expression(self):
-        from sglang.srt.layers.attention import flashinfer_backend as fb
+        from flliper.srt.layers.attention import flashinfer_backend as fb
 
         g = torch.Generator().manual_seed(3)
         o_cur = torch.randn(9, 3, 8, generator=g).to(torch.bfloat16)
@@ -512,7 +512,7 @@ class TestDispatcherAndSites(CustomTestCase):
         _reset_merge_cache()
 
     def test_dispatcher_blocks_above_the_width_only(self):
-        from sglang.srt.layers.attention import flashinfer_backend as fb
+        from flliper.srt.layers.attention import flashinfer_backend as fb
 
         grp = _FakeGroup(3)
         for mode, T, want_blocks in (("a2a", 12, 3), ("a2a", 5, 1), ("ar", 12, 3), ("ar", 4, 1)):
@@ -544,7 +544,7 @@ class TestDispatcherAndSites(CustomTestCase):
             self.assertEqual(comm.lse_merge_effective_mode(), "a2a")
 
     def test_every_site_carries_the_width(self):
-        from sglang.srt.layers.attention import flashinfer_backend as fb
+        from flliper.srt.layers.attention import flashinfer_backend as fb
 
         cls = fb.FlashInferAttnBackend
         for name in ("_forward_decode_dcp", "_forward_extend_dcp"):
@@ -568,7 +568,7 @@ class TestDispatcherAndSites(CustomTestCase):
         return mock.Mock(server_args=sa, model_config=mock.Mock(head_dim=256), dtype=dtype)
 
     def test_resolver(self):
-        from sglang.srt.layers.attention import flashinfer_backend as fb
+        from flliper.srt.layers.attention import flashinfer_backend as fb
 
         with mock.patch.object(comm, "lse_merge_mode", return_value="a2a"), \
              mock.patch.object(comm, "weightless_kv_active", return_value=False), \
@@ -589,7 +589,7 @@ class TestDispatcherAndSites(CustomTestCase):
     def test_resolver_head_dim_zero_logs_and_does_not_block(self):
         # H86b (V2): the DCP-MERGE-BLOCK line was bound to head_dim > 0 and stayed silent exactly when the
         # geometry was missing. It must now speak, with block_tokens=0 and head_dim=0, and not raise.
-        from sglang.srt.layers.attention import flashinfer_backend as fb
+        from flliper.srt.layers.attention import flashinfer_backend as fb
 
         runner = self._runner(None)
         runner.model_config = mock.Mock(head_dim=0)
@@ -607,7 +607,7 @@ class TestDispatcherAndSites(CustomTestCase):
     def test_server_arg_parses(self):
         import argparse
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         p = argparse.ArgumentParser()
         ServerArgs.add_cli_args(p)

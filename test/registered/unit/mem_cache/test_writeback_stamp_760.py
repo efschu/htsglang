@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.mem_cache import hicache_phase_binding as pb
+from flliper.srt.mem_cache import hicache_phase_binding as pb
 
 
 class TestAStampSurvivesOnlyItsOwnGeneration(unittest.TestCase):

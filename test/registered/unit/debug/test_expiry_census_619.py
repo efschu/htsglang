@@ -20,10 +20,10 @@ import unittest.mock
 import pytest
 import torch
 
-from sglang.srt.distributed.device_communicators.barlink_abort_gate import (
+from flliper.srt.distributed.device_communicators.barlink_abort_gate import (
     ENV_SYNC_DEADLINE_MS,
 )
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     BarlinkBar1Transport,
 )
 
@@ -96,14 +96,14 @@ def mock_census(monkeypatch):
     mock = _CaptureCensusMock()
     mp = unittest.mock.MagicMock(wraps=mock)
     monkeypatch.setitem(sys.modules,
-                        "sglang.srt.distributed.device_communicators.barlink_capture_census",
+                        "flliper.srt.distributed.device_communicators.barlink_capture_census",
                         mp)
     # `from package import module` resolves through the parent package's
     # attribute once the real module has been imported anywhere in the
     # process (e.g. by an earlier test file in the same run), bypassing the
     # sys.modules entry above. Patch the attribute as well so the fixture
     # is order-independent.
-    from sglang.srt.distributed import device_communicators as _dc_pkg
+    from flliper.srt.distributed import device_communicators as _dc_pkg
 
     if hasattr(_dc_pkg, "barlink_capture_census"):
         monkeypatch.setattr(_dc_pkg, "barlink_capture_census", mp)
@@ -119,14 +119,14 @@ class TestExpiryCensusAfter:
     """After N expiries the census dump fires exactly once."""
 
     def test_default_threshold_is_three(self, monkeypatch, mock_census):
-        """SGLANG_BARLINK_EXPIRY_CENSUS_AFTER defaults to 3."""
+        """FLLIPER_BARLINK_EXPIRY_CENSUS_AFTER defaults to 3."""
         mock, mp = mock_census
-        monkeypatch.delenv("SGLANG_BARLINK_EXPIRY_CENSUS_AFTER", raising=False)
+        monkeypatch.delenv("FLLIPER_BARLINK_EXPIRY_CENSUS_AFTER", raising=False)
         ev = _Event()
         s = _stub(ev)
 
         monkeypatch.setenv(ENV_SYNC_DEADLINE_MS, "1")
-        monkeypatch.setenv("SGLANG_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
+        monkeypatch.setenv("FLLIPER_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
 
         # Two expiries -- below threshold, no dump.
         BarlinkBar1Transport._wait_ctl_event(s)
@@ -144,12 +144,12 @@ class TestExpiryCensusAfter:
     def test_disabled_via_zero(self, monkeypatch, mock_census):
         """Threshold 0 disables the expiry dump entirely."""
         mock, mp = mock_census
-        monkeypatch.setenv("SGLANG_BARLINK_EXPIRY_CENSUS_AFTER", "0")
+        monkeypatch.setenv("FLLIPER_BARLINK_EXPIRY_CENSUS_AFTER", "0")
         ev = _Event()
         s = _stub(ev)
 
         monkeypatch.setenv(ENV_SYNC_DEADLINE_MS, "1")
-        monkeypatch.setenv("SGLANG_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
+        monkeypatch.setenv("FLLIPER_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
 
         for _ in range(10):
             BarlinkBar1Transport._wait_ctl_event(s)
@@ -161,12 +161,12 @@ class TestExpiryCensusAfter:
     def test_dump_fires_exactly_once(self, monkeypatch, mock_census):
         """The bool latch prevents re-dumping after repeated expiries."""
         mock, mp = mock_census
-        monkeypatch.setenv("SGLANG_BARLINK_EXPIRY_CENSUS_AFTER", "3")
+        monkeypatch.setenv("FLLIPER_BARLINK_EXPIRY_CENSUS_AFTER", "3")
         ev = _Event()
         s = _stub(ev)
 
         monkeypatch.setenv(ENV_SYNC_DEADLINE_MS, "1")
-        monkeypatch.setenv("SGLANG_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
+        monkeypatch.setenv("FLLIPER_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
 
         # Run well past the threshold.
         for _ in range(10):
@@ -180,12 +180,12 @@ class TestExpiryCensusAfter:
         """When capture_census_enabled() returns False, format is not called."""
         mock, mp = mock_census
         mock._enabled = False
-        monkeypatch.setenv("SGLANG_BARLINK_EXPIRY_CENSUS_AFTER", "3")
+        monkeypatch.setenv("FLLIPER_BARLINK_EXPIRY_CENSUS_AFTER", "3")
         ev = _Event()
         s = _stub(ev)
 
         monkeypatch.setenv(ENV_SYNC_DEADLINE_MS, "1")
-        monkeypatch.setenv("SGLANG_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
+        monkeypatch.setenv("FLLIPER_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
 
         for _ in range(5):
             BarlinkBar1Transport._wait_ctl_event(s)
@@ -196,12 +196,12 @@ class TestExpiryCensusAfter:
     def test_custom_threshold(self, monkeypatch, mock_census):
         """A user-set threshold of 1 means dump on the first expiry."""
         mock, mp = mock_census
-        monkeypatch.setenv("SGLANG_BARLINK_EXPIRY_CENSUS_AFTER", "1")
+        monkeypatch.setenv("FLLIPER_BARLINK_EXPIRY_CENSUS_AFTER", "1")
         ev = _Event()
         s = _stub(ev)
 
         monkeypatch.setenv(ENV_SYNC_DEADLINE_MS, "1")
-        monkeypatch.setenv("SGLANG_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
+        monkeypatch.setenv("FLLIPER_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
 
         BarlinkBar1Transport._wait_ctl_event(s)
         assert s._ctl_sync_timeouts == 1
@@ -215,12 +215,12 @@ class TestExpiryCensusAfter:
     def test_dump_uses_correct_rank(self, monkeypatch, mock_census, caplog):
         """The dump logs the rank from the stub, not a hardcoded value."""
         mock, mp = mock_census
-        monkeypatch.setenv("SGLANG_BARLINK_EXPIRY_CENSUS_AFTER", "1")
+        monkeypatch.setenv("FLLIPER_BARLINK_EXPIRY_CENSUS_AFTER", "1")
         ev = _Event()
         s = _stub(ev, rank=7)
 
         monkeypatch.setenv(ENV_SYNC_DEADLINE_MS, "1")
-        monkeypatch.setenv("SGLANG_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
+        monkeypatch.setenv("FLLIPER_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
 
         with caplog.at_level(logging.ERROR):
             BarlinkBar1Transport._wait_ctl_event(s)

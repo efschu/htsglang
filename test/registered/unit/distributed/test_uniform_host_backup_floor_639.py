@@ -90,17 +90,17 @@ from unittest import mock
 import torch
 
 try:
-    from sglang.test.ci.ci_register import register_cpu_ci
+    from flliper.test.ci.ci_register import register_cpu_ci
 except ImportError:  # pragma: no cover - registration is a CI-time marker
 
     def register_cpu_ci(*args, **kwargs):
         return None
 
 
-from sglang.srt.managers.prefetch_ballot import build_prefetch_ballot_payload
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.common import uniform_host_avail_for_backup
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.prefetch_ballot import build_prefetch_ballot_payload
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.common import uniform_host_avail_for_backup
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -332,8 +332,8 @@ class _FakeUnifiedCache:
 def _backup_admitted(tree, kv_tokens):
     """Run the REAL ``UnifiedRadixCache.write_backup`` for this rank and
     report whether the node got a host backup. True = backed up."""
-    from sglang.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from flliper.srt.mem_cache.unified_cache_components import BASE_COMPONENT_TYPE
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     cache = _FakeUnifiedCache(
         BASE_COMPONENT_TYPE, tree.cache_controller.mem_pool_host.available_size()
@@ -579,8 +579,8 @@ class UniformHostBackupFloorTest(CustomTestCase):
         The rig runs ``UnifiedRadixCache``; ``HiRadixCache`` carries the same
         gate for the deployments that use it.
         """
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         for func, name in (
             (UnifiedRadixCache.write_backup, "UnifiedRadixCache.write_backup"),
@@ -608,7 +608,7 @@ class UniformHostBackupFloorTest(CustomTestCase):
         pin's justification would have to be rewritten rather than silently
         kept.
         """
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         src = inspect.getsource(UnifiedRadixCache._evict_device_leaf)
         self.assertIn("if not node.backuped:", src)
@@ -618,7 +618,7 @@ class UniformHostBackupFloorTest(CustomTestCase):
     def test_the_extend_token_axis_still_reads_the_matched_prefix(self):
         """The other end of the chain: a rank-dependent ``prefix_indices``
         becomes a rank-dependent collective shape here and nowhere else."""
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from flliper.srt.managers.schedule_batch import ScheduleBatch
 
         src = inspect.getsource(ScheduleBatch.prepare_for_extend)
         self.assertIn("len(r.prefix_indices)", src)
@@ -627,7 +627,7 @@ class UniformHostBackupFloorTest(CustomTestCase):
     def test_the_attribute_is_declared_on_the_base_class(self):
         """Declared in the type, not conjured by whichever path happens to set
         it (#606): a reader must be able to see the pin exists."""
-        from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+        from flliper.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
         self.assertIn("uniform_host_avail_floor", BasePrefixCache.__annotations__)
         self.assertIsNone(BasePrefixCache.uniform_host_avail_floor)
@@ -688,7 +688,7 @@ class HasPrefixIsNotRankUniformTest(CustomTestCase):
         ``weightless_has_prefix`` itself, on three length vectors that differ
         the way three radix replicas differ once they stop being replicas.
         """
-        from sglang.srt.layers.dcp.lockstep import weightless_has_prefix
+        from flliper.srt.layers.dcp.lockstep import weightless_has_prefix
 
         # The 08:26 shape: TP0's request carries no matched prefix, its peers'
         # carries one. `forces_prefix` is False -- this is an EXTEND, not a
@@ -712,7 +712,7 @@ class HasPrefixIsNotRankUniformTest(CustomTestCase):
         """It does not take a large divergence. ONE token of prefix on one
         rank and none on another flips the branch, so any prefix divergence at
         all -- not merely a large one -- is enough to desync the group."""
-        from sglang.srt.layers.dcp.lockstep import weightless_has_prefix
+        from flliper.srt.layers.dcp.lockstep import weightless_has_prefix
 
         self.assertFalse(weightless_has_prefix(False, [0]))
         self.assertTrue(weightless_has_prefix(False, [1]))
@@ -721,7 +721,7 @@ class HasPrefixIsNotRankUniformTest(CustomTestCase):
         """The one case that IS pinned today stays pinned: a target-verify
         batch forces the branch regardless of the length vector, which is
         #180's rule and must not regress."""
-        from sglang.srt.layers.dcp.lockstep import weightless_has_prefix
+        from flliper.srt.layers.dcp.lockstep import weightless_has_prefix
 
         self.assertTrue(weightless_has_prefix(True, [0]))
         self.assertTrue(weightless_has_prefix(True, None))
@@ -731,7 +731,7 @@ class HasPrefixIsNotRankUniformTest(CustomTestCase):
         ``cp_lse_ag_out_ar_mha_uneven`` -- or removed -- this hazard is gone
         and the analysis above has to be rewritten rather than silently kept.
         """
-        from sglang.srt.layers.attention.flashinfer_backend import (
+        from flliper.srt.layers.attention.flashinfer_backend import (
             FlashInferAttnBackend,
         )
 
@@ -749,8 +749,8 @@ class HasPrefixIsNotRankUniformTest(CustomTestCase):
         """The LINK, pinned so it cannot be quietly broken in either
         direction: ``has_prefix`` and ``extend_num_tokens`` are both functions
         of ``len(r.prefix_indices)``."""
-        from sglang.srt.layers.dcp.lockstep import weightless_has_prefix
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from flliper.srt.layers.dcp.lockstep import weightless_has_prefix
+        from flliper.srt.managers.schedule_batch import ScheduleBatch
 
         batch_src = inspect.getsource(ScheduleBatch.prepare_for_extend)
         self.assertIn(

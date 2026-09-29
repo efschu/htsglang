@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """H136 (NF): the storage-queue agreement cadence does not reach the sleep drain.
 
-The 27B D-round gate (SGLANG_HICACHE_DRAIN_AGREE_EVERY=N, 0619f1280f, on the NF
+The 27B D-round gate (FLLIPER_HICACHE_DRAIN_AGREE_EVERY=N, 0619f1280f, on the NF
 line since H62 c977af7bbc) thins `drain_storage_control_queues`' gloo MIN over
 the attention group to every N-th round while the group's MIN is zero. The NF
 line (fnFL2x105) also polls `check_hicache_events` in a GROUP LOOP before every
-sleep (`weg2_sleep_drain.drain_until_group_verdict`, 10 ms per poll). A backup
+sleep (`pdflip_sleep_drain.drain_until_group_verdict`, 10 ms per poll). A backup
 ack that lands while the gate is cold would wait there up to N-1 polls -- with
 N=8 up to ~70 ms added to the flip. `UnifiedRadixCache.drain_gate_forced`
 makes every poll inside that loop agree again, exactly as with the gate unset.
@@ -19,7 +19,7 @@ What must hold:
   call indices with IDENTICAL MINs -- the Form A (TP0 host, workers without KV
   bytes) condition H93..H99 rest on: one rank alone in a gloo all_reduce is the
   wedge;
-* the real `_weg2_drain_hicache_before_sleep` wraps its loop in the block, and
+* the real `_pdflip_drain_hicache_before_sleep` wraps its loop in the block, and
   a sleep drain with the gate at N=8 needs as many polls as unset.
 """
 
@@ -31,19 +31,19 @@ from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.scheduler_components.weight_updater import (
+from flliper.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
-from sglang.srt.mem_cache import unified_radix_cache as u
+from flliper.srt.mem_cache import unified_radix_cache as u
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_ENVS = ("SGLANG_HICACHE_DRAIN_AGREE_EVERY", "SGLANG_HICACHE_ROUND_TIMING")
+_ENVS = ("FLLIPER_HICACHE_DRAIN_AGREE_EVERY", "FLLIPER_HICACHE_ROUND_TIMING")
 
 
 class _EnvCase(CustomTestCase):
@@ -116,7 +116,7 @@ class TheBlockAgreesEveryCall(_EnvCase):
         return calls
 
     def test_cold_cadence_outside_every_call_inside(self):
-        os.environ["SGLANG_HICACHE_DRAIN_AGREE_EVERY"] = "8"
+        os.environ["FLLIPER_HICACHE_DRAIN_AGREE_EVERY"] = "8"
         c = _cache()
         calls = self._counting(c)
         for _ in range(10):  # rounds 1..10: agreements at 1 and 9
@@ -129,7 +129,7 @@ class TheBlockAgreesEveryCall(_EnvCase):
         self.assertEqual(calls, [1, 9, 11, 12, 13, 14, 22])
 
     def test_p_takes_no_collective_and_is_never_gated(self):
-        os.environ["SGLANG_HICACHE_DRAIN_AGREE_EVERY"] = "8"
+        os.environ["FLLIPER_HICACHE_DRAIN_AGREE_EVERY"] = "8"
         c = _cache(tp_world_size=1)
         c.drain_storage_control_queues = mock.Mock(return_value=False)
         with c.drain_gate_forced():
@@ -146,7 +146,7 @@ class ThreeRanksPostTheSameSequence(_EnvCase):
 
     def _run(self, every, arrivals, schedule):
         if every is not None:
-            os.environ["SGLANG_HICACHE_DRAIN_AGREE_EVERY"] = str(every)
+            os.environ["FLLIPER_HICACHE_DRAIN_AGREE_EVERY"] = str(every)
         ranks = [_cache() for _ in range(3)]
         pending = [0, 0, 0]
         entered = [[] for _ in range(3)]
@@ -271,7 +271,7 @@ class TheSleepDrainIsNotGated(_EnvCase):
         """`decode_rounds` gated rounds first (the gate goes cold), then the
         sleep drain; each rank's ack lands at its call number `land`."""
         if every is not None:
-            os.environ["SGLANG_HICACHE_DRAIN_AGREE_EVERY"] = str(every)
+            os.environ["FLLIPER_HICACHE_DRAIN_AGREE_EVERY"] = str(every)
         group = _Group(3)
         trees = [_rank(group, r, land) for r in range(3)]
         out = [None] * 3
@@ -280,7 +280,7 @@ class TheSleepDrainIsNotGated(_EnvCase):
             try:
                 for _ in range(decode_rounds):
                     trees[r].check_hicache_events()
-                _updater(trees[r])._weg2_drain_hicache_before_sleep(bound_s=2.0)
+                _updater(trees[r])._pdflip_drain_hicache_before_sleep(bound_s=2.0)
                 out[r] = "returned"
             except Exception as exc:  # noqa: BLE001 -- the outcome is the finding
                 out[r] = type(exc).__name__
@@ -317,7 +317,7 @@ class TheSleepDrainIsNotGated(_EnvCase):
         import inspect
 
         src = inspect.getsource(
-            SchedulerWeightUpdaterManager._weg2_drain_hicache_before_sleep
+            SchedulerWeightUpdaterManager._pdflip_drain_hicache_before_sleep
         )
         i = src.index("drain_gate_forced")
         j = src.index("drain_until_group_verdict(")

@@ -6,15 +6,15 @@ import uuid
 
 import zmq
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
-from sglang.test.scripted_runtime.io_struct import (
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.scripted_runtime.http_server import ScriptedHttpServer
+from flliper.test.scripted_runtime.io_struct import (
     HookReady,
     RunScript,
     ScriptFailed,
     ScriptSucceeded,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 

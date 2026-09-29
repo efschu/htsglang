@@ -7,10 +7,10 @@ reads before spending an hour of card time is provably the plan that runs.
 
 import unittest
 
-from sglang.srt.boot_matrix.arms import BASE_FLAGS, arm_by_name
-from sglang.srt.boot_matrix.sweep import build_command, render_plan
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.boot_matrix.arms import BASE_FLAGS, arm_by_name
+from flliper.srt.boot_matrix.sweep import build_command, render_plan
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -20,10 +20,10 @@ class TestBuildCommand(CustomTestCase):
         arm = arm_by_name("A_default")
         env, argv = build_command(arm, model_path="/m", port=30000)
         line = " ".join(argv)
-        self.assertIn("sglang.launch_server", line)
+        self.assertIn("flliper.launch_server", line)
         self.assertIn("--model-path /m", line)
         self.assertIn("--tp-size 3", line)
-        self.assertEqual(env["SGLANG_UNEVEN_DCP"], "1")
+        self.assertEqual(env["FLLIPER_UNEVEN_DCP"], "1")
 
     def test_arm_flags_are_added_on_top(self):
         arm = arm_by_name("B_offload")
@@ -80,7 +80,7 @@ class TestBuildCommand(CustomTestCase):
 
     def test_a_drop_that_matches_nothing_is_an_error(self):
         """A silent no-op here is how an arm runs something it did not declare."""
-        from sglang.srt.boot_matrix.sweep import _without
+        from flliper.srt.boot_matrix.sweep import _without
 
         with self.assertRaises(ValueError) as caught:
             _without(("--tp-size", "3"), ("--not-a-base-flag",))
@@ -89,11 +89,11 @@ class TestBuildCommand(CustomTestCase):
     def test_reject_arm_env_override(self):
         arm = arm_by_name("reject_dcp_offlane")
         env, _ = build_command(arm, model_path="/m", port=30000)
-        self.assertEqual(env["SGLANG_UNEVEN_DCP"], "0")
+        self.assertEqual(env["FLLIPER_UNEVEN_DCP"], "0")
 
     def test_barlink_arm_sets_transport(self):
         env, _ = build_command(arm_by_name("E_barlink"), model_path="/m", port=1)
-        self.assertEqual(env["SGLANG_BARLINK_TRANSPORT"], "device")
+        self.assertEqual(env["FLLIPER_BARLINK_TRANSPORT"], "device")
 
     def test_base_flags_unmutated_between_arms(self):
         """build_command must not mutate the shared BASE_FLAGS tuple."""

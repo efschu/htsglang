@@ -16,7 +16,7 @@ THREE DIRECTIONS, because a bound that only ever fires is not a guard:
    withholds measured across 291 boot logs) is NOT shortened. This is the
    mutant that matters: a shortening applied to every withhold would turn the
    commonest healthy transient into a refused flip.
-3. ``SGLANG_PP_PRESENCE_FUTILE_S=0`` restores the full deadline for the futile
+3. ``FLLIPER_PP_PRESENCE_FUTILE_S=0`` restores the full deadline for the futile
    reason too, so the guard is provable in both directions.
 
 Hermetic: no scheduler, no process group, no CUDA.
@@ -68,8 +68,8 @@ class _Clock:
 
 def _gate(reason, clock, futile_s=2.0, deadline=60.0):
     """The SHIPPED gate, wired to a probe that returns a real reason string."""
-    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
-    from sglang.srt.managers.phase_policy import PHASE_PP
+    from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+    from flliper.srt.managers.phase_policy import PHASE_PP
 
     class R:
         pass
@@ -171,7 +171,7 @@ class TestFutileWaitIsCutShort(unittest.TestCase):
     def test_the_bound_is_disableable_but_detection_continues(self):
         """The off-switch, and the counter split it forced.
 
-        SGLANG_PP_PRESENCE_FUTILE_S=0 disables the ACTUATOR while leaving the
+        FLLIPER_PP_PRESENCE_FUTILE_S=0 disables the ACTUATOR while leaving the
         detector intact -- the same bargain #800's escape clock strikes. So the
         defect is still counted and still named, and nothing is abandoned
         early. The first version of this fix incremented one counter in the
@@ -260,7 +260,7 @@ class TestTheShippedConstructorSetsTheState(unittest.TestCase):
     def test_init_sets_the_futile_state(self):
         from types import SimpleNamespace
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         noop = lambda *a, **k: None  # noqa: E731
         runtime = PhaseFlipRuntime(
@@ -296,7 +296,7 @@ class TestTheGrepKeyIsStable(unittest.TestCase):
     """
 
     def test_the_emitted_line_carries_the_literal(self):
-        from sglang.srt.managers.pp_presence_disposition import (
+        from flliper.srt.managers.pp_presence_disposition import (
             ALARM_PRESENCE_FUTILE,
         )
 
@@ -305,7 +305,7 @@ class TestTheGrepKeyIsStable(unittest.TestCase):
         clock = _Clock()
         gate = _gate(FUTILE, clock, futile_s=2.0)
         with self.assertLogs(
-            "sglang.srt.managers.phase_flip_runtime", level="ERROR"
+            "flliper.srt.managers.phase_flip_runtime", level="ERROR"
         ) as caught:
             _run(gate, clock, until=30.0)
 

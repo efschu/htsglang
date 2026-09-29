@@ -6,10 +6,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.kvcache.trtllm_fp8_kv_kernel import (
+from flliper.kernels.ops.kvcache.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestTRTLLMFP8KVKernel(CustomTestCase):

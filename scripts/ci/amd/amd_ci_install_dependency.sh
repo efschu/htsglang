@@ -3,18 +3,18 @@ set -euo pipefail
 HOSTNAME_VALUE=$(hostname)
 GPU_ARCH="mi30x"   # default
 SKIP_TT_DEPS=""
-SKIP_SGLANG_BUILD=""
+SKIP_FLLIPER_BUILD=""
 SKIP_AITER_BUILD=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --skip-aiter-build) SKIP_AITER_BUILD="1"; shift;;
-    --skip-sglang-build) SKIP_SGLANG_BUILD="1"; shift;;
+    --skip-flliper-build) SKIP_FLLIPER_BUILD="1"; shift;;
     --skip-test-time-deps) SKIP_TT_DEPS="1"; shift;;
     -h|--help)
       echo "Usage: $0 [OPTIONS] [OPTIONAL_DEPS]"
       echo "Options:"
-      echo "  --skip-sglang-build         Don't build checkout sglang, use what was shipped with the image"
+      echo "  --skip-flliper-build         Don't build checkout flliper, use what was shipped with the image"
       echo "  --skip-aiter-build          Don't build aiter, use what was shipped with the image"
       echo "  --skip-test-time-deps       Don't build miscellaneous dependencies"
       exit 0
@@ -42,8 +42,8 @@ fi
 
 # Install the required dependencies in CI.
 # Fix permissions on pip cache, ignore errors from concurrent access or missing temp files
-docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
-docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
+docker exec ci_flliper chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
+docker exec ci_flliper pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 
 # Helper function to install with retries and fallback PyPI mirror
 install_with_retry() {
@@ -79,7 +79,7 @@ install_with_retry() {
 #   TypeError: HTTPTransport.__init__() got an unexpected keyword argument 'socket_options'
 # Call this as the LAST pip operation so nothing can downgrade httpx afterwards.
 ensure_httpx() {
-  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
+  install_with_retry docker exec ci_flliper pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
 }
 
 # Helper function to git clone with retries
@@ -115,23 +115,23 @@ git_clone_with_retry() {
   return 1
 }
 
-# Install checkout sglang
-if [ -n "$SKIP_SGLANG_BUILD" ]; then
-  echo "Didn't build checkout SGLang"
+# Install checkout flliper
+if [ -n "$SKIP_FLLIPER_BUILD" ]; then
+  echo "Didn't build checkout fLLiper"
 else
-  docker exec ci_sglang pip uninstall sgl-kernel -y || true
-  docker exec ci_sglang pip uninstall sglang-kernel -y || true
-  docker exec ci_sglang pip uninstall sglang -y || true
+  docker exec ci_flliper pip uninstall sgl-kernel -y || true
+  docker exec ci_flliper pip uninstall sglang-kernel -y || true
+  docker exec ci_flliper pip uninstall flliper -y || true
   # Clear Python cache to ensure latest code is used
-  docker exec ci_sglang find /opt/venv -name "*.pyc" -delete || true
-  docker exec ci_sglang find /opt/venv -name "__pycache__" -type d -exec rm -rf {} + || true
-  # Also clear cache in sglang-checkout
-  docker exec ci_sglang find /sglang-checkout -name "*.pyc" -delete || true
-  docker exec ci_sglang find /sglang-checkout -name "__pycache__" -type d -exec rm -rf {} + || true
-  docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+  docker exec ci_flliper find /opt/venv -name "*.pyc" -delete || true
+  docker exec ci_flliper find /opt/venv -name "__pycache__" -type d -exec rm -rf {} + || true
+  # Also clear cache in flliper-checkout
+  docker exec ci_flliper find /flliper-checkout -name "*.pyc" -delete || true
+  docker exec ci_flliper find /flliper-checkout -name "__pycache__" -type d -exec rm -rf {} + || true
+  docker exec -w /flliper-checkout/sgl-kernel ci_flliper bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
 
-  docker exec ci_sglang bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
-  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
+  docker exec ci_flliper bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
+  install_with_retry docker exec ci_flliper pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
@@ -142,13 +142,13 @@ else
   # owned by the runner (non-root); mark it safe so setuptools_scm /
   # vcs_versioning can run `git` introspection during pip install.
   git_clone_with_retry https://github.com/EvolvingLMMs-Lab/lmms-eval.git lmms-eval "--branch v0.4.1"
-  docker cp lmms-eval ci_sglang:/
-  docker exec ci_sglang git config --global --add safe.directory /lmms-eval
-  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+  docker cp lmms-eval ci_flliper:/
+  docker exec ci_flliper git config --global --add safe.directory /lmms-eval
+  install_with_retry docker exec -w /lmms-eval ci_flliper pip install --cache-dir=/sgl-data/pip-cache -e .
 
   git_clone_with_retry https://github.com/akao-amd/human-eval.git human-eval
-  docker cp human-eval ci_sglang:/
-  install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+  docker cp human-eval ci_flliper:/
+  install_with_retry docker exec -w /human-eval ci_flliper pip install --cache-dir=/sgl-data/pip-cache -e .
 
   mkdir -p dummy-grok
   cat > dummy-grok/config.json << 'EOF'
@@ -174,17 +174,17 @@ else
     "torch_dtype": "bfloat16"
   }
 EOF
-  docker exec -w / ci_sglang mkdir -p /dummy-grok
-  docker cp ./dummy-grok/config.json ci_sglang:/dummy-grok/config.json
+  docker exec -w / ci_flliper mkdir -p /dummy-grok
+  docker cp ./dummy-grok/config.json ci_flliper:/dummy-grok/config.json
 
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
+  docker exec ci_flliper pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
+  docker exec ci_flliper pip install --cache-dir=/sgl-data/pip-cache pytest
 
   # Install cache-dit for qwen_image_t2i_cache_dit_enabled test (added in PR 16204)
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'cache-dit==1.3.0' || echo "cache-dit installation failed"
+  docker exec ci_flliper pip install --cache-dir=/sgl-data/pip-cache --upgrade 'cache-dit==1.3.0' || echo "cache-dit installation failed"
 
   # Install accelerate for distributed training and inference support
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
+  docker exec ci_flliper pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
 fi
 
 # -----------------------
@@ -192,7 +192,7 @@ fi
 # The CI image bakes MORI at the docker/rocm.Dockerfile-pinned commit; when a PR
 # bumps MORI_COMMIT the image is not rebuilt, so reinstall MORI here the same way
 # the Dockerfile does. Only ENABLE_MORI=1 images ship /sgl-workspace/mori.
-if docker exec ci_sglang test -d /sgl-workspace/mori; then
+if docker exec ci_flliper test -d /sgl-workspace/mori; then
   MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
   MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/')
 
@@ -203,7 +203,7 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   fi
 
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
-  docker exec ci_sglang bash -c "
+  docker exec ci_flliper bash -c "
     set -euo pipefail
     export MORI_GPU_ARCHS='${MORI_GPU_ARCHS}'
     rm -rf /sgl-workspace/mori
@@ -266,7 +266,7 @@ echo "[CI-AITER-CHECK] Dockerfile expects AITER_COMMIT=${REPO_AITER_COMMIT}"
 #############################################
 # 2. Check container pre-installed AITER version
 #############################################
-IMAGE_AITER_VERSION=$(docker exec ci_sglang bash -c "pip show amd-aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'" || echo "none")
+IMAGE_AITER_VERSION=$(docker exec ci_flliper bash -c "pip show amd-aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'" || echo "none")
 IMAGE_AITER_VERSION="v${IMAGE_AITER_VERSION}"
 echo "[CI-AITER-CHECK] AITER version inside CI image: ${IMAGE_AITER_VERSION}"
 
@@ -300,13 +300,13 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     echo "[CI-AITER-CHECK] === AITER REBUILD START ==="
 
     # uninstall existing aiter
-    docker exec ci_sglang pip uninstall -y amd-aiter || true
+    docker exec ci_flliper pip uninstall -y amd-aiter || true
 
     # delete old aiter directory
-    docker exec ci_sglang rm -rf /sgl-workspace/aiter
+    docker exec ci_flliper rm -rf /sgl-workspace/aiter
 
     # clone a fresh copy to /sgl-workspace/aiter
-    docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
+    docker exec ci_flliper git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
 
     # checkout correct version and install requirements
     # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
@@ -314,7 +314,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # not block switching to commits that predate that rule. The working tree
     # was just produced by `rm -rf` + fresh `git clone` above, so there are no
     # real user changes to preserve.
-    docker exec ci_sglang bash -c "
+    docker exec ci_flliper bash -c "
         cd /sgl-workspace/aiter && \
         git fetch --all && \
         git checkout -f ${REPO_AITER_COMMIT} && \
@@ -330,7 +330,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
     # build AITER
-    docker exec ci_sglang bash -c "
+    docker exec ci_flliper bash -c "
         cd /sgl-workspace/aiter && \
         AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
@@ -348,9 +348,9 @@ ensure_httpx
 # # Clear pre-built AITER kernels from Docker image to avoid segfaults
 # # The Docker image may contain pre-compiled kernels incompatible with the current environment
 # echo "Clearing pre-built AITER kernels from Docker image..."
-# docker exec ci_sglang find /sgl-workspace/aiter/aiter/jit -name "*.so" -delete 2>/dev/null || true
-# docker exec ci_sglang ls -la /sgl-workspace/aiter/aiter/jit/ 2>/dev/null || echo "jit dir empty or not found"
+# docker exec ci_flliper find /sgl-workspace/aiter/aiter/jit -name "*.so" -delete 2>/dev/null || true
+# docker exec ci_flliper ls -la /sgl-workspace/aiter/aiter/jit/ 2>/dev/null || echo "jit dir empty or not found"
 
 # # Pre-build AITER kernels to avoid timeout during tests
 # echo "Warming up AITER JIT kernels..."
-# docker exec -e SGLANG_USE_AITER=1 ci_sglang python3 /sglang-checkout/scripts/ci/amd/amd_ci_warmup_aiter.py || echo "AITER warmup completed (some kernels may not be available)"
+# docker exec -e FLLIPER_USE_AITER=1 ci_flliper python3 /flliper-checkout/scripts/ci/amd/amd_ci_warmup_aiter.py || echo "AITER warmup completed (some kernels may not be available)"

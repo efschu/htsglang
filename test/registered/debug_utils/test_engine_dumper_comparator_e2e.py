@@ -1,4 +1,4 @@
-"""E2E test: source patcher + dumper + comparator on SGLang server.
+"""E2E test: source patcher + dumper + comparator on fLLiper server.
 
 Patches Qwen3MoeDecoderLayer.forward (and related methods) to insert
 dumper.dump() calls at 7 points, launches servers with Qwen3-30B-A3B
@@ -27,9 +27,9 @@ pytestmark = pytest.mark.filterwarnings(
     "ignore:Unknown config option. asyncio_mode:pytest.PytestConfigWarning",
 )
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -65,7 +65,7 @@ _FIELDS_TO_VERIFY: list[str] = [
 PATCH_CONFIG_YAML: str = """\
 patches:
   # --- decoder layer level (aligned with miles test) ---
-  - target: sglang.srt.models.qwen3_moe.Qwen3MoeDecoderLayer.forward
+  - target: flliper.srt.models.qwen3_moe.Qwen3MoeDecoderLayer.forward
     edits:
       - match: |
           hidden_states, residual = (
@@ -94,13 +94,13 @@ patches:
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 
   # --- attention internals ---
-  - target: sglang.srt.models.qwen3_moe.Qwen3MoeAttention.forward_core
+  - target: flliper.srt.models.qwen3_moe.Qwen3MoeAttention.forward_core
     edits:
       - match: "output, _ = self.o_proj(attn_output)"
         prepend: "dumper.dump('attn_pre_o_proj', attn_output, dims='t attn_h[attn_tp] # tp:replicated')"
 
   # --- moe internals ---
-  - target: sglang.srt.models.qwen3_moe.Qwen3MoeSparseMoeBlock.forward_normal
+  - target: flliper.srt.models.qwen3_moe.Qwen3MoeSparseMoeBlock.forward_normal
     edits:
       - match: "router_logits, _ = self.gate(hidden_states)"
         append: "dumper.dump('moe_router_logits', router_logits, dims='t num_experts # tp:replicated')"
@@ -122,7 +122,7 @@ patches:
   # postprocess_layer(), after the dump point.
   # layer_input is dumped after prepare_attn which DP-distributes tokens,
   # so it needs dp:=attn_dp to filter to the non-empty DP rank.
-  - target: sglang.srt.models.qwen3_moe.Qwen3MoeDecoderLayer.forward
+  - target: flliper.srt.models.qwen3_moe.Qwen3MoeDecoderLayer.forward
     edits:
       - match: |
           hidden_states, residual = (
@@ -151,13 +151,13 @@ patches:
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 
   # --- attention internals ---
-  - target: sglang.srt.models.qwen3_moe.Qwen3MoeAttention.forward_core
+  - target: flliper.srt.models.qwen3_moe.Qwen3MoeAttention.forward_core
     edits:
       - match: "output, _ = self.o_proj(attn_output)"
         prepend: "dumper.dump('attn_pre_o_proj', attn_output, dims='t attn_h # tp:replicated dp:=attn_dp')"
 
   # --- moe internals ---
-  - target: sglang.srt.models.qwen3_moe.Qwen3MoeSparseMoeBlock.forward_normal
+  - target: flliper.srt.models.qwen3_moe.Qwen3MoeSparseMoeBlock.forward_normal
     edits:
       - match: "router_logits, _ = self.gate(hidden_states)"
         append: "dumper.dump('moe_router_logits', router_logits, dims='t num_experts # tp:replicated')"
@@ -166,7 +166,7 @@ patches:
 """
 
 
-class TestSourcePatcherE2ESGLang:
+class TestSourcePatcherE2EFlliper:
     """E2E: patch Qwen3Moe forward -> dump -> compare."""
 
     def test_patch_dump_and_compare(self, tmp_path: Path) -> None:
@@ -265,7 +265,7 @@ def _run_e2e_scenario(
     cmd: list[str] = [
         "python",
         "-m",
-        "sglang.srt.debug_utils.comparator",
+        "flliper.srt.debug_utils.comparator",
         "--baseline-path",
         str(baseline_exp),
         "--target-path",
@@ -302,7 +302,7 @@ def _run_server_and_generate(
     base_url: str,
     extra_server_args: Optional[list[str]] = None,
 ) -> None:
-    """Launch SGLang server with source patcher + dumper, send a generate request."""
+    """Launch fLLiper server with source patcher + dumper, send a generate request."""
     env: dict[str, str] = {
         **os.environ,
         "DUMPER_SOURCE_PATCHER_CONFIG": str(config_path),

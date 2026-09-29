@@ -13,13 +13,13 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.layers.attention import fi_prefill_wave_split as W
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.attention import fi_prefill_wave_split as W
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-WS = 384 * 1024 * 1024  # SGLANG_FLASHINFER_WORKSPACE_SIZE default
+WS = 384 * 1024 * 1024  # FLLIPER_FLASHINFER_WORKSPACE_SIZE default
 GEOM = dict(num_qo_heads=24, num_kv_heads=4, head_dim=256, float_workspace_bytes=WS)
 
 
@@ -117,7 +117,7 @@ class TestEnvironment(CustomTestCase):
             self.assertEqual(W.wave_split_from_prefix(), 10240)
 
     def test_graph_threshold_is_not_this_modules(self):
-        # the graph side is Agent H's SGLANG_PREFILL_GRAPH_MAX_PREFIX
+        # the graph side is Agent H's FLLIPER_PREFILL_GRAPH_MAX_PREFIX
         env = W.launcher_env_p_deep_split(10240)
         self.assertFalse(any("GRAPH" in k for k in env))
 

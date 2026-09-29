@@ -53,7 +53,7 @@ Hermetic: pure functions, no scheduler, no pool, no CUDA.
 
 import unittest
 
-from sglang.srt.managers.kv_backing_relief import (
+from flliper.srt.managers.kv_backing_relief import (
     _SHRINK_SCALE,
     _floor_ppm,
     _shrink_ppm,
@@ -61,7 +61,7 @@ from sglang.srt.managers.kv_backing_relief import (
     collective_kv_target,
     floor_exceeds_local_cap,
 )
-from sglang.srt.mem_cache.kv_row_ownership import Law, RowSpace, RowOwnershipAuthority
+from flliper.srt.mem_cache.kv_row_ownership import Law, RowSpace, RowOwnershipAuthority
 
 # ---------------------------------------------------------------------------
 # The W22 specimen, verbatim. Every number is quoted from

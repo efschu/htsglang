@@ -18,8 +18,8 @@ import sys
 import threading
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -60,7 +60,7 @@ class FakeServer:
         self.decode_tokens = 0
         self.posted = []
         self.out_ids = out_ids or (lambda job: [1, 2, 3])
-        # Present only when the server runs under SGLANG_LANE_MARGIN_PROBE=1,
+        # Present only when the server runs under FLLIPER_LANE_MARGIN_PROBE=1,
         # so the default stays a server that sends none -- the state a window
         # launched without the probe is actually in.
         self.margins = margins
@@ -555,7 +555,7 @@ class TestTheGateKeepsTheAnswersItGraded(CustomTestCase):
     def test_a_window_without_the_probe_says_so_instead_of_looking_answered(self):
         """The absence-is-an-assertion rule, applied to the margin channel.
 
-        A gate run without ``SGLANG_LANE_MARGIN_PROBE`` produces arms with no
+        A gate run without ``FLLIPER_LANE_MARGIN_PROBE`` produces arms with no
         margins. That must READ as "this window cannot answer the margin
         question", not as an empty list a later reader mistakes for a measured
         zero.

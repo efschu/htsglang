@@ -43,7 +43,7 @@ import unittest
 from types import SimpleNamespace
 
 import torch
-from sglang.srt.mem_cache.hicache_storage import (
+from flliper.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     PoolHitPolicy,
@@ -51,10 +51,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 PAGE_BYTES = 64
 KEYS = ["aa01", "aa02", "aa03"]
@@ -195,7 +195,7 @@ class TestZeroAnswerPartition1035c(CustomTestCase):
             for k in KEYS:
                 _write(store, k)  # KV present, anchor absent -> CAPPED
             with self.assertLogs(
-                "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
+                "flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
                 level=logging.WARNING,
             ) as cm:
                 out = self._drive_query(store, KEYS, [_mamba_transfer(KEYS)])
@@ -211,7 +211,7 @@ class TestZeroAnswerPartition1035c(CustomTestCase):
         with tempfile.TemporaryDirectory() as d:
             store = _store(d)
             with self.assertLogs(
-                "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
+                "flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
                 level=logging.WARNING,
             ) as cm:
                 self._drive_query(store, [], [_mamba_transfer([])])
@@ -223,7 +223,7 @@ class TestZeroAnswerPartition1035c(CustomTestCase):
         with tempfile.TemporaryDirectory() as d:
             store = _store(d)
             with self.assertLogs(
-                "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
+                "flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
                 level=logging.WARNING,
             ) as cm:
                 self._drive_query(store, KEYS, [_mamba_transfer(KEYS)])
@@ -240,7 +240,7 @@ class TestZeroAnswerPartition1035c(CustomTestCase):
                 _write(store, k)
                 _write(store, k, component=PoolName.MAMBA)
             logger = logging.getLogger(
-                "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller"
+                "flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller"
             )
             with unittest.mock.patch.object(logger, "warning") as warn:
                 out = self._drive_query(store, KEYS, [_mamba_transfer(KEYS)])

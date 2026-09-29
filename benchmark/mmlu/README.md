@@ -5,18 +5,18 @@ bash download_data.sh
 
 ## Run benchmark
 
-### Benchmark sglang
+### Benchmark flliper
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python -m flliper.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 ```
 
 ```
-python3 bench_sglang.py --nsub 10
+python3 bench_flliper.py --nsub 10
 ```
 
 ```
 # OpenAI models
-python3 bench_sglang.py --backend gpt-3.5-turbo --parallel 8
+python3 bench_flliper.py --backend gpt-3.5-turbo --parallel 8
 ```
 
 ### Benchmark vllm

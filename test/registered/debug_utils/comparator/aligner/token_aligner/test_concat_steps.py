@@ -3,12 +3,12 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.concat_steps import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.concat_steps import (
     execute_token_aligner_concat_steps,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import apply_dim_names
-from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.dims_spec import apply_dim_names
+from flliper.srt.debug_utils.comparator.utils import Pair
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")

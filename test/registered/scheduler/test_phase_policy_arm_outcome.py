@@ -25,7 +25,7 @@ Three properties, each of which the pre-fix code fails:
 
 import pytest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PHASE_PP,
     PHASE_TP,
     TP_TO_PP,

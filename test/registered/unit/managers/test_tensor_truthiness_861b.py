@@ -39,14 +39,14 @@ import types
 import pytest
 import torch
 
-from sglang.srt.managers.phase_flip_draft_bootstrap import (
+from flliper.srt.managers.phase_flip_draft_bootstrap import (
     COLD_ARMED_ATTR,
     arm_draft_cold_for_admission,
     draft_cold_reason,
     prefix_len,
     rounds_owed,
 )
-from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
+from flliper.srt.managers.phase_purity import SEAM_READMIT_ATTR
 
 N_SLOTS = 64
 
@@ -211,7 +211,7 @@ def test_both_call_sites_go_through_the_one_helper():
     """Two spellings of "how long is this prefix" is one too many: the copy in
     `arm_draft_cold_for_admission` was the one written with `or ()`, and it was
     the one that crashed."""
-    import sglang.srt.managers.phase_flip_draft_bootstrap as mod
+    import flliper.srt.managers.phase_flip_draft_bootstrap as mod
 
     for fn in (mod.draft_cold_reason, mod.arm_draft_cold_for_admission):
         src = inspect.getsource(fn)
@@ -251,11 +251,11 @@ TENSOR_BEARING = {
 #: The modules #861 touched. Named rather than discovered: a module this list
 #: forgets is a module the sweep silently blesses.
 SWEPT_MODULES = (
-    "sglang.srt.managers.phase_flip_draft_bootstrap",
-    "sglang.srt.mem_cache.kv_cache_builder",
-    "sglang.srt.mem_cache.hicache_phase_binding",
-    "sglang.srt.managers.cache_controller",
-    "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
+    "flliper.srt.managers.phase_flip_draft_bootstrap",
+    "flliper.srt.mem_cache.kv_cache_builder",
+    "flliper.srt.mem_cache.hicache_phase_binding",
+    "flliper.srt.managers.cache_controller",
+    "flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
 )
 
 

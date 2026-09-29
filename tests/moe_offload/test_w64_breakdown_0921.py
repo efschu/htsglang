@@ -9,8 +9,8 @@ BOTH that the arithmetic is printed and that it reconciles with the budget.
 
 import types
 
-from sglang.srt.weg2.launcher import _infeasible_breakdown
-from sglang.srt.uneven_perf import (
+from flliper.srt.pdflip.launcher import _infeasible_breakdown
+from flliper.srt.uneven_perf import (
     _PREDICT_MAMBA_ACT_RESERVE_MIB,
     _PREDICT_MIN_RANK_TOKENS,
     _PREDICT_OVERHEAD_MIB,
@@ -83,7 +83,7 @@ def test_a_broken_model_degrades_to_a_named_note_not_an_exception():
 def test_the_refusal_text_carries_the_clause():
     import inspect
 
-    from sglang.srt.weg2 import launcher
+    from flliper.srt.pdflip import launcher
 
     src = inspect.getsource(launcher.d_operating_point_rows)
     assert "_infeasible_breakdown(pcm, mlp, attn_units, budgets, cap, cards)" in src

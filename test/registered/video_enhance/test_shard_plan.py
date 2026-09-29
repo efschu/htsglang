@@ -11,9 +11,9 @@ proposal and the two baselines under one shared cost model.
 
 import unittest
 
-from sglang.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
-from sglang.srt.video_enhance.frame_math import GIB, MIB, R1080P
-from sglang.srt.video_enhance.shard_plan import (
+from flliper.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
+from flliper.srt.video_enhance.frame_math import GIB, MIB, R1080P
+from flliper.srt.video_enhance.shard_plan import (
     CardAvailability,
     MissingRateError,
     PlanStrategy,
@@ -29,7 +29,7 @@ from sglang.srt.video_enhance.shard_plan import (
     static_single_card_plan,
     vsgan_style_modulo_plan,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 # Pure arithmetic over a measurement table; no device, no NVML, no network.
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")

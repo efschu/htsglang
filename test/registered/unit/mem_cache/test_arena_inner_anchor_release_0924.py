@@ -12,7 +12,7 @@ other anchor is prefix cache and may be dropped by a claim (A's
 
 Hermetic, CPU, the REAL C arena and REAL pool / tree / component methods:
   * the chain: completing node k releases the anchor of node k-1 (tombstoned
-    in the tree first, then the reference), never an `_weg2_end_anchor`, a
+    in the tree first, then the reference), never an `_pdflip_end_anchor`, a
     host-locked or a write-pending one; the released anchor stays COMPLETE and
     findable, and a full arena's claim drops it -- never the held end anchor;
   * group D and the switch off release nothing;
@@ -27,13 +27,13 @@ import types
 import pytest
 import torch
 
-from sglang.srt.mem_cache.unified_cache_components import (
+from flliper.srt.mem_cache.unified_cache_components import (
     ComponentData,
     ComponentType,
     EvictLayer,
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_radix_cache import (
+from flliper.srt.mem_cache.unified_radix_cache import (
     INNER_ANCHOR_RELEASE_ENV,
     UnifiedRadixCache,
 )
@@ -43,30 +43,30 @@ SLOTS, PAGE, STAGING = 8, 4096, 3
 
 @pytest.fixture(autouse=True)
 def _group_p(monkeypatch):
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
 
-    monkeypatch.setenv("SGLANG_WEG2_GROUP", "P")
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "P")
     monkeypatch.setenv(INNER_ANCHOR_RELEASE_ENV, "1")    # the arm arms it (default off)
-    monkeypatch.setattr(urc, "_WEG2_END_ANCHOR", True)   # the launcher sets it on P
+    monkeypatch.setattr(urc, "_PDFLIP_END_ANCHOR", True)   # the launcher sets it on P
 
 
 def test_the_default_is_off(monkeypatch):
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
 
     monkeypatch.delenv(INNER_ANCHOR_RELEASE_ENV)
-    assert urc._weg2_inner_anchor_release_on() is False
+    assert urc._pdflip_inner_anchor_release_on() is False
 
 
 def test_without_the_end_anchor_mark_nothing_is_released(monkeypatch):
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
 
-    assert urc._weg2_inner_anchor_release_on() is True
-    monkeypatch.setattr(urc, "_WEG2_END_ANCHOR", False)
-    assert urc._weg2_inner_anchor_release_on() is False
+    assert urc._pdflip_inner_anchor_release_on() is True
+    monkeypatch.setattr(urc, "_PDFLIP_END_ANCHOR", False)
+    assert urc._pdflip_inner_anchor_release_on() is False
 
 
 def _arena_or_skip(path):
-    from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+    from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
     try:
         return ShmArena(str(path), PAGE, SLOTS)
@@ -80,7 +80,7 @@ class _NoDiskBackend:
 
 
 def _pool(path):
-    from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost
+    from flliper.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost
 
     pool = object.__new__(ArenaMambaPoolHost)
     pool.size = STAGING
@@ -140,7 +140,7 @@ def _node(parent=None, host=None, *, end=False, lock=0, pending=None):
     n = types.SimpleNamespace(id=id(data), parent=parent, children={}, component_data=data,
                               write_through_pending_id=pending)
     if end:
-        n._weg2_end_anchor = True
+        n._pdflip_end_anchor = True
     if parent is not None:
         parent.children[len(parent.children)] = n
     return n
@@ -153,15 +153,15 @@ def _tree(pool):
         root_node=root, components={ComponentType.MAMBA: comp}, _components_tuple=(comp,),
         cache_controller=types.SimpleNamespace(mem_pool_host=types.SimpleNamespace(arena_read=True)))
     # UNIFY S7: the unified tree holds the END anchors through the NF H81 form
-    # (_weg2_carrier_rotate + weg2_release_carrier_hold, UNIFY S2), not the
-    # 27B _weg2_carrier_hold -- same one-phase contract.
-    t._weg2_carrier_rotate = types.MethodType(UnifiedRadixCache._weg2_carrier_rotate, t)
-    t.weg2_release_carrier_hold = types.MethodType(UnifiedRadixCache.weg2_release_carrier_hold, t)
+    # (_pdflip_carrier_rotate + pdflip_release_carrier_hold, UNIFY S2), not the
+    # 27B _pdflip_carrier_hold -- same one-phase contract.
+    t._pdflip_carrier_rotate = types.MethodType(UnifiedRadixCache._pdflip_carrier_rotate, t)
+    t.pdflip_release_carrier_hold = types.MethodType(UnifiedRadixCache.pdflip_release_carrier_hold, t)
     return t, root
 
 
 def _release(t, node, pool):
-    return UnifiedRadixCache._weg2_release_inner_anchor(t, node, pool)
+    return UnifiedRadixCache._pdflip_release_inner_anchor(t, node, pool)
 
 
 def _slot(host):
@@ -206,7 +206,7 @@ def test_a_fork_keeps_its_anchor(tmp_path):
     h = [_publish(pool, f"f-{i}") for i in range(3)]
     fork = _node(root, h[0])
     _node(fork, h[1])                                   # branch 1
-    fork._weg2_fork = True                              # set by the insert of branch 2
+    fork._pdflip_fork = True                              # set by the insert of branch 2
     assert _release(t, _node(fork, h[2]), pool) is False  # branch 2's anchor acked
     assert fork.component_data[ComponentType.MAMBA].host_value is not None
     assert pool.arena.evict_candidates(SLOTS) == [], "the fork's anchor stays referenced"
@@ -244,7 +244,7 @@ def test_a_full_arena_drops_released_inner_anchors_never_the_end_anchor(tmp_path
 
 @pytest.mark.parametrize("group,switch", [("D", None), ("P", "0")])
 def test_group_d_and_the_switch_off_release_nothing(tmp_path, monkeypatch, group, switch):
-    monkeypatch.setenv("SGLANG_WEG2_GROUP", group)
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", group)
     if switch is not None:
         monkeypatch.setenv(INNER_ANCHOR_RELEASE_ENV, switch)
     pool = _pool(tmp_path / "d.bin")
@@ -276,7 +276,7 @@ def test_the_reset_holds_the_end_anchors_one_phase(tmp_path):
 
 
 def test_group_d_resets_as_a_releases_them(tmp_path, monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_GROUP", "D")
+    monkeypatch.setenv("FLLIPER_PDFLIP_GROUP", "D")
     pool = _pool(tmp_path / "f.bin")
     t, root = _tree(pool)
     he = _publish(pool, "end")
@@ -288,6 +288,6 @@ def test_group_d_resets_as_a_releases_them(tmp_path, monkeypatch):
 def test_the_ack_path_calls_the_release_after_the_complete():
     import inspect
 
-    src = inspect.getsource(UnifiedRadixCache._weg2_direct_complete)
-    assert src.index("mp.complete_write(mhv)") < src.index("self._weg2_release_inner_anchor(node, mp)")
+    src = inspect.getsource(UnifiedRadixCache._pdflip_direct_complete)
+    assert src.index("mp.complete_write(mhv)") < src.index("self._pdflip_release_inner_anchor(node, mp)")
     assert EvictLayer.HOST  # the release goes through the component's own host eviction

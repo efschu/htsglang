@@ -14,7 +14,7 @@ profiling and analyzing nsys profile output.
   List of input files and their metadata. Each entry should be in the format:
   `<nsys-rep>,<engine>,<model>,<elapsed_nonprofiled_sec>`
   - `nsys-rep`: Path to the `.nsys-rep` file.
-  - `engine`: Engine name (e.g., `sglang`).
+  - `engine`: Engine name (e.g., `flliper`).
   - `model`: Model name (e.g., `llama`, `gpt-oss`, `ds`).
   - `elapsed_nonprofiled_sec`: Wall-clock runtime (in seconds) without
     profiling. Specify `0` to use the elapsed time from the nsys-rep file
@@ -51,20 +51,20 @@ python3 gputrc2graph.py --help
 
 ## Example 1: analyze a single profile
 
-To analyze the GPU cycles of for example, a llama-3.1-8B model with sglang:
+To analyze the GPU cycles of for example, a llama-3.1-8B model with flliper:
 
-1. Run the following command to collect nsys profile, for sglang server config.
+1. Run the following command to collect nsys profile, for flliper server config.
 
    ```bash
    nsys profile -t cuda -o nsys_res -f true --trace-fork-before-exec=true \
    --cuda-graph-trace=node --delay <DELAY> --duration <DURATION> \
-   python3 -m sglang.launch_server --model meta-llama/Llama-3.1-8B ...
+   python3 -m flliper.launch_server --model meta-llama/Llama-3.1-8B ...
    ```
 
    where:
 
    - DELAY: how many seconds to delay nsys from collecting profiles, needed so
-     that profiles aren't captured till sglang server has come up and load
+     that profiles aren't captured till flliper server has come up and load
      generation starts.
    - DURATION: how many seconds for nsys profile to run before generating the
      profile. This should be > the duration of the run.
@@ -84,7 +84,7 @@ seconds. This value will be used by the script to calculate the
 
    ```bash
    python3 gputrc2graph.py \
-   --in_file run1.nsys-rep,sglang,llama,132
+   --in_file run1.nsys-rep,flliper,llama,132
    ```
 
 The command will produce 2 files for analysis:
@@ -119,7 +119,7 @@ time, something like the following command can be used.
 
 ```bash
 python3 gputrc2graph.py \
---in_file run1.nsys-rep,sglang,llama,100 run2.nsys-rep,sglang,gpt-oss,102 \
+--in_file run1.nsys-rep,flliper,llama,100 run2.nsys-rep,flliper,gpt-oss,102 \
 --out_dir results
 ```
 

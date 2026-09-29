@@ -12,8 +12,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.mem_cache import canonical_page_store as cps
-from sglang.srt.mem_cache.storage.file import pageio
+from flliper.srt.mem_cache import canonical_page_store as cps
+from flliper.srt.mem_cache.storage.file import pageio
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 

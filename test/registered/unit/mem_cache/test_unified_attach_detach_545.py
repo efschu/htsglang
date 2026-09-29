@@ -29,7 +29,7 @@ be pinned is the ORDER and the REFUSALS, not the controller's internals.
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 class _Controller:

@@ -37,8 +37,8 @@ from pathlib import Path
 
 import pytest
 
-from sglang.srt.utils import kernel_dist_guard as G
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.utils import kernel_dist_guard as G
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -286,7 +286,7 @@ def test_list_providers_is_generic_over_the_package_name(good):
 
 
 def test_the_guard_imports_only_the_standard_library():
-    """It must run in a build layer where torch and sglang are not importable.
+    """It must run in a build layer where torch and flliper are not importable.
 
     Enforced structurally rather than by comment: a future edit that reaches
     for ``torch`` or a fork helper would break the Docker assert at image
@@ -306,7 +306,7 @@ def test_the_guard_imports_only_the_standard_library():
     )
 
 
-def test_cli_runs_by_path_without_importing_sglang(good, tmp_path):
+def test_cli_runs_by_path_without_importing_flliper(good, tmp_path):
     """Exactly how the Dockerfile invokes it: a plain path, no PYTHONPATH."""
     proc = subprocess.run(
         [

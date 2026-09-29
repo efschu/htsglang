@@ -1,0 +1,850 @@
+"""RotaryEmbedding base class + LinearScalingRotaryEmbedding."""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+
+import torch
+
+from flliper.srt.environ import envs
+from flliper.srt.layers.rotary_embedding import lazy_cos_sin_cache
+from flliper.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from flliper.srt.layers.utils import MultiPlatformOp
+from flliper.srt.platforms import current_platform
+from flliper.srt.runtime_context import get_server_args
+from flliper.srt.utils import (
+    cpu_has_amx_support,
+    get_bool_env_var,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_mps,
+    is_musa,
+    is_npu,
+    is_xpu,
+)
+
+if TYPE_CHECKING:
+    from flliper.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
+
+logger = logging.getLogger(__name__)
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("FLLIPER_USE_AITER") and _is_hip
+_is_npu = is_npu()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
+_is_xpu = is_xpu()
+_is_musa = is_musa()
+_is_mps = is_mps()
+
+if _is_cuda:
+    from flliper.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
+else:
+    # Bind the name on every platform so the call site can test availability
+    # instead of raising NameError. This mirrors what mrope.py already does
+    # (`if _is_cuda and (apply_rope_with_cos_sin_cache_inplace is not None)`);
+    # base.py gated the call on `use_fallback_kernel` alone, which is False on
+    # ROCm too, so a rank without the kernel called a name never imported.
+    apply_rope_with_cos_sin_cache_inplace = None
+
+if _is_npu:
+    import torch_npu
+
+    # `fused_rope_qk_mqa` is an optional fast-path kernel shipped with
+    # `sgl_kernel_npu`. Older NPU CANN / sgl_kernel_npu builds may not include
+    # it. If we let the ImportError propagate, importing this module fails,
+    # which in turn causes `ModelRegistry` to silently skip every model that
+    # depends on it (and fall back to HF Transformers without quantisation
+    # awareness — see PR #22352). We tolerate the missing kernel so model
+    # loading still works; call sites must check for `None` and use the
+    # generic rope path. A warning is emitted so the missing kernel is
+    # visible in logs instead of being silently swallowed.
+    try:
+        from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
+    except ImportError:
+        fused_rope_qk_mqa = None
+        logger.warning(
+            "sgl_kernel_npu.norm.fused_rope_qk_mqa is unavailable; "
+            "falling back to the generic rope implementation. Upgrade "
+            "sgl_kernel_npu to enable the fused kernel."
+        )
+
+if _is_hip:
+    from flliper.srt.layers.attention.utils import (
+        fused_qk_rope_reshape_and_cache,
+    )
+
+if _is_xpu:
+    from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
+
+
+@lazy_cos_sin_cache.register_lazy_safe
+class RotaryEmbedding(MultiPlatformOp):
+    """Original rotary positional embedding."""
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.is_neox_style = is_neox_style
+        self.dtype = dtype
+
+        # #656 T1: reserve the ceiling instead of materializing it, when the
+        # lazy cache is enabled and this class's growth hooks are verified.
+        # Declining (None) lands on the eager path below, unchanged.
+        self._lazy_cos_sin = None
+        cache = lazy_cos_sin_cache.install(
+            self,
+            capacity_rows=self._cos_sin_cache_rows(),
+            cols=self.rotary_dim,
+            device=torch.empty(0).device,
+            dtype=(
+                torch.float32
+                if (_is_cuda or envs.FLLIPER_ROPE_CACHE_FP32.get())
+                else dtype
+            ),
+        )
+        if cache is None:
+            cache = self._compute_cos_sin_cache()
+            # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
+            if not (_is_cuda or envs.FLLIPER_ROPE_CACHE_FP32.get()):
+                cache = cache.to(dtype)
+
+        if (
+            (not (_is_cuda) or self.head_size not in [64, 128, 256, 512])
+            and not (_is_cpu)
+            and not (_is_xpu)
+            and not (_is_npu)
+            and not (_is_musa)
+            and not (_is_mps)
+            and not (current_platform.is_out_of_tree())
+        ):
+            # rotary_embedding from flliper.jit_kernel.rope and vllm._custom_ops has the same implementation.
+            # TODO: Test on different devices and remove this conditional.
+            # NOTE: this import happens at LAYER CONSTRUCTION time, not at
+            # module import. Module-level import sweeps cannot see it -- it was
+            # found only by actually building a model on gfx900, where
+            # sgl-kernel has no ROCm build below gfx942. The same applies to an
+            # sm75 CUDA rank via the vllm branch.
+            #
+            # `use_fallback_kernel = False` is not a new path: it is the
+            # existing non-kernel route this constructor already takes when the
+            # conditions above are not met, so declining here lands on code
+            # that is exercised on every platform that lacks the kernel.
+            _rotary_embedding = None
+            try:
+                if _is_cuda:
+                    from flliper.jit_kernel.rope import rotary_embedding
+
+                    _rotary_embedding = rotary_embedding
+                elif _is_hip:
+                    from sgl_kernel import rotary_embedding
+
+                    _rotary_embedding = rotary_embedding
+                else:
+                    from vllm._custom_ops import rotary_embedding
+
+                    _rotary_embedding = rotary_embedding
+            except ImportError:
+                _rotary_embedding = None
+
+            if _rotary_embedding is not None:
+                self.use_fallback_kernel = True
+                self.fallback_rotary_embedding = _rotary_embedding
+            else:
+                self.use_fallback_kernel = False
+        else:
+            self.use_fallback_kernel = False
+
+        self.cos_sin_cache: torch.Tensor
+        self.register_buffer("cos_sin_cache", cache, persistent=False)
+
+        self._apply_rotary_emb_wrapped = apply_rotary_emb
+
+        # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
+        if get_server_args().rl_on_policy_target is not None or _is_musa:
+            self._forward_method = self.forward_native
+            self._apply_rotary_emb_wrapped = torch.compile(
+                dynamic=True,
+                disable=_is_npu,
+            )(apply_rotary_emb)
+        self.position_cos, self.position_sin = None, None
+
+    def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
+        # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
+        # is expensive, so avoid calling it if possible
+        if (
+            self.cos_sin_cache.device != query.device
+            or self.cos_sin_cache.dtype != query.dtype
+        ):
+            # A conversion copies the buffer, and a lazy buffer's tail is
+            # uninitialized reservation -- copying it would turn deferred rows
+            # into garbage rows with no error anywhere. Materialize first.
+            if getattr(self, "_lazy_cos_sin", None) is not None:
+                self._relinquish_lazy_cos_sin_cache(
+                    f"cache {self.cos_sin_cache.dtype}@{self.cos_sin_cache.device} "
+                    f"converted to {query.dtype}@{query.device}"
+                )
+            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+
+    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+        """Compute the inverse frequency."""
+        # NOTE(woosuk): To exactly match the HF implementation, we need to
+        # use CPU to compute the cache and then move it to GPU. However, we
+        # create the cache on GPU for faster initialization. This may cause
+        # a slight numerical difference between the HF implementation and ours.
+        init_device = (
+            "cpu" if get_server_args().rl_on_policy_target is not None else None
+        )
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(
+                    0, self.rotary_dim, 2, dtype=torch.float, device=init_device
+                )
+                / self.rotary_dim
+            )
+        )
+        if get_server_args().rl_on_policy_target is not None:
+            inv_freq = inv_freq.cuda()
+        return inv_freq
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        """Compute the cos and sin cache."""
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
+
+    def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
+        """Frequencies for rows APPENDED by _ensure_cos_sin_cache_length.
+
+        This exists because the rows a subclass builds in
+        _compute_cos_sin_cache and the rows the growth path appends must come
+        from the SAME frequencies. The base cache is built with
+        _compute_inv_freq(self.base), so that is the default -- but every
+        scaled variant (YaRN, Deepseek, YaRN-MRoPE) builds its cache with
+        _compute_inv_freq(self.scaling_factor) instead. Those classes MUST
+        override this, or the appended positions silently carry different
+        frequencies from the ones before them: no exception, just wrong
+        attention past the boot-time cache length.
+        """
+        return self._compute_inv_freq(self.base)
+
+    def _cos_sin_cache_row_scale(self) -> float:
+        """Amplitude applied to appended cos/sin rows (YaRN's mscale).
+
+        Same contract as _cos_sin_cache_inv_freq: the scaled variants
+        multiply their cache by self.mscale, so a growth path that omits it
+        produces rows of the wrong magnitude.
+        """
+        return 1.0
+
+    def _cos_sin_cache_rows(self) -> int:
+        """How many rows _compute_cos_sin_cache would build, without building.
+
+        The lazy cache reserves this many rows. A subclass whose cache is
+        longer than max_position_embeddings (every scaled variant) MUST
+        override this, or its reservation is short and the growth path pays
+        for the difference at runtime.
+        """
+        return int(self.max_position_embeddings)
+
+    def _build_cos_sin_rows(
+        self,
+        start: int,
+        end: int,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        """Rows [start, end) from the SAME parameters the cache was built with.
+
+        The single place rows are computed outside the constructor: both the
+        growth path and the lazy fill go through here, so register 47's bug
+        (appending rows from _compute_inv_freq(self.base) with no mscale) has
+        one place left to be wrong in, and one place to be tested.
+        """
+        inv_freq = self._cos_sin_cache_inv_freq()
+        if device is not None:
+            inv_freq = inv_freq.to(device=device)
+        t = torch.arange(start, end, dtype=inv_freq.dtype, device=inv_freq.device)
+        if t.numel() == 0:
+            return torch.empty(
+                (0, self.rotary_dim),
+                dtype=dtype or inv_freq.dtype,
+                device=inv_freq.device,
+            )
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        row_scale = self._cos_sin_cache_row_scale()
+        rows = torch.cat((freqs.cos() * row_scale, freqs.sin() * row_scale), dim=-1)
+        return rows if dtype is None else rows.to(dtype=dtype)
+
+    def _relinquish_lazy_cos_sin_cache(self, why: str) -> None:
+        """Stop being lazy, and materialize what laziness was deferring.
+
+        Called when something takes the buffer out from under the state --
+        a dtype conversion, a device move. The rows past `filled` are
+        uninitialized reservation, so they MUST be written before the buffer
+        can be treated as an ordinary cache; skipping that is silent garbage
+        attention rather than an error.
+        """
+        state = getattr(self, "_lazy_cos_sin", None)
+        if state is None:
+            return
+        logger.warning(
+            "RoPE lazy cos/sin cache relinquished (%s): materializing rows %d..%d",
+            why,
+            state.filled,
+            state.capacity,
+        )
+        self._lazy_cos_sin = None
+        lazy_cos_sin_cache.drop(self)
+        if state.filled < state.capacity:
+            tail = self._build_cos_sin_rows(
+                state.filled,
+                state.capacity,
+                device=self.cos_sin_cache.device,
+                dtype=self.cos_sin_cache.dtype,
+            )
+            if int(self.cos_sin_cache.shape[0]) >= state.capacity:
+                self.cos_sin_cache[state.filled : state.capacity] = tail
+            else:
+                self.cos_sin_cache = torch.cat(
+                    (self.cos_sin_cache[: state.filled], tail), dim=0
+                )
+
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        """Ensure cos_sin_cache length > needed_max_pos."""
+        state = getattr(self, "_lazy_cos_sin", None)
+        if state is not None:
+            if self.cos_sin_cache.data_ptr() != state.ptr:
+                # Somebody replaced the buffer (a .to(), an _apply). The
+                # reservation is no longer what the layer reads from, so the
+                # unfilled tail has to be written before it is read.
+                self._relinquish_lazy_cos_sin_cache("buffer was replaced")
+            elif needed_max_pos < state.filled:
+                return
+            elif needed_max_pos < state.capacity:
+                # THE LAZY PATH: fill in place, so the address the CUDA graphs
+                # captured stays valid. Growth is chunked to keep the number
+                # of fill launches small, and is monotone.
+                chunk = lazy_cos_sin_cache.lazy_chunk_rows()
+                new_filled = min(
+                    state.capacity,
+                    max(needed_max_pos + 1, state.filled + chunk),
+                )
+                self.cos_sin_cache[state.filled : new_filled] = (
+                    self._build_cos_sin_rows(
+                        state.filled,
+                        new_filled,
+                        device=self.cos_sin_cache.device,
+                        dtype=self.cos_sin_cache.dtype,
+                    )
+                )
+                logger.debug(
+                    "RoPE lazy cos/sin cache grew %d -> %d rows (position %d reached)",
+                    state.filled,
+                    new_filled,
+                    needed_max_pos,
+                )
+                state.filled = new_filled
+                lazy_cos_sin_cache.note_growth(self)
+                return
+            else:
+                # Past the reservation. Reallocation is the only way out and
+                # it moves the address, so say so: if a CUDA graph has been
+                # captured against this buffer, this is the moment it broke.
+                self._relinquish_lazy_cos_sin_cache(
+                    f"position {needed_max_pos} is past the reserved {state.capacity} rows"
+                )
+
+        cur_len = int(self.cos_sin_cache.shape[0])
+        if needed_max_pos < cur_len:
+            return
+
+        # Align to reduce realloc frequency
+        align = envs.FLLIPER_ROPE_CACHE_ALIGN.get()
+        new_len = ((needed_max_pos + align) // align) * align
+        device = self.cos_sin_cache.device
+        dtype = self.cos_sin_cache.dtype
+
+        # Incremental computation for new positions only, through the hooks so
+        # scaled variants extend with the frequencies they were built with.
+        new_rows = self._build_cos_sin_rows(
+            cur_len, new_len, device=device, dtype=dtype
+        )
+        if new_rows.shape[0] == 0:
+            return
+
+        # Update cache with new rows
+        self.cos_sin_cache = torch.cat((self.cos_sin_cache, new_rows), dim=0).to(
+            device=device, dtype=dtype
+        )
+
+    def ensure_cos_sin_cache_capacity(self, rows: int) -> None:
+        """Make the reservation cover `rows`, without filling it.
+
+        This is what a lazy cache does with a pre-capture reserve request: the
+        reserve is a CEILING statement, and prepaying it is the cost this
+        whole path exists to remove.
+        """
+        state = getattr(self, "_lazy_cos_sin", None)
+        if state is None:
+            # A cache can be born too small to be worth a reservation and then
+            # be asked to cover the whole ceiling right here -- which is how a
+            # 1048960x36 cache that started under the threshold ended up
+            # EAGERLY holding 144 MiB of a 1M ceiling. The reserve is the
+            # moment the ceiling becomes known, so it is also the moment to
+            # reconsider. Eligibility is re-asked in full (install, not
+            # reserve): this layer has never been lazy.
+            written = int(self.cos_sin_cache.shape[0])
+            cache = lazy_cos_sin_cache.install(
+                self,
+                capacity_rows=rows,
+                cols=self.rotary_dim,
+                device=self.cos_sin_cache.device,
+                dtype=self.cos_sin_cache.dtype,
+            )
+            if cache is None:
+                self._ensure_cos_sin_cache_length(rows - 1)
+                return
+            # Carry over the rows that were already computed, so becoming lazy
+            # never un-writes a row somebody may already have read.
+            if written > self._lazy_cos_sin.filled:
+                cache[:written] = self.cos_sin_cache[:written].to(
+                    device=cache.device, dtype=cache.dtype
+                )
+                self._lazy_cos_sin.filled = written
+                lazy_cos_sin_cache.note_growth(self)
+            self.cos_sin_cache = cache
+            return
+        if rows <= state.capacity:
+            return
+        # Enlarging the reservation moves the address. Safe here only because
+        # the reserve runs before CUDA graph capture; that ordering is the
+        # caller's contract (model_runner calls it before capture).
+        logger.info(
+            "RoPE lazy cos/sin cache: enlarging reservation %d -> %d rows",
+            state.capacity,
+            rows,
+        )
+        filled = state.filled
+        self._lazy_cos_sin = None
+        lazy_cos_sin_cache.drop(self)
+        cache = lazy_cos_sin_cache.reserve(
+            self,
+            capacity_rows=rows,
+            cols=self.rotary_dim,
+            device=self.cos_sin_cache.device,
+            dtype=self.cos_sin_cache.dtype,
+        )
+        if cache is None:
+            self._ensure_cos_sin_cache_length(rows - 1)
+            return
+        if filled > self._lazy_cos_sin.filled:
+            cache[self._lazy_cos_sin.filled : filled] = self._build_cos_sin_rows(
+                self._lazy_cos_sin.filled,
+                filled,
+                device=cache.device,
+                dtype=cache.dtype,
+            )
+            self._lazy_cos_sin.filled = filled
+            lazy_cos_sin_cache.note_growth(self)
+        self.cos_sin_cache = cache
+
+    def get_cos_sin_with_position(self, positions):
+        assert positions.ndim == 1, (
+            "2D positions (multimodal RoPE) are not supported by the base "
+            "RotaryEmbedding. Override this method in a subclass (e.g. MRotaryEmbedding)."
+        )
+        cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
+        last_dim = cos_sin.size()[-1]
+        cos, sin = (
+            cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
+        )
+        # BSNH
+        self.position_cos, self.position_sin = (
+            cos.view(-1, 1, 1, last_dim).contiguous(),
+            sin.view(-1, 1, 1, last_dim).contiguous(),
+        )
+
+    def get_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
+        cos_sin = self.cos_sin_cache[:seqlen]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        return cos, sin
+
+    def forward_native(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """A PyTorch-native implementation of forward()."""
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for native implementation"
+
+        if offsets is not None:
+            positions = positions + offsets
+
+        positions = positions.flatten()
+        num_tokens = positions.shape[0]
+
+        if hasattr(self, "sin_cos_cache"):
+            cos_sin = self.sin_cos_cache
+        else:
+            cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+
+        query_shape = query.shape
+        query = query.view(num_tokens, -1, self.head_size)
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        query_rot = self._apply_rotary_emb_wrapped(
+            query_rot, cos, sin, self.is_neox_style
+        )
+        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.view(num_tokens, -1, self.head_size)
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+        key_rot = self._apply_rotary_emb_wrapped(key_rot, cos, sin, self.is_neox_style)
+        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        return query, key
+
+    def forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """A PyTorch-npu implementation of forward()."""
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
+        if (
+            query.dtype == torch.bfloat16
+            and self.cos_sin_cache.dtype == torch.float
+            or key.ndim == 3
+        ):
+            if hasattr(self, "sin_cos_cache"):
+                cos_sin = self.sin_cos_cache
+            else:
+                cos_sin = self.cos_sin_cache.index_select(0, positions)
+
+            if fused_rope_qk_mqa is not None and query.shape[0] < 65535:
+                return fused_rope_qk_mqa(
+                    query,
+                    key,
+                    cos_sin,
+                    self.rotary_dim,
+                    self.is_neox_style,
+                )
+            else:
+                return self.forward_native(positions, query, key, offsets)
+        if self.is_neox_style:
+            rotary_mode = "half"
+        else:
+            rotary_mode = "interleave"
+
+        mrope_section = [0, 0, 0]
+        # The npu_mrope kernel only supports 1D or 2D tensors for query and key.
+        # Therefore, when their dimensions exceed 2D, we flatten query and key to 2D tensors before computation
+        # and reshape their original shapes afterward.
+        query_shape = query.shape
+        key_shape = key.shape
+        query = query.reshape(query.shape[0], -1)
+        key = key.reshape(key.shape[0], -1)
+
+        query_out, key_out = torch_npu.npu_mrope(
+            positions,
+            query,
+            key,
+            self.cos_sin_cache,
+            self.head_size,
+            mrope_section=mrope_section,
+            rotary_mode=rotary_mode,
+        )
+
+        query_out = query_out.reshape(query_shape)
+        key_out = key_out.reshape(key_shape)
+        return query_out, key_out
+
+    def forward_cpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for cpu implementation"
+
+        positions = torch.add(positions, offsets) if offsets is not None else positions
+        if _is_cpu_amx_available:
+            return torch.ops.sgl_kernel.rotary_embedding_cpu(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.is_neox_style,
+            )
+        else:
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
+            )
+
+    def forward_cuda(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # BOTH branches below require a kernel: the `if` needs the CUDA-only
+        # jit_kernel rope, the `else` needs self.fallback_rotary_embedding,
+        # which the constructor sets only when some kernel imported. On a
+        # device where neither exists -- ROCm below gfx942 has no sgl_kernel
+        # build -- the constructor lands on use_fallback_kernel=False and this
+        # method then dereferenced a name that was never bound (NameError),
+        # or an attribute that was never set (AttributeError).
+        #
+        # forward_native is the class's own documented PyTorch implementation,
+        # so route to it rather than inventing a third path. Measured
+        # equivalent: on identical inputs the jit kernel and forward_native
+        # agree to one fp16 ULP (max 0.00195), and forward_native is
+        # BYTE-identical between sm75 and gfx900. On CUDA the jit kernel is
+        # always present, so this test is False there and behaviour is
+        # unchanged.
+        if not self.use_fallback_kernel and (
+            apply_rope_with_cos_sin_cache_inplace is None
+        ):
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
+            )
+
+        if not self.use_fallback_kernel:
+            batch_size = positions.size(0)
+            q_rope = query.view(batch_size, -1, self.head_size)
+            k_rope = key.view(batch_size, -1, self.head_size)
+            if self.head_size != self.rotary_dim:
+                q_rope = q_rope[..., : self.rotary_dim]
+                k_rope = k_rope[..., : self.rotary_dim]
+            apply_rope_with_cos_sin_cache_inplace(
+                positions=positions,
+                q=q_rope,
+                k=k_rope,
+                cos_sin_cache=self.cos_sin_cache,
+                is_neox=self.is_neox_style,
+                fused_args=fused_set_kv_buffer_arg,
+            )
+        else:
+
+            if fused_set_kv_buffer_arg is not None and _is_hip:
+                extra_args = fused_set_kv_buffer_arg
+                k_cache = fused_set_kv_buffer_arg["key_cache"]
+                # 5D SHUFFLE pool feeds raw (N, H, D/x, page, x) K cache;
+                # NHD 3D pool feeds the legacy 4D paged view. Auto-detect.
+                is_shuffle_5d = k_cache.ndim == 5
+                if is_shuffle_5d:
+                    # K shape (num_blocks, H_kv, D//x, page, x): D = D//x * x
+                    qk_head_dim = k_cache.shape[2] * k_cache.shape[4]
+                    tp_k_head_num = k_cache.shape[1]
+                else:
+                    qk_head_dim = k_cache.shape[-1]
+                    tp_k_head_num = k_cache.shape[-2]
+
+                key = key.view(-1, tp_k_head_num, qk_head_dim)
+                tokens = key.shape[0]
+                query = query.view(tokens, -1, qk_head_dim)
+
+                query, key, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+                    q=query,
+                    k=key,
+                    pos=positions,
+                    cos_sin=self.cos_sin_cache,
+                    is_neox=self.is_neox_style,
+                    flash_layout=not is_shuffle_5d,
+                    offs=None,
+                    q_out=query,
+                    k_out=key,
+                    output_zeros=False,
+                    **extra_args,
+                )
+            else:
+                assert (
+                    fused_set_kv_buffer_arg is None
+                ), "save kv cache is not supported for fallback_rotary_embedding."
+                self._match_cos_sin_cache_dtype(query)
+                self.fallback_rotary_embedding(
+                    positions,
+                    query,
+                    key,
+                    self.head_size,
+                    self.cos_sin_cache,
+                    self.is_neox_style,
+                )
+        return query, key
+
+    def extra_repr(self) -> str:
+        s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
+        s += f", max_position_embeddings={self.max_position_embeddings}"
+        s += f", base={self.base}, is_neox_style={self.is_neox_style}"
+        return s
+
+    def forward_xpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
+        positions = torch.add(positions, offsets) if offsets is not None else positions
+
+        self._match_cos_sin_cache_dtype(query)
+
+        # Fused_qk_rope only supports aligned head_size
+        if self.head_size in [128, 256, 512]:
+            num_tokens = positions.size(0)
+            q_rope = query.view(num_tokens, -1, self.head_size)
+            k_rope = key.view(num_tokens, -1, self.head_size)
+            if self.head_size != self.rotary_dim:
+                q_rope = q_rope[..., : self.rotary_dim]
+                k_rope = k_rope[..., : self.rotary_dim]
+            fused_qk_rope_with_cos_sin_cache_inplace(
+                q_rope,
+                k_rope,
+                self.cos_sin_cache,
+                positions,
+                self.rotary_dim,
+                self.is_neox_style,
+            )
+            return query, key
+        else:
+            # Use fallback kernel of 'rotary_embedding'
+            return torch.ops.sgl_kernel.rotary_embedding(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.is_neox_style,
+            )
+
+
+class LinearScalingRotaryEmbedding(RotaryEmbedding):
+    """RotaryEmbedding extended with linear scaling.
+
+    It supports multiple scaling factors. Since multiple LoRA adapters may have
+    different scaling factors, we need multiple cos/sin caches. In this way,
+    instead of running rotary embedding kernel per lora, we can run multiple
+    lora in a batched way.
+
+    In addition to that, we also keep the cos/sin cache for the scaling factor
+    of 1 (default) at all times.
+
+    Exemplary for two scaling factors x=1, y and z with embeddings
+    [[x11, x12, ... x1m], ..., [xn1, xn2, ..., xnm]] and
+    [[y11, y12, ... y1o], ..., [yn1, yn2, ..., yno]], and
+    [[z11, z12, ... z1p], ..., [zn1, zn2, ..., znp]],
+
+    we construct the cos/sin cache as follows:
+    [[x11, x12, ... x1m, y11, y12, ... y1o, z11, z12, ... z1p],
+        ...
+     [xn1, xn2, ... xnm, yn1, yn2, ... yno, zn1, zn2, ... znp]]
+
+    We then use offsets to index into the cos/sin cache for
+    the respective scaling factors.
+
+    The offset to cache can be accessed via `scaling_factor_to_offset` API.
+
+    Credits to the Reddit user /u/kaiokendev
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        scaling_factors: Union[List[float], float],
+        dtype: torch.dtype,
+    ) -> None:
+        if isinstance(scaling_factors, float):
+            scaling_factors = [scaling_factors]
+        self.scaling_factors: List[float] = scaling_factors  # noqa
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
+        # Lazy initialized.
+        self._scaling_factor_to_offset: Dict[float, int]
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        inv_freq = self._compute_inv_freq(self.base)
+        cache_list: List[torch.Tensor] = []
+        # offsets to the next cache in a tensor.
+        # Each offset corresponds to the same index in scaling_factors.
+        offsets: List[int] = []
+        for scaling_factor in self.scaling_factors:
+            # NOTE(woosuk): self.max_position_embeddings is the original
+            # maximum length before applying the rope scaling.
+            # Thus, the maximum length after applying the rope scaling is
+            # self.max_position_embeddings * self.scaling_factor.
+            max_len = self.max_position_embeddings * scaling_factor
+            t = torch.arange(max_len, dtype=torch.float)
+            t = t / scaling_factor
+
+            freqs = torch.einsum("i,j -> ij", t, inv_freq)
+            cos = freqs.cos()
+            sin = freqs.sin()
+            cache = torch.cat((cos, sin), dim=-1)
+            if not cache_list:
+                offset = 0
+            else:
+                last_offset = offsets[-1]
+                next_max_len = cache_list[-1].shape[0]
+                offset = last_offset + next_max_len
+            offsets.append(offset)
+            cache_list.append(cache)
+        self._scaling_factor_to_offset = {
+            float(scaling_factor): offsets[i]
+            for i, scaling_factor in enumerate(self.scaling_factors)
+        }
+        assert len(self.scaling_factors) == len(offsets)
+        return torch.cat(cache_list, dim=0)
+
+    @property
+    def scaling_factor_to_offset(self) -> Dict[float, int]:
+        return self._scaling_factor_to_offset

@@ -4,16 +4,16 @@ import unittest
 
 import torch
 
-from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache, TreeNode
-from sglang.srt.mem_cache.unified_cache_components import (
+from flliper.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
+from flliper.srt.mem_cache.swa_radix_cache import SWARadixCache, TreeNode
+from flliper.srt.mem_cache.unified_cache_components import (
     BASE_COMPONENT_TYPE,
     ComponentType,
 )
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_radix_cache
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.fixtures import DEFAULT_DEVICE, make_radix_cache
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, suite="extra-a-test-1-gpu-small-amd")

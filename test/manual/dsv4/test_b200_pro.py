@@ -67,7 +67,7 @@ class TestB200ProBalanced(DSV4ProAime25TestBase):
         "--deepep-config",
         DEEPEP_LARGE_SMS_CONFIG,
     ]
-    EXTRA_ENV = {"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256"}
+    EXTRA_ENV = {"FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256"}
 
 
 class TestB200ProMaxThroughput(DSV4ProAime25TestBase):
@@ -90,7 +90,7 @@ class TestB200ProMaxThroughput(DSV4ProAime25TestBase):
         "--deepep-config",
         DEEPEP_LARGE_SMS_CONFIG,
     ]
-    EXTRA_ENV = {"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256"}
+    EXTRA_ENV = {"FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256"}
 
 
 class TestB200ProCP(DSV4ProAime25TestBase):
@@ -116,7 +116,7 @@ class TestB200ProCP(DSV4ProAime25TestBase):
         DEEPEP_LARGE_SMS_CONFIG,
     ]
     EXTRA_ENV = {
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+        "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
     }
 
 

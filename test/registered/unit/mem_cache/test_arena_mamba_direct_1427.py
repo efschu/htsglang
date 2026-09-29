@@ -12,9 +12,9 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.mem_cache.hicache_migrate import MambaBlobSpec, conv_extents, temporal_extents
-from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+from flliper.srt.mem_cache.hicache_migrate import MambaBlobSpec, conv_extents, temporal_extents
+from flliper.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -59,7 +59,7 @@ def _pool(arena, ratios=(1,), rank=0, t_shape=(2, 2, 2), conv_shape=(6, 2)):
     p.temporal_buffer = torch.zeros(SPEC.num_layers, S, 2, 2, 2)
     p.conv_buffer = [torch.zeros(SPEC.num_layers, S, 6, 2, dtype=torch.float16)]
     p._arena_init_fields()
-    p._weg2_parts = (SPEC, list(ratios), rank, 0, SPEC.num_layers)
+    p._pdflip_parts = (SPEC, list(ratios), rank, 0, SPEC.num_layers)
     be = _Backend(arena)
     assert p.ensure_bound(be)
     return p
@@ -118,7 +118,7 @@ def test_the_dma_state_load_lands_the_cpu_stages_rows_without_a_pinned_stage(tmp
     back_rows = rows.flip(0)                                 # slots out of order
     got = {}
     for mode in ("cpu", "dma"):
-        monkeypatch.setenv("SGLANG_WEG2_ARENA_PAGE_LOAD_MODE", mode)
+        monkeypatch.setenv("FLLIPER_PDFLIP_ARENA_PAGE_LOAD_MODE", mode)
         p._state_stage = None
         p._state_loaded_key = None
         back = _device_pool(fill=False)
@@ -178,7 +178,7 @@ def test_an_unbound_pool_hands_out_nothing(tmp_path):
 def test_the_storage_read_hook_reaches_the_resolver_and_never_copies_into_a_placeholder(tmp_path):
     """#1427e: `op_fn is self._read_page` compared two fresh bound-method
     objects and was always False; the resolver never ran on the metal."""
-    from sglang.srt.mem_cache.hicache_storage import HiCacheFile, PoolName, PoolTransfer
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile, PoolName, PoolTransfer
     arena = ShmArena(str(tmp_path / "mamba.bin"), TOTAL, 8)
     p = _pool(arena)
     rows = p.alloc_write(["h1"]); p.backup_from_device_all_layer(_device_pool(), rows, torch.tensor([0]), "direct")

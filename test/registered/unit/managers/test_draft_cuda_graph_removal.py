@@ -28,9 +28,9 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.speculative import eagle_worker_v2
-from sglang.srt.speculative.base_spec_worker import should_capture_draft_graphs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.speculative import eagle_worker_v2
+from flliper.srt.speculative.base_spec_worker import should_capture_draft_graphs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -86,7 +86,7 @@ class TheGateIsReachedFromTheCallSite(unittest.TestCase):
     """
 
     def _worker(self, server_args):
-        from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
+        from flliper.srt.speculative.base_spec_worker import EagleDraftWorkerBase
 
         calls = []
 
@@ -307,7 +307,7 @@ class TheEagerRunnerMustStillExist(unittest.TestCase):
     """
 
     def _runner(self, disable_draft):
-        from sglang.srt.model_executor.model_runner import ModelRunner
+        from flliper.srt.model_executor.model_runner import ModelRunner
 
         r = ModelRunner.__new__(ModelRunner)
         r.is_draft_worker = True
@@ -321,7 +321,7 @@ class TheEagerRunnerMustStillExist(unittest.TestCase):
         return r
 
     def test_a_refused_draft_capture_still_leaves_a_usable_runner(self):
-        from sglang.srt.model_executor import model_runner as mr
+        from flliper.srt.model_executor import model_runner as mr
 
         r = self._runner(True)
         sentinel = object()

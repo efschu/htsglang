@@ -39,8 +39,8 @@ honest; it does not make the boot pass.
 
 import unittest
 
-from sglang.srt.managers import corridor_guard as cg
-from sglang.srt.managers import phase_flip_seam_reserve as sr
+from flliper.srt.managers import corridor_guard as cg
+from flliper.srt.managers import phase_flip_seam_reserve as sr
 
 
 class TheShippedPairIsUnsatisfiableWithoutTheCredit(unittest.TestCase):

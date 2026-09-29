@@ -94,9 +94,9 @@ export PYTHONPATH="$WT/python"
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 # Identical across all four arms on purpose: an arm-to-arm comparison is only
 # readable if the environment is not one of the things that varies.
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 
 mkdir -p "$RES/logs"
@@ -255,14 +255,14 @@ launch() {  # $1 = label, $2 = CUDA_VISIBLE_DEVICES ("-" for unset), rest = flag
   local server_log="$RES/logs/${label}.server.log"
   CUR_LABEL="$label"
   if is_dry; then
-    echo "DRY RUN launch: CUDA_VISIBLE_DEVICES=${cvd} $PY -m sglang.launch_server $*"
+    echo "DRY RUN launch: CUDA_VISIBLE_DEVICES=${cvd} $PY -m flliper.launch_server $*"
     return 0
   fi
   cd "$WT" || return 1
   if [ "$cvd" = "-" ]; then
-    setsid "$PY" -m sglang.launch_server "$@" > "$server_log" 2>&1 &
+    setsid "$PY" -m flliper.launch_server "$@" > "$server_log" 2>&1 &
   else
-    CUDA_VISIBLE_DEVICES="$cvd" setsid "$PY" -m sglang.launch_server "$@" \
+    CUDA_VISIBLE_DEVICES="$cvd" setsid "$PY" -m flliper.launch_server "$@" \
       > "$server_log" 2>&1 &
   fi
   SRV_PID=$!

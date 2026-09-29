@@ -8,14 +8,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.attention.fla.layernorm_gated import (
+from flliper.srt.layers.attention.fla.layernorm_gated import (
     _layer_norm_fwd as layer_norm_fwd,
 )
-from sglang.srt.layers.attention.fla.layernorm_gated import (
+from flliper.srt.layers.attention.fla.layernorm_gated import (
     layernorm_fn,
     rms_norm_ref,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=60,
@@ -24,11 +24,11 @@ register_cuda_ci(
     disabled="Temporarily disabled",
 )
 
-# Optional dependency in sglang repo; skip collection cleanly if absent.
+# Optional dependency in flliper repo; skip collection cleanly if absent.
 custom_all_reduce_utils = pytest.importorskip(
-    "sglang.srt.distributed.device_communicators.custom_all_reduce_utils"
+    "flliper.srt.distributed.device_communicators.custom_all_reduce_utils"
 )
-parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
+parallel_state = pytest.importorskip("flliper.srt.distributed.parallel_state")
 
 update_environment_variables = custom_all_reduce_utils.update_environment_variables
 init_distributed_environment = parallel_state.init_distributed_environment
@@ -57,13 +57,13 @@ def _skip_if_dtype_unsupported(dtype: torch.dtype) -> None:
         pytest.skip("bfloat16 not supported on this CUDA device")
 
 
-def _setup_sglang_distributed(
+def _setup_flliper_distributed(
     local_rank: int,
     world_size: int,
     master_port: int,
     dtype: torch.dtype,
 ) -> torch.device:
-    # Match sglang test style: set per-rank CUDA device + default dtype/device.
+    # Match flliper test style: set per-rank CUDA device + default dtype/device.
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
@@ -261,7 +261,7 @@ def _layernorm_guard_fwd_worker(
     case: FwdCase,
     device: str,
 ):
-    device = _setup_sglang_distributed(local_rank, world_size, master_port, dtype)
+    device = _setup_flliper_distributed(local_rank, world_size, master_port, dtype)
 
     with torch.inference_mode():
         torch.manual_seed(42 + local_rank)
@@ -342,7 +342,7 @@ def _layernorm_guard_misc_worker(
     dtype: torch.dtype,
     device: str,
 ):
-    device = _setup_sglang_distributed(local_rank, world_size, master_port, dtype)
+    device = _setup_flliper_distributed(local_rank, world_size, master_port, dtype)
 
     with torch.inference_mode():
         torch.manual_seed(123 + local_rank)

@@ -2,11 +2,11 @@
 
 import unittest
 
-from sglang.srt.rigmon.aggregator import (
+from flliper.srt.rigmon.aggregator import (
     Aggregator,
     CompatibilityRefused,
 )
-from sglang.srt.rigmon.compat import (
+from flliper.srt.rigmon.compat import (
     BLOCK,
     OK,
     WARN,
@@ -14,10 +14,10 @@ from sglang.srt.rigmon.compat import (
     check_compatibility,
     local_identity,
 )
-from sglang.srt.rigmon.config import AggregatorConfig
-from sglang.srt.rigmon.series import TierSpec
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.rigmon.config import AggregatorConfig
+from flliper.srt.rigmon.series import TierSpec
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

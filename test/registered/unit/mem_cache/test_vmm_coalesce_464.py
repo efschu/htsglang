@@ -19,7 +19,7 @@ Hermetic: pure arithmetic over a plan plus a mocked driver, no CUDA.
 """
 
 import pytest
-from sglang.srt.mem_cache.kv_vmm_backing import (
+from flliper.srt.mem_cache.kv_vmm_backing import (
     VmmCoalesceRefused,
     coalesce_commit_plan,
 )

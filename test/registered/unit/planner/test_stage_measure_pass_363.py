@@ -25,7 +25,7 @@ import json
 
 import pytest
 
-from sglang.srt.planner.stage_measure_pass import (
+from flliper.srt.planner.stage_measure_pass import (
     MIN_BOUNDARIES,
     ArmSeries,
     StageMeasurePassError,
@@ -39,7 +39,7 @@ from sglang.srt.planner.stage_measure_pass import (
     merge_rank_arms,
     read_arm,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -284,7 +284,7 @@ def test_a_thin_arm_is_refused_before_anything_is_computed():
 
 def test_the_cli_writes_a_usable_record(tmp_path, monkeypatch):
     store = tmp_path / "store.json"
-    monkeypatch.setenv("SGLANG_STAGE_MEASUREMENTS", str(store))
+    monkeypatch.setenv("FLLIPER_STAGE_MEASUREMENTS", str(store))
     ref = write_trace(tmp_path / "ref.jsonl", series(100.0))
     fast = write_trace(tmp_path / "fast.jsonl", series(90.0))
     fa = write_trace(tmp_path / "fa.jsonl", series(100.0))
@@ -309,7 +309,7 @@ def test_the_cli_writes_a_usable_record(tmp_path, monkeypatch):
         ]
     )
     assert rc == 0
-    from sglang.srt.planner.stage_measure_store import StageMeasurementLibrary
+    from flliper.srt.planner.stage_measure_store import StageMeasurementLibrary
 
     lib = StageMeasurementLibrary.load(str(store))
     rec, why = lib.lookup("solved-enc", rig="2:GPU-aaa,GPU-bbb", model=MODEL)
@@ -320,7 +320,7 @@ def test_the_cli_writes_a_usable_record(tmp_path, monkeypatch):
 
 
 def test_the_cli_refuses_a_run_with_no_floor(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("SGLANG_STAGE_MEASUREMENTS", str(tmp_path / "store.json"))
+    monkeypatch.setenv("FLLIPER_STAGE_MEASUREMENTS", str(tmp_path / "store.json"))
     ref = write_trace(tmp_path / "ref.jsonl", series(100.0))
     rc = main(
         [

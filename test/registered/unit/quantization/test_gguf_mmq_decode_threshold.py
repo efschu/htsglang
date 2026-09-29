@@ -42,9 +42,9 @@ from unittest import mock
 
 import gguf as gguf_lib
 
-from sglang.srt.layers.quantization import gguf as G
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization import gguf as G
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -351,7 +351,7 @@ class EnableGateTest(CustomTestCase):
     def test_env_override_wins_over_server_args(self):
         fake_args = mock.Mock(gguf_mmq_decode_threshold=True)
         with mock.patch(
-            "sglang.srt.runtime_context.get_server_args", return_value=fake_args
+            "flliper.srt.runtime_context.get_server_args", return_value=fake_args
         ):
             G._reset_mmq_threshold_cache()
             with mock.patch.dict("os.environ", {G._MMQ_THRESHOLD_ENV: "0"}):
@@ -368,7 +368,7 @@ class EnableGateTest(CustomTestCase):
         fake_args = mock.Mock(gguf_mmq_decode_threshold=True)
         with mock.patch.dict("os.environ", env, clear=True):
             with mock.patch(
-                "sglang.srt.runtime_context.get_server_args", return_value=fake_args
+                "flliper.srt.runtime_context.get_server_args", return_value=fake_args
             ):
                 self.assertTrue(G._mmq_decode_threshold_enabled())
         G._reset_mmq_threshold_cache()
@@ -382,14 +382,14 @@ class EnableGateTest(CustomTestCase):
         env.pop(G._MMQ_THRESHOLD_ENV, None)
         with mock.patch.dict("os.environ", env, clear=True):
             with mock.patch(
-                "sglang.srt.runtime_context.get_server_args",
+                "flliper.srt.runtime_context.get_server_args",
                 side_effect=RuntimeError("not published yet"),
             ):
                 self.assertFalse(G._mmq_decode_threshold_enabled())
             self.assertIsNone(G._mmq_threshold_cached)  # not latched
             fake_args = mock.Mock(gguf_mmq_decode_threshold=True)
             with mock.patch(
-                "sglang.srt.runtime_context.get_server_args", return_value=fake_args
+                "flliper.srt.runtime_context.get_server_args", return_value=fake_args
             ):
                 self.assertTrue(G._mmq_decode_threshold_enabled())
         G._reset_mmq_threshold_cache()
@@ -402,7 +402,7 @@ class ServerArgsSurfaceTest(CustomTestCase):
         import dataclasses
         from typing import get_type_hints
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         hints = get_type_hints(ServerArgs, include_extras=True)
         field = {f.name: f for f in dataclasses.fields(ServerArgs)}[
@@ -526,9 +526,9 @@ def test_decode_bucket_registration_happens_after_the_last_capture_bs_edit():
     import pathlib
 
     root = pathlib.Path(__file__).resolve()
-    while root.name and not (root / "python" / "sglang").is_dir():
+    while root.name and not (root / "python" / "flliper").is_dir():
         root = root.parent
-    src = root / "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py"
+    src = root / "python/flliper/srt/model_executor/runner/decode_cuda_graph_runner.py"
     tree = ast.parse(src.read_text())
     cls = next(
         n for n in ast.walk(tree)
@@ -581,9 +581,9 @@ def test_dequant_workspace_has_exactly_one_consumer_each():
     import pathlib
 
     root = pathlib.Path(__file__).resolve()
-    while root.name and not (root / "python" / "sglang").is_dir():
+    while root.name and not (root / "python" / "flliper").is_dir():
         root = root.parent
-    src = root / "python/sglang/srt/layers/quantization/gguf.py"
+    src = root / "python/flliper/srt/layers/quantization/gguf.py"
     tree = ast.parse(src.read_text())
 
     calls = {"_ggml_dequantize_ws": [], "_mul_mat_dequant_chunked": []}

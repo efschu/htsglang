@@ -67,8 +67,8 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.managers.kv_backing_relief import exposure_over_backing
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.kv_backing_relief import exposure_over_backing
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8)
 
@@ -125,7 +125,7 @@ def _relief(
     free_mib: int = 8192,
     live_rows=(),
 ):
-    from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+    from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
     relief = KvBackingRelief(
         pool,
@@ -264,7 +264,7 @@ class ItCannotBecomeTheDefectItMirrors(unittest.TestCase):
         relief = _relief(pool, alloc=alloc, live_rows=[233289])
 
         with self.assertLogs(
-            "sglang.srt.managers.kv_backing_relief", level="ERROR"
+            "flliper.srt.managers.kv_backing_relief", level="ERROR"
         ) as caught:
             relief.clamp_exposure_to_backing("test")
 
@@ -313,7 +313,7 @@ class EveryReleaseSiteIsWired(unittest.TestCase):
         import inspect
         import textwrap
 
-        from sglang.srt.managers import kv_backing_relief
+        from flliper.srt.managers import kv_backing_relief
 
         tree = ast.parse(textwrap.dedent(inspect.getsource(kv_backing_relief)))
         out = {}

@@ -6,7 +6,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch
 
-from sglang.srt.model_executor.vram_family_census import census, family_of
+from flliper.srt.model_executor.vram_family_census import census, family_of
 
 
 def test_family_names_follow_the_qwen4exp_layout():
@@ -61,7 +61,7 @@ def test_vram_peak_logs_once_per_kind_and_again_on_every_new_high_water():
     once-each; a NEW allocator high-water is now emitted on top."""
     from types import SimpleNamespace
 
-    from sglang.srt.model_executor import vram_family_census as vc
+    from flliper.srt.model_executor import vram_family_census as vc
 
     def _cuda(peak_gib):
         class _Cuda:

@@ -26,20 +26,20 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler_components.batch_result_processor import (
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _PROCESSOR = (
     pathlib.Path(__file__).resolve().parents[4]
     / "python"
-    / "sglang"
+    / "flliper"
     / "srt"
     / "managers"
     / "scheduler_components"
@@ -119,12 +119,12 @@ def _form_a_worker(spec: bool):
 
 
 @patch(
-    "sglang.srt.managers.scheduler_components.batch_result_processor."
+    "flliper.srt.managers.scheduler_components.batch_result_processor."
     "maybe_cache_unfinished_req"
 )
 class TestFormAWorkerPrefillWithLogprobs(CustomTestCase):
     def _drive(self, model_worker):
-        req = _make_logprob_req("weg2-gate")
+        req = _make_logprob_req("pdflip-gate")
         proc = _make_processor(model_worker)
         proc.process_batch_result_prefill(
             _LogprobBatch([req]), _WorkerResult(next_token_ids=[999])

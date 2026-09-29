@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # S1 -- P2P re-probe after the driver update.
 #
-# One call, a few minutes, no sglang boots: capability matrix -> d2d bench ->
+# One call, a few minutes, no flliper boots: capability matrix -> d2d bench ->
 # NCCL transport check. Every placement and transport verdict on this rig was
 # made on a machine without GPUDirect P2P; this step is what makes those
 # verdicts re-examinable.

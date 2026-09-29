@@ -22,7 +22,7 @@ The DEFECT is real regardless of that. A predicate that refuses the install to
 the pool-owning runner is a bug on any cut, any model and any rig without this
 ceiling, and it pays the moment the ceiling moves.
 
-The cause is that ``SGLANG_UNEVEN_TOKEN_VECTOR`` is read as a BOOLEAN: "a
+The cause is that ``FLLIPER_UNEVEN_TOKEN_VECTOR`` is read as a BOOLEAN: "a
 vector is present" was conflated with "the operator asserts THIS vector". #797
 splits the two with ``--uneven-token-vector-role``:
 
@@ -49,17 +49,17 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.distributed.utils import get_cp_token_ratios, set_cp_token_ratios
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.distributed.utils import get_cp_token_ratios, set_cp_token_ratios
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_VEC_ENV = "SGLANG_UNEVEN_TOKEN_VECTOR"
-_ROLE_ENV = "SGLANG_UNEVEN_TOKEN_VECTOR_ROLE"
+_VEC_ENV = "FLLIPER_UNEVEN_TOKEN_VECTOR"
+_ROLE_ENV = "FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE"
 
 
 class _StubConfig:
@@ -163,12 +163,12 @@ def _run(
 
             world_group = mock.Mock(world_size=dcp_size, cpu_group=None)
             parallel = mock.Mock(attn_dcp_rank=rank)
-            base = "sglang.srt.model_executor.model_runner_kv_cache_mixin"
+            base = "flliper.srt.model_executor.model_runner_kv_cache_mixin"
             with (
                 mock.patch(f"{base}.get_world_group", return_value=world_group),
                 mock.patch(f"{base}.get_parallel", return_value=parallel),
                 mock.patch(
-                    "sglang.srt.model_executor.pool_configurator"
+                    "flliper.srt.model_executor.pool_configurator"
                     ".create_memory_pool_configurator",
                     side_effect=lambda mr: _configurator_for(mr.tp_rank),
                 ),
@@ -225,7 +225,7 @@ class SeedInstallsTheMeasuredVector797(CustomTestCase):
         self.assertNotEqual(installed, _ACTIVE)
 
     def test_the_installed_vector_raises_the_context_budget(self):
-        from sglang.srt.distributed.utils import cp_token_context_budget
+        from flliper.srt.distributed.utils import cp_token_context_budget
 
         installed, _, _env = _run(_CAPS, _ACTIVE, env_vector="29,19,16", role="seed")
         self.assertGreater(
@@ -284,7 +284,7 @@ class TheInstallSurvivesTheCutover797(CustomTestCase):
         """End-to-end on the REAL resolver, not a re-implementation of it: the
         env this run left behind is fed to parse_flip_token_vector exactly as
         the flip's second stack build would read it."""
-        from sglang.srt.managers.phase_flip_boot import parse_flip_token_vector
+        from flliper.srt.managers.phase_flip_boot import parse_flip_token_vector
 
         installed, _, env = _run(_CAPS, _ACTIVE, env_vector="29,19,16", role="seed")
         self.assertNotEqual(installed, _ACTIVE)
@@ -353,7 +353,7 @@ class TheFlagItself797(CustomTestCase):
 
         It used to assert the FIELD default was the string ``"pin"``. That
         literal was the #1270b root: the field is published into
-        ``SGLANG_UNEVEN_TOKEN_VECTOR_ROLE`` unconditionally and the consumer
+        ``FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE`` unconditionally and the consumer
         reads that env first, so a boot which declared nothing still asserted
         'pin' about its own budget estimate and suppressed the measured
         install (weg2sb4s, group D: 574,336 tokens against a profiled
@@ -362,8 +362,8 @@ class TheFlagItself797(CustomTestCase):
         What #797 actually needs is unchanged and is what is asserted now: a
         vector somebody DECLARED, with no role stated, is still a pin.
         """
-        from sglang.srt.distributed.utils import ROLE_PIN, token_vector_role_from_args
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.distributed.utils import ROLE_PIN, token_vector_role_from_args
+        from flliper.srt.server_args import ServerArgs
 
         self.assertIsNone(
             ServerArgs.__dataclass_fields__["uneven_token_vector_role"].default
@@ -378,7 +378,7 @@ class TheFlagItself797(CustomTestCase):
     def test_only_pin_and_seed_are_accepted(self):
         import argparse
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         p = argparse.ArgumentParser()
         ServerArgs.add_cli_args(p)
@@ -409,7 +409,7 @@ class TheCallSiteAdmitsTheSeed797(CustomTestCase):
     def _source(self):
         import inspect
 
-        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+        from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
             ModelRunnerKVCacheMixin,
         )
 
@@ -503,7 +503,7 @@ def _skip_infos(
 
         world_group = mock.Mock(world_size=world_size, cpu_group=None)
         parallel = mock.Mock(attn_dcp_rank=0)
-        base = "sglang.srt.model_executor.model_runner_kv_cache_mixin"
+        base = "flliper.srt.model_executor.model_runner_kv_cache_mixin"
         with ExitStack() as stack:
             log = stack.enter_context(mock.patch(f"{base}.logger"))
             stack.enter_context(
@@ -514,7 +514,7 @@ def _skip_infos(
             )
             stack.enter_context(
                 mock.patch(
-                    "sglang.srt.model_executor.pool_configurator"
+                    "flliper.srt.model_executor.pool_configurator"
                     ".create_memory_pool_configurator",
                     side_effect=lambda mr: _StubConfigurator(caps[0]),
                 )
@@ -531,7 +531,7 @@ def _skip_infos(
                 # bound in the mixin's namespace.
                 stack.enter_context(
                     mock.patch(
-                        "sglang.srt.distributed.utils.get_cp_token_ratios",
+                        "flliper.srt.distributed.utils.get_cp_token_ratios",
                         return_value=ratios_override,
                     )
                 )

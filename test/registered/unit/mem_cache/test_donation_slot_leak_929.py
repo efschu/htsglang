@@ -57,7 +57,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from flliper.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 
 
 class _Pool:
@@ -93,7 +93,7 @@ def _component(allocator, *, int8=None, extra_buffer=False):
     Built by ``__new__`` so the test needs no CUDA pool, no radix cache and no
     engine -- the method under test reaches exactly four attributes.
     """
-    from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+    from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
         MambaComponent,
     )
 

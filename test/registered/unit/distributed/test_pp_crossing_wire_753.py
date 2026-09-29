@@ -20,15 +20,15 @@ import os
 import types
 import unittest
 
-from sglang.srt.distributed.pp_crossing_schedule import crossing_schedule
-from sglang.srt.distributed.pp_crossing_wire import (
+from flliper.srt.distributed.pp_crossing_schedule import crossing_schedule
+from flliper.srt.distributed.pp_crossing_wire import (
     CrossingWire,
     NoCrossingWire,
     PpCrossingWireError,
     build_crossing_wire,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -251,7 +251,7 @@ class TestTheObservable(CustomTestCase):
     def test_building_with_a_peer_map_routes_and_logs(self):
         import logging
 
-        from sglang.srt.distributed.device_communicators.barlink_peer_transport import (
+        from flliper.srt.distributed.device_communicators.barlink_peer_transport import (
             resolve_peer_transports,
         )
 
@@ -283,10 +283,10 @@ class TestTheModelEntryPoint(CustomTestCase):
         import os
         from unittest.mock import patch
 
-        from sglang.srt.distributed.pp_crossing_wire import build_wire_for_model
+        from flliper.srt.distributed.pp_crossing_wire import build_wire_for_model
 
         with patch.dict(os.environ, env, clear=False):
-            for k in ("SGLANG_PP_LAYER_SET", "SGLANG_PP_CROSSING_WIRE"):
+            for k in ("FLLIPER_PP_LAYER_SET", "FLLIPER_PP_CROSSING_WIRE"):
                 if k not in env:
                     os.environ.pop(k, None)
             return build_wire_for_model(self._Cfg(), self._Group())
@@ -302,7 +302,7 @@ class TestTheModelEntryPoint(CustomTestCase):
             (",".join(map(str, GDN)), ",".join(map(str, FA[:8])), ",".join(map(str, FA[8:])))
         )
         self.assertIsInstance(
-            self._build({"SGLANG_PP_LAYER_SET": raw}), NoCrossingWire
+            self._build({"FLLIPER_PP_LAYER_SET": raw}), NoCrossingWire
         )
 
     def test_a_layer_set_WITH_the_wire_flag_builds_the_real_wire(self):
@@ -310,7 +310,7 @@ class TestTheModelEntryPoint(CustomTestCase):
             (",".join(map(str, GDN)), ",".join(map(str, FA[:8])), ",".join(map(str, FA[8:])))
         )
         w = self._build(
-            {"SGLANG_PP_LAYER_SET": raw, "SGLANG_PP_CROSSING_WIRE": "1"}
+            {"FLLIPER_PP_LAYER_SET": raw, "FLLIPER_PP_CROSSING_WIRE": "1"}
         )
         self.assertIsInstance(w, CrossingWire)
         schedule = crossing_schedule(TARGET, N)
@@ -319,7 +319,7 @@ class TestTheModelEntryPoint(CustomTestCase):
 
 class TestThePpGroupLink(CustomTestCase):
     def test_it_delegates_to_the_group_tensor_dict_path(self):
-        from sglang.srt.distributed.pp_crossing_wire import PpGroupLink
+        from flliper.srt.distributed.pp_crossing_wire import PpGroupLink
 
         seen = {}
 
@@ -347,7 +347,7 @@ if __name__ == "__main__":
 class TestWireIsScopedToRealPipelines(CustomTestCase):
     """#754 seam, second call site.
 
-    SGLANG_PP_LAYER_SET is process-wide, but a phase flip builds a SECOND model
+    FLLIPER_PP_LAYER_SET is process-wide, but a phase flip builds a SECOND model
     -- the TP stack -- in the same process with pp world size 1. get_pp_layer_set
     already answers None there; build_wire_for_model called parse_pp_layer_sets
     raw and inherited its by-stage-count refusal instead, killing a gapped boot
@@ -361,8 +361,8 @@ class TestWireIsScopedToRealPipelines(CustomTestCase):
 
     def setUp(self):
         self._env = dict(os.environ)
-        os.environ["SGLANG_PP_LAYER_SET"] = self.GAPPED
-        os.environ["SGLANG_PP_CROSSING_WIRE"] = "1"
+        os.environ["FLLIPER_PP_LAYER_SET"] = self.GAPPED
+        os.environ["FLLIPER_PP_CROSSING_WIRE"] = "1"
 
     def tearDown(self):
         os.environ.clear()
@@ -375,7 +375,7 @@ class TestWireIsScopedToRealPipelines(CustomTestCase):
         return cfg
 
     def test_tp_stack_gets_the_null_object_not_a_refusal(self):
-        from sglang.srt.distributed.pp_crossing_wire import (
+        from flliper.srt.distributed.pp_crossing_wire import (
             NoCrossingWire,
             build_wire_for_model,
         )
@@ -386,7 +386,7 @@ class TestWireIsScopedToRealPipelines(CustomTestCase):
 
     def test_a_real_pipeline_still_gets_a_real_wire(self):
         """The guard must not disarm the wire it was added next to."""
-        from sglang.srt.distributed.pp_crossing_wire import (
+        from flliper.srt.distributed.pp_crossing_wire import (
             NoCrossingWire,
             build_wire_for_model,
         )

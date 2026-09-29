@@ -4,16 +4,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.moe import hash_topk as hash_topk_module
-from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.topk import (
+from flliper.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from flliper.srt.layers.moe import hash_topk as hash_topk_module
+from flliper.srt.layers.moe.hash_topk import HashTopK
+from flliper.srt.layers.moe.topk import (
     StandardTopKOutput,
 )
-from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.models.deepseek_v2 import DeepseekV2MoE
+from flliper.srt.runtime_context import get_parallel
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
@@ -33,7 +33,7 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
         def on_select_experts(self, *, topk_ids):
             recorded["topk_ids"] = topk_ids.clone()
 
-    from sglang.srt.runtime_context import get_resources
+    from flliper.srt.runtime_context import get_resources
 
     monkeypatch.setattr(get_resources(), "expert_distribution_recorder", FakeRecorder())
 
@@ -64,7 +64,7 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
 
     with (
         get_parallel().override(moe_ep_size=4, moe_ep_rank=2),
-        hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False),
+        hash_topk_module.envs.FLLIPER_OPT_USE_FUSED_HASH_TOPK.override(False),
     ):
         output = topk(
             hidden_states=torch.empty(2, 4),

@@ -67,8 +67,8 @@ import unittest
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.eagle_info import EagleVerifyInput
+from flliper.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from flliper.srt.speculative.eagle_info import EagleVerifyInput
 
 #: The crash iteration: pool essentially full.
 USAGE_AT_CRASH = 0.97
@@ -171,7 +171,7 @@ class TheViolationStaysVisibleTest(unittest.TestCase):
 
     def test_a_wrong_dtype_is_announced(self):
         with self.assertLogs(
-            "sglang.srt.speculative.eagle_info", level="WARNING"
+            "flliper.srt.speculative.eagle_info", level="WARNING"
         ) as cm:
             _verify_input(torch.zeros(2, dtype=torch.int32))
         joined = "\n".join(cm.output)
@@ -182,14 +182,14 @@ class TheViolationStaysVisibleTest(unittest.TestCase):
         """This runs on every verify of every round. A per-call warning would
         be its own outage."""
         with self.assertLogs(
-            "sglang.srt.speculative.eagle_info", level="WARNING"
+            "flliper.srt.speculative.eagle_info", level="WARNING"
         ) as cm:
             for _ in range(50):
                 _verify_input(torch.zeros(2, dtype=torch.int32))
         self.assertEqual(len([m for m in cm.output if "#680" in m]), 1)
 
     def test_a_compliant_path_says_nothing(self):
-        with self.assertNoLogs("sglang.srt.speculative.eagle_info", level="WARNING"):
+        with self.assertNoLogs("flliper.srt.speculative.eagle_info", level="WARNING"):
             _verify_input(torch.zeros(2, dtype=torch.int64))
 
 
@@ -212,7 +212,7 @@ class TheFixIsAtTheConstructionSiteTest(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+        from flliper.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
         src = inspect.getsource(EAGLEWorkerV2._build_trivial_verify_input)
         self.assertIn("draft_token=draft_input.bonus_tokens", src)
@@ -222,7 +222,7 @@ class TheFixIsAtTheConstructionSiteTest(unittest.TestCase):
         stops protecting the kernel and the pin must move with it."""
         import inspect
 
-        from sglang.srt.speculative import eagle_utils
+        from flliper.srt.speculative import eagle_utils
 
         src = inspect.getsource(eagle_utils)
         self.assertIn("candidates = verify_input.draft_token.reshape(", src)

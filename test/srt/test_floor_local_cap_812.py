@@ -33,7 +33,7 @@ Hermetic: no CUDA, no pool, no collectives.
 
 import unittest
 
-from sglang.srt.managers.kv_backing_relief import (
+from flliper.srt.managers.kv_backing_relief import (
     _SHRINK_SCALE,
     _floor_ppm,
     _shrink_ppm,
@@ -126,7 +126,7 @@ class TestFloorRowsDetectsButDoesNotLower(unittest.TestCase):
     """
 
     def _rung(self, cap, page=1, margin=0, reserve=512):
-        from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+        from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
         class _Stub:
             _margin_rows = margin
@@ -159,7 +159,7 @@ class TestFloorRowsDetectsButDoesNotLower(unittest.TestCase):
         self.assertFalse(floor_exceeds_local_cap(floor, PP_BACKED[0]))
 
     def test_an_unreadable_cap_leaves_the_floor_alone(self):
-        from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+        from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
         class _Broken:
             _margin_rows = 0

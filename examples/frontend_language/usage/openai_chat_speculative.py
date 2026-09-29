@@ -16,8 +16,8 @@ export OPENAI_API_KEY=sk-******
 python3 openai_chat_speculative.py
 """
 
-import sglang as sgl
-from sglang import OpenAI, function, set_default_backend
+import flliper as sgl
+from flliper import OpenAI, function, set_default_backend
 
 
 @function(num_api_spec_tokens=256)

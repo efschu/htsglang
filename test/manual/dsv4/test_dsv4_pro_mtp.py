@@ -1,6 +1,6 @@
 """DSV4-Pro 1.6T MTP performance tests on B200 TP=8.
 
-1. TestDSV4ProMTPSimulatedAcc — `SGLANG_SIMULATE_ACC_LEN=3` pins EAGLE accept
+1. TestDSV4ProMTPSimulatedAcc — `FLLIPER_SIMULATE_ACC_LEN=3` pins EAGLE accept
    length so latency comparisons are apples-to-apples. Runs `bench_one_batch_server`
    at bs=1 for isl=4096 and isl=900000 (osl=1024).
 
@@ -20,12 +20,12 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
-from sglang.bench_one_batch_server import run_benchmark as run_one_batch_benchmark
-from sglang.benchmark.serving import run_benchmark as run_serving_benchmark
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
+from flliper.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
+from flliper.bench_one_batch_server import run_benchmark as run_one_batch_benchmark
+from flliper.benchmark.serving import run_benchmark as run_serving_benchmark
+from flliper.srt.server_args import ServerArgs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -35,12 +35,12 @@ from sglang.test.test_utils import (
 DSV4_PRO_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Pro"
 
 HONGLOUMENG_PATH = os.environ.get(
-    "SGLANG_HONGLOUMENG_PATH",
+    "FLLIPER_HONGLOUMENG_PATH",
     os.path.join(os.path.dirname(__file__), "hongloumeng.txt"),
 )
 
 DSV4_PRO_BASE_ENV = {
-    "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "1",
+    "FLLIPER_OPT_USE_CUSTOM_ALL_REDUCE_V2": "1",
 }
 
 DSV4_PRO_SERVER_ARGS = [
@@ -81,7 +81,7 @@ def _launch_dsv4_pro_server(extra_env=None):
 
 
 class TestDSV4ProMTPSimulatedAcc(CustomTestCase):
-    """bs=1 latency at isl=4096 / 900000 with `SGLANG_SIMULATE_ACC_LEN=3`.
+    """bs=1 latency at isl=4096 / 900000 with `FLLIPER_SIMULATE_ACC_LEN=3`.
 
     Reference (B200 Pro TP8):
       - isl=4096   → output 194.6 tok/s, accept 2.96
@@ -92,7 +92,7 @@ class TestDSV4ProMTPSimulatedAcc(CustomTestCase):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = _launch_dsv4_pro_server(
-            extra_env={"SGLANG_SIMULATE_ACC_LEN": "3"}
+            extra_env={"FLLIPER_SIMULATE_ACC_LEN": "3"}
         )
 
     @classmethod
@@ -184,7 +184,7 @@ class TestDSV4ProMTPHongloumeng(CustomTestCase):
         # on-the-fly token-level slicing matches what the server will see.
         info = requests.get(cls.base_url + "/server_info", timeout=60).json()
         tokenizer_path = info.get("tokenizer_path") or DSV4_PRO_MODEL_PATH
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from flliper.srt.utils.hf_transformers_utils import get_tokenizer
 
         cls.tokenizer = get_tokenizer(tokenizer_path)
 
@@ -208,7 +208,7 @@ class TestDSV4ProMTPHongloumeng(CustomTestCase):
     def _run_custom_bench(self, dataset_path):
         requests.get(self.base_url + "/flush_cache")
         args = SimpleNamespace(
-            backend="sglang",
+            backend="flliper",
             base_url=self.base_url,
             host=None,
             port=None,

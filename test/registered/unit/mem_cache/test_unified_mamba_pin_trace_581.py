@@ -6,7 +6,7 @@ Boot 26 logged
     Tree cache initialized: source=default impl=UnifiedRadixCache
       hybrid_swa=False hybrid_ssm=True hierarchical=True
 
-and emitted ZERO trace lines with SGLANG_MAMBA_PIN_TRACE=50 armed, because
+and emitted ZERO trace lines with FLLIPER_MAMBA_PIN_TRACE=50 armed, because
 the first trace landed in `HiMambaRadixCache`. `registry.py:106-109` routes
 `--enable-hierarchical-cache` + hybrid SSM to `_create_unified_radix_cache`
 unconditionally, so the hierarchical MAMBA path is UnifiedRadixCache and the
@@ -27,15 +27,15 @@ import unittest
 from array import array
 from collections import Counter
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components import ComponentType
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components import ComponentType
+from flliper.test.ci.ci_register import register_cpu_ci
 
 _spec = importlib.util.spec_from_file_location(
     "_unified_fixture",
@@ -50,7 +50,7 @@ build_fixture = _fixture.build_fixture
 
 register_cpu_ci(est_time=15)
 
-TRACE_LOGGER = "sglang.srt.mem_cache.unified_radix_cache"
+TRACE_LOGGER = "flliper.srt.mem_cache.unified_radix_cache"
 
 
 def _mamba_cfg() -> CacheConfig:
@@ -76,7 +76,7 @@ def _insert(cache, allocator, pool, token_ids):
 
 class TestUnifiedPinTrace(unittest.TestCase):
     def test_trace_line_renders_with_the_pin_ledger(self):
-        with envs.SGLANG_MAMBA_PIN_TRACE.override(1):
+        with envs.FLLIPER_MAMBA_PIN_TRACE.override(1):
             cache, allocator, pool = build_fixture(_mamba_cfg())
             self.assertEqual(cache._pin_trace_every, 1)
             node = _insert(cache, allocator, pool, list(range(100, 116)))
@@ -111,7 +111,7 @@ class TestUnifiedPinTrace(unittest.TestCase):
         self.assertIn("evictable=0", line)
 
     def test_release_is_attributed_to_its_own_site(self):
-        with envs.SGLANG_MAMBA_PIN_TRACE.override(1):
+        with envs.FLLIPER_MAMBA_PIN_TRACE.override(1):
             cache, allocator, pool = build_fixture(_mamba_cfg())
             node = _insert(cache, allocator, pool, list(range(100, 116)))
             cache.inc_lock_ref(node)
@@ -132,7 +132,7 @@ class TestUnifiedPinTrace(unittest.TestCase):
     def test_a_tombstone_lock_is_counted_as_a_call_but_not_as_a_mamba_ref(self):
         """The inc/inc_mamba split is what separates 'lock traffic' from
         'pool pressure': only the latter can exhaust the state pool."""
-        with envs.SGLANG_MAMBA_PIN_TRACE.override(1):
+        with envs.FLLIPER_MAMBA_PIN_TRACE.override(1):
             cache, allocator, pool = build_fixture(_mamba_cfg())
             token_ids = list(range(100, 116))
             node = _insert(cache, allocator, pool, token_ids)
@@ -154,7 +154,7 @@ class TestUnifiedPinTrace(unittest.TestCase):
         self.assertNotIn("inc_mamba@", line)
 
     def test_counters_reset_between_lines(self):
-        with envs.SGLANG_MAMBA_PIN_TRACE.override(1):
+        with envs.FLLIPER_MAMBA_PIN_TRACE.override(1):
             cache, allocator, pool = build_fixture(_mamba_cfg())
             node = _insert(cache, allocator, pool, list(range(100, 116)))
             cache.inc_lock_ref(node)
@@ -167,7 +167,7 @@ class TestUnifiedPinTrace(unittest.TestCase):
         self.assertIn("ops[]", next(m for m in second.output if "MAMBA-PIN-TRACE" in m))
 
     def test_interval_throttles_the_line(self):
-        with envs.SGLANG_MAMBA_PIN_TRACE.override(3):
+        with envs.FLLIPER_MAMBA_PIN_TRACE.override(3):
             cache, _, _ = build_fixture(_mamba_cfg())
             with self.assertLogs(TRACE_LOGGER, level="INFO") as captured:
                 for _ in range(6):

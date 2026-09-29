@@ -7,11 +7,11 @@ import unittest
 import requests
 from transformers import AutoTokenizer
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+from flliper.test.ci.ci_register import register_npu_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -108,7 +108,7 @@ class TestNpuApi(CustomTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["data"][0]["id"], self.model)
         self.assertEqual(response.json()["data"][0]["object"], "model")
-        self.assertEqual(response.json()["data"][0]["owned_by"], "sglang")
+        self.assertEqual(response.json()["data"][0]["owned_by"], "flliper")
         self.assertEqual(response.json()["data"][0]["root"], self.model)
         self.assertEqual(response.json()["data"][0]["max_model_len"], 131072)
 
@@ -117,7 +117,7 @@ class TestNpuApi(CustomTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["id"], self.model)
         self.assertEqual(response.json()["object"], "model")
-        self.assertEqual(response.json()["owned_by"], "sglang")
+        self.assertEqual(response.json()["owned_by"], "flliper")
         self.assertEqual(response.json()["root"], self.model)
         self.assertEqual(response.json()["max_model_len"], 131072)
 
@@ -659,7 +659,7 @@ class TestStartProfile(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # Skip initialization, reuse global server + configure profiler directory
-        envs.SGLANG_TORCH_PROFILER_DIR.set(OUTPUT_DIR)
+        envs.FLLIPER_TORCH_PROFILER_DIR.set(OUTPUT_DIR)
         cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.additional_chat_kwargs = {}

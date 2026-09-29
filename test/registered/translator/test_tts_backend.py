@@ -28,8 +28,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from sglang.srt.translator.backends import AudioChunk, BackendError
-from sglang.srt.translator.tts_backends import (
+from flliper.srt.translator.backends import AudioChunk, BackendError
+from flliper.srt.translator.tts_backends import (
     OpenAiSpeechTts,
     TtsHttpConfig,
     languages_from_qwen3_tts_config,

@@ -1,8 +1,8 @@
 import shutil, subprocess, sys, tempfile, atexit, signal
 from pathlib import Path
 R = Path("/spinning/wt-739-class")
-C = R/"python/sglang/srt/managers/wedge_class.py"
-I = R/"python/sglang/srt/managers/scheduler_components/invariant_checker.py"
+C = R/"python/flliper/srt/managers/wedge_class.py"
+I = R/"python/flliper/srt/managers/scheduler_components/invariant_checker.py"
 S = "test/registered/unit/managers/test_wedge_class_739.py"
 M = [
  ("M1 falsifier absorbed into A", C,

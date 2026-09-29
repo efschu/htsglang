@@ -6,7 +6,7 @@ Currently supported configurations: **TP=8** (single-node) and **TP=16** (two-no
 
 ### Prerequisites
 
-1. If you use the default SGLang Docker image build from `docker/Dockerfile`, [MSCCL++](https://github.com/microsoft/mscclpp) is already installed by default.
+1. If you use the default fLLiper Docker image build from `docker/Dockerfile`, [MSCCL++](https://github.com/microsoft/mscclpp) is already installed by default.
 2. If you are not using that Docker image (or want to install manually), install [MSCCL++](https://github.com/microsoft/mscclpp) from source (requires CMake and a CUDA toolkit):
     ```bash
     git clone https://github.com/microsoft/mscclpp.git
@@ -46,7 +46,7 @@ torchrun --nproc_per_node 8 \
 Use the `--enable-mscclpp` flag to select MSCCL++ as the all-reduce backend during CUDA-graph-captured inference:
 
 ```bash
-python -m sglang.launch_server \
+python -m flliper.launch_server \
     --model-path Qwen/Qwen3-8B \
     --tp-size 8 \
     --enable-mscclpp

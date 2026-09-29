@@ -79,11 +79,11 @@ import unittest
 
 import torch
 
-from sglang.srt.managers import kv_backing_relief as kbr
-from sglang.srt.managers import phase_flip_spill as pfs
-from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.common import alloc_token_slots, payable_size
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import kv_backing_relief as kbr
+from flliper.srt.managers import phase_flip_spill as pfs
+from flliper.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.common import alloc_token_slots, payable_size
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

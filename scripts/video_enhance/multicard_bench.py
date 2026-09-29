@@ -39,9 +39,9 @@ import time
 from fractions import Fraction
 from pathlib import Path
 
-from sglang.srt.video_enhance.chain import ChainRequest, build_chain
-from sglang.srt.video_enhance.frame_math import MIB, Resolution
-from sglang.srt.video_enhance.multicard import (
+from flliper.srt.video_enhance.chain import ChainRequest, build_chain
+from flliper.srt.video_enhance.frame_math import MIB, Resolution
+from flliper.srt.video_enhance.multicard import (
     ChunkSpec,
     MultiCardExecutor,
     PersistentChunkRunner,
@@ -52,7 +52,7 @@ from sglang.srt.video_enhance.multicard import (
     resolve_cards,
     verify_chunk_arithmetic,
 )
-from sglang.srt.video_enhance.mux import (
+from flliper.srt.video_enhance.mux import (
     StreamRemuxer,
     TrackSelection,
     build_remux_command,
@@ -60,7 +60,7 @@ from sglang.srt.video_enhance.mux import (
     probe,
     retimed_rate,
 )
-from sglang.srt.video_enhance.shard_plan import (
+from flliper.srt.video_enhance.shard_plan import (
     CardAvailability,
     RateTable,
     ReservationInputs,
@@ -423,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.source:
         source = Path(args.source)
     else:
-        from sglang.srt.video_enhance.codec import make_test_clip
+        from flliper.srt.video_enhance.codec import make_test_clip
 
         source = workdir / "source.mp4"
         if not source.is_file():

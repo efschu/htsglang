@@ -11,8 +11,8 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     w8a8_block_fp8_matmul as vllm_w8a8_block_fp8_matmul,
 )
 
-from sglang.benchmark.bench_utils import run_bench
-from sglang.srt.layers.quantization.fp8_kernel import (
+from flliper.benchmark.bench_utils import run_bench
+from flliper.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm as w8a8_block_fp8_matmul,
 )
 
@@ -137,7 +137,7 @@ def fp8_gemm_deepgemm(
     return out
 
 
-def fp8_gemm_sglang(
+def fp8_gemm_flliper(
     x_fp8: torch.Tensor,
     x_scale: torch.Tensor,
     y_fp8: torch.Tensor,
@@ -146,10 +146,10 @@ def fp8_gemm_sglang(
     n: int,
     k: int,
 ):
-    """SGLang implementation of FP8 GEMM"""
+    """fLLiper implementation of FP8 GEMM"""
     block_size = [128, 128]  # Matches the block size in per_block_cast_to_fp8
 
-    # Run SGLang kernel
+    # Run fLLiper kernel
     out = w8a8_block_fp8_matmul(
         x_fp8, y_fp8, x_scale, y_scale, block_size, torch.bfloat16
     )
@@ -192,7 +192,7 @@ def calculate_diff(m: int, n: int, k: int):
         n,
         k,
     )
-    out_sglang = fp8_gemm_sglang(
+    out_flliper = fp8_gemm_flliper(
         x_fp8.clone(), x_scale.clone(), y_fp8.clone(), y_scale.clone(), m, n, k
     )
 
@@ -202,35 +202,35 @@ def calculate_diff(m: int, n: int, k: int):
         x_fp8.clone(), x_scale.clone(), y_fp8.clone(), y_scale.clone()
     )
 
-    diff_sglang_deepgemm = torch.abs(out_deepgemm - out_sglang).mean().item()
+    diff_flliper_deepgemm = torch.abs(out_deepgemm - out_flliper).mean().item()
     diff_tilelang_deepgemm = torch.abs(out_deepgemm - out_tilelang).mean().item()
-    diff_tilelang_sglang = torch.abs(out_tilelang - out_sglang).mean().item()
+    diff_tilelang_flliper = torch.abs(out_tilelang - out_flliper).mean().item()
 
     print(f"Shape m={m}, n={n}, k={k}:")
     print(f"DeepGEMM output: {out_deepgemm[0, 0:5]}")
-    print(f"SGLang output: {out_sglang[0, 0:5]}")
+    print(f"fLLiper output: {out_flliper[0, 0:5]}")
     print(f"TileLang output: {out_tilelang[0, 0:5]}")
-    print(f"Mean absolute difference (SGLang-DeepGEMM): {diff_sglang_deepgemm}")
+    print(f"Mean absolute difference (fLLiper-DeepGEMM): {diff_flliper_deepgemm}")
     print(f"Mean absolute difference (TileLang-DeepGEMM): {diff_tilelang_deepgemm}")
-    print(f"Mean absolute difference (TileLang-SGLang): {diff_tilelang_sglang}")
+    print(f"Mean absolute difference (TileLang-fLLiper): {diff_tilelang_flliper}")
 
-    sglang_deepgemm_match = torch.allclose(
-        out_deepgemm, out_sglang, atol=1e-2, rtol=1e-2
+    flliper_deepgemm_match = torch.allclose(
+        out_deepgemm, out_flliper, atol=1e-2, rtol=1e-2
     )
     tilelang_deepgemm_match = torch.allclose(
         out_deepgemm, out_tilelang, atol=1e-2, rtol=1e-2
     )
-    tilelang_sglang_match = torch.allclose(
-        out_tilelang, out_sglang, atol=1e-2, rtol=1e-2
+    tilelang_flliper_match = torch.allclose(
+        out_tilelang, out_flliper, atol=1e-2, rtol=1e-2
     )
 
-    if sglang_deepgemm_match and tilelang_deepgemm_match and tilelang_sglang_match:
+    if flliper_deepgemm_match and tilelang_deepgemm_match and tilelang_flliper_match:
         print("✅ All implementations match\n")
     else:
         print("❌ Some implementations differ:")
-        print(f"  - SGLang vs DeepGEMM: {'✅' if sglang_deepgemm_match else '❌'}")
+        print(f"  - fLLiper vs DeepGEMM: {'✅' if flliper_deepgemm_match else '❌'}")
         print(f"  - TileLang vs DeepGEMM: {'✅' if tilelang_deepgemm_match else '❌'}")
-        print(f"  - TileLang vs SGLang: {'✅' if tilelang_sglang_match else '❌'}\n")
+        print(f"  - TileLang vs fLLiper: {'✅' if tilelang_flliper_match else '❌'}\n")
 
 
 def get_weight_shapes(tp_size):
@@ -286,8 +286,8 @@ def get_benchmark(tp_size):
             x_names=["m", "n", "k", "tp_size"],
             x_vals=[list(config) for config in all_configs],
             line_arg="provider",
-            line_vals=["deepgemm", "sglang", "tilelang"],
-            line_names=["DeepGEMM", "SGLang", "TileLang"],
+            line_vals=["deepgemm", "flliper", "tilelang"],
+            line_names=["DeepGEMM", "fLLiper", "TileLang"],
             styles=[("blue", "-"), ("red", "-"), ("green", "-")],
             ylabel="ms",
             plot_name=f"fp8-gemm-performance-comparison-tp{tp_size}",
@@ -319,9 +319,9 @@ def get_benchmark(tp_size):
                 ),
                 quantiles=quantiles,
             )
-        elif provider == "sglang":
+        elif provider == "flliper":
             ms, min_ms, max_ms = run_bench(
-                lambda: fp8_gemm_sglang(
+                lambda: fp8_gemm_flliper(
                     x_fp8.clone(),
                     x_scale.clone(),
                     y_fp8.clone(),

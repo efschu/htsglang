@@ -48,10 +48,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.swa import PureSWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.kv_row_ownership import (
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from flliper.srt.mem_cache.allocator.swa import PureSWATokenToKVPoolAllocator
+from flliper.srt.mem_cache.kv_row_ownership import (
     FREE_COUNTED,
     FREE_COUNTED_UNDECLARED,
     FREE_ENUMERATED,
@@ -63,13 +63,13 @@ from sglang.srt.mem_cache.kv_row_ownership import (
     audit_pool_census,
     read_free_rows,
 )
-from sglang.srt.mem_cache.multi_ended_allocator import (
+from flliper.srt.mem_cache.multi_ended_allocator import (
     MultiEndedAllocator,
     UnifiedMambaTokenToKVPoolAllocator,
     UnifiedSWATokenToKVPoolAllocator,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5)
 
@@ -108,7 +108,7 @@ def _run_census(alloc, cached_ids=()):
     stub._census_owner_probe = lambda *a, **k: None
     stub._pool_census = PhaseFlipRuntime._pool_census.__get__(stub, SimpleNamespace)
 
-    logger = logging.getLogger("sglang.srt.managers.phase_flip_runtime")
+    logger = logging.getLogger("flliper.srt.managers.phase_flip_runtime")
     with unittest.mock.patch.object(logger, "warning") as warn:
         stub._pool_census("at-arm", "pp_to_tp")
     assert warn.called, "the census must always emit"
@@ -476,7 +476,7 @@ class TestO8AbandonedWindowsAreRecoveredNotDiscarded(CustomTestCase):
     nobody closed are out of the radix tree, in no free list, and held by no
     request -- so assigning `self.free_group = []` makes them unreachable for
     the life of the process, and the idle invariant then reports them as a
-    fatal leak under the default SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.
+    fatal leak under the default FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.
 
     An override silently opts out of an inherited fix. Four classes did:
     `PureSWATokenToKVPoolAllocator`, `MultiEndedAllocator`, and both unified
@@ -529,7 +529,7 @@ class TestO8AbandonedWindowsAreRecoveredNotDiscarded(CustomTestCase):
                 self.assertEqual(alloc.free_group, [])
 
     def test_hisparse_never_stages_so_it_has_no_hole(self):
-        from sglang.srt.mem_cache.allocator.hisparse import (
+        from flliper.srt.mem_cache.allocator.hisparse import (
             HiSparseTokenToKVPoolAllocator,
         )
 

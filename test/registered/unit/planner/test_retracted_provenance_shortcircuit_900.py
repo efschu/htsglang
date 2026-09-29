@@ -4,7 +4,7 @@
 (DECLARED lineage) ran first and RETURNED -- so a provenance naming an
 investigation that is *not* in the retraction register short-circuited the
 whole predicate and mode 2's value match never happened. The env twin
-``SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE`` survives a shell, so the disarming
+``FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE`` survives a shell, so the disarming
 input is not exotic: one earlier launch in the same terminal is enough, and
 from then on the retracted vector rides in under a lineage that has nothing
 to do with it.
@@ -30,8 +30,8 @@ import types
 
 import pytest
 
-from sglang.srt.distributed.utils import resolve_cp_token_ratios
-from sglang.srt.planner.retracted import (
+from flliper.srt.distributed.utils import resolve_cp_token_ratios
+from flliper.srt.planner.retracted import (
     PROVENANCE_MEASURED,
     RetractedProvenanceError,
     find_retracted_token_vector,
@@ -124,9 +124,9 @@ def _args(**over):
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     for name in (
-        "SGLANG_UNEVEN_TOKEN_VECTOR",
-        "SGLANG_UNEVEN_TOKEN_VECTOR_ROLE",
-        "SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE",
+        "FLLIPER_UNEVEN_TOKEN_VECTOR",
+        "FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE",
+        "FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE",
     ):
         monkeypatch.delenv(name, raising=False)
     yield
@@ -139,15 +139,15 @@ class TestTheBootPathReachesIt900:
     def test_a_stale_env_provenance_does_not_boot_the_retracted_pin(
         self, monkeypatch
     ):
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", "29,19,16")
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE", CLEAN_PROVENANCE)
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", "29,19,16")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE", CLEAN_PROVENANCE)
         with pytest.raises(RetractedProvenanceError) as exc:
             resolve_cp_token_ratios(_args())
         assert "#602" in str(exc.value)
 
     def test_a_stale_flag_provenance_does_not_boot_it_either(self, monkeypatch):
         # The flag is the other door into _token_vector_provenance.
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", "29,19,16")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", "29,19,16")
         with pytest.raises(RetractedProvenanceError):
             resolve_cp_token_ratios(
                 _args(uneven_token_vector_provenance=CLEAN_PROVENANCE)
@@ -158,14 +158,14 @@ class TestTheBootPathReachesIt900:
     ):
         # A seed is permitted and warned about; the point is that the stale
         # provenance no longer makes it SILENT.
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", "29,19,16")
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_ROLE", "seed")
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE", CLEAN_PROVENANCE)
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", "29,19,16")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE", "seed")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE", CLEAN_PROVENANCE)
         with caplog.at_level("WARNING"):
             assert resolve_cp_token_ratios(_args()) == [29, 19, 16]
         assert "#602" in " ".join(r.getMessage() for r in caplog.records)
 
     def test_a_clean_vector_under_a_clean_provenance_still_boots(self, monkeypatch):
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", "29,17,18")
-        monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE", CLEAN_PROVENANCE)
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", "29,17,18")
+        monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE", CLEAN_PROVENANCE)
         assert resolve_cp_token_ratios(_args()) == [29, 17, 18]

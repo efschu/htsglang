@@ -40,7 +40,7 @@ def read_current_version(file_path: Path) -> str:
     match = CLONE_RE.search(file_path.read_text())
     if not match:
         raise ValueError(
-            f"Could not find a 'git clone -b v<version> ...sglang.git' line in {file_path}"
+            f"Could not find a 'git clone -b v<version> ...flliper.git' line in {file_path}"
         )
     return match.group(2)
 

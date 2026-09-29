@@ -25,8 +25,8 @@ import unittest
 
 import torch
 
-from sglang.srt.video_enhance.frame_math import R4K, R8K, PixelFormat, Resolution
-from sglang.srt.video_enhance.fused_tail import (
+from flliper.srt.video_enhance.frame_math import R4K, R8K, PixelFormat, Resolution
+from flliper.srt.video_enhance.fused_tail import (
     FusedTailError,
     apply_tail_torch,
     fused_tail_reference,
@@ -34,15 +34,15 @@ from sglang.srt.video_enhance.fused_tail import (
     plan_fused_tail,
     refuse_unless_halving,
 )
-from sglang.srt.video_enhance.resize import (
+from flliper.srt.video_enhance.resize import (
     _taps,
     halving_pad,
     halving_taps,
     is_exact_halving,
     lanczos3_resize,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -238,7 +238,7 @@ class GraphSurgeryTest(CustomTestCase):
     def test_the_tail_is_appended_without_renaming_the_output(self):
         import onnx
 
-        from sglang.srt.video_enhance.fused_tail import append_halving_tail
+        from flliper.srt.video_enhance.fused_tail import append_halving_tail
 
         model, added = append_halving_tail(self._identity_graph(), plan_fused_tail())
         onnx.checker.check_model(model)
@@ -249,7 +249,7 @@ class GraphSurgeryTest(CustomTestCase):
     def test_the_graph_computes_what_the_torch_twin_computes(self):
         import onnxruntime as ort
 
-        from sglang.srt.video_enhance.fused_tail import append_halving_tail
+        from flliper.srt.video_enhance.fused_tail import append_halving_tail
 
         plan = plan_fused_tail()
         model, _added = append_halving_tail(self._identity_graph(), plan)
@@ -268,7 +268,7 @@ class GraphSurgeryTest(CustomTestCase):
         )
 
     def test_the_antialias_arm_raises_the_opset_and_the_conv_arm_does_not(self):
-        from sglang.srt.video_enhance.fused_tail import append_halving_tail
+        from flliper.srt.video_enhance.fused_tail import append_halving_tail
 
         conv, _ = append_halving_tail(self._identity_graph(), plan_fused_tail())
         bicubic, _ = append_halving_tail(
@@ -278,7 +278,7 @@ class GraphSurgeryTest(CustomTestCase):
         self.assertEqual([imp.version for imp in bicubic.opset_import], [18])
 
     def test_a_multi_output_graph_is_refused(self):
-        from sglang.srt.video_enhance.fused_tail import append_halving_tail
+        from flliper.srt.video_enhance.fused_tail import append_halving_tail
 
         model = self._identity_graph()
         model.graph.output.append(model.graph.output[0])
@@ -290,7 +290,7 @@ class PayloadTest(CustomTestCase):
     """What the fusion is actually for, in bytes."""
 
     def test_the_engine_stops_emitting_the_8k_frame(self):
-        from sglang.srt.video_enhance.frame_math import MIB, frame_bytes
+        from flliper.srt.video_enhance.frame_math import MIB, frame_bytes
 
         unfused = frame_bytes(R8K, PixelFormat.RGB_FP16) / MIB
         fused = frame_bytes(R4K, PixelFormat.RGB_FP16) / MIB

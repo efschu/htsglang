@@ -18,14 +18,14 @@ Desk test: pure arithmetic over ServerArgs, no device.
 
 import unittest
 
-from sglang.srt.mem_cache.common import (
+from flliper.srt.mem_cache.common import (
     get_alloc_len_per_decode,
     get_alloc_reserve_per_decode,
     get_commit_lag_per_decode,
 )
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

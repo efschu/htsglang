@@ -7,14 +7,14 @@ from unittest.mock import patch
 
 import requests
 
-from sglang.srt.utils.common import (
+from flliper.srt.utils.common import (
     _normalize_video_input,
     configure_media_url_security,
     download_remote_media,
     get_image_bytes,
     load_audio,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -166,7 +166,7 @@ class TestMediaURLSecurity(unittest.TestCase):
     def test_all_common_loaders_share_the_policy(self):
         blocked = ValueError("media URL domain is not allowed")
         with patch(
-            "sglang.srt.utils.common.download_remote_media", side_effect=blocked
+            "flliper.srt.utils.common.download_remote_media", side_effect=blocked
         ) as download:
             for loader in (
                 get_image_bytes,

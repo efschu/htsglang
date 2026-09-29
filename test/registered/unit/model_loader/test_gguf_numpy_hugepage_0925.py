@@ -23,7 +23,7 @@ c) byte identity: the REAL ``Qwen35GGUFAdapter.transform_stream`` dequantizes an
 d) the loader wiring: ``GGUFModelLoader.load_model`` runs ``model.load_weights``
    -- i.e. the whole weight stream -- with the hint off, and numpy's setting is
    back afterwards.  RED on bb086e1120: the stream ran with numpy's default.
-e) in the rank process, without an env: a process SPAWNED the way sglang
+e) in the rank process, without an env: a process SPAWNED the way flliper
    starts its schedulers, NUMPY_MADVISE_HUGEPAGE removed from its environment,
    starts with numpy's hint on, streams its GGUF with it off (numpy flag and
    kernel VmFlags) and has it back afterwards.
@@ -39,9 +39,9 @@ from unittest import mock
 import numpy as np
 import torch
 
-from sglang.srt.model_loader import gguf_numpy_hugepage as H
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_loader import gguf_numpy_hugepage as H
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -65,7 +65,7 @@ class _HintCase(CustomTestCase):
         env = mock.patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
-        os.environ.pop("SGLANG_GGUF_NUMPY_HUGEPAGE", None)
+        os.environ.pop("FLLIPER_GGUF_NUMPY_HUGEPAGE", None)
 
     def tearDown(self):
         _SWITCH(self._orig)
@@ -92,7 +92,7 @@ class TheScopeSwitchesTheHintOffAndBack(_HintCase):
         self.assertFalse(_get_hint(), "the scope must restore, not force on")
 
     def test_opt_out_env_keeps_numpys_setting(self):
-        os.environ["SGLANG_GGUF_NUMPY_HUGEPAGE"] = "1"
+        os.environ["FLLIPER_GGUF_NUMPY_HUGEPAGE"] = "1"
         with H.numpy_hugepage_off_for_gguf_load(rank=0) as switched:
             self.assertFalse(switched)
             self.assertTrue(_get_hint())
@@ -184,7 +184,7 @@ class TheTransformIsBitIdentical(_HintCase):
     ROWS, COLS = 256, 48 * 128
 
     def _adapter(self):
-        from sglang.srt.model_loader.gguf_qwen35 import Qwen35GGUFAdapter
+        from flliper.srt.model_loader.gguf_qwen35 import Qwen35GGUFAdapter
 
         a = Qwen35GGUFAdapter.__new__(Qwen35GGUFAdapter)
         a.is_draft = False
@@ -226,8 +226,8 @@ def _stubbed_gguf_load(probe):
     """Run the REAL ``GGUFModelLoader.load_model`` with everything around
     ``model.load_weights`` stubbed; ``probe()`` runs while load_weights consumes
     the weight stream, and its result is returned."""
-    from sglang.srt.configs.load_config import LoadConfig
-    from sglang.srt.model_loader import loader as L
+    from flliper.srt.configs.load_config import LoadConfig
+    from flliper.srt.model_loader import loader as L
 
     seen = {}
 
@@ -252,10 +252,10 @@ def _stubbed_gguf_load(probe):
         "_get_weights_iterator",
         return_value=iter([("w", torch.zeros(1))]),
     ), mock.patch(
-        "sglang.srt.model_loader.gguf_registry.create_gguf_adapter",
+        "flliper.srt.model_loader.gguf_registry.create_gguf_adapter",
         return_value=None,
     ), mock.patch(
-        "sglang.srt.model_loader.gguf_dflash.is_dflash_gguf_config",
+        "flliper.srt.model_loader.gguf_dflash.is_dflash_gguf_config",
         return_value=False,
     ), mock.patch.object(
         L, "get_gguf_extra_tensor_names", return_value=[]
@@ -287,7 +287,7 @@ def _hint_and_kernel_flag():
 
 
 def _rank_process_main(conn):
-    """Body of a freshly SPAWNED process -- the way sglang starts a rank:
+    """Body of a freshly SPAWNED process -- the way flliper starts a rank:
     numpy imported with its own default, no NUMPY_MADVISE_HUGEPAGE in the
     environment, then the real GGUF loader."""
     try:
@@ -322,7 +322,7 @@ class TheLoaderStreamsWithTheHintOff(_HintCase):
 
 @unittest.skipIf(_SWITCH is None, "this numpy has no _set_madvise_hugepage")
 class TheRankProcessNeedsNoEnv(CustomTestCase):
-    """The fix lives in the process that loads -- a rank spawned like sglang
+    """The fix lives in the process that loads -- a rank spawned like flliper
     spawns its schedulers, with NUMPY_MADVISE_HUGEPAGE REMOVED from its
     environment (memory rule: an env in the launcher is not an env in the rank;
     /proc/<rank>/environ cannot even show it, setproctitle zeroes it).  Inside
@@ -336,7 +336,7 @@ class TheRankProcessNeedsNoEnv(CustomTestCase):
         parent, child = ctx.Pipe(duplex=False)
         with mock.patch.dict(os.environ):
             os.environ.pop("NUMPY_MADVISE_HUGEPAGE", None)
-            os.environ.pop("SGLANG_GGUF_NUMPY_HUGEPAGE", None)
+            os.environ.pop("FLLIPER_GGUF_NUMPY_HUGEPAGE", None)
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
             proc = ctx.Process(target=_rank_process_main, args=(child,))
             proc.start()

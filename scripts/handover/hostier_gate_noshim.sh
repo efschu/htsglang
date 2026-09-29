@@ -10,7 +10,7 @@
 # Verifying at the code first, as required: the step in question is step 4 of
 # live_handover_gate.sh,
 #
-#     python -m sglang.srt.mem_cache.hicache_migrate \
+#     python -m flliper.srt.mem_cache.hicache_migrate \
 #         --source-dir A --target-dir B --manifest ... \
 #         --target-tp-size N --target-ratios ... \
 #         --num-linear-layers ... --gdn-units ... \
@@ -51,7 +51,7 @@
 #   --page-size 1 --enable-hierarchical-cache
 #   --hicache-storage-backend file --hicache-write-policy write_through
 #   --hicache-mem-layout page_first_direct
-# with SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR pointing at their store.
+# with FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR pointing at their store.
 # A hybrid-GDN model has no choice about the layout: MambaPoolHost accepts
 # page_first_direct only.
 #

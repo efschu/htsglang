@@ -27,8 +27,8 @@ import unittest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt import rank_role  # noqa: E402
-from sglang.srt.managers import tp_match_floor as m  # noqa: E402
+from flliper.srt import rank_role  # noqa: E402
+from flliper.srt.managers import tp_match_floor as m  # noqa: E402
 
 _H98 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_nf_form_a_follow_h98.py")
 _spec = importlib.util.spec_from_file_location("_h98_harness", _H98)
@@ -38,14 +38,14 @@ _spec.loader.exec_module(h98)
 
 class _ProvenTree(h98._Tree):
     """An H98 tree whose host chain is proven only up to ``proven`` tokens
-    (``weg2_chain_proof_depth``: None = everything proven)."""
+    (``pdflip_chain_proof_depth``: None = everything proven)."""
 
     def __init__(self, kv, anchors, proven=None):
         super().__init__(kv, anchors)
         self.proven = proven
         self.proof_asks = 0
 
-    def weg2_chain_proof_depth(self, node, req=None):
+    def pdflip_chain_proof_depth(self, node, req=None):
         self.proof_asks += 1
         if self.proven is None:
             return None
@@ -108,7 +108,7 @@ class TestGroup(unittest.TestCase):
         """H98's reduce (usable MIN, MAX, H97 realize) and each rank's admission,
         with ``holds`` pinning form_a_worker_holds_kv for the worker ranks."""
         with h98._switch(True), _HoldsKv(holds):
-            return h98._run(trees, "weg2-7-2")
+            return h98._run(trees, "pdflip-7-2")
 
     def test_group_takes_every_rank_to_the_workers_proven_page(self):
         # TP0 (share 0 under the cut: its KV rows are byteless, its mamba
@@ -120,7 +120,7 @@ class TestGroup(unittest.TestCase):
             2: _ProvenTree(REACH, []),
         }
         planted, geometry = self._plant_and_admit(trees, True)
-        self.assertEqual(planted, {"weg2-7-2": CUT}, geometry)
+        self.assertEqual(planted, {"pdflip-7-2": CUT}, geometry)
         self.assertEqual(set(geometry.values()), {CUT},
                          f"every rank must admit the proven depth: {geometry}")
 
@@ -142,7 +142,7 @@ class TestGroup(unittest.TestCase):
             2: _ProvenTree(REACH, []),
         }
         planted, geometry = self._plant_and_admit(trees, False)
-        self.assertEqual(planted, {"weg2-7-2": REACH})
+        self.assertEqual(planted, {"pdflip-7-2": REACH})
         self.assertEqual(set(geometry.values()), {REACH})
 
 

@@ -41,8 +41,8 @@ import json
 import unittest
 from unittest import mock
 
-from sglang.srt.planner import rate_env as renv
-from sglang.srt.planner.card_library import (
+from flliper.srt.planner import rate_env as renv
+from flliper.srt.planner.card_library import (
     CardCapacityMismatch,
     CardLibrary,
     CardSpec,
@@ -233,7 +233,7 @@ class ConsumersDetectTest(unittest.TestCase):
     def test_t11_the_roofline_declines_to_price_the_wrong_card(self):
         """``_profile_for`` is the roofline's name-keyed fallback. Handed a
         20480 MiB card it must not return the 10240 MiB seed."""
-        from sglang.srt.planner import roofline
+        from flliper.srt.planner import roofline
 
         lib = CardLibrary()
         wrong = roofline._profile_for(lib, DRIVER_3080, total_mib=RIG_3080_MIB)
@@ -249,7 +249,7 @@ class ConsumersDetectTest(unittest.TestCase):
         supplies would leave the defect exactly where it was."""
         import inspect
 
-        from sglang.srt.planner import roofline
+        from flliper.srt.planner import roofline
 
         source = inspect.getsource(roofline)
         calls = [
@@ -268,7 +268,7 @@ class ConsumersDetectTest(unittest.TestCase):
         import os
         import tempfile
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         before = renv.RateEnv(driver_version="580.65.06", power_limit_mw=320000)
         now = renv.RateEnv(driver_version="580.65.06", power_limit_mw=200000)
@@ -291,7 +291,7 @@ class ConsumersDetectTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "card_library.json")
             lib.save(path)
-            with mock.patch.dict(os.environ, {"SGLANG_CARD_LIBRARY": path}):
+            with mock.patch.dict(os.environ, {"FLLIPER_CARD_LIBRARY": path}):
                 with mock.patch.object(
                     renv, "current_envs_by_name", return_value={"rtx 3080": [now]}
                 ):
@@ -311,7 +311,7 @@ class ConsumersDetectTest(unittest.TestCase):
         import tempfile
         from contextlib import redirect_stdout
 
-        from sglang.srt.planner import card_rate_pass as crp
+        from flliper.srt.planner import card_rate_pass as crp
 
         before = renv.RateEnv(driver_version="580.65.06", power_limit_mw=320000)
         now = renv.RateEnv(driver_version="580.65.06", power_limit_mw=200000)

@@ -11,13 +11,13 @@ once or twice.
 import sys
 import unittest
 
-from sglang.srt.registry.adapter import AdapterContext, AdapterError, EstimateError
-from sglang.srt.registry.adapters.class1_srt import Class1SrtAdapter
-from sglang.srt.registry.adapters.class2_diffusion import Class2DiffusionAdapter
-from sglang.srt.registry.adapters.class3_utility import build as build_class3
-from sglang.srt.registry.ledger import MIB
-from sglang.srt.registry.spec import EngineClass, EngineSpec, ResidencyState
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.registry.adapter import AdapterContext, AdapterError, EstimateError
+from flliper.srt.registry.adapters.class1_srt import Class1SrtAdapter
+from flliper.srt.registry.adapters.class2_diffusion import Class2DiffusionAdapter
+from flliper.srt.registry.adapters.class3_utility import build as build_class3
+from flliper.srt.registry.ledger import MIB
+from flliper.srt.registry.spec import EngineClass, EngineSpec, ResidencyState
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -147,7 +147,7 @@ class Class1LaunchTest(unittest.TestCase):
         )
         adapter = self.build(spec, (CARD_A, CARD_B))
         argv = adapter.build_argv()
-        self.assertEqual(argv[:3], [sys.executable, "-m", "sglang.launch_server"])
+        self.assertEqual(argv[:3], [sys.executable, "-m", "flliper.launch_server"])
         self.assertIn("--rank-gpu-id", argv)
         self.assertEqual(argv[argv.index("--rank-gpu-id") + 1], "1,1,0")
         self.assertEqual(argv[argv.index("--rank-gpu-memory-mib") + 1], "15000")
@@ -296,7 +296,7 @@ class Class2Test(unittest.TestCase):
     #
     # Until #348b the measured branch of _capacity_weights called
     # load_measured_registry -- the KV-BUDGET registry, gated behind
-    # SGLANG_MEASURED_KV_BUDGET, keyed by components/mlp_vector rather than by
+    # FLLIPER_MEASURED_KV_BUDGET, keyed by components/mlp_vector rather than by
     # card UUID, and typed for a ServerArgs this caller does not have. It could
     # not return a per-card gemm_tflops under any configuration, so uneven SP
     # was reachable only by declaring the weights by hand while the docstring
@@ -313,7 +313,7 @@ class Class2Test(unittest.TestCase):
     def test_capacity_weights_come_off_the_measured_gemm_rates(self):
         from unittest import mock
 
-        from sglang.srt.planner import cost_model
+        from flliper.srt.planner import cost_model
 
         spec = self.spec()
         adapter = Class2DiffusionAdapter(spec, context())
@@ -332,7 +332,7 @@ class Class2Test(unittest.TestCase):
     def test_a_card_without_a_measured_rate_is_named_not_guessed(self):
         from unittest import mock
 
-        from sglang.srt.planner import cost_model
+        from flliper.srt.planner import cost_model
 
         spec = self.spec()
         adapter = Class2DiffusionAdapter(spec, context())

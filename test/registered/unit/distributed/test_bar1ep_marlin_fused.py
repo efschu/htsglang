@@ -33,15 +33,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner import marlin as marlin_mod
-from sglang.srt.layers.moe.moe_runner.base import FusedOpPool, MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
-from sglang.srt.layers.moe.token_dispatcher.deepep import (
+from flliper.srt.layers.moe.moe_runner import marlin as marlin_mod
+from flliper.srt.layers.moe.moe_runner.base import FusedOpPool, MoeRunnerConfig
+from flliper.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+from flliper.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalCombineInput,
     DeepEPNormalDispatchOutput,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -106,10 +106,10 @@ def _run_capturing(dispatch, quant=None, config=None) -> Dict[str, Any]:
 
     fused = FusedOpPool.get_fused_func("bar1ep", "marlin")
     with mock.patch(
-        "sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe.fused_marlin_moe",
+        "flliper.srt.layers.moe.fused_moe_triton.fused_marlin_moe.fused_marlin_moe",
         fake,
     ), mock.patch(
-        "sglang.srt.layers.quantization.marlin_utils.marlin_make_workspace",
+        "flliper.srt.layers.quantization.marlin_utils.marlin_make_workspace",
         lambda device, max_blocks_per_sm=4: torch.zeros(4, dtype=torch.int),
     ):
         out = fused(dispatch, quant or _quant_info(), config or _config())
@@ -133,8 +133,8 @@ class TestRegistration(CustomTestCase):
     def test_marlin_still_has_no_runner_core_so_the_fused_func_is_the_path(self):
         """If a core ever appears, the fused func stops being load-bearing and
         this file's premise needs re-reading."""
-        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
-        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from flliper.srt.layers.moe.moe_runner.runner import MoeRunner
+        from flliper.srt.layers.moe.utils import MoeRunnerBackend
 
         runner = MoeRunner(MoeRunnerBackend.MARLIN, _config())
         self.assertIsNone(runner.runner_core)
@@ -262,7 +262,7 @@ class TestTheGatingOutputSubstitution(CustomTestCase):
         import ast
         import inspect
 
-        from sglang.srt.layers.moe.fused_moe_triton import fused_marlin_moe as mod
+        from flliper.srt.layers.moe.fused_moe_triton import fused_marlin_moe as mod
 
         tree = ast.parse(inspect.getsource(mod))
         for fn in ast.walk(tree):
@@ -288,7 +288,7 @@ class TestTheGatingOutputSubstitution(CustomTestCase):
     def test_its_only_use_is_the_token_count_assert(self):
         import inspect
 
-        from sglang.srt.layers.moe.fused_moe_triton import fused_marlin_moe as mod
+        from flliper.srt.layers.moe.fused_moe_triton import fused_marlin_moe as mod
 
         line = self._gating_uses()[0].lineno
         src = inspect.getsource(mod).splitlines()[line - 1]

@@ -13,7 +13,7 @@ Three extractions carry the step:
   * per-group attainment. parallel_state logs "barlink enabled for group '<x>':
     requested=<a>, ACHIEVED=<e>" on success and the same pair as a WARNING on
     fallback. The requested name is worthless -- it says bar1 either way. Only
-    ACHIEVED counts, and it counts PER GROUP: with SGLANG_UNEVEN_DCP=1 there
+    ACHIEVED counts, and it counts PER GROUP: with FLLIPER_UNEVEN_DCP=1 there
     are two (tp:0, dcp:0), and a run where one of them fell back to gloo is a
     mixed measurement, not a bar1 measurement.
   * the coverage bolt. barlink._select raises rather than falling back to the
@@ -95,8 +95,8 @@ SCHEMA_VERSION = 6
 SMOKE_PROMPT = "1 2 3 4"
 #: The first number the continuation has to produce -- immediately after the
 #: prompt. What the prompt itself says is no evidence about the answer.
-ZAHLEN_VON = 5
-ZAHLEN_BIS = 20
+COUNT_FROM = 5
+COUNT_TO = 20
 
 #: How many numbers must follow IMMEDIATELY and WITHOUT A GAP.
 #:
@@ -113,31 +113,31 @@ ZAHLEN_BIS = 20
 #: justify a threshold at its own value. The distance that matters is the one
 #: between 0 and 4 -- a broken collective does not deliver four correct
 #: numbers and then come off the rails.
-ANKER_MIN = 4
+ANCHOR_MIN = 4
 
 #: Garbage thresholds. EVERY one is calibrated against the real artifact of
 #: attempt 4 (smoke.json, 1055 characters), not guessed -- the measured values
 #: are noted with each. A test drives exactly that artifact and requires it to
 #: pass.
 #: measured 1.0000
-MUELL_DRUCKBAR_MIN = 0.98
+GARBAGE_PRINTABLE_MIN = 0.98
 #: measured 0.435 (the forum post repeats a block; that is web text, not a
 #: defect). A token loop sits at ~0.01 -- the distance is large, so the
 #: threshold is deliberately far below the measured value.
-MUELL_VIELFALT_MIN = 0.15
+GARBAGE_VARIETY_MIN = 0.15
 #: Below that few words the diversity is noise and is not checked.
-MUELL_VIELFALT_AB_WORTEN = 30
+GARBAGE_VARIETY_AB_WORDS = 30
 #: measured 3 ("###"). A degeneration repeats a short unit dozens of times.
-MUELL_WDH_MAX = 10
-MUELL_EINHEIT_MAX = 32
+GARBAGE_WDH_MAX = 10
+GARBAGE_UNIT_MAX = 32
 #: Shorter than this is not an answer anything can be said about.
-MUELL_MIN_ZEICHEN = 20
+GARBAGE_MIN_CHARS = 20
 
 #: Where the evidence is read from, in this order. `barlink_lines.txt` is the
 #: complete grep result and therefore comes first; `server.log` is the bounded
 #: excerpt the step script writes on EVERY path -- including the ones that
 #: branch off before the grep.
-LOG_QUELLEN = ("barlink_lines.txt", "server.log")
+LOG_SOURCES = ("barlink_lines.txt", "server.log")
 
 RE_GROUP = re.compile(
     r"group '(?P<group>[^']+)': requested=(?P<requested>[^,\s]+),\s*"
@@ -236,7 +236,7 @@ def collect_log_lines(step_dir: str) -> tuple:
     sources = []
     lines = []
     seen = set()
-    for name in LOG_QUELLEN:
+    for name in LOG_SOURCES:
         path = os.path.join(step_dir, name)
         if not os.path.exists(path):
             continue
@@ -365,7 +365,7 @@ def _max_repetition(text: str) -> int:
     """
     text = text[:4000]
     best = 0
-    for length in range(1, MUELL_EINHEIT_MAX + 1):
+    for length in range(1, GARBAGE_UNIT_MAX + 1):
         i = 0
         while i + length <= len(text):
             unit = text[i:i + length]
@@ -397,34 +397,34 @@ def garbage_check(text: str) -> tuple:
     findings = []
     metrics = {}
     trimmed = text.strip()
-    if len(trimmed) < MUELL_MIN_ZEICHEN:
+    if len(trimmed) < GARBAGE_MIN_CHARS:
         findings.append(f"nur {len(trimmed)} Zeichen Text")
         return findings, metrics
 
     printable = sum(1 for c in text if c.isprintable() or c in "\n\t")
     share = printable / len(text)
     metrics["druckbar_anteil"] = round(share, 4)
-    if share < MUELL_DRUCKBAR_MIN:
+    if share < GARBAGE_PRINTABLE_MIN:
         findings.append(
-            f"nur {share:.3f} druckbare Zeichen (< {MUELL_DRUCKBAR_MIN})"
+            f"nur {share:.3f} druckbare Zeichen (< {GARBAGE_PRINTABLE_MIN})"
         )
 
     words = text.split()
-    if len(words) >= MUELL_VIELFALT_AB_WORTEN:
+    if len(words) >= GARBAGE_VARIETY_AB_WORDS:
         diversity = len(set(words)) / len(words)
         metrics["wort_vielfalt"] = round(diversity, 4)
-        if diversity < MUELL_VIELFALT_MIN:
+        if diversity < GARBAGE_VARIETY_MIN:
             findings.append(
-                f"Wortvielfalt {diversity:.3f} (< {MUELL_VIELFALT_MIN}) -- "
+                f"Wortvielfalt {diversity:.3f} (< {GARBAGE_VARIETY_MIN}) -- "
                 f"{len(set(words))} verschiedene von {len(words)} Worten"
             )
 
     repeats = _max_repetition(text)
     metrics["max_wiederholung"] = repeats
-    if repeats >= MUELL_WDH_MAX:
+    if repeats >= GARBAGE_WDH_MAX:
         findings.append(
             f"a short unit repeats {repeats}x back to back "
-            f"(>= {MUELL_WDH_MAX}) -- Tokenschleife"
+            f"(>= {GARBAGE_WDH_MAX}) -- Tokenschleife"
         )
     return findings, metrics
 
@@ -451,9 +451,9 @@ def parse_smoke(step_dir: str) -> dict:
         "spec_verify_ct": None,
         "finish_reason": None,
         "zahlen_in_folge": 0,
-        "zahlen_erwartet": ZAHLEN_BIS - ZAHLEN_VON + 1,
+        "zahlen_erwartet": COUNT_TO - COUNT_FROM + 1,
         "anker_zahlen": 0,
-        "anker_min": ANKER_MIN,
+        "anker_min": ANCHOR_MIN,
         "drift_zeichen": 0,
         "muell_befunde": [],
         "lm_intakt": False,
@@ -482,7 +482,7 @@ def parse_smoke(step_dir: str) -> dict:
         out["endpunkt"] = "generate"
         text = payload["text"]
         meta = payload.get("meta_info") or {}
-        start, end = ZAHLEN_VON, ZAHLEN_BIS
+        start, end = COUNT_FROM, COUNT_TO
     else:
         # Chat shape. It counts from 1, because no prompt is continued there
         # -- an older artifact should yield the same number it did back then.
@@ -522,9 +522,9 @@ def parse_smoke(step_dir: str) -> dict:
     # (a) The anchor: does a determined prefix produce the right tokens?
     hits, rest = anchor_run(text, start)
     out["anker_zahlen"] = hits
-    out["anker_min"] = ANKER_MIN
+    out["anker_min"] = ANCHOR_MIN
     out["drift_zeichen"] = len(rest.strip())
-    anchor_ok = hits >= ANKER_MIN
+    anchor_ok = hits >= ANCHOR_MIN
 
     # (b) And is the rest well-formed text? The WHOLE section is checked, not
     #     just the drift: an answer that carries exactly the numbers and then

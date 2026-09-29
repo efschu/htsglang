@@ -27,11 +27,11 @@ import unittest
 from collections import deque
 from unittest import mock
 
-from sglang.srt.distributed.pp_crossing_wire import (
+from flliper.srt.distributed.pp_crossing_wire import (
     NoCrossingWire,
     build_crossing_wire,
 )
-from sglang.srt.distributed.pp_typed_channel import (
+from flliper.srt.distributed.pp_typed_channel import (
     CROSSING_KIND,
     recv_typed_tensor_dict,
     resolve_src,
@@ -39,7 +39,7 @@ from sglang.srt.distributed.pp_typed_channel import (
     stash_typed,
     take_typed,
 )
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     PP_CROSSING_WIRE_ENV,
     PP_LAYER_SET_ENV,
     pp_gapped_ownership_active,
@@ -56,7 +56,7 @@ CONTIGUOUS_SET = "0-21;22-42;43-63"
 
 
 def _owned_from(raw: str, num_layers: int, world: int):
-    from sglang.srt.distributed.utils import parse_pp_layer_sets
+    from flliper.srt.distributed.utils import parse_pp_layer_sets
 
     return parse_pp_layer_sets(raw, num_layers, world, allow_gapped=True)
 
@@ -206,7 +206,7 @@ class TestStageEntryComesFromTheWire(unittest.TestCase):
             self.assertFalse(pp_gapped_ownership_active(3))
 
     def test_wire_is_the_null_object_when_switched_off(self):
-        from sglang.srt.distributed.pp_crossing_wire import build_wire_for_model
+        from flliper.srt.distributed.pp_crossing_wire import build_wire_for_model
 
         class _Cfg:
             num_hidden_layers = 64
@@ -321,7 +321,7 @@ class TestGappedCorridorHoldback(unittest.TestCase):
     """
 
     def _call(self, rest, *, layer_set=GAPPED_SET, wire="1", reserve=1024, pp=3):
-        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+        from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
             ModelRunnerKVCacheMixin,
         )
 
@@ -409,14 +409,14 @@ class TestOutputRingSymmetricGating(unittest.TestCase):
         Guards the specific regression this commit undoes: d139c463cc removed
         the pp_loop_size=1 selection on a wrong reading of why v7pp5 starved.
         """
-        from sglang.srt.managers import scheduler_pp_mixin as m
+        from flliper.srt.managers import scheduler_pp_mixin as m
 
         src = inspect.getsource(m.SchedulerPPMixin.init_pp_loop_state)
         self.assertIn("self.pp_loop_size = 1", src)
 
     def test_exchange_predicate_is_one_expression(self):
         """Both sides call the same function, so they cannot drift apart."""
-        from sglang.srt.managers.scheduler_pp_mixin import _pp_output_exchange_due
+        from flliper.srt.managers.scheduler_pp_mixin import _pp_output_exchange_due
 
         class _Mode:
             def __init__(self, prebuilt):
@@ -438,14 +438,14 @@ class TestOutputRingSymmetricGating(unittest.TestCase):
 
     def test_send_side_uses_the_shared_predicate(self):
         """The last rank's gate is the function, not a re-spelling of it."""
-        from sglang.srt.managers import scheduler_pp_mixin as m
+        from flliper.srt.managers import scheduler_pp_mixin as m
 
         src = inspect.getsource(m.SchedulerPPMixin._pp_send_output_to_next_stage)
         self.assertIn("_pp_output_exchange_due(target)", src)
 
     def test_split_slots_are_refused_on_the_gapped_path(self):
         """A future ring-size change must fail loudly, not starve silently."""
-        from sglang.srt.managers import scheduler_pp_mixin as m
+        from flliper.srt.managers import scheduler_pp_mixin as m
 
         src = inspect.getsource(m.SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors)
         self.assertIn("next_first_rank_mb_id != next_mb_id", src)
@@ -469,12 +469,12 @@ class TestIdleTickSendsNothing(unittest.TestCase):
         A None default cannot express both 'no value given' and 'the value is
         nothing', which is precisely the conflation that stalled v7pp17.
         """
-        from sglang.srt.managers.scheduler_pp_mixin import _NOT_SUPPLIED
+        from flliper.srt.managers.scheduler_pp_mixin import _NOT_SUPPLIED
 
         self.assertIsNotNone(_NOT_SUPPLIED)
 
     def test_do_send_defaults_to_the_sentinel(self):
-        from sglang.srt.managers import scheduler_pp_mixin as m
+        from flliper.srt.managers import scheduler_pp_mixin as m
 
         src = inspect.getsource(
             m.SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors
@@ -486,7 +486,7 @@ class TestIdleTickSendsNothing(unittest.TestCase):
         """Forwarding an explicit None must not fall back to pp_outputs."""
         sentinel_src = inspect.getsource(
             __import__(
-                "sglang.srt.managers.scheduler_pp_mixin", fromlist=["x"]
+                "flliper.srt.managers.scheduler_pp_mixin", fromlist=["x"]
             ).SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors
         )
         # The fallback must be keyed on the sentinel, never on `is None`.
@@ -502,7 +502,7 @@ class TestGappedForwardIsRefused(unittest.TestCase):
     """
 
     def test_refusal_fires_by_default(self):
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             PP_GAPPED_KNOWN_WRONG_ENV,
             _refuse_known_wrong_gapped_forward,
         )
@@ -517,7 +517,7 @@ class TestGappedForwardIsRefused(unittest.TestCase):
         self.assertIn(PP_GAPPED_KNOWN_WRONG_ENV, msg)
 
     def test_escape_hatch_allows_debugging(self):
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             PP_GAPPED_KNOWN_WRONG_ENV,
             _refuse_known_wrong_gapped_forward,
         )
@@ -529,7 +529,7 @@ class TestGappedForwardIsRefused(unittest.TestCase):
 
     def test_falsey_values_do_not_open_the_hatch(self):
         """'0' and '' must keep the refusal shut."""
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             PP_GAPPED_KNOWN_WRONG_ENV,
             _refuse_known_wrong_gapped_forward,
         )
@@ -544,7 +544,7 @@ class TestGappedForwardIsRefused(unittest.TestCase):
 
     def test_the_gapped_init_path_calls_the_refusal(self):
         """The gate must sit on the path a gapped boot actually takes."""
-        from sglang.srt.managers import scheduler_pp_mixin as m
+        from flliper.srt.managers import scheduler_pp_mixin as m
 
         src = inspect.getsource(m.SchedulerPPMixin.init_pp_loop_state)
         self.assertIn("_refuse_known_wrong_gapped_forward()", src)

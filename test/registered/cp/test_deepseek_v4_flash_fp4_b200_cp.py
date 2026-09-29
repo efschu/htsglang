@@ -10,12 +10,12 @@ Registry: extra-b-test-4-gpu-b200 (label-gated extra CI, 4x B200)
 
 import unittest
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.kits.spec_decoding_kit import SpecDecodingMixin
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -29,12 +29,12 @@ SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 _DEEPEP_ENV = {
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+    "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
     # The draft-extend graph pool costs ~4.5 GB here (DeepEP MoE workspace is
     # captured at full dispatch capacity), which starves the eager prefill
     # draft extend and OOMs. Run draft extend eager until the capture-time
     # footprint is fixed.
-    "SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH": "1",
+    "FLLIPER_DISABLE_DRAFT_EXTEND_CUDA_GRAPH": "1",
 }
 
 

@@ -3,7 +3,7 @@
 
 rc12z30o3: the presplit summed to PP0 26.8 of 60 s and TP0 33.4 of 62.8 s on
 the loader thread, and reading/consuming stood still while it ran. With
-SGLANG_LOAD_PRESPLIT_THREAD=1 it runs on ONE thread that mirrors the loader's
+FLLIPER_LOAD_PRESPLIT_THREAD=1 it runs on ONE thread that mirrors the loader's
 TMS thread-local config; off, the fnFL2x31 behaviour stays byte-identical.
 """
 
@@ -14,12 +14,12 @@ from unittest import mock
 import pytest
 import torch
 
-from sglang.srt.managers import weg2_memory_saver as wms
-from sglang.srt.model_loader import load_consumer as lc
+from flliper.srt.managers import pdflip_memory_saver as wms
+from flliper.srt.model_loader import load_consumer as lc
 
 
 def _stub_layer(param, fired):
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     class Stub:
         _ct_stream_note = FusedMoE._ct_stream_note

@@ -6,16 +6,16 @@ import unittest
 import numpy as np
 import requests
 
-from sglang.srt.utils import get_device_capability, is_blackwell, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kl_test_utils import (
+from flliper.srt.utils import get_device_capability, is_blackwell, kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kl_test_utils import (
     _extract_output_logprobs,
     _flush_cache,
     _generate,
     _get_input_logprobs,
     get_input_ids,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,

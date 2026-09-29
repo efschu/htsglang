@@ -15,7 +15,7 @@
 """
 Regression test for DeepSeek-V3.1-Base MLA LoRA logprob accuracy.
 
-Compares SGLang LoRA logprobs against reference training logprobs from a
+Compares fLLiper LoRA logprobs against reference training logprobs from a
 pre-computed dataset. The LoRA adapter and reference data are downloaded from:
 https://huggingface.co/datasets/yushengsu/lora-diff-DeepSeek-V3.1-Base
 
@@ -30,9 +30,9 @@ import unittest
 import torch
 from huggingface_hub import snapshot_download
 
-import sglang as sgl
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper as sgl
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=300,
@@ -121,20 +121,20 @@ class TestLoRADeepSeekV3BaseLogprobDiff(CustomTestCase):
                 "LoRA logprobs should differ from base model logprobs",
             )
 
-            kl_sglang_trainer = kl_v2(cdata["training_logprobs"], logprobs)
+            kl_flliper_trainer = kl_v2(cdata["training_logprobs"], logprobs)
             kl_orig_trainer = kl_v2(
                 cdata["training_logprobs"], cdata["sampling_logprobs"]
             )
-            kl_sglang_orig = kl_v2(logprobs, cdata["sampling_logprobs"])
+            kl_flliper_orig = kl_v2(logprobs, cdata["sampling_logprobs"])
 
             print(f"KL(orig_sampler, trainer) = {kl_orig_trainer:.6e}")
-            print(f"KL(sglang, trainer)       = {kl_sglang_trainer:.6e}")
-            print(f"KL(sglang, orig_sampler)  = {kl_sglang_orig:.6e}")
+            print(f"KL(flliper, trainer)       = {kl_flliper_trainer:.6e}")
+            print(f"KL(flliper, orig_sampler)  = {kl_flliper_orig:.6e}")
 
             self.assertLessEqual(
-                kl_sglang_trainer,
+                kl_flliper_trainer,
                 KL_THRESHOLD,
-                f"KL(sglang, trainer) = {kl_sglang_trainer:.6e} exceeds "
+                f"KL(flliper, trainer) = {kl_flliper_trainer:.6e} exceeds "
                 f"threshold {KL_THRESHOLD}",
             )
 

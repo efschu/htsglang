@@ -1,10 +1,10 @@
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.test.scripted_runtime.context import ScriptedContext
-from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
-from sglang.test.scripted_runtime.test_case import ScriptedTestCase
-from sglang.test.scripted_runtime_chunked_helpers import (
+from flliper.srt.environ import envs
+from flliper.test.scripted_runtime.context import ScriptedContext
+from flliper.test.scripted_runtime.req_handle import ScriptedReqHandle
+from flliper.test.scripted_runtime.test_case import ScriptedTestCase
+from flliper.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
@@ -612,7 +612,7 @@ class TestAbortSmallPool(ScriptedTestCase):
         yield from run_until(r, lambda h: r.rid in waiting_rids())
         assert r.kv_pages == 0, "pressured waiting req must not own KV before admission"
 
-        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1e-6):
+        with envs.FLLIPER_REQ_WAITING_TIMEOUT.override(1e-6):
             for _ in range(DEFAULT_MAX_STEPS):
                 if r.rid not in waiting_rids():
                     break

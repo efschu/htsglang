@@ -27,10 +27,10 @@ Three properties are pinned here:
 
 import unittest
 
-from sglang.srt.managers import corridor_guard as cg
-from sglang.srt.mem_ledger import corridor_trace
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers import corridor_guard as cg
+from flliper.srt.mem_ledger import corridor_trace
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -157,7 +157,7 @@ if __name__ == "__main__":
 
 
 class TestTheLawHasOneReader(CustomTestCase):
-    """`SGLANG_CORRIDOR_LAW_FLOOR_MIB` was read in three places, each with
+    """`FLLIPER_CORRIDOR_LAW_FLOOR_MIB` was read in three places, each with
     its own `"1024"` fallback. The law could then be moved for one module
     and not the others -- a divergence with no symptom until a breach is
     judged twice and answered differently."""
@@ -181,8 +181,8 @@ class TestTheLawHasOneReader(CustomTestCase):
     def test_every_consumer_moves_together(self):
         import os
 
-        from sglang.srt.managers import phase_flip_seam_census as census
-        from sglang.srt.mem_cache import kv_vmm_backing
+        from flliper.srt.managers import phase_flip_seam_census as census
+        from flliper.srt.mem_cache import kv_vmm_backing
 
         os.environ[cg.LAW_ENV] = "1500"
         self.assertEqual(cg.corridor_law_mib(), 1500)
@@ -222,8 +222,8 @@ class TestTheLawHasOneReader(CustomTestCase):
 
 import types as _types
 
-from sglang.srt.managers import corridor_guard as _cg
-from sglang.srt.managers import phase_flip_spill as _spill
+from flliper.srt.managers import corridor_guard as _cg
+from flliper.srt.managers import phase_flip_spill as _spill
 
 
 class _Reserve:
@@ -249,7 +249,7 @@ def _sched(rank=1):
 
 
 def test_the_measured_draw_is_read_for_this_rank(monkeypatch):
-    import sglang.srt.managers.phase_flip_seam_reserve as seam
+    import flliper.srt.managers.phase_flip_seam_reserve as seam
 
     monkeypatch.setattr(seam, "read_seam_reserve", lambda sa, r: _Reserve(954))
     assert _spill._measured_seam_draw_mib(_sched(), object()) == 954
@@ -260,7 +260,7 @@ def test_the_draw_is_the_WORST_LEG_where_the_record_has_one(monkeypatch):
     rig, by different ones -- arena tail on tp_to_pp, draft restore on
     pp_to_tp -- so their sum prices a commit no seam makes. rank 2 measured
     1456 + 139 = 1595 against a worst leg of 1456."""
-    import sglang.srt.managers.phase_flip_seam_reserve as seam
+    import flliper.srt.managers.phase_flip_seam_reserve as seam
 
     monkeypatch.setattr(
         seam, "read_seam_reserve", lambda sa, r: _Reserve(1595, worst_leg_mib=1456)
@@ -269,14 +269,14 @@ def test_the_draw_is_the_WORST_LEG_where_the_record_has_one(monkeypatch):
 
 
 def test_a_cold_record_leaves_the_shipped_allowance_in_force(monkeypatch):
-    import sglang.srt.managers.phase_flip_seam_reserve as seam
+    import flliper.srt.managers.phase_flip_seam_reserve as seam
 
     monkeypatch.setattr(seam, "read_seam_reserve", lambda sa, r: None)
     assert _spill._measured_seam_draw_mib(_sched(), object()) == 0
 
 
 def test_an_inactive_record_is_not_a_measurement(monkeypatch):
-    import sglang.srt.managers.phase_flip_seam_reserve as seam
+    import flliper.srt.managers.phase_flip_seam_reserve as seam
 
     monkeypatch.setattr(
         seam, "read_seam_reserve", lambda sa, r: _Reserve(954, active=False)
@@ -289,7 +289,7 @@ def test_no_runtime_means_no_rank_means_no_measurement():
 
 
 def test_a_reader_that_raises_falls_back_rather_than_killing_the_boot(monkeypatch):
-    import sglang.srt.managers.phase_flip_seam_reserve as seam
+    import flliper.srt.managers.phase_flip_seam_reserve as seam
 
     def boom(sa, r):
         raise RuntimeError("record went away")

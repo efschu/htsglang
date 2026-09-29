@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import msgspec.msgpack
 
-from sglang.srt.entrypoints.v1_loads import get_loads
-from sglang.srt.managers.load_snapshot import (
+from flliper.srt.entrypoints.v1_loads import get_loads
+from flliper.srt.managers.load_snapshot import (
     HEADER_STRUCT,
     MAGIC,
     SLOT_LEN_STRUCT,
@@ -22,9 +22,9 @@ from sglang.srt.managers.load_snapshot import (
     ShmLoadSnapshotWriter,
     slot_offset,
 )
-from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from flliper.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 

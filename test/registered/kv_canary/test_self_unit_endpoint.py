@@ -6,24 +6,24 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
-from sglang.jit_kernel.kv_canary.verify import (
+from flliper.jit_kernel.kv_canary.consts import RealKvHashMode
+from flliper.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     VerifyPlan,
 )
-from sglang.jit_kernel.kv_canary.write import WritePlan
-from sglang.srt.kv_canary import endpoint as endpoint_module
-from sglang.srt.kv_canary.endpoint import (
+from flliper.jit_kernel.kv_canary.write import WritePlan
+from flliper.srt.kv_canary import endpoint as endpoint_module
+from flliper.srt.kv_canary.endpoint import (
     CanaryEndpoint,
 )
-from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
-from sglang.srt.kv_canary.state import (
+from flliper.srt.kv_canary.expected_inputs import ExpectedInputs
+from flliper.srt.kv_canary.state import (
     ViolationLog,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.fixtures import DEFAULT_DEVICE
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, suite="extra-a-test-1-gpu-small-amd")
@@ -230,7 +230,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 device=self.device, kernel_kind=CanaryLaunchTag.HEAD_K_SWA, swa_lut=lut
             )
             args = _make_kernel_args(self.device)
-            # Point out_cache_loc at the trailing-sentinel-row index — this is how sglang signals
+            # Point out_cache_loc at the trailing-sentinel-row index — this is how flliper signals
             # "this token is out-of-window for the SWA group" pre-cleanup, and the new host gather must
             # produce -1 here.
             args.out_cache_loc.fill_(8)

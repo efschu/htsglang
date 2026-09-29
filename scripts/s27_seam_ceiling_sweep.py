@@ -26,7 +26,7 @@ import argparse
 import sys
 from types import SimpleNamespace as NS
 
-from sglang.srt.managers.phase_flip_runtime import PP_TO_TP, TP_TO_PP, PhaseFlipRuntime
+from flliper.srt.managers.phase_flip_runtime import PP_TO_TP, TP_TO_PP, PhaseFlipRuntime
 
 MIB = 1024 * 1024
 

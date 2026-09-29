@@ -1,7 +1,7 @@
 """#913/W42: the refusing component's NAME is not the defect.
 
 WHAT THE 0826 ACCEPTANCE WINDOW MEASURED, and could not act on. With
-``SGLANG_MATCH_REFUSAL_CENSUS_EVERY=50`` armed over 93 phase flips, the #904
+``FLLIPER_MATCH_REFUSAL_CENSUS_EVERY=50`` armed over 93 phase flips, the #904
 census emitted exactly five distinct lines
 (``/spinning/evidence-665-f1/boot_accept0826r7fix_0826_1817.log``):
 
@@ -35,16 +35,16 @@ instead of re-posing it.
 
 import unittest
 
-from sglang.srt.mem_cache.mamba_ckpt_utils import (
+from flliper.srt.mem_cache.mamba_ckpt_utils import (
     RESUME_REFUSAL_ABSENT,
     RESUME_REFUSAL_OFF_GRID,
     is_resume_candidate,
     resume_refusal_reason,
 )
-from sglang.srt.mem_cache.match_refusal_census import MatchOutcome, MatchRefusalCensus
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.match_refusal_census import MatchOutcome, MatchRefusalCensus
+from flliper.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -312,7 +312,7 @@ class TestTheWalkAsksForTheReason(CustomTestCase):
     def test_the_match_walk_calls_explain_match_refusal(self):
         import inspect
 
-        from sglang.srt.mem_cache import unified_radix_cache
+        from flliper.srt.mem_cache import unified_radix_cache
 
         src = inspect.getsource(
             unified_radix_cache.UnifiedRadixCache._match_prefix_helper
@@ -322,7 +322,7 @@ class TestTheWalkAsksForTheReason(CustomTestCase):
 
     def test_every_component_answers_the_hook(self):
         """It is declared on the base so no component can be silently inert."""
-        from sglang.srt.mem_cache.unified_cache_components import tree_component
+        from flliper.srt.mem_cache.unified_cache_components import tree_component
 
         self.assertTrue(hasattr(tree_component.TreeComponent, "explain_match_refusal"))
 

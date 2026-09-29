@@ -7,7 +7,7 @@
 WHY, measured on this rig 2026-08-12: all five units hardcoded
 ``/spinning/htsglang-gpu`` for PYTHONPATH and for the interpreter, regardless
 of what ``[stack].repo`` said. That checkout predates the turnkey merge, so
-every unit died with ``No module named sglang.srt.turnkey`` and the serving
+every unit died with ``No module named flliper.srt.turnkey`` and the serving
 unit died on the dependency. ``[stack].repo`` READS as the single source of
 truth and is not one, and the divergence is invisible until the import error.
 
@@ -28,8 +28,8 @@ import subprocess
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -71,7 +71,7 @@ uuid = "GPU-11111111-1111-1111-1111-111111111111"
 port = 30030
 cards = [0]
 boot_log = "/var/log/elsewhere/ship.boot.log"
-argv = ["/opt/elsewhere/venv/bin/python", "-m", "sglang.launch_server"]
+argv = ["/opt/elsewhere/venv/bin/python", "-m", "flliper.launch_server"]
 """
 
 
@@ -172,7 +172,7 @@ class TestRendering(CustomTestCase):
                       text)
         self.assertIn(
             "ExecStart=/spinning/htsglang-gpu/.venv/bin/python "
-            "-m sglang.srt.turnkey --config /etc/htsglang/stack.toml boot %i",
+            "-m flliper.srt.turnkey --config /etc/htsglang/stack.toml boot %i",
             text)
 
     def test_an_unresolved_placeholder_is_refused_not_written(self):

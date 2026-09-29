@@ -58,19 +58,19 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
     ComponentType,
     LRURefreshPhase,
     TreeComponent,
 )
-from sglang.srt.mem_cache.unified_radix_cache import (
+from flliper.srt.mem_cache.unified_radix_cache import (
     UnifiedLRUList,
     UnifiedRadixCache,
     UnifiedTreeNode,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

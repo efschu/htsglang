@@ -25,7 +25,7 @@ import types
 
 import pytest
 
-from sglang.srt.managers.pp_admission_congruence import (
+from flliper.srt.managers.pp_admission_congruence import (
     PPWidthDivergenceRefused,
     pp_row_carrier_present,
     refuse_pp_width_divergence,
@@ -68,7 +68,7 @@ def _stand_in(pp_size: int, pp_rank: int, counters=None, gate=None):
 
 
 def _width_fn():
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     return Scheduler._corridor_granted_prefill_width
 
@@ -76,7 +76,7 @@ def _width_fn():
 def test_pp0_narrowing_disarmed_without_carrier(monkeypatch):
     """The specimen form: PP=3, PP0, no pp_flip_counters -> width unchanged,
     the gate is never consulted, the pass is counted."""
-    monkeypatch.delenv("SGLANG_PP_ROW_AUTHORITY", raising=False)
+    monkeypatch.delenv("FLLIPER_PP_ROW_AUTHORITY", raising=False)
     gate = _Gate(448)
     pp0 = _stand_in(3, 0, gate=gate)
     assert pp_row_carrier_present(pp0) is False
@@ -88,7 +88,7 @@ def test_pp0_narrowing_disarmed_without_carrier(monkeypatch):
 
 def test_pp0_narrowing_armed_with_carrier(monkeypatch):
     """The flip form (carrier present): PP0 narrows as before, byte-identical."""
-    monkeypatch.delenv("SGLANG_PP_ROW_AUTHORITY", raising=False)
+    monkeypatch.delenv("FLLIPER_PP_ROW_AUTHORITY", raising=False)
     gate = _Gate(448)
     pp0 = _stand_in(3, 0, counters=object(), gate=gate)
     assert pp_row_carrier_present(pp0) is True
@@ -97,7 +97,7 @@ def test_pp0_narrowing_armed_with_carrier(monkeypatch):
 
 
 def test_followers_never_narrow(monkeypatch):
-    monkeypatch.delenv("SGLANG_PP_ROW_AUTHORITY", raising=False)
+    monkeypatch.delenv("FLLIPER_PP_ROW_AUTHORITY", raising=False)
     gate = _Gate(448)
     pp1 = _stand_in(3, 1, gate=gate)
     assert _width_fn()(pp1, 4096) == 4096

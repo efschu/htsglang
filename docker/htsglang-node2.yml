@@ -3,7 +3,7 @@
 #   On the head rig:   docker compose -f docker/htsglang.yml up      (NODE_RANK=0)
 #   On the second rig: docker compose -f docker/htsglang-node2.yml up
 #
-# This node serves NO API. sglang starts a TokenizerManager and a
+# This node serves NO API. flliper starts a TokenizerManager and a
 # DetokenizerManager only on node_rank 0; every other node spawns its scheduler
 # processes, reports ready, and then runs a dummy health-check server. All HTTP
 # traffic goes to the head node. Start the head node first — the second node
@@ -93,7 +93,7 @@ services:
     devices:
       # /dev/infiniband must be present in the container namespace for the UCX
       # rc transport. If this rig has no RoCE NIC, comment this out and use
-      # SGLANG_BARLINK_TRANSPORT=shm or gloo (TCP) instead — slower, still
+      # FLLIPER_BARLINK_TRANSPORT=shm or gloo (TCP) instead — slower, still
       # correct.
       # MISSING -> UCX endpoint creation fails at the first collective.
       - ${IB_DEVICE:-/dev/infiniband}:/dev/infiniband
@@ -108,7 +108,7 @@ services:
       # Per-node caches. These are NOT shared with the head rig: the hardware
       # profile, the JIT cubins and the hibernate shards all describe this
       # rig's cards.
-      - ${NODE2_SGLANG_CACHE_DIR:-./state/node2-sglang-cache}:/root/.cache/sglang
+      - ${NODE2_FLLIPER_CACHE_DIR:-./state/node2-flliper-cache}:/root/.cache/flliper
       - ${NODE2_FLASHINFER_CACHE_DIR:-./state/node2-flashinfer}:/root/.cache/flashinfer
       - ${NODE2_TORCH_EXT_CACHE_DIR:-./state/node2-torch-extensions}:/root/.cache/torch_extensions
       - ${NODE2_TRITON_CACHE_DIR:-./state/node2-triton}:/root/.triton
@@ -138,16 +138,16 @@ services:
       - RANK_GPU_MEMORY_MIB=${RANK_GPU_MEMORY_MIB:-}
       - RANK_KV_RATIO=${RANK_KV_RATIO:-}
       - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
-      - SGLANG_UNEVEN_MLP_VECTOR=${SGLANG_UNEVEN_MLP_VECTOR:-}
+      - FLLIPER_UNEVEN_MLP_VECTOR=${FLLIPER_UNEVEN_MLP_VECTOR:-}
 
       # --- barlink cross-vendor / cross-rig transport ---
       # Both rigs must run the SAME UCX release: UCX refuses to interoperate
       # across releases whose UCP wire address format differs, and the failure
       # mode is an unhelpful "invalid bandwidth 0.00" at endpoint creation.
       # Running the same image on both sides is what guarantees that.
-      - SGLANG_BARLINK=${SGLANG_BARLINK:-}
-      - SGLANG_BARLINK_TRANSPORT=${SGLANG_BARLINK_TRANSPORT:-ucx}
-      - SGLANG_BARLINK_UCX_LIB=${SGLANG_BARLINK_UCX_LIB:-}
+      - FLLIPER_BARLINK=${FLLIPER_BARLINK:-}
+      - FLLIPER_BARLINK_TRANSPORT=${FLLIPER_BARLINK_TRANSPORT:-ucx}
+      - FLLIPER_BARLINK_UCX_LIB=${FLLIPER_BARLINK_UCX_LIB:-}
       - UCX_TLS=${UCX_TLS:-rc,self,sm}
       - UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX:-3}
       - UCX_NET_DEVICES=${UCX_NET_DEVICES:-}

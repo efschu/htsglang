@@ -384,7 +384,7 @@ class TestTheExpertExtentOffByOne:
     NUM_EXPERTS = 256
 
     def test_the_predicted_extents_are_the_real_experts(self):
-        from sglang.srt.distributed.utils import partition_units
+        from flliper.srt.distributed.utils import partition_units
 
         base = partition_units(self.NUM_EXPERTS, self.BASE_PLAN)
         installed = partition_units(self.NUM_EXPERTS, self.INSTALLED)
@@ -393,7 +393,7 @@ class TestTheExpertExtentOffByOne:
         assert sum(base) == sum(installed) == self.NUM_EXPERTS
 
     def test_the_measured_extents_are_the_same_partition_plus_the_pad(self):
-        from sglang.srt.distributed.utils import partition_units
+        from flliper.srt.distributed.utils import partition_units
 
         base = [n + 1 for n in partition_units(self.NUM_EXPERTS, self.BASE_PLAN)]
         installed = [n + 1 for n in partition_units(self.NUM_EXPERTS, self.INSTALLED)]
@@ -403,7 +403,7 @@ class TestTheExpertExtentOffByOne:
         assert sum(base) == sum(installed) == self.NUM_EXPERTS + 3
 
     def test_the_delta_is_exactly_one_pad_slot_per_rank(self):
-        from sglang.srt.distributed.utils import partition_units
+        from flliper.srt.distributed.utils import partition_units
 
         for plan in (self.BASE_PLAN, self.INSTALLED):
             raw = partition_units(self.NUM_EXPERTS, plan)
@@ -421,7 +421,7 @@ class TestTheExpertExtentOffByOne:
         """
         import inspect
 
-        from sglang.srt.layers.moe import expert_compute_placement as ecp
+        from flliper.srt.layers.moe import expert_compute_placement as ecp
 
         source = inspect.getsource(ecp.resident_fraction_held_at_base_plan)
         assert "partition_units(int(num_experts), list(base))[rank] + 1" in source
@@ -448,38 +448,38 @@ class TestTheS12WindowBasis:
 
     def test_equal_bases_are_silent(self):
         s12 = _s12()
-        assert s12.fenster_basis_pruefen({"bar1:1": 12, "grundlinie:1": 12}) == []
+        assert s12.check_window_basis({"bar1:1": 12, "grundlinie:1": 12}) == []
 
     def test_a_differing_basis_is_named(self):
         s12 = _s12()
-        warnungen = s12.fenster_basis_pruefen({"bar1:8": 96, "grundlinie:8": 64})
-        assert len(warnungen) == 1
-        assert "sessions=8" in warnungen[0]
-        assert "bar1=96" in warnungen[0] and "grundlinie=64" in warnungen[0]
-        assert "DIFFERENT window bases" in warnungen[0]
+        warnings = s12.check_window_basis({"bar1:8": 96, "grundlinie:8": 64})
+        assert len(warnings) == 1
+        assert "sessions=8" in warnings[0]
+        assert "bar1=96" in warnings[0] and "grundlinie=64" in warnings[0]
+        assert "DIFFERENT window bases" in warnings[0]
 
     def test_the_silent_fallback_is_the_case_that_is_named_loudest(self):
         """requests=0 keeps the warmup; that is the defect, not a default."""
         s12 = _s12()
-        mixed = s12.fenster_basis_pruefen({"bar1:1": 0, "grundlinie:1": 12})
+        mixed = s12.check_window_basis({"bar1:1": 0, "grundlinie:1": 12})
         assert "whole log incl. warmup" in mixed[0]
-        both = s12.fenster_basis_pruefen({"bar1:1": 0, "grundlinie:1": 0})
+        both = s12.check_window_basis({"bar1:1": 0, "grundlinie:1": 0})
         assert "NO window basis for any arm" in both[0]
 
     def test_a_single_arm_point_is_not_a_comparison(self):
         s12 = _s12()
-        assert s12.fenster_basis_pruefen({"bar1:1": 0}) == []
+        assert s12.check_window_basis({"bar1:1": 0}) == []
 
-    def test_punkt_fenster_really_keeps_everything_at_zero(self):
+    def test_point_window_really_keeps_everything_at_zero(self):
         """The claim the warning rests on, pinned rather than assumed."""
         s12 = _s12()
         rows = [{"rang": 0, "new_token": 2048} for _ in range(9)]
-        assert len(s12.punkt_fenster(rows, 0)[0]) == 9
-        assert len(s12.punkt_fenster(rows, 4)[0]) == 4
+        assert len(s12.point_window(rows, 0)[0]) == 9
+        assert len(s12.point_window(rows, 4)[0]) == 4
 
     def test_the_payload_carries_the_basis_and_the_warnings(self):
         s12 = _s12()
-        payload = s12.auswerten([], {}, 5120, 3)
+        payload = s12.evaluate([], {}, 5120, 3)
         assert payload["fenster_basis"] == {}
         assert payload["fenster_basis_warnungen"] == []
 

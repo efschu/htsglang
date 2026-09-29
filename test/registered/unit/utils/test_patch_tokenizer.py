@@ -4,12 +4,12 @@ from contextlib import contextmanager
 
 from transformers import AutoTokenizer
 
-from sglang.srt.utils.patch_tokenizer import (
+from flliper.srt.utils.patch_tokenizer import (
     _SpecialTokensCachePatcher,
     decode_without_hf_kwargs,
     unpatch_tokenizer,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=53, suite="base-c-test-cpu")
@@ -82,7 +82,7 @@ class TestPatchTokenizerUnitTest(unittest.TestCase):
         original_ids = _get_class_attr_ids(cls)
 
         _SpecialTokensCachePatcher.patch(tokenizer)
-        self.assertTrue(getattr(cls, "_sglang_special_tokens_patched", False))
+        self.assertTrue(getattr(cls, "_flliper_special_tokens_patched", False))
 
         patched_ids = _get_class_attr_ids(cls)
         changed_attrs = [
@@ -93,11 +93,11 @@ class TestPatchTokenizerUnitTest(unittest.TestCase):
         self.assertGreater(len(changed_attrs), 0, "Patch should change some attributes")
 
         unpatch_tokenizer(tokenizer)
-        self.assertFalse(getattr(cls, "_sglang_special_tokens_patched", False))
+        self.assertFalse(getattr(cls, "_flliper_special_tokens_patched", False))
 
         restored_ids = _get_class_attr_ids(cls)
         for name in original_ids:
-            if name.startswith("_sglang") or name.startswith("_original"):
+            if name.startswith("_flliper") or name.startswith("_original"):
                 continue
             self.assertEqual(
                 restored_ids.get(name),
@@ -135,11 +135,11 @@ class TestPatchTokenizerUnitTest(unittest.TestCase):
         with _patched_tokenizer() as tokenizer:
             _ = tokenizer.all_special_tokens
             _ = tokenizer.all_special_ids
-            self.assertTrue(hasattr(tokenizer, "_sglang_cached_special_tokens"))
-            self.assertTrue(hasattr(tokenizer, "_sglang_cached_special_ids"))
+            self.assertTrue(hasattr(tokenizer, "_flliper_cached_special_tokens"))
+            self.assertTrue(hasattr(tokenizer, "_flliper_cached_special_ids"))
 
-        self.assertFalse(hasattr(tokenizer, "_sglang_cached_special_tokens"))
-        self.assertFalse(hasattr(tokenizer, "_sglang_cached_special_ids"))
+        self.assertFalse(hasattr(tokenizer, "_flliper_cached_special_tokens"))
+        self.assertFalse(hasattr(tokenizer, "_flliper_cached_special_ids"))
 
     def test_double_patch_is_idempotent(self):
         tokenizer = _load_tokenizer()
@@ -147,7 +147,7 @@ class TestPatchTokenizerUnitTest(unittest.TestCase):
         _SpecialTokensCachePatcher.patch(tokenizer)
 
         self.assertTrue(
-            getattr(type(tokenizer), "_sglang_special_tokens_patched", False)
+            getattr(type(tokenizer), "_flliper_special_tokens_patched", False)
         )
 
         unpatch_tokenizer(tokenizer)

@@ -11,14 +11,14 @@ the collectives" stops holding by construction and becomes a claim to check.
 
 import pytest
 
-from sglang.srt.form_a_boot_gate import (
+from flliper.srt.form_a_boot_gate import (
     FormARanksDisagree,
     _encode,
     assert_ranks_agree,
     declare_layer_collectives,
     gate_form_a_boot,
 )
-from sglang.srt.rank_role import RankRolePlan
+from flliper.srt.rank_role import RankRolePlan
 
 FORM_A = RankRolePlan(("host", "worker", "worker"))
 
@@ -112,6 +112,6 @@ def test_the_gate_and_the_desk_probe_cannot_drift_apart():
     collectives' is how a gate comes to pass while the boot hangs."""
     import inspect
 
-    from sglang.srt import form_a_boot_gate
+    from flliper.srt import form_a_boot_gate
 
     assert "trace_layer" in inspect.getsource(form_a_boot_gate)

@@ -198,7 +198,7 @@ HOSTPID=""
 #
 # One template, and the speculative block is the only interpolated part. The
 # environment is the reference recipe of _bar1_host_boot.sh minus the three
-# SGLANG_BARLINK* lines: the transport is plain NCCL on every arm here, because
+# FLLIPER_BARLINK* lines: the transport is plain NCCL on every arm here, because
 # the question is which DRAFTER is better on structured text and a second
 # moving part would have to be defended in every cell of the table.
 #
@@ -213,7 +213,7 @@ s16_write_boot_script() {
     hm="$(host_path "$TARGET")" || return 2
     hcache="$(host_path "${BAR1_EXTCACHE:-/spinning/torch-ext-cache}")" || return 2
     [ -n "$MAX_TOTAL_TOKENS" ] && pin="--max-total-tokens $MAX_TOTAL_TOKENS"
-    [ -n "$MLP_VECTOR" ] && mlpenv="SGLANG_UNEVEN_MLP_VECTOR=$MLP_VECTOR \\
+    [ -n "$MLP_VECTOR" ] && mlpenv="FLLIPER_UNEVEN_MLP_VECTOR=$MLP_VECTOR \\
 "
 
     cat > "$out" <<EOF
@@ -226,11 +226,11 @@ cd $hw
 PYTHONPATH=$hw/python:$hv/lib/python3.12/site-packages \\
 LD_LIBRARY_PATH=$hv/lib/python3.12/site-packages/nvidia/cu13/lib \\
 CUDA_HOME=$hv/lib/python3.12/site-packages/nvidia/cu13 \\
-${mlpenv}SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 \\
-SGLANG_MAMBA_SSM_DTYPE=bfloat16 FLASHINFER_DISABLE_VERSION_CHECK=1 \\
+${mlpenv}FLLIPER_UNEVEN_DCP=1 FLLIPER_UNEVEN_DCP_WEIGHTED=1 \\
+FLLIPER_MAMBA_SSM_DTYPE=bfloat16 FLASHINFER_DISABLE_VERSION_CHECK=1 \\
 TORCH_EXTENSIONS_DIR=$hcache \\
 TORCH_CUDA_ARCH_LIST="8.6;12.0" MAX_JOBS=4 \\
-setsid /spinning/miniforge3_local_install/bin/python3.12 -m sglang.launch_server \\
+setsid /spinning/miniforge3_local_install/bin/python3.12 -m flliper.launch_server \\
   --model-path $hm \\
   --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \\
   --rank-auto-reserve-mib $RESERVE \\

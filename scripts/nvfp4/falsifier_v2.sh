@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Falsifier v2 for the ARM 1 stopper. v1 (plain even --tp-size 3) never got to
-# ask the question: stock sglang refuses an even split across mismatched cards
+# ask the question: stock flliper refuses an even split across mismatched cards
 # ("The memory capacity is unbalanced", pre_model_load 19.23 vs local 30.55 GB)
 # — which is the very thing this fork's uneven TP exists to avoid. So v2 stays
 # on the uneven placement path and varies ONLY the ratio, which is the single
@@ -28,7 +28,7 @@
 #      B is deliberately still UNEVEN. The even split cannot be used as the
 #      control on this rig at all: --rank-tp-ratio 1,1,1 is refused ("identical
 #      entries is the even split -- omit the flag instead") and omitting the
-#      flag runs into stock sglang's balance guard on mismatched cards. So the
+#      flag runs into stock flliper's balance guard on mismatched cards. So the
 #      control has to be an uneven ratio that happens to satisfy the kernel's
 #      constraint, which is exactly what 4,1,1 is.
 #

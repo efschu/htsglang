@@ -35,8 +35,8 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -47,17 +47,17 @@ def _heavy():
     agent-test cgroup is capped at 3 GiB and shared)."""
     global gdn_backend, GDNAttnBackend, GDNKernelDispatcher, TritonGDNKernel
     global LinearAttnKernelBackend, MambaPool, ForwardMode
-    from sglang.srt.layers.attention.linear import gdn_backend
-    from sglang.srt.layers.attention.linear.gdn_backend import (
+    from flliper.srt.layers.attention.linear import gdn_backend
+    from flliper.srt.layers.attention.linear.gdn_backend import (
         GDNAttnBackend,
         GDNKernelDispatcher,
     )
-    from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
+    from flliper.srt.layers.attention.linear.kernels.gdn_triton import (
         TritonGDNKernel,
     )
-    from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
-    from sglang.srt.mem_cache.memory_pool import MambaPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from flliper.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+    from flliper.srt.mem_cache.memory_pool import MambaPool
+    from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
 
 class TestDispatcherCapability(CustomTestCase):
@@ -205,7 +205,7 @@ _WORKER = textwrap.dedent("""
     os.environ["TRITON_INTERPRET"] = "1"
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "99")
     import torch
-    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+    from flliper.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
 

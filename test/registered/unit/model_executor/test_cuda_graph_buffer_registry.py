@@ -21,12 +21,12 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+from flliper.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
     PaddingPolicy,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -586,7 +586,7 @@ class TestPoolBackedAlloc(unittest.TestCase):
     the legacy DecodeInputBuffers during migration)."""
 
     def setUp(self):
-        from sglang.srt.model_executor import input_buffers
+        from flliper.srt.model_executor import input_buffers
 
         input_buffers._forward_input_buffer_pool.clear()
 
@@ -617,7 +617,7 @@ class TestPoolBackedAlloc(unittest.TestCase):
         )
 
     def test_sharing_is_independent_of_registration_order(self):
-        from sglang.srt.model_executor import input_buffers
+        from flliper.srt.model_executor import input_buffers
 
         def _ptrs(first_tokens, second_tokens):
             input_buffers._forward_input_buffer_pool.clear()
@@ -648,12 +648,12 @@ class TestBuildDecodeRegistry(unittest.TestCase):
     ``DecodeInputBuffers.populate_from_forward_batch``."""
 
     def setUp(self):
-        from sglang.srt.model_executor import input_buffers
+        from flliper.srt.model_executor import input_buffers
 
         input_buffers._forward_input_buffer_pool.clear()
 
     def test_factory_slot_set_and_padding(self):
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
 
@@ -738,7 +738,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertEqual(fb_view.seq_lens.shape[0], padded_bs)
 
     def test_source_adopts_buffers(self):
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
 
@@ -771,10 +771,10 @@ class TestBuildDecodeRegistry(unittest.TestCase):
 
     def test_num_token_non_padded_gathered_dp_branch(self):
 
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
-        from sglang.srt.runtime_context import get_parallel
+        from flliper.srt.runtime_context import get_parallel
 
         ntnp = torch.zeros(1, dtype=torch.int32)
         src = SimpleNamespace(
@@ -816,7 +816,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         # register_global_num_tokens=False (eager) excludes the computed
         # global_num_tokens_* slots so the batch's DP values are carried, not
         # clobbered by the zero buffer extract_buffer would otherwise expose.
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
 
@@ -868,7 +868,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertTrue(reg2.has_slot("global_num_tokens_for_logprob_gpu"))
 
     def test_source_with_ngram_registers_structured_slots(self):
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
 
@@ -917,7 +917,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         )
 
     def test_source_with_pp_registers_proxy_slots(self):
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
 
@@ -964,7 +964,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertTrue(torch.all(hs[3:] == 0))  # tail untouched
 
     def test_source_with_canary_registers_bs_slots(self):
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
 
@@ -1023,7 +1023,7 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         return SimpleNamespace(**base)
 
     def test_core_token_slots_zero_tail_and_copy_head(self):
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
         )
 
@@ -1059,7 +1059,7 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         self.assertTrue(torch.all(ids[8:] == 7))  # beyond the bucket: untouched
 
     def test_num_token_non_padded_scalar_copy(self):
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
         )
 
@@ -1103,7 +1103,7 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         )
 
     def test_multimodal_input_embeds_reset_only(self):
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
         )
 
@@ -1144,7 +1144,7 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         self.assertTrue(torch.all(mr[:, 3:8] == 0))
 
     def test_mamba_bs_axis_copy(self):
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
         )
 
@@ -1176,7 +1176,7 @@ class TestBuildPrefillRegistry(unittest.TestCase):
 
     def test_source_none_owns_allocated_buffers(self):
         # source=None -> the registry allocates (owns) every slot.
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
         )
 
@@ -1214,7 +1214,7 @@ class TestBuildPrefillRegistry(unittest.TestCase):
     def test_register_input_embeds_false_keeps_mrope_carries_embeds(self):
         # register_input_embeds=False (eager): mrope stays registered but
         # input_embeds is carried from the FB (a read input), not a zero buffer.
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
         )
 
@@ -1283,7 +1283,7 @@ class TestComputedSlots(unittest.TestCase):
     (copy_from_fb=False + post_fill fill)."""
 
     def test_num_token_non_padded_copy_path(self):
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
 
@@ -1311,7 +1311,7 @@ class TestComputedSlots(unittest.TestCase):
         )
 
     def test_global_num_tokens_fill_path(self):
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+        from flliper.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
 

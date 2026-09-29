@@ -54,7 +54,7 @@ def make_github_request(url, token, method="GET", data=None):
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
-        # "User-Agent": "sglang-ci",
+        # "User-Agent": "flliper-ci",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 

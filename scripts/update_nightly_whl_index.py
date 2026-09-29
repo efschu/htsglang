@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Update the wheel index for nightly SGLang releases.
+Update the wheel index for nightly fLLiper releases.
 
-This script generates a PyPI-compatible index.html file at cu{version}/sglang/index.html
+This script generates a PyPI-compatible index.html file at cu{version}/flliper/index.html
 containing all historical nightly builds, ordered by commit count (newest first).
 
 The CUDA version is specified via the --cuda-version argument.
@@ -30,7 +30,7 @@ def update_wheel_index(
 ):
     """Update the wheel index for nightly releases.
 
-    Creates an index at cu{version}/sglang/index.html containing all historical nightlies.
+    Creates an index at cu{version}/flliper/index.html containing all historical nightlies.
 
     Args:
         commit_hash: Short git commit hash (e.g., 'c5f1e86')
@@ -61,16 +61,16 @@ def update_wheel_index(
         release_tag = f"nightly-{commit_hash}"
 
     # Create directory structure following PEP 503
-    # /cu{version}/index.html -> links to sglang/ and sgl-kernel/
-    # /cu{version}/sglang/index.html -> contains wheel links
+    # /cu{version}/index.html -> links to flliper/ and sgl-kernel/
+    # /cu{version}/flliper/index.html -> contains wheel links
     cuda_dir = whl_repo_dir / cuda_version
     cuda_dir.mkdir(parents=True, exist_ok=True)
 
-    sglang_dir = cuda_dir / "sglang"
-    sglang_dir.mkdir(parents=True, exist_ok=True)
+    flliper_dir = cuda_dir / "flliper"
+    flliper_dir.mkdir(parents=True, exist_ok=True)
 
     root_index = cuda_dir / "index.html"
-    package_index = sglang_dir / "index.html"
+    package_index = flliper_dir / "index.html"
 
     print(f"\nUpdating nightly wheel index")
     print(f"  Root index: {root_index}")
@@ -120,7 +120,7 @@ def update_wheel_index(
                 seen.add(filename)
                 unique_links.append(link)
 
-    # Update root index to include both sgl-kernel and sglang
+    # Update root index to include both sgl-kernel and flliper
     # Read existing packages from root index if it exists
     existing_packages = set()
     if root_index.exists():
@@ -130,8 +130,8 @@ def update_wheel_index(
             for match in re.finditer(r'<a href="([^"]+)/">', content):
                 existing_packages.add(match.group(1))
 
-    # Add sglang to the package list
-    existing_packages.add("sglang")
+    # Add flliper to the package list
+    existing_packages.add("flliper")
 
     # Write root index with all packages (sorted for consistency)
     with open(root_index, "w") as f:
@@ -144,7 +144,7 @@ def update_wheel_index(
     # Write package index in minimal format (matching production sgl-kernel index)
     with open(package_index, "w") as f:
         f.write("<!DOCTYPE html>\n")
-        f.write(f"<h1>SGLang Nightly Wheels ({cuda_version})</h1>\n")
+        f.write(f"<h1>fLLiper Nightly Wheels ({cuda_version})</h1>\n")
         # Write links only
         f.write("\n".join(unique_links))
         f.write("\n")
@@ -152,13 +152,13 @@ def update_wheel_index(
     print(f"  Written {len(unique_links)} total wheels to {package_index}")
     print(f"\nDone! Users can install with:")
     print(
-        f"  pip install sglang --pre --extra-index-url https://sgl-project.github.io/whl/{cuda_version}/"
+        f"  pip install flliper --pre --extra-index-url https://sgl-project.github.io/whl/{cuda_version}/"
     )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Update wheel index for nightly SGLang releases"
+        description="Update wheel index for nightly fLLiper releases"
     )
     parser.add_argument(
         "--commit-hash",

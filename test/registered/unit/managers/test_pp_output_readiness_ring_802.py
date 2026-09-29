@@ -64,7 +64,7 @@ import time
 import types
 import unittest
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 WORLD = 3
 PP0, PP1, PP2 = 0, 1, 2
@@ -102,8 +102,8 @@ def _worker(rank, counter_dir, store_file, mode, out):
     import torch
     import torch.distributed as dist
 
-    from sglang.srt.managers.phase_flip_counters import CHAN_DICT, PhaseFlipCounters
-    from sglang.srt.managers.scheduler_pp_mixin import (
+    from flliper.srt.managers.phase_flip_counters import CHAN_DICT, PhaseFlipCounters
+    from flliper.srt.managers.scheduler_pp_mixin import (
         ENV_PROXY_READINESS_BUDGET,
         SchedulerPPMixin,
     )
@@ -274,7 +274,7 @@ class PPOutputReadinessRing802(CustomTestCase):
         on a boot without --enable-phase-flip there is no side channel, so
         the gate must return without touching anything. No wire, no group,
         no counters -- exactly what the reference launch command produces."""
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         h = types.SimpleNamespace()
         h._pp_wait_for_dict_readiness = types.MethodType(

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     Bar1CollectiveAborted,
     BarlinkBar1Transport,
 )
@@ -124,7 +124,7 @@ def test_untripped_window_excludes_the_host_abort_word():
     msg = _message(pending=0, captured=True, window=_Window())
     assert "was NOT set, which excludes it" in msg
     assert "A peer did not arrive." in msg
-    assert "SGLANG_BARLINK_BAR1_CAP_CYCLES=60000000000" in msg
+    assert "FLLIPER_BARLINK_BAR1_CAP_CYCLES=60000000000" in msg
     # No unresolved disjunction.
     assert "or the host abort word was set" not in msg
 

@@ -32,8 +32,8 @@ import math
 
 import pytest
 
-from sglang.srt.managers.regime_classifier import REGIME_MIXED, Stage
-from sglang.srt.managers.regime_ms_clock import (
+from flliper.srt.managers.regime_classifier import REGIME_MIXED, Stage
+from flliper.srt.managers.regime_ms_clock import (
     DEFAULT_FLIP_PAYBACK_S,
     MsClockError,
     MsStageDecider,
@@ -42,7 +42,7 @@ from sglang.srt.managers.regime_ms_clock import (
     flip_cost_pct,
     improvement_pct,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

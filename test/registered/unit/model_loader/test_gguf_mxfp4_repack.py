@@ -18,7 +18,7 @@ This file pins the thing that actually loads a model:
   block is self-contained, so repacking a slice and slicing a repack have to
   agree byte for byte;
 * the gates must be able to fail. An e8m0 exponent fp16 cannot hold is refused
-  by name, and ``SGLANG_GGUF_MXFP4_REPACK=0`` restores the refusal instead of
+  by name, and ``FLLIPER_GGUF_MXFP4_REPACK=0`` restores the refusal instead of
   quietly loading something unexecutable.
 
 The end-to-end test writes a small GGUF containing MXFP4 tensors and runs the
@@ -33,7 +33,7 @@ below silently stopped describing anything: the value tests failed against
 (``test_slice_of_repack_equals_repack_of_slice``, for instance) passed
 VACUOUSLY, because slicing the identity trivially commutes with it. The repack
 is nevertheless still shipped and still reachable -- the wheel is pinned
-separately from the source, and ``SGLANG_GGUF_MXFP4_NATIVE=0`` is the standing
+separately from the source, and ``FLLIPER_GGUF_MXFP4_NATIVE=0`` is the standing
 A/B lever -- so this file now forces that state in-process
 (``ForcesRepackPath``) instead of inheriting whatever the wheel happens to do.
 Deterministic on every wheel, and no capability skip that would sleep forever
@@ -51,15 +51,15 @@ import numpy as np
 from gguf.constants import GGMLQuantizationType as GGMLType
 from gguf.quants import dequantize, quantize
 
-from sglang.srt.environ import envs
-from sglang.srt.model_loader.gguf_mxfp4_repack import (
+from flliper.srt.environ import envs
+from flliper.srt.model_loader.gguf_mxfp4_repack import (
     log_gguf_repack_plan,
     repack_enabled,
     repack_source_types,
     repacked_gguf_bytes,
     repacked_gguf_type,
 )
-from sglang.test.gguf_mxfp4_state import ForcesRepackPath
+from flliper.test.gguf_mxfp4_state import ForcesRepackPath
 
 MXFP4_TYPE_SIZE = 17
 Q5_0_TYPE_SIZE = 22
@@ -190,7 +190,7 @@ class TestRepackGatesCanFail(ForcesRepackPath, unittest.TestCase):
     def test_opt_out_restores_the_refusal(self):
         self.assertTrue(repack_enabled())
         self.assertEqual(repack_source_types(), {GGMLType.MXFP4})
-        with envs.SGLANG_GGUF_MXFP4_REPACK.override(False):
+        with envs.FLLIPER_GGUF_MXFP4_REPACK.override(False):
             self.assertFalse(repack_enabled())
             # Nothing is claimed executable any more...
             self.assertEqual(repack_source_types(), set())
@@ -198,7 +198,7 @@ class TestRepackGatesCanFail(ForcesRepackPath, unittest.TestCase):
             # returning the unexecutable payload untouched.
             with self.assertRaises(RuntimeError) as caught:
                 repacked_gguf_type(GGMLType.MXFP4, "blk.3.ffn_down_exps.weight")
-            self.assertIn("SGLANG_GGUF_MXFP4_REPACK", str(caught.exception))
+            self.assertIn("FLLIPER_GGUF_MXFP4_REPACK", str(caught.exception))
             self.assertIn("blk.3.ffn_down_exps.weight", str(caught.exception))
             with self.assertRaises(RuntimeError):
                 repacked_gguf_bytes(
@@ -211,10 +211,10 @@ class TestRepackGatesCanFail(ForcesRepackPath, unittest.TestCase):
     def test_deepseek4_executability_gate_follows_the_opt_out(self):
         """The family gate is the user-visible refusal; it must track the
         switch, not carry a second opinion."""
-        from sglang.srt.model_loader.gguf_deepseek4 import _supported_ggml_types
+        from flliper.srt.model_loader.gguf_deepseek4 import _supported_ggml_types
 
         self.assertIn(GGMLType.MXFP4, _supported_ggml_types())
-        with envs.SGLANG_GGUF_MXFP4_REPACK.override(False):
+        with envs.FLLIPER_GGUF_MXFP4_REPACK.override(False):
             self.assertNotIn(GGMLType.MXFP4, _supported_ggml_types())
 
 
@@ -287,7 +287,7 @@ class TestIteratorEndToEnd(ForcesRepackPath, unittest.TestCase):
     """The real iterator over a real (small) file: no consumer sees type 39."""
 
     def test_stream_is_q5_0_everywhere_and_value_identical(self):
-        from sglang.srt.model_loader.weight_utils import gguf_quant_weights_iterator
+        from flliper.srt.model_loader.weight_utils import gguf_quant_weights_iterator
 
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "synthetic.gguf")
@@ -332,15 +332,15 @@ class TestIteratorEndToEnd(ForcesRepackPath, unittest.TestCase):
             )
 
     def test_iterator_refuses_when_the_repack_is_switched_off(self):
-        from sglang.srt.model_loader.weight_utils import gguf_quant_weights_iterator
+        from flliper.srt.model_loader.weight_utils import gguf_quant_weights_iterator
 
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "synthetic.gguf")
             _write_synthetic_gguf(path)
-            with envs.SGLANG_GGUF_MXFP4_REPACK.override(False):
+            with envs.FLLIPER_GGUF_MXFP4_REPACK.override(False):
                 with self.assertRaises(RuntimeError) as caught:
                     list(gguf_quant_weights_iterator(path, {}))
-        self.assertIn("SGLANG_GGUF_MXFP4_REPACK", str(caught.exception))
+        self.assertIn("FLLIPER_GGUF_MXFP4_REPACK", str(caught.exception))
 
     def test_repack_plan_is_logged_with_the_inflation(self):
         import gguf
@@ -357,7 +357,7 @@ class TestIteratorEndToEnd(ForcesRepackPath, unittest.TestCase):
             _Tensor(gguf.GGMLQuantizationType.MXFP4, 1140850688) for _ in range(45)
         ]
         with self.assertLogs(
-            "sglang.srt.model_loader.gguf_mxfp4_repack", level="INFO"
+            "flliper.srt.model_loader.gguf_mxfp4_repack", level="INFO"
         ) as logs:
             log_gguf_repack_plan(tensors)
         line = "\n".join(logs.output)
@@ -373,7 +373,7 @@ class TestIteratorEndToEnd(ForcesRepackPath, unittest.TestCase):
             n_bytes = 1024
             name = "t"
 
-        logger_name = "sglang.srt.model_loader.gguf_mxfp4_repack"
+        logger_name = "flliper.srt.model_loader.gguf_mxfp4_repack"
         with self.assertNoLogs(logger_name, level="INFO"):
             log_gguf_repack_plan([_Tensor()])
 
@@ -388,7 +388,7 @@ class TestRealFileBlocks(ForcesRepackPath, unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from sglang.srt.model_loader.gguf_shards import (
+        from flliper.srt.model_loader.gguf_shards import (
             iter_gguf_tensors,
             resolve_gguf_shard_paths,
         )

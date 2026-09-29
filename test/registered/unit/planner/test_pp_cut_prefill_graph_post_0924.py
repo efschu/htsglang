@@ -7,7 +7,7 @@ absolute budget the flip's credit ledger holds it to. The post lives on both
 sides of one seam, and this file pins that they are the SAME post:
 
 * the runtime (model_runner_kv_cache_mixin, absolute-budget branch) books
-  ``prefill graph pool`` from ``SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB``;
+  ``prefill graph pool`` from ``FLLIPER_KV_BUDGET_PREFILL_GRAPH_MIB``;
 * the P cut's pool model (PhasePoolModel.prefill_graph_pool_mib) subtracts the
   same per-stage vector in the one post arithmetic every capacity reads
   (_stage_free_after_residency), and names it in RUNTIME_BUDGET_POSTS so the
@@ -21,10 +21,10 @@ import os
 import re
 import unittest
 
-from sglang.srt.planner import pp_cut
-from sglang.srt.planner.pp_cut import PhasePoolModel, _stage_free_after_residency
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import pp_cut
+from flliper.srt.planner.pp_cut import PhasePoolModel, _stage_free_after_residency
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -91,7 +91,7 @@ class TestTheTwoSidesNameOnePost(CustomTestCase):
     def test_the_runtime_books_it_under_this_name_from_this_env(self):
         src = self._runtime_src()
         self.assertRegex(src, r"budget_posts\.append\(\(\"prefill graph pool\"")
-        self.assertIn('PREFILL_GRAPH_POOL_ENV = "SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB"', src)
+        self.assertIn('PREFILL_GRAPH_POOL_ENV = "FLLIPER_KV_BUDGET_PREFILL_GRAPH_MIB"', src)
         # read from the env constant, per rank, in the absolute-budget branch
         self.assertRegex(src, r"os\.environ\.get\(PREFILL_GRAPH_POOL_ENV")
 
@@ -102,7 +102,7 @@ class TestTheTwoSidesNameOnePost(CustomTestCase):
         self.assertEqual(fields["prefill graph pool"], "prefill_graph_pool_mib")
 
     def test_the_launcher_hands_one_vector_to_both(self):
-        from sglang.srt.weg2 import launcher as L
+        from flliper.srt.pdflip import launcher as L
 
         src = open(L.__file__).read()
         # the pool model and the env are built from the same call

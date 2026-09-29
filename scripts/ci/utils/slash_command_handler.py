@@ -444,7 +444,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         return False
 
 
-MULTIMODAL_TEST_DIR = "python/sglang/multimodal_gen/test"
+MULTIMODAL_TEST_DIR = "python/flliper/multimodal_gen/test"
 
 MULTIMODAL_PATH_TO_RUNNER = {
     "2_gpu": "2-gpu-h100",
@@ -528,7 +528,7 @@ def expand_glob_spec(file_part):
     matches = set()
     if "/" in pat:
         # Path-ful pattern. Glob from the repo root (handles fully qualified
-        # multimodal paths like python/sglang/multimodal_gen/test/**/test_*.py)
+        # multimodal paths like python/flliper/multimodal_gen/test/**/test_*.py)
         # and under test/ (handles test/-relative patterns like
         # registered/attention/test_*.py).
         for base in (".", "test"):
@@ -585,14 +585,14 @@ def resolve_test_file(file_part):
     - Full path: test/registered/core/test_srt_endpoint.py
     - Relative to test/: registered/core/test_srt_endpoint.py
     - Bare filename: test_srt_endpoint.py (glob-matched, must be unique)
-    - Multimodal paths: python/sglang/multimodal_gen/test/server/test_server_a.py
+    - Multimodal paths: python/flliper/multimodal_gen/test/server/test_server_a.py
 
     Returns (resolved_path, is_multimodal, error_message). On success error_message is None.
     """
     # Check if it's explicitly a multimodal path
     multimodal_prefixes = [
-        "python/sglang/multimodal_gen/test/",
-        "sglang/multimodal_gen/test/",
+        "python/flliper/multimodal_gen/test/",
+        "flliper/multimodal_gen/test/",
         "multimodal_gen/test/",
     ]
     for prefix in multimodal_prefixes:
@@ -600,7 +600,7 @@ def resolve_test_file(file_part):
             full_path = (
                 file_part
                 if file_part.startswith("python/")
-                else f"python/sglang/multimodal_gen/test/{file_part[len(prefix):]}"
+                else f"python/flliper/multimodal_gen/test/{file_part[len(prefix):]}"
             )
             if not os.path.isfile(full_path):
                 return None, False, f"File not found: `{full_path}`"

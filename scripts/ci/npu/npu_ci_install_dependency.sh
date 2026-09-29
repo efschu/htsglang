@@ -32,7 +32,7 @@ export UV_SYSTEM_PYTHON=true
 export UV_INDEX_STRATEGY=unsafe-best-match
 
 # Install Rust toolchain (needed by crates built via setuptools-rust, e.g. the
-# native gRPC extension bundled into the sglang wheel).
+# native gRPC extension bundled into the flliper wheel).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bash "${SCRIPT_DIR}/../utils/install_rustup.sh"
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
@@ -61,14 +61,14 @@ ${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirror
 
 
 ### Install sgl-kernel-npu
-SGLANG_KERNEL_NPU_TAG="2026.6.2"
+FLLIPER_KERNEL_NPU_TAG="2026.6.2"
 mkdir sgl-kernel-npu
-(cd sgl-kernel-npu && wget "${GITHUB_PROXY_URL:=""}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip" \
-&& unzip ./sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip \
+(cd sgl-kernel-npu && wget "${GITHUB_PROXY_URL:=""}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${FLLIPER_KERNEL_NPU_TAG}/sgl-kernel-npu-${FLLIPER_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip" \
+&& unzip ./sgl-kernel-npu-${FLLIPER_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip \
 && ${UV_PIP_INSTALL} ./deep_ep*.whl ./sgl_kernel_npu*.whl \
 && (cd "$(python3 -m pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so))
 
 
-### Install SGLang
+### Install fLLiper
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
 ${UV_PIP_INSTALL} -v -e "python[dev_npu]"

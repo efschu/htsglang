@@ -25,9 +25,9 @@ import inspect
 
 import pytest
 
-from sglang.srt import rank_role
-from sglang.srt.form_a_boot_gate import declare_layer_collectives
-from sglang.srt.rank_role import (
+from flliper.srt import rank_role
+from flliper.srt.form_a_boot_gate import declare_layer_collectives
+from flliper.srt.rank_role import (
     HOST,
     WORKER,
     SEAMS,
@@ -129,8 +129,8 @@ def test_the_captured_body_is_the_same_method_the_eager_forward_calls():
     ModelRunner.run_form_a_worker_route, and so does the eager forward. If
     someone inlines either one, this test fails and the drift is reported
     before a boot has to discover it as a hang."""
-    from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    from flliper.srt.model_executor.model_runner import ModelRunner
+    from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
 
@@ -147,7 +147,7 @@ def test_the_route_takes_its_host_rank_from_the_plan_not_from_a_literal():
     already carries."""
     src = inspect.getsource(
         __import__(
-            "sglang.srt.model_executor.model_runner", fromlist=["ModelRunner"]
+            "flliper.srt.model_executor.model_runner", fromlist=["ModelRunner"]
         ).ModelRunner.run_form_a_worker_route
     )
     assert "form_a_token_src_rank" in src
@@ -203,7 +203,7 @@ def test_capture_one_shape_routes_the_three_cases_in_the_right_order():
     """Read as SOURCE rather than executed: constructing a real runner needs
     a device. What must hold is the ORDER -- the weightless branch first (a
     rank is never both), then Form A, then the untouched classic path."""
-    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
 
@@ -223,10 +223,10 @@ def test_the_guard_is_inert_without_a_role_plan():
     """The classic-boot property, executed rather than asserted in prose:
     with no plan installed the guard returns before it can look at anything
     else -- so it cannot refuse a classic capture, whatever the body says."""
-    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
-    from sglang.srt.rank_role import installed_role_plan, set_form_a_role_plan
+    from flliper.srt.rank_role import installed_role_plan, set_form_a_role_plan
 
     assert installed_role_plan() is None, "a test left a plan installed"
     calls = []
@@ -254,7 +254,7 @@ def test_the_guard_is_inert_without_a_role_plan():
 
 
 def test_the_graph_mode_name_falls_back_without_inventing_a_mode():
-    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
 
@@ -289,7 +289,7 @@ def test_the_admission_predicate_is_the_same_predicate_on_both_roles():
     Form-A-only admission rule; the boot log line
     ("Form A worker: FIRST GRAPH REPLAY") is the metal-side counterpart.
     """
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from flliper.srt.model_executor.model_runner import ModelRunner
 
     src = inspect.getsource(ModelRunner._forward_raw)
     form_a_branch = src[src.index('getattr(self, "is_form_a_worker", False)') :]
@@ -305,7 +305,7 @@ def test_prefill_stays_eager_for_the_whole_form_a_group():
     """Rank-uniform by construction: the HOST takes the same exit, because
     the plan is installed on every rank. A phase captured on one role and
     eager on the other is the #631 wedge."""
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from flliper.srt.model_executor.model_runner import ModelRunner
 
     src = inspect.getsource(ModelRunner.init_prefill_cuda_graph)
     assert "form_a_role_plan_installed" in src
@@ -318,7 +318,7 @@ def test_flashinfer_autotune_is_refused_for_every_rank_under_form_a():
     """Its dummy run is a full model forward. Skipping it only on the worker
     would leave exactly the one-sided forward that hangs (the fnFA12 shape,
     one phase earlier), so the refusal is group-wide."""
-    from sglang.srt.model_executor.runner import flashinfer_autotune
+    from flliper.srt.model_executor.runner import flashinfer_autotune
 
     src = inspect.getsource(flashinfer_autotune.should_run_flashinfer_autotune)
     assert "installed_role_plan() is not None" in src
@@ -329,7 +329,7 @@ def test_the_worker_attention_backend_answers_the_graph_path_bookkeeping():
     """Every no-op the capture and replay path touches on this rank, as a
     list rather than as luck. An AttributeError here would surface as a
     capture abort with a stack that names flashinfer, not Form A."""
-    from sglang.srt.form_a_construction import FormAWorkerAttnBackend
+    from flliper.srt.form_a_construction import FormAWorkerAttnBackend
 
     for name in (
         "init_forward_metadata_out_graph",
@@ -352,11 +352,11 @@ def test_a_mid_serving_recapture_crashes_instead_of_wedging_the_group():
     rank that does not while a peer does blocks in the round. The trigger is
     rank-uniform, so reaching it at all means the ranks already disagree --
     CRASH/STOP, never hang."""
-    from sglang.srt.form_a_boot_gate import FormARanksDisagree
-    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    from flliper.srt.form_a_boot_gate import FormARanksDisagree
+    from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
-    from sglang.srt.rank_role import set_form_a_role_plan
+    from flliper.srt.rank_role import set_form_a_role_plan
 
     src = inspect.getsource(DecodeCudaGraphRunner.recapture_if_needed)
     # The refusal must sit BEFORE the mutation + capture, not after it.
@@ -400,7 +400,7 @@ def test_the_zero_addend_reasoning_is_recorded_where_the_capture_lives():
     carrier buffer. A later 'optimisation' that hoists the buffer out of the
     body corrupts the MoE input on replay two, silently and identically on
     every rank."""
-    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
 

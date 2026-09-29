@@ -11,7 +11,7 @@ event were silent:
   ``BasePrefixCache.update_eviction_metrics`` -- fed by every sibling cache --
   is never called on either mamba lineage.
 * a prefix match cut short because the anchor was gone was indistinguishable
-  from a genuine cache miss. The only report was the ``SGLANG_MAMBA_CKPT_DEBUG``
+  from a genuine cache miss. The only report was the ``FLLIPER_MAMBA_CKPT_DEBUG``
   line, default off and confined to the ``--mamba-checkpoint-interval``
   lineage; ``hi_mamba_radix_cache._match_post_processor`` had no emitter at all.
 
@@ -37,14 +37,14 @@ from array import array
 
 import torch
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.srt.mem_cache.mamba_slot_observer import (
+from flliper.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from flliper.srt.mem_cache.mamba_slot_observer import (
     DEFAULT_LOG_BURST,
     DEFAULT_LOG_RATE_PER_S,
     LOG_PREFIX,
@@ -52,11 +52,11 @@ from sglang.srt.mem_cache.mamba_slot_observer import (
     anchor_depth_tokens,
     probe_available,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15)
 
@@ -64,7 +64,7 @@ NUM_LAYERS = 8
 GLOBAL_INTERVAL = 4
 KV_POOL_SIZE = 512
 MAX_CONTEXT_LEN = 128
-CACHE_LOGGER = "sglang.srt.mem_cache.mamba_radix_cache"
+CACHE_LOGGER = "flliper.srt.mem_cache.mamba_radix_cache"
 
 
 # --------------------------------------------------------------------------
@@ -297,7 +297,7 @@ def _build_tree(mamba_size=6, max_num_reqs=10):
         i for i in range(GLOBAL_INTERVAL - 1, NUM_LAYERS, GLOBAL_INTERVAL)
     ]
     mamba_layers = [i for i in range(NUM_LAYERS) if i not in full_attention_layer_ids]
-    with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+    with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
         shape = Mamba2StateShape.create(
             tp_world_size=1,
             intermediate_size=512,
@@ -422,7 +422,7 @@ class TestTheEvictionIsNoLongerSilent743(CustomTestCase):
         tree, allocator, pool = _build_tree(mamba_size=4)
         _insert_cached(tree, allocator, pool, list(range(1000, 1008)))
         _insert_cached(tree, allocator, pool, list(range(2000, 2008)))
-        from sglang.srt.mem_cache.mamba_slot_observer import observer_of
+        from flliper.srt.mem_cache.mamba_slot_observer import observer_of
 
         observer_of(tree).rate_per_s = 0.0
         logger_obj = __import__("logging").getLogger(CACHE_LOGGER)

@@ -73,14 +73,14 @@ still drain, and no number from #856/#819 is recalibrated here -- those are
 re-measured on a window after this lands, not converted at the desk.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import dataclasses
 import unittest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PP_TO_TP,
     UNREACHABLE_FLIP_THRESHOLD,
     PhasePolicyConfig,
@@ -91,7 +91,7 @@ from sglang.srt.managers.phase_policy import (
     effective_pp_exit_term,
     stranded_decode_s,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # The booted values on the w38b/w39/w40 line, so every number below is live.
 N = 7004

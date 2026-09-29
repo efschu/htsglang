@@ -1,7 +1,7 @@
 """Unit test for the SM90 cutlass MXFP4 path in :class:`Mxfp4MoEMethod`.
 
 Builds a single-layer GPT-OSS-style MoE with random MXFP4 weights, drives the
-SGLang plumbing (``_process_weights_for_sm90_cutlass`` + ``_apply_sm90_cutlass``)
+fLLiper plumbing (``_process_weights_for_sm90_cutlass`` + ``_apply_sm90_cutlass``)
 and compares against a direct FlashInfer ``cutlass_fused_moe`` call with the
 same inputs. Both paths invoke the same SM90 kernel from FlashInfer PR #3084,
 so outputs must be bit-exact.
@@ -18,7 +18,7 @@ from contextlib import nullcontext
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
 
@@ -48,7 +48,7 @@ if not hasattr(flashinfer_fused_moe, "interleave_moe_weights_for_sm90_mixed_gemm
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from sglang.srt.utils import is_sm90_supported, is_sm100_supported
+from flliper.srt.utils import is_sm90_supported, is_sm100_supported
 
 if not is_sm90_supported() or is_sm100_supported():
     pytest.skip(
@@ -69,7 +69,7 @@ GROUP_SIZE = 32  # MXFP4 block size
 class _MockLayer:
     """Stand-in for ``FusedMoE`` carrying the attributes the SM90 helpers read.
 
-    We construct one by hand so the test stays out of SGLang's distributed init
+    We construct one by hand so the test stays out of fLLiper's distributed init
     path (``get_tp_group`` etc.).
     """
 
@@ -162,7 +162,7 @@ def _round_up(x, base):
 
 
 def _build_method(num_experts, hidden, inter):
-    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+    from flliper.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
     method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
     method._fi_kernel = "cutlass_sm90"
@@ -186,10 +186,10 @@ def _build_flashinfer_mxfp4_runner(num_experts, hidden, inter):
     and wires the runner with a minimal MoeRunnerConfig sufficient for the
     cutlass SM90 fused func, which only reads dispatch_output / quant_info.
     """
-    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
-    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-    from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
-    from sglang.srt.layers.moe.utils import MoeRunnerBackend
+    import flliper.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
+    from flliper.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from flliper.srt.layers.moe.moe_runner.runner import MoeRunner
+    from flliper.srt.layers.moe.utils import MoeRunnerBackend
 
     cfg = MoeRunnerConfig(
         num_experts=num_experts,
@@ -334,14 +334,14 @@ def test_process_weights_matches_direct_interleave(num_experts, hidden, inter):
 def test_apply_sm90_cutlass_matches_flashinfer_direct(
     tokens, num_experts, hidden, inter, top_k, monkeypatch
 ):
-    """End-to-end: SGLang's ``_apply_sm90_cutlass`` must produce the same
+    """End-to-end: fLLiper's ``_apply_sm90_cutlass`` must produce the same
     output as a direct FlashInfer ``cutlass_fused_moe`` call fed with the
     same processed weights / scales / biases. The processing pipeline is
     covered separately by ``test_process_weights_matches_direct_interleave``;
     here we just verify that ``apply`` calls the kernel with the right
     arguments (incl. input padding + output trim)."""
-    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
-    import sglang.srt.layers.quantization.mxfp4 as mxfp4_mod
+    import flliper.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
+    import flliper.srt.layers.quantization.mxfp4 as mxfp4_mod
 
     # Bypass symmetric-memory / TP-group in both the legacy quant_method and
     # the new fused-func module (where the kernel call now lives).
@@ -360,14 +360,14 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
     topk_w, topk_i = _make_topk(tokens, num_experts, top_k)
 
-    # ---- SGLang path ----
+    # ---- fLLiper path ----
     layer = _build_mock_layer(
         num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
     )
     method = _build_method(num_experts, hidden, inter)
     method._process_weights_for_sm90_cutlass(layer)
 
-    out_sglang = method._apply_sm90_cutlass(
+    out_flliper = method._apply_sm90_cutlass(
         layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
     ).hidden_states
 
@@ -405,9 +405,9 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
         out_ref_padded[:, :hidden].contiguous() if K_pad != hidden else out_ref_padded
     )
 
-    assert torch.equal(out_sglang, out_ref), (
-        f"SGLang vs FlashInfer-direct mismatch; "
-        f"max abs diff = {(out_sglang.float() - out_ref.float()).abs().max().item():.4g}"
+    assert torch.equal(out_flliper, out_ref), (
+        f"fLLiper vs FlashInfer-direct mismatch; "
+        f"max abs diff = {(out_flliper.float() - out_ref.float()).abs().max().item():.4g}"
     )
 
 
@@ -473,14 +473,14 @@ def _make_random_dsv4_mxfp4(num_experts, hidden, inter, seed=0):
 def test_dsv4_apply_matches_flashinfer_direct(
     tokens, num_experts, hidden, inter, top_k, monkeypatch
 ):
-    """End-to-end: SGLang's DSv4 ``Mxfp4FlashinferCutlassMoEMethod.apply``
+    """End-to-end: fLLiper's DSv4 ``Mxfp4FlashinferCutlassMoEMethod.apply``
     output must match a direct FlashInfer ``cutlass_fused_moe`` call with
     the equivalent reorder + scale-cast + interleave applied manually."""
     from types import SimpleNamespace
 
-    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
-    import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as ds_mod
-    from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
+    import flliper.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
+    import flliper.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as ds_mod
+    from flliper.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
 
     # Bypass symmetric-memory / TP-group stack in the new fused-func module
     # (where DSv4 ``apply`` now dispatches the kernel call through).
@@ -494,7 +494,7 @@ def test_dsv4_apply_matches_flashinfer_direct(
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
     topk_w, topk_i = _make_topk(tokens, num_experts, top_k)
 
-    # ---- SGLang DSv4 path ----
+    # ---- fLLiper DSv4 path ----
     method = ds_mod.Mxfp4FlashinferCutlassMoEMethod.__new__(
         ds_mod.Mxfp4FlashinferCutlassMoEMethod
     )
@@ -523,7 +523,7 @@ def test_dsv4_apply_matches_flashinfer_direct(
 
     method.process_weights_after_loading(layer)
 
-    out_sglang = method.apply(
+    out_flliper = method.apply(
         layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
     ).hidden_states
 
@@ -561,10 +561,10 @@ def test_dsv4_apply_matches_flashinfer_direct(
         output=out_ref,
     )
 
-    assert torch.equal(out_sglang, out_ref), (
-        f"DSv4 SGLang vs FlashInfer-direct mismatch; "
+    assert torch.equal(out_flliper, out_ref), (
+        f"DSv4 fLLiper vs FlashInfer-direct mismatch; "
         f"max abs diff = "
-        f"{(out_sglang.float() - out_ref.float()).abs().max().item():.4g}"
+        f"{(out_flliper.float() - out_ref.float()).abs().max().item():.4g}"
     )
 
 
@@ -574,7 +574,7 @@ class _MockDispatchOutput:
     (an isinstance check) returns True without distributed init."""
 
     def __init__(self, hidden_states, topk_weights, topk_ids):
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        from flliper.srt.layers.moe.topk import StandardTopKOutput
 
         self.hidden_states = hidden_states
         # router_logits is unused by Mxfp4FlashinferCutlassMoEMethod.apply;

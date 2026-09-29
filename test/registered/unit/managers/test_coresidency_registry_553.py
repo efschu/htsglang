@@ -27,7 +27,7 @@ Hermetic: pure data in, ranked view out. No CUDA, no registries touched.
 
 import unittest
 
-from sglang.srt.managers.coresidency_registry import (
+from flliper.srt.managers.coresidency_registry import (
     ORIGIN_ASSET,
     ORIGIN_DIAL,
     ReclaimSource,
@@ -213,7 +213,7 @@ class TestItReadsTheRealRegistriesByDefault(unittest.TestCase):
     """The defaults must point at the real thing, or this bridge is a toy."""
 
     def test_the_default_accessors_resolve(self):
-        from sglang.srt.managers import coresidency_registry as m
+        from flliper.srt.managers import coresidency_registry as m
 
         self.assertTrue(callable(m._default_dial_participants))
         self.assertTrue(callable(m._default_asset_classes))
@@ -253,7 +253,7 @@ class TestCut2TheProbesAreWired(unittest.TestCase):
 
     def test_an_unmeasurable_dial_probe_refuses_by_name(self):
         """THE #606 PIN. Not 0 bytes; a named refusal."""
-        from sglang.srt.managers.coresidency_registry import ProbeUnavailable
+        from flliper.srt.managers.coresidency_registry import ProbeUnavailable
 
         def _blind(participant):
             raise ProbeUnavailable("unbooted pool")
@@ -264,7 +264,7 @@ class TestCut2TheProbesAreWired(unittest.TestCase):
         self.assertIn("unbooted pool", view.unavailable[0].reason)
 
     def test_an_unmeasurable_asset_probe_refuses_by_name(self):
-        from sglang.srt.managers.coresidency_registry import ProbeUnavailable
+        from flliper.srt.managers.coresidency_registry import ProbeUnavailable
 
         def _blind(name, descriptor):
             raise ProbeUnavailable("no offload register on this process")
@@ -283,7 +283,7 @@ class TestCut2TheProbesAreWired(unittest.TestCase):
         )
         self.assertIn("floor", measured.unavailable[0].reason)
 
-        from sglang.srt.managers.coresidency_registry import ProbeUnavailable
+        from flliper.srt.managers.coresidency_registry import ProbeUnavailable
 
         def _blind(p):
             raise ProbeUnavailable("unmeasurable row width")
@@ -321,7 +321,7 @@ class TestCut2TheDialProbeReadsLive(unittest.TestCase):
             return [torch.zeros(4, 8)]
 
     def _probe(self, pool, floor):
-        from sglang.srt.managers.vram_dial import reclaimable_bytes_for
+        from flliper.srt.managers.vram_dial import reclaimable_bytes_for
 
         return reclaimable_bytes_for(type("P", (), {"pool": pool})(), floor)
 
@@ -347,7 +347,7 @@ class TestCut2TheRegisterProbeExcludesWhatItMustNot(unittest.TestCase):
     """``OffloadRegister.reclaimable_bytes``: resident AND not hot."""
 
     def _register(self, items):
-        from sglang.srt.model_executor.offload_register import OffloadRegister
+        from flliper.srt.model_executor.offload_register import OffloadRegister
 
         reg = OffloadRegister.__new__(OffloadRegister)
         import threading

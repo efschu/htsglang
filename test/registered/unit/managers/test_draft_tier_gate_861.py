@@ -21,9 +21,9 @@ import inspect
 
 import pytest
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache import hicache_phase_binding as binding
-from sglang.srt.mem_cache import hicache_phase_guard as guard
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache import hicache_phase_binding as binding
+from flliper.srt.mem_cache import hicache_phase_guard as guard
 
 
 class Stub:
@@ -136,8 +136,8 @@ def test_can_fail_term3_matching_generation_stays_open():
 # ONE gate; the pin counts them so a seventh site reading `has_draft` directly
 # is still caught.
 CONSUME_SITES = {
-    "sglang.srt.managers.cache_controller": 5,
-    "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller": 3,
+    "flliper.srt.managers.cache_controller": 5,
+    "flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller": 3,
 }
 
 

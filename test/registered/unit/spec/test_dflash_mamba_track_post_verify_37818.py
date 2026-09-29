@@ -26,8 +26,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sglang.srt.runtime_context as rc
-from sglang.srt.speculative import dflash_worker_v2 as dfw
+import flliper.srt.runtime_context as rc
+from flliper.srt.speculative import dflash_worker_v2 as dfw
 
 
 class _Backend:

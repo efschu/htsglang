@@ -17,7 +17,7 @@ torch.distributed, no process group.
 """
 
 import pytest
-from sglang.srt.distributed import parallel_state as ps
+from flliper.srt.distributed import parallel_state as ps
 
 # --------------------------------------------------------------------------
 # Membership

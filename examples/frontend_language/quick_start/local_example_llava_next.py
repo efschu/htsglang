@@ -2,8 +2,8 @@
 Usage: python3 local_example_llava_next.py
 """
 
-import sglang as sgl
-from sglang.lang.chat_template import get_chat_template
+import flliper as sgl
+from flliper.lang.chat_template import get_chat_template
 
 
 @sgl.function

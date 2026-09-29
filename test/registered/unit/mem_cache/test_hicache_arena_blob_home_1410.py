@@ -8,8 +8,8 @@ import types
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache import canonical_page_store as cps
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+from flliper.srt.mem_cache import canonical_page_store as cps
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile
 
 
 def _store(tmp_path):

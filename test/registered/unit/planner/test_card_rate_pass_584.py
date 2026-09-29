@@ -29,9 +29,9 @@ from pathlib import Path
 
 import pytest
 
-from sglang.srt.planner import card_rate_pass as crp
-from sglang.srt.planner.card_library import CardLibrary
-from sglang.srt.rigmon.card_probe import CardProbeMeasurement, CardProbeProfile
+from flliper.srt.planner import card_rate_pass as crp
+from flliper.srt.planner.card_library import CardLibrary
+from flliper.srt.rigmon.card_probe import CardProbeMeasurement, CardProbeProfile
 
 # The two cards this rig actually carries, with the rates a previous shift
 # measured on them (evidence-631/s50/gate_check.py). Used as fixtures only --
@@ -74,7 +74,7 @@ def rig_profile():
 @pytest.fixture
 def lib_path(tmp_path, monkeypatch):
     p = tmp_path / "card_library.json"
-    monkeypatch.setenv("SGLANG_CARD_LIBRARY", str(p))
+    monkeypatch.setenv("FLLIPER_CARD_LIBRARY", str(p))
     return p
 
 
@@ -83,14 +83,14 @@ def lib_path(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_t1_library_path_resolves_and_is_overridable(tmp_path, monkeypatch):
-    monkeypatch.delenv("SGLANG_CARD_LIBRARY", raising=False)
+    monkeypatch.delenv("FLLIPER_CARD_LIBRARY", raising=False)
     default = crp.card_library_path()
     assert default.endswith(crp.CARD_LIBRARY_BASENAME)
     # It must live beside the #213 probe cache the rates are projected from.
-    from sglang.srt.rigmon.card_probe import CACHE_DIR
+    from flliper.srt.rigmon.card_probe import CACHE_DIR
     assert str(Path(default).parent) == str(Path(CACHE_DIR))
 
-    monkeypatch.setenv("SGLANG_CARD_LIBRARY", str(tmp_path / "elsewhere.json"))
+    monkeypatch.setenv("FLLIPER_CARD_LIBRARY", str(tmp_path / "elsewhere.json"))
     assert crp.card_library_path() == str(tmp_path / "elsewhere.json")
     # An explicit argument beats the environment.
     assert crp.card_library_path(str(tmp_path / "explicit.json")).endswith(
@@ -100,7 +100,7 @@ def test_t1_library_path_resolves_and_is_overridable(tmp_path, monkeypatch):
 
 def test_t1b_no_seed_card_carries_a_measured_rate(self_check=None):
     """The premise of the whole ticket, pinned so it cannot rot silently."""
-    from sglang.srt.planner.card_library import SEED_CARDS
+    from flliper.srt.planner.card_library import SEED_CARDS
 
     rated = [
         s.name for s in SEED_CARDS.values() if s.gemm_tflops or s.membw_gbs
@@ -164,7 +164,7 @@ def test_t4_solver_loads_and_uses_the_measured_library(rig_profile, lib_path):
     ``CardLibrary()`` this test fails -- which is the exact regression #485
     spent a window discovering.
     """
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     report = crp.run_card_rate_pass(path=str(lib_path), profile=rig_profile)
     assert report.wrote, report.format_text()
@@ -189,7 +189,7 @@ def test_t5_solver_refuses_loudly_when_no_pass_has_run(lib_path):
     so a fallback would price every stage from an absent number while looking
     like it had a catalog.
     """
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     assert not lib_path.exists()
     args = ServerArgs.__new__(ServerArgs)
@@ -206,7 +206,7 @@ def test_t5_solver_refuses_loudly_when_no_pass_has_run(lib_path):
 
 def test_t6_a_library_without_this_card_still_refuses(rig_profile, lib_path):
     """A pass that covered other cards must not price this one."""
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     crp.run_card_rate_pass(
         path=str(lib_path),
@@ -271,7 +271,7 @@ def test_t10_throttled_measurement_is_recorded_not_dropped(lib_path):
 
 
 def test_t11_round_trips_through_the_real_library_format(rig_profile, lib_path):
-    from sglang.srt.planner.card_library import _canonical
+    from flliper.srt.planner.card_library import _canonical
 
     crp.run_card_rate_pass(path=str(lib_path), profile=rig_profile)
     lib = CardLibrary.load(str(lib_path))
@@ -348,7 +348,7 @@ def test_t13_census_records_the_uuid_alongside_the_name():
     """A name cannot identify a card on a rig with two of the same model."""
     import inspect
 
-    from sglang.srt.planner import residency_census
+    from flliper.srt.planner import residency_census
 
     src = inspect.getsource(residency_census)
     assert '"gpu_uuid"' in src, (

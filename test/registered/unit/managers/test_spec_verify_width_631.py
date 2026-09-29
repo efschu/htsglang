@@ -31,7 +31,7 @@ consumer further along.
 
 import torch
 
-from sglang.srt.managers.scheduler_components.batch_result_processor import (
+from flliper.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 

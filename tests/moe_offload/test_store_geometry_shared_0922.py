@@ -3,7 +3,7 @@
 `expert_store.shared_geometry()` existiert seit #91, und sein Docstring
 sagt woertlich "Gesetzt vom Launcher ueber ``STORE_GEOMETRY_ENV``". Der
 Launcher setzte sie nie -- im ganzen Baum stand kein einziger Schreiber
-(`grep -r SGLANG_MOE_EXPERT_STORE_GEOMETRY` fand nur expert_store.py).
+(`grep -r FLLIPER_MOE_EXPERT_STORE_GEOMETRY` fand nur expert_store.py).
 
 Also rechnete jede Ranggruppe ihre eigene Abbildung globale Id -> Slot auf
 DERSELBEN Datei. Genau das, was #91s eigener Kommentar als Gefahr
@@ -22,8 +22,8 @@ kein Beweis, und er verdeckte den fehlenden Schreiber drei Boots lang.
 
 import pytest
 
-from sglang.srt.weg2 import launcher as L
-from sglang.srt.layers.moe import expert_store as es
+from flliper.srt.pdflip import launcher as L
+from flliper.srt.layers.moe import expert_store as es
 
 
 EXTRA_D = ('--rank-role host,worker,worker --rank-moe-ratio 183,137,168 '
@@ -31,24 +31,24 @@ EXTRA_D = ('--rank-role host,worker,worker --rank-moe-ratio 183,137,168 '
            '--rank-gpu-memory-mib 29900,18500,18500 --page-size 64')
 
 
-def test_die_vektoren_kommen_aus_extra_d():
+def test_vectors_come_from_extra_d():
     assert L._argv_vector(EXTRA_D, "--rank-moe-ratio") == ["183", "137", "168"]
     assert L._argv_vector(EXTRA_D, "--rank-moe-resident-fraction") == [
         "0.12", "0.319", "0.284"]
 
 
-def test_gleichheitsform_wird_auch_gelesen():
+def test_equals_form_is_read_too():
     assert L._argv_vector("--rank-moe-ratio=1,2,3", "--rank-moe-ratio") == [
         "1", "2", "3"]
 
 
 @pytest.mark.parametrize("extra", ["", "--page-size 64", "--rank-moe-ratio"])
-def test_fehlende_flagge_gibt_none_nicht_leere_liste(extra):
+def test_missing_flag_gives_none_not_empty_list(extra):
     """Eine leere Liste waere vom Aufrufer nicht von 'fehlt' zu trennen."""
     assert L._argv_vector(extra, "--rank-moe-ratio") is None
 
 
-def test_der_leser_versteht_was_der_schreiber_schreibt():
+def test_reader_understands_what_writer_writes():
     """DIE NAHT, um die es geht: Schreiber und Leser an EINEM Strang.
 
     Der Test prueft nicht zwei Formate gegeneinander, sondern faehrt das
@@ -78,7 +78,7 @@ def test_der_leser_versteht_was_der_schreiber_schreibt():
     assert got_fracs == [0.12, 0.319, 0.284]
 
 
-def test_ohne_geometrie_bleibt_der_leser_bei_none():
+def test_without_geometry_reader_stays_none():
     """Der konservative Fall (#91): lieber keine als eine halbe Geometrie."""
     import os
     old = os.environ.get(es.STORE_GEOMETRY_ENV)

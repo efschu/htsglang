@@ -17,14 +17,14 @@ import math
 
 import pytest
 
-from sglang.srt.planner.layout_ladder import (
+from flliper.srt.planner.layout_ladder import (
     LadderInputs,
     arena_refill_ms,
     solve_fill_ladder,
     solve_layout_ladder,
     switch_payback_s,
 )
-from sglang.srt.planner.pp_cut import (
+from flliper.srt.planner.pp_cut import (
     PhasePoolModel,
     kv_mib_per_token_per_attn_layer_from_config,
     layer_families_from_config,

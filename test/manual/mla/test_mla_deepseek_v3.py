@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import is_cuda, is_hip, kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import is_cuda, is_hip, kill_process_tree
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -56,7 +56,7 @@ class TestMLADeepseekV3(CustomTestCase):
 class TestMLADeepseekV3DisableFusedFunc(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_CI_DISABLE_MOE_FUSED_FUNC"] = "1"
+        os.environ["FLLIPER_CI_DISABLE_MOE_FUSED_FUNC"] = "1"
         cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code", "--chunked-prefill-size", "256"]

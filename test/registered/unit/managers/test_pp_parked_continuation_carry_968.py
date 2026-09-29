@@ -57,16 +57,16 @@ from array import array
 
 import torch
 
-from sglang.srt.managers import scheduler_pp_mixin as m
-from sglang.srt.managers.pp_admission_congruence import (
+from flliper.srt.managers import scheduler_pp_mixin as m
+from flliper.srt.managers.pp_admission_congruence import (
     PPAdmissionCongruenceGuard,
     PPAdmissionDecision,
     build_pp_admission_decision,
 )
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.utils.common import Range
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.utils.common import Range
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

@@ -6,7 +6,7 @@
 
 The defect class, measured 2026-08-12: the boot script kept its own
 hand-maintained copy of the ship environment and drifted from the capture in
-seven keys, one of which (``SGLANG_UNEVEN_TOKEN_VECTOR``) put the KV token
+seven keys, one of which (``FLLIPER_UNEVEN_TOKEN_VECTOR``) put the KV token
 split at odds with the layout. The instance came up, answered ``/model_info``
 and never answered ``/generate``.
 
@@ -36,8 +36,8 @@ import subprocess
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -140,7 +140,7 @@ class TestNoPrivateCopyOfTheEnvironment(CustomTestCase):
     #: Set once here rather than re-derived: keys whose value is per boot and
     #: therefore cannot come from a capture.
     PER_BOOT = {"PYTHONPATH", "CUDA_VISIBLE_DEVICES",
-                "SGLANG_PHASE_FLIP_INSTANCE", "SGLANG_BOOT_COMMIT"}
+                "FLLIPER_PHASE_FLIP_INSTANCE", "FLLIPER_BOOT_COMMIT"}
 
     def test_the_script_declares_no_key_the_capture_owns(self):
         owned = set(_capture_pairs()) - self.PER_BOOT
@@ -190,15 +190,15 @@ class TestAssembledEnvironment(CustomTestCase):
 
     def test_the_ship_token_vector_is_what_the_boot_carries(self):
         """The single value that differed on the wedged boot."""
-        self.assertEqual(self.env.get("SGLANG_UNEVEN_TOKEN_VECTOR"), "14,10,8")
+        self.assertEqual(self.env.get("FLLIPER_UNEVEN_TOKEN_VECTOR"), "14,10,8")
 
     def test_the_five_keys_the_script_used_to_drop_are_present(self):
         want = {
-            "SGLANG_CORRIDOR_FLOOR_MIB": "1536",
-            "SGLANG_CORRIDOR_REBALANCE": "0",
-            "SGLANG_KV_BACKING_RELIEF": "1",
-            "SGLANG_SEAM_ENTRY_DELAY_BUDGET": "2",
-            "SGLANG_SEAM_ENTRY_MARGIN_MIB": "512",
+            "FLLIPER_CORRIDOR_FLOOR_MIB": "1536",
+            "FLLIPER_CORRIDOR_REBALANCE": "0",
+            "FLLIPER_KV_BACKING_RELIEF": "1",
+            "FLLIPER_SEAM_ENTRY_DELAY_BUDGET": "2",
+            "FLLIPER_SEAM_ENTRY_MARGIN_MIB": "512",
         }
         for k, v in want.items():
             self.assertEqual(self.env.get(k), v, f"{k} missing or wrong")
@@ -225,32 +225,32 @@ class TestAssembledEnvironment(CustomTestCase):
         self.assertIn("reason", text.lower())
 
     def test_the_argv_still_launches_the_server(self):
-        self.assertIn("sglang.launch_server", self.argv)
+        self.assertIn("flliper.launch_server", self.argv)
         self.assertIn("--enable-phase-flip", self.argv)
         self.assertIn("--port", self.argv)
 
 
 class TestTheGateActuallyFires(CustomTestCase):
     def test_a_stray_governed_key_in_the_operators_shell_refuses_the_boot(self):
-        """The failure mode the gate exists for: an SGLANG_* variable left
+        """The failure mode the gate exists for: an FLLIPER_* variable left
         over in the shell silently changing what boots."""
-        rc, out, err = _dry_run({"SGLANG_A_STRAY_KNOB": "1"})
+        rc, out, err = _dry_run({"FLLIPER_A_STRAY_KNOB": "1"})
         self.assertNotEqual(rc, 0, "an unsanctioned key must refuse the boot")
         text = out + err
-        self.assertIn("SGLANG_A_STRAY_KNOB", text)
+        self.assertIn("FLLIPER_A_STRAY_KNOB", text)
         self.assertIn("REFUSE", text.upper())
 
     def test_a_stray_key_is_refused_before_anything_is_launched(self):
-        rc, out, err = _dry_run({"SGLANG_A_STRAY_KNOB": "1"})
+        rc, out, err = _dry_run({"FLLIPER_A_STRAY_KNOB": "1"})
         self.assertNotEqual(rc, 0)
         self.assertNotIn("=== DRY RUN ARGV ===", out)
 
     def test_a_named_operator_tunable_is_accepted_and_announced(self):
-        rc, out, err = _dry_run({"SGLANG_UNEVEN_TOKEN_VECTOR": "7,39,18"})
+        rc, out, err = _dry_run({"FLLIPER_UNEVEN_TOKEN_VECTOR": "7,39,18"})
         self.assertEqual(rc, 0, f"{out}\n{err}")
         env, _ = _parse_dump(out)
-        self.assertEqual(env.get("SGLANG_UNEVEN_TOKEN_VECTOR"), "7,39,18")
-        self.assertIn("OVERRIDE SGLANG_UNEVEN_TOKEN_VECTOR", out + err)
+        self.assertEqual(env.get("FLLIPER_UNEVEN_TOKEN_VECTOR"), "7,39,18")
+        self.assertIn("OVERRIDE FLLIPER_UNEVEN_TOKEN_VECTOR", out + err)
 
     def test_a_declared_addition_not_in_the_capture_is_accepted(self):
         """PHASE_POLICY_FLIP_TOKENS sets a key the capture does not carry.
@@ -259,8 +259,8 @@ class TestTheGateActuallyFires(CustomTestCase):
                                  "PHASE_POLICY_FLIP_TOKENS": "9000"})
         self.assertEqual(rc, 0, f"{out}\n{err}")
         env, _ = _parse_dump(out)
-        self.assertEqual(env.get("SGLANG_PHASE_POLICY_FLIP_TOKENS"), "9000")
-        self.assertIn("OVERRIDE SGLANG_PHASE_POLICY_FLIP_TOKENS", out + err)
+        self.assertEqual(env.get("FLLIPER_PHASE_POLICY_FLIP_TOKENS"), "9000")
+        self.assertIn("OVERRIDE FLLIPER_PHASE_POLICY_FLIP_TOKENS", out + err)
 
     def test_a_missing_capture_refuses_rather_than_booting_bare(self):
         rc, out, err = _dry_run(
@@ -315,11 +315,11 @@ class TestTheTunableArmsStillWork(CustomTestCase):
         rc, out, err = _dry_run({"BARLINK": "0"})
         self.assertEqual(rc, 0, f"{out}\n{err}")
         env, _ = _parse_dump(out)
-        self.assertEqual(env.get("SGLANG_BARLINK"), "0")
-        self.assertNotIn("SGLANG_BARLINK_TRANSPORT", env)
+        self.assertEqual(env.get("FLLIPER_BARLINK"), "0")
+        self.assertNotIn("FLLIPER_BARLINK_TRANSPORT", env)
         text = out + err
-        self.assertIn("OVERRIDE SGLANG_BARLINK", text)
-        self.assertIn("OVERRIDE SGLANG_BARLINK_TRANSPORT", text)
+        self.assertIn("OVERRIDE FLLIPER_BARLINK", text)
+        self.assertIn("OVERRIDE FLLIPER_BARLINK_TRANSPORT", text)
 
     def test_rank_mib_and_context_still_reach_the_argv(self):
         argv = self._argv({"RANK_MIB": "1,2,3", "CTX": "4096"})

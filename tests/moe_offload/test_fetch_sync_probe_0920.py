@@ -1,18 +1,18 @@
-"""Task #49 probe switch (20.09.): SGLANG_MOE_OFFLOAD_FETCH_SYNC host-synchronizes
+"""Task #49 probe switch (20.09.): FLLIPER_MOE_OFFLOAD_FETCH_SYNC host-synchronizes
 after every joined fetch; default off."""
 
 import inspect
 
-from sglang.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_offload as eo
 
 
 def test_switch_parses_and_defaults_off(monkeypatch):
     for raw, want in (("", False), ("0", False), ("1", True), ("on", True)):
         eo._FETCH_SYNC["on"] = None
         if raw == "":
-            monkeypatch.delenv("SGLANG_MOE_OFFLOAD_FETCH_SYNC", raising=False)
+            monkeypatch.delenv("FLLIPER_MOE_OFFLOAD_FETCH_SYNC", raising=False)
         else:
-            monkeypatch.setenv("SGLANG_MOE_OFFLOAD_FETCH_SYNC", raw)
+            monkeypatch.setenv("FLLIPER_MOE_OFFLOAD_FETCH_SYNC", raw)
         assert eo.fetch_sync_on() is want, raw
     eo._FETCH_SYNC["on"] = None
 

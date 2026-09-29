@@ -6,17 +6,17 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+from flliper.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.attention_unittest.attention_methods.mamba2_attention import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.attention_unittest.attention_methods.mamba2_attention import (
     DEFAULT_CONV_KERNEL,
     DEFAULT_HEAD_DIM,
     DEFAULT_HIDDEN_SIZE,
@@ -29,10 +29,10 @@ from sglang.test.kits.attention_unittest.attention_methods.mamba2_attention impo
     make_mamba2_cases,
     run_mamba2_attention_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
+from flliper.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_mamba2_cuda_graph_decode_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
+from flliper.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
     run_mamba2_eagle_verify_case,
     run_mamba2_eagle_verify_cuda_graph_case,
 )

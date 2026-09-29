@@ -1,7 +1,7 @@
 """DSV4 Flash MTP test using EAGLE speculative algorithm.
 
 DSV4 Flash MTP shares the EAGLE wire path: EAGLE algo + NextN head built
-into the target model weights. No separate draft model is needed (sglang
+into the target model weights. No separate draft model is needed (flliper
 auto-falls back `--speculative-draft-model-path` to the target model).
 
 Test matrix mirrors test_eagle_infer_b.TestEAGLEServerBasic to maximize
@@ -22,9 +22,9 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.few_shot_gsm8k import run_eval as run_gsm8k_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -34,12 +34,12 @@ from sglang.test.test_utils import (
 DSV4_FLASH_MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
 
 DSV4_FLASH_ENV = {
-    "SGLANG_DSV4_FP4_EXPERTS": "0",
+    "FLLIPER_DSV4_FP4_EXPERTS": "0",
     # MTP runs ~num_draft_tokens forward passes per step, so the deepep
     # dispatch input size scales by that factor. Default 256 (used by the
     # plain server) overflows once cuda-graph-max-bs-decode * num_draft_tokens
     # > 256. 1024 covers bs=128 * 4 draft tokens with headroom.
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+    "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
 }
 
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'

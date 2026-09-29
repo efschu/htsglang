@@ -3,10 +3,10 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.run_eval import run_eval
+from flliper.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 )
 
 TEST_MODEL = os.environ.get("NIXL_EP_TEST_MODEL", DEFAULT_MODEL_NAME_FOR_TEST_MLA)
-os.environ.setdefault("SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "1024")
+os.environ.setdefault("FLLIPER_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "1024")
 
 ib_devices = get_rdma_devices_args()
 
@@ -103,7 +103,7 @@ class TestNixlEPElasticEP(_EPTestBase):
 class TestNixlMoeMooncakeElasticEP(_EPTestBase):
     server_args = [*NIXL_COMMON, *DP_ATTN, *ELASTIC_MOONCAKE]
 
-    pkill_process_1 = "sglang::scheduler_DP1_TP8_EP8"
+    pkill_process_1 = "flliper::scheduler_DP1_TP8_EP8"
 
     def test_gsm8k_fault_1(self):
         os.system(f"pkill -f {self.pkill_process_1}")

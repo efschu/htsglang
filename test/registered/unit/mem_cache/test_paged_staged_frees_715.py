@@ -40,8 +40,8 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache import common as mem_common
-from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from flliper.srt.mem_cache import common as mem_common
+from flliper.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 
 PAGE = 8
 SIZE = 64
@@ -288,7 +288,7 @@ class TestAccountingLivesInTheAllocator(unittest.TestCase):
     def test_available_size_is_computed_only_from_the_allocator_lists(self):
         import inspect
 
-        from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+        from flliper.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
         source = inspect.getsource(BaseTokenToKVPoolAllocator.available_size)
         self.assertIn("free_pages", source)

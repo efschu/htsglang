@@ -48,11 +48,11 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.reshard_plan import KvReshardError
-from sglang.srt.managers.gdn_flip_mover import GdnFlipMover
-from sglang.srt.managers.kv_reshard import _CHECKSUM_BYTES
-from sglang.srt.model_executor.weights_arena import uint8_checksum
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.dcp.reshard_plan import KvReshardError
+from flliper.srt.managers.gdn_flip_mover import GdnFlipMover
+from flliper.srt.managers.kv_reshard import _CHECKSUM_BYTES
+from flliper.srt.model_executor.weights_arena import uint8_checksum
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15)
 
@@ -182,7 +182,7 @@ class GdnPayloadTrailer(unittest.TestCase):
         `computed` is an ordinary checksum for a GDN-sized payload; `stored` is
         impossible for any payload at all. That asymmetry IS the diagnosis.
         """
-        from sglang.srt.model_executor.weights_arena import checksum_is_representable
+        from flliper.srt.model_executor.weights_arena import checksum_is_representable
 
         self.assertLess(SPECIMEN_STORED, 0)
         self.assertFalse(checksum_is_representable(SPECIMEN_STORED, 1 << 40))

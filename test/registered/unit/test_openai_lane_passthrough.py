@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.srt.entrypoints.openai.protocol import (
+from flliper.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
 )
@@ -56,7 +56,7 @@ def _stub_serving(cls):
 
 
 def test_completions_passthrough_to_generate_req_input():
-    from sglang.srt.entrypoints.openai.serving_completions import (
+    from flliper.srt.entrypoints.openai.serving_completions import (
         OpenAIServingCompletion,
     )
 
@@ -73,7 +73,7 @@ def test_completions_passthrough_to_generate_req_input():
 def test_generate_req_input_tokenized_carries_lane():
     # The scheduler consumes TokenizedGenerateReqInput.lane; make sure the
     # native conversion keeps carrying the field (io_struct contract).
-    from sglang.srt.managers.io_struct import (
+    from flliper.srt.managers.io_struct import (
         GenerateReqInput,
         TokenizedGenerateReqInput,
     )

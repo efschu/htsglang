@@ -37,7 +37,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -121,21 +121,21 @@ def _code_string_literals(path: Path):
 
 class TestResolutionIsModelTypeDriven(unittest.TestCase):
     def test_the_gguf_adapter_resolves_by_model_type(self):
-        from sglang.srt.model_loader.gguf_registry import get_gguf_adapter_class
+        from flliper.srt.model_loader.gguf_registry import get_gguf_adapter_class
 
         self.assertIsNotNone(get_gguf_adapter_class("qwen3_5"))
 
     def test_the_text_only_variant_resolves_too(self):
         """``text_config.model_type`` is ``qwen3_5_text``; a text-only
         checkpoint is exactly what a Qwen3.8-27B release would be."""
-        from sglang.srt.model_loader.gguf_registry import get_gguf_adapter_class
+        from flliper.srt.model_loader.gguf_registry import get_gguf_adapter_class
 
         self.assertIsNotNone(get_gguf_adapter_class("qwen3_5_text"))
 
     def test_an_unknown_checkpoint_NAME_does_not_matter(self):
         """The property that carries day 0: rename the checkpoint to anything,
         keep the model_type, and it must still resolve to the same adapter."""
-        from sglang.srt.model_loader.gguf_registry import get_gguf_adapter_class
+        from flliper.srt.model_loader.gguf_registry import get_gguf_adapter_class
 
         # create_gguf_adapter() reads exactly one field to choose the class:
         #   model_type = getattr(hf_config, "model_type", None)
@@ -152,12 +152,12 @@ class TestResolutionIsModelTypeDriven(unittest.TestCase):
                     get_gguf_adapter_class("qwen3_5"),
                     get_gguf_adapter_class("qwen3_5"),
                 )
-        src = (_ROOT / "python/sglang/srt/model_loader/gguf_registry.py").read_text()
+        src = (_ROOT / "python/flliper/srt/model_loader/gguf_registry.py").read_text()
         self.assertIn('model_type = getattr(hf_config, "model_type", None)', src)
         self.assertNotIn("name_or_path", src)
 
     def test_a_genuinely_unknown_model_type_is_a_miss_not_a_crash(self):
-        from sglang.srt.model_loader.gguf_registry import get_gguf_adapter_class
+        from flliper.srt.model_loader.gguf_registry import get_gguf_adapter_class
 
         # None == "no bespoke family, take the generic GGUF path".
         self.assertIsNone(get_gguf_adapter_class("qwen9_9_from_the_future"))
@@ -175,7 +175,7 @@ class TestResolutionIsModelTypeDriven(unittest.TestCase):
         boot may come up on a generic path with none of this fork's features
         rather than saying so. See ANALYSE_495 §4 for the day-0 action.
         """
-        from sglang.srt.models.registry import ModelRegistry
+        from flliper.srt.models.registry import ModelRegistry
 
         unknown = "Qwen3_8DefinitelyNotRegisteredForCausalLM"
         self.assertNotIn(unknown, ModelRegistry.get_supported_archs())
@@ -185,7 +185,7 @@ class TestResolutionIsModelTypeDriven(unittest.TestCase):
     def test_the_refusal_path_itself_names_the_architecture(self):
         """When even the fallback is absent, the message must name what was
         asked for and what exists -- not a KeyError."""
-        from sglang.srt.models.registry import ModelRegistry
+        from flliper.srt.models.registry import ModelRegistry
 
         unknown = "Qwen3_8DefinitelyNotRegisteredForCausalLM"
         with self.assertRaises(ValueError) as caught:
@@ -201,7 +201,7 @@ class TestResolutionIsModelTypeDriven(unittest.TestCase):
         dot or a capital letter would be a model NAME, i.e. the version-string
         matching this test exists to keep out.
         """
-        from sglang.srt.model_loader.gguf_qwen35 import _MODEL_TYPE_TO_GGUF_ARCH
+        from flliper.srt.model_loader.gguf_qwen35 import _MODEL_TYPE_TO_GGUF_ARCH
 
         for key in _MODEL_TYPE_TO_GGUF_ARCH:
             with self.subTest(key=key):
@@ -225,7 +225,7 @@ class TestResolutionIsModelTypeDriven(unittest.TestCase):
         # identifiers, and exactly what the dispatch is supposed to use.
         pattern = re.compile(r"[Qq]wen3\.[56]")
         for sub in ("model_loader", "configs"):
-            for path in (_ROOT / "python" / "sglang" / "srt" / sub).rglob("*.py"):
+            for path in (_ROOT / "python" / "flliper" / "srt" / sub).rglob("*.py"):
                 for tok in _code_string_literals(path):
                     if pattern.search(tok.value):
                         offenders.append(
@@ -303,7 +303,7 @@ class _ArgsStub:
     """
 
     def __init__(self, model_path: str):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         self.model_path = model_path
         self._sa = ServerArgs
@@ -392,7 +392,7 @@ class TestGeometryIsConfigDriven(unittest.TestCase):
 
     def test_the_gdn_geometry_is_read_per_field(self):
         """No hardcoded 16/48/128: change them and the numbers follow."""
-        from sglang.srt.uneven_perf import layer_family_census
+        from flliper.srt.uneven_perf import layer_family_census
 
         census = layer_family_census({"num_hidden_layers": 40}, 40)
         self.assertEqual(census.n_layers, 40)
@@ -402,8 +402,8 @@ class TestGeometryIsConfigDriven(unittest.TestCase):
         """Ratchet against a re-introduced `== 64`-style geometry assumption."""
         offenders = []
         for rel in (
-            "python/sglang/srt/models/qwen3_5.py",
-            "python/sglang/srt/model_loader/gguf_qwen35.py",
+            "python/flliper/srt/models/qwen3_5.py",
+            "python/flliper/srt/model_loader/gguf_qwen35.py",
         ):
             path = _ROOT / rel
             for n, line in enumerate(path.read_text().splitlines(), 1):
@@ -477,7 +477,7 @@ class TestMRopeDeclarationGap(unittest.TestCase):
     def test_the_transcription_matches_the_source(self):
         """Reference-twin discipline (#418 family): the predicate above is a
         copy, so pin the original's shape rather than trusting the copy."""
-        src = (_ROOT / "python/sglang/srt/model_executor/model_runner.py").read_text()
+        src = (_ROOT / "python/flliper/srt/model_executor/model_runner.py").read_text()
         self.assertIn('"mrope_section" in rope_scaling', src)
         self.assertIn('model_config.hf_text_config, "rope_parameters", None', src)
         self.assertIn('"rope_scaling", {})', src)
@@ -490,7 +490,7 @@ class TestMRopeDeclarationGap(unittest.TestCase):
         If this ever fails because a THIRD assignment appeared, that is the fix
         landing -- update the count and the note in ANALYSE_495 §4 together.
         """
-        src = (_ROOT / "python/sglang/srt/models/qwen3_5.py").read_text()
+        src = (_ROOT / "python/flliper/srt/models/qwen3_5.py").read_text()
         self.assertEqual(src.count("self.is_mrope_enabled = "), 2)
         # ...and both sit inside ForConditionalGeneration classes.
         classes = [m.group(1) for m in re.finditer(r"^class (\w+)", src, re.M)]
@@ -510,7 +510,7 @@ class TestMRopeDeclarationGap(unittest.TestCase):
         dropped, which is what makes the gap silent rather than loud."""
         src = (
             _ROOT
-            / "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py"
+            / "python/flliper/srt/model_executor/runner/prefill_cuda_graph_runner.py"
         ).read_text()
         self.assertIn('if getattr(model, "is_mrope_enabled", False):', src)
         self.assertIn('getattr(language_model, "is_mrope_enabled", False)', src)

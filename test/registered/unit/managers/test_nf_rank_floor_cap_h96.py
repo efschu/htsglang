@@ -1,4 +1,4 @@
-"""H96 (rc9l, boot dkrnfbar1rc9l09260540, rid weg2-21-21): the ABOVE-GROUP band
+"""H96 (rc9l, boot dkrnfbar1rc9l09260540, rid pdflip-21-21): the ABOVE-GROUP band
 of the RU usable-match floor must be ACTED ON, not only counted.
 
 MEASURED (D log lines 58506-58519, 05:55:54): TP0 matched 19712 on a
@@ -21,17 +21,17 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+from flliper.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
 
 FLOOR_ATTR = "_tp_match_floor_group"
-RID = "weg2-21-21"
+RID = "pdflip-21-21"
 LOCAL = {0: 19712, 1: 16384, 2: 16384}
 GROUP = min(LOCAL.values())
 
@@ -116,7 +116,7 @@ class TestRc9lAboveGroupSplit(unittest.TestCase):
         self.assertEqual(
             set(geometry.values()),
             {GROUP},
-            f"rc9l weg2-21-21: the ranks admitted {geometry} -- TP0 extends from "
+            f"rc9l pdflip-21-21: the ranks admitted {geometry} -- TP0 extends from "
             "its deeper host anchor while TP1/TP2 extend from the group depth",
         )
 
@@ -137,7 +137,7 @@ class TestRc9lAboveGroupSplit(unittest.TestCase):
         self.assertEqual(_admit(0, {RID: 0})[0], 0)
 
     def test_unmaterializable_group_depth_stops_loudly(self):
-        from sglang.srt.managers.tp_match_floor import RankFloorCapMiss
+        from flliper.srt.managers.tp_match_floor import RankFloorCapMiss
 
         tree = _Tree(LOCAL[0], anchors_down_to=GROUP + 64)
         with self.assertRaises(RankFloorCapMiss) as ctx:
@@ -147,7 +147,7 @@ class TestRc9lAboveGroupSplit(unittest.TestCase):
 
 class TestCapVerdictPure(unittest.TestCase):
     def test_cap_only_in_the_above_group_band(self):
-        from sglang.srt.managers.tp_match_floor import group_floor_cap
+        from flliper.srt.managers.tp_match_floor import group_floor_cap
 
         tree = types.SimpleNamespace()
         req = types.SimpleNamespace(rid=RID)

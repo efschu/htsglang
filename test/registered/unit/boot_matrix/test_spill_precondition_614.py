@@ -32,14 +32,14 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.boot_matrix.arms import (
+from flliper.srt.boot_matrix.arms import (
     ARMS,
     SPILL_MARKER_DECODE,
     SPILL_MARKER_PREFILL,
     Arm,
     arm_by_name,
 )
-from sglang.srt.boot_matrix.check import (
+from flliper.srt.boot_matrix.check import (
     FAIL,
     PASS,
     STOP,
@@ -48,9 +48,9 @@ from sglang.srt.boot_matrix.check import (
     check_arm,
     check_pairing,
 )
-from sglang.srt.boot_matrix.effective import READY_MARKER
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.boot_matrix.effective import READY_MARKER
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -312,7 +312,7 @@ class TestPairingIsWired(CustomTestCase):
     """
 
     def test_sweep_folds_declared_pairings(self):
-        from sglang.srt.boot_matrix.sweep import _apply_pairings
+        from flliper.srt.boot_matrix.sweep import _apply_pairings
 
         treatment = Verdict(PASS, "O_hicache_contention", "ok")
         control = Verdict(FAIL, "P_hicache_nospill_control", "the pin did not hold")
@@ -323,7 +323,7 @@ class TestPairingIsWired(CustomTestCase):
     def test_sweep_voids_a_treatment_run_without_its_control(self):
         """`--only O_hicache_contention` must not be able to print a
         contention number."""
-        from sglang.srt.boot_matrix.sweep import _apply_pairings
+        from flliper.srt.boot_matrix.sweep import _apply_pairings
 
         out = _apply_pairings([Verdict(PASS, "O_hicache_contention", "ok")])
         self.assertEqual(out[0].status, VOID, out[0].render())
@@ -334,12 +334,12 @@ class TestPairingIsWired(CustomTestCase):
         at."""
         import inspect
 
-        from sglang.srt.boot_matrix import sweep
+        from flliper.srt.boot_matrix import sweep
 
         self.assertIn("_apply_pairings(verdicts)", inspect.getsource(sweep._main))
 
     def test_sweep_leaves_unpaired_arms_alone(self):
-        from sglang.srt.boot_matrix.sweep import _apply_pairings
+        from flliper.srt.boot_matrix.sweep import _apply_pairings
 
         out = _apply_pairings([Verdict(PASS, "A_default", "ok")])
         self.assertEqual(out[0].status, PASS)
@@ -347,7 +347,7 @@ class TestPairingIsWired(CustomTestCase):
     def test_sweep_tolerates_a_non_arm_verdict(self):
         """The A-vs-A band baseline is appended to the verdict list but is not
         a matrix arm; the fold must not raise on it."""
-        from sglang.srt.boot_matrix.sweep import _apply_pairings
+        from flliper.srt.boot_matrix.sweep import _apply_pairings
 
         out = _apply_pairings([Verdict(PASS, "not_an_arm", "ok")])
         self.assertEqual(out[0].status, PASS)
@@ -407,7 +407,7 @@ class TestMatrixDeclarations(CustomTestCase):
         against the dataclass field the server actually reads."""
         import dataclasses
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         names = {f.name for f in dataclasses.fields(ServerArgs)}
         self.assertIn("kv_session_offload_budget_total_tokens", names)
@@ -482,7 +482,7 @@ class TestMarkersMatchTheSource(CustomTestCase):
     def test_markers_are_prefixes_of_the_real_format_strings(self):
         import inspect
 
-        from sglang.srt.managers import kv_session_offload
+        from flliper.srt.managers import kv_session_offload
 
         src = inspect.getsource(kv_session_offload)
         # The format strings are wrapped across source lines, so compare

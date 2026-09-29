@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.utils.collective_clock import ClockBackend, CollectiveClock
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.utils.collective_clock import ClockBackend, CollectiveClock
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="stage-a-cpu")
 
@@ -236,7 +236,7 @@ class ExternalEventTest(unittest.TestCase):
         carries nothing the reader could read."""
         import torch
 
-        from sglang.srt.utils.collective_clock import TorchCudaBackend
+        from flliper.srt.utils.collective_clock import TorchCudaBackend
 
         seen = {}
 

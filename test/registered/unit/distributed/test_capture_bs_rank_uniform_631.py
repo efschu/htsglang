@@ -31,12 +31,12 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-_MOD = "sglang.srt.model_executor.runner.base_cuda_graph_runner"
+_MOD = "flliper.srt.model_executor.runner.base_cuda_graph_runner"
 
 
 def _model_runner(pool_size: int, configured_bs):
@@ -61,7 +61,7 @@ def _run(pool_size, configured_bs, tp_size, peer_min=None):
     ``peer_min`` is the smallest pool across the simulated group; the stubbed
     all_reduce(MIN) writes it back exactly as gloo would.
     """
-    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+    from flliper.srt.model_executor.runner.base_cuda_graph_runner import (
         get_batch_sizes_to_capture,
     )
 
@@ -79,7 +79,7 @@ def _run(pool_size, configured_bs, tp_size, peer_min=None):
     ), mock.patch(
         f"{_MOD}.require_gathered_buffer", return_value=False
     ), mock.patch(
-        "sglang.srt.distributed.get_tp_group",
+        "flliper.srt.distributed.get_tp_group",
         return_value=SimpleNamespace(cpu_group=object()),
     ), mock.patch(
         "torch.distributed.all_reduce", side_effect=fake_all_reduce

@@ -9,13 +9,13 @@ logic is provable without the scripts tree.
 
 import unittest
 
-from sglang.srt.boot_matrix.coherence import (
+from flliper.srt.boot_matrix.coherence import (
     BYTE_TIER_MAX_CHARS,
     _find_grader,
     grade_probes,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -87,7 +87,7 @@ class TestGraderAvailability(CustomTestCase):
         """When the locator finds no grader (e.g. a wheel with no scripts
         tree), the result is flagged unavailable, not crashed -- the check
         turns that into STOP, never a false FAIL."""
-        from sglang.srt.boot_matrix import coherence as coh_mod
+        from flliper.srt.boot_matrix import coherence as coh_mod
 
         saved = coh_mod._find_grader
         try:

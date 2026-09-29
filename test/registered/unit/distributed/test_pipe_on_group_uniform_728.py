@@ -36,8 +36,8 @@ is slow, a per-rank layout hangs -- but the cost must be named accurately.
 import inspect
 import unittest
 
-from sglang.srt.distributed.device_communicators import barlink_bar1
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators import barlink_bar1
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     max_payload,
     pipe_on_group_verdict,
 )

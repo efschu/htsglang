@@ -73,10 +73,10 @@ if before == after:
 PY
 }
 
-CE=python/sglang/srt/weg2/weight_exchange.py
-RT=python/sglang/srt/managers/scheduler_components/weight_updater.py
-T="test/registered/unit/weg2/test_weg2_wave_publication_1273.py
-test/registered/unit/weg2/test_weg2_xchg_form_token_1273.py"
+CE=python/flliper/srt/pdflip/weight_exchange.py
+RT=python/flliper/srt/managers/scheduler_components/weight_updater.py
+T="test/registered/unit/pdflip/test_pdflip_wave_publication_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_form_token_1273.py"
 
 if [ "${1:-}" = "--selfcheck" ]; then
   PLANT="# MUTANT-HARNESS-SELFCHECK-PLANTED-$$"

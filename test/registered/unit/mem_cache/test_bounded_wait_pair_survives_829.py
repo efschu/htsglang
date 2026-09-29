@@ -6,7 +6,7 @@ wait by handing the deadline to the ``Work``::
     completed = work.wait(timeout=datetime.timedelta(seconds=timeout_s))
 
 That was the ONLY timed ``Work.wait`` on a gloo ``Work`` anywhere in
-``sglang/srt`` -- every other ``.wait(timeout=`` in the tree is a
+``flliper/srt`` -- every other ``.wait(timeout=`` in the tree is a
 ``threading.Event`` or a ``Popen`` -- and #630 (e4f1ae2556, 2026-08-17 13:53)
 introduced it. An expired ``wait(timeout=...)`` CLOSES THE GLOO PAIR, measured
 hermetically by #824 W4 and written up on ``ParkedWait``: the waiter then gets
@@ -46,7 +46,7 @@ import threading
 import time
 import unittest
 
-from sglang.srt.mem_cache.hicache_collective import (
+from flliper.srt.mem_cache.hicache_collective import (
     HiCacheCollectiveError,
     HiCacheCollectiveTimeoutError,
     bounded_wait,
@@ -71,7 +71,7 @@ _CHILD = textwrap.dedent(
     )
     group = dist.new_group([0, 1], backend="gloo")
 
-    from sglang.srt.mem_cache.hicache_collective import (
+    from flliper.srt.mem_cache.hicache_collective import (
         bounded_wait,
         HiCacheCollectiveTimeoutError,
     )
@@ -166,7 +166,7 @@ class TheDeadlineMustNotBeHandedToTheWork(unittest.TestCase):
         self.assertIn("pp_sync/isend[0]->pp1", msg)
         self.assertIn("pp_rank=1/3", msg)
         self.assertIn("waited", msg)
-        self.assertIn("SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S", msg)
+        self.assertIn("FLLIPER_HICACHE_COLLECTIVE_TIMEOUT_S", msg)
 
     def test_a_healthy_wait_returns_and_is_unbounded(self):
         work = _StubWork(unblock_after=0.05)

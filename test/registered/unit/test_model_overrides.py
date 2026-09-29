@@ -1,7 +1,7 @@
 """Unit tests for the model-override machinery: whitelist metadata, registry,
 gate, publish wiring, and the per-arch golden diffs for migrated families."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -15,19 +15,19 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import patch
 
-from sglang.srt.arg_groups import overrides as overrides_module
-from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
-from sglang.srt.arg_groups.overrides import (
+from flliper.srt.arg_groups import overrides as overrides_module
+from flliper.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
+from flliper.srt.arg_groups.overrides import (
     collect_model_override_declarations,
     register_model_override,
     validate_declarations,
 )
-from sglang.srt.runtime_context import (
+from flliper.srt.runtime_context import (
     get_context,
     get_server_args,
     reset_context,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 @dataclasses.dataclass
@@ -49,7 +49,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
         # Fields are whitelisted one family at a time by the migration
         # sweeps. This pin makes accidental tagging visible — extend it in
         # the same commit that tags a new field.
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         self.assertEqual(
             resolvable_fields(ServerArgs),
@@ -156,7 +156,7 @@ class TestModelOverrideRegistry(_IsolatedRegistry):
             collect_model_override_declarations("FakeForCausalLM", None, None)
 
     def test_predicate_keyed_provider(self):
-        from sglang.srt.arg_groups.overrides import register_model_override_predicate
+        from flliper.srt.arg_groups.overrides import register_model_override_predicate
 
         @register_model_override("FakeStep9ForCausalLM")
         def _exact(server_args, hf_config):
@@ -181,7 +181,7 @@ class TestResolvedViewAndPasses(CustomTestCase):
     """Pipeline skeleton: read-only view semantics + transition invocation."""
 
     def test_view_forwards_reads_and_rejects_writes(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView
+        from flliper.srt.arg_groups.overrides import ResolvedView
 
         live = SimpleNamespace(a=1, method=lambda: "m")
         view = ResolvedView(live)
@@ -193,14 +193,14 @@ class TestResolvedViewAndPasses(CustomTestCase):
             view.a = 3
 
     def test_view_overlay_wins(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView
+        from flliper.srt.arg_groups.overrides import ResolvedView
 
         view = ResolvedView(SimpleNamespace(a=1, b=2), overlay={"a": 10})
         self.assertEqual(view.a, 10)
         self.assertEqual(view.b, 2)
 
     def test_run_pass_appends_stash_and_stays_pristine(self):
-        from sglang.srt.arg_groups.overrides import run_post_process_pass
+        from flliper.srt.arg_groups.overrides import run_post_process_pass
 
         live = SimpleNamespace(x=None, _resolved_overrides=[])
 
@@ -217,7 +217,7 @@ class TestResolvedViewAndPasses(CustomTestCase):
         self.assertEqual(len(live._resolved_overrides), 1)
 
     def test_run_pass_rejects_non_dict(self):
-        from sglang.srt.arg_groups.overrides import run_post_process_pass
+        from flliper.srt.arg_groups.overrides import run_post_process_pass
 
         with self.assertRaises(TypeError):
             run_post_process_pass(
@@ -244,7 +244,7 @@ class TestPublishInstallsSlot(_IsolatedPublish):
     into the context-owned slot (no transformation at publish time)."""
 
     def test_dummy_fixture_has_empty_stash_and_publishes_cleanly(self):
-        from sglang.srt.server_args import (
+        from flliper.srt.server_args import (
             ServerArgs,
             set_global_server_args_for_scheduler,
         )
@@ -281,7 +281,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     }
 
     def _construct(self, arch, model_type, config_extra=None, **server_kwargs):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         # Golden resolution must be host-independent: accelerator-less CI
         # runners resolve only the base platform, where get_device() raises.
@@ -295,7 +295,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         return ServerArgs(model_path=config_dir, **server_kwargs)
 
     def _publish(self, server_args):
-        from sglang.srt.server_args import (
+        from flliper.srt.server_args import (
             set_global_server_args_for_scheduler,
         )
 
@@ -363,8 +363,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         moe_dense_tp_size == 1 is lifted for the MoE checkpoint."""
         import torch
 
-        from sglang.srt.arg_groups.overrides import _qwen4_exp_overrides
-        from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
+        from flliper.srt.arg_groups.overrides import _qwen4_exp_overrides
+        from flliper.srt.configs.qwen4_exp import Qwen4ExpConfig
 
         # The indexer fields of the real checkpoint (config.json 16.09.):
         # 4 index heads x 128, 1 KV head, budget 2048, compress ratio 4.
@@ -414,7 +414,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
         # so the declaration is pinned directly for both provider inputs.
-        from sglang.srt.arg_groups.overrides import _mimo_v2_overrides
+        from flliper.srt.arg_groups.overrides import _mimo_v2_overrides
 
         self.assertEqual(
             _mimo_v2_overrides(SimpleNamespace(speculative_algorithm="EAGLE"), None),
@@ -480,7 +480,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertTrue(self._publish(sa).disable_hybrid_swa_memory)
 
     def test_exaone_without_pattern_declares_nothing(self):
-        from sglang.srt.arg_groups.overrides import _exaone_overrides
+        from flliper.srt.arg_groups.overrides import _exaone_overrides
 
         self.assertEqual(
             _exaone_overrides(None, SimpleNamespace(sliding_window_pattern=None)),
@@ -488,7 +488,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_gpt_oss_mxfp4_forces_bfloat16(self):
-        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+        from flliper.srt.layers.quantization import QUANTIZATION_METHODS
 
         if "mxfp4" not in QUANTIZATION_METHODS:
             # Registration is platform-gated (CUDA / CPU engine / MXFP-HIP);
@@ -508,7 +508,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(self._publish(sa).dtype, "auto")
 
     def test_gpt_oss_xpu_dtype_validation_reads_pristine(self):
-        from sglang.srt.arg_groups.overrides import _gpt_oss_overrides
+        from flliper.srt.arg_groups.overrides import _gpt_oss_overrides
 
         with patch.object(overrides_module, "is_xpu", return_value=True):
             with self.assertRaises(NotImplementedError):
@@ -521,7 +521,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_sampling_backend_default_pass(self):
-        from sglang.srt.utils.common import is_flashinfer_available
+        from flliper.srt.utils.common import is_flashinfer_available
 
         sa = self._construct("LlamaForCausalLM", "llama")
         expected = "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -559,7 +559,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(flags.attention_backend, deterministic_fills[0])
 
     def test_deterministic_incompatible_backend_raises(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _deterministic_attention_backend,
         )
@@ -573,7 +573,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _deterministic_attention_backend(view)
 
     def test_deterministic_ascend_is_left_alone(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _deterministic_sampling_backend,
         )
@@ -618,7 +618,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(self._publish(sa).attention_backend, declared_values[-1])
 
     def test_post_materialize_pass_writes_through(self):
-        from sglang.srt.arg_groups.overrides import run_post_process_pass
+        from flliper.srt.arg_groups.overrides import run_post_process_pass
 
         # A pass invoked after materialization (a post-init slot, like the
         # legacy runner-side adjustments) declares AND writes through, so
@@ -642,7 +642,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(self._publish(sa).attention_backend, "triton")
 
     def test_compatibility_passes_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _attention_backend_default,
             _attention_backend_dual_chunk,
@@ -695,11 +695,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(_attention_backend_dual_chunk(ResolvedView(_mc(None))), {})
 
     def test_dllm_platform_paths_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _dllm_attention_backend,
         )
-        from sglang.srt.model_executor.cuda_graph_config import Backend
+        from flliper.srt.model_executor.cuda_graph_config import Backend
 
         def _view(**kw):
             defaults = dict(
@@ -733,7 +733,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_page_size_default_pass(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView, _page_size_default
+        from flliper.srt.arg_groups.overrides import ResolvedView, _page_size_default
 
         # user-set page_size: nothing to declare
         self.assertEqual(
@@ -753,7 +753,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_dllm_page_size_pass(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView, _dllm_page_size
+        from flliper.srt.arg_groups.overrides import ResolvedView, _dllm_page_size
 
         def _view(**kw):
             defaults = dict(
@@ -763,7 +763,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return ResolvedView(SimpleNamespace(**defaults))
 
         with patch(
-            "sglang.srt.dllm.config.DllmConfig.from_server_args",
+            "flliper.srt.dllm.config.DllmConfig.from_server_args",
             return_value=SimpleNamespace(block_size=32),
         ):
             self.assertEqual(_view() and _dllm_page_size(_view()), {"page_size": 32})
@@ -780,7 +780,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(_dllm_page_size(_view(dllm_algorithm=None)), {})
 
     def test_overlap_disable_passes(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _dllm_overlap_disable,
             _pipeline_parallel_overlap_disable,
@@ -818,23 +818,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         # embeddings sparse head: keyed on the env var being set
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         view = ResolvedView(SimpleNamespace())
         with patch.object(
-            envs.SGLANG_EMBEDDINGS_SPARSE_HEAD, "is_set", return_value=False
+            envs.FLLIPER_EMBEDDINGS_SPARSE_HEAD, "is_set", return_value=False
         ):
             self.assertEqual(_sparse_head_overlap_disable(view), {})
         with patch.object(
-            envs.SGLANG_EMBEDDINGS_SPARSE_HEAD, "is_set", return_value=True
+            envs.FLLIPER_EMBEDDINGS_SPARSE_HEAD, "is_set", return_value=True
         ):
             self.assertEqual(
                 _sparse_head_overlap_disable(view), {"disable_overlap_schedule": True}
             )
 
     def test_deepseek_v4_overrides_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import _deepseek_v4_overrides
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.arg_groups.overrides import _deepseek_v4_overrides
+        from flliper.srt.server_args import ServerArgs
 
         hf = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
 
@@ -877,7 +877,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_deepseek_v4_sm120_moe_pass(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _deepseek_v4_sm120_moe,
         )
@@ -904,7 +904,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_deepseek_v4_sm120_moe(_view()), {})
 
     def test_nemotron_h_overrides_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from flliper.srt.arg_groups.overrides import _nemotron_h_overrides
 
         def _hf(quant_algo="NVFP4"):
             return SimpleNamespace(
@@ -969,7 +969,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_speculative_moe_runner_default_pass(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _speculative_moe_runner_default,
         )
@@ -998,7 +998,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_dsa_split_backend_resolution_pass(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _dsa_split_backend_resolution,
         )
@@ -1019,7 +1019,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
         with (
-            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch("flliper.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             patch.object(overrides_module, "is_npu", return_value=False),
             patch.object(overrides_module, "is_xpu", return_value=False),
             patch.object(overrides_module, "is_hip", return_value=False),
@@ -1059,7 +1059,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}
             )
         with (
-            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch("flliper.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             patch.object(overrides_module, "is_npu", return_value=False),
             patch.object(overrides_module, "is_xpu", return_value=False),
             patch.object(overrides_module, "is_hip", return_value=True),
@@ -1075,7 +1075,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_flashinfer_allreduce_fusion_passes(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _deterministic_allreduce_fusion_disable,
             _enforce_disable_allreduce_fusion,
@@ -1172,7 +1172,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_cutedsl_prefill_backend_fill_pass(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _cutedsl_prefill_backend_fill,
         )
@@ -1216,7 +1216,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _cutedsl_prefill_backend_fill(_view())
 
     def test_moss_vl_overrides_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import _moss_vl_overrides
+        from flliper.srt.arg_groups.overrides import _moss_vl_overrides
 
         def _args(**kw):
             defaults = dict(
@@ -1251,7 +1251,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moss_vl_overrides(_args(attention_backend="fa3"), None)
 
     def test_dsa_kv_cache_dtype_default_pass(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _dsa_kv_cache_dtype_default,
         )
@@ -1271,7 +1271,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
         with (
-            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch("flliper.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             patch.object(overrides_module, "is_npu", return_value=False),
             patch.object(overrides_module, "is_xpu", return_value=False),
         ):
@@ -1301,7 +1301,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_deepseek_v4_kv_cache_dtype_pass(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _deepseek_v4_kv_cache_dtype,
         )
@@ -1335,11 +1335,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_deepseek_spec_moe_resolution_pass(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _deepseek_spec_moe_resolution,
         )
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         def _view(**kw):
             hf = SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
@@ -1359,7 +1359,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         with patch.object(overrides_module, "is_hip", return_value=True):
             with patch.object(
-                envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE, "get", return_value=False
+                envs.FLLIPER_NVFP4_CKPT_FP8_NEXTN_MOE, "get", return_value=False
             ):
                 self.assertEqual(
                     _deepseek_spec_moe_resolution(_view()),
@@ -1386,7 +1386,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     {},
                 )
             with patch.object(
-                envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE, "get", return_value=True
+                envs.FLLIPER_NVFP4_CKPT_FP8_NEXTN_MOE, "get", return_value=True
             ):
                 self.assertEqual(
                     _deepseek_spec_moe_resolution(_view()),
@@ -1402,7 +1402,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_deepseek_spec_moe_resolution(_view()), {})
 
     def test_mamba_radix_cache_resolution_pass(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _mamba_radix_cache_resolution,
             supports_mamba_cache_extra_buffer,
@@ -1507,7 +1507,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_qwen3_5_hybrid_coupled_declaration(self):
-        from sglang.srt.arg_groups.overrides import _qwen3_5_hybrid_overrides
+        from flliper.srt.arg_groups.overrides import _qwen3_5_hybrid_overrides
 
         def _args(default_backend, **kw):
             defaults = dict(
@@ -1564,10 +1564,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_qwen3_5_hybrid_overrides(_args("fa3"), None), {})
 
     def test_qwen3vl_page_size(self):
-        from sglang.srt.arg_groups.overrides import _qwen3vl_overrides
+        from flliper.srt.arg_groups.overrides import _qwen3vl_overrides
 
         with patch.object(overrides_module, "is_hip", return_value=True):
-            with patch("sglang.srt.environ.envs.SGLANG_USE_AITER_UNIFIED_ATTN") as e:
+            with patch("flliper.srt.environ.envs.FLLIPER_USE_AITER_UNIFIED_ATTN") as e:
                 e.get.return_value = True
                 self.assertEqual(
                     _qwen3vl_overrides(SimpleNamespace(page_size=None), None),
@@ -1578,7 +1578,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_moe_runner_quant_constraint_pass(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _moe_runner_backend_quant_constraints,
         )
@@ -1613,12 +1613,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
     def test_cutlass_moe_env_override_pass(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _cutlass_moe_env_override,
         )
 
-        with patch("sglang.srt.environ.envs.SGLANG_CUTLASS_MOE") as e:
+        with patch("flliper.srt.environ.envs.FLLIPER_CUTLASS_MOE") as e:
             e.get.return_value = True
             self.assertEqual(
                 _cutlass_moe_env_override(
@@ -1636,10 +1636,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_gguf_quantization_pass(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
+        from flliper.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
 
         with patch(
-            "sglang.srt.utils.hf_transformers_utils.check_gguf_file",
+            "flliper.srt.utils.hf_transformers_utils.check_gguf_file",
             return_value=True,
         ):
             self.assertEqual(
@@ -1660,7 +1660,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_page_constraint_passes_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _fa4_page_constraint,
             _intel_xpu_page_constraint,
@@ -1745,7 +1745,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_monolith_attention_families_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             _falcon_h1_jet_overrides,
             _gemma4_overrides,
             _glm4_moe_overrides,
@@ -1837,7 +1837,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_deepseek_moe_quant_slot_pass(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _deepseek_moe_quant_resolution,
         )
@@ -1877,7 +1877,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_deepseek_moe_quant_resolution(_view()), {})
 
     def test_data_parallelism_and_a2a_passes(self):
-        from sglang.srt.arg_groups.overrides import (
+        from flliper.srt.arg_groups.overrides import (
             ResolvedView,
             _a2a_backend_overrides,
             _a2a_ep_size,
@@ -1892,7 +1892,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _data_parallelism_defaults(ResolvedView(SimpleNamespace(dp_size=2))), {}
         )
 
-        with patch("sglang.srt.environ.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
+        with patch("flliper.srt.environ.envs.FLLIPER_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
             e.get.return_value = False
             self.assertEqual(
                 _a2a_backend_overrides(
@@ -1931,7 +1931,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_deepseek_family_order_safe_declarations(self):
-        from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
+        from flliper.srt.arg_groups.overrides import _deepseek_family_overrides
 
         def _args(**kw):
             defaults = dict(
@@ -1946,7 +1946,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         # DSA path on CUDA: dsa fill + page 64
         with patch(
-            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+            "flliper.srt.configs.model_config.is_deepseek_dsa", return_value=True
         ):
             with patch.object(overrides_module, "is_npu", return_value=False):
                 with patch.object(overrides_module, "is_xpu", return_value=False):
@@ -1958,7 +1958,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     # HIP without the preshuffle path: page 1
                     with patch.object(overrides_module, "is_hip", return_value=True):
                         with patch(
-                            "sglang.srt.layers.attention.dsa.utils.aiter_can_use_preshuffle_paged_mqa",
+                            "flliper.srt.layers.attention.dsa.utils.aiter_can_use_preshuffle_paged_mqa",
                             return_value=False,
                         ):
                             self.assertEqual(
@@ -1967,7 +1967,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             )
         # DSA CP (zigzag): the coupled parallel-field declaration
         with patch(
-            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+            "flliper.srt.configs.model_config.is_deepseek_dsa", return_value=True
         ):
             with patch.object(overrides_module, "is_npu", return_value=False):
                 with patch.object(overrides_module, "is_xpu", return_value=False):
@@ -2010,7 +2010,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         # MLA path on sm100: trtllm_mla fill (all three backends unset)
         with patch(
-            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=False
+            "flliper.srt.configs.model_config.is_deepseek_dsa", return_value=False
         ):
             with patch.object(
                 overrides_module, "is_sm100_supported", return_value=True
@@ -2031,7 +2031,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(_deepseek_family_overrides(_args(), None), {})
 
     def test_qwen3_moe_family_quant_absorption(self):
-        from sglang.srt.arg_groups.overrides import _qwen3_moe_family_overrides
+        from flliper.srt.arg_groups.overrides import _qwen3_moe_family_overrides
 
         with patch.object(overrides_module, "is_sm100_supported", return_value=True):
             with patch.object(
@@ -2056,7 +2056,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
 
     def test_step3p_declarations_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import _step3p_overrides
+        from flliper.srt.arg_groups.overrides import _step3p_overrides
 
         def _args(**kw):
             defaults = dict(

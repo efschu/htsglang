@@ -27,7 +27,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=200, suite="base-a-test-cpu")
 
@@ -138,7 +138,7 @@ class TestCommonNoModuleScopeSglKernel(unittest.TestCase):
         # sgl_kernel's loader queries device properties at import; common.py
         # must therefore not import it at module scope.
         proc = run_probe(
-            "import sglang.srt.utils.common\n"
+            "import flliper.srt.utils.common\n"
             'assert "sgl_kernel" not in sys.modules, "common.py imported sgl_kernel"\n'
             'print("OK")\n'
         )
@@ -148,7 +148,7 @@ class TestCommonNoModuleScopeSglKernel(unittest.TestCase):
 
 class TestNvmlDevice0(unittest.TestCase):
     def setUp(self):
-        import sglang.srt.utils.common as common
+        import flliper.srt.utils.common as common
 
         self.common = common
         self._clear()
@@ -220,7 +220,7 @@ class TestPredicatesContextFree(unittest.TestCase):
     fails the test."""
 
     def _context(self):
-        import sglang.srt.utils.common as common
+        import flliper.srt.utils.common as common
 
         fake = make_fake_pynvml(MIXED_RIG)
         clean_env = {
@@ -333,7 +333,7 @@ class TestParentImportClosureContextFree(unittest.TestCase):
         # (torchao via transformers, the installed sgl_kernel wheel until it
         # is rebuilt with the NVML loader) are printed but not gated.
         proc = run_probe(
-            "import sglang.srt.entrypoints.http_server\n"
+            "import flliper.srt.entrypoints.http_server\n"
             "fp = first_party_touches()\n"
             "for kind, site in fp:\n"
             "    print('FIRST-PARTY', kind, site)\n"
@@ -349,7 +349,7 @@ class TestParentImportClosureContextFree(unittest.TestCase):
         # answered platform/capability questions through triton->torch and
         # torch.cuda directly. Context-free now, with unchanged answers.
         proc = run_probe(
-            "import sglang.srt.layers.attention.fla.utils as fla\n"
+            "import flliper.srt.layers.attention.fla.utils as fla\n"
             'assert fla.get_available_device() == "cuda", fla.get_available_device()\n'
             "assert fla.is_nvidia, (fla.device_platform, fla.is_nvidia)\n"
             "assert fla.is_nvidia_hopper, 'cap (12,0) >= 9 expected'\n"
@@ -369,9 +369,9 @@ class TestParentImportClosureContextFree(unittest.TestCase):
         # until it is rebuilt; that shows up as external touches and is
         # deliberately not gated here.)
         proc = run_probe(
-            "import sglang.srt.layers.quantization.compressed_tensors.schemes"
+            "import flliper.srt.layers.quantization.compressed_tensors.schemes"
             ".compressed_tensors_w4a4_mxint4_moe as mxint4\n"
-            "import sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe as mxfp4\n"
+            "import flliper.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe as mxfp4\n"
             "for mod, name in [\n"
             "    (mxint4, 'trtllm_mxint4_block_scale_moe'),\n"
             "    (mxint4, 'block_scale_interleave'),\n"
@@ -398,7 +398,7 @@ class TestCudaInitTracer(unittest.TestCase):
             )
             code = (
                 "import importlib.util, os, sys\n"
-                f"path = os.path.join({REPO_PYTHON_ROOT!r}, 'sglang', 'srt', 'utils', 'cuda_init_tracer.py')\n"
+                f"path = os.path.join({REPO_PYTHON_ROOT!r}, 'flliper', 'srt', 'utils', 'cuda_init_tracer.py')\n"
                 "spec = importlib.util.spec_from_file_location('tracer', path)\n"
                 "tracer = importlib.util.module_from_spec(spec)\n"
                 "spec.loader.exec_module(tracer)\n"

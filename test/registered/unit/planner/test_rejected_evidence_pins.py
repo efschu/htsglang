@@ -26,9 +26,9 @@ import re
 import unittest
 from pathlib import Path
 
-from sglang.srt.planner.rejected import BLOCKED, by_key
+from flliper.srt.planner.rejected import BLOCKED, by_key
 
-_SRT = Path(__file__).resolve().parents[4] / "python" / "sglang" / "srt"
+_SRT = Path(__file__).resolve().parents[4] / "python" / "flliper" / "srt"
 _SERVER_ARGS = _SRT / "server_args.py"
 
 _LINE_REF = re.compile(r"([A-Za-z0-9_/]+\.py):(\d+)")

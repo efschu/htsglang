@@ -4,22 +4,22 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.srt.utils import is_flashinfer_available
+from flliper.srt.utils.common import is_sm90_supported, is_sm120_supported
+from flliper.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
     run_dense_attention_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
+from flliper.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
+from flliper.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     run_dense_eagle_draft_cuda_graph_runner_case,
     run_dense_frozen_kv_mtp_cuda_graph_runner_case,
 )

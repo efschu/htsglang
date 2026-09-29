@@ -11,23 +11,23 @@ Todes-Praedikat war NVML:
 NVML listet nur Prozesse, die auf der Karte ALLOKIERT haben. Die schlafende
 Gruppe gibt beim Sleep genau das frei -- sie faellt aus der Liste, ohne zu
 sterben. Und der Flip legt die Quelle IMMER schlafen
-(`WEG2-FLIP begin epoch=0 sleep=D wake=P`), also trifft es jeden Flip.
+(`PDFLIP-FLIP begin epoch=0 sleep=D wake=P`), also trifft es jeden Flip.
 
 GEMESSEN an fnFL2w5 (18:09:37 Flip-Start, 18:10:19 Tod):
     W68: 3 lane(s) refused: c0/weights_1: PeerGone at unit 0
     'model.layers.3.attn_hyper_connection.block_inject_weight.weight'
     | rank 1: c1/weights_9 | rank 2: c2/weights_14
-  -> W29 Weg2FlipRankDisagree auf resume_memory_occupation, 0/6 Raenge.
+  -> W29 PdFlipRankDisagree auf resume_memory_occupation, 0/6 Raenge.
 Bis zur selben Sekunde liefen 6/6 Scheduler.
 """
 
 import inspect
 
-from sglang.srt.managers.scheduler_components import weight_updater as wu
+from flliper.srt.managers.scheduler_components import weight_updater as wu
 
 
 def test_an_empty_nvml_list_is_no_longer_a_death_certificate():
-    src = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_cocard_peer_alive
+    src = inspect.getsource(wu.SchedulerWeightUpdaterManager._pdflip_cocard_peer_alive
                             if hasattr(wu, "SchedulerWeightUpdaterManager")
                             else wu)
     assert "if others:" in src and "return True" in src
@@ -54,7 +54,7 @@ def test_it_finds_a_living_scheduler_by_comm():
 def test_the_budget_is_still_the_hard_bound():
     """Der Fix weicht die Schranke NICHT auf -- er entfernt nur ein falsches
     Todesurteil. Das Budget bleibt, was den Wait beendet."""
-    from sglang.srt.weg2 import weight_exchange_bounce as wxb
+    from flliper.srt.pdflip import weight_exchange_bounce as wxb
 
     sig = inspect.signature(wxb.run_sequential_units)
     assert sig.parameters["budget_s"].default == 90.0  # #81: 30 s Vorlauf vor dem Front-Bound 120 s

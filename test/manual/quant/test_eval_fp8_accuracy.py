@@ -1,9 +1,9 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import is_hip, kill_process_tree
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_ACCURACY_TEST_FP8,
     DEFAULT_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST_FP8,
     DEFAULT_MODEL_NAME_FOR_TEST,

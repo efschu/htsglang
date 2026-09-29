@@ -26,7 +26,7 @@ import tempfile
 
 import pytest
 
-from sglang.srt.mem_ledger.boot_history import (
+from flliper.srt.mem_ledger.boot_history import (
     POST_HARDWARE_RESIDUAL,
     POST_LOAD_TRANSIENT,
     WIDE_SPREAD_FRACTION,

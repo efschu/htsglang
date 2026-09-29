@@ -61,13 +61,13 @@ surcharge is used unchanged. Same idiom as `flip_cost_s`: a term justified
 only by a measurement is gated on that measurement, not on a flag.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PHASE_TP,
     TP_TO_PP,
     PhasePolicyConfig,
@@ -79,7 +79,7 @@ from sglang.srt.managers.phase_policy import (
     effective_flip_threshold,
     observe_idle,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # The booted values on the dev instance, so the numbers below are live ones.
 N = 7004
@@ -206,7 +206,7 @@ class TestTheBoundIsStructural(CustomTestCase):
         divides out, so the threshold depends only on the break-even and the
         number of decodes -- nothing here needs re-measuring after a re-ship.
         """
-        from sglang.srt.managers.phase_policy import break_even_tokens
+        from flliper.srt.managers.phase_policy import break_even_tokens
 
         ladders = [(1681.0, 7245.5), (1194.0, 7245.5), (1322.0, 6842.6)]
         for bs in range(5):
@@ -317,7 +317,7 @@ class TestTheShippedDefaultWindow(CustomTestCase):
         """Below the contention where a flip can ever repay an unbounded PP
         residency, the answer is 'never' -- not a large finite number that
         happens to look like a threshold, and not a small one."""
-        from sglang.srt.managers.phase_policy import UNREACHABLE_FLIP_THRESHOLD
+        from flliper.srt.managers.phase_policy import UNREACHABLE_FLIP_THRESHOLD
 
         cfg = self._cfg0(0.1)
         self.assertEqual(effective_flip_threshold(cfg, 6), UNREACHABLE_FLIP_THRESHOLD)
@@ -418,7 +418,7 @@ class TestItDegradesGracefullyOnAnUnfundableSeam(CustomTestCase):
     """
 
     def test_a_permanently_refused_seam_arms_a_bounded_number_of_times(self):
-        from sglang.srt.managers.phase_policy import (
+        from flliper.srt.managers.phase_policy import (
             note_flip_armed,
             note_flip_outcome,
         )
@@ -490,7 +490,7 @@ class TestItDegradesGracefullyOnAnUnfundableSeam(CustomTestCase):
 
     def test_a_completion_clears_the_staging_rate_limit_outright(self):
         """The property that makes it a limiter and not a latch."""
-        from sglang.srt.managers.phase_policy import (
+        from flliper.srt.managers.phase_policy import (
             note_flip_armed,
             note_flip_completed,
             note_flip_outcome,
@@ -520,7 +520,7 @@ class TestItDegradesGracefullyOnAnUnfundableSeam(CustomTestCase):
         self.assertNotIn(TP_TO_PP, state.last_abandon_at)
 
     def test_the_refusal_hold_is_reported_rather_than_silent(self):
-        from sglang.srt.managers.phase_policy import (
+        from flliper.srt.managers.phase_policy import (
             note_flip_armed,
             note_flip_outcome,
         )
@@ -575,7 +575,7 @@ class TestTheRuntimeToggle(CustomTestCase):
     """
 
     def test_it_returns_a_new_config_and_leaves_the_original_alone(self):
-        from sglang.srt.managers.phase_policy import with_decode_contention
+        from flliper.srt.managers.phase_policy import with_decode_contention
 
         cfg = _cfg(decode_contention=0.0)
         got = with_decode_contention(cfg, 1.0)
@@ -583,7 +583,7 @@ class TestTheRuntimeToggle(CustomTestCase):
         self.assertEqual(cfg.decode_contention, 0.0)
 
     def test_it_actually_moves_the_ladder(self):
-        from sglang.srt.managers.phase_policy import with_decode_contention
+        from flliper.srt.managers.phase_policy import with_decode_contention
 
         one_sided = _cfg(decode_contention=0.0)
         measured = with_decode_contention(one_sided, 1.0)
@@ -592,12 +592,12 @@ class TestTheRuntimeToggle(CustomTestCase):
 
     def test_a_string_fraction_is_accepted(self):
         """It arrives over JSON, so "1.0" must work as well as 1.0."""
-        from sglang.srt.managers.phase_policy import with_decode_contention
+        from flliper.srt.managers.phase_policy import with_decode_contention
 
         self.assertEqual(with_decode_contention(_cfg(), "0.5").decode_contention, 0.5)
 
     def test_nonsense_is_refused_rather_than_half_applied(self):
-        from sglang.srt.managers.phase_policy import with_decode_contention
+        from flliper.srt.managers.phase_policy import with_decode_contention
 
         for bad in ("banana", None, [1], 1.5, -0.1):
             with self.subTest(bad=bad):
@@ -607,7 +607,7 @@ class TestTheRuntimeToggle(CustomTestCase):
     def test_the_round_trip_restores_the_old_behaviour_exactly(self):
         """The A arm of the A/B must be the shipped behaviour, not an
         approximation of it."""
-        from sglang.srt.managers.phase_policy import with_decode_contention
+        from flliper.srt.managers.phase_policy import with_decode_contention
 
         cfg = _cfg(decode_contention=0.0)
         there = with_decode_contention(cfg, 1.0)
@@ -733,11 +733,11 @@ class TestTheBootedLadderEqualsTheSolvedLadder(CustomTestCase):
     """
 
     ENV = {
-        "SGLANG_PHASE_POLICY_FLIP_COST_S": "5.918",
-        "SGLANG_PHASE_POLICY_TP_TOK_S": "1100",
-        "SGLANG_PHASE_POLICY_PP_TOK_S": "4036",
-        "SGLANG_PHASE_POLICY_DECODE_CONTENTION": "1.0",
-        "SGLANG_PHASE_POLICY_PP_WINDOW_S": "15",
+        "FLLIPER_PHASE_POLICY_FLIP_COST_S": "5.918",
+        "FLLIPER_PHASE_POLICY_TP_TOK_S": "1100",
+        "FLLIPER_PHASE_POLICY_PP_TOK_S": "4036",
+        "FLLIPER_PHASE_POLICY_DECODE_CONTENTION": "1.0",
+        "FLLIPER_PHASE_POLICY_PP_WINDOW_S": "15",
     }
 
     def _cfg_from_env(self):
@@ -745,7 +745,7 @@ class TestTheBootedLadderEqualsTheSolvedLadder(CustomTestCase):
         import os
         from unittest import mock
 
-        from sglang.srt.managers.phase_policy import config_from_env
+        from flliper.srt.managers.phase_policy import config_from_env
 
         with mock.patch.dict(os.environ, self.ENV, clear=False):
             cfg = config_from_env(True)
@@ -823,7 +823,7 @@ class TestThePpPhaseIsGovernedByDrainNotAStopwatch(CustomTestCase):
         )
 
     def test_the_solved_cap_is_the_slo_minus_both_seams(self):
-        from sglang.srt.managers.phase_policy import pp_residency_cap_s
+        from flliper.srt.managers.phase_policy import pp_residency_cap_s
 
         self.assertAlmostEqual(pp_residency_cap_s(self._cfg_slo(45.0)), 33.164)
         # A carried decode pays the seam in BOTH directions on top of the
@@ -831,7 +831,7 @@ class TestThePpPhaseIsGovernedByDrainNotAStopwatch(CustomTestCase):
         self.assertAlmostEqual(pp_residency_cap_s(self._cfg_slo(0.0)), 0.0)
 
     def test_an_slo_tighter_than_the_round_trip_collapses_to_zero(self):
-        from sglang.srt.managers.phase_policy import pp_residency_cap_s
+        from flliper.srt.managers.phase_policy import pp_residency_cap_s
 
         self.assertEqual(pp_residency_cap_s(self._cfg_slo(4.0)), 0.0)
 
@@ -875,7 +875,7 @@ class TestThePpPhaseIsGovernedByDrainNotAStopwatch(CustomTestCase):
         self.assertIn("HAND-SET STOPWATCH", d.reason)
         self.assertIn("would STAY", d.reason)
         self.assertIn("23313", d.reason)
-        self.assertIn("SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S", d.reason)
+        self.assertIn("FLLIPER_PHASE_POLICY_DECODE_STALL_SLO_S", d.reason)
 
     def test_a_declared_slo_overrides_the_hand_set_window(self):
         cfg = _cfg(
@@ -889,6 +889,6 @@ class TestThePpPhaseIsGovernedByDrainNotAStopwatch(CustomTestCase):
         self.assertIsNone(self._pp(cfg, 23_313, 3, 15.0).direction)
 
     def test_the_tp_floor_is_solved_from_the_seam(self):
-        from sglang.srt.managers.phase_policy import solved_tp_decode_floor_s
+        from flliper.srt.managers.phase_policy import solved_tp_decode_floor_s
 
         self.assertAlmostEqual(solved_tp_decode_floor_s(self._cfg_slo(45.0)), 11.836)

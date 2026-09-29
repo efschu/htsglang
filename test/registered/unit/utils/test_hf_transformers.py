@@ -1,4 +1,4 @@
-"""Unit tests for the sglang.srt.utils.hf_transformers subpackage.
+"""Unit tests for the flliper.srt.utils.hf_transformers subpackage.
 
 Tests cover the pure utility functions (compat patches, config helpers,
 context length, GGUF detection, etc.) that don't require actual model files.
@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 from transformers import PretrainedConfig
 
-from sglang.srt.utils.hf_transformers.common import (
+from flliper.srt.utils.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
@@ -20,9 +20,9 @@ from sglang.srt.utils.hf_transformers.common import (
     get_hf_text_config,
     get_rope_config,
 )
-from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
-from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
+from flliper.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -426,7 +426,7 @@ class TestFixSpecialTokensPattern(unittest.TestCase):
 
 class TestModuleReExports(unittest.TestCase):
     def test_all_public_symbols_importable(self):
-        import sglang.srt.utils.hf_transformers as pkg
+        import flliper.srt.utils.hf_transformers as pkg
 
         for name in pkg.__all__:
             self.assertTrue(
@@ -435,8 +435,8 @@ class TestModuleReExports(unittest.TestCase):
             )
 
     def test_shim_module_exports_match(self):
-        import sglang.srt.utils.hf_transformers as pkg
-        import sglang.srt.utils.hf_transformers_utils as shim
+        import flliper.srt.utils.hf_transformers as pkg
+        import flliper.srt.utils.hf_transformers_utils as shim
 
         for name in pkg.__all__:
             self.assertTrue(

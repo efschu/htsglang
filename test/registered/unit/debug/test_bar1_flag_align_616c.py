@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import sglang.srt.debug_utils.bar1_flag_align as mod
+import flliper.srt.debug_utils.bar1_flag_align as mod
 
 
 # ---------------------------------------------------------------------------

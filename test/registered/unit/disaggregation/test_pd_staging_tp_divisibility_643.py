@@ -46,16 +46,16 @@ general split is written up as a recipe in
 
 import unittest
 
-from sglang.srt.disaggregation.common.staging_buffer import (
+from flliper.srt.disaggregation.common.staging_buffer import (
     compute_head_slice_params,
     compute_staging_layout,
 )
-from sglang.srt.disaggregation.common.tp_pair import (
+from flliper.srt.disaggregation.common.tp_pair import (
     HeadSplitNotRepresentable,
     validate_tp_pair_divisible,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -258,7 +258,7 @@ class HandshakeRefusalTest(CustomTestCase):
     def _run(self, prefill_attn_tp_size, decode_attn_tp_size):
         from unittest import mock
 
-        from sglang.srt.disaggregation.common.conn import CommonKVManager
+        from flliper.srt.disaggregation.common.conn import CommonKVManager
 
         response = mock.Mock(status_code=200)
         response.json.return_value = {
@@ -271,7 +271,7 @@ class HandshakeRefusalTest(CustomTestCase):
             "follow_bootstrap_room": False,
         }
         with mock.patch(
-            "sglang.srt.disaggregation.common.conn.requests.get",
+            "flliper.srt.disaggregation.common.conn.requests.get",
             return_value=response,
         ):
             return CommonKVManager.try_ensure_parallel_info(

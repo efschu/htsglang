@@ -35,8 +35,8 @@ import asyncio
 import collections
 import unittest
 
-from sglang.srt.translator.backends import BackendError
-from sglang.srt.translator.session import EventKind
+from flliper.srt.translator.backends import BackendError
+from flliper.srt.translator.session import EventKind
 from test_session import (  # noqa: E402  - sibling helper module
     VOICE_A_HZ,
     conversation_audio,

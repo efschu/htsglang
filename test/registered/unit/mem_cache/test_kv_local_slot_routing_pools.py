@@ -2,7 +2,7 @@
 
 `memory_pool.py` was converted first (see `test_kv_local_slot_routing.py`).
 The subclasses kept their own inlined `layer_id - self.start_layer`, which is
-the same silent-wrongness class: under `SGLANG_PP_LAYER_SET` the subtraction
+the same silent-wrongness class: under `FLLIPER_PP_LAYER_SET` the subtraction
 returns a plausible index belonging to a DIFFERENT layer.
 
 Three distinct outcomes are pinned here, because the honest answer differed
@@ -28,7 +28,7 @@ per file:
   translation, so it is not silently converted -- it is refused.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -37,8 +37,8 @@ import io
 import tokenize
 import unittest
 
-from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.memory_pool import KVCache
+from flliper.test.test_utils import CustomTestCase
 
 #: The family plan's second FA stage: 8 layers, none adjacent, spanning 29.
 FA_STAGE = [35, 39, 43, 47, 51, 55, 59, 63]
@@ -81,7 +81,7 @@ class TestTheAccessorReachesEveryDerivedPool(CustomTestCase):
     the accessor AND runs the __init__ that builds its map."""
 
     def test_the_dsa_and_dsv4_pools_inherit_it(self):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        from flliper.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4IndexerPool,
             DeepSeekV4SingleKVPool,
             DeepSeekV4TokenToKVPool,
@@ -100,7 +100,7 @@ class TestTheAccessorReachesEveryDerivedPool(CustomTestCase):
         """The map is built in `KVCache.__init__`. A class that skips it would
         raise AttributeError on the first routed call -- which is exactly why
         SWAKVPool is excluded below rather than converted."""
-        from sglang.srt.mem_cache import deepseek_v4_memory_pool as dsv4
+        from flliper.srt.mem_cache import deepseek_v4_memory_pool as dsv4
 
         for name in (
             "DeepSeekV4SingleKVPool",
@@ -118,7 +118,7 @@ class TestTheLayerSplitPoolRoutesThroughTheAccessor(CustomTestCase):
     still exactly one rule."""
 
     def test_it_gives_the_rank_not_the_subtraction(self):
-        from sglang.srt.mem_cache.dsa_cache_layer_split import (
+        from flliper.srt.mem_cache.dsa_cache_layer_split import (
             LayerSplitDSATokenToKVPool,
         )
 
@@ -128,7 +128,7 @@ class TestTheLayerSplitPoolRoutesThroughTheAccessor(CustomTestCase):
         self.assertNotEqual(idx, 7 - 3)
 
     def test_it_is_still_the_subtraction_when_ownership_is_contiguous(self):
-        from sglang.srt.mem_cache.dsa_cache_layer_split import (
+        from flliper.srt.mem_cache.dsa_cache_layer_split import (
             LayerSplitDSATokenToKVPool,
         )
 
@@ -140,7 +140,7 @@ class TestTheLayerSplitPoolRoutesThroughTheAccessor(CustomTestCase):
                 )
 
     def test_the_fa_stage_maps_onto_dense_slots(self):
-        from sglang.srt.mem_cache.dsa_cache_layer_split import (
+        from flliper.srt.mem_cache.dsa_cache_layer_split import (
             LayerSplitDSATokenToKVPool,
         )
 
@@ -153,7 +153,7 @@ class TestTheLayerSplitPoolRoutesThroughTheAccessor(CustomTestCase):
         That composition survives only because the accessor returns a DENSE
         0..N-1 index -- pin it, since a sparse local index would break the CP
         layer-shard layered on top."""
-        from sglang.srt.mem_cache.dsa_cache_layer_split import (
+        from flliper.srt.mem_cache.dsa_cache_layer_split import (
             LayerSplitDSATokenToKVPool,
         )
 
@@ -169,14 +169,14 @@ class TestNoSubtractionSurvivesInTheRoutedFiles(CustomTestCase):
     """CODE ONLY -- see `_code_only`."""
 
     def test_layer_split_file_has_no_raw_subtraction(self):
-        from sglang.srt.mem_cache import dsa_cache_layer_split
+        from flliper.srt.mem_cache import dsa_cache_layer_split
 
         self.assertEqual(
             _code_only(dsa_cache_layer_split).count("layer_id-self.start_layer"), 0
         )
 
     def test_dsv4_file_has_no_raw_subtraction(self):
-        from sglang.srt.mem_cache import deepseek_v4_memory_pool
+        from flliper.srt.mem_cache import deepseek_v4_memory_pool
 
         self.assertEqual(
             _code_only(deepseek_v4_memory_pool).count("layer_id-self.start_layer"), 0
@@ -187,7 +187,7 @@ class TestTheSwaPoolIsExcludedOnPurpose(CustomTestCase):
     """(b). The pin is on the REASON, not on the leftover line."""
 
     def test_swa_pool_pins_start_layer_to_zero(self):
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from flliper.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         src = inspect.getsource(SWAKVPool.__init__)
         self.assertIn("self.start_layer = 0", src)
@@ -195,7 +195,7 @@ class TestTheSwaPoolIsExcludedOnPurpose(CustomTestCase):
     def test_swa_pool_does_not_chain_the_base_init(self):
         """If this ever starts calling `super().__init__`, the accessor becomes
         available and the exclusion must be re-argued."""
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from flliper.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         src = inspect.getsource(SWAKVPool.__init__)
         self.assertNotIn("super().__init__", src)
@@ -205,18 +205,18 @@ class TestTheInverseDirectionIsRefused(CustomTestCase):
     """(c). Local offset -> global id, for the PD transfer's start+count label."""
 
     def test_contiguous_ownership_still_gets_its_global_start(self):
-        from sglang.srt.mem_cache.dsa_cache_layer_split import shard_start_global
+        from flliper.srt.mem_cache.dsa_cache_layer_split import shard_start_global
 
         self.assertEqual(shard_start_global(22, 4, None), 26)
 
     def test_set_ownership_is_refused_not_silently_mislabelled(self):
-        from sglang.srt.mem_cache.dsa_cache_layer_split import shard_start_global
+        from flliper.srt.mem_cache.dsa_cache_layer_split import shard_start_global
 
         with self.assertRaises(NotImplementedError):
             shard_start_global(min(FA_STAGE), 4, _slot_map(FA_STAGE))
 
     def test_the_refusal_explains_the_wire_format_limit(self):
-        from sglang.srt.mem_cache.dsa_cache_layer_split import shard_start_global
+        from flliper.srt.mem_cache.dsa_cache_layer_split import shard_start_global
 
         with self.assertRaises(NotImplementedError) as cm:
             shard_start_global(min(FA_STAGE), 4, _slot_map(FA_STAGE))

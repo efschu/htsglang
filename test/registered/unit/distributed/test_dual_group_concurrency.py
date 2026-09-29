@@ -28,12 +28,12 @@ import os
 import threading
 import unittest
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     get_tp_partition_ratios,
     scoped_tp_partition_ratios,
     set_tp_partition_ratios,
 )
-from sglang.srt.runtime_context import (
+from flliper.srt.runtime_context import (
     current_lane_id,
     get_context,
     get_parallel,
@@ -235,7 +235,7 @@ class TestPerLaneGraphPool(unittest.TestCase):
         reset_context()
 
     def test_each_lane_gets_its_own_pool_handle(self):
-        from sglang.srt.model_executor.runner_utils.pool import (
+        from flliper.srt.model_executor.runner_utils.pool import (
             get_global_graph_memory_pool,
             get_or_create_global_graph_memory_pool,
         )
@@ -276,7 +276,7 @@ class TestPerLaneDequantWorkspace(unittest.TestCase):
     def test_the_key_separates_lanes(self):
         import torch
 
-        from sglang.srt.layers.quantization.gguf import _dequant_ws_key
+        from flliper.srt.layers.quantization.gguf import _dequant_ws_key
 
         device = torch.device("cpu")
         serving = _dequant_ws_key(torch.float16, device)
@@ -294,7 +294,7 @@ class TestPerLaneDequantWorkspace(unittest.TestCase):
     def test_shared_form_would_alias(self):
         import torch
 
-        from sglang.srt.layers.quantization.gguf import _dequant_ws_key
+        from flliper.srt.layers.quantization.gguf import _dequant_ws_key
 
         # The pre-slice-C key, reconstructed: device + dtype only.
         device = torch.device("cpu")
@@ -323,19 +323,19 @@ class TestPerLaneInputBufferPool(unittest.TestCase):
     """
 
     def setUp(self):
-        from sglang.srt.model_executor.input_buffers import (
+        from flliper.srt.model_executor.input_buffers import (
             _forward_input_buffer_pool,
         )
 
         _forward_input_buffer_pool.clear()
 
     def tearDown(self):
-        from sglang.srt.model_executor.input_buffers import (
+        from flliper.srt.model_executor.input_buffers import (
             _forward_input_buffer_pool,
         )
 
         _forward_input_buffer_pool.clear()
-        os.environ.pop("SGLANG_LANE_SHARED_INPUT_BUFFERS", None)
+        os.environ.pop("FLLIPER_LANE_SHARED_INPUT_BUFFERS", None)
         reset_context()
 
     @staticmethod
@@ -347,7 +347,7 @@ class TestPerLaneInputBufferPool(unittest.TestCase):
         return torch.zeros(2048, dtype=torch.int64)
 
     def test_a_concurrent_lane_does_not_land_on_the_serving_buffer(self):
-        from sglang.srt.model_executor.input_buffers import share_input_buffer
+        from flliper.srt.model_executor.input_buffers import share_input_buffer
 
         serving = share_input_buffer("out_cache_loc", self._out_cache_loc())
         with lane_scope(0, None):
@@ -359,7 +359,7 @@ class TestPerLaneInputBufferPool(unittest.TestCase):
         self.assertNotEqual(lane0.data_ptr(), lane1.data_ptr())
 
     def test_within_one_scope_the_sharing_is_unchanged(self):
-        from sglang.srt.model_executor.input_buffers import share_input_buffer
+        from flliper.srt.model_executor.input_buffers import share_input_buffer
 
         # The default path: the serving group's own runners still coalesce,
         # which is the whole point of the pool.
@@ -373,9 +373,9 @@ class TestPerLaneInputBufferPool(unittest.TestCase):
         self.assertEqual(a.data_ptr(), b.data_ptr())
 
     def test_the_escape_hatch_reproduces_the_defect(self):
-        from sglang.srt.model_executor.input_buffers import share_input_buffer
+        from flliper.srt.model_executor.input_buffers import share_input_buffer
 
-        os.environ["SGLANG_LANE_SHARED_INPUT_BUFFERS"] = "1"
+        os.environ["FLLIPER_LANE_SHARED_INPUT_BUFFERS"] = "1"
         serving = share_input_buffer("out_cache_loc", self._out_cache_loc())
         with lane_scope(0, None):
             lane0 = share_input_buffer("out_cache_loc", self._out_cache_loc())
@@ -383,7 +383,7 @@ class TestPerLaneInputBufferPool(unittest.TestCase):
         self.assertEqual(serving.data_ptr(), lane0.data_ptr())
 
     def test_a_serial_lane_keeps_sharing(self):
-        from sglang.srt.model_executor.input_buffers import share_input_buffer
+        from flliper.srt.model_executor.input_buffers import share_input_buffer
 
         # ``DualGroupLane.scope_lane_id`` is None in serial mode, so the serial
         # path stays byte-for-byte the slice-B path -- the gate slice C was not
@@ -416,16 +416,16 @@ class TestPerLaneAttentionWorkspace(unittest.TestCase):
     """
 
     def setUp(self):
-        from sglang.srt.layers.attention.flashinfer_backend import _WORKSPACE_BUFFERS
+        from flliper.srt.layers.attention.flashinfer_backend import _WORKSPACE_BUFFERS
 
         _WORKSPACE_BUFFERS.clear()
         reset_context()
 
     def tearDown(self):
-        from sglang.srt.layers.attention.flashinfer_backend import _WORKSPACE_BUFFERS
+        from flliper.srt.layers.attention.flashinfer_backend import _WORKSPACE_BUFFERS
 
         _WORKSPACE_BUFFERS.clear()
-        os.environ.pop("SGLANG_LANE_SHARED_ATTN_WORKSPACE", None)
+        os.environ.pop("FLLIPER_LANE_SHARED_ATTN_WORKSPACE", None)
         reset_context()
 
     @staticmethod
@@ -433,11 +433,11 @@ class TestPerLaneAttentionWorkspace(unittest.TestCase):
         import torch
 
         # Shape is irrelevant to the keying; the production one is
-        # SGLANG_FLASHINFER_WORKSPACE_SIZE bytes of uint8.
+        # FLLIPER_FLASHINFER_WORKSPACE_SIZE bytes of uint8.
         return torch.empty(1024, dtype=torch.uint8)
 
     def _alloc(self):
-        from sglang.srt.runtime_context import get_buffer
+        from flliper.srt.runtime_context import get_buffer
 
         return get_buffer("flashinfer_workspace", self._workspace)
 
@@ -475,7 +475,7 @@ class TestPerLaneAttentionWorkspace(unittest.TestCase):
         self.assertEqual(serving.data_ptr(), serial_lane.data_ptr())
 
     def test_the_escape_hatch_reproduces_the_defect(self):
-        os.environ["SGLANG_LANE_SHARED_ATTN_WORKSPACE"] = "1"
+        os.environ["FLLIPER_LANE_SHARED_ATTN_WORKSPACE"] = "1"
         serving = self._alloc()
         with lane_scope(0, None):
             lane0 = self._alloc()
@@ -483,7 +483,7 @@ class TestPerLaneAttentionWorkspace(unittest.TestCase):
         self.assertEqual(serving.data_ptr(), lane0.data_ptr())
 
     def test_distinct_names_stay_distinct_within_a_lane(self):
-        from sglang.srt.runtime_context import get_buffer
+        from flliper.srt.runtime_context import get_buffer
 
         with lane_scope(0, None):
             ws = get_buffer("flashinfer_workspace", self._workspace)
@@ -493,7 +493,7 @@ class TestPerLaneAttentionWorkspace(unittest.TestCase):
     # -- C2: the zeroing ---------------------------------------------------
 
     def test_serving_zeroing_leaves_a_concurrent_lanes_workspace_alone(self):
-        from sglang.srt.layers.attention.flashinfer_backend import (
+        from flliper.srt.layers.attention.flashinfer_backend import (
             register_flashinfer_workspace_buffer,
             zero_flashinfer_workspaces,
         )
@@ -512,7 +512,7 @@ class TestPerLaneAttentionWorkspace(unittest.TestCase):
         self.assertTrue(bool((lane_ws == 0xAB).all()))
 
     def test_a_lane_zeroes_its_own_and_only_its_own(self):
-        from sglang.srt.layers.attention.flashinfer_backend import (
+        from flliper.srt.layers.attention.flashinfer_backend import (
             register_flashinfer_workspace_buffer,
             zero_flashinfer_workspaces,
         )
@@ -532,12 +532,12 @@ class TestPerLaneAttentionWorkspace(unittest.TestCase):
         self.assertTrue(bool((serving_ws == 0xCD).all()))
 
     def test_the_escape_hatch_reproduces_the_zeroing_defect(self):
-        from sglang.srt.layers.attention.flashinfer_backend import (
+        from flliper.srt.layers.attention.flashinfer_backend import (
             register_flashinfer_workspace_buffer,
             zero_flashinfer_workspaces,
         )
 
-        os.environ["SGLANG_LANE_SHARED_ATTN_WORKSPACE"] = "1"
+        os.environ["FLLIPER_LANE_SHARED_ATTN_WORKSPACE"] = "1"
         lane_ws = self._workspace()
         with lane_scope(0, None):
             register_flashinfer_workspace_buffer(lane_ws)
@@ -549,7 +549,7 @@ class TestPerLaneAttentionWorkspace(unittest.TestCase):
         self.assertTrue(bool((lane_ws == 0).all()))
 
     def test_a_serial_lane_is_zeroed_by_the_serving_group(self):
-        from sglang.srt.layers.attention.flashinfer_backend import (
+        from flliper.srt.layers.attention.flashinfer_backend import (
             register_flashinfer_workspace_buffer,
             zero_flashinfer_workspaces,
         )
@@ -565,7 +565,7 @@ class TestPerLaneAttentionWorkspace(unittest.TestCase):
         self.assertTrue(bool((ws == 0).all()))
 
     def test_zeroing_an_empty_bucket_is_zero_not_a_key_error(self):
-        from sglang.srt.layers.attention.flashinfer_backend import (
+        from flliper.srt.layers.attention.flashinfer_backend import (
             zero_flashinfer_workspaces,
         )
 
@@ -575,7 +575,7 @@ class TestPerLaneAttentionWorkspace(unittest.TestCase):
 
 class TestCaptureModeIsolation(unittest.TestCase):
     def test_capture_on_one_thread_is_not_capture_on_another(self):
-        from sglang.srt.model_executor.runner_utils.capture_mode import (
+        from flliper.srt.model_executor.runner_utils.capture_mode import (
             get_is_capture_mode,
             model_capture_mode,
         )
@@ -615,12 +615,12 @@ class TestForwardContextIsolation(unittest.TestCase):
     """
 
     def tearDown(self):
-        from sglang.srt.model_executor.forward_context import set_forward_context
+        from flliper.srt.model_executor.forward_context import set_forward_context
 
         set_forward_context(None)
 
     def test_two_threads_see_their_own_attention_backend(self):
-        from sglang.srt.model_executor.forward_context import (
+        from flliper.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
             get_attn_backend,
@@ -648,7 +648,7 @@ class TestForwardContextIsolation(unittest.TestCase):
         self.assertIs(out["serving"], serving_backend)
 
     def test_a_fresh_thread_has_no_forward_context(self):
-        from sglang.srt.model_executor.forward_context import (
+        from flliper.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
             has_forward_context,
@@ -669,7 +669,7 @@ class TestForwardContextIsolation(unittest.TestCase):
         self.assertFalse(seen["has"])
 
     def test_graph_window_flags_do_not_leak_across_threads(self):
-        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (  # noqa: E501
+        from flliper.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (  # noqa: E501
             enable_breakable_cuda_graph,
             is_in_breakable_cuda_graph,
         )
@@ -695,7 +695,7 @@ class TestForwardContextIsolation(unittest.TestCase):
         self.assertFalse(out["out"])
 
     def test_dcp_guard_toggle_does_not_leak_across_threads(self):
-        from sglang.srt.layers.dcp.collective_guard import (
+        from flliper.srt.layers.dcp.collective_guard import (
             guard_enabled,
             set_guard_enabled,
         )
@@ -734,12 +734,12 @@ class TestSpeedDial(unittest.TestCase):
         return _A()
 
     def test_unset_is_exactly_the_configured_capacity(self):
-        from sglang.srt.model_executor.dual_group_lane import resolve_speed_dial
+        from flliper.srt.model_executor.dual_group_lane import resolve_speed_dial
 
         self.assertEqual(resolve_speed_dial(self._args(None)), (1600, 4))
 
     def test_dial_only_reduces_and_is_monotone(self):
-        from sglang.srt.model_executor.dual_group_lane import resolve_speed_dial
+        from flliper.srt.model_executor.dual_group_lane import resolve_speed_dial
 
         seen = [resolve_speed_dial(self._args(d)) for d in (0.0, 0.25, 0.5, 1.0)]
         self.assertEqual(seen[0], (1600, 4))
@@ -748,7 +748,7 @@ class TestSpeedDial(unittest.TestCase):
         self.assertEqual(budgets, sorted(budgets, reverse=True))
 
     def test_out_of_range_is_refused(self):
-        from sglang.srt.model_executor.dual_group_lane import resolve_speed_dial
+        from flliper.srt.model_executor.dual_group_lane import resolve_speed_dial
 
         with self.assertRaises(ValueError):
             resolve_speed_dial(self._args(1.5))
@@ -808,7 +808,7 @@ class TestLaneSpecBudget(unittest.TestCase):
         return self._cfg(64, full_ids=list(range(3, 64, 4)), nextn=1)
 
     def test_the_split_conserves_the_operators_budget(self):
-        from sglang.srt.model_executor.dual_group_lane import split_lane_budget
+        from flliper.srt.model_executor.dual_group_lane import split_lane_budget
 
         target, draft = split_lane_budget(
             self._args(1600), self._qwen35(), self._qwen35_head()
@@ -816,7 +816,7 @@ class TestLaneSpecBudget(unittest.TestCase):
         self.assertEqual(target + draft, 1600)
 
     def test_the_head_gets_its_KV_LAYER_share_not_a_quarter(self):
-        from sglang.srt.model_executor.dual_group_lane import split_lane_budget
+        from flliper.srt.model_executor.dual_group_lane import split_lane_budget
 
         _, draft = split_lane_budget(
             self._args(1600), self._qwen35(), self._qwen35_head()
@@ -829,7 +829,7 @@ class TestLaneSpecBudget(unittest.TestCase):
         self.assertEqual(draft, 95)
 
     def test_a_head_that_declares_no_nextn_layer_is_not_guessed_to_be_one(self):
-        from sglang.srt.model_executor.dual_group_lane import split_lane_budget
+        from flliper.srt.model_executor.dual_group_lane import split_lane_budget
 
         # Same config WITHOUT the NEXTN declaration: it is then indistinguishable
         # from the target and must be charged like it, not silently shrunk.
@@ -841,7 +841,7 @@ class TestLaneSpecBudget(unittest.TestCase):
         self.assertEqual(draft, 800)
 
     def test_a_dense_target_is_counted_by_its_plain_layers(self):
-        from sglang.srt.model_executor.dual_group_lane import split_lane_budget
+        from flliper.srt.model_executor.dual_group_lane import split_lane_budget
 
         # No hybrid split: every layer bears KV, so 1 of 64 + 1.
         _, draft = split_lane_budget(
@@ -850,7 +850,7 @@ class TestLaneSpecBudget(unittest.TestCase):
         self.assertEqual(draft, 25)
 
     def test_the_head_pool_stays_allocatable_on_a_tiny_budget(self):
-        from sglang.srt.model_executor.dual_group_lane import split_lane_budget
+        from flliper.srt.model_executor.dual_group_lane import split_lane_budget
 
         target, draft = split_lane_budget(
             self._args(8), self._cfg(4096), self._cfg(4096, nextn=1)
@@ -859,7 +859,7 @@ class TestLaneSpecBudget(unittest.TestCase):
         self.assertEqual(target + draft, 8)
 
     def test_the_head_can_never_crowd_out_the_target(self):
-        from sglang.srt.model_executor.dual_group_lane import split_lane_budget
+        from flliper.srt.model_executor.dual_group_lane import split_lane_budget
 
         # A pathological ratio (the head deeper than the target) must not
         # starve the lane target the head exists to serve.
@@ -870,7 +870,7 @@ class TestLaneSpecBudget(unittest.TestCase):
         self.assertGreaterEqual(target, draft)
 
     def test_the_ledger_names_both_posts_and_their_layer_counts(self):
-        from sglang.srt.model_executor.dual_group_lane import (
+        from flliper.srt.model_executor.dual_group_lane import (
             LaneBudgetSplit,
             split_lane_budget,
         )
@@ -896,13 +896,13 @@ class TestLaneKvBearingLayerCount(unittest.TestCase):
         return TestLaneSpecBudget._cfg(TestLaneSpecBudget(), layers, full_ids, nextn)
 
     def test_a_hybrid_target_counts_only_its_full_attention_layers(self):
-        from sglang.srt.model_executor.dual_group_lane import kv_bearing_layer_count
+        from flliper.srt.model_executor.dual_group_lane import kv_bearing_layer_count
 
         cfg = self._cfg(64, full_ids=list(range(3, 64, 4)))
         self.assertEqual(kv_bearing_layer_count(cfg), 16)
 
     def test_a_head_is_counted_by_its_nextn_declaration(self):
-        from sglang.srt.model_executor.dual_group_lane import kv_bearing_layer_count
+        from flliper.srt.model_executor.dual_group_lane import kv_bearing_layer_count
 
         # The inherited 64 layers and the inherited 16 full-attention ids are
         # both wrong for the head, and both are present on the object.
@@ -911,12 +911,12 @@ class TestLaneKvBearingLayerCount(unittest.TestCase):
         self.assertEqual(kv_bearing_layer_count(cfg), 16)
 
     def test_a_dense_config_falls_through_to_its_layer_count(self):
-        from sglang.srt.model_executor.dual_group_lane import kv_bearing_layer_count
+        from flliper.srt.model_executor.dual_group_lane import kv_bearing_layer_count
 
         self.assertEqual(kv_bearing_layer_count(self._cfg(32)), 32)
 
     def test_an_empty_config_never_returns_zero(self):
-        from sglang.srt.model_executor.dual_group_lane import kv_bearing_layer_count
+        from flliper.srt.model_executor.dual_group_lane import kv_bearing_layer_count
 
         class _Bare:
             pass
@@ -946,7 +946,7 @@ class TestLaneLending(unittest.TestCase):
             return self._idle
 
     def _lending(self, lane, **kw):
-        from sglang.srt.model_executor.dual_group_lane import LaneLending
+        from flliper.srt.model_executor.dual_group_lane import LaneLending
 
         return LaneLending(lane, lend_mib=64, threshold_s=5.0, **kw)
 
@@ -998,13 +998,13 @@ class TestPerLaneGraphSharedOutput(unittest.TestCase):
 
     def setUp(self):
         reset_context()
-        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+        from flliper.srt.model_executor.graph_shared_output import GraphSharedOutput
 
         self._saved = dict(GraphSharedOutput._lane_shared)
         GraphSharedOutput._lane_shared.clear()
 
     def tearDown(self):
-        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+        from flliper.srt.model_executor.graph_shared_output import GraphSharedOutput
 
         GraphSharedOutput._lane_shared.clear()
         GraphSharedOutput._lane_shared.update(self._saved)
@@ -1016,7 +1016,7 @@ class TestPerLaneGraphSharedOutput(unittest.TestCase):
         device = "cpu"
 
         def __init__(self, rows=8):
-            from sglang.srt.model_executor.cuda_graph_config import (
+            from flliper.srt.model_executor.cuda_graph_config import (
                 default_cuda_graph_config,
             )
 
@@ -1032,7 +1032,7 @@ class TestPerLaneGraphSharedOutput(unittest.TestCase):
             return self._rows
 
     def test_each_lane_gets_its_own_logits_buffer(self):
-        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+        from flliper.srt.model_executor.graph_shared_output import GraphSharedOutput
 
         runner = self._FakeRunner()
         serving = GraphSharedOutput.create_for_model_runner(runner)
@@ -1051,7 +1051,7 @@ class TestPerLaneGraphSharedOutput(unittest.TestCase):
         self.assertIsNot(lane0, lane1)
 
     def test_the_buffers_are_distinct_storage_not_just_distinct_objects(self):
-        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+        from flliper.srt.model_executor.graph_shared_output import GraphSharedOutput
 
         runner = self._FakeRunner()
         serving = GraphSharedOutput.create_for_model_runner(runner)
@@ -1067,7 +1067,7 @@ class TestPerLaneGraphSharedOutput(unittest.TestCase):
 
     def test_the_serving_group_is_unchanged(self):
         """The default path must keep exactly one buffer (backward compat)."""
-        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+        from flliper.srt.model_executor.graph_shared_output import GraphSharedOutput
 
         runner = self._FakeRunner()
         first = GraphSharedOutput.create_for_model_runner(runner)
@@ -1089,7 +1089,7 @@ class TestLaneVocabShellSelection(unittest.TestCase):
     def _shells(self, widths):
         import torch.nn as nn
 
-        from sglang.srt.model_executor.dual_group_lane import (
+        from flliper.srt.model_executor.dual_group_lane import (
             LaneLmHeadShell,
             LaneVocabEmbeddingShell,
         )
@@ -1107,7 +1107,7 @@ class TestLaneVocabShellSelection(unittest.TestCase):
         return target
 
     def test_the_language_width_is_chosen_not_the_first_registered(self):
-        from sglang.srt.model_executor.dual_group_lane import (
+        from flliper.srt.model_executor.dual_group_lane import (
             _find_lane_vocab_shells,
         )
 
@@ -1119,7 +1119,7 @@ class TestLaneVocabShellSelection(unittest.TestCase):
 
     def test_a_single_shell_is_taken_as_is(self):
         """Unimodal targets must not need the discriminator at all."""
-        from sglang.srt.model_executor.dual_group_lane import (
+        from flliper.srt.model_executor.dual_group_lane import (
             _find_lane_vocab_shells,
         )
 
@@ -1129,7 +1129,7 @@ class TestLaneVocabShellSelection(unittest.TestCase):
         self.assertIsNotNone(head)
 
     def test_an_ambiguous_target_is_refused_loudly(self):
-        from sglang.srt.model_executor.dual_group_lane import (
+        from flliper.srt.model_executor.dual_group_lane import (
             _find_lane_vocab_shells,
         )
 
@@ -1139,7 +1139,7 @@ class TestLaneVocabShellSelection(unittest.TestCase):
         self.assertIn("5120", str(ctx.exception))
 
     def test_no_matching_width_is_refused_rather_than_guessed(self):
-        from sglang.srt.model_executor.dual_group_lane import (
+        from flliper.srt.model_executor.dual_group_lane import (
             _find_lane_vocab_shells,
         )
 
@@ -1167,7 +1167,7 @@ class TestLaneTargetVsHeadClassification(unittest.TestCase):
 
         @property
         def is_dual_group_lane_target(self):
-            from sglang.srt.model_executor.model_runner import ModelRunner
+            from flliper.srt.model_executor.model_runner import ModelRunner
 
             return ModelRunner.is_dual_group_lane_target.fget(self)
 
@@ -1186,8 +1186,8 @@ class TestLaneTargetVsHeadClassification(unittest.TestCase):
         """The three sites must not respell the condition and drift apart."""
         import inspect
 
-        from sglang.srt.layers.attention import attention_registry
-        from sglang.srt.model_executor import model_runner, model_runner_kv_cache_mixin
+        from flliper.srt.layers.attention import attention_registry
+        from flliper.srt.model_executor import model_runner, model_runner_kv_cache_mixin
 
         for mod in (attention_registry, model_runner, model_runner_kv_cache_mixin):
             src = inspect.getsource(mod)
@@ -1215,7 +1215,7 @@ class TestLaneSpecDispatch(unittest.TestCase):
     def test_both_step_paths_route_a_spec_lane_to_the_spec_round(self):
         import inspect
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         for fn in (DualGroupLane.tick, DualGroupLane._step_locked_scope):
             src = inspect.getsource(fn)
@@ -1238,7 +1238,7 @@ class TestLaneSpecDispatch(unittest.TestCase):
         )
 
     def test_job_spec_override_defaults_to_the_server_flag(self):
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         lane = DualGroupLane.__new__(DualGroupLane)
         lane.draft_runner = object()
@@ -1284,14 +1284,14 @@ class TestLaneVerifyStrategy(unittest.TestCase):
     """
 
     def _lane(self):
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         return DualGroupLane.__new__(DualGroupLane)
 
     def test_default_is_the_coherent_strategy(self):
         import inspect
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         # Round 5 made TARGET_VERIFY coherent; round 6 captured it and made it
         # dominant (35.9 vs 75-96 ms per round); rounds 7a/7b kept every byte
@@ -1314,7 +1314,7 @@ class TestLaneVerifyStrategy(unittest.TestCase):
     def test_unknown_strategy_is_refused_rather_than_guessed(self):
         import torch
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         lane = DualGroupLane.__new__(DualGroupLane)
         job = {
@@ -1331,7 +1331,7 @@ class TestLaneVerifyStrategy(unittest.TestCase):
     def test_the_defect_is_named_where_the_batched_path_lives(self):
         import inspect
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         doc = inspect.getdoc(DualGroupLane._verify) or ""
         # Not prose-policing: this is the one place a future reader decides
@@ -1351,7 +1351,7 @@ class TestLaneVerifyStrategy(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         doc = inspect.getdoc(DualGroupLane._verify_by_target_verify) or ""
         # Round 6 captured the forward and moved the number: 4.78 -> 2.22. The
@@ -1370,7 +1370,7 @@ class TestLaneVerifyStrategy(unittest.TestCase):
         """
         import torch
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         class _Fake(DualGroupLane):
             def __init__(self, target_says):
@@ -1393,7 +1393,7 @@ class TestLaneVerifyStrategy(unittest.TestCase):
     def test_seqdecode_rejecting_everything_still_emits_one_token(self):
         import torch
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         class _Fake(DualGroupLane):
             def _timed_forward_raw(self, batch, capture_mode=None):
@@ -1417,7 +1417,7 @@ class TestLaneChainVerifyInput(unittest.TestCase):
     """
 
     def test_chain_mask_is_prefix_visible_and_lower_triangular(self):
-        from sglang.srt.model_executor.dual_group_lane import lane_chain_verify_mask
+        from flliper.srt.model_executor.dual_group_lane import lane_chain_verify_mask
 
         n_cached, d = 5, 3
         mask = lane_chain_verify_mask(n_cached, d).view(d, n_cached + d)
@@ -1430,7 +1430,7 @@ class TestLaneChainVerifyInput(unittest.TestCase):
         )
 
     def test_verify_input_describes_the_chain(self):
-        from sglang.srt.model_executor.dual_group_lane import (
+        from flliper.srt.model_executor.dual_group_lane import (
             build_lane_chain_verify_input,
         )
 
@@ -1498,7 +1498,7 @@ class TestLaneTargetVerifyRound(unittest.TestCase):
     def _lane(self, target_says, n_cached=10):
         import torch
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         calls = []
 
@@ -1565,7 +1565,7 @@ class TestLaneTargetVerifyRound(unittest.TestCase):
         self.assertEqual(calls[0]["last_correct_step_indices"].tolist(), [3])
 
     def test_the_verify_leaves_no_spec_input_on_the_batch(self):
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
         lane, job, _ = self._lane([9, 0, 0, 0])
         lane._verify_by_target_verify(job, [3, 5, 6], 10)
@@ -1584,7 +1584,7 @@ class TestLaneTargetVerifyRound(unittest.TestCase):
         """
         import torch
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         rebuilt = []
 
@@ -1628,11 +1628,11 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
     """
 
     def _runner(self, *, verify_tokens=(4,), captured=None, max_bs=1, ntpb=1):
-        from sglang.srt.model_executor.forward_batch_info import (
+        from flliper.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardMode,
         )
-        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
 
@@ -1655,7 +1655,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
     def _batch(self, *, bs=1, tokens=4, verify=True):
         import torch
 
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
         fb = type("FB", (), {})()
         fb.batch_size = bs
@@ -1679,7 +1679,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
         """
         from types import SimpleNamespace
 
-        from sglang.srt.model_executor.dual_group_lane import _lane_server_args_view
+        from flliper.srt.model_executor.dual_group_lane import _lane_server_args_view
 
         args = SimpleNamespace(
             speculative_algorithm="NEXTN",
@@ -1697,7 +1697,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
         self.assertIsNone(view.speculative_algorithm)
 
     def test_the_shape_scope_swaps_and_restores(self):
-        from sglang.srt.model_executor.forward_batch_info import (
+        from flliper.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardMode,
         )
@@ -1721,7 +1721,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
         -- a KeyError one forward away from the real error, which is how a
         one-line failure becomes an unreadable one.
         """
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
         r = self._runner()
         with self.assertRaises(RuntimeError):
@@ -1763,7 +1763,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
             self.assertFalse(r.can_run_graph(self._batch()))
 
     def test_the_lane_scope_yields_false_without_a_captured_entry(self):
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         lane = DualGroupLane.__new__(DualGroupLane)
         lane.runner = type("R", (), {"decode_cuda_graph_runner": None})()
@@ -1771,7 +1771,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
             self.assertFalse(captured)
 
     def test_the_lane_scope_refuses_a_chain_of_another_length(self):
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         lane = DualGroupLane.__new__(DualGroupLane)
         lane.runner = type(
@@ -1793,10 +1793,10 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.model_executor.dual_group_lane import (
+        from flliper.srt.model_executor.dual_group_lane import (
             build_lane_chain_verify_input,
         )
-        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
 
@@ -1819,7 +1819,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
 
@@ -1837,8 +1837,8 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
         from types import SimpleNamespace
         from unittest import mock
 
-        from sglang.srt.model_executor import model_runner as mr_mod
-        from sglang.srt.model_executor.model_runner import ModelRunner
+        from flliper.srt.model_executor import model_runner as mr_mod
+        from flliper.srt.model_executor.model_runner import ModelRunner
 
         mr = ModelRunner.__new__(ModelRunner)
         mr.server_args = SimpleNamespace(max_speculative_num_draft_tokens=None)
@@ -1867,11 +1867,11 @@ class TestLaneHeadGraphEntry(unittest.TestCase):
     def _head_runner(self, *, captured=True, max_bs=1, hidden=8):
         import torch
 
-        from sglang.srt.model_executor.forward_batch_info import (
+        from flliper.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardMode,
         )
-        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
 
@@ -1894,7 +1894,7 @@ class TestLaneHeadGraphEntry(unittest.TestCase):
     def _draft_batch(self, *, bs=1, hidden_rows=1, hidden=8, decode=True):
         import torch
 
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
         fb = type("FB", (), {})()
         fb.batch_size = bs
@@ -1919,7 +1919,7 @@ class TestLaneHeadGraphEntry(unittest.TestCase):
         real ``EagleDraftInput`` whose hidden states are the STATIC buffer the
         replay copies into -- a graph input, not a per-round object.
         """
-        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from flliper.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
         r = self._head_runner()
         spec = r.get_spec_info(1)
@@ -1973,7 +1973,7 @@ class TestLaneHeadGraphEntry(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
 
@@ -1991,7 +1991,7 @@ class TestLaneHeadGraphEntry(unittest.TestCase):
         ``verify_graph``: the replay arm and the eager arm of the byte gate have
         to come from ONE boot.
         """
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         lane = DualGroupLane.__new__(DualGroupLane)
         runner = self._head_runner()
@@ -2016,8 +2016,8 @@ class TestLaneHeadGraphEntry(unittest.TestCase):
         """
         from types import SimpleNamespace
 
-        from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
-        from sglang.srt.model_executor.dual_group_lane import (
+        from flliper.srt.model_executor.cuda_graph_config import Backend, Phase
+        from flliper.srt.model_executor.dual_group_lane import (
             _disable_graph_phases,
             _enable_decode_graph_phase,
         )
@@ -2054,7 +2054,7 @@ class TestLaneHeadGraphEntry(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.model_executor import dual_group_lane as dgl
+        from flliper.srt.model_executor import dual_group_lane as dgl
 
         src = inspect.getsource(dgl._finish_lane_draft_runner_scoped)
         pool = src.index("alloc_memory_pool")
@@ -2080,11 +2080,11 @@ class TestLaneSpecRungLadder(unittest.TestCase):
     """
 
     def _runner(self, rungs=(2, 3, 4), captured=None):
-        from sglang.srt.model_executor.forward_batch_info import (
+        from flliper.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardMode,
         )
-        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
 
@@ -2105,7 +2105,7 @@ class TestLaneSpecRungLadder(unittest.TestCase):
     def _batch(self, tokens):
         import torch
 
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
         fb = type("FB", (), {})()
         fb.batch_size = 1
@@ -2138,7 +2138,7 @@ class TestLaneSpecRungLadder(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
 
@@ -2166,7 +2166,7 @@ class TestLaneSpecRungLadder(unittest.TestCase):
                 pass
 
     def test_the_lane_scope_picks_the_rung_it_is_asked_for(self):
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         lane = DualGroupLane.__new__(DualGroupLane)
         runner = self._runner(rungs=(2, 4))
@@ -2187,7 +2187,7 @@ class TestLaneSpecRungLadder(unittest.TestCase):
         """
         from types import SimpleNamespace
 
-        from sglang.srt.model_executor.dual_group_lane import resolve_lane_spec_rungs
+        from flliper.srt.model_executor.dual_group_lane import resolve_lane_spec_rungs
 
         args = SimpleNamespace(
             dual_group_lane_spec_rungs="0,1,3", dual_group_lane_spec_steps=3
@@ -2211,7 +2211,7 @@ class TestLaneSpecRungLadder(unittest.TestCase):
         """
         import torch
 
-        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        from flliper.srt.layers.attention.hybrid_linear_attn_backend import (
             MambaAttnBackendBase,
         )
 
@@ -2242,10 +2242,10 @@ class TestLaneSpecRungLadder(unittest.TestCase):
         first plan, so the surviving rung's capacity became everyone's:
         "the total number of rows in qo_indptr 3 ... cannot exceed ... 2".
         """
-        from sglang.srt.layers.attention.flashinfer_backend import (
+        from flliper.srt.layers.attention.flashinfer_backend import (
             FlashInferAttnBackend,
         )
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
         key = FlashInferAttnBackend._verify_cg_key
         b = object()
@@ -2263,7 +2263,7 @@ class TestLaneSpecRungLadder(unittest.TestCase):
         """Opt-in, because every rung is another graph pool on the lane's card."""
         from types import SimpleNamespace
 
-        from sglang.srt.model_executor.dual_group_lane import resolve_lane_spec_rungs
+        from flliper.srt.model_executor.dual_group_lane import resolve_lane_spec_rungs
 
         args = SimpleNamespace(
             dual_group_lane_spec_rungs=None, dual_group_lane_spec_steps=3
@@ -2280,14 +2280,14 @@ class TestLaneSpecPolicy(unittest.TestCase):
     """
 
     def _policy(self, **kw):
-        from sglang.srt.model_executor.lane_spec_policy import LaneSpecPolicy
+        from flliper.srt.model_executor.lane_spec_policy import LaneSpecPolicy
 
         kw.setdefault("rungs", (0, 1, 2, 3))
         kw.setdefault("adaptive", True)
         return LaneSpecPolicy(**kw)
 
     def test_the_rung_list_parses_and_rejects_junk(self):
-        from sglang.srt.model_executor.lane_spec_policy import parse_lane_spec_rungs
+        from flliper.srt.model_executor.lane_spec_policy import parse_lane_spec_rungs
 
         self.assertEqual(parse_lane_spec_rungs("0,1,2,3"), (0, 1, 2, 3))
         self.assertEqual(parse_lane_spec_rungs(" 3 , 1 ,3"), (1, 3))
@@ -2390,7 +2390,7 @@ class TestLaneSpecPolicy(unittest.TestCase):
 
         Rounding up would run two chain steps the margin already rejected.
         """
-        from sglang.srt.model_executor.lane_spec_policy import LaneSpecPolicy
+        from flliper.srt.model_executor.lane_spec_policy import LaneSpecPolicy
 
         p = LaneSpecPolicy((0, 1, 3), adaptive=True)
         self.assertEqual(p._rung_at_or_below(2, (0, 1, 3)), 1)
@@ -2477,7 +2477,7 @@ class TestLaneSpecPolicy(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         src = inspect.getsource(DualGroupLane._spec_step)
         self.assertIn('job.get("verify_graph") is False', src)
@@ -2516,7 +2516,7 @@ class TestLaneDraftRollback(unittest.TestCase):
     def _lane_and_batch(self, start=10, steps=3):
         import torch
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         class _Fake(DualGroupLane):
             def __init__(self):
@@ -2622,7 +2622,7 @@ class TestLaneDraftReseed(unittest.TestCase):
     def _lane_and_batch(self, start=10, steps=3, rows=3):
         import torch
 
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         class _Fake(DualGroupLane):
             def __init__(self):
@@ -2753,12 +2753,12 @@ class TestAcceptPositionProbe(unittest.TestCase):
     """
 
     def setUp(self):
-        from sglang.srt.speculative import accept_position_probe
+        from flliper.srt.speculative import accept_position_probe
 
         accept_position_probe.reset()
 
     def test_a_greedy_chain_only_evaluates_up_to_the_first_rejection(self):
-        from sglang.srt.speculative import accept_position_probe as probe
+        from flliper.srt.speculative import accept_position_probe as probe
 
         # accept_len 1 == bonus token only, i.e. proposal 0 rejected.
         probe.record_accept_lens([1, 1, 2, 4], num_proposals=3)
@@ -2783,8 +2783,8 @@ class TestAcceptPositionProbe(unittest.TestCase):
         evaluates, and which of those it accepts. Driven one round at a time
         with the EMA weight at 1.0, the policy's rate IS that round's hit flag.
         """
-        from sglang.srt.model_executor.lane_spec_policy import LaneSpecPolicy
-        from sglang.srt.speculative import accept_position_probe as probe
+        from flliper.srt.model_executor.lane_spec_policy import LaneSpecPolicy
+        from flliper.srt.speculative import accept_position_probe as probe
 
         for accept_len in (1, 2, 3, 4):
             probe.reset()
@@ -2813,17 +2813,17 @@ class TestAcceptPositionProbe(unittest.TestCase):
     def test_the_probe_is_off_unless_asked_for(self):
         import os
 
-        from sglang.srt.speculative import accept_position_probe as probe
+        from flliper.srt.speculative import accept_position_probe as probe
 
-        saved = os.environ.pop("SGLANG_ACCEPT_POSITION_PROBE", None)
+        saved = os.environ.pop("FLLIPER_ACCEPT_POSITION_PROBE", None)
         try:
             self.assertFalse(probe.probe_enabled())
-            os.environ["SGLANG_ACCEPT_POSITION_PROBE"] = "1"
+            os.environ["FLLIPER_ACCEPT_POSITION_PROBE"] = "1"
             self.assertTrue(probe.probe_enabled())
         finally:
-            os.environ.pop("SGLANG_ACCEPT_POSITION_PROBE", None)
+            os.environ.pop("FLLIPER_ACCEPT_POSITION_PROBE", None)
             if saved is not None:
-                os.environ["SGLANG_ACCEPT_POSITION_PROBE"] = saved
+                os.environ["FLLIPER_ACCEPT_POSITION_PROBE"] = saved
 
 
 class TestLaneDrafterQuant(unittest.TestCase):
@@ -2844,7 +2844,7 @@ class TestLaneDrafterQuant(unittest.TestCase):
     DENSE = 62_720  # 1-D norms; no format quantises them
 
     def test_the_band_for_a_q3_target_is_q4_to_q6(self):
-        from sglang.srt.model_executor.lane_spec_policy import drafter_quant_band
+        from flliper.srt.model_executor.lane_spec_policy import drafter_quant_band
 
         self.assertEqual(drafter_quant_band("Q3_K_M"), ("q4_k_m", "q5_k_m", "q6_k"))
         # Spelling is the caller's, not the ladder's: this is read off a
@@ -2852,14 +2852,14 @@ class TestLaneDrafterQuant(unittest.TestCase):
         self.assertEqual(drafter_quant_band("q3_k_m"), drafter_quant_band("Q3_K_M"))
 
     def test_the_band_follows_the_target_up_the_ladder(self):
-        from sglang.srt.model_executor.lane_spec_policy import drafter_quant_band
+        from flliper.srt.model_executor.lane_spec_policy import drafter_quant_band
 
         self.assertEqual(drafter_quant_band("fp8_e4m3"), ("bf16",))
         self.assertEqual(drafter_quant_band("bf16"), ())
 
     def test_an_unknown_target_gets_no_band_rather_than_a_guess(self):
         """A recommendation with no evidence under it is worse than none."""
-        from sglang.srt.model_executor.lane_spec_policy import (
+        from flliper.srt.model_executor.lane_spec_policy import (
             choose_drafter_quant,
             drafter_quant_band,
         )
@@ -2871,7 +2871,7 @@ class TestLaneDrafterQuant(unittest.TestCase):
 
     def test_the_footprint_matches_the_checkpoint_at_bf16(self):
         """The ladder's top step must reproduce the measured 3300 MiB."""
-        from sglang.srt.model_executor.lane_spec_policy import drafter_weight_mib
+        from flliper.srt.model_executor.lane_spec_policy import drafter_weight_mib
 
         self.assertAlmostEqual(
             drafter_weight_mib(self.PARAMS, "bf16", self.DENSE), 3300.1, places=1
@@ -2879,7 +2879,7 @@ class TestLaneDrafterQuant(unittest.TestCase):
 
     def test_a_roomy_card_gets_the_top_of_the_band_not_the_top_of_the_ladder(self):
         """Q6, not Q8 and not BF16: the band is what the default respects."""
-        from sglang.srt.model_executor.lane_spec_policy import choose_drafter_quant
+        from flliper.srt.model_executor.lane_spec_policy import choose_drafter_quant
 
         quant, why = choose_drafter_quant(
             "Q3_K_M", budget_mib=2600.0, params=self.PARAMS, dense_params=self.DENSE
@@ -2888,7 +2888,7 @@ class TestLaneDrafterQuant(unittest.TestCase):
         self.assertIn("q6_k", why)
 
     def test_a_tight_card_steps_down_inside_the_band(self):
-        from sglang.srt.model_executor.lane_spec_policy import choose_drafter_quant
+        from flliper.srt.model_executor.lane_spec_policy import choose_drafter_quant
 
         # Room for Q4 and Q5 but not Q6 (1354 MiB).
         quant, _ = choose_drafter_quant(
@@ -2903,7 +2903,7 @@ class TestLaneDrafterQuant(unittest.TestCase):
 
     def test_overhead_is_subtracted_before_the_band_is_walked(self):
         """KV, graphs and dequant scratch are not weights, and they are real."""
-        from sglang.srt.model_executor.lane_spec_policy import choose_drafter_quant
+        from flliper.srt.model_executor.lane_spec_policy import choose_drafter_quant
 
         roomy = dict(target_quant="Q3_K_M", params=self.PARAMS, dense_params=self.DENSE)
         # 1400 MiB holds Q6 (1354). Take 100 MiB of graphs off the top and it
@@ -2922,7 +2922,7 @@ class TestLaneDrafterQuant(unittest.TestCase):
         expected accept, and a helper that made it silently would hide exactly
         the trade the operator asked to control.
         """
-        from sglang.srt.model_executor.lane_spec_policy import choose_drafter_quant
+        from flliper.srt.model_executor.lane_spec_policy import choose_drafter_quant
 
         quant, why = choose_drafter_quant(
             "Q3_K_M", budget_mib=400.0, params=self.PARAMS, dense_params=self.DENSE
@@ -2932,7 +2932,7 @@ class TestLaneDrafterQuant(unittest.TestCase):
         self.assertIn("400", why)
 
     def test_the_policy_carries_the_choice_and_reports_it(self):
-        from sglang.srt.model_executor.lane_spec_policy import (
+        from flliper.srt.model_executor.lane_spec_policy import (
             LANE_DRAFTER_DFLASH,
             LANE_DRAFTER_NEXTN,
             LaneDrafterPolicy,
@@ -2955,7 +2955,7 @@ class TestLaneDrafterQuant(unittest.TestCase):
         self.assertEqual(pol.stats()["drafter_quant"], {LANE_DRAFTER_DFLASH: "Q6_K"})
 
     def test_the_policy_rejects_a_quant_for_a_drafter_it_does_not_have(self):
-        from sglang.srt.model_executor.lane_spec_policy import (
+        from flliper.srt.model_executor.lane_spec_policy import (
             LANE_DRAFTER_DFLASH,
             LANE_DRAFTER_NEXTN,
             LaneDrafterPolicy,
@@ -2982,7 +2982,7 @@ class TestLaneDrafterPolicy(unittest.TestCase):
     """
 
     def _policy(self, **kw):
-        from sglang.srt.model_executor.lane_spec_policy import LaneDrafterPolicy
+        from flliper.srt.model_executor.lane_spec_policy import LaneDrafterPolicy
 
         kw.setdefault("available", ("nextn", "dflash"))
         kw.setdefault("ctx_gate_tokens", 8192)

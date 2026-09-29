@@ -45,8 +45,8 @@ suite as grounds to lift it a third time.
 import types
 import unittest
 
-from sglang.srt.managers.phase_flip_runtime import flip_blocking_guards
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.phase_flip_runtime import flip_blocking_guards
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1)
 

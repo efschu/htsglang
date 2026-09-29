@@ -24,8 +24,8 @@ kv-slack draws. Those are a separate metal ticket.
 
 import pytest
 
-from sglang.srt.managers import corridor_guard as cg
-from sglang.srt.managers.phase_flip_seam_reserve import DEFAULT_ARMING_MARGIN_MIB
+from flliper.srt.managers import corridor_guard as cg
+from flliper.srt.managers.phase_flip_seam_reserve import DEFAULT_ARMING_MARGIN_MIB
 
 
 @pytest.fixture(autouse=True)
@@ -156,7 +156,7 @@ def test_the_production_arming_path_honours_the_flag(monkeypatch):
 
     This drives the real consumer and requires the floor to move.
     """
-    from sglang.srt.managers import phase_flip_seam_reserve as sr
+    from flliper.srt.managers import phase_flip_seam_reserve as sr
 
     monkeypatch.setattr(sr, "_arming_margin_bytes", lambda: 0)
 
@@ -178,7 +178,7 @@ def test_a_measured_draw_above_the_solved_reserve_still_raises_the_floor(monkeyp
     demonstrably draws more than the solved reserve must still raise the
     floor -- lowering it to fit a band would be trading a correctness
     invariant for a funding win, which is what 3b2bbde3ad withdrew."""
-    from sglang.srt.managers import phase_flip_seam_reserve as sr
+    from flliper.srt.managers import phase_flip_seam_reserve as sr
 
     monkeypatch.setattr(sr, "_arming_margin_bytes", lambda: 0)
     monkeypatch.setenv(cg.SOLVED_FLOOR_ENV, "1")

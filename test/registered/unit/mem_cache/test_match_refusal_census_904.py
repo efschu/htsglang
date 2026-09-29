@@ -16,20 +16,20 @@ means recomputed" has no evidence either way. This is the instrument that
 makes the next such boot decidable instead of arguable.
 
 The desk half is here. The boot half is a window ticket: arm
-``SGLANG_MATCH_REFUSAL_CENSUS_EVERY`` on a run whose store is demonstrably
+``FLLIPER_MATCH_REFUSAL_CENSUS_EVERY`` on a run whose store is demonstrably
 non-empty (``staged>0 acked>0`` on the fence line) and read the verdict
 field.
 """
 
 import unittest
 
-from sglang.srt.mem_cache.match_refusal_census import (
+from flliper.srt.mem_cache.match_refusal_census import (
     MatchOutcome,
     MatchRefusalCensus,
     classify,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -115,7 +115,7 @@ class TestThePartitionIsExhaustive(CustomTestCase):
 
 class TestTheGateIsOffByDefault(CustomTestCase):
     def test_disarmed_builds_no_census(self):
-        from sglang.srt.mem_cache.match_refusal_census import (
+        from flliper.srt.mem_cache.match_refusal_census import (
             census_every,
             new_match_census,
         )
@@ -126,20 +126,20 @@ class TestTheGateIsOffByDefault(CustomTestCase):
     def test_armed_builds_one(self):
         import os
 
-        from sglang.srt.mem_cache import match_refusal_census as m
+        from flliper.srt.mem_cache import match_refusal_census as m
 
-        os.environ["SGLANG_MATCH_REFUSAL_CENSUS_EVERY"] = "5"
+        os.environ["FLLIPER_MATCH_REFUSAL_CENSUS_EVERY"] = "5"
         try:
             self.assertEqual(m.census_every(), 5)
             self.assertIsNotNone(m.new_match_census())
         finally:
-            os.environ.pop("SGLANG_MATCH_REFUSAL_CENSUS_EVERY", None)
+            os.environ.pop("FLLIPER_MATCH_REFUSAL_CENSUS_EVERY", None)
 
     def test_a_refusal_is_never_sampled_away(self):
         import logging
         import os
 
-        from sglang.srt.mem_cache import match_refusal_census as m
+        from flliper.srt.mem_cache import match_refusal_census as m
 
         class _Sink(logging.Logger):
             def __init__(self):
@@ -149,7 +149,7 @@ class TestTheGateIsOffByDefault(CustomTestCase):
             def info(self, fmt, *args):
                 self.lines.append(fmt % args if args else fmt)
 
-        os.environ["SGLANG_MATCH_REFUSAL_CENSUS_EVERY"] = "1000"
+        os.environ["FLLIPER_MATCH_REFUSAL_CENSUS_EVERY"] = "1000"
         try:
             sink = _Sink()
             c = m.MatchRefusalCensus()
@@ -165,7 +165,7 @@ class TestTheGateIsOffByDefault(CustomTestCase):
             m.emit(hit, sink2)
             self.assertEqual(len(sink2.lines), 0, "hits are sampled, not streamed")
         finally:
-            os.environ.pop("SGLANG_MATCH_REFUSAL_CENSUS_EVERY", None)
+            os.environ.pop("FLLIPER_MATCH_REFUSAL_CENSUS_EVERY", None)
 
 
 class TestTheWalkIsWired(CustomTestCase):
@@ -176,7 +176,7 @@ class TestTheWalkIsWired(CustomTestCase):
     def test_the_live_match_helper_feeds_it(self):
         import inspect
 
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         src = inspect.getsource(UnifiedRadixCache._match_prefix_helper)
         self.assertIn("new_match_census()", src)
@@ -190,7 +190,7 @@ class TestTheWalkIsWired(CustomTestCase):
         missing, which is the first branch of any follow-up."""
         import inspect
 
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         src = inspect.getsource(UnifiedRadixCache._match_prefix_helper)
         self.assertIn("component_names", src)

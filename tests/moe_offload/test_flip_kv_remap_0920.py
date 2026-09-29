@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.flip_kv_remap import (
+from flliper.srt.flip_kv_remap import (
     DISPOSITION_LEG,
     DISPOSITION_REMAP,
     FULL_ATTENTION_LAYERS,
@@ -12,11 +12,11 @@ from sglang.srt.flip_kv_remap import (
     PP3_BYTES_PER_TOKEN_PER_LAYER,
     plan_kv_remap,
 )
-from sglang.srt.flip_nextflash_plan import (
+from flliper.srt.flip_nextflash_plan import (
     FORM_A_KV,
     PP3_KV,
     KvLayout,
-    Weg2FlipKvRelayInfeasible,
+    PdFlipKvRelayInfeasible,
 )
 
 _GB = 1e9
@@ -117,7 +117,7 @@ def test_an_infeasible_destination_is_W113_before_any_disposition():
         avail_bytes=(1 << 20, 1 << 20, 1 << 20),
         full_attn_per_rank=(12, 0, 0),
     )
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         plan_kv_remap(dst=tiny)
     assert "binds at" in str(exc.value)
 
@@ -132,7 +132,7 @@ def test_a_source_that_does_not_cover_every_layer_is_refused():
         avail_bytes=PP3_KV.avail_bytes,
         full_attn_per_rank=(7, 3, 1),  # 11, not 12
     )
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         plan_kv_remap(src=short)
     msg = str(exc.value)
     assert "11 full-attention layer(s)" in msg
@@ -147,7 +147,7 @@ def test_a_destination_with_two_carriers_is_refused():
         avail_bytes=(8 << 30, 8 << 30, 8 << 30),
         full_attn_per_rank=(6, 6, 0),
     )
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         plan_kv_remap(dst=two)
     assert "exactly ONE attention host" in str(exc.value)
 
@@ -160,14 +160,14 @@ def test_a_destination_holding_fewer_than_all_layers_is_a_different_layout():
         avail_bytes=(8 << 30, 2 << 30, 2 << 30),
         full_attn_per_rank=(11, 0, 0),
     )
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         plan_kv_remap(dst=partial, total_full_attention_layers=11)
     # src still says 12 -> caught on the source check first
     assert "full-attention layer" in str(exc.value)
 
 
 def test_an_unrated_lane_is_refused_rather_than_costed_as_free():
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         plan_kv_remap(link_gb_s={0: 14.4})  # ranks 1 and 2 unrated
     msg = str(exc.value)
     assert "no measured link rate" in msg
@@ -175,7 +175,7 @@ def test_an_unrated_lane_is_refused_rather_than_costed_as_free():
 
 
 def test_a_non_cell_is_refused():
-    with pytest.raises(Weg2FlipKvRelayInfeasible):
+    with pytest.raises(PdFlipKvRelayInfeasible):
         plan_kv_remap(bytes_per_token_per_layer=0)
 
 

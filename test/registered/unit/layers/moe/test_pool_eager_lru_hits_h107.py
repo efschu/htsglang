@@ -18,7 +18,7 @@ What must hold, black-box through the FusedMoE pool branch
   the hit rows keep their expert and are stamped as used, and the next
   decode step routes every lane to a row holding that expert's bytes;
 * the pool map crosses in the SAME D2H as the routing (no extra sync);
-* SGLANG_OPT_MOE_POOL_EAGER_LRU_HITS=0 restores the plain plan.
+* FLLIPER_OPT_MOE_POOL_EAGER_LRU_HITS=0 restores the plain plan.
 """
 
 import os
@@ -30,11 +30,11 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.srt.layers.moe import expert_pool_device as ep
-from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.environ import envs
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_pool_device as ep
+from flliper.srt.layers.moe.topk import StandardTopKOutput
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -57,7 +57,7 @@ def _pool_cache(monkeypatch, warm=()):
     """A CPU pool cache whose bank rows carry their expert id as bytes; the
     experts in ``warm`` are seeded into LRU rows as a decode round would
     have left them."""
-    monkeypatch.setenv("SGLANG_MOE_SCRATCH_SLOTS", str(C))
+    monkeypatch.setenv("FLLIPER_MOE_SCRATCH_SLOTS", str(C))
     monkeypatch.setitem(eo._PARTIALS_MODE, "mode", "stream")  # no combine kernel on CPU
     layer = SimpleNamespace(
         num_local_experts=E, layer_id=23,
@@ -139,7 +139,7 @@ def test_output_is_bit_identical_with_and_without_the_switch(monkeypatch):
     routes = [[2, 3, 0], [4, 5, 1], [2, 6, 0], [3, 7, 1], [8, 9, 2], [7, 3, 9]]
     with_switch, _ = _pool_cache(monkeypatch, warm=[3, 7, 9])
     on = _extend(with_switch, routes)
-    with envs.SGLANG_OPT_MOE_POOL_EAGER_LRU_HITS.override(False):
+    with envs.FLLIPER_OPT_MOE_POOL_EAGER_LRU_HITS.override(False):
         without, _ = _pool_cache(monkeypatch, warm=[3, 7, 9])
     off = _extend(without, routes)
     assert torch.equal(on, off)
@@ -198,7 +198,7 @@ def test_the_pool_map_crosses_with_the_routing_in_one_host_read(monkeypatch):
 
 
 def test_the_switch_off_fetches_the_warm_experts_again(monkeypatch):
-    with envs.SGLANG_OPT_MOE_POOL_EAGER_LRU_HITS.override(False):
+    with envs.FLLIPER_OPT_MOE_POOL_EAGER_LRU_HITS.override(False):
         cache, fetched = _pool_cache(monkeypatch, warm=[3, 7])
     got = _extend(cache)
     assert {3, 7} <= set(fetched)

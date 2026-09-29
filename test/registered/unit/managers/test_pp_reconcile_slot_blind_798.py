@@ -62,12 +62,12 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.managers.pp_admission_congruence import (
+from flliper.srt.managers.pp_admission_congruence import (
     PPAdmissionDecision,
     PPAdmissionEntry,
 )
-from sglang.srt.managers import scheduler_pp_mixin as spm
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from flliper.srt.managers import scheduler_pp_mixin as spm
+from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
 RING = 3
 RANK = 1

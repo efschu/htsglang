@@ -5,7 +5,7 @@ Metal boot xsn407 (20.09. 17:16Z, tree 16d39cbb1c) got further than any before
 it: census, placement (card0), tower load all ran. The ENCODER FORWARD then
 refused::
 
-    W107 Weg2VisionEncodeFailed rid=weg2-8-27 -- VisionStageEncodeFailed:
+    W107 PdFlipVisionEncodeFailed rid=pdflip-8-27 -- VisionStageEncodeFailed:
     card0: the encoder forward over 1 item(s) raised: out of resource: shared
     memory, Required: 131072, Hardware limit: 101376. Reducing block sizes or
     num_stages may help.
@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.weg2.vision_stage_boot import (
+from flliper.srt.pdflip.vision_stage_boot import (
     TRITON_BACKED_BACKENDS,
     TRITON_VISION_ATTN_SMEM_BYTES,
     VISION_BACKEND_FALLBACK,
@@ -69,7 +69,7 @@ class TestTheConstantsAreTheMeasuredOnes:
 
     def test_the_fallback_is_a_real_registered_backend(self):
         """A fallback that is not in the registry is a KeyError at load time."""
-        from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
+        from flliper.srt.layers.attention.vision import QKV_BACKEND_IMPL
 
         assert VISION_BACKEND_FALLBACK in QKV_BACKEND_IMPL
         for name in TRITON_BACKED_BACKENDS:
@@ -177,8 +177,8 @@ class TestTheOperatorOverride:
 
 class TestTheRefusalIsMappedToAWCode:
     def test_it_is_a_load_refusal_so_code_for_gives_W106(self):
-        from sglang.srt.planner.vision_stage_load import VisionStageLoadRefused
-        from sglang.srt.weg2.vision_stage_service import W_LOAD, code_for
+        from flliper.srt.planner.vision_stage_load import VisionStageLoadRefused
+        from flliper.srt.pdflip.vision_stage_service import W_LOAD, code_for
 
         assert issubclass(VisionStageBackendRefused, VisionStageLoadRefused)
         code, fatal = code_for(VisionStageBackendRefused("x"))
@@ -193,7 +193,7 @@ class TestTheUpstreamDefaultIsWhatWeThinkItIs:
     def test_the_default_table_only_special_cases_sm90_and_sm100(self):
         import inspect
 
-        from sglang.srt.layers.attention import vision
+        from flliper.srt.layers.attention import vision
 
         src = inspect.getsource(vision.VisionAttention._determine_attention_backend)
         assert 'backend = "fa3"' in src and "major == 9" in src
@@ -205,7 +205,7 @@ class TestTheUpstreamDefaultIsWhatWeThinkItIs:
         """Why block sizes are not a knob this stage can turn."""
         import inspect
 
-        from sglang.srt.layers.attention import vision
+        from flliper.srt.layers.attention import vision
 
         src = inspect.getsource(vision.VisionTritonAttention)
         assert "context_attention_fwd" in src
@@ -219,7 +219,7 @@ class TestTheWiring:
     def test_the_builder_decides_before_it_builds(self):
         import inspect
 
-        from sglang.srt.weg2 import vision_stage_boot as vsb
+        from flliper.srt.pdflip import vision_stage_boot as vsb
 
         src = inspect.getsource(vsb._build_qwen3vl_tower)
         assert "choose_vision_attention_backend(" in src
@@ -234,10 +234,10 @@ class TestTheWiring:
     def test_the_override_context_restores_the_previous_value(self):
         import types
 
-        from sglang.srt.weg2 import vision_stage_boot as vsb
+        from flliper.srt.pdflip import vision_stage_boot as vsb
 
         fake = types.SimpleNamespace(mm_attention_backend="original")
-        import sglang.srt.runtime_context as rc
+        import flliper.srt.runtime_context as rc
 
         real = rc.get_server_args
         rc.get_server_args = lambda: fake
@@ -255,6 +255,6 @@ class TestTheWiring:
 
     def test_the_probe_returns_None_rather_than_a_fabricated_ceiling(self):
         """With no CUDA present it must be None -- the refusing value."""
-        from sglang.srt.weg2.vision_stage_boot import smem_optin_for_torch_index
+        from flliper.srt.pdflip.vision_stage_boot import smem_optin_for_torch_index
 
         assert smem_optin_for_torch_index(0) is None

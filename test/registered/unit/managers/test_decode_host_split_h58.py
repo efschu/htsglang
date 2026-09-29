@@ -25,9 +25,9 @@ from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.environ import envs
-from sglang.srt.managers.scheduler_components import decode_host_split as dhs
-from sglang.srt.managers.scheduler_components.decode_host_split import (
+from flliper.srt.environ import envs
+from flliper.srt.managers.scheduler_components import decode_host_split as dhs
+from flliper.srt.managers.scheduler_components.decode_host_split import (
     MARK_DEXT_BEGIN,
     MARK_DEXT_END,
     MARK_DRAFT_BEGIN,
@@ -38,14 +38,14 @@ from sglang.srt.managers.scheduler_components.decode_host_split import (
     DeviceGapProbe,
     SplitCounters,
 )
-from sglang.srt.managers.scheduler_components.host_round_cost import (
+from flliper.srt.managers.scheduler_components.host_round_cost import (
     HostCostCounters,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
-MOD = "sglang.srt.managers.scheduler_components.decode_host_split"
+MOD = "flliper.srt.managers.scheduler_components.decode_host_split"
 #: the ``python/`` root the module under test was imported from
 PY = os.path.normpath(os.path.join(os.path.dirname(dhs.__file__), "..", "..", "..", ".."))
 
@@ -365,8 +365,8 @@ class DecodeHostSplitTest(unittest.TestCase):
         self.assertTrue(any(l.startswith("DECODE-HOST-SPLIT rank=0 n=2") for l in cap.lines))
 
     def test_env_drives_the_period(self):
-        self.assertEqual(envs.SGLANG_DEBUG_DECODE_HOST_SPLIT.get(), 64)
-        with envs.SGLANG_DEBUG_DECODE_HOST_SPLIT.override(0):
+        self.assertEqual(envs.FLLIPER_DEBUG_DECODE_HOST_SPLIT.get(), 64)
+        with envs.FLLIPER_DEBUG_DECODE_HOST_SPLIT.override(0):
             s = DecodeHostSplit.from_env(rank=0)
             self.assertFalse(s.on)
             self.assertIsNone(s.probe)
@@ -396,11 +396,11 @@ class DecodeHostSplitTest(unittest.TestCase):
 
 class DecodeRoundLogCarriesTheSplitTest(unittest.TestCase):
     def test_begin_and_end_round_drive_the_split_and_register_it(self):
-        from sglang.srt.managers.scheduler_components.decode_round_log import (
+        from flliper.srt.managers.scheduler_components.decode_round_log import (
             DecodeRoundLog,
         )
 
-        with envs.SGLANG_DEBUG_DECODE_HOST_SPLIT.override(0):
+        with envs.FLLIPER_DEBUG_DECODE_HOST_SPLIT.override(0):
             log = DecodeRoundLog(clock=None, rank=1)
         self.assertIs(dhs.active_split(), log.host_split)
         c = SplitCounters()
@@ -420,7 +420,7 @@ class WiringTest(unittest.TestCase):
     def test_resolve_seq_lens_cpu_times_its_existing_sync_as_seq_wait(self):
         import torch
 
-        from sglang.srt.managers import overlap_utils
+        from flliper.srt.managers import overlap_utils
 
         clk = _Clock()
 
@@ -461,7 +461,7 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(int(batch.seq_lens_sum), 700)
 
     def test_finish_ple_verify_stage_splits_sync_and_stage(self):
-        from sglang.srt.models import qwen4_exp_ple_decode_pread as ple
+        from flliper.srt.models import qwen4_exp_ple_decode_pread as ple
 
         clk = _Clock()
         staged = []
@@ -489,7 +489,7 @@ class WiringTest(unittest.TestCase):
         self.assertAlmostEqual(dhs.SPLIT.ple_stage_ms - b[1], 1.2, places=6)
 
     def test_barlink_broadcast_counts_every_host_path_broadcast(self):
-        from sglang.srt.distributed.device_communicators.barlink import (
+        from flliper.srt.distributed.device_communicators.barlink import (
             BarlinkCommunicator,
         )
 
@@ -518,8 +518,8 @@ class WiringTest(unittest.TestCase):
     def test_bar1_forced_wait_is_ctl_wait_and_only_that(self):
         import torch
 
-        from sglang.srt.distributed.device_communicators import barlink_abort_gate
-        from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+        from flliper.srt.distributed.device_communicators import barlink_abort_gate
+        from flliper.srt.distributed.device_communicators.barlink_bar1 import (
             BarlinkBar1Transport,
         )
 
@@ -578,7 +578,7 @@ class StructuralWiringTest(unittest.TestCase):
                     self.assertNotIn(s, line, line)
 
     def test_scheduler_overlap_loop_spans(self):
-        text = _src("sglang/srt/managers/scheduler.py")
+        text = _src("flliper/srt/managers/scheduler.py")
         src = _between(text, "    def event_loop_overlap(self):",
                        "    def is_disable_overlap_for_batch(")
         for span in ("result_ms", "recv_ms", "sched_ms"):
@@ -591,7 +591,7 @@ class StructuralWiringTest(unittest.TestCase):
         self._no_sync_on_h58_lines(src)
 
     def test_eagle_round_marks_and_spans_in_order(self):
-        text = _src("sglang/srt/speculative/eagle_worker_v2.py")
+        text = _src("flliper/srt/speculative/eagle_worker_v2.py")
         rnd = _between(text, "    def _forward_decode_round(", "    def _forward_spill_tick_spec(")
         order = [
             "_h58.mark(_h58.MARK_DRAFT_BEGIN)",
@@ -632,7 +632,7 @@ class StructuralWiringTest(unittest.TestCase):
         self.assertEqual(ver.count(".synchronize()"), 0)
 
     def test_expert_planner_resolve_is_timed_once(self):
-        text = _src("sglang/srt/layers/moe/expert_offload.py")
+        text = _src("flliper/srt/layers/moe/expert_offload.py")
         cls = _between(text, "class ExpertResidencyPlanner:", "    def resolve_sticky(")
         self.assertIn('@_h58_timed("fetch_plan_ms", "fetch_plan_n")\n    def resolve(', cls)
         sticky = _between(text, "    def resolve_sticky(", "\n    def ")
@@ -642,19 +642,19 @@ class StructuralWiringTest(unittest.TestCase):
         """Why seq_wait is 0 on NF and the forced BAR1 wait is where NF's host
         blocks: every backend NF's spec-v2 round touches opts out, so
         ``resolve_seq_lens_cpu`` takes the GPU-only branch (no host sync)."""
-        qsa = _src("sglang/srt/layers/attention/qwen_sparse_attn_backend.py")
+        qsa = _src("flliper/srt/layers/attention/qwen_sparse_attn_backend.py")
         for cls in ("class QwenSparseAttnBackend(", "class QwenSparseMultiStepDraftBackend"):
             head = qsa[qsa.index(cls):][:400]
             self.assertIn("needs_cpu_seq_lens: bool = False", head, cls)
-        gdn = _src("sglang/srt/layers/attention/linear/gdn_backend.py")
+        gdn = _src("flliper/srt/layers/attention/linear/gdn_backend.py")
         self.assertIn("needs_cpu_seq_lens: bool = False", gdn)
-        hyb = _src("sglang/srt/layers/attention/hybrid_linear_attn_backend.py")
+        hyb = _src("flliper/srt/layers/attention/hybrid_linear_attn_backend.py")
         self.assertRegex(
             hyb,
             r"self\.needs_cpu_seq_lens = \(\s*full_attn_backend\.needs_cpu_seq_lens\s*"
             r"or linear_attn_backend\.needs_cpu_seq_lens",
         )
-        from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
+        from flliper.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 
         args = types.SimpleNamespace(enable_two_batch_overlap=False,
                                      speculative_algorithm="EAGLE")
@@ -663,7 +663,7 @@ class StructuralWiringTest(unittest.TestCase):
         self.assertTrue(decide_needs_cpu_seq_lens(args, [off, object()]))
 
     def test_seq_wait_brackets_the_existing_sync(self):
-        text = _src("sglang/srt/managers/overlap_utils.py")
+        text = _src("flliper/srt/managers/overlap_utils.py")
         src = _between(text, "    def resolve_seq_lens_cpu(", "    def publish(")
         self.assertEqual(src.count(".synchronize()"), 2)  # HIP publish + d2h stream
         a = src.index("_h58_t0 = time.perf_counter()")

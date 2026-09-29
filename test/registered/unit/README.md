@@ -5,7 +5,7 @@ Tests can use CPU or GPU — the key criterion is **no server process**.
 
 ## Quick Start
 
-1. Find the source file under `python/sglang/srt/`.
+1. Find the source file under `python/flliper/srt/`.
 2. Create the corresponding test here, mirroring the source tree:
    ```
    srt/mem_cache/radix_cache.py       →  unit/mem_cache/test_radix_cache.py
@@ -13,7 +13,7 @@ Tests can use CPU or GPU — the key criterion is **no server process**.
    ```
 3. Register for CI at the **top of the file** (after imports, before test classes):
    ```python
-   from sglang.test.ci.ci_register import register_cpu_ci
+   from flliper.test.ci.ci_register import register_cpu_ci
    register_cpu_ci(est_time=5, suite="base-a-test-cpu")
    # or: register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
    ```
@@ -42,14 +42,14 @@ Tests can use CPU or GPU — the key criterion is **no server process**.
 ```python
 """Unit tests for <module> — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.<module> import TargetClass
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.<module> import TargetClass
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestTargetClass(CustomTestCase):
@@ -73,19 +73,19 @@ on GPU machines, and on CPU it installs a `sys.meta_path` finder that auto-creat
 stub modules for all `sgl_kernel.*` submodules.
 
 ```python
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
-from sglang.srt.managers.io_struct import FlushCacheReqInput
-from sglang.srt.managers.scheduler import Scheduler
+from flliper.srt.managers.io_struct import FlushCacheReqInput
+from flliper.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 ```
 
 The same pattern (`sys.meta_path` finder) can be applied to other GPU-only packages.
-See `maybe_stub_sgl_kernel()` in `python/sglang/test/test_utils.py` for the
+See `maybe_stub_sgl_kernel()` in `python/flliper/test/test_utils.py` for the
 implementation. Do not directly mutate `sys.modules` at module level — pytest
 imports all test files before running any, so such mutations pollute the entire
 process. If you must stub, use `patch.dict("sys.modules", ...)` with proper cleanup.
@@ -94,5 +94,5 @@ process. If you must stub, use `patch.dict("sys.modules", ...)` with proper clea
 
 - **No** `popen_launch_server()` or `Engine(...)`.
 - **No** model weight loading.
-- Use `CustomTestCase` (from `sglang.test.test_utils`, adds CI retry).
+- Use `CustomTestCase` (from `flliper.test.test_utils`, adds CI retry).
 - Use `unittest.mock` for dependencies that are expensive to construct.

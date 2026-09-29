@@ -30,7 +30,7 @@ Hermetic: a pure function, no pool, no driver, no CUDA.
 
 import unittest
 
-from sglang.srt.managers.kv_backing_relief import lawful_reservation_rows
+from flliper.srt.managers.kv_backing_relief import lawful_reservation_rows
 
 
 class TestTheReservationCoversTheFloor(unittest.TestCase):
@@ -101,7 +101,7 @@ class TestTheFloorIsREACHABLE(unittest.TestCase):
     @staticmethod
     def _shipped_reservation(size):
         """The reservation the SHIPPED pool would take for `size` rows."""
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         pool = type("P", (), {"size": size})()
         return int(MHATokenToKVPool._lawful_reserved_tokens(pool))

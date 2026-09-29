@@ -12,10 +12,10 @@ import tempfile
 import unittest
 import urllib.parse
 
-from sglang.srt.planner import issue_text as it
-from sglang.srt.planner import scrub
-from sglang.srt.planner.hardware import hardware_from_manual
-from sglang.srt.planner.issue_text import (
+from flliper.srt.planner import issue_text as it
+from flliper.srt.planner import scrub
+from flliper.srt.planner.hardware import hardware_from_manual
+from flliper.srt.planner.issue_text import (
     BenchmarkFields,
     EnergyFields,
     HardwareFingerprint,
@@ -25,8 +25,8 @@ from sglang.srt.planner.issue_text import (
     results_from_plan,
     results_issue,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -96,8 +96,8 @@ class TestScrub(CustomTestCase):
         self.assertEqual(out[1], "--tp-size 3")
 
     def test_hotset_env_basenamed(self):
-        out = scrub.scrub_launch_flags(["SGLANG_MOE_HOTSET_FILE=/home/x/hot.json"])
-        self.assertEqual(out[0], "SGLANG_MOE_HOTSET_FILE=hot.json")
+        out = scrub.scrub_launch_flags(["FLLIPER_MOE_HOTSET_FILE=/home/x/hot.json"])
+        self.assertEqual(out[0], "FLLIPER_MOE_HOTSET_FILE=hot.json")
 
     def test_log_excerpt_windows_around_error_and_scrubs(self):
         log = "\n".join(
@@ -147,7 +147,7 @@ class TestResultsIssue(CustomTestCase):
                 "--tp-size 3",
                 "--rank-gpu-id 0,1,2",
                 "--rank-gpu-memory-mib 28591,16464,16464",
-                "SGLANG_UNEVEN_DCP=1",
+                "FLLIPER_UNEVEN_DCP=1",
             ],
             fits=True,
             max_context_tokens=206748,
@@ -251,7 +251,7 @@ class TestBugIssue(CustomTestCase):
 class TestPlanBridges(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        from sglang.srt.planner.feasibility import plan
+        from flliper.srt.planner.feasibility import plan
 
         cls._tmp = tempfile.TemporaryDirectory()
         path = os.path.join(cls._tmp.name, "model")
@@ -272,7 +272,7 @@ class TestPlanBridges(CustomTestCase):
         self.assertIn("### Config that ran", issue.markdown)
         self.assertIn("--rank-gpu-id 0,1,2", issue.markdown)
         # Env token routed into the config block, not as a flag arg.
-        self.assertIn("SGLANG_UNEVEN_DCP=1", issue.markdown)
+        self.assertIn("FLLIPER_UNEVEN_DCP=1", issue.markdown)
         # stock cannot shard 4 KV heads across 3 -> verdict carries it, no
         # fabricated capacity %.
         self.assertIn("planner estimate", issue.markdown)

@@ -1,10 +1,10 @@
 """
 Usage:
 # replay from a folder
-python3 replay_request_dump.py --file-number 100 --parallel 512 --input-folder /data/lianmin/sglang_request_dump/engine-34xd1/
+python3 replay_request_dump.py --file-number 100 --parallel 512 --input-folder /data/lianmin/flliper_request_dump/engine-34xd1/
 
 # replay from a single file
-python3 replay_request_dump.py --parallel 512 --input-file /data/sglang_crash_dump/crash_dump_2025-06-04_20-13-18.pkl
+python3 replay_request_dump.py --parallel 512 --input-file /data/flliper_crash_dump/crash_dump_2025-06-04_20-13-18.pkl
 """
 
 import argparse
@@ -17,9 +17,9 @@ from datetime import datetime
 
 import requests
 
-from sglang.benchmark.utils import set_ulimit
-from sglang.srt.utils.common import safe_pickle_load
-from sglang.utils import get_exception_traceback
+from flliper.benchmark.utils import set_ulimit
+from flliper.srt.utils.common import safe_pickle_load
+from flliper.utils import get_exception_traceback
 
 
 def normalize_mm_data_item(item):

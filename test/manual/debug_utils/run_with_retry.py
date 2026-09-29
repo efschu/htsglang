@@ -2,13 +2,13 @@
 Simple wrapper to run a test file with retry logic.
 
 Usage:
-    python3 -m sglang.test.ci.run_with_retry test_file.py [--max-attempts 2] [--retry-wait 60]
+    python3 -m flliper.test.ci.run_with_retry test_file.py [--max-attempts 2] [--retry-wait 60]
 """
 
 import argparse
 import sys
 
-from sglang.test.ci.ci_utils import TestFile, run_unittest_files
+from flliper.test.ci.ci_utils import TestFile, run_unittest_files
 
 
 def main():

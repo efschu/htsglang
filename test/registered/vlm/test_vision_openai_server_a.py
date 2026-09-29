@@ -8,9 +8,9 @@ import unittest
 
 import openai
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.vlm_utils import *
-from sglang.test.vlm_utils import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.vlm_utils import *
+from flliper.test.vlm_utils import (
     AudioOpenAITestMixin,
     CustomTestCase,
     ImageOpenAITestMixin,

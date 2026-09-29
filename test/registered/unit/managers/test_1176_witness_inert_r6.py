@@ -48,8 +48,8 @@ import unittest
 
 import torch
 
-from sglang.srt.managers import phase_purity
-from sglang.srt.managers.phase_purity import (
+from flliper.srt.managers import phase_purity
+from flliper.srt.managers.phase_purity import (
     SEAM_GRANT_CONSUMED_ATTR,
     SEAM_READMIT_ATTR,
     observe_store_witness,
@@ -57,10 +57,10 @@ from sglang.srt.managers.phase_purity import (
     store_witness,
     witness_readings,
 )
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.hicache_storage import PrefetchOutcome
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.hicache_storage import PrefetchOutcome
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -238,7 +238,7 @@ class A_TheWitnessIsInert(CustomTestCase):
         legitimate as NEGATIVE assertions (this file and the #1157 ratchet
         both name them to keep them dead), so test/ is checked for BINDINGS
         instead -- an import or a call, never a mention."""
-        root = phase_purity.__file__.split("/python/sglang/")[0]
+        root = phase_purity.__file__.split("/python/flliper/")[0]
         prod = subprocess.run(
             ["grep", "-rn", "-e", "StoreWitnessContradiction",
              "-e", "witness_stop_authority", "-e", "assert_store_witness_at_admission",
@@ -380,7 +380,7 @@ class C_TheObservationMeasuresEveryDisputedTerm(CustomTestCase):
 
     def _emit(self, req, outcome, sched=None):
         s = sched or _sched([req], outcomes={req.rid: outcome})
-        with self.assertLogs("sglang.srt.managers.phase_purity", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.managers.phase_purity", level="WARNING") as cm:
             observe_store_witness(s, req, outcome, s.tree_cache)
         return "\n".join(cm.output)
 
@@ -466,7 +466,7 @@ class C_TheObservationMeasuresEveryDisputedTerm(CustomTestCase):
         out = PrefetchOutcome(0, hit_tokens=1, probed=True)
         s = _sched([r], outcomes={r.rid: out})
         n = head + 2 * every + 5
-        with self.assertLogs("sglang.srt.managers.phase_purity", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.managers.phase_purity", level="WARNING") as cm:
             for _ in range(n):
                 observe_store_witness(s, r, out, s.tree_cache)
         emitted = [ln for ln in cm.output if "STORE WITNESS OBSERVATION" in ln]
@@ -539,7 +539,7 @@ class D_TheReaderSurvivesTheProductionType(CustomTestCase):
                 req.prefix_indices = pi
                 s = _sched([req], outcomes={req.rid: out})
                 with self.assertLogs(
-                    "sglang.srt.managers.phase_purity", level="WARNING"
+                    "flliper.srt.managers.phase_purity", level="WARNING"
                 ) as cm:
                     observe_store_witness(s, req, out, s.tree_cache)
                 self.assertIn(f"resident={want}", "\n".join(cm.output))
@@ -576,7 +576,7 @@ class E_ABreachIsNeverSuppressedByTheRateLimit(CustomTestCase):
         bs = _sched([benign], outcomes={benign.rid: bout})
         brs = _sched([breach_req], outcomes={breach_req.rid: breach_out})
         with self.assertLogs(
-            "sglang.srt.managers.phase_purity", level="WARNING"
+            "flliper.srt.managers.phase_purity", level="WARNING"
         ) as cm:
             for _ in range(n_benign):
                 observe_store_witness(bs, benign, bout, bs.tree_cache)
@@ -621,7 +621,7 @@ class E_ABreachIsNeverSuppressedByTheRateLimit(CustomTestCase):
         s = _sched([req], outcomes={req.rid: out})
         n = head + 2 * every + 5
         with self.assertLogs(
-            "sglang.srt.managers.phase_purity", level="WARNING"
+            "flliper.srt.managers.phase_purity", level="WARNING"
         ) as cm:
             for _ in range(n):
                 observe_store_witness(s, req, out, s.tree_cache)

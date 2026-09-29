@@ -18,8 +18,8 @@ import sys
 
 import pytest
 
-from sglang.srt.managers import phase_flip_boot as boot
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import phase_flip_boot as boot
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10)
 
@@ -184,7 +184,7 @@ def _patch_flip_scope_deps(monkeypatch, active=False, world_rank=0):
     ``active`` seeds the routing-active state the scope must SAVE on entry
     and RESTORE on exit (part B). Returns the mutable dict backing the fake
     so a test can read/flip it directly if needed."""
-    from sglang.srt.distributed import parallel_state as ps
+    from flliper.srt.distributed import parallel_state as ps
 
     routing = {"active": active}
     monkeypatch.setattr(ps, "get_phase_flip_group", lambda kind: f"fake-flip-{kind}")
@@ -199,7 +199,7 @@ def _patch_flip_scope_deps(monkeypatch, active=False, world_rank=0):
 
 
 def _restore(depth, tp, draft, monkeypatch, carrier=None, vector=(1, 1, 1)):
-    from sglang.srt.managers import phase_flip_spill as sp
+    from flliper.srt.managers import phase_flip_spill as sp
 
     monkeypatch.delenv(sp.DEPTH_ENV, raising=False)
     monkeypatch.setenv(sp.DEPTH_UNIMPLEMENTED_ENV, "1")
@@ -245,7 +245,7 @@ def test_the_cutover_reaches_the_restore_through_the_named_helper():
     """STRUCTURAL: the seam's restore slot must actually call it."""
     import inspect
 
-    from sglang.srt.managers import phase_flip_runtime as rt
+    from flliper.srt.managers import phase_flip_runtime as rt
 
     src = inspect.getsource(rt.build_production_flip_cutover)
     assert "restore_deferred_cold_stack" in src
@@ -257,7 +257,7 @@ def test_the_cutover_reaches_the_restore_through_the_named_helper():
 
 
 def _runtime(scheduler, rank=0):
-    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+    from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
     rt = object.__new__(PhaseFlipRuntime)
     rt._census_scheduler = scheduler
@@ -266,9 +266,9 @@ def _runtime(scheduler, rank=0):
 
 
 def _price(depth, monkeypatch, direction=None, rank=0, built=False, draft=True):
-    from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
-    from sglang.srt.managers import phase_flip_spill as sp
-    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+    from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP
+    from flliper.srt.managers import phase_flip_spill as sp
+    from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
     monkeypatch.delenv(sp.DEPTH_ENV, raising=False)
     monkeypatch.setenv(sp.DEPTH_UNIMPLEMENTED_ENV, "1")
@@ -288,7 +288,7 @@ def test_the_seam_prices_the_deferred_build_on_the_leg_that_performs_it(monkeypa
     point of no return -- the same shape that killed all three ranks on
     2026-08-09 when rung 2's re-commit was unpriced. Pricing it converts a
     death into a free abandon before a byte moves."""
-    from sglang.srt.managers.arena_tail_probe import STACK_RESIDUAL_MIB
+    from flliper.srt.managers.arena_tail_probe import STACK_RESIDUAL_MIB
 
     for rank in (0, 1, 2):
         assert _price("draft+graphs", monkeypatch, rank=rank) == (
@@ -297,7 +297,7 @@ def test_the_seam_prices_the_deferred_build_on_the_leg_that_performs_it(monkeypa
 
 
 def test_nothing_is_priced_on_the_tp_to_pp_leg(monkeypatch):
-    from sglang.srt.layers.dcp.phase_flip_plan import TP_TO_PP
+    from flliper.srt.layers.dcp.phase_flip_plan import TP_TO_PP
 
     assert _price("draft+graphs", monkeypatch, direction=TP_TO_PP) == 0
 
@@ -317,8 +317,8 @@ def test_nothing_is_priced_at_a_rung_that_does_not_defer(monkeypatch):
 
 
 def test_a_unit_stub_without_a_scheduler_prices_zero_rather_than_raising():
-    from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
-    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+    from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP
+    from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
     rt = _runtime(None)
     assert PhaseFlipRuntime._cold_stack_restore_bytes(rt, PP_TO_TP) == 0
@@ -328,7 +328,7 @@ def test_the_staging_formula_actually_consults_the_new_term():
     """STRUCTURAL: a priced term nobody adds is not a gate."""
     import inspect
 
-    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+    from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
     src = inspect.getsource(PhaseFlipRuntime._staging_bytes)
     assert "_cold_stack_restore_bytes" in src
@@ -350,7 +350,7 @@ def test_the_restore_builds_under_the_flip_tp_geometry_not_the_ambient_one(
     instead of the flip TP size (n) the KV pool was actually sized under.
     Assert on the geometry the code under test ACTUALLY OBSERVES during the
     build, not on the fix's intent."""
-    from sglang.srt.runtime_context import get_parallel
+    from flliper.srt.runtime_context import get_parallel
 
     # Ambient, outside any scope: no distributed groups are initialized in
     # this hermetic process, so this is the real fallback the ambient read
@@ -390,7 +390,7 @@ def test_the_scope_restores_a_previously_armed_tp_routing(monkeypatch):
     # Imported AFTER patching: the fake replaces the module attribute, and
     # this name must bind to the CURRENT (patched) function object, not the
     # real one bound at module-import time.
-    from sglang.srt.distributed.parallel_state import phase_flip_tp_routing_active
+    from flliper.srt.distributed.parallel_state import phase_flip_tp_routing_active
 
     assert phase_flip_tp_routing_active() is True
     with boot.phase_flip_tp_scope(0, 3):
@@ -403,7 +403,7 @@ def test_the_scope_leaves_routing_off_when_it_started_off(monkeypatch):
     always False there, so the scope must still exit False -- this is what
     keeps the boot path's behaviour unchanged by the part B fix."""
     _patch_flip_scope_deps(monkeypatch, active=False)
-    from sglang.srt.distributed.parallel_state import phase_flip_tp_routing_active
+    from flliper.srt.distributed.parallel_state import phase_flip_tp_routing_active
 
     assert phase_flip_tp_routing_active() is False
     with boot.phase_flip_tp_scope(0, 3):
@@ -450,7 +450,7 @@ def test_the_geometry_guard_does_not_fire_on_the_healthy_scoped_path(monkeypatch
     A) cutover shape. Executed explicitly, not merely asserted about,
     because a guard that always fires would make the positive-direction test
     below meaningless."""
-    from sglang.srt.distributed import utils as dist_utils
+    from flliper.srt.distributed import utils as dist_utils
 
     monkeypatch.setattr(
         dist_utils, "get_tp_partition_ratios", lambda *a, **k: [30, 17, 17]

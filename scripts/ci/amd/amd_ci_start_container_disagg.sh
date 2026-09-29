@@ -2,27 +2,27 @@
 set -euo pipefail
 
 # Get version from git tags
-SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
+FLLIPER_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
 # Fetch tags from origin to ensure we have the latest
 if git fetch --tags origin; then
   # Use the shared helper so stable/post releases sort above rc tags.
   VERSION_FROM_TAG=$(python3 python/tools/get_version_tag.py --tag-only || true)
   if [ -n "$VERSION_FROM_TAG" ]; then
-    SGLANG_VERSION="$VERSION_FROM_TAG"
-    echo "Using SGLang version from git tags: $SGLANG_VERSION"
+    FLLIPER_VERSION="$VERSION_FROM_TAG"
+    echo "Using fLLiper version from git tags: $FLLIPER_VERSION"
   else
-    echo "Warning: No version tags found; using default $SGLANG_VERSION" >&2
+    echo "Warning: No version tags found; using default $FLLIPER_VERSION" >&2
   fi
 else
-  echo "Warning: Failed to fetch tags from origin; using default $SGLANG_VERSION" >&2
+  echo "Warning: Failed to fetch tags from origin; using default $FLLIPER_VERSION" >&2
 fi
 
 
 # Default base tags (can be overridden by command line arguments)
 ROCM_VERSION="rocm700"
-DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
-DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
+DEFAULT_MI30X_BASE_TAG="${FLLIPER_VERSION}-${ROCM_VERSION}-mi30x"
+DEFAULT_MI35X_BASE_TAG="${FLLIPER_VERSION}-${ROCM_VERSION}-mi35x"
 LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 
 # Parse command line arguments
@@ -35,8 +35,8 @@ while [[ $# -gt 0 ]]; do
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
     --rocm-version)
       ROCM_VERSION="$2"
-      MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
-      MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
+      MI30X_BASE_TAG="${FLLIPER_VERSION}-${ROCM_VERSION}-mi30x"
+      MI35X_BASE_TAG="${FLLIPER_VERSION}-${ROCM_VERSION}-mi35x"
       echo "Using ROCm version override: ${ROCM_VERSION}"
       shift 2;;
     -h|--help)
@@ -229,7 +229,7 @@ else
 fi
 
 # CACHE_HOST=/home/runner/sgl-data
-CACHE_HOST=/home/runner/temp-sglang-data
+CACHE_HOST=/home/runner/temp-flliper-data
 if [[ -d "$CACHE_HOST" ]]; then
     CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
 else
@@ -292,12 +292,12 @@ add_mount_if_exists "libmnl" "libmnl.so*"
 
 echo "Mount args: $MOUNT_ARGS"
 
-echo "Launching container: ci_sglang"
+echo "Launching container: ci_flliper"
 docker run -dt --user root \
   --device=/dev/kfd \
   --device=/dev/dri \
   ${DEVICE_FLAG} \
-  -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
+  -v "${GITHUB_WORKSPACE:-$PWD}:/flliper-checkout" \
   -v /sys/class/infiniband:/sys/class/infiniband:ro \
   -v /sys/class/infiniband_verbs:/sys/class/infiniband_verbs:ro \
   -v /sys/class/net:/sys/class/net:ro \
@@ -321,11 +321,11 @@ docker run -dt --user root \
   -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
   -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
   -e MIOPEN_CUSTOM_CACHE_DIR=/sgl-data/miopen-cache \
-  -w /sglang-checkout \
-  --name ci_sglang \
+  -w /flliper-checkout \
+  --name ci_flliper \
   "${IMAGE}"
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
 # setuptools-scm / vcs_versioning can resolve the package version.
-docker exec ci_sglang git config --global --add safe.directory /sglang-checkout
+docker exec ci_flliper git config --global --add safe.directory /flliper-checkout

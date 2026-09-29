@@ -29,8 +29,8 @@ RED-FIRST. Every assertion below fails on the parent commit: ``probe_poison``,
 
 import unittest
 
-from sglang.srt.distributed.device_communicators import barlink_abort_gate
-from sglang.srt.managers import phase_flip_seam_census as census
+from flliper.srt.distributed.device_communicators import barlink_abort_gate
+from flliper.srt.managers import phase_flip_seam_census as census
 
 MIB = 1024 * 1024
 

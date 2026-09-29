@@ -22,7 +22,7 @@ import os
 import struct
 import unittest
 
-from sglang.srt.model_loader.gguf_dflash import (
+from flliper.srt.model_loader.gguf_dflash import (
     audit_dflash_name_map,
     build_dflash_name_map,
     dflash_unquantized_module_prefixes,
@@ -255,12 +255,12 @@ class TestTheQ8CheckpointLoadsCompletely(unittest.TestCase):
         import torch
         from transformers import AutoConfig
 
-        import sglang.srt.runtime_context as rc
-        from sglang.srt.server_args import ServerArgs
+        import flliper.srt.runtime_context as rc
+        from flliper.srt.server_args import ServerArgs
 
         try:
             rc.get_context().set_server_args(ServerArgs(model_path=DFLASH_HF))
-            from sglang.srt.distributed import (
+            from flliper.srt.distributed import (
                 init_distributed_environment,
                 initialize_model_parallel,
             )
@@ -273,8 +273,8 @@ class TestTheQ8CheckpointLoadsCompletely(unittest.TestCase):
                 backend="gloo",
             )
             initialize_model_parallel(tensor_model_parallel_size=1)
-            from sglang.srt.layers.quantization.gguf import GGUFConfig
-            from sglang.srt.models.dflash import DFlashDraftModel
+            from flliper.srt.layers.quantization.gguf import GGUFConfig
+            from flliper.srt.models.dflash import DFlashDraftModel
 
             cls.cfg = AutoConfig.from_pretrained(DFLASH_HF, trust_remote_code=True)
             with torch.device("meta"):
@@ -288,7 +288,7 @@ class TestTheQ8CheckpointLoadsCompletely(unittest.TestCase):
 
     def _emitted_names(self):
         """Exactly what gguf_quant_weights_iterator yields for this file."""
-        from sglang.srt.model_loader.gguf_dflash import build_dflash_name_map
+        from flliper.srt.model_loader.gguf_dflash import build_dflash_name_map
 
         F32 = 0
         name_map = build_dflash_name_map(self.cfg)
@@ -341,7 +341,7 @@ class TestTheQ8CheckpointLoadsCompletely(unittest.TestCase):
         """Every configuration that worked before must still work."""
         import torch
 
-        from sglang.srt.models.dflash import DFlashDraftModel
+        from flliper.srt.models.dflash import DFlashDraftModel
 
         with torch.device("meta"):
             dense = DFlashDraftModel(self.cfg, quant_config=None, prefix="")

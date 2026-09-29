@@ -15,7 +15,7 @@ file:
    own local `match_prefix` result, no decision forwarded at all -- and pins
    that this is genuinely divergent (a CAN-FAIL proof: if this ever stopped
    diverging the fix below would have nothing to fix);
-2. proves the FIX (`sglang.srt.managers.pp_admission_congruence`) makes the
+2. proves the FIX (`flliper.srt.managers.pp_admission_congruence`) makes the
    three ranks agree, in the ordinary case (every downstream local match is
    >= what PP0 decided) and in the safe-truncate case (a downstream rank's
    local match is LARGER than told -- #616g's slack trade, taken on the PP
@@ -56,10 +56,10 @@ import inspect
 import logging
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
-from sglang.srt.managers.pp_admission_congruence import (  # noqa: E402
+from flliper.srt.managers.pp_admission_congruence import (  # noqa: E402
     PPAdmissionDecision,
     PPAdmissionEntry,
     build_pp_admission_decision,
@@ -208,7 +208,7 @@ class PpSizeOneIsAPassThroughTest(CustomTestCase):
     def test_pp_size_one_never_retracts_regardless_of_local_match(self):
         decision0 = _decision(req=(120, 80))
         with self.assertNoLogs(
-            "sglang.srt.managers.pp_admission_congruence", level="WARNING"
+            "flliper.srt.managers.pp_admission_congruence", level="WARNING"
         ):
             eff, decision1 = reconcile_pp_admission_decision(
                 decision0, {"req": 0}, rank=0, pp_size=1
@@ -241,7 +241,7 @@ class NoCollectiveOnTheAdmissionPathTest(CustomTestCase):
         module docstring -- which discusses this exact constraint in prose
         (and therefore legitimately contains the string "torch.distributed"
         as an explanation, not a call site)."""
-        import sglang.srt.managers.pp_admission_congruence as mod
+        import flliper.srt.managers.pp_admission_congruence as mod
 
         code_src = "\n".join(
             inspect.getsource(obj)
@@ -260,7 +260,7 @@ class NoCollectiveOnTheAdmissionPathTest(CustomTestCase):
             )
 
     def test_the_module_imports_no_torch_at_all(self):
-        import sglang.srt.managers.pp_admission_congruence as mod
+        import flliper.srt.managers.pp_admission_congruence as mod
 
         src = inspect.getsource(mod)
         self.assertNotIn("import torch", src)

@@ -9,11 +9,11 @@ import unittest
 
 import requests
 
-from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
-from sglang.bench_one_batch_server import run_benchmark as run_one_batch_benchmark
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
+from flliper.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
+from flliper.bench_one_batch_server import run_benchmark as run_one_batch_benchmark
+from flliper.srt.server_args import ServerArgs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 DSV4_FLASH_MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
 
 DSV4_FLASH_BASE_ENV = {
-    "SGLANG_DSV4_FP4_EXPERTS": "0",
+    "FLLIPER_DSV4_FP4_EXPERTS": "0",
 }
 
 DSV4_FLASH_SERVER_ARGS = [
@@ -57,7 +57,7 @@ def _launch_dsv4_flash_server(extra_env=None):
 
 
 class TestDSV4FlashMTPSimulatedAcc(CustomTestCase):
-    """bs=1 latency at isl=4096 / 900000 with `SGLANG_SIMULATE_ACC_LEN=3`.
+    """bs=1 latency at isl=4096 / 900000 with `FLLIPER_SIMULATE_ACC_LEN=3`.
 
     Reference (H200 Flash TP8):
       - isl=4096   → output 258.1 tok/s, accept 2.94
@@ -68,7 +68,7 @@ class TestDSV4FlashMTPSimulatedAcc(CustomTestCase):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = _launch_dsv4_flash_server(
-            extra_env={"SGLANG_SIMULATE_ACC_LEN": "3"}
+            extra_env={"FLLIPER_SIMULATE_ACC_LEN": "3"}
         )
 
     @classmethod

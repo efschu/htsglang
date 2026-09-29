@@ -2,7 +2,7 @@
 """#452 -- the capturable MoE offload decode path refuses again, by name.
 
 #443 ported the DeepSeek-V4 GGUF expert fetch onto the capturable path and
-shipped it BOOT-PENDING behind ``SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1``. The boot ran
+shipped it BOOT-PENDING behind ``FLLIPER_MOE_OFFLOAD_CUDA_GRAPH=1``. The boot ran
 on 2026-08-02 and refuted it
 (``/spinning/gpu-battery-results/2026-08-02_desync_graph_proof/RESULTS.md``):
 capture succeeds (B1), but the replayed arm decodes DIFFERENT text from the same
@@ -37,8 +37,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe import offload_capture_gate  # noqa: E402
-from sglang.srt.layers.moe.offload_capture_gate import (  # noqa: E402
+from flliper.srt.layers.moe import offload_capture_gate  # noqa: E402
+from flliper.srt.layers.moe.offload_capture_gate import (  # noqa: E402
     ENV_GRAPH_REFUTED_OVERRIDE,
     REFUTATION,
     CapturableOffloadRefuted,
@@ -163,7 +163,7 @@ def test_the_layer_selects_the_mode_through_this_gate():
     green -- they exercise the gate module directly -- and only this test goes
     red, which is the point of having it.
     """
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     src = inspect.getsource(FusedMoE.__init__)
     # #462 widened the gate to three outcomes, so the layer now calls
@@ -176,7 +176,7 @@ def test_the_layer_selects_the_mode_through_this_gate():
     # ...and the inline expression it replaced is gone, so a half-revert that
     # leaves both in place (the #444 lesson: a revert must be complete) is red
     # too.
-    assert "envs.SGLANG_MOE_OFFLOAD_CUDA_GRAPH.get()\n        )" not in src
+    assert "envs.FLLIPER_MOE_OFFLOAD_CUDA_GRAPH.get()\n        )" not in src
 
 
 def test_the_refutation_facts_have_one_source():

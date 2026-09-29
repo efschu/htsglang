@@ -558,7 +558,7 @@ def _verdict(arms: Dict[str, ArmResult]) -> str:
 #: What this process calls itself in `ps` / `py-spy` output. Deliberately
 #: carries the ticket AND the word GUEST: the two questions a triage asks are
 #: "whose is this" and "is it supposed to be on this card".
-PROCESS_TAG = "sglang::488-talker-profile-GUEST"
+PROCESS_TAG = "flliper::488-talker-profile-GUEST"
 
 
 def _tag_process() -> None:
@@ -629,7 +629,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         free_mib, need_mib,
     )
 
-    from sglang.srt.translator.inprocess_tts import (  # noqa: PLC0415
+    from flliper.srt.translator.inprocess_tts import (  # noqa: PLC0415
         InProcessQwen3Tts,
         InProcessTtsConfig,
     )

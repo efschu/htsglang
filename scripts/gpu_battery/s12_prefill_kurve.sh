@@ -14,7 +14,7 @@
 # Eight boots for four points per arm, and that is the price of not comparing
 # two different afternoons. Blockwise would be one boot per arm and worthless.
 #
-# The two arms differ in EXACTLY the three SGLANG_BARLINK* variables. The boot
+# The two arms differ in EXACTLY the three FLLIPER_BARLINK* variables. The boot
 # script is generated from one template for both, so they cannot drift.
 #
 # Each boot also leaves its ERREICHT lines behind: a bar1 arm whose second

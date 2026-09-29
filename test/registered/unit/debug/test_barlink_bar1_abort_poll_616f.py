@@ -25,11 +25,11 @@ import types
 import pytest
 import torch
 
-from sglang.srt.distributed.device_communicators.barlink_abort_gate import (
+from flliper.srt.distributed.device_communicators.barlink_abort_gate import (
     ENV_SYNC_DEADLINE_MS,
     sync_deadline_s,
 )
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     Bar1CollectiveStalled,
     BarlinkBar1Transport,
 )
@@ -164,7 +164,7 @@ class TestStallEscalation:
     """A run of expiries must reach the serving path as an exception."""
 
     def test_default_threshold(self, monkeypatch):
-        from sglang.srt.distributed.device_communicators.barlink_abort_gate import (
+        from flliper.srt.distributed.device_communicators.barlink_abort_gate import (
             ENV_STALL_RAISE_AFTER,
             stall_raise_after,
         )
@@ -178,7 +178,7 @@ class TestStallEscalation:
 
     def test_a_run_of_expiries_raises(self, monkeypatch):
         monkeypatch.setenv(ENV_SYNC_DEADLINE_MS, "1")
-        monkeypatch.setenv("SGLANG_BARLINK_BAR1_STALL_RAISE_AFTER", "3")
+        monkeypatch.setenv("FLLIPER_BARLINK_BAR1_STALL_RAISE_AFTER", "3")
         s = _stub(_Event(ready=False))
         assert BarlinkBar1Transport._wait_ctl_event(s) is False
         assert BarlinkBar1Transport._wait_ctl_event(s) is False
@@ -194,7 +194,7 @@ class TestStallEscalation:
 
     def test_zero_never_raises(self, monkeypatch):
         monkeypatch.setenv(ENV_SYNC_DEADLINE_MS, "1")
-        monkeypatch.setenv("SGLANG_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
+        monkeypatch.setenv("FLLIPER_BARLINK_BAR1_STALL_RAISE_AFTER", "0")
         s = _stub(_Event(ready=False))
         for _ in range(8):
             assert BarlinkBar1Transport._wait_ctl_event(s) is False
@@ -202,7 +202,7 @@ class TestStallEscalation:
     def test_a_resolved_read_breaks_the_run(self, monkeypatch):
         """A slow step must not accumulate toward a stall."""
         monkeypatch.setenv(ENV_SYNC_DEADLINE_MS, "1")
-        monkeypatch.setenv("SGLANG_BARLINK_BAR1_STALL_RAISE_AFTER", "3")
+        monkeypatch.setenv("FLLIPER_BARLINK_BAR1_STALL_RAISE_AFTER", "3")
         ev = _Event(ready=False)
         s = _stub(ev)
         for _ in range(20):
@@ -214,7 +214,7 @@ class TestStallEscalation:
 
     def test_stall_is_catchable_as_a_liveness_failure(self):
         """Existing handlers of the barlink abort family must still catch it."""
-        from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+        from flliper.srt.distributed.device_communicators.barlink_bar1 import (
             Bar1KernelAborted,
         )
 
@@ -350,10 +350,10 @@ class TestPollStatusWordExists:
 
     def test_the_gate_now_reaches_this_transport(self, _no_cuda_stream, monkeypatch):
         """End of the chain: poll_status_words must count a BAR1 trip."""
-        from sglang.srt.distributed.device_communicators import barlink_abort_gate as m
+        from flliper.srt.distributed.device_communicators import barlink_abort_gate as m
 
         m.reset_for_test()
-        monkeypatch.setenv("SGLANG_BARLINK_BAR1_ABORT_ENABLE", "1")
+        monkeypatch.setenv("FLLIPER_BARLINK_BAR1_ABORT_ENABLE", "1")
 
         stub = _poll_stub(_ctl_dev=torch.tensor([1, 0], dtype=torch.int32))
         # Bind the real method to the stub, exactly as a transport exposes it.

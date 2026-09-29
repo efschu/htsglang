@@ -36,8 +36,8 @@ protected. A fix that simply evicts everything while armed must fail that pin.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -48,7 +48,7 @@ EVICT_TARGET = 61_303
 
 
 def _relief(*, pending, armed, split=None, evict_rows=50_000):
-    from sglang.srt.managers import kv_backing_relief as m
+    from flliper.srt.managers import kv_backing_relief as m
 
     r = m.KvBackingRelief.__new__(m.KvBackingRelief)
     r._pool = type("P", (), {"page_size": 1})()
@@ -74,7 +74,7 @@ def _pending_probe(live_fn, armed_fn):
     because that factory needs a pool, an allocator and a live-set function;
     the decision this file is about is entirely in these few lines.
     """
-    from sglang.srt.managers.kv_backing_relief import flip_pending_from_live_fn
+    from flliper.srt.managers.kv_backing_relief import flip_pending_from_live_fn
 
     return flip_pending_from_live_fn(live_fn, armed_fn)
 
@@ -98,7 +98,7 @@ class _WatermarkStub:
     to do with the gate under test."""
 
     def setUp(self):
-        import sglang.srt.managers.kv_radix_watermark as w
+        import flliper.srt.managers.kv_radix_watermark as w
 
         self._v_orig = w.evictable_rows_above
         self._e_orig = w.evict_rows_above
@@ -112,7 +112,7 @@ class _WatermarkStub:
         w.evict_rows_above = _spy
 
     def tearDown(self):
-        import sglang.srt.managers.kv_radix_watermark as w
+        import flliper.srt.managers.kv_radix_watermark as w
 
         w.evictable_rows_above = self._v_orig
         w.evict_rows_above = self._e_orig

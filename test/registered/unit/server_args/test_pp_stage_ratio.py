@@ -16,14 +16,14 @@ import os
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.distributed.utils import derive_pp_layer_split
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.utils import derive_pp_layer_split
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
-PARTITION_ENV = "SGLANG_PP_LAYER_PARTITION"
+PARTITION_ENV = "FLLIPER_PP_LAYER_PARTITION"
 
 
 def qwen_kinds(num_layers=64, interval=4):

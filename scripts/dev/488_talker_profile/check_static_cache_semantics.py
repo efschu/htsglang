@@ -45,18 +45,18 @@ import torch
 
 HERE = pathlib.Path("/spinning/wt-488-talker-lane")
 for name, rel in (
-    ("sglang.srt.models.qwen3_tts_fast_predictor",
-     "python/sglang/srt/models/qwen3_tts_fast_predictor.py"),
-    ("sglang.srt.models.qwen3_tts_graph_driver",
-     "python/sglang/srt/models/qwen3_tts_graph_driver.py"),
+    ("flliper.srt.models.qwen3_tts_fast_predictor",
+     "python/flliper/srt/models/qwen3_tts_fast_predictor.py"),
+    ("flliper.srt.models.qwen3_tts_graph_driver",
+     "python/flliper/srt/models/qwen3_tts_graph_driver.py"),
 ):
     spec = importlib.util.spec_from_file_location(name, HERE / rel)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
 
-from sglang.srt.models.qwen3_tts_graph_driver import decode_mask  # noqa: E402
-from sglang.srt.translator.inprocess_tts import (  # noqa: E402
+from flliper.srt.models.qwen3_tts_graph_driver import decode_mask  # noqa: E402
+from flliper.srt.translator.inprocess_tts import (  # noqa: E402
     InProcessQwen3Tts, InProcessTtsConfig,
 )
 from transformers import DynamicCache, StaticCache  # noqa: E402

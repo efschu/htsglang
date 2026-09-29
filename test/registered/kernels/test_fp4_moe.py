@@ -8,11 +8,11 @@ from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_m
 from sgl_kernel import silu_and_mul
 from torch.nn import functional as F
 
-from sglang.jit_kernel.nvfp4 import scaled_fp4_quant
-from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.nvfp4 import scaled_fp4_quant
+from flliper.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
+from flliper.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+from flliper.srt.layers.moe.topk import TopKConfig, select_experts
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=300, suite="nightly-4-gpu-b200", nightly=True)
 

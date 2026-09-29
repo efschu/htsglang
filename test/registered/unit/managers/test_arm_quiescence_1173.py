@@ -24,8 +24,8 @@ import time
 import types
 import unittest
 
-from sglang.srt.managers import scheduler_pp_mixin as ppm
-from sglang.srt.managers.scheduler import Scheduler
+from flliper.srt.managers import scheduler_pp_mixin as ppm
+from flliper.srt.managers.scheduler import Scheduler
 
 
 class _Range:
@@ -325,8 +325,8 @@ class TestQuiescenceIsAnArmPrecondition(unittest.TestCase):
     def _runtime(self, launched, stall_s=120.0):
         import torch
 
-        from sglang.srt.managers.kv_reshard import KvPoolView
-        from sglang.srt.managers.phase_flip_runtime import (
+        from flliper.srt.managers.kv_reshard import KvPoolView
+        from flliper.srt.managers.phase_flip_runtime import (
             PHASE_PP,
             PhaseFlipRuntime,
         )
@@ -427,7 +427,7 @@ class TestTheArmPrintsItsTermAndItsProducer(unittest.TestCase):
     """The small #1173 item: an arm line that can be read back."""
 
     def test_the_pending_breakdown_is_reported_or_named_absent(self):
-        from sglang.srt.managers.phase_policy import PhasePolicyInputs, _pending_terms
+        from flliper.srt.managers.phase_policy import PhasePolicyInputs, _pending_terms
 
         self.assertIn("UNREPORTED", _pending_terms(types.SimpleNamespace()))
         self.assertEqual(
@@ -442,7 +442,7 @@ class TestTheArmPrintsItsTermAndItsProducer(unittest.TestCase):
         self.assertIn("seam_witness_states", inp)
 
     def test_the_witness_census_names_the_state_not_just_the_verdict(self):
-        from sglang.srt.managers import phase_purity as pp
+        from flliper.srt.managers import phase_purity as pp
 
         orig_c = pp.seam_readmit_candidates
         orig_w = pp.store_witness
@@ -524,7 +524,7 @@ class TestTheLaunchedPassProbe(unittest.TestCase):
 
 
 def ppm_build():
-    from sglang.srt.managers.phase_flip_runtime import build_launched_passes_fn
+    from flliper.srt.managers.phase_flip_runtime import build_launched_passes_fn
 
     return build_launched_passes_fn
 

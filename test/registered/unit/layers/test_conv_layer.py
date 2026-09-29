@@ -1,4 +1,4 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd")
@@ -8,7 +8,7 @@ import unittest
 import torch
 import torch.nn as nn
 
-from sglang.srt.layers.conv import Conv2dLayer, Conv3dLayer
+from flliper.srt.layers.conv import Conv2dLayer, Conv3dLayer
 
 
 def _copy_weights(src, dst_nn):

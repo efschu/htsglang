@@ -14,8 +14,8 @@ and that ops eventually answered by hand-raising 3800 to 4200.
 
 import pytest
 
-from sglang.srt.mem_ledger.contract import enforce_boot_contract, kv_pool_mib_per_rank
-from sglang.srt.mem_ledger.engine import (
+from flliper.srt.mem_ledger.contract import enforce_boot_contract, kv_pool_mib_per_rank
+from flliper.srt.mem_ledger.engine import (
     TERM_ACTIVATION,
     TERM_GRAPH_CAPTURE,
     TERM_HARDWARE_RESIDUAL,
@@ -25,7 +25,7 @@ from sglang.srt.mem_ledger.engine import (
     DemandInputs,
     build_card_ledgers,
 )
-from sglang.srt.mem_ledger.terms import (
+from flliper.srt.mem_ledger.terms import (
     DEFAULT_USER_RESERVE_MIB,
     CardVramLedger,
     LedgerError,
@@ -314,8 +314,8 @@ def test_kv_pool_split_across_colocated_ranks_loses_nothing():
 def test_undeclared_tenant_errors_loudly():
     """FALSIFIER (d). A lane that ships without declaring its ledger terms
     cannot board, and the error says how to fix it."""
-    from sglang.srt.mem_ledger import tenants
-    from sglang.srt.registry.spec import ResourceProfile
+    from flliper.srt.mem_ledger import tenants
+    from flliper.srt.registry.spec import ResourceProfile
 
     tenants._reset_for_tests()
     profile = ResourceProfile(
@@ -334,8 +334,8 @@ def test_undeclared_tenant_errors_loudly():
 
 
 def test_declared_tenant_with_an_undeclared_post_errors_loudly():
-    from sglang.srt.mem_ledger import tenants
-    from sglang.srt.registry.spec import ResourceProfile
+    from flliper.srt.mem_ledger import tenants
+    from flliper.srt.registry.spec import ResourceProfile
 
     tenants._reset_for_tests()
     tenants.declare_tenant_terms(
@@ -362,7 +362,7 @@ def test_declared_tenant_with_an_undeclared_post_errors_loudly():
 
 
 def test_empty_declaration_is_refused_but_host_only_is_accepted():
-    from sglang.srt.mem_ledger import tenants
+    from flliper.srt.mem_ledger import tenants
 
     tenants._reset_for_tests()
     with pytest.raises(tenants.UndeclaredTenant):
@@ -376,8 +376,8 @@ def test_empty_declaration_is_refused_but_host_only_is_accepted():
 def test_coresident_tenant_sums_exactly_into_the_card_ledger():
     """A registered tenant's declared bytes land in the SAME sum, so a
     coresident boot is the solo boot plus named rows."""
-    from sglang.srt.mem_ledger import tenants
-    from sglang.srt.registry.spec import ResourceProfile
+    from flliper.srt.mem_ledger import tenants
+    from flliper.srt.registry.spec import ResourceProfile
 
     tenants._reset_for_tests()
     tenants.declare_tenant_terms(
@@ -544,7 +544,7 @@ def test_a_capped_transient_is_charged_and_names_its_cap():
     )
     term = ledgers[0].term(TERM_INDEXER_SCRATCH)
     assert term is not None
-    assert term.bounded_by and "SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB=256" in (
+    assert term.bounded_by and "FLLIPER_DSV4_INDEXER_QUERY_CHUNK_MIB=256" in (
         term.bounded_by
     )
 
@@ -616,7 +616,7 @@ def test_budget_funded_terms_are_not_charged_twice():
     ledger term for them is right (they ARE card memory and the boot log must
     show them) but subtracting them again while FORMING that budget would
     reserve them twice and cost the KV pool their size for nothing."""
-    from sglang.srt.mem_ledger.engine import (
+    from flliper.srt.mem_ledger.engine import (
         BUDGET_FUNDED_TERMS,
         demand_outside_budget_mib,
     )
@@ -633,7 +633,7 @@ def test_budget_funded_terms_are_not_charged_twice():
 
 # --- the flashinfer workspace responds to the config that actually sets it ---
 #
-# The gap: the term read SGLANG_FLASHINFER_WORKSPACE_SIZE at ledger-build time,
+# The gap: the term read FLLIPER_FLASHINFER_WORKSPACE_SIZE at ledger-build time,
 # but FlashInferAttnBackend.__init__ REWRITES that variable afterwards -- 512
 # MiB for listed architectures, then 2048 MiB under deterministic inference,
 # which overrides the first. So the term charged the 384 MiB default for a
@@ -644,7 +644,7 @@ def test_budget_funded_terms_are_not_charged_twice():
 
 
 def workspace_inputs(n_ranks=1, **overrides):
-    from sglang.srt.layers.attention.flashinfer_workspace import (
+    from flliper.srt.layers.attention.flashinfer_workspace import (
         describe_flashinfer_workspace,
         resolve_flashinfer_workspace_mib,
     )
@@ -692,7 +692,7 @@ def test_workspace_term_moves_with_deterministic_inference():
     """CAN-FAIL ANCHOR. Empirically the failed deterministic boot consumed an
     extra 1649 MiB between pool end and capture begin against a derived delta
     of 1664 MiB (2048 - 384); before this fix the ledger's delta was 0."""
-    from sglang.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
+    from flliper.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
 
     off = workspace_ledger(deterministic=False).term(TERM_ATTN_WORKSPACE).mib
     on = workspace_ledger(deterministic=True).term(TERM_ATTN_WORKSPACE).mib
@@ -706,7 +706,7 @@ def test_the_served_architecture_is_not_on_the_high_workspace_list():
     so its non-deterministic workspace is the 384 MiB env default and not 512.
     This is what makes the empirical delta 1664 rather than 1536; a substring
     match against 'Qwen3ForCausalLM' would get this wrong."""
-    from sglang.srt.layers.attention.flashinfer_workspace import (
+    from flliper.srt.layers.attention.flashinfer_workspace import (
         HIGH_WORKSPACE_ARCHITECTURES,
         resolve_flashinfer_workspace_mib,
     )
@@ -722,7 +722,7 @@ def test_the_served_architecture_is_not_on_the_high_workspace_list():
 
 
 def test_a_listed_architecture_raises_the_workspace_to_512():
-    from sglang.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
+    from flliper.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
 
     listed = workspace_ledger(architectures=("Qwen3ForCausalLM",))
     assert listed.term(TERM_ATTN_WORKSPACE).mib == 512
@@ -732,14 +732,14 @@ def test_deterministic_overrides_the_architecture_bump_not_the_reverse():
     """The backend assigns the architecture bump FIRST and the deterministic
     bump SECOND, so deterministic wins. Getting this backwards would charge 512
     for a boot that allocates 2048."""
-    from sglang.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
+    from flliper.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
 
     both = workspace_ledger(deterministic=True, architectures=("Qwen3ForCausalLM",))
     assert both.term(TERM_ATTN_WORKSPACE).mib == 2048
 
 
 def test_workspace_term_declares_the_inputs_that_actually_drive_it():
-    from sglang.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
+    from flliper.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
 
     term = workspace_ledger(deterministic=True).term(TERM_ATTN_WORKSPACE)
     assert "enable_deterministic_inference" in term.inputs
@@ -750,7 +750,7 @@ def test_workspace_term_declares_the_inputs_that_actually_drive_it():
 
 
 def test_workspace_scales_with_colocated_ranks():
-    from sglang.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
+    from flliper.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
 
     ledger = build_card_ledgers(
         workspace_inputs(n_ranks=3, deterministic=True),
@@ -765,8 +765,8 @@ def test_workspace_scales_with_colocated_ranks():
 def test_the_resolver_is_the_one_the_backend_uses():
     """Not a second implementation: the backend imports these very names, so a
     change to the rule cannot move one side without the other."""
-    import sglang.srt.layers.attention.flashinfer_backend as fb
-    from sglang.srt.layers.attention import flashinfer_workspace as fw
+    import flliper.srt.layers.attention.flashinfer_backend as fb
+    from flliper.srt.layers.attention import flashinfer_workspace as fw
 
     assert fb.HIGH_WORKSPACE_ARCHITECTURES is fw.HIGH_WORKSPACE_ARCHITECTURES
     assert fb.WORKSPACE_ARCH_MIB == fw.WORKSPACE_ARCH_MIB == 512

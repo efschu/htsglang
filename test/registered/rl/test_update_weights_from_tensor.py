@@ -1,4 +1,4 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=147, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
@@ -13,10 +13,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import torch
 
-import sglang as sgl
-from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
-from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
-from sglang.test.test_utils import (
+import flliper as sgl
+from flliper.srt.utils import MultiprocessingSerializer, kill_process_tree
+from flliper.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -97,7 +97,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
 
     def test_update_weights_from_tensor_load_format_custom(self):
         custom_loader_name = (
-            "sglang.srt.model_executor.model_runner._model_load_weights_direct"
+            "flliper.srt.model_executor.model_runner._model_load_weights_direct"
         )
         engine = sgl.Engine(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -158,7 +158,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
         bucket_dict = {"flattened_tensor": flattened_tensor, "metadata": metadata}
 
         # Serialize the bucket data
-        from sglang.srt.utils import MultiprocessingSerializer
+        from flliper.srt.utils import MultiprocessingSerializer
 
         serialized_bucket = MultiprocessingSerializer.serialize(
             bucket_dict, output_str=True

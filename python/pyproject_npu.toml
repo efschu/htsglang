@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sglang"
+name = "flliper"
 dynamic = ["version"]
-description = "SGLang is a fast serving framework for large language models and vision language models."
+description = "fLLiper is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -109,18 +109,18 @@ test = [
 
 # https://docs.sglang.io/platforms/ascend_npu.html
 srt_npu = []
-all_npu = ["sglang[diffusion]"]
-dev_npu = ["sglang[all_npu]", "sglang[test]"]
+all_npu = ["flliper[diffusion]"]
+dev_npu = ["flliper[all_npu]", "flliper[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [project.scripts]
-sglang = "sglang.cli.main:main"
+flliper = "flliper.cli.main:main"
 
 [tool.setuptools.package-data]
-"sglang" = [
+"flliper" = [
   "srt/**/*",
   "jit_kernel/**/*"
 ]
@@ -149,7 +149,7 @@ exclude = [
 
 [tool.setuptools_scm]
 root = ".."
-version_file = "sglang/_version.py"
+version_file = "flliper/_version.py"
 git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"

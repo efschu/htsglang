@@ -34,9 +34,9 @@ Hermetic: no NVML, no cards, the live table is injected.
 
 import unittest
 
-from sglang.srt.planner.rate_env import RateEnv, check_card_rate_freshness
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner.rate_env import RateEnv, check_card_rate_freshness
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 

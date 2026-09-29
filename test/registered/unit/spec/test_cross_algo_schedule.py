@@ -12,14 +12,14 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.speculative.cross_algo_utils import (
+from flliper.srt.speculative.cross_algo_utils import (
     RUNTIME_SHAPE_FIELDS,
     apply_runtime_shape,
     parse_cross_force,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -99,7 +99,7 @@ class TestRuntimeShapeSwap(CustomTestCase):
 
 def _bare_worker():
     """A CrossAlgoWorker shell with only the schedule-decision state set."""
-    from sglang.srt.speculative.cross_algo_worker import CrossAlgoWorker
+    from flliper.srt.speculative.cross_algo_worker import CrossAlgoWorker
 
     w = object.__new__(CrossAlgoWorker)
     w._switching = True
@@ -198,8 +198,8 @@ class TestConvertSpecInfo(CustomTestCase):
         )
 
     def test_eagle_to_dflash_and_back_carries_relay_identity(self):
-        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-        from sglang.srt.speculative.eagle_info import EagleDraftInput
+        from flliper.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+        from flliper.srt.speculative.eagle_info import EagleDraftInput
 
         w = _bare_worker()
         batch = self._batch()
@@ -226,7 +226,7 @@ class TestConvertSpecInfo(CustomTestCase):
         self.assertIs(batch.spec_info.topk_p, eagle.topk_p)
 
     def test_wrong_boundary_type_asserts(self):
-        from sglang.srt.speculative.eagle_info import EagleDraftInput
+        from flliper.srt.speculative.eagle_info import EagleDraftInput
 
         w = _bare_worker()
         batch = self._batch()
@@ -243,7 +243,7 @@ class TestConvertSpecInfo(CustomTestCase):
         self.assertIsNone(batch.spec_info)
 
     def test_batch_size_mismatch_asserts(self):
-        from sglang.srt.speculative.eagle_info import EagleDraftInput
+        from flliper.srt.speculative.eagle_info import EagleDraftInput
 
         w = _bare_worker()
         batch = self._batch(bs=3)
@@ -260,9 +260,9 @@ class TestFutureMapMixedPayloadStash(CustomTestCase):
     them."""
 
     def _future_map(self):
-        from sglang.srt.managers.overlap_utils import FutureMap
-        from sglang.srt.runtime_context import get_context
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.managers.overlap_utils import FutureMap
+        from flliper.srt.runtime_context import get_context
+        from flliper.srt.server_args import ServerArgs
 
         # spec_need_hidden_states (lazy buf init) reads the global server
         # args; provide an EAGLE-shaped one (model_path="dummy"
@@ -281,7 +281,7 @@ class TestFutureMapMixedPayloadStash(CustomTestCase):
         )
 
     def test_bonus_only_then_full_payload(self):
-        from sglang.srt.managers.overlap_utils import RelayPayload
+        from flliper.srt.managers.overlap_utils import RelayPayload
 
         fm = self._future_map()
         idx = torch.tensor([1, 2], dtype=torch.int64)

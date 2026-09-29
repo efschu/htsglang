@@ -8,7 +8,7 @@ import types
 import pytest
 import torch
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     attn_replicated_kv_local_head,
     draft_rank_local_single_kv_head,
     set_tp_partition_ratios,
@@ -42,7 +42,7 @@ def test_draft_single_kv_head_switch():
 
 
 def test_select_rank_local_kv_head():
-    from sglang.srt.models.qwen3_5 import select_rank_local_kv_head
+    from flliper.srt.models.qwen3_5 import select_rank_local_kv_head
 
     T, nkv, d = 5, 2, 4
     k = torch.arange(T * nkv * d, dtype=torch.float32).reshape(T, nkv * d)
@@ -55,8 +55,8 @@ def test_select_rank_local_kv_head():
 
 
 def test_backend_rank_local_kv_inputs(monkeypatch):
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsb
-    import sglang.srt.runtime_context as rc
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as qsb
+    import flliper.srt.runtime_context as rc
 
     set_tp_partition_ratios([39, 13, 12])
     monkeypatch.setattr(

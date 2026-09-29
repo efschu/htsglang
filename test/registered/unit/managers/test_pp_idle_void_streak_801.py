@@ -52,12 +52,12 @@ import logging
 import types
 import unittest
 
-from sglang.srt.managers.scheduler_pp_mixin import (
+from flliper.srt.managers.scheduler_pp_mixin import (
     SchedulerPPMixin,
     pp_idle_void_should_report,
     pp_idle_void_streak_exceeded,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20)
 
@@ -111,7 +111,7 @@ class _Capture(logging.Handler):
         self.records.append(record.getMessage())
 
     def __enter__(self):
-        self.logger = logging.getLogger("sglang.srt.managers.scheduler_pp_mixin")
+        self.logger = logging.getLogger("flliper.srt.managers.scheduler_pp_mixin")
         self.prev = self.logger.level
         self.logger.setLevel(logging.WARNING)
         self.logger.addHandler(self)
@@ -133,11 +133,11 @@ def _drive(holder, passes, bound_env=None):
     Returns (raise_message_or_None, passes_completed). The cap is what makes a
     lost bound a FAILURE rather than a hang.
     """
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
     completed = 0
     with (
-        envs.SGLANG_PP_IDLE_VOID_STREAK_BOUND.override(bound_env)
+        envs.FLLIPER_PP_IDLE_VOID_STREAK_BOUND.override(bound_env)
         if (bound_env is not None)
         else _nullcontext()
     ):
@@ -260,7 +260,7 @@ class ThreeRetractionsMayNotBecomeAnEndlessLoop(unittest.TestCase):
         # It must name where the defect is NOT, or the next reader chases this
         # rank's void handling, which did its job every one of those passes.
         self.assertIn("The defect is NOT on this rank", msg)
-        self.assertIn("SGLANG_PP_IDLE_VOID_STREAK_BOUND", msg)
+        self.assertIn("FLLIPER_PP_IDLE_VOID_STREAK_BOUND", msg)
 
     def test_MUTANT_with_the_bound_disabled_the_spin_is_unbounded(self):
         # The gate is load-bearing: remove it and the corpse walks again. This

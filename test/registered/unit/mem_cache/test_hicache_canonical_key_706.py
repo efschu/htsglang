@@ -21,10 +21,10 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
-from sglang.srt.mem_cache.canonical_page_store import window_for_layers
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_page_store import window_for_layers
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from flliper.test.test_utils import CustomTestCase
 
 ATTN_LAYER_IDS = list(range(3, 64, 4))  # the live checkpoint: 16 of 64 layers
 CELL = 64  # stand-in for the 2048 B/token/layer of fp8 KV; arithmetic identical

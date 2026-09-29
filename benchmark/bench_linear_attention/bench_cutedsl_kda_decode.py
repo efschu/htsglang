@@ -17,11 +17,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python")
 import torch
 import triton
 
-from sglang.jit_kernel.cutedsl_kda import cutedsl_fused_sigmoid_gating_kda_update
-from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+from flliper.jit_kernel.cutedsl_kda import cutedsl_fused_sigmoid_gating_kda_update
+from flliper.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.srt.layers.attention.fla.kda import chunk_kda
+from flliper.srt.layers.attention.fla.kda import chunk_kda
 
 
 def make_inputs(

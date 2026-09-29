@@ -2,7 +2,7 @@
 2026-09-16: under --rank-gpu-id every rank saw local_rank 0 / local_size 1
 and all three warmed the same third of the files)."""
 
-from sglang.srt.model_loader.weight_utils import prefetch_share_of_rank
+from flliper.srt.model_loader.weight_utils import prefetch_share_of_rank
 
 
 def test_collapsed_local_view_falls_back_to_the_world_rank():

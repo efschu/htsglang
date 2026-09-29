@@ -27,9 +27,9 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt import uneven_perf
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import uneven_perf
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -363,14 +363,14 @@ class TestMixedPrecisionScores(CustomTestCase):
         self.assertEqual(len(widened.warnings), 3)
         for w in widened.warnings:
             self.assertIn("no probe yet", w)
-            self.assertNotIn("SGLANG_PERF_REPROBE", w)
+            self.assertNotIn("FLLIPER_PERF_REPROBE", w)
 
     def test_the_fp8_reprobe_advice_survives(self):
         """The pre-existing hint must stay on the formats it applies to."""
         widened = uneven_perf.rank_gemm_family_scores(_entries(lanes=False), "fp8", {})
         self.assertEqual(len(widened.warnings), 3)
         for w in widened.warnings:
-            self.assertIn("SGLANG_PERF_REPROBE=1", w)
+            self.assertIn("FLLIPER_PERF_REPROBE=1", w)
 
 
 class TestFallbackIsNamed(CustomTestCase):

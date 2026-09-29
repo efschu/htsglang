@@ -7,7 +7,7 @@ WHAT #464 CHANGES. ``KvVmmArena.commit_range`` splits a gap into
 ``self._chunk``-sized extents and issues one map + one setAccess per extent.
 When the run is CONTIGUOUS those extents describe one VA region, so one handle
 suffices and the resume becomes ~3 driver calls (map, setAccess, memset). The
-coalescer is built and default-off; ``SGLANG_VMM_COALESCE_RESUME=1`` turns it
+coalescer is built and default-off; ``FLLIPER_VMM_COALESCE_RESUME=1`` turns it
 on. This script measures whether that is worth anything.
 
 TWO CORRECTIONS TO THE TICKET'S PREMISE ARE ENCODED HERE, because a runner that
@@ -28,7 +28,7 @@ acceptance rule that cannot see what it claims to judge.
 
 **(2) "~500 x 2 MiB calls" is chunk-dependent, and no default produces it.**
 The extent count is ``ceil(nbytes / chunk)``, and the chunks actually in use
-are ``SGLANG_FLIP_SEAM_CHUNK_MIB`` (default **8 MiB**, ``memory_pool.py:2477``)
+are ``FLLIPER_FLIP_SEAM_CHUNK_MIB`` (default **8 MiB**, ``memory_pool.py:2477``)
 and ``CARRIER_COMMIT_CHUNK`` (**64 MiB**, ``phase_flip_spill.py:219``). For
 ~1 GiB that is ~128 extents and ~16 extents respectively -- ~257 and ~33
 driver calls, not ~1001. The 2 MiB figure is the allocation-granularity
@@ -64,7 +64,7 @@ MIB = 1024 * 1024
 #: The chunks really in use, so the runner reports against reality rather than
 #: against the ticket's 2 MiB illustration.
 KNOWN_CHUNKS_MIB = {
-    "kv_seam (SGLANG_FLIP_SEAM_CHUNK_MIB default)": 8,
+    "kv_seam (FLLIPER_FLIP_SEAM_CHUNK_MIB default)": 8,
     "carriers (CARRIER_COMMIT_CHUNK)": 64,
     "granularity fallback (the ticket's illustration)": 2,
 }
@@ -249,7 +249,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("the call-count half is arithmetic and is covered by --self-test.")
         return 2
 
-    from sglang.srt.mem_cache.kv_vmm_backing import KvVmmArena, align_up
+    from flliper.srt.mem_cache.kv_vmm_backing import KvVmmArena, align_up
 
     nbytes = args.mib * MIB
     chunk = args.chunk_mib * MIB

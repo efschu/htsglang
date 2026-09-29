@@ -32,8 +32,8 @@ import os
 import pytest
 import torch
 
-from sglang.srt.managers import phase_flip_seam_reserve as sr
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.managers import phase_flip_seam_reserve as sr
+from flliper.srt.server_args import ServerArgs
 
 #: THIS FILE NEEDS A VISIBLE DEVICE, and says so instead of failing.
 #:
@@ -107,7 +107,7 @@ pytestmark = [
     ),
 ]
 OLD_QUARANTINE = 620000
-ENV = "SGLANG_PHASE_FLIP_UNPROVEN_POOL"
+ENV = "FLLIPER_PHASE_FLIP_UNPROVEN_POOL"
 
 
 def _flip_args(**extra):

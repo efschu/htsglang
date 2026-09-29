@@ -4,7 +4,7 @@ by zero (pool_host/base.py). The rank still joins the min-reduce."""
 
 import inspect
 
-from sglang.srt.mem_cache.pool_host import base as b
+from flliper.srt.mem_cache.pool_host import base as b
 
 
 def test_no_kv_rank_bids_the_sentinel_and_others_their_budget():
@@ -22,7 +22,7 @@ def test_constructor_sizes_through_the_helper_before_the_min_reduce():
 def test_mamba_anchor_pool_uses_the_same_rule():
     assert b.fixed_host_pool_slots(600 * 1024**2, 0) == b.NO_KV_RANK_TOKENS
     assert b.fixed_host_pool_slots(600 * 1024**2, 37 * 1024**2) == 16
-    from sglang.srt.mem_cache import memory_pool_host as mh
+    from flliper.srt.mem_cache import memory_pool_host as mh
 
     src = inspect.getsource(mh)
     assert "fixed_host_pool_slots(int(anchor_host_mib) * (1024**2), self.size_per_token)" in src
@@ -33,7 +33,7 @@ def test_mamba_anchor_pool_uses_the_same_rule():
 def test_zero_byte_host_pool_skips_mmap_and_host_register(monkeypatch):
     import torch
 
-    from sglang.srt.mem_cache.pool_host import common as c
+    from flliper.srt.mem_cache.pool_host import common as c
 
     calls = []
     monkeypatch.setattr(c, "_cuda_host_register", lambda buf: calls.append("register"))

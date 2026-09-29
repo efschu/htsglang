@@ -1,10 +1,10 @@
 """
 Usage:
 # Installing latest llava-next: pip install git+https://github.com/LLaVA-VL/LLaVA-NeXT.git
-# Installing latest sglang.
+# Installing latest flliper.
 
 # Endpoint Service CLI:
-python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --port=30000
+python -m flliper.launch_server --model-path lmms-lab/llama3-llava-next-8b --port=30000
 
 python3 llama3_llava_server.py
 
@@ -21,7 +21,7 @@ import aiohttp
 import requests
 from llava.conversation import conv_llava_llama_3
 
-from sglang.utils import normalize_base_url
+from flliper.utils import normalize_base_url
 
 
 async def send_request(url, data, delay=0):

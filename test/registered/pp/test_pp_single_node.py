@@ -15,12 +15,12 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
+from flliper.srt.server_args import ServerArgs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PLE_PP,
@@ -153,7 +153,7 @@ class TestGemma4PPAccuracy(unittest.TestCase):
     """End-to-end PP=2 accuracy gate for Gemma4 multimodal.
 
     Gemma4 has full-attention layers with head_dim=512 (FA's max is 256), so
-    sglang auto-selects the triton attention backend; no manual flag needed.
+    flliper auto-selects the triton attention backend; no manual flag needed.
     The 26B BF16 model splits to ~26 GB per stage under PP=2, well within an
     H100's 80 GB.
     """

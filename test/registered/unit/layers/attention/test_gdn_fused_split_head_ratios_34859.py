@@ -37,8 +37,8 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
@@ -47,7 +47,7 @@ _WORKER = textwrap.dedent("""
     os.environ["TRITON_INTERPRET"] = "1"
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "99")
     import torch
-    from sglang.jit_kernel.triton.gdn_fused_proj import (
+    from flliper.jit_kernel.triton.gdn_fused_proj import (
         fused_qkvzba_split_reshape_cat_contiguous as fused,
     )
 
@@ -125,7 +125,7 @@ HEAD = 16
 class TestQwen35Dispatch(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        from sglang.srt.models import qwen3_5
+        from flliper.srt.models import qwen3_5
 
         cls.qwen3_5 = qwen3_5
 
@@ -186,14 +186,14 @@ class TestQwen35Dispatch(CustomTestCase):
         )
 
     def test_decode_and_verify_take_the_fused_split(self):
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
         for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
             with self.subTest(mode=mode):
                 self.assertEqual(self.route(mode), ["fused"])
 
     def test_prefill_keeps_the_views(self):
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
         self.assertEqual(self.route(ForwardMode.EXTEND), ["views"])
 

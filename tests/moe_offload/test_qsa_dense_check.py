@@ -7,7 +7,7 @@ import types
 import pytest
 import torch
 
-from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsb
+from flliper.srt.layers.attention import qwen_sparse_attn_backend as qsb
 
 
 def _sdpa_reference(q, k, v, scaling):
@@ -49,13 +49,13 @@ def test_dense_reference_is_causal():
 
 
 def test_mode_switch(monkeypatch):
-    monkeypatch.delenv("SGLANG_QSA_DENSE_CHECK", raising=False)
+    monkeypatch.delenv("FLLIPER_QSA_DENSE_CHECK", raising=False)
     assert qsb._qsa_dense_check_mode() == ""
-    monkeypatch.setenv("SGLANG_QSA_DENSE_CHECK", "1")
+    monkeypatch.setenv("FLLIPER_QSA_DENSE_CHECK", "1")
     assert qsb._qsa_dense_check_mode() == "check"
-    monkeypatch.setenv("SGLANG_QSA_DENSE_CHECK", "subst")
+    monkeypatch.setenv("FLLIPER_QSA_DENSE_CHECK", "subst")
     assert qsb._qsa_dense_check_mode() == "subst"
-    monkeypatch.setenv("SGLANG_QSA_DENSE_CHECK", "0")
+    monkeypatch.setenv("FLLIPER_QSA_DENSE_CHECK", "0")
     assert qsb._qsa_dense_check_mode() == ""
 
 
@@ -82,7 +82,7 @@ def _fake_backend(impl_output):
 
 @pytest.mark.parametrize("mode,expect_ref", [("check", False), ("subst", True)])
 def test_wrapper_substitutes_only_in_subst_mode(monkeypatch, mode, expect_ref):
-    monkeypatch.setenv("SGLANG_QSA_DENSE_CHECK", mode)
+    monkeypatch.setenv("FLLIPER_QSA_DENSE_CHECK", mode)
     torch.manual_seed(2)
     n, hq, hkv, d = 6, 4, 2, 8
     q = torch.randn(n, hq * d)
@@ -104,7 +104,7 @@ def test_wrapper_substitutes_only_in_subst_mode(monkeypatch, mode, expect_ref):
 
 
 def test_wrapper_off_passes_through(monkeypatch):
-    monkeypatch.delenv("SGLANG_QSA_DENSE_CHECK", raising=False)
+    monkeypatch.delenv("FLLIPER_QSA_DENSE_CHECK", raising=False)
     wrong = torch.full((3, 8), 7.0)
     backend = _fake_backend(wrong)
     layer = types.SimpleNamespace(tp_q_head_num=2, tp_k_head_num=1, head_dim=4, scaling=1.0, layer_id=0)
@@ -146,5 +146,5 @@ def test_dense_reference_with_kv_map_uses_given_heads():
 
 
 def test_mode_subst_global_parses(monkeypatch):
-    monkeypatch.setenv("SGLANG_QSA_DENSE_CHECK", "subst_global")
+    monkeypatch.setenv("FLLIPER_QSA_DENSE_CHECK", "subst_global")
     assert qsb._qsa_dense_check_mode() == "subst_global"

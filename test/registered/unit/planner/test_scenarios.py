@@ -6,7 +6,7 @@ import tempfile
 import dataclasses
 import unittest
 
-from sglang.srt.planner.scenarios import (
+from flliper.srt.planner.scenarios import (
     SCENARIOS,
     build_harness_command,
     Scenario,
@@ -15,9 +15,9 @@ from sglang.srt.planner.scenarios import (
     render_scenario_text,
     suggest,
 )
-from sglang.srt.rigmon.facilities import HostEnvironment, facilities
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.rigmon.facilities import HostEnvironment, facilities
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -198,7 +198,7 @@ class TestHarnessBinding(CustomTestCase):
     def test_every_scenario_binds_to_an_existing_harness(self):
         for key, s in SCENARIOS.items():
             self.assertIsNotNone(s.harness, f"{key} has no harness binding")
-            self.assertTrue(s.harness.module.startswith("sglang."), key)
+            self.assertTrue(s.harness.module.startswith("flliper."), key)
 
     def test_the_bound_module_actually_exists(self):
         import importlib
@@ -209,7 +209,7 @@ class TestHarnessBinding(CustomTestCase):
     def test_axis_flags_are_real_harness_flags(self):
         import pathlib
 
-        src = pathlib.Path("python/sglang/benchmark/serving.py")
+        src = pathlib.Path("python/flliper/benchmark/serving.py")
         if not src.is_file():
             self.skipTest("harness source not in this checkout")
         text = src.read_text()
@@ -224,7 +224,7 @@ class TestHarnessBinding(CustomTestCase):
         self.assertTrue(out["runnable"])
         self.assertIn("--max-concurrency 8", out["command"])
         self.assertIn("--random-input-len 8192", out["command"])
-        self.assertIn("sglang.benchmark.serving", out["command"])
+        self.assertIn("flliper.benchmark.serving", out["command"])
 
     def test_axes_the_harness_cannot_set_surface_as_manual_steps(self):
         """A control axis silently dropped would make the sweep run the same
@@ -307,7 +307,7 @@ class TestTheYardstick(CustomTestCase):
 class TestHarnessBindingsAreReal(CustomTestCase):
     """A scenario must not emit a command the shipped harness cannot parse.
 
-    The whole point of binding to sglang's own load generators instead of
+    The whole point of binding to flliper's own load generators instead of
     writing another one is that the flags and result fields already exist; a
     binding that has drifted turns that saving into a trap, so it is checked
     against the harness source and the harness result type rather than against
@@ -343,11 +343,11 @@ class TestHarnessBindingsAreReal(CustomTestCase):
                 )
 
     def test_every_harness_result_field_exists_on_the_result_type(self):
-        from sglang.benchmark.serving import BenchmarkMetrics
+        from flliper.benchmark.serving import BenchmarkMetrics
 
         fields = {f.name for f in dataclasses.fields(BenchmarkMetrics)}
         for key, s in SCENARIOS.items():
-            if not s.harness or s.harness.module != "sglang.benchmark.serving":
+            if not s.harness or s.harness.module != "flliper.benchmark.serving":
                 continue
             for metric_key, field in s.harness.metric_fields.items():
                 # A parenthesised entry names a source the harness does not
@@ -359,11 +359,11 @@ class TestHarnessBindingsAreReal(CustomTestCase):
                 )
 
     def test_the_command_it_prints_is_the_module_that_exists(self):
-        from sglang.srt.planner.scenarios import build_harness_command
+        from flliper.srt.planner.scenarios import build_harness_command
 
         s = SCENARIOS["noise_floor"]
         cmd = build_harness_command(s, {}, base_url="http://x:1")
-        self.assertTrue(cmd["command"].startswith("python -m sglang.benchmark.serving"))
+        self.assertTrue(cmd["command"].startswith("python -m flliper.benchmark.serving"))
         self.assertTrue(cmd["runnable"])
 
 

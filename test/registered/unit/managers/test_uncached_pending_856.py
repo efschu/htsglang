@@ -32,15 +32,15 @@ eight retracted 20k-token requests at 160k against a live bar of 18614 --
 reproduced below as `test_the_shipped_sum_reproduces_the_731_shape`.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 import types
 import unittest
 
-from sglang.srt.managers.scheduler import uncached_prompt_tokens
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.scheduler import uncached_prompt_tokens
+from flliper.test.test_utils import CustomTestCase
 
 #: W25's shape: max_running_requests=8, prompts 16-24k, live bar N=18614.
 W25_BAR = 18614
@@ -159,7 +159,7 @@ class TestTheStampIsTakenBeforeItIsCleared(CustomTestCase):
     def test_reset_for_retract_records_the_credit(self):
         import inspect
 
-        from sglang.srt.managers.schedule_batch import Req
+        from flliper.srt.managers.schedule_batch import Req
 
         src = inspect.getsource(Req.reset_for_retract)
         stamp = src.index("cached_prompt_tokens_at_retract")

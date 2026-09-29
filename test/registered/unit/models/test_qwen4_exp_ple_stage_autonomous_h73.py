@@ -1,4 +1,4 @@
-"""fnFL2 H73 (SGLANG_WEG2_PLE_STAGE_AUTONOMOUS, SGLANG_WEG2_PLE_STAGE_BONUS_EARLY):
+"""fnFL2 H73 (FLLIPER_PDFLIP_PLE_STAGE_AUTONOMOUS, FLLIPER_PDFLIP_PLE_STAGE_BONUS_EARLY):
 the pread WORKERS stage the verify round on their own. The device posts the
 round's windows into a mailbox of the stage (then the round number into a flag
 word); every worker polls the flag, hashes, reads the rows of its own stage
@@ -53,12 +53,12 @@ from unittest import mock
 import torch
 from triton.runtime.interpreter import InterpretedFunction
 
-from sglang.srt.environ import envs
-from sglang.srt.models import qwen4_exp_ple_decode_pread as dp
-from sglang.srt.models import qwen4_exp_ple_pread_worker as pw
-from sglang.srt.models import qwen4_exp_ple_prefetch as pf
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.models import qwen4_exp_ple_decode_pread as dp
+from flliper.srt.models import qwen4_exp_ple_pread_worker as pw
+from flliper.srt.models import qwen4_exp_ple_prefetch as pf
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 # the H40 file's fixtures: checkpoint-like files, the hash stand-ins, kernels
 from test_qwen4_exp_ple_decode_pread_h40 import (  # noqa: E402
@@ -80,7 +80,7 @@ from test_qwen4_exp_ple_decode_pread_h40 import (  # noqa: E402
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
-LOGGER = "sglang.srt.models.qwen4_exp_ple_decode_pread"
+LOGGER = "flliper.srt.models.qwen4_exp_ple_decode_pread"
 SRC = pathlib.Path(dp.__file__).resolve().parents[1]
 GATED = InterpretedFunction(dp._gather_ple_embedding_gated_kernel.fn)
 PROCS = 2
@@ -700,12 +700,12 @@ class TestRoundLevel(_AutoCase):
 
 class TestSwitches(_AutoCase):
     def test_default_off_and_reach_the_stager(self):
-        self.assertFalse(envs.SGLANG_WEG2_PLE_STAGE_AUTONOMOUS.get())
-        self.assertFalse(envs.SGLANG_WEG2_PLE_STAGE_BONUS_EARLY.get())
+        self.assertFalse(envs.FLLIPER_PDFLIP_PLE_STAGE_AUTONOMOUS.get())
+        self.assertFalse(envs.FLLIPER_PDFLIP_PLE_STAGE_BONUS_EARLY.get())
         fn = lambda: pf.PleHashParams.of(self.emb)  # noqa: E731
         for auto, bonus in ((False, False), (True, False), (True, True), (False, True)):
-            with envs.SGLANG_WEG2_PLE_STAGE_AUTONOMOUS.override(auto), \
-                    envs.SGLANG_WEG2_PLE_STAGE_BONUS_EARLY.override(bonus):
+            with envs.FLLIPER_PDFLIP_PLE_STAGE_AUTONOMOUS.override(auto), \
+                    envs.FLLIPER_PDFLIP_PLE_STAGE_BONUS_EARLY.override(bonus):
                 st = dp.make_ple_decode_stager(
                     self.f.table, fn, vocab_start=0, vocab_end=TOTAL, device=torch.device("cpu")
                 )

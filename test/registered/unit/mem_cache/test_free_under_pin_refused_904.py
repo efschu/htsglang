@@ -33,8 +33,8 @@ The family convention this restores is an ACT-time check:
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -43,8 +43,8 @@ class TestLiveFunnelRefusesToFreeUnderAPin(CustomTestCase):
     """``_evict_component_and_detach_lru``, the site that actually frees."""
 
     def _cache_and_node(self, lock_ref):
-        from sglang.srt.mem_cache.unified_cache_components import ComponentType
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_cache_components import ComponentType
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         lru = MagicMock()
         lru.in_list.return_value = False
@@ -66,7 +66,7 @@ class TestLiveFunnelRefusesToFreeUnderAPin(CustomTestCase):
 
     def test_free_under_a_pin_is_refused(self):
         """RED-FIRST for #904 load-then-invalidate."""
-        from sglang.srt.mem_cache.unified_cache_components import EvictLayer
+        from flliper.srt.mem_cache.unified_cache_components import EvictLayer
 
         cache, node, comp = self._cache_and_node(lock_ref=1)
         with self.assertRaises(ValueError) as ctx:
@@ -80,7 +80,7 @@ class TestLiveFunnelRefusesToFreeUnderAPin(CustomTestCase):
     def test_unlocked_row_is_freed_as_before(self):
         """The can-fail direction: a refusal that also refuses the normal
         case is a capacity bug wearing a correctness costume."""
-        from sglang.srt.mem_cache.unified_cache_components import EvictLayer
+        from flliper.srt.mem_cache.unified_cache_components import EvictLayer
 
         cache, node, comp = self._cache_and_node(lock_ref=0)
         freed, host_freed = cache._evict_component_and_detach_lru(
@@ -92,10 +92,10 @@ class TestLiveFunnelRefusesToFreeUnderAPin(CustomTestCase):
     def test_a_row_with_no_device_value_is_not_blocked(self):
         """A node whose device half is already gone carries a stale lock_ref
         for the HOST half's sake; blocking on it would wedge host eviction."""
-        from sglang.srt.mem_cache.unified_cache_components import EvictLayer
+        from flliper.srt.mem_cache.unified_cache_components import EvictLayer
 
         cache, node, comp = self._cache_and_node(lock_ref=2)
-        from sglang.srt.mem_cache.unified_cache_components import ComponentType
+        from flliper.srt.mem_cache.unified_cache_components import ComponentType
 
         node.component_data[ComponentType.MAMBA].value = None
         cache._evict_component_and_detach_lru(
@@ -107,7 +107,7 @@ class TestLiveFunnelRefusesToFreeUnderAPin(CustomTestCase):
         """The device pin says nothing about the host tier, which has its own
         ``host_lock_ref``. Widening the check to HOST would be a different
         (and unproven) claim."""
-        from sglang.srt.mem_cache.unified_cache_components import EvictLayer
+        from flliper.srt.mem_cache.unified_cache_components import EvictLayer
 
         cache, node, comp = self._cache_and_node(lock_ref=5)
         comp.evict_component.return_value = (0, 4)
@@ -123,7 +123,7 @@ class TestDeadPathNoLongerClearsThePin(CustomTestCase):
     resurrect it."""
 
     def _cache_and_node(self, lock_ref):
-        from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
+        from flliper.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
 
         cache = object.__new__(HiMambaRadixCache)
         cache.req_to_token_pool = MagicMock()
@@ -176,7 +176,7 @@ class TestDeadPathNoLongerClearsThePin(CustomTestCase):
                     "-rn",
                     "--include=*.py",
                     "HiMambaRadixCache(",
-                    "python/sglang/",
+                    "python/flliper/",
                 ],
                 cwd=_repo_root(),
                 capture_output=True,
@@ -198,10 +198,10 @@ class TestDeadPathNoLongerClearsThePin(CustomTestCase):
 def _repo_root() -> str:
     import os
 
-    import sglang
+    import flliper
 
     return os.path.abspath(
-        os.path.join(os.path.dirname(sglang.__file__), os.pardir, os.pardir)
+        os.path.join(os.path.dirname(flliper.__file__), os.pardir, os.pardir)
     )
 
 

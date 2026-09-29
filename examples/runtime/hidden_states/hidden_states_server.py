@@ -11,19 +11,19 @@ So avoid getting hidden states and completions alternately.
 import requests
 import torch
 
-from sglang.test.test_utils import is_in_ci
-from sglang.utils import terminate_process, wait_for_server
+from flliper.test.test_utils import is_in_ci
+from flliper.utils import terminate_process, wait_for_server
 
 if is_in_ci():
     from docs.backend.patch import launch_server_cmd
 else:
-    from sglang.utils import launch_server_cmd
+    from flliper.utils import launch_server_cmd
 
 
 def main():
     # Launch the server
     server_process, port = launch_server_cmd(
-        "python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-1.5B-instruct --enable-return-hidden-states --host 0.0.0.0"
+        "python -m flliper.launch_server --model-path Alibaba-NLP/gte-Qwen2-1.5B-instruct --enable-return-hidden-states --host 0.0.0.0"
     )
     wait_for_server(f"http://localhost:{port}", process=server_process)
 

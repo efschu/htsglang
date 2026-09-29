@@ -8,11 +8,11 @@ pip install antlr4-python3-runtime
 
 for `parse_latex` which we use for symbolic equality check.
 
-## Benchmark sglang
+## Benchmark flliper
 
 1. Launch the Server
 ```bash
-python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 30000
+python3 -m flliper.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 30000
 ```
 
 Note that depending on the GPU this benchmark will take quiet some time. To employ data parallelism please use:
@@ -29,19 +29,19 @@ We use [suggested](https://github.com/deepseek-ai/DeepSeek-R1) parameters of `te
 By default evaluate on LIMO dataset.
 
 ```bash
-python3 bench_sglang.py --parallel 256 --num-tries 64 --port 30000
+python3 bench_flliper.py --parallel 256 --num-tries 64 --port 30000
 ```
 
 Evaluate on AIME 2024 dataset.
 
 ```bash
-python3 bench_sglang.py --parallel 256 --port 30000 --data-path Maxwell-Jia/AIME_2024 --question-key Problem --answer-key Answer --num-tries 64
+python3 bench_flliper.py --parallel 256 --port 30000 --data-path Maxwell-Jia/AIME_2024 --question-key Problem --answer-key Answer --num-tries 64
 ```
 
 Evaluate on [AIME 2025 I dataset](https://huggingface.co/datasets/opencompass/AIME2025). For benchmark result see [here](https://matharena.ai/).
 
 ```bash
-python3 bench_sglang.py --parallel 256 --port 30000 --data-path opencompass/AIME2025 --question-key question --answer-key answer --num-tries 64
+python3 bench_flliper.py --parallel 256 --port 30000 --data-path opencompass/AIME2025 --question-key question --answer-key answer --num-tries 64
 ```
 ## Results
 
@@ -53,7 +53,7 @@ python3 bench_sglang.py --parallel 256 --port 30000 --data-path opencompass/AIME
 | AIME 2025 I| 64        | 29.9%    | 25.0%     |  ?        |
 
 ### Statistic Analysis Results
-Set up SGLang engine for statistic analysis, for high efficiency we use `--dp-size 8` for data parallelism:
+Set up fLLiper engine for statistic analysis, for high efficiency we use `--dp-size 8` for data parallelism:
 ```bash
 python3 -m sglang_router.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 30000 --dp-size 8
 ```
@@ -62,7 +62,7 @@ We fixed the number of attempts (num_tries) and conducted multiple runs to asses
 
 To collect the accuracy, run the following command 30 times:
 ```bash
-python3 bench_sglang.py --parallel 64 --port 30000 --data-path Maxwell-Jia/AIME_2024 --question-key Problem --answer-key Answer --num-tries 64
+python3 bench_flliper.py --parallel 64 --port 30000 --data-path Maxwell-Jia/AIME_2024 --question-key Problem --answer-key Answer --num-tries 64
 ```
 
 ![acc_hist](figure/Acc_histplot.png)
@@ -72,6 +72,6 @@ python3 bench_sglang.py --parallel 64 --port 30000 --data-path Maxwell-Jia/AIME_
 
 To reveal the relationship, run the command 6 times and adjust the parameter `--num-tries` for each run:
 ```bash
-python3 bench_sglang.py --parallel 64 --port 30000 --data-path Maxwell-Jia/AIME_2024 --question-key Problem --answer-key Answer --num-tries <num_tries>
+python3 bench_flliper.py --parallel 64 --port 30000 --data-path Maxwell-Jia/AIME_2024 --question-key Problem --answer-key Answer --num-tries <num_tries>
 ```
 ![SE_num_tries](figure/SE_numtries.png)

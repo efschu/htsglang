@@ -21,11 +21,11 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.speculative.adaptive_runtime_state import (
+from flliper.srt.speculative.adaptive_runtime_state import (
     SpecRuntimeState,
     assert_runtime_state_isolation,
 )
-from sglang.srt.speculative.adaptive_spec_params import (
+from flliper.srt.speculative.adaptive_spec_params import (
     DEFAULT_ADAPTIVE_CONFIG,
     MULTI_LAYER_EAGLE_ALGO_KEY,
     MULTI_LAYER_EAGLE_DEFAULT_ADAPTIVE_CONFIG,
@@ -35,12 +35,12 @@ from sglang.srt.speculative.adaptive_spec_params import (
     default_adaptive_config_for,
     resolve_candidate_steps_from_config,
 )
-from sglang.srt.speculative.multi_layer_eagle_utils import (
+from flliper.srt.speculative.multi_layer_eagle_utils import (
     adapt_draft_columns,
     adapt_draft_state_width,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -65,7 +65,7 @@ def _patch_resolved_view(server_args):
     """`resolved_view` needs the full override registry; the flags we read are
     plain attributes on the fake, so resolve to the fake itself."""
     return patch(
-        "sglang.srt.arg_groups.overrides.resolved_view",
+        "flliper.srt.arg_groups.overrides.resolved_view",
         side_effect=lambda sa: sa,
     )
 
@@ -269,7 +269,7 @@ class TestInitGuards(CustomTestCase):
     instance (a real __init__ needs a GPU and two loaded models)."""
 
     def _assert_supported(self, server_args):
-        from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+        from flliper.srt.speculative.multi_layer_eagle_worker_v2 import (
             MultiLayerEagleWorkerV2,
         )
 
@@ -316,7 +316,7 @@ class _FakeServerArgs(SimpleNamespace):
 def _detached_worker(active_steps=2, num_runners=3):
     """A MultiLayerEagleWorkerV2 with only the attributes the state-swap and
     capture-override paths touch (a real __init__ needs two loaded models)."""
-    from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+    from flliper.srt.speculative.multi_layer_eagle_worker_v2 import (
         MultiLayerEagleWorkerV2,
     )
 
@@ -468,7 +468,7 @@ class TestDraftRunnerCount(CustomTestCase):
     layers 0..k-1 resident, so boot must load the ladder ceiling."""
 
     def _count(self, num_nextn_predict_layers=8, **kwargs):
-        from sglang.srt.managers.tp_worker import TpModelWorker
+        from flliper.srt.managers.tp_worker import TpModelWorker
 
         worker = object.__new__(TpModelWorker)
         worker.server_args = SimpleNamespace(**kwargs)

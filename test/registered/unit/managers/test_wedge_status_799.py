@@ -32,12 +32,12 @@ import tempfile
 import time
 import unittest
 
-from sglang.srt.managers import wedge_status as WS
-from sglang.srt.managers.scheduler_components.invariant_checker import (
+from flliper.srt.managers import wedge_status as WS
+from flliper.srt.managers.scheduler_components.invariant_checker import (
     make_admission_wedge_poller,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -268,7 +268,7 @@ class TestTheThreadRunsThePoll(CustomTestCase):
         """
         import threading
 
-        from sglang.srt.managers.scheduler_components import invariant_checker
+        from flliper.srt.managers.scheduler_components import invariant_checker
 
         stop = threading.Event()
         with tempfile.TemporaryDirectory() as d:

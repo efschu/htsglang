@@ -1,4 +1,4 @@
-"""Generate a Markdown dashboard for SGLang-Diffusion nightly benchmarks.
+"""Generate a Markdown dashboard for fLLiper-Diffusion nightly benchmarks.
 
 Reads current comparison results + historical data from sgl-project/ci-data repo
 and produces a Markdown report with tables and trend charts saved as PNG files.
@@ -116,10 +116,10 @@ def _fmt_latency(val: float | None) -> str:
     return f"{val:.2f}"
 
 
-def _fmt_speedup(sglang_lat: float | None, other_lat: float | None) -> str:
-    if sglang_lat is None or other_lat is None or sglang_lat <= 0:
+def _fmt_speedup(flliper_lat: float | None, other_lat: float | None) -> str:
+    if flliper_lat is None or other_lat is None or flliper_lat <= 0:
         return "N/A"
-    ratio = other_lat / sglang_lat
+    ratio = other_lat / flliper_lat
     return f"{ratio:.2f}x"
 
 
@@ -146,24 +146,24 @@ def _assess_risk(
 
     Rules (checked in order):
     - N/A latency → ❌ broken
-    - History exists: SGLang latency >5% vs avg of last 3 runs → ⚠️ regression
-    - Competitor exists & SGLang slower → 🔴 competitive risk
-    - SGLang faster than all competitors by >20% → 🟢 strong advantage
-    - SGLang faster than all competitors by ≤20% → 🟡 moderate advantage
+    - History exists: fLLiper latency >5% vs avg of last 3 runs → ⚠️ regression
+    - Competitor exists & fLLiper slower → 🔴 competitive risk
+    - fLLiper faster than all competitors by >20% → 🟢 strong advantage
+    - fLLiper faster than all competitors by ≤20% → 🟡 moderate advantage
     - Default → ✅ stable
     """
-    sg_lat = current_cases.get(cid, {}).get("sglang")
+    sg_lat = current_cases.get(cid, {}).get("flliper")
 
-    # Broken: sglang latency is N/A
+    # Broken: flliper latency is N/A
     if sg_lat is None:
-        return "❌", f"{cid}: SGLang latency is N/A (broken)"
+        return "❌", f"{cid}: fLLiper latency is N/A (broken)"
 
     # Check regression against 3-run historical average
     if history:
         hist_lats: list[float] = []
         for run in history[:3]:
             run_cases = _extract_case_results(run)
-            h_lat = run_cases.get(cid, {}).get("sglang")
+            h_lat = run_cases.get(cid, {}).get("flliper")
             if h_lat is not None:
                 hist_lats.append(h_lat)
         if hist_lats:
@@ -172,7 +172,7 @@ def _assess_risk(
                 pct = (sg_lat - avg_3) / avg_3 * 100
                 return (
                     "⚠️",
-                    f"{cid}: SGLang regression +{pct:.1f}% vs 3-run avg "
+                    f"{cid}: fLLiper regression +{pct:.1f}% vs 3-run avg "
                     f"({sg_lat:.2f}s vs {avg_3:.2f}s)",
                 )
 
@@ -185,16 +185,16 @@ def _assess_risk(
                 competitor_lats[ofw] = olat
 
         if competitor_lats:
-            # SGLang slower than any competitor?
+            # fLLiper slower than any competitor?
             for ofw, olat in competitor_lats.items():
                 if sg_lat > olat:
                     return (
                         "🔴",
-                        f"{cid}: SGLang slower than {ofw} "
+                        f"{cid}: fLLiper slower than {ofw} "
                         f"({sg_lat:.2f}s vs {olat:.2f}s)",
                     )
 
-            # SGLang faster — check margin
+            # fLLiper faster — check margin
             min_competitor = min(competitor_lats.values())
             advantage = (min_competitor - sg_lat) / min_competitor
             if advantage > 0.20:
@@ -251,7 +251,7 @@ def generate_dashboard(
     Returns the markdown string.
     """
     lines: list[str] = []
-    lines.append("# SGLang-Diffusion Nightly Performance Dashboard\n")
+    lines.append("# fLLiper-Diffusion Nightly Performance Dashboard\n")
     ts = current.get("timestamp", datetime.now(timezone.utc).isoformat())
     sha = current.get("commit_sha", "unknown")
     lines.append(f"*Generated: {_short_date(ts)} | Commit: `{_short_sha(sha)}`*\n")
@@ -265,7 +265,7 @@ def generate_dashboard(
     if history:
         prev_cases = _extract_case_results(history[0])
         for cid in case_ids:
-            for fw in ("sglang", "vllm-omni"):
+            for fw in ("flliper", "vllm-omni"):
                 cur = current_cases.get(cid, {}).get(fw)
                 prev = prev_cases.get(cid, {}).get(fw)
                 if cur and prev and prev > 0:
@@ -290,14 +290,14 @@ def generate_dashboard(
         if fw not in seen_fw:
             all_frameworks.append(fw)
             seen_fw.add(fw)
-    # Ensure sglang is first
-    if "sglang" in all_frameworks:
-        all_frameworks.remove("sglang")
-        all_frameworks.insert(0, "sglang")
-    other_frameworks = [fw for fw in all_frameworks if fw != "sglang"]
+    # Ensure flliper is first
+    if "flliper" in all_frameworks:
+        all_frameworks.remove("flliper")
+        all_frameworks.insert(0, "flliper")
+    other_frameworks = [fw for fw in all_frameworks if fw != "flliper"]
 
-    # ---- Section 1: SGLang-Diffusion performance (current run) ----
-    lines.append("## SGLang-Diffusion Performance\n")
+    # ---- Section 1: fLLiper-Diffusion performance (current run) ----
+    lines.append("## fLLiper-Diffusion Performance\n")
 
     # Compute risk assessments for all cases
     risk_map: dict[str, tuple[str, str]] = {}
@@ -325,7 +325,7 @@ def generate_dashboard(
         seen_cases.add(cid)
 
         case_fws = current_cases.get(cid, {})
-        sg_lat = case_fws.get("sglang")
+        sg_lat = case_fws.get("flliper")
 
         risk_emoji, _ = risk_map.get(cid, ("✅", ""))
         row = f"| {r['model'].split('/')[-1]} | {risk_emoji} |"
@@ -346,7 +346,7 @@ def generate_dashboard(
 
     # ---- Section 2: Speedup-over-time vs. other frameworks (rendered only when present) ----
     if history and other_frameworks:
-        lines.append("\n## SGLang vs vLLM-Omni Speedup Over Time\n")
+        lines.append("\n## fLLiper vs vLLM-Omni Speedup Over Time\n")
 
         header = "| Date |"
         sep = "|------|"
@@ -362,7 +362,7 @@ def generate_dashboard(
             date = _short_date(run.get("timestamp", ""))
             row = f"| {date} |"
             for cid in case_ids:
-                sg = run_cases.get(cid, {}).get("sglang")
+                sg = run_cases.get(cid, {}).get("flliper")
                 vl = run_cases.get(cid, {}).get("vllm-omni")
                 row += f" {_fmt_speedup(sg, vl)} |"
             lines.append(row)
@@ -391,7 +391,7 @@ def generate_dashboard(
                 vl_vals = []
                 for run in all_runs:
                     run_cases = _extract_case_results(run)
-                    sg = run_cases.get(cid, {}).get("sglang")
+                    sg = run_cases.get(cid, {}).get("flliper")
                     vl = run_cases.get(cid, {}).get("vllm-omni")
                     if sg is None:
                         continue
@@ -405,7 +405,7 @@ def generate_dashboard(
                 has_vl = any(v is not None for v in vl_vals)
                 fig, ax = plt.subplots(figsize=(max(6, len(labels) * 1.2), 4))
 
-                # SGLang line
+                # fLLiper line
                 ax.plot(
                     range(len(sg_vals)),
                     sg_vals,
@@ -413,7 +413,7 @@ def generate_dashboard(
                     color="#2563eb",
                     linewidth=2,
                     markersize=6,
-                    label="SGLang",
+                    label="fLLiper",
                 )
                 for i, v in enumerate(sg_vals):
                     ax.annotate(
@@ -485,7 +485,7 @@ def generate_dashboard(
                     run_labels = []
                     for run in all_runs:
                         run_cases = _extract_case_results(run)
-                        sg = run_cases.get(cid, {}).get("sglang")
+                        sg = run_cases.get(cid, {}).get("flliper")
                         vl = run_cases.get(cid, {}).get("vllm-omni")
                         if sg and vl and sg > 0:
                             speedups.append(vl / sg)
@@ -507,7 +507,7 @@ def generate_dashboard(
                 ax.set_xticklabels(run_labels, fontsize=7)
                 ax.set_ylabel("Speedup (x)")
                 ax.set_title(
-                    "SGLang Speedup Over vLLM-Omni", fontsize=11, fontweight="bold"
+                    "fLLiper Speedup Over vLLM-Omni", fontsize=11, fontweight="bold"
                 )
                 ax.axhline(y=1.0, color="gray", linestyle=":", alpha=0.5)
                 ax.legend(loc="upper left", fontsize=7)
@@ -520,15 +520,15 @@ def generate_dashboard(
                 print(f"  Saved chart: {chart_path}")
 
                 chart_url = f"{CHARTS_RAW_BASE_URL}/{filename}"
-                lines.append("\n### Speedup Trend (SGLang vs vLLM-Omni)\n")
+                lines.append("\n### Speedup Trend (fLLiper vs vLLM-Omni)\n")
                 lines.append(f"![Speedup Trend]({chart_url})\n")
 
         except ImportError:
             lines.append("\n*Charts unavailable (matplotlib not installed)*\n")
 
-    # ---- SGLang Performance Trend (raw data table, at the end) ----
+    # ---- fLLiper Performance Trend (raw data table, at the end) ----
     if history:
-        lines.append(f"\n## SGLang Performance Trend (Last {len(history) + 1} Runs)\n")
+        lines.append(f"\n## fLLiper Performance Trend (Last {len(history) + 1} Runs)\n")
 
         header = "| Date | Commit |"
         sep = "|------|--------|"
@@ -547,14 +547,14 @@ def generate_dashboard(
             sha_s = _short_sha(run.get("commit_sha", ""))
             row = f"| {date} | `{sha_s}` |"
             for cid in case_ids:
-                lat = run_cases.get(cid, {}).get("sglang")
+                lat = run_cases.get(cid, {}).get("flliper")
                 row += f" {_fmt_latency(lat)} |"
             if i + 1 < len(all_runs):
                 prev_cases = _extract_case_results(all_runs[i + 1])
                 emojis = []
                 for cid in case_ids:
-                    cur = run_cases.get(cid, {}).get("sglang")
-                    prev = prev_cases.get(cid, {}).get("sglang")
+                    cur = run_cases.get(cid, {}).get("flliper")
+                    prev = prev_cases.get(cid, {}).get("flliper")
                     emojis.append(_trend_emoji(cur, prev))
                 row += " ".join(emojis) + " |"
             else:
@@ -579,7 +579,7 @@ def generate_dashboard(
     # Footer
     lines.append("\n---")
     lines.append(
-        "*Generated by `generate_diffusion_dashboard.py` in SGLang nightly CI.*"
+        "*Generated by `generate_diffusion_dashboard.py` in fLLiper nightly CI.*"
     )
 
     alert_reasons = [reason for _, _, reason in alert_cases]
@@ -749,7 +749,7 @@ def _create_alert_issue(alert_reasons: list[str]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate SGLang-Diffusion nightly benchmark dashboard"
+        description="Generate fLLiper-Diffusion nightly benchmark dashboard"
     )
     parser.add_argument(
         "--results",

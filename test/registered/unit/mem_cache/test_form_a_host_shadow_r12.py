@@ -4,8 +4,8 @@ SAME host and anchor entries.
 THE ROOT (rc9i/rc9k/rc9l/rc9m/rc9o). NF D in Form A: TP0 owns the arena host
 pools, TP1/TP2 are expert workers with 0-byte plain host pools. At the store
 ack TP0 rebinds a node's rows to the arena and keeps them; a worker frees them
-as transit (``_weg2_release_chain_piece_host``: HOST layer of every component,
-the mamba anchor included) -- rc9m D log: ``WEG2 PUBLISH-CHAIN host released``
+as transit (``_pdflip_release_chain_piece_host``: HOST layer of every component,
+the mamba anchor included) -- rc9m D log: ``PDFLIP PUBLISH-CHAIN host released``
 on TP1/TP2 only. At the next device eviction TP0's node stays a host node with
 its anchor (``#1469 EVICT ... backuped=True host=True``), the worker's node is
 deleted (``backuped=False host=False``) -> anchors at different depths.
@@ -35,23 +35,23 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt import rank_role
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt import rank_role
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
     EvictLayer,
     TreeComponent,
 )
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache as U
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedLRUList
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache as U
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 
 try:  # absent on d1c7094ba6 -- that absence is part of the red
-    m = importlib.import_module("sglang.srt.mem_cache.form_a_host_shadow")
+    m = importlib.import_module("flliper.srt.mem_cache.form_a_host_shadow")
 except ImportError:  # pragma: no cover - base tree
     m = None
 
-SWITCH = "SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"
+SWITCH = "FLLIPER_PDFLIP_ENABLE_FORM_A_HOST_SHADOW"
 ROLES = ("host", "worker", "worker")
 PAGE = 64
 NODE = 2 * PAGE  # every node of the chain: two pages
@@ -100,7 +100,7 @@ class _Rank:
     """One D rank's tree cache: the REAL host-life methods on real nodes."""
 
     _drain_storage_control_queues_impl = U._drain_storage_control_queues_impl
-    _weg2_release_chain_piece_host = U._weg2_release_chain_piece_host
+    _pdflip_release_chain_piece_host = U._pdflip_release_chain_piece_host
     _evict_component_and_detach_lru = U._evict_component_and_detach_lru
     _evict_device_leaf = U._evict_device_leaf
     _evict_to_host = U._evict_to_host
@@ -116,7 +116,7 @@ class _Rank:
     loading_check = U.loading_check
     evict_host = U.evict_host
     _1421_refused = U._1421_refused
-    _weg2_release_anchor = U._weg2_release_anchor
+    _pdflip_release_anchor = U._pdflip_release_anchor
     _r12_rec = None
     page_size = PAGE
     enable_storage_metrics = False
@@ -169,10 +169,10 @@ class _Rank:
     def _mamba_pins_held(self):
         return 0
 
-    def _weg2_host_is_transit(self):
-        return True  # SGLANG_HICACHE_ARENA_DIR set, as on NF D
+    def _pdflip_host_is_transit(self):
+        return True  # FLLIPER_HICACHE_ARENA_DIR set, as on NF D
 
-    def _weg2_rebind_host_to_arena(self, node):
+    def _pdflip_rebind_host_to_arena(self, node):
         # TP0: the arena pool rebinds (#1424); a worker's plain pool cannot.
         return self.is_host and node.hash_value[-1] not in self.fail_rebind
 
@@ -266,7 +266,7 @@ def _as_rank(rank):
 
 @contextlib.contextmanager
 def _switch(value):
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
     field = getattr(envs, SWITCH, None)
     if field is None:  # d1c7094ba6: no switch (= the old path)
@@ -380,10 +380,10 @@ def test_an_h19_displacement_on_tp0_reaches_the_workers():
     with _switch(True):
         _each(ranks, lambda r: r.ack_store_writes())
         with _as_rank(ranks[0]):
-            victim = SimpleNamespace(node=ranks[0].node_at(NODE), slots=[3], rid="weg2-18-15", depth=NODE)
+            victim = SimpleNamespace(node=ranks[0].node_at(NODE), slots=[3], rid="pdflip-18-15", depth=NODE)
             st = SimpleNamespace(displaced_share=0, displaced_full=0, dropped=0)
             mp = SimpleNamespace(drop_unreferenced=lambda slots: len(slots))
-            ranks[0]._weg2_release_anchor(victim, mp, st, why="share", for_rid="weg2-18-15")
+            ranks[0]._pdflip_release_anchor(victim, mp, st, why="share", for_rid="pdflip-18-15")
         _broadcast(ranks)
     assert _same(ranks) == {NODE: (1, 0), 2 * NODE: (1, 1), 3 * NODE: (1, 1)}
 
@@ -471,8 +471,8 @@ def test_wire_only_on_a_pure_tp_group():
 
 
 def test_a_worker_anchor_pool_gets_the_arena_rows_byteless_only(monkeypatch):
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_HOST", "1")
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "32")  # rc9m
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_HOST", "1")
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_MAMBA_SLOTS", "32")  # rc9m
     with _switch(True):
         with _as_rank(_Rank(1)):
             assert m.mamba_shadow_extra_rows(0) == 64

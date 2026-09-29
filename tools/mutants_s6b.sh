@@ -64,7 +64,7 @@ PY
 
 # ---------------------------------------------------------------- self-test
 if [ "${1:-}" = "--selfcheck" ]; then
-  F=python/sglang/srt/weg2/weight_exchange_bounce.py
+  F=python/flliper/srt/pdflip/weight_exchange_bounce.py
   PLANT="# MUTANT-HARNESS-SELFCHECK-PLANTED-$$"
   cd "$WT" || exit 2
   if ! git diff --quiet -- "$F"; then
@@ -94,13 +94,13 @@ fi
 
 # ---------------------------------------------------------------- the run
 cd "$WT" || exit 2
-BX=python/sglang/srt/weg2/weight_exchange_bounce.py
-WU=python/sglang/srt/managers/scheduler_components/weight_updater.py
-WX=python/sglang/srt/weg2/weight_exchange.py
-T="test/registered/unit/weg2/test_weg2_xchg_inject_modes_1273.py
-test/registered/unit/weg2/test_weg2_xchg_seam_wiring_1273.py
-test/registered/unit/weg2/test_weg2_xchg_bounce_execution_smoke_1273.py
-test/registered/unit/weg2/test_weg2_xchg_plan_provider_1273.py"
+BX=python/flliper/srt/pdflip/weight_exchange_bounce.py
+WU=python/flliper/srt/managers/scheduler_components/weight_updater.py
+WX=python/flliper/srt/pdflip/weight_exchange.py
+T="test/registered/unit/pdflip/test_pdflip_xchg_inject_modes_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_seam_wiring_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_bounce_execution_smoke_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_plan_provider_1273.py"
 
 export CUDA_VISIBLE_DEVICES="" PYTHONPATH="$WT/python" OMP_NUM_THREADS=1
 run() { timeout 900 python3 -m pytest $T -q --tb=no -p no:cacheprovider \

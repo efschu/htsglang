@@ -47,7 +47,7 @@ Hermetic: no CUDA, no NVML, no pool. CUDA_VISIBLE_DEVICES="".
 import inspect
 import unittest
 
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
 ENFORCE = "_enforce_exposure_at_seam"
 
@@ -107,7 +107,7 @@ class TheEnforcementStaysHarmlessWhereItIsNowReached(unittest.TestCase):
     def test_a_raising_clamp_does_not_escape_the_seam(self):
         import types
 
-        from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+        from flliper.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
 
         r = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
         sched = types.SimpleNamespace()

@@ -6,7 +6,7 @@ import struct
 
 import pytest
 
-from sglang.srt.planner import pp_cut
+from flliper.srt.planner import pp_cut
 
 
 def _write_shard(path, tensors):

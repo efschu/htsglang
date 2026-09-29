@@ -12,9 +12,9 @@ from typing import List, Optional
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -206,7 +206,7 @@ class TestServingTranscription(CustomTestCase):
     def test_auto_detect_streaming(self):
         """language=None + stream=True: deltas scrubbed, concat matches non-streaming.
 
-        Verified against a real server: sglang's streaming path for Whisper
+        Verified against a real server: flliper's streaming path for Whisper
         produces clean deltas (complete words, no BPE fragmentation), so the
         fused path only needs to hide the forced prefix — which this PR
         does. Asserts both the prefix-leak guard and text equivalence.

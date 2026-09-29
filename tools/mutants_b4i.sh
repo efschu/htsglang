@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Mutant harness for the #1273 B4i slice: the uncovered conv/5-D population
-# (weight_exchange.py) and the WEG2-XCHG-RESERVE emission (launcher.py).
+# (weight_exchange.py) and the PDFLIP-XCHG-RESERVE emission (launcher.py).
 #
 # SAME SNAPSHOT DISCIPLINE AS tools/mutants_b4h.sh AND FOR THE SAME MEASURED
 # REASON: a harness that restores with `git checkout --` reverts to the last
@@ -65,14 +65,14 @@ if before == after:
 PY
 }
 
-WX=python/sglang/srt/weg2/weight_exchange.py
-LA=python/sglang/srt/weg2/launcher.py
-T="test/registered/unit/weg2/test_weg2_xchg_coverage_conv_1273.py
-test/registered/unit/weg2/test_weg2_xchg_reserve_1273.py
-test/registered/unit/weg2/test_weg2_w19_form_residue_1273.py
-test/registered/unit/weg2/test_weg2_xchg_cover_1273.py
-test/registered/unit/weg2/test_weg2_xchg_plan_1273.py
-test/registered/unit/weg2/test_weg2_xchg_plan_provider_1273.py"
+WX=python/flliper/srt/pdflip/weight_exchange.py
+LA=python/flliper/srt/pdflip/launcher.py
+T="test/registered/unit/pdflip/test_pdflip_xchg_coverage_conv_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_reserve_1273.py
+test/registered/unit/pdflip/test_pdflip_w19_form_residue_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_cover_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_plan_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_plan_provider_1273.py"
 
 if [ "${1:-}" = "--selfcheck" ]; then
   PLANT="# MUTANT-HARNESS-SELFCHECK-PLANTED-$$"
@@ -145,15 +145,15 @@ m "M8 an aliasing attribute is judged WITHOUT its storage (144 lines come back)"
 
 # ---- HALF 2: the RESERVE line's emission and its one instrument ----------
 m "M9 the emitter loses its production call site again (weg2xsn15: 0 lines in 4 logs)" "$LA" \
-  '        xchg_form_dormant_reserve(cards, ns.weg2_xchg_census, log=log)' \
+  '        xchg_form_dormant_reserve(cards, ns.pdflip_xchg_census, log=log)' \
   '        pass'
 m "M10 the call computes and never prints (the W84 shape one level down)" "$LA" \
-  '        xchg_form_dormant_reserve(cards, ns.weg2_xchg_census, log=log)' \
-  '        xchg_form_dormant_reserve(cards, ns.weg2_xchg_census)'
+  '        xchg_form_dormant_reserve(cards, ns.pdflip_xchg_census, log=log)' \
+  '        xchg_form_dormant_reserve(cards, ns.pdflip_xchg_census)'
 m "M11 the census path is truthy-checked again (#872: silent absence, no W71)" "$LA" \
   '    if _xchg_form:
         # B4i: THE LINE' \
-  '    if _xchg_form and ns.weg2_xchg_census:
+  '    if _xchg_form and ns.pdflip_xchg_census:
         # B4i: THE LINE'
 m "M12 the line is emitted on EVERY form (the ring arm pays for a census it has no reason to read)" "$LA" \
   '    if _xchg_form:
@@ -167,7 +167,7 @@ m "M14 the host-side subtraction returns as a printed term" "$LA" \
   '            f"measured_mib={int(entry.dormant_proc_used_mib)} "' \
   '            f"measured_mib={int(entry.dormant_proc_used_mib)} region_mib=385 "'
 m "M15 the two readings stop naming their shared instrument" "$LA" \
-  '            f"instrument=WEG2-DC-at-sleep "' \
+  '            f"instrument=PDFLIP-DC-at-sleep "' \
   '            f""'
 m "M16 the delta is silently dropped (the attribution loses its number)" "$LA" \
   '            f"delta_mib={out[c.uuid] - int(entry.dormant_proc_used_mib)} "' \

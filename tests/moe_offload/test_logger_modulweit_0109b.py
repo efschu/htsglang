@@ -7,14 +7,14 @@ einer anderen Funktion gebunden.
 """
 import logging
 
-from sglang.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_offload as eo
 
 
 def test_logger_ist_modulweit():
     assert isinstance(getattr(eo, "logger", None), logging.Logger)
 
 
-def test_der_109_pfad_findet_ihn():
+def test_109_path_finds_it():
     """Der Aufruf steht in einer Funktion OHNE eigene logger-Bindung --
     er loest gegen das Modul auf, oder er wirft am Metall."""
     import inspect

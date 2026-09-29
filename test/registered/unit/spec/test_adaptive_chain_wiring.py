@@ -2,7 +2,7 @@
 
 Two things are checked here that the pure-policy tests cannot:
 
-* with ``SGLANG_SPEC_ADAPTIVE_CHAIN`` unset, nothing is allocated and no code
+* with ``FLLIPER_SPEC_ADAPTIVE_CHAIN`` unset, nothing is allocated and no code
   path changes — the default run must stay byte-identical;
 * when it is set, the probe/policy hand-off does what the hot path expects, and
   a not-yet-landed readout falls back instead of blocking.
@@ -17,13 +17,13 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.speculative.adaptive_chain import (
+from flliper.srt.speculative.adaptive_chain import (
     AdaptiveChainPolicy,
     RoundCostProbe,
     SurvivalProbe,
 )
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -51,13 +51,13 @@ class TestProbeArming(unittest.TestCase):
 
     def test_armed_when_env_set(self):
         w = _draft_worker()
-        with patch.dict("os.environ", {"SGLANG_SPEC_ADAPTIVE_CHAIN": "1"}):
+        with patch.dict("os.environ", {"FLLIPER_SPEC_ADAPTIVE_CHAIN": "1"}):
             w._init_adaptive_chain_probe()
         self.assertIsNotNone(w.survival_probe)
         # The buffer must span the longest chain the controller could ever
         # activate: max of the default config's candidate union (this tree
         # ships [1,2,3] / [0,1,3] / ..., i.e. 3; upstream-ish configs go to 7).
-        from sglang.srt.speculative.adaptive_spec_params import (
+        from flliper.srt.speculative.adaptive_spec_params import (
             resolve_candidate_steps_from_config,
         )
 
@@ -67,14 +67,14 @@ class TestProbeArming(unittest.TestCase):
 
     def test_not_armed_for_topk_above_one(self):
         w = _draft_worker(topk=4)
-        with patch.dict("os.environ", {"SGLANG_SPEC_ADAPTIVE_CHAIN": "1"}):
+        with patch.dict("os.environ", {"FLLIPER_SPEC_ADAPTIVE_CHAIN": "1"}):
             w._init_adaptive_chain_probe()
         self.assertIsNone(w.survival_probe)
 
     def test_not_armed_without_speculative_adaptive(self):
         # It selects between runtime states that only --speculative-adaptive builds.
         w = _draft_worker(adaptive=False)
-        with patch.dict("os.environ", {"SGLANG_SPEC_ADAPTIVE_CHAIN": "1"}):
+        with patch.dict("os.environ", {"FLLIPER_SPEC_ADAPTIVE_CHAIN": "1"}):
             w._init_adaptive_chain_probe()
         self.assertIsNone(w.survival_probe)
 

@@ -19,17 +19,17 @@ The number is READ, not modelled and not probed -- see Provenance.REPORTED.
 import types
 import unittest
 
-from sglang.srt.mem_ledger.engine import (
+from flliper.srt.mem_ledger.engine import (
     TERM_NVML_CARVE_OUT,
     CardFacts,
     DemandInputs,
     build_card_ledgers,
     demand_outside_budget_mib,
 )
-from sglang.srt.mem_ledger.terms import Provenance
-from sglang.srt.registry.nvml import DeviceInfo
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_ledger.terms import Provenance
+from flliper.srt.registry.nvml import DeviceInfo
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -168,7 +168,7 @@ class TestThePlannerCorridorIsNoLongerAConstant(unittest.TestCase):
     """
 
     def test_the_default_extra_corridor_is_zero(self):
-        from sglang.srt.uneven_perf import planner_corridor_mib
+        from flliper.srt.uneven_perf import planner_corridor_mib
 
         self.assertEqual(
             planner_corridor_mib(),
@@ -180,8 +180,8 @@ class TestThePlannerCorridorIsNoLongerAConstant(unittest.TestCase):
     def test_it_no_longer_reads_the_daemons_emergency_floor(self):
         """The reservation daemon's 400 MiB floor answers a different
         question and must not double as the planner's release criterion."""
-        from sglang.srt.registry.ledger import DEFAULT_CORRIDOR_BYTES
-        from sglang.srt.uneven_perf import planner_corridor_mib
+        from flliper.srt.registry.ledger import DEFAULT_CORRIDOR_BYTES
+        from flliper.srt.uneven_perf import planner_corridor_mib
 
         self.assertEqual(DEFAULT_CORRIDOR_BYTES // MIB, 400)
         self.assertNotEqual(planner_corridor_mib(), DEFAULT_CORRIDOR_BYTES // MIB)
@@ -189,13 +189,13 @@ class TestThePlannerCorridorIsNoLongerAConstant(unittest.TestCase):
     def test_the_experiment_seam_still_works(self):
         import os
 
-        from sglang.srt.uneven_perf import planner_corridor_mib
+        from flliper.srt.uneven_perf import planner_corridor_mib
 
-        os.environ["SGLANG_PLANNER_CORRIDOR_MIB"] = "256"
+        os.environ["FLLIPER_PLANNER_CORRIDOR_MIB"] = "256"
         try:
             self.assertEqual(planner_corridor_mib(), 256)
         finally:
-            del os.environ["SGLANG_PLANNER_CORRIDOR_MIB"]
+            del os.environ["FLLIPER_PLANNER_CORRIDOR_MIB"]
 
 
 class _ReserveStub:
@@ -298,7 +298,7 @@ class TestTheCorridorZeroIsCoupledToTheDemand(unittest.TestCase):
         """Stated as one assertion so the coupling is not separable: the zero
         is a CONSEQUENCE of the two carriers above, not an independent
         policy choice."""
-        from sglang.srt.uneven_perf import planner_corridor_mib
+        from flliper.srt.uneven_perf import planner_corridor_mib
 
         stub = _ReserveStub()
         demand = stub.reserve_demand_per_gpu(RTX_3080_TOTAL_MIB, {1: 1})[1]
@@ -336,7 +336,7 @@ class TestTheCarveOutSurvivesTheProductionCardPath(unittest.TestCase):
     """
 
     def test_memory_info_carries_reserved_and_allocatable(self):
-        from sglang.srt.registry.nvml import MemoryInfo
+        from flliper.srt.registry.nvml import MemoryInfo
 
         mem = MemoryInfo(
             total_bytes=RTX_3080_TOTAL_MIB * MIB,
@@ -353,7 +353,7 @@ class TestTheCarveOutSurvivesTheProductionCardPath(unittest.TestCase):
         """_RankGpuCard must REFUSE to be built without it. If this ever
         becomes optional again, the carve-out can silently price at 0 in a
         boot while every hand-built fixture still passes."""
-        from sglang.srt.server_args import _RankGpuCard
+        from flliper.srt.server_args import _RankGpuCard
 
         with self.assertRaises(TypeError):
             _RankGpuCard(
@@ -371,7 +371,7 @@ class TestTheCarveOutSurvivesTheProductionCardPath(unittest.TestCase):
         getattr default turns a missing field into a priced-zero term."""
         import inspect
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         src = inspect.getsource(ServerArgs._build_card_ledgers)
         self.assertIn("reserved_mib=card.reserved_mib", src)

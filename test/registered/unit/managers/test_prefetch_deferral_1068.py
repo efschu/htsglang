@@ -63,24 +63,24 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers import scheduler as sched_mod
-from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
-from sglang.srt.managers.scheduler import (
+from flliper.srt.disaggregation.utils import DisaggregationMode
+from flliper.srt.managers import scheduler as sched_mod
+from flliper.srt.managers.phase_purity import SEAM_READMIT_ATTR
+from flliper.srt.managers.scheduler import (
     _DEFER_REASON_RATE,
     _DEFER_REASON_SHORTFALL,
     _VERDICT_TRUNCATED_GROUP,
     Scheduler,
 )
-from sglang.srt.mem_cache.match_refusal_census import PREFETCH_GATE_COUNTS
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.match_refusal_census import PREFETCH_GATE_COUNTS
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 SPAN = 39365
 LIMIT = 329589  # 0.9 x 366211 (spec section 5)
-LOG = "sglang.srt.managers.scheduler"
+LOG = "flliper.srt.managers.scheduler"
 
 
 def _field(key, value):
@@ -208,10 +208,10 @@ class _Intake:
     # #1436/#1440 progress witness: the double models no delivery, so the
     # witness is a no-op ("n/a") except where a test installs the #1317k
     # stall stand-in (`_stall_witness`) on its own instance.
-    _weg2_note_prefetch_progress = lambda self, req: "n/a"  # noqa: E731
+    _pdflip_note_prefetch_progress = lambda self, req: "n/a"  # noqa: E731
     # the undeferrable exit asks whether a windowed store read is in flight;
     # the double has none
-    _weg2_windowed_store_read_active = lambda self, *a, **k: False  # noqa: E731
+    _pdflip_windowed_store_read_active = lambda self, *a, **k: False  # noqa: E731
     # NF fnFL2 H43 (0244277a30): intake starts the PLE first-chunk gather; the
     # double has no PLE gather in its process (the real call is a no-op there
     # too). Missing since the unified base a3b9479f29: every intake raised
@@ -219,14 +219,14 @@ class _Intake:
     _ple_admit_on_intake = lambda self, req: None  # noqa: E731
     # NF H91c3-2: a hand-off arriving after the D park is held behind it;
     # this double is no parked group D, so nothing is ever held here.
-    _weg2_d_park_hold_late = lambda self, req: False  # noqa: E731
+    _pdflip_d_park_hold_late = lambda self, req: False  # noqa: E731
 
     def _stall_witness(self, req):
         """#1317k stand-in (installed per test): every retry is a no-progress
         pass; 'terminal' once the stall bound is reached."""
-        n = int(getattr(req, "_weg2_no_progress_passes", 0) or 0) + 1
-        req._weg2_no_progress_passes = n
-        return "terminal" if n >= self._weg2_prefetch_stall_passes() else "stalled"
+        n = int(getattr(req, "_pdflip_no_progress_passes", 0) or 0) + 1
+        req._pdflip_no_progress_passes = n
+        return "terminal" if n >= self._pdflip_prefetch_stall_passes() else "stalled"
 
     def __init__(
         self,
@@ -413,7 +413,7 @@ class TestTheNamedExits(_Clean):
 
     def test_expiry_exits_by_name_and_admits_with_rate_expired(self):
         # #1317k: NO WALL CLOCK -- a rate mark expires after
-        # SGLANG_WEG2_PREFETCH_STALL_PASSES consecutive retries without
+        # FLLIPER_PDFLIP_PREFETCH_STALL_PASSES consecutive retries without
         # progress (the double models no delivery, so every retry is one).
         # Rewritten 2026-09-17 from the pre-#1317k bound_s form.
         import types
@@ -421,11 +421,11 @@ class TestTheNamedExits(_Clean):
         # the pass-based law is installed on THIS instance only: binding the
         # stall bound on the class switches the shortfall arm's tests, which
         # still exercise the priced wall-clock bound, to the pass law too
-        s._weg2_prefetch_stall_passes = types.MethodType(Scheduler._weg2_prefetch_stall_passes, s)
-        s._weg2_note_prefetch_progress = s._stall_witness
+        s._pdflip_prefetch_stall_passes = types.MethodType(Scheduler._pdflip_prefetch_stall_passes, s)
+        s._pdflip_note_prefetch_progress = s._stall_witness
         r = _Req("slow", seq=1)
-        with mock.patch.dict(os.environ, {"SGLANG_WEG2_PREFETCH_STALL_PASSES": "3"}):
-            self.assertEqual(s._weg2_prefetch_stall_passes(), 3)
+        with mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_PREFETCH_STALL_PASSES": "3"}):
+            self.assertEqual(s._pdflip_prefetch_stall_passes(), 3)
             s._add_request_to_queue(r)
             self.assertEqual(r.prefetch_deferred, "rate_limited")
             for _ in range(2):
@@ -516,7 +516,7 @@ class TestThe969CIntakeLine(_Clean):
         (`prefetch_budget.log_prefetch_limit`) -- both must carry the
         anchor's id() and never the group's. Mutant 'return anchor or pool'
         -> 'return pool' reds the first assert and both lines."""
-        from sglang.srt.mem_cache import prefetch_budget
+        from flliper.srt.mem_cache import prefetch_budget
 
         s = _Intake(lambda req: "issued")
         cc = s.tree_cache.cache_controller
@@ -742,10 +742,10 @@ class TestFollowersMarkAndRetryButNeverHold(_Clean):
         f = _Intake(occ, pp_size=3, pp_rank=1)
         r = _Req("w", seq=1)
         # #1400: in the carrierless PP form with HiCache storage a follower is
-        # weg2_held on PP0's told verdict and never defers itself; this test
+        # pdflip_held on PP0's told verdict and never defers itself; this test
         # exercises the follower DEFERRAL mechanism, which still serves every
         # form without store-told, so that arm is disabled here (2026-09-17).
-        with mock.patch.object(sched_mod.weg2_store_told, "armed", lambda scheduler: False), \
+        with mock.patch.object(sched_mod.pdflip_store_told, "armed", lambda scheduler: False), \
                 self.assertLogs(LOG, level="INFO") as caught:
             f._add_request_to_queue(r)
         # the mark is set on the follower exactly as on PP0
@@ -785,7 +785,7 @@ class TestFollowersMarkAndRetryButNeverHold(_Clean):
         self.assertFalse(getattr(r, "_prefetch_landed_hold_once", False))
         self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_dropped", 0), 0, "nothing dropped by name")
 
-    @mock.patch.object(sched_mod.weg2_store_told, "armed", lambda scheduler: False)  # #1400 off: deferral mechanism under test
+    @mock.patch.object(sched_mod.pdflip_store_told, "armed", lambda scheduler: False)  # #1400 off: deferral mechanism under test
     def test_pp0_and_a_follower_land_the_same_sequence(self):
         # The rank-uniformity argument, as a test: the same wave through a
         # PP0 and a follower stand-in with the same (MIN-synced) capacity
@@ -844,18 +844,18 @@ class TestFollowersMarkAndRetryButNeverHold(_Clean):
     def test_the_follower_join_that_carries_pp0s_hold_is_alive_in_the_tree(self):
         # (i) the row-authority predicate defaults ON for every multi-stage
         # PP form (pp_admission_congruence.pp_row_authority_enabled)
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             pp_row_authority_enabled,
         )
 
-        env = {k: v for k, v in os.environ.items() if k != "SGLANG_PP_ROW_AUTHORITY"}
+        env = {k: v for k, v in os.environ.items() if k != "FLLIPER_PP_ROW_AUTHORITY"}
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertTrue(
                 pp_row_authority_enabled(types.SimpleNamespace(ps=types.SimpleNamespace(pp_size=3)))
             )
         # (ii) the downstream PP body WRITES the memo from the row: the
         # reconciled decision when a frame is pending, {} when provably none
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         body = inspect.getsource(SchedulerPPMixin._event_loop_pp_body)
         self.assertIn("self._pp_admission_incoming_effective = effective", body)
@@ -882,11 +882,11 @@ class TestFollowersMarkAndRetryButNeverHold(_Clean):
         # the stand-ins of this file. (i) the controller the assembler
         # attaches (hybrid_pool_assembler.py build_*_stack) inherits the rate
         # verdict and its budget from HiCacheController unchanged ...
-        from sglang.srt.managers.cache_controller import HiCacheController
-        from sglang.srt.mem_cache.hybrid_cache import (
+        from flliper.srt.managers.cache_controller import HiCacheController
+        from flliper.srt.mem_cache.hybrid_cache import (
             hybrid_cache_controller as hcc_mod,
         )
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         hcc = hcc_mod.HybridCacheController
         self.assertIs(hcc.__mro__[1], HiCacheController)
@@ -1061,7 +1061,7 @@ class TestATruncatedReadNeverReachesTheDeferral(_Clean):
         _assert_unmarked(self, r)
         self.assertIsNone(s._apply_prefetch_deferral(r, "issued", site="intake"))
         _assert_unmarked(self, r)
-        # So the X gate's deferral arm (`_weg2_store_read_is_pending` reads
+        # So the X gate's deferral arm (`_pdflip_store_read_is_pending` reads
         # `prefetch_deferred`) is False the instant the read leaves
         # `ongoing_prefetch` -- which is why a cut read is priced at its whole
         # extent (W50) instead of deferred. THAT is the #1298 part (C) gap.
@@ -1108,7 +1108,7 @@ class TestTheGroupShortfallDeferral(_Clean):
     group trim fired (`unified_radix_cache.py`, S2 census key), so by the time
     it reaches this state machine it is already a fact every rank of the group
     agreed on. These tests drive the state machine; the group-agreement half is
-    pinned in `test_weg2_store_grid_claim_1298.py::test_s1_*`.
+    pinned in `test_pdflip_store_grid_claim_1298.py::test_s1_*`.
     """
 
     def test_the_symmetric_vote_refusal_no_longer_blocks_this_mark(self):
@@ -1180,11 +1180,11 @@ class TestTheGroupShortfallDeferral(_Clean):
                          _DEFER_REASON_SHORTFALL)
         self.assertEqual(r.prefetch_defer_attempts, 2)
         # #1317k (rewritten 2026-09-17): NO WALL CLOCK -- the mark expires after
-        # SGLANG_WEG2_PREFETCH_STALL_PASSES retries without progress
+        # FLLIPER_PDFLIP_PREFETCH_STALL_PASSES retries without progress
         import types
-        s._weg2_prefetch_stall_passes = types.MethodType(Scheduler._weg2_prefetch_stall_passes, s)
-        s._weg2_note_prefetch_progress = s._stall_witness
-        with mock.patch.dict(os.environ, {"SGLANG_WEG2_PREFETCH_STALL_PASSES": "2"}):
+        s._pdflip_prefetch_stall_passes = types.MethodType(Scheduler._pdflip_prefetch_stall_passes, s)
+        s._pdflip_note_prefetch_progress = s._stall_witness
+        with mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_PREFETCH_STALL_PASSES": "2"}):
             s._retry_deferred_prefetches()
             self.assertEqual(getattr(r, "prefetch_deferred", None), _DEFER_REASON_SHORTFALL)
             with self.assertLogs(LOG, level="WARNING") as caught:
@@ -1336,10 +1336,10 @@ class TheShortfallMarkSurvivesTheInFlightCutRead(CustomTestCase):
         s, r = self._marked()
         # #1317k (rewritten 2026-09-17): the SAME pass bound as the rate arm
         import types
-        s._weg2_prefetch_stall_passes = types.MethodType(Scheduler._weg2_prefetch_stall_passes, s)
-        s._weg2_note_prefetch_progress = s._stall_witness
+        s._pdflip_prefetch_stall_passes = types.MethodType(Scheduler._pdflip_prefetch_stall_passes, s)
+        s._pdflip_note_prefetch_progress = s._stall_witness
         s._verdict = lambda req: "declined:already_in_flight"
-        with mock.patch.dict(os.environ, {"SGLANG_WEG2_PREFETCH_STALL_PASSES": "2"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_PDFLIP_PREFETCH_STALL_PASSES": "2"}):
             s._retry_deferred_prefetches()
             s._retry_deferred_prefetches()
         self.assertIsNone(getattr(r, "prefetch_deferred", None))
@@ -1347,23 +1347,23 @@ class TheShortfallMarkSurvivesTheInFlightCutRead(CustomTestCase):
     def test_the_rank_local_hold_stands_down_where_the_group_speaks(self):
         """#1305 finding 1: in `_get_new_batch_prefill_raw` the A12.2 hold is
         conditioned on the group NOT having an opinion on the rid's store read
-        (`_weg2_x_group_speaks`), so a marked request the group has an opinion
-        on falls through to the group-agreed `_weg2_x_defers` -- which stays
-        DIRECTLY above the pricing gate, FIX 7's own pin (test_weg2_sched_fix7
-        c1d) -- and is skipped under `weg2_x_defer` with the S3 X-DEFER line,
+        (`_pdflip_x_group_speaks`), so a marked request the group has an opinion
+        on falls through to the group-agreed `_pdflip_x_defers` -- which stays
+        DIRECTLY above the pricing gate, FIX 7's own pin (test_pdflip_sched_fix7
+        c1d) -- and is skipped under `pdflip_x_defer` with the S3 X-DEFER line,
         not silently under `prefetch_deferred`."""
         import inspect
 
         src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
         self.assertIn(
             "self._admission_held_for_deferred_prefetch(req) and not (\n"
-            "                self._weg2_x_group_speaks(req, _head_inputs)\n"
+            "                self._pdflip_x_group_speaks(req, _head_inputs)\n"
             "            )",
             src,
         )
         i_hold = src.index("self._admission_held_for_deferred_prefetch(req)")
-        i_defer = src.index("self._weg2_x_defers(req, _head_inputs)")
-        i_refuse = src.index("self._weg2_x_refuses(req, _head_inputs)")
+        i_defer = src.index("self._pdflip_x_defers(req, _head_inputs)")
+        i_refuse = src.index("self._pdflip_x_refuses(req, _head_inputs)")
         self.assertLess(i_hold, i_defer)
         self.assertLess(i_defer, i_refuse)
 
@@ -1371,7 +1371,7 @@ class TheShortfallMarkSurvivesTheInFlightCutRead(CustomTestCase):
         """Same term the X gate reads, asked without acting; fail-closed."""
         import inspect
 
-        src = inspect.getsource(Scheduler._weg2_x_group_speaks)
+        src = inspect.getsource(Scheduler._pdflip_x_group_speaks)
         self.assertIn("tp_head_congruence.group_store_read_pending_ms(", src)
         self.assertIn("is not None", src)
         self.assertIn("return False", src)

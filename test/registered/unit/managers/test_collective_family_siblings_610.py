@@ -44,8 +44,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15)
 
@@ -252,7 +252,7 @@ class WallClockAbortGateTest(unittest.TestCase):
         with _process_patches(
             collective,
             unittest.mock.patch(
-                "sglang.srt.managers.scheduler.envs.SGLANG_REQ_WAITING_TIMEOUT.get",
+                "flliper.srt.managers.scheduler.envs.FLLIPER_REQ_WAITING_TIMEOUT.get",
                 lambda: timeout_s,
             ),
         ):
@@ -297,7 +297,7 @@ class WallClockAbortGateTest(unittest.TestCase):
         with _process_patches(
             collective,
             unittest.mock.patch(
-                "sglang.srt.managers.scheduler.envs.SGLANG_REQ_RUNNING_TIMEOUT.get",
+                "flliper.srt.managers.scheduler.envs.FLLIPER_REQ_RUNNING_TIMEOUT.get",
                 lambda: timeout_s,
             ),
         ):
@@ -372,7 +372,7 @@ def make_hiradix(collective, controller, symmetric=True):
     """A REAL HiRadixCache object with only the attributes these two methods
     touch populated. Pinning against the real class is deliberate: a
     transcribed copy would not notice a change to the class under test."""
-    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+    from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
 
     cache = HiRadixCache.__new__(HiRadixCache)
     cache.enable_storage = True
@@ -577,11 +577,11 @@ class BudgetHarness:
     # canonical head. Tenth and eleventh drift; the guard named both. Bound,
     # not stubbed: `waiting_queue` is empty, so the canonical head is empty
     # and both votes are the empty dict -- neutral and identical on every rank.
-    _weg2_local_store_read_pending_ages = Scheduler._weg2_local_store_read_pending_ages
-    _weg2_local_store_matches = Scheduler._weg2_local_store_matches
+    _pdflip_local_store_read_pending_ages = Scheduler._pdflip_local_store_read_pending_ages
+    _pdflip_local_store_matches = Scheduler._pdflip_local_store_matches
     # ... and the predicate the pending-ages vote asks per head rid (found by
     # the guard on the next descent, bound for the same reason).
-    _weg2_store_read_is_pending = Scheduler._weg2_store_read_is_pending
+    _pdflip_store_read_is_pending = Scheduler._pdflip_store_read_is_pending
 
     def get_num_allocatable_reqs(self, running_bs):
         """A STAND-IN, which is what the guard's own message offers as the
@@ -641,13 +641,13 @@ def _budget_state_stub(*, avail: int, evictable: int, deficit: int):
     ``TheAdderStubTracksTheBudgetPredicate`` below is what makes that absence
     loud; see #624 for why this harness class keeps earning one.
     """
-    from sglang.srt.managers.schedule_policy import PrefillAdder
-    from sglang.srt.planner.chunked_admission import ChunkedCommitmentLedger
+    from flliper.srt.managers.schedule_policy import PrefillAdder
+    from flliper.srt.planner.chunked_admission import ChunkedCommitmentLedger
 
     adder = PrefillAdder.__new__(PrefillAdder)
     adder.prefill_spill_deep_taken = False
     #: H24: budget_state closes the batch behind a skip-extend admission too
-    adder.weg2_skip_extend_taken = False
+    adder.pdflip_skip_extend_taken = False
     adder.is_hybrid_swa = False
     adder.is_all_swa = False
     adder.is_hybrid_ssm_cache = False
@@ -719,7 +719,7 @@ class TheAdderStubTracksTheBudgetPredicate(unittest.TestCase):
     """
 
     def test_the_stub_carries_everything_the_budget_term_reads(self):
-        from sglang.srt.managers.schedule_policy import PrefillAdder
+        from flliper.srt.managers.schedule_policy import PrefillAdder
 
         stub = _budget_state_stub(avail=1, evictable=1, deficit=0)
         needed = _self_attributes_read_by(PrefillAdder.rem_total_tokens.fget)
@@ -733,7 +733,7 @@ class TheAdderStubTracksTheBudgetPredicate(unittest.TestCase):
         )
 
     def test_the_guard_can_fail(self):
-        from sglang.srt.managers.schedule_policy import PrefillAdder
+        from flliper.srt.managers.schedule_policy import PrefillAdder
 
         stub = _budget_state_stub(avail=1, evictable=1, deficit=0)
         needed = _self_attributes_read_by(PrefillAdder.rem_total_tokens.fget) | {
@@ -766,7 +766,7 @@ class PrefillAdmissionBudgetTest(unittest.TestCase):
         with _process_patches(
             collective,
             unittest.mock.patch(
-                "sglang.srt.distributed.utils.uneven_dcp_active", lambda *a: True
+                "flliper.srt.distributed.utils.uneven_dcp_active", lambda *a: True
             ),
         ):
             results, errors = run_ranks(body)
@@ -794,7 +794,7 @@ class PrefillAdmissionBudgetTest(unittest.TestCase):
         """The symptom itself, through the real PrefillAdder predicate: with a
         per-request demand between the two ranks' local budgets, the unpinned
         code makes them disagree on NO_TOKEN."""
-        from sglang.srt.managers.schedule_policy import AddReqResult
+        from flliper.srt.managers.schedule_policy import AddReqResult
 
         budgets, errors = self._budgets()
         self.assertEqual(errors, [], f"a rank broke the budget reduce: {errors}")

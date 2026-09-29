@@ -39,15 +39,15 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt import server_args as server_args_mod
-from sglang.srt.arg_groups.arg_utils import resolvable_fields
-from sglang.srt.arg_groups.overrides import (
+from flliper.srt import server_args as server_args_mod
+from flliper.srt.arg_groups.arg_utils import resolvable_fields
+from flliper.srt.arg_groups.overrides import (
     materialize_declarations,
     run_post_process_pass,
 )
-from sglang.srt.model_loader import hibernate
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.model_loader import hibernate
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -88,7 +88,7 @@ class HibernateIdentityTest(unittest.TestCase):
     def setUp(self):
         self._orig = server_args_mod.check_gguf_file
         server_args_mod.check_gguf_file = _looks_like_gguf
-        import sglang.srt.utils.hf_transformers_utils as hf_utils
+        import flliper.srt.utils.hf_transformers_utils as hf_utils
 
         self._orig_hf = hf_utils.check_gguf_file
         hf_utils.check_gguf_file = _looks_like_gguf

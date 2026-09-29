@@ -3,14 +3,14 @@ test_basic_sanity.py with the spec-decoding path active."""
 
 import unittest
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
-from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
-from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kits.basic_api_contract_kit import BasicAPIContractMixin
+from flliper.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
+from flliper.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
+from flliper.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -53,7 +53,7 @@ class TestBasicSanityEagle3(
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                # Canonical EAGLE3 sglang config: fp16 + triton attention.
+                # Canonical EAGLE3 flliper config: fp16 + triton attention.
                 # bf16 + flashinfer cutlass RMSNorm hits a SM120 dtype
                 # mismatch on the draft model's input_layernorm.
                 "--dtype",
@@ -77,7 +77,7 @@ class TestBasicSanityEagle3(
                 "--enable-metrics",
                 "--disable-piecewise-cuda-graph",
             ],
-            env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
+            env={"FLLIPER_ENABLE_METRICS_DEVICE_TIMER": "1"},
         )
 
     @classmethod

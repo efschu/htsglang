@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-RELIEF = ROOT / "python/sglang/srt/managers/kv_backing_relief.py"
+RELIEF = ROOT / "python/flliper/srt/managers/kv_backing_relief.py"
 SUITE = "test/registered/unit/managers/test_floor_need_exits_839_v2.py"
 
 MUTANTS = [

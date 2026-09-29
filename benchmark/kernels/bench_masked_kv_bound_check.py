@@ -32,7 +32,7 @@ import statistics
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import masked_set_kv_buffer_kernel
+from flliper.srt.mem_cache.memory_pool import masked_set_kv_buffer_kernel
 
 DTYPES = {
     "fp8": torch.float8_e4m3fn,

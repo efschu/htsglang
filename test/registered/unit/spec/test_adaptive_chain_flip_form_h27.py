@@ -30,27 +30,27 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.speculative import adaptive_graph_memory as agm
-from sglang.srt.speculative.adaptive_chain import (
+from flliper.srt.speculative import adaptive_graph_memory as agm
+from flliper.srt.speculative.adaptive_chain import (
     FALLBACK_SENTINEL,
     AdaptiveChainPolicy,
     ChainConsensusError,
     ChainCostModel,
 )
-from sglang.srt.speculative.adaptive_graph_memory import plan_residency
-from sglang.srt.speculative.adaptive_runtime_state import (
+from flliper.srt.speculative.adaptive_graph_memory import plan_residency
+from flliper.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
-from sglang.srt.speculative.adaptive_spec_params import (
+from flliper.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
 )
-from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-LOGGER = "sglang.srt.speculative.adaptive_chain"
+LOGGER = "flliper.srt.speculative.adaptive_chain"
 
 
 class _Bus:
@@ -326,7 +326,7 @@ class TestConsensusSource(unittest.TestCase):
             mock.patch.object(dist, "get_global_rank", lambda g, r: 10 + r),
             mock.patch.object(dist, "broadcast_object_list", bcast),
             mock.patch(
-                "sglang.srt.distributed.get_tp_group",
+                "flliper.srt.distributed.get_tp_group",
                 lambda: SimpleNamespace(cpu_group=object()),
             ),
         ):
@@ -405,7 +405,7 @@ class TestEmaDoesNotFightThePolicy(unittest.TestCase):
     def test_allow_switch_false_observes_but_never_switches(self):
         worker, ctrl = self._controller()
         with mock.patch.dict(
-            "os.environ", {"SGLANG_ADAPTIVE_FORCE_SWAP_INTERVAL": "1"}
+            "os.environ", {"FLLIPER_ADAPTIVE_FORCE_SWAP_INTERVAL": "1"}
         ):
             for _ in range(5):
                 ctrl.on_verify_complete([0, 0], batch_size=2, allow_switch=False)
@@ -464,7 +464,7 @@ class TestOneStateResident(unittest.TestCase):
 
     def test_env_is_read_by_the_manager(self):
         with mock.patch.dict(
-            "os.environ", {"SGLANG_ADAPTIVE_GRAPH_MEMORY_MAX_RESIDENT": "1"}
+            "os.environ", {"FLLIPER_ADAPTIVE_GRAPH_MEMORY_MAX_RESIDENT": "1"}
         ):
             mgr = agm.AdaptiveGraphMemoryManager(mode="resident")
         self.assertEqual(mgr._max_resident, 1)

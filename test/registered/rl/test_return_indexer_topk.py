@@ -5,12 +5,12 @@ import unittest
 import aiohttp
 import numpy as np
 
-from sglang.srt.state_capturer.indexer_topk import (
+from flliper.srt.state_capturer.indexer_topk import (
     extract_indexer_topk_from_meta_info,
 )
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,

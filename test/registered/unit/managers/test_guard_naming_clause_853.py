@@ -41,7 +41,7 @@ Hermetic: no CUDA, no NVML, no pool. CUDA_VISIBLE_DEVICES="".
 
 import unittest
 
-from sglang.srt.managers import corridor_guard as cg
+from flliper.srt.managers import corridor_guard as cg
 
 MIB = 1024 * 1024
 

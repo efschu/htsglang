@@ -3,11 +3,11 @@ import itertools
 import pytest
 import torch
 
-from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
+from flliper.jit_kernel.per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
 )
-from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.utils import get_ci_test_range
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -21,12 +21,12 @@ if sgl_per_token_group_quant_8bit is None and not torch.cuda.is_available():
 if sgl_per_token_group_quant_8bit is None:
     raise ImportError("sgl_kernel AOT reference op is unavailable")
 
-from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
+from flliper.srt.layers.quantization.fp8_kernel import (  # noqa: E402
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,
     fp8_min,
-    sglang_per_token_group_quant_fp8,
+    flliper_per_token_group_quant_fp8,
 )
 
 G = 128
@@ -132,14 +132,14 @@ ROW_MAJOR_UE8M0_CASES = get_ci_test_range(
 
 
 @pytest.mark.parametrize("dtype,num_tokens,hidden", ROW_MAJOR_UE8M0_CASES)
-def test_sglang_per_token_group_quant_fp8_row_major_ue8m0(dtype, num_tokens, hidden):
+def test_flliper_per_token_group_quant_fp8_row_major_ue8m0(dtype, num_tokens, hidden):
     """Row-major scale_ue8m0=True quantizes WITH the rounded (power-of-2) scale.
     Verify: (1) scales are exact powers of 2, (2) dequant ≈ original within FP8 tolerance.
     """
     torch.manual_seed(num_tokens * 1000 + hidden)
     x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype)
 
-    x_q, x_s = sglang_per_token_group_quant_fp8(x, G, scale_ue8m0=True)
+    x_q, x_s = flliper_per_token_group_quant_fp8(x, G, scale_ue8m0=True)
     torch.cuda.synchronize()
 
     # Scales must be exact powers of 2

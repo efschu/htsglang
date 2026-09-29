@@ -15,12 +15,12 @@
 import multiprocessing as mp
 import unittest
 
-from sglang.test.lora_utils import (
+from flliper.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
     LORA_MODELS_QWEN3,
     run_lora_multiple_batch_on_model_cases,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestLoRASpecDecoding(CustomTestCase):

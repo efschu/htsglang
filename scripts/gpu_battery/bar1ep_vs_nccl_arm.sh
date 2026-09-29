@@ -38,8 +38,8 @@ hssh() { timeout "${1:?t}" ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=10 \
 # NCCL path, which is exactly what it is the control for.
 if [ "$BACKEND" = bar1ep ]; then
     DEV_ARGS="--device /dev/dmabuf_holder --cap-add SYS_ADMIN --security-opt apparmor=unconfined -v /sys:/sys"
-    BARLINK_ENV="-e SGLANG_BARLINK=1 -e SGLANG_BARLINK_TRANSPORT=bar1 \
- -e SGLANG_BARLINK_BAR1_NV_SOURCE=/nvsrc -e SGLANG_BARLINK_BAR1_WINDOW_MIB=64"
+    BARLINK_ENV="-e FLLIPER_BARLINK=1 -e FLLIPER_BARLINK_TRANSPORT=bar1 \
+ -e FLLIPER_BARLINK_BAR1_NV_SOURCE=/nvsrc -e FLLIPER_BARLINK_BAR1_WINDOW_MIB=64"
 else
     DEV_ARGS=""; BARLINK_ENV=""
 fi
@@ -59,7 +59,7 @@ hssh 120 "setsid bash -c 'docker run --rm --name $NAME --network host \
  -e TORCH_CUDA_ARCH_LIST=8.6 \
  -e CUDA_VISIBLE_DEVICES=1,2 \
  $BARLINK_ENV \
- --entrypoint bash $IMG -c \"cd /wt && python3 -m sglang.launch_server \
+ --entrypoint bash $IMG -c \"cd /wt && python3 -m flliper.launch_server \
    --model-path /model --tp-size 2 \
    --moe-a2a-backend $BACKEND --deepep-mode normal \
    --mem-fraction-static ${MEMFRAC:-0.94} --context-length ${CTX:-2048} --trust-remote-code \

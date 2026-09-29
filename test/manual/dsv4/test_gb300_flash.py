@@ -59,7 +59,7 @@ class TestGB300FlashBalanced(DSV4FlashAime25TestBase):
         "--deepep-config",
         DEEPEP_LARGE_SMS_CONFIG,
     ]
-    EXTRA_ENV = {"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024"}
+    EXTRA_ENV = {"FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024"}
 
 
 class TestGB300FlashMaxThroughput(DSV4FlashAime25TestBase):
@@ -76,7 +76,7 @@ class TestGB300FlashMaxThroughput(DSV4FlashAime25TestBase):
         "--deepep-config",
         DEEPEP_LARGE_SMS_CONFIG,
     ]
-    EXTRA_ENV = {"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024"}
+    EXTRA_ENV = {"FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024"}
 
 
 class TestGB300FlashCP(DSV4FlashAime25TestBase):
@@ -100,7 +100,7 @@ class TestGB300FlashCP(DSV4FlashAime25TestBase):
         DEEPEP_LARGE_SMS_CONFIG,
     ]
     EXTRA_ENV = {
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+        "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
     }
 
 

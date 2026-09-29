@@ -13,7 +13,7 @@
 # ==============================================================================
 """#656 register C20, residual 1: THE KV RUNG'S FLOOR PROTECTS ROWS, NOT WORK.
 
-HANDOFF_681 §1a, measured on metal with ``SGLANG_SEAM_ENTRY_MARGIN_MIB=8192``:
+HANDOFF_681 §1a, measured on metal with ``FLLIPER_SEAM_ENTRY_MARGIN_MIB=8192``:
 
     RuntimeError: Out of memory. Try to allocate 512 tokens.
     Available full tokens: 0 (full_available_size=0 + full_evictable_size=0)
@@ -47,7 +47,7 @@ from __future__ import annotations
 import unittest
 
 
-from sglang.srt.managers import kv_backing_relief as kbr
+from flliper.srt.managers import kv_backing_relief as kbr
 from test_kv_backing_relief_631 import _Card, _FakeAllocator, _FakePool, _relief
 
 MIB = 1024 * 1024
@@ -179,7 +179,7 @@ class TheGateDoesNotAskForWhatTheRungCannotFundTest(unittest.TestCase):
         return relief, seen
 
     def test_the_margin_is_capped_at_what_the_rung_can_fund(self):
-        from sglang.srt.managers.phase_flip_spill import collective_kv_backing_relief
+        from flliper.srt.managers.phase_flip_spill import collective_kv_backing_relief
 
         relief, seen = self._relief_recording(4000)
         fundable = relief.fundable_bytes()
@@ -220,7 +220,7 @@ class TheGateDoesNotAskForWhatTheRungCannotFundTest(unittest.TestCase):
         )
 
     def test_without_a_discretionary_part_the_ask_is_passed_through(self):
-        from sglang.srt.managers.phase_flip_spill import collective_kv_backing_relief
+        from flliper.srt.managers.phase_flip_spill import collective_kv_backing_relief
 
         relief, seen = self._relief_recording(4000)
 
@@ -255,7 +255,7 @@ class TheGateWiresBothHalvesTest(unittest.TestCase):
     def test_the_corridor_gate_declares_the_margin_as_discretionary(self):
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         src = inspect.getsource(PhaseFlipRuntime._corridor_gate)
         gate = src[src.index("collective_kv_backing_relief(") :]

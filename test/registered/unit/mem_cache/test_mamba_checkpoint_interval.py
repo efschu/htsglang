@@ -22,37 +22,37 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.distributed.utils import set_cp_token_ratios
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from flliper.srt.distributed.utils import set_cp_token_ratios
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.mamba_ckpt_utils import (
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.mamba_ckpt_utils import (
     floor_to_interval,
     is_on_interval,
     mamba_checkpoint_track_target,
 )
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.srt.mem_cache.memory_pool import (
+from flliper.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from flliper.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     zero_kv_data_buffers,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.utils import get_device
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
@@ -133,7 +133,7 @@ def _build_tree(
         i for i in range(global_interval - 1, num_layers, global_interval)
     ]
     mamba_layers = [i for i in range(num_layers) if i not in full_attention_layer_ids]
-    with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+    with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
         shape = Mamba2StateShape.create(
             tp_world_size=1,
             intermediate_size=512,
@@ -285,7 +285,7 @@ class TestCheckpointIntervalResume(unittest.TestCase):
         self.assertEqual(result.mamba_branching_seqlen, 8)
 
     def test_strict_resume_falls_back_to_zero(self):
-        with envs.SGLANG_MAMBA_CKPT_STRICT_RESUME.override(True):
+        with envs.FLLIPER_MAMBA_CKPT_STRICT_RESUME.override(True):
             tree, allocator, pool, _ = _build_tree(self.INTERVAL)
             _insert_seq(tree, allocator, pool, SEQ[:4])
             _insert_seq(tree, allocator, pool, SEQ[:8])
@@ -368,7 +368,7 @@ class TestCheckpointEvictionWindow(unittest.TestCase):
         return sorted(depths)
 
     def test_window_protects_deepest(self):
-        with envs.SGLANG_MAMBA_CKPT_WINDOW.override(2):
+        with envs.FLLIPER_MAMBA_CKPT_WINDOW.override(2):
             tree, allocator, pool, _ = _build_tree(self.INTERVAL)
             self._chain(tree, allocator, pool)
             self.assertEqual(self._depths_with_ckpt(tree), [4, 8, 12])
@@ -378,7 +378,7 @@ class TestCheckpointEvictionWindow(unittest.TestCase):
             self.assertEqual(self._depths_with_ckpt(tree), [8, 12])
 
     def test_window_yields_under_pressure(self):
-        with envs.SGLANG_MAMBA_CKPT_WINDOW.override(2):
+        with envs.FLLIPER_MAMBA_CKPT_WINDOW.override(2):
             tree, allocator, pool, _ = _build_tree(self.INTERVAL)
             self._chain(tree, allocator, pool)
             # Demand all three: the second pass ignores the window.
@@ -387,7 +387,7 @@ class TestCheckpointEvictionWindow(unittest.TestCase):
             self.assertEqual(self._depths_with_ckpt(tree), [])
 
     def test_window_disabled_without_interval(self):
-        with envs.SGLANG_MAMBA_CKPT_WINDOW.override(2):
+        with envs.FLLIPER_MAMBA_CKPT_WINDOW.override(2):
             tree, allocator, pool, _ = _build_tree(None)
             self._chain(tree, allocator, pool)
             # Upstream behavior: plain LRU, the shallowest (least recently
@@ -524,7 +524,7 @@ class TestPoolClaimPoison(unittest.TestCase):
         mamba_pool.mamba_cache.temporal.fill_(float("nan"))
 
     def test_pingpong_claim_is_queued_and_cleared(self):
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from flliper.srt.managers.schedule_batch import ScheduleBatch
 
         tree, allocator, pool, make_req = _build_tree(
             None, enable_mamba_extra_buffer=True
@@ -573,11 +573,11 @@ class TestPoolClaimPoison(unittest.TestCase):
         self.assertEqual(req.mamba_pingpong_clear_indices.tolist(), new_slot.tolist())
 
     def test_poison_helper_touches_only_float_buffers(self):
-        from sglang.srt.mem_cache.memory_pool import maybe_poison_pool_data
+        from flliper.srt.mem_cache.memory_pool import maybe_poison_pool_data
 
         f = torch.zeros(4, dtype=torch.float32)
         i = torch.zeros(4, dtype=torch.int32)
-        with envs.SGLANG_POISON_POOL_DATA.override(True):
+        with envs.FLLIPER_POISON_POOL_DATA.override(True):
             maybe_poison_pool_data([f, i, None], "test")
         self.assertTrue(torch.isnan(f).all())
         self.assertTrue(torch.all(i == 0))
@@ -589,11 +589,11 @@ class TestPoolClaimPoison(unittest.TestCase):
         # fp8 KV pools store their data as torch.uint8 (index_put lacks fp8
         # support); the poison must cover them with 0xFF, which is NaN in
         # both float8_e5m2 and float8_e4m3fn.
-        from sglang.srt.mem_cache.memory_pool import maybe_poison_pool_data
+        from flliper.srt.mem_cache.memory_pool import maybe_poison_pool_data
 
         u = torch.zeros(8, dtype=torch.uint8)
         i32 = torch.zeros(8, dtype=torch.int32)
-        with envs.SGLANG_POISON_POOL_DATA.override(True):
+        with envs.FLLIPER_POISON_POOL_DATA.override(True):
             maybe_poison_pool_data([u, i32], "test")
         self.assertTrue(torch.all(u == 0xFF))
         self.assertTrue(torch.all(i32 == 0))  # non-uint8 ints stay semantic
@@ -851,7 +851,7 @@ class TestSparseGridFalsifikator(unittest.TestCase):
     PREFILL_CHUNK = 512
 
     def test_anchor_exactly_at_the_16th_chunk_end_and_none_between(self):
-        from sglang.srt.mem_cache.mamba_ckpt_utils import (
+        from flliper.srt.mem_cache.mamba_ckpt_utils import (
             mamba_checkpoint_track_target,
         )
 
@@ -876,7 +876,7 @@ class TestSparseGridFalsifikator(unittest.TestCase):
         window), so the scheduler's last-position routing
         (last_recurrent_state) serves every anchor and the mid-step
         ``+1``/intermediate-h arm is never needed."""
-        from sglang.srt.mem_cache.mamba_ckpt_utils import (
+        from flliper.srt.mem_cache.mamba_ckpt_utils import (
             mamba_checkpoint_track_target,
         )
 
@@ -931,7 +931,7 @@ class TestCheckpointTruncationAlign(unittest.TestCase):
     untouched."""
 
     def _fold(self, existing, interval, chunk):
-        from sglang.srt.mem_cache.mamba_ckpt_utils import (
+        from flliper.srt.mem_cache.mamba_ckpt_utils import (
             checkpoint_truncation_align,
         )
 
@@ -973,7 +973,7 @@ class TestCheckpointTruncationAlign(unittest.TestCase):
         drift apart."""
         import inspect
 
-        from sglang.srt.managers import scheduler as sched_mod
+        from flliper.srt.managers import scheduler as sched_mod
 
         src = inspect.getsource(sched_mod)
         self.assertIn("checkpoint_truncation_align(", src)

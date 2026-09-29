@@ -17,7 +17,7 @@ the model dtype was.
 
 That guard is not pedantry. `moe_wna16_marlin_gemm` is instantiated for ONE
 scalar type, taken from the activation dtype (`_jit_moe_wna16_marlin_module(
-a.dtype)` in python/sglang/jit_kernel/moe_wna16_marlin.py), and the kernel
+a.dtype)` in python/flliper/jit_kernel/moe_wna16_marlin.py), and the kernel
 reads `b_scales` through that same type. Feeding it float16 scales under
 bfloat16 activations is a bit reinterpretation, not a slow path -- so the fix
 belongs at the allocation site, not in the kernel and not by deleting the
@@ -31,7 +31,7 @@ is untouched down to the parameter dtypes and shapes.
 No GPU, no server: one pass through the real `create_weights` of both schemes.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -41,11 +41,11 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.quantization.awq.awq import AWQMarlinConfig
-from sglang.srt.layers.quantization.awq.schemes.awq_moe import AWQMoEScheme
-from sglang.srt.layers.quantization.gptq.gptq import GPTQMarlinConfig
-from sglang.srt.layers.quantization.gptq.schemes.gptq_moe import GPTQMarlinMoEScheme
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization.awq.awq import AWQMarlinConfig
+from flliper.srt.layers.quantization.awq.schemes.awq_moe import AWQMoEScheme
+from flliper.srt.layers.quantization.gptq.gptq import GPTQMarlinConfig
+from flliper.srt.layers.quantization.gptq.schemes.gptq_moe import GPTQMarlinMoEScheme
+from flliper.test.test_utils import CustomTestCase
 
 # Qwen3.5-35B-A3B-GPTQ-Int4 geometry, shrunk to keep the allocation cheap:
 # GPTQ INT4, group 128, desc_act=False, sym=True.
@@ -80,7 +80,7 @@ def _awq_config() -> AWQMarlinConfig:
     # quant type; on a CPU runner that query reports capability -1 and refuses.
     # The rest of __init__ is arithmetic, and create_weights only reads
     # pack_factor / group_size, so stub the capability check out.
-    with mock.patch("sglang.srt.layers.quantization.awq.awq.verify_marlin_supported"):
+    with mock.patch("flliper.srt.layers.quantization.awq.awq.verify_marlin_supported"):
         return AWQMarlinConfig(
             weight_bits=4,
             group_size=GROUP_SIZE,

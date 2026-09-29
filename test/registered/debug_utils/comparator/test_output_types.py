@@ -18,31 +18,31 @@ from registered.debug_utils.comparator.testing_helpers import (
 from rich.console import Console, Group
 from rich.panel import Panel
 
-from sglang.srt.debug_utils.comparator.aligner.axis_aligner import AxisAlignerPlan
-from sglang.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
+from flliper.srt.debug_utils.comparator.aligner.axis_aligner import AxisAlignerPlan
+from flliper.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
     TracedAlignerPlan,
     TracedSidePlan,
     TracedStepPlan,
     TracedSubPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
+from flliper.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
     AlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.reorderer.types import (
+from flliper.srt.debug_utils.comparator.aligner.reorderer.types import (
     ReordererPlan,
     ZigzagToNaturalParams,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     TokenAlignerPlan,
     TokenLocator,
 )
-from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.types import (
     ConcatParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
-from sglang.srt.debug_utils.comparator.output_types import (
+from flliper.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
+from flliper.srt.debug_utils.comparator.output_types import (
     BundleFileInfo,
     BundleSideInfo,
     ComparisonNonTensorRecord,
@@ -57,8 +57,8 @@ from sglang.srt.debug_utils.comparator.output_types import (
     _format_aligner_plan,
     _split_logs,
 )
-from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.utils import Pair
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 
@@ -431,7 +431,7 @@ class TestComparisonTensorRecordFormatBody:
         )
 
     def test_with_replicated_checks(self) -> None:
-        from sglang.srt.debug_utils.comparator.output_types import ReplicatedCheckResult
+        from flliper.srt.debug_utils.comparator.output_types import ReplicatedCheckResult
 
         record: ComparisonTensorRecord = ComparisonTensorRecord(
             name="hidden",

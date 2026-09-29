@@ -48,11 +48,11 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.unified_cache_components import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.memory_pool import ReqToTokenPool
+from flliper.srt.mem_cache.unified_cache_components import ComponentType
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.test.test_utils import CustomTestCase
 
 
 class _HandleHoldingPool(ReqToTokenPool):
@@ -116,7 +116,7 @@ def _scheduler(pp_pool, tp_pool, tree_cache=None):
 
 
 def _rebind(scheduler, phase):
-    from sglang.srt.managers.phase_req_pool_binding import (
+    from flliper.srt.managers.phase_req_pool_binding import (
         rebind_req_pool_for_cutover,
     )
 
@@ -246,7 +246,7 @@ class TestTheSeamRefusesADivergentHandle(CustomTestCase):
     """(d): a fifth holder is a loud stop at the seam, not a wrong answer."""
 
     def _assert_identity(self, scheduler):
-        from sglang.srt.managers.phase_req_pool_binding import (
+        from flliper.srt.managers.phase_req_pool_binding import (
             assert_req_pool_identity,
         )
 
@@ -260,7 +260,7 @@ class TestTheSeamRefusesADivergentHandle(CustomTestCase):
         self._assert_identity(sched)
 
     def test_a_cache_left_on_the_outgoing_pool_is_refused(self):
-        from sglang.srt.managers.phase_req_pool_binding import (
+        from flliper.srt.managers.phase_req_pool_binding import (
             ReqPoolRebindRefused,
         )
 
@@ -276,7 +276,7 @@ class TestTheSeamRefusesADivergentHandle(CustomTestCase):
             self._assert_identity(sched)
 
     def test_a_pool_left_bound_to_nothing_is_refused(self):
-        from sglang.srt.managers.phase_req_pool_binding import (
+        from flliper.srt.managers.phase_req_pool_binding import (
             ReqPoolRebindRefused,
         )
 
@@ -294,7 +294,7 @@ class TestTheSeamRefusesADivergentHandle(CustomTestCase):
         src = (
             pathlib.Path(__file__).resolve().parents[4]
             / "python"
-            / "sglang"
+            / "flliper"
             / "srt"
             / "managers"
             / "phase_flip_runtime.py"
@@ -310,7 +310,7 @@ class TestTheRegistryNamesThePhaseStampedHandles(CustomTestCase):
     """(d) structural: 'what this list forgets, a boot finds'."""
 
     def test_the_request_pool_is_declared_mutated_state(self):
-        from sglang.srt.managers.cutover_participants import (
+        from flliper.srt.managers.cutover_participants import (
             MUTATED_STATE,
             ReadWindow,
         )
@@ -321,7 +321,7 @@ class TestTheRegistryNamesThePhaseStampedHandles(CustomTestCase):
         )
 
     def test_the_request_pool_rebind_is_a_registered_participant(self):
-        from sglang.srt.managers.cutover_participants import REGISTRY
+        from flliper.srt.managers.cutover_participants import REGISTRY
 
         named = {p.name: p for p in REGISTRY}
         self.assertIn("request_pool_phase_ownership", named)
@@ -329,7 +329,7 @@ class TestTheRegistryNamesThePhaseStampedHandles(CustomTestCase):
         self.assertTrue(p.hook and p.probe, p)
 
     def test_the_pool_back_references_are_registered(self):
-        from sglang.srt.managers.cutover_participants import REGISTRY
+        from flliper.srt.managers.cutover_participants import REGISTRY
 
         named = {p.name: p for p in REGISTRY}
         self.assertIn("req_pool_back_references", named)
@@ -343,7 +343,7 @@ class TestTheRegistryNamesThePhaseStampedHandles(CustomTestCase):
         stood here is RETRACTED rather than deleted, so the sequence is
         readable: filed here, closed one commit later.  See
         ``test_1201_future_map_phase.py`` for the closure's own suite."""
-        from sglang.srt.managers.cutover_participants import (
+        from flliper.srt.managers.cutover_participants import (
             REGISTRY,
             participants_with_gaps,
         )
@@ -374,7 +374,7 @@ class TestEveryTreeCacheClassTheFlipCanRunUnderHasTheHook(CustomTestCase):
     def _cls(self, name):
         if name == "UnifiedRadixCache":
             return UnifiedRadixCache
-        from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+        from flliper.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
         return MambaRadixCache
 

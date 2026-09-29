@@ -9,7 +9,7 @@ Identical argv on an identical commit (87c050ef83, cut (31,16,17) / attn
     standS  13:50  record written 13:49:28   -> 161378
 
 The state carried between them is
-``~/.cache/sglang/kv_budget-<digest>-seam-rank<N>.json``. ``max_total_tokens``
+``~/.cache/flliper/kv_budget-<digest>-seam-rank<N>.json``. ``max_total_tokens``
 is not part of the digest, so every one of those boots read and overwrote the
 same three files.
 
@@ -40,7 +40,7 @@ Numbers below are the measured rig values, not constructed ones.
 
 import pytest
 
-from sglang.srt.managers import phase_flip_seam_reserve as sr
+from flliper.srt.managers import phase_flip_seam_reserve as sr
 
 MIB = 1 << 20
 

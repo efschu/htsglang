@@ -27,7 +27,7 @@ compute it with the same code.
 import math
 import unittest
 
-from sglang.srt.managers.regime_classifier import (
+from flliper.srt.managers.regime_classifier import (
     DEFAULT_ENTER_PREFILL,
     DWELL_AMORTIZATION,
     KV_ASCEND_MARK,
@@ -50,8 +50,8 @@ from sglang.srt.managers.regime_classifier import (
     signal_band,
     unpack_reduced,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -222,7 +222,7 @@ class TestHysteresisContract(CustomTestCase):
     def test_the_inherited_kv_marks_are_the_287_numbers(self):
         """Two independently-chosen thresholds on one physical quantity is how
         two controllers end up disagreeing about the same pool."""
-        from sglang.srt.model_executor import kv_pressure_ladder as ladder
+        from flliper.srt.model_executor import kv_pressure_ladder as ladder
 
         self.assertEqual(KV_ASCEND_MARK, ladder.DEFAULT_ASCEND_THRESHOLD)
         self.assertEqual(KV_DESCEND_MARK, ladder.DEFAULT_DESCEND_THRESHOLD)
@@ -693,7 +693,7 @@ class TestPhaseOneScope(CustomTestCase):
         import ast
         import pathlib
 
-        import sglang.srt.managers.regime_classifier as mod
+        import flliper.srt.managers.regime_classifier as mod
 
         tree = ast.parse(pathlib.Path(mod.__file__).read_text())
         imported = set()
@@ -702,12 +702,12 @@ class TestPhaseOneScope(CustomTestCase):
                 imported.update(a.name.split(".")[0] for a in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module.split(".")[0])
-        self.assertEqual(imported & {"torch", "sglang"}, set(), sorted(imported))
+        self.assertEqual(imported & {"torch", "flliper"}, set(), sorted(imported))
 
     def test_no_actuator_is_reachable_from_this_module(self):
         import pathlib
 
-        import sglang.srt.managers.regime_classifier as mod
+        import flliper.srt.managers.regime_classifier as mod
 
         src = pathlib.Path(mod.__file__).read_text()
         for forbidden in ("kv_reshard", "vram_dial", ".arm(", "apply_budget_request"):

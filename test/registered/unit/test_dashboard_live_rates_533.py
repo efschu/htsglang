@@ -14,7 +14,7 @@ Hermetic: no server, no CUDA, no NVML.
 
 import unittest
 
-from sglang.srt.planner import webui
+from flliper.srt.planner import webui
 
 
 class _BaselineTestBase(unittest.TestCase):
@@ -87,7 +87,7 @@ class TestRatesActuallyComputeFromStoredBaseline(_BaselineTestBase):
     the tile shows."""
 
     def test_decode_rate_matches_hand_calculation(self):
-        from sglang.srt.planner import live_metrics
+        from flliper.srt.planner import live_metrics
 
         prev = {"generation_tokens_total": 1000.0, "prompt_tokens_total": 0.0,
                 "cached_total": 0.0, "gen_throughput": 0.0}
@@ -98,7 +98,7 @@ class TestRatesActuallyComputeFromStoredBaseline(_BaselineTestBase):
         self.assertAlmostEqual(rates["decode_tok_s"], 80.0)
 
     def test_no_baseline_yields_none_which_is_the_empty_tile(self):
-        from sglang.srt.planner import live_metrics
+        from flliper.srt.planner import live_metrics
 
         self.assertIsNone(live_metrics._rates(None, {}, None, 1.0))
 
@@ -118,7 +118,7 @@ class TestServerInfoIsCachedNotRefetchedPerPoll(unittest.TestCase):
     """
 
     def setUp(self):
-        from sglang.srt.planner import live_metrics
+        from flliper.srt.planner import live_metrics
 
         self.lm = live_metrics
         live_metrics._SERVER_INFO_CACHE.clear()
@@ -186,7 +186,7 @@ class TestAutoDetectReachesTheRigsServingPort(unittest.TestCase):
     """
 
     def setUp(self):
-        from sglang.srt.planner import webui as w
+        from flliper.srt.planner import webui as w
 
         self.w = w
         self._orig_detected = w._DETECTED_ENDPOINT
@@ -205,11 +205,11 @@ class TestAutoDetectReachesTheRigsServingPort(unittest.TestCase):
             seen_ports.append(port)
             return port == 30030
 
-        orig_tcp, orig_probe = w._tcp_open, w._probe_sglang
+        orig_tcp, orig_probe = w._tcp_open, w._probe_flliper
         w._tcp_open = fake_tcp_open
-        w._probe_sglang = lambda url, timeout=0.8: url.endswith(":30030")
+        w._probe_flliper = lambda url, timeout=0.8: url.endswith(":30030")
         self.addCleanup(lambda: (setattr(w, "_tcp_open", orig_tcp),
-                                 setattr(w, "_probe_sglang", orig_probe)))
+                                 setattr(w, "_probe_flliper", orig_probe)))
 
         got = w._detect_external_endpoint()
         self.assertEqual(got, "http://127.0.0.1:30030")
@@ -220,11 +220,11 @@ class TestAutoDetectReachesTheRigsServingPort(unittest.TestCase):
         """The two paths must not diverge again: that divergence WAS the bug."""
         w = self.w
         seen = []
-        orig_tcp, orig_probe = w._tcp_open, w._probe_sglang
+        orig_tcp, orig_probe = w._tcp_open, w._probe_flliper
         w._tcp_open = lambda host, port, timeout=0.15: (seen.append(port), False)[1]
-        w._probe_sglang = lambda url, timeout=0.8: False
+        w._probe_flliper = lambda url, timeout=0.8: False
         self.addCleanup(lambda: (setattr(w, "_tcp_open", orig_tcp),
-                                 setattr(w, "_probe_sglang", orig_probe)))
+                                 setattr(w, "_probe_flliper", orig_probe)))
         w._detect_external_endpoint()
         self.assertEqual(sorted(set(seen)), sorted(set(w._DETECT_SWEEP_PORTS)))
 
@@ -233,10 +233,10 @@ class TestAutoDetectReachesTheRigsServingPort(unittest.TestCase):
         w = self.w
         w._DETECTED_ENDPOINT = "http://127.0.0.1:30030"
         swept = []
-        orig_tcp, orig_probe = w._tcp_open, w._probe_sglang
+        orig_tcp, orig_probe = w._tcp_open, w._probe_flliper
         w._tcp_open = lambda host, port, timeout=0.15: (swept.append(port), False)[1]
-        w._probe_sglang = lambda url, timeout=0.8: True
+        w._probe_flliper = lambda url, timeout=0.8: True
         self.addCleanup(lambda: (setattr(w, "_tcp_open", orig_tcp),
-                                 setattr(w, "_probe_sglang", orig_probe)))
+                                 setattr(w, "_probe_flliper", orig_probe)))
         self.assertEqual(w._detect_external_endpoint(), "http://127.0.0.1:30030")
         self.assertEqual(swept, [], "steady state fell through to the full sweep")

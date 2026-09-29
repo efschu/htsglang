@@ -6,8 +6,8 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.utils import is_sm90_supported
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.utils import is_sm90_supported
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=300, suite="nightly-kernel-1-gpu", nightly=True)
@@ -115,7 +115,7 @@ def _torch_sparse_attention_ref(
 
 
 def _run_and_check(d_qk, with_sink, s_q=2, topk=TOPK, s_kv=S_KV):
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from flliper.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -213,7 +213,7 @@ def test_sparse_mla_q8kv8_prefill_precision(d_qk: int, s_q: int, topk: int, s_kv
     """Demonstrate that Q8KV8 kernel precision is near-lossless versus the
     fp32 reference: max/mean/p99 absolute error are small and the fraction
     of elements exceeding 0.1 absolute error is under 1%."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from flliper.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -286,7 +286,7 @@ def test_sparse_mla_q8kv8_prefill_precision(d_qk: int, s_q: int, topk: int, s_kv
 def test_sparse_mla_q8kv8_prefill_no_alias_between_calls():
     """Two default-allocation calls with the same shape must return independent
     storage. This guards against regressing to a module-scope output cache."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from flliper.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -333,7 +333,7 @@ def test_sparse_mla_q8kv8_prefill_no_alias_between_calls():
 def test_sparse_mla_q8kv8_prefill_caller_owned_buffers():
     """Caller-provided ``out`` / ``max_logits`` / ``lse`` tensors must be
     written into in-place and returned as-is."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from flliper.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
@@ -374,7 +374,7 @@ def test_sparse_mla_q8kv8_prefill_caller_owned_buffers():
 )
 def test_sparse_mla_q8kv8_prefill_rejects_bad_buffers():
     """Validation: wrong shape/dtype and aliasing must raise ValueError."""
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from flliper.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 

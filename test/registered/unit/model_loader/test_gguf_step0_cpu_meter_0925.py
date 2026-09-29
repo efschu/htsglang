@@ -13,8 +13,8 @@ loading thread computed (cpu/wall ~ 1) or waited -- runnable but not running
 
 from unittest import mock
 
-from sglang.srt.model_loader import loader as L
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_loader import loader as L
+from flliper.test.test_utils import CustomTestCase
 
 
 def _fake_clock(readings):

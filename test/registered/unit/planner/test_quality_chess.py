@@ -26,7 +26,7 @@ import unittest
 import chess
 import chess.svg
 
-from sglang.srt.planner.quality_chess import (
+from flliper.srt.planner.quality_chess import (
     CHESS_PGN,
     CHESS_PROMPT,
     REFERENCE_PNG,

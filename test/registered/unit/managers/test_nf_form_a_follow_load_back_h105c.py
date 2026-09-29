@@ -3,26 +3,26 @@ own load-back instead of waiting alone.
 
 THE DEATH (rc12z30g 7bd3541c4f, -st-vsync, no cut, Form A host,worker,worker,
 1h07 under qwen load; D log boot_weg2_dkrnfh91dprsavisnoadoptstvsyncbar1dauer
-09282210, ~745380-745460, 23:23:28). One pass after weg2-180-303:
+09282210, ~745380-745460, 23:23:28). One pass after pdflip-180-303:
 
-* weg2-180-304 came to the gate host-backed; every rank passed it and the
-  host's ADMIT went out (TP0 ``#988 LOADBACK rid=weg2-180-304 prefix moved to
+* pdflip-180-304 came to the gate host-backed; every rank passed it and the
+  host's ADMIT went out (TP0 ``#988 LOADBACK rid=pdflip-180-304 prefix moved to
   71168 ... extent=71168``);
 * TP1/TP2 read that ADMIT, then ran their own load-back:
-  ``WEG2-LOADBACK-WAIT rid=weg2-180-304 extent=63296 applied=0: no device room
+  ``PDFLIP-LOADBACK-WAIT rid=pdflip-180-304 extent=63296 applied=0: no device room
   for the host hit yet (rem_total_tokens=157504.0)`` -> a rank-local NO_TOKEN,
   the loop ended;
-* TP0 went on to weg2-180-305 and posted its gate NO_TOKEN (price 98650,
+* TP0 went on to pdflip-180-305 and posted its gate NO_TOKEN (price 98650,
   budget 89792);
 * the workers' post-loop riegel read that post as the extend set:
-  ``FormAAdmissionSplit: H105 RU FORM-A EXTEND-SET MALFORMED got=('weg2-180-305',
+  ``FormAAdmissionSplit: H105 RU FORM-A EXTEND-SET MALFORMED got=('pdflip-180-305',
   'NO_TOKEN', 98650, 89792, 0, '') local=[...]`` -- D dead, TP0 died on gloo.
 
 Driven through the REAL ``PrefillAdder.add_one_req`` and the REAL
 ``Scheduler._form_a_admission_follow_fn`` / ``_form_a_extend_set_riegel`` with
 the H105b harness (the TP broadcast as one ordered stream the host fills
-first). RED on 7bd3541c4f: the worker returns NO_TOKEN for weg2-180-304 and its
-riegel reads the weg2-180-305 verdict. GREEN with H105c.
+first). RED on 7bd3541c4f: the worker returns NO_TOKEN for pdflip-180-304 and its
+riegel reads the pdflip-180-305 verdict. GREEN with H105c.
 """
 
 from __future__ import annotations
@@ -34,24 +34,24 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.managers import schedule_policy as sp
-from sglang.srt.managers import tp_match_floor as m
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache import unified_radix_cache as urc
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.managers import schedule_policy as sp
+from flliper.srt.managers import tp_match_floor as m
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache import unified_radix_cache as urc
+from flliper.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
-#: weg2-180-304 (D log 23:23:28): the group depth 71168; TP0 loads all of it,
+#: pdflip-180-304 (D log 23:23:28): the group depth 71168; TP0 loads all of it,
 #: the workers hold 7872 rows on device and load 63296 (their '#988' extent).
-RID_304, RID_305 = "weg2-180-304", "weg2-180-305"
+RID_304, RID_305 = "pdflip-180-304", "pdflip-180-305"
 DEPTH_304 = 71168
 WORKER_DEVICE = DEPTH_304 - 63296
 WORKER_EXTENT = 63296
-UNCACHED_304 = 221  # 'WEG2 X-GATE rid=weg2-180-304 uncached=221'
+UNCACHED_304 = 221  # 'PDFLIP X-GATE rid=pdflip-180-304 uncached=221'
 AVAILABLE = 157504  # 'rem_total_tokens=157504.0' on TP1/TP2
-FILL_305 = 200_000  # the host's gate refuses weg2-180-305 (metal: 98650 > 89792)
+FILL_305 = 200_000  # the host's gate refuses pdflip-180-305 (metal: 98650 > 89792)
 
 
 class _Channel:
@@ -93,7 +93,7 @@ def _tree_cache(*, worker: bool):
     tc.swa_evictable_size.return_value = 0
     tc.disable = False
     tc.uniform_avail_floor = None
-    tc._weg2_loadback_no_room = 0
+    tc._pdflip_loadback_no_room = 0
     tc._h105c_follow_room = False
     tc.inc_lock_ref.return_value = IncLockRefResult()
     tc.dec_lock_ref.return_value = DecLockRefResult()
@@ -189,7 +189,7 @@ class FollowLoadBackTest(unittest.TestCase):
         results = []
         with patch.object(
             sp, "_pp_load_back_extent", side_effect=lambda r: extents[r.rid]
-        ), patch("sglang.srt.mem_cache.common.release_admission_acquired_mamba_slot"):
+        ), patch("flliper.srt.mem_cache.common.release_admission_acquired_mamba_slot"):
             for req in reqs:
                 res = adder.add_one_req(req, truncation_align_size=None)
                 results.append((req.rid, res))
@@ -237,7 +237,7 @@ class FollowLoadBackTest(unittest.TestCase):
         _install(adder, sched, 1)
         req = _req(RID_304, WORKER_DEVICE, DEPTH_304 + UNCACHED_304)
         with patch.object(sp, "_pp_load_back_extent", return_value=WORKER_EXTENT), patch(
-            "sglang.srt.mem_cache.common.release_admission_acquired_mamba_slot"
+            "flliper.srt.mem_cache.common.release_admission_acquired_mamba_slot"
         ):
             with self.assertRaisesRegex(m.FormAAdmissionSplit, "H105c FORM-A FOLLOW LOAD-BACK UNSERVABLE"):
                 adder.add_one_req(req, truncation_align_size=None)
@@ -251,7 +251,7 @@ class FollowLoadBackTest(unittest.TestCase):
         _install(adder, _scheduler(ch, 0), 0)
         req = _req(RID_304, WORKER_DEVICE, DEPTH_304 + UNCACHED_304)
         with patch.object(sp, "_pp_load_back_extent", return_value=WORKER_EXTENT), patch(
-            "sglang.srt.mem_cache.common.release_admission_acquired_mamba_slot"
+            "flliper.srt.mem_cache.common.release_admission_acquired_mamba_slot"
         ):
             res = adder.add_one_req(req, truncation_align_size=None)
         self.assertEqual(res, AddReqResult.NO_TOKEN)

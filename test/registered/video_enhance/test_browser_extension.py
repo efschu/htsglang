@@ -25,14 +25,14 @@ import re
 import unittest
 from pathlib import Path
 
-from sglang.srt.video_enhance.server import (
+from flliper.srt.video_enhance.server import (
     CHAIN_PRESETS,
     JOB_ID_MAX_LENGTH,
     normalize_job_id,
 )
-from sglang.srt.video_enhance.tenant import TenantConfig
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.video_enhance.tenant import TenantConfig
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -165,7 +165,7 @@ class EndpointContractTest(CustomTestCase):
         return match.group(1)
 
     def test_the_paths_shared_js_builds_are_routes_the_server_mounts(self):
-        from sglang.srt.video_enhance.server import create_app
+        from flliper.srt.video_enhance.server import create_app
 
         app = create_app(TenantConfig(budget_mib=8192))
         paths = {route.path for route in app.routes}
@@ -175,7 +175,7 @@ class EndpointContractTest(CustomTestCase):
         self.assertIn(self._constant("ENHANCE_PATH") + "/{job_id}", paths)
 
     def test_the_query_parameter_names_are_the_ones_the_endpoint_takes(self):
-        from sglang.srt.video_enhance.server import create_app
+        from flliper.srt.video_enhance.server import create_app
 
         app = create_app(TenantConfig(budget_mib=8192))
         route = next(

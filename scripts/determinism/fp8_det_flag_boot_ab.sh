@@ -19,7 +19,7 @@ PY="${VENV:-<VENV>}/bin/python"
 MODEL="${MODEL_ROOT:-<MODEL_ROOT>}/Qwen3.6-27B-FP8"
 LOG=/tmp/fp8det_boot_${ARM}.log
 
-if [ "$ARM" = "on" ]; then export SGLANG_DETERMINISTIC_FP8_GEMM=1; fi
+if [ "$ARM" = "on" ]; then export FLLIPER_DETERMINISTIC_FP8_GEMM=1; fi
 
 # PCI_BUS_ID order: 0 and 2 are the 3080s, 1 is the 5090. Torch's default
 # FASTEST_FIRST order disagrees, which is why the order is pinned explicitly.
@@ -27,7 +27,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0,2
 export PYTHONPATH=$REPO/python
 
-"$PY" -m sglang.launch_server \
+"$PY" -m flliper.launch_server \
   --model-path "$MODEL" \
   --tp 2 \
   --context-length 8192 \

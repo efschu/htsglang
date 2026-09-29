@@ -21,7 +21,7 @@ construction, only under non-contiguous ownership, so the contiguous default
 path keeps the pass-through behaviour byte-for-byte.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -31,9 +31,9 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.utils.common import PPMissingLayer
-from sglang.srt.utils.common import make_layers
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.utils.common import PPMissingLayer
+from flliper.srt.utils.common import make_layers
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Layer(torch.nn.Module):
@@ -109,9 +109,9 @@ class TestMakeLayersArmsOnlyTheInteriorMode(CustomTestCase):
         with patch.dict(
             os.environ,
             {
-                "SGLANG_PP_LAYER_SET": "0,4;1,2,3,5,6,7",
+                "FLLIPER_PP_LAYER_SET": "0,4;1,2,3,5,6,7",
                 # #753: a gapped set needs the crossing wire declared.
-                "SGLANG_PP_CROSSING_WIRE": "1",
+                "FLLIPER_PP_CROSSING_WIRE": "1",
             },
         ):
             mods, start, end = make_layers(
@@ -132,9 +132,9 @@ class TestMakeLayersArmsOnlyTheInteriorMode(CustomTestCase):
         with patch.dict(
             os.environ,
             {
-                "SGLANG_PP_LAYER_SET": "0,4;1,2,3,5,6,7",
+                "FLLIPER_PP_LAYER_SET": "0,4;1,2,3,5,6,7",
                 # #753: a gapped set needs the crossing wire declared.
-                "SGLANG_PP_CROSSING_WIRE": "1",
+                "FLLIPER_PP_CROSSING_WIRE": "1",
             },
         ):
             mods, _, _ = make_layers(

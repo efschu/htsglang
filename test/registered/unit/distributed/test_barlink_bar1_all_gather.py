@@ -25,12 +25,12 @@ docs/dev/INTEGRATION_R3_VALIDATION.md.
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     BarlinkBar1Transport,
     ag_plan,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -202,7 +202,7 @@ class TestAgPlanArithmetic(CustomTestCase):
         slot = 4096
         for lengths in ([slot * 3 + 5] * 2, [100, 33, 7], [16] * 4):
             for round_ in ag_plan(lengths, slot):
-                for s_off, _laenge, _e_off in round_:
+                for s_off, _length, _e_off in round_:
                     self.assertEqual(s_off % 16, 0, msg=f"{lengths}")
 
     def test_receive_offsets_are_aligned_exactly_when_the_shard_is(self):
@@ -375,7 +375,7 @@ class TestLoudBarStillGuardsTheRest(CustomTestCase):
     """The bar in barlink._select, on the ops all_gather did NOT cover."""
 
     def _comm(self, transport):
-        from sglang.srt.distributed.device_communicators.barlink import (
+        from flliper.srt.distributed.device_communicators.barlink import (
             BarlinkCommunicator,
         )
 
@@ -385,7 +385,7 @@ class TestLoudBarStillGuardsTheRest(CustomTestCase):
         return c
 
     def test_uncovered_op_under_capture_raises_and_names_the_coverage(self):
-        from sglang.srt.distributed.device_communicators import barlink as mod
+        from flliper.srt.distributed.device_communicators import barlink as mod
 
         t = _stub()
         c = self._comm(t)
@@ -401,7 +401,7 @@ class TestLoudBarStillGuardsTheRest(CustomTestCase):
         self.assertIn("all_reduce", text)
 
     def test_covered_op_under_capture_passes(self):
-        from sglang.srt.distributed.device_communicators import barlink as mod
+        from flliper.srt.distributed.device_communicators import barlink as mod
 
         t = _stub(a2a_slot=8384512)
         c = self._comm(t)
@@ -412,7 +412,7 @@ class TestLoudBarStillGuardsTheRest(CustomTestCase):
             )
 
     def test_outside_capture_nothing_raises(self):
-        from sglang.srt.distributed.device_communicators import barlink as mod
+        from flliper.srt.distributed.device_communicators import barlink as mod
 
         c = self._comm(_stub())
         with mock.patch.object(mod, "graph_capture_running", lambda: False):

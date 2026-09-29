@@ -1,20 +1,20 @@
 """Unit tests for srt/disaggregation/common/conn — register_to_bootstrap retry logic."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 from unittest.mock import MagicMock, call, patch
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestRegisterToBootstrap(CustomTestCase):
     """Tests for CommonKVManager.register_to_bootstrap retry/backoff behavior."""
 
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    @patch("flliper.srt.disaggregation.common.conn.time")
+    @patch("flliper.srt.disaggregation.common.conn.requests.put")
     def test_succeeds_on_first_attempt(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
         mock_response = MagicMock()
@@ -27,8 +27,8 @@ class TestRegisterToBootstrap(CustomTestCase):
         mock_put.assert_called_once()
         mock_time.sleep.assert_not_called()
 
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    @patch("flliper.srt.disaggregation.common.conn.time")
+    @patch("flliper.srt.disaggregation.common.conn.requests.put")
     def test_succeeds_after_retries(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
         fail_resp = MagicMock()
@@ -43,8 +43,8 @@ class TestRegisterToBootstrap(CustomTestCase):
         self.assertEqual(mock_put.call_count, 3)
         self.assertEqual(mock_time.sleep.call_count, 2)
 
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    @patch("flliper.srt.disaggregation.common.conn.time")
+    @patch("flliper.srt.disaggregation.common.conn.requests.put")
     def test_all_retries_exhausted(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
         fail_resp = MagicMock()
@@ -58,8 +58,8 @@ class TestRegisterToBootstrap(CustomTestCase):
         # Sleep is only called between attempts, not after the final failure
         self.assertEqual(mock_time.sleep.call_count, 4)
 
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    @patch("flliper.srt.disaggregation.common.conn.time")
+    @patch("flliper.srt.disaggregation.common.conn.requests.put")
     def test_exception_with_nested_cause(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
 
@@ -78,8 +78,8 @@ class TestRegisterToBootstrap(CustomTestCase):
 
         self.assertEqual(mock_put.call_count, 2)
 
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    @patch("flliper.srt.disaggregation.common.conn.time")
+    @patch("flliper.srt.disaggregation.common.conn.requests.put")
     def test_exception_with_no_cause(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
 
@@ -95,8 +95,8 @@ class TestRegisterToBootstrap(CustomTestCase):
 
         self.assertEqual(mock_put.call_count, 2)
 
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    @patch("flliper.srt.disaggregation.common.conn.time")
+    @patch("flliper.srt.disaggregation.common.conn.requests.put")
     def test_backoff_delay_exponential(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
         fail_resp = MagicMock()
@@ -112,8 +112,8 @@ class TestRegisterToBootstrap(CustomTestCase):
         expected_calls = [call(0.75), call(1.5), call(3.0), call(6.0)]
         self.assertEqual(mock_time.sleep.call_args_list, expected_calls)
 
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    @patch("flliper.srt.disaggregation.common.conn.time")
+    @patch("flliper.srt.disaggregation.common.conn.requests.put")
     def test_jitter_never_exceeds_max_delay(self, mock_put, mock_time):
         """Guard against operator-precedence regressions in the jitter factor.
 
@@ -137,8 +137,8 @@ class TestRegisterToBootstrap(CustomTestCase):
             self.assertLess(actual_delay, max_delay)
             self.assertGreaterEqual(actual_delay, 0.75)
 
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    @patch("flliper.srt.disaggregation.common.conn.time")
+    @patch("flliper.srt.disaggregation.common.conn.requests.put")
     def test_payload_contains_required_fields(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
         success_resp = MagicMock()
@@ -173,8 +173,8 @@ class TestRegisterToBootstrap(CustomTestCase):
             self.assertIn(field, payload)
         self.assertEqual(payload["prefill_http_port"], 30000)
 
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    @patch("flliper.srt.disaggregation.common.conn.time")
+    @patch("flliper.srt.disaggregation.common.conn.requests.put")
     def test_url_with_dist_init_addr(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
         success_resp = MagicMock()
@@ -187,13 +187,13 @@ class TestRegisterToBootstrap(CustomTestCase):
         url_used = mock_put.call_args[0][0]
         self.assertIn("10.0.0.1", url_used)
 
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    @patch("flliper.srt.disaggregation.common.conn.time")
+    @patch("flliper.srt.disaggregation.common.conn.requests.put")
     def test_wildcard_host_0000_uses_ipv4_loopback(self, mock_put, mock_time):
         """When --host 0.0.0.0 is used, the PUT must target IPv4 loopback.
 
         Scenario: cross-node P/D disagg where each role runs on a single node
-        (tp=1).  Each machine runs its own SGLang instance with --host 0.0.0.0
+        (tp=1).  Each machine runs its own fLLiper instance with --host 0.0.0.0
         to accept remote connections.  dist_init_addr is None because tp=1
         needs no multi-node rendezvous, so register_to_bootstrap takes the
         else-branch and would use bootstrap_host="0.0.0.0" as the PUT target.
@@ -216,8 +216,8 @@ class TestRegisterToBootstrap(CustomTestCase):
         self.assertNotIn("0.0.0.0", url_used)
         self.assertIn("127.0.0.1", url_used)
 
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    @patch("flliper.srt.disaggregation.common.conn.time")
+    @patch("flliper.srt.disaggregation.common.conn.requests.put")
     def test_wildcard_host_ipv6_uses_ipv6_loopback(self, mock_put, mock_time):
         """Same fix for the IPv6 wildcard \"::\": must use IPv6 loopback."""
         mock_time.monotonic.return_value = 0.0
@@ -239,7 +239,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         """Create a lightweight mock manager that has the attributes needed
         by register_to_bootstrap, without going through CommonKVManager.__init__
         (which requires zmq, ServerArgs model resolution, etc.)."""
-        from sglang.srt.disaggregation.common.conn import CommonKVManager
+        from flliper.srt.disaggregation.common.conn import CommonKVManager
 
         mgr = MagicMock(spec=CommonKVManager)
         # Bind the real method to the mock

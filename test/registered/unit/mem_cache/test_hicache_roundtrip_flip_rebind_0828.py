@@ -35,28 +35,28 @@ from types import SimpleNamespace
 
 import torch
 
-import sglang
+import flliper
 
-from sglang.srt.managers.cache_controller import (
+from flliper.srt.managers.cache_controller import (
     HiCacheController,
     PrefetchOperation,
 )
-from sglang.srt.mem_cache import hicache_phase_binding as binding
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
-from sglang.srt.mem_cache.canonical_page_store import (
+from flliper.srt.mem_cache import hicache_phase_binding as binding
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_page_store import (
     build_mamba_window,
     window_for_layers,
 )
-from sglang.srt.mem_cache.hicache_migrate import MambaBlobSpec
-from sglang.srt.mem_cache.hicache_storage import (
+from flliper.srt.mem_cache.hicache_migrate import MambaBlobSpec
+from flliper.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.mamba_ckpt_utils import is_resume_candidate
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.mamba_ckpt_utils import is_resume_candidate
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -507,7 +507,7 @@ class TestSpecimenIsReproduced(_Base):
             f"{_kv_window_for_stage(1).byte_length} bytes"
         )
         with self.assertLogs(
-            "sglang.srt.mem_cache.hicache_storage", level="ERROR"
+            "flliper.srt.mem_cache.hicache_storage", level="ERROR"
         ) as logs:
             probe._page_transfer(op)
         self.assertTrue(
@@ -752,7 +752,7 @@ class TestWindowDerivationHasOneSource(_Base):
     flip_writeback reads the backend attribute live rather than caching it.
     """
 
-    SRT = os.path.join(os.path.dirname(sglang.__file__), "srt")
+    SRT = os.path.join(os.path.dirname(flliper.__file__), "srt")
 
     def _files_referencing(self, needles, exclude):
         hits = set()

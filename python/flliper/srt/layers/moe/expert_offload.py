@@ -1,0 +1,8303 @@
+# SPDX-License-Identifier: Apache-2.0
+"""MoE expert-offload cache (feat/moe-expert-offload, M-B).
+
+Keeps only a hot subset of a FusedMoE layer's local routed experts resident on
+GPU; the full set lives in a pinned host-RAM pool. Before each MoE apply(), the
+needed experts (from topk_ids) are resolved against the resident slots; misses
+are async H2D-copied from the pinned pool into LRU-evicted slots, and topk_ids
+are remapped to slot indices so the unmodified grouped-GEMM runs over the small
+resident buffer.
+
+Wave processing (fix for the prefill overflow crash)
+----------------------------------------------------
+A single forward can route to MORE unique experts than there are resident
+slots (n_slots). This is the norm on prefill of a 256-expert / top-8 model:
+even a short prompt touches nearly every expert. Rather than crash (the old
+`_acquire_slot` evicted a still-needed expert -> KeyError) or silently serve
+only the first n_slots, the forward is split into WAVES.
+
+The split is over TOKENS, not over experts. Each token routes to at most
+`top_k` (<= n_slots) unique experts, so every token's complete top-k set fits
+in the resident buffer at once. We greedily pack consecutive token rows into a
+wave until the union of their unique experts would exceed n_slots, then close
+the wave. For each wave we (a) fetch its experts into resident slots, (b) remap
+that wave's topk_ids -> slot ids, (c) run the unmodified grouped-GEMM over the
+wave's token rows, and (d) scatter the per-row outputs back into the full
+output buffer.
+
+Byte-identity: a token's MoE output depends only on its own hidden state and
+its own routed experts' weights -- it is independent of which other tokens
+share the batch. Because every token is computed EXACTLY ONCE, with ALL of its
+experts resident, and its top-k reduction runs in the original slot order,
+the wave decomposition introduces no cross-wave accumulation of a single
+token's partial sums, and so no floating-point re-association of its own.
+
+SCOPE OF THAT CLAIM (corrected, #412). It is a statement about the WAVE
+mechanism, not about the offloaded path as a whole, and the unqualified form
+this paragraph used to carry ("bit-identical to the no-offload path") is
+false: shrinking the resident expert buffer from the full expert count to
+R+C slots changes ``layer.num_local_experts`` (see the marlin apply at
+``:2898-2902``), which changes ``moe_align_block_size``'s ``global_num_experts``,
+which changes the GEMM tiling and therefore reassociates the accumulation --
+measured at ~1e-2 logit delta on marlin int4, and sub-ULP but still non-zero
+on fp8 (the author's own "FP8 byte-identical" claim was retracted after a
+256-token re-run agreed on 118/256). The correctly scoped statements are the
+ones further down this module: self-determinism at temp 0 (``:437-442``) and
+bit-identity against the static [0,R) layout AT THE SAME FRACTION
+(``:3615-3622``). A determinism certificate must cite those, never this
+paragraph's former wording.
+
+Expert-major waves (FLLIPER_MOE_OFFLOAD_WAVE_ORDER=expert, #254)
+---------------------------------------------------------------
+The token-major split above re-fetches a spill expert in EVERY wave whose
+tokens route to it -- with C=16 scratch slots a 2048-token chunk runs ~62
+waves, so each spill expert is streamed ~62 times (hundreds of GiB per chunk
+and rank). The opt-in expert-major split inverts the axis: waves are disjoint
+groups of at most C SPILL EXPERTS, and each group is fetched exactly once per
+forward.
+
+That breaks the "a wave holds a token's complete top-k" property the identity
+argument above rests on, so the reduction is taken out of the wave: each routed
+(token, k-slot) pair is submitted as its own pseudo-token with top_k == 1 (the
+fused kernel then writes the weighted contribution straight out, with no
+internal reduction) and stored at its own k-slot in a [T, top_k, H] buffer. The
+k-slot is fixed by the routing, so the buffer holds the same values in the same
+places for ANY wave split; the top-k reduction runs once at the end over the
+full buffer, in k order, with the same reduction the unsplit kernel applies to
+its own intermediate_cache3. The result is bit-identical to both the
+token-major and the no-offload path (measured on bf16 and fp8-blockwise,
+tests/moe_offload/test_wave_order_gpu.py). Cost: one transient [T, top_k, H]
+buffer per layer. Decode (single wave) is unaffected; default stays token.
+
+Design notes
+------------
+* Cold experts are FETCHED and computed on GPU (this rig's AMD CPU has no AMX,
+  so ktransformers-style CPU compute via kt_ep_wrapper is not viable here).
+* Default path is untouched: with FLLIPER_MOE_RESIDENT_EXPERT_FRACTION == 1.0
+  the layer never installs a cache and behaves byte-identically.
+* The resolve/LRU/wave bookkeeping (`ExpertResidencyPlanner` + `plan_token_waves`)
+  is pure Python and is unit-tested on CPU without CUDA
+  (tests/moe_offload/test_planner.py); only `MoEExpertOffloadCache` touches
+  tensors.
+* Two decode paths, and only one of them syncs. `prepare()`/`run_waves()` do a
+  device->host sync (`topk_ids.tolist()`) plus data-dependent Python planning,
+  which is illegal during graph capture, so the EAGER path requires
+  --disable-cuda-graph and the layer fails fast at construction otherwise (see
+  layer.py). `FLLIPER_MOE_OFFLOAD_CUDA_GRAPH=1` selects the capturable path
+  instead: frozen residency, fixed-shape on-device index math
+  (`prepare_capturable_remap`) and a captured UVA gather over the pinned pool,
+  with no host read anywhere in the step. The two are proven bit-identical for
+  the single-wave case on CPU (tests/moe_offload/test_capturable_planner.py)
+  and the sync-freedom is pinned by interception
+  (tests/moe_offload/test_capture_desync_port.py).
+  #452: the capturable path is REFUTED on hardware and
+  `FLLIPER_MOE_OFFLOAD_CUDA_GRAPH=1` now refuses at boot
+  (`moe/offload_capture_gate.resolve_graph_mode`). B4 is structural: the
+  captured gather has a static index length, so it moves the WORST-CASE
+  scratch set every layer every step (2.128 GiB/token measured) where the
+  eager fetch moves only the missed experts (0.366-0.535 GiB/token) -- a 5.30x
+  PCIe multiplier on a step that is bandwidth-bound. The mechanism below is
+  kept so a candidate fix can be measured against those numbers; see
+  docs/dev/NOTE_452_desync_boot_refutation.md.
+* The capturable path has ONE gap, and it is named rather than latent: under
+  the #394 shared cold tier a routed expert can be delegated to a peer's
+  segment, for which this rank's pool has no row. The installer refuses that
+  combination by default; behind FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE=1 the gather
+  clamps to a valid row and counts the breach on device, and
+  `moe/offload_capture_gate.py` turns that count into a named exception at the
+  CUDA-graph replay boundary (the #431 pattern).
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import threading
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
+
+#: #109b MODUL-WEIT, NICHT LOKAL IN EINER ANDEREN FUNKTION.
+#: `logger` war nur innerhalb einer Funktion weiter unten gebunden; der
+#: #109-Pfad daneben (`STORE-ADOPT`) rief ihn auf Modulebene-Sicht und
+#: fnFL2w61 starb mit `NameError: name 'logger' is not defined` --
+#: NACHDEM #112/4 den Rang ueberhaupt erst bis dorthin gebracht hatte.
+import logging
+
+logger = logging.getLogger(__name__)
+
+from flliper.srt.debug_utils import host_anon_probe as _hap
+from flliper.srt.layers.moe import pinned_host_ledger
+from flliper.srt.layers.fwd_timeline import fwd_mark
+from flliper.srt.layers.prefill_timing import StageHead, flush_wait
+from flliper.srt.managers.scheduler_components.decode_host_split import (
+    timed as _h58_timed,
+)
+from flliper.srt.utils.break_cost_clock import break_cost_phase
+
+# --- M-C routing trace ------------------------------------------------------
+# Append-only JSONL sink consumed by moe_offload/sim.py. One handle per output
+# file, shared by every FusedMoE layer in a process and serialized by a lock so
+# concurrent layers never interleave a line. Distinct TP/EP ranks write to
+# distinct files (rank tag in the name), so no cross-process contention exists.
+_TRACE_HANDLES: Dict[str, "object"] = {}
+_TRACE_LOCK = threading.Lock()
+
+# The one layer whose per-chunk H2D volume is logged at INFO (see
+# MoEExpertOffloadCache._log_wave_h2d). Latched to the first layer that reports.
+_H2D_LOG_LAYER = None
+# H107: the one layer whose eager LRU plan is logged at INFO, one line per
+# extend (same latch rule as _H2D_LOG_LAYER).
+_H107_LOG_LAYER = None
+
+
+def write_routing_trace(
+    path: str,
+    rank_tag: str,
+    layer_id: int,
+    step: int,
+    experts_per_token: List[List[int]],
+) -> None:
+    """Append one JSONL record ``{"layer","step","experts"}`` for the offline
+    hit-rate simulator (sim.py). ``experts_per_token`` is the per-token list of
+    routed expert ids (``-1`` padding preserved; sim filters it). Measurement
+    tooling only — reached exclusively when FLLIPER_MOE_OFFLOAD_TRACE is set."""
+    fname = f"{path}.{rank_tag}.jsonl"
+    rec = json.dumps(
+        {"layer": int(layer_id), "step": int(step), "experts": experts_per_token}
+    )
+    with _TRACE_LOCK:
+        fh = _TRACE_HANDLES.get(fname)
+        if fh is None:
+            fh = open(fname, "a", buffering=1)
+            _TRACE_HANDLES[fname] = fh
+        fh.write(rec + "\n")
+
+
+@dataclass
+class ExpertOffloadRelease:
+    """Per-rank tally of expert weight memory the offload took OFF the GPU.
+
+    #119: the KV pool is sized from a live free-memory reading taken after the
+    weights are resident, so the VRAM the offload releases flows into the KV
+    budget on its own -- PROVIDED the install happens before the profiling and
+    the freed blocks are actually back with the driver. That reclaim used to be
+    an invisible side effect: nothing said how much was released, and a
+    regression that moved the install back behind the sizing step (the #77
+    "known limitation") would silently cost the whole win with no log line to
+    notice it by. These counters make the reclaim an accounted, assertable
+    quantity.
+
+    ``device_bytes`` is the expert weight VRAM no longer held on the GPU;
+    ``host_bytes`` is what the pinned spill pool took over in its place.
+    """
+
+    device_bytes: int = 0
+    host_bytes: int = 0
+    layers: int = 0
+    tensors: int = 0
+
+
+_RELEASE_TALLY = ExpertOffloadRelease()
+
+
+def expert_offload_released_device_bytes(
+    num_local_experts: int, buffer_slots: int, row_bytes: int
+) -> int:
+    """Pure: VRAM (bytes) one expert-major tensor stops holding under offload.
+
+    The layer used to hold ``num_local_experts`` expert rows on GPU; after the
+    split it holds ``buffer_slots`` (= R resident + C scratch). The difference
+    is what the KV pool may claim. Returns 0 whenever the split keeps at least
+    as many slots as there are experts (fully-resident = no offload), so the
+    no-offload path tallies exactly nothing.
+    """
+    experts = int(num_local_experts)
+    slots = max(0, int(buffer_slots))
+    width = max(0, int(row_bytes))
+    if experts <= 0 or slots >= experts:
+        return 0
+    return (experts - slots) * width
+
+
+def record_expert_offload_release(
+    device_bytes: int, host_bytes: int, tensors: int = 1, count_layer: bool = True
+) -> None:
+    """Tally one layer's release. Called once per layer that actually split.
+
+    ``count_layer=False`` is for callers that tally a layer one TENSOR at a
+    time (the #123-GGUF materialization-time staging stages w13 and w2 in
+    separate calls) and must not report the layer twice.
+    """
+    _RELEASE_TALLY.device_bytes += max(0, int(device_bytes))
+    _RELEASE_TALLY.host_bytes += max(0, int(host_bytes))
+    _RELEASE_TALLY.tensors += max(0, int(tensors))
+    if count_layer:
+        _RELEASE_TALLY.layers += 1
+
+
+# BOOTZEIT 3 (29.09.): the host-store half of the per-layer presplit, split
+# out of the `[ct-stream-presplit]` seconds (instrument only). open_s is
+# `open_store` -- a fresh store file is ftruncated, first-touched and
+# cudaHostRegister'ed there (shared_pinned_empty, 8-14 % of the loader
+# thread in rc12z30o3); write_s is the D2H of the cold rows into it.
+_STORE_CLOCK = {"open_s": 0.0, "write_s": 0.0, "opens": 0,
+                # BOOTZEIT 3 (29.09.): the repack itself, split (instrument
+                # only): marlin_s = gptq_marlin_moe_repack of w13+w2 (one JIT
+                # launch per expert row), scales_s = marlin_moe_permute_scales,
+                # presplit_s = presplit_expert_offload_after_repack (store
+                # open/write included, see open_s/write_s), rows = expert rows
+                # repacked / rows in the [E] windows.
+                "marlin_s": 0.0, "scales_s": 0.0, "presplit_s": 0.0,
+                "rows_repacked": 0, "rows_total": 0}
+
+
+def expert_store_clock() -> dict:
+    """Snapshot of the store clocks (a copy)."""
+    return dict(_STORE_CLOCK)
+
+
+def expert_offload_release_totals() -> ExpertOffloadRelease:
+    """Snapshot of this rank's release tally (a copy; callers must not mutate)."""
+    return ExpertOffloadRelease(
+        device_bytes=_RELEASE_TALLY.device_bytes,
+        host_bytes=_RELEASE_TALLY.host_bytes,
+        layers=_RELEASE_TALLY.layers,
+        tensors=_RELEASE_TALLY.tensors,
+    )
+
+
+def reset_expert_offload_release() -> None:
+    """Clear the tally (tests; and a second model load in one process)."""
+    _RELEASE_TALLY.device_bytes = 0
+    _RELEASE_TALLY.host_bytes = 0
+    _RELEASE_TALLY.layers = 0
+    _RELEASE_TALLY.tensors = 0
+
+
+@dataclass
+class ResidencyStats:
+    fetches: int = 0  # experts H2D-copied (misses that fit)
+    hits: int = 0  # needed experts already resident
+    misses: int = 0  # needed experts not resident
+    evictions: int = 0  # resident experts kicked out
+    forwards: int = 0  # resolve() calls (== number of waves run)
+    overflow_forwards: int = 0  # forwards that needed >n_slots unique experts
+    waves: int = 0  # total waves run across all forwards
+    h2d_bytes: int = 0  # bytes streamed host->device by _fetch()
+    # #394 slice 2: the subset of the above that came out of a PEER rank's
+    # shared cold-tier segment rather than this rank's own pinned pool. Kept
+    # separate because it is the direct measure of whether the shared tier is
+    # being used at all -- a proportional arm whose remote counters stay zero
+    # is an arm that silently ran the baseline.
+    remote_fetches: int = 0
+    remote_h2d_bytes: int = 0
+    # WP8 expert lookahead: spill experts prefetched on a prediction, how many
+    # of a forward's real spill experts were already in a scratch slot when it
+    # resolved (no H2D), how many were not, and predictions that could not be
+    # used (no cache yet, wave overflow, a captured route).
+    lookahead_prefetched: int = 0
+    lookahead_hits: int = 0
+    lookahead_misses: int = 0
+    lookahead_dropped: int = 0
+
+    @property
+    def hit_rate(self) -> float:
+        tot = self.hits + self.misses
+        return self.hits / tot if tot else 1.0
+
+
+def plan_token_waves(
+    experts_per_token: Sequence[Sequence[int]],
+    resident_count: int,
+    scratch: int,
+    resident_ids: Optional[frozenset] = None,
+) -> List[List[int]]:
+    """Greedily partition token indices into waves whose union of unique SPILL
+    experts is <= ``scratch``.
+
+    Fixed-resident + scratch model: the resident experts are always resident on
+    GPU (fixed slots, never fetched), so they impose NO wave budget. Only the
+    SPILL experts consume the ``scratch`` slots and must be fetched, so a wave
+    may include any number of resident experts plus at most ``scratch`` unique
+    spill experts.
+
+    Residency set: when ``resident_ids`` is None (default) the resident set is
+    the static ``[0, resident_count)`` (spill == global id >= resident_count).
+    When ``resident_ids`` is given (Stage-1 hot residency), the resident set is
+    exactly that frozen id set (spill == id not in resident_ids); its size still
+    equals ``resident_count`` so the scratch budget is unchanged. The wave split
+    is over TOKENS either way, so every token is still computed exactly once with
+    all its experts resident -> byte-identical regardless of which set is chosen.
+
+    Pure-python, CPU-testable. ``experts_per_token[t]`` is the list of routed
+    expert ids for token ``t`` (``-1`` padding allowed and ignored). Returns a
+    list of waves; each wave is a list of token indices in original order.
+
+    Raises ``ValueError`` if a single token needs more than ``scratch`` unique
+    spill experts -- offload cannot serve even one token; fail fast.
+    """
+    if scratch < 1:
+        raise ValueError("scratch must be >= 1")
+
+    def _is_spill(e: int) -> bool:
+        return (
+            e not in resident_ids if resident_ids is not None else e >= resident_count
+        )
+
+    waves: List[List[int]] = []
+    cur_rows: List[int] = []
+    cur_spill: set = set()
+    for t, experts in enumerate(experts_per_token):
+        spill = {int(e) for e in experts if e is not None and _is_spill(int(e))}
+        if len(spill) > scratch:
+            raise ValueError(
+                f"token {t} routes to {len(spill)} spill experts but only "
+                f"scratch={scratch} scratch slots are available (a single "
+                f"token's spilled top-k must fit in the scratch region; raise "
+                f"the scratch size or the resident fraction)."
+            )
+        if cur_rows and len(cur_spill | spill) > scratch:
+            waves.append(cur_rows)
+            cur_rows = []
+            cur_spill = set()
+        cur_spill |= spill
+        cur_rows.append(t)
+    if cur_rows:
+        waves.append(cur_rows)
+    return waves
+
+
+def plan_expert_waves(
+    experts_per_token: Sequence[Sequence[int]],
+    resident_count: int,
+    scratch: int,
+    resident_ids: Optional[frozenset] = None,
+) -> Tuple[List[int], List[List[int]]]:
+    """Partition the forward's routed SPILL experts into waves of <= ``scratch``.
+
+    The expert-major counterpart of ``plan_token_waves``. Returns
+    ``(resident_used, spill_waves)``:
+
+    * ``resident_used`` -- the resident experts this forward routes to, sorted.
+      They are already on GPU, need no scratch slot and no fetch, so they are
+      computed in ONE wave of their own however many there are.
+    * ``spill_waves`` -- the routed spill experts, sorted and chunked into
+      groups of at most ``scratch``. Each group is fetched ONCE; a spill expert
+      therefore crosses PCIe exactly once per forward instead of once per
+      token-major wave.
+
+    Deterministic (sorted ids, fixed chunking), pure-python, CPU-testable.
+    Unlike the token-major split this cannot fail: a token's top-k may be
+    spread across waves, so no per-token scratch bound exists.
+    """
+    if scratch < 1:
+        raise ValueError("scratch must be >= 1")
+
+    def _is_spill(e: int) -> bool:
+        return (
+            e not in resident_ids if resident_ids is not None else e >= resident_count
+        )
+
+    resident_used: set = set()
+    spill_used: set = set()
+    for experts in experts_per_token:
+        for e in experts:
+            if e is None:
+                continue
+            e = int(e)
+            if e < 0:
+                continue
+            (spill_used if _is_spill(e) else resident_used).add(e)
+
+    spill_sorted = sorted(spill_used)
+    spill_waves = [
+        spill_sorted[i : i + scratch] for i in range(0, len(spill_sorted), scratch)
+    ]
+    return sorted(resident_used), spill_waves
+
+
+def plan_expert_waves_np(
+    ids_np,
+    resident_count: int,
+    scratch: int,
+    resident_ids: Optional[frozenset] = None,
+    num_experts: Optional[int] = None,
+) -> Tuple[List[int], List[List[int]]]:
+    """``plan_expert_waves`` over a [T, K] integer array instead of a nested
+    Python list (fnFL2 H20b). Same result, element for element: the used set
+    is ``np.unique`` of the non-negative ids (sorted, like ``sorted(set)``),
+    split by the same spill predicate, chunked by the same ``scratch``.
+
+    Why: at a 16384-token prefill chunk the list path costs ~26 ms of host
+    Python PER MoE LAYER after the ``tolist`` rendezvous (desk bench, T=16384
+    K=10: tolist 4.2 + plan_expert_waves 16.0 + np.asarray 5.4 ms), and the
+    GPU idles through all of it -- ~0.75 s of PP0's 5.5-s forward (29 layers).
+    """
+    import numpy as np
+
+    if scratch < 1:
+        raise ValueError("scratch must be >= 1")
+    flat = np.asarray(ids_np).reshape(-1)
+    used = np.unique(flat[flat >= 0])
+    if resident_ids is not None:
+        width = max(int(used[-1]) + 1 if used.size else 0, int(num_experts or 0))
+        is_res = np.zeros(width, dtype=bool)
+        members = [int(e) for e in resident_ids if 0 <= int(e) < width]
+        is_res[members] = True
+        res_of_used = is_res[used]
+    else:
+        res_of_used = used < resident_count
+    spill_sorted = used[~res_of_used].tolist()
+    spill_waves = [
+        spill_sorted[i : i + scratch] for i in range(0, len(spill_sorted), scratch)
+    ]
+    return used[res_of_used].tolist(), spill_waves
+
+
+def pool_lru_rows(hot_phys, lru_start: int, row_limit: int) -> Dict[int, int]:
+    """H107: expert -> the LRU row it OWNS, read off a host copy of the pool's
+    ``hot_phys`` map. The pool keeps ``row_key[r] == e`` iff ``hot_phys[e] ==
+    r`` over the LRU rows (#104), and a staged expert never enters ``hot_phys``
+    (``step_reference``: staging lives in the step map only), so a row in
+    ``[lru_start, row_limit)`` carries exactly that expert's bytes. Residents
+    (rows below ``lru_start``) and experts without a row (-1) are not listed."""
+    out: Dict[int, int] = {}
+    for e, r in enumerate(hot_phys):
+        r = int(r)
+        if lru_start <= r < row_limit:
+            out[e] = r
+    return out
+
+
+def eager_lru_static_residency(planner, resident_count: int) -> bool:
+    """H107b: does the planner hold the static identity residency -- expert
+    ``e`` resident at slot ``e`` for ``e`` in ``[0, R)`` -- the layout
+    ``_run_eager_lru`` computes wave 0 in (``slot0 = {e: e}``)? True for no
+    map at all and for the store layout's spelled-out identity maps (Task #47,
+    ``resident_ids == range(R)``, ``resident_slot == {e: e}``); False for a hot
+    set or a load-time layout that moved a resident off its own slot."""
+    ids = getattr(planner, "resident_ids", None)
+    if ids is None:
+        return True
+    R = int(resident_count)
+    if frozenset(int(e) for e in ids) != frozenset(range(R)):
+        return False
+    slot = getattr(planner, "resident_slot", None)
+    return slot is None or all(slot.get(e) == e for e in range(R))
+
+
+def plan_eager_lru_waves(
+    spill_sorted: Sequence[int],
+    lru_row_of: Dict[int, int],
+    scratch_rows: Sequence[int],
+) -> Optional[Tuple[Dict[int, int], List[List[Tuple[int, int]]]]]:
+    """H107 (D extend, 28.09.): the expert-major eager plan that KNOWS the
+    pool's warm LRU rows.
+
+    Before H107 an eager forward under the pool mode fetched every routed
+    spill expert into the scratch rows ``[R, R + scratch)`` -- also the ones
+    that already sat in an LRU row from the decode rounds before (D TP0
+    rc12z26: 12 residents + 98 LRU rows = 110 of 193 experts on the card, a
+    61-token extend still moved 0.20 GiB per layer in 3 waves, ~1.6 s gpu-ms),
+    and it overwrote the decode working set on the way (H23: cold round 1
+    after every extend).
+
+    Returns ``(hits, miss_waves)``: ``hits`` = spill expert -> the LRU row it
+    is read from (no fetch, computed in the fetch-free wave 0 with the
+    residents); ``miss_waves`` = the remaining spill experts, sorted, chunked
+    over the scratch rows that hold NO hit, as ``(expert, row)`` fetch pairs.
+    A hit row is never written during the forward, so no wave can swap an
+    expert out from under a later wave that reads it. None when misses remain
+    but every scratch row holds a hit (the caller keeps the plain plan).
+
+    Which row holds an expert never changes WHAT the forward computes (the
+    apply reads the expert's bytes wherever they are; expert-major lands every
+    pair in its own k-slot and reduces once at the end), so the output is the
+    plain plan's, bit for bit."""
+    hits = {int(e): int(lru_row_of[e]) for e in spill_sorted if e in lru_row_of}
+    held = set(hits.values())
+    writable = [int(r) for r in scratch_rows if int(r) not in held]
+    misses = [int(e) for e in spill_sorted if e not in hits]
+    if misses and not writable:
+        return None
+    width = max(1, len(writable))
+    miss_waves = [
+        list(zip(misses[i : i + width], writable)) for i in range(0, len(misses), width)
+    ]
+    return hits, miss_waves
+
+
+# fnFL2 H20b: below this many routed (token, k) pairs the list path stays --
+# decode and small extends are not what the vector planner is for.
+PLAN_VECTOR_MIN_PAIRS = 4096
+
+# fnFL2 H20c: the last (mode, why) this process logged; decode-sized forwards
+# are the documented exclusion and never move it.
+_PLAN_ROUTE_LAST: Dict[str, Optional[str]] = {"state": None}
+
+
+def note_plan_route(closed_by: Optional[str], *, layer_id, pairs: int) -> bool:
+    """Edge-triggered 'MOE-PLAN-ROUTE mode=vector|list why=<reader>': one line
+    per process whenever the route of a prefill-sized forward changes, so a
+    boot names why the vector planner did (not) run. Returns whether it logged."""
+    if closed_by == "decode_size":
+        return False
+    state = "vector" if closed_by is None else f"list:{closed_by}"
+    if state == _PLAN_ROUTE_LAST["state"]:
+        return False
+    _PLAN_ROUTE_LAST["state"] = state
+    logger.info(
+        "MOE-PLAN-ROUTE mode=%s why=%s layer=%s pairs=%d (fnFL2 H20c; "
+        "FLLIPER_MOE_OFFLOAD_PLAN_VECTOR; logged on change only)",
+        "vector" if closed_by is None else "list",
+        closed_by or "open",
+        layer_id,
+        pairs,
+    )
+    return True
+
+
+def resolve_wave_order(value: Optional[str]) -> str:
+    """Normalize FLLIPER_MOE_OFFLOAD_WAVE_ORDER; reject anything else loudly."""
+    order = (value or "token").strip().lower()
+    if order not in ("token", "expert"):
+        raise RuntimeError(
+            f"FLLIPER_MOE_OFFLOAD_WAVE_ORDER must be 'token' or 'expert', got {value!r}"
+        )
+    return order
+
+
+def combine_topk_partials(partials, out, routed_scaling_factor):  # pragma: no cover
+    """Reduce a [T, top_k, H] per-(token, k-slot) contribution stack to [T, H].
+
+    This is the SAME reduction ``_fused_moe_kernel_sequence`` applies to its own
+    ``intermediate_cache3`` (see moe_runner/triton_utils/fused_moe.py, the
+    combine block after the second kernel): the branch selection depends only on
+    ``top_k``, the token count and ``routed_scaling_factor`` -- all of which the
+    expert-major path keeps at their unsplit, full-batch values. Feeding it the
+    same values in the same k order therefore reproduces the unsplit output bit
+    for bit.
+    """
+    import torch
+
+    from flliper.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+        _use_moe_sum_reduce_torch_compile,
+        moe_sum_reduce,
+        moe_sum_reduce_torch_compile,
+    )
+
+    topk = partials.shape[1]
+    rsf = 1.0 if routed_scaling_factor is None else routed_scaling_factor
+    if topk == 2 and rsf == 1.0:
+        torch.add(partials[:, 0], partials[:, 1], out=out)
+        return out
+    if _use_moe_sum_reduce_torch_compile(partials.shape[0]):
+        moe_sum_reduce_torch_compile(partials, out, rsf)
+    else:
+        moe_sum_reduce(partials, out, rsf)
+    return out
+
+
+def remap_ids_host(ids_list, slot_of_needed) -> List[int]:
+    """Host-side twin of ``MoEExpertOffloadCache._remap``, flattened.
+
+    ``_remap`` is ``torch.where(ids >= 0, lut[ids.clamp(min=0)], ids)`` over the
+    LUT ``_build_lut`` fills with ``slot_of_needed`` and ``-1`` everywhere else.
+    The same answer, element for element:
+
+    * ``e < 0``  -> ``e`` (the unrouted / pad marker survives untouched, which is
+      what makes a graph-PADDED batch legal here -- #444's pad-slot family);
+    * ``e >= 0`` -> ``slot_of_needed[e]``, or ``-1`` when the id is absent from
+      the resolved set, which is exactly the value ``_build_lut`` left in that
+      LUT row.
+
+    This exists because the #462 breakable route already paid for the ids on the
+    host (the one D2H rendezvous per layer per step) and can therefore publish a
+    finished slot vector with ONE pinned H2D, instead of shipping a LUT to the
+    device and gathering there. ``_build_lut``'s two pageable H2D copies per
+    layer -- host-blocking, because ``non_blocking`` is only honoured for pinned
+    memory -- disappear with it. Pure Python over ints, so the equivalence is a
+    hermetic test rather than a GPU-window claim
+    (``tests/moe_offload/test_breakable_route_462.py``).
+    """
+    get = slot_of_needed.get
+    return [(e if e < 0 else get(e, -1)) for row in ids_list for e in row]
+
+
+@dataclass
+class ExpertResidencyPlanner:
+    """Pure-python FIXED-RESIDENT + SCRATCH residency for one MoE layer.
+
+    This is the host-capping, deterministic residency (Variant-C B2b):
+      * experts ``[0, resident_count)`` are ALWAYS resident on GPU at slot==id
+        (never fetched, never evicted). The host pinned pool therefore only
+        needs the SPILL experts ``[resident_count, num_local_experts)`` -> the
+        host footprint is ~spill, not the full expert set.
+      * a wave's SPILL experts (id >= resident_count), taken in SORTED order,
+        are fetched into the scratch region
+        ``[resident_count, resident_count + scratch)``.
+      * the GPU buffer size (``resident_count + scratch``) is FIXED, and the
+        per-wave layout is a pure function of the wave's needed set (fixed
+        resident slots + sorted scratch), so the marlin moe_align tiling is
+        deterministic -> greedy output is self-deterministic at temp=0 (no
+        cross-request drift). Resident experts are reused across waves without
+        re-fetching (throughput win vs the earlier refetch-all scheme).
+
+    A single ``resolve()`` must contain <= ``scratch`` unique spill experts
+    (guaranteed by ``plan_token_waves``).
+    """
+
+    num_local_experts: int
+    resident_count: int
+    scratch: int
+    stats: ResidencyStats = field(default_factory=ResidencyStats)
+    # Stage-1 hot residency: when set, the resident set is exactly ``resident_ids``
+    # (a frozen set of size resident_count) and ``resident_slot`` maps each
+    # resident expert id -> its GPU slot in [0, resident_count). When None
+    # (default) the resident set is the static [0, resident_count) at slot==id.
+    resident_ids: Optional[frozenset] = None
+    resident_slot: Optional[Dict[int, int]] = None
+    # #394 link-proportional cold shard: cold experts a PEER rank's host tier
+    # owns. This rank has no spill-pool row for them, so routing one here is a
+    # caller bug (a layer that delegated without remapping foreign expert ids
+    # away). None on every path without a host-shard ratio -> one `is not None`
+    # per resolve on the default path.
+    delegated_ids: Optional[frozenset] = None
+    # #394 slice 2: True once a shared cold tier makes those ids REACHABLE --
+    # the bytes live in a peer's segment and this rank can DMA the row. The
+    # planner then treats a delegated expert exactly like any other spill
+    # expert (scratch slot, fetch entry) and only the fetch SOURCE differs;
+    # ``MoEExpertOffloadCache._fetch`` is the one place that knows which. False
+    # keeps the slice-1 behaviour, which is a named refusal, because without a
+    # shared tier a delegated expert really is absent.
+    delegated_reachable: bool = False
+
+    def __post_init__(self):
+        if self.scratch < 1:
+            raise ValueError("scratch must be >= 1")
+        if self.resident_count < 0:
+            raise ValueError("resident_count must be >= 0")
+        if self.resident_count > self.num_local_experts:
+            self.resident_count = self.num_local_experts
+
+    @property
+    def buffer_size(self) -> int:
+        """GPU buffer slot count = fixed resident + scratch (capped at E)."""
+        return min(self.resident_count + self.scratch, self.num_local_experts)
+
+    @property
+    def fully_resident(self) -> bool:
+        return self.resident_count >= self.num_local_experts
+
+    def split_needed(
+        self, needed_unique: Sequence[int]
+    ) -> Tuple[List[int], List[int]]:
+        """Split an already-uniqued, sorted needed set into (resident, spill).
+
+        Extracted from :meth:`resolve` so a caller can ask "would this forward
+        overflow the scratch region?" WITHOUT taking the stats side effects
+        resolve() applies (#462's breakable route pre-checks the fixed-shape
+        invariant and must be able to refuse by name before a forward counter
+        moves). Both lists preserve the input order, so the spill list is
+        sorted exactly as resolve() requires for its slot assignment.
+        """
+        if self.resident_ids is None:
+            # Static residency: resident == [0, R) at slot==id.
+            return (
+                [e for e in needed_unique if e < self.resident_count],
+                [e for e in needed_unique if e >= self.resident_count],
+            )
+        # Hot residency: resident == frozen id set at its assigned slot.
+        return (
+            [e for e in needed_unique if e in self.resident_ids],
+            [e for e in needed_unique if e not in self.resident_ids],
+        )
+
+    # fnFL2 H58: host expert planning, fetch_plan of DECODE-HOST-SPLIT (the
+    # pool mode plans on the device, so a graphed decode round never calls
+    # it). resolve_sticky (WP8 lookahead, prefill waves only) is not timed:
+    # its fallback calls this method and would count twice.
+    @_h58_timed("fetch_plan_ms", "fetch_plan_n")
+    def resolve(
+        self, needed: Sequence[int]
+    ) -> Tuple[Dict[int, int], List[Tuple[int, int]]]:
+        """Return (slot_of_needed, fetch_plan) for one wave.
+
+        slot_of_needed: expert_id -> slot for every needed expert.
+        fetch_plan: list of (spill_expert_id, scratch_slot) to H2D-copy.
+        Resident experts (id < resident_count) map to slot==id and are NOT
+        fetched (already resident). Spill experts (id >= resident_count), sorted,
+        map to scratch slots [resident_count + i] and are fetched. The layout is
+        a pure function of ``needed`` (history-independent) -> deterministic.
+        """
+        self.stats.forwards += 1
+        self.stats.waves += 1
+        needed_unique = sorted(set(int(e) for e in needed if e >= 0))
+        if self.fully_resident:
+            self.stats.hits += len(needed_unique)
+            return {e: e for e in needed_unique}, []
+
+        resident, spill = self.split_needed(needed_unique)
+        if self.resident_ids is None:
+            resident_slot_of = {e: e for e in resident}
+        else:
+            resident_slot_of = {e: self.resident_slot[e] for e in resident}
+        if self.delegated_ids is not None:
+            foreign = [e for e in spill if e in self.delegated_ids]
+            if foreign and not self.delegated_reachable:
+                raise RuntimeError(
+                    f"experts {foreign} were delegated to a peer rank's host "
+                    f"tier by the #394 link-proportional cold shard, but this "
+                    f"rank's router asked for them and no shared cold tier is "
+                    f"attached, so they are absent rather than relocated. "
+                    f"Either enable the shared tier "
+                    f"(FLLIPER_MOE_COLD_TIER_SHM=1, #394 slice 2) or remap the "
+                    f"foreign expert id away (the #82 dim-0 shard's padding "
+                    f"expert) before delegating any cold expert."
+                )
+            if foreign:
+                # Reachable: the row comes from a peer's segment instead of
+                # this rank's pool. Counted here rather than in _fetch so the
+                # tally survives the desk path, which has no CUDA stream.
+                self.stats.remote_fetches += len(foreign)
+        if len(spill) > self.scratch:
+            raise RuntimeError(
+                f"resolve() got {len(spill)} spill experts but only "
+                f"{self.scratch} scratch slots exist; caller must wave-split "
+                f"with plan_token_waves() first."
+            )
+        self.stats.hits += len(resident)
+        self.stats.misses += len(spill)
+        self.stats.fetches += len(spill)
+
+        slot_of_needed: Dict[int, int] = dict(resident_slot_of)
+        fetch_plan: List[Tuple[int, int]] = []
+        for i, e in enumerate(spill):
+            slot = self.resident_count + i
+            slot_of_needed[e] = slot
+            fetch_plan.append((e, slot))
+        return slot_of_needed, fetch_plan
+
+    def resolve_sticky(
+        self, needed: Sequence[int], holds: Dict[int, int]
+    ) -> Tuple[Dict[int, int], List[Tuple[int, int]], int]:
+        """WP8 lookahead variant of :meth:`resolve`: a spill expert that a
+        scratch slot ALREADY HOLDS (``holds``: slot -> expert, maintained by
+        every fetch) keeps that slot and is not fetched again; the remaining
+        spill experts take the free scratch slots in sorted order. Returns
+        (slot_of_needed, fetch_plan, reused). Residency accounting is the same
+        as resolve(); the reused experts count as lookahead hits, not misses.
+
+        The layout is no longer a pure function of ``needed`` -- which slot an
+        expert sits in only decides where the grouped GEMM reads its weights,
+        never what it computes -- and that is why this is a separate method
+        behind the lookahead switch: resolve() keeps its history-independent
+        layout for every launch that did not ask for the lookahead."""
+        self.stats.forwards += 1
+        self.stats.waves += 1
+        needed_unique = sorted(set(int(e) for e in needed if e >= 0))
+        if self.fully_resident:
+            self.stats.hits += len(needed_unique)
+            return {e: e for e in needed_unique}, [], 0
+        resident, spill = self.split_needed(needed_unique)
+        if self.resident_ids is None:
+            slot_of_needed: Dict[int, int] = {e: e for e in resident}
+        else:
+            slot_of_needed = {e: self.resident_slot[e] for e in resident}
+        if self.delegated_ids is not None:
+            foreign = [e for e in spill if e in self.delegated_ids]
+            if foreign and not self.delegated_reachable:
+                # Same refusal as resolve(); stated once there.
+                return self.resolve(needed)
+            if foreign:
+                self.stats.remote_fetches += len(
+                    [e for e in foreign if e not in holds.values()]
+                )
+        if len(spill) > self.scratch:
+            raise RuntimeError(
+                f"resolve_sticky() got {len(spill)} spill experts but only "
+                f"{self.scratch} scratch slots exist; caller must wave-split "
+                f"with plan_token_waves() first."
+            )
+        held_slot_of = {e: slot for slot, e in holds.items()}
+        reused = [e for e in spill if e in held_slot_of]
+        missing = [e for e in spill if e not in held_slot_of]
+        taken = {held_slot_of[e] for e in reused}
+        free = [
+            slot
+            for slot in range(self.resident_count, self.resident_count + self.scratch)
+            if slot not in taken
+        ]
+        fetch_plan: List[Tuple[int, int]] = []
+        for e in reused:
+            slot_of_needed[e] = held_slot_of[e]
+        for e, slot in zip(missing, free):
+            slot_of_needed[e] = slot
+            fetch_plan.append((e, slot))
+        self.stats.hits += len(resident)
+        self.stats.misses += len(missing)
+        self.stats.fetches += len(missing)
+        self.stats.lookahead_hits += len(reused)
+        self.stats.lookahead_misses += len(missing)
+        return slot_of_needed, fetch_plan, len(reused)
+
+
+_POOL_PREFETCH: Optional[bool] = None
+_POOL_PREFETCH_STREAM = None
+
+
+def pool_prefetch_enabled() -> bool:
+    """FLLIPER_MOE_POOL_PREFETCH=1 arms the speculative expert prefetch of the
+    device-planned pool (default OFF -- with it unset every pool forward is
+    byte-identical to before). Read once per process."""
+    global _POOL_PREFETCH
+    if _POOL_PREFETCH is None:
+        import os
+
+        _POOL_PREFETCH = str(
+            os.environ.get("FLLIPER_MOE_POOL_PREFETCH", "") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+    return _POOL_PREFETCH
+
+
+def pool_prefetch_stream():
+    """ONE side stream per rank for every layer's speculative prefetch.
+
+    One stream, not one per layer: the prefetches of successive layers happen
+    at different points of the same forward and all contend for the same PCIe
+    link, so serialising them on a single stream is what we want anyway, and it
+    keeps the number of streams a decode graph forks to one."""
+    global _POOL_PREFETCH_STREAM
+    if _POOL_PREFETCH_STREAM is None:
+        import torch
+
+        _POOL_PREFETCH_STREAM = torch.cuda.Stream()
+    return _POOL_PREFETCH_STREAM
+
+
+def resident_slot_count(num_local_experts: int, fraction: float) -> int:
+    """Resident-expert count to keep on GPU for a given fraction (<1)."""
+    n = int(math.ceil(fraction * num_local_experts))
+    return max(1, min(num_local_experts, n))
+
+
+#: The fewest scratch rows a Platztausch/offload buffer can run with (the
+#: staging width is C-1). ONE owner: ``scratch_slot_count`` refuses below it,
+#: and ``expert_map.unbuilt_platztausch_buffers`` refuses a map that would
+#: make a rank go below it (fnFL2x100, W120).
+MIN_SCRATCH_ROWS = 2
+
+
+def scratch_slot_count(
+    resident_count: int, num_local_experts: Optional[int] = None
+) -> int:
+    """Scratch slots C for the fixed-resident buffer (env-overridable).
+
+    The GPU buffer is (resident_count + C) slots; C bounds the unique SPILL
+    experts a single wave may fetch. Default C = max(8, resident_count // 4):
+    big enough to hold a decode step's spilled top-k, small enough to keep the
+    GPU buffer modest (buffer/E fraction determines resident-VRAM). Override via
+    FLLIPER_MOE_SCRATCH_SLOTS.
+
+    ``num_local_experts`` CLAMPS C to the rows that exist: the buffer is built
+    as ``min(R + C, E)`` (the plan cannot hold more rows than the rank owns)
+    while the pool-mode capture asserts ``buffer_size == R + C``, so an
+    unclamped C above ``E - R`` makes the two disagree and the decode graph
+    refuses -- fnFL2v64 died on ``pool mode requires buffer_size == R+C
+    (61 != 2+60)`` with E=61, R=2 and the default C=60. Clamping here, at the
+    single source both sides read, is what keeps them equal by construction.
+    A rank that cannot spare two scratch rows is refused rather than clamped
+    to a pool that the staging width (``C - 1``) cannot use.
+    """
+    import os
+
+    env = os.environ.get("FLLIPER_MOE_SCRATCH_SLOTS", "")
+    picked = scratch_slots_from_env(env, _scratch_env_rank_and_size())
+    want = picked if picked is not None else max(8, resident_count // 4)
+    if num_local_experts is None:
+        return want
+    room = int(num_local_experts) - int(resident_count)
+    if room < MIN_SCRATCH_ROWS:
+        raise ValueError(
+            f"expert pool: {num_local_experts} owned experts with "
+            f"{resident_count} resident leave {room} scratch row(s); the pool "
+            f"needs at least {MIN_SCRATCH_ROWS} (the staging width is C-1). "
+            "Lower the residency fraction for this rank."
+        )
+    return min(want, room)
+
+
+def _scratch_env_rank_and_size():
+    try:
+        from flliper.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        return int(parallel.moe_tp_rank), int(parallel.moe_tp_size)
+    except Exception:
+        return None
+
+
+def scratch_slots_from_env(env: str, rank_and_size) -> Optional[int]:
+    """FLLIPER_MOE_SCRATCH_SLOTS as one value for every rank, or a per-rank
+    comma vector (fn5t/fn5u 19.09.: the LRU rows = C - staging are the recency
+    lever of the pool, and only the 5090's link is the round's critical path,
+    so the ranks need different C). A vector must have exactly tp_size
+    entries; anything unparsable falls back to the default."""
+    text = (env or "").strip()
+    if not text:
+        return None
+    if "," in text:
+        try:
+            values = [max(1, int(v)) for v in text.split(",")]
+        except ValueError:
+            return None
+        if rank_and_size is None:
+            return None
+        rank, size = rank_and_size
+        if len(values) != size:
+            raise ValueError(
+                f"FLLIPER_MOE_SCRATCH_SLOTS vector has {len(values)} entries "
+                f"({text}) but the MoE tensor parallelism is {size}; give one "
+                "entry per rank or a single value."
+            )
+        return values[rank]
+    try:
+        return max(1, int(text))
+    except ValueError:
+        return None
+
+
+# ===========================================================================
+# #394: LINK-PROPORTIONAL COLD-EXPERT SHARDING
+#
+# A cold expert is paid for in PCIe seconds, and a fetch wave is over only when
+# the LAST rank's share has landed. Splitting the cold pool EQUALLY across TP
+# ranks whose links are not equal therefore lets the narrowest link set the
+# clock for all of them. On this rig the links are gen4 x4 / x8 / x8 -- 6.4 /
+# 13 / 13 GB/s measured H2D out of pinned host memory -- so the x4 rank moves
+# the same bytes over half the link and every other rank waits for it.
+#
+# ANALYSE_393 §7.3/§7.4 puts numbers on it under its parameterised 2.79
+# GB/token model: 0.93 GB over 6.4 GB/s = 145 ms/token with equal shards,
+# against 2.79 GB over the 32.4 GB/s the three links absorb together = 86
+# ms/token with proportional shares. That is a 1.69x ceiling on the cold tier,
+# and 84% of the total headroom a full host-side compute lane could reach.
+#
+# DIRECTION -- the deliberate inverse of the standing "slowest rank is the
+# metronome" rule. That rule governs CAPACITY splits: give a card work in
+# proportion to its capacity and the weakest card carries the largest RELATIVE
+# load, so it still sets the clock. What is being split here is not work a card
+# must have room for, it is BYTES THAT MUST CROSS A LINK, and the weak
+# participant is the LINK, not the card. So the weak link is handed FEWER cold
+# experts, not more, and the shares are sized so all links finish their share
+# at the same instant -- which is the only instant a wave cares about. The two
+# orderings genuinely disagree on this box: the 20 GB 3080 sits in the x4 slot,
+# so a share sized by VRAM is the worst possible share to send down that link.
+#
+# WHAT DOES NOT MOVE -- device residency. The resident tier is sized by the
+# per-card VRAM budget and is untouched: R, the [R+C] buffer and every #400
+# ledger figure derived from them are the same numbers with and without a
+# ratio. Only HOST-side ownership of the cold pool moves, and only on dim 0 in
+# whole experts, because a GGUF expert row is a run of opaque quantization
+# blocks (#82/#109) and the expert axis is the one axis with no block structure
+# on it.
+#
+# PRECONDITION for a caller -- delegating a cold expert to a peer is only legal
+# on a layer that shards experts on dim 0 and remaps a foreign expert id away
+# from this rank (the #82 GGUF expert-dim shard with its zero padding expert).
+# On an intermediate-dim TP MoE every rank holds an essential slice of EVERY
+# expert and nothing can be delegated; such a layer must not construct a
+# ColdShardContext. A delegated id that reaches this rank's router anyway is
+# caught by name in ExpertResidencyPlanner.resolve rather than surfacing as a
+# missing spill-pool row.
+# ===========================================================================
+
+#: Env override for the per-rank host-shard ratio. Comma-separated positive
+#: floats, one per TP rank, e.g. ``6.4,13,13`` for this rig's measured H2D
+#: bandwidths. Read through ``os.environ`` (same as FLLIPER_MOE_SCRATCH_SLOTS)
+#: rather than ``environ.py`` so the policy stays inside this module.
+HOST_SHARD_RATIO_ENV = "FLLIPER_MOE_HOST_SHARD_RATIO"
+
+#: Lowest provenance this rank will WEIGHT a split on: ``measured`` or
+#: ``estimate``. ``absent`` is not accepted in either setting -- a split has to
+#: come from a number, and "nobody measured this link" is not a number. The
+#: default admits the nameplate derivation below, whose ratios land within 2 %
+#: of the measured ones on this rig; a run that must not be weighted by a
+#: datasheet at all sets ``measured`` and gets an equal split until the probe
+#: has run.
+HOST_SHARD_MIN_PROVENANCE_ENV = "FLLIPER_MOE_HOST_SHARD_MIN_PROVENANCE"
+
+#: Ratio sources, strongest first. The label is not decoration: it is what
+#: decides whether the number may weight a split at all, and it is written into
+#: the log line and the #390 dump so an A/B arm names its own policy.
+HOST_SHARD_SOURCE_ENV = "env"
+HOST_SHARD_SOURCE_PROBE = "card-probe-h2d"
+HOST_SHARD_SOURCE_NVML = "nvml-pcie"
+HOST_SHARD_SOURCE_EQUAL = "equal"
+
+#: source -> provenance, in the #348b/#407 vocabulary
+#: (:class:`flliper.srt.planner.cost_model.Provenance`). ``env`` counts as
+#: MEASURED because the vector an operator types is the measurement they took;
+#: the nameplate derivation is an ESTIMATE by construction (a formula over a
+#: measured link width, not a transfer anybody timed); ``equal`` is ABSENT --
+#: it is the shape a refusal takes, not a ratio.
+_HOST_SHARD_PROVENANCE = {
+    HOST_SHARD_SOURCE_ENV: "measured",
+    HOST_SHARD_SOURCE_PROBE: "measured",
+    HOST_SHARD_SOURCE_NVML: "estimate",
+    HOST_SHARD_SOURCE_EQUAL: "absent",
+}
+
+_PROVENANCE_RANK = {"measured": 0, "estimate": 1, "absent": 2}
+
+#: Encoding-adjusted per-lane throughput of one PCIe generation, GB/s, one
+#: direction. Only the RATIOS between ranks are used, so these nominal figures
+#: are enough; the measured numbers (6.4 vs 13 GB/s, i.e. 1.00 : 2.03 against
+#: this table's 1 : 2) come from the card probe, which outranks this derivation
+#: precisely because a measurement beats a nameplate.
+_PCIE_LANE_GBPS = {1: 0.250, 2: 0.500, 3: 0.985, 4: 1.969, 5: 3.938, 6: 7.563}
+
+#: Latch so the chosen ratio is logged once per process, not once per layer.
+#: Read and set under _HOST_SHARD_LOG_LOCK: the plan that reaches it is built
+#: inside the loader's thread pool (#391), and an unguarded check-then-set latch
+#: is exactly the pattern that let two threads through at once.
+_HOST_SHARD_LOGGED = False
+_HOST_SHARD_LOG_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class HostShardRatio:
+    """Per-rank host->device bandwidth weights, plus where they came from.
+
+    ``weights`` is normalized to sum 1.0 and is the same tuple on every rank
+    (the partition is a pure function of it, so the ranks agree without
+    talking). ``source`` is one of ``"env"``, ``"nvml-pcie"`` or ``"equal"``,
+    and ``detail`` carries the provenance in a form fit for a log line.
+    """
+
+    weights: Tuple[float, ...]
+    source: str
+    detail: str = ""
+
+    @property
+    def provenance(self) -> str:
+        """``measured`` / ``estimate`` / ``absent``, derived from the source.
+
+        Derived rather than stored so the two can never be set to disagree:
+        the source IS the provenance claim, and a second field would let a
+        caller construct a nameplate ratio labelled as a measurement.
+        """
+        return _HOST_SHARD_PROVENANCE.get(self.source, "absent")
+
+    @property
+    def is_equal(self) -> bool:
+        """True when the ratio carries no information a split could use.
+
+        This is the default-unchanged predicate: an equal ratio must produce
+        exactly today's assignment, so callers test it rather than comparing
+        floats themselves.
+        """
+        if not self.weights:
+            return True
+        hi, lo = max(self.weights), min(self.weights)
+        return (hi - lo) <= 1e-9 * hi
+
+    def describe(self) -> str:
+        shares = ", ".join(f"rank{i}={w:.4f}" for i, w in enumerate(self.weights))
+        tail = f" ({self.detail})" if self.detail else ""
+        return f"source={self.source} provenance={self.provenance} [{shares}]{tail}"
+
+
+def _normalize_weights(values: Sequence[float]) -> Tuple[float, ...]:
+    """Positive floats -> weights summing to 1.0. Raises on anything else."""
+    out = [float(v) for v in values]
+    for i, v in enumerate(out):
+        if not (v > 0.0) or v != v or v == float("inf"):
+            raise ValueError(
+                f"host-shard weight for rank {i} is {v!r}; every weight must be "
+                "a finite positive number"
+            )
+    total = sum(out)
+    return tuple(v / total for v in out)
+
+
+def equal_host_shard_ratio(world_size: int, detail: str = "") -> HostShardRatio:
+    """The safe default: nothing is known about the links, so split equally."""
+    n = max(1, int(world_size))
+    return HostShardRatio(tuple(1.0 / n for _ in range(n)), "equal", detail)
+
+
+def _host_shard_ratio_from_env(world_size: int) -> Optional[HostShardRatio]:
+    """``FLLIPER_MOE_HOST_SHARD_RATIO`` or ``None`` when it is unset.
+
+    A malformed or wrong-length vector is a hard error, never a silent fall
+    back to the derivation below: an operator who typed a ratio meant it, and
+    quietly running a different split than the one they asked for is how a
+    measurement arm turns into a lie. (Same contract as
+    ``FLLIPER_SP_CAPACITY_WEIGHTS`` on the diffusion lane.)
+    """
+    import os
+
+    raw = os.environ.get(HOST_SHARD_RATIO_ENV, "").strip()
+    if not raw:
+        return None
+    parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+    try:
+        values = [float(p) for p in parts]
+    except ValueError as exc:
+        raise ValueError(
+            f"{HOST_SHARD_RATIO_ENV}={raw!r} is not a comma-separated list of "
+            f"positive floats ({exc})"
+        ) from exc
+    if len(values) != int(world_size):
+        raise ValueError(
+            f"{HOST_SHARD_RATIO_ENV}={raw!r} has {len(values)} entries but the "
+            f"MoE group has {int(world_size)} ranks; give exactly one weight "
+            "per rank"
+        )
+    return HostShardRatio(
+        _normalize_weights(values),
+        HOST_SHARD_SOURCE_ENV,
+        f"{HOST_SHARD_RATIO_ENV}={raw}",
+    )
+
+
+def _min_provenance() -> str:
+    """The weakest provenance this process will weight a split on."""
+    import os
+
+    raw = os.environ.get(HOST_SHARD_MIN_PROVENANCE_ENV, "").strip().lower()
+    if not raw:
+        return "estimate"
+    if raw not in ("measured", "estimate"):
+        raise ValueError(
+            f"{HOST_SHARD_MIN_PROVENANCE_ENV}={raw!r} must be 'measured' or "
+            "'estimate'. 'absent' is not selectable: a split weighted by a "
+            "number nobody has is not a split, it is a guess."
+        )
+    return raw
+
+
+def _provenance_admitted(provenance: str, minimum: str) -> bool:
+    """True when a ratio of this provenance may weight the split."""
+    return _PROVENANCE_RANK.get(provenance, 2) <= _PROVENANCE_RANK[minimum]
+
+
+#: Process-wide memo of the card probe, so 40+ MoE layers do not each read and
+#: parse the same JSON. ``False`` distinguishes "looked, found nothing" from
+#: "have not looked yet"; both are reached from the loader's thread pool
+#: (#391), hence the lock.
+_CARD_PROBE_MEMO = None
+_CARD_PROBE_LOCK = threading.Lock()
+
+
+def _card_probe_h2d_table():
+    """``{uuid: measured pinned H2D GB/s}`` from the rigmon card probe, or ``{}``.
+
+    The probe (``rigmon/card_probe.py``, #271) times a 64 MiB pinned host->device
+    copy per card, best-of wall clock, and caches the result under a path keyed
+    on the sorted card UUIDs AND the driver version. Reading it here is a pure
+    lookup: ``load_card_probe`` never triggers a measurement, so a weight load
+    can never turn into a multi-second GPU probe as a side effect.
+
+    THE PATH IS BUILT FROM NVML'S CARD SET, NOT THE PROCESS'S CUDA VIEW, and
+    that is the whole reason this helper exists instead of a bare
+    ``load_card_probe()``. The cache key is a digest over the SORTED UUIDS of
+    the cards the caller can see, and a worker's ``CUDA_VISIBLE_DEVICES`` is
+    narrowed to one GPU (``FLLIPER_ONE_VISIBLE_DEVICE_PER_PROCESS``, forced by
+    ``--rank-gpu-id``). A worker therefore computes a one-card digest, misses
+    the three-card profile the probe actually wrote, and silently falls through
+    to the nameplate ESTIMATE. Measured on the reference rig 2026-08-02: the
+    same call returns the profile with all cards visible and ``None`` under
+    ``CUDA_VISIBLE_DEVICES=1``. NVML is not masked by that variable, so the full
+    card set is still available here and the digest can be reconstructed.
+
+    This is the SAME artifact the planner and the dashboard price cards from
+    (``planner.cost_model.memory_rates_from_entries``, kind ``h2d``), which is
+    the point -- a second H2D opinion measured by a second kernel would be
+    indistinguishable from this one after the fact.
+    """
+    global _CARD_PROBE_MEMO
+
+    with _CARD_PROBE_LOCK:
+        if _CARD_PROBE_MEMO is not None:
+            return _CARD_PROBE_MEMO or {}
+        table = {}
+        try:
+            from flliper.srt.rigmon.card_probe import load_card_probe
+
+            profile = load_card_probe(_nvml_card_probe_path())
+            if profile is None:
+                # Last resort: the process's own view. Correct whenever the
+                # caller can see every card (the launcher, the dashboard, a
+                # desk test), and no worse than nothing when it cannot.
+                profile = load_card_probe()
+            if profile is not None:
+                for card in profile.cards:
+                    if card.h2d_gbs and float(card.h2d_gbs) > 0.0:
+                        table[card.uuid] = float(card.h2d_gbs)
+        except Exception:  # noqa: BLE001 - an unreadable probe is an absence
+            table = {}
+        _CARD_PROBE_MEMO = table or False
+        return table
+
+
+def _nvml_card_probe_path():
+    """The probe cache path keyed on EVERY physical card, or ``None``.
+
+    NVML enumerates the whole rig regardless of ``CUDA_VISIBLE_DEVICES``, so
+    this reconstructs the key the probe was written under even inside a worker
+    that can only see its own GPU. The driver version must come from the same
+    place the probe took it, or the digest differs for that reason instead.
+    """
+    try:
+        from flliper.srt.registry.nvml import list_devices, nvml_session
+        from flliper.srt.rigmon.card_probe import card_probe_cache_path
+
+        uuids = [d.uuid for d in list_devices()]
+        if not uuids:
+            return None
+        with nvml_session() as pynvml:
+            driver = pynvml.nvmlSystemGetDriverVersion()
+        if isinstance(driver, bytes):
+            driver = driver.decode()
+        return card_probe_cache_path(uuids, driver)
+    except Exception:  # noqa: BLE001 - no NVML here is simply no reconstruction
+        return None
+
+
+def reset_card_probe_memo() -> None:
+    """Test hook: re-read the card probe on the next resolution."""
+    global _CARD_PROBE_MEMO
+
+    with _CARD_PROBE_LOCK:
+        _CARD_PROBE_MEMO = None
+
+
+def _measured_h2d_gbps_by_uuid(uuid: str):
+    """Measured pinned H2D GB/s for this card, or ``None`` if unmeasured."""
+    return _card_probe_h2d_table().get(uuid)
+
+
+def _pcie_link_gbps_by_uuid(uuid: str) -> Optional[float]:
+    """PCIe bandwidth of the SLOT this card sits in, GB/s, or ``None``.
+
+    The link itself comes from ``registry.nvml.pcie_link_for_uuid``, which is
+    the ONE authority for the question (#736) and carries the canon in full:
+    WIDTH FROM THE CURRENT LINK, GENERATION FROM THE MAXIMUM, resolved through
+    the #331 IdentityMap by UUID and never positionally (#392). That rule used
+    to be spelled out here and again in the #732 per-peer transport binding;
+    two copies of a subtle rule is one too many, so it moved DOWN to the
+    registry and both consumers import it. Change it there, not here.
+
+    What stays here is the only part specific to this consumer: turning lanes
+    and generation into GB/s through ``_PCIE_LANE_GBPS``. That remains an
+    ESTIMATE -- lanes x an encoding constant, not a transfer anybody timed. The
+    measured card probe outranks it.
+    """
+    from flliper.srt.registry.nvml import pcie_link_for_uuid
+
+    link = pcie_link_for_uuid(uuid)
+    if link is None:
+        return None
+    lane = _PCIE_LANE_GBPS.get(link.generation)
+    if lane is None:
+        return None
+    return lane * link.width
+
+
+def derive_link_weights(
+    card_uuids: Sequence[str], link_gbps=None
+) -> Optional[Tuple[float, ...]]:
+    """Per-rank weights from PCIe link width x generation, or ``None``.
+
+    ``card_uuids[r]`` is the NVML UUID of the card serving rank ``r``; the
+    caller gathers it (a rank knows its own via
+    ``registry.nvml.current_device_uuid``). ``link_gbps`` is the injectable
+    ``uuid -> Optional[float]`` lookup the hermetic tests use in place of a
+    driver.
+
+    Two ranks CO-LOCATED on one card share one link, so that card's bandwidth
+    is divided between them: the quantity being apportioned is link seconds,
+    and two ranks behind one x8 slot have an x4's worth each. ``None`` when any
+    card cannot be resolved -- a partial derivation is worse than no
+    derivation, because the ranks would disagree about the split.
+    """
+    from collections import Counter
+
+    if not card_uuids:
+        return None
+    lookup = _pcie_link_gbps_by_uuid if link_gbps is None else link_gbps
+    ranks_per_card = Counter(card_uuids)
+    weights = []
+    for uuid in card_uuids:
+        gbps = lookup(uuid)
+        if gbps is None or not (float(gbps) > 0.0):
+            return None
+        weights.append(float(gbps) / ranks_per_card[uuid])
+    return _normalize_weights(weights)
+
+
+def resolve_host_shard_ratio(
+    world_size: int,
+    card_uuids: Optional[Sequence[str]] = None,
+    link_gbps=None,
+    probe_gbps=None,
+) -> HostShardRatio:
+    """The ratio and its provenance, in strict preference order.
+
+    1. ``FLLIPER_MOE_HOST_SHARD_RATIO`` -- an explicit vector always wins;
+       malformed input raises rather than falling through.
+    2. MEASURED pinned H2D bandwidth per rank's card, read from the rigmon
+       card probe by UUID. This is a timed 64 MiB transfer over the link the
+       cold experts will actually cross, which is the quantity being
+       apportioned -- nothing else in the chain measures it.
+    3. ESTIMATE: NVML PCIe link width x generation for each rank's card, again
+       resolved by UUID through the #331 IdentityMap. A formula over a measured
+       link width, not a transfer anybody timed, and admitted only while
+       ``FLLIPER_MOE_HOST_SHARD_MIN_PROVENANCE`` allows an estimate.
+    4. Equal -- the shape a REFUSAL takes. An unknown link is not an excuse to
+       guess, and an equal ratio reproduces today's assignment exactly, so
+       refusing costs nothing beyond the speedup nobody could justify.
+
+    ``link_gbps`` / ``probe_gbps`` are the injectable ``uuid -> Optional[float]``
+    lookups the hermetic tests use in place of a driver and a probe cache.
+    """
+    n = max(1, int(world_size))
+    minimum = _min_provenance()
+
+    from_env = _host_shard_ratio_from_env(n)
+    if from_env is not None:
+        return from_env
+
+    if card_uuids is None:
+        return equal_host_shard_ratio(n, "no per-rank card identity supplied")
+    if len(card_uuids) != n:
+        return equal_host_shard_ratio(
+            n,
+            f"the card vector names {len(card_uuids)} ranks but the group has "
+            f"{n}; that vector describes a different group",
+        )
+
+    measured = derive_link_weights(
+        card_uuids, link_gbps=probe_gbps or _measured_h2d_gbps_by_uuid
+    )
+    if measured is not None:
+        return HostShardRatio(
+            measured,
+            HOST_SHARD_SOURCE_PROBE,
+            "measured pinned H2D per rank's card (rigmon card probe, by UUID)",
+        )
+
+    if not _provenance_admitted("estimate", minimum):
+        return equal_host_shard_ratio(
+            n,
+            "no measured H2D bandwidth for every rank's card and "
+            f"{HOST_SHARD_MIN_PROVENANCE_ENV}=measured forbids weighting on "
+            "the nameplate derivation; run the card probe "
+            "(python -m flliper.srt.rigmon.card_probe) to fill it in",
+        )
+
+    derived = derive_link_weights(card_uuids, link_gbps=link_gbps)
+    if derived is not None:
+        return HostShardRatio(
+            derived,
+            HOST_SHARD_SOURCE_NVML,
+            "max PCIe link width x generation per rank's card (NVML, by UUID)",
+        )
+    return equal_host_shard_ratio(
+        n, "neither a measured H2D rate nor NVML PCIe link data for these cards"
+    )
+
+
+def plan_proportional_shares(total: int, weights: Sequence[float]) -> Tuple[int, ...]:
+    """Apportion ``total`` WHOLE units over ``weights`` (largest remainder).
+
+    Whole units because a cold expert cannot be cut: dim 0 is the one axis of a
+    quantized expert stack with no block structure on it (#82/#109). Largest
+    remainder (Hamilton) rather than repeated rounding, so the shares sum to
+    ``total`` exactly and the result is a pure function of the inputs -- every
+    rank computes the same partition without a collective. Ties go to the lower
+    rank index, which is arbitrary but fixed.
+    """
+    total = int(total)
+    if total < 0:
+        raise ValueError(f"total must be >= 0, got {total}")
+    norm = _normalize_weights(weights)
+    exact = [total * w for w in norm]
+    floors = [int(math.floor(x)) for x in exact]
+    remaining = total - sum(floors)
+    order = sorted(range(len(norm)), key=lambda i: (-(exact[i] - floors[i]), i))
+    for i in order[:remaining]:
+        floors[i] += 1
+    return tuple(floors)
+
+
+def partition_cold_experts(
+    cold_ids: Sequence[int], weights: Sequence[float]
+) -> Tuple[Tuple[int, ...], ...]:
+    """Split the cold pool into one ascending, contiguous block per rank.
+
+    Contiguous and ascending on purpose: the owning rank's spill pool then has
+    the same "row j holds the j-th smallest owned id" shape the static layout
+    has, so ``_spill_pool_index``, the frozen-layout adoption in
+    ``MoEExpertOffloadCache`` and the capturable LUT builder all keep working
+    unchanged. Nothing here depends on WHICH experts a rank gets, only on how
+    many -- routing is uniform enough over the cold pool that the cheapest
+    correct partition is the right one.
+    """
+    ids = [int(e) for e in cold_ids]
+    shares = plan_proportional_shares(len(ids), weights)
+    out = []
+    cursor = 0
+    for count in shares:
+        out.append(tuple(ids[cursor : cursor + count]))
+        cursor += count
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class ColdShardContext:
+    """This rank's view of the link-proportional cold-expert partition.
+
+    Constructed ONLY by a caller whose layer shards experts on dim 0 and remaps
+    foreign expert ids away from this rank (see the PRECONDITION note above).
+    ``None`` in place of a context is the default path, byte for byte.
+    """
+
+    rank: int
+    world_size: int
+    ratio: HostShardRatio
+
+    def __post_init__(self):
+        if self.world_size < 1:
+            raise ValueError(f"world_size must be >= 1, got {self.world_size}")
+        if not (0 <= self.rank < self.world_size):
+            raise ValueError(f"rank {self.rank} is outside [0,{self.world_size})")
+        if len(self.ratio.weights) != self.world_size:
+            raise ValueError(
+                f"host-shard ratio has {len(self.ratio.weights)} weights but "
+                f"the group has {self.world_size} ranks"
+            )
+
+    @property
+    def active(self) -> bool:
+        """False when the ratio says nothing -- then the plan is today's plan."""
+        return self.world_size > 1 and not self.ratio.is_equal
+
+
+def cold_shard_context(
+    rank: int,
+    world_size: int,
+    card_uuids: Optional[Sequence[str]] = None,
+    link_gbps=None,
+    probe_gbps=None,
+) -> Optional[ColdShardContext]:
+    """Resolve the ratio and wrap it, or ``None`` when there is nothing to do.
+
+    ``None`` for a single-rank group or an equal ratio, so the caller's
+    ``cold_shard=`` argument is literally absent on the default path instead of
+    being a context that happens to be a no-op. That is what makes "no ratio
+    known" and "no #394" the same code path.
+    """
+    if int(world_size) < 2:
+        return None
+    ratio = resolve_host_shard_ratio(
+        world_size, card_uuids, link_gbps=link_gbps, probe_gbps=probe_gbps
+    )
+    if ratio.is_equal:
+        return None
+    return ColdShardContext(int(rank), int(world_size), ratio)
+
+
+def _log_host_shard_choice(context: "ColdShardContext", owned: int, pool: int) -> None:
+    """One INFO line per process naming the ratio, its source and this share."""
+    global _HOST_SHARD_LOGGED
+
+    import logging
+
+    with _HOST_SHARD_LOG_LOCK:
+        if _HOST_SHARD_LOGGED:
+            return
+        _HOST_SHARD_LOGGED = True
+    share = (owned / pool) if pool else 0.0
+    logging.getLogger(__name__).info(
+        "MoE cold-expert host shard (#394): rank %d/%d owns %d of %d cold "
+        "experts (%.1f%% of the pool) -- %s",
+        context.rank,
+        context.world_size,
+        owned,
+        pool,
+        100.0 * share,
+        context.ratio.describe(),
+    )
+
+
+def reset_host_shard_log_latch() -> None:
+    """Test hook: re-arm the once-per-process log line."""
+    global _HOST_SHARD_LOGGED
+
+    _HOST_SHARD_LOGGED = False
+
+
+def host_shard_row(plan: "ExpertStagingPlan") -> dict:
+    """The #394 policy this layer was staged under, as a dump row.
+
+    Written into the #390 expert-stats file so a measurement arm identifies its
+    own placement policy. Two runs of an A/B differ in exactly this row, and
+    reading which arm produced a JSON file out of the file itself is what stops
+    a pair of dumps from being un-attributable a week later.
+
+    ``owned`` and ``delegated`` are counts of THIS rank's cold pool, so
+    ``owned / (owned + delegated)`` is the realized share against the ratio the
+    policy asked for -- the whole-expert rounding error is visible rather than
+    assumed away.
+    """
+    owned = len(plan.spill_ids)
+    delegated = len(plan.delegated_ids)
+    pool = owned + delegated
+    return {
+        "policy": "link-proportional" if delegated else "equal",
+        "ratio": plan.host_shard or "",
+        "cold_pool": pool,
+        "owned_cold_experts": owned,
+        "delegated_cold_experts": delegated,
+        "owned_share": (owned / pool) if pool else 0.0,
+        "resident_count": plan.resident_count,
+        "num_experts": plan.num_experts,
+    }
+
+
+def publish_host_shard_on_layer(layer, plan: "ExpertStagingPlan") -> None:
+    """Attach the #394 row to the layer, for the #390 instrument to pick up.
+
+    On the layer rather than passed down a call chain because the two staging
+    doors reach the cache by different routes and only the layer is common to
+    both. Always written, including on the equal/default path -- a row saying
+    ``policy=equal`` is what makes the baseline arm of an A/B self-describing
+    instead of merely silent.
+    """
+    try:
+        layer._moe_offload_host_shard = host_shard_row(plan)
+    except Exception:  # noqa: BLE001 - instrumentation must never fail a load
+        pass
+
+
+# ===========================================================================
+# #123-GGUF: MATERIALIZATION-TIME staging (the third load-time entry point).
+#
+# fp8 / GPTQ / AWQ reach the offload through
+# ``presplit_expert_offload_after_repack``: by the time it runs, a real
+# ``[E, ...]`` expert stack already exists and is merely split. GGUF cannot use
+# that door. Its expert parameter is a ``GGUFUninitializedParameter`` with no
+# storage at all until ``materialize_gguf_weights`` stacks the per-expert
+# tensors the loader collected -- and that stack is exactly the allocation the
+# offload exists to avoid (it is built on the host and copied to the card in
+# full, so both peaks are paid before any presplit could run).
+#
+# So the GGUF half intercepts one step EARLIER: instead of splitting a stack
+# that exists, it decides residency FIRST and then materializes only the
+# resident slots on the device, streaming every other expert straight into the
+# pinned host tier. The full stack is never formed on either side.
+#
+# The three functions below are the reusable half of that: plan (pure), stage
+# (per-expert copy into the two tiers), register (hand the tiers to the cache
+# in the same ``_moe_offload_presplit`` shape the repack door uses). They take
+# a per-expert ``source(expert_id) -> Tensor`` callable rather than a stacked
+# tensor, which is what makes them usable before materialization.
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class ExpertStagingPlan:
+    """Which expert lands where, decided BEFORE any tensor is allocated.
+
+    ``resident_ids[i]`` is the expert that occupies GPU slot ``i`` (``i < R``);
+    ``spill_ids[j]`` is the expert at pinned-pool row ``j``. Tuples, so the
+    plan is hashable, comparable and printable in a test.
+
+    ``resident_ids`` IS SORTED (#134), and that is a contract, not an
+    accident: an expert band (the global ids ``[b*S, (b+1)*S)``) must fall on
+    a CONSECUTIVE slot range, or it cannot be published as one named tensor
+    and the flip can neither tag it nor move it in one piece
+    (``expert_band_slot_ranges`` relies on it and refuses if it is broken).
+    The slot ORDER is free -- every consumer reads it from this very list --
+    but a pinned expert is therefore at its sorted position, not at slot 0;
+    the pin travels as an ID SET (``pinned_ids``), never as a position.
+
+    ``pinned_experts`` (see ``plan_load_time_staging``) is why the layout is
+    carried explicitly instead of being the implicit static ``[0, R)``.
+
+    ``delegated_ids`` (#394) are cold experts a PEER rank's host tier owns.
+    They are neither staged nor fetched here, and the three tuples together
+    always cover ``range(num_experts)`` exactly once. Empty on every path that
+    does not pass a ``ColdShardContext``, which is every path today.
+    """
+
+    num_experts: int
+    resident_count: int
+    buffer_slots: int
+    resident_ids: Tuple[int, ...]
+    spill_ids: Tuple[int, ...]
+    delegated_ids: Tuple[int, ...] = ()
+    host_shard: Optional[str] = None
+    # The ``pinned_experts`` argument, carried forward. #302a needs it: a
+    # migration must never demote an expert that was pinned for a structural
+    # reason (the #82 pad expert every foreign token collapses onto), and
+    # re-deriving that rule at the consumer is exactly the "private list"
+    # duplication the plan object exists to prevent.
+    pinned_ids: Tuple[int, ...] = ()
+
+    @property
+    def is_static_layout(self) -> bool:
+        """True when the plan is exactly the default ``[0,R)`` residency."""
+        R = self.resident_count
+        return (
+            not self.delegated_ids
+            and self.resident_ids == tuple(range(R))
+            and self.spill_ids == tuple(range(R, self.num_experts))
+        )
+
+
+def plan_load_time_staging(
+    num_experts: int,
+    fraction: Optional[float] = None,
+    pinned_experts: Sequence[int] = (),
+    cold_shard: Optional[ColdShardContext] = None,
+    resident_order: Optional[Sequence[int]] = None,
+) -> Optional[ExpertStagingPlan]:
+    """Residency plan for a load-time split, or ``None`` when there is none.
+
+    ``None`` means "do not offload this layer": either the resident fraction is
+    >= 1.0, or ceil(fraction * E) already covers every expert. Callers treat
+    ``None`` as "materialize the full stack the way you always did", which is
+    what keeps the default path byte-identical.
+
+    ``pinned_experts`` are expert ids that MUST be resident regardless of the
+    ordering. The GGUF uneven-TP expert-dim shard (#82) needs exactly this: its
+    trailing all-zero padding expert sits at id ``E-1`` -- the last id, so the
+    static ``[0,R)`` layout would put the one expert that EVERY foreign token
+    routes to in the spill pool and re-fetch it on every single forward. Pinned
+    ids take the lowest slots; the remaining slots are filled in ascending id
+    order, so the layout stays a pure function of (E, R, pinned) and therefore
+    deterministic across ranks and runs.
+
+    ``cold_shard`` (#394) narrows the SPILL set to this rank's link-proportional
+    share of the cold pool; the rest is recorded as ``delegated_ids`` and is a
+    peer's host tier to hold. Residency is decided FIRST and is not a function
+    of the ratio, so ``resident_ids``, ``resident_count`` and ``buffer_slots``
+    -- the three numbers every VRAM figure and #400 ledger entry comes from --
+    are identical with and without a ratio. ``None`` (the default, and the only
+    thing any caller passes today) reproduces the previous plan exactly.
+    """
+
+    E = int(num_experts)
+    if E <= 0:
+        return None
+    from flliper.srt.layers.moe.resident_fraction import resident_fraction_for_rank
+
+    # SIZING: this number decides how many experts stay on THIS rank's GPU, so
+    # it must be this rank's own fraction, not a group-wide one.
+    #
+    # ``R = resident_slot_count(E, frac)`` below is sized off ``E``, the rank's
+    # OWN expert count -- which "--rank-moe-ratio" is precisely what changes.
+    # A caller running under a solved compute placement must therefore hand in
+    # the fraction ALREADY corrected to the base plan
+    # (``expert_compute_placement.resident_fraction_held_at_base_plan``), which
+    # is what ``FusedMoE`` latches at construction and what every production
+    # caller passes. The ``fraction=None`` default reads the raw operator
+    # fraction and is for callers with no layer -- tests, and the doors that
+    # run before any placement exists (#439).
+    frac = resident_fraction_for_rank() if fraction is None else float(fraction)
+    if frac >= 1.0:
+        return None
+    R = resident_slot_count(E, frac)
+    if R >= E:
+        return None
+    pinned = sorted({int(e) for e in pinned_experts})
+    for e in pinned:
+        if e < 0 or e >= E:
+            raise ValueError(f"pinned expert id {e} out of range [0,{E})")
+    if len(pinned) > R:
+        raise ValueError(
+            f"{len(pinned)} experts must stay resident but only {R} resident "
+            f"slots exist at fraction {frac} over {E} experts; raise "
+            f"FLLIPER_MOE_RESIDENT_EXPERT_FRACTION."
+        )
+    pinned_set = set(pinned)
+    rest = [e for e in range(E) if e not in pinned_set]
+    # #134: SORTIERT, und das ist keine Kosmetik.  ``resident_ids[i]`` ist der
+    # Experte in GPU-Slot i; solange die Liste ``pinned + rest`` ist, liegen
+    # die Ids eines EXPERTEN-BANDES ([b*S, (b+1)*S)) verstreut ueber den
+    # Buffer, und ein Band laesst sich dann nicht als EIN Tensor benennen --
+    # der Flip koennte es weder taggen noch am Stueck transportieren.
+    # Sortiert ist jedes Band per Konstruktion ein KONSEKUTIVER Slot-Bereich
+    # (``expert_band_slot_ranges`` unten verlaesst sich darauf und prueft es).
+    # Die Slot-Reihenfolge ist frei: jeder Konsument liest sie aus DIESER
+    # Liste (``_moe_offload_frozen_layout``, ``MoEExpertOffloadCache``), keiner
+    # rechnet sie nach.
+    resident_ids = sorted(pinned + rest[: R - len(pinned)])
+    if resident_order is not None:
+        # Version-2-Karte (Platztausch): die PUFFER-REIHENFOLGE ist der
+        # Vertrag mit dem Austausch -- Zeilen [0, praefix) sind die, die beide
+        # Phasen halten, nach Id sortiert. Die Menge muss exakt die sein, die
+        # oben entstand (die Karte hat genau R Ids gepinnt); nur die Ordnung
+        # kommt von ihr. Die Baender (#134) sind unter dieser Form aus.
+        order = [int(e) for e in resident_order]
+        if sorted(order) != resident_ids or len(set(order)) != len(order):
+            raise ValueError(
+                f"resident_order nennt {len(order)} Ids, die Residenz dieses "
+                f"Plans hat {len(resident_ids)} -- nicht dieselbe Menge "
+                f"(erste Abweichung: "
+                f"{sorted(set(order) ^ set(resident_ids))[:4]})"
+            )
+        resident_ids = order
+    resident_set = set(resident_ids)
+    spill_ids = [e for e in range(E) if e not in resident_set]
+    C = scratch_slot_count(R, E)
+
+    # #394: residency above is already fixed; only the cold pool is re-owned.
+    # A pinned expert (the #82 pad expert at id E-1) is resident, so it is not
+    # in the pool and cannot be delegated -- the two features compose without
+    # either knowing about the other.
+    delegated_ids: Tuple[int, ...] = ()
+    host_shard = None
+    if cold_shard is not None and cold_shard.active:
+        shares = partition_cold_experts(spill_ids, cold_shard.ratio.weights)
+        owned = set(shares[cold_shard.rank])
+        delegated_ids = tuple(e for e in spill_ids if e not in owned)
+        spill_ids = [e for e in spill_ids if e in owned]
+        host_shard = cold_shard.ratio.describe()
+        _log_host_shard_choice(
+            cold_shard, len(spill_ids), len(spill_ids) + len(delegated_ids)
+        )
+
+    return ExpertStagingPlan(
+        num_experts=E,
+        resident_count=R,
+        buffer_slots=min(R + C, E),
+        resident_ids=tuple(resident_ids),
+        spill_ids=tuple(spill_ids),
+        delegated_ids=delegated_ids,
+        host_shard=host_shard,
+        pinned_ids=tuple(pinned),
+    )
+
+
+def allocate_spill_pool(spill_ids, row_shape, dtype, cold_tier=None, param_attr=""):
+    """The pinned host cold pool for one expert-major tensor.
+
+    One function for the two #123-GGUF doors (the pull loop and the streaming
+    stager) so they cannot drift on WHERE the cold bytes live. The marlin
+    repack door keeps its own allocation because it refuses a cold shard
+    outright (:func:`refuse_cold_shard_at_repack_door`) and therefore never has
+    a tier to share. Without a ``cold_tier`` this is the allocation it was: a
+    private ``torch.empty(...).pin_memory()``, page-locked only when a CUDA
+    context exists (desk tests have none).
+
+    With one (#394 slice 2), the storage IS the shared segment -- not a copy
+    into it. That distinction is the difference between a feature that shares
+    the cold tier and one that doubles it, and the reference rig's host RAM was
+    already the binding constraint.
+    """
+    import torch
+
+    shape = tuple(int(d) for d in row_shape)
+    ids = tuple(int(e) for e in spill_ids)
+    if cold_tier is not None:
+        return cold_tier.allocate_spill_pool(param_attr, ids, shape, dtype)
+    if not ids:
+        return None
+    # Page-locked at its exact size (see pinned_exact_empty): plain pageable
+    # memory without a CUDA context, exactly as pin_memory() would be there.
+    return pinned_exact_empty((len(ids),) + shape, dtype)
+
+
+# ===========================================================================
+# #396(a): ON-DEMAND cold staging -- and the honest limit of its reach today.
+#
+# The mechanism below defers the cold tier's READS to first touch. What it
+# cannot do is make a door defer a read the LOADER has already performed, and
+# every production door into this offload runs after exactly that:
+#
+#   * GGUF materialization door -- ``fused_moe_triton/layer.py:2774`` calls
+#     ``stage_experts_into_tiers(plan, get, ...)`` where ``get`` closes over
+#     ``param.expert_data_map`` (read at ``:2712``, built by
+#     ``_gguf_expert_source`` at ``:2599``). Filling that map IS the load pass:
+#     by the time the plan exists, every expert is already in host RAM. This
+#     is the #123 GGUFUninitializedParameter wall -- experts materialize only
+#     in postprocess -- and deferring here would save no read at all.
+#   * GGUF streaming door (#391c) -- ``StreamingExpertStager.submit``
+#     (``:1869``) is handed a tensor that has already left the weight stream.
+#     The read happened upstream of the call.
+#   * fp8 / GPTQ / AWQ repack door -- ``presplit_expert_offload_after_repack``
+#     from ``layers/quantization/fp8.py:2317``,
+#     ``gptq/schemes/gptq_moe.py:156`` / ``:454``,
+#     ``awq/schemes/awq_moe.py:186``, all inside
+#     ``process_weights_after_loading``: a real ``[E, ...]`` stack exists and
+#     is merely split, so again there is nothing left to defer.
+#
+# End-to-end load-time saving therefore needs the LOADER to stop reading cold
+# experts, not this function to stop copying them -- a genuinely invasive
+# loader change, deliberately not attempted here. What IS delivered is the
+# mechanism plus the one door parameter (``lazy_refs``) it plugs into, so that
+# change becomes "derive refs and pass them" rather than a redesign, and
+# ``expert_refs_from_expert_major_tensor`` already does the derivation for the
+# expert-major layout every one of those doors uses.
+# ===========================================================================
+
+
+def _stage_spill_lazily(plan, lazy_refs, release, cold_tier, param_attr):
+    """#396(a): allocate the cold tier and leave its rows to first touch.
+
+    Same allocation, same row order, same ``spill_ids[j] -> row j`` mapping as
+    the eager loop below -- so ``register_load_time_presplit``'s byte tally,
+    the #394 shard's row layout and the fetch path's ``pool[row]`` are all
+    unchanged. What is skipped is the ``source(expert_id)`` call per cold
+    expert, i.e. exactly the read this feature exists to defer.
+
+    ``release`` still runs for every cold expert. A door that is holding the
+    loader's copy must let go of it here whether or not the bytes were read;
+    trading the load-time read for a retained host copy would be a strictly
+    worse boot.
+    """
+    from flliper.srt.layers.moe.lazy_expert_staging import LazySpillPool
+
+    if not plan.spill_ids:
+        return None
+    refs = {int(e): lazy_refs(int(e)) for e in plan.spill_ids}
+    first = refs[int(plan.spill_ids[0])]
+    storage = allocate_spill_pool(
+        plan.spill_ids,
+        first.shape,
+        first.dtype,
+        cold_tier=cold_tier,
+        param_attr=param_attr,
+    )
+    pool = LazySpillPool(storage, plan.spill_ids, refs)
+    if release is not None:
+        for expert_id in plan.spill_ids:
+            release(expert_id)
+    return pool
+
+
+def stage_experts_into_tiers(
+    plan: ExpertStagingPlan,
+    source,
+    out,
+    release=None,
+    cold_tier=None,
+    param_attr="",
+    lazy_refs=None,
+):
+    """Fill the two tiers from a per-expert ``source(expert_id) -> Tensor``.
+
+    ``out`` is the caller-allocated ``[buffer_slots, ...]`` device buffer; rows
+    ``[0, R)`` are written from ``plan.resident_ids`` and the scratch region
+    ``[R, buffer_slots)`` is deliberately left uninitialized (the fetch path
+    overwrites it before any read). Returns the ``[E-R, ...]`` pinned host
+    spill pool, row ``j`` holding ``plan.spill_ids[j]``.
+
+    ``source`` is called EXACTLY ONCE per expert, in staging order, and the
+    result is copied immediately -- so a source that frees its per-expert
+    tensor after handing it over (``release``) keeps host peak at one expert
+    above the two tiers, not at the full stack. Pinning is skipped when there
+    is no CUDA context (desk tests); production always has one, and the pinned
+    pool is what makes the H2D fetch async.
+
+    No reshaping, padding or re-blocking happens here: an expert's bytes are
+    copied whole. That is the property GGUF depends on -- its rows are opaque
+    quantization blocks (Q4_K 144 B / 256 values, Q6_K 210 B / 256 values), so
+    ANY split other than "whole experts on the expert axis" would cut a block
+    in half. The expert axis is the one axis with no block structure on it.
+
+    ``lazy_refs`` (#396a) is the OPT-IN door to on-demand cold staging: a
+    ``lazy_refs(expert_id) -> ExpertFileRef`` telling the cold tier where that
+    expert's bytes live, so the rows can be read on first touch instead of
+    here. It is consulted only when ``FLLIPER_EXPERT_LAZY_STAGING`` is on AND a
+    caller passed one -- both conditions, because a door that cannot describe
+    its bytes on disk must keep staging eagerly no matter what the flag says.
+    The RESIDENT half is never lazy: those experts are read on the first
+    forward regardless, so deferring them would buy nothing and would put a
+    disk read inside the device buffer's fill.
+    """
+    import torch
+
+    R = plan.resident_count
+    for slot, expert_id in enumerate(plan.resident_ids):
+        out[slot].copy_(source(expert_id))
+        if release is not None:
+            release(expert_id)
+    if R != len(plan.resident_ids):  # defensive: plan invariant
+        raise RuntimeError("staging plan resident_ids length != resident_count")
+
+    if lazy_refs is not None:
+        from flliper.srt.layers.moe.lazy_expert_staging import (
+            lazy_expert_staging_enabled,
+        )
+
+        if lazy_expert_staging_enabled():
+            spill = _stage_spill_lazily(plan, lazy_refs, release, cold_tier, param_attr)
+            for expert_id in plan.delegated_ids:
+                if release is not None:
+                    release(expert_id)
+            return spill
+
+    spill = None
+    for row, expert_id in enumerate(plan.spill_ids):
+        src = source(expert_id)
+        if spill is None:
+            spill = allocate_spill_pool(
+                plan.spill_ids,
+                tuple(src.shape),
+                src.dtype,
+                cold_tier=cold_tier,
+                param_attr=param_attr,
+            )
+        spill[row].copy_(src)
+        if release is not None:
+            release(expert_id)
+
+    # #394: a delegated cold expert belongs to a peer's host tier. Its bytes are
+    # never read here -- but the loader is still holding them, so they are
+    # released without a copy. Skipping the release instead would trade the
+    # VRAM this feature saves for host RAM it never used.
+    for expert_id in plan.delegated_ids:
+        if release is not None:
+            release(expert_id)
+    return spill
+
+
+def register_load_time_presplit(layer, attr, resident_buf, spill, plan):
+    """Publish one staged tensor in the shape ``MoEExpertOffloadCache.install``
+    already understands, and tally the VRAM it means the layer never took.
+
+    Same contract as ``presplit_expert_offload_after_repack``'s stash
+    (``layer._moe_offload_presplit[attr] = (resident_buf, spill)`` +
+    ``_moe_offload_full_experts``), plus ``_moe_offload_frozen_layout`` for the
+    non-static case, which the cache adopts as its frozen residency map.
+    """
+    presplit = getattr(layer, "_moe_offload_presplit", None)
+    first_tensor_of_layer = presplit is None
+    if presplit is None:
+        presplit = {}
+        layer._moe_offload_presplit = presplit
+    presplit[attr] = (resident_buf, spill)
+    layer._moe_offload_full_experts = plan.num_experts
+    if not plan.is_static_layout:
+        layer._moe_offload_frozen_layout = (
+            list(plan.resident_ids),
+            list(plan.spill_ids),
+        )
+    if plan.pinned_ids:
+        # #302a: which ids are pinned for a structural reason, so a later
+        # migration cannot demote them.
+        layer._moe_offload_pinned_experts = list(plan.pinned_ids)
+    if plan.delegated_ids:
+        # #394: the cache turns this into a named refusal if a delegated expert
+        # ever reaches this rank's router, instead of a missing pool row.
+        layer._moe_offload_delegated_experts = list(plan.delegated_ids)
+    publish_host_shard_on_layer(layer, plan)
+    row_bytes = (
+        (resident_buf.numel() // resident_buf.shape[0]) * resident_buf.element_size()
+        if resident_buf.shape[0]
+        else 0
+    )
+    record_expert_offload_release(
+        expert_offload_released_device_bytes(
+            plan.num_experts, plan.buffer_slots, row_bytes
+        ),
+        (spill.numel() * spill.element_size()) if spill is not None else 0,
+        1,
+        count_layer=first_tensor_of_layer,
+    )
+
+
+# ===========================================================================
+# #391c: STREAMING staging -- the same two tiers, filled from the weight stream
+#
+# ``stage_experts_into_tiers`` above is a PULL loop: it asks a ``source`` for
+# expert after expert, which presumes every expert is already sitting somewhere
+# the source can hand it over from. For GGUF that "somewhere" is the loader's
+# ``param.expert_data_map``, and filling it is the whole load pass -- so the
+# residency plan only ever got to act on a set that had already been paid for
+# in host RAM. On DeepSeek-V4-Flash UD-Q3_K_XL that set is 126.19 GiB of
+# post-repack experts against 98.5 GiB of swapless host RAM, and boot attempt 5
+# of #391 was OOM-killed at 90.7 GiB of anon mid-load, before the plan existed.
+#
+# ``StreamingExpertStager`` is the same placement, PUSHED: the plan is computed
+# from config-level facts alone (expert count, resident fraction, the #82 pad
+# expert, the #394 ratio), so it exists before the first tensor arrives, and
+# each expert is copied into its resident slot or its pinned row AS IT LEAVES
+# THE STREAM and then dropped. Nothing is retained but the tiers themselves and
+# the shards of experts whose set is still incomplete -- for GGUF's w13 that is
+# at most one layer's gate shards, because the iterator emits one whole
+# ``ffn_gate_exps`` tensor before the matching ``ffn_up_exps``.
+#
+# The tiers this produces are byte-for-byte the tiers the pull loop produces
+# from the same plan and the same inputs; only the ORDER of the copies differs
+# (stream order rather than plan order), and a copy's destination is a pure
+# function of the plan.
+# ===========================================================================
+
+
+@dataclass
+class StreamingStagingLedger:
+    """The stager's own byte accounting, cumulative over a process.
+
+    Kept next to the code that does the copying rather than derived from an
+    external RAM monitor: a monitor sees the whole process, this sees only what
+    the staging is responsible for, and the interesting number is whether the
+    two move together. ``peak_host_bytes`` is the claim boot 6 has to beat --
+    pinned tier plus whatever was in flight at the worst moment.
+    """
+
+    streamed_bytes: int = 0
+    resident_bytes: int = 0
+    pinned_bytes: int = 0
+    delegated_bytes: int = 0
+    inflight_bytes: int = 0
+    peak_inflight_bytes: int = 0
+    peak_host_bytes: int = 0
+    layers: int = 0
+    tensors: int = 0
+    #: #391: the weight loaders run on a ThreadPoolExecutor, so several stagers
+    #: (and several experts of one stager) reach this ledger at once. ``x += n``
+    #: on a field is a read-modify-write and drops updates under threads, which
+    #: would make the very number the host-RAM model is judged against
+    #: silently low. All mutation goes through :meth:`record`.
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+
+    def record(
+        self,
+        *,
+        streamed: int = 0,
+        resident: int = 0,
+        pinned: int = 0,
+        delegated: int = 0,
+        inflight: int = 0,
+        tensors: int = 0,
+        layers: int = 0,
+    ) -> None:
+        """Apply one atomic set of deltas and re-touch the peaks."""
+        with self._lock:
+            self.streamed_bytes += streamed
+            self.resident_bytes += resident
+            self.pinned_bytes += pinned
+            self.delegated_bytes += delegated
+            self.inflight_bytes += inflight
+            self.tensors += tensors
+            self.layers += layers
+            self._touch_peak()
+
+    def _touch_peak(self) -> None:
+        self.peak_inflight_bytes = max(self.peak_inflight_bytes, self.inflight_bytes)
+        self.peak_host_bytes = max(
+            self.peak_host_bytes, self.pinned_bytes + self.inflight_bytes
+        )
+
+
+_STAGING_LEDGER = StreamingStagingLedger()
+
+
+def streaming_staging_ledger() -> StreamingStagingLedger:
+    """The process-wide staging ledger (read-only for callers; tests reset)."""
+    return _STAGING_LEDGER
+
+
+def reset_streaming_staging_ledger() -> None:
+    """Clear the ledger (tests; and a second model load in one process)."""
+    global _STAGING_LEDGER
+    _STAGING_LEDGER = StreamingStagingLedger()
+
+
+def trim_host_allocator() -> None:
+    """Give the per-expert buffers back to the OS, not just to glibc's arena.
+
+    The #256 lesson: dropping the last reference to an expert returns its bytes
+    to torch's CPU allocator and glibc's arena, and RSS does not move. Across
+    40+ MoE layers that retention IS the expert set, on a box with no swap.
+    Called at each layer boundary -- often enough that the arena never grows to
+    layer count x layer size, rarely enough that the arena walk is noise next to
+    a layer's copies.
+    """
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001 - non-glibc platforms simply have no trim
+        pass
+
+
+def _human_bytes(nbytes: int) -> str:
+    for unit, scale in (("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if abs(nbytes) >= scale:
+            return f"{nbytes / scale:.2f} {unit}"
+    return f"{nbytes} B"
+
+
+def log_streaming_staging_layer(label: str, plan: "ExpertStagingPlan") -> None:
+    """One trace line per finished layer, gated on FLLIPER_MOE_STAGING_TRACE.
+
+    Emitted at the LAYER boundary, which is the granularity an external
+    ram-monitor can actually be lined up against: the cumulative pinned figure
+    here should track the monitor's anon curve, and ``in-flight peak`` is the
+    transient the curve is allowed to bulge by.
+    """
+    import logging
+
+    from flliper.srt.environ import envs
+
+    ledger = _STAGING_LEDGER
+    ledger.record(layers=1)
+    # #537: publish the pinned figure where the GGUF stream trim can read it.
+    # The trim compares against the CGROUP's memory.current, which spans every
+    # rank process, so a per-process ledger read would under-state the
+    # unreclaimable floor by (ranks - 1) pools. Unconditional -- not behind
+    # FLLIPER_MOE_STAGING_TRACE -- because the trim is a different consumer from
+    # the trace line below and must not depend on a debug switch being on.
+    pinned_host_ledger.publish_pinned_bytes(ledger.pinned_bytes)
+    if not envs.FLLIPER_MOE_STAGING_TRACE.get():
+        return
+    logging.getLogger(__name__).info(
+        "[moe-staging-trace] %s staged (#%d): %d/%d experts resident, "
+        "%d pinned, %d delegated | cumulative streamed=%s resident=%s "
+        "pinned(host)=%s delegated=%s | in-flight now=%s peak=%s | "
+        "peak host held (pinned+in-flight)=%s",
+        label,
+        ledger.layers,
+        plan.resident_count,
+        plan.num_experts,
+        len(plan.spill_ids),
+        len(plan.delegated_ids),
+        _human_bytes(ledger.streamed_bytes),
+        _human_bytes(ledger.resident_bytes),
+        _human_bytes(ledger.pinned_bytes),
+        _human_bytes(ledger.delegated_bytes),
+        _human_bytes(ledger.inflight_bytes),
+        _human_bytes(ledger.peak_inflight_bytes),
+        _human_bytes(ledger.peak_host_bytes),
+    )
+
+
+def _nbytes(tensor) -> int:
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+class StreamingExpertStager:
+    """Place each expert into its tier as the weight stream delivers it.
+
+    One instance per (layer, expert-major parameter). The caller feeds shards
+    with :meth:`submit` in whatever order the checkpoint happens to use and
+    calls :meth:`finalize` once the stream is over; the result is the same
+    ``(resident_buffer, pinned_spill_pool)`` pair
+    ``stage_experts_into_tiers`` returns.
+
+    ``shard_keys`` is the ordered tuple of per-expert shards that make up one
+    row -- ``("w1", "w3")`` for a GGUF ``w13_qweight`` (gate above up, the
+    concatenation the stacked path builds) and ``("w2",)`` for the down
+    projection. An expert is placed only once ALL of its shards have arrived,
+    which is what bounds the retained set: shards of incomplete experts.
+
+    ``allocate(row_shape, dtype) -> Tensor`` materializes the caller's
+    ``[buffer_slots, *row_shape]`` resident buffer. It is called lazily, on the
+    first complete expert, because the row shape is a property of the
+    checkpoint's quantized bytes and is not known before one has been seen.
+
+    ``zero_experts`` are ids with no bytes in the stream that must still occupy
+    their planned slot -- exactly the #82 uneven-TP shard's trailing all-zero
+    padding expert, the target of every foreign topk id. They are written in
+    :meth:`finalize`, once the row shape is known.
+    """
+
+    def __init__(
+        self,
+        plan: "ExpertStagingPlan",
+        shard_keys: Sequence[str],
+        allocate,
+        zero_experts: Sequence[int] = (),
+        label: str = "",
+        cold_tier=None,
+        param_attr: str = "",
+    ):
+        self.plan = plan
+        self.shard_keys = tuple(shard_keys)
+        self.label = label
+        # #394 slice 2: when set, this stager's cold rows are written straight
+        # into the shared segment a peer will read them from. ``None`` is the
+        # default and the previous private pinned pool.
+        self._cold_tier = cold_tier
+        self._param_attr = param_attr
+        self._allocate = allocate
+        self._zero_experts = tuple(sorted({int(e) for e in zero_experts}))
+        # expert id -> ("resident", slot) | ("spill", row) | None (delegated).
+        self._dest: Dict[int, Optional[Tuple[str, int]]] = {}
+        for slot, expert_id in enumerate(plan.resident_ids):
+            self._dest[int(expert_id)] = ("resident", slot)
+        for row, expert_id in enumerate(plan.spill_ids):
+            self._dest[int(expert_id)] = ("spill", row)
+        for expert_id in plan.delegated_ids:
+            self._dest[int(expert_id)] = None
+        self._pending: Dict[int, Dict[str, Optional[object]]] = {}
+        #: Host bytes this stager is currently holding per incomplete expert.
+        #: Kept per expert rather than recomputed at placement time so the
+        #: all-zero pad expert -- which is built in finalize() and was never in
+        #: flight -- cannot subtract bytes it never added.
+        self._inflight: Dict[int, int] = {}
+        self._placed: set = set()
+        self._row_shape: Optional[Tuple[int, ...]] = None
+        self._dtype = None
+        self.resident_buf = None
+        self.spill = None
+        self.finalized = False
+        #: #391: one stager is fed by MANY loader threads. The weight loaders
+        #: run on a ThreadPoolExecutor and every GGUF tensor is a CPU tensor, so
+        #: gate and up of one layer -- both routed into the same ``w13_qweight``
+        #: stager -- are submitted concurrently. This lock covers every piece of
+        #: shared state below: the two tiers and the row-shape guard that says
+        #: whether they exist, the pending-shard map, and the placed set. Held
+        #: only around bookkeeping; the per-expert ``copy_`` runs outside it, so
+        #: experts still land in parallel (they write disjoint rows).
+        self._lock = threading.RLock()
+
+    @property
+    def is_complete(self) -> bool:
+        """Every expert the stream owes this tensor has been placed.
+
+        The all-zero experts are excluded: they carry no stream bytes and are
+        written in :meth:`finalize`, so waiting for them would mean the layer
+        boundary never fires during the load.
+        """
+        with self._lock:
+            return not self._pending and len(self._placed) == len(self._dest) - len(
+                self._zero_experts
+            )
+
+    # -- stream side --------------------------------------------------------
+
+    def submit(self, expert_id: int, shard_id: str, tensor) -> None:
+        """Take one shard of one expert out of the stream.
+
+        The tensor is either copied into its tier (when this completes the
+        expert) or held until the rest of the expert arrives. Either way the
+        caller must not keep a reference of its own -- holding one turns the
+        "one incomplete expert set" bound back into "the whole loaded set",
+        which is the #256 lesson and the whole point of this class.
+
+        Concurrent-safe: the shard set of an expert is completed and CLAIMED
+        under the lock, so two threads carrying the two halves of one expert
+        cannot both decide they were the last one. Only the claiming thread
+        goes on to copy, and it copies outside the lock.
+        """
+        expert_id = int(expert_id)
+        with self._lock:
+            if self.finalized:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r} got expert "
+                    f"{expert_id}/{shard_id} after finalize()"
+                )
+            if shard_id not in self.shard_keys:
+                raise ValueError(
+                    f"streaming stager for {self.label!r} takes shards "
+                    f"{list(self.shard_keys)}, got {shard_id!r}"
+                )
+            if expert_id not in self._dest:
+                raise KeyError(
+                    f"streaming stager for {self.label!r} has no plan slot for "
+                    f"expert {expert_id}; the plan covers "
+                    f"[0,{self.plan.num_experts})"
+                )
+            if expert_id in self._placed:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: expert {expert_id} was "
+                    "already placed; the stream delivered it twice"
+                )
+            parts = self._pending.setdefault(expert_id, {})
+            if shard_id in parts:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: expert {expert_id} got "
+                    f"shard {shard_id!r} twice"
+                )
+            nbytes = _nbytes(tensor)
+            if self._dest[expert_id] is None:
+                # #394: a peer rank's host tier owns this cold expert. Released
+                # here without ever being copied -- keeping it would trade the
+                # VRAM the feature saves for host RAM nobody reads.
+                parts[shard_id] = None
+                _STAGING_LEDGER.record(streamed=nbytes, delegated=nbytes)
+            else:
+                parts[shard_id] = tensor
+                self._inflight[expert_id] = self._inflight.get(expert_id, 0) + nbytes
+                _STAGING_LEDGER.record(streamed=nbytes, inflight=nbytes)
+            complete = len(parts) == len(self.shard_keys)
+            if complete:
+                del self._pending[expert_id]
+                self._placed.add(expert_id)
+        if complete:
+            self._place(expert_id, parts)
+
+    def _place(self, expert_id: int, parts) -> None:
+        import torch
+
+        with self._lock:
+            self._placed.add(expert_id)
+            held = self._inflight.pop(expert_id, 0)
+        dest = self._dest[expert_id]
+        if dest is None:
+            parts.clear()
+            return
+        ordered = [parts[key] for key in self.shard_keys]
+        parts.clear()
+        row = ordered[0] if len(ordered) == 1 else torch.cat(ordered, dim=0)
+        del ordered
+        resident_buf, spill = self._ensure_tiers(row)
+        kind, index = dest
+        if kind == "resident":
+            resident_buf[index].copy_(row)
+            _STAGING_LEDGER.record(resident=_nbytes(row), inflight=-held)
+        else:
+            spill[index].copy_(row)
+            _STAGING_LEDGER.record(inflight=-held)
+
+    def _ensure_tiers(self, row):
+        """Build the two tiers on the first complete expert; return them.
+
+        #391 boot 10: this used to publish ``self._row_shape`` -- the guard that
+        says "the tiers exist" -- BEFORE allocating them, and ran unlocked while
+        the loader's thread pool pushed experts of the same tensor in parallel.
+        A second thread arriving inside that window saw the guard, skipped the
+        build and got a pair whose halves were still ``None``, and ``_place``
+        subscripted it: ``TypeError: 'NoneType' object is not subscriptable``,
+        three boots out of three. ``spill.pin_memory()`` is what makes the
+        window wide enough to hit reliably -- it is a page-locking allocation of
+        the whole cold tier.
+
+        The build is therefore serialized and the guard published LAST, after
+        both tiers exist. Both halves matter: the lock alone would still let the
+        ``elif`` shape check read a half-published ``_row_shape``/``_dtype``
+        pair if the build ever raised, and the ordering alone would still race
+        two threads into two allocations of the same tier.
+        """
+        import torch
+
+        row_shape = tuple(int(d) for d in row.shape)
+        with self._lock:
+            if self._row_shape is None:
+                buf = self._allocate(row_shape, row.dtype)
+                if tuple(buf.shape) != (self.plan.buffer_slots,) + row_shape:
+                    raise RuntimeError(
+                        f"streaming stager for {self.label!r}: allocate() returned "
+                        f"{tuple(buf.shape)}, expected "
+                        f"{(self.plan.buffer_slots,) + row_shape}"
+                    )
+                # Pinning is what makes the later H2D fetch async; skipped when
+                # there is no CUDA context (desk tests), as in the pull loop.
+                # With a #394 cold tier the pool IS the shared segment and the
+                # page-locking is a cudaHostRegister on the mapping instead.
+                spill = allocate_spill_pool(
+                    self.plan.spill_ids,
+                    row_shape,
+                    row.dtype,
+                    cold_tier=self._cold_tier,
+                    param_attr=self._param_attr,
+                )
+                # Publish only now: every reader of _row_shape takes it to mean
+                # that BOTH tiers below are already built.
+                self.resident_buf = buf
+                self.spill = spill
+                self._dtype = row.dtype
+                self._row_shape = row_shape
+                _STAGING_LEDGER.record(
+                    pinned=_nbytes(spill) if spill is not None else 0, tensors=1
+                )
+            elif row_shape != self._row_shape or row.dtype != self._dtype:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: expert row is "
+                    f"{row_shape}/{row.dtype} but the tiers were built for "
+                    f"{self._row_shape}/{self._dtype}; experts of one tensor must "
+                    "be uniform"
+                )
+            return self.resident_buf, self.spill
+
+    # -- end of stream ------------------------------------------------------
+
+    def finalize(self):
+        """Write the zero experts, check the plan is covered, hand over tiers.
+
+        Returns ``(resident_buffer, spill_pool_or_None)`` -- the same pair
+        ``stage_experts_into_tiers`` returns, for the same
+        ``register_load_time_presplit`` call.
+
+        Under the same lock as the stream side: the drain happens after the
+        loader's pool has joined, but a stager that closes while a straggler is
+        still in ``submit`` has to see either the whole submission or none of
+        it, not a half-filled shard set that reads as "incomplete".
+        """
+        import torch
+
+        with self._lock:
+            if self.finalized:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r} finalized twice"
+                )
+            if self._pending:
+                incomplete = {
+                    e: sorted(k for k in parts)
+                    for e, parts in sorted(self._pending.items())
+                }
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: the stream ended with "
+                    f"incomplete experts {incomplete}; every expert needs all of "
+                    f"{list(self.shard_keys)}"
+                )
+            if self._row_shape is None:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: the stream delivered no "
+                    "expert at all, so there is no row shape to build the tiers "
+                    "from"
+                )
+            zero_shard_shape = self._zero_shard_shape(self._row_shape)
+            for expert_id in self._zero_experts:
+                if expert_id in self._placed:
+                    raise RuntimeError(
+                        f"streaming stager for {self.label!r}: expert {expert_id} "
+                        "is declared all-zero but the stream delivered bytes for it"
+                    )
+                self._place(
+                    expert_id,
+                    {
+                        key: torch.zeros(zero_shard_shape, dtype=self._dtype)
+                        for key in self.shard_keys
+                    },
+                )
+            missing = sorted(set(self._dest) - self._placed)
+            if missing:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: the stream never "
+                    f"delivered experts {missing}; the plan reserved a tier slot "
+                    "for each of them"
+                )
+            self.finalized = True
+            return self.resident_buf, self.spill
+
+    def _zero_shard_shape(self, row_shape: Tuple[int, ...]) -> Tuple[int, ...]:
+        """Shape of ONE shard of the all-zero pad expert.
+
+        The shards of one expert are concatenated on the row axis, and the pad
+        expert's row must match every other expert's, so each of the ``k``
+        shards contributes ``rows // k``. GGUF's w13 is gate+up of identical
+        width, which is the only multi-shard case; a non-integral split means
+        the assumption no longer holds and is an error rather than a guess.
+        """
+        rows = row_shape[0]
+        k = len(self.shard_keys)
+        if rows % k:
+            raise RuntimeError(
+                f"streaming stager for {self.label!r}: {rows} rows do not "
+                f"divide over {k} shards, so the all-zero pad expert cannot be "
+                "built shard-wise"
+            )
+        return (rows // k,) + tuple(row_shape[1:])
+
+
+# --- #268: quant-path fail-fast for the expert-offload installer -----------
+# Ascend GGUF-MoE (GGUFMoEAscendMethod) and MoeWNA16 (MoeWNA16Method) have no
+# load-time offload half: unlike fp8 / GPTQ-Marlin / AWQ-Marlin, their
+# per-expert tensors either aren't materialized yet at install time
+# (GGUFUninitializedParameter only takes real shape in the loader postprocess
+# step, #123) or use a quant layout the offload cache's tensor-slicing/LRU
+# fetch was never validated against. Installing the cache on one of these
+# quant methods anyway would run EXPERT_TENSOR_ATTRS slicing over a parameter
+# that is either not a real tensor yet (crash) or real but semantically
+# unsupported (silently wrong per-expert weights, not a crash) -- undefined
+# behavior either way, so this must hard-abort before install(), not fall
+# back to the try/except's silent per-layer degrade.
+#
+# #323b: NVFP4 MoE was the named residual risk of #268 and it materialized.
+# The guard is an EXCLUSION list, so every quant method not named here passes
+# by default -- which is right for a family whose members share one tensor
+# layout, and wrong for a genuinely new one. NVFP4 MoE is a genuinely new one:
+# EXPERT_TENSOR_ATTRS below lists none of its per-expert tensors
+# (w13_weight_packed / w13_weight_scale_2 / w13_blockscale_swizzled /
+# w13_alphas / w13_input_scale_quant ...), and no NVFP4 MoE method calls
+# presplit_expert_offload_after_repack (fp8.py, gptq_moe.py and awq_moe.py do).
+# So the installer would stage a strict subset of the tensors the kernel reads
+# and run with per-expert weights paired against another expert's scales:
+# silently wrong output, not a crash. Named here until an NVFP4 offload half
+# actually exists.
+#
+# #123-GGUF: ``GGUFMoEMethod`` moved out of the unconditional set into
+# _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES below. It is admitted ONLY on a layer
+# that actually carries the materialization-time staging marker
+# (``_moe_offload_gguf_staged``), which the GGUF half sets after it has staged
+# both expert tensors into the two tiers. Every GGUF path the half does not
+# cover -- a ggml type with no MoE kernel (MXFP4 type 39 among them), the
+# dense-linear-only Ascend method, a layer whose expert set is too small to
+# split -- leaves the marker unset and is refused exactly as before. The guard
+# therefore still fails fast rather than downgrading: what changed is that
+# there is now a covered case, not that the refusal got softer.
+_OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES = (
+    "GGUFMoEAscendMethod",
+    "MoeWNA16Method",
+    # NVFP4 MoE (#323b) -- ModelOpt online-converted and the
+    # compressed-tensors scheme. The serialized ModelOpt method moved to the
+    # conditional set below (H68b): it has a half now, on the Marlin path.
+    "ModelOptNvFp4OnlineFusedMoEMethod",
+    "CompressedTensorsW4A4Nvfp4MoE",
+)
+
+#: Quant methods with a load-time offload half that only covers PART of the
+#: paths the method can take. Value = name of the layer attribute the half sets
+#: once it has actually staged this layer; absent/False => refuse.
+_OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES = {
+    "GGUFMoEMethod": "_moe_offload_gguf_staged",
+    # H68b: ModelOpt NVFP4 has the half on the MARLIN path only (host staging
+    # in create_weights, per-expert repack + presplit in
+    # _marlin_repack_and_presplit). A native W4A4 backend (flashinfer
+    # cutlass / trtllm / cutedsl: swizzled block scales, alphas) never sets
+    # the marker and is refused exactly as before.
+    "ModelOptNvFp4FusedMoEMethod": "_moe_offload_nvfp4_marlin_staged",
+}
+
+#: Why a conditional method's half did not stage a layer, per method -- the
+#: reason names the layer's OWN state, so it cannot go stale (#479).
+_OFFLOAD_CONDITIONAL_REASONS = {
+    "ModelOptNvFp4FusedMoEMethod": (
+        "'ModelOptNvFp4FusedMoEMethod' has a load-time offload half on the "
+        "Marlin path only (H68b), and it did not stage this layer: the marker "
+        "{marker!r} is absent. That happens when the MoE runner backend is not "
+        "Marlin (a native W4A4 backend keeps swizzled block scales and alphas "
+        "the offload cache does not know), when the checkpoint is not "
+        "serialized ModelOpt NVFP4, or when no rank of the group runs a "
+        "resident fraction < 1.0 (then create_weights built nothing on the "
+        "host). Run --moe-runner-backend marlin on every rank."
+    ),
+}
+
+
+def assert_expert_offload_quant_supported(
+    quant_method, layer_id=None, scheme=None, layer=None
+) -> None:
+    """Fail-fast guard (#268/#323b) for the MoE expert-offload installer.
+
+    Call this BEFORE constructing a ``MoEExpertOffloadCache`` for a layer.
+    Raises ``RuntimeError`` if the layer's quant path has no load-time offload
+    half (GGUF-MoE, MoeWNA16, NVFP4 MoE). No-op for every supported quant
+    method (fp8, GPTQ-Marlin, AWQ-Marlin, unquantized) -- those are matched by
+    NOT being in the unsupported set, so a new supported quant method never
+    needs to be added here.
+
+    ``scheme`` is the compressed-tensors MoE scheme when there is one
+    (``layer.scheme``). It has to be checked separately because a
+    compressed-tensors layer's ``quant_method`` is always the same delegating
+    ``CompressedTensorsFusedMoEMethod`` wrapper -- the class that decides the
+    tensor layout is the scheme behind it, so checking only the wrapper would
+    either miss NVFP4 or deny every compressed-tensors checkpoint.
+
+    ``layer`` is the FusedMoE layer about to be wrapped. It is what makes the
+    CONDITIONAL verdict possible (#123-GGUF): ``GGUFMoEMethod`` passes only on
+    a layer its half has actually staged, so an uncovered GGUF path is refused
+    with the same hard error as before instead of installing a cache over an
+    unstaged (or MXFP4-typed) expert parameter.
+
+    Matched by class name (not isinstance) to avoid importing
+    ``flliper.srt.layers.quantization.gguf`` / ``.moe_wna16`` /
+    ``.modelopt_quant`` from this module at call sites that must stay
+    import-light (this file is imported from the hot FusedMoE construction
+    path).
+    """
+    for candidate in (quant_method, scheme):
+        if candidate is None:
+            continue
+        name = type(candidate).__name__
+        marker = _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES.get(name)
+        if marker is not None and name in _OFFLOAD_CONDITIONAL_REASONS:
+            if getattr(layer, marker, False):
+                continue  # the half staged this layer -> covered
+            reason = _OFFLOAD_CONDITIONAL_REASONS[name].format(marker=marker)
+        elif marker is not None:
+            if getattr(layer, marker, False):
+                continue  # the half staged this layer -> covered
+            # #479: this used to name MXFP4 as THE uncovered example, which
+            # #398 made false -- type 39 has a full kernel set on a wheel that
+            # carries it. Name the layer's OWN types instead; that is the
+            # information a reader needs anyway, and it cannot go stale.
+            declared = []
+            for attr in ("w13_qweight_type", "w2_qweight_type"):
+                holder = getattr(layer, attr, None) if layer is not None else None
+                raw = getattr(holder, "weight_type", None)
+                if raw is not None:
+                    declared.append(f"{attr}={raw}")
+            types = f" This layer declares {', '.join(declared)}." if declared else ""
+            reason = (
+                f"{name!r} has a load-time offload half (#123-GGUF), but it "
+                f"did not stage this layer: the materialization-time staging "
+                f"marker {marker!r} is absent. That happens when the ggml "
+                f"quantization type has no GGUF MoE kernel (any type outside "
+                f"MMVQ_QUANT_TYPES | MMQ_QUANT_TYPES), when the layer's expert "
+                f"parameters were already materialized by another path, or "
+                f"when the expert count is too small to split at this "
+                f"fraction.{types} Installing the cache anyway would slice a "
+                f"parameter the half never tiered."
+            )
+        elif name in _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES:
+            reason = (
+                "GGUF-MoE (Ascend), MoeWNA16 and NVFP4 MoE have no load-time "
+                "offload half: the Ascend GGUF MoE method materializes and "
+                "pre-dequantizes on its own path (#123 covers the CUDA method "
+                "only), MoeWNA16's per-expert tensor layout was never "
+                "validated against the offload cache's slice/fetch path, and "
+                "the NVFP4 MoE layouts (#323b) are absent from "
+                "EXPERT_TENSOR_ATTRS and from "
+                "presplit_expert_offload_after_repack, so only part of each "
+                "expert would be staged -- installing the cache here would "
+                "either crash on an uninitialized parameter or silently run "
+                "with undefined per-expert weight contents."
+            )
+        else:
+            continue
+        layer_tag = f" (layer_id={layer_id})" if layer_id is not None else ""
+        raise RuntimeError(
+            f"MoE expert-offload (FLLIPER_MOE_RESIDENT_EXPERT_FRACTION < 1.0) "
+            f"is not supported for quant method {name!r}{layer_tag}. "
+            f"{reason} Supported quant paths for "
+            "--moe-resident-expert-fraction < 1.0: fp8, GPTQ (Marlin), AWQ "
+            "(Marlin), GGUF-MoE (CUDA, ggml types with a MoE kernel). Leave "
+            "--moe-resident-expert-fraction at 1.0 (or unset) for this "
+            "checkpoint's quant type, or use a supported quant path."
+        )
+
+
+# ===========================================================================
+# Stage-3: CUDA-graph-capturable routing math (host-sync-free).
+#
+# The eager offload path (run_waves) does per layer per step: topk_ids.tolist()
+# (D->H sync), Python set/sort/dict planning, and a per-(attr,expert) Python
+# copy loop -- none capturable. The functions below replace the single-wave
+# fast path with pure, fixed-shape tensor algebra over the 256-expert axis that
+# reproduces ExpertResidencyPlanner.resolve() + _build_lut + _remap BIT-FOR-BIT
+# (proven in tests/moe_offload/test_capturable_planner.py), plus the fetch
+# source indices for a single captured gather. All ops are scatter / cumsum /
+# gather over fixed axes (E, C) => no host sync, CUDA-graph capturable. They are
+# written to run identically on CPU tensors (for the unit test) and CUDA.
+# ===========================================================================
+
+
+def build_capturable_luts(
+    num_local_experts: int,
+    resident_count: int,
+    resident_slot: Optional[Dict[int, int]],
+    spill_pool_index: Optional[Dict[int, int]],
+    device="cpu",
+):
+    """Build the three frozen device-constant LUTs (int32[E]) the capturable
+    path gathers from. Pure derivation from the (already-frozen) residency maps.
+
+    resident_slot / spill_pool_index None => the static [0,R) layout
+    (resident e<R at slot==e; spill e>=R at pool row e-R). Otherwise the frozen
+    hot-set maps (from _freeze_hotset). Returns:
+      resident_slot_lut : int32[E]  slot in [0,R) for resident e, else -1
+      is_spill          : bool[E]   (resident_slot_lut < 0)
+      spill_pool_row_lut: int32[E]  pool row in [0,E-R) for spill e, else -1
+    """
+    import torch
+
+    E, R = int(num_local_experts), int(resident_count)
+    resident_slot_lut = torch.full((E,), -1, dtype=torch.int32)
+    spill_pool_row_lut = torch.full((E,), -1, dtype=torch.int32)
+    if resident_slot is None:
+        # Static [0,R): resident ids are exactly [0,R) at slot==id.
+        idx = torch.arange(R, dtype=torch.int32)
+        resident_slot_lut[:R] = idx
+        spill_pool_row_lut[R:E] = torch.arange(E - R, dtype=torch.int32)
+    else:
+        for e, s in resident_slot.items():
+            resident_slot_lut[int(e)] = int(s)
+        for e, r in spill_pool_index.items():
+            spill_pool_row_lut[int(e)] = int(r)
+    is_spill = resident_slot_lut < 0
+    return (
+        resident_slot_lut.to(device),
+        is_spill.to(device),
+        spill_pool_row_lut.to(device),
+    )
+
+
+def worst_case_unique_spill(
+    routed_slots: int, num_local_experts: int, resident_count: int
+) -> int:
+    """Scratch slots a captured step can need, exactly -- not conservatively.
+
+    ``prepare_capturable_remap`` assigns one scratch slot per DISTINCT routed
+    spill expert, so the requirement is bounded twice over: a step cannot route
+    more distinct experts than it has routed (token, k-slot) pairs, and it
+    cannot route more distinct SPILL experts than the cold set contains. The
+    binding bound is the smaller of the two.
+
+    layer.py used only the first, which is the loose one whenever a decode
+    bucket's ``tokens x top_k`` exceeds the cold set -- and under the #82 GGUF
+    expert-dim shard that is the common case, because ``forward_impl`` remaps
+    every FOREIGN expert id onto the resident zero-pad expert BEFORE the
+    offload sees it. The remapped ids that survive are drawn from this rank's
+    local table alone, so the cold set (``E - R``, both local counts) is the
+    real ceiling and the loose bound refuses captures that are provably safe.
+
+    Pure arithmetic over static shapes: no tensor is touched, so this is legal
+    on the capture path (it reads shapes, not contents).
+    """
+    slots = max(0, int(routed_slots))
+    cold = max(0, int(num_local_experts) - int(resident_count))
+    return min(slots, cold)
+
+
+def refuse_capturable_cold_tier(num_experts: int) -> None:
+    """#394 slice 2 graph seam: BOOT-PENDING, and say exactly what is missing.
+
+    Nothing here is blocked in principle, and the corrected canon says so: a
+    CUDA graph pins ADDRESSES, not CONTENTS, so a captured ``index_select``
+    over a stable device-addressable source replays correctly after the host
+    bytes change -- that is already how the local capturable path works
+    (:func:`device_view_of_pinned`, verified on this rig).
+
+    TWO links are missing, and the first is nearer than the docstring used to
+    admit.
+
+    1. **There is no peer source in the captured gather at all.**
+       :meth:`MoEExpertOffloadCache._issue_fetch_capturable` reads
+       ``_cap_pool_dev``, which is built from ``self._pinned`` -- this rank's
+       own rows. A DELEGATED expert has no row there, so the frozen
+       ``spill_pool_row_lut`` holds ``-1`` for it and the gather's index is
+       out of bounds. The eager ``_fetch`` covers this with
+       ``expert_id in self._remote_ids``, a host read of a Python set, which is
+       precisely what a capture cannot contain. Proven on CPU tensors in
+       ``tests/moe_offload/test_capture_desync_port.py`` -- no card required.
+    2. **The peer pointer is unverified.** The local pool is a torch
+       ``pin_memory()`` allocation, so its UVA device pointer equals its host
+       pointer and ``torch.as_tensor`` aliases it. A PEER's cold row lives in a
+       ``mmap`` that this process page-locked with ``cudaHostRegister``
+       instead; the device address for such a range is obtained from
+       ``cudaHostGetDevicePointer``, and whether ``is_pinned()``/``as_tensor``
+       reproduce the aliasing for it has NOT been exercised on hardware.
+       Capturing a graph over an address that has not been verified to alias is
+       the failure mode that cannot be detected after the fact: the graph
+       replays happily and reads whatever is at that address.
+
+    So the eager path is complete and the capturable installer refuses.
+    ``FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE=1`` is a development window's switch
+    past the refusal, not a performance option -- and past it, gap 1 is no
+    longer undefined behaviour: the remap clamps the index and counts the
+    breach on device, and ``moe/offload_capture_gate.py`` raises at the replay
+    boundary (see :meth:`MoEExpertOffloadCache.check_capture_breach`).
+    """
+    import logging
+
+    from flliper.srt.environ import envs
+
+    if envs.FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE.get():
+        logging.getLogger(__name__).warning(
+            "MoE cold tier (#394): capturing a decode graph over PEER-owned "
+            "cold rows (%d experts). TWO things are unproven: the captured "
+            "gather has no peer source (a routed delegated expert clamps to "
+            "local row 0 and trips the replay-boundary capture gate), and the "
+            "UVA device pointer for a cudaHostRegister'd mapping is "
+            "BOOT-PENDING. Verify the gathered rows against the eager path "
+            "before trusting any output.",
+            num_experts,
+        )
+        return
+    raise RuntimeError(
+        "FLLIPER_MOE_OFFLOAD_CUDA_GRAPH cannot yet be combined with the shared "
+        "cold tier (FLLIPER_MOE_COLD_TIER_SHM, #394 slice 2). Two gaps: (1) the "
+        "capturable scratch gather sources only THIS rank's pinned pool, so a "
+        "routed delegated expert has no row to gather -- the eager path's "
+        "`expert_id in self._remote_ids` branch is a host read a capture "
+        "cannot contain; (2) the UVA device pointer for the PEER segment's "
+        "cudaHostRegister'd mapping has not been verified on hardware. Both "
+        "are implementation gaps, not limits -- graphs pin addresses, not "
+        "contents. Run eager (--disable-cuda-graph), leave "
+        "FLLIPER_MOE_COLD_TIER_SHM unset, or set "
+        "FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE=1 in a card window to develop it."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Exact-size page-locked host buffers (host-RAM peak of the load-time presplit)
+# ---------------------------------------------------------------------------
+#
+# ``torch.empty(...).pin_memory()`` goes through ATen's CachingHostAllocator,
+# which rounds EVERY request up to the next power of two before it calls
+# cudaHostAlloc (ATen/core/CachingHostAllocator.h:302, ``PowerOf2Ceil``, torch
+# 2.11.0). The presplit allocates one pinned spill pool per layer per expert
+# tensor, so a spill pool that lands 1 % above 256 MiB is page-locked as
+# 512 MiB -- 48 layers x 3 tensors of that is ~18 GiB of host RAM nobody uses
+# (measured 19.09.: MoE vector 32/16/16 lifted the boot from 71 to 89-92 GiB and
+# tripped the 88 GiB RAM guard; 39/13/12 only fit because 311 rows x 1.6384 MB
+# happens to sit 0.5 % below 512 MiB).
+#
+# The buffers below are page-locked at their exact byte size: an anonymous
+# ``mmap`` (page aligned by construction) registered with ``cudaHostRegister``.
+# cudaPointerGetAttributes reports such a range as host memory, so
+# ``Tensor.is_pinned()`` is true for it, H2D copies take the DMA path, and under
+# UVA its device pointer equals the host pointer -- exactly what
+# ``device_view_of_pinned`` needs for the captured spill gather.
+_PINNED_EXACT_REGISTRY: dict = {}  # ptr -> nbytes of live registrations
+_CUDA_HOST_REGISTER_MAPPED = 0x02
+
+
+import mmap as _mmap
+
+
+class _PinnedMap(_mmap.mmap):
+    """The anonymous mapping behind one exact-size pool.
+
+    A plain ``mmap.mmap`` cannot be weakly referenced; this subclass can.
+    torch keeps it alive through the tensor's STORAGE (frombuffer holds its
+    buffer source), so a ``weakref.finalize`` on it fires exactly when the
+    LAST view of the pool is gone -- and unregisters the range before the
+    mapping is torn down. That lifetime is the whole point: a pool that is
+    rebuilt (hot set frozen from file, heat migration, a second presplit door)
+    must return its bytes when the old tensor is dropped -- fn6r (19.09.)
+    held every superseded pool in a registry and had 40 GiB page-locked on
+    TP0 by layer 19 of 48 (3.3 pools per layer instead of one)."""
+
+    def __new__(cls, nbytes: int):
+        return super().__new__(
+            cls, -1, nbytes, flags=_mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS
+        )
+
+
+def _pinned_exact_unregister(ptr: int) -> bool:
+    """Unregister ``ptr`` if it is a live registration; idempotent."""
+    nbytes = _PINNED_EXACT_REGISTRY.pop(ptr, None)
+    if nbytes is None:
+        return False
+    import torch
+
+    try:
+        torch.cuda.cudart().cudaHostUnregister(ptr)
+    except Exception:  # pragma: no cover - CUDA already torn down
+        pass
+    return True
+
+
+def pinned_exact_empty(shape, dtype):
+    """Uninitialised host tensor of ``shape``/``dtype``, page-locked at its
+    exact byte size (see the module comment). Without a CUDA context (desk
+    tests) it is a plain pageable tensor, like ``pin_memory()`` there."""
+    import torch
+
+    shape = tuple(int(d) for d in shape)
+    n = 1
+    for d in shape:
+        n *= d
+    nbytes = n * torch.empty((), dtype=dtype).element_size()
+    if nbytes == 0 or not torch.cuda.is_available():
+        return torch.empty(shape, dtype=dtype, device="cpu")
+    # Give back what torch's host cache still holds from the weight load
+    # before pinning new pages: the loader's pinned staging blocks sit in the
+    # CachingHostAllocator's free lists after use, and the presplit pools used
+    # to RECYCLE them (same power-of-two sizes). Exact pools cannot, so without
+    # this the cache stays resident on top of them -- fn6p (19.09.) peaked at
+    # 100 GiB host RAM and was OOM-killed at layer 19 of the presplit.
+    # empty_cache only frees blocks whose recorded events have completed, and
+    # nothing but an allocate() call polls those events any more once the
+    # pools stop going through the cache -- so complete them here first.
+    try:
+        torch.cuda.synchronize()
+    except Exception:  # pragma: no cover - no CUDA context
+        pass
+    release_torch_host_cache()
+    import weakref
+
+    mm = _PinnedMap(nbytes)
+    flat = torch.frombuffer(mm, dtype=torch.uint8)
+    ptr = flat.data_ptr()
+    err = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, _CUDA_HOST_REGISTER_MAPPED)
+    if int(err) != 0:
+        mm.close()
+        raise RuntimeError(
+            f"cudaHostRegister({nbytes} bytes) failed with cudaError {int(err)}"
+        )
+    _PINNED_EXACT_REGISTRY[ptr] = nbytes
+    # The storage holds ``mm``; when the last view of it dies, the finalizer
+    # unregisters the range BEFORE the mapping is torn down.
+    fin = weakref.finalize(mm, _pinned_exact_unregister, ptr)
+    fin.atexit = False
+    _log_pinned_exact_milestone(nbytes)
+    return flat.view(dtype).view(shape)
+
+
+_PINNED_EXACT_MILESTONE_GIB = 4
+_pinned_exact_next_milestone = [_PINNED_EXACT_MILESTONE_GIB << 30]
+
+
+def _cgroup_anon_shmem_gib():
+    """(anon, shmem) GiB charged to this process's cgroup (-1, -1 = unknown)."""
+    try:
+        with open("/proc/self/cgroup") as f:
+            path = f.read().strip().split(":", 2)[-1]
+        vals = {}
+        with open(f"/sys/fs/cgroup{path}/memory.stat") as f:
+            for line in f:
+                k, v = line.split()
+                if k in ("anon", "shmem"):
+                    vals[k] = int(v) / (1 << 30)
+        return vals.get("anon", -1.0), vals.get("shmem", -1.0)
+    except Exception:
+        return -1.0, -1.0
+
+
+def _log_pinned_exact_milestone(nbytes: int) -> None:
+    """One line per 4 GiB of exact pools: where the host RAM really sits
+    (fn6p/fn6q 19.09.: TP0 was OOM-killed mid-presplit with nothing in the
+    log saying which allocator held the bytes)."""
+    total = pinned_exact_bytes()
+    if total < _pinned_exact_next_milestone[0]:
+        return
+    while total >= _pinned_exact_next_milestone[0]:
+        _pinned_exact_next_milestone[0] += _PINNED_EXACT_MILESTONE_GIB << 30
+    import logging
+
+    anon, shmem = _cgroup_anon_shmem_gib()
+    logging.getLogger(__name__).info(
+        "[pinned-exact] %.1f GiB page-locked exactly (last +%.0f MiB); torch host "
+        "allocator %.1f GiB; cgroup anon %.1f GiB shmem %.1f GiB",
+        total / (1 << 30), nbytes / (1 << 20),
+        torch_host_cache_reserved_bytes() / (1 << 30), anon, shmem,
+    )
+
+
+def pinned_exact_release(tensor):
+    """Unregister and unmap a buffer from :func:`pinned_exact_empty` once no
+    view of it is used any more (the caller's promise). No-op for others."""
+    return _pinned_exact_unregister(tensor.data_ptr())
+
+
+def release_torch_host_cache() -> None:
+    """Free the CachingHostAllocator's cached (unused) pinned blocks."""
+    import torch
+
+    fn = getattr(torch._C, "_host_emptyCache", None)
+    if fn is not None:
+        fn()
+
+
+def torch_host_cache_reserved_bytes() -> int:
+    """Bytes torch's CachingHostAllocator currently holds (-1 = unknown).
+
+    torch 2.11 exposes the raw stats as nested dicts (``allocated_bytes``
+    counts live blocks plus the ones whose deferred free has not been processed
+    yet; ``reserved_bytes`` is present on builds that track it)."""
+    import torch
+
+    fn = getattr(torch._C, "_cuda_hostMemoryStats", None)
+    if fn is None:
+        return -1
+    try:
+        stats = fn()
+    except Exception:  # pragma: no cover - no CUDA context
+        return -1
+    for key in ("reserved_bytes", "allocated_bytes"):
+        entry = stats.get(key) if hasattr(stats, "get") else None
+        if isinstance(entry, dict) and "current" in entry:
+            return int(entry["current"])
+    return -1
+
+
+def pinned_exact_bytes():
+    """Bytes currently page-locked through :func:`pinned_exact_empty`."""
+    return sum(_PINNED_EXACT_REGISTRY.values())
+
+
+class _PinnedDeviceViewHolder:
+    """Minimal ``__cuda_array_interface__`` producer used to alias PINNED host
+    memory as a CUDA tensor (UVA zero-copy). Under CUDA UVA every page-locked
+    allocation (torch ``pin_memory``) is device-addressable at the SAME virtual
+    address, so a CUDA gather kernel can read it directly across PCIe. Verified
+    empirically on this rig (torch 2.11/cu130): ``torch.as_tensor`` aliases the
+    pointer without copying, and a graph-captured ``index_select`` sourcing the
+    view honors post-capture host-content changes bit-identically."""
+
+    def __init__(self, ptr: int, nbytes: int):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (ptr, False),
+            "version": 3,
+            "strides": None,
+        }
+
+
+def _h2d_i64(arr, device):
+    """A small int64 vector on ``device`` WITHOUT a host-blocking copy: staged
+    through a pinned tensor from torch's caching host allocator (event-tracked
+    reuse) and copied non_blocking. On a non-CUDA device: the plain tensor."""
+    import numpy as np
+    import torch
+    n = int(len(arr))
+    if getattr(device, "type", str(device)) != "cuda" and str(device) != "cuda":
+        return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.int64))
+    host = torch.empty((n,), dtype=torch.int64, pin_memory=True)
+    if n:
+        host.numpy()[:] = arr
+    return host.to(device, non_blocking=True)
+
+
+_WAVE_T = {"on": None, "ev": [], "fetch_ms": 0.0, "apply_ms": 0.0, "layers": 0, "spill": 0,
+           "tokens": 0, "forwards0": 0}
+# The layer that opens a forward on THIS pipeline stage (see prefill_timing):
+# keying on layer 0 left every stage but the first without a single line.
+_WAVE_T_HEAD = StageHead()
+_WAVE_TP_HEAD = StageHead()
+
+
+def _wave_timing_on() -> bool:
+    if _WAVE_T["on"] is None:
+        import os
+        _WAVE_T["on"] = str(os.environ.get("FLLIPER_MOE_OFFLOAD_TIMING", "0")).strip() not in ("", "0")
+    return bool(_WAVE_T["on"])
+
+
+def _wave_timing_note(layer_id, e0, e1, e2, n_spill, n_tokens):
+    """Collect one layer's (fetch, apply) event pair; every 16 forwards of
+    layer 0 synchronize ONCE, sum the elapsed times and log the split."""
+    import logging
+    import torch
+    t = _WAVE_T
+    t["ev"].append((e0, e1, e2))
+    t["spill"] += int(n_spill)
+    head = _WAVE_T_HEAD.opens_forward(layer_id)
+    if head:
+        t["forwards0"] += 1
+        t["tokens"] += int(n_tokens)
+    if head and t["forwards0"] % 16 == 0:
+        # fnFL2 H67: event-scoped with FLLIPER_PDFLIP_ENABLE_TIMING_EVENT_FLUSH
+        # (a device-wide wait here joins the pending PP send, see flush_wait)
+        flush_wait(
+            [e for tri in t["ev"] for e in tri],
+            instrument="moe",
+            forward=t["forwards0"],
+        )
+        f = sum(a.elapsed_time(b) for a, b, _c in t["ev"])
+        g = sum(b.elapsed_time(c) for _a, b, c in t["ev"])
+        n = len(t["ev"])
+        logging.getLogger(__name__).info(
+            "MOE-OFFLOAD-TIMING forwards=%d layers=%d tokens=%d fetch_ms=%.1f apply_ms=%.1f "
+            "per_forward: fetch_ms=%.2f apply_ms=%.2f spill_experts=%.1f (CUDA events: fetch = "
+            "host->scratch incl. the join, apply = the grouped GEMM over the wave)",
+            t["forwards0"], n, t["tokens"], f, g, f / 16.0, g / 16.0, t["spill"] / 16.0)
+        t["ev"].clear(); t["spill"] = 0; t["tokens"] = 0
+
+
+_WAVE_TP = {"ev": [], "layers": 0, "waves": 0, "spill": 0, "tokens": 0, "forwards": 0}
+_WAVE_SLICE = {"pairs": None}
+_PARTIALS_MODE = {"mode": None}
+
+
+def partials_mode() -> str:
+    """FLLIPER_MOE_OFFLOAD_PARTIALS: 'table' (default) keeps the [T*K, H]
+    partials table and combines once at the end (byte-identical to the
+    token-major path); 'stream' accumulates every slice straight into a
+    [T, H] fp32 output (index_add_), which drops the T*K*H table -- 1.7 GB at
+    a 32768-token chunk with top-k 10 -- at the price of fp32 summation order
+    instead of the combine kernel's. Prefill chunks beyond 16k need it on TP0
+    (fn6v 19.09.: OOM before the first wave)."""
+    if _PARTIALS_MODE["mode"] is None:
+        import os
+
+        v = str(os.environ.get("FLLIPER_MOE_OFFLOAD_PARTIALS", "table")).strip().lower()
+        _PARTIALS_MODE["mode"] = "stream" if v == "stream" else "table"
+    return _PARTIALS_MODE["mode"]
+
+
+def wave_token_slice_pairs() -> int:
+    """FLLIPER_MOE_OFFLOAD_WAVE_SLICE: (token, expert) pairs one grouped GEMM of
+    an expert-major wave may take at once; 0 = whole wave (the old behaviour).
+
+    Why: the expert stream is paid ONCE per chunk (fn6u 19.09.: 18.7 GiB on
+    TP0 per forward, 8.1 s of fetch against 0.8 s of GEMM over the needle's
+    forwards), so a 4x larger prefill chunk buys 4x fewer host->device bytes
+    per token -- but the grouped GEMM's workspace (Marlin) grows with the
+    tokens of the wave, and a 16384-token chunk already OOMed a 3080 (fn6m,
+    514 MiB short). Slicing the wave's tokens keeps that workspace at the
+    slice's size while the wave's experts stay resident in scratch for all
+    slices. Default 81920 pairs = 8192 tokens x top-k 10 = the shape that fits."""
+    if _WAVE_SLICE["pairs"] is None:
+        import os
+
+        raw = str(os.environ.get("FLLIPER_MOE_OFFLOAD_WAVE_SLICE", "81920")).strip()
+        try:
+            _WAVE_SLICE["pairs"] = max(0, int(raw))
+        except ValueError:
+            _WAVE_SLICE["pairs"] = 81920
+    return int(_WAVE_SLICE["pairs"])
+
+
+def _wave_timing_note_prefill(layer_id, wave_events, n_spill, n_tokens):
+    """Expert-major prefill: collect one layer's per-wave (fetch, apply) event
+    triples; when the NEXT forward starts (layer 0 again) synchronize once, sum
+    and log the forward's split. That is the decomposition the 'Prefill rank
+    batch ... compute' figure hides: how much of a chunk's compute is the
+    expert stream (host -> scratch over PCIe) and how much the grouped GEMM."""
+    import logging
+    import torch
+
+    t = _WAVE_TP
+    head = _WAVE_TP_HEAD.opens_forward(layer_id)
+    if head and t["ev"]:
+        # fnFL2 H67: this flush runs at the head layer INSIDE the next forward;
+        # a device-wide synchronize here also joined the pending PP proxy send
+        # (flush_wait's docstring). Event-scoped with
+        # FLLIPER_PDFLIP_ENABLE_TIMING_EVENT_FLUSH.
+        flush_wait(
+            [e for tri in t["ev"] for e in tri],
+            instrument="moe_prefill",
+            forward=t["forwards"] + 1,
+        )
+        f = sum(a.elapsed_time(b) for a, b, _c in t["ev"])
+        g = sum(b.elapsed_time(c) for _a, b, c in t["ev"])
+        t["forwards"] += 1
+        logging.getLogger(__name__).info(
+            "MOE-OFFLOAD-TIMING-PREFILL forward=%d tokens=%d layers=%d waves=%d "
+            "spill_experts=%d fetch_ms=%.1f apply_ms=%.1f (CUDA events per wave: "
+            "fetch = host->scratch incl. the join, apply = grouped GEMM of the wave)",
+            t["forwards"], t["tokens"], t["layers"], t["waves"], t["spill"], f, g,
+        )
+        t["ev"].clear(); t["layers"] = t["waves"] = t["spill"] = t["tokens"] = 0
+    t["ev"].extend(wave_events)
+    t["layers"] += 1
+    t["waves"] += len(wave_events)
+    t["spill"] += int(n_spill)
+    if head:
+        t["tokens"] = int(n_tokens)
+
+
+_FETCH_SYNC = {"on": None}
+
+
+def fetch_sync_on() -> bool:
+    """FLLIPER_MOE_OFFLOAD_FETCH_SYNC=1: host-synchronize after every joined
+    fetch (Task #49 probe switch, default off; costs prefill throughput)."""
+    if _FETCH_SYNC["on"] is None:
+        import os
+
+        _FETCH_SYNC["on"] = str(os.environ.get("FLLIPER_MOE_OFFLOAD_FETCH_SYNC", "0")).strip().lower() in ("1", "true", "on")
+    return _FETCH_SYNC["on"]
+
+
+def _fetch_mode() -> str:
+    """FLLIPER_MOE_OFFLOAD_FETCH: 'gather' (default, Task #33) or 'memcpy'."""
+    import os
+    v = str(os.environ.get("FLLIPER_MOE_OFFLOAD_FETCH", "gather")).strip().lower()
+    return "memcpy" if v == "memcpy" else "gather"
+
+
+#: rc12c (NF D TP0, 27.09. 01:22:13Z "MoE offload gather fetch failed ...
+#: Tried to allocate 158.00 MiB"): the gather fetch materialised
+#: ``index_select(pool, rows)`` as a FRESH temporary per call -- up to all
+#: fetched rows of one tensor (158 MiB at 100 rows of w13) -- on the copy
+#: stream of THAT layer's cache. 48 layers = 48 copy streams, and the caching
+#: allocator hands a freed block only to its own stream again, so every
+#: stream kept its own cached temporaries the compute stream could never
+#: reuse (VRAM-PEAK round n=18: reserved +766 MiB of NEW segments beside 1145
+#: MiB cached). ONE persistent ring per (device, dtype, row shape) replaces
+#: them: the gather runs in chunks of ``GATHER_RING_ROWS`` rows through it,
+#: and an event recorded after each use orders the next user stream behind it
+#: (the PCIe link serialises these copies anyway). 16 rows of the NF w13 are
+#: ~25 MiB, all four tensors ~39 MiB per rank -- a fixed post the awake rest
+#: (pdflip/d_awake_rest.py) measures, where the temporaries were not.
+GATHER_RING_ROWS = 16
+_GATHER_RINGS: dict = {}
+
+
+def gather_rows_into(dst, slots_t, pool_dev, rows_t, *, ring_rows: int, stream=None) -> None:
+    """``dst[slots_t] = pool_dev[rows_t]`` through the shared ring, chunk by
+    chunk -- byte-identical to ``dst.index_copy_(0, slots_t,
+    torch.index_select(pool_dev, 0, rows_t))`` without its temporary. The ring
+    is allocated once (on first use) and never freed, so no per-stream cached
+    block is left behind; ``stream`` (the copy stream issuing this gather)
+    waits for the ring's previous user and records the next event."""
+    import torch
+
+    n = int(rows_t.numel())
+    if n == 0:
+        return
+    key = (str(dst.device), dst.dtype, tuple(dst.shape[1:]))
+    entry = _GATHER_RINGS.get(key)
+    if entry is None:
+        entry = [
+            torch.empty((int(ring_rows),) + tuple(dst.shape[1:]), dtype=dst.dtype, device=dst.device),
+            None,
+        ]
+        _GATHER_RINGS[key] = entry
+    ring, last = entry
+    if stream is not None and last is not None:
+        stream.wait_event(last)
+    k = int(ring.shape[0])
+    for a in range(0, n, k):
+        b = min(n, a + k)
+        buf = ring[: b - a]
+        torch.index_select(pool_dev, 0, rows_t[a:b], out=buf)
+        dst.index_copy_(0, slots_t[a:b], buf)
+    if stream is not None:
+        ev = torch.cuda.Event()
+        ev.record(stream)
+        entry[1] = ev
+
+
+def device_view_of_pinned(pinned):  # pragma: no cover - requires CUDA
+    """Return a CUDA tensor aliasing ``pinned`` (no copy; UVA zero-copy view).
+
+    The view has the same shape/dtype and a stable device pointer (== the host
+    pointer), so it can be baked into a CUDA graph as the SOURCE of the scratch
+    gather (design §4). Caller must keep ``pinned`` alive for the view's life.
+    """
+    import torch
+
+    # #396(a): a lazy cold tier CANNOT be handed out as a raw device view. The
+    # whole point of this function is to bake the pool's ADDRESS into a CUDA
+    # graph, and a captured graph then reads that memory directly -- it never
+    # goes through ``LazySpillPool.__getitem__``, so a row nobody happened to
+    # touch first would be read as allocation garbage, at full speed, with no
+    # error anywhere. That is precisely the silent-wrong-expert outcome the
+    # lazy tier's loud-failure rule exists to prevent, so the combination is
+    # refused here rather than left to produce plausible output.
+    from flliper.srt.layers.moe.lazy_expert_staging import LazySpillPool
+
+    if isinstance(pinned, LazySpillPool):
+        raise RuntimeError(
+            "device_view_of_pinned: the cold expert tier is lazily staged "
+            "(FLLIPER_EXPERT_LAZY_STAGING), which cannot be combined with the "
+            "capturable spill pool (FLLIPER_MOE_OFFLOAD_CUDA_GRAPH): a captured "
+            "graph reads the pool's memory by address and would bypass the "
+            "materialize-on-first-touch accessor entirely, returning "
+            "uninitialized rows for every expert not touched before capture. "
+            "Turn one of the two off."
+        )
+    if not pinned.is_pinned():
+        raise RuntimeError("device_view_of_pinned: tensor is not page-locked")
+    if not pinned.is_contiguous():
+        raise RuntimeError("device_view_of_pinned: tensor must be contiguous")
+    nbytes = pinned.numel() * pinned.element_size()
+    holder = _PinnedDeviceViewHolder(pinned.data_ptr(), nbytes)
+    dev_bytes = torch.as_tensor(holder, device="cuda")
+    if dev_bytes.data_ptr() != pinned.data_ptr():
+        raise RuntimeError(
+            "device_view_of_pinned: torch.as_tensor copied instead of aliasing "
+            "(UVA zero-copy unavailable?); cannot build a capturable spill pool"
+        )
+    return dev_bytes.view(pinned.dtype).view(pinned.shape)
+
+
+def prepare_capturable_remap(
+    topk_ids,
+    resident_slot_lut,
+    is_spill,
+    spill_pool_row_lut,
+    resident_count: int,
+    scratch: int,
+    breach_counter=None,
+):
+    """Fixed-shape, host-sync-free reproduction of resolve()+_build_lut+_remap
+    for the single-wave case. Returns (remapped_topk_ids, src_row, num_spill):
+
+      remapped_topk_ids : like topk_ids; global expert id -> resident/scratch
+                          slot (-1 padding preserved). Bit-identical to the
+                          eager _remap output.
+      src_row           : int32[C]; src_row[j] = pinned-pool row to gather into
+                          scratch slot j (global slot R+j). Unused slots => 0
+                          (harmless: no topk_id maps there).
+      num_spill         : int32 scalar (device); # unique spill experts routed.
+
+    Correctness (see test_capturable_planner.py): the cumsum-rank over the
+    ascending expert-id axis reproduces resolve()'s sorted(spill)->R+i loop
+    index i exactly, so scratch-slot assignment and remap match the eager path.
+
+    ``breach_counter`` is an optional int32 device tensor, supplied ONLY under
+    the #394 cold tier's development seam. Without it (every default launch)
+    this function is unchanged, statement for statement. With it, a cold expert
+    whose ``spill_pool_row_lut`` entry is ``-1`` -- i.e. one DELEGATED to a
+    peer's segment, for which this rank has no row -- is counted into the
+    tensor and its index is clamped to a valid row, so the captured gather
+    reads a wrong-but-in-bounds expert instead of walking off the pool. The
+    count is what makes that survivable: ``offload_capture_gate`` reads it at
+    the replay boundary and raises. Counting on device and reading at the
+    boundary is the #431 pattern -- the alternative, testing the condition
+    here, is a host read inside a capture.
+    """
+    import torch
+
+    E = int(resident_slot_lut.shape[0])
+    R, C = int(resident_count), int(scratch)
+    device = topk_ids.device
+    idsf = topk_ids.reshape(-1)
+    valid = idsf >= 0
+    clamped = idsf.clamp(min=0).to(torch.long)
+
+    # (1) presence over experts via accumulate-scatter of 1s (padding adds 0).
+    presence = torch.zeros(E, dtype=torch.int32, device=device)
+    presence.index_put_((clamped,), valid.to(torch.int32), accumulate=True)
+    present = presence > 0
+    spill_present = present & is_spill  # bool[E]
+
+    # (2) sorted scratch-slot assignment via cumulative rank over ascending id.
+    rank = torch.cumsum(spill_present.to(torch.int32), dim=0) - 1  # int32[E]
+    num_spill = spill_present.to(torch.int32).sum()
+
+    # (3) fetch source rows: src_row[rank[e]] = pool_row(e) for present spill e.
+    #     Non-spill entries are routed to a trash slot C and discarded.
+    dst = torch.where(
+        spill_present,
+        rank.clamp(0, C - 1),
+        torch.full_like(rank, C),
+    ).to(torch.long)
+    src_row_ext = torch.zeros(C + 1, dtype=torch.int32, device=device)
+    src_row_ext.index_put_((dst,), spill_pool_row_lut, accumulate=False)
+    src_row = src_row_ext[:C].contiguous()
+
+    # (3b) #394 seam only: a delegated expert carries pool row -1. Count it on
+    # device (read at the replay boundary) and clamp so the gather stays in
+    # bounds. Unused slots hold 0 from the zeros() above, so only slots a
+    # routed spill expert actually claimed can be negative -- no `< num_spill`
+    # mask is needed, and adding one would cost an extra arange per step.
+    if breach_counter is not None:
+        # add_, not `+=`: the counter's ADDRESS is what the graph captures, so
+        # the accumulation has to land in that buffer rather than rebind a name.
+        breach_counter.add_((src_row < 0).to(breach_counter.dtype).sum())
+        src_row = src_row.clamp(min=0)
+
+    # (4) global-id -> slot LUT + remap (replaces _build_lut/_remap, no loop).
+    slot_of = torch.where(is_spill, R + rank, resident_slot_lut)  # int32[E]
+    remapped = torch.where(
+        topk_ids >= 0,
+        slot_of[topk_ids.clamp(min=0).to(torch.long)].to(topk_ids.dtype),
+        topk_ids,
+    )
+    return remapped, src_row, num_spill
+
+
+class MoEExpertOffloadCache:
+    """Tensor-level wrapper around ExpertResidencyPlanner for a FusedMoE layer.
+
+    Wiring lives here (built during the GPU window). It expects the layer's
+    stacked expert tensors (w13_weight/w2_weight [+scales]) and moves the full
+    set to a pinned host pool, allocating a resident buffer of n_slots experts.
+
+    NOTE: the tensor path requires CUDA and is exercised in the GPU window; the
+    planner/wave bookkeeping carries all correctness-critical logic and is
+    tested on CPU now (tests/moe_offload/test_planner.py).
+    """
+
+    #: fnFL2 H29b: P notes its tail routing (set per instance in __init__)
+    _route_note = False
+    #: H31b: the Pad+Extra rows this pool layer has NOT loaded yet (DeferredRows)
+    _deferred_rows = None
+    #: H107: armed by run_eager_pool for one eager forward (set per instance)
+    _eager_lru_armed = False
+
+    #: names of the stacked per-expert tensors to pool/fetch (dim 0 == expert).
+    EXPERT_TENSOR_ATTRS = (
+        # FP8 / triton fused path (M-B original).
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale",
+        "w2_weight_scale",
+        "w13_weight_scale_inv",
+        "w2_weight_scale_inv",
+        # Optional fp8 expert biases (GPT-OSS-style). Expert-major like the
+        # weights, and read by the triton runner at the SLOT index that the
+        # offload remap produces -- so a full [E] bias next to a [R+C] weight
+        # buffer would pair every expert with the wrong bias. Stage them.
+        "w13_weight_bias",
+        "w2_weight_bias",
+        # GPTQ-Int4 Marlin path (Variant-C B2b): the POST-repack marlin tensors.
+        # The apply kernel reads these; for GPTQ qzeros is unused (sym) and g_idx
+        # is empty (desc_act=False). All are expert-major (dim 0 == num_experts)
+        # and per-expert sliceable in the marlin layout.
+        "w13_qweight",
+        "w2_qweight",
+        "w13_scales",
+        "w2_scales",
+        # AWQ-Int4 Marlin path (same qwen3_5_moe fused_marlin_moe path, used for
+        # the small-model cross-fraction proof): AWQ is asymmetric, so the marlin
+        # apply ALSO reads the per-expert zero-points -> stage them too. Tensors
+        # absent for a given quant method are skipped by the shape check below.
+        "w13_qzeros",
+        "w2_qzeros",
+        # compressed-tensors WNA16 Marlin path (WP2, Qwen3.8-Flash-Next AWQ/GPTQ
+        # INT4 as llm-compressor writes it): the same post-repack marlin tensors
+        # under compressed-tensors' names. Scales reuse "w13_weight_scale" /
+        # "w2_weight_scale" above; the zero points exist only for asymmetric
+        # checkpoints and are read per expert by the marlin apply. The NVFP4
+        # schemes that also name "w13_weight_packed" stay refused by class name
+        # (_OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES) before any staging.
+        "w13_weight_packed",
+        "w2_weight_packed",
+        "w13_weight_zero_point",
+        "w2_weight_zero_point",
+        # H68b: ModelOpt NVFP4 on the Marlin path (the one NVFP4 layout with a
+        # load-time half, see _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES). Its
+        # packed E2M1 stacks and E4M3 block scales reuse "w13_weight" /
+        # "w13_weight_scale" above; the per-expert GLOBAL scales are the only
+        # new expert-major tensors. The kernel reads them at the SLOT index the
+        # remap produces, so a full [E] vector next to [R+C] weights would pair
+        # every expert with another expert's global scale -- the #323b defect.
+        # [E, 1] after the repack (one row per expert, see
+        # prepare_moe_nvfp4_layer_for_marlin_inplace). input_scale stays out:
+        # global (all experts on every rank) and unread by Marlin.
+        "w13_weight_scale_2",
+        "w2_weight_scale_2",
+    )
+
+    def __init__(self, layer, fraction: float):
+        self.layer = layer
+        self.fraction = fraction
+        # E: captured BEFORE install shrinks layer.num_local_experts. A prior
+        # load-time presplit stashes the real E on the layer; else read it now.
+        presplit = getattr(layer, "_moe_offload_presplit", None)
+        self.num_local_experts = int(
+            getattr(layer, "_moe_offload_full_experts", None)
+            or getattr(layer, "num_local_experts")
+        )
+        self.resident_count = resident_slot_count(self.num_local_experts, fraction)
+        self.scratch = scratch_slot_count(
+            self.resident_count, self.num_local_experts
+        )
+        # #93: WER RESIDENT IST, STEHT IM HOTSET -- der Planner darf nicht
+        # weiter `resident == [0, R) at slot==id` annehmen (Zeile ~524).
+        # Seit #92 sind die Residenten die Hotset-Ids (bei w22 u.a. 320..369),
+        # und ein residenter Experte mit Id 370 landete im 32-zeiligen
+        # Scratch: "IndexError: index 370 is out of bounds for dimension 0
+        # with size 32". Der Planner hat den Zweig fuer genau diesen Fall
+        # ("Hot residency: resident == frozen id set at its assigned slot"),
+        # er bekam die Menge nur nie.
+        _hot_local = _hotset_local_ids(layer, self.num_local_experts)
+        self.planner = ExpertResidencyPlanner(
+            num_local_experts=self.num_local_experts,
+            resident_count=self.resident_count,
+            scratch=self.scratch,
+            resident_ids=frozenset(_hot_local) if _hot_local else None,
+        )
+        self._pinned: Dict[str, "object"] = {}  # attr -> pinned spill [E-R,...]
+        self._resident: Dict[str, "object"] = {}  # attr -> GPU buffer [R+C,...]
+        self._stream = None
+        self._installed = False
+        # WP8 lookahead: what each scratch slot currently holds (slot -> expert),
+        # written by every fetch on every route so a sticky resolve can trust
+        # it; cleared whenever the buffers are physically rearranged.
+        self._scratch_holds: Dict[int, int] = {}
+        # Task #49 (20.09.): with FLLIPER_NAN_GUARD=1 every forward records the
+        # routing and the per-wave slot assignment here, so that when the MoE
+        # output goes non-finite the '[nan-disc2]' group can say WHICH expert
+        # the bad rows share and WHICH slot it was reading. None when the guard
+        # is off -- then nothing is recorded and nothing is paid.
+        self._nan_trace: Optional[Dict[str, "object"]] = None
+        # Device-planned expert pool (vLLM #56177 port, 19.09.): tables, step
+        # buffers and the UVA views of the spill pool; built by install_pool().
+        self._pool_ready = False
+        self._pool_tables = None
+        self._pool_buffers = None
+        # fnFL2 H29b: on P, every eager forward notes its tail routing for D's
+        # LRU warm after the wake (pdflip/decode_warm_handoff). False off P or
+        # with FLLIPER_PDFLIP_LRU_WARM_FROM_HANDOFF=0 -- then nothing is paid.
+        self._route_note = _route_note_armed(layer, self.num_local_experts)
+        self._pool_srcs = None
+        self._pool_dsts = None
+        self._pool_view_holders = []
+        # Speculative expert prefetch (FLLIPER_MOE_POOL_PREFETCH=1, default off):
+        # own step buffers, because the gather list the side stream copies from
+        # must survive while the real step writes the layer's normal buffers.
+        self._pool_pf_buffers = None
+        self._pool_pf_begin = None  # main -> side: x_L is ready
+        self._pool_pf_done = None  # side -> main: the predicted rows are in
+        self._pool_pf_armed = False
+        # #276 heat record (FLLIPER_DEBUG_MOE_HEAT, default off): the device
+        # histogram of the captured step's routed ids (layers/moe/pool_heat).
+        # None = off: prepare_pool then adds no op to the captured step.
+        self._pool_heat = None
+        self._pool_heat_ones = None
+        # H95: (n_ids -> waves) the captured steps of this layer were built
+        # with, for the capture log line and the demand probe.
+        self._pool_waves_seen: Dict[int, int] = {}
+        # H95c: extra LRU rows at the end of the bank whose pages follow D's
+        # phase seat count (pdflip/d_seat_vram.py); 0 = the bank of H95 B. Set
+        # by the presplit that allocated the [R+C+X] buffer.
+        self.seat_rows = int(getattr(layer, "_pdflip_seat_rows", 0) or 0)
+        # #251c: the seat rows the step being CAPTURED may count as ON (set by
+        # pool_waves per captured forward; 0 = the live count)
+        self._pool_capture_on = 0
+        from flliper.srt.environ import envs as _envs
+
+        self.lookahead_sticky = int(_envs.FLLIPER_MOE_EXPERT_LOOKAHEAD.get()) > 0
+
+        # --- Stage-1 hot-expert residency ----------------------------------
+        # When enabled, per-expert routing counts are accumulated over the first
+        # `_hot_calib_steps` forwards; then the R hottest experts are frozen as
+        # the resident set and the buffers are physically rearranged so those
+        # experts sit in [0,R) and the rest form the spill pool. `_spill_pool_index`
+        # maps a (cold) global expert id -> its row in the pinned spill pool
+        # (identity `id-R` in the static/default layout). See _freeze_hotset.
+        from collections import Counter as _Counter
+
+        from flliper.srt.environ import envs
+
+        self._hot_enabled = bool(envs.FLLIPER_MOE_HOT_RESIDENCY.get())
+        self._hot_calib_steps = max(1, int(envs.FLLIPER_MOE_HOT_CALIB_STEPS.get()))
+        self._hot_counts = _Counter()
+        self._hot_seen = 0
+        self._hot_frozen = False
+        self._spill_pool_index: Optional[Dict[int, int]] = None  # None => id-R
+
+        # --- #302a Stage-2 heat migration -----------------------------------
+        # Stage-1 above freezes a residency choice once. This keeps re-ranking
+        # it against a decayed window of live routing, swapping EQUAL COUNTS
+        # (hot in, cold out) so residency size -- the #439 sizing latch's
+        # invariant -- never moves. Off by default; the default path pays one
+        # `if self._heat is not None` per forward.
+        from flliper.srt.layers.moe.expert_heat_migration import (
+            HeatMigrationConfig,
+            HeatWindow,
+            refuse_heat_migration_under_graph_capture,
+        )
+
+        heat_cfg = HeatMigrationConfig.from_env()
+        refuse_heat_migration_under_graph_capture(heat_cfg)
+        self._heat: Optional[HeatWindow] = (
+            HeatWindow(heat_cfg) if heat_cfg.enabled else None
+        )
+
+        # --- #123-GGUF: residency decided at LOAD time -----------------------
+        # A load-time stager that could not use the plain [0,R) layout (the GGUF
+        # uneven-TP shard must keep its zero-padding expert resident) publishes
+        # the layout it actually built. Adopt it verbatim: the buffers on the
+        # layer are ALREADY arranged that way, so this is a map install, not a
+        # rearrange. Marked frozen so live hot calibration never permutes
+        # buffers whose physical layout the stager chose.
+        layout = getattr(layer, "_moe_offload_frozen_layout", None)
+        if layout is not None:
+            resident_ids, spill_ids = layout
+            if len(resident_ids) != self.resident_count:
+                raise RuntimeError(
+                    f"load-time residency layout has {len(resident_ids)} "
+                    f"resident experts but this cache computed "
+                    f"{self.resident_count} at fraction {fraction} over "
+                    f"{self.num_local_experts} experts -- the stager and the "
+                    f"installer disagree (did the fraction change between "
+                    f"load and install?)"
+                )
+            self.planner.resident_ids = frozenset(int(e) for e in resident_ids)
+            self.planner.resident_slot = {int(e): i for i, e in enumerate(resident_ids)}
+            self._spill_pool_index = {int(e): j for j, e in enumerate(spill_ids)}
+            self._hot_frozen = True
+        store_index = getattr(layer, "_moe_offload_store_index", None)
+        if store_index:
+            # Task #47 step 1: spill rows are GLOBAL ids in the shared store.
+            # A static [0,R) layout gets its resident maps spelled out so the
+            # freeze invariant (both maps or neither) holds.
+            if self.planner.resident_slot is None:
+                self.planner.resident_ids = frozenset(range(self.resident_count))
+                self.planner.resident_slot = {e: e for e in range(self.resident_count)}
+            self._spill_pool_index = {int(e): int(r) for e, r in store_index.items()}
+            self._hot_frozen = True
+
+        # #394: cold experts a peer's host tier owns. Adopted as a planner
+        # guard, not as state: without a shared tier this rank simply has no
+        # row for them, and the named error is worth far more than the KeyError
+        # it replaces.
+        delegated = getattr(layer, "_moe_offload_delegated_experts", None)
+        if delegated:
+            self.planner.delegated_ids = frozenset(int(e) for e in delegated)
+
+        # #394 slice 2: turn that guard into a fetch route when the shared cold
+        # tier is on. ``resolver_for_layer`` returns None on every launch that
+        # did not ask for the tier, so the default path takes one attribute
+        # read and keeps the refusal above.
+        self._cold_tier = None
+        self._remote_ids: frozenset = frozenset()
+        if delegated:
+            from flliper.srt.layers.moe.cold_tier_fetch import resolver_for_layer
+
+            resolver = resolver_for_layer(layer)
+            if resolver is not None:
+                self._cold_tier = resolver
+                self._remote_ids = resolver.remote_ids
+                self.planner.delegated_reachable = True
+                missing = self.planner.delegated_ids - self._remote_ids
+                if missing:
+                    raise RuntimeError(
+                        f"the staging plan delegated experts {sorted(missing)} "
+                        f"but the cold-tier assignment gives them no remote "
+                        f"owner. The plan and the assignment were built from "
+                        f"different cold pools, and fetching under that "
+                        f"disagreement is how a rank reads a plausible wrong "
+                        f"row (#394)."
+                    )
+
+        # --- #254 prefill wave order ---------------------------------------
+        # "token" (default) = disjoint token subsets, every wave re-fetches its
+        # tokens' spill experts. "expert" = disjoint spill-expert groups, each
+        # spill expert fetched once per forward; byte-identical via the fixed
+        # k-order combine in _run_waves_expert_major.
+        self._wave_order = resolve_wave_order(envs.FLLIPER_MOE_OFFLOAD_WAVE_ORDER.get())
+        # fnFL2 H20b: numpy wave planning for expert-major prefill.
+        self._plan_vector = bool(envs.FLLIPER_MOE_OFFLOAD_PLAN_VECTOR.get())
+        # H12: the device-planned pool's eager forwards (run_eager_pool) split
+        # expert-major unless FLLIPER_OPT_MOE_POOL_EAGER_EXPERT_MAJOR=0.
+        self._pool_eager_wave_order = (
+            "expert"
+            if envs.FLLIPER_OPT_MOE_POOL_EAGER_EXPERT_MAJOR.get()
+            else self._wave_order
+        )
+        # H107: the expert-major eager forward reads warm LRU rows instead of
+        # fetching them again (FLLIPER_OPT_MOE_POOL_EAGER_LRU_HITS).
+        self._pool_eager_lru_hits = bool(envs.FLLIPER_OPT_MOE_POOL_EAGER_LRU_HITS.get())
+        # per eager forward: armed by run_eager_pool, the hit rows the sync
+        # stamps as used (row -> expert)
+        self._eager_lru_armed = False
+        self._eager_lru_used: Dict[int, int] = {}
+
+        # --- Stage-3 CUDA-graph-capturable path ----------------------------
+        # Built by install_capturable_buffers() (after install(), and after any
+        # freeze_from_source() rearrange): frozen device LUTs + UVA device
+        # views of the pinned spill pool + stable scratch dest views.
+        self._graph_mode = bool(envs.FLLIPER_MOE_OFFLOAD_CUDA_GRAPH.get())
+        if self._graph_mode and self._hot_enabled:
+            # §5: live calibration cannot be frozen before graph capture.
+            raise RuntimeError(
+                "FLLIPER_MOE_HOT_RESIDENCY (live hot calibration) cannot be "
+                "combined with FLLIPER_MOE_OFFLOAD_CUDA_GRAPH: the residency "
+                "layout must be frozen BEFORE graph capture. Supply "
+                "FLLIPER_MOE_HOTSET_FILE or use static residency."
+            )
+
+        # --- #390 router / residency instrument -----------------------------
+        # Opt-in (FLLIPER_EXPERT_STATS=1). Resolved ONCE here: on the default
+        # path this stays None and run_waves pays a single `is not None` test.
+        from flliper.srt.layers.moe.expert_stats import (
+            get_collector,
+            maybe_layer_stats,
+            moe_rank_tag,
+        )
+
+        self._router_stats = maybe_layer_stats(
+            layer_id=getattr(layer, "layer_id", None),
+            num_experts=self.num_local_experts,
+            resident_count=self.resident_count,
+            # #481c: the tag carries the pipeline stage when there is one, so
+            # two stages' rank 0 stop writing the same dump file. Unchanged
+            # without PP.
+            rank_tag=moe_rank_tag(
+                moe_tp_rank=getattr(layer, "moe_tp_rank", 0),
+                moe_ep_rank=getattr(layer, "moe_ep_rank", 0),
+            ),
+            graph_mode=self._graph_mode,
+        )
+        self._stats_collector = None
+        if self._router_stats is not None:
+            # Hand the planner's own fetch/H2D tally to the dump so the routing
+            # histogram and what the offload actually paid for it land in one
+            # file instead of two places.
+            self._router_stats.residency = self.planner.stats
+            # #302a: the migration counters, so a dump says how often the
+            # resident set was re-ranked and what the window hit rate was doing
+            # while it happened. Held by reference; `None` when the feature is
+            # off, which is how a dump distinguishes "no migrations happened"
+            # from "migration was not enabled".
+            self._router_stats.heat_migration = (
+                self._heat.stats if self._heat is not None else None
+            )
+            # #394: the placement policy this layer was staged under, so the
+            # dump names its own A/B arm (see publish_host_shard_on_layer),
+            # plus how a delegated expert is REACHED. Without the second field
+            # a proportional arm and a proportional arm whose shared tier never
+            # attached look identical in the dump, and only one of them is the
+            # thing being measured.
+            row = getattr(layer, "_moe_offload_host_shard", None)
+            if row is not None:
+                row = dict(row)
+                row["reachability"] = (
+                    "shared-cold-tier"
+                    if self._cold_tier is not None
+                    else ("refused" if delegated else "local-only")
+                )
+            self._router_stats.host_shard = row
+            self._stats_collector = get_collector()
+
+        self._capturable_ready = False
+        self._cap_resident_slot_lut = None  # int32[E] device
+        self._cap_is_spill = None  # bool[E] device
+        self._cap_spill_pool_row_lut = None  # int32[E] device
+        self._cap_pool_dev: Dict[str, "object"] = {}  # attr -> UVA view [E-R,...]
+        self._cap_scratch_dst: Dict[str, "object"] = {}  # attr -> resident[R:R+C]
+        self._cap_view_holders: List["object"] = []  # keep pinned bases alive
+        # #394 seam only: int32[1] device counter of captured gathers that hit
+        # a delegated expert's absent row. None on every default launch, which
+        # is what keeps prepare_capturable_remap statement-identical there.
+        self._cap_breach = None
+
+    # --- lifecycle (GPU window) --------------------------------------------
+    def install(self):
+        """Build the [R+C]-slot GPU buffer (fixed resident [0,R) + scratch) and
+        the [E-R]-slot pinned host spill pool. Idempotent.
+
+        Source is either (a) a load-time presplit stashed on the layer
+        (``_moe_offload_presplit``: attr -> (resident_buf[R+C], spill_pinned)),
+        which never let the full [E] stack sit on host -- the RAM-safe path; or
+        (b) the layer's full [E] tensor still present (GPU or CPU-pinned), which
+        we split here (used by the small-model proof where the full stack fits).
+        """
+        import torch
+
+        if self._installed or self.planner.fully_resident:
+            return
+        # The copy stream and the ambient device are the only CUDA-only pieces
+        # of install/_fetch. Making them optional lets the whole
+        # install -> resolve -> fetch -> remap -> apply chain run on CPU
+        # tensors, which is what turns the #123-GGUF round-trip proof into a
+        # hermetic desk test instead of a GPU-window claim. Production always
+        # has a context, so the CUDA branch is unchanged.
+        cuda = torch.cuda.is_available()
+        self._stream = torch.cuda.Stream() if cuda else None
+        dev = torch.cuda.current_device() if cuda else torch.device("cpu")
+        R = self.resident_count
+        buf_slots = self.planner.buffer_size  # R + C
+        presplit = getattr(self.layer, "_moe_offload_presplit", None)
+        # #119 tally. Only the split-here branch releases VRAM *here*; the
+        # presplit branch already released it at load time (and tallied there),
+        # so counting it again would double-report the reclaim.
+        freed_device = 0
+        freed_host = 0
+
+        for attr in self.EXPERT_TENSOR_ATTRS:
+            if presplit is not None:
+                if attr not in presplit:
+                    continue
+                resident_buf, spill = presplit[attr]  # buf[R+C] GPU, spill host
+                self._resident[attr] = resident_buf
+                self._pinned[attr] = spill
+                _stack = torch.nn.Parameter(resident_buf, requires_grad=False)
+                # PLATZTAUSCH: dieser Parameter ist ein ALIAS des Experten-
+                # Puffers, den der Presplit schon (als Praefix) dem Flip
+                # veroeffentlicht hat. Ohne Markierung saehe der Austausch nach
+                # dem ersten Forward einen zweiten, ungeplanten Tensor ueber
+                # demselben Storage -- W84 `uncovered`, oder bei einem Manifest
+                # nach dem Install ein ganzer [R+C]-Stapel im Plan, den die
+                # andere Gruppe nie gleich schneiden kann (W68).
+                from flliper.srt.managers.pdflip_memory_saver import (
+                    mark_expert_stack_alias,
+                )
+
+                mark_expert_stack_alias(_stack)
+                setattr(self.layer, attr, _stack)
+                continue
+            # Split-here path (full [E] tensor present).
+            full = getattr(self.layer, attr, None)
+            if full is None:
+                continue
+            full = full.data if hasattr(full, "data") else full
+            if full.dim() == 0 or full.shape[0] != self.num_local_experts:
+                continue  # not an expert-major tensor
+            # GPU buffer [R+C]: [0:R] = fixed resident experts, scratch left as-is.
+            buf = torch.empty(
+                (buf_slots,) + tuple(full.shape[1:]), dtype=full.dtype, device=dev
+            )
+            buf[:R].copy_(full[:R])
+            self._resident[attr] = buf
+            # Pinned host spill pool = experts [R:E].
+            spill_src = full[R:].contiguous()
+            if spill_src.is_cpu and spill_src.is_pinned():
+                spill = spill_src
+            else:
+                spill = pinned_exact_empty(spill_src.shape, spill_src.dtype)
+                spill.copy_(spill_src)
+            self._pinned[attr] = spill
+            setattr(
+                self.layer,
+                attr,
+                (
+                    torch.nn.Parameter(buf, requires_grad=False)
+                    if isinstance(getattr(self.layer, attr), torch.nn.Parameter)
+                    else buf
+                ),
+            )
+            if not full.is_cpu:
+                row_bytes = (full.numel() // full.shape[0]) * full.element_size()
+                freed_device += expert_offload_released_device_bytes(
+                    self.num_local_experts, buf_slots, row_bytes
+                )
+            freed_host += spill.numel() * spill.element_size()
+
+        # The marlin apply reads E = w1.shape[0] = buffer size (R+C). Advertise
+        # it so moe_align / the runner size to the buffer; topk_ids arriving at
+        # apply() are already slot ids in [0, R+C).
+        self._orig_num_local_experts = self.layer.num_local_experts
+        # H95c: the bank holds R+C+X rows when the presplit reserved seat rows
+        buf_rows = buf_slots + self.seat_rows
+        self.layer.num_local_experts = buf_rows
+        runner_cfg = getattr(self.layer, "moe_runner_config", None)
+        if runner_cfg is not None and hasattr(runner_cfg, "num_local_experts"):
+            try:
+                runner_cfg.num_local_experts = buf_rows
+            except Exception:
+                pass  # frozen/dataclass runner configs: kernel reads the layer attr
+        if presplit is not None:
+            # Release the layer's ref to the presplit dict (tensors now owned by
+            # self._resident / self._pinned).
+            try:
+                delattr(self.layer, "_moe_offload_presplit")
+            except Exception:
+                self.layer._moe_offload_presplit = None
+        elif self._resident:
+            record_expert_offload_release(freed_device, freed_host, len(self._resident))
+        self._installed = True
+
+    # --- fetch / remap helpers (GPU window) --------------------------------
+    def _uva_pool_view(self, attr, spill):
+        """The cached UVA device view of one pinned spill pool (Task #33)."""
+        views = getattr(self, "_uva_views", None)
+        if views is None:
+            views = self._uva_views = {}
+        v = views.get(attr)
+        if v is None or v.data_ptr() != spill.data_ptr():
+            v = views[attr] = device_view_of_pinned(spill)
+        return v
+
+    def _nan_trace_begin(self, ids_list) -> None:
+        """Task #49: open this forward's routing trace for '[nan-disc2]'. Costs
+        one dict and one list reference; nothing is copied, and with the guard
+        off the attribute is set to None and every recorder below is a no-op."""
+        try:
+            from flliper.srt.layers.nan_guard import nan_guard_on
+
+            if not nan_guard_on():
+                self._nan_trace = None
+                return
+            self._nan_trace = {
+                "ids_list": ids_list,
+                "waves": [],
+                "partials": partials_mode(),
+            }
+        except Exception:  # noqa: BLE001 -- an instrument never kills a forward
+            self._nan_trace = None
+
+    def _nan_trace_wave(self, wave, needed, slot_of_needed) -> None:
+        """Record one wave's expert set and its expert -> slot assignment, plus
+        what the scratch holds said at that moment. This is the half that
+        cannot be reconstructed after the fact: later waves overwrite the
+        scratch slots, so 'which slot did THIS wave read' is only knowable
+        here."""
+        tr = getattr(self, "_nan_trace", None)
+        if not isinstance(tr, dict):
+            return
+        try:
+            tr["waves"].append(
+                {
+                    "wave": int(wave),
+                    "needed": [int(e) for e in needed],
+                    "slot_of_needed": {int(k): int(v) for k, v in slot_of_needed.items()},
+                    "holds": dict(self._scratch_holds),
+                }
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _nan_guard_wave(self, combine_out, wave, needed, start) -> None:
+        """Task #49: with FLLIPER_NAN_GUARD=1 name the wave (its expert set and
+        slice start) whose grouped GEMM produced non-finite rows."""
+        try:
+            from flliper.srt.layers.nan_guard import nan_guard_on
+            if not nan_guard_on():
+                return
+            import os
+            if os.environ.get("FLLIPER_NAN_GUARD_WAVE", "1").strip() in ("0", "off"):
+                return  # the per-slice .item() completes each GEMM before the next fetch -- hides a race
+            import torch
+            hs = getattr(combine_out, "hidden_states", combine_out)
+            if hs is None or not torch.is_tensor(hs):
+                return
+            finite = torch.isfinite(hs)
+            if bool(finite.all().item()):
+                return
+            rows = torch.nonzero(~finite.reshape(hs.shape[0], -1).all(dim=1)).reshape(-1)
+            import logging
+            logging.getLogger(__name__).error(
+                "[nan-guard] wave %d slice@%d on layer %s: %d non-finite rows of %d; wave experts (local ids) %s",
+                int(wave), int(start), getattr(self.layer, "layer_id", "?"), int(rows.numel()), int(hs.shape[0]),
+                sorted(int(e) for e in needed)[:24],
+            )
+        except Exception as exc:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).debug("[nan-guard] wave check skipped: %s", exc)
+
+    def _nan_guard_fetched(self, fetch_plan) -> None:
+        """Task #49 (19.09.): with FLLIPER_NAN_GUARD=1, after the join, every
+        FLOAT resident tensor (the scales) of the slots this fetch filled is
+        checked; a non-finite scale row means the bytes that landed in the
+        slot are not the expert's (race, stale row, wrong offset)."""
+        try:
+            from flliper.srt.layers.nan_guard import nan_guard_on
+            if not nan_guard_on():
+                return
+            import os
+            if os.environ.get("FLLIPER_NAN_GUARD_FETCH", "1").strip() in ("0", "off"):
+                return  # the per-fetch check joins copy and compute -- a race hides behind it
+            import torch
+            slots = [int(sl) for _e, sl in fetch_plan]
+            for attr, dst in self._resident.items():
+                if not dst.is_floating_point():
+                    continue
+                sub = dst[slots].float()
+                if bool(torch.isfinite(sub).all().item()):
+                    continue
+                bad = ~torch.isfinite(sub).reshape(len(slots), -1).any(dim=1)
+                bad_idx = torch.nonzero(bad).reshape(-1).tolist()
+                pairs = [fetch_plan[i] for i in bad_idx[:6]]
+                import logging
+                logging.getLogger(__name__).error(
+                    "[nan-guard] fetched slot(s) with non-finite %s on layer %s: %d of %d slots, "
+                    "(expert, slot) %s",
+                    attr, getattr(self.layer, "layer_id", "?"), len(bad_idx), len(slots), pairs,
+                )
+        except Exception as exc:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).debug("[nan-guard] fetched check skipped: %s", exc)
+
+    def _fetch(self, fetch_plan, join: bool = True):
+        """Async H2D-copy each wave's SPILL experts into their scratch slots,
+        then join the copy stream before compute reads them. ``fetch_plan`` is
+        (spill_expert_id, scratch_slot); the spill pool is indexed by
+        (expert_id - resident_count). ``join=False`` (WP8 lookahead prefetch)
+        leaves the copies in flight on the copy stream; the next fetch of this
+        cache -- which always joins -- is what makes them visible to compute.
+
+        #394 slice 2: an expert in ``self._remote_ids`` is not in this rank's
+        pool at all -- its row is a zero-copy view of a PEER's shared segment,
+        resolved through ``self._cold_tier``. The copy itself is the same
+        ``copy_`` over the same link; only the source address differs, which is
+        the whole design (the storage moved, the transport did not)."""
+        import torch
+
+        if not fetch_plan:
+            return
+        for expert_id, slot in fetch_plan:
+            self._scratch_holds[slot] = expert_id
+        R = self.resident_count
+        pool_index = self._spill_pool_index  # None => static layout (id - R)
+        remote = self._cold_tier
+        moved = 0
+        remote_moved = 0
+
+        # Write-after-read: the scratch slots this fetch overwrites are still
+        # being READ by the previous wave's grouped-GEMM, which was enqueued on
+        # the compute stream. Without this the copy stream can overtake that
+        # GEMM and swap an expert's weights out from under it -- silently wrong
+        # output, and timing-dependent, so it only shows up once waves get long
+        # enough for the copies to win the race (expert-major waves do; the
+        # short token-major waves happened not to). The join below covers the
+        # other direction (compute must not read before the copy lands).
+        def _copies_gather():
+            # 19.09. (Task #33, fn3e profile): the eager fetch as ONE gather
+            # over the UVA device view of the pinned pool plus ONE scatter into
+            # the scratch slots, per tensor per layer -- instead of one
+            # cudaMemcpyAsync per expert per tensor (~10 x attrs launches a
+            # layer, ~1300 a token; the Python thread was busy 91 % of the
+            # decode wall). Same bytes over the same link (only the misses);
+            # only the launch count changes. Static layout or pool_index alike.
+            nonlocal moved
+            rows = [int(pool_index[e]) if pool_index is not None else int(e) - R
+                    for e, _s in fetch_plan]
+            slots = [int(sl) for _e, sl in fetch_plan]
+            first = next(iter(self._resident.values()))
+            dev = first.device
+            import numpy as np
+            rows_t = _h2d_i64(np.asarray(rows, dtype=np.int64), dev)
+            slots_t = _h2d_i64(np.asarray(slots, dtype=np.int64), dev)
+            # rc12c: through the shared ring, except under graph capture
+            # (a cross-stream event wait is not legal there; the captured
+            # form keeps its own pool and never frees the temporary anyway).
+            capturing = torch.cuda.is_current_stream_capturing()
+            for attr in self._pinned:
+                spill = self._pinned.get(attr)
+                dst = self._resident[attr]
+                pool_dev = self._uva_pool_view(attr, spill)
+                if capturing:
+                    dst.index_copy_(0, slots_t, torch.index_select(pool_dev, 0, rows_t))
+                else:
+                    gather_rows_into(dst, slots_t, pool_dev, rows_t,
+                                     ring_rows=GATHER_RING_ROWS, stream=self._stream)
+                moved += dst[0].numel() * dst.element_size() * len(rows)
+
+        def _copies():
+            nonlocal moved, remote_moved
+            if remote is None and self._stream is not None and _fetch_mode() == "gather" and fetch_plan:
+                try:
+                    return _copies_gather()
+                except Exception as exc:  # noqa: BLE001 -- one named fallback, then memcpy
+                    import logging
+                    import os
+                    logging.getLogger(__name__).warning(
+                        "MoE offload gather fetch failed (%s: %s); memcpy fetch from now on",
+                        type(exc).__name__, exc)
+                    os.environ["FLLIPER_MOE_OFFLOAD_FETCH"] = "memcpy"
+            # With no shared tier the iteration set is exactly what it always
+            # was. With one, a rank can own ZERO local cold rows for a tensor
+            # (a lopsided ratio is legal), so the attr set has to come from the
+            # resident buffers -- the pinned pool may not be there at all.
+            attrs = self._pinned if remote is None else self._resident
+            for attr in attrs:
+                spill = self._pinned.get(attr)
+                dst = self._resident[attr]
+                per_expert = dst[0].numel() * dst.element_size()
+                for expert_id, slot in fetch_plan:
+                    if remote is not None and expert_id in self._remote_ids:
+                        dst[slot].copy_(remote.row(attr, expert_id), non_blocking=True)
+                        moved += per_expert
+                        remote_moved += per_expert
+                        continue
+                    row = (
+                        pool_index[expert_id]
+                        if pool_index is not None
+                        else expert_id - R
+                    )
+                    dst[slot].copy_(spill[row], non_blocking=True)
+                    moved += per_expert
+
+        if self._stream is None:
+            # No CUDA context (desk test): same copies, same order, no streams.
+            _copies()
+        else:
+            self._stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._stream):
+                _copies()
+            if join:
+                torch.cuda.current_stream().wait_stream(self._stream)
+            if fetch_sync_on():
+                # Task #49 probe (fn8ah 20.09.): a device-side wait is the
+                # design; a host-side synchronize here is the DISCRIMINATOR --
+                # if the 259k needle stops going NaN with it, the first
+                # compute read a slot whose copy had not landed.
+                torch.cuda.synchronize()
+        _g = getattr(self, "_nan_guard_fetched", None)  # desk stubs carry no guard
+        if _g is not None and join and fetch_plan:
+            _g(fetch_plan)
+        self.planner.stats.h2d_bytes += moved
+        self.planner.stats.remote_h2d_bytes += remote_moved
+
+    def _build_lut(self, slot_of_needed, dtype, device):
+        """Global expert id -> slot LUT for one wave; -1 for every id the wave
+        does not need.
+
+        Written as ONE ``index_copy_`` over host-built index/value vectors. The
+        previous per-entry ``lut[e] = s`` issued one device scalar store per
+        needed expert, and a scalar store from a Python int blocks the host
+        until the stream drains -- so every wave stalled the host behind its own
+        queued scratch fetches. A 2048-token prefill chunk runs ~886 waves per
+        layer x 40 layers, ~18 needed experts each: ~640k blocking stores per
+        chunk. Measured on one RTX 3080 with the real per-expert shapes
+        (Qwen3.6-35B-A3B-FP8, TP=3): 5.5 s/chunk of pure LUT time, and 5.8
+        s/chunk even in the fetch-bound regime because the stalls serialize the
+        host against the H2D copies.
+
+        Bit-identical to the per-entry build (tests/moe_offload/test_build_lut.py),
+        and CPU-runnable, so the equivalence is proven without CUDA.
+        """
+        import numpy as np
+        import torch
+
+        lut = torch.full((self.num_local_experts,), -1, dtype=dtype, device=device)
+        n = len(slot_of_needed)
+        if n == 0:
+            return lut
+        # 19.09. (Task #33, fn3g profile): pageable -> device copies are host-
+        # blocking (`non_blocking` is honoured only for pinned memory), so the
+        # two vectors go through PINNED host tensors from the caching host
+        # allocator (its reuse is event-tracked, so a buffer freed here is not
+        # handed out again before the copy has read it). CPU desk path unchanged.
+        idx = _h2d_i64(np.fromiter(slot_of_needed.keys(), np.int64, n), device)
+        val = _h2d_i64(np.fromiter(slot_of_needed.values(), np.int64, n), device).to(dtype)
+        lut.index_copy_(0, idx, val)
+        return lut
+
+    @staticmethod
+    def _remap(topk_ids, lut):
+        import torch
+
+        # -1 padding stays -1; every real id maps to its resident slot.
+        return torch.where(topk_ids >= 0, lut[topk_ids.clamp(min=0)], topk_ids)
+
+    # --- per-forward (GPU window) ------------------------------------------
+    def prepare(self, topk_ids):  # pragma: no cover - requires CUDA
+        """Single-wave remap for a forward whose unique experts fit in n_slots
+        (e.g. decode). Resolves residency, async-fetches misses, returns a
+        remapped topk_ids (global expert id -> resident slot; -1 stays -1).
+
+        Raises if the forward needs more than n_slots unique experts -- callers
+        that can hit prefill overflow must use ``run_waves`` instead.
+        """
+        import torch
+
+        if self.planner.fully_resident:
+            return topk_ids
+        needed = torch.unique(topk_ids[topk_ids >= 0]).tolist()
+        slot_of_needed, fetch_plan = self.planner.resolve(needed)
+        self._fetch(fetch_plan)
+        lut = self._build_lut(slot_of_needed, topk_ids.dtype, topk_ids.device)
+        return self._remap(topk_ids, lut)
+
+    # --- Stage-3 capturable path (GPU window) ------------------------------
+    def install_capturable_buffers(self):  # pragma: no cover - requires CUDA
+        """Build the frozen device LUTs (§3.1), the UVA device views of the
+        pinned spill pool, and the stable scratch destination views (§4).
+
+        MUST run after install() and after any freeze_from_source() rearrange
+        (the LUTs and pool views snapshot the FROZEN layout), and before graph
+        capture. In practice it runs on the first (warmup) forward, which is
+        eager and precedes DecodeCudaGraphRunner's stream capture (§5).
+        Idempotent.
+        """
+        import torch
+
+        if self._capturable_ready:
+            return
+        if not self._installed:
+            raise RuntimeError("install_capturable_buffers() requires install() first")
+        R, C = self.resident_count, self.scratch
+        if self.planner.buffer_size != R + C:
+            raise RuntimeError(
+                f"capturable offload requires buffer_size == R+C "
+                f"({self.planner.buffer_size} != {R}+{C}); the scratch region "
+                f"was capped by num_local_experts -- lower "
+                f"FLLIPER_MOE_SCRATCH_SLOTS or the resident fraction."
+            )
+        if (self.planner.resident_slot is None) != (self._spill_pool_index is None):
+            raise RuntimeError(
+                "inconsistent frozen residency maps (resident_slot vs "
+                "spill_pool_index); freeze must install both or neither"
+            )
+        device = torch.device("cuda", torch.cuda.current_device())
+        if self._cold_tier is not None:
+            # Refuses unless the development seam is open. Past it, arm the
+            # breach counter FIRST -- an unarmed capturable path under a cold
+            # tier is the out-of-bounds gather the refusal names.
+            refuse_capturable_cold_tier(self.num_local_experts)
+            from flliper.srt.layers.moe import offload_capture_gate
+
+            self._cap_breach = torch.zeros(1, dtype=torch.int32, device=device)
+            offload_capture_gate.register(self)
+        (
+            self._cap_resident_slot_lut,
+            self._cap_is_spill,
+            self._cap_spill_pool_row_lut,
+        ) = build_capturable_luts(
+            self.num_local_experts,
+            R,
+            self.planner.resident_slot,
+            self._spill_pool_index,
+            device=device,
+        )
+        for attr, pinned in self._pinned.items():
+            self._cap_pool_dev[attr] = device_view_of_pinned(pinned)
+            self._cap_view_holders.append(pinned)
+            # Stable scratch sub-view of the resident buffer: fixed address,
+            # contiguous (slice of dim 0 of a contiguous [R+C,...] tensor).
+            self._cap_scratch_dst[attr] = self._resident[attr][R : R + C]
+        self._capturable_ready = True
+
+    def _issue_fetch_capturable(self, src_row):  # pragma: no cover - CUDA
+        """Captured scratch fetch (§4): one gather KERNEL per expert-tensor
+        attr, sourcing the UVA device view of the pinned pool and writing the
+        stable scratch region [R:R+C] in place. Stable in/out pointers; the
+        data-dependent part is only the CONTENT of ``src_row`` -> capturable.
+        Runs on the current stream, so program order guarantees the routed
+        apply (issued later on the same stream) reads a complete scratch (§7 R1).
+        """
+        import torch
+
+        for attr, pool_dev in self._cap_pool_dev.items():
+            torch.index_select(pool_dev, 0, src_row, out=self._cap_scratch_dst[attr])
+
+    def prepare_capturable(self, topk_ids):  # pragma: no cover - requires CUDA
+        """Single-wave, host-sync-free prepare for the captured decode path:
+        on-device remap (bit-identical to resolve()+_build_lut+_remap, proven
+        on CPU) + the captured scratch gather. Returns remapped topk_ids.
+
+        Caller must guarantee the §2 invariant (worst-case unique spill <= C,
+        i.e. topk_ids.numel() <= C); enforced loudly in layer.py.
+        """
+        if not self._capturable_ready:
+            raise RuntimeError(
+                "prepare_capturable() before install_capturable_buffers()"
+            )
+        remapped, src_row, _num_spill = prepare_capturable_remap(
+            topk_ids,
+            self._cap_resident_slot_lut,
+            self._cap_is_spill,
+            self._cap_spill_pool_row_lut,
+            self.resident_count,
+            self.scratch,
+            breach_counter=self._cap_breach,
+        )
+        self._issue_fetch_capturable(src_row)
+        return remapped
+
+    def check_capture_breach(self, where: str = "cuda-graph replay") -> None:
+        """Replay-boundary read of the #394 seam's breach counter.
+
+        Called from ``offload_capture_gate.check_after_graph_replay`` -- host
+        code, no capture in progress, which is the only place this device read
+        is legal. Resets the counter after reporting so a window that catches
+        the exception and continues does not re-raise on the SAME breach and
+        mistake one wrong step for a permanent state.
+        """
+        counter = self._cap_breach
+        if counter is None:
+            return
+        breaches = int(counter.item())
+        if breaches == 0:
+            return
+        counter.zero_()
+        from flliper.srt.layers.moe.offload_capture_gate import OffloadCaptureBreach
+
+        raise OffloadCaptureBreach(
+            getattr(self.layer, "layer_id", None), breaches, where
+        )
+
+    def freeze_from_source(self):  # pragma: no cover - requires CUDA
+        """§5 freeze-before-capture: load this layer's frozen hot set from
+        FLLIPER_MOE_HOTSET_FILE and drive the existing _freeze_hotset physical
+        rearrange from it (instead of live calibration counts). No file =>
+        static [0,R) fallback (no-op). Runs before install_capturable_buffers.
+
+        File format (JSON): ``{"<layer_id>": [expert_id, ...], ...}`` with the
+        per-layer list ordered hottest-first (>= R entries; the first R are
+        taken). Produced offline from the M-C routing trace.
+        """
+        import logging
+
+        from flliper.srt.environ import envs
+
+        path = envs.FLLIPER_MOE_HOTSET_FILE.get()
+        if not path:
+            return  # static [0,R) residency (F3)
+        if self._hot_frozen:
+            return
+        if not hotset_covers_layer(self.layer):
+            logging.getLogger(__name__).info(
+                "FLLIPER_MOE_HOTSET_FILE not applied to draft layer %r "
+                "(layer_id %s): the file is keyed by the TARGET's layer ids; "
+                "static [0,R) residency here",
+                getattr(self.layer, "_flliper_prefix", ""),
+                getattr(self.layer, "layer_id", None),
+            )
+            return
+        path = hotset_path_for_rank(path, getattr(self.layer, "moe_tp_rank", 0))
+        data = _load_hotset_file(path)
+        layer_id = getattr(self.layer, "layer_id", None)
+        key = str(layer_id)
+        if key not in data:
+            raise RuntimeError(
+                f"FLLIPER_MOE_HOTSET_FILE {path!r} has no entry for layer "
+                f"{key!r} (keys: {sorted(data)[:8]}...)"
+            )
+        R, E = self.resident_count, self.num_local_experts
+        ids = [int(e) for e in data[key]]
+        if len(ids) != E:
+            # fn4h 19.09.: the file describes another expert space (a rank's
+            # expert-split target layer: 313/105/97 ids) while THIS layer holds
+            # a different set (the MTP draft's replicated 512). Not this
+            # layer's file -> static [0,R) residency, said once.
+            logging.getLogger(__name__).warning(
+                "FLLIPER_MOE_HOTSET_FILE %s layer %s lists %d experts but this "
+                "layer holds %d (a different expert space); keeping the static "
+                "[0,R) residency here",
+                path, key, len(ids), E,
+            )
+            return
+        if any(e < 0 or e >= E for e in ids):
+            raise RuntimeError(
+                f"FLLIPER_MOE_HOTSET_FILE layer {key}: expert id out of [0,{E})"
+            )
+        hot = sorted(set(ids[:R]))
+        if len(hot) != R:
+            raise RuntimeError(
+                f"FLLIPER_MOE_HOTSET_FILE layer {key}: need {R} unique hot "
+                f"experts, got {len(hot)} from the first {R} listed"
+            )
+        self._apply_hotset_freeze(hot)
+        logging.getLogger(__name__).info(
+            "MoE hot-residency FROZEN FROM FILE on layer %s: R=%d (source %s)",
+            key,
+            R,
+            path,
+        )
+
+    # ---- device-planned expert pool (vLLM PR #56177 port, 19.09.) -------------
+    def install_pool(self):  # pragma: no cover - requires CUDA
+        """Build the per-layer pool tables over the EXISTING [R+C] arena: rows
+        [0, R) are the fixed residents (never victims, no host copy needed),
+        [R, R+C-S) the device-LRU region, the last S rows staging. The host
+        source is the pinned spill pool through its UVA device view, addressed
+        by the static ``host_row`` table. Idempotent."""
+        import logging
+        import os
+
+        from flliper.srt.layers.moe.expert_pool_device import (
+            allocate_pool_tables,
+            allocate_step_buffers,
+            plan_width_for,
+        )
+
+        if self._pool_ready:
+            return
+        if not self._installed:
+            raise RuntimeError("install_pool() requires install() first")
+        # The frozen hot set (FLLIPER_MOE_HOTSET_FILE) is installed BEFORE the
+        # tables snapshot the layout: the residents [0, R) then are the file's
+        # hottest R experts, not expert ids 0..R-1.
+        self.freeze_from_source()
+        if self._hot_enabled and not self._hot_frozen:
+            raise RuntimeError(
+                "pool mode: live hot-set calibration (FLLIPER_MOE_HOT_RESIDENCY=1) "
+                "would rearrange the bank after the decode graphs captured it; "
+                "freeze from FLLIPER_MOE_HOTSET_FILE or set HOT_RESIDENCY=0"
+            )
+        if self._cold_tier is not None:
+            raise RuntimeError("pool mode has no shared cold tier (#394) path")
+        R, C, E = self.resident_count, self.scratch, self.num_local_experts
+        rows = self.planner.buffer_size
+        if rows != R + C:
+            raise RuntimeError(
+                f"pool mode requires buffer_size == R+C ({rows} != {R}+{C})"
+            )
+        staging = int(os.environ.get("FLLIPER_MOE_POOL_STAGING", "12") or 12)
+        # H91b/H95: the plan width follows the widest captured step (n seats
+        # x 4 MTP verify rows x top-10, n = 1..--d-bs: 80 ids at bs2, 240 at
+        # bs6 -> 256 lanes); a bs1 form keeps exactly PLAN_WIDTH.
+        width = plan_width_for(self._pool_max_step_ids())
+        staging = max(1, min(staging, C - 1, width))
+        attrs = [a for a in self._pinned if a in self._resident]
+        device = self._resident[attrs[0]].device
+        hot_slot_of, host_row = self._pool_layout()
+        self._pool_staging = staging
+        from flliper.srt.environ import envs
+
+        # H95 probe: the demand counters exist only when it is armed; off,
+        # the tables and the step kernel are exactly those before H95.
+        demand = int(envs.FLLIPER_DEBUG_MOE_POOL_DEMAND.get() or 0) > 0
+        if self.seat_rows > 0:
+            # H95c: [R+C+X] bank, seat form (staging first, X rows OFF)
+            self._pool_tables = allocate_pool_tables(
+                device, E, rows + self.seat_rows, R, staging, hot_slot_of, host_row,
+                demand=demand, seat_rows=self.seat_rows,
+            )
+        else:
+            self._pool_tables = allocate_pool_tables(
+                device, E, rows, R, staging, hot_slot_of, host_row, demand=demand
+            )
+        self._pool_buffers = allocate_step_buffers(device, E, width)
+        from flliper.srt.layers.moe import pool_heat
+
+        self._pool_heat, self._pool_heat_ones = pool_heat.allocate(device, E, width)
+        self._pool_srcs = [device_view_of_pinned(self._pinned[a]) for a in attrs]
+        self._pool_dsts = [self._resident[a] for a in attrs]
+        self._pool_view_holders = [self._pinned[a] for a in attrs]
+        if pool_prefetch_enabled():
+            import torch
+
+            self._pool_pf_buffers = allocate_step_buffers(device, E, width)
+            self._pool_pf_begin = torch.cuda.Event()
+            self._pool_pf_done = torch.cuda.Event()
+        self._pool_ready = True
+        logging.getLogger(__name__).info(
+            "MoE expert pool on layer %s: residents %d, LRU rows %d, staging %d, "
+            "spill rows %d, tensors %d, prefetch %s%s",
+            getattr(self.layer, "layer_id", None), R, C - staging, staging,
+            sum(1 for h in host_row if h >= 0), len(attrs),
+            "on" if self._pool_pf_buffers is not None else "off",
+            (", seat rows %d (H95c, OFF until a D phase funds them)" % self.seat_rows)
+            if self.seat_rows > 0 else "",
+        )
+
+    def _pool_max_step_ids(self):
+        """H91b: the widest step a captured decode graph routes through this
+        layer (``expert_pool_device.pool_max_step_ids``), from the boot's
+        server args; ``None`` (= the historic PLAN_WIDTH) when they are not
+        reachable, e.g. in a desk harness."""
+        from flliper.srt.layers.moe.expert_pool_device import pool_max_step_ids
+
+        try:
+            from flliper.srt.runtime_context import get_server_args
+
+            sa = get_server_args()
+        except Exception:  # noqa: BLE001 -- no runtime context: keep the old width
+            return None
+        spec = getattr(sa, "speculative_algorithm", None)
+        verify = getattr(sa, "speculative_num_draft_tokens", None) if spec else None
+        return pool_max_step_ids(
+            graph_bs=getattr(sa, "cuda_graph_bs_decode", None),
+            max_graph_bs=getattr(sa, "cuda_graph_max_bs_decode", None),
+            max_running=getattr(sa, "max_running_requests", None),
+            verify_tokens=verify,
+            top_k=getattr(self.layer, "top_k", None),
+        )
+
+    def pool_waves(self, n_ids: int) -> int:
+        """H95: how many overflow waves the captured step of ``n_ids`` routed
+        ids runs on this layer -- 1 (today's single step) unless
+        FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES=N >= 2, then ``ceil(min(ids, E - R)
+        / (LRU + staging))`` capped at N (past N the step's own bound refuses
+        the capture by name, exactly as without waves)."""
+        import logging
+
+        from flliper.srt.environ import envs
+        from flliper.srt.layers.moe.expert_pool_device import (
+            pool_row_capacity,
+            pool_waves_for,
+            resident_count,
+            step_row_demand,
+        )
+
+        # #251c: a D KV stage form moves stage rows from the scratch into the
+        # seat rows (OFF at boot); the captured step counts the fewest rows ON
+        # of any phase this batch can replay in (d_seat_vram.capture_floor_rows)
+        self._pool_capture_on = self._stage_capture_rows(int(n_ids))
+        cap = int(envs.FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES.get() or 0)
+        if cap < 2:
+            return 1
+        if not self._pool_ready:
+            self.install_pool()
+        t = self._pool_tables
+        # H95c: C of the phase with EVERY seat occupied (seat rows OFF) --
+        # the capture happens in that form, a phase with rows ON needs fewer
+        C = pool_row_capacity(t, getattr(self, "_pool_capture_on", 0))
+        need = pool_waves_for(int(n_ids), t.num_experts, resident_count(t), C)
+        waves = min(need, cap)
+        if self._pool_waves_seen.get(int(n_ids)) != waves:
+            self._pool_waves_seen[int(n_ids)] = waves
+            lid = getattr(self.layer, "layer_id", None)
+            if lid in (0, 23, 47):
+                logging.getLogger(__name__).info(
+                    "MoE expert pool layer %s (H95): captured step of %d ids -> %d "
+                    "wave(s); demand bound min(ids, E-R)=%d, C=LRU+staging=%d, "
+                    "FLLIPER_OPT_MOE_POOL_OVERFLOW_WAVES=%d%s",
+                    lid, int(n_ids), waves,
+                    step_row_demand(int(n_ids), t.num_experts, resident_count(t)), C, cap,
+                    (" (#251 capture floor: %d stage/seat rows ON)" % self._pool_capture_on)
+                    if self._pool_capture_on else "",
+                )
+        return waves
+
+    def _stage_capture_rows(self, n_ids: int) -> int:
+        """#251c: the seat rows ON that the captured step of ``n_ids`` routed
+        ids may count on (``d_seat_vram.capture_floor_rows``); 0 on a layer
+        without seat rows or without a KV stage form."""
+        seat_rows = int(getattr(self, "seat_rows", 0) or 0)
+        if seat_rows <= 0:
+            return 0
+        from flliper.srt.pdflip import d_seat_vram as _dsv
+
+        per_seat = None
+        try:
+            from flliper.srt.runtime_context import get_server_args
+
+            sa = get_server_args()
+            spec = getattr(sa, "speculative_algorithm", None)
+            verify = getattr(sa, "speculative_num_draft_tokens", None) if spec else None
+            k = int(getattr(self.layer, "top_k", 0) or 0)
+            per_seat = max(1, int(verify or 1)) * k if k > 0 else None
+        except Exception:  # noqa: BLE001 -- no runtime context: no floor
+            per_seat = None
+        return min(seat_rows, _dsv.capture_floor_rows(int(n_ids), per_seat))
+
+    def set_seat_rows_on(self, k: int, *, device_write: bool) -> int:
+        """H95c: this phase's k of the layer's X seat rows are ON
+        (``expert_pool_device.set_seat_rows_on``). Returns the previous k; a
+        layer without seat rows or without its pool tables accepts only 0."""
+        if self.seat_rows <= 0 or not self._pool_ready:
+            if int(k) != 0:
+                raise ValueError("H95c: seat rows on a layer without seat rows / pool")
+            return 0
+        from flliper.srt.layers.moe.expert_pool_device import set_seat_rows_on
+
+        return set_seat_rows_on(self._pool_tables, int(k), device_write=device_write)
+
+    def _pool_zero_row(self):
+        """H95: a [1] device view of the row that masked wave lanes point at.
+        The expert-shard PAD row (all-zero weights, zeroed at every wake
+        before any forward, resident by construction) when this layer has
+        one -- read off ``hot_phys`` at replay, so a re-layout moves it with
+        the tables; else the first row of the resident region that owns an
+        expert (a deferred H31b row owns none and is never chosen)."""
+        import torch
+
+        t = self._pool_tables
+        pad = self._pool_pad_expert()
+        if pad is not None:
+            return t.hot_phys[pad : pad + 1]
+        owned = (t.row_key[: max(1, t.lru_start)] >= 0).to(torch.int32)
+        return torch.argmax(owned).reshape(1).to(torch.int32)
+
+    def _pool_pad_expert(self):
+        """The local id of this layer's expert-shard pad (``FusedMoE.
+        pool_prefetch_local_ids``' rule) when it is a resident pool row."""
+        layer = self.layer
+        if not getattr(layer, "_gguf_expert_shard", False):
+            return None
+        rng = getattr(layer, "_gguf_expert_range", None)
+        if rng is None:
+            return None
+        lo, hi = rng
+        pad = 0 if getattr(layer, "_expert_shard_generic", False) else int(hi) - int(lo)
+        _hot, host_row = self._pool_layout()
+        if not 0 <= pad < len(host_row) or int(host_row[pad]) >= 0:
+            return None
+        return pad
+
+    def run_pool_waves(self, dispatch_output, apply_fn, waves: int):
+        """H95: the captured decode MoE in ``waves`` pool steps (module
+        docstring of ``expert_pool_device``, OVERFLOW WAVES).
+
+        Wave 1 is ``prepare_pool`` with ``spill``: lanes whose expert found no
+        row keep route -1 and are recomputed by the next wave. In every wave a
+        lane it does not serve points at the zero row with weight 0, so each
+        (token, k) lane contributes in exactly one wave and the sum of the
+        waves' outputs is the one-wave output (bit-exact when wave 1 serves
+        everything: the later waves then add exact zeros). The last wave runs
+        without ``spill`` -- anything it cannot serve sets the sticky error as
+        before H95, and the capture-time bound makes that impossible."""
+        import torch
+
+        topk_output = dispatch_output.topk_output
+        topk_ids = topk_output.topk_ids
+        weights = topk_output.topk_weights
+        bs, k = topk_ids.shape
+        E = self.num_local_experts
+        flat = topk_ids.reshape(-1)
+        if flat.dtype != torch.int32:
+            flat = flat.to(torch.int32)
+        routes = self.prepare_pool(topk_ids, spill=True, waves=waves).reshape(-1)
+        zero_row = self._pool_zero_row().to(routes.dtype)
+        valid = (flat >= 0) & (flat < E)
+        over = valid & (routes < 0)
+        zero_w = torch.zeros_like(weights)
+
+        def _run(lane_routes, lane_keep):
+            sub_topk = topk_output._replace(
+                topk_ids=lane_routes.view(bs, k),
+                topk_weights=torch.where(lane_keep.view(bs, k), weights, zero_w),
+            )
+            return apply_fn(dispatch_output._replace(topk_output=sub_topk))
+
+        first = _run(torch.where(over, zero_row, routes), ~over)
+        hidden = first.hidden_states
+        ids = torch.where(over, flat, torch.full_like(flat, -1))
+        for wave in range(2, int(waves) + 1):
+            last = wave == int(waves)
+            r = self._pool_wave_step(ids, spill=not last, waves=waves).to(routes.dtype)
+            served = (ids >= 0) & (r >= 0)
+            hidden = hidden + _run(torch.where(served, r, zero_row), served).hidden_states
+            if not last:
+                ids = torch.where((ids >= 0) & (r < 0), ids, torch.full_like(ids, -1))
+        return first._replace(hidden_states=hidden)
+
+    def _pool_wave_step(self, ids, *, spill: bool, waves: int):
+        """H95: one later wave -- plan ``ids`` (lanes not in this wave = -1),
+        copy its misses, return its routes (flat, one per lane)."""
+        from contextlib import nullcontext
+
+        from flliper.srt.layers.moe.expert_pool_device import copy_rows, step
+        from flliper.srt.utils.collective_clock import collective_clock
+
+        clock = collective_clock()
+        armed = clock.armed
+        with clock.span("pool.step") if armed else nullcontext():
+            step(self._pool_tables, ids, self._pool_buffers, spill=spill, wave=True,
+                 waves=waves, capture_rows_on=getattr(self, "_pool_capture_on", 0))
+        with clock.span("pool.fetch") if armed else nullcontext():
+            copy_rows(
+                self._pool_srcs,
+                self._pool_dsts,
+                self._pool_buffers.gather_src,
+                self._pool_buffers.gather_dst,
+                self._pool_buffers.gather_count,
+            )
+        return self._pool_buffers.routes[: ids.numel()]
+
+    def prepare_pool(self, topk_ids, spill: bool = False, waves: int = 1):
+        """The captured decode step: plan on the device, copy only the misses
+        (device count), return the physical rows the apply reads. Pure device
+        ops with fixed addresses -- captured once, replayed every step.
+        ``spill``/``waves``: wave 1 of ``run_pool_waves`` (H95); the defaults
+        are the step before H95."""
+        import torch
+
+        from flliper.srt.layers.moe.expert_pool_device import copy_rows, step
+
+        if not self._pool_ready:
+            self.install_pool()
+        bs, k = topk_ids.shape
+        flat = topk_ids.reshape(-1)
+        if flat.dtype != torch.int32:
+            flat = flat.to(torch.int32)
+        if self._pool_pf_armed:
+            # The speculative rows for THIS layer were copied on the side
+            # stream while the previous layer computed. One wait, captured into
+            # the graph, and the real plan below sees them as ordinary hits.
+            self._pool_pf_armed = False
+            torch.cuda.current_stream().wait_event(self._pool_pf_done)
+        heat = getattr(self, "_pool_heat", None)
+        if heat is not None:
+            # #276: wave 1 sees every lane of the step; on the device, no host read
+            from flliper.srt.layers.moe import pool_heat
+
+            pool_heat.count(heat, self._pool_heat_ones, flat, self.num_local_experts)
+        # 20.09. (fn8u, Task #52): the pool step and the row fetch are timed
+        # as their own clock families, so a decode round's split names the
+        # host->device expert traffic apart from compute and collectives.
+        # Outside a capture/round the span costs one attribute read.
+        from contextlib import nullcontext
+
+        from flliper.srt.utils.collective_clock import collective_clock
+
+        clock = collective_clock()
+        armed = clock.armed
+        with clock.span("pool.step") if armed else nullcontext():
+            if spill or waves != 1:
+                step(self._pool_tables, flat, self._pool_buffers, spill=spill, waves=waves,
+                     capture_rows_on=getattr(self, "_pool_capture_on", 0))
+            else:
+                step(self._pool_tables, flat, self._pool_buffers,
+                     capture_rows_on=getattr(self, "_pool_capture_on", 0))
+        with clock.span("pool.fetch") if armed else nullcontext():
+            copy_rows(
+                self._pool_srcs,
+                self._pool_dsts,
+                self._pool_buffers.gather_src,
+                self._pool_buffers.gather_dst,
+                self._pool_buffers.gather_count,
+            )
+        routes = self._pool_buffers.routes[: bs * k].view(bs, k)
+        return routes if routes.dtype == topk_ids.dtype else routes.to(topk_ids.dtype)
+
+    def prefetch_pool(self, predicted_ids):
+        """Speculative pass for THIS layer, issued by the PREVIOUS layer while
+        its experts compute (FLLIPER_MOE_POOL_PREFETCH=1).
+
+        ``predicted_ids`` are this layer's LOCAL expert ids as the caller's
+        block predicted them -- the next MoE block's router applied to the
+        current block's MoE input, remapped through the expert shard, padding
+        marked -1 (see ``FusedMoE.pool_prefetch``).
+
+        Everything runs on ONE side stream per rank, joined to the caller's
+        stream by two events so a CUDA graph captures the fork: the side stream
+        waits for ``begin`` (recorded on the main stream, which is therefore
+        also ordered behind this layer's PREVIOUS-round GEMM), plans and copies
+        the predicted rows, and records ``done``; ``prepare_pool`` waits for
+        ``done`` before this layer's real step. Nothing is allocated here that
+        is not already allocated: the plan writes the layer's own prefetch
+        buffers, the copy writes its own bank rows."""
+        import torch
+
+        from flliper.srt.layers.moe.expert_pool_device import copy_rows, step
+
+        if not self._pool_ready:
+            self.install_pool()
+        if self._pool_pf_buffers is None:
+            return False
+        flat = predicted_ids.reshape(-1)
+        width = self._pool_pf_buffers.gather_src.shape[0]
+        if flat.numel() > width:
+            flat = flat[:width]
+        # The side stream reads the ids from the layer's OWN buffer, filled on
+        # the main stream before the fork. ``predicted_ids`` is a temporary of
+        # the caller's forward (top-k output); under graph capture its block
+        # goes back to the private pool as soon as the caller drops it and a
+        # later allocation on the capture stream may reuse it -- concurrently
+        # with the side-stream step on replay. fn6n (19.09.): three ranks died
+        # with an illegal address on the first replay after two clean warmup
+        # forwards, the signature of exactly that race.
+        ids = self._pool_pf_buffers.ids[: flat.numel()]
+        ids.copy_(flat)
+        side = pool_prefetch_stream()
+        main = torch.cuda.current_stream()
+        self._pool_pf_begin.record(main)
+        with torch.cuda.stream(side):
+            side.wait_event(self._pool_pf_begin)
+            step(self._pool_tables, ids, self._pool_pf_buffers, prefetch=True)
+            copy_rows(
+                self._pool_srcs,
+                self._pool_dsts,
+                self._pool_pf_buffers.gather_src,
+                self._pool_pf_buffers.gather_dst,
+                self._pool_pf_buffers.gather_count,
+            )
+            self._pool_pf_done.record(side)
+        self._pool_pf_armed = True
+        return True
+
+    def run_eager_pool(self, dispatch_output, apply_fn):
+        """An eager forward (extend, uncaptured shape) under the pool mode, the
+        FusedMoE branch in one place: record the rows run_waves writes, split
+        in the pool's eager order (FLLIPER_OPT_MOE_POOL_EAGER_EXPERT_MAJOR,
+        H12: expert-major -- each spill expert fetched once and held by one
+        row), then republish those rows to the device tables."""
+        self.land_deferred_rows()  # H31b: run_waves plans with every resident row
+        resume_warm().eager_reached(self)  # RW: an eager layer never waits for the warm
+        self.begin_eager_pool()
+        # H107: static residency and expert-major only (a hot resident set or a
+        # token-major split keep the plain plan). H107b: "static" is the
+        # identity [0,R) at slot == id, not "no map" -- the store layout
+        # (Task #47) spells that identity out as maps, and the NF D pool runs
+        # on the store, so `resident_ids is None` kept H107 off on the metal
+        # (bridge 28.09. 19:38-19:58: 0x 'H107 EAGER-LRU').
+        self._eager_lru_armed = (
+            self._pool_eager_lru_hits
+            and self._pool_ready
+            and self._pool_eager_wave_order == "expert"
+            and eager_lru_static_residency(self.planner, self.resident_count)
+        )
+        try:
+            out = self.run_waves(
+                dispatch_output, apply_fn, lookahead=None, order=self._pool_eager_wave_order
+            )
+        finally:
+            self._eager_lru_armed = False
+        self.sync_pool_from_host()
+        return out
+
+    def begin_eager_pool(self):
+        """Before an eager (prefill / uncaptured) forward under the pool mode:
+        run_waves will rewrite scratch rows; record exactly those."""
+        self._scratch_holds.clear()
+        self._eager_lru_used.clear()
+
+    def sync_pool_from_host(self):
+        """After that eager forward: the device tables take the host's truth
+        for the LRU rows run_waves wrote; the rest of the LRU region is free."""
+        if not self._pool_ready:
+            return
+        import logging
+
+        from flliper.srt.layers.moe.expert_pool_device import (
+            check_pool_error,
+            sync_tables,
+            take_prefetch_report,
+            take_report,
+        )
+
+        check_pool_error(self._pool_tables, f"layer {getattr(self.layer, 'layer_id', '?')} sync")
+        forwards, misses = take_report(self._pool_tables)
+        predicted, fetched, pf_hits, pf_skipped = take_prefetch_report(self._pool_tables)
+        lid = getattr(self.layer, "layer_id", None)
+        if forwards and lid in (0, 23, 47):
+            logging.getLogger(__name__).info(
+                "MoE expert pool layer %s: %d decode forwards since last sync, "
+                "%d misses (%.2f per forward, top-k %d); prefetch predicted %d, "
+                "fetched %d, hits %d, wasted %d, skipped %d",
+                lid, forwards, misses, misses / forwards,
+                getattr(self.layer, "top_k", -1),
+                predicted, fetched, pf_hits, max(fetched - pf_hits, 0), pf_skipped,
+            )
+        from flliper.srt.environ import envs
+
+        keep = envs.FLLIPER_OPT_MOE_POOL_KEEP_LRU.get()
+        resume_warm().note_eager_sync(lid, len(self._scratch_holds))  # RW instrument
+        # H107: a row the pass READ an expert from keeps it and is stamped as
+        # used, exactly like a row it wrote (one owner per expert holds: a hit
+        # row is never written in the same pass)
+        holds = dict(self._eager_lru_used)
+        holds.update(self._scratch_holds)
+        report = sync_tables(self._pool_tables, holds, keep_unwritten=keep)
+        if lid in (0, 23, 47):
+            # Beweiszeile #104 + FLLIPER_OPT_MOE_POOL_KEEP_LRU: wie viel Decode-
+            # Arbeitsmenge ein eager Forward uebrig laesst, und wie viele
+            # Zwillinge (derselbe Experte in zwei Zeilen) er freigegeben hat --
+            # vor #104 blieben sie stehen, und der erste Graph-Verify routete
+            # den Experten auf -1.
+            t = self._pool_tables
+            logging.getLogger(__name__).info(
+                "MoE expert pool layer %s sync: eager pass wrote %d rows, LRU owns "
+                "%d of %d rows after the sync, %d twin rows freed (keep_lru=%s, "
+                "one owner per expert, #104)",
+                lid, len(self._scratch_holds), report.owned,
+                t.pool_rows - t.lru_start, report.twins_freed, keep,
+            )
+
+    def _pool_layout(self):
+        """``(hot_slot_of, host_row)`` -- EINE Rechnung fuer Install und
+        Wake: welcher Experte in welcher Puffer-Zeile resident ist, und in
+        welcher Store-Zeile jeder kalte liegt."""
+        R, E = self.resident_count, self.num_local_experts
+        pool_index = self._spill_pool_index
+        resident_ids = self.planner.resident_ids
+        host_row = []
+        for e in range(E):
+            resident = (e < R) if resident_ids is None else (e in resident_ids)
+            if resident:
+                host_row.append(-1)
+            else:
+                host_row.append(int(pool_index[e]) if pool_index is not None else e - R)
+        hot_slot_of = (
+            dict(self.planner.resident_slot)
+            if self.planner.resident_slot is not None
+            else {e: e for e in range(R)}
+        )
+        return hot_slot_of, host_row
+
+    def _note_route(self, ids) -> None:
+        """fnFL2 H29b, P side: this forward's host ids -> the stage's route
+        file (written once per forward, at the stage's last layer). Never
+        kills a forward."""
+        try:
+            import numpy as np
+
+            from flliper.srt.environ import envs
+
+            _ROUTE_RECORDER.note(
+                getattr(self.layer, "layer_id", -1),
+                np.asarray(ids, dtype=np.int64).reshape(len(ids), -1),
+                self.num_local_experts,
+                int(envs.FLLIPER_PDFLIP_LRU_WARM_TOKENS.get()),
+            )
+        except Exception as exc:  # noqa: BLE001 -- a warm hint never kills a forward
+            logger.debug("[H29b] route note skipped: %s", exc)
+
+    def warm_lru_from_route(self, route, limit: int = 0) -> int:
+        """fnFL2 H29b, D side, right after ``rearm_after_wake``: fill the LRU
+        rows the reinit left free with P's most-routed experts of this layer
+        (``route`` = [(GLOBAL expert, count)], most routed first).
+
+        No new VRAM: only rows that own no expert are written, at most
+        ``limit`` (0 = every free row). The bytes come from the same pinned
+        store rows the step's own misses copy from (``host_row``), on the
+        current stream, BEFORE any replay reads the tables; the tables are
+        written by ``seed_lru_rows`` so the bijection holds. Returns the rows
+        filled."""
+        if not self._pool_ready or not route:
+            return 0
+        import torch
+
+        from flliper.srt.layers.moe.expert_pool_device import copy_rows, seed_lru_rows
+
+        ids = [int(e) for e, _c in route]
+        to_local = getattr(self.layer, "pool_prefetch_local_ids", None)
+        if to_local is not None:
+            dev = self._pool_tables.hot_phys.device
+            local = to_local(torch.tensor(ids, dtype=torch.int64, device=dev))
+            ids = [int(x) for x in local.tolist()]
+        pairs = seed_lru_rows(self._pool_tables, ids, limit=int(limit))
+        if not pairs:
+            return 0
+        dev = self._pool_dsts[0].device
+        src = torch.tensor([p[0] for p in pairs], dtype=torch.int32, device=dev)
+        dst = torch.tensor([p[1] for p in pairs], dtype=torch.int32, device=dev)
+        count = torch.tensor([len(pairs)], dtype=torch.int32, device=dev)
+        copy_rows(self._pool_srcs, self._pool_dsts, src, dst, count)
+        return len(pairs)
+
+    def lru_snapshot(self, limit: int = 0) -> List[int]:
+        """RW: the LOCAL expert ids this layer's LRU rows own right now, most
+        recently used first (``row_use`` desc), at most ``limit`` (0 = all).
+        Two small host reads of the pool tables; call it outside any capture."""
+        if not self._pool_ready:
+            return []
+        t = self._pool_tables
+        lo, hi = int(t.lru_start), int(t.pool_rows)
+        key = t.row_key[lo:hi].cpu().tolist()
+        use = t.row_use[lo:hi].cpu().tolist()
+        owned = sorted(((int(u), int(k)) for k, u in zip(key, use) if int(k) >= 0), reverse=True)
+        ids = [k for _u, k in owned]
+        return ids[:limit] if limit > 0 else ids
+
+    def pool_row_bytes(self) -> int:
+        """RW / K10: bytes ONE pool row moves (every resident buffer's row);
+        0 when the pool is not installed."""
+        dsts = getattr(self, "_pool_dsts", None) or ()
+        try:
+            return int(sum(int(t[0].numel()) * int(t.element_size()) for t in dsts))
+        except Exception:  # noqa: BLE001 -- an instrument
+            return 0
+
+    def warm_lru_local(self, ids, limit: int = 0) -> int:
+        """RW: hand free LRU rows to the LOCAL expert ids ``ids`` and copy their
+        bytes from the pinned store rows, on the CURRENT stream -- the same rows,
+        the same copies a miss makes (``seed_lru_rows`` + ``copy_rows``); no new
+        VRAM, no transient. Returns the rows filled."""
+        if not self._pool_ready or not ids:
+            return 0
+        import torch
+
+        from flliper.srt.layers.moe.expert_pool_device import copy_rows, seed_lru_rows
+
+        pairs = seed_lru_rows(self._pool_tables, [int(e) for e in ids], limit=int(limit))
+        if not pairs:
+            return 0
+        dev = self._pool_dsts[0].device
+        src = torch.tensor([p[0] for p in pairs], dtype=torch.int32, device=dev)
+        dst = torch.tensor([p[1] for p in pairs], dtype=torch.int32, device=dev)
+        count = torch.tensor([len(pairs)], dtype=torch.int32, device=dev)
+        copy_rows(self._pool_srcs, self._pool_dsts, src, dst, count)
+        return len(pairs)
+
+    def rearm_after_wake(self, rows_loaded: bool = False, defer: bool = False) -> int:
+        """Nach dem Wake, bevor irgendein Forward laeuft (Platztausch).
+
+        Der Resume mappt FRISCHE Seiten; der Austausch hat nur den Praefix
+        gefuellt. Hier kommt der Rest: Pad-Zeile nullen, Extra-Zeilen aus ihren
+        festen Store-Plaetzen laden, den LRU-Zustand verwerfen (der Scratch
+        haelt Reste der anderen Gruppe) und die Pool-Tabellen an ihren alten
+        Adressen neu schreiben -- lagen sie unter einem pausierten Tag, sind
+        sie jetzt Muell, und die Graphen lesen genau diese Adressen.
+
+        ``rows_loaded`` (H31): Pad+Extra hat :class:`ExpertRearmPrefetch`
+        schon waehrend der Legs geladen (und der Aufrufer hat dessen Strom
+        gejoint) -- dann bleibt nur der Rest (LRU, Tabellen).
+
+        ``defer`` (H31b): an einem Pool-Layer (Decode) werden die Extra-Zeilen
+        NICHT vor dem ersten Forward geladen. Die Tabellen fuehren diese
+        Experten bis dahin als kalt (Store-Platz als ``host_row``, ein Miss
+        holt sie wie jeden anderen kalten Experten), der Pad wird sofort
+        genullt, und :class:`DeferredRowsFill` laedt die Zeilen nach dem ersten
+        Decode-Forward und befoerdert den Layer dann auf das volle Layout.
+
+        Gibt die Zahl der HIER nachgeladenen Experten-Zeilen zurueck.
+        """
+        import torch
+
+        deferred_rows_fill().drop(self)
+        self._deferred_rows = None
+        runs = tuple(getattr(self.layer, "_moe_offload_refill_runs", ()) or ())
+        entries = [(attr, buf, self._pinned.get(attr))
+                   for attr, buf in self._resident.items()]
+        lid = getattr(self.layer, "layer_id", "?")
+        extra = tuple(r for r in runs if r[1] >= 0)
+        plan = None
+        if defer and not rows_loaded and self._pool_ready and extra:
+            plan = self._deferred_layout(extra, entries)
+        row_list = 0
+        if plan is not None:
+            load_refill_rows(entries, tuple(r for r in runs if r[1] < 0), layer_id=lid)
+        elif not rows_loaded:
+            row_list = load_refill_rows(entries, runs, layer_id=lid)
+        self._scratch_holds.clear()
+        if self._pool_ready:
+            from flliper.srt.layers.moe.expert_pool_device import (
+                apply_pool_layout,
+                pool_layout_tensors,
+                reinit_pool_tables,
+            )
+
+            hot_slot_of, host_row = self._pool_layout()
+            if plan is None:
+                reinit_pool_tables(self._pool_tables, hot_slot_of, host_row)
+            else:
+                hot_cold, host_cold = plan
+                full = pool_layout_tensors(self._pool_tables, hot_slot_of, host_row)
+                apply_pool_layout(self._pool_tables,
+                                  pool_layout_tensors(self._pool_tables, hot_cold, host_cold))
+                self._deferred_rows = DeferredRows(
+                    entries=entries, runs=extra, full=full,
+                    rows=sum(n for _z, _p, n in extra) * len(entries), layer_id=lid)
+                deferred_rows_fill().add(self)
+            if self._pool_pf_buffers is not None:
+                self._pool_pf_armed = False
+        return row_list
+
+    def _deferred_layout(self, extra, entries):
+        """``(hot_slot_of, host_row)`` mit den Extra-Zeilen als KALT, oder None
+        (dann laedt der Rearm seriell): jede Extra-Zeile muss genau einen
+        residenten Experten tragen, und jedes Attribut braucht seinen Store."""
+        if any(spill is None for _a, _b, spill in entries):
+            return None
+        hot_slot_of, host_row = self._pool_layout()
+        expert_of_row = {r: e for e, r in hot_slot_of.items()}
+        hot = dict(hot_slot_of)
+        host = list(host_row)
+        for z0, p0, n in extra:
+            for i in range(n):
+                e = expert_of_row.get(z0 + i)
+                if e is None or host[e] >= 0:
+                    return None
+                del hot[e]
+                host[e] = p0 + i
+        return hot, host
+
+    def land_deferred_rows(self) -> bool:
+        """H31b, vor jedem EAGER Forward dieses Layers: die Host-Planung
+        (``run_waves``) haelt die Extra-Zeilen fuer resident, also muessen sie
+        auf der Karte sein. Laeuft der Nachlader schon, wartet der laufende
+        Strom auf DIESES Layers Event; sonst kommen die Zeilen hier auf den
+        laufenden Strom. Danach das volle Layout. True = es war etwas offen."""
+        if self._deferred_rows is None:
+            return False
+        deferred_rows_fill().land(self)
+        return True
+
+    def _promote_deferred(self) -> None:
+        """Das volle Layout in die Tabellen (laufender Strom, geraeteintern)."""
+        from flliper.srt.layers.moe.expert_pool_device import apply_pool_layout
+
+        d = self._deferred_rows
+        if d is None:
+            return
+        apply_pool_layout(self._pool_tables, d.full)
+        self._scratch_holds.clear()
+        if self._pool_pf_buffers is not None:
+            self._pool_pf_armed = False
+        self._deferred_rows = None
+
+    def prepare_breakable(self, topk_ids, bridge, stage=None):
+        """#462 breakable route: the EAGER pre-replay phase, in one call.
+
+        Runs inside an ``eager_on_graph`` break -- the captured segment before
+        it has ended, the one after it has not begun -- so every host read here
+        is legal, and it re-runs on every replay through the break function the
+        decorator registers. What it must leave behind when it returns is the
+        whole contract the captured compute depends on:
+
+        1. the routed experts' bytes materialised in the FIXED slot arena
+           (``self._resident[attr]``, whose device addresses ``install()`` bound
+           into the layer's parameters and which therefore never move), and
+        2. ``bridge`` -- a static device buffer at a fixed address -- holding
+           this step's expert -> slot vector, which is the only thing the
+           captured kernels read to find out WHICH expert occupies which slot.
+
+        That is the whole of #302b: the graph addresses slots, and the mapping
+        from slot to expert is republished eagerly before every replay.
+
+        SYNC POINTS -- one host/device rendezvous, one pinned H2D, per layer per
+        step. The rendezvous is ``topk_ids.tolist()`` and it is IRREDUCIBLE on
+        this route: which rows to fetch is host knowledge by construction, and
+        MoE routing is sequential across layers (layer L+1's router consumes
+        layer L's output), so the 43 rendezvous a DeepSeek-V4-Flash step pays
+        cannot be batched into fewer. What this route does remove is the eager
+        path's ``_build_lut`` pair of PAGEABLE H2D copies per layer, which block
+        the host because ``non_blocking`` is honoured only for pinned memory:
+        3 host-blocking crossings per layer become 1 rendezvous + 1 pinned copy.
+        See ``docs/dev/DESIGN_462_breakable_route.md`` §4.
+
+        ``stage`` is the pinned host mirror of ``bridge``, owned by the same
+        arena entry so no two bridges can ever share one; ``None`` selects the
+        CPU desk path, where ``bridge`` is host memory and is filled directly.
+        """
+        import numpy as np
+
+        # #494: the four F2 terms are bracketed by host wall clocks here, in the
+        # order the ticket names them. With the probe off, break_cost_phase()
+        # returns one shared no-op object -- no allocation, no clock read.
+        with break_cost_phase("rendezvous"):
+            ids_list = topk_ids.tolist()  # SYNC POINT 1/1: the D2H rendezvous.
+
+        with break_cost_phase("planning"):
+            self._observe_routing(ids_list)
+
+            needed = sorted({e for row in ids_list for e in row if e >= 0})
+            # Fixed-shape invariant, checked BEFORE resolve() so a refusal does
+            # not move a forward counter and the message can name the real
+            # numbers. A captured segment cannot wave-split: its work is fixed
+            # at capture time, so an overflow here is a wrong answer, not a slow
+            # one.
+            spill = self.planner.split_needed(needed)[1]
+            if len(spill) > self.scratch:
+                from flliper.srt.layers.moe.breakable_offload import (
+                    BreakableScratchOverflow,
+                )
+
+                raise BreakableScratchOverflow(
+                    layer_id=getattr(self.layer, "layer_id", None),
+                    spill=len(spill),
+                    scratch=self.scratch,
+                    routed_slots=int(topk_ids.numel()),
+                    cold=self.num_local_experts - self.resident_count,
+                )
+
+            slot_of_needed, fetch_plan = self.planner.resolve(needed)
+
+        # Publish the slot vector BEFORE issuing the fetch. The copy below is
+        # deliberately BLOCKING: a non_blocking copy out of a reused pinned
+        # staging buffer is only safe if the DMA lands before the next write to
+        # that buffer, and an ordering rule that lives in a comment is the
+        # shared-buffer family this fork keeps rediscovering (htccl
+        # _get_out_buf, GraphSharedOutput, _DEQUANT_WS). Blocking makes it safe
+        # by construction. It is issued here, ahead of _fetch, so it waits only
+        # on an already-drained stream (the tolist() above drained it) rather
+        # than on this step's expert DMAs; the payload is tokens x top_k ints.
+        with break_cost_phase("publish"):
+            flat = remap_ids_host(ids_list, slot_of_needed)
+            if stage is None:
+                np.asarray(bridge.reshape(-1))[:] = flat
+            else:
+                np.asarray(stage)[:] = flat
+                bridge.reshape(-1).copy_(stage, non_blocking=False)
+
+        with break_cost_phase("fetch"):
+            self._fetch(fetch_plan)
+        return bridge
+
+    def _observe_routing(self, ids_list):
+        """Fold one forward's host-side routing decision into the instruments
+        and the residency policies, BEFORE this forward resolves and fetches.
+
+        Extracted from ``run_waves`` so the #462 breakable route (which plans
+        and fetches in an eager graph break and then hands a captured segment a
+        static slot buffer) runs the SAME preamble instead of a second copy of
+        it. Nothing here is new: the call order -- router stats, then Stage-1
+        hot freeze, then #302a heat migration -- is preserved exactly, and each
+        step keeps the reason it sits where it does.
+
+        Requires ``ids_list`` already on the host; every step below reads Python
+        ints, so no step adds a device sync of its own.
+        """
+        # #390: fold this forward's routing decision into the per-layer expert
+        # histogram and the hit/miss tally against the resident set. This is the
+        # fetch-decision point -- residency is already known here and the ids
+        # are already on the host, so the instrument adds no device sync. Taken
+        # BEFORE any hot-set freeze below, so an activation is attributed to the
+        # residency that was actually in force when it was routed.
+        if self._router_stats is not None:
+            self._router_stats.record(
+                ids_list, self.planner.resident_ids, self.resident_count
+            )
+            self._stats_collector.maybe_dump_periodic()
+
+        # Stage-1 hot residency: accumulate routing counts, then freeze the R
+        # hottest experts (physical rearrange) once calibration is complete. Done
+        # BEFORE this forward's resolve/fetch/apply so the triggering forward's
+        # own output already uses the frozen set (no intra-run drift).
+        if self._hot_enabled and not self._hot_frozen:
+            for row in ids_list:
+                for e in row:
+                    if e >= 0:
+                        self._hot_counts[e] += 1
+            self._hot_seen += 1
+            if self._hot_seen >= self._hot_calib_steps:
+                self._freeze_hotset()
+
+        # #302a Stage-2: fold this forward into the heat window and, when the
+        # period is up, migrate. Placed here for the same reason the Stage-1
+        # freeze is: this is BETWEEN two forwards' compute, before this
+        # forward's own resolve/fetch, so no wave is reading a slot while it is
+        # rewritten and the triggering forward already sees the new layout.
+        if self._heat is not None:
+            self._heat.observe(
+                ids_list, self.planner.resident_ids, self.resident_count
+            )
+            if self._heat.due():
+                self._migrate_heat()
+
+    def _vector_plan_closed_by(self, topk_ids, order) -> Optional[str]:
+        """fnFL2 H20b/H20c: why this forward must take the nested-list route,
+        or None when it may plan on a numpy array. The list stays only where
+        something still reads it element by element: the router stats, the
+        Stage-1 hot calibration and the #302a heat window. The NaN trace
+        (FLLIPER_NAN_GUARD=1, the Bestform P env) reads rows by index and takes
+        the [T, K] array as it is (H20c: x136 had the switch on and the route
+        shut by exactly that guard, moe_plan_ms 1078-1696 on PP0)."""
+        if not self._plan_vector:
+            return "switch_off"
+        if (self._wave_order if order is None else order) != "expert":
+            return "token_order"
+        if int(topk_ids.numel()) < PLAN_VECTOR_MIN_PAIRS:
+            return "decode_size"
+        if self._router_stats is not None:
+            return "router_stats"
+        if self._hot_enabled and not self._hot_frozen:
+            return "hot_calibration"
+        if self._heat is not None:
+            return "heat_window"
+        return None
+
+    def _run_waves_vector(self, dispatch_output, apply_fn, lookahead):
+        """The expert-major route of ``run_waves`` planned in numpy: one D2H
+        copy of the ids (the same rendezvous ``tolist`` was), ``np.unique``
+        for the used set, no per-element Python. The waves and the flat pair
+        array are the list path's exactly, so the forward is byte-identical;
+        a forward that turns out single-wave re-enters the list path."""
+        import numpy as np
+        import torch
+
+        topk_ids = dispatch_output.topk_output.topk_ids
+        n_own = int(topk_ids.numel())
+        pool_hot = None
+        if lookahead is None and self._eager_lru_armed:
+            # H107: the pool map rides the ids' D2H (see run_waves)
+            both_np = torch.cat(
+                [topk_ids.reshape(-1), self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)]
+            ).cpu().numpy()
+            pool_hot = both_np[n_own:].tolist()
+        elif lookahead is None:
+            both_np = topk_ids.reshape(-1).cpu().numpy()
+        else:
+            _next_cache, pred = lookahead
+            both_np = torch.cat(
+                [topk_ids.reshape(-1), pred.reshape(-1).to(topk_ids.dtype)]
+            ).cpu().numpy()
+        flat_np = both_np[:n_own].astype(np.int64)
+        k = int(topk_ids.shape[-1])
+        if self._route_note:
+            self._note_route(flat_np.reshape(-1, k))
+        # [T, K] int64 rows: nan_disc2 reads ids_list[r] per row, which an
+        # array answers exactly like the list (H20c).
+        self._nan_trace_begin(flat_np.reshape(-1, k))
+        _hap.checkpoint("moe.routed", layer=getattr(self.layer, "layer_id", None),
+                        T=int(topk_ids.shape[0]))
+        resident_used, spill_waves = plan_expert_waves_np(
+            flat_np,
+            self.resident_count,
+            self.scratch,
+            self.planner.resident_ids,
+            num_experts=self.num_local_experts,
+        )
+        if pool_hot is not None:
+            out = self._run_eager_lru(
+                dispatch_output,
+                apply_fn,
+                flat_np=flat_np,
+                resident_used=resident_used,
+                spill_waves=spill_waves,
+                pool_hot=pool_hot,
+            )
+            if out is not None:
+                return out
+        if len(spill_waves) <= 1:
+            own = flat_np.tolist()
+            ids_list = [own[i : i + k] for i in range(0, n_own, k)]
+            prefetch = (
+                None
+                if lookahead is None
+                else self._issue_lookahead(lookahead, both_np[n_own:].tolist())
+            )
+            return self._run_single_wave(dispatch_output, apply_fn, ids_list, prefetch)
+        self.planner.stats.overflow_forwards += 1
+        if lookahead is not None:
+            # the list path drops it too: either _issue_lookahead finds no
+            # installed cache or the multi-wave branch drops the thunk
+            self.planner.stats.lookahead_dropped += 1
+        return self._run_waves_expert_major(
+            dispatch_output, apply_fn, flat_np, resident_used, spill_waves
+        )
+
+    def run_waves(self, dispatch_output, apply_fn, lookahead=None, order=None):
+        """Run the grouped-GEMM for one forward, wave-splitting when the forward
+        needs more unique experts than there are resident slots.
+
+        ``order`` (H12): the overflow split, "token" or "expert"; None is the
+        configured FLLIPER_MOE_OFFLOAD_WAVE_ORDER. ``run_eager_pool`` passes the
+        pool's own eager order.
+
+        ``lookahead`` (WP8): ``(next_cache, predicted_ids)`` -- the offload
+        cache of a LATER layer and the expert ids its router predicted on this
+        layer's stream (already this rank's local ids). The prediction rides
+        the same D2H rendezvous as this forward's routing (one ``tolist`` for
+        both) and, when this forward is a single wave, ``next_cache.prefetch``
+        is issued right after this layer's own fetch.
+
+        ``apply_fn(sub_dispatch_output) -> CombineInput`` runs the unmodified
+        MoE math (``quant_method.apply``) over the resident buffer. We call it
+        once per wave over that wave's token rows and scatter the results back.
+
+        Returns a CombineInput whose hidden_states is the full [T, H] output,
+        byte-identical to the no-offload path (see module docstring).
+        """
+        import numpy as np
+        import torch
+
+        self.land_deferred_rows()  # H31b: the host plan counts the extras as resident
+
+        topk_output = dispatch_output.topk_output
+        topk_ids = topk_output.topk_ids
+        # fnFL2 H20 (FWD-TIMING-PREFILL): router GEMM + top-k end here; the
+        # segment up to the first wave is the rendezvous + host planning.
+        fwd_mark("gate")
+
+        if self.planner.fully_resident:
+            if lookahead is not None:
+                self._issue_lookahead(lookahead, None)
+            out = apply_fn(dispatch_output)
+            fwd_mark("moe_apply")
+            return out
+
+        closed_by = self._vector_plan_closed_by(topk_ids, order)
+        note_plan_route(closed_by, layer_id=getattr(self.layer, "layer_id", None),
+                        pairs=int(topk_ids.numel()))
+        if closed_by is None:
+            return self._run_waves_vector(dispatch_output, apply_fn, lookahead)
+
+        prefetch = None
+        pool_hot = None
+        if lookahead is None and self._eager_lru_armed:
+            # H107: this layer's pool map crosses in the SAME rendezvous as the
+            # routing -- one D2H per layer, as before
+            n_own = topk_ids.numel()
+            k = topk_ids.shape[-1]
+            both = torch.cat(
+                [topk_ids.reshape(-1), self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)]
+            ).tolist()
+            ids_list = [both[i : i + k] for i in range(0, n_own, k)]
+            pool_hot = both[n_own:]
+        elif lookahead is None:
+            ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
+        else:
+            # One rendezvous for both: this forward's routing and the later
+            # layer's prediction cross together.
+            next_cache, pred = lookahead
+            n_own = topk_ids.numel()
+            both = torch.cat(
+                [topk_ids.reshape(-1), pred.reshape(-1).to(topk_ids.dtype)]
+            ).tolist()
+            own = both[:n_own]
+            k = topk_ids.shape[-1]
+            ids_list = [own[i : i + k] for i in range(0, n_own, k)]
+            pred_list = both[n_own:]
+            prefetch = self._issue_lookahead(lookahead, pred_list)
+
+        self._observe_routing(ids_list)
+        if self._route_note:
+            self._note_route(ids_list)
+        self._nan_trace_begin(ids_list)
+        # H13: FLLIPER_DEBUG_HOST_ANON_PROBE -- RssAnon at every MoE site.
+        _hap_layer = getattr(self.layer, "layer_id", None)
+        _hap.checkpoint("moe.routed", layer=_hap_layer, T=len(ids_list))
+
+        # Task #45 (19.09.): expert-oracle dump, eager decode only, rank 0
+        try:
+            from flliper.srt.layers.moe.expert_oracle_dump import active as _oracle_on
+
+            if _oracle_on():
+                from flliper.srt.layers.moe.expert_oracle_dump import record_target
+
+                record_target(
+                    str(getattr(self.layer, "_flliper_prefix", "") or ""),
+                    getattr(self.layer, "layer_id", None),
+                    getattr(dispatch_output, "hidden_states", None),
+                    topk_ids,
+                )
+        except Exception as exc:  # noqa: BLE001 -- a dump never kills a forward
+            logger.debug("[expert-oracle] target record skipped: %s", exc)
+
+        if (self._wave_order if order is None else order) == "expert":
+            # #254: split over SPILL EXPERTS instead of tokens. The single-wave
+            # case is bit-for-bit the token-major fast path below.
+            resident_used, spill_waves = plan_expert_waves(
+                ids_list, self.resident_count, self.scratch, self.planner.resident_ids
+            )
+            if pool_hot is not None:
+                out = self._run_eager_lru(
+                    dispatch_output,
+                    apply_fn,
+                    flat_np=np.asarray(ids_list, dtype=np.int64).reshape(-1),
+                    resident_used=resident_used,
+                    spill_waves=spill_waves,
+                    pool_hot=pool_hot,
+                )
+                if out is not None:
+                    return out
+            if len(spill_waves) > 1:
+                self.planner.stats.overflow_forwards += 1
+                if prefetch is not None:
+                    self.planner.stats.lookahead_dropped += 1
+                return self._run_waves_expert_major(
+                    dispatch_output,
+                    apply_fn,
+                    np.asarray(ids_list, dtype=np.int64).reshape(-1),
+                    resident_used,
+                    spill_waves,
+                )
+            return self._run_single_wave(dispatch_output, apply_fn, ids_list, prefetch)
+
+        waves = plan_token_waves(
+            ids_list, self.resident_count, self.scratch, self.planner.resident_ids
+        )
+
+        # Fast path: the whole forward fits in one wave (typical decode). Remap
+        # the full batch and run a single apply -- no token slicing overhead.
+        if len(waves) == 1:
+            return self._run_single_wave(dispatch_output, apply_fn, ids_list, prefetch)
+
+        # Multi-wave (prefill overflow): process disjoint token subsets.
+        self.planner.stats.overflow_forwards += 1
+        if prefetch is not None:
+            self.planner.stats.lookahead_dropped += 1
+        h2d_before = self.planner.stats.h2d_bytes
+        hidden = dispatch_output.hidden_states
+        scale = dispatch_output.hidden_states_scale
+        topk_weights = topk_output.topk_weights
+        router_logits = getattr(topk_output, "router_logits", None)
+        T = hidden.shape[0]
+        out_full = torch.empty_like(hidden)
+        _router_probe(router_logits, topk_weights, None, int(T), int(topk_weights.shape[1]))
+        combine_out = None
+
+        for _w, rows in enumerate(waves):
+            rows_t = torch.tensor(rows, device=topk_ids.device, dtype=torch.long)
+            needed = sorted({e for r in rows for e in ids_list[r] if e >= 0})
+            slot_of_needed, fetch_plan = self.planner.resolve(needed)
+            fwd_mark("moe_plan")
+            self._fetch(fetch_plan)
+            fwd_mark("moe_fetch")
+            _hap.checkpoint("moe.fetch", layer=_hap_layer, wave=f"{_w}/{len(waves)}",
+                            fetched=len(fetch_plan))
+            self._nan_trace_wave(_w, needed, slot_of_needed)
+            lut = self._build_lut(slot_of_needed, topk_ids.dtype, topk_ids.device)
+
+            tid_w = self._remap(topk_ids.index_select(0, rows_t), lut)
+            tw_w = topk_weights.index_select(0, rows_t)
+            hs_w = hidden.index_select(0, rows_t)
+            sc_w = (
+                scale.index_select(0, rows_t)
+                if isinstance(scale, torch.Tensor) and scale.shape[0] == T
+                else scale
+            )
+            rl_w = (
+                router_logits.index_select(0, rows_t)
+                if isinstance(router_logits, torch.Tensor)
+                and router_logits.dim() >= 1
+                and router_logits.shape[0] == T
+                else router_logits
+            )
+
+            sub_topk = topk_output._replace(
+                topk_weights=tw_w, topk_ids=tid_w, router_logits=rl_w
+            )
+            sub = dispatch_output._replace(
+                hidden_states=hs_w,
+                hidden_states_scale=sc_w,
+                topk_output=sub_topk,
+            )
+            combine_out = apply_fn(sub)
+            out_full.index_copy_(
+                0, rows_t, combine_out.hidden_states.to(out_full.dtype)
+            )
+            fwd_mark("moe_apply")
+            _hap.checkpoint("moe.apply", layer=_hap_layer, wave=f"{_w}/{len(waves)}",
+                            rows=len(rows))
+
+        # Reuse the last wave's CombineInput type/fields, swapping in full output.
+        self._log_wave_h2d("token", len(waves), h2d_before)
+        return combine_out._replace(hidden_states=out_full)
+
+    def _run_eager_lru(
+        self, dispatch_output, apply_fn, *, flat_np, resident_used, spill_waves, pool_hot
+    ):
+        """H107: run this eager pool forward on the plan that reads warm LRU
+        rows (``plan_eager_lru_waves``). ``pool_hot`` is the host copy of the
+        pool's ``hot_phys`` that crossed with the routing. Returns None when the
+        plan does not apply (every scratch row holds a hit); the caller then
+        runs the plain plan. One fetch-free wave for residents + hits; one
+        apply when the misses fit the rows left, expert-major waves otherwise."""
+        t = self._pool_tables
+        bank_rows = int(next(iter(self._resident.values())).shape[0])
+        lru = pool_lru_rows(pool_hot, t.lru_start, min(int(t.pool_rows), bank_rows))
+        spill = [e for wave in spill_waves for e in wave]
+        R = self.resident_count
+        plan = plan_eager_lru_waves(spill, lru, range(R, R + self.scratch))
+        if plan is None:
+            return None
+        hits, miss_waves = plan
+        self._eager_lru_used.update({row: e for e, row in hits.items()})
+        slot0 = {int(e): int(e) for e in resident_used}
+        slot0.update(hits)
+        n_miss = sum(len(w) for w in miss_waves)
+        stats = self.planner.stats
+        stats.forwards += 1 + len(miss_waves)
+        stats.waves += 1 + len(miss_waves)
+        stats.hits += len(slot0)
+        stats.misses += n_miss
+        stats.fetches += n_miss
+        h2d_before = stats.h2d_bytes
+        if len(miss_waves) <= 1:
+            fetch = list(miss_waves[0]) if miss_waves else []
+            slot = dict(slot0)
+            slot.update(fetch)
+            out = self._run_single_wave(
+                dispatch_output, apply_fn, None, slot_plan=(slot, fetch)
+            )
+        else:
+            self.planner.stats.overflow_forwards += 1
+            out = self._run_waves_expert_major(
+                dispatch_output,
+                apply_fn,
+                flat_np,
+                sorted(slot0),
+                [[e for e, _row in w] for w in miss_waves],
+                slot_plans=[(slot0, [])] + [(dict(w), list(w)) for w in miss_waves],
+            )
+        self._note_eager_lru(
+            tokens=int(dispatch_output.topk_output.topk_ids.shape[0]),
+            spill=len(spill),
+            hits=len(hits),
+            misses=n_miss,
+            waves_before=len(spill_waves),
+            waves_after=len(miss_waves),
+            h2d_bytes=stats.h2d_bytes - h2d_before,
+        )
+        return out
+
+    def _note_eager_lru(self, *, tokens, spill, hits, misses, waves_before, waves_after, h2d_bytes):
+        """H107 metal marker, one line per eager forward (INFO for one
+        representative layer, DEBUG for the rest -- the _log_wave_h2d rule).
+        waves_before = the scratch waves the plain plan would have run."""
+        import logging
+
+        global _H107_LOG_LAYER
+
+        layer_id = getattr(self.layer, "layer_id", "?")
+        if _H107_LOG_LAYER is None:
+            _H107_LOG_LAYER = layer_id
+        logging.getLogger(__name__).log(
+            logging.INFO if layer_id == _H107_LOG_LAYER else logging.DEBUG,
+            "H107 EAGER-LRU layer %s: T=%d spill %d = lru_hits %d + misses %d, "
+            "waves %d -> %d, %.3f GiB H2D",
+            layer_id,
+            tokens,
+            spill,
+            hits,
+            misses,
+            waves_before,
+            waves_after,
+            h2d_bytes / float(1 << 30),
+        )
+
+    def _issue_lookahead(self, lookahead, pred_list):
+        """Build the prefetch thunk for ``lookahead`` (see run_waves). With
+        ``pred_list`` None the prediction was not carried across the
+        rendezvous (fully resident layer) and is dropped by name."""
+        next_cache, pred = lookahead
+        if pred_list is None:
+            pred_list = pred.reshape(-1).tolist()
+        if next_cache is None or not getattr(next_cache, "_installed", False):
+            self.planner.stats.lookahead_dropped += 1
+            return None
+
+        def _thunk():
+            next_cache.prefetch(pred_list)
+
+        return _thunk
+
+    def _log_wave_h2d(self, order, waves, before):  # pragma: no cover - CUDA
+        """One line per multi-wave forward with the PCIe volume it cost, so the
+        token- vs expert-major difference is readable off the log instead of
+        being inferred from the wall clock.
+
+        INFO for ONE representative layer (the first that reports; layer 0 is
+        dense in most MoE models, so keying on id 0 logs nothing), DEBUG for the
+        rest -- one line per chunk at the default log level, the full per-layer
+        picture at DEBUG.
+        """
+        import logging
+
+        global _H2D_LOG_LAYER
+
+        gib = (self.planner.stats.h2d_bytes - before) / float(1 << 30)
+        layer_id = getattr(self.layer, "layer_id", "?")
+        if _H2D_LOG_LAYER is None:
+            _H2D_LOG_LAYER = layer_id
+        logging.getLogger(__name__).log(
+            logging.INFO if layer_id == _H2D_LOG_LAYER else logging.DEBUG,
+            "MoE offload layer %s: %s-major prefill, %d waves, %.2f GiB H2D",
+            layer_id,
+            order,
+            waves,
+            gib,
+        )
+
+    def prefetch(self, predicted):
+        """WP8 lookahead: bring the PREDICTED spill experts of this layer into
+        free scratch slots on the copy stream, without joining compute. Called
+        by an EARLIER layer's forward while that layer's GEMM runs, so the
+        H2D overlaps compute instead of sitting on the critical path. A
+        prediction that does not fit the scratch region is truncated to it
+        (the first sorted experts, as resolve() would place them); an expert
+        already held keeps its slot. Returns the number of experts issued."""
+        if not self._installed or self.planner.fully_resident:
+            return 0
+        needed_unique = sorted(set(int(e) for e in predicted if e >= 0))
+        spill = self.planner.split_needed(needed_unique)[1]
+        if self.planner.delegated_ids is not None and not self.planner.delegated_reachable:
+            spill = [e for e in spill if e not in self.planner.delegated_ids]
+        spill = spill[: self.scratch]
+        held_slot_of = {e: slot for slot, e in self._scratch_holds.items()}
+        missing = [e for e in spill if e not in held_slot_of]
+        if not missing:
+            return 0
+        keep = {held_slot_of[e] for e in spill if e in held_slot_of}
+        free = [
+            slot
+            for slot in range(self.resident_count, self.resident_count + self.scratch)
+            if slot not in keep
+        ]
+        plan = list(zip(missing, free))
+        self._fetch(plan, join=False)
+        self.planner.stats.lookahead_prefetched += len(plan)
+        return len(plan)
+
+    def _run_single_wave(self, dispatch_output, apply_fn, ids_list, prefetch=None, slot_plan=None):
+        """One apply over the full batch: every routed expert fits the buffer at
+        once (typical decode, and any prefill whose spill set fits the scratch).
+        Shared by both wave orders -- with a single wave they are the same path.
+
+        ``prefetch`` (WP8 lookahead): a thunk issuing the NEXT layer's
+        predicted spill fetch, run right after this layer's own fetch so the
+        copies overlap this layer's GEMM."""
+        topk_output = dispatch_output.topk_output
+        topk_ids = topk_output.topk_ids
+        # fn8c9b: the layer-0 ROUTER-W event (M=8192 topk=10) ran through this
+        # path and the three-level router probe never saw it -- it was wired into
+        # the expert-major wave path only. Every path that hands topk_weights to
+        # the MoE kernel probes them, or the probe's silence is coverage, not health.
+        _router_probe(
+            getattr(topk_output, "router_logits", None),
+            topk_output.topk_weights,
+            None,
+            int(topk_ids.shape[0]),
+            int(topk_ids.shape[1]),
+        )
+        if slot_plan is not None:
+            # H107: the caller planned the rows (LRU hits + misses)
+            slot_of_needed, fetch_plan = slot_plan
+            needed = sorted(slot_of_needed)
+        else:
+            needed = sorted({e for row in ids_list for e in row if e >= 0})
+            if self.lookahead_sticky:
+                slot_of_needed, fetch_plan, _ = self.planner.resolve_sticky(
+                    needed, self._scratch_holds
+                )
+            else:
+                slot_of_needed, fetch_plan = self.planner.resolve(needed)
+        _tm = _wave_timing_on() and topk_ids.is_cuda
+        fwd_mark("moe_plan")
+        if _tm:
+            import torch
+            _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
+        self._fetch(fetch_plan)
+        self._nan_trace_wave(0, needed, slot_of_needed)
+        fwd_mark("moe_fetch")
+        if _tm:
+            _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
+        if prefetch is not None:
+            prefetch()
+        lut = self._build_lut(slot_of_needed, topk_ids.dtype, topk_ids.device)
+        remapped = self._remap(topk_ids, lut)
+        sub = dispatch_output._replace(
+            topk_output=topk_output._replace(topk_ids=remapped)
+        )
+        out = apply_fn(sub)
+        fwd_mark("moe_apply")
+        _hap.checkpoint("moe.single", layer=getattr(self.layer, "layer_id", None),
+                        fetched=len(fetch_plan))
+        if _tm:
+            _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
+            _wave_timing_note(getattr(self.layer, "layer_id", None), _e0, _e1, _e2,
+                              len(fetch_plan), int(topk_ids.shape[0]))
+        return out
+
+    def _run_waves_expert_major(
+        self, dispatch_output, apply_fn, flat_np, resident_used, spill_waves, slot_plans=None
+    ):  # pragma: no cover - requires CUDA
+        """#254 expert-major prefill: waves are disjoint SPILL-EXPERT groups, so
+        every spill expert crosses PCIe exactly ONCE per forward instead of once
+        per token-major wave (~62x at C=16 on a 2048-token chunk).
+
+        Byte-identity to the token-major path
+        -------------------------------------
+        A wave no longer holds a token's complete top-k, so the per-token
+        reduction may not happen inside the wave -- accumulating per-wave partial
+        sums would re-associate it and lose bit-identity. Instead every wave
+        computes its (token, k-slot) contributions as INDEPENDENT rows: each
+        routed pair becomes its own pseudo-token with top_k == 1, which makes the
+        fused kernel write the weighted contribution straight out (no internal
+        reduction), and it is stored at its own k-slot in a [T, top_k, H] buffer.
+        The k-slot comes from the routing and is independent of the wave split,
+        so the buffer's contents are the same values in the same places for ANY
+        split. The top-k reduction then runs ONCE at the end over the full buffer
+        via ``combine_topk_partials`` -- the same reduction the unsplit kernel
+        applies to its own intermediate_cache3.  Padded (-1) slots are never
+        assigned to a wave and stay zero, which is what the kernel writes for
+        them. Verified bit-exact against the unsplit apply on bf16 and
+        fp8-blockwise up to T=2048/E=64/top_k=8 (tests/moe_offload).
+
+        ``routed_scaling_factor`` is applied by the FINAL reduction, so the
+        per-wave applies run with it neutralized to 1.0 (the kernel's top_k == 1
+        path does not carry a scaling step of its own).
+
+        Cost: one transient [T, top_k, H] buffer per layer, freed when the
+        forward returns.
+        """
+        import numpy as np
+        import torch
+
+        topk_output = dispatch_output.topk_output
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+        hidden = dispatch_output.hidden_states
+        scale = dispatch_output.hidden_states_scale
+        router_logits = getattr(topk_output, "router_logits", None)
+        device = topk_ids.device
+        T, K = int(topk_ids.shape[0]), int(topk_ids.shape[1])
+
+        # pair index (t*K + k) -> wave: 0 = the fetch-free resident wave,
+        # 1..n = spill groups, -1 = padded slot (contributes an exact zero).
+        # flat_np: the [T*K] routed ids as int64 (list path: np.asarray of
+        # the tolist; H20b vector path: the D2H array itself).
+        wave_lut = np.full(self.num_local_experts, -1, dtype=np.int64)
+        for e in resident_used:
+            wave_lut[e] = 0
+        for w, group in enumerate(spill_waves):
+            for e in group:
+                wave_lut[e] = w + 1
+        wave_of_pair = np.where(flat_np >= 0, wave_lut[np.maximum(flat_np, 0)], -1)
+
+        flat_ids = topk_ids.reshape(-1)
+        flat_weights = topk_weights.reshape(-1, 1).contiguous()
+        # Task #49 (fn8c8b): ROUTER-W resolved into gate / renorm / gather.
+        _router_probe(router_logits, topk_weights, flat_weights, T, K)
+        partials = None
+        combine_out = None
+
+        h2d_before = self.planner.stats.h2d_bytes
+        cfg = self.layer.moe_runner_config
+        saved_rsf = cfg.routed_scaling_factor
+        _tm = _wave_timing_on()
+        _tm_ev = []
+        slice_pairs = wave_token_slice_pairs()
+        stream_partials = partials_mode() == "stream"
+        out_acc = None  # [T, H] fp32 when streaming
+        try:
+            cfg.routed_scaling_factor = 1.0
+            for w, needed in enumerate([resident_used] + spill_waves):
+                idx_np = np.flatnonzero(wave_of_pair == w)
+                if idx_np.size == 0:
+                    continue
+                if slot_plans is None:
+                    slot_of_needed, fetch_plan = self.planner.resolve(needed)
+                else:
+                    slot_of_needed, fetch_plan = slot_plans[w]  # H107
+                fwd_mark("moe_plan")
+                if _tm:
+                    _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
+                self._fetch(fetch_plan)
+                _hap.checkpoint("moe.fetch", layer=getattr(self.layer, "layer_id", None),
+                                wave=f"{w}/{len(spill_waves) + 1}", fetched=len(fetch_plan))
+                self._nan_trace_wave(w, needed, slot_of_needed)
+                fwd_mark("moe_fetch")
+                if _tm:
+                    _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
+                lut = self._build_lut(slot_of_needed, topk_ids.dtype, device)
+
+                # The wave's experts are resident in scratch now; the grouped
+                # GEMM over its (token, expert) pairs runs in slices so its
+                # workspace is bounded by the slice, not by the chunk (see
+                # wave_token_slice_pairs). Byte-identical: every pair is
+                # computed exactly once and lands in its own partials row.
+                step = slice_pairs if slice_pairs > 0 else int(idx_np.size)
+                for start in range(0, int(idx_np.size), step):
+                    idx = torch.from_numpy(idx_np[start : start + step]).to(
+                        device, non_blocking=True
+                    )
+                    rows = torch.div(idx, K, rounding_mode="floor")
+                    tid_w = lut[flat_ids.index_select(0, idx)].unsqueeze(1)
+                    tw_w = flat_weights.index_select(0, idx)
+                    hs_w = hidden.index_select(0, rows).contiguous()
+                    sc_w = (
+                        scale.index_select(0, rows)
+                        if isinstance(scale, torch.Tensor) and scale.shape[0] == T
+                        else scale
+                    )
+                    rl_w = (
+                        router_logits.index_select(0, rows)
+                        if isinstance(router_logits, torch.Tensor)
+                        and router_logits.dim() >= 1
+                        and router_logits.shape[0] == T
+                        else router_logits
+                    )
+
+                    sub_topk = topk_output._replace(
+                        topk_weights=tw_w, topk_ids=tid_w, router_logits=rl_w
+                    )
+                    sub = dispatch_output._replace(
+                        hidden_states=hs_w,
+                        hidden_states_scale=sc_w,
+                        topk_output=sub_topk,
+                    )
+                    combine_out = apply_fn(sub)
+                    _gw = getattr(self, "_nan_guard_wave", None)
+                    if _gw is not None:
+                        _gw(combine_out, w, needed, start)
+                    part = combine_out.hidden_states
+                    if stream_partials:
+                        if out_acc is None:
+                            out_acc = torch.zeros(
+                                (T, part.shape[-1]), dtype=torch.float32, device=device
+                            )
+                        out_acc.index_add_(0, rows, part.to(torch.float32))
+                        continue
+                    if partials is None:
+                        partials = torch.zeros(
+                            (T * K, part.shape[-1]), dtype=part.dtype, device=device
+                        )
+                    partials.index_copy_(0, idx, part.to(partials.dtype))
+                _hap.checkpoint("moe.apply", layer=getattr(self.layer, "layer_id", None),
+                                wave=f"{w}/{len(spill_waves) + 1}", pairs=int(idx_np.size))
+                fwd_mark("moe_apply")
+                if _tm:
+                    _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
+                    _tm_ev.append((_e0, _e1, _e2))
+        finally:
+            cfg.routed_scaling_factor = saved_rsf
+
+        if stream_partials:
+            # the combine kernel's job (sum over K, times the routed scaling
+            # factor) was done incrementally; only the scale and dtype remain
+            out_full = (out_acc * saved_rsf).to(combine_out.hidden_states.dtype)
+        else:
+            out_full = torch.empty(
+                (T, partials.shape[-1]), dtype=partials.dtype, device=device
+            )
+            combine_topk_partials(partials.view(T, K, -1), out_full, saved_rsf)
+        self._log_wave_h2d("expert", len(spill_waves) + 1, h2d_before)
+        if _tm and _tm_ev:
+            _wave_timing_note_prefill(
+                getattr(self.layer, "layer_id", None), _tm_ev,
+                sum(len(g) for g in spill_waves), int(T),
+            )
+        return combine_out._replace(hidden_states=out_full)
+
+    # --- Stage-1 hot-set freeze (GPU window) -------------------------------
+    def _freeze_hotset(self):  # pragma: no cover - requires CUDA
+        """Compute the R most-frequently-routed experts (from accumulated
+        calibration counts), physically rearrange every expert tensor so those R
+        occupy the resident GPU slots [0,R) and the rest form the pinned spill
+        pool, install the id->slot / id->pool-row maps on the planner+cache, and
+        FREEZE. One-time, deterministic (tie-break by ascending expert id).
+
+        Byte-identity: this only permutes WHICH physical expert lives in WHICH
+        slot/pool-row. A token's MoE output depends only on its own routed
+        experts' weights and its top-k reduction order (unchanged); each expert's
+        per-block GEMM is independent of its slot. Buffer size (R+C) and every
+        expert's token set are unchanged, so the marlin moe_align tiling is
+        unchanged -> output is bit-identical to the static-[0,R) layout at the
+        same fraction. The win is purely a higher resident hit-rate => fewer H2D
+        fetches. Frozen after this call => residency never drifts => self-det.
+        """
+        import logging
+
+        R = self.resident_count
+        E = self.num_local_experts
+        counts = self._hot_counts
+
+        # Deterministic hot set: highest count first, ties broken by ascending id.
+        ranked = sorted(range(E), key=lambda e: (-counts.get(e, 0), e))
+        hot = sorted(ranked[:R])
+        self._apply_hotset_freeze(hot)
+        self._hot_counts = None  # release; never consulted again
+
+        total = sum(counts.values()) or 1
+        hot_mass = sum(counts.get(e, 0) for e in hot)
+        logging.getLogger(__name__).info(
+            "MoE hot-residency FROZEN on layer %s: R=%d hottest experts hold "
+            "%.1f%% of routed mass over %d calib forwards (static [0,R) held "
+            "%.1f%%); spill pool = %d cold experts.",
+            getattr(self.layer, "layer_id", "?"),
+            R,
+            100.0 * hot_mass / total,
+            self._hot_seen,
+            100.0 * sum(counts.get(e, 0) for e in range(R)) / total,
+            E - R,
+        )
+
+    def _apply_hotset_freeze(self, hot):  # pragma: no cover - requires CUDA
+        if getattr(self.layer, "_moe_offload_store_index", None):
+            raise RuntimeError(
+                "hot-set freeze rearranges the private spill pool; the shared "
+                "expert store (rows = global ids) has no such pool to rearrange"
+            )
+        """Physically install ``hot`` (sorted list of R expert ids) as the
+        frozen resident set: in-place buffer rearrange + planner/cache map
+        install + freeze. Shared by live calibration (_freeze_hotset) and the
+        §5 file-driven freeze_from_source."""
+        import torch
+
+        self._scratch_holds.clear()  # WP8: the slots are about to be rewritten
+        R = self.resident_count
+        E = self.num_local_experts
+        if self._capturable_ready:
+            # The LUTs / pool device views snapshot the frozen layout; a
+            # rearrange after they were built would silently desync them.
+            raise RuntimeError(
+                "hot-set freeze after install_capturable_buffers(); the freeze "
+                "must happen before the capturable buffers are built"
+            )
+        if self._pool_ready:
+            raise RuntimeError(
+                "hot-set freeze after install_pool(); the pool's tables and the "
+                "captured graphs address the frozen layout -- freeze from a "
+                "FLLIPER_MOE_HOTSET_FILE at install, or run with "
+                "FLLIPER_MOE_HOT_RESIDENCY=0 under the pool mode"
+            )
+        hot_set = set(hot)
+        cold = [e for e in range(E) if e not in hot_set]  # ascending
+        resident_slot = {e: i for i, e in enumerate(hot)}
+        spill_pool_index = {e: j for j, e in enumerate(cold)}
+
+        # Rearrange with ZERO extra GPU memory: the co-located 3080 ranks sit at
+        # their full mem budget after load, so a transient second GPU buffer would
+        # OOM. Instead we snapshot the resident region to host, rebuild the spill
+        # pool on host, and overwrite the EXISTING resident buffer in place (H2D
+        # into buf[0:R]); no new GPU tensor is allocated. Per-attr host temp is
+        # one layer's expert set (~O(100 MB)), freed each iteration.
+        for attr in list(self._resident.keys()):
+            buf = self._resident[attr]  # [R+C,...]; slot i (i<R) == expert i
+            old_spill = self._pinned[attr]  # [E-R,...]; row (e-R) == expert e>=R
+            tail = tuple(buf.shape[1:])
+
+            # Host snapshot of the current resident experts [0,R) so overwriting
+            # buf[0:R] in place can never corrupt a not-yet-moved source.
+            resident_host = buf[:R].to("cpu")
+
+            def _src(e):  # current physical tensor for expert e (STATIC layout)
+                return resident_host[e] if e < R else old_spill[e - R]
+
+            # New spill pool (cold experts), pinned for async H2D fetches later.
+            new_spill = pinned_exact_empty((E - R,) + tail, old_spill.dtype)
+            for j, e in enumerate(cold):
+                new_spill[j].copy_(_src(e))  # host<-host (snapshot or old_spill)
+
+            # Push hot experts into the existing resident slots, in place.
+            for i, e in enumerate(hot):
+                buf[i].copy_(_src(e))  # GPU<-host (H2D); no new GPU alloc
+
+            self._pinned[attr] = new_spill  # self._resident[attr] stays `buf`
+            del resident_host, old_spill
+
+        torch.cuda.synchronize()
+        # Install the frozen maps; from here resolve()/_fetch() use the hot set.
+        self.planner.resident_ids = frozenset(hot_set)
+        self.planner.resident_slot = resident_slot
+        self._spill_pool_index = spill_pool_index
+        self._hot_frozen = True
+
+    # --- #302a Stage-2 heat migration --------------------------------------
+    def _current_layout_maps(self):
+        """``(resident_ids, resident_slot, spill_pool_index)``, materialised.
+
+        On the untouched static layout all three are implicit (``[0,R)`` at
+        ``slot == id``, pool row ``id - R``). A migration has to permute them,
+        so the first one materialises the implicit form rather than special-
+        casing every later read.
+        """
+        R = self.resident_count
+        E = self.num_local_experts
+        resident_ids = self.planner.resident_ids
+        resident_slot = self.planner.resident_slot
+        pool_index = self._spill_pool_index
+        if resident_ids is None:
+            resident_ids = frozenset(range(R))
+        if resident_slot is None:
+            resident_slot = {e: e for e in range(R)}
+        if pool_index is None:
+            pool_index = {e: e - R for e in range(R, E)}
+        return resident_ids, dict(resident_slot), dict(pool_index)
+
+    def _migrate_heat(self):
+        """One re-rank round: plan equal-count swaps, execute them, close the
+        window. Called between two forwards, never inside a wave."""
+        import logging
+
+        heat = self._heat
+        resident_ids, resident_slot, pool_index = self._current_layout_maps()
+        pinned = frozenset(
+            int(e)
+            for e in getattr(self.layer, "_moe_offload_pinned_experts", ()) or ()
+        )
+        swaps = heat.plan(
+            resident_ids,
+            pinned=pinned,
+            delegated=self.planner.delegated_ids,
+        )
+        if swaps:
+            self._apply_heat_swaps(swaps, resident_ids, resident_slot, pool_index)
+            heat.stats.rounds_migrating += 1
+            logging.getLogger(__name__).debug(
+                "MoE heat migration on layer %s: %d swap(s) %s",
+                getattr(self.layer, "layer_id", "?"),
+                len(swaps),
+                [f"{h}<-in/{c}->out" for h, c in swaps],
+            )
+        heat.close_round()
+
+    def _apply_heat_swaps(self, swaps, resident_ids, resident_slot, pool_index):
+        """Exchange each ``(promote, demote)`` pair in place.
+
+        VRAM-neutral by construction: no tensor is allocated on the device and
+        no tensor changes shape. Per pair and per expert-major attribute the
+        exchange is three copies through ONE host row of scratch --
+
+            tmp        <- pool[j]     (host->host; the promoted expert's bytes)
+            pool[j]    <- buf[i]      (D2H; the victim takes the freed pool row)
+            buf[i]     <- tmp         (H2D; the promoted expert takes the slot)
+
+        -- so the resident buffer keeps its ``R + C`` rows, the pinned pool
+        keeps its ``E - R`` rows, and the only thing that changed is which
+        expert is addressed by which index.
+
+        The two ``torch.cuda.synchronize()`` calls are load-bearing. Slot ``i``
+        may still be under read by the previous forward's grouped GEMM enqueued
+        on the compute stream (the write-after-read hazard ``_fetch`` documents
+        for the scratch region applies verbatim to the resident region), and the
+        D2H must land before the maps are installed. A round happens once per
+        ``FLLIPER_MOE_HEAT_PERIOD`` forwards, so a full sync is the cheap,
+        obviously correct choice over an event dance.
+        """
+        self._scratch_holds.clear()  # WP8: scratch is the exchange buffer below
+        import torch
+
+        if self._capturable_ready:
+            raise RuntimeError(
+                "heat migration after install_capturable_buffers(); a captured "
+                "gather's LUTs pin the residency layout, so the slot contents "
+                "must not move underneath them (#302a / #452)"
+            )
+        stats = self._heat.stats
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        for attr in list(self._resident.keys()):
+            buf = self._resident.get(attr)
+            pool = self._pinned.get(attr)
+            if buf is None or pool is None:
+                continue
+            per_expert = buf[0].numel() * buf.element_size()
+            for hot, cold in swaps:
+                i = resident_slot[cold]
+                j = pool_index[hot]
+                tmp = pool[j].clone()
+                pool[j].copy_(buf[i])
+                buf[i].copy_(tmp)
+                stats.d2h_bytes += per_expert
+                stats.h2d_bytes += per_expert
+                del tmp
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        # Install the permuted maps only after every byte has landed.
+        new_resident = set(resident_ids)
+        for hot, cold in swaps:
+            i = resident_slot.pop(cold)
+            j = pool_index.pop(hot)
+            resident_slot[hot] = i
+            pool_index[cold] = j
+            new_resident.discard(cold)
+            new_resident.add(hot)
+        self.planner.resident_ids = frozenset(new_resident)
+        self.planner.resident_slot = resident_slot
+        self._spill_pool_index = pool_index
+        stats.swaps += len(swaps)
+        stats.promoted += len(swaps)
+        stats.demoted += len(swaps)
+
+    @property
+    def stats(self) -> ResidencyStats:
+        return self.planner.stats
+
+
+# Per-process cache for FLLIPER_MOE_HOTSET_FILE: every MoE layer freezes from
+# the same small JSON, so parse it once.
+_HOTSET_FILE_CACHE: Dict[str, dict] = {}
+
+
+def hotset_covers_layer(layer) -> bool:
+    """Whether FLLIPER_MOE_HOTSET_FILE describes THIS layer. The file is keyed
+    by the target model's layer ids; an MTP/NEXTN draft layer (checkpoint
+    prefix ``mtp.…``) has layer_id 0 too and, once its experts are split
+    like the target's, the SAME local expert count -- the target's layer-0
+    hot set would silently be frozen onto it (fn4j 19.09.). Draft layers keep
+    the static plan."""
+    prefix = str(getattr(layer, "_flliper_prefix", "") or "")
+    return not (prefix.startswith("mtp") or ".mtp." in prefix)
+
+
+def hotset_path_for_rank(path: str, tp_rank: int) -> str:
+    """One FLLIPER_MOE_HOTSET_FILE for a TP group whose ranks own DISJOINT
+    expert sets (the expert-dim shard): ``{rank}`` in the path names this
+    rank's own file (local expert ids). A path without the token is shared."""
+    return str(path).replace("{rank}", str(int(tp_rank)))
+
+
+def _load_hotset_file(path: str) -> dict:
+    data = _HOTSET_FILE_CACHE.get(path)
+    if data is None:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"FLLIPER_MOE_HOTSET_FILE {path!r}: expected a JSON object "
+                f'{{"<layer_id>": [expert ids hottest-first]}}'
+            )
+        _HOTSET_FILE_CACHE[path] = data
+    return data
+
+
+def repack_door_shards_experts_on_dim0(layer) -> bool:
+    """Does this marlin-repack layer hold a DISJOINT slice of the expert set?
+
+    The two ways a FusedMoE layer ends up expert-major-sharded: expert
+    parallelism (``moe_ep_size > 1``, with ``expert_map`` remapping foreign
+    ids away) and the #82 GGUF expert-dim shard. Anything else is an
+    intermediate-dim TP MoE, which holds an essential slice of EVERY expert
+    and can therefore delegate none of them.
+    """
+    if getattr(layer, "_gguf_expert_shard", False):
+        return True
+    return int(getattr(layer, "moe_ep_size", 1) or 1) > 1
+
+
+def refuse_cold_shard_at_repack_door(layer) -> None:
+    """#421 F8 / #394: the marlin-repack door does not take a cold shard.
+
+    The #394 link-proportional cold-expert policy has two load-time doors.
+    ``a2b21c2880`` wired the GGUF one; this one stayed at ``cold_shard=None``
+    at every production call site, and the merge message nonetheless claimed
+    both halves "take their layout from ONE plan object". The audit recorded
+    that as partial wiring. This function is the resolution, and it is a
+    refusal rather than a wiring for a reason that was measured, not assumed:
+
+    ``partition_cold_experts`` keeps this rank's share of ITS OWN cold experts
+    and drops the rest -- delegating the remainder to a peer's host tier. That
+    is sound only if a delegated expert stays REACHABLE from the rank whose
+    router asks for it. It does not: booted on the reference rig 2026-08-02
+    (V4-Flash UD-IQ3_XXS, TP=3) the GGUF door died on the first forward inside
+    ``ExpertResidencyPlanner.resolve`` -- "experts [80, 83, 94] were delegated
+    to a peer rank's host tier ... but this rank's router asked for them".
+    A delegated expert under a disjoint expert shard is not relocated, it is
+    absent.
+
+    The precondition documented for THIS door -- "only legal on a layer that
+    shards experts on dim 0 and remaps foreign ids away" -- is exactly the
+    disjoint-shard case, i.e. exactly the case in which delegation is unsound.
+    So the door is shut in both directions:
+
+    * an intermediate-dim TP MoE cannot delegate at all (nothing is
+      expert-major here);
+    * an EP / GGUF-expert-shard layer could delegate structurally, but the
+      delegated experts would be unreachable.
+
+    Until a reachability mechanism exists (shared pinned host pools a rank can
+    DMA out of, or EP-style dispatch to the owner), the honest answer is that
+    no production caller passes a cold shard, and one that does gets this
+    error instead of a load that dies on the first token.
+    ``FLLIPER_MOE_HOST_SHARD_UNSAFE_DELEGATE`` -- the same escape hatch the
+    GGUF door carries -- exists so the mechanism can be developed against a
+    real boot. It is not a performance option.
+    """
+    from flliper.srt.environ import envs
+
+    eligible = repack_door_shards_experts_on_dim0(layer)
+    if eligible and envs.FLLIPER_MOE_HOST_SHARD_UNSAFE_DELEGATE.get():
+        return
+    if not eligible:
+        why = (
+            "this layer is an intermediate-dim TP MoE: it holds an essential "
+            "slice of EVERY expert (moe_ep_size=1, no GGUF expert-dim shard), "
+            "so there is no whole expert it could delegate"
+        )
+    else:
+        why = (
+            "this layer shards experts disjointly, which is exactly when a "
+            "delegated expert becomes UNREACHABLE rather than relocated -- "
+            "measured on the reference rig 2026-08-02, the router asks for "
+            "experts no rank holds and the first forward dies. The #394 slice-2 "
+            "shared cold tier (FLLIPER_MOE_COLD_TIER_SHM=1) is that missing "
+            "reachability mechanism, and it is wired at the GGUF streaming "
+            "door -- not here, because this door's own callers are "
+            "intermediate-dim TP MoEs. Set "
+            "FLLIPER_MOE_HOST_SHARD_UNSAFE_DELEGATE=1 only to develop it "
+            "against a real boot"
+        )
+    raise ValueError(
+        "presplit_expert_offload_after_repack(cold_shard=...) is refused "
+        f"(#394 / #421 F8): {why}. Every production caller (fp8.py, "
+        "gptq_moe.py, awq_moe.py) passes no cold shard, and that is the "
+        "intended state, not an oversight."
+    )
+
+
+_SLOT_POOL_OFF_WARNED = set()
+
+
+def _warn_slot_pool_off(rank: int, cold: int, span: int) -> None:
+    """Einmal je Rang sagen, dass der Slot-Pool nicht greift (#72).
+
+    EINMAL, nicht je Layer: die Ursache ist eine Rang-Eigenschaft (die
+    gemessene Residenz bleibt hinter `--rank-moe-resident-fraction`
+    zurueck), also gilt sie fuer alle 48 MoE-Layer gleich. Achtundvierzig
+    identische Zeilen im Bootlog haetten dieselbe Information und weniger
+    Chance, gelesen zu werden.
+    """
+    key = (int(rank), int(span))
+    if key in _SLOT_POOL_OFF_WARNED:
+        return
+    _SLOT_POOL_OFF_WARNED.add(key)
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "[#72] slot pool OFF on rank %d: %d cold experts exceed the %d slots "
+        "its resident fraction reserves -- one store row per expert, as "
+        "before. Raise FLLIPER_MOE_RESIDENT_EXPERT_FRACTION for this rank or "
+        "leave FLLIPER_MOE_EXPERT_STORE_SLOT_FRACTION unset.",
+        int(rank), int(cold), int(span),
+    )
+
+
+def _layer_expert_window(layer):
+    """``(lo, pad)`` -- das Fenster dieses Layers im GLOBALEN Id-Raum.
+
+    #159. Die Regel stand bisher NUR inline in `_expert_store_rows_for`,
+    und der Ladepfad, der die Residenz waehlt, hatte sie nicht. Genau
+    deshalb konnte die Karte etwas anderes beschreiben als der Rang tut:
+    keine der beiden Seiten kannte die Umrechnung der anderen.
+
+    ``lo`` ist die erste globale Id dieses Rangs, ``pad`` sagt, ob lokal 0
+    der Null-Padding-Experte ist (#82, GGUF-Expertenshard) und die echten
+    Ids deshalb bei lokal 1 beginnen. ``None`` heisst "fuer diesen Layer
+    ist kein globales Fenster definiert" -- ein EP-Slice; dann bleibt
+    alles wie bisher.
+
+    Umrechnung, in beide Richtungen die einzige im Haus:
+        lokal -> global:  lo + e - 1 wenn pad (e >= 1), sonst lo + e
+        global -> lokal:  g - lo + 1 wenn pad,          sonst g - lo
+    """
+    num_global = int(getattr(layer, "num_experts", 0) or 0)
+    num_local = int(getattr(layer, "num_local_experts", 0) or 0)
+    if num_global <= 0:
+        return None
+    if getattr(layer, "_expert_shard_generic", False):
+        rng = getattr(layer, "_gguf_expert_range", None)
+        if rng is None:
+            return None
+        return int(rng[0]), True
+    if num_local == num_global:
+        return 0, False           # unsharded PP-Stufe: lokal == global
+    return None                   # EP-Slice
+
+
+def _karten_residenz_lokal(layer, num_local):
+    """Die LOKALEN Ids, die DIE KARTE fuer diesen Rang resident nennt.
+
+    #159, und es ist der Leser, der seit #107 fehlte: `resident_of` gibt es
+    seit die Karte gebaut wird, und sie hatte NULL AUFRUFER. Die Residenz
+    stellte weiter `resident_fraction_for_rank()` her, also beschrieb die
+    Karte etwas, das niemand herstellte. fnFL2w133 ist daran gestorben --
+    mit eingeschaltetem Spiegel sofort und laut (`#107: 113 eigene kalte
+    Experten haben in der KARTE keinen Platz`), ohne ihn still.
+
+    Das ist dieselbe Klasse wie #140, #156 und #107 selbst: gebaut, nie
+    verdrahtet. Vier Instanzen an einem Tag, diese hier von mir.
+
+    ``None`` heisst "keine Karte fuer diesen Layer" -- dann gilt das
+    Hotset, und ohne Hotset die alte Regel. Kein Raten: eine falsche
+    Residenzmenge ist eine falsche Slot-Zuordnung, und die ist
+    Datenverlust (wie #91/3).
+    """
+    from flliper.srt.layers.moe import expert_map as _em
+    from flliper.srt.layers.moe import expert_store as _es
+
+    emap = _es.expert_map()
+    if emap is None:
+        return None
+    window = _layer_expert_window(layer)
+    if window is None:
+        return None
+    lo, pad = window
+    try:
+        phase = _em.phase_of(_group_of_layer(layer))
+        glob = _em.resident_of(emap, phase, int(getattr(layer, "moe_tp_rank", 0)))
+    except Exception:
+        return None
+    if not glob:
+        return None
+
+    local_ids = set()
+    fremd = []
+    for g in glob:
+        e = int(g) - int(lo) + (1 if pad else 0)
+        if 0 <= e < int(num_local):
+            local_ids.add(e)
+        else:
+            fremd.append(int(g))
+    # Der Pad-Experte hat KEIN globales Gegenstueck (#82) und muss resident
+    # bleiben, sonst faellt jeder fremde Top-k-Treffer in den Spill-Pool.
+    if pad:
+        local_ids.add(0)
+    if not local_ids:
+        return None
+    # Ids AUSSERHALB des eigenen Fensters sind kein Fehler: die Karte fuehrt
+    # alle Raenge, und die PP-Stufen halten denselben globalen Raum. Sie
+    # gehoeren schlicht jemand anderem. Gezaehlt werden sie trotzdem, damit
+    # eine Karte, die gar nicht zu diesem Rang passt, sichtbar wird.
+    if fremd and not local_ids:
+        return None
+    return tuple(sorted(local_ids))
+
+
+def _local_map_layout(layer, num_local):
+    """Version-2-Karte (Platztausch): ``(reihenfolge, praefix, refill)`` oder None.
+
+    ``reihenfolge`` sind die LOKALEN Ids in PUFFER-Ordnung:
+    ``[gemeinsam (sortiert) | Pad | Extra]``. Die ersten ``praefix`` Zeilen
+    halten BEIDE Phasen und wandern ueber den Austausch; alles dahinter holt der
+    aufwachende Rang selbst aus dem Store (``refill``: ``(zeile, platz)``,
+    ``platz=-1`` ist der Null-Pad-Experte). Weil Gewichte sich nie aendern, liegt
+    jeder Experte ausserhalb der Schnittmenge DAUERHAFT in seinem festen Platz --
+    beim Schlafen wird nichts zurueckgeschrieben.
+
+    ``None``: keine Version-2-Karte oder kein globales Fenster -- dann gilt der
+    bisherige Pfad (`_karten_residenz_lokal`, Hotset, erste R).
+    """
+    from flliper.srt.layers.moe import expert_map as _em
+    from flliper.srt.layers.moe import expert_store as _es
+
+    emap = _es.expert_map()
+    if not _em.is_nested(emap):
+        return None
+    window = _layer_expert_window(layer)
+    layer_id = getattr(layer, "layer_id", None)
+    if window is None or layer_id is None:
+        return None
+    lo, pad = window
+    phase = _em.phase_of(_group_of_layer(layer))
+    lay = _em.rank_layout(emap, phase, int(layer_id),
+                          int(getattr(layer, "moe_tp_rank", 0) or 0))
+    if lay is None:
+        return None
+    name_prefix, extra, _ = lay
+
+    def local_ids(g):
+        return int(g) - int(lo) + (1 if pad else 0)
+
+    pre_l = [local_ids(g) for g in name_prefix]
+    ext_l = [local_ids(g) for g in extra]
+    outside = [e for e in pre_l + ext_l if not 0 <= e < int(num_local)]
+    if outside:
+        raise RuntimeError(
+            f"Platztausch-Karte: Layer {layer_id} Phase {phase} nennt Ids "
+            f"ausserhalb dieses Rangs (lokal {outside[:4]}, lo={lo}, "
+            f"pad={pad}, E={num_local}) -- Karte und Expertenfenster "
+            f"beschreiben nicht denselben Rang"
+        )
+    ordering = pre_l + ([0] if pad else []) + ext_l
+    refill = []
+    row_idx = len(pre_l)
+    if pad:
+        refill.append((row_idx, -1))
+        row_idx += 1
+    for g in extra:
+        slot_idx = _em.slot_of(emap, phase, g)
+        if slot_idx is None:
+            raise RuntimeError(
+                f"Platztausch-Karte: Extra-Experte {g} (Layer {layer_id}, "
+                f"Phase {phase}) hat keinen Store-Platz -- er koennte nach dem "
+                f"Wake nicht nachgeladen werden")
+        refill.append((row_idx, int(slot_idx)))
+        row_idx += 1
+    return tuple(ordering), len(pre_l), tuple(refill)
+
+
+def _refuse_unbuilt_platztausch_buffer(layer, *, frac: float, why: str) -> None:
+    """W120 at LOAD: the Version-2 Karte gives this layer a Platztausch
+    layout, but this rank is about to keep the plain [E] stack instead.
+
+    fnFL2x100: P's last stage ran at fraction 1.0, this door returned before
+    building a buffer, and the stage published ``mlp.experts.w13_weight_packed``
+    [512, ...] where every D rank published ``pdflip_experts_*`` -- the flip's
+    join had nothing to pair for layers 40-47 and D TP1 died at W106 in the
+    first sleep leg, 5 minutes after load. The Karte and the rank must build
+    the same thing; when they cannot, the load is the place to say so.
+    ``None`` from ``_karten_layout_lokal`` (no Version-2 Karte, EP slice)
+    keeps the pre-Karte behaviour: no buffer, no refusal. The NEXTN draft
+    (``FLLIPER_MOE_OFFLOAD_EXCLUDE_DRAFT=1``) is fully resident BY DESIGN and
+    outside the Karte -- its one-layer block is ``model.layers.0`` again, so
+    the Karte would otherwise answer for P stage 0's layer 0.
+    """
+    from flliper.srt.layers.moe import expert_map as _em
+    from flliper.srt.layers.moe import expert_store as _es
+
+    if not _em.is_nested(_es.expert_map()) or layer._moe_offload_excluded:
+        return
+    num_local = int(layer.num_local_experts)
+    if num_local <= 0 or _local_map_layout(layer, num_local) is None:
+        return
+    top = (num_local - MIN_SCRATCH_ROWS) / num_local
+    raise RuntimeError(
+        f"W120 PdFlipPlatztauschBufferUnbuilt: layer {layer.layer_id} group "
+        f"{_group_of_layer(layer)} rank {layer.moe_tp_rank}: {why} (fraction "
+        f"{frac}) -- this rank would keep the plain [{num_local}] expert "
+        f"stack, while the Platztausch-Karte gives the layer a buffer whose "
+        f"prefix the flip moves by name; the other group has no counterpart "
+        f"for the plain stack. Keep this rank's resident fraction at or below "
+        f"{math.floor(top * 1000) / 1000:.3f} ((E-{MIN_SCRATCH_ROWS})/E, "
+        f"E={num_local}): the buffer still spans every expert row.")
+
+
+def load_refill_rows(entries, runs, *, layer_id="?") -> int:
+    """Pad+Extra EINES Layers auf den laufenden Strom legen (Platztausch).
+
+    ``entries`` sind ``(attr, buf, spill)`` je Experten-Attribut, ``runs`` die
+    ``(zeile0, platz0, n)``-Laeufe der Karte (:func:`_refill_runs`). Ein Pad-Lauf
+    (``platz0 < 0``) wird genullt, jeder andere aus seinem festen Store-Platz
+    kopiert (gepinnter Host -> Karte, ``non_blocking``). Gibt die Zahl der
+    kopierten Zeilen zurueck. EINE Stelle fuer den seriellen Rearm, den
+    Presplit-Fall und den H31-Prefetch, damit die drei nie verschiedene Bytes
+    laden.
+    """
+    row_list = 0
+    for attr, buf, spill in entries:
+        for z0, p0, n in runs:
+            if p0 < 0:
+                buf[z0 : z0 + n].zero_()
+                continue
+            if spill is None:
+                raise RuntimeError(
+                    f"rearm_after_wake: Layer {layer_id} {attr} hat "
+                    f"Extra-Zeilen, aber keinen Store")
+            buf[z0 : z0 + n].copy_(spill[p0 : p0 + n], non_blocking=True)
+            row_list += n
+    return row_list
+
+
+def _rearm_targets(module):
+    """``(cache, runs, entries)`` eines Moduls oder None -- genau die
+    Verzweigung von :func:`rearm_expert_offload_after_wake`: ein installierter
+    Cache nimmt seine eigenen Puffer (Runs am ``cache.layer``), sonst der
+    Presplit-Stash (derselbe Tensor, den der Install spaeter uebernimmt)."""
+    runs = getattr(module, "_moe_offload_refill_runs", None)
+    cache = getattr(module, "_expert_offload", None)
+    if cache is not None and isinstance(cache, MoEExpertOffloadCache):
+        if runs is None and not cache._pool_ready:
+            return None
+        c_runs = tuple(getattr(cache.layer, "_moe_offload_refill_runs", ()) or ())
+        return cache, c_runs, [(attr, buf, cache._pinned.get(attr))
+                               for attr, buf in cache._resident.items()]
+    presplit = getattr(module, "_moe_offload_presplit", None)
+    if not runs or not presplit:
+        return None
+    return None, tuple(runs), [(attr, buf, spill)
+                               for attr, (buf, spill) in presplit.items()]
+
+
+def rearm_expert_offload_after_wake(model, prefetch=None, defer=False, sync=True):
+    """``(layer, zeilen)``: jeden Offload-Layer des Modells nach dem Wake
+    wieder rechenfaehig machen (Platztausch). Laeuft auf der AUFWACHENDEN Seite,
+    nachdem die Tags gemappt und die Austausch-Stuecke gesammelt sind, und
+    bevor irgendein Forward laeuft (weight_updater, hinter
+    `zero_local_scratch`).
+
+    Ein Layer ohne installierten Cache (Install ist lazy, erster Forward) wird
+    ueber seinen Presplit-Puffer bedient -- es ist derselbe Tensor, den der
+    Install spaeter uebernimmt. Ohne Version-2-Karte gibt es keine
+    `_moe_offload_refill_runs`, und die Funktion tut nichts.
+
+    ``prefetch`` (H31): ein GEJOINTER :class:`ExpertRearmPrefetch`. Layer, deren
+    Pad+Extra er schon geladen hat, laden hier nichts mehr (LRU und Tabellen
+    macht der Rearm weiter selbst); alle anderen laden wie bisher seriell.
+    ``zeilen`` zaehlt nur die HIER geladenen Zeilen.
+
+    ``defer`` (H31b): Pool-Layer laden ihre Extra-Zeilen erst nach dem ersten
+    Decode-Forward (:class:`DeferredRowsFill`); ``sync`` (H31b): am Ende nur
+    den LAUFENDEN Strom abwarten, nie das ganze Geraet -- ein geraeteweites
+    ``synchronize`` wartete auch auf den Draft-Unpark (1,5 GB auf der 5090,
+    x146 TP0 rearm 139 ms bei 232 Zeilen) und auf das KV-Laden der Arena.
+    Die Ordnung zum ersten Forward gibt der Strom (forward_stream wartet
+    schedule_stream); ``sync=False`` laesst auch das Host-Warten weg.
+    """
+    import torch
+
+    if prefetch is not None and not prefetch.joined:
+        raise RuntimeError(
+            "rearm_expert_offload_after_wake: der H31-Prefetch ist nicht gejoint "
+            "-- sein Seitenstrom kann noch in die Puffer schreiben, die der "
+            "Rearm gleich an den ersten Forward gibt")
+    loaded = prefetch.loaded if prefetch is not None else frozenset()
+    layers = row_list = 0
+    for module in model.modules():
+        target = _rearm_targets(module)
+        if target is None:
+            continue
+        cache, runs, entries = target
+        pre = id(module) in loaded
+        if cache is not None:
+            row_list += cache.rearm_after_wake(rows_loaded=pre, defer=defer)
+        elif not pre:
+            row_list += load_refill_rows(entries, runs,
+                                       layer_id=getattr(module, "layer_id", "?"))
+        layers += 1
+    if sync and layers and torch.cuda.is_available():
+        torch.cuda.current_stream().synchronize()
+    _warm_after_wake(model)
+    return layers, row_list
+
+
+@dataclass
+class DeferredRows:
+    """H31b: what one pool layer still owes after a deferred rearm."""
+
+    entries: list  # (attr, buf, spill)
+    runs: tuple  # the extra runs (zeile0, platz0, n), platz0 >= 0
+    full: object  # expert_pool_device.PoolLayout of the full residency
+    rows: int  # rows over all attrs, the unit of rows_from_store
+    layer_id: object = "?"
+
+
+class DeferredRowsFill:
+    """fnFL2 H31b: die Extra-Zeilen des Platztauschs NACH dem ersten Token.
+
+    x147 (H31, Prefetch in den Legs): Mechanik gruen, Flip P->D 4,10 s statt
+    2,57 s. Der Eingang der Worker-Karten ist in den Legs KEIN freier Platz --
+    TP1 (x4, 6,5 GB/s) empfaengt dort ~14 GB Austausch plus das KV der Arena;
+    jede zusaetzliche Kopie verlaengert die Legs (+286 ms leg_collects) und
+    liess das KV-Lesen kurz vor dem Drain unfertig (94208/97792, Settle
+    +0,9 s). Seriell nach den Legs (x146) kosten dieselben Bytes TP1 ~165 ms
+    vor der Fence. Beides liegt VOR dem ersten Token; frei ist der Eingang
+    erst danach.
+
+    Also: der Rearm fuehrt die Extra-Experten eines Pool-Layers als KALT (ein
+    Decode-Miss holt sie aus demselben Store-Platz, rechnet also dieselben
+    Bytes), der erste Decode-Tick startet das Laden auf einem Seitenstrom
+    (ein Event je Layer), jeder spaetere Tick befoerdert die fertigen Layer
+    auf das volle Layout -- auf dem Forward-Strom, zwischen zwei Forwards,
+    ohne Host-Warten. Ein EAGER Forward (Extend) eines noch offenen Layers
+    landet ihn vorher (:meth:`land`), weil ``run_waves`` auf dem Host mit
+    voller Residenz plant. Der Schlaf wartet einen laufenden Nachlader ab
+    (:meth:`settle`), bevor irgendein Tag pausiert.
+    """
+
+    LINE = "PDFLIP-REARM-DEFER"
+
+    def __init__(self, *, stream_ops="cuda", clock=None):
+        import time
+
+        self._ops_arg = stream_ops
+        self._clock = clock or time.perf_counter
+        self.reset()
+
+    def reset(self) -> None:
+        self.pending: List["MoEExpertOffloadCache"] = []
+        self.events: Dict[int, object] = {}
+        self.stream = None
+        self.started = False
+        self.t_rearm = None
+        self.t_start = None
+        self.rows_total = 0
+        self.rows_landed = 0
+        self.by_tick = 0
+        self.by_eager = 0
+        self.ticks = 0
+
+    def _ops(self):
+        if self._ops_arg == "cuda":
+            self._ops_arg = _default_stream_ops()
+        return self._ops_arg
+
+    # -- rearm side ---------------------------------------------------------
+    def add(self, cache) -> None:
+        if not self.pending:
+            self.t_rearm = self._clock()
+        self.pending.append(cache)
+        self.rows_total += int(cache._deferred_rows.rows)
+
+    def drop(self, cache) -> None:
+        if cache in self.pending:
+            self.pending.remove(cache)
+            self.events.pop(id(cache), None)
+
+    def rows_pending(self) -> int:
+        return sum(int(c._deferred_rows.rows) for c in self.pending
+                   if c._deferred_rows is not None)
+
+    # -- forward side -------------------------------------------------------
+    def start(self) -> None:
+        """Alle offenen Layer auf den Seitenstrom, ein Event je Layer."""
+        if self.started or not self.pending:
+            return
+        ops = self._ops()
+        self.started = True
+        self.t_start = self._clock()
+        if ops is not None and self.stream is None:
+            self.stream = ops.new_stream()
+        self._issue(list(self.pending))
+        logger.info("%s fill-start layers=%d rows=%d since_rearm_ms=%.0f (the extra rows "
+                    "load now, behind the first forward, on a side stream)", self.LINE,
+                    len(self.pending), self.rows_pending(),
+                    (self.t_start - (self.t_rearm or self.t_start)) * 1000)
+
+    def _issue(self, caches) -> None:
+        """Die Zeilen dieser Layer auf den Seitenstrom, ein Event je Layer
+        (ohne Strom-Handgriffe -- CPU -- synchron auf dem laufenden Strom)."""
+        import contextlib
+
+        ops = self._ops()
+        ctx = ops.stream_ctx(self.stream) if ops is not None else contextlib.nullcontext()
+        with ctx:
+            if ops is not None:
+                # hinter alles, was der Forward-Strom schon eingereiht hat
+                # (Rearm, Pad, kalte Tabellen)
+                ops.after_current(self.stream)
+            for cache in caches:
+                d = cache._deferred_rows
+                load_refill_rows(d.entries, d.runs, layer_id=d.layer_id)
+                self.events[id(cache)] = ops.record(self.stream) if ops is not None else None
+
+    def _promote(self, cache, how: str) -> None:
+        ops = self._ops()
+        ev = self.events.pop(id(cache), None)
+        if ev is not None and ops is not None:
+            ops.current_waits(ev)
+        rows = int(cache._deferred_rows.rows)
+        cache._promote_deferred()
+        self.pending.remove(cache)
+        self.rows_landed += rows
+        if how == "tick":
+            self.by_tick += 1
+        else:
+            self.by_eager += 1
+        if not self.pending:
+            now = self._clock()
+            logger.info(
+                "%s landed layers=%d rows=%d by_tick=%d by_eager=%d ticks=%d "
+                "fill_ms=%s since_rearm_ms=%.0f (every pool layer is on its full layout "
+                "again)", self.LINE, self.by_tick + self.by_eager, self.rows_landed,
+                self.by_tick, self.by_eager, self.ticks,
+                "n/a" if self.t_start is None else "%.0f" % ((now - self.t_start) * 1000),
+                (now - (self.t_rearm or now)) * 1000)
+            self.reset()
+
+    def land(self, cache) -> None:
+        """Vor einem EAGER Forward dieses Layers (laufender Strom = Forward-Strom)."""
+        if cache not in self.pending:
+            cache._deferred_rows = None
+            return
+        if id(cache) not in self.events:
+            d = cache._deferred_rows
+            # noch nicht auf dem Seitenstrom: dieser Layer allein, hier
+            load_refill_rows(d.entries, d.runs, layer_id=d.layer_id)
+        self._promote(cache, "eager")
+
+    def tick(self, is_decode: bool) -> None:
+        """Vor jedem Forward, auf dem Strom des Forwards."""
+        if not self.pending:
+            return
+        self.ticks += 1
+        if not self.started:
+            if is_decode:
+                self.start()
+            return
+        late = [c for c in self.pending if id(c) not in self.events]
+        if late:
+            self._issue(late)  # nach dem Start dazugekommen: hinten anstellen
+        for cache in list(self.pending):
+            ev = self.events.get(id(cache))
+            if ev is not None and not bool(ev.query()):
+                break  # ein Strom: dahinter ist auch noch nichts fertig
+            self._promote(cache, "tick")
+
+    def settle(self) -> None:
+        """Vor dem Schlaf: einen laufenden Nachlader abwarten (die Puffer
+        werden gleich pausiert), dann alles vergessen -- der naechste Wake
+        schreibt die Tabellen ohnehin neu."""
+        for cache in self.pending:
+            ev = self.events.get(id(cache))
+            if ev is not None:
+                ev.synchronize()
+            cache._deferred_rows = None
+        if self.pending:
+            logger.info("%s settled-at-sleep layers=%d started=%s (not promoted; the next "
+                        "wake rewrites the tables)", self.LINE, len(self.pending),
+                        "yes" if self.started else "no")
+        self.reset()
+
+
+_DEFERRED_ROWS_FILL: Optional[DeferredRowsFill] = None
+
+
+# ---------------------------------------------------------------------------
+# RW RESUME WARM (28.09., NF rc12z22 D): the first eager extend after a wake
+# re-fetched its experts one wave at a time -- "MoE expert pool layer N sync:
+# eager pass wrote 23..58 rows", 1.6-2.0 s of compute for 8..229 tokens, while
+# an extend with its experts resident took 12-16 ms. The wake's rearm drops the
+# LRU (the other group overwrote it) and prefetches nothing (rows_from_store=0
+# prefetched=0 overlap=off). The resumes are the requests D decoded before it
+# slept, so the experts its LRU owned then are the ones their tail extend
+# routes to.
+#
+#   * SNAPSHOT at the sleep, before the pauses: per pool layer the LRU's local
+#     expert ids, most recent first (two small host reads per layer, no copy).
+#   * WARM after the legs (never in a leg -- the x147 lesson): the rearm arms
+#     the queue; the scheduler warms up to LAYERS_PER_TICK layers per pass,
+#     only while the device is idle (nothing running, nothing in flight) and a
+#     wake read is still settling. Rows: only those the rearm left free, from
+#     the same pinned store rows a miss copies from -- no VRAM, no transient.
+#   * NEVER WAITS: an eager forward that reaches a layer still queued removes
+#     it (the eager sync fetches as today); a pass that admits work stops the
+#     warm (``cancel``). The copies are on the scheduler's stream, ordered
+#     before the next forward like the rearm's own.
+#   * UNIFORM: the snapshot comes from each rank's own LRU, which the
+#     replicated routing wrote; the ticks run in the group-agreed settle passes
+#     on every rank; no collective.
+# Switch FLLIPER_PDFLIP_RESUME_WARM (default on), FLLIPER_PDFLIP_RESUME_WARM_ROWS
+# (rows per layer, 0 = every snapshot row), FLLIPER_PDFLIP_RESUME_WARM_LAYERS
+# (layers per pass).
+# ---------------------------------------------------------------------------
+
+RESUME_WARM_ENV = "FLLIPER_PDFLIP_RESUME_WARM"
+RESUME_WARM_ROWS_ENV = "FLLIPER_PDFLIP_RESUME_WARM_ROWS"
+RESUME_WARM_LAYERS_ENV = "FLLIPER_PDFLIP_RESUME_WARM_LAYERS"
+
+
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def resume_warm_enabled() -> bool:
+    import os
+
+    return (os.environ.get(RESUME_WARM_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _pool_caches(model):
+    for module in model.modules():
+        cache = getattr(module, "_expert_offload", None)
+        if isinstance(cache, MoEExpertOffloadCache) and cache._pool_ready:
+            yield cache
+
+
+class ResumeWarm:
+    def __init__(self) -> None:
+        self._queue: List = []
+        self.reset_stats()
+
+    def reset_stats(self) -> None:
+        self.snap_layers = self.snap_rows = 0
+        self.snap_ms = 0.0
+        self.warm_layers = self.warm_rows = 0
+        self.warm_ms = 0.0
+        self.warm_bytes = 0
+        self.row_bytes = 0
+        self.skipped_eager = self.skipped_cancel = 0
+        self.cancel_reason = ""
+        self._first_extend_layers: Dict = {}
+        self._first_extend_closed = False
+
+    # -- the sleep --------------------------------------------------------
+    def snapshot(self, models) -> int:
+        """Record every pool layer's LRU owners (before the pauses)."""
+        import time
+
+        if not resume_warm_enabled():
+            return 0
+        t0 = time.perf_counter()
+        rows = _env_int(RESUME_WARM_ROWS_ENV, 32)
+        layers = n = 0
+        for model in models:
+            for cache in _pool_caches(model):
+                ids = cache.lru_snapshot(rows)
+                cache._rw_snap = ids
+                layers += 1
+                n += len(ids)
+        self.snap_layers, self.snap_rows = layers, n
+        self.snap_ms = (time.perf_counter() - t0) * 1000.0
+        return n
+
+    # -- the wake, after the rearm (the legs are over) --------------------
+    def arm(self, models) -> int:
+        stats = (self.snap_layers, self.snap_rows, self.snap_ms)
+        self.reset_stats()
+        self.snap_layers, self.snap_rows, self.snap_ms = stats
+        self._queue = []
+        # The settle of THIS wake is not open yet: the arm runs in the weights
+        # leg, the dormant hold is released (and the #1471 settle built) by a
+        # later resume RPC -- the scheduler passes in between must not read
+        # "no settle" as "settle over" (NF rc12z26: 8/8 wakes cancel=settle_done
+        # with warm_layers=0).
+        self._settle_open = False
+        if not resume_warm_enabled():
+            return 0
+        for model in models:
+            for cache in _pool_caches(model):
+                if getattr(cache, "_rw_snap", None):
+                    self._queue.append(cache)
+        return len(self._queue)
+
+    def open_settle(self) -> None:
+        """The wake's dormant hold was released: from now on an empty settle
+        means the settle is over."""
+        self._settle_open = True
+
+    @property
+    def settle_open(self) -> bool:
+        return bool(getattr(self, "_settle_open", False))
+
+    def pending(self) -> int:
+        return len(self._queue)
+
+    def tick(self, layers: Optional[int] = None) -> int:
+        """Warm up to ``layers`` queued layers now (the caller checked that the
+        device is idle). Returns the layers warmed."""
+        import time
+
+        if not self._queue:
+            return 0
+        n = _env_int(RESUME_WARM_LAYERS_ENV, 8) if layers is None else int(layers)
+        t0 = time.perf_counter()
+        done = 0
+        while self._queue and done < max(1, n):
+            cache = self._queue.pop(0)
+            ids = getattr(cache, "_rw_snap", None) or []
+            cache._rw_snap = None
+            rows = cache.warm_lru_local(ids)
+            rb = cache.pool_row_bytes() if hasattr(cache, "pool_row_bytes") else 0
+            self.row_bytes = max(self.row_bytes, rb)
+            self.warm_bytes += rows * rb
+            self.warm_rows += rows
+            self.warm_layers += 1
+            done += 1
+        self.warm_ms += (time.perf_counter() - t0) * 1000.0
+        return done
+
+    def eager_reached(self, cache) -> None:
+        """An eager forward reached ``cache``: never wait -- drop it."""
+        if cache in self._queue:
+            self._queue.remove(cache)
+            cache._rw_snap = None
+            self.skipped_eager += 1
+
+    def cancel(self, reason: str) -> int:
+        n = len(self._queue)
+        for cache in self._queue:
+            cache._rw_snap = None
+        self._queue = []
+        if n:
+            self.skipped_cancel += n
+            self.cancel_reason = reason
+        return n
+
+    # -- instrument -------------------------------------------------------
+    def note_eager_sync(self, layer_id, rows: int) -> None:
+        """The first eager forward after the wake: rows its sync wrote per
+        layer; it ends when a layer syncs a second time."""
+        if self._first_extend_closed:
+            return
+        if layer_id in self._first_extend_layers:
+            self._first_extend_closed = True
+            return
+        self._first_extend_layers[layer_id] = int(rows)
+
+    def fields(self) -> str:
+        fe = self._first_extend_layers
+        return (
+            f"first_extend_eager_syncs={sum(1 for r in fe.values() if r > 0)} "
+            f"first_extend_rows={sum(fe.values())} snap_layers={self.snap_layers} "
+            f"snap_rows={self.snap_rows} snap_ms={self.snap_ms:.1f} "
+            f"warm_layers={self.warm_layers} warm_rows={self.warm_rows} warm_ms={self.warm_ms:.1f} "
+            f"row_bytes={self.row_bytes} warm_mib={self.warm_bytes / 2**20:.1f} "
+            f"skipped_eager={self.skipped_eager} skipped_cancel={self.skipped_cancel}"
+            + (f" cancel={self.cancel_reason}" if self.cancel_reason else "")
+        )
+
+
+_RESUME_WARM: Optional[ResumeWarm] = None
+
+
+def resume_warm() -> ResumeWarm:
+    global _RESUME_WARM
+    if _RESUME_WARM is None:
+        _RESUME_WARM = ResumeWarm()
+    return _RESUME_WARM
+
+
+def deferred_rows_fill() -> DeferredRowsFill:
+    global _DEFERRED_ROWS_FILL
+    if _DEFERRED_ROWS_FILL is None:
+        _DEFERRED_ROWS_FILL = DeferredRowsFill()
+    return _DEFERRED_ROWS_FILL
+
+
+def deferred_rows_tick(batch) -> None:
+    """Der Scheduler-Haken vor jedem Forward (H31b); ohne offene Zeilen ein
+    Attributzugriff."""
+    fill = _DEFERRED_ROWS_FILL
+    if fill is None or not fill.pending:
+        return
+    try:
+        is_decode = bool(batch.forward_mode.is_decode())
+    except Exception:  # noqa: BLE001 -- unknown batch shape: no start, promotion still runs
+        is_decode = False
+    fill.tick(is_decode)
+
+
+def _buffer_mapped(buf) -> bool:
+    """Kennt der Treiber die Seiten dieses Puffers (erstes UND letztes Byte)?
+
+    Der H31-Prefetch schreibt nur in einen Puffer, dessen Tag schon wieder
+    gemappt ist. Die Tag-Zuordnung sagt WANN er es versucht; diese Lesung ist
+    der Riegel davor (``ptr_attrs`` kann nicht faulten, ein Fehler liest sich
+    als nicht gemappt -> der Layer bleibt beim seriellen Rearm). Ein
+    CPU-Tensor (Tests) gilt als gemappt."""
+    if not getattr(buf, "is_cuda", False):
+        return True
+    nbytes = int(buf.numel()) * int(buf.element_size())
+    if nbytes <= 0:
+        return True
+    from flliper.srt.pdflip.weight_exchange_bounce import ptr_attrs
+
+    addr = int(buf.data_ptr())
+    return ptr_attrs(addr)[1] == 2 and ptr_attrs(addr + nbytes - 1)[1] == 2
+
+
+def _default_rearm_tag_of(name: str, region_tag: str) -> str:
+    """Der Tag, unter dem ein Experten-Puffer dieses Namens liegt -- die
+    Autoritaet des Austauschs (``tag_of_parameter_name``: die Region gewinnt
+    ueber den Namen, der Draft-Layer liegt unter ``weights_draft``)."""
+    from flliper.srt.pdflip.weight_exchange import tag_of_parameter_name
+
+    return tag_of_parameter_name(name, region_tag=region_tag)
+
+
+@dataclass
+class _PrefetchLayer:
+    key: int
+    layer_id: object
+    runs: tuple
+    entries: list
+
+
+@dataclass(frozen=True)
+class RearmPrefetchJoin:
+    """Was der Join des H31-Prefetchs gemessen hat (Felder der Rearm-Zeile)."""
+
+    rows: int
+    layers: int
+    tags: int
+    wait_ms: float
+    pending_at_join: bool
+    issue_ms: float
+    span_ms: float
+    plan_ms: float
+    skipped_unmapped: int
+    left_serial: int
+    overlap: str
+
+    def fields(self) -> str:
+        return (
+            f"prefetched={self.rows} rows prefetch_layers={self.layers} "
+            f"prefetch_tags={self.tags} wait_ms={self.wait_ms:.1f} "
+            f"pending_at_join={'yes' if self.pending_at_join else 'no'} "
+            f"issue_ms={self.issue_ms:.1f} span_ms={self.span_ms:.0f} "
+            f"plan_ms={self.plan_ms:.1f} skipped_unmapped={self.skipped_unmapped} "
+            f"left_serial={self.left_serial} overlap={self.overlap or 'none'}"
+        )
+
+
+#: Die Felder der Rearm-Zeile, wenn kein Prefetch lief (Schalter aus, kein
+#: Offload-Layer mit Karte, oder der Plan ist gescheitert).
+REARM_PREFETCH_OFF_FIELDS = "prefetched=0 rows wait_ms=0.0 overlap=off"
+
+
+class _CudaStreamOps:
+    """Die vier Strom-Handgriffe des H31-Prefetchs gegen CUDA (Tests setzen
+    eine Attrappe ein, die Fertigzeiten simuliert)."""
+
+    def new_stream(self):
+        import torch
+
+        return torch.cuda.Stream()
+
+    def stream_ctx(self, stream):
+        import torch
+
+        return torch.cuda.stream(stream)
+
+    def after_current(self, stream) -> None:
+        import torch
+
+        stream.wait_stream(torch.cuda.current_stream())
+
+    def record(self, stream):
+        import torch
+
+        ev = torch.cuda.Event()
+        ev.record(stream)
+        return ev
+
+    def current_waits(self, event) -> None:
+        import torch
+
+        torch.cuda.current_stream().wait_event(event)
+
+
+def _default_stream_ops():
+    import torch
+
+    return _CudaStreamOps() if torch.cuda.is_available() else None
+
+
+class ExpertRearmPrefetch:
+    """fnFL2 H31: Pad+Extra des Platztauschs WAEHREND der Flip-Legs laden.
+
+    x141 (b07a9087cb): jede D-Zeile ueber die P-Stufe-0-Residenz hinaus ist
+    eine Extra-Zeile, die ``rearm_expert_offload_after_wake`` SERIELL nach den
+    Legs aus dem Store laedt (TP1: 232 Zeilen in 46 ms direkt vor der
+    Gruppen-Fence, der Rang wartete davor auf die letzte 5090-Lane). Die
+    Zeilenliste steht seit dem Load fest (Karte -> ``_moe_offload_refill_runs``),
+    der Zielpuffer existiert, sobald der Chunk-Tag seines Layers wieder gemappt
+    ist (``resume(tag)`` im Leg-Loop, hinter dessen Kredit), und der Store ist
+    gepinnter Host (``cudaHostRegister`` auf tmpfs): die Kopie braucht also
+    weder einen fruehen Kredit noch einen Host-Zwischenpuffer, nur einen
+    anderen Zeitpunkt.
+
+    Ablauf: :meth:`issue` direkt hinter ``resume(tag)`` legt die Laeufe aller
+    Layer dieses Tags auf einen Seitenstrom (die Austausch-Sammlung schreibt
+    nur den Praefix, die Bereiche sind disjunkt); :meth:`join` an der Stelle
+    des alten seriellen Ladens wartet nur den Rest, und der Rearm laedt fuer
+    diese Layer nichts mehr. Ein Layer, dessen Tag dieser Wake nicht mappt
+    oder dessen Puffer der Treiber nicht kennt, bleibt beim seriellen Pfad.
+
+    Kein neuer Dauer-Host-RAM, keine VRAM-Reserve: dieselben Bytes vom selben
+    Store in denselben Puffer, nur frueher.
+    """
+
+    def __init__(self, models_regions, *, phases=None, stream_ops="cuda",
+                 tag_of=None, mapped=None, clock=None):
+        import time
+
+        self._clock = clock or time.perf_counter
+        t0 = self._clock()
+        self._tag_of = tag_of or _default_rearm_tag_of
+        self._mapped = mapped or _buffer_mapped
+        # ``stream_ops`` None: synchron auf dem laufenden Strom (CPU-Tests)
+        self._ops = _default_stream_ops() if stream_ops == "cuda" else stream_ops
+        self.stream = None
+        self.event = None
+        self._by_tag: Dict[str, List[_PrefetchLayer]] = {}
+        self.planned_rows = 0
+        self.planned_layers = 0
+        for model, region in models_regions:
+            for name, module in model.named_modules():
+                target = _rearm_targets(module)
+                if target is None:
+                    continue
+                _cache, runs, entries = target
+                if not runs or not entries:
+                    continue  # nichts zu laden (Pool ohne Karte): der Rearm macht die Tabellen
+                tag = str(self._tag_of(f"{name}.{entries[0][0]}", region))
+                self._by_tag.setdefault(tag, []).append(_PrefetchLayer(
+                    key=id(module), layer_id=getattr(module, "layer_id", "?"),
+                    runs=runs, entries=entries))
+                self.planned_layers += 1
+                self.planned_rows += sum(n for _z, p, n in runs if p >= 0) * len(entries)
+        self.loaded: set = set()
+        self.rows = 0
+        self.tags_issued: List[str] = []
+        self.skipped_unmapped = 0
+        self.issue_ms = 0.0
+        self.plan_ms = (self._clock() - t0) * 1000
+        self.t_first = None
+        self.joined = False
+        self.failed = False
+        self._phases = phases
+        self._phase_idx = None
+
+    @property
+    def planned_tags(self) -> Tuple[str, ...]:
+        return tuple(self._by_tag)
+
+    def _ensure_stream(self):
+        if self.stream is None and self._ops is not None:
+            self.stream = self._ops.new_stream()
+        return self.stream
+
+    def issue(self, tag) -> int:
+        """Hinter ``resume(tag)``: die Laeufe der Layer dieses Tags auf den
+        Seitenstrom legen. Gibt die Zahl der Zeilen zurueck (0: kein Layer)."""
+        import contextlib
+
+        if self.joined:
+            raise RuntimeError("ExpertRearmPrefetch.issue nach dem Join")
+        if self.failed:
+            return 0  # nach einem Fehler laedt der Rest seriell
+        layers = self._by_tag.pop(str(tag), None)
+        if not layers:
+            return 0
+        t0 = self._clock()
+        if self.t_first is None:
+            self.t_first = t0
+            self._phase_idx = len(self._phases) if self._phases is not None else None
+        stream = self._ensure_stream()
+        ctx = self._ops.stream_ctx(stream) if stream is not None else contextlib.nullcontext()
+        n = 0
+        with ctx:
+            if stream is not None:
+                # der Seitenstrom ueberholt nichts, was der laufende Strom auf
+                # diesen Adressen schon eingereiht hat (nach dem Resume nichts,
+                # aber die Ordnung ist der Vertrag, nicht die Hoffnung)
+                self._ops.after_current(stream)
+            try:
+                for lay in layers:
+                    if not all(self._mapped(buf) for _a, buf, _s in lay.entries):
+                        self.skipped_unmapped += 1
+                        continue
+                    n += load_refill_rows(lay.entries, lay.runs, layer_id=lay.layer_id)
+                    self.loaded.add(lay.key)
+            except BaseException:
+                # was schon eingereiht ist, deckt das Event unten; der Layer,
+                # der scheiterte, und alle dahinter bleiben beim seriellen Pfad
+                self.failed = True
+                raise
+            finally:
+                if stream is not None:
+                    self.event = self._ops.record(stream)
+                self.rows += n
+                self.tags_issued.append(str(tag))
+                self.issue_ms += (self._clock() - t0) * 1000
+        return n
+
+    def join(self, phases=None) -> RearmPrefetchJoin:
+        """Den laufenden Strom auf den Seitenstrom warten lassen und blockieren,
+        bis die Kopien fertig sind. Misst, was der Wake davon noch selbst
+        bezahlt (``wait_ms``, 0 = ganz versteckt), und nennt die Phasen, die
+        zwischen dem ersten :meth:`issue` und hier liefen."""
+        t0 = self._clock()
+        pending = False
+        if self.event is not None:
+            try:
+                pending = not bool(self.event.query())
+            except Exception:  # noqa: BLE001 -- nur die Lesung, das Warten folgt
+                pending = True
+            # GPU-Ordnung fuer alles, was der Wake danach einreiht, UND
+            # Host-Warten: der Rearm gibt die Puffer gleich an den Forward
+            self._ops.current_waits(self.event)
+            self.event.synchronize()
+        t1 = self._clock()
+        self.joined = True
+        names = []
+        ph = phases if phases is not None else self._phases
+        if ph is not None and self._phase_idx is not None:
+            names = [str(nm) for nm, _ms in list(ph)[int(self._phase_idx):]]
+        left = self.planned_layers - len(self.loaded)
+        return RearmPrefetchJoin(
+            rows=self.rows, layers=len(self.loaded), tags=len(self.tags_issued),
+            wait_ms=(t1 - t0) * 1000, pending_at_join=pending,
+            issue_ms=self.issue_ms,
+            span_ms=0.0 if self.t_first is None else (t1 - self.t_first) * 1000,
+            plan_ms=self.plan_ms, skipped_unmapped=self.skipped_unmapped,
+            left_serial=left, overlap="+".join(names))
+
+
+def _warm_after_wake(model):
+    """fnFL2 H29: the D-side half of the decode warm, AFTER the rearm (its
+    reinit freed the LRU rows) and before any forward. Both halves are off by
+    default and neither can refuse the wake."""
+    from flliper.srt.environ import envs
+
+    if envs.FLLIPER_PDFLIP_LRU_WARM_FROM_HANDOFF.get():
+        try:
+            warm_lru_after_wake(model, int(envs.FLLIPER_PDFLIP_LRU_WARM_ROWS.get()))
+        except Exception as exc:  # noqa: BLE001 -- the warm is a hint
+            logger.warning("LRU-WARM skipped: %s", exc)
+    if envs.FLLIPER_PDFLIP_PLE_DECODE_PREFETCH.get():
+        try:
+            from flliper.srt.models.qwen4_exp_ple_table import start_ple_decode_warm
+
+            start_ple_decode_warm(model)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PLE-DECODE-PREFETCH skipped: %s", exc)
+
+
+def warm_lru_after_wake(model, limit: int, routes=None):
+    """``(rows_filled, layers)``: every pool layer's free LRU rows from P's
+    published tail routing (pdflip/decode_warm_handoff). Synchronous: the copies
+    finish before this returns, and ``ms=`` is what the flip pays for them."""
+    import time
+
+    import torch
+
+    from flliper.srt.environ import envs
+    from flliper.srt.pdflip import decode_warm_handoff as dwh
+
+    t0 = time.monotonic()
+    files = None
+    if routes is None:
+        routes, files = dwh.load_routes()
+    rows = layers = considered = 0
+    for module in model.modules():
+        cache = getattr(module, "_expert_offload", None)
+        if not isinstance(cache, MoEExpertOffloadCache) or not cache._pool_ready:
+            continue
+        considered += 1
+        n = cache.warm_lru_from_route(routes.get(getattr(module, "layer_id", -1)), limit)
+        if n:
+            rows += n
+            layers += 1
+    if rows and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    ms = (time.monotonic() - t0) * 1000.0
+    logger.info(
+        "LRU-WARM rows_filled=%d layers=%d ms=%.1f pool_layers=%d route_layers=%d "
+        "route_files=%s limit=%d (fnFL2 H29b: free LRU rows after the wake from "
+        "P's last %d tokens' routing; ms is paid inside the flip)",
+        rows, layers, ms, considered, len(routes), files if files is not None else "given",
+        limit, int(envs.FLLIPER_PDFLIP_LRU_WARM_TOKENS.get()),
+    )
+    return rows, layers
+
+
+def _refill_runs(refill):
+    """``(zeile, platz)``-Paare zu zusammenhaengenden Laeufen
+    ``(zeile0, platz0, n)``; der Pad (``platz=-1``) bleibt ein eigener Lauf."""
+    runs = []
+    for row_idx, slot_idx in refill:
+        if (runs and slot_idx >= 0 and runs[-1][1] >= 0
+                and row_idx == runs[-1][0] + runs[-1][2]
+                and slot_idx == runs[-1][1] + runs[-1][2]):
+            z0, p0, n = runs[-1]
+            runs[-1] = (z0, p0, n + 1)
+        else:
+            runs.append((int(row_idx), int(slot_idx), 1))
+    return runs
+
+
+def _hotset_local_ids(layer, num_local):
+    """Die LOKALEN Experten-Ids aus dem Hotset -- oder () wenn keins gilt.
+
+    #92. Die Datei ist je Rang lokal geschrieben, `plan_load_time_staging`
+    rechnet ebenfalls lokal: hier ist also keine Umrechnung noetig (anders
+    als bei `_hotset_global_ids`, das der Store braucht).
+
+    Leer heisst "kein Hotset" und damit das bisherige Verhalten -- die
+    ersten R Ids bleiben resident. Kein Raten: ohne Datei, ohne Abdeckung
+    dieses Layers, bei unlesbarem Inhalt gilt die alte Regel weiter.
+    """
+    from flliper.srt.environ import envs
+
+    file_path = envs.FLLIPER_MOE_HOTSET_FILE.get()
+    if not file_path or not hotset_covers_layer(layer):
+        return ()
+    try:
+        hotset_data = _load_hotset_file(hotset_path_for_rank(
+            file_path, getattr(layer, "moe_tp_rank", 0)))
+        roh = hotset_data.get(str(getattr(layer, "layer_id", "")))
+        if not roh:
+            return ()
+        return tuple(sorted({int(x) for x in roh if 0 <= int(x) < int(num_local)}))
+    except Exception:
+        return ()
+
+
+def _hotset_global_ids(layer, num_global, lo, pad):
+    """Die GLOBALEN Experten-Ids, die das Hotset resident haelt -- oder None.
+
+    #91/3. Das Hotset ist je Rang in LOKALEN Ids geschrieben
+    (`hotset_path_for_rank`); der Store rechnet global. Ohne Datei, ohne
+    Abdeckung dieses Layers oder bei unlesbarem Inhalt: None, dann bleibt
+    alles wie bisher. Kein Raten -- eine falsche Residenzmenge waere eine
+    falsche Slot-Zuordnung, und die ist Datenverlust.
+    """
+    from flliper.srt.environ import envs
+
+    file_path = envs.FLLIPER_MOE_HOTSET_FILE.get()
+    if not file_path or not hotset_covers_layer(layer):
+        return None
+    try:
+        hotset_data = _load_hotset_file(hotset_path_for_rank(
+            file_path, getattr(layer, "moe_tp_rank", 0)))
+        roh = hotset_data.get(str(getattr(layer, "layer_id", "")))
+        if not roh:
+            return None
+        local_ids = [int(x) for x in roh]
+    except Exception:
+        return None
+    # lokal -> global, dieselbe Regel wie `global_rows`
+    ids = {int(lo) + e - 1 if pad else int(lo) + e for e in local_ids if not pad or e >= 1}
+    return {g for g in ids if 0 <= g < int(num_global)} or None
+
+
+def _group_of_layer(layer) -> str:
+    """``P`` fuer die PP-Gruppe, ``D`` fuer die TP-Gruppe (#107).
+
+    Die Karte fuehrt zwei Phasen, und ein Rang muss wissen, welche seine
+    ist. ``FLLIPER_PDFLIP_GROUP`` setzt der Launcher ohnehin je Gruppe; ohne
+    sie entscheidet die Form: wer JEDEN Experten haelt
+    (``num_local == num_global``) ist die unsharded PP-Stufe, wer einen
+    Ausschnitt haelt, ist TP.
+    """
+    import os
+
+    g = os.environ.get("FLLIPER_PDFLIP_GROUP", "").strip()
+    if g:
+        return g
+    nl = int(getattr(layer, "num_local_experts", 0) or 0)
+    ng = int(getattr(layer, "num_experts", 0) or 0)
+    return "P" if (ng and nl == ng) else "D"
+
+
+def _expert_store_rows_for(layer, plan):
+    """``(dir, layer_key, lo, num_global, local->row)`` when the shared expert
+    store is on and this layer is a generic expert-dim shard; else ``None``."""
+    from flliper.srt.layers.moe import expert_store as _es
+
+    if not _es.store_enabled():
+        return None
+    num_global = int(getattr(layer, "num_experts", 0) or 0)
+    if num_global <= 0:
+        raise RuntimeError(
+            "the shared expert store needs the layer's GLOBAL expert count "
+            "(layer.num_experts) and found none"
+        )
+    num_local = int(getattr(layer, "num_local_experts", 0) or 0)
+    if getattr(layer, "_expert_shard_generic", False):
+        rng = getattr(layer, "_gguf_expert_range", None)
+        if rng is None:
+            return None
+        lo, _hi = rng
+        pad = True  # local 0 is the zero pad expert
+    elif num_local == num_global:
+        lo, pad = 0, False  # unsharded (a PP stage): local id == global id
+    else:
+        return None  # an EP-style slice; no global row map defined here
+    from flliper.srt.layers.moe.cold_tier_fetch import layer_key_for
+
+    # #72 (Nutzer-Order 21.09.): DER STORE HAELT PLAETZE FUER DAS, WAS NICHT
+    # AUF EINER KARTE LIEGT -- "waehrend decode oder prefill muss niemals
+    # alles im systemram liegen". Bisher war die globale Experten-Id der
+    # Zeilenindex, also brauchte die Datei einen Platz je Experte, auch fuer
+    # die nie geschriebenen: 59 GiB auf Platte, 61,10 GiB shmem (fnFL2w5/w7),
+    # der groesste nicht-reclaimable Posten gegen die ~93-GiB-Decke.
+    #
+    # Die Slot-Zuordnung bleibt eine RECHNUNG, keine Absprache -- der Store
+    # ist ueber Raenge UND Gruppen geteilt. `slot_base_for_rank` liest die
+    # zwei Vektoren, die ohnehin auf jeder Kommandozeile stehen
+    # (`--rank-moe-ratio`, `--rank-moe-resident-fraction`), und
+    # `slot_rows` packt die Kalten darin lueckenlos. Fehlt eines von beiden,
+    # faellt alles auf `global_rows` zurueck -- byte-identisch zu vorher.
+    _index = _es.global_rows(plan.spill_ids, int(lo), pad)
+    _slots = None
+    if _es.slot_fraction() < 1.0:
+        # #72, KORRIGIERT NACH fnFL2w10: `len(_ratios)` stand VOR der
+        # Pruefung, ob es die Ratios ueberhaupt gibt -- und Gruppe P laeuft
+        # OHNE --rank-moe-ratio. P starb daran vor READY
+        # (TypeError: object of type 'NoneType' has no len(),
+        # expert_offload.py:5136), und zwar erst, als der Slot-Pool zum
+        # ersten Mal eingeschaltet war: ohne die Env ist
+        # `slot_fraction() < 1.0` falsch und der ganze Block unerreichbar.
+        # Ein Feature, das nie lief, hat auch nie gezeigt, dass es bricht.
+        # #91: STEHT EINE GEMEINSAME GEOMETRIE, GILT SIE FUER BEIDE GRUPPEN.
+        # Sonst rechnet P aus [512]/[0.30] 358 Plaetze und D aus
+        # [183,137,168]/[0.006,0.564,0.467] 332 -- zwei Zuordnungen auf
+        # DERSELBEN Datei, und die zweite schreibt in die Zeilen der ersten.
+        # Das ist Datenverlust, nicht Speicherverlust; deshalb gibt der
+        # Launcher, der als einziger beide Konfigurationen kennt, eine
+        # gemeinsame Geometrie vor.
+        # #91/3: die globalen Ids, die das gemeinsame Hotset resident haelt.
+        # Sie sind die Autoritaet ueber die kalte Menge -- nicht die Fraction.
+        _ratios = _fracs = _hot_ids = None
+        _hot_ids = _hotset_global_ids(layer, num_global, int(lo), pad)
+        _shared = _es.shared_geometry()
+        if _shared is not None:
+            _ratios, _fracs = _shared
+        else:
+            _ratios = _rank_moe_ratio_vector(layer)
+            _fracs = (_rank_resident_fraction_vector(layer, len(_ratios))
+                      if _ratios else None)
+        # #97 (fnFL2w27, die #96-Zeile sagt es woertlich):
+        #     ratios=None fracs=None global_res=188 -> SLOTS=None
+        # Die GLOBALE Menge war da und wurde nie benutzt, weil sie HINTER
+        # `if _ratios and _fracs:` lag -- der Bedingung, die sie selbst
+        # ueberfluessig macht. Elfte Instanz von
+        # [[riegel-hinter-dem-was-er-sichert]] an einem Tag, und den Riegel
+        # habe ich mit #95 eigenhaendig davorgesetzt.
+        #
+        # Steht die globale Menge, genuegt sie allein: die Plaetzezahl ist
+        # `num_global - |global_res|`, und die Zuordnung ist die Position
+        # der eigenen kalten Id in der aufsteigenden kalten Liste. Beides
+        # braucht weder --rank-moe-ratio noch die Fraction-Vektoren, die
+        # Gruppe D unter Form A gar nicht auf diesem Weg fuehrt.
+        # #107: DIE KARTE ZUERST. Nutzer-Gesetz 22.09.: "alles was geshardet
+        # wird braucht ne karte". Steht sie, ist sie die AUTORITAET -- die
+        # vier Ableitungen darunter (shared_resident_ids, slot_base_for_rank,
+        # global_rows, das Hotset) bleiben nur als Rueckfall fuer Laeufe ohne
+        # Karte. Sie haben sich am 22.09. in acht Boots gegenseitig
+        # widersprochen, weil jede dieselbe Aufteilung neu ausrechnete:
+        #   w42-44  P rechnete 451 Plaetze, D 512
+        #   w45     beide 512 -> 59 GB tmpfs -> oom_kill 27->28, P tot
+        #   w46-49  #97, viermal -- zuletzt an funf Ids (183..187), weil die
+        #           ROHEN Ratios 183,137,168 als Bereichsgrenzen genommen
+        #           wurden statt der vom Server SKALIERTEN 192,144,176
+        # Die Karte rechnet nichts nach: sie wird gelesen.
+        _karte = _es.expert_map()
+        if _karte is not None:
+            from flliper.srt.layers.moe import expert_map as _em
+
+            _phase = _em.phase_of(_group_of_layer(layer))
+            _missing = [g for g in _index.values()
+                        if _em.slot_of(_karte, _phase, g) is None]
+            if _missing:
+                # Nach dem Umbau kann das nur noch heissen, dass die KARTE
+                # selbst falsch ist -- nicht, dass zwei Rechnungen
+                # auseinanderlaufen. Deshalb nennt die Meldung die Karte.
+                raise RuntimeError(
+                    f"#107: {len(_missing)} eigene kalte Experten haben in der "
+                    f"KARTE keinen Platz (erste: {_missing[:4]}, Phase "
+                    f"{_phase}, mein Bereich ab lo={lo}). Die Karte sagt fuer "
+                    f"diese Phase {len(_karte['phases'][_phase]['slot_of'])} "
+                    f"kalte Ids bei {_karte['slots']} Plaetzen; sie und die "
+                    f"tatsaechliche Residenz muessen dieselbe Aufteilung "
+                    f"meinen."
+                )
+            _index = {k: _em.slot_of(_karte, _phase, g)
+                      for k, g in _index.items()}
+            _slots = int(_karte["slots"])
+            _em_phase, _card_slots = _phase, _slots
+
+        # KEIN frueher `return` hier: die `#96 STORE-SLOTS`-Zeile am Ende der
+        # Funktion ist der Beleg, an dem w22/w24/w26 gemessen wurden, und sie
+        # muss auch fuer den Kartenweg kommen.
+        #
+        # ABER EIN ECHTES `elif`, KEIN VORSPANN (fnFL2w50, 07:15Z): meine
+        # erste Fassung setzte die Werte und liess den Rest weiterlaufen --
+        # `_global_only` war None, also fiel es in `elif _ratios and _fracs`,
+        # rechnete die Zuordnung neu und starb an `#91: 92 kalte Experten
+        # stehen im Hotset`. Einen Zweig VORZUSCHALTEN genuegt nicht; die
+        # Alternativen muessen wirklich Alternativen sein.
+        _global_only = None if _karte is not None else _es.shared_resident_ids()
+        if _karte is not None:
+            pass  # die Karte hat oben entschieden
+        elif _global_only is not None:
+            _cold = [e for e in range(num_global) if e not in _global_only]
+            _pos = {g: i for i, g in enumerate(_cold)}
+            _missing = [g for g in _index.values() if g not in _pos]
+            if _missing:
+                raise RuntimeError(
+                    f"#97: {len(_missing)} eigene kalte Experten stehen in der "
+                    f"GLOBALEN Residenzmenge und haetten keinen Store-Platz "
+                    f"(erste: {_missing[:4]}, mein Bereich ab lo={lo}). Die "
+                    f"Menge und die tatsaechliche Residenz muessen dieselbe "
+                    f"meinen -- pruefe die Bereichsgrenzen des Hotsets."
+                )
+            _index = {k: _pos[g] for k, g in _index.items()}
+            _slots = len(_cold)
+        elif _ratios and _fracs:
+            _rank = int(getattr(layer, "moe_tp_rank", 0) or 0)
+            _base = _es.slot_base_for_rank(_ratios, _fracs, _rank)
+            # DREI GROESSEN, DREI GETRENNTE RECHNUNGEN -- und die mittlere ist
+            # die, an der meine erste Fassung falsch war:
+            #
+            # (a) `_base`  : wo MEINE Plaetze anfangen. Aus den zwei Vektoren,
+            #                also auf jedem Rang dieselbe Zahl.
+            # (b) `_packed`: welcher meiner Experten auf welchen Platz. Dafuer
+            #                braucht `slot_rows` die Residenten im GLOBALEN
+            #                Id-Raum -- und zwar ALLE, die nicht meine Kalten
+            #                sind. Die Bereiche der ANDEREN Raenge gehoeren
+            #                dazu: sie sind nicht resident, aber sie sind auch
+            #                nicht meine, und sie duerfen meine Positionen
+            #                nicht verschieben. (Erste Fassung mischte hier
+            #                lokale spill_ids mit `range(512)` und zaehlte
+            #                fremde Bereiche als Kalte mit.)
+            # (c) `_slots`: wie GROSS die Datei ist. Die Summe ueber ALLE
+            #               Raenge, nie `_base + meine` -- der Store ist EINE
+            #               Datei je Layer/Attribut, und wer sie zuerst
+            #               oeffnet, legt sie an. Rang 0 wuerde sonst 25
+            #               Plaetze anlegen, in die Rang 2 auf Platz 118
+            #               schreibt: ein Schreiber hinter dem Dateiende.
+            _cold_global = {int(g) for g in _index.values()}
+            _not_mine = [e for e in range(num_global) if e not in _cold_global]
+            _packed = _es.slot_rows(plan.spill_ids, int(lo), pad,
+                                    resident_ids=_not_mine,
+                                    num_experts=num_global)
+            _span = _es.slot_base_for_rank(_ratios, _fracs, _rank + 1) - _base
+            # #95 (fnFL2w24): DIE PLAETZEZAHL IST EINE GLOBALE GROESSE.
+            # `_hot_ids` ist das Hotset DIESES Rangs. Unter tp1 (Gruppe P)
+            # ist das zugleich die ganze Residenz, unter tp3 (Gruppe D) nur
+            # ein Drittel -- gemessen rechnete P 324 Plaetze und die drei
+            # D-Raenge 421/467/463 fuer DIESELBE Datei. Steht die globale
+            # Menge, gilt sie; sonst bleibt es bei der alten Annahme, die
+            # unter tp1 richtig ist.
+            _global_res = _es.shared_resident_ids()
+            if _global_res is not None:
+                _hot_ids = set(_global_res) | set(_hot_ids or ())
+            if _hot_ids is not None:
+                # #91/3: STEHT EIN GEMEINSAMES HOTSET, IST DIE KALTE MENGE IN
+                # BEIDEN GRUPPEN DIESELBE -- dann folgt die Zuordnung direkt
+                # aus ihr und braucht die Ratio-Rechnung nicht mehr. Die ist
+                # hier sogar FALSCH: sie unterstellt, die ersten R Ids eines
+                # Bereichs seien resident, das Hotset waehlt aber andere.
+                # fnFL2w19 starb genau daran (IndexError: index 451 is out of
+                # bounds for dimension 0 with size 451, expert_store.py:310).
+                _cold = [e for e in range(num_global) if e not in _hot_ids]
+                _pos = {g: i for i, g in enumerate(_cold)}
+                _missing = [g for g in _index.values() if g not in _pos]
+                if _missing:
+                    raise RuntimeError(
+                        f"#91: {len(_missing)} kalte Experten stehen im Hotset "
+                        f"und haetten keinen Store-Platz (erste: {_missing[:4]}). "
+                        f"Das Hotset und die tatsaechliche Residenz muessen "
+                        f"dieselbe Menge meinen."
+                    )
+                _index = {k: _pos[g] for k, g in _index.items()}
+                _slots = len(_cold)
+            elif _packed and len(_packed) <= _span:
+                _index = {k: _base + v for k, v in _packed.items()}
+                _slots = _es.slot_base_for_rank(_ratios, _fracs, len(_ratios))
+            elif _packed:
+                # Mehr Kalte als die Rechnung mir zugesteht -- die Residenz
+                # blieb hinter `--rank-moe-resident-fraction` zurueck. Dann
+                # LIEBER DER ALTE, VOLLE STORE: mein Ueberlauf landete sonst
+                # in den Plaetzen des naechsten Rangs, und eine Kollision im
+                # geteilten Store ist Datenverlust, kein Speicherverlust.
+                _warn_slot_pool_off(_rank, len(_packed), _span)
+    # #96: DIE ZEILE, DIE SAGT WELCHEN WEG DIE SLOT-RECHNUNG GENOMMEN HAT.
+    # Drei Boots (w22/w24/w26) sind an einer Slot-Zahl gestorben, und jedes
+    # Mal musste ich sie aus dem Absturz zurueckrechnen. Nur Layer 0 je Rang,
+    # also sechs Zeilen je Boot.
+    _hot_ids = locals().get("_hot_ids")
+    _ratios = locals().get("_ratios")
+    _fracs = locals().get("_fracs")
+    if int(getattr(layer, "layer_id", -1) or 0) == 0:
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            "#96 STORE-SLOTS rank=%s lo=%s pad=%s num_global=%s | "
+            "karte=%s slot_fraction=%.3f hot=%s global_res=%s ratios=%s "
+            "fracs=%s | SLOTS=%s (karte=... heisst: #107, die Karte war die Autoritaet; None bedeutet: der Block lief nicht, Datei = num_global)",
+            getattr(layer, "moe_tp_rank", "?"), lo, pad, num_global,
+            (f"{_em_phase}/{_card_slots}" if locals().get("_karte") is not None
+             else None),
+            _es.slot_fraction(),
+            len(_hot_ids) if _hot_ids else None,
+            len(_es.shared_resident_ids() or ()) or None,
+            _ratios, _fracs, _slots,
+        )
+    return (
+        _es.store_dir(),
+        layer_key_for(layer),
+        int(lo),
+        num_global if _slots is None else int(_slots),
+        _index,
+        pad,
+    )
+
+
+def _rank_moe_ratio_vector(layer):
+    """Die Expertenzahl je Rang, oder ``None``. #72."""
+    from flliper.srt.distributed import parallel_state as _ps
+
+    for src in (getattr(layer, "moe_ratio", None),
+                getattr(getattr(_ps, "_TP", None), "moe_ratio", None)):
+        if src:
+            try:
+                return [int(x) for x in src]
+            except (TypeError, ValueError):
+                continue
+    # #90: Gruppe P laeuft tp1/pp3 und bekommt deshalb KEIN --rank-moe-ratio
+    # (der Server verweigert die Flag ohne --rank-tp-ratio, server_args.py).
+    # Ohne Vektor faellt der Slot-Pool-Block in `_expert_store_rows_for` still
+    # durch -- ausgerechnet bei der Gruppe, die den Store FUELLT. Gemessen
+    # fnFL2w16: die Store-Datei blieb bei 512 Slots (800,0 MiB) fuer JEDE
+    # Residenz-Fraction, weil dieser Zweig nie lief.
+    #
+    # Bei EINEM Rang ist der Vektor trivial und braucht keine Absprache: der
+    # Rang haelt alle Experten des Layers. Das ist keine Annahme, sondern die
+    # Definition von tp_size==1 -- und `slot_rows` rechnet damit dieselbe
+    # Packung wie fuer jede andere Geometrie.
+    _tp = getattr(getattr(_ps, "_TP", None), "world_size", None)
+    if _tp in (None, 1):
+        _e = getattr(layer, "num_experts", None) or getattr(
+            layer, "num_local_experts", None
+        )
+        if _e:
+            return [int(_e)]
+    return None
+
+
+def _rank_resident_fraction_vector(layer, tp_size=None):
+    """Der Residenzanteil je Rang, oder ``None``. #72.
+
+    UEBER `resident_fraction_vector`, NICHT ueber `envs`: der EnvFloatVector
+    VERWEIGERT `.get()`, sobald er je Rang gesetzt ist -- "is set per rank
+    (0.59,0.59,0.59), so there is no single value to return" (environ.py:206).
+    Das ist genau der Fall, den #72 braucht, also war der direkte Weg der
+    einzige, der nie funktionieren konnte: meine erste Fassung fing die
+    Verweigerung ab und lieferte still `None`, der Slot-Pool blieb aus und
+    der Store wieder 512 Plaetze gross. Der vorgesehene Leser kreuzt Flag und
+    Env gegeneinander und broadcastet einen Skalar auf alle Raenge.
+
+    Ein BROADCASTETER Skalar taugt hier trotzdem: er sagt fuer jeden Rang
+    dasselbe, und genau das braucht die Basisrechnung -- nur die Laenge muss
+    zu den Ratios passen, sonst faellt ein Rang aus der Rechnung.
+    """
+    from flliper.srt.layers.moe import resident_fraction as _rf
+
+    try:
+        vec = _rf.resident_fraction_vector(tp_size=tp_size)
+    except Exception:  # noqa: BLE001 -- ohne Vektor bleibt es beim Alten
+        return None
+    try:
+        out = [float(x) for x in vec]
+    except (TypeError, ValueError):
+        return None
+    return out or None
+
+
+
+def _fill_experts_from_store(store, dst, s_dir, s_key, attr, s_lo, E, s_pad):
+    """#109: die Experten-Bytes, die der GETEILTE STORE schon traegt.
+
+    Gibt ``(gefuellt, fehlend)`` zurueck -- Zeilen aus dem Store und
+    Zeilen, die dort NICHT liegen, weil die andere Gruppe sie auf einer
+    Karte haelt. Die fehlenden bleiben Platzhalter; sie kommen ueber die
+    Legs (Nutzer-Order 20.09.: "on-card reuse sonst bar1 dma").
+
+    MESSUNG, die den Schnitt bemisst (Karte #107 mit den Arm-Parametern
+    183,137,168 / FR_P 0.367 / FR_D 0.479,0.319,0.284, Slotgroesse aus
+    fnFL2w51): von 512 Experten je Layer liegen 324 im Store (63 %) und
+    188 nur auf P's Karten (37 %) -- und D-Rang 0 braucht 92 residente,
+    von denen KEIN einziger im Store liegt: es sind genau die
+    ``shared_resident=92``, die beide Gruppen auf DERSELBEN 5090 heiss
+    halten.
+    """
+    from flliper.srt.layers.moe import expert_map as _em
+    from flliper.srt.layers.moe import expert_store as _es
+
+    emap = _es.expert_map()
+    if emap is None:
+        return 0, int(E)
+    p_slots = emap.get("phases", {}).get(_em.PHASE_PP, {}).get("slot_of", {})
+    if not p_slots:
+        return 0, int(E)
+    global_of = _es.global_rows(range(int(E)), int(s_lo), bool(s_pad))
+    row_list = {}
+    absent = 0
+    for local, gid in global_of.items():
+        slot = p_slots.get(str(int(gid)))
+        if slot is None:
+            absent += 1          # die andere Gruppe haelt ihn auf der Karte
+            continue
+        row_list[int(local)] = int(slot)
+    occupied_rows = _es.rows_written(s_dir, s_key, attr, 8)
+    filled = _es.fill_rows(store, dst, row_list, valid=occupied_rows.keys())
+    # Was der Store fuehren SOLLTE, aber noch nicht belegt hat, zaehlt als
+    # fehlend -- nicht als gefuellt. Eine genullte Zeile sieht aus wie ein
+    # Gewicht; nur der Sentinel unterscheidet sie.
+    return len(filled), int(E) - len(filled)
+
+
+def expert_band_slot_ranges(resident_ids) -> "list":
+    """Je Experten-Band der GPU-Slot-Bereich ``[s0, s1)``, den es belegt (#134).
+
+    ``resident_ids`` ist SORTIERT (``plan_load_time_staging``), also faellt
+    jedes Band -- die globalen Ids ``[b*S, (b+1)*S)`` -- auf einen
+    KONSEKUTIVEN Slot-Bereich.  Genau das macht ein Band benennbar: ein
+    Tensor, ein Tag, ein Transport-Stueck.
+
+    Leere Baender kommen NICHT in die Liste: dieser Rang haelt von ihnen
+    nichts auf der Karte (alles kalt, oder es gehoert gar nicht zu seinem
+    Experten-Band).  Ein leerer Eintrag waere ein 0-Byte-Tensor, den
+    ``build_plan`` als Parameter ohne Deskriptor sieht -- W74.
+
+    Gibt ``[]`` zurueck, wenn die Bandteilung aus ist.  REFUSED (ValueError)
+    statt geraten, wenn die Ids nicht sortiert ankommen: dann waere der
+    Bereich falsch, die Bytes gingen unter dem falschen Tag auf die Reise,
+    und der Fehler zeigte sich erst als falsch rechnendes Modell.
+    """
+    from flliper.srt.managers.pdflip_memory_saver import expert_band_geometry
+
+    size, count = expert_band_geometry()
+    if size <= 0:
+        return []
+    ids = list(resident_ids)
+    if any(ids[i] > ids[i + 1] for i in range(len(ids) - 1)):
+        raise ValueError(
+            "#134: resident_ids ist nicht sortiert, ein Experten-Band waere "
+            "damit kein konsekutiver Slot-Bereich. plan_load_time_staging "
+            "sortiert; wer hier unsortiert ankommt, hat die Liste nach dem "
+            "Plan umgestellt."
+        )
+    import bisect
+
+    out = []
+    for b in range(count):
+        lo, hi = b * size, (b + 1) * size
+        s0 = bisect.bisect_left(ids, lo)
+        s1 = bisect.bisect_left(ids, hi)
+        if s1 > s0:
+            out.append((b, s0, s1))
+    return out
+
+
+def publish_expert_bands(layer, attr: str, buf, resident_ids) -> int:
+    """Die karten-residenten Experten als BENANNTE Baender am Modul (#134).
+
+    WARUM DAS NOETIG IST, gemessen an fnFL2w62: ``PDFLIP-XCHG-COVER tag=weights_1
+    planned_mib=226.4`` fuer DREI Layer -- die Experten eines einzigen Layers
+    sind ein Vielfaches davon.  Der Austausch baut sein Inventar aus
+    ``named_parameters()``/``named_buffers()``/``vars(module)``
+    (``weight_exchange.walk_live_tensors``), und der Presplit ersetzt den
+    Experten-Parameter durch einen 0-Zeilen-Platzhalter und legt die echten
+    Bytes in ein DICT (``layer._moe_offload_presplit``).  Der Walk sagt seine
+    Grenze selbst: "a tensor reachable only through a container attribute (a
+    list, a dict ...) is not found".  Der Flip transportierte damit Dense und
+    Attention und NULL Experten-Bytes.
+
+    Ein Band wird als VIEW auf den Slot-Buffer veroeffentlicht, nicht als
+    Kopie: es sind dieselben Bytes, der Austausch braucht Zeiger und Laenge,
+    und eine Kopie waere ein zweites Mal Karte fuer nichts.  Der Name traegt
+    den Band-Index (``expert_band_attr_name``), aus dem
+    ``tag_of_parameter_name`` denselben Tag ableitet, den der Allokationspfad
+    gesetzt hat.
+
+    Gibt die Zahl der veroeffentlichten Baender zurueck (0 = Teilung aus).
+
+    KEIN AUFRUFER, UND WARUM -- gemessen an fnFL2w67 (9a50ccbb34), nicht
+    vermutet. Am Metall tat diese Funktion genau, was sie sollte: der Walk fand
+    jedes Band unter seinem richtigen Tag
+    (``PDFLIP-XCHG-UNCOVERED rank=0 tag=weights_13_e0 kind=attribute
+    name=model.layers.40.mlp.experts.pdflip_eband0_w13_weight_packed``).
+    Trotzdem ist ein VIEW in DIESER Buchhaltung kein eigenstaendiges Stueck,
+    und die Zeile sagt es selbst: ``mib=800.000`` fuer ein Band mit
+    ``shape=[16, 160, 2560]`` int32 = 25 MiB. ``_nbytes`` misst den STORAGE
+    (``untyped_storage().nbytes()``), absichtlich, weil ``covered_storage``
+    per Storage-Key deckt und ein View so nicht zweimal zaehlt -- dieselbe
+    Eigenschaft, die ihn als Transport-Stueck untauglich macht. Ergebnis:
+    ``W84 PdFlipXchgCoverageRefused: 1056/1392/992 finding(s)``, Boot gestoppt.
+    Die Refusal hatte recht.
+
+    DER RICHTIGE ORT ist ``pdflip/xchg_manifest.py`` -- das Cross-Group-Manifest,
+    in dem jeder Rang aufschreibt, was sein Loader entschieden hat, und dessen
+    Join die zwei Fragen beantwortet, die kein Rang allein kann: welche P-Stufe
+    die Quelle haelt, und wie der Tensor ueber D geschnitten ist. Genau das ist
+    ein Experten-Band. Diese Funktion bleibt mit ihren Tests stehen, weil die
+    Bereichsrechnung (``expert_band_slot_ranges``) dort unveraendert gebraucht
+    wird; was faellt, ist nur der Weg ueber Modul-Attribute.
+    """
+    from flliper.srt.managers.pdflip_memory_saver import expert_band_attr_name
+
+    n = 0
+    for band, s0, s1 in expert_band_slot_ranges(resident_ids):
+        setattr(layer, expert_band_attr_name(band, attr), buf[s0:s1])
+        n += 1
+    return n
+
+
+def presplit_expert_offload_after_repack(
+    layer, cold_shard: Optional[ColdShardContext] = None
+) -> None:  # pragma: no cover - CUDA
+    """Variant-C B2b LOAD-TIME RAM cap: called right after a FusedMoE layer's
+    marlin repack (the repacked expert tensors are on GPU, inside
+    device_loading_context). Splits each expert-major tensor into a [R+C]-slot
+    GPU buffer (fixed resident [0,R) + scratch) plus an [E-R]-slot pinned host
+    SPILL pool, stashes them on the layer (``_moe_offload_presplit``), and
+    replaces the registered param with a 0-row GPU placeholder so
+    device_loading_context's exit copies ~nothing back to host. The full [E,...]
+    stack therefore NEVER sits in host RAM -> host peak ~= spill, not the full
+    expert set. The eager installer later wires the stash into a
+    MoEExpertOffloadCache. No-op unless FLLIPER_MOE_RESIDENT_EXPERT_FRACTION < 1.
+
+    The layout now comes from ``plan_load_time_staging`` -- the same plan the
+    #123-GGUF half stages against -- so the two halves cannot drift apart and
+    both honour a non-static layout. With no ``cold_shard`` (every production
+    caller today: fp8.py, gptq_moe.py, awq_moe.py) the plan is the static
+    ``[0,R)`` one and the copies below are the same two slices as before.
+
+    ``cold_shard`` (#394) is REFUSED here by default, and the refusal is a
+    measurement rather than caution -- see
+    :func:`refuse_cold_shard_at_repack_door` for the reason and the escape
+    hatch. #421 F8 recorded this door as the second, unwired half of the #394
+    policy; the honest resolution is the named refusal, not a wiring, because
+    the door's own precondition (experts sharded on dim 0) is exactly the case
+    in which delegation was measured to be unsound.
+    """
+    import torch
+
+    from flliper.srt.layers.moe.resident_fraction import resident_fraction_for_rank
+    from flliper.srt.managers.pdflip_memory_saver import expert_buffer_attr_name
+
+    if cold_shard is not None:
+        refuse_cold_shard_at_repack_door(layer)
+
+    # SIZING: drives plan_load_time_staging below, i.e. the resident set and
+    # every buffer booked against this rank's VRAM. Prefer the value the LAYER
+    # latched at construction: it is the same number by default, and under
+    # "--rank-moe-ratio link" it is the one corrected to hold this rank's
+    # resident bytes at the base plan (#439). MoEExpertOffloadCache sizes
+    # itself from the layer's value and hard-errors if the two disagree.
+    frac = getattr(layer, "_expert_offload_fraction", None)
+    if frac is None:
+        frac = resident_fraction_for_rank()
+    if frac >= 1.0:
+        _refuse_unbuilt_platztausch_buffer(layer, frac=float(frac),
+                                           why="fraction >= 1.0")
+        return
+    E = getattr(layer, "num_local_experts", None)
+    if not E:
+        return
+    # #92: DAS HOTSET MUSS SCHON HIER GELTEN, nicht erst in `_freeze_hotset`.
+    # `build_plan` fuellt die Residenz sonst mit `rest[: R - len(pinned)]`,
+    # also mit den ERSTEN R Ids -- und der Presplit schreibt danach einen
+    # Store, dessen kalte Menge nicht die des Hotsets ist. fnFL2w20 und w21
+    # starben genau daran (#91-Verweigerung: "155 kalte Experten stehen im
+    # Hotset und haetten keinen Store-Platz"), w19 vorher am IndexError
+    # dahinter. Siebte Instanz der Klasse: der richtige Wert an einer Stelle,
+    # die der zaehlende Pfad nie erreicht.
+    # #159: DIE KARTE ZUERST, dann das Hotset, dann die alte Regel -- echte
+    # Alternativen, kein Vorspann (#107/2 hat gezeigt, dass Vorschalten
+    # nicht genuegt, solange ein anderer Pfad dieselbe Frage nochmal
+    # beantwortet).
+    #
+    # `pinned_experts` IST der Mechanismus, mit dem die Residenz
+    # vorgeschrieben wird: nennt die Karte genau R Ids, dann ist
+    # `rest[: R - len(pinned)]` leer und `resident_ids == sorted(pinned)`.
+    # Der Rang haelt also, was die Karte sagt -- und erst damit beschreibt
+    # sie etwas, das jemand herstellt.
+    # PLATZTAUSCH (Version-2-Karte, Nutzer-Entscheid 22.09.): Menge UND
+    # Reihenfolge kommen aus der Karte. Der Praefix ist, was der Austausch
+    # bewegt; dahinter Pad und Extra, die der Wake aus dem Store holt.
+    _layout = _local_map_layout(layer, int(E))
+    _order = None
+    _n_prefix = None
+    if _layout is not None:
+        _order, _n_prefix, _refill = _layout
+        _R_expected = resident_slot_count(int(E), frac)
+        if len(_order) != _R_expected:
+            raise RuntimeError(
+                f"Platztausch-Karte nennt {len(_order)} residente Zeilen fuer "
+                f"Layer {getattr(layer, 'layer_id', '?')} Rang "
+                f"{getattr(layer, 'moe_tp_rank', '?')} (Praefix {_n_prefix}, "
+                f"Pad+Extra {len(_refill)}), der Rang rechnet bei Fraction "
+                f"{frac} ueber {int(E)} Experten {_R_expected}. Die Karte "
+                f"zaehlt mit resident_slot_count(span+pad, f) -- weichen sie "
+                f"ab, wurde sie mit anderen Fractions gebaut als dieser Rang "
+                f"laeuft.")
+        layer._moe_offload_exchange_rows = int(_n_prefix)
+        layer._moe_offload_refill_runs = tuple(_refill_runs(_refill))
+        _card_res = None
+    else:
+        _card_res = _karten_residenz_lokal(layer, int(E))
+    if _order is not None:
+        _pinned = _order
+    elif _card_res is not None:
+        _R_expected = resident_slot_count(int(E), frac)
+        if len(_card_res) != _R_expected:
+            # KEIN Anpassen im Stillen. R bestimmt `buffer_slots` und damit
+            # jede VRAM-Zahl dieses Rangs (#439-Latch); waehlte ich hier
+            # einfach die Kartenzahl, waeren Plan und Budget wieder zwei
+            # Rechnungen -- genau die Klasse, die #160 gerade geschlossen
+            # hat. Die Karte und die Fraction muessen zusammenpassen, und
+            # wenn nicht, gehoert das VOR die erste Allokation.
+            raise RuntimeError(
+                f"#159: die KARTE nennt {len(_card_res)} residente Experten "
+                f"fuer Layer {getattr(layer, 'layer_id', '?')} Rang "
+                f"{getattr(layer, 'moe_tp_rank', '?')}, die Fraction {frac} "
+                f"ueber {int(E)} Experten ergibt {_R_expected}. Beide "
+                f"beschreiben dieselbe Karte und muessen dieselbe Zahl "
+                f"meinen -- sonst stimmt das VRAM-Budget nicht zu dem, was "
+                f"wirklich resident wird. Pruefe --rank-moe-resident-fraction "
+                f"gegen die Fractions, mit denen die Karte gebaut wurde."
+            )
+        _pinned = _card_res
+    else:
+        _pinned = _hotset_local_ids(layer, int(E))
+    plan = plan_load_time_staging(
+        int(E),
+        fraction=frac,
+        cold_shard=cold_shard,
+        pinned_experts=_pinned,
+        resident_order=_order,
+    )
+    if plan is None:
+        if _order is not None:
+            _refuse_unbuilt_platztausch_buffer(
+                layer, frac=float(frac),
+                why=f"the Karte pins all {len(_order)} of {int(E)} experts")
+        return
+    R = plan.resident_count
+    buf_slots = plan.buffer_slots
+    static = plan.is_static_layout
+    store_rows = _expert_store_rows_for(layer, plan)
+    # H95c: X seat rows behind the [R+C] bank on D's attention host (0 = off,
+    # byte-identical: the allocation below is the one of H95 B)
+    from flliper.srt.pdflip import d_seat_vram as _seat_vram
+
+    _seat_x = _seat_vram.presplit_seat_rows(layer)
+    if store_rows is not None:
+        layer._moe_offload_store_index = dict(store_rows[4])
+
+    presplit = {}
+    freed_device = 0
+    freed_host = 0
+    for attr in MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS:
+        p = getattr(layer, attr, None)
+        if p is None:
+            continue
+        t = p.data if hasattr(p, "data") else p
+        if t.dim() == 0 or t.shape[0] != int(E):
+            continue  # not an expert-major tensor
+        # [R+C] GPU buffer: [0:R] fixed resident; scratch [R:R+C] left uninit.
+        # THE survivor of the presplit: born in the tag pool even when the
+        # repack around it runs outside (ct-stream-presplit, fnFL2x2).
+        from flliper.srt.managers.pdflip_memory_saver import back_into_tag_pool
+
+        with back_into_tag_pool() as _in_tag_pool:
+            if _seat_x > 0:
+                # H95c: [R+C+X] rows, their pages trimmed to the cap form
+                # (rows [0, R+C)) before anything is written into them
+                buf = _seat_vram.seat_expert_buffer(
+                    rows=buf_slots, extra=_seat_x, tail=tuple(t.shape[1:]),
+                    dtype=t.dtype, device=t.device, in_tag_pool=bool(_in_tag_pool),
+                    name="layer %s %s" % (getattr(layer, "layer_id", "?"), attr))
+            else:
+                buf = torch.empty(
+                    (buf_slots,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
+                )
+        # Spill -> pinned host; the GPU [E] stack is then freed. The static
+        # plan is two contiguous slices, exactly as before; a #394 plan gathers
+        # the rows the plan names (whole experts on dim 0 either way).
+        if store_rows is not None:
+            # Task #47 step 1: the spill pool IS the shared store (rows =
+            # global ids), damit ein Leser aus der anderen Ranggruppe die
+            # Zeilen findet.
+            #
+            # #72 (21.09.): DER SATZ "residents included" STAND HIER FALSCH.
+            # `build_plan` setzt `spill_ids = [e for e in range(E) if e not in
+            # resident_set]` (Zeile ~1529) -- es gehen also NUR die kalten
+            # Zeilen in den Host, genau wie der Kommentar zwei Absaetze
+            # weiter unten sagt. Zwei Regeln an einer Stelle, und die
+            # veraltete stand oben; wer sie las, suchte den Host-Platz bei
+            # den falschen Zeilen.
+            #
+            # Was der Store trotzdem GROSS macht, ist nicht der Inhalt,
+            # sondern der reservierte Platz: `open_store` legt die Datei
+            # ueber ALLE globalen Experten-Ids an, auch die nie
+            # geschriebenen. Gemessen fnFL2w5/w7: 59 GiB auf Platte, 61,10
+            # GiB shmem. Die Indirektion global_id -> slot (Aufgabe #72)
+            # setzt genau hier an.
+            from flliper.srt.layers.moe import expert_store as _es
+
+            s_dir, s_key, s_lo, s_num, s_index, s_pad = store_rows
+            # #72: `s_num` ist BEREITS die Plaetzezahl, wenn der Slot-Pool
+            # greift (`_expert_store_rows_for` hat sie gerechnet). Sie als
+            # `num_experts` zu uebergeben hiesse, `slots_for` ein zweites Mal
+            # darauf loszulassen -- die Datei waere doppelt verkleinert und
+            # der letzte Rang schriebe hinter ihr Ende. Explizit als
+            # `num_slots` durchreichen, damit genau eine Stelle rechnet.
+            import time
+
+            _t_open = time.perf_counter()
+            spill, _created = _es.open_store(
+                s_dir, s_key, attr, s_num, tuple(t.shape[1:]), t.dtype,
+                num_slots=s_num,
+            )
+            _STORE_CLOCK["open_s"] += time.perf_counter() - _t_open
+            _STORE_CLOCK["opens"] += 1
+            # Only the COLD rows go to the host (flip design 20.09.: a row a
+            # card holds in some layout is taken from that card over BAR1, the
+            # host store keeps what no card holds). fn8m measured the store
+            # with residents at 58 GiB shmem / 77 GiB cgroup after load, 89 at
+            # the load peak, against the 88 GiB mark; residents are the 12 GiB.
+            # #94 (fnFL2w22/w23): MIT der vorgerechneten Abbildung, nicht
+            # ohne. `_expert_store_rows_for` hat `lokal -> Slot` schon
+            # gerechnet und oben als `layer._moe_offload_store_index` fuer den
+            # LESER abgelegt; hier stand sie als `_s_index` entpackt und
+            # ungenutzt daneben, waehrend `write_rows` sich `global_rows` ein
+            # zweites Mal selbst rechnete. Ergebnis: Schreiben in Zeile 370
+            # einer Datei mit 324 Plaetzen -- zwei Boots tot, und der
+            # Unterstrich im Namen sagte die ganze Zeit, dass niemand sie
+            # liest.
+            # #109 ERSTBOOT-ADOPTION: HIER IST DER STORE QUELLE, NICHT ZIEL.
+            # Unter `--load-format dummy` haelt dieser Rang Zufallszahlen;
+            # der geteilte Store traegt P's echte Experten-Bytes bereits.
+            # Vor dem `buf[:R].copy_(t[...])` unten gefuellt, damit die
+            # residenten Zeilen echt auf die Karte gehen statt Zufall.
+            try:
+                from flliper.srt.pdflip import adopt as _ad
+
+                if _ad.weights_are_placeholder():
+                    _g, _f = _fill_experts_from_store(
+                        spill, t, s_dir, s_key, attr, s_lo, int(E), s_pad
+                    )
+                    logger.info(
+                        "#109 STORE-ADOPT layer=%s attr=%s: %d von %d "
+                        "Experten aus dem geteilten Store geholt, %d fehlen "
+                        "(die haelt die andere Gruppe auf ihrer Karte -- sie "
+                        "kommen ueber die Legs)",
+                        s_key, attr, _g, int(E), _f,
+                    )
+            except ImportError:
+                pass
+            # NF-Bootzeit H2: the rows this D rank vetoed at load were never
+            # read -- the store holds P's bytes for them (sentinel). Leave
+            # them out of the write; the reader index stays complete.
+            from flliper.srt.layers.moe import store_adopt as _sa
+
+            _rows_w, _n_adopt = _sa.filter_store_rows(
+                layer, attr, dict(s_index), plan.resident_ids, s_lo, s_pad
+            )
+            if _n_adopt:
+                logger.info(
+                    "%s layer=%s attr=%s: %d store rows taken from P (not read, "
+                    "not rewritten), %d written",
+                    _sa.MARKER, s_key, attr, _n_adopt, len(_rows_w),
+                )
+            _t_write = time.perf_counter()
+            written = _es.write_rows(
+                spill, t, list(plan.spill_ids), s_lo, s_pad, rows=_rows_w
+            )
+            _STORE_CLOCK["write_s"] += time.perf_counter() - _t_write
+            # H2: the adopted rows are valid store rows too (P's bytes); the
+            # sentinel keeps meaning "these rows hold real weights".
+            _adopted = [int(v) for k, v in s_index.items() if k not in _rows_w]
+            _es.mark_rows_written(
+                s_dir, s_key, attr, int(getattr(layer, "moe_tp_rank", 0) or 0),
+                list(written.values()) + _adopted,
+            )
+        else:
+            spill = pinned_exact_empty((len(plan.spill_ids),) + tuple(t.shape[1:]), t.dtype)
+        if static:
+            buf[:R].copy_(t[:R])
+            if store_rows is None:
+                spill.copy_(t[R:])
+        else:
+            buf[:R].copy_(
+                t.index_select(
+                    0,
+                    torch.as_tensor(
+                        plan.resident_ids, dtype=torch.long, device=t.device
+                    ),
+                )
+            )
+            if plan.spill_ids and store_rows is None:
+                spill.copy_(
+                    t.index_select(
+                        0,
+                        torch.as_tensor(
+                            plan.spill_ids, dtype=torch.long, device=t.device
+                        ),
+                    )
+                )
+        presplit[attr] = (buf, spill)
+        # #135: DEN EXPERTEN-PUFFER DEM FLIP ZEIGEN -- EIN Tensor, kein View.
+        #
+        # Gemessen an fnFL2w67: der Plan trug 3,59 GiB ueber 18 Chunk-Tags
+        # (Dense + Attention) gegen 13/20/13 GB Kartenbelegung, und das
+        # Manifest dasselbe (rank=0 pieces=1103 bytes=3,0 GB). Die Experten
+        # standen in KEINEM Deskriptor, weil der Presplit den Parameter durch
+        # einen 0-Zeilen-Platzhalter ersetzt und die Bytes in ein DICT legt,
+        # das keine der drei Walks findet (named_parameters, named_buffers,
+        # vars(module) -- ein Dict ist keins davon).
+        #
+        # WARUM DER GANZE PUFFER UND NICHT JE BAND (w67 hat das widerlegt):
+        # `_nbytes` misst den STORAGE, weil `covered_storage` per Storage-Key
+        # deckt; ein View meldet damit den ganzen Puffer (mib=800.000 fuer ein
+        # 25-MiB-Band) und die Coverage refuest (W84, ok = not (uncovered or
+        # short or missing)). Ein Band KANN auch kein eigener Tensor sein: der
+        # MoE-Kernel braucht den Experten-Stapel zusammenhaengend.
+        # Die Feinheit gehoert deshalb nicht in den Tag, sondern in die
+        # SHARD-ACHSE -- `StorageGeom.of` flacht [R,160,2560] auf rows=R*160
+        # ab, ein Experte sind 160 Zeilen, und der Join liest die Achse aus
+        # den Manifesten ab, statt sie zu raten (xchg_manifest.py-Kopf).
+        #
+        # Der Scratch [R, R+C) reist mit. Ehrlich beziffert statt versteckt:
+        # bei R=188, C=32 sind das 14,5 % Overhead je Tensor -- der Preis
+        # dafuer, dass die Byte-Zahl des Eintrags die des Storages IST und
+        # die Coverage nicht auf `short` laeuft.
+        # PLATZTAUSCH: unter der Version-2-Karte sieht der Austausch NUR den
+        # Praefix -- die Zeilen, die beide Phasen halten. Pad, Extra und
+        # Scratch reisen nicht: das Extra liegt dauerhaft im Store, der Scratch
+        # ist ein LRU-Cache. Ein View ueber den Anfang eines zusammenhaengenden
+        # Puffers flacht zu rows = praefix * (Zeilen je Experte) ab, und der
+        # Join liest daraus einen gewoehnlichen Zeilenschnitt ueber D.
+        if _n_prefix is None:
+            setattr(layer, expert_buffer_attr_name(attr), buf)
+        elif _n_prefix > 0:
+            setattr(layer, expert_buffer_attr_name(attr), buf[:_n_prefix])
+        if store_rows is not None:
+            torch.cuda.empty_cache()  # give the sizer the device bytes back (fn8m)
+        # #119: tally the VRAM this tensor stops holding, so the KV-pool sizing
+        # step can report (and assert on) the reclaim it is about to inherit.
+        row_bytes = (t.numel() // t.shape[0]) * t.element_size()
+        freed_device += expert_offload_released_device_bytes(
+            int(E), buf_slots, row_bytes
+        )
+        if store_rows is not None:
+            freed_host += len(plan.spill_ids) * row_bytes  # own rows of the shared file
+        else:
+            freed_host += spill.numel() * spill.element_size()
+        # Replace the param's DATA with a 0-row placeholder so
+        # device_loading_context copies nothing back to host (the full [E]
+        # GPU tensor is dropped here). In place, on the SAME Parameter object:
+        # measured on Qwen3.8-Flash-Next (fn1l, 16.09.2026) a fresh Parameter
+        # left the old one -- with its repacked [E] stack -- alive under
+        # ``model.layers.N.mlp.experts.w13_weight_packed`` in the loader's
+        # params_dict snapshot for the rest of load_weights: +0.81 GiB per
+        # layer on the card, OOM at 71 % of the checkpoint. Swapping .data
+        # frees the stack for every holder of the object.
+        empty = torch.empty((0,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)
+        if isinstance(p, torch.nn.Parameter):
+            p.data = empty
+        else:
+            setattr(layer, attr, empty)
+
+    if presplit:
+        layer._moe_offload_presplit = presplit
+        if _seat_x > 0:
+            layer._pdflip_seat_rows = int(_seat_x)
+        layer._moe_offload_full_experts = int(E)
+        if not static:
+            # Same publication contract as the #123-GGUF half: the buffers are
+            # already arranged this way, so the cache adopts the map verbatim.
+            layer._moe_offload_frozen_layout = (
+                list(plan.resident_ids),
+                list(plan.spill_ids),
+            )
+            if plan.pinned_ids:  # #302a: never-demote set
+                layer._moe_offload_pinned_experts = list(plan.pinned_ids)
+            if plan.delegated_ids:
+                layer._moe_offload_delegated_experts = list(plan.delegated_ids)
+        publish_host_shard_on_layer(layer, plan)
+        record_expert_offload_release(freed_device, freed_host, len(presplit))
+        # Return freed host memory to the OS NOW. create_weights loaded the full
+        # [E] expert set to host CPU; the loader frees each layer's loaded tensor
+        # (via device_loading_context) as it is repacked, but glibc/torch retain
+        # the freed CPU buffers in the allocator pool -- so across the 48-layer
+        # repack the retained-but-unused buffers accumulate (~ the whole [E]
+        # set) and squeeze MemAvailable toward the no-swap floor. A per-layer
+        # gc + malloc_trim returns them so the host peak stays ~= spill, not the
+        # full loaded set. Cheap (runs once per MoE layer at load).
+        del t, buf, spill
+        import gc as _gc
+
+        _gc.collect()
+        try:
+            import ctypes as _ct
+
+            _ct.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
+
+# --- Task #49 (2026-09-20, after fn8c8b): the router-level probe ------------
+#
+# fn8c8b put the NaN in topk_weights, on the way into GEMM2's
+# mul_topk_weights. This splits that one verdict into three, so the next boot
+# does not have to guess which half of the router did it:
+#
+#   GATE-LOGITS   -- router_logits already non-finite: the gate GEMM (or the
+#                    model) made it and softmax/sigmoid only carried it.
+#   TOPK-WEIGHTS  -- logits finite, weights not: the selection and its
+#                    renormalisation made it. The 0/0 case.
+#   GATHERED      -- both finite, only the wave-slice gather dirty. Reading the
+#                    gather, that should be impossible (index_select over
+#                    flatnonzero indices); if it ever fires, the index is wrong
+#                    and this is the finding.
+#
+# Budgeted and capture-gated through the same helpers as the level-2 stage
+# walk, so it can never repeat the fn8c5 mistake of syncing inside a graph
+# capture.
+_ROUTER_PROBE_LOGGED = {"n": 0}
+_ROUTER_PROBE_BUDGET = 24
+
+
+def _router_probe(router_logits, topk_weights, flat_weights, T, K) -> None:
+    # This module imports logging per function rather than at module scope;
+    # every other logging site here does the same, so this one follows suit.
+    import logging
+
+    import torch
+
+    logger = logging.getLogger(__name__)
+    try:
+        from flliper.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            _bad_rows,
+            _capture_active,
+            _first,
+            _n,
+            marlin_stage_probe_on,
+        )
+        from flliper.srt.layers.moe.router_nan_probe import classify_router_origin
+
+        if not marlin_stage_probe_on() or _capture_active():
+            return
+        if _ROUTER_PROBE_LOGGED["n"] >= _ROUTER_PROBE_BUDGET:
+            return
+
+        levels = {}
+        lg = None
+        if isinstance(router_logits, torch.Tensor) and router_logits.dim() >= 2:
+            lg = _bad_rows(router_logits)
+            levels["GATE-LOGITS"] = _n(lg)
+        tw = _bad_rows(topk_weights.reshape(T, -1))
+        levels["TOPK-WEIGHTS"] = _n(tw)
+        if flat_weights is None:
+            flat_weights = topk_weights.reshape(-1, 1)
+        gw = _bad_rows(flat_weights)
+        levels["GATHERED"] = _n(gw)
+
+        if all(v == 0 for v in levels.values()):
+            return
+        _ROUTER_PROBE_LOGGED["n"] += 1
+        origin = classify_router_origin(levels)
+        # A per-token failure hits ALL K of that token's weights; a per-pair one
+        # does not. The ratio is the discriminator between "the renorm divided
+        # this token by zero" and "one weight went bad on its own".
+        bad_pairs = levels["GATHERED"]
+        bad_tokens = levels["TOPK-WEIGHTS"]
+        logger.error(
+            "[nan-probe-rw] ROUTER-ORIGIN %s: T=%d K=%d bad_logit_rows=%s "
+            "bad_weight_tokens=%d bad_flat_pairs=%d pairs_per_bad_token=%.2f "
+            "first_bad_logits=%s first_bad_tokens=%s "
+            "-- pairs_per_bad_token == K means every weight of those tokens is "
+            "gone at once, which is the signature of the unguarded "
+            "topk_weights / topk_weights.sum() (0/0); a value below K means "
+            "individual weights failed and the renorm is NOT the cause",
+            origin, int(T), int(K),
+            levels.get("GATE-LOGITS", "unmeasured"), bad_tokens, bad_pairs,
+            (bad_pairs / bad_tokens) if bad_tokens else float("nan"),
+            _first(lg), _first(tw),
+        )
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a layer
+        logger.debug("[nan-probe-rw] router probe skipped: %s", exc)
+
+
+# ---- fnFL2 H29b: P's tail routing for D's LRU warm ---------------------------
+def _make_route_recorder():
+    from flliper.srt.pdflip.decode_warm_handoff import RouteRecorder
+
+    return RouteRecorder()
+
+
+_ROUTE_RECORDER = _make_route_recorder()
+
+
+def _route_note_armed(layer, num_local: int) -> bool:
+    """True on a P-stage layer that holds EVERY expert (its local ids are the
+    global ids D's shards translate) with FLLIPER_PDFLIP_LRU_WARM_FROM_HANDOFF on;
+    the layer is registered so the stage writes its file once per forward."""
+    from flliper.srt.environ import envs
+
+    if not envs.FLLIPER_PDFLIP_LRU_WARM_FROM_HANDOFF.get():
+        return False
+    if _group_of_layer(layer) != "P":
+        return False
+    num_global = int(getattr(layer, "num_experts", 0) or 0)
+    if not num_global or int(num_local) != num_global:
+        return False
+    lid = getattr(layer, "layer_id", None)
+    if lid is None:
+        return False
+    _ROUTE_RECORDER.register(int(lid))
+    return True

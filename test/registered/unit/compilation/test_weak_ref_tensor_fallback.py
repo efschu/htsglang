@@ -1,6 +1,6 @@
 """`weak_ref_tensor` must not hard-require sgl-kernel (#164).
 
-`sglang/srt/compilation/weak_ref_tensor.py` did `from sgl_kernel import
+`flliper/srt/compilation/weak_ref_tensor.py` did `from sgl_kernel import
 weak_ref_tensor` at module scope for every CUDA/HIP/MUSA/XPU build. sgl-kernel's
 wheel is cubin-only with a gencode floor of sm_80 and has no ROCm build below
 gfx942, so on a Turing card or a gfx900 card the package is simply not there --
@@ -27,8 +27,8 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.compilation import weak_ref_tensor as wrt
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.compilation import weak_ref_tensor as wrt
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

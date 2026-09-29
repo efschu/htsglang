@@ -16,7 +16,7 @@ split the ranks' told):
   calls return (slot per stem, None for a page not on disk / not readable),
   with ONE claim and ONE completion call, and the bytes land in the slots;
 * the parallel read (16 threads) equals the serial read, status and bytes;
-  ``SGLANG_HICACHE_L3_READ_THREADS=1`` is the serial single call;
+  ``FLLIPER_HICACHE_L3_READ_THREADS=1`` is the serial single call;
 * ``_arena_page_get`` returns the same page count as before for a mixed batch
   (complete lead, L3 pages, a page the L3 lacks) -- the prefix ends at the
   first page nothing can give -- and asks the L3 once per batch;
@@ -36,7 +36,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
-from sglang.srt.mem_cache import hicache_storage as hs  # noqa: E402
+from flliper.srt.mem_cache import hicache_storage as hs  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -117,7 +117,7 @@ def test_one_batch_fill_equals_n_single_fills(tmp_path):
 
 def test_the_parallel_read_equals_the_serial_read(tmp_path, monkeypatch):
     be, stems = _store(tmp_path, 500, missing={3})
-    from sglang.srt.mem_cache.storage.file.pageio import load
+    from flliper.srt.mem_cache.storage.file.pageio import load
 
     pio = load()
     paths = [be._existing_path(st) for st in stems]
@@ -160,7 +160,7 @@ class _PoolArena:
 
 
 def _controller(found, fill_ok, evicted=()):
-    from sglang.srt.managers import cache_controller as cc
+    from flliper.srt.managers import cache_controller as cc
 
     arena = _PoolArena(found, evicted)
     fills = []
@@ -182,12 +182,12 @@ def _controller(found, fill_ok, evicted=()):
     ctl = types.SimpleNamespace(mem_pool_host=pool, storage_backend=backend, page_size=1)
     op = types.SimpleNamespace(probe_pins=None, completed_tokens=0, n=0)
     op.increment = lambda k: setattr(op, "n", op.n + k)
-    orig = cc.weg2_suffixed_stems
-    cc.weg2_suffixed_stems = lambda be, hv: ["s%d" % i for i in range(len(hv))]
+    orig = cc.pdflip_suffixed_stems
+    cc.pdflip_suffixed_stems = lambda be, hv: ["s%d" % i for i in range(len(hv))]
     try:
         got = cc.HiCacheController._arena_page_get(ctl, op, list(range(len(found))), None)
     finally:
-        cc.weg2_suffixed_stems = orig
+        cc.pdflip_suffixed_stems = orig
     arena.seen_refs = seen_refs
     return got, fills, arena
 
@@ -300,7 +300,7 @@ def test_a_failed_reference_ends_the_fill_list_before_the_fill():
 
 
 def test_a_large_page_is_read_in_pieces_byte_exact(tmp_path):
-    from sglang.srt.mem_cache.storage.file.pageio import load
+    from flliper.srt.mem_cache.storage.file.pageio import load
 
     pio = load()
     total = hs.L3_SPLIT_MIN_BYTES + 3 * hs.L3_SPLIT_CHUNK_BYTES + 12345   # not a chunk multiple
@@ -327,7 +327,7 @@ def test_small_pages_keep_the_page_parallel_path(tmp_path, monkeypatch):
     real = hs._l3_read_split
     monkeypatch.setattr(hs, "_l3_read_split", lambda *a, **k: calls.append(1) or real(*a, **k))
     be, stems = _store(tmp_path, 100)
-    from sglang.srt.mem_cache.storage.file.pageio import load
+    from flliper.srt.mem_cache.storage.file.pageio import load
 
     pio = load()
     b = np.zeros((100, PAGE), dtype=np.uint8)

@@ -1,10 +1,10 @@
 import json
 import unittest
 
-from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.function_call.minimax_m3 import MINIMAX_NS_TOKEN, MinimaxM3Detector
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.entrypoints.openai.protocol import Function, Tool
+from flliper.srt.function_call.minimax_m3 import MINIMAX_NS_TOKEN, MinimaxM3Detector
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 

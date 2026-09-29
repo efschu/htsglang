@@ -9,20 +9,20 @@ import unittest
 
 import torch
 
-import sglang.jit_kernel.dsv4.fp8_wo_a as fp8_wo_a_module
-from sglang.jit_kernel.dsv4 import sglang_per_token_group_quant_fp8_dsv4_wo_a
-from sglang.srt.layers.quantization.fp8_kernel import (
+import flliper.jit_kernel.dsv4.fp8_wo_a as fp8_wo_a_module
+from flliper.jit_kernel.dsv4 import flliper_per_token_group_quant_fp8_dsv4_wo_a
+from flliper.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
-    sglang_per_token_group_quant_fp8,
+    flliper_per_token_group_quant_fp8,
 )
-from sglang.srt.layers.quantization.fp8_utils import (
+from flliper.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
-from sglang.srt.utils import get_device_sm
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils import get_device_sm
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -46,7 +46,7 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
 
     def _flat_reference(self, o):
         T, G, D = o.shape
-        q_ref, s_ref = sglang_per_token_group_quant_fp8(
+        q_ref, s_ref = flliper_per_token_group_quant_fp8(
             o.contiguous().view(T * G, D),
             _GROUP_SIZE,
             scale_ue8m0=True,
@@ -92,16 +92,16 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
                 o = (
                     torch.randn(T, G, D, device=device, dtype=torch.float32) * 0.25
                 ).to(dtype)
-                o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                o_fp8, o_s = flliper_per_token_group_quant_fp8_dsv4_wo_a(o)
                 self._assert_matches_flat_reference(o, o_fp8, o_s)
 
                 o = self._strided_tgd(T, G, D, dtype, device)
-                o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                o_fp8, o_s = flliper_per_token_group_quant_fp8_dsv4_wo_a(o)
                 self._assert_matches_flat_reference(o, o_fp8, o_s)
 
     def test_dsv4_wo_a_quant_empty_token_dimension(self):
         o = torch.empty(0, 3, 256, device="cuda", dtype=torch.bfloat16)
-        o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+        o_fp8, o_s = flliper_per_token_group_quant_fp8_dsv4_wo_a(o)
 
         self.assertEqual(o_fp8.shape, o.shape)
         self.assertEqual(o_fp8.dtype, fp8_dtype)
@@ -128,7 +128,7 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
                     o = (
                         torch.randn(T, G, D, device=device, dtype=torch.float32) * 0.25
                     ).to(torch.bfloat16)
-                o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                o_fp8, o_s = flliper_per_token_group_quant_fp8_dsv4_wo_a(o)
                 self._assert_matches_flat_reference(o, o_fp8, o_s)
 
     def test_dsv4_wo_a_quant_uses_dedicated_jit(self):
@@ -146,7 +146,7 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
         fp8_wo_a_module._jit_module = wrapped_jit_module
         try:
             o = self._strided_tgd(3, 2, 256, torch.bfloat16, "cuda")
-            sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+            flliper_per_token_group_quant_fp8_dsv4_wo_a(o)
             torch.cuda.synchronize()
             self.assertGreater(jit_module_calls, 0)
         finally:
@@ -182,7 +182,7 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
                 )
                 weight_s = transform_scale_ue8m0(weight_s_raw, mn=R)
 
-                q_dsv4, s_dsv4 = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                q_dsv4, s_dsv4 = flliper_per_token_group_quant_fp8_dsv4_wo_a(o)
                 out = torch.empty(T, G, R, device=device, dtype=torch.bfloat16)
                 self.deep_gemm.fp8_einsum(
                     "bhr,hdr->bhd",

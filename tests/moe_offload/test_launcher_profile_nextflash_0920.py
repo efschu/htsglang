@@ -1,7 +1,7 @@
-"""Task #47 Scheibe 6a (20.09.): the weg2 launcher's ``--profile nextflash``.
+"""Task #47 Scheibe 6a (20.09.): the pdflip launcher's ``--profile nextflash``.
 
 Next Flash runs P = PP3 (tp 1 per stage) and D = Form A, whose rank_role
-collapses DCP to 1 and REFUSES an inherited SGLANG_UNEVEN_DCP=1. The 27B
+collapses DCP to 1 and REFUSES an inherited FLLIPER_UNEVEN_DCP=1. The 27B
 launcher wrote the uneven-DCP facts (EARLY_READ_FACTS) into BOTH groups' env
 and the flag half into D's argv. Under the nextflash profile the env is
 group-owned (flip_nextflash_groups GROUP_ENV_VALUES) and the flag half is
@@ -9,7 +9,7 @@ dropped; the qwen27b profile stays byte-identical."""
 
 import types
 
-from sglang.srt.weg2 import launcher as lc
+from flliper.srt.pdflip import launcher as lc
 
 
 def _common(group, profile):
@@ -29,24 +29,24 @@ def test_nextflash_profile_drops_the_dcp_flag_half_on_both_groups():
 
 
 def test_nextflash_env_is_group_owned(monkeypatch, tmp_path):
-    monkeypatch.delenv("SGLANG_UNEVEN_DCP", raising=False)
-    monkeypatch.delenv("SGLANG_UNEVEN_DCP_WEIGHTED", raising=False)
+    monkeypatch.delenv("FLLIPER_UNEVEN_DCP", raising=False)
+    monkeypatch.delenv("FLLIPER_UNEVEN_DCP_WEIGHTED", raising=False)
     kw = dict(chunk_layers=0, chunk_count=0, tms_so="", transport="bar1", ring=None)
     env_p = lc.build_env(str(tmp_path), "venv", "0,1,2", str(tmp_path), False, "t", group="P",
                          profile=lc.PROFILE_NEXTFLASH, **kw)
     env_d = lc.build_env(str(tmp_path), "venv", "0,1,2", str(tmp_path), False, "t", group="D",
                          profile=lc.PROFILE_NEXTFLASH, **kw)
     env_d27 = lc.build_env(str(tmp_path), "venv", "0,1,2", str(tmp_path), False, "t", group="D", **kw)
-    assert (env_p["SGLANG_UNEVEN_DCP"], env_p["SGLANG_UNEVEN_DCP_WEIGHTED"]) == ("1", "1")
-    assert (env_d["SGLANG_UNEVEN_DCP"], env_d["SGLANG_UNEVEN_DCP_WEIGHTED"]) == ("0", "0")
-    assert (env_d27["SGLANG_UNEVEN_DCP"], env_d27["SGLANG_UNEVEN_DCP_WEIGHTED"]) == ("1", "1")
+    assert (env_p["FLLIPER_UNEVEN_DCP"], env_p["FLLIPER_UNEVEN_DCP_WEIGHTED"]) == ("1", "1")
+    assert (env_d["FLLIPER_UNEVEN_DCP"], env_d["FLLIPER_UNEVEN_DCP_WEIGHTED"]) == ("0", "0")
+    assert (env_d27["FLLIPER_UNEVEN_DCP"], env_d27["FLLIPER_UNEVEN_DCP_WEIGHTED"]) == ("1", "1")
 
 
 def test_the_knobs_carry_the_profile_and_the_cli_offers_it():
-    ns = types.SimpleNamespace(weg2_seam_digest=False, barlink_build_window_cap_s=1, pp_chain_recv_stall_s=1,
+    ns = types.SimpleNamespace(pdflip_seam_digest=False, barlink_build_window_cap_s=1, pp_chain_recv_stall_s=1,
                                pp_occupant_horizon_s=1, match_refusal_census_every=1, arming_floor_solved=True,
                                hicache_bigram_keys=True, hicache_flush_publish_sweep=True, profile="nextflash",
-                               weg2_vision="off", tag="t")
+                               pdflip_vision="off", tag="t")
     assert lc._env_knobs(ns)["profile"] == "nextflash"
     import inspect
 
@@ -58,13 +58,13 @@ def test_group_env_extra_is_applied_last_and_parsed_strictly(tmp_path):
     import pytest as _pt
 
     assert lc.parse_group_env("") == {}
-    assert lc.parse_group_env("A=1; SGLANG_MOE_SCRATCH_SLOTS=74,48,48") == {"A": "1", "SGLANG_MOE_SCRATCH_SLOTS": "74,48,48"}
+    assert lc.parse_group_env("A=1; FLLIPER_MOE_SCRATCH_SLOTS=74,48,48") == {"A": "1", "FLLIPER_MOE_SCRATCH_SLOTS": "74,48,48"}
     with _pt.raises(ValueError):
         lc.parse_group_env("NOEQUALS")
     kw = dict(chunk_layers=0, chunk_count=0, tms_so="", transport="bar1", ring=None)
     env = lc.build_env(str(tmp_path), "venv", "0,1,2", str(tmp_path), False, "t", group="P",
-                       profile=lc.PROFILE_NEXTFLASH, group_env_extra={"SGLANG_MOE_SCRATCH_SLOTS": "32"}, **kw)
-    assert env["SGLANG_MOE_SCRATCH_SLOTS"] == "32"
+                       profile=lc.PROFILE_NEXTFLASH, group_env_extra={"FLLIPER_MOE_SCRATCH_SLOTS": "32"}, **kw)
+    assert env["FLLIPER_MOE_SCRATCH_SLOTS"] == "32"
 
 
 def test_resident_arm_sleeps_only_kv(monkeypatch):
@@ -72,7 +72,7 @@ def test_resident_arm_sleeps_only_kv(monkeypatch):
     weights tag on a resident boot (server W4 refuses -> W29 rank disagree)."""
     import types
 
-    from sglang.srt.weg2 import launcher as L
+    from flliper.srt.pdflip import launcher as L
 
     fam = ["weights_0", "weights_1", "weights"]
     assert L.flip_weights_tags(types.SimpleNamespace(flip_weights="resident"), fam) == []
@@ -87,7 +87,7 @@ def test_resident_arm_sleeps_only_kv(monkeypatch):
 def test_w7_w10_counts_form_a_workers(tmp_path):
     """fnFL2 v18 (21.09.): D READY with one attention host and two expert
     workers logged kv x1 blob x1; the workers' own #706 line stands in."""
-    from sglang.srt.weg2 import launcher as L
+    from flliper.srt.pdflip import launcher as L
 
     log = tmp_path / "D.log"
     log.write_text(
@@ -100,7 +100,7 @@ def test_w7_w10_counts_form_a_workers(tmp_path):
     log.write_text("[PP0] #706 canonical KV page active\n[PP0] canonical GDN blob active\n")
     assert L.canonical_marker_counts(str(log)) == (1, 1, 0)
     # the marker text is the controller's own line, byte for byte
-    from sglang.srt.managers import cache_controller as cc
+    from flliper.srt.managers import cache_controller as cc
     import inspect
 
     src = inspect.getsource(cc.HiCacheController._generate_storage_config)

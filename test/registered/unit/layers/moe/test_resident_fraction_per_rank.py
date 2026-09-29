@@ -20,23 +20,23 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe.expert_offload import (
+from flliper.srt.environ import envs
+from flliper.srt.layers.moe.expert_offload import (
     plan_load_time_staging,
     resident_slot_count,
 )
-from sglang.srt.layers.moe.resident_fraction import (
+from flliper.srt.layers.moe.resident_fraction import (
     describe,
     offload_active,
     resident_fraction_for_rank,
     resident_fraction_vector,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
-_ENV = "SGLANG_MOE_RESIDENT_EXPERT_FRACTION"
+_ENV = "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"
 
 
 class _EnvMixin:
@@ -66,14 +66,14 @@ class TestScalarPathUnchanged(_EnvMixin, CustomTestCase):
         """A dozen readers do `< 1.0` on this. It must stay a float, not
         become a 1-tuple, or every one of them changes meaning."""
         self._set(None)
-        value = envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get()
+        value = envs.FLLIPER_MOE_RESIDENT_EXPERT_FRACTION.get()
         self.assertIsInstance(value, float)
         self.assertEqual(value, 1.0)
         self.assertFalse(offload_active())
 
     def test_scalar_still_reads_as_a_plain_float(self):
         self._set("0.45")
-        value = envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get()
+        value = envs.FLLIPER_MOE_RESIDENT_EXPERT_FRACTION.get()
         self.assertIsInstance(value, float)
         self.assertEqual(value, 0.45)
         self.assertTrue(offload_active())
@@ -172,14 +172,14 @@ class TestRefusals(_EnvMixin, CustomTestCase):
         tuple or from the wrong element."""
         self._set("0.485,0.42,0.42")
         with self.assertRaises(RuntimeError) as ctx:
-            envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get()
+            envs.FLLIPER_MOE_RESIDENT_EXPERT_FRACTION.get()
         message = str(ctx.exception)
         self.assertIn("per rank", message)
         self.assertIn("resident_fraction_for_rank", message)
         self.assertIn("offload_active", message)
 
     def test_env_and_flag_must_agree(self):
-        import sglang.srt.layers.moe.resident_fraction as mod
+        import flliper.srt.layers.moe.resident_fraction as mod
 
         self._set("0.485,0.42,0.42")
         with mock.patch.object(
@@ -195,7 +195,7 @@ class TestRefusals(_EnvMixin, CustomTestCase):
             self.assertEqual(resident_fraction_vector(3), (0.485, 0.42, 0.42))
 
     def test_flag_wins_when_env_is_absent(self):
-        import sglang.srt.layers.moe.resident_fraction as mod
+        import flliper.srt.layers.moe.resident_fraction as mod
 
         self._set(None)
         with mock.patch.object(
@@ -229,7 +229,7 @@ class TestMoeGroupRefusal(_EnvMixin, CustomTestCase):
     two groups differ that is ambiguous, and ambiguity is refused by name."""
 
     def test_vector_refused_when_moe_group_differs_from_tp_group(self):
-        import sglang.srt.layers.moe.resident_fraction as mod
+        import flliper.srt.layers.moe.resident_fraction as mod
 
         self._set("0.485,0.42,0.42")
         with mock.patch.object(mod, "_moe_tp_size", lambda: 6):
@@ -241,7 +241,7 @@ class TestMoeGroupRefusal(_EnvMixin, CustomTestCase):
 
     def test_scalar_is_still_fine_when_the_groups_differ(self):
         """A single value is unambiguous no matter how the groups are split."""
-        import sglang.srt.layers.moe.resident_fraction as mod
+        import flliper.srt.layers.moe.resident_fraction as mod
 
         self._set("0.45")
         with mock.patch.object(mod, "_moe_tp_size", lambda: 6):
@@ -257,7 +257,7 @@ class TestEagerCliValidation(CustomTestCase):
         other server_args tests use), so the validator is invoked directly --
         which is also what pins that it lives in the always-run part of
         _handle_uneven_tp rather than behind the uneven-plan early return."""
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         args = ServerArgs(model_path="dummy")
         args.tp_size = tp_size

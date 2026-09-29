@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.cp.base import (
+from flliper.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     get_cp_strategy,
     get_cp_strategy_kind,
@@ -13,15 +13,15 @@ from sglang.srt.layers.cp.base import (
     is_interleave,
     is_zigzag,
 )
-from sglang.srt.layers.cp.utils import (
+from flliper.srt.layers.cp.utils import (
     cp_split_before_forward,
     enable_cp_v2,
     is_cp_v2_active,
 )
-from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
-from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.cp.zigzag import ZigzagCPStrategy
+from flliper.srt.runtime_context import get_parallel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -81,14 +81,14 @@ class TestCPStrategyUnit(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=False
+            "flliper.srt.environ.envs.FLLIPER_ENABLE_CP_V2.get", return_value=False
         ):
             self.assertIsNotNone(get_cp_strategy())
             self.assertTrue(is_cp_enabled())
             self.assertTrue(is_interleave())
 
         with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+            "flliper.srt.environ.envs.FLLIPER_ENABLE_CP_V2.get", return_value=True
         ):
             self.assertIsNotNone(get_cp_strategy())
 
@@ -137,13 +137,13 @@ class TestCPZigzagStrategy(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=False
+            "flliper.srt.environ.envs.FLLIPER_ENABLE_CP_V2.get", return_value=False
         ):
             self.assertFalse(enable_cp_v2())
             self.assertFalse(is_cp_v2_active(active_batch))
 
         with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+            "flliper.srt.environ.envs.FLLIPER_ENABLE_CP_V2.get", return_value=True
         ):
             self.assertTrue(enable_cp_v2())
             self.assertTrue(is_cp_v2_active(active_batch))
@@ -339,7 +339,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             local_x = strategy.shard_hidden_states(x, fb)
             local_positions = strategy.shard_position_ids(positions, fb)
             with patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+                "flliper.srt.environ.envs.FLLIPER_ENABLE_CP_V2.get", return_value=True
             ):
                 helper_x, helper_positions = cp_split_before_forward(
                     x,
@@ -375,7 +375,7 @@ class TestCPZigzagStrategy(CustomTestCase):
                     attn_cp_group=_FakeCPGroup(padded_rank_tensors)
                 ),
                 patch(
-                    "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
+                    "flliper.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
                     return_value=torch.no_grad(),
                 ),
             ):
@@ -408,7 +408,7 @@ class TestCPZigzagStrategy(CustomTestCase):
                     attn_cp_group=_FakeCPGroup(padded_rank_tensors)
                 ),
                 patch(
-                    "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
+                    "flliper.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
                     return_value=torch.no_grad(),
                 ),
             ):

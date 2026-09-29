@@ -45,7 +45,7 @@ def test_mooncake_te_condition(server_args: ServerArgs) -> bool:
     """
     Test the condition logic for using MooncakeTransferEngine.
     """
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from flliper.srt.model_executor.model_runner import ModelRunner
 
     dummy_runner = SimpleNamespace(server_args=server_args, gpu_id=0)
     init_called = False
@@ -61,11 +61,11 @@ def test_mooncake_te_condition(server_args: ServerArgs) -> bool:
 
     with (
         patch(
-            "sglang.srt.distributed.device_communicators.mooncake_transfer_engine.init_mooncake_transfer_engine",
+            "flliper.srt.distributed.device_communicators.mooncake_transfer_engine.init_mooncake_transfer_engine",
             side_effect=_fake_init_mooncake_transfer_engine,
         ),
         patch(
-            "sglang.srt.model_executor.model_runner.get_local_ip_auto",
+            "flliper.srt.model_executor.model_runner.get_local_ip_auto",
             return_value="127.0.0.1",
         ),
     ):
@@ -121,10 +121,10 @@ def run_mooncake_init(
         if use_mooncake_te:
             print(f"[Rank {rank}] Attempting to initialize MooncakeTransferEngine...")
 
-            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+            from flliper.srt.distributed.device_communicators.mooncake_transfer_engine import (
                 init_mooncake_transfer_engine,
             )
-            from sglang.srt.utils import get_local_ip_auto
+            from flliper.srt.utils import get_local_ip_auto
 
             ib_device = (
                 server_args.disaggregation_ib_device or server_args.mooncake_ib_device
@@ -249,7 +249,7 @@ def test_condition_logic():
     print("=" * 60)
     print()
 
-    original_hicache_reuse = os.environ.get("SGLANG_HICACHE_MOONCAKE_REUSE_TE")
+    original_hicache_reuse = os.environ.get("FLLIPER_HICACHE_MOONCAKE_REUSE_TE")
     passed = 0
     failed = 0
 
@@ -329,9 +329,9 @@ def test_condition_logic():
 
         for name, env_value, server_args, expected in test_cases:
             if env_value is None:
-                os.environ.pop("SGLANG_HICACHE_MOONCAKE_REUSE_TE", None)
+                os.environ.pop("FLLIPER_HICACHE_MOONCAKE_REUSE_TE", None)
             else:
-                os.environ["SGLANG_HICACHE_MOONCAKE_REUSE_TE"] = env_value
+                os.environ["FLLIPER_HICACHE_MOONCAKE_REUSE_TE"] = env_value
 
             result = test_mooncake_te_condition(server_args)
             status = "PASS" if result == expected else "FAIL"
@@ -346,9 +346,9 @@ def test_condition_logic():
             print()
     finally:
         if original_hicache_reuse is None:
-            os.environ.pop("SGLANG_HICACHE_MOONCAKE_REUSE_TE", None)
+            os.environ.pop("FLLIPER_HICACHE_MOONCAKE_REUSE_TE", None)
         else:
-            os.environ["SGLANG_HICACHE_MOONCAKE_REUSE_TE"] = original_hicache_reuse
+            os.environ["FLLIPER_HICACHE_MOONCAKE_REUSE_TE"] = original_hicache_reuse
 
     print(f"Condition logic tests: {passed} passed, {failed} failed")
     print()
@@ -403,7 +403,7 @@ def main():
     elif args.test_case == "hicache":
         server_args.enable_hierarchical_cache = True
         server_args.hicache_storage_backend = "mooncake"
-        os.environ["SGLANG_HICACHE_MOONCAKE_REUSE_TE"] = "1"
+        os.environ["FLLIPER_HICACHE_MOONCAKE_REUSE_TE"] = "1"
     elif args.test_case == "encoder_only":
         server_args.encoder_only = True
         server_args.encoder_transfer_backend = "mooncake"

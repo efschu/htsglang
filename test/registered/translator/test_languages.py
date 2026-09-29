@@ -9,7 +9,7 @@ Hermetic: no model, no GPU, no network.
 
 import unittest
 
-from sglang.srt.translator.languages import (
+from flliper.srt.translator.languages import (
     ConversationLanguages,
     LanguageError,
     LanguageMatrix,
@@ -146,7 +146,7 @@ class TestNoHardcodedPairFalsifier(unittest.TestCase):
         import ast
         import pathlib
 
-        import sglang.srt.translator as package
+        import flliper.srt.translator as package
 
         root = pathlib.Path(package.__file__).parent
         # ``languages.py`` legitimately contains every code in its display and

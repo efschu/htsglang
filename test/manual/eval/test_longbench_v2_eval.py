@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 
-from sglang.test.simple_eval_longbench_v2 import (
+from flliper.test.simple_eval_longbench_v2 import (
     LongBenchV2Eval,
     extract_longbench_v2_answer,
     format_longbench_v2_question,
@@ -229,7 +229,7 @@ def main():
 
     print("\n" + "=" * 50)
     print("✅ ALL TESTS PASSED!")
-    print("The simplified implementation follows SGLang patterns")
+    print("The simplified implementation follows fLLiper patterns")
     print("while maintaining LongBench-v2 compatibility.")
     print("=" * 50)
 

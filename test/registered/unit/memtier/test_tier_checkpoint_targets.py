@@ -25,9 +25,9 @@ What is proved here, each with the can-fail half:
 
 import unittest
 
-from sglang.srt.memtier.consumers import CheckpointTierPolicy, checkpoint_tier_targets
-from sglang.srt.memtier.registry import TierRegistry
-from sglang.srt.memtier.tiers import (
+from flliper.srt.memtier.consumers import CheckpointTierPolicy, checkpoint_tier_targets
+from flliper.srt.memtier.registry import TierRegistry
+from flliper.srt.memtier.tiers import (
     TierCapacity,
     TierCaps,
     TierDescriptor,
@@ -36,8 +36,8 @@ from sglang.srt.memtier.tiers import (
     TierTransport,
     Volatility,
 )
-from sglang.srt.planner.cost_model import Rate
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.planner.cost_model import Rate
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

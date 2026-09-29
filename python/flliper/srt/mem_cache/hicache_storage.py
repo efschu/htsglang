@@ -1,0 +1,4576 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import threading
+import time
+import uuid
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
+
+import torch
+
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageError
+from flliper.srt.mem_cache.canonical_page_store import (
+    CanonicalAbstainWindow,
+    kv_extents_for,
+)
+from flliper.srt.pdflip import prefix_trace as _prefix_trace
+from flliper.srt.mem_cache.pdflip_store_gates import (
+    owner_write_covers_whole_file,
+    writes_shared_keys,
+)
+
+if TYPE_CHECKING:
+    from flliper.srt.mem_cache.canonical_page_store import (
+        CanonicalExtentWindow,
+        CanonicalPageWindow,
+    )
+    from flliper.srt.mem_cache.pool_host import HostKVCache
+
+logger = logging.getLogger(__name__)
+
+
+def _free_named(arena, slots, reason: str) -> None:
+    """#1427s: ARENA-FREE with a named reason (hicache_arena.free_named;
+    imported here, the storage.file package imports this module)."""
+    from flliper.srt.mem_cache.storage.file.hicache_arena import free_named
+
+    free_named(arena, slots, reason)
+
+#: HICACHE-DRAFT-TIER (user order 2026-09-24, see environ.py): the one
+#: rank-side reader of the switch. Measured reason (boot weg2xsn420, the P
+#: side without a draft producer): the draft arena (720896 slots x 10240 B =
+#: 7.76 GiB) was pre-pinned on P-PP2 (14.2 s) and every D rank (17.4 s) and
+#: carried nothing -- 30 of 30 D requests draft_pages=0, '#993 draft L3 READ'
+#: >= 276728 pages asked, 0 hits.
+HICACHE_DRAFT_TIER_ENV = "FLLIPER_PDFLIP_HICACHE_DRAFT_TIER"
+
+
+def hicache_draft_tier_off() -> bool:
+    """True when this rank's draft gets no HiCache space (``off``); unset,
+    ``auto`` and ``on`` keep the draft tier as before (a rank cannot resolve
+    ``auto`` -- group D does not know P's form; the launcher does)."""
+    from flliper.srt.environ import envs
+
+    return str(envs.FLLIPER_PDFLIP_HICACHE_DRAFT_TIER.get() or "").strip().lower() == "off"
+
+
+def hicache_draft_tier_off_line(*, where: str) -> str:
+    """The one rank-side line naming the form (never silent)."""
+    return (
+        f"PDFLIP HICACHE-DRAFT-TIER off ({HICACHE_DRAFT_TIER_ENV}=off) at {where}: the "
+        "draft gets no HiCache space -- no draft host pool, no draft arena, no draft "
+        "write-back, no draft lookup/read at a restore or at admission; D builds its "
+        "draft context cold (#993 zeros + 1 bootstrap round; user order 2026-09-24)"
+    )
+
+
+# Max pages per batched storage IO call.
+# Task #3 (17.09.): the per-call overhead of `_page_transfer`'s batches
+# (ctypes marshalling of the stems, one find_slots + ref_slots + resolve
+# per call) was 2048 calls for a 262k-page re-admission on xsn246. The
+# upstream default stays 128; the arena form raises it through the env
+# (FLLIPER_HICACHE_STORAGE_BATCH). Termination still lands at a batch
+# boundary -- a larger batch is a coarser stop, never a wrong one.
+STORAGE_BATCH_SIZE = int(os.environ.get("FLLIPER_HICACHE_STORAGE_BATCH", "128") or 128)
+
+
+def compute_model_identity_hash(
+    server_args: Any, *, include_parallel_vectors: bool = True
+) -> str:
+    """Compute a short hash that uniquely identifies the model and KV layout.
+
+    Storage page hashes cover token ids only, and the storage key suffix covers
+    served_model_name plus parallel geometry. Neither includes the model
+    identity (weights revision) or the KV byte format (dtype, quantization,
+    kv_cache_dtype). Entries in a persistent storage tier outlive the server
+    process, so a later run that shares the served_model_name and storage
+    location but differs in e.g. --kv-cache-dtype would silently read pages
+    written in another byte format. Incorporating this hash into the key
+    suffix turns that silent wrong hit into a clean miss.
+
+    Matches the recipe of upstream PR #24794 so keys converge with stock
+    flliper once it lands; the two uneven-TP vectors below are fork-only and
+    enter the string only when they are set, so an even-TP key is
+    byte-identical to the upstream recipe.
+    """
+    # Every part is str()-coerced. ``dtype`` and ``kv_cache_dtype`` always
+    # were; ``revision`` and ``quantization`` were not, which left the
+    # function able to raise TypeError in "|".join for any server_args whose
+    # fields are not already strings. That was latent while the only callers
+    # ran late with a fully-resolved ServerArgs; #631a added a call on the PD
+    # REGISTRATION path, where it became reachable. Coercion is byte-identical
+    # for real inputs -- str() of a str is itself, and None still becomes ""
+    # through the `or` -- so no persisted HiCache key moves.
+    identity_parts = [
+        os.path.normpath(str(server_args.model_path)) if server_args.model_path else "",
+        str(server_args.revision or ""),
+        str(server_args.dtype or "auto").lower(),
+        str(server_args.quantization or ""),
+        str(server_args.kv_cache_dtype or "auto").lower(),
+    ]
+    # #513 (audit #506, finding A3-2): under this fork's uneven TP,
+    # tp_rank/tp_size in the key suffix do NOT determine a rank's kv-head
+    # count -- `--rank-tp-ratio 13,6,6` and an even split are both
+    # (tp_rank=0, tp_size=3) with different bytes per stored page, and page
+    # hashes cover token ids only. The sibling fingerprint in
+    # managers/kv_session_spill_destination.py already treats these vectors as
+    # key-relevant for exactly this reason.
+    #
+    # APPENDED ONLY WHEN SET, so an even-TP deployment keeps the pages it has
+    # already persisted: re-keying every rig to fix a case that cannot occur
+    # there would be a cost with no benefit. Same convention
+    # uneven_perf.measured_kv_budget_fingerprint_fields uses for pp_size.
+    #
+    # ``include_parallel_vectors=False`` drops this tail, and the distinction
+    # is the whole reason the flag exists (#631a guard 1). These vectors
+    # belong in a STORAGE KEY, where a page's bytes depend on the writing
+    # rank's kv-head count, so two differently-split servers must not read
+    # each other's pages. They do NOT belong in a PD HANDSHAKE, which asks a
+    # different question -- "are these two servers serving the same model?" --
+    # and where differing parallelism between the arms is EXPECTED and
+    # supported: TransportIdentity.COMPARED deliberately omits tp_size and
+    # pp_size, and the token-axis difference is handled by ``owned_ordinals``
+    # (disaggregation/base/conn.py). Comparing the vectors there would refuse
+    # a Route A pair (PP prefill + TP decode) that the engine transfers
+    # correctly. Same recipe, one function, two honest questions.
+    if include_parallel_vectors:
+        for name in ("rank_tp_ratio", "rank_kv_ratio"):
+            value = getattr(server_args, name, None)
+            if value:
+                identity_parts.append(f"{name}={value}")
+    identity_str = "|".join(identity_parts)
+    return hashlib.sha256(identity_str.encode()).hexdigest()[:16]
+
+
+def l3_rank_identity(server_args: Any) -> dict:
+    """L3P N3/N4: a rank's identity of the persistent L3 store. The key's
+    identity hash WITHOUT the uneven-TP vectors (those are in every key; a
+    ratio change is a clean miss), the effective model override string
+    (rope_scaling / YaRN changes page bytes, not keys) and a stat fingerprint
+    of the weight files (a checkpoint swapped in place)."""
+    model = str(getattr(server_args, "model_path", "") or "")
+    real = os.path.realpath(model) if model else ""
+    rows = []
+    try:
+        if real and os.path.isfile(real):
+            st = os.stat(real)
+            rows.append((os.path.basename(real), st.st_size, st.st_mtime_ns))
+        elif real:
+            with os.scandir(real) as it:
+                for e in it:
+                    if e.name.endswith((".safetensors", ".gguf", ".bin", ".pt", ".pth")) and e.is_file():
+                        st = e.stat()
+                        rows.append((e.name, st.st_size, st.st_mtime_ns))
+    except OSError:
+        rows = []
+    rows.sort()
+    ovr = str(getattr(server_args, "json_model_override_args", "") or "")
+    return {
+        "model_identity": compute_model_identity_hash(server_args, include_parallel_vectors=False),
+        "override_sha": hashlib.sha1(ovr.encode()).hexdigest()[:16] if ovr and ovr != "{}" else "",
+        "weights_fp": hashlib.sha1(repr(rows).encode()).hexdigest() if rows else "",
+    }
+
+
+@dataclass
+class HiCacheStorageConfig:
+    tp_rank: int
+    tp_size: int
+    pp_rank: int
+    pp_size: int
+    attn_cp_rank: int
+    attn_cp_size: int
+    is_mla_model: bool
+    enable_storage_metrics: bool
+    is_page_first_layout: bool
+    model_name: Optional[str]
+    # Hash over (model_path, revision, dtype, quantization, kv_cache_dtype),
+    # see compute_model_identity_hash(). None keeps legacy key layout.
+    model_identity_hash: Optional[str] = None
+    # L3P N3/N4: what a PERSISTENT store is for, as this rank resolved it
+    # (see l3_rank_identity). None outside the Weg-2 persistent store.
+    l3_rank_identity: Optional[dict] = None
+    tp_lcm_size: Optional[int] = None
+    should_split_heads: bool = False
+    extra_config: Optional[dict] = None
+    # #810: `--hicache-host-role`. Carried here rather than re-derived because
+    # a backend has to know whether it is the RETENTION tier: under 'staging'
+    # the pinned host tier in front of it is deliberately small, so an
+    # unbounded backend is no longer a cache that merely grows -- it is the
+    # only copy, growing without a bound. Defaulted, so every other
+    # construction site and the whole retention path are unchanged.
+    host_role: str = "retention"
+    # Weighted uneven-DCP owner mode (task #60): KV pages are token-sharded
+    # with FULL replicated kv-heads, so a KV page's bytes are complete on its
+    # owner rank and rank-independent. KV page keys drop the _{tp_rank}_{tp_size}
+    # suffix (one shared file per page, written only by its backup-time owner,
+    # readable by every rank), while component pools (mamba/SWA: genuinely
+    # per-rank shards) keep the rank suffix.
+    dcp_owner_mode: bool = False
+    # #706 whole-page protocol: this rank's slot window in the canonical page
+    # (mem_cache/canonical_page_store.py). Set only when the geometry-neutral
+    # format is active; None keeps every key and every byte exactly as before.
+    #
+    # When set, a KV page is full width (every attention layer of one token) and
+    # each stage deposits its own slots at their GLOBAL offset, so the bytes stop
+    # depending on the PP cut and the key drops the _{pp_size}_{pp_rank} suffix
+    # as well -- the same argument dcp_owner_mode above already made on the token
+    # axis. The key then carries content alone: model identity and token hash.
+    canonical_kv_page: Optional[CanonicalPageWindow] = None
+    # #706 slice 2: this rank's window in the canonical {hash}.mamba blob, on
+    # the same protocol. Required whenever the model HAS GDN/mamba layers and
+    # the canonical page is active, because a KV-only prefix is worth nothing:
+    # batch_exists_v2 takes the MINIMUM across pools and the mamba pool is
+    # registered TRAILING_PAGES, so a missing blob truncates the whole KV
+    # prefix to zero (test_mamba_gates_the_hit_706.py), and the device-side
+    # MambaRadixCache match advances only at nodes that carry mamba state.
+    canonical_mamba_blob: Optional[CanonicalExtentWindow] = None
+    #: #1233 draft KV across the flip: this rank's head window in the whole
+    #: canonical draft page (``canonical_page_store.build_draft_window``).
+    #: Installed late, from ``HiCacheController._maybe_register_draft_with_
+    #: storage``, because the draft pool binds after the storage config is
+    #: built; None keeps every draft key byte-identical to today.
+    canonical_draft_page: Optional[CanonicalExtentWindow] = None
+    #: 23.09. (fnFL2x54, Task #106): this rank's layer window in the whole
+    #: canonical QSA index page (``qsa_pool_host.build_qsa_index_window``).
+    #: None keeps ``{hash}.qsa_indexer`` a per-rank key -- which under PP=3
+    #: means three stages overwriting one another, so the window is REQUIRED
+    #: wherever the sidecar pool is registered.
+    canonical_qsa_page: Optional[CanonicalExtentWindow] = None
+    #: #239 S4b (F14): ``(page_size, S, lo, hi)`` of this rank's token-owner
+    #: range when the owner mode runs on PAGED pools (the token cut, page 64):
+    #: a page is then written by every owner, each its own token rows
+    #: (``canonical_page_store.owner_row_window``). None keeps the page-1
+    #: owner form (whole pages, one owner each) and every other path as is.
+    canonical_kv_owner_rows: Optional[tuple] = None
+
+
+@dataclass
+class HiCacheStorageExtraInfo:
+    prefix_keys: Optional[List[str]] = None
+    extra_info: Optional[dict] = None
+
+
+@dataclass(frozen=True)
+class PrefetchTimeoutConfig:
+    """Knobs for the linear prefetch-timeout policy used by HiCache."""
+
+    # #968/#1065 re-pricing (2026-09-01). The old 0.1 s/KiToken with max 30 s
+    # was priced for small prefixes; a 13-16k-token cutover re-admission under
+    # page_size=1 measures ~0.32 s/KiToken best case from the live store
+    # (12556 tok in ~4 s, trainA log:66678/66823) with 40-52k draft
+    # miss-fetches competing. 1.0 s/KiToken carries ~3x headroom; max 60 s
+    # keeps a 16k readmit (2 + 16 = 18 s linear) unclipped with margin.
+    # Per-backend override: hicache_storage_backend_extra_config
+    # (prefetch_timeout_base / _per_ki_token / _max).
+    base: float = 2.0  # seconds, fixed overhead unrelated to token count
+    per_ki_token: float = 1.0  # seconds per 1024 tokens
+    max: float = 60.0  # seconds, upper bound for the linear timeout
+
+
+class PrefetchOutcome(int):
+    """#1157: the tokens a terminated prefetch LOADED (this int), annotated
+    with what the store PROBE answered for that request.
+
+    An ``int`` subclass on purpose: ``prefetch_loaded_tokens_by_reqid`` is the
+    tree's ONE record of a finished prefetch (popped at admission, cleared on
+    abort), and every existing reader treats its value as the loaded count
+    (``> 0``, ``int(...)``). Annotating that same value keeps one record and
+    one lifecycle -- the seam witness reads the record the admission loop
+    already pops, not a second ledger (upstream-minimal law).
+
+    ``probed``     the serial prefetch thread's store probe ran for this
+                   operation (rank-uniform: the hit count is MIN-reduced across
+                   the prefetch group before it is stamped, and the reap
+                   annotation itself rides the tree's packed MIN all_reduce).
+    ``hit_tokens`` the probe's answer in tokens (0 when it answered nothing,
+                   or when the operation was reaped before the probe ran --
+                   ``probed`` tells the two apart).
+    ``matched``    the prefix that was ALREADY DEVICE-RESIDENT for this request
+                   when the fetched tail was inserted (``insert_result.
+                   prefix_len``, the "matched=" field of the emitter line). It
+                   is the OTHER half of the presence, disjoint from this int:
+                   `unified_radix_cache.py:4140-4145` computes
+                   ``loaded = min_completed_tokens - prefix_len``, so
+                   ``matched + loaded == completed_synced`` by construction --
+                   including the ``host_span_unclaimed`` branch, where the
+                   refused tail forces ``loaded = 0`` while the already-resident
+                   prefix is untouched and stays counted here.
+
+    ``materialized`` (read-only) is ``matched + loaded``: the post-prefetch
+    device-resident prefix, which is what a reader asking "is the prefix
+    THERE" must consult. #1176: the seam witness read ``loaded`` alone and
+    called a reaped-but-fully-resident re-admission a contradiction (boot
+    weg1b6, rid 1e95e023: matched=3456 loaded=0 against stamp 6008). Same
+    class the #841 comment names for ``loaded`` at :4136-4139 -- an instrument
+    that measures the TRANSFER cannot answer a question about the PRESENCE.
+
+    SERIALIZATION (#1157 review B1): the record rides
+    ``req.storage_hit_length`` into ``cached_tokens_storage`` and from there
+    into the pickled detokenizer output (``details['storage']``), and the
+    tree state may be deep-copied. A keyword-only ``__new__`` survived
+    ``pickle.dumps`` but not ``pickle.loads`` (int subclasses are rebuilt
+    positionally by ``copyreg.__reduce_ex__``), which would have killed the
+    detokenizer on the FIRST partial store hit. The constructor is therefore
+    positional with defaults and ``__reduce__`` rebuilds the record with its
+    annotation; the admission sites additionally store a bare ``int``.
+    """
+
+    def __new__(
+        cls,
+        loaded: int,
+        hit_tokens=None,
+        probed: bool = False,
+        matched=None,
+        deliverable=None,
+        synced=None,
+    ):
+        self = super().__new__(cls, int(loaded))
+        self.hit_tokens = int(hit_tokens if hit_tokens is not None else 0)
+        self.probed = bool(probed)
+        self.matched = int(matched if matched is not None else 0)
+        self.deliverable = int(deliverable if deliverable is not None else 0)
+        self.synced = int(synced if synced is not None else 0)
+        return self
+
+    @property
+    def is_incomplete(self) -> bool:
+        """#1324: did this read land SHORT of the prefix it was asked for?
+
+        THE THIRD STATE, and the reason it has to exist. Before this the
+        record answered only "how much came back", and the X gate read every
+        terminated read as landed -- so a read that delivered HALF the
+        requested prefix was indistinguishable from one that delivered all of
+        it, and the shortfall was priced as tokens D must prefill.
+
+        MEASURED, boot weg2sn6s rid 00f5bc40 (2026-09-10): requested 109,132
+        tokens, delivered 53,247, and the emitter said ``HiCache prefetch
+        success completed_local=53247 completed_synced=53247 synced=yes``
+        beside ``#1040 EXTENT STATE-ALIGN loss=0 class=aligned``. Nothing was
+        reaped, rate-limited, truncated or dropped -- the store simply did not
+        HOLD the rest yet, because P's write-through is asynchronous and was
+        46 s behind. With no incompleteness on the record there was nothing
+        for the X gate's defer to wait on (``X-DEFER`` 0 hits on that boot),
+        so the remaining 55,885 priced as uncached: W31 -> W50 after the first
+        stream byte -> 413.
+
+        ``deliverable`` is the largest prefix this read COULD have returned --
+        the requested prefix floored to whole pages, since the store hands
+        back pages and never part of one. Floored rather than raw so page
+        arithmetic can never manufacture a phantom shortfall of a few tokens;
+        ``0`` means "not a terminated store read" and is never incomplete,
+        which keeps every admission-site record (which stores a bare ``int``)
+        and every pre-#1324 pickle byte-identical in behaviour.
+
+        THE COMPARED QUANTITY IS ``synced``, THE GROUP-AGREED COMPLETION, and
+        NOT ``materialized``. That is not cosmetic -- it is what makes this
+        verdict a GROUP fact, which the deferral it feeds structurally
+        requires. ``_prefetch_deferral_refusal_reason`` refuses a deferral on a
+        phase running uneven DCP unless the mark is provably rank-uniform (its
+        ``symmetric_vote`` arm), and group D IS such a phase: TP=3 on the
+        uneven ``[17,7,8]`` vector. A mark built from a rank-local number would
+        therefore be REFUSED and dropped at every retry, leaving this whole
+        repair present but unwired -- the most expensive of the three delivery
+        states.
+        ``synced`` is ``min_completed_tokens``, which the packed MIN all_reduce
+        agrees across the attention group whenever ``tp_world_size > 1``, and
+        ``deliverable`` derives from ``prefetch_key``, the participation-voted
+        span (#580 makes registration rank-uniform). Both sides are group
+        facts, so the verdict is one too.
+        ``materialized`` would NOT have been: it is ``matched + loaded``, and on
+        the ``host_span_unclaimed`` path (#841, the tree declining the fetched
+        tail) ``loaded`` is forced to 0 and ``materialized`` collapses to this
+        rank's own device-resident ``prefix_len``. On every other path the two
+        are equal by construction, so this choice costs nothing and closes the
+        one path where the ranks could have disagreed.
+        """
+        # HFB-b: an END-vote read (Form A) carries the group's absolute ENDs;
+        # the span-relative pair can disagree per rank when a span base is not
+        # page-aligned, the ENDs cannot. Absent on every other read.
+        _dend = getattr(self, "deliverable_end", None)
+        _send = getattr(self, "synced_end", None)
+        if _dend is not None and _send is not None:
+            return int(_dend) > 0 and int(_send) < int(_dend)
+        return int(self.deliverable) > 0 and int(self.synced) < int(self.deliverable)
+
+    @property
+    def materialized(self) -> int:
+        """#1176: the post-prefetch device-resident prefix in tokens.
+
+        ``matched + loaded``, which equals ``completed_synced`` on the emitter
+        line (unified_radix_cache.py:4140-4145 computes loaded as
+        ``min_completed_tokens - insert_result.prefix_len``). Read-only and
+        derived: there is no second record to keep in step.
+        """
+        return int(self.matched) + int(self)
+
+    def __reduce__(self):
+        return (
+            PrefetchOutcome,
+            (int(self), self.hit_tokens, self.probed, self.matched, self.deliverable,
+             self.synced),
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"PrefetchOutcome(loaded={int(self)}, hit_tokens={self.hit_tokens}, "
+            f"probed={self.probed}, matched={self.matched}, "
+            f"deliverable={self.deliverable}, synced={self.synced})"
+        )
+
+
+class PoolName(str, Enum):
+    """Well-known pool names used as PoolTransfer/PoolEntry identifiers."""
+
+    KV = "kv"
+    MAMBA = "mamba"
+    SWA = "swa"
+    INDEXER = "indexer"
+    # 23.09. (fnFL2x54, Task #106): the compressed QSA index keys of
+    # Qwen3.8-Flash-Next, a KV-indexed sidecar (qsa_pool_host.py).
+    QSA_INDEXER = "qsa_indexer"
+    # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
+    # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
+    DEEPSEEK_V4_C4 = "deepseek_v4_c4"
+    DEEPSEEK_V4_C4_INDEXER = "deepseek_v4_c4_indexer"
+    DEEPSEEK_V4_C128 = "deepseek_v4_c128"
+    DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
+    DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
+    DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
+
+    # Draft KV pool
+    DRAFT = "draft"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class PoolHitPolicy(str, Enum):
+    """Hit policy for batch_exists_v2 per-pool prefix matching.
+
+    ALL_PAGES      : every page in [0, kv_hit) must exist (e.g. DSA).
+    TRAILING_PAGES : only the last N pages must exist (e.g. Mamba/SWA states).
+    """
+
+    ALL_PAGES = "all_pages"
+    TRAILING_PAGES = "trailing_pages"
+
+
+@dataclass
+class PoolTransfer:
+    """Unified per-pool transfer descriptor for batch v2 interface.
+
+    device<->host path : host_indices + device_indices
+    host<->storage path: host_indices + keys
+    nodes_to_load      : evicted nodes this transfer covers
+    """
+
+    name: PoolName
+    host_indices: Optional[torch.Tensor] = None
+    device_indices: Optional[torch.Tensor] = None
+    keys: Optional[List[str]] = None
+    hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+    nodes_to_load: Optional[List[Any]] = None
+    indices_from_pool: Optional[PoolName] = None
+    #: #1233 draft KV across the flip: a PRESENCE-ONLY pool. Its boundary is
+    #: recorded in ``extra_pool_hit_pages`` like every other pool's, but it
+    #: does not enter the ``min`` that decides the KV claim -- the consumer
+    #: (``HybridCacheController._storage_hit_query``) decides between trim
+    #: and cold-by-name from the two numbers. Default True = upstream.
+    caps_claim: bool = True
+
+
+@dataclass(frozen=True)
+class SidecarPoolSpec:
+    """Pool whose transfer indices are reused from one real source pool."""
+
+    pool_name: PoolName
+    indices_from_pool: PoolName
+    hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+
+
+@dataclass
+class PoolTransferResult:
+    """Tracks how many pages were successfully processed per pool.
+
+    THE ARITHMETIC OF EVERY FIELD, STATED. This paragraph is not decoration:
+    two of the fields below carry a quantity their NAME does not describe, and
+    both misreadings were made -- by readers of this file -- before it existed.
+
+    * ``kv_hit_pages`` -- **NOT the KV prefix.** It is the CROSS-POOL MINIMUM,
+      ``min(kv_prefix, boundary(pool) for every pool_transfer)``
+      (``batch_exists_v2``: ``final_pages = min(final_pages, boundary)``), and
+      it is what the caller SLICES with. A missing mamba page therefore pulls
+      the KV pages down with it: measured, ``kv=276 claimed=0`` with 276 KV
+      pages present on disk and no anchor in range.
+    * ``extra_pool_hit_pages`` -- per pool, and **only NON-ZERO entries are
+      recorded** (``if boundary: hit_count[name] = boundary``). So a pool whose
+      boundary was exactly 0 is ABSENT from this dict, and absence therefore
+      reads as "no constraint" while meaning "capped to nothing". Never infer
+      "uncapped" from a missing key; use ``zero_capped_pools`` below.
+    * ``keys_asked`` -- how many keys the probe was GIVEN. This is the term
+      that used to die at the return, and it is the ONLY way to tell
+      ``kv_hit_pages == 0`` because the store said no from ``== 0`` because the
+      probe was never asked anything. ``keys_asked == 0`` is "never asked".
+    * ``kv_uncapped`` -- the KV prefix BEFORE any component cap, i.e.
+      ``final_pages`` with the ``min`` not yet applied. ``kv_uncapped > 0`` with
+      ``kv_hit_pages == 0`` is the capped-to-zero case, and the pool that did it
+      is named in ``zero_capped_pools``.
+    * ``zero_capped_pools`` -- the pools whose boundary was exactly 0, which is
+      precisely the set ``extra_pool_hit_pages`` cannot represent. Names, not a
+      count, because "which pool" is the actionable half.
+
+    The three new fields DEFAULT, so every existing construction site and every
+    existing reader is unchanged; nothing here alters a decision.
+    """
+
+    kv_hit_pages: int
+    extra_pool_hit_pages: dict[str, int]
+    #: see the arithmetic block above -- these three are REPORTING ONLY.
+    keys_asked: int = 0
+    kv_uncapped: int = 0
+    zero_capped_pools: tuple = ()
+
+    @classmethod
+    def empty(cls) -> PoolTransferResult:
+        return cls(0, {})
+
+    def update_kv_hit_pages(self, kv_hit_pages: int) -> None:
+        """Accumulate kv_hit_pages across batches (max = last successful batch)."""
+        self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
+
+    def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
+        """Record actual load/write success counts per extra pool."""
+        self.extra_pool_hit_pages.update(
+            {name: sum(rs) for name, rs in results.items()}
+        )
+
+
+class HiCacheStorage(ABC):
+    """
+    HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
+    It abstracts the underlying storage mechanism, allowing different implementations to be used.
+    """
+
+    # todo, the page size of storage backend does not have to be the same as the same as host memory pool
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        self.mem_pool_host = mem_pool_host
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if not hasattr(self, "registered_pools"):
+            self.registered_pools = {}
+        self.registered_pools[host_pool_name] = host_pool
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        """Check which cache pages exist in storage, respecting per-pool hit policies.
+
+        Longest-prefix semantics
+        Extra-pool hit policies (``PoolTransfer.hit_policy``)
+        ------------------------------------------------------
+        Each ``PoolTransfer`` in ``pool_transfers`` describes a secondary
+        cache pool (e.g. Mamba SSM states) that must be co-present with the
+        KV pages.  The final ``final_pages`` is the minimum across all pools,
+        so a missing auxiliary page shrinks the usable prefix.
+
+        - ``"all_pages"`` (default):  every page in [0, kv_hit) must exist
+          for this pool.  Used for pools that are required for every token
+          in the prefix (e.g. DeepSeek DSA pool).
+
+        - ``"trailing_pages"``:  only the *last* ``len(transfer.keys)`` pages
+          of the KV prefix need to exist.  Used for pools whose data covers
+          only the tail of a prefix (e.g. Mamba/SWA Pool).
+
+        Returns
+        -------
+        PoolTransferResult
+            ``kv_hit_pages`` = length of the usable KV prefix.
+            ``extra_pool_hit_pages`` maps each pool name to the number of pages
+            that were found.
+        """
+        raise NotImplementedError()
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        """Read data from storage into host memory for each PoolTransfer.
+
+        Returns a dict mapping pool name to a per-entry success list.
+        """
+        raise NotImplementedError()
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        """Write data from host memory to storage for each PoolTransfer.
+
+        Returns a dict mapping pool name to a per-entry success list.
+        """
+        raise NotImplementedError()
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """
+        Retrieve values for multiple keys.
+        Returns a list of booleans indicating success for each key.
+        """
+        pass
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """
+        Store multiple key-value pairs.
+        Returns a list of booleans indicating success for each key.
+        """
+        pass
+
+    @abstractmethod
+    def get(
+        self,
+        key: str,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> torch.Tensor | None:
+        """
+        Retrieve the value associated with the given key.
+        Returns None if the key does not exist.
+        """
+        pass
+
+    # TODO: Deprecate
+    @abstractmethod
+    def batch_get(
+        self,
+        keys: List[str],
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> List[torch.Tensor | None] | int:
+        """
+        Retrieve values for multiple keys.
+        Returns a list of tensors or None for each key.
+        """
+        pass
+
+    @abstractmethod
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        """
+        Store the value associated with the given key.
+        Returns True if the operation was successful, False otherwise.
+        """
+        pass
+
+    # TODO: Deprecate
+    @abstractmethod
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        """
+        Store multiple key-value pairs.
+        Returns True if all operations were successful, False otherwise.
+        """
+        pass
+
+    @abstractmethod
+    def exists(self, key: str) -> bool:
+        """
+        Check if the key exists in the storage.
+        Returns True if the key exists, False otherwise.
+        """
+        pass
+
+    # TODO: Use a finer-grained return type (e.g., List[bool])
+    def batch_exists(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
+        """
+        Check if the keys exist in the storage.
+        return the number of consecutive existing keys from the start.
+        Can be overridden by subclasses for more efficient implementation.
+        """
+        for i in range(len(keys)):
+            if not self.exists(keys[i]):
+                return i
+        return len(keys)
+
+    def clear(self) -> None:
+        pass
+
+    def get_stats(self):
+        return None
+
+    def capacity_stats(self) -> Optional[dict]:
+        """Current capacity limits and usage, or None if this backend has none.
+
+        Only backends that do their own on-disk capacity accounting (today:
+        ``file``) report here; backends whose capacity lives in an external
+        service return None.
+        """
+        return None
+
+    def check_disk_space(self, force: bool = False) -> bool:
+        """Periodic capacity watchdog; False means the backend stopped writing.
+
+        Backends that own local storage override this (today: ``file``).
+        Backends without a local capacity of their own are always writable.
+        """
+        return True
+
+    def resize(
+        self,
+        *,
+        max_size_bytes: Optional[int] = None,
+        min_free_bytes: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Change the capacity limits at runtime; ``None`` leaves one unchanged.
+
+        Returns post-resize ``capacity_stats`` (plus ``freed_bytes``) on
+        success, or None if this backend cannot be resized in place.
+        """
+        return None
+
+
+class MetadataCache:
+    def __init__(self, ttl_seconds: float):
+        self.ttl_seconds = ttl_seconds
+        # key -> monotonic timestamp
+        self.cache: dict[str, float] = {}
+        self.lock = threading.Lock()
+
+    def add(self, key: str):
+        with self.lock:
+            if key not in self.cache:
+                self.cache[key] = time.monotonic()
+
+    def remove(self, key: str):
+        with self.lock:
+            self.cache.pop(key, None)
+
+    def contains(self, key: str) -> bool:
+        with self.lock:
+            if key not in self.cache:
+                return False
+            if self.ttl_seconds == -1.0:
+                return True
+            if time.monotonic() - self.cache[key] > self.ttl_seconds:
+                del self.cache[key]
+                return False
+            return True
+
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+
+
+# Shard directories the page files spread over: the first two hex characters
+# of the key. Page keys are sha256 hex digests, so the first byte spreads
+# uniformly over 256 subdirectories. Stems that do not start with two lowercase
+# hex characters -- only ever synthetic keys -- share one shard.
+_SHARD_HEX = "0123456789abcdef"
+_SHARD_FALLBACK = "zz"
+
+
+def page_shard(stem: str) -> str:
+    """Shard subdirectory a page file with this key stem belongs in.
+
+    Everything that touches the on-disk store must agree on this rule: the
+    backend, and the offline geometry migration in ``hicache_migrate``. Before
+    sharding, every page landed directly in the storage directory -- the
+    incident of task #558 left 11.7 million entries in one flat directory,
+    which cost ~114 s to scan at startup and turned every existence sweep into
+    a full-directory walk.
+    """
+    prefix = stem[:2]
+    if len(prefix) == 2 and all(c in _SHARD_HEX for c in prefix):
+        return prefix
+    return _SHARD_FALLBACK
+
+
+class MixedLayoutError(RuntimeError):
+    """The same page stem exists in BOTH the flat and the sharded layout."""
+
+
+class MixedGenerationError(MixedLayoutError):
+    """One store holds component blobs written by TWO key GENERATIONS.
+
+    Subclasses ``MixedLayoutError`` on purpose (#558's mechanic, extended one
+    axis) rather than introducing a parallel refusal: both say the same thing
+    -- one content-addressed key resolves to more than one candidate file, and
+    the read path would silently prefer one of them. #558 is the FILE-LAYOUT
+    axis (flat vs sharded, same key). This is the KEY-FORMAT axis (the retired
+    per-stage suffix vs the #706 geometry-neutral suffix, same pool).
+
+    Anything already catching MixedLayoutError therefore keeps working.
+    """
+
+
+def audit_blob_generations(
+    root_dir: str,
+    *,
+    stage_marker: str,
+    canonical_marker: str,
+    limit: int = 4,
+    max_files: int = 200_000,
+) -> tuple:
+    """Sample the store for component blobs of BOTH key generations.
+
+    THE HAZARD THIS NAMES (user order 2026-08-29, the retired second HiCache
+    implementation): the per-stage component writer of that era keys a GDN blob
+    ``{hash}.mamba{model}_{identity}_{tp_rank}_{tp_size}_{pp_size}_{pp_rank}``
+    -- the ``_0_1_3_r`` tail -- while the #706 canonical writer keys the SAME
+    pool ``{hash}.mamba{model}_{identity}``, geometry-neutral. Both writers ran
+    against the same directory for weeks. Measured 2026-08-29 in the specimen
+    store ``/tmp/hicache_783``: 328 canonical ``.mamba`` blobs beside 1091
+    per-stage ones (``_0_1_3_0`` / ``_0_1_3_1`` / ``_0_1_3_2``). Those bytes
+    describe different cuts of the state under one content-addressed hash.
+
+    DRAFT BLOBS ARE NOT A SECOND GENERATION and must never be counted here:
+    ``_is_shared_kv_key``'s docstring states the rule -- draft KV is
+    head-SHARDED and token-COMPLETE, so it keeps the geometry suffix BY
+    DESIGN, in every generation. Only the pool whose key MOVED between
+    generations can be ambiguous, and that is the one the caller names.
+
+    Returns ``(stage_samples, canonical_samples, files_seen, exhausted)``.
+    This is a bounded DETECTOR, not a proof of coherence: it stops at
+    ``max_files`` and ``exhausted`` reports whether the whole store was seen,
+    so a caller never reads a clean result as more than it is (indicator law).
+    """
+    stage: list = []
+    canonical: list = []
+    seen = 0
+    exhausted = True
+
+    def _consider(name: str) -> bool:
+        """False when the budget is spent."""
+        nonlocal seen
+        if not name.endswith(".bin"):
+            return True
+        seen += 1
+        stem = name[:-4]
+        # The stage marker EXTENDS the canonical one (same pool + model +
+        # identity, plus the geometry tail), so it is the more specific of the
+        # two and is tested first. On today's suffixes the two cannot both
+        # match one stem; the order costs nothing and holds if a future suffix
+        # rule ever makes them overlap.
+        if stem.endswith(stage_marker):
+            if len(stage) < limit:
+                stage.append(stem)
+        elif stem.endswith(canonical_marker):
+            if len(canonical) < limit:
+                canonical.append(stem)
+        if stage and canonical:
+            # Both generations found: the refusal is already decided.
+            return False
+        return seen < max_files
+
+    try:
+        with os.scandir(root_dir) as it:
+            top = list(it)
+    except (FileNotFoundError, NotADirectoryError):
+        return ((), (), 0, True)
+    for entry in top:
+        if entry.is_dir():
+            try:
+                with os.scandir(entry.path) as shard_it:
+                    for sub in shard_it:
+                        if not _consider(sub.name):
+                            # Early exit: either decided, or out of budget.
+                            # Either way the whole store was NOT examined.
+                            return (tuple(stage), tuple(canonical), seen, False)
+            except OSError:
+                continue
+        elif not _consider(entry.name):
+            return (tuple(stage), tuple(canonical), seen, False)
+    return (tuple(stage), tuple(canonical), seen, exhausted)
+
+
+def audit_layout(root_dir: str, *, limit: int = 8) -> list:
+    """Stems present in BOTH layouts. Empty list when the store is coherent.
+
+    Sharding (#558) is a READ-THROUGH migration: new writes are sharded, old
+    flat files keep serving hits, and nothing moves. That is safe exactly while
+    a stem lives in one place or the other. If a stem exists in both,
+    ``_existing_path`` silently prefers the sharded one -- and the two files can
+    differ, because the flat one was written under whatever geometry and format
+    the store had at the time. A silent preference between two candidate pages
+    for one content-addressed key is the failure this refuses.
+
+    Only the top-level ``.bin`` files are enumerated (the legacy layout), and
+    each is checked against its shard. A store that never had a flat layout
+    costs one scandir of a directory holding only shard directories.
+    """
+    duplicates = []
+    try:
+        with os.scandir(root_dir) as it:
+            entries = list(it)
+    except FileNotFoundError:
+        return duplicates
+    for entry in entries:
+        if entry.is_dir() or not entry.name.endswith(".bin"):
+            continue
+        stem = entry.name[:-4]
+        sharded = os.path.join(root_dir, page_shard(stem), entry.name)
+        if os.path.exists(sharded):
+            duplicates.append(stem)
+            if len(duplicates) >= limit:
+                break
+    return duplicates
+
+
+
+def _969g_trace(direction: str, tag: str, stem: str) -> None:
+    """#1065: one key-trace for BOTH funnels, so the sets are comparable.
+
+    `direction` is `io` (the page write/read, via `_log_key`) or `lookup` (the
+    existence query, via `_get_component_key`). Boot 35's whole question is
+    whether the stems the WRITER produced are the stems the LOOKUP asks for, and
+    that comparison is only possible if both are printed with a direction label
+    and share one denominator.
+
+    The caller frame is printed too: it is what separates `_write_page` from
+    `_read_page` inside `io`, and names which existence path asked inside
+    `lookup`. Never raises, and past the cap it prints the suppressed count
+    rather than going silent.
+    """
+    try:
+        _n = getattr(HiCacheFile, "_969g_n", 0) + 1
+        HiCacheFile._969g_n = _n
+        # Order point 2 (xsn123): 20000 lines per rank per boot landed in the
+        # FIRST requests' seconds (PP1: 8151 lines in the second its second
+        # chunk ran 3x slow, 1278 ms for 3616 tokens against 479 ms for
+        # 4096), formatted under the GIL of the scheduler process while it
+        # launches kernels. 64 lines keep the writer/lookup stem comparison
+        # readable; FLLIPER_HICACHE_KEY_TRACE_CAP raises it for a key hunt.
+        _cap = int(envs.FLLIPER_HICACHE_KEY_TRACE_CAP.get() or 0) or 64
+        if _n <= _cap:
+            import sys as _sys
+
+            logger.warning(
+                "#969G KEY n=%d dir=%s caller=%s tag=%s stem=%s",
+                _n,
+                direction,
+                _sys._getframe(2).f_code.co_name,
+                tag,
+                stem,
+            )
+        else:
+            _s = getattr(HiCacheFile, "_969g_suppressed", 0) + 1
+            HiCacheFile._969g_suppressed = _s
+            if _s == 1 or _s % 100000 == 0:
+                logger.warning(
+                    "#969G KEY TRACE CAPPED at %d lines; %d further key "
+                    "derivations SUPPRESSED so far. A set difference read off "
+                    "the printed lines is bounded by this number, not by the "
+                    "population.",
+                    _cap,
+                    _s,
+                )
+    except Exception:  # noqa: BLE001 - a probe may never break an IO path
+        pass
+
+
+class HiCacheFile(HiCacheStorage):
+
+    def __init__(
+        self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
+    ):
+        self.file_path = envs.FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
+
+        tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
+            storage_config.tp_rank,
+            storage_config.tp_size,
+            storage_config.pp_rank,
+            storage_config.pp_size,
+            storage_config.model_name,
+            storage_config.is_mla_model,
+        )
+        attn_cp_rank = storage_config.attn_cp_rank
+        attn_cp_size = storage_config.attn_cp_size
+        model_name = "-".join(model_name.split("/")) if model_name else ""
+        enable_pp = pp_size > 1
+        self.dcp_owner_mode = bool(getattr(storage_config, "dcp_owner_mode", False))
+        # #706: this rank's window in the canonical (full-width) page. None on
+        # every default path, and the ONLY thing that moves a key.
+        self.canonical_kv_page = getattr(storage_config, "canonical_kv_page", None)
+        self.canonical_mamba_blob = getattr(
+            storage_config, "canonical_mamba_blob", None
+        )
+        self.canonical_draft_page = getattr(storage_config, "canonical_draft_page", None)
+        self.canonical_qsa_page = getattr(storage_config, "canonical_qsa_page", None)
+        if self.canonical_qsa_page is not None and self.canonical_kv_page is None:
+            raise CanonicalPageError(
+                "a canonical QSA index page window needs the canonical KV page: "
+                "the sidecar is addressed by the KV page's own key and indices."
+            )
+        if self.canonical_draft_page is not None and self.canonical_kv_page is None:
+            raise NotImplementedError(
+                "The #1233 canonical draft page was configured without the "
+                "canonical KV page. The draft page rides the KV page's key "
+                "rule; a neutral draft page beside geometry-suffixed KV pages "
+                "is a prefix nobody can continue from."
+            )
+        # Precomputed once: the KV page's generic (one-extent) form, so the hot
+        # path does not rebuild and revalidate it per page. #239 S4b (F14):
+        # under the paged token cut it is this rank's owner rows instead, or
+        # the abstention of a rank that owns none.
+        self._kv_owner_rows = getattr(storage_config, "canonical_kv_owner_rows", None)
+        self._canonical_kv_extents = (
+            kv_extents_for(self.canonical_kv_page, self._kv_owner_rows)
+            if self.canonical_kv_page is not None
+            else None
+        )
+        if self.canonical_mamba_blob is not None and self.canonical_kv_page is None:
+            raise NotImplementedError(
+                "The #706 canonical mamba blob was configured without the "
+                "canonical KV page. The two travel together: a neutral GDN blob "
+                "beside pp-suffixed KV pages still misses across the flip."
+            )
+        if self.canonical_kv_page is not None and attn_cp_size > 1:
+            raise NotImplementedError(
+                "The #706 canonical KV page and NSA context parallel both claim "
+                "the page: each CP rank holds a disjoint slice of every page, "
+                "which is a THIRD sharding axis the 16-slot layer format does "
+                "not describe. Refusing rather than writing pages whose key no "
+                "longer names their bytes."
+            )
+        # Model identity hash keeps runs that share a served_model_name but
+        # differ in weights or KV byte format (dtype/quantization/
+        # kv_cache_dtype) from hitting each other's persisted pages. Old-layout
+        # keys (written without the hash) simply no longer match: clean miss
+        # instead of a silent wrong-format hit.
+        identity_hash = storage_config.model_identity_hash or ""
+        # #969F: ONE DERIVATION MOMENT. These inputs are kept so the suffixes
+        # can be RE-DERIVED when `install_canonical_windows` later changes the
+        # one fact they depend on. See `_derive_key_suffixes`.
+        self._key_geom = dict(
+            model_name=model_name,
+            identity_hash=identity_hash,
+            is_mla_model=is_mla_model,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            enable_pp=enable_pp,
+            pp_size=pp_size,
+            pp_rank=pp_rank,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=attn_cp_size,
+        )
+        self._derive_key_suffixes()
+
+        # Shard directories created so far (see page_shard): keeps the write path
+        # to one makedirs per shard instead of one per page.
+        self._known_shards: set[str] = set()
+
+        # #410: the pin ledger, loaded before anything can evict or sweep. It
+        # is durable because a checkpoint outlives the process, so a pin that
+        # only lived in memory would silently stop protecting anything at the
+        # next restart.
+        from flliper.srt.mem_cache.pin_ledger import PinLedger
+
+        self.pins = PinLedger(
+            self.file_path,
+            budget_bytes=int(envs.FLLIPER_HICACHE_PIN_BUDGET_BYTES.get() or 0),
+        )
+        self.pins.load()
+
+        # #558: a stem in BOTH layouts means two candidate pages for one
+        # content-addressed key, and the read path would silently prefer one.
+        # Checked once, at attach, and refused loudly rather than resolved.
+        duplicates = audit_layout(self.file_path)
+        if duplicates:
+            raise MixedLayoutError(
+                f"HiCacheFile store {self.file_path!r} holds the same page in "
+                f"both the flat and the sharded layout: {duplicates}. The read "
+                "path prefers the sharded copy, but the two files can differ -- "
+                "the flat one predates sharding and may predate the current key "
+                "format entirely. Resolve it deliberately (delete the legacy "
+                "copies, or run the offline migration) rather than letting a "
+                "content-addressed key resolve to whichever file the lookup "
+                "order happens to find first."
+            )
+
+        # THE RETIRED SECOND HiCACHE IMPLEMENTATION MUST NOT SHARE A STORE WITH
+        # THE ONE THAT REPLACED IT (user order 2026-08-29). Same law as #558
+        # directly above, one axis over: there the same key lived in two
+        # LAYOUTS, here the same pool is keyed by two FORMATS. The per-stage
+        # component writer of the retired era appends this rank's geometry
+        # (`_{tp_rank}_{tp_size}_{pp_size}_{pp_rank}`, the `_0_1_3_r` tail);
+        # the #706 writer that replaced it keys the same pool geometry-neutral.
+        # Bytes under those two keys are different CUTS of the same state, and
+        # the store cannot tell a reader which cut it just handed over.
+        #
+        # Checked once, at attach, and only where it can actually be ambiguous:
+        # the pool must have MOVED between generations, which is exactly the
+        # condition `config_suffix != kv_config_suffix`. Draft blobs keep the
+        # geometry suffix in BOTH generations by design (see
+        # `_is_shared_kv_key`) and are therefore never a generation signal.
+        if self.config_suffix != self.kv_config_suffix:
+            stage_blobs, canonical_blobs, files_seen, exhausted = (
+                audit_blob_generations(
+                    self.file_path,
+                    stage_marker=f".{PoolName.MAMBA}{self.config_suffix}",
+                    canonical_marker=f".{PoolName.MAMBA}{self.kv_config_suffix}",
+                )
+            )
+            if stage_blobs and canonical_blobs:
+                raise MixedGenerationError(
+                    f"HiCacheFile store {self.file_path!r} holds "
+                    f"{PoolName.MAMBA} blobs written by TWO key generations: "
+                    f"the retired second HiCache implementation's per-stage "
+                    f"form (e.g. {stage_blobs[0]!r}) beside the #706 "
+                    f"geometry-neutral form (e.g. {canonical_blobs[0]!r}). "
+                    "The two name different cuts of the same state under one "
+                    "content-addressed hash, so a hit can return bytes that do "
+                    "not describe this rank's layers. The retired writer is "
+                    "gone; its deposits are not. Migrate or drop them "
+                    "deliberately -- see #975 for the offline cut "
+                    "(hicache_migrate.MambaBlobSpec.for_layers / layer_extents) "
+                    "-- rather than letting the read path pick whichever file "
+                    "the lookup order happens to find first."
+                )
+            if stage_blobs:
+                # Single-generation, but the RETIRED one, and this process
+                # writes the new format. Not ambiguous yet, so not a refusal --
+                # it becomes one the moment this boot deposits its first
+                # canonical blob into the same directory.
+                logger.warning(
+                    "HiCacheFile store %s holds %d+ %s blob(s) in the retired "
+                    "second HiCache implementation's per-stage key format "
+                    "(e.g. %s). This process writes the #706 geometry-neutral "
+                    "format, so the store becomes two-generation -- and this "
+                    "attach a hard MixedGenerationError -- as soon as the "
+                    "first canonical blob lands. Clear them or migrate them "
+                    "now (#975).",
+                    self.file_path,
+                    len(stage_blobs),
+                    PoolName.MAMBA,
+                    stage_blobs[0],
+                )
+            elif not exhausted:
+                logger.info(
+                    "HiCacheFile generation audit stopped after %d files in "
+                    "%s without seeing the whole store; a clean result here "
+                    "bounds the check, it does not prove coherence.",
+                    files_seen,
+                    self.file_path,
+                )
+
+        # #706: orphaned partials are invisible to readers AND untracked by the
+        # LRU evictor (it walks .bin only), so nothing else would ever reap a
+        # page whose remaining writers never arrived. One sweep at attach, by
+        # age, on the same principle as the .tmp. staging files: never reap
+        # something a live writer might still be filling.
+        self._partial_ttl_s = float(
+            envs.FLLIPER_HICACHE_CANONICAL_PARTIAL_TTL_S.get() or 3600.0
+        )
+        # #558: the free-space floor the canonical protocol refuses below. The
+        # LRU evictor's watermark does not cover this: it is disabled entirely
+        # unless a cap or a min-free is configured, which is the default.
+        self._space_floor_bytes = int(
+            envs.FLLIPER_HICACHE_CANONICAL_MIN_FREE_BYTES.get() or 0
+        )
+        if self.canonical_kv_page is not None or self.canonical_mamba_blob is not None:
+            from flliper.srt.mem_cache.canonical_page_store import sweep_partials
+
+            # 2026-08-28 boot-3 store wipe: this sweep, keyed on age alone,
+            # reaped ALL 16898 partial files the previous boot had deposited
+            # into the store -- the restart gap (100 min) exceeded the TTL
+            # (3600 s), and nothing had completed yet, so cross-boot retention
+            # went to zero at attach. Age cannot tell abandonment from a
+            # restart; the marker can. A pair whose marker decodes against the
+            # geometry THIS attach writes is resumable deposited work and is
+            # kept at any age (computed work is never thrown away); a genuine
+            # format transition is reaped past the TTL but NAMED loudly, never
+            # wiped silently.
+            resumable_totals = []
+            if self.canonical_kv_page is not None:
+                resumable_totals.append(int(self.canonical_kv_page.spec.page_bytes))
+            if self.canonical_mamba_blob is not None:
+                resumable_totals.append(int(self.canonical_mamba_blob.total_bytes))
+            if self.canonical_qsa_page is not None:
+                resumable_totals.append(int(self.canonical_qsa_page.total_bytes))
+            try:
+                sweep_partials(
+                    self.file_path,
+                    older_than_s=self._partial_ttl_s,
+                    is_pinned=self.pins.is_pinned,
+                    resumable_totals=tuple(resumable_totals),
+                )
+            except OSError as e:
+                # A store that cannot be swept is still usable; orphans only
+                # cost disk, and the free-space watchdog still sees them.
+                logger.warning("Could not sweep canonical partial files: %s", e)
+
+        # THE "ONLY RANK 0 CREATES IT" GUARD DOES NOT COVER PIPELINE PARALLELISM.
+        #
+        # Measured 2026-08-18 07:37Z: the ARM I harvest boot died before health with
+        #
+        #     FileExistsError: [Errno 17] File exists: '/tmp/hicache'
+        #
+        # on a pp_size=3, tp_size=1 deployment. The condition below elects a single
+        # creator by TP and attention-CP rank, which is exactly right when the fan-out
+        # is TP -- but with pure PP every stage has tp_rank == 0 and attn_cp_rank == 0,
+        # so all three ranks elect THEMSELVES, and the losers of the race raise. The
+        # directory found afterwards was empty and stamped with the boot's own minute:
+        # not a stale leftover, the boot's own first rank.
+        #
+        # exist_ok also closes the TOCTOU that was always here regardless of rank: the
+        # exists() check and the makedirs() are two steps, so even a correctly elected
+        # single creator races against anything else on the box using the same path.
+        # Creating a directory that already exists is precisely the no-op we want, so
+        # the election is not worth defending -- the idempotent call is.
+        if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
+            os.makedirs(self.file_path, exist_ok=True)
+            logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
+        elif not os.path.exists(self.file_path):
+            # A non-electing rank still needs the directory to exist before it writes
+            # into it; under PP the elected rank may simply be a different process
+            # that has not run yet.
+            os.makedirs(self.file_path, exist_ok=True)
+
+        # Metadata cache positive lookup toggle & TTL
+        enable_cache_raw = None
+        if storage_config.extra_config:
+            enable_cache_raw = storage_config.extra_config.get("enable_metadata_cache")
+        if enable_cache_raw is None:
+            enable_cache_raw = (
+                envs.FLLIPER_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE.get()
+            )
+
+        self.enable_metadata_cache = bool(enable_cache_raw)
+
+        if self.enable_metadata_cache:
+            ttl_raw = None
+            if storage_config.extra_config:
+                ttl_raw = storage_config.extra_config.get("metadata_ttl")
+            if ttl_raw is None:
+                ttl_raw = envs.FLLIPER_HICACHE_FILE_BACKEND_METADATA_TTL.get()
+
+            self.metadata_ttl = float(ttl_raw) if ttl_raw is not None else 5.0
+            self.metadata_cache = MetadataCache(self.metadata_ttl)
+            self._scan_existing_files_to_metadata_cache()
+        else:
+            self.metadata_cache = None
+
+        # All LRU / size accounting and disk eviction lives in the evictor so
+        # this backend stays a thin raw-bytes store. Imported lazily: the storage
+        # package __init__ pulls in the backend factory, which imports this
+        # module, so a top-level import here would be circular.
+        from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+
+        # F7: ONE definition of "do the ranks of this group write the same
+        # physical files", used for BOTH the eviction owner and the cap split.
+        # It was ``is_mla_model`` in two places, a proxy that stopped being
+        # true once the #706 canonical page let a GQA model's ranks deposit
+        # into one page under one key. Left alone under Weg 2 it splits the
+        # operator's single cap by tp_size -- 1 in the prefill group, 3 in the
+        # decode group -- giving two different caps over one directory.
+        shared_keys = writes_shared_keys(
+            is_mla_model=is_mla_model,
+            dcp_owner_mode=self.dcp_owner_mode,
+            canonical_kv_page=self.canonical_kv_page,
+        )
+        # A rank that writes its own suffixed files spends the cap once per
+        # rank, so the budget is split; ranks writing one shared set of files
+        # spend it once between them.
+        writer_count = 1 if shared_keys else max(1, tp_size)
+        # #410: the pin ledger, built BEFORE the evictor because the evictor
+        # must never run a single pass without it -- a checkpoint's pages are
+        # protected from the first eviction or the protection is a promise with
+        # a hole in it. Durable, because a checkpoint outlives the process.
+        from flliper.srt.mem_cache.pin_ledger import PinLedger
+
+        self.pins = PinLedger(
+            self.file_path,
+            budget_bytes=int(envs.FLLIPER_HICACHE_PIN_BUDGET_BYTES.get() or 0),
+        )
+        self.pins.load()
+        # L3P (N3/N4): refuse a persistent store whose recorded rank identity
+        # differs, BEFORE the evictor adopts a single page of it.
+        self._l3p_check_rank_identity(storage_config)
+        self._evictor = LRUFileEvictor(
+            self.file_path,
+            self.config_suffix,
+            tp_rank=tp_rank,
+            writes_shared_keys=shared_keys,
+            # The eviction owner is elected over the group's FULL rank
+            # identity. Group P is pp_size=3, tp_size=1: every stage has
+            # tp_rank == 0, so a tp-keyed election would give one directory
+            # three owners -- the same trap the directory-creation guard 90
+            # lines above already names for pure PP.
+            pp_rank=pp_rank,
+            attn_cp_rank=attn_cp_rank,
+            # F7 / W8b: the canonical KV pages and GDN blobs end with the KV
+            # suffix, not this rank's config_suffix. Without it the eviction
+            # index cannot see them at all and the byte cap bounds only the
+            # draft files -- measured 83.7 % of the store of record invisible.
+            kv_config_suffix=self.kv_config_suffix,
+            # ONE OWNER MEANS ONE INDEX OVER THE WHOLE GROUP'S FILES. Injected
+            # only where the election actually produces a sole owner: with
+            # per-rank keys every rank is its own owner, and handing each of
+            # them the group's set would give N indices over one directory,
+            # each carrying a cap already divided by N.
+            scan_suffixes=(self._group_scan_suffixes() if shared_keys else None),
+            extra_config=storage_config.extra_config,
+            on_evict=(
+                self.metadata_cache.remove if self.metadata_cache is not None else None
+            ),
+            writer_count=writer_count,
+            path_for_stem=self._existing_path,
+            iter_existing=self._iter_existing_files,
+            iter_staging=self._iter_staging_files,
+            pins=self.pins,
+            # #810: under `--hicache-host-role staging` this store IS the
+            # retention tier, so it may not run unbounded. Decided from the
+            # config the evictor itself resolved, one line below, rather than
+            # from a second reading of the same knobs at parse time -- the two
+            # readings would be free to drift, and the one that refuses would
+            # not be the one that evicts.
+            require_watermark=(
+                getattr(storage_config, "host_role", "retention") == "staging"
+            ),
+        )
+        # L3P (N1): record this group's scan suffixes for the NEXT boot's
+        # launcher (orphan reap + the inherited set it publishes); (B1) open
+        # the L3 index now and seed it off-thread -- never lazily inside a
+        # prefetch collective.
+        self._l3p_register_suffixes(shared_keys)
+        self._l3p_open_index_eagerly()
+        # L3-REUSE 0928: armed at attach (persistent store, index owner); the
+        # thread itself starts with the first arena this process opens.
+        self._l3wb_armed = True
+
+    # ------------------------------------------------------------------ L3P
+    @staticmethod
+    def _l3p_on() -> bool:
+        raw = (os.environ.get("FLLIPER_PDFLIP_L3_PERSIST", "") or "").strip().lower()
+        return raw not in ("0", "false", "no", "off")
+
+    def _l3p_persistent_dir(self) -> bool:
+        """A persistent store the launcher proved (identity file present)."""
+        return self._l3p_on() and os.path.isfile(
+            os.path.join(self.file_path, "L3_IDENTITY.json"))
+
+    @staticmethod
+    def _l3p_group() -> str:
+        return (os.environ.get("FLLIPER_PDFLIP_GROUP", "") or "").strip()
+
+    def _l3p_check_rank_identity(self, storage_config) -> None:
+        """L3P N3/N4: the rank's OWN identity of this store, per group:
+        compute_model_identity_hash without the uneven-TP vectors (dtype,
+        quantization, revision, kv dtype as the server resolved them -- a
+        ratio change only moves the keys, a clean miss, never a refusal), the
+        sha of the effective --json-model-override-args (rope_scaling/YaRN:
+        the key hashes token ids only) and the weight-file stat fingerprint.
+        First rank of a group to arrive writes ``L3_RANK_IDENTITY.<group>.json``
+        (O_EXCL); every rank compares; a mismatch is W165 by name (W57 is the launcher's; W91 is seam_digest's)."""
+        ident = getattr(storage_config, "l3_rank_identity", None)
+        group = self._l3p_group()
+        if not ident or not group or not self._l3p_persistent_dir():
+            return
+        path = os.path.join(self.file_path, f"L3_RANK_IDENTITY.{group}.json")
+        body = json.dumps(ident, sort_keys=True)
+        # Written COMPLETE before it becomes visible: tmp file, then link(2) --
+        # create-if-absent and atomic, so a crash mid-write never leaves a torn
+        # record that every later boot would read as a foreign identity.
+        tmp = f"{path}.w{os.getpid()}"
+        try:
+            with open(tmp, "w") as f:
+                f.write(body)
+            try:
+                os.link(tmp, path)
+                logger.info("L3-PERSIST rank identity recorded group=%s %s", group, body)
+                return
+            except FileExistsError:
+                pass
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        have = None
+        for _ in range(50):  # the record appears whole (link); retries cover a slow filesystem only
+            try:
+                with open(path) as f:
+                    txt = f.read()
+                if txt:
+                    have = json.loads(txt)
+                    break
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.1)
+        if have == ident:
+            return
+        from flliper.srt.mem_cache.pdflip_store_gates import PdFlipL3IdentityMismatch
+
+        raise PdFlipL3IdentityMismatch(
+            f"W165 PdFlipL3IdentityMismatch: persistent L3 store {self.file_path!r} was "
+            f"written by group {group} under rank identity {have!r}; this rank resolves "
+            f"{ident!r}. Two identities never share an L3 store (user 2026-09-27). "
+            f"The launcher's directory identity did not separate them -- move the "
+            f"directory aside or set FLLIPER_PDFLIP_L3_PERSIST=0.")
+
+    def _l3p_register_suffixes(self, shared_keys: bool) -> None:
+        """L3P N1: ``L3_SUFFIXES.<group>.json`` = the suffixes this group's
+        eviction owner scans. Atomic replace; every rank of the group writes
+        the same set."""
+        group = self._l3p_group()
+        if not group or not shared_keys or not self._l3p_persistent_dir():
+            return
+        try:
+            sfx = list(self._group_scan_suffixes())
+            path = os.path.join(self.file_path, f"L3_SUFFIXES.{group}.json")
+            tmp = f"{path}.w{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump({"group": group, "suffixes": sfx}, f)
+            os.replace(tmp, path)
+        except Exception as exc:  # noqa: BLE001 -- a missing record only means orphans are counted, not reaped
+            logger.warning("L3-PERSIST suffix record not written (%s: %s)", type(exc).__name__, exc)
+
+    def _l3p_open_index_eagerly(self) -> None:
+        """L3P B1: open the shared L3 index at backend init (outside every
+        collective); the creator seeds it on a daemon thread."""
+        if not self._l3p_on():
+            return
+        try:
+            self._l3_index()
+        except Exception as exc:  # noqa: BLE001 -- the index is an accelerator
+            logger.warning("L3-PERSIST eager index open failed (%s: %s)", type(exc).__name__, exc)
+
+    def _pin_path(self, stem: str) -> str:
+        """Where ``stem`` lives in THIS lineage's flat layout.
+
+        RE-PORTED for this lineage (#410 reconciliation onto the 0817 train).
+        The reconciliation wrote this as a flat join because the branch it came
+        from had no sharding. THIS store shards (#558), so a flat join names a
+        path it never writes: `pin_checkpoint` would drop every stem as
+        "missing" and pin nothing while reporting success, and a test that
+        removes `_pin_path(stem)` gets FileNotFoundError.
+
+        The property the reconciliation actually asked for is preserved, and it
+        is the one that matters: the ledger must stat EXACTLY what the evictor
+        unlinks. Both now resolve through ``_existing_path`` -- sharded, else
+        legacy flat, else the path it would be written to -- so there is one
+        join, whatever the layout.
+        """
+        return self._existing_path(stem)
+
+
+    def pin_checkpoint(self, checkpoint_id: str, keys: List[str]):
+        """Pin every store object a checkpoint references (#410 slice 2).
+
+        Translates CONTENT keys -- what a manifest holds -- into the suffixed
+        stems the evictor indexes, so the manifest never has to know the
+        store's key layout and the ledger never has to guess a size.
+
+        Reports what it could NOT pin. ``stems_with_sizes`` drops a stem whose
+        file is gone, which is right for the budget and invisible to the
+        caller; recording it here, where the CONTENT key is still known, is
+        what lets a create refuse by name instead of leaving the shortfall to
+        surface at the branch.
+        """
+        import dataclasses
+
+        from flliper.srt.mem_cache.pin_ledger import stems_with_sizes
+
+        pairs = []
+        missing: List[str] = []
+        for key in keys:
+            stem = self._get_suffixed_key(key)
+            path = self._pin_path(stem)
+            pairs.append((stem, path))
+            if not os.path.exists(path):
+                missing.append(key)
+        result = self.pins.pin(checkpoint_id, stems_with_sizes(pairs))
+        return dataclasses.replace(result, unpinned=tuple(missing))
+
+    def unpin_checkpoint(self, checkpoint_id: str) -> int:
+        """Release a checkpoint's pins, returning the bytes actually freed."""
+        return self.pins.unpin(checkpoint_id)
+
+    def pin_stats(self) -> dict:
+        return self.pins.ledger()
+
+    # Longest filename most Linux filesystems accept, in bytes.
+    _NAME_MAX = 255
+
+    def _tmp_path_for(self, tensor_path: str) -> str:
+        """Staging name for the atomic write, sized to fit NAME_MAX.
+
+        The final name is already long (page hash + served model name +
+        identity hash + geometry suffix; the served model name is a full
+        checkpoint PATH when the user does not pass --served-model-name). A
+        staging suffix carrying pid + thread id + a full uuid4 hex added ~50
+        more bytes, which pushed component pages of a deeply-nested checkpoint
+        over the limit: the write failed with "[Errno 36] File name too long"
+        and the store silently stayed empty -- the page was never persisted
+        even though the FINAL name would have fit. Keep the staging suffix
+        short, and shrink it further rather than fail when the final name is
+        near the limit; uniqueness comes from uuid4 alone.
+        """
+        base = os.path.basename(tensor_path)
+        room = self._NAME_MAX - len(base.encode("utf-8")) - len(".tmp.")
+        if room < 4:
+            raise OSError(
+                f"cannot stage an atomic write for '{base}': the final name "
+                f"already uses {len(base.encode('utf-8'))} of "
+                f"{self._NAME_MAX} bytes. Pass a short --served-model-name; "
+                "the default is the full checkpoint path."
+            )
+        return f"{tensor_path}.tmp.{uuid.uuid4().hex[:min(16, room)]}"
+
+    def _is_draft_key(self, key: str) -> bool:
+        """Draft page keys: ``{hash}.draft`` or ``{hash}.draft-{drafter}``.
+
+        The live key carries the drafter identity (#861,
+        ``HiCacheController._draft_component_name``), so the old
+        ``endswith(".draft")`` test was False for every key the generic route
+        writes -- a dead predicate that became load-bearing the moment a
+        canonical draft window existed (#1233). Recognising the identity
+        form is what routes a draft key to its own window and its own
+        suffix; with no window installed both answers fall back to today's.
+        """
+        return f".{PoolName.DRAFT}-" in key or key.endswith(f".{PoolName.DRAFT}")
+
+    def _is_shared_kv_key(self, key: str) -> bool:
+        """True for the keys whose bytes are geometry-independent.
+
+        Plain KV page keys are bare page hashes (hex, no '.'); component and
+        draft keys are '{hash}.{pool_name}'. Only the plain ones can lose a
+        geometry suffix, under either rule that earns it:
+
+        * ``dcp_owner_mode`` -- pages carry FULL replicated kv-heads and are
+          token-sharded, so a page is complete on its owner rank (token axis).
+        * ``canonical_kv_page`` (#706) -- pages carry every attention layer, so
+          a page is complete across PP stages (layer axis).
+
+        Draft pages are not plain KV keys and take their own branch in
+        ``_suffix_for_key``: a canonical draft page (#1233) is full-head and
+        single-layer, so it loses the same terms the KV page does -- but only
+        while the draft window is installed; without it the draft key keeps
+        every term it carries today. Component pools (mamba/SWA) are
+        genuinely per-rank shards and keep their suffix too; their
+        cross-geometry form is the offline cut in ``hicache_migrate``
+        (``MambaBlobSpec.for_layers`` / ``layer_extents`` for the layer
+        axis), never a softened key.
+        """
+        return "." not in key
+
+    def _is_qsa_key(self, key: str) -> bool:
+        """True when the compressed QSA index page for this key is canonical
+        (23.09., Task #106). Gated on the window, like the mamba blob: without
+        it the key keeps every geometry term and stays per-rank."""
+        return self.canonical_qsa_page is not None and key.endswith(
+            f".{PoolName.QSA_INDEXER}"
+        )
+
+    def _is_shared_mamba_key(self, key: str) -> bool:
+        """True when the GDN/mamba blob for this key is the canonical one.
+
+        Gated on the window existing, because only then are the blob's bytes
+        full-width in both axes (every layer, every head) instead of this
+        rank's shard. Without it the blob stays per-rank and per-stage, exactly
+        as it is today.
+        """
+        return self.canonical_mamba_blob is not None and key.endswith(
+            f".{PoolName.MAMBA}"
+        )
+
+    def _derive_key_suffixes(self) -> None:
+        """Build the two key suffixes from the geometry the BYTES still depend on.
+
+        #969F: THIS USED TO RUN ONCE, IN `__init__`, AND THE FACT IT READS
+        CHANGES AFTERWARDS. `install_canonical_windows` assigns
+        `self.canonical_kv_page` (:1347 pre-fix) and re-derived nothing, so a
+        store whose canonical page is installed AFTER construction -- which is
+        the live path, `cache_controller.py:1278` -- kept keys carrying
+        `_{tp_rank}_{tp_size}` and `_{pp_size}_{pp_rank}` even though the
+        canonical format had made that geometry irrelevant to the bytes.
+
+        The consequence is the whole read-side miss of this campaign: those
+        terms CHANGE AT EVERY FLIP (PP phase tp_size=1/pp_size=3, TP phase
+        tp_size=3/pp_size=1), so a page written in one phase is asked for under
+        a key the other phase never wrote. Measured: 132 `#937 STALE PREFETCH
+        INSERT REFUSED ... 0 token(s) fetched`, `#cached-token > 0` on 0 of 355
+        prefill lines, 315 of 324 re-admissions matching an empty tree.
+
+        The #706 rule the exemption states is unchanged and is the reason this
+        is a re-derivation and not a new rule: "the key carries exactly the
+        geometry the bytes still depend on". Under the canonical page the bytes
+        stop depending on the cut -- whenever that becomes true, including
+        later than construction.
+
+        The constructor already refuses a canonical mamba blob configured
+        WITHOUT the canonical KV page (":679", "a neutral GDN blob beside
+        pp-suffixed KV pages still misses across the flip") -- the author saw
+        this interaction; the guard simply could not fire for windows installed
+        after construction.
+        """
+        g = self._key_geom
+        (
+            self.config_suffix,
+            self.kv_config_suffix,
+            self.draft_config_suffix,
+        ) = self._build_key_suffixes(g)
+        # WHICH OF THESE PATHS DOES EVERY RANK OF THE GROUP NAME?
+        # Asked by re-deriving the same two strings from the same builder with
+        # the rank terms zeroed, and comparing. It is deliberately not a list
+        # of axes: a list is a second bookkeeping of the derivation above and
+        # drifts the day an axis is added -- which is exactly how the first
+        # attempt at this answer (``is_mla_model`` alone) refused every write
+        # from an MLA PP stage 1 and from attn_cp rank 1, whose suffixes carry
+        # a rank term the tp-only exemption never touches.
+        #
+        # ``_evictor.reserve`` is the one consumer: a non-owner writing a path
+        # only it names holds bytes nobody else writes, and refusing it is a
+        # carrier that moves nothing (see
+        # ``pdflip_store_gates.owner_write_covers_whole_file``).
+        rank0 = dict(g, tp_rank=0, pp_rank=0, attn_cp_rank=0)
+        (
+            rank0_config_suffix,
+            rank0_kv_config_suffix,
+            rank0_draft_config_suffix,
+        ) = self._build_key_suffixes(rank0)
+        self._config_suffix_is_group_wide = self.config_suffix == rank0_config_suffix
+        self._kv_config_suffix_is_group_wide = (
+            self.kv_config_suffix == rank0_kv_config_suffix
+        )
+        self._draft_config_suffix_is_group_wide = (
+            self.draft_config_suffix == rank0_draft_config_suffix
+        )
+
+    def _group_scan_suffixes(self) -> Tuple[str, ...]:
+        """Every suffix ANY rank of this group can write into the directory.
+
+        THE EVICTION POPULATION OF A SOLE OWNER IS THE GROUP'S, NOT ITS OWN.
+        F7 elects exactly one evictor per shared-key group; that owner's scan
+        filter was still its own ``(config_suffix, kv_config_suffix)`` pair, so
+        every OTHER rank's suffixed bytes -- its draft/NEXTN pages, its
+        component/SWA pages, and every key falling to the default branch of
+        ``_suffix_for_key`` -- were admitted by ``reserve`` and then indexed by
+        nobody. Measured at 69447a36 on group D (tp_size=3, canonical page on,
+        40 own draft pages per rank): 120 files on disk, 40 in the owner's
+        index. Only ``min_free_space`` still acted, and it stops the whole
+        carrier rather than the drafts.
+
+        DERIVED, NOT LISTED. The same pure ``_build_key_suffixes`` runs once
+        per rank triple of the three axes the geometry already carries, so an
+        axis added later is covered the day it is added -- the same reason
+        ``_derive_key_suffixes`` answers the group-wide question by comparison
+        rather than by a list of shapes. The product is the group's world size
+        (3 under Weg 2's P and D shapes), walked once at construction.
+
+        Stable for the life of the store: ``install_canonical_windows`` refuses
+        to switch the canonical format on or off, and the geometry terms never
+        move, so the re-derivation at the cutover cannot change these strings.
+        """
+        g = self._key_geom
+        suffixes = []
+        for tp_rank in range(max(1, int(g["tp_size"]))):
+            for pp_rank in range(max(1, int(g["pp_size"]))):
+                for cp_rank in range(max(1, int(g["attn_cp_size"]))):
+                    cfg, kv, draft = self._build_key_suffixes(
+                        dict(
+                            g,
+                            tp_rank=tp_rank,
+                            pp_rank=pp_rank,
+                            attn_cp_rank=cp_rank,
+                        )
+                    )
+                    suffixes.append(cfg)
+                    suffixes.append(kv)
+                    suffixes.append(draft)
+        return tuple(dict.fromkeys(s for s in suffixes if s))
+
+    def _build_key_suffixes(self, g: dict) -> Tuple[str, str, str]:
+        """(config_suffix, kv_config_suffix, draft_config_suffix) for ``g``.
+
+        Pure in ``g``, so the caller above can run it a second time with the
+        rank terms zeroed and learn, from the derivation itself, whether this
+        rank's suffix is the group's or its own.
+
+        #1233: the DRAFT suffix drops ``_{tp_rank}_{tp_size}`` and
+        ``_{pp_size}_{pp_rank}`` exactly while the canonical draft window is
+        installed -- the #706 rule ("the key carries exactly the geometry the
+        bytes still depend on") applied to a page that is then full-head and
+        full-draft-layer. Without the window it is byte-identical to
+        ``config_suffix``, which is what every draft key carried before.
+        """
+        config_suffix = f"_{g['model_name']}"
+        kv_config_suffix = f"_{g['model_name']}"
+        draft_config_suffix = f"_{g['model_name']}"
+        draft_neutral = self.canonical_draft_page is not None
+        if g["identity_hash"]:
+            config_suffix += f"_{g['identity_hash']}"
+            kv_config_suffix += f"_{g['identity_hash']}"
+            draft_config_suffix += f"_{g['identity_hash']}"
+        if not g["is_mla_model"]:
+            config_suffix += f"_{g['tp_rank']}_{g['tp_size']}"
+            if not self.dcp_owner_mode and self.canonical_kv_page is None:
+                kv_config_suffix += f"_{g['tp_rank']}_{g['tp_size']}"
+            if not draft_neutral:
+                draft_config_suffix += f"_{g['tp_rank']}_{g['tp_size']}"
+        if g["enable_pp"]:
+            config_suffix += f"_{g['pp_size']}_{g['pp_rank']}"
+            if self.canonical_kv_page is None:
+                kv_config_suffix += f"_{g['pp_size']}_{g['pp_rank']}"
+            if not draft_neutral:
+                draft_config_suffix += f"_{g['pp_size']}_{g['pp_rank']}"
+        if g["attn_cp_size"] > 1:
+            config_suffix += f"_cp{g['attn_cp_rank']}_{g['attn_cp_size']}"
+            kv_config_suffix += f"_cp{g['attn_cp_rank']}_{g['attn_cp_size']}"
+            draft_config_suffix += f"_cp{g['attn_cp_rank']}_{g['attn_cp_size']}"
+        return config_suffix, kv_config_suffix, draft_config_suffix
+
+    def _suffix_for_key(self, key: str) -> Tuple[str, bool]:
+        """The suffix this key carries, and whether every rank names that path.
+
+        ONE branch, two answers, because the second question is only ever
+        asked about a path the first one chose. Splitting them would leave a
+        write admitted under the group-wide answer for the config suffix while
+        the bytes landed on the kv-suffixed path, or the reverse.
+        """
+        if self._is_draft_key(key):
+            return self.draft_config_suffix, self._draft_config_suffix_is_group_wide
+        if (
+            self.dcp_owner_mode or self.canonical_kv_page is not None
+        ) and self._is_shared_kv_key(key):
+            return self.kv_config_suffix, self._kv_config_suffix_is_group_wide
+        if self._is_shared_mamba_key(key) or self._is_qsa_key(key):
+            return self.kv_config_suffix, self._kv_config_suffix_is_group_wide
+        return self.config_suffix, self._config_suffix_is_group_wide
+
+    def _get_suffixed_key(self, key: str) -> str:
+        return key + self._suffix_for_key(key)[0]
+
+    def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
+        """The LOOKUP-side component key.
+
+        #1062 CORRECTION -- THE COMMENT THAT STOOD HERE LIED, and it is the
+        instrument-text-lies class, so it is replaced rather than amended. It
+        claimed to be "The ONE funnel every store key goes through, READ AND
+        WRITE ALIKE (6 call sites)", and the #969G probe that sat here was built
+        on that claim to answer "does the re-admission ask for the SAME key the
+        retention wrote".
+
+        STATICALLY THERE ARE FIVE CALL SITES AND NOT ONE OF THEM WRITES:
+        ``_get_component_path`` (:1244), ``_collect_existing_component_keys``
+        (:1546, :1549), ``batch_exists_v2`` (:1686, :1694) -- all lookup or
+        existence. Confirmed on metal: across boot 30 the only callers the probe
+        ever observed were ``_collect_existing_component_keys``, ``has_component``
+        and a ``<genexpr>``. So the probe could never see a write key, and its
+        never-observed difference was a property of ITS PLACEMENT, not of the
+        code -- the indicator law, exactly.
+
+        The probe therefore moved DOWN to ``_log_key``, which IS symmetric
+        (``_write_page`` and ``_read_page`` both call it). This function keeps
+        its arithmetic unchanged.
+        """
+        if component_name is None or component_name in ("__default__", PoolName.KV):
+            out = self._get_suffixed_key(key)
+        else:
+            out = self._get_suffixed_key(f"{key}.{component_name}")
+        # #1065: TRACED AGAIN, BUT LABELLED HONESTLY THIS TIME. The set
+        # comparison boot 35 exists for needs BOTH funnels: `_log_key` carries
+        # the page IO (`_write_page`/`_read_page`), while the EXISTENCE query
+        # that produces `storage_hit=0` -- `batch_exists` ->
+        # `_collect_existing_component_keys` / `batch_exists_v2` -- comes
+        # through HERE and never touches `_log_key`. Tracing only the first
+        # would have compared writes against writes.
+        # Same counter and same cap as `_log_key`, so the two directions share
+        # one denominator and one suppressed count.
+        _969g_trace("lookup", str(component_name), out)
+        return out
+
+    def _sharded_path(self, stem: str) -> str:
+        """Path a NEW file for ``stem`` is written to."""
+        return os.path.join(self.file_path, page_shard(stem), f"{stem}.bin")
+
+    def _flat_path(self, stem: str) -> str:
+        """Pre-sharding path for ``stem`` (read-only compatibility)."""
+        return os.path.join(self.file_path, f"{stem}.bin")
+
+    def _flat_layout_present(self) -> bool:
+        """Does this directory still hold pre-sharding flat ``.bin`` files?
+
+        Decided ONCE per backend from one scandir of the top directory (256
+        shard dirs at most): new writes are always sharded, so a False never
+        turns True again, and a True that later turns False costs exactly one
+        extra stat per probe. Before this, every presence probe and every
+        read paid a second ``exists`` on the flat path of a file that has not
+        existed in that layout since the migration.
+        """
+        present = getattr(self, "_legacy_flat", None)
+        if present is None:
+            present = False
+            try:
+                with os.scandir(self.file_path) as it:
+                    for entry in it:
+                        if entry.name.endswith(".bin") and not entry.is_dir():
+                            present = True
+                            break
+            except OSError:
+                present = False
+            self._legacy_flat = present
+        return present
+
+    def _stat_stem(self, stem: str):
+        """``(path, size)`` of the file serving ``stem``, or None: ONE stat.
+
+        Profiled on boot xsn132 (2026-09-15, py-spy on D TP0): the prefetch
+        issuer spent 691 of 710 samples in ``batch_exists_v2``, 533 of them
+        in ``os.path.exists`` -- the probe of one stem cost exists(sharded) +
+        exists(flat) + exists(sharded) again + getsize, four syscalls, and a
+        prefix of 11k tokens probes 33k stems (KV, mamba, draft). Measured on
+        the store: 11.5 us a stem as written, 2.7 us as one stat.
+        """
+        sharded = self._sharded_path(stem)
+        try:
+            return sharded, os.stat(sharded).st_size
+        except OSError:
+            pass
+        if self._flat_layout_present():
+            flat = self._flat_path(stem)
+            try:
+                return flat, os.stat(flat).st_size
+            except OSError:
+                pass
+        return None
+
+    def _existing_path(self, stem: str) -> str:
+        """Where ``stem`` currently lives: sharded if present, else the legacy
+        flat path if present, else the sharded path it would be written to.
+
+        Read-through migration: a directory written before sharding keeps
+        serving hits and its files stay evictable, while every new write is
+        sharded. Nothing rewrites or moves the old files.
+        """
+        found = self._stat_stem(stem)
+        return found[0] if found is not None else self._sharded_path(stem)
+
+    def _stem_exists(self, stem: str) -> bool:
+        """True when ``stem`` is on disk, sharded or in the legacy flat layout."""
+        return self._stat_stem(stem) is not None
+
+    def _ensure_shard_dir(self, path: str) -> None:
+        """Create the shard directory of ``path`` once per shard."""
+        shard = os.path.dirname(path)
+        if shard in self._known_shards:
+            return
+        os.makedirs(shard, exist_ok=True)
+        self._known_shards.add(shard)
+
+    def _iter_existing_files(self):
+        """(stem, stat) for every ``.bin`` under the storage directory.
+
+        Walks the shard directories and the storage directory itself, so a
+        directory that predates sharding is picked up unchanged.
+        """
+        try:
+            with os.scandir(self.file_path) as it:
+                top = list(it)
+        except FileNotFoundError:
+            return
+        for entry in top:
+            if entry.is_dir():
+                try:
+                    with os.scandir(entry.path) as shard_it:
+                        shard_entries = list(shard_it)
+                except OSError:
+                    continue
+                for sub in shard_entries:
+                    if not sub.name.endswith(".bin"):
+                        continue
+                    try:
+                        yield sub.name[:-4], sub.stat()
+                    except OSError:
+                        continue
+            elif entry.name.endswith(".bin"):
+                try:
+                    yield entry.name[:-4], entry.stat()
+                except OSError:
+                    continue
+
+    def _iter_staging_files(self):
+        """``stat`` for every non-``.bin`` regular file under the store.
+
+        #1295 SHOULD_FIX 8 -- THE COMPONENT THE CAP COULD NOT SEE AT ALL.
+        ``_iter_existing_files`` yields ``.bin`` only, so the evictor's
+        ``seen_bytes`` -- and therefore the operator's ``max_size`` -- excluded
+        the ``<final>.tmp.<uuid>`` staging files every write passes through and
+        the orphaned canonical partials, both of which sit on the same
+        filesystem under the same cap. Those are reaped BY AGE AT ATTACH ONLY
+        (``_partial_ttl_s`` / ``sweep_partials``), and under Weg 2 the process
+        attaches once and runs for hours, so between attaches the component is
+        unbounded.
+
+        BY MEASUREMENT, NOT BY NAME: anything under this directory that is not
+        a ``.bin`` occupies the cap's filesystem, whatever the writer called
+        it. Naming ``.tmp.`` explicitly would bound only the class we happened
+        to think of, which is the population bug this ticket IS.
+
+        A SECOND ``scandir`` PASS, PRICED: the shard directories are read
+        twice, but ``os.stat`` -- the expensive half -- runs only on the
+        non-``.bin`` entries, which are few. Folding it into the ``.bin`` walk
+        would change ``iter_existing``'s contract, which three other callers
+        share.
+        """
+        try:
+            with os.scandir(self.file_path) as it:
+                top = list(it)
+        except FileNotFoundError:
+            return
+        for entry in top:
+            if entry.is_dir():
+                try:
+                    with os.scandir(entry.path) as shard_it:
+                        shard_entries = list(shard_it)
+                except OSError:
+                    continue
+                for sub in shard_entries:
+                    if sub.name.endswith(".bin") or sub.is_dir():
+                        continue
+                    try:
+                        yield sub.stat()
+                    except OSError:
+                        continue
+            elif not entry.name.endswith(".bin"):
+                try:
+                    yield entry.stat()
+                except OSError:
+                    continue
+
+    def _get_component_path(
+        self, key: str, component_name: Optional[str] = None
+    ) -> str:
+        return self._existing_path(self._get_component_key(key, component_name))
+
+    def _scan_existing_files_to_metadata_cache(self) -> None:
+        for stem, _st in self._iter_existing_files():
+            # Only files belonging to this rank/model. Shared KV files
+            # (dcp_owner_mode on the token axis, #706 on the layer axis) carry
+            # the geometry-free kv_config_suffix instead.
+            if stem.endswith(self.config_suffix) or (
+                (
+                    self.dcp_owner_mode
+                    or self.canonical_kv_page is not None
+                    or self.canonical_mamba_blob is not None
+                )
+                and stem.endswith(self.kv_config_suffix)
+            ):
+                self.metadata_cache.add(stem)
+
+
+
+
+    def _canonical_space_check(self, need_bytes: int) -> None:
+        """Refuse a canonical write that would take the store below the floor."""
+        from flliper.srt.mem_cache.canonical_page_store import ensure_space
+
+        ensure_space(self.file_path, need_bytes, self._space_floor_bytes)
+
+    def _canonical_window(self, key: str):
+        """The canonical window serving this key, or None for the normal path.
+
+        One dispatch for three pools: the KV page's window in its generic
+        one-extent form, the mamba blob's extent window, or (#1233) the draft
+        page's head window while one is installed. A draft key NEVER takes
+        the KV window -- without a draft window it stays on the per-rank
+        path -- and any other component pool keeps its per-rank key because
+        no canonical form is defined for it.
+        """
+        if self._is_draft_key(key):
+            return self.canonical_draft_page
+        if self._canonical_kv_extents is not None and self._is_shared_kv_key(key):
+            return self._canonical_kv_extents
+        if self._is_shared_mamba_key(key):
+            return self.canonical_mamba_blob
+        if self._is_qsa_key(key):
+            return self.canonical_qsa_page
+        return None
+
+    def _get_canonical_slice(
+        self, key: str, window, target_location: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Cut this rank's extents out of the canonical blob (#706).
+
+        Both phases arrive here with the SAME key and leave with different
+        bytes: a PP stage takes the byte ranges of the layers it owns, a TP rank
+        takes its head channels across every layer. That is the read-time cut
+        the token axis already does for kv-heads, on the other two axes.
+        """
+        from flliper.srt.mem_cache.canonical_page_store import read_extents
+
+        suffixed = self._get_suffixed_key(key)
+        tensor_path = self._existing_path(suffixed)
+        try:
+            served = read_extents(tensor_path, window, target_location)
+        except CanonicalPageError as e:
+            # A geometry that cannot cut this blob is a configuration error, not
+            # a cache miss. Loud and per-page rather than raised, because this
+            # runs on the prefetch worker and a dead worker is a wedge.
+            logger.error("Canonical read refused for %s: %s", key, e)
+            return None
+        if not served:
+            if self.metadata_cache is not None:
+                self.metadata_cache.remove(suffixed)
+            return None
+        self._evictor.touch(suffixed, tensor_path)
+        if self.metadata_cache is not None:
+            self.metadata_cache.add(suffixed)
+        return target_location
+
+    def _set_canonical_slice(self, key: str, window, value: torch.Tensor) -> bool:
+        """Deposit this rank's extents into the canonical blob (#706).
+
+        The blob becomes visible only once every byte is present, so a writer
+        acting alone leaves nothing readable behind -- see
+        ``canonical_page_store`` for the marker and the rename.
+        """
+        from flliper.srt.mem_cache.canonical_page_store import write_extents
+
+        suffixed = self._get_suffixed_key(key)
+        # #1065b: THE THIRD WRITE PATH, and the one that actually carries the KV
+        # bytes. Neither traced funnel saw it: `_log_key` covers the v2 page IO
+        # and `_get_component_key` covers lookups, while the canonical slice
+        # writes through `_get_suffixed_key` DIRECTLY. Boot 35 measured
+        # io_unique=1 / lookup_unique=19999 / intersection=0 -- a number that
+        # looked like a finding and was an artefact of this blind spot.
+        _969g_trace("write", "canonical", suffixed)
+        if self.exists(key):
+            # A complete blob is content-addressed: it already holds exactly
+            # these bytes. Refresh recency, write nothing.
+            self._evictor.touch(suffixed, self._existing_path(suffixed))
+            return True
+
+        tensor_path = self._sharded_path(suffixed)
+        reserved = False
+        try:
+            # Charged per SLICE: the writers together account for one blob, and
+            # the one that completes it has ``commit`` correct the estimate to
+            # the file's real allocation.
+            if not self._evictor.reserve(
+                suffixed,
+                window.payload_bytes,
+                key=key,
+                # An extent write is a PART by construction: this rank
+                # deposits its layers (PP) or its head channels (TP) and the
+                # blob becomes readable only when the last byte lands. The
+                # storage owner's write never covers it, so the owner gate
+                # must not apply -- refusing here is a blob that never
+                # completes, which reads as a cold cache and never raises.
+                owner_writes_whole_file=owner_write_covers_whole_file(
+                    is_mla_model=self._key_geom["is_mla_model"],
+                    canonical_extent_write=True,
+                ),
+            ):
+                return False
+            reserved = True
+            self._ensure_shard_dir(tensor_path)
+            result = write_extents(
+                tensor_path, window, value, space_check=self._canonical_space_check
+            )
+            self._evictor.commit(suffixed)
+            if (
+                result.completed or result.already_complete
+            ) and self.metadata_cache is not None:
+                self.metadata_cache.add(suffixed)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save canonical slice for {key}: {e}")
+            if reserved:
+                self._evictor.abort(suffixed)
+            return False
+
+    def rescan_eviction_index(self) -> dict:
+        """Re-read the store directory into the LRU index (Weg 2 wake path).
+
+        Called when this group wakes. Two groups share one directory and only
+        one of them is awake at a time, so the sibling's writes accumulated
+        entirely outside this process's index while it slept; evicting against
+        that index would evict against a snapshot of the past. A no-op for a
+        non-owner or an unbounded store.
+
+        MAY RAISE ``PdFlipStoreIndexBlind`` (W8b): the rebuilt index is graded
+        against the directory it just read, and the wake is the moment that
+        grading has a denominator -- at boot this store can be empty, where
+        coverage is 1.0 over zero bytes. A caller on the wake path must let it
+        propagate; a cap enforced over a fraction of the sole carrier is not a
+        cap, and continuing would spend the group's awake phase evicting
+        against numbers that do not describe the disk.
+
+        AND MUST ESCALATE IT GROUP-FATALLY: the wake caller turns this raise
+        into W4 ``PdFlipWakeRefused`` -- a group-fatal STOP with no retry (spec
+        §5, which places the wake refusal at the launcher for exactly this
+        reason). The raise is still the eviction owner's alone, but no longer
+        for the reason recorded at fix 2 ("a non-owner grades a different
+        population"): the scan filter is now the GROUP's suffix set, so the
+        census is a property of the directory and the geometry and every rank
+        would grade it identically -- which is why the ATTACH-time grading has
+        moved above the owner-only early return in ``LRUFileEvictor.__init__``
+        and the ranks refuse together there. What keeps the WAKE verdict
+        single is that only the owner holds an index to rebuild; the others
+        return without walking the directory, and giving them a walk on every
+        wake would buy nothing but the walk. So a rank that dies HERE alone
+        while its siblings wake on is still the disagreement §0 forbids
+        ("STOP, never compensation"), and the escalation above is what closes
+        it.
+
+        WIRED (#1295 fix 2 round 2), and NOT as a ``raise`` on the caller's
+        line -- that was fix 2's first cut and it performed exactly the
+        rank-local death this paragraph forbids, under a docstring claiming
+        otherwise. ``SchedulerWeightUpdaterManager._pdflip_rescan_store_index``
+        RECORDS the refusal in ``pdflip_store_rescan_failure``, and
+        ``resume_memory_occupation`` votes it through the C15 ok-bit of the
+        group fence that already closes the resume leg: every rank joins,
+        the verdict is all-gathered, any False raises ``PdFlipRankDisagree``
+        on all of them. No new collective and no rank left running.
+        """
+        return self._evictor.rescan()
+
+    def install_canonical_windows(
+        self, kv_page, mamba_blob, draft_page=None, qsa_page=None
+    ) -> None:
+        """#706 x #719 (0828): swap this backend's read/write-time cut.
+
+        Called by ``HiCacheController.rebind_canonical_windows`` at the flip
+        cutover, AFTER the #719 pool rebind committed, with windows derived
+        from the pools now bound. The store's bytes never move -- one
+        canonical file per key, every phase cutting its own extents out of it
+        -- only WHICH extents this rank reads and writes changes with the
+        phase.
+
+        Never a format transition: window presence decides the KEY shape
+        (`_get_suffixed_key`), so flipping the format on or off here would
+        silently re-key a live store and strand every page written under the
+        other rule. Likewise the canonical TOTAL is a model constant: a
+        different total is a different page format, not another phase's cut
+        of the same one.
+
+        The DRAFT slot has one more legal transition: its FIRST install
+        (None -> window). The draft pool binds after the storage config is
+        built (`HiCacheStorageConfig.canonical_draft_page` has no writer in
+        the tree), so `HiCacheController._install_canonical_draft_window`
+        installs the third slot from `set_draft_kv_pool`, at registration,
+        before this process wrote a single page -- there is no live store to
+        re-key yet (spec G1/Q8; boot weg2dk1 review). Switching the slot OFF
+        over an installed window, and a `total_bytes` change, stay refusals.
+        """
+        if (
+            (kv_page is None) != (self.canonical_kv_page is None)
+            or ((mamba_blob is None) != (self.canonical_mamba_blob is None))
+            or (draft_page is None and self.canonical_draft_page is not None)
+        ):
+            # qsa_page=None means UNCHANGED, not "switch off": the draft
+            # install (`_install_canonical_draft_window`) passes only its own
+            # slot, and fnFL2x55 died on every P stage at exactly that call.
+            raise CanonicalPageError(
+                "refusing to switch the canonical format on or off at a "
+                "cutover: window presence decides the key shape, and "
+                "re-keying a live store strands every page written under "
+                "the other rule."
+            )
+        if (
+            qsa_page is not None
+            and self.canonical_qsa_page is not None
+            and int(qsa_page.total_bytes) != int(self.canonical_qsa_page.total_bytes)
+        ):
+            raise CanonicalPageError(
+                f"refusing to install a QSA index window of a "
+                f"{qsa_page.total_bytes}-byte page over a store keyed for "
+                f"{self.canonical_qsa_page.total_bytes}-byte index pages."
+            )
+        if kv_page is None:
+            return
+        if int(kv_page.spec.page_bytes) != int(
+            self.canonical_kv_page.spec.page_bytes
+        ):
+            raise CanonicalPageError(
+                f"refusing to install a KV window of a "
+                f"{kv_page.spec.page_bytes}-byte page over a store keyed for "
+                f"{self.canonical_kv_page.spec.page_bytes}-byte pages: that "
+                "is a different page format, not another phase's cut."
+            )
+        if mamba_blob is not None and int(mamba_blob.total_bytes) != int(
+            self.canonical_mamba_blob.total_bytes
+        ):
+            raise CanonicalPageError(
+                f"refusing to install a mamba window of a "
+                f"{mamba_blob.total_bytes}-byte blob over a store keyed for "
+                f"{self.canonical_mamba_blob.total_bytes}-byte blobs."
+            )
+        if (
+            draft_page is not None
+            and self.canonical_draft_page is not None
+            and int(draft_page.total_bytes) != int(self.canonical_draft_page.total_bytes)
+        ):
+            raise CanonicalPageError(
+                f"refusing to install a draft window of a "
+                f"{draft_page.total_bytes}-byte page over a store keyed for "
+                f"{self.canonical_draft_page.total_bytes}-byte draft pages."
+            )
+        self.canonical_kv_page = kv_page
+        self._canonical_kv_extents = kv_extents_for(kv_page, self._kv_owner_rows)
+        self.canonical_mamba_blob = mamba_blob
+        self.canonical_draft_page = draft_page
+        if qsa_page is not None:
+            self.canonical_qsa_page = qsa_page
+        # #969F: THE FACT THE KEY SUFFIX DEPENDS ON JUST CHANGED. Re-derive it
+        # here, at the one place that changes it, so there is a single
+        # derivation function and no second moment. Without this the store
+        # keeps the pre-canonical, geometry-bearing key and every page written
+        # before a flip is unreachable after it.
+        self._derive_key_suffixes()
+
+    def get(
+        self,
+        key: str,
+        target_location: torch.Tensor,
+        target_sizes: Optional[Any] = None,
+    ) -> torch.Tensor | None:
+        window = self._canonical_window(key)
+        if isinstance(window, CanonicalAbstainWindow):
+            # #239 S4b (F14): no token rows of this page live on this rank;
+            # the owners read theirs, the group's MIN decides the hit.
+            return target_location
+        if window is not None:
+            # The shared arena first (the extra-pool route batch_get_v2 ->
+            # _read_page -> get reads one page at a time; boot-xsn142 class:
+            # a mamba blob completed in the arena is invisible to a disk
+            # read), then the disk. The C arena packs extents front to back,
+            # so an identity-addressed window (#239 owner rows) reads the disk.
+            if (
+                not window.identity
+                and self._arena_dir()
+                and target_location is not None
+                and target_location.is_contiguous()
+                and int(target_location.numel()) * int(target_location.element_size())
+                == int(window.payload_bytes)
+            ):
+                arena = self._arena_for(int(window.total_bytes))
+                if arena is not None:
+                    suffixed = self._get_suffixed_key(key)
+                    st = arena.read([suffixed], [int(window.total_bytes)],
+                                    [tuple(window.extents)], [int(target_location.data_ptr())])[0]
+                    if st == 0:
+                        if self.metadata_cache is not None:
+                            self.metadata_cache.add(suffixed)
+                        return target_location
+            return self._get_canonical_slice(key, window, target_location)
+        suffixed = self._get_suffixed_key(key)
+        tensor_path = self._existing_path(suffixed)
+        try:
+            expected = target_location.numel() * target_location.element_size()
+            with open(tensor_path, "rb", buffering=0) as f:
+                buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
+                # An unbuffered readinto is one syscall and may legitimately
+                # return short on a large page -- loop until the page is whole
+                # or the file really is truncated. KV pages (tens of KiB) never
+                # hit this; component pages do (a Mamba/GDN state page is tens
+                # of MiB), and a partial recurrent state is the worst possible
+                # thing to hand back.
+                got = 0
+                while got < expected:
+                    n = f.readinto(buf[got:])
+                    if not n:
+                        break
+                    got += n
+                if got != expected:
+                    raise IOError(
+                        f"Short read for {suffixed}: {got} of {expected} bytes"
+                    )
+            self._evictor.touch(suffixed, tensor_path)
+            if self.metadata_cache is not None:
+                self.metadata_cache.add(suffixed)
+            return target_location
+        except FileNotFoundError:
+            if self.metadata_cache is not None:
+                self.metadata_cache.remove(suffixed)
+            logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+            return None
+
+    def batch_get(
+        self,
+        keys: List[str],
+        target_locations: List[torch.Tensor],
+        target_sizes: Optional[Any] = None,
+    ) -> List[torch.Tensor | None]:
+        """#1402: canonical-window keys are read in ONE C call per batch.
+
+        Per page the Python path is open/fstat/pread/close + the evictor's
+        utime + a stat for the path, six GIL hand-offs; beside a busy main
+        thread each costs up to the switch interval. The helper does the
+        same syscalls for the whole batch under one release of the GIL, and
+        the evictor's in-memory LRU is updated afterwards without a second
+        utime. Keys without a canonical window, targets the window cannot
+        fill, and the legacy flat layout take ``get`` exactly as before.
+        """
+        targets = list(target_locations or [None] * len(keys))
+        results: List[torch.Tensor | None] = [None] * len(keys)
+        from flliper.srt.mem_cache.storage.file.pageio import load as _load_pageio
+
+        pio = _load_pageio()
+        plan = []
+        for i, (key, target) in enumerate(zip(keys, targets)):
+            window = self._canonical_window(key) if pio is not None else None
+            if isinstance(window, CanonicalAbstainWindow):
+                results[i] = target  # #239 S4b (F14): no rows here
+                continue
+            if (
+                window is None
+                or window.identity  # #239 S4b: the C reader packs extents
+                or target is None
+                or not target.is_contiguous()
+                or int(target.numel()) * int(target.element_size())
+                != int(window.payload_bytes)
+            ):
+                results[i] = self.get(key, target)
+                continue
+            suffixed = self._get_suffixed_key(key)
+            plan.append((i, key, suffixed, self._sharded_path(suffixed), window, target))
+        if not plan:
+            return results
+        touch = bool(getattr(self._evictor, "_eviction_enabled", True))
+        # The shared arena first: a page another rank completed there is
+        # served from RAM, no file I/O and no per-process staging.
+        if self._arena_dir():
+            # #1416g: one arena call per width for the whole batch (it was one
+            # per page -- the extra pools' index pages pay it per page).
+            still = []
+            by_arena: dict = {}
+            for entry in plan:
+                arena = self._arena_for(int(entry[4].total_bytes))
+                if arena is None:
+                    still.append(entry)
+                    continue
+                by_arena.setdefault(id(arena), (arena, []))[1].append(entry)
+            for arena, entries in by_arena.values():
+                sts = arena.read(
+                    [e[2] for e in entries], [int(e[4].total_bytes) for e in entries],
+                    [tuple(e[4].extents) for e in entries], [int(e[5].data_ptr()) for e in entries],
+                )
+                for entry, st in zip(entries, sts):
+                    i, key, suffixed, path, window, target = entry
+                    if st == 0:
+                        if self.metadata_cache is not None:
+                            self.metadata_cache.add(suffixed)
+                        results[i] = target
+                    else:
+                        still.append(entry)
+            still.sort(key=lambda e: e[0])
+            plan = still
+            if not plan:
+                return results
+        statuses = pio.read_pages(
+            [p[3] for p in plan],
+            [int(p[4].total_bytes) for p in plan],
+            [tuple(p[4].extents) for p in plan],
+            [int(p[5].data_ptr()) for p in plan],
+            touch,
+        )
+        if self._arena_dir():
+            # a disk hit is promoted into the arena so the next rank reads RAM
+            for (i, key, suffixed, path, window, target), status in zip(plan, statuses):
+                if status != 0:
+                    continue
+                arena = self._arena_for(int(window.total_bytes))
+                if arena is None:
+                    continue
+                if arena.write([suffixed], [int(window.total_bytes)], [tuple(window.extents)],
+                               [int(target.data_ptr())])[0] == 4:
+                    self._arena_evict_to_disk(arena, 256)
+        for (i, key, suffixed, path, window, target), status in zip(plan, statuses):
+            if status == 0:
+                self._evictor.touch(suffixed, path, mtime=False)
+                if self.metadata_cache is not None:
+                    self.metadata_cache.add(suffixed)
+                results[i] = target
+            elif status == 1 and self._flat_layout_present():
+                # Not in the sharded layout: the per-key path knows the flat one.
+                results[i] = self.get(key, target)
+            else:
+                if status != 1:
+                    self._1402_n = getattr(self, "_1402_n", 0) + 1
+                    if self._1402_n <= 8 or self._1402_n % 256 == 0:
+                        logger.warning(
+                            "[#1402 pageio] canonical %s %s refused (status=%d: "
+                            "2=width mismatch, 3=short read, 4=io error; n=%d)",
+                            window.label,
+                            os.path.basename(path),
+                            int(status),
+                            self._1402_n,
+                        )
+                if self.metadata_cache is not None:
+                    self.metadata_cache.remove(suffixed)
+                results[i] = None
+        return results
+
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        window = self._canonical_window(key)
+        if isinstance(window, CanonicalAbstainWindow):
+            return True  # #239 S4b (F14): the owners write this page's rows
+        if window is not None:
+            return self._set_canonical_slice(key, window, value)
+        suffixed = self._get_suffixed_key(key)
+        # #1065b: the plain write path; `batch_set` funnels through here.
+        _969g_trace("write", "plain", suffixed)
+
+        # Fast path: same key already on disk. Refresh recency and skip rewrite.
+        if self.exists(key):
+            logger.debug(f"Key {key} already exists. Skipped.")
+            self._evictor.touch(suffixed, self._existing_path(suffixed))
+            return True
+
+        # New pages are always sharded, whatever the directory looked like before.
+        tensor_path = self._sharded_path(suffixed)
+
+        tmp_path = None
+        reserved = False
+        try:
+            value_bytes = value.numel() * value.element_size()
+            # Ask the evictor to admit + reserve disk space (evicting if
+            # needed). Whether a non-owner may write is a question about THIS
+            # FILE, not about this rank: when every rank of the group names
+            # this same path AND the model is rank-replicated, the owner's
+            # write already puts every byte there; where the suffix carries a
+            # rank term -- this rank's tp shard, its PP stage, its attn-cp
+            # rank -- the owner never writes this path at all.
+            if not self._evictor.reserve(
+                suffixed,
+                value_bytes,
+                key=key,
+                owner_writes_whole_file=owner_write_covers_whole_file(
+                    is_mla_model=self._key_geom["is_mla_model"],
+                    path_is_group_wide=self._suffix_for_key(key)[1],
+                ),
+            ):
+                return False
+            reserved = True
+
+            self._ensure_shard_dir(tensor_path)
+            tmp_path = self._tmp_path_for(tensor_path)
+            value.contiguous().view(dtype=torch.uint8).numpy().tofile(tmp_path)
+            os.replace(tmp_path, tensor_path)
+            self._evictor.commit(suffixed)
+            if self.metadata_cache is not None:
+                self.metadata_cache.add(suffixed)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save tensor {key}: {e}")
+            # Roll back the reservation and clean up any half-written file.
+            if reserved:
+                self._evictor.abort(suffixed)
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            if self.metadata_cache is not None:
+                self.metadata_cache.remove(suffixed)
+            return False
+
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        return all(self._batch_set_each(keys, values))
+
+    def _batch_set_each(self, keys: List[str], values) -> List[bool]:
+        """#1402: canonical-window keys are written in ONE C call per batch.
+
+        The same protocol as ``write_extents`` (part file + flock, marker
+        sidecar, rename on completion), page by page under one release of
+        the GIL -- py-spy on P PP0 (xsn134) had the backup thread in the
+        per-page syscalls of the publish sweep for the whole in-flip window
+        and the P->D drain at 10.5 s. The evictor's reserve/commit/abort
+        bookkeeping and the metadata cache are unchanged per key; keys
+        without a canonical window take ``set`` exactly as before.
+        """
+        from flliper.srt.mem_cache.storage.file.pageio import load as _load_pageio
+
+        pio = _load_pageio()
+        values = list(values or [])
+        if pio is None:
+            return [bool(self.set(key, value)) for key, value in zip(keys, values)]
+        results: List[bool] = [True] * len(keys)
+        plan = []
+        for i, (key, value) in enumerate(zip(keys, values)):
+            window = self._canonical_window(key)
+            if isinstance(window, CanonicalAbstainWindow):
+                continue  # #239 S4b (F14): the owners write this page's rows
+            if window is None or value is None or window.identity:
+                # (#239 S4b: the C writer packs extents; owner rows are
+                # identity-addressed and take the per-key protocol.)
+                results[i] = bool(self.set(key, value))
+                continue
+            flat = value.contiguous().view(torch.uint8)
+            if int(flat.numel()) != int(window.payload_bytes):
+                # shape refusals keep their per-key error line
+                results[i] = bool(self._set_canonical_slice(key, window, value))
+                continue
+            suffixed = self._get_suffixed_key(key)
+            _969g_trace("write", "canonical", suffixed)
+            plan.append((i, key, suffixed, window, flat))
+        if not plan:
+            return results
+        if self._arena_dir():
+            # ONE HiCache: the extents land in the shared arena; the disk
+            # store only sees what the arena evicts. Refused extents
+            # (granule alignment, no arena for the width) take the disk path.
+            rest = []
+            by_arena: dict = {}
+            for entry in plan:
+                i, key, suffixed, window, flat = entry
+                arena = self._arena_for(int(window.total_bytes))
+                if arena is None or self._arena_home_is_disk(arena, suffixed):
+                    rest.append(entry)
+                    continue
+                by_arena.setdefault(id(arena), (arena, []))[1].append(entry)
+            for arena, entries in by_arena.values():
+                for attempt in range(2):
+                    sts = arena.write(
+                        [e[2] for e in entries], [int(e[3].total_bytes) for e in entries],
+                        [tuple(e[3].extents) for e in entries], [int(e[4].data_ptr()) for e in entries],
+                    )
+                    stems = getattr(arena, "_stems", None)
+                    if stems is None:
+                        stems = arena._stems = {}
+                    from flliper.srt.mem_cache.storage.file.hicache_arena import key128
+                    again = []
+                    for entry, st in zip(entries, sts):
+                        i, key, suffixed, window, flat = entry
+                        if st in (0, 1, 2):
+                            stems[key128(suffixed)] = suffixed
+                            if st in (1, 2) and self.metadata_cache is not None:
+                                self.metadata_cache.add(suffixed)
+                        elif st == 4 and attempt == 0:
+                            again.append(entry)
+                        else:
+                            self._arena_refused_n = getattr(self, "_arena_refused_n", 0) + 1
+                            if self._arena_refused_n <= 8 or self._arena_refused_n % 512 == 0:
+                                logger.warning(
+                                    "[arena] write refused status=%d key=%s total=%d extents=%d "
+                                    "first=%s (n=%d): this extent goes to the DISK store; a page "
+                                    "split between tiers completes nowhere",
+                                    int(st), suffixed[:24], int(window.total_bytes),
+                                    len(window.extents), tuple(window.extents)[:2],
+                                    self._arena_refused_n,
+                                )
+                            self._arena_note_disk_home(arena, suffixed)
+                            rest.append(entry)
+                    if not again:
+                        break
+                    self._arena_evict_to_disk(arena, max(256, len(again)))
+                    entries = again
+            plan = rest
+            if not plan:
+                return results
+        # Presence for the whole batch in one call: a complete blob is
+        # content-addressed and only gets its recency refreshed.
+        present = self._stat_stems([p[2] for p in plan])
+        todo = []
+        for i, key, suffixed, window, flat in plan:
+            if suffixed in present:
+                self._evictor.touch(suffixed, self._existing_path(suffixed))
+                continue
+            if not self._evictor.reserve(
+                suffixed,
+                window.payload_bytes,
+                key=key,
+                owner_writes_whole_file=owner_write_covers_whole_file(
+                    is_mla_model=self._key_geom["is_mla_model"],
+                    canonical_extent_write=True,
+                ),
+            ):
+                results[i] = False
+                continue
+            path = self._sharded_path(suffixed)
+            self._ensure_shard_dir(path)
+            todo.append((i, key, suffixed, window, flat, path))
+        if not todo:
+            return results
+        from flliper.srt.mem_cache.canonical_page_store import canonical_fsync_default
+
+        statuses = pio.write_pages(
+            [t[5] for t in todo],
+            [int(t[3].total_bytes) for t in todo],
+            [tuple(t[3].extents) for t in todo],
+            [int(t[4].data_ptr()) for t in todo],
+            canonical_fsync_default(),
+        )
+        for (i, key, suffixed, window, flat, path), status in zip(todo, statuses):
+            if status in (0, 1, 2):
+                self._evictor.commit(suffixed)
+                if status in (0, 2) and self.metadata_cache is not None:
+                    self.metadata_cache.add(suffixed)
+            else:
+                logger.error(
+                    "Failed to save canonical slice for %s: [#1402 pageio] "
+                    "status=%d (3=shape refused, 4=io/lock error)",
+                    key,
+                    int(status),
+                )
+                self._evictor.abort(suffixed)
+                results[i] = False
+        return results
+
+    def exists(self, key: str) -> bool:
+        key = self._get_suffixed_key(key)
+        if self.metadata_cache is not None and self.metadata_cache.contains(key):
+            return True
+        if self._stem_exists(key):
+            if self.metadata_cache is not None:
+                self.metadata_cache.add(key)
+            return True
+        return False
+
+    def _collect_existing_component_keys(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+    ) -> Set[str]:
+        target_files = {f"{self._get_component_key(key)}.bin" for key in keys}
+        for transfer in pool_transfers or []:
+            for key in keys:
+                target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
+
+        # One stat per candidate (this used to be a full-directory scandir,
+        # which was cheaper only while the directory was flat and small; the
+        # incident directory held 11.7M entries). #1402: all of them in ONE
+        # C call when the helper is loaded -- the probe of an 11k prefix is
+        # 33k stats, and each os.stat from Python is a GIL hand-off.
+        existing_files = set()
+        unknown = []
+        for filename in target_files:
+            stem = filename[:-4]
+            if self.metadata_cache is not None and self.metadata_cache.contains(stem):
+                existing_files.add(filename)
+            else:
+                unknown.append(stem)
+        for stem in self._readable_stems(unknown):
+            existing_files.add(f"{stem}.bin")
+            if self.metadata_cache is not None:
+                self.metadata_cache.add(stem)
+        return existing_files
+
+    # -- the shared-memory arena (BAUPLAN_SHM_ARENA_0916) -----------------
+    def _arena_dir(self) -> str:
+        return os.environ.get("FLLIPER_HICACHE_ARENA_DIR", "").strip()
+
+    def _draft_arena_refused(self, total_bytes: int) -> bool:
+        """HICACHE-DRAFT-TIER off: the canonical DRAFT width gets no arena.
+
+        Structural, beside the registration (kv_cache_builder never registers
+        a draft host pool under the switch, so nothing asks): a width that is
+        the draft page's and neither the KV page's nor the mamba blob's is
+        refused here, the file is never created, nothing is pinned. Logged
+        once per process."""
+        if not hicache_draft_tier_off():
+            return False
+        dpage = getattr(self, "canonical_draft_page", None)
+        if dpage is None or int(total_bytes) != int(dpage.total_bytes):
+            return False
+        kv = getattr(self, "_canonical_kv_extents", None)
+        if kv is not None and int(total_bytes) == int(kv.total_bytes):
+            return False
+        blob = getattr(self, "canonical_mamba_blob", None)
+        if blob is not None and int(total_bytes) == int(blob.total_bytes):
+            return False
+        if not getattr(self, "_draft_arena_refused_logged", False):
+            self._draft_arena_refused_logged = True
+            logger.info("[arena] draft width %d refused: %s", int(total_bytes),
+                        hicache_draft_tier_off_line(where="HiCacheFile._arena_for"))
+        return True
+
+    def _arena_for(self, total_bytes: int):
+        """The shared arena for pages of this canonical width, or None.
+
+        One arena file per width under FLLIPER_HICACHE_ARENA_DIR, sized by
+        FLLIPER_HICACHE_ARENA_GIB (KV pages; the draft arena gets the same
+        slot COUNT, the mamba arena FLLIPER_HICACHE_ARENA_MAMBA_SLOTS). Opened
+        lazily by every rank of both groups on the same path -- that is the
+        ONE HiCache: whoever completes a page, every rank can read it.
+        """
+        d = self._arena_dir()
+        if not d:
+            return None
+        arenas = getattr(self, "_arenas", None)
+        if arenas is None:
+            arenas = self._arenas = {}
+        if total_bytes in arenas:
+            return arenas[total_bytes]
+        if self._draft_arena_refused(int(total_bytes)):
+            arenas[total_bytes] = None
+            return None
+        try:
+            from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
+
+            kv_total = (
+                int(self._canonical_kv_extents.total_bytes)
+                if self._canonical_kv_extents is not None else 32768
+            )
+            gib = float(os.environ.get("FLLIPER_HICACHE_ARENA_GIB", "8"))
+            kv_slots = max(1024, int(gib * (1 << 30)) // max(1, kv_total))
+            blob = self.canonical_mamba_blob
+            if blob is not None and int(total_bytes) == int(blob.total_bytes):
+                slots = int(os.environ.get("FLLIPER_HICACHE_ARENA_MAMBA_SLOTS", "48"))
+            else:
+                # the draft page AND the QSA index page (23.09., Task #106)
+                # follow the KV page 1:1, so they get the KV slot COUNT
+                slots = kv_slots
+            os.makedirs(d, exist_ok=True)
+            arena = ShmArena(os.path.join(d, f"arena-{int(total_bytes)}.bin"), int(total_bytes), slots)
+            logger.info(
+                "[arena] %s: %d slots x %d bytes = %.2f GiB (%s)",
+                arena.path, slots, int(total_bytes), arena.file_bytes / (1 << 30),
+                "fresh" if arena.fresh else "attached",
+            )
+        except Exception as e:  # noqa: BLE001 - the arena is a hot tier, not a requirement
+            logger.warning("[arena] unavailable for width %d (%s: %s); disk only",
+                           int(total_bytes), type(e).__name__, str(e)[:160])
+            arena = None
+        arenas[total_bytes] = arena
+        if arena is not None:
+            self._l3_write_behind_start()
+        return arena
+
+    # -- L3-REUSE 0928: the persistent L3 holds what L2 holds -----------------
+    def _l3_write_behind_start(self) -> bool:
+        """Start this process's L3 write-behind thread (once per backend).
+
+        Only on a PERSISTENT store (L3P: ``L3_IDENTITY.json``, the directory
+        the next boot reattaches to) and only on the rank that owns the
+        store's LRU index (one per group: P PP0, D TP0) -- the arenas are
+        shared by every rank of both groups, so one reader sees every page.
+        ``FLLIPER_PDFLIP_L3_WRITE_BEHIND_S`` = 0 keeps the pre-0928 form (L3 is
+        written only when a page leaves L2)."""
+        if getattr(self, "_l3wb_thread", None) is not None:
+            return False
+        if not getattr(self, "_l3wb_armed", False):
+            # a backend that never ran __init__ (unit-test scaffolds) has no
+            # attach to arm it; the pass itself stays callable
+            return False
+        try:
+            every = float(envs.FLLIPER_PDFLIP_L3_WRITE_BEHIND_S.get() or 0.0)
+            if every <= 0 or not self._l3p_persistent_dir():
+                return False
+            ev = getattr(self, "_evictor", None)
+            if ev is not None and not getattr(ev, "_is_storage_owner", True):
+                return False
+        except Exception:  # noqa: BLE001 - a bare backend (unit tests) has no store
+            return False
+        stop = threading.Event()
+        self._l3wb_stop = stop
+
+        def _run():
+            fails = 0
+            while not stop.wait(every):
+                try:
+                    self.l3_write_behind_pass()
+                except Exception as exc:  # noqa: BLE001 - never takes the process down
+                    fails += 1
+                    if fails <= 8 or fails % 256 == 0:
+                        logger.warning("L3-REUSE WRITE-BEHIND pass failed (n=%d): %r", fails, exc)
+
+        t = threading.Thread(target=_run, name="pdflip-l3-write-behind", daemon=True)
+        self._l3wb_thread = t
+        t.start()
+        logger.info(
+            "L3-REUSE WRITE-BEHIND started (every %.1f s, %d MiB per arena and pass, store %s): "
+            "every COMPLETE L2 arena page gets its L3 copy, so a restart resumes from L3",
+            every, int(self._l3_write_behind_budget() >> 20), self.file_path,
+        )
+        return True
+
+    @staticmethod
+    def _l3_write_behind_budget() -> int:
+        try:
+            return max(1, int(envs.FLLIPER_PDFLIP_L3_WRITE_BEHIND_MIB.get())) << 20
+        except Exception:  # noqa: BLE001
+            return 256 << 20
+
+    def l3_write_behind_pass(self, budget_bytes: Optional[int] = None, quiet=None) -> dict:
+        """One pass: every COMPLETE page of every arena this process opened
+        that has no L3 copy yet is copied to the disk store WITHOUT being
+        freed, up to ``budget_bytes`` per arena.
+
+        L3-REUSE 0928 (NF boot rc12z13, first request after the boot):
+        ``#1472 READ-TRACE asked=512 readable=399 first_missing=eb5869b2...
+        why=no-file``. The L2 arena lives in /dev/shm under the BOOT tag and
+        dies with the boot; before this pass the disk store saw a page only
+        when it LEFT L2 (claim room #257 d, QSA arena full, park demote), so
+        every page still in L2 at the end of a boot -- the hot tail of every
+        live conversation, up to 5461 KV pages = 349k tokens -- was lost and
+        re-prefilled after the restart. The persistent L3 is only persistent
+        for what reaches it.
+
+        Never against the flip, never against the scheduler:
+        * quiet while a leg runs, while this group sleeps and while it is
+          dormant (``l3_write_behind.quiet``: the existing leg bracket and
+          W25 ``pdflip_dormant``, no clock) -- checked before every batch;
+        * no per-slot Python: the census of COMPLETE slots is ONE C call
+          (``arena_complete_census``), the pages already secured are filtered
+          by numpy on (slot, generation, key), pinning is one C call
+          (``arena_pin_complete``) and the bytes go arena mapping -> file in
+          ONE ``pageio.write_pages`` call per batch (#1402, GIL released) --
+          no host copy, the same buffered writer every L3 page uses;
+        * each (slot, generation) is written at most once: a page the L3
+          cap evicts later is not written again while it sits in the same
+          slot (no write/evict ping-pong); a refused reservation (cap or
+          min-free) ends this arena's pass instead of retrying page by page.
+        """
+        import numpy as np
+
+        from flliper.srt.mem_cache import l3_write_behind as _gate
+        from flliper.srt.mem_cache.canonical_page_store import canonical_fsync_default
+        from flliper.srt.mem_cache.storage.file.pageio import load as _load_pageio
+
+        quiet = _gate.quiet_reason if quiet is None else quiet
+        budget = int(budget_bytes) if budget_bytes else self._l3_write_behind_budget()
+        tot = {"arenas": 0, "complete": 0, "new": 0, "on_disk": 0, "written": 0,
+               "pending": 0, "refused": 0, "bytes": 0, "paused": None}
+        t0 = time.perf_counter()
+        c0 = time.thread_time()
+        why = quiet()
+        if (why or "open") != getattr(self, "_l3wb_gate", "open"):
+            # one line per gate change: the metal shows the pass stops at the
+            # flip's first leg and resumes after the wake, never in between
+            logger.info("L3-REUSE WRITE-BEHIND gate=%s (was %s)", why or "open",
+                        getattr(self, "_l3wb_gate", "open"))
+            self._l3wb_gate = why or "open"
+        if why:
+            tot["paused"] = why
+            return tot
+        pio = _load_pageio()
+        if pio is None:
+            return tot
+        fsync = canonical_fsync_default()
+        chunk = 64
+        for arena in [a for a in list((getattr(self, "_arenas", None) or {}).values()) if a is not None]:
+            tot["arenas"] += 1
+            nslots = int(arena.slots)
+            sec = getattr(arena, "_l3wb_sec", None)
+            if sec is None:
+                sec = arena._l3wb_sec = (np.full(nslots, -1, dtype=np.int64),
+                                         np.zeros(nslots, dtype=np.uint64))
+            sec_gen, sec_lo = sec
+            slots, gens, klo, khi = arena.complete_census()
+            tot["complete"] += int(slots.shape[0])
+            if not slots.shape[0]:
+                continue
+            new = np.nonzero((sec_gen[slots] != gens) | (sec_lo[slots] != klo))[0]
+            if not new.shape[0]:
+                continue
+            tot["new"] += int(new.shape[0])
+            slots, gens, klo, khi = slots[new], gens[new], klo[new], khi[new]
+            # the stem of a NEW page only -- once per page in its lifetime
+            stems = [arena.slot_stem(int(s)) for s in slots.tolist()]
+            on = self._stat_stems([s for s in stems if s])
+            have = np.fromiter((bool(s) and s in on for s in stems), dtype=bool, count=len(stems))
+            sec_gen[slots[have]] = gens[have]
+            sec_lo[slots[have]] = klo[have]
+            tot["on_disk"] += int(have.sum())
+            todo = np.nonzero(~have & np.fromiter((bool(s) for s in stems), dtype=bool,
+                                                  count=len(stems)))[0]
+            if not todo.shape[0]:
+                continue
+            total = int(arena.slot_bytes)
+            cap = max(1, budget // max(1, total))
+            tot["pending"] += max(0, int(todo.shape[0]) - cap)
+            todo = todo[:cap]
+            for off in range(0, int(todo.shape[0]), chunk):
+                why = quiet()
+                if why:
+                    tot["paused"] = why
+                    tot["pending"] += int(todo.shape[0]) - off
+                    break
+                part = todo[off:off + chunk]
+                ok = arena.pin_complete(slots[part], klo[part], khi[part])
+                pinned = part[ok]
+                try:
+                    batch = []
+                    refused = False
+                    for i in pinned.tolist():
+                        stem = stems[i]
+                        if not self._evictor.reserve(
+                            stem, total, key=stem,
+                            owner_writes_whole_file=owner_write_covers_whole_file(
+                                is_mla_model=self._key_geom["is_mla_model"],
+                                canonical_extent_write=True,
+                            ),
+                        ):
+                            refused = True
+                            break
+                        path = self._sharded_path(stem)
+                        self._ensure_shard_dir(path)
+                        batch.append((i, stem, path))
+                    if batch:
+                        statuses = pio.write_pages(
+                            [b[2] for b in batch], [total] * len(batch),
+                            [((0, total),)] * len(batch),
+                            [int(arena.slot_ptr(int(slots[b[0]]))) for b in batch], fsync,
+                        )
+                        for (i, stem, _path), st in zip(batch, statuses):
+                            if st in (0, 2):
+                                self._evictor.commit(stem)
+                                sec_gen[slots[i]] = gens[i]
+                                sec_lo[slots[i]] = klo[i]
+                                tot["written"] += 1
+                                tot["bytes"] += total
+                            else:
+                                self._evictor.abort(stem)
+                                tot["pending"] += 1
+                finally:
+                    arena.unpin(slots[pinned])
+                if refused:
+                    tot["refused"] += 1
+                    tot["pending"] += int(todo.shape[0]) - off - len(batch)
+                    break
+        n = getattr(self, "_l3wb_n", 0) + 1
+        self._l3wb_n = n
+        self._l3wb_written = getattr(self, "_l3wb_written", 0) + tot["written"]
+        tot["ms"] = (time.perf_counter() - t0) * 1e3
+        tot["cpu_ms"] = (time.thread_time() - c0) * 1e3
+        if tot["written"] or tot["refused"]:
+            k = getattr(self, "_l3wb_logged", 0) + 1
+            self._l3wb_logged = k
+            if k <= 32 or k % 64 == 0 or tot["refused"]:
+                logger.info(
+                    "L3-REUSE WRITE-BEHIND pass=%d pages=%d bytes=%d ms=%.1f cpu_ms=%.1f "
+                    "arenas=%d complete=%d new=%d on_disk=%d pending=%d refused=%d "
+                    "paused=%s written_total=%d (L2 pages copied to the persistent L3 "
+                    "without a free)",
+                    n, tot["written"], tot["bytes"], tot["ms"], tot["cpu_ms"],
+                    tot["arenas"], tot["complete"], tot["new"], tot["on_disk"],
+                    tot["pending"], tot["refused"], tot["paused"] or "-", self._l3wb_written,
+                )
+        return tot
+
+    def _arena_note_disk_home(self, arena, suffixed: str) -> None:
+        """#1410: this blob's home is the DISK tier from now on (this process)."""
+        homes = getattr(arena, "_disk_home", None)
+        if homes is None:
+            homes = arena._disk_home = set()
+        homes.add(suffixed)
+        arena._had_refusal = True
+
+    def _arena_home_is_disk(self, arena, suffixed: str) -> bool:
+        """#1410 (boot xsn159): ONE home per blob, decided by its first writer.
+
+        A blob is written by several ranks, one extent each. When the arena
+        is full, one rank's extent went to disk (partial + marker) while a
+        later rank found room (after an eviction) and put its extent into
+        the arena: the arena slot stayed CLAIMED forever, the disk partial
+        never completed, and NO rank could read the blob -- the mamba anchor
+        of the 4k prefix on xsn159, behind which every follower answered
+        'store_absent' to PP0's told=4095 and P stopped. The rule: once any
+        extent of a blob is on disk, every later extent of it goes to disk.
+        Process-local memory first (free); the marker stat only once this
+        arena has refused a write at all, so a cold arena pays nothing.
+        """
+        homes = getattr(arena, "_disk_home", None)
+        if homes and suffixed in homes:
+            return True
+        if not getattr(arena, "_had_refusal", False):
+            return False
+        try:
+            final = self._sharded_path(suffixed)
+            from flliper.srt.mem_cache.canonical_page_store import marker_path
+            if os.path.exists(marker_path(final)) or os.path.exists(final):
+                self._arena_note_disk_home(arena, suffixed)
+                return True
+        except Exception:  # noqa: BLE001 - a stat failure is not a routing fact
+            return False
+        return False
+
+    def arena_fill_from_disk(self, arena, stems, total_bytes: int, prefix: bool = False):
+        """#1433: the L3 -> L2 return path. For every stem that is NOT in the
+        arena but IS on disk: claim a slot, read the whole canonical page from
+        the disk store straight into the slot, complete it. Returns one entry
+        per stem: the slot (COMPLETE, no reference taken yet), or None when
+        the page is not on disk / could not be read / is being filled by
+        another writer right now (join later, it is a miss for this read).
+        Before #1433 the arena was a write-only sink towards the disk: a
+        page evicted to L3 was never read back, the prefix was recomputed.
+
+        ``prefix=True`` (EG review of L3-FAST, (a)): the stems are a PREFIX
+        walk -- nothing past the first page that can not be had (not on disk,
+        or a claim that yields no slot) is claimed or read; claims already
+        taken past it are freed unread. The answer for those stems is None."""
+        n = len(stems)
+        out = [None] * n
+        if n == 0:
+            return out
+        try:
+            on_disk = self._stat_stems(list(stems))
+        except Exception:  # noqa: BLE001 - no stat, no fill
+            return out
+        # L3-FAST (28.09., 27B boots: 1.4-3.2k tokens/s against 10-115k the
+        # disk gives -- measured with this pageio on the same store): ONE claim,
+        # ONE completion and parallel reads for the whole batch instead of a
+        # claim/read/complete per page. The claim statuses and what a page
+        # yields are exactly the per-page loop's; only the calls are batched.
+        t0 = time.perf_counter()
+        if prefix:
+            _gap = next((i for i, st in enumerate(stems) if st not in on_disk), n)
+            cand = [(i, st) for i, st in enumerate(stems[:_gap])]
+        else:
+            cand = [(i, st) for i, st in enumerate(stems) if st in on_disk]
+        todo = []
+        if cand:
+            claims = arena.claim_slots([st for _, st in cand], [int(total_bytes)] * len(cand))
+            full = []
+            for (i, st), (slot, status, gen) in zip(cand, claims):
+                if status == 2:
+                    out[i] = slot          # raced in by someone else: complete, usable
+                elif status == 0:
+                    todo.append((i, slot, gen, st))
+                elif status == 4:
+                    full.append((i, st))
+            if full:
+                try:
+                    self._arena_evict_to_disk(arena, max(256, len(full)))
+                except Exception:  # noqa: BLE001
+                    pass
+                for (i, st), (slot, status, gen) in zip(
+                        full, arena.claim_slots([st for _, st in full], [int(total_bytes)] * len(full))):
+                    if status == 0:
+                        todo.append((i, slot, gen, st))
+                    elif status == 2:
+                        out[i] = slot
+        if prefix and todo:
+            # (a): the first stem that neither raced in complete nor got a
+            # claim ends the prefix -- its successors are not read
+            todo.sort(key=lambda t: t[0])
+            _mine = {t[0] for t in todo}
+            _stop = next((i for i, _st in cand if out[i] is None and i not in _mine), n)
+            _past = [t[1] for t in todo if t[0] > _stop]
+            if _past:
+                _free_named(arena, _past, "l3fill_past_prefix")
+                todo = [t for t in todo if t[0] < _stop]
+            for i, _st in cand:
+                if i > _stop:
+                    out[i] = None
+        if not todo:
+            return out
+        from flliper.srt.mem_cache.storage.file.pageio import load as _load_pageio
+        pio = _load_pageio()
+        paths = [self._existing_path(st) for _, _, _, st in todo]
+        ptrs = [arena.slot_ptr(slot) for _, slot, _, _ in todo]
+        rc, threads = l3_read_pages_parallel(pio, paths, int(total_bytes), ptrs)
+        ok = [k for k, r in enumerate(rc) if r == 0]
+        bad = [todo[k][1] for k, r in enumerate(rc) if r != 0]
+        filled = 0
+        if ok:
+            cs = arena.complete_slots([todo[k][1] for k in ok], [todo[k][2] for k in ok],
+                                      [(0, int(total_bytes))])
+            for k, c in zip(ok, cs):
+                if c in (1, 2):
+                    out[todo[k][0]] = todo[k][1]
+                    filled += 1
+                else:
+                    bad.append(todo[k][1])
+        if bad:
+            _free_named(arena, bad, "l3fill_complete_refused")
+        k = getattr(self, "_1433_n", 0) + 1
+        self._1433_n = k
+        if k <= 8 or k % 256 == 0:
+            ms = (time.perf_counter() - t0) * 1000.0
+            logger.info("#1433 L3->L2 fill: %d of %d pages read from disk into the arena (n=%d) threads=%d "
+                        "ms=%.0f pages_per_s=%.0f", filled, len(todo), k, threads, ms,
+                        filled / max(1e-6, ms / 1000.0))
+        return out
+
+    def _arena_evict_to_disk(self, arena, want: int) -> int:
+        """Move up to `want` complete, unreferenced, unpinned pages from the
+        arena to the disk store (the cold tier), then free their slots."""
+        _en = getattr(type(self), "_evict_log_n", 0) + 1
+        type(self)._evict_log_n = _en
+        if _en <= 16 or _en % 64 == 0:
+            logger.info("ARENA-EVICT n=%d want=%d (arena clock: COMPLETE unreferenced slots go to disk and FREE -- xsn328)", _en, int(want))
+        pins = getattr(self, "pins", None)
+        keep = []
+        if pins is not None:
+            try:
+                keep = list(getattr(pins, "pinned_stems", lambda: [])())
+            except Exception:  # noqa: BLE001
+                keep = []
+        cands = arena.evict_candidates(want, keep_stems=keep)
+        if not cands:
+            return 0
+        moved = self.arena_secure_to_disk(arena, cands)["written"]
+        _free_named(arena, [c[0] for c in cands], "evict_to_disk")
+        arena.reap_stale()
+        stems = getattr(arena, "_stems", {})
+        for c in cands:
+            stems.pop((c[1], c[2]), None)
+        return moved
+
+    def arena_secure_to_disk(self, arena, cands) -> dict:
+        """#257 (d): give every EVICTING candidate ``(slot, key_lo, key_hi,
+        total)`` an L3 copy before its slot is freed -- the disk half of
+        ``_arena_evict_to_disk``, shared with the claim-time room of
+        ``ArenaMHAHostPool._evict_for_claim``. A page already on disk is not
+        written again. Returns ``{on_disk, written, lost}``: ``lost`` pages
+        leave L2 with no copy in L3 (no stem recorded, the evictor refused the
+        room, or the write failed) -- each is counted, never silent.
+
+        Vision boot 0928 (pdflip-4-27, P PP0 06:20:28): the claim path freed
+        COMPLETE pages with no disk copy (#1427 stage i, 49 unlogged drops on
+        PP0 between 06:17:41 and 06:22:29); the probe had counted them, the
+        read found neither slot nor file and ended at page 219 of 813."""
+        out = {"on_disk": 0, "written": 0, "lost": 0}
+        if not cands:
+            return out
+        from flliper.srt.mem_cache.storage.file.pageio import load as _load_pageio
+        from flliper.srt.mem_cache.canonical_page_store import canonical_fsync_default
+
+        pio = _load_pageio()
+        stems = getattr(arena, "_stems", {})
+        todo = []
+        cand_stems = {}
+        for slot, lo, hi, total in cands:
+            stem = stems.get((lo, hi)) or arena.slot_stem(slot) or None
+            cand_stems[slot] = stem
+        on_disk = self._stat_stems([st for st in cand_stems.values() if st])
+        for slot, lo, hi, total in cands:
+            stem = cand_stems.get(slot)
+            if stem is None:
+                # no stem recorded (a slot claimed before this build): the
+                # page cannot be written by name -- LOGGED, it is lost to the
+                # disk tier (boot xsn153: silent drops made followers see
+                # "store_absent" behind PP0's verdict).
+                self._arena_dropped_n = getattr(self, "_arena_dropped_n", 0) + 1
+                if self._arena_dropped_n <= 8 or self._arena_dropped_n % 256 == 0:
+                    logger.warning("[arena] evicting a page WITHOUT a stem (n=%d): not written to disk",
+                                   self._arena_dropped_n)
+                out["lost"] += 1
+                continue
+            if stem in on_disk:
+                out["on_disk"] += 1
+                continue
+            path = self._sharded_path(stem)
+            if not self._evictor.reserve(
+                stem, int(total), key=stem,
+                owner_writes_whole_file=owner_write_covers_whole_file(
+                    is_mla_model=self._key_geom["is_mla_model"],
+                    canonical_extent_write=True,
+                ),
+            ):
+                out["lost"] += 1
+                continue
+            self._ensure_shard_dir(path)
+            todo.append((stem, slot, total, path))
+        if todo and pio is not None:
+            statuses = pio.write_pages(
+                [t[3] for t in todo], [int(t[2]) for t in todo],
+                [((0, int(t[2])),) for t in todo],
+                [int(arena._lib.arena_slot_ptr(arena._base, int(t[1]))) for t in todo],
+                canonical_fsync_default(),
+            )
+            for (stem, slot, total, path), st in zip(todo, statuses):
+                if st in (0, 1, 2):
+                    self._evictor.commit(stem)
+                    out["written"] += 1
+                else:
+                    self._evictor.abort(stem)
+                    out["lost"] += 1
+        elif todo:
+            for stem, slot, total, path in todo:
+                self._evictor.abort(stem)
+            out["lost"] += len(todo)
+        # L3-REUSE 0928: the KV page's L3 copy carries its QSA index sibling.
+        out.update(self._l3_couple_sidecars(arena, [st for st in cand_stems.values() if st]))
+        return out
+
+    def _l3_sidecar_stems(self, kv_stems) -> list:
+        """The QSA index stems (``{hash}.qsa_indexer`` + suffix) of KV page
+        stems (``{hash}`` + suffix). Empty without a canonical QSA window --
+        a model without the sidecar, or a Form-A worker."""
+        if getattr(self, "canonical_qsa_page", None) is None or not kv_stems:
+            return []
+        kv_sfx = self._suffix_for_key("k")[0]
+        q_sfx = self._suffix_for_key(f"k.{PoolName.QSA_INDEXER}")[0]
+        out = []
+        for stem in kv_stems:
+            if not stem or (kv_sfx and not stem.endswith(kv_sfx)):
+                continue
+            h = stem[: len(stem) - len(kv_sfx)] if kv_sfx else stem
+            if not h or "." in h:
+                continue
+            out.append(f"{h}.{PoolName.QSA_INDEXER}{q_sfx}")
+        return out
+
+    def _l3_couple_sidecars(self, arena, kv_stems) -> dict:
+        """L3-REUSE 0928 (NF boot rc12z13 7b2c6ee5ef, P PP0 09:33:33, the first
+        request after the boot): ``#1028B FETCH CAP n=1: kv=399 claimed=47
+        caps={mamba: 399, qsa_indexer: 47}`` -- the store held 399 leading KV
+        pages and mamba anchors up to page 398, but the QSA index for only 47,
+        so the claim was capped at 47 pages and the prompt re-prefilled. On
+        disk 8104 KV pages against 2048 QSA pages (= 8 x 256, eight
+        ``ARENA-EVICT want=256`` rounds of the QSA arena itself).
+
+        The QSA index page lives in its OWN arena (``_arena_for(49152)``) and
+        its L3 copy was written only when THAT arena ran full. Every path that
+        gives a KV page its L3 copy -- the claim-time room
+        (``arena_secure_to_disk``, #257 d), the park/hand-off demoter
+        (``arena_copy_to_disk``, #248: 147 D copies in boot 0831, pool=kv),
+        the write-behind -- copied the KV page alone; its sibling stayed in L2
+        and died with the boot's /dev/shm arena. ``batch_exists_v2`` takes the
+        MINIMUM over the pools (QSA_INDEXER is ALL_PAGES), so a KV page on
+        disk without its index is worth nothing.
+
+        Rule: a KV page that gets (or has) an L3 copy gets its QSA index copy
+        in the same call, from the QSA arena, without freeing it there. A
+        sibling that is neither in the QSA arena nor on disk is counted
+        (``sidecar_absent``), never silent. No-op for any arena other than
+        the canonical KV page's width."""
+        out = {"sidecar_written": 0, "sidecar_on_disk": 0, "sidecar_absent": 0}
+        try:
+            kv = getattr(self, "_canonical_kv_extents", None)
+            qsa = getattr(self, "canonical_qsa_page", None)
+            if kv is None or qsa is None or arena is None or not kv_stems:
+                return out
+            if int(getattr(arena, "slot_bytes", -1)) != int(kv.total_bytes):
+                return out
+            q_stems = self._l3_sidecar_stems(kv_stems)
+            if not q_stems:
+                return out
+            q_arena = self._arena_for(int(qsa.total_bytes))
+            if q_arena is None:
+                on = self._stat_stems(q_stems)
+                out["sidecar_on_disk"] = len(on)
+                out["sidecar_absent"] = len(q_stems) - len(on)
+                return out
+            r = self._arena_copy_pages_to_disk(q_arena, q_stems)
+            out["sidecar_written"] = int(r.get("written", 0))
+            out["sidecar_on_disk"] = int(r.get("on_disk", 0))
+            out["sidecar_absent"] = int(r.get("absent", 0))
+        except Exception as exc:  # noqa: BLE001 - the KV copy stands; the loss is named
+            logger.warning("L3-REUSE sidecar couple failed: %r", exc)
+            return out
+        n = getattr(self, "_l3_couple_n", 0) + 1
+        self._l3_couple_n = n
+        if out["sidecar_absent"] or n <= 16 or n % 256 == 0:
+            logger.info(
+                "L3-REUSE SIDECAR-COUPLE n=%d kv_pages=%d qsa_written=%d qsa_on_disk=%d "
+                "qsa_absent=%d (a KV page's L3 copy carries its QSA index; absent = the "
+                "index is in neither L2 nor L3, the claim caps there)",
+                n, len(kv_stems), out["sidecar_written"], out["sidecar_on_disk"],
+                out["sidecar_absent"],
+            )
+        return out
+
+    def arena_copy_to_disk(self, arena, stems) -> dict:
+        """#248 PARK-DEMOTE copy of ``stems`` (see
+        :meth:`_arena_copy_pages_to_disk`), plus -- L3-REUSE 0928 -- the QSA
+        index sibling of every KV page (:meth:`_l3_couple_sidecars`)."""
+        out = self._arena_copy_pages_to_disk(arena, stems)
+        out.update(self._l3_couple_sidecars(arena, [s for s in dict.fromkeys(stems or ()) if s]))
+        return out
+
+    def _arena_copy_pages_to_disk(self, arena, stems) -> dict:
+        """#248 PARK-DEMOTE: copy the COMPLETE arena pages of ``stems`` to the
+        disk store WITHOUT freeing them -- ``_arena_evict_to_disk`` minus the
+        free. The slot stays where it is; from now on a claim may free it
+        without I/O (stage ii of ``_evict_for_claim``), and a later read takes
+        it back from disk (``arena_fill_from_disk``).
+
+        Each slot carries a transient reader reference while its bytes are
+        written (raw, past this process's ledger: it is no holder), so no
+        claim can free and refill it under the write; a slot whose key moved
+        between the lookup and that reference is skipped. Runs on the D
+        demoter's thread, never on a scheduler thread (H81). Returns
+        ``{written, on_disk, absent, bytes}``."""
+        import ctypes
+
+        # absent = missing (no slot in the arena at all) + busy (a slot that
+        # was not in the ready state, held by another reference, or moved
+        # between lookup and pin). The anchor pool keeps two candidate pages
+        # of which only one exists (handoff_pending.ANCHOR_TAIL_KEYS), so its
+        # other candidate is `missing` by design, not a lost page.
+        out = {"written": 0, "on_disk": 0, "absent": 0, "missing": 0, "busy": 0, "bytes": 0}
+        stems = [s for s in dict.fromkeys(stems or ()) if s]
+        if not stems or arena is None:
+            return out
+        on_disk = self._stat_stems(stems)
+        todo = [s for s in stems if s not in on_disk]
+        out["on_disk"] = len(stems) - len(todo)
+        if not todo:
+            return out
+        from flliper.srt.mem_cache.storage.file.pageio import load as _load_pageio
+        from flliper.srt.mem_cache.canonical_page_store import canonical_fsync_default
+
+        pio = _load_pageio()
+        if pio is None:
+            out["absent"] = out["busy"] = len(todo)
+            return out
+        lib, base = arena._lib, arena._base
+
+        def _ref(slot, delta):
+            return int(lib.arena_ref_slots(base, 1, (ctypes.c_int64 * 1)(int(slot)), int(delta)))
+
+        pinned = []
+        for stem, (slot, state) in zip(todo, arena.find_slots(todo)):
+            if slot < 0:
+                out["absent"] += 1
+                out["missing"] += 1
+                continue
+            if int(state) != 2 or _ref(slot, +1) != 1:
+                out["absent"] += 1
+                out["busy"] += 1
+                continue
+            (s2, st2), = arena.find_slots([stem])
+            if s2 != slot or int(st2) != 2:
+                _ref(slot, -1)  # evicted and re-claimed between find and pin
+                out["absent"] += 1
+                out["busy"] += 1
+                continue
+            pinned.append((stem, int(slot)))
+        try:
+            total = int(arena.slot_bytes)
+            batch = []
+            for stem, slot in pinned:
+                path = self._sharded_path(stem)
+                if not self._evictor.reserve(
+                    stem, total, key=stem,
+                    owner_writes_whole_file=owner_write_covers_whole_file(
+                        is_mla_model=self._key_geom["is_mla_model"],
+                        canonical_extent_write=True,
+                    ),
+                ):
+                    continue
+                self._ensure_shard_dir(path)
+                batch.append((stem, slot, path))
+            if batch:
+                statuses = pio.write_pages(
+                    [b[2] for b in batch], [total] * len(batch), [((0, total),)] * len(batch),
+                    [int(lib.arena_slot_ptr(base, b[1])) for b in batch], canonical_fsync_default(),
+                )
+                for (stem, _slot, _path), st in zip(batch, statuses):
+                    if st in (0, 1, 2):
+                        self._evictor.commit(stem)
+                        out["written"] += 1
+                        out["bytes"] += total
+                    else:
+                        self._evictor.abort(stem)
+        finally:
+            for _stem, slot in pinned:
+                _ref(slot, -1)
+        return out
+
+    def _l3_index(self):
+        """#1459: the shared L3 stem index beside the arena, opened once
+        (None without an arena dir, with the env off, or when the build
+        failed).  Handed to the evictor, which keeps it exact."""
+        idx = getattr(self, "_l3idx", None)
+        if idx is not None or getattr(self, "_l3idx_tried", False):
+            return idx
+        self._l3idx_tried = True
+        try:
+            adir = self._arena_dir()
+            if not adir:
+                return None
+            from flliper.srt.mem_cache.storage.file.l3_index import open_index
+            # #1459b (boot weg2xsn216): NOT inside the arena dir -- every file
+            # there is read as an arena of some slot size, and the index file
+            # made the host tiers rebind against a phantom pool (HICACHE-INDEX
+            # REFUSED on the first prefill).  A sibling dir instead.
+            _idir = adir.rstrip("/") + "-l3idx"
+            os.makedirs(_idir, exist_ok=True)
+            idx = open_index(os.path.join(_idir, "l3idx.bin"))
+            self._l3idx = idx
+            if idx is not None:
+                self._evictor.l3_index = idx
+                logger.info("#1459 L3-INDEX %s at %s (cap %d, entries %d)",
+                            "created" if idx.created else "joined", idx.path, idx.cap, idx.count())
+                if idx.created and self._l3p_on():
+                    # B1: never on the caller's thread -- the first caller may
+                    # be the prefetch thread inside a group MIN collective
+                    # (PREFETCH_CLAIM_REDUCE_BOUND_S), and a 150 GB store is
+                    # ~2 M files. Queries before the seed completes see
+                    # misses only (the index is an accelerator).
+                    threading.Thread(target=self._l3p_seed_index, args=(idx,),
+                               name="l3p-index-seed", daemon=True).start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("#1459 L3-INDEX n/a (%s: %s)", type(exc).__name__, exc)
+        return idx
+
+    def _l3p_seed_index(self, idx) -> int:
+        """L3P: a freshly CREATED index starts empty, and "a stem missing here
+        is NOT on disk" -- so every page a previous boot left in a persistent
+        store would read as a miss. The creator seeds it from the directory
+        (one walk, the same ``_iter_existing_files`` the evictor's census
+        uses); joiners that query before the seed completes only see misses,
+        never a wrong hit. ``FLLIPER_PDFLIP_L3_PERSIST=0`` skips it (the per-boot
+        store is empty anyway)."""
+        raw = (os.environ.get("FLLIPER_PDFLIP_L3_PERSIST", "") or "").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return 0
+        n, batch = 0, []
+        t0 = time.monotonic()
+        # NF metal rc12z30c: the seed was one more walk per boot. The
+        # persistent index (snapshot + earlier boots' journals; this boot's
+        # pages are added by the evictor as they commit) names the same stems.
+        source = "walk"
+        stems = None
+        try:
+            from flliper.srt.mem_cache.storage.file import store_journal as _sj
+
+            if _sj.enabled():
+                stems, why = _sj.index_stems(self.file_path, _sj.attach_epoch())
+                source = "index" if stems is not None else f"walk ({why})"
+        except Exception as exc:  # noqa: BLE001 -- fall back to the walk
+            source = f"walk ({type(exc).__name__}: {exc})"
+        try:
+            for stem in (stems if stems is not None
+                         else (st for st, _st in self._iter_existing_files())):
+                batch.append(stem)
+                if len(batch) >= 4096:
+                    idx.add(batch)
+                    n += len(batch)
+                    batch = []
+            if batch:
+                idx.add(batch)
+                n += len(batch)
+        except Exception as exc:  # noqa: BLE001 -- the index is an accelerator; a partial seed is only misses
+            logger.warning("L3-PERSIST index seed stopped after %d stems (%s: %s)",
+                           n, type(exc).__name__, exc)
+        logger.info("L3-PERSIST index_seeded=%d source=%s seed_s=%.1f dir=%s index=%s",
+                    n, source, time.monotonic() - t0, self.file_path, idx.path)
+        return n
+
+    def _stat_stems(self, stems: List[str]) -> dict:
+        """``{stem: size}`` for the stems that are on disk; one C call when
+        the #1402 helper is available, else ``_stat_stem`` each.
+        #1459: the shared L3 index answers first -- only the stems it names
+        are stat'ed; a stem it does not know is not on disk."""
+        if not stems:
+            return {}
+        _idx = self._l3_index()
+        if _idx is not None:
+            _present = _idx.has(stems)
+            stems = [st for st, p in zip(stems, _present) if p]
+            if not stems:
+                return {}
+        from flliper.srt.mem_cache.storage.file.pageio import load as _load_pageio
+
+        pio = _load_pageio()
+        if pio is None:
+            out = {}
+            for stem in stems:
+                found = self._stat_stem(stem)
+                if found is not None:
+                    out[stem] = int(found[1])
+            return out
+        sizes = pio.stat_sizes([self._sharded_path(s) for s in stems])
+        out = {s: int(sz) for s, sz in zip(stems, sizes) if sz >= 0}
+        if len(out) < len(stems) and self._flat_layout_present():
+            rest = [s for s in stems if s not in out]
+            sizes = pio.stat_sizes([self._flat_path(s) for s in rest])
+            out.update({s: int(sz) for s, sz in zip(rest, sizes) if sz >= 0})
+        if _idx is not None and len(out) < len(stems):
+            # 28.09.: the index named them, the disk does not have them (a
+            # crash after an unlink, before its E line): a miss, and struck
+            # from both indexes -- never a read of a page that is not there
+            gone = [s for s in stems if s not in out]
+            try:
+                _idx.remove(gone)
+                self._evictor.forget(gone)
+            except Exception:  # noqa: BLE001 -- bookkeeping, never a gate on the read
+                pass
+        return out
+
+    def _arena_kv_present_prefix(self, keys: List[str]) -> Optional[int]:
+        """#1439: how many LEADING KV pages are COMPLETE in the L2 arena, from
+        one C call; None when no arena / no canonical KV window (the caller
+        keeps the per-key path). The pages beyond the answer may still be on
+        the disk -- the caller checks that remainder the old way."""
+        _pn = getattr(type(self), "_1439_present_n", 0) + 1
+        type(self)._1439_present_n = _pn
+        if not keys or not self._arena_dir() or self._canonical_kv_extents is None:
+            if _pn <= 12 or _pn % 512 == 0:
+                logger.info("#1439 ARENA-PRESENT n=%d keys=%d -> None (arena_dir=%s kv_extents=%s)", _pn, len(keys),
+                            bool(self._arena_dir()), self._canonical_kv_extents is not None)
+            return None
+        arena = self._arena_for(int(self._canonical_kv_extents.total_bytes))
+        if arena is None:
+            if _pn <= 12 or _pn % 512 == 0:
+                logger.info("#1439 ARENA-PRESENT n=%d keys=%d -> None (no arena for total=%d)", _pn, len(keys),
+                            int(self._canonical_kv_extents.total_bytes))
+            return None
+        sfx = self._suffix_for_key(keys[0])[0]
+        stems = [k + sfx for k in keys]
+        n = 0
+        _states = arena.find_states(stems)
+        for st in _states:
+            if st != 2:
+                break
+            n += 1
+        # prefix trace (IN 26.09.): every distinct (keys, leading, first stem)
+        # of a probe whose rest (keys - leading, in KEYS: one per token at the
+        # 27B's page size 1) is >= the trace minimum -- the break stem is what
+        # an ARENA-DROP's dropped keys are joined against.
+        _traced = False
+        if _prefix_trace.on() and len(keys) - n >= _prefix_trace.min_tokens():
+            _traced = _prefix_trace.once("1439", len(keys), n, stems[0])
+        if _traced or _pn <= 24 or _pn % 512 == 0:
+            # xsn327/328: the dormant hit query answers 0 while P completed the
+            # pages; xsn328 showed leading_complete=64 of 4314 -- name the state
+            # at the break and the state census over the asked range.
+            _hist = {}
+            for st in _states:
+                _hist[int(st)] = _hist.get(int(st), 0) + 1
+            _brk = int(_states[n]) if n < len(_states) else -1
+            _brk_stem = stems[n] if n < len(stems) else "-"
+            # xsn334: the keys equal P's (first_mismatch=None) and pages 64.. are
+            # still 'state 0' while dormant -- is the INDEX entry gone (slot -1)
+            # or the slot FREE (slot >= 0)? Plus the arena's own counters.
+            try:
+                _fs2, _st2 = arena.find_slots_np(stems[n:n + 2]) if n < len(stems) else ([], [])
+                _brk_slots = [(int(a), int(b)) for a, b in zip(list(_fs2), list(_st2))]
+            except Exception as exc:  # noqa: BLE001
+                _brk_slots = f"n/a:{type(exc).__name__}"
+            try:
+                _ast = arena.stats()
+            except Exception as exc:  # noqa: BLE001
+                _ast = f"n/a:{type(exc).__name__}"
+            logger.info("#1439 ARENA-PRESENT n=%d keys=%d leading_complete=%d break_state=%d break_stem=%s break_slots=%s stats=%s census=%s first_stem=%s arena=%s%s",
+                        _pn, len(keys), n, _brk, _brk_stem[:64], _brk_slots, _ast, sorted(_hist.items()), stems[0][:64], getattr(arena, "path", "?"),
+                        (" trace=1 break_stem_full=%s" % _brk_stem) if _traced else "")
+        return n
+
+    def _readable_stems(self, stems: List[str]) -> List[str]:
+        """The subset of ``stems`` a reader can serve (``_stem_readable``'s
+        rule: canonical stems only at the canonical width), batched. A
+        complete page in the shared arena counts before the disk is asked."""
+        in_arena = set()
+        if self._arena_dir() and stems:
+            by_total: dict = {}
+            for stem in stems:
+                total = self._canonical_total_for_stem(stem)
+                if total is not None:
+                    by_total.setdefault(int(total), []).append(stem)
+            for total, group in by_total.items():
+                arena = self._arena_for(total)
+                if arena is None:
+                    continue
+                for stem, hit in zip(group, arena.lookup(group)):
+                    if hit:
+                        in_arena.add(stem)
+        rest = [s for s in stems if s not in in_arena]
+        sizes = self._stat_stems(rest) if rest else {}
+        out = [s for s in stems if s in in_arena]
+        _first_missing = None
+        for stem in rest:
+            size = sizes.get(stem)
+            if size is None:
+                if _first_missing is None:
+                    _first_missing = (stem, "no-file")
+                continue
+            total = self._canonical_total_for_stem(stem)
+            if total is None or int(size) == int(total):
+                out.append(stem)
+            elif _first_missing is None:
+                _first_missing = (stem, f"partial size={size} total={total}")
+        if _first_missing is not None:
+            # #1472 READ-TRACE: what the reader could NOT serve, and why.  The
+            # short store reads on group D during the flip (weg2xsn229-231:
+            # delivered 4095 of 98210, 20+ s after P served the prompt) had no
+            # line naming the first unreadable page or the path that refused it.
+            _n = getattr(type(self), "_1472_n", 0) + 1
+            type(self)._1472_n = _n
+            if _n <= 40 or _n % 200 == 0:
+                logger.info("#1472 READ-TRACE n=%d asked=%d readable=%d arena_hits=%d first_missing=%s why=%s arena_dir=%s",
+                            _n, len(stems), len(out), len(in_arena), _first_missing[0][:48], _first_missing[1],
+                            bool(self._arena_dir()))
+        return out
+
+    def _canonical_total_for_stem(self, stem: str) -> Optional[int]:
+        """The canonical width a stem's file must have to be readable, or None."""
+        if self._canonical_kv_extents is None:
+            return None
+        suffix = self.kv_config_suffix
+        if not suffix or not stem.endswith(suffix):
+            return None
+        bare = stem[: -len(suffix)]
+        if self.canonical_mamba_blob is not None and bare.endswith(
+            f".{PoolName.MAMBA}"
+        ):
+            return int(self.canonical_mamba_blob.total_bytes)
+        if self.canonical_draft_page is not None and self._is_draft_key(bare):
+            return int(self.canonical_draft_page.total_bytes)
+        if "." not in bare:
+            return int(self._canonical_kv_extents.total_bytes)
+        return None
+
+    def _stem_readable(self, stem: str) -> bool:
+        """Presence a reader can actually serve (#706 x #719, 0828).
+
+        A canonical stem counts only when its file has the canonical width;
+        a same-stem file of another width -- a leftover of a different format
+        era in a long-lived store -- would pass an existence check and then
+        refuse at `read_extents`, which is exactly the presence-vs-readability
+        drift the 0828 specimen paid a full re-prefill for. Non-canonical
+        stems keep the plain existence answer.
+        """
+        found = self._stat_stem(stem)
+        if found is None:
+            return False
+        total = self._canonical_total_for_stem(stem)
+        if total is None:
+            return True
+        return int(found[1]) == int(total)
+
+    # #706 x #719 (0828): occurrences of a refused presence probe, class-wide
+    # so the rate limit survives a backend re-attach.
+    _probe_mismatch_count = 0
+
+    def _canonical_probe_mismatch(self) -> Optional[str]:
+        """Fix 2 of the 0828 specimen: presence must not outrun readability.
+
+        `batch_exists_v2` promised pages by bare file existence while the
+        reader's window refused every one of them ("read target holds 32768
+        bytes but this KV page window is 8192 bytes"), so the issuance saw
+        hits the fetch could never deliver, the match collapsed to 0, and the
+        #928 anchor re-prefilled the WHOLE prefix. The compatibility between
+        the window and the pool the read path actually fills therefore
+        belongs in the probe itself: a store the current window cannot cut is
+        an honest cold miss, never a promise.
+
+        Returns the named mismatch, or None when the probe may answer. Pools
+        this backend was never given (bare-backend unit tests, non-hybrid
+        deployments) are not turned into a claim.
+        """
+        if self._canonical_kv_extents is None:
+            return None
+        pool = getattr(self, "mem_pool_host", None)
+        if pool is not None:
+            try:
+                page = pool.get_dummy_flat_data_page()
+                have = int(page.numel()) * int(page.element_size())
+            except Exception:  # noqa: BLE001 - verification is best-effort
+                have = None
+            kv_ext = self._canonical_kv_extents
+            want = (
+                None if isinstance(kv_ext, CanonicalAbstainWindow)
+                else int(kv_ext.buffer_bytes)
+            )
+            if have is not None and want is not None and have != want:
+                return (
+                    f"the KV window cuts {want} bytes but the bound host "
+                    f"pool's page is {have} bytes"
+                )
+        blob = self.canonical_mamba_blob
+        mamba_pool = (getattr(self, "registered_pools", None) or {}).get(
+            PoolName.MAMBA
+        )
+        if blob is not None and mamba_pool is not None:
+            try:
+                page = mamba_pool.get_dummy_flat_data_page()
+                have = int(page.numel()) * int(page.element_size())
+            except Exception:  # noqa: BLE001 - verification is best-effort
+                have = None
+            if have is not None and have != int(blob.payload_bytes):
+                return (
+                    f"the mamba window cuts {blob.payload_bytes} bytes but "
+                    f"the registered mamba pool's page is {have} bytes"
+                )
+        return None
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        mismatch = self._canonical_probe_mismatch()
+        if mismatch is not None:
+            HiCacheFile._probe_mismatch_count += 1
+            n = HiCacheFile._probe_mismatch_count
+            if n <= 3 or n % 100 == 0:
+                logger.error(
+                    "Canonical presence probe refused (occurrence %d): %s. "
+                    "Answering 0 hits -- an honest cold miss -- instead of "
+                    "promising pages the reader's window would refuse (the "
+                    "0828 specimen: a #719 rebind without a window rebuild).",
+                    n,
+                    mismatch,
+                )
+            return PoolTransferResult(0, {}, keys_asked=len(keys))
+        # #1439 (xsn199 D profile): the presence probe of a 100k prompt was
+        # 27 % of D's re-admission -- 300k stems formatted, hashed and
+        # looked up one by one in Python. Now: the leading KV prefix that is
+        # COMPLETE in the arena comes from ONE C call (arena_find_stems, the
+        # hash in C too); only what the arena does not hold goes through the
+        # old per-key path, and the component pools are asked lazily for
+        # exactly the pages the trailing rule inspects.
+        kv_fast = self._arena_kv_present_prefix(keys)
+        if kv_fast is not None:
+            rest = keys[kv_fast:]
+            # #1473: LONGEST-PREFIX means STOP AT THE FIRST MISS.  The probe
+            # walked every remaining key through `_readable_stems` (Python per
+            # stem: canonical width, arena lookup, stat) before it took the
+            # prefix -- 94k stems for a fresh 100k prompt, ~1 s in the
+            # scheduler thread of PP0 at every request change (py-spy
+            # weg2xsn223: 150 of 3516 samples in _readable_stems/_stat_stems;
+            # #1466 PASS-STALL input_ms 400-1400).  Chunked in key order, the
+            # walk ends at the chunk holding the first miss: a new prompt costs
+            # one chunk.
+            kv_pages = kv_fast
+            _CH = 512
+            for _off in range(0, len(rest), _CH):
+                _chunk = rest[_off:_off + _CH]
+                existing_rest = self._collect_existing_component_keys(_chunk, None)
+                _hit = next(
+                    (i for i in range(len(_chunk))
+                     if f"{self._get_component_key(_chunk[i])}.bin" not in existing_rest),
+                    len(_chunk),
+                )
+                kv_pages += _hit
+                if _hit < len(_chunk):
+                    break
+            # #1439b (xsn200 D profile): the trailing rule walked prefix_len
+            # downwards asking has_component() per page -- for the mamba
+            # blob that is up to one chunk (4096) of single lookups per pool,
+            # 18 % of D's re-admission. One C call per pool over all kv_pages
+            # stems answers every page at once; the disk is asked only for a
+            # page the arena does not hold.
+            _bulk: dict = {}
+            _memo: dict = {}
+
+            def _bulk_states(name: str):
+                if name in _bulk:
+                    return _bulk[name]
+                states = None
+                try:
+                    if kv_pages and self._arena_dir():
+                        k0 = keys[0] if name in (None, "__default__", PoolName.KV) else f"{keys[0]}.{name}"
+                        win = self._canonical_window(k0)
+                        arena = self._arena_for(int(win.total_bytes)) if win is not None else None
+                        if arena is not None:
+                            sfx = self._suffix_for_key(k0)[0]
+                            tail = "" if name in (None, "__default__", PoolName.KV) else f".{name}"
+                            stems = [f"{k}{tail}{sfx}" for k in keys[:kv_pages]]
+                            states = arena.find_states(stems)
+                except Exception:  # noqa: BLE001 - fall back to the per-page path
+                    states = None
+                _bulk[name] = states
+                return states
+
+            _l3bulk: dict = {}
+
+            def _bulk_l3(name: str):
+                """xsn362 (py-spy PP0, prefetch thread 517/1316 samples): the
+                trailing rule asked has_component per page, and every page the
+                arena does not hold went through _readable_stems([k]) -- a
+                lookup, a canonical-width derivation and an L3 stat, one page at
+                a time, ~4k times per pool for a fresh prompt. The shared L3
+                index answers all pages of a pool in ONE call; a stem it does
+                not list is on no disk, so the per-page path runs only for the
+                stems it names."""
+                if name in _l3bulk:
+                    return _l3bulk[name]
+                present = None
+                try:
+                    _idx = self._l3_index()
+                    if _idx is not None and kv_pages:
+                        stems = [self._get_component_key(k, name) for k in keys[:kv_pages]]
+                        present = _idx.has(stems)
+                except Exception:  # noqa: BLE001 - fall back to the per-page path
+                    present = None
+                _l3bulk[name] = present
+                return present
+
+            _rbulk: dict = {}
+            def _bulk_readable(name: str, states, l3):
+                """xsn381 (py-spy PP0, prefetch thread 320/1066 samples): every
+                page the arena did not hold COMPLETE but the L3 index listed
+                still went through _readable_stems([k]) one page at a time
+                (an arena lookup, a width derivation, a stat -- per page).
+                ONE batched call per pool for all such pages; the answer is a
+                set the per-page rule reads."""
+                if name in _rbulk:
+                    return _rbulk[name]
+                try:
+                    idx = [i for i in range(kv_pages)
+                           if not (states is not None and i < len(states) and states[i] == 2)
+                           and not (l3 is not None and i < len(l3) and not l3[i])]
+                    stems = [self._get_component_key(keys[i], name) for i in idx]
+                    present = set(self._readable_stems(stems)) if stems else set()
+                except Exception:  # noqa: BLE001 - fall back to the per-page path
+                    present = None
+                _rbulk[name] = present
+                return present
+            def has_component(page_idx: int, name: str) -> bool:
+                states = _bulk_states(name)
+                if states is not None and page_idx < len(states) and states[page_idx] == 2:
+                    return True
+                l3 = None
+                if states is not None and page_idx < len(states):
+                    l3 = _bulk_l3(name)
+                    if l3 is not None and page_idx < len(l3) and not l3[page_idx]:
+                        return False   # neither COMPLETE in the arena nor on any disk
+                k = self._get_component_key(keys[page_idx], name)
+                v = _memo.get(k)
+                if v is None:
+                    rb = _bulk_readable(name, states, l3)
+                    v = (k in rb) if rb is not None else bool(self._readable_stems([k]))
+                    _memo[k] = v
+                return v
+        else:
+            existing_files = self._collect_existing_component_keys(keys, pool_transfers)
+
+            def has_component(page_idx: int, name: str) -> bool:
+                return (
+                    f"{self._get_component_key(keys[page_idx], name)}.bin" in existing_files
+                )
+            kv_pages = next(
+                (
+                    i
+                    for i in range(len(keys))
+                    if f"{self._get_component_key(keys[i])}.bin" not in existing_files
+                ),
+                len(keys),
+            )
+
+        hit_count: dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+        #: pools whose boundary came back exactly 0 -- the set `hit_count`
+        #: structurally cannot hold. See PoolTransferResult's arithmetic block.
+        _zero_capped: list[str] = []
+
+        # #1035 R13: THE MISS THAT LOOKS LIKE SILENCE.
+        # `#1028B` below only fires when a COMPONENT cap moved the number
+        # (`final_pages != kv_pages`). When the KV prefix itself is 0 the claim
+        # is already zero and nothing prints -- so "storage genuinely has
+        # nothing for this key" and "everything is fine" are the SAME log, which
+        # is how a dead read path can look healthy for a whole campaign. Say it
+        # once per occurrence, rate-limited, and say which of the two it is.
+        if kv_pages == 0 and keys:
+            self._1035r13_n = getattr(self, "_1035r13_n", 0) + 1
+            if self._1035r13_n <= 40 or self._1035r13_n % 256 == 0:
+                logger.warning(
+                    "#1035 R13 EMPTY KV PREFIX n=%d: storage holds NO leading "
+                    "page for this key set (keys=%d) -- an honest cold miss, "
+                    "not a component cap. Distinguishing this from a capped "
+                    "claim is the whole point: #1028B stays silent here "
+                    "because final==kv==0.",
+                    self._1035r13_n,
+                    len(keys),
+                )
+
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+            name = transfer.name
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                boundary = next(
+                    (i for i in range(kv_pages) if not has_component(i, name)), kv_pages
+                )
+            else:  # trailing_pages
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                boundary = 0
+                for prefix_len in range(kv_pages, 0, -1):
+                    if all(
+                        has_component(i, name)
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
+                    ):
+                        boundary = prefix_len
+                        break
+            if boundary:
+                hit_count[name] = boundary
+            if not getattr(transfer, "caps_claim", True):
+                # #1233: presence-only pool (the draft page). Its boundary is
+                # reported above; the consumer decides trim vs. cold-by-name
+                # from it, so it must not pull the KV claim down here.
+                continue
+            if not boundary:
+                # THE ABSENCE THAT LOOKS LIKE CONSENT. `hit_count` records only
+                # non-zero boundaries, so a pool capped to exactly 0 vanishes
+                # from it and its `caps={}` reads as "nothing capped this" when
+                # it means "this capped it to nothing". Recorded here as a NAME
+                # rather than added to `hit_count`, because that dict is read by
+                # live consumers (`mamba_component`, `swa_component`,
+                # `unified_radix_cache`) and adding a zero entry would change a
+                # decision. This list changes none.
+                _zero_capped.append(str(name))
+            final_pages = min(final_pages, boundary)
+
+        # #1028B THE CAP, NAMED. This `min` is the only place that decides how
+        # much of an existing KV prefix a prefetch may actually claim, and it
+        # printed NOTHING: measured 2026-08-30 on boot `boot_855_1028fence`,
+        # the strings `final_pages`, `kv_pages`, `boundary=` and `hit_pages`
+        # each occur 0 times in the whole 5.87 MB log. The consequence was
+        # that a completion of 3072 against a 13179-token prompt could not be
+        # attributed -- "the mamba anchors are too sparse" and "the KV prefix
+        # in storage is short" produce the SAME number here and were not
+        # separable from that boot at all.
+        #
+        # Both terms on one line, so the next boot answers it directly:
+        # `kv` is the longest contiguous KV prefix present in storage and
+        # `final` is what survives the component caps; when they differ, the
+        # component named in `caps` is the binding constraint.
+        if final_pages != kv_pages:
+            self._1028b_n = getattr(self, "_1028b_n", 0) + 1
+            if self._1028b_n <= 40 or self._1028b_n % 256 == 0:
+                # `lost` is the REALISED loss of this claim: pages that exist
+                # in storage and were given up. It is the quantity the
+                # no-double-prefill law (#939) bounds at ONE chunk, so it is
+                # printed as a number rather than left to be subtracted by
+                # whoever reads the line.
+                #
+                # NOTE FOR THE READER OF `caps`: an empty dict does NOT mean
+                # "no component cap applied". `hit_count[name]` is only
+                # assigned `if boundary`, so a component whose boundary came
+                # out 0 -- the total-miss case, which is exactly the one that
+                # zeroes the claim -- leaves NO entry behind. Empty caps next
+                # to final=0 therefore means "a component found no anchor in
+                # this span at all", the opposite of "nothing capped it".
+                # #1035b WHERE IS THE NEAREST ANCHOR? `claimed=0 caps={}` is
+                # produced by two different worlds and the line above cannot
+                # tell them apart:
+                #   (i)  anchors ARE inside the queried range but not at a
+                #        reachable trailing position -- a GRANULARITY problem,
+                #        fixed by publishing anchors more often; or
+                #   (ii) the queried range was cut SHORT of the nearest anchor
+                #        -- a SPAN problem (the prefetch span is truncated, or
+                #        the node boundary simply lies past the last queried
+                #        key), where denser publication inside the span would
+                #        change nothing.
+                # Building the density step without separating these is exactly
+                # the "fix an unverified root" move that has already cost this
+                # strand two roots, so the discriminator is printed at the
+                # failure point rather than argued: for each capped component,
+                # how many of its blobs exist among the queried keys and the
+                # DEEPEST index carrying one (-1 = none at all). Computed only
+                # on the rate-limited logging path.
+                _anchor_probe = {}
+                for _t in pool_transfers or []:
+                    if _t.name == PoolName.KV:
+                        continue
+                    _present = [
+                        i for i in range(len(keys)) if has_component(i, _t.name)
+                    ]
+                    _anchor_probe[_t.name] = (
+                        len(_present),
+                        _present[-1] if _present else -1,
+                    )
+                logger.warning(
+                    "#1028B FETCH CAP n=%d: kv=%d claimed=%d lost=%d caps=%s "
+                    "keys=%d #1035b anchors_in_range(count,deepest_idx)=%s",
+                    self._1028b_n,
+                    kv_pages,
+                    final_pages,
+                    kv_pages - final_pages,
+                    {k: v for k, v in hit_count.items() if k != PoolName.KV},
+                    len(keys),
+                    _anchor_probe,
+                )
+
+        return PoolTransferResult(
+            final_pages,
+            hit_count,
+            keys_asked=len(keys),
+            kv_uncapped=kv_pages,
+            zero_capped_pools=tuple(_zero_capped),
+        )
+
+    def _log_key(self, pool_name: str, key: str) -> str:
+        """The component stem for one pool's page -- READ AND WRITE ALIKE.
+
+        #1062: the #969G instrument lives HERE now, because this is the funnel
+        that is actually symmetric: ``_write_page`` and ``_read_page`` both call
+        it, so a key printed here can be compared across the two directions.
+        Its previous home (``_get_component_key``) has five call sites and none
+        of them writes, so it observed read keys only and its silence meant
+        nothing.
+
+        NO RATE LIMIT, AND THE SUPPRESSED COUNT IS PRINTED. The old probe
+        sampled ``_n <= 60 or _n % 1024`` and printed 602 lines against a
+        population of 235520 on boot 30 -- 0.3 %, in which an absence proves
+        nothing (denominator law). Sampling is kept only as an explicit cap with
+        its own counter, so the log stays bounded AND the reader is told exactly
+        how many keys were not shown.
+        """
+        out = key if pool_name == PoolName.KV else f"{key}.{pool_name}"
+        _969g_trace("io", pool_name, out)
+        return out
+
+    def _read_buffer_pool(self, pool_name: str, host_pool):
+        """#720: the reusable read target for this pool, or None (today's path).
+
+        Built lazily, once per registered pool, because the page size is the
+        pool's and is only known here. ``0`` -- the default -- keeps the
+        per-read fresh allocation exactly as it was.
+        """
+        capacity = int(envs.FLLIPER_HICACHE_READ_BUFFERS.get() or 0)
+        if capacity <= 0:
+            return None
+        pools = getattr(self, "_read_buffers", None)
+        if pools is not None and pool_name in pools:
+            return pools[pool_name]
+        # WAKE-PARALLEL: several aux threads may ask first at once -- one ring
+        # per pool, never two pinned rings of which one leaks
+        with _read_ring_lock:
+            return self._read_buffer_pool_locked(pool_name, host_pool, capacity)
+
+    def _read_buffer_pool_locked(self, pool_name: str, host_pool, capacity: int):
+        pools = getattr(self, "_read_buffers", None)
+        if pools is None:
+            pools = self._read_buffers = {}
+        pool = pools.get(pool_name)
+        if pool is None:
+            from flliper.srt.mem_cache.read_buffer_pool import ReadBufferPool
+
+            probe = host_pool.get_dummy_flat_data_page()
+            _page_bytes = int(probe.numel()) * int(probe.element_size())
+            # Boot xsn130 (2026-09-15): the ring is per REGISTERED pool, and
+            # the Mamba anchor pool's "page" is one 46.76 MiB state blob --
+            # 256 of them pinned per rank = 11.7 GiB, six ranks, shmem
+            # 30 -> 67 GiB inside 30 s, W98 PdFlipHostRateLatched stopped the
+            # boot. The count is a KV-page count; every pool's ring is capped
+            # by BYTES (FLLIPER_HICACHE_READ_BUFFER_MIB, default 64 MiB), so a
+            # blob-sized page gets one or two buffers and a 32 KiB page keeps
+            # its 256.
+            try:
+                _ring_mib = float(os.environ.get("FLLIPER_HICACHE_READ_BUFFER_MIB", "64"))
+            except ValueError:
+                _ring_mib = 64.0
+            _cap = max(1, min(int(capacity), int((_ring_mib * (1 << 20)) // max(1, _page_bytes))))
+            pool = ReadBufferPool(
+                name=f"HiCache read buffers [{pool_name}]",
+                flag="FLLIPER_HICACHE_READ_BUFFERS",
+                capacity=_cap,
+                page_bytes=_page_bytes,
+                factory=host_pool.get_dummy_flat_data_page,
+            )
+            pools[pool_name] = pool
+        return pool
+
+    def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
+        """Read one page from storage into host_pool at page_offset."""
+        from flliper.srt.mem_cache.read_buffer_pool import borrowed
+
+        storage_key = self._log_key(pool_name, key)
+        buffers = self._read_buffer_pool(pool_name, host_pool)
+        with borrowed(buffers, host_pool.get_dummy_flat_data_page) as target:
+            data_page = self.get(storage_key, target)
+            if data_page is None:
+                return False
+            host_pool.set_from_flat_data_page(page_offset, data_page)
+        return True
+
+    def _write_page(
+        self, pool_name: str, key: str, host_pool, page_offset: int
+    ) -> bool:
+        """Write one page from host_pool at page_offset to storage as raw bytes."""
+        storage_key = self._log_key(pool_name, key)
+        data_page = host_pool.get_data_page(page_offset, flat=True)
+        return self.set(storage_key, data_page)
+
+    def _batch_io_v2(self, transfers: List[PoolTransfer], op_fn):
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            host_pool = self.registered_pools[transfer.name]
+            keys = transfer.keys or []
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            expected = len(keys) * page_size
+            host_indices = transfer.host_indices
+
+            if host_indices is None or host_indices.numel() != expected:
+                logger.error(
+                    "%s indices length mismatch for %s: expected %s, got %s",
+                    op_fn.__name__,
+                    transfer.name,
+                    expected,
+                    host_indices.numel() if host_indices is not None else 0,
+                )
+                results[transfer.name] = [False] * len(keys)
+                continue
+
+            # #1427 Stufe 4b: a pool that lives in the arena resolves COMPLETE
+            # blobs in place (slot id over the placeholder, no copy); only the
+            # keys it does not hold go through the per-key read.
+            pre = None
+            resolver = getattr(host_pool, "arena_resolve_reads", None)
+            # #1427e: `op_fn is self._read_page` was always False -- a bound
+            # method is a fresh object per attribute access -- so the resolver
+            # never ran on the metal (xsn190/191) and every read fell into the
+            # per-key copy. Compare by name.
+            is_read = getattr(op_fn, "__name__", "") == "_read_page"
+            if is_read and callable(resolver):
+                try:
+                    pre = resolver(self, host_indices, [self._log_key(transfer.name, k) for k in keys])
+                except Exception:  # noqa: BLE001 - fall back to the copy path
+                    logger.warning("#1427 arena resolve failed for %s", transfer.name, exc_info=True)
+                    pre = None
+            # #1427e: a placeholder or arena id is never a row the per-key copy
+            # can land in -- on the READ side that is a miss (False), on the
+            # write side the page is in the store already (True); the raise
+            # inside the storage thread took a rank down (xsn191).
+            _is_ph = getattr(host_pool, "is_placeholder", None)
+            _is_ar = getattr(host_pool, "is_arena_id", None)
+            def _one(i, key):
+                if pre is not None and pre[i] is not None:
+                    return pre[i]
+                idx = host_indices[i * page_size].item()
+                if callable(_is_ph) and _is_ph(idx):
+                    return not is_read
+                if callable(_is_ar) and _is_ar(idx):
+                    return not is_read
+                ok = op_fn(transfer.name, key, host_pool, idx)
+                if ok and is_read:
+                    self._qsa_sidecar_trace("read", transfer.name, key, host_pool, idx)
+                return ok
+            if is_read and getattr(op_fn, "__func__", None) is HiCacheFile._read_page:
+                batched = self._batch_read_extra(
+                    transfer.name, keys, host_pool, host_indices, page_size, pre, _is_ph, _is_ar
+                )
+                if batched is not None:
+                    results[transfer.name] = batched
+                    continue
+            results[transfer.name] = [_one(i, key) for i, key in enumerate(keys)]
+        return results
+
+    def _extra_page_spec(self, pool_name, host_pool):
+        """(numel, dtype) of one flat page of this extra pool -- probed once
+        (``get_dummy_flat_data_page`` allocates a pinned page per call)."""
+        specs = getattr(self, "_extra_page_specs", None)
+        if specs is None:
+            specs = self._extra_page_specs = {}
+        spec = specs.get(pool_name)
+        if spec is None:
+            probe = host_pool.get_dummy_flat_data_page()
+            spec = specs[pool_name] = (int(probe.numel()), probe.dtype)
+        return spec
+
+    def _batch_read_extra(self, pool_name, keys, host_pool, host_indices, page_size, pre, is_ph, is_ar):
+        """#1416g: the extra pools' pages of one prefetch in ONE ``batch_get``.
+
+        NF z30e (ca2a9706ec, boot ...stvsyncbar1dauer09282117): PP0's store
+        read is ``kv`` 1-3 ms (the arena addresses the KV pages in place) and
+        ``extra`` 35-695 ms, linear in pages (~0.22 ms/page: 1275 pages 301 ms,
+        256 pages 55 ms) -- the QSA index sidecar went through ``_read_page``
+        one page at a time (window lookup, arena read of one stem, borrowed
+        buffer, per-layer setter). ``batch_get`` serves the same pages with
+        one arena call per width and one ``pageio.read_pages`` for the rest
+        (#1402, the KV route since xsn134), into one staging block, then one
+        ``set_from_flat_data_pages``. Same stores, same bytes, same misses;
+        returns None when there is nothing to batch (the per-key path runs).
+        """
+        out: List[Optional[bool]] = [None] * len(keys)
+        todo = []
+        for i, key in enumerate(keys):
+            if pre is not None and pre[i] is not None:
+                out[i] = pre[i]
+                continue
+            idx = int(host_indices[i * page_size])
+            if (callable(is_ph) and is_ph(idx)) or (callable(is_ar) and is_ar(idx)):
+                out[i] = False  # a placeholder / arena id is never a copy target
+                continue
+            todo.append((i, key, idx))
+        if len(todo) < 2:
+            return None
+        numel, dtype = self._extra_page_spec(pool_name, host_pool)
+        # zeros, as the per-key path's fresh dummy page: an abstaining
+        # window (#239 F14) returns its target unread
+        stage = torch.zeros((len(todo), numel), dtype=dtype)
+        got = self.batch_get(
+            [self._log_key(pool_name, key) for _, key, _ in todo],
+            [stage[j] for j in range(len(todo))],
+        )
+        ok_rows, ok_idx = [], []
+        for j, ((i, key, idx), page) in enumerate(zip(todo, got)):
+            out[i] = page is not None
+            if page is not None:
+                ok_rows.append(j)
+                ok_idx.append(idx)
+        if ok_idx:
+            pages = stage if len(ok_rows) == len(todo) else stage[torch.tensor(ok_rows, dtype=torch.int64)]
+            host_pool.set_from_flat_data_pages(ok_idx, pages)
+            for (i, key, idx), page in zip(todo, got):
+                if page is not None:
+                    self._qsa_sidecar_trace("read", pool_name, key, host_pool, idx)
+        n = getattr(self, "_1416g_n", 0) + 1
+        self._1416g_n = n
+        if n <= 8 or n % 256 == 0:
+            logger.info(
+                "#1416g EXTRA-BATCH-READ pool=%s pages=%d read=%d miss=%d pre=%d (n=%d): one "
+                "batch_get + one set_from_flat_data_pages instead of a per-page read",
+                str(pool_name), len(keys), len(ok_idx), len(todo) - len(ok_idx),
+                sum(1 for v in (pre or ()) if v is not None), n,
+            )
+        return [bool(v) for v in out]
+
+    def _qsa_sidecar_trace(self, side: str, pool_name, key: str, host_pool, idx: int) -> None:
+        """fnFL2x56 (Task #106): the byte content of the index page, per layer
+        block, on BOTH sides of the carrier -- `FLLIPER_QSA_SIDECAR_TRACE=N`
+        prints the first N pages a process writes or reads. P prints the
+        blocks of its own layers (in canonical order), D all twelve; equal
+        sums for the same key on both sides prove the carrier, unequal ones
+        name the side. Off by default (0)."""
+        if str(pool_name) != str(PoolName.QSA_INDEXER):
+            return
+        try:
+            budget = int(os.environ.get("FLLIPER_QSA_SIDECAR_TRACE", "0") or 0)
+        except ValueError:
+            budget = 0
+        if budget <= 0:
+            return
+        # x57: one budget for both directions let D's own control writes use
+        # up the read lines; the budget is PER SIDE.
+        counters = getattr(self, "_qsa_trace_n", None)
+        if counters is None:
+            counters = self._qsa_trace_n = {"write": 0, "read": 0}
+        if counters.get(side, 0) >= budget:
+            return
+        counters[side] = counters.get(side, 0) + 1
+        try:
+            page = host_pool.get_data_page(idx, flat=True)
+            blocks = page.view(torch.uint8).reshape(int(host_pool.layer_num), -1).to(torch.int64)
+            sums = blocks.sum(dim=1).tolist()
+            head = page.view(torch.uint8)[:8].tolist()
+            logger.info(
+                "#106T qsa page %s key=%s idx=%d layers=%d block_sums=%s head=%s",
+                side, str(key)[:20], int(idx), int(host_pool.layer_num), sums, head,
+            )
+        except Exception as exc:  # noqa: BLE001 -- an instrument never fails the IO
+            logger.info("#106T qsa page %s key=%s idx=%d trace failed: %r", side, str(key)[:20], int(idx), exc)
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        return self._batch_io_v2(transfers, self._read_page)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        """#1402: the extra pools (draft pages, mamba blobs) write through
+        the same batched path as the KV pages -- boot xsn138 still spent
+        the publish sweep's thread in _write_page -> get_data_page -> set,
+        one Python canonical write per draft page."""
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            host_pool = self.registered_pools[transfer.name]
+            keys = transfer.keys or []
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            expected = len(keys) * page_size
+            host_indices = transfer.host_indices
+            if host_indices is None or host_indices.numel() != expected:
+                logger.error(
+                    "_write_page indices length mismatch for %s: expected %s, got %s",
+                    transfer.name,
+                    expected,
+                    host_indices.numel() if host_indices is not None else 0,
+                )
+                results[transfer.name] = [False] * len(keys)
+                continue
+            starts = [int(host_indices[i * page_size]) for i in range(len(keys))]
+            batched = getattr(host_pool, "get_data_pages", None)
+            if batched is not None:
+                pages = batched(starts)
+            else:
+                pages = [host_pool.get_data_page(s, flat=True) for s in starts]
+            storage_keys = [self._log_key(transfer.name, key) for key in keys]
+            results[transfer.name] = self._batch_set_each(storage_keys, pages)
+            for key, start, ok in zip(keys, starts, results[transfer.name]):
+                if ok:
+                    self._qsa_sidecar_trace("write", transfer.name, key, host_pool, start)
+        return results
+
+    def capacity_stats(self) -> Optional[dict]:
+        stats = self._evictor.stats()
+        stats["file_path"] = self.file_path
+        return stats
+
+    def resize(
+        self,
+        *,
+        max_size_bytes: Optional[int] = None,
+        min_free_bytes: Optional[int] = None,
+    ) -> Optional[dict]:
+        stats = self._evictor.set_limits(
+            max_size_bytes=max_size_bytes, min_free_bytes=min_free_bytes
+        )
+        stats["file_path"] = self.file_path
+        return stats
+
+    def check_disk_space(self, force: bool = False) -> bool:
+        """Run the free-space watchdog; False means writes are stopped.
+
+        Called from the storage worker loop so a filesystem that fills up is
+        noticed while the backend is idle, not only when the next page happens
+        to be written.
+        """
+        return self._evictor.check_free_space(force=force)
+
+    def clear(self, force: bool = False) -> bool:
+        # L3P (review 28.09.): a PERSISTENT store (its launcher identity file is
+        # present) is what the next boot reattaches to; one clear wipes every
+        # page of this model identity -- the energy planner's cold-prefill flush
+        # did exactly that on a measurement server of the same identity. Only an
+        # explicit force clears it.
+        if not force and os.path.isfile(os.path.join(self.file_path, "L3_IDENTITY.json")):
+            logger.error(
+                "W166 PdFlipL3ClearRefused: HiCacheFile store %s is the persistent L3 store of "
+                "this model identity (L3_IDENTITY.json); a clear would remove every page the "
+                "next boot reattaches to. Refused -- clear with force=true "
+                "(POST /hicache/storage-backend/clear?force=1) if that is meant.",
+                self.file_path,
+            )
+            return False
+        _idx = self._l3_index()
+        if _idx is not None:
+            _idx.clear()  # #1459
+        try:
+            for dirpath, _dirnames, filenames in os.walk(self.file_path):
+                for filename in filenames:
+                    file_path = os.path.join(dirpath, filename)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+            self._evictor.clear()
+            if self.metadata_cache is not None:
+                self.metadata_cache.clear()
+            logger.info("Cleared all entries in HiCacheFile storage.")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear HiCacheFile storage: {e}")
+            return False
+
+
+
+def clear_storage(backend, force: bool = False) -> bool:
+    """Clear a storage backend; ``force`` reaches a backend whose ``clear``
+    takes it (HiCacheFile: a persistent L3 store refuses without it). A backend
+    returning None counts as done (the upstream contract)."""
+    try:
+        ok = backend.clear(force=force)
+    except TypeError:
+        ok = backend.clear()
+    return ok is not False
+
+
+class FormAWorkerNullStorage(HiCacheStorage):
+    """The storage tier of a Form A EXPERT WORKER (fnFL2 v16, 21.09.).
+
+    A worker holds no attention layer, so its KV host pool is 0 bytes/token
+    and the canonical page store refuses it a window ("a rank with no bytes
+    ... must not take part in the protocol"). It still runs the SAME HiCache
+    control path as the attention host: the prefetch progress is MIN-reduced
+    over the whole tp group (hiradix_cache._all_reduce_attn_groups falls
+    back to tp_group when the attention groups are trivial), so a worker
+    without a storage tier would hang the host in that collective, and a
+    worker answering "miss" would drag every group decision to zero and
+    starve the P->D KV carrier. This backend therefore claims every page
+    (the MIN is decided by the host, which holds the bytes), moves nothing,
+    and writes nothing -- the store's completeness markers come from the
+    ranks that own bytes.
+    """
+
+    #: fnFL2x22: in the PACKED claim vote ([claim, -claim] MIN, cache_controller
+    #: .encode_claim_vote) "claims every page" is not neutral -- it would set
+    #: the group's MAX and the host's anchor-capped claim beside it reads as a
+    #: rank disagreement (W-STOP). A tier with no bytes abstains instead.
+    abstains_from_claim_vote = True
+
+    def __init__(self, storage_config=None):
+        self.storage_config = storage_config
+        self.mem_pool_host = None
+        self.registered_pools = {}
+        self.canonical_kv_page = None
+        self.canonical_mamba_blob = None
+        self.canonical_draft_page = None
+
+    # --- v1 ---------------------------------------------------------
+    def get(self, key, target_location=None, target_sizes=None):
+        return target_location
+
+    def batch_get(self, keys, target_locations=None, target_sizes=None):
+        if target_locations is not None:
+            return list(target_locations)
+        return [b""] * len(keys)
+
+    def set(self, key, value=None, target_location=None, target_sizes=None) -> bool:
+        return True
+
+    def batch_set(self, keys, values=None, target_locations=None, target_sizes=None) -> bool:
+        return True
+
+    def exists(self, key: str) -> bool:
+        return True
+
+    def batch_exists(self, keys, extra_info=None) -> int:
+        return len(keys)
+
+    # --- v2 ---------------------------------------------------------
+    def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
+        return PoolTransferResult(
+            kv_hit_pages=len(keys),
+            extra_pool_hit_pages={
+                str(t.name): len(t.keys or []) for t in (pool_transfers or [])
+            },
+            keys_asked=len(keys),
+        )
+
+    def batch_get_v2(self, transfers, extra_info=None):
+        return {str(t.name): [True] * len(t.keys or []) for t in transfers}
+
+    def batch_set_v2(self, transfers, extra_info=None):
+        return {str(t.name): [True] * len(t.keys or []) for t in transfers}
+
+    # --- housekeeping ------------------------------------------------
+    def register_mem_pool_host(self, mem_pool_host):
+        self.mem_pool_host = mem_pool_host
+
+    def register_mem_host_pool_v2(self, host_pool, host_pool_name):
+        self.registered_pools[host_pool_name] = host_pool
+
+    def get_stats(self):
+        return None
+
+    def clear(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def check_disk_space(self, force: bool = False) -> bool:
+        return True
+
+
+#: L3-FAST (28.09.): parallel page reads on the STORE path (the prefetch aux
+#: thread / a fill caller), never in the scheduler's round. pageio releases the
+#: GIL once per call, so N calls on N threads read N files at a time -- measured
+#: on the 27B store (445k 32-KiB pages, NVMe): 1 call 11.7k pages/s, 8 threads
+#: 62k, 16 threads 106k, 32 threads 115k. FLLIPER_HICACHE_L3_READ_THREADS
+#: (default 16; 1 = the serial single call as before).
+L3_READ_THREADS_ENV = "FLLIPER_HICACHE_L3_READ_THREADS"
+L3_READ_THREADS_DEFAULT = 16
+L3_PARALLEL_MIN_PAGES = 64
+_l3_pool = None
+_l3_pool_n = 0
+_l3_pool_lock = threading.Lock()
+_read_ring_lock = threading.Lock()
+
+
+def l3_read_threads() -> int:
+    try:
+        n = int(os.environ.get(L3_READ_THREADS_ENV, "") or L3_READ_THREADS_DEFAULT)
+    except ValueError:
+        n = L3_READ_THREADS_DEFAULT
+    return max(1, min(64, n))
+
+
+def _l3_executor(n: int):
+    global _l3_pool, _l3_pool_n
+    with _l3_pool_lock:
+        if _l3_pool is None or _l3_pool_n != n:
+            from concurrent.futures import ThreadPoolExecutor
+
+            _l3_pool = ThreadPoolExecutor(max_workers=n, thread_name_prefix="l3-read")
+            _l3_pool_n = n
+        return _l3_pool
+
+
+#: BS (28.09., 27B rc12z26 P 17:18:02): a page at least this large (the 27B
+#: Mamba anchor blob, 78446592 B) is read in pieces of L3_SPLIT_CHUNK_BYTES by
+#: the pool -- "#1433 L3->L2 fill: 1 of 1 pages ... threads=1 ms=281" was 72 %
+#: of that request's read. Desk, same XFS NVMe, cold file, fresh shm target:
+#: one pread 52 ms (1.5 GB/s), 8 x 4 MiB 23 ms (3.3 GB/s).
+L3_SPLIT_MIN_BYTES = 8 << 20
+L3_SPLIT_CHUNK_BYTES = 4 << 20
+
+
+def _l3_read_split(pio, paths, total_bytes: int, ptrs, k: int):
+    """Every page of ``paths`` in ``L3_SPLIT_CHUNK_BYTES`` pieces across ``k``
+    pool threads, each piece a pread at its offset into the page's own target
+    (``ptrs[i] + off``); a page's status is its first failing piece's (the
+    size check runs per piece against the whole file)."""
+    total = int(total_bytes)
+    pieces = [(i, off, min(L3_SPLIT_CHUNK_BYTES, total - off))
+              for i in range(len(paths)) for off in range(0, total, L3_SPLIT_CHUNK_BYTES)]
+    k = min(k, len(pieces))
+    groups = [pieces[g::k] for g in range(k)]
+
+    def one(group):
+        return pio.read_pages([paths[i] for i, _o, _l in group], [total] * len(group),
+                              [((o, l),) for _i, o, l in group],
+                              [int(ptrs[i]) + o for i, o, _l in group], True)
+
+    rc = [0] * len(paths)
+    for group, res in zip(groups, _l3_executor(k).map(one, groups)):
+        for (i, _o, _l), r in zip(group, res):
+            if r != 0 and rc[i] == 0:
+                rc[i] = r
+    return rc, k
+
+
+def l3_read_pages_parallel(pio, paths, total_bytes: int, ptrs, threads: Optional[int] = None):
+    """``(status per page, threads used)`` -- the pages read into ``ptrs``
+    split across ``threads`` concurrent pageio calls (strided, so every call
+    gets a spread of the batch); status as ``PageIO.read_pages``. A page of
+    ``L3_SPLIT_MIN_BYTES`` or more is itself read in pieces (BS)."""
+    n = len(paths)
+    k = l3_read_threads() if threads is None else max(1, int(threads))
+    ext = ((0, int(total_bytes)),)
+    if k > 1 and n and int(total_bytes) >= L3_SPLIT_MIN_BYTES:
+        return _l3_read_split(pio, paths, total_bytes, ptrs, k)
+    if k <= 1 or n < L3_PARALLEL_MIN_PAGES:
+        return pio.read_pages(paths, [int(total_bytes)] * n, [ext] * n, ptrs, True), 1
+    k = min(k, n)
+    groups = [list(range(g, n, k)) for g in range(k)]
+
+    def one(idx):
+        return pio.read_pages([paths[i] for i in idx], [int(total_bytes)] * len(idx),
+                              [ext] * len(idx), [ptrs[i] for i in idx], True)
+
+    rc = [4] * n
+    for idx, res in zip(groups, _l3_executor(k).map(one, groups)):
+        for i, r in zip(idx, res):
+            rc[i] = r
+    return rc, k

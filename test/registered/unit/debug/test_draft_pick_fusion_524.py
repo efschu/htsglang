@@ -27,7 +27,7 @@ Hermetic: CPU tensors only, no CUDA, no distributed backend.
 import pytest
 import torch
 
-from sglang.srt.speculative.spec_utils import (
+from flliper.srt.speculative.spec_utils import (
     draft_pick_payload_bytes,
     pack_draft_picks,
     unpack_draft_picks,

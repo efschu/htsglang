@@ -31,7 +31,7 @@ import os
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -54,7 +54,7 @@ class TestCardProbeReaderMatchesTheRig(unittest.TestCase):
         self._tmp.cleanup()
 
     def _write(self, uuids, driver, *, mtime, tag):
-        from sglang.srt.rigmon.card_probe import (  # noqa: PLC0415
+        from flliper.srt.rigmon.card_probe import (  # noqa: PLC0415
             CARD_PROBE_VERSION,
             card_probe_cache_path,
         )
@@ -77,7 +77,7 @@ class TestCardProbeReaderMatchesTheRig(unittest.TestCase):
         return path
 
     def _load(self, uuids, driver):
-        from sglang.srt.rigmon.card_probe import (  # noqa: PLC0415
+        from flliper.srt.rigmon.card_probe import (  # noqa: PLC0415
             matching_cached_probe_json,
         )
 
@@ -109,7 +109,7 @@ class TestCardProbeReaderMatchesTheRig(unittest.TestCase):
         self.assertEqual(self._load([self.C, self.A, self.B], "580.01")["tag"], "full")
 
     def test_an_unreadable_file_is_skipped_not_raised_on(self):
-        from sglang.srt.rigmon.card_probe import (  # noqa: PLC0415
+        from flliper.srt.rigmon.card_probe import (  # noqa: PLC0415
             card_probe_cache_path,
         )
 
@@ -125,7 +125,7 @@ class TestCardProbeReaderMatchesTheRig(unittest.TestCase):
         # Without NVML we cannot attribute a probe to this rig. A miss has a
         # remedy path (solver_api._card_probe_remedy); a wrong hit does not.
         self._write([self.A, self.B], "580.01", mtime=2000, tag="whatever")
-        from sglang.srt.rigmon.card_probe import (  # noqa: PLC0415
+        from flliper.srt.rigmon.card_probe import (  # noqa: PLC0415
             matching_cached_probe_json,
         )
 
@@ -135,10 +135,10 @@ class TestCardProbeReaderMatchesTheRig(unittest.TestCase):
 
     def test_both_readers_go_through_it(self):
         """The two audit sites, exercised as themselves."""
-        from sglang.srt.planner.rig_profile_source import (  # noqa: PLC0415
+        from flliper.srt.planner.rig_profile_source import (  # noqa: PLC0415
             _latest_card_probe,
         )
-        from sglang.srt.planner.solver_api import cached_card_probe  # noqa: PLC0415
+        from flliper.srt.planner.solver_api import cached_card_probe  # noqa: PLC0415
 
         self._write([self.A, self.B, self.C], "580.01", mtime=1000, tag="full")
         self._write([self.A, self.B], "580.01", mtime=2000, tag="subset")
@@ -171,7 +171,7 @@ class _FakeArgs:
 
 class TestHiCacheIdentityCarriesTheShardVector(unittest.TestCase):
     def _h(self, **kw):
-        from sglang.srt.mem_cache.hicache_storage import (  # noqa: PLC0415
+        from flliper.srt.mem_cache.hicache_storage import (  # noqa: PLC0415
             compute_model_identity_hash,
         )
 
@@ -211,7 +211,7 @@ class TestHiCacheIdentityCarriesTheShardVector(unittest.TestCase):
         self.assertEqual(self._h(), legacy)
 
     def test_the_storage_config_can_carry_it(self):
-        from sglang.srt.mem_cache.hicache_storage import (  # noqa: PLC0415
+        from flliper.srt.mem_cache.hicache_storage import (  # noqa: PLC0415
             HiCacheStorageConfig,
         )
 
@@ -278,7 +278,7 @@ class _FakeSA:
 
 class TestMeasuredKvBudgetFingerprint(unittest.TestCase):
     def _f(self, **kw):
-        from sglang.srt.uneven_perf import (  # noqa: PLC0415
+        from flliper.srt.uneven_perf import (  # noqa: PLC0415
             measured_kv_budget_fingerprint_fields,
         )
 
@@ -322,7 +322,7 @@ class TestMeasuredKvBudgetFingerprint(unittest.TestCase):
 
 class TestGraphMemAnchorKey(unittest.TestCase):
     def _k(self, **kw):
-        from sglang.srt.planner.graphmem import anchor_key  # noqa: PLC0415
+        from flliper.srt.planner.graphmem import anchor_key  # noqa: PLC0415
 
         meta = {
             "model_path": "/models/Qwen3.6-27B",
@@ -358,7 +358,7 @@ class TestGraphMemAnchorKey(unittest.TestCase):
         self.assertTrue(self._k().startswith("v2|"))
 
     def test_the_boot_log_parser_supplies_the_new_fields(self):
-        from sglang.srt.planner.graphmem import parse_boot_meta  # noqa: PLC0415
+        from flliper.srt.planner.graphmem import parse_boot_meta  # noqa: PLC0415
 
         text = (
             "server_args=ServerArgs(model_path='/models/X', tp_size=3, "

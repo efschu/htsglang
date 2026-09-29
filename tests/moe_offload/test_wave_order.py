@@ -26,8 +26,8 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.environ import envs  # noqa: E402
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.environ import envs  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     plan_expert_waves,
     plan_token_waves,
     resolve_wave_order,
@@ -237,7 +237,7 @@ def test_per_wave_partial_sums_would_reassociate():
 
 
 def test_wave_order_default_is_token():
-    assert envs.SGLANG_MOE_OFFLOAD_WAVE_ORDER.get() == "token"
+    assert envs.FLLIPER_MOE_OFFLOAD_WAVE_ORDER.get() == "token"
 
 
 @pytest.mark.parametrize(

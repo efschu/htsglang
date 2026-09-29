@@ -12,7 +12,7 @@ otherwise. Mirrors ``test_kda_prefill_cutedsl.py``.
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 # SM90+ single-GPU kernel-unit suite. Disabled in CI: flash_kda is not in the
 # public runner image, and the module-level pytest.skip aborts non-zero under
@@ -39,8 +39,8 @@ except ImportError:
         allow_module_level=True,
     )
 
-from sglang.srt.layers.attention.fla.kda import chunk_kda  # noqa: E402
-from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (  # noqa: E402
+from flliper.srt.layers.attention.fla.kda import chunk_kda  # noqa: E402
+from flliper.srt.layers.attention.linear.kernels.kda_flashkda import (  # noqa: E402
     FlashKDAKernel,
 )
 

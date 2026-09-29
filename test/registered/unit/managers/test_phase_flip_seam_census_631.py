@@ -15,7 +15,7 @@ trough attributed to the wrong stage sends the fix to the wrong module.
 
 import unittest
 
-from sglang.srt.managers import phase_flip_seam_census as census
+from flliper.srt.managers import phase_flip_seam_census as census
 
 MIB = 1024 * 1024
 

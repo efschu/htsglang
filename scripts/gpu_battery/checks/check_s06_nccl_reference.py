@@ -155,7 +155,7 @@ def check(step_dir: str) -> None:
 def _check_loadable(payload: dict) -> None:
     add_repo_to_path()
     try:
-        from sglang.srt.distributed.device_communicators.barlink_path_rates import (
+        from flliper.srt.distributed.device_communicators.barlink_path_rates import (
             load_nccl_reference,
         )
     except Exception as exc:

@@ -65,9 +65,9 @@ export LD_LIBRARY_PATH="$H_SP/nvidia/cu13/lib"
 export PATH="$SUB/usr/local/cuda-12.9/bin:\$PATH"
 export CUDA_HOME="$SUB/usr/local/cuda-12.9"
 export TORCH_EXTENSIONS_DIR="$H_EXTCACHE"
-export SGLANG_BARLINK=1
-export SGLANG_BARLINK_TRANSPORT=bar1
-export SGLANG_BARLINK_BAR1_NV_SOURCE="$H_NVSRC"
+export FLLIPER_BARLINK=1
+export FLLIPER_BARLINK_TRANSPORT=bar1
+export FLLIPER_BARLINK_BAR1_NV_SOURCE="$H_NVSRC"
 setsid "$H_PY" "$H_WT/benchmark/bar1_graph_check.py" $ARGS > "$H_LOG" 2>&1 &
 echo \$! > "$H_PIDF"
 echo "started pid \$(cat $H_PIDF)"

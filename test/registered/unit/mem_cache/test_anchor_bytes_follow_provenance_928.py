@@ -117,9 +117,9 @@ WHAT EACH TEST HOLDS DOWN
 
 import unittest
 
-from sglang.srt.managers.gdn_flip_mover import install_phase_aware_mamba_state_pool
-from sglang.srt.managers.phase_flip_runtime import PHASE_PP, PHASE_TP
-from sglang.srt.mem_cache.mamba_state_pool import (
+from flliper.srt.managers.gdn_flip_mover import install_phase_aware_mamba_state_pool
+from flliper.srt.managers.phase_flip_runtime import PHASE_PP, PHASE_TP
+from flliper.srt.mem_cache.mamba_state_pool import (
     active_mamba_state_pool,
     anchor_bytes_reachable,
     anchor_provenance_verdict,
@@ -319,7 +319,7 @@ class TestProvenanceIsRecordedAtTheTreeInsert928(unittest.TestCase):
     """
 
     def _component(self, cache, ct):
-        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+        from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
             MambaComponent,
         )
 

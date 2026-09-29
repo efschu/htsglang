@@ -42,10 +42,10 @@ import unittest
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.model_executor import weights_arena
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.model_executor import weights_arena
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -86,7 +86,7 @@ def _resident(image: torch.Tensor) -> float:
 
 def _make_layout(nbytes: int):
     """A one-slot layout of ``nbytes``, which is all the refill needs."""
-    from sglang.srt.model_executor.weights_arena import ArenaLayout, ArenaSlot
+    from flliper.srt.model_executor.weights_arena import ArenaLayout, ArenaSlot
 
     slot = ArenaSlot(
         name="w",
@@ -135,9 +135,9 @@ class TestStagedRefillRouting(CustomTestCase):
 
     def test_env_switch_moves_both_ways(self):
         """The A/B has to be runnable on ONE binary, so the switch must switch."""
-        with envs.SGLANG_PHASE_FLIP_REFILL_STAGED.override(True):
+        with envs.FLLIPER_PHASE_FLIP_REFILL_STAGED.override(True):
             self.assertTrue(weights_arena._staged_refill_enabled())
-        with envs.SGLANG_PHASE_FLIP_REFILL_STAGED.override(False):
+        with envs.FLLIPER_PHASE_FLIP_REFILL_STAGED.override(False):
             self.assertFalse(weights_arena._staged_refill_enabled())
 
     def test_file_backed_image_keeps_a_read_fd(self):
@@ -147,8 +147,8 @@ class TestStagedRefillRouting(CustomTestCase):
         stays empty and the refill has nothing to read from.
         """
         with tempfile.TemporaryDirectory(dir="/tmp") as d:
-            with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-                with envs.SGLANG_PHASE_FLIP_IMAGE_DIR.override(d):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+                with envs.FLLIPER_PHASE_FLIP_IMAGE_DIR.override(d):
                     total = 1 << 20
                     image = weights_arena._file_backed_image(total)
             meta = weights_arena._file_backed_meta(image)
@@ -172,8 +172,8 @@ class TestStagedRefillOnDevice(CustomTestCase):
 
     def _image(self, d, payload: bytes):
         total = len(payload) + weights_arena._CHECKSUM_BYTES
-        with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_DIR.override(d):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_DIR.override(d):
                 image = weights_arena._file_backed_image(total)
         image[: len(payload)] = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
         csum = weights_arena.uint8_checksum(image[: len(payload)])
@@ -220,7 +220,7 @@ class TestStagedRefillOnDevice(CustomTestCase):
         with tempfile.TemporaryDirectory(dir="/tmp") as d:
             image, layout = self._image(d, payload)
             arena = torch.zeros(len(payload), dtype=torch.uint8, device="cuda")
-            with envs.SGLANG_PHASE_FLIP_REFILL_STAGED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_REFILL_STAGED.override(True):
                 weights_arena.arena_refill(arena, layout, image)
             self.assertEqual(bytes(arena.cpu().numpy().tobytes()), payload)
 
@@ -230,7 +230,7 @@ class TestStagedRefillOnDevice(CustomTestCase):
         with tempfile.TemporaryDirectory(dir="/tmp") as d:
             image, layout = self._image(d, payload)
             arena = torch.zeros(len(payload), dtype=torch.uint8, device="cuda")
-            with envs.SGLANG_PHASE_FLIP_REFILL_STAGED.override(False):
+            with envs.FLLIPER_PHASE_FLIP_REFILL_STAGED.override(False):
                 weights_arena.arena_refill(arena, layout, image)
             self.assertEqual(bytes(arena.cpu().numpy().tobytes()), payload)
 
@@ -263,7 +263,7 @@ class TestStagedRefillOnDevice(CustomTestCase):
             # was not actually cold and nothing below means anything.
             comparand = torch.zeros(len(payload), dtype=torch.uint8, device="cuda")
             before = _majflt()
-            with envs.SGLANG_PHASE_FLIP_REFILL_STAGED.override(False):
+            with envs.FLLIPER_PHASE_FLIP_REFILL_STAGED.override(False):
                 weights_arena.arena_refill(comparand, layout, image)
             mapped_faults = _majflt() - before
             self.assertGreater(
@@ -282,7 +282,7 @@ class TestStagedRefillOnDevice(CustomTestCase):
             if _resident(image) > 0.1:
                 self.skipTest("second image did not come up cold")
             before = _majflt()
-            with envs.SGLANG_PHASE_FLIP_REFILL_STAGED.override(True):
+            with envs.FLLIPER_PHASE_FLIP_REFILL_STAGED.override(True):
                 weights_arena.arena_refill(arena, layout, image)
             staged_faults = _majflt() - before
 

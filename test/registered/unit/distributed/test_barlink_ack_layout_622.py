@@ -23,24 +23,24 @@ import re
 import unittest
 from pathlib import Path
 
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     ackbase_a2a,
     ackbase_mesh,
     fbase_a2a,
     flags_requirement,
 )
-from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
+from flliper.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
     pipe_flags_extra,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 _EXT = (
     Path(__file__).resolve().parents[4]
-    / "python/sglang/srt/distributed/device_communicators/barlink_bar1_ext.py"
+    / "python/flliper/srt/distributed/device_communicators/barlink_bar1_ext.py"
 )
 
 _WORLDS = tuple(range(2, 9))

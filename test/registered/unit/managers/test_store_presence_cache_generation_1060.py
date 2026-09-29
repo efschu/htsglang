@@ -18,10 +18,10 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache import hicache_phase_binding as hpb
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache import hicache_phase_binding as hpb
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

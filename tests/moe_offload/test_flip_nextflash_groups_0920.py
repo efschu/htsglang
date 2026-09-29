@@ -8,19 +8,19 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.flip_nextflash_groups import (
+from flliper.srt.flip_nextflash_groups import (
     D_GROUP,
     FLIP_CONTEXT_TOKENS,
     GROUP_ENV_VALUES,
     GROUP_OWNED_ENV,
     P_GROUP,
     REQ_TO_TOKEN_EXTRA_MEASURED,
-    Weg2FlipGroupEnvInherited,
+    PdFlipGroupEnvInherited,
     build_flip_groups,
     build_group_env,
     solve_group_context,
 )
-from sglang.srt.flip_nextflash_plan import Weg2FlipKvRelayInfeasible
+from flliper.srt.flip_nextflash_plan import PdFlipKvRelayInfeasible
 
 
 # --------------------------------------------------------------------------
@@ -52,10 +52,10 @@ def test_the_run_fn7s2_default_max_total_tokens_refuses_at_262k():
     profiled capacity is the documented use of the flag), the boot comes up
     healthy, and the 259k needle fails. W113 moves it to the desk.
     """
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         solve_group_context(P_GROUP, 262144, 1, REQ_TO_TOKEN_EXTRA_MEASURED, 40000)
     msg = str(exc.value)
-    assert "W113 Weg2FlipKvRelayInfeasible" in msg
+    assert "W113 PdFlipKvRelayInfeasible" in msg
     assert "40000" in msg
     assert "262144" in msg
     # short by 262144 - 40000
@@ -76,7 +76,7 @@ def test_exactly_the_hybrid_cap_is_enough_and_one_below_is_not():
     ``context_tokens`` is sufficient; one token less is W113."""
     ok = solve_group_context(P_GROUP, 1000, 1, 0, 1000)
     assert ok.reachable_tokens == 1000
-    with pytest.raises(Weg2FlipKvRelayInfeasible):
+    with pytest.raises(PdFlipKvRelayInfeasible):
         solve_group_context(P_GROUP, 1000, 1, 0, 999)
 
 
@@ -99,18 +99,18 @@ def test_the_refusal_names_the_hybrid_cap_when_the_cap_is_what_binds():
 
 @pytest.mark.parametrize("bad", [0, -1, -262144])
 def test_a_non_context_is_refused(bad):
-    with pytest.raises(Weg2FlipKvRelayInfeasible):
+    with pytest.raises(PdFlipKvRelayInfeasible):
         solve_group_context(P_GROUP, bad)
 
 
 def test_a_non_positive_concurrency_is_refused_not_silently_uncapped():
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         solve_group_context(P_GROUP, 262144, 0)
     assert "max_running_requests=0" in str(exc.value)
 
 
 def test_a_zero_pool_is_refused():
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         solve_group_context(P_GROUP, 262144, 1, 7, 0)
     assert "not a pool" in str(exc.value)
 
@@ -121,10 +121,10 @@ def test_a_zero_pool_is_refused():
 def test_p_and_d_get_opposite_dcp_values():
     p = build_group_env(P_GROUP, {"PYTHONPATH": "/x"})
     d = build_group_env(D_GROUP, {"PYTHONPATH": "/x"})
-    assert p.env["SGLANG_UNEVEN_DCP"] == "1"
-    assert p.env["SGLANG_UNEVEN_DCP_WEIGHTED"] == "1"
-    assert d.env["SGLANG_UNEVEN_DCP"] == "0"
-    assert d.env["SGLANG_UNEVEN_DCP_WEIGHTED"] == "0"
+    assert p.env["FLLIPER_UNEVEN_DCP"] == "1"
+    assert p.env["FLLIPER_UNEVEN_DCP_WEIGHTED"] == "1"
+    assert d.env["FLLIPER_UNEVEN_DCP"] == "0"
+    assert d.env["FLLIPER_UNEVEN_DCP_WEIGHTED"] == "0"
     # the common part survives into both
     assert p.env["PYTHONPATH"] == d.env["PYTHONPATH"] == "/x"
 
@@ -140,15 +140,15 @@ def test_neither_group_unsets_the_axis():
 
 def test_an_inherited_dcp_in_the_common_env_is_refused_at_the_desk():
     """This is the bug the design's seam D describes: a re-exec into the
-    Form-A group with SGLANG_UNEVEN_DCP=1 inherited lands in RankRoleError
+    Form-A group with FLLIPER_UNEVEN_DCP=1 inherited lands in RankRoleError
     (rank_role.py:925-938) -- inside the GPU window. W116 is the same
     refusal, one layer earlier and free."""
-    base = {"PYTHONPATH": "/x", "SGLANG_UNEVEN_DCP": "1"}
-    with pytest.raises(Weg2FlipGroupEnvInherited) as exc:
+    base = {"PYTHONPATH": "/x", "FLLIPER_UNEVEN_DCP": "1"}
+    with pytest.raises(PdFlipGroupEnvInherited) as exc:
         build_group_env(D_GROUP, base)
     msg = str(exc.value)
-    assert "W116 Weg2FlipGroupEnvInherited" in msg
-    assert "SGLANG_UNEVEN_DCP" in msg
+    assert "W116 PdFlipGroupEnvInherited" in msg
+    assert "FLLIPER_UNEVEN_DCP" in msg
     assert "rank_role.py:925-938" in msg
     assert "Uneven nie ab" in msg
 
@@ -156,18 +156,18 @@ def test_an_inherited_dcp_in_the_common_env_is_refused_at_the_desk():
 def test_the_p_group_is_refused_the_same_inheritance():
     """Not an asymmetric rule: a value in the COMMON prefix is wrong for
     either group, even when it happens to match what P wants."""
-    with pytest.raises(Weg2FlipGroupEnvInherited):
-        build_group_env(P_GROUP, {"SGLANG_UNEVEN_DCP": "1"})
+    with pytest.raises(PdFlipGroupEnvInherited):
+        build_group_env(P_GROUP, {"FLLIPER_UNEVEN_DCP": "1"})
 
 
 def test_extra_env_may_not_smuggle_a_group_owned_axis():
-    with pytest.raises(Weg2FlipGroupEnvInherited) as exc:
-        build_group_env(D_GROUP, {}, {"SGLANG_UNEVEN_DCP_WEIGHTED": "0"})
+    with pytest.raises(PdFlipGroupEnvInherited) as exc:
+        build_group_env(D_GROUP, {}, {"FLLIPER_UNEVEN_DCP_WEIGHTED": "0"})
     assert "same bug one layer up" in str(exc.value)
 
 
 def test_an_unknown_group_is_refused():
-    with pytest.raises(Weg2FlipGroupEnvInherited):
+    with pytest.raises(PdFlipGroupEnvInherited):
         build_group_env("X", {})
 
 
@@ -184,8 +184,8 @@ def test_one_launcher_line_yields_two_groups_with_their_own_values():
         p_argv=("--tp-size", "1", "--pp-size", "3"),
         d_argv=("--tp-size", "3", "--pp-size", "1", "--rank-role", "host,worker,worker"),
     )
-    assert plan.p_env.env["SGLANG_UNEVEN_DCP"] == "1"
-    assert plan.d_env.env["SGLANG_UNEVEN_DCP"] == "0"
+    assert plan.p_env.env["FLLIPER_UNEVEN_DCP"] == "1"
+    assert plan.d_env.env["FLLIPER_UNEVEN_DCP"] == "0"
     assert plan.p_context.reachable_tokens >= 262144
     assert plan.d_context.reachable_tokens >= 262144
     assert "--pp-size" in plan.p_argv and "--rank-role" in plan.d_argv
@@ -197,7 +197,7 @@ def test_the_flip_refuses_when_only_the_p_side_carries_the_40000_default():
     """The realistic failure: the D template was fixed (270000) and the P
     template still carries run_fn7s2.sh's default. One group short is the
     whole flip short."""
-    with pytest.raises(Weg2FlipKvRelayInfeasible) as exc:
+    with pytest.raises(PdFlipKvRelayInfeasible) as exc:
         build_flip_groups(
             base_env={},
             p_max_total_tokens=40000,

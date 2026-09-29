@@ -20,7 +20,7 @@ numbers use the EFFECTIVE values only, never the nominal BAR size.
 | Q2 | the 256-MiB window is fully usable or effectively smaller (addressability, reservations) | capability_matrix effective_max_single_copy / effective_max_region_chunked vs nominal |
 | Q3 | direct D2D beats host staging, per direction and size -- including above the window boundary | d2d_bench ladder, knee around 255/256/257 MiB |
 | Q4 | both 3080 windows can be pressured simultaneously without collapsing | d2d_bench dual-window arm vs single-leg medians |
-| Q5 | custom allreduce becomes constructible (can_p2p gate) and, if so, whether it is BAR-limited | capability_matrix can_access_peer + a later guarded sglang boot; #195 fix is prerequisite (see below) |
+| Q5 | custom allreduce becomes constructible (can_p2p gate) and, if so, whether it is BAR-limited | capability_matrix can_access_peer + a later guarded flliper boot; #195 fix is prerequisite (see below) |
 | Q6 | a broadcast topology exists that exploits the asymmetry (full-BAR 5090 vs windowed 3080s) | d2d_bench directed asymmetry (into-3080 vs into-5090 rows) |
 
 ## Standing verdicts that assumed "no P2P"

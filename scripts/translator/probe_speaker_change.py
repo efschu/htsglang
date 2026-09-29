@@ -42,8 +42,8 @@ DEFAULT_EMBEDDER = Path(
 def load(path: Path, rate: int):
     import soundfile as sf
 
-    from sglang.srt.translator.audio import resample
-    from sglang.srt.translator.backends import AudioChunk
+    from flliper.srt.translator.audio import resample
+    from flliper.srt.translator.backends import AudioChunk
 
     samples, sr = sf.read(str(path), dtype="float32")
     if samples.ndim > 1:
@@ -53,7 +53,7 @@ def load(path: Path, rate: int):
 
 
 async def windows_of(embedder, chunk, window_s: float):
-    from sglang.srt.translator.backends import AudioChunk
+    from flliper.srt.translator.backends import AudioChunk
 
     rate = chunk.sample_rate
     width = int(window_s * rate)
@@ -66,8 +66,8 @@ async def windows_of(embedder, chunk, window_s: float):
 
 
 async def run(args) -> int:
-    from sglang.srt.translator.speakers import split_points_by_dispersion
-    from sglang.srt.translator.asr_backends import OnnxSpeakerEmbedder
+    from flliper.srt.translator.speakers import split_points_by_dispersion
+    from flliper.srt.translator.asr_backends import OnnxSpeakerEmbedder
 
     embedder = OnnxSpeakerEmbedder(args.embedder_model)
     rate = 16000
@@ -136,7 +136,7 @@ async def sweep(args) -> int:
     population, windows of DIFFERENT voices are the between-speaker one, and
     the gap between the two distributions is what a threshold may live in.
     """
-    from sglang.srt.translator.asr_backends import OnnxSpeakerEmbedder
+    from flliper.srt.translator.asr_backends import OnnxSpeakerEmbedder
 
     embedder = OnnxSpeakerEmbedder(args.embedder_model)
     rate = 16000

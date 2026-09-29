@@ -27,9 +27,9 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -83,7 +83,7 @@ class TestCanonicalPageUnderTokenCut(CustomTestCase):
             "--model-path", "dummy", "--tp-size", "3", "--page-size", "64",
             "--hicache-storage-backend", "file", "--hicache-canonical-kv-page",
         ]
-        with mock.patch.dict(os.environ, {"SGLANG_UNEVEN_DCP_WEIGHTED": "1"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_UNEVEN_DCP_WEIGHTED": "1"}):
             args = _parse(argv)
             self.assertIsNone(args.form_a_dcp_vector())
             with self.assertRaisesRegex(ValueError, "requires --page-size 1 under weighted uneven DCP"):

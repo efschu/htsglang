@@ -4,8 +4,8 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.models.utils import fused_qk_gemma_rmsnorm_with_gate
-from sglang.test.ci.ci_register import register_amd_ci
+from flliper.srt.models.utils import fused_qk_gemma_rmsnorm_with_gate
+from flliper.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 

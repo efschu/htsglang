@@ -40,7 +40,7 @@ done
 sleep 5
 after=$(find "$HICACHE_DIR" -type f 2>/dev/null | wc -l)
 echo "  files in $HICACHE_DIR: before=$before after=$after  bytes=$(du -sh "$HICACHE_DIR" 2>/dev/null | cut -f1)"
-curl -s -m 10 "$B/metrics" | grep -E "^sglang:(cache_hit_rate|cached_tokens_total)\{" | head -4
+curl -s -m 10 "$B/metrics" | grep -E "^flliper:(cache_hit_rate|cached_tokens_total)\{" | head -4
 
 say "5 preserve_thinking two-turn prefix reuse"
 if [ -f "$PROBE_DIR/probe_preserve_thinking.py" ]; then

@@ -5,7 +5,7 @@ allocated the pinning block when the memory history is armed."""
 
 import types
 
-from sglang.srt.model_executor import vram_family_census as vc
+from flliper.srt.model_executor import vram_family_census as vc
 
 
 def _snap():
@@ -17,7 +17,7 @@ def _snap():
                 "blocks": [
                     {"size": 440 * 2**20, "state": "active_allocated",
                      "frames": [{"filename": "/x/torch/foo.py", "line": 1, "name": "t"},
-                                {"filename": "/repo/python/sglang/srt/layers/moe/expert_offload.py", "line": 5190, "name": "presplit"}]},
+                                {"filename": "/repo/python/flliper/srt/layers/moe/expert_offload.py", "line": 5190, "name": "presplit"}]},
                     {"size": 760 * 2**20, "state": "inactive", "frames": []},
                 ],
             },
@@ -55,7 +55,7 @@ def test_report_survives_a_missing_snapshot(monkeypatch):
 
 def test_frame_str_skips_torch_internals():
     assert vc._frame_str([{"filename": "<string>", "line": 1, "name": "a"}]) == "?"
-    assert vc._frame_str([{"filename": "??", "line": 0, "name": "torch::unwind::unwind()"}, {"filename": "/r/python/sglang/x.py", "line": 3, "name": "f"}]) == "x.py:3 f"
+    assert vc._frame_str([{"filename": "??", "line": 0, "name": "torch::unwind::unwind()"}, {"filename": "/r/python/flliper/x.py", "line": 3, "name": "f"}]) == "x.py:3 f"
     assert vc._frame_str(None) == "?"
 
 

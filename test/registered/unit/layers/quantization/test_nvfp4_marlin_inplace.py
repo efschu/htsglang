@@ -8,7 +8,7 @@ repack is the pure-torch reference, which the upstream GPU test
 (test/registered/jit/test_gptq_marlin_repack.py) pins against gptq_marlin_repack.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -20,17 +20,17 @@ from unittest import mock
 import numpy as np
 import torch
 
-from sglang.srt.layers.quantization import fp4_utils
-from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
-from sglang.srt.layers.quantization import nvfp4_native_mixed as nm
-from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
-from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
-from sglang.srt.layers.quantization.marlin_utils_fp4 import nvfp4_marlin_process_scales
-from sglang.srt.layers.quantization.modelopt_quant import (
+from flliper.srt.layers.quantization import fp4_utils
+from flliper.srt.layers.quantization import nvfp4_marlin_inplace as mi
+from flliper.srt.layers.quantization import nvfp4_native_mixed as nm
+from flliper.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+from flliper.srt.layers.quantization.marlin_utils import marlin_permute_scales
+from flliper.srt.layers.quantization.marlin_utils_fp4 import nvfp4_marlin_process_scales
+from flliper.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 G = torch.Generator().manual_seed(38)
 
@@ -49,7 +49,7 @@ def _nibbles_kn(w_u8):
 
 
 def _marlin_weights_numpy(q_kn, perm):
-    """Verbatim algorithm of sglang.test.test_marlin_utils.marlin_weights
+    """Verbatim algorithm of flliper.test.test_marlin_utils.marlin_weights
     (marlin_permute_weights + numpy packing), which the upstream repack test
     compares with gptq_marlin_repack on GPU."""
     size_k, size_n = q_kn.shape
@@ -65,7 +65,7 @@ def _marlin_weights_numpy(q_kn, perm):
 
 
 def _upstream_perm():
-    from sglang.srt.layers.quantization.moe_wna16 import get_weight_perm
+    from flliper.srt.layers.quantization.moe_wna16 import get_weight_perm
 
     return get_weight_perm(4)
 
@@ -138,8 +138,8 @@ def _small_bands(band_bytes, chunk_bytes):
     with mock.patch.dict(
         os.environ,
         {
-            "SGLANG_FP4_NATIVE_MIXED_BAND_MIB": str(band_bytes),
-            "SGLANG_FP4_NATIVE_MIXED_CHUNK_MIB": str(chunk_bytes),
+            "FLLIPER_FP4_NATIVE_MIXED_BAND_MIB": str(band_bytes),
+            "FLLIPER_FP4_NATIVE_MIXED_CHUNK_MIB": str(chunk_bytes),
         },
     ):
         yield
@@ -207,12 +207,12 @@ def _backend(b):
         with (
             mock.patch.object(torch.Tensor, "cuda", lambda self, *a, **kw: self),
             mock.patch(
-                "sglang.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
+                "flliper.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
                 # the 5090 rank is sm_120 (native), the 3080 rank sm_86
                 return_value=(b == Fp4GemmRunnerBackend.CUTLASS),
             ),
             mock.patch(
-                "sglang.srt.layers.quantization.marlin_utils.marlin_make_workspace",
+                "flliper.srt.layers.quantization.marlin_utils.marlin_make_workspace",
                 side_effect=lambda dev, *a, **kw: torch.zeros(8, dtype=torch.int32),
             ),
         ):
@@ -381,13 +381,13 @@ class TestSm12xSeam(CustomTestCase):
     def test_the_5090_rank_asks_the_hook_and_none_falls_through(self):
         method, l_nat = _loaded_layer(Fp4GemmRunnerBackend.CUTLASS)
         with _backend(Fp4GemmRunnerBackend.CUTLASS), mock.patch(
-            "sglang.srt.layers.quantization.modelopt_quant.maybe_apply_sm12x_w4a16",
+            "flliper.srt.layers.quantization.modelopt_quant.maybe_apply_sm12x_w4a16",
             side_effect=lambda layer, x, bias, be: torch.ones(x.shape[0], 512) if x.shape[0] <= 4 else None,
         ) as hook:
             out = method.apply(l_nat, torch.randn(2, 512, dtype=torch.bfloat16))
             self.assertTrue(torch.equal(out, torch.ones(2, 512)))
             with mock.patch(
-                "sglang.srt.layers.quantization.modelopt_quant.fp4_quantize",
+                "flliper.srt.layers.quantization.modelopt_quant.fp4_quantize",
                 side_effect=RuntimeError("fell through to W4A4"),
             ), self.assertRaisesRegex(RuntimeError, "fell through"):
                 method.apply(l_nat, torch.randn(8, 512, dtype=torch.bfloat16))
@@ -397,7 +397,7 @@ class TestSm12xSeam(CustomTestCase):
     def test_the_3080_rank_never_reaches_the_hook(self):
         method, l_mar = _loaded_layer(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE)
         with _backend(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE), mock.patch(
-            "sglang.srt.layers.quantization.modelopt_quant.maybe_apply_sm12x_w4a16"
+            "flliper.srt.layers.quantization.modelopt_quant.maybe_apply_sm12x_w4a16"
         ) as hook, mock.patch.object(mi, "apply", return_value=torch.zeros(1)):
             method.apply(l_mar, torch.randn(2, 512, dtype=torch.bfloat16))
         hook.assert_not_called()
@@ -413,13 +413,13 @@ class TestFlipHooks(CustomTestCase):
     """weight_updater's two hooks, driven on a stub carrying their inputs."""
 
     def _stub(self, models, carrier):
-        from sglang.srt.managers.scheduler_components.weight_updater import (
+        from flliper.srt.managers.scheduler_components.weight_updater import (
             SchedulerWeightUpdaterManager as WU,
         )
 
         stub = mock.Mock()
-        stub._weg2_wake_models = lambda: models
-        stub._weg2_wake_weight_carrier = lambda: carrier
+        stub._pdflip_wake_models = lambda: models
+        stub._pdflip_wake_weight_carrier = lambda: carrier
         stub.CARRIER_EXCHANGE = WU.CARRIER_EXCHANGE
         return WU, stub
 
@@ -428,9 +428,9 @@ class TestFlipHooks(CustomTestCase):
         _, l_mar = _loaded_layer(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE)
         marlin_bytes = l_mar.weight.clone()
         WU, stub = self._stub([l_mar], "exchange")
-        WU._weg2_nvfp4_marlin_to_native(stub)
+        WU._pdflip_nvfp4_marlin_to_native(stub)
         self.assertTrue(torch.equal(l_mar.weight, l_nat.weight))  # the deposit reads native
-        WU._weg2_nvfp4_marlin_after_wake(stub)
+        WU._pdflip_nvfp4_marlin_after_wake(stub)
         self.assertTrue(torch.equal(l_mar.weight, marlin_bytes))
 
     def test_a_draft_reloaded_from_disk_keeps_its_own_stamp(self):
@@ -443,14 +443,14 @@ class TestFlipHooks(CustomTestCase):
         t_marlin, d_marlin = target.weight.clone(), draft.weight.clone()
         WU, stub = self._stub([target, draft], "exchange")
         stub.tp_worker.model_runner.model = target
-        stub._weg2_model_for_group = lambda g: draft if g == "D" else target
+        stub._pdflip_model_for_group = lambda g: draft if g == "D" else target
         target.weight.data.copy_(t_nat.weight)  # the exchange wrote native bytes
         target.weight_scale.data.copy_(t_nat.weight_scale)
-        stub._weg2_nvfp4_draft_disk_reloaded = True
-        WU._weg2_nvfp4_marlin_after_wake(stub)
+        stub._pdflip_nvfp4_draft_disk_reloaded = True
+        WU._pdflip_nvfp4_marlin_after_wake(stub)
         self.assertTrue(torch.equal(target.weight, t_marlin))
         self.assertTrue(torch.equal(draft.weight, d_marlin))  # untouched
-        self.assertFalse(stub._weg2_nvfp4_draft_disk_reloaded)  # read-and-clear
+        self.assertFalse(stub._pdflip_nvfp4_draft_disk_reloaded)  # read-and-clear
 
     def test_a_layer_shared_by_target_and_draft_is_converted_once(self):
         """rc9meas n4old (26.09.): the DFlash2 draft's lm_head IS the target's
@@ -473,19 +473,19 @@ class TestFlipHooks(CustomTestCase):
                   for l in (head, t_own, d_own)}
         WU, stub = self._stub([target, draft], "exchange")
         stub.tp_worker.model_runner.model = target
-        stub._weg2_model_for_group = lambda g: draft if g == "D" else target
-        stub._weg2_nvfp4_draft_disk_reloaded = False
+        stub._pdflip_model_for_group = lambda g: draft if g == "D" else target
+        stub._pdflip_nvfp4_draft_disk_reloaded = False
         logs = []
         for _flip in range(3):
             with mock.patch.object(mi.logger, "info", side_effect=logs.append):
-                WU._weg2_nvfp4_marlin_to_native(stub)
+                WU._pdflip_nvfp4_marlin_to_native(stub)
             for l, ref in ((head, h_nat), (t_own, t_nat), (d_own, d_nat)):
                 self.assertTrue(torch.equal(l.weight, ref.weight))  # the deposit reads native
                 # "the exchange" writes the peer's native bytes
                 l.weight.data.copy_(ref.weight)
                 l.weight_scale.data.copy_(ref.weight_scale)
             with mock.patch.object(mi.logger, "info", side_effect=logs.append):
-                WU._weg2_nvfp4_marlin_after_wake(stub)
+                WU._pdflip_nvfp4_marlin_after_wake(stub)
             for l in (head, t_own, d_own):
                 w, s = marlin[id(l)]
                 self.assertTrue(torch.equal(l.weight, w))
@@ -512,8 +512,8 @@ class TestFlipHooks(CustomTestCase):
         _, l_nat = _loaded_layer(Fp4GemmRunnerBackend.CUTLASS)
         before = l_nat.weight.clone()
         WU, stub = self._stub([l_nat], "exchange")
-        WU._weg2_nvfp4_marlin_to_native(stub)
-        WU._weg2_nvfp4_marlin_after_wake(stub)
+        WU._pdflip_nvfp4_marlin_to_native(stub)
+        WU._pdflip_nvfp4_marlin_after_wake(stub)
         self.assertTrue(torch.equal(l_nat.weight, before))
 
 
@@ -528,14 +528,14 @@ class TestExchangeClassesL4(CustomTestCase):
     )
 
     def test_native_mixed_boot_classes_them_under_their_linear(self):
-        from sglang.srt.weg2 import weight_exchange_shadow as sh
+        from flliper.srt.pdflip import weight_exchange_shadow as sh
 
         with mock.patch.dict(os.environ, {sh.NVFP4_NATIVE_LEAFS_ENV: "1"}):
             got = {sh.tensor_class(n) for n in self.NAMES}
         self.assertEqual(got, {"gate_up_proj", "down_proj"})
 
     def test_todays_marlin_class_names_unchanged(self):
-        from sglang.srt.weg2 import weight_exchange_shadow as sh
+        from flliper.srt.pdflip import weight_exchange_shadow as sh
 
         env = {k: v for k, v in os.environ.items() if k != sh.NVFP4_NATIVE_LEAFS_ENV}
         with mock.patch.dict(os.environ, env, clear=True):
@@ -548,8 +548,8 @@ class TestExchangeClassesL4(CustomTestCase):
             self.assertEqual(sh.tensor_class("model.layers.3.mlp.down_proj.weight_scale"), "down_proj")
 
     def test_launcher_sets_the_switch_only_for_native_mixed(self):
-        from sglang.srt.weg2 import launcher as L
-        from sglang.srt.weg2 import weight_exchange_shadow as sh
+        from flliper.srt.pdflip import launcher as L
+        from flliper.srt.pdflip import weight_exchange_shadow as sh
 
         self.assertEqual(
             L.fp4_native_mixed_env(L.uniform_marlin_argv("modelopt", True, True)),
@@ -567,9 +567,9 @@ class TestPlannerLanesL7(CustomTestCase):
     ]
 
     def test_native_mixed_scores_from_the_measured_record(self):
-        from sglang.srt import uneven_perf as up
+        from flliper.srt import uneven_perf as up
 
-        env = {k: v for k, v in os.environ.items() if k != "SGLANG_FP4_NATIVE_MIXED_SM8X"}
+        env = {k: v for k, v in os.environ.items() if k != "FLLIPER_FP4_NATIVE_MIXED_SM8X"}
         env[up.NVFP4_NATIVE_MIXED_ENV] = "1"
         with mock.patch.dict(os.environ, env, clear=True):
             scores, labels, warns = up.rank_gemm_scores(self.ENTRIES, "nvfp4_a4")
@@ -581,19 +581,19 @@ class TestPlannerLanesL7(CustomTestCase):
         self.assertEqual(warns, [])
 
     def test_marlin_opt_in_scores_the_marlin_lane(self):
-        from sglang.srt import uneven_perf as up
+        from flliper.srt import uneven_perf as up
 
-        with mock.patch.dict(os.environ, {up.NVFP4_NATIVE_MIXED_ENV: "1", "SGLANG_FP4_NATIVE_MIXED_SM8X": "marlin"}):
+        with mock.patch.dict(os.environ, {up.NVFP4_NATIVE_MIXED_ENV: "1", "FLLIPER_FP4_NATIVE_MIXED_SM8X": "marlin"}):
             scores, labels, _ = up.rank_gemm_scores(self.ENTRIES, "nvfp4_a4")
         self.assertEqual(scores, [805.4, 55.4, 55.4])
         self.assertIn("Marlin", labels[1])
 
     def test_profile_measurement_wins_over_the_record(self):
-        from sglang.srt import uneven_perf as up
+        from flliper.srt import uneven_perf as up
 
         entries = [dict(e) for e in self.ENTRIES]
         entries[1] = dict(entries[1], gemm_lanes={"nvfp4_w4a8": 57.0})
-        env = {k: v for k, v in os.environ.items() if k != "SGLANG_FP4_NATIVE_MIXED_SM8X"}
+        env = {k: v for k, v in os.environ.items() if k != "FLLIPER_FP4_NATIVE_MIXED_SM8X"}
         env[up.NVFP4_NATIVE_MIXED_ENV] = "1"
         with mock.patch.dict(os.environ, env, clear=True):
             scores, labels, _ = up.rank_gemm_scores(entries, "nvfp4_a4")
@@ -604,12 +604,12 @@ class TestPlannerLanesL7(CustomTestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             scores, labels, _ = up.rank_gemm_scores(entries, "nvfp4_a4")
         self.assertEqual(scores[1], 62.7)
-        with mock.patch.dict(os.environ, {up.NVFP4_NATIVE_MIXED_ENV: "1", "SGLANG_FP4_NATIVE_MIXED_SM8X": "marlin"}):
+        with mock.patch.dict(os.environ, {up.NVFP4_NATIVE_MIXED_ENV: "1", "FLLIPER_FP4_NATIVE_MIXED_SM8X": "marlin"}):
             scores, labels, _ = up.rank_gemm_scores(entries, "nvfp4_a4")
         self.assertEqual(scores[1], 57.0)
 
     def test_default_boot_is_the_pre_38_view(self):
-        from sglang.srt import uneven_perf as up
+        from flliper.srt import uneven_perf as up
 
         env = {k: v for k, v in os.environ.items() if k != up.NVFP4_NATIVE_MIXED_ENV}
         with mock.patch.dict(os.environ, env, clear=True):

@@ -39,7 +39,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "python"))
 
-from sglang.srt.model_loader.sparse_write import (  # noqa: E402
+from flliper.srt.model_loader.sparse_write import (  # noqa: E402
     PAGE_SIZE,
     SparseFileWriter,
     filesystem_supports_holes,

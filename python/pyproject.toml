@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", 
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sglang"
+name = "flliper"
 dynamic = ["version"]
-description = "SGLang is a fast serving framework for large language models and vision language models."
+description = "fLLiper is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -138,7 +138,7 @@ fastokens = [
 ]
 
 # Offline config-planner dashboard + its "Quality benchmark" chess-SVG
-# validator (sglang.srt.planner.quality_chess). CPU-only, no GPU: python-chess
+# validator (flliper.srt.planner.quality_chess). CPU-only, no GPU: python-chess
 # builds the ground-truth board and a reference SVG, cairosvg is the render
 # smoke-test, and defusedxml hardens SVG parsing against XXE (the model's SVG
 # is untrusted input). defusedxml is also pulled in transitively by cairosvg,
@@ -178,18 +178,18 @@ test = [
   "pytest",
   "pytest-cov",
   "sentence_transformers",
-  "sglang[fastokens]",
-  "sglang[planner]",
+  "flliper[fastokens]",
+  "flliper[planner]",
   "tabulate",
 ]
 
-dev = ["sglang[test]"]
+dev = ["flliper[test]"]
 
 all = [
-  "sglang[diffusion]",
-  "sglang[http2]",
-  "sglang[planner]",
-  "sglang[tracing]",
+  "flliper[diffusion]",
+  "flliper[http2]",
+  "flliper[planner]",
+  "flliper[tracing]",
 ]
 
 [tool.uv.extra-build-dependencies]
@@ -201,11 +201,11 @@ vsa = ["setuptools", "torch"]
 "Bug Tracker" = "https://github.com/efschu/fLLiper/issues"
 
 [project.scripts]
-sglang = "sglang.cli.main:main"
-killall_sglang = "sglang.cli.killall:main"
+flliper = "flliper.cli.main:main"
+killall_flliper = "flliper.cli.killall:main"
 
 [tool.setuptools.package-data]
-"sglang" = [
+"flliper" = [
   "srt/**/*",
   "jit_kernel/**/*",
   "multimodal_gen/apps/realtime_webui/**/*"
@@ -235,13 +235,13 @@ exclude = [
 
 [tool.setuptools_scm]
 root = ".."
-version_file = "sglang/_version.py"
+version_file = "flliper/_version.py"
 git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.1.0.dev0"
 
 [[tool.setuptools-rust.ext-modules]]
-target = "sglang.srt.grpc._core"
+target = "flliper.srt.grpc._core"
 path = "../rust/sglang-grpc/Cargo.toml"
 binding = "PyO3"
 

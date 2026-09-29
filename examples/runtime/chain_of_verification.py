@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chain-of-Verification (CoVe) example for reducing LLM hallucinations with SGLang.
+"""Chain-of-Verification (CoVe) example for reducing LLM hallucinations with fLLiper.
 
 This script implements the "Factored CoVe" pattern from:
   Dhuliawala et al. (2023) "Chain-of-Verification Reduces Hallucination in Large Language Models"
@@ -20,8 +20,8 @@ Flow
 
 Usage
 -----
-1. Launch an SGLang-compatible server, e.g.:
-     python -m sglang.launch_server \\
+1. Launch an fLLiper-compatible server, e.g.:
+     python -m flliper.launch_server \\
          --model-path meta-llama/Llama-3.1-8B-Instruct --port 30000
 
 2. Run this script:
@@ -122,7 +122,7 @@ def chain_of_verification(
 
     Parameters
     ----------
-    client:       OpenAI-compatible client pointing at an SGLang server.
+    client:       OpenAI-compatible client pointing at an fLLiper server.
     model:        Model identifier.
     user_query:   The question or request from the user.
     max_tokens:   Token budget per call.
@@ -213,13 +213,13 @@ def chain_of_verification(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Chain-of-Verification (CoVe) hallucination reduction demo for SGLang",
+        description="Chain-of-Verification (CoVe) hallucination reduction demo for fLLiper",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--base-url",
         default=DEFAULT_BASE_URL,
-        help="SGLang OpenAI-compatible API base URL",
+        help="fLLiper OpenAI-compatible API base URL",
     )
     parser.add_argument(
         "--model",
@@ -253,7 +253,7 @@ def main() -> None:
     try:
         model = resolve_model(client, args.model)
     except Exception as exc:
-        print(f"Failed to connect to SGLang server: {exc}", file=sys.stderr)
+        print(f"Failed to connect to fLLiper server: {exc}", file=sys.stderr)
         print(f"  Check server at {args.base_url}", file=sys.stderr)
         sys.exit(1)
 

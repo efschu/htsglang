@@ -1,4 +1,4 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=156, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=270, suite="stage-b-test-1-gpu-small-amd")
@@ -20,8 +20,8 @@ import pybase64
 import requests
 from PIL import Image
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 class TestVisionChunkedPrefill(CustomTestCase):
 
     def prepare_video_messages(self, video_path, max_frames_num=8):
-        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+        from flliper.srt.utils.video_decoder import VideoDecoderWrapper
 
         decoder = VideoDecoderWrapper(video_path)
         total_frame_num = len(decoder)

@@ -17,17 +17,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_quant
-from sglang.jit_kernel.dsv32 import (
+from flliper.jit_kernel.dsv4 import fused_q_indexer_rope_first_quant
+from flliper.jit_kernel.dsv32 import (
     fused_k_indexer_norm_rope,
     fused_k_indexer_norm_rope_store,
 )
-from sglang.jit_kernel.fused_store_index_cache import (
+from flliper.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.utils import is_hip
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 _is_hip = is_hip()
 
@@ -205,7 +205,7 @@ def test_q_strided_weight_matches_contiguous():
 
 def test_indexer_uses_replaced_rope_cache_for_fused_kernels():
     _skip_if_unavailable()
-    from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+    from flliper.srt.layers.attention.dsa.dsa_indexer import Indexer
 
     dev = "cuda"
     B, n_heads = 7, 64

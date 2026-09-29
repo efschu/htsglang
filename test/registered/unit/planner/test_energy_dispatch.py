@@ -29,16 +29,16 @@ phase 2.
 
 import unittest
 
-from sglang.srt.planner.key_solver import (
+from flliper.srt.planner.key_solver import (
     ENERGY_PRICEABLE_GOALS,
     _busy_seconds,
     _energy_objective_value,
     _energy_unscorable_reason,
     _objective_value,
 )
-from sglang.srt.planner.objective import EnergyModel, Provenance, RankPower
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner.objective import EnergyModel, Provenance, RankPower
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -191,7 +191,7 @@ class TestSolveDispatchContract(CustomTestCase):
 
     def test_energy_with_a_second_goal_is_refused(self):
         # A Pareto front over two THROUGHPUT goals is not an energy question.
-        from sglang.srt.planner import key_solver
+        from flliper.srt.planner import key_solver
 
         with self.assertRaises(ValueError) as ctx:
             key_solver.solve(
@@ -201,7 +201,7 @@ class TestSolveDispatchContract(CustomTestCase):
         self.assertIn("single-goal", str(ctx.exception))
 
     def test_energy_with_constraints_is_refused(self):
-        from sglang.srt.planner import key_solver
+        from flliper.srt.planner import key_solver
 
         with self.assertRaises(ValueError) as ctx:
             key_solver.solve(
@@ -211,7 +211,7 @@ class TestSolveDispatchContract(CustomTestCase):
         self.assertIn("constraints", str(ctx.exception))
 
     def test_an_unknown_objective_is_rejected(self):
-        from sglang.srt.planner import key_solver
+        from flliper.srt.planner import key_solver
 
         with self.assertRaises(ValueError):
             key_solver.solve(None, [1], [1], None, goal="dec", objective="cheap")
@@ -219,7 +219,7 @@ class TestSolveDispatchContract(CustomTestCase):
     def test_unknown_goal_still_wins_over_the_objective_check(self):
         # Goal validation runs first; an unknown goal must not be reported as
         # an objective problem.
-        from sglang.srt.planner import key_solver
+        from flliper.srt.planner import key_solver
 
         with self.assertRaises(ValueError) as ctx:
             key_solver.solve(None, [1], [1], None, goal="bogus", objective="energy")
@@ -242,7 +242,7 @@ class TestDefaultPathByteIdentical(CustomTestCase):
         # The dispatch is gated on the objective ONLY; with the default it
         # must not even ask whether the request is priceable, so a missing
         # energy model cannot affect a throughput solve.
-        from sglang.srt.planner import key_solver
+        from flliper.srt.planner import key_solver
 
         # An unknown goal raises for the same reason it always did -- proof
         # the throughput path reaches the original validation untouched.
@@ -272,7 +272,7 @@ class TestSolverApiThreading(CustomTestCase):
     """``--objective`` reaches the solver through the API layer."""
 
     def test_power_anchors_become_an_energy_model(self):
-        from sglang.srt.planner.solver_api import _energy_model_from_payload
+        from flliper.srt.planner.solver_api import _energy_model_from_payload
 
         em = _energy_model_from_payload(
             [
@@ -284,13 +284,13 @@ class TestSolverApiThreading(CustomTestCase):
         self.assertIs(em.provenance, Provenance.MEASURED)
 
     def test_absent_anchors_stay_absent(self):
-        from sglang.srt.planner.solver_api import _energy_model_from_payload
+        from flliper.srt.planner.solver_api import _energy_model_from_payload
 
         self.assertIsNone(_energy_model_from_payload(None))
         self.assertIsNone(_energy_model_from_payload([]))
 
     def test_anchors_default_to_the_estimate_tier(self):
-        from sglang.srt.planner.solver_api import _energy_model_from_payload
+        from flliper.srt.planner.solver_api import _energy_model_from_payload
 
         em = _energy_model_from_payload([{"idle_w": 32, "active_w": 320}])
         self.assertIs(em.provenance, Provenance.ESTIMATE)

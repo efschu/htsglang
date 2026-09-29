@@ -16,8 +16,8 @@ import asyncio
 import unittest
 from fractions import Fraction
 
-from sglang.srt.video_enhance.ring import OverloadPolicy, RingClosed
-from sglang.srt.video_enhance.streaming import (
+from flliper.srt.video_enhance.ring import OverloadPolicy, RingClosed
+from flliper.srt.video_enhance.streaming import (
     DEFAULT_WATERMARK_S,
     NO_MORE_FRAMES,
     NOT_YET,
@@ -30,8 +30,8 @@ from sglang.srt.video_enhance.streaming import (
     drain_to_sink,
     growing_frames,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

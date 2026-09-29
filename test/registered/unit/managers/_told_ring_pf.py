@@ -144,7 +144,7 @@ class Ring:
         self.box = []
         for s in self.stages:
             if channel:
-                s._weg2_fb_channel = MemChannel(self.box)
+                s._pdflip_fb_channel = MemChannel(self.box)
             assert m.armed(s)
         self.wire = {}
         self.pass_n = 0
@@ -181,7 +181,7 @@ class Ring:
                     continue
                 s.waiting_queue.remove(r)
                 s.admitted.append(
-                    (k - s.ps.pp_rank, r.rid, getattr(r, "_weg2_prefix_cap", None), credit)
+                    (k - s.ps.pp_rank, r.rid, getattr(r, "_pdflip_prefix_cap", None), credit)
                 )
         self.pass_n += 1
         self.clock.t += DT
@@ -218,11 +218,11 @@ def _scenarios():
     """(name, env, paced, read_s, script) -- script: list of (op, arg)."""
     return [
         ("paced-two", {}, True, _rs(0.5, 0.8), [("arrive", "aaaa-told"), ("run", 2), ("arrive", "bbbb-fresh"), ("run", 60)]),
-        ("paced-residual", {"SGLANG_WEG2_TOLD_PACE_CAP_S": "0.5"}, True, _rs(0.1, 2.0), [("arrive", "aaaa-told"), ("run", 80)]),
+        ("paced-residual", {"FLLIPER_PDFLIP_TOLD_PACE_CAP_S": "0.5"}, True, _rs(0.1, 2.0), [("arrive", "aaaa-told"), ("run", 80)]),
         ("single-phase", {}, False, _rs(0.5, 0.8), [("arrive", "aaaa-told"), ("run", 2), ("arrive", "bbbb-fresh"), ("run", 60)]),
         ("paced-abort", {}, True, _rs(0.2, 0.2), [("arrive", "aaaa-told"), ("run", 8), ("clear", None), ("run", 40)]),
-        ("paced-absolute", {"SGLANG_WEG2_TOLD_ABSOLUTE": "1"}, True, _rs(0.3, 0.4), [("arrive", "aaaa-told"), ("arrive", "cccc-slow"), ("run", 60)]),
-        ("paced-slow-follower", {"SGLANG_WEG2_TOLD_PACE_CAP_S": "0.5"}, True, _rs(0.1, 0.1, slow=3.0), [("arrive", "cccc-slow"), ("run", 120)]),
+        ("paced-absolute", {"FLLIPER_PDFLIP_TOLD_ABSOLUTE": "1"}, True, _rs(0.3, 0.4), [("arrive", "aaaa-told"), ("arrive", "cccc-slow"), ("run", 60)]),
+        ("paced-slow-follower", {"FLLIPER_PDFLIP_TOLD_PACE_CAP_S": "0.5"}, True, _rs(0.1, 0.1, slow=3.0), [("arrive", "cccc-slow"), ("run", 120)]),
     ]
 
 
@@ -232,7 +232,7 @@ class _Cap(logging.Handler):
         self.lines = []
 
     def emit(self, record):
-        if record.name.startswith("sglang.srt.managers.weg2") or record.name.startswith("sglang.srt.weg2"):
+        if record.name.startswith("flliper.srt.managers.pdflip") or record.name.startswith("flliper.srt.pdflip"):
             self.lines.append((record.levelno, record.getMessage()))
 
 
@@ -241,7 +241,7 @@ def run_digest(m, monkeypatch, extra_env):
     time and the told module's log lines, under ``extra_env``."""
     h = hashlib.sha256()
     cap = _Cap()
-    lg = logging.getLogger("sglang.srt")
+    lg = logging.getLogger("flliper.srt")
     old_level = lg.level
     lg.addHandler(cap)
     lg.setLevel(logging.DEBUG)
@@ -249,7 +249,7 @@ def run_digest(m, monkeypatch, extra_env):
         for name, env, paced, read_s, script in _scenarios():
             with monkeypatch.context() as mp:
                 for k in list(__import__("os").environ):
-                    if k.startswith("SGLANG_WEG2_TOLD") or k == "SGLANG_WEG2_P_TWIN_DEFER":
+                    if k.startswith("FLLIPER_PDFLIP_TOLD") or k == "FLLIPER_PDFLIP_P_TWIN_DEFER":
                         mp.delenv(k, raising=False)
                 for k, v in {**env, **extra_env}.items():
                     mp.setenv(k, v)

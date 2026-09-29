@@ -13,14 +13,14 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.utils.cp_utils import prepare_context_parallel_metadata
-from sglang.srt.utils.common import ceil_align
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.utils.cp_utils import prepare_context_parallel_metadata
+from flliper.srt.utils.common import ceil_align
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-large")
 
-_DSA_UTILS = "sglang.srt.layers.attention.dsa.utils"
+_DSA_UTILS = "flliper.srt.layers.attention.dsa.utils"
 _DEVICE = "cuda"
 _DTYPE = torch.bfloat16
 _HEAD_NUM = 8

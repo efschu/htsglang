@@ -4,14 +4,14 @@ import unittest
 
 import torch
 
-from sglang.srt.kv_canary.sweep_plan_builder import build_verify_plan_radix_sweep
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.fixtures import (
+from flliper.srt.kv_canary.sweep_plan_builder import build_verify_plan_radix_sweep
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
     make_radix_cache,
     make_req_to_token_pool,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, suite="extra-a-test-1-gpu-small-amd")

@@ -3,7 +3,7 @@ import socket
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.utils.network import (
+from flliper.srt.utils.network import (
     _get_addrinfos_for_bind,
     bind_port,
     get_free_port,
@@ -11,9 +11,9 @@ from sglang.srt.utils.network import (
     is_port_available,
     try_bind_socket,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
-from sglang.utils import normalize_base_url, release_port, reserve_port
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
+from flliper.utils import normalize_base_url, release_port, reserve_port
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -79,7 +79,7 @@ class TestTryBindSocket(CustomTestCase):
     def test_gaierror_fallback(self):
         """_get_addrinfos_for_bind should fall back to AF_INET on gaierror."""
         with patch(
-            "sglang.srt.utils.network.socket.getaddrinfo",
+            "flliper.srt.utils.network.socket.getaddrinfo",
             side_effect=socket.gaierror("mocked"),
         ):
             infos = _get_addrinfos_for_bind()
@@ -91,7 +91,7 @@ class TestTryBindSocket(CustomTestCase):
     def test_gaierror_fallback_preserves_host(self):
         """Fallback should use the provided host, not default to 0.0.0.0."""
         with patch(
-            "sglang.srt.utils.network.socket.getaddrinfo",
+            "flliper.srt.utils.network.socket.getaddrinfo",
             side_effect=socket.gaierror("mocked"),
         ):
             infos = _get_addrinfos_for_bind(host="10.0.0.1", port=8080)
@@ -135,18 +135,18 @@ class TestSocketUtilities(CustomTestCase):
         self.assertLessEqual(port, 65535)
 
     def test_get_open_port_with_env_var(self):
-        """get_open_port should respect SGLANG_PORT env var."""
+        """get_open_port should respect FLLIPER_PORT env var."""
         free_port = get_free_port()
-        with patch.dict(os.environ, {"SGLANG_PORT": str(free_port)}):
+        with patch.dict(os.environ, {"FLLIPER_PORT": str(free_port)}):
             port = get_open_port()
             self.assertEqual(port, free_port)
 
     def test_get_open_port_env_var_occupied_increments(self):
-        """get_open_port should increment if SGLANG_PORT is occupied."""
+        """get_open_port should increment if FLLIPER_PORT is occupied."""
         sock = try_bind_socket(port=0, reuse_addr=False, listen=True)
         try:
             occupied_port = sock.getsockname()[1]
-            with patch.dict(os.environ, {"SGLANG_PORT": str(occupied_port)}):
+            with patch.dict(os.environ, {"FLLIPER_PORT": str(occupied_port)}):
                 port = get_open_port()
                 # Should skip the occupied port and return a higher one
                 self.assertGreater(port, occupied_port)
@@ -188,7 +188,7 @@ class TestReservePort(CustomTestCase):
     def test_reserve_port_no_free_port_raises(self):
         """reserve_port should raise RuntimeError if no port is available."""
         with patch(
-            "sglang.srt.utils.network.try_bind_socket",
+            "flliper.srt.utils.network.try_bind_socket",
             side_effect=OSError("mocked"),
         ):
             with self.assertRaises(RuntimeError):

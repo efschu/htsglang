@@ -58,8 +58,8 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.managers import kv_backing_relief as kbr
-from sglang.srt.managers.kv_backing_relief import (
+from flliper.srt.managers import kv_backing_relief as kbr
+from flliper.srt.managers.kv_backing_relief import (
     _floor_ppm,
     _rows_for_ppm,
     _shrink_ppm,

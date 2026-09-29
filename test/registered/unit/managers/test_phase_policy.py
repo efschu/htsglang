@@ -21,7 +21,7 @@ import time
 
 import pytest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PHASE_PP,
     PHASE_TP,
     PP_TO_TP,
@@ -305,7 +305,7 @@ def test_enabled_without_a_threshold_is_refused():
 
 
 def test_config_from_env_derives_n_from_a_measured_throughput(monkeypatch):
-    import sglang.srt.managers.phase_policy as pp
+    import flliper.srt.managers.phase_policy as pp
 
     monkeypatch.setattr(pp, "DEFAULT_TP_PREFILL_TOK_S", 5000.0)
     monkeypatch.delenv(pp.ENV_FLIP_TOKENS, raising=False)
@@ -323,7 +323,7 @@ def test_config_from_env_derives_n_from_a_measured_throughput(monkeypatch):
 
 
 def test_config_from_env_explicit_threshold_wins(monkeypatch):
-    import sglang.srt.managers.phase_policy as pp
+    import flliper.srt.managers.phase_policy as pp
 
     monkeypatch.setenv(pp.ENV_FLIP_TOKENS, "12345")
     monkeypatch.setenv(pp.ENV_MIN_DWELL, "3.5")
@@ -337,7 +337,7 @@ def test_config_from_env_explicit_threshold_wins(monkeypatch):
 
 
 def test_config_from_env_refuses_enabled_without_any_threshold(monkeypatch):
-    import sglang.srt.managers.phase_policy as pp
+    import flliper.srt.managers.phase_policy as pp
 
     monkeypatch.setattr(pp, "DEFAULT_TP_PREFILL_TOK_S", 0.0)
     monkeypatch.delenv(pp.ENV_FLIP_TOKENS, raising=False)
@@ -346,7 +346,7 @@ def test_config_from_env_refuses_enabled_without_any_threshold(monkeypatch):
 
 
 def test_config_from_env_off_is_inert_without_a_threshold(monkeypatch):
-    import sglang.srt.managers.phase_policy as pp
+    import flliper.srt.managers.phase_policy as pp
 
     monkeypatch.setattr(pp, "DEFAULT_TP_PREFILL_TOK_S", 0.0)
     monkeypatch.delenv(pp.ENV_FLIP_TOKENS, raising=False)
@@ -355,7 +355,7 @@ def test_config_from_env_off_is_inert_without_a_threshold(monkeypatch):
 
 
 def test_bad_env_number_is_named(monkeypatch):
-    import sglang.srt.managers.phase_policy as pp
+    import flliper.srt.managers.phase_policy as pp
 
     monkeypatch.setenv(pp.ENV_MIN_DWELL, "soon")
     with pytest.raises(PhasePolicyError, match="MIN_DWELL"):
@@ -427,7 +427,7 @@ def _sched(
     been sitting in for a while must say so explicitly rather than inherit
     a clock by accident.
     """
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     class S:
         pass
@@ -443,7 +443,7 @@ def _sched(
     # speculate and requests are resident (they have no draft state).
     # Default the harness to NO speculation so the existing pins keep
     # testing the layout rule rather than that guard.
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
     s.flip_spec_algorithm = SpeculativeAlgorithm.from_string(spec_algo)
     s.running_mbs = list(running_mbs) if running_mbs is not None else []
@@ -460,7 +460,7 @@ def _sched(
 
 
 def _fwd_harness(is_last_rank=False, track_commits=False, armed=False):
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     sends = []
     processed = []
@@ -513,7 +513,7 @@ def test_arm_is_armed_in_the_same_pass_it_arrives():
     and that recv blocks because upstream is already inside the
     reduction. All three ranks armed, cutovers=0, dead at 40 s.
     """
-    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+    from flliper.srt.managers.io_struct import PhaseFlipReqInput
 
     arm = PhaseFlipReqInput(direction=PP_TO_TP, source="policy", internal=True)
     s, fwd, sends, processed = _fwd_harness()
@@ -538,7 +538,7 @@ def test_no_blocking_commit_anywhere_in_the_armed_path():
     instead. This test fails if a blocking commit is reintroduced for
     arm-carrying batches.
     """
-    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+    from flliper.srt.managers.io_struct import PhaseFlipReqInput
 
     arm = PhaseFlipReqInput(direction=PP_TO_TP, source="policy", internal=True)
     s, fwd, sends, processed, commits = _fwd_harness(track_commits=True)
@@ -570,7 +570,7 @@ def test_manual_flip_takes_the_same_non_blocking_path():
     keeps cycling and delivery happens by accident rather than by
     construction.
     """
-    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+    from flliper.srt.managers.io_struct import PhaseFlipReqInput
 
     rpc = PhaseFlipReqInput(direction=PP_TO_TP)  # internal=False
     s, fwd, sends, processed, commits = _fwd_harness(track_commits=True)
@@ -584,7 +584,7 @@ def test_manual_flip_takes_the_same_non_blocking_path():
 def test_last_stage_owes_no_forward_and_joins_directly():
     """(iii) The last rank has nobody to wake; it must not try to commit
     a send it never issued, and must still arm in-pass."""
-    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+    from flliper.srt.managers.io_struct import PhaseFlipReqInput
 
     arm = PhaseFlipReqInput(direction=PP_TO_TP, source="policy", internal=True)
     s, fwd, sends, processed, commits = _fwd_harness(
@@ -603,8 +603,8 @@ def test_only_the_zmq_intake_rank_injects():
     from contextlib import ExitStack
     from unittest import mock
 
-    from sglang.srt.managers.io_struct import PhaseFlipReqInput
-    from sglang.srt.managers.scheduler_components.request_receiver import (
+    from flliper.srt.managers.io_struct import PhaseFlipReqInput
+    from flliper.srt.managers.scheduler_components.request_receiver import (
         SchedulerRequestReceiver,
     )
 
@@ -683,7 +683,7 @@ def test_the_flip_join_is_not_bounded_and_that_is_deliberate():
     """
     import inspect
 
-    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+    from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
     src = inspect.getsource(PhaseFlipRuntime.on_round)
     assert "_join_bounded" not in src, (
@@ -701,7 +701,7 @@ def test_the_flip_join_is_not_bounded_and_that_is_deliberate():
 
 
 def _presence(tmpdir, n_ranks=3, rank=0):
-    from sglang.srt.managers.phase_flip_presence import PhaseFlipPresence
+    from flliper.srt.managers.phase_flip_presence import PhaseFlipPresence
 
     return PhaseFlipPresence(
         n_ranks=n_ranks, rank=rank, directory=str(tmpdir), instance="test"
@@ -772,7 +772,7 @@ def _runtime_stub(
     service_fn=None,
     channels_empty_fn=None,
 ):
-    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+    from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
     class R:
         pass
@@ -824,7 +824,7 @@ def test_stale_markers_from_an_earlier_boot_never_open_the_gate(tmp_path):
     armed, and rank 0 entered the reduction alone -- the gate causing the
     exact failure it exists to prevent.
     """
-    from sglang.srt.managers.phase_flip_presence import PhaseFlipPresence
+    from flliper.srt.managers.phase_flip_presence import PhaseFlipPresence
 
     # An earlier boot left a full quorum behind.
     old = [
@@ -848,9 +848,9 @@ def test_stale_markers_from_an_earlier_boot_never_open_the_gate(tmp_path):
 def test_the_instance_tag_is_identical_across_ranks_of_one_boot(monkeypatch, tmp_path):
     """The flags are a RENDEZVOUS: a per-process tag would give every
     rank a different quorum and none would ever assemble."""
-    from sglang.srt.managers.phase_flip_presence import PhaseFlipPresence
+    from flliper.srt.managers.phase_flip_presence import PhaseFlipPresence
 
-    monkeypatch.setenv("SGLANG_PHASE_FLIP_INSTANCE", "boot-xyz")
+    monkeypatch.setenv("FLLIPER_PHASE_FLIP_INSTANCE", "boot-xyz")
     tags = {
         PhaseFlipPresence(n_ranks=3, rank=r, directory=str(tmp_path)).instance
         for r in range(3)
@@ -924,7 +924,7 @@ class _StopHere(Exception):
 
 def _onround_stub(presence, ready, clock=None, deadline=60.0, pending="pp_to_tp"):
     """A runtime whose on_round can be driven without a collective."""
-    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+    from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
     class R:
         pass

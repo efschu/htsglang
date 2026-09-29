@@ -2,7 +2,7 @@
 (task #310).
 
 A venv without ``sgl_kernel`` is not evidence about any GPU: with sgl_kernel
-not importable, ``sglang.srt.layers.quantization.utils.get_scalar_types()``
+not importable, ``flliper.srt.layers.quantization.utils.get_scalar_types()``
 falls back to a ``MockScalarTypes`` stand-in, ``marlin_utils_fp8`` resolves
 ``scalar_types.float8_e4m3fn`` against it as a plain mock string instead of a
 real ``ScalarType``, and the fp8 Marlin lane probe's real sgl_kernel call
@@ -26,7 +26,7 @@ What is asserted here, all on CPU, none of it touching a real GPU:
   via ``PROBE_ENV_ERROR_PREFIX``) leaves the cached profile with NO note for
   the fields it could not measure; the same failure without the marker (a
   card-relevant top-up failure) still records its reason, unchanged;
-* the actual ``python -m sglang.srt.uneven_perf --probe`` entry point aborts
+* the actual ``python -m flliper.srt.uneven_perf --probe`` entry point aborts
   BEFORE writing anything and exits non-zero when ``sgl_kernel`` cannot be
   imported, and does not even attempt the guard when the requested probe
   groups do not include ``lanes``.
@@ -40,10 +40,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sglang.srt import uneven_perf
-from sglang.srt.layers.quantization import utils as quant_utils
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import uneven_perf
+from flliper.srt.layers.quantization import utils as quant_utils
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -57,7 +57,7 @@ _GPUS = [
 
 class MockScalarTypes:
     """Same shape (and, load-bearingly, the same CLASS NAME) as the real
-    fallback in ``sglang.srt.layers.quantization.utils.get_scalar_types``:
+    fallback in ``flliper.srt.layers.quantization.utils.get_scalar_types``:
     the check identifies the fallback by ``type(...).__name__``, not by
     identity, since it never imports the real utils fallback class."""
 
@@ -242,7 +242,7 @@ class TestTopUpEnvironmentFailureIsNotPersisted(CustomTestCase):
         self.assertIn("top-up failed", source)
         note = profile[uneven_perf.PROFILE_NOTES_KEY]["gemm_lanes"]
         self.assertIn("rc=1", note)
-        self.assertIn("SGLANG_PERF_REPROBE", note)
+        self.assertIn("FLLIPER_PERF_REPROBE", note)
 
 
 class TestRunProbeSubprocessMarkerDetection(CustomTestCase):
@@ -306,7 +306,7 @@ def _write_broken_sgl_kernel_shadow(root: str) -> str:
 
 
 class TestProbeSubprocessEntryPoint(CustomTestCase):
-    """The real ``python -m sglang.srt.uneven_perf --probe`` entry point, run
+    """The real ``python -m flliper.srt.uneven_perf --probe`` entry point, run
     as an actual subprocess (this is "am Sondeneinstieg" -- the entry point
     the launcher's ``_run_probe_subprocess`` spawns): the environment guard
     must abort before ``run_probe`` writes anything, and exit non-zero."""
@@ -322,7 +322,7 @@ class TestProbeSubprocessEntryPoint(CustomTestCase):
                 [
                     sys.executable,
                     "-m",
-                    "sglang.srt.uneven_perf",
+                    "flliper.srt.uneven_perf",
                     "--probe",
                     "--out",
                     out,
@@ -367,7 +367,7 @@ class TestProbeSubprocessEntryPoint(CustomTestCase):
                 [
                     sys.executable,
                     "-m",
-                    "sglang.srt.uneven_perf",
+                    "flliper.srt.uneven_perf",
                     "--probe",
                     "--out",
                     out,

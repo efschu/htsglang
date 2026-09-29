@@ -30,9 +30,9 @@ Hermetic: no CUDA.
 import unittest
 from unittest.mock import MagicMock
 
-from sglang.srt.managers.schedule_policy import PrefillAdder
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.planner.chunked_admission import (
+from flliper.srt.managers.schedule_policy import PrefillAdder
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.planner.chunked_admission import (
     ChunkedCommitmentLedger,
     PoolState,
     decide_chunked_admission,
@@ -217,7 +217,7 @@ class TheDeferredHeadIsVisibleToTheFlip(unittest.TestCase):
     """Defect 5: a deferred head must not look like an idle instance."""
 
     def test_a_deferred_head_inhibits_idle_flip_formation(self):
-        from sglang.srt.planner.chunked_admission import (
+        from flliper.srt.planner.chunked_admission import (
             deferred_head_blocks_idle_flip,
         )
 

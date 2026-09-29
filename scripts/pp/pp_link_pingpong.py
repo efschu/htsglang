@@ -1,6 +1,6 @@
 """#201 slice 2 -- what one pipeline stage boundary costs on the wire.
 
-The in-server counter (SGLANG_PP_BOUNDARY_STATS) can only report a blocking
+The in-server counter (FLLIPER_PP_BOUNDARY_STATS) can only report a blocking
 recv, which is pipeline bubble plus wire. This measures the wire alone: two
 processes, the same two transports the PP path actually uses, and the exact
 payload shapes ``PPProxyTensors`` carries.

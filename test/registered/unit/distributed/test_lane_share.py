@@ -23,12 +23,12 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.model_executor.lane_share import (
+from flliper.srt.model_executor.lane_share import (
     ClassSample,
     LaneShareMeter,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -315,14 +315,14 @@ class TestSchedulerWiring(CustomTestCase):
         )
 
     def test_a_boot_without_lanes_never_touches_the_meter(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         sched = self._scheduler(None, [])
         Scheduler._lane_share_sample(sched)  # must not raise, must not build one
         self.assertIsNone(sched.lane_share_meter)
 
     def test_both_classes_and_both_arms_reach_the_meter(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         m = LaneShareMeter(window_s=0.0, floor_min_windows=1)
         sched = self._scheduler(m, [self._lane(0, 0, 0)])
@@ -338,7 +338,7 @@ class TestSchedulerWiring(CustomTestCase):
         self.assertEqual(m.counts["shared_without_floor"] + m.counts["shared"], 1)
 
     def test_a_failing_meter_disables_itself_instead_of_killing_the_loop(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         class _Boom:
             window_s = 1.0
@@ -371,7 +371,7 @@ class TestGaugePublication(CustomTestCase):
     def _collector(self):
         from types import SimpleNamespace
 
-        from sglang.srt.observability.metrics_collector import (
+        from flliper.srt.observability.metrics_collector import (
             SchedulerMetricsCollector,
         )
 

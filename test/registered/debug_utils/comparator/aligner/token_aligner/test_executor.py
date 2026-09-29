@@ -5,29 +5,29 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.executor import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.executor import (
     execute_token_aligner,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.planner import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.planner import (
     compute_token_aligner_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.seq_info_builder import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.seq_info_builder import (
     build_seqs_info,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
-    SGLangSeqId,
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
+    FlliperSeqId,
     TokenAlignerGlobalAux,
     TokenAlignerPlan,
     TokenAlignerStepAux,
     TokenLocator,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import (
+from flliper.srt.debug_utils.comparator.dims_spec import (
     TokenLayout,
     apply_dim_names,
     without_dim_names,
 )
-from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.utils import Pair
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")
@@ -50,18 +50,18 @@ class TestExecuteAlignment:
             input_ids=[10, 20, 30, 40, 50],
             positions=[0, 1, 2, 0, 1],
             seq_lens=[3, 2],
-            seq_ids=[SGLangSeqId(rid="A"), SGLangSeqId(rid="B")],
+            seq_ids=[FlliperSeqId(rid="A"), FlliperSeqId(rid="B")],
         )
         aux_step1 = TokenAlignerStepAux(
             input_ids=[31, 51],
             positions=[3, 2],
             seq_lens=[1, 1],
-            seq_ids=[SGLangSeqId(rid="A"), SGLangSeqId(rid="B")],
+            seq_ids=[FlliperSeqId(rid="A"), FlliperSeqId(rid="B")],
         )
 
         side_aux = TokenAlignerGlobalAux(
             step_auxs={0: aux, 1: aux_step1},
-            framework="sglang",
+            framework="flliper",
             layout=TokenLayout.T,
         )
 

@@ -22,8 +22,8 @@ import os
 
 import pytest
 
-from sglang.srt.mem_cache.mamba_pool_floor import mamba_hard_floor
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.mem_cache.mamba_pool_floor import mamba_hard_floor
+from flliper.srt.server_args import ServerArgs
 
 MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8-yarn1.5"
 

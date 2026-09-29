@@ -26,10 +26,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.speculative import dflash_worker_v2 as dfw
-from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-from sglang.srt.speculative.dflash_utils import validate_dflash_request
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from flliper.srt.speculative import dflash_worker_v2 as dfw
+from flliper.srt.speculative.dflash_info import DFlashVerifyInput
+from flliper.srt.speculative.dflash_utils import validate_dflash_request
+from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def _req(*, logprob=False, hidden=False, json_schema=None):

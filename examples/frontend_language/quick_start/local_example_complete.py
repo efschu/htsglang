@@ -3,7 +3,7 @@ Usage:
 python3 local_example_complete.py
 """
 
-import sglang as sgl
+import flliper as sgl
 
 
 @sgl.function

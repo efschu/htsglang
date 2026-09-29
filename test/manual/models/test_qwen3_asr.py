@@ -1,5 +1,5 @@
 """
-Test Qwen3-ASR model support in SGLang.
+Test Qwen3-ASR model support in fLLiper.
 
 Tests /v1/audio/transcriptions (HTTP) and /v1/realtime (OpenAI Realtime
 transcription WebSocket).
@@ -27,8 +27,8 @@ try:
 except ImportError:
     HAS_WEBSOCKETS = False
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,

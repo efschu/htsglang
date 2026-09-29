@@ -5,9 +5,9 @@ import numpy as np
 import requests
 from transformers import AutoModelForCausalLM
 
-import sglang as sgl
-from sglang.srt.utils import get_device
-from sglang.test.test_utils import (
+import flliper as sgl
+from flliper.srt.utils import get_device
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
-from sglang.utils import terminate_process
+from flliper.utils import terminate_process
 
 
 def _process_return(ret):

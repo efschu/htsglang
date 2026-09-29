@@ -1,9 +1,9 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.scripted_runtime.context import ScriptedContext
-from sglang.test.scripted_runtime.test_case import ScriptedTestCase
-from sglang.test.scripted_runtime_chunked_helpers import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.scripted_runtime.context import ScriptedContext
+from flliper.test.scripted_runtime.test_case import ScriptedTestCase
+from flliper.test.scripted_runtime_chunked_helpers import (
     DEFAULT_MAX_STEPS,
     SMALL_MODEL,
     base_engine_kwargs,

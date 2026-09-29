@@ -2,13 +2,13 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -24,7 +24,7 @@ class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+        envs.FLLIPER_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
@@ -103,7 +103,7 @@ class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+        envs.FLLIPER_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
@@ -182,7 +182,7 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+        envs.FLLIPER_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
@@ -261,7 +261,7 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+        envs.FLLIPER_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
@@ -336,9 +336,9 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
 
 
 STAGING_ENV = {
-    "SGLANG_DISAGG_STAGING_BUFFER": "1",
-    "SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB": "64",
-    "SGLANG_DISAGG_STAGING_POOL_SIZE_MB": "1024",
+    "FLLIPER_DISAGG_STAGING_BUFFER": "1",
+    "FLLIPER_DISAGG_STAGING_BUFFER_SIZE_MB": "64",
+    "FLLIPER_DISAGG_STAGING_POOL_SIZE_MB": "1024",
 }
 
 
@@ -348,7 +348,7 @@ class TestDisaggregationStagingPrefillLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+        envs.FLLIPER_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
@@ -429,7 +429,7 @@ class TestDisaggregationStagingDecodeLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+        envs.FLLIPER_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 

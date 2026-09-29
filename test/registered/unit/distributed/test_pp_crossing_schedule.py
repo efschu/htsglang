@@ -15,13 +15,13 @@ Two things the schedule makes checkable that prose could not:
   depends on which pairs it uses and not only on how many crossings it makes.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.distributed.pp_crossing_schedule import (
+from flliper.srt.distributed.pp_crossing_schedule import (
     Crossing,
     CrossingScheduleError,
     LoopbackLink,
@@ -29,7 +29,7 @@ from sglang.srt.distributed.pp_crossing_schedule import (
     schedule_cost,
     stage_of_layer,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 NUM_LAYERS = 64
 FA = [i for i in range(NUM_LAYERS) if i % 4 == 3]

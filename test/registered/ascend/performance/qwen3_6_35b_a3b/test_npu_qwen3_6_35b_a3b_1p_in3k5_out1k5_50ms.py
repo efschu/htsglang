@@ -1,12 +1,12 @@
 import unittest
 
-from sglang.test.ascend.e2e.test_npu_performance_utils import (
+from flliper.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
     QWEN3_6_35B_A3B_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
-from sglang.test.ci.ci_register import register_npu_ci
+from flliper.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
@@ -22,9 +22,9 @@ QWEN3_6_35B_A3B_3K5_1K5_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "SGLANG_SET_CPU_AFFINITY": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "0",
+    "FLLIPER_SET_CPU_AFFINITY": "1",
+    "FLLIPER_ENABLE_SPEC_V2": "1",
+    "FLLIPER_ENABLE_OVERLAP_PLAN_STREAM": "0",
     "ASCEND_USE_FIA": "1",
 }
 

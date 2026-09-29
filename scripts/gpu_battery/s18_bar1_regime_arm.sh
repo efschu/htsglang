@@ -78,8 +78,8 @@ hssh() { timeout "${1:?}" ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=10 \
 
 MLP_FLAG=""; [ "$MLP" != auto ] && MLP_FLAG="--rank-mlp-ratio $MLP"
 GRAPH_FLAG="--disable-cuda-graph"
-# SGLANG_BARLINK_GRAPH_ENABLE must track the regime. Off + graphs enabled is
-# the one combination sglang refuses outright ("capturable, but ... set to an
+# FLLIPER_BARLINK_GRAPH_ENABLE must track the regime. Off + graphs enabled is
+# the one combination flliper refuses outright ("capturable, but ... set to an
 # off value"), so a hardcoded 0 turns a graph boot into an instant crash.
 BARLINK_GRAPH_ENABLE=0
 if [ "$REGIME" = graph ]; then GRAPH_FLAG=""; BARLINK_GRAPH_ENABLE=1; fi
@@ -96,7 +96,7 @@ if [ "$FMT" = int8 ]; then
     # common_ops.abi3.so links the whole CUDA-12 runtime set (libcudart.so.12,
     # libcublas.so.12, libcublasLt.so.12, ...). The image is cu13 and has none
     # of them, so installing the wheel BREAKS sgl_kernel outright: common_ops
-    # fails to import, sglang falls back to "no int8_scaled_mm for this
+    # fails to import, flliper falls back to "no int8_scaled_mm for this
     # device", and every INT8 rank dies at model load. /spinning/cu12libs is a
     # directory of symlinks to every *.so.12* the CT999 venv ships (targets
     # written with the host's subvol prefix so they resolve on both sides).
@@ -118,7 +118,7 @@ echo "=== $(date -u +%H:%M:%SZ) arm=$ARM fmt=$FMT transport=$TRANSPORT regime=$R
 # graph -> full CUDA-graph capture, which is only affordable once the tuned
 # W8A8 block-fp8 configs for this device exist (#370); without them every GEMM
 # shape cold-autotunes and capture ran >35 min in #366.
-LAUNCH="cd /wt && $INJECT python3 -m sglang.launch_server \
+LAUNCH="cd /wt && $INJECT python3 -m flliper.launch_server \
   --model-path /model --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto \
   --rank-auto-reserve-mib $RESERVE $MLP_FLAG \
   --kv-cache-dtype fp8_e4m3 --context-length 32768 --trust-remote-code \
@@ -132,9 +132,9 @@ LAUNCH="cd /wt && $INJECT python3 -m sglang.launch_server \
 # SYS_ADMIN. Both are eager.
 if [ "$TRANSPORT" = bar1 ]; then
     DEV_ARGS="--device /dev/dmabuf_holder --cap-add SYS_ADMIN --security-opt apparmor=unconfined -v /sys:/sys"
-    BARLINK_ENV="-e SGLANG_BARLINK_BAR1_NV_SOURCE=/nvsrc \
-  -e SGLANG_BARLINK=1 -e SGLANG_BARLINK_TRANSPORT=bar1 -e SGLANG_BARLINK_GRAPH_ENABLE=$BARLINK_GRAPH_ENABLE \
-  -e SGLANG_BARLINK_BAR1_WINDOW_MIB=64 -e SGLANG_BARLINK_BAR1_WINDOW_MIB_DCP=32"
+    BARLINK_ENV="-e FLLIPER_BARLINK_BAR1_NV_SOURCE=/nvsrc \
+  -e FLLIPER_BARLINK=1 -e FLLIPER_BARLINK_TRANSPORT=bar1 -e FLLIPER_BARLINK_GRAPH_ENABLE=$BARLINK_GRAPH_ENABLE \
+  -e FLLIPER_BARLINK_BAR1_WINDOW_MIB=64 -e FLLIPER_BARLINK_BAR1_WINDOW_MIB_DCP=32"
 else
     DEV_ARGS=""
     BARLINK_ENV=""   # barlink unset -> stock NCCL TP collectives
@@ -154,7 +154,7 @@ docker run -d --rm --name $CN --network host --gpus all \
   -e TORCH_CUDA_ARCH_LIST='8.6;12.0' \
   $INT8_LIBS \
   $BARLINK_ENV \
-  -e SGLANG_UNEVEN_DCP=1 -e SGLANG_UNEVEN_DCP_WEIGHTED=1 -e SGLANG_MAMBA_SSM_DTYPE=bfloat16 \
+  -e FLLIPER_UNEVEN_DCP=1 -e FLLIPER_UNEVEN_DCP_WEIGHTED=1 -e FLLIPER_MAMBA_SSM_DTYPE=bfloat16 \
   --entrypoint bash $IMG -c '$LAUNCH'
 echo started" || { echo "DOCKER RUN FAILED arm=$ARM"; exit 2; }
 

@@ -13,15 +13,15 @@ else
   echo "Warning: could not parse GPU family from '${HOSTNAME_VALUE}'"
 fi
 
-WORKDIR="/sglang-checkout/test"
+WORKDIR="/flliper-checkout/test"
 declare -A ENV_MAP=(
-  [SGLANG_IS_IN_CI_AMD]=1
-  [SGLANG_IS_IN_CI]=1
+  [FLLIPER_IS_IN_CI_AMD]=1
+  [FLLIPER_IS_IN_CI]=1
   # Disabled on AMD: the async-assert probes (#27461) fire torch._assert_async in
   # the MXFP4 EAGLE-MTP decode path and abort the queue with an HSA hardware
   # exception.
-  [SGLANG_ENABLE_ASYNC_ASSERT]=0
-  [SGLANG_USE_AITER]=1
+  [FLLIPER_ENABLE_ASYNC_ASSERT]=0
+  [FLLIPER_USE_AITER]=1
 )
 
 # Conditionally add GPU_ARCHS only for mi35x
@@ -65,7 +65,7 @@ done
 if docker exec \
   -w "$WORKDIR" \
   "${ENV_ARGS[@]}" \
-  ci_sglang "$@"; then
+  ci_flliper "$@"; then
   exit 0
 else
   FIRST_EXIT_CODE=$?
@@ -90,4 +90,4 @@ docker exec \
   -w "$WORKDIR" \
   "${ENV_ARGS[@]}" \
   -e HF_HUB_OFFLINE=1 \
-  ci_sglang "$@"
+  ci_flliper "$@"

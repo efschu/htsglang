@@ -62,7 +62,7 @@ ARM=graphs bash scripts/dev/443_graph_proof/boot_graphs.sh
 
 `scratch_preflight.py` calls the same `worst_case_unique_spill` the runtime
 calls, so the preflight and the capture-admission check cannot drift. Without
-it the first thing a wrong `SGLANG_MOE_SCRATCH_SLOTS` produces is a refusal
+it the first thing a wrong `FLLIPER_MOE_SCRATCH_SLOTS` produces is a refusal
 several minutes into warmup, after a full GGUF load.
 
 ## Sizing: capture is not free, and the recipe's own operating point fits
@@ -72,10 +72,10 @@ requirement is simply `bs * top_k` scratch slots, and each slot is one more
 expert's worth of resident VRAM per layer.
 
 `DeepSeekV4Config` defaults to `num_experts_per_tok = 6`
-(`python/sglang/srt/configs/deepseek_v4.py:74`). CONFIRM it against the
+(`python/flliper/srt/configs/deepseek_v4.py:74`). CONFIRM it against the
 checkpoint before sizing — a class default is not a checkpoint. If it holds for
 V4-Flash-0731, then at `bs=1` the requirement is exactly 6, which is what the
-2026-08-02 battery already ran (`SGLANG_MOE_SCRATCH_SLOTS=6`), and the recipe's
+2026-08-02 battery already ran (`FLLIPER_MOE_SCRATCH_SLOTS=6`), and the recipe's
 own operating point (`--max-running-requests 1`) is capture-eligible at no
 extra VRAM. Every larger bucket costs `6` more slots per unit of `bs`, which is
 why `boot_graphs.sh` caps the captured list instead of leaving it at the
@@ -84,10 +84,10 @@ knob.
 
 ## Not in this window
 
-The shared cold tier (`SGLANG_MOE_COLD_TIER_SHM`) stays OFF. Capture over
+The shared cold tier (`FLLIPER_MOE_COLD_TIER_SHM`) stays OFF. Capture over
 peer-owned cold rows is refused by name: the captured gather has no peer
 source, and the peer's `cudaHostRegister`'d UVA pointer is unverified. Opening
 both at once would make any failure un-attributable.
-`SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1` is a later window's switch; past it, a
+`FLLIPER_MOE_COLD_TIER_GRAPH_UNSAFE=1` is a later window's switch; past it, a
 routed delegated expert is counted on device and raised by name at the replay
 boundary rather than silently reading local row 0.

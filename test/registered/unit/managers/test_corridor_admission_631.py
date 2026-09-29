@@ -35,13 +35,13 @@ import types
 
 import pytest
 
-from sglang.srt.managers.corridor_admission import (
+from flliper.srt.managers.corridor_admission import (
     WANT_CAP_MIB,
     PrefillAdmissionGate,
     get_prefill_admission_gate,
     guard_prefill_admission,
 )
-from sglang.srt.managers.corridor_guard import CorridorGuard, RELIEF_LOCAL
+from flliper.srt.managers.corridor_guard import CorridorGuard, RELIEF_LOCAL
 
 MIB = 1024 * 1024
 
@@ -556,7 +556,7 @@ def test_stats_report_what_the_gate_did():
 
 def _unlevel_gate(card, peer_free_mib=3000):
     """A gate whose fleet is UNLEVEL, with this card as the water-fill loser."""
-    from sglang.srt.managers.corridor_rebalance import RebalanceLender
+    from flliper.srt.managers.corridor_rebalance import RebalanceLender
 
     scheduler = FakeScheduler(FakeReporter(qkv=COHERENT_SLOPE, ffn=0))
     gate = PrefillAdmissionGate(scheduler, cooldown_s=0.0)

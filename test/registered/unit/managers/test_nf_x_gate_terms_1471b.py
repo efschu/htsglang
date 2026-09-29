@@ -1,6 +1,6 @@
 """#1471b: every rank names its own usable-match vote and why.
 
-z30m 03:19:50 / 03:21:40 / 03:22:09 (D, rid weg2-116-141): the X gate priced
+z30m 03:19:50 / 03:21:40 / 03:22:09 (D, rid pdflip-116-141): the X gate priced
 uncached = the WHOLE prompt (38687, 39693, 39693) right after every rank had
 read 28096, 4352 and 36800 of it. The group's usable floor was 0 -- and the
 lines that name which rank voted 0 and on which branch (#1424d PROOF-CUT,
@@ -18,7 +18,7 @@ import unittest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.managers import tp_match_floor as m  # noqa: E402
+from flliper.srt.managers import tp_match_floor as m  # noqa: E402
 
 _S4B = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "test_nf_s4b_worker_proof_cut_239.py"

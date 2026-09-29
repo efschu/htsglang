@@ -49,8 +49,8 @@ import weakref
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -93,7 +93,7 @@ def _stub_gguf_moe_layer(keep_sources: bool, rows: int = ROWS):
     is what puts it on the default branch: ``_gguf_moe_offload_eligible``
     returns False for a fraction >= 1.0 (``layer.py:2534-2536``), so ``plan``
     is None and the fully-resident path runs -- the same way a server without
-    ``SGLANG_MOE_RESIDENT_EXPERT_FRACTION`` reaches it.
+    ``FLLIPER_MOE_RESIDENT_EXPERT_FRACTION`` reaches it.
 
     Returns ``(layer, source_refs, payload_bytes)``. ``source_refs`` are weak
     references to every tensor the loader handed the parameters; when
@@ -101,8 +101,8 @@ def _stub_gguf_moe_layer(keep_sources: bool, rows: int = ROWS):
     referent afterwards means the parameter's own holders are keeping the
     expert set in host memory.
     """
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.quantization.gguf import GGUFUninitializedParameter
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.quantization.gguf import GGUFUninitializedParameter
 
     class _StubGGUFMoELayer(torch.nn.Module):
         materialize_gguf_weights = FusedMoE.materialize_gguf_weights

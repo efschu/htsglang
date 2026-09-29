@@ -23,7 +23,7 @@ and that a stepped price is inverted exactly rather than approximated.
 
 import math
 
-from sglang.srt.managers.corridor_width import (
+from flliper.srt.managers.corridor_width import (
     MIN_CHUNK_TOKENS,
     fundable_chunk_tokens,
     width_was_cut,
@@ -294,7 +294,7 @@ def test_the_width_is_monotone_in_the_budget():
 
 import types
 
-from sglang.srt.managers.corridor_admission import PrefillAdmissionGate
+from flliper.srt.managers.corridor_admission import PrefillAdmissionGate
 
 
 class FakeGuard:
@@ -411,7 +411,7 @@ def test_the_calibration_is_the_measured_share_over_the_config_share():
     gate = build_actuator(free_mib=1000.0)
     measured_bytes_per_token = 38436864 / 122
     gate._scheduler.metrics_reporter = None  # noqa: SLF001
-    import sglang.srt.managers.corridor_admission as ca
+    import flliper.srt.managers.corridor_admission as ca
 
     original = ca._measured_bytes_per_token
     ca._measured_bytes_per_token = lambda _s, _t: measured_bytes_per_token
@@ -433,7 +433,7 @@ def test_the_calibration_is_the_measured_share_over_the_config_share():
 #    pass and then a voided one -- a livelock wearing a safety jacket.
 # --------------------------------------------------------------------------
 
-from sglang.srt.managers.scheduler import Scheduler
+from flliper.srt.managers.scheduler import Scheduler
 
 WIDTH = Scheduler._corridor_granted_prefill_width
 
@@ -457,7 +457,7 @@ def scheduler_stub(pp_size, pp_rank, tp_world=1):
 def test_a_downstream_pp_rank_never_narrows(monkeypatch):
     gate = CuttingGate()
     monkeypatch.setattr(
-        "sglang.srt.managers.scheduler.get_prefill_admission_gate",
+        "flliper.srt.managers.scheduler.get_prefill_admission_gate",
         lambda _s: gate,
     )
     for rank in (1, 2):
@@ -474,7 +474,7 @@ def test_a_broken_actuator_leaves_the_width_alone(monkeypatch):
             raise RuntimeError("no guard")
 
     monkeypatch.setattr(
-        "sglang.srt.managers.scheduler.get_prefill_admission_gate",
+        "flliper.srt.managers.scheduler.get_prefill_admission_gate",
         lambda _s: Exploding(),
     )
     assert WIDTH(scheduler_stub(pp_size=3, pp_rank=0), 4096) == 4096
@@ -489,7 +489,7 @@ def test_a_widened_answer_is_refused(monkeypatch):
             return requested * 2
 
     monkeypatch.setattr(
-        "sglang.srt.managers.scheduler.get_prefill_admission_gate",
+        "flliper.srt.managers.scheduler.get_prefill_admission_gate",
         lambda _s: Widening(),
     )
     assert WIDTH(scheduler_stub(pp_size=3, pp_rank=0), 4096) == 4096
@@ -518,7 +518,7 @@ def tp_scheduler_stub(reduced, chunked=4096):
 
 
 def _world3(monkeypatch):
-    import sglang.srt.managers.scheduler as sched
+    import flliper.srt.managers.scheduler as sched
 
     monkeypatch.setattr(
         sched.torch.distributed, "get_world_size", lambda _g: 3, raising=False
@@ -561,14 +561,14 @@ def test_the_contributed_ceiling_is_never_a_silent_narrowing(monkeypatch):
             raise RuntimeError("no guard")
 
     monkeypatch.setattr(
-        "sglang.srt.managers.scheduler.get_prefill_admission_gate",
+        "flliper.srt.managers.scheduler.get_prefill_admission_gate",
         lambda _s: Exploding(),
     )
     stub = types.SimpleNamespace(chunked_prefill_size=4096)
     assert CEILING(stub) == 4096
 
     monkeypatch.setattr(
-        "sglang.srt.managers.scheduler.get_prefill_admission_gate",
+        "flliper.srt.managers.scheduler.get_prefill_admission_gate",
         lambda _s: None,
     )
     assert CEILING(types.SimpleNamespace(chunked_prefill_size=4096)) == 4096
@@ -576,7 +576,7 @@ def test_the_contributed_ceiling_is_never_a_silent_narrowing(monkeypatch):
 
 def test_the_contributed_ceiling_carries_a_real_cut(monkeypatch):
     monkeypatch.setattr(
-        "sglang.srt.managers.scheduler.get_prefill_admission_gate",
+        "flliper.srt.managers.scheduler.get_prefill_admission_gate",
         lambda _s: CuttingGate(),
     )
     assert CEILING(types.SimpleNamespace(chunked_prefill_size=4096)) == MIN_CHUNK_TOKENS
@@ -588,7 +588,7 @@ def test_a_widened_ceiling_is_refused(monkeypatch):
             return requested * 4
 
     monkeypatch.setattr(
-        "sglang.srt.managers.scheduler.get_prefill_admission_gate",
+        "flliper.srt.managers.scheduler.get_prefill_admission_gate",
         lambda _s: Widening(),
     )
     assert CEILING(types.SimpleNamespace(chunked_prefill_size=4096)) == 4096

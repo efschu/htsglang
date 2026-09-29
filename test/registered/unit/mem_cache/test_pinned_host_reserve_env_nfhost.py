@@ -21,7 +21,7 @@ the runtime backstop refused, four times:
     [ArenaMHAHostPool, Mamba anchor, qsa_indexer, read buffers] does not fit in
     8.73 GB available minus a 10.74 GB OS reserve = 0.00 GB usable
 
--> W53 Weg2StoreHandbackFailed -> HTTP 413 on the 148k needle. Inside the
+-> W53 PdFlipStoreHandbackFailed -> HTTP 413 on the 148k needle. Inside the
 cgroup ``available`` is the cap minus nonreclaim (82 - 73.9), and the 10 GiB
 "OS reserve" duplicates what the cap already guarantees. Natively (CT999, 118
 GiB limit) the same boot never came near the reserve.
@@ -43,7 +43,7 @@ import subprocess
 import sys
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10)
 
@@ -53,7 +53,7 @@ GIB = 1024**3
 AVAILABLE_GB = 8.73
 DEMAND_GB = 0.54
 TOTAL_GB = 82.0
-ENV = "SGLANG_PINNED_HOST_RESERVE_GIB"
+ENV = "FLLIPER_PINNED_HOST_RESERVE_GIB"
 
 #: Runs in a FRESH interpreter: only a new process shows what a container
 #: launched with the env actually gets from a clean import -- and a reload inside
@@ -61,7 +61,7 @@ ENV = "SGLANG_PINNED_HOST_RESERVE_GIB"
 _PROBE = f"""
 import json
 from unittest import mock
-from sglang.srt.mem_cache import pinned_host_budget as m
+from flliper.srt.mem_cache import pinned_host_budget as m
 post = m.PinnedHostPost("read buffers", "--hicache-size", int({DEMAND_GB} * {GB}))
 err = m.joint_pinned_host_error([post], int({TOTAL_GB} * {GB}), int({AVAILABLE_GB} * {GB}))
 m.clear_registered_posts()

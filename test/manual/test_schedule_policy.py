@@ -1,15 +1,15 @@
 import unittest
 from array import array
 
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import (
+from flliper.srt.managers.schedule_batch import Req, ScheduleBatch
+from flliper.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
     CacheAwarePolicy,
     SchedulePolicy,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.radix_cache import RadixCache
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.test.test_utils import CustomTestCase
 
 
 def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **kwargs):

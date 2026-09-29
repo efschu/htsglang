@@ -5,19 +5,19 @@ import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
-from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
-from sglang.srt.layers.quantization.marlin_utils import (
+from flliper.jit_kernel.gptq_marlin import gptq_marlin_gemm
+from flliper.srt.layers.quantization.marlin_utils import (
     check_marlin_supported,
     marlin_make_workspace,
 )
-from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+from flliper.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     nvfp4_marlin_process_global_scale,
     prepare_nvfp4_layer_for_marlin,
 )
-from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_marlin_utils import (
+from flliper.srt.utils.common import is_sm80_supported, is_sm90_supported
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_marlin_utils import (
     awq_marlin_quantize,
     make_nvfp4_weight_and_ref,
     marlin_quantize,

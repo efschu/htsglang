@@ -8,9 +8,9 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_xpu_ci
-from sglang.test.test_utils import CustomTestCase
-from sglang.test.xpu.simple_eval_gsm8k_xpu_mixin import SimpleEvalGSM8KXPUMixin
+from flliper.test.ci.ci_register import register_xpu_ci
+from flliper.test.test_utils import CustomTestCase
+from flliper.test.xpu.simple_eval_gsm8k_xpu_mixin import SimpleEvalGSM8KXPUMixin
 
 register_xpu_ci(est_time=1800, suite="nightly-xpu-4-gpu", nightly=True)
 

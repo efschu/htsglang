@@ -3,10 +3,10 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import get_device_sm, kill_process_tree
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
@@ -27,7 +27,7 @@ OFFLINE_MODE = False
 # Change the path below when OFFLINE_MODE is True.
 OFFLINE_PATH_DICT = {
     DEFAULT_MODEL_NAME_FOR_TEST: "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct",
-    DEFAULT_DRAFT_MODEL_EAGLE3: "/shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",
+    DEFAULT_DRAFT_MODEL_EAGLE3: "/shared/public/elr-models/jamesliu1/flliper-EAGLE3-Llama-3.1-Instruct-8B",
     DEFAULT_MODEL_NAME_FOR_TEST_MLA: "/shared/public/sharing/deepseek/dsv3-test/snapshots/",
     DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN: "/shared/public/sharing/deepseek/dsv3-test-NextN/snapshots/",
     GSM_DATASET_PATH: "/shared/public/data/gsm8k/test.jsonl",
@@ -52,7 +52,7 @@ DEFAULT_SERVER_ARGS = [
 ]
 
 """
-Integration test for python/sglang/srt/layers/attention/flashattention_backend.py
+Integration test for python/flliper/srt/layers/attention/flashattention_backend.py
 """
 
 
@@ -76,8 +76,8 @@ class BaseFlashAttentionTest(CustomTestCase):
         # disable deep gemm precompile to make launch server faster
         # please don't do this if you want to make your inference workload faster
         with (
-            envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.override(False),
-            envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False),
+            envs.FLLIPER_JIT_DEEPGEMM_PRECOMPILE.override(False),
+            envs.FLLIPER_ENABLE_JIT_DEEPGEMM.override(False),
         ):
             cls.process = popen_launch_server(
                 cls.model,

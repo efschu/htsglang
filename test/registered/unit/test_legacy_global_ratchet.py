@@ -3,13 +3,13 @@
 The process-wide ``ServerArgs`` is owned by the runtime context; the legacy
 ``get_global_server_args`` / ``set_global_server_args_for_*`` names survive as
 thin shims for the existing call-sites. New code should use the
-``sglang.srt.runtime_context`` accessors (``get_server_args()`` /
+``flliper.srt.runtime_context`` accessors (``get_server_args()`` /
 ``get_context().set_server_args()``), so the shim call-site counts below must
 never grow. When your change removes call-sites, lower the matching baseline
 to the new count.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -17,12 +17,12 @@ import re
 import unittest
 from pathlib import Path
 
-import sglang.srt
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt
+from flliper.test.test_utils import CustomTestCase
 
-_SRT_ROOT = Path(next(iter(sglang.srt.__path__)))
+_SRT_ROOT = Path(next(iter(flliper.srt.__path__)))
 
-# Baselines counted over python/sglang/srt/**/*.py, including each function's
+# Baselines counted over python/flliper/srt/**/*.py, including each function's
 # own def line. Ratchet: decrease-only.
 _RATCHETS = [
     # Down to the shim definition itself; every call-site now goes through
@@ -51,7 +51,7 @@ class TestLegacyGlobalRatchet(CustomTestCase):
             if count > baseline:
                 self.fail(
                     f"{name} call-sites grew: {count} > baseline {baseline}. "
-                    "New code must use the sglang.srt.runtime_context accessors "
+                    "New code must use the flliper.srt.runtime_context accessors "
                     "(get_server_args() / get_context().set_server_args())."
                 )
             if count < baseline:

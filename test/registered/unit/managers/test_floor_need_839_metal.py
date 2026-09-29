@@ -115,7 +115,7 @@ class _FakeVmmPool:
 
 class _Rank:
     def __init__(self, name: str, rows: int, budget_rows=None):
-        from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+        from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
         self.name = name
         self.pool = _FakeVmmPool(rows, RESERVATION, budget_rows=budget_rows)
@@ -462,7 +462,7 @@ class TheCallsiteActuallyConsumesTheNeed(unittest.TestCase):
     def _spill_source(self) -> str:
         import inspect
 
-        from sglang.srt.managers import phase_flip_spill
+        from flliper.srt.managers import phase_flip_spill
 
         return inspect.getsource(phase_flip_spill)
 

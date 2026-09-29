@@ -26,7 +26,7 @@ import types
 
 import pytest
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     assert_seed_superseded,
     note_seed_awaiting_supersession,
     note_seed_calibration_site,
@@ -35,7 +35,7 @@ from sglang.srt.distributed.utils import (
     resolve_cp_token_ratios,
     seed_liveness_state,
 )
-from sglang.srt.planner.retracted import SeedNotSupersededError
+from flliper.srt.planner.retracted import SeedNotSupersededError
 
 SEED = [29, 19, 16]
 MEASURED = [29, 17, 18]
@@ -58,9 +58,9 @@ def _clean(monkeypatch):
     """The latch is process-global by design (a draft runner and its target
     share it), so a value left behind would decide the next case."""
     for name in (
-        "SGLANG_UNEVEN_TOKEN_VECTOR",
-        "SGLANG_UNEVEN_TOKEN_VECTOR_ROLE",
-        "SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE",
+        "FLLIPER_UNEVEN_TOKEN_VECTOR",
+        "FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE",
+        "FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE",
     ):
         monkeypatch.delenv(name, raising=False)
     reset_seed_liveness()
@@ -163,9 +163,9 @@ def test_state_is_readable_for_diagnosis():
 
 
 def test_resolver_arms_the_claim_for_a_seed(monkeypatch):
-    monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", "29,19,16")
-    monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_ROLE", "seed")
-    monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE", "measured")
+    monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", "29,19,16")
+    monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE", "seed")
+    monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE", "measured")
     out = resolve_cp_token_ratios(_args())
     assert out == SEED
     assert seed_liveness_state()[0] == SEED
@@ -175,9 +175,9 @@ def test_resolver_does_not_arm_for_a_pin(monkeypatch):
     """A pin ASSERTS its value. It promises nothing about being replaced, so
     holding it to a supersession it never claimed would refuse every
     deliberately pinned boot."""
-    monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", "29,17,18")
-    monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_ROLE", "pin")
-    monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE", "measured")
+    monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", "29,17,18")
+    monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE", "pin")
+    monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE", "measured")
     out = resolve_cp_token_ratios(_args(uneven_token_vector_role="pin"))
     assert out == MEASURED
     assert seed_liveness_state()[0] is None
@@ -188,8 +188,8 @@ def test_resolver_does_not_arm_for_a_pin(monkeypatch):
 def test_resolver_arms_the_reduced_form(monkeypatch):
     """The install compares gcd-reduced vectors, so the latch must hold the
     same form or the diagnosis would name a vector that appears nowhere."""
-    monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR", "58,38,32")
-    monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_ROLE", "seed")
-    monkeypatch.setenv("SGLANG_UNEVEN_TOKEN_VECTOR_PROVENANCE", "measured")
+    monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR", "58,38,32")
+    monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE", "seed")
+    monkeypatch.setenv("FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE", "measured")
     resolve_cp_token_ratios(_args())
     assert seed_liveness_state()[0] == SEED

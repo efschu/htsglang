@@ -4,7 +4,7 @@ WHY THIS FILE EXISTS
 --------------------
 Audit #500's structural finding (§3) is that this tree has TWO capability
 registries and they disagree. ``planner/flags.py`` calls itself "the single
-source of truth for EVERY sglang ``ServerArgs`` flag plus EVERY fork-specific
+source of truth for EVERY flliper ``ServerArgs`` flag plus EVERY fork-specific
 flag/env var" and carries ``requires`` / ``mutually_exclusive_with`` /
 ``tuple_len_flag`` edges that drive the dashboard's Runner tab.
 ``FEATURE_CATALOG.md`` never mentions it. Neither is authoritative -- only the
@@ -67,11 +67,11 @@ executed red before the fix (that is where the two rows above come from).
 import unittest
 from unittest.mock import patch
 
-import sglang.srt.server_args as server_args_module
-from sglang.srt.planner import flags
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.server_args as server_args_module
+from flliper.srt.planner import flags
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 

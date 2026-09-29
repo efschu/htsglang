@@ -3,14 +3,14 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.decode_attention import (
+from flliper.kernels.ops.attention.decode_attention import (
     decode_attention_fwd_grouped,
 )
-from sglang.kernels.ops.attention.rocm_mla_decode_rope import (
+from flliper.kernels.ops.attention.rocm_mla_decode_rope import (
     decode_attention_fwd_grouped_rope,
 )
-from sglang.srt.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestTritonAttentionMLA(CustomTestCase):

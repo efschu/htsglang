@@ -130,7 +130,7 @@ class _FakeDist:
 
 
 def _receiver(monkeypatch, messages, size_delay=0, data_delay=0):
-    from sglang.srt.managers import pp_chain_receiver as mod
+    from flliper.srt.managers import pp_chain_receiver as mod
 
     fake = _FakeDist(messages, size_delay=size_delay, data_delay=data_delay)
     monkeypatch.setattr(mod, "dist", fake)
@@ -250,7 +250,7 @@ def _upstream(port, payload_kb, q):
     try:
         import torch.distributed as dist
 
-        from sglang.srt.utils import point_to_point_pyobj
+        from flliper.srt.utils import point_to_point_pyobj
 
         _init(0, port)
         payload = ["q" * (payload_kb * 1024)]
@@ -270,7 +270,7 @@ def _downstream(port, drain, hold_s, q):
     try:
         import torch.distributed as dist
 
-        from sglang.srt.managers.pp_chain_receiver import PpChainReceiver
+        from flliper.srt.managers.pp_chain_receiver import PpChainReceiver
 
         _init(1, port)
         rx = PpChainReceiver(group=None, src=0, dst=1)

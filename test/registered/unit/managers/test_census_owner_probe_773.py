@@ -29,9 +29,9 @@ import unittest
 import unittest.mock
 from types import SimpleNamespace
 
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5)
 
@@ -49,7 +49,7 @@ def _probe(scheduler):
 def _run(scheduler, leaked, alloc=None, tree=None):
     stub = _probe(scheduler)
     with unittest.mock.patch.object(
-        logging.getLogger("sglang.srt.managers.phase_flip_runtime"), "warning"
+        logging.getLogger("flliper.srt.managers.phase_flip_runtime"), "warning"
     ) as warn:
         stub._census_owner_probe("at-arm", "pp_to_tp", alloc, tree, leaked)
     assert warn.called, "the probe must always emit"
@@ -192,7 +192,7 @@ class TestTheCensusActuallyCallsTheProbe(CustomTestCase):
             )
 
         with unittest.mock.patch.object(
-            logging.getLogger("sglang.srt.managers.phase_flip_runtime"), "warning"
+            logging.getLogger("flliper.srt.managers.phase_flip_runtime"), "warning"
         ) as warn:
             stub._pool_census("at-arm", "pp_to_tp")
 

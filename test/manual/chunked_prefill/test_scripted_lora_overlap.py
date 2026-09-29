@@ -1,9 +1,9 @@
 import unittest
 
-from sglang.srt.lora.lora_registry import LoRARef
-from sglang.test.scripted_runtime.context import ScriptedContext
-from sglang.test.scripted_runtime.test_case import ScriptedTestCase
-from sglang.test.scripted_runtime_chunked_helpers import (
+from flliper.srt.lora.lora_registry import LoRARef
+from flliper.test.scripted_runtime.context import ScriptedContext
+from flliper.test.scripted_runtime.test_case import ScriptedTestCase
+from flliper.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,

@@ -12,18 +12,18 @@ length finish. Drives the real `Req.update_finish_state`; pure CPU."""
 import unittest
 from array import array
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import (
+from flliper.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     FINISH_MATCHED_STR,
     FINISH_MATCHED_TOKEN,
     Req,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

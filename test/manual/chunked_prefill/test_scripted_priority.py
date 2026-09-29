@@ -1,8 +1,8 @@
 import unittest
 
-from sglang.test.scripted_runtime.context import ScriptedContext
-from sglang.test.scripted_runtime.test_case import ScriptedTestCase
-from sglang.test.scripted_runtime_chunked_helpers import (
+from flliper.test.scripted_runtime.context import ScriptedContext
+from flliper.test.scripted_runtime.test_case import ScriptedTestCase
+from flliper.test.scripted_runtime_chunked_helpers import (
     BALLAST_MAX_NEW_TOKENS,
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,

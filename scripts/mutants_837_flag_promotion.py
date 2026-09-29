@@ -49,8 +49,8 @@ _SUMMARY = re.compile(
 )
 
 ROOT = Path(__file__).resolve().parent.parent
-SERVER_ARGS = ROOT / "python/sglang/srt/server_args.py"
-ENVIRON = ROOT / "python/sglang/srt/environ.py"
+SERVER_ARGS = ROOT / "python/flliper/srt/server_args.py"
+ENVIRON = ROOT / "python/flliper/srt/environ.py"
 
 TESTS = ROOT / "test/registered/unit/server_args"
 
@@ -108,7 +108,7 @@ MUTANTS: list[Mutant] = [
     _drop_publish(
         "M1 --seam-shrink is accepted and published nowhere",
         "seam_shrink",
-        "SGLANG_SEAM_SHRINK",
+        "FLLIPER_SEAM_SHRINK",
         "_b(self.seam_shrink)",
         why=(
             "the master gate reaches argparse and never reaches the runtime; "
@@ -119,21 +119,21 @@ MUTANTS: list[Mutant] = [
     _drop_publish(
         "M2 --seam-shrink-prearm-quiesce is published nowhere",
         "seam_shrink_prearm_quiesce",
-        "SGLANG_SEAM_SHRINK_PREARM_QUIESCE",
+        "FLLIPER_SEAM_SHRINK_PREARM_QUIESCE",
         "str(\n                self.seam_shrink_prearm_quiesce\n            )",
         why="half A of the attribution pair cannot be cut apart from half B",
     ),
     _drop_publish(
         "M3 --seam-shrink-defer-grow is published nowhere",
         "seam_shrink_defer_grow",
-        "SGLANG_SEAM_SHRINK_DEFER_GROW",
+        "FLLIPER_SEAM_SHRINK_DEFER_GROW",
         "str(\n                self.seam_shrink_defer_grow\n            )",
         why="half B of the attribution pair, the same defect from the other end",
     ),
     _drop_publish(
         "M4 --seam-shrink-grow-debt-rounds is published nowhere",
         "seam_shrink_grow_debt_rounds",
-        "SGLANG_SEAM_SHRINK_GROW_DEBT_ROUNDS",
+        "FLLIPER_SEAM_SHRINK_GROW_DEBT_ROUNDS",
         "str(\n                self.seam_shrink_grow_debt_rounds\n            )",
         why=(
             "the #834 ratchet patience silently stays at 32 rounds; a window "
@@ -144,7 +144,7 @@ MUTANTS: list[Mutant] = [
     _drop_publish(
         "M5 --flip-seam-drain-budget-ms is published nowhere",
         "flip_seam_drain_budget_ms",
-        "SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS",
+        "FLLIPER_FLIP_SEAM_DRAIN_BUDGET_MS",
         "str(\n                self.flip_seam_drain_budget_ms\n            )",
         why=(
             "the #830 seam guard keeps the derived 1094 ms no matter what the "
@@ -154,7 +154,7 @@ MUTANTS: list[Mutant] = [
     _drop_publish(
         "M6 --hicache-read-buffers is published nowhere",
         "hicache_read_buffers",
-        "SGLANG_HICACHE_READ_BUFFERS",
+        "FLLIPER_HICACHE_READ_BUFFERS",
         "str(self.hicache_read_buffers)",
         why=(
             "the #720 read-buffer ring stays disabled; the knob DESIGN_706 "
@@ -174,12 +174,12 @@ MUTANTS: list[Mutant] = [
         ),
         path=SERVER_ARGS,
         old=(
-            '            os.environ["SGLANG_SEAM_SHRINK_PREARM_QUIESCE"] = str(\n'
+            '            os.environ["FLLIPER_SEAM_SHRINK_PREARM_QUIESCE"] = str(\n'
             "                self.seam_shrink_prearm_quiesce\n"
             "            )"
         ),
         new=(
-            '            os.environ["SGLANG_SEAM_SHRINK_PREARM_QUIESCE"] = _b(\n'
+            '            os.environ["FLLIPER_SEAM_SHRINK_PREARM_QUIESCE"] = _b(\n'
             "                self.seam_shrink_prearm_quiesce\n"
             "            )"
         ),
@@ -189,12 +189,12 @@ MUTANTS: list[Mutant] = [
         why="the same collapse on the other half; each half needs its own arm",
         path=SERVER_ARGS,
         old=(
-            '            os.environ["SGLANG_SEAM_SHRINK_DEFER_GROW"] = str(\n'
+            '            os.environ["FLLIPER_SEAM_SHRINK_DEFER_GROW"] = str(\n'
             "                self.seam_shrink_defer_grow\n"
             "            )"
         ),
         new=(
-            '            os.environ["SGLANG_SEAM_SHRINK_DEFER_GROW"] = _b(\n'
+            '            os.environ["FLLIPER_SEAM_SHRINK_DEFER_GROW"] = _b(\n'
             "                self.seam_shrink_defer_grow\n"
             "            )"
         ),
@@ -204,7 +204,7 @@ MUTANTS: list[Mutant] = [
         "flip_seam_drain_budget_ms",
         why=(
             "END OF BYTE-IDENTITY. Every boot that never asked for this knob "
-            "would start writing SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS=None, which "
+            "would start writing FLLIPER_FLIP_SEAM_DRAIN_BUDGET_MS=None, which "
             "EnvInt cannot parse -- it warns and falls back to the default, so "
             "the damage is a log line and a habit, not a crash"
         ),
@@ -265,7 +265,7 @@ MUTANTS: list[Mutant] = [
         new="        pass",
     ),
     Mutant(
-        name="M15 SGLANG_SEAM_SHRINK loses its deprecation notice",
+        name="M15 FLLIPER_SEAM_SHRINK loses its deprecation notice",
         why=(
             "the bridge stops announcing itself. A boot script that still sets "
             "the env keeps working -- which is the point of the bridge -- but "
@@ -275,7 +275,7 @@ MUTANTS: list[Mutant] = [
         path=ENVIRON,
         old=(
             "_warn_deprecated_env_to_cli_flag(\n"
-            '    "SGLANG_SEAM_SHRINK",\n'
+            '    "FLLIPER_SEAM_SHRINK",\n'
             "    \"Please use '--seam-shrink' instead.\",\n"
             ")"
         ),

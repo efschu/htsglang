@@ -23,13 +23,13 @@ import unittest
 from fractions import Fraction
 from pathlib import Path
 
-from sglang.srt.liveness import EndpointClass, LivenessConfig
-from sglang.srt.video_enhance.chain import StageKind
-from sglang.srt.video_enhance.frame_math import PixelFormat, Resolution
-from sglang.srt.video_enhance.frames import Frame, StageBase
-from sglang.srt.video_enhance.mux import MediaInfo, TrackInfo, build_remux_command
-from sglang.srt.video_enhance.probes import load_frontier, load_probe_reports
-from sglang.srt.video_enhance.server import (
+from flliper.srt.liveness import EndpointClass, LivenessConfig
+from flliper.srt.video_enhance.chain import StageKind
+from flliper.srt.video_enhance.frame_math import PixelFormat, Resolution
+from flliper.srt.video_enhance.frames import Frame, StageBase
+from flliper.srt.video_enhance.mux import MediaInfo, TrackInfo, build_remux_command
+from flliper.srt.video_enhance.probes import load_frontier, load_probe_reports
+from flliper.srt.video_enhance.server import (
     CHAIN_PRESETS,
     WHOLE_SOURCE,
     EnhanceRequestBody,
@@ -40,9 +40,9 @@ from sglang.srt.video_enhance.server import (
     normalize_job_id,
     resolve_time_range,
 )
-from sglang.srt.video_enhance.tenant import TenantConfig, build_stages
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.video_enhance.tenant import TenantConfig, build_stages
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -136,7 +136,7 @@ class RangeReachesTheDecodeStageTest(CustomTestCase):
     """A resolved range is only useful if it lands on the two decode knobs."""
 
     def _chain(self):
-        from sglang.srt.video_enhance.chain import ChainRequest, build_chain
+        from flliper.srt.video_enhance.chain import ChainRequest, build_chain
 
         # A downscaling resize-only chain: it has the decode stage the range
         # lands on and needs neither a TensorRT engine nor RIFE weights to
@@ -187,7 +187,7 @@ class RemuxRangeTest(CustomTestCase):
         )
 
     def _command(self, **kwargs):
-        from sglang.srt.video_enhance.mux import TrackSelection
+        from flliper.srt.video_enhance.mux import TrackSelection
 
         return build_remux_command(
             source_url="/tmp/a.mp4",
@@ -687,7 +687,7 @@ class RouteTableTest(CustomTestCase):
     """The endpoints the extension's README documents must exist."""
 
     def test_every_documented_route_is_mounted(self):
-        from sglang.srt.video_enhance.server import create_app
+        from flliper.srt.video_enhance.server import create_app
 
         app = create_app(TenantConfig(budget_mib=8192))
         mounted = {
@@ -709,7 +709,7 @@ class RouteTableTest(CustomTestCase):
                 self.assertIn((path, method), mounted)
 
     def test_the_enhance_get_accepts_the_range_and_job_id_parameters(self):
-        from sglang.srt.video_enhance.server import create_app
+        from flliper.srt.video_enhance.server import create_app
 
         app = create_app(TenantConfig(budget_mib=8192))
         route = next(

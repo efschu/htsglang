@@ -34,15 +34,15 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
-from sglang.srt.mem_cache.mamba_pool_floor import (
+from flliper.srt.mem_cache.base_prefix_cache import DecLockRefParams
+from flliper.srt.mem_cache.mamba_pool_floor import (
     mamba_anchor_ack_release_active,
     mamba_slots_per_running_req,
 )
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 from test_mamba_pin_budget_live_773 import _build, _checkpoint_nodes, _mamba_value
 
@@ -83,7 +83,7 @@ class _ReorderEnv(CustomTestCase):
 
     def setUp(self):
         self._env = mock.patch.dict(
-            os.environ, {"SGLANG_MAMBA_SLOT_REORDER": "1"}, clear=False
+            os.environ, {"FLLIPER_MAMBA_SLOT_REORDER": "1"}, clear=False
         )
         self._env.start()
         self.addCleanup(self._env.stop)
@@ -100,7 +100,7 @@ class TestThePredicate(_ReorderEnv):
         self.assertEqual(mamba_slots_per_running_req(sa), 2)
 
     def test_requires_the_reorder(self):
-        with mock.patch.dict(os.environ, {"SGLANG_MAMBA_SLOT_REORDER": "0"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_MAMBA_SLOT_REORDER": "0"}):
             self.assertFalse(mamba_anchor_ack_release_active(_armed_args()))
 
     def test_excluded_dec_site_families_refuse_arming(self):
@@ -123,7 +123,7 @@ class TestThePredicate(_ReorderEnv):
         self.assertEqual(mamba_slots_per_running_req(_armed_args()), 1)
 
     def test_describe_names_the_mechanism(self):
-        from sglang.srt.mem_cache.mamba_pool_floor import describe_mamba_floor
+        from flliper.srt.mem_cache.mamba_pool_floor import describe_mamba_floor
 
         self.assertIn("#811", describe_mamba_floor(_armed_args(), 8))
 

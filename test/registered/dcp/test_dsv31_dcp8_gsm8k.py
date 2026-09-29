@@ -40,11 +40,11 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -223,7 +223,7 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
     def setUpClass(cls):
         # Launch non-DCP baseline server first
         env = os.environ.copy()
-        env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
+        env["FLLIPER_JIT_DEEPGEMM_PRECOMPILE"] = "0"
         cls._baseline_process = popen_launch_server(
             DEEPSEEK_V31_MODEL_PATH,
             cls.base_url,
@@ -297,7 +297,7 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
         time.sleep(5)
 
         env = os.environ.copy()
-        env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
+        env["FLLIPER_JIT_DEEPGEMM_PRECOMPILE"] = "0"
         dcp_process = popen_launch_server(
             DEEPSEEK_V31_MODEL_PATH,
             self.base_url,

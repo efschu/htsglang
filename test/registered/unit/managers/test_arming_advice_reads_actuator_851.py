@@ -1,6 +1,6 @@
 """#851 F5: the advice must read the value the actuator adopted.
 
-W22 armed the #826 solver (`SGLANG_ARMING_FLOOR_SOLVED=1`) and it WORKED --
+W22 armed the #826 solver (`FLLIPER_ARMING_FLOOR_SOLVED=1`) and it WORKED --
 boot_w22_0824_0656.log:396/411/412 (06:56:43, all three ranks):
 
     CORRIDOR-GUARD #826 arming floor 1037 MiB, solver-derived,
@@ -39,8 +39,8 @@ two directions independent rather than order-dependent.
 import os
 import unittest
 
-from sglang.srt.managers import corridor_guard as cg
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.srt.managers import corridor_guard as cg
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
 SOLVED_ENV = cg.SOLVED_FLOOR_ENV
 

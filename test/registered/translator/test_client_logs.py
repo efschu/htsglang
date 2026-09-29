@@ -25,8 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from sglang.srt.translator import server as server_module  # noqa: E402
-from sglang.srt.translator.server import build_app  # noqa: E402
+from flliper.srt.translator import server as server_module  # noqa: E402
+from flliper.srt.translator.server import build_app  # noqa: E402
 from test_audio_and_http import build_service  # noqa: E402
 
 

@@ -2,13 +2,13 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_utils import (
+from flliper.srt.layers.quantization.fp8_utils import (
     inverse_transform_scale_ue8m0,
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 

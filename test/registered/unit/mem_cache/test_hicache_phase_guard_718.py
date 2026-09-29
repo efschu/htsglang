@@ -33,9 +33,9 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache import hicache_phase_guard as guard
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache import hicache_phase_guard as guard
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Exploding:
@@ -177,7 +177,7 @@ class TestPhaseGuard(CustomTestCase):
         import sys
 
         guard.flip_routing_active = self._orig
-        name = "sglang.srt.distributed.parallel_state"
+        name = "flliper.srt.distributed.parallel_state"
         real = sys.modules.get(name)
 
         class _Broken:
@@ -202,7 +202,7 @@ class TestReachability(CustomTestCase):
         """No hierarchical cache, no controller, no device-tier I/O. This is
         why the hazard is LATENT on the live flagset rather than live: the
         serving argv carries --enable-phase-flip and no hicache flags."""
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         self.assertFalse(ServerArgs(model_path="dummy").enable_hierarchical_cache)
 

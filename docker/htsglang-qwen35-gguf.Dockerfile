@@ -16,7 +16,7 @@ FROM ${BASE}
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# The base editable-installs sglang from /sgl-workspace/sglang/python, so
+# The base editable-installs flliper from /sgl-workspace/sglang/python, so
 # overlaying the source there makes the GGUF code live with no reinstall.
 COPY python /sgl-workspace/sglang/python
 

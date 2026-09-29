@@ -1,8 +1,8 @@
 """#190 stage 4: hammer the FP8 MARLIN linear on one sm8x gpu.
 
-On sm80-sm88 sglang's Fp8LinearMethod sets use_marlin (can_auto_enable_marlin_fp8:
+On sm80-sm88 flliper's Fp8LinearMethod sets use_marlin (can_auto_enable_marlin_fp8:
 80 <= sm < 89), so an RTX 3080 runs every fp8 linear through
-torch.ops.sglang.apply_fp8_marlin_linear -> gptq_marlin_gemm, NOT through the
+torch.ops.flliper.apply_fp8_marlin_linear -> gptq_marlin_gemm, NOT through the
 triton block-fp8 matmul (triton has no fp8e4nv on Ampere at all).
 
 The layer bisect put the first run-to-run divergence exactly on such a linear
@@ -37,7 +37,7 @@ def main():
     p.add_argument("--zero-ws", type=int, default=0)
     a = p.parse_args()
 
-    from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    from flliper.srt.layers.quantization.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
         prepare_fp8_layer_for_marlin,
     )

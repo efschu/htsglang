@@ -18,18 +18,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.srt.registry import ladder, tick as tick_mod
-from sglang.srt.registry.adapter import Health, register_adapter
-from sglang.srt.registry.arbiter import EngineRegistry
-from sglang.srt.registry.ladder import COLD, HOT, TEIL_HOT, WARM
-from sglang.srt.registry.ledger import MIB, ReservationStore
-from sglang.srt.registry.spec import (
+from flliper.srt.registry import ladder, tick as tick_mod
+from flliper.srt.registry.adapter import Health, register_adapter
+from flliper.srt.registry.arbiter import EngineRegistry
+from flliper.srt.registry.ladder import COLD, HOT, PART_HOT, WARM
+from flliper.srt.registry.ledger import MIB, ReservationStore
+from flliper.srt.registry.spec import (
     EngineClass,
     EngineSpec,
     ResidencyState,
     ResourceProfile,
 )
-from sglang.srt.registry.tick import HELD, REFUSED, STEPPED, ControlTick
+from flliper.srt.registry.tick import HELD, REFUSED, STEPPED, ControlTick
 
 GIB = 1024 * MIB
 CARD = "GPU-tick0000-0000-0000-0000-00000000000t"
@@ -45,7 +45,7 @@ UNDECLARED = "tick_undeclared"  # on no rung table at all
 
 ladder.declare_class(
     LADDER_SHAPED,
-    {HOT, TEIL_HOT, COLD},
+    {HOT, PART_HOT, COLD},
     absent_because={WARM: "test double shaped like class1_srt: no host image"},
     replace=True,
 )
@@ -53,7 +53,7 @@ ladder.declare_class(
     ENDS_ONLY,
     {HOT, COLD},
     absent_because={
-        TEIL_HOT: "test double shaped like class3_utility: HOT / COLD only",
+        PART_HOT: "test double shaped like class3_utility: HOT / COLD only",
         WARM: "test double shaped like class3_utility: HOT / COLD only",
     },
     replace=True,
@@ -61,7 +61,7 @@ ladder.declare_class(
 ladder.declare_class(
     WARM_ONLY,
     {HOT, WARM, COLD},
-    absent_because={TEIL_HOT: "test double shaped like class2_diffusion"},
+    absent_because={PART_HOT: "test double shaped like class2_diffusion"},
     replace=True,
 )
 
@@ -161,7 +161,7 @@ class TestItIsOffByDefault(TickTestCase):
         self.assertIsNone(t._thread)
 
     def test_the_launch_flag_defaults_to_off(self):
-        from sglang.srt.registry.launch import make_parser
+        from flliper.srt.registry.launch import make_parser
 
         args = make_parser().parse_args([])
         self.assertIsNone(args.tick_interval_s)
@@ -182,7 +182,7 @@ class TestItStepsOnlyAlongDeclaredEdges(TickTestCase):
         self.registry.ensure_state(engine_id, state)
         self.advance(1_000.0)
 
-    def test_a_full_ladder_class_steps_HOT_to_TEIL_HOT_not_straight_to_COLD(self):
+    def test_a_full_ladder_class_steps_HOT_to_PART_HOT_not_straight_to_COLD(self):
         """The rung ``return_to_idle`` throws away is the one worth having: the
         process, the CUDA context and the graphs survive a TEIL-HOT park."""
         self.add("full")
@@ -190,7 +190,7 @@ class TestItStepsOnlyAlongDeclaredEdges(TickTestCase):
         report = self.tick().run_once()
         decision = report.of("full")
         self.assertEqual(decision.action, STEPPED)
-        self.assertEqual((decision.src_rung, decision.dst_rung), (HOT, TEIL_HOT))
+        self.assertEqual((decision.src_rung, decision.dst_rung), (HOT, PART_HOT))
         self.assertEqual(self.registry.instance("full").state, ResidencyState.WARM_GPU)
         self.assertEqual(decision.skipped_rungs, ())
 
@@ -201,13 +201,13 @@ class TestItStepsOnlyAlongDeclaredEdges(TickTestCase):
         decision = self.tick().evaluate().of("full")
         self.assertTrue(ladder.can(LADDER_SHAPED, decision.src_rung, decision.dst_rung))
 
-    def test_TEIL_HOT_steps_to_COLD_and_names_the_rung_it_stepped_over(self):
+    def test_PART_HOT_steps_to_COLD_and_names_the_rung_it_stepped_over(self):
         """Adjacency is not reachability: this class has no WARM, so the next
         rung down is COLD and the skip has to be visible, not silent."""
         self.add("full")
         self._idle("full", ResidencyState.WARM_GPU)
         decision = self.tick().run_once().of("full")
-        self.assertEqual((decision.src_rung, decision.dst_rung), (TEIL_HOT, COLD))
+        self.assertEqual((decision.src_rung, decision.dst_rung), (PART_HOT, COLD))
         self.assertEqual(decision.skipped_rungs, (WARM,))
         self.assertEqual(self.registry.instance("full").state, ResidencyState.COLD)
 
@@ -216,14 +216,14 @@ class TestItStepsOnlyAlongDeclaredEdges(TickTestCase):
         self._idle("ends")
         decision = self.tick().run_once().of("ends")
         self.assertEqual((decision.src_rung, decision.dst_rung), (HOT, COLD))
-        self.assertEqual(decision.skipped_rungs, (TEIL_HOT, WARM))
+        self.assertEqual(decision.skipped_rungs, (PART_HOT, WARM))
 
     def test_a_warm_only_class_steps_HOT_to_WARM(self):
         self.add("warm", adapter=WARM_ONLY)
         self._idle("warm")
         decision = self.tick().run_once().of("warm")
         self.assertEqual((decision.src_rung, decision.dst_rung), (HOT, WARM))
-        self.assertEqual(decision.skipped_rungs, (TEIL_HOT,))
+        self.assertEqual(decision.skipped_rungs, (PART_HOT,))
 
     def test_COLD_is_the_floor_and_the_tick_says_so_rather_than_looping(self):
         self.add("full")
@@ -249,7 +249,7 @@ class TestItRefusesUnbuiltEdgesLoudly(TickTestCase):
         self.add("mystery", adapter=UNDECLARED)
         self.registry.ensure_state("mystery", ResidencyState.HOT)
         self.advance(1_000.0)
-        with self.assertLogs("sglang.srt.registry.tick", level="WARNING") as logs:
+        with self.assertLogs("flliper.srt.registry.tick", level="WARNING") as logs:
             report = self.tick().run_once()
         decision = report.of("mystery")
         self.assertEqual(decision.action, REFUSED)
@@ -263,7 +263,7 @@ class TestItRefusesUnbuiltEdgesLoudly(TickTestCase):
         self.add("mystery", adapter=UNDECLARED)
         self.registry.ensure_state("mystery", ResidencyState.HOT)
         self.advance(1_000.0)
-        with self.assertLogs("sglang.srt.registry.tick", level="WARNING"):
+        with self.assertLogs("flliper.srt.registry.tick", level="WARNING"):
             decision = self.tick().run_once().of("mystery")
         self.assertIn("known:", decision.reason)
 
@@ -273,7 +273,7 @@ class TestItRefusesUnbuiltEdgesLoudly(TickTestCase):
         self.registry.ensure_state("mystery", ResidencyState.HOT)
         self.registry.ensure_state("full", ResidencyState.HOT)
         self.advance(1_000.0)
-        with self.assertLogs("sglang.srt.registry.tick", level="WARNING"):
+        with self.assertLogs("flliper.srt.registry.tick", level="WARNING"):
             report = self.tick().run_once()
         self.assertEqual(report.of("mystery").action, REFUSED)
         self.assertEqual(report.of("full").action, STEPPED)
@@ -361,7 +361,7 @@ class TestTheConstraintsFromTheDetermination(TickTestCase):
     def test_the_arbiters_rank_table_agrees_with_the_ladders_order(self):
         """``ensure_state`` tells a promotion from a demotion by rank; if that
         order ever disagreed with the ladder, a step down would promote."""
-        from sglang.srt.registry.arbiter import _RESIDENCY_RANK
+        from flliper.srt.registry.arbiter import _RESIDENCY_RANK
 
         by_rank = sorted(_RESIDENCY_RANK, key=lambda s: _RESIDENCY_RANK[s])
         self.assertEqual(

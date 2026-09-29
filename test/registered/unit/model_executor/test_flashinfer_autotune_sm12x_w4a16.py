@@ -5,10 +5,10 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.layers.quantization import fp4_utils
-from sglang.srt.layers.quantization import nvfp4_sm12x_w4a16 as S
-from sglang.srt.model_executor.runner import flashinfer_autotune as A
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.quantization import fp4_utils
+from flliper.srt.layers.quantization import nvfp4_sm12x_w4a16 as S
+from flliper.srt.model_executor.runner import flashinfer_autotune as A
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -32,9 +32,9 @@ class TestGate(unittest.TestCase):
         with mock.patch.dict("os.environ", e, clear=False), mock.patch.object(
             fp4_utils, "FP4_GEMM_RUNNER_BACKEND", fp4_utils.Fp4GemmRunnerBackend("cutlass")
         ), mock.patch.object(A, "cuda_sm_at_least", return_value=True), mock.patch(
-            "sglang.srt.layers.quantization.fp8_utils.get_fp8_gemm_runner_backend",
+            "flliper.srt.layers.quantization.fp8_utils.get_fp8_gemm_runner_backend",
             return_value=types.SimpleNamespace(is_flashinfer_cutlass=lambda: False),
-        ), mock.patch("sglang.srt.utils.is_sm100_supported", return_value=False):
+        ), mock.patch("flliper.srt.utils.is_sm100_supported", return_value=False):
             if env is None:
                 import os
 

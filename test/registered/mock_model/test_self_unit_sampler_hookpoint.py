@@ -1,4 +1,4 @@
-"""install_oracle_sampler registration into sglang's sampler-backend registry.
+"""install_oracle_sampler registration into flliper's sampler-backend registry.
 
 Instantiating the registered _OracleSampler factory requires a live distributed (TP) group
 plus a populated global ServerArgs, so the forward-path behavior of _OracleSampler is covered
@@ -12,14 +12,14 @@ from __future__ import annotations
 import os
 import unittest
 
-os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1"
+os.environ["FLLIPER_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1"
 
-from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
-from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
-from sglang.srt.layers.sampler import _CUSTOM_SAMPLER_FACTORIES
-from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.kv_canary.token_oracle.oracle import HashOracle
+from flliper.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
+from flliper.srt.layers.sampler import _CUSTOM_SAMPLER_FACTORIES
+from flliper.srt.server_args import SAMPLING_BACKEND_CHOICES
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=60, suite="extra-a-test-1-gpu-small-amd")

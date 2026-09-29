@@ -13,15 +13,15 @@ from io import StringIO
 import requests
 from huggingface_hub import snapshot_download
 
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.model_file_verifier import (
+from flliper.srt.utils import kill_process_tree
+from flliper.srt.utils.model_file_verifier import (
     IntegrityError,
     compute_sha256,
     generate_checksums,
     verify,
 )
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -176,7 +176,7 @@ class TestModelFileVerifierCLI(_FakeModelTestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang.srt.utils.model_file_verifier",
+                "flliper.srt.utils.model_file_verifier",
                 "generate",
                 "--model-path",
                 self.test_dir,
@@ -202,7 +202,7 @@ class TestModelFileVerifierCLI(_FakeModelTestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang.srt.utils.model_file_verifier",
+                "flliper.srt.utils.model_file_verifier",
                 "verify",
                 "--model-path",
                 self.test_dir,
@@ -226,7 +226,7 @@ class TestModelFileVerifierCLI(_FakeModelTestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang.srt.utils.model_file_verifier",
+                "flliper.srt.utils.model_file_verifier",
                 "verify",
                 "--model-path",
                 self.test_dir,

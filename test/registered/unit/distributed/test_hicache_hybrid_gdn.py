@@ -11,7 +11,7 @@ Covers the two host-side fixes:
    MambaPoolHost, now they are normalized with a warning up front.
 
 No GPU, no distributed init: collectives and parallel groups are
-patched; `sgl_kernel` is stubbed before the sglang imports.
+patched; `sgl_kernel` is stubbed before the flliper imports.
 """
 
 import importlib.util
@@ -50,13 +50,13 @@ _install_sgl_kernel_stub()
 
 import torch  # noqa: E402
 
-import sglang.srt.distributed.parallel_state as parallel_state  # noqa: E402
-from sglang.srt.distributed.utils import set_tp_partition_ratios  # noqa: E402
-from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache  # noqa: E402
-from sglang.srt.mem_cache.pool_host.base import sync_fixed_hicache_size  # noqa: E402
-from sglang.srt.server_args import ServerArgs  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+import flliper.srt.distributed.parallel_state as parallel_state  # noqa: E402
+from flliper.srt.distributed.utils import set_tp_partition_ratios  # noqa: E402
+from flliper.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache  # noqa: E402
+from flliper.srt.mem_cache.pool_host.base import sync_fixed_hicache_size  # noqa: E402
+from flliper.srt.server_args import ServerArgs  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 

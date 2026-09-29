@@ -12,7 +12,7 @@
 #   --page-size 1 --enable-hierarchical-cache
 #   --hicache-storage-backend file --hicache-write-policy write_through
 #   --hicache-mem-layout page_first_direct
-# and SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR pointing at their store. A
+# and FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR pointing at their store. A
 # hybrid-GDN model has no choice about the layout: MambaPoolHost accepts
 # page_first_direct only.
 #
@@ -109,7 +109,7 @@ EOF
 "$PY" "$PROBE" liveness --port "$PORT_B" --tokenizer "$TOKENIZER" --state "$STATE"
 
 echo "== 4. manifest-scoped umsharder (source store stays LIVE) =="
-"$PY" -m sglang.srt.mem_cache.hicache_migrate \
+"$PY" -m flliper.srt.mem_cache.hicache_migrate \
   --source-dir "$STORE_A" --target-dir "$STORE_B" \
   --manifest "$MANIFEST" \
   --target-tp-size "$TARGET_TP" --target-ratios "$TARGET_RATIOS" \

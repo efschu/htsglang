@@ -10,12 +10,12 @@ against the adapters' own refusal text rather than restating it.
 import inspect
 import unittest
 
-from sglang.srt.registry import ladder
-from sglang.srt.registry.ladder import (
+from flliper.srt.registry import ladder
+from flliper.srt.registry.ladder import (
     COLD,
     HOT,
     RUNG_ORDER,
-    TEIL_HOT,
+    PART_HOT,
     WARM,
     LadderRefusal,
     can,
@@ -29,16 +29,16 @@ from sglang.srt.registry.ladder import (
 class TestTheHeadline(unittest.TestCase):
     """No class has all four rungs, and one edge exists nowhere."""
 
-    def test_TEIL_HOT_to_WARM_is_absent_for_every_class(self):
+    def test_PART_HOT_to_WARM_is_absent_for_every_class(self):
         absent = universally_absent()
-        self.assertIn((TEIL_HOT, WARM), absent)
-        self.assertIn((WARM, TEIL_HOT), absent)
+        self.assertIn((PART_HOT, WARM), absent)
+        self.assertIn((WARM, PART_HOT), absent)
 
     def test_no_class_implements_both_middle_rungs(self):
         for klass in ladder.CLASS_RUNGS:
             have = ladder.rungs_for(klass)
             self.assertFalse(
-                TEIL_HOT in have and WARM in have,
+                PART_HOT in have and WARM in have,
                 f"{klass} now has both middle rungs -- the #305 determination's "
                 "central claim is retired; update it",
             )
@@ -65,22 +65,22 @@ class TestTheTableMatchesTheAdapters(unittest.TestCase):
         return " ".join(inspect.getsource(mod).split())
 
     def test_class1_really_refuses_WARM_HOST(self):
-        from sglang.srt.registry.adapters import class1_srt
+        from flliper.srt.registry.adapters import class1_srt
 
         self.assertIn("Class 1 has no WARM_HOST rung", self._src(class1_srt))
         self.assertNotIn(WARM, ladder.CLASS_RUNGS["class1_srt"])
 
     def test_class2_really_refuses_WARM_GPU(self):
-        from sglang.srt.registry.adapters import class2_diffusion
+        from flliper.srt.registry.adapters import class2_diffusion
 
         self.assertIn("no WARM_GPU endpoint", self._src(class2_diffusion))
-        self.assertNotIn(TEIL_HOT, ladder.CLASS_RUNGS["class2_diffusion"])
+        self.assertNotIn(PART_HOT, ladder.CLASS_RUNGS["class2_diffusion"])
 
     def test_class3_really_refuses_WARM_GPU(self):
-        from sglang.srt.registry.adapters import class3_utility
+        from flliper.srt.registry.adapters import class3_utility
 
         self.assertIn("no WARM_GPU rung", self._src(class3_utility))
-        self.assertNotIn(TEIL_HOT, ladder.CLASS_RUNGS["class3_utility"])
+        self.assertNotIn(PART_HOT, ladder.CLASS_RUNGS["class3_utility"])
 
     def test_every_declared_absence_carries_its_reason(self):
         for klass, have in ladder.CLASS_RUNGS.items():
@@ -97,13 +97,13 @@ class TestTheTableMatchesTheAdapters(unittest.TestCase):
 class TestItRefusesBeforeDrivingAnything(unittest.TestCase):
     def test_an_unbuilt_transition_names_the_missing_rung_and_why(self):
         with self.assertRaises(LadderRefusal) as e:
-            check_transition("class1_srt", TEIL_HOT, WARM)
+            check_transition("class1_srt", PART_HOT, WARM)
         msg = str(e.exception)
         self.assertIn("target rung WARM does not exist", msg)
         self.assertIn("not a reloadable host image", msg)
 
     def test_a_built_transition_passes(self):
-        check_transition("class1_srt", HOT, TEIL_HOT)
+        check_transition("class1_srt", HOT, PART_HOT)
         check_transition("class2_diffusion", HOT, WARM)
         check_transition("class3_utility", HOT, COLD)
 
@@ -131,13 +131,13 @@ class TestTheReportIsUsable(unittest.TestCase):
 
     def test_reachable_edges_excludes_the_absent_rung(self):
         edges = reachable_edges("class1_srt")
-        self.assertIn((HOT, TEIL_HOT), edges)
-        self.assertNotIn((TEIL_HOT, WARM), edges)
+        self.assertIn((HOT, PART_HOT), edges)
+        self.assertNotIn((PART_HOT, WARM), edges)
         self.assertNotIn((HOT, WARM), edges)
 
     def test_can_is_symmetric_in_availability(self):
-        self.assertTrue(can("class1_srt", HOT, TEIL_HOT))
-        self.assertTrue(can("class1_srt", TEIL_HOT, HOT))
+        self.assertTrue(can("class1_srt", HOT, PART_HOT))
+        self.assertTrue(can("class1_srt", PART_HOT, HOT))
         self.assertFalse(can("class1_srt", HOT, WARM))
 
 

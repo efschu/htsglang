@@ -23,21 +23,21 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     set_cp_token_ratios,
     set_tp_partition_ratios,
     tp_partition_size,
 )
-from sglang.srt.layers.dcp.gdn_flip_plan import conv_slice, temporal_slice
-from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
-from sglang.srt.layers.dcp.reshard_plan import KvReshardError
-from sglang.srt.managers.gdn_flip_mover import (
+from flliper.srt.layers.dcp.gdn_flip_plan import conv_slice, temporal_slice
+from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+from flliper.srt.layers.dcp.reshard_plan import KvReshardError
+from flliper.srt.managers.gdn_flip_mover import (
     GdnFlipMover,
     derive_pp_linear_layer_map,
     gdn_flip_preconditions,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 from test_phase_flip_runtime import _MailboxExchange  # noqa: E402
 
@@ -178,7 +178,7 @@ class TestGdnFlipBitIdentity(CustomTestCase):
     def setUp(self):
         set_tp_partition_ratios(None, families=None)
         set_cp_token_ratios(None)
-        os.environ.pop("SGLANG_PP_LAYER_PARTITION", None)
+        os.environ.pop("FLLIPER_PP_LAYER_PARTITION", None)
 
     tearDown = setUp
 
@@ -370,7 +370,7 @@ class TestReachableRefusal(CustomTestCase):
 
 class TestLinearLayerMap(CustomTestCase):
     def setUp(self):
-        os.environ.pop("SGLANG_PP_LAYER_PARTITION", None)
+        os.environ.pop("FLLIPER_PP_LAYER_PARTITION", None)
 
     tearDown = setUp
 
@@ -381,7 +381,7 @@ class TestLinearLayerMap(CustomTestCase):
         )
 
     def test_qwen36_recipe_split(self):
-        os.environ["SGLANG_PP_LAYER_PARTITION"] = "32,16,16"
+        os.environ["FLLIPER_PP_LAYER_PARTITION"] = "32,16,16"
         linear = [i for i in range(64) if i % 4 != 3]  # 48 linear layers
         stage_ids = derive_pp_linear_layer_map(linear, 64, 3)
         self.assertEqual([len(s) for s in stage_ids], [24, 12, 12])

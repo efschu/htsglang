@@ -9,7 +9,7 @@ import unittest
 
 import torch
 
-from sglang.srt.distributed.dual_group import (
+from flliper.srt.distributed.dual_group import (
     DUPLICATED,
     NESTED,
     SHARED,
@@ -25,7 +25,7 @@ from sglang.srt.distributed.dual_group import (
     nesting_failures,
     transformer_nesting_probes,
 )
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     get_tp_partition_ratios,
     partition_units,
     scoped_tp_partition_ratios,

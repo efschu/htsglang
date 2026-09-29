@@ -4,9 +4,9 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers import flashinfer_comm_fusion as fusion
-from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.layers import flashinfer_comm_fusion as fusion
+from flliper.srt.runtime_context import get_parallel
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-h100")
 register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-b200")
@@ -175,7 +175,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
         original_comm = fusion._flashinfer_comm
         original_create = fusion._create_allreduce_fusion_workspace
         original_unavailable = fusion._flashinfer_allreduce_unavailable
-        from sglang.srt.runtime_context import get_resources
+        from flliper.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
         manager_key = "flashinfer_fusion_attn_tp_workspace"

@@ -1,14 +1,14 @@
 import unittest
 
-from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
+from flliper.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
-from sglang.test.ascend.e2e.test_npu_performance_utils import (
+from flliper.test.ascend.e2e.test_npu_performance_utils import (
     QWEN3_NEXT_80B_A3B_MODEL_PATH,
     QWEN3_NEXT_80B_A3B_W8A8_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
-from sglang.test.ci.ci_register import register_npu_ci
+from flliper.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
@@ -23,20 +23,20 @@ QWEN3_NEXT_80B_A3B_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "400",
+    "FLLIPER_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "400",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "10",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "TASK_QUEUE_ENABLE": "1",
     "ASCEND_USE_FIA": "1",
-    "SGLANG_NPU_USE_MULTI_STREAM": "0",
-    "SGLANG_WARMUP_TIMEOUT": "3600",
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "FLLIPER_NPU_USE_MULTI_STREAM": "0",
+    "FLLIPER_WARMUP_TIMEOUT": "3600",
+    "FLLIPER_ENABLE_SPEC_V2": "1",
+    "FLLIPER_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "FORCE_DRAFT_MODEL_NON_QUANT": "1",
     "HCCL_BUFFSIZE": "2000",
     "ZBCCL_LOCAL_MEM_SIZE": "60416",
-    "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
+    "FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
     "ZBCCL_BOOTSTRAP_URL": "tcp://127.0.0.1:24669",
     "ZBCCL_NPU_ALLOC_CONF": "use_vmm_for_static_memory:True",
     "ZBCCL_ENABLE_GRAPH": "1",

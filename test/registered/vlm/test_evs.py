@@ -3,12 +3,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.test.ci.ci_register import (
+from flliper.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
 )
-from sglang.test.test_utils import run_doctests
+from flliper.test.test_utils import run_doctests
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
@@ -16,7 +16,7 @@ register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
 def test_resolve_evs_config():
-    from sglang.srt.multimodal.evs import EVS, EVSConfig, EVSProcessor
+    from flliper.srt.multimodal.evs import EVS, EVSConfig, EVSProcessor
 
     @dataclass(frozen=True, kw_only=True)
     class EVSModelConfig:
@@ -54,7 +54,7 @@ def test_resolve_evs_config():
 
 
 def test_replace_offsets_with_tokens_per_frame():
-    from sglang.srt.multimodal.evs.evs_core import replace_offsets_with_tokens_per_frame
+    from flliper.srt.multimodal.evs.evs_core import replace_offsets_with_tokens_per_frame
 
     run_doctests(replace_offsets_with_tokens_per_frame)
 

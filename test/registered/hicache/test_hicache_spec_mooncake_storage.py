@@ -7,7 +7,7 @@ the spec accept length does not regress.
 
 Mooncake_master + http metadata server lifecycle is reused from
 ``test_hicache_storage_mooncake_backend.HiCacheStorageMooncakeBackendBaseMixin``;
-this file only overrides the SGLang-side setup for EAGLE3 + spec loadback.
+this file only overrides the fLLiper-side setup for EAGLE3 + spec loadback.
 
 Usage:
     python3 -m pytest test/registered/hicache/test_hicache_spec_mooncake_storage.py -v
@@ -24,10 +24,10 @@ from test_hicache_storage_mooncake_backend import (
     HiCacheStorageMooncakeBackendBaseMixin,
 )
 
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.hicache_spec_storage_common import HiCacheSpecStorageMixin
-from sglang.test.test_utils import CustomTestCase, find_available_port
+from flliper.srt.utils import is_hip
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.hicache_spec_storage_common import HiCacheSpecStorageMixin
+from flliper.test.test_utils import CustomTestCase, find_available_port
 
 register_cuda_ci(est_time=240, stage="extra-a", runner_config="2-gpu-large")
 
@@ -164,7 +164,7 @@ class TestHiCacheSpecMooncakeStorage(
                 f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata"
             ),
             # Keep storage capacity in the external mooncake_client so cached
-            # pages survive SGLang server restart.
+            # pages survive fLLiper server restart.
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": "0",
         }
 

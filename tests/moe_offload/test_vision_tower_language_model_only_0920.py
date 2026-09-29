@@ -5,7 +5,7 @@ GiB of never-loaded parameters per rank."""
 
 import types
 
-from sglang.srt.models import qwen3_vl as qv
+from flliper.srt.models import qwen3_vl as qv
 
 
 def test_language_model_only_forces_the_tower_off(monkeypatch):

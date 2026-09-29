@@ -33,7 +33,7 @@ CPU-only.
 
 import pytest
 
-from sglang.srt.managers.phase_flip_counters import (
+from flliper.srt.managers.phase_flip_counters import (
     CHAN_DICT,
     CHAN_PASS,
     CHAN_REQ,
@@ -267,7 +267,7 @@ def test_the_real_send_site_publishes_after_the_post(tmp_path):
     so this drives the real ``_pp_send_pyobj_to_next_stage`` and records
     the order of the two events.
     """
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     order = []
 
@@ -294,7 +294,7 @@ def test_the_real_send_site_publishes_after_the_post(tmp_path):
         pp_flip_counters = _Counters()
 
     s = S()
-    import sglang.srt.managers.scheduler_pp_mixin as mod
+    import flliper.srt.managers.scheduler_pp_mixin as mod
 
     def _fake_p2p(data, *a, **kw):
         order.append(("post", "req"))
@@ -343,7 +343,7 @@ class _CommitWire:
 
 
 def _flush_harness(tmp_path, wire):
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     class _Ps:
         pp_rank = 0
@@ -422,7 +422,7 @@ def test_can_fail_flushing_without_the_counter_gate_blocks_on_the_peer(tmp_path)
 
 
 def _intake(armed, pp_rank, service_calls):
-    from sglang.srt.managers.scheduler_components.request_receiver import (
+    from flliper.srt.managers.scheduler_components.request_receiver import (
         SchedulerRequestReceiver,
     )
 
@@ -475,7 +475,7 @@ class _FakeSizeZeroDist:
 def _tick_harness(counters, armed=True, enabled=True):
     from types import SimpleNamespace
 
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     class S:
         pass

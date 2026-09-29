@@ -2,17 +2,17 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.decode import (
+from flliper.srt.disaggregation.base import KVPoll
+from flliper.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.disaggregation.utils import DisaggregationMode
+from flliper.srt.managers.schedule_batch import FINISH_ABORT
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -130,9 +130,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(ready, {})
         self.assertEqual(remaining, [])
 
-    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
-    @patch("sglang.srt.disaggregation.decode.prepare_abort")
-    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
+    @patch("flliper.srt.disaggregation.decode.release_kv_cache")
+    @patch("flliper.srt.disaggregation.decode.prepare_abort")
+    @patch("flliper.srt.disaggregation.decode.poll_and_all_reduce")
     def test_transfer_failure_clears_receiver_before_removing_request(
         self, mock_poll, mock_prepare_abort, mock_release_kv_cache
     ):

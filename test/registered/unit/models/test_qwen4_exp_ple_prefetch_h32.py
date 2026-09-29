@@ -1,4 +1,4 @@
-"""fnFL2 H32 (SGLANG_QWEN4_PLE_PREFETCH): the PLE pread gather one chunk ahead.
+"""fnFL2 H32 (FLLIPER_QWEN4_PLE_PREFETCH): the PLE pread gather one chunk ahead.
 
 The pread gather of a prefill chunk runs in worker processes; the scheduler
 publishes the chunked request's next chunk before each extend forward, and the
@@ -28,11 +28,11 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.models import qwen4_exp_ple_prefetch as pf
-from sglang.srt.models import qwen4_exp_ple_table as pt
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.models import qwen4_exp_ple_prefetch as pf
+from flliper.srt.models import qwen4_exp_ple_table as pt
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -42,7 +42,7 @@ SHARDS = 4
 DIM = 160
 RB = DIM * 2
 HEADER = 100
-LOGGER = "sglang.srt.models.qwen4_exp_ple_prefetch"
+LOGGER = "flliper.srt.models.qwen4_exp_ple_prefetch"
 
 
 def _table(tmpdir):
@@ -119,7 +119,7 @@ class _Run:
 
 class TestHostHashMirror(CustomTestCase):
     def test_host_hash_is_the_models_hash(self):
-        from sglang.srt.models import qwen4_exp as q
+        from flliper.srt.models import qwen4_exp as q
 
         g = torch.Generator().manual_seed(7)
         eos = 248044
@@ -294,12 +294,12 @@ class TestPrefetchGather(CustomTestCase):
     def test_switch_off_keeps_the_serial_gather(self):
         base = pt.PleCheckpointPreadGather(self.table, min_rows=16, workers=2)
         try:
-            with envs.SGLANG_QWEN4_PLE_PREFETCH.override(False):
+            with envs.FLLIPER_QWEN4_PLE_PREFETCH.override(False):
                 self.assertIs(pf.make_ple_prefetch_gather(base, self.table, _identity_hasher), base)
             self.assertIsNone(pf.make_ple_prefetch_gather(None, self.table, _identity_hasher))
             self.assertIs(pf.make_ple_prefetch_gather(base, self.table, None), base)
-            with envs.SGLANG_QWEN4_PLE_PREFETCH.override(True), \
-                    envs.SGLANG_QWEN4_PLE_PREFETCH_PROCS.override(3):
+            with envs.FLLIPER_QWEN4_PLE_PREFETCH.override(True), \
+                    envs.FLLIPER_QWEN4_PLE_PREFETCH_PROCS.override(3):
                 g = pf.make_ple_prefetch_gather(base, self.table, _identity_hasher)
                 self.assertIsInstance(g, pf.PlePrefetchGather)
                 self.assertEqual(g._n_procs, 3)

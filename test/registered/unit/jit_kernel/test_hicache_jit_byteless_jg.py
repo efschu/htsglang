@@ -17,10 +17,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.jit_kernel import hicache as hc
-from sglang.srt.mem_cache.pool_host import base as host_base
-from sglang.srt.mem_cache.pool_host import mha
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.jit_kernel import hicache as hc
+from flliper.srt.mem_cache.pool_host import base as host_base
+from flliper.srt.mem_cache.pool_host import mha
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

@@ -14,7 +14,7 @@ import tempfile
 import time
 import unittest
 
-from sglang.srt.planner.crossover import (
+from flliper.srt.planner.crossover import (
     MEASURED_ELSEWHERE,
     MEASURED_HERE,
     MODELLED,
@@ -30,8 +30,8 @@ from sglang.srt.planner.crossover import (
     load_finding,
     save_finding,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -245,7 +245,7 @@ class TestTheStudyOffer(CustomTestCase):
             )
 
     def test_the_tiers_drive_the_registered_scenario(self):
-        from sglang.srt.planner.scenarios import SCENARIOS
+        from flliper.srt.planner.scenarios import SCENARIOS
 
         self.assertIn(STUDY_KEY, SCENARIOS)
 
@@ -255,7 +255,7 @@ class TestTheStudyOffer(CustomTestCase):
         rather than after the first boot."""
         import pathlib
 
-        from sglang.srt.planner.runner import load_study
+        from flliper.srt.planner.runner import load_study
 
         root = pathlib.Path("tools/rig_dashboard/studies")
         if not root.is_dir():
@@ -272,7 +272,7 @@ class TestTheStudyOffer(CustomTestCase):
         and the token split move together and neither is attributable."""
         import pathlib
 
-        from sglang.srt.planner.runner import load_study
+        from flliper.srt.planner.runner import load_study
 
         root = pathlib.Path("tools/rig_dashboard/studies")
         if not root.is_dir():

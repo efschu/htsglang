@@ -169,7 +169,7 @@ sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 )
 
-from sglang.srt.managers.regime_classifier import (  # noqa: E402
+from flliper.srt.managers.regime_classifier import (  # noqa: E402
     DEFAULT_ENTER_DECODE,
     DEFAULT_ENTER_PREFILL,
     DEFAULT_EXIT_DECODE,
@@ -255,7 +255,7 @@ class Constant:
     def blocking_eligible(self):
         """Whether a bad verdict on this constant may BLOCK gate 3.
 
-        A gate reports on the rig. A constant nothing in ``python/sglang``
+        A gate reports on the rig. A constant nothing in ``python/flliper``
         reads reports on the gate instead: its verdict cannot change with the
         workload, because no runtime decision is taken at it. Such a constant
         is still judged and still reported -- the reachability evidence has to
@@ -293,7 +293,7 @@ CONSTANTS = [
         "prefill_share",
         exit_value=DEFAULT_EXIT_PREFILL,
         partner="exit_prefill",
-        runtime_site="sglang.srt.managers.regime_classifier:DEFAULT_ENTER_PREFILL",
+        runtime_site="flliper.srt.managers.regime_classifier:DEFAULT_ENTER_PREFILL",
     ),
     Constant(
         "enter_decode",
@@ -301,7 +301,7 @@ CONSTANTS = [
         "decode_share",
         exit_value=DEFAULT_EXIT_DECODE,
         partner="exit_decode",
-        runtime_site="sglang.srt.managers.regime_classifier:DEFAULT_ENTER_DECODE",
+        runtime_site="flliper.srt.managers.regime_classifier:DEFAULT_ENTER_DECODE",
     ),
     Constant(
         "kv_ascend_mark",
@@ -309,7 +309,7 @@ CONSTANTS = [
         "occupancy",
         exit_value=KV_DESCEND_MARK,
         partner="kv_descend_mark",
-        runtime_site="sglang.srt.managers.regime_classifier:KV_ASCEND_MARK",
+        runtime_site="flliper.srt.managers.regime_classifier:KV_ASCEND_MARK",
         note=(
             "INHERITED from #287 and deliberately not re-derived here: two "
             "independently-chosen thresholds on one physical quantity is how "
@@ -350,7 +350,7 @@ CONSTANTS = [
         8192,
         "queued_prompt_tokens",
         # Also runtime-orphaned, found by the test written for the one
-        # above rather than asserted: no `python/sglang` code compares queued
+        # above rather than asserted: no `python/flliper` code compares queued
         # prompt tokens against 8192. It has been CLEARING, so it was not in
         # the blocking set today -- but on a quieter workload it would have
         # gone UNREACHED and blocked the gate for the same non-reason. Retired
@@ -359,7 +359,7 @@ CONSTANTS = [
         note=(
             "queue mass, not a share; the trace records the total queued. "
             "RETIRED from the blocking set -- no runtime decision is taken at "
-            "this value (no `python/sglang` site reads it)"
+            "this value (no `python/flliper` site reads it)"
         ),
     ),
 ]
@@ -754,7 +754,7 @@ def report(path_a: str, path_b: str) -> Dict:
     # threshold judged against it has not been checked.
     bad = ("INSIDE_BAND", "UNREACHED", "NO_DATA", "ARMS_DISSIMILAR", "UNDERPOWERED")
     # A bad verdict blocks only if the RUNTIME enforces the constant. A
-    # constant no `python/sglang` code reads cannot produce a verdict that
+    # constant no `python/flliper` code reads cannot produce a verdict that
     # moves with the workload, so blocking on it reports a gap in the gate as
     # though it were a finding about the rig -- which is exactly what
     # `spread_veto_pct = 25` did for four recordings running. See

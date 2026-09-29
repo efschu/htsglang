@@ -11,10 +11,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVSender
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.disaggregation.base.conn import KVPoll
+from flliper.srt.disaggregation.common.conn import CommonKVSender
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -44,7 +44,7 @@ class TestRegisterPrefillDpRank(CustomTestCase):
     def test_success_returns_true_and_does_not_fail_room(self):
         sender = _make_sender()
         with patch(
-            "sglang.srt.disaggregation.common.conn.requests.post",
+            "flliper.srt.disaggregation.common.conn.requests.post",
             return_value=SimpleNamespace(status_code=200, text="ok"),
         ):
             self.assertTrue(sender._register_prefill_dp_rank())
@@ -55,7 +55,7 @@ class TestRegisterPrefillDpRank(CustomTestCase):
     def test_non_200_returns_false(self):
         sender = _make_sender()
         with patch(
-            "sglang.srt.disaggregation.common.conn.requests.post",
+            "flliper.srt.disaggregation.common.conn.requests.post",
             return_value=SimpleNamespace(status_code=503, text="unavailable"),
         ):
             self.assertFalse(sender._register_prefill_dp_rank())
@@ -63,7 +63,7 @@ class TestRegisterPrefillDpRank(CustomTestCase):
     def test_exception_returns_false(self):
         sender = _make_sender()
         with patch(
-            "sglang.srt.disaggregation.common.conn.requests.post",
+            "flliper.srt.disaggregation.common.conn.requests.post",
             side_effect=OSError("connection refused"),
         ):
             self.assertFalse(sender._register_prefill_dp_rank())
@@ -73,7 +73,7 @@ class TestRegisterPrefillDpRankOrFail(CustomTestCase):
     def test_failure_records_failure_and_marks_room_failed(self):
         sender = _make_sender()
         with patch(
-            "sglang.srt.disaggregation.common.conn.requests.post",
+            "flliper.srt.disaggregation.common.conn.requests.post",
             side_effect=OSError("connection refused"),
         ):
             ok = sender._register_prefill_dp_rank_or_fail()
@@ -90,7 +90,7 @@ class TestRegisterPrefillDpRankOrFail(CustomTestCase):
     def test_success_leaves_room_untouched(self):
         sender = _make_sender()
         with patch(
-            "sglang.srt.disaggregation.common.conn.requests.post",
+            "flliper.srt.disaggregation.common.conn.requests.post",
             return_value=SimpleNamespace(status_code=200, text="ok"),
         ):
             self.assertTrue(sender._register_prefill_dp_rank_or_fail())

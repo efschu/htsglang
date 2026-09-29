@@ -39,8 +39,8 @@ measured draws on this rig do not.
 
 import pytest
 
-from sglang.srt.managers import corridor_guard as cg
-from sglang.srt.managers.phase_flip_seam_reserve import DEFAULT_ARMING_MARGIN_MIB
+from flliper.srt.managers import corridor_guard as cg
+from flliper.srt.managers.phase_flip_seam_reserve import DEFAULT_ARMING_MARGIN_MIB
 
 # Seam draws measured on boot_827_review_0823_0910c, in MiB.
 MEASURED_DRAWS_0910C = (162, 387, 436, 907)

@@ -10,7 +10,7 @@ the fused shared expert's topk weight on the two paths this fix covers:
     routed_scaling_factor afterward, so the shared weight must be 1/rsf.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -20,9 +20,9 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.moe import topk as topk_module
-from sglang.srt.layers.moe.topk import TopKConfig
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.moe import topk as topk_module
+from flliper.srt.layers.moe.topk import TopKConfig
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestFusedSharedExpertScaling(CustomTestCase):

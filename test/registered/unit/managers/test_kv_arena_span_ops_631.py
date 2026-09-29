@@ -34,7 +34,7 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Result:
@@ -126,7 +126,7 @@ def _bare_arena(backing, chunk=CHUNK):
 
 class _SpanOpsBase(CustomTestCase):
     def setUp(self):
-        import sglang.srt.mem_cache.kv_vmm_backing as backing
+        import flliper.srt.mem_cache.kv_vmm_backing as backing
 
         self.backing = backing
         self.drv = _FakeDriver()

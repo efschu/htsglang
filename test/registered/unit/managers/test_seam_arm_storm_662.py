@@ -21,7 +21,7 @@ import time
 import types
 import unittest
 
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
 
 def _rt():

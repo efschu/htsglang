@@ -7,7 +7,7 @@ from typing import List
 import torch
 from tqdm import tqdm
 
-from sglang.srt.mem_cache.storage.hf3fs.hf3fs_usrbio_client import Hf3fsUsrBioClient
+from flliper.srt.mem_cache.storage.hf3fs.hf3fs_usrbio_client import Hf3fsUsrBioClient
 
 
 def print_stats(x: List[int]):

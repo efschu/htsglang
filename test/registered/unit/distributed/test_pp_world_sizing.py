@@ -51,9 +51,9 @@ _install_sgl_kernel_stub()
 
 import torch  # noqa: E402
 
-import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+import flliper.srt.model_executor.model_runner_kv_cache_mixin as mixin  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -446,7 +446,7 @@ class TestMeasuredBudgetStageKeying(CustomTestCase):
         self.assertEqual(p, "/tmp/kv_budget-abcdef012345.json")
 
     def test_fingerprint_gains_pp_fields_only_under_pp(self):
-        from sglang.srt.uneven_perf import measured_kv_budget_fingerprint_fields
+        from flliper.srt.uneven_perf import measured_kv_budget_fingerprint_fields
 
         def args(pp_size, ratio=None):
             return SimpleNamespace(

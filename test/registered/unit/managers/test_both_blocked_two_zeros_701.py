@@ -24,11 +24,11 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _stub_scheduler(rows_after=139507, chunked=512):
-    from sglang.srt.managers import scheduler as scheduler_mod
+    from flliper.srt.managers import scheduler as scheduler_mod
 
     stub = SimpleNamespace(
         server_args=SimpleNamespace(chunked_prefill_size=chunked),
@@ -43,21 +43,21 @@ def _stub_scheduler(rows_after=139507, chunked=512):
 
 
 def _both_blocked_decision():
-    from sglang.srt.managers.phase_policy import BOTH_BLOCKED
+    from flliper.srt.managers.phase_policy import BOTH_BLOCKED
 
     return SimpleNamespace(reason=f"{BOTH_BLOCKED}: nothing can run")
 
 
 def _run(stub, avail, freed, pending=0):
     """Drive the relief with a stubbed actuator + availability."""
-    from sglang.srt.managers import scheduler as scheduler_mod
+    from flliper.srt.managers import scheduler as scheduler_mod
 
     with (
         mock.patch(
-            "sglang.srt.mem_cache.common.evict_from_tree_cache", return_value=freed
+            "flliper.srt.mem_cache.common.evict_from_tree_cache", return_value=freed
         ),
         mock.patch(
-            "sglang.srt.mem_cache.common.uniform_avail_for_evict", return_value=avail
+            "flliper.srt.mem_cache.common.uniform_avail_for_evict", return_value=avail
         ),
     ):
         with mock.patch.object(scheduler_mod.logger, "warning") as warn:

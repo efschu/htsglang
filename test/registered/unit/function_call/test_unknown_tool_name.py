@@ -3,11 +3,11 @@ import logging
 
 import pytest
 
-from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.environ import envs
-from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import StreamingParseResult
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.entrypoints.openai.protocol import Function, Tool
+from flliper.srt.environ import envs
+from flliper.srt.function_call.base_format_detector import BaseFormatDetector
+from flliper.srt.function_call.core_types import StreamingParseResult
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(5, "base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -29,7 +29,7 @@ class DummyDetector(BaseFormatDetector):
 
 def test_unknown_tool_name_dropped_default(caplog):
     """Test that unknown tools are dropped by default (legacy behavior)."""
-    with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(False):
+    with envs.FLLIPER_FORWARD_UNKNOWN_TOOLS.override(False):
         tools = [
             Tool(
                 function=Function(
@@ -39,7 +39,7 @@ def test_unknown_tool_name_dropped_default(caplog):
         ]
         detector = DummyDetector()
         with caplog.at_level(
-            logging.WARNING, logger="sglang.srt.function_call.base_format_detector"
+            logging.WARNING, logger="flliper.srt.function_call.base_format_detector"
         ):
             result = detector.detect_and_parse(
                 '{"name":"unknown_tool","parameters":{"city":"Paris"}}', tools
@@ -53,7 +53,7 @@ def test_unknown_tool_name_dropped_default(caplog):
 
 def test_unknown_tool_name_forwarded(caplog):
     """Test that unknown tools are forwarded when env var is True."""
-    with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+    with envs.FLLIPER_FORWARD_UNKNOWN_TOOLS.override(True):
         tools = [
             Tool(
                 function=Function(
@@ -63,7 +63,7 @@ def test_unknown_tool_name_forwarded(caplog):
         ]
         detector = DummyDetector()
         with caplog.at_level(
-            logging.WARNING, logger="sglang.srt.function_call.base_format_detector"
+            logging.WARNING, logger="flliper.srt.function_call.base_format_detector"
         ):
             result = detector.detect_and_parse(
                 '{"name":"unknown_tool","parameters":{"city":"Paris"}}', tools

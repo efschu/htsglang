@@ -23,8 +23,8 @@ NVRTC=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib
 
 export LD_LIBRARY_PATH="$NVRTC:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH=$WT/python
-export SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_UNEVEN_DCP=1 FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 
 PROMPT="Name three rivers in Europe and one fact about each of them."
 
@@ -32,7 +32,7 @@ say() { echo "[p287 $(date -u +%H:%M:%S)] $*"; }
 
 boot() { # boot <logfile> [extra args...]
   local log="$1"; shift
-  setsid "$VENV" -m sglang.launch_server \
+  setsid "$VENV" -m flliper.launch_server \
     --model-path "$MODEL" \
     --tp 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
     --rank-auto-reserve-mib 3000,2700,2700 \
@@ -65,16 +65,16 @@ gen() { # gen <max_new> <outfile>
 
 kill_server() {
   local pids
-  pids=$(pgrep -f "sglang.launch_serve[r].*port $PORT" || true)
+  pids=$(pgrep -f "flliper.launch_serve[r].*port $PORT" || true)
   for p in $pids; do
     /spinning/htsglang-gpu/.venv/bin/py-spy dump --pid "$p" > "$ART/pyspy_$p.txt" 2>&1 || true
   done
   [ -n "${BOOT_PGID:-}" ] && kill -- -"$BOOT_PGID" 2>/dev/null
   sleep 3
-  pids=$(pgrep -f "sglang.launch_serve[r].*port $PORT" || true)
+  pids=$(pgrep -f "flliper.launch_serve[r].*port $PORT" || true)
   [ -n "$pids" ] && kill -9 $pids 2>/dev/null
   local deadline=$((SECONDS+30))
-  while [ $SECONDS -lt $deadline ] && pgrep -f "sglang.launch_serve[r].*port $PORT" >/dev/null; do sleep 2; done
+  while [ $SECONDS -lt $deadline ] && pgrep -f "flliper.launch_serve[r].*port $PORT" >/dev/null; do sleep 2; done
   say "server down"
 }
 

@@ -6,10 +6,10 @@ from pathlib import Path
 
 import requests
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -30,8 +30,8 @@ class TestStartProfile(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.output_dir = tempfile.mkdtemp()
-        envs.SGLANG_TORCH_PROFILER_DIR.set(cls.output_dir)
-        envs.SGLANG_PROFILE_V2.set(True)
+        envs.FLLIPER_TORCH_PROFILER_DIR.set(cls.output_dir)
+        envs.FLLIPER_PROFILE_V2.set(True)
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(

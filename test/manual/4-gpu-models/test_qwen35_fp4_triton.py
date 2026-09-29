@@ -1,11 +1,11 @@
 import unittest
 
-from sglang.test.accuracy_test_runner import AccuracyTestParams
+from flliper.test.accuracy_test_runner import AccuracyTestParams
 
 # This eval harness applies the chat_template, which is critical for qwen3.5
 # to get good accuracy on gsm8k
-from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import (
+from flliper.test.run_combined_tests import run_combined_tests
+from flliper.test.test_utils import (
     CustomTestCase,
     ModelLaunchSettings,
 )

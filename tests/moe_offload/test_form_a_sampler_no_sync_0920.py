@@ -6,8 +6,8 @@ host's stream (fnFA13 watchdog) and aborted the Bar1 spin kernel (fnFA12)."""
 
 import types
 
-from sglang.srt.layers import sampler as sm
-from sglang.srt.rank_role import HOST, WORKER, RankRolePlan, set_form_a_role_plan
+from flliper.srt.layers import sampler as sm
+from flliper.srt.rank_role import HOST, WORKER, RankRolePlan, set_form_a_role_plan
 
 FORM_A = RankRolePlan((HOST, WORKER, WORKER))
 
@@ -22,7 +22,7 @@ def _sampler(calls):
 def test_form_a_host_skips_the_token_sync(monkeypatch):
     calls = []
     monkeypatch.setattr(sm, "maybe_sync_sampled_tokens", lambda *a, **k: calls.append("bcast"))
-    monkeypatch.setattr(sm, "SGLANG_SYNC_SAMPLED_TOKENS", True)
+    monkeypatch.setattr(sm, "FLLIPER_SYNC_SAMPLED_TOKENS", True)
     s = _sampler(calls)
     info = types.SimpleNamespace(grammars=None)
     try:

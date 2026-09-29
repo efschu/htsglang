@@ -4,12 +4,12 @@ The four detectors behind `docs/dev/AUDIT_421_UNWIRED.md`. They exist in the
 repo rather than in a scratch directory so the audit can be re-run against a
 later tip — a finding table without a reproducible detector ages into folklore.
 
-All of them are pure `ast` analysis over a source tree. No imports of sglang,
+All of them are pure `ast` analysis over a source tree. No imports of flliper,
 no torch, no CUDA, no GPU.
 
 ## Detector A — flag / env consumer classification
 
-Which fork-added CLI flags and `SGLANG_*` env vars have production consumers.
+Which fork-added CLI flags and `FLLIPER_*` env vars have production consumers.
 
 ```
 cd <scratch dir holding the name lists>
@@ -50,7 +50,7 @@ ignores. This is the only detector that can see the #197 shape; a consumer
 count never will.
 
 ```
-python3 detC.py <tree_root> --env SGLANG_GGUF_DENSE_VOCAB
+python3 detC.py <tree_root> --env FLLIPER_GGUF_DENSE_VOCAB
 ```
 
 Entities come from the gate's own docstring, so C cannot fire on an
@@ -68,7 +68,7 @@ audit doc section B.7). Two results bound what the STRONG tier is worth:
   or require the helper name to be unique to the gate's module.
 - **A gate read into a module constant is invisible.** `barlink.py` does
   `self.transport = _build_transport(_TRANSPORT, ...)` where `_TRANSPORT` is
-  the module-level read of `SGLANG_BARLINK_TRANSPORT`; the detector matches
+  the module-level read of `FLLIPER_BARLINK_TRANSPORT`; the detector matches
   the literal env name in the function body and reports the honoured site as
   unhonoured. Same family as the `_e(name)` prefix blind spot.
 
@@ -100,7 +100,7 @@ pre-fix trees, and silent at HEAD:
 
 | case | pre-fix ref | detector | expected |
 |---|---|---|---|
-| #197 `SGLANG_GGUF_DENSE_VOCAB` | `ef6f8bc0a2^` | C | STRONG hit on `lm_head` |
+| #197 `FLLIPER_GGUF_DENSE_VOCAB` | `ef6f8bc0a2^` | C | STRONG hit on `lm_head` |
 | #394 cold-shard apportionment | `d71e7133d2` | B | TEST-ONLY on the `cold_shard` chain |
 | #394 degenerate derivation | `d71e7133d2` | B2 | 2 DEGENERATE-RISK rows |
 

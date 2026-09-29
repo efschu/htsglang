@@ -6,15 +6,15 @@ import types
 import pytest
 import torch
 
-from sglang.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_offload as eo
 
 
 def test_fetch_mode_default_gather_and_memcpy_opt_out(monkeypatch):
-    monkeypatch.delenv("SGLANG_MOE_OFFLOAD_FETCH", raising=False)
+    monkeypatch.delenv("FLLIPER_MOE_OFFLOAD_FETCH", raising=False)
     assert eo._fetch_mode() == "gather"
-    monkeypatch.setenv("SGLANG_MOE_OFFLOAD_FETCH", "memcpy")
+    monkeypatch.setenv("FLLIPER_MOE_OFFLOAD_FETCH", "memcpy")
     assert eo._fetch_mode() == "memcpy"
-    monkeypatch.setenv("SGLANG_MOE_OFFLOAD_FETCH", "nonsense")
+    monkeypatch.setenv("FLLIPER_MOE_OFFLOAD_FETCH", "nonsense")
     assert eo._fetch_mode() == "gather"
 
 
@@ -50,7 +50,7 @@ def test_gpu_gather_fetch_matches_memcpy(monkeypatch):
     plan = [(3, 2), (6, 3), (7, 4)]
     out = {}
     for mode in ("memcpy", "gather"):
-        monkeypatch.setenv("SGLANG_MOE_OFFLOAD_FETCH", mode)
+        monkeypatch.setenv("FLLIPER_MOE_OFFLOAD_FETCH", mode)
         st = _cache_stub(R, C, E, rows)
         st._resident = {"w": torch.zeros((R + C, rows), dtype=torch.int32, device="cuda")}
         st._pinned = {"w": pinned}

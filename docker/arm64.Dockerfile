@@ -1,8 +1,8 @@
 FROM ubuntu:24.04
 SHELL ["/bin/bash", "-c"]
 
-ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
-ARG VER_SGLANG=main
+ARG FLLIPER_REPO=https://github.com/sgl-project/sglang.git
+ARG VER_FLLIPER=main
 
 RUN apt-get update && \
     apt-get full-upgrade -y && \
@@ -36,9 +36,9 @@ ENV CMAKE_BUILD_PARALLEL_LEVEL=1
 WORKDIR /sgl-workspace
 RUN source $HOME/.local/bin/env && \
     source /opt/.venv/bin/activate && \
-    git clone ${SGLANG_REPO} sglang && \
-    cd sglang && \
-    git checkout ${VER_SGLANG} && \
+    git clone ${FLLIPER_REPO} flliper && \
+    cd flliper && \
+    git checkout ${VER_FLLIPER} && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install . && \
@@ -46,7 +46,7 @@ RUN source $HOME/.local/bin/env && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install .
 
-ENV SGLANG_USE_CPU_ENGINE=1
+ENV FLLIPER_USE_CPU_ENGINE=1
 RUN echo 'source /opt/.venv/bin/activate' >> /root/.bashrc
 
 WORKDIR /sgl-workspace/sglang

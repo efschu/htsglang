@@ -36,7 +36,7 @@ Hermetic: no CUDA. The poison is a real `torch.AcceleratorError` carrying the
 specimen's message, raised by a stub transport.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -44,8 +44,8 @@ import unittest
 
 import torch
 
-from sglang.srt.distributed.device_communicators import barlink_abort_gate as gate
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.device_communicators import barlink_abort_gate as gate
+from flliper.test.test_utils import CustomTestCase
 
 IMA = "CUDA error: an illegal memory access was encountered"
 

@@ -15,16 +15,16 @@ loads the store).
 import time
 import unittest
 
-from sglang.srt.planner import flags
-from sglang.srt.planner.crossover import (
+from flliper.srt.planner import flags
+from flliper.srt.planner.crossover import (
     MEASURED_HERE,
     REFERENCE_FINDING,
     ConcentrationPoint,
     CrossoverFinding,
     RigDescriptor,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 

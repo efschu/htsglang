@@ -73,11 +73,11 @@ if before == after:
 PY
 }
 
-CE=python/sglang/srt/weg2/weight_exchange.py
-RT=python/sglang/srt/weg2/launcher.py
-T="test/registered/unit/weg2/test_weg2_coverage_verdict_1273.py
-test/registered/unit/weg2/test_weg2_xchg_reserve_1273.py
-test/registered/unit/weg2/test_weg2_xchg_plan_provider_1273.py"
+CE=python/flliper/srt/pdflip/weight_exchange.py
+RT=python/flliper/srt/pdflip/launcher.py
+T="test/registered/unit/pdflip/test_pdflip_coverage_verdict_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_reserve_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_plan_provider_1273.py"
 
 if [ "${1:-}" = "--selfcheck" ]; then
   PLANT="# MUTANT-HARNESS-SELFCHECK-PLANTED-$$"
@@ -149,8 +149,8 @@ m "M9 the uncovered tensors stop being named" "$CE" \
             emit(ln)' \
   '        pass'
 m "M11 the reserve swallows the residual (serving constants stand in)" "$RT" \
-  '            raise xchg_residency.Weg2XchgResidencyUnarmable(' \
-  '            out[c.uuid] = DC_MEASURED_D_5090_MIB; raise SystemExit(0) if False else None; raise xchg_residency.Weg2XchgResidencyUnarmable('
+  '            raise xchg_residency.PdFlipXchgResidencyUnarmable(' \
+  '            out[c.uuid] = DC_MEASURED_D_5090_MIB; raise SystemExit(0) if False else None; raise xchg_residency.PdFlipXchgResidencyUnarmable('
 m "M12 the named terms collapse to the region alone" "$RT" \
   '    named = int(XCHG_RESIDENT_REGION_MIB) + slots_mib' \
   '    named = int(XCHG_RESIDENT_REGION_MIB)'

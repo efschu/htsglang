@@ -9,7 +9,7 @@ import types
 
 import torch
 
-from sglang.srt.managers.kv_session_offload import (
+from flliper.srt.managers.kv_session_offload import (
     RestoreHysteresis,
     SpillTickController,
     assign_owner_matched_slots,
@@ -360,7 +360,7 @@ def _back_only_manager(log_sink):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
-    from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+    from flliper.srt.managers.kv_session_offload import KVSessionOffloadManager
 
     mgr = KVSessionOffloadManager.__new__(KVSessionOffloadManager)
     mgr.spills = {}
@@ -817,7 +817,7 @@ def test_wave_back_gate_threshold_reaches_the_controller():
 
 def test_wave_back_min_free_server_arg_defaults_to_off():
     """The knob must ship OFF so an unmodified launch keeps today's path."""
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     assert (
         ServerArgs.__dataclass_fields__[
@@ -1055,7 +1055,7 @@ def _bare_manager():
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
-    from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+    from flliper.srt.managers.kv_session_offload import KVSessionOffloadManager
 
     mgr = KVSessionOffloadManager.__new__(KVSessionOffloadManager)
     mgr.spills = {}
@@ -1087,7 +1087,7 @@ def _fake_finished_spill_req(rpi):
 
 
 def _install_slot(mgr, req, region):
-    from sglang.srt.managers.kv_session_offload import (
+    from flliper.srt.managers.kv_session_offload import (
         RestoreHysteresis,
         SpillSlot,
         WaveBackController,
@@ -1155,11 +1155,11 @@ def test_pre_schedule_reap_resets_admission_gate():
 
 
 def test_spill_graph_enabled_default_off(monkeypatch):
-    monkeypatch.delenv("SGLANG_KVSO_SPILL_GRAPH", raising=False)
+    monkeypatch.delenv("FLLIPER_KVSO_SPILL_GRAPH", raising=False)
     assert spill_graph_enabled() is False  # flag AUS -> eager, byte-identical
-    monkeypatch.setenv("SGLANG_KVSO_SPILL_GRAPH", "1")
+    monkeypatch.setenv("FLLIPER_KVSO_SPILL_GRAPH", "1")
     assert spill_graph_enabled() is True
-    monkeypatch.setenv("SGLANG_KVSO_SPILL_GRAPH", "0")
+    monkeypatch.setenv("FLLIPER_KVSO_SPILL_GRAPH", "0")
     assert spill_graph_enabled() is False
 
 
@@ -1357,8 +1357,8 @@ def test_release_kv_cache_routes_spilled_req_to_manager():
     keep the stock path -> byte-identical."""
     from unittest.mock import MagicMock
 
-    import sglang.srt.managers.kv_session_offload as kso
-    from sglang.srt.mem_cache.common import release_kv_cache
+    import flliper.srt.managers.kv_session_offload as kso
+    from flliper.srt.mem_cache.common import release_kv_cache
 
     saved = kso._MANAGER
     mgr = MagicMock()
@@ -1390,7 +1390,7 @@ def test_restore_hysteresis():
 
 
 def test_alloc_owner_matched_classes_cpu():
-    from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+    from flliper.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 
     alloc = PagedTokenToKVPoolAllocator(
         size=4 * S,
@@ -1776,7 +1776,7 @@ def test_p2_budget_is_not_referenced_by_the_tick_regulator():
     # must never become a CADENCE input -- no regulator path may read it.
     import inspect
 
-    from sglang.srt.managers import kv_session_offload as kvso
+    from flliper.srt.managers import kv_session_offload as kvso
 
     sources = [inspect.getsource(kvso.SpillTickController)]
     for name in ("maybe_take_tick", "_min_reduce_headroom", "pre_schedule"):
@@ -1843,7 +1843,7 @@ def _fake_server_args(**over):
 
 
 def _validate(ns):
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     ServerArgs._handle_kv_session_offload(ns)
 
@@ -1923,7 +1923,7 @@ def _spec_gate_manager(server_algo, active_algo, has_worker=True):
     """
     from types import SimpleNamespace
 
-    from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+    from flliper.srt.managers.kv_session_offload import KVSessionOffloadManager
 
     mgr = KVSessionOffloadManager.__new__(KVSessionOffloadManager)
     mgr.server_spec_algorithm = server_algo
@@ -1942,7 +1942,7 @@ def _spec_gate_manager(server_algo, active_algo, has_worker=True):
 
 def test_spec_in_tick_gate_rejects_an_active_dflash_rung():
     """THE R1 CASE: primary family NEXTN/EAGLE, active rung DFLASH -> reject."""
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
     mgr = _spec_gate_manager(
         server_algo=SpeculativeAlgorithm.EAGLE,
@@ -1955,7 +1955,7 @@ def test_spec_in_tick_gate_rejects_an_active_dflash_rung():
 
 
 def test_spec_in_tick_gate_allows_an_active_nextn_rung():
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
     mgr = _spec_gate_manager(
         server_algo=SpeculativeAlgorithm.EAGLE,
@@ -1966,7 +1966,7 @@ def test_spec_in_tick_gate_allows_an_active_nextn_rung():
 
 def test_spec_in_tick_gate_also_rejects_the_dspark_rung():
     """is_dflash_family() covers DSPARK too; the gate must not narrow it."""
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
     mgr = _spec_gate_manager(
         server_algo=SpeculativeAlgorithm.EAGLE,
@@ -1981,7 +1981,7 @@ def test_spec_in_tick_gate_is_unchanged_without_cross_algo():
     This is the flag-OFF / no-cross-algo equivalence: the gate must reduce to
     exactly the pre-existing static behaviour.
     """
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
     mgr = _spec_gate_manager(
         server_algo=SpeculativeAlgorithm.EAGLE, active_algo=None
@@ -2003,7 +2003,7 @@ def test_spec_in_tick_gate_is_unchanged_without_cross_algo():
 
 
 def test_spec_in_tick_gate_handles_a_none_algorithm():
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
     mgr = _spec_gate_manager(
         server_algo=SpeculativeAlgorithm.NONE, active_algo=None
@@ -2018,8 +2018,8 @@ def test_cross_algo_worker_publishes_the_active_family():
     """The one-way coupling point: the property the offload gate reads must
     exist on CrossAlgoWorker and must track the active rung, not the boot
     configuration."""
-    from sglang.srt.speculative.cross_algo_worker import CrossAlgoWorker
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from flliper.srt.speculative.cross_algo_worker import CrossAlgoWorker
+    from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
 
     assert isinstance(
         getattr(CrossAlgoWorker, "active_spec_algorithm", None), property
@@ -2051,7 +2051,7 @@ def test_offload_manager_init_is_not_truncated():
     import ast
     import inspect
 
-    from sglang.srt.managers import kv_session_offload as kvso
+    from flliper.srt.managers import kv_session_offload as kvso
 
     tree = ast.parse(inspect.getsource(kvso.KVSessionOffloadManager))
     init = next(
@@ -2094,7 +2094,7 @@ def test_no_manager_method_has_unreachable_code_after_return():
     import ast
     import inspect
 
-    from sglang.srt.managers import kv_session_offload as kvso
+    from flliper.srt.managers import kv_session_offload as kvso
 
     tree = ast.parse(inspect.getsource(kvso.KVSessionOffloadManager))
     cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef))
@@ -2122,7 +2122,7 @@ def test_spill_batch_and_admission_consult_the_runtime_family_gate():
     """
     import inspect
 
-    from sglang.srt.managers import kv_session_offload as kvso
+    from flliper.srt.managers import kv_session_offload as kvso
 
     mgr_cls = kvso.KVSessionOffloadManager
     admission = inspect.getsource(mgr_cls.try_spill)
@@ -2557,7 +2557,7 @@ def test_spilled_req_never_donates_sentinel_rows_to_the_radix_tree():
     The FINISH path already refuses the insert for this exact reason; this
     pins the same rule at the UNFINISHED seam.
     """
-    from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+    from flliper.srt.mem_cache.common import maybe_cache_unfinished_req
 
     class _Pool:
         def __init__(self):
@@ -2632,7 +2632,7 @@ def test_restore_readiness_counts_radix_evictable_not_just_the_free_list():
     (`_maybe_spill_for_fast_lane`: `available_size() + _tree_evictable_size()`).
     This pins the restore side to the same rule.
     """
-    from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+    from flliper.srt.managers.kv_session_offload import KVSessionOffloadManager
 
     class _WaveBackReached(Exception):
         """Raised instead of executing the incremental wave-back branch."""
@@ -2704,7 +2704,7 @@ def _restore_gate_opens(pool_tokens: int, margin: int) -> bool:
     is the most generous state the gate can ever see -- so a False here means
     the gate cannot open at this margin under ANY memory condition.
     """
-    from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+    from flliper.srt.managers.kv_session_offload import KVSessionOffloadManager
 
     class _WaveBackReached(Exception):
         pass
@@ -2783,7 +2783,7 @@ def test_the_restore_margin_is_sized_against_the_pool_it_is_spent_from():
     # tree without the resolver, which is exactly the pre-C29 behaviour and
     # exactly what must fail here.
     try:
-        from sglang.srt.managers.kv_session_offload import (
+        from flliper.srt.managers.kv_session_offload import (
             resolve_restore_margin_tokens,
         )
 
@@ -2808,7 +2808,7 @@ def test_restore_margin_resolution_refuses_explicit_and_clamps_the_default():
     small-pool instance; it is clamped instead. Both paths are LOUD. The one
     outcome that is forbidden is the pre-C29 one: silently inert.
     """
-    from sglang.srt.managers.kv_session_offload import (
+    from flliper.srt.managers.kv_session_offload import (
         resolve_restore_margin_tokens,
         restore_margin_shipped_default,
     )

@@ -20,7 +20,7 @@ points call it. Four copies of one rule is the shape that cost W32, so the
 tests below pin the callers as well as the behaviour.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -28,8 +28,8 @@ import inspect
 import types
 import unittest
 
-from sglang.srt.managers.cache_controller import consume_gate
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.cache_controller import consume_gate
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Op:
@@ -45,7 +45,7 @@ class _Ctl:
 
 def _gen_at(n):
     """Pin the ONE stamp authority to generation n."""
-    from sglang.srt.mem_cache import hicache_phase_binding as b
+    from flliper.srt.mem_cache import hicache_phase_binding as b
 
     b._STATE.reset()
     for _ in range(n):
@@ -63,7 +63,7 @@ class TestTheStaleBatchIsRefused(CustomTestCase):
     """
 
     def setUp(self):
-        import sglang.srt.managers.cache_controller as cc
+        import flliper.srt.managers.cache_controller as cc
 
         _gen_at(2)
         self._orig = cc.device_tier_disarmed
@@ -104,7 +104,7 @@ class TestTheDisarmPredicateAlsoRefuses(CustomTestCase):
     generation check is dead code. The phase predicate is the one that knows."""
 
     def test_a_disarmed_direction_clears_the_queue_even_when_stamps_match(self):
-        import sglang.srt.managers.cache_controller as cc
+        import flliper.srt.managers.cache_controller as cc
 
         _gen_at(1)
         ctl = _Ctl([_Op(1)])  # stamp is CURRENT
@@ -123,8 +123,8 @@ class TestAllFourConsumePointsUseTheOneGate(CustomTestCase):
     calling the gate is a fifth copy of the rule, and silently exempt."""
 
     def test_every_consume_point_calls_it(self):
-        from sglang.srt.managers.cache_controller import HiCacheController
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        from flliper.srt.managers.cache_controller import HiCacheController
+        from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
         )
 
@@ -145,8 +145,8 @@ class TestAllFourConsumePointsUseTheOneGate(CustomTestCase):
             )
 
     def test_the_rule_is_not_reimplemented_inline_anywhere(self):
-        from sglang.srt.managers.cache_controller import HiCacheController
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        from flliper.srt.managers.cache_controller import HiCacheController
+        from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
         )
 
@@ -162,7 +162,7 @@ class TestAllFourConsumePointsUseTheOneGate(CustomTestCase):
     def test_the_gate_is_checked_before_a_producer_is_allocated(self):
         # A refused load must cost nothing downstream; allocating a producer
         # for a batch that is then dropped leaks a layer-done slot.
-        from sglang.srt.managers.cache_controller import HiCacheController
+        from flliper.srt.managers.cache_controller import HiCacheController
 
         src = inspect.getsource(HiCacheController.start_loading)
         self.assertLess(
@@ -176,7 +176,7 @@ class TestAgainstTheRealEnqueueSites(CustomTestCase):
     calls. Pin that they really are separate, or this whole fix is moot."""
 
     def test_enqueue_and_consume_are_different_methods(self):
-        from sglang.srt.managers.cache_controller import HiCacheController
+        from flliper.srt.managers.cache_controller import HiCacheController
 
         self.assertIsNot(HiCacheController.load, HiCacheController.start_loading)
         self.assertIn("device_tier_disarmed", inspect.getsource(HiCacheController.load))
@@ -184,7 +184,7 @@ class TestAgainstTheRealEnqueueSites(CustomTestCase):
     def test_the_hybrid_enqueue_had_the_check_and_the_consume_did_not(self):
         # Documents the exact asymmetry the sweep found, so a future reader
         # does not "simplify" the consume gate away as duplicated.
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
         )
 

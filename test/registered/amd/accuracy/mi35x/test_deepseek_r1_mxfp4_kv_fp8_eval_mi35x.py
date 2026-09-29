@@ -16,16 +16,16 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
+from flliper.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - MI35x DeepSeek-R1-MXFP4 KV FP8 accuracy test (~60 min)
 register_amd_ci(
@@ -82,7 +82,7 @@ def get_mxfp4_models() -> List[ModelConfig]:
                 "--kv-cache-dtype",
                 "fp8_e4m3",
             ],
-            env_vars={"SGLANG_USE_AITER": "1"},
+            env_vars={"FLLIPER_USE_AITER": "1"},
         ),
     ]
 
@@ -122,8 +122,8 @@ def run_gsm8k_benchmark(
     parallel: int = 64,
 ) -> Tuple[float, float, float]:
     """Run GSM8K few-shot completion benchmark."""
-    import sglang as sgl
-    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+    import flliper as sgl
+    from flliper.lang.backend.runtime_endpoint import RuntimeEndpoint
 
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
     data_path = download_and_cache_file(url)

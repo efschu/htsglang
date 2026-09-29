@@ -42,8 +42,8 @@ import pathlib
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -117,7 +117,7 @@ class TestWall1SiblingQuantizationConfig(CustomTestCase):
     """The upstream quantization_config must not survive the GGUF route."""
 
     def test_quantization_config_is_dropped(self):
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from flliper.srt.utils.hf_transformers_utils import get_config
 
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_gguf(
@@ -142,7 +142,7 @@ class TestWall1SiblingQuantizationConfig(CustomTestCase):
         the block present it raises the boot's exact message; the dropped
         config passes the same frame.
         """
-        from sglang.srt.configs.model_config import ModelConfig
+        from flliper.srt.configs.model_config import ModelConfig
 
         pre_fix = ModelConfig.__new__(ModelConfig)
         pre_fix.hf_config = type("C", (), {})()
@@ -171,7 +171,7 @@ class TestWall1SiblingQuantizationConfig(CustomTestCase):
 
     def test_a_config_without_the_block_is_unchanged(self):
         """Negative control: nothing is invented where nothing was declared."""
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from flliper.srt.utils.hf_transformers_utils import get_config
 
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_gguf(pathlib.Path(tmp))
@@ -184,7 +184,7 @@ class TestWall1SiblingQuantizationConfig(CustomTestCase):
         A plain HF directory goes nowhere near reconcile_sibling_config, so an
         fp8 / awq / gptq checkpoint still declares what it is.
         """
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from flliper.srt.utils.hf_transformers_utils import get_config
 
         with tempfile.TemporaryDirectory() as tmp:
             directory = pathlib.Path(tmp)
@@ -212,7 +212,7 @@ class TestWall2BespokeTokenizerRoute(CustomTestCase):
     """AutoTokenizer must read the sibling files, or refuse by name."""
 
     def _resolve(self, path):
-        from sglang.srt.utils.hf_transformers.tokenizer import _resolve_tokenizer_name
+        from flliper.srt.utils.hf_transformers.tokenizer import _resolve_tokenizer_name
 
         kwargs = {}
         resolved = _resolve_tokenizer_name(str(path), kwargs)
@@ -301,7 +301,7 @@ class TestOnTheRealV4FlashExport(CustomTestCase):
 
     def test_model_config_builds_from_the_pristine_config(self):
         """model_config.py:1791, the frame boot attempt 1 died in."""
-        from sglang.srt.configs.model_config import ModelConfig
+        from flliper.srt.configs.model_config import ModelConfig
 
         config = ModelConfig(
             model_path=str(_V4_SHARD), trust_remote_code=True, quantization="gguf"
@@ -315,7 +315,7 @@ class TestOnTheRealV4FlashExport(CustomTestCase):
         """No --tokenizer-path: the tokenizer files now sit next to the
         shards, and the tokenizer built from them is the one the workaround
         directory produced."""
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from flliper.srt.utils.hf_transformers_utils import get_tokenizer
 
         tokenizer = get_tokenizer(str(_V4_SHARD), trust_remote_code=True)
         self.assertEqual(len(tokenizer), 129280)

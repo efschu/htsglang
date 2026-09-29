@@ -16,13 +16,13 @@ argument resolution, so the refusal belongs there.
 
 import unittest
 
-from sglang.srt.layers.quantization.w8a8_int8 import (
+from flliper.srt.layers.quantization.w8a8_int8 import (
     INT8_ARM_RUNBOOK_SECTION,
     int8_arm_available,
     require_int8_arm,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -72,7 +72,7 @@ class TestPassThrough(CustomTestCase):
         import unittest.mock as m
 
         with m.patch(
-            "sglang.srt.layers.quantization.w8a8_int8.int8_arm_available",
+            "flliper.srt.layers.quantization.w8a8_int8.int8_arm_available",
             return_value=False,
         ):
             with self.assertRaises(RuntimeError):

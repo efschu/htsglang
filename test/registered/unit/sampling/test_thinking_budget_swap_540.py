@@ -17,17 +17,17 @@ Hermetic: no server, no model load, no GPU. The fixture tokenizers carry the
 real Qwen3.6 ids and a deliberately different second vocabulary.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 import unittest  # noqa: E402
 
-from sglang.srt.sampling.thinking_budget import (  # noqa: E402
+from flliper.srt.sampling.thinking_budget import (  # noqa: E402
     ThinkingBudgetUnsupportedError,
     resolve_thinking_budget_token_ids,
 )
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 # Checkpoint A: the real Qwen3.6-27B ids (same values the sibling suite uses).
 A_START, A_END, A_NEWLINE = 248068, 248069, 198

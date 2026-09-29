@@ -58,16 +58,16 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.hicache_phase_binding import (
+from flliper.srt.mem_cache.hicache_phase_binding import (
     PhasePools,
     RebindRefused,
     check_pool_coverage,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
 
 
 def _entry(name, *, anchor=False, alloc_result=None):
@@ -240,7 +240,7 @@ class TestResolverRefusesUnknownPool(unittest.TestCase):
         class)."""
         ctrl = _controller_with({PoolName.KV: _entry(PoolName.KV, anchor=True)})
         with self.assertLogs(
-            "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
+            "flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
             level=logging.ERROR,
         ) as caught:
             for _ in range(40):
@@ -311,7 +311,7 @@ class TestRebindPoolCoverage(unittest.TestCase):
 
     def test_rebind_itself_refuses_a_narrowing_tier(self):
         """The wiring, not just the helper: a check nobody calls is inert."""
-        from sglang.srt.mem_cache import hicache_phase_binding as binding
+        from flliper.srt.mem_cache import hicache_phase_binding as binding
 
         readers = {"controller": self._reader([PoolName.KV, PoolName.MAMBA])}
         before = binding.binding_state().generation

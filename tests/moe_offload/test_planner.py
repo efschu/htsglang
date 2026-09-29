@@ -22,7 +22,7 @@ sys.path.insert(
     os.path.join(os.path.dirname(__file__), "..", "..", "python"),
 )
 
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     ExpertResidencyPlanner,
     plan_token_waves,
     resident_slot_count,
@@ -168,11 +168,11 @@ def test_resident_slot_count():
 def test_scratch_slot_count_default_and_override():
     assert scratch_slot_count(64) == 16  # max(8, 64//4)
     assert scratch_slot_count(16) == 8  # floor of 8
-    os.environ["SGLANG_MOE_SCRATCH_SLOTS"] = "24"
+    os.environ["FLLIPER_MOE_SCRATCH_SLOTS"] = "24"
     try:
         assert scratch_slot_count(64) == 24
     finally:
-        del os.environ["SGLANG_MOE_SCRATCH_SLOTS"]
+        del os.environ["FLLIPER_MOE_SCRATCH_SLOTS"]
 
 
 def test_fully_resident_passthrough():

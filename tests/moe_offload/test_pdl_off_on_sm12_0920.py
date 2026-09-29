@@ -2,7 +2,7 @@
 
 import types
 
-from sglang.jit_kernel import utils as ju
+from flliper.jit_kernel import utils as ju
 
 
 def _arch(major, minor=0):
@@ -17,7 +17,7 @@ def _pdl():
 def test_pdl_is_off_on_sm12_by_default(monkeypatch):
     monkeypatch.setattr(ju, "is_hip_runtime", lambda: False)
     monkeypatch.setattr(ju, "is_musa_runtime", lambda: False)
-    monkeypatch.delenv("SGLANG_PDL_ON_SM12", raising=False)
+    monkeypatch.delenv("FLLIPER_PDL_ON_SM12", raising=False)
     ju._PDL_SM12_LOGGED["done"] = False
     monkeypatch.setattr(ju, "get_jit_cuda_arch", lambda: _arch(12, 0))
     assert _pdl() is False
@@ -39,6 +39,6 @@ def test_the_opt_in_restores_pdl_on_sm12(monkeypatch):
     monkeypatch.setattr(ju, "is_hip_runtime", lambda: False)
     monkeypatch.setattr(ju, "is_musa_runtime", lambda: False)
     monkeypatch.setattr(ju, "get_jit_cuda_arch", lambda: _arch(12, 0))
-    monkeypatch.setenv("SGLANG_PDL_ON_SM12", "1")
+    monkeypatch.setenv("FLLIPER_PDL_ON_SM12", "1")
     assert _pdl() is True
     assert ju.pdl_on_sm12_opted_in({}) is False

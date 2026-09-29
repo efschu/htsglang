@@ -1,11 +1,11 @@
-"""#897 -- ``SGLANG_UNEVEN_TOKEN_VECTOR`` beats ``--rank-kv-ratio``, silently.
+"""#897 -- ``FLLIPER_UNEVEN_TOKEN_VECTOR`` beats ``--rank-kv-ratio``, silently.
 
 THE DEFECT, at base commit 65a4b8dbd2 (= pin 0cd27d957d + #889 + #894)
 ----------------------------------------------------------------------
 ``resolve_cp_token_ratios`` (``distributed/utils.py:816-838`` at the base)
 reads the env vector FIRST and returns on its PRESENCE::
 
-    env_vec = envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
+    env_vec = envs.FLLIPER_UNEVEN_TOKEN_VECTOR.get()
     if env_vec:
         ...
         return reduced
@@ -22,7 +22,7 @@ its supersession ratchet rather than fixing it there.
 WHAT CHANGES, AND WHAT DOES NOT
 -------------------------------
 The PRECEDENCE does not move. It is documented in the flag's own help text
-("The environment variable SGLANG_UNEVEN_TOKEN_VECTOR (explicit vector) takes
+("The environment variable FLLIPER_UNEVEN_TOKEN_VECTOR (explicit vector) takes
 precedence over this flag") and the env is how the post-profiling calibration
 feeds its measured optimum back in. Flipping it would change which vector
 serves; refusing the combination would kill a boot on every process carrying
@@ -45,9 +45,9 @@ failure this ticket is about.
 THE REMEDY IT NAMES
 -------------------
 Remove the variable, never blank it. ``server_args.py:5607`` records what an
-empty override already cost: SGLANG_UNEVEN_TOKEN_VECTOR set, then silently
+empty override already cost: FLLIPER_UNEVEN_TOKEN_VECTOR set, then silently
 cleared by a later empty append, uneven token sharding off for a day with
-nobody aware. A message that suggested ``SGLANG_UNEVEN_TOKEN_VECTOR=`` would
+nobody aware. A message that suggested ``FLLIPER_UNEVEN_TOKEN_VECTOR=`` would
 be advising the next instance of that.
 
 CPU only: the boot function is driven with a stub server_args and stopped at
@@ -60,19 +60,19 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 # THE REAL BOOT FUNCTION -- not a re-implementation of its gate.
-import sglang.srt.distributed.utils as du  # noqa: E402
-from sglang.srt.managers import scheduler as sched_mod  # noqa: E402
+import flliper.srt.distributed.utils as du  # noqa: E402
+from flliper.srt.managers import scheduler as sched_mod  # noqa: E402
 
-_TOKVEC = "SGLANG_UNEVEN_TOKEN_VECTOR"
-_ROLE = "SGLANG_UNEVEN_TOKEN_VECTOR_ROLE"
-_WEIGHTED = "SGLANG_UNEVEN_DCP_WEIGHTED"
-LOGGER = "sglang.srt.distributed.utils"
+_TOKVEC = "FLLIPER_UNEVEN_TOKEN_VECTOR"
+_ROLE = "FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE"
+_WEIGHTED = "FLLIPER_UNEVEN_DCP_WEIGHTED"
+LOGGER = "flliper.srt.distributed.utils"
 
 
 class _ReachedProcTitle(Exception):
@@ -254,7 +254,7 @@ class TestTheRemedyAndTheRefusalBoundary(_Base):
         server_args.py:5607 records the day one cost."""
         self._env(**{_TOKVEC: "7,3", _WEIGHTED: "1"})
         msg = self._announcement(_server_args(kv_ratio=[3, 7]))
-        self.assertIn("REMOVE SGLANG_UNEVEN_TOKEN_VECTOR", msg)
+        self.assertIn("REMOVE FLLIPER_UNEVEN_TOKEN_VECTOR", msg)
         self.assertIn("not by setting it to an empty string", msg)
 
     def test_a_malformed_env_vector_is_left_to_the_existing_refusal(self):

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.managers.kv_spill_park_tier import (
+from flliper.srt.managers.kv_spill_park_tier import (
     BYTES_QUANTUM,
     PARK_FAULT_BLOCK,
     choose_park_tier,
@@ -34,13 +34,13 @@ from sglang.srt.managers.kv_spill_park_tier import (
     probe_park_filesystem,
     outranks,
 )
-from sglang.srt.managers.kv_spill_tier_selection import (
+from flliper.srt.managers.kv_spill_tier_selection import (
     kv_spill_registry,
     local_host_kv_tier,
 )
-from sglang.srt.memtier.tiers import TierKind, Volatility
-from sglang.srt.planner.cost_model import Provenance, Rate
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.memtier.tiers import TierKind, Volatility
+from flliper.srt.planner.cost_model import Provenance, Rate
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -268,7 +268,7 @@ class TheParkCountersAreRead(unittest.TestCase):
 
 class TheAskIsABootConstant(unittest.TestCase):
     def test_the_ask_is_quantized_up_so_ranks_cannot_straddle_a_threshold(self):
-        from sglang.srt.managers.kv_session_spill_destination import _park_ask_bytes
+        from flliper.srt.managers.kv_session_spill_destination import _park_ask_bytes
 
         class _Pool:
             def get_size_per_token(self):
@@ -289,7 +289,7 @@ class TheAskIsABootConstant(unittest.TestCase):
 
         self.assertEqual(
             __import__(
-                "sglang.srt.managers.kv_session_spill_destination",
+                "flliper.srt.managers.kv_session_spill_destination",
                 fromlist=["_park_ask_bytes"],
             )._park_ask_bytes(_Mgr(), None),
             0,

@@ -21,13 +21,13 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 _HAS_CUDA = torch.cuda.is_available()
 # The set_kv_buffer integration test needs UnifiedMHATokenToKVPool, which only
 # exists once the shared-KV-pool feature lands; skip it where absent.
 _HAS_SHARED_POOL = (
-    importlib.util.find_spec("sglang.srt.mem_cache.unified_memory_pool") is not None
+    importlib.util.find_spec("flliper.srt.mem_cache.unified_memory_pool") is not None
 )
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
@@ -111,7 +111,7 @@ class TestStoreCache4D(unittest.TestCase):
         dtype: torch.dtype = torch.bfloat16,
         loc_dtype: torch.dtype = torch.int64,
     ):
-        from sglang.kernels.ops.kvcache.cache_move import store_cache_4d
+        from flliper.kernels.ops.kvcache.cache_move import store_cache_4d
 
         # Two independent target buffers — one for the kernel, one for the
         # legacy reference path.
@@ -219,7 +219,7 @@ class TestStoreCache4D(unittest.TestCase):
     def test_store_cache_4d_empty_loc(self):
         """N=0 must be a no-op: no kernel launch, no exception, no buffer
         mutation."""
-        from sglang.kernels.ops.kvcache.cache_move import store_cache_4d
+        from flliper.kernels.ops.kvcache.cache_move import store_cache_4d
 
         k_view = torch.zeros((8, 4, 4, 64), dtype=torch.bfloat16, device="cuda")
         v_view = torch.zeros((8, 4, 4, 64), dtype=torch.bfloat16, device="cuda")
@@ -259,7 +259,7 @@ class TestStoreCache4DAssertions(unittest.TestCase):
         """Wrapper requires `stride[-1] == 1` and `stride[-2] == head_dim`
         (the trailing two dims must be contiguous). A permutation that
         breaks this should trigger AssertionError."""
-        from sglang.kernels.ops.kvcache.cache_move import store_cache_4d
+        from flliper.kernels.ops.kvcache.cache_move import store_cache_4d
 
         # Build a 4-D view, then permute the last two dims → trailing
         # contiguity violated.
@@ -278,7 +278,7 @@ class TestStoreCache4DAssertions(unittest.TestCase):
     def test_rejects_dtype_mismatch(self):
         """All four tensors must share a dtype; the caller is responsible
         for any cast before the call."""
-        from sglang.kernels.ops.kvcache.cache_move import store_cache_4d
+        from flliper.kernels.ops.kvcache.cache_move import store_cache_4d
 
         k_view = torch.zeros((4, 4, 4, 64), dtype=torch.bfloat16, device="cuda")
         v_view = torch.zeros((4, 4, 4, 64), dtype=torch.bfloat16, device="cuda")
@@ -306,7 +306,7 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
         already-physical write location."""
         import torch as _t
 
-        from sglang.srt.mem_cache.unified_memory_pool import (
+        from flliper.srt.mem_cache.unified_memory_pool import (
             MHASubPoolSpec,
             UnifiedKVPool,
             UnifiedMHATokenToKVPool,

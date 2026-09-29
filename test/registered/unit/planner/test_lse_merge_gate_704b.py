@@ -35,7 +35,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from sglang.srt.planner.lse_merge_gate import (
+from flliper.srt.planner.lse_merge_gate import (
     LseMergeGateError,
     agreement_report,
     assert_deterministic,

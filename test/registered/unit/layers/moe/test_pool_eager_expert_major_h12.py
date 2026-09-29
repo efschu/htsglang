@@ -1,6 +1,6 @@
 """H12 (fnFL2x104, 90k needle): D's extend after the flip is an eager forward
 under the device-planned expert pool, and it ran TOKEN-major -- the arm sets
-SGLANG_MOE_OFFLOAD_WAVE_ORDER=expert only for P. On D TP0 (12 residents, 181
+FLLIPER_MOE_OFFLOAD_WAVE_ORDER=expert only for P. On D TP0 (12 residents, 181
 spill rows, scratch 44) the 49-token extend took 3 waves per layer and every
 wave re-fetched the hot spill experts its tokens shared with the previous
 wave: 0.27 GiB H2D per layer, gpu-ms 1069 for 64 tokens -- the stream WAS the
@@ -9,7 +9,7 @@ extend. (The same split left twins in the pool rows, Blocker #104.)
 What must hold, black-box through the FusedMoE pool branch
 (``run_eager_pool``): an eager forward that overflows the scratch region
 fetches every spill expert EXACTLY ONCE and computes every (token, k) pair;
-SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR=0 gives the old token-major split back.
+FLLIPER_OPT_MOE_POOL_EAGER_EXPERT_MAJOR=0 gives the old token-major split back.
 Hermetic: a CPU cache, no CUDA.
 """
 
@@ -22,11 +22,11 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.srt.layers.moe import expert_pool_device as ep
-from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.environ import envs
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_pool_device as ep
+from flliper.srt.layers.moe.topk import StandardTopKOutput
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -47,8 +47,8 @@ ROUTES = [
 
 
 def _pool_cache(monkeypatch):
-    monkeypatch.setenv("SGLANG_MOE_SCRATCH_SLOTS", str(C))
-    monkeypatch.setenv("SGLANG_MOE_OFFLOAD_WAVE_ORDER", "token")  # D's launcher env
+    monkeypatch.setenv("FLLIPER_MOE_SCRATCH_SLOTS", str(C))
+    monkeypatch.setenv("FLLIPER_MOE_OFFLOAD_WAVE_ORDER", "token")  # D's launcher env
     monkeypatch.setitem(eo._PARTIALS_MODE, "mode", "stream")  # no combine kernel on CPU
     layer = SimpleNamespace(
         num_local_experts=E, layer_id=23,
@@ -111,7 +111,7 @@ def test_the_pool_extend_fetches_each_spill_expert_once_and_computes_every_pair(
 
 
 def test_the_switch_off_restores_the_token_major_refetch(monkeypatch):
-    with envs.SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR.override(False):
+    with envs.FLLIPER_OPT_MOE_POOL_EAGER_EXPERT_MAJOR.override(False):
         cache, fetched = _pool_cache(monkeypatch)
     got = _extend(cache)
     assert fetched[2] >= 2, f"token-major should re-fetch the shared hot expert: {fetched}"

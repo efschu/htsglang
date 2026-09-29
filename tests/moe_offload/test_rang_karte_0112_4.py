@@ -15,12 +15,12 @@ import types
 
 import torch
 
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+from flliper.srt.layers.quantization.compressed_tensors.schemes import (
     compressed_tensors_wNa16_moe as m,
 )
 
 
-def test_host_tensor_gibt_trotzdem_eine_karte(monkeypatch):
+def test_host_tensor_still_gives_a_card(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     layer = types.SimpleNamespace(
         w13_weight_packed=torch.empty(0)  # cpu -- der w60-Zustand
@@ -30,13 +30,13 @@ def test_host_tensor_gibt_trotzdem_eine_karte(monkeypatch):
     assert d.index == 0
 
 
-def test_fehlender_tensor_gibt_trotzdem_eine_karte(monkeypatch):
+def test_missing_tensor_still_gives_a_card(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
     d = m._rang_karte(types.SimpleNamespace())
     assert d.type == "cuda" and d.index == 1
 
 
-def test_ein_kartentensor_bestimmt_die_karte():
+def test_card_tensor_determines_the_card():
     """Liegt das Gewicht auf einer Karte, gilt DIESE -- nicht current_device,
     sonst landet das Workspace unter Multi-Device auf der falschen."""
 
@@ -47,7 +47,7 @@ def test_ein_kartentensor_bestimmt_die_karte():
     assert d == torch.device("cuda", 2)
 
 
-def test_der_aufrufer_fragt_die_funktion():
+def test_caller_asks_the_function():
     # fnFL2x2: der Repack-Koerper steht in `_repack_to_marlin`, der aeussere
     # `process_weights_after_loading` legt ihn nur ausserhalb des Tag-Pools.
     src = inspect.getsource(m.CompressedTensorsWNA16MoE._repack_to_marlin)

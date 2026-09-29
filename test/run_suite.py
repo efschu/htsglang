@@ -7,13 +7,13 @@ from typing import Dict, List, Optional
 
 import tabulate
 
-from sglang.test.ci.ci_register import (
+from flliper.test.ci.ci_register import (
     CIRegistry,
     HWBackend,
     auto_partition,
     collect_tests,
 )
-from sglang.test.ci.ci_utils import run_unittest_files
+from flliper.test.ci.ci_utils import run_unittest_files
 
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
@@ -446,7 +446,7 @@ def main():
         "--partition-model-file",
         type=str,
         default=None,
-        help="Path to sglang-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
+        help="Path to flliper-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
     )
     args = parser.parse_args()
 

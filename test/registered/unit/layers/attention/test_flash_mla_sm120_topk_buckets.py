@@ -26,9 +26,9 @@ import unittest
 import torch
 
 import flashinfer.mla._sparse_mla_sm120 as fi
-from sglang.srt.layers.attention import flash_mla_sm120 as fmod
-from sglang.srt.layers.attention import flash_mla_sm120_triton as tmod
-from sglang.srt.layers.attention.flash_mla_sm120 import (
+from flliper.srt.layers.attention import flash_mla_sm120 as fmod
+from flliper.srt.layers.attention import flash_mla_sm120_triton as tmod
+from flliper.srt.layers.attention.flash_mla_sm120 import (
     _NOPE_ROPE_STRIDE,
     _PBS_DST,
     _SCALE_STRIDE,

@@ -11,12 +11,12 @@ import os
 
 import pytest
 
-from sglang.srt.flip_cold_tier_share import (
+from flliper.srt.flip_cold_tier_share import (
     COLD_TIER_INSTANCE_ENV,
     COLD_TIER_SWITCH_ENV,
     ColdTierHolder,
     ShardMap,
-    Weg2FlipColdTierSplit,
+    PdFlipColdTierSplit,
     assert_one_instance,
     build_cold_tier_group_env,
     check_shard_alignment,
@@ -30,13 +30,13 @@ from sglang.srt.flip_cold_tier_share import (
 def test_the_instance_env_name_matches_cold_tier_fetch():
     """This module keeps the name as a literal so it stays desk-pure. That
     only works while the literal is right."""
-    from sglang.srt.layers.moe import cold_tier_fetch
+    from flliper.srt.layers.moe import cold_tier_fetch
 
     assert cold_tier_fetch.COLD_TIER_INSTANCE_ENV == COLD_TIER_INSTANCE_ENV
 
 
 def test_the_switch_name_matches_the_environ_inventory():
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
     assert hasattr(envs, COLD_TIER_SWITCH_ENV)
 
@@ -47,7 +47,7 @@ def test_the_shared_pinned_path_is_mmap_plus_register_not_pin_memory():
     number in the design is too small (Memory PINNED-EXAKT-DREI-FALLEN)."""
     import inspect
 
-    from sglang.srt.layers.moe import shared_pinned
+    from flliper.srt.layers.moe import shared_pinned
 
     src = inspect.getsource(shared_pinned.shared_pinned_empty)
     assert "cudaHostRegister" in src
@@ -70,10 +70,10 @@ def test_an_empty_instance_is_refused_because_each_group_would_mint_its_own():
     """publish_cold_tier_instance() mints uuid4 per SERVER PROCESS
     (cold_tier_fetch.py:149-165, called engine.py:683). Two groups = two ids
     = two pools, while both report shared=true."""
-    with pytest.raises(Weg2FlipColdTierSplit) as exc:
+    with pytest.raises(PdFlipColdTierSplit) as exc:
         build_cold_tier_group_env("")
     msg = str(exc.value)
-    assert "W117 Weg2FlipColdTierSplit" in msg
+    assert "W117 PdFlipColdTierSplit" in msg
     assert "engine.py:683" in msg
     assert "uuid4" in msg
 
@@ -83,7 +83,7 @@ def test_two_different_instances_are_refused_with_the_saving_named():
         "P": {COLD_TIER_SWITCH_ENV: "1", COLD_TIER_INSTANCE_ENV: "aaaa"},
         "D": {COLD_TIER_SWITCH_ENV: "1", COLD_TIER_INSTANCE_ENV: "bbbb"},
     }
-    with pytest.raises(Weg2FlipColdTierSplit) as exc:
+    with pytest.raises(PdFlipColdTierSplit) as exc:
         assert_one_instance(envs)
     msg = str(exc.value)
     assert "two pools, not one" in msg
@@ -95,14 +95,14 @@ def test_the_switch_on_in_one_group_only_is_refused():
         "P": {COLD_TIER_SWITCH_ENV: "1", COLD_TIER_INSTANCE_ENV: "aaaa"},
         "D": {},
     }
-    with pytest.raises(Weg2FlipColdTierSplit) as exc:
+    with pytest.raises(PdFlipColdTierSplit) as exc:
         assert_one_instance(envs)
     assert "half-shared" in str(exc.value).lower()
 
 
 def test_the_switch_on_with_no_instance_is_refused():
     envs = {"P": {COLD_TIER_SWITCH_ENV: "1"}, "D": {COLD_TIER_SWITCH_ENV: "1"}}
-    with pytest.raises(Weg2FlipColdTierSplit) as exc:
+    with pytest.raises(PdFlipColdTierSplit) as exc:
         assert_one_instance(envs)
     assert "mint its own id" in str(exc.value)
 
@@ -152,7 +152,7 @@ def test_the_real_cut_is_orthogonal_and_is_refused():
         1: _by_expert(1, [1, 2]),
         2: _by_expert(2, [3]),
     }
-    with pytest.raises(Weg2FlipColdTierSplit) as exc:
+    with pytest.raises(PdFlipColdTierSplit) as exc:
         check_shard_alignment(left, right)
     msg = str(exc.value)
     assert "DIFFERENT cold rows" in msg
@@ -166,13 +166,13 @@ def test_the_real_cut_is_orthogonal_and_is_refused():
 def test_a_rank_slot_with_one_reader_is_a_sum_term_not_a_max_term():
     left = {0: _by_layer(0, [0]), 1: _by_layer(1, [1])}
     right = {0: _by_layer(0, [0])}
-    with pytest.raises(Weg2FlipColdTierSplit) as exc:
+    with pytest.raises(PdFlipColdTierSplit) as exc:
         check_shard_alignment(left, right)
     assert "SUM term" in str(exc.value)
 
 
 def test_empty_shards_are_refused():
-    with pytest.raises(Weg2FlipColdTierSplit):
+    with pytest.raises(PdFlipColdTierSplit):
         check_shard_alignment({}, {})
 
 
@@ -186,28 +186,28 @@ def test_the_holder_may_unlink_its_own_epoch():
 
 def test_a_foreign_epoch_is_refused():
     h = ColdTierHolder("epoch1", 4242)
-    with pytest.raises(Weg2FlipColdTierSplit) as exc:
+    with pytest.raises(PdFlipColdTierSplit) as exc:
         may_unlink(h, caller_pid=4242, caller_instance="epoch2")
     assert "by ITS holder or by nobody" in str(exc.value)
 
 
 def test_a_peer_may_not_tear_down_for_the_holder():
     h = ColdTierHolder("epoch1", 4242)
-    with pytest.raises(Weg2FlipColdTierSplit) as exc:
+    with pytest.raises(PdFlipColdTierSplit) as exc:
         may_unlink(h, caller_pid=9999, caller_instance="epoch1")
     assert "not the holder" in str(exc.value)
 
 
 def test_a_live_peer_blocks_the_unlink():
     h = ColdTierHolder("epoch1", 4242)
-    with pytest.raises(Weg2FlipColdTierSplit) as exc:
+    with pytest.raises(PdFlipColdTierSplit) as exc:
         may_unlink(h, 4242, "epoch1", live_peer_pids=[4242, 5555])
     assert "5555" in str(exc.value)
 
 
 def test_an_unlink_without_an_epoch_is_a_pattern_sweep():
     """Memory SHM-RESIDUE-NUR-PER-HALTER, stated in the refusal."""
-    with pytest.raises(Weg2FlipColdTierSplit) as exc:
+    with pytest.raises(PdFlipColdTierSplit) as exc:
         may_unlink(ColdTierHolder("", 1), 1, "")
     assert "SHM-RESIDUE-NUR-PER-HALTER" in str(exc.value)
 
@@ -218,7 +218,7 @@ def test_an_unlink_without_an_epoch_is_a_pattern_sweep():
 def test_a_second_opener_attaches_to_the_same_bytes_and_does_not_resize(tmp_path):
     """``open_shared_file`` is the primitive both groups go through. The
     second opener must see the first opener's size and bytes."""
-    from sglang.srt.layers.moe.shared_pinned import open_shared_file
+    from flliper.srt.layers.moe.shared_pinned import open_shared_file
 
     path = str(tmp_path / "store" / "seg.bin")
     fd1, created1 = open_shared_file(path, 4096)
@@ -235,7 +235,7 @@ def test_a_second_opener_attaches_to_the_same_bytes_and_does_not_resize(tmp_path
 
 def test_a_size_disagreement_between_layouts_is_refused_loudly(tmp_path):
     """Two layouts disagreeing on a store's shape must never silently alias."""
-    from sglang.srt.layers.moe.shared_pinned import open_shared_file
+    from flliper.srt.layers.moe.shared_pinned import open_shared_file
 
     path = str(tmp_path / "seg.bin")
     fd, _ = open_shared_file(path, 4096)

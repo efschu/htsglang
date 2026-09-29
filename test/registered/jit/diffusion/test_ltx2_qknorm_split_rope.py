@@ -4,11 +4,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.ltx2_qknorm_split_rope import (
+from flliper.jit_kernel.diffusion.ltx2_qknorm_split_rope import (
     can_use_ltx2_qknorm_split_rope_cuda,
     ltx2_qknorm_split_rope_cuda,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 

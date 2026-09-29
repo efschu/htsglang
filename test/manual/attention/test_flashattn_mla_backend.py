@@ -2,17 +2,17 @@ import unittest
 
 import torch
 
-from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_executor.forward_context import (
+from flliper.srt.configs.model_config import AttentionArch
+from flliper.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from flliper.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
+from flliper.srt.layers.radix_attention import RadixAttention
+from flliper.srt.mem_cache.memory_pool import MLATokenToKVPool
+from flliper.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from flliper.srt.model_executor.forward_context import (
     ForwardContext,
     set_forward_context,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class MockModelRunner:

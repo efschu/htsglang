@@ -27,7 +27,7 @@ Run:  CUDA_VISIBLE_DEVICES="" python -m pytest tests/moe_offload/test_marlin_c_p
 import pytest
 import torch
 
-from sglang.srt.layers.moe.fused_moe_triton import fused_marlin_moe as fm
+from flliper.srt.layers.moe.fused_moe_triton import fused_marlin_moe as fm
 
 
 @pytest.fixture(autouse=True)
@@ -45,16 +45,16 @@ def _reset_memos():
 
 
 def test_sentinel_switch_defaults_off(monkeypatch):
-    monkeypatch.delenv("SGLANG_MOE_MARLIN_C_SENTINEL", raising=False)
+    monkeypatch.delenv("FLLIPER_MOE_MARLIN_C_SENTINEL", raising=False)
     assert fm.marlin_c_sentinel_on() is False
     for raw, want in (("0", False), ("1", True), ("on", True), ("true", True)):
         fm._C_SENTINEL["on"] = None
-        monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", raw)
+        monkeypatch.setenv("FLLIPER_MOE_MARLIN_C_SENTINEL", raw)
         assert fm.marlin_c_sentinel_on() is want, raw
 
 
 def test_atomic_add_override_defaults_to_the_hardware_rule(monkeypatch):
-    monkeypatch.delenv("SGLANG_MOE_MARLIN_ATOMIC_ADD", raising=False)
+    monkeypatch.delenv("FLLIPER_MOE_MARLIN_ATOMIC_ADD", raising=False)
     assert fm.marlin_atomic_add_override() is None
     assert fm.resolve_atomic_add(True) == (True, "hardware")
     fm._ATOMIC_ADD["mode"] = None
@@ -66,7 +66,7 @@ def test_atomic_add_override_defaults_to_the_hardware_rule(monkeypatch):
     [("0", False), ("false", False), ("off", False), ("1", True), ("on", True)],
 )
 def test_atomic_add_override_forces_both_ways(monkeypatch, raw, forced):
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_ATOMIC_ADD", raw)
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_ATOMIC_ADD", raw)
     # forced in BOTH directions: the 5090's hardware rule says True, the
     # 3080's says False, and the boot must be able to put either rank on
     # either branch to A/B the fault.
@@ -76,7 +76,7 @@ def test_atomic_add_override_forces_both_ways(monkeypatch, raw, forced):
 
 
 def test_unknown_value_is_not_silently_an_override(monkeypatch):
-    monkeypatch.setenv("SGLANG_MOE_MARLIN_ATOMIC_ADD", "yes-please")
+    monkeypatch.setenv("FLLIPER_MOE_MARLIN_ATOMIC_ADD", "yes-please")
     assert fm.marlin_atomic_add_override() is None
     assert fm.resolve_atomic_add(True) == (True, "hardware")
 

@@ -1,4 +1,4 @@
-# SGLang CI failure monitoring
+# fLLiper CI failure monitoring
 
 Scripts used by [.github/workflows/ci-failure-monitor.yml](../../.github/workflows/ci-failure-monitor.yml): scheduled failure analysis.
 

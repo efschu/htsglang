@@ -1,4 +1,4 @@
-"""GPU-free unit tests for ``sglang.kernels``: BaseFusedOp + registry/selector/spec.
+"""GPU-free unit tests for ``flliper.kernels``: BaseFusedOp + registry/selector/spec.
 
 Part of RFC #29630, Phase 2. Covers the multi-backend operator contract
 (structural backend detection, priority dispatch, forced backend, runtime
@@ -12,15 +12,15 @@ import unittest
 
 import torch
 
-import sglang.kernels as K
-from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.registry import KernelRegistry
-from sglang.kernels.spec import (
+import flliper.kernels as K
+from flliper.kernels.fused_op import BaseFusedOp
+from flliper.kernels.registry import KernelRegistry
+from flliper.kernels.spec import (
     CapabilityRequirement,
     KernelBackend,
     KernelSpec,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -99,12 +99,12 @@ class TestBaseFusedOp(unittest.TestCase):
         self.assertEqual(op(a, b).item(), 1003.0)
 
     def test_forced_backend_env_var(self):
-        import sglang.kernels.fused_op as fused_op_module
-        from sglang.srt.environ import envs
+        import flliper.kernels.fused_op as fused_op_module
+        from flliper.srt.environ import envs
 
         op = _ToyAddOp()
         a, b = torch.tensor([1.0]), torch.tensor([2.0])
-        with envs.SGLANG_FORCE_FUSED_OP_BACKEND.override("torch"):
+        with envs.FLLIPER_FORCE_FUSED_OP_BACKEND.override("torch"):
             # Reset the module cache so the env var is re-read.
             fused_op_module._forced_backend = fused_op_module._UNRESOLVED
             self.assertEqual(K.get_fused_op_backend(), KernelBackend.TORCH)
@@ -209,7 +209,7 @@ class TestKernelSpecUnit(unittest.TestCase):
         spec = KernelSpec(
             op="g.n",
             backend=KernelBackend.TORCH,
-            target="sglang.kernels.ops.layernorm:_RMSNORM.forward_native",
+            target="flliper.kernels.ops.layernorm:_RMSNORM.forward_native",
         )
         self.assertTrue(callable(spec.load()))
 
@@ -232,7 +232,7 @@ class TestNativeReferenceImplementations(unittest.TestCase):
         torch.manual_seed(0)
 
     def test_rmsnorm_native(self):
-        from sglang.kernels.ops.layernorm import _RMSNORM
+        from flliper.kernels.ops.layernorm import _RMSNORM
 
         x = torch.randn(8, 128)
         w = torch.randn(128)
@@ -244,7 +244,7 @@ class TestNativeReferenceImplementations(unittest.TestCase):
         self.assertTrue(torch.allclose(buf, out))
 
     def test_fused_add_rmsnorm_native(self):
-        from sglang.kernels.ops.layernorm import _FUSED_ADD_RMSNORM
+        from flliper.kernels.ops.layernorm import _FUSED_ADD_RMSNORM
 
         x = torch.randn(8, 128)
         residual = torch.randn(8, 128)
@@ -257,7 +257,7 @@ class TestNativeReferenceImplementations(unittest.TestCase):
         self.assertTrue(torch.allclose(x, ref))
 
     def test_gemma_rmsnorm_native(self):
-        from sglang.kernels.ops.layernorm import _GEMMA_RMSNORM
+        from flliper.kernels.ops.layernorm import _GEMMA_RMSNORM
 
         x = torch.randn(8, 128)
         w = torch.randn(128)
@@ -269,7 +269,7 @@ class TestNativeReferenceImplementations(unittest.TestCase):
     def test_gated_activations_native(self):
         import torch.nn.functional as F
 
-        from sglang.kernels.ops.activation import (
+        from flliper.kernels.ops.activation import (
             _GELU_AND_MUL,
             _GELU_TANH_AND_MUL,
             _SILU_AND_MUL,

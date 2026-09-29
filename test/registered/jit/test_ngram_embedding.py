@@ -3,13 +3,13 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.ngram_embedding import (
+from flliper.jit_kernel.ngram_embedding import (
     compute_n_gram_ids,
     compute_n_gram_ids_decode,
     update_token_table,
     update_token_table_decode,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, stage="jit-kernel-unit", runner_config="amd")

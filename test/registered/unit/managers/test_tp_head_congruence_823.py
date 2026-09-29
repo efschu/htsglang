@@ -94,7 +94,7 @@ def _rank_queue(rank):
     and the slot indexing could be queue-position based without any test
     noticing.
     """
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     return thc.local_head_order(RIDS, LOCAL_MATCHES[rank])
 
@@ -102,7 +102,7 @@ def _rank_queue(rank):
 def test_todays_local_rule_really_does_diverge():
     """THE PREMISE. If this ever stops being true the rest is pointless, so
     it is asserted rather than assumed."""
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     orders = [thc.local_head_order(RIDS, LOCAL_MATCHES[r]) for r in range(3)]
 
@@ -117,7 +117,7 @@ def test_todays_local_rule_really_does_diverge():
 
 def test_the_group_rule_is_uniform_across_ranks():
     """CHANGE 1: the sort key is the group's number, so the order agrees."""
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     # Each rank derives the canonical slots from ITS OWN queue order.
     canonicals = [thc.canonical_head_rids(_rank_queue(r)) for r in range(3)]
@@ -138,7 +138,7 @@ def test_the_group_rule_is_uniform_across_ranks():
 
 def test_the_group_never_claims_a_prefix_a_rank_lacks():
     """MIN is the safe direction: the agreed length is <= every rank's own."""
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     canonical = thc.canonical_head_rids(_rank_queue(0))
     payloads = [
@@ -164,7 +164,7 @@ def test_a_rid_missing_on_one_rank_is_dropped_by_the_group():
     A request one rank has not got cannot be admitted by the others, so it
     leaves the group's head rather than splitting the batch.
     """
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     canonical = thc.canonical_head_rids(_rank_queue(0))
     holders = [dict(LOCAL_MATCHES[r]) for r in range(3)]
@@ -183,7 +183,7 @@ def test_a_rid_missing_on_one_rank_is_dropped_by_the_group():
 
 
 def _decide(rank, digest_agreed, enforcer_enabled):
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     canonical = thc.canonical_head_rids(_rank_queue(rank))
     reduced = _group_min(
@@ -209,7 +209,7 @@ def _decide(rank, digest_agreed, enforcer_enabled):
 def test_a_digest_mismatch_no_longer_falls_back_to_rank_local():
     """CHANGE 2. This is the wedge case: today a mismatch voids the ballot
     and admission uses the rank-local verdict."""
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     results = [_decide(r, digest_agreed=False, enforcer_enabled=True) for r in range(3)]
     orders = [o for o, _ in results]
@@ -229,7 +229,7 @@ def test_can_fail_with_the_enforcer_off_the_divergence_goes_silent():
     ranks disagree while nothing objects -- exactly today's behaviour, and
     exactly what this suite must be able to see.
     """
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     results = [
         _decide(r, digest_agreed=False, enforcer_enabled=False) for r in range(3)
@@ -247,7 +247,7 @@ def test_can_fail_with_the_enforcer_off_the_divergence_goes_silent():
 def test_the_agreeing_case_is_enforced_too():
     """Uniformity must not be conditional on the digest: a pass that agrees
     today can diverge on the next one, and the rule may not change under it."""
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     agreed = [_decide(r, digest_agreed=True, enforcer_enabled=True) for r in range(3)]
     diverged = [_decide(r, digest_agreed=False, enforcer_enabled=True) for r in range(3)]
@@ -268,7 +268,7 @@ def _worker(rank, world, port, out):
         import torch
         import torch.distributed as dist
 
-        from sglang.srt.managers import tp_head_congruence as thc
+        from flliper.srt.managers import tp_head_congruence as thc
 
         dist.init_process_group(
             backend="gloo",
@@ -319,7 +319,7 @@ def _run(world):
 
 @pytest.mark.parametrize("world", [2, 3])
 def test_real_gloo_ranks_form_the_same_head(world):
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     got = _run(world)
 
@@ -353,7 +353,7 @@ LOCAL_LIMITS = {0: 3, 1: 1}
 
 
 def _count_decide(rank, enforcer_enabled, limits=None):
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     limits = LOCAL_LIMITS if limits is None else limits
     canonical = thc.canonical_head_rids(RIDS)
@@ -388,7 +388,7 @@ def test_todays_local_count_really_does_diverge():
 
 def test_the_group_count_is_uniform_across_ranks():
     """After the fix both ranks admit the SAME requests, MIN many."""
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     results = [_count_decide(r, enforcer_enabled=True) for r in (0, 1)]
     admitted = [a for a, _, _ in results]
@@ -413,7 +413,7 @@ def test_the_group_never_asks_a_rank_to_seat_more_than_it_can():
 
 def test_can_fail_with_the_count_enforcer_off_the_divergence_goes_silent():
     """THE MUTANT LEVER for this arm, as a test."""
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     results = [_count_decide(r, enforcer_enabled=False) for r in (0, 1)]
     admitted = [a for a, _, _ in results]
@@ -429,7 +429,7 @@ def test_can_fail_with_the_count_enforcer_off_the_divergence_goes_silent():
 def test_an_unpriced_group_leaves_the_local_limit_untouched():
     """A configuration with no allocator to ask must behave exactly as it
     does today, not collapse to a zero-sized batch."""
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     limit, source = thc.admit_limit_decision(
         local_limit=5,
@@ -442,7 +442,7 @@ def test_an_unpriced_group_leaves_the_local_limit_untouched():
 def test_both_arms_are_required_for_a_uniform_batch():
     """ORDER alone and COUNT alone each leave a divergent batch, which is why
     W9 is only green when both are enforced."""
-    from sglang.srt.managers import tp_head_congruence as thc
+    from flliper.srt.managers import tp_head_congruence as thc
 
     canonical = thc.canonical_head_rids(RIDS)
     reduced = _group_min(

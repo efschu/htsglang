@@ -39,16 +39,16 @@ import threading
 import unittest
 from unittest import mock
 
-from sglang.jit_kernel import baton_health
-from sglang.srt.distributed import parallel_state
-from sglang.srt.distributed.device_communicators import barlink_liveness
-from sglang.srt.utils import jit_cold_build
-from sglang.srt.distributed.device_communicators.barlink_bar1_ext import (
+from flliper.jit_kernel import baton_health
+from flliper.srt.distributed import parallel_state
+from flliper.srt.distributed.device_communicators import barlink_liveness
+from flliper.srt.utils import jit_cold_build
+from flliper.srt.distributed.device_communicators.barlink_bar1_ext import (
     ENV_GROUPED_BUILD,
     build_once_per_group,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -94,7 +94,7 @@ def _run_group(body, world=WORLD):
 
     patches = [
         mock.patch(
-            "sglang.srt.distributed.device_communicators.barlink_liveness"
+            "flliper.srt.distributed.device_communicators.barlink_liveness"
             ".bounded_barrier",
             fake_barrier,
         ),
@@ -249,7 +249,7 @@ class TestWaitersRunUnderABuildDeadline(CustomTestCase):
                 g.barrier.wait()
 
             with mock.patch(
-                "sglang.srt.distributed.device_communicators.barlink_liveness"
+                "flliper.srt.distributed.device_communicators.barlink_liveness"
                 ".bounded_barrier",
                 watching_barrier,
             ):
@@ -292,7 +292,7 @@ class TestTheGraphReleaseIsOn(CustomTestCase):
     """
 
     def test_bar1_and_matrix_are_capturable_by_default(self):
-        prev = os.environ.pop("SGLANG_BARLINK_GRAPH_ENABLE", None)
+        prev = os.environ.pop("FLLIPER_BARLINK_GRAPH_ENABLE", None)
         try:
             self.assertTrue(parallel_state.graph_enable_set())
             capturable = parallel_state.capturable_transports()
@@ -303,11 +303,11 @@ class TestTheGraphReleaseIsOn(CustomTestCase):
                 self.assertIn(name, capturable)
         finally:
             if prev is not None:
-                os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = prev
+                os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = prev
 
     def test_the_opt_out_still_removes_them(self):
-        prev = os.environ.get("SGLANG_BARLINK_GRAPH_ENABLE")
-        os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = "0"
+        prev = os.environ.get("FLLIPER_BARLINK_GRAPH_ENABLE")
+        os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = "0"
         try:
             self.assertFalse(parallel_state.graph_enable_set())
             capturable = parallel_state.capturable_transports()
@@ -318,20 +318,20 @@ class TestTheGraphReleaseIsOn(CustomTestCase):
             )
         finally:
             if prev is None:
-                os.environ.pop("SGLANG_BARLINK_GRAPH_ENABLE", None)
+                os.environ.pop("FLLIPER_BARLINK_GRAPH_ENABLE", None)
             else:
-                os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = prev
+                os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = prev
 
     def test_host_staged_transports_are_still_refused(self):
         """The release must not have widened anything else."""
-        prev = os.environ.pop("SGLANG_BARLINK_GRAPH_ENABLE", None)
+        prev = os.environ.pop("FLLIPER_BARLINK_GRAPH_ENABLE", None)
         try:
             capturable = parallel_state.capturable_transports()
             for name in ("shm", "gloo", "ucx", "something-unknown"):
                 self.assertNotIn(name, capturable)
         finally:
             if prev is not None:
-                os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = prev
+                os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = prev
 
 
 class TestTheBatonRuleThisReplaces(CustomTestCase):

@@ -51,7 +51,7 @@ import types
 from collections import defaultdict, deque
 
 
-from sglang.srt.managers.pp_stash_disposition import (
+from flliper.srt.managers.pp_stash_disposition import (
     BLOCKS_FLIP,
     PP_LOOP_ONLY,
     UNDECLARED,
@@ -59,8 +59,8 @@ from sglang.srt.managers.pp_stash_disposition import (
     declared_stash_kinds,
     stash_flip_disposition,
 )
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20)
 
@@ -148,8 +148,8 @@ def test_every_kind_the_wire_actually_carries_is_declared():
     So the constants are read from where the senders read them, and every kind
     the wire actually carries has to be declared.
     """
-    from sglang.srt.distributed.pp_typed_channel import CROSSING_KIND
-    from sglang.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
+    from flliper.srt.distributed.pp_typed_channel import CROSSING_KIND
+    from flliper.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
 
     for kind in (ADMISSION_DECISION_KIND, CROSSING_KIND, "output", "proxy"):
         assert stash_flip_disposition(kind) != UNDECLARED, (
@@ -182,7 +182,7 @@ def test_the_census_never_answers_none_for_two_different_states():
 
 
 def _presence(tmpdir, n_ranks=3, rank=0):
-    from sglang.srt.managers.phase_flip_presence import PhaseFlipPresence
+    from flliper.srt.managers.phase_flip_presence import PhaseFlipPresence
 
     return PhaseFlipPresence(
         n_ranks=n_ranks, rank=rank, directory=str(tmpdir), instance="test"
@@ -197,8 +197,8 @@ def _gate(presence, channels_empty_fn, deadline=60.0, clock=None):
     lambda. A fix that lives only in the probe and never reaches the gate fails
     here and nowhere else.
     """
-    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
-    from sglang.srt.managers.phase_policy import PHASE_PP
+    from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+    from flliper.srt.managers.phase_policy import PHASE_PP
 
     class R:
         pass
@@ -251,7 +251,7 @@ def _cutover_bytecode():
     """
     import dis
 
-    from sglang.srt.managers import phase_flip_runtime
+    from flliper.srt.managers import phase_flip_runtime
 
     outer = phase_flip_runtime.build_production_flip_cutover.__code__
     inner = [

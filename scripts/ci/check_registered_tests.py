@@ -40,10 +40,10 @@ _LEGACY_CUDA_PREFIXES = ("nightly", "stress", "weekly")
 
 
 def main() -> int:
-    # Import ci_register directly to avoid pulling in all of sglang
+    # Import ci_register directly to avoid pulling in all of flliper
     spec = importlib.util.spec_from_file_location(
         "ci_register",
-        os.path.join("python", "sglang", "test", "ci", "ci_register.py"),
+        os.path.join("python", "flliper", "test", "ci", "ci_register.py"),
     )
     ci_register = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ci_register)

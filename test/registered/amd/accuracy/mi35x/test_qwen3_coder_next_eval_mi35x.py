@@ -16,16 +16,16 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
+from flliper.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - MI35x Qwen3-Coder-Next accuracy test
 register_amd_ci(est_time=3600, suite="nightly-amd-8-gpu-mi35x", nightly=True)
@@ -143,8 +143,8 @@ def run_gsm8k_benchmark(
     parallel: int = 64,
 ) -> Tuple[float, float, float]:
     """Run GSM8K few-shot completion benchmark."""
-    import sglang as sgl
-    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+    import flliper as sgl
+    from flliper.lang.backend.runtime_endpoint import RuntimeEndpoint
 
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
     data_path = download_and_cache_file(url)

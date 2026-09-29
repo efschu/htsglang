@@ -44,9 +44,9 @@ import numpy as np
 from gguf.constants import GGMLQuantizationType as GGMLType
 from gguf.quants import dequantize, quantize
 
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.gguf_mxfp4_state import (
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.gguf_mxfp4_state import (
     ForcesNativePath,
     native_path,
     repack_path,
@@ -118,9 +118,9 @@ class _PlanTensor:
 
 def _repack_plan_line(n_bytes: int = 1 << 30) -> str:
     """The single load-time line the plan emits for one MXFP4 tensor."""
-    from sglang.srt.model_loader.gguf_mxfp4_repack import log_gguf_repack_plan
+    from flliper.srt.model_loader.gguf_mxfp4_repack import log_gguf_repack_plan
 
-    logger_name = "sglang.srt.model_loader.gguf_mxfp4_repack"
+    logger_name = "flliper.srt.model_loader.gguf_mxfp4_repack"
     with _CapturedLogs(logger_name) as captured:
         log_gguf_repack_plan([_PlanTensor(GGMLType.MXFP4, n_bytes)])
     return "\n".join(captured.messages)
@@ -151,7 +151,7 @@ class _CapturedLogs(logging.Handler):
 
 def _run_iterator() -> tuple:
     """``(stream, payloads)`` from the real iterator over a synthetic file."""
-    from sglang.srt.model_loader.weight_utils import gguf_quant_weights_iterator
+    from flliper.srt.model_loader.weight_utils import gguf_quant_weights_iterator
 
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "synthetic.gguf")
@@ -233,14 +233,14 @@ class TestNativeExecutabilityGateNeedsNoRepack(ForcesNativePath, unittest.TestCa
     def test_mxfp4_is_supported_on_the_kernels_alone(self):
         import gguf
 
-        from sglang.srt.model_loader.gguf_deepseek4 import _supported_ggml_types
+        from flliper.srt.model_loader.gguf_deepseek4 import _supported_ggml_types
 
-        with envs.SGLANG_GGUF_MXFP4_REPACK.override(False):
+        with envs.FLLIPER_GGUF_MXFP4_REPACK.override(False):
             supported = _supported_ggml_types()
         self.assertIn(gguf.GGMLQuantizationType.MXFP4, supported)
 
     def test_the_repack_contributes_nothing_because_it_has_nothing_to_add(self):
-        from sglang.srt.model_loader.gguf_mxfp4_repack import repack_source_types
+        from flliper.srt.model_loader.gguf_mxfp4_repack import repack_source_types
 
         self.assertEqual(repack_source_types(), set())
 
@@ -284,9 +284,9 @@ class TestTheTwoPathsActuallyDiffer(unittest.TestCase):
     def test_the_gate_differs_between_the_two_paths_with_the_repack_off(self):
         import gguf
 
-        from sglang.srt.model_loader.gguf_deepseek4 import _supported_ggml_types
+        from flliper.srt.model_loader.gguf_deepseek4 import _supported_ggml_types
 
-        with envs.SGLANG_GGUF_MXFP4_REPACK.override(False):
+        with envs.FLLIPER_GGUF_MXFP4_REPACK.override(False):
             with native_path():
                 self.assertIn(gguf.GGMLQuantizationType.MXFP4, _supported_ggml_types())
             with repack_path():

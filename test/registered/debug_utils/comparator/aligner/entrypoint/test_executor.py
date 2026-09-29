@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.entrypoint.executor import (
+from flliper.srt.debug_utils.comparator.aligner.entrypoint.executor import (
     AlignerResult,
     StepPlansResult,
     SubPlansResult,
@@ -12,26 +12,26 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.executor import (
     execute_sub_plan,
     execute_sub_plans,
 )
-from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
+from flliper.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
     AlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     TokenAlignerPlan,
     TokenLocator,
 )
-from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.types import (
     ConcatParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import (
+from flliper.srt.debug_utils.comparator.dims_spec import (
     ParallelAxis,
     TokenLayout,
     apply_dim_names,
     without_dim_names,
 )
-from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.utils import Pair
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")
@@ -281,7 +281,7 @@ class TestExecuteAlignerPlanWithTokenDim:
             )
 
     def test_bshd_cross_layout_e2e(self) -> None:
-        """x=SGLang THD, y=Megatron BSHD: planner->executor full flow."""
+        """x=fLLiper THD, y=Megatron BSHD: planner->executor full flow."""
         torch.manual_seed(42)
 
         # x side: THD layout, shape [6, 8] (6 tokens, hidden=8), pre-named

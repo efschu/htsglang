@@ -31,10 +31,10 @@ import os
 
 import pytest
 
-from sglang.srt.mem_ledger import activation_probe as ap
-from sglang.srt.mem_ledger import calibration as cal
-from sglang.srt.mem_ledger.activation import ActivationProfile
-from sglang.srt.registry.nvml import DeviceInfo
+from flliper.srt.mem_ledger import activation_probe as ap
+from flliper.srt.mem_ledger import calibration as cal
+from flliper.srt.mem_ledger.activation import ActivationProfile
+from flliper.srt.registry.nvml import DeviceInfo
 
 _HERE = os.path.abspath(__file__)
 _ROOT = _HERE
@@ -263,7 +263,7 @@ def test_ingest_refuses_a_dump_that_carries_no_delta(tmp_path, capsys):
 
 
 def _patch_nvml(monkeypatch, devices):
-    from sglang.srt.registry import nvml as registry_nvml
+    from flliper.srt.registry import nvml as registry_nvml
 
     monkeypatch.setattr(registry_nvml, "list_devices", lambda: list(devices))
     monkeypatch.setattr(registry_nvml, "driver_version", lambda: DRIVER)
@@ -330,7 +330,7 @@ def test_enumeration_order_cannot_change_the_rig_fingerprint(monkeypatch):
 
 
 def test_no_nvml_is_an_honest_none(monkeypatch):
-    from sglang.srt.registry import nvml as registry_nvml
+    from flliper.srt.registry import nvml as registry_nvml
 
     def boom():
         raise registry_nvml.NvmlUnavailableError("no driver here")
@@ -347,14 +347,14 @@ def test_the_probe_stamps_the_rig_fingerprint_into_the_dump(monkeypatch, tmp_pat
     monkeypatch.setenv(ap.DUMP_ENV, str(tmp_path))
     ap._identity = None
 
-    from sglang.srt.registry import nvml as registry_nvml
+    from flliper.srt.registry import nvml as registry_nvml
 
     monkeypatch.setattr(registry_nvml, "current_device_uuid", lambda: UUID_5090)
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.engine._model_architectures", lambda _sa: ("X",)
+        "flliper.srt.mem_ledger.engine._model_architectures", lambda _sa: ("X",)
     )
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.activation.profile_from_server_args",
+        "flliper.srt.mem_ledger.activation.profile_from_server_args",
         lambda _sa, _arch: PROFILE,
     )
 

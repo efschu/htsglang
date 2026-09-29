@@ -21,22 +21,22 @@ import unittest.mock
 import torch
 from torch import nn
 
-import sglang.srt.model_executor.dual_group_lane as dgl
-from sglang.srt.distributed.dual_group import (
+import flliper.srt.model_executor.dual_group_lane as dgl
+from flliper.srt.distributed.dual_group import (
     derive_nested_plan,
     lane_part_device_indices,
     lane_visible_physical_gpus,
 )
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     partition_sizes,
     scoped_tp_partition_ratios,
 )
-from sglang.srt.layers.linear import (
+from flliper.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.model_executor.dual_group_lane import (
+from flliper.srt.model_executor.dual_group_lane import (
     DualGroupLane,
     LaneColumnParallelShell,
     LaneFusedMoEShell,
@@ -365,7 +365,7 @@ class TestMoEShell(unittest.TestCase):
         self.assertIn("forward_local", str(ctx.exception))
 
     def test_fused_moe_exposes_the_split_reduce_entry_point(self):
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         self.assertTrue(hasattr(FusedMoE, "forward_local"))
 
@@ -790,7 +790,7 @@ class TestExpertShellEndToEnd(unittest.TestCase):
 
     @staticmethod
     def _expert_module(seed):
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         mod = FusedMoE.__new__(FusedMoE)
         nn.Module.__init__(mod)
@@ -859,7 +859,7 @@ class TestPartGpuFlagValidation(unittest.TestCase):
         )
 
     def _check(self, args):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         ServerArgs._validate_dual_group_lane_part_gpu_id(args)
 
@@ -932,7 +932,7 @@ class TestExpertParallelIsRefused(unittest.TestCase):
 
     @staticmethod
     def _moe(**attrs):
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         mod = FusedMoE.__new__(FusedMoE)
         nn.Module.__init__(mod)

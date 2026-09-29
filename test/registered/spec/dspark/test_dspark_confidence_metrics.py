@@ -2,13 +2,13 @@ import unittest
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.speculative.dspark_components.dspark_observability import (
+from flliper.srt.environ import envs
+from flliper.srt.speculative.dspark_components.dspark_observability import (
     ConfidenceMetricsProbe,
     PerPositionConfidenceMetrics,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -124,19 +124,19 @@ class TestConfidenceMetricsProbe(CustomTestCase):
 
     def test_non_rank0_is_noop(self):
         probe = ConfidenceMetricsProbe(gamma=4, verify_num_draft_tokens=5, tp_rank=1)
-        with envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.override(True):
+        with envs.FLLIPER_DSPARK_DEBUG_CONFIDENCE_METRICS.override(True):
             self._observe(probe)
         self.assertIsNone(probe._metrics)
 
     def test_missing_confidence_head_is_noop(self):
         probe = ConfidenceMetricsProbe(gamma=4, verify_num_draft_tokens=5, tp_rank=0)
-        with envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.override(True):
+        with envs.FLLIPER_DSPARK_DEBUG_CONFIDENCE_METRICS.override(True):
             self._observe(probe, carries_confidence=False)
         self.assertIsNone(probe._metrics)
 
     def test_compact_mode_warns_once_and_skips(self):
         probe = ConfidenceMetricsProbe(gamma=4, verify_num_draft_tokens=5, tp_rank=0)
-        with envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.override(True):
+        with envs.FLLIPER_DSPARK_DEBUG_CONFIDENCE_METRICS.override(True):
             self._observe(probe, is_compact_mode=True)
             self.assertTrue(probe._compact_warned)
             self._observe(probe, is_compact_mode=True)
@@ -147,7 +147,7 @@ class TestConfidenceMetricsProbe(CustomTestCase):
         probe = ConfidenceMetricsProbe(
             gamma=4, verify_num_draft_tokens=5, tp_rank=0, print_every=2
         )
-        with envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.override(True):
+        with envs.FLLIPER_DSPARK_DEBUG_CONFIDENCE_METRICS.override(True):
             self._observe(probe)
             self.assertIsInstance(probe._metrics, PerPositionConfidenceMetrics)
             self.assertEqual(probe._step_ct, 1)

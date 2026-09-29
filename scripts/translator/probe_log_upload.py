@@ -20,7 +20,7 @@ so the click travels the whole way to the store and back while the served file
 is untouched. After the gate passes, the flip is one copy (§17.8.23).
 
     /spinning/htsglang-gpu/.venv/bin/python scripts/translator/probe_log_upload.py \\
-      --client python/sglang/srt/translator/client/index.dev.html
+      --client python/flliper/srt/translator/client/index.dev.html
 
 `--sabotage` points the proxy at a dead path: the click must then produce a
 VISIBLE failure. A button that fails silently is the defect this whole probe
@@ -42,7 +42,7 @@ import urllib.request
 from pathlib import Path
 
 DEFAULT_CLIENT = Path(
-    "/spinning/wt-466-translator/python/sglang/srt/translator/client/index.dev.html"
+    "/spinning/wt-466-translator/python/flliper/srt/translator/client/index.dev.html"
 )
 DEFAULT_TENANT = "http://192.168.0.101:30800"
 

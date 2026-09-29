@@ -10,8 +10,8 @@ python3 -m unittest test_xpu_basic.TestXPUBasic.test_basic_generation
 
 import unittest
 
-from sglang.test.ci.ci_register import register_xpu_ci
-from sglang.test.test_utils import (
+from flliper.test.ci.ci_register import register_xpu_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
     is_in_ci,

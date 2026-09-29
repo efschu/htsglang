@@ -11,10 +11,10 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -49,8 +49,8 @@ class TestKimiK2EvalAMD(CustomTestCase):
             '{"enable_multithread_load": true}',
         ]
         env = os.environ.copy()
-        env["SGLANG_USE_AITER"] = "1"
-        env["SGLANG_ROCM_FUSED_DECODE_MLA"] = "0"
+        env["FLLIPER_USE_AITER"] = "1"
+        env["FLLIPER_ROCM_FUSED_DECODE_MLA"] = "0"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

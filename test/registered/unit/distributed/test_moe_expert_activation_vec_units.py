@@ -30,7 +30,7 @@ Fix, in two halves, both pinned here:
    multiple of 16 is a multiple of 8, so one plan is valid on a mixed rig.
 2. REJECT LOUDLY where a foreign split arrives: `FusedMoE.__init__` calls
    `assert_activation_aligned_shards` on the expert intermediate, so a split
-   no unit grain can fix (a hand-set SGLANG_UNEVEN_MOE_VECTOR, an
+   no unit grain can fix (a hand-set FLLIPER_UNEVEN_MOE_VECTOR, an
    intermediate size that is not a multiple of the vector) fails at
    construction naming the constraint instead of in the kernel mid-forward.
 
@@ -39,15 +39,15 @@ Pure functions, no GPU, no server.
 
 import unittest
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     ACTIVATION_VEC_ELEMS,
     assert_activation_aligned_shards,
     set_tp_partition_ratios,
     tp_partition_sizes,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import moe_uneven_tp_units
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.moe.fused_moe_triton.layer import moe_uneven_tp_units
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 

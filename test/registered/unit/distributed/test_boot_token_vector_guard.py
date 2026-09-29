@@ -3,7 +3,7 @@
 THE DEFECT
 ----------
 ``resolve_cp_token_ratios`` carries a deliberate honesty guard: a
-``SGLANG_UNEVEN_TOKEN_VECTOR`` with no engaged shard plan is REJECTED rather
+``FLLIPER_UNEVEN_TOKEN_VECTOR`` with no engaged shard plan is REJECTED rather
 than silently ignored (measured on Qwen3.5-2B TP=2/DCP=2 TOKVEC=2,1: boots
 green, output token-identical to TP=1, zero uneven-machinery log lines -- a
 configured-looking server doing nothing that was asked).
@@ -47,17 +47,17 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 # THE REAL BOOT FUNCTION -- not a re-implementation of its gate.
-import sglang.srt.distributed.utils as du  # noqa: E402
-from sglang.srt.managers import scheduler as sched_mod  # noqa: E402
+import flliper.srt.distributed.utils as du  # noqa: E402
+from flliper.srt.managers import scheduler as sched_mod  # noqa: E402
 
-_TOKVEC = "SGLANG_UNEVEN_TOKEN_VECTOR"
-_WEIGHTED = "SGLANG_UNEVEN_DCP_WEIGHTED"
+_TOKVEC = "FLLIPER_UNEVEN_TOKEN_VECTOR"
+_WEIGHTED = "FLLIPER_UNEVEN_DCP_WEIGHTED"
 
 
 class _ReachedProcTitle(Exception):
@@ -136,7 +136,7 @@ class BootTokenVectorGuardTest(CustomTestCase):
             with self.assertRaises(ValueError) as ei:
                 _boot(_server_args(plan=None, weighted=True))
         msg = str(ei.exception)
-        self.assertIn("SGLANG_UNEVEN_TOKEN_VECTOR", msg)
+        self.assertIn("FLLIPER_UNEVEN_TOKEN_VECTOR", msg)
         self.assertIn("silently ignored", msg)
         self.assertIn("--rank-tp-ratio", msg)
 

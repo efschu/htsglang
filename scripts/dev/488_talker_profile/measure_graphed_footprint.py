@@ -42,10 +42,10 @@ _CORRIDOR_MIB = 400.0
 
 def _install_local_modules():
     for name, rel in (
-        ("sglang.srt.models.qwen3_tts_fast_predictor",
-         "python/sglang/srt/models/qwen3_tts_fast_predictor.py"),
-        ("sglang.srt.models.qwen3_tts_graph_driver",
-         "python/sglang/srt/models/qwen3_tts_graph_driver.py"),
+        ("flliper.srt.models.qwen3_tts_fast_predictor",
+         "python/flliper/srt/models/qwen3_tts_fast_predictor.py"),
+        ("flliper.srt.models.qwen3_tts_graph_driver",
+         "python/flliper/srt/models/qwen3_tts_graph_driver.py"),
     ):
         spec = importlib.util.spec_from_file_location(name, _HERE.parents[2] / rel)
         module = importlib.util.module_from_spec(spec)
@@ -73,7 +73,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    from sglang.srt.translator.qwen3_tts_compat import ensure_qwen3_tts_importable
+    from flliper.srt.translator.qwen3_tts_compat import ensure_qwen3_tts_importable
 
     ensure_qwen3_tts_importable()
     _install_local_modules()
@@ -88,7 +88,7 @@ def main(argv=None) -> int:
         Qwen3TTSTalkerModel,
     )
 
-    from sglang.srt.models.qwen3_tts_graph_driver import (
+    from flliper.srt.models.qwen3_tts_graph_driver import (
         GraphedPredictorFrame,
         GraphedTrunkStep,
     )

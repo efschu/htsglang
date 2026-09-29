@@ -27,9 +27,9 @@ the base tree, because the name it pins does not exist there.
 import argparse
 import unittest
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -86,7 +86,7 @@ class TestCanonicalKvPageArgs(CustomTestCase):
         drops the flag silently boots without the carrier.  #1233 (WEG 2, S0)
         therefore refuses before argparse, naming the replacement.
         """
-        from sglang.srt.removed_cli_flags import refuse_removed_flip_flags
+        from flliper.srt.removed_cli_flags import refuse_removed_flip_flags
 
         with self.assertRaises(ValueError) as caught:
             refuse_removed_flip_flags(

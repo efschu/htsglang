@@ -54,10 +54,10 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.video_enhance import codec
-from sglang.srt.video_enhance.frame_math import PixelFormat, Resolution
-from sglang.srt.video_enhance.frames import Frame
-from sglang.srt.video_enhance.parity import psnr, ssim
+from flliper.srt.video_enhance import codec
+from flliper.srt.video_enhance.frame_math import PixelFormat, Resolution
+from flliper.srt.video_enhance.frames import Frame
+from flliper.srt.video_enhance.parity import psnr, ssim
 
 #: Both arms are pinned to one operating point. A parity claim across two
 #: different rate-control settings would say nothing about the lane.

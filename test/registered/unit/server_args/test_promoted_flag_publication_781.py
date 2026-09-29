@@ -4,7 +4,7 @@ The boot env used to be assembled by concatenating a captured shell
 environment, a heredoc and EXTRA_ENV, and a key written twice resolved silently
 as "last one wins". Now the flag is the single source of truth and the process
 publishes it from its own argv, so the unit environment can go identity-only and
-the boot env gate can refuse any SGLANG_* it finds there.
+the boot env gate can refuse any FLLIPER_* it finds there.
 
 What has to hold:
   1. a set flag reaches the environment the consumers read,
@@ -26,7 +26,7 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.server_args import ServerArgs
 
 
 def _publish(**kw):
@@ -51,21 +51,21 @@ def _publish(**kw):
 class TestPromotedFlagPublication781(unittest.TestCase):
     def test_set_flags_reach_the_environment(self):
         cases = [
-            (dict(seam_entry_margin_mib=512), "SGLANG_SEAM_ENTRY_MARGIN_MIB", "512"),
-            (dict(seam_entry_delay_budget_s=2), "SGLANG_SEAM_ENTRY_DELAY_BUDGET", "2"),
-            (dict(flip_seam_chunk_mib=8), "SGLANG_FLIP_SEAM_CHUNK_MIB", "8"),
+            (dict(seam_entry_margin_mib=512), "FLLIPER_SEAM_ENTRY_MARGIN_MIB", "512"),
+            (dict(seam_entry_delay_budget_s=2), "FLLIPER_SEAM_ENTRY_DELAY_BUDGET", "2"),
+            (dict(flip_seam_chunk_mib=8), "FLLIPER_FLIP_SEAM_CHUNK_MIB", "8"),
             (dict(collective_census_interval=50),
-             "SGLANG_COLLECTIVE_CENSUS_INTERVAL", "50"),
-            (dict(barlink_transport="bar1"), "SGLANG_BARLINK_TRANSPORT", "bar1"),
+             "FLLIPER_COLLECTIVE_CENSUS_INTERVAL", "50"),
+            (dict(barlink_transport="bar1"), "FLLIPER_BARLINK_TRANSPORT", "bar1"),
             (dict(barlink_bar1_cap_cycles=300000000000),
-             "SGLANG_BARLINK_BAR1_CAP_CYCLES", "300000000000"),
-            (dict(barlink=True), "SGLANG_BARLINK", "1"),
-            (dict(mamba_slot_reorder=True), "SGLANG_MAMBA_SLOT_REORDER", "1"),
-            (dict(uneven_dcp=True), "SGLANG_UNEVEN_DCP", "1"),
-            (dict(uneven_dcp_weighted=True), "SGLANG_UNEVEN_DCP_WEIGHTED", "1"),
-            (dict(kv_backing_relief=True), "SGLANG_KV_BACKING_RELIEF", "1"),
+             "FLLIPER_BARLINK_BAR1_CAP_CYCLES", "300000000000"),
+            (dict(barlink=True), "FLLIPER_BARLINK", "1"),
+            (dict(mamba_slot_reorder=True), "FLLIPER_MAMBA_SLOT_REORDER", "1"),
+            (dict(uneven_dcp=True), "FLLIPER_UNEVEN_DCP", "1"),
+            (dict(uneven_dcp_weighted=True), "FLLIPER_UNEVEN_DCP_WEIGHTED", "1"),
+            (dict(kv_backing_relief=True), "FLLIPER_KV_BACKING_RELIEF", "1"),
             (dict(phase_flip_image_file_backed=True),
-             "SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED", "1"),
+             "FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED", "1"),
         ]
         for kw, env, expected in cases:
             with self.subTest(env=env):
@@ -77,18 +77,18 @@ class TestPromotedFlagPublication781(unittest.TestCase):
     def test_unset_flag_leaves_environment_untouched(self):
         """The compatibility guarantee: not specifying a flag changes nothing."""
         watched = [
-            "SGLANG_BARLINK", "SGLANG_BARLINK_TRANSPORT",
-            "SGLANG_SEAM_ENTRY_MARGIN_MIB", "SGLANG_FLIP_SEAM_CHUNK_MIB",
-            "SGLANG_UNEVEN_DCP", "SGLANG_KV_BACKING_RELIEF",
-            "SGLANG_COLLECTIVE_CENSUS_INTERVAL",
+            "FLLIPER_BARLINK", "FLLIPER_BARLINK_TRANSPORT",
+            "FLLIPER_SEAM_ENTRY_MARGIN_MIB", "FLLIPER_FLIP_SEAM_CHUNK_MIB",
+            "FLLIPER_UNEVEN_DCP", "FLLIPER_KV_BACKING_RELIEF",
+            "FLLIPER_COLLECTIVE_CENSUS_INTERVAL",
         ]
         with mock.patch.dict(os.environ, {}, clear=False):
             for k in watched:
                 os.environ.pop(k, None)
-            os.environ["SGLANG_BARLINK"] = "preexisting"
+            os.environ["FLLIPER_BARLINK"] = "preexisting"
             _publish()  # every flag None
             self.assertEqual(
-                os.environ.get("SGLANG_BARLINK"), "preexisting",
+                os.environ.get("FLLIPER_BARLINK"), "preexisting",
                 "an unset flag overwrote an existing env value",
             )
             for k in watched[1:]:
@@ -104,12 +104,12 @@ class TestPromotedFlagPublication781(unittest.TestCase):
         """
         for field, env in [
             ("enable_tp_memory_imbalance_check",
-             "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"),
+             "FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK"),
             ("enable_health_endpoint_generation",
-             "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"),
-            ("corridor_rebalance", "SGLANG_CORRIDOR_REBALANCE"),
-            ("kv_backing_relief", "SGLANG_KV_BACKING_RELIEF"),
-            ("barlink", "SGLANG_BARLINK"),
+             "FLLIPER_ENABLE_HEALTH_ENDPOINT_GENERATION"),
+            ("corridor_rebalance", "FLLIPER_CORRIDOR_REBALANCE"),
+            ("kv_backing_relief", "FLLIPER_KV_BACKING_RELIEF"),
+            ("barlink", "FLLIPER_BARLINK"),
         ]:
             with self.subTest(field=field):
                 with mock.patch.dict(os.environ, {}, clear=False):
@@ -126,37 +126,37 @@ class TestPromotedFlagPublication781(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             _publish(enable_tp_memory_imbalance_check=True)
             self.assertEqual(
-                os.environ["SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"], "1"
+                os.environ["FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK"], "1"
             )
             _publish(enable_tp_memory_imbalance_check=False)
             self.assertEqual(
-                os.environ["SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"], "0"
+                os.environ["FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK"], "0"
             )
 
     def test_bar1_window_expands_to_per_group_keys(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             for k in list(os.environ):
-                if k.startswith("SGLANG_BARLINK_BAR1_WINDOW_MIB"):
+                if k.startswith("FLLIPER_BARLINK_BAR1_WINDOW_MIB"):
                     os.environ.pop(k)
             _publish(
                 barlink_bar1_window_mib="24,PP_0=96,FLIP_TP_0=48,FLIP_DCP_0=32"
             )
-            self.assertEqual(os.environ["SGLANG_BARLINK_BAR1_WINDOW_MIB"], "24")
+            self.assertEqual(os.environ["FLLIPER_BARLINK_BAR1_WINDOW_MIB"], "24")
             self.assertEqual(
-                os.environ["SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0"], "96"
+                os.environ["FLLIPER_BARLINK_BAR1_WINDOW_MIB_PP_0"], "96"
             )
             self.assertEqual(
-                os.environ["SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0"], "48"
+                os.environ["FLLIPER_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0"], "48"
             )
             self.assertEqual(
-                os.environ["SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0"], "32"
+                os.environ["FLLIPER_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0"], "32"
             )
 
     def test_bar1_window_bare_scalar(self):
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_BARLINK_BAR1_WINDOW_MIB", None)
+            os.environ.pop("FLLIPER_BARLINK_BAR1_WINDOW_MIB", None)
             _publish(barlink_bar1_window_mib="64")
-            self.assertEqual(os.environ["SGLANG_BARLINK_BAR1_WINDOW_MIB"], "64")
+            self.assertEqual(os.environ["FLLIPER_BARLINK_BAR1_WINDOW_MIB"], "64")
 
 
 if __name__ == "__main__":

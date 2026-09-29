@@ -20,9 +20,9 @@ import unittest
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from sglang.srt.entrypoints.engine import Engine
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.entrypoints.engine import Engine
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
 )
@@ -42,7 +42,7 @@ class TestMISServerArgsValidation(unittest.TestCase):
 
     def test_enable_mis_default(self):
         """Test that enable_mis defaults to False."""
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         self.assertEqual(ServerArgs.enable_mis, False)
 

@@ -1,14 +1,14 @@
 import inspect
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.managers.scheduler import Scheduler
+from flliper.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+from flliper.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from flliper.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

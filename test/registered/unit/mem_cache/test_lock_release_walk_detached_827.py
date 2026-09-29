@@ -29,7 +29,7 @@ detach/evict racing a lock release reaches the same line.)
 
 import pytest
 
-from sglang.srt.mem_cache.unified_cache_components.full_component import FullComponent
+from flliper.srt.mem_cache.unified_cache_components.full_component import FullComponent
 
 
 class _CD:

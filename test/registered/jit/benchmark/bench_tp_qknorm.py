@@ -22,22 +22,22 @@ from typing import List
 import torch
 import torch.distributed as dist
 
-import sglang.srt.distributed.parallel_state as ps
-from sglang.jit_kernel.all_reduce import (
+import flliper.srt.distributed.parallel_state as ps
+from flliper.jit_kernel.all_reduce import (
     _jit_custom_all_reduce_pull_module,
     _jit_custom_all_reduce_push_module,
     _jit_fused_parallel_qknorm_module,
     fused_parallel_qknorm,
     get_fused_parallel_qknorm_max_occupancy,
 )
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import multigpu_bench_main
-from sglang.jit_kernel.mp import register_comm_cleanup
-from sglang.jit_kernel.utils import cache_once, get_ci_test_range
-from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+from flliper.jit_kernel.benchmark import marker
+from flliper.jit_kernel.benchmark.utils import multigpu_bench_main
+from flliper.jit_kernel.mp import register_comm_cleanup
+from flliper.jit_kernel.utils import cache_once, get_ci_test_range
+from flliper.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=120,
@@ -177,7 +177,7 @@ def _rmsnorm_baseline(
     k_weight: torch.Tensor,
     world_size: int,
 ) -> None:
-    from sglang.srt.models.minimax_m2 import rms_apply_serial, rms_sumsq_serial
+    from flliper.srt.models.minimax_m2 import rms_apply_serial, rms_sumsq_serial
 
     sum_sq = rms_sumsq_serial(q, k)
     sum_sq = comm.custom_all_reduce(sum_sq)

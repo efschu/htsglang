@@ -1,7 +1,7 @@
 """#1424c (rc12n D-TP0 12:57:43): the chain proof refused a park loadback
 by name -- "the chain's rows are not whole distinct pages although every
 node's pages match their keys (5 node(s))". Two parked rids of ONE
-conversation (weg2-1-18, weg2-1-20), each read in two pieces (second piece
+conversation (pdflip-1-18, pdflip-1-20), each read in two pieces (second piece
 768 / 512 tokens), shared prefix to the Mamba anchor at 24320, H98 depth
 scissors (extent TP0 24832, TP1/TP2 21824).
 
@@ -30,7 +30,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
+from flliper.srt.mem_cache.pool_host import arena_pool as ap  # noqa: E402
 
 P = 4
 SLOTS = 8
@@ -198,8 +198,8 @@ def test_the_real_wrapper_reads_the_depth_and_ps_chain_from_the_tree_and_the_req
     """``UnifiedRadixCache._1424_verify_load_chain`` on a parented tree: the
     depth of the first loaded page comes from the ancestors, P's chain from
     the request (``handoff_keys.CHAIN_ATTR``), own keys from get_hash_str."""
-    from sglang.srt.mem_cache import unified_radix_cache as urc
-    from sglang.srt.weg2.handoff_keys import CHAIN_ATTR
+    from flliper.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.pdflip.handoff_keys import CHAIN_ATTR
 
     arena = _Arena({k + "#": s for k, s in SLOT_OF.items()})
     pool = _pool(arena)
@@ -216,7 +216,7 @@ def test_the_real_wrapper_reads_the_depth_and_ps_chain_from_the_tree_and_the_req
     nodes[0].parent, nodes[1].parent, nodes[2].parent = n11, nodes[0], nodes[1]
     for n in nodes:
         n.component_data = {urc.BASE_COMPONENT_TYPE: types.SimpleNamespace(host_value=n.host_value)}
-    req = types.SimpleNamespace(rid="weg2-1-18")
+    req = types.SimpleNamespace(rid="pdflip-1-18")
     setattr(req, CHAIN_ATTR, list(CHAIN))
     xfer = types.SimpleNamespace(nodes_to_load=nodes,
                                  host_indices=torch.cat([n.host_value for n in nodes]))

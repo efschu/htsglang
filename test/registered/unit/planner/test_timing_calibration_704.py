@@ -25,7 +25,7 @@ Hermetic: pure arithmetic, no CUDA.
 """
 
 import pytest
-from sglang.srt.planner.timing_calibration import (
+from flliper.srt.planner.timing_calibration import (
     TimingCalibrationError,
     TimingPoint,
     solve_timing_from_two_cuts,
@@ -149,7 +149,7 @@ def test_required_sample_count_is_reported_so_the_window_can_be_planned():
     The standard error of a mean falls as 1/sqrt(N), so the harness can say how
     many chunk samples a target precision needs -- before the window, not after.
     """
-    from sglang.srt.planner.timing_calibration import samples_needed
+    from flliper.srt.planner.timing_calibration import samples_needed
 
     # per-chunk spread 3 ms, dn=1, want rank0's 1.757 slope to 10%.
     n = samples_needed(

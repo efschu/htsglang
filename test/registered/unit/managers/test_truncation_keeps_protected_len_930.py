@@ -46,15 +46,15 @@ two fields it touches, plus an arithmetic model of the finished-req interval.
 No CUDA, no pools.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
 import types
 import unittest
 
-from sglang.srt.managers.schedule_batch import Req
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.schedule_batch import Req
+from flliper.test.test_utils import CustomTestCase
 
 MATCHED = 9447
 TOLD = 8192
@@ -148,7 +148,7 @@ class BothBranchesUseTheHelper930(CustomTestCase):
     def test_neither_branch_slices_prefix_indices_by_hand(self):
         import inspect
 
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
         self.assertNotIn("req.prefix_indices = req.prefix_indices[:told]", src)

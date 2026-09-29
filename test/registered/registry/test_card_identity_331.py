@@ -27,8 +27,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from sglang.srt.registry import nvml
-from sglang.srt.registry.nvml import (
+from flliper.srt.registry import nvml
+from flliper.srt.registry.nvml import (
     DeviceInfo,
     DeviceNotFoundError,
     identity_map,
@@ -210,7 +210,7 @@ class IdentityMapTest(unittest.TestCase):
 # ===========================================================================
 class ArbIdentityTest(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.workbench.arb import ArbDirectory
+        from flliper.srt.workbench.arb import ArbDirectory
 
         self.root = Path(tempfile.mkdtemp(prefix="arb-331-"))
         self.addCleanup(self._cleanup)
@@ -266,7 +266,7 @@ class ArbIdentityTest(unittest.TestCase):
             clock=lambda: self.now,
             identity=shuffled_map,
         )
-        from sglang.srt.workbench.arb import ArbRefused
+        from flliper.srt.workbench.arb import ArbRefused
 
         with self.assertRaises(ArbRefused) as caught:
             arb.claim([2], "something else")
@@ -293,7 +293,7 @@ class ArbIdentityTest(unittest.TestCase):
         self.assertIn("are not present on this host", body["holder"]["identity_note"])
 
     def test_a_free_window_follows_the_card_not_the_index(self):
-        from sglang.srt.workbench.arb import ArbRefused
+        from flliper.srt.workbench.arb import ArbRefused
 
         # The other session published a window on the 5090 by uuid.
         self.root.joinpath("free-until").write_text(
@@ -316,11 +316,11 @@ class ArbIdentityTest(unittest.TestCase):
 
 
 # ===========================================================================
-# Saved planner profiles (~/.cache/sglang/planner_profiles.json)
+# Saved planner profiles (~/.cache/flliper/planner_profiles.json)
 # ===========================================================================
 class ProfileStoreIdentityTest(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.planner.flags import CARD_UUIDS_KEY, Profile, ProfileStore
+        from flliper.srt.planner.flags import CARD_UUIDS_KEY, Profile, ProfileStore
 
         self.tmp = tempfile.mkdtemp(prefix="profiles-331-")
         self.addCleanup(self._cleanup)
@@ -384,7 +384,7 @@ class ProfileStoreIdentityTest(unittest.TestCase):
             )
         )
         store = self.ProfileStore(self.path, identity=shuffled_map)
-        with self.assertLogs("sglang.srt.planner.flags", level="WARNING") as logs:
+        with self.assertLogs("flliper.srt.planner.flags", level="WARNING") as logs:
             loaded = store.load("old")
         self.assertEqual(loaded.settings["rank_gpu_id"], [0, 1])
         self.assertIn("predates card identity stamping", "\n".join(logs.output))
@@ -405,11 +405,11 @@ class ProfileStoreIdentityTest(unittest.TestCase):
 
 
 # ===========================================================================
-# Measured KV-budget registry (~/.cache/sglang/kv_budget-*.json)
+# Measured KV-budget registry (~/.cache/flliper/kv_budget-*.json)
 # ===========================================================================
 class MeasuredRegistryIdentityTest(unittest.TestCase):
     def _check(self, components, imap):
-        from sglang.srt import uneven_perf
+        from flliper.srt import uneven_perf
 
         # list_devices, not identity_map: the boot-path checks are forbidden
         # from creating a CUDA context, so they never build the full map.
@@ -426,16 +426,16 @@ class MeasuredRegistryIdentityTest(unittest.TestCase):
         self.assertFalse(self._check(comps, map_without_5090()))
 
     def test_a_pre_331_registry_is_kept_with_a_warning(self):
-        from sglang.srt import uneven_perf
+        from flliper.srt import uneven_perf
 
         comps = [{"device_total_bytes": 1}, {"device_total_bytes": 2}]
-        with self.assertLogs("sglang.srt.uneven_perf", level="WARNING") as logs:
+        with self.assertLogs("flliper.srt.uneven_perf", level="WARNING") as logs:
             kept = uneven_perf.measured_registry_cards_still_present(comps)
         self.assertTrue(kept)
         self.assertIn("predates card-identity stamping", "\n".join(logs.output))
 
     def test_an_unreachable_driver_does_not_lose_the_registry(self):
-        from sglang.srt import uneven_perf
+        from flliper.srt import uneven_perf
 
         comps = [{"card_uuid": UUID_5090}]
         with mock.patch.object(nvml, "is_available", return_value=False):
@@ -450,7 +450,7 @@ class HibernateIdentityTest(unittest.TestCase):
         return {"ranks": {str(i): {"nvml_uuid": u} for i, u in enumerate(uuids)}}
 
     def _check(self, manifest, imap):
-        from sglang.srt.model_loader import hibernate
+        from flliper.srt.model_loader import hibernate
 
         with mock.patch.object(nvml, "is_available", return_value=True), \
                 mock.patch.object(nvml, "list_devices", return_value=list(imap.cards)):
@@ -462,13 +462,13 @@ class HibernateIdentityTest(unittest.TestCase):
         )
 
     def test_an_image_parked_on_a_departed_card_falls_back_to_cold_load(self):
-        from sglang.srt.model_loader import hibernate
+        from flliper.srt.model_loader import hibernate
 
         with mock.patch.object(nvml, "is_available", return_value=True), \
                 mock.patch.object(
                     nvml, "list_devices",
                     return_value=list(map_without_5090().cards)), \
-                self.assertLogs("sglang.srt.model_loader.hibernate", level="WARNING") as logs:
+                self.assertLogs("flliper.srt.model_loader.hibernate", level="WARNING") as logs:
             present = hibernate._manifest_cards_present(
                 self._manifest([UUID_5090, UUID_3080_A])
             )
@@ -484,7 +484,7 @@ class HibernateIdentityTest(unittest.TestCase):
 # ===========================================================================
 class CardWindowIdentityTest(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.planner import comm_suite
+        from flliper.srt.planner import comm_suite
 
         self.comm_suite = comm_suite
         self.tmp = tempfile.mkdtemp(prefix="locks-331-")
@@ -549,7 +549,7 @@ class CardWindowIdentityTest(unittest.TestCase):
 # ===========================================================================
 class WorkGrantIdentityTest(unittest.TestCase):
     def test_visible_devices_uses_uuids(self):
-        from sglang.srt.workbench.tenant import WorkGrant
+        from flliper.srt.workbench.tenant import WorkGrant
 
         grant = WorkGrant(
             card_uuids=(UUID_5090, UUID_3080_A),
@@ -560,7 +560,7 @@ class WorkGrantIdentityTest(unittest.TestCase):
         self.assertEqual(grant.visible_devices, f"{UUID_5090},{UUID_3080_A}")
 
     def test_an_unpinned_grant_still_falls_back_to_indices(self):
-        from sglang.srt.workbench.tenant import WorkGrant
+        from flliper.srt.workbench.tenant import WorkGrant
 
         grant = WorkGrant(
             card_uuids=(),

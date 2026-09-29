@@ -31,8 +31,8 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.models import deepseek_v4 as v4mod
-from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+from flliper.srt.models import deepseek_v4 as v4mod
+from flliper.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
 
 N_ROUTED = 3
 
@@ -98,7 +98,7 @@ def _load(num_fused: int, name: str):
     draft = _StubDraft(num_fused)
     weight = torch.ones(1)
     with patch(
-        "sglang.srt.models.deepseek_v4_dspark.logger"
+        "flliper.srt.models.deepseek_v4_dspark.logger"
     ) as log:
         draft.load_weights([(name, weight)])
     warnings = [call for call in log.warning.call_args_list]
@@ -146,7 +146,7 @@ class TestFusedSharedExpertReachesTheSlot(unittest.TestCase):
 
     def test_the_widened_mapping_is_what_makes_the_slot_addressable(self):
         """Both halves of the port are load-bearing, stated as arithmetic."""
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from flliper.srt.layers.moe.fused_moe_triton import FusedMoE
 
         narrow = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
@@ -193,7 +193,7 @@ class TestResolverIsShared(unittest.TestCase):
         self.assertEqual(len(seen), 1)
 
     def test_the_draft_head_imports_the_same_resolver(self):
-        from sglang.srt.models import deepseek_v4_dspark as dmod
+        from flliper.srt.models import deepseek_v4_dspark as dmod
 
         self.assertIs(
             dmod._resolve_num_fused_shared_experts,
@@ -210,7 +210,7 @@ class TestResolverIsShared(unittest.TestCase):
         config, so the expected failure downstream is caught and the
         observation is that the resolver ran BEFORE it.
         """
-        from sglang.srt.models import deepseek_v4_dspark as dmod
+        from flliper.srt.models import deepseek_v4_dspark as dmod
 
         seen = []
 

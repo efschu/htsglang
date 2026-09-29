@@ -46,7 +46,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.managers.pp_admission_congruence import (
+from flliper.srt.managers.pp_admission_congruence import (
     FORWARDED_SCHEDULE_STOP_FORMAT,
     FORWARDED_SCHEDULE_STOP_PREFIX,
     PPAdmissionDecision,
@@ -55,9 +55,9 @@ from sglang.srt.managers.pp_admission_congruence import (
     forwarded_schedule_stop_message,
     rank_local_count_veto_applies,
 )
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-b-test-small-1-gpu")
 
@@ -156,7 +156,7 @@ class T1ARefusedForwardedScheduleStopsTheGroup(unittest.TestCase):
 
     def test_the_stop_line_names_every_term(self):
         with patch(
-            "sglang.srt.managers.scheduler.get_server_args",
+            "flliper.srt.managers.scheduler.get_server_args",
             return_value=types.SimpleNamespace(pp_max_micro_batch_size=2),
         ):
             msg = str(_refuse(_holder()))
@@ -200,7 +200,7 @@ class T1ARefusedForwardedScheduleStopsTheGroup(unittest.TestCase):
 
     def test_the_detector_line_is_still_logged_before_the_stop(self):
         with self.assertLogs(
-            "sglang.srt.managers.scheduler", level=logging.ERROR
+            "flliper.srt.managers.scheduler", level=logging.ERROR
         ) as cm:
             _refuse(_holder())
         self.assertTrue(
@@ -219,7 +219,7 @@ class T1ARefusedForwardedScheduleStopsTheGroup(unittest.TestCase):
         del h.admission_limiter
         del h.parked_decode_set
         with patch(
-            "sglang.srt.managers.scheduler.get_server_args",
+            "flliper.srt.managers.scheduler.get_server_args",
             side_effect=AttributeError("no server args in this process"),
         ):
             msg = str(_refuse(h))
@@ -518,7 +518,7 @@ class T3ALaunchedSlotIsNeverNulledSilently(unittest.TestCase):
     def test_a_launched_frameless_slot_keeps_its_batch_and_says_so(self):
         h = self._h(pending=(1,))
         with self.assertLogs(
-            "sglang.srt.managers.scheduler_pp_mixin", level=logging.WARNING
+            "flliper.srt.managers.scheduler_pp_mixin", level=logging.WARNING
         ) as cm:
             self.assertFalse(h._pp_null_frameless_slot(1))
         self.assertEqual(h.mbs[1], "batch-on-slot-1", "never nulled silently")
@@ -553,7 +553,7 @@ class TheOtherWriterIsProvablyUnreachable(unittest.TestCase):
     every path (its final statement is `return False`)."""
 
     def test_the_predicate_is_constant_false(self):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_upstream_void_pending
+        from flliper.srt.managers.scheduler_pp_mixin import pp_upstream_void_pending
 
         src = inspect.getsource(pp_upstream_void_pending)
         body = src[src.index('"""', src.index('"""') + 3) + 3 :]

@@ -15,7 +15,7 @@ and that every later wiring depends on:
      are supposed to be inert until something moves; two identical greedy
      generations that differ would mean they are not inert.
   3. the sensor consumes a REAL occupancy series from this rig -- scraped from
-     sglang:token_usage against the real token capacity -- and produces a
+     flliper:token_usage against the real token capacity -- and produces a
      reading with a verdict. Feeding it invented numbers proves nothing about
      the units, the denominator or the trend projection; feeding it the rig's
      own numbers proves all three.
@@ -36,7 +36,7 @@ import threading
 import time
 import urllib.request
 
-TOKEN_USAGE_RE = re.compile(r"^sglang:token_usage\{[^}]*\}\s+([0-9.eE+-]+)\s*$", re.M)
+TOKEN_USAGE_RE = re.compile(r"^flliper:token_usage\{[^}]*\}\s+([0-9.eE+-]+)\s*$", re.M)
 
 
 def http_get(url: str, timeout: float = 10.0) -> str:
@@ -85,7 +85,7 @@ def main() -> int:
     )
     sys.path.insert(0, repo_python)
 
-    from sglang.srt.model_executor.kv_pressure_ladder import (
+    from flliper.srt.model_executor.kv_pressure_ladder import (
         KvPressureSensor,
         OccupancySample,
     )
@@ -114,7 +114,7 @@ def main() -> int:
     capacity = memory_usage.get("token_capacity")
     payload["token_capacity"] = capacity
     payload["memory_usage"] = memory_usage
-    payload["offload_register_env"] = os.environ.get("SGLANG_OFFLOAD_REGISTER")
+    payload["offload_register_env"] = os.environ.get("FLLIPER_OFFLOAD_REGISTER")
 
     if not capacity:
         payload["error"] = "get_server_info meldet keine token_capacity"

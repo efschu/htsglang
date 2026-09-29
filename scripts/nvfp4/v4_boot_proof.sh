@@ -160,7 +160,7 @@ PY="${PY:-$VENV/bin/python}"
 WT="${WT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$WT/python"
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 
 ARM="${1:-both}"
 MODEL="${MODEL:-/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-NVFP4}"
@@ -176,7 +176,7 @@ SOLO_RESERVE_MIB="${SOLO_RESERVE_MIB:-2048}"
 NEXTN="${NEXTN:-1}"
 # MEASURED 2026-07-31 (#336 card window, ARM A attempt 1): this used to be a
 # literal `--context-length -1` and NEITHER arm could boot with it. `-1` is the
-# vLLM idiom for "the model's own maximum"; sglang has no such sentinel.
+# vLLM idiom for "the model's own maximum"; flliper has no such sentinel.
 # ModelConfig._derive_context_length assigns the value verbatim whenever it is
 # not greater than the derived length, so context_len became -1 and tp_worker's
 #     max_req_len = min(context_len - 1, max_token_pool_size - 1)
@@ -288,7 +288,7 @@ boot() {
   echo "--- ${tag}: booting, log -> ${log}"
   # setsid so the server survives this script's own process group and a stray
   # Ctrl-C never leaves a half-killed rank holding VRAM.
-  setsid "$PY" -m sglang.launch_server "${COMMON[@]}" "$@" >"$log" 2>&1 &
+  setsid "$PY" -m flliper.launch_server "${COMMON[@]}" "$@" >"$log" 2>&1 &
   local pid=$!
   echo "$pid" > "$OUT/${tag}.pid"
   if wait_ready "$pid"; then

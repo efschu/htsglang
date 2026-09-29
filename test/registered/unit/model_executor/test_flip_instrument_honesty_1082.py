@@ -39,7 +39,7 @@ device-free. Only the span VALUES need metal, and the span-carrying test
 injects them so the wiring is provable without one.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -47,8 +47,8 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.read_buffer_pool import ReadBufferPool
-from sglang.srt.model_executor.rotation_executor import (
+from flliper.srt.mem_cache.read_buffer_pool import ReadBufferPool
+from flliper.srt.model_executor.rotation_executor import (
     RotationPhases,
     RotationStats,
     TorchRotationOps,
@@ -57,8 +57,8 @@ from sglang.srt.model_executor.rotation_executor import (
     rotation_phase_report,
     rotation_report,
 )
-from sglang.srt.model_executor.weights_arena import _CHECKSUM_BYTES, uint8_checksum
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.weights_arena import _CHECKSUM_BYTES, uint8_checksum
+from flliper.test.test_utils import CustomTestCase
 
 CHUNK = 4096
 DEPTH = 4
@@ -292,7 +292,7 @@ class TestOverlappedStepsCarriesNoExecutionInformation(CustomTestCase):
     def test_at_production_depth_it_reduces_to_R_TIMEs_fitted_form(self):
         # R-TIME fitted `min(h, d) - 1 + [d > h]` and matched 12/12 legs. That
         # is this expression at depth 2, and depth 2 is the production default
-        # (SGLANG_PHASE_FLIP_REFILL_DEPTH, environ.py:358). Asserted over a grid
+        # (FLLIPER_PHASE_FLIP_REFILL_DEPTH, environ.py:358). Asserted over a grid
         # rather than asserted in prose, because "the fit was a special case"
         # is the kind of claim that decays into "the fit was wrong".
         for h in range(0, 25):

@@ -25,9 +25,9 @@ own vocabulary:
 
 import unittest
 
-from sglang.srt.memtier.consumers import expert_offload_host_targets
-from sglang.srt.memtier.registry import TierRegistry
-from sglang.srt.memtier.tiers import (
+from flliper.srt.memtier.consumers import expert_offload_host_targets
+from flliper.srt.memtier.registry import TierRegistry
+from flliper.srt.memtier.tiers import (
     LinkVerdict,
     TierCapacity,
     TierCaps,
@@ -38,8 +38,8 @@ from sglang.srt.memtier.tiers import (
     Volatility,
     link_disjointness,
 )
-from sglang.srt.planner.cost_model import Rate
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.planner.cost_model import Rate
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

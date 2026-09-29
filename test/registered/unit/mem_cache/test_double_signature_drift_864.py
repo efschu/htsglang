@@ -30,7 +30,7 @@ prove the double behaves like the real thing. That is the assertions' job, and
 those still need a card.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -43,7 +43,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 _TEST_FILE = _HERE / "test_unified_radix_cache_unittest.py"
 _PROD_FILE = (
-    _HERE.parents[3] / "python" / "sglang" / "srt" / "mem_cache" / "hiradix_cache.py"
+    _HERE.parents[3] / "python" / "flliper" / "srt" / "mem_cache" / "hiradix_cache.py"
 )
 
 

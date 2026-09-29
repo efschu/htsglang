@@ -1,8 +1,8 @@
 """
-Integration test for abort_request functionality with a SGLang server.
+Integration test for abort_request functionality with a fLLiper server.
 
 Run with:
-    python -m unittest sglang.test.srt.entrypoints.http_server.test_abort_request -v
+    python -m unittest flliper.test.srt.entrypoints.http_server.test_abort_request -v
 """
 
 import threading
@@ -11,8 +11,8 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,

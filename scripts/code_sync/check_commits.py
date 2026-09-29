@@ -34,7 +34,7 @@ from utils import (  # noqa: E402
 )
 
 # --- Configuration Begin ---
-private_repo = "your-org/sglang-private-repo"
+private_repo = "your-org/flliper-private-repo"
 oss_repo_url = "https://github.com/sgl-project/sglang.git"
 oss_repo_branch = "main"
 default_oss_repo_dir = ".oss_repo"

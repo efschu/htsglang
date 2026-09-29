@@ -45,7 +45,7 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+from flliper.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 
 class _Embed(torch.nn.Module):

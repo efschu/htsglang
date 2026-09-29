@@ -17,8 +17,8 @@ BEHAVIOUR DELTA, deliberate and tested here:
 
 import pytest
 
-from sglang.srt.mem_ledger.activation import FootprintProvenance, PhaseFootprint
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.mem_ledger.activation import FootprintProvenance, PhaseFootprint
+from flliper.srt.server_args import ServerArgs
 
 HEURISTIC = 512 + 2048 * 1.5 + 3 * 1 / 8 * 1024  # 3968
 
@@ -54,16 +54,16 @@ def _reset_warn_latch():
 
 def install(monkeypatch, footprint):
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.activation.resolve_phase_footprint",
+        "flliper.srt.mem_ledger.activation.resolve_phase_footprint",
         lambda uuid, **kw: footprint,
     )
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.calibration.live_fingerprint",
+        "flliper.srt.mem_ledger.calibration.live_fingerprint",
         lambda **kw: ("fp586", [], "drv"),
     )
-    monkeypatch.setattr("sglang.srt.registry.nvml.current_device_uuid", lambda: "GPU-x")
+    monkeypatch.setattr("flliper.srt.registry.nvml.current_device_uuid", lambda: "GPU-x")
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.engine._model_architectures", lambda sa: ()
+        "flliper.srt.mem_ledger.engine._model_architectures", lambda sa: ()
     )
 
 
@@ -111,7 +111,7 @@ def test_the_three_kv_sizing_sites_call_the_resolver_not_the_heuristic():
     would silently restore the over-reserve."""
     import inspect
 
-    from sglang.srt.model_executor import model_runner_kv_cache_mixin as m
+    from flliper.srt.model_executor import model_runner_kv_cache_mixin as m
 
     src = inspect.getsource(m)
     assert "activation_reserve_mb(" in src
@@ -128,6 +128,6 @@ def test_resolver_failure_degrades_to_the_heuristic_rather_than_crashing(monkeyp
         raise RuntimeError("cache on fire")
 
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.activation.resolve_phase_footprint", boom
+        "flliper.srt.mem_ledger.activation.resolve_phase_footprint", boom
     )
     assert args.activation_reserve_mb(20480) == HEURISTIC

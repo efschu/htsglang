@@ -2,11 +2,11 @@ import unittest
 
 import requests
 
-from sglang import Engine
-from sglang.lang.chat_template import get_chat_template_by_model_path
-from sglang.srt.utils import kill_process_tree
-from sglang.test.kits.eval_accuracy_kit import MMLUMixin
-from sglang.test.test_utils import (
+from flliper import Engine
+from flliper.lang.chat_template import get_chat_template_by_model_path
+from flliper.srt.utils import kill_process_tree
+from flliper.test.kits.eval_accuracy_kit import MMLUMixin
+from flliper.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,

@@ -14,7 +14,7 @@ import zmq
 
 
 def test_schema_roundtrip():
-    from sglang.srt.observability.forward_pass_metrics import (
+    from flliper.srt.observability.forward_pass_metrics import (
         ForwardPassMetrics,
         QueuedRequestMetrics,
         ScheduledRequestMetrics,
@@ -72,7 +72,7 @@ def test_schema_roundtrip():
 
 def test_zmq_pub_sub():
     """Test _FpmPublisherThread -> ZMQ SUB end-to-end."""
-    from sglang.srt.observability.forward_pass_metrics import (
+    from flliper.srt.observability.forward_pass_metrics import (
         ForwardPassMetrics,
         ScheduledRequestMetrics,
         _FpmPublisherThread,
@@ -143,7 +143,7 @@ def test_zmq_pub_sub():
 
 def test_heartbeat():
     """Test that heartbeat messages are emitted when idle."""
-    from sglang.srt.observability.forward_pass_metrics import (
+    from flliper.srt.observability.forward_pass_metrics import (
         _FpmPublisherThread,
         decode,
     )

@@ -886,7 +886,7 @@ def mode_idem_record(base: str, args) -> dict:
     speculative decoding OUTPUT-IDENTICAL to non-speculative greedy: a
     rejected draft token must leave no trace. If the CSA/HCA/LID compressor
     writes in ``compressor_v2.forward_unified``
-    (python/sglang/srt/layers/attention/dsv4/compressor_v2.py:516-596, which
+    (python/flliper/srt/layers/attention/dsv4/compressor_v2.py:516-596, which
     writes ``state_pool.kv_score_buffer.kv_score`` and, when
     ``online_c128_mtp`` is present, ``write_prefix_states``) are NOT idempotent
     under a re-run at the same positions, rejected drafts corrupt that state

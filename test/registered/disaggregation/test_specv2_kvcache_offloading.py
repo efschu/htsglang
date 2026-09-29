@@ -4,7 +4,7 @@ Unit tests for _release_finished_req in DecodeKVCacheOffloadManager.
 Verifies that over-allocated KV cache slots (from speculative decoding v2)
 are correctly freed when a request finishes, preventing GPU memory leaks.
 
-Requires: torch, sglang (run in an environment with sglang installed)
+Requires: torch, flliper (run in an environment with flliper installed)
 """
 
 import unittest
@@ -12,11 +12,11 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+from flliper.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.disaggregation.kv_events import OffloadedState
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.disaggregation.kv_events import OffloadedState
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")

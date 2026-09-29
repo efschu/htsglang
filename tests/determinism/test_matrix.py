@@ -75,7 +75,7 @@ def test_seed_pinning_discipline():
 def test_offload_rows_can_never_claim_bit_exactness():
     """Permanent guard against the retracted overclaim (0fb3d8007)."""
     for c in TEST_MATRIX:
-        offloady = "offload" in c.case_id or "SGLANG_MOE_RESIDENT_EXPERT_FRACTION" in c.test_env
+        offloady = "offload" in c.case_id or "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION" in c.test_env
         if offloady:
             assert c.expected_class is ByteIdentityClass.SELF_DET_NEAR_TIE, c.case_id
             assert c.needs_rerun, c.case_id

@@ -16,9 +16,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from sglang.srt.translator.backends import Transcript  # noqa: E402
-from sglang.srt.translator.session import EventKind, run_conversation  # noqa: E402
-from sglang.srt.translator.voices import (  # noqa: E402
+from flliper.srt.translator.backends import Transcript  # noqa: E402
+from flliper.srt.translator.session import EventKind, run_conversation  # noqa: E402
+from flliper.srt.translator.voices import (  # noqa: E402
     PresetVoice,
     VoiceClass,
     VoicePool,
@@ -39,12 +39,12 @@ class TestTheFloor(unittest.IsolatedAsyncioTestCase):
         """One closed segment, stamped as if captured during `over`."""
         import dataclasses
 
-        from sglang.srt.translator.segmenter import SegmentReason
-        from sglang.srt.translator.backends import AudioChunk
+        from flliper.srt.translator.segmenter import SegmentReason
+        from flliper.srt.translator.backends import AudioChunk
         import numpy as np
 
         audio = AudioChunk(np.zeros(16000, dtype=np.float32), 16000)
-        from sglang.srt.translator.segmenter import Segment
+        from flliper.srt.translator.segmenter import Segment
 
         seg = Segment(
             audio=audio, reason=SegmentReason.PAUSE, index=1, start_s=0.0
@@ -136,8 +136,8 @@ class TestTheEchoLock(unittest.IsolatedAsyncioTestCase):
     async def test_audio_captured_while_we_speak_never_becomes_a_reference(self):
         import numpy as np
 
-        from sglang.srt.translator.backends import AudioChunk
-        from sglang.srt.translator.speakers import SpeakerRegistry
+        from flliper.srt.translator.backends import AudioChunk
+        from flliper.srt.translator.speakers import SpeakerRegistry
 
         registry = SpeakerRegistry()
         audio = AudioChunk(np.ones(16000 * 4, dtype=np.float32) * 0.2, 16000)
@@ -152,8 +152,8 @@ class TestTheEchoLock(unittest.IsolatedAsyncioTestCase):
         """The echo scored 0.026 and enrolled itself carrying a cloned voice."""
         import numpy as np
 
-        from sglang.srt.translator.backends import AudioChunk
-        from sglang.srt.translator.speakers import SpeakerRegistry
+        from flliper.srt.translator.backends import AudioChunk
+        from flliper.srt.translator.speakers import SpeakerRegistry
 
         registry = SpeakerRegistry()
         audio = AudioChunk(np.ones(16000 * 4, dtype=np.float32) * 0.2, 16000)
@@ -169,8 +169,8 @@ class TestTheEchoLock(unittest.IsolatedAsyncioTestCase):
         admission path -- the arm has to show that something CAN get in."""
         import numpy as np
 
-        from sglang.srt.translator.backends import AudioChunk
-        from sglang.srt.translator.speakers import SpeakerRegistry
+        from flliper.srt.translator.backends import AudioChunk
+        from flliper.srt.translator.speakers import SpeakerRegistry
 
         registry = SpeakerRegistry()
         audio = AudioChunk(np.ones(16000 * 4, dtype=np.float32) * 0.2, 16000)
@@ -188,7 +188,7 @@ def _mixed_pool():
     unclassified adult was handed a child's voice."""
     import numpy as np
 
-    from sglang.srt.translator.backends import AudioChunk
+    from flliper.srt.translator.backends import AudioChunk
 
     clip = AudioChunk(
         (0.2 * np.sin(np.arange(int(4.0 * 16000)) * 0.05)).astype(np.float32),

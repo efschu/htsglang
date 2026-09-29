@@ -78,7 +78,7 @@ Columns are runner modes; rows are `compress_ratio` modes of the single
   *production-unreachable*, not "broken". The DSV4 draft model
   (`deepseek_v4_nextn.DeepseekV4ModelNextN`) is a single decoder layer
   built with `compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER = 0`
-  (`python/sglang/srt/models/deepseek_v4_nextn.py:47,105`), which flows
+  (`python/flliper/srt/models/deepseek_v4_nextn.py:47,105`), which flows
   through `MQALayer.__init__` at `deepseek_v4.py:232-237` and forces the
   draft layer to SWA-only regardless of `config.compress_ratios`.
   Production therefore never invokes `forward(compress_ratio=4 or 128,

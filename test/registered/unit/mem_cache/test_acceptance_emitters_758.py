@@ -30,7 +30,7 @@ import logging
 import types
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15)
 
@@ -39,7 +39,7 @@ class AnchorGate(unittest.TestCase):
     """(1 of 3) anchor-written -- the gate must be able to say NO."""
 
     def setUp(self):
-        from sglang.srt.mem_cache.mamba_ckpt_utils import (
+        from flliper.srt.mem_cache.mamba_ckpt_utils import (
             mamba_checkpoint_track_target,
         )
 
@@ -73,7 +73,7 @@ class HostResume(unittest.TestCase):
     """(2 of 3) mamba-host-resume -- fires ONLY on a host-only acceptance."""
 
     def _predicate(self, interval=8192):
-        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+        from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
             MambaComponent,
         )
 
@@ -126,7 +126,7 @@ class HostResume(unittest.TestCase):
         cls._host_resume_count = 0
         node = self._node(device_value=object(), host_value=object())
         logger = logging.getLogger(
-            "sglang.srt.mem_cache.unified_cache_components.mamba_component"
+            "flliper.srt.mem_cache.unified_cache_components.mamba_component"
         )
         with self.assertNoLogs(logger, level=logging.INFO):
             self.assertTrue(fn(node, 8192))
@@ -136,7 +136,7 @@ class HostResume(unittest.TestCase):
         cls._host_resume_count = 0
         node = self._node(device_value=None, host_value=object())
         logger = logging.getLogger(
-            "sglang.srt.mem_cache.unified_cache_components.mamba_component"
+            "flliper.srt.mem_cache.unified_cache_components.mamba_component"
         )
         with self.assertNoLogs(logger, level=logging.INFO):
             self.assertFalse(fn(node, 8193), "off-grid anchor must not match")
@@ -150,7 +150,7 @@ class RefillTiming(unittest.TestCase):
         # restore below the stub leaks into every test that runs after it in
         # the same process, which is how a green file makes a different file
         # fail -- observed exactly that way against the scheduler suite.
-        import sglang.srt.model_executor.rotation_executor as rx
+        import flliper.srt.model_executor.rotation_executor as rx
 
         self._rx = rx
         self._orig_rotate = rx.rotate_arena
@@ -161,8 +161,8 @@ class RefillTiming(unittest.TestCase):
     def _stack(self, monkey_refill):
         # #809/W28: the shipped copy is now the ROTATION, imported inside
         # `_timed_arena_refill` at call time, so this is the seam to stub.
-        import sglang.srt.model_executor.rotation_executor as rx
-        from sglang.srt.managers import phase_flip_boot
+        import flliper.srt.model_executor.rotation_executor as rx
+        from flliper.srt.managers import phase_flip_boot
 
         rx.rotate_arena = monkey_refill  # shipped call site, stubbed copy
         holder = types.SimpleNamespace(arena=None, rotation_image=None)
@@ -194,16 +194,16 @@ class RefillTiming(unittest.TestCase):
 
         holder = self._stack(lambda *a, **k: None)
         layout = types.SimpleNamespace(total_bytes=1048576)
-        prev = os.environ.get("SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED")
+        prev = os.environ.get("FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED")
         try:
-            os.environ["SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED"] = "1"
+            os.environ["FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED"] = "1"
             # The rotation alternates the marker, so each leg is re-armed.
             holder.image_holds = "tp"
             with self.assertLogs(level=logging.INFO) as cm:
                 holder._timed_arena_refill("pp_to_tp", layout, layout, "tp")
             self.assertIn("file-backed", "\n".join(cm.output))
 
-            os.environ.pop("SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED")
+            os.environ.pop("FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED")
             # The rotation alternates the marker, so each leg is re-armed.
             holder.image_holds = "tp"
             with self.assertLogs(level=logging.INFO) as cm:
@@ -211,9 +211,9 @@ class RefillTiming(unittest.TestCase):
             self.assertIn("pinned", "\n".join(cm.output))
         finally:
             if prev is None:
-                os.environ.pop("SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED", None)
+                os.environ.pop("FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED", None)
             else:
-                os.environ["SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED"] = prev
+                os.environ["FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED"] = prev
 
 
 if __name__ == "__main__":

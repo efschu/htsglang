@@ -48,7 +48,7 @@ def _worker(rank: int, init_file: str, out_dir: str, mode: str) -> None:
         tokens = torch.tensor([11, 248046, 33, 44], dtype=torch.int64)
 
     if mode == "fixed":
-        from sglang.srt.layers.sampler import maybe_sync_sampled_tokens
+        from flliper.srt.layers.sampler import maybe_sync_sampled_tokens
 
         maybe_sync_sampled_tokens(tokens, group=dist.group.WORLD, src=0)
     # mode == "default": upstream default path — no sync at all.

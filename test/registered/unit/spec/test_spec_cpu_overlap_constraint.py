@@ -1,10 +1,10 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -52,7 +52,7 @@ class TestSpecCPUOverlapConstraint(CustomTestCase):
         # Already disabled: the hook must not flip the flag, and (unlike the
         # forced-disable cases) must not warn about overriding it.
         with self.assertLogs(
-            "sglang.srt.arg_groups.speculative_hook", "WARNING"
+            "flliper.srt.arg_groups.speculative_hook", "WARNING"
         ) as logs:
             handle_speculative_decoding(args)
 

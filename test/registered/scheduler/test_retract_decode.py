@@ -4,18 +4,18 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.utils import is_in_ci
+from flliper.utils import is_in_ci
 
 register_cuda_ci(est_time=353, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd")
@@ -32,8 +32,8 @@ class TestRetractDecode(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         launch_args = ["--chunked-prefill-size", "128"] + cls.other_args
         with (
-            envs.SGLANG_TEST_RETRACT.override(True),
-            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+            envs.FLLIPER_TEST_RETRACT.override(True),
+            envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
         ):
             cls.process = popen_launch_server(
                 cls.model,

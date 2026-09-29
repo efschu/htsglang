@@ -12,10 +12,10 @@ import os
 import unittest
 from typing import List
 
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.nightly_bench_utils import BenchmarkResult
-from sglang.test.nightly_utils import NightlyBenchmarkRunner
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.nightly_bench_utils import BenchmarkResult
+from flliper.test.nightly_utils import NightlyBenchmarkRunner
+from flliper.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 register_amd_ci(
     est_time=18000,
@@ -108,7 +108,7 @@ class TestGLM5MXFP4PerfMI35x(unittest.TestCase):
         failed_variants = []
 
         old_env = {}
-        env_vars = {"SGLANG_USE_AITER": "1"}
+        env_vars = {"FLLIPER_USE_AITER": "1"}
         for key, value in env_vars.items():
             old_env[key] = os.environ.get(key)
             os.environ[key] = value

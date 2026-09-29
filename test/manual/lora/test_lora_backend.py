@@ -17,7 +17,7 @@ import os
 import unittest
 from typing import List
 
-from sglang.test.lora_utils import (
+from flliper.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
     BACKENDS,
     CI_LORA_MODELS,
@@ -26,7 +26,7 @@ from sglang.test.lora_utils import (
     LoRAModelCase,
     run_lora_test_one_by_one,
 )
-from sglang.test.test_utils import CustomTestCase, is_in_ci
+from flliper.test.test_utils import CustomTestCase, is_in_ci
 
 
 class TestLoRABackend(CustomTestCase):

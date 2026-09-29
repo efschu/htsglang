@@ -16,8 +16,8 @@ MATCHED TO THE FAILURE CLASS OF BOTH EDITS, which is not "does it import".
 
 import os
 
-import sglang.srt.mem_cache.hicache_flip_writeback as fw
-from sglang.srt.mem_cache.canonical_page_store import marker_path, part_path
+import flliper.srt.mem_cache.hicache_flip_writeback as fw
+from flliper.srt.mem_cache.canonical_page_store import marker_path, part_path
 
 
 class _Backend:
@@ -131,7 +131,7 @@ def test_key_trace_now_sits_on_the_symmetric_funnel():
     """
     import inspect
 
-    from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
 
     log_key = inspect.getsource(HiCacheFile._log_key)
     comp_key = inspect.getsource(HiCacheFile._get_component_key)
@@ -150,7 +150,7 @@ def test_key_trace_prints_a_suppressed_count_rather_than_going_silent():
     """A capped trace must name its own denominator (denominator law)."""
     import inspect
 
-    from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+    from flliper.srt.mem_cache.hicache_storage import HiCacheFile
 
     src = inspect.getsource(HiCacheFile._log_key)
     assert "SUPPRESSED" in src, src

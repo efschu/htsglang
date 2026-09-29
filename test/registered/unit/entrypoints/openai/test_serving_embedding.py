@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, Mock
 import jinja2
 
 
-# Stub out sgl_kernel (and all submodules) before any sglang import so
+# Stub out sgl_kernel (and all submodules) before any flliper import so
 # the test runs on CPU-only runners without the real CUDA library.
 class _SglKernelMockLoader(importlib.abc.Loader):
     def create_module(self, spec):
@@ -54,13 +54,13 @@ if (
 
 from fastapi import Request
 
-from sglang.srt.entrypoints.openai.protocol import (
+from flliper.srt.entrypoints.openai.protocol import (
     EmbeddingRequest,
     MultimodalEmbeddingInput,
 )
-from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
-from sglang.srt.managers.io_struct import EmbeddingReqInput
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
+from flliper.srt.managers.io_struct import EmbeddingReqInput
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")

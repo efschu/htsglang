@@ -1,6 +1,6 @@
-"""TF (27B rc12k27 b1, 27.09. 09:45:58, weg2-10-95): PP0's Admit names the prefix
+"""TF (27B rc12k27 b1, 27.09. 09:45:58, pdflip-10-95): PP0's Admit names the prefix
 PP0 itself can admit -- or told=0 for every rank -- and a W27 names which term
-split (managers/weg2_told_fidelity.py, pp_admission_congruence.divergence_cause).
+split (managers/pdflip_told_fidelity.py, pp_admission_congruence.divergence_cause).
 
 The ring is the #1416e harness (a simulated PP3 ring over the shipped module);
 PP0's tree gets the read-only match the probe asks."""
@@ -10,16 +10,16 @@ from types import SimpleNamespace
 
 import pytest
 
-import test_weg2_store_told_paced_1416e as ring_mod
-from sglang.srt.managers import pp_admission_congruence as pac
-from sglang.srt.managers import weg2_store_told as m
-from sglang.srt.managers import weg2_told_fallback as fb
-from sglang.srt.managers import weg2_told_fidelity as tf
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+import test_pdflip_store_told_paced_1416e as ring_mod
+from flliper.srt.managers import pp_admission_congruence as pac
+from flliper.srt.managers import pdflip_store_told as m
+from flliper.srt.managers import pdflip_told_fallback as fb
+from flliper.srt.managers import pdflip_told_fidelity as tf
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 
 METAL = ("sender stamp (mb_id=0 seq=613 rows=1024 epoch=-1 fwd_ct=613 "
-         "sender_geom=('weg2-10-95', 512, 1536)), receiver fwd_ct=612, "
-         "receiver_geom=('weg2-10-95', 16895, 17407)")
+         "sender_geom=('pdflip-10-95', 512, 1536)), receiver fwd_ct=612, "
+         "receiver_geom=('pdflip-10-95', 16895, 17407)")
 
 
 # -- the W27 names its cause ---------------------------------------------------
@@ -72,7 +72,7 @@ def _sched(tree):
 
 
 def _req(n=18361, head=0):
-    return SimpleNamespace(rid="weg2-10-95", origin_input_ids=list(range(n)),
+    return SimpleNamespace(rid="pdflip-10-95", origin_input_ids=list(range(n)),
                            full_untruncated_fill_ids=list(range(n)), extra_key=None,
                            _prefetch_registered_prefix_len=head)
 
@@ -92,7 +92,7 @@ def test_the_metal_case_is_refused_and_retold_zero(caplog):
     assert tf.pp0_admissible(s, _req(), 16383) == 0
     with caplog.at_level("WARNING", logger=tf.logger.name):
         assert tf.pp0_verdict(s, _req(), 16383, absolute=True) == (0, 0)
-    assert any("#TF TOLD-FIDELITY rid=weg2-10-95 told=16383 depth=16383 pp0_admissible=0" in x
+    assert any("#TF TOLD-FIDELITY rid=pdflip-10-95 told=16383 depth=16383 pp0_admissible=0" in x
                for x in caplog.messages)
 
 
@@ -162,7 +162,7 @@ def test_ring_pp0_that_lost_its_head_admits_zero_on_every_rank(monkeypatch):
     ring = _ring(monkeypatch, lost.match_prefix)
     _arrive(ring, "aaaa-told")
     ring.run(60)
-    admits = [o for k in sorted(ring.wire) for o in ring.wire[k] if isinstance(o, m.Weg2StoreAdmit)]
+    admits = [o for k in sorted(ring.wire) for o in ring.wire[k] if isinstance(o, m.PdFlipStoreAdmit)]
     assert len(admits) == 1 and admits[0].told == 0 and getattr(admits[0], fb.WIRE_FALLBACK, 0) == 1
     a = ring.plans("aaaa-told")
     assert a[0] == a[1] == a[2] and len(a[0]) == 1, a  # same PP0 pass, same cap, every rank
@@ -174,7 +174,7 @@ def test_ring_resumable_told_is_admitted_unchanged(monkeypatch):
     ring = _ring(monkeypatch, fine.match_prefix)
     _arrive(ring, "aaaa-told")
     ring.run(60)
-    admits = [o for k in sorted(ring.wire) for o in ring.wire[k] if isinstance(o, m.Weg2StoreAdmit)]
+    admits = [o for k in sorted(ring.wire) for o in ring.wire[k] if isinstance(o, m.PdFlipStoreAdmit)]
     assert len(admits) == 1 and admits[0].told == 100_000
     assert not getattr(admits[0], fb.WIRE_FALLBACK, 0)
     a = ring.plans("aaaa-told")
@@ -187,7 +187,7 @@ def test_ring_switch_off_is_the_old_admit(monkeypatch):
     ring = _ring(monkeypatch, lost.match_prefix)
     _arrive(ring, "aaaa-told")
     ring.run(60)
-    admits = [o for k in sorted(ring.wire) for o in ring.wire[k] if isinstance(o, m.Weg2StoreAdmit)]
+    admits = [o for k in sorted(ring.wire) for o in ring.wire[k] if isinstance(o, m.PdFlipStoreAdmit)]
     assert len(admits) == 1 and admits[0].told == 100_000 and lost.asked == []
 
 
@@ -196,8 +196,8 @@ def test_wiring_both_admit_paths_ask_before_the_admit_goes_out():
 
     src = inspect.getsource(m._pp0_publish_paced)
     fb_site = src.index("_tf.pp0_verdict(scheduler, p.req, told_final, p.absolute)")
-    fb_admit = src.index("admit = Weg2StoreAdmit(rid=rid, told=told_final)")
+    fb_admit = src.index("admit = PdFlipStoreAdmit(rid=rid, told=told_final)")
     plain = src.index("_tf_told, _tf_own = _tf.pp0_verdict(scheduler, p.req, p.told, p.absolute)")
-    plain_admit = src.index("out.append(Weg2StoreAdmit(rid=rid, told=p.told))")
+    plain_admit = src.index("out.append(PdFlipStoreAdmit(rid=rid, told=p.told))")
     assert fb_site < fb_admit and plain < plain_admit
     assert "absolute=bool(absolute))" in src

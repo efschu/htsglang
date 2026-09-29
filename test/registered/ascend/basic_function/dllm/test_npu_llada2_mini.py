@@ -1,11 +1,11 @@
 import os
 import unittest
 
-from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
-from sglang.test.ascend.test_ascend_utils import LLaDA2_0_MINI_WEIGHTS_PATH
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.send_one import BenchArgs, send_one_prompt
-from sglang.test.test_utils import (
+from flliper.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
+from flliper.test.ascend.test_ascend_utils import LLaDA2_0_MINI_WEIGHTS_PATH
+from flliper.test.ci.ci_register import register_npu_ci
+from flliper.test.send_one import BenchArgs, send_one_prompt
+from flliper.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     write_github_step_summary,
@@ -32,7 +32,7 @@ class TestLLaDA2Mini(GSM8KAscendMixin, CustomTestCase):
     ]
     env = {
         **os.environ,
-        "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1",  # Need to avoid OOM issue
+        "FLLIPER_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1",  # Need to avoid OOM issue
     }
     accuracy = 0.88
     output_throughput = 70

@@ -19,8 +19,8 @@ Tests LRU and FIFO eviction behavior.
 
 import unittest
 
-from sglang.srt.lora.eviction_policy import get_eviction_policy
-from sglang.test.ci.ci_register import (
+from flliper.srt.lora.eviction_policy import get_eviction_policy
+from flliper.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,

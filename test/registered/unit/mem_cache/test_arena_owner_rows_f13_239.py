@@ -25,15 +25,15 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
-from sglang.srt.mem_cache.canonical_page_store import (
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_page_store import (
     CanonicalAbstainWindow,
     CanonicalPageWindow,
     owner_row_window,
     owner_token_runs,
 )
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -158,16 +158,16 @@ def test_ensure_bound_takes_the_owner_rows_from_the_backend(arena):
                                    _arena_for=lambda total: arena)
         p._pin = False
         with pytest.MonkeyPatch.context() as mp:
-            mp.setenv("SGLANG_HICACHE_ARENA_PREPIN", "0")
+            mp.setenv("FLLIPER_HICACHE_ARENA_PREPIN", "0")
             assert p.ensure_bound(be, role="kv") is True
         assert p._owner_tok.tolist() == want
 
 
 def test_the_chooser_puts_a_kv_holding_worker_on_the_arena(monkeypatch):
-    from sglang.srt import rank_role
-    from sglang.srt.mem_cache.pool_host import mha as mha_mod
+    from flliper.srt import rank_role
+    from flliper.srt.mem_cache.pool_host import mha as mha_mod
 
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_HOST", "1")
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_HOST", "1")
     dp = types.SimpleNamespace(head_dim=D, v_head_dim=D, page_size=64)
     monkeypatch.setattr(rank_role, "this_rank_is_form_a_worker", lambda: True)
     monkeypatch.setattr(rank_role, "form_a_worker_holds_kv", lambda: True)
@@ -182,8 +182,8 @@ def test_a_kv_worker_refuses_a_sidecar_with_bytes():
     sidecar with bytes keyed by the worker's arena KV ids is refused by name
     at attach (the #249 BYTELESS-GROW shape, where skipping is right only
     because nothing is there)."""
-    from sglang.srt.managers.cache_controller import refuse_kv_worker_sidecar_bytes
-    from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+    from flliper.srt.managers.cache_controller import refuse_kv_worker_sidecar_bytes
+    from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
 
     def _entry(name, spt, anchor=False):
         host = types.SimpleNamespace(size_per_token=spt, layout="layer_first", page_size=P,

@@ -780,7 +780,7 @@ def main() -> int:
     a = ap.parse_args()
     if a.self_test:
         return self_test()
-    paths = a.paths or ["/spinning/wt-weg1/python/sglang/srt/managers"]
+    paths = a.paths or ["/spinning/wt-weg1/python/flliper/srt/managers"]
     fs = scan_paths(paths)
     for f in fs:
         rel = f.file
