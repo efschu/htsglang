@@ -88,6 +88,14 @@ class Weg2DSeatVramRefused(RuntimeError):
     """The seat-form expert bank could not be trimmed to its cap form."""
 
 
+class Weg2DSeatVramNoMemory(Weg2DSeatVramRefused):
+    """A live ``tms_set_spans`` answered rc=2 (cuMemCreate out of memory)."""
+
+
+#: torch_memory_saver's rc for a map the card cannot back (cuMemCreate OOM)
+TMS_RC_OUT_OF_MEMORY = 2
+
+
 class Weg2DSeatVramWipe(Weg2DSeatVramRefused):
     """W-SEAT-WIPE: a live span plan would release an extent holding bytes it
     keeps. Never swallowed into "no controller on this rank" (``controller``):
@@ -1404,8 +1412,8 @@ class SeatVram:
             census["tensors"] += 1
         rc = self.spans.set_spans(ptr, spans, now=live)
         if rc != 0:
-            raise Weg2DSeatVramRefused("%s: tms_set_spans(%s, now=%s) rc=%d"
-                                       % (LINE_MARK, name, live, rc))
+            cls = Weg2DSeatVramNoMemory if (live and rc == TMS_RC_OUT_OF_MEMORY) else Weg2DSeatVramRefused
+            raise cls("%s: tms_set_spans(%s, now=%s) rc=%d" % (LINE_MARK, name, live, rc))
         self.spans_by_ptr[int(ptr)] = tuple(spans)
 
     @classmethod
@@ -1555,7 +1563,7 @@ class SeatVram:
             # #239 S3g: each pool's own (a token-cut FA pool: compacted)
             bound_stage_tokens(pool, tokens, page)
         if not shrink:
-            self._set_bank_plans(bank_plans, census)
+            k = self._grow_bank_elastic(bank_plans, k, census)
             for cache in self.caches:
                 cache.set_seat_rows_on(k, device_write=experts_live)
         log_live_spans(census, n=n, stage=j, rows_from=int(self.rows_on), rows_to=k,
@@ -1580,6 +1588,37 @@ class SeatVram:
     def _set_bank_plans(self, bank_plans, census) -> None:
         for m, sp, live in bank_plans:
             self.set_plan(m.ptr, m.geom.name, sp, live=live, census=census)
+
+    def _grow_bank_elastic(self, bank_plans, k: int, census) -> int:
+        """A growing bank takes the rows the card CAN back (y4g b8e559c3e3, D TP1
+        07:48:04, S8 -> S6 with rows_on 6 -> k: the KV prefix released first
+        (RB), yet ``WEG2-TMS-RESUME cuMemCreate FAILED rc=2 size=4194304`` on
+        the bank -> Weg2DSeatVramRefused -> W17 group dead; the same death in
+        e033a931db 09300130). Expert rows are elastic by law: a row the card
+        cannot map stays in the host store and the rank keeps decoding. On
+        rc=2 the rows ON above the current ``rows_on`` are halved until the map
+        fits; tensors already mapped for the larger count give the extra cells
+        back (their rows were never turned ON). At ``rows_on`` nothing new is
+        mapped, so a refusal there is a real one and stops by name."""
+        floor, want = int(self.rows_on), int(k)
+        while True:
+            plans = bank_plans if k == want else [
+                (m, self.bank_spans(m, k), live) for m, _sp, live in bank_plans]
+            try:
+                self._set_bank_plans(plans, census)
+            except Weg2DSeatVramNoMemory as exc:
+                if k <= floor:
+                    raise
+                k_next = floor + (k - floor) // 2
+                logger.warning(
+                    "%s BANK-GROW-ELASTIC rows_on %d->%d refused (%s); retrying with %d rows "
+                    "(the rows above stay in the host store)", LINE_MARK, floor, k, exc, k_next)
+                k = k_next
+                continue
+            if k != want:
+                logger.warning("%s BANK-GROW-ELASTIC rows_on %d -> %d of %d wanted (card short)",
+                               LINE_MARK, floor, k, want)
+            return k
 
     def _rows_off_live(self, k: int, experts_live: bool) -> None:
         """Turn bank rows OFF (coldest first) on a live bank: sync, then the
