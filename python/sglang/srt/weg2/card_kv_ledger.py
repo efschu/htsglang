@@ -205,8 +205,17 @@ class CardKvLedger:
                 raise RuntimeError(f"card KV ledger {self.path}: group {self.group} already held by pid "
                                    f"{st.pid[self.group]}")
             st.pid[self.group] = pid
-            st.budget += int(kv_bytes) - st.contrib[self.group]
-            st.contrib[self.group] = int(kv_bytes)
+            # metal dual14 (bdfefe): D unmapped its boot pool (2415919104 B on
+            # the 5090) in the second P began sizing, and P's KV sizing counted
+            # it as free (4475322368 B vs 2122317824 in dual13) -- the budget
+            # held the same bytes twice and D's grow hit cuMemCreate OOM. What
+            # the other group contributed but has RELEASED was free memory to
+            # this sizing: it is not contributed a second time.
+            other = GROUPS[1 - self._gi]
+            released = max(0, st.contrib[other] - st.committed[other]) if st.pid[other] else 0
+            counted = max(0, int(kv_bytes) - released)
+            st.budget += counted - st.contrib[self.group]
+            st.contrib[self.group] = counted
             st.committed[self.group] = max(0, int(committed))
             if sum(st.committed.values()) > st.budget:
                 raise RuntimeError(
@@ -243,6 +252,23 @@ class CardKvLedger:
             st.committed[self.group] -= n
             st.pressure[self.group] = max(0, st.pressure[self.group] - n)
             return n
+
+    def reconcile(self, phys_free: int) -> int:
+        """The card said no (cuMemCreate OOM) although the ledger had room: the
+        budget promised bytes the card does not have. Lower it until the
+        ledger's free equals the physical free bytes; returns the correction.
+        Taken from this group's contribution first (a leaving group takes its
+        own share out of the budget)."""
+        with self._locked() as st:
+            over = int(st.free) - max(0, int(phys_free))
+            if over <= 0:
+                return 0
+            st.budget -= over
+            mine = min(over, st.contrib[self.group])
+            st.contrib[self.group] -= mine
+            other = GROUPS[1 - self._gi]
+            st.contrib[other] = max(0, st.contrib[other] - (over - mine))
+            return over
 
     def pressure_on_me(self) -> int:
         """Bytes the other process asked this one to release from its cache."""

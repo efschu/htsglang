@@ -124,6 +124,20 @@ def born(pool, t, name: str, *, spans=None, granule: Optional[int] = None):
     return t
 
 
+class Weg2DualKvCoverBreach(RuntimeError):
+    """The card ledger covers fewer bytes for this group than this rank maps
+    (invariant: ledger committed >= mapped bytes, after every map/grant/release)."""
+
+
+class Weg2DualKvMapShort(RuntimeError):
+    """tms_set_spans rc=2 (cuMemCreate CUDA_ERROR_OUT_OF_MEMORY): the card is
+    physically short -- D treats it as "card short", never as a crash."""
+
+    def __init__(self, msg, rc=2):
+        super().__init__(msg)
+        self.rc = rc
+
+
 class Weg2DualKvCapBreach(RuntimeError):
     """A free id above the mapped span: the next allocation would write into
     unmapped memory (metal e3hgpw: illegal memory access). Refused by name."""
@@ -252,6 +266,9 @@ class PKvStage:
     def _move(self, tokens: int) -> None:
         for ptr, g in self.born:
             rc = self.spans.set_spans(ptr, self._plan(g, tokens), now=True)
+            if rc == 2:
+                raise Weg2DualKvMapShort("%s: tms_set_spans rc=2 (cuMemCreate out of memory) moving %s to %d "
+                                         "tokens" % (MARK, getattr(g.geom, "name", "?"), tokens))
             if rc != 0:
                 raise RuntimeError("%s: tms_set_spans rc=%d moving %s to %d tokens"
                                    % (MARK, rc, getattr(g.geom, "name", "?"), tokens))
@@ -279,6 +296,7 @@ class PKvStage:
         logger.info("%s GROW %d -> %d tokens (+%d B from the card pool)", MARK, self.mapped_tokens, want, need)
         self._committed = int(getattr(self, "_committed", 0) or 0) + need
         self.mapped_tokens = want
+        check_cover(self, "ensure")
         return True
 
     def table(self) -> List[int]:
@@ -313,6 +331,7 @@ class PKvStage:
             self._committed = keep
         logger.info("%s MAPPED-BY-GRANT tokens=%d (PP0's atomic group grant) committed=%d B returned=%d B",
                     MARK, want, self._committed, max(0, excess))
+        check_cover(self, "map_granted")
 
     def release_all(self) -> int:
         """Unmap everything; the caller guarantees no request holds a page."""
@@ -333,7 +352,72 @@ class PKvStage:
         logger.info("%s RELEASE %d tokens -> 0 (-%d B back to the card pool)", MARK, self.mapped_tokens, n)
         self.mapped_tokens = 0
         self._committed = 0
+        check_cover(self, "release_all")
         return n
+
+
+def check_cover(actor, where: str) -> None:
+    """Invariant after every map/grant/release (operator order after dual14):
+    the card ledger's committed bytes for this group cover what this rank maps."""
+    led = getattr(actor, "ledger", None)
+    path = getattr(led, "path", None)
+    if not path:
+        return
+    from sglang.srt.weg2.card_kv_ledger import peek
+
+    st = peek(path)
+    if st is None:
+        return
+    mine = actor.bytes_for(actor.mapped_tokens) - actor.bytes_for(0)
+    have = int(st.committed.get(led.group, 0))
+    if have < mine:
+        raise Weg2DualKvCoverBreach(
+            "%s COVER-BREACH at %s: the card ledger covers %d B for %s, this rank maps %d B (%d tokens) "
+            "-- the pool would promise mapped bytes to the other group" % (MARK, where, have, led.group, mine,
+                                                                            actor.mapped_tokens))
+
+
+def phys_free_bytes() -> Optional[int]:
+    """cuMemGetInfo's free bytes on this process's device (None off CUDA)."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return int(torch.cuda.mem_get_info()[0])
+    except Exception:  # noqa: BLE001 -- an instrument never kills the rank
+        return None
+
+
+PHYS_CHECK_S = 10.0
+
+
+def phys_check(actor, group: str) -> None:
+    """Throttled instrument (operator order after dual14): the ledger's free
+    bytes against the card's physical free bytes. OVER-PROMISE = the ledger
+    would grant bytes the card does not have (dual14: budget counted twice)."""
+    t = _now()
+    if t < getattr(actor, "_phys_next", 0.0):
+        return
+    actor._phys_next = t + PHYS_CHECK_S
+    led = getattr(actor, "ledger", None)
+    path = getattr(led, "path", None)
+    phys = phys_free_bytes()
+    if not path or phys is None:
+        return
+    from sglang.srt.weg2.card_kv_ledger import peek
+
+    st = peek(path)
+    if st is None:
+        return
+    over = int(st.free) - int(phys)
+    if over > 0:
+        logger.warning("%s LEDGER-PHYS OVER-PROMISE by %d B group=%s ledger_free=%d phys_free=%d budget=%d "
+                       "committed=%s", MARK, over, group, int(st.free), int(phys), int(st.budget),
+                       dict(st.committed))
+    else:
+        logger.info("%s LEDGER-PHYS ok group=%s ledger_free=%d phys_free=%d budget=%d committed=%s", MARK,
+                    group, int(st.free), int(phys), int(st.budget), dict(st.committed))
 
 
 # -- wiring (P process, dual only) -------------------------------------------
@@ -559,6 +643,8 @@ def on_idle(sched) -> int:
     """A fully idle P rank gives its whole context back: device tree evicted
     (write-back keeps the pages in L2), then unmapped and released."""
     actor = _actor(sched)
+    if actor is not None:
+        phys_check(actor, "P")
     if actor is None or actor.mapped_tokens <= 0:
         return 0
     tree = getattr(sched, "tree_cache", None)
