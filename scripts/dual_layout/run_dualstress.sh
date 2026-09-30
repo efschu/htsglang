@@ -30,22 +30,30 @@ pair() {  # <tag> "<d-extra>" "<p-extra>"
   local b=$!
   wait $a; echo "$tag D rc=$?"; wait $b; echo "$tag P rc=$?"; reap
 }
-JIT="--jit-at 3 --jit-every 2"
+# round-based cold loads (every rank of the group at the SAME round; ~every 2 s at the measured loop rates)
+JD="--jit-round 1500 --jit-every-rounds 1500"   # D 40 KiB AR: ~790 rounds/s
+JP="--jit-round 300 --jit-every-rounds 300"     # P 1 MiB AR + GEMM 2048: ~150 rounds/s
+JB="--jit-round 400 --jit-every-rounds 400"     # D 8 MiB AR
 BIG="--size 8388608"
 mkdir -p $MPSROOT/pipe $MPSROOT/log
 CUDA_MPS_PIPE_DIRECTORY=$MPSROOT/pipe CUDA_MPS_LOG_DIRECTORY=$MPSROOT/log nvidia-cuda-mps-control -d; sleep 1
 export CUDA_MPS_PIPE_DIRECTORY=$MPSROOT/pipe
-echo "== R1 MPS, D cold loads (rerun, salt fix)"; PENV="CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=50" pair R1 "$JIT" ""
-echo "== R2 MPS, P cold loads (rerun, salt fix)"; PENV="CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=50" pair R2 "" "$JIT"
+P50="CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=50"
+echo "== R1 MPS, D cold loads";                      PENV=$P50 pair R1 "$JD" ""
+echo "== R2 MPS, P cold loads";                      PENV=$P50 pair R2 "" "$JP"
+echo "== R3 MPS, D cold loads, P GEMM only";         PENV=$P50 pair R3 "$JD" "--gemm-only"
 DUR=45
-echo "== S1 MPS, D 8 MiB AR (extend-like) + cold loads, P 1 MiB AR + GEMM, 45 s"; PENV="CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=50" pair S1 "$BIG $JIT" ""
-echo "== S2 MPS, D 8 MiB AR, no loads, 45 s"; PENV="CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=50" pair S2 "$BIG" ""
+echo "== S1 MPS, D 8 MiB AR + cold loads, 45 s";     PENV=$P50 pair S1 "$BIG $JB" ""
+echo "== S2 MPS, D 8 MiB AR, no loads, 45 s";        PENV=$P50 pair S2 "$BIG" ""
 stop_mps; unset CUDA_MPS_PIPE_DIRECTORY
-echo "== S3 no MPS, D 8 MiB AR + cold loads, 45 s"; pair S3 "$BIG $JIT" ""
+DUR=12
+echo "== N1 no MPS, D cold loads";                   pair N1 "$JD" ""
+DUR=45
+echo "== S3 no MPS, D 8 MiB AR + cold loads, 45 s";  pair S3 "$BIG $JB" ""
 $PY - "$OUT" <<'PYEOF'
 import glob, json, os, sys
 for f in sorted(glob.glob(sys.argv[1] + "/*.json")):
     d = json.load(open(f))
     print(f"{os.path.basename(f):8s} ok={d['ok']} mps={d['mps']} " + " | ".join(
-        f"r{x.get('rank')} p50 {x.get('p50_ms', float('nan')):.3f} max {x.get('max_ms', float('nan')):.1f} n {x.get('n', 0)} jit {x.get('jit_ms')} {x.get('err', '')[:60]}" for x in d["ranks"]))
+        f"r{x.get('rank')} bad {x.get('bad')} p50 {x.get('p50_ms', float('nan')):.3f} max {x.get('max_ms', float('nan')):.1f} n {x.get('n', 0)} jit {x.get('jit_ms')} {x.get('err', '')[:60]}" for x in d["ranks"]))
 PYEOF

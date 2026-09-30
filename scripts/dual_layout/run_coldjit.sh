@@ -28,7 +28,7 @@ pair() {  # <tag> "<d-extra>" "<p-extra>"
   local b=$!
   wait $a; echo "$tag D rc=$?"; wait $b; echo "$tag P rc=$?"; reap
 }
-JIT="--jit-at 3 --jit-every 2"
+JIT="--jit-round 1500 --jit-every-rounds 1500"
 mkdir -p $MPSROOT/pipe $MPSROOT/log
 CUDA_MPS_PIPE_DIRECTORY=$MPSROOT/pipe CUDA_MPS_LOG_DIRECTORY=$MPSROOT/log nvidia-cuda-mps-control -d; sleep 1
 export CUDA_MPS_PIPE_DIRECTORY=$MPSROOT/pipe

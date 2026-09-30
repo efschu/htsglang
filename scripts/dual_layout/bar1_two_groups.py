@@ -127,20 +127,25 @@ def worker(rank, a, store):
             time.sleep(a.start_at - now)
         dist.barrier()
         t_end = time.perf_counter() + a.dur
-        t_jit = (time.perf_counter() + a.jit_at) if a.jit_at > 0 else None
+        # ROUND-based, not time-based: the loop is in host lockstep, so every
+        # rank reaches the same round -- the extra in-flight collective before
+        # the load is then SYMMETRIC (a time trigger fires on different rounds
+        # per rank and misaligns the collective sequence; the first repro's
+        # ~30 s stalls in M3/N1 were that artifact).
         res["jit_ms"] = []
         rnd = 0
         while time.perf_counter() < t_end:
             rnd += 1
             if gemm is not None:
                 gemm()
-            if t_jit is not None and time.perf_counter() >= t_jit and (a.jit_ranks == "all" or str(rank) in a.jit_ranks.split(",")):
+            if a.jit_round > 0 and rnd >= a.jit_round and (rnd - a.jit_round) % max(1, a.jit_every_rounds or 10**12) == 0:
                 # the cold load lands while this group's previous collective and the
                 # OTHER group's kernels may still be resident (async launch)
                 inp_j = _pattern(n, rank, rnd, dev)
                 t.barlink_all_reduce(None, inp_j)  # left in flight, not synced
-                res["jit_ms"].append(round(_cold_triton_launch(dev, f"{a.name}{rank}{rnd}{time.time()}"), 1))
-                t_jit = (time.perf_counter() + a.jit_every) if a.jit_every > 0 else None
+                # the salt is the ROUND (same on every rank of this group: they load
+                # the same new kernel, as D's ranks do on metal)
+                res["jit_ms"].append(round(_cold_triton_launch(dev, f"{a.name}{rnd}{a.port}"), 1))
             if a.gemm_only:
                 torch.cuda.synchronize(dev)
             else:
@@ -195,10 +200,9 @@ def main():
     ap.add_argument("--verify-every", type=int, default=10)
     ap.add_argument("--gemm-only", action="store_true",
                     help="P's compute alone: the GEMM loop, no collectives (the transport is still built)")
-    ap.add_argument("--jit-at", type=float, default=0.0,
-                    help="seconds into the loop: this group loads a COLD triton module (0 = never)")
-    ap.add_argument("--jit-every", type=float, default=0.0, help="repeat the cold load every N s (0 = once)")
-    ap.add_argument("--jit-ranks", default="all", help="'all' or a comma list of ranks that do the cold load")
+    ap.add_argument("--jit-round", type=int, default=0,
+                    help="loop round at which EVERY rank of this group loads a COLD triton module (0 = never)")
+    ap.add_argument("--jit-every-rounds", type=int, default=0, help="repeat every N rounds (0 = once)")
     ap.add_argument("--windows-mib", default="",
                     help="comma list: one BAR1 window per barlink group, e.g. D '16,32,40', P '16,64'")
     ap.add_argument("--bar1-snapshot", action="store_true", help="record nvidia-smi BAR1 usage once all windows exist")
