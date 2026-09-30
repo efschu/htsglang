@@ -146,6 +146,31 @@ def test_the_plan_requires_every_slot_state_the_pool_carries():
     assert ta.slot_state_kinds(SimpleNamespace(short_conv_pool=off, ngram_pool=off)) == ()
 
 
+def test_a_stage_without_a_ple_layer_does_not_require_the_ngram_history():
+    """P-TURN-REUSE (y3u 30.09.): NF's P is PP3 and only PP0 owns the PLE
+    layer. The pool still carries the n-gram rows on PP1/PP2
+    (``ngram_context_len`` is not stage-filtered, the short-conv ids are), but
+    no forward there writes them -- requiring them refused EVERY turn anchor
+    on PP1/PP2 ('TURN-ANCHOR SKIP reason=unmarked:ple_ngram'). Red on the base:
+    the plan required ('gdn', 'ple_ngram')."""
+    from sglang.srt.weg2 import turn_anchor as ta
+
+    on, off = SimpleNamespace(enabled=True), SimpleNamespace(enabled=False)
+    pp1 = SimpleNamespace(short_conv_pool=off, ngram_pool=on)
+    assert ta.slot_state_kinds(pp1) == ()
+    pp0 = SimpleNamespace(short_conv_pool=on, ngram_pool=on)
+    assert ta.slot_state_kinds(pp0) == ("ple_conv", "ple_ngram"), \
+        "the stage that keeps the history still requires it"
+    alloc = _Alloc([11])
+    req = _sreq(PROMPT)
+    batch = SimpleNamespace(reqs=[req], req_to_token_pool=SimpleNamespace(
+        mamba_allocator=alloc, short_conv_pool=off, ngram_pool=on))
+    desc = ta.note_step(batch=batch, desc=None, req=req, row=0, prefix=0, end=N,
+                        track_mask=True, main_track=N - 1, chunk=1, page=1, tok=IM)
+    desc.done.add("gdn")    # what PP1's forward leaves: the GDN rows, no PLE code
+    assert desc.complete()
+
+
 def test_the_scheduler_plans_one_slot_per_turn_row_and_frees_a_stale_one():
     from sglang.srt.weg2 import turn_anchor as ta
 
@@ -345,7 +370,7 @@ def group_p(monkeypatch):
     return monkeypatch
 
 
-def _fixture(bigram):
+def _fixture(bigram, ple=None):
     server_args = ServerArgs(model_path="dummy", page_size=1)
     server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
     server_args.chunked_prefill_size = 16
@@ -360,7 +385,7 @@ def _fixture(bigram):
         size=10, mamba_size=MAMBA_SLOTS, mamba_spec_state_size=10, max_context_len=256,
         device="cpu", enable_memory_saver=False, cache_params=cache_params,
         mamba_layer_ids=MAMBA_LAYER_IDS, enable_mamba_extra_buffer=False,
-        speculative_num_draft_tokens=3,
+        speculative_num_draft_tokens=3, **(ple or {}),
     )
     kv_pool = HybridLinearKVPool(
         size=KV_SIZE, dtype=torch.bfloat16, page_size=1, head_num=2, head_dim=64,
@@ -509,6 +534,58 @@ def test_an_unmarked_plan_inserts_nothing_and_frees_its_slot(group_p, marks, nee
     assert state != pytest.approx(S_TURN), why
     # the request's own slot went to the tree as its END anchor; the turn slot back
     assert fx.pool.mamba_allocator.available_size() == free_before - 1, why
+
+
+#: NF's P stages as the model runner builds their pools: the short-conv ids are
+#: filtered to the stage's layers, the n-gram window is not.
+PLE_PP0 = dict(short_conv_layer_ids=[MAMBA_LAYER_IDS[0]], short_conv_state_shape=(4, 3),
+               ngram_context_len=2, ngram_eos_token_id=IM_END)
+PLE_PP1 = dict(short_conv_layer_ids=[], short_conv_state_shape=(4, 3),
+               ngram_context_len=2, ngram_eos_token_id=IM_END)
+
+
+def _planned_one_forward_prefill(fx, marks):
+    """The scheduler's own plan (note_step against the stage's real pool),
+    then the forward's marks, then the finish -- weg2-0-6's shape."""
+    from sglang.srt.weg2 import turn_anchor as ta
+
+    req = _req(fx, PROMPT)
+    _write_kv(fx, req, N)
+    batch = SimpleNamespace(reqs=[req], req_to_token_pool=fx.pool)
+    desc = ta.note_step(batch=batch, desc=None, req=req, row=0, prefix=0, end=N,
+                        track_mask=True, main_track=N - 1, chunk=1, page=1, tok=IM)
+    assert desc is not None, "the step holds the boundary: a plan is drawn"
+    slot = getattr(req, ta.PENDING_ATTR)[1]
+    _state(fx, slot, S_TURN)
+    desc.done.update(marks)
+    _state(fx, req.mamba_pool_idx, S_END)
+    _finish(fx, req)
+    return req
+
+
+@pytest.mark.parametrize("bigram", [False, True], ids=["unigram", "bigram"])
+def test_a_pp_stage_without_the_ple_layer_inserts_its_turn_anchor(group_p, bigram):
+    """y3u weg2-0-6 -> weg2-2-8: PP1/PP2 planned the turn anchor, their forward
+    wrote the GDN rows (no PLE layer, no PLE code), the insert refused it as
+    'unmarked:ple_ngram' -- so the arena never held the 69696 anchor on every
+    rank and the next turn read only to 60224 (9528 tokens re-prefilled).
+    Red on the base: the claim stops below the boundary."""
+    fx = _fixture(bigram, ple=PLE_PP1)
+    assert fx.pool.ngram_pool.enabled and not fx.pool.short_conv_pool.enabled
+    _planned_one_forward_prefill(fx, marks=("gdn",))
+    assert _claim(fx, NEXT) == (I_LAST, pytest.approx(S_TURN))
+
+
+def test_the_ple_stage_still_refuses_an_unwritten_ple_state(group_p):
+    """PP0 keeps the PLE states: a forward that wrote only the GDN rows (its
+    PLE code did not run in Python) is still refused there."""
+    fx = _fixture(False, ple=PLE_PP0)
+    assert fx.pool.ngram_pool.enabled and fx.pool.short_conv_pool.enabled
+    _planned_one_forward_prefill(fx, marks=("gdn",))
+    assert _claim(fx, NEXT)[1] != pytest.approx(S_TURN)
+    fx = _fixture(False, ple=PLE_PP0)
+    _planned_one_forward_prefill(fx, marks=("gdn", "ple_conv", "ple_ngram"))
+    assert _claim(fx, NEXT) == (I_LAST, pytest.approx(S_TURN))
 
 
 def test_an_unarmed_request_is_untouched(group_p):

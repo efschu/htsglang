@@ -381,14 +381,37 @@ def slot_state_kinds(pool: Any) -> Tuple[str, ...]:
     the Qwen4-Exp PLE side states when their pools are enabled (the same two
     ``MambaPool.register_slot_state`` carries). Fixed at PLAN time, so a
     forward whose model code did not run in Python (a captured graph) leaves
-    them unmarked and the plan is refused -- never inserted half-written."""
+    them unmarked and the plan is refused -- never inserted half-written.
+
+    P-TURN-REUSE (NF y3u, 30.09.; P log ...0930_002717): the n-gram history
+    is required only on the stage that KEEPS it. The pool carries it on every
+    PP stage (``ngram_context_len`` is not stage-filtered in
+    model_runner_kv_cache_mixin, the short-conv layer ids are), but only the
+    stage that owns a PLE layer builds and commits the PLE batch
+    (``Qwen4ExpModel._stage_has_ple``) -- on NF's P (PP3) that is PP0 alone.
+    The PLE layers ARE the short-conv layers (config ``short_conv_layer_ids``
+    = ``ple_layer_ids - 1``), so a stage whose short-conv pool is off owns no
+    PLE layer, and no forward there writes an n-gram row for ANY track (the
+    default track neither). Requiring it anyway refused every turn anchor on
+    PP1/PP2 ('TURN-ANCHOR SKIP reason=unmarked:ple_ngram', 100 % in y3r/y3t/
+    y3u), PP0's anchor stayed a partial arena slot, and the next turn read
+    only to the older anchor: weg2-2-8 '#1028B FETCH CAP kv=1089 claimed=941
+    ... mamba (11, 940)', 9528 tokens re-prefilled on P."""
     kinds = []
     scp = getattr(pool, "short_conv_pool", None)
+    stage_keeps_ple = scp is None or bool(getattr(scp, "enabled", False))
     if scp is not None and bool(getattr(scp, "enabled", False)):
         kinds.append("ple_conv")
     ngp = getattr(pool, "ngram_pool", None)
     if ngp is not None and bool(getattr(ngp, "enabled", False)):
-        kinds.append("ple_ngram")
+        if stage_keeps_ple:
+            kinds.append("ple_ngram")
+        else:
+            n = _count("ngram_not_on_stage")
+            if _log_due(n):
+                logger.info("WEG2 TURN-ANCHOR NGRAM-OFF-STAGE n=%d: this PP stage owns no PLE "
+                            "layer (short-conv pool off); its n-gram rows are written by no "
+                            "track, so the turn plan does not require them", n)
     return tuple(kinds)
 
 
