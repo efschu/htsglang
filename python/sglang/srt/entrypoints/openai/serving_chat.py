@@ -1411,18 +1411,22 @@ class OpenAIServingChat(OpenAIServingBase):
         resumable_depth = weg2_resumable_depth.from_meta_infos(
             [r["meta_info"] for r in ret]
         )
+        # #49 L3: a Weg-2 P prefill's inner anchor depths (first choice: per request).
+        anchor_depths = first_ret["meta_info"].get("weg2_anchor_depths") or None
         response_sglext = None
         if (
             routed_experts
             or cached_tokens_details
             or weg2_prefill_s
             or resumable_depth is not None
+            or anchor_depths
         ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
                 weg2_prefill_s=weg2_prefill_s,
                 weg2_resumable_depth=resumable_depth,
+                weg2_anchor_depths=anchor_depths,
             )
 
         for idx, ret_item in enumerate(ret):

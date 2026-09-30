@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     get_and_increase_time_counter,
 )
 from sglang.srt.mem_cache.mamba_ckpt_utils import (
+    ANCHOR_STEP_INTERVAL,
     RESUME_REFUSAL_PATH_CAP,
     floor_to_interval,
     is_on_interval,
@@ -898,6 +899,19 @@ class MambaComponent(TreeComponent):
                 n, str(getattr(req, "rid", "?"))[:12], int(cache_len), prompt_len,
                 last, interval, why or "DECLINED", counts,
             )
+        if why == ANCHOR_STEP_INTERVAL:
+            # #49 L3: the INNER anchor depths this request donates (raw token positions), reported
+            # on its finishing output (req_time_stats.weg2_anchor_depths) so the front can credit a
+            # later text that leaves this one between two anchors. Rank-uniform inputs only (above).
+            try:
+                got = getattr(req, "_weg2_anchor_depths", None)
+                if got is None:
+                    got = []
+                    req._weg2_anchor_depths = got
+                if not got or got[-1] != int(cache_len):
+                    got.append(int(cache_len))
+            except Exception:  # noqa: BLE001 -- an instrument never breaks the insert
+                pass
         return why is None
 
     def redistribute_on_node_split(

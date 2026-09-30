@@ -55,7 +55,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -395,6 +395,10 @@ class TokenSpans:
         #: beside the entry, never folded into its measured ``ct``: a published depth past a later
         #: text's divergence must not erase the lower measured anchor that lies on the shared path.
         self.published: Dict[str, int] = {}
+        #: #49 L3: key -> the INNER mamba anchor depths P's prefill donated for that text (sorted,
+        #: below its end anchor), recorded with the P-anchor witness; beside the entry like
+        #: :attr:`published`. :meth:`pending` credits the deepest one on the new text's shared path.
+        self.inner: Dict[str, Tuple[int, ...]] = {}
 
     @staticmethod
     def _key(ids: np.ndarray) -> str:
@@ -424,6 +428,7 @@ class TokenSpans:
         # #49 L2: a NEW D reading of this text supersedes its published depth -- a W31 refusal's small
         # cached_tokens retracts an over-credit here, D itself being the witness
         self.published.pop(key, None)
+        self.inner.pop(key, None)
         if not self.agent_span:
             prompt_tokens, held_epoch = 0, None
         ct = max(0, int(cached_tokens))
@@ -454,7 +459,8 @@ class TokenSpans:
         """The end anchor a served ``n``-token prompt leaves: its page floor."""
         return max(0, int(n)) // self.anchor_page * self.anchor_page
 
-    def record_store_anchor(self, ids: Optional[np.ndarray], prompt_tokens: int = 0) -> int:
+    def record_store_anchor(self, ids: Optional[np.ndarray], prompt_tokens: int = 0,
+                            inner: Optional[Sequence[int]] = None, inner_keep: int = 0) -> int:
         """PREFILL-EINBRUCH-0929 K1 (switch SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE):
         P's END-ANCHOR of ``ids`` is in the store and D resumed from it -- the
         caller calls this only at the first content of an ``after_p`` leg 2,
@@ -483,6 +489,15 @@ class TokenSpans:
             cap = self.depth_caps.get(key)
             if cap is not None and int(cap) < anchor:
                 self.depth_caps[key] = anchor
+        if inner:
+            # #49 L3: the inner anchors P donated below this end anchor; with a per-path state cap
+            # (``inner_keep`` = MAX_STATES_PER_PATH - 1, the end anchor takes one) only the deepest
+            # survive P's cap, so only those are credited.
+            got = sorted({int(a) for a in inner if 0 < int(a) < anchor})
+            if inner_keep > 0:
+                got = got[-int(inner_keep):]
+            if got:
+                self.inner[key] = tuple(got)
         self._stamp(key)
         return anchor
 
@@ -523,6 +538,7 @@ class TokenSpans:
             old_key, _ = self.entries.popitem(last=False)
             self.depth_caps.pop(old_key, None)
             self.published.pop(old_key, None)
+            self.inner.pop(old_key, None)
             self.entry_seq.pop(old_key, None)
 
     def record_inflight(self, ids: Optional[np.ndarray], held_epoch: Optional[int]) -> None:
@@ -580,6 +596,11 @@ class TokenSpans:
             pub = self.published.get(key)
             if pub is not None and credit < int(pub) <= lcp:
                 credit = int(pub)  # #49 L2: the published anchor, only where it lies on the shared path
+            inner = self.inner.get(key)
+            if inner:
+                on_path = [a for a in inner if a <= lcp]
+                if on_path and on_path[-1] > credit:
+                    credit = int(on_path[-1])  # #49 L3: the deepest inner anchor on the shared path
             if credit > best:
                 best = credit
                 src = "d_served_epoch" if held and credit > ct else "d_leg2_cached"

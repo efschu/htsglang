@@ -1454,6 +1454,12 @@ class Envs:
     # #59 weg2_resumable_depth, never the prompt (front_tokens.TokenSpans.promote_published). Front only;
     # default off until the first 27B flip boot proves it.
     SGLANG_WEG2_ENABLE_D_EPOCH_PUBLISH_PRESENCE = EnvBool(False)
+    # #49 L3 (30.09.): with the P-anchor presence witness, also credit the INNER mamba anchors P's
+    # prefill donated (P's leg-1 sglext/meta_info weg2_anchor_depths) -- the deepest one on a later
+    # text's shared path. Front only, and only under --dual-layout: the flip form RELEASES inner anchors
+    # at P's reset (SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE, grid4096), so crediting them there would
+    # over-credit. Default off.
+    SGLANG_WEG2_ENABLE_INNER_ANCHOR_PRESENCE = EnvBool(False)
     # The page grain of that end anchor (the store page, ArenaMHAHostPool #107).
     SGLANG_WEG2_FRONT_ANCHOR_PAGE = EnvInt(64)
     # H102 (Weg-2 front): a per-request watcher sees the client's connection

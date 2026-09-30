@@ -63,6 +63,9 @@ class AnthropicSglExt(BaseModel):
 
     weg2_resumable_depth: Optional[NonNegativeInt] = None
     cached_tokens_details: Optional[dict[str, Any]] = None
+    #: #49 L3: a Weg-2 P prefill's inner mamba anchor depths (the OpenAI wire's
+    #: ``sglext.weg2_anchor_depths``), read by the front on P's leg 1.
+    weg2_anchor_depths: Optional[list[int]] = None
 
 
 # ---------- Content blocks (discriminated by ``type``) ----------

@@ -1477,6 +1477,21 @@ def d_resumable_depth(body: Any) -> Optional[int]:
     return None
 
 
+def anchor_depths_of(body: Any) -> tuple:
+    """#49 L3: P's ``weg2_anchor_depths`` (the inner mamba anchors its prefill donated) from a leg-1
+    answer -- ``meta_info`` on ``/generate``, ``sglext`` on the OpenAI / Anthropic wire. () when
+    absent or unreadable: the credit is then the end anchor alone, as before."""
+    if not isinstance(body, dict):
+        return ()
+    for holder in (body.get("meta_info"), body.get("sglext")):
+        if isinstance(holder, dict) and holder.get("weg2_anchor_depths"):
+            try:
+                return tuple(sorted({int(a) for a in holder["weg2_anchor_depths"] if int(a) > 0}))
+            except (TypeError, ValueError):
+                return ()
+    return ()
+
+
 def d_resumable_depth_stream_tail(tail: bytes) -> Optional[int]:
     """#59: :func:`d_resumable_depth` of the LAST streamed chunk that carries
     it (the finish chunk), scanning the retained tail from the end."""
@@ -3168,6 +3183,9 @@ class Pending:
     est_uncached: int = 0
     span_known: bool = False
     leg1_prompt_tokens: int = 0
+    #: #49 L3: the INNER mamba anchor depths P's leg-1 prefill donated (sglext / meta_info
+    #: weg2_anchor_depths); credited only with the P-anchor witness, see _p_anchor_presence.
+    leg1_anchor_depths: tuple = ()
     skip_leg1: bool = False  # #1233 route CARRIER-EXCEEDS: one prefill on D, no leg 1
     leg1_done: bool = False
     #: weg2xsn272: P refused this leg 1 as WEG2-INTAKE-STALL (its pool cannot
@@ -5884,7 +5902,20 @@ class Front:
             return 0
         ids = self.ftok.ids_for(text)
         p_pt = int(getattr(pending, "leg1_prompt_tokens", 0) or 0)
-        anchor = self.tspans.record_store_anchor(ids, p_pt)
+        inner, keep = (), 0
+        if envs.SGLANG_WEG2_ENABLE_INNER_ANCHOR_PRESENCE.get() and getattr(self, "dual_layout", False):
+            # #49 L3: only under --dual-layout (the flip form releases inner anchors at P's reset)
+            inner = tuple(getattr(pending, "leg1_anchor_depths", ()) or ())
+            from sglang.srt.weg2.form import profile_switch_default
+
+            cap = int(profile_switch_default("SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH", 0) or 0)
+            keep = max(0, cap - 1)
+        anchor = self.tspans.record_store_anchor(ids, p_pt, inner=inner, inner_keep=keep)
+        if inner and self.tspans.inner.get(self.tspans._key(ids)):
+            self.counters["inner_anchor_presence"] += 1
+            logger.info("WEG2 INNER-ANCHOR-PRESENCE rid=%s anchors=%s kept=%s (P's donated inner mamba "
+                        "anchors, credited on a later text's shared path; dual layout)",
+                        rid, list(inner)[-8:], list(self.tspans.inner[self.tspans._key(ids)]))
         if anchor <= 0:
             return 0
         self.counters["p_anchor_presence"] += 1
@@ -7909,6 +7940,7 @@ class Front:
             # DUAL-TP3PP3 (metal dual20): P answers an aborted leg 1 with 200 and
             # prompt_tokens=0 (finish_reason abort) -- not a failure, not a finish
             p.leg1_aborted = leg1_aborted(js, pt)
+            p.leg1_anchor_depths = anchor_depths_of(js)  # #49 L3
             self._note_p_prefix_reuse(p, ct)
             # #1324: NO PRESENCE RECORD HERE. This site used to call
             # `self.spans.record(p.text, pt)`, i.e. it credited the span
