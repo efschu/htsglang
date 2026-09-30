@@ -149,6 +149,9 @@ _H2D_LOG_LAYER = None
 # H107: the one layer whose eager LRU plan is logged at INFO, one line per
 # extend (same latch rule as _H2D_LOG_LAYER).
 _H107_LOG_LAYER = None
+# D-Mini-Extend: the one layer whose device-planned eager step is logged at
+# INFO, one line per forward (same latch rule).
+_EDS_LOG_LAYER = None
 
 
 def write_routing_trace(
@@ -3424,6 +3427,28 @@ def prepare_capturable_remap(
     return remapped, src_row, num_spill
 
 
+def compare_moe_outputs(got, want) -> Tuple[str, float, float]:
+    """D-Mini-Extend metal check: ``(verdict, max_abs, scale)`` of two MoE
+    outputs. MATCH = bit-identical; MATCH~fp = the same non-finite pattern
+    and every finite difference within 2^-5 of the reference's largest
+    magnitude (fp rounding of another summation order); else MISMATCH."""
+    import torch
+
+    if tuple(got.shape) != tuple(want.shape):
+        return "MISMATCH", float("inf"), 0.0
+    w = want.float()
+    fin = torch.isfinite(w)
+    scale = float(w[fin].abs().max()) if bool(fin.any()) else 0.0
+    if torch.equal(got, want):
+        return "MATCH", 0.0, scale
+    g = got.float()
+    if not torch.equal(torch.isfinite(g), fin):
+        return "MISMATCH", float("inf"), scale
+    max_abs = float((g - w)[fin].abs().max()) if bool(fin.any()) else 0.0
+    tol = max(scale * 2.0**-5, 1e-6)
+    return ("MATCH~fp" if max_abs <= tol else "MISMATCH"), max_abs, scale
+
+
 class MoEExpertOffloadCache:
     """Tensor-level wrapper around ExpertResidencyPlanner for a FusedMoE layer.
 
@@ -3442,6 +3467,11 @@ class MoEExpertOffloadCache:
     _deferred_rows = None
     #: H107: armed by run_eager_pool for one eager forward (set per instance)
     _eager_lru_armed = False
+    #: D-Mini-Extend: device-planned eager step on/off, metal checks left, and
+    #: the graph form's id limit (None = not derived yet; set per instance)
+    _pool_eager_device_step = False
+    _pool_eager_device_checks = 0
+    _pool_eager_device_limit = None
 
     #: names of the stacked per-expert tensors to pool/fetch (dim 0 == expert).
     EXPERT_TENSOR_ATTRS = (
@@ -3699,6 +3729,12 @@ class MoEExpertOffloadCache:
         # H107: the expert-major eager forward reads warm LRU rows instead of
         # fetching them again (SGLANG_OPT_MOE_POOL_EAGER_LRU_HITS).
         self._pool_eager_lru_hits = bool(envs.SGLANG_OPT_MOE_POOL_EAGER_LRU_HITS.get())
+        # D-Mini-Extend: small eager forwards take the decode's device step
+        # (SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP) + its metal check budget
+        self._pool_eager_device_step = bool(envs.SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP.get())
+        self._pool_eager_device_checks = max(
+            0, int(envs.SGLANG_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK.get() or 0)
+        )
         # per eager forward: armed by run_eager_pool, the hit rows the sync
         # stamps as used (row -> expert)
         self._eager_lru_armed = False
@@ -4818,8 +4854,162 @@ class MoEExpertOffloadCache:
 
     def run_eager_pool(self, dispatch_output, apply_fn):
         """An eager forward (extend, uncaptured shape) under the pool mode, the
-        FusedMoE branch in one place: record the rows run_waves writes, split
-        in the pool's eager order (SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR,
+        FusedMoE branch in one place.
+
+        D-Mini-Extend (SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP): a forward whose
+        routed ids fit the widest captured decode step runs that step's
+        device plan (``_run_eager_device_step``) -- the misses are the same,
+        the host plan and the per-layer syncs are gone. Everything else, and
+        every forward with a host-side routing instrument, plans on the host
+        (``_run_eager_host_plan``)."""
+        n_ids = int(dispatch_output.topk_output.topk_ids.numel())
+        waves, _reason = self.eager_device_waves(n_ids)
+        if waves:
+            return self._run_eager_device_step(dispatch_output, apply_fn, waves)
+        return self._run_eager_host_plan(dispatch_output, apply_fn)
+
+    def eager_device_limit(self) -> int:
+        """D-Mini-Extend: the most routed ids an eager forward may hand the
+        device step -- the widest CAPTURED decode step of this boot (graph
+        form: max graph bs x MTP verify rows x top-k), never above the step
+        buffers' width. No new width, no new kernel, no VRAM."""
+        if self._pool_eager_device_limit is None:
+            width = int(self._pool_buffers.gather_src.shape[0])
+            graph = self._pool_max_step_ids()
+            self._pool_eager_device_limit = width if graph is None else min(width, int(graph))
+        return int(self._pool_eager_device_limit)
+
+    def eager_device_waves(self, n_ids: int) -> Tuple[int, str]:
+        """D-Mini-Extend: ``(waves, reason)`` -- the device step's wave count
+        for an eager forward of ``n_ids`` routed ids, or 0 and why the host
+        plans it. The bound is the captured step's own: ``min(ids, E - R) <=
+        waves x (LRU + staging)`` over the rows ON now, with ``waves`` <=
+        SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES (1 when off). Host ints only."""
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_pool_device import (
+            pool_row_capacity,
+            pool_waves_for,
+            resident_count,
+        )
+
+        if not self._pool_eager_device_step:
+            return 0, "switch_off"
+        if not self._pool_ready:
+            return 0, "pool_not_ready"
+        if n_ids <= 0:
+            return 0, "empty"
+        if (
+            self._route_note
+            or getattr(self, "_router_stats", None) is not None
+            or getattr(self, "_heat", None) is not None
+            or (getattr(self, "_hot_enabled", False) and not getattr(self, "_hot_frozen", True))
+        ):
+            return 0, "host_instrument"  # they read the routing on the host
+        if n_ids > self.eager_device_limit():
+            return 0, "over_graph_form"
+        t = self._pool_tables
+        need = pool_waves_for(n_ids, t.num_experts, resident_count(t), pool_row_capacity(t, 0))
+        cap = max(1, int(envs.SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES.get() or 0))
+        if need > cap:
+            return 0, "waves_cap"
+        return need, "device"
+
+    def _run_eager_device_step(self, dispatch_output, apply_fn, waves: int):
+        """D-Mini-Extend: the eager forward on the decode graph's device plan
+        (``prepare_pool`` / ``run_pool_waves``), run eagerly -- plan and row
+        copies on the device, the LRU updated by the step's own rule, nothing
+        republished from the host. Deferred rows land first and the resume
+        warm drops this layer, exactly as on the host plan."""
+        self.land_deferred_rows()  # H31b: the layout is the full one before the step
+        resume_warm().eager_reached(self)  # RW: an eager layer never waits for the warm
+        check = self._pool_eager_device_checks > 0
+        saved = None
+        if check:
+            # the reference must see the MoE input this forward saw
+            scale_in = dispatch_output.hidden_states_scale
+            saved = dispatch_output._replace(
+                hidden_states=dispatch_output.hidden_states.clone(),
+                hidden_states_scale=(
+                    scale_in.clone() if hasattr(scale_in, "clone") else scale_in
+                ),
+            )
+        prev_on = getattr(self, "_pool_capture_on", 0)
+        self._pool_capture_on = 0  # not a capture: the rows ON now
+        try:
+            if waves > 1:
+                out = self.run_pool_waves(dispatch_output, apply_fn, waves)
+            else:
+                topk_output = dispatch_output.topk_output
+                remapped = self.prepare_pool(topk_output.topk_ids)
+                out = apply_fn(
+                    dispatch_output._replace(
+                        topk_output=topk_output._replace(topk_ids=remapped)
+                    )
+                )
+        finally:
+            self._pool_capture_on = prev_on
+        topk_ids = dispatch_output.topk_output.topk_ids
+        self._note_eager_device_step(int(topk_ids.shape[0]), int(topk_ids.numel()), waves)
+        if check:
+            self._pool_eager_device_checks -= 1
+            out = self._check_eager_device_step(saved, apply_fn, out, waves)
+        return out
+
+    def _note_eager_device_step(self, tokens: int, n_ids: int, waves: int) -> None:
+        """Metal marker, one line per forward on one representative layer."""
+        import logging
+
+        global _EDS_LOG_LAYER
+
+        self._eager_device_steps = int(getattr(self, "_eager_device_steps", 0)) + 1
+        layer_id = getattr(self.layer, "layer_id", "?")
+        if _EDS_LOG_LAYER is None:
+            _EDS_LOG_LAYER = layer_id
+        logging.getLogger(__name__).log(
+            logging.INFO if layer_id == _EDS_LOG_LAYER else logging.DEBUG,
+            "EAGER-DEVICE-STEP layer %s: T=%d ids=%d waves=%d limit=%d n=%d (the decode's "
+            "device-planned pool step on an eager forward: no host plan, no per-layer "
+            "sync; SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP)",
+            layer_id, tokens, n_ids, waves, self.eager_device_limit(),
+            self._eager_device_steps,
+        )
+
+    def _check_eager_device_step(self, saved, apply_fn, out, waves: int):
+        """SGLANG_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK: the same forward on the
+        plain host plan (H107 off -- every spill expert fetched fresh from
+        the host store, no device table trusted) is the reference. MATCH
+        (bit-identical) or MATCH~fp (fp rounding, e.g. a multi-wave
+        reference) logs; anything else stops the rank by name. Returns the
+        device result (a copy: the reference's apply may reuse buffers)."""
+        import logging
+
+        got = out.hidden_states.clone()
+        lru = self._pool_eager_lru_hits
+        self._pool_eager_lru_hits = False
+        try:
+            ref = self._run_eager_host_plan(saved, apply_fn)
+        finally:
+            self._pool_eager_lru_hits = lru
+        verdict, max_abs, scale = compare_moe_outputs(got, ref.hidden_states)
+        layer_id = getattr(self.layer, "layer_id", "?")
+        tokens = int(saved.topk_output.topk_ids.shape[0])
+        if verdict == "MISMATCH":
+            raise RuntimeError(
+                f"EAGER-DEVICE-STEP MISMATCH layer {layer_id}: T={tokens} waves={waves} "
+                f"max_abs={max_abs:.6g} scale={scale:.6g} -- the device-planned eager "
+                f"step's MoE output differs from the host plan's beyond fp rounding; "
+                f"SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP=0 restores the host plan"
+            )
+        logging.getLogger(__name__).info(
+            "EAGER-DEVICE-STEP CHECK layer %s: T=%d waves=%d verdict=%s max_abs=%.3g "
+            "scale=%.3g (reference: plain host plan, fresh fetch)",
+            layer_id, tokens, waves, verdict, max_abs, scale,
+        )
+        return out._replace(hidden_states=got)
+
+    def _run_eager_host_plan(self, dispatch_output, apply_fn):
+        """The host-planned eager forward: record the rows run_waves writes,
+        split in the pool's eager order (SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR,
         H12: expert-major -- each spill expert fetched once and held by one
         row), then republish those rows to the device tables."""
         self.land_deferred_rows()  # H31b: run_waves plans with every resident row
