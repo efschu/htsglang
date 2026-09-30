@@ -116,6 +116,16 @@ class InsertResult:
     #: at (the fetched span was already in the tree) -- set whether or not it
     #: carries a host KV copy; ``inserted_host_node`` keeps its meaning.
     matched_end_node: Any = None
+    #: y5h (30.09.): the read's own KV host rows and page hashes for exactly
+    #: ``matched_end_node``'s span, set only when that node carries no Full
+    #: host copy. PREFETCH ANCHOR ATTACH may adopt them as the node's host
+    #: copy (aux host requires Full host); the caller then keeps them.
+    matched_end_host_kv: Any = None
+    matched_end_hashes: Any = None
+    #: y5h: tokens of the matched head the tree adopted that way -- the tail
+    #: ``[prefix_len - anchor_adopted_tokens, prefix_len)`` of the read's rows
+    #: is the tree's now and must not be released with the head.
+    anchor_adopted_tokens: int = 0
 
     #: #841: the host-only insert declined to adopt the fetched tail because
     #: attaching it would have broken the contiguous-backup law (see
