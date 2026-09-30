@@ -237,7 +237,10 @@ def _front(ipc: Optional[dict]) -> dict:
 
 
 def _flip_first_work(ipc, direction: str):
-    rows = [_data(e) for e in _ev(ipc, "flip_first_work") if _data(e).get("dir") == direction]
+    # what="none" (8654c4e647): the flip ended without work -- never a Flipzeit (P-Ende -> erstes Token),
+    # even when an older front still set flip_time_ms there
+    rows = [_data(e) for e in _ev(ipc, "flip_first_work") if _data(e).get("dir") == direction
+            and _data(e).get("what") != "none"]
     if not rows:
         return None
     ms = [float(r["flip_time_ms"]) for r in rows if r.get("flip_time_ms") is not None]

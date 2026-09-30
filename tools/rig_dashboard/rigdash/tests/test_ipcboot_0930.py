@@ -27,7 +27,8 @@ PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def rec(g, ts, pnew=0, pcached=0, pchunks=0, pcomp=0.0, dtok=0, rounds=0, dgpu=0.0, running=None, kv=None):
     return {"schema": "weg2.rankstats/1", "group": g, "ts": ts,
-            "prefill": {"new_tokens": pnew, "cached_tokens": pcached, "chunks": pchunks, "compute_ms": pcomp},
+            "prefill": {"new_tokens": pnew, "cached_tokens": pcached, "chunks": pchunks, "compute_ms": pcomp,
+                        "last": {"t": ts, "gpu_ms": 1000.0, "new": 1000} if pchunks else None},
             "decode": {"tokens": dtok, "rounds": rounds, "gpu_ms": dgpu, "running": running,
                        "accept_len_ewma": 2.5, "gpu_ms_by_bs": {"1": [10, 400.0]}},
             "sched": {"full_token_usage": kv, "queue_req": 0}, "cap": {"kv_tokens": 1000, "seats": 6}}
@@ -117,7 +118,7 @@ class TestNoLogOpened(unittest.TestCase):
                 opened.append(str(path))
                 return real(path, *a, **k)
             ib = ipcboot.IpcBoots(roots=(root,))
-            hr = history.Recorder(history.HistoryDB(None), None, ipc=ipcboot.ipcstate.IpcStates((root,)))
+            hr = history.Recorder(history.HistoryDB(None), ib)
             import time
             now = time.time()
             builtins.open = spy

@@ -24,7 +24,7 @@ import time
 from collections import deque
 from typing import Dict, List, Optional, Tuple
 
-from . import ipcfields, ipcstate, stops
+from . import activity, ipcfields, ipcstate, stops
 
 SAMPLE_S = 1.0
 RING_S = 16 * 60.0
@@ -70,6 +70,9 @@ def compact(rec: dict) -> dict:
         "pchunks": _n(pre.get("chunks")),
         "pcomp": first(_n(pre.get("compute_ms")), _n(pre.get("gpu_ms"))),
         "plast_t": _n((pre.get("last") or {}).get("t")) if isinstance(pre.get("last"), dict) else None,
+        "plast_gpu": _n((pre.get("last") or {}).get("gpu_ms")) if isinstance(pre.get("last"), dict) else None,
+        "last_bs": _n(dec.get("last_bs")),
+        "si_del": _n(cache.get("store_incomplete_delivered")), "si_deliv": _n(cache.get("store_incomplete_deliverable")),
         "dtok": first(_n(dec.get("tokens")), _n(tok.get("decode_total"))),
         "rounds": _n(dec.get("rounds")),
         "dgpu": _n(dec.get("gpu_ms")),
@@ -93,7 +96,7 @@ def compact(rec: dict) -> dict:
 
 def _front_small(front: dict) -> dict:
     keep = ("state", "awake", "queue", "outstanding", "served", "served_tokens", "d_phase_n", "d_parked_n",
-            "d_seats", "epoch", "ts")
+            "d_seats", "d_cached_tokens", "epoch", "ts")
     return {k: front.get(k) for k in keep if k in (front or {})}
 
 
@@ -172,143 +175,147 @@ def one_s(ps, f: str, now: float) -> float:
 
 # ----------------------------------------------------------------------------- the view parts
 
-def _prefill_burst(ring, keys, g, ps) -> Optional[dict]:
-    if not ps:
-        return None
-    t0, t1 = ps[0][0], ps[-1][1]
-    tok, chunks, cached = _sum(ps, "pnew"), _sum(ps, "pchunks"), _sum(ps, "pcached")
-    wall = sum(_dts(p) for p in ps)
-    ranks = {}
+LIVE_BURST_S = 6.0      # a prefill burst whose last chunk ended this recently is "running"
+
+
+def _rank_gpu_rates(ring, keys, g, t0, t1) -> Dict[str, dict]:
+    """GPU rate per rank over the chunks that ended in [t0, t1]: Δnew / Δcompute_ms (rank's own time)."""
+    out = {}
     for k in sorted(x for x in keys if _grp(x) == g):
-        rp = [p for p in pairs(ring, k) if p[0] >= t0 - 0.5 and p[1] <= t1 + 0.5]
-        n, ms = _sum(rp, "pnew"), _sum(rp, "pcomp")
-        if ms > 0:
-            ranks[k.split(".", 1)[1]] = {"tps": n / (ms / 1000.0)}
-    gpu = min((r["tps"] for r in ranks.values()), default=None)
-    return {"tokens": tok, "chunks": chunks, "cached": cached, "mean_chunk": (tok / chunks) if chunks else None,
-            "wall_s": wall, "wall_tps": (tok / wall) if wall > 0 else None, "ranks": ranks, "tps_gpu": gpu,
-            "tps": gpu, "wall_confounded_tps": None}
+        n = ms = 0.0
+        for a, b in activity.rank_pairs(ring, k):
+            e = b.get("plast_t") or b["ts"]
+            if t0 - 0.5 <= e <= t1 + 0.5:
+                n += _d(b, a, "pnew") or 0.0
+                ms += _d(b, a, "pcomp") or 0.0
+        if ms > 0 and n > 0:
+            out[k.split(".", 1)[1]] = {"tps": n / (ms / 1000.0)}
+    return out
 
 
-def prefill_view(ring, keys, g, now) -> Optional[dict]:
-    k = first_key(keys, g)
-    if k is None:
+def _burst_dict(ring, keys, g, b) -> dict:
+    ranks = _rank_gpu_rates(ring, keys, g, b["s"], b["e"])
+    gpu = min((r["tps"] for r in ranks.values()), default=None) if b["tok"] >= activity.MIN_RATE_TOK else None
+    return {"tokens": b["tok"], "chunks": b["n"], "cached": b["cached"], "mean_chunk": (b["tok"] / b["n"]) if b["n"] else None,
+            "wall_s": b["wall_s"], "wall_tps": b["rate"], "ranks": ranks, "tps_gpu": gpu, "tps": b["rate"],
+            "t0": b["s"], "t1": b["e"]}
+
+
+def prefill_view(m: "activity.Model", g: str, now: float) -> Optional[dict]:
+    """Prefill tile.  Rates only over the time the chunks ran (activity.py): the running or last burst
+    (P-Ende wall clock: first chunk's start on the first stage -> last chunk's end on the last stage),
+    the best burst of the ring, and the chunks that ended in the last 60 s."""
+    cs = m.pchunks.get(g)
+    if cs is None:
         return None
-    ps = pairs(ring, k)
-    win = [p for p in ps if p[1] >= now - WINDOW_S]
-    act = [p for p in win if (_d(p[3], p[2], "pnew") or 0) > 0]
-    last = ring[-1]["r"].get(k) or {}
-    return {"window_s": WINDOW_S, "one_s": one_s(ps, "pnew", now), "max3s_120": max3(ps, "pnew", now),
-            "now": _prefill_burst(ring, keys, g, act) if act else None,
-            "last_burst": _prefill_burst(ring, keys, g, burst_of(ps, "pnew")),
-            "last_t": last.get("plast_t"), "queue": last.get("queue"), "pending_tok": last.get("pending")}
+    bs = activity.bursts(cs)
+    last = bs[-1] if bs else None
+    running = last is not None and now - last["e"] <= LIVE_BURST_S
+    win = [c for c in cs if c["e0"] >= now - WINDOW_S]
+    wb = activity.bursts(win)
+    wtok = sum(b["tok"] for b in wb)
+    wwall = sum(b["wall_s"] for b in wb)
+    rated = [b["rate"] for b in bs if b["rate"] is not None]
+    k0, _ = activity.stage_keys(m.keys, g)
+    lastrec = (m.ring[-1]["r"].get(k0) if m.ring and k0 else None) or {}
+    return {"window_s": WINDOW_S,
+            "one_s": (last["rate"] or 0.0) if running else 0.0,
+            "max3s_120": max(rated) if rated else None,
+            "now": ({"tokens": wtok, "chunks": sum(b["n"] for b in wb), "cached": sum(b["cached"] for b in wb),
+                     "mean_chunk": wtok / max(1, sum(b["n"] for b in wb)), "wall_s": wwall,
+                     "wall_tps": (wtok / wwall) if wwall > 0 and wtok >= activity.MIN_RATE_TOK else None,
+                     "ranks": _rank_gpu_rates(m.ring, m.keys, g, now - WINDOW_S, now),
+                     "tps_gpu": min((r["tps"] for r in _rank_gpu_rates(m.ring, m.keys, g, now - WINDOW_S, now).values()),
+                                    default=None) if wtok >= activity.MIN_RATE_TOK else None}
+                    if wb else None),
+            "last_burst": _burst_dict(m.ring, m.keys, g, last) if last else None,
+            "last_t": last["e"] if last else None, "queue": lastrec.get("queue"), "pending_tok": lastrec.get("pending"),
+            "instrument": "Chunks zur Rechenzeit (prefill.last t/gpu_ms), Schub = erster Chunk-Start PP0 bis letztes Chunk-Ende letzte Stufe"}
 
 
-def decode_view(ring, keys, g, front, now) -> Optional[dict]:
-    k = first_key(keys, g)
-    if k is None:
+def decode_view(m: "activity.Model", g: str, front, now: float) -> Optional[dict]:
+    if g != m.dec_group:
         return None
-    ps = pairs(ring, k)
-    last = ring[-1]["r"].get(k) or {}
-    if not ps and not last.get("dtok"):
+    k, _ = activity.stage_keys(m.keys, g)
+    last = (m.ring[-1]["r"].get(k) if m.ring else None) or {}
+    iv = m.dec
+    if not iv and not last.get("dtok"):
         return None
-    win = [p for p in ps if p[1] >= now - WINDOW_S]
-    act = [p for p in win if (_d(p[3], p[2], "dtok") or 0) > 0]
-    rate = lambda xs: (_sum(xs, "dtok") / sum(_dts(p) for p in xs)) if xs else None  # noqa: E731
-    gms = _sum(act, "dgpu")
-    lb = burst_of(ps, "dtok")
+    win = [x for x in iv if x["e"] >= now - WINDOW_S]
+    # the rate while decoding: steady intervals only (decode before and after) -- the first and the
+    # last interval of a stretch hold idle time the sample cannot place
+    sw = [x for x in win if x["steady"]] or win
+    tok, dur = sum(x["tok"] for x in sw), sum(x["dur"] for x in sw)
+    st = activity.decode_stretches(iv)
+    lastst = st[-1] if st else None
+    streams = [x["stream"] for x in win if x["stream"] is not None]
+    cur = iv[-1] if iv and now - iv[-1]["e"] <= 3 * SAMPLE_S else None
+    best, acc_t, acc_d = None, 0.0, 0.0
+    for x in iv:                       # best 3-s stretch of the last 120 s, over decode time only
+        if x["e"] < now - MAX3_WIN_S:
+            continue
+        acc_t += x["tok"]
+        acc_d += x["dur"]
+        if acc_d >= MAX3_S:
+            r = acc_t / acc_d
+            best = r if best is None or r > best else best
+            acc_t = acc_d = 0.0
+    gms = sum((x.get("gpu_ms") or 0.0) for x in sw)
     by_bs = {str(bs): {"median_ms": round(v[1] / v[0], 1), "n": int(v[0]), "stat": "Mittel"}
              for bs, v in sorted((last.get("by_bs") or {}).items(), key=lambda x: int(x[0]))
              if isinstance(v, (list, tuple)) and len(v) == 2 and v[0]}
     seats = (front or {}).get("d_seats")
     if not seats and (front or {}).get("d_phase_n") is not None:
         seats = {"n": front.get("d_phase_n"), "parked_n": front.get("d_parked_n"), "cap": last.get("cap_seats")}
-    return {"window_s": WINDOW_S, "gen_tps": rate(act), "gen_tps_last": rate(lb) if lb else None,
-            "rows": len(act), "last_t": lb[-1][1] if lb else None, "one_s": one_s(ps, "dtok", now),
-            "max3s_120": max3(ps, "dtok", now), "running": last.get("running"), "accept_len": last.get("acc_len"),
+    return {"window_s": WINDOW_S, "gen_tps": (tok / dur) if dur >= 2.0 else None,
+            "gen_tps_last": lastst["rate"] if lastst else None, "rows": len(win),
+            "last_t": lastst["e"] if lastst else None,
+            "one_s": (cur["tok"] / cur["dur"]) if cur else 0.0, "max3s_120": best,
+            "per_stream": (sum(streams) / len(streams)) if streams else None, "per_stream_n": len(streams),
+            "running": last.get("running"), "last_bs": last.get("last_bs"), "accept_len": last.get("acc_len"),
             "accept_rate": last.get("acc_rate"), "cuda_graph": last.get("cuda_graph"), "full_use": last.get("kv"),
             "queue_req": last.get("queue"), "max_running": last.get("cap_seats"),
-            "max_total_tokens": last.get("cap_kv"), "seats": seats or None, "round_bs": None,
-            "compute_tps": (_sum(act, "dtok") / (gms / 1000.0)) if gms > 0 else None, "round_ms_by_bs": by_bs}
+            "max_total_tokens": last.get("cap_kv"), "seats": seats or None,
+            "round_bs": {"bs": last.get("last_bs")} if last.get("last_bs") is not None else None,
+            "compute_tps": (tok / (gms / 1000.0)) if gms > 0 and dur >= 2.0 else None, "round_ms_by_bs": by_bs}
 
 
-def series_view(ring, keys, groups, now) -> dict:
+def series_view(m: "activity.Model", now: float) -> dict:
     n = int(SPAN_S // BUCKET_S)
     t0 = (now // BUCKET_S) * BUCKET_S - (n - 1) * BUCKET_S
-    ts = [t0 + i * BUCKET_S for i in range(n)]
-    start = ring[0]["t"] if ring else now
-    out = {"t": ts}
-    for g in groups:
-        for f, name in (("pnew", "prefill"), ("dtok", "decode")):
-            k = first_key(keys, g)
-            if k is None or (name == "decode" and g == "P"):
-                continue
-            acc = [None if t + BUCKET_S <= start else 0.0 for t in ts]
-            for p in pairs(ring, k):
-                i = int((p[1] - t0) // BUCKET_S)
-                if 0 <= i < n and acc[i] is not None:
-                    acc[i] += _d(p[3], p[2], f) or 0.0
-            out["%s_%s_tps" % (g, name)] = [None if v is None else v / BUCKET_S for v in acc]
+    b = m.buckets(t0, n, BUCKET_S)
+    out = {"t": [t0 + i * BUCKET_S for i in range(n)]}
+    if "P" in m.pchunks or "single" in m.pchunks:
+        out[("P" if "P" in m.pchunks else "single") + "_prefill_tps"] = b["p_tps"]
+    if "D" in m.pchunks:
+        out["D_prefill_tps"] = b["d_tps"]
+    if m.dec_group:
+        out[m.dec_group + "_decode_tps"] = b["dec_tps"]
     return out
 
 
-def timeline_view(ring, keys, groups, flip_done, live, now) -> dict:
-    """Phase bar from the samples: per sample step the class that worked (P prefill, D prefill,
-    decode) or idle (with the awake group); flips painted from flip_done events (begin -> done)."""
-    kP = first_key(keys, "P") or first_key(keys, "single")
-    kD = first_key(keys, "D")
-    kdec = kD or first_key(keys, "single")
-    by_t = {}
-    for key, cls, f in ((kP, "P", "pnew"), (kD, "D", "pnew"), (kdec, "dec", "dtok")):
-        if key is None:
-            continue
-        for p in pairs(ring, key):
-            d = _d(p[3], p[2], f) or 0.0
-            if d > 0:
-                cur = by_t.setdefault((p[0], p[1]), {})
-                cur[cls] = cur.get(cls, 0.0) + d
-    segs: List[dict] = []
-    samples = list(ring)
-    for a, b in zip(samples, samples[1:]):
-        if b["t"] < now - SPAN_S:
-            continue
-        work = by_t.get((a["t"], b["t"]), {})
-        k = "P" if work.get("P") else "D" if work.get("D") else "dec" if work.get("dec") else "idle"
-        awake = (b.get("front") or {}).get("awake")
-        tok = work.get(k, 0.0)
-        if segs and segs[-1]["k"] == k and abs(segs[-1]["e"] - a["t"]) < 3 * SAMPLE_S and \
-                (k != "idle" or segs[-1].get("awake") == awake):
-            segs[-1]["e"] = b["t"]
-            segs[-1]["tok"] += tok
-            segs[-1]["n"] += 1
-        else:
-            segs.append({"s": a["t"], "e": b["t"], "k": k, "tok": tok, "n": 1, "awake": awake if k == "idle" else None})
-    for fd in flip_done or []:
-        s, e = fd.get("flip_begin_ts"), fd.get("t")
-        if s is None or e is None or e < now - SPAN_S:
-            continue
-        out = []
-        for x in segs:
-            if x["e"] <= s or x["s"] >= e:
-                out.append(x)
-                continue
-            if x["s"] < s:
-                out.append(dict(x, e=s))
-            if x["e"] > e:
-                out.append(dict(x, s=e))
-        out.append({"s": s, "e": e, "k": "flip", "total_ms": fd.get("flip_ms"), "drain_ms": fd.get("drain_quiesce_ms"),
-                    "slept": fd.get("sleep"), "woke": fd.get("wake"), "n": 0, "tok": 0})
-        segs = sorted(out, key=lambda x: x["s"])
+def timeline_view(m: "activity.Model", live: bool, awake_now, now: float) -> dict:
+    """Phase bar: the non-overlapping segments of activity.Model; idle stretches name the group that
+    was awake then (flip_done events: the woken group from the flip on)."""
+    segs = [dict(x) for x in m.segments() if x["e"] >= now - SPAN_S]
+    src = {"P": m.pchunks.get("P", []) + m.pchunks.get("single", []), "D": m.pchunks.get("D", []), "dec": m.dec}
     for x in segs:
-        dur = max(1e-6, x["e"] - x["s"])
-        if x["k"] in ("P", "D", "dec"):
-            x["tps"] = x["tok"] / dur
-            if x["k"] == "dec":
-                x["rounds"] = None
-    if segs and live and segs[-1]["k"] != "flip":
-        segs[-1]["running"] = True
-    t1 = now if live or not ring else ring[-1]["t"]
-    return {"segs": segs, "span_s": SPAN_S, "t1": t1}
+        if x["k"] in src:
+            tok = activity.spread(src[x["k"]], x["s"], 1, max(1e-3, x["e"] - x["s"]))[0]
+            x["tok"] = tok
+            x["tps"] = tok / max(1e-3, x["e"] - x["s"])
+            x["n"] = 1
+    out, prev = [], (now - SPAN_S)
+    for x in segs:
+        if x["s"] > prev + 0.05:
+            out.append({"s": prev, "e": x["s"], "k": "idle", "awake": m.awake_at(prev, awake_now)})
+        out.append(x)
+        prev = max(prev, x["e"])
+    end = now if live else (m.ring[-1]["t"] if m.ring else now)
+    if end > prev + 0.05:
+        out.append({"s": prev, "e": end, "k": "idle", "awake": m.awake_at(prev, awake_now), "running": live})
+    return {"segs": [x for x in out if x["e"] > now - SPAN_S], "span_s": SPAN_S, "t1": end if not live else now,
+            "overlap": m.overlap_s()}
 
 
 def _q(xs, p):
@@ -320,8 +327,10 @@ def flip_times_view(first_work: List[dict], flip_done: List[dict], is_27b: bool)
     out = {"instruments": INSTRUMENTS,
            "headline": "flip_total" if is_27b and not FIRST_TOKEN_HEADLINE_FOR_27B else "first_token"}
     for d in ("P>D", "D>P"):
-        fw = sorted((x for x in first_work if x.get("dir") == d and x.get("flip_time_ms") is not None),
-                    key=lambda x: x.get("flip_begin_ts") or 0)
+        allfw = [x for x in first_work if x.get("dir") == d and x.get("flip_time_ms") is not None]
+        # what="none" (8654c4e647): the flip ended without work after it -- no "bis erstes Token" time
+        fw = sorted((x for x in allfw if x.get("what") != "none"), key=lambda x: x.get("flip_begin_ts") or 0)
+        no_work = len(allfw) - len(fw)
         sl, wk = d.split(">")
         fd = [x for x in flip_done if x.get("sleep") == sl and x.get("wake") == wk and x.get("flip_ms") is not None]
         vals = [float(x["flip_time_ms"]) for x in fw]
@@ -329,11 +338,11 @@ def flip_times_view(first_work: List[dict], flip_done: List[dict], is_27b: bool)
         out[d] = {"n": len(vals), "last": vals[-1] if vals else None, "last_t": fw[-1].get("flip_begin_ts") if fw else None,
                   "median": _q(vals, 0.5), "p90": _q(vals, 0.9), "resolution_s": 0.001, "open": False,
                   "src": "IPC flip_first_work (%s)" % (fw[-1].get("what") or "?") if fw else None,
-                  "layer_n": len(lay), "layer_newest": lay[-1] if lay else None,
+                  "no_work": no_work, "layer_n": len(lay), "layer_newest": lay[-1] if lay else None,
                   "layer_median": _q(lay, 0.5), "layer_p90": _q(lay, 0.9)}
     done_by_begin = {round(x.get("flip_begin_ts") or 0, 1): x for x in flip_done}
     recent = []
-    for x in sorted(first_work, key=lambda x: x.get("flip_begin_ts") or 0)[-24:]:
+    for x in sorted((x for x in first_work if x.get("what") != "none"), key=lambda x: x.get("flip_begin_ts") or 0)[-24:]:
         fd = done_by_begin.get(round(x.get("flip_begin_ts") or 0, 1)) or {}
         recent.append({"t": x.get("flip_begin_ts"), "dir": x.get("dir"), "ms": x.get("flip_time_ms"),
                        "layer_ms": fd.get("flip_ms"), "state": "ok", "src": "ipc"})
@@ -391,9 +400,15 @@ def cache_view(ring, keys, now) -> dict:
         b = {"chunks": r.get("pchunks"), "cached": bc, "new": bn, "hit_share": bc / (bc + bn) if bc + bn else None,
              "loadback_n": r.get("lb_n"), "loadback_tok": r.get("lb_tok"),
              "l2_share": (r.get("lb_tok") or 0) / (bc + bn) if bc + bn and r.get("lb_tok") else None,
-             "mamba_n": r.get("mamba_n"), "l3inc_n": r.get("l3inc_n"), "l3inc_share": None,
+             "mamba_n": r.get("mamba_n"), "l3inc_n": r.get("l3inc_n"),
+             "l3inc_share": (r["si_del"] / r["si_deliv"]) if r.get("si_del") is not None and r.get("si_deliv") else None,
+             "l3inc_delivered": r.get("si_del"), "l3inc_deliverable": r.get("si_deliv"),
              "prefetch_refused": r.get("pf_refused"), "prefetch_timeout": r.get("pf_timeout")}
         out[g] = {"window": w, "boot": b}
+    dct = (last.get("front") or {}).get("d_cached_tokens")
+    if isinstance(dct, dict) and "D" in out:
+        out["D"]["boot"]["handoff"] = dct.get("handoff")
+        out["D"]["boot"]["d_prefix_hit"] = dct.get("d_prefix_hit")
     st_now = ((last.get("front") or {}).get("served_tokens")) or {}
     old = next((s for s in ring if s["t"] >= now - WINDOW_S), None)
     st_old = ((old or {}).get("front") or {}).get("served_tokens") or {}
@@ -448,6 +463,16 @@ def ring_rates(ring) -> dict:
 FLIP_KEYS = ("B1", "B2", "B3", "B4", "B5", "B6", "B7", "D3", "F3")
 
 
+def _awake(m: "activity.Model", front: dict):
+    """Awake group now: the woken group of the newest flip_done (events), else the front mirror."""
+    return (front or {}).get("awake")
+
+
+def flip_done_of(ipc: dict) -> List[dict]:
+    return [dict(e.get("data") or {}, t=(e.get("data") or {}).get("t") or e.get("ts"))
+            for e in (ipc.get("ipc_events") or []) if e.get("type") == "flip_done"]
+
+
 def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float) -> dict:
     """One boot card from its IPC alone.  Pure over its inputs."""
     ring = list(ring or [])
@@ -470,6 +495,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float) -> dict:
     tag = ipc.get("tag") or ""
     is27 = "27b" in (model + " " + tag + " " + (ipc.get("dir") or "")).lower()
     fields = ipcfields.resolve(ipc, rank, {}, rates or ring_rates(ring))
+    m = activity.Model(ring, flip_done, fw)
     if not any(e.get("type") in ("flip_begin", "flip_done", "flip_first_work") for e in (ipc.get("ipc_events") or [])) \
             and not ipc.get("flip_first_work"):
         # no flip yet in this boot: the flip fields are empty, not missing a writer
@@ -515,13 +541,13 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float) -> dict:
         "last_activity": last_act,
         "last_activity_any": max([t for t in last_act.values() if t] or [0]) or None,
         "prefill": {g: pv for g in groups if g in ("P", "D", "single")
-                    for pv in [prefill_view(ring, keys, g, now)] if pv},
+                    for pv in [prefill_view(m, g, now)] if pv},
         "decode": {g: dv for g in groups if g in ("D", "single")
-                   for dv in [decode_view(ring, keys, g, front, now)] if dv},
+                   for dv in [decode_view(m, g, front, now)] if dv},
         "totals": totals_view(ring, keys, front, t0, now),
         "cache": cache_view(ring, keys, now),
-        "series": series_view(ring, keys, [g for g in groups if g in ("P", "D", "single")], now),
-        "timeline": timeline_view(ring, keys, groups, flip_done, live, now),
+        "series": series_view(m, now),
+        "timeline": timeline_view(m, live, _awake(m, front), now),
         "fields": ipcfields.for_page(fields),
         "fields_summary": ipcfields.summary(fields),
         "end": stops.classify_ipc(ipc),
@@ -602,23 +628,29 @@ class IpcBoots:
         views.sort(key=lambda v: (not v["live"], not v["primary"], v["age_s"] if v["age_s"] is not None else 1e12))
         return views
 
-    def activity(self, key: str, start: float, n: int, bs: float) -> List[dict]:
-        """Per bucket which class computed and how many tokens (energy.EnergyBook), from the ring."""
-        out = [{"P": False, "D": False, "dec": False, "P_tok": 0, "D_tok": 0, "dec_tok": 0} for _ in range(n)]
+    def model(self, key: str) -> Optional["activity.Model"]:
         with self.lock:
             ring = list(self.rings.get(key) or ())
-        keys = set()
-        for s in ring:
-            keys.update(s["r"].keys())
-        for g, cls, f in (("P", "P", "pnew"), ("single", "P", "pnew"), ("D", "D", "pnew"),
-                          ("D", "dec", "dtok"), ("single", "dec", "dtok")):
-            k = first_key(keys, g)
-            if k is None:
-                continue
-            for p in pairs(ring, k):
-                i = int((p[1] - start) // bs)
-                d = _d(p[3], p[2], f) or 0.0
-                if 0 <= i < n and d > 0:
+        if not ring:
+            return None
+        with self.ipc.lock:
+            d = next((d for d, st in self.ipc._st.items() if (st.get("boot_id") or d) == key), None)
+            st = self.ipc._st.get(d) if d else None
+        ipc = ipcstate.boot_view(d, st, self.ipc._ev.get(d), time.time()) if st else {}
+        return activity.Model(ring, flip_done_of(ipc), list(ipc.get("flip_first_work") or []))
+
+    def activity(self, key: str, start: float, n: int, bs: float) -> List[dict]:
+        """Per bucket which class computed and how many tokens (energy.EnergyBook): the work at the
+        time it was done (activity.Model), not at the sample that saw the counter move."""
+        out = [{"P": False, "D": False, "dec": False, "P_tok": 0, "D_tok": 0, "dec_tok": 0} for _ in range(n)]
+        m = self.model(key)
+        if m is None:
+            return out
+        b = m.buckets(start, n, bs)
+        for i in range(n):
+            for cls, k in (("P", "p_tps"), ("D", "d_tps"), ("dec", "dec_tps")):
+                v = b[k][i] or 0.0
+                if v > 0:
                     out[i][cls] = True
-                    out[i][cls + "_tok"] += int(d)
+                    out[i][cls + "_tok"] = int(round(v * bs))
         return out

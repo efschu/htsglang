@@ -180,7 +180,7 @@ class App:
         self.stop = threading.Event()
         # DASHBOARD-GRAFIKEN: the persistent history of the Grafana-style panels (history.py)
         self.hist = history.HistoryDB(os.path.join(args.state_dir, "history.sqlite") if args.state_dir else None)
-        self.hist_rec = history.Recorder(self.hist, None, cfg["docker_ssh"])
+        self.hist_rec = history.Recorder(self.hist, self.boots, cfg["docker_ssh"])
         self.t0 = time.time()
         self.version = _version()
         self.edition = getattr(args, "edition", "rig") or "rig"

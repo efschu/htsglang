@@ -529,22 +529,16 @@ function kv(rows) {
 
 // the 60-s figure and, in the same size under it, the 1-s live rate; 0 is normal
 // (only one phase runs at a time): the running one is coloured, the others dimmed
-function bigPair(lbl60, v60, one, digits, extra, max3) {
-  const on = one > 0;
-  return `<div class="bigrow ${on ? "on" : "off"}" title="letzte Probe (~1 s): Delta der Rang-Zaehler (rankstats) durch die Rang-Uhr; 0 = die Phase rechnet gerade nicht"><span class="bl" style="white-space:nowrap">jetzt 1 s</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span>${extra || ""}</div>
-    <div class="bigrow" title="hoechster 3-s-Mittelwert der letzten 120 s"><span class="bl" style="white-space:nowrap">MAX 3s/120s</span><span class="big num">${max3 == null ? "–" : fmt(max3, digits) + "<small>tok/s</small>"}</span></div>
-    <div class="bigrow"><span class="bl">${lbl60}</span><span class="big num">${fmt(v60, digits)}<small>tok/s</small></span></div>`;
-}
 
 // decode: how many seats REALLY compute (bs of the newest round) against the
 // seats of this D phase (WEG2 D-PHASE-SEATS n of cap), and what waits in D's queue
 function bsBadge(d, on) {
   const rb = d.round_bs, se = d.seats || {};
   const cap = se.n != null ? se.n : d.max_running;
-  const bs = rb ? rb.bs : d.running;
+  const bs = rb && rb.bs != null ? rb.bs : d.running;
   if (bs == null) return "";
   const q = d.queue_req;
-  return `<span class="bsbadge${on ? "" : " off"}" title="laufend = decode.running (rankstats TP0)${cap != null ? "; Sitze = " + (se.n != null ? "front d_seats/d_phase_n dieser Phase (cap " + fmt(se.cap) + ")" : "--max-running-requests") : ""}; wartend = sched.queue_req (rankstats)">bs <b>${fmt(bs)}</b>${cap != null ? " / " + fmt(cap) : ""}${q ? ` <span class="q">&middot; ${fmt(q)} wartend</span>` : ""}</span>`;
+  return `<span class="bsbadge${on ? "" : " off"}" title="${rb && rb.bs != null ? "bs der j&uuml;ngsten Runde (rankstats decode.last_bs)" : "laufende Anfragen (decode.running; decode.last_bs fehlt in IPC bis zum Build mit 8654c4e647)"}${cap != null ? "; Sitze = " + (se.n != null ? "front d_seats/d_phase_n dieser Phase (cap " + fmt(se.cap) + ")" : "--max-running-requests") : ""}; wartend = sched.queue_req (rankstats)">bs <b>${fmt(bs)}</b>${cap != null ? " / " + fmt(cap) : ""}${q ? ` <span class="q">&middot; ${fmt(q)} wartend</span>` : ""}</span>`;
 }
 
 // ---- phase bar: P-Prefill / D-Prefill / Decode runs and the flips between them
@@ -676,29 +670,39 @@ function ipcRankRows(b, g, key, show) {
     .map(([r, v]) => [`${esc(r)} ${ipcTag(f.ipc_src)}`, show(v || {})]);
 }
 
+function bigPair(lbl60, v60, one, digits, extra, max3, L) {
+  // L: labels + titles per tile (prefill: bursts of chunks; decode: continuous rounds)
+  L = L || {one: "jetzt ~1 s", oneT: "letzte Probe (~1 s): Δdecode.tokens / Rang-Uhr, Flip-Fenster ausgenommen; 0 = D dekodiert gerade nicht",
+    max: "MAX 3 s / 120 s", maxT: "höchste 3-s-Rate der letzten 120 s, nur über Decode-Zeit"};
+  const on = one > 0;
+  return `<div class="bigrow ${on ? "on" : "off"}" title="${L.oneT}"><span class="bl" style="white-space:nowrap">${L.one}</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span>${extra || ""}</div>
+    <div class="bigrow" title="${L.maxT}"><span class="bl" style="white-space:nowrap">${L.max}</span><span class="big num">${max3 == null ? "–" : fmt(max3, digits) + "<small>tok/s</small>"}</span></div>
+    <div class="bigrow"><span class="bl">${lbl60}</span><span class="big num">${v60 == null ? "–" : fmt(v60, digits) + "<small>tok/s</small>"}</span></div>`;
+}
+const PREFILL_L = {one: "laufender Schub", oneT: "Tokens des laufenden Schubs / (jetzt letztes Chunk-Ende − Start seines ersten Chunks); ein Chunk zählt über die Sekunden, in denen er rechnete (prefill.last t/gpu_ms), nie in der Probe, in der sein Zähler sprang; 0 = die Phase rechnet gerade nicht",
+  max: "bester Schub 15 min", maxT: "höchste Schub-Rate im 15-min-Speicher (Schübe unter 512 Tokens haben keine Rate)"};
 function prefillTile(b, g, color, label, binders, now) {
   const p = (b.prefill || {})[g];
   if (!p) return `<div class="tile"><div class="label"><i style="background:${color}"></i>${label}</div><div class="big">—</div><div class="state">fehlt in IPC: rankstats.prefill dieser Gruppe</div></div>`;
   const n = p.now, lb = p.last_burst;
-  const active = n && n.tps != null;
+  const active = !!(n && n.tokens);
   const src = active ? n : lb;
   const ranks = src ? Object.entries(src.ranks || {}).map(([r, a]) => `${r} ${fmt(a.tps)}`).join(" &middot; ") : "—";
-  const state = active ? `aktiv &middot; letzte ${Math.round(p.window_s)} s`
-    : (p.last_t ? `ruht &middot; letzter Chunk vor ${ago(now - p.last_t)}, Zahl = letzter Schub` : "noch kein Chunk");
+  const small = src && src.tokens != null && src.tokens < 512;
+  const state = active ? `Chunks der letzten ${Math.round(p.window_s)} s`
+    : (p.last_t ? `ruht &middot; letzter Chunk fertig vor ${ago(now - p.last_t)}, Zahlen = letzter Schub` : "noch kein Chunk");
   const charts = rateCharts(b, g + "_prefill_tps", color, 0, now, binders);
   const one = p.one_s || 0;
   return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>${label}${srcOf(b, "C1", "C2", "C7")}</div>
-    ${bigPair(active ? "Wanduhr 60 s" : "letzter Schub, Wanduhr", src && src.wall_tps, one, 0, null, p.max3s_120)}
-    <div class="state">${state} &middot; <span class="muted" title="Z&auml;hler: &Delta;prefill.new_tokens des ersten Rangs (rankstats); Nenner: &Delta;ts der Proben mit Arbeit">Tokens / Wanduhr${src && src.wall_s ? " (" + fmt(src.tokens) + " Tok / " + fmt(src.wall_s, 1) + " s)" : ""}</span></div>
+    ${bigPair(active ? "Schübe 60 s, Wanduhr" : "letzter Schub, Wanduhr", src && src.wall_tps, one, 0, null, p.max3s_120, PREFILL_L)}
+    <div class="state">${state} &middot; <span class="muted" title="Tokens / (Ende letzter Chunk auf der letzten PP-Stufe − Start erster Chunk auf PP0), je Schub; Schübe ohne die Pausen dazwischen">Tokens / Wanduhr der Schübe${src && src.wall_s ? " (" + fmt(src.tokens) + " Tok / " + fmt(src.wall_s, 1) + " s)" : ""}</span>${small ? ` <span class="muted">&middot; unter 512 Tokens (z.&nbsp;B. Re-Extend nach der Übergabe): keine Rate</span>` : ""}</div>
     ${kv([
-      ["GPU-Rechenrate (&Sigma; Tok / &Sigma; compute-ms, langsamster Rang)", src && src.tps_gpu != null ? fmt(src.tps_gpu) + " tok/s" : "—"],
-      ["Rechenrate je Rang (gpu-ms)", ranks],
-      [active ? "Tokens / Chunks im Fenster" : "Tokens / Chunks im letzten Schub", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
+      ["GPU-Rechenrate (Tokens / compute-ms, langsamster Rang)", src && src.tps_gpu != null ? fmt(src.tps_gpu) + " tok/s" : "—"],
+      ["Rechenrate je Rang (compute-ms)", ranks || "—"],
+      [active ? "Tokens / Chunks, 60 s" : "Tokens / Chunks im letzten Schub", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
       ["mittl. Chunk &middot; aus Cache", src ? `${fmt(src.mean_chunk)} &middot; ${fmt(src.cached)}` : "—"],
-      active ? ["Durchsatz Wandzeit (Tokens / " + Math.round(p.window_s) + " s)", fmt(n.tokens / p.window_s)] : null,
+      active ? ["Durchsatz Wandzeit (Tokens / " + Math.round(p.window_s) + " s, mit Pausen)", fmt(n.tokens / p.window_s)] : null,
       ["Warteschlange &middot; ausstehende Tokens", `${fmt(p.queue)} &middot; ${fmt(p.pending_tok)}`],
-      ...ipcRankRows(b, g, "C1", (v) => v.prefill_tps_gpu != null ? fmt(v.prefill_tps_gpu) + " tok/s (Deltas)" : fmt(v.new_tokens) + " Tok neu"),
-      src && src.wall_confounded_tps != null ? ["input throughput (wall-konfundiert)", fmt(src.wall_confounded_tps), "wc"] : null,
       ["&Oslash; tok/s/W &middot; 60 s (Kurvenmittel, Ruhe = 0)", fmt(((b.series || {}).per_w_60s || {})[g + "_prefill_tps"], 2)],
     ])}
     ${charts}</div>`;
@@ -709,17 +713,18 @@ function decodeTile(b, g, color, binders, now) {
   if (!d) return `<div class="tile"><div class="label"><i style="background:${color}"></i>Decode</div><div class="big">—</div><div class="state">fehlt in IPC: rankstats.decode</div></div>`;
   const active = d.gen_tps != null;
   const v = active ? d.gen_tps : d.gen_tps_last;
-  const state = active ? `aktiv &middot; Tokens / Wanduhr der letzten ${Math.round(d.window_s)} s (&Delta;decode.tokens / &Delta;ts &uuml;ber die Proben mit Arbeit, ${d.rows} Proben)`
+  const state = active ? `aktiv &middot; Tokens / Decode-Zeit der letzten ${Math.round(d.window_s)} s (&Delta;decode.tokens / Rang-Uhr, nur Proben mit Decode davor und danach, Flips ausgenommen; ${d.rows} Proben)`
     : (d.last_t ? `ruht &middot; zuletzt dekodiert vor ${ago(now - d.last_t)}, Zahl = letzter Schub` : "noch kein Decode");
   const charts = rateCharts(b, g + "_decode_tps", color, 1, now, binders);
-  const per = (v != null && d.running) ? v / d.running : null;
+  const per = d.per_stream;
   const one = d.one_s || 0;
   return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>Decode${g !== "D" ? " (" + g + ")" : ""}${srcOf(b, "C3", "C4", "C7")}</div>
     ${bigPair(active ? "Wanduhr 60 s" : "letzter Wert", v, one, 1, bsBadge(d, one > 0), d.max3s_120)}
     <div class="state">${state}</div>
     ${kv([
-      ["laufende Anfragen (bs) &middot; je Anfrage", `${fmt(d.running)} &middot; ${fmt(per, 1)} tok/s`],
-      d.seats ? ["Sitze dieser D-Phase (D-PHASE-SEATS)", `${fmt(d.seats.n)} von ${fmt(d.seats.cap)} &middot; &uuml;bergeben ${fmt(d.seats.handoff_n)} + geparkt ${fmt(d.seats.parked_n)}${d.seats.clamped ? " (gekappt)" : ""}`] : null,
+      ["laufende Anfragen (bs) &middot; je Stream", `${fmt(d.last_bs != null ? d.last_bs : d.running)} &middot; ${per == null ? "—" : fmt(per, 1) + " tok/s"}${d.per_stream_n ? ` <span class="muted">(${d.per_stream_n} Proben mit Decode davor und danach)</span>` : ""}`],
+      d.seats ? ["Sitze dieser D-Phase (front.d_seats)", `${fmt(d.seats.n)} von ${fmt(d.seats.cap)}${d.seats.handoff_n != null ? " &middot; &uuml;bergeben " + fmt(d.seats.handoff_n) : ""} &middot; geparkt ${fmt(d.seats.parked_n)}${d.seats.clamped ? " (gekappt)" : ""}${d.seats.source ? ` <span class="muted">(${esc(d.seats.source)}, n des Wakes)</span>` : ""}`]
+        : ["Sitze dieser D-Phase", MISSTAG("front.d_seats (ab Build mit 8654c4e647)")],
       ["accept len &middot; accept rate", `${fmt(d.accept_len, 2)} &middot; ${fmt(d.accept_rate, 2)}`],
       ...ipcRankRows(b, g, "C3", (v) => `${v.gen_tps != null ? fmt(v.gen_tps, 1) + " tok/s (Deltas)" : "—"} &middot; accept len ${fmt(v.accept_len_mean != null ? v.accept_len_mean : v.accept_len_ewma, 2)}`),
       ...ipcRankRows(b, g, "C5", (v) => `KV ${fmt(v.kv_tokens)} Tok${v.share != null ? " &middot; Anteil " + fmt(v.share, 3) : ""}${v.holds_kv === false ? " (h&auml;lt kein KV)" : ""} &middot; Sitze ${fmt(v.seats)}`),
@@ -759,13 +764,21 @@ function bootTile(label, tok, src, rGpu, rGpuNote, rWall, e) {
     <div class="big num" style="font-size:24px">${fmt(tok)}<small>Tok (Summe)</small></div><div class="state">${src}</div>
     ${kv([
       ["&Oslash; tok/s seit Boot &middot; GPU-Rechenzeit", rGpu == null ? "\u2014" : fmt(rGpu, rGpu < 100 ? 1 : 0), "kvb"],
-      ["&Oslash; tok/s seit Boot &middot; Wandzeit", wall],
+      ["&Oslash; tok/s seit Boot &middot; Wandzeit (inkl. Leerlauf und andere Phase)", wall],
       ["Energie je Token", e.j_per_tok == null ? "\u2014" : `${fmt(e.j_per_tok, e.j_per_tok < 1 ? 3 : 2)} J &middot; ${fmt(e.wh_per_1k, 3)} Wh/1k`],
       ["&Oslash; tok/s/W seit Boot (Token / Energie)", e.tok_per_j == null ? "\u2014" : fmt(e.tok_per_j, 2)],
     ])}
     <div class="muted" style="font-size:10px">${rGpuNote}; Wandzeit = &Sigma; Token / Zeit seit Boot-Start (Boot-ID)</div></div>`;
 }
 
+// D cached = Übergabe P->D + echter D-Präfix-Treffer; getrennt nur mit front.d_cached_tokens (8654c4e647)
+function dsplit(x) {
+  if (!x) return "";
+  const a = x.boot || {};
+  const v = a.handoff != null ? `Übergabe ${fmt(a.handoff)} &middot; D-Präfix-Treffer ${fmt(a.d_prefix_hit)} ${ipcTag("front.d_cached_tokens")}`
+    : `${MISSTAG("front.d_cached_tokens (ab Build mit 8654c4e647)")} <span class="muted">bis dahin z&auml;hlt D-cached als &Uuml;bergabe, nie als Cache</span>`;
+  return `<tr><td class="muted">&nbsp;&nbsp;davon</td><td colspan="6" class="num" style="text-align:left">${v}</td></tr>`;
+}
 function cacheHtml(b, now, awake) {
   const c = b.cache || {}, t = b.totals || {};
   const en = b.energy || {};
@@ -775,7 +788,8 @@ function cacheHtml(b, now, awake) {
     const w = x.window || {}, a = x.boot || {};
     const hit = (o) => o.hit_share == null ? "\u2014" : `${pct(o.hit_share)} <span class="muted">(${fmt(o.cached)} / ${fmt(o.new)})</span>`;
     const l2 = (o) => o.loadback_n ? `${fmt(o.loadback_n)} &times; &middot; ${fmt(o.loadback_tok)} Tok${o.l2_share != null ? " &middot; " + pct(o.l2_share) : ""}` : "0";
-    const l3 = (o) => o.l3inc_n ? `${fmt(o.l3inc_n)} &times; &middot; ${pct(o.l3inc_share)} <span class="muted">(${fmt(o.l3inc_delivered)} / ${fmt(o.l3inc_deliverable)})</span>` : "0";
+    const l3 = (o) => !o.l3inc_n ? "0" : o.l3inc_share == null ? `${fmt(o.l3inc_n)} &times; &middot; ${MISSTAG("Anteil (ab Build mit 8654c4e647)")}`
+      : `${fmt(o.l3inc_n)} &times; &middot; ${pct(o.l3inc_share)} <span class="muted">(${fmt(o.l3inc_delivered)} / ${fmt(o.l3inc_deliverable)})</span>`;
     // Asleep P: the 60-s cell would only say "—"; show its last burst (from the backend) instead
     let w60 = hit(w);
     if (g === "P" && awake !== "P" && !w.chunks) {
@@ -810,7 +824,7 @@ function cacheHtml(b, now, awake) {
     <h3 style="font-size:13px;margin:4px 0 6px">Cache-Treffer${srcOf(b, "E1", "E2", "E3")}${prog}</h3>
     <div class="tablewrap"><table>
       <tr><th></th><th class="num">aus Cache / neu &middot; 60 s</th><th class="num">seit Boot</th><th class="num">L2 Host: #988 Load-back &middot; 60 s</th><th class="num">seit Boot</th><th class="num">MAMBA-HOST-RESUME</th><th class="num">L3 Store: unvollst. Lesungen</th></tr>
-      ${row("P-Gruppe", "P")}${row("D-Gruppe", "D")}${row("Gruppe", "single")}
+      ${row("P-Gruppe", "P")}${row("D-Gruppe", "D")}${dsplit(c.D)}${row("Gruppe", "single")}
       ${req("Front je Anfrage, P-Bein (cached/prompt)", "served_P")}${req("Front je Anfrage, D-Bein (cached/prompt)", "served_D")}
     </table></div>
     ${prefetchRows(b)}
