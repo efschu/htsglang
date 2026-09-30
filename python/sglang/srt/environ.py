@@ -646,6 +646,16 @@ class Envs:
     # prompt (110438) of a request whose 109440-token prefix sat on TP0's
     # device: W50, P re-prefilled it. Off = the pre-H98x pricing.
     SGLANG_WEG2_ENABLE_X_FLOOR_CREDIT = EnvBool(True)
+    # RVP_CAPACITY_PARK (#248h, 30.09., NF y4b D 03:58:57-03:59:24 weg2-32-72):
+    # a streamed request the X gate refuses right after a store read that ended
+    # short although the store holds its context (P wrote it: delivered 39168
+    # of deliverable 95104, total 95137) is kept parked on D and re-read when
+    # the arena has room -- no P leg (P already has it), no attempt spent, no
+    # W50 to the client. Bounded by this many seconds from its first capacity
+    # park; past it the RESUME-VIA-P legs / the named end apply as before.
+    # 0 = off. y4b: two needless P legs (p_ms 7712 / 7460, flips included),
+    # then the third refusal ended the client's stream with W50.
+    SGLANG_WEG2_RVP_CAPACITY_PARK_S = EnvFloat(120.0)
     # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
     # rank 0, never the scheduler thread) that copies the kept pages of
     # parked and waiting rids from the arena to HiCacheFile without freeing

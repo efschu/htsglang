@@ -13864,6 +13864,8 @@ class Scheduler(
             "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",
             str(getattr(req, "rid", "?"))[:16], uncached, x, term, verdict,
         )
+        if verdict == "admit":
+            _weg2_rvp.clear_capacity_park(req)  # #248h: its re-read landed
         if verdict == "W31":
             # #1471b (z30m 03:19-03:22, weg2-116-141): three W31s priced the
             # WHOLE prompt right after every rank had read 28096/4352/36800 of
@@ -13898,8 +13900,26 @@ class Scheduler(
         x = int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0)
         refused_ids = {id(r) for r in refused}
         self.waiting_queue = [q for q in self.waiting_queue if id(q) not in refused_ids]
-        for req in refused:
+        # #248h (30.09., NF y4b weg2-32-72): a refusal that follows a store read
+        # cut short by D's own capacity, while the store holds the context, is
+        # parked on D for a re-read -- one group verdict (the list is the
+        # group's; the local terms are MIN-reduced like every park release).
+        _cap_park = [False] * len(refused)
+        if any(_weg2_rvp.capacity_park_precondition(r) for r in refused):  # replicated terms
+            _cap_local = [_weg2_rvp.capacity_park_candidate(r, x, sched=self) for r in refused]
+            _cap_park = [bool(f) for f in self._weg2_group_min_flags(_cap_local)]
+        for _i, req in enumerate(refused):
             uncached = self.weg2_uncached_extent(req, head_inputs)
+            if _cap_park[_i]:
+                _tc = getattr(self, "tree_cache", None)
+                if _tc is not None:
+                    release_admission_acquired_mamba_slot(req, _tc, site="weg2_x_refusal_cappark")
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
+                elif self.enable_hierarchical_cache:
+                    self.tree_cache.terminate_prefetch(req.rid)
+                _weg2_rvp.park_for_capacity(self, req, uncached, x)
+                continue
             # RESUME-VIA-P (weg2/resume_via_p.py): a STREAMED request that has
             # generated tokens is not aborted -- its client holds text, the
             # front cannot re-route it. D keeps it parked, P prefills its
@@ -14901,6 +14921,7 @@ class Scheduler(
         # gains nothing leaves this value unchanged and the standstill count
         # advances, which is what ends the wait honestly.
         req._weg2_store_delivered = delivered
+        req._weg2_store_deliverable = deliverable  # #248h: what the store holds
         self._weg2_store_short_seen = getattr(self, "_weg2_store_short_seen", 0) + 1
         n = self._weg2_store_short_seen
         if n <= 8 or n % 64 == 0:

@@ -486,7 +486,7 @@ def park_tick(sched) -> int:
         )
         due = bool(sched._weg2_group_min_flags([local])[0])
     if not due:
-        return 0
+        return _capacity_requeue(sched, parked)
     moved = list(parked)
     sched.weg2_d_parked = []
     sched._weg2_d_park_slept = False
@@ -512,6 +512,31 @@ def park_tick(sched) -> int:
                 (", %d back to the #1471 settle %s" % (len(back), [str(r.rid)[:12] for r in back]))
                 if back else "")
     return len(mine) + len(back)
+
+
+def _capacity_requeue(sched, parked) -> int:
+    """#248h: the capacity-parked requests (``resume_via_p.park_for_capacity``)
+    re-join the queue head as soon as the arena holds their re-read -- the
+    other parked requests keep waiting for their P leg / the awake bound.
+    One group verdict per parked request (MIN, rank-local clock)."""
+    from sglang.srt.weg2 import resume_via_p as _rvp
+
+    if not any(getattr(r, _rvp.CAPPARK_AT_ATTR, None) is not None for r in parked):
+        return 0
+    due_ids = {id(r) for r in _rvp.capacity_requeue_due(sched, parked)}
+    flags = sched._weg2_group_min_flags([id(r) in due_ids for r in parked])
+    moved = [r for r, f in zip(list(parked), flags) if f]
+    if not moved:
+        return 0
+    ids = {id(r) for r in moved}
+    sched.weg2_d_parked = [r for r in parked if id(r) not in ids]
+    for req in moved:
+        setattr(req, _rvp.CAPPARK_AT_ATTR, None)  # a re-park stamps it again
+        sched._add_request_to_queue(req, is_retracted=True)
+    mine = _to_queue_head(sched, moved)
+    logger.info("#248h WEG2-D-PARK requeue (capacity): %d parked request(s) at the queue head %s -- "
+                "the arena holds their re-read now", len(mine), [str(r.rid)[:12] for r in mine])
+    return len(mine)
 
 
 def note_retracted(sched, retracted_reqs) -> int:
