@@ -11,6 +11,12 @@ RankState reader and the W7/W10 gate never see it):
   head      schema, pid, ts, seq, group, tp_rank, pp_rank, rank_state_seq
   work      forward_ct (the round path's own counter; the dashboard's per-rank
             heartbeat together with ts)
+  progress  fwd_ct, tokens_done (= prefill_total + decode_total), prefill_tokens,
+            decode_tokens -- THE PROGRESS CONTRACT (30.09., progress_watch): all
+            cumulative and monotone within a process, moving per forward /
+            per prefill CHUNK (prefill_tokens_total is incremented per prefill
+            batch on every rank), so a 62k P prefill advances them chunk by
+            chunk while front.served stands still until the request ends
   tokens    prefill_total, decode_total (MetricsReporter's monotone counters)
   spec      accept_tokens_total, forward_ct_total (lifetime spec counters)
   sched     waiting, running, queue_req, running_req, pending_tokens,
@@ -205,13 +211,18 @@ def scheduler_counters(scheduler) -> Dict[str, Any]:
     except Exception:  # noqa: BLE001 -- a racing swap of the batch reads as unknown
         running = None
     waiting = len(getattr(scheduler, "waiting_queue", None) or ())
+    fwd = int(getattr(scheduler, "forward_ct", 0) or 0)
+    pre = int(getattr(mr, "prefill_tokens_total", 0) or 0)
+    dec = int(getattr(mr, "gen_tokens_total", 0) or 0)
     return {
+        # the progress contract (see the module note); ts/seq are the head's
+        "progress": {"fwd_ct": fwd, "tokens_done": pre + dec,
+                     "prefill_tokens": pre, "decode_tokens": dec},
         "prefill": _prefill_block(mr),
         "decode": _decode_block(mr),
         "cache": _cache_block(scheduler),
-        "work": {"forward_ct": int(getattr(scheduler, "forward_ct", 0) or 0)},
-        "tokens": {"prefill_total": int(getattr(mr, "prefill_tokens_total", 0) or 0),
-                   "decode_total": int(getattr(mr, "gen_tokens_total", 0) or 0)},
+        "work": {"forward_ct": fwd},
+        "tokens": {"prefill_total": pre, "decode_total": dec},
         "spec": {"accept_tokens_total": int(getattr(mr, "spec_total_num_accept_tokens", 0) or 0),
                  "forward_ct_total": int(getattr(mr, "spec_total_num_forward_ct", 0) or 0)},
         "sched": {"waiting": waiting, "running": running,
