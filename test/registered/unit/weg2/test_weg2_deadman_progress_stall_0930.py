@@ -144,6 +144,81 @@ class TestProgressCheckOnStateDir(unittest.TestCase):
             SF.transition(self.d, None, fields={"progress": {}}, writer="front")
 
 
+def _ns_front(stream_flags):
+    """y5c 19:31:41-19:32:42Z: outstanding=2 (weg2-32-62 and a sibling), both NON-stream, D decoding bs2 --
+    served / served_tokens frozen (a non-stream answer reaches the front only at its end)."""
+    fr = _front(len(stream_flags), 131, 42, 2512000, 61234)
+    fr["outstanding_n"] = len(stream_flags)
+    fr["outstanding_nonstream_n"] = sum(1 for s in stream_flags if not s)
+    return fr
+
+
+class TestNonStreamRankWork(unittest.TestCase):
+    """y5c died at 19:32:42Z on PROGRESS-STALL ("outstanding=2, served/tokens 61 s unbewegt") while D decoded
+    bs2 until 19:32:59: both open requests were non-stream. With only non-stream requests open, the ranks'
+    progress counters (rankstate/*/*.rankstats, the contract progress_watch reads) are the witness."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.d = SF.init(self.root, "nf-y5c-replay", "boot", {})
+        self.memo = os.path.join(self.root, "memo.json")
+        os.makedirs(os.path.join(self.d, "rankstate", "D"), exist_ok=True)
+
+    def ranks(self, tokens_done, fwd_ct):
+        for t in range(3):
+            p = os.path.join(self.d, "rankstate", "D", "D.tp%dpp0.rankstats" % t)
+            with open(p, "w") as f:
+                json.dump({"schema": "weg2.rankstats/1", "progress": {
+                    "fwd_ct": fwd_ct, "tokens_done": tokens_done, "prefill_tokens": 0,
+                    "decode_tokens": tokens_done}}, f)
+
+    def replay(self, flags, moving):
+        SF.transition(self.d, "serving", fields={"front": _ns_front(flags)})
+        lines = []
+        for i, t in enumerate(range(1000, 1130, 10)):
+            k = i if moving else 0
+            self.ranks(100000 + 8 * k, 5000 + 4 * k)          # bs2 x 4 verify rows per round
+            lines.append(SF.deadman_progress(self.d, self.memo, 60, now=float(t)))
+        return [l for l in lines if l]
+
+    def test_y5c_two_nonstream_with_moving_rank_work_do_not_stall(self):
+        self.assertEqual(self.replay([False, False], moving=True), [])
+        self.assertNotIn("progress", SF.read(self.d))
+
+    def test_rank_work_standing_still_is_a_real_stall(self):
+        lines = self.replay([False, False], moving=False)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("HAENGT", lines[0])
+        self.assertIn("nur Nicht-Stream", lines[0])
+        self.assertEqual(SF.read(self.d)["progress"]["verdict"], "HAENGT")
+
+    def test_a_stream_request_open_keeps_the_old_rule(self):
+        # one stream request among them: its chunks would move served_tokens -- rank work is not read
+        lines = self.replay([False, True], moving=True)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("HAENGT", lines[0])
+
+    def test_front_without_the_field_keeps_the_old_rule(self):
+        fr = _front(2, 131, 42, 2512000, 61234)                  # a y5c image: no stream info
+        SF.transition(self.d, "serving", fields={"front": fr})
+        out = []
+        for i, t in enumerate(range(1000, 1130, 10)):
+            self.ranks(100000 + 8 * i, 5000 + 4 * i)
+            out.append(SF.deadman_progress(self.d, self.memo, 60, now=float(t)))
+        self.assertEqual(len([l for l in out if l]), 1)
+
+    def test_no_rankstats_no_witness(self):
+        SF.transition(self.d, "serving", fields={"front": _ns_front([False, False])})
+        out = [SF.deadman_progress(self.d, self.memo, 60, now=float(t)) for t in range(1000, 1130, 10)]
+        self.assertEqual(len([l for l in out if l]), 1)
+        self.assertIsNone(SF.rank_work(self.d))
+
+    def test_resumed_rank_work_ends_the_stall(self):
+        self.replay([False, False], moving=False)
+        self.ranks(200000, 9000)
+        self.assertIn("LAEUFT WIEDER", SF.deadman_progress(self.d, self.memo, 60, now=1200.0))
+
+
 @unittest.skipUnless(DEADMAN.exists(), "deadman not in the tree")
 class TestDeadmanShell(unittest.TestCase):
     """The deadman's own shell function (extracted and run), and its wiring in the main loop."""
