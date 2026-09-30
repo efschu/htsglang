@@ -283,10 +283,20 @@ def merge_into_record(path: str, key: str, census: Mapping[str, object]) -> Dict
     # 09291559 + ungebucht 6.26 of z30w, whose store was 39.20). The peak of the
     # SUM is kept beside them, with the store/arena of that same sample, so the
     # ledger can cap its shmem claim at what one instant actually held.
-    for _f in ("shm_total_max_gib", "shm_total_store_gib", "shm_total_arena_gib", "shm_total_source"):
+    for _f in ("shm_total_max_gib", "shm_total_store_gib", "shm_total_arena_gib", "shm_total_source",
+               "shm_rest_max_gib", "shm_rest_source"):
         if _f in old:
             ent[_f] = old[_f]
     _tot = census.get("cg_shmem_gib")
+    # 30.09. LEDGER-FIXPOINT: the shmem OUTSIDE the store and the arena at the
+    # SAME instant, max over the samples -- the ledger adds THIS arm's own
+    # store/arena to it instead of charging an old instant's larger store.
+    if _tot is not None:
+        _c = dict(census.get("shm_classes_gib") or {})
+        _rest = max(0.0, float(_tot) - float(_c.get("store", 0.0)) - float(_c.get("arena_booked", 0.0)))
+        if _rest > float(ent.get("shm_rest_max_gib", -1.0)):
+            ent["shm_rest_max_gib"] = _rest
+            ent["shm_rest_source"] = f"{census.get('source', '')} {census.get('at', '')}".strip()
     if _tot is not None and float(_tot) > float(ent.get("shm_total_max_gib", -1.0)):
         _cls = dict(census.get("shm_classes_gib") or {})
         ent["shm_total_max_gib"] = float(_tot)
@@ -336,6 +346,9 @@ def ledger_terms(entry: Optional[Mapping[str, object]]) -> Dict[str, object]:
         "shm_total_store_gib": float(entry.get("shm_total_store_gib") or 0.0),
         "shm_total_arena_gib": float(entry.get("shm_total_arena_gib") or 0.0),
         "shm_total_source": str(entry.get("shm_total_source") or ""),
+        # 30.09. LEDGER-FIXPOINT: max over samples of (total - store - arena), None before
+        "shm_rest_max_gib": (float(entry["shm_rest_max_gib"])
+                             if entry.get("shm_rest_max_gib") is not None else None),
     }
 
 
