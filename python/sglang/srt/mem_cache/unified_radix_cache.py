@@ -7408,6 +7408,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         rate, and the acceptance expects 0 of them on a sized boot.
         """
         t = self._prefetch_line_terms(need)
+        # #287 NEED0: the settle reads a refusal's own terms (need/available)
+        # to tell "no room" from "nothing to read" (weg2/settle_writer.py).
+        _terms = self.__dict__.get("_weg2_refusal_terms")
+        if _terms is None:
+            import collections as _collections
+
+            _terms = self.__dict__["_weg2_refusal_terms"] = _collections.OrderedDict()
+        _terms.pop(str(req_id), None)
+        # the ROOM is the smaller of the host pool's free rows and the
+        # prefetch budget left (limit - occupied): y3u refused need=77824 with
+        # available=415040 but occupied=392320 > limit=373536
+        _room = int(t["available"])
+        if int(t["limit"]) >= 0 and int(t["occupied"]) >= 0:
+            _budget = int(t["limit"]) - int(t["occupied"])
+            _room = _budget if _room < 0 else min(_room, _budget)
+        _terms[str(req_id)] = (str(reason), int(t["need"]), int(_room))
+        while len(_terms) > 1024:
+            _terms.popitem(last=False)
         # H108: the key source of this rank's #950 presence probe (handoff /
         # own), "-" when the rank was eligible without asking.
         _keys = (getattr(self, PRESENCE_SRC_ATTR, None) or {}).get(str(req_id), "-")

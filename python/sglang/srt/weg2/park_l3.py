@@ -282,7 +282,7 @@ def _issue(sched, reqs) -> list:
         req._969c_verdict = verdict
         # NW (30.09.): a refusal of the host budget is "not read yet" -- the #1471
         # settle keeps it parked and re-reads once the budget has room.
-        if _sw.note_read_verdict(req, verdict, now):
+        if _sw.note_read_verdict(req, verdict, now, tree=getattr(sched, "tree_cache", None)):
             refused.append((req, verdict))
         apply = getattr(sched, "_apply_prefetch_deferral", None)
         if apply is not None:

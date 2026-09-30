@@ -137,16 +137,54 @@ BUDGET_TERMS = frozenset({
 BUDGET_RETRY_S = 0.25
 
 
-def budget_refused(verdict) -> bool:
-    """True when ``_prefetch_kvcache``'s verdict is a budget refusal."""
+#: #287 NEED0 (30.09., NF y4k weg2-0-4): ``vote_negative`` is the GROUP's exit
+#: -- a common span below the prefetch threshold, 0 included. It means "no
+#: room" only when this rank asked for something the host could not give
+#: (y3u: need=77632 over a full budget). ``need=0 available=415040`` (a
+#: 25-token prompt, retained=0, nothing registered to read) is an ANSWER:
+#: 533 group re-reads over 12 D phases, 525 s wall for 2 tokens, one D seat
+#: held through the whole bench (bs6 ran as bs5).
+VOTE_TERMS_ATTR = "_weg2_refusal_terms"
+
+
+def refusal_terms(tree, rid) -> Optional[Tuple[str, int, int]]:
+    """``(reason, need, room)`` of the last #915 refusal of ``rid`` on this
+    rank's tree (``UnifiedRadixCache._log_prefetch_refused``), or None. ``room``
+    = min(host pool available, prefetch limit - occupied): y3u refused
+    need=77824 with available=415040 but occupied=392320 > limit=373536."""
+    terms = getattr(tree, VOTE_TERMS_ATTR, None) if tree is not None else None
+    if not terms:
+        return None
+    return terms.get(str(rid))
+
+
+def budget_refused(verdict, terms: Optional[Tuple[str, int, int]] = None) -> bool:
+    """True when ``_prefetch_kvcache``'s verdict is a budget refusal.
+
+    ``vote_negative`` counts only with the rank's own terms showing a real
+    shortage (``need > 0`` and ``need > room``, the room the smaller of the
+    host pool's free rows and the prefetch budget left); without them, or with
+    ``need == 0``, it is the group's answer "nothing worth reading"."""
     v = str(verdict or "")
-    return v.startswith("declined:") and v.split(":", 1)[1] in BUDGET_TERMS
+    if not v.startswith("declined:"):
+        return False
+    term = v.split(":", 1)[1]
+    if term not in BUDGET_TERMS:
+        return False
+    if term == "vote_negative":
+        if terms is None:
+            return False
+        _reason, need, room = terms
+        return int(need) > 0 and int(need) > int(room)
+    return True
 
 
-def note_read_verdict(req, verdict, now: float) -> bool:
+def note_read_verdict(req, verdict, now: float, tree=None) -> bool:
     """Record what the last read attempt of ``req`` did; True = budget-refused.
-    Any other verdict (issued, in flight, too short, ...) clears the mark."""
-    refused = budget_refused(verdict)
+    Any other verdict (issued, in flight, too short, ...) clears the mark.
+    ``tree``: this rank's radix tree, whose last #915 terms of ``req`` decide
+    a ``vote_negative`` (see :func:`budget_refused`)."""
+    refused = budget_refused(verdict, refusal_terms(tree, getattr(req, "rid", None)))
     setattr(req, BUDGET_ATTR, refused)
     if refused:
         setattr(req, BUDGET_T_ATTR, float(now))
@@ -178,6 +216,21 @@ def keep_ack_if_unread(req, act: str) -> None:
     the next tick re-reads again once the budget has room."""
     if act == "reread" and budget_pending(req):
         req._1471w_ack = None
+
+
+def settle_since_for_wake(req, now: float) -> float:
+    """#287 NEED0 (b): the #1471 settle clock of a held request at a new wake.
+
+    A request whose last store read was budget-refused keeps the clock of its
+    FIRST refused wake: the bound (``WEG2_POST_WAKE_SETTLE_S``) runs over
+    wakes, so a request no D phase of < 20 s could release (y4k weg2-0-4,
+    12 phases of 10-18 s) is released at the next wake instead of being
+    re-stamped for ever. Every other request starts the bound at this wake,
+    as before."""
+    since = getattr(req, "_1471_since", None)
+    if budget_pending(req) and since is not None:
+        return float(since)
+    return float(now)
 
 
 def reset_for_wake(req) -> None:

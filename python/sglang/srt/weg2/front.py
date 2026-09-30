@@ -3321,6 +3321,9 @@ class Seat:
         self.held = False
         self.front._d_seat.release()
         self.front._d_seats_live.discard(self)
+        _ps = getattr(self.front, "_park_stuck", None)
+        if _ps is not None:
+            _ps().done(self.rid)  # #287 NEED0 (c): the rid left D
         self.front.counters["d_seat_released"] += 1
         # L3: the "wenn ein slot frei wird, wird nachgezogen" instrument.
         logger.info(
@@ -4935,6 +4938,9 @@ class Front:
             late = [r for r in self._flip_ledger(D) if r not in rids]
         for r in known + late:
             self._d_parked[r] = t_park
+        _ps = getattr(self, "_park_stuck", None)  # #287 NEED0 (c): the streak, as IPC
+        if _ps is not None:
+            _ps().note_park(known + late)
         self.counters["d_parked"] += len(known) + len(late)
         self.counters["d_parked_in_flight"] += len(late)
         still = self._flip_ledger(D)
@@ -6345,6 +6351,15 @@ class Front:
         if ev is not None:
             self._ipc_publish("flip_first_work", ev)
 
+    def _park_stuck(self):
+        """#287 NEED0 (c): the per-rid park streak (weg2/park_stuck.py)."""
+        ps = self.__dict__.get("_park_stuck_obj")
+        if ps is None:
+            from sglang.srt.weg2.park_stuck import ParkStuck
+
+            ps = self.__dict__["_park_stuck_obj"] = ParkStuck()
+        return ps
+
     def _ipc_front_fields(self) -> dict:
         """The front's own keys under state.json `front` (never the host's mirror keys)."""
         out: Dict[str, Any] = {"ts": round(time.time(), 3)}
@@ -6353,6 +6368,8 @@ class Front:
         out["served_tokens"] = dict(self.__dict__.get("_ipc_served_tokens") or {})
         out["d_phase_n"] = getattr(self, "_d_phase_n", None)
         out["d_parked_n"] = len(getattr(self, "_d_parked", None) or {})
+        # #287 NEED0 (c): parked over N D phases without output (weg2/park_stuck.py)
+        out["d_park_stuck"] = self._park_stuck().block(envs.SGLANG_WEG2_PARK_STUCK_PHASES.get())
         health = {}
         for g in self.groups.values():
             f = getattr(g, "health_facts", None)
@@ -8786,6 +8803,7 @@ class Front:
                                 break
                             if getattr(self, "_rvp_p_done", None) and rid in self._rvp_p_done:
                                 self._rvp_resumed(rid)
+                            self._park_stuck().note_output(rid)  # #287 NEED0 (c): progress
                             await _push(restate_inband_refusal(chunk, request.path))
                     if tier_carry and not client_io["gone"]:
                         await _write_client(strip_cached_tier(bytes(tier_carry), request.path, True))

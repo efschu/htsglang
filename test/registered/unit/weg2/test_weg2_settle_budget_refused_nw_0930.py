@@ -195,7 +195,10 @@ def test_a_stale_ack_does_not_outlive_its_wake(arena):
 
 def test_budget_terms():
     assert sw.budget_refused("declined:rate_limited")
-    assert sw.budget_refused("declined:vote_negative")
+    # #287 NEED0: vote_negative is a budget refusal only on the rank's own
+    # shortage terms (y3u need=77824 over a spent budget); need=0 is an answer
+    assert sw.budget_refused("declined:vote_negative", ("vote_negative", 77824, -18784))
+    assert not sw.budget_refused("declined:vote_negative", ("vote_negative", 0, 415040))
     assert not sw.budget_refused("declined:too_short")
     assert not sw.budget_refused("declined:already_in_flight")
     assert not sw.budget_refused("issued")

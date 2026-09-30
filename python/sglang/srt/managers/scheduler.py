@@ -6479,7 +6479,7 @@ class Scheduler(
         if req._1456_n <= 4 or req._1456_n % 16 == 0:
             logger.info("#1456 HOLD-REFETCH rid=%s n=%d reason=%s verdict=%s (the store was short; "
                         "re-read from the registered extent)", str(req.rid)[:12], req._1456_n, reason, verdict)
-        if _sw.note_read_verdict(req, verdict, now):
+        if _sw.note_read_verdict(req, verdict, now, tree=self.tree_cache):
             return "budget"  # NW: refused, not issued -- never a read in flight
         return "reissued"
 
@@ -6511,7 +6511,7 @@ class Scheduler(
             verdict = self._prefetch_kvcache(req)
         else:
             verdict = self._prefetch_kvcache(req, limit_tokens=int(plan))
-        refused = _sw.note_read_verdict(req, verdict, now)
+        refused = _sw.note_read_verdict(req, verdict, now, tree=self.tree_cache)
         n = int(getattr(self, "_1471b_n", 0) or 0) + 1
         self._1471b_n = n
         if n <= 16 or n % 64 == 0:
@@ -6917,13 +6917,14 @@ class Scheduler(
                 _r._weg2_settled_wake = self._weg2_wake_seq  # WT
                 released.append(_r)
             else:
-                _r._1471_since = _now
                 try:  # NW (30.09.): this wake's writer view starts fresh (P may have written again)
                     from sglang.srt.weg2 import settle_writer as _sw_nw
 
+                    # #287 NEED0 (b): a budget-refused read keeps its settle clock over wakes
+                    _r._1471_since = _sw_nw.settle_since_for_wake(_r, _now)
                     _sw_nw.reset_for_wake(_r)
                 except Exception:  # noqa: BLE001
-                    pass
+                    _r._1471_since = _now
                 parked.append(_r)
         hold.clear()
         if parked:

@@ -832,6 +832,10 @@ class Envs:
     SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK = EnvBool(False)
     # the groups both parts apply to (comma list; default the D->P sleeper)
     SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS = EnvStr("D")
+    # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field
+    # front.d_park_stuck lists the rids parked in at least this many
+    # consecutive D phases with no output in between (weg2/park_stuck.py).
+    SGLANG_WEG2_PARK_STUCK_PHASES = EnvInt(3)
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.
