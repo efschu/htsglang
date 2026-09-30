@@ -612,9 +612,30 @@ def _release_fresh(arena, slots, gens, site: str) -> None:
                 _RELEASE_N[1])
 
 
-_COMPLETE_LOST = {3: 0, 4: 0, 5: 0}  # arena_complete status -> slots lost, process-wide
+_COMPLETE_LOST = {3: 0, 4: 0, 5: 0, 6: 0}  # arena_complete status -> slots lost, process-wide
 _COMPLETE_LOST_CALLS = [0]
 _LOST_NAMES = {3: "recycled", 4: "not_claimed", 5: "overflow"}
+
+
+def _host_write_claim(arena, stems, totals):
+    """L3FILL-JOINED (30.09.): the direct host writes (write-through, park)
+    claim with the host-write role, so a JOIN names them; a fake arena
+    without the keyword claims as before."""
+    from sglang.srt.mem_cache.storage.file.hicache_arena import ROLE_HOST_WRITE
+
+    try:
+        return arena.claim_slots(stems, totals, role=ROLE_HOST_WRITE)
+    except TypeError:
+        return arena.claim_slots(stems, totals)
+
+
+def _host_write_claim_np(arena, stems, totals):
+    from sglang.srt.mem_cache.storage.file.hicache_arena import ROLE_HOST_WRITE
+
+    try:
+        return arena.claim_slots_np(stems, totals, role=ROLE_HOST_WRITE)
+    except TypeError:
+        return arena.claim_slots_np(stems, totals)
 
 
 def _note_complete_lost(st, slots, site: str) -> int:
@@ -640,10 +661,11 @@ def _note_complete_lost(st, slots, site: str) -> int:
     k = _COMPLETE_LOST_CALLS[0]
     if k <= 8 or (k & (k - 1)) == 0 or 5 in by:
         (logger.error if 5 in by else logger.warning)(
-            "#1427 ARENA-COMPLETE LOST site=%s recycled=%d not_claimed=%d overflow=%d slots=%s "
-            "calls=%d totals=recycled:%d,not_claimed:%d,overflow:%d",
-            site, by.get(3, 0), by.get(4, 0), by.get(5, 0), bad[:4], k,
-            _COMPLETE_LOST[3], _COMPLETE_LOST[4], _COMPLETE_LOST[5])
+            "#1427 ARENA-COMPLETE LOST site=%s recycled=%d not_claimed=%d overflow=%d "
+            "stale_reaped=%d slots=%s calls=%d "
+            "totals=recycled:%d,not_claimed:%d,overflow:%d,stale_reaped:%d",
+            site, by.get(3, 0), by.get(4, 0), by.get(5, 0), by.get(6, 0), bad[:4], k,
+            _COMPLETE_LOST[3], _COMPLETE_LOST[4], _COMPLETE_LOST[5], _COMPLETE_LOST[6])
     return len(bad)
 
 
@@ -1844,7 +1866,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         pending state as mask/gen/fresh tensors, no per-slot Python."""
         import numpy as np
         arena = self.arena
-        slots, st, gens = arena.claim_slots_np(stems, totals)
+        slots, st, gens = _host_write_claim_np(arena, stems, totals)
         _cn = getattr(ArenaMHAHostPool, "_1427_claim_n", 0) + 1
         ArenaMHAHostPool._1427_claim_n = _cn
         if _cn <= 12 or _cn % 512 == 0:
@@ -1867,7 +1889,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 self._evict_for_claim(arena, int((st == 4).sum()),
                                       claim_stem=stems[0] if stems else None)
                 redo = np.nonzero(st == 4)[0]
-                s2, st2, g2 = arena.claim_slots_np([stems[int(i)] for i in redo], [self._page_bytes] * int(redo.size))
+                s2, st2, g2 = _host_write_claim_np(arena, [stems[int(i)] for i in redo], [self._page_bytes] * int(redo.size))
                 slots[redo] = s2; st[redo] = st2; gens[redo] = g2
                 if bool((st2 == 2).any()):
                     arena.ref_slots(s2[st2 == 2].tolist(), +1)
@@ -2173,7 +2195,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         totals = [self._page_bytes] * len(stems)
         if self._pending_mask is not None:
             return self._claim_np(stems, totals)
-        got = arena.claim_slots(stems, totals)
+        got = _host_write_claim(arena, stems, totals)
         # xsn327: D's dormant re-reads never find P's pages -- name what P claims
         # (full stem incl. suffix) so the reader's stem can be compared by eye.
         _cn = getattr(ArenaMHAHostPool, "_1427_claim_n", 0) + 1
@@ -2194,7 +2216,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 self._evict_for_claim(arena, sum(1 for _, st, _ in got if st == 4),
                                       claim_stem=stems[0] if stems else None)
                 redo = [i for i, (_, st, _) in enumerate(got) if st == 4]
-                again = arena.claim_slots([stems[i] for i in redo], [self._page_bytes] * len(redo))
+                again = _host_write_claim(arena, [stems[i] for i in redo], [self._page_bytes] * len(redo))
                 for i, g in zip(redo, again):
                     got[i] = g
                 late = [g[0] for g in again if g[1] == 2]

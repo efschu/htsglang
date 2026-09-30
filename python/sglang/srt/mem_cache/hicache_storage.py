@@ -89,6 +89,34 @@ def _reap_orphans_before_fill(arena, stems) -> int:
     return len(freed)
 
 
+#: L3FILL-JOINED (30.09.): the JOINED line names at most this many holders
+JOIN_OWNERS_K = 4
+
+
+def _join_owner_text(arena, joined) -> str:
+    """L3FILL-JOINED (30.09., NF y4a ep36): per joined stem the holder --
+    slot/age since its last claim or merge/pid/role/generation/open writers --
+    for the first ``JOIN_OWNERS_K``, plus the oldest age and the holder pids
+    over all. y4a: 29 stems stayed JOINED for 5 read cycles on D and on P and
+    the line could not say who held them."""
+    info_fn = getattr(arena, "claim_info", None)
+    if not callable(info_fn):
+        return ""
+    try:
+        from sglang.srt.mem_cache.storage.file.hicache_arena import claim_owner_text
+
+        rows = info_fn([int(s) for _, s, _ in joined])
+    except Exception:  # noqa: BLE001 - an instrument never raises
+        return ""
+    if not rows:
+        return ""
+    ages = [int(r[2]) for r in rows]
+    pids = sorted({int(r[3]) for r in rows})
+    head = " ".join(claim_owner_text(r) for r in rows[:JOIN_OWNERS_K])
+    return " holders=[%s%s] oldest_ms=%d pids=%s" % (
+        head, " ..." if len(rows) > JOIN_OWNERS_K else "", max(ages), pids[:8])
+
+
 def _unclaim_fill_joins(arena, joined) -> None:
     """A fill never keeps a JOINED claim (status 1): it writes nothing into
     another writer's slot, so its open-writer mark is given back at once --
@@ -97,12 +125,147 @@ def _unclaim_fill_joins(arena, joined) -> None:
     unclaim = getattr(arena, "unclaim", None)
     if callable(unclaim):
         unclaim([int(s) for _, s, _ in joined], [int(g) for _, _, g in joined])
+    owners = _join_owner_text(arena, joined)   # after our own open mark went: the others
     _FILL_JOIN_N[0] += 1
     _FILL_JOIN_N[1] += len(joined)
     k = _FILL_JOIN_N[0]
     if k <= 16 or (k & (k - 1)) == 0:
         logger.info("L3-FILL JOINED n=%d stems=%d total=%d: a live writer holds the claim -- "
-                    "unclaimed, a miss for this read", k, len(joined), _FILL_JOIN_N[1])
+                    "unclaimed, a miss for this read%s", k, len(joined), _FILL_JOIN_N[1], owners)
+
+
+#: L3FILL-JOINED (30.09.): the name prefix of the prefetch io threads
+#: (``HiCacheController._start_prefetch_io_workers``: ``hicache-prefetch-io-<k>``)
+PREFETCH_IO_THREAD_PREFIX = "hicache-prefetch-io"
+_JOIN_WAIT_N = [0, 0, 0]   # waits, stems waited for, stems that completed in the wait
+
+
+def fill_join_wait_ms() -> int:
+    """L3FILL-JOINED (2): how long this thread's fill may wait for a JOINED stem.
+
+    Only a prefetch io thread waits. The KV path that reaches the fill runs
+    there: ``prefetch_io_aux_func`` (thread ``hicache-prefetch-io-<k>``) ->
+    ``_page_transfer`` -> ``page_get_func`` = ``_generic_page_get`` ->
+    ``_arena_page_get`` -> ``arena_fill_from_disk(prefix=True)``. Every other
+    caller -- the scheduler's own thread (admission, load-back), the flip
+    legs, the decode, the write-behind -- gets 0 and keeps the immediate miss."""
+    if not threading.current_thread().name.startswith(PREFETCH_IO_THREAD_PREFIX):
+        return 0
+    try:
+        return max(0, int(envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.get()))
+    except Exception:  # noqa: BLE001 - no switch, no wait
+        return 0
+
+
+def _await_fill_joins(arena, stems, joined, wait_ms: int) -> dict:
+    """L3FILL-JOINED (2): poll the JOINED stems until another writer's claim
+    turns COMPLETE (same answer as claim status 2: complete, usable) or the
+    wait is spent. Returns {index: slot} of those that completed."""
+    find = getattr(arena, "find_slots", None)
+    if not joined or wait_ms <= 0 or not callable(find):
+        return {}
+    pend = {int(i): stems[int(i)] for i, _s, _g in joined}
+    done = {}
+    t0 = time.perf_counter()
+    deadline = t0 + wait_ms / 1000.0
+    while pend:
+        keys = list(pend)
+        for i, (slot, state) in zip(keys, find([pend[i] for i in keys])):
+            if int(slot) >= 0 and int(state) == 2:
+                done[i] = int(slot)
+                pend.pop(i)
+        if not pend or time.perf_counter() >= deadline:
+            break
+        time.sleep(0.005)
+    _JOIN_WAIT_N[0] += 1
+    _JOIN_WAIT_N[1] += len(joined)
+    _JOIN_WAIT_N[2] += len(done)
+    k = _JOIN_WAIT_N[0]
+    if k <= 16 or (k & (k - 1)) == 0 or pend:
+        logger.info("L3-FILL JOIN-WAIT n=%d stems=%d completed=%d still_claimed=%d waited_ms=%.0f "
+                    "bound_ms=%d totals=%d/%d (a JOINED stem another writer completed inside the "
+                    "wait is read from L2 instead of ending the prefix; prefetch io thread only)",
+                    k, len(joined), len(done), len(pend), (time.perf_counter() - t0) * 1000.0,
+                    int(wait_ms), _JOIN_WAIT_N[2], _JOIN_WAIT_N[1])
+    return done
+
+
+_STALE_REAP_N = [0, 0]   # reaps, stems re-claimed
+_LATE_COMPLETE_N = [0, 0]   # lines, slots whose late completion was refused
+#: quarantined slots whose old writer never resolved are freed after this many
+#: stale bounds (the writer is gone for good)
+QUARANTINE_BACKSTOP_FACTOR = 12
+
+
+def fill_stale_claim_ms() -> int:
+    try:
+        return max(0, int(float(envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.get()) * 1000.0))
+    except Exception:  # noqa: BLE001 - no switch, no reap
+        return 0
+
+
+def _reap_stale_live_joins(arena, stems, joined, total_bytes: int) -> list:
+    """L3FILL-JOINED (3): the JOINED stems whose holder delivered no byte for
+    ``SGLANG_WEG2_L3FILL_STALE_CLAIM_S`` are taken from their keys (quarantine,
+    generation-safe) and claimed fresh by this fill. Returns the new todo
+    entries (index, slot, generation, stem) -- read from disk like any fresh
+    claim. y4a ep36: 29 such stems ended a 1070-page prefix read at 146."""
+    min_ms = fill_stale_claim_ms()
+    q = getattr(arena, "quarantine_stale", None)
+    if not joined or min_ms <= 0 or not callable(q):
+        return []
+    try:
+        arena.quarantine_sweep(min_ms * QUARANTINE_BACKSTOP_FACTOR)
+    except Exception:  # noqa: BLE001 - the sweep is housekeeping
+        pass
+    owners = _join_owner_text(arena, joined)
+    st = q([int(s) for _, s, _ in joined], [int(g) for _, _, g in joined], min_ms)
+    reaped = [joined[k] for k, v in enumerate(st) if int(v) == 1]
+    if not reaped:
+        return []
+    fresh = []
+    for (i, _s, _g), (slot, status, gen) in zip(
+            reaped, _fill_claim(arena, [stems[int(i)] for i, _s, _g in reaped], int(total_bytes))):
+        if int(status) == 0:
+            fresh.append((int(i), int(slot), int(gen), stems[int(i)]))
+        elif int(status) == 1:
+            _unclaim_fill_joins(arena, [(int(i), int(slot), int(gen))])
+    _STALE_REAP_N[0] += 1
+    _STALE_REAP_N[1] += len(fresh)
+    k = _STALE_REAP_N[0]
+    if k <= 16 or (k & (k - 1)) == 0:
+        logger.warning(
+            "L3-FILL STALE-CLAIM-REAP n=%d stems=%d reaped=%d reclaimed=%d total=%d bound_ms=%d%s "
+            "(a claim with a live writer and no byte for the bound was quarantined from its key "
+            "-- generation kept, a late completion of the old writer is refused by name; the "
+            "stem is read from disk into a fresh slot)",
+            k, len(joined), len(reaped), len(fresh), _STALE_REAP_N[1], min_ms, owners)
+    return fresh
+
+
+def _note_late_complete(slots, statuses) -> None:
+    """L3FILL-JOINED (3): a fill's completion the arena refused because its
+    slot was reaped (6) or recycled (3) under it -- named, never freed again
+    (the slot may already be the stem's or another stem's new home)."""
+    _LATE_COMPLETE_N[0] += 1
+    _LATE_COMPLETE_N[1] += len(slots)
+    k = _LATE_COMPLETE_N[0]
+    if k <= 16 or (k & (k - 1)) == 0:
+        logger.warning("L3-FILL LATE-COMPLETE REFUSED n=%d slots=%s statuses=%s total=%d (6 = the "
+                       "claim was reaped as stale while this fill read it, 3 = recycled; the bytes "
+                       "are discarded, the slot is not freed by this writer)",
+                       k, list(slots)[:4], sorted(set(int(x) for x in statuses)), _LATE_COMPLETE_N[1])
+
+
+def _fill_claim(arena, stems, total_bytes: int):
+    """The fill's claims, stamped with the l3fill role (L3FILL-JOINED); a
+    hermetic fake arena without the keyword claims as before."""
+    from sglang.srt.mem_cache.storage.file.hicache_arena import ROLE_L3FILL
+
+    try:
+        return arena.claim_slots(stems, [int(total_bytes)] * len(stems), role=ROLE_L3FILL)
+    except TypeError:
+        return arena.claim_slots(stems, [int(total_bytes)] * len(stems))
 
 
 #: HICACHE-DRAFT-TIER (user order 2026-09-24, see environ.py): the one
@@ -3136,7 +3299,7 @@ class HiCacheFile(HiCacheStorage):
         joined = []
         if cand:
             _reap_orphans_before_fill(arena, [st for _, st in cand])
-            claims = arena.claim_slots([st for _, st in cand], [int(total_bytes)] * len(cand))
+            claims = _fill_claim(arena, [st for _, st in cand], int(total_bytes))
             full = []
             for (i, st), (slot, status, gen) in zip(cand, claims):
                 if status == 2:
@@ -3155,7 +3318,7 @@ class HiCacheFile(HiCacheStorage):
                 except Exception:  # noqa: BLE001
                     pass
                 for (i, st), (slot, status, gen) in zip(
-                        full, arena.claim_slots([st for _, st in full], [int(total_bytes)] * len(full))):
+                        full, _fill_claim(arena, [st for _, st in full], int(total_bytes))):
                     if status == 0:
                         todo.append((i, slot, gen, st))
                     elif status == 2:
@@ -3167,6 +3330,15 @@ class HiCacheFile(HiCacheStorage):
             # fill writes nothing into it, so its open-writer mark goes at once
             # -- left behind, the slot could never be reaped nor complete
             _unclaim_fill_joins(arena, joined)
+            # L3FILL-JOINED (2): wait (bounded, prefetch io thread only) for the
+            # other writer instead of ending the prefix at its page
+            _waited = _await_fill_joins(arena, stems, joined, fill_join_wait_ms())
+            for i, s_ in _waited.items():
+                out[i] = s_
+            joined = [j for j in joined if int(j[0]) not in _waited]
+            # L3FILL-JOINED (3): a holder with no byte for the stale bound loses
+            # the stem; this fill claims it fresh and reads it from disk
+            todo.extend(_reap_stale_live_joins(arena, stems, joined, int(total_bytes)))
         if prefix and todo:
             # (a): the first stem that neither raced in complete nor got a
             # claim ends the prefix -- its successors are not read
@@ -3188,7 +3360,8 @@ class HiCacheFile(HiCacheStorage):
         ptrs = [arena.slot_ptr(slot) for _, slot, _, _ in todo]
         rc, threads = l3_read_pages_parallel(pio, paths, int(total_bytes), ptrs)
         ok = [k for k, r in enumerate(rc) if r == 0]
-        bad = [todo[k][1] for k, r in enumerate(rc) if r != 0]
+        bad = [(todo[k][1], todo[k][2]) for k, r in enumerate(rc) if r != 0]
+        late = []
         filled = 0
         if ok:
             cs = arena.complete_slots([todo[k][1] for k in ok], [todo[k][2] for k in ok],
@@ -3197,10 +3370,18 @@ class HiCacheFile(HiCacheStorage):
                 if c in (1, 2):
                     out[todo[k][0]] = todo[k][1]
                     filled += 1
+                elif c in (3, 6):
+                    late.append((todo[k][1], int(c)))   # reaped / recycled under us: not ours
                 else:
-                    bad.append(todo[k][1])
+                    bad.append((todo[k][1], todo[k][2]))
+        if late:
+            _note_late_complete([s for s, _ in late], [c for _, c in late])
         if bad:
-            _free_named(arena, bad, "l3fill_complete_refused")
+            _fg = getattr(arena, "free_if_gen", None)
+            if callable(_fg):
+                _fg([s for s, _ in bad], [g for _, g in bad], reason="l3fill_complete_refused")
+            else:
+                _free_named(arena, [s for s, _ in bad], "l3fill_complete_refused")
         k = getattr(self, "_1433_n", 0) + 1
         self._1433_n = k
         if k <= 8 or k % 256 == 0:

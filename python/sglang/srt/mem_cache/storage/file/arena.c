@@ -15,7 +15,10 @@
  *   header_bytes, holding the bitmap) | data[slots * slot_bytes]
  *
  * Slot states: 0 FREE, 1 CLAIMED (being filled), 2 COMPLETE (readable),
- * 3 EVICTING (leaving; no new readers).
+ * 3 EVICTING (leaving; no new readers), 4 QUARANTINE (a stale live claim
+ * taken away from its key -- L3FILL-JOINED (3); its old writer may still
+ * hold the bytes, so the slot is freed only once that writer resolved or a
+ * long backstop passed).
  */
 #define _GNU_SOURCE
 #include <stdatomic.h>
@@ -23,12 +26,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define A_MAGIC 0x41524e4132363931ULL /* "ARNA2691" */
 #define S_FREE 0u
 #define S_CLAIMED 1u
 #define S_COMPLETE 2u
 #define S_EVICTING 3u
+#define S_QUARANTINE 4u
 #define TOMB (~0ULL)
 #define KV_IVALS 64      /* interval capacity for slots <= 1 MiB */
 #define BLOB_IVALS 8192  /* interval capacity for larger slots (mamba blobs) */
@@ -64,6 +69,9 @@ typedef struct {
     uint64_t cap_ivals;        /* capacity of ivals[] */
     _Atomic uint32_t touched_ms; /* #231: CLOCK_MONOTONIC ms (mod 2^32) of the last claim / merge */
     _Atomic uint32_t writers;    /* #231: direct writers of this generation: claims << 16 | open */
+    uint32_t owner_pid;          /* L3FILL-JOINED (30.09.): pid of the fresh claimant of this generation */
+    uint32_t owner_role;         /* its role (arena_set_claim_role; 0 other, 1 l3fill, 2 host-write) */
+    _Atomic uint32_t progress_ms; /* ms of the fresh claim or the last MERGE -- a join never moves it */
     char stem[192];            /* the store stem, so ANY rank can evict this page to disk */
     Ival ivals[];              /* cap_ivals entries, sorted, disjoint */
 } SlotHeader;
@@ -207,6 +215,30 @@ static int64_t find_slot(uint8_t *base, uint64_t klo, uint64_t khi) {
     return -1;
 }
 
+/* L3FILL-JOINED (3): free a QUARANTINE slot once no writer is open on it and
+ * nobody references it (its old writer resolved: completed late or gave up).
+ * Returns 1 when freed. The generation moves, so any later call of the old
+ * writer on this slot is refused as 'recycled'. */
+static int quarantine_release(uint8_t *base, uint64_t slot) {
+    ArenaHeader *h = hdr(base);
+    SlotHeader *sh = slot_hdr(base, slot);
+    if (atomic_load(&sh->state) != S_QUARANTINE) return 0;
+    if ((atomic_load(&sh->writers) & W_OPEN) != 0 || atomic_load(&sh->refcount) != 0) return 0;
+    uint32_t expect = S_QUARANTINE;
+    if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) return 0;
+    sh->n_ivals = 0;
+    sh->generation++;
+    atomic_store(&sh->writers, 0u);
+    atomic_fetch_sub(&h->n_claimed, 1);
+    atomic_store(&sh->state, S_FREE);
+    return 1;
+}
+
+/* L3FILL-JOINED (30.09.): the role this THREAD claims with (ctypes calls run
+ * in the calling thread), stamped on every fresh claim with the pid */
+static __thread uint32_t tl_claim_role = 0;
+void arena_set_claim_role(uint32_t role) { tl_claim_role = role; }
+
 /* claim a FREE slot for key (index entry published); -1 = arena full */
 static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t total, int *fresh) {
     ArenaHeader *h = hdr(base);
@@ -239,6 +271,10 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
             atomic_store(&sh->refcount, 0);
             atomic_store(&sh->writers, 0u);
             atomic_store(&sh->touched_ms, mono_ms());
+            /* L3FILL-JOINED: who holds this claim, so a JOIN can name it */
+            sh->owner_pid = (uint32_t)getpid();
+            sh->owner_role = tl_claim_role;
+            atomic_store(&sh->progress_ms, mono_ms());
             /* publish in the index */
             _Atomic uint64_t *keys = index_keys(base);
             _Atomic uint32_t *slots = index_slots(base);
@@ -600,6 +636,15 @@ int64_t arena_complete(uint8_t *base, int64_t n, const int64_t *slots, const int
         SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
         if ((int64_t)sh->generation != gens[i]) { status[i] = 3; e += k; continue; }
         uint32_t st0 = atomic_load(&sh->state);
+        if (st0 == S_QUARANTINE) {
+            /* L3FILL-JOINED (3): the claim was reaped as stale while this
+             * writer was away -- its bytes are discarded (the key already
+             * has a new slot), the writer is resolved, and the last one out
+             * frees the quarantined slot. Named status 6. */
+            writer_done(sh);
+            quarantine_release(base, (uint64_t)slots[i]);
+            status[i] = 6; e += k; continue;
+        }
         if (st0 == S_COMPLETE) { writer_done(sh); status[i] = 2; e += k; ok++; continue; }
         if (st0 != S_CLAIMED) { status[i] = 4; e += k; continue; }  /* freed or evicting */
         atomic_thread_fence(memory_order_release);
@@ -607,6 +652,7 @@ int64_t arena_complete(uint8_t *base, int64_t n, const int64_t *slots, const int
         e += k;
         if (mr < 0) { writer_done(sh); status[i] = 5; continue; }
         atomic_store(&sh->touched_ms, mono_ms());
+        atomic_store(&sh->progress_ms, mono_ms());   /* L3FILL-JOINED: bytes arrived */
         writer_done(sh);
         if (mr == 0) { status[i] = 0; ok++; continue; }
         uint32_t expect = S_CLAIMED;
@@ -823,7 +869,7 @@ void arena_free_slots(uint8_t *base, int64_t n, const int64_t *slots) {
         /* #1431: keep the occupancy counters exact (EVICTING was already
          * taken out of n_complete by arena_evict_candidates). */
         if (prev == S_COMPLETE) atomic_fetch_sub(&h->n_complete, 1);
-        else if (prev == S_CLAIMED) atomic_fetch_sub(&h->n_claimed, 1);
+        else if (prev == S_CLAIMED || prev == S_QUARANTINE) atomic_fetch_sub(&h->n_claimed, 1);
     }
 }
 
@@ -1255,4 +1301,162 @@ void l3idx_clear(uint8_t *base) {
     memset(base + L3_HDR_BYTES, 0, (size_t)(16 * h->cap));
     atomic_store(&h->count, 0);
     l3_unlock(h);
+}
+
+/* ------------------------------------------------------------------------
+ * L3FILL-JOINED (30.09., NF y4a ep36, weg2-36-74): a JOIN names its holder.
+ * The read stopped 146 pages into a 1070-page prefix on every D rank and on
+ * P ('L3-FILL JOINED stems=29: a live writer holds the claim') for 5 cycles
+ * and >= 6 s, and nothing said WHO held the claim or for how long.
+ * ------------------------------------------------------------------------ */
+
+/* per slot: generation, ms without byte progress (fresh claim or last merge;
+ * a JOIN does not count -- every reader's join refreshed touched_ms), the fresh
+ * claimant's pid and role, open writers, state. Returns the count answered. */
+int64_t arena_claim_info(uint8_t *base, int64_t n, const int64_t *slots, int64_t *gen_out,
+                         int64_t *age_out, int64_t *pid_out, int64_t *role_out,
+                         int64_t *open_out, int8_t *state_out) {
+    ArenaHeader *h = hdr(base);
+    uint32_t now = mono_ms();
+    int64_t got = 0;
+    for (int64_t i = 0; i < n; i++) {
+        gen_out[i] = -1; age_out[i] = -1; pid_out[i] = 0; role_out[i] = 0; open_out[i] = 0;
+        state_out[i] = 0;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        gen_out[i] = (int64_t)sh->generation;
+        age_out[i] = (int64_t)(uint32_t)(now - atomic_load(&sh->progress_ms));
+        pid_out[i] = (int64_t)sh->owner_pid;
+        role_out[i] = (int64_t)sh->owner_role;
+        open_out[i] = (int64_t)(atomic_load(&sh->writers) & W_OPEN);
+        state_out[i] = (int8_t)atomic_load(&sh->state);
+        got++;
+    }
+    return got;
+}
+
+/* the oldest CLAIMED slot (longest without byte progress):
+ * out = [slot, age_ms, pid, role, generation, open writers, claimed count,
+ * slots in state >= 4]. Returns the claimed count (-1 slot when none). */
+int64_t arena_oldest_claim(uint8_t *base, int64_t *out) {
+    ArenaHeader *h = hdr(base);
+    uint32_t now = mono_ms();
+    int64_t best = -1, best_age = -1, claimed = 0, other = 0;
+    for (uint64_t s = 0; s < h->slots; s++) {
+        SlotHeader *sh = slot_hdr(base, s);
+        uint32_t st = atomic_load(&sh->state);
+        if (st >= 4u) { other++; continue; }
+        if (st != S_CLAIMED) continue;
+        claimed++;
+        int64_t age = (int64_t)(uint32_t)(now - atomic_load(&sh->progress_ms));
+        if (age > best_age) { best_age = age; best = (int64_t)s; }
+    }
+    out[0] = best; out[1] = best_age; out[2] = 0; out[3] = 0; out[4] = -1; out[5] = 0;
+    out[6] = claimed; out[7] = other;
+    if (best >= 0) {
+        SlotHeader *sh = slot_hdr(base, (uint64_t)best);
+        out[2] = (int64_t)sh->owner_pid;
+        out[3] = (int64_t)sh->owner_role;
+        out[4] = (int64_t)sh->generation;
+        out[5] = (int64_t)(atomic_load(&sh->writers) & W_OPEN);
+    }
+    return claimed;
+}
+
+/* ------------------------------------------------------------------------
+ * L3FILL-JOINED (3), 30.09. (NF y4a ep36): a claim whose writer is alive but
+ * delivered no byte for min_age_ms blocks every L3 fill of its stem for good
+ * -- #231's reap_partial only frees claims with NO open writer. y4a: 29 stems
+ * stayed JOINED for >= 6 s on D and P, the read of a 1070-page prefix ended at
+ * 146, the request was re-prefilled on P (70846 tokens).
+ * Generation-safe QUARANTINE instead of a free: the key's index cell is
+ * tombstoned (the next claim of the stem gets a FRESH slot and reads it from
+ * disk), but the old slot keeps its generation and stays out of the free list
+ * -- the old writer may still be writing its bytes there. When it completes
+ * late, arena_complete answers 6 (named, bytes discarded); when it resolves,
+ * the last one out frees the slot (quarantine_release), or the sweep's
+ * backstop does. A referenced slot is never taken.
+ * status per slot: 1 quarantined, 0 young (progress within min_age_ms),
+ * 2 generation moved / not CLAIMED, 3 referenced.
+ * ------------------------------------------------------------------------ */
+int64_t arena_quarantine_stale(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
+                               int64_t min_age_ms, int8_t *status) {
+    ArenaHeader *h = hdr(base);
+    uint32_t now = mono_ms();
+    int64_t done = 0;
+    for (int64_t i = 0; i < n; i++) {
+        status[i] = 2;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) continue;
+        if (atomic_load(&sh->state) != S_CLAIMED) continue;
+        if (atomic_load(&sh->refcount) != 0) { status[i] = 3; continue; }
+        uint32_t p = atomic_load(&sh->progress_ms);
+        if ((uint32_t)(now - p) < (uint32_t)min_age_ms) { status[i] = 0; continue; }
+        uint32_t expect = S_CLAIMED;
+        if (!atomic_compare_exchange_strong(&sh->state, &expect, S_QUARANTINE)) continue;
+        if ((int64_t)sh->generation != gens[i] || atomic_load(&sh->refcount) != 0
+            || atomic_load(&sh->progress_ms) != p) {
+            atomic_store(&sh->state, S_CLAIMED);   /* moved under us: leave it */
+            continue;
+        }
+        _Atomic uint64_t *keys = index_keys(base);
+        _Atomic uint32_t *islots = index_slots(base);
+        uint64_t mask = h->index_cap - 1;
+        uint64_t j = mix64(sh->key_lo) & mask;
+        for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
+            uint64_t k = atomic_load(&keys[j]);
+            if (k == 0) break;
+            if (k == sh->key_lo && atomic_load(&islots[j]) == (uint32_t)slots[i]) {
+                atomic_store(&keys[j], TOMB);
+                break;
+            }
+        }
+        sh->key_lo = 0; sh->key_hi = 0;
+        atomic_store(&sh->touched_ms, now);   /* quarantine start, for the backstop */
+        quarantine_release(base, (uint64_t)slots[i]);   /* nobody open: free at once */
+        status[i] = 1;
+        done++;
+    }
+    return done;
+}
+
+/* free QUARANTINE slots nobody holds any more, and -- backstop -- those
+ * quarantined longer than backstop_ms (their writer never came back).
+ * Returns the number freed. */
+int64_t arena_quarantine_sweep(uint8_t *base, int64_t backstop_ms) {
+    ArenaHeader *h = hdr(base);
+    uint32_t now = mono_ms();
+    int64_t freed = 0;
+    for (uint64_t s = 0; s < h->slots; s++) {
+        SlotHeader *sh = slot_hdr(base, s);
+        if (atomic_load(&sh->state) != S_QUARANTINE) continue;
+        if (quarantine_release(base, s)) { freed++; continue; }
+        if (atomic_load(&sh->refcount) != 0) continue;
+        if ((uint32_t)(now - atomic_load(&sh->touched_ms)) < (uint32_t)backstop_ms) continue;
+        atomic_store(&sh->writers, 0u);
+        if (quarantine_release(base, s)) freed++;
+    }
+    return freed;
+}
+
+/* free the given slots only while they still carry the caller's generation
+ * and are CLAIMED or QUARANTINE (a writer giving up its own fresh claim).
+ * status: 1 freed, 0 skipped (generation moved / other state). */
+int64_t arena_free_if_gen(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
+                          int8_t *status) {
+    ArenaHeader *h = hdr(base);
+    int64_t freed = 0;
+    for (int64_t i = 0; i < n; i++) {
+        status[i] = 0;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) continue;
+        uint32_t st = atomic_load(&sh->state);
+        if (st != S_CLAIMED && st != S_QUARANTINE) continue;
+        arena_free_slots(base, 1, &slots[i]);
+        status[i] = 1;
+        freed++;
+    }
+    return freed;
 }
