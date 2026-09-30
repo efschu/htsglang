@@ -2361,6 +2361,12 @@ class Envs:
     # runs ~1 s each off the reset-joined threads, 23 flips interleave max 2.34 s, needle MATCH; user order: a
     # proven performance switch is default on). Off: byte-identical old path, the whole run stays in reserve().
     SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH = EnvBool(True)
+    # 30.09. (NF y3u 5bedac26f1, weg2-0-5): the L3 LRU evicted the QSA index page of a KV page alone -- D's owner
+    # unlinked 8 `{h}.qsa_indexer` files at 00:35:43 whose KV pages stayed on disk (index order: QSA 21:41:25, KV
+    # 00:10:24), so D's resume and P's reroute both capped at 47 of 1996 pages and P re-prefilled 127813 tokens.
+    # On: the QSA index page of a KV page that is on disk is never the victim; it leaves together with its KV page.
+    # Off: byte-identical old path (every file its own LRU entry).
+    SGLANG_HICACHE_L3_SIDECAR_PAIR_EVICT = EnvBool(True)
     SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
     # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)

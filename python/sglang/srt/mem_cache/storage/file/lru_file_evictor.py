@@ -105,6 +105,39 @@ _EVICT_LOG_INTERVAL_S = 10.0
 _BG_EVICT_BATCH = 256
 
 
+#: L3-PAIR (30.09., NF y3u 5bedac26f1): the per-page sidecars that the claim takes as ALL_PAGES
+#: (``batch_exists_v2``: a KV page without one is worth nothing). The tag is ``PoolName.QSA_INDEXER``
+#: with its dot, exactly as ``HiCacheFile._get_component_key`` builds the stem: ``{hash}.qsa_indexer{sfx}``
+#: beside the KV page ``{hash}{sfx}``. Literal here so this module stays free of the backend import;
+#: the unit test pins it to the enum.
+_PAIR_SIDECAR_TAGS: Tuple[str, ...] = (".qsa_indexer",)
+
+
+def _sidecar_kv_twin(stem: str) -> Optional[str]:
+    """The KV page stem an ALL_PAGES sidecar stem belongs to, or None.
+
+    ``{h}.qsa_indexer{sfx}`` -> ``{h}{sfx}``. The page hash carries no dot, so
+    the tag must be the FIRST dot of the stem (a model name in the suffix,
+    ``_Qwen3.8-...``, has dots of its own)."""
+    for tag in _PAIR_SIDECAR_TAGS:
+        i = stem.find(tag)
+        if i > 0 and stem.find(".") == i:
+            return stem[:i] + stem[i + len(tag):]
+    return None
+
+
+def _kv_sidecar_twins(stem: str) -> Tuple[str, ...]:
+    """The ALL_PAGES sidecar stems of a KV page stem (``{h}{sfx}``), or ().
+
+    A KV page stem has no dot before the suffix's leading underscore; every
+    component stem (``{h}.mamba...``, ``{h}.qsa_indexer...``) has one."""
+    u = stem.find("_")
+    d = stem.find(".")
+    if u <= 0 or (0 <= d < u):
+        return ()
+    return tuple(stem[:u] + tag + stem[u:] for tag in _PAIR_SIDECAR_TAGS)
+
+
 class Weg2L3EvictorPauseRefused(RuntimeError):
     """NF review 3 (B): the background L3 evictor could not be parked at the sleep entry (named stop)."""
 
@@ -376,6 +409,11 @@ class LRUFileEvictor:
         self._evict_runs_suppressed = 0
         # EVICT_OFFPATH (29.09.): the bulk eviction leaves reserve() for a thread no reset joins (see environ).
         self._evict_offpath = bool(envs.SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH.get())
+        # L3-PAIR (30.09.): a KV page's QSA index page shares its lifetime (see _evict_one_lru_locked).
+        self._pair_evict = bool(envs.SGLANG_HICACHE_L3_SIDECAR_PAIR_EVICT.get())
+        self._pair_deferred = 0      # sidecar victims kept because their KV page is on disk
+        self._pair_with_kv = 0       # sidecars unlinked in the same step as their KV page
+        self._pair_logged = (0, 0)
         self._bg_evict_event = threading.Event()
         self._bg_evict_thread: Optional[threading.Thread] = None
         self._bg_evict_runs = 0
@@ -1862,6 +1900,23 @@ class LRUFileEvictor:
             # the space is not there, rather than looping forever.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
+        if self._pair_evict:
+            twin = _sidecar_kv_twin(evict_stem)
+            if twin is not None and self._kv_twin_on_disk_locked(twin):
+                # L3-PAIR (30.09., NF y3u 5bedac26f1, weg2-0-5): the QSA index
+                # page is worth nothing without its KV page and the KV page
+                # nothing without it (batch_exists_v2 takes it ALL_PAGES). The
+                # two files kept separate recencies -- a KV rewrite or read
+                # moved the KV page, never its index page (store index at the
+                # attach: QSA 21:41:25 at position 46 of 174419, KV 00:10:24 at
+                # 139279) -- so D's owner unlinked 8 index pages at 00:35:43
+                # whose KV pages stayed, D's resume capped at 47 of 1996 pages,
+                # W50 midstream, P re-prefilled 127813 tokens (32.49 s).
+                # Same skip-and-repin as a pin: the index page leaves in the
+                # step that unlinks its KV page (_unlink_pair_sidecars_locked).
+                self._lru[evict_stem] = evict_size
+                self._pair_deferred += 1
+                return "skipped", 0
         # The INJECTED resolver, not a flat join: this backend hands the
         # evictor `path_for_stem=self._existing_path`, which knows the sharded
         # layout. A flat join here misses the file, `os.remove` fails, the
@@ -1894,7 +1949,69 @@ class LRUFileEvictor:
             self._lru.move_to_end(evict_stem, last=False)
             return "stop", 0
         self._total_bytes -= evict_size
+        if self._pair_evict:
+            freed += self._unlink_pair_sidecars_locked(evict_stem)
         return "evicted", freed
+
+    def _kv_twin_on_disk_locked(self, kv_stem: str) -> bool:
+        """Is the KV page of a sidecar victim still on disk? This owner's index
+        first; a KV page only the sibling group indexes (or one written after
+        this owner's attach) is asked of the file itself. Caller holds _lock."""
+        if kv_stem in self._lru:
+            return True
+        try:
+            return os.path.exists(self._path_for_stem(kv_stem))
+        except Exception:  # noqa: BLE001 - no answer is no protection, the old path
+            return False
+
+    def _unlink_pair_sidecars_locked(self, kv_stem: str) -> int:
+        """L3-PAIR: unlink the ALL_PAGES sidecars of a KV page this step just
+        unlinked -- the same bookkeeping as a victim (index, #1459 L3 index,
+        on_evict, journal ``E``, bytes). Skips what a victim would skip: an
+        in-flight write, the sibling group's page, a pinned page. Returns the
+        bytes freed. Caller holds _lock."""
+        freed = 0
+        for tw in _kv_sidecar_twins(kv_stem):
+            size = self._lru.get(tw)
+            if size is None or tw in self._pending_writes or tw in self._foreign_indexed:
+                continue
+            if self._pins is not None and self._pins.is_pinned(tw):
+                continue
+            try:
+                os.remove(self._path_for_stem(tw))
+                freed += size
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.warning(f"HiCacheFile pair eviction failed for {tw}: {e}")
+                continue
+            del self._lru[tw]
+            _idx = getattr(self, "l3_index", None)
+            if _idx is not None:
+                try:
+                    _idx.remove([tw])  # #1459
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._on_evict is not None:
+                self._on_evict(tw)
+            if self._journal is not None:
+                self._journal.write("E", time.time(), size, tw)
+            self._total_bytes -= size
+            self._pair_with_kv += 1
+        return freed
+
+    def _pair_report(self) -> None:
+        """One line when the L3-PAIR counters moved since the last one (rides
+        the eviction reports' rate limit)."""
+        cur = (self._pair_deferred, self._pair_with_kv)
+        if not self._pair_evict or cur == self._pair_logged:
+            return
+        self._pair_logged = cur
+        logger.info(
+            "L3-PAIR EVICT deferred=%d with_kv=%d (the QSA index page of a KV page on disk "
+            "is never the victim; it is unlinked in the step that unlinks its KV page -- "
+            "SGLANG_HICACHE_L3_SIDECAR_PAIR_EVICT)", cur[0], cur[1],
+        )
 
     def _evict_while(self, should_continue) -> int:
         """Evict oldest non-pending entries while ``should_continue(reclaimed)``.
@@ -2060,6 +2177,7 @@ class LRUFileEvictor:
             f"threads); directory {before} -> {after} B toward cap {self.max_size_bytes} B x ratio "
             f"{self.eviction_ratio:.2f}; runs {self._bg_evict_runs}, total {self._bg_evict_reclaimed} B"
         )
+        self._pair_report()
 
     def _evict_locked(self, needed_bytes: int, target: Optional[int] = None) -> None:
         """Evict LRU entries until DIRECTORY + needed <= cap*ratio.
@@ -2106,3 +2224,4 @@ class LRUFileEvictor:
             f"a suffix this group does not scan + {self._staging_bytes} B "
             f"staging; {suppressed} further run(s) suppressed since the last line"
         )
+        self._pair_report()
