@@ -371,3 +371,99 @@ def test_one_re_plan_per_round_boundary():
             mock.patch.object(dsv, "runtime_tick", lambda sched: ran.append("stage")):
         assert R.round_boundary(s) is None
     assert ran == ["stage"]
+
+
+# ---------------------------------------------------------------- 30.09. idle shrink (an EMPTY D shrinks)
+
+def _idle_run(s, ctl, ticks, clock, step_s=0.2):
+    got = None
+    for _ in range(ticks):
+        clock[0] += step_s
+        ctxs = _tick_env(ctl) + [mock.patch.object(R.time, "monotonic", lambda: clock[0])]
+        got = _run(ctxs, lambda: R.tick(s)) or got
+    return got
+
+
+def test_an_empty_d_shrinks_in_the_idle_loop_with_its_own_marker(caplog):
+    """y4x 16:33:26-36: D empty, n=6 of cap 6, nothing shrank. The idle loop
+    still iterates (IdleSleeper polls <= 50 ms); after IDLE_ASK_ROUNDS idle
+    iterations past the measured price the empty D shrinks, trigger=idle."""
+    caplog.set_level(logging.WARNING)
+    ctl = _Ctl()
+    s, calls = _sched(4, 0, 0)
+    got = _idle_run(s, ctl, R.IDLE_ASK_ROUNDS, [1000.0])
+    assert got == "shrink" and ctl.calls == [1] and s._weg2_d_seat_phase.n == 1
+    line = [m for m in caplog.messages if "D-SEAT-REWAKE SHRINK n=4->1" in m][-1]
+    assert "trigger=idle" in line and "idle_ms=" in line and "pause_ms=" in line
+    assert getattr(s, R.ATTR).counters["shrink_idle"] == 1
+
+
+def test_a_busy_round_shrink_names_its_trigger(caplog):
+    caplog.set_level(logging.WARNING)
+    ctl = _Ctl()
+    s, _calls = _sched(4, 2, 0)
+    _idle_run(s, ctl, R.SHRINK_ASK_ROUNDS, [1000.0])
+    assert ctl.calls == [2]
+    assert any("SHRINK n=4->2" in m and "trigger=round" in m for m in caplog.messages)
+
+
+def _riegel_case(attr, value, caplog):
+    caplog.set_level(logging.INFO)
+    ctl = _Ctl()
+    s, calls = _sched(4, 0, 0)
+    setattr(s, attr, value) if attr != "has_n" else setattr(s._weg2_d_seat_phase, "has_n", value)
+    _idle_run(s, ctl, R.IDLE_ASK_ROUNDS * 4, [1000.0])
+    return ctl, calls, [m for m in caplog.messages if "SHRINK HELD" in m]
+
+
+def test_riegel_flip_park_holds_the_shrink(caplog):
+    ctl, calls, held = _riegel_case("weg2_d_parked", [object()], caplog)
+    assert ctl.calls == [] and calls == [] and len(held) == 1 and "why=flip_park" in held[0]
+
+
+def test_riegel_dormant_hold_holds_the_shrink(caplog):
+    ctl, calls, held = _riegel_case("weg2_dormant_hold", {"x": 1}, caplog)
+    assert ctl.calls == [] and "why=dormant_hold" in held[0]
+
+
+def test_riegel_wake_settle_holds_the_shrink(caplog):
+    ctl, calls, held = _riegel_case("weg2_post_wake_settle", [object()], caplog)
+    assert ctl.calls == [] and "why=wake_settle" in held[0]
+
+
+def test_riegel_wake_legs_hold_the_shrink(caplog):
+    ctl, calls, held = _riegel_case("has_n", False, caplog)
+    assert ctl.calls == [] and "why=wake_legs" in held[0]
+
+
+def test_riegel_admission_chunk_holds_the_shrink(caplog):
+    ctl, calls, held = _riegel_case("chunked_req", types.SimpleNamespace(rid="c"), caplog)
+    assert ctl.calls == [] and "why=admission_chunk" in held[0]
+
+
+def test_riegel_dormant_never_ticks():
+    ctl = _Ctl()
+    s, calls = _sched(4, 0, 0)
+    s.weg2_dormant = True
+    _idle_run(s, ctl, R.IDLE_ASK_ROUNDS * 4, [1000.0])
+    assert ctl.calls == [] and calls == []
+
+
+def test_the_tree_held_slots_allow_a_partial_shrink(caplog):
+    """y4x: 4 GDN slots held by the tree (mamba usage 0.11). The limit of n=1
+    (7) does not cover slot 10; the base held n=4 silently. Now n=2 (limit 13)."""
+    caplog.set_level(logging.INFO)
+    ctl = _Ctl()
+    s, _calls = _sched(4, 0, 0, alloc=_Alloc(used=(10,)))
+    got = _idle_run(s, ctl, R.IDLE_ASK_ROUNDS, [1000.0])
+    assert got == "shrink" and ctl.calls == [2] and s._weg2_d_seat_phase.n == 2
+    assert R.seats_covering(38, 6, 10, 1) == 2 and R.seats_covering(38, 6, 0, 1) == 1
+
+
+def test_a_slot_above_every_smaller_limit_is_named_held(caplog):
+    caplog.set_level(logging.INFO)
+    ctl = _Ctl()
+    s, calls = _sched(4, 0, 0, alloc=_Alloc(used=(30,)))
+    _idle_run(s, ctl, R.IDLE_ASK_ROUNDS * 3, [1000.0])
+    held = [m for m in caplog.messages if "SHRINK HELD" in m]
+    assert ctl.calls == [] and calls == [] and len(held) == 1 and "slots_held" in held[0]
