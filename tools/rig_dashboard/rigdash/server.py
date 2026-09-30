@@ -2,12 +2,12 @@
 
 Routes
   GET /               the live page
-  GET /api/live       one JSON snapshot: boots (from their logs), GPUs,
+  GET /api/live       one JSON snapshot: boots (IPC: state.json, events.jsonl, rankstats -- no log), GPUs,
                       containers, gpuq plan, every source's age and error,
                       the running image's changes per seat (image_changes.json)
   GET /api/launch     Startflags + ENV je Modell (Container/Front/P/D) aus state.json,
                       P<->D-Vergleich; ?ver=<ver> antwortet {same: true}, solange gleich
-  GET /api/history    Grafana-style panels (history.py): ?model=27B|NF&range=15m|1h|6h|24h|7d
+  GET /api/history    Verlauf (history.py): ?model=27B|NF&range=15m|1h|6h|24h|7d
   GET /api/health     liveness of the dashboard itself
 """
 
@@ -23,7 +23,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import energy, features, health, history, imagechanges, launchview, live, redact, sources, weg2line
+from . import energy, features, health, history, imagechanges, ipcboot, launchview, live, redact, sources, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -114,6 +114,23 @@ def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: flo
         ser["per_w_60s"][k] = (sum(last) / len(last)) if last else None
 
 
+def attach_containers_ipc(boots, containers):
+    """The boot's container by the name its state.json carries (``container``), no log dir involved."""
+    by_name = {c.get("Names"): c for c in containers or []}
+    claimed = set()
+    # one container name serves boot after boot of a line: it belongs to the newest one only (boots come
+    # live first, then newest first), an older boot of the same name must not look running
+    order = sorted(boots, key=lambda b: (not b.get("live"), -(b.get("first_t") or 0)))
+    for b in order:
+        name = (b.get("ipc") or {}).get("container")
+        hit = by_name.get(name)
+        if hit is not None and name not in claimed:
+            claimed.add(name)
+            b["container"] = {k: hit.get(k) for k in ("Names", "Image", "Status", "State", "Ports", "RunningFor",
+                                                      "health_output")}
+    return boots
+
+
 def attach_containers(boots, containers):
     """Give every boot the container that writes its logs, if any."""
     containers = containers or []
@@ -143,7 +160,9 @@ def attach_containers(boots, containers):
 class App:
     def __init__(self, args):
         self.args = args
-        self.logs = live.LiveLogs(args.log_glob or None, interval=1.0)
+        # the boot cards from IPC only (NF-Operator 30.09.: keine Anzeige liest mehr ein Boot-Log);
+        # live.LiveLogs, the old log reader, is no longer started
+        self.boots = ipcboot.IpcBoots()
         cfg = {
             "gpu_period": 2.0,
             "docker_ssh": shlex.split(args.docker_ssh) if args.docker_ssh else [],
@@ -161,28 +180,23 @@ class App:
         self.stop = threading.Event()
         # DASHBOARD-GRAFIKEN: the persistent history of the Grafana-style panels (history.py)
         self.hist = history.HistoryDB(os.path.join(args.state_dir, "history.sqlite") if args.state_dir else None)
-        self.hist_rec = history.Recorder(self.hist, self.logs, cfg["docker_ssh"])
+        self.hist_rec = history.Recorder(self.hist, None, cfg["docker_ssh"])
         self.t0 = time.time()
         self.version = _version()
         self.edition = getattr(args, "edition", "rig") or "rig"
 
     def energy_loop(self, stop: threading.Event):
-        """Every 5 s: account the closed 5-s intervals of every live boot (energy.py)."""
+        """Every 5 s: account the closed 5-s intervals of every live boot (energy.py); which class
+        computed comes from the rank counters' deltas (ipcboot.IpcBoots.activity), not from a log."""
         while not stop.is_set():
             try:
                 now = time.time()
                 gs = self.src.gpu_series()
-                with self.logs.lock:
-                    boots = list(self.logs.boots.values())
-                for b in boots:
-                    if now - b.newest_mtime > live.LIVE_S or b.read_progress() < 0.999:
+                for b in self.boots.snapshot(now):
+                    if not b.get("live") or b.get("first_t") is None:
                         continue
-
-                    def act(start, n, bs, b=b):
-                        with b.lock:
-                            return b.bucket_activity(start, n, bs)
-
-                    self.energy.update(b.stem, b.first_t, act,
+                    self.energy.update(b["stem"], b["first_t"],
+                                       lambda start, n, bs, k=b["stem"]: self.boots.activity(k, start, n, bs),
                                        lambda start, n, bs: energy.power_buckets(gs, start, n, bs), now)
                 self.energy.save(now)
             except Exception as e:  # keep accounting alive; visible in /api/live
@@ -190,8 +204,7 @@ class App:
             stop.wait(5.0)
 
     def start(self):
-        self.logs.scan()
-        for target, name in ((self.logs.run_forever, "rigdash-logs"),
+        for target, name in ((self.boots.run_forever, "rigdash-ipcboots"),
                              (self.src.run_forever, "rigdash-sources"),
                              (self.energy_loop, "rigdash-energy"),
                              (self.hist_rec.run_forever, "rigdash-history")):
@@ -200,9 +213,9 @@ class App:
     def snapshot(self, with_series=True) -> dict:
         now = time.time()
         sv = self.src.view()
-        boots = self.logs.snapshot(with_series)
+        boots = self.boots.snapshot(now)
         docker = sv.get("docker", {}).get("value")
-        attach_containers(boots, docker)
+        attach_containers_ipc(boots, docker)
         fronts = {k: v for k, v in sv.items() if k.startswith("front:")}
         for b in boots:
             b["front"] = sources.front_for_boot(fronts, b["meta"].get("tag"))
@@ -228,7 +241,7 @@ class App:
             "docker": sv.get("docker"),
             "gpuq": sv.get("gpuq"),
             "fronts": {k: {kk: vv for kk, vv in v.items() if kk != "value"} for k, v in fronts.items()},
-            "collector_error": getattr(self.logs, "last_error", None),
+            "collector_error": self.boots.last_error,
             "energy_error": getattr(self, "energy_error", None),
             "image_changes": imagechanges.view(boots, images, img_err, self.imgchg.path),
             "features": features.attach_current(self.features.view(), boots, sv.get("gpus")),
@@ -285,6 +298,8 @@ def edition_snapshot(snap: dict, edition: str) -> dict:
                 (b.get("meta") or {}).pop(k, None)
             if isinstance(b.get("container"), dict):
                 b["container"] = {k: v for k, v in b["container"].items() if k in ("State", "Status")}
+        if isinstance(snap.get("docker"), dict):     # the container table (names, images) is dev; the chip keeps age/error
+            snap["docker"] = {k: v for k, v in snap["docker"].items() if k != "value"}
         snap["edition"] = "release"
     return snap
 
@@ -397,8 +412,6 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8890)
-    ap.add_argument("--log-glob", action="append", default=[],
-                    help="boot-log glob (repeatable); default: %s" % live.DEFAULT_LOG_GLOBS)
     ap.add_argument("--docker-ssh", default="ssh -o BatchMode=yes -o ConnectTimeout=5 proxmox",
                     help="command prefix that reaches the Docker host ('' disables)")
     ap.add_argument("--docker-host-prefix", default="/spinning/subvol-999-disk-0",

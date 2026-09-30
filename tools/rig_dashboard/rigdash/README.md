@@ -7,9 +7,7 @@ Flipzeit = `WEG2-FLIP begin` → erstes Decode-Token (P→D) bzw. erste PP0-`Pre
 Ein 27B-Boot führt mit `flip_total`, bis ein 27B-Boot unter der neuen Definition gemessen ist
 (`FIRST_TOKEN_HEADLINE_FOR_27B` in `live.py`) — sonst sähe die 27B-Historie wie ein Rückschritt aus.
 
-**TODO (27B-Review 29.09.):** `live.py` liest die Flip-Zeiten aus Log-Zeilen (nur Anzeige für
-Menschen, keine Steuerung). Umstellen auf `events.jsonl` der Front, sobald die Front die
-Flip-Ereignisse (begin/done/erstes Token) dort schreibt; dann entfällt der Log-Scan.
+Seit 30.09.: Flipzeiten nur aus `events.jsonl` (`flip_first_work`, `flip_done`), kein Log-Scan mehr (ipcboot.py).
 
 **Phasenleiste mit echter Arbeitszeit (WACH-OHNE-ARBEIT-0929):** Die Rang-Zeilen kommen zu spät
 (P nach dem Pipeline-Durchlauf, D einen Pass später). P-Arbeit zeichnet deshalb von
@@ -37,19 +35,19 @@ Ein bewusster Rückschritt geht nur mit `RIGDASH_DEPLOY_ROLLBACK=1`, der Grund g
 
 Anlass: Der Features-Sitz deployte von `desk/dashboard-features-0929`. Ein Deploy von dort hätte Stufe 1 von DASHBOARD-AUS-IPC still wieder entfernt.
 
-## Aus IPC, nicht aus Logs (Nutzer 29.09. über 27B)
+## Nur IPC, kein Boot-Log (Nutzer 29.09. über 27B; Rüge und Order 30.09.)
 
-Die Order lautet: „das dashboard soll auch aus der inter prozess kommunikation gespeist werden, nicht aus logs“. Das Inventar mit jeder Kachel, ihrer Quelle heute, der IPC-Quelle und dem Stand liegt in `/spinning/gpu-arb/docs/DASHBOARD-AUS-IPC-INVENTAR-0929.md`.
+„das dashboard soll auch aus der inter prozess kommunikation gespeist werden, nicht aus logs“ -- seit 30.09. ohne Ausnahme:
 
-- `ipcstate.py` liest je Boot `state.json`, `events.jsonl` und `stop_request.json` unter `/spinning/docker-acceptance/<line>/state/<boot_id>/` (IPC-STATE-PLAN §2.2) und ordnet sie über `state.json.tag` dem Log-Boot zu.
-- Aus IPC kommen:
-  - Kopf (REV, Profil, Image, lifecycle, Topologie, Modell)
-  - Startform (`groups.<G>.launch`)
-  - geplanter Stopp oder Tod (`stops.classify_ipc`)
-  - Front-Zustand und Warteschlange (`/weg2/state`, sonst der `state.json front`-Spiegel)
-  - Feature-Werte „Transport“ und „bedient“
-- Was noch aus einem Log kommt, trägt sichtbar **„aus Log (Übergang)“**.
-- `tests/test_no_new_log_parsers.py` friert alle heutigen Regex-Literale ein. Ein neuer Log-Parser macht den Test rot, sein Weg ist: zuerst schreibt die Quelle (Front, Launcher, Rang), dann wird der Leser umgestellt, dann fällt der Parser.
+- `ipcboot.py` (`IpcBoots`) ersetzt `live.LiveLogs` als Quelle der Boot-Karten. Jede Sekunde eine Probe je Boot-Zustandsordner
+  `/spinning/docker-acceptance/<line>/state/<boot_id>/` (`state.json`, `events.jsonl`, `rankstate/<G>/*.rankstats`) in einen
+  16-min-Ring; Raten, Fenster, Schübe, Kurven, Phasenleiste und Energie-Zuordnung sind Deltas dieser Proben.
+- `ipcfields.field()` kennt keinen Log-Rückfall: ein Feld ist `ipc`, `fehlt` (die Seite zeigt „fehlt in IPC“ und im Titel den
+  Schreiber aus `ipcfields.MISSING_WRITER`) oder `leer` („noch kein Flip in diesem Boot“, „keine Raten: Boot beendet“).
+- `live.py`, `parse.py`, `stops.py:HarnessLogs` startet der Server nicht mehr (Altbestand für Tests).
+  `tests/test_ipcboot_0930.py` wird rot, sobald ein verdrahtetes Modul ein `*.log` öffnet oder der Server einen Log-Leser startet.
+- Inventar mit IPC/FEHLT je Anzeige und der FEHLT-Liste: `/spinning/gpu-arb/docs/DASHBOARD-AUS-IPC-INVENTAR-0929.md`.
+- `tests/test_no_new_log_parsers.py` bleibt: kein neuer Regex.
 
 ## Ruhige Anzeige (Nutzer 29.09.: „ständig verschiebt sich das nach oben/unten“)
 

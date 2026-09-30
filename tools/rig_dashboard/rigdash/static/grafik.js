@@ -14,6 +14,7 @@
   if (!root || typeof uPlot === "undefined") return;
 
   const LOG = "aus Log (Übergang)";
+  const NO_DATA = "keine Daten (vor IPC-Aufzeichnung)";
   let model = "27B", range = "1h";
   try {
     model = localStorage.getItem("rigdash-gf-model") || model;
@@ -42,8 +43,9 @@
     if (a >= 1e4) return (v / 1e3).toFixed(1).replace(".", ",") + " k";
     return v.toFixed(d == null ? (a >= 100 ? 0 : 1) : d).replace(".", ",");
   }
-  const srcBadge = (s) => !s ? "" : (s === LOG || /Übergang|fehlt|–/.test(s))
+  const srcBadge = (s) => !s ? "" : (s !== NO_DATA && (s === LOG || /Übergang|fehlt|–/.test(s)))
     ? `<span class="logsrc" title="Quelle: ${esc(s)}">${esc(s)}</span>`
+    : s === NO_DATA ? `<span class="logsrc" title="Im Zeitraum keine IPC-Probe">${esc(s)}</span>`
     : `<span class="ipcsrc" title="Quelle: ${esc(s)}">${esc(s)}</span>`;
 
   // ---------------------------------------------------------------- Kopfzeile
@@ -132,6 +134,23 @@
     const flips = ms.filter((m) => m.kind === "flip" && m.t >= x0 && m.t <= x1);
     ctx.save();
     ctx.beginPath(); ctx.rect(left, top, width, height); ctx.clip();
+    // Modellreihen: Abschnitte ohne IPC-Probe sind eine ehrliche Lücke, schraffiert und benannt
+    // (Nutzer 30.09.: keine Reihe aus Boot-Logs; kein Boot live oder vor der IPC-Aufzeichnung)
+    if (u._model && data && data.series["m.ipc"]) {
+      const al = data.series["m.ipc"], xs = data.t, step = data.step || 5;
+      let i = 0;
+      while (i < xs.length) {
+        if (al[i] != null) { i++; continue; }
+        let j = i; while (j < xs.length && al[j] == null) j++;
+        const a = u.valToPos(xs[i], "x", true), b = j < xs.length ? u.valToPos(xs[j], "x", true) : u.valToPos(Math.min(xs[j - 1] + step, x1), "x", true);
+        ctx.fillStyle = C.grid; ctx.fillRect(a, top, Math.max(1, b - a), height);
+        if (b - a > 150 * dpr) {
+          ctx.fillStyle = C.muted; ctx.font = `${10.5 * dpr}px system-ui, sans-serif`; ctx.textAlign = "center";
+          ctx.fillText(NO_DATA, (a + b) / 2, top + height / 2); ctx.textAlign = "start";
+        }
+        i = j;
+      }
+    }
     if (flips.length && flips.length < 600) {
       ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
       ctx.beginPath();
@@ -184,9 +203,12 @@
     const el = $(id);
     if (!el) return null;
     const w = Math.max(240, el.clientWidth - 2);
-    return new uPlot(Object.assign({ width: w, height: 200, legend: { live: true },
+    const u = new uPlot(Object.assign({ width: w, height: 200, legend: { live: true },
       cursor: { drag: { x: false, y: false }, sync: { key: "rigdash-verlauf" }, points: { size: 7 } },
       hooks: { draw: [marksDraw, endDots] } }, opts), rows, el);
+    u._model = id.startsWith("vl-c-") && id !== "vl-c-flip";
+    u.redraw();
+    return u;
   }
 
   function cardLabel(c) {

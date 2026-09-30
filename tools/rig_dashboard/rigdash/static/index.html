@@ -339,22 +339,19 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
   </section>
   <section class="card note">
     <h2>Instrumente</h2>
-    <p><b>Prefill tok/s (Rechenrate)</b> = <span class="mono">#new-token / compute-ms</span> aus den
-    Zeilen <span class="mono">Prefill rank batch &hellip; gpu-ms: X (compute Y, wait Z)</span>, je Rang summiert
-    &uuml;ber das Fenster; die Kachel zeigt den <b>langsamsten Rang</b>, denn eine PP-Stufe bzw. ein TP-Partner
-    begrenzt jeden Chunk. Das ist Ger&auml;tezeit, also rechen-ehrlich: Leerlauf zwischen Anfragen senkt sie nicht.</p>
-    <p><b>Durchsatz Wandzeit</b> = verarbeitete Prompt-Tokens im Fenster durch die Fensterl&auml;nge &mdash; das, was tats&auml;chlich
-    durchging, inklusive Leerlauf und Warten; ehrlich, aber keine Rechenrate.</p>
-    <p><b>input throughput</b> aus der Zeile <span class="mono">Prefill batch</span> ist <b>wall-konfundiert</b>: es teilt durch
-    die Scheduler-Wanduhr und springt bei Leerlauf. Es steht nur grau und unter diesem Namen da.</p>
-    <p><b>Decode tok/s</b> = <span class="mono">gen throughput</span> der Zeile <span class="mono">Decode batch</span>
-    (Tokens seit der vorigen Zeile durch die Zeit dazwischen); die gro&szlig;e Zahl ist Tokens / Wanduhr:
-    &Sigma;(gen throughput &times; Zeilenabstand) / &Sigma; Zeilenabstand, nie das Mittel der Raten. Prefill: die gro&szlig;e Zahl
-    ist &Sigma; #new-token der ersten Stufe / Wanduhr der Prefill-Sch&uuml;be (je Schub Start des ersten Chunks bis zur letzten Rang-Zeile; Leerlauf Wanduhr (Start des ersten Chunks bis zur letzten Rang-Zeile); die GPU-Rechenrategt; 5 s zwischen Sch&uuml;ben z&auml;hlt nicht); die GPU-Rechenrate
-    steht beschriftet daneben. Daneben die
-    Rechenrate aus <span class="mono">Decode rank batch</span>: bs &times; accept len / gpu-ms je Runde.</p>
-    <p>Quelle sind die Boot-Logs, die der weg2-Launcher ohnehin schreibt (per Byte-Offset gelesen, nie ganz).
-    Das Dashboard schickt keinem Modell eine Anfrage au&szlig;er <span class="mono">GET /weg2/state</span> alle 10 s.</p>
+    <p>Alle Zahlen oben kommen aus der Inter-Prozess-Kommunikation, kein Boot-Protokoll wird gelesen (NF-Operator 30.09.):
+    je Boot <span class="mono">state.json</span>, <span class="mono">events.jsonl</span> und je Rang
+    <span class="mono">rankstate/&lt;G&gt;/*.rankstats</span> (kumulative Z&auml;hler, vom Rang alle ~1 s geschrieben);
+    rigdash nimmt jede Sekunde eine Probe und rechnet Raten aus den Deltas. Wo ein Wert kein IPC-Feld hat, steht
+    &bdquo;fehlt in IPC&ldquo; mit dem Schreiber, der ihn liefern m&uuml;sste.</p>
+    <p><b>Prefill tok/s (Rechenrate)</b> = &Delta;<span class="mono">prefill.new_tokens</span> / &Delta;<span class="mono">prefill.compute_ms</span>
+    je Rang; die Kachel zeigt den <b>langsamsten Rang</b>, denn eine PP-Stufe bzw. ein TP-Partner begrenzt jeden Chunk.
+    Das ist Ger&auml;tezeit, also rechen-ehrlich: Leerlauf zwischen Anfragen senkt sie nicht.</p>
+    <p><b>Durchsatz Wandzeit</b> = &Delta;<span class="mono">prefill.new_tokens</span> des ersten Rangs durch die Zeit der Proben
+    mit Arbeit (Leerlauf-Proben z&auml;hlen nicht); <b>jetzt</b> = die letzte Probe.</p>
+    <p><b>Decode tok/s</b> = &Delta;<span class="mono">decode.tokens</span> (TP0) / &Delta;ts &uuml;ber die Proben mit Arbeit;
+    <b>je Stream</b> = das durch <span class="mono">decode.running</span>; Rechenrate = &Delta;decode.tokens / &Delta;<span class="mono">decode.gpu_ms</span>.</p>
+    <p>Das Dashboard schickt keinem Modell eine Anfrage au&szlig;er <span class="mono">GET /weg2/state</span> alle 10 s.</p>
   </section>
   <!--DEV:BEGIN-->
   <div class="devhead" id="dev-head"><h2>Entwicklungsstand</h2><span class="muted">nur im Rig-Dashboard; die veröffentlichte fLLiper-Ausgabe (<span class="mono">--edition release</span>) liefert diesen Teil nicht aus</span></div>
@@ -389,7 +386,7 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
     <div id="gpuq" class="tablewrap"></div>
   </section>
   <section class="card">
-    <h2>Letzte Boots <span class="muted">entdeckt aus den Boot-Logs der letzten 6 h; Kopf, Lebenszyklus und Stopp-Ursache aus state.json/events.jsonl, wo vorhanden</span><span class="logsrc" title="Boot-Entdeckung und Kacheln aus den Boot-Logs; Umstellung: DASHBOARD-AUS-IPC-INVENTAR-0929.md">Kacheln aus Log (&Uuml;bergang)</span></h2>
+    <h2>Letzte Boots <span class="muted">aus den state-Ordnern der letzten 6 h: Kopf, Lebenszyklus, Stopp-Ursache und Zahlen aus state.json, events.jsonl und rankstats</span><span class="ipcsrc">IPC</span></h2>
     <div id="history" class="tablewrap"></div>
   </section>
   <!--DEV:END-->
@@ -405,7 +402,8 @@ const DEV = !!document.getElementById("dev-head");
 const PAGE_TITLE = EDITION === "release" ? "fLLiper Dashboard" : "Rig-Dashboard";
 document.getElementById("title").textContent = PAGE_TITLE;
 // DASHBOARD-AUS-IPC (Nutzer 29.09.): what still comes from a log line says so; the rest names its IPC source
-const LOGSRC = `<span class="logsrc" title="Quelle: Boot-Log (Regex in parse.py/live.py). Umstellung auf IPC: /spinning/gpu-arb/docs/DASHBOARD-AUS-IPC-INVENTAR-0929.md">aus Log (&Uuml;bergang)</span>`;
+const MISSTAG = (what, title) => `<span class="logsrc" title="${esc(title || "")}">fehlt in IPC${what ? ": " + esc(what) : ""}</span>`;
+const LOGSRC = `<span class="logsrc" title="Kein IPC-Feld fuer diesen Wert; aus einem Log wird nicht gelesen (NF-Operator 30.09.)">fehlt in IPC</span>`;
 const ipcTag = (what) => `<span class="ipcsrc" title="Quelle: IPC (${esc(what)})">${esc(what)}</span>`;
 // ipcfields.py (Nutzer 29.09. ~12:00Z): one reader per field -- the IPC value when the boot carries the
 // source, else the log value with its label. The switch is per field, by presence: no deploy waits for a boot.
@@ -413,11 +411,15 @@ const fieldIpc = (b, k) => { const f = (b.fields || {})[k]; return f && f.src ==
 const srcOf = (b, ...keys) => {
   const on = keys.map((k) => fieldIpc(b, k)).filter(Boolean);
   const off = keys.filter((k) => !fieldIpc(b, k));
-  // sub-fields the IPC record carries as null (RANKSTATS-S3-SCHEMA: source missing on this rank) stay on the log
-  const part = on.flatMap((f) => (f.from_log || []).map((s) => f.key + "." + s));
+  // no log fallback (NF-Operator 30.09.): a field without IPC source says so and names its writer
+  const part = on.flatMap((f) => (f.missing_leaves || []).map((s) => f.key + "." + s));
   const tag = on.length ? ipcTag([...new Set(on.map((f) => f.ipc_src))].join(" + ")) : "";
   const miss = [...off, ...part];
-  return miss.length ? (tag ? tag + " " : "") + LOGSRC.replace('title="', `title="Felder aus Log: ${miss.join(", ")}. `) : tag;
+  const F = (k) => (b.fields || {})[k] || {};
+  const empty = off.filter((k) => F(k).empty), gone = [...off.filter((k) => !F(k).empty), ...part];
+  const writers = gone.map((k) => k + ": " + (F(k.split(".")[0]).missing || "?")).join(" | ");
+  const leer = empty.length ? ` <span class="ipcsrc" title="${esc(empty.join(", "))}: ${esc(F(empty[0]).empty)}">${esc(F(empty[0]).empty)}</span>` : "";
+  return (gone.length ? (tag ? tag + " " : "") + MISSTAG(gone.join(", "), "Schreiber: " + writers) : tag) + leer;
 };
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmt = (v, d = 0) => (v == null || !isFinite(v)) ? "—" : Number(v).toLocaleString("de-DE", {maximumFractionDigits: d, minimumFractionDigits: d});
@@ -529,7 +531,7 @@ function kv(rows) {
 // (only one phase runs at a time): the running one is coloured, the others dimmed
 function bigPair(lbl60, v60, one, digits, extra, max3) {
   const on = one > 0;
-  return `<div class="bigrow ${on ? "on" : "off"}" title="letzte 1 s: Zeilen mit Stempel in der vorigen oder laufenden Sekunde; 0 = die Phase rechnet gerade nicht"><span class="bl" style="white-space:nowrap">jetzt 1 s</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span>${extra || ""}</div>
+  return `<div class="bigrow ${on ? "on" : "off"}" title="letzte Probe (~1 s): Delta der Rang-Zaehler (rankstats) durch die Rang-Uhr; 0 = die Phase rechnet gerade nicht"><span class="bl" style="white-space:nowrap">jetzt 1 s</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span>${extra || ""}</div>
     <div class="bigrow" title="hoechster 3-s-Mittelwert der letzten 120 s"><span class="bl" style="white-space:nowrap">MAX 3s/120s</span><span class="big num">${max3 == null ? "–" : fmt(max3, digits) + "<small>tok/s</small>"}</span></div>
     <div class="bigrow"><span class="bl">${lbl60}</span><span class="big num">${fmt(v60, digits)}<small>tok/s</small></span></div>`;
 }
@@ -542,7 +544,7 @@ function bsBadge(d, on) {
   const bs = rb ? rb.bs : d.running;
   if (bs == null) return "";
   const q = d.queue_req;
-  return `<span class="bsbadge${on ? "" : " off"}" title="rechnend = bs der j&uuml;ngsten Runde (Decode rank batch, TP0)${cap != null ? "; Sitze = " + (se.n != null ? "WEG2 D-PHASE-SEATS n dieser Phase (cap " + fmt(se.cap) + ")" : "--max-running-requests") : ""}; wartend = #queue-req der j&uuml;ngsten Decode-batch-Zeile">bs <b>${fmt(bs)}</b>${cap != null ? " / " + fmt(cap) : ""}${q ? ` <span class="q">&middot; ${fmt(q)} wartend</span>` : ""}</span>`;
+  return `<span class="bsbadge${on ? "" : " off"}" title="laufend = decode.running (rankstats TP0)${cap != null ? "; Sitze = " + (se.n != null ? "front d_seats/d_phase_n dieser Phase (cap " + fmt(se.cap) + ")" : "--max-running-requests") : ""}; wartend = sched.queue_req (rankstats)">bs <b>${fmt(bs)}</b>${cap != null ? " / " + fmt(cap) : ""}${q ? ` <span class="q">&middot; ${fmt(q)} wartend</span>` : ""}</span>`;
 }
 
 // ---- phase bar: P-Prefill / D-Prefill / Decode runs and the flips between them
@@ -560,17 +562,17 @@ const dur = (s) => s < 90 ? fmt(s, s < 10 ? 1 : 0) + " s" : fmt(s / 60, 1) + " m
 function phaseName(k, single) { return single && k === "P" ? "Prefill" : (PHASE[k] || [k])[0]; }
 function phaseTip(x, single) {
   const when = `${hhmm(x.s)}&ndash;${x.running || x.open ? "jetzt" : hhmm(x.e)} &middot; ${dur(x.e - x.s)}`;
-  if (x.k === "flip") return `<b>Flip ${esc(x.slept)}&rarr;${esc(x.woke)}</b>${x.open ? " &middot; l&auml;uft" : ` &middot; davon Layer-Tausch (flip_total) ${fmt(x.total_ms)} ms${x.drain_ms != null ? " (drain+quiesce " + fmt(x.drain_ms) + " ms)" : ""}`}<br>${when} <span class="muted">grau ab der letzten Arbeitszeile der alten Gruppe bis WEG2-FLIP done</span>`;
+  if (x.k === "flip") return `<b>Flip ${esc(x.slept)}&rarr;${esc(x.woke)}</b>${x.open ? " &middot; l&auml;uft" : ` &middot; davon Layer-Tausch (flip_total) ${fmt(x.total_ms)} ms${x.drain_ms != null ? " (drain+quiesce " + fmt(x.drain_ms) + " ms)" : ""}`}<br>${when} <span class="muted">flip_begin bis flip_done (events.jsonl)</span>`;
   if (x.k === "flip_tail") {
     const p = x.parts;
-    const parts = p ? `<br>Lesungen vor Pass 0 ${fmt(p.reads_ms)} ms &middot; Park-Resume (prepare) ${fmt(p.prepare_ms)} ms &middot; Re-Extend ${fmt(p.run_ms)} ms <span class="muted">(WEG2-POST-WAKE-PASS n=0, schedule ${fmt(p.schedule_ms)} ms)</span>` : "";
-    return `<b>Flip-Nachlauf D ${fmt((x.ms || 0) / 1000, 1)} s</b> &middot; WEG2-FLIP done bis erstes Decode-Token (Flipzeit nach Nutzerdefinition, keine Leerlaufzeit)${parts}<br>${when}`;
+    const parts = p ? `<br>Lesungen vor Pass 0 ${fmt(p.reads_ms)} ms &middot; Park-Resume (prepare) ${fmt(p.prepare_ms)} ms &middot; Re-Extend ${fmt(p.run_ms)} ms <span class="muted">(rankstats.last_post_wake, schedule ${fmt(p.schedule_ms)} ms)</span>` : "";
+    return `<b>Flip-Nachlauf D ${fmt((x.ms || 0) / 1000, 1)} s</b> &middot; flip_done bis erstes Decode-Token (Flipzeit nach Nutzerdefinition, keine Leerlaufzeit)${parts}<br>${when}`;
   }
-  if (x.k === "idle" && x.boot) return `<b>Boot l&auml;dt</b> &middot; noch keine Prefill-/Decode-Zeile<br>${when}`;
-  if (x.k === "idle") return `<b>${x.awake ? esc(x.awake) + " wach" : "ruht"} &middot; keine Arbeit</b><br>${when} <span class="muted">keine Prefill-/Decode-Zeile</span>`;
+  if (x.k === "idle" && x.boot) return `<b>Boot l&auml;dt</b> &middot; die Rang-Z&auml;hler zeigen noch keine Arbeit<br>${when}`;
+  if (x.k === "idle") return `<b>${x.awake ? esc(x.awake) + " wach" : "ruht"} &middot; keine Arbeit</b><br>${when} <span class="muted">Rang-Z&auml;hler unver&auml;ndert</span>`;
   const nm = phaseName(x.k, single);
-  if (x.k === "dec") return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s Wanduhr <span class="muted">(&Sigma; gen throughput &times; Zeilenabstand / &Sigma; Zeilenabstand, ${fmt(x.n)} Zeilen)</span>` : `&mdash; <span class="muted">(keine &bdquo;Decode batch&ldquo;-Zeile in dieser Phase)</span>`}${x.bs_mean != null ? ` &middot; bs ${x.bs_min === x.bs_max ? fmt(x.bs_min) : fmt(x.bs_min) + "&ndash;" + fmt(x.bs_max)} (&Oslash; ${fmt(x.bs_mean, 1)}, Runden)` : x.bs != null ? " &middot; bs &Oslash; " + fmt(x.bs, 1) : ""}<br>${when}${x.rounds ? " &middot; " + fmt(x.rounds) + " Runden" : ""}${x.running ? " &middot; l&auml;uft" : ""}`;
-  return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s Wanduhr <span class="muted">(&Sigma; #new-token erste Stufe / Laufdauer)</span>` : "&mdash;"}${x.tps_gpu != null ? ` &middot; GPU-Rechenrate ${fmt(x.tps_gpu)} tok/s <span class="muted">(&Sigma; Tok / &Sigma; compute-ms, langsamster Rang)</span>` : ""}<br>${when} &middot; ${fmt(x.tok)} Tok &middot; ${fmt(x.n)} Chunks${x.running ? " &middot; l&auml;uft" : ""}`;
+  if (x.k === "dec") return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s Wanduhr <span class="muted">(&Delta;decode.tokens / Dauer, ${fmt(x.n)} Proben)</span>` : "&mdash;"}${x.bs_mean != null ? ` &middot; bs ${x.bs_min === x.bs_max ? fmt(x.bs_min) : fmt(x.bs_min) + "&ndash;" + fmt(x.bs_max)} (&Oslash; ${fmt(x.bs_mean, 1)}, Runden)` : x.bs != null ? " &middot; bs &Oslash; " + fmt(x.bs, 1) : ""}<br>${when}${x.rounds ? " &middot; " + fmt(x.rounds) + " Runden" : ""}${x.running ? " &middot; l&auml;uft" : ""}`;
+  return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s Wanduhr <span class="muted">(&Delta;prefill.new_tokens erste Stufe / Dauer)</span>` : "&mdash;"}${x.tps_gpu != null ? ` &middot; GPU-Rechenrate ${fmt(x.tps_gpu)} tok/s <span class="muted">(&Sigma; Tok / &Sigma; compute-ms, langsamster Rang)</span>` : ""}<br>${when} &middot; ${fmt(x.tok)} Tok &middot; ${fmt(x.n)} Chunks${x.running ? " &middot; l&auml;uft" : ""}`;
 }
 function phaseHtml(b) {
   const tl = b.timeline;
@@ -589,7 +591,7 @@ function phaseHtml(b) {
     return `<div class="seg k-${x.k}${x.running ? " run" : ""}" data-i="${i}" style="${ic}left:${pos(x.s)}%;width:${(100 * (x.e - x.s) / span).toFixed(3)}%"><span data-full="${esc(full)}" data-short="${esc(short)}"></span></div>`;
   }).join("");
   const cut = tl.cut_at && tl.cut_at > t0 ? `<div class="cut${tl.cut_kind === "planned" ? " planned" : ""}" style="left:${pos(tl.cut_at)}%" title="${esc(tl.cut_reason || "")}"></div>` : "";
-  let end = b.live ? "jetzt" : "Log-Ende " + hhmm(t1);
+  let end = b.live ? "jetzt" : "letzte IPC-Probe " + hhmm(t1);
   if (tl.cut_at) end = tl.cut_kind === "planned" ? `<span style="color:var(--text-2)">■ ${esc(tl.cut_reason)} ${hhmm(tl.cut_at)}</span> &middot; ${end}`
     : `<span style="color:var(--bad)">✕ ${esc(tl.cut_reason)} ${hhmm(tl.cut_at)}</span> &middot; ${end}`;
   const ticks = span >= 900 ? ["&minus;15 min", "&minus;10", "&minus;5", end] : ["&minus;5 min", "&minus;2:30", end];
@@ -676,7 +678,7 @@ function ipcRankRows(b, g, key, show) {
 
 function prefillTile(b, g, color, label, binders, now) {
   const p = (b.prefill || {})[g];
-  if (!p) return `<div class="tile"><div class="label"><i style="background:${color}"></i>${label}</div><div class="big">—</div><div class="state">keine Prefill-Zeilen in diesem Log</div></div>`;
+  if (!p) return `<div class="tile"><div class="label"><i style="background:${color}"></i>${label}</div><div class="big">—</div><div class="state">fehlt in IPC: rankstats.prefill dieser Gruppe</div></div>`;
   const n = p.now, lb = p.last_burst;
   const active = n && n.tps != null;
   const src = active ? n : lb;
@@ -687,7 +689,7 @@ function prefillTile(b, g, color, label, binders, now) {
   const one = p.one_s || 0;
   return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>${label}${srcOf(b, "C1", "C2", "C7")}</div>
     ${bigPair(active ? "Wanduhr 60 s" : "letzter Schub, Wanduhr", src && src.wall_tps, one, 0, null, p.max3s_120)}
-    <div class="state">${state} &middot; <span class="muted" title="Z&auml;hler: &Sigma; #new-token der ersten Stufe (PP0/TP0); Nenner: Wanduhr der Sch&uuml;be -- je Schub Start des ersten Chunks (Stempel &minus; compute-ms) bis zur letzten Zeile irgendeines Rangs; L&uuml;cken &gt; 5 s zwischen Sch&uuml;ben z&auml;hlen nicht">Tokens / Wanduhr${src && src.wall_s ? " (" + fmt(src.tokens) + " Tok / " + fmt(src.wall_s, 1) + " s)" : ""}</span></div>
+    <div class="state">${state} &middot; <span class="muted" title="Z&auml;hler: &Delta;prefill.new_tokens des ersten Rangs (rankstats); Nenner: &Delta;ts der Proben mit Arbeit">Tokens / Wanduhr${src && src.wall_s ? " (" + fmt(src.tokens) + " Tok / " + fmt(src.wall_s, 1) + " s)" : ""}</span></div>
     ${kv([
       ["GPU-Rechenrate (&Sigma; Tok / &Sigma; compute-ms, langsamster Rang)", src && src.tps_gpu != null ? fmt(src.tps_gpu) + " tok/s" : "—"],
       ["Rechenrate je Rang (gpu-ms)", ranks],
@@ -704,11 +706,11 @@ function prefillTile(b, g, color, label, binders, now) {
 
 function decodeTile(b, g, color, binders, now) {
   const d = (b.decode || {})[g];
-  if (!d) return `<div class="tile"><div class="label"><i style="background:${color}"></i>Decode</div><div class="big">—</div><div class="state">keine Decode-Zeilen in diesem Log</div></div>`;
+  if (!d) return `<div class="tile"><div class="label"><i style="background:${color}"></i>Decode</div><div class="big">—</div><div class="state">fehlt in IPC: rankstats.decode</div></div>`;
   const active = d.gen_tps != null;
   const v = active ? d.gen_tps : d.gen_tps_last;
-  const state = active ? `aktiv &middot; Tokens / Wanduhr der letzten ${Math.round(d.window_s)} s (&Sigma; gen throughput &times; Zeilenabstand / &Sigma; Zeilenabstand, ${d.rows} Zeilen)`
-    : (d.last_t ? `ruht &middot; letzte Zeile vor ${ago(now - d.last_t)}, Zahl = letzter Wert` : "noch keine Decode-Zeile");
+  const state = active ? `aktiv &middot; Tokens / Wanduhr der letzten ${Math.round(d.window_s)} s (&Delta;decode.tokens / &Delta;ts &uuml;ber die Proben mit Arbeit, ${d.rows} Proben)`
+    : (d.last_t ? `ruht &middot; zuletzt dekodiert vor ${ago(now - d.last_t)}, Zahl = letzter Schub` : "noch kein Decode");
   const charts = rateCharts(b, g + "_decode_tps", color, 1, now, binders);
   const per = (v != null && d.running) ? v / d.running : null;
   const one = d.one_s || 0;
@@ -761,7 +763,7 @@ function bootTile(label, tok, src, rGpu, rGpuNote, rWall, e) {
       ["Energie je Token", e.j_per_tok == null ? "\u2014" : `${fmt(e.j_per_tok, e.j_per_tok < 1 ? 3 : 2)} J &middot; ${fmt(e.wh_per_1k, 3)} Wh/1k`],
       ["&Oslash; tok/s/W seit Boot (Token / Energie)", e.tok_per_j == null ? "\u2014" : fmt(e.tok_per_j, 2)],
     ])}
-    <div class="muted" style="font-size:10px">${rGpuNote}; Wandzeit = &Sigma; Token / Zeit seit der ersten Logzeile</div></div>`;
+    <div class="muted" style="font-size:10px">${rGpuNote}; Wandzeit = &Sigma; Token / Zeit seit Boot-Start (Boot-ID)</div></div>`;
 }
 
 function cacheHtml(b, now, awake) {
@@ -793,15 +795,15 @@ function cacheHtml(b, now, awake) {
     const r = (o) => o.req_hit_share == null ? "\u2014" : `${pct(o.req_hit_share)} <span class="muted">(${fmt(o.cached)} / ${fmt(o.prompt)})</span>`;
     return `<tr><td>${label}</td><td class="num">${r(w)}</td><td class="num">${r(a)}</td><td colspan="4" class="muted">${fmt(a.n)} Anfragen seit Boot</td></tr>`;
   };
-  const prog = t.read_progress != null && t.read_progress < 1 ? ` <span class="chip warn">Z\u00e4hlung l\u00e4uft: ${fmt(100 * t.read_progress)} % des Logs gelesen</span>` : "";
+  const prog = "";
   return `<div class="cachebox">
     <div class="tiles" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin-bottom:10px">
-      ${bootTile("P-Prefill seit Boot", t.p_new, `&Sigma; #new-token, Zeile &bdquo;Prefill batch&ldquo;, nur PP0 (${fmt(t.p_chunks)} Chunks), ohne Cache-Treffer`, t.p_rate_gpu, "GPU-Rechenzeit: &Sigma; Token / &Sigma; compute-ms je Rang, langsamster Rang", t.p_rate_wall, E.P)}
-      ${bootTile("D-Prefill seit Boot", t.d_new, `&Sigma; #new-token, &bdquo;Prefill batch&ldquo;, nur TP0 (${fmt(t.d_chunks)} Chunks), ohne &Uuml;bernahme/Cache`, t.d_rate_gpu, "GPU-Rechenzeit: &Sigma; Token / &Sigma; compute-ms je Rang, langsamster Rang", t.d_rate_wall, E.D)}
-      ${bootTile("Decode seit Boot", t.decoded, `&Sigma; completion_tokens der Front-Zeilen WEG2-SERVED (je Anfrage einmal, ${fmt(t.served_requests)} D-Beine)`, t.dec_rate_gpu, "GPU-Rechenzeit: &Sigma; Token / &Sigma; gpu-ms der Zeilen &bdquo;Decode rank batch&ldquo; (TP0)", t.dec_rate_wall, E.dec)}
+      ${bootTile("P-Prefill seit Boot", t.p_new, `rankstats prefill.new_tokens, erster Rang (${fmt(t.p_chunks)} Chunks), ohne Cache-Treffer`, t.p_rate_gpu, "GPU-Rechenzeit: prefill.new_tokens / prefill.compute_ms je Rang, langsamster Rang", t.p_rate_wall, E.P)}
+      ${bootTile("D-Prefill seit Boot", t.d_new, `rankstats prefill.new_tokens, TP0 (${fmt(t.d_chunks)} Chunks), ohne &Uuml;bernahme/Cache`, t.d_rate_gpu, "GPU-Rechenzeit: prefill.new_tokens / prefill.compute_ms je Rang, langsamster Rang", t.d_rate_wall, E.D)}
+      ${bootTile("Decode seit Boot", t.decoded, `rankstats decode.tokens, TP0 (${fmt(t.served_requests)} D-Beine bedient laut front.served)`, t.dec_rate_gpu, "GPU-Rechenzeit: decode.tokens / decode.gpu_ms (TP0)", t.dec_rate_wall, E.dec)}
     </div>
     <div class="muted" style="font-size:11px;margin:-4px 0 10px">Energie je Token: jedes abgeschlossene 5-s-Intervall kostet
-      (Mittel der Summe power.draw aller 3 Karten) &times; 5 s; das geht an die Klassen, von denen in dem Intervall eine Logzeile fiel
+      (Mittel der Summe power.draw aller 3 Karten) &times; 5 s; das geht an die Klassen, deren Rang-Z&auml;hler (rankstats) in dem Intervall Arbeit zeigten
       (mehrere: zu gleichen Teilen); Intervalle ohne Arbeit z&auml;hlen als Leerlauf (${fmt((en.idle_j || 0) / 3600, 1)} Wh) und keiner Klasse.
       Token nur aus denselben Intervallen. Gemessen seit der Dashboard-Messung l&auml;uft: Abdeckung
       ${en.coverage == null ? "\u2014" : fmt(100 * en.coverage) + " %"} der Bootdauer (${fmt((en.covered_s || 0) / 60)} min).</div>
@@ -812,9 +814,8 @@ function cacheHtml(b, now, awake) {
       ${req("Front je Anfrage, P-Bein (cached/prompt)", "served_P")}${req("Front je Anfrage, D-Bein (cached/prompt)", "served_D")}
     </table></div>
     ${prefetchRows(b)}
-    <div class="muted" style="font-size:11px;margin-top:4px">aus Cache = &Sigma; #cached-token / neu = &Sigma; #new-token der Zeile &bdquo;Prefill batch&ldquo; (nur erster Rang, jeder Chunk einmal). Bei D ist &bdquo;aus Cache&ldquo; vor allem der von P &uuml;bergebene Pr&auml;fix, nicht nur echte Treffer.
-      L2: Zeilen &bdquo;#988 LOADBACK&ldquo; (TP0), Tokens = anchor_depth, Anteil gegen alle Prompt-Tokens der Gruppe. L3: nur <b>unvollst&auml;ndige</b> Store-Lesungen werden geloggt (&bdquo;STORE READ INCOMPLETE&ldquo;, delivered/deliverable) &mdash; vollst&auml;ndige erscheinen nicht.
-      L1-Device ist nicht eigens geloggt; h&ouml;chstens aus Cache &minus; L2 &minus; L3. Front: WEG2-SERVED cached_tokens/prompt_tokens je Anfrage.</div>
+    <div class="muted" style="font-size:11px;margin-top:4px">Quelle: rankstats des ersten Rangs je Gruppe (IPC). aus Cache = prefill.cached_tokens, neu = prefill.new_tokens (jeder Chunk einmal). Bei D ist &bdquo;aus Cache&ldquo; vor allem der von P &uuml;bergebene Pr&auml;fix, nicht nur echte Treffer.
+      L2: cache.loadback_n / loadback_tok. Mamba: cache.mamba_resume_n. L3: cache.store_incomplete_n (nur unvollst&auml;ndige Lesungen). Front je Anfrage: state.json front.served_tokens.</div>
   </div>`;
 }
 
@@ -863,7 +864,7 @@ function bootCard(b, now, binders) {
     return [label, `<b>${secs(x.last)}</b> &middot; Median ${secs(x.median)} &middot; p90 ${secs(x.p90)} &middot; n=${fmt(x.n)}`
       + (x.no_work ? ` <span class="muted">(${fmt(x.no_work)} ohne Folgearbeit)</span>` : "")
       + (x.resolution_s >= 1 ? ` <span class="muted">±1 s</span>` : "") + tag(x.src || ins.first_token)
-      + (x.src ? "" : LOGSRC)];
+      + (x.src ? "" : MISSTAG("flip_first_work"))];
   };
   const totalRow = (key, label, head) => {
     const x = ft[key] || {};
@@ -888,19 +889,19 @@ function bootCard(b, now, binders) {
     ${alarmHtml(b, now)}
     <div class="boot-head">
       <span class="model">${esc((ipc && ipc.model) || m.model || b.stem)}</span>
-      ${plannedStopped(b) ? `<span class="badge stopped">■ gestoppt (geplant) &middot; ${b.live ? "Abbau l&auml;uft" : "kein Log seit " + ago(b.age_s)}</span>`
+      ${plannedStopped(b) ? `<span class="badge stopped">■ gestoppt (geplant) &middot; ${b.live ? "Abbau l&auml;uft" : "keine IPC-Probe seit " + ago(b.age_s)}</span>`
         : ipc && ipc.terminal ? `<span class="badge ${ipc.lifecycle === "dead" ? "dead" : "stopped"}">■ ${esc(ipc.lifecycle)}${ipc.cause && ipc.cause.code ? " &middot; " + esc(ipc.cause.code) : ""} &middot; state.json</span>`
-        : `<span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "kein Log seit " + ago(b.age_s)}</span>`}
+        : `<span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "keine IPC-Probe seit " + ago(b.age_s)}</span>`}
       ${b.live && ((b.alarm || {}).planned_stop || {}).t && !plannedStopped(b) ? `<span class="chip">Stopp angefordert ${hhmm(b.alarm.planned_stop.t)} (geplant)</span>` : ""}
       ${awake ? `<span class="badge phase">wach: ${esc(awake)}${frState ? " &middot; Front: " + esc(frState) : flipping ? " &middot; flippt" : ""}</span>` : ""}
-      ${c ? `<span class="chip ${c.State !== "running" ? "bad" : /unhealthy/.test(c.Status || "") ? "warn" : "ok"}">${DEV ? esc(c.Names) : "Container"} &middot; ${esc(c.Status)}</span>` : `<span class="chip warn">kein laufender Container zu diesem Log</span>`}
-      ${health.length && !plannedStopped(b) ? `<span class="chip bad">Gruppe ${health.map((h) => esc(h.group)).join(", ")} tot (WEG2-HEALTH)${srcOf(b, "A12")}</span>` : ""}
+      ${c ? `<span class="chip ${c.State !== "running" ? "bad" : /unhealthy/.test(c.Status || "") ? "warn" : "ok"}">${DEV ? esc(c.Names) : "Container"} &middot; ${esc(c.Status)}</span>` : `<span class="chip warn">kein laufender Container zu diesem Boot</span>`}
+      ${health.length && !plannedStopped(b) ? `<span class="chip bad">Gruppe ${health.map((h) => esc(h.group)).join(", ")} tot (front.groups)${srcOf(b, "A12")}</span>` : ""}
     </div>
     <div class="muted" style="font-size:12px;margin:-6px 0 10px">
       ${!DEV ? relHead(b, ipc, topo) : `<span class="mono">${esc(m.tag || b.stem)}</span>${ipc
         ? ` &middot; REV ${esc(ipc.rev)} &middot; Profil ${esc(ipc.profile)} &middot; ${esc(ipc.image)} &middot; lifecycle <b>${esc(ipc.lifecycle)}</b>${ipc.cause && ipc.cause.code ? " (" + esc(ipc.cause.code) + ")" : ""}${topo ? " &middot; " + esc(topo) : ""} ${ipcTag("state.json " + (ipc.boot_id || ""))}`
-        : `${m.sha ? " &middot; Baum " + esc(m.sha) : ""}${topo ? " &middot; " + esc(topo) : ""}${LOGSRC}`}`}${fieldIpc(b, "A4") ? " &middot; " + esc(Object.entries(fieldIpc(b, "A4").value).map(([g, f]) => g + ": " + f).join(" | ")) + " " + ipcTag("state.json groups.form") : m.form ? " &middot; " + esc(m.form) + srcOf(b, "A4") : ""}
-      ${b.fields_summary ? ` &middot; <span class="muted" title="Felder aus Log: ${esc((b.fields_summary.log_keys || []).join(", "))}">Felder aus IPC ${b.fields_summary.ipc}/${b.fields_summary.n}</span>` : ""}
+        : `${m.sha ? " &middot; Baum " + esc(m.sha) : ""}${topo ? " &middot; " + esc(topo) : ""}${LOGSRC}`}`}${fieldIpc(b, "A4") ? " &middot; " + esc(Object.entries(fieldIpc(b, "A4").value).map(([g, f]) => g + ": " + (f && typeof f === "object" ? (f.describe || Object.entries(f).map(([k, v]) => k + "=" + (typeof v === "object" ? JSON.stringify(v) : v)).join(" ")) : f)).join(" | ")) + " " + ipcTag("state.json groups.form") : m.form ? " &middot; " + esc(m.form) + srcOf(b, "A4") : ""}
+      ${b.fields_summary ? ` &middot; <span class="muted" title="fehlt in IPC: ${esc((b.fields_summary.fehlt_keys || []).join(", "))}">Felder aus IPC ${b.fields_summary.ipc}/${b.fields_summary.n}</span>` : ""}
     </div>
     ${phaseHtml(b)}
     <div class="tiles">
@@ -912,7 +913,7 @@ function bootCard(b, now, binders) {
         <div class="state">${lastFlip ? `letzter ${esc(lastFlip.slept)}→${esc(lastFlip.woke)} vor ${ago(now - lastFlip.t)}` : "noch kein Flip"}</div>
         ${kv([
           ...flipRows,
-          ["Warteschlange Front", fmt(q) + (fr ? " " + ipcTag(fr.src || "/weg2/state") : LOGSRC)],
+          ["Warteschlange Front", fmt(q) + (fr ? " " + ipcTag(fr.src || "/weg2/state") : MISSTAG("front.queue"))],
           fr && fr.served ? ["bedient P / D", `${fmt((fr.served || {}).P)} / ${fmt((fr.served || {}).D)} ${ipcTag(fr.src || "/weg2/state")}`] : null,
           ["Fehlerzeilen (ERROR)", fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count) + " " + srcOf(b, "A13")],
           fieldIpc(b, "B1") ? ["Flipzeit P&rarr;D (1. Decode-Token) median / letzte", `${fmt(fieldIpc(b, "B1").value.median_ms)} / ${fmt(fieldIpc(b, "B1").value.last_ms)} ms ${ipcTag("flip_first_work")}`] : null,
@@ -925,7 +926,7 @@ function bootCard(b, now, binders) {
     </div>
     ${cacheHtml(b, now, awake)}
     ${!DEV ? "" : ipc && Object.keys(ipc.launch || {}).length ? `<details id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform je Gruppe (argv + Schalter-Env) ${ipcTag("state.json groups.launch")}</summary><div class="launch mono">${Object.entries(ipc.launch).map(([g, l]) => `<div><b>${esc(g)}</b> ${esc((l.argv || []).join(" "))}</div>${Object.entries(l.env || {}).map(([k, v]) => `<div>&nbsp;&nbsp;${esc(k)}=${esc(v)}</div>`).join("")}`).join("")}</div></details>`
-      : (m.launch || []).length ? `<details id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform (weg2-Launcher, ${m.launch.length} Kernzeilen aus dem Front-Log)${LOGSRC}</summary><div class="launch mono">${m.launch.map((l) => `<div>${esc(l)}</div>`).join("")}</div></details>` : ""}
+      : ""}
     ${errs.length ? `<details id="err-${esc(b.stem)}" style="margin-top:10px"><summary>letzte Fehlerzeilen (${fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count)})${srcOf(b, "A13")}</summary>${errs.map((e) => `<div class="err mono">${hhmm(e.t)} [${esc(e.group)}] ${esc(e.text)}</div>`).join("")}</details>` : ""}
   </section>`;
 }
@@ -1134,7 +1135,7 @@ function imgChgHtml(d) {
   const ic = d.image_changes;
   if (!ic) return `<div class="muted">keine Daten</div>`;
   const err = ic.error ? `<div class="err">image_changes.json: ${esc(ic.error)}</div>` : "";
-  if (!(ic.seats || []).length) return err + `<div class="muted">kein Boot eines Sitzes (27B, NF) in den Logs der letzten 6 h</div>`;
+  if (!(ic.seats || []).length) return err + `<div class="muted">kein Boot eines Sitzes (27B, NF) in den state-Ordnern der letzten 6 h</div>`;
   return err + ic.seats.map((s) => {
     const head = `<div class="boot-head"><span class="model">${esc(s.seat)}</span>`
       + (s.rc ? `<span class="badge phase">${esc(s.rc)}</span>` : "")
@@ -1167,7 +1168,7 @@ function historyHtml(boots, now) {
   const rows = boots.filter((b) => !b.live);
   if (!rows.length) return `<div class="muted">keine weiteren Boots</div>`;
   const r = (b, g) => { const p = (b.prefill || {})[g]; return p && p.last_burst ? fmt(p.last_burst.tps) : "—"; };
-  return `<table><tr><th>Modell</th><th>Tag</th><th class="num">letztes Log</th><th class="num">P-Prefill</th><th class="num">D-Prefill</th><th class="num">Decode</th><th class="num">Flips</th><th class="num" title="Summe #new-token, Prefill batch, nur PP0">P neu &Sigma;<br><span class="muted">#new-token PP0</span></th><th class="num" title="Summe #new-token, Prefill batch, nur TP0">D neu &Sigma;<br><span class="muted">#new-token TP0</span></th><th class="num" title="Summe completion_tokens der Front-Zeilen WEG2-SERVED">dekodiert &Sigma;<br><span class="muted">WEG2-SERVED</span></th><th>Ende</th></tr>` +
+  return `<table><tr><th>Modell</th><th>Tag</th><th class="num">letzte IPC-Probe</th><th class="num">P-Prefill</th><th class="num">D-Prefill</th><th class="num">Decode</th><th class="num">Flips</th><th class="num" title="Summe #new-token, Prefill batch, nur PP0">P neu &Sigma;<br><span class="muted">#new-token PP0</span></th><th class="num" title="Summe #new-token, Prefill batch, nur TP0">D neu &Sigma;<br><span class="muted">#new-token TP0</span></th><th class="num" title="Summe completion_tokens der Front-Zeilen WEG2-SERVED">dekodiert &Sigma;<br><span class="muted">WEG2-SERVED</span></th><th>Ende</th></tr>` +
     rows.map((b) => `<tr><td>${esc((b.meta || {}).model || "")}</td><td class="mono">${esc((b.meta || {}).tag || b.stem)}</td><td class="num">vor ${ago(b.age_s)}</td><td class="num">${r(b, "P")}</td><td class="num">${r(b, "D")}</td><td class="num">${b.decode && b.decode.D ? fmt(b.decode.D.gen_tps_last, 1) : "—"}</td><td class="num">${fmt(b.flip_count)}</td><td class="num">${fmt((b.totals || {}).p_new)}</td><td class="num">${fmt((b.totals || {}).d_new)}</td><td class="num">${fmt((b.totals || {}).decoded)}${(b.totals || {}).read_progress < 1 ? "*" : ""}</td>${endCell(b)}</tr>`).join("") +
     `</table><div class="muted" style="font-size:12px;margin-top:4px">Prefill-Spalten: Rechenrate (gpu-ms) des letzten Schubs, langsamster Rang; Decode: letzter gen-throughput-Wert.</div>`;
 }
@@ -1182,7 +1183,7 @@ function chipsHtml(d) {
     const cls = s.error ? "bad" : (s.age_s != null && s.age_s < 3 * s.period_s + 5 ? "ok" : "warn");
     out.push(`<span class="chip ${cls}" title="${esc(s.error || "")}">${esc(name)}${s.error ? " &middot; Fehler" : s.age_s != null ? " &middot; " + ago(s.age_s) : ""}</span>`);
   }
-  if (d.collector_error) out.push(`<span class="chip bad">Log-Leser: ${esc(d.collector_error)}</span>`);
+  if (d.collector_error) out.push(`<span class="chip bad">IPC-Leser: ${esc(d.collector_error)}</span>`);
   return out.join("");
 }
 
@@ -1427,10 +1428,10 @@ async function refresh(force) {
     const live = d.boots.filter((b) => b.live || (b.container && b.container.State === "running"));
     const shown = live.length ? live : d.boots.filter((b) => b.primary).slice(0, 1);
     const banner = !live.length && shown.length ? (shown.every(plannedStopped)
-      ? `<section class="card" id="boots-banner" style="border-color:var(--flip)"><b>Kein Modell schreibt gerade Logs</b> <span class="muted">&middot; der letzte Boot wurde geplant gestoppt. Unten seine letzten Zahlen.</span></section>`
-      : `<section class="card" id="boots-banner" style="border-color:var(--bad)"><b style="color:var(--bad)">Kein Modell schreibt gerade Logs.</b> <span class="muted">Unten der zuletzt aktive Boot mit seinen letzten Zahlen.</span></section>`) : "";
+      ? `<section class="card" id="boots-banner" style="border-color:var(--flip)"><b>Kein Boot liefert gerade IPC</b> <span class="muted">&middot; der letzte Boot wurde geplant gestoppt. Unten seine letzten Zahlen.</span></section>`
+      : `<section class="card" id="boots-banner" style="border-color:var(--bad)"><b style="color:var(--bad)">Kein Boot liefert gerade IPC.</b> <span class="muted">Unten der zuletzt aktive Boot mit seinen letzten Zahlen.</span></section>`) : "";
     morph($("boots"), banner + (shown.length ? shown.map((b) => bootCard(b, now, binders)).join("")
-      : `<section class="card" id="boots-none"><div class="muted">Kein Boot-Log der letzten 6 h gefunden.</div></section>`));
+      : `<section class="card" id="boots-none"><div class="muted">Kein Boot-Zustand (state.json) der letzten 6 h gefunden.</div></section>`));
     if (DEV) {
       morph($("prod"), prodHtml(d));
       morph($("feat"), featHtml(d));

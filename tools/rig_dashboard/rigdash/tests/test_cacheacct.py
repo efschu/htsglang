@@ -85,14 +85,6 @@ class TestClassify(unittest.TestCase):
         cur = {"cache": 15, "comp_p": 3, "comp_d": 10, "handoff": 12}
         self.assertEqual(cacheacct.delta(prev, cur), {"cache": 5, "comp_p": 3, "comp_d": 0, "handoff": 2})
 
-    def test_buckets_keep_rid_across_windows(self):
-        # P leg in an earlier (already processed) window: its rid must still mark A's D leg as hand-over
-        pr = {"A"}
-        b = history.cache_buckets(LEGS[1:], 125.0, 20, 5.0, pr)
-        self.assertEqual(b[1]["handoff"], 990)       # t=130 -> bucket 1
-        self.assertEqual(b[1]["cache"], 0)
-        self.assertEqual(b[15]["cache"], 400)        # t=200 -> bucket 15
-
 
 if __name__ == "__main__":
     unittest.main()

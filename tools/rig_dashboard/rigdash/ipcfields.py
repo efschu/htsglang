@@ -2,10 +2,9 @@
 
 User 29.09. ~12:00Z (via 27B): "und warum sind die ganzen werte im dashboard noch aus log.
 warum arbeitet da niemand dran?"  -- so every field that still came from a log line gets its
-IPC reader NOW, before the producers are in a running image.  The switch is per field and by
-presence: when the boot's IPC carries the source, the field is read from there
-(``src="ipc"``); when it does not, the log value stays and is labelled ``aus Log (Übergang)``.
-No deploy has to wait for a boot: the day a producer lands in an image, its field switches.
+IPC reader NOW, before the producers are in a running image.  Since 30.09. there is no log
+fallback any more (NF-Operator: "Log-Rückfall für ALLE Werte entfernen"): a field is read from the
+boot's IPC (``src="ipc"``) or it is ``src="fehlt"`` and names the writer that would have to write it.
 
 Sources (read-only; the writers are weg2/state_file.py, weg2/front.py, weg2/rankstats.py):
 
@@ -29,7 +28,6 @@ import json
 import os
 from typing import Dict, List, Optional
 
-LOG_LABEL = "aus Log (Übergang)"
 RANKSTATS_SCHEMA = "weg2.rankstats/1"
 RANKSTATE_SCHEMAS = (1, 2)
 
@@ -42,17 +40,56 @@ KEYS = ("A1", "A4", "A12", "A13", "A14", "A15",
         "F3", "F4", "F6")
 
 
-def field(key: str, ipc_value, ipc_src: Optional[str], log_value, from_log: Optional[List[str]] = None) -> dict:
-    """The switch: IPC when present, else the log value with its label.  ``from_log`` names the
-    sub-fields the IPC record carries as null (RANKSTATS-S3-SCHEMA: null = the source is missing
-    on this rank, never 0) -- those stay on the log with the label."""
+#: who would have to write a field that the IPC of a boot does not carry (the page names it instead of
+#: reading a log -- NF-Operator 30.09.: "Wo das IPC-Feld fehlt ... NICHT aus dem Log holen")
+W_RS = "python/sglang/srt/weg2/rankstats.py"
+W_FI = "python/sglang/srt/weg2/front_state_ipc.py"
+MISSING_WRITER = {
+    "A1": "state.json boot_id/lifecycle -- weg2/state_file.py:init/transition",
+    "A4": "state.json groups.<G>.form -- Launcher (SGLANG_WEG2_FORM) über weg2/state_file.py:transition",
+    "A12": "state.json front.groups -- %s:publish_front_fields + publish_event(group_health)" % W_FI,
+    "A13": "rankstats.errors -- %s:ErrorTally / front.errors -- %s:publish_front_fields" % (W_RS, W_FI),
+    "A14": "events rank_stop -- %s:publish_rank_stops / rankstats.stops -- %s:note_stop" % (W_FI, W_RS),
+    "A15": "rankstats ts + work.forward_ct -- %s:RankStats.record" % W_RS,
+    "B1": "events flip_first_work P>D -- %s:FirstWorkClock.seen" % W_FI,
+    "B2": "events flip_first_work D>P -- %s:FirstWorkClock.seen" % W_FI,
+    "B3": "events flip_done -- %s:flip_done_payload + publish_event" % W_FI,
+    "B4": "events flip_done -- %s:flip_done_payload + publish_event" % W_FI,
+    "B5": "events flip_done -- %s:flip_done_payload + publish_event" % W_FI,
+    "B6": "events flip_begin -- %s:publish_event(flip_begin)" % W_FI,
+    "B7": "rankstats.last_post_wake -- %s:note_post_wake" % W_RS,
+    "C1": "rankstats.prefill -- %s:_prefill_block" % W_RS,
+    "C2": "rankstats.sched -- %s:scheduler_counters" % W_RS,
+    "C3": "rankstats.decode/spec -- %s:_decode_block" % W_RS,
+    "C4": "rankstats.decode.gpu_ms_by_bs -- %s:_decode_block" % W_RS,
+    "C5": "RankState kv/seats -- python/sglang/srt/weg2/rank_state.py:note_capacity / rankstats.cap -- %s:RankStats.sync_capacity" % W_RS,
+    "C6": "state.json front.d_seats (bzw. d_phase_n) -- %s:publish_front_fields" % W_FI,
+    "C7": "rankstats-Zähler (Deltas) -- %s:RankStats.record" % W_RS,
+    "D1": "rankstats.work.spans (sonst prefill.last) -- %s:RankStats.record" % W_RS,
+    "D2": "rankstats.work.spans kind=extend (sonst prefill.last auf D) -- %s:RankStats.record" % W_RS,
+    "D3": "events flip_first_work + flip_done -- %s" % W_FI,
+    "D4": "state.json serving_since_ts / events group_ready -- weg2/state_file.py:transition, add_event",
+    "E1": "rankstats.prefill.cached_tokens -- %s:_prefill_block" % W_RS,
+    "E2": "rankstats.cache -- %s:_cache_block" % W_RS,
+    "E3": "state.json front.served_tokens -- %s:publish_front_fields" % W_FI,
+    "F3": "wie B1", "F4": "wie A4", "F6": "wie C1-C6",
+}
+MISSING_LABEL = "fehlt in IPC"
+
+
+def field(key: str, ipc_value, ipc_src: Optional[str], log_value=None, from_log: Optional[List[str]] = None) -> dict:
+    """IPC or nothing (NF-Operator 30.09.: kein Log-Rückfall mehr).  ``log_value`` is ignored and
+    stays in the signature only so older callers keep working.  Without the IPC value the field is
+    ``fehlt`` and names the writer (MISSING_WRITER).  ``from_log`` names sub-fields the record carries
+    as null (RANKSTATS-S3-SCHEMA: source missing on this rank) -- they are reported as missing too."""
     if ipc_value is not None:
         f = {"key": key, "src": "ipc", "ipc_src": ipc_src, "value": ipc_value, "label": None}
         if from_log:
-            f["from_log"] = sorted(set(from_log))
-            f["from_log_label"] = LOG_LABEL
+            f["missing_leaves"] = sorted(set(from_log))
+            f["missing_label"] = MISSING_LABEL
         return f
-    return {"key": key, "src": "log", "ipc_src": None, "value": log_value, "label": LOG_LABEL}
+    return {"key": key, "src": "fehlt", "ipc_src": None, "value": None, "label": MISSING_LABEL,
+            "missing": MISSING_WRITER.get(key, ipc_src or key)}
 
 
 def _null_leaves(rows: dict) -> List[str]:
@@ -223,6 +260,7 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
     """All fields of one boot.  ``ipc`` = ipcstate.boot_view (+ ``ipc_events``), ``rank`` =
     read_rank_files(), ``logv`` = the log view of the same boot (live.Boot.view), ``rates`` =
     Rates.update() of this poll.  Pure over its inputs."""
+    logv = {}      # 30.09.: no log fallback -- the log arguments below are dead, field() ignores them
     rank = rank or {}
     stats = rank.get("rankstats") or {}
     rstate = rank.get("rankstate") or {}
@@ -279,7 +317,9 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
                 stops_ev.append(dict(x, group=_grp(k), rank=k.split(".", 1)[-1]))
         stops_ev.sort(key=lambda x: x.get("t") or 0)
         a14_src = "rankstats.stops"
-    f["A14"] = field("A14", stops_ev[-12:] or None, a14_src,
+    # a rank that carries its stops block with n=0 says "no stop": an empty list, not a missing field
+    have_stops = bool(_ev(ipc, "rank_stop")) or any(isinstance(rec.get("stops"), dict) for rec in stats.values())
+    f["A14"] = field("A14", stops_ev[-12:] if have_stops else None, a14_src,
                      {"n": logv.get("stop_count"), "last": logv.get("stops")})
 
     # A15 alarm dead/hung: the per-rank heartbeat = rankstats ts + forward counter
@@ -433,14 +473,14 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
 
 
 def for_page(fields: dict) -> dict:
-    """What goes to the page: the IPC value, or only the label -- the log value is already
-    in the boot's view under its old key and is not sent twice."""
-    return {k: ({kk: vv for kk, vv in fv.items()} if fv["src"] == "ipc"
-                else {kk: vv for kk, vv in fv.items() if kk != "value"}) for k, fv in fields.items()}
+    """What goes to the page: the IPC value, or the "fehlt in IPC" marker with its writer."""
+    return {k: dict(fv) for k, fv in fields.items()}
 
 
 def summary(fields: dict) -> dict:
-    """How many of the fields read the IPC now (the page shows it in the footer)."""
+    """How many of the fields read the IPC now; the rest are named as missing, never read from a log."""
     n_ipc = sum(1 for v in fields.values() if v.get("src") == "ipc")
-    return {"ipc": n_ipc, "log": len(fields) - n_ipc, "n": len(fields),
-            "log_keys": [k for k, v in fields.items() if v.get("src") != "ipc"]}
+    return {"ipc": n_ipc, "fehlt": len(fields) - n_ipc, "n": len(fields),
+            "fehlt_keys": [k for k, v in fields.items() if v.get("src") != "ipc" and not v.get("empty")],
+            "leer_keys": [k for k, v in fields.items() if v.get("src") != "ipc" and v.get("empty")],
+            "fehlt_writer": {k: v.get("missing") for k, v in fields.items() if v.get("src") != "ipc"}}

@@ -2,7 +2,7 @@
 ganzen werte im dashboard noch aus log"): one reader per field, switched by presence.
 
 For every field: the IPC source present -> the IPC value (src=ipc); absent -> the log value
-with the label "aus Log (Übergang)".  The fixtures follow the producers' schemas:
+with the label "fehlt in IPC".  The fixtures follow the producers' schemas:
 weg2/rankstats.py (weg2.rankstats/1, 2188e1bd98), weg2/front.py _ipc_front_fields and the
 events flip_begin / flip_done / flip_first_work / group_health (front_state_ipc.py), and the
 §3 blocks the inventory names for rankstats (prefill / decode / cache / work.spans).
@@ -109,19 +109,23 @@ class FieldSwitchTests(unittest.TestCase):
             self.assertIsNone(f["label"], k)
             self.assertTrue(f["ipc_src"], k)
 
-    def test_every_field_falls_back_to_the_log_with_its_label(self):
+    def test_no_field_falls_back_to_the_log(self):
+        # NF-Operator 30.09.: kein Log-Rückfall -- a field without IPC is "fehlt" and names its writer,
+        # the log value handed in is ignored
         for k, f in self.off.items():
-            self.assertEqual(f["src"], "log", k)
-            self.assertEqual(f["label"], "aus Log (Übergang)", k)
+            self.assertEqual(f["src"], "fehlt", k)
+            self.assertEqual(f["label"], "fehlt in IPC", k)
+            self.assertIsNone(f["value"], k)
+            self.assertTrue(f["missing"], k)
 
     def test_values(self):
         on, off = self.on, self.off
         self.assertEqual(on["A1"]["value"]["boot_id"], "nf-boot-x")
         self.assertEqual(on["A4"]["value"], {"D": "OWNED_CUT_X1=workers kv=S0"})
-        self.assertEqual(off["A4"]["value"], "log-form")
+        self.assertIsNone(off["A4"]["value"])
         self.assertEqual(on["A12"]["value"]["D"]["verdict"], "ok")
         self.assertEqual(on["A13"]["value"]["n"], 1 + 2 + 2)          # front + two ranks
-        self.assertEqual(off["A13"]["value"]["n"], 9)
+        self.assertIsNone(off["A13"]["value"])
         self.assertEqual(on["A14"]["value"][0]["code"], "W35_RuntimeError")
         self.assertEqual((on["A14"]["value"][0]["rank"], on["A14"]["value"][0]["ticket"]), ("tp0pp0", "#1068"))
         self.assertEqual(on["A15"]["value"]["D.tp0pp0"]["forward_ct"], 7)
@@ -129,13 +133,13 @@ class FieldSwitchTests(unittest.TestCase):
         self.assertEqual(on["B2"]["value"]["last_ms"], 3000)
         self.assertEqual(on["B3"]["value"]["flip_ms"], 2100)
         self.assertEqual(on["B4"]["value"]["n"], 1)
-        self.assertEqual(off["B4"]["value"]["n"], 12)
+        self.assertIsNone(off["B4"]["value"])
         self.assertEqual(len(on["B5"]["value"]), 1)
         self.assertFalse(on["B6"]["value"]["open"])                    # epoch 3 -> done epoch 4
         self.assertEqual(on["B7"]["value"]["run_ms"], 31)
         self.assertEqual(on["C1"]["value"]["P.tp0pp0"]["prefill_tps_gpu"], 5400.0)
         self.assertEqual(on["C2"]["value"]["D.tp0pp0"]["waiting"], 2)
-        self.assertEqual(off["C2"]["value"], 3)
+        self.assertIsNone(off["C2"]["value"])
         self.assertEqual(on["C3"]["value"]["D.tp0pp0"]["gen_tps"], 88.0)
         self.assertEqual(on["C3"]["value"]["D.tp0pp0"]["accept_len_mean"], 3.0)
         self.assertEqual(on["C4"]["value"]["D.tp0pp0"], {"1": [40, 1200.0]})
@@ -150,7 +154,7 @@ class FieldSwitchTests(unittest.TestCase):
         self.assertEqual(on["E1"]["value"]["P.tp0pp0"], 4096)
         self.assertEqual(on["E2"]["value"]["D.tp0pp0"]["loadback_n"], 2)
         self.assertEqual(on["E3"]["value"]["P"]["prompt"], 30000)
-        self.assertEqual(off["E3"]["value"], 7)
+        self.assertIsNone(off["E3"]["value"])
         self.assertEqual(on["F3"]["value"], on["B1"]["value"])
         self.assertEqual(on["F4"]["value"], on["A4"]["value"])
         self.assertEqual(set(on["F6"]["value"]), {"C1", "C2", "C3", "C4", "C5", "C6"})
@@ -165,7 +169,7 @@ class FieldSwitchTests(unittest.TestCase):
         f = ipcfields.resolve(None, {"rankstats": st, "rankstate": {}}, _logv(), rates={})
         self.assertEqual({k for k in ("A13", "A15", "B7", "C2", "C3") if f[k]["src"] == "ipc"},
                          {"A13", "A15", "B7", "C2", "C3"})
-        self.assertEqual({k for k in ("C1", "C4", "E1", "E2", "D1", "D2") if f[k]["src"] == "log"},
+        self.assertEqual({k for k in ("C1", "C4", "E1", "E2", "D1", "D2") if f[k]["src"] == "fehlt"},
                          {"C1", "C4", "E1", "E2", "D1", "D2"})
 
     def test_open_flip(self):
@@ -175,12 +179,12 @@ class FieldSwitchTests(unittest.TestCase):
         self.assertTrue(f["B6"]["value"]["open"])
         self.assertEqual(f["B6"]["value"]["since_ts"], 100.0)
 
-    def test_page_payload_carries_no_log_value_twice(self):
+    def test_page_payload_carries_no_log_value(self):
         page = ipcfields.for_page(self.off)
-        self.assertTrue(all("value" not in v for v in page.values()))
+        self.assertTrue(all(v["value"] is None and v["missing"] for v in page.values()))
         self.assertTrue(all("value" in v for v in ipcfields.for_page(self.on).values()))
         s = ipcfields.summary(self.off)
-        self.assertEqual((s["ipc"], s["log"], s["n"]), (0, len(ipcfields.KEYS), len(ipcfields.KEYS)))
+        self.assertEqual((s["ipc"], s["fehlt"], s["n"]), (0, len(ipcfields.KEYS), len(ipcfields.KEYS)))
 
 
 #: the reader fixture of /spinning/gpu-arb/docs/RANKSTATS-S3-SCHEMA-0929.md, verbatim (producer
@@ -219,21 +223,21 @@ class SchemaS3FixtureTests(unittest.TestCase):
         self.assertEqual(f["E2"]["value"]["P.tp0pp0"]["prefetch"]["landed"], 1)
         span = f["D1"]["value"]["P.tp0pp0"][0]
         self.assertEqual((span["t1"], span["t0"], span["kind"]), (1790679999.1, round(1790679999.1 - 2.81, 3), "prefill"))
-        self.assertEqual(f["D2"]["src"], "log")                              # no D rank in the fixture
+        self.assertEqual(f["D2"]["src"], "fehlt")                              # no D rank in the fixture
 
     def test_nachzug_leaves_come_from_the_record(self):
         """ff643c9010 fills full_token_usage, mamba_tok and prefetch.timeout: nothing of C2/E2 on the log."""
         f = self.f
-        self.assertNotIn("from_log", f["C2"])
-        self.assertNotIn("from_log", f["E2"])
+        self.assertNotIn("missing_leaves", f["C2"])
+        self.assertNotIn("missing_leaves", f["E2"])
         self.assertEqual(f["C2"]["value"]["P.tp0pp0"]["full_token_usage"], 0.4271)
         self.assertEqual(f["E2"]["value"]["P.tp0pp0"]["mamba_tok"], 0)
         pf = f["E2"]["value"]["P.tp0pp0"]["prefetch"]
         # deferred = census key 'deferred' (#1068 DEFERRED), defer_refused its own key (9969bd336b mixed them)
         self.assertEqual((pf["deferred"], pf["defer_refused"], pf["timeout"]), (1, 0, 0))
         # a P rank's decode block is all null (+ tokens 0): C3/C4 do not switch on it
-        self.assertEqual(f["C3"]["src"], "log")
-        self.assertEqual(f["C4"]["src"], "log")
+        self.assertEqual(f["C3"]["src"], "fehlt")
+        self.assertEqual(f["C4"]["src"], "fehlt")
 
     def test_a_leaf_null_on_every_rank_stays_on_the_log_with_the_label(self):
         """null = the source is missing on this rank (e.g. timeout without tree_cache): generic, per leaf."""
@@ -245,13 +249,13 @@ class SchemaS3FixtureTests(unittest.TestCase):
         other["cache"]["prefetch"]["timeout"] = 5                       # one rank carries it: not on the log
         f = ipcfields.resolve(None, {"rankstats": {"P.tp0pp0": rec, "P.tp0pp1": copy.deepcopy(rec)},
                                      "rankstate": {}}, _logv(), rates={})
-        self.assertEqual(f["E2"]["from_log"], ["mamba_tok", "prefetch.timeout"])
-        self.assertEqual(f["E2"]["from_log_label"], "aus Log (Übergang)")
-        self.assertEqual(f["C2"]["from_log"], ["full_token_usage"])
+        self.assertEqual(f["E2"]["missing_leaves"], ["mamba_tok", "prefetch.timeout"])
+        self.assertEqual(f["E2"]["missing_label"], "fehlt in IPC")
+        self.assertEqual(f["C2"]["missing_leaves"], ["full_token_usage"])
         f = ipcfields.resolve(None, {"rankstats": {"P.tp0pp0": rec, "P.tp0pp1": other}, "rankstate": {}},
                               _logv(), rates={})
-        self.assertEqual(f["E2"]["from_log"], ["mamba_tok"])
-        self.assertEqual(f["C2"]["from_log"], ["full_token_usage"])
+        self.assertEqual(f["E2"]["missing_leaves"], ["mamba_tok"])
+        self.assertEqual(f["C2"]["missing_leaves"], ["full_token_usage"])
 
     def test_c5_from_the_cap_block_until_the_rankstate_names_it(self):
         f = self.f
@@ -303,8 +307,12 @@ class NachzugA14C5Tests(unittest.TestCase):
     def test_a14_no_stop_anywhere_stays_on_the_log(self):
         f = ipcfields.resolve(None, {"rankstats": {"P.tp0pp0": copy.deepcopy(S3_FIXTURE)}, "rankstate": {}},
                               _logv(), rates={})
-        self.assertEqual(f["A14"]["src"], "log")
-        self.assertEqual(f["A14"]["label"], "aus Log (Übergang)")
+        # the rank carries its stops block (n=0): "no stop" is an IPC answer, an empty list
+        self.assertEqual((f["A14"]["src"], f["A14"]["value"]), ("ipc", []))
+        rec = copy.deepcopy(S3_FIXTURE)
+        rec.pop("stops", None)
+        f = ipcfields.resolve(None, {"rankstats": {"P.tp0pp0": rec}, "rankstate": {}}, _logv(), rates={})
+        self.assertEqual((f["A14"]["src"], f["A14"]["label"]), ("fehlt", "fehlt in IPC"))
 
     def test_c5_rankstate_kv_and_seats(self):
         rs = {"D.tp0pp0": {"schema": 2, "kv": {"holds_kv": True, "kv_tokens": 180000, "share": 0.625}, "seats": 6},
@@ -321,8 +329,8 @@ class NachzugA14C5Tests(unittest.TestCase):
         st = copy.deepcopy(S3_FIXTURE)
         st.pop("cap")
         f = ipcfields.resolve(None, {"rankstats": {"D.tp0pp0": st}, "rankstate": rs}, _logv(), rates={})
-        self.assertEqual(f["C5"]["src"], "log")
-        self.assertEqual(f["C5"]["label"], "aus Log (Übergang)")
+        self.assertEqual(f["C5"]["src"], "fehlt")
+        self.assertEqual(f["C5"]["label"], "fehlt in IPC")
 
 
 class RatesTests(unittest.TestCase):

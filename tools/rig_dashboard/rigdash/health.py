@@ -8,15 +8,13 @@ reason line it produces:
 * DEAD comes ONLY from IPC (operator 29.09., rule "IPC nie ueber Logs"):
   ``b["end"]["death"]`` from stops.classify_ipc (state.json lifecycle/cause,
   events deadman_verdict / front_stop).
-* WEG2-HEALTH (front log): ``process_alive=False`` -> a hint only;
+* front.groups (IPC, state.json front mirror): ``alive=False`` -> a hint only;
   ``http_ok=False`` with a streak >= 2 while alive -> the group is hung.
-* named stops in the P/D logs (parse.STOP_RE: W27, #791b, SPLIT refused,
-  ADMISSION SPLIT, a traceback, CUDA OOM, DEBUG-HOLD) -> a hint naming its
-  source file, never a death (a ConsumerGone traceback in D's HTTP layer
+* named stops (IPC: events rank_stop / rankstats.stops) -> a hint, never a death (a ConsumerGone traceback in D's HTTP layer
   showed "GRUPPE D TOT" while D decoded on, 29.09.).
 * Docker health: ``(unhealthy)`` in the container status.
-* the hang indicator: work is queued, but no prefill/decode line for
-  HANG_S seconds.
+* the hang indicator: work is queued, but the rank counters (rankstats) have not
+  advanced for HANG_S seconds.
 
 A PLANNED stop is not a death (operator 27.09. ~18Z, NF rc12s stopped by the
 loop's stop file showed "Gruppe D tot"): ``b["end"]`` (stops.classify, from the
@@ -86,11 +84,11 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
         if _age(now, h.get("t")) is None or _age(now, h["t"]) > HEALTH_FRESH_S:
             continue
         if not h.get("alive"):
-            add("warn", g, "Hinweis aus Log (Übergang): WEG2-HEALTH group=%s process_alive=False%s -- "
+            add("warn", g, "Hinweis (IPC front.groups): Gruppe %s alive=False%s -- "
                 "tot ist eine Gruppe nur laut state.json" % (g, " (streak %d)" % h["streak"] if h.get("streak") else ""),
                 h["t"])
         elif not h.get("http_ok") and (h.get("streak") or 0) >= 2:
-            add("hang", g, "Gruppe %s antwortet nicht: WEG2-HEALTH http_ok=False, streak %d, Prozess lebt" % (
+            add("hang", g, "Gruppe %s antwortet nicht: front.groups http_ok=False, streak %d, Prozess lebt" % (
                 g, h["streak"]), h["t"])
 
     # 2. named stops in the P/D logs (a traceback, W27, OOM ...), newest per group;
@@ -106,13 +104,13 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
         act = (b.get("last_activity") or {}).get(g)
         recovered = act is not None and act > s["t"] + STOP_RECOVERED_S
         src = " [Quelle: %s]" % s["src"] if s.get("src") else ""
-        text = "Hinweis aus Log, Gruppe %s: %s%s" % (g, s["text"][:300], src)
+        text = "benannter Stopp, Gruppe %s: %s%s" % (g, s["text"][:300], src)
         if ended_on is None or s["t"] > ended_on["t"]:
             ended_on = {"group": g, "text": s["text"][:300], "t": s["t"], "recovered": recovered, "src": s.get("src")}
         if recovered:
             add("warn", g, text + " (danach lief die Gruppe weiter)", s["t"])
         elif catching_up:
-            add("warn", g, text + " (Log wird noch eingelesen: ob die Gruppe danach weiterlief, steht noch aus)", s["t"])
+            add("warn", g, text + " (ob die Gruppe danach weiterlief, steht noch aus)", s["t"])
         else:
             add("warn", g, text + " (lebend/tot entscheidet state.json)", s["t"])
 
@@ -126,11 +124,11 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
         idle_now = _age(now, b.get("last_activity_any"))
         hc = (c.get("health_output") or "").strip()
         if catching_up:
-            add("warn", None, "Docker meldet %s unhealthy; Fortschritt noch nicht beurteilbar (Log wird noch eingelesen)%s"
+            add("warn", None, "Docker meldet %s unhealthy; Fortschritt noch nicht beurteilbar%s"
                 % (c.get("Names"), (" -- Healthcheck: " + hc[:300]) if hc else ""))
         elif idle_now is not None and idle_now < PROGRESS_S:
-            add("warn", None, "Docker-Health widerspricht dem Fortschritt: %s meldet unhealthy, aber vor %d s kam "
-                "eine Prefill-/Decode-Zeile%s" % (c.get("Names"), idle_now, (" -- Healthcheck: " + hc[:300]) if hc else ""))
+            add("warn", None, "Docker-Health widerspricht dem Fortschritt: %s meldet unhealthy, aber vor %d s zählten "
+                "die Rang-Zähler (rankstats) noch Arbeit%s" % (c.get("Names"), idle_now, (" -- Healthcheck: " + hc[:300]) if hc else ""))
         else:
             add("dead" if any(r["level"] == "dead" for r in reasons) else "hang", None,
                 "Docker meldet den Container %s: %s%s" % (c.get("Names"), status, (" -- Healthcheck: " + hc[:300]) if hc else ""))
@@ -149,10 +147,10 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
         queued, src = (q_front or 0) + outstanding, "%s (queue %s + outstanding %s)" % (
             fr.get("src") or "Front /weg2/state", q_front, outstanding)
     elif q_log is not None and q_log_age is not None and q_log_age < 600:
-        queued, src = q_log, "letzte WEG2-ROUTE-Zeile"
+        queued, src = q_log, "Warteschlange"
     idle = _age(now, b.get("last_activity_any"))
     if judged and queued and idle is not None and idle >= HANG_S and not catching_up and not stopping():
-        add("hang", None, "HÄNGT: %d Anfrage(n) warten (%s), seit %d s keine Prefill-/Decode-Zeile" % (
+        add("hang", None, "HÄNGT: %d Anfrage(n) warten (%s), seit %d s zählen die Rang-Zähler (rankstats) keine Arbeit" % (
             queued, src, idle))
 
     ps = None

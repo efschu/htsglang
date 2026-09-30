@@ -89,27 +89,6 @@ class TestCompaction(unittest.TestCase):
 
 
 class TestBuckets(unittest.TestCase):
-    def test_decode_spread_time_weighted(self):
-        lines = [{"t": 100.0, "gen_tps": None, "running": 2},
-                 {"t": 110.0, "gen_tps": 100.0, "running": 2},
-                 {"t": 200.0, "gen_tps": 50.0, "running": 1}]   # gap 90 s > DEC_GAP_MAX_S: not spread
-        tok, cov, stream = history.decode_buckets(lines, 100.0, 4, 5.0)
-        self.assertEqual(tok[:2], [500.0, 500.0])
-        self.assertEqual(cov[:2], [5.0, 5.0])
-        self.assertEqual(stream[:2], [50.0, 50.0])
-        self.assertEqual(tok[2:], [0.0, 0.0])
-        self.assertIsNone(stream[2])
-
-    def test_decode_artefact_not_spread(self):
-        lines = [{"t": 100.0}, {"t": 105.0, "gen_tps": 999.0, "gen_art": True, "running": 1}]
-        tok, _, _ = history.decode_buckets(lines, 100.0, 1, 5.0)
-        self.assertEqual(tok, [0.0])
-
-    def test_prefill_first_rank_only(self):
-        ev = [{"t": 101.0, "rank": 0, "new_tok": 4096}, {"t": 101.0, "rank": 1, "new_tok": 4096},
-              {"t": 106.0, "new_tok": 100}]
-        self.assertEqual(history.prefill_tokens(ev, 100.0, 2, 5.0), [4096.0, 100.0])
-
     def test_card_roles_from_launch(self):
         cards = [{"index": 0, "uuid": "GPU-a3080"}, {"index": 1, "uuid": "GPU-b5090"}, {"index": 2, "uuid": "GPU-c3080"}]
         vis = "GPU-b5090,GPU-a3080,GPU-c3080"

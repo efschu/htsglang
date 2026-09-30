@@ -73,10 +73,12 @@ class TestIpcRates(unittest.TestCase):
                                                                   "tok_comp_d": 0.0, "tok_handoff": 0.0})
 
     def test_model_src_label(self):
-        self.assertEqual(history.model_src([1.0, 1.0], [[0.0, 5.0]]), history.IPC_LABEL)
-        self.assertEqual(history.model_src([None, None], [[0.0, 5.0]]), history.LOG_LABEL)
-        self.assertIn("ältere Abschnitte", history.model_src([None, 1.0], [[0.0, 5.0]]))
-        self.assertIsNone(history.model_src([None], [[None]]))
+        self.assertEqual(history.model_src([None, 1.0]), history.IPC_LABEL)
+        self.assertEqual(history.model_src([None, None]), "keine Daten (vor IPC-Aufzeichnung)")
+
+    def test_boot_ts_from_id(self):
+        self.assertEqual(history.boot_ts("nfh91-boot-20260930T153426Z-051f"), 1790782466.0)
+        self.assertIsNone(history.boot_ts("27bbf-boot-x"))
 
     def test_model_of_ipc(self):
         self.assertEqual(history.model_of_ipc({"dir": "/spinning/docker-acceptance/27b/state/x"}), "27B")
@@ -123,6 +125,61 @@ class TestRecorderIpc(unittest.TestCase):
             self.assertEqual(set(got["m.27B.ipc"]), {1000, 1005})
             self.assertEqual(db.get("ipc0.27bbf-boot-x"), 1001.0)      # the log backfill stops here
             self.assertEqual([m["label"] for m in db.marks("27B", 900, 1100) if m["kind"] == "flip"], ["P>D ipc"])
+            view["terminal"], view["lifecycle"], view["lifecycle_since"] = True, "stopped_clean", 1007.0
+            rec.ingest_ipc(1008.0)
+            self.assertEqual([m["kind"] for m in db.marks("27B", 900, 1100) if m["kind"] != "flip"], ["end"])
+
+
+class TestNoLogInHistory(unittest.TestCase):
+    """Nutzer 30.09.: "warum ist da immernoch 'aus Log (übergang)'" -- no history series may come
+    from a boot log.  Structural: history.py neither imports the log reader nor touches a log boot;
+    behavioural: rows without an IPC sample (what an older rigdash derived from logs) are not shown."""
+
+    def test_history_module_reads_no_log(self):
+        src = open(history.__file__, encoding="utf-8").read()
+        for w in (".D.log", ".P.log", ".front.log", "from . import live", "live.", "self.logs.boots",
+                  "b.ev.get(", "served_legs", "flip_rows", "_prefill_batch", "_decode_batch", "aus Log"):
+            self.assertNotIn(w, src, w)
+
+    def test_recorder_never_opens_a_log(self):
+        import builtins
+        opened = []
+        real = builtins.open
+
+        def spy(path, *a, **k):
+            opened.append(str(path))
+            return real(path, *a, **k)
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "nf", "state", "nfx-boot-20260930T153426Z-051f")
+            os.makedirs(os.path.join(d, "rankstate", "P"))
+            with real(os.path.join(d, "rankstate", "P", "P.tp0pp0.rankstats"), "w") as fh:
+                json.dump(rs("P", 0, 1000.0, pnew=5), fh)
+            for g in ("P", "D", "front"):          # logs lying next to it must stay unopened
+                real(os.path.join(tmp, "x.%s.log" % g), "w").close()
+            view = {"dir": d, "boot_id": os.path.basename(d), "kind": "boot", "terminal": False}
+            rec = history.Recorder(history.HistoryDB(None), _Logs(None), ipc=_Ipc([view]))
+            builtins.open = spy
+            try:
+                rec.ingest_ipc(1001.0)
+                rec.ingest_ipc(1006.0)
+            finally:
+                builtins.open = real
+        self.assertTrue(any(p.endswith(".rankstats") for p in opened))
+        self.assertFalse([p for p in opened if p.endswith(".log")])
+
+    def test_view_hides_rows_without_ipc_sample(self):
+        db = history.HistoryDB(None)
+        db.put([("m.NF.p_tps", 9900, 500.0), ("m.NF.p_tps", 9905, 700.0), ("m.NF.ipc", 9905, 1.0)])
+        db.mark(9800, "NF", "flip", "P>D log", 3000.0)
+        db.mark(9810, "NF", "flip", "P>D ipc", 2000.0)
+        db.mark(9700, "NF", "boot", "nfx")                 # an old log-derived boot mark
+        v = history.view(db, None, "NF", "15m", now=10000.0)
+        i = v["t"].index(9900)
+        self.assertIsNone(v["series"]["m.p_tps"][i])       # log-derived: not shown
+        self.assertEqual(v["series"]["m.p_tps"][i + 1], 700.0)
+        self.assertEqual([(m["kind"], m["label"]) for m in v["marks"]], [("flip", "P>D")])
+        self.assertEqual(v["src"]["prefill"], history.IPC_LABEL)
+        self.assertNotIn("Log", json.dumps(v["src"], ensure_ascii=False))
 
 
 class TestViewPowerSum(unittest.TestCase):

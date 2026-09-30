@@ -500,17 +500,17 @@ def _cur_flip(lb, fb, gpus):
         return None
     return ("P→D Median %s, p90 %s (n=%s); D→P Median %s (n=%s); Flips %s" % (
         _fmt_s(pd.get("median")), _fmt_s(pd.get("p90")), pd.get("n"), _fmt_s(dp.get("median")), dp.get("n"),
-        lb.get("flip_count")), "rigdash live.py: WEG2-FLIP begin → erste TP0 Decode rank batch / PP0 Prefill batch")
+        lb.get("flip_count")), "events.jsonl flip_first_work (Front-Uhr) + flip_done (IPC)")
 
 
 def _cur_decode(lb, fb, gpus):
     dec = (lb.get("decode") or {}).get("D") or {}
     rb = dec.get("round_ms_by_bs") or {}
-    parts = ["bs%s %s ms (n=%s)" % (bs, str(v["median_ms"]).replace(".", ","), v["n"]) for bs, v in rb.items()]
+    parts = ["bs%s %s ms (n=%s)" % (bs, str(v["median_ms"]).replace(".", ","), v["n"]) for bs, v in rb.items()]  # Mittel
     if not parts and dec.get("gen_tps_last") is None:
         return None
     return ("Runde " + (", ".join(parts) or "—") + "; gen %s tok/s" % dec.get("gen_tps_last"),
-            "TP0 Decode rank batch gpu-ms je bs (Tiefe/Text gemischt) + Decode batch gen throughput")
+            "rankstats decode.gpu_ms_by_bs (Mittel je bs, Tiefe/Text gemischt) + Δdecode.tokens (IPC)")
 
 
 def _cur_prefill(lb, fb, gpus):
@@ -520,7 +520,7 @@ def _cur_prefill(lb, fb, gpus):
         return None
     return ("letzter Schub %s tok/s (langsamste Stufe, %s Chunks, Ø %s Tok)" % (
         round(lb_["tps"]), lb_.get("chunks"), round(lb_.get("mean_chunk") or 0)),
-        "Prefill rank batch #new-token / compute-ms je Stufe")
+        "rankstats Δprefill.new_tokens / Δcompute_ms je Rang (IPC)")
 
 
 def _cur_spec(lb, fb, gpus):
@@ -528,7 +528,7 @@ def _cur_spec(lb, fb, gpus):
     if dec.get("accept_len") is None:
         return None
     return ("Akzeptanzlänge %s (Rate %s)" % (dec.get("accept_len"), dec.get("accept_rate")),
-            "Decode batch accept len")
+            "rankstats decode.accept_len_ewma (IPC)")
 
 
 def _cur_kv(lb, fb, gpus):
@@ -536,7 +536,7 @@ def _cur_kv(lb, fb, gpus):
     if dec.get("max_total_tokens") is None:
         return None
     return ("D max_total_num_tokens %s; brachliegende GiB: kein Instrument (Marker: freier KV-VRAM je Rang)"
-            % dec["max_total_tokens"], "max_total_num_tokens-Zeile TP0")
+            % dec["max_total_tokens"], "rankstats cap.kv_tokens TP0 (IPC)")
 
 
 def _cur_seats(lb, fb, gpus):
@@ -545,12 +545,12 @@ def _cur_seats(lb, fb, gpus):
     if not s and not rb:
         return None
     return ("Sitze %s von %s, Runde bs %s" % (s.get("n"), s.get("cap"), rb.get("bs")),
-            "WEG2 D-PHASE-SEATS + Decode rank batch bs")
+            "state.json front.d_seats/d_phase_n + rankstats cap.seats (IPC)")
 
 
 def _cur_form(lb, fb, gpus):
     form = (lb.get("meta") or {}).get("form")
-    return (form, "front.log WEG2-FORM") if form else None
+    return (form, "state.json groups.<G>.form (IPC)") if form else None
 
 
 def _cur_boot(lb, fb, gpus):
@@ -593,7 +593,7 @@ def _cur_api(lb, fb, gpus):
         return ("%s Anfragen bedient (P %s / D %s)" % (served.get("D", 0), served.get("P", 0), served.get("D", 0)),
                 "Front /weg2/state served")
     tot = lb.get("totals") or {}
-    return ("%s Anfragen bedient" % tot["served_requests"], "front.log WEG2-SERVED") if tot.get("served_requests") else None
+    return ("%s Anfragen bedient" % tot["served_requests"], "state.json front.served (IPC)") if tot.get("served_requests") else None
 
 
 def _cur_format(lb, fb, gpus):
@@ -660,7 +660,7 @@ def attach_current(fv: dict, live_boots: list, gpus: Optional[dict]) -> dict:
             tag = (lb.get("meta") or {}).get("tag") or lb.get("stem")
             cur[m] = {"wert": _clean(r[0]), "instrument": r[1], "boot": _clean(tag) or (fb or {}).get("rc")} if r \
                 else {"leer": "Instrument vorhanden, in diesem Boot noch kein Wert" if lb else
-                      "Instrument im Boot-Log, das Log dieses Boots liest rigdash nicht (mehr)", "boot": _clean(tag)}
+                      "kein IPC-Boot dieses Modells in den letzten 6 h", "boot": _clean(tag)}
         for m in MODELS:
             fb = fboot.get(m)
             if not fb:

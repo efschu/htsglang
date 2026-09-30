@@ -329,7 +329,7 @@ class HealthTests(unittest.TestCase):
         b = self._boot(health={"P": {"t": self.NOW - 10, "alive": False, "http_ok": False, "streak": 4}})
         a = health.assess(b, self.NOW)
         self.assertEqual(a["state"], "WARNUNG")
-        self.assertIn("Hinweis aus Log", a["reasons"][0]["text"])
+        self.assertIn("Hinweis (IPC front.groups)", a["reasons"][0]["text"])
         self.assertNotIn("dead", {r["level"] for r in a["reasons"]})
 
     def test_stale_health_line_does_not_alarm(self):
@@ -369,7 +369,7 @@ class HealthTests(unittest.TestCase):
                        container={"Names": "c", "State": "running", "Status": "Up 51 minutes (unhealthy)"})
         a = health.assess(b, self.NOW)
         self.assertEqual(a["state"], "WARNUNG")
-        self.assertIn("noch eingelesen", a["reasons"][0]["text"])
+        self.assertIn("noch nicht beurteilbar", a["reasons"][0]["text"])
 
     def test_queue_with_recent_progress_is_fine(self):
         b = self._boot(front={"queue": 3, "outstanding": {}}, last_activity_any=self.NOW - 20)
@@ -797,7 +797,7 @@ class PlannedStopTests(unittest.TestCase):
                        last_activity={"P": _utc(17, 37, 0)})
         a = health.assess(b, self.NOW)
         self.assertNotEqual(a["state"], "TOT")
-        self.assertTrue(any("Hinweis aus Log, Gruppe P" in r["text"] for r in a["reasons"]))
+        self.assertTrue(any("benannter Stopp, Gruppe P" in r["text"] for r in a["reasons"]))
 
     def test_stop_requested_while_serving_changes_nothing(self):
         end = {"planned": {"t": self.NOW - 200, "text": H_DAUER_STOP, "src": "nf-dauer"}, "death": None}
