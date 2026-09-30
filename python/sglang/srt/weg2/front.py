@@ -5602,6 +5602,7 @@ class Front:
         wait_ms = (time.monotonic() - t0) * 1000.0
         if c is None:
             self.counters["x_exact_fallback"] += 1
+            self._x_exact_note_fallback(rid, reason)
             logger.info("WEG2 X-EXACT-FALLBACK rid=%s reason=%s est_uncached=%d est_prompt=%d "
                         "(chars/3 estimate stands for this request) wait_ms=%.1f",
                         rid, reason, est_uncached, est_prompt, wait_ms)
@@ -5946,6 +5947,51 @@ class Front:
                         "reading below it retracts it)", done_epoch, n, gained)
             self._x_exact_reprice_queue("d_epoch_publish")
         return n
+
+    #: X-EXACT-BACKFILL: the fallback reasons whose count would give the RIGHT ids once the tokenizer
+    #: is ready (the others -- multimodal, path, a payload the count raised on -- would not)
+    X_EXACT_BACKFILL_REASONS = ("tokenizer_loading", "timeout")
+
+    def _x_exact_note_fallback(self, rid: str, reason: Optional[str]) -> None:
+        """Remember why ``rid`` was priced by chars/3 (X-EXACT-BACKFILL, see ``_x_exact_backfill``)."""
+        fb = self.__dict__.get("_x_exact_fallback_rid")
+        if fb is None:
+            fb = self.__dict__["_x_exact_fallback_rid"] = collections.OrderedDict()
+        fb[rid] = str(reason)
+        while len(fb) > 4096:
+            fb.popitem(last=False)
+
+    async def _x_exact_backfill(self, rid: str, path: str, payload: Any, text: str) -> None:
+        """X-EXACT-BACKFILL (30.09., freeze flip 3vsqkr s0): a request priced by the chars/3 fallback
+        because the front tokenizer was still LOADING (or the count timed out) never got its token ids, and
+        every presence record of its own legs reads ``ftok.ids_for(text)`` -- the K1 P anchor at its first
+        content, D's finish reading, the #49 in-flight span. All of them wrote nothing, so its follow-ups
+        were priced credit=0 (weg2-0-2 arrived 1.3 s before READY: its twin AND its follow-up went LONG).
+        Called once at leg 2, before D is asked: counts it now with the same ``ftok.count(path, payload)``
+        the arrival would have used and remembers the ids. Routing of this request is unchanged."""
+        fb = self.__dict__.get("_x_exact_fallback_rid")
+        reason = fb.pop(rid, None) if fb else None
+        if reason not in self.X_EXACT_BACKFILL_REASONS:
+            return
+        ft = self.ftok
+        if (ft is None or getattr(ft, "state", None) != "ready" or not isinstance(payload, dict)
+                or ft.ids_for(text) is not None):
+            return
+        t0 = time.monotonic()
+        try:
+            c = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(ft.executor, ft.count, path, payload),
+                timeout=envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0)
+        except Exception as e:  # noqa: BLE001 -- the leg runs as before, named
+            self.counters["x_exact_backfill_failed"] += 1
+            logger.info("WEG2 X-EXACT-BACKFILL rid=%s reason=%s FAILED %s: %s (no presence records "
+                        "for this request's legs)", rid, reason, type(e).__name__, str(e)[:160])
+            return
+        ft.remember(text, c.ids)
+        self.counters["x_exact_backfilled"] += 1
+        logger.info("WEG2 X-EXACT-BACKFILL rid=%s reason=%s tokens=%d count_ms=%.1f wait_ms=%.1f (priced by "
+                    "chars/3 at arrival; its exact ids now feed this request's presence records: P anchor, "
+                    "D reading)", rid, reason, c.n, c.ms, (time.monotonic() - t0) * 1000.0)
 
     def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
                         held_epoch: Optional[int], resumable_depth: Optional[int] = None) -> None:
@@ -8167,6 +8213,8 @@ class Front:
                 logger.warning("WEG2 X R_D-PROBE-ERROR rid=%s %s: %s (no sample)",
                                rid, type(e).__name__, e)
 
+        # X-EXACT-BACKFILL: a request priced by chars/3 while the tokenizer loaded gets its ids now
+        await self._x_exact_backfill(rid, request.path, payload, text)
         if pending is not None and pending.skip_leg1:
             single_prefill = True
         if (stream and pending is not None and request.path.startswith("/v1/")
