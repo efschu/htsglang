@@ -836,6 +836,13 @@ class Envs:
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (weg2/park_stuck.py).
     SGLANG_WEG2_PARK_STUCK_PHASES = EnvInt(3)
+    # RW-FINISH (#287, 30.09., NF y4k): the resume warm runs to the end instead
+    # of being cancelled at the first decode (14/14 wakes: warm_layers=8
+    # skipped_cancel=40; window-1 decode wall 38.4 ms vs 27-28.5 steady). The
+    # rest goes on a side stream in layer order, each layer committed before a
+    # forward once its event completed -- no host wait in the decode path.
+    # Off until its own metal proof (layers/moe/expert_offload.ResumeWarm).
+    SGLANG_WEG2_RESUME_WARM_FINISH = EnvBool(False)
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.

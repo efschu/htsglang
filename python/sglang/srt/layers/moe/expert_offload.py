@@ -5267,6 +5267,51 @@ class MoEExpertOffloadCache:
         copy_rows(self._pool_srcs, self._pool_dsts, src, dst, count)
         return len(pairs)
 
+    # -- RW-FINISH (#287, 30.09.): the warm in four device-side steps ---------
+    def warm_plan(self, ids, limit: int = 0):
+        """RW-FINISH: choose free LRU rows for ``ids`` (host reads; the caller
+        is the RW tick, device idle) and RESERVE them on the current stream.
+        Returns the plan (device tensors) or None."""
+        if not self._pool_ready or not ids:
+            return None
+        import torch
+
+        from sglang.srt.layers.moe.expert_pool_device import plan_warm_rows, reserve_warm_rows
+
+        triples = plan_warm_rows(self._pool_tables, [int(e) for e in ids], limit=int(limit))
+        if not triples:
+            return None
+        dev = self._pool_dsts[0].device
+        plan = WarmPlan(
+            src=torch.tensor([t[0] for t in triples], dtype=torch.int32, device=dev),
+            dst=torch.tensor([t[1] for t in triples], dtype=torch.int32, device=dev),
+            exp=torch.tensor([t[2] for t in triples], dtype=torch.int64, device=dev),
+            count=torch.tensor([len(triples)], dtype=torch.int32, device=dev),
+            rows=len(triples))
+        reserve_warm_rows(self._pool_tables, plan.dst.long())
+        return plan
+
+    def warm_copy(self, plan) -> None:
+        """RW-FINISH: the reserved rows' bytes from the pinned store rows, on
+        the CURRENT stream (the RW tick's, or the finish side stream)."""
+        from sglang.srt.layers.moe.expert_pool_device import copy_rows
+
+        copy_rows(self._pool_srcs, self._pool_dsts, plan.src, plan.dst, plan.count)
+
+    def warm_commit(self, plan) -> None:
+        """RW-FINISH: the landed rows into the tables (device-side, current
+        stream -- behind the copy's event)."""
+        from sglang.srt.layers.moe.expert_pool_device import commit_warm_rows
+
+        commit_warm_rows(self._pool_tables, plan.exp, plan.dst.long())
+
+    def warm_release(self, plan) -> None:
+        """RW-FINISH: reserved rows back to free (an eager pass reached the
+        layer before its copy was issued)."""
+        from sglang.srt.layers.moe.expert_pool_device import release_warm_rows
+
+        release_warm_rows(self._pool_tables, plan.dst.long())
+
     def rearm_after_wake(self, rows_loaded: bool = False, defer: bool = False) -> int:
         """Nach dem Wake, bevor irgendein Forward laeuft (Platztausch).
 
@@ -6890,6 +6935,18 @@ DEFER_HOST = "host"
 
 
 @dataclass
+class WarmPlan:
+    """RW-FINISH: one layer's warm -- store rows, reserved bank rows, experts
+    (device tensors, built once while the device was idle)."""
+
+    src: object
+    dst: object
+    exp: object
+    count: object
+    rows: int
+
+
+@dataclass
 class DeferredRows:
     """H31b: what one pool layer still owes after a deferred rearm."""
 
@@ -7148,6 +7205,17 @@ def resume_warm_enabled() -> bool:
     return (os.environ.get(RESUME_WARM_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+def resume_warm_finish_enabled() -> bool:
+    """RW-FINISH (#287, 30.09.): the warm runs to the end instead of being
+    cancelled at the first decode (``SGLANG_WEG2_RESUME_WARM_FINISH``)."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_RESUME_WARM_FINISH.get())
+    except Exception:  # noqa: BLE001 -- no environ: the old cancel
+        return False
+
+
 def _pool_caches(model):
     for module in model.modules():
         cache = getattr(module, "_expert_offload", None)
@@ -7156,8 +7224,31 @@ def _pool_caches(model):
 
 
 class ResumeWarm:
+    """RW, and RW-FINISH (#287, 30.09., NF y4k): every wake cancelled the warm
+    at the first decode (``RW WAKE-FIRST-TOKEN ... warm_layers=8 ...
+    skipped_cancel=40 cancel=first_decode``, 14/14 wakes); the first 64 decode
+    rounds then ran cold -- ``MOE-POOL-DEMAND max_nonres_per_step=57
+    median_layer_max=29`` against 22/17 steady, ``DECODE-HOST-SPLIT`` window-1
+    wall 38.4 ms (gpu_verify 35.1, max 186) against 27.0-28.5 steady.
+
+    Under ``SGLANG_WEG2_RESUME_WARM_FINISH`` the first idle tick PLANS every
+    queued layer (host reads, device idle -- the tick's own gate) and RESERVES
+    its rows (OFF rows: never free, never a victim, never routed); the ticks
+    copy and commit layers on the current stream as before; at the cancel
+    point the rest goes on a side stream, in layer order, one event per layer
+    (``_finish``), and :func:`deferred_rows_tick` -- the scheduler's hook before
+    every forward -- commits each layer whose event has COMPLETED
+    (``query``; the forward stream's ``wait_event`` on a finished event does
+    not stall; the commit is a device-side table write). No host read, no
+    synchronize, no wait in the decode path; a layer whose copy is still in
+    flight is simply not committed yet (its experts miss as before)."""
+
     def __init__(self) -> None:
         self._queue: List = []
+        self._inflight: List = []
+        self._stream = None
+        self._ops = None
+        self._planned = False
         self.reset_stats()
 
     def reset_stats(self) -> None:
@@ -7169,6 +7260,8 @@ class ResumeWarm:
         self.row_bytes = 0
         self.skipped_eager = self.skipped_cancel = 0
         self.cancel_reason = ""
+        self.finish_layers = self.finish_rows = self.finish_landed = 0
+        self.finish_reason = ""
         self._first_extend_layers: Dict = {}
         self._first_extend_closed = False
 
@@ -7194,6 +7287,8 @@ class ResumeWarm:
 
     # -- the wake, after the rearm (the legs are over) --------------------
     def arm(self, models) -> int:
+        if self._inflight:
+            self.settle()  # RW-FINISH: a sleep that skipped the settle hook
         stats = (self.snap_layers, self.snap_rows, self.snap_ms)
         self.reset_stats()
         self.snap_layers, self.snap_rows, self.snap_ms = stats
@@ -7204,6 +7299,7 @@ class ResumeWarm:
         # "no settle" as "settle over" (NF rc12z26: 8/8 wakes cancel=settle_done
         # with warm_layers=0).
         self._settle_open = False
+        self._planned = False
         if not resume_warm_enabled():
             return 0
         for model in models:
@@ -7234,6 +7330,20 @@ class ResumeWarm:
         n = _env_int(RESUME_WARM_LAYERS_ENV, 8) if layers is None else int(layers)
         t0 = time.perf_counter()
         done = 0
+        if resume_warm_finish_enabled():
+            if not self._planned:
+                self._plan_all()
+            while self._queue and done < max(1, n):
+                cache = self._queue.pop(0)
+                plan = getattr(cache, "_rw_plan", None)
+                cache._rw_plan = None
+                if plan is not None:
+                    cache.warm_copy(plan)
+                    cache.warm_commit(plan)
+                    self._count(cache, plan.rows)
+                done += 1
+            self.warm_ms += (time.perf_counter() - t0) * 1000.0
+            return done
         while self._queue and done < max(1, n):
             cache = self._queue.pop(0)
             ids = getattr(cache, "_rw_snap", None) or []
@@ -7248,14 +7358,107 @@ class ResumeWarm:
         self.warm_ms += (time.perf_counter() - t0) * 1000.0
         return done
 
+    def _count(self, cache, rows: int) -> None:
+        rb = cache.pool_row_bytes() if hasattr(cache, "pool_row_bytes") else 0
+        self.row_bytes = max(self.row_bytes, rb)
+        self.warm_bytes += int(rows) * rb
+        self.warm_rows += int(rows)
+        self.warm_layers += 1
+
+    def _plan_all(self) -> None:
+        """RW-FINISH: plan + reserve every queued layer (the first idle tick)."""
+        rows = _env_int(RESUME_WARM_ROWS_ENV, 32)
+        for cache in list(self._queue):
+            ids = getattr(cache, "_rw_snap", None) or []
+            cache._rw_snap = None
+            plan = cache.warm_plan(ids, limit=rows) if hasattr(cache, "warm_plan") else None
+            cache._rw_plan = plan
+        self._planned = True
+
     def eager_reached(self, cache) -> None:
-        """An eager forward reached ``cache``: never wait -- drop it."""
+        """An eager forward reached ``cache``: never wait -- drop it (a planned
+        layer gives its reserved rows back; one in flight stays reserved until
+        its event completes)."""
         if cache in self._queue:
             self._queue.remove(cache)
+            plan = getattr(cache, "_rw_plan", None)
+            if plan is not None:
+                cache.warm_release(plan)
+                cache._rw_plan = None
             cache._rw_snap = None
             self.skipped_eager += 1
 
+    def _finish(self, reason: str) -> int:
+        """RW-FINISH: the planned rest on the side stream, layer order, one
+        event per layer. Nothing is skipped; returns 0."""
+        caches = [c for c in self._queue if getattr(c, "_rw_plan", None) is not None]
+        self._queue = []
+        if not caches:
+            return 0
+        if self._ops is None:
+            self._ops = _default_stream_ops()
+        ops = self._ops
+        if ops is not None and self._stream is None:
+            self._stream = ops.new_stream()
+        import contextlib
+
+        ctx = ops.stream_ctx(self._stream) if ops is not None else contextlib.nullcontext()
+        with ctx:
+            if ops is not None:
+                ops.after_current(self._stream)  # behind the reservations and the forward
+            for cache in caches:
+                cache.warm_copy(cache._rw_plan)
+                ev = ops.record(self._stream) if ops is not None else None
+                self._inflight.append((cache, ev))
+                self.finish_rows += int(cache._rw_plan.rows)
+        self.finish_layers += len(caches)
+        self.finish_reason = reason
+        return 0
+
+    def promote_ready(self) -> int:
+        """RW-FINISH, before a forward on its stream: commit every in-flight
+        layer whose event has COMPLETED, in issue order (one stream: behind an
+        unfinished one nothing is done either). Never waits on the host."""
+        n = 0
+        ops = self._ops
+        while self._inflight:
+            cache, ev = self._inflight[0]
+            if ev is not None and not bool(ev.query()):
+                break
+            if ev is not None and ops is not None:
+                ops.current_waits(ev)  # completed: a no-op on the device, orders the commit
+            plan = cache._rw_plan
+            cache._rw_plan = None
+            if plan is not None:
+                cache.warm_commit(plan)
+                self._count(cache, plan.rows)
+            self._inflight.pop(0)
+            self.finish_landed += 1
+            n += 1
+        if n and not self._inflight:
+            logger.info("RW FINISH-LANDED layers=%d rows=%d reason=%s (RW-FINISH: the warm's "
+                        "rest ran on a side stream behind the first decode; committed before "
+                        "the forwards as each layer's event completed, no host wait)",
+                        self.finish_landed, self.finish_rows, self.finish_reason or "-")
+        return n
+
+    def settle(self) -> None:
+        """RW-FINISH, before the first pause of a sleep: the pool buffers are
+        paused next -- wait for copies still in flight, forget the rest (the
+        next wake rewrites the tables)."""
+        for cache, ev in self._inflight:
+            if ev is not None:
+                ev.synchronize()
+            cache._rw_plan = None
+        self._inflight = []
+        for cache in self._queue:
+            cache._rw_plan = None
+            cache._rw_snap = None
+        self._queue = []
+
     def cancel(self, reason: str) -> int:
+        if resume_warm_finish_enabled() and self._planned:
+            return self._finish(reason)
         n = len(self._queue)
         for cache in self._queue:
             cache._rw_snap = None
@@ -7286,6 +7489,9 @@ class ResumeWarm:
             f"row_bytes={self.row_bytes} warm_mib={self.warm_bytes / 2**20:.1f} "
             f"skipped_eager={self.skipped_eager} skipped_cancel={self.skipped_cancel}"
             + (f" cancel={self.cancel_reason}" if self.cancel_reason else "")
+            + (f" finish_layers={self.finish_layers} finish_rows={self.finish_rows} "
+               f"finish_landed={self.finish_landed} finish={self.finish_reason}"
+               if self.finish_layers else "")
         )
 
 
@@ -7308,7 +7514,14 @@ def deferred_rows_fill() -> DeferredRowsFill:
 
 def deferred_rows_tick(batch) -> None:
     """Der Scheduler-Haken vor jedem Forward (H31b); ohne offene Zeilen ein
-    Attributzugriff."""
+    Attributzugriff. RW-FINISH: die fertig gelandeten Warm-Layer werden hier
+    eingetragen (Event-Abfrage, keine Host-Wartestelle)."""
+    rw = _RESUME_WARM
+    if rw is not None and rw._inflight:
+        try:
+            rw.promote_ready()
+        except Exception as exc:  # noqa: BLE001 -- a warm never breaks a forward
+            logger.warning("RW FINISH promote skipped: %s", exc)
     fill = _DEFERRED_ROWS_FILL
     if fill is None or not fill.pending:
         return

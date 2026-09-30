@@ -2177,9 +2177,11 @@ class SchedulerWeightUpdaterManager:
         """H31b: before the first pause of a sleep -- wait for a running
         deferred fill and forget what is pending (the next wake rewrites the
         tables). Only a module lookup when nothing is pending."""
-        from sglang.srt.layers.moe.expert_offload import deferred_rows_fill
+        from sglang.srt.layers.moe.expert_offload import deferred_rows_fill, resume_warm
 
         deferred_rows_fill().settle()
+        # RW-FINISH (#287): warm copies still in flight land before the pauses
+        resume_warm().settle()
 
     def _weg2_zero_local_scratch(self, models) -> list:
         """fnFL2 v43: zero the runtime-built parameters (Marlin workspaces)

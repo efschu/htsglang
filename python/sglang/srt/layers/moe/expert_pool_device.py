@@ -733,6 +733,72 @@ def seed_lru_rows(tables: PoolTables, experts: Sequence[int],
     return pairs
 
 
+def plan_warm_rows(tables: PoolTables, experts: Sequence[int],
+                   limit: int = 0) -> List[Tuple[int, int, int]]:
+    """RW-FINISH (#287, 30.09.): ``seed_lru_rows``'s choice WITHOUT writing it:
+    ``(host_row, bank_row, expert)`` triples for FREE LRU rows, most wanted
+    first. Only rows below the seat block (H95c: a seat row may be switched
+    OFF -- unmapped -- inside the phase, so no copy may target it). Host reads
+    of the tables: call it where the device is idle (the RW tick's gate)."""
+    E, lo, hi = tables.num_experts, int(tables.lru_start), int(tables.pool_rows)
+    if tables.seat_rows:
+        hi = min(hi, int(tables.seat_base))
+    hot = tables.hot_phys.cpu()
+    key = tables.row_key.cpu()
+    host_row = tables.host_row.cpu()
+    free = [r for r in range(lo, hi) if int(key[r]) < 0]
+    out: List[Tuple[int, int, int]] = []
+    seen = set()
+    for e in experts:
+        e = int(e)
+        if limit > 0 and len(out) >= limit:
+            break
+        if not free:
+            break
+        if e in seen or not 0 <= e < E:
+            continue
+        seen.add(e)
+        if int(host_row[e]) < 0 or int(hot[e]) >= 0:
+            continue
+        out.append((int(host_row[e]), free.pop(0), e))
+    return out
+
+
+def reserve_warm_rows(tables: PoolTables, rows) -> None:
+    """RW-FINISH: the rows a warm copy targets become OFF rows until it lands
+    (``row_key`` = SEAT_OFF_KEY, ``row_use`` = NEVER: never free, never a
+    victim, never routed -- the H95c contract above). Device writes on the
+    current stream; no host read."""
+    tables.row_key.index_fill_(0, rows, SEAT_OFF_KEY)
+    tables.row_use.index_fill_(0, rows, ROW_USE_NEVER)
+
+
+def release_warm_rows(tables: PoolTables, rows) -> None:
+    """RW-FINISH: give reserved rows back as free rows (key -1, use 0 -- the
+    layout's free value). Device writes on the current stream."""
+    tables.row_key.index_fill_(0, rows, -1)
+    tables.row_use.index_fill_(0, rows, 0)
+
+
+def commit_warm_rows(tables: PoolTables, experts, rows) -> None:
+    """RW-FINISH: the landed rows become their experts' rows -- ON THE DEVICE,
+    no host read. An expert that a step made hot elsewhere meanwhile keeps its
+    row; the warm row is freed (the bijection ``row_key[r] == e`` iff
+    ``hot_phys[e] == r`` holds either way). The clock is the device clock."""
+    import torch
+
+    hot = tables.hot_phys
+    cur = hot.index_select(0, experts)
+    ok = cur < 0
+    hot.index_copy_(0, experts, torch.where(ok, rows.to(hot.dtype), cur))
+    key = tables.row_key
+    new_key = torch.where(ok, experts.to(key.dtype), torch.full_like(experts, -1).to(key.dtype))
+    key.index_copy_(0, rows, new_key)
+    use = tables.row_use
+    clk = tables.clock.reshape(-1)[:1].to(use.dtype).expand(rows.numel())
+    use.index_copy_(0, rows, torch.where(ok, clk, torch.zeros_like(clk)))
+
+
 def bijection_breaks(tables: PoolTables) -> int:
     """LRU rows that break ``row_key[r] == e`` iff ``hot_phys[e] == r``: a row
     naming an expert whose ``hot_phys`` points elsewhere, or an expert pointing
