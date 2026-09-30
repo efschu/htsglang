@@ -862,6 +862,25 @@ class Envs:
     # (tail_handoff.fold_spec, page_prefix = the reader's claim, E1 rows may be
     # 0) and D takes it as the E2 skip. 0 = spec_for (no part, D extends).
     SGLANG_WEG2_TAIL_FOLD_SHORT = EnvBool(True)
+    # TAIL_FOLD_PAGE_END (P-MINIFWD 0930, metal y3r ...dauer09292330 / y3t,
+    # group P under the H63 fold): a page-multiple prompt (N % 64 == 0) still
+    # took the END-ANCHOR split -- the last 4 tokens a PP0 forward of their
+    # own (1.37-1.57 s), the body [.., N-4) truncated, so no waiting request
+    # joined it and its 60/124-token remainder ran alone as well (weg2-74:
+    # 6 x 124 tokens at 1.1 s each). On: the fold applies wherever the CLAIM
+    # ANCHOR track puts the anchor on the reader's claim N - page inside the
+    # last chunk (tail_handoff.page_end_fold_applies); END-only part as for
+    # every other fold. False = the split at N % page == 0, byte for byte.
+    SGLANG_WEG2_TAIL_FOLD_PAGE_END = EnvBool(True)
+    # P_MINIFWD_TOLD_WAIT (P-MINIFWD 0930, group P PP0 under the #1400 told):
+    # a carried request's final rest below 1000 tokens waits at the top of its
+    # pass for the store read of a request already queued (held, read open),
+    # so the told goes on this pass's wire and the rest runs in that request's
+    # chunk 0 instead of alone (y3r weg2-62-92: 66 tokens 1144.7 gpu-ms alone,
+    # 93's told one pass later). Bound = the measured price of a lone rest on
+    # this rank (weg2/p_minifwd_hold.py), no waiter / a control request / a
+    # co-admissible request / unmeasured -> no wait. False = no wait, ever.
+    SGLANG_WEG2_P_MINIFWD_TOLD_WAIT = EnvBool(True)
     # TAIL FOLD (fnFL2 H63, group P, only with TAIL_HANDOFF + TAIL_ADOPT +
     # TAIL_SKIP_EXTEND): the END-ANCHOR no longer splits the last chunk at
     # c = floor_r(N-1) when N is not a page multiple -- the tail [c, N) runs

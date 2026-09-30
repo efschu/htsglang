@@ -772,6 +772,9 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     # also when nothing is held -- a twin arriving right after its sibling's
     # finish is held until that finish settled (the end anchor published).
     _twin.tick(scheduler)
+    # P-MINIFWD: a lone final rest waits (bounded, measured) for the read of a
+    # queued request, so this pass's told carries it into the same forward.
+    _minifwd_hold(scheduler, recv_reqs)
     paced_on = bool(getattr(scheduler, "_weg2_told_paced_on", False))
     if paced_on:
         return _pp0_publish_paced(scheduler, recv_reqs)
@@ -829,6 +832,87 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     if not out:
         return recv_reqs
     return list(recv_reqs) + out
+
+
+def _read_open(scheduler, tree, rid: str, held: Dict[str, Any]) -> bool:
+    """P-MINIFWD: ``rid`` is held by #1400 with its store read still running
+    (the publish loop would skip it only for that reason)."""
+    req = held.get(rid)
+    if req is None or _twin.is_deferred(scheduler, rid):
+        return False
+    if getattr(req, "prefetch_deferred", None) is not None:
+        return False
+    entry = (getattr(tree, "ongoing_prefetch", None) or {}).get(rid)
+    return entry is not None and getattr(entry, "operation", None) is not None
+
+
+def _read_terminable(tree, rid: str) -> bool:
+    """P-MINIFWD: would ``check_prefetch_progress(rid)`` terminate now? The
+    same predicate without the termination (``can_terminate_prefetch`` is
+    collective-free on the tp_size 1 form this module arms on)."""
+    entry = (getattr(tree, "ongoing_prefetch", None) or {}).get(rid)
+    if entry is None:
+        return True
+    op = getattr(entry, "operation", None)
+    if op is None or getattr(op, "host_indices", None) is None:
+        return True
+    from sglang.srt.weg2 import tail_adopt
+
+    return bool(tree.can_terminate_prefetch(op, tail_hold=tail_adopt.vote_hold(rid)))
+
+
+def _minifwd_rest(scheduler) -> Optional[int]:
+    """P-MINIFWD: the carried chunked request's next piece when it is final."""
+    from sglang.srt.managers import schedule_policy as _sp
+    from sglang.srt.weg2 import p_minifwd_hold as _mh
+    from sglang.srt.weg2 import tail_handoff as _th
+
+    req = getattr(scheduler, "chunked_req", None)
+    if req is None:
+        return None
+    fill = len(req.full_untruncated_fill_ids)
+    er = getattr(req, "extend_range", None)
+    done = max(int(getattr(er, "end", 0) or 0), len(getattr(req, "prefix_indices", ()) or ()))
+    page = int(getattr(scheduler, "page_size", 1) or 1)
+    split = False
+    if _sp._WEG2_END_ANCHOR and fill - done >= 2:
+        claim = _th.claim_anchor_end(req, getattr(scheduler, "tree_cache", None))
+        split = not _th.fold_applies(fill, page, start=done, claim=claim)
+    return _mh.final_rest(fill, done, getattr(scheduler, "chunked_prefill_size", None), split)
+
+
+def _minifwd_hold(scheduler, recv_reqs: List) -> None:
+    """P-MINIFWD adapter (weg2/p_minifwd_hold.py): read the pass state, let
+    the pure verdict decide, wait if it says so. Never raises into the pass."""
+    from sglang.srt.weg2 import p_minifwd_hold as _mh
+
+    if not _mh.enabled():
+        return
+    try:
+        held: Dict[str, Any] = scheduler._weg2_store_held
+        # cheapest facts first: no carried request or nobody held -> no import,
+        # no probe, the pass runs exactly as before
+        if not held or getattr(scheduler, "chunked_req", None) is None:
+            return
+        tree = scheduler.tree_cache
+        told_map: Dict[str, int] = scheduler._weg2_store_told
+        queued = [_rid(r) for r in scheduler.waiting_queue]
+        control = any(type(r).__name__ in _mh.CONTROL_KINDS for r in (recv_reqs or ()))
+        bound = _mh.wait_bound_s()
+        verdict = _mh.decide(
+            rest=_minifwd_rest(scheduler),
+            queued=queued,
+            admissible=lambda rid: rid in told_map and rid not in held,
+            open_read=lambda rid: _read_open(scheduler, tree, rid, held),
+            control=control,
+            bound_s=bound,
+        )
+        if not verdict.wait:
+            return
+        outcome, rid, waited = _mh.wait(verdict.rids, lambda r: _read_terminable(tree, r), bound)
+        _mh.log_hold(_rid(scheduler.chunked_req), verdict, outcome, rid, waited, bound)
+    except Exception as exc:  # noqa: BLE001 -- the hold is an optimisation, the pass must run
+        logger.warning("P-MINIFWD-HOLD skipped (%s: %s)", type(exc).__name__, exc)
 
 
 def _note_fork(scheduler, rid: str, fork) -> None:

@@ -1700,7 +1700,16 @@ class PrefillAdder:
         # which is floor_page(end - 1) unless end is a page multiple (then the
         # cut below stays) -- and D takes the END state P publishes at the
         # finish (weg2/tail_handoff.arm_fold); no state at c is ever needed.
-        if tail_handoff.fold_applies(end, _page):
+        # P-MINIFWD (SGLANG_WEG2_TAIL_FOLD_PAGE_END): at end % page == 0 the
+        # fold holds too where the CLAIM ANCHOR track lands the anchor on the
+        # reader's claim end - page inside this chunk (one predicate with the
+        # track, tail_handoff.page_end_fold_applies).
+        _claim = (
+            tail_handoff.claim_anchor_end(req, getattr(self, "tree_cache", None))
+            if end % max(1, _page) == 0
+            else None
+        )
+        if tail_handoff.fold_applies(end, _page, start=start, claim=_claim):
             n = getattr(PrefillAdder, "_weg2_end_anchor_folds", 0) + 1
             PrefillAdder._weg2_end_anchor_folds = n
             if n <= 8 or n % 64 == 0:
