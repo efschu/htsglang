@@ -19,6 +19,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import textwrap
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[4]
@@ -360,3 +361,131 @@ class TestPublishGate(unittest.TestCase):
         for name in ("L2 two trees: nf pushed on its own branch (all green)", "L2 two trees: nf head unpushed",
                      "L3 two trees: NF verdict names the 27B tree", "PUBLISH two trees all green"):
             self.assertIn(name, r.stdout)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# release profiles from the set that ACTUALLY reaches the ranks (docker/flliper/release_profile.py)
+# ---------------------------------------------------------------------------------------------------------------------
+
+import importlib.util as _ilu  # noqa: E402
+
+_spec = _ilu.spec_from_file_location("release_profile", D / "release_profile.py")
+RP = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(RP)
+
+NF_TARGET = pathlib.Path("/spinning/gpu-arb/docker/profiles/"
+                         "nf-h91-dpr-sa-vis-adopt-st-cut-vsync-odx-2b-swr-e2cut-z30y2-arr-wre-ta-dh-ml-ef.env")
+NF_DRAFT = D / "profiles_release" / "nf.env"
+META = {"PROFILE_NAME", "PROFILE_STATUS", "PROFILE_OWNER", "PROFILE_FORM"}
+
+
+def _env_dict(args, flag):
+    """What the launcher makes of --env-p/--env-d: the last entry of a key wins."""
+    out = {}
+    for t in RP._env_tokens(args, flag) or []:
+        k, _, v = t.partition("=")
+        out[k] = v
+    return out
+
+
+def _effective(d, drop=()):
+    args = RP.drop_args(d["args"], set(drop))
+    return {"args": RP._without_env(args), "env_p": _env_dict(args, "--env-p"), "env_d": _env_dict(args, "--env-d"),
+            "form": d["form"], "instr": d["instr"], "exports": d["exports"], "arrays": d["arrays"],
+            "vars": {k: v for k, v in d["vars"].items() if k not in META}}
+
+
+class TestReleaseProfileGenerator(unittest.TestCase):
+    """The generator on synthetic profiles: late NF_ENV appends only count once written back, plain assignments do
+    not arrive, exports do, instrument/nccl parts become conditional appends, precedence changes are refused."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, body):
+        p = self.tmp / "t.env"
+        p.write_text(body)
+        return p
+
+    def test_effective_set_and_roundtrip(self):
+        t = self._write(textwrap.dedent('''\
+            PROFILE_NAME=t
+            PROFILE_STATUS=experimentell
+            PROFILE_MODEL=/m
+            E_P="A=1;B=2"
+            if [ "${HTSGLANG_INSTRUMENTS:-1}" = 1 ]; then E_P="$E_P;TRACE=1"; fi
+            if [ "${HTSGLANG_TRANSPORT:-bar1}" = nccl ]; then E_P="$E_P;B=3"; fi
+            PROFILE_ARGS=(--env-p "$E_P" --env-d "D=1" --drop-me x --keep "a b")
+            E_P="$E_P;LATE=1"          # never arrives: PROFILE_ARGS is already built
+            PLAIN=1                     # a plain assignment does not arrive
+            export EXP=1
+            profile_form_env() { _form F1 "v ${HTSGLANG_TAG}"; }
+            profile_instr_env() { _form I1 "${SGLANG_WEG2_EVIDENCE_DIR:-/x}/c"; }
+            '''))
+        d = RP.dump(str(t))
+        self.assertNotIn("LATE", str(d["args"]))
+        self.assertNotIn("PLAIN", d["exports"])
+        self.assertEqual(d["exports"], {"EXP": "1"})
+        out = self.tmp / "rel.env"
+        RP.generate(str(t), str(out), "rel", "experimentell", ["--drop-me"], "", "")
+        for instr in ("0", "1"):
+            for tr in ("bar1", "nccl"):
+                a, b = RP.dump(str(t), instr, tr), RP.dump(str(out), instr, tr)
+                self.assertEqual(_effective(a, ["--drop-me"]), _effective(b), (instr, tr))
+        self.assertNotIn("--drop-me", RP.dump(str(out))["args"])
+        self.assertIn('"${HTSGLANG_TAG}"', out.read_text().replace("v ${HTSGLANG_TAG}", "${HTSGLANG_TAG}"))
+        # the release instrument default is OFF: unset HTSGLANG_INSTRUMENTS -> no TRACE
+        r = subprocess.run(["bash", "-c", f'source "{out}"; echo "$REL_ENV_P"'], capture_output=True, text=True,
+                           env={"PATH": "/usr/bin:/bin"})
+        self.assertNotIn("TRACE", r.stdout)
+
+    def test_precedence_change_is_refused(self):
+        t = self._write(textwrap.dedent('''\
+            PROFILE_NAME=t
+            E_P="A=1"
+            if [ "${HTSGLANG_TRANSPORT:-bar1}" = nccl ]; then E_P="$E_P;B=3"; fi
+            E_P="$E_P;B=2"              # a base token of key B AFTER the nccl one: appending B=3 at the end would flip it
+            PROFILE_ARGS=(--env-p "$E_P")
+            '''))
+        with self.assertRaises(SystemExit) as cm:
+            RP.generate(str(t), str(self.tmp / "o.env"), "rel", "experimentell", [], "", "")
+        self.assertIn("order would change", str(cm.exception))
+
+
+@unittest.skipUnless(NF_TARGET.exists(), "NF target profile not present")
+class TestReleaseProfileNF(unittest.TestCase):
+    """docker/flliper/profiles_release/nf.env (draft for NF's release) against NF's Soll profile -ml-ef: the set that
+    reaches the ranks is identical under HTSGLANG_INSTRUMENTS 0/1 x transport bar1/nccl, except the named decisions:
+    --d-kv-token-cut is NOT pinned (the planner chooses it since #287), PROFILE_NAME=nf, the draft status."""
+
+    def test_same_effective_set_as_the_target(self):
+        for instr in ("0", "1"):
+            for tr in ("bar1", "nccl"):
+                a, b = RP.dump(str(NF_TARGET), instr, tr), RP.dump(str(NF_DRAFT), instr, tr)
+                ea, eb = _effective(a, ["--d-kv-token-cut"]), _effective(b)
+                for k in ea:
+                    self.assertEqual(ea[k], eb[k], f"{k} differs under instr={instr} transport={tr}")
+
+    def test_named_decisions(self):
+        d = RP.dump(str(NF_DRAFT))
+        self.assertNotIn("--d-kv-token-cut", d["args"])
+        self.assertIn("--d-kv-token-cut", RP.dump(str(NF_TARGET))["args"])
+        self.assertEqual(d["vars"]["PROFILE_NAME"], "nf")
+        self.assertIn(d["vars"]["PROFILE_STATUS"], ("experimentell", "abgenommen"))
+        # NF 30.09.: release value ARRIVAL_SEAT_RULE=1 (A/B in the noise), on front and D
+        self.assertIn(["SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "1"], d["form"])
+        self.assertEqual(_env_dict(d["args"], "--env-d").get("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE"), "1")
+        # the late -ef appends DO arrive (written back into PROFILE_ARGS by the target)
+        self.assertEqual(_env_dict(d["args"], "--env-d").get("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY"), "1")
+
+    def test_draft_is_current(self):
+        """Regenerating from the target gives the checked-in draft (modulo the timestamp line) -- a changed target
+        shows up here, not silently at the freeze."""
+        out = pathlib.Path(tempfile.mkdtemp()) / "nf.env"
+        RP.generate(str(NF_TARGET), str(out), "nf", "experimentell", ["--d-kv-token-cut"],
+                    "NF-Sitz (Release-Entwurf aus -ml-ef, 27B-Implementierer 30.09.; Freigabe NF ausstehend)", "+release")
+        strip = lambda s: [l for l in s.splitlines() if "GENERATED by" not in l]
+        self.assertEqual(strip(out.read_text()), strip(NF_DRAFT.read_text()))
