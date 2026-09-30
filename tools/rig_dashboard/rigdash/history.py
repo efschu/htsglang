@@ -87,7 +87,8 @@ class HistoryDB:
         self.lock = threading.RLock()
         if path:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-        self.db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        # two processes share the file since 30.09. ~21:40Z: the sampler writes, the web server reads
+        self.db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=30)
         self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")   # only takes on a new file
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
@@ -102,6 +103,11 @@ class HistoryDB:
         self._sid: Dict[str, int] = {}
         for sid, name in self.db.execute("SELECT id, name FROM series"):
             self._sid[name] = sid
+
+    def reload_sids(self) -> None:
+        with self.lock:
+            for sid, name in self.db.execute("SELECT id, name FROM series"):
+                self._sid[name] = sid
 
     # --- small helpers ---------------------------------------------------
     def sid(self, name: str) -> int:
@@ -241,6 +247,8 @@ class HistoryDB:
         lo_i, hi_i = int(lo // step) * step, int(hi)
         out: Dict[str, Dict[int, float]] = {n: {} for n in names}
         with self.lock:
+            if any(n not in self._sid for n in names):
+                self.reload_sids()          # a series the sampler process created after we opened the file
             sids = {self._sid[n]: n for n in names if n in self._sid}
             if not sids:
                 return out
@@ -331,6 +339,35 @@ def short_name(name: str) -> str:
     return (name or "").replace("NVIDIA GeForce ", "").replace("NVIDIA ", "")
 
 
+# ----------------------------------------------------------------------------- counters (pure)
+
+def spread_counter(acc: Dict[int, float], t0: float, t1: float, delta: float) -> None:
+    """Book a counter's Δ between two readings at t0 < t1 onto the whole seconds they cover, in
+    proportion to the overlap (Nutzer 30.09. ~21:40Z: a late reading must lose nothing -- it only
+    makes the interval longer).  ``acc`` = {second: amount}."""
+    if t1 <= t0 or delta is None:
+        return
+    rate = delta / (t1 - t0)
+    x = t0
+    while x < t1:
+        sec = int(math.floor(x))
+        z = min(t1, sec + 1.0)
+        acc[sec] = acc.get(sec, 0.0) + rate * (z - x)
+        x = z
+
+
+def pop_complete(acc: Dict[int, float], upto: float, since: Optional[float] = None) -> Dict[int, float]:
+    """The seconds of ``acc`` that are complete (sec + 1 <= upto) -- removed from ``acc``.  A second
+    that began before ``since`` (the first reading) is only partly covered and is dropped."""
+    out = {}
+    for sec in sorted(k for k in acc if k + 1 <= upto):
+        v = acc.pop(sec)
+        if since is not None and sec < since:
+            continue
+        out[sec] = v
+    return out
+
+
 # ----------------------------------------------------------------------------- recorder
 
 class Recorder:
@@ -347,6 +384,16 @@ class Recorder:
         self._cpu_prev = None
         self._tier_prev: Dict[str, dict] = {}
         self._flips_done: Dict[str, int] = {}
+        # counter state: NVML energy (mJ) per card, host CPU jiffies; levels: the last written second
+        self._e_prev: Dict[int, Tuple[float, float]] = {}
+        self._e_acc: Dict[int, Dict[int, float]] = {}
+        self._e_first: Dict[int, float] = {}
+        self._lvl_last: Optional[Tuple[int, List[tuple]]] = None
+        self._cpu_t: Optional[float] = None
+        #: the emergency fill: seconds a LEVEL (temp, clock, util, mem, power without energy counter, KV)
+        #: was held from the previous reading instead of read -- target 0 (the sampler has its own process)
+        self.held = {"total": 0, "nvml": 0, "kv": 0, "recent": []}
+        self.energy_counter: Dict[int, bool] = {}
 
     # --- NVML -------------------------------------------------------------
     def sample_gpus(self, now: float) -> None:
@@ -354,7 +401,7 @@ class Recorder:
         if self._nvml is None:
             n.nvmlInit()
             self._nvml = n
-        rows, cards = [], []
+        rows, cards, levels = [], [], []
         ts = int(now)
         for i in range(n.nvmlDeviceGetCount()):
             h = n.nvmlDeviceGetHandleByIndex(i)
@@ -370,18 +417,73 @@ class Recorder:
                     return fn(*a)
                 except Exception:
                     return None
-            rows.append((p + "temp", ts, rd(n.nvmlDeviceGetTemperature, h, n.NVML_TEMPERATURE_GPU)))
-            pw = rd(n.nvmlDeviceGetPowerUsage, h)
-            rows.append((p + "power", ts, pw / 1000.0 if pw is not None else None))
-            rows.append((p + "clock", ts, rd(n.nvmlDeviceGetClockInfo, h, n.NVML_CLOCK_SM)))
+            t_read = time.time()
+            e = rd(n.nvmlDeviceGetTotalEnergyConsumption, h)          # mJ since driver load: a counter
+            lv = [(p + "temp", rd(n.nvmlDeviceGetTemperature, h, n.NVML_TEMPERATURE_GPU)),
+                  (p + "clock", rd(n.nvmlDeviceGetClockInfo, h, n.NVML_CLOCK_SM))]
             u = rd(n.nvmlDeviceGetUtilizationRates, h)
-            rows.append((p + "util", ts, u.gpu if u is not None else None))
+            lv.append((p + "util", u.gpu if u is not None else None))
             m = rd(n.nvmlDeviceGetMemoryInfo, h)
-            rows.append((p + "mem", ts, m.used / 1048576.0 if m is not None else None))
+            lv.append((p + "mem", m.used / 1048576.0 if m is not None else None))
+            if e is not None:
+                self.energy_counter[i] = True
+                rows += self.power_from_energy(i, t_read, float(e))
+            else:
+                self.energy_counter[i] = False
+                pw = rd(n.nvmlDeviceGetPowerUsage, h)
+                lv.append((p + "power", pw / 1000.0 if pw is not None else None))
+            levels += lv
+        rows += self.level_rows(ts, levels)
         self.db.put(rows)
         if cards != self.cards:
             self.cards = cards
             self.db.set("cards", cards)
+
+    def power_from_energy(self, i: int, t: float, e_mj: float) -> List[tuple]:
+        """Leistung lückenlos als Energie-Differenz (nvmlDeviceGetTotalEnergyConsumption): the mJ between
+        two readings are spread over the seconds they cover, each complete second gets its mean watts --
+        a reading that comes late (a slipped loop) makes one interval longer and loses nothing."""
+        prev = self._e_prev.get(i)
+        self._e_prev[i] = (t, e_mj)
+        if prev is None:
+            self._e_first[i] = t
+            return []
+        if e_mj < prev[1]:                      # the counter restarted (driver reload)
+            self._e_acc[i] = {}
+            self._e_first[i] = t
+            return []
+        acc = self._e_acc.setdefault(i, {})
+        spread_counter(acc, prev[0], t, e_mj - prev[1])
+        done = pop_complete(acc, t, since=math.ceil(self._e_first[i]))
+        return [("g%d.power" % i, sec, mj / 1000.0) for sec, mj in done.items()]
+
+    def level_rows(self, ts: int, levels: List[tuple]) -> List[tuple]:
+        """Levels (no counter): the reading at its second.  A second the loop skipped is filled from the
+        previous reading and COUNTED as held (the emergency fill; the sampler's own process keeps it 0)."""
+        rows = [(nme, ts, v) for nme, v in levels]
+        last = self._lvl_last
+        if last is not None and ts - last[0] > 1:
+            gap = [sec for sec in range(last[0] + 1, ts) if ts - sec <= 5]
+            for sec in gap:
+                rows += [(nme, sec, v) for nme, v in last[1]]
+            self._held("nvml", len(gap))
+        if last is None or ts > last[0]:
+            self._lvl_last = (ts, levels)
+        return rows
+
+    def _held(self, kind: str, n: int) -> None:
+        if n <= 0:
+            return
+        self.held[kind] = self.held.get(kind, 0) + n
+        self.held["total"] += n
+        now = time.time()
+        self.held["recent"] = [t for t in self.held["recent"] if t > now - 900][-500:] + [now] * min(n, 50)
+
+    def held_view(self, now: Optional[float] = None) -> dict:
+        now = now or time.time()
+        return {"total": self.held["total"], "nvml": self.held.get("nvml", 0), "kv": self.held.get("kv", 0),
+                "last_5min": sum(1 for t in self.held["recent"] if t > now - 300),
+                "energy_counter": {str(k): v for k, v in sorted(self.energy_counter.items())}}
 
     # --- host -------------------------------------------------------------
     HOST_CMD = ("head -1 /proc/stat; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; "
@@ -405,8 +507,12 @@ class Recorder:
                 tot = vals["cpu"][0] - self._cpu_prev[0]
                 idle = vals["cpu"][1] - self._cpu_prev[1]
                 if tot > 0:
-                    rows.append(("host.cpu", int(now), 100.0 * (tot - idle) / tot))
+                    # /proc/stat is a counter: its share holds for every second since the last reading
+                    pct = 100.0 * (tot - idle) / tot
+                    a = int(self._cpu_t) + 1 if self._cpu_t is not None else int(now)
+                    rows += [("host.cpu", sec, pct) for sec in range(max(a, int(now) - 30), int(now) + 1)]
             self._cpu_prev = vals["cpu"]
+            self._cpu_t = now
         mt, ma = vals.get("MemTotal"), vals.get("MemAvailable")
         if mt:
             if ma is not None:
@@ -458,6 +564,7 @@ class Recorder:
                 split = (float(dct.get("handoff") or 0) / float(dct["total"])) if dct.get("total") else None
                 pre = SERIES % model
                 rows = []
+                self._held("kv", sum(1 for i in range(n) if b["held"][i] is not None and b["kv_pct"][i] is not None))
                 for i in range(n):
                     ts = lo + i * step
                     if b["ipc"][i] is None:
@@ -542,21 +649,34 @@ class Recorder:
         self._flips_done[key + "#ut"] = len(ut)
 
     # --- loop ----------------------------------------------------------------
+    def publish(self, now: Optional[float] = None) -> None:
+        """What the web server shows about the recorder, which runs in the sampler process."""
+        self.db.set("rec.state", {"t": now or time.time(), "errors": dict(self.errors),
+                                  "host_where": getattr(self, "host_where", None), "held": self.held_view(now)})
+
     def run_forever(self, stop: threading.Event) -> None:
-        def loop(name, period, fn):
+        def loop(name, period, fn, phase=0.0):
+            # on the clock's tick, not "period after the last run": a slow run delays the next reading,
+            # it never shifts the grid (the counters book the longer interval completely)
+            nxt = (math.floor(time.time() / period) + 1) * period + phase
             while not stop.is_set():
+                stop.wait(max(0.0, nxt - time.time()))
+                if stop.is_set():
+                    break
                 t0 = time.time()
                 try:
                     fn(t0)
                     self.errors.pop(name, None)
                 except Exception as e:
                     self.errors[name] = "%s: %s" % (type(e).__name__, str(e)[:300])
-                stop.wait(max(0.05, period - (time.time() - t0)))
+                nxt += period
+                if nxt < time.time():
+                    nxt = (math.floor(time.time() / period) + 1) * period + phase
 
-        for name, period, fn in (("nvml", 1.0, self.sample_gpus), ("host", 5.0, self.sample_host),
-                                 ("model", MODEL_BUCKET_S, self.ingest_ipc),
-                                 ("compact", 60.0, self.db.compact)):
-            threading.Thread(target=loop, args=(name, period, fn), name="rigdash-hist-" + name, daemon=True).start()
+        for name, period, fn, ph in (("nvml", 1.0, self.sample_gpus, 0.25), ("host", 5.0, self.sample_host, 0.6),
+                                     ("model", MODEL_BUCKET_S, self.ingest_ipc, 2.4),
+                                     ("compact", 60.0, self.db.compact, 31.0), ("publish", 2.0, self.publish, 0.9)):
+            threading.Thread(target=loop, args=(name, period, fn, ph), name="rigdash-hist-" + name, daemon=True).start()
         stop.wait()
 
 
@@ -641,19 +761,21 @@ def _ratio(num: List[Optional[float]], den: List[Optional[float]], eps: float = 
     return [(a / b) if a is not None and b is not None and b > eps else None for a, b in zip(num, den)]
 
 
-def _hold(arr: List[Optional[float]], max_buckets: int) -> None:
+def _hold(arr: List[Optional[float]], max_buckets: int) -> int:
     """A level sampled at a fixed period holds until the next sample, at most ``max_buckets`` rows:
     the NVML loop slips like the rank sampler (measured 30.09. ~21:10Z: the 1-s raster missed a second
     of the 5090 every ~10 s), and a missing second is not a missing value."""
-    last, age = None, 0
+    last, age, n = None, 0, 0
     for i, v in enumerate(arr):
         if v is not None:
             last, age = v, 0
         elif last is not None and age < max_buckets:
             age += 1
             arr[i] = last
+            n += 1
         else:
             last = None
+    return n
 
 
 def zoom_step(span_s: float) -> int:
@@ -702,10 +824,12 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
                 elif last is not None and age < 5 - step:
                     age += step
                     arr[i] = last
-    # NVML rows every 1 s: a slipped second holds the previous reading (at most 2 s), no gap
+    # NVML rows every 1 s (power from the energy counter, the levels filled by the recorder): the view's
+    # hold is only the emergency fill for rows written before that (<= 2 s), and it is counted
+    held_view = 0
     if step < 5:
         for n in [k for k in series if k.startswith("g")]:
-            _hold(series[n], max(1, int(2 // step)))
+            held_view += _hold(series[n], max(1, int(2 // step)))
     # Leistungsaufnahme (Nutzer 30.09.: "power draw von allen karten gemeinsam"): the sum of ALL cards;
     # a bucket where one card has no reading is a gap, never the sum of the others (that was a
     # 200-400 W drop whenever the 5090's second slipped -- the same jump class as the decode curve)
@@ -776,7 +900,8 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
         "src": {
             "cards": "NVML", "temp": "NVML GPU-Kern (Hotspot/Junction per NVML nicht lesbar)",
             "host": ("Proxmox-Host /proc + memory.current der htsglang-Container"
-                     if getattr(rec, "host_where", None) == "proxmox" else "LXC /proc"),
+                     if (getattr(rec, "host_where", None) if rec else (db.get("rec.state") or {}).get("host_where")) == "proxmox"
+                     else "LXC /proc"),
             "roles": "state.json groups.launch",
             "prefill": src_model, "decode": src_model, "kv": src_model, "cache": src_model,
             "rates": "Tokens / Zeit, in der die Phase arbeitete (dec_busy/p_busy/d_busy); Pausen = Lücke",
@@ -787,7 +912,8 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
             "flip": "events.jsonl flip_first_work (P→D) + flip_user_time (D→P)",
             "marks": "state.json (Boot-ID, lifecycle) + events.jsonl flip_first_work",
         },
-        "errors": dict(rec.errors) if rec else {},
+        "errors": dict(rec.errors) if rec else dict((db.get("rec.state") or {}).get("errors") or {}),
+        "held": {"view_filled": held_view, "recorder": (rec.held_view() if rec else (db.get("rec.state") or {}).get("held"))},
         "db": db.stats(),
         "ranges": list(RANGES),
     }

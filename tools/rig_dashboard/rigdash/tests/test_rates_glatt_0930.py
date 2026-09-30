@@ -82,10 +82,20 @@ class TestSlippedSampler(unittest.TestCase):
         for sec in (11, 12, 13, 16, 17, 18):
             self.assertAlmostEqual(b["dec_tps"][sec - 1], 400.0, delta=1.0, msg=sec)
 
-    def test_an_unwatched_stretch_stays_a_gap(self):
+    def test_a_stalled_sampler_loses_nothing(self):
+        # Nutzer 30.09. ~21:40Z: the sampler stalls 6 s (no reading 20..27): the rank's counters bound the
+        # interval by the RANK's clock, the Δ is spread over it -- no gap, every token once
         rg = [s for s in ring() if not (20 < s["t"] < 27)]
         b = activity.Model(rg, [], []).buckets(0.0, 40, 1.0)
-        self.assertIsNone(b["dec_tps"][23])                     # 6.x s without a sample: not observed
+        self.assertEqual([i for i in range(11, 30) if b["dec_tps"][i] is None], [])
+        self.assertAlmostEqual(sum(v or 0 for v in b["dec_tps"]), 400 * 8 + 200 * 8, delta=2)
+        self.assertEqual([i for i in range(11, 30) if b["kv_pct"][i] is None], [])
+        self.assertTrue(any(b["held"][i] for i in range(21, 27)))      # the KV level there was held: counted
+
+    def test_a_silent_rank_stays_a_gap(self):
+        rg = [s for s in ring(80.0) if not (20 < s["t"] < 62)]          # the rank itself gave nothing for 42 s
+        b = activity.Model(rg, [], []).buckets(0.0, 80, 1.0)
+        self.assertIsNone(b["dec_tps"][40])
 
 
 class TestRateWhileWorking(unittest.TestCase):
@@ -237,6 +247,39 @@ class TestHistoryHonestTiers(unittest.TestCase):
         v = history.view(db, None, "NF", "15m", now=1100.0)
         self.assertEqual(v["step"], 1)
         self.assertAlmostEqual(v["tiles"]["tiers"]["device"], 500.0, delta=1)   # was 100 (1/5)
+
+
+class TestCounterBooking(unittest.TestCase):
+    """Nutzer 30.09. ~21:40Z: "der probenehmer sollte doch nicht an zu viel last scheitern" -- a counter's
+    Δ between two readings goes onto the seconds they cover; a late reading loses nothing."""
+
+    def test_spread_and_complete_seconds(self):
+        acc = {}
+        history.spread_counter(acc, 10.5, 13.5, 300.0)            # 100 per second
+        self.assertEqual(history.pop_complete(acc, 13.5), {10: 50.0, 11: 100.0, 12: 100.0})
+        self.assertEqual(acc, {13: 50.0})                        # 13 is not complete yet
+        history.spread_counter(acc, 13.5, 14.0, 50.0)
+        self.assertEqual(history.pop_complete(acc, 14.0), {13: 100.0})
+
+    def test_power_from_energy_with_a_late_reading(self):
+        rec = history.Recorder(history.HistoryDB(None), None)
+        rows = []
+        # 250 W constant; readings at 100.2, 101.2, then the loop stalls 4 s, 105.3, 106.2
+        for t in (100.2, 101.2, 105.3, 106.2):
+            rows += rec.power_from_energy(1, t, 250.0 * 1000.0 * t)
+        got = {ts: v for _, ts, v in rows}
+        self.assertEqual(sorted(got), [101, 102, 103, 104, 105])   # no second lost, 100 only half covered
+        for v in got.values():
+            self.assertAlmostEqual(v, 250.0, places=6)
+        self.assertEqual(rec.held["total"], 0)
+
+    def test_levels_filled_and_counted(self):
+        rec = history.Recorder(history.HistoryDB(None), None)
+        rec.level_rows(100, [("g0.temp", 50.0)])
+        rows = rec.level_rows(103, [("g0.temp", 53.0)])
+        self.assertEqual(sorted((ts, v) for _, ts, v in rows), [(101, 50.0), (102, 50.0), (103, 53.0)])
+        self.assertEqual(rec.held["nvml"], 2)
+        self.assertEqual(rec.held_view()["last_5min"], 2)
 
 
 class TestStaticZoom(unittest.TestCase):

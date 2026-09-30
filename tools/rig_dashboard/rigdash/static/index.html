@@ -1494,7 +1494,11 @@ async function refresh(force) {
     const banner = !live.length && shown.length ? (shown.every(plannedStopped)
       ? `<section class="card" id="boots-banner" style="border-color:var(--flip)"><b>Kein Boot liefert gerade IPC</b> <span class="muted">&middot; der letzte Boot wurde geplant gestoppt. Unten seine letzten Zahlen.</span></section>`
       : `<section class="card" id="boots-banner" style="border-color:var(--bad)"><b style="color:var(--bad)">Kein Boot liefert gerade IPC.</b> <span class="muted">Unten der zuletzt aktive Boot mit seinen letzten Zahlen.</span></section>`) : "";
-    morph($("boots"), banner + (shown.length ? shown.map((b) => bootCard(b, now, binders)).join("")
+    // the sampler runs in its own process (30.09. ~21:40Z): dead or silent is said, never hidden
+    const smp = d.sampler || {};
+    const smpBanner = smp.ok === false ? `<section class="card" id="sampler-banner" style="border-color:var(--bad)"><b style="color:var(--bad)">${esc(smp.why || "Probennehmer steht")}</b>
+      <span class="muted">&middot; Kurven und Verlauf bekommen keine neuen Proben${smp.restarts ? ` &middot; ${fmt(smp.restarts)}&times; neu gestartet` : ""}${smp.last_exit ? ` &middot; zuletzt beendet mit Code ${esc(smp.last_exit.code)}` : ""} &middot; der Webserver startet ihn neu</span></section>` : "";
+    morph($("boots"), smpBanner + banner + (shown.length ? shown.map((b) => bootCard(b, now, binders)).join("")
       : `<section class="card" id="boots-none"><div class="muted">Kein Boot-Zustand (state.json) der letzten 6 h gefunden.</div></section>`));
     if (DEV) {
       morph($("prod"), prodHtml(d));
@@ -1515,7 +1519,9 @@ async function refresh(force) {
     if ($("lannote")) $("lannote").style.display = d.via_proxy ? "" : "none";
     const bad = live.filter((b) => b.alarm && (b.alarm.state === "TOT" || b.alarm.state === "HAENGT"));
     document.title = bad.length ? `[${bad.map((b) => b.alarm.state === "TOT" ? "TOT" : "H\u00c4NGT").join(",")}] ${PAGE_TITLE}` : PAGE_TITLE;
-    $("sub").textContent = `${live.length} Modell${live.length === 1 ? "" : "e"} live · Stand ${hhmm(now)} · rigdash ${d.version}`;
+    const held = smp.held && smp.held.last_5min != null ? ` · gehalten 5 min: ${smp.held.last_5min}` : "";
+    $("sub").textContent = `${live.length} Modell${live.length === 1 ? "" : "e"} live · Stand ${hhmm(now)} · rigdash ${d.version}` +
+      (smp.mode === "prozess" ? ` · Probennehmer PID ${smp.pid}${smp.ok ? "" : " STEHT"}${held}` : "");
     binders.forEach((f) => f());
     bindPhaseBars();
     reserveHeights();

@@ -18,12 +18,13 @@ import json
 import os
 import re
 import shlex
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import energy, features, health, history, imagechanges, ipcboot, launchview, live, redact, sources, weg2line
+from . import energy, features, health, history, imagechanges, ipcboot, launchview, live, redact, sampler, sources, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -185,8 +186,24 @@ class App:
     def __init__(self, args):
         self.args = args
         # the boot cards from IPC only (NF-Operator 30.09.: keine Anzeige liest mehr ein Boot-Log);
-        # live.LiveLogs, the old log reader, is no longer started
-        self.boots = ipcboot.IpcBoots()
+        # live.LiveLogs, the old log reader, is no longer started.
+        # Sampler in its own process (Nutzer 30.09. ~21:40Z): with a state dir the readings (IPC ring,
+        # NVML, host, history) run in ``python -m rigdash.sampler``, started and watched here; this
+        # process only reads ring.sqlite / history.sqlite.  Without a state dir (dev) all in one process.
+        self.sampler_mode = getattr(args, "sampler", None) or ("prozess" if args.state_dir else "thread")
+        self.ring_store = None
+        self.sup = None
+        if self.sampler_mode == "prozess":
+            self.ring_store = sampler.RingStore(os.path.join(args.state_dir, sampler.RING_FILE))
+            self.boots = ipcboot.IpcBoots(store=self.ring_store, role="reader")
+            env = dict(os.environ)
+            pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            env["PYTHONPATH"] = pkg_parent + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            self.sup = sampler.Supervisor([sys.executable, "-m", "rigdash.sampler", "--state-dir", args.state_dir,
+                                           "--docker-ssh", args.docker_ssh or "", "--parent-pid", str(os.getpid())],
+                                          env=env, store=self.ring_store)
+        else:
+            self.boots = ipcboot.IpcBoots()
         cfg = {
             "gpu_period": 2.0,
             "docker_ssh": shlex.split(args.docker_ssh) if args.docker_ssh else [],
@@ -204,7 +221,8 @@ class App:
         self.stop = threading.Event()
         # DASHBOARD-GRAFIKEN: the persistent history of the Grafana-style panels (history.py)
         self.hist = history.HistoryDB(os.path.join(args.state_dir, "history.sqlite") if args.state_dir else None)
-        self.hist_rec = history.Recorder(self.hist, self.boots, cfg["docker_ssh"])
+        self.hist_rec = history.Recorder(self.hist, self.boots, cfg["docker_ssh"]) if self.sup is None else None
+        self.view_held = {"total": 0, "last": 0}
         self.t0 = time.time()
         self.version = _version()
         self.edition = getattr(args, "edition", "rig") or "rig"
@@ -228,11 +246,26 @@ class App:
             stop.wait(5.0)
 
     def start(self):
-        for target, name in ((self.boots.run_forever, "rigdash-ipcboots"),
-                             (self.src.run_forever, "rigdash-sources"),
-                             (self.energy_loop, "rigdash-energy"),
-                             (self.hist_rec.run_forever, "rigdash-history")):
+        loops = [(self.boots.run_forever, "rigdash-ipcboots"), (self.src.run_forever, "rigdash-sources"),
+                 (self.energy_loop, "rigdash-energy")]
+        loops.append((self.sup.run_forever, "rigdash-sampler-supervisor") if self.sup is not None
+                     else (self.hist_rec.run_forever, "rigdash-history"))
+        for target, name in loops:
             threading.Thread(target=target, args=(self.stop,), name=name, daemon=True).start()
+
+    def sampler_status(self) -> dict:
+        if self.sup is not None:
+            return self.sup.status()
+        r = self.hist_rec
+        return {"mode": "thread", "ok": True, "pid": os.getpid(), "server_pid": os.getpid(),
+                "held": r.held_view() if r else None, "why": None}
+
+    def history_view(self, model, rng, lo_hi=None) -> dict:
+        v = history.view(self.hist, self.hist_rec, model, rng, lo_hi=lo_hi)
+        n = (v.get("held") or {}).get("view_filled") or 0
+        self.view_held["total"] += n
+        self.view_held["last"] = n
+        return v
 
     def snapshot(self, with_series=True, zoom=None) -> dict:
         now = time.time()
@@ -268,6 +301,7 @@ class App:
             "gpuq": sv.get("gpuq"),
             "fronts": {k: {kk: vv for kk, vv in v.items() if kk != "value"} for k, v in fronts.items()},
             "collector_error": self.boots.last_error,
+            "sampler": self.sampler_status(),
             "energy_error": getattr(self, "energy_error", None),
             "image_changes": imagechanges.view(boots, images, img_err, self.imgchg.path),
             "features": features.attach_current(self.features.view(), boots, sv.get("gpus")),
@@ -396,7 +430,7 @@ def make_handler(app: App):
                     lo_hi = None
                     if q.get("from") and q.get("to"):
                         lo_hi = (float(q["from"]), float(q["to"]))     # a zoomed stretch (Klicken und Ziehen)
-                    return self._json(history.view(app.hist, app.hist_rec, model, q.get("range", "1h"), lo_hi=lo_hi))
+                    return self._json(app.history_view(model, q.get("range", "1h"), lo_hi=lo_hi))
                 if path in STATIC_FILES:
                     name, ctype = STATIC_FILES[path]
                     with open(os.path.join(STATIC, name), "rb") as fh:
@@ -424,8 +458,11 @@ def make_handler(app: App):
                     snap = launchview.snapshot()
                     return self._json({"ver": snap["ver"], "same": True} if have == snap["ver"] else snap)
                 if path == "/api/health":
+                    smp = app.sampler_status()
                     return self._json({"ok": True, "version": app.version,
-                                       "uptime_s": round(time.time() - app.t0, 1)})
+                                       "uptime_s": round(time.time() - app.t0, 1),
+                                       # the sampler's own process, and the emergency fills ("held", target 0)
+                                       "sampler": smp, "held": {"sampler": smp.get("held"), "view_filled": app.view_held}})
                 return self._send(404, "not found", "text/plain")
             except BrokenPipeError:
                 return None
@@ -449,6 +486,8 @@ def main(argv=None):
     ap.add_argument("--front", action="append", default=[],
                     help="weg2 front base URL to read /weg2/state from (repeatable)")
     ap.add_argument("--gpuq", default="http://127.0.0.1:8770")
+    ap.add_argument("--sampler", choices=("prozess", "thread"), default=None,
+                    help="prozess = the readings in their own process (default with --state-dir); thread = in this one")
     ap.add_argument("--state-dir", default="", help="keeps the card history and history.sqlite (the panels' days)")
     ap.add_argument("--image-changes", default=imagechanges.DEFAULT_PATH,
                     help="the operator's per-image change list (rev -> fixes, expected gain, metal status)")
@@ -472,4 +511,6 @@ def main(argv=None):
         srv.serve_forever()
     finally:
         app.stop.set()
+        if app.sup is not None:
+            app.sup.terminate()
     return 0

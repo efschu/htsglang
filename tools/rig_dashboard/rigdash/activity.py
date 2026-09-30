@@ -312,6 +312,7 @@ def spread(items, lo: float, n: int, step: float, key: str = "tok", excl=None) -
 #: unterscheidbar sein").  Each comes from data; what no data explains is "unknown", never idle or flip.
 STATES = ("P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "idle", "off", "unknown")
 SAMPLE_GAP_S = 3.0      # two dashboard samples further apart: the time between is unobserved (unknown)
+RANK_GAP_S = 30.0       # two records of one rank further apart: the rank stalled or was gone -- not observed
 
 
 def _outstanding(front: dict) -> Optional[float]:
@@ -505,10 +506,14 @@ class Model:
         observed, not missing -- it was drawn as a gap and broke every curve into pieces."""
         cov = [0.0] * n
         hi = lo + n * step
-        for a, b in zip(self.ring, self.ring[1:]):
-            if b["t"] - a["t"] > SAMPLE_GAP_S:
-                continue
-            x, y = max(a["t"], lo), min(b["t"], hi)
+        spans = [(a["t"], b["t"]) for a, b in zip(self.ring, self.ring[1:]) if b["t"] - a["t"] <= SAMPLE_GAP_S]
+        # counters by the RANK's clock (Nutzer 30.09. ~21:40Z: "der probenehmer sollte doch nicht an zu
+        # viel last scheitern"): two records of one rank bound an interval whose Δcounters are complete,
+        # however late the dashboard read the second one -- that interval is observed, up to RANK_GAP_S
+        for k in self.keys:
+            spans += [(a["ts"], b["ts"]) for a, b in rank_pairs(self.ring, k) if b["ts"] - a["ts"] <= RANK_GAP_S]
+        for sa, sb in spans:
+            x, y = max(sa, lo), min(sb, hi)
             while x < y:
                 i = int((x - lo) // step)
                 z = min(y, lo + (i + 1) * step)
@@ -532,6 +537,7 @@ class Model:
         stored as shares, the division stays right at every history tier."""
         cov = self.coverage(lo, n, step)
         have = [c > 0 for c in cov]
+        sampled = [False] * n
         kv = [[0.0, 0] for _ in range(n)]
         kvp = [[0.0, 0] for _ in range(n)]
         kD, _ = stage_keys(self.keys, self.dec_group) if self.dec_group else (None, None)
@@ -540,7 +546,7 @@ class Model:
             i = int((s["t"] - lo) // step)
             if not 0 <= i < n:
                 continue
-            have[i] = True
+            have[i] = sampled[i] = True
             for key, acc in ((kD, kv), (kP, kvp)):
                 r = s["r"].get(key) if key else None
                 if r and r.get("kv") is not None:
@@ -594,6 +600,8 @@ class Model:
                     last = None
             out[name] = arr
         out["ipc"] = [1.0 if h else None for h in have]
+        # a watched bucket without its own sample: its levels (KV) were held, not read (the "held" count)
+        out["held"] = [1.0 if h and not sm else None for h, sm in zip(have, sampled)]
         # phase share per bucket (0..1 per state): averages stay right at every history tier
         frac = {k: [0.0] * n for k in STATES}
         for x in self.segments():

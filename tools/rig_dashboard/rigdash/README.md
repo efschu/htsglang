@@ -70,6 +70,24 @@ Der Verlauf lädt `api/history?from=&to=` im passenden Raster neu (ab ≤ 24 min
 mit 1/2/5-s-Eimern (`series_zoom`); die 60-s-Kacheln bleiben auf „jetzt“. Die Kartenbalken oben sind Momentwerte ohne Zeitachse.
 Tests: `tests/test_rates_glatt_0930.py`.
 
+## Probennehmer im eigenen Prozess, Zähler statt Momentproben (Nutzer 30.09. ~21:40Z)
+
+„der probenehmer sollte doch nicht an zu viel last scheitern? der sollte das doch irgendwie parallel davon tun können?“
+Die Lesungen liefen bisher als Threads im Webserver-Prozess. Unter 5 dauerabfragenden `/api/live`-Clients schrieb
+der NVML-Thread 287 s lang keine Zeile (GIL).
+- Mit `--state-dir` startet der Webserver `python -m rigdash.sampler` als Kindprozess (`sampler.Supervisor`) und
+  überwacht ihn. Der Sampler liest den IPC-Ring, NVML, den Host und den Verlauf; er schreibt `history.sqlite` und `ring.sqlite`.
+  Der Webserver liest nur (`IpcBoots(role="reader")`). Ist der Sampler tot oder still, zeigt die Seite ein rotes Banner,
+  und `/api/health` meldet `sampler.ok=false`. Der Supervisor startet ihn neu. Stirbt der Webserver, beendet sich der
+  Sampler selbst (Eltern-PID). Die systemd-Unit bleibt dieselbe, deshalb gibt ein Rollback nie einen zweiten Schreiber.
+- Zähler statt Momentproben: Das Δ der Rang-Zähler zwischen zwei Lesungen gilt über die Rang-Uhr (`activity.coverage`,
+  bis 30 s). Die Leistung kommt aus `nvmlDeviceGetTotalEnergyConsumption`: Energie-Δ auf die überdeckten Sekunden
+  (`history.spread_counter`). Die Host-CPU kommt aus dem /proc/stat-Δ über alle Sekunden seit der letzten Lesung.
+  Eine verspätete Lesung verliert damit nichts.
+- Pegel ohne Zähler (Temperatur, Takt, Last, Speicher, KV) werden bei einer übersprungenen Sekunde gehalten und
+  gezählt: `held` in `/api/health` (Ziel 0). Das `_hold` der Ansicht ist nur Notnagel und wird als `view_filled` gezählt.
+Tests: `tests/test_sampler_prozess_0930.py`, `tests/test_rates_glatt_0930.py::TestCounterBooking`.
+
 ## Nur IPC, kein Boot-Log (Nutzer 29.09. über 27B; Rüge und Order 30.09.)
 
 „das dashboard soll auch aus der inter prozess kommunikation gespeist werden, nicht aus logs“ -- seit 30.09. ohne Ausnahme:

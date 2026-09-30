@@ -716,9 +716,17 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
 
 
 class IpcBoots:
-    """Samples every boot state dir once a second (rank counters + front mirror) into a ring."""
+    """Samples every boot state dir once a second (rank counters + front mirror) into a ring.
 
-    def __init__(self, roots=ipcstate.STATE_ROOTS):
+    ``role`` (30.09. ~21:40Z, sampler in its own process): "both" = sample and serve in one process
+    (tests, a dev server without state dir); "sampler" = sample and write each sample to ``store``
+    (sampler.RingStore); "reader" = the web server: reads state.json/events and the rank files for the
+    fields, but the ring comes from ``store`` -- the reading moment is never on the web server's GIL."""
+
+    def __init__(self, roots=ipcstate.STATE_ROOTS, store=None, role: str = "both"):
+        self.store, self.role = store, role
+        self._synced_t = 0.0
+        self._extent_t = 0.0
         self.ipc = ipcstate.IpcStates(roots)
         self.lock = threading.Lock()
         self.rings: Dict[str, deque] = {}
@@ -731,6 +739,7 @@ class IpcBoots:
         now = now or time.time()
         self.ipc.poll(now)
         seen = set()
+        new = []
         for v in self.ipc.boots(now):
             key = v.get("boot_id") or v.get("dir")
             seen.add(key)
@@ -740,29 +749,64 @@ class IpcBoots:
             samp = {"t": now, "r": {k: compact(r) for k, r in rank["rankstats"].items()},
                     "front": _front_small(v.get("front") or {})}
             with self.lock:
-                ring = self.rings.setdefault(key, deque())
-                ring.append(samp)
-                while ring and ring[0]["t"] < now - RING_S:
-                    ring.popleft()
+                if self.role != "reader":
+                    ring = self.rings.setdefault(key, deque())
+                    ring.append(samp)
+                    while ring and ring[0]["t"] < now - RING_S:
+                        ring.popleft()
+                    new.append((key, now, samp))
                 self.rank[key] = rank
                 if v.get("terminal"):
                     self.final.add(key)
         with self.lock:
-            for k in list(self.rings):
+            for k in list(self.rings) + list(self.rank):
                 if k not in seen:
                     self.rings.pop(k, None)
                     self.rank.pop(k, None)
                     self.final.discard(k)
+            keep = {k: r[0]["t"] for k, r in self.rings.items() if r}
+        if self.role == "sampler" and self.store is not None:
+            self.store.append(new, keep)
+        if self.role == "reader" and self.store is not None:
+            self.sync(now)
+
+    def sync(self, now: Optional[float] = None) -> None:
+        """Reader: the samples the sampler process wrote since the last sync, into the in-memory ring;
+        every 10 s the ring is trimmed to what the store still holds."""
+        rows = self.store.since(self._synced_t)
+        with self.lock:
+            for k, t, samp in rows:
+                self.rings.setdefault(k, deque()).append(samp)
+                self._synced_t = max(self._synced_t, t)
+        if (now or time.time()) - self._extent_t >= 10.0:
+            self._extent_t = now or time.time()
+            ext = self.store.extent()
+            with self.lock:
+                for k in list(self.rings):
+                    if k not in ext:
+                        self.rings.pop(k, None)
+                        continue
+                    r = self.rings[k]
+                    while r and r[0]["t"] < ext[k]:
+                        r.popleft()
 
     def run_forever(self, stop: threading.Event) -> None:
+        # on the tick (x.5 s), not "1 s after the last poll": a slow poll delays one reading, the grid stays
+        phase = 0.5
+        nxt = time.time() // SAMPLE_S * SAMPLE_S + SAMPLE_S + phase
         while not stop.is_set():
+            stop.wait(max(0.0, nxt - time.time()))
+            if stop.is_set():
+                break
             t0 = time.time()
             try:
                 self.poll(t0)
                 self.last_error = None
             except Exception as e:  # keep sampling alive; visible in /api/live
                 self.last_error = "%s: %s" % (type(e).__name__, e)
-            stop.wait(max(0.05, SAMPLE_S - (time.time() - t0)))
+            nxt += SAMPLE_S
+            if nxt < time.time():
+                nxt = time.time() // SAMPLE_S * SAMPLE_S + SAMPLE_S + phase
 
     def snapshot(self, now: Optional[float] = None, max_boots: int = 10,
                  zoom: Optional[Tuple[float, float]] = None) -> List[dict]:
