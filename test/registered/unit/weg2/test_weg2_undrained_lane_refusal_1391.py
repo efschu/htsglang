@@ -122,8 +122,10 @@ diagnostic BOOT7's instrument run can read directly.
 
 from __future__ import annotations
 
+import glob
 import inspect
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -968,6 +970,44 @@ def _run_two_tag_leg(*, dest_per_tag: bool, tmp_path, timeout=8.0):
         return results, alive
     finally:
         xr.unlink_semaphores(nonce)
+        _unlink_bounce_slots(nonce)
+
+
+#: 29.09.: every /dev/shm name this module creates carries this run's pid, so
+#: the teardown below removes exactly its own segments -- 45 leftovers of
+#: earlier runs made every launcher refuse by #1217/#1233 (LIVE HOLDER).
+_RUN_TAG = f"desk10-1391-r4-{os.getpid()}-"
+
+
+def _unlink_bounce_slots(nonce):
+    """The leg's bnc record AND its (seq, bytes) record dir in /dev/shm.
+
+    30.09.: the seq record lives under a DIFFERENT prefix --
+    ``/dev/shm/weg2-seq-<nonce>`` (weight_exchange_bounce.py:2681) -- and it
+    is a DIRECTORY, so the old unlink-only teardown never even matched it:
+    base b03e724bda leaks it deterministically. FileNotFoundError is
+    tolerated (a wedged leg may race the sweep); every other error surfaces
+    as an OSError that names the offending path.
+    """
+    paths = list(glob.glob(bx.bounce_slots_path(nonce) + "*"))
+    paths += glob.glob(f"/dev/shm/weg2-seq-{nonce}*")
+    for path in paths:
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _no_bounce_slot_outlives_the_module():
+    """A wedged leg (the old shape below) may leave a thread that maps its
+    record after `_run_two_tag_leg` returned; the module sweeps this run's
+    own prefix once more on the way out."""
+    yield
+    _unlink_bounce_slots(_RUN_TAG)
 
 
 @pytest.fixture(autouse=True)
@@ -1014,6 +1054,11 @@ def test_the_fix_per_tag_collect_drains_the_same_lane(tmp_path):
     results, alive = _run_two_tag_leg(dest_per_tag=True, tmp_path=tmp_path)
     assert results.get("source") == "deposited", results
     assert results.get("dest") == "collected", results
+    nonce = f"{_RUN_TAG}{id(tmp_path)}"
+    assert glob.glob(bx.bounce_slots_path(nonce) + "*") == [], (
+        f"bounce-slot record of THIS run's nonce outlived the leg: {nonce}")
+    assert glob.glob(f"/dev/shm/weg2-seq-{nonce}*") == [], (
+        f"seq-record dir of THIS run's nonce outlived the leg: {nonce}")
     assert not alive, "a thread is still running -- the fix did not drain"
 
 
