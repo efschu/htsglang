@@ -32,6 +32,11 @@
 #     inspect, buildx inspect, boot_procs.sh) -- no docker build, no container start, no pull, no builder start;
 #   * no GPU, no secrets (wheels and lock are hashed, never keys).
 #
+# DEADMAN (30.09., as gpu-arb make_delta_ctx.sh/make_flat_ctx.sh 0930dm): assets/devtools/boot_deadman.sh comes from the
+# 27B REVISION (scripts/<pdflip|weg2>/devtools/boot_deadman.sh), not from the host. The image has ONE devtools dir for
+# both slots, so it must fit the state_file.py of BOTH trees (27B and NF). A 27B tree without one ships the host copy
+# (warning). FLAT_REQUIRE_DEADMAN=1 (release/freeze build): deadman from the tree with PROGRESS-STALL, progress-check in
+# both slots' state_file.py, "rank" in WRITERS -- otherwise a ctx blocker. flliper_postcheck.sh C11 checks the image.
 # Exit: --plan 0 = no blocker, 3 = blockers named (BLOCKER lines); --write 0 = ctx created (release blockers may remain,
 # listed), 3 = refused by a ctx blocker (nothing kept); 2 = usage.
 set -uo pipefail
@@ -199,6 +204,35 @@ done
 if [ "$REV_NF" = "$REV_27B" ]; then ONE_TREE=1; say "   ONE tree: both slots carry ${SHA10} (FLAT-2)"
 else ONE_TREE=0; say "   TWO trees: src-27b @ ${SHA10_27B} ($BRANCH_27B), src-nf @ ${SHA10_NF} ($BRANCH_NF) -- as the duo delta images; FLAT-2 relaxed (FLLIPER_ONE_TREE=0)"
   [ "$PKG_27B" = "$PKG_NF" ] || warn "the two trees differ in layout (27b: python/$PKG_27B, nf: python/$PKG_NF) -- the image allows it (layout-agnostic step 4), the release wants both renamed"
+fi
+# 1b. Deadman from the 27B revision; it serves both slots (one /opt/htsglang/devtools), so both state_file.py must fit
+DM_SRC=""
+for _p in "scripts/$PDF_27B/devtools/boot_deadman.sh" scripts/weg2/devtools/boot_deadman.sh scripts/pdflip/devtools/boot_deadman.sh; do
+  "${G[@]}" cat-file -e "$REV_27B:$_p" 2>/dev/null && { DM_SRC=$_p; break; }
+done
+_dm_prog=0; [ -n "$DM_SRC" ] && _dm_prog=$("${G[@]}" show "$REV_27B:$DM_SRC" | grep -c "progress-check")
+say "   deadman: ${DM_SRC:-none in the 27B tree (host copy $ARB/devtools)} (deadman_progress=$_dm_prog)"
+[ -n "$DM_SRC" ] || warn "27B revision ${SHA10_27B} carries no boot_deadman.sh -- the ctx ships the HOST copy ($ARB/devtools/boot_deadman.sh)"
+_dm_strict_bad=0; [ -z "$DM_SRC" ] || [ "$_dm_prog" = 0 ] && _dm_strict_bad=1
+for _slot in 27b nf; do
+  if [ "$_slot" = 27b ]; then _r=$REV_27B; _k=$PKG_27B; _d=$PDF_27B; else _r=$REV_NF; _k=$PKG_NF; _d=$PDF_NF; fi
+  _sf=""
+  for _p in "python/$_k/srt/$_d/state_file.py" python/sglang/srt/weg2/state_file.py python/flliper/srt/pdflip/state_file.py; do
+    "${G[@]}" cat-file -e "$_r:$_p" 2>/dev/null && { _sf=$_p; break; }
+  done
+  _sp=0; _sr=0; _sd=0
+  if [ -n "$_sf" ]; then
+    _sp=$("${G[@]}" show "$_r:$_sf" | grep -c '"progress-check"'); _sr=$("${G[@]}" show "$_r:$_sf" | grep -cE '^WRITERS = .*"rank"')
+    _sd=$("${G[@]}" show "$_r:$_sf" | grep -c '^def note_rank_death')
+  fi
+  say "   state_file $_slot: ${_sf:-none} (state_file_progress=$_sp writers_rank=$_sr rank_death=$_sd)"
+  [ "$_dm_prog" -gt 0 ] && [ "$_sp" = 0 ] && blocker "the deadman (27B ${SHA10_27B}) calls 'state_file.py progress-check', the $_slot tree's state_file.py (${_sf:-none}) has none"
+  [ "$_sd" -gt 0 ] && [ "$_sr" = 0 ] && blocker "$_slot state_file.py has note_rank_death but no writer \"rank\" in WRITERS"
+  { [ "$_sp" = 0 ] || [ "$_sr" = 0 ]; } && _dm_strict_bad=1
+done
+if [ "${FLAT_REQUIRE_DEADMAN:-0}" = 1 ]; then
+  if [ "$_dm_strict_bad" = 1 ]; then blocker "FLAT_REQUIRE_DEADMAN=1: deadman from the 27B tree with PROGRESS-STALL, progress-check and a rank writer in BOTH slots' state_file.py required"
+  else ok "FLAT_REQUIRE_DEADMAN=1: deadman, progress-check and rank writer in both slots"; fi
 fi
 
 # --- 2. Pinned inputs -----------------------------------------------------------------------------------------------
@@ -411,7 +445,7 @@ say "     lock/requirements.lock (pip freeze of $REF_VENV, without sglang-kernel
 say "     assets/wheels/        <- $(basename "$KW_FILE") (${KW_SHA:0:12})"
 say "     assets/fi-wheels/     <- flashinfer_python 0.7.0 (${FIPY_SHA:0:12}), flashinfer_cubin 0.7.0 (${FICUBIN_SHA:0:12})"
 say "     assets/flashinfer_modules.txt (52), assets/tvm-ffi/ (EMPTY), assets/nvidia-open-595/ (EMPTY, WITH_NV_HEADERS=0)"
-say "     assets/devtools/ (boot_deadman.sh host_ledger_preflight.sh mem_timeseries.sh), assets/arb-seed-{27b,nf}/, assets/profiles/{27b,nf}/"
+say "     assets/devtools/ (boot_deadman.sh <- ${DM_SRC:-host copy} of the 27B tree, host_ledger_preflight.sh mem_timeseries.sh), assets/arb-seed-{27b,nf}/, assets/profiles/{27b,nf}/"
 say "     tools/{entrypoint.sh,healthcheck.sh,prebuild_jit.py,delta_prebuild.py,delta_postcheck.py}, tools/profiles/ ($(echo $PROFILES | wc -w) whitelisted)"
 say "     tools/kernels.txt     <- union list above ($N_ALL lines)"
 say "     BUILD_INFO.json (layout duo + build flat, release $REL, 27b ${SHA10_27B}, nf ${SHA10_NF}, pins), BUILD_INFO-{27b,nf}.json, MANIFEST.sha256"
@@ -542,7 +576,15 @@ echo "empty: image built without NV headers (WITH_NV_HEADERS=0, user F6)" > "$PA
 say "   kernels.txt $N_ALL lines ($(printf '%s\n' "$UNION" | grep -cE '(^|[[:space:]])MAX_JOBS=' || true) heavy), kernels-nf.txt $(grep -cE '^barlink ' "$PART/tools/kernels-nf.txt" || true) lines"
 
 say "5/8 rig tools, ARB seed per slot, profile data"
-for f in boot_deadman.sh host_ledger_preflight.sh mem_timeseries.sh; do cp -p "$ARB/devtools/$f" "$PART/assets/devtools/" || fail "devtools $f"; done
+for f in host_ledger_preflight.sh mem_timeseries.sh; do cp -p "$ARB/devtools/$f" "$PART/assets/devtools/" || fail "devtools $f"; done
+if [ -n "$DM_SRC" ]; then   # 30.09.: the deadman of the 27B revision (section 1b), not the host's
+  "${G[@]}" show "$REV_27B:$DM_SRC" > "$PART/assets/devtools/boot_deadman.sh" || fail "deadman $REV_27B:$DM_SRC"
+  chmod 0755 "$PART/assets/devtools/boot_deadman.sh"; DM_FROM="${SHA10_27B}:$DM_SRC"
+else
+  cp -p "$ARB/devtools/boot_deadman.sh" "$PART/assets/devtools/" || fail "devtools boot_deadman.sh"; DM_FROM="host:$ARB/devtools/boot_deadman.sh"
+fi
+DM_MD5=$(md5sum < "$PART/assets/devtools/boot_deadman.sh" | cut -d' ' -f1)
+say "   deadman $DM_FROM md5 $DM_MD5 (acceptance arms: DEADMAN_MD5=$DM_MD5)"
 for f in 27b nf; do
   cp -p "$ARB/weg2/PROBE_RING_0907.md" "$PART/assets/arb-seed-$f/weg2/" && cp -p "$ARB"/weg2/calib/*.json "$PART/assets/arb-seed-$f/weg2/calib/" || fail "arb seed $f"
 done
@@ -609,7 +651,7 @@ DRV=$(awk '/NVRM version/{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+$/)
 REL_JSON=$(printf '%s\n' "${RELBLOCKERS[@]}")
 PRS=$(for pr in $PROFILES; do printf '%s=%s\n' "$pr" "$(img_status "$pr")"; done)
 KL=$(for l in "${KLISTS[@]}"; do basename "$l"; done)
-FLAT_LOCK_FOLD=$LOCK_FOLD FLAT_MEMPROF=$MEMPROF FLAT_ONE_TREE=$ONE_TREE FLAT_REV_NF=$REV_NF FLAT_BRANCH_NF=$BRANCH_NF \
+FLAT_DM_FROM=$DM_FROM FLAT_DM_MD5=$DM_MD5 FLAT_LOCK_FOLD=$LOCK_FOLD FLAT_MEMPROF=$MEMPROF FLAT_ONE_TREE=$ONE_TREE FLAT_REV_NF=$REV_NF FLAT_BRANCH_NF=$BRANCH_NF \
 FLAT_PUSH_NF="$PUSH_STATE_NF" FLAT_PKG_NF=$PKG_NF python3 - "$PART" "$REL" "$CU" "$REV" "$BRANCH" "$PUSH_STATE" "$SINCE" "$REF_VENV" "$LOCKW" "$KW_SHA" "$(basename "$KW_FILE")" \
           "$DRV" "$STAGE_B" "$PKG" "$SOURCE" "$PLACEHOLDERS" "$TAG" "$TAG2" "$REL_JSON" "$PRS" "$KL" "$FIM" <<'PYW' || fail "BUILD_INFO"
 import hashlib, json, os, pathlib, re, sys, time, glob, base64
@@ -659,6 +701,7 @@ bi = {"layout": "duo", "build": "flat", "release": rel, "cuda": cu, "created_utc
       "accepted_first_docker": sorted(k for k, v in dict(l.split("=", 1) for l in prs.splitlines() if "=" in l).items() if v == "abgenommen"),
       "flliper": {"version": rel, "source": source, "placeholders": ph, "tags": [tag, tag2]},
       "mem_profile": os.environ.get("FLAT_MEMPROF", "full"),
+      "deadman": {"from": os.environ.get("FLAT_DM_FROM"), "md5": os.environ.get("FLAT_DM_MD5")},
       "release_blockers": [l for l in relb.splitlines() if l]}
 (o / "BUILD_INFO.json").write_text(json.dumps(bi, indent=1))
 PYW

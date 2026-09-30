@@ -26,6 +26,11 @@
 #       missing (image built from a tree before ad8b383b08) or off
 #   C9  pip check: findings counted (WARN; the allow-list is frozen from the first image, FLAT_IMAGE_PLAN 5.4)
 #   C10 dryrun of the accepted profiles with --models (launcher argv without a boot)
+#   C11 deadman in the image (30.09., DEADMAN-IM-IMAGE): /opt/htsglang/devtools/boot_deadman.sh serves BOTH slots; FAIL if
+#       it calls `state_file.py progress-check` and a slot's state_file.py has none (or the reverse: a tree with it and
+#       a deadman without = the host copy baked in), if a slot has note_rank_death without "rank" in WRITERS, or if its
+#       md5 differs from BUILD_INFO.json .deadman.md5 (make_flat_ctx 0930dm). An old deadman with old trees = WARN;
+#       env FLAT_REQUIRE_DEADMAN=1 makes every missing part a FAIL (release/freeze image).
 # Exit: 0 no FAIL, 1 at least one FAIL, 2 usage.
 set -uo pipefail
 
@@ -60,6 +65,7 @@ if [ "$PLAN" = 1 ]; then
   say "  C8     ${RUN[*]} --entrypoint /opt/venv/bin/python -e PYTHONPATH=/opt/htsglang/src-27b/python $IMG -c '<registry row>'"
   say "  C9     ${RUN[*]} --entrypoint /opt/venv/bin/python $IMG -m pip check"
   say "  C10    ${RUN[*]} -v <models>:/spinning/llm_stuff/club-3090/models-cache:ro -e MODE=weg2 -e HTSGLANG_PROFILE=<p> $IMG dryrun"
+  say "  C11    ${RUN[*]} --entrypoint /opt/venv/bin/python $IMG -c '<boot_deadman.sh md5/progress-check vs each slot's state_file.py, BUILD_INFO deadman.md5>'"
   exit 0
 fi
 
@@ -259,6 +265,44 @@ if want C10; then
       then res C10 PASS "dryrun $p rc 0"; else res C10 FAIL "dryrun $p rc != 0"; fi
     done
   fi
+fi
+
+# ---- C11: deadman in the image ------------------------------------------------------------------------------------------
+if want C11; then
+  o=$("${RUN[@]}" --entrypoint /opt/venv/bin/python "$IMG" -c '
+import hashlib, json, os, re
+dm = "/opt/htsglang/devtools/boot_deadman.sh"   # boot_deadman
+b = open(dm, "rb").read() if os.path.exists(dm) else b""
+try:
+    want = (json.load(open("/opt/htsglang/BUILD_INFO.json")).get("deadman") or {}).get("md5") or "-"
+except Exception:
+    want = "-"
+print("DM md5=%s progress=%d want=%s" % (hashlib.md5(b).hexdigest() if b else "none", b.count(b"progress-check"), want))
+for slot in ("27b", "nf"):
+    sf = next((p for p in ("/opt/htsglang/src-%s/python/flliper/srt/pdflip/state_file.py" % slot,
+                           "/opt/htsglang/src-%s/python/sglang/srt/weg2/state_file.py" % slot) if os.path.exists(p)), None)
+    t = open(sf).read() if sf else ""
+    print("S %s sf=%s progress=%d rank=%d death=%d" % (slot, sf or "none", t.count("\"progress-check\""),
+          len(re.findall(r"(?m)^WRITERS = .*\"rank\"", t)), len(re.findall(r"(?m)^def note_rank_death", t))))
+' 2>&1)
+  dmp=$(printf '%s\n' "$o" | sed -n 's/^DM .* progress=\([0-9]*\) .*/\1/p'); dmm=$(printf '%s\n' "$o" | sed -n 's/^DM md5=\([^ ]*\) .*/\1/p')
+  dmw=$(printf '%s\n' "$o" | sed -n 's/^DM .* want=\(.*\)$/\1/p'); bad=""; old=""
+  [ -n "$dmp" ] || bad="no deadman answer ($(printf '%s' "$o" | tail -1 | cut -c1-120))"
+  for slot in 27b nf; do
+    l=$(printf '%s\n' "$o" | grep "^S $slot "); sp=$(sed -n 's/.* progress=\([0-9]*\) .*/\1/p' <<< "$l")
+    sr=$(sed -n 's/.* rank=\([0-9]*\) .*/\1/p' <<< "$l"); sd=$(sed -n 's/.* death=\([0-9]*\)$/\1/p' <<< "$l")
+    [ -n "$sp" ] || { bad="$bad; $slot: no state_file answer"; continue; }
+    if [ "${dmp:-0}" -gt 0 ] && [ "$sp" = 0 ]; then bad="$bad; the deadman calls progress-check, $slot state_file.py has none"
+    elif [ "${dmp:-0}" = 0 ] && [ "$sp" -gt 0 ]; then bad="$bad; $slot tree has progress-check, the deadman not (host copy baked in)"; fi
+    [ "${sd:-0}" -gt 0 ] && [ "${sr:-0}" = 0 ] && bad="$bad; $slot: note_rank_death without the rank writer"
+    { [ "$sp" = 0 ] || [ "${sr:-0}" = 0 ]; } && old="$old $slot"
+  done
+  [ "${dmw:--}" != "-" ] && [ "$dmm" != "$dmw" ] && bad="$bad; md5 $dmm != BUILD_INFO deadman.md5 $dmw"
+  [ "${dmp:-0}" = 0 ] && old="$old deadman"
+  if [ -n "$bad" ]; then res C11 FAIL "${bad#; }"
+  elif [ -n "$old" ] && [ "${FLAT_REQUIRE_DEADMAN:-0}" = 1 ]; then res C11 FAIL "FLAT_REQUIRE_DEADMAN=1: PROGRESS-STALL/rank writer missing in:$old"
+  elif [ -n "$old" ]; then res C11 WARN "old generation (no PROGRESS-STALL / rank writer) in:$old -- consistent, not the release form"
+  else res C11 PASS "deadman md5 ${dmm:0:8} progress-check, both slots' state_file.py fit (rank writer), = BUILD_INFO"; fi
 fi
 
 say "POSTCHECK $IMG: $NFAIL FAIL, $NWARN WARN -> $([ "$NFAIL" = 0 ] && echo GREEN || echo RED)"

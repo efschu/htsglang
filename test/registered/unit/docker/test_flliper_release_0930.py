@@ -206,6 +206,7 @@ if a[:1] == ["run"]:
     if "pip" in a and "check" in a: out("pip")
     if "accepted_first_docker" in s: out("accepted")
     if "dryrun" in a: out("dryrun")
+    if "boot_deadman" in s: out("deadman")
 sys.stderr.write("stub: unexpected %r\n" % a); sys.exit(97)
 '''
 
@@ -234,6 +235,9 @@ def _good_state():
         "defaults": "MISS -\nOFF -\nON 31 of 44",
         "pip": "No broken requirements found.",
         "accepted": "27b nf", "dryrun": "LAUNCH-DRYRUN ok",
+        "deadman": "DM md5=b436391f63b7c64f27a10bf3d9d926a7 progress=2 want=b436391f63b7c64f27a10bf3d9d926a7\n"
+                   "S 27b sf=/opt/htsglang/src-27b/python/flliper/srt/pdflip/state_file.py progress=2 rank=1 death=1\n"
+                   "S nf sf=/opt/htsglang/src-nf/python/flliper/srt/pdflip/state_file.py progress=2 rank=1 death=1",
     }
 
 
@@ -269,7 +273,7 @@ class TestPostcheck(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("-> GREEN", r.stdout)
         v = self._verdicts(r)
-        for c in ("C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"):
+        for c in ("C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C11"):
             self.assertIn((c, "PASS"), v, r.stdout)
         self.assertIn(("C10", "SKIP"), v)
         self.assertNotRegex(r.stdout, r"(?m)^CHECK C\d+ FAIL")
@@ -333,6 +337,33 @@ class TestPostcheck(unittest.TestCase):
         s = _good_state(); s["dryrun_rc"] = 3
         r = self._run(s, "--models", "/models")
         self.assertIn(("C10", "FAIL"), self._verdicts(r))
+
+    def test_deadman_in_the_image(self):
+        """C11 (30.09., DEADMAN-IM-IMAGE): the image's deadman fits BOTH slots' state_file.py and BUILD_INFO's md5."""
+        good = _good_state()
+        self.assertIn(("C11", "PASS"), self._verdicts(self._run(good, "--only", "C11")))
+        s = dict(good)   # the host copy baked in (no progress-check) while the trees have it
+        s["deadman"] = good["deadman"].replace("progress=2 want", "progress=0 want")
+        self.assertIn(("C11", "FAIL"), self._verdicts(self._run(s, "--only", "C11")))
+        s = dict(good)   # the NF tree lacks progress-check the deadman calls
+        s["deadman"] = good["deadman"].replace("S nf sf=/opt/htsglang/src-nf/python/flliper/srt/pdflip/state_file.py progress=2",
+                                               "S nf sf=/opt/htsglang/src-nf/python/flliper/srt/pdflip/state_file.py progress=0")
+        self.assertIn(("C11", "FAIL"), self._verdicts(self._run(s, "--only", "C11")))
+        s = dict(good)   # note_rank_death without the rank writer
+        s["deadman"] = good["deadman"].replace("rank=1 death=1\nS nf", "rank=0 death=1\nS nf")
+        self.assertIn(("C11", "FAIL"), self._verdicts(self._run(s, "--only", "C11")))
+        s = dict(good)   # md5 differs from BUILD_INFO.deadman.md5
+        s["deadman"] = good["deadman"].replace("want=b436391f63b7c64f27a10bf3d9d926a7", "want=5982a49d824d21abced819b001a3b0ba")
+        self.assertIn(("C11", "FAIL"), self._verdicts(self._run(s, "--only", "C11")))
+        s = dict(good)   # an image before 0930dm: no deadman field -> md5 not compared; old deadman + old trees = WARN
+        s["deadman"] = ("DM md5=5982a49d824d21abced819b001a3b0ba progress=0 want=-\n"
+                        "S 27b sf=none progress=0 rank=0 death=0\nS nf sf=none progress=0 rank=0 death=0")
+        self.assertIn(("C11", "WARN"), self._verdicts(self._run(s, "--only", "C11")))
+        r = self._run(s, "--only", "C11")
+        self.assertIn(("C11", "FAIL"), self._verdicts(subprocess.run(
+            ["bash", str(POST), "flliper:0.1.0-cu130", "--only", "C11"], capture_output=True, text=True,
+            env=dict(os.environ, DOCKER=str(self.stub), STUB_STATE=str(self.state), FLAT_REQUIRE_DEADMAN="1"))))
+        del r
 
     def test_only(self):
         r = self._run(_good_state(), "--only", "C1 C3")
