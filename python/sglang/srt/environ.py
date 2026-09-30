@@ -1539,7 +1539,9 @@ class Envs:
     # 3320/6096, TP2 3120/7632; repack ~30 s per D rank. On: repack only the
     # rows that were read (+ the pad row). Same bytes for every row anyone
     # reads; the vetoed rows stay what they were -- unread garbage.
-    SGLANG_MOE_REPACK_SKIP_VETOED = EnvBool(False)
+    # Default on (30.09.): every NF metal boot since z30r3 ran it, but only via
+    # the instrument profile -- a release with HTSGLANG_INSTRUMENTS=0 lost it.
+    SGLANG_MOE_REPACK_SKIP_VETOED = EnvBool(True)
     # BOOTZEIT 4 (29.09., z30w-park): the per-layer host reclaim at the end of
     # the presplit (PresplitGcMode). FULL: gc.collect() + malloc_trim(0) --
     # the collect was 7.8-9.6 % of the D loader thread, under the GIL, 48x
