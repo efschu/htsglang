@@ -13514,6 +13514,17 @@ class Weg2DualLayoutRefused(Weg2LaunchRefused):
     """DUAL-TP3PP3: a flag combination the dual layout cannot serve."""
 
 
+#: DUAL-TP3PP3: --dual-mps on only with this env set to 1. MEASURED 30.09.:
+#: repro v2 (gpuq scjhru, scripts/dual_layout/run_dualstress.sh) arm S1, where
+#: both groups are clients of ONE MPS daemon and run extend-sized barlink
+#: collectives (D 8 MiB AR, P 1 MiB AR + GEMM), WEDGED: P rc=124, D managed 31
+#: rounds in 45 s (max 62 s). The same arm without MPS (S3) was clean. Metal
+#: boots kw6pft and ndktv4 died the same way: both groups froze in the same
+#: second while D ran an eager extend and P prefilled. The device-spin
+#: collectives of the two groups couple through the shared MPS server context.
+DUAL_MPS_OPT_IN_ENV = "SGLANG_WEG2_DUAL_MPS_OPT_IN"
+
+
 def resolve_dual_layout(ns) -> None:
     """DUAL-TP3PP3 (F26): the ONE place --dual-layout changes other flags.
 
@@ -13532,6 +13543,14 @@ def resolve_dual_layout(ns) -> None:
                 "DUAL-TP3PP3: --dual-mps on needs --dual-layout (MPS only pays when both groups "
                 "run kernels at the same time)")
         return
+    if str(getattr(ns, "dual_mps", "off")) == "on" and os.environ.get(DUAL_MPS_OPT_IN_ENV, "").strip() != "1":
+        raise Weg2DualLayoutRefused(
+            "DUAL-TP3PP3: --dual-mps on is refused -- MEASURED to wedge both groups: repro v2 "
+            "(gpuq scjhru 30.09., run_dualstress.sh arm S1: MPS + extend-sized barlink collectives of "
+            "D and P, P rc=124, D 31 rounds in 45 s; without MPS, arm S3, clean) and metal boots "
+            "kw6pft/ndktv4 (both groups frozen in the same second). Run without MPS "
+            f"(--dual-mps off, latency guard --dual-p-duty), or set {DUAL_MPS_OPT_IN_ENV}=1 "
+            "to opt in for a measurement.")
     if _d_adopt_armed(ns):
         raise Weg2DualLayoutRefused(
             "DUAL-TP3PP3: --dual-layout with --weg2-d-adopt on -- D would hold placeholder "
@@ -20740,7 +20759,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dual-mps", choices=("off", "on"), default="off",
                     help="DUAL-TP3PP3: start a private MPS control daemon before the groups (pipe dir "
                          "under the boot's run dir) so P and D kernels run concurrently on a card instead "
-                         "of time-slicing. Only with --dual-layout.")
+                         "of time-slicing. Only with --dual-layout. REFUSED unless SGLANG_WEG2_DUAL_MPS_OPT_IN=1: "
+                         "measured to wedge both groups under extend-sized collectives (repro v2 scjhru S1, "
+                         "boots kw6pft/ndktv4); the dual layout runs without MPS, latency guard --dual-p-duty.")
     ap.add_argument("--flip-weights", choices=("family", "resident"), default="family",
                     help="Task #47 Scheibe 6a: 'family' (default) moves the weights family across the flip "
                          "(gathered legs, host ring / exchange); 'resident' keeps BOTH groups' weights mapped "

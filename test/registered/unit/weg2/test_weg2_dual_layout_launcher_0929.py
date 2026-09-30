@@ -15,6 +15,7 @@ DANGER DIRECTIONS guarded here:
 from __future__ import annotations
 
 import inspect
+import unittest.mock as mock
 import os
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
@@ -69,7 +70,8 @@ class DualLayoutLauncher(CustomTestCase):
 
     def test_mps_env_is_private_to_the_boot(self):
         ns = _ns("--dual-layout", "--dual-mps", "on")
-        L.resolve_dual_layout(ns)
+        with mock.patch.dict(os.environ, {L.DUAL_MPS_OPT_IN_ENV: "1"}):
+            L.resolve_dual_layout(ns)
         lines = []
         env = L.start_dual_mps(ns, lines.append, dry=True)
         self.assertEqual(env["CUDA_MPS_PIPE_DIRECTORY"], "/tmp/weg2-dual-mps-t/pipe")
@@ -126,7 +128,8 @@ class DualLayoutLauncher(CustomTestCase):
 
     def test_p_sm_pct_only_with_mps_and_below_100(self):
         ns = _ns("--dual-layout", "--dual-mps", "on", "--dual-p-sm-pct", "50")
-        L.resolve_dual_layout(ns)
+        with mock.patch.dict(os.environ, {L.DUAL_MPS_OPT_IN_ENV: "1"}):
+            L.resolve_dual_layout(ns)
         self.assertEqual(L.dual_p_sm_env(ns), {"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "50"})
         ns = _ns("--dual-layout", "--dual-p-sm-pct", "50")
         L.resolve_dual_layout(ns)
@@ -181,4 +184,22 @@ class DualLayoutLauncher(CustomTestCase):
         # the arithmetic: RM 19 + P + D (16+32+40) + reserve 32 fits 256
         p = sum(int(x.split("=")[-1]) for x in L.DUAL_P_BARLINK_BAR1_WINDOW_MIB.split(","))
         self.assertLessEqual(19 + p + 88 + 32, 256)
+
+    def test_dual_mps_needs_explicit_opt_in(self):
+        # Repro v2 scjhru S1 (30.09.): MPS + extend-sized barlink collectives of both
+        # groups wedged (P rc=124, D 31 rounds in 45 s); the same arm without MPS (S3)
+        # was clean. Metal: kw6pft / ndktv4 died the same way.
+        env = {k: v for k, v in os.environ.items() if k != L.DUAL_MPS_OPT_IN_ENV}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(L.Weg2DualLayoutRefused) as cm:
+                L.resolve_dual_layout(_ns("--dual-layout", "--dual-mps", "on"))
+            self.assertIn("scjhru", str(cm.exception))
+            self.assertIn(L.DUAL_MPS_OPT_IN_ENV, str(cm.exception))
+            ns = _ns("--dual-layout")  # the default (off) is untouched
+            L.resolve_dual_layout(ns)
+            self.assertEqual(ns.dual_mps, "off")
+        with mock.patch.dict(os.environ, {L.DUAL_MPS_OPT_IN_ENV: "1"}):
+            ns = _ns("--dual-layout", "--dual-mps", "on")
+            L.resolve_dual_layout(ns)
+            self.assertEqual(ns.dual_mps, "on")
 
