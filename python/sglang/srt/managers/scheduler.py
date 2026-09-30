@@ -244,6 +244,7 @@ from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progre
 from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision verdict on the chain
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import d_seat_vram as _weg2_d_seat_vram  # D-MEM-SCHED stage between wakes
+from sglang.srt.weg2 import d_seat_rewake as _weg2_d_seat_rewake  # D-SEAT-REWAKE: live seat re-plan
 from sglang.srt.weg2 import skip_first as _weg2_skip_first  # E2 in a mixed wake cohort
 from sglang.srt.weg2 import short_read as _weg2_short_read  # held short wake reads
 from sglang.srt.weg2 import tail_adopt as _weg2_tail_adopt
@@ -11801,6 +11802,10 @@ class Scheduler(
         # D-MEM-SCHED: the KV stage between wakes, after the acks above (an
         # ended request's pages go only once backed); rank-symmetric like them
         _weg2_d_seat_vram.runtime_tick(self)
+        # D-SEAT-REWAKE: the phase's seat count n follows the waiting requests
+        # (grow at once) and the free seats (shrink past the measured re-plan
+        # price) -- same round boundary, rank-symmetric like the tick above
+        _weg2_d_seat_rewake.tick(self)
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()

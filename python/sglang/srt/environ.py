@@ -3053,6 +3053,17 @@ class Envs:
     # the Next-Flash launcher profile writes it True into --env-d.
     # Rank-uniform: every rank of D reads the same launcher env.
     SGLANG_OPT_WEG2_D_SEAT_VRAM = EnvBool(False)
+    # D-SEAT-REWAKE (Nutzer 30.09.: "D sleeped (ohne wirklich runterzufahren)
+    # und waket sofort wieder mit mehr sitzen ... selbe funktion nur auch
+    # wieder in die andere richtung"): D's phase seat count n moves LIVE at a
+    # round boundary, rank-uniform, no weight legs, no P -- grow n -> n+k when
+    # waiting requests find every seat taken (the expert rows the new seats'
+    # GDN pages need go off, coldest first); shrink n -> n-k when seats stand
+    # free and nobody waits, once the free time exceeds the MEASURED price of a
+    # re-plan round trip (ski rental, the flip policy's shape) -- the freed
+    # pages go back to expert rows. Needs SGLANG_OPT_WEG2_D_SEAT_VRAM; read by
+    # D's ranks AND by the front (which then counts D's seats at --d-bs).
+    SGLANG_WEG2_D_SEAT_REWAKE = EnvBool(False)
     # H95c: the extra expert rows' VIRTUAL reservation per MoE TP rank
     # ("16,0,0"), written by the launcher from the seat table (rows at n=1
     # minus rows at the --d-bs cap, GERECHNET). Only the rows the runtime's
