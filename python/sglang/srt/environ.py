@@ -728,8 +728,11 @@ class Envs:
     # post-wake census) as <G>.tp<t>pp<p>.rankstats next to its RankState, from
     # one timer thread every PERIOD_S (weg2/rankstats.py); the forward path
     # writes nothing. Off = no thread, no file. Display only.
-    SGLANG_WEG2_ENABLE_RANKSTATS = EnvBool(False)
-    SGLANG_WEG2_RANKSTATS_PERIOD_S = EnvFloat(2.0)
+    # 30.09. (progress_watch, 27B false alarm: a 62k P prefill 80 s without a
+    # front.served step): an INSTRUMENT, on by default; its `progress` block
+    # (fwd_ct, tokens_done) moves per forward / prefill chunk. 1 s cadence.
+    SGLANG_WEG2_ENABLE_RANKSTATS = EnvBool(True)
+    SGLANG_WEG2_RANKSTATS_PERIOD_S = EnvFloat(1.0)
     # WEG2_STATE_DIR (IPC §2.2, 27B B1/H5): the boot's own state directory
     # state/<boot_id>/ (state.json + events.jsonl), mounted into the container
     # by the arm, the host writer creates it. The launcher writes its fields
