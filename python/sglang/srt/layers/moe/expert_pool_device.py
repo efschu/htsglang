@@ -594,6 +594,37 @@ class SyncReport(msgspec.Struct, frozen=True):
     twins_freed: int
 
 
+class PoolRowKeyOutOfRange(RuntimeError):
+    """W-POOL-KEY: a row the eager sync would treat as an expert's holds a key
+    outside [-1, E) and is no OFF seat row."""
+
+
+def _check_row_keys(key, lo: int, rows: int, E: int, off, lru_holds, skip=None) -> None:
+    """y4u (D TP1 15:18:30Z): ``hot[old]`` with old = SEAT_OFF_KEY outside the
+    OFF seat block -- a row RW-FINISH had reserved for an in-flight warm copy
+    (``reserve_warm_rows``) and the eager pass then wrote -- raised a bare
+    IndexError. The eager sync may only take rows whose key is free (-1) or an
+    expert; any other key outside the OFF seat rows stops by name, with the
+    row, the key and whether the eager pass wrote it. ``skip(r)``: a row the
+    sync leaves as it is (keep: an unwritten row keeps its reservation)."""
+    for r in range(lo, rows):
+        if off is not None and off[0] <= r < off[1]:
+            continue
+        if skip is not None and skip(r):
+            continue
+        k = int(key[r])
+        if -1 <= k < E:
+            continue
+        raise PoolRowKeyOutOfRange(
+            "W-POOL-KEY: row %d holds key %d outside [-1, %d) and is no OFF seat row%s -- %s; "
+            "the eager sync would read it as an expert (the tables are not moved)" % (
+                r, k, E, "" if off is None else " (OFF rows %d..%d)" % (off[0], off[1] - 1),
+                "the eager pass WROTE it (two writers on one bank row: an RW-FINISH warm copy "
+                "reserved it, SEAT_OFF_KEY)" if r in lru_holds and k == SEAT_OFF_KEY else
+                "a reservation (SEAT_OFF_KEY) the eager pass reached" if k == SEAT_OFF_KEY
+                else "an unknown writer"))
+
+
 def sync_tables(
     tables: PoolTables, lru_holds: Dict[int, int], keep_unwritten: bool = False
 ) -> SyncReport:
@@ -638,6 +669,8 @@ def sync_tables(
     rows = int(key.shape[0])
     written = {r for r in lru_holds if lo <= r < rows}
     off = seat_off_range(tables)
+    _check_row_keys(key, lo, rows, E, off, lru_holds,
+                    skip=(lambda r: r < hi and r not in written) if keep_unwritten else None)
     for r in range(lo, rows):
         # staging rows are never owned; a written LRU row loses its old expert;
         # without keep every LRU row is cleared

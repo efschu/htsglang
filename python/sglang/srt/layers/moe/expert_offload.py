@@ -7570,9 +7570,33 @@ class ResumeWarm:
         self._planned = True
 
     def eager_reached(self, cache) -> None:
-        """An eager forward reached ``cache``: never wait -- drop it (a planned
-        layer gives its reserved rows back; one in flight stays reserved until
-        its event completes)."""
+        """An eager forward reached ``cache``: never wait on the host -- drop it
+        (a planned layer gives its reserved rows back).
+
+        A layer whose copy is IN FLIGHT lands now, ordered on the device: the
+        current stream waits for its event (no host wait) and the rows are
+        committed to their experts before the eager pass plans. Before (y4u
+        f50f51020f, D TP1 15:18:30Z, 40 layers in flight after the wake's
+        first decode, ``finish_landed=0``): the rows stayed reserved
+        (``row_key`` = SEAT_OFF_KEY) while the host eager plan wrote its
+        scratch rows over them -- two writers on one bank row, and
+        ``sync_tables`` read the reserved key as an expert id: IndexError
+        ``index 2147483647 ... size 128``, the group died."""
+        for i, (c, ev) in enumerate(list(self._inflight)):
+            if c is not cache:
+                continue
+            ops = self._ops
+            if ev is not None and ops is not None:
+                ops.current_waits(ev)  # device order: the commit and the eager pass follow the copy
+            plan = getattr(c, "_rw_plan", None)
+            c._rw_plan = None
+            if plan is not None:
+                c.warm_commit(plan)
+                self._count(c, plan.rows)
+            self._inflight.pop(i)
+            self.finish_landed += 1
+            self.eager_landed = int(getattr(self, "eager_landed", 0)) + 1
+            break
         if cache in self._queue:
             self._queue.remove(cache)
             plan = getattr(cache, "_rw_plan", None)

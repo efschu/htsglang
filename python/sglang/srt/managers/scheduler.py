@@ -22349,6 +22349,25 @@ def run_scheduler_process(
             )
         except Exception:  # noqa: BLE001 - diagnostics may not mask the death
             logger.warning("#1223: debug hold unavailable")
+        # RANK-DEATH (30.09., y4u D TP1 15:18:30Z; lifecycle "serving" until the
+        # deadman's crash verdict 78 s later): the boot's lifecycle goes `dead`
+        # FROM HERE, through the one state writer -- after the #1223 hold (a
+        # held rank is inspected, not torn down), before the census and the
+        # SIGQUIT below. First cause wins; never raises.
+        try:
+            from sglang.srt.environ import envs as _rd_envs
+            from sglang.srt.weg2 import state_file as _rd_state
+
+            if _rd_state.note_rank_death(
+                _rd_envs.WEG2_STATE_DIR.get() or None,
+                group=(os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() or None,
+                tp_rank=tp_rank, pp_rank=pp_rank, exc=scheduler_exc,
+                detail=traceback.strip().splitlines()[-1] if traceback else "",
+            ):
+                logger.error("WEG2 RANK-DEATH lifecycle=dead written (origin rank, code %s)",
+                             _rd_state.RANK_EXCEPTION_CODE)
+        except Exception:  # noqa: BLE001 - a record may not mask the death
+            pass
         # #1058b: the census goes out HERE, ahead of every signal, not only in
         # the `finally` below. `parent_process.send_signal(SIGQUIT)` and the
         # opt-in `os.killpg(..., SIGKILL)` a few lines down can both end this

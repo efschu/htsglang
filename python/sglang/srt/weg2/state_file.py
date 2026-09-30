@@ -52,6 +52,7 @@ import secrets
 import subprocess
 import sys
 import time
+from typing import Optional
 
 STATE_SCHEMA = "weg2.state/1"
 EVENT_SCHEMA = "weg2.event/1"
@@ -71,7 +72,7 @@ ORIGINS = ("preflight", "launcher", "rank", "front", "deadman", "operator", "con
 #: stopping-/stopped_clean-Gründe (cause.code, origin operator); stopped_clean trägt cause.rc = 0 (A3)
 STOP_REASONS = ("stop_file", "operator", "window_end", "max_deaths", "probes_done", "d2_done")
 #: `deadman` (Phase 2): nur Herzschlag, Event deadman_verdict und stop_request.json -- keine Felder, keine Zustände
-WRITERS = ("host", "launcher", "front", "deadman")
+WRITERS = ("host", "launcher", "front", "deadman", "rank")
 #: A1c Feld-Eigentum: oberstes Feld je Schreiber (heartbeat.<name> schreibt jeder für sich).
 #: Ein Eintrag mit Punkt besitzt nur diesen Teilbaum: ``launch`` teilen sich Host
 #: (launch.container) und Launcher (launch.front), Nutzer 29.09. Startflags im rigdash.
@@ -81,6 +82,8 @@ OWNED_FIELDS = {
     "launcher": ("groups", "invariants", "launch.front"),
     "front": ("front",),
     "deadman": (),
+    #: 30.09. RANK-DEATH: a rank owns no field -- only its own death
+    "rank": (),
 }
 #: A1c Zustands-Eigentum
 OWNED_STATES = {
@@ -89,11 +92,13 @@ OWNED_STATES = {
     "launcher": ("loading", "ready", "dead"),
     "front": ("serving", "flipping"),
     "deadman": (),
+    "rank": ("dead",),
 }
 #: A1c: ein `dead` des Launchers trägt nur diese Ursprünge (Host: Container-Exit, OOM, Wächter, host)
 LAUNCHER_DEAD_ORIGINS = ("launcher", "rank")
 #: Heartbeat-Name je Schreiber (H3: die Namen sind offen, Ränge schreiben "<G>.tp<t>pp<p>")
-HEARTBEAT_NAME = {"host": "host_acceptance", "launcher": "launcher", "front": "front", "deadman": "deadman"}
+HEARTBEAT_NAME = {"host": "host_acceptance", "launcher": "launcher", "front": "front", "deadman": "deadman",
+                  "rank": "rank"}
 #: Verbraucher-Regel §2.2: Herzschlag älter als das = verdächtig
 HEARTBEAT_STALE_S = 30.0
 #: Aus Abwärtsverträglichkeit: der Host-Schreiber durfte immer genau diese Felder
@@ -280,6 +285,8 @@ def _check_owner(writer: str, state, cause, fields) -> None:
                                  f"(erlaubt: {', '.join(OWNED_FIELDS[writer])})")
     if writer == "launcher" and state == "dead" and (cause or {}).get("origin") not in LAUNCHER_DEAD_ORIGINS:
         raise StateFileError(f"state_file: dead des Launchers braucht origin in {LAUNCHER_DEAD_ORIGINS}")
+    if writer == "rank" and state == "dead" and (cause or {}).get("origin") != "rank":
+        raise StateFileError("state_file: dead eines Rangs braucht origin rank")
 
 
 def transition(d: str, state=None, *, if_state=None, cause=None, fields=None, heartbeat_only=False,
@@ -684,3 +691,35 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+#: 30.09. RANK-DEATH (y4u 15:18:30Z D TP1 IndexError, lifecycle stayed "serving"
+#: until DEADMAN_CRASH 15:19:48, 78 s): the scheduler's own exception path
+#: writes the death -- no log parsing, no deadman interval.
+RANK_EXCEPTION_CODE = "RANK_EXCEPTION"
+
+
+def note_rank_death(d: Optional[str], *, group: Optional[str], tp_rank: int, pp_rank: int,
+                    exc: BaseException, detail: str = "") -> bool:
+    """The dying rank's lifecycle ``dead`` (origin rank, rc
+    RC_DEAD_AFTER_SERVING once serving, else RC_DEAD_BEFORE_SERVING), written
+    AT ONCE from the scheduler's exception handler through the one writer.
+    First cause wins (a boot already dead or stopped stays as it is: the
+    transition is a no-op). No state dir, no state.json, any error: False --
+    the death path goes on regardless. Never raises."""
+    if not d:
+        return False
+    try:
+        st = read(d)
+        if not st:
+            return False
+        cur = (st.get("lifecycle") or {}).get("state")
+        rc = RC_DEAD_AFTER_SERVING if st.get("serving_since_ts") else RC_DEAD_BEFORE_SERVING
+        g = group if group in ("P", "D") else None
+        cause = make_cause(RANK_EXCEPTION_CODE, "rank", (detail or "%s: %s" % (type(exc).__name__, exc))[:2000],
+                           group=g, rank="tp%dpp%d" % (int(tp_rank), int(pp_rank)),
+                           exception_type=type(exc).__name__, rc=rc)
+        out = transition(d, "dead", cause=cause, writer="rank")
+        return (out.get("lifecycle") or {}).get("state") == "dead" and cur != "dead"
+    except Exception:  # noqa: BLE001 -- the death path goes on regardless
+        return False
