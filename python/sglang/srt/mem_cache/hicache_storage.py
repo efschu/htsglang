@@ -3970,7 +3970,40 @@ class HiCacheFile(HiCacheStorage):
                     len(keys),
                 )
 
-        for transfer in pool_transfers or []:
+        # AC (NF y3v 5327bdfa17, PP0 01:08:59, weg2-23-56): THE TRAILING
+        # ANCHOR IS SEARCHED BELOW THE OTHER CAPS, NOT BESIDE THEM. Each pool
+        # used to take its boundary over the whole KV prefix and the claim
+        # was their MIN: ``#1028B FETCH CAP kv=1350 claimed=716 caps={mamba:
+        # 1350, qsa_indexer: 716}`` -- the mamba boundary sat at page 1349,
+        # the QSA index was missing at page 716, so the claim ended at page
+        # 715, where no recurrent anchor exists. The read loaded 716 KV
+        # pages, its trailing mamba key named page 715 (absent), the #1416
+        # clamp then asked the same keys (``kv=716 ... mamba: (0, -1)``) and
+        # cut told to 0: P re-prefilled 86598 tokens although anchors lay
+        # inside the 716 readable pages. A trailing pool's contract is "the
+        # last pages OF THE FINAL PREFIX", so its search starts at the cap
+        # the all-pages pools leave. Order: every non-trailing pool first,
+        # then the trailing ones within ``final_pages``. A presence-only pool
+        # (``caps_claim`` False, the draft page) keeps its whole-prefix
+        # boundary: its consumer decides from it and it caps nothing.
+        def _trailing_boundary(transfer, limit: int) -> int:
+            trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+            for prefix_len in range(int(limit), 0, -1):
+                if all(
+                    has_component(i, transfer.name)
+                    for i in range(max(0, prefix_len - trailing), prefix_len)
+                ):
+                    return prefix_len
+            return 0
+
+        _ordered = sorted(
+            pool_transfers or [],
+            key=lambda t: (
+                getattr(t, "caps_claim", True)
+                and t.hit_policy != PoolHitPolicy.ALL_PAGES
+            ),
+        )
+        for transfer in _ordered:
             if final_pages == 0:
                 break
             name = transfer.name
@@ -3979,15 +4012,8 @@ class HiCacheFile(HiCacheStorage):
                     (i for i in range(kv_pages) if not has_component(i, name)), kv_pages
                 )
             else:  # trailing_pages
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                boundary = 0
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        has_component(i, name)
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        boundary = prefix_len
-                        break
+                _limit = final_pages if getattr(transfer, "caps_claim", True) else kv_pages
+                boundary = _trailing_boundary(transfer, _limit)
             if boundary:
                 hit_count[name] = boundary
             if not getattr(transfer, "caps_claim", True):
@@ -4006,6 +4032,23 @@ class HiCacheFile(HiCacheStorage):
                 # decision. This list changes none.
                 _zero_capped.append(str(name))
             final_pages = min(final_pages, boundary)
+
+        # AC: two trailing pools (mamba + SWA) end at ONE page -- a later one
+        # that lowered the claim moves the earlier one's search below it.
+        _trail = [
+            t for t in _ordered
+            if getattr(t, "caps_claim", True) and t.hit_policy != PoolHitPolicy.ALL_PAGES
+        ]
+        _moved = len(_trail) > 1
+        while _moved and final_pages > 0:
+            _moved = False
+            for t in _trail:
+                b = _trailing_boundary(t, final_pages)
+                if b != final_pages:
+                    final_pages = b
+                    if b:
+                        hit_count[t.name] = b
+                    _moved = True
 
         # #1028B THE CAP, NAMED. This `min` is the only place that decides how
         # much of an existing KV prefix a prefetch may actually claim, and it
