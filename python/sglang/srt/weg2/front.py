@@ -7596,6 +7596,11 @@ class Front:
         and the prefilled requests still waiting for a front seat -- against the
         phase's seat count (H95c ``_d_phase_n``, else ``--d-bs``)."""
         n = getattr(self, "_d_phase_n", None) or self.d_bs
+        if _d_seat_rewake_on():
+            # D-SEAT-REWAKE: D grows its phase seats live at the next round
+            # boundary when a request it can hold finds them taken -- the
+            # seats this rule counts are D's cap (--d-bs), not the wake's n
+            n = self.d_bs
         D = self.groups["D"]
         st = self._asr_st()
         parked, granted = st["parked"], st["granted"]
@@ -12579,6 +12584,14 @@ class Front:
             )
         except Exception:  # noqa: BLE001 -- a guard may not break the endpoint
             return None
+
+
+def _d_seat_rewake_on() -> bool:
+    """D-SEAT-REWAKE (weg2/d_seat_rewake.py), the front's half."""
+    try:
+        return bool(envs.SGLANG_WEG2_D_SEAT_REWAKE.get())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def start_host_census_sampler(record: str, key: str, store_dir: str,

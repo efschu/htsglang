@@ -113,6 +113,16 @@ def switch_on() -> bool:
     return bool(envs.SGLANG_OPT_WEG2_D_SEAT_VRAM.get())
 
 
+def _rewake_on() -> bool:
+    """D-SEAT-REWAKE (weg2/d_seat_rewake.py): the live seat re-plan."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_D_SEAT_REWAKE.get())
+    except Exception:  # noqa: BLE001 -- an unreadable switch is off
+        return False
+
+
 def armed(env: Optional[Dict[str, str]] = None) -> bool:
     """The switch AND group D (the posts only move on D)."""
     env = os.environ if env is None else env
@@ -1261,6 +1271,8 @@ class PhaseState:
     stage_tokens: Optional[int] = None
     demand: Optional[int] = None
     over: bool = False
+    #: D-SEAT-REWAKE: this rank's measured ms of the wake's page apply
+    apply_ms: Optional[float] = None
 
 
 @dataclass
@@ -1474,12 +1486,19 @@ class SeatVram:
         the whole temporal -> FillFunctor<BFloat16> device exception on the
         unmapped tail, 58 GB GPU coredump, abort in torch.cuda.synchronize."""
         planned = False
+        rewake = _rewake_on()
         for m, info in zip(self.slot_tensors, infos):
             if info is not None and not info.active:
-                rc = self.spans.set_spans(m.ptr, slot_spans(m.geom, keep, self.granule), now=False)
+                # D-SEAT-REWAKE: the plan is cut at every keep a phase can take,
+                # so a live shrink frees whole cells and never wipes a kept one
+                sp = (slot_spans(m.geom, keep, self.granule, cuts=self.mamba_cut_keeps())
+                      if rewake else slot_spans(m.geom, keep, self.granule))
+                rc = self.spans.set_spans(m.ptr, sp, now=False)
                 if rc != 0:
                     raise Weg2DSeatVramRefused("%s: tms_set_spans(%s) rc=%d"
                                                % (LINE_MARK, m.geom.name, rc))
+                if rewake:
+                    self.spans_by_ptr[int(m.ptr)] = tuple(sp)
                 planned = True
         if planned:
             self.mamba_keep = None if keep > self.pool_size else int(keep)
@@ -1721,6 +1740,94 @@ class SeatVram:
         self.applied = applied
         return applied
 
+    def mamba_cut_keeps(self) -> Tuple[int, ...]:
+        """D-SEAT-REWAKE: every GDN keep a phase of this rank can take (n =
+        1..cap, every stage cell) -- the lattice the Mamba plans are cut at."""
+        ks = {int(r.slot_limit) + 1 for r in self.rows}
+        ks.update(int(c.mamba_keep) for c in self.cells.values())
+        return tuple(sorted(k for k in ks if 0 < k <= self.pool_size))
+
+    def reseat_target(self, n: int, stage: Optional[int]) -> Tuple[int, int]:
+        """``(k, keep)`` of a phase of ``n`` seats: the expert rows ON and the
+        GDN slots per layer mapped (``pool_size + 1`` = every slot) -- the stage
+        cell when the stage form holds, else the H95c row."""
+        n = max(1, min(int(n), self.cap))
+        if stage is not None and self.cells:
+            cell = self.cells[(n, int(stage))]
+            return int(cell.extra_rows), int(cell.mamba_keep)
+        row = self.row_for(n)
+        k = int(row.extra_rows) if (self.slot_tensors and self.row_tensors) else 0
+        return k, ((int(row.slot_limit) + 1) if k > 0 else self.pool_size + 1)
+
+    def reseat_live(self, n: int, stage: Optional[int]) -> PhaseApplied:
+        """D-SEAT-REWAKE: the pages of a LIVE phase move from n seats to ``n``
+        (Nutzer 30.09.: "D sleeped ohne wirklich runterzufahren und waket
+        sofort wieder mit mehr sitzen"). Nothing sleeps: the GDN pool keeps the
+        cells of its slots in use and maps / frees only the cells of the seats
+        that come or go; the expert bank gives rows back or takes them.
+
+        GROW (more GDN slots): the bank's rows go OFF coldest first (sync,
+        copies, sync) and its cells are released BEFORE the GDN cells map --
+        release before map (RB), the card never holds both. SHRINK: a sync
+        (no kernel reads a freed slot), the GDN cells above the new keep go,
+        then the bank grows elastically (a row the card cannot back stays in
+        the host store). Every plan is cut at the lattice (``refuse_wipes``
+        stops a plan that would release a kept cell before anything moves)."""
+        n = max(1, min(int(n), self.cap))
+        k, keep = self.reseat_target(n, stage)
+        cur_keep = self.pool_size + 1 if self.mamba_keep is None else int(self.mamba_keep)
+        keep_eff = min(int(keep), self.pool_size + 1)
+        grow = keep_eff > cur_keep
+        mamba_plans = [(m, slot_spans(m.geom, keep_eff, self.granule, cuts=self.mamba_cut_keeps()))
+                       for m in self.slot_tensors]
+        bank_plans = [(m, self.bank_spans(m, k), True) for m in self.row_tensors]
+        self.refuse_wipes([(m.ptr, m.geom.name, sp, True) for m, sp in mamba_plans]
+                          + [(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        rows_from = int(self.rows_on)
+        if grow:
+            if k < rows_from:
+                self._rows_off_live(k, True)
+                self._set_bank_plans(bank_plans, census)
+            for m, sp in mamba_plans:
+                self.set_plan(m.ptr, m.geom.name, sp, live=True, census=census)
+        else:
+            import torch
+
+            if torch.cuda.is_initialized():
+                self._timed_sync()  # no kernel may still read a slot whose cells go
+            for m, sp in mamba_plans:
+                self.set_plan(m.ptr, m.geom.name, sp, live=True, census=census)
+            if k > rows_from:
+                k = self._grow_bank_elastic(bank_plans, k, census)
+                for cache in self.caches:
+                    cache.set_seat_rows_on(k, device_write=True)
+            elif k < rows_from:
+                self._rows_off_live(k, True)
+                self._set_bank_plans(bank_plans, census)
+        self.mamba_keep = None if keep_eff > self.pool_size else int(keep_eff)
+        if self.mamba_pool is not None and self.slot_tensors:
+            self.mamba_pool._weg2_seat_keep = self.mamba_keep
+        if k < rows_from:
+            self.evicted_rows += rows_from - k
+        elif k > rows_from:
+            self.refilled_rows += k - rows_from
+        self.rows_on = int(k)
+        log_live_spans(census, n=n, stage=stage, rows_from=rows_from, rows_to=int(k),
+                       mamba_keep=self.mamba_keep, order="bank-first" if grow else "mamba-first")
+        prev = self.applied
+        applied = PhaseApplied(
+            n=n, extra_rows=int(k),
+            mamba_mapped=sum(span_bytes(slot_spans(m.geom, keep_eff, self.granule))
+                             for m in self.slot_tensors),
+            expert_mapped=sum(span_bytes(row_spans(m.geom, m.geom.rows_boot + k, self.granule))
+                              for m in self.row_tensors),
+            cap_mapped=int(prev.cap_mapped) if prev is not None else 0,
+            note="live reseat", stage=stage if stage is None else int(stage),
+            kv_mapped=int(prev.kv_mapped) if prev is not None else 0)
+        self.applied = applied
+        return applied
+
     def table_lines(self) -> List[str]:
         return [
             "%s table n=%d: slots 1..%d, expert rows +%d, mapped %.1f MiB (mamba %.1f + "
@@ -1890,6 +1997,9 @@ def on_wake(sched, recv_req, seats) -> Optional[PhaseState]:
         st.stage, st.stage_tokens = stage, form.tokens[stage]
         st.demand, st.over = choice.demand, bool(choice.over)
     # 2. RANK-LOCAL: the pages
+    import time as _time
+
+    _t_apply = _time.perf_counter()
     ctl = controller(sched)
     if ctl is None:
         applied = None
@@ -1897,7 +2007,13 @@ def on_wake(sched, recv_req, seats) -> Optional[PhaseState]:
         applied = ctl.apply_stage(n_phys, stage)
     else:
         applied = ctl.apply(n_phys)
+    # D-SEAT-REWAKE: the wake's own page re-plan, measured (the first price)
+    st.apply_ms = (_time.perf_counter() - _t_apply) * 1000.0 if ctl is not None else None
     logger.info("%s", phase_line(st, applied, ctl))
+    if _rewake_on() and st.apply_ms is not None:
+        logger.info("WEG2 D-SEAT-REWAKE WAKE-APPLY n=%d ms=%.1f rows_on=%s mamba_keep=%s (the wake's page "
+                    "re-plan, measured: the first price of a live re-plan)", st.n, st.apply_ms,
+                    getattr(ctl, "rows_on", None), getattr(ctl, "mamba_keep", None))
     if stage is not None:
         line = stage_line(st, applied)
         if form.by_demand:
