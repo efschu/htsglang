@@ -19018,6 +19018,11 @@ class Scheduler(
             _wu_chk(join=False)
         if getattr(self, "weg2_dormant", False) and getattr(self, "weg2_dormant_hold", None):
             self._weg2_hold_refetch()  # #1456
+        # DUAL-TP3PP3: an idle P stage still drains its write-through acks
+        # (D reads the tail only once they are processed; no-op off the dual P)
+        from sglang.srt.weg2.dual_p_kv_stage import flush_acks_when_idle
+
+        flush_acks_when_idle(self)
         if not self.is_fully_idle():
             # #547: no batch to run, but work is queued somewhere (waiting
             # queue, grammar, disagg, hicache drain). That is the loaded path

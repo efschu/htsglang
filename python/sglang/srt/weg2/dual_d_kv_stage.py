@@ -143,9 +143,15 @@ class DKvStage(_pk.PKvStage):
         if int(self.gmin([ok])[0]) != 1:
             if granted:
                 self.ledger.release(granted)
-            logger.info("%s GROUP-WAIT want=%d need=%d granted=%d pressure_on_P=%d", MARK, want, need,
-                        granted, pressure)
+            t = _pk._now()
+            self._gw_n = int(getattr(self, "_gw_n", 0)) + 1
+            if t >= getattr(self, "_gw_next", 0.0):   # 1 line/s at most, backing off (metal dual13)
+                self._gw_iv = 2.0 * float(getattr(self, "_gw_iv", 0.5))
+                self._gw_next = t + self._gw_iv
+                logger.info("%s GROUP-WAIT want=%d need=%d granted=%d pressure_on_P=%d waits=%d", MARK, want,
+                            need, granted, pressure, self._gw_n)
             return False
+        self._gw_n, self._gw_next, self._gw_iv = 0, 0.0, 0.5
         self._move(want)
         self._committed = int(getattr(self, "_committed", 0) or 0) + need
         logger.info("%s GROW %d -> %d tokens (+%d B)", MARK, self.mapped_tokens, want, need)
@@ -249,6 +255,32 @@ def d_demand(sched) -> int:
     return sum(_sv._req_tokens(r) for r in running) + sum(_sv._req_tokens(r) for r in queue)
 
 
+def cache_yield(sched, actor) -> int:
+    """Evict D's whole EVICTABLE device cache (unlocked nodes only -- a live
+    seat's rows are locked and stay). Backed prefixes keep their L2 copy.
+    Metal dual13 (3q33cu): D held 65536 mapped rows of cache with 0 running and
+    0 queued while P's grant starved on the 5090. Returns the evicted tokens."""
+    tree = getattr(sched, "tree_cache", None)
+    if tree is None:
+        return 0
+    try:
+        ev = int(tree.evictable_size() or 0)
+    except Exception:  # noqa: BLE001 -- a tree without the counter has nothing to yield
+        return 0
+    if ev <= 0:
+        return 0
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+    tree.evict(EvictParams(num_tokens=ev))
+    t = _pk._now()
+    if t >= getattr(actor, "_yield_log_next", 0.0):
+        actor._yield_log_iv = min(300.0, 2.0 * float(getattr(actor, "_yield_log_iv", 0.5)))
+        actor._yield_log_next = t + actor._yield_log_iv
+        logger.info("%s CACHE-YIELD evicted=%d tokens: P waits and D has no running or waiting request "
+                    "(backed prefixes stay in L2) mapped=%d", MARK, ev, actor.mapped_tokens)
+    return ev
+
+
 def tick(sched) -> Optional[str]:
     """Once per scheduler iteration on every D rank. ONE collective per tick
     (MAX of want, P-waiting and the highest live row), so every rank decides on
@@ -263,12 +295,18 @@ def tick(sched) -> Optional[str]:
     from sglang.srt.weg2.card_kv_ledger import peek
 
     actor.gmin = getattr(sched, "_weg2_group_min_ints", None) or actor.gmin
-    want_local = want_tokens(d_demand(sched), 0, _sv._air(sched), actor.step)
+    demand_local = d_demand(sched)
+    want_local = want_tokens(demand_local, 0, _sv._air(sched), actor.step)
     st = peek(actor.ledger.path)
     p_wait_local = 1 if (st is not None and int(st.demand.get("P", 0)) > 0) else 0
     live_local = int(_pk.max_live_id(actor.allocator, actor.page)) * int(actor.page)
-    g = actor.gmin([-int(want_local), -int(p_wait_local), -int(live_local)])
+    g = actor.gmin([-int(want_local), -int(p_wait_local), -int(live_local), -int(demand_local)])
     want, p_waiting, floor = -int(g[0]), -int(g[1]) > 0, -int(g[2])
+    if p_waiting and -int(g[3]) == 0:
+        # the GROUP has no running or waiting request and P waits: D's cached
+        # prefix is not demand (user rule) -- every rank gives it up alike, the
+        # next tick's live floor lets the shrink through
+        cache_yield(sched, actor)
     want = max(want, _pk.round_up(floor, actor.step))       # never below a live row of any rank
     below = actor._below + 1 if want < actor.mapped_tokens else 0
     verdict, level = decide(actor.mapped_tokens, want, p_waiting, below, actor.step)
