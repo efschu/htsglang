@@ -787,7 +787,9 @@ function bootCard(b, now, binders) {
   const topoSrc = ipc && Object.keys(ipc.topology || {}).length ? ipc.topology : m.topology;
   const topo = topoSrc ? Object.entries(topoSrc).map(([g, t]) => `${g}: TP${t.tp || 1}${t.pp > 1 ? "·PP" + t.pp : ""}`).join(", ") : "";
   const q = fr ? fr.queue : (b.queue ? b.queue.queue : null);
-  // Flipzeit (Nutzer 29.09.) = WEG2-FLIP begin -> erstes Decode-Token (P→D) bzw. erste PP0-Prefill-Zeile (D→P);
+  // Flipzeit (Nutzer 29.09.) = WEG2-FLIP begin -> erstes Decode-Token (P→D) bzw. Start des ersten Prefills (D→P),
+  // aus events.jsonl flip_first_work (Front-Uhr, ms), sonst aus dem Log (dort D→P bis zur PP0-Zeile, die erst nach
+  // dem ersten Chunk durch alle PP-Stufen kommt: +5-8 s Rechenzeit);
   // flip_total ist nur der Layer-Tausch darin.  Jeder Wert nennt sein Instrument (27B-Review 29.09.); ein
   // 27B-Boot fuehrt mit flip_total, bis ein 27B-Boot unter der neuen Definition gemessen ist (live.py).
   const ft = b.flip_times || {};
@@ -808,7 +810,8 @@ function bootCard(b, now, binders) {
     if (!x.n) return [label, (x.open ? "offen (noch kein erstes Token)" : "—") + tag(ins.first_token)];
     return [label, `<b>${secs(x.last)}</b> &middot; Median ${secs(x.median)} &middot; p90 ${secs(x.p90)} &middot; n=${fmt(x.n)}`
       + (x.no_work ? ` <span class="muted">(${fmt(x.no_work)} ohne Folgearbeit)</span>` : "")
-      + (x.resolution_s >= 1 ? ` <span class="muted">±1 s</span>` : "") + tag(ins.first_token)];
+      + (x.resolution_s >= 1 ? ` <span class="muted">±1 s</span>` : "") + tag(x.src || ins.first_token)
+      + (x.src ? "" : LOGSRC)];
   };
   const totalRow = (key, label, head) => {
     const x = ft[key] || {};
@@ -824,7 +827,7 @@ function bootCard(b, now, binders) {
   ] : [
     firstRow("P>D", "Flipzeit P→D (P-Ende → 1. Decode-Token)"),
     totalRow("P>D", "davon Layer-Tausch P→D", false),
-    firstRow("D>P", "Flipzeit D→P (→ 1. PP0-Prefill)"),
+    firstRow("D>P", "Flipzeit D→P (→ Start 1. Prefill)"),
     totalRow("D>P", "davon Layer-Tausch D→P", false),
   ];
   const errs = (fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.last : (b.errors || [])).slice(-3).reverse();

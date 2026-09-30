@@ -126,6 +126,59 @@ class TestClassifyIpc(unittest.TestCase):
             self.assertEqual(s.for_tag(TAG)["events"]["hold_end"][0]["data"]["reason"], "stop_file")
 
 
+def _fw(direction, begin, ms, what):
+    # shaped like the y4j front's events (nfh91...clkpodauer-boot-20260930T101130Z-74d3)
+    return {"type": "flip_first_work", "ts": begin + ms / 1000.0,
+            "data": {"clock": "time.time front", "dir": direction, "epoch": 1, "flip_begin_ts": begin,
+                     "first_work_ts": begin + ms / 1000.0, "flip_time_ms": ms, "rid": "weg2-0-2", "what": what}}
+
+
+class TestFlipFirstWork(unittest.TestCase):
+    """Flipzeit from the front's own clock (30.09.): the log's D->P mark ('Prefill batch' on
+    PP0) comes only after the first chunk ran through all PP stages -- y4i showed 9.6 s median
+    there against 2.0 s to the first P leg in events.jsonl."""
+
+    def _log_view(self):
+        # what flip_times_view gave for y4i: D->P from the late PP0 line (whole seconds)
+        return {"P>D": {"n": 1, "last": 2600, "median": 2600, "p90": 2600, "resolution_s": 0.001,
+                        "layer_median": 1400, "layer_n": 1, "no_work": 0, "open": False},
+                "D>P": {"n": 2, "last": 9400, "median": 9400, "p90": 10386, "resolution_s": 1.0,
+                        "layer_median": 1600, "layer_n": 2, "no_work": 0, "open": False},
+                "recent": [{"t": 1790763310.679, "dir": "D>P", "ms": 9321, "state": "ok", "layer_ms": 1600},
+                           {"t": 1790763330.0, "dir": "P>D", "ms": 2600, "state": "ok", "layer_ms": 1400},
+                           {"t": 1790763350.25, "dir": "D>P", "ms": 10386, "state": "ok", "layer_ms": 1610}]}
+
+    def test_events_keep_first_work_apart_from_the_row_window(self):
+        with tempfile.TemporaryDirectory() as root:
+            evs = [_fw("D>P", 1790763310.679, 4136, "p_leg1_dispatch")]
+            evs += [{"type": "hold_end", "ts": 1.0, "data": {"reason": "x"}}] * (ipcstate.EVENTS_KEEP + 5)
+            _write_boot(root, _state(), events=evs)
+            s = ipcstate.IpcStates(roots=(root,))
+            s.poll()
+            fw = s.for_tag(TAG)["flip_first_work"]
+            self.assertEqual([x["flip_time_ms"] for x in fw], [4136])
+
+    def test_ipc_replaces_the_late_log_mark(self):
+        from rigdash import live
+        fw = [_fw("D>P", 1790763310.679, 4136, "p_leg1_dispatch")["data"],
+              _fw("P>D", 1790763330.0, 2460, "decode_token")["data"],
+              _fw("D>P", 1790763350.25, 1822, "p_leg1_dispatch")["data"]]
+        ft = live.apply_ipc_first_work(self._log_view(), fw)
+        self.assertEqual((ft["D>P"]["n"], ft["D>P"]["last"], ft["D>P"]["median"]), (2, 1822, 1822))
+        self.assertEqual(ft["D>P"]["resolution_s"], 0.001)
+        self.assertIn("p_leg1_dispatch", ft["D>P"]["src"])
+        self.assertEqual(ft["D>P"]["layer_median"], 1600)     # layer swap stays from the log
+        self.assertEqual([r["ms"] for r in ft["recent"]], [4136, 2460, 1822])
+        self.assertEqual({r.get("src") for r in ft["recent"]}, {"ipc"})
+
+    def test_without_ipc_the_log_view_stays(self):
+        from rigdash import live
+        view = self._log_view()
+        ft = live.apply_ipc_first_work(view, [])
+        self.assertEqual(ft["D>P"], view["D>P"])
+        self.assertNotIn("src", ft["recent"][0])
+
+
 class TestHealthFrontMirror(unittest.TestCase):
     def test_state_json_front_outstanding_is_one_number(self):
         # IPC §2.2 H4: the state.json mirror keeps outstanding as one number, /weg2/state per group

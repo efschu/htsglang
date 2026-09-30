@@ -35,6 +35,9 @@ FIELD_EVENT_TYPES = ("flip_begin", "flip_done", "flip_first_work", "group_health
 EVENT_TYPES = ("lifecycle", "hold_begin", "hold_end", "deadman_verdict", "front_stop", "flip_cushion",
                "group_ready", "launcher_done") + FIELD_EVENT_TYPES
 EVENTS_KEEP = 2000
+# flip_first_work (front's own clock, ms): kept apart from `rows` so a long boot's flip
+# times are not pushed out by the other event types' window.
+FIRST_WORK_KEEP = 5000
 
 
 def _read_json(path: str) -> Optional[dict]:
@@ -102,6 +105,7 @@ class _Events:
         self.off = 0
         self.buf = b""
         self.rows: List[dict] = []
+        self.first_work: List[dict] = []
         self.counts: Dict[str, int] = {}
 
     def poll(self):
@@ -128,7 +132,10 @@ class _Events:
             self.counts[t] = self.counts.get(t, 0) + 1
             if t in EVENT_TYPES:
                 self.rows.append(e)
+            if t == "flip_first_work" and isinstance(e.get("data"), dict):
+                self.first_work.append(e["data"])
         del self.rows[:-EVENTS_KEEP]
+        del self.first_work[:-FIRST_WORK_KEEP]
 
 
 def boot_view(d: str, st: dict, ev: Optional[_Events], now: float) -> dict:
@@ -172,6 +179,7 @@ def boot_view(d: str, st: dict, ev: Optional[_Events], now: float) -> dict:
                    "hold_end": [e for e in rows if e.get("type") == "hold_end"][-1:],
                    "deadman_verdict": [e for e in rows if e.get("type") == "deadman_verdict"][-3:],
                    "front_stop": [e for e in rows if e.get("type") == "front_stop"][-3:]},
+        "flip_first_work": list(ev.first_work) if ev else [],
     }
 
 
