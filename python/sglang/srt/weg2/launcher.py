@@ -14255,6 +14255,23 @@ def p_mamba_floor_text(slots: int, seats: int) -> str:
     return text
 
 
+def _without_budget_flag(extra: List[str]) -> List[str]:
+    """``extra`` without ``--rank-gpu-memory-mib`` (both spellings)."""
+    out: List[str] = []
+    skip = False
+    for tok in extra:
+        if skip:
+            skip = False
+            continue
+        if tok == "--rank-gpu-memory-mib":
+            skip = True
+            continue
+        if tok.startswith("--rank-gpu-memory-mib="):
+            continue
+        out.append(tok)
+    return out
+
+
 def p_mamba_slots(ns, model: str, p_bs: int) -> Tuple[int, str]:
     """Group P's device mamba SLOTS as the boot allocates them, and the source.
 
@@ -14279,8 +14296,15 @@ def p_mamba_slots(ns, model: str, p_bs: int) -> Tuple[int, str]:
     (qwen27b) keeps the demand formula as before H92c.
     """
     _row = weg2_form.profile_row(getattr(ns, "profile", None))
+    # The probe's budgets [1, 1, 1] are sentinels, not the launcher's card
+    # calculation: W100 (``_refuse_if_extra_raises_budget``) must not judge an
+    # arm's --rank-gpu-memory-mib against them -- dual19 D2 (dual1g, --extra-p
+    # '--rank-gpu-memory-mib 8830,3400,2900 ...'): "Launcher 1 MiB -> extra
+    # 8830 MiB". The probe reads --max-mamba-cache-size only; the budget flag
+    # is dropped from ITS extra, and the real argv_p still meets W100.
+    _probe_extra = _without_budget_flag(shlex.split(str(getattr(ns, "extra_p", "") or "")))
     flags = (argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG,
-                    shlex.split(str(getattr(ns, "extra_p", "") or "")), p_bs=int(p_bs),
+                    _probe_extra, p_bs=int(p_bs),
                     stage_ratio="", attn_stage_ratio="")
              if _row is not None and _row.p_mamba_slots_from_argv else [])
     value = None

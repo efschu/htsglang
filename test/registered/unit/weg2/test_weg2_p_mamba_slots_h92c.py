@@ -136,6 +136,29 @@ class TestMambaPost:
         slots, src = lc.p_mamba_slots(_ns("--max-mamba-cache-size 32", profile="qwen27b"), model, 8)
         assert slots == 32 and "argv" in src
 
+    def test_dual1g_extra_p_budgets_do_not_trip_w100_on_the_probe(self, model):
+        """dual19 D2 (acceptance_0930_135630, image 52faed46a105 = merge e61aba8a61):
+        solve_p_cut -> p_mamba_slots -> argv_p(budgets=[1, 1, 1], --extra-p) raised
+        W100 'Launcher 1 MiB -> extra 8830 MiB'. [1, 1, 1] are the PROBE's sentinel
+        budgets, not the launcher's calculation; the dual profile's --extra-p carries
+        P's stage budgets (8830,3400,2900). The probe reads --max-mamba-cache-size only
+        -- the budget flag is not its business; W100 still judges the real argv_p."""
+        extra = ("--max-running-requests=1 --rank-gpu-memory-mib 8830,3400,2900 "
+                 "--max-mamba-cache-size=8 --fp4-gemm-backend native-mixed")
+        slots, src = lc.p_mamba_slots(_ns(extra, p_bs=1, profile="qwen27b"), model, 1)
+        assert slots == 8 and "argv" in src
+        slots, _ = lc.p_mamba_slots(_ns("--rank-gpu-memory-mib=8830,3400,2900 --max-mamba-cache-size 8",
+                                        p_bs=1, profile="qwen27b"), model, 1)
+        assert slots == 8
+
+    def test_w100_still_refuses_a_raise_on_the_real_argv(self, model):
+        import pytest as _pt
+
+        with _pt.raises(RuntimeError, match="W100"):
+            lc.argv_p("py", model, [8000, 3000, 2800], 1, 1, lc.RING_FORM_SENTINEL_STORE_CFG,
+                      ["--rank-gpu-memory-mib", "8830,3400,2900"], p_bs=1, stage_ratio="",
+                      attn_stage_ratio="")
+
     def test_the_demand_bound_only_for_an_argv_without_the_flag(self, model):
         real = lc.argv_p
 
