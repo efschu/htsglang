@@ -26,6 +26,11 @@ Pinned here:
     time (first content given, leg 2 not finished -- D's radix held it); any other such move would be a
     W50 over-credit and fails the test;
   * a credit only appears after a first-content witness, never below 0.
+Replayed with today's reprice semantics (a re-priced queued LONG reaches D only through the short drain,
+i.e. while D is awake and serving): OFF 59, L1 38 (21 moved, 7 of them by the reprice at the witness).
+L2 (#49, D-epoch publish presence): alone 56, on top of L1 still 38 (see its test). The
+router's held-credit rule includes "not while flipping" (flip begin .. done) and D's #59 depths come
+from the D log's '#59 RESUMABLE' lines.
 """
 
 import json
@@ -39,15 +44,21 @@ from sglang.srt.weg2.front_tokens import TokenSpans
 FIX = pathlib.Path(__file__).with_name("fixtures") / "front_span_49" / "w109290020_events.json"
 
 
-def replay(anchor_on: bool):
+def replay(anchor_on: bool, publish_on: bool = False):
     ev = json.loads(FIX.read_text())["events"]
     ts = TokenSpans(agent_span=True)
     ids, order, fresh = {}, [], [10_000_000]
-    epoch, awake = 0, "D"
-    p1 = {}
-    out = {}
-    anchor_t = {}
+    epoch, awake, flipping = 0, "D", False
+    p1, out, anchor_t = {}, {}, {}
     src_of, fc_t, d2_t = {}, {}, {}
+    # when each LONG route leaves the queue for P: the first D->P flip done after its price
+    dp_done = [e["t"] for e in ev if e["k"] == "flip" and e["awake"] == "P"]
+
+    def dispatch_t(t):
+        for d in dp_done:
+            if d > t:
+                return d
+        return 1e18
 
     def new_ids(tokens, reused):
         src = None
@@ -68,21 +79,44 @@ def replay(anchor_on: bool):
         fresh[0] += n
         return np.concatenate([head, tail])
 
+    def price_epoch():
+        # the router's rule: a held (#49) credit only while D is awake AND serving
+        return epoch if (awake == "D" and not flipping) else None
+
+    def reprice(t, why):
+        # _x_exact_reprice_queue re-prices a queued LONG (routing flags unchanged); it reaches D only
+        # through the short drain (_d_short_drain), i.e. while D is awake and serving -- a reprice at
+        # a D->P flip done moves nothing (P is awake and takes the queue)
+        if not (awake == "D" and not flipping):
+            return
+        for rid, o in out.items():
+            if o.get("long_now") and o["t"] < t < o["dispatch"]:
+                pend, credit, _k, _s = ts.pending(ids[rid], epoch=price_epoch())
+                if pend <= o["X"]:
+                    o.update(pending=pend, credit=credit, long_now=False, moved_by=why)
+
     for e in ev:
         k = e["k"]
-        if k == "flip":
-            epoch, awake = e["epoch"], e["awake"]
+        if k == "flip_begin":
+            flipping = True
+        elif k == "flip":
+            epoch, awake, flipping = e["epoch"], e["awake"], False
+            if publish_on and awake == "P":
+                if ts.promote_published(epoch)[0]:
+                    reprice(e["t"] - 1e-3, "d_epoch_publish")   # before the controller dispatches to P
         elif k == "price":
             rid = e["rid"]
             if rid not in ids:
                 ids[rid] = new_ids(e["tokens"], e["reused"])
                 src_of[rid] = new_ids.src
                 order.append(rid)
-            pend, credit, _known, _src = ts.pending(ids[rid], epoch=epoch if awake == "D" else None)
-            out[rid] = {"pending": pend, "credit": credit, "t": e["t"], "log_credit": e["credit"]}
+            pend, credit, _known, _src = ts.pending(ids[rid], epoch=price_epoch())
+            out[rid] = {"pending": pend, "credit": credit, "t": e["t"], "log_credit": e["credit"],
+                        "dispatch": dispatch_t(e["t"])}
         elif k == "route":
-            if e["rid"] in out:
-                out[e["rid"]].update(X=e["X"], log_verdict=e["verdict"])
+            o = out.get(e["rid"])
+            if o is not None:
+                o.update(X=e["X"], log_verdict=e["verdict"], long_now=o["pending"] > e["X"])
         elif k == "p1":
             p1[e["rid"]] = (e["pt"], e["ct"])
         elif k == "fc" and e["rid"] in ids:
@@ -92,13 +126,14 @@ def replay(anchor_on: bool):
             elif e["via"] == "after_p" and anchor_on and e["rid"] in p1:
                 if ts.record_store_anchor(ids[e["rid"]], p1[e["rid"]][0]) > 0:
                     anchor_t[e["rid"]] = e["t"]
+                    reprice(e["t"], "p_anchor")
         elif k == "d2" and e["rid"] in ids:
             d2_t[e["rid"]] = e["t"]
             held = e["status"] == 200 and e["priced"] and e["verdict"] != "reroute"
             ts.record_presence(ids[e["rid"]], e["ct"], prompt_tokens=e["pt"],
                                held_epoch=e["epoch"] if held else None, resumable_depth=e["depth"])
     for rid, o in out.items():
-        o["long"] = "X" in o and o["pending"] > o["X"]
+        o["long"] = bool(o.get("long_now"))
         o["p1"] = p1.get(rid)
         s = src_of.get(rid)
         # the source was on D (first content given, leg 2 not yet finished) when this text was priced:
@@ -129,7 +164,7 @@ def test_off_is_todays_code_and_already_below_the_log(off):
     log_long = sum(1 for v in r.values() if v["log_verdict"] == "long")
     model_long = sum(1 for v in r.values() if v["long"])
     assert log_long == 94 and len(r) == 182
-    assert model_long <= log_long
+    assert model_long <= 62, model_long
     # OFF never routes SHORT what P then had to prefill over X (the measured side of #1324)
     assert [x for x, v in r.items() if not v["long"] and v["p1"] and v["p1"][0] - v["p1"][1] > v["X"]] == []
 
@@ -139,7 +174,7 @@ def test_on_moves_turns_to_d_and_never_over_credits(off, on):
     r_off, r_on = _routed(off), _routed(o_on)
     moved = [rid for rid in r_on if r_off[rid]["long"] and not r_on[rid]["long"]]
     back = [rid for rid in r_on if not r_off[rid]["long"] and r_on[rid]["long"]]
-    assert len(moved) >= 12, len(moved)
+    assert len(moved) >= 18, len(moved)
     assert back == []
     for rid in moved:
         v = r_on[rid]
@@ -156,7 +191,9 @@ def test_credit_only_after_the_witness(on):
     o_on, anchor_t = on
     assert anchor_t, "no P-anchor presence recorded"
     first = min(anchor_t.values())
-    early = [r for r, v in o_on.items() if v["t"] < first and v["credit"] > 0 and v["log_credit"] == 0]
+    # a turn priced before the first witness may carry a credit only if a later witness repriced it
+    early = [r for r, v in o_on.items() if v["t"] < first and v["credit"] > 0 and v["log_credit"] == 0
+             and v.get("moved_by") is None]
     assert early == []
 
 
@@ -164,3 +201,29 @@ def test_never_past_the_own_prompt(on):
     o_on, _ = on
     for rid, v in o_on.items():
         assert v["pending"] >= 0 and v["credit"] >= 0
+
+
+@pytest.fixture(scope="module")
+def on_l2():
+    return replay(True, True)[0]
+
+
+@pytest.fixture(scope="module")
+def l2_only():
+    return replay(False, True)[0]
+
+
+def test_l2_publish_presence_on_this_trace(off, on, on_l2, l2_only):
+    """#49 L2 (D-epoch publish presence): the texts D served in an ended epoch credit their #59 depth
+    once D's sleep leg published them. On w109290020 it moves 3 turns alone (weg2-15-18, 27-27, 90-99:
+    priced after the promotion) and NOTHING on top of L1 -- K1 already covers them, and the 7
+    DDIRECT_GAP turns of front_route_gap were priced DURING the D->P flip that was already under way
+    (state flipping: no held credit, no witness yet); their LONG route costs no extra flip, since the
+    flip happened anyway. None moves back in either arm."""
+    o_l1, _ = on
+    r0, r1, r12, r2 = _routed(off), _routed(o_l1), _routed(on_l2), _routed(l2_only)
+    alone = [rid for rid in r2 if r0[rid]["long"] and not r2[rid]["long"]]
+    assert len(alone) >= 3, alone
+    assert [rid for rid in r2 if not r0[rid]["long"] and r2[rid]["long"]] == []
+    assert [rid for rid in r12 if not r1[rid]["long"] and r12[rid]["long"]] == []
+    assert sum(v["long"] for v in r12.values()) <= sum(v["long"] for v in r1.values())

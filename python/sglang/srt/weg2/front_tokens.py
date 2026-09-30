@@ -391,6 +391,10 @@ class TokenSpans:
         # until D confirms it afresh. Beside ``entries``, its tuple unchanged.
         self.seq = 0
         self.entry_seq: Dict[str, int] = {}
+        #: #49 L2: key -> the depth D's sleep leg PUBLISHED for that text (its #59 depth at the serve),
+        #: beside the entry, never folded into its measured ``ct``: a published depth past a later
+        #: text's divergence must not erase the lower measured anchor that lies on the shared path.
+        self.published: Dict[str, int] = {}
 
     @staticmethod
     def _key(ids: np.ndarray) -> str:
@@ -417,6 +421,9 @@ class TokenSpans:
         key = self._key(ids)
         self.entries.pop(key, None)
         self.depth_caps.pop(key, None)
+        # #49 L2: a NEW D reading of this text supersedes its published depth -- a W31 refusal's small
+        # cached_tokens retracts an over-credit here, D itself being the witness
+        self.published.pop(key, None)
         if not self.agent_span:
             prompt_tokens, held_epoch = 0, None
         ct = max(0, int(cached_tokens))
@@ -479,6 +486,33 @@ class TokenSpans:
         self._stamp(key)
         return anchor
 
+    def promote_published(self, before_epoch: int) -> Tuple[int, int]:
+        """#49 L2 (switch SGLANG_WEG2_ENABLE_D_EPOCH_PUBLISH_PRESENCE): D slept -- its sleep leg drained
+        its HiCache writes, published the rest (#1470) and joined the store queue (#1470b) before the
+        kv pause -- so a text D SERVED in an epoch before ``before_epoch`` (its #49 held credit, gone
+        with that epoch) is now a STORE presence, but only to the depth D itself witnessed: the #59
+        ``weg2_resumable_depth`` of that serve (the anchor its next admission resumes from), never the
+        prompt. An entry without a #59 depth has no witnessed depth and is left as it is (its measured
+        arrival reading). The depth is kept in :attr:`published` BESIDE the entry (not folded into
+        its ``ct``): :meth:`pending` credits it only where it lies on the new text's shared path, and
+        the entry's own measured anchor stays for a text that diverges earlier. Returns ``(entries promoted, tokens credited beyond their
+        old measured reading)``. A later D reading below it (a W31 refusal's small ``cached_tokens``)
+        replaces the entry in :meth:`record_presence`, so an over-credit is retracted by D itself."""
+        n = gained = 0
+        for key in list(self.entries.keys()):
+            ids, ct, pt, held = self.entries[key]
+            if held is None or int(held) >= int(before_epoch):
+                continue
+            cap = self.depth_caps.get(key)
+            if cap is None or int(cap) <= 0:
+                continue
+            depth = min(int(cap), int(pt), int(ids.size))
+            if depth > int(ct) and depth > int(self.published.get(key, 0)):
+                gained += depth - max(int(ct), int(self.published.get(key, 0)))
+                self.published[key] = depth
+                n += 1
+        return n, gained
+
     def _stamp(self, key: str) -> None:
         self.seq += 1
         self.entry_seq[key] = self.seq
@@ -488,6 +522,7 @@ class TokenSpans:
         while len(self.entries) > self.cap:
             old_key, _ = self.entries.popitem(last=False)
             self.depth_caps.pop(old_key, None)
+            self.published.pop(old_key, None)
             self.entry_seq.pop(old_key, None)
 
     def record_inflight(self, ids: Optional[np.ndarray], held_epoch: Optional[int]) -> None:
@@ -542,6 +577,9 @@ class TokenSpans:
                 continue
             known = True
             credit = divergence_credit(raw, ct, cap, lcp)
+            pub = self.published.get(key)
+            if pub is not None and credit < int(pub) <= lcp:
+                credit = int(pub)  # #49 L2: the published anchor, only where it lies on the shared path
             if credit > best:
                 best = credit
                 src = "d_served_epoch" if held and credit > ct else "d_leg2_cached"

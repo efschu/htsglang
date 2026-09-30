@@ -5858,6 +5858,25 @@ class Front:
         self._x_exact_reprice_queue("p_anchor")
         return anchor
 
+    def _d_epoch_publish_presence(self, done_epoch: int) -> int:
+        """#49 L2 (switch SGLANG_WEG2_ENABLE_D_EPOCH_PUBLISH_PRESENCE): D has just slept -- its sleep
+        leg published its tree and joined the store queue -- so the texts it served in the epochs
+        before ``done_epoch`` are store presences to the depth D witnessed for each (#59), see
+        ``TokenSpans.promote_published``. X-EXACT spans only (the char path keeps its old credit).
+        Returns the entries promoted."""
+        if not envs.SGLANG_WEG2_ENABLE_D_EPOCH_PUBLISH_PRESENCE.get() or not self.x_exact or self.tspans is None:
+            return 0
+        n, gained = self.tspans.promote_published(done_epoch)
+        self.counters["d_epoch_publish_presence"] += n
+        self.counters["d_epoch_publish_presence_tokens"] += gained
+        if n:
+            logger.info("WEG2 D-EPOCH-PUBLISH-PRESENCE epoch=%d entries=%d tokens=%d (D slept: its sleep leg "
+                        "published its tree and joined the store queue; each text D served before this "
+                        "epoch now credits the #59 depth D witnessed for it, never its prompt; a later D "
+                        "reading below it retracts it)", done_epoch, n, gained)
+            self._x_exact_reprice_queue("d_epoch_publish")
+        return n
+
     def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
                         held_epoch: Optional[int], resumable_depth: Optional[int] = None) -> None:
         """D leg 2 finished: feed the token spans with D's MEASURED reading and
@@ -10316,6 +10335,7 @@ class Front:
         self._flip_cushion_close()
         if src == "D" and dst == "P":
             self._dp_report(t_flip0, _dp_drain_end)
+            self._d_epoch_publish_presence(int(rec["epoch"]))
 
     # ---------------- R28: D->P wait instrument ----------------
     def _dp_mark(self, p: Pending, origin: str) -> None:
