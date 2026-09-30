@@ -4073,7 +4073,8 @@ class Front:
         # 27B flipfast: read ONCE, like every other front switch; the startup
         # line names all three (flipfast_line), so a boot's log says which ran.
         self._kick_on: Dict[str, bool] = {
-            why: _env_switch_on(env) for why, env in CTL_KICK_REASONS.items()}
+            # LS12 rest (30.09.): unset/blank takes the registry row (qwen27b front_ctl_kick on)
+            why: _env_switch_on_or_profile(env) for why, env in CTL_KICK_REASONS.items()}
         self._dc_off_path = _env_switch_on_or_profile(DC_OFF_PATH_ENV)
         # The kick event is created lazily in the running loop (_ctl_evt), so a
         # Front built outside a loop -- the unit tests, main() -- binds nothing.

@@ -79,7 +79,14 @@ VERIFY_LOCAL_VOCAB_ENV = "SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX"
 def verify_local_vocab_requested() -> bool:
     import os
 
-    return os.environ.get(VERIFY_LOCAL_VOCAB_ENV, "") == "1"
+    raw = str(os.environ.get(VERIFY_LOCAL_VOCAB_ENV, "") or "").strip()
+    if raw:
+        return raw == "1"
+    # LS12 rest (30.09.): unset/blank takes the published form's registry row (qwen27b
+    # d_verify_vocab_argmax on, hauenh 'DFLASH-VERIFY-VOCAB-ARGMAX armed' 3/3); off without a form.
+    from sglang.srt.weg2.form import profile_switch_default
+
+    return bool(profile_switch_default(VERIFY_LOCAL_VOCAB_ENV, False))
 
 
 _VERIFY_LOCAL_VOCAB_SEEN: set = set()

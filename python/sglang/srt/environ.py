@@ -377,7 +377,18 @@ class Envs:
     # allocator peak straight from torch's nested stats dict instead of the
     # flattened memory_stats() -- the same number without the Python flatten
     # (~0.7 ms per DFLASH round on D). Off = torch.cuda.max_memory_allocated().
-    SGLANG_VRAM_PEAK_FAST_READ = EnvBool(False)
+    # LS12 rest (30.09.): default = the published form's row (ModelProfile.vram_peak_fast_read,
+    # qwen27b on); off without a form; an explicit value wins.
+    SGLANG_VRAM_PEAK_FAST_READ = EnvBool(_profile_default("SGLANG_VRAM_PEAK_FAST_READ", False))
+    # LS12 rest (30.09.): the profile-default contract entries (UNIFY S2) of the switches whose
+    # readers parse the environment themselves and ask the same registry when unset/blank:
+    # logits_processor.verify_local_vocab_requested, arena_pool.load_index_async,
+    # unified_radix_cache._hicache_drain_agree_every, front._env_switch_on_or_profile (kicks).
+    SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX = EnvBool(_profile_default("SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX", False))
+    SGLANG_HICACHE_LOAD_ASYNC_INDEX = EnvBool(_profile_default("SGLANG_HICACHE_LOAD_ASYNC_INDEX", False))
+    SGLANG_HICACHE_DRAIN_AGREE_EVERY = EnvInt(_profile_default("SGLANG_HICACHE_DRAIN_AGREE_EVERY", 1))
+    SGLANG_WEG2_CTL_KICK_ARRIVAL = EnvBool(_profile_default("SGLANG_WEG2_CTL_KICK_ARRIVAL", False))
+    SGLANG_WEG2_CTL_KICK_AFTER_FLIP = EnvBool(_profile_default("SGLANG_WEG2_CTL_KICK_AFTER_FLIP", False))
     # INT8 W8A8 small-M GEMM on sm_120 (27b-int8tri 26.09.): route
     # CompressedTensorsW8A8Int8.apply_weights through the Triton kernel with
     # exact int32 split-K (layers/quantization/int8_sm120_triton.py) when the
@@ -1835,7 +1846,10 @@ class Envs:
     # forced-admission recovery attempt for that episode. See
     # ADMISSION_WEDGE_RECOVERY_SECONDS in invariant_checker.py for the
     # default's derivation and rationale.
-    SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS = EnvFloat(-1)
+    # LS12 rest (30.09.): default = the published form's row (ModelProfile.admission_wedge_recovery_s,
+    # qwen27b 2.0 s); -1 (the 60 s default) without a form; an explicit value wins.
+    SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS = EnvFloat(
+        _profile_default("SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS", -1.0))
 
     # #788: per-rank admission-verdict trace. OFF by default -- it exists to
     # convert a MECHANISM proof into a captured value on one instrumented

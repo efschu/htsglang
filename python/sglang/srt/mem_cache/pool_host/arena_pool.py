@@ -992,8 +992,15 @@ def load_index_async() -> bool:
     the thread never waits on the load stream. The copies are the same bytes
     into the same rows in the same stream order; only the host wait is gone.
     """
-    on = str(os.environ.get("SGLANG_HICACHE_LOAD_ASYNC_INDEX", "0")).strip().lower() in (
-        "1", "true", "yes", "on")
+    raw = str(os.environ.get("SGLANG_HICACHE_LOAD_ASYNC_INDEX", "") or "").strip().lower()
+    if raw:
+        on = raw in ("1", "true", "yes", "on")
+    else:
+        # LS12 rest (30.09.): unset/blank takes the published form's registry row
+        # (qwen27b hicache_load_async_index on, hauenh 'HICACHE-LOAD-ASYNC-INDEX armed' 3/3).
+        from sglang.srt.weg2.form import profile_switch_default
+
+        on = bool(profile_switch_default("SGLANG_HICACHE_LOAD_ASYNC_INDEX", False))
     if on and not _LOAD_ASYNC_INDEX_SEEN:
         # LS12 (30.09.): the metal proof -- one line per process at the first
         # load-back that takes the async index path. Off: no line.

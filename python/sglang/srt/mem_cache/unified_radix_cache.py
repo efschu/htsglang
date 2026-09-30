@@ -711,9 +711,29 @@ def _hicache_drain_agree_every() -> int:
     so a D decode round does not carry a cross-rank CPU collective for queues
     that are empty. See `UnifiedRadixCache._gated_drain_storage_control_queues`.
     """
+    raw = str(os.environ.get("SGLANG_HICACHE_DRAIN_AGREE_EVERY", "") or "").strip()
+    if not raw:
+        # LS12 rest (30.09.): unset/blank takes the published form's registry row
+        # (qwen27b hicache_drain_agree_every 8; nextflash 1 = every round). Rank-
+        # uniform: every rank of a group reads the same published form.
+        return _drain_agree_every_profile(str(os.environ.get("SGLANG_WEG2_FORM", "") or ""))
     try:
-        return max(1, int(os.environ.get("SGLANG_HICACHE_DRAIN_AGREE_EVERY", "1")))
+        return max(1, int(raw))
     except ValueError:
+        return 1
+
+
+@functools.lru_cache(maxsize=8)
+def _drain_agree_every_profile(form_env: str) -> int:
+    """The registry row's SGLANG_HICACHE_DRAIN_AGREE_EVERY for a published form string, cached per
+    form (the reader sits on the D decode round)."""
+    if not form_env:
+        return 1
+    from sglang.srt.weg2.form import FORM_ENV, profile_switch_default
+
+    try:
+        return max(1, int(profile_switch_default("SGLANG_HICACHE_DRAIN_AGREE_EVERY", 1, {FORM_ENV: form_env})))
+    except (TypeError, ValueError):
         return 1
 
 

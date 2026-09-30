@@ -599,6 +599,24 @@ class ModelProfile:
     d_dcp_lse_merge: str = "ar"
     #: --p-host-overlap -- '#PGAP ... overlap=1' 756/756 forwards.
     p_host_overlap: bool = False
+    #: LS12 rest (30.09., metal proof hauenh dkr27browauthorityls12bar1fs09301342, image z30y5r @
+    #: b43c19ef1a with the LS12 markers: 15/15, needle MATCH, group death 0, watchdog 0, 0 tracebacks;
+    #: check_ls12.py ALL 12 GRUEN). The six whose effect had no log line before da8464b9f0:
+    #: SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX -- 'DFLASH-VERIFY-VOCAB-ARGMAX armed' 3/3, argmax rounds 512.
+    d_verify_vocab_argmax: bool = False
+    #: SGLANG_VRAM_PEAK_FAST_READ -- 'VRAM-PEAK-FAST-READ armed' P 3 / D 3, fallback 0.
+    vram_peak_fast_read: bool = False
+    #: SGLANG_HICACHE_LOAD_ASYNC_INDEX -- 'HICACHE-LOAD-ASYNC-INDEX armed' 3, START-LOADING mamba.idx
+    #: max 0 ms; with its twin SGLANG_HICACHE_DRAIN_AGREE_EVERY ('HICACHE-DRAIN-GATE every=8' 3), the
+    #: inventory's one row. 0 / 1 = the code default.
+    hicache_load_async_index: bool = False
+    hicache_drain_agree_every: int = 1
+    #: SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS -- 'ADMISSION-WEDGE recovery armed after 2.0s' 6,
+    #: RECOVERY 0, wrapper failed 0 (acts only on a wedge). -1 = the code default (60 s).
+    admission_wedge_recovery_s: float = -1.0
+    #: SGLANG_WEG2_CTL_KICK_ARRIVAL / _AFTER_FLIP -- 'WEG2-FLIPFAST kick why=arrival' 4,
+    #: 'why=after_flip' 3 (the controller woke before its 0.2 s tick).
+    front_ctl_kick: bool = False
     #: --p-prefill-graph TOKENS on the checkpoint formats listed in
     #: ``p_prefill_graph_formats`` -- 'PREFILL-GRAPH captured backend=full'
     #: 3/3 PP stages. 0 = off (the code default). GGUF runs without it (27b-
@@ -649,6 +667,14 @@ class ModelProfile:
         out["SGLANG_WEG2_DC_OFF_PATH"] = bool(self.front_dc_off_path)
         out["SGLANG_WEG2_QUIESCE_FAST"] = bool(self.front_quiesce_fast)
         out["SGLANG_DCP_LSE_MERGE"] = str(self.d_dcp_lse_merge)
+        # LS12 rest (30.09.): the six with a metal marker since da8464b9f0.
+        out["SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX"] = bool(self.d_verify_vocab_argmax)
+        out["SGLANG_VRAM_PEAK_FAST_READ"] = bool(self.vram_peak_fast_read)
+        out["SGLANG_HICACHE_LOAD_ASYNC_INDEX"] = bool(self.hicache_load_async_index)
+        out["SGLANG_HICACHE_DRAIN_AGREE_EVERY"] = int(self.hicache_drain_agree_every)
+        out["SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS"] = float(self.admission_wedge_recovery_s)
+        out["SGLANG_WEG2_CTL_KICK_ARRIVAL"] = bool(self.front_ctl_kick)
+        out["SGLANG_WEG2_CTL_KICK_AFTER_FLIP"] = bool(self.front_ctl_kick)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -838,6 +864,14 @@ PROFILES: Dict[str, ModelProfile] = {
         p_host_overlap=True,
         p_prefill_graph=512,
         p_prefill_graph_formats=("int8", "nvfp4", "fp8"),
+        # LS12 rest (30.09.): proven on metal in hauenh dkr27browauthorityls12bar1fs09301342 -- see
+        # the fields.
+        d_verify_vocab_argmax=True,
+        vram_peak_fast_read=True,
+        hicache_load_async_index=True,
+        hicache_drain_agree_every=8,
+        admission_wedge_recovery_s=2.0,
+        front_ctl_kick=True,
         # row 24b: bandwidth on INT8 only (rc9meas -1.1 ... -3.1 % in depth).
         # --d-reshard stays off (wake-seg + drq: gain at 6 of 24 points, the
         # drq preset has no A/B of its own -- inventory class b).
@@ -999,6 +1033,8 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: :data:`RELEASE_FIX_SWITCHES` (``d_release_fixes``, 27B bug fixes, on 30.09.).
 #: SGLANG_WEG2_DC_OFF_PATH / SGLANG_WEG2_QUIESCE_FAST / SGLANG_DCP_LSE_MERGE
 #: (``front_dc_off_path`` / ``front_quiesce_fast`` / ``d_dcp_lse_merge``, LS6 30.09.).
+#: VERIFY_VOCAB_ARGMAX / VRAM_PEAK_FAST_READ / LOAD_ASYNC_INDEX + DRAIN_AGREE_EVERY /
+#: ADMISSION_WEDGE_RECOVERY_SECONDS / CTL_KICK_ARRIVAL + _AFTER_FLIP (LS12 rest 30.09.).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }
