@@ -420,7 +420,9 @@ def _riegel_case(attr, value, caplog):
 
 def test_riegel_flip_park_holds_the_shrink(caplog):
     ctl, calls, held = _riegel_case("weg2_d_parked", [object()], caplog)
-    assert ctl.calls == [] and calls == [] and len(held) == 1 and "why=flip_park" in held[0]
+    # RIEGEL AS A VOTE (30.09.): the rank still enters the collective, voting no
+    assert ctl.calls == [] and len(held) == 1 and "why=flip_park" in held[0]
+    assert calls and all(not c[0] for c in calls)
 
 
 def test_riegel_dormant_hold_holds_the_shrink(caplog):

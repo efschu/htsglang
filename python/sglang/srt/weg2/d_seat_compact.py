@@ -162,6 +162,13 @@ class TreeView:
         else:
             node.mamba_value = nv
 
+    def set_value(self, node: Any, value: Any) -> None:
+        """Put ``value`` (the node's original tensor) back -- the rollback of repoint."""
+        if self.kind == "unified":
+            node.component_data[self.ct].value = value
+        else:
+            node.mamba_value = value
+
     def evict_device(self, node: Any) -> int:
         """Tombstone the node's DEVICE state only (its KV and host copy stay);
         the slot goes back to the allocator. Returns the slots freed."""
@@ -266,11 +273,31 @@ def execute(cache: Any, allocator: Any, view: TreeView, plan: Plan) -> Result:
         except Exception as exc:  # noqa: BLE001 -- nothing re-pointed yet: the destinations go back
             allocator.free(dst_all)
             raise CompactRefused("copy failed before any node moved: %s: %s" % (type(exc).__name__, exc)) from exc
+        # TRANSACTIONAL (qwen review of 48345d52ca, NF-Operator 30.09.): a
+        # repoint that raises mid-loop must not leave some nodes on their new
+        # slot and every destination claimed. The nodes already re-pointed go
+        # back to their ORIGINAL value (the same tensor object), the #928
+        # ledger entries go back, all destinations are freed -- then refused.
+        # The sources are freed only after every node moved.
         ledger = getattr(cache, "_mamba_anchor_pool", None)
-        for a, d in plan.moves:
-            view.repoint(a.node, d)
-            if isinstance(ledger, dict) and int(a.slot) in ledger:
-                ledger[int(d)] = ledger.pop(int(a.slot))
+        done = []  # (node, original value, ledger move (src, dst) or None)
+        try:
+            for a, d in plan.moves:
+                orig = view._value(a.node)
+                view.repoint(a.node, d)
+                moved_ledger = None
+                if isinstance(ledger, dict) and int(a.slot) in ledger:
+                    ledger[int(d)] = ledger.pop(int(a.slot))
+                    moved_ledger = (int(a.slot), int(d))
+                done.append((a.node, orig, moved_ledger))
+        except Exception as exc:  # noqa: BLE001 -- roll back, then refuse by name
+            for node, orig, mv in reversed(done):
+                view.set_value(node, orig)
+                if mv is not None and isinstance(ledger, dict) and mv[1] in ledger:
+                    ledger[mv[0]] = ledger.pop(mv[1])
+            allocator.free(dst_all)
+            raise CompactRefused("repoint failed after %d of %d nodes (rolled back, destinations freed): "
+                                 "%s: %s" % (len(done), len(plan.moves), type(exc).__name__, exc)) from exc
         allocator.free(torch.tensor([int(a.slot) for a, _d in plan.moves], dtype=torch.int64, device=dev))
     evicted = 0
     for a in plan.evicts:

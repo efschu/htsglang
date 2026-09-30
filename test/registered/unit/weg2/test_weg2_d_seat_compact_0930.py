@@ -322,7 +322,9 @@ def test_the_riegel_hold_the_compaction_too():
         s, calls = _sched(cache, pool)
         setattr(s, attr, value)
         _idle(s, ctl, R.IDLE_ASK_ROUNDS * 2, [1000.0])
-        assert calls == [] and ctl.calls == [], attr
+        # RIEGEL AS A VOTE (30.09.): the collective is entered, the due flag is no
+        # (a chunk makes the trigger round: 32 rounds, maybe not asked yet)
+        assert all(not c[0] for c in calls) and ctl.calls == [], attr
         assert sorted(int(nd.component_data[MC].value[0]) for nd in nodes.values()) == [10, 20], attr
 
 

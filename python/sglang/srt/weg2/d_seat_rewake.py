@@ -399,15 +399,24 @@ def tick(sched: Any) -> Optional[str]:
     # iterates (IdleSleeper polls <= 50 ms), and no decode waits for the pause.
     # Never while a sleep, a flip or a wake is under way or a request is being
     # admitted (the remap must not race them): the RIEGEL, named.
+    #
+    # RIEGEL AS A VOTE (qwen review of 48345d52ca, NF-Operator 30.09.): an
+    # early return here is safe only if every riegel reads replicated inputs.
+    # Not all do provably (dormant_hold is filled at intake behind a switch the
+    # launcher's env sets per rank; the settle list keeps a cap-wait part), and
+    # an early return that one rank takes and another does not splits the ask
+    # rhythm and leaves the others in the group MIN. So the riegel no longer
+    # returns: the rhythm counts only replicated terms, the riegel votes NO in
+    # the one collective (every rank sees nothing move while ANY rank holds),
+    # and its name is logged after it. The price clock restarts locally while
+    # the riegel holds (a shrink is due only past the price after it clears).
     riegel = idle_riegel(sched, st)
-    if riegel is not None:
-        _note_held(sched, rs, st, riegel, n, down)
-        rs.idle_since, rs.idle_rounds = None, 0
-        return None
     trigger = TRIGGER_IDLE if not running else TRIGGER_ROUND
     now = time.monotonic()
     if rs.idle_since is None or rs.trigger != trigger:
         rs.idle_since, rs.idle_rounds, rs.trigger = now, 0, trigger
+    if riegel is not None:
+        rs.idle_since = now
     rs.idle_rounds += 1
     if rs.idle_rounds % (IDLE_ASK_ROUNDS if trigger == TRIGGER_IDLE else SHRINK_ASK_ROUNDS):
         return None
@@ -443,7 +452,7 @@ def tick(sched: Any) -> Optional[str]:
     # collective below, never an early return (KEIL).
     idle = trigger == TRIGGER_IDLE
     sv = view = None
-    if idle and ledger_ok and fit > down:
+    if idle and ledger_ok and fit > down and riegel is None:
         sv, view, cwhy = _compact_survey(sched, rs, st, allocator, size, cap, down, n, fit)
         if cwhy is not None:
             local_why = cwhy
@@ -457,11 +466,13 @@ def tick(sched: Any) -> Optional[str]:
     idle_s = now - rs.idle_since
     rs.counters["shrink_asked"] += 1
     # the vote: due, per n' "I reach it", and (idle) per n' "without a move"
-    flags = [shrink_due(idle_s, price)] + reach
+    flags = [shrink_due(idle_s, price) and riegel is None] + reach
     if idle:
         flags += [m >= fit and ledger_ok for m in seats]
     mins = _group_min(sched, flags)
-    if local_why is not None and (not any(reach) or local_why.startswith("compact_survey_failed")):
+    if riegel is not None:
+        _note_held(sched, rs, st, riegel, n, down)
+    elif local_why is not None and (not any(reach) or local_why.startswith("compact_survey_failed")):
         _note_held(sched, rs, st, local_why, n, down)
     if not bool(mins[0]):
         return None
