@@ -872,7 +872,9 @@ OWNED_MISS_MS_SOURCE_SEED = "Saat UNMEASURED (plan_s3_251 §1, H29/x138)"
 #:
 #: * RECORD -- written by the D RANKS themselves at their sleep
 #:   (``layers.moe.pool_miss_cost``, ``SGLANG_WEG2_OWNED_MISS_RECORD=<dir>``):
-#:   pool.fetch device ms / missed rows of every pool layer, per rank;
+#:   PR (30.09.): per timed prefill forward, its pool.fetch device ms / the
+#:   rows the SAME forward missed (``pairing`` = OWNED_MISS_PAIRING), counted
+#:   only from OWNED_MISS_MIN_PAIRED_FORWARDS paired forwards per rank;
 #: * LOG-BOOTSTRAP -- ``weg2.tools.owned_miss_record`` from one D log, the
 #:   TRANSITION ("aus Log (Uebergang)") until the first rank record exists;
 #:   it ranks under every rank record and is dropped once one is there;
@@ -965,28 +967,60 @@ def _owned_miss_model_ok(model: Optional[str], entry_model: object) -> bool:
     return mine is not None and mine == theirs
 
 
-def owned_miss_from_rank_records(
-    records: Sequence[Mapping[str, object]], *, host: int, model: Optional[str] = None,
-) -> Optional[Tuple[Tuple[float, float], str]]:
-    """``((host ms, worker ms), source)`` from the ranks' own records of this
-    model -- the youngest window (``OWNED_MISS_RANK_WINDOW_S``), host = the
-    attention host's rank, worker = the miss-weighted cost of the others --
-    or ``None`` when the window lacks the host or every worker."""
+#: PR (30.09.): a rank record counts only in the PAIRED form of
+#: ``layers.moe.pool_miss_cost`` (one timed prefill forward's pool.fetch ms
+#: against the rows THE SAME forward missed) -- the older scope mixed graphed
+#: decode rows into the denominator.
+OWNED_MISS_PAIRING = "prefill_window_v2"
+#: PR: RECORD beats the seed only from this many paired forwards on EVERY rank
+#: of the youngest window; fewer stay the seed, and the line names the count.
+OWNED_MISS_MIN_PAIRED_FORWARDS = 16
+
+
+def _owned_miss_paired_window(records: Sequence[Mapping[str, object]], model: Optional[str]):
     mine = []
     for r in records:
         if r.get("kind") != OWNED_MISS_RANK_KIND or not _owned_miss_model_ok(model, r.get("model")):
             continue
+        if r.get("pairing") != OWNED_MISS_PAIRING:
+            continue
         try:
             t, rank = float(r["time_unix"]), int(r["rank"])
-            fetch, rows = float(r["fetch_ms"]), int(r["miss_rows"])
+            fetch, rows, n = float(r["fetch_ms"]), int(r["miss_rows"]), int(r["rounds"])
         except (KeyError, TypeError, ValueError):
             continue
-        if fetch > 0 and rows > 0:
-            mine.append((t, rank, fetch, rows))
+        if fetch > 0 and rows > 0 and n > 0:
+            mine.append((t, rank, fetch, rows, n))
     if not mine:
-        return None
+        return []
     newest = max(t for t, *_ in mine)
-    window = [m for m in mine if m[0] >= newest - OWNED_MISS_RANK_WINDOW_S]
+    return [m for m in mine if m[0] >= newest - OWNED_MISS_RANK_WINDOW_S]
+
+
+def owned_miss_paired_counts(records: Sequence[Mapping[str, object]], *,
+                             model: Optional[str] = None) -> Dict[int, int]:
+    """PR: paired forwards per rank in the youngest window (empty = none)."""
+    out: Dict[int, int] = {}
+    for _t, rank, _f, _r, n in _owned_miss_paired_window(records, model):
+        out[rank] = out.get(rank, 0) + int(n)
+    return out
+
+
+def owned_miss_from_rank_records(
+    records: Sequence[Mapping[str, object]], *, host: int, model: Optional[str] = None,
+    min_forwards: int = OWNED_MISS_MIN_PAIRED_FORWARDS,
+) -> Optional[Tuple[Tuple[float, float], str]]:
+    """``((host ms, worker ms), source)`` from the ranks' own PAIRED records of
+    this model -- the youngest window (``OWNED_MISS_RANK_WINDOW_S``), host =
+    the attention host's rank, worker = the miss-weighted cost of the others
+    -- or ``None`` when the window lacks the host or every worker, or when a
+    rank of it has fewer than ``min_forwards`` paired forwards."""
+    window = [m[:4] for m in _owned_miss_paired_window(records, model)]
+    if not window:
+        return None
+    counts = owned_miss_paired_counts(records, model=model)
+    if any(n < int(min_forwards) for n in counts.values()):
+        return None
     hf = sum(f for _, r, f, _ in window if r == int(host))
     hr = sum(n for _, r, _, n in window if r == int(host))
     wf = sum(f for _, r, f, _ in window if r != int(host))
@@ -1015,6 +1049,9 @@ def resolve_owned_miss_ms(
     from_ranks = owned_miss_from_rank_records(rank_records, host=host, model=model)
     if from_ranks is not None:
         return from_ranks[0], OWNED_MISS_RECORD, from_ranks[1]
+    counts = owned_miss_paired_counts(rank_records, model=model)
+    young = ("; RECORD zu jung: gepaarte Forwards je Rang %s < K=%d"
+             % (dict(sorted(counts.items())), OWNED_MISS_MIN_PAIRED_FORWARDS)) if counts else ""
     best: Optional[Tuple[str, Tuple[float, float], Mapping[str, object]]] = None
     for e in records:
         if e.get("kind", OWNED_MISS_KIND) != OWNED_MISS_KIND:
@@ -1027,13 +1064,13 @@ def resolve_owned_miss_ms(
             best = (at, pair, e)
     if best is not None:
         e = best[2]
-        return best[1], OWNED_MISS_LOG_BOOTSTRAP, "%s %s (%s, %s Runden)" % (
+        return best[1], OWNED_MISS_LOG_BOOTSTRAP, "%s %s (%s, %s Runden)%s" % (
             OWNED_MISS_LOG_PROVENANCE, e.get("source") or e.get("boot_tag") or "?",
-            best[0] or "?", e.get("rounds", "?"))
+            best[0] or "?", e.get("rounds", "?"), young)
     pair = _owned_miss_pair(builtin) if builtin is not None else None
     if pair is not None:
-        return pair, OWNED_MISS_BUILTIN, "BUILTIN %s" % (builtin_source or "OWNED_MISS_MS")
-    return OWNED_MISS_MS_PER_ROW_SEED, OWNED_MISS_UNMEASURED, OWNED_MISS_MS_SOURCE_SEED
+        return pair, OWNED_MISS_BUILTIN, "BUILTIN %s%s" % (builtin_source or "OWNED_MISS_MS", young)
+    return OWNED_MISS_MS_PER_ROW_SEED, OWNED_MISS_UNMEASURED, OWNED_MISS_MS_SOURCE_SEED + young
 #: #239 S3f (main 28.09.): the ATTENTION and LSE posts of T_r, named, SEED,
 #: UNMEASURED -- without them the solve saw only expert misses and put the
 #: whole FA-KV on one worker (desk probe 524k: cut 0/64/0). Per full-attention
