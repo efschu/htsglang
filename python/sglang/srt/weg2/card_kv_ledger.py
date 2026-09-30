@@ -13,11 +13,12 @@ captured graphs keep replaying) and asks THIS ledger before every commit.
 
 Invariant I1 (checked under the lock on every commit):
     committed[P] + committed[D] <= budget
-No quota and no reserve: a request is granted from what is free; when that is
-short, the requester raises PRESSURE on the other process, which answers by
-releasing what it holds only as CACHE (evictable radix leaves), never pages
-of running work. ``arbitrate`` is the policy as a pure function; the ledger is
-the shared state it runs on.
+No quota and no reserve: a request is granted from what is free. D has
+priority: when D is short, it raises PRESSURE on P, which PAUSES its request at
+the next chunk boundary (finished chunks are in L2 already), releases its whole
+context and later resumes by reading them back; when P is short, it waits.
+``arbitrate`` is the policy as a pure function; the ledger is the shared state
+it runs on.
 
 Shared state: one small record per card in /dev/shm, updated under
 ``fcntl.flock`` (the lease/flock pattern of ``registry/ledger.py``, without its
@@ -83,16 +84,27 @@ class LedgerState:
         return self.budget - sum(self.committed.values())
 
 
-def arbitrate(need: int, free: int, other_evictable: int) -> Tuple[int, int]:
-    """The policy. ``need``: bytes the requester must commit now for running
-    or admitted work. Returns ``(grant, pressure)``: ``grant`` <= free, taken
-    at once; ``pressure`` = what the other process is asked to release from
-    its CACHE (capped by what it reports evictable -- running work is never
-    asked for). No quota, no reserve: the order of arrival decides, and a
-    request that cannot be met waits (backpressure) instead of preempting."""
-    need, free, other_evictable = max(0, int(need)), max(0, int(free)), max(0, int(other_evictable))
+def arbitrate(need: int, free: int, other_evictable: int, *, requester: str = "D",
+              other_committed: int = 0) -> Tuple[int, int]:
+    """The policy (user order 30.09. 07:25Z, verbatim: "wird vram kv knapp,
+    pausiert P und gibt den context frei und das erarbeitete in den L2 zur
+    späteren weiterverwendung wenn vram kv wieder frei wird"). ``need``: bytes
+    the requester must commit now. Returns ``(grant, pressure)``; ``grant`` <=
+    free is taken at once. No quota, no reserve.
+
+    * D asks: D has priority. The shortfall becomes pressure on P up to ALL of
+      P's committed KV -- P answers by PAUSING at its next chunk boundary (its
+      finished chunks are already in L2 by the per-chunk write-through), then
+      releasing its whole context. ``other_evictable`` is not a cap here.
+    * P asks: P never presses D. A shortfall waits (backpressure) until D's
+      demand drops; the paused request then resumes by READING its chunks
+      from L2 ("Lesen statt Rechnen")."""
+    need, free = max(0, int(need)), max(0, int(free))
     grant = min(need, free)
-    pressure = min(need - grant, other_evictable)
+    if requester == "D":
+        pressure = min(need - grant, max(0, int(other_committed)))
+    else:
+        pressure = 0
     return grant, pressure
 
 
@@ -185,7 +197,8 @@ class CardKvLedger:
         ``granted`` bytes; if ``granted < need`` the rest waits."""
         other = GROUPS[1 - self._gi]
         with self._locked() as st:
-            grant, pressure = arbitrate(need, st.free, other_evictable)
+            grant, pressure = arbitrate(need, st.free, other_evictable, requester=self.group,
+                                        other_committed=st.committed[other])
             st.committed[self.group] += grant
             st.demand[self.group] = max(0, int(need) - grant)
             st.pressure[other] = max(st.pressure[other], pressure) if pressure else st.pressure[other]

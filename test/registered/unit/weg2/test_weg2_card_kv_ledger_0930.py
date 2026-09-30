@@ -48,11 +48,13 @@ class CardKvLedger(CustomTestCase):
         self.dir = tempfile.mkdtemp(prefix="wkv")
         self.path = os.path.join(self.dir, "card")
 
-    def test_policy_no_quota_no_reserve(self):
-        self.assertEqual(K.arbitrate(100, 300, 0), (100, 0))
-        self.assertEqual(K.arbitrate(500, 300, 1000), (300, 200))
-        self.assertEqual(K.arbitrate(500, 300, 50), (300, 50))  # never more than the other's cache
-        self.assertEqual(K.arbitrate(500, 0, 0), (0, 0))
+    def test_policy_d_first_p_pauses(self):
+        # user order 07:25Z: KV short -> P pauses and frees its context; D has priority
+        self.assertEqual(K.arbitrate(100, 300, 0, requester="D", other_committed=900), (100, 0))
+        self.assertEqual(K.arbitrate(500, 300, 0, requester="D", other_committed=900), (300, 200))
+        self.assertEqual(K.arbitrate(500, 300, 0, requester="D", other_committed=50), (300, 50))
+        self.assertEqual(K.arbitrate(500, 300, 999, requester="P", other_committed=900), (300, 0))
+        self.assertEqual(K.arbitrate(500, 0, 0, requester="P"), (0, 0))
 
     def test_grant_pressure_release(self):
         d = K.CardKvLedger(self.path, "D")
@@ -60,17 +62,19 @@ class CardKvLedger(CustomTestCase):
         d.join(1000 * MIB)
         p.join(1000 * MIB)
         self.assertEqual(d.request(900 * MIB)[0], 900 * MIB)          # D takes the idle card
-        g, pr = p.request(300 * MIB, other_evictable=800 * MIB)       # P's prompt arrives
-        self.assertEqual((g, pr), (100 * MIB, 200 * MIB))
-        self.assertEqual(d.pressure_on_me(), 200 * MIB)
-        d.release(200 * MIB)                                          # D evicts cache
+        g, pr = p.request(300 * MIB)                                  # P's prompt arrives
+        self.assertEqual((g, pr), (100 * MIB, 0))                     # P never presses D: it waits
         self.assertEqual(d.pressure_on_me(), 0)
+        d.release(400 * MIB)                                          # D's seats finish
         self.assertEqual(p.request(200 * MIB)[0], 200 * MIB)
-        st = p.state()
-        self.assertEqual(st.committed, {"P": 300 * MIB, "D": 700 * MIB})
-        p.release(300 * MIB)                                          # P hands off, returns all
-        self.assertEqual(d.request(300 * MIB)[0], 300 * MIB)          # D grows back
-        self.assertEqual(d.state().committed["D"], 1000 * MIB)
+        self.assertEqual(p.state().committed, {"P": 300 * MIB, "D": 500 * MIB})
+        g, pr = d.request(400 * MIB)                                  # D needs it back: priority
+        self.assertEqual((g, pr), (200 * MIB, 200 * MIB))
+        self.assertEqual(p.pressure_on_me(), 200 * MIB)               # P pauses ...
+        p.release(300 * MIB)                                          # ... and frees its whole context
+        self.assertEqual(p.pressure_on_me(), 0)
+        self.assertEqual(d.request(200 * MIB)[0], 200 * MIB)
+        self.assertEqual(d.state().committed, {"P": 0, "D": 900 * MIB})
 
     def test_budget_disagreement_refused(self):
         K.CardKvLedger(self.path, "D").join(1000 * MIB)
