@@ -632,6 +632,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # request's sequence from, stamped with weg2_prefill_s on the finishing
     # output (managers/weg2_resumable_depth.py). -1 = absent; 0 is measured.
     weg2_resumable_depth: int = -1
+    # #49 L3 (Weg-2 P): the INNER mamba anchor depths this request's prefill donated
+    # (mamba_component._weg2_anchor_step_declines, interval anchors), stamped on the finishing
+    # output by the output streamer. () = absent.
+    weg2_anchor_depths: tuple = ()
 
     def stamp_weg2_prefill_s(self) -> None:
         if self.forward_entry_time > 0.0 and self.prefill_finished_time > 0.0:
@@ -648,6 +652,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 state["weg2_prefill_s"] = self.weg2_prefill_s
             if self.weg2_resumable_depth >= 0:
                 state["weg2_resumable_depth"] = self.weg2_resumable_depth
+            if self.weg2_anchor_depths:
+                state["weg2_anchor_depths"] = tuple(self.weg2_anchor_depths)
             return state
 
         state = {
@@ -660,6 +666,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             state["weg2_prefill_s"] = self.weg2_prefill_s
         if self.weg2_resumable_depth >= 0:
             state["weg2_resumable_depth"] = self.weg2_resumable_depth
+        if self.weg2_anchor_depths:
+            state["weg2_anchor_depths"] = tuple(self.weg2_anchor_depths)
         return state
 
     def set_scheduler_recv_time(self, ts=None):

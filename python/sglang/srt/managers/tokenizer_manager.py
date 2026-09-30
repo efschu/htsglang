@@ -2353,6 +2353,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if resumable is not None:
                         meta_info[weg2_resumable_depth.FIELD] = resumable
 
+                # #49 L3 (Weg-2 P): the inner anchor depths the prefill donated (P's leg 1).
+                if recv_obj.time_stats is not None:
+                    _ad = getattr(recv_obj.time_stats[i], "weg2_anchor_depths", None)
+                    if _ad:
+                        meta_info["weg2_anchor_depths"] = [int(a) for a in _ad]
+
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
                 if self.enable_metrics:

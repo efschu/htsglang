@@ -155,6 +155,12 @@ class SchedulerOutputStreamer:
             # finishing outputs (the finish's insert already ran).
             weg2_resumable_depth.stamp_stream(self.tree_cache, reqs, skip_req, self.ps)
         for req in reqs:
+            # #49 L3 (Weg-2 P): the inner anchor depths this request donated ride its finishing
+            # output (only a group that spaces anchors -- SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL -- has any).
+            _ad = getattr(req, "_weg2_anchor_depths", None)
+            if _ad and req is not skip_req and req.finished() and getattr(req, "time_stats", None) is not None:
+                req.time_stats.weg2_anchor_depths = tuple(int(a) for a in _ad)
+        for req in reqs:
             if req is skip_req:
                 continue
             if req.finished() and req.finished_output:

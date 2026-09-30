@@ -239,11 +239,13 @@ def _sglext_of(openai_obj) -> Optional[AnthropicSglExt]:
     depth = _resumable_depth(openai_obj)
     ext = getattr(openai_obj, "sglext", None)
     details = getattr(ext, "cached_tokens_details", None) if ext is not None else None
-    if depth is None and details is None:
+    anchors = getattr(ext, "weg2_anchor_depths", None) if ext is not None else None
+    if depth is None and details is None and not anchors:
         return None
     return AnthropicSglExt(
         weg2_resumable_depth=depth,
         cached_tokens_details=details.model_dump() if details is not None else None,
+        weg2_anchor_depths=list(anchors) if anchors else None,
     )
 
 

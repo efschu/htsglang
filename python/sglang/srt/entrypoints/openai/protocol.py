@@ -523,6 +523,9 @@ class SglExt(BaseModel):
     # weg2_resumable_depth); the front caps its presence credit there. 0 is a
     # measured "nothing resumable" and is sent.
     weg2_resumable_depth: Optional[int] = None
+    # #49 L3: the inner mamba anchor depths a Weg-2 P prefill donated (meta_info
+    # weg2_anchor_depths), read by the front on P's leg 1.
+    weg2_anchor_depths: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
