@@ -3063,6 +3063,12 @@ class Envs:
     # same forward) and inserts it as its own anchor -- where the next turn
     # and a client's side request fork. Unset/None = every path byte-identical.
     SGLANG_WEG2_TURN_ANCHOR_TOKEN = EnvInt(None)
+    # TWIN ANCHOR (weg2/twin_anchor.py, 30.09., NF y4a weg2-16-28): where the
+    # turn anchor and the twin deferral are armed, a prefill step also tracks
+    # the state at floor_page(shared - 1) of every fork twin still queued
+    # behind the request (one more gather row, one mamba slot), and a twin
+    # waits only for a source that promised an anchor <= shared. 0 = off.
+    SGLANG_WEG2_TWIN_ANCHOR = EnvBool(True)
     # fnFL2 H42b: burst assembly on the DECIDING P rank (PP0), only while
     # multi anchor tails are armed. A pass that would carry nothing but new
     # bodies is held back up to this many ms while more of a burst is still

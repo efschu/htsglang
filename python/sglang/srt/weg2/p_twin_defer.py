@@ -55,6 +55,20 @@ THE RULE (PP0 only; switch ``SGLANG_WEG2_P_TWIN_DEFER``, default off):
      ('#TW TWIN-NO-GAIN ... at=intake'); a pass that learns ``s0`` releases
      a held one as an ordinary request ('... at=release').
 
+  5. PROMISE, NOT HOPE (30.09., NF y4a weg2-16-28 / weg2-12-19; TWIN ANCHOR,
+     weg2/twin_anchor.py): with the twin anchor armed a twin is held only
+     behind a source that PROMISED an anchor at or below ``shared``: its end
+     anchor (``end <= shared``), a chunk end (``shared - s0 >= chunk``), or
+     the twin boundary ``B = floor_page(shared - 1)`` the source tracks as an
+     extra extend track -- promised once its step holding ``B`` was planned
+     with the track (``twin_anchor.status`` planned/written), provisionally
+     while the source has not planned past ``B`` and its start can still lie
+     below it (queued: its registered head < ``B``). A source whose start is
+     past ``B``, or that planned ``B``'s step without the track, promises
+     nothing: no source with a promise -> the twin registers at once
+     ('#TW TWIN-NO-COMMIT', at=intake or at=release -- a provisional promise
+     is resolved at the source's first plan, one pass). Switch off: rule 4.
+
 RANK AGREEMENT. Nothing new is decided off PP0. A follower already holds
 every request until PP0's told arrives on the request wire (#1400,
 ``declined:weg2_held``) and skips it at admission until then
@@ -175,6 +189,8 @@ class _State:
     #: until the sibling's retain publish (its end anchor) has landed.
     last_seen: Dict[int, Any] = field(default_factory=dict)
     recent: Dict[str, Tuple[Any, int, float]] = field(default_factory=dict)
+    #: rule 5: promises are asked (twin anchor armed on this process)
+    promise: bool = False
     n_defer: int = 0
     n_recent: int = 0
     n_release: int = 0
@@ -197,6 +213,7 @@ def state(scheduler) -> Optional[_State]:
             settle_passes=max(1, pp_size),
             page=_pos_int(getattr(scheduler, "page_size", 1), 1),
             chunk=_pos_int(getattr(scheduler, "chunked_prefill_size", 0), 0),
+            promise=_twin_anchor_armed(),
         )
         logger.warning(
             "#TW P-TWIN-DEFER ARMED rank pp=%s min_tokens=%d wait_s=%g settle_ms=%g "
@@ -359,6 +376,98 @@ def _gain(st: "_State", src, shared: int) -> Optional[bool]:
     return bool(st.chunk > 0 and shared - s0 >= st.chunk)
 
 
+def _twin_anchor_armed() -> bool:
+    """Rule 5 runs where the source half can keep the promise: the twin
+    anchor switch and the turn anchor's second track on this process."""
+    try:
+        from sglang.srt.weg2 import turn_anchor as _ta
+        from sglang.srt.weg2 import twin_anchor as _ta2
+
+        return bool(_ta2.armed()) and _ta.armed() is not None
+    except Exception:  # noqa: BLE001 - an accelerator, never a wall
+        return False
+
+
+#: rule 5 promise kinds; PROVISIONAL is resolved at the source's first plan
+PROMISE_END = "end"
+PROMISE_CHUNK = "chunk"
+PROMISE_BOUNDARY = "boundary"
+PROMISE_PROVISIONAL = "boundary?"
+
+
+def _planned_end(src) -> Optional[int]:
+    """End of the source's latest planned step (its fill ids), or None."""
+    fill = getattr(src, "fill_ids", None)
+    try:
+        return len(fill) if fill is not None and len(fill) > 0 else None
+    except TypeError:
+        return None
+
+
+def _promise(st: "_State", src, shared: int) -> Optional[Tuple[str, int]]:
+    """Rule 5: ``(kind, position)`` of the anchor ``src`` promises at or below
+    ``shared`` for its twin, or None (no promise: nobody waits for it)."""
+    from sglang.srt.weg2 import twin_anchor as _tw
+
+    n = len(_ids(src))
+    end = ((n - 1) // st.page) * st.page if n > 0 else 0
+    rid = _rid(src)
+    s0 = st.s0.get(rid)
+    if 0 < end <= shared and (s0 is None or s0 < end):
+        return PROMISE_END, end
+    if s0 is not None and st.chunk > 0 and shared - s0 >= st.chunk:
+        return PROMISE_CHUNK, s0 + ((shared - s0) // st.chunk) * st.chunk
+    b = _tw.boundary(shared, st.page)
+    if not (0 < b < n):
+        return None
+    status = _tw.status(rid, b)
+    if status in ("planned", "written"):
+        return PROMISE_BOUNDARY, b
+    if status == "declined":
+        return None
+    fin = getattr(src, "finished", None)
+    if callable(fin) and fin():
+        return None  # finished without the track
+    if s0 is None:
+        return (PROMISE_PROVISIONAL, b) if registered_head(src) < b else None
+    if s0 >= b:
+        return None
+    done = _planned_end(src)
+    if done is not None and done == b:
+        return PROMISE_CHUNK, b  # the planned step ends exactly there: its own anchor
+    if done is not None and done > b:
+        return None  # its step holding B was planned without the track
+    return PROMISE_PROVISIONAL, b
+
+
+def _keeps(st: "_State", src, shared: int) -> Optional[bool]:
+    """A source a twin may wait for: rule 5 (promise) when armed, rule 4
+    (gain) otherwise."""
+    if st.promise:
+        return _promise(st, src, shared) is not None
+    return _gain(st, src, shared)
+
+
+def _say_no_commit(st: "_State", rid: str, w_shared: Dict[str, int], srcs, at: str) -> None:
+    st.n_no_gain += 1
+    if _say(st.n_no_gain):
+        logger.info(
+            "#TW TWIN-NO-COMMIT rid=%s at=%s sources=%s page=%d chunk=%d (n=%d): no "
+            "source promised an anchor <= shared (end, chunk end or twin boundary "
+            "track) -- registered as an ordinary request, no wait.",
+            rid[:12], at,
+            [(_rid(s)[:12], w_shared.get(_rid(s)), st.s0.get(_rid(s)),
+              _tw_anchor_boundary(w_shared.get(_rid(s), 0), st.page)) for s in srcs],
+            st.page, st.chunk, st.n_no_gain,
+        )
+
+
+def _tw_anchor_boundary(shared: int, page: int) -> int:
+    from sglang.srt.weg2 import twin_anchor as _tw
+
+    return _tw.boundary(shared, page)
+
+
 def _say_no_gain(st: "_State", rid: str, w_shared: Dict[str, int], at: str) -> None:
     st.n_no_gain += 1
     if _say(st.n_no_gain):
@@ -400,11 +509,14 @@ def intake_defer(scheduler, req) -> bool:
     all_src = sources + [r for r, _p, _t in recent]
     shared_by = {_rid(s): shared_prefix_len(_ids(s), _ids(req)) for s in all_src}
     # Rule 4: a source that cannot put an anchor into the twin's band is no
-    # reason to wait.
-    gain_src = [s for s in all_src if _gain(st, s, shared_by[_rid(s)]) is not False]
+    # reason to wait. Rule 5 (armed): only a source that PROMISED one is.
+    gain_src = [s for s in all_src if _keeps(st, s, shared_by[_rid(s)]) is not False]
     if not gain_src:
         st.waits.pop(rid, None)
-        _say_no_gain(st, rid, shared_by, "intake")
+        if st.promise:
+            _say_no_commit(st, rid, shared_by, all_src, "intake")
+        else:
+            _say_no_gain(st, rid, shared_by, "intake")
         return False
     keep = {id(s) for s in gain_src}
     sources = [s for s in sources if id(s) in keep]
@@ -464,13 +576,17 @@ def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
             continue
         # Rule 4: drop the sources that turned out to bring nothing (their
         # start depth is known now); none left -> no reason to wait.
+        _before = list(w.sources)
         w.sources = [
             s for s in w.sources
-            if _gain(st, s, w.shared_by.get(_rid(s), w.shared)) is not False
+            if _keeps(st, s, w.shared_by.get(_rid(s), w.shared)) is not False
         ]
         if not w.sources:
             st.waits.pop(rid, None)
-            _say_no_gain(st, rid, w.shared_by, "release")
+            if st.promise:
+                _say_no_commit(st, rid, w.shared_by, _before, "release")
+            else:
+                _say_no_gain(st, rid, w.shared_by, "release")
             out.append((w.req, False))
             continue
         pending = [
