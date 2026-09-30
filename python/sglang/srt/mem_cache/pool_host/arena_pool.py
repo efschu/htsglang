@@ -2060,6 +2060,18 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         need = int(need)
         if need <= 0:
             return 0
+        # OS (NF y3w, KV arena 6485 slots, complete 6472 at 01:38:21): orphan
+        # claims first -- CLAIMED slots no writer can still come to hold no
+        # page anybody can read, so they are the cheapest room there is (no
+        # I/O, nothing lost); before this the KV arena never reaped them
+        # (#231 ran for the mamba arena only) and a claim evicted kept pages
+        # while 753 orphans sat beside them. The mamba anchor arena keeps
+        # #231's order (its COMPLETE unreferenced slots first, the reap only
+        # for what they miss, below).
+        reaped0 = [] if getattr(self, "_weg2_reaps_orphan_claims", False) else _reap_orphan_claims(arena)
+        need -= len(reaped0)
+        if need <= 0:
+            return len(reaped0)
         try:
             keep = _handoff_pending.keep_for(self)
         except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
@@ -2117,7 +2129,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         stems.pop((c[1], c[2]), None)
         except Exception as exc:  # noqa: BLE001 - loud, the claim below decides
             logger.warning("#1427 ARENA-DROP failed: %r", exc)
-            return 0
+            return len(reaped0)
         reaped = (_reap_orphan_claims(arena)
                   if len(cands) < need and getattr(self, "_weg2_reaps_orphan_claims", False) else [])
         k = getattr(ArenaMHAHostPool, "_1427_drop_n", 0) + 1
@@ -2150,7 +2162,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         l3_state[0], l3_state[1], l3_state[2],
                         ArenaMHAHostPool._257_written_to_l3,
                         ArenaMHAHostPool._257_dropped_without_l3)
-        return len(cands) + len(reaped)
+        return len(cands) + len(reaped) + len(reaped0)
 
     def _claim(self, stems):
         """Claim (or join, or find complete) one slot per stem. Returns the
