@@ -76,8 +76,11 @@ def test_the_front_requeues_at_the_head_stops_dispatching_and_never_hands_off():
     src = open(fr.__file__).read()
     assert "intake_stalled: bool = False" in src                      # Pending field
     i = src.index("async def one(p: Pending) -> Pending:")
-    assert "if is_intake_stall(e) and not is_too_large(e):" in src[i:i + 900]  # xsn291: too-large is refused, not requeued
-    assert "await self._requeue_intake_stalled(p, e)" in src[i:i + 900]
+    # the whole body of `one` (up to _on_leg1_done), not a fixed character window: the dual-layout
+    # pause branch (DUAL-TP3PP3 unified KV) sits in front of the stall branch since the dual merge
+    one = src[i:src.index("def _on_leg1_done(p: Pending)", i)]
+    assert "if is_intake_stall(e) and not is_too_large(e):" in one  # xsn291: too-large is refused, not requeued
+    assert "await self._requeue_intake_stalled(p, e)" in one
     j = src.index("def _on_leg1_done(p: Pending)")
     assert "if p.intake_stalled:" in src[j:j + 300]
     k = src.index("passes = await _p_drain_pool(")
@@ -212,9 +215,10 @@ def test_xsn286_a_requeued_request_is_ordinary_again_after_its_next_leg1():
     from sglang.srt.weg2 import front as fr
     src = open(fr.__file__).read()
     i = src.index("async def one(p: Pending) -> Pending:")
-    blk = src[i:i + 2600]  # xsn291: the too-large branch sits in between
+    # the body of `one` (xsn291: the too-large branch sits in between; dual merge: the pause branch too)
+    blk = src[i:src.index("def _on_leg1_done(p: Pending)", i)]
     j = blk.index("await self.leg1(p)")          # the real leg 1, not the skip_leg1 stub
     k2 = blk.index("p.leg1_done = True", j)
-    assert "p.intake_stalled = False" in blk[k2:k2 + 700]
+    assert "p.intake_stalled = False" in blk[k2:]
     k = src.index("def _on_leg1_done(p: Pending)")
     assert "if p.intake_stalled:" in src[k:k + 300]
