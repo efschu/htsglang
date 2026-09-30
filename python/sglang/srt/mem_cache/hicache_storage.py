@@ -43,6 +43,68 @@ def _free_named(arena, slots, reason: str) -> None:
 
     free_named(arena, slots, reason)
 
+
+_FILL_ORPHAN_N = [0, 0]  # fills that reaped, slots reaped
+_FILL_JOIN_N = [0, 0]  # fills that met a live writer's claim, stems
+
+
+def _reap_orphans_before_fill(arena, stems) -> int:
+    """NF (y3w e033a931db, P PP0 01:43:12, weg2-26-39): a page on disk whose
+    L2 slot is a CLAIMED ORPHAN -- every writer gave it up, none can still
+    come -- is unreadable twice over: the reader finds it not COMPLETE, and the
+    L3 -> L2 fill's claim JOINS the orphan (status 1), which the fill used to
+    skip as "another writer is filling it". The orphans come from the whole
+    group giving up a claim together (D TP1 01:39:13 / 01:40:20: ``#1427r
+    CLAIM-RELEASE ... kept=753`` and ``kept=512``, TP0/TP2 ``ARENA-CLAIM
+    REFUSED statuses=[1, 2, 4]``): the slots stay CLAIMED with no open writer,
+    and the KV arena never reaps (#231's reap ran for the mamba arena only).
+    P's probe counted such a page from its L3 copy, the read stopped on it:
+    612 of 1067 held pages, 38528 tokens re-prefilled although on disk.
+
+    Here, before the fill claims, a stem that sits CLAIMED sends the arena
+    through #231's reap (``arena_reap_partial``: no open writer, no reference,
+    untouched for ``SGLANG_WEG2_ARENA_PARTIAL_REAP_S``, default 30 s) -- a
+    claim a live writer still holds is never touched. The fill then claims
+    fresh and reads the page from disk. Returns the slots reaped."""
+    if not stems or not hasattr(arena, "reap_partial") or not hasattr(arena, "find_states"):
+        return 0
+    try:
+        if not any(int(s) == 1 for s in arena.find_states(list(stems))):
+            return 0
+        from sglang.srt.mem_cache.pool_host.arena_pool import _reap_orphan_claims
+
+        freed = _reap_orphan_claims(arena)
+    except Exception:  # noqa: BLE001 - the claim below decides, loudly
+        logger.warning("L3-FILL ORPHAN-REAP failed", exc_info=True)
+        return 0
+    if freed:
+        _FILL_ORPHAN_N[0] += 1
+        _FILL_ORPHAN_N[1] += len(freed)
+        k = _FILL_ORPHAN_N[0]
+        if k <= 16 or (k & (k - 1)) == 0:
+            logger.warning(
+                "L3-FILL ORPHAN-REAP n=%d reaped=%d total=%d: CLAIMED slots no writer can still "
+                "come to blocked pages that are on disk -- reaped before the fill claims, the "
+                "page is read from L3 instead of recomputed", k, len(freed), _FILL_ORPHAN_N[1])
+    return len(freed)
+
+
+def _unclaim_fill_joins(arena, joined) -> None:
+    """A fill never keeps a JOINED claim (status 1): it writes nothing into
+    another writer's slot, so its open-writer mark is given back at once --
+    before, it stayed and made the slot un-reapable for good. The stem is a
+    miss for this read (a live writer is filling it)."""
+    unclaim = getattr(arena, "unclaim", None)
+    if callable(unclaim):
+        unclaim([int(s) for _, s, _ in joined], [int(g) for _, _, g in joined])
+    _FILL_JOIN_N[0] += 1
+    _FILL_JOIN_N[1] += len(joined)
+    k = _FILL_JOIN_N[0]
+    if k <= 16 or (k & (k - 1)) == 0:
+        logger.info("L3-FILL JOINED n=%d stems=%d total=%d: a live writer holds the claim -- "
+                    "unclaimed, a miss for this read", k, len(joined), _FILL_JOIN_N[1])
+
+
 #: HICACHE-DRAFT-TIER (user order 2026-09-24, see environ.py): the one
 #: rank-side reader of the switch. Measured reason (boot weg2xsn420, the P
 #: side without a draft producer): the draft arena (720896 slots x 10240 B =
@@ -3071,7 +3133,9 @@ class HiCacheFile(HiCacheStorage):
         else:
             cand = [(i, st) for i, st in enumerate(stems) if st in on_disk]
         todo = []
+        joined = []
         if cand:
+            _reap_orphans_before_fill(arena, [st for _, st in cand])
             claims = arena.claim_slots([st for _, st in cand], [int(total_bytes)] * len(cand))
             full = []
             for (i, st), (slot, status, gen) in zip(cand, claims):
@@ -3081,6 +3145,8 @@ class HiCacheFile(HiCacheStorage):
                     todo.append((i, slot, gen, st))
                 elif status == 4:
                     full.append((i, st))
+                elif status == 1:
+                    joined.append((i, slot, gen))
             if full:
                 try:
                     # #248e: kept pages (hand-off, park) only as many as this
@@ -3094,6 +3160,13 @@ class HiCacheFile(HiCacheStorage):
                         todo.append((i, slot, gen, st))
                     elif status == 2:
                         out[i] = slot
+                    elif status == 1:
+                        joined.append((i, slot, gen))
+        if joined:
+            # NF (y3w): a join is a claim another writer is still filling; this
+            # fill writes nothing into it, so its open-writer mark goes at once
+            # -- left behind, the slot could never be reaped nor complete
+            _unclaim_fill_joins(arena, joined)
         if prefix and todo:
             # (a): the first stem that neither raced in complete nor got a
             # claim ends the prefix -- its successors are not read
