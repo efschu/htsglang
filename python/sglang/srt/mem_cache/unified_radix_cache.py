@@ -7641,15 +7641,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         return done
 
-    def _anchor_reach_local(self, completed_tokens: int, hash_value) -> int:
+    def _anchor_reach_local(self, completed_tokens: int, hash_value, operation=None) -> int:
         """#257 (b): this rank's deepest reachable recurrent anchor of a SHORT
         read, in tokens -- the trailing mamba boundary the store reports over
         the pages that did land (the same question ``_storage_hit_query``
         asked before the read, ``_presence_pool_transfers``). A full read, a
-        model without a mamba component, or a rank without a store abstains."""
+        model without a mamba component, or a rank without a store abstains.
+
+        SA (NF y3v, weg2-46-98): when the controller READ the state of a short
+        read (``_weg2_short_anchor_pages`` on the operation, 0 = none could be
+        read), that page is the anchor -- the store's presence answer named
+        45824 while nothing had loaded the state there, and the cut inserted
+        a stateless prefix PP0's own walk then refused."""
         full = len(hash_value) * self.page_size
         if int(completed_tokens) >= full:
             return _ANCHOR_ABSTAIN
+        _sa_pages = None if operation is None else getattr(operation, "_weg2_short_anchor_pages", None)
+        if _sa_pages is not None:
+            return int(_sa_pages) * self.page_size
         cc = self.cache_controller
         backend = getattr(cc, "storage_backend", None)
         transfers_fn = getattr(cc, "_presence_pool_transfers", None)
@@ -7724,7 +7733,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _eb,
             completed_tokens,
             _hit_tokens_local,
-            self._anchor_reach_local(completed_tokens, hash_value),
+            self._anchor_reach_local(completed_tokens, hash_value, operation),
         )
         _synced_end = int(_c_vote)
         packed_list = [_c_vote] + [0] * _POOL_SLOT_COUNT
@@ -7971,6 +7980,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         // self.page_size
                     ]
                 )
+
+        # SA: a state is committed only at the cut it belongs to. On a rank
+        # that decides its own cut (no attention-TP reduce) this is local and
+        # final; on a TP group the MIN-reduced hit pages already decide for
+        # every rank alike and a rank-local refusal would split them.
+        if self.tp_world_size <= 1:
+            from sglang.srt.mem_cache.short_read_anchor import refuse_foreign_depth_states
+
+            refuse_foreign_depth_states(
+                rid=req_id,
+                transfers=[x for xfers in comp_xfers.values() for x in xfers],
+                hash_value=hash_value,
+                cut_pages=int(min_completed_tokens) // self.page_size,
+                hit_pages=operation.pool_storage_result.extra_pool_hit_pages,
+            )
 
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
