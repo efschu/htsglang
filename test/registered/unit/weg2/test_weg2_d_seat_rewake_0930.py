@@ -234,7 +234,8 @@ def test_free_seats_shrink_only_after_the_price_no_flapping(caplog):
     for _ in range(R.SHRINK_ASK_ROUNDS):
         clock[0] += 0.05 / R.SHRINK_ASK_ROUNDS
         assert _run(ctxs(), lambda: R.tick(s)) is None
-    assert ctl.calls == [] and calls == [[False]]
+    # the vote (KEIL): due, then per n' in 2..3 whether this rank's slots fit
+    assert ctl.calls == [] and calls == [[False, True, True]]
     # the gap goes on past the price -> n=2
     got = None
     for _ in range(R.SHRINK_ASK_ROUNDS):
@@ -259,12 +260,13 @@ def test_no_shrink_over_a_slot_still_in_use_and_none_without_a_price():
     s, calls = _sched(4, 2, 0, alloc=_Alloc(used=(30,)))
     for _ in range(R.SHRINK_ASK_ROUNDS * 3):
         _run(_tick_env(ctl), lambda: R.tick(s))
-    assert ctl.calls == [] and calls == []
+    # KEIL: the rank still votes (no), it never skips the collective
+    assert ctl.calls == [] and len(calls) == 3 and all(c[1:] == [False, False] for c in calls)
     s2, calls2 = _sched(4, 2, 0)
     s2._weg2_d_seat_phase.apply_ms = None                 # nothing measured
     for _ in range(R.SHRINK_ASK_ROUNDS * 3):
         _run(_tick_env(ctl), lambda: R.tick(s2))
-    assert ctl.calls == [] and all(f == [False] for f in calls2)
+    assert ctl.calls == [] and all(not f[0] for f in calls2)
 
 
 def test_off_nothing_moves():
@@ -466,4 +468,6 @@ def test_a_slot_above_every_smaller_limit_is_named_held(caplog):
     s, calls = _sched(4, 0, 0, alloc=_Alloc(used=(30,)))
     _idle_run(s, ctl, R.IDLE_ASK_ROUNDS * 3, [1000.0])
     held = [m for m in caplog.messages if "SHRINK HELD" in m]
-    assert ctl.calls == [] and calls == [] and len(held) == 1 and "slots_held" in held[0]
+    assert ctl.calls == [] and len(held) == 1 and "slots_held" in held[0]
+    # KEIL: every ask still enters the group MIN, voting no for n=1..3
+    assert len(calls) == 3 and all(c[1:] == [False, False, False] for c in calls)

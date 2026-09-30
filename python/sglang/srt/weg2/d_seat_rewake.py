@@ -350,30 +350,48 @@ def tick(sched: Any) -> Optional[str]:
     rs.idle_rounds += 1
     if rs.idle_rounds % (IDLE_ASK_ROUNDS if trigger == TRIGGER_IDLE else SHRINK_ASK_ROUNDS):
         return None
-    # the slots above the new limit must be free: the allocator decides (replicated).
+    # the slots above the new limit must be free: the allocator decides.
     # y4x 16:33:26-36 (D empty, 4 GDN slots held by the tree, mamba usage 0.11):
     # the all-or-nothing test for n=1 held n=6 silently. Now: the fewest seats
     # whose limit covers every slot in use -- a partial shrink, named when held.
+    #
+    # KEIL (qwen review of 50bed49e3a, NF-Operator 30.09.): from the ask rhythm
+    # on, NO rank-local reason may skip the collective -- a rank that returned
+    # early (an unreadable ledger, slots held) left the others in the group MIN
+    # for ever. Every rank that reached the rhythm votes: shrink due, and for
+    # each n' in down..n-1 whether ITS slots fit the limit of n'. The group MIN
+    # picks the fewest seats every rank reaches (a rank-local ``down = fit``
+    # could also have split n); a local reason is named AFTER the collective.
     pool = V._req_pool(sched)
     allocator = getattr(pool, "mamba_allocator", None)
-    if allocator is not None and hasattr(allocator, "slot_used"):
-        size = int(getattr(allocator, "size", 0) or 0)
-        try:
-            top = highest_used_slot(allocator.slot_used)
-        except Exception:  # noqa: BLE001 -- unreadable ledger: no shrink
-            _note_held(sched, rs, st, "slot_ledger_unreadable", n, down)
-            return None
-        fit = seats_covering(size, cap, top, down)
-        if fit >= n:
-            _note_held(sched, rs, st, "slots_held (highest slot in use %d > limit of n=%d; the tree keeps "
-                       "GDN states there)" % (top, n - 1), n, down)
-            return None
-        down = fit
+    fit, local_why = down, None
+    try:
+        ledger = None if allocator is None else getattr(allocator, "slot_used", None)
+        if ledger is not None:
+            size = int(getattr(allocator, "size", 0) or 0)
+            top = highest_used_slot(ledger)
+            fit = seats_covering(size, cap, top, down)
+            if fit >= n:
+                local_why = ("slots_held (highest slot in use %d > limit of n=%d; the tree keeps "
+                             "GDN states there)" % (top, n - 1))
+    except Exception as exc:  # noqa: BLE001 -- unreadable ledger: this rank votes no
+        fit, local_why = n, "slot_ledger_unreadable (%s: %s)" % (type(exc).__name__, exc)
     price = price_ms(rs, getattr(st, "apply_ms", None))
     idle_s = now - rs.idle_since
     rs.counters["shrink_asked"] += 1
-    if not bool(_group_min(sched, [shrink_due(idle_s, price)])[0]):
+    seats = list(range(down, n))
+    mins = _group_min(sched, [shrink_due(idle_s, price)] + [m >= fit for m in seats])
+    if local_why is not None:
+        _note_held(sched, rs, st, local_why, n, down)
+    if not bool(mins[0]):
         return None
+    agreed = [m for m, ok in zip(seats, mins[1:]) if ok]
+    if not agreed:
+        if local_why is None:
+            _note_held(sched, rs, st, "group_slots_held (another rank's slots do not fit a limit below "
+                       "n=%d; group MIN)" % n, n, down)
+        return None
+    down = agreed[0]
     rows0 = getattr(V.controller(sched), "rows_on", None)
     ms = _reseat(sched, st, down, grow=False)
     if ms is None:
