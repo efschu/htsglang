@@ -81,8 +81,7 @@ class GrantDelta(CustomTestCase):
         ds = []
         for p in paths:
             d = K.CardKvLedger(p, "D")
-            d.contribute(40 * MIB, committed=40 * MIB)
-            d.release(20 * MIB)                                  # D holds 20 MiB
+            d.contribute(40 * MIB, committed=40 * MIB)          # D keeps its boot pool until P joined
             ds.append(d)
         stages = []
         for i, p in enumerate(paths):
@@ -91,6 +90,7 @@ class GrantDelta(CustomTestCase):
             st = _stage(led)
             S.publish_stage(st, self.tag, i)
             stages.append(st)
+            ds[i].release(20 * MIB)                              # then shrinks: D holds 20 MiB
         sched = types.SimpleNamespace(tp_worker=types.SimpleNamespace(
             model_runner=types.SimpleNamespace(dual_p_kv=stages[0])),
             ps=types.SimpleNamespace(pp_rank=0, pp_size=len(paths)))

@@ -152,10 +152,34 @@ class DKvStage(_pk.PKvStage):
                             need, granted, pressure, self._gw_n)
             return False
         self._gw_n, self._gw_next, self._gw_iv = 0, 0.0, 0.5
-        self._move(want)
+        # metal dual14: cuMemCreate OOM here killed D. A physically short card
+        # is "card short": EVERY rank rolls back (second MIN), the grant goes
+        # back, the failing card's ledger is reconciled against cuMemGetInfo
+        # and the shortfall is asked again -- which presses P.
+        moved, short = 1, None
+        try:
+            self._move(want)
+        except _pk.Weg2DualKvMapShort as exc:
+            moved, short = 0, exc
+        if int(self.gmin([moved])[0]) != 1:
+            self._move(self.mapped_tokens)                   # unmap what this rank got; rows/cap back
+            self.ledger.release(granted)
+            over = 0
+            phys = _pk.phys_free_bytes() if short is not None else None
+            if phys is not None:
+                over = self.ledger.reconcile(phys)
+            got, pressure = self.ledger.request(need)       # registers D's demand; presses P if it holds any
+            if got:
+                self.ledger.release(got)
+            logger.warning("%s GROW-SHORT want=%d need=%d: %s -- grow refused on every rank, rolled back to %d; "
+                           "ledger reconciled by -%d B against phys_free=%s; pressure_on_P=%d",
+                           MARK, want, need, short if short is not None else "another rank's card is short",
+                           self.mapped_tokens, over, phys, pressure)
+            return False
         self._committed = int(getattr(self, "_committed", 0) or 0) + need
         logger.info("%s GROW %d -> %d tokens (+%d B)", MARK, self.mapped_tokens, want, need)
         self.mapped_tokens = want
+        _pk.check_cover(self, "grow")
         return True
 
     def group_shrink(self, target: int, live_floor_tokens: int) -> int:
@@ -181,6 +205,7 @@ class DKvStage(_pk.PKvStage):
         logger.info("%s SHRINK %d -> %d tokens (-%d B back to the card pool)", MARK, self.mapped_tokens,
                     target, n)
         self.mapped_tokens = target
+        _pk.check_cover(self, "shrink")
         return n
 
 
@@ -300,8 +325,14 @@ def tick(sched) -> Optional[str]:
     st = peek(actor.ledger.path)
     p_wait_local = 1 if (st is not None and int(st.demand.get("P", 0)) > 0) else 0
     live_local = int(_pk.max_live_id(actor.allocator, actor.page)) * int(actor.page)
-    g = actor.gmin([-int(want_local), -int(p_wait_local), -int(live_local), -int(demand_local)])
+    # metal dual14: D unmapped its boot pool before P sized its KV on the card,
+    # P counted those bytes as free -> the budget held them twice. D keeps its
+    # boot pool until P has JOINED every D card (group decision).
+    p_missing_local = 1 if (st is None or not int(st.pid.get("P", 0) or 0)) else 0
+    g = actor.gmin([-int(want_local), -int(p_wait_local), -int(live_local), -int(demand_local),
+                    -int(p_missing_local)])
     want, p_waiting, floor = -int(g[0]), -int(g[1]) > 0, -int(g[2])
+    p_missing = len(g) > 4 and -int(g[4]) > 0
     if p_waiting and -int(g[3]) == 0:
         # the GROUP has no running or waiting request and P waits: D's cached
         # prefix is not demand (user rule) -- every rank gives it up alike, the
@@ -310,6 +341,9 @@ def tick(sched) -> Optional[str]:
     want = max(want, _pk.round_up(floor, actor.step))       # never below a live row of any rank
     below = actor._below + 1 if want < actor.mapped_tokens else 0
     verdict, level = decide(actor.mapped_tokens, want, p_waiting, below, actor.step)
+    if verdict == "shrink" and p_missing:
+        verdict, level = "hold", actor.mapped_tokens
+    _pk.phys_check(actor, "D")
     actor._below = below
     if verdict == "grow":
         actor.group_grow(level)

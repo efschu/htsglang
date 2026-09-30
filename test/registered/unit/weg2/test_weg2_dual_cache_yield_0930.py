@@ -72,9 +72,9 @@ class MetalReplayOf3q33cuP(CustomTestCase):
         path = os.path.join(tempfile.mkdtemp(prefix="wkvy"), "card")
         d = K.CardKvLedger(path, "D")
         d.contribute(40 * MIB, committed=40 * MIB)
-        d.release(35 * MIB)                                     # D keeps 5 MiB (its cache on metal)
         led = K.CardKvLedger(path, "P")
-        led.contribute(34 * MIB)                                # budget 74 MiB
+        led.contribute(34 * MIB)                                # budget 74 MiB (P sized while D held its pool)
+        d.release(35 * MIB)                                     # D keeps 5 MiB (its cache on metal)
         st = _p_stage(led)
         u = st.bytes_for(12288) - st.bytes_for(0)
         self.assertEqual(u, 24 * MIB)
