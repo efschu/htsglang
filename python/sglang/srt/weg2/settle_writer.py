@@ -94,6 +94,100 @@ def step(prev: Optional[str], now: str, ack_seen: Optional[str]) -> Tuple[str, O
     return "poll", ack_seen
 
 
+# ---------------------------------------------------------------------------
+# NW (30.09.): a read the HOST BUDGET refused is not a read that came back short.
+#
+# NF y3u (5bedac26f1, boot ...0930_002717, D TP0): five requests parked over the
+# flip, three of them ~130k tokens (weg2-0-5 130048, weg2-30-49 131136,
+# weg2-30-50 131136 = 392320 registered). The wake issued their reads first, in
+# hold order, and the prefetch budget (limit 373536) was spent: the reads of
+# weg2-30-52 (77695 tokens) and weg2-31-53 (77854) were REFUSED before they ran
+# (``#915 PREFETCH REFUSED reason=vote_negative need=77632 occupied=392320
+# limit=373536`` at the wakes 00:41:52, 00:42:08, 00:42:21). P had published
+# their tails (``WEG2-TAIL-PUBLISH ... of=3``; D: ``SETTLE-WRITER
+# writer=p-published action=reread``), the re-read came back
+# ``declined:rate_limited`` -- and the settle took that as the ack spent and,
+# one tick later, ``SETTLE-NO-WRITER`` ("nothing can fill the rest"). Admission
+# then priced the whole prompt on a read that never ran (``X-GATE-TERMS
+# total=77695 head=0 store=0``), the front re-routed via P twice, and the third
+# refusal reached the client as W50 (``LEG2-TERMINAL-NAMED reason=W50``).
+#
+# The law: a refused registration is "not read yet", never "read short". Such a
+# request stays parked (bounded by the #1471 settle bound), is re-read as soon
+# as the budget has room (not on the 2 s timer), keeps the writer's ack, and
+# is never decided "no writer" and never tail-settled on a stale stamp.
+# ---------------------------------------------------------------------------
+
+#: the request's last store read was refused by the host budget / the group vote
+BUDGET_ATTR = "_1471b_budget"
+#: monotonic time of that refused attempt (the retry cadence)
+BUDGET_T_ATTR = "_1471b_t"
+#: the refusal terms that mean "the budget had no room" (match_refusal_census
+#: PREFETCH_DECLINE_ORDER minus anchor / too_short, which are answers, not room)
+BUDGET_TERMS = frozenset({
+    "rate_limited",
+    "host_pool_exhausted",
+    "host_alloc_failed",
+    "anchor_pool_exhausted",
+    "vote_negative",
+    "alloc_failed_post_vote",
+})
+#: the shortest interval between two refused attempts of one request -- a retry
+#: is a group collective (the #580 vote), so not on every scheduling pass
+BUDGET_RETRY_S = 0.25
+
+
+def budget_refused(verdict) -> bool:
+    """True when ``_prefetch_kvcache``'s verdict is a budget refusal."""
+    v = str(verdict or "")
+    return v.startswith("declined:") and v.split(":", 1)[1] in BUDGET_TERMS
+
+
+def note_read_verdict(req, verdict, now: float) -> bool:
+    """Record what the last read attempt of ``req`` did; True = budget-refused.
+    Any other verdict (issued, in flight, too short, ...) clears the mark."""
+    refused = budget_refused(verdict)
+    setattr(req, BUDGET_ATTR, refused)
+    if refused:
+        setattr(req, BUDGET_T_ATTR, float(now))
+    return refused
+
+
+def budget_pending(req) -> bool:
+    return bool(getattr(req, BUDGET_ATTR, False))
+
+
+def budget_retry_due(req, now: float, rate_limited: bool) -> bool:
+    """A budget-refused read is re-issued once this rank's budget has room and
+    the retry interval passed (rank-local; the caller takes the group MIN)."""
+    if rate_limited:
+        return False
+    return now - float(getattr(req, BUDGET_T_ATTR, 0.0) or 0.0) >= BUDGET_RETRY_S
+
+
+def gate_action(act: str, req) -> str:
+    """The settle action under a pending budget refusal: ``decide`` becomes
+    ``poll`` -- the read has not run, so "no writer" is not proven."""
+    if act == "decide" and budget_pending(req):
+        return "poll"
+    return act
+
+
+def keep_ack_if_unread(req, act: str) -> None:
+    """A ``reread`` whose re-read the budget refused has not spent the ack:
+    the next tick re-reads again once the budget has room."""
+    if act == "reread" and budget_pending(req):
+        req._1471w_ack = None
+
+
+def reset_for_wake(req) -> None:
+    """A new wake follows a P phase in which P may have written this rid again
+    (RESUME-VIA-P publishes the same tail files anew): the writer view of the
+    previous wake -- state, spent ack -- does not carry over."""
+    for attr in ("_1471w_state", "_1471w_ack", "_1471w_t"):
+        setattr(req, attr, None)
+
+
 def _tail_facts(rid: str) -> Tuple[str, bool]:
     from sglang.srt.weg2 import tail_handoff as _th
 

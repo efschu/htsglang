@@ -1172,6 +1172,7 @@ def _weg2_settle_writer_action(sched, req) -> str:
             return "poll"
         req._1471w_t = t
     act, ack = _sw.step(prev, now_state, getattr(req, "_1471w_ack", None))
+    act = _sw.gate_action(act, req)  # NW: a budget-refused read has not run -- no "no writer"
     req._1471w_state = now_state
     req._1471w_ack = ack
     if now_state != prev:
@@ -1212,6 +1213,12 @@ def _weg2_store_tail_settles(sched, req) -> bool:
     stamp, over X, a stand-in without server_args): the settle hold decides as
     before -- over X (weg2xsn229, 4095 of 98210) the request waits for its read."""
     if not _weg2_store_short_tail_on():
+        return False
+    from sglang.srt.weg2 import settle_writer as _sw
+
+    if _sw.budget_pending(req):
+        # NW (30.09.): the read the budget refused has not run this wake; a
+        # remainder taken off an older stamp would prefill against an empty host.
         return False
     x = _weg2_store_short_tail_x(sched)
     remainder = _weg2_store_short_remainder(req)
@@ -6356,6 +6363,12 @@ class Scheduler(
             # #248: looked up only -- no read in the sleep, nothing to top up;
             # the wake issues it (weg2.park_l3.issue_deferred_reads)
             return "complete"
+        from sglang.srt.weg2 import settle_writer as _sw
+
+        if _sw.budget_pending(req):
+            # NW (30.09., y3u weg2-30-52/31-53): the last read was REFUSED by the
+            # host budget -- nothing registered, nothing read. Not short: unread.
+            return self._weg2_refetch_budget(req, now, allow_reissue)
         if not self.tree_cache.check_prefetch_progress(req.rid):
             return "reading"
         reason = self._weg2_note_store_shortfall(req)
@@ -6454,7 +6467,46 @@ class Scheduler(
         if req._1456_n <= 4 or req._1456_n % 16 == 0:
             logger.info("#1456 HOLD-REFETCH rid=%s n=%d reason=%s verdict=%s (the store was short; "
                         "re-read from the registered extent)", str(req.rid)[:12], req._1456_n, reason, verdict)
+        if _sw.note_read_verdict(req, verdict, now):
+            return "budget"  # NW: refused, not issued -- never a read in flight
         return "reissued"
+
+    def _weg2_refetch_budget(self, req, now: float, allow_reissue: bool) -> str:
+        """NW (30.09.): one settle/hold step of a request whose last store read
+        the host budget REFUSED (weg2/settle_writer.py): "wait" while this
+        rank's budget is still full or the retry interval runs, "due" when it
+        may be re-read (the caller takes the group MIN -- the read is a
+        collective), then the re-read: "reissued", or "budget" when refused
+        again. Never "complete": nothing of this read reached the host."""
+        from sglang.srt.weg2 import settle_writer as _sw
+
+        req._1471_short = True
+        try:
+            limited = bool(self.tree_cache.cache_controller.prefetch_rate_limited())
+        except Exception:  # noqa: BLE001 - no budget readable: retry on the interval
+            limited = False
+        if not _sw.budget_retry_due(req, now, limited):
+            return "wait"
+        if not allow_reissue:
+            return "due"
+        req._1456_last = now
+        req._1456_n = int(getattr(req, "_1456_n", 0) or 0) + 1
+        clear = getattr(self, "_clear_prefetch_deferral_fields", None)
+        if clear is not None:
+            clear(req)
+        plan = weg2_store_told.refetch_plan(self, req)
+        if plan is None or plan == weg2_store_told.REFETCH_SKIP:
+            verdict = self._prefetch_kvcache(req)
+        else:
+            verdict = self._prefetch_kvcache(req, limit_tokens=int(plan))
+        refused = _sw.note_read_verdict(req, verdict, now)
+        n = int(getattr(self, "_1471b_n", 0) or 0) + 1
+        self._1471b_n = n
+        if n <= 16 or n % 64 == 0:
+            logger.info("#1471b BUDGET-REREAD rid=%s n=%d verdict=%s refused=%s (n_all=%d): the read the "
+                        "host budget refused is re-issued now that it has room", str(req.rid)[:12],
+                        req._1456_n, verdict, refused, n)
+        return "budget" if refused else "reissued"
 
     def _weg2_group_min_ints(self, vals):
         """#1479b: element-wise MIN of small ints over the TP cpu group;
@@ -6598,6 +6650,8 @@ class Scheduler(
         # writer at work: wait for its ack; the ack: re-read now, past the 2 s
         # timer (weg2/settle_writer.py). Rank-local facts; every verdict built
         # on them goes through the group MIN below.
+        from sglang.srt.weg2 import settle_writer as _sw_nw
+
         _acts = [_weg2_settle_writer_action(self, req) for req in settle]
         # P4b-fix (28.09.): the writer view is RANK-LOCAL -- a rank that never read the
         # hand-off record before the wake removed it sees "none" while its peers see P's
@@ -6635,11 +6689,17 @@ class Scheduler(
                 logger.info("#1471 SETTLE rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
                             type(exc).__name__, exc)
                 state = "complete"
+            # NW (30.09.): a re-read the budget refused has not spent the writer's ack
+            _sw_nw.keep_ack_if_unread(req, _act)
             lapsed = now - float(getattr(req, "_1471_since", now)) >= self.WEG2_POST_WAKE_SETTLE_S
             # P4b: no writer and no read in flight = decided now (the bound would
             # release the same request "as it is" 20 s later).
             # a re-read the group issued this tick is a read in flight, on this rank too
-            _no_writer = _act == "decide" and state not in ("reading", "reissued")
+            # NW: a read the budget refused has not run -- "no writer" is not proven;
+            # a read that came back whole is "complete", not a no-writer decision
+            _no_writer = (_act == "decide"
+                          and state not in ("reading", "reissued", "budget", "complete")
+                          and not _sw_nw.budget_pending(req))
             if _no_writer:
                 state = "no-writer"
             # weg2rc2: a remainder within X is D's to prefill -- settled now, not at the bound.
@@ -6825,6 +6885,12 @@ class Scheduler(
                 released.append(_r)
             else:
                 _r._1471_since = _now
+                try:  # NW (30.09.): this wake's writer view starts fresh (P may have written again)
+                    from sglang.srt.weg2 import settle_writer as _sw_nw
+
+                    _sw_nw.reset_for_wake(_r)
+                except Exception:  # noqa: BLE001
+                    pass
                 parked.append(_r)
         hold.clear()
         if parked:

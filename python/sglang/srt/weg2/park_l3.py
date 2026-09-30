@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -103,13 +104,20 @@ def issue_deferred_reads(sched, hold) -> list:
     the group's), so the reads' collectives line up. Returns the requests
     whose read was issued -- the release parks them in the #1471 settle
     until the read is complete."""
-    out = []
+    from sglang.srt.weg2 import settle_writer as _sw
+
+    out, refused = [], []
+    now = time.monotonic()
     for req in list(hold or ()):
         if not deferred(req):
             continue
         setattr(req, DEFER_ATTR, False)
         verdict = sched._prefetch_kvcache(req)
         req._969c_verdict = verdict
+        # NW (30.09.): a refusal of the host budget is "not read yet" -- the #1471
+        # settle keeps it parked and re-reads once the budget has room.
+        if _sw.note_read_verdict(req, verdict, now):
+            refused.append((req, verdict))
         apply = getattr(sched, "_apply_prefetch_deferral", None)
         if apply is not None:
             apply(req, verdict, site="wake-248")
@@ -118,6 +126,11 @@ def issue_deferred_reads(sched, hold) -> list:
     if out:
         logger.info("#248 WAKE-READ issued=%d %s (the hold read runs now: reference and pin at the wake, "
                     "the device load at admission)", len(out), [str(r.rid)[:12] for r in out])
+    if refused:
+        logger.warning("#1471b WAKE-READ BUDGET-REFUSED n=%d %s -- the host budget had no room for "
+                       "these reads (the earlier hold reads hold it); they stay parked in the settle "
+                       "and are re-read once it frees, never decided 'no writer' on a read that did "
+                       "not run", len(refused), [(str(r.rid)[:12], v) for r, v in refused])
     return out
 
 
