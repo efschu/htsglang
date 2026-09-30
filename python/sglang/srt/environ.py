@@ -768,6 +768,18 @@ class Envs:
     # CSV, "0" = no rate). Set by the weg2 launcher from D_EXTEND_GROWTH_PER_ROW_MIB;
     # the scheduler caps the extend chunk to floor((card_free_post - 300) / rate).
     SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB = EnvStr(None)
+    # CORRIDOR BOUND WAKE RESET (y3r Klasse E/A2, D TP1 3080, 23:45:29-34): the
+    # '#794 GROUP-NARROWED ... from 4096 to 64' right after every wake is the
+    # #1028c bounded-min window (5 s) of the #656 gate still holding the
+    # driver_free samples of the DORMANT phase -- 81.8 MiB while P owned the
+    # card -- against 2444/2188/2100 MiB measured after the resume. The vote
+    # priced the budget at -97..-188 MiB (81.8 + takeable cache - delta 256),
+    # so every real extend of the next ~5 s ran in 64-token pieces (ep36 220
+    # tokens: 64 + 156 = 2490 + 1922 ms). The window now starts at the wake
+    # (scheduler._weg2_last_wake_t): samples of the other group's phase are
+    # dropped, every value still returned is a MIN over this phase's own
+    # device readings. 0 = the window spans the flip (the old form).
+    SGLANG_WEG2_CORRIDOR_BOUND_WAKE_RESET = EnvBool(True)
     # DEGEN-SUSPECT (27B weg2-1-13, 28.09. 13:44-13:51: an endless generation
     # held the D->P drain): the detokenizer watches each request's decode tail
     # for an exact repetition (smallest period <= 256 tokens covering >= 8
