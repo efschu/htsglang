@@ -932,6 +932,11 @@ def _form_a_note_loaded(tree, rows: int) -> None:
 
 
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
+    #: HY (weg2/park_hold_yield.py): the retained nodes whose backup the arena
+    #: refused (#1421 arena_claim) during a D park's retraction; None = no
+    #: park is recording.
+    _weg2_park_track: Optional[dict] = None
+
     #: The scheduler, once the phase flip has claimed ownership of the request
     #: pool (`bind_req_pool_owner`). None on every boot that never flips, which
     #: is why the property below falls back to the constructor's pool.
@@ -4289,6 +4294,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _r12.worker_short(self, why, node)
         except Exception as _e:  # noqa: BLE001 - an instrument never refuses harder
             logger.warning("R12 refusal note raised: %s: %s", type(_e).__name__, _e)
+        # HY: a park backup the arena refused (getattr: hermetic ranks borrow
+        # this method onto bare namespaces, test_form_a_host_shadow_r12)
+        _track = getattr(self, "_weg2_park_track", None)
+        if why == "arena_claim" and _track is not None:
+            _track[node.id] = node
         n = getattr(UnifiedRadixCache, "_1421_n", 0) + 1
         UnifiedRadixCache._1421_n = n
         # #1426: sampled PER REASON. xsn186 sampled 1/256 over the whole

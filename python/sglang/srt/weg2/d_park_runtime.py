@@ -32,7 +32,7 @@ import time
 from typing import Optional
 
 from sglang.srt.managers import weg2_resumable_depth
-from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats
+from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats, park_hold_yield
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +164,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     # F4 (#259 4c): the END state of each running request as a park tail part,
     # gathered before the retraction hands its slots to the tree.
     _park_end(sched, running)
+    park_hold_yield.begin(getattr(sched, "tree_cache", None))
     retracted = (
         sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True)
         if running else []
@@ -209,6 +210,10 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         for req in settle:
             setattr(req, FROM_SETTLE_ATTR, True)
     sched.weg2_d_parked = d_seats.order_waiting(list(parked) + list(retracted) + settle + queued)
+    # HY: a retained span whose backup the full arena refused takes the
+    # L3-copied pages of a held (not running) request -- one group vote, then
+    # the give-back and the backup again on every rank, or nothing moves
+    park_hold_yield.settle(sched, retracted=retracted, parked=sched.weg2_d_parked)
     # #248: every parked request is kept by ORDER over the flip -- the
     # sleep's reset gives its references back, the hold reads it at the wake
     try:
