@@ -57,7 +57,25 @@ def worker(rank, a, store):
         from sglang.srt.distributed.device_communicators.barlink_bar1 import BarlinkBar1Transport
         from sglang.srt.distributed.device_communicators.barlink_matrix_transport import _window_bytes
 
-        t = BarlinkBar1Transport(dist.group.WORLD, dev, _window_bytes())
+        extra = []
+        if a.windows_mib:
+            # the production shape: several barlink groups per process, each its
+            # own BAR1 window (D: world/tp/dcp, P: world/pp) -- built one after
+            # the other like GroupCoordinator does, all kept alive.
+            mibs = [int(x) for x in a.windows_mib.split(",")]
+            t = BarlinkBar1Transport(dist.group.WORLD, dev, mibs[0] << 20)
+            for m in mibs[1:]:
+                extra.append(BarlinkBar1Transport(dist.group.WORLD, dev, m << 20))
+        else:
+            t = BarlinkBar1Transport(dist.group.WORLD, dev, _window_bytes())
+        dist.barrier()
+        if a.bar1_snapshot:
+            import subprocess as _sp
+            res["bar1_free_mib"] = _sp.run(
+                ["nvidia-smi", "--query-gpu=index,name,pci.bus_id", "--format=csv,noheader"],
+                capture_output=True, text=True).stdout.strip()
+            q = _sp.run(["nvidia-smi", "-q", "-d", "MEMORY"], capture_output=True, text=True).stdout
+            res["bar1_q"] = [l.strip() for l in q.splitlines() if l.strip().startswith(("Free", "Used", "Total"))][-24:]
         res["proof"] = {str(k): bool(v) for k, v in t.byte_proof_all().items()}
         if not all(res["proof"].values()):
             raise RuntimeError(f"byte proof failed: {res['proof']}")
@@ -111,6 +129,8 @@ def worker(rank, a, store):
         try:
             if t is not None:
                 t.close()
+            for x in locals().get("extra", []) or []:
+                x.close()
         except Exception:  # noqa: BLE001
             pass
         lat = sorted(res.pop("lat_ms"))
@@ -136,6 +156,9 @@ def main():
     ap.add_argument("--verify-every", type=int, default=10)
     ap.add_argument("--gemm-only", action="store_true",
                     help="P's compute alone: the GEMM loop, no collectives (the transport is still built)")
+    ap.add_argument("--windows-mib", default="",
+                    help="comma list: one BAR1 window per barlink group, e.g. D '16,32,40', P '16,64'")
+    ap.add_argument("--bar1-snapshot", action="store_true", help="record nvidia-smi BAR1 usage once all windows exist")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     a.devs = [int(x) for x in a.devs.split(",")]
