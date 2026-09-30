@@ -89,6 +89,34 @@ def _reap_orphans_before_fill(arena, stems) -> int:
     return len(freed)
 
 
+#: L3FILL-JOINED (30.09.): the JOINED line names at most this many holders
+JOIN_OWNERS_K = 4
+
+
+def _join_owner_text(arena, joined) -> str:
+    """L3FILL-JOINED (30.09., NF y4a ep36): per joined stem the holder --
+    slot/age since its last claim or merge/pid/role/generation/open writers --
+    for the first ``JOIN_OWNERS_K``, plus the oldest age and the holder pids
+    over all. y4a: 29 stems stayed JOINED for 5 read cycles on D and on P and
+    the line could not say who held them."""
+    info_fn = getattr(arena, "claim_info", None)
+    if not callable(info_fn):
+        return ""
+    try:
+        from sglang.srt.mem_cache.storage.file.hicache_arena import claim_owner_text
+
+        rows = info_fn([int(s) for _, s, _ in joined])
+    except Exception:  # noqa: BLE001 - an instrument never raises
+        return ""
+    if not rows:
+        return ""
+    ages = [int(r[2]) for r in rows]
+    pids = sorted({int(r[3]) for r in rows})
+    head = " ".join(claim_owner_text(r) for r in rows[:JOIN_OWNERS_K])
+    return " holders=[%s%s] oldest_ms=%d pids=%s" % (
+        head, " ..." if len(rows) > JOIN_OWNERS_K else "", max(ages), pids[:8])
+
+
 def _unclaim_fill_joins(arena, joined) -> None:
     """A fill never keeps a JOINED claim (status 1): it writes nothing into
     another writer's slot, so its open-writer mark is given back at once --
@@ -97,12 +125,24 @@ def _unclaim_fill_joins(arena, joined) -> None:
     unclaim = getattr(arena, "unclaim", None)
     if callable(unclaim):
         unclaim([int(s) for _, s, _ in joined], [int(g) for _, _, g in joined])
+    owners = _join_owner_text(arena, joined)   # after our own open mark went: the others
     _FILL_JOIN_N[0] += 1
     _FILL_JOIN_N[1] += len(joined)
     k = _FILL_JOIN_N[0]
     if k <= 16 or (k & (k - 1)) == 0:
         logger.info("L3-FILL JOINED n=%d stems=%d total=%d: a live writer holds the claim -- "
-                    "unclaimed, a miss for this read", k, len(joined), _FILL_JOIN_N[1])
+                    "unclaimed, a miss for this read%s", k, len(joined), _FILL_JOIN_N[1], owners)
+
+
+def _fill_claim(arena, stems, total_bytes: int):
+    """The fill's claims, stamped with the l3fill role (L3FILL-JOINED); a
+    hermetic fake arena without the keyword claims as before."""
+    from sglang.srt.mem_cache.storage.file.hicache_arena import ROLE_L3FILL
+
+    try:
+        return arena.claim_slots(stems, [int(total_bytes)] * len(stems), role=ROLE_L3FILL)
+    except TypeError:
+        return arena.claim_slots(stems, [int(total_bytes)] * len(stems))
 
 
 #: HICACHE-DRAFT-TIER (user order 2026-09-24, see environ.py): the one
@@ -3136,7 +3176,7 @@ class HiCacheFile(HiCacheStorage):
         joined = []
         if cand:
             _reap_orphans_before_fill(arena, [st for _, st in cand])
-            claims = arena.claim_slots([st for _, st in cand], [int(total_bytes)] * len(cand))
+            claims = _fill_claim(arena, [st for _, st in cand], int(total_bytes))
             full = []
             for (i, st), (slot, status, gen) in zip(cand, claims):
                 if status == 2:
@@ -3155,7 +3195,7 @@ class HiCacheFile(HiCacheStorage):
                 except Exception:  # noqa: BLE001
                     pass
                 for (i, st), (slot, status, gen) in zip(
-                        full, arena.claim_slots([st for _, st in full], [int(total_bytes)] * len(full))):
+                        full, _fill_claim(arena, [st for _, st in full], int(total_bytes))):
                     if status == 0:
                         todo.append((i, slot, gen, st))
                     elif status == 2:
