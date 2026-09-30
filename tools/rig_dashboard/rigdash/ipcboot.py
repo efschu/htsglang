@@ -336,6 +336,10 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
         out.append({"s": prev, "e": end, "k": "unknown", "why": "noch keine zweite IPC-Probe"})
     if live and out and out[-1]["k"] in ("P", "D", "dec"):
         out[-1]["running"] = True
+    if live:
+        for x in out[-2:]:
+            if x["k"] == "unknown" and x["e"] >= end - 1.5 and (x.get("why") or "").startswith("Rang-Zähler"):
+                x["why"] = "Arbeit läuft gerade, der Chunk ist noch nicht fertig -- die Zuordnung folgt mit seinem Ende"
     return {"segs": out, "span_s": SPAN_S, "t1": now if live else end, "overlap": m.overlap_s(),
             "states": list(activity.STATES)}
 

@@ -91,8 +91,8 @@ def chunks(ring, keys, g: str) -> List[dict]:
     * burst = chunks whose PP0 start (t - gpu_ms) lies within CHUNK_GAP_S of the burst's end; the burst
       runs from the first chunk's PP0 start to the end of its last chunk on the last stage (the first
       last-stage record whose counter reached that chunk) -- the P-Ende wall clock;
-    * the curve spreads chunk k over [PP0 end of chunk k-1, PP0 end of chunk k] (the first one from
-      its PP0 start, the last one on to the burst end): one chunk at a time, every token once.
+    * the curve spreads a burst's tokens evenly over the burst: never more than the burst rate, every
+      token once (per chunk gave 10k spikes with 27B's 1k-token chunks, several per sample).
     """
     k0, kl = stage_keys(keys, g)
     if k0 is None:
@@ -128,14 +128,14 @@ def chunks(ring, keys, g: str) -> List[dict]:
             burst.append(c)
             continue
         if burst:
+            # the curve: a burst's tokens spread evenly over the burst (its P-Ende wall clock).  Per
+            # chunk is not honest at 1-s rows: with ~1k-token chunks (27B) several end inside one
+            # sample, their end stamps bunch, and [prev end, end] gave 10k tok/s spikes (18:30Z).
+            start = min(x["s"] for x in burst)
             end = max(x["e"] for x in burst)
-            prev = None
             for i, x in enumerate(burst):
-                a0 = x["s"] if prev is None else max(prev, min(x["s"], x["e0"]) if x["s"] > prev else prev)
-                b0 = end if i == len(burst) - 1 else x["e0"]
-                x["parts"] = [(min(a0, b0 - 1e-3), b0)]
-                x["e"] = b0 if i == len(burst) - 1 else x["e0"]
-                prev = x["e0"]
+                x["parts"] = [(start, max(end, start + 1e-3))]
+                x["e"] = end if i == len(burst) - 1 else x["e0"]
         burst = [c] if c is not None else []
     return out
 
