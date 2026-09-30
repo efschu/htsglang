@@ -3202,6 +3202,7 @@ class Pending:
     dual_pause: bool = False
     leg1_aborted: bool = False  # DUAL-TP3PP3: P ended the leg by an abort (200, prompt_tokens=0)
     dual_paused_n: int = 0
+    dual_requeued: bool = False  # DUAL-TP3PP3: requeued by a pause, not ready for D
     #: H102: the client closed its connection before its answer; nothing is
     #: dispatched for it any more (no leg 1, no hand-off to D).
     client_gone: bool = False
@@ -11099,6 +11100,27 @@ class Front:
                         bool(t is not None and not t.done()), len(self.queue))
         return worst
 
+    def _dual_skip_after_requeue(self, p: "Pending") -> bool:
+        """Metal dual23 (16:07:04): the pause's requeue returned the Pending from
+        the pass's ``one``, and the pool's ``on_done`` handed it to D anyway
+        (D-ADMIT 68 ms after P-PAUSED): a never-started 129186-token B at D ->
+        X refusal -> W50 re-route. A requeued pause is back in leg 1, never D's."""
+        if getattr(p, "dual_requeued", False):
+            p.dual_requeued = False
+            return True
+        return False
+
+    def _dual_dispatch_held(self) -> bool:
+        """The P pool's gate for EVERY new leg 1 in the dual layout, inside a
+        running pass as well: not while D presses P (the same card read as the
+        pump's), and a requeued PAUSED head not before ``_dual_resume_held`` lets
+        it. Metal dual23: the running pass took the requeued B again 134 ms later
+        with pressure unchanged at 360710144 -> a second pause; the pump's own
+        gates (before a NEW pass) never saw it -- 0 RESUME-WAIT lines."""
+        if _dual_p_pressure(self.dual_kv_ledgers) > 0:
+            return True
+        return self._dual_resume_held()
+
     def _dual_resume_held(self) -> bool:
         """A requeued PAUSED request at the head goes back to P only when every
         card shows no pressure, nothing committed by P (all stages released) and
@@ -11162,6 +11184,7 @@ class Front:
         computes only the rest ("Lesen statt Rechnen")."""
         p.dual_pause = False
         p.leg1_done = False
+        p.dual_requeued = True  # _on_leg1_done must not hand it to D (dual23)
         p.dual_paused_n = int(getattr(p, "dual_paused_n", 0) or 0) + 1
         self.queue.appendleft(p)
         self.counters["dual_p_paused_requeued"] += 1
@@ -11565,6 +11588,8 @@ class Front:
                 nonlocal _drain_uncached, prefilled
                 if p.intake_stalled:
                     return  # weg2xsn272: back in the queue, not ready for D
+                if self._dual_skip_after_requeue(p):
+                    return  # DUAL pause: back at the head in leg 1, never handed to D (dual23)
                 if p.client_gone:
                     return  # H102: its client left; never handed to D
                 if p.resume_via_p:
@@ -11588,7 +11613,8 @@ class Front:
             # finishes, so P always has the next request queued.
             passes = await _p_drain_pool(
                 self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
-                lambda: self.state == "serving" and not self._p_intake_stalled,
+                lambda: (self.state == "serving" and not self._p_intake_stalled
+                         and not (self.dual_kv_ledgers and self._dual_dispatch_held())),
                 # H91 part C rule 1: at most p_phase_max_requests leave the
                 # queue in this P phase, overlapping only as far as their
                 # est_prompt fits P's unified pool (0 = off, law 1 as before).
