@@ -13604,6 +13604,212 @@ def driver_carve_min_total_mib(profile: Optional[str] = None) -> int:
     return int(getattr(row, "driver_carve_min_total_mib", 0) or 0)
 
 
+class Weg2DualLayoutRefused(Weg2LaunchRefused):
+    """DUAL-TP3PP3: a flag combination the dual layout cannot serve."""
+
+
+#: DUAL-TP3PP3: --dual-mps on only with this env set to 1. MEASURED 30.09.:
+#: repro v2 (gpuq scjhru, scripts/dual_layout/run_dualstress.sh) arm S1, where
+#: both groups are clients of ONE MPS daemon and run extend-sized barlink
+#: collectives (D 8 MiB AR, P 1 MiB AR + GEMM), WEDGED: P rc=124, D managed 31
+#: rounds in 45 s (max 62 s). The same arm without MPS (S3) was clean. Metal
+#: boots kw6pft and ndktv4 died the same way: both groups froze in the same
+#: second while D ran an eager extend and P prefilled. The device-spin
+#: collectives of the two groups couple through the shared MPS server context.
+DUAL_MPS_OPT_IN_ENV = "SGLANG_WEG2_DUAL_MPS_OPT_IN"
+
+
+def resolve_dual_layout(ns) -> None:
+    """DUAL-TP3PP3 (F26): the ONE place --dual-layout changes other flags.
+
+    Both groups stay awake, so their weights never sleep: --flip-weights is
+    forced to 'resident' and --idle-layout pp (an idle flip rule) to 'tp'.
+    Refused by name: --weg2-d-adopt on (D would hold placeholders that only a
+    flip fills -- and there is no flip), --dual-mps on without --dual-layout.
+    Off: no-op."""
+    if str(getattr(ns, "dual_unified_kv", "off")) == "on" and not getattr(ns, "dual_share", False):
+        raise Weg2DualLayoutRefused(
+            "DUAL-TP3PP3: --dual-unified-kv on needs --dual-share (the card KV ledger lives next to "
+            "the union image; P's pages are D's card)")
+    if getattr(ns, "dual_share", False) and not getattr(ns, "dual_layout", False):
+        print("WEG2-DUAL --dual-share implies --dual-layout", flush=True)
+        ns.dual_layout = True
+    dual = bool(getattr(ns, "dual_layout", False))
+    if not dual:
+        if str(getattr(ns, "dual_mps", "off")) == "on":
+            raise Weg2DualLayoutRefused(
+                "DUAL-TP3PP3: --dual-mps on needs --dual-layout (MPS only pays when both groups "
+                "run kernels at the same time)")
+        return
+    if str(getattr(ns, "dual_mps", "off")) == "on" and os.environ.get(DUAL_MPS_OPT_IN_ENV, "").strip() != "1":
+        raise Weg2DualLayoutRefused(
+            "DUAL-TP3PP3: --dual-mps on is refused -- MEASURED to wedge both groups: repro v2 "
+            "(gpuq scjhru 30.09., run_dualstress.sh arm S1: MPS + extend-sized barlink collectives of "
+            "D and P, P rc=124, D 31 rounds in 45 s; without MPS, arm S3, clean) and metal boots "
+            "kw6pft/ndktv4 (both groups frozen in the same second). Run without MPS "
+            f"(--dual-mps off, latency guard --dual-p-duty), or set {DUAL_MPS_OPT_IN_ENV}=1 "
+            "to opt in for a measurement.")
+    if _d_adopt_armed(ns):
+        raise Weg2DualLayoutRefused(
+            "DUAL-TP3PP3: --dual-layout with --weg2-d-adopt on -- D would hold placeholder "
+            "weights that only the first flip fills, and the dual layout never flips")
+    if str(getattr(ns, "idle_layout", "tp")) == "pp":
+        # The idle layout is a flip rule; the dual layout never flips, so it is
+        # moot -- but the front would still read it, hence forced, not kept.
+        print("WEG2-DUAL --idle-layout pp -> tp (the idle layout is a flip rule; "
+              "the dual layout never flips)", flush=True)
+        ns.idle_layout = "tp"
+    if getattr(ns, "flip_weights", "family") != "resident":
+        print(f"WEG2-DUAL --flip-weights {getattr(ns, 'flip_weights', 'family')} -> resident "
+              "(both groups stay awake, no weight ever sleeps)", flush=True)
+        ns.flip_weights = "resident"
+    if str(getattr(ns, "p_barlink_bar1_window_mib", P_BARLINK_BAR1_WINDOW_MIB)) == P_BARLINK_BAR1_WINDOW_MIB:
+        # Only the untouched default is replaced; an explicit operator value is kept.
+        print(f"WEG2-DUAL --p-barlink-bar1-window-mib {P_BARLINK_BAR1_WINDOW_MIB} -> "
+              f"{DUAL_P_BARLINK_BAR1_WINDOW_MIB} (P never sleeps, so both groups' BAR1 windows "
+              f"share the 3080's 256 MiB aperture)", flush=True)
+        ns.p_barlink_bar1_window_mib = DUAL_P_BARLINK_BAR1_WINDOW_MIB
+
+
+#: DUAL-TP3PP3: group P's BAR1 windows while BOTH groups are awake. Metal
+#: 30.09. boot f9fch3: with P at the flip default (24 + pp 96) D's dcp window
+#: was REFUSED on both 3080s (40 MiB wanted, 39 free). The 3080 has 256 MiB
+#: BAR1. The RM base, measured from that refusal line, is 19 MiB (NVML free 71
+#: with P 120 + D 46 held). So 19 + P 120 + D 88 = 227 left 29 free, under the
+#: 32 MiB reserve. The flip default only fits because P sleeps before D builds.
+#: With P at 16 + 64: 19 + 80 + 88 = 187, 69 free, 37 above the reserve. The
+#: price is more rounds per large pp send (per-round ~16 instead of ~24 MiB at
+#: ~323 us/round), about a millisecond on an 80 MiB hidden-state send.
+DUAL_P_BARLINK_BAR1_WINDOW_MIB = "16,PP_0=64"
+
+
+def dual_kv_ledger_paths(ns, cards) -> List[str]:
+    """DUAL-TP3PP3 unified KV: the card KV ledgers (weg2/card_kv_ledger.py) of
+    this boot, one per card; the ranks derive the same path from the tag and
+    their card uuid. Empty unless --dual-share."""
+    if not getattr(ns, "dual_share", False):
+        return []
+    from sglang.srt.weg2.card_kv_ledger import ledger_path
+
+    return [ledger_path(str(ns.tag), str(getattr(c, "uuid", ""))) for c in cards if getattr(c, "uuid", "")]
+
+
+#: DUAL-TP3PP3 --dual-share: written by the launcher once D is READY; the P
+#: stage waits for it before loading (model_executor/dual_stage_hull.py).
+DUAL_D_READY_FILE = "d_ready"
+
+
+def dual_share_env(ns, group: str) -> Dict[str, str]:
+    """DUAL-TP3PP3 --dual-share: the union env of one group. D OWNS the card's
+    image (and publishes its installed TP vectors with it), P BINDS the part of
+    its stage that is D's shard on the same card. Off: {}."""
+    if not getattr(ns, "dual_share", False):
+        return {}
+    import hashlib
+
+    # SHORT on purpose: the card sockets live under it and a unix socket path
+    # takes at most ~107 bytes; boot tags on this rig run past 60 characters.
+    _h = hashlib.sha1(str(ns.tag).encode()).hexdigest()[:10]
+    env = {"SGLANG_WEG2_UNION_DIR": f"/dev/shm/wu-{_h}",
+           "SGLANG_WEG2_UNION_MODE": "own" if group == "D" else "bind",
+           # Only the main model is shared: the draft is TP3-sharded in D and
+           # TP1 in P, so none of its tensors has one form in both groups
+           # (union_arena_bind.UNION_ROLES_ENV; metal 30.09. ...09300226).
+           "SGLANG_WEG2_UNION_ROLES": "main",
+           # Both groups stay awake: rank-side rules that assume the other
+           # group sleeps read this (scheduler._weg2_store_short_max_cycles).
+           "SGLANG_WEG2_DUAL_LAYOUT": "1",
+           # the card KV ledgers' name space: the ranks derive the same path
+           # as the front (dual_kv_ledger_paths) from this tag
+           "SGLANG_WEG2_DUAL_KV_TAG": str(ns.tag)}
+    if group == "P" and str(getattr(ns, "dual_unified_kv", "off")) == "on":
+        # unified KV (user orders 30.09. 07:10Z/07:25Z): P's pool is virtually
+        # this big; its pages come from the card pool (weg2/dual_p_kv_stage.py)
+        env["SGLANG_WEG2_DUAL_P_KV_MAX_TOKENS"] = str(int(getattr(ns, "dual_p_kv_max_tokens", 0) or 0))
+    if group == "D" and str(getattr(ns, "dual_unified_kv", "off")) == "on":
+        env["SGLANG_WEG2_DUAL_D_KV_MAX_TOKENS"] = str(int(getattr(ns, "dual_d_kv_max_tokens", 0) or 0))
+    if group == "P":
+        env["SGLANG_WEG2_DUAL_SHARE"] = "1"
+    return env
+
+
+def dual_p_cut_from_argv(argv) -> str:
+    """The --pp-stage-ratio group P was launched with ('' if absent)."""
+    argv = list(argv or ())
+    for i, t in enumerate(argv):
+        if t == "--pp-stage-ratio" and i + 1 < len(argv):
+            return str(argv[i + 1])
+        if str(t).startswith("--pp-stage-ratio="):
+            return str(t).split("=", 1)[1]
+    return ""
+
+
+def dual_share_planned_dc(cards, budgets_p: List[int], extra_p: str, overhead_mib: int) -> Dict[str, int]:
+    """What P will hold per card, from its PLAN: the effective P budget (an
+    --extra-p '--rank-gpu-memory-mib' lowers the launcher's, W100) plus what P
+    holds outside it. Indexed like ``cards`` (P rank i on cards[i])."""
+    eff = [int(b) for b in budgets_p]
+    toks = shlex.split(extra_p or "")
+    for i, t in enumerate(toks):
+        raw = None
+        if t == "--rank-gpu-memory-mib" and i + 1 < len(toks):
+            raw = toks[i + 1]
+        elif t.startswith("--rank-gpu-memory-mib="):
+            raw = t.split("=", 1)[1]
+        if raw is not None:
+            vals = [int(x) for x in raw.split(",") if x]
+            if len(vals) == len(eff):
+                eff = [min(a, b) for a, b in zip(eff, vals)]
+    return {c.uuid: int(eff[i]) + int(overhead_mib) for i, c in enumerate(cards)}
+
+
+def dual_duty_env(ns) -> Dict[str, str]:
+    """DUAL-TP3PP3 --dual-p-duty below 1: P's throttle env (the front gets the
+    same signal file on its argv). {} when off."""
+    duty = float(getattr(ns, "dual_p_duty", 1.0))
+    if not (0.0 < duty <= 1.0):
+        raise Weg2DualLayoutRefused(f"DUAL-TP3PP3: --dual-p-duty {duty} outside (0, 1]")
+    if duty >= 1.0 or not getattr(ns, "dual_layout", False):
+        return {}
+    from sglang.srt.weg2.dual_duty import dbusy_path
+
+    return {"SGLANG_WEG2_DUAL_P_DUTY": f"{duty:.3f}",
+            "SGLANG_WEG2_DUAL_DBUSY_FILE": dbusy_path(ns.tag)}
+
+
+def dual_p_sm_env(ns) -> Dict[str, str]:
+    """DUAL-TP3PP3: P's MPS SM share (only with --dual-mps on, only below 100)."""
+    pct = int(getattr(ns, "dual_p_sm_pct", 100))
+    if not (1 <= pct <= 100):
+        raise Weg2DualLayoutRefused(f"DUAL-TP3PP3: --dual-p-sm-pct {pct} outside 1..100")
+    if pct >= 100 or not getattr(ns, "dual_layout", False) or str(getattr(ns, "dual_mps", "off")) != "on":
+        return {}
+    return {"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(pct)}
+
+
+def start_dual_mps(ns, log, dry: bool) -> Dict[str, str]:
+    """DUAL-TP3PP3 --dual-mps on: one PRIVATE MPS control daemon for this
+    boot (pipe dir under /tmp/weg2-dual-mps-<tag>, so nothing outside the boot
+    can attach), started before the groups; returns the client env both
+    groups get. The daemon lives as long as the container. Off: {}."""
+    if not getattr(ns, "dual_layout", False) or str(getattr(ns, "dual_mps", "off")) != "on":
+        return {}
+    root = f"/tmp/weg2-dual-mps-{ns.tag}"
+    env = {"CUDA_MPS_PIPE_DIRECTORY": root + "/pipe", "CUDA_MPS_LOG_DIRECTORY": root + "/log"}
+    if not dry:
+        os.makedirs(env["CUDA_MPS_PIPE_DIRECTORY"], exist_ok=True)
+        os.makedirs(env["CUDA_MPS_LOG_DIRECTORY"], exist_ok=True)
+        r = subprocess.run(["nvidia-cuda-mps-control", "-d"], env={**os.environ, **env},
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            raise Weg2DualLayoutRefused(
+                f"DUAL-TP3PP3: nvidia-cuda-mps-control -d failed rc={r.returncode}: "
+                f"{(r.stderr or r.stdout).strip()[:300]}")
+    log(f"WEG2-DUAL MPS daemon {'(dry, not started)' if dry else 'started'}: pipe "
+        f"{env['CUDA_MPS_PIPE_DIRECTORY']} -- P and D are MPS clients on every card")
+    return env
+
+
 def _d_early_start_armed(ns) -> bool:
     """BOOTZEIT 3: the one resolution of ``--weg2-d-early-start``.
 
@@ -13612,6 +13818,10 @@ def _d_early_start_armed(ns) -> bool:
     Flash) and off for every other one, so the 27B line boots serial exactly
     as before until its own proof boot ran with an explicit 'on'."""
     mode = str(getattr(ns, "weg2_d_early_start", "off") or "off")
+    if getattr(ns, "dual_layout", False):
+        # DUAL-TP3PP3: D is sized from P's AWAKE footprint, measured after P's
+        # READY -- an early D would be planned before that number exists.
+        return False
     if mode == "auto":
         return d_early_start_proven(getattr(ns, "profile", None))
     return mode == "on"
@@ -15533,6 +15743,32 @@ class DTpRatioDecision:
     rows: Tuple[DOperatingPointRow, ...] = ()
 
 
+def dual_w64_override(refusal: str, budgets: Sequence[int], model: str, *, dual_layout: bool,
+                      evidence_dirs: Sequence[str] = (EVIDENCE_DIR,)) -> Tuple[bool, str]:
+    """DUAL-TP3PP3: may a W64 refusal of the SHIPPED D position be lifted under
+    --dual-layout? Only when the newest dual-share D log of this model with the
+    same installed weight vector shows, on its OWN budget posts (the runtime's
+    ``KV = budget - posts``), that every rank keeps >= the model's minimum
+    tokens at these budgets (weg2/dual_w64.py; metal a3t5js: model 17188 vs
+    measured ~14853 MiB on D r0). ``(lifted, note)``; never lifts off-dual,
+    never a non-W64 refusal, never without a measurement."""
+    if not dual_layout or not str(refusal).startswith("W64 "):
+        return False, ""
+    m = re.search(r"derives weights \[([\d, ]+)\]", str(refusal))
+    if not m:
+        return False, "W64-DUAL: the refusal names no weight vector; the model verdict stands"
+    weights = [int(x) for x in m.group(1).split(",") if x.strip()]
+    from sglang.srt.uneven_perf import _PREDICT_MIN_RANK_TOKENS
+    from sglang.srt.weg2 import dual_w64 as _dw
+
+    meas = _dw.find_dual_d_measurement(list(evidence_dirs), model, weights)
+    if meas is None:
+        return False, ("W64-DUAL: no measured dual-share D log of %s with weights %s under %s; "
+                       "the model verdict stands" % (model, weights, ", ".join(evidence_dirs)))
+    v = _dw.judge(meas, list(budgets), int(_PREDICT_MIN_RANK_TOKENS))
+    return v.feasible, v.line
+
+
 def d_tp_ratio_decision(
     objective: str,
     tune: str,
@@ -15543,6 +15779,7 @@ def d_tp_ratio_decision(
     env_d: str = "",
     user_reserve_by_card: Optional[Dict[str, int]] = None,
     overhead_mib_by_rank: Optional[Sequence[float]] = None,
+    dual_layout: bool = False,
 ) -> DTpRatioDecision:
     """Choose group D's weight objective and PRICE the choice on one line.
 
@@ -15624,6 +15861,14 @@ def d_tp_ratio_decision(
             for r in op_refusals
             if objective in r or r.startswith(("W61", "W63"))
         ]
+        if mine and dual_layout:
+            _lifted, _note = dual_w64_override(mine[0], budgets, model, dual_layout=True)
+            if _note:
+                op_line = op_line + "\n  " + _note
+            if _lifted:
+                mine = []
+            else:
+                mine = [mine[0] + (" | " + _note if _note else "")]
         if mine:
             raise Weg2LaunchRefused(mine[0] + " (position %s was SHIPPED, so "
                                     "the refusal is fatal here; on a maxkv boot "
@@ -20698,6 +20943,52 @@ def build_parser() -> argparse.ArgumentParser:
              "so the floor protects the box -- boot logs, the evidence tree, the model "
              "cache -- not the store. NOT the old 1 GiB, which was 1/6th of a 6 GiB "
              "tmpfs and latched the backend's write stop after 5 GiB.")
+    ap.add_argument("--dual-layout", action="store_true", default=False,
+                    help="DUAL-TP3PP3 (F26, user 29.09.): BOTH groups stay awake for the whole boot and "
+                         "the front never flips. Implies --flip-weights resident; P is NOT put to sleep "
+                         "after READY, its AWAKE footprint is measured in its place and D is sized from "
+                         "that measurement (the same per-PID reading the dormant residue uses). P's own "
+                         "budget is lowered with --extra-p '--rank-gpu-memory-mib ...' (W100 allows "
+                         "lowering). Refuses --weg2-d-adopt on and --idle-layout pp. Default off: the "
+                         "launcher is byte-identical.")
+    ap.add_argument("--dual-share", action="store_true", default=False,
+                    help="DUAL-TP3PP3 stage 1b (implies --dual-layout): P's stage computes on D's TP "
+                         "shards (shells over D's three shards of its layers) and binds the shard of the "
+                         "D rank on its card to D's bytes via the union image. D boots right after P as "
+                         "the union OWNER, sized from P's PLANNED budget (+ --dual-p-overhead-mib); P "
+                         "waits for D's image before it loads anything.")
+    ap.add_argument("--dual-p-overhead-mib", type=int, default=1500,
+                    help="DUAL-TP3PP3 --dual-share: what P holds on a card outside its "
+                         "--rank-gpu-memory-mib budget (CUDA context, graphs, activations), charged "
+                         "when D is sized from P's plan instead of P's measurement.")
+    ap.add_argument("--dual-p-duty", type=float, default=1.0,
+                    help="DUAL-TP3PP3: the share of wall time P's first stage may compute while D holds "
+                         "decodes (weg2/dual_duty.py; the latency guard WITHOUT MPS). 1.0 = off. The front "
+                         "publishes D's busy bit, P's PP0 idles t_fwd*(1-duty)/duty after each forward.")
+    ap.add_argument("--dual-p-sm-pct", type=int, default=100,
+                    help="DUAL-TP3PP3 with --dual-mps on: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for group P, "
+                         "i.e. the share of SMs P's kernels may occupy while D decodes. MEASURED 29.09. "
+                         "(risk-1 bench, 5090): unlimited P takes ~90%% of the card and D's step runs "
+                         "~7x slower; 50 splits ~50/50; the sum of both shares stays ~1.0 either way. "
+                         "100 = no limit.")
+    ap.add_argument("--dual-unified-kv", choices=("off", "on"), default="off",
+                    help="DUAL-TP3PP3: one KV pool per card shared by P and D at runtime (user orders "
+                         "30.09. 07:10Z/07:25Z; weg2/card_kv_ledger.py). P maps KV only while it "
+                         "prefills and pauses when D is short. Needs --dual-share.")
+    ap.add_argument("--dual-p-kv-max-tokens", type=int, default=196608,
+                    help="DUAL-TP3PP3 --dual-unified-kv: P's KV pool rows (virtual; pages from the card "
+                         "pool). Each K/V buffer is born at this size and trimmed at once, so the boot "
+                         "transient is one buffer (tokens x bytes per token per layer).")
+    ap.add_argument("--dual-d-kv-max-tokens", type=int, default=1048576,
+                    help="DUAL-TP3PP3 --dual-unified-kv: D's KV pool in GLOBAL tokens (virtual; D keeps "
+                         "its boot level mapped and grows from the card pool). Must exceed D's boot "
+                         "context; each buffer is born at its owner share of this and trimmed at once.")
+    ap.add_argument("--dual-mps", choices=("off", "on"), default="off",
+                    help="DUAL-TP3PP3: start a private MPS control daemon before the groups (pipe dir "
+                         "under the boot's run dir) so P and D kernels run concurrently on a card instead "
+                         "of time-slicing. Only with --dual-layout. REFUSED unless SGLANG_WEG2_DUAL_MPS_OPT_IN=1: "
+                         "measured to wedge both groups under extend-sized collectives (repro v2 scjhru S1, "
+                         "boots kw6pft/ndktv4); the dual layout runs without MPS, latency guard --dual-p-duty.")
     ap.add_argument("--flip-weights", choices=("family", "resident"), default="family",
                     help="Task #47 Scheibe 6a: 'family' (default) moves the weights family across the flip "
                          "(gathered legs, host ring / exchange); 'resident' keeps BOTH groups' weights mapped "
@@ -22800,6 +23091,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         weights_cpu_backup_armed = weight_exchange.weights_cpu_backup_armed(
             explicit=ns.weg2_weights_cpu_backup)
+    resolve_dual_layout(ns)
     if getattr(ns, "flip_weights", "family") == "resident":
         # Task #47 Scheibe 6a: the weights never sleep -> no host ring, no cpu
         # backup, no exchange; the ring planner takes the ABSENT-BY-DESIGN path.
@@ -24819,6 +25111,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
             user_reserve_by_card=user_reserve_by_card,
+            dual_layout=bool(getattr(ns, "dual_layout", False)),
             overhead_mib_by_rank=d_overhead_mib,
         )
         log(d_ratio.line)
@@ -24874,6 +25167,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
             user_reserve_by_card=user_reserve_by_card,
+            dual_layout=bool(getattr(ns, "dual_layout", False)),
             overhead_mib_by_rank=d_overhead_mib,
         )
         log(d_ratio.line)
@@ -24923,7 +25217,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                     f"p_free_reads_{ns.tag}")
         spec_p.env[_des.FREE_READ_JOURNAL_ENV] = _journal_dir
         log(f"{_des.FREE_READ_MARKER} P journals its free-memory reads -> {_journal_dir}")
+    ns._dual_mps_env = start_dual_mps(ns, log, dry)
+    spec_p.env.update(ns._dual_mps_env)
+    spec_p.env.update(dual_p_sm_env(ns))
+    spec_p.env.update(dual_duty_env(ns))
+    spec_p.env.update(dual_share_env(ns, "P"))
     launch_group(spec_p, tree, log, dry)
+    ns._dual_spec_d = None
+    if getattr(ns, "dual_share", False):
+        # DUAL-TP3PP3 1b: D boots NOW as the union owner; P holds before its
+        # load until D's image (and D's installed vectors) are published.
+        _dual_dc = dual_share_planned_dc(cards, state.budgets["P"], getattr(ns, "extra_p", ""),
+                                         int(getattr(ns, "dual_p_overhead_mib", 1500)))
+        log("WEG2-DUAL-SHARE D sized from P's PLAN (budget + overhead, MiB): " + ", ".join(
+            f"nvml{c.nvml_index} {_dual_dc[c.uuid]}" for c in cards))
+        _denv = dual_share_env(ns, "D")
+        _pcut = dual_p_cut_from_argv(spec_p.argv)
+        if _pcut:
+            # D's union image then holds only what the P stage on each card binds;
+            # D's other weights stay in their TMS tags (sleepable, stage 2).
+            _denv["SGLANG_WEG2_DUAL_P_CUT"] = _pcut
+        log(f"WEG2-DUAL-SHARE P cut for D's image filter: {_pcut or '(none -> whole image)'}")
+        _sd, _ = _d_spec_from(_dual_dc, "D(dual-share, P-Plan)", _denv)
+        _sd.env.update(ns._dual_mps_env)
+        state.argv["D"] = " ".join(shlex.quote(a) for a in _sd.argv)
+        launch_group(_sd, tree, log, dry)
+        ns._dual_spec_d = _sd
+        if not dry:
+            # D must be READY -- its KV sized, its graphs captured -- before P
+            # loads a byte: D sizes its KV off the card's free memory, and a P
+            # load running alongside would move that reading under it. P
+            # waits for this marker next to D's union socket.
+            state.t_ready["D"] = wait_ready(PORT_D, _sd.pid, ns.ready_deadline_s, log, "D", _sd.proc)
+            _udir = dual_share_env(ns, "D")["SGLANG_WEG2_UNION_DIR"]
+            os.makedirs(_udir, exist_ok=True)
+            with open(os.path.join(_udir, DUAL_D_READY_FILE), "w") as _f:
+                _f.write(f"{time.time():.3f}\n")
+            log(f"WEG2-DUAL-SHARE D READY -> {_udir}/{DUAL_D_READY_FILE}: P may load now")
     if dry:
         _dry_terms: List[Dict[str, object]] = []
         _dry_other, _dry_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
@@ -24939,6 +25269,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
             user_reserve_by_card=user_reserve_by_card,
+            dual_layout=bool(getattr(ns, "dual_layout", False)),
         )
         log(d_ratio.line)
         log(d_ratio.op_line)
@@ -25107,10 +25438,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # prices its image term from (BOOT_weg2dk7_0907.md: the weight-tag census
     # under-charged the measured image by +9.80 GiB).
     shmem_before = host_ledger.read_cgroup_shmem_bytes()
-    state.sleep_p_ms = sleep_group(PORT_P, log, "P", weights_tags)
-    time.sleep(2)
-    pids_p = session_pids(spec_p.pid)
-    image_rec = host_ledger.dormant_image_sample(
+    if getattr(ns, "dual_layout", False):
+        # DUAL-TP3PP3: P stays awake. What is measured below is P's AWAKE
+        # footprint, and D is sized from it exactly as it would be from the
+        # dormant residue. No dormant image is sampled or recorded -- an awake
+        # footprint in the dormant-image record would poison the next boot's
+        # ledger.
+        state.sleep_p_ms = 0.0
+        log("WEG2-DUAL P stays AWAKE (--dual-layout): no sleep leg, no dormant image; "
+            "the per-PID reading below is P's awake footprint and sizes D")
+        time.sleep(2)
+        pids_p = session_pids(spec_p.pid)
+    else:
+        state.sleep_p_ms = sleep_group(PORT_P, log, "P", weights_tags)
+        time.sleep(2)
+        pids_p = session_pids(spec_p.pid)
+    image_rec = None if getattr(ns, "dual_layout", False) else host_ledger.dormant_image_sample(
         group="P",
         shmem_before_bytes=shmem_before,
         shmem_after_bytes=host_ledger.read_cgroup_shmem_bytes(),
@@ -25128,9 +25471,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # forever and the transition path below would never retire.
         model_digest_=(host_ledger.checkpoint_digest(ns.model)[0] or ""),
     )
-    log(host_ledger.format_dormant_image(image_rec))
-    host_ledger.append_measured_record(measured_record_path(), image_rec)
-    state.dormant_image_p = image_rec
+    if image_rec is not None:
+        log(host_ledger.format_dormant_image(image_rec))
+        host_ledger.append_measured_record(measured_record_path(), image_rec)
+    state.dormant_image_p = image_rec or {}
     dc_p = nvml_process_mib(pids_p)
     for c in cards:
         dc_p.setdefault(c.uuid, 0)
@@ -25160,12 +25504,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(_ln)
 
     # 5. group D
-    spec_d = None
-    if _early_d is not None:
+    spec_d = getattr(ns, "_dual_spec_d", None)  # DUAL-TP3PP3 1b: launched right after P
+    if spec_d is None and _early_d is not None:
         spec_d = _d_early_verdict(_early_d, dc_p)
     if spec_d is None:
         spec_d, _ = _d_spec_from(dc_p, "D")
         state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
+        spec_d.env.update(getattr(ns, "_dual_mps_env", None) or {})
         launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
     _write_state(state)
@@ -25720,7 +26065,12 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
          if group_context_tokens(ns, "d")[0] > CONTEXT_LENGTH_TOKENS else []) + [
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
-    ] + (["--weights-resident"] if getattr(ns, "flip_weights", "family") == "resident" else []) + [
+    ] + (["--weights-resident"] if getattr(ns, "flip_weights", "family") == "resident" else []) + (
+        ["--dual-layout"] if getattr(ns, "dual_layout", False) else []) + (
+        ["--dual-dbusy-file", dual_duty_env(ns)["SGLANG_WEG2_DUAL_DBUSY_FILE"]]
+        if dual_duty_env(ns) else []) + (
+        ["--dual-kv-ledgers", ",".join(dual_kv_ledger_paths(ns, cards))]
+        if dual_kv_ledger_paths(ns, cards) else []) + [
         "--carrier-max-tokens", str(carrier_max_tokens),
         "--p-concurrency", str(p_bs),
         "--d-bs", str(d_bs),

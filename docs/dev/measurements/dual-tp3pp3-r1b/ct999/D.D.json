@@ -1,0 +1,73 @@
+{
+ "group": "D",
+ "size": 40960,
+ "gemm_m": 0,
+ "mps": true,
+ "sm_pct": null,
+ "ok": false,
+ "ranks": [
+  {
+   "group": "D",
+   "rank": 0,
+   "ok": false,
+   "err": "RuntimeError: [/pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:547] Connection closed by peer [127.0.0.1]:64642",
+   "bad": 0,
+   "ops": 0,
+   "proof": {
+    "(0, 1)": true,
+    "(0, 2)": true,
+    "(1, 0)": true,
+    "(1, 2)": true,
+    "(2, 0)": true,
+    "(2, 1)": true
+   },
+   "handles": true,
+   "p50_ms": 0.09714299812912941,
+   "p99_ms": 0.20883302204310894,
+   "max_ms": 20566.27417699201,
+   "n": 26957
+  },
+  {
+   "group": "D",
+   "rank": 1,
+   "ok": true,
+   "err": "",
+   "bad": 0,
+   "ops": 26956,
+   "proof": {
+    "(0, 1)": true,
+    "(0, 2)": true,
+    "(1, 0)": true,
+    "(1, 2)": true,
+    "(2, 0)": true,
+    "(2, 1)": true
+   },
+   "handles": true,
+   "p50_ms": 0.0795199885033071,
+   "p99_ms": 0.16175495693460107,
+   "max_ms": 2.6482330285944045,
+   "n": 26956
+  },
+  {
+   "group": "D",
+   "rank": 2,
+   "ok": false,
+   "err": "RuntimeError: [/pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:547] Connection closed by peer [127.0.0.1]:26799",
+   "bad": 0,
+   "ops": 0,
+   "proof": {
+    "(0, 1)": true,
+    "(0, 2)": true,
+    "(1, 0)": true,
+    "(1, 2)": true,
+    "(2, 0)": true,
+    "(2, 1)": true
+   },
+   "handles": true,
+   "p50_ms": 0.08542003342881799,
+   "p99_ms": 0.18209300469607115,
+   "max_ms": 21109.59801595891,
+   "n": 26957
+  }
+ ]
+}

@@ -1,0 +1,14 @@
+{
+ "dur_s": 6.0,
+ "decode_steps_per_s": 147.0,
+ "decode_p50_ms": 6.832293001934886,
+ "decode_p99_ms": 6.8563529930543154,
+ "decode_max_ms": 6.864517985377461,
+ "decode_weight_gb": 3.3554432,
+ "role": "decode",
+ "rows": 4,
+ "prefill_m": 4096,
+ "device": "NVIDIA GeForce RTX 5090",
+ "mem_reserved_gb": 3.527409664,
+ "wall_start": 1790716720.6928515
+}

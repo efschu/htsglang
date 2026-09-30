@@ -3039,7 +3039,12 @@ def _kv_stage_born(pool, t: torch.Tensor, name: str) -> torch.Tensor:
     stage_rows = kv_stage_boot_rows(int(pool.size), int(pool.page_size))
     if stage_rows is not None:
         pool.set_stage_backed_rows(stage_rows)
-    return t
+    # DUAL-TP3PP3 unified KV (B): group P's buffers map 0 tokens at birth
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    from sglang.srt.weg2 import dual_d_kv_stage as _ddk
+
+    return _ddk.born(pool, _dpk.born(pool, t, name), name)
 
 
 def zero_kv_data_buffers(kvcache) -> int:

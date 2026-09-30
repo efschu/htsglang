@@ -1,0 +1,11 @@
+{
+ "dur_s": 6.0,
+ "prefill_tflops": 24.73901162496,
+ "prefill_iters": 216,
+ "role": "prefill",
+ "rows": 4,
+ "prefill_m": 4096,
+ "device": "NVIDIA GeForce RTX 3080",
+ "mem_reserved_gb": 0.423624704,
+ "wall_start": 1790716858.7467947
+}

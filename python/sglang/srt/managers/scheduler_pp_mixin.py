@@ -11530,6 +11530,16 @@ class SchedulerPPMixin:
         _bubble = self._pp_bubble_meter()
         if _bubble is not None:
             _bubble.begin(mb_id)
+        # DUAL-TP3PP3 (weg2/dual_duty.py): while D decodes, the first P stage
+        # idles after each forward so P computes at most --dual-p-duty of the
+        # wall time. None unless SGLANG_WEG2_DUAL_P_DUTY + _DBUSY_FILE are set.
+        _duty = (_dual_duty_throttle(self)
+                 if os.environ.get("SGLANG_WEG2_DUAL_P_DUTY") else None)
+        _duty_ev0 = None
+        if _duty is not None:
+            _duty.before_forward()
+            _duty_ev0 = self.device_module.Event(enable_timing=True)
+            _duty_ev0.record(self.device_module.current_stream())
         # #PGAP (weg2_p_overlap.py): card idle before THIS forward, measured on
         # the card (timing events on the forward stream), plus the host phases
         # since the previous launch. None when SGLANG_WEG2_P_HOSTGAP is unset.
@@ -11564,6 +11574,10 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                if _duty_ev0 is not None:
+                    _duty_ev1 = self.device_module.Event(enable_timing=True)
+                    _duty_ev1.record(self.device_module.current_stream())
+                    self._dual_duty_pending = (_duty_ev0, _duty_ev1)
                 if _gap is not None:
                     _gap_host["launch"] = float(getattr(self, "_1466_run_ms", 0.0) or 0.0)
                     # spans opened INSIDE this launch (fi_plan: flashinfer's
@@ -11949,3 +11963,29 @@ class ChunkSizePredictor:
             return None
 
         return dynamic_chunk_size
+
+
+def _dual_duty_throttle(sched):
+    """DUAL-TP3PP3: the first P stage's duty throttle (weg2/dual_duty.py), made
+    once per scheduler; None on every other rank. Only reached when
+    SGLANG_WEG2_DUAL_P_DUTY is set (the call site checks the env first, so a
+    default boot never touches the scheduler here). Feeds the previous
+    forward's GPU time (timing events, read once complete) before it is asked
+    for the next pause."""
+    t = getattr(sched, "_dual_duty_obj", False)
+    if t is False:
+        t = None
+        if sched.pp_group.is_first_rank:
+            from sglang.srt.weg2.dual_duty import DutyThrottle
+
+            t = DutyThrottle.from_env()
+            if t is not None:
+                logger.info("DUAL-TP3PP3 P duty throttle armed: duty=%.2f signal=%s",
+                            t.duty, t.path)
+        sched._dual_duty_obj = t
+    if t is not None:
+        pend = getattr(sched, "_dual_duty_pending", None)
+        if pend is not None and pend[1].query():
+            t.after_forward(pend[0].elapsed_time(pend[1]) / 1000.0)
+            sched._dual_duty_pending = None
+    return t

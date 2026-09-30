@@ -106,6 +106,7 @@ def own_image(
     card: str,
     phase: str,
     device,
+    include=None,
 ) -> ArenaLayout:
     """Pack this rank's weights into an exportable arena and publish them.
 
@@ -117,6 +118,13 @@ def own_image(
     from sglang.srt.managers.phase_flip_boot import checkpoint_param_dict
 
     named = _shareable(checkpoint_param_dict(model))
+    if include is not None:
+        # DUAL-TP3PP3: only what the peer can bind goes into the image; the rest
+        # stays where the loader put it (TMS weight tags: sleepable in stage 2).
+        kept_out = sum(1 for n in named if not include(n))
+        named = {n: t for n, t in named.items() if include(n)}
+        logger.info("WEG2-UNION OWNER image filter: %d tensors in, %d stay outside the image",
+                    len(named), kept_out)
     layout = plan_arena_layout(dict(named))
     before = _free_bytes(device)
     # BEFORE the pack. Once a parameter is rebound to an arena view its
@@ -230,6 +238,23 @@ def bind_image(
     return binding.shared_bytes, binding.private_bytes
 
 
+#: Which model roles take part in the union (comma list, default: all). The
+#: dual layout sets "main": D holds the draft TP3-sharded and P holds it TP1
+#: (full vocab), so no draft tensor has the same form in both groups (metal
+#: 30.09. dkr27bnvfp4dual1bbar1fs09300226: predecessor_codebook (248320, 256)
+#: in P vs (82816, 256) in D's manifest -> UnionShareError). The draft stays
+#: private in each group; P's plan already carries its draft.
+UNION_ROLES_ENV = "SGLANG_WEG2_UNION_ROLES"
+
+
+def union_role_enabled(role: str, env=None) -> bool:
+    env = os.environ if env is None else env
+    raw = str(env.get(UNION_ROLES_ENV, "") or "").strip()
+    if not raw:
+        return True
+    return role in {x.strip() for x in raw.split(",") if x.strip()}
+
+
 def maybe_union_image(model, *, device, role: str = "main") -> Optional[str]:
     """Boot hook: own or bind the card's weight image, by env.
 
@@ -245,6 +270,13 @@ def maybe_union_image(model, *, device, role: str = "main") -> Optional[str]:
         raise UnionShareError(
             f"{UNION_MODE_ENV} must be 'own', 'bind' or 'off', got {mode!r}"
         )
+    if not union_role_enabled(role):
+        logger.info(
+            "WEG2-UNION role=%s not in %s=%r: this model stays private (no image %s)",
+            role, UNION_ROLES_ENV, os.environ.get(UNION_ROLES_ENV, ""),
+            "published" if mode == "own" else "bound",
+        )
+        return None
     from sglang.srt.managers.weg2_memory_saver import weg2_group_name
 
     phase = weg2_group_name()
@@ -255,6 +287,11 @@ def maybe_union_image(model, *, device, role: str = "main") -> Optional[str]:
     # living on the same card, and it needs its own arena and socket.
     scoped_dir = union_dir if role == "main" else os.path.join(union_dir, role)
     if mode == "own":
+        if phase == PHASE_D and role == "main":
+            # DUAL-TP3PP3 1b: the P stage builds its parts under D's vectors;
+            # D resolves them at runtime (auto / d-reshard), so D publishes the
+            # INSTALLED ones before its image -- P reads them after the wait.
+            write_d_ratios(scoped_dir)
         own_image(
             model,
             union_dir=scoped_dir,
@@ -262,6 +299,7 @@ def maybe_union_image(model, *, device, role: str = "main") -> Optional[str]:
             card=card,
             phase=phase,
             device=device,
+            include=(dual_share_include() if phase == PHASE_D and role == "main" else None),
         )
     else:
         bind_image(
@@ -274,3 +312,74 @@ def maybe_union_image(model, *, device, role: str = "main") -> Optional[str]:
             required=(role == "main"),
         )
     return mode
+
+
+D_RATIOS_FILE = "d_ratios.json"
+
+
+def write_d_ratios(union_dir: str) -> str:
+    """Write D's installed TP partition vectors (base + mlp/moe/vocab families
+    that differ from the base) to ``<union_dir>/d_ratios.json`` atomically.
+    Every D rank writes the same content; the last rename wins harmlessly."""
+    import json
+
+    from sglang.srt.distributed.utils import get_tp_partition_ratios
+
+    base = get_tp_partition_ratios(None)
+    fams = {}
+    for name in ("mlp", "moe", "vocab"):
+        vec = get_tp_partition_ratios(name)
+        if vec is not None and base is not None and list(vec) != list(base):
+            fams[name] = [int(x) for x in vec]
+    os.makedirs(union_dir, exist_ok=True)
+    path = os.path.join(union_dir, D_RATIOS_FILE)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump({"tp": None if base is None else [int(x) for x in base], "families": fams}, f)
+    os.replace(tmp, path)
+    logger.info("WEG2-UNION D ratios published for the dual P stage: %s -> %s",
+                {"tp": base, "families": fams}, path)
+    return path
+
+
+#: DUAL-TP3PP3: the P layer cut ("49,8,7") and which P stage shares this D
+#: rank's card; with both set, D's image holds only the tensors that P stage
+#: binds (its layers; embed on stage 0; lm_head/final norm on the last stage).
+DUAL_P_CUT_ENV = "SGLANG_WEG2_DUAL_P_CUT"
+DUAL_P_STAGE_OF_RANK_ENV = "SGLANG_WEG2_DUAL_P_STAGE_OF_D_RANK"
+
+
+def dual_share_include_for(cut, stage: int):
+    """Name filter for D's image under the P stage ``stage`` of ``cut``."""
+    import re
+
+    cut = [int(x) for x in cut]
+    lo = sum(cut[:stage])
+    hi = lo + cut[stage]
+    last = stage == len(cut) - 1
+    layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+    def include(name: str) -> bool:
+        m = layer_re.search(name)
+        if m:
+            return lo <= int(m.group(1)) < hi
+        if "embed_tokens" in name:
+            return stage == 0
+        if "lm_head" in name or name.endswith("model.norm.weight") or name.endswith(".norm.weight"):
+            return last
+        return False
+
+    return include
+
+
+def dual_share_include():
+    """The filter for THIS D rank, from env; None (whole image) when unset."""
+    cut = os.environ.get(DUAL_P_CUT_ENV, "").strip()
+    if not cut:
+        return None
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    r = int(get_tensor_model_parallel_rank())
+    stages = [int(x) for x in os.environ.get(DUAL_P_STAGE_OF_RANK_ENV, "").split(",") if x.strip()]
+    stage = stages[r] if stages else r
+    return dual_share_include_for(cut.split(","), stage)

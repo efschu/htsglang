@@ -79,6 +79,10 @@ from sglang.srt.weg2.intake_stall import STALL_MARK as _INTAKE_STALL_MARK  # H91
 #: weg2xsn291: the least a woken group keeps the cards even when fairness or
 #: work-exhaustion override the derived min-dwell (see Front._dwell_ok).
 FAIRNESS_DWELL_FLOOR_MS = 2000.0
+
+#: DUAL-TP3PP3: pause between two P passes after an intake stall or a failed
+#: pass (the P pool is full; D drains it through the store meanwhile).
+DUAL_STALL_BACKOFF_S = 0.5
 from sglang.srt.environ import envs
 from sglang.srt.managers import corridor_guard
 from sglang.srt.managers.corridor_guard import (
@@ -3176,6 +3180,9 @@ class Pending:
     posted_evt: Optional[asyncio.Event] = None
     #: C12: how often D refused this rid with W31.  A second one is W35.
     x_requeues: int = 0
+    #: DUAL-TP3PP3 unified KV: the front paused this leg 1 (D short of KV)
+    dual_pause: bool = False
+    dual_paused_n: int = 0
     #: H102: the client closed its connection before its answer; nothing is
     #: dispatched for it any more (no leg 1, no hand-off to D).
     client_gone: bool = False
@@ -3674,6 +3681,23 @@ def _env_switch_on(name: str) -> bool:
     return str(os.environ.get(name, "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
+
+#: DUAL-TP3PP3: why every flip is refused under --dual-layout.
+DUAL_NO_FLIP_WHY = ("--dual-layout: both groups stay awake and the front never flips "
+                    "(P prefills while D decodes; no group holds a released region to wake)")
+
+
+def _dual_p_pressure(paths) -> int:
+    """DUAL-TP3PP3 unified KV: the largest pressure a card ledger puts on P."""
+    from sglang.srt.weg2.card_kv_ledger import p_pressure
+
+    try:
+        return int(p_pressure(paths))
+    except Exception as exc:  # noqa: BLE001 -- a ledger read never stops the pump
+        logger.warning("WEG2 DUAL card KV ledger read failed: %r", exc)
+        return 0
+
+
 class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
@@ -3701,7 +3725,8 @@ class Front:
                  p_pool_tokens: int = 0,
                  d_wait_bound_s: float = 0.0,
                  p_leg1_stall_s: float = 0.0,
-                 d_park_immediate: bool = False):
+                 d_park_immediate: bool = False,
+                 dual_layout: bool = False):
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
         # key is world-readable in /proc/<pid>/cmdline), but the front does, and
@@ -4176,6 +4201,21 @@ class Front:
         #: The CLASS default is off (the 27B front byte-identical); main()
         #: resolves the flag from SGLANG_WEG2_D_PARK_IMMEDIATE / the profile.
         self.d_park_immediate = bool(d_park_immediate)
+        #: DUAL-TP3PP3 (F26, user 29.09.): both groups stay AWAKE for the
+        #: whole boot and the front never flips. Leg 1 goes to P the moment a
+        #: request is queued (the P pump below runs the unchanged P drain
+        #: pass), leg 2 goes to D as soon as leg 1 returned (the admitter;
+        #: D is `awake`), SHORT work is served on D as in every D phase.
+        #: Default off: the front is byte-identical.
+        self.dual_layout = bool(dual_layout)
+        self._dual_task: Optional[asyncio.Task] = None
+        self._dual_backoff_until = 0.0
+        #: DUAL-TP3PP3 unified KV (user order 30.09. 07:25Z): the card KV
+        #: ledgers (weg2/card_kv_ledger.py). Set by main from --dual-kv-ledgers;
+        #: empty = no pause logic (byte-identical dual pump).
+        self.dual_kv_ledgers: List[str] = []
+        #: rids whose leg 1 is in flight on P under the dual pump
+        self._dual_inflight: Dict[str, "Pending"] = {}
         #: the D phase (epoch) whose immediate park was held by the dwell
         #: already named (one WEG2 PARK-IMMEDIATE-DWELL line per phase).
         self._park_immediate_dwell_epoch = -1
@@ -5333,6 +5373,8 @@ class Front:
                     "force_close" if _ka_client is None else "%.1f s" % _ka_client, _ka_server, _ka_src)
         app["controller"] = asyncio.create_task(self.controller())
         app["admitter"] = asyncio.create_task(self.d_admitter())
+        if getattr(self, "dual_layout", False) and getattr(self, "dual_dbusy_file", ""):
+            app["dual_dbusy"] = asyncio.create_task(self.dual_dbusy_writer())
         app["health"] = asyncio.create_task(self.health_poller())
         app["corridor"] = asyncio.create_task(self.corridor_sampler())
         # #1262 tier 3 -- the deadman's third signal, see flip_stall_check.
@@ -9636,6 +9678,14 @@ class Front:
         if getattr(self, "state", None) == "STOP":
             self._refuse_flip_in_stop(src, dst, "before the flip")
             return
+        if getattr(self, "dual_layout", False):
+            # DUAL-TP3PP3: refused BEFORE any effect, whoever asks. Both groups
+            # stay awake and neither owns a released region; a flip leg would
+            # resume a kv_cache P never released (metal 30.09. ...09300304: W29
+            # KeyError 'kv_cache' on all P ranks after a POST /weg2/flip).
+            self.counters["flip_refused_dual"] += 1
+            logger.error("WEG2-FLIP REFUSED-DUAL sleep=%s wake=%s: %s", src, dst, DUAL_NO_FLIP_WHY)
+            return
         # #55 F2: unlock the clocks BEFORE anything of the flip runs -- both groups' legs use the cards.
         _ic = getattr(self, "_idle_clock", None)
         if _ic is not None:
@@ -10872,6 +10922,87 @@ class Front:
                        queue_name, len(self.queue))
         return True
 
+    async def dual_dbusy_writer(self, period_s: float = 0.02) -> None:
+        """DUAL-TP3PP3 --dual-p-duty: publish whether D holds decodes (its
+        outstanding set, the admitted seats included) for P's duty throttle."""
+        from sglang.srt.weg2.dual_duty import DBusyWriter
+
+        w = DBusyWriter(self.dual_dbusy_file)
+        D = self.groups["D"]
+        while True:
+            try:
+                w.update(bool(D.outstanding) or self._handoff_in_flight() > 0)
+            except Exception as e:  # noqa: BLE001 -- a missing signal means no throttle
+                logger.warning("WEG2 DUAL-DBUSY write failed: %s", e)
+            await asyncio.sleep(period_s)
+
+    def _dual_pump(self, pass_fn) -> None:
+        """DUAL-TP3PP3: keep ONE P drain pass running while the queue holds
+        work. A pass ends when the queue is empty (law 1), at the H91 cap or on
+        an intake stall; the next controller tick starts the next pass. After a
+        stall the pump waits DUAL_STALL_BACKOFF_S: P's pool is full and D is
+        draining it through the store, a hot re-dispatch would only re-stall."""
+        t = self._dual_task
+        if t is not None and not t.done():
+            return
+        if t is not None:
+            self._dual_task = None
+            exc = t.exception() if not t.cancelled() else None
+            if exc is not None:
+                self.counters["dual_pass_errors"] += 1
+                logger.error("WEG2 DUAL-LAYOUT P-pass failed: %r", exc)
+                self._dual_backoff_until = time.time() + DUAL_STALL_BACKOFF_S
+            elif getattr(self, "_p_intake_stalled", False):
+                self._dual_backoff_until = time.time() + DUAL_STALL_BACKOFF_S
+        if self.dual_kv_ledgers:
+            # User order 30.09. 07:25Z: VRAM-KV short -> P pauses, frees its
+            # context, keeps what it finished in L2; resumes when KV is free.
+            pressure = _dual_p_pressure(self.dual_kv_ledgers)
+            if pressure > 0:
+                self._dual_pause_inflight(pressure)
+                return  # no new P pass while D is short
+        if not self.queue or time.time() < self._dual_backoff_until:
+            return
+        self.counters["dual_passes"] += 1
+        self._dual_task = asyncio.get_running_loop().create_task(pass_fn())
+
+    def _dual_pause_inflight(self, pressure: int) -> None:
+        """Mark every leg 1 in flight on P as PAUSED and abort it on P (every
+        PP rank; P stops at its next chunk boundary -- the finished chunks are
+        in L2 by the per-chunk write-through). ``one`` requeues the request at
+        the head without failing it: it stays in leg 1, no W50, no 503."""
+        for rid, p in list(self._dual_inflight.items()):
+            if getattr(p, "dual_pause", False):
+                continue
+            p.dual_pause = True
+            self.counters["dual_p_pauses"] += 1
+            logger.warning(
+                "WEG2 DUAL P-PAUSE rid=%s pressure=%d B: D is short of KV on a card -- P stops at "
+                "its next chunk boundary and frees its context; the finished chunks stay in L2 "
+                "(user order 07:25Z)", rid, int(pressure))
+            asyncio.get_running_loop().create_task(self._dual_abort_p(rid))
+
+    async def _dual_abort_p(self, rid: str) -> None:
+        try:
+            code, _b = await self.rpc(self.groups["P"], "/abort_request", {"rid": rid}, 30)
+            logger.info("WEG2 DUAL P-PAUSE rid=%s /abort_request on P -> %s", rid, code)
+        except Exception as exc:  # noqa: BLE001 -- the leg's own error path still requeues
+            logger.warning("WEG2 DUAL P-PAUSE rid=%s /abort_request on P raised: %s", rid, exc)
+
+    def _dual_requeue_paused(self, p: "Pending") -> None:
+        """The paused request goes back to the HEAD of the queue, still in leg 1.
+        Its next leg 1 READS the chunks P finished from L2 (#1400 intake) and
+        computes only the rest ("Lesen statt Rechnen")."""
+        p.dual_pause = False
+        p.leg1_done = False
+        p.dual_paused_n = int(getattr(p, "dual_paused_n", 0) or 0) + 1
+        self.queue.appendleft(p)
+        self.counters["dual_p_paused_requeued"] += 1
+        logger.warning(
+            "WEG2 DUAL P-PAUSED rid=%s requeued at the head (pauses=%d, queue=%d) -- resumes when "
+            "the card KV is free again, reading its finished chunks from L2",
+            p.rid, p.dual_paused_n, len(self.queue))
+
     async def _adopt_first_flip(self) -> None:
         """#108: EIN Flip-Paar, bevor der erste Request kommt.
 
@@ -11161,6 +11292,188 @@ class Front:
         logger.info("WEG2 P-READ-OVERLAP max_extra=%d state=%s (RO: legs P holds for a store "
                     "read free a dispatch slot each; 0 = the p_concurrency+ahead cap alone)",
                     _ro_max, getattr(_ro_state, "path", None))
+        async def _p_drain_pass() -> int:
+            """One P drain pass (the former inline `awake == P` block, moved
+            verbatim so the DUAL-TP3PP3 pump can run the SAME pass while D stays
+            awake). Returns the pool's pass count."""
+            # awake == P: prefill the backlog until empty (#1011 PP exit
+            # clock).  LAW 1: the phase ends on an EMPTY queue, never on
+            # p_concurrency and never on a timer -- p_concurrency bounds
+            # only how many leg-1 POSTs are in flight at once.
+            # H91 part C AMENDS law 1 (user 25.09.): with
+            # --p-phase-max-requests N > 0 the phase also ends once N
+            # requests left the queue (the rest waits for the next P phase),
+            # and --p-pool-tokens plans the overlap against P's pool.
+            t_drain0 = time.time()
+            queue_at_entry = len(self.queue)
+            prefilled = 0
+            passes = 0
+            # weg2xsn272: a P intake stall ends THIS drain (no new
+            # dispatches, the stalled request stays at the head) and the
+            # flip below follows because the queue is not empty.
+            self._p_intake_stalled = False
+            short_behind_p0 = self.counters.get("short_behind_p", 0)
+            # MF-3: the same delta idiom as `short_behind_p0` -- the
+            # epoch's terms are read off the running counters rather than
+            # carried in a second per-epoch structure.
+            reuse0 = (self.counters.get("p_prefill_requests", 0),
+                      self.counters.get("p_prefix_tokens_in_store", 0),
+                      self.counters.get("p_prefix_tokens_reused", 0))
+            _drain_uncached = 0
+            # H91 part C rule 1: the drain's stats and its overlap plan
+            # (the queue head folded against P's pool, for the P-PHASE line).
+            _phase_stats: Dict[str, int] = {}
+            _overlap_plan = phase_policy.plan_p_overlap(
+                [phase_policy.p_request_cost(p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1)
+                 for p in list(self.queue)[:max(1, self.p_phase_max_requests or len(self.queue))]],
+                self.p_pool_tokens,
+                min(self.p_concurrency + _ahead, self.p_phase_max_requests or (self.p_concurrency + _ahead)))
+            async def one(p: Pending) -> Pending:
+                if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once
+                    p.leg1_done = True
+                    return p
+                async with sem:
+                    if p.client_gone:  # H102: its client left while it waited for a P slot
+                        return p
+                    try:
+                        if self.dual_kv_ledgers:
+                            self._dual_inflight[p.rid] = p
+                        await self.leg1(p)
+                    except Exception as e:  # noqa: BLE001
+                        if p.client_gone:  # H102: aborted on P for a client that left
+                            self.counters["leg1_client_gone"] += 1
+                            return p
+                        if getattr(p, "dual_pause", False):
+                            # DUAL unified KV: our own pause abort, not a failure
+                            self._dual_requeue_paused(p)
+                            return p
+                        if is_intake_stall(e) and not is_too_large(e):
+                            await self._requeue_intake_stalled(p, e)
+                            return p
+                        if is_too_large(e):
+                            # weg2xsn291: larger than P's whole pool -- no
+                            # flip can make room; refused by name, never
+                            # requeued (the requeue loop killed the boot).
+                            self.counters["p_intake_too_large"] += 1
+                            logger.error(
+                                "WEG2 P-INTAKE-TOO-LARGE rid=%s est_prompt=%d: refused, "
+                                "not requeued -- the request exceeds P's pool: %s",
+                                p.rid, int(p.est_prompt), str(e)[:300])
+                        self.counters["leg1_failures"] += 1
+                        logger.error("WEG2 leg1 rid=%s failed: %s", p.rid, e)
+                        if not p.fut.done():
+                            p.fut.set_exception(e)
+                        return p
+                    finally:
+                        self._dual_inflight.pop(p.rid, None)
+                    if getattr(p, "dual_pause", False):
+                        # the pause came after P had finished this leg: nothing to redo
+                        p.dual_pause = False
+                    p.leg1_done = True
+                    # xsn286: a request requeued by an intake stall is an
+                    # ordinary request again once its leg 1 succeeded --
+                    # the flag stayed set, _on_leg1_done skipped it, it
+                    # never reached D (weg2-6-4: prefilled 44 s on P in the
+                    # next phase, then nothing; D idle, IDLE-WEDGE).
+                    p.intake_stalled = False
+                return p
+
+            def _on_leg1_done(p: Pending) -> None:
+                nonlocal _drain_uncached, prefilled
+                if p.intake_stalled:
+                    return  # weg2xsn272: back in the queue, not ready for D
+                if p.client_gone:
+                    return  # H102: its client left; never handed to D
+                if p.resume_via_p:
+                    self._rvp_p_finished(p)
+                    prefilled += 1
+                    return
+                _drain_uncached += int(p.est_uncached)
+                if not p.fut.done():
+                    p.t_ready = time.time()  # #244 seat_wait_s
+                    self._ready_for_d.append(p)
+                    self._sync_batch_gate()
+                    prefilled += 1
+
+            # #1459c: a CONTINUOUS pool, not paired batches.  The #1459
+            # form dispatched `p_concurrency + ahead` requests as ONE
+            # batch and gathered the whole batch before taking the next,
+            # so only every second request had a successor queued on P
+            # while it ran (xsn217: -7 finished 26.2 s after -6, -8 took
+            # 29.5 s again -- the 3 s store probe was back on every
+            # second request).  The pool refills the moment ONE leg
+            # finishes, so P always has the next request queued.
+            passes = await _p_drain_pool(
+                self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
+                lambda: self.state == "serving" and not self._p_intake_stalled,
+                # H91 part C rule 1: at most p_phase_max_requests leave the
+                # queue in this P phase, overlapping only as far as their
+                # est_prompt fits P's unified pool (0 = off, law 1 as before).
+                max_dispatch=self.p_phase_max_requests,
+                cost=lambda p: phase_policy.p_request_cost(
+                    p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1),
+                budget=self.p_pool_tokens, stats=_phase_stats,
+                extra=(None if _ro_state is None else
+                       (lambda ps: _ro.extra_slots((q.rid for q in ps), _ro_state.rids(), _ro_max))),
+                poll_s=_ro.POLL_S)
+            if _phase_stats.get("overlap_dispatched"):
+                self.counters["p_read_overlap"] += _phase_stats["overlap_dispatched"]
+                logger.info("WEG2 P-READ-OVERLAP epoch=%d overlap_dispatched=%d dispatched=%d "
+                            "peak_n=%d base=%d (RO: dispatched while P held legs for their "
+                            "store reads -- P computed them instead of idling)",
+                            self.epoch, _phase_stats["overlap_dispatched"],
+                            _phase_stats["dispatched"], _phase_stats["peak_n"],
+                            self.p_concurrency + _ahead)
+            if passes and (self.p_phase_max_requests or self.p_pool_tokens):
+                _cap_hit = phase_policy.phase_cap_reached(
+                    _phase_stats["dispatched"], self.p_phase_max_requests)
+                logger.info(
+                    "WEG2 P-PHASE epoch=%d dispatched=%d cap=%d prefilled=%d end=%s "
+                    "overlap_plan=%d peak_overlap=%d peak_inflight_tokens=%d pool_tokens=%d "
+                    "pool_holds=%d queue_left=%d (H91 part C rule 1: the phase ends at the "
+                    "cap or on an empty queue; overlap planned from est_prompt against P's "
+                    "unified pool; what is left waits for the next P phase)",
+                    self.epoch, _phase_stats["dispatched"], self.p_phase_max_requests,
+                    prefilled,
+                    ("stall" if self._p_intake_stalled else "cap" if _cap_hit
+                     else "empty" if not self.queue else "leaving"),
+                    _overlap_plan, _phase_stats["peak_n"], _phase_stats["peak_tokens"],
+                    self.p_pool_tokens, _phase_stats["pool_holds"], len(self.queue))
+            if passes:
+                oldest_short = 0.0
+                if self._ready_for_d:
+                    oldest_short = time.time() - self._ready_for_d[0].t_arrive
+                # #1271 (b): ONE r_P SAMPLE PER DRAIN WINDOW, in the same
+                # unit the launcher now uses -- the uncached tokens this
+                # drain moved over the drain's own wall. NOT per request:
+                # the drain runs at p_concurrency, so a per-request wall
+                # counts queueing behind peers and is a latency, not a rate.
+                _drain_s = time.time() - t_drain0
+                if _drain_s > 0 and _drain_uncached > 0:
+                    self.note_x_sample("r_p", _drain_uncached / _drain_s)
+                if prefilled > 0:
+                    # X-COST-LINE: the requests this P phase carried (k).
+                    self._p_phase_k.append(int(prefilled))
+                if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get():
+                    # X-COST-LINE: P's forwards of this drain, as a task.
+                    _pc = asyncio.get_running_loop().create_task(self._read_p_cost())
+                    self._p_cost_tasks.add(_pc)
+                    _pc.add_done_callback(self._p_cost_tasks.discard)
+                logger.info("WEG2 P-DRAIN epoch=%d prefilled=%d arrived_during=%d p_concurrency=%d "
+                            "passes=%d queue_at_exit=%d drain_s=%.1f",
+                            self.epoch, prefilled, max(0, prefilled - queue_at_entry),
+                            self.p_concurrency, passes, len(self.queue), time.time() - t_drain0)
+                # L4/R-10: the counted consequence of law 1 -- SHORT work
+                # that arrived while P was draining and had to queue
+                # BATCH.  n=0 is printed too, so absence is a reading.
+                logger.info("WEG2 SHORT-BEHIND-P epoch=%d n=%d oldest_wait_s=%.1f",
+                            self.epoch, self.counters.get("short_behind_p", 0) - short_behind_p0,
+                            oldest_short)
+                # MF-3 (L15): what group P's disarmed store read cost THIS
+                # drain, beside the drain it cost it in.
+                self._log_p_prefix_reuse(reuse0)
+            return passes
+
         await self._adopt_first_flip()
         while True:
             # 27B flipfast F2/F3: the 0.2 s tick, ended early by a kick when a
@@ -11171,6 +11484,11 @@ class Front:
                     continue
                 self._hl_sweep()  # #243 seam: lost hand-offs of waiting rids -> P
                 self._rvp_take()
+                if self.dual_layout:
+                    # DUAL-TP3PP3: no flip, no park, no economics -- P drains
+                    # while D decodes. The D branch below is never reached.
+                    self._dual_pump(_p_drain_pass)
+                    continue
                 if self.awake == "D":
                     D = self.groups["D"]
                     _now = time.time()
@@ -11304,171 +11622,7 @@ class Front:
                                                         cause="before-flip")
                         await self.flip("D", "P")
                     continue
-                # awake == P: prefill the backlog until empty (#1011 PP exit
-                # clock).  LAW 1: the phase ends on an EMPTY queue, never on
-                # p_concurrency and never on a timer -- p_concurrency bounds
-                # only how many leg-1 POSTs are in flight at once.
-                # H91 part C AMENDS law 1 (user 25.09.): with
-                # --p-phase-max-requests N > 0 the phase also ends once N
-                # requests left the queue (the rest waits for the next P phase),
-                # and --p-pool-tokens plans the overlap against P's pool.
-                t_drain0 = time.time()
-                queue_at_entry = len(self.queue)
-                prefilled = 0
-                passes = 0
-                # weg2xsn272: a P intake stall ends THIS drain (no new
-                # dispatches, the stalled request stays at the head) and the
-                # flip below follows because the queue is not empty.
-                self._p_intake_stalled = False
-                short_behind_p0 = self.counters.get("short_behind_p", 0)
-                # MF-3: the same delta idiom as `short_behind_p0` -- the
-                # epoch's terms are read off the running counters rather than
-                # carried in a second per-epoch structure.
-                reuse0 = (self.counters.get("p_prefill_requests", 0),
-                          self.counters.get("p_prefix_tokens_in_store", 0),
-                          self.counters.get("p_prefix_tokens_reused", 0))
-                _drain_uncached = 0
-                # H91 part C rule 1: the drain's stats and its overlap plan
-                # (the queue head folded against P's pool, for the P-PHASE line).
-                _phase_stats: Dict[str, int] = {}
-                _overlap_plan = phase_policy.plan_p_overlap(
-                    [phase_policy.p_request_cost(p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1)
-                     for p in list(self.queue)[:max(1, self.p_phase_max_requests or len(self.queue))]],
-                    self.p_pool_tokens,
-                    min(self.p_concurrency + _ahead, self.p_phase_max_requests or (self.p_concurrency + _ahead)))
-                async def one(p: Pending) -> Pending:
-                    if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once
-                        p.leg1_done = True
-                        return p
-                    async with sem:
-                        if p.client_gone:  # H102: its client left while it waited for a P slot
-                            return p
-                        try:
-                            await self.leg1(p)
-                        except Exception as e:  # noqa: BLE001
-                            if p.client_gone:  # H102: aborted on P for a client that left
-                                self.counters["leg1_client_gone"] += 1
-                                return p
-                            if is_intake_stall(e) and not is_too_large(e):
-                                await self._requeue_intake_stalled(p, e)
-                                return p
-                            if is_too_large(e):
-                                # weg2xsn291: larger than P's whole pool -- no
-                                # flip can make room; refused by name, never
-                                # requeued (the requeue loop killed the boot).
-                                self.counters["p_intake_too_large"] += 1
-                                logger.error(
-                                    "WEG2 P-INTAKE-TOO-LARGE rid=%s est_prompt=%d: refused, "
-                                    "not requeued -- the request exceeds P's pool: %s",
-                                    p.rid, int(p.est_prompt), str(e)[:300])
-                            self.counters["leg1_failures"] += 1
-                            logger.error("WEG2 leg1 rid=%s failed: %s", p.rid, e)
-                            if not p.fut.done():
-                                p.fut.set_exception(e)
-                            return p
-                        p.leg1_done = True
-                        # xsn286: a request requeued by an intake stall is an
-                        # ordinary request again once its leg 1 succeeded --
-                        # the flag stayed set, _on_leg1_done skipped it, it
-                        # never reached D (weg2-6-4: prefilled 44 s on P in the
-                        # next phase, then nothing; D idle, IDLE-WEDGE).
-                        p.intake_stalled = False
-                    return p
-
-                def _on_leg1_done(p: Pending) -> None:
-                    nonlocal _drain_uncached, prefilled
-                    if p.intake_stalled:
-                        return  # weg2xsn272: back in the queue, not ready for D
-                    if p.client_gone:
-                        return  # H102: its client left; never handed to D
-                    if p.resume_via_p:
-                        self._rvp_p_finished(p)
-                        prefilled += 1
-                        return
-                    _drain_uncached += int(p.est_uncached)
-                    if not p.fut.done():
-                        p.t_ready = time.time()  # #244 seat_wait_s
-                        self._ready_for_d.append(p)
-                        self._sync_batch_gate()
-                        prefilled += 1
-
-                # #1459c: a CONTINUOUS pool, not paired batches.  The #1459
-                # form dispatched `p_concurrency + ahead` requests as ONE
-                # batch and gathered the whole batch before taking the next,
-                # so only every second request had a successor queued on P
-                # while it ran (xsn217: -7 finished 26.2 s after -6, -8 took
-                # 29.5 s again -- the 3 s store probe was back on every
-                # second request).  The pool refills the moment ONE leg
-                # finishes, so P always has the next request queued.
-                passes = await _p_drain_pool(
-                    self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
-                    lambda: self.state == "serving" and not self._p_intake_stalled,
-                    # H91 part C rule 1: at most p_phase_max_requests leave the
-                    # queue in this P phase, overlapping only as far as their
-                    # est_prompt fits P's unified pool (0 = off, law 1 as before).
-                    max_dispatch=self.p_phase_max_requests,
-                    cost=lambda p: phase_policy.p_request_cost(
-                        p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1),
-                    budget=self.p_pool_tokens, stats=_phase_stats,
-                    extra=(None if _ro_state is None else
-                           (lambda ps: _ro.extra_slots((q.rid for q in ps), _ro_state.rids(), _ro_max))),
-                    poll_s=_ro.POLL_S)
-                if _phase_stats.get("overlap_dispatched"):
-                    self.counters["p_read_overlap"] += _phase_stats["overlap_dispatched"]
-                    logger.info("WEG2 P-READ-OVERLAP epoch=%d overlap_dispatched=%d dispatched=%d "
-                                "peak_n=%d base=%d (RO: dispatched while P held legs for their "
-                                "store reads -- P computed them instead of idling)",
-                                self.epoch, _phase_stats["overlap_dispatched"],
-                                _phase_stats["dispatched"], _phase_stats["peak_n"],
-                                self.p_concurrency + _ahead)
-                if passes and (self.p_phase_max_requests or self.p_pool_tokens):
-                    _cap_hit = phase_policy.phase_cap_reached(
-                        _phase_stats["dispatched"], self.p_phase_max_requests)
-                    logger.info(
-                        "WEG2 P-PHASE epoch=%d dispatched=%d cap=%d prefilled=%d end=%s "
-                        "overlap_plan=%d peak_overlap=%d peak_inflight_tokens=%d pool_tokens=%d "
-                        "pool_holds=%d queue_left=%d (H91 part C rule 1: the phase ends at the "
-                        "cap or on an empty queue; overlap planned from est_prompt against P's "
-                        "unified pool; what is left waits for the next P phase)",
-                        self.epoch, _phase_stats["dispatched"], self.p_phase_max_requests,
-                        prefilled,
-                        ("stall" if self._p_intake_stalled else "cap" if _cap_hit
-                         else "empty" if not self.queue else "leaving"),
-                        _overlap_plan, _phase_stats["peak_n"], _phase_stats["peak_tokens"],
-                        self.p_pool_tokens, _phase_stats["pool_holds"], len(self.queue))
-                if passes:
-                    oldest_short = 0.0
-                    if self._ready_for_d:
-                        oldest_short = time.time() - self._ready_for_d[0].t_arrive
-                    # #1271 (b): ONE r_P SAMPLE PER DRAIN WINDOW, in the same
-                    # unit the launcher now uses -- the uncached tokens this
-                    # drain moved over the drain's own wall. NOT per request:
-                    # the drain runs at p_concurrency, so a per-request wall
-                    # counts queueing behind peers and is a latency, not a rate.
-                    _drain_s = time.time() - t_drain0
-                    if _drain_s > 0 and _drain_uncached > 0:
-                        self.note_x_sample("r_p", _drain_uncached / _drain_s)
-                    if prefilled > 0:
-                        # X-COST-LINE: the requests this P phase carried (k).
-                        self._p_phase_k.append(int(prefilled))
-                    if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get():
-                        # X-COST-LINE: P's forwards of this drain, as a task.
-                        _pc = asyncio.get_running_loop().create_task(self._read_p_cost())
-                        self._p_cost_tasks.add(_pc)
-                        _pc.add_done_callback(self._p_cost_tasks.discard)
-                    logger.info("WEG2 P-DRAIN epoch=%d prefilled=%d arrived_during=%d p_concurrency=%d "
-                                "passes=%d queue_at_exit=%d drain_s=%.1f",
-                                self.epoch, prefilled, max(0, prefilled - queue_at_entry),
-                                self.p_concurrency, passes, len(self.queue), time.time() - t_drain0)
-                    # L4/R-10: the counted consequence of law 1 -- SHORT work
-                    # that arrived while P was draining and had to queue
-                    # BATCH.  n=0 is printed too, so absence is a reading.
-                    logger.info("WEG2 SHORT-BEHIND-P epoch=%d n=%d oldest_wait_s=%.1f",
-                                self.epoch, self.counters.get("short_behind_p", 0) - short_behind_p0,
-                                oldest_short)
-                    # MF-3 (L15): what group P's disarmed store read cost THIS
-                    # drain, beside the drain it cost it in.
-                    self._log_p_prefix_reuse(reuse0)
+                await _p_drain_pass()
                 # C6/R-2: the _ready_for_d term is NOT optional.  Without it,
                 # --idle-layout pp keeps P awake with requests P has just
                 # prefilled sitting on `await fut` behind a one-hour client
@@ -11832,6 +11986,13 @@ class Front:
                 logger.error("WEG2-FLIP STALL check raised: %r", exc)
 
     async def handle_manual_flip(self, request: web.Request) -> web.Response:
+        if getattr(self, "dual_layout", False):
+            # DUAL-TP3PP3: refused with a name, before admission or any group
+            # is touched (flip() refuses too; this answers the caller).
+            self.counters["flip_refused_dual"] += 1
+            logger.error("WEG2-FLIP manual flip REFUSED-DUAL: %s", DUAL_NO_FLIP_WHY)
+            return web.json_response({"error": "manual-flip-refused", "code": "dual-layout",
+                                      "why": DUAL_NO_FLIP_WHY}, status=409)
         if self.state != "serving":
             return web.json_response({"error": self.state}, status=503)
         # #1493: a manual flip from D turns around inside one request, so the
@@ -11948,6 +12109,17 @@ def main():
                          "to P; the parked ones resume first after the flip back. Unset = "
                          "SGLANG_WEG2_D_PARK_IMMEDIATE / the profile's d_park_immediate (on for qwen27b "
                          "and nextflash). D needs the same switch (its flip park).")
+    ap.add_argument("--dual-kv-ledgers", default="",
+                    help="DUAL-TP3PP3 unified KV: comma list of the card KV ledgers "
+                         "(weg2/card_kv_ledger.py); when D is short of KV on a card, P's leg 1 "
+                         "PAUSES (user order 30.09. 07:25Z). Empty = off.")
+    ap.add_argument("--dual-dbusy-file", default="",
+                    help="DUAL-TP3PP3 --dual-p-duty: the file the front rewrites with '1'/'0' when D's "
+                         "outstanding set turns non-empty/empty; P's first stage throttles on it.")
+    ap.add_argument("--dual-layout", action="store_true", default=False,
+                    help="DUAL-TP3PP3 (F26): both groups stay awake, the front never flips; leg 1 "
+                         "goes to P at once, leg 2 to D right after leg 1 (prefix from the store). "
+                         "The launcher sets it with --dual-layout; off = the phase router unchanged.")
     ap.add_argument("--p-leg1-stall-s", type=float, default=None,
                     help="H91 part C: a leg 1 older than this while P showed no work for as long (no "
                          "leg 1 completed, P's progress counters unchanged) is aborted on P and "
@@ -12126,6 +12298,14 @@ def main():
                   d_wait_bound_s=args.d_wait_bound_s,
                   p_leg1_stall_s=args.p_leg1_stall_s,
                   d_park_immediate=args.d_park_immediate == "on")
+    # DUAL-TP3PP3: set after construction so the constructor call above stays
+    # the one pinned by test_27b_park_immediate (the class default is off).
+    front.dual_layout = bool(getattr(args, "dual_layout", False))
+    front.dual_dbusy_file = str(getattr(args, "dual_dbusy_file", "") or "")
+    front.dual_kv_ledgers = [x for x in str(getattr(args, "dual_kv_ledgers", "") or "").split(",") if x]
+    if front.dual_layout:
+        logger.info("WEG2 DUAL-LAYOUT on: both groups stay awake, the front never flips; "
+                    "leg 1 -> P at once, leg 2 -> D right after leg 1")
     front.d_residue_context_tokens = int(getattr(args, "d_residue_context_tokens", 0) or 0)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
