@@ -863,6 +863,18 @@ class Envs:
     # forward once its event completed -- no host wait in the decode path.
     # Off until its own metal proof (layers/moe/expert_offload.ResumeWarm).
     SGLANG_WEG2_RESUME_WARM_FINISH = EnvBool(False)
+    # RW-AT-ARM (30.09., NF y4k/y4l P->D): the resume warm is planned,
+    # reserved and copied on the side stream AT THE ARM (the weight legs are
+    # over) instead of 8 layers per idle settle pass -- the settle ends first
+    # (y4l 12/12 wakes: warm_layers=8, skipped_cancel=40). The copies land
+    # during the kv leg and the first pass; deferred_rows_tick commits each
+    # layer before a forward once its event completed (no host wait). Measured
+    # target: the first decode round after every P->D wake, pool.fetch 104 ms
+    # (y4l median, n=12; y4k 108, n=14) against the steady round. Rows per
+    # layer: _ROWS (no new VRAM: free LRU rows only, below the seat block).
+    # Off until metal.
+    SGLANG_WEG2_RESUME_WARM_AT_ARM = EnvBool(False)
+    SGLANG_WEG2_RESUME_WARM_AT_ARM_ROWS = EnvInt(16)
     # PFO (#287 Hebel A, 30.09., layers/moe/expert_offload.PrefillFetchOverlap):
     # the expert-major multi-wave prefill copies wave k+1 on the rank's
     # prefetch stream while wave k computes; the scratch is split in two

@@ -7372,6 +7372,27 @@ def resume_warm_finish_enabled() -> bool:
         return False
 
 
+def resume_warm_at_arm_enabled() -> bool:
+    """RW-AT-ARM (30.09., NF y4k/y4l P->D): the whole warm is issued on the
+    side stream at the arm -- the weight legs are over -- instead of in the
+    idle settle passes (``SGLANG_WEG2_RESUME_WARM_AT_ARM``)."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_RESUME_WARM_AT_ARM.get())
+    except Exception:  # noqa: BLE001 -- no environ: the settle-pass warm
+        return False
+
+
+def resume_warm_at_arm_rows() -> int:
+    try:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_WEG2_RESUME_WARM_AT_ARM_ROWS.get()))
+    except Exception:  # noqa: BLE001
+        return 16
+
+
 def _pool_caches(model):
     for module in model.modules():
         cache = getattr(module, "_expert_offload", None)
@@ -7418,6 +7439,8 @@ class ResumeWarm:
         self.cancel_reason = ""
         self.finish_layers = self.finish_rows = self.finish_landed = 0
         self.finish_reason = ""
+        self.at_arm = False
+        self.arm_ms = 0.0
         self._first_extend_layers: Dict = {}
         self._first_extend_closed = False
 
@@ -7462,7 +7485,21 @@ class ResumeWarm:
             for cache in _pool_caches(model):
                 if getattr(cache, "_rw_snap", None):
                     self._queue.append(cache)
-        return len(self._queue)
+        n = len(self._queue)
+        if n and resume_warm_at_arm_enabled():
+            # RW-AT-ARM: plan + reserve every layer now (host reads: the rearm
+            # just synchronized, nothing runs) and put every copy on the side
+            # stream behind the rearm -- they land while the kv leg and the
+            # first pass run on the host; deferred_rows_tick commits each
+            # layer before a forward once its event completed.
+            import time
+
+            t0 = time.perf_counter()
+            self._plan_all(rows=resume_warm_at_arm_rows())
+            self._finish("arm")
+            self.at_arm = True
+            self.arm_ms = (time.perf_counter() - t0) * 1000.0
+        return n
 
     def open_settle(self) -> None:
         """The wake's dormant hold was released: from now on an empty settle
@@ -7521,9 +7558,10 @@ class ResumeWarm:
         self.warm_rows += int(rows)
         self.warm_layers += 1
 
-    def _plan_all(self) -> None:
-        """RW-FINISH: plan + reserve every queued layer (the first idle tick)."""
-        rows = _env_int(RESUME_WARM_ROWS_ENV, 32)
+    def _plan_all(self, rows: Optional[int] = None) -> None:
+        """RW-FINISH: plan + reserve every queued layer (the first idle tick;
+        RW-AT-ARM: the arm, with its own row cap)."""
+        rows = _env_int(RESUME_WARM_ROWS_ENV, 32) if rows is None else int(rows)
         for cache in list(self._queue):
             ids = getattr(cache, "_rw_snap", None) or []
             cache._rw_snap = None
@@ -7613,7 +7651,7 @@ class ResumeWarm:
         self._queue = []
 
     def cancel(self, reason: str) -> int:
-        if resume_warm_finish_enabled() and self._planned:
+        if (resume_warm_finish_enabled() or getattr(self, "at_arm", False)) and self._planned:
             return self._finish(reason)
         n = len(self._queue)
         for cache in self._queue:
@@ -7648,6 +7686,7 @@ class ResumeWarm:
             + (f" finish_layers={self.finish_layers} finish_rows={self.finish_rows} "
                f"finish_landed={self.finish_landed} finish={self.finish_reason}"
                if self.finish_layers else "")
+            + (f" at_arm=1 arm_issue_ms={self.arm_ms:.1f}" if getattr(self, "at_arm", False) else "")
         )
 
 
