@@ -238,6 +238,23 @@ def bind_image(
     return binding.shared_bytes, binding.private_bytes
 
 
+#: Which model roles take part in the union (comma list, default: all). The
+#: dual layout sets "main": D holds the draft TP3-sharded and P holds it TP1
+#: (full vocab), so no draft tensor has the same form in both groups (metal
+#: 30.09. dkr27bnvfp4dual1bbar1fs09300226: predecessor_codebook (248320, 256)
+#: in P vs (82816, 256) in D's manifest -> UnionShareError). The draft stays
+#: private in each group; P's plan already carries its draft.
+UNION_ROLES_ENV = "SGLANG_WEG2_UNION_ROLES"
+
+
+def union_role_enabled(role: str, env=None) -> bool:
+    env = os.environ if env is None else env
+    raw = str(env.get(UNION_ROLES_ENV, "") or "").strip()
+    if not raw:
+        return True
+    return role in {x.strip() for x in raw.split(",") if x.strip()}
+
+
 def maybe_union_image(model, *, device, role: str = "main") -> Optional[str]:
     """Boot hook: own or bind the card's weight image, by env.
 
@@ -253,6 +270,13 @@ def maybe_union_image(model, *, device, role: str = "main") -> Optional[str]:
         raise UnionShareError(
             f"{UNION_MODE_ENV} must be 'own', 'bind' or 'off', got {mode!r}"
         )
+    if not union_role_enabled(role):
+        logger.info(
+            "WEG2-UNION role=%s not in %s=%r: this model stays private (no image %s)",
+            role, UNION_ROLES_ENV, os.environ.get(UNION_ROLES_ENV, ""),
+            "published" if mode == "own" else "bound",
+        )
+        return None
     from sglang.srt.managers.weg2_memory_saver import weg2_group_name
 
     phase = weg2_group_name()

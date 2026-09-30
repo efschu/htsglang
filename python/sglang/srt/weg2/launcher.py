@@ -13583,7 +13583,11 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
     # takes at most ~107 bytes; boot tags on this rig run past 60 characters.
     _h = hashlib.sha1(str(ns.tag).encode()).hexdigest()[:10]
     env = {"SGLANG_WEG2_UNION_DIR": f"/dev/shm/wu-{_h}",
-           "SGLANG_WEG2_UNION_MODE": "own" if group == "D" else "bind"}
+           "SGLANG_WEG2_UNION_MODE": "own" if group == "D" else "bind",
+           # Only the main model is shared: the draft is TP3-sharded in D and
+           # TP1 in P, so none of its tensors has one form in both groups
+           # (union_arena_bind.UNION_ROLES_ENV; metal 30.09. ...09300226).
+           "SGLANG_WEG2_UNION_ROLES": "main"}
     if group == "P":
         env["SGLANG_WEG2_DUAL_SHARE"] = "1"
     return env
