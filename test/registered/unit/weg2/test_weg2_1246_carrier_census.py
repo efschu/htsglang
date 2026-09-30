@@ -786,7 +786,12 @@ def test_the_launcher_delegates_the_whole_decision_and_keeps_no_second_check(tmp
     src = inspect.getsource(launcher)
     assert "_cc.decide_bound(_cen, ns.carrier_max_tokens" in src
     assert "raise Weg2LaunchRefused(_dec.detail)" in src
-    assert "_override" not in src, "the launcher still compares the operator's number itself"
+    # 30.09.: a TOKEN, not a substring -- 7f0e2eb39b (28.09., L3 identity) wrote
+    # "apply_model_override_args" into a launcher comment, and the substring
+    # check read that as the old `_override` comparison (red since then).
+    import re
+
+    assert not re.search(r"\b_override\b", src), "the launcher still compares the operator's number itself"
     assert "if not _cen.ok" not in src
 
 
