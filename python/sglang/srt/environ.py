@@ -4042,6 +4042,17 @@ class Envs:
     # setting is restored afterwards (model_loader/gguf_numpy_hugepage.py).
     # True: numpy keeps its setting during the load (pre-fix behaviour).
     SGLANG_GGUF_NUMPY_HUGEPAGE = EnvBool(False)
+    # NUMPY-THP-SERVE (27B z30y11, b4946aa966, 30.09.): the same numpy hint
+    # during SERVING. The scheduler's host-side numpy arrays of 4 MiB or more
+    # (L3 write-behind census buffers, park-demote) faulted 2 MiB pages with
+    # direct compaction; the compaction migrates the shared arena's shmem
+    # pages (rmap walk + TLB shootdown into every rank). perf on P PP0's and
+    # D TP0's write-behind thread: 31.4 s / 18.8 s of sys in 152 s, top frame
+    # arena_complete_census -> do_huge_pmd_anonymous_page ->
+    # __alloc_pages_direct_compact. False (default): run_scheduler_process
+    # switches the hint off for the whole rank process. True: numpy keeps its
+    # own setting (pre-fix behaviour, A/B arm).
+    SGLANG_WEG2_NUMPY_HUGEPAGE = EnvBool(False)
     # Synchronous cgroup reclaim during the GGUF stream, in GiB of
     # memory.current. 0 (default) = off, behaviour byte-identical to before.
     # The dropper only releases page cache BEHIND the consumer while the

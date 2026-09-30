@@ -296,3 +296,47 @@ def test_the_default_budget_is_25_ms():
 
     assert envs.SGLANG_WEG2_L3_WRITE_BEHIND_SLICE_MS.get() == 25.0
     assert abs(HiCacheFile._l3wb_slice_s() - 0.025) < 1e-12
+
+
+T2 = 128
+
+
+def _put(arena, stem, total, fill=0):
+    pay = torch.full((total,), fill & 0xFF, dtype=torch.uint8)
+    assert arena.write([stem], [total], [((0, total),)], [pay.data_ptr()]) == [1]
+
+
+def test_a_new_cycle_resets_every_arena_not_only_those_its_first_pass_reaches(tmp_path, monkeypatch):
+    """NF 03ef1f6699 (port of its NF-only test to the 27B pass): a new cycle resets the cycle
+    state of EVERY arena before the first one is visited. Two arenas; cycle 1 writes n pages
+    in each. Cycle 2 brings m new pages in each and its FIRST pass is cut inside arena 1, so
+    arena 2 is not reached by it. Arena 2 must still be visited later in cycle 2 -- in the
+    82871045cd form an arena was reset only when the cycle's first pass reached it, arena 2
+    kept cycle 1's ``done`` and its m new pages waited a whole cycle."""
+    n, m = 200, 200
+    be, _a0, _ = _backend(tmp_path, monkeypatch, 0)
+    a1 = ShmArena(str(tmp_path / "shm" / f"arena-a1-{TOTAL}.bin"), TOTAL, n + m + 16)
+    a2 = ShmArena(str(tmp_path / "shm" / f"arena-a2-{T2}.bin"), T2, n + m + 16)
+    be._arenas = {TOTAL: a1, T2: a2}
+    s1 = [be._get_suffixed_key(f"{i:05d}" + "a1" * 30) for i in range(n + m)]
+    s2 = [be._get_suffixed_key(f"{i:05d}" + "b2" * 30) for i in range(n + m)]
+
+    def fill(lo, hi):
+        for i in range(lo, hi):
+            _put(a1, s1[i], TOTAL, i)
+            _put(a2, s2[i], T2, i)
+
+    clock = _Clock()
+    monkeypatch.setattr(HS, "time", clock)
+    _slow_stat(be, clock, monkeypatch)
+    fill(0, n)
+    p1 = _drive(be)
+    _assert_bounded(p1)
+    assert all(be._stem_exists(s) for s in s1[:n] + s2[:n])
+    fill(n, n + m)
+    p2 = _drive(be)
+    assert p2[0]["sliced"] and p2[0]["arenas"] == 1          # the first pass ends in arena 1
+    _assert_bounded(p2)
+    assert all(be._stem_exists(s) for s in s1[n:])
+    assert all(be._stem_exists(s) for s in s2[n:])           # RED in the 82871045cd form
+    assert sum(p["written"] for p in p2) == 2 * m

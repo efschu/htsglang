@@ -2961,24 +2961,28 @@ class HiCacheFile(HiCacheStorage):
         fsync = canonical_fsync_default()
         chunk = 64
         arenas = [a for a in list((getattr(self, "_arenas", None) or {}).values()) if a is not None]
+        if not cont:
+            # a new cycle: EVERY arena from its first slot, its byte budget
+            # full -- before the first one is visited (NF 03ef1f6699: reset
+            # only when reached, a first pass cut in arena 1 left arena 2 with
+            # the previous cycle's `done`, and its new pages waited a cycle)
+            for arena in arenas:
+                arena._l3wb_cycle_pages = 0
+                arena._l3wb_cursor = 0
+                arena._l3wb_done = False
         stop_all = False
         for arena in arenas:
             if stop_all:
                 break
             tot["arenas"] += 1
+            if getattr(arena, "_l3wb_done", False):
+                continue                    # this cycle has visited all of it already
             nslots = int(arena.slots)
             sec = getattr(arena, "_l3wb_sec", None)
             if sec is None:
                 sec = arena._l3wb_sec = (np.full(nslots, -1, dtype=np.int64),
                                          np.zeros(nslots, dtype=np.uint64))
             sec_gen, sec_lo = sec
-            if not cont:
-                # a new cycle: every arena from its first slot, its byte budget full
-                arena._l3wb_cycle_pages = 0
-                arena._l3wb_cursor = 0
-                arena._l3wb_done = False
-            elif getattr(arena, "_l3wb_done", False):
-                continue                    # this cycle has visited all of it already
             slots, gens, klo, khi = arena.complete_census()
             tot["complete"] += int(slots.shape[0])
             if not slots.shape[0]:
