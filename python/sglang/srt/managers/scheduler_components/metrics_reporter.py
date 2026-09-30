@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import tempfile
@@ -27,6 +28,46 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
 from sglang.srt.utils.collective_clock import CollectiveClock, collective_clock
 from sglang.srt.utils.device_timer import DeviceTimer, SplitDeviceTimer
+
+
+class MissWindowTimer(SplitDeviceTimer):
+    """PR (30.09.): the per-rank prefill timer with the pool miss window of
+    ``layers.moe.pool_miss_cost`` around the same forward -- the rows the
+    forward's host-plan fetches load and their own ``pool.host_fetch`` spans
+    travel in ONE interval, so the prefill line pairs them or drops them
+    together. Off (no record dir): the window is a dict nobody fills."""
+
+    @contextlib.contextmanager
+    def wrap(self, metadata):
+        from sglang.srt.layers.moe import pool_miss_cost
+
+        holder: dict = {}
+        pool_miss_cost.open_window(holder)
+        with SplitDeviceTimer.wrap(self, {**metadata, "miss_window": holder}):
+            try:
+                yield
+            finally:
+                pool_miss_cost.close_window()
+
+
+def _note_paired_miss(families, miss_window) -> None:
+    """PR/PR2: a PAIRED, split-known prefill duration hands its own
+    ``pool.host_fetch`` ms and span count, with the rows its window's host-plan
+    fetches loaded, to the miss record (refused there unless the span count is
+    the window's fetch count). Never raises."""
+    if miss_window is None:
+        return
+    try:
+        from sglang.srt.layers.moe import pool_miss_cost
+
+        ms, n = 0.0, 0
+        for name, stat in (families or {}).items():
+            if str(name).split(":")[-1] == pool_miss_cost.HOST_FETCH_FAMILY:
+                ms += float(stat.total_ms)
+                n += int(stat.count)
+        pool_miss_cost.note_paired(fetch_ms=ms, fetch_count=n, window=miss_window)
+    except Exception:  # noqa: BLE001 -- an instrument feed never breaks the line
+        pass
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
@@ -405,7 +446,7 @@ class RankPrefillLog:
     def has_pending(self) -> bool:
         return bool(self._pending)
 
-    def _on_duration(self, t: float, collective_slot=None, **_kwargs) -> None:
+    def _on_duration(self, t: float, collective_slot=None, miss_window=None, **_kwargs) -> None:
         wait_s = None
         families = None
         if self.clock is not None:
@@ -420,7 +461,7 @@ class RankPrefillLog:
             if collective_slot is not None and collective_slot.graph_capture_skipped:
                 wait_s = None
                 families = None
-        self._durations.append((t, wait_s, families))
+        self._durations.append((t, wait_s, families, miss_window))
 
     def record(
         self,
@@ -523,11 +564,13 @@ class RankPrefillLog:
                 bubble_mb = bub[1]
             new_tokens += n
             cached_tokens += c
-            t, w, fams = self._durations.popleft()
+            t, w, fams, *_mw = self._durations.popleft()
+            miss_window = _mw[0] if _mw else None
             gpu_s += t
             if graphed or w is None:
                 split_known = False
             else:
+                _note_paired_miss(fams, miss_window)
                 wait_s += w
                 for name, stat in (fams or {}).items():
                     slot_acc = family_acc.get(name)
@@ -776,7 +819,7 @@ class SchedulerMetricsReporter:
         if getattr(self.scheduler, "device", "") != "cuda":
             return
         self.rank_prefill_log.clock = collective_clock()
-        self.rank_prefill_log.timer = SplitDeviceTimer(
+        self.rank_prefill_log.timer = MissWindowTimer(
             reporter=self.rank_prefill_log._on_duration,
             clock=self.rank_prefill_log.clock,
         )

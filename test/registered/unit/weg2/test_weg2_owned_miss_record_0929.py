@@ -13,6 +13,7 @@ at bs1/bs2 -- the solve steered on the seed.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import types
@@ -219,13 +220,30 @@ def miss_dir(tmp_path, monkeypatch):
     pmc._reset_for_test()
 
 
-def _phase(rank, fetch_per_round, miss_per_sync, rounds=100):
-    for _ in range(rounds):
-        pmc.note_round({"spec_verify:pool.fetch": [fetch_per_round, 12, 0.1],
-                        "tp.all_reduce": [4.0, 96, 0.01]})
-    for _ in range(48):  # every pool layer syncs
-        pmc.note_sync(200, miss_per_sync)
-    return pmc.flush(rank=rank, group="D", reason="sleep", model=MODEL, phase_index=3)
+class _Clock:
+    armed = True
+
+    @contextlib.contextmanager
+    def span(self, label=None):
+        yield
+
+
+def _paired_forwards(fetch_per_forward, miss_per_layer, forwards=100):
+    """PR2 (30.09.): the record pairs timed prefill forwards -- each one's
+    window sees every layer's host-plan fetch once, then their span ms."""
+    for _ in range(forwards):
+        w: dict = {}
+        pmc.open_window(w)
+        for _ in range(48):  # every pool layer fetches its missed rows once
+            with pmc.host_fetch_span(miss_per_layer, _Clock()):
+                pass
+        pmc.close_window()
+        pmc.note_paired(fetch_ms=fetch_per_forward, fetch_count=48, window=w)
+
+
+def _phase(rank, fetch_per_forward, miss_per_layer, forwards=100, model=MODEL):
+    _paired_forwards(fetch_per_forward, miss_per_layer, forwards)
+    return pmc.flush(rank=rank, group="D", reason="sleep", model=model, phase_index=3)
 
 
 def test_rank_record_kind_is_the_one_the_planner_reads():
@@ -242,10 +260,11 @@ def test_rank_writes_its_record_at_the_sleep(miss_dir):
     assert os.path.dirname(path) == os.path.join(
         str(miss_dir), os.path.basename(MODEL.rstrip("/")), "owned_miss")
     rec = json.loads(open(path).read())
-    # 240 ms over 48 layers x 10 missed rows = 0.5 ms per row
+    # 100 forwards x 2.4 ms over 100 x 48 layers x 10 missed rows = 0.005 ms per row
     assert rec["kind"] == er.OWNED_MISS_RANK_KIND and rec["rank"] == 0
-    assert rec["miss_rows"] == 480 and rec["rounds"] == 100
-    assert abs(rec["ms_per_row"] - 240.0 / 480) < 1e-9
+    assert rec["miss_rows"] == 48000 and rec["rounds"] == 100
+    assert rec["pairing"] == er.OWNED_MISS_PAIRING
+    assert abs(rec["ms_per_row"] - 240.0 / 48000) < 1e-9
     # counters zeroed: the next phase starts from nothing
     assert pmc.rank_record(rank=0, group="D", reason="x", model=MODEL) is None
 
@@ -254,25 +273,26 @@ def test_off_counts_nothing_and_writes_nothing(monkeypatch):
     monkeypatch.delenv("SGLANG_WEG2_OWNED_MISS_RECORD", raising=False)
     pmc._reset_for_test()
     assert _phase(0, 2.4, 10) is None
-    assert pmc._ACC["rounds"] == 0 and pmc._ACC["miss_rows"] == 0
+    assert pmc._PAIR["forwards"] == 0 and pmc._PAIR["miss_rows"] == 0
 
 
 def test_a_phase_without_split_writes_no_record(miss_dir):
-    for _ in range(48):
-        pmc.note_sync(200, 10)
+    for _ in range(48):  # host fetches outside any prefill window
+        with pmc.host_fetch_span(10, _Clock()):
+            pass
     assert pmc.flush(rank=1, group="D", reason="sleep", model=MODEL) is None
     assert not miss_dir.exists() or not any(miss_dir.iterdir())
 
 
 def test_planner_reads_the_rank_records(miss_dir):
-    _phase(0, 2.4, 10)   # host 0.5 ms/row
-    _phase(1, 9.6, 10)   # worker 2.0 ms/row
-    _phase(2, 4.8, 20)   # worker 0.5 ms/row, twice the rows
+    _phase(0, 2.4, 10)   # host 0.005 ms/row
+    _phase(1, 9.6, 10)   # worker 0.02 ms/row
+    _phase(2, 4.8, 20)   # worker 0.005 ms/row, twice the rows
     recs = er.read_owned_miss_rank_records(_rank_dir(miss_dir))
     ms, tier, src = er.resolve_owned_miss_ms((), rank_records=recs, host=0, model=MODEL)
     assert tier == er.OWNED_MISS_RECORD and src.startswith("RECORD")
-    # worker = (960 + 480) ms / (480 + 960) rows = 1.0
-    assert ms == pytest.approx((0.5, 1.0))
+    # worker = (960 + 480) ms / (48000 + 96000) rows = 0.01
+    assert ms == pytest.approx((0.005, 0.01))
 
 
 def test_log_bootstrap_ranks_under_every_rank_record(miss_dir):
@@ -282,7 +302,7 @@ def test_log_bootstrap_ranks_under_every_rank_record(miss_dir):
     # a YOUNGER log entry still loses to the ranks' own record
     log = [_rec((0.05, 0.6), "2099-01-01 00:00:00")]
     ms, tier, _ = er.resolve_owned_miss_ms(log, rank_records=ranks, host=0, model=MODEL)
-    assert tier == er.OWNED_MISS_RECORD and ms == pytest.approx((0.5, 2.0))
+    assert tier == er.OWNED_MISS_RECORD and ms == pytest.approx((0.005, 0.02))
     # without the ranks the bootstrap stands, named as the transition
     ms, tier, src = er.resolve_owned_miss_ms(log, rank_records=(), host=0, model=MODEL)
     assert tier == er.OWNED_MISS_LOG_BOOTSTRAP and src.startswith(er.OWNED_MISS_LOG_PROVENANCE)
@@ -306,7 +326,7 @@ def test_launcher_takes_the_rank_records_from_group_d_env(miss_dir, tmp_path, mo
     ns = types.SimpleNamespace(profile=None, model=MODEL)
     ms, src = launcher.d_owned_miss_ms(
         ns, env_d={"SGLANG_WEG2_OWNED_MISS_RECORD": str(miss_dir)}, host=0)
-    assert ms == pytest.approx((0.5, 2.0)) and src.startswith("RECORD")
+    assert ms == pytest.approx((0.005, 0.02)) and src.startswith("RECORD")
 
 
 def test_records_of_another_model_are_not_read(miss_dir, tmp_path, monkeypatch):
@@ -315,11 +335,7 @@ def test_records_of_another_model_are_not_read(miss_dir, tmp_path, monkeypatch):
     from sglang.srt.weg2 import launcher
 
     for rank, fetch in ((0, 2.4), (1, 9.6)):
-        for _ in range(100):
-            pmc.note_round({"spec_verify:pool.fetch": [fetch, 12, 0.1]})
-        for _ in range(48):
-            pmc.note_sync(200, 10)
-        pmc.flush(rank=rank, group="D", reason="sleep", model="/m/Other-Model", phase_index=1)
+        assert _phase(rank, fetch, 10, model="/m/Other-Model") is not None
     monkeypatch.setattr(launcher, "measured_record_path", lambda: str(tmp_path / "none.json"))
     ns = types.SimpleNamespace(profile=None, model=MODEL)
     assert launcher.d_owned_miss_ms(
@@ -332,11 +348,12 @@ def test_model_id_is_the_checkpoint_directory_name():
     assert pmc.model_id(None) == "unknown-model"
 
 
-def test_the_round_log_feeds_the_rank_record():
-    """DecodeRoundLog hands every split round's families to the record."""
+def test_the_round_log_no_longer_feeds_the_rank_record():
+    """PR (30.09.): a decode round's fetch ms never reaches the record -- its
+    sync-window misses mix graphed rounds'; only paired prefill forwards do."""
     import inspect
 
     from sglang.srt.managers.scheduler_components import decode_round_log
 
-    assert "_miss_cost.note_round(family_acc)" in inspect.getsource(
-        decode_round_log.DecodeRoundLog._emit)
+    assert "note_round" not in inspect.getsource(decode_round_log.DecodeRoundLog._emit)
+    assert not hasattr(pmc, "note_round")

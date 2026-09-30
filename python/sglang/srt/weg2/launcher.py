@@ -13290,6 +13290,38 @@ def apply_profile_torch_cache_cap_default(ns) -> Optional[str]:
             f"{TORCH_CACHE_CAP_ENV}=0 = the uncapped form)")
 
 
+#: PR (30.09.): group D's paired miss record is ON by default -- the records
+#: root of the line under the evidence dir (``<root>/<model_id>/owned_miss``,
+#: layers.moe.pool_miss_cost.record_dir_for). --env-d
+#: SGLANG_WEG2_OWNED_MISS_RECORD=<dir> names another root; an empty value
+#: turns it off.
+OWNED_MISS_RECORD_ENV = "SGLANG_WEG2_OWNED_MISS_RECORD"
+
+
+def owned_miss_record_root() -> str:
+    return os.path.join(EVIDENCE_DIR, "records", "weg2")
+
+
+def apply_owned_miss_record_default(ns) -> Optional[str]:
+    """PR: ``SGLANG_WEG2_OWNED_MISS_RECORD`` into ``ns.env_d`` unless --env-d
+    states it (every reader -- the D ranks, ``d_owned_miss_ms`` -- sees ONE
+    value). Returns the line naming it, or None."""
+    env_d = str(getattr(ns, "env_d", "") or "")
+    if OWNED_MISS_RECORD_ENV in parse_group_env(env_d):
+        return None
+    root = owned_miss_record_root()
+    ns.env_d = set_group_env(env_d, OWNED_MISS_RECORD_ENV, root)
+    return (f"D-EIGENTUM MISS-RECORD (#239 S3f, PR): --env-d {OWNED_MISS_RECORD_ENV}={root} "
+            f"(D ranks write paired prefill miss records at their sleep; the owned solve reads "
+            f"them as RECORD from K={_owned_miss_min_paired()} paired forwards per rank)")
+
+
+def _owned_miss_min_paired() -> int:
+    from sglang.srt.planner import expert_residency as _er
+
+    return int(_er.OWNED_MISS_MIN_PAIRED_FORWARDS)
+
+
 def d_fixed_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optional[float]]], str]:
     """``D_FIXED_MIB`` of the profile (the #145 fixed post measured on the
     form that runs today), or ``(None, "")`` -- the builtin reference stands."""
@@ -13341,7 +13373,8 @@ def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
         rank_records=_er.read_owned_miss_rank_records(rank_dir), host=int(host),
         model=model, builtin=builtin, builtin_source=builtin_src)
     if tier == _er.OWNED_MISS_UNMEASURED:
-        return None, ""
+        # PR: the seed stays -- the line still names a too-young RECORD's count
+        return None, src if "RECORD zu jung" in src else ""
     return ms, src
 
 
@@ -18077,6 +18110,9 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN (#239 S3f): "
             f"{_miss_ms[0]:g}/{_miss_ms[1]:g} ms je Zeile (Host/Worker) aus {_miss_src} "
             f"statt der Saat")
+    elif _miss_src:
+        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN (#239 S3f): "
+            f"Saat -- {_miss_src}")
     # #239: the token cut of the full-attention KV (None = off, byte-identical)
     _kv_cut = d_kv_token_cut(ns)
     _pinned = getattr(ns, "_d_map_form", None)
@@ -22554,6 +22590,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _p0_line = apply_profile_torch_cache_cap_default(ns)  # WEG2-ALLOC-OVERHANG
     if _p0_line:
         print(_p0_line, flush=True)
+    _miss_rec_line = apply_owned_miss_record_default(ns)  # PR: paired miss record
+    if _miss_rec_line:
+        print(_miss_rec_line, flush=True)
     if not ns.teardown:
         _park_split = d_park_split_refusal(ns)  # 27B park (RV B5): front and D must agree
         if _park_split:

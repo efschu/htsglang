@@ -114,6 +114,7 @@ import functools
 import json
 import math
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -128,6 +129,7 @@ logger = logging.getLogger(__name__)
 
 from sglang.srt.debug_utils import host_anon_probe as _hap
 from sglang.srt.layers.moe import pinned_host_ledger
+from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
 from sglang.srt.layers.fwd_timeline import fwd_mark
 from sglang.srt.layers.prefill_timing import StageHead, flush_wait
 from sglang.srt.managers.scheduler_components.decode_host_split import (
@@ -4172,6 +4174,15 @@ class MoEExpertOffloadCache:
                     dst[slot].copy_(spill[row], non_blocking=True)
                     moved += per_expert
 
+        # #239 S3f PR2: inside a timed prefill forward's miss window (D, record
+        # on) these rows and one clock span over the copies + join pair up as
+        # the miss record's numerator and denominator (a no-op context
+        # outside). Device events only -- no host read. join=False (lookahead)
+        # is a prefetch, not this forward's miss. Entered/exited around the
+        # unchanged copy block rather than re-indenting it.
+        miss_span = (_miss_cost.host_fetch_span(len(fetch_plan))
+                     if join and _miss_cost.window_open() else nullcontext())
+        miss_span.__enter__()
         if self._stream is None:
             # No CUDA context (desk test): same copies, same order, no streams.
             _copies()
@@ -4211,6 +4222,7 @@ class MoEExpertOffloadCache:
             _g(fetch_plan)
         self.planner.stats.h2d_bytes += moved
         self.planner.stats.remote_h2d_bytes += remote_moved
+        miss_span.__exit__(None, None, None)
 
     def _build_lut(self, slot_of_needed, dtype, device):
         """Global expert id -> slot LUT for one wave; -1 for every id the wave
@@ -5105,12 +5117,6 @@ class MoEExpertOffloadCache:
         forwards, misses = take_report(self._pool_tables)
         predicted, fetched, pf_hits, pf_skipped = take_prefetch_report(self._pool_tables)
         lid = getattr(self.layer, "layer_id", None)
-        if forwards:
-            # #239 S3f: every layer's misses into the rank's miss record
-            # (no-op unless SGLANG_WEG2_OWNED_MISS_RECORD)
-            from sglang.srt.layers.moe import pool_miss_cost
-
-            pool_miss_cost.note_sync(forwards, misses)
         if forwards and lid in (0, 23, 47):
             logging.getLogger(__name__).info(
                 "MoE expert pool layer %s: %d decode forwards since last sync, "
