@@ -162,9 +162,11 @@ class DKvStage(_pk.PKvStage):
         self._engage_cap(self.allocator, int(target), self.page)
         live = _pk.max_live_id(self.allocator, self.page) * self.page
         if live > target:
-            # a page above the new end is still held on THIS rank: no unmap under it
-            logger.warning("%s SHRINK HELD: live token %d above target %d", MARK, live, target)
-            return 0
+            # cannot happen with the tick's group floor; if it does, the ranks
+            # would part company -- stop by name instead of holding locally
+            raise _pk.Weg2DualKvCapBreach(
+                "%s SHRINK under a live row: token %d is live above the target %d on this rank although "
+                "the group floor was %d" % (MARK, live, target, int(live_floor_tokens)))
         self._sync()
         n = self.bytes_for(self.mapped_tokens) - self.bytes_for(target)
         self._move(target)
@@ -229,8 +231,30 @@ def attach(runner) -> Optional[DKvStage]:
     return actor
 
 
+def d_demand(sched) -> int:
+    """The tokens D's requests need NOW: every running request (and the
+    chunked one) plus EVERY request in the waiting queue -- a deferred one
+    (X-DEFER prefetch_pending: its store read landed short and is re-issued),
+    a requeue returner and a request not yet admitted all need their rows for
+    the loadback and the prefill. Metal bsffsv: counting only the queue head let
+    D shrink under a waiting 40767-token request. The front bounds the queue by
+    D's seats, so the sum is bounded too."""
+    from sglang.srt.weg2 import d_seat_vram as _sv
+
+    running = list(getattr(getattr(sched, "running_batch", None), "reqs", None) or ())
+    chunked = getattr(sched, "chunked_req", None)
+    if chunked is not None and all(chunked is not r for r in running):
+        running.append(chunked)
+    queue = list(getattr(sched, "waiting_queue", None) or ())
+    return sum(_sv._req_tokens(r) for r in running) + sum(_sv._req_tokens(r) for r in queue)
+
+
 def tick(sched) -> Optional[str]:
-    """Once per scheduler iteration on every D rank (rank-symmetric inputs)."""
+    """Once per scheduler iteration on every D rank. ONE collective per tick
+    (MAX of want, P-waiting and the highest live row), so every rank decides on
+    the SAME numbers -- metal bsffsv: a local view let TP1/TP2 shrink while TP0
+    held, and the collective of the shrink path then met ranks that were not
+    in it."""
     runner = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
     actor = getattr(runner, ACTOR_ATTR, None)
     if actor is None:
@@ -239,21 +263,19 @@ def tick(sched) -> Optional[str]:
     from sglang.srt.weg2.card_kv_ledger import peek
 
     actor.gmin = getattr(sched, "_weg2_group_min_ints", None) or actor.gmin
-    used, incoming, _rids = _sv.global_demand(sched)
-    want = want_tokens(used, incoming, _sv._air(sched), actor.step)
+    want_local = want_tokens(d_demand(sched), 0, _sv._air(sched), actor.step)
     st = peek(actor.ledger.path)
-    # replicated enough: P's demand is card-local, so the shrink trigger takes
-    # the group MAX of "a P prompt waits here" (one collective, every rank)
     p_wait_local = 1 if (st is not None and int(st.demand.get("P", 0)) > 0) else 0
-    p_waiting = -int(actor.gmin([-p_wait_local])[0]) > 0
+    live_local = int(_pk.max_live_id(actor.allocator, actor.page)) * int(actor.page)
+    g = actor.gmin([-int(want_local), -int(p_wait_local), -int(live_local)])
+    want, p_waiting, floor = -int(g[0]), -int(g[1]) > 0, -int(g[2])
+    want = max(want, _pk.round_up(floor, actor.step))       # never below a live row of any rank
     below = actor._below + 1 if want < actor.mapped_tokens else 0
     verdict, level = decide(actor.mapped_tokens, want, p_waiting, below, actor.step)
     actor._below = below
     if verdict == "grow":
         actor.group_grow(level)
     elif verdict == "shrink":
-        live = _pk.max_live_id(actor.allocator, actor.page) * actor.page
-        floor = -int(actor.gmin([-int(live)])[0])
         if actor.group_shrink(level, floor):
             actor._below = 0
     return verdict
