@@ -8299,6 +8299,12 @@ class Front:
         n = getattr(self, "_d_phase_n", None)
         if self.d_wait_bound_s <= 0 or not n:
             return False
+        if _d_seat_rewake_on():
+            # D-SEAT-REWAKE (NF-Operator 30.09.): the wake's n moves live -- a
+            # request past it must reach D, whose WAITING queue is what the
+            # GROW reads; sent to P it was invisible to D. Full = D's cap, the
+            # admitter's seats (as ``_arrival_seat_taken`` counts them).
+            n = self.d_bs
         D = self.groups["D"]
         ready = [p for p in self._ready_for_d if getattr(p, "fut", None) is None or not p.fut.done()]
         taken = (len(self._flip_ledger(D)) + max(0, self._handoff_in_flight()) + len(ready)
