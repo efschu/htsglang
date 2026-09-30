@@ -801,8 +801,11 @@ class Envs:
     # at the leg end. Measured: D's leg binds the D->P flip (TP1 37/39, TP2
     # 23/31) and pause_ms is 26-28 ms per tag on the 3080 D ranks (5090: 6)
     # with sync_ms=0 -- 465-517 ms per leg. Inert while H111b runs the leg.
-    # False = the per-tag chain, byte for byte. Off until the first series.
-    SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP = EnvBool(False)
+    # False = the per-tag chain, byte for byte. METAL (y4k 09301110, y4l
+    # rc12z30y4l 11e5db4370, profile -clk-po-pm-b1): 0 deaths, D->P
+    # flip_first_work median 1757 (y4k) / 1588 ms (y4l) against 2002 (y4i) --
+    # on by default since (user law: a proven switch is on); off via env.
+    SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP = EnvBool(True)
     # the sleeping group(s) that take it (comma list; default the D->P leg).
     SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS = EnvStr("D")
     # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):
@@ -811,16 +814,21 @@ class Envs:
     # Measured y4i (WEG2-PAUSE-SUB): 3080 D tag = 10 allocations, 31-64
     # cuMemUnmap calls, 21-25 ms; the same tag before the first D phase (no
     # extents, 10 calls) 10.6 ms. False = the per-extent walk, call for call.
-    # Off until metal (the driver may refuse a multi-mapping range: that run
-    # then falls back to the per-extent walk and the line counts it).
-    SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP = EnvBool(False)
+    # The driver may refuse a multi-mapping range: that run then falls back to
+    # the per-extent walk and the line counts it. METAL (y4l): unmaps = allocs
+    # 8172/8172, fallbacks 0, unmap time per tag line 14.9 ms against 17.9 in
+    # y4k, calls per line 44.9 -> 13.4 -- on by default; off via env.
+    SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP = EnvBool(True)
     # B1 (30.09., NF y4i, managers/weg2_flush_nonblock.py): the HiCache
     # publish leaves the D->P flip's quiesce. Measured: the first quiesce
     # /flush_cache refused in 11/12 flips (hicache_backup), FLUSH-PUBLISH
     # waited 32-166 ms, begin -> quiesce done median 98 ms; D was idle
     # 137-333 ms before each flip. (1) D-IDLE-PUBLISH: the bubble publisher's
     # sweep from Scheduler.on_idle (nothing running/waiting, not dormant).
-    SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH = EnvBool(False)
+    # METAL (y4l): WEG2-D-IDLE-PUBLISH 117x, D quiesce median 10 ms (max 23)
+    # against 98 ms; no "Cache not flushed", no STORE READ INCOMPLETE, no
+    # W120 -- on by default; off via env.
+    SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH = EnvBool(True)
     # nodes per idle pass (the sweep's max_issue). 1: a request that lands
     # during a pass waits at most one node's issue (y4i: ~23-48 ms per node
     # incl. arena claim + mamba write); the idle loop takes the next node
@@ -829,7 +837,9 @@ class Envs:
     # (2) FLUSH-QUIESCE-NONBLOCK: the quiesce answers "quiesced" when the only
     # blockers on every rank are the group's own write-throughs / store
     # writes; the sleep leg's group drain + #1470 flush reset before the pause.
-    SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK = EnvBool(False)
+    # On by default with (1) (y4l: never needed to act, the idle publish left
+    # nothing in flight at the quiesce); off via env.
+    SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK = EnvBool(True)
     # the groups both parts apply to (comma list; default the D->P sleeper)
     SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS = EnvStr("D")
     # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field

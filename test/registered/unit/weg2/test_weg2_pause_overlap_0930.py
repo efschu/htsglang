@@ -43,10 +43,13 @@ MIB = 1 << 20
 
 # ---- (2) the overlap rule --------------------------------------------------------
 
-def test_switch_default_off_and_groups():
-    assert envs.SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP.get() is False
+def test_switch_default_on_after_metal_and_groups():
+    # y4k + y4l metal: on by default; "off" stays an env value
+    assert envs.SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP.get() is True
     assert envs.SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS.get() == "D"
-    assert po.overlap_on("D") is False
+    assert po.overlap_on("D") is True
+    with envs.SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP.override(False):
+        assert po.overlap_on("D") is False
     with envs.SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP.override(True):
         assert po.overlap_on("D") is True
         assert po.overlap_on("P") is False
@@ -265,8 +268,9 @@ def _scope(stub, h111b=None):
 
 def test_scope_is_the_chain_unless_armed_readable_and_not_h111b():
     stub = _Stub({"w1"})
-    with _scope(stub) as look:
-        assert look is None                           # switch off
+    with envs.SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP.override(False):
+        with _scope(stub) as look:
+            assert look is None                       # switch off
     with envs.SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP.override(True):
         with _scope(stub, h111b=object()) as look:
             assert look is None                       # H111b runs the leg
