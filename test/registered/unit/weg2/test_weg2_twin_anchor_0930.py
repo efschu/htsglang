@@ -60,16 +60,22 @@ TWIN_A = _ids(SHARED_A, 110, 1)
 TWIN_B = _ids(SHARED_B, 130, 2)
 
 
+def _reset_ledger():
+    try:
+        from sglang.srt.weg2 import twin_anchor as ta2
+    except ImportError:  # the base: no ledger to reset, the test body names what is missing
+        return
+    ta2._reset_for_test()
+
+
 @pytest.fixture(autouse=True)
 def armed(monkeypatch):
-    from sglang.srt.weg2 import twin_anchor as ta2
-
     monkeypatch.setenv(tw.ENV, "1")
     monkeypatch.setenv(tw.ENV_MIN_TOKENS, str(MIN))
     monkeypatch.setenv("SGLANG_WEG2_GROUP", "P")
-    ta2._reset_for_test()
+    _reset_ledger()
     yield
-    ta2._reset_for_test()
+    _reset_ledger()
 
 
 # -- 1a/3a. the source plans a track per queued twin's boundary ------------------------
@@ -280,7 +286,7 @@ def _big(shared, total, salt):
 @pytest.fixture
 def pp0(monkeypatch):
     monkeypatch.setenv(tw.ENV_MIN_TOKENS, "8192")
-    monkeypatch.setattr(tw, "_twin_anchor_armed", lambda: True)
+    monkeypatch.setattr(tw, "_twin_anchor_armed", lambda: True, raising=False)
     return _Sched()
 
 
