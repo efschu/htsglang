@@ -776,6 +776,21 @@ class Envs:
     # Off until metal (the driver may refuse a multi-mapping range: that run
     # then falls back to the per-extent walk and the line counts it).
     SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP = EnvBool(False)
+    # B1 (30.09., NF y4i, managers/weg2_flush_nonblock.py): the HiCache
+    # publish leaves the D->P flip's quiesce. Measured: the first quiesce
+    # /flush_cache refused in 11/12 flips (hicache_backup), FLUSH-PUBLISH
+    # waited 32-166 ms, begin -> quiesce done median 98 ms; D was idle
+    # 137-333 ms before each flip. (1) D-IDLE-PUBLISH: the bubble publisher's
+    # sweep from Scheduler.on_idle (nothing running/waiting, not dormant).
+    SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH = EnvBool(False)
+    # nodes per idle pass (the sweep's max_issue)
+    SGLANG_WEG2_D_IDLE_PUBLISH_MAX_ISSUE = EnvInt(4)
+    # (2) FLUSH-QUIESCE-NONBLOCK: the quiesce answers "quiesced" when the only
+    # blockers on every rank are the group's own write-throughs / store
+    # writes; the sleep leg's group drain + #1470 flush reset before the pause.
+    SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK = EnvBool(False)
+    # the groups both parts apply to (comma list; default the D->P sleeper)
+    SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS = EnvStr("D")
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.

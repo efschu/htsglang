@@ -235,6 +235,7 @@ from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
 from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
 from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
 from sglang.srt.weg2 import flush_verdict as _weg2_flush_verdict  # z30j PP0 flush verdict
+from sglang.srt.managers import weg2_flush_nonblock as _weg2_flush_nonblock  # B1 (30.09.)
 from sglang.srt.weg2 import fork_anchor as _weg2_fork
 from sglang.srt.weg2 import d_park_read as _weg2_park_read  # PARK-RETAIN READ
 from sglang.srt.weg2 import resume_via_p as _weg2_rvp  # RESUME-VIA-P
@@ -19023,6 +19024,9 @@ class Scheduler(
         from sglang.srt.weg2.dual_p_kv_stage import flush_acks_when_idle
 
         flush_acks_when_idle(self)
+        # B1 part 1 (D-IDLE-PUBLISH): the nodes the flip's flush would publish,
+        # published while D has nothing to run (replicated gate, no clock).
+        _weg2_flush_nonblock.idle_publish(self)
         if not self.is_fully_idle():
             # #547: no batch to run, but work is queued somewhere (waiting
             # queue, grammar, disagg, hicache drain). That is the loaded path
@@ -19593,6 +19597,10 @@ class Scheduler(
                 _t0 = time.perf_counter()
                 _issued = 0
                 _stats = {}
+                # B1 (weg2_flush_nonblock part 2): the quiesce issues, the sleep
+                # leg drains -- unless a node is left un-issued (then #1470 as before)
+                _b1_nowait = not _weg2_flush_nonblock.quiesce_sweep_blocking(
+                    self, {}, tp_group_verdict)
                 # kvs2 W3 (boot ...kvdemandbar1dauer09291534): the poll's own
                 # publish work is not the idle lap's age (weg2_idle_vote.own_work).
                 with _weg2_own_work():
@@ -19601,6 +19609,11 @@ class Scheduler(
                         _issued += int(_stats.get("issued", 0) or 0)
                         if int(_stats.get("unbacked", 0) or 0) == 0:
                             break
+                        if _b1_nowait:
+                            if not _weg2_flush_nonblock.quiesce_sweep_blocking(
+                                    self, _stats, tp_group_verdict):
+                                break
+                            _b1_nowait = False  # a node left un-issued: the #1470 loop
                         # kvs2 W3: a round that issued nothing with nothing in
                         # flight cannot be followed by one that does -- no pin
                         # frees, no write lands. Measured: 4 such rounds of
@@ -19613,16 +19626,27 @@ class Scheduler(
                             _wc(write_back=True)  # free the pins, then sweep again
                         if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:
                             break
-                    if _wc is not None:
+                    if _wc is not None and not _b1_nowait:
                         _wc(write_back=True)
                 logger.info(
                     "#1470 FLUSH-PUBLISH issued=%d unbacked_left=%s in_flight_after=%s waited_ms=%.0f "
-                    "(un-backed nodes published and their write-throughs joined BEFORE the reset)",
+                    "(un-backed nodes published and their write-throughs joined BEFORE the reset)%s",
                     _issued, _stats.get("unbacked"), _stats.get("pending"),
-                    (time.perf_counter() - _t0) * 1000.0)
+                    (time.perf_counter() - _t0) * 1000.0,
+                    " -- B1 NONBLOCK: issued, not joined here; the sleep leg drains them "
+                    "before its reset" if _b1_nowait else "")
         group_idle, verdict_detail = self.group_idle_verdict(
             tp_group_verdict=tp_group_verdict
         )
+        # B1 (weg2_flush_nonblock part 2): a quiesce whose only blockers are
+        # the group's own publish answers "quiesced" and keeps the tree; the
+        # sleep leg drains, publishes, joins and resets before the kv pause.
+        _b1_quiesced = _weg2_flush_nonblock.quiesce_verdict(
+            self, group_idle, tp_group_verdict
+        )
+        if _b1_quiesced is not None:
+            logger.info("%s | #1268 group verdict: %s", _b1_quiesced, verdict_detail)
+            return True
         if group_idle:
             # fnFL2 H63d (#1470b): the reset below restarts the storage
             # pipeline and drops every store write still queued behind the one
