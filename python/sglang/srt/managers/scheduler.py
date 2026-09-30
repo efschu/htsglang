@@ -11801,11 +11801,12 @@ class Scheduler(
             self.tree_cache.flush_write_through_acks()
         # D-MEM-SCHED: the KV stage between wakes, after the acks above (an
         # ended request's pages go only once backed); rank-symmetric like them
-        _weg2_d_seat_vram.runtime_tick(self)
         # D-SEAT-REWAKE: the phase's seat count n follows the waiting requests
         # (grow at once) and the free seats (shrink past the measured re-plan
-        # price) -- same round boundary, rank-symmetric like the tick above
-        _weg2_d_seat_rewake.tick(self)
+        # price); only when it did not move does the D-MEM-SCHED stage tick
+        # run -- one live re-plan per iteration, rank-symmetric (both verdicts
+        # are replicated)
+        _weg2_d_seat_rewake.round_boundary(self)
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()

@@ -184,6 +184,32 @@ def _reseat(sched: Any, st: Any, n_new: int, grow: bool) -> Optional[float]:
     return ms
 
 
+def parts_text(ctl: Any, pause_ms: float) -> str:
+    """The pause in parts: rows OFF (copies), cells released, cells mapped,
+    device syncs, and the rest (the group MIN, the slot limit) -- per rank."""
+    p = dict(getattr(ctl, "last_reseat_parts", None) or {})
+    keys = ("off_copy_ms", "unmap_ms", "map_ms", "sync_ms")
+    rest = max(0.0, float(pause_ms) - sum(float(p.get(k, 0.0)) for k in keys))
+    return " ".join("%s=%.1f" % (k, float(p.get(k, 0.0))) for k in keys) + " other_ms=%.1f" % rest
+
+
+def round_boundary(sched: Any) -> Optional[str]:
+    """THE D round boundary's memory step: ONE of the two live re-plans per
+    iteration, never both against each other. The seat re-plan goes first
+    (a waiting request is demand now; its GROW/SHRINK is replicated); only
+    when it did not move does the D-MEM-SCHED tick move the KV stage -- with
+    the live n, beside the live GDN pages (``apply_stage``). A moved seat
+    count lets the stage tick run at the next iteration, on the new n."""
+    from sglang.srt.weg2 import d_seat_vram as V
+
+    moved = tick(sched)
+    if moved is None:
+        V.runtime_tick(sched)
+        return None
+    V._tick_noop(sched)
+    return moved
+
+
 def tick(sched: Any) -> Optional[str]:
     """Once per iteration of an AWAKE D, after the D-MEM-SCHED tick. Returns
     "grow"/"shrink" when n moved, else None."""
@@ -229,10 +255,11 @@ def tick(sched: Any) -> Optional[str]:
         rs.grow_ms = ms
         rs.counters["grow"] += 1
         V._reopen_admission(sched)
-        logger.warning("%s GROW n=%d->%d waiting=%d running=%d pause_ms=%.1f rows_on %s->%s "
+        logger.warning("%s GROW n=%d->%d waiting=%d running=%d pause_ms=%.1f (%s) rows_on %s->%s "
                        "mamba_keep=%s (the waiting requests take the new seats at this round; "
                        "no weight legs, no P)", MARKER, n, up, len(waiting), len(running), ms,
-                       rows0, getattr(V.controller(sched), "rows_on", None),
+                       parts_text(V.controller(sched), ms), rows0,
+                       getattr(V.controller(sched), "rows_on", None),
                        getattr(V.controller(sched), "mamba_keep", None))
         return "grow"
     down = shrink_target(n, len(running), len(waiting))
@@ -272,9 +299,10 @@ def tick(sched: Any) -> Optional[str]:
     rs.shrink_ms = ms
     rs.counters["shrink"] += 1
     rs.idle_since, rs.idle_rounds = None, 0
-    logger.warning("%s SHRINK n=%d->%d running=%d idle_s=%.2f price_ms=%s pause_ms=%.1f rows_on %s->%s "
+    logger.warning("%s SHRINK n=%d->%d running=%d idle_s=%.2f price_ms=%s pause_ms=%.1f (%s) rows_on %s->%s "
                    "mamba_keep=%s (the free seats' pages went back to expert rows)", MARKER, n, down,
-                   len(running), idle_s, "-" if price is None else "%.1f" % price, ms, rows0,
+                   len(running), idle_s, "-" if price is None else "%.1f" % price, ms,
+                   parts_text(V.controller(sched), ms), rows0,
                    getattr(V.controller(sched), "rows_on", None),
                    getattr(V.controller(sched), "mamba_keep", None))
     return "shrink"

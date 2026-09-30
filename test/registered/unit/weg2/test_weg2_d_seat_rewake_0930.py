@@ -275,14 +275,14 @@ def test_off_nothing_moves():
     assert _run(ctxs, lambda: R.tick(s)) is None and ctl.calls == [] and calls == []
 
 
-def test_the_scheduler_runs_the_tick_after_the_stage_tick():
+def test_the_scheduler_runs_one_round_boundary_step():
     import inspect
 
     from sglang.srt.managers import scheduler as SC
 
-    src = inspect.getsource(SC)
-    i = src.index("_weg2_d_seat_vram.runtime_tick(self)")
-    assert "_weg2_d_seat_rewake.tick(self)" in src[i:i + 400]
+    src = inspect.getsource(SC.Scheduler.get_next_batch_to_run)
+    assert "_weg2_d_seat_rewake.round_boundary(self)" in src
+    assert "_weg2_d_seat_vram.runtime_tick(self)" not in src     # never a second, independent tick
 
 
 # ---------------------------------------------------------------- (4) the front
@@ -297,3 +297,77 @@ def test_the_front_counts_ds_cap_as_its_seats(monkeypatch):
     assert f._arrival_seat_taken() == (3, 3)
     with envs.SGLANG_WEG2_D_SEAT_REWAKE.override(True):
         assert f._arrival_seat_taken() == (3, 6)          # d_bs: D grows its seats live
+
+
+# ---------------------------------------------------------------- 30.09. follow-up: MEM-SCHED after a re-seat
+
+def test_a_stage_move_after_a_shrink_books_the_rows_beside_the_live_gdn():
+    """After a live SHRINK n=2 -> 1 the GDN pool maps n=1's slots. A D-MEM-SCHED
+    stage move S0 -> S1 booked ``rows_full`` (the GDN of the cap form) and gave
+    the freed GDN cells away -- against "freier VRAM gehört den Experten".
+    Now: the rows that fit beside the LIVE pages (``rows_shrunk``), no GDN page
+    moves, and the card still never holds more than the boot form."""
+    tms = rb.CardTms()
+    with h._armed(tms), envs.SGLANG_WEG2_D_SEAT_REWAKE.override(True):
+        r, ctl, st = _live_phase(tms, 2, True)
+        ctl.reseat_live(1, st.stage)
+        keep1 = int(ctl.mamba_keep)
+        gdn = _gdn_ids(tms, r.temporal, keep1)
+        gdn_mapped = tms.mapped(r.temporal.data_ptr())
+        cell = ctl.cells[(1, 1)]
+        assert cell.rows_shrunk > cell.rows_full, "the desk rank must show the gap"
+        tms.budget = max(tms.total(), cell.cap_mapped)
+        applied = ctl.apply_stage(1, 1)
+        assert applied.extra_rows == cell.rows_shrunk                   # base: rows_full
+        assert ctl.mamba_keep == keep1 and _gdn_ids(tms, r.temporal, keep1) == gdn
+        assert tms.mapped(r.temporal.data_ptr()) == gdn_mapped
+        assert tms.total() <= tms.budget
+
+
+def test_a_stage_move_on_the_cap_form_gdn_keeps_rows_full():
+    tms = rb.CardTms()
+    with h._armed(tms), envs.SGLANG_WEG2_D_SEAT_REWAKE.override(True):
+        r, ctl, st = _live_phase(tms, 2, True)
+        assert ctl.mamba_keep is None
+        applied = ctl.apply_stage(2, 1)
+        assert applied.extra_rows == ctl.cells[(2, 1)].rows_full
+
+
+def test_the_grow_pause_comes_in_parts():
+    tms = rb.CardTms()
+    with h._armed(tms), envs.SGLANG_WEG2_D_SEAT_REWAKE.override(True):
+        r, ctl, st = _live_phase(tms, 1, True)
+        ctl.reseat_live(2, st.stage)
+        p = ctl.last_reseat_parts
+        assert set(p) == {"off_copy_ms", "unmap_ms", "map_ms", "sync_ms"}
+        assert p["map_ms"] > 0.0 and all(v >= 0.0 for v in p.values())
+        txt = R.parts_text(ctl, sum(p.values()) + 1.0)
+        assert "off_copy_ms=" in txt and "map_ms=" in txt and "other_ms=1.0" in txt
+
+
+def test_the_tick_line_carries_the_parts(caplog):
+    caplog.set_level(logging.WARNING)
+    ctl = _Ctl()
+    ctl.last_reseat_parts = {"off_copy_ms": 8.0, "unmap_ms": 0.5, "map_ms": 6.0, "sync_ms": 0.2}
+    s, _calls = _sched(3, 3, 1)
+    assert _run(_tick_env(ctl), lambda: R.tick(s)) == "grow"
+    line = [m for m in caplog.messages if "D-SEAT-REWAKE GROW" in m][-1]
+    assert "off_copy_ms=8.0 unmap_ms=0.5 map_ms=6.0 sync_ms=0.2 other_ms=" in line
+
+
+def test_one_re_plan_per_round_boundary():
+    """The seat re-plan moved -> the stage tick does not run in this iteration
+    (it counts a noop and runs at the next one, on the new n); it did not
+    move -> the stage tick runs."""
+    ran = []
+    s = types.SimpleNamespace()
+    with mock.patch.object(R, "tick", lambda sched: "grow"), \
+            mock.patch.object(dsv, "runtime_tick", lambda sched: ran.append("stage")), \
+            mock.patch.object(dsv, "_tick_noop", lambda sched: ran.append("noop")):
+        assert R.round_boundary(s) == "grow"
+    assert ran == ["noop"]
+    ran.clear()
+    with mock.patch.object(R, "tick", lambda sched: None), \
+            mock.patch.object(dsv, "runtime_tick", lambda sched: ran.append("stage")):
+        assert R.round_boundary(s) is None
+    assert ran == ["stage"]

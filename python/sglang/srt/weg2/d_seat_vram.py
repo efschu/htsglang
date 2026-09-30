@@ -436,6 +436,10 @@ class StageCell:
     #: k with the GDN pool in its cap form (it cannot shrink while it is
     #: mapped and live -- H95c's rule); -1 = the stage needs the GDN pages
     rows_full: int = -1
+    #: D-SEAT-REWAKE: k with the GDN pool mapped for n seats (``slot_limit +
+    #: 1``), -1 at the cap or when it does not fit -- what a live stage move
+    #: books when the live pool IS that shrunk form (a live re-seat made it)
+    rows_shrunk: int = -1
 
     @property
     def mapped(self) -> int:
@@ -499,7 +503,8 @@ def stage_vram_cells(
             out[(n, j)] = StageCell(
                 n=n, stage=j, tokens=tokens, slot_limit=lim, mamba_keep=keep,
                 extra_rows=max(0, k), mamba_mapped=m, expert_mapped=ex[max(0, k)],
-                kv_mapped=kv, cap_mapped=budget, feasible=k >= 0, rows_full=k_full)
+                kv_mapped=kv, cap_mapped=budget, feasible=k >= 0, rows_full=k_full,
+                rows_shrunk=k_shrunk)
     return out
 
 
@@ -1332,6 +1337,8 @@ class SeatVram:
     #: round: the copy goes to the copy stream with an event)
     bytes_copied: int = 0
     copy_ms: float = 0.0
+    #: D-SEAT-REWAKE: the last live re-seat's pause in parts (ms)
+    last_reseat_parts: Dict[str, float] = field(default_factory=dict)
     #: the last span plan set on each managed allocation; after its tag's
     #: resume or a live apply it IS the saver's extents (one per range)
     spans_by_ptr: Dict[int, Tuple[Tuple[int, int], ...]] = field(default_factory=dict)
@@ -1525,7 +1532,29 @@ class SeatVram:
         notes = []
         k, keep = int(cell.extra_rows), int(cell.mamba_keep)
         infos = [self.spans.info(m.ptr) for m in self.slot_tensors]
-        if keep <= self.pool_size and any(i is not None and i.active for i in infos):
+        live_gdn = any(i is not None and i.active for i in infos)
+        if live_gdn and _rewake_on():
+            # D-SEAT-REWAKE: the live GDN pool is whatever the wake or a live
+            # re-seat mapped for THIS phase's n -- the stage move books the
+            # rows that fit beside exactly those pages (never the cap form's
+            # GDN, whose cells a SHRINK gave back to the experts) and moves
+            # no GDN page (the re-seat alone does, at its own round)
+            live_keep = self.pool_size + 1 if self.mamba_keep is None else int(self.mamba_keep)
+            if live_keep <= self.pool_size and cell.rows_shrunk >= 0 and live_keep == cell.slot_limit + 1:
+                k, keep = int(cell.rows_shrunk), live_keep
+                notes.append("the GDN pool is live for %d seats: rows beside it" % n)
+            else:
+                # the cap form (or a keep this n does not name): the rows that
+                # fit beside the cap form's GDN -- never more than the pages hold
+                if cell.rows_full < 0:
+                    raise Weg2DSeatVramRefused(
+                        "%s: stage S%d at n=%d needs the GDN pages of the empty seats but the "
+                        "Mamba pool is mapped (live) in its cap form" % (LINE_MARK, j, n))
+                k, keep = int(cell.rows_full), live_keep
+                if live_keep <= self.pool_size:
+                    notes.append("the live GDN pool keeps %d slots, not n=%d's %d: rows of the cap "
+                                 "form" % (live_keep - 1, n, cell.slot_limit))
+        elif keep <= self.pool_size and live_gdn:
             if cell.rows_full < 0:
                 raise Weg2DSeatVramRefused(
                     "%s: stage S%d at n=%d needs the GDN pages of the empty seats but the "
@@ -1785,26 +1814,53 @@ class SeatVram:
                           + [(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
         census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
         rows_from = int(self.rows_on)
-        if grow:
-            if k < rows_from:
-                self._rows_off_live(k, True)
-                self._set_bank_plans(bank_plans, census)
+        import time as _time
+
+        # the decode pause in parts (the metal's 200 ms bound, per term):
+        # off_copy = rows OFF (coldest-first copies + table writes), unmap =
+        # cells released, map = cells mapped (+ rows ON), sync = device syncs
+        parts = {"off_copy_ms": 0.0, "unmap_ms": 0.0, "map_ms": 0.0, "sync_ms": 0.0}
+
+        def _off(k_to: int) -> None:
+            s0, t = self.sync_ms, _time.perf_counter()
+            self._rows_off_live(k_to, True)
+            wall = (_time.perf_counter() - t) * 1000.0
+            ds = max(0.0, self.sync_ms - s0)
+            parts["sync_ms"] += ds
+            parts["off_copy_ms"] += max(0.0, wall - ds)
+
+        def _timed(key: str, fn) -> None:
+            t = _time.perf_counter()
+            fn()
+            parts[key] += (_time.perf_counter() - t) * 1000.0
+
+        def _map_gdn() -> None:
             for m, sp in mamba_plans:
                 self.set_plan(m.ptr, m.geom.name, sp, live=True, census=census)
+
+        if grow:
+            if k < rows_from:
+                _off(k)
+                _timed("unmap_ms", lambda: self._set_bank_plans(bank_plans, census))
+            _timed("map_ms", _map_gdn)
         else:
             import torch
 
             if torch.cuda.is_initialized():
+                s0 = self.sync_ms
                 self._timed_sync()  # no kernel may still read a slot whose cells go
-            for m, sp in mamba_plans:
-                self.set_plan(m.ptr, m.geom.name, sp, live=True, census=census)
+                parts["sync_ms"] += self.sync_ms - s0
+            _timed("unmap_ms", _map_gdn)
             if k > rows_from:
+                t_map = _time.perf_counter()
                 k = self._grow_bank_elastic(bank_plans, k, census)
                 for cache in self.caches:
                     cache.set_seat_rows_on(k, device_write=True)
+                parts["map_ms"] += (_time.perf_counter() - t_map) * 1000.0
             elif k < rows_from:
-                self._rows_off_live(k, True)
-                self._set_bank_plans(bank_plans, census)
+                _off(k)
+                _timed("unmap_ms", lambda: self._set_bank_plans(bank_plans, census))
+        self.last_reseat_parts = dict(parts)
         self.mamba_keep = None if keep_eff > self.pool_size else int(keep_eff)
         if self.mamba_pool is not None and self.slot_tensors:
             self.mamba_pool._weg2_seat_keep = self.mamba_keep
