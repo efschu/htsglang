@@ -15622,6 +15622,32 @@ class DTpRatioDecision:
     rows: Tuple[DOperatingPointRow, ...] = ()
 
 
+def dual_w64_override(refusal: str, budgets: Sequence[int], model: str, *, dual_layout: bool,
+                      evidence_dirs: Sequence[str] = (EVIDENCE_DIR,)) -> Tuple[bool, str]:
+    """DUAL-TP3PP3: may a W64 refusal of the SHIPPED D position be lifted under
+    --dual-layout? Only when the newest dual-share D log of this model with the
+    same installed weight vector shows, on its OWN budget posts (the runtime's
+    ``KV = budget - posts``), that every rank keeps >= the model's minimum
+    tokens at these budgets (weg2/dual_w64.py; metal a3t5js: model 17188 vs
+    measured ~14853 MiB on D r0). ``(lifted, note)``; never lifts off-dual,
+    never a non-W64 refusal, never without a measurement."""
+    if not dual_layout or not str(refusal).startswith("W64 "):
+        return False, ""
+    m = re.search(r"derives weights \[([\d, ]+)\]", str(refusal))
+    if not m:
+        return False, "W64-DUAL: the refusal names no weight vector; the model verdict stands"
+    weights = [int(x) for x in m.group(1).split(",") if x.strip()]
+    from sglang.srt.uneven_perf import _PREDICT_MIN_RANK_TOKENS
+    from sglang.srt.weg2 import dual_w64 as _dw
+
+    meas = _dw.find_dual_d_measurement(list(evidence_dirs), model, weights)
+    if meas is None:
+        return False, ("W64-DUAL: no measured dual-share D log of %s with weights %s under %s; "
+                       "the model verdict stands" % (model, weights, ", ".join(evidence_dirs)))
+    v = _dw.judge(meas, list(budgets), int(_PREDICT_MIN_RANK_TOKENS))
+    return v.feasible, v.line
+
+
 def d_tp_ratio_decision(
     objective: str,
     tune: str,
@@ -15632,6 +15658,7 @@ def d_tp_ratio_decision(
     env_d: str = "",
     user_reserve_by_card: Optional[Dict[str, int]] = None,
     overhead_mib_by_rank: Optional[Sequence[float]] = None,
+    dual_layout: bool = False,
 ) -> DTpRatioDecision:
     """Choose group D's weight objective and PRICE the choice on one line.
 
@@ -15713,6 +15740,14 @@ def d_tp_ratio_decision(
             for r in op_refusals
             if objective in r or r.startswith(("W61", "W63"))
         ]
+        if mine and dual_layout:
+            _lifted, _note = dual_w64_override(mine[0], budgets, model, dual_layout=True)
+            if _note:
+                op_line = op_line + "\n  " + _note
+            if _lifted:
+                mine = []
+            else:
+                mine = [mine[0] + (" | " + _note if _note else "")]
         if mine:
             raise Weg2LaunchRefused(mine[0] + " (position %s was SHIPPED, so "
                                     "the refusal is fatal here; on a maxkv boot "
@@ -24884,6 +24919,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
             user_reserve_by_card=user_reserve_by_card,
+            dual_layout=bool(getattr(ns, "dual_layout", False)),
             overhead_mib_by_rank=d_overhead_mib,
         )
         log(d_ratio.line)
@@ -24939,6 +24975,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
             user_reserve_by_card=user_reserve_by_card,
+            dual_layout=bool(getattr(ns, "dual_layout", False)),
             overhead_mib_by_rank=d_overhead_mib,
         )
         log(d_ratio.line)
@@ -25040,6 +25077,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
             user_reserve_by_card=user_reserve_by_card,
+            dual_layout=bool(getattr(ns, "dual_layout", False)),
         )
         log(d_ratio.line)
         log(d_ratio.op_line)
