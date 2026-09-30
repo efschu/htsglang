@@ -6751,7 +6751,7 @@ class Scheduler(
         self._weg2_hold_release_due = False
         from sglang.srt.weg2 import rpc_stall_watchdog as _rsw
 
-        armed = _rsw.arm("hold_release", rank=getattr(self, "tp_rank", "?"),
+        armed = _rsw.arm("hold_release", rank=_rsw.rank_of(self),
                          group=os.environ.get("SGLANG_WEG2_GROUP", "") or "?")
         t0 = time.perf_counter()
         n_hold = len(getattr(self, "weg2_dormant_hold", None) or [])

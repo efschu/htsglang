@@ -132,6 +132,29 @@ def test_the_deferred_release_is_watched(tmp_path):
     assert len(files) == 1 and "Thread" in files[0].read_text()
 
 
+def test_the_deferred_release_names_its_rank_from_the_world_group(tmp_path):
+    """RPCSTALL-NAME (z30y10, D 20:03:51): the call site read ``getattr(self, "tp_rank", "?")``; the
+    Scheduler has no ``tp_rank`` (the fake above sets one, the real one does not), so every rank
+    armed ``r_`` and they shared one file."""
+    ev = []
+    s = _sched(ev)
+    del s.tp_rank
+    s.world_group = types.SimpleNamespace(rank_in_group=1)
+
+    def slow():
+        time.sleep(0.5)
+        return 0
+
+    s._weg2_release_dormant_hold = slow
+    s._weg2_hold_release_due = True
+    with mock.patch.dict(os.environ, {"SGLANG_WEG2_RPC_STALL_WATCHDOG_S": "0.2",
+                                      "SGLANG_WEG2_EVIDENCE_DIR": str(tmp_path),
+                                      "SGLANG_WEG2_GROUP": "D"}):
+        s._weg2_run_deferred_hold_release()
+    files = list(tmp_path.glob("weg2_rpcstall_D_r1_hold_release_*_p%d.txt" % os.getpid()))
+    assert len(files) == 1 and "Thread" in files[0].read_text()
+
+
 def test_the_resume_marks_the_release_due_under_the_switch():
     src = inspect.getsource(WU)
     i = src.index("SGLANG_WEG2_HOLD_RELEASE_AFTER_REPLY.get()")

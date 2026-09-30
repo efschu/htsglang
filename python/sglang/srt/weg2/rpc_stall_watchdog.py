@@ -21,7 +21,7 @@ A second dump follows at +``REPEAT_S`` (8 s) when the RPC still runs (the implem
 two snapshots show whether a stall moves. Both land in the same file.
 
 :func:`watched` wraps a handler: before it, :func:`arm` opens
-``<evidence>/weg2_rpcstall_<group>_r<rank>_<kind>_<unix_ms>.txt`` with one header line and starts the
+``<evidence>/weg2_rpcstall_<group>_r<rank>_<kind>_<unix_ms>_p<pid>.txt`` with one header line and starts the
 sampler; after it (also on a raise), :func:`disarm` stops the sampler (bounded join, never a hang) and
 reads the file size: grown past the header = fired -> one ``RPC-STALL-WATCHDOG fired`` line naming
 rank, kind and file; not grown -> the file is removed.
@@ -94,8 +94,12 @@ def arm(kind: str, *, rank, group: str, directory: Optional[str] = None,
         d = directory or dump_dir()
         os.makedirs(d, exist_ok=True)
         now = time.time()
-        path = os.path.join(d, "weg2_rpcstall_%s_r%s_%s_%d.txt" % (
-            _slug(group), _slug(rank), _slug(kind), int(now * 1000)))
+        # RPCSTALL-NAME (z30y10, D 20:03:51): every rank of a group arms the SAME kind in the SAME
+        # millisecond; without a rank (``r_``) and without the pid the three processes opened ONE
+        # path, and the first disarm unlinked the file under the other two (FileNotFoundError on
+        # TP0/TP1). The pid makes the path this process's own whatever the rank reads.
+        path = os.path.join(d, "weg2_rpcstall_%s_r%s_%s_%d_p%d.txt" % (
+            _slug(group), _slug(rank), _slug(kind), int(now * 1000), os.getpid()))
         fh = open(path, "w")
         header = "%s group=%s rank=%s kind=%s armed_unix=%.3f timeout_s=%.3f pid=%d\n" % (
             MARKER, group, rank, kind, now, t, os.getpid())
@@ -127,10 +131,35 @@ def disarm(armed: Optional[Armed]) -> Optional[str]:
                 "GIL; a second dump at +%.0f s if it still ran)", MARKER, armed.group, armed.rank, armed.kind, armed.path,
                 size, (time.perf_counter() - armed.t0) * 1000, REPEAT_S)
             return armed.path
-        os.unlink(armed.path)
+        try:
+            os.unlink(armed.path)
+        except FileNotFoundError:
+            pass                                # already gone: the end state disarm wants
     except Exception as exc:  # noqa: BLE001 -- an instrument never breaks a leg
         logger.warning("%s disarm for %s: %s: %s", MARKER, armed.kind, type(exc).__name__, exc)
     return None
+
+
+def rank_of(scheduler):
+    """THIS process's rank for the dump name: the world group's ``rank_in_group``, else the flat
+    ``ps`` rank (``pp_rank * tp_size + tp_rank``), else ``tp_rank``, else ``"?"``.
+
+    RPCSTALL-NAME (z30y10): the hold-release call site read ``getattr(self, "tp_rank", "?")`` -- the
+    Scheduler has no ``tp_rank`` (its identity lives on ``world_group`` / ``ps``, see
+    ``SchedulerWeightUpdaterManager._weg2_rank``), so every rank armed ``r?`` -> ``r_``."""
+    try:
+        r = getattr(getattr(scheduler, "world_group", None), "rank_in_group", None)
+        if isinstance(r, int):
+            return r
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ps = scheduler.ps
+        return int(ps.pp_rank) * int(ps.tp_size) + int(ps.tp_rank)
+    except Exception:  # noqa: BLE001
+        pass
+    r = getattr(scheduler, "tp_rank", None)
+    return r if isinstance(r, int) else "?"
 
 
 def _who(obj) -> tuple:
@@ -138,7 +167,7 @@ def _who(obj) -> tuple:
     try:
         rank = obj._weg2_rank()
     except Exception:  # noqa: BLE001
-        pass
+        rank = rank_of(getattr(obj, "scheduler", obj))
     try:
         group = obj._weg2_group_name()
     except Exception:  # noqa: BLE001

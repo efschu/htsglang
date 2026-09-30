@@ -143,3 +143,49 @@ def test_the_shared_stall_sampler_interface(tmp_path):
         s = S.arm(fh, 5.0)
         S.disarm(s, 1.0)                                 # stopped before the timeout: nothing written
         assert s.dumps == 0 and not s.thread.is_alive()
+
+
+# ---------------------------------------------------------------- RPCSTALL-NAME (z30y10, 30.09.)
+# D.log 20:03:51 TP0 and TP1: "RPC-STALL-WATCHDOG disarm for hold_release: FileNotFoundError ...
+# weg2_rpcstall_D_r__hold_release_1790798631501.txt" -- no rank in the name (``r_``) and the SAME
+# millisecond on every rank: the three processes opened ONE path and the first disarm unlinked it.
+
+def test_two_ranks_arming_in_the_same_ms_do_not_share_a_file(tmp_path, caplog):
+    import logging
+
+    armed = []
+    with mock.patch.object(W.time, "time", return_value=1790798631.501), \
+            mock.patch.dict(os.environ, {"SGLANG_WEG2_EVIDENCE_DIR": str(tmp_path),
+                                         "SGLANG_WEG2_RPC_STALL_WATCHDOG_S": "5"}):
+        for pid in (4101, 4102):                     # two rank processes, the worst case rank "?"
+            with mock.patch.object(W.os, "getpid", return_value=pid):
+                armed.append(W.arm("hold_release", rank="?", group="D"))
+        assert armed[0].path != armed[1].path
+        with caplog.at_level(logging.WARNING, logger=W.logger.name):
+            for a in armed:
+                assert W.disarm(a) is None
+    assert not [r for r in caplog.records if W.MARKER in r.getMessage()]
+    assert _files(tmp_path) == []
+
+
+def test_disarm_of_a_file_already_gone_is_silent(tmp_path, caplog):
+    import logging
+
+    with mock.patch.dict(os.environ, {"SGLANG_WEG2_EVIDENCE_DIR": str(tmp_path),
+                                      "SGLANG_WEG2_RPC_STALL_WATCHDOG_S": "5"}):
+        a = W.arm("hold_release", rank=0, group="D")
+    os.unlink(a.path)
+    with caplog.at_level(logging.WARNING, logger=W.logger.name):
+        assert W.disarm(a) is None
+    assert not [r for r in caplog.records if W.MARKER in r.getMessage()]
+
+
+def test_rank_of_reads_the_world_group_then_ps_never_a_missing_tp_rank():
+    import types
+
+    wg = types.SimpleNamespace(world_group=types.SimpleNamespace(rank_in_group=2),
+                               ps=types.SimpleNamespace(pp_rank=0, tp_size=3, tp_rank=0))
+    assert W.rank_of(wg) == 2
+    ps = types.SimpleNamespace(ps=types.SimpleNamespace(pp_rank=1, tp_size=1, tp_rank=0))
+    assert W.rank_of(ps) == 1                        # P: pp_size=3, tp_size=1 -> the flat rank
+    assert W.rank_of(types.SimpleNamespace()) == "?"

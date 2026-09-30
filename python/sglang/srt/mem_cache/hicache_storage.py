@@ -2818,13 +2818,20 @@ class HiCacheFile(HiCacheStorage):
 
         def _run():
             fails = 0
-            while not stop.wait(every):
+            wait_s = every
+            cont = False
+            cycle_t0 = time.monotonic()
+            while not stop.wait(wait_s):
+                tot = None
+                if not cont:
+                    cycle_t0 = time.monotonic()
                 try:
-                    self.l3_write_behind_pass()
+                    tot = self.l3_write_behind_pass(cont=cont)
                 except Exception as exc:  # noqa: BLE001 - never takes the process down
                     fails += 1
                     if fails <= 8 or fails % 256 == 0:
                         logger.warning("L3-REUSE WRITE-BEHIND pass failed (n=%d): %r", fails, exc)
+                cont, wait_s = self._l3wb_next_wait(tot, every, cycle_t0, time.monotonic())
 
         t = threading.Thread(target=_run, name="weg2-l3-write-behind", daemon=True)
         self._l3wb_thread = t
@@ -2837,16 +2844,47 @@ class HiCacheFile(HiCacheStorage):
         return True
 
     @staticmethod
+    def _l3wb_slice_s() -> float:
+        """L3WB-SLICE: the longest uninterrupted burst of one pass (s); 0 = no slicing."""
+        try:
+            v = float(envs.SGLANG_WEG2_L3_WRITE_BEHIND_SLICE_MS.get())
+        except Exception:  # noqa: BLE001
+            v = 25.0
+        return max(0.0, v) / 1000.0
+
+    @staticmethod
+    def _l3wb_yield_s() -> float:
+        try:
+            v = float(envs.SGLANG_WEG2_L3_WRITE_BEHIND_YIELD_MS.get())
+        except Exception:  # noqa: BLE001
+            v = 25.0
+        return max(0.001, v / 1000.0)
+
+    @classmethod
+    def _l3wb_next_wait(cls, tot, every: float, cycle_t0: float, now: float):
+        """L3WB-SLICE: ``(cont, wait_s)`` after one pass. A pass the slice
+        budget cut (``sliced``) is CONTINUED after the yield -- the rest of its
+        work is stretched over short bursts, not left for the next tick and
+        never dropped. Otherwise the cycle is over: the next one starts one
+        tick after this cycle STARTED (at least one yield from now), so a cycle
+        that took longer than the tick costs no extra idle time."""
+        y = cls._l3wb_yield_s()
+        if tot and tot.get("sliced"):
+            return True, y
+        return False, max(y, float(every) - max(0.0, now - cycle_t0))
+
+    @staticmethod
     def _l3_write_behind_budget() -> int:
         try:
             return max(1, int(envs.SGLANG_WEG2_L3_WRITE_BEHIND_MIB.get())) << 20
         except Exception:  # noqa: BLE001
             return 256 << 20
 
-    def l3_write_behind_pass(self, budget_bytes: Optional[int] = None, quiet=None) -> dict:
+    def l3_write_behind_pass(self, budget_bytes: Optional[int] = None, quiet=None,
+                             cont: bool = False, slice_s: Optional[float] = None) -> dict:
         """One pass: every COMPLETE page of every arena this process opened
         that has no L3 copy yet is copied to the disk store WITHOUT being
-        freed, up to ``budget_bytes`` per arena.
+        freed, up to ``budget_bytes`` per arena and cycle.
 
         L3-REUSE 0928 (NF boot rc12z13, first request after the boot):
         ``#1472 READ-TRACE asked=512 readable=399 first_missing=eb5869b2...
@@ -2861,7 +2899,7 @@ class HiCacheFile(HiCacheStorage):
         Never against the flip, never against the scheduler:
         * quiet while a leg runs, while this group sleeps and while it is
           dormant (``l3_write_behind.quiet``: the existing leg bracket and
-          W25 ``weg2_dormant``, no clock) -- checked before every batch;
+          W25 ``weg2_dormant``, no clock) -- checked before every slice;
         * no per-slot Python: the census of COMPLETE slots is ONE C call
           (``arena_complete_census``), the pages already secured are filtered
           by numpy on (slot, generation, key), pinning is one C call
@@ -2872,6 +2910,24 @@ class HiCacheFile(HiCacheStorage):
           cap evicts later is not written again while it sits in the same
           slot (no write/evict ping-pong); a refused reservation (cap or
           min-free) ends this arena's pass instead of retrying page by page.
+
+        L3WB-SLICE (z30y10, dcdb9ab8f9, D TP0): the baseline of what is
+        already secured (``arena._l3wb_sec``) is THIS process's -- a page the
+        other group completed and wrote to L3 is ``new`` here until this
+        process has stat'ed it once, so the first pass after a flip's gate
+        opens sees ``new == complete`` (4092 there) and verified them all in
+        ONE uninterrupted burst: 17.6 s, cpu_ms=17574.6, for 8 pages written,
+        with TP0 answering nothing (front W3 after 12 s). Now the new stems
+        are processed in slices (stem read, stat, write), the slice size
+        adapts to the measured per-stem cost, and once ``slice_s``
+        (SGLANG_WEG2_L3_WRITE_BEHIND_SLICE_MS) is used up the pass stops at a
+        slice edge with ``sliced=True``: every stem not reached is counted
+        ``deferred``, the arena's cursor names where the continuation starts
+        (each new page is visited at most once per cycle: a head that never
+        secures cannot starve the tail, and the cycle ends), and the thread
+        continues after the yield (``_l3wb_next_wait``). At least one slice
+        runs per pass, so every pass makes progress. ``cont`` marks such a
+        continuation: it shares the byte budget of the cycle it continues.
         """
         import numpy as np
 
@@ -2881,10 +2937,14 @@ class HiCacheFile(HiCacheStorage):
 
         quiet = _gate.quiet_reason if quiet is None else quiet
         budget = int(budget_bytes) if budget_bytes else self._l3_write_behind_budget()
+        slice_s = self._l3wb_slice_s() if slice_s is None else max(0.0, float(slice_s))
         tot = {"arenas": 0, "complete": 0, "new": 0, "on_disk": 0, "written": 0,
-               "pending": 0, "refused": 0, "bytes": 0, "paused": None}
+               "pending": 0, "refused": 0, "bytes": 0, "paused": None,
+               "sliced": False, "deferred": 0, "slices": 0, "slice_max_ms": 0.0,
+               "slice_max_stems": 0, "last_slice_at_ms": 0.0, "stat_ms": 0.0, "stat_cpu_ms": 0.0, "cont": bool(cont)}
         t0 = time.perf_counter()
         c0 = time.thread_time()
+        deadline = (t0 + slice_s) if slice_s > 0 else None
         why = quiet()
         if (why or "open") != getattr(self, "_l3wb_gate", "open"):
             # one line per gate change: the metal shows the pass stops at the
@@ -2900,7 +2960,11 @@ class HiCacheFile(HiCacheStorage):
             return tot
         fsync = canonical_fsync_default()
         chunk = 64
-        for arena in [a for a in list((getattr(self, "_arenas", None) or {}).values()) if a is not None]:
+        arenas = [a for a in list((getattr(self, "_arenas", None) or {}).values()) if a is not None]
+        stop_all = False
+        for arena in arenas:
+            if stop_all:
+                break
             tot["arenas"] += 1
             nslots = int(arena.slots)
             sec = getattr(arena, "_l3wb_sec", None)
@@ -2908,95 +2972,173 @@ class HiCacheFile(HiCacheStorage):
                 sec = arena._l3wb_sec = (np.full(nslots, -1, dtype=np.int64),
                                          np.zeros(nslots, dtype=np.uint64))
             sec_gen, sec_lo = sec
+            if not cont:
+                # a new cycle: every arena from its first slot, its byte budget full
+                arena._l3wb_cycle_pages = 0
+                arena._l3wb_cursor = 0
+                arena._l3wb_done = False
+            elif getattr(arena, "_l3wb_done", False):
+                continue                    # this cycle has visited all of it already
             slots, gens, klo, khi = arena.complete_census()
             tot["complete"] += int(slots.shape[0])
             if not slots.shape[0]:
                 continue
+            # L3WB-SLICE: THE LINE THAT MAKES A PAGE `new` -- its (generation,
+            # key) is not the one this process last secured in that slot.
             new = np.nonzero((sec_gen[slots] != gens) | (sec_lo[slots] != klo))[0]
             if not new.shape[0]:
                 continue
+            # a continuation resumes at the cursor (the census walks slots in
+            # ascending order): each new page is visited at most ONCE per cycle,
+            # so a head that never secures cannot eat every continuation's
+            # budget, and the cycle ends. What turns new behind the cursor
+            # meanwhile is the next cycle's (one tick later).
+            cur = int(getattr(arena, "_l3wb_cursor", 0) or 0)
+            if cur:
+                new = new[int(np.searchsorted(slots[new], cur)):]
+                if not new.shape[0]:
+                    arena._l3wb_done = True
+                    continue
             tot["new"] += int(new.shape[0])
-            slots, gens, klo, khi = slots[new], gens[new], klo[new], khi[new]
-            # the stem of a NEW page only -- once per page in its lifetime
-            stems = [arena.slot_stem(int(s)) for s in slots.tolist()]
-            on = self._stat_stems([s for s in stems if s])
-            have = np.fromiter((bool(s) and s in on for s in stems), dtype=bool, count=len(stems))
-            sec_gen[slots[have]] = gens[have]
-            sec_lo[slots[have]] = klo[have]
-            tot["on_disk"] += int(have.sum())
-            todo = np.nonzero(~have & np.fromiter((bool(s) for s in stems), dtype=bool,
-                                                  count=len(stems)))[0]
-            if not todo.shape[0]:
-                continue
             total = int(arena.slot_bytes)
             cap = max(1, budget // max(1, total))
-            tot["pending"] += max(0, int(todo.shape[0]) - cap)
-            todo = todo[:cap]
-            for off in range(0, int(todo.shape[0]), chunk):
+            # first slice small (16 stems): its cost sizes the next ones
+            step = int(getattr(arena, "_l3wb_step", 0) or 16)
+            pos = 0
+            n_new = int(new.shape[0])
+            while pos < n_new:
+                if deadline is not None and tot["slices"] and time.perf_counter() >= deadline:
+                    # the budget is used up at a slice edge: stop, remember
+                    tot["sliced"] = True
+                    tot["deferred"] += n_new - pos
+                    arena._l3wb_cursor = int(slots[new[pos]])
+                    stop_all = True
+                    break
                 why = quiet()
                 if why:
                     tot["paused"] = why
-                    tot["pending"] += int(todo.shape[0]) - off
+                    tot["pending"] += n_new - pos
+                    stop_all = True
                     break
-                part = todo[off:off + chunk]
-                ok = arena.pin_complete(slots[part], klo[part], khi[part])
-                pinned = part[ok]
-                try:
-                    batch = []
-                    refused = False
-                    for i in pinned.tolist():
-                        stem = stems[i]
-                        if not self._evictor.reserve(
-                            stem, total, key=stem,
-                            owner_writes_whole_file=owner_write_covers_whole_file(
-                                is_mla_model=self._key_geom["is_mla_model"],
-                                canonical_extent_write=True,
-                            ),
-                        ):
-                            refused = True
+                part = new[pos:pos + step]
+                pos += int(part.shape[0])
+                ts = time.perf_counter()
+                tot["last_slice_at_ms"] = (ts - t0) * 1e3
+                tc = time.thread_time()
+                # the stem of a NEW page only -- once per page in its lifetime
+                stems = [arena.slot_stem(int(s)) for s in slots[part].tolist()]
+                on = self._stat_stems([s for s in stems if s])
+                tot["stat_ms"] += (time.perf_counter() - ts) * 1e3
+                tot["stat_cpu_ms"] += (time.thread_time() - tc) * 1e3
+                have = np.fromiter((bool(s) and s in on for s in stems), dtype=bool, count=len(stems))
+                sec_gen[slots[part[have]]] = gens[part[have]]
+                sec_lo[slots[part[have]]] = klo[part[have]]
+                tot["on_disk"] += int(have.sum())
+                todo = part[~have & np.fromiter((bool(s) for s in stems), dtype=bool,
+                                                count=len(stems))]
+                stem_of = dict(zip(part.tolist(), stems))
+                room = cap - int(getattr(arena, "_l3wb_cycle_pages", 0))
+                if todo.shape[0] > max(0, room):
+                    tot["pending"] += int(todo.shape[0]) - max(0, room)
+                    todo = todo[:max(0, room)]
+                refused = False
+                for off in range(0, int(todo.shape[0]), chunk):
+                    if off:
+                        why = quiet()
+                        if why:
+                            tot["paused"] = why
+                            tot["pending"] += int(todo.shape[0]) - off
+                            stop_all = True
                             break
-                        path = self._sharded_path(stem)
-                        self._ensure_shard_dir(path)
-                        batch.append((i, stem, path))
-                    if batch:
-                        statuses = pio.write_pages(
-                            [b[2] for b in batch], [total] * len(batch),
-                            [((0, total),)] * len(batch),
-                            [int(arena.slot_ptr(int(slots[b[0]]))) for b in batch], fsync,
-                        )
-                        for (i, stem, _path), st in zip(batch, statuses):
-                            if st in (0, 2):
-                                self._evictor.commit(stem)
-                                sec_gen[slots[i]] = gens[i]
-                                sec_lo[slots[i]] = klo[i]
-                                tot["written"] += 1
-                                tot["bytes"] += total
-                            else:
-                                self._evictor.abort(stem)
-                                tot["pending"] += 1
-                finally:
-                    arena.unpin(slots[pinned])
+                    sub = todo[off:off + chunk]
+                    ok = arena.pin_complete(slots[sub], klo[sub], khi[sub])
+                    pinned = sub[ok]
+                    batch = []
+                    try:
+                        for i in pinned.tolist():
+                            stem = stem_of[i]
+                            if not self._evictor.reserve(
+                                stem, total, key=stem,
+                                owner_writes_whole_file=owner_write_covers_whole_file(
+                                    is_mla_model=self._key_geom["is_mla_model"],
+                                    canonical_extent_write=True,
+                                ),
+                            ):
+                                refused = True
+                                break
+                            path = self._sharded_path(stem)
+                            self._ensure_shard_dir(path)
+                            batch.append((i, stem, path))
+                        if batch:
+                            statuses = pio.write_pages(
+                                [b[2] for b in batch], [total] * len(batch),
+                                [((0, total),)] * len(batch),
+                                [int(arena.slot_ptr(int(slots[b[0]]))) for b in batch], fsync,
+                            )
+                            for (i, stem, _path), st in zip(batch, statuses):
+                                if st in (0, 2):
+                                    self._evictor.commit(stem)
+                                    sec_gen[slots[i]] = gens[i]
+                                    sec_lo[slots[i]] = klo[i]
+                                    tot["written"] += 1
+                                    tot["bytes"] += total
+                                    arena._l3wb_cycle_pages = int(getattr(arena, "_l3wb_cycle_pages", 0)) + 1
+                                else:
+                                    self._evictor.abort(stem)
+                                    tot["pending"] += 1
+                    finally:
+                        arena.unpin(slots[pinned])
+                    if refused:
+                        tot["refused"] += 1
+                        tot["pending"] += int(todo.shape[0]) - off - len(batch)
+                        break
+                sl_ms = (time.perf_counter() - ts) * 1e3
+                tot["slices"] += 1
+                if sl_ms > tot["slice_max_ms"]:
+                    tot["slice_max_ms"] = sl_ms
+                    tot["slice_max_stems"] = int(part.shape[0])
+                if slice_s > 0:
+                    # the next slice is sized to about half the budget at the
+                    # per-stem cost just measured (4..256 stems)
+                    per = max(1e-6, sl_ms / 1e3 / max(1, int(part.shape[0])))
+                    step = max(4, min(256, int(0.5 * slice_s / per + 1e-6)))
+                    arena._l3wb_step = step
                 if refused:
-                    tot["refused"] += 1
-                    tot["pending"] += int(todo.shape[0]) - off - len(batch)
+                    tot["pending"] += n_new - pos
+                    arena._l3wb_done = True     # a refusal ends this arena's cycle
                     break
+                if stop_all:
+                    tot["pending"] += n_new - pos
+                    break
+            else:
+                arena._l3wb_done = True
         n = getattr(self, "_l3wb_n", 0) + 1
         self._l3wb_n = n
         self._l3wb_written = getattr(self, "_l3wb_written", 0) + tot["written"]
+        if tot["sliced"]:
+            self._l3wb_sliced_n = getattr(self, "_l3wb_sliced_n", 0) + 1
         tot["ms"] = (time.perf_counter() - t0) * 1e3
         tot["cpu_ms"] = (time.thread_time() - c0) * 1e3
-        if tot["written"] or tot["refused"]:
+        over = slice_s > 0 and tot["ms"] > 4.0 * slice_s * 1e3
+        if tot["written"] or tot["refused"] or tot["sliced"] or over:
             k = getattr(self, "_l3wb_logged", 0) + 1
             self._l3wb_logged = k
-            if k <= 32 or k % 64 == 0 or tot["refused"]:
+            if k <= 32 or k % 64 == 0 or tot["refused"] or over:
                 logger.info(
                     "L3-REUSE WRITE-BEHIND pass=%d pages=%d bytes=%d ms=%.1f cpu_ms=%.1f "
                     "arenas=%d complete=%d new=%d on_disk=%d pending=%d refused=%d "
-                    "paused=%s written_total=%d (L2 pages copied to the persistent L3 "
-                    "without a free)",
+                    "paused=%s written_total=%d budget=%s slice_ms=%.0f slices=%d "
+                    "slice_max_ms=%.1f slice_max_stems=%d stat_ms=%.1f stat_cpu_ms=%.1f "
+                    "deferred=%d cont=%d sliced_total=%d (L2 pages copied to the persistent L3 "
+                    "without a free; budget=hit: the pass stopped at a slice edge and continues "
+                    "after the yield, deferred stems are NOT dropped)",
                     n, tot["written"], tot["bytes"], tot["ms"], tot["cpu_ms"],
                     tot["arenas"], tot["complete"], tot["new"], tot["on_disk"],
                     tot["pending"], tot["refused"], tot["paused"] or "-", self._l3wb_written,
+                    ("hit" if tot["sliced"] else ("OVER" if over else "ok")) if slice_s > 0 else "off",
+                    slice_s * 1e3, tot["slices"], tot["slice_max_ms"], tot["slice_max_stems"],
+                    tot["stat_ms"], tot["stat_cpu_ms"], tot["deferred"], int(bool(cont)),
+                    getattr(self, "_l3wb_sliced_n", 0),
                 )
         return tot
 
