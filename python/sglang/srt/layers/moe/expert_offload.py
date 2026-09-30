@@ -3236,6 +3236,26 @@ def fetch_sync_on() -> bool:
     return _FETCH_SYNC["on"]
 
 
+_FORWARD_STREAM_FETCH = {"n": 0}
+
+
+def _note_forward_stream_fetch(layer) -> None:
+    """P-MINIFWD-THROTTLE metal marker: once per process, the first joined
+    fetch that ran on the forward's own stream (count kept for tests)."""
+    n = _FORWARD_STREAM_FETCH["n"] + 1
+    _FORWARD_STREAM_FETCH["n"] = n
+    if n == 1:
+        import logging
+
+        logging.getLogger(__name__).info(
+            "MOE-FETCH-STREAM forward layer=%s: joined expert fetches run on the "
+            "forward's stream, never on the layer's side stream -- a PP send "
+            "parked on a shared hardware queue can no longer stall them "
+            "(P-MINIFWD-THROTTLE 0930)",
+            getattr(layer, "layer_id", "?"),
+        )
+
+
 def _fetch_mode() -> str:
     """SGLANG_MOE_OFFLOAD_FETCH: 'gather' (default, Task #33) or 'memcpy'."""
     import os
@@ -3559,6 +3579,9 @@ class MoEExpertOffloadCache:
         self._pinned: Dict[str, "object"] = {}  # attr -> pinned spill [E-R,...]
         self._resident: Dict[str, "object"] = {}  # attr -> GPU buffer [R+C,...]
         self._stream = None
+        # P-MINIFWD-THROTTLE: copies a WP8 lookahead left on ``_stream``
+        # (join=False) that the next joined fetch still has to make visible.
+        self._side_copies_in_flight = False
         self._installed = False
         # WP8 lookahead: what each scratch slot currently holds (slot -> expert),
         # written by every fetch on every route so a sticky resolve can trust
@@ -4107,8 +4130,11 @@ class MoEExpertOffloadCache:
                 if capturing:
                     dst.index_copy_(0, slots_t, torch.index_select(pool_dev, 0, rows_t))
                 else:
+                    # the stream these copies run on: the side stream inside
+                    # its context, the forward's own on the joined path
                     gather_rows_into(dst, slots_t, pool_dev, rows_t,
-                                     ring_rows=GATHER_RING_ROWS, stream=self._stream)
+                                     ring_rows=GATHER_RING_ROWS,
+                                     stream=torch.cuda.current_stream())
                 moved += dst[0].numel() * dst.element_size() * len(rows)
 
         def _copies():
@@ -4150,11 +4176,30 @@ class MoEExpertOffloadCache:
             # No CUDA context (desk test): same copies, same order, no streams.
             _copies()
         else:
-            self._stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self._stream):
+            if join and not self._side_copies_in_flight:
+                # P-MINIFWD-THROTTLE (30.09.): a JOINED fetch runs on the
+                # forward's own stream. The side-stream round trip bought no
+                # overlap (the side stream waited for the forward, the forward
+                # for the side stream) but put every wave on one of this
+                # rank's ~30 per-layer streams, which share the device's 8
+                # hardware queues (CUDA_DEVICE_MAX_CONNECTIONS, engine.py) with
+                # the PP send stream. An isend the next stage has not received
+                # yet parks on its queue, and every command queued behind it
+                # waits: y3v/y3w/y3u PP0 16k chunks right behind a lone rest
+                # forward stalled until PP1 took the rest's hidden states
+                # (fetch 312-359 us per expert instead of 193, +0.9-1.26 s,
+                # 11 of 11; stall = PP1's wait - a fixed forward offset).
+                _note_forward_stream_fetch(self.layer)
                 _copies()
-            if join:
-                torch.cuda.current_stream().wait_stream(self._stream)
+            else:
+                self._stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._stream):
+                    _copies()
+                if join:
+                    torch.cuda.current_stream().wait_stream(self._stream)
+                # WP8 lookahead copies stay in flight until a joined fetch
+                # of this cache waits for them (the branch above never does)
+                self._side_copies_in_flight = not join
             if fetch_sync_on():
                 # Task #49 probe (fn8ah 20.09.): a device-side wait is the
                 # design; a host-side synchronize here is the DISCRIMINATOR --

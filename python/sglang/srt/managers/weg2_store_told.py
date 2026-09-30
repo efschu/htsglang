@@ -872,7 +872,12 @@ def _minifwd_rest(scheduler) -> Optional[int]:
         return None
     fill = len(req.full_untruncated_fill_ids)
     er = getattr(req, "extend_range", None)
-    done = max(int(getattr(er, "end", 0) or 0), len(getattr(req, "prefix_indices", ()) or ()))
+    # P-MINIFWD-HOLD fired 0x on metal (y3v 15, y3w 4 'skipped (RuntimeError:
+    # Boolean value of Tensor with more than one value is ambiguous)'): the
+    # prefix indices are a device TENSOR, and ``tensor or ()`` asks its truth
+    # value -- every pass that reached this line dropped the hold. Length only.
+    prefix = getattr(req, "prefix_indices", None)
+    done = max(int(getattr(er, "end", 0) or 0), 0 if prefix is None else len(prefix))
     page = int(getattr(scheduler, "page_size", 1) or 1)
     split = False
     if _sp._WEG2_END_ANCHOR and fill - done >= 2:
