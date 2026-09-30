@@ -55,12 +55,13 @@ from . import cacheacct, ipcstate
 NO_DATA_LABEL = "keine Daten (vor IPC-Aufzeichnung)"
 TIERS = (("p0", 1, 3 * 3600), ("p1", 10, 3 * 86400), ("p2", 60, 30 * 86400))
 MAX_MB = 256
-MODEL_BUCKET_S = 5.0
+MODEL_BUCKET_S = 5.0        # the recorder's loop period
+MODEL_STEP_S = 1.0          # model rows per second: a phase change (flip ~2 s) never shares a row
 MODEL_LAG_S = 30.0          # a decode line reports the interval BEFORE it: wait for it
 DEC_GAP_MAX_S = 30.0        # two decode lines further apart did not decode continuously
 RANGES = {"15m": 900, "1h": 3600, "6h": 6 * 3600, "24h": 86400, "7d": 7 * 86400}
 MAX_POINTS = 1440
-STEPS = (5, 10, 20, 30, 60, 120, 300, 600, 900)    # multiples of the tier steps: no jitter
+STEPS = (1, 5, 10, 20, 30, 60, 120, 300, 600, 900)    # multiples of the tier steps: no jitter
 MODELS = ("27B", "NF")
 IPC_LABEL = "rankstats (IPC)"
 IPC_STALE_S = 20.0          # a rank file older than this: the rank is gone, its group gives no value
@@ -408,7 +409,7 @@ class Recorder:
         boots = self.boots
         if boots is None:
             return
-        step = MODEL_BUCKET_S
+        step = MODEL_STEP_S
         with boots.ipc.lock:
             items = [(d, st) for d, st in boots.ipc._st.items() if st.get("kind") == "boot"]
         for d, st in items:
@@ -469,7 +470,7 @@ class Recorder:
         prev = self._tier_prev.get(key)
         self._tier_prev[key] = tiers
         if prev is not None:
-            self.db.put([(SERIES % model + "tier_" + k, ts, (tiers[k] - prev.get(k, 0)) / MODEL_BUCKET_S)
+            self.db.put([(SERIES % model + "tier_" + k, ts, (tiers[k] - prev.get(k, 0)) / MODEL_BUCKET_S)  # per loop
                          for k in tiers if tiers[k] > prev.get(k, 0)])
         self.db.set("src.%s.tiers" % model, "ipc")
 
@@ -493,16 +494,24 @@ class Recorder:
                 self.db.set("roles." + model, roles)
 
     def _mark_flips(self, key: str, model: str, ipc: dict) -> None:
-        """events.jsonl flip_first_work (the front's one clock, ms): one mark per flip, new ones only."""
+        """One mark per flip (events.jsonl, the front's one clock), new ones only.  Value = Flipzeit
+        after the user's definition, never flip_total: P>D = flip_first_work.flip_time_ms (what="none"
+        gives no value); D>P = flip_user_time.flip_user_ms (build y4z on) -- a D>P flip_first_work
+        only draws the flip line, without a value (no fallback)."""
         rows = (ipc or {}).get("flip_first_work") or []
         done = self._flips_done.get(key, 0)
         for dd in rows[done:] if done <= len(rows) else rows:
             t0 = dd.get("flip_begin_ts") or dd.get("t")
             if t0 is not None and dd.get("dir") in ("P>D", "D>P"):
-                # what="none" (8654c4e647): flip without work after it -- a mark, but no Flipzeit value
-                v = None if dd.get("what") == "none" else dd.get("flip_time_ms")
+                v = dd.get("flip_time_ms") if dd.get("dir") == "P>D" and dd.get("what") != "none" else None
                 self.db.mark(t0, model, "flip", dd["dir"] + " ipc", v)
         self._flips_done[key] = len(rows)
+        ut = (ipc or {}).get("flip_user_time") or []
+        done_u = self._flips_done.get(key + "#ut", 0)
+        for u in ut[done_u:] if done_u <= len(ut) else ut:
+            if u.get("flip_user_ms") is not None and u.get("start_ts") is not None:
+                self.db.mark(u["start_ts"], model, "flip_user", "D>P ipc", u["flip_user_ms"])
+        self._flips_done[key + "#ut"] = len(ut)
 
     # --- loop ----------------------------------------------------------------
     def run_forever(self, stop: threading.Event) -> None:
@@ -577,6 +586,16 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
     for n in names:
         d = data.get(n) or {}
         series[n.replace(mp, "m.")] = [d.get(t) for t in ts]
+    # host rows come every 5 s: at the 1-s raster each value holds until the next sample (no dotted line)
+    if step < 5:
+        for n in [k for k in series if k.startswith("host.")]:
+            arr, last, age = series[n], None, 0
+            for i, v in enumerate(arr):
+                if v is not None:
+                    last, age = v, 0
+                elif last is not None and age < 5 - step:
+                    age += step
+                    arr[i] = last
     # Leistungsaufnahme (Nutzer 30.09.: "power draw von allen karten gemeinsam"): the sum of the cards
     # that reported in the bucket; None only when no card did
     pw = [series.get("g%d.power" % c["index"]) or [] for c in cards]
@@ -631,7 +650,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
         "flip_last_ms": last_pd["v"] if last_pd else None, "flip_last_t": last_pd["t"] if last_pd else None,
         "flip_median_ms": _pct(flips_pd, 0.5), "flip_n": len(flips_pd),
     }
-    thin = [m for m in marks if m["kind"] != "flip"]
+    thin = [m for m in marks if m["kind"] not in ("flip", "flip_user")] + [m for m in marks if m["kind"] == "flip_user"]
     fl = [m for m in marks if m["kind"] == "flip"]
     if len(fl) > 800:
         k = len(fl) / 800.0
@@ -649,7 +668,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
             "power": "NVML, Summe aller Karten",
             "cache_tiers": ("state.json front.served_tokens.*.cached_tier" if src_tiers == "ipc"
                             else "– (Feld served_tokens.*.cached_tier ab Image z30y2, 9266bdfb8d)"),
-            "flip": "events.jsonl flip_first_work",
+            "flip": "events.jsonl flip_first_work (P→D) + flip_user_time (D→P)",
             "marks": "state.json (Boot-ID, lifecycle) + events.jsonl flip_first_work",
         },
         "errors": dict(rec.errors) if rec else {},

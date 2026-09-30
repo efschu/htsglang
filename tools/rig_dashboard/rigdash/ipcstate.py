@@ -30,7 +30,7 @@ EVENT_SCHEMA = "weg2.event/1"
 TERMINAL = ("refused_preflight", "stopped_clean", "dead")
 SHOW_S = 6 * 3600.0           # same horizon as the log-discovered boots (live.SHOW_S)
 #: the events the field readers use (ipcfields.py, DASHBOARD-AUS-IPC-INVENTAR rows A12/A14/B1-B7/D4)
-FIELD_EVENT_TYPES = ("flip_begin", "flip_done", "flip_first_work", "group_health", "rank_stop", "post_wake_pass",
+FIELD_EVENT_TYPES = ("flip_begin", "flip_done", "flip_first_work", "flip_user_time", "group_health", "rank_stop", "post_wake_pass",
                      "group_ready")
 EVENT_TYPES = ("lifecycle", "hold_begin", "hold_end", "deadman_verdict", "front_stop", "flip_cushion",
                "group_ready", "launcher_done") + FIELD_EVENT_TYPES
@@ -106,6 +106,7 @@ class _Events:
         self.buf = b""
         self.rows: List[dict] = []
         self.first_work: List[dict] = []
+        self.user_time: List[dict] = []
         self.counts: Dict[str, int] = {}
 
     def poll(self):
@@ -134,8 +135,11 @@ class _Events:
                 self.rows.append(e)
             if t == "flip_first_work" and isinstance(e.get("data"), dict):
                 self.first_work.append(e["data"])
+            if t == "flip_user_time" and isinstance(e.get("data"), dict):
+                self.user_time.append(dict(e["data"], ts=e.get("ts")))
         del self.rows[:-EVENTS_KEEP]
         del self.first_work[:-FIRST_WORK_KEEP]
+        del self.user_time[:-FIRST_WORK_KEEP]
 
 
 def boot_view(d: str, st: dict, ev: Optional[_Events], now: float) -> dict:
@@ -180,6 +184,8 @@ def boot_view(d: str, st: dict, ev: Optional[_Events], now: float) -> dict:
                    "deadman_verdict": [e for e in rows if e.get("type") == "deadman_verdict"][-3:],
                    "front_stop": [e for e in rows if e.get("type") == "front_stop"][-3:]},
         "flip_first_work": list(ev.first_work) if ev else [],
+        # D>P Flipzeit nach Nutzerdefinition (Decode-Ende -> P-Prefill-Start), ab Build y4z (53977b2b67)
+        "flip_user_time": list(ev.user_time) if ev else [],
     }
 
 

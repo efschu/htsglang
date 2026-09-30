@@ -159,7 +159,7 @@
       ctx.stroke();
     }
     let lastLbl = -1e9;
-    ms.filter((m) => m.kind !== "flip" && m.t >= x0 && m.t <= x1).forEach((m) => {
+    ms.filter((m) => (m.kind === "boot" || m.kind === "end") && m.t >= x0 && m.t <= x1).forEach((m) => {
       const x = Math.round(u.valToPos(m.t, "x", true)) + 0.5;
       ctx.strokeStyle = m.kind === "boot" ? C.good : C.muted;
       ctx.lineWidth = 1.25 * dpr;
@@ -216,20 +216,6 @@
     return c.short + (same ? " #" + c.index : "") + r;
   }
 
-  // eine Lücke der je-Stream-Linie wird nur INNERHALB eines laufenden Boots überbrückt (m.ipc gesetzt:
-  // der IPC-Sampler war da, D hat nur gerade nicht durchgehend dekodiert); zwischen Boots bleibt sie
-  const gapsInsideBoot = (u, sidx, i0, i1, nullGaps) => {
-    const alive = (data && data.series["m.ipc"]) || [];
-    const xs = u.data[0];
-    return nullGaps.filter(([a, b]) => {
-      for (let k = 0; k < xs.length; k++) {
-        const px = u.valToPos(xs[k], "x", true);
-        if (px > a && px < b && alive[k] == null) return true;
-      }
-      return false;
-    });
-  };
-
   function build(d) {
     Object.values(charts).forEach((u) => u && u.destroy());
     charts = {};
@@ -246,7 +232,9 @@
       scales: { y: { range: zeroUp(10) } },
       axes: [axisX(), axisY(tps)],
       series: [{}, line("alle Streams", C.s3, "tok/s"),
-        line("je Stream (Mittel)", C.text, "tok/s", { fill: undefined, width: 1.75, gaps: gapsInsideBoot })],
+        // je Stream nur, wo D durchgehend dekodierte (Probe mit Decode davor und danach): Punkte + Linie,
+        // keine Überbrückung -- eine gerade Linie über eine Pause wäre ein erfundener Wert
+        line("je Stream (Mittel, nur durchgehender Decode)", C.text, "tok/s", { fill: undefined, width: 1.5, points: { show: true, size: 4, fill: C.text } })],
     }, rowsDec(d));
     charts.cache = mk("vl-c-cache", {
       scales: { y: { range: zeroUp(10) } },
@@ -267,7 +255,7 @@
       scales: { x: { time: true, range: () => [d.t[0], d.now] }, y: { range: zeroUp(1000) } },
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v / 1000, 1) + " s")],
       series: [{}, line("P→D", C.s1, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s1 }, noDot: true }),
-        line("D→P", C.s2, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s2 }, noDot: true })],
+        line("D→P (Decode-Ende → P-Prefill, flip_user_time)", C.s2, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s2 }, noDot: true })],
     }, rowsFlips(d));
     // Karten: Leistungsaufnahme als Summe (kräftig, Fläche), die Einzelkarten dünn darunter
     charts.power = mk("hw-c-power", {
@@ -312,9 +300,12 @@
     }
     return [d.t, c1, c2, c3, h.map((v) => (v == null ? null : v))];
   }
+  // Flipzeit nach Nutzerdefinition, nie flip_total: P→D = flip_first_work (P-Ende → erstes Decode-Token),
+  // D→P = flip_user_time (Decode-Ende → P-Prefill-Start, ab Build y4z); ohne flip_user_time keine D→P-Punkte
   function rowsFlips(d) {
-    const fl = (d.marks || []).filter((m) => m.kind === "flip" && m.v != null);
-    return [fl.map((m) => m.t), fl.map((m) => (m.label === "P>D" ? m.v : null)), fl.map((m) => (m.label === "D>P" ? m.v : null))];
+    const fl = (d.marks || []).filter((m) => m.v != null && ((m.kind === "flip" && m.label === "P>D") || m.kind === "flip_user"))
+      .sort((a, b) => a.t - b.t);
+    return [fl.map((m) => m.t), fl.map((m) => (m.kind === "flip" ? m.v : null)), fl.map((m) => (m.kind === "flip_user" ? m.v : null))];
   }
   const sigOf = (d) => [d.model, d.range, (d.cards || []).map((c) => cardLabel(c)).join("|")].join("/");
 

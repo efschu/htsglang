@@ -52,7 +52,7 @@ MISSING_WRITER = {
     "A14": "events rank_stop -- %s:publish_rank_stops / rankstats.stops -- %s:note_stop" % (W_FI, W_RS),
     "A15": "rankstats ts + work.forward_ct -- %s:RankStats.record" % W_RS,
     "B1": "events flip_first_work P>D -- %s:FirstWorkClock.seen" % W_FI,
-    "B2": "events flip_first_work D>P -- %s:FirstWorkClock.seen" % W_FI,
+    "B2": "events flip_user_time (D>P: Decode-Ende -> P-Prefill-Start) -- weg2 Front, ab Build y4z (53977b2b67)",
     "B3": "events flip_done -- %s:flip_done_payload + publish_event" % W_FI,
     "B4": "events flip_done -- %s:flip_done_payload + publish_event" % W_FI,
     "B5": "events flip_done -- %s:flip_done_payload + publish_event" % W_FI,
@@ -250,6 +250,16 @@ def _flip_first_work(ipc, direction: str):
             "rows": rows[-24:]}
 
 
+def _flip_user_time(ipc):
+    rows = [_data(e) for e in _ev(ipc, "flip_user_time") if _data(e).get("flip_user_ms") is not None]
+    if not rows:
+        return None
+    ms = [float(r["flip_user_ms"]) for r in rows]
+    ss = sorted(ms)
+    return {"n": len(ms), "last_ms": ms[-1], "median_ms": ss[len(ss) // 2], "rows": rows[-24:],
+            "end_is_dispatch": rows[-1].get("prefill_start_source") == "leg1_dispatch"}
+
+
 def _flip_done(ipc):
     rows = [_data(e) for e in _ev(ipc, "flip_done")]
     if not rows:
@@ -333,7 +343,8 @@ def resolve(ipc: Optional[dict], rank: Optional[dict], logv: dict, rates: Option
     # B1/B2 flip time from the front's one clock
     lft = logv.get("flip_times") or {}
     f["B1"] = field("B1", _flip_first_work(ipc, "P>D"), "events flip_first_work P>D", lft.get("p2d") or lft)
-    f["B2"] = field("B2", _flip_first_work(ipc, "D>P"), "events flip_first_work D>P", lft.get("d2p") or lft)
+    # D>P (NF-Operator 30.09.): only flip_user_time.flip_user_ms -- no fallback on flip_first_work
+    f["B2"] = field("B2", _flip_user_time(ipc), "events flip_user_time", None)
 
     # B3 layer exchange, B4 count/last, B5 bars
     done = _flip_done(ipc)

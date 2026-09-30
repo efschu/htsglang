@@ -35,6 +35,16 @@ Ein bewusster Rückschritt geht nur mit `RIGDASH_DEPLOY_ROLLBACK=1`, der Grund g
 
 Anlass: Der Features-Sitz deployte von `desk/dashboard-features-0929`. Ein Deploy von dort hätte Stufe 1 von DASHBOARD-AUS-IPC still wieder entfernt.
 
+## Arbeit zur Zeit, in der sie geschah (Nutzer 30.09. ~16:45Z: „die ganze zeit 16k/s prefill“)
+
+`activity.py` legt jede Arbeit auf ihre echte Zeit. Ein Prefill-Chunk läuft über `prefill.last {t, gpu_ms}`
+(PP0-Start bis Ende auf der letzten PP-Stufe), Decode ist Δ`decode.tokens` zwischen zwei Rang-Uhren ohne Flip-/Extend-Fenster,
+Flips kommen aus den Ereignissen. Grund: Der kumulative Zähler springt um einen ganzen Chunk; Δ Zähler / Δ Probe gab 16.384 tok/s
+und P/D-Überlappung. Kacheln: „Schub jetzt“, „bester Schub“, „Schübe 60 s“ (P/D), Decode nur über stetige Proben, je Stream
+nur mit Decode davor und danach. Verlauf: 1-s-Modellzeilen unter dem Präfix `mi.`; die alten `m.`-Zeilen aus dem falschen Instrument
+werden nicht mehr gezeigt. Flipzeit: P→D `flip_first_work` (ohne `what="none"`), D→P nur `flip_user_time` (ab Build y4z).
+Audit aller Werte: `/spinning/gpu-arb/docs/DASHBOARD-PLAUSI-AUDIT-0930.md`; Tests `tests/test_activity_0930.py`.
+
 ## Nur IPC, kein Boot-Log (Nutzer 29.09. über 27B; Rüge und Order 30.09.)
 
 „das dashboard soll auch aus der inter prozess kommunikation gespeist werden, nicht aus logs“ -- seit 30.09. ohne Ausnahme:

@@ -46,6 +46,10 @@ def _ipc():
                                     "flip_time_ms": 2500, "what": "decode_token", "rid": "r1"}),
             _ev("flip_first_work", {"epoch": 5, "dir": "D>P", "flip_begin_ts": 110.0, "first_work_ts": 113.0,
                                     "flip_time_ms": 3000, "what": "p_prefill", "rid": "r2"}),
+            _ev("flip_user_time", {"epoch": 6, "dir": "D>P", "start_ts": 109.5, "prefill_start_ts": 112.5,
+                                   "flip_user_ms": 3000, "prefill_start_source": "leg1_end_minus_p_prefill_s"}),
+            _ev("flip_first_work", {"epoch": 7, "dir": "D>P", "flip_begin_ts": 130.0, "what": "none",
+                                    "flip_time_ms": 99999, "flip_total_ms": 99999}),
             _ev("rank_stop", {"t": 1790680001.0, "reason": "scheduler_exception", "code": "W35_RuntimeError",
                               "exc": "RuntimeError", "ticket": "#1068", "text": "W35 credit wait #1068", "pid": 7,
                               "group": "D", "rank": "tp0pp0"}, group="D", rank="tp0pp0", code="W35_RuntimeError"),
@@ -130,7 +134,8 @@ class FieldSwitchTests(unittest.TestCase):
         self.assertEqual((on["A14"]["value"][0]["rank"], on["A14"]["value"][0]["ticket"]), ("tp0pp0", "#1068"))
         self.assertEqual(on["A15"]["value"]["D.tp0pp0"]["forward_ct"], 7)
         self.assertEqual(on["B1"]["value"]["last_ms"], 2500)
-        self.assertEqual(on["B2"]["value"]["last_ms"], 3000)
+        self.assertEqual(on["B2"]["value"]["last_ms"], 3000)          # flip_user_time, not flip_first_work
+        self.assertEqual(on["B2"]["ipc_src"], "events flip_user_time")
         self.assertEqual(on["B3"]["value"]["flip_ms"], 2100)
         self.assertEqual(on["B4"]["value"]["n"], 1)
         self.assertIsNone(off["B4"]["value"])

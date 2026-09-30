@@ -100,7 +100,11 @@ class TestRecorderIpc(unittest.TestCase):
             # P and D never at once; a 5-s bucket can only hold both around a phase change (one flip here)
             self.assertLessEqual(len(both), 1)
             self.assertTrue(all(abs(v - 100.0) < 1 for v in got["mi.NF.stream_tps"].values()))
-            self.assertEqual(db.get("hcur." + key) % 5, 0)
+            self.assertEqual(db.get("hcur." + key) % 1, 0)
+            one = db.query(["mi.NF.p_tps", "mi.NF.dec_tps", "mi.NF.d_tps"], T0, T0 + 70, 1, now=T0 + 100)
+            both1 = [t for t, v in one["mi.NF.p_tps"].items() if v > 0 and (one["mi.NF.dec_tps"].get(t, 0) > 0
+                                                                         or one["mi.NF.d_tps"].get(t, 0) > 0)]
+            self.assertEqual(both1, [])                                         # 1-s rows: never both
             flips = [m for m in db.marks("NF", T0, T0 + 100) if m["kind"] == "flip"]
             self.assertEqual([(m["label"], m["v"]) for m in flips], [("P>D ipc", 2500), ("D>P ipc", None)])
             v = history.view(db, None, "NF", "15m", now=T0 + 100)
@@ -162,7 +166,7 @@ class TestNoLogInHistory(unittest.TestCase):
         v = history.view(db, None, "NF", "15m", now=10000.0)
         i = v["t"].index(9900)
         self.assertIsNone(v["series"]["m.p_tps"][i])       # log-derived: not shown
-        self.assertEqual(v["series"]["m.p_tps"][i + 1], 700.0)
+        self.assertEqual(v["series"]["m.p_tps"][v["t"].index(9905)], 700.0)
         self.assertEqual([(m["kind"], m["label"]) for m in v["marks"]], [("flip", "P>D")])
         self.assertEqual(v["src"]["prefill"], history.IPC_LABEL)
         self.assertNotIn("Log", json.dumps(v["src"], ensure_ascii=False))
@@ -177,7 +181,7 @@ class TestViewPowerSum(unittest.TestCase):
         v = history.view(db, None, "27B", "15m", now=now)
         i = v["t"].index(9900)
         self.assertEqual(v["series"]["gsum.power"][i], 350.0)
-        self.assertEqual(v["series"]["gsum.power"][i + 1], 90.0)     # one card reported: its value, not a gap
+        self.assertEqual(v["series"]["gsum.power"][v["t"].index(9905)], 90.0)     # one card reported: its value, not a gap
         self.assertEqual(v["src"]["power"], "NVML, Summe aller Karten")
         self.assertNotIn("now_tiles", v["src"])                        # the log "jetzt" tiles are gone
 

@@ -323,28 +323,50 @@ def _q(xs, p):
     return xs[max(0, math.ceil(p * len(xs)) - 1)] if xs else None
 
 
-def flip_times_view(first_work: List[dict], flip_done: List[dict], is_27b: bool) -> dict:
+def flip_times_view(first_work: List[dict], flip_done: List[dict], is_27b: bool,
+                    user_time: Optional[List[dict]] = None) -> dict:
+    """Flipzeit per direction, never flip_total (NF-Operator 30.09.):
+    P>D = flip_first_work.flip_time_ms (P-Ende -> erstes Decode-Token), what="none" never counted;
+    D>P = flip_user_time.flip_user_ms (Decode-Ende -> P-Prefill-Start, ab Build y4z 53977b2b67) --
+    no fallback on flip_first_work: without the event the D>P value is "fehlt in IPC"."""
     out = {"instruments": INSTRUMENTS,
            "headline": "flip_total" if is_27b and not FIRST_TOKEN_HEADLINE_FOR_27B else "first_token"}
+    ut = sorted((x for x in (user_time or []) if x.get("flip_user_ms") is not None),
+                key=lambda x: x.get("start_ts") or 0)
     for d in ("P>D", "D>P"):
-        allfw = [x for x in first_work if x.get("dir") == d and x.get("flip_time_ms") is not None]
-        # what="none" (8654c4e647): the flip ended without work after it -- no "bis erstes Token" time
-        fw = sorted((x for x in allfw if x.get("what") != "none"), key=lambda x: x.get("flip_begin_ts") or 0)
-        no_work = len(allfw) - len(fw)
+        mine = [x for x in first_work if x.get("dir") == d]
+        no_work = sum(1 for x in mine if x.get("what") == "none")
+        if d == "P>D":
+            fw = sorted((x for x in mine if x.get("what") != "none" and x.get("flip_time_ms") is not None),
+                        key=lambda x: x.get("flip_begin_ts") or 0)
+            vals = [float(x["flip_time_ms"]) for x in fw]
+            last_t = fw[-1].get("flip_begin_ts") if fw else None
+            src = "IPC flip_first_work (%s)" % (fw[-1].get("what") or "?") if fw else None
+            missing = None
+        else:
+            vals = [float(x["flip_user_ms"]) for x in ut]
+            last_t = ut[-1].get("start_ts") if ut else None
+            src = ("IPC flip_user_time%s" % (" (Ende = nur Leg-1-Dispatch)"
+                                             if ut[-1].get("prefill_start_source") == "leg1_dispatch" else "")) if ut else None
+            missing = None if ut else "flip_user_time (ab Build y4z)"
         sl, wk = d.split(">")
         fd = [x for x in flip_done if x.get("sleep") == sl and x.get("wake") == wk and x.get("flip_ms") is not None]
-        vals = [float(x["flip_time_ms"]) for x in fw]
         lay = [float(x["flip_ms"]) for x in fd]
-        out[d] = {"n": len(vals), "last": vals[-1] if vals else None, "last_t": fw[-1].get("flip_begin_ts") if fw else None,
+        out[d] = {"n": len(vals), "last": vals[-1] if vals else None, "last_t": last_t,
                   "median": _q(vals, 0.5), "p90": _q(vals, 0.9), "resolution_s": 0.001, "open": False,
-                  "src": "IPC flip_first_work (%s)" % (fw[-1].get("what") or "?") if fw else None,
-                  "no_work": no_work, "layer_n": len(lay), "layer_newest": lay[-1] if lay else None,
-                  "layer_median": _q(lay, 0.5), "layer_p90": _q(lay, 0.9)}
+                  "src": src, "missing": missing, "no_work": no_work, "layer_n": len(lay),
+                  "layer_newest": lay[-1] if lay else None, "layer_median": _q(lay, 0.5), "layer_p90": _q(lay, 0.9)}
     done_by_begin = {round(x.get("flip_begin_ts") or 0, 1): x for x in flip_done}
     recent = []
     for x in sorted((x for x in first_work if x.get("what") != "none"), key=lambda x: x.get("flip_begin_ts") or 0)[-24:]:
         fd = done_by_begin.get(round(x.get("flip_begin_ts") or 0, 1)) or {}
-        recent.append({"t": x.get("flip_begin_ts"), "dir": x.get("dir"), "ms": x.get("flip_time_ms"),
+        if x.get("dir") == "D>P":
+            u = next((y for y in ut if y.get("parts") is not None and abs((y.get("start_ts") or 0) - (x.get("flip_begin_ts") or 0)) < 15
+                      and (y.get("prefill_start_ts") or 0) >= (x.get("flip_begin_ts") or 0)), None)
+            ms = u.get("flip_user_ms") if u else None
+        else:
+            ms = x.get("flip_time_ms")
+        recent.append({"t": x.get("flip_begin_ts"), "dir": x.get("dir"), "ms": ms,
                        "layer_ms": fd.get("flip_ms"), "state": "ok", "src": "ipc"})
     out["recent"] = recent
     return out
@@ -530,7 +552,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float) -> dict:
         "flip_open": bool(b6.get("open")),
         "flips": flip_done[-12:],
         "flip_count": len(flip_done),
-        "flip_times": flip_times_view(fw, flip_done, is27),
+        "flip_times": flip_times_view(fw, flip_done, is27, ipc.get("flip_user_time")),
         "health": health,
         "errors": [{"t": x.get("t"), "group": x.get("group"), "text": x.get("text") or x.get("exc") or ""}
                    for x in (a13.get("last") or [])],
@@ -552,7 +574,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float) -> dict:
         "fields_summary": ipcfields.summary(fields),
         "end": stops.classify_ipc(ipc),
     }
-    view_ipc = {k: x for k, x in ipc.items() if k not in ("ipc_events", "flip_first_work")}
+    view_ipc = {k: x for k, x in ipc.items() if k not in ("ipc_events", "flip_first_work", "flip_user_time")}
     v["ipc"] = view_ipc
     return v
 

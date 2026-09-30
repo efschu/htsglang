@@ -81,15 +81,27 @@ def rank_pairs(ring, key: str):
 
 
 def chunks(ring, keys, g: str) -> List[dict]:
-    """Prefill chunks of group g with the time they really ran."""
+    """Prefill chunks of group g with the time they really ran.
+
+    Measured at NF y4x (30.09. ~17:00Z, raw rankstats every 0.5 s): the first stage's chunk ends
+    ``prefill.last.t`` rise monotonically (one chunk per ~2.4 s on PP0 for 16k chunks), but a chunk's
+    ``gpu_ms`` can reach back before the previous chunk's end (it was queued behind it), and the LAST
+    stage's counter often jumps by 2-4 chunks between two samples (PP2 is fast).  So:
+
+    * burst = chunks whose PP0 start (t - gpu_ms) lies within CHUNK_GAP_S of the burst's end; the burst
+      runs from the first chunk's PP0 start to the end of its last chunk on the last stage (the first
+      last-stage record whose counter reached that chunk) -- the P-Ende wall clock;
+    * the curve spreads chunk k over [PP0 end of chunk k-1, PP0 end of chunk k] (the first one from
+      its PP0 start, the last one on to the burst end): one chunk at a time, every token once.
+    """
     k0, kl = stage_keys(keys, g)
     if k0 is None:
         return []
-    ends_last: Dict[float, float] = {}
+    last_recs: List[Tuple[float, float]] = []            # (counter, last.t) of the last stage
     if kl != k0:
         for a, b in rank_pairs(ring, kl):
             if (_d(b, a, "pchunks") or 0) > 0 and b.get("plast_t") is not None:
-                ends_last[b["pchunks"]] = b["plast_t"]
+                last_recs.append((b["pchunks"], b["plast_t"]))
     out = []
     for a, b in rank_pairs(ring, k0):
         n = _d(b, a, "pchunks") or 0
@@ -99,19 +111,29 @@ def chunks(ring, keys, g: str) -> List[dict]:
         e0 = b.get("plast_t") if b.get("plast_t") is not None else b["ts"]
         s = e0 - (b.get("plast_gpu") or 0.0) / 1000.0
         if n > 1:
-            s = min(s, a["ts"])
-        e = max(e0, ends_last.get(b.get("pchunks"), e0))
-        out.append({"s": s, "e": max(e, s + 1e-3), "e0": e0, "tok": tok, "cached": _d(b, a, "pcached") or 0.0,
-                    "n": n, "comp_ms": _d(b, a, "pcomp") or 0.0, "g": g})
-    # the curve: a pipelined chunk overlaps the next one on the other stages; its tokens are spread
-    # from where the previous chunk LEFT the pipeline to where it leaves -- the output-side rate
-    # (steady state = one chunk per bottleneck-stage time), never two chunks counted at once
-    out.sort(key=lambda c: c["e"])
-    prev_e = None
-    for c in out:
-        a = c["s"] if prev_e is None else max(c["s"], min(prev_e, c["e"] - 1e-3))
-        c["parts"] = [(a, c["e"])]
-        prev_e = c["e"]
+            # several chunks between two samples: they ran back to back for their summed compute time
+            s = min(s, e0 - (_d(b, a, "pcomp") or 0.0) / 1000.0)
+        cnt = b.get("pchunks")
+        el = next((t for c, t in last_recs if cnt is not None and c >= cnt), None) if kl != k0 else e0
+        out.append({"s": s, "e0": e0, "e": max(e0, el if el is not None else e0), "tok": tok,
+                    "cached": _d(b, a, "pcached") or 0.0, "n": n, "comp_ms": _d(b, a, "pcomp") or 0.0, "g": g})
+    out.sort(key=lambda c: c["e0"])
+    # bursts and the spread intervals
+    burst: List[dict] = []
+    for c in out + [None]:
+        if c is not None and burst and c["s"] <= max(x["e"] for x in burst) + CHUNK_GAP_S:
+            burst.append(c)
+            continue
+        if burst:
+            end = max(x["e"] for x in burst)
+            prev = None
+            for i, x in enumerate(burst):
+                a0 = x["s"] if prev is None else max(prev, min(x["s"], x["e0"]) if x["s"] > prev else prev)
+                b0 = end if i == len(burst) - 1 else x["e0"]
+                x["parts"] = [(min(a0, b0 - 1e-3), b0)]
+                x["e"] = b0 if i == len(burst) - 1 else x["e0"]
+                prev = x["e0"]
+        burst = [c] if c is not None else []
     return out
 
 
