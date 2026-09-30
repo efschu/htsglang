@@ -853,7 +853,7 @@ def adopt_ids(req, park: bool):
 
 
 def uniform_refusal(spec: th.TailSpec, ids, fill_len: int, extra_key, prefix_len: int,
-                    park: bool = False) -> str:
+                    park: bool = False, end_only: bool = False) -> str:
     """'' when the admission may take the tail; otherwise why not. Every
     input is identical on every rank of the group (the extend length the
     group runs is decided HERE). F4 (``park``): the fill still carries the
@@ -868,7 +868,11 @@ def uniform_refusal(spec: th.TailSpec, ids, fill_len: int, extra_key, prefix_len
             return f"prefix:{int(prefix_len)}!in[{spec.page_prefix},{spec.cut})"
     elif int(prefix_len) != spec.page_prefix:
         return f"prefix:{int(prefix_len)}!={spec.page_prefix}"
-    if not (0 < spec.rows and spec.extend >= 1):
+    # TAIL_FOLD_SHORT: an END-only part (H63 fold, no E1 payload) may have no
+    # row below the cut (c on the page boundary, N % page in 1..grain) -- the
+    # END section [page_prefix, N) is the whole hand-off (y3r: 23 of 53
+    # prompts had no part and paid a 0.6-2.4 s extend of 1-65 tokens)
+    if not ((0 < spec.rows or (end_only and spec.rows == 0)) and spec.extend >= 1):
         return "geometry"
     if th.tail_key(ids, spec.cut, extra_key) != spec.key:
         return "key_mismatch"
@@ -933,7 +937,7 @@ def plan_adopt(req, prefix_len: int, batch_empty: bool = True) -> Optional[Agree
         return None
     park = _is_park(entry.staged)
     why = uniform_refusal(entry.staged.spec, adopt_ids(req, park), len(req.full_untruncated_fill_ids),
-                          req.extra_key, prefix_len, park=park)
+                          req.extra_key, prefix_len, park=park, end_only=not entry.staged.e1)
     if why:
         _log_ready(entry.staged, f"skipped:{why}", waited_ms=entry.waited_ms)
         return None
@@ -971,7 +975,7 @@ def peek_target_start(req, prefix_len: int, batch_empty: bool = True) -> Tuple[O
         return None, False
     park = _is_park(entry.staged)
     if uniform_refusal(entry.staged.spec, adopt_ids(req, park), len(req.full_untruncated_fill_ids),
-                       req.extra_key, prefix_len, park=park):
+                       req.extra_key, prefix_len, park=park, end_only=not entry.staged.e1):
         return None, False
     spec = entry.staged.spec
     if entry.skip:
@@ -1018,7 +1022,7 @@ def skip_joinable(req, prefix_len: Optional[int] = None) -> bool:
     at = spec.page_prefix if prefix_len is None else int(prefix_len)
     park = _is_park(entry.staged)
     if uniform_refusal(spec, adopt_ids(req, park), len(req.full_untruncated_fill_ids), req.extra_key, at,
-                       park=park):
+                       park=park, end_only=not entry.staged.e1):
         return False
     return not skip_refusal(entry, req, batch_empty=True)
 
@@ -1188,9 +1192,10 @@ def _commit_skip(req, entry: Agreed, tree_cache, page_size: int) -> int:
     # re-enters at page_prefix (one page); F4's park anywhere in its window
     need = spec.cut - len(req.prefix_indices)
     page_size = int(page_size)
-    page = alloc_token_slots(tree_cache, -(-need // page_size) * page_size)
-    rows = page[:need].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
-    req.prefix_indices = torch.cat([req.prefix_indices, rows])
+    if need > 0:  # PARK-ANCHOR: a park resume AT the cut grows nothing
+        page = alloc_token_slots(tree_cache, -(-need // page_size) * page_size)
+        rows = page[:need].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
+        req.prefix_indices = torch.cat([req.prefix_indices, rows])
     if _is_park(st):
         # F4: the parked request's last sampled token comes back as the
         # skip's token -- take it off now so the batch is [c, N) over the

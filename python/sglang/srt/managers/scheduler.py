@@ -18353,6 +18353,7 @@ class Scheduler(
                 self.token_to_kv_pool_allocator,
                 self.page_size,
                 self.forward_stream,
+                tree_cache=self.tree_cache,
             )
         # Pairing objective (#274 slice D): publish this batch's grain shape
         # for the lane's pairing policy. Read-only for the policy, one tuple
