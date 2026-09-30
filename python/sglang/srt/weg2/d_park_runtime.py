@@ -630,8 +630,15 @@ def victims_needed(need: int, available: int, young_first_sizes) -> Optional[int
     return None
 
 
+def _n(x) -> int:
+    """len() of a list OR a torch tensor; never ``x or ()`` -- a tensor has no
+    truth value (metal z30y6 16:47:04: an empty ``prefix_indices`` tensor ->
+    'Boolean value of Tensor with no values is ambiguous' on every D rank, W17)."""
+    return 0 if x is None else len(x)
+
+
 def _req_kv_tokens(r) -> int:
-    return len(getattr(r, "origin_input_ids", None) or ()) + len(getattr(r, "output_ids", None) or ())
+    return _n(getattr(r, "origin_input_ids", None)) + _n(getattr(r, "output_ids", None))
 
 
 def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False) -> bool:
@@ -646,7 +653,7 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False) ->
     older = next((q for q in getattr(sched, "waiting_queue", ()) or () if str(q.rid) == str(older_rid)), None)
     if older is None:
         return False
-    need = max(0, _req_kv_tokens(older) - len(getattr(older, "prefix_indices", None) or ()))
+    need = max(0, _req_kv_tokens(older) - _n(getattr(older, "prefix_indices", None)))
     try:
         avail = int(sched.token_to_kv_pool_allocator.available_size())
     except Exception:  # noqa: BLE001 -- no reading: no displacement

@@ -172,6 +172,22 @@ class DAdmissionAgeBackfillDisplace(CustomTestCase):
         self.assertFalse(DP.kv_displace_would_fit(sched, "weg2-0-6", running_old_big))
         self.assertTrue(DP.kv_displace_would_fit(sched, "weg2-0-6", running_old_big + [req("weg2-0-10", 700)]))
 
+    def test_z30y6_tensor_fields_are_counted_not_truth_tested(self):
+        # metal z30y6 16:47:04 (all D ranks, W17): prefix_indices is a torch tensor on D,
+        # `len(x or ())` raised "Boolean value of Tensor with no values is ambiguous"
+        older = types.SimpleNamespace(rid="weg2-0-6", origin_input_ids=list(range(1000)), output_ids=[],
+                                      prefix_indices=torch.empty(0, dtype=torch.int64))
+        young = types.SimpleNamespace(rid="weg2-0-10", origin_input_ids=torch.zeros(700, dtype=torch.int64),
+                                      output_ids=[], prefix_indices=torch.arange(3))
+        sched = types.SimpleNamespace(
+            waiting_queue=[older],
+            token_to_kv_pool_allocator=types.SimpleNamespace(available_size=lambda: 400),
+            tree_cache=types.SimpleNamespace(evictable_size=lambda: 0))
+        self.assertTrue(DP.kv_displace_would_fit(sched, "weg2-0-6", [young]))
+        self.assertTrue(DP.kv_displace_would_fit(sched, "weg2-0-6", [young], seat=True))
+        older.prefix_indices = torch.arange(900)                     # a non-empty tensor: 100 left, fits free
+        self.assertFalse(DP.kv_displace_would_fit(sched, "weg2-0-6", [young]))
+
     def test_backfill_gate_group_d_only_both_modes(self):
         s = types.SimpleNamespace(ps=types.SimpleNamespace(pp_size=1))
         for layout in ("1", ""):                                               # dual and flip form

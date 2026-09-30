@@ -556,7 +556,8 @@ def pp0_grant(sched, req) -> Optional[int]:
         except OSError:
             logger.warning("%s PP0 GRANT waits: stage %d has not published its table yet", MARK, r)
             return 0
-    tokens = len(getattr(req, "origin_input_ids", None) or ()) + int(actor.page)
+    _ids = getattr(req, "origin_input_ids", None)
+    tokens = (0 if _ids is None else len(_ids)) + int(actor.page)   # never `x or ()` on a tensor
     own = int(getattr(actor, "_committed", 0) or 0)    # PP0's card: the ledger covers its mapping exactly
     lvl = group_grant(stages, tokens, lambda pth: CardKvLedger(pth, "P"), covered={0: own})
     rid = str(getattr(req, "rid", "?"))[:16]
