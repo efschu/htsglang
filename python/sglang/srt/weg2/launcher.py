@@ -13657,6 +13657,8 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
         # unified KV (user orders 30.09. 07:10Z/07:25Z): P's pool is virtually
         # this big; its pages come from the card pool (weg2/dual_p_kv_stage.py)
         env["SGLANG_WEG2_DUAL_P_KV_MAX_TOKENS"] = str(int(getattr(ns, "dual_p_kv_max_tokens", 0) or 0))
+    if group == "D" and str(getattr(ns, "dual_unified_kv", "off")) == "on":
+        env["SGLANG_WEG2_DUAL_D_KV_MAX_TOKENS"] = str(int(getattr(ns, "dual_d_kv_max_tokens", 0) or 0))
     if group == "P":
         env["SGLANG_WEG2_DUAL_SHARE"] = "1"
     return env
@@ -20849,6 +20851,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="DUAL-TP3PP3 --dual-unified-kv: P's KV pool rows (virtual; pages from the card "
                          "pool). Each K/V buffer is born at this size and trimmed at once, so the boot "
                          "transient is one buffer (tokens x bytes per token per layer).")
+    ap.add_argument("--dual-d-kv-max-tokens", type=int, default=1048576,
+                    help="DUAL-TP3PP3 --dual-unified-kv: D's KV pool in GLOBAL tokens (virtual; D keeps "
+                         "its boot level mapped and grows from the card pool). Must exceed D's boot "
+                         "context; each buffer is born at its owner share of this and trimmed at once.")
     ap.add_argument("--dual-mps", choices=("off", "on"), default="off",
                     help="DUAL-TP3PP3: start a private MPS control daemon before the groups (pipe dir "
                          "under the boot's run dir) so P and D kernels run concurrently on a card instead "

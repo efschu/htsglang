@@ -11676,6 +11676,11 @@ class Scheduler(
         # D-MEM-SCHED: the KV stage between wakes, after the acks above (an
         # ended request's pages go only once backed); rank-symmetric like them
         _weg2_d_seat_vram.runtime_tick(self)
+        # DUAL-TP3PP3 unified KV (C): D's share of the card pool follows its
+        # running demand (rank-symmetric; no-op unless the D actor is attached)
+        from sglang.srt.weg2 import dual_d_kv_stage as _ddk
+
+        _ddk.tick(self)
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()

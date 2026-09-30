@@ -5247,6 +5247,10 @@ class ModelRunnerKVCacheMixin:
             from sglang.srt.weg2 import dual_p_kv_stage as _dpk
 
             _dpk.attach(self)
+            from sglang.srt.weg2 import dual_d_kv_stage as _ddk
+
+            _ddk.attach(self)
+            _ddk._BOOT_TOKENS = None  # the draft's pool (built later) passes untouched
 
     def _hybrid_kv_token_cap(self: ModelRunner) -> Optional[int]:
         """Physically reachable ceiling on max_total_num_tokens for hybrid
@@ -7946,6 +7950,12 @@ class ModelRunnerKVCacheMixin:
         if _dpk.armed() and not getattr(self, "is_draft_worker", False):
             self._dual_p_boot_tokens = int(max_tokens)
             max_tokens = _dpk.pool_tokens(max_tokens)
+        from sglang.srt.weg2 import dual_d_kv_stage as _ddk
+
+        if _ddk.armed() and not getattr(self, "is_draft_worker", False):
+            self._dual_d_boot_tokens = int(max_tokens)
+            _ddk._BOOT_TOKENS = int(max_tokens)
+            max_tokens = _ddk.pool_tokens(max_tokens)
         if max_tokens != config.max_total_num_tokens:
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 max_tokens, self.page_size

@@ -3042,7 +3042,9 @@ def _kv_stage_born(pool, t: torch.Tensor, name: str) -> torch.Tensor:
     # DUAL-TP3PP3 unified KV (B): group P's buffers map 0 tokens at birth
     from sglang.srt.weg2 import dual_p_kv_stage as _dpk
 
-    return _dpk.born(pool, t, name)
+    from sglang.srt.weg2 import dual_d_kv_stage as _ddk
+
+    return _ddk.born(pool, _dpk.born(pool, t, name), name)
 
 
 def zero_kv_data_buffers(kvcache) -> int:
