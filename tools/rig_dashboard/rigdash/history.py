@@ -50,7 +50,7 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-from . import cacheacct, ipcstate
+from . import activity, cacheacct, ipcstate
 
 NO_DATA_LABEL = "keine Daten (vor IPC-Aufzeichnung)"
 TIERS = (("p0", 1, 3 * 3600), ("p1", 10, 3 * 86400), ("p2", 60, 30 * 86400))
@@ -449,6 +449,7 @@ class Recorder:
                             "stream_tps": b["stream_tps"][i], "kv_pct": b["kv_pct"][i], "kv_p_pct": b["kv_p_pct"][i],
                             "tok_cache": (b["tok_cache"][i] or 0.0) + (dc - ho), "tok_comp_p": b["tok_comp_p"][i],
                             "tok_comp_d": b["tok_comp_d"][i], "tok_handoff": ho, "ipc": 1.0}
+                    vals.update({"ph_" + k: b["ph_" + k][i] for k in activity.STATES})
                     rows += [(pre + k, ts, v) for k, v in vals.items() if v is not None]
                 self.db.put(rows)
                 c1 = self.db.get("cursor.p1")
@@ -577,7 +578,8 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
         names += ["g%d.%s" % (c["index"], k) for k in ("temp", "power", "clock", "util", "mem")]
     names += ["host.cpu", "host.mem_pct", "host.bootmem_pct", "host.bootmem_gib"]
     mp = SERIES % model
-    msr = ["p_tps", "d_tps", "dec_tps", "stream_tps", "kv_pct", "kv_p_pct", "ipc"] + ["tok_" + k for k in cacheacct.CLASSES]
+    msr = ["p_tps", "d_tps", "dec_tps", "stream_tps", "kv_pct", "kv_p_pct", "ipc"] + ["tok_" + k for k in cacheacct.CLASSES] \
+        + ["ph_" + k for k in activity.STATES]
     names += [mp + k for k in msr] + [mp + "tier_" + k for k in cacheacct.TIERS]
     data = db.query(names, lo, now, step, now)
     t0 = int(lo // step) * step

@@ -127,6 +127,42 @@
       ctx.restore();
     });
   }
+  // Phasen-Band unter jedem Modell-Diagramm: je Bucket der Zustand mit dem größten Anteil (history ph_*),
+  // dieselben Farben/Muster wie die Phasenleiste der Boot-Karte (Nutzer 30.09.: idle ≠ flip ≠ Nachlauf)
+  const PH = ["P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "idle", "off", "unknown"];
+  function phFill(ctx, k) {
+    const c = { P: C.s1, D: C.s2, dec: C.s3, flip_pd: C.s7, flip_dp: C.s5 }[k];
+    if (c) return c;
+    const t = document.createElement("canvas"), dpr = devicePixelRatio, n = Math.round(6 * dpr);
+    t.width = n; t.height = n;
+    const x = t.getContext("2d");
+    x.fillStyle = k === "off" ? C.text2 : C.surface; x.fillRect(0, 0, n, n);
+    if (k === "flip_tail" || k === "unknown") {
+      x.strokeStyle = k === "flip_tail" ? C.s7 : C.muted; x.lineWidth = 1.6 * dpr;
+      x.beginPath(); x.moveTo(0, n); x.lineTo(n, 0); x.moveTo(-n / 2, n / 2); x.lineTo(n / 2, -n / 2); x.moveTo(n / 2, n * 1.5); x.lineTo(n * 1.5, n / 2); x.stroke();
+    }
+    return ctx.createPattern(t, "repeat");
+  }
+  function phaseBand(u) {
+    const pid = (u.root && u.root.parentNode && u.root.parentNode.id) || "";
+    if (!pid.startsWith("vl-c-") || pid === "vl-c-flip" || !data) return;
+    const ctx = u.ctx, { left, top, width, height } = u.bbox, dpr = devicePixelRatio, h = 6 * dpr;
+    const xs = data.t, step = data.step || 1;
+    const fills = {};
+    ctx.save();
+    for (let i = 0; i < xs.length; i++) {
+      let best = null, bv = 0;
+      for (const k of PH) { const v = (data.series["m.ph_" + k] || [])[i]; if (v != null && v > bv) { bv = v; best = k; } }
+      if (!best) continue;
+      const a = u.valToPos(xs[i], "x", true), b = u.valToPos(xs[i] + step, "x", true);
+      if (b < left || a > left + width) continue;
+      ctx.fillStyle = fills[best] || (fills[best] = phFill(ctx, best));
+      ctx.fillRect(Math.max(a, left), top + height - h, Math.min(b, left + width) - Math.max(a, left) + 0.5, h);
+      if (best === "idle") { ctx.strokeStyle = C.muted; ctx.lineWidth = 1; ctx.strokeRect(Math.max(a, left) + 0.5, top + height - h + 0.5, Math.min(b, left + width) - Math.max(a, left) - 1, h - 1); }
+    }
+    ctx.restore();
+  }
+
   function marksDraw(u) {
     const ms = (data && data.marks) || [];
     const ctx = u.ctx, { left, top, width, height } = u.bbox, dpr = devicePixelRatio;
@@ -206,7 +242,7 @@
     const w = Math.max(240, el.clientWidth - 2);
     const u = new uPlot(Object.assign({ width: w, height: 200, legend: { live: true },
       cursor: { drag: { x: false, y: false }, sync: { key: "rigdash-verlauf" }, points: { size: 7 } },
-      hooks: { draw: [marksDraw, endDots] } }, opts), rows, el);
+      hooks: { draw: [marksDraw, phaseBand, endDots] } }, opts), rows, el);
     return u;
   }
 
@@ -360,6 +396,12 @@
   const rebuild = () => { clearTimeout(rt); rt = setTimeout(() => { if (data) { sig = ""; update(data); tiles(data); } }, 200); };
   window.addEventListener("resize", rebuild);
   try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", rebuild); } catch (e) { /* old browser */ }
+  // Legende der Phasen-Bänder: dieselben Klassen wie die Phasenleiste der Boot-Karte
+  const PH_NAME = { P: "P-Prefill", D: "D-Prefill/Extend", dec: "D-Decode", flip_pd: "Flip P→D", flip_dp: "Flip D→P",
+    flip_tail: "Flip-Nachlauf", idle: "Leerlauf", off: "aus/lädt/tot", unknown: "unbekannt" };
+  const lgEl = $("vl-legend");
+  if (lgEl) lgEl.innerHTML = "<b style=\"color:var(--text)\">Band unter den Diagrammen = Phase:</b>" + PH.map((k) =>
+    `<span class="lg" style="display:inline-flex;align-items:center;gap:4px"><i class="ph-k-${k}" style="display:inline-block;width:18px;height:11px;border-radius:2px${k === "idle" ? ";--ic:var(--muted)" : ""}"></i>${PH_NAME[k]}</span>`).join("");
   bar();
   load(true);
   setInterval(() => load(false), 10000);

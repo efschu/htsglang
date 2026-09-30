@@ -109,7 +109,10 @@ def chunks(ring, keys, g: str) -> List[dict]:
         if n <= 0 and tok <= 0:
             continue
         e0 = b.get("plast_t") if b.get("plast_t") is not None else b["ts"]
-        s = e0 - (b.get("plast_gpu") or 0.0) / 1000.0
+        # FEHLT 7 (build y5a): own_ms = the chunk's own time after the previous one left -- the
+        # chunk's real start; without it gpu_ms, which reaches back into the wait behind the previous
+        own = b.get("plast_own") if n == 1 else None
+        s = e0 - (own if own is not None else (b.get("plast_gpu") or 0.0)) / 1000.0
         if n > 1:
             # several chunks between two samples: they ran back to back for their summed compute time
             s = min(s, e0 - (_d(b, a, "pcomp") or 0.0) / 1000.0)
@@ -244,20 +247,45 @@ def spread(items, lo: float, n: int, step: float, key: str = "tok", excl=None) -
     return acc
 
 
-class Model:
-    """All activity of one boot from its ring + events; the views and the history read this."""
+#: the states of the phase bar (Nutzer 30.09. ~18Z: "idle sieht aus wie flip ... das muss eindeutig
+#: unterscheidbar sein").  Each comes from data; what no data explains is "unknown", never idle or flip.
+STATES = ("P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "idle", "off", "unknown")
+SAMPLE_GAP_S = 3.0      # two dashboard samples further apart: the time between is unobserved (unknown)
 
-    def __init__(self, ring, flip_done: List[dict], first_work: List[dict]):
+
+def _outstanding(front: dict) -> Optional[float]:
+    o = (front or {}).get("outstanding")
+    if isinstance(o, dict):
+        vals = [v for v in o.values() if isinstance(v, (int, float))]
+        return float(sum(vals)) if vals else None
+    return float(o) if isinstance(o, (int, float)) else None
+
+
+class Model:
+    """All activity of one boot from its ring + events; the views and the history read this.
+
+    ``begins`` = flip_begin event data (an open flip has no flip_done yet), ``user_time`` =
+    flip_user_time data (D>P: end of the flip tail = P prefill start), ``life`` = {serving_since,
+    terminal_since, terminal_state} from state.json."""
+
+    def __init__(self, ring, flip_done: List[dict], first_work: List[dict], begins: Optional[List[dict]] = None,
+                 user_time: Optional[List[dict]] = None, life: Optional[dict] = None):
         self.ring = list(ring or ())
         self.keys = set()
         for s in self.ring:
             self.keys.update(s["r"].keys())
         self.groups = sorted({_grp(k) for k in self.keys})
+        self.flip_done = [x for x in flip_done or () if x.get("flip_begin_ts") is not None and x.get("t") is not None]
         self.flips = flip_windows(flip_done)
         # who is awake when: the woken group from flip_done on, the slept group before the first flip
         self.wakes = sorted((x["t"], x.get("wake"), x.get("sleep")) for x in flip_done or ()
                             if x.get("t") is not None and x.get("wake"))
         self.first_work = [x for x in first_work or () if x.get("flip_begin_ts") is not None]
+        self.user_time = [x for x in user_time or () if x.get("prefill_start_ts") is not None]
+        self.life = life or {}
+        done_b = [s for s, _ in self.flips]
+        self.open_flips = [x for x in begins or () if x.get("flip_begin_ts") is not None
+                           and not any(abs(x["flip_begin_ts"] - b) < 1.0 for b in done_b)]
         self.pchunks = {g: chunks(self.ring, self.keys, g) for g in self.groups if g in ("P", "D", "single")}
         dg = "D" if "D" in self.groups else ("single" if "single" in self.groups else None)
         self.dec_group = dg
@@ -267,22 +295,47 @@ class Model:
 
     # --- phases -----------------------------------------------------------
     def tails(self) -> List[Tuple[float, float, str]]:
+        """Flip tail = flip_done -> first work after it: P>D the first decode token (flip_first_work),
+        D>P the P prefill start (flip_user_time, else flip_first_work's first work); what="none" has none."""
         out = []
         for x in self.first_work:
-            if x.get("what") == "none" or x.get("flip_time_ms") is None:
+            if x.get("what") == "none":
                 continue
             b = x["flip_begin_ts"]
-            end = b + float(x["flip_time_ms"]) / 1000.0
             done = next((e for s, e in self.flips if abs(s - b) < 1.0), None)
-            if done is not None and end > done:
+            if done is None:
+                continue
+            end = None
+            if x.get("dir") == "D>P":
+                u = next((u for u in self.user_time if done - 30 <= u["prefill_start_ts"] and u["prefill_start_ts"] >= b
+                          and abs((u.get("start_ts") or b) - b) < 30), None)
+                if u is not None:
+                    end = u["prefill_start_ts"]
+            if end is None and x.get("first_work_ts") is not None:
+                end = float(x["first_work_ts"])
+            if end is None and x.get("flip_time_ms") is not None:
+                end = b + float(x["flip_time_ms"]) / 1000.0
+            if end is not None and end > done:
                 out.append((done, end, x.get("dir") or ""))
         return out
 
-    def segments(self) -> List[dict]:
-        """Non-overlapping phase segments: flip > flip tail > P prefill > D prefill > decode."""
+    def _flip_kind(self, sleep, wake) -> str:
+        return "flip_dp" if (sleep, wake) == ("D", "P") else "flip_pd"
+
+    def segments(self, now: Optional[float] = None) -> List[dict]:
+        """Non-overlapping segments, each from data (priority left to right):
+        flip (flip_begin..flip_done, an open flip up to now) > flip tail > P prefill > D prefill/extend >
+        decode > aus/lädt/tot (before serving_since / after the terminal lifecycle) > idle (a sample
+        pair with no rank counter moving AND the front's queue = 0 and outstanding = 0) > unknown
+        (a sample pair with work queued but no rank moving, a counter moving without tokens, or
+        no sample at all)."""
         raw = []
-        for s, e in self.flips:
-            raw.append((s, e, "flip", 0))
+        for x in self.flip_done:
+            raw.append((x["flip_begin_ts"], x["t"], self._flip_kind(x.get("sleep"), x.get("wake")), 0))
+        end_all = now if now is not None else (self.ring[-1]["t"] if self.ring else None)
+        for x in self.open_flips:
+            if end_all is not None and end_all > x["flip_begin_ts"]:
+                raw.append((x["flip_begin_ts"], end_all, self._flip_kind(x.get("sleep"), x.get("wake")), 0))
         for s, e, _ in self.tails():
             raw.append((s, e, "flip_tail", 1))
         for g, cs in self.pchunks.items():
@@ -292,6 +345,36 @@ class Model:
         for d in self.dec:
             for x, y in d["parts"]:
                 raw.append((x, y, "dec", 4))
+        ss, ts = self.life.get("serving_since"), self.life.get("terminal_since")
+        if self.ring:
+            t0 = self.ring[0]["t"]
+            if ss is not None and t0 < ss:
+                raw.append((t0, ss, "off", 5))
+            if ts is not None:
+                raw.append((ts, max(ts, end_all or ts), "off", 5))
+        work = [r for r in raw if r[2] in ("P", "D", "dec")]
+        for a, b in zip(self.ring, self.ring[1:]):
+            if b["t"] - a["t"] > SAMPLE_GAP_S:
+                raw.append((a["t"], b["t"], "unknown", 7))
+                continue
+            moved = any((_d(b["r"].get(k) or {}, a["r"].get(k) or {}, f) or 0) > 0
+                        for k in self.keys for f in ("pnew", "dtok", "fwd", "pchunks"))
+            q = (b.get("front") or {}).get("queue")
+            o = _outstanding(b.get("front") or {})
+            if moved:
+                # a counter moved in this sample interval: the work placed by the token model that
+                # overlaps it covers the rest of it (rank clocks and the sample clock differ by < 1 s);
+                # without any placed work it is work we cannot name
+                near = [w for w in work if w[0] < b["t"] and w[1] > a["t"]]
+                if near:
+                    w = max(near, key=lambda w: min(w[1], b["t"]) - max(w[0], a["t"]))
+                    raw.append((a["t"], b["t"], w[2], w[3] + 0.5))
+                else:
+                    raw.append((a["t"], b["t"], "unknown", 7))
+            elif q == 0 and o == 0:
+                raw.append((a["t"], b["t"], "idle", 6))
+            else:
+                raw.append((a["t"], b["t"], "unknown", 7))
         cuts = sorted({t for s, e, _, _ in raw for t in (s, e)})
         segs: List[dict] = []
         for a, b in zip(cuts, cuts[1:]):
@@ -303,7 +386,22 @@ class Model:
                 segs[-1]["e"] = b
             else:
                 segs.append({"s": a, "e": b, "k": k})
+        for x in segs:
+            if x["k"] == "unknown":
+                x["why"] = self._why_unknown(x)
+            if x["k"] == "off":
+                x["why"] = "lädt (vor serving)" if ss is not None and x["e"] <= ss + 1e-6 else \
+                    "aus/tot (%s)" % (self.life.get("terminal_state") or "beendet")
         return segs
+
+    def _why_unknown(self, x) -> str:
+        pairs = [(a, b) for a, b in zip(self.ring, self.ring[1:]) if a["t"] < x["e"] and b["t"] > x["s"]]
+        if not pairs or any(b["t"] - a["t"] > SAMPLE_GAP_S for a, b in pairs):
+            return "keine IPC-Probe in dieser Zeit"
+        if any(any((_d(b["r"].get(k) or {}, a["r"].get(k) or {}, f) or 0) > 0 for k in self.keys for f in ("fwd", "pchunks"))
+               for a, b in pairs):
+            return "Rang-Zähler bewegt sich, aber ohne zuordenbare Tokens"
+        return "Anfragen offen (queue/outstanding > 0), aber kein Rang arbeitet"
 
     def overlap_s(self) -> Dict[str, float]:
         """Seconds in which P prefill and D work (prefill or decode) ran at the same time -- outside
@@ -370,4 +468,16 @@ class Model:
         out["kv_pct"] = [(a / c) if c else None for a, c in kv]
         out["kv_p_pct"] = [(a / c) if c else None for a, c in kvp]
         out["ipc"] = [1.0 if h else None for h in have]
+        # phase share per bucket (0..1 per state): averages stay right at every history tier
+        frac = {k: [0.0] * n for k in STATES}
+        for x in self.segments():
+            a, b = max(x["s"], lo), min(x["e"], lo + n * step)
+            while a < b:
+                i = int((a - lo) // step)
+                z = min(b, lo + (i + 1) * step)
+                if 0 <= i < n:
+                    frac[x["k"]][i] += (z - a) / step
+                a = z
+        for k in STATES:
+            out["ph_" + k] = [(min(1.0, frac[k][i]) if have[i] else None) for i in range(n)]
         return out

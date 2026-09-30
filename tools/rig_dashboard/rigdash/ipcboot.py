@@ -71,6 +71,11 @@ def compact(rec: dict) -> dict:
         "pcomp": first(_n(pre.get("compute_ms")), _n(pre.get("gpu_ms"))),
         "plast_t": _n((pre.get("last") or {}).get("t")) if isinstance(pre.get("last"), dict) else None,
         "plast_gpu": _n((pre.get("last") or {}).get("gpu_ms")) if isinstance(pre.get("last"), dict) else None,
+        # FEHLT 7 (d086ac9a71, ab Build y5a): the chunk's own time and pure compute, without the wait
+        # behind the previous chunk
+        "plast_new": _n((pre.get("last") or {}).get("new")) if isinstance(pre.get("last"), dict) else None,
+        "plast_own": _n((pre.get("last") or {}).get("own_ms")) if isinstance(pre.get("last"), dict) else None,
+        "plast_conly": _n((pre.get("last") or {}).get("compute_only_ms")) if isinstance(pre.get("last"), dict) else None,
         "last_bs": _n(dec.get("last_bs")),
         "si_del": _n(cache.get("store_incomplete_delivered")), "si_deliv": _n(cache.get("store_incomplete_deliverable")),
         "dtok": first(_n(dec.get("tokens")), _n(tok.get("decode_total"))),
@@ -179,25 +184,36 @@ LIVE_BURST_S = 6.0      # a prefill burst whose last chunk ended this recently i
 
 
 def _rank_gpu_rates(ring, keys, g, t0, t1) -> Dict[str, dict]:
-    """GPU rate per rank over the chunks that ended in [t0, t1]: Δnew / Δcompute_ms (rank's own time)."""
+    """Rate per rank over the chunks that ended in [t0, t1].  With FEHLT 7 (build y5a):
+    Σ last.new / Σ last.compute_only_ms of the chunks read one by one -- the rank's pure compute
+    rate.  Without it: Δnew / Δcompute_ms, which on PP0 includes the wait behind the previous
+    chunk -- a lower bound (``exact`` False)."""
     out = {}
     for k in sorted(x for x in keys if _grp(x) == g):
-        n = ms = 0.0
+        n = ms = cn = cms = 0.0
         for a, b in activity.rank_pairs(ring, k):
             e = b.get("plast_t") or b["ts"]
-            if t0 - 0.5 <= e <= t1 + 0.5:
-                n += _d(b, a, "pnew") or 0.0
-                ms += _d(b, a, "pcomp") or 0.0
-        if ms > 0 and n > 0:
-            out[k.split(".", 1)[1]] = {"tps": n / (ms / 1000.0)}
+            if not (t0 - 0.5 <= e <= t1 + 0.5):
+                continue
+            n += _d(b, a, "pnew") or 0.0
+            ms += _d(b, a, "pcomp") or 0.0
+            if (_d(b, a, "pchunks") or 0) == 1 and b.get("plast_conly") and b.get("plast_new"):
+                cn += b["plast_new"]
+                cms += b["plast_conly"]
+        if cms > 0 and cn > 0:
+            out[k.split(".", 1)[1]] = {"tps": cn / (cms / 1000.0), "exact": True}
+        elif ms > 0 and n > 0:
+            out[k.split(".", 1)[1]] = {"tps": n / (ms / 1000.0), "exact": False}
     return out
 
 
 def _burst_dict(ring, keys, g, b) -> dict:
     ranks = _rank_gpu_rates(ring, keys, g, b["s"], b["e"])
     gpu = min((r["tps"] for r in ranks.values()), default=None) if b["tok"] >= activity.MIN_RATE_TOK else None
+    exact = bool(ranks) and all(r.get("exact") for r in ranks.values())
     return {"tokens": b["tok"], "chunks": b["n"], "cached": b["cached"], "mean_chunk": (b["tok"] / b["n"]) if b["n"] else None,
-            "wall_s": b["wall_s"], "wall_tps": b["rate"], "ranks": ranks, "tps_gpu": gpu, "tps": b["rate"],
+            "wall_s": b["wall_s"], "wall_tps": b["rate"], "ranks": ranks, "tps_gpu": gpu, "tps_gpu_exact": exact,
+            "tps": b["rate"],
             "t0": b["s"], "t1": b["e"]}
 
 
@@ -294,28 +310,34 @@ def series_view(m: "activity.Model", now: float) -> dict:
     return out
 
 
-def timeline_view(m: "activity.Model", live: bool, awake_now, now: float) -> dict:
-    """Phase bar: the non-overlapping segments of activity.Model; idle stretches name the group that
-    was awake then (flip_done events: the woken group from the flip on)."""
-    segs = [dict(x) for x in m.segments() if x["e"] >= now - SPAN_S]
+def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t0: Optional[float] = None) -> dict:
+    """Phase bar = the data-backed segments of activity.Model (Nutzer 30.09.: idle, flip and tail must
+    be told apart).  Time inside the window that no sample covers is "unknown" (rigdash did not watch),
+    never idle and never flip; before the boot's start nothing is drawn."""
+    end = now if live else (m.ring[-1]["t"] if m.ring else now)
+    lo = max(now - SPAN_S, boot_t0 or (now - SPAN_S))
+    segs = [dict(x) for x in m.segments(end) if x["e"] > lo]
     src = {"P": m.pchunks.get("P", []) + m.pchunks.get("single", []), "D": m.pchunks.get("D", []), "dec": m.dec}
+    out, prev = [], lo
     for x in segs:
+        x["s"] = max(x["s"], lo)
+        if x["s"] > prev + 0.05:
+            out.append({"s": prev, "e": x["s"], "k": "unknown", "why": "keine IPC-Probe (rigdash sah den Boot nicht)"})
         if x["k"] in src:
             tok = activity.spread(src[x["k"]], x["s"], 1, max(1e-3, x["e"] - x["s"]))[0]
             x["tok"] = tok
             x["tps"] = tok / max(1e-3, x["e"] - x["s"])
             x["n"] = 1
-    out, prev = [], (now - SPAN_S)
-    for x in segs:
-        if x["s"] > prev + 0.05:
-            out.append({"s": prev, "e": x["s"], "k": "idle", "awake": m.awake_at(prev, awake_now)})
+        if x["k"] == "idle":
+            x["awake"] = m.awake_at(x["s"], awake_now)
         out.append(x)
         prev = max(prev, x["e"])
-    end = now if live else (m.ring[-1]["t"] if m.ring else now)
     if end > prev + 0.05:
-        out.append({"s": prev, "e": end, "k": "idle", "awake": m.awake_at(prev, awake_now), "running": live})
-    return {"segs": [x for x in out if x["e"] > now - SPAN_S], "span_s": SPAN_S, "t1": end if not live else now,
-            "overlap": m.overlap_s()}
+        out.append({"s": prev, "e": end, "k": "unknown", "why": "noch keine zweite IPC-Probe"})
+    if live and out and out[-1]["k"] in ("P", "D", "dec"):
+        out[-1]["running"] = True
+    return {"segs": out, "span_s": SPAN_S, "t1": now if live else end, "overlap": m.overlap_s(),
+            "states": list(activity.STATES)}
 
 
 def _q(xs, p):
@@ -490,6 +512,18 @@ def _awake(m: "activity.Model", front: dict):
     return (front or {}).get("awake")
 
 
+def model_of(ipc: dict, ring) -> "activity.Model":
+    """activity.Model with everything the phase states need from the boot's IPC."""
+    evs = ipc.get("ipc_events") or []
+    begins = [dict(e.get("data") or {}, flip_begin_ts=(e.get("data") or {}).get("flip_begin_ts") or e.get("ts"))
+              for e in evs if e.get("type") == "flip_begin"]
+    life = {"serving_since": ipc.get("serving_since_ts"),
+            "terminal_since": ipc.get("lifecycle_since") if ipc.get("terminal") else None,
+            "terminal_state": ipc.get("lifecycle") if ipc.get("terminal") else None}
+    return activity.Model(ring, flip_done_of(ipc), list(ipc.get("flip_first_work") or []), begins,
+                          list(ipc.get("flip_user_time") or []), life)
+
+
 def flip_done_of(ipc: dict) -> List[dict]:
     return [dict(e.get("data") or {}, t=(e.get("data") or {}).get("t") or e.get("ts"))
             for e in (ipc.get("ipc_events") or []) if e.get("type") == "flip_done"]
@@ -517,7 +551,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float) -> dict:
     tag = ipc.get("tag") or ""
     is27 = "27b" in (model + " " + tag + " " + (ipc.get("dir") or "")).lower()
     fields = ipcfields.resolve(ipc, rank, {}, rates or ring_rates(ring))
-    m = activity.Model(ring, flip_done, fw)
+    m = model_of(ipc, ring)
     if not any(e.get("type") in ("flip_begin", "flip_done", "flip_first_work") for e in (ipc.get("ipc_events") or [])) \
             and not ipc.get("flip_first_work"):
         # no flip yet in this boot: the flip fields are empty, not missing a writer
@@ -569,7 +603,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float) -> dict:
         "totals": totals_view(ring, keys, front, t0, now),
         "cache": cache_view(ring, keys, now),
         "series": series_view(m, now),
-        "timeline": timeline_view(m, live, _awake(m, front), now),
+        "timeline": timeline_view(m, live, _awake(m, front), now, t0),
         "fields": ipcfields.for_page(fields),
         "fields_summary": ipcfields.summary(fields),
         "end": stops.classify_ipc(ipc),
@@ -659,7 +693,7 @@ class IpcBoots:
             d = next((d for d, st in self.ipc._st.items() if (st.get("boot_id") or d) == key), None)
             st = self.ipc._st.get(d) if d else None
         ipc = ipcstate.boot_view(d, st, self.ipc._ev.get(d), time.time()) if st else {}
-        return activity.Model(ring, flip_done_of(ipc), list(ipc.get("flip_first_work") or []))
+        return model_of(ipc, ring)
 
     def activity(self, key: str, start: float, n: int, bs: float) -> List[dict]:
         """Per bucket which class computed and how many tokens (energy.EnergyBook): the work at the

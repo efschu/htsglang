@@ -104,8 +104,8 @@ class TestInstrument(unittest.TestCase):
         for a, b in zip(segs, segs[1:]):
             self.assertLessEqual(a["e"], b["s"] + 1e-9)
         kinds = [s["k"] for s in segs]
-        self.assertLess(kinds.index("P"), kinds.index("flip"))
-        self.assertLess(kinds.index("flip"), kinds.index("dec"))
+        self.assertLess(kinds.index("P"), kinds.index("flip_pd"))
+        self.assertLess(kinds.index("flip_pd"), kinds.index("dec"))
         b = self.m.buckets(0.0, 60, 1.0)
         both = [i for i in range(60) if (b["p_tps"][i] or 0) > 0 and ((b["dec_tps"][i] or 0) > 0 or (b["d_tps"][i] or 0) > 0)]
         self.assertEqual(both, [])
@@ -139,6 +139,64 @@ class TestInstrument(unittest.TestCase):
         self.assertEqual(len(tail), 1)
         self.assertAlmostEqual(tail[0]["s"], 28.0, places=3)
         self.assertAlmostEqual(tail[0]["e"], 28.5, places=3)
+
+
+class TestPhaseStates(unittest.TestCase):
+    """Nutzer 30.09. ~18Z: "idle sieht aus wie flip oder flip nachlauf" -- every state from data.
+    Leerlauf -> Flip P>D -> Nachlauf -> Decode -> Leerlauf gives exactly these segments."""
+
+    def ring(self, queue=0, gap=None):
+        out = []
+        for i in range(41):
+            t = float(i)
+            if gap and gap[0] < t < gap[1]:
+                continue
+            dec = max(0.0, min(t, 25.0) - 13.0)
+            out.append({"t": t, "front": {"queue": queue, "outstanding": {"P": 0, "D": 0}},
+                        "r": {"D.tp0pp0": ipcboot.compact({"ts": t, "decode": {"tokens": int(100 * dec), "running": 1},
+                                                            "prefill": {"chunks": 0, "new_tokens": 0},
+                                                            "work": {"forward_ct": int(20 * dec)}})}})
+        return out
+
+    FD = [{"sleep": "P", "wake": "D", "flip_begin_ts": 10.0, "t": 12.0, "flip_ms": 2000}]
+    FW = [{"dir": "P>D", "flip_begin_ts": 10.0, "flip_time_ms": 3000, "what": "decode_token", "first_work_ts": 13.0}]
+
+    def test_sequence(self):
+        m = activity.Model(self.ring(), self.FD, self.FW, life={"serving_since": -1.0})
+        segs = [(x["k"], round(x["s"], 1), round(x["e"], 1)) for x in m.segments(40.0)]
+        self.assertEqual([k for k, _, _ in segs], ["idle", "flip_pd", "flip_tail", "dec", "idle"])
+        self.assertEqual(segs[1][1:], (10.0, 12.0))
+        self.assertEqual(segs[2][1:], (12.0, 13.0))
+        self.assertAlmostEqual(segs[3][2], 26.0, delta=1.0)
+
+    def test_idle_needs_proof(self):
+        # work queued but no rank moving: not idle, "unknown" with the reason
+        m = activity.Model(self.ring(queue=2), [], [], life={"serving_since": -1.0})
+        segs = m.segments(40.0)
+        self.assertNotIn("idle", [x["k"] for x in segs])
+        self.assertIn("queue/outstanding", [x for x in segs if x["k"] == "unknown"][0]["why"])
+        # no samples at all: unknown, never flip or idle
+        m = activity.Model(self.ring(gap=(30, 38)), self.FD, self.FW, life={"serving_since": -1.0})
+        unk = [x for x in m.segments(40.0) if x["k"] == "unknown"]
+        self.assertTrue(unk and unk[-1]["s"] <= 30.0 and unk[-1]["e"] >= 38.0)
+
+    def test_open_flip_and_off(self):
+        begins = [{"flip_begin_ts": 30.0, "sleep": "D", "wake": "P"}]
+        m = activity.Model(self.ring(), self.FD, self.FW, begins=begins,
+                           life={"serving_since": 5.0, "terminal_since": None})
+        segs = m.segments(40.0)
+        self.assertEqual(segs[0]["k"], "off")                                  # before serving: lädt
+        self.assertEqual(segs[-1]["k"], "flip_dp")                              # open D>P flip up to now
+        self.assertEqual((segs[-1]["s"], segs[-1]["e"]), (30.0, 40.0))
+
+    def test_legend_same_in_both_editions(self):
+        from rigdash import server
+        html = open(os.path.join(server.STATIC, "index.html"), encoding="utf-8").read()
+        rel = server.edition_page(html, "release")
+        for page in (html, rel):
+            for k in activity.STATES:
+                self.assertIn(".ph-k-%s {" % k, page)
+            self.assertIn('const PHASE_ORDER = ["P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "idle", "off", "unknown"]', page)
 
 
 class TestWhatNone(unittest.TestCase):

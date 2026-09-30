@@ -52,7 +52,7 @@ class TestBuildView(unittest.TestCase):
     def setUp(self):
         self.ring = ring_of(61)
         self.now = self.ring[-1]["t"]
-        self.ipc = {"boot_id": "nfx-boot-20260930T153426Z-051f", "dir": "/x/nf/state/nfx-boot", "tag": "nfx",
+        self.ipc = {"boot_id": "nfx-boot-x", "dir": "/x/nf/state/nfx-boot", "tag": "nfx",
                     "model": "NF", "terminal": False, "lifecycle": "serving", "front": {"awake": "D"},
                     "ipc_events": [{"type": "flip_done", "ts": 1021.0,
                                     "data": {"sleep": "P", "wake": "D", "flip_ms": 1800, "flip_begin_ts": 1020.5, "t": 1021.0}}],
@@ -87,7 +87,7 @@ class TestBuildView(unittest.TestCase):
         ft = self.v["flip_times"]
         self.assertEqual((ft["P>D"]["n"], ft["P>D"]["last"], ft["P>D"]["layer_newest"]), (1, 2100.0, 1800.0))
         self.assertEqual(self.v["flip_count"], 1)
-        self.assertTrue(any(x["k"] == "flip" for x in self.v["timeline"]["segs"]))
+        self.assertTrue(any(x["k"] == "flip_pd" for x in self.v["timeline"]["segs"]))
 
     def test_missing_fields_name_their_writer(self):
         f = self.v["fields"]
