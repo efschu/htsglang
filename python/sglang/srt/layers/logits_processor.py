@@ -81,6 +81,22 @@ def verify_local_vocab_requested() -> bool:
 
     return os.environ.get(VERIFY_LOCAL_VOCAB_ENV, "") == "1"
 
+
+_VERIFY_LOCAL_VOCAB_SEEN: set = set()
+
+
+def _verify_local_vocab_note(armed: bool, why: dict) -> None:
+    """One line per process and verdict: armed, or requested but INERT with
+    the facts that decided it (LS12 metal proof)."""
+    if armed in _VERIFY_LOCAL_VOCAB_SEEN:
+        return
+    _VERIFY_LOCAL_VOCAB_SEEN.add(armed)
+    logger.info(
+        "DFLASH-VERIFY-VOCAB-ARGMAX %s (%s=1): %s",
+        "armed -- the verify forward keeps this rank's vocab shard" if armed
+        else "requested but INERT for this logits processor",
+        VERIFY_LOCAL_VOCAB_ENV, " ".join("%s=%s" % kv for kv in sorted(why.items())))
+
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
     "UnquantizedLinearMethod",
@@ -459,6 +475,15 @@ class LogitsProcessor(nn.Module):
             # this processor; their workers expect the full logits.
             and not getattr(_sa, "speculative_cross_algorithm", False)
         )
+        if verify_local_vocab_requested():
+            # LS12 (30.09.): the metal proof -- one line per process and verdict
+            # (requested only; unset leaves the log as it was).
+            _verify_local_vocab_note(self.verify_local_vocab, dict(
+                tp_gather=bool(self.do_tensor_parallel_all_gather),
+                attn_tp_group=bool(self.use_attn_tp_group),
+                dp_attn_gather=bool(self.do_tensor_parallel_all_gather_dp_attn),
+                algo=str(getattr(_sa, "speculative_algorithm", "") or ""),
+                cross=bool(getattr(_sa, "speculative_cross_algorithm", False))))
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(

@@ -992,8 +992,19 @@ def load_index_async() -> bool:
     the thread never waits on the load stream. The copies are the same bytes
     into the same rows in the same stream order; only the host wait is gone.
     """
-    return str(os.environ.get("SGLANG_HICACHE_LOAD_ASYNC_INDEX", "0")).strip().lower() in (
+    on = str(os.environ.get("SGLANG_HICACHE_LOAD_ASYNC_INDEX", "0")).strip().lower() in (
         "1", "true", "yes", "on")
+    if on and not _LOAD_ASYNC_INDEX_SEEN:
+        # LS12 (30.09.): the metal proof -- one line per process at the first
+        # load-back that takes the async index path. Off: no line.
+        _LOAD_ASYNC_INDEX_SEEN.append(True)
+        logger.info("HICACHE-LOAD-ASYNC-INDEX armed: the first load-back's index tensors cross "
+                    "through pinned memory / are selected on the device, no host wait on the "
+                    "load stream (SGLANG_HICACHE_LOAD_ASYNC_INDEX=1)")
+    return on
+
+
+_LOAD_ASYNC_INDEX_SEEN: list = []
 
 
 def index_to_device_async(idx: torch.Tensor, dev) -> torch.Tensor:

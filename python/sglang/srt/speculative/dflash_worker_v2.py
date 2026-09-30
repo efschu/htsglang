@@ -71,6 +71,19 @@ _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
+
+def _verify_vocab_round_note(worker, path: str) -> None:
+    """SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX, LS12 (30.09.) metal proof: how many
+    verify rounds took the vocab-parallel argmax vs. the local-shard gather.
+    Logged when the round total reaches 1, 2, 4, 8 ... -- log2(N)+1 lines."""
+    c = worker.__dict__.setdefault("_verify_vocab_rounds", {"argmax": 0, "gather": 0})
+    c[path] += 1
+    n = c["argmax"] + c["gather"]
+    if n & (n - 1) == 0:
+        logger.info("DFLASH-VERIFY-VOCAB-ARGMAX rounds=%d argmax=%d gather=%d "
+                    "(argmax = one [rows,2] all_gather instead of the [rows,vocab] one)",
+                    n, c["argmax"], c["gather"])
+
 _FusedKVMaterializeHelper = None
 
 
@@ -3812,10 +3825,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                     int(_shard.org_vocab_start_index),
                     lambda t: _tp.all_gather(t, dim=0),
                 ).view(bs, int(self.block_size))
+                _verify_vocab_round_note(self, "argmax")
             else:
                 logits_output.next_token_logits = _vlp.finish_local_verify_logits(
                     logits_output.next_token_logits, lm_head
                 )
+                _verify_vocab_round_note(self, "gather")
 
         grammar_vocab_mask = None
         if grammar_draft_tokens_cpu is not None:

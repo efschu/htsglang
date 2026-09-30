@@ -11093,6 +11093,14 @@ class Front:
             return
         self.counters[f"ctl_kick_{why}"] += 1
         evt.set()
+        # LS12 (30.09.): the metal proof of the kick switches, since the counters
+        # live only in /weg2/state -- one line per reason at 1, 2, 4, 8 ... kicks.
+        k = int(self.counters[f"ctl_kick_{why}"])
+        if k & (k - 1) == 0:
+            logger.info("WEG2-FLIPFAST kick why=%s n=%d kicked=%d held_ready_for_d=%d "
+                        "(the controller woke before its %.2f s tick)", why, k,
+                        int(self.counters["ctl_kicked"]),
+                        int(self.counters["ctl_kick_held_ready_for_d"]), CTL_TICK_S)
 
     async def _ctl_wait(self) -> None:
         """The controller's tick. Both kick switches off: ``asyncio.sleep(CTL_TICK_S)``,
