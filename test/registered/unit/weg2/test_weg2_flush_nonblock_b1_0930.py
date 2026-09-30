@@ -96,7 +96,7 @@ def test_switches_default_off():
     assert envs.SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH.get() is False
     assert envs.SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK.get() is False
     assert envs.SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS.get() == "D"
-    assert envs.SGLANG_WEG2_D_IDLE_PUBLISH_MAX_ISSUE.get() == 4
+    assert envs.SGLANG_WEG2_D_IDLE_PUBLISH_MAX_ISSUE.get() == 1
 
 
 def test_groups_gate(monkeypatch, armed_d):
@@ -229,22 +229,22 @@ def test_idle_publish_walks_once_per_forward(armed_d):
     nb.idle_publish(s)                  # issued all it saw -> clean at forward 10
     nb.idle_publish(s)
     nb.idle_publish(s)
-    assert tree.sweep_calls == [4]      # no repeat walk while nothing ran
+    assert tree.sweep_calls == [1]      # no repeat walk while nothing ran
     s.forward_ct = 11                   # a forward ran: walk again
     nb.idle_publish(s)
-    assert tree.sweep_calls == [4, 4]
+    assert tree.sweep_calls == [1, 1]
     # a pass left nodes (cap) -> the next idle pass continues
-    tree2 = _Tree(sweeps=[{"unbacked": 9, "issued": 4}, {"unbacked": 5, "issued": 4}])
+    tree2 = _Tree(sweeps=[{"unbacked": 3, "issued": 1}, {"unbacked": 2, "issued": 1}])
     s2 = _sched(tree2, fct=3)
     nb.idle_publish(s2)
     nb.idle_publish(s2)
-    assert tree2.sweep_calls == [4, 4]
+    assert tree2.sweep_calls == [1, 1]
     # refused (nothing issuable): no spin
     tree3 = _Tree(sweeps=[{"unbacked": 2, "issued": 0, "refused": 2}])
     s3 = _sched(tree3, fct=5)
     nb.idle_publish(s3)
     nb.idle_publish(s3)
-    assert tree3.sweep_calls == [4]
+    assert tree3.sweep_calls == [1]
 
 
 def test_idle_publish_never_raises(armed_d, caplog):
