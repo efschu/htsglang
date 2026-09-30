@@ -25,7 +25,8 @@ TWO PARTS, each behind its own switch (default off until metal), groups
    nothing running, nothing waiting, not dormant (the KV pool is mapped).
    The gate reads REPLICATED state only (TP ranks reach ``on_idle`` in the
    same loop iteration: the request broadcast is their lockstep), no wall
-   clock, a node cap per pass. The write-through acks drain through the
+   clock, a node cap per pass (default 1: an arriving request waits at
+   most one node's issue). The write-through acks drain through the
    loop's own ``check_hicache_events``; nothing waits here.
 
 2. FLUSH-QUIESCE-NONBLOCK (``SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK``).
@@ -138,7 +139,7 @@ def idle_publish(scheduler) -> Optional[dict]:
     try:
         cap = max(1, int(envs.SGLANG_WEG2_D_IDLE_PUBLISH_MAX_ISSUE.get()))
     except Exception:  # noqa: BLE001
-        cap = 4
+        cap = 1
     try:
         stats = scheduler.tree_cache.publish_unbacked_sweep(max_issue=cap) or {}
     except Exception as e:  # noqa: BLE001 -- a publisher never takes the loop down

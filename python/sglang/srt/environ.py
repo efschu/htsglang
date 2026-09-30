@@ -783,8 +783,11 @@ class Envs:
     # 137-333 ms before each flip. (1) D-IDLE-PUBLISH: the bubble publisher's
     # sweep from Scheduler.on_idle (nothing running/waiting, not dormant).
     SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH = EnvBool(False)
-    # nodes per idle pass (the sweep's max_issue)
-    SGLANG_WEG2_D_IDLE_PUBLISH_MAX_ISSUE = EnvInt(4)
+    # nodes per idle pass (the sweep's max_issue). 1: a request that lands
+    # during a pass waits at most one node's issue (y4i: ~23-48 ms per node
+    # incl. arena claim + mamba write); the idle loop takes the next node
+    # on its next iteration.
+    SGLANG_WEG2_D_IDLE_PUBLISH_MAX_ISSUE = EnvInt(1)
     # (2) FLUSH-QUIESCE-NONBLOCK: the quiesce answers "quiesced" when the only
     # blockers on every rank are the group's own write-throughs / store
     # writes; the sleep leg's group drain + #1470 flush reset before the pause.
