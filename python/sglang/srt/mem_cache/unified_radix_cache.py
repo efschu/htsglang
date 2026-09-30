@@ -106,6 +106,7 @@ from sglang.srt.mem_cache.producer_phase_census import (
 from sglang.srt.mem_cache.mamba_ckpt_utils import weg2_max_states_per_path
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.weg2.turn_anchor import PENDING_ATTR as _TURN_PENDING_ATTR
+from sglang.srt.weg2.turn_anchor import TWIN_PENDING_ATTR as _TWIN_PENDING_ATTR
 
 
 def bigram_anchor_key(token_ids, cache_len: int, extra_key, *, is_bigram: bool,
@@ -2596,7 +2597,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # first, as its own node below the finish insert. Asked only when a
         # plan is pending: unarmed, the finish path is the stock one byte for
         # byte (the h63c/h63d harnesses bind this method alone).
-        if getattr(req, _TURN_PENDING_ATTR, None) is not None:
+        # TWIN ANCHOR (weg2/twin_anchor.py): the step's twin-boundary tracks
+        # ride the same insert, in position order.
+        if (getattr(req, _TURN_PENDING_ATTR, None) is not None
+                or getattr(req, _TWIN_PENDING_ATTR, None)):
             self._weg2_turn_insert(req, is_insert=is_insert)
 
         kv_committed_len = req.pop_committed_kv_cache()
@@ -2778,8 +2782,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
         # TURN ANCHOR (weg2/turn_anchor.py): the step's second track goes in
         # first, as its own node below this chunk's insert (only with a plan
-        # pending; unarmed nothing is asked)
-        if getattr(req, _TURN_PENDING_ATTR, None) is not None:
+        # pending; unarmed nothing is asked) -- with the twin-boundary tracks
+        if (getattr(req, _TURN_PENDING_ATTR, None) is not None
+                or getattr(req, _TWIN_PENDING_ATTR, None)):
             self._weg2_turn_insert(req)
 
         token_ids = req.get_fill_ids()
@@ -2975,9 +2980,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         from sglang.srt.weg2 import turn_anchor as _ta
 
-        pend = _ta.pop_pending(req)
-        if pend is None:
-            return
+        # TWIN ANCHOR: the turn plan and the step's twin-boundary plans, lowest
+        # position first -- each is its own node on the request's path.
+        for kind, pend in _ta.pop_all_pending(req):
+            self._weg2_turn_insert_one(req, pend, kind=kind, is_insert=is_insert)
+
+    def _weg2_turn_insert_one(self, req: Req, pend, *, kind: str, is_insert: bool) -> None:
+        """One second-track plan ``pend`` (turn or twin boundary) into the tree
+        (see ``_weg2_turn_insert``)."""
+        from sglang.srt.weg2 import turn_anchor as _ta
+
         t, slot, _desc, step_start, step_end = pend
         ok, why = _ta.insert_verdict(pend)
         if ok and (not is_insert or self.disable):
@@ -2996,7 +3008,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 ok, why = False, "key_len"
         if not ok:
             self._weg2_turn_free(slot)
-            _ta.note_skip(req, why, t)
+            _ta.note_skip(req, why, t, kind=kind)
             return
         # #811: the old anchor's pin may already be gone (released at its ack);
         # its MAMBA half is then not decremented again below.
@@ -3051,7 +3063,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # scheduler-thread wall between forwards, WEG2-PUBLISH-REQ).
         _ta.note_insert(
             req, t=t, prefix_len=len(new_indices), taken=taken,
-            prompt=len(req.origin_input_ids), step=(step_start, step_end),
+            prompt=len(req.origin_input_ids), step=(step_start, step_end), kind=kind,
         )
 
     def _weg2_turn_free(self, slot) -> None:

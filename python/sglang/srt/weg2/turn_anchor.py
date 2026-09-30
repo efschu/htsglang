@@ -76,6 +76,9 @@ logger = logging.getLogger(__name__)
 
 PENDING_ATTR = "_weg2_turn_pending"
 POS_ATTR = "_weg2_turn_pos"
+#: TWIN ANCHOR (30.09., weg2/twin_anchor.py): the step's twin-boundary tracks,
+#: a list of plans of the same shape as PENDING_ATTR's, ascending by position
+TWIN_PENDING_ATTR = "_weg2_twin_pending"
 
 #: the generation prompt of a thinking Qwen3.x turn is 5 tokens, the
 #: non-thinking one 8; the same window the FORK ANCHOR uses.
@@ -321,9 +324,11 @@ def conv_starts(ext_lens_cpu: Sequence[int], rows: Sequence[int], targets: Seque
 # -- the scheduler side --------------------------------------------------------------
 def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
               prefix: int, end: int, track_mask: bool, main_track: Optional[int],
-              chunk: int, page: int, tok: int) -> Optional[TurnTracks]:
-    """prepare_for_extend, per request: plan the second track of this step.
-    Returns the (possibly new) batch descriptor."""
+              chunk: int, page: int, tok: int,
+              twin_bounds: Sequence[int] = ()) -> Optional[TurnTracks]:
+    """prepare_for_extend, per request: plan the second track of this step
+    and (TWIN ANCHOR, weg2/twin_anchor.py) one more track per twin boundary
+    ``twin_bounds`` inside it. Returns the (possibly new) batch descriptor."""
     stale = getattr(req, PENDING_ATTR, None)
     if stale is not None:
         # a plan the tree never consumed (a path that skipped the insert):
@@ -334,10 +339,17 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
         if _log_due(n):
             logger.warning("WEG2 TURN-ANCHOR STALE rid=%s: an unconsumed plan's slot "
                            "freed (n=%d)", str(getattr(req, "rid", "?")), n)
+    for st_pend in getattr(req, TWIN_PENDING_ATTR, None) or ():
+        _free_slot(batch, st_pend[1])
+    if getattr(req, TWIN_PENDING_ATTR, None):
+        setattr(req, TWIN_PENDING_ATTR, None)
     if not track_mask or len(getattr(req, "output_ids", None) or ()) > 0:
         return desc
     t_abs = req_anchor_pos(req, tok, page)
     t = step_target(prefix, end, t_abs, chunk, main_track)
+    if twin_bounds:
+        desc = _note_twin_steps(batch, desc, req, row, prefix, end, main_track, chunk,
+                                page, twin_bounds, turn=t if t is not None and t % max(1, int(page)) == 0 else None)
     if t is None:
         return desc
     if t % max(1, int(page)) != 0:
@@ -367,6 +379,72 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
             main_track,
         )
     return desc
+
+
+def _note_twin_steps(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
+                     prefix: int, end: int, main_track: Optional[int], chunk: int,
+                     page: int, bounds: Sequence[int], turn: Optional[int]) -> Optional[TurnTracks]:
+    """TWIN ANCHOR: one extra track per twin boundary ``B`` inside this step
+    (same grid, below the main track, above the protected prefix, not the
+    turn position, which the turn track writes anyway). Plans are kept on
+    ``TWIN_PENDING_ATTR`` ascending; the tree inserts them with the turn plan
+    in position order before the step's own insert."""
+    from sglang.srt.weg2 import twin_anchor as _tw
+
+    protected = int(getattr(req, "cache_protected_len", 0) or 0)
+    plans = []
+    rid = str(getattr(req, "rid", "?"))
+    for b in sorted({int(x) for x in bounds}):
+        if turn is not None and b == turn:
+            _tw.note_planned(rid, b)  # the turn track writes this very position
+            continue
+        if b <= protected or b % max(1, int(page)) != 0:
+            continue
+        if step_target(prefix, end, b, chunk, main_track) is None:
+            continue
+        slot = _alloc_slot(batch)
+        if slot is None:
+            n = _count("twin_no_slot")
+            if _log_due(n):
+                logger.info("WEG2 TWIN-ANCHOR SKIP rid=%s reason=no_free_slot at=%d "
+                            "step=[%d,%d) (n=%d; no eviction, no reserve)", rid, b, prefix, end, n)
+            _tw.note_declined(rid, b)
+            continue
+        if desc is None:
+            desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
+        desc.add(row, slot, b, prefix, end - prefix)
+        plans.append((b, slot, desc, int(prefix), int(end)))
+        _tw.note_planned(rid, b)
+        n = _count("twin_planned")
+        if _log_due(n):
+            logger.info(
+                "WEG2 TWIN-ANCHOR TRACK n=%d rid=%s step=[%d,%d) at=%d main=%s (extra "
+                "extend track at a queued twin's shared boundary: the twin resumes here "
+                "instead of the previous chunk anchor)", n, rid, prefix, end, b, main_track)
+    if plans:
+        setattr(req, TWIN_PENDING_ATTR, plans)
+    return desc
+
+
+def has_pending(req: Any) -> bool:
+    """A turn or twin plan waits for the tree's next insert of ``req``."""
+    return (getattr(req, PENDING_ATTR, None) is not None
+            or bool(getattr(req, TWIN_PENDING_ATTR, None)))
+
+
+def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
+    """Every pending plan of ``req`` as ``(kind, plan)``, ascending by position
+    (the tree inserts the lower node first); both attributes cleared."""
+    out: List[Tuple[str, Any]] = []
+    turn = pop_pending(req)
+    if turn is not None:
+        out.append(("turn", turn))
+    twins = getattr(req, TWIN_PENDING_ATTR, None) or ()
+    if twins:
+        setattr(req, TWIN_PENDING_ATTR, None)
+        out.extend(("twin", p) for p in twins)
+    out.sort(key=lambda kp: int(kp[1][0]))
+    return out
 
 
 def _boundary_of(req: Any, tok: int) -> Optional[int]:
@@ -483,19 +561,29 @@ def insert_verdict(pend) -> Tuple[bool, str]:
 
 
 def note_insert(req: Any, t: int, prefix_len: int, taken: bool, prompt: int,
-                step: Tuple[int, int]) -> None:
-    n = _count("inserted" if taken else "exists")
+                step: Tuple[int, int], kind: str = "turn") -> None:
+    label = "TWIN-ANCHOR" if kind == "twin" else "TURN-ANCHOR"
+    n = _count(("twin_" if kind == "twin" else "") + ("inserted" if taken else "exists"))
+    from sglang.srt.weg2 import twin_anchor as _tw
+
+    if kind == "twin" or _tw.status(str(getattr(req, "rid", "?")), int(t)) is not None:
+        _tw.note_written(str(getattr(req, "rid", "?")), int(t))
     if _log_due(n):
         logger.info(
-            "WEG2 TURN-ANCHOR INSERT n=%d rid=%s at=%d step=[%d,%d) prompt=%d "
+            "WEG2 %s INSERT n=%d rid=%s at=%d step=[%d,%d) prompt=%d "
             "prefix_len=%d value=%s counts=%s",
-            n, str(getattr(req, "rid", "?")), t, step[0], step[1], prompt, prefix_len,
+            label, n, str(getattr(req, "rid", "?")), t, step[0], step[1], prompt, prefix_len,
             "taken" if taken else "exists", counts(),
         )
 
 
-def note_skip(req: Any, reason: str, t: int) -> None:
-    n = _count("skip:" + reason.split(":")[0])
+def note_skip(req: Any, reason: str, t: int, kind: str = "turn") -> None:
+    label = "TWIN-ANCHOR" if kind == "twin" else "TURN-ANCHOR"
+    n = _count(("twin_" if kind == "twin" else "") + "skip:" + reason.split(":")[0])
+    from sglang.srt.weg2 import twin_anchor as _tw
+
+    if kind == "twin" or _tw.status(str(getattr(req, "rid", "?")), int(t)) is not None:
+        _tw.note_declined(str(getattr(req, "rid", "?")), int(t))
     if _log_due(n):
-        logger.info("WEG2 TURN-ANCHOR SKIP rid=%s reason=%s turn=%d (n=%d) -- slot freed",
-                    str(getattr(req, "rid", "?")), reason, t, n)
+        logger.info("WEG2 %s SKIP rid=%s reason=%s turn=%d (n=%d) -- slot freed",
+                    label, str(getattr(req, "rid", "?")), reason, t, n)

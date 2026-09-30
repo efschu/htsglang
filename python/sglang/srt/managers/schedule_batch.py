@@ -3358,6 +3358,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
     # TURN ANCHOR (weg2/turn_anchor.py): this extend's second tracks, or None
     weg2_turn_tracks: Optional[Any] = None
+    # TWIN ANCHOR (weg2/twin_anchor.py): rid -> twin boundaries of this new
+    # prefill batch (stamped by the scheduler before prepare_for_extend), or None
+    weg2_twin_bounds: Optional[Any] = None
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
@@ -4016,6 +4019,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         chunk=server_args.mamba_cache_chunk_size,
                         page=self.token_to_kv_pool_allocator.page_size,
                         tok=_turn_tok,
+                        twin_bounds=(self.weg2_twin_bounds or {}).get(req.rid, ()),
                     )
 
             if self.return_logprob:

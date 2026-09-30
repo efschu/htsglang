@@ -236,6 +236,7 @@ from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
 from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
 from sglang.srt.weg2 import flush_verdict as _weg2_flush_verdict  # z30j PP0 flush verdict
 from sglang.srt.weg2 import fork_anchor as _weg2_fork
+from sglang.srt.weg2 import twin_anchor as _weg2_twin_anchor  # TWIN ANCHOR (y4a 16-28)
 from sglang.srt.weg2 import d_park_read as _weg2_park_read  # PARK-RETAIN READ
 from sglang.srt.weg2 import resume_via_p as _weg2_rvp  # RESUME-VIA-P
 from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progress beacon
@@ -17522,6 +17523,11 @@ class Scheduler(
 
         _wk_t3 = time.perf_counter()  # init_new done
         self._weg2_ready_ms = (_wk_t3 - _wk_t2b) * 1000.0
+        # TWIN ANCHOR (weg2/twin_anchor.py): the boundaries of twins still
+        # queued behind this batch's requests (None when off / none queued)
+        new_batch.weg2_twin_bounds = _weg2_twin_anchor.batch_bounds(
+            can_run_list, self.waiting_queue, page=self.page_size
+        )
         new_batch.prepare_for_extend()
         _wk_t4 = time.perf_counter()
         if getattr(self, "_weg2_post_wake_pass_n", None) is not None:
