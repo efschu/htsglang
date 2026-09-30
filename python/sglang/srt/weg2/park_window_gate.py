@@ -30,6 +30,7 @@ when the front sends ``left_ms < 0``.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -98,7 +99,9 @@ def note(sched, recv_req) -> None:
         clear(sched, "front")
         return
     win = {"epoch": int(recv_req.epoch), "left_ms": left, "a_ms": float(recv_req.a_ms),
-           "b_ms": float(recv_req.b_ms), "c_ms": float(recv_req.c_ms)}
+           "b_ms": float(recv_req.b_ms), "c_ms": float(recv_req.c_ms),
+           # rankstats (FEHLT 2): when it arrived -- the instrument's clock, never the verdict's
+           "t_set": time.monotonic()}
     prev = getattr(sched, STATE_ATTR, None)
     setattr(sched, STATE_ATTR, win)
     n = getattr(sched, "_weg2_park_window_n", 0) + 1

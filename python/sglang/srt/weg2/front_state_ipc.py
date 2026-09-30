@@ -270,12 +270,40 @@ class FirstWorkClock:
     group never worked before the next one simply never fires. No model switch:
     the 27B flip-time tile reads the same event."""
 
+    #: DASHBOARD-AUS-IPC (30.09., Inventar FEHLT 3; 27B 11 flip_done / 3
+    #: flip_first_work, NF 32 / 30): EVERY flip that reached ``done`` gets
+    #: exactly one ``flip_first_work`` -- its first work, or ``what: "none"``
+    #: with the time to the flip's end and the reason no work came (the next
+    #: flip began first, or the front stopped).
+    NONE = "none"
+
     def __init__(self) -> None:
         self._armed: Optional[dict] = None
 
-    def arm(self, epoch: int, sleep: str, wake: str, flip_begin_ts: float) -> None:
+    def arm(self, epoch: int, sleep: str, wake: str, flip_begin_ts: float) -> Optional[dict]:
+        """Arm the new flip; returns the ``none`` event of the previous flip when
+        it reached ``done`` and its woken group never worked (publish it)."""
+        prev = self.flush("next_flip_before_work")
         self._armed = {"epoch": int(epoch), "dir": f"{sleep}>{wake}", "wake": wake,
                        "flip_begin_ts": float(flip_begin_ts)}
+        return prev
+
+    def done(self, now: float) -> None:
+        """The armed flip reached ``done`` (its ``flip_done`` was published)."""
+        if self._armed is not None:
+            self._armed["done_ts"] = float(now)
+
+    def flush(self, reason: str) -> Optional[dict]:
+        """The armed flip's ``none`` event (only for a flip that reached ``done``;
+        a flip that never finished has no ``flip_done`` to pair), disarmed."""
+        a = self._armed
+        self._armed = None
+        if a is None or a.get("done_ts") is None:
+            return None
+        return {"epoch": a["epoch"], "dir": a["dir"], "flip_begin_ts": round(a["flip_begin_ts"], 3),
+                "first_work_ts": None,
+                "flip_time_ms": round((a["done_ts"] - a["flip_begin_ts"]) * 1000.0),
+                "what": self.NONE, "reason": reason, "rid": None, "clock": "time.time front"}
 
     def seen(self, group: str, what: str, rid: Optional[str], now: float) -> Optional[dict]:
         a = self._armed

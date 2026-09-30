@@ -190,14 +190,16 @@ def test_the_front_resends_only_on_a_step_a_new_epoch_or_a_new_line():
 
 def test_the_window_in_force_is_in_the_rankstats_ipc():
     """IPC (RANKSTATS-S3 `sched`): the window D applies and the extends it held
-    back are readable without a log line; null = no window (never 0)."""
+    back are readable without a log line. 30.09. (Inventar FEHLT 2: null on
+    every rank read as "missing"): -1 = no window, else the ms still open."""
     from sglang.srt.weg2 import rankstats as rs
 
     s = types.SimpleNamespace(waiting_queue=[], running_batch=types.SimpleNamespace(reqs=[1, 2]))
-    assert rs._park_window_left_ms(s) is None
+    assert rs._park_window_left_ms(s) == -1
     G.note(s, _win(LINE_27B, 1000))
     G.defers(s, object(), uncached=3000, prefix_tokens=20000, batch_empty=True, running_n=2)
-    assert rs._park_window_left_ms(s) == 1000 and s._weg2_park_window_defer_n == 1
+    left = rs._park_window_left_ms(s)
+    assert 900 <= left <= 1000 and s._weg2_park_window_defer_n == 1
     src = inspect.getsource(rs)
     assert '"park_window_left_ms": _park_window_left_ms(scheduler)' in src
     assert '"park_window_defers"' in src and '"park_window_hold_max_ms"' in src
