@@ -10411,8 +10411,19 @@ class Front:
                 # the interleave happened to return the natural order, which is
                 # why leg 0 never showed it. `family` (natural order) remains
                 # the permutation check's reference above.
+                # WT2 (30.09., NF y4g): the WEIGHTS leg carries the seat counts
+                # too. Without them D's first request of the wake set the cap
+                # form (S0, 10 bank rows) on the paused bank, the tags mapped
+                # it, and the kv leg that carried n then moved the LIVE bank
+                # (10 -> 20/16/15 or -> 6/7 rows: device sync behind the draft
+                # unpark's 1.5 GB H2D, unmap/map of 144-576 cells): seat_vram
+                # median ~140 ms, 611/1482 ms, inside cg_resume. With n on
+                # the first request the bank is planned while paused and
+                # mapped once by its tag; the kv leg changes nothing
+                # (d_seat_vram.on_wake: has_n). {} for P and for qwen27b.
                 self.timed_rpc(D, "/resume_memory_occupation",
-                               {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
+                               dict({"tags": pause_order, "epoch": flip_epoch}, **_wake_extra),
+                               RPC_TIMEOUT_S),
             ]
             _kv_early = bool(_kv_early_on())
             if _kv_early:
