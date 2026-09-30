@@ -20374,6 +20374,11 @@ class Scheduler(
             _lad = kv_ladder_reading(self)
             if _lad:
                 ret["weg2_kv"].update(_lad)
+            # NF-STAU-KV (30.09.): the decode clip D's own admission reserves
+            # per request -- the front's KV need asks the same, not max_tokens.
+            from sglang.srt.weg2.arrival_seat_rule import d_decode_clip
+
+            ret["weg2_kv"]["decode_clip"] = d_decode_clip()
         except Exception:  # noqa: BLE001 -- an instrument never breaks the info route
             pass
         # #287: the effective figure is the limiter's floating value. Without

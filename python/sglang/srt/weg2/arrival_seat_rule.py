@@ -40,6 +40,11 @@ WAIT_SEAT = "wait_seat"
 
 #: the park reason D sees for (c)
 REASON_YOUNGEST = "arrival-seat-youngest"
+#: the park reason D sees for the KV displacement (NF-STAU-KV, #246)
+REASON_KV = "arrival-seat-kv"
+#: one KV displacement per this many seconds: longer than the front's KV
+#: reading cache (1 s), so the next verdict reads D after the park landed
+KV_PARK_COOLDOWN_S = 1.5
 
 #: counters the front keeps (all published under state.json front.arrival_seat)
 COUNTERS = (
@@ -51,6 +56,11 @@ COUNTERS = (
     "arrival_seat_backfill",
     "arrival_seat_verdict_n", "arrival_seat_verdict_ms_sum", "arrival_seat_verdict_ms_max",
     "arrival_seat_ttft_n", "arrival_seat_ttft_ms_sum", "arrival_seat_ttft_ms_max",
+    # NF-STAU-KV (30.09., Klasse J): the head whose KV does not fit parks the
+    # youngest running decode that ARRIVED after it (user rule #246 "Ältester
+    # rückt nach und verdrängt Jüngere"), and the KV need's two honest terms
+    "arrival_seat_kv_displace", "arrival_seat_kv_displace_refused",
+    "arrival_seat_kv_shared_tokens", "arrival_seat_kv_decode_clipped",
 )
 
 
@@ -100,6 +110,99 @@ def max_tokens_of(payload) -> Optional[int]:
         except (TypeError, ValueError):
             return None
     return None
+
+
+def default_decode_clip() -> int:
+    """D's own decode reservation cap per request (upstream
+    ``SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION``, ``schedule_policy.CLIP_MAX_NEW_TOKENS``)
+    -- the fallback when D does not publish ``weg2_kv.decode_clip``."""
+    from sglang.srt.environ import envs
+
+    return int(envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get())
+
+
+def d_decode_clip() -> int:
+    """D side (``/server_info`` ``weg2_kv.decode_clip``): the cap D's own
+    admission (``PrefillAdder``) reserves per request for its decode."""
+    from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
+
+    return int(CLIP_MAX_NEW_TOKENS)
+
+
+def decode_part(max_tokens: Optional[int], default_reserve_tokens: int, clip: Optional[int]) -> int:
+    """NF-STAU-KV (30.09., Klasse J): the decode term of an arrival's KV need,
+    INCREMENTAL like D's own admission, never the client's worst case.
+
+    y3u 00:42:24 weg2-38-56: need=141854 = 77854 prompt + 64000 (Claude Code's
+    ``max_tokens``) > free=131820 -> 13.6 s wait; it decoded 47 tokens. D
+    itself reserves ``min(max_new_tokens, CLIP_MAX_NEW_TOKENS)`` per request
+    (``PrefillAdder``) and grows past it elastically: a decode-pressure
+    retraction parks the youngest with its span retained (retract_retain,
+    ResumeBook resumes it when it fits). The front's fit test now asks what
+    D's admission asks -- the same clip, read from D (``weg2_kv.decode_clip``)."""
+    r = decode_reserve(max_tokens, default_reserve_tokens)
+    try:
+        c = int(clip) if clip is not None else 0
+    except (TypeError, ValueError):
+        c = 0
+    return min(r, c) if c > 0 else r
+
+
+def shared_prefix_credit(est_prompt: int, est_uncached: Optional[int], common: Optional[int],
+                         prev_running: bool) -> int:
+    """NF-STAU-KV: the prefix an arrival shares with a request RUNNING on D
+    (the same session's previous turn: front ``SESSION-PREFIX`` common) --
+    those pages are locked by the running turn, already counted in D's used
+    tokens, and the new turn maps them instead of allocating (radix match).
+    Capped by the MEASURED cached-on-D span (``est_prompt - est_uncached``,
+    presence: Mamba anchor depth). A finished or parked previous turn gives no
+    credit: its pages are evictable, D's free reading already counts them."""
+    if not prev_running or common is None or est_uncached is None:
+        return 0
+    try:
+        present = max(0, int(est_prompt or 0) - int(est_uncached))
+        return max(0, min(int(common), present))
+    except (TypeError, ValueError):
+        return 0
+
+
+def kv_free(kv_reading: Optional[Mapping]) -> Optional[int]:
+    """The free tokens :func:`kv_fits` tests against (the larger of D's stage
+    reading and its ladder room), or None without a reading."""
+    if not kv_reading:
+        return None
+    try:
+        free = int(kv_reading.get("available", 0) or 0) + int(kv_reading.get("evictable", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    lad = ladder_free(kv_reading)
+    return max(free, lad[0]) if lad is not None else free
+
+
+def kv_displace_victim(head_arrival: Optional[float], running: Iterable[str],
+                       arrival_of: Mapping[str, float], tokens_of: Mapping[str, int],
+                       deficit: int) -> Optional[str]:
+    """NF-STAU-KV (user rule #246, 27.09.: "strikte Ankunftsreihenfolge +
+    KV-Backfill, Ältester rückt nach und verdrängt Jüngere"): the head's KV
+    does not fit a free seat -> the running decode that ARRIVED last, and
+    after the head, parks (SA (3)'s pressure shape, span retained) so the
+    head gets its room now instead of after the 60 s bound (c).
+
+    Only a younger one is ever a victim (an older running request has the
+    right of way; then the head is blocked by its elders and KV backfill
+    applies). Only when the younger ones' KV can cover the deficit at all --
+    ``tokens_of`` is the front's LOWER bound (the prompt it priced), so a
+    park that cannot make the head fit is never taken (no churn). A rid with
+    no arrival stamp counts as old."""
+    if head_arrival is None or int(deficit) <= 0:
+        return None
+    younger = [(float(arrival_of[r]), r) for r in running
+               if r in arrival_of and float(arrival_of[r]) > float(head_arrival)]
+    if not younger:
+        return None
+    if sum(max(0, int(tokens_of.get(r, 0) or 0)) for _, r in younger) < int(deficit):
+        return None
+    return max(younger)[1]
 
 
 def kv_need(est_prompt_tokens: int, reserve_tokens: int) -> int:
