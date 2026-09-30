@@ -57,7 +57,7 @@ def _cold_triton_launch(dev, salt):
         "def k(x_ptr, n, BLOCK: tl.constexpr):\n"
         "    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n"
         "    m = o < n\n"
-        f"    tl.store(x_ptr + o, tl.load(x_ptr + o, mask=m) * 1.0 + {float(salt)!r}, mask=m)\n"
+        f"    tl.store(x_ptr + o, tl.load(x_ptr + o, mask=m) * 1.0 + {(abs(hash(salt)) % 1000003) / 7.0!r}, mask=m)\n"
     )
     d = _tf.mkdtemp(prefix="coldjit")
     path = os.path.join(d, f"cold_{abs(hash(salt))}.py")
