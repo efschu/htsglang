@@ -291,15 +291,24 @@ class PKvStage:
         rank (the atomic group grant): map, no ledger request. The previous
         commitment of this rank is dropped here -- a grant is always fresh."""
         want = min(self.top, round_up(tokens, self.step))
-        # the commitments ACCUMULATE until the idle release: a previous
-        # request may still hold pages above ``want`` on this stage, so the
-        # ledger keeps covering the mapping (over-commit is the safe side of I1)
+        # PP0 charged this card for the whole grant; adopt it, then keep only
+        # what the mapping needs. The mapping is ONE high-water level: a
+        # second grant on the same level is not a second span (metal dual13
+        # 3q33cu: weg2-0-21 and -22 on one 65536 mapping counted 2952790016 B
+        # on the 5090, the next grant starved on P's own count). A grant still
+        # in flight to a follower stays charged in the ledger until adopted,
+        # so the ledger never covers less than the mapping.
         self._committed = int(getattr(self, "_committed", 0) or 0) + (self.bytes_for(want) - self.bytes_for(0))
         if want > self.mapped_tokens:
             self._move(want)
             self.mapped_tokens = want
-        logger.info("%s MAPPED-BY-GRANT tokens=%d (PP0's atomic group grant) committed=%d B",
-                    MARK, want, self._committed)
+        keep = self.bytes_for(self.mapped_tokens) - self.bytes_for(0)
+        excess = self._committed - keep
+        if excess > 0:
+            self.ledger.release(excess)
+            self._committed = keep
+        logger.info("%s MAPPED-BY-GRANT tokens=%d (PP0's atomic group grant) committed=%d B returned=%d B",
+                    MARK, want, self._committed, max(0, excess))
 
     def release_all(self) -> int:
         """Unmap everything; the caller guarantees no request holds a page."""
@@ -437,15 +446,67 @@ def pp0_grant(sched, req) -> Optional[int]:
             return 0
     tokens = len(getattr(req, "origin_input_ids", None) or ()) + int(actor.page)
     lvl = group_grant(stages, tokens, lambda pth: CardKvLedger(pth, "P"))
+    rid = str(getattr(req, "rid", "?"))[:16]
     if lvl:
         actor.map_granted(lvl)
         req._dual_kv_tokens = lvl
-        logger.info("%s PP0 GRANT rid=%s tokens=%d on all %d cards", MARK,
-                    str(getattr(req, "rid", "?"))[:16], lvl, pp)
+        waited = _wait_granted(rid)
+        logger.info("%s PP0 GRANT rid=%s tokens=%d on all %d cards%s", MARK, rid, lvl, pp,
+                    (" after %d waits over %.1f s" % waited) if waited else "")
     else:
-        logger.info("%s PP0 WAIT rid=%s tokens=%d: a card is short, nothing held (P never presses D)",
-                    MARK, str(getattr(req, "rid", "?"))[:16], tokens)
+        _log_wait(rid, tokens)
     return lvl
+
+
+# -- WAIT log rate (metal dual13: 497k WAIT lines kept a stalled boot "alive") --
+#: rid -> [first_t, next_t, interval_s, waits, suppressed]
+_WAITS: dict = {}
+_CENSUS = {"next": 0.0, "iv": 1.0, "waits": 0}
+
+
+def _now() -> float:
+    import time
+
+    return time.monotonic()
+
+
+def _reset_wait_log() -> None:
+    _WAITS.clear()
+    _CENSUS.update(next=0.0, iv=1.0, waits=0)
+
+
+def _log_wait(rid: str, tokens: int) -> None:
+    """At most one line per rid per second, the gap doubling each line, plus
+    one census line on the same backoff. A long wait therefore goes quiet, and
+    the silence watchdog can see a stall instead of a busy log."""
+    t = _now()
+    e = _WAITS.get(rid)
+    if e is None:
+        e = _WAITS[rid] = [t, t, 1.0, 0, 0]
+    e[3] += 1
+    _CENSUS["waits"] += 1
+    if t >= e[1]:
+        logger.info("%s PP0 WAIT rid=%s tokens=%d: a card is short, nothing held (P never presses D) "
+                    "waits=%d suppressed=%d waiting_s=%.1f", MARK, rid, int(tokens), e[3], e[4], t - e[0])
+        e[4] = 0
+        e[1] = t + e[2]
+        e[2] *= 2.0
+    else:
+        e[4] += 1
+    if t >= _CENSUS["next"]:
+        logger.info("%s PP0 WAIT census: rids=%d waits=%d since the last census line (next in %.0f s)",
+                    MARK, len(_WAITS), _CENSUS["waits"], _CENSUS["iv"])
+        _CENSUS["waits"] = 0
+        _CENSUS["next"] = t + _CENSUS["iv"]
+        _CENSUS["iv"] *= 2.0
+
+
+def _wait_granted(rid: str):
+    """Forget ``rid``'s wait; returns (waits, seconds) when it had waited."""
+    e = _WAITS.pop(rid, None)
+    if not _WAITS:
+        _CENSUS.update(next=0.0, iv=1.0, waits=0)
+    return (e[3], _now() - e[0]) if e else None
 
 
 def on_told(sched, item) -> None:

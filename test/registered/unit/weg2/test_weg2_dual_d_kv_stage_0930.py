@@ -203,8 +203,8 @@ class DemandReplayOfBsffsv(CustomTestCase):
 
         def group(vals):                                        # the other rank reports the big demand
             seen["vals"] = list(vals)
-            if len(vals) == 3:                                  # [-want, -p_wait, -live]: MAX via MIN of negatives
-                return [min(vals[0], -(40767 + 72 + 8192)), vals[1], vals[2]]
+            if len(vals) >= 3:                                  # [-want, -p_wait, -live, -demand]: MAX via MIN of negatives
+                return [min(vals[0], -(40767 + 72 + 8192))] + list(vals[1:])
             return list(vals)
 
         a = self._actor(86016)
