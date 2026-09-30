@@ -22,14 +22,43 @@ by ``unlink_store(dir)`` at teardown by whoever owns the epoch.
 """
 from __future__ import annotations
 
+import logging
 import mmap as _mmap
 import os
+import time
 import weakref
 from typing import Optional, Tuple
 
 import torch
 
+logger = logging.getLogger(__name__)
+
 _CUDA_HOST_REGISTER_MAPPED = 2
+
+#: PIN-REGISTER (30.09., NF y3z/y4a): the per-file registration clock. A slow
+#: D load was 6-8 layers whose presplit took 4-17 s instead of 0.3 s (the rest
+#: normal), inside this call -- the LOAD-PROFILE could only say "shared_pinned
+#: 71 %", not WHICH file waited how long. Every call that registers logs one
+#: line up to ``_REG_LOG_CAP`` per process; a call at or above
+#: ``_REG_SLOW_MS`` is always logged (the stall a later reader correlates with
+#: the host's compaction counters in memts' vmstat companion).
+REG_MARK = "WEG2-PIN-REGISTER"
+_REG_LOG_CAP = 512
+_REG_SLOW_MS = 1000.0
+_REG_N = {"n": 0}
+
+
+def _note_register(path: str, nbytes: int, created: bool, register_ms: float,
+                   mlock_ms: Optional[float] = None) -> None:
+    n = _REG_N["n"] + 1
+    _REG_N["n"] = n
+    if n > _REG_LOG_CAP and register_ms < _REG_SLOW_MS:
+        return
+    logger.info(
+        "%s n=%d file=%s bytes=%d created=%s mlock_ms=%s register_ms=%.1f%s",
+        REG_MARK, n, os.path.basename(path), int(nbytes), "yes" if created else "no",
+        "-" if mlock_ms is None else "%.1f" % mlock_ms, register_ms,
+        " SLOW" if register_ms >= _REG_SLOW_MS else "")
 
 
 class SharedMap(_mmap.mmap):
@@ -88,6 +117,7 @@ def shared_pinned_empty(
     do_register = torch.cuda.is_available() if register is None else register
     registered = False
     if do_register:
+        t_reg = time.perf_counter()
         err = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, _CUDA_HOST_REGISTER_MAPPED)
         if int(err) != 0:
             mm.close()
@@ -95,6 +125,7 @@ def shared_pinned_empty(
                 f"cudaHostRegister({nbytes} bytes of {path}) failed with cudaError {int(err)}"
             )
         registered = True
+        _note_register(path, nbytes, created, (time.perf_counter() - t_reg) * 1000.0)
 
     def _release(m=mm, p=ptr, reg=registered):
         if reg:
