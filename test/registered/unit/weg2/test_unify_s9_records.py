@@ -72,7 +72,8 @@ class TestRecordsAreTheOldLiterals(unittest.TestCase):
         # (D_OVERSHOOT_MIB, a ratchet without fixpoint) -- neither its own
         # nor a borrowed D_OVERSHOOT_MIB any more
         self.assertNotIn("D_OVERSHOOT_MIB", row.constants)
-        self.assertEqual(row.constant("D_AWAKE_REST_MIB"), (3186, None, None))
+        # y5a (30.09.): 3186 (rc12c edge) - 514 (TP0's tightest y5a moment above the floor)
+        self.assertEqual(row.constant("D_AWAKE_REST_MIB"), (2672, None, None))
         self.assertEqual(row.constant("D_FIXED_MIB"), (7442, 1036, 914))
         got = dict(F.borrowed_constants("nextflash"))
         # #242 (28.09.): P's stage-fixed post and mamba rate measured on NF;

@@ -55,16 +55,17 @@
   {
    "name": "D_AWAKE_REST_MIB",
    "value": [
-    3186,
+    2672,
     null,
     null
    ],
-   "provenance": "rc12c: what the awake D rank holds BEYOND its booked form, measured against the form and never against the budget (weg2/d_awake_rest.py): demand at the edge (torch OOM line: capacity - free - other processes + refused request) - the form's posts (W+R + mamba + spec + activation + 262144 x cell, same log). TP0: rc12 3129 and 3077, rc12b 3039, rc12c 3186 -- under budgets 29624/29624/29144/28288 the rest stays 3039-3186 (the budget-relative D_OVERSHOOT_MIB it replaces went 428/353/826/1798: no fixpoint). Covers CUDA graphs 498, untagged 2036-2340, unreusable allocator/private-pool cache, unattributed 331-362 at the edge. LOWER bound (the rank died there). 3080 ranks: no edge on NF, not measured (null: the builtin 404 stays there).",
+   "provenance": "y5a (30.09., same checkpoint, NF-Operator decision): 3186 - 514 = 2672 on TP0. The rank's tightest moment of the whole y5a boot (WEG2-VRAM-PEAK, min over windows of min(card_free_start, card_free_end) - transient_mib) was 1281 MiB free on the 5090 (round, 17:45:00Z, transient 708; chunk 1437, idle 1847, flip 1747) while the plan booked awake 3186 + floor 767: 1281 - 767 = 514 MiB of the booked rest were never held above the corridor floor. The floor stays; the rest moves to experts (VRAM law). NOT a new edge measurement: an upper bound of what y5a's load held; the rc12c edge value below stays the history. 3080 ranks unchanged (booked 404, measured 440/422 transient). -- WAS: rc12c: what the awake D rank holds BEYOND its booked form, measured against the form and never against the budget (weg2/d_awake_rest.py): demand at the edge (torch OOM line: capacity - free - other processes + refused request) - the form's posts (W+R + mamba + spec + activation + 262144 x cell, same log). TP0: rc12 3129 and 3077, rc12b 3039, rc12c 3186 -- under budgets 29624/29624/29144/28288 the rest stays 3039-3186 (the budget-relative D_OVERSHOOT_MIB it replaces went 428/353/826/1798: no fixpoint). Covers CUDA graphs 498, untagged 2036-2340, unreusable allocator/private-pool cache, unattributed 331-362 at the edge. LOWER bound (the rank died there). 3080 ranks: no edge on NF, not measured (null: the builtin 404 stays there).",
    "boots": [
     "dkrnfh91bar1dauer09262249",
     "dkrnfh91bar1dauer09262302",
     "dkrnfh91bar1dauer09270007",
-    "dkrnfh91bar1dauer09270103"
+    "dkrnfh91bar1dauer09270103",
+    "dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30y2arrwretadhmlefrwfpfopwhctsesrwtswbar1dauer09301740"
    ],
    "kind": "memory",
    "power_limit_w": null,
