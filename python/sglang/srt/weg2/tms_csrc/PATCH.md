@@ -72,3 +72,17 @@ behaviour unchanged.  Used by `weg2/d_seat_vram.py` (SGLANG_OPT_WEG2_D_SEAT_VRAM
 D's GDN temporal state maps the slots of the phase's n seats, the expert bank
 the rows those seats' pages fund.  Desk proof: the unit test builds these
 sources against a mock driver (`test_weg2_d_seat_vram_h95c.py`, section 5).
+
+## Patch 4 -- PAUSE-SUB, the pause's own split (30.09., NF y4h)
+
+`core.{h,cpp}` and `entrypoint.cpp` changed, instrument only.  `pause` pass 3
+makes the same cuMemUnmap/cuMemRelease calls in the same order; each pair now
+runs on its own clocks (`timed_unmap_release`), and the call records
+`(tag, allocations, unmaps, unmap_ms, release_ms, total_ms)`.  New entrypoint
+`tms_pause_stats(tag, len, &allocations, &unmaps, &unmap_ms, &release_ms,
+&total_ms)` with the `tms_resume_stats` contract (tag written back, 0 = no
+pause recorded).  Why: D's `pause_ms` on the 3080 ranks is ~28 ms per ~1 GiB
+tag against ~6 ms on the 5090 with `sync_ms=0` on every tag, and P's pause on
+the same card costs a third per byte -- the suspect is D's H95c extent count,
+which no line carried.  The scheduler prints it as `WEG2-PAUSE-SUB`.  Desk
+proof against the mock driver: `test_weg2_pause_overlap_0930.py`.
