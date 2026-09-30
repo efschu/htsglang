@@ -268,9 +268,24 @@ def _batch_reqs(batch) -> Iterable[Any]:
     return getattr(batch, "reqs", None) or ()
 
 
+def _dormant_hold(scheduler) -> List[Any]:
+    """TW-WAKE (#294, NF y5a dmatrix 6x65602): the requests P took in while it
+    SLEPT -- ``Scheduler._add_request_to_queue`` registers their store read
+    (the #1400 intake, where TW asks) and then parks them in
+    ``weg2_dormant_hold`` instead of the waiting queue until the wake."""
+    return list(getattr(scheduler, "weg2_dormant_hold", None) or ())
+
+
 def inflight(scheduler) -> List[Any]:
     """Every request PP0 knows as in flight on P and not finished: queued,
-    the chunked one, the running batch, the PP microbatch rings."""
+    the dormant hold (TW-WAKE), the chunked one, the running batch, the PP
+    microbatch rings.
+
+    TW-WAKE (#294, y5a 17:56:08Z): weg2-52-75..80, six identical 65602-token
+    prompts, reached P while it slept ('PLE-PREFETCH admit ... dormant=1').
+    The dormant hold was not in this set, so 52-76 found no sibling at its
+    intake, registered its store read at told 0 and prefilled all 65602
+    tokens again -- six times in a row, 68 s of P, not one #TW line."""
     seen, out = set(), []
 
     def add(r):
@@ -283,6 +298,8 @@ def inflight(scheduler) -> List[Any]:
         out.append(r)
 
     for r in list(getattr(scheduler, "waiting_queue", None) or ()):
+        add(r)
+    for r in _dormant_hold(scheduler):
         add(r)
     add(getattr(scheduler, "chunked_req", None))
     for r in _batch_reqs(getattr(scheduler, "running_batch", None)):
@@ -339,6 +356,7 @@ def _note_s0(st: "_State", scheduler, cur: List[Any]) -> None:
     anchor it writes later lies above it. Kept while the rid is in flight,
     just finished, or a source of a held twin."""
     queued = {id(r) for r in (getattr(scheduler, "waiting_queue", None) or ())}
+    queued.update(id(r) for r in _dormant_hold(scheduler))  # TW-WAKE: held, not admitted
     for r in cur:
         if id(r) in queued:
             continue
@@ -492,9 +510,13 @@ def intake_defer(scheduler, req) -> bool:
         return False
     now = _now()
     live = _refresh_recent(st, scheduler, now)
+    # TW-WAKE: a twin that is itself deferred computes nothing before its own
+    # source finished -- it is no source (y5a: 77..80 wait behind 75 only and
+    # are released together with 76, not one after another).
     sources = [
         s for s in live
         if s is not req and str(getattr(s, "rid", "")) != rid
+        and _rid(s) not in st.waits
         and is_twin(s, req, st.min_tokens)
     ]
     # #56: siblings that finished within the settle window count too; their
@@ -530,14 +552,19 @@ def intake_defer(scheduler, req) -> bool:
         st.n_recent += 1
     st.waits[rid] = w
     st.n_defer += 1
+    dormant = bool(getattr(scheduler, "weg2_dormant", False))
+    held_ids = {id(r) for r in _dormant_hold(scheduler)}
+    if dormant or any(id(s) in held_ids for s in sources):
+        st.n_defer_wake = getattr(st, "n_defer_wake", 0) + 1
     if _say(st.n_defer):
         logger.info(
-            "#TW TWIN-DEFER rid=%s len=%d shared=%d sources=%s just_finished=%s (n=%d): "
-            "store read held until the sibling finished and its publish settled; "
-            "admission skips it meanwhile, nothing else waits.",
+            "#TW TWIN-DEFER rid=%s len=%d shared=%d sources=%s just_finished=%s p_dormant=%d "
+            "sources_in_hold=%s (n=%d): store read held until the sibling finished and its "
+            "publish settled; admission skips it meanwhile, nothing else waits.",
             rid[:12], len(_ids(req)), shared,
             [str(getattr(s, "rid", "?"))[:12] for s in sources],
-            [str(getattr(r, "rid", "?"))[:12] for r, _p, _t in recent], st.n_defer,
+            [str(getattr(r, "rid", "?"))[:12] for r, _p, _t in recent], int(dormant),
+            [str(getattr(s, "rid", "?"))[:12] for s in sources if id(s) in held_ids], st.n_defer,
         )
     return True
 

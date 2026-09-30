@@ -805,12 +805,14 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     told_map: Dict[str, int] = scheduler._weg2_store_told
     tree = scheduler.tree_cache
     queued = {_rid(r) for r in scheduler.waiting_queue}
+    parked = _parked(scheduler)
     # TW: held fork twins whose sibling finished (or whose Frist ran out)
     # register their store read NOW, exactly as the intake would have.
-    for _treq, _is_twin in _twin.release_due(scheduler, queued):
+    # TW-WAKE: a twin deferred while P slept sits in the dormant hold (then the
+    # settle), not in the queue -- it is still waiting, not gone.
+    for _treq, _is_twin in _twin.release_due(scheduler, queued | parked):
         _twin_register(scheduler, _treq, _is_twin)
     out: List[Weg2StoreTold] = []
-    parked = _parked(scheduler)
     for rid in list(held):
         req = held[rid]
         if rid not in queued:
@@ -1224,7 +1226,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
         fb_parked = _parked(scheduler)
     # TW: held fork twins whose sibling finished (or whose Frist ran out)
     # register their store read now (the paced read clock starts here).
-    for _treq, _is_twin in _twin.release_due(scheduler, queued):
+    for _treq, _is_twin in _twin.release_due(scheduler, queued | _parked(scheduler)):  # TW-WAKE
         _twin_register(scheduler, _treq, _is_twin)
     out: List[Any] = []
     # (a) Admits first: an entry created in THIS pass is never admitted in it,
