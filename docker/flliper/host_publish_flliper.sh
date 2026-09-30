@@ -18,18 +18,22 @@
 #                io.github.efschu.flliper.placeholders empty or "none"; no value carries a placeholder
 #                (UNDECIDED / PLACEHOLDER / __FLLIPER_); title fLLiper, slots "27b nf", build flat, source https://,
 #                lock/kernel-wheel sha256 = 64 hex; no leftover htsglang.* label.
-#   2 revision   org.opencontainers.image.revision is a 40-hex SHA, equal to revision.27b and revision.nf (ONE tree);
-#                the commit exists in $REPO; it is on the remote $REMOTE -- REMOTE_CHECK=tracking (default): a
-#                remote-tracking ref refs/remotes/$REMOTE/* contains it (fetch proof, FETCH_HEAD time printed);
-#                REMOTE_CHECK=ls-remote: a tip listed by `git ls-remote $REMOTE` is the SHA or a local descendant of it;
-#                the tree is renamed (python/flliper is a tree at that SHA).
+#   2 revision   org.opencontainers.image.revision is a 40-hex SHA, equal to revision.27b (the 27B head = primary line).
+#                ONE tree (label io.github.efschu.flliper.one_tree=1, or absent = images before 30.09.): revision.nf
+#                equals it. TWO trees (one_tree=0, B5 30.09., two frozen heads): revision.nf is a DIFFERENT 40-hex SHA
+#                and is checked like the 27B one, its remote proof ALWAYS by `git ls-remote $REMOTE` (the listed ref and
+#                tip are printed). Per revision: the commit exists in $REPO; it is on the remote $REMOTE --
+#                REMOTE_CHECK=tracking (default, 27B): a remote-tracking ref refs/remotes/$REMOTE/* contains it (fetch
+#                proof, FETCH_HEAD time printed); REMOTE_CHECK=ls-remote: a tip listed by `git ls-remote $REMOTE` is the
+#                SHA or a local descendant of it; the tree is renamed (python/flliper is a tree at that SHA).
 #   3 acceptance PASS verdict for 27B-INT8 (newest verdict_*.md in $VERDICT_27B_DIR bound to this image, from
 #                acc_cu130_final_27b.sh; or VERDICT_27B=<file>) AND for NF-INT4 (NF_VERDICT=<file>, from the NF seat),
 #                both bound to EXACTLY this image id: the verdict file, or its sibling facts_<RUNID>.kv
 #                (image_id= / image_digest=), must carry the full sha256:<64 hex> image id. A tag alone is no binding.
 #                Heading: 27B file names "27B" and "INT8", NF file names "NF" and "INT4" (first heading only;
 #                user order 26.09.: first docker acceptance only 27B-INT8 + NF-INT4). Every "Overall:"/"Gesamt:" verdict
-#                in the file must be PASS. A "27B tree `<sha>`" / "tree `<sha>`" mention must match the revision.
+#                in the file must be PASS. A "27B tree `<sha>`" mention must match the 27B revision, an NF "tree `<sha>`"
+#                mention the NF revision (= the 27B one for a one-tree image).
 #   4 user Go    $GO_DIR/<64-hex image id>.go exists (regular file, not a symlink), names the full image id and has a
 #                non-empty "go:" line (the user's verbatim Go, entered by the operator); not older than the verdicts.
 #                THIS SCRIPT NEVER CREATES, TOUCHES OR EDITS THAT FILE (memory docker-release-entscheid-0924).
@@ -142,39 +146,56 @@ old=$(for k in "${!L[@]}"; do case "$k" in htsglang.*) printf '%s ' "$k" ;; esac
 [ -z "${RED[1]:-}" ] && WHY[1]="labels complete, placeholders '${L[$P.placeholders]}'"
 
 # ---- lock 2: revision -------------------------------------------------------------------------------------------------
-sec "2. Revision: 40-hex SHA, one tree, on the remote, renamed"
+sec "2. Revision: 40-hex SHA(s), one or two trees, on the remote, renamed"
+# rev_on_remote <slot> <sha> <mode>: commit known, renamed, on $REMOTE (mode tracking|ls-remote); reds go to lock 2
+rev_on_remote(){ local slot=$1 r=$2 mode=$3 hit tip ref refs GD FH
+  if ! "${G[@]}" cat-file -e "$r^{commit}" 2>/dev/null; then red 2 "$slot commit ${r:0:10} unknown in $REPO (fetch first)"; return; fi
+  if [ "$("${G[@]}" cat-file -t "$r:python/flliper" 2>/dev/null)" = tree ]; then ok "$slot renamed tree: python/flliper present at ${r:0:10}"
+  else red 2 "$slot tree ${r:0:10} is not renamed (python/flliper missing, B1)"; fi
+  [ -n "$RURL" ] || return
+  if [ "$mode" = ls-remote ]; then
+    hit=""
+    while read -r tip ref; do
+      [ -n "$tip" ] || continue
+      if [ "$tip" = "$r" ] || { "${G[@]}" cat-file -e "$tip^{commit}" 2>/dev/null && "${G[@]}" merge-base --is-ancestor "$r" "$tip" 2>/dev/null; }; then hit="$ref @ ${tip:0:10}"; break; fi
+    done < <(GIT_TERMINAL_PROMPT=0 "${G[@]}" ls-remote "$REMOTE" 2>/dev/null)
+    [ -n "$hit" ] && ok "$slot on the remote $REMOTE ($RURL): $hit contains ${r:0:10} (ls-remote $(date -u +%FT%TZ))" \
+                  || red 2 "$slot ls-remote $REMOTE ($RURL): no listed tip is ${r:0:10} or a known descendant (unpushed, or ls-remote failed -- its stderr is not printed)"
+  elif [ "$mode" = tracking ]; then
+    refs=$("${G[@]}" for-each-ref --format='%(refname:short)' --contains "$r" "refs/remotes/$REMOTE/" 2>/dev/null | grep -v '/HEAD$' | head -3 | paste -sd, -)
+    GD=$("${G[@]}" rev-parse --absolute-git-dir 2>/dev/null)
+    FH=$(mtime "$GD/FETCH_HEAD")
+    [ -n "$refs" ] && ok "$slot on the remote $REMOTE ($RURL): $refs (fetch proof, FETCH_HEAD $(utc "$FH"))" \
+                   || red 2 "$slot: no refs/remotes/$REMOTE/* contains ${r:0:10} (UNPUSHED, or no fetch since the push; last FETCH_HEAD $(utc "$FH"))"
+  else red 2 "REMOTE_CHECK='$mode' unknown (tracking|ls-remote)"; fi
+}
 REV=${L[$OCI.revision]:-}
+REV_NF=""; TWO=0
 if ! [[ "$REV" =~ ^[0-9a-f]{40}$ ]]; then red 2 "revision label '$REV' is not a plain 40-hex SHA"; REV=""
 else
   ok "revision $REV"
-  [ "${L[$P.revision.27b]:-}" = "$REV" ] && [ "${L[$P.revision.nf]:-}" = "$REV" ] \
-    && ok "revision.27b = revision.nf = revision (one tree)" \
-    || red 2 "slot revisions differ: 27b '${L[$P.revision.27b]:-}' nf '${L[$P.revision.nf]:-}' (must both be $REV)"
-  if ! "${G[@]}" cat-file -e "$REV^{commit}" 2>/dev/null; then red 2 "commit ${REV:0:10} unknown in $REPO (fetch first)"
-  else
-    if [ "$("${G[@]}" cat-file -t "$REV:python/flliper" 2>/dev/null)" = tree ]; then ok "renamed tree: python/flliper present at ${REV:0:10}"
-    else red 2 "tree ${REV:0:10} is not renamed (python/flliper missing, B1)"; fi
-    RURL=$("${G[@]}" remote get-url "$REMOTE" 2>/dev/null | nocred)
-    [ -n "$RURL" ] || red 2 "remote '$REMOTE' unknown in $REPO"
-    if [ -n "$RURL" ] && [ "$REMOTE_CHECK" = ls-remote ]; then
-      hit=""
-      while read -r tip ref; do
-        [ -n "$tip" ] || continue
-        if [ "$tip" = "$REV" ] || { "${G[@]}" cat-file -e "$tip^{commit}" 2>/dev/null && "${G[@]}" merge-base --is-ancestor "$REV" "$tip" 2>/dev/null; }; then hit="$ref"; break; fi
-      done < <(GIT_TERMINAL_PROMPT=0 "${G[@]}" ls-remote "$REMOTE" 2>/dev/null)
-      [ -n "$hit" ] && ok "on the remote $REMOTE ($RURL): $hit contains ${REV:0:10} (ls-remote $(date -u +%FT%TZ))" \
-                    || red 2 "ls-remote $REMOTE ($RURL): no listed tip is ${REV:0:10} or a known descendant (unpushed, or ls-remote failed -- its stderr is not printed)"
-    elif [ -n "$RURL" ] && [ "$REMOTE_CHECK" = tracking ]; then
-      refs=$("${G[@]}" for-each-ref --format='%(refname:short)' --contains "$REV" "refs/remotes/$REMOTE/" 2>/dev/null | grep -v '/HEAD$' | head -3 | paste -sd, -)
-      GD=$("${G[@]}" rev-parse --absolute-git-dir 2>/dev/null)
-      FH=$(mtime "$GD/FETCH_HEAD")
-      [ -n "$refs" ] && ok "on the remote $REMOTE ($RURL): $refs (fetch proof, FETCH_HEAD $(utc "$FH"))" \
-                     || red 2 "no refs/remotes/$REMOTE/* contains ${REV:0:10} (UNPUSHED, or no fetch since the push; last FETCH_HEAD $(utc "$FH"))"
-    elif [ -n "$RURL" ]; then red 2 "REMOTE_CHECK='$REMOTE_CHECK' unknown (tracking|ls-remote)"; fi
-  fi
+  [ "${L[$P.revision.27b]:-}" = "$REV" ] && ok "revision.27b = revision (27B head = primary line)" \
+    || red 2 "revision.27b '${L[$P.revision.27b]:-}' != revision $REV"
+  R_NF=${L[$P.revision.nf]:-}
+  case "${L[$P.one_tree]-__absent__}" in
+    __absent__|1)
+      if [ "$R_NF" = "$REV" ]; then REV_NF=$REV; ok "revision.nf = revision (one tree$([ -n "${L[$P.one_tree]+x}" ] || echo ', no one_tree label: image before 30.09.'))"
+      else red 2 "slot revisions differ: 27b '${L[$P.revision.27b]:-}' nf '$R_NF' but one_tree='${L[$P.one_tree]-absent}' (one tree: both must be $REV)"; fi ;;
+    0)
+      TWO=1
+      if ! [[ "$R_NF" =~ ^[0-9a-f]{40}$ ]]; then red 2 "one_tree=0 but revision.nf '$R_NF' is not a plain 40-hex SHA"
+      elif [ "$R_NF" = "$REV" ]; then red 2 "one_tree=0 but revision.nf = revision (label contradicts the revisions)"
+      else REV_NF=$R_NF; ok "two trees (one_tree=0): 27b ${REV:0:10}, nf ${REV_NF:0:10}"; fi ;;
+    *) red 2 "one_tree label '${L[$P.one_tree]}' is neither 0 nor 1" ;;
+  esac
+  RURL=$("${G[@]}" remote get-url "$REMOTE" 2>/dev/null | nocred)
+  [ -n "$RURL" ] || red 2 "remote '$REMOTE' unknown in $REPO"
+  rev_on_remote 27b "$REV" "$REMOTE_CHECK"
+  # the NF head of a two-tree image: always ls-remote (proof printed), whatever REMOTE_CHECK says
+  [ "$TWO" = 1 ] && [ -n "$REV_NF" ] && rev_on_remote nf "$REV_NF" ls-remote
   say "   info: build-time push_state label: '${L[$P.push_state]:-}' (git decides, not the label)"
 fi
-[ -z "${RED[2]:-}" ] && WHY[2]="${REV:0:10} on $REMOTE, renamed"
+[ -z "${RED[2]:-}" ] && WHY[2]="${REV:0:10}$([ "$TWO" = 1 ] && echo " + nf ${REV_NF:0:10}") on $REMOTE, renamed"
 
 # ---- lock 3: acceptance verdicts --------------------------------------------------------------------------------------
 sec "3. Acceptance PASS for 27B-INT8 and NF-INT4 on image ${HEX:0:12}"
@@ -184,8 +205,8 @@ bound(){ local f=$1 d r fx
   d=$(dirname "$f"); r=$(basename "$f" .md); r=${r#verdict_}; fx=$d/facts_$r.kv
   [ -f "$fx" ] && grep -qxE "(image_id|image_digest)=$ID" "$fx" && { echo "id in $(basename "$fx")"; return 0; }
   return 1; }
-# judge <n> <label> <file> <heading-re-1> <heading-re-2> <tree-re>
-judge(){ local n=$1 lab=$2 f=$3 h1=$4 h2=$5 tre=$6 head ov bad t how w0=${WHY[$1]:-}
+# judge <n> <label> <file> <heading-re-1> <heading-re-2> <tree-re> <expected revision>
+judge(){ local n=$1 lab=$2 f=$3 h1=$4 h2=$5 tre=$6 exp=$7 head ov bad t how w0=${WHY[$1]:-}
   [ -f "$f" ] && [ ! -L "$f" ] || { red "$n" "$lab verdict '$f' missing (or a symlink)"; return 1; }
   how=$(bound "$f") || { red "$n" "$lab verdict $(basename "$f") is not bound to $ID (neither the file nor facts_<RUNID>.kv names the image id)"; return 1; }
   head=$(grep -m1 -E '^#' "$f")
@@ -195,9 +216,9 @@ judge(){ local n=$1 lab=$2 f=$3 h1=$4 h2=$5 tre=$6 head ov bad t how w0=${WHY[$1
   elif [ "$ov" != PASS ]; then red "$n" "$lab verdict $(basename "$f") overall '$ov' (must be PASS only)"; fi
   bad=""
   for t in $(grep -oE "$tre"'`[0-9a-f]{7,40}`' "$f" | grep -oE '[0-9a-f]{7,40}' | sort -u); do
-    [ -n "$REV" ] && [ "${REV#"$t"}" != "$REV" ] || bad="$bad $t"
+    [ -n "$exp" ] && [ "${exp#"$t"}" != "$exp" ] || bad="$bad $t"
   done
-  [ -z "$bad" ] || red "$n" "$lab verdict names tree(s)$bad, not the image revision ${REV:0:10}${REV:+}$([ -n "$REV" ] || echo '(no valid revision label)')"
+  [ -z "$bad" ] || red "$n" "$lab verdict names tree(s)$bad, not its slot revision ${exp:0:10}$([ -n "$exp" ] || echo '(no valid revision label)')"
   [ "${WHY[$n]:-}" = "$w0" ] && ok "$lab: $(basename "$f") ($how, overall ${ov:-?}, $(utc "$(mtime "$f")"))"
   return 0
 }
@@ -209,9 +230,9 @@ if [ -z "$V27" ]; then
   done < <(ls -1t "$VERDICT_27B_DIR"/verdict_*.md 2>/dev/null)
   [ -n "$V27" ] || red 3 "27B-INT8: none of $nall verdict_*.md in $VERDICT_27B_DIR is bound to $ID (acc_cu130_final_27b.sh records only the image TAG today -- it needs a fact image_id=\$(docker image inspect -f '{{.Id}}' \$IMAGE), or the id in the verdict)"
 fi
-[ -n "$V27" ] && judge 3 27B-INT8 "$V27" '27b' 'int8' '27B tree '
+[ -n "$V27" ] && judge 3 27B-INT8 "$V27" '27b' 'int8' '27B tree ' "$REV"
 if [ -z "$NF_VERDICT" ]; then red 3 "NF-INT4: NF_VERDICT (verdict file from the NF seat) not given"
-else judge 3 NF-INT4 "$NF_VERDICT" '(^|[^a-z])nf([^a-z]|$)' 'int4' 'tree '; fi
+else judge 3 NF-INT4 "$NF_VERDICT" '(^|[^a-z])nf([^a-z]|$)' 'int4' 'tree ' "${REV_NF:-$REV}"; fi
 [ -z "${RED[3]:-}" ] && WHY[3]="27B-INT8 $(basename "$V27") + NF-INT4 $(basename "$NF_VERDICT") PASS on ${HEX:0:12}"
 
 # ---- lock 4: user Go --------------------------------------------------------------------------------------------------

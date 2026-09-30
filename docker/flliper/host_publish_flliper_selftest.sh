@@ -90,8 +90,12 @@ g -C "$R" add -A; g -C "$R" commit -m c1; g -C "$R" push origin main
 C1=$(git -C "$R" rev-parse HEAD)
 g -C "$R" checkout -b local-only; echo z >> "$R/python/flliper/__init__.py"; g -C "$R" commit -am c2
 C2=$(git -C "$R" rev-parse HEAD)
+g -C "$R" checkout main
+# c3: the NF head of a two-tree image -- renamed, pushed on its own branch nf-head (B5, 30.09.)
+g -C "$R" checkout -b nf-head main; echo nf >> "$R/python/flliper/__init__.py"; g -C "$R" commit -am c3; g -C "$R" push origin nf-head
+C3=$(git -C "$R" rev-parse HEAD)
 g -C "$R" checkout main; g -C "$R" fetch origin
-[ -n "$C0" ] && [ -n "$C1" ] && [ -n "$C2" ] || { echo "git fixture failed"; exit 2; }
+[ -n "$C0" ] && [ -n "$C1" ] && [ -n "$C2" ] && [ -n "$C3" ] || { echo "git fixture failed"; exit 2; }
 
 ID=sha256:$(printf 'ab%.0s' {1..32})
 OTHER=sha256:$(printf 'cd%.0s' {1..32})
@@ -138,6 +142,10 @@ EOF
   printf 'digest: %s\ngo: "ja, veroeffentlichen" (user, verbatim, 2026-09-26T19:00Z, via operator)\n' "$ID" > "$F/go/$HEX.go"
   touch -d '2026-09-26 19:00' "$F/go/$HEX.go"
 }
+# two <dir> <nf rev>: the baseline as a TWO-tree image (one_tree=0, NF head <nf rev>, NF verdict names it)
+two(){ local F=$1 nf=$2
+  setlabel "$F" io.github.efschu.flliper.one_tree 0; setlabel "$F" io.github.efschu.flliper.revision.nf "$nf"
+  sed -i "s/tree \`[0-9a-f]*\`/tree \`${nf:0:10}\`/" "$F/nf/verdict_nf.md"; }
 setlabel(){ local F=$1 k=$2 v=$3; grep -v "^$k=" "$F/labels.kv" > "$F/l.tmp"; [ "$v" = __DEL__ ] || echo "$k=$v" >> "$F/l.tmp"; mv "$F/l.tmp" "$F/labels.kv"; }
 
 # case <name> <expected red set, e.g. "1" / "2 6" / "-"> <expected rc> <mutation (eval'd, F set)> [gate args...]
@@ -146,6 +154,9 @@ case_(){ local name=$1 want=$2 wantrc=$3 mut=$4; shift 4
   mkdir -p "$F"; REVC=$C1; base "$F" "$C1"
   REGISTRY_ARG=(--registry ghcr.io/efschu/flliper); REMOTE_CHECK=tracking
   eval "$mut"
+  # the verdicts keep their base time: a mutation by sed/echo must not outdate the fixed Go file (the old time bomb:
+  # after 26.09. 19:00 every sed-mutated verdict turned lock 4 red on top). Lock 4's own mtime cases move the Go file.
+  for f in "$F/v27/verdict_r1.md" "$F/nf/verdict_nf.md"; do [ -f "$f" ] && touch -d '2026-09-26 18:00' "$f"; done
   out=$(env -u REGISTRY FAKE_DOCKER_STATE="$F" S_ROOT="" REPO="$R" REMOTE=origin REMOTE_CHECK="$REMOTE_CHECK" \
         VERDICT_27B_DIR="$F/v27" NF_VERDICT="${NFV-$F/nf/verdict_nf.md}" GO_DIR="$F/go" IMAGE=flliper-cand:test \
         SCAN_PATHS="$F/img/opt $F/img/etc $F/img/root" bash "$GATE" "${REGISTRY_ARG[@]}" "$@" 2>&1); rc=$?
@@ -169,7 +180,7 @@ case_(){ local name=$1 want=$2 wantrc=$3 mut=$4; shift 4
   EXPECT_PUSH=0; WANT_ACT=""
 }
 
-echo "== host_publish_flliper.sh self-test (fake docker $T/bin/docker; git fixture c0=${C0:0:10} c1=${C1:0:10} c2=${C2:0:10})"
+echo "== host_publish_flliper.sh self-test (fake docker $T/bin/docker; git fixture c0=${C0:0:10} c1=${C1:0:10} c2=${C2:0:10} c3=${C3:0:10})"
 # ---- all green ---------------------------------------------------------------------------------------------------------
 case_ "baseline plan --scan: all six green"                    -  0 ':' --scan
 case_ "baseline, REMOTE_CHECK=ls-remote"                       -  0 'REMOTE_CHECK=ls-remote' --scan
@@ -195,6 +206,22 @@ case_ "L2 commit unpushed (tracking refs)"                      2  3 'base "$F" 
 case_ "L2 commit unpushed (ls-remote)"                          2  3 'base "$F" $C2; REMOTE_CHECK=ls-remote' --scan
 case_ "L2 tree not renamed (no python/flliper)"                 2  3 'base "$F" $C0' --scan
 case_ "L2 commit unknown in repo"                               2  3 'X=$(printf "e%.0s" {1..40}); base "$F" $X' --scan
+# ---- lock 2, two trees (B5 30.09.: 27B head = revision, NF head on its own pushed branch, ls-remote proof) ----------------
+case_ "L2 two trees: nf pushed on its own branch (all green)"   -  0 'two "$F" $C3' --scan
+case_ "L2 two trees, REMOTE_CHECK=ls-remote for the 27B head"   -  0 'two "$F" $C3; REMOTE_CHECK=ls-remote' --scan
+case_ "L2 two trees: nf head unpushed"                          2  3 'two "$F" $C2' --scan
+case_ "L2 two trees: nf head not renamed"                       2  3 'two "$F" $C0' --scan
+case_ "L2 two trees: nf head unknown in repo"                   2  3 'two "$F" $(printf "e%.0s" {1..40})' --scan
+# no valid NF revision -> the NF verdict (naming c3) cannot be bound to a slot revision either: 2 and 3 red
+case_ "L2 two trees: nf revision not 40 hex"                "2 3" 3 'two "$F" ${C3:0:12}' --scan
+case_ "L2 one_tree=0 but one revision"                          2  3 'setlabel "$F" io.github.efschu.flliper.one_tree 0' --scan
+case_ "L2 one_tree=1 but two revisions"                     "2 3" 3 'two "$F" $C3; setlabel "$F" io.github.efschu.flliper.one_tree 1' --scan
+case_ "L2 one_tree label neither 0 nor 1"                       2  3 'setlabel "$F" io.github.efschu.flliper.one_tree yes' --scan
+case_ "L2 two trees: revision != revision.27b"                  2  3 'two "$F" $C3; setlabel "$F" io.github.efschu.flliper.revision.27b $C3' --scan
+case_ "L3 two trees: NF verdict names the 27B tree"             3  3 'two "$F" $C3; sed -i "s/tree \`[0-9a-f]*\`/tree \`${C1:0:10}\`/" "$F/nf/verdict_nf.md"' --scan
+S10=${C1:0:10}
+EXPECT_PUSH=1 WANT_ACT="TAG flliper:0.1.0-rc1-cu130 TAG flliper:cu130-$S10 TAG ghcr.io/efschu/flliper:cu130-$S10 PUSH ghcr.io/efschu/flliper:cu130-$S10 TAG ghcr.io/efschu/flliper:0.1.0-rc1-cu130 PUSH ghcr.io/efschu/flliper:0.1.0-rc1-cu130"
+case_ "PUBLISH two trees all green: tags carry the 27B sha10"  - 0 'two "$F" $C3' --publish
 # ---- lock 3 -------------------------------------------------------------------------------------------------------------
 case_ "L3 27B verdict names only the tag (arm as of today)"     3  3 'rm "$F/v27/facts_r1.kv"' --scan
 case_ "L3 27B verdict bound to another image id"                3  3 'echo "image_id=$OTHER" > "$F/v27/facts_r1.kv"' --scan

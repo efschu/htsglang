@@ -340,3 +340,23 @@ class TestPostcheck(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPublishGate(unittest.TestCase):
+    """B5 (30.09.): host_publish_flliper.sh lock 2 for TWO trees -- its own self-test (fake docker, git fixture with a
+    pushed NF head c3 on its own branch) must be all green: one-tree cases unchanged, two-tree cases green/red as
+    named, the old time bomb (sed-mutated verdicts outdating the fixed Go file) gone."""
+
+    @unittest.skipUnless(shutil.which("git"), "git missing")
+    def test_selftest_all_green(self):
+        st = D / "host_publish_flliper_selftest.sh"
+        r = subprocess.run(["bash", str(st)], capture_output=True, text=True, timeout=600)
+        tail = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-300:]
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:])
+        m = re.search(r"== (\d+) passed, (\d+) failed", r.stdout)
+        self.assertIsNotNone(m, tail)
+        self.assertEqual(m.group(2), "0")
+        self.assertGreaterEqual(int(m.group(1)), 63)
+        for name in ("L2 two trees: nf pushed on its own branch (all green)", "L2 two trees: nf head unpushed",
+                     "L3 two trees: NF verdict names the 27B tree", "PUBLISH two trees all green"):
+            self.assertIn(name, r.stdout)
