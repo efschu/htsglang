@@ -267,11 +267,24 @@ def edition_page(html: str, edition: str) -> str:
                 .replace('<h1 id="title">Rig-Dashboard</h1>', '<h1 id="title">fLLiper Dashboard</h1>', 1))
 
 
+#: per boot, what names the image, branch, profile or env (NF-Operator 30.09.: Startform, Image-SHAs,
+#: Zweig-, Profilnamen und Env-Schalter gehören zum Entwicklungsstand, im Release fehlen sie)
+RELEASE_DROP_IPC = ("launch", "rev", "profile", "image", "tag", "boot_id", "dir", "line", "container", "gpuq_id")
+RELEASE_DROP_META = ("launch", "tag", "sha", "profile", "image", "rev")
+
+
 def edition_snapshot(snap: dict, edition: str) -> dict:
     """/api/live of the release edition: the development state is not answered either."""
     if edition == "release":
         for k in RELEASE_DROP_KEYS:
             snap.pop(k, None)
+        for b in snap.get("boots") or []:
+            for k in RELEASE_DROP_IPC:
+                (b.get("ipc") or {}).pop(k, None)
+            for k in RELEASE_DROP_META:
+                (b.get("meta") or {}).pop(k, None)
+            if isinstance(b.get("container"), dict):
+                b["container"] = {k: v for k, v in b["container"].items() if k in ("State", "Status")}
         snap["edition"] = "release"
     return snap
 

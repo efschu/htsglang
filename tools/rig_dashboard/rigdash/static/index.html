@@ -818,6 +818,12 @@ function cacheHtml(b, now, awake) {
   </div>`;
 }
 
+// Release-Kopfzeile (NF-Operator 30.09.): kein Tag, keine REV/Image-SHA, kein Profil-, Zweig- oder
+// Container-Name, keine Startform/Env -- das bleibt der Rig-Ausgabe vorbehalten
+function relHead(b, ipc, topo) {
+  if (!ipc) return topo ? esc(topo) : "";
+  return `lifecycle <b>${esc(ipc.lifecycle)}</b>${ipc.cause && ipc.cause.code ? " (" + esc(ipc.cause.code) + ")" : ""}${topo ? " &middot; " + esc(topo) : ""} ${ipcTag("state.json")}`;
+}
 function bootCard(b, now, binders) {
   const m = b.meta || {};
   const c = b.container;
@@ -887,13 +893,13 @@ function bootCard(b, now, binders) {
         : `<span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "kein Log seit " + ago(b.age_s)}</span>`}
       ${b.live && ((b.alarm || {}).planned_stop || {}).t && !plannedStopped(b) ? `<span class="chip">Stopp angefordert ${hhmm(b.alarm.planned_stop.t)} (geplant)</span>` : ""}
       ${awake ? `<span class="badge phase">wach: ${esc(awake)}${frState ? " &middot; Front: " + esc(frState) : flipping ? " &middot; flippt" : ""}</span>` : ""}
-      ${c ? `<span class="chip ${c.State !== "running" ? "bad" : /unhealthy/.test(c.Status || "") ? "warn" : "ok"}">${esc(c.Names)} &middot; ${esc(c.Status)}</span>` : `<span class="chip warn">kein laufender Container zu diesem Log</span>`}
+      ${c ? `<span class="chip ${c.State !== "running" ? "bad" : /unhealthy/.test(c.Status || "") ? "warn" : "ok"}">${DEV ? esc(c.Names) : "Container"} &middot; ${esc(c.Status)}</span>` : `<span class="chip warn">kein laufender Container zu diesem Log</span>`}
       ${health.length && !plannedStopped(b) ? `<span class="chip bad">Gruppe ${health.map((h) => esc(h.group)).join(", ")} tot (WEG2-HEALTH)${srcOf(b, "A12")}</span>` : ""}
     </div>
     <div class="muted" style="font-size:12px;margin:-6px 0 10px">
-      <span class="mono">${esc(m.tag || b.stem)}</span>${ipc
+      ${!DEV ? relHead(b, ipc, topo) : `<span class="mono">${esc(m.tag || b.stem)}</span>${ipc
         ? ` &middot; REV ${esc(ipc.rev)} &middot; Profil ${esc(ipc.profile)} &middot; ${esc(ipc.image)} &middot; lifecycle <b>${esc(ipc.lifecycle)}</b>${ipc.cause && ipc.cause.code ? " (" + esc(ipc.cause.code) + ")" : ""}${topo ? " &middot; " + esc(topo) : ""} ${ipcTag("state.json " + (ipc.boot_id || ""))}`
-        : `${m.sha ? " &middot; Baum " + esc(m.sha) : ""}${topo ? " &middot; " + esc(topo) : ""}${LOGSRC}`}${fieldIpc(b, "A4") ? " &middot; " + esc(Object.entries(fieldIpc(b, "A4").value).map(([g, f]) => g + ": " + f).join(" | ")) + " " + ipcTag("state.json groups.form") : m.form ? " &middot; " + esc(m.form) + srcOf(b, "A4") : ""}
+        : `${m.sha ? " &middot; Baum " + esc(m.sha) : ""}${topo ? " &middot; " + esc(topo) : ""}${LOGSRC}`}`}${fieldIpc(b, "A4") ? " &middot; " + esc(Object.entries(fieldIpc(b, "A4").value).map(([g, f]) => g + ": " + f).join(" | ")) + " " + ipcTag("state.json groups.form") : m.form ? " &middot; " + esc(m.form) + srcOf(b, "A4") : ""}
       ${b.fields_summary ? ` &middot; <span class="muted" title="Felder aus Log: ${esc((b.fields_summary.log_keys || []).join(", "))}">Felder aus IPC ${b.fields_summary.ipc}/${b.fields_summary.n}</span>` : ""}
     </div>
     ${phaseHtml(b)}
@@ -918,7 +924,7 @@ function bootCard(b, now, binders) {
       </div>
     </div>
     ${cacheHtml(b, now, awake)}
-    ${ipc && Object.keys(ipc.launch || {}).length ? `<details id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform je Gruppe (argv + Schalter-Env) ${ipcTag("state.json groups.launch")}</summary><div class="launch mono">${Object.entries(ipc.launch).map(([g, l]) => `<div><b>${esc(g)}</b> ${esc((l.argv || []).join(" "))}</div>${Object.entries(l.env || {}).map(([k, v]) => `<div>&nbsp;&nbsp;${esc(k)}=${esc(v)}</div>`).join("")}`).join("")}</div></details>`
+    ${!DEV ? "" : ipc && Object.keys(ipc.launch || {}).length ? `<details id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform je Gruppe (argv + Schalter-Env) ${ipcTag("state.json groups.launch")}</summary><div class="launch mono">${Object.entries(ipc.launch).map(([g, l]) => `<div><b>${esc(g)}</b> ${esc((l.argv || []).join(" "))}</div>${Object.entries(l.env || {}).map(([k, v]) => `<div>&nbsp;&nbsp;${esc(k)}=${esc(v)}</div>`).join("")}`).join("")}</div></details>`
       : (m.launch || []).length ? `<details id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform (weg2-Launcher, ${m.launch.length} Kernzeilen aus dem Front-Log)${LOGSRC}</summary><div class="launch mono">${m.launch.map((l) => `<div>${esc(l)}</div>`).join("")}</div></details>` : ""}
     ${errs.length ? `<details id="err-${esc(b.stem)}" style="margin-top:10px"><summary>letzte Fehlerzeilen (${fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count)})${srcOf(b, "A13")}</summary>${errs.map((e) => `<div class="err mono">${hhmm(e.t)} [${esc(e.group)}] ${esc(e.text)}</div>`).join("")}</details>` : ""}
   </section>`;

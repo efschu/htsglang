@@ -51,6 +51,29 @@ class TestEdition(unittest.TestCase):
         self.assertIn("boots", out)
         self.assertEqual(server.edition_snapshot(dict(snap), "rig"), snap)
 
+    def test_release_boot_card_hides_build_identity(self):
+        # NF-Operator 30.09.: Startform je Gruppe (argv + Schalter-Env), Image-SHAs, Zweig-, Profilnamen
+        # und Env-Schalter gehören in den Entwicklungsteil: im Release weder auf der Seite noch in /api/live
+        self.assertIn('${!DEV ? "" : ipc && Object.keys(ipc.launch || {}).length', self.html)
+        self.assertIn("${!DEV ? relHead(b, ipc, topo) :", self.html)
+        self.assertIn('${DEV ? esc(c.Names) : "Container"}', self.html)
+        head = self.html[self.html.index("function relHead("):self.html.index("function bootCard(")]
+        for w in ("rev", "profile", "image", "tag", "boot_id", "launch", "env", "Names"):
+            self.assertNotIn("ipc." + w, head, w)
+        mk = lambda: {"stem": "x", "meta": {"tag": "nfh91-profil", "sha": "abc", "launch": ["--x"], "model": "M"},
+                "container": {"Names": "htsglang-acc-nf-h91", "State": "running", "Status": "Up"},
+                "ipc": {"launch": {"P": {"argv": ["--tp-size", "1"], "env": {"SGLANG_X": "1"}}}, "rev": "62357f2ba1",
+                        "profile": "nf-h91", "image": "htsglang:cu130-weg2", "tag": "nfh91", "boot_id": "nfh91-boot",
+                        "dir": "/spinning/docker-acceptance/nf/state/nfh91-boot", "lifecycle": "serving"}}
+        out = server.edition_snapshot({"boots": [mk()]}, "release")
+        blob = repr(out)
+        for w in ("62357f2ba1", "nf-h91", "nfh91", "cu130", "SGLANG_X", "--tp-size", "htsglang-acc", "abc"):
+            self.assertNotIn(w, blob, w)
+        self.assertEqual(out["boots"][0]["ipc"]["lifecycle"], "serving")
+        self.assertEqual(out["boots"][0]["container"], {"State": "running", "Status": "Up"})
+        rig = server.edition_snapshot({"boots": [mk()]}, "rig")
+        self.assertEqual(rig["boots"][0]["ipc"]["rev"], "62357f2ba1")
+
     def test_one_logo(self):
         # the word mark and the square mark were BOTH shown: 'header .brand img {display:block}' (0,1,2)
         # beat 'header .logo-mark {display:none}' (0,1,1).  The hide rule must be at least as specific.
