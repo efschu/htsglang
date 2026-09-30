@@ -2229,6 +2229,23 @@ def d_reshard_env() -> Dict[str, str]:
 D_GC_FREEZE_DEFAULT = "off"
 
 
+def apply_p_gc_warn_default(ns) -> Optional[str]:
+    """30.09. (NF y3z ep52: PP0 stood still 5.4 s process-wide at the first
+    tag of P's sleep; a gen-2 GC is one candidate): group P's schedulers arm
+    the GC warning at 0.5 s by default -- ``SGLANG_WEG2_GC_WARN_SECS`` into
+    ``ns.env_p`` unless --env-p states it (=0 turns it off). Returns the line
+    naming it, or None."""
+    from sglang.srt.weg2 import gc_instrument as _gci
+
+    env_p = str(getattr(ns, "env_p", "") or "")
+    if _gci.WARN_ENV in parse_group_env(env_p):
+        return None
+    ns.env_p = set_group_env(env_p, _gci.WARN_ENV, f"{_gci.P_GC_WARN_DEFAULT_S:g}")
+    return (f"WEG2-GC P warn: --env-p {_gci.WARN_ENV}={_gci.P_GC_WARN_DEFAULT_S:g} (every P "
+            f"scheduler logs a GC collection over {_gci.P_GC_WARN_DEFAULT_S:g} s after boot; "
+            f"--env-p {_gci.WARN_ENV}=0 = off)")
+
+
 def d_gc_env(ns) -> Dict[str, str]:
     from sglang.srt.weg2 import gc_instrument as _gci
 
@@ -22581,6 +22598,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # H91b/H95: the Next-Flash form's own D seat bound (6, dynamic 1..6 per
     # phase) and its pool waves, before anything reads --d-bs or --env-d.
     apply_profile_d_bs_default(ns, list(sys.argv[1:] if argv is None else argv))
+    _p_gc_line = apply_p_gc_warn_default(ns)  # NF y3z ep52: gen-2 GC on P named
+    if _p_gc_line:
+        print(_p_gc_line, flush=True)
     _h95_waves_line = apply_profile_d_pool_waves_default(ns)
     if _h95_waves_line:
         print(_h95_waves_line, flush=True)

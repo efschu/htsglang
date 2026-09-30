@@ -186,6 +186,7 @@ TMS_RING_GRANULE_BYTES = 2 * 1024 * 1024
 from sglang.srt.weg2 import host_ledger as hl  # noqa: E402
 from sglang.srt.weg2 import lane_coverage as wlc  # noqa: E402
 from sglang.srt.weg2 import ring_guard  # noqa: E402
+from sglang.srt.weg2 import tag_stall_sentinel as _tag_stall  # noqa: E402
 from sglang.srt.weg2.ring_guard import RingNeedGuard  # noqa: E402
 
 #: The POPULATION token every ``WEG2-FLIP-TAG`` line carries, read back by
@@ -9239,6 +9240,12 @@ class SchedulerWeightUpdaterManager:
                     # needs can run -- which is the ordering boot weg2xsn30
                     # did not have. The buffer holds a whole tag (Option 1),
                     # so this completes without its collector.
+                    # TAG-STALL-SENTINEL (NF y3z ep52: PP0 5.4 s process-wide
+                    # still at the first tag of P's sleep): faulthandler's C
+                    # watchdog writes every thread's stack if this tag outlives
+                    # SGLANG_WEG2_TAG_STALL_SENTINEL_S -- GIL held or not.
+                    _stall = _tag_stall.arm(tag, rank=self._weg2_rank(),
+                                            group=self._weg2_group_name())
                     _t_dep0 = time.perf_counter()
                     _gap_ms = ((_t_dep0 - _t_prev_end) * 1000
                                if _t_prev_end is not None else 0.0)
@@ -9292,6 +9299,7 @@ class SchedulerWeightUpdaterManager:
                         # front log is wall-clock ms, so the legs align on it
                         time.time() - (time.perf_counter() - _t_dep0),
                         time.time())
+                    _tag_stall.disarm(_stall)  # names the dump if it fired
             # #1360b: ONE `WEG2-RING NEED` LINE PER SAVED TAG, not per
             # ring-carried tag.  The loop above guards the `weights_*` family
             # because those are the tags whose bytes the peer has to release --
