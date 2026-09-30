@@ -172,3 +172,11 @@ class DualPPause(CustomTestCase):
         off = L.build_parser().parse_args(["--tree", "/x", "--tag", "t"])
         self.assertEqual(L.dual_kv_ledger_paths(off, cards), [])
 
+    def test_ranks_and_front_share_the_ledger_namespace(self):
+        from sglang.srt.weg2 import launcher as L
+
+        ns = L.build_parser().parse_args(["--tree", "/x", "--tag", "boot7", "--dual-share"])
+        L.resolve_dual_layout(ns)
+        for g in ("P", "D"):
+            self.assertEqual(L.dual_share_env(ns, g)["SGLANG_WEG2_DUAL_KV_TAG"], "boot7")
+

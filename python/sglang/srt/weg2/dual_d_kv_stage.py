@@ -206,7 +206,7 @@ def attach(runner) -> Optional[DKvStage]:
 
     dev = torch.device("cuda", int(runner.gpu_id))
     card = str(torch.cuda.get_device_properties(dev).uuid)
-    tag = os.environ.get("SGLANG_WEG2_TAG", "weg2")
+    tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
     ledger = CardKvLedger(ledger_path(tag, card), "D")
     pool = runner.token_to_kv_pool
     pools = [pool] + ([pool.full_kv_pool] if hasattr(pool, "full_kv_pool") else [])

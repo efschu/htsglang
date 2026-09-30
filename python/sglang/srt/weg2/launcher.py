@@ -13652,7 +13652,10 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
            "SGLANG_WEG2_UNION_ROLES": "main",
            # Both groups stay awake: rank-side rules that assume the other
            # group sleeps read this (scheduler._weg2_store_short_max_cycles).
-           "SGLANG_WEG2_DUAL_LAYOUT": "1"}
+           "SGLANG_WEG2_DUAL_LAYOUT": "1",
+           # the card KV ledgers' name space: the ranks derive the same path
+           # as the front (dual_kv_ledger_paths) from this tag
+           "SGLANG_WEG2_DUAL_KV_TAG": str(ns.tag)}
     if group == "P" and str(getattr(ns, "dual_unified_kv", "off")) == "on":
         # unified KV (user orders 30.09. 07:10Z/07:25Z): P's pool is virtually
         # this big; its pages come from the card pool (weg2/dual_p_kv_stage.py)

@@ -243,7 +243,7 @@ def attach(runner) -> Optional["PKvStage"]:
 
     dev = torch.device("cuda", int(runner.gpu_id))
     card = str(torch.cuda.get_device_properties(dev).uuid)
-    tag = os.environ.get("SGLANG_WEG2_TAG", "weg2")
+    tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
     ledger = CardKvLedger(ledger_path(tag, card), "P")
     pool = runner.token_to_kv_pool
     pools = [pool] + ([pool.full_kv_pool] if hasattr(pool, "full_kv_pool") else [])
@@ -328,7 +328,7 @@ def pp0_grant(sched, req) -> Optional[int]:
 
     from sglang.srt.weg2.card_kv_ledger import CardKvLedger
 
-    tag = os.environ.get("SGLANG_WEG2_TAG", "weg2")
+    tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
     pp = int(getattr(getattr(sched, "ps", None), "pp_size", 1) or 1)
     stages = []
     for r in range(pp):
