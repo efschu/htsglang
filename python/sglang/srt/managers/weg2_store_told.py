@@ -302,6 +302,28 @@ def follower_limit_tokens(tree, told: int) -> int:
     return int(told) + bigram
 
 
+def told_read_min_tokens(limit_tokens: Optional[int], tail_min: Optional[int]) -> Optional[int]:
+    """TS (NF y4a b547263cb8, death 03:36:24, rid weg2-50-159): the smallest
+    read a registration may issue. A read bounded by a TOLD (``limit_tokens``:
+    a follower's #1400 registration, a told refetch plan) is PRESCRIBED -- PP0
+    already admitted that prefix -- so the #915 ``prefetch_threshold`` (256),
+    which prices whether opening a FRESH read is worth it, does not apply: 1.
+    Otherwise the caller's own minimum (store-short tail, park read) or None
+    = the tree's threshold, unchanged.
+
+    The seam: PP0 registered 50-159 at head 94080 (span 10241 >= 256), its
+    read matched 1152 host tokens and loaded 64 from the store: told 95296.
+    One pass later PP1/PP2 registered at told with their host walk already at
+    95232 (the source's pages had landed): need 64 < 256, ``#915 PREFETCH
+    REFUSED reason=too_short``, ``FOLLOWER REGISTRATION DECLINED``, then
+    ``Weg2StoreToldMismatch told=95296 own_prefix=95232`` on both followers,
+    W17 GroupDead. Same page keys, same store: the follower CAN read the 64
+    tokens PP0 read; it only refused to open the read."""
+    if limit_tokens is not None:
+        return 1
+    return tail_min
+
+
 def prefix_cap_tokens(tree, told: int) -> int:
     """TK (#1419 with told > 0): the RAW-token cap that lets the radix match
     reach exactly ``told`` KEYS. ``_weg2_cap_key_limit`` feeds it to

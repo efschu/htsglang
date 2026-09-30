@@ -7579,6 +7579,9 @@ class Scheduler(
         _park_min = _weg2_park_read.park_read_min_tokens(req)
         if _park_min is not None:
             _tail_min = _park_min if _tail_min is None else min(int(_tail_min), int(_park_min))
+        # TS (y4a death 03:36:24): a read bounded by a told is prescribed --
+        # the #915 threshold does not refuse it (follower need 64 < 256).
+        _tail_min = weg2_store_told.told_read_min_tokens(limit_tokens, _tail_min)
         _tail_kw = {"min_tokens": _tail_min} if _tail_min is not None else {}
         _tail_kw.update(_prefetch_namespace_kw(self.tree_cache, req))
         if group_decides:
