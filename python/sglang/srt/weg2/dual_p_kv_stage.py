@@ -463,6 +463,23 @@ def with_dual_kv(told, req):
     return told
 
 
+def flush_acks_when_idle(sched) -> bool:
+    """DUAL-TP3PP3 (metal qu97hh): an idle P stage drains its write-through
+    acks. The batch path flushes them once per iteration; an idle PP stage runs
+    only on_idle, so a finished tail's ack sat unprocessed for 25 s and D's
+    store read stayed short until it gave up (W50 re-route, 66-71 s instead of
+    28-31 s per long prompt). In the flip form P sleeps and its seam flushes;
+    in the dual layout P never sleeps. Dual + group P + hicache only."""
+    if str(os.environ.get("SGLANG_WEG2_DUAL_LAYOUT", "")).strip() != "1":
+        return False
+    if str(os.environ.get("SGLANG_WEG2_GROUP", "")).strip().upper() != "P":
+        return False
+    if not getattr(sched, "enable_hierarchical_cache", False):
+        return False
+    sched.tree_cache.flush_write_through_acks()
+    return True
+
+
 def on_idle(sched) -> int:
     """A fully idle P rank gives its whole context back: device tree evicted
     (write-back keeps the pages in L2), then unmapped and released."""
