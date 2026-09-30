@@ -3681,6 +3681,19 @@ def _env_switch_on(name: str) -> bool:
     return str(os.environ.get(name, "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_switch_on_or_profile(name: str) -> bool:
+    """An explicitly set switch keeps its parse (1/true/yes/on); unset or blank
+    takes the published form's registry row (weg2/form.py
+    PROFILE_SWITCH_DEFAULTS -- LS6 30.09.: qwen27b DC_OFF_PATH on), off
+    without a form."""
+    raw = os.environ.get(name)
+    if raw is not None and raw.strip():
+        return _env_switch_on(name)
+    from sglang.srt.weg2.form import profile_switch_default
+
+    return bool(profile_switch_default(name, False))
+
+
 
 #: DUAL-TP3PP3: why every flip is refused under --dual-layout.
 DUAL_NO_FLIP_WHY = ("--dual-layout: both groups stay awake and the front never flips "
@@ -4045,7 +4058,7 @@ class Front:
         # line names all three (flipfast_line), so a boot's log says which ran.
         self._kick_on: Dict[str, bool] = {
             why: _env_switch_on(env) for why, env in CTL_KICK_REASONS.items()}
-        self._dc_off_path = _env_switch_on(DC_OFF_PATH_ENV)
+        self._dc_off_path = _env_switch_on_or_profile(DC_OFF_PATH_ENV)
         # The kick event is created lazily in the running loop (_ctl_evt), so a
         # Front built outside a loop -- the unit tests, main() -- binds nothing.
         self._ctl_evt_obj: Optional[asyncio.Event] = None

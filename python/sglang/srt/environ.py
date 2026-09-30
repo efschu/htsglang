@@ -719,7 +719,19 @@ class Envs:
     # the launcher hands its own environment to the front and to every rank
     # (build_env / fenv = dict(os.environ)), so export it in the arm.
     # False = the 50 ms poll and the unconditional want, byte-identical.
-    SGLANG_WEG2_QUIESCE_FAST = EnvBool(False)
+    # LS6 (30.09.): default = the published form's row (weg2/form.py
+    # ModelProfile.front_quiesce_fast, qwen27b on -- z30y5m 13 WEG2-QUIESCE-FAST
+    # lines, until then only the 27B arm set it; nextflash off, NF H111 decides);
+    # off without a form; an explicit value wins.
+    SGLANG_WEG2_QUIESCE_FAST = EnvBool(_profile_default("SGLANG_WEG2_QUIESCE_FAST", False))
+    # LS6 (30.09.): the profile-default contract entries of the two other env
+    # switches of the six (UNIFY S2: one environ entry per registry switch).
+    # Their rank-side readers keep their own parse of an explicit value and
+    # ask the same registry when unset/blank: front._env_switch_on_or_profile
+    # (DC_OFF_PATH, ModelProfile.front_dc_off_path) and layers/dcp/comm.
+    # lse_merge_mode (DCP_LSE_MERGE, ModelProfile.d_dcp_lse_merge).
+    SGLANG_WEG2_DC_OFF_PATH = EnvBool(_profile_default("SGLANG_WEG2_DC_OFF_PATH", False))
+    SGLANG_DCP_LSE_MERGE = EnvStr(_profile_default("SGLANG_DCP_LSE_MERGE", "ar"))
     SGLANG_WEG2_QUIESCE_FAST_POLL_MS = EnvInt(10)
     # IDLE_VOTE_NO_REWANT (27B rc12z21 park boot dkr27bparkdraftbar1w109281421,
     # flip epoch=5 14:28:08-14:29:38): the H111 guard ALONE, without the fast

@@ -68,7 +68,11 @@ def test_chunk_policy_cli_default_follows_the_row(profile, model, argv, want):
 
 
 @pytest.mark.parametrize("argv,want", [
-    ((), "fixed"),                                   # no graph: baseline 4096 > max 2048
+    # LS6 (30.09.): the INT8 row now also gives --p-prefill-graph 512, so an
+    # argv without graph flags runs the measured dynamic form; "no graph" is
+    # an explicit --p-prefill-graph 0.
+    ((), "dynamic"),
+    (("--p-prefill-graph", "0"), "fixed"),           # no graph: baseline 4096 > max 2048
     (("--p-prefill-graph", "4096"), "fixed"),        # bucket above max 2048
     (("--p-prefill-graph", "2048"), "dynamic"),
     (("--p-chunk-fixed", "1024"), "dynamic"),        # a baseline under the max, no graph

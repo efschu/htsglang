@@ -582,6 +582,29 @@ class ModelProfile:
     #: qwen27b on (30.09.); nextflash off here -- NF decides its own default
     #: (KR pick e17bd548b5). Explicit env wins.
     d_release_fixes: bool = False
+    #: LS6 (30.09., Leistungsschalter class b', metal proof z30y5m
+    #: dkr27browauthoritybar1fs09301128, cfdb9b50b3: 15/15, group death 0,
+    #: needle MATCH; check_ls12.py GRUEN). Every 27B profile has run them since
+    #: RC2/RC9; these fields make them the code default of the row, an explicit
+    #: env / flag wins, NF keeps its own (off) values.
+    #: SGLANG_WEG2_DC_OFF_PATH -- 'WEG2-DC-OFFPATH epoch=' 11 per boot (the
+    #: post-wake residue reading off the flip, F1 flipfast).
+    front_dc_off_path: bool = False
+    #: SGLANG_WEG2_QUIESCE_FAST -- 'WEG2-QUIESCE-FAST group=' 13 per boot
+    #: (10-ms quiesce poll, H111); set so far only by the 27B arm.
+    front_quiesce_fast: bool = False
+    #: SGLANG_DCP_LSE_MERGE on group D's DCP -- 'DCP-MERGE-BLOCK ... mode=a2a'
+    #: 3/3 ranks, needle MATCH (a2a is not bit-identical to ar; the needle is
+    #: the gate). "ar" = the code default.
+    d_dcp_lse_merge: str = "ar"
+    #: --p-host-overlap -- '#PGAP ... overlap=1' 756/756 forwards.
+    p_host_overlap: bool = False
+    #: --p-prefill-graph TOKENS on the checkpoint formats listed in
+    #: ``p_prefill_graph_formats`` -- 'PREFILL-GRAPH captured backend=full'
+    #: 3/3 PP stages. 0 = off (the code default). GGUF runs without it (27b-
+    #: gguf.env passes none), so the row lists the formats that do.
+    p_prefill_graph: int = 0
+    p_prefill_graph_formats: Tuple[str, ...] = ()
     #: 27B row 24b: --d-token-placement (weg2/d_token_placement.py) -- where
     #: group D's NEW KV tokens land. The launcher's DEFAULT for an unset flag
     #: on a checkpoint whose registry format is in ``d_token_placement_formats``
@@ -621,6 +644,11 @@ class ModelProfile:
             out[env_name] = bool(self.d_hostgap_base)
         for env_name in RELEASE_FIX_SWITCHES:
             out[env_name] = bool(self.d_release_fixes)
+        # LS6 (30.09.): the three env switches of the six (the other three are
+        # launcher flags: launcher.PROFILE_ARG_DEFAULTS).
+        out["SGLANG_WEG2_DC_OFF_PATH"] = bool(self.front_dc_off_path)
+        out["SGLANG_WEG2_QUIESCE_FAST"] = bool(self.front_quiesce_fast)
+        out["SGLANG_DCP_LSE_MERGE"] = str(self.d_dcp_lse_merge)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -802,6 +830,14 @@ PROFILES: Dict[str, ModelProfile] = {
         d_hostgap_base=True,
         # release-draft bug fixes (DEDUP_CARRY, CENSUS_O1_EVICT) -- see the field.
         d_release_fixes=True,
+        # LS6 (30.09.): proven on metal in z30y5m dkr27browauthoritybar1fs09301128
+        # -- see the fields. --p-trim-end-anchor follows end_anchor="trim".
+        front_dc_off_path=True,
+        front_quiesce_fast=True,
+        d_dcp_lse_merge="a2a",
+        p_host_overlap=True,
+        p_prefill_graph=512,
+        p_prefill_graph_formats=("int8", "nvfp4", "fp8"),
         # row 24b: bandwidth on INT8 only (rc9meas -1.1 ... -3.1 % in depth).
         # --d-reshard stays off (wake-seg + drq: gain at 6 of 24 points, the
         # drq preset has no A/B of its own -- inventory class b).
@@ -961,6 +997,8 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: :data:`HG_SWITCHES` (``d_hostgap_levers``, 27B row 24h, on 29.09.).
 #: :data:`HG_BASE_SWITCHES` (``d_hostgap_base``, 27B row 24h, on 30.09.).
 #: :data:`RELEASE_FIX_SWITCHES` (``d_release_fixes``, 27B bug fixes, on 30.09.).
+#: SGLANG_WEG2_DC_OFF_PATH / SGLANG_WEG2_QUIESCE_FAST / SGLANG_DCP_LSE_MERGE
+#: (``front_dc_off_path`` / ``front_quiesce_fast`` / ``d_dcp_lse_merge``, LS6 30.09.).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }

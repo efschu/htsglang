@@ -381,7 +381,16 @@ def lse_merge_mode() -> str:
     if _LSE_MERGE["mode"] is None:
         import os
 
-        v = str(os.environ.get("SGLANG_DCP_LSE_MERGE", "ar")).strip().lower()
+        v = str(os.environ.get("SGLANG_DCP_LSE_MERGE", "")).strip().lower()
+        if not v:
+            # LS6 (30.09.): unset/blank takes the published form's registry row
+            # (weg2/form.py ModelProfile.d_dcp_lse_merge: qwen27b a2a -- z30y5m
+            # 'DCP-MERGE-BLOCK mode=a2a' 3/3, needle MATCH; nextflash ar); "ar"
+            # without a form. Rank-uniform: every rank of a group reads the
+            # same published form.
+            from sglang.srt.weg2.form import profile_switch_default
+
+            v = str(profile_switch_default("SGLANG_DCP_LSE_MERGE", "ar")).strip().lower()
         _LSE_MERGE["mode"] = "a2a" if v in ("a2a", "rs", "reduce_scatter") else "ar"
     return _LSE_MERGE["mode"]
 

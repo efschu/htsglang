@@ -16944,11 +16944,22 @@ PROFILE_ARG_DEFAULTS: Tuple[Tuple[str, str, Callable[[str, object], object]], ..
     # (qwen27b dynamic on INT8, chunkab rc9j 128k -13.6 %) -- and only when
     # the flags make that form RUNNABLE (_p_chunk_dynamic_runnable: the rc9j
     # form ran with --p-prefill-graph 512); NF row fixed.
+    ("--p-prefill-graph", "p_prefill_graph",
+     lambda p, ns: _row_format_default(p, ns, int(_profile_row_or_27b(p).p_prefill_graph),
+                                       _profile_row_or_27b(p).p_prefill_graph_formats,
+                                       P_PREFILL_GRAPH_DEFAULT)),
     ("--p-chunk-policy", "p_chunk_policy",
      lambda p, ns: (_row_format_default(p, ns, _profile_row_or_27b(p).chunk.policy,
                                         _profile_row_or_27b(p).chunk.default_formats,
                                         P_CHUNK_POLICY_DEFAULT)
                     if _p_chunk_dynamic_runnable(ns) else P_CHUNK_POLICY_DEFAULT)),
+    # LS6 (30.09., metal z30y5m dkr27browauthoritybar1fs09301128: 15/15, needle
+    # MATCH): the row's P forms. ORDER: --p-prefill-graph BEFORE --p-chunk-policy,
+    # whose runnability check reads the graph bucket.
+    ("--p-trim-end-anchor", "p_trim_end_anchor",
+     lambda p, ns: _profile_row_or_27b(p).end_anchor == "trim"),
+    ("--p-host-overlap", "p_host_overlap",
+     lambda p, ns: bool(_profile_row_or_27b(p).p_host_overlap)),
     # 27B row 24b: bandwidth on the formats the row measured it on (INT8).
     ("--d-token-placement", "d_token_placement",
      lambda p, ns: _row_format_default(p, ns, _profile_row_or_27b(p).d_token_placement,
@@ -16996,11 +17007,17 @@ def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
         "d_replayssm_spec": D_REPLAYSSM_SPEC_DEFAULT,
         "p_chunk_policy": P_CHUNK_POLICY_DEFAULT,
         "d_token_placement": D_TOKEN_PLACEMENT_DEFAULT,
+        "p_prefill_graph": P_PREFILL_GRAPH_DEFAULT,
+        "p_trim_end_anchor": False,
+        "p_host_overlap": False,
     }
     profile = getattr(ns, "profile", None) or PROFILE_QWEN27B
     changed: List[str] = []
     for flag, dest, of in PROFILE_ARG_DEFAULTS:
-        if weg2_form.flag_given(argv_words, flag) or not hasattr(ns, dest):
+        # A store_true flag's "--no-" twin (LS6) counts as given, too.
+        if (weg2_form.flag_given(argv_words, flag)
+                or weg2_form.flag_given(argv_words, "--no-" + flag[2:])
+                or not hasattr(ns, dest)):
             continue
         if getattr(ns, dest) != parser_default[dest]:
             continue
@@ -21604,7 +21621,11 @@ def build_parser() -> argparse.ArgumentParser:
              "stage) never runs. prompt_tokens and the #1442 hand-off still carry "
              "all N; N<2, read outputs, sessions, input embeds and multimodal "
              "prompts keep today's split. Adds SGLANG_WEG2_P_TRIM_END_ANCHOR=1 to "
-             "group P only; default off = argv and env byte-identical.")
+             "group P only. Code default off (argv and env byte-identical); an UNSET "
+             "flag takes the booted row (end_anchor=trim: qwen27b on since LS6 30.09.).")
+    ap.add_argument(
+        "--no-p-trim-end-anchor", dest="p_trim_end_anchor", action="store_false",
+        help="Turn --p-trim-end-anchor off against the registry row's default (A/B arm).")
     ap.add_argument(
         "--fork-anchor-token", type=int, default=None, metavar="ID",
         help="FORK ANCHOR (27B line, weg2/fork_anchor.py): the chat template's "
@@ -22307,7 +22328,12 @@ def build_parser() -> argparse.ArgumentParser:
              "publish moves from the plan to right after the next launch. "
              "Measured reason (weg2xsn420, 4x98k): PP2 pass 873 ms vs 733 "
              "gpu-ms, ~95-140 ms card idle per 4096 chunk, flat over depth. "
-             "Default off = argv and env byte-identical to before.",
+             "Code default off = argv and env byte-identical to before; an UNSET "
+             "flag takes the booted row (p_host_overlap: qwen27b on since LS6 30.09.).",
+    )
+    ap.add_argument(
+        "--no-p-host-overlap", dest="p_host_overlap", action="store_false",
+        help="Turn --p-host-overlap off against the registry row's default (A/B arm).",
     )
     ap.add_argument(
         "--p-recv-stream", action="store_true",
