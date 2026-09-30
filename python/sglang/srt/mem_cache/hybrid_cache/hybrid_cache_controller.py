@@ -1134,7 +1134,11 @@ class HybridCacheController(BaseHiCacheController):
         # without a recurrent state; PP0's adder ends a chunk at its depth.
         p_fork_cut.note_store_uncapped(
             getattr(operation, "request_id", None),
-            getattr(hit_result, "kv_uncapped", 0),
+            # QS: the fork stands on what every ALL_PAGES pool holds with KV
+            p_fork_cut.store_fork_pages(
+                getattr(hit_result, "kv_uncapped", 0),
+                getattr(hit_result, "all_pages_uncapped", None),
+            ),
             kv_hit_pages,
         )
 

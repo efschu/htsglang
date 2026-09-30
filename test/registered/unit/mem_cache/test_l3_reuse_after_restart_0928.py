@@ -315,8 +315,11 @@ def test_b_no_write_evict_ping_pong(tmp_path, monkeypatch):
     kv.free_slots([slot])
     fresh = "h00" + "cd" * 30
     _put(kv, be._get_suffixed_key(fresh), KV_TOTAL, 0x11)
+    # QS (30.09.): a KV page reaches L3 only with its QSA index -- the fresh
+    # page's index is in the QSA arena, the pass writes both
+    _put(be._arenas[Q_TOTAL], be._get_suffixed_key(f"{fresh}.{PoolName.QSA_INDEXER}"), Q_TOTAL, 0x12)
     r = be.l3_write_behind_pass()
-    assert r["written"] == 1 and os.path.exists(be._existing_path(be._get_suffixed_key(fresh)))
+    assert r["written"] == 2 and os.path.exists(be._existing_path(be._get_suffixed_key(fresh)))
 
 
 def test_b_a_refused_reservation_ends_the_arena_pass(tmp_path, monkeypatch):
@@ -333,8 +336,10 @@ def test_b_a_refused_reservation_ends_the_arena_pass(tmp_path, monkeypatch):
 
     be._evictor.reserve = _refuse
     r = be.l3_write_behind_pass()
-    assert r["written"] == 0 and r["refused"] == 2
-    assert len(calls) == 2, "one refused reservation per arena, not one per page"
+    # QS (30.09.): the QSA arena goes first; its refusal leaves every KV page
+    # waiting for its index (pending), so the KV arena asks no reservation
+    assert r["written"] == 0 and r["refused"] == 1 and r["pending"] == 2 * PAGES
+    assert len(calls) == 1, "one refused reservation per arena, not one per page"
     assert all(s == 2 for s in be._arenas[KV_TOTAL].find_states(
         [be._get_suffixed_key(h) for h in hs])), "L2 untouched"
     kv = be._arenas[KV_TOTAL]

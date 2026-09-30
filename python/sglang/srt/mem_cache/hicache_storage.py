@@ -762,6 +762,10 @@ class PoolTransferResult:
     keys_asked: int = 0
     kv_uncapped: int = 0
     zero_capped_pools: tuple = ()
+    #: QS: the leading pages EVERY claim-capping ALL_PAGES pool (the QSA
+    #: index) holds together with KV -- ``min(kv_uncapped, boundary)`` over
+    #: those pools; None = not computed (v1 probe). The P fork reads it.
+    all_pages_uncapped: Optional[int] = None
 
     @classmethod
     def empty(cls) -> PoolTransferResult:
@@ -3125,7 +3129,14 @@ class HiCacheFile(HiCacheStorage):
             return tot
         fsync = canonical_fsync_default()
         chunk = 64
-        for arena in [a for a in list((getattr(self, "_arenas", None) or {}).values()) if a is not None]:
+        # QS: the QSA index arena goes first, so a KV page's index is on disk
+        # before the KV page itself is asked (the pair gate below)
+        _qsa = getattr(self, "canonical_qsa_page", None)
+        _q_bytes = int(_qsa.total_bytes) if _qsa is not None else None
+        _arenas = [a for a in list((getattr(self, "_arenas", None) or {}).values()) if a is not None]
+        _arenas.sort(key=lambda a: 0 if int(getattr(a, "slot_bytes", -1)) == _q_bytes else 1)
+        tot["unpaired"] = 0
+        for arena in _arenas:
             tot["arenas"] += 1
             nslots = int(arena.slots)
             sec = getattr(arena, "_l3wb_sec", None)
@@ -3153,6 +3164,19 @@ class HiCacheFile(HiCacheStorage):
                                                   count=len(stems)))[0]
             if not todo.shape[0]:
                 continue
+            # QS: a KV page waits for its QSA index on disk (the QSA arena went
+            # first); one whose index is in neither tier is not written -- it
+            # is asked again next pass, bounded by the census of NEW pages
+            allowed, pair = self._l3_pair_gate(arena, [stems[i] for i in todo.tolist()],
+                                               "write_behind", copy_sidecars=False)
+            if pair["kv_unpaired"] or pair["kv_waiting"]:
+                keep = np.fromiter((stems[i] in allowed for i in todo.tolist()), dtype=bool,
+                                   count=int(todo.shape[0]))
+                tot["unpaired"] += pair["kv_unpaired"]
+                tot["pending"] += pair["kv_waiting"]
+                todo = todo[keep]
+                if not todo.shape[0]:
+                    continue
             total = int(arena.slot_bytes)
             cap = max(1, budget // max(1, total))
             tot["pending"] += max(0, int(todo.shape[0]) - cap)
@@ -3422,7 +3446,7 @@ class HiCacheFile(HiCacheStorage):
         cands = self._arena_evict_candidates(arena, int(want), int(want if need is None else need), keep)
         if not cands:
             return 0
-        moved = self.arena_secure_to_disk(arena, cands)["written"]
+        moved = self.arena_secure_to_disk(arena, cands, writer="evict_clock")["written"]
         _free_named(arena, [c[0] for c in cands], "evict_to_disk")
         arena.reap_stale()
         stems = getattr(arena, "_stems", {})
@@ -3455,7 +3479,7 @@ class HiCacheFile(HiCacheStorage):
             cands += _hp.evict_ordered(arena, order, need - len(cands), protect_lo=protect, site="l3fill")
         return cands
 
-    def arena_secure_to_disk(self, arena, cands) -> dict:
+    def arena_secure_to_disk(self, arena, cands, writer: str = "claim_room") -> dict:
         """#257 (d): give every EVICTING candidate ``(slot, key_lo, key_hi,
         total)`` an L3 copy before its slot is freed -- the disk half of
         ``_arena_evict_to_disk``, shared with the claim-time room of
@@ -3468,7 +3492,7 @@ class HiCacheFile(HiCacheStorage):
         COMPLETE pages with no disk copy (#1427 stage i, 49 unlogged drops on
         PP0 between 06:17:41 and 06:22:29); the probe had counted them, the
         read found neither slot nor file and ended at page 219 of 813."""
-        out = {"on_disk": 0, "written": 0, "lost": 0}
+        out = {"on_disk": 0, "written": 0, "lost": 0, "unpaired": 0}
         if not cands:
             return out
         from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
@@ -3482,6 +3506,10 @@ class HiCacheFile(HiCacheStorage):
             stem = stems.get((lo, hi)) or arena.slot_stem(slot) or None
             cand_stems[slot] = stem
         on_disk = self._stat_stems([st for st in cand_stems.values() if st])
+        # QS: the pair rule before any KV byte moves (a KV page already on disk
+        # keeps its copy; a new one is written only with its QSA index)
+        allowed, pair = self._l3_pair_gate(
+            arena, [st for st in cand_stems.values() if st and st not in on_disk], writer)
         for slot, lo, hi, total in cands:
             stem = cand_stems.get(slot)
             if stem is None:
@@ -3497,6 +3525,12 @@ class HiCacheFile(HiCacheStorage):
                 continue
             if stem in on_disk:
                 out["on_disk"] += 1
+                continue
+            if stem not in allowed:
+                # QS: its QSA index is in neither tier -- the KV page alone in
+                # L3 would cap every claim there; both stay absent (counted
+                # apart from `lost`: the W3 spill releases on lost == 0)
+                out["unpaired"] += 1
                 continue
             path = self._sharded_path(stem)
             if not self._evictor.reserve(
@@ -3528,8 +3562,10 @@ class HiCacheFile(HiCacheStorage):
             for stem, slot, total, path in todo:
                 self._evictor.abort(stem)
             out["lost"] += len(todo)
-        # L3-REUSE 0928: the KV page's L3 copy carries its QSA index sibling.
-        out.update(self._l3_couple_sidecars(arena, [st for st in cand_stems.values() if st]))
+        # L3-REUSE 0928 / QS: the KV page's QSA index went first (the gate)
+        out["sidecar_written"] = pair["qsa_written"]
+        out["sidecar_on_disk"] = pair["qsa_on_disk"]
+        out["sidecar_absent"] = pair["qsa_busy"] + pair["qsa_missing"]
         return out
 
     def _l3_sidecar_stems(self, kv_stems) -> list:
@@ -3550,72 +3586,112 @@ class HiCacheFile(HiCacheStorage):
             out.append(f"{h}.{PoolName.QSA_INDEXER}{q_sfx}")
         return out
 
-    def _l3_couple_sidecars(self, arena, kv_stems) -> dict:
-        """L3-REUSE 0928 (NF boot rc12z13 7b2c6ee5ef, P PP0 09:33:33, the first
-        request after the boot): ``#1028B FETCH CAP n=1: kv=399 claimed=47
-        caps={mamba: 399, qsa_indexer: 47}`` -- the store held 399 leading KV
-        pages and mamba anchors up to page 398, but the QSA index for only 47,
-        so the claim was capped at 47 pages and the prompt re-prefilled. On
-        disk 8104 KV pages against 2048 QSA pages (= 8 x 256, eight
-        ``ARENA-EVICT want=256`` rounds of the QSA arena itself).
+    def _l3_pair_gate(self, arena, kv_stems, writer: str,
+                      copy_sidecars: bool = True) -> Tuple[set, dict]:
+        """QS (NF y4b 0114232648, P PP0 04:05:26, weg2-52-142): ``#1028B FETCH
+        CAP kv=1500 claimed=0 caps={qsa_indexer: 359}`` -- the store held 1500
+        KV pages of the shared prefix but its QSA index only for 359, so the
+        claim (the MINIMUM over the pools, QSA_INDEXER is ALL_PAGES) found no
+        anchor below 359 and P prefilled 97088 tokens. The coupling
+        (L3-REUSE 0928, rc12z13 ``kv=399 claimed=47``) ran AFTER the KV write and only counted
+        a sibling it could not find: D logged ``qsa_absent`` 685 times
+        (590 after a #248 PARK-DEMOTE, 95 after a claim room), P 57, and the
+        L3 write-behind wrote KV pages with no look at their index at all.
 
-        The QSA index page lives in its OWN arena (``_arena_for(49152)``) and
-        its L3 copy was written only when THAT arena ran full. Every path that
-        gives a KV page its L3 copy -- the claim-time room
-        (``arena_secure_to_disk``, #257 d), the park/hand-off demoter
-        (``arena_copy_to_disk``, #248: 147 D copies in boot 0831, pool=kv),
-        the write-behind -- copied the KV page alone; its sibling stayed in L2
-        and died with the boot's /dev/shm arena. ``batch_exists_v2`` takes the
-        MINIMUM over the pools (QSA_INDEXER is ALL_PAGES), so a KV page on
-        disk without its index is worth nothing.
+        THE PAIR RULE, before any KV byte moves: a KV page of the canonical
+        width goes to L3 only together with its QSA index -- already on disk,
+        or copied from the QSA arena in this call. A page whose index is in
+        neither tier (``missing``) or cannot be pinned now (``busy``) is NOT
+        written: both are absent from L3, never KV alone. Returns ``(allowed
+        KV stems, counts)``; every stem is allowed off the canonical KV width
+        or without a QSA window (other models, Form-A workers). One
+        ``L3-SIDECAR-COUPLE writer=...`` line names the writer whenever a KV
+        page was held back (first 16 and every 256th otherwise).
 
-        Rule: a KV page that gets (or has) an L3 copy gets its QSA index copy
-        in the same call, from the QSA arena, without freeing it there. A
-        sibling that is neither in the QSA arena nor on disk is counted
-        (``sidecar_absent``), never silent. No-op for any arena other than
-        the canonical KV page's width."""
-        out = {"sidecar_written": 0, "sidecar_on_disk": 0, "sidecar_absent": 0}
+        ``copy_sidecars`` False (the write-behind, whose QSA arena pass runs
+        first under its own budget): the index is not copied here; a KV page
+        whose index still waits in the QSA arena is ``qsa_pending`` (asked
+        again next pass, not unpaired)."""
+        stems = [s for s in dict.fromkeys(kv_stems or ()) if s]
+        cnt = {"kv": len(stems), "qsa_on_disk": 0, "qsa_written": 0, "qsa_busy": 0,
+               "qsa_missing": 0, "qsa_pending": 0, "kv_unpaired": 0, "kv_waiting": 0}
         try:
             kv = getattr(self, "_canonical_kv_extents", None)
             qsa = getattr(self, "canonical_qsa_page", None)
-            if kv is None or qsa is None or arena is None or not kv_stems:
-                return out
-            if int(getattr(arena, "slot_bytes", -1)) != int(kv.total_bytes):
-                return out
-            q_stems = self._l3_sidecar_stems(kv_stems)
-            if not q_stems:
-                return out
-            q_arena = self._arena_for(int(qsa.total_bytes))
-            if q_arena is None:
-                on = self._stat_stems(q_stems)
-                out["sidecar_on_disk"] = len(on)
-                out["sidecar_absent"] = len(q_stems) - len(on)
-                return out
-            r = self._arena_copy_pages_to_disk(q_arena, q_stems)
-            out["sidecar_written"] = int(r.get("written", 0))
-            out["sidecar_on_disk"] = int(r.get("on_disk", 0))
-            out["sidecar_absent"] = int(r.get("absent", 0))
-        except Exception as exc:  # noqa: BLE001 - the KV copy stands; the loss is named
-            logger.warning("L3-REUSE sidecar couple failed: %r", exc)
-            return out
-        n = getattr(self, "_l3_couple_n", 0) + 1
-        self._l3_couple_n = n
-        if out["sidecar_absent"] or n <= 16 or n % 256 == 0:
+            if (kv is None or qsa is None or arena is None or not stems
+                    or int(getattr(arena, "slot_bytes", -1)) != int(kv.total_bytes)):
+                return set(stems), cnt
+            twin = {}
+            for s in stems:
+                q = self._l3_sidecar_stems([s])
+                if q:
+                    twin[s] = q[0]
+            on = set(self._stat_stems(list(twin.values())))
+            cnt["qsa_on_disk"] = sum(1 for q in twin.values() if q in on)
+            todo = [q for q in dict.fromkeys(twin.values()) if q not in on]
+            waiting_q = set()
+            if todo:
+                q_arena = self._arena_for(int(qsa.total_bytes))
+                if q_arena is None:
+                    cnt["qsa_missing"] = len(todo)
+                elif copy_sidecars:
+                    r = self._arena_copy_pages_to_disk(q_arena, todo)
+                    cnt["qsa_written"] = int(r.get("written", 0))
+                    cnt["qsa_busy"] = int(r.get("busy", 0))
+                    cnt["qsa_missing"] = int(r.get("missing", 0))
+                    on |= set(self._stat_stems(todo))
+                else:
+                    for q, (slot, _st) in zip(todo, q_arena.find_slots(todo)):
+                        if int(slot) >= 0:
+                            waiting_q.add(q)
+                    cnt["qsa_pending"] = len(waiting_q)
+                    cnt["qsa_missing"] = len(todo) - len(waiting_q)
+            allowed = {s for s in stems if s not in twin or twin[s] in on}
+            cnt["kv_waiting"] = sum(1 for s in stems if s in twin and twin[s] in waiting_q)
+        except Exception as exc:  # noqa: BLE001 - no verdict = the pre-QS behaviour, named
+            logger.warning("L3-SIDECAR-COUPLE gate failed writer=%s: %r", writer, exc)
+            return set(stems), cnt
+        cnt["kv_unpaired"] = len(stems) - len(allowed) - cnt["kv_waiting"]
+        per = getattr(self, "_l3_pair_n", None)
+        if per is None:
+            per = self._l3_pair_n = {}
+        n = per.get(writer, 0) + 1
+        per[writer] = n
+        held = getattr(self, "_l3_pair_held", None)
+        if held is None:
+            held = self._l3_pair_held = {}
+        held[writer] = held.get(writer, 0) + cnt["kv_unpaired"]
+        loud = False
+        if cnt["kv_unpaired"]:
+            ln = getattr(self, "_l3_pair_loud", None)
+            if ln is None:
+                ln = self._l3_pair_loud = {}
+            k = ln.get(writer, 0) + 1
+            ln[writer] = k
+            loud = k <= 32 or k % 256 == 0
+        if loud or n <= 16 or n % 256 == 0:
             logger.info(
-                "L3-REUSE SIDECAR-COUPLE n=%d kv_pages=%d qsa_written=%d qsa_on_disk=%d "
-                "qsa_absent=%d (a KV page's L3 copy carries its QSA index; absent = the "
-                "index is in neither L2 nor L3, the claim caps there)",
-                n, len(kv_stems), out["sidecar_written"], out["sidecar_on_disk"],
-                out["sidecar_absent"],
+                "L3-SIDECAR-COUPLE writer=%s n=%d kv=%d qsa_on_disk=%d qsa_written=%d "
+                "qsa_busy=%d qsa_pending=%d qsa_missing=%d kv_unpaired=%d held_total=%d (a KV "
+                "page reaches L3 only with its QSA index; unpaired = held back, both absent "
+                "from L3)",
+                writer, n, cnt["kv"], cnt["qsa_on_disk"], cnt["qsa_written"], cnt["qsa_busy"],
+                cnt["qsa_pending"], cnt["qsa_missing"], cnt["kv_unpaired"], held[writer],
             )
-        return out
+        return allowed, cnt
 
     def arena_copy_to_disk(self, arena, stems) -> dict:
         """#248 PARK-DEMOTE copy of ``stems`` (see
-        :meth:`_arena_copy_pages_to_disk`), plus -- L3-REUSE 0928 -- the QSA
-        index sibling of every KV page (:meth:`_l3_couple_sidecars`)."""
-        out = self._arena_copy_pages_to_disk(arena, stems)
-        out.update(self._l3_couple_sidecars(arena, [s for s in dict.fromkeys(stems or ()) if s]))
+        :meth:`_arena_copy_pages_to_disk`) -- QS: only the KV pages whose QSA
+        index reached L3 first (:meth:`_l3_pair_gate`); a held-back page stays
+        in L2 and is asked again on the next demote pass."""
+        stems = [s for s in dict.fromkeys(stems or ()) if s]
+        allowed, cnt = self._l3_pair_gate(arena, stems, "park_demote")
+        out = self._arena_copy_pages_to_disk(arena, [s for s in stems if s in allowed])
+        out["unpaired"] = cnt["kv_unpaired"]
+        out["sidecar_written"] = cnt["qsa_written"]
+        out["sidecar_on_disk"] = cnt["qsa_on_disk"]
+        out["sidecar_absent"] = cnt["qsa_busy"] + cnt["qsa_missing"]
         return out
 
     def _arena_copy_pages_to_disk(self, arena, stems) -> dict:
@@ -4257,6 +4333,7 @@ class HiCacheFile(HiCacheStorage):
                 and t.hit_policy != PoolHitPolicy.ALL_PAGES
             ),
         )
+        _all_pages = kv_pages
         for transfer in _ordered:
             if final_pages == 0:
                 break
@@ -4265,6 +4342,8 @@ class HiCacheFile(HiCacheStorage):
                 boundary = next(
                     (i for i in range(kv_pages) if not has_component(i, name)), kv_pages
                 )
+                if getattr(transfer, "caps_claim", True):
+                    _all_pages = min(_all_pages, boundary)
             else:  # trailing_pages
                 _limit = final_pages if getattr(transfer, "caps_claim", True) else kv_pages
                 boundary = _trailing_boundary(transfer, _limit)
@@ -4381,6 +4460,7 @@ class HiCacheFile(HiCacheStorage):
             keys_asked=len(keys),
             kv_uncapped=kv_pages,
             zero_capped_pools=tuple(_zero_capped),
+            all_pages_uncapped=_all_pages,
         )
 
     def _log_key(self, pool_name: str, key: str) -> str:
