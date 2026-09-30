@@ -847,9 +847,22 @@ def _is_park(staged) -> bool:
 
 
 def adopt_ids(req, park: bool):
-    """The token ids a tail keys on: P's prompt, or (F4) the tokens a parked
-    D request had consumed -- its prompt and all output but the last."""
-    return th.park_ids(req) if park else req.origin_input_ids
+    """The token ids a tail keys on -- exactly the context the publisher's
+    END state consumed: (F4) the tokens a parked D request had consumed, its
+    prompt and all output but the last; otherwise the context P PREFILLED,
+    i.e. D's prompt plus every token D had already decoded. For a fresh
+    hand-off that is the prompt alone (no output yet); for a RESUME-VIA-P leg
+    it is ``resume_via_p.context_ids`` -- ``origin + output`` -- which P took
+    as ITS prompt. TAIL-NTOK (y3r 09292330 weg2-38-53 / weg2-48-71, the two
+    W50-REROUTE path=midstream legs with output): keyed on the prompt alone,
+    D counted 131770 / 108536 against P's 131774 / 109167 (the 4 / 631
+    tokens D had decoded before the reroute), refused
+    ``skipped:n_tokens`` and re-ran the 2-3 token tail as a real 2.1 s
+    extend; the two ``held-uncommitted`` legs (no output) adopted."""
+    if park:
+        return th.park_ids(req)
+    out = getattr(req, "output_ids", None)
+    return list(req.origin_input_ids) + list(out) if out else req.origin_input_ids
 
 
 def uniform_refusal(spec: th.TailSpec, ids, fill_len: int, extra_key, prefix_len: int,
@@ -866,8 +879,12 @@ def uniform_refusal(spec: th.TailSpec, ids, fill_len: int, extra_key, prefix_len
     (``adopt=skipped:prefix:104000!in[103488,104000)`` ran it: 3 tokens, one
     1.5 s expert pass that the H24c skip batch of a sibling paid too)."""
     want_fill = spec.n_tokens + 1 if park else spec.n_tokens
-    if len(ids) != spec.n_tokens or fill_len != want_fill:
+    if fill_len != want_fill:
         return f"n_tokens:{fill_len}!={want_fill}"
+    if len(ids) != spec.n_tokens:
+        # TAIL-NTOK: name the term that failed -- the old joint check printed
+        # fill vs want (``n_tokens:131774!=131774``) for a refusal of the ids
+        return f"n_tokens:ids{len(ids)}!={spec.n_tokens}"
     if park:
         if not (spec.page_prefix <= int(prefix_len) <= spec.cut):
             return f"prefix:{int(prefix_len)}!in[{spec.page_prefix},{spec.cut}]"
@@ -1057,7 +1074,9 @@ def commit_adopt(req, entry: Agreed, tree_cache, page_size: int) -> int:
 def _ple_line(req, rows, why: str, path: str, at: int, result: str) -> None:
     """H63c: D's WEG2-PLE-STATE line -- the digest P printed for the same
     rid/path/position, and whether the history is the prompt's own tokens."""
-    ids = list(getattr(req, "origin_input_ids", None) or [])
+    # the history the state consumed: prompt + output (a RESUME-VIA-P leg's
+    # P prompt, TAIL-NTOK; a park's window ends at N <= this length)
+    ids = list(getattr(req, "origin_input_ids", None) or []) + list(getattr(req, "output_ids", None) or [])
     ctx = ple_state.ctx_tokens(rows)
     expect = ids[max(0, int(at) - len(ctx)):int(at)] if ctx else []
     ple_state.log_state(
