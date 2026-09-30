@@ -407,6 +407,10 @@ class PrefillAdmissionGate:
         # none. The initial value says "never called" rather than pretending
         # a healthy exit.
         self.last_reason = REASON_NEVER_CALLED
+        # y3r Klasse E/A2: the #1028c window's ownership regime (the wake it
+        # belongs to) and how often a wake restarted it.
+        self._bound_regime = None
+        self.bound_wake_resets = 0
 
     # -- the gate ---------------------------------------------------------
 
@@ -743,6 +747,7 @@ class PrefillAdmissionGate:
         if hist is None:
             hist = {}
             self._bound_hist = hist
+        self._bound_wake_reset(hist)
         samples = hist.setdefault(name, [])
         last_t = samples[-1][0] if samples else None
         if last_t is None or (now - last_t) >= self._BOUND_REFRESH_S:
@@ -767,6 +772,54 @@ class PrefillAdmissionGate:
                 (instant - bound) / (1024 * 1024),
             )
         return min(v for _, v in samples)
+
+    def _bound_wake_reset(self, hist: dict) -> None:
+        """Start the #1028c window at the wake: a flip changes who owns the card.
+
+        y3r (D TP1, 3080, 23:45:25-34): while D slept, P held the card and the
+        bound sampled driver_free=81.8 MiB every second. The resume brought it
+        to 2444 / 2188 / 2100 MiB, but the 5-s window kept the 81.8 until it
+        aged out at 23:45:34 -- the vote priced -97..-188 MiB of spendable
+        transient against 198 MiB for 4096 tokens, the group cut every chunk
+        to MIN_CHUNK_TOKENS, and each real extend of the first seconds after
+        the wake ran as 64-token expert passes (1.5-2.5 s each).
+
+        The minimum's direction argument holds WITHIN one ownership regime; a
+        sample from the other group's phase is not a lower bound on this one,
+        it is a reading of a different card layout. So the window restarts at
+        the wake (``scheduler._weg2_last_wake_t``, written where the admission
+        seams re-open) and every value returned afterwards is still a MIN over
+        this phase's own device readings -- no constant, no reserve.
+
+        No wake attribute (non-weg2 boots) or the switch off: nothing changes.
+        """
+        try:
+            from sglang.srt.environ import envs
+
+            if not envs.SGLANG_WEG2_CORRIDOR_BOUND_WAKE_RESET.get():
+                return
+        except Exception:  # noqa: BLE001 -- a probe must never break admission
+            return
+        regime = getattr(self._scheduler, "_weg2_last_wake_t", None)
+        if regime == self._bound_regime:
+            return
+        self._bound_regime = regime
+        dropped = {
+            n: (len(s), min(v for _, v in s)) for n, s in hist.items() if s
+        }
+        hist.clear()
+        if dropped:
+            self.bound_wake_resets += 1
+            logger.info(
+                "#1028c BOUND WAKE-RESET n=%d: window restarts at the wake, "
+                "dropped the previous phase's samples %s (MiB min) -- the "
+                "next reading is this phase's first",
+                self.bound_wake_resets,
+                ", ".join(
+                    "%s=%d@%.1f" % (n, k, v / (1024 * 1024))
+                    for n, (k, v) in sorted(dropped.items())
+                ),
+            )
 
     def _allocator_cache_bytes(self) -> int:
         """Bytes torch holds reserved but not allocated: the cheap tier.
