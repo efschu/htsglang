@@ -1307,6 +1307,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         except Exception as exc:  # noqa: BLE001 -- a warm-up never refuses a bind
             logger.info("#task3 arena load JIT warm-up skipped: %r", exc)
         self.arena = arena
+        if role == "kv":
+            _handoff_pending.bind_arena(self, arena)  # #248e: the clock evict finds the order
         self.arena_slots = A
         self._pending_mask = torch.zeros(int(A), dtype=torch.bool)
         self._pending_gen = torch.zeros(int(A), dtype=torch.int64)     # xsn359: generation per pending slot
@@ -2073,14 +2075,20 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 if len(cands) < need:
                     # (ii) #248: kept, WITH an L3 copy -- freed without I/O,
                     # the copy is the page (arena_fill_from_disk reads it back)
+                    # #248e: in hold order -- the rid read last first, each
+                    # chain from its tail, never the head of the next read
                     copied = _handoff_pending.copied_mask(self, keep)
                     if copied.any():
-                        mid = arena.evict_candidates(need - len(cands), keep_lo=keep.keys[~copied])
+                        mid = _handoff_pending.evict_ordered(arena, keep, need - len(cands),
+                                                             eligible=copied, site="claim_ii")
                         stages[1] = len(mid)
                         cands += list(mid)
                 if len(cands) < need:
-                    # (iii) kept, WITHOUT a copy: lost, by name
-                    last = arena.evict_candidates(need - len(cands))
+                    # (iii) kept, WITHOUT a copy: lost, by name -- in the same
+                    # order; the keep-less clock only for what the order misses
+                    last = _handoff_pending.evict_ordered(arena, keep, need - len(cands), site="claim_iii")
+                    if len(last) < need - len(cands):
+                        last = list(last) + list(arena.evict_candidates(need - len(cands) - len(last)))
                     if last:
                         stages[2] = len(last)
                         _handoff_pending.note_evicted(self, last, keep, need=need)

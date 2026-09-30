@@ -251,6 +251,9 @@ class ArenaMambaPoolHost(MambaPoolHost):
             self._pinned[:] = True
             logger.info("#1436 mamba arena pre-pinned: %.2f GiB in %.1f s", total / (1 << 30), _time.perf_counter() - t0)
         self.arena = arena
+        from sglang.srt.weg2 import handoff_pending as _hp248e
+
+        _hp248e.bind_arena(self, arena)  # #248e: the clock evict finds the anchor order
         self.arena_slots = A
         self.id_space = self.staging_rows + A + PLACEHOLDERS
         logger.info("#1427 mamba arena host pool bound staging=%d slots=%d layers=[%d,%d) extents=%d",
