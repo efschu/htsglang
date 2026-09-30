@@ -1060,6 +1060,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # fnFL2 H19: per-request mamba arena anchors (weg2/mamba_arena_displace.py)
         self._weg2_anchor_ledger = _mad.RidAnchorLedger()
         self._weg2_direct_mamba_rows: dict = {}   # #1427: node id -> mamba arena rows in flight
+        self._weg2_anchor_only_ids: set = set()   # ANCHOR-ONLY BACKUP: in-flight anchor-only writes
         self._weg2_rid_anchor_cfg = envs.SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS.get()
 
         self.tp_group = params.tp_cache_group
@@ -4571,6 +4572,88 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _r12.note_backup_ok(self, node)  # R12: supersedes an earlier "absent" (TP0 only)
         return len(host_indices)
 
+    def _weg2_anchor_only_candidate(self, node: UnifiedTreeNode) -> bool:
+        """ANCHOR-ONLY BACKUP: a node whose KV is backed (host copy or store)
+        and whose Mamba anchor is on the device only, with nothing in flight."""
+        if not envs.SGLANG_WEG2_ANCHOR_ONLY_BACKUP.get():
+            return False
+        if node is self.root_node or node.evicted:
+            return False
+        if not (node.backuped or node.l3_present):
+            return False
+        if node.write_through_pending_id is not None:
+            return False
+        if ComponentType.MAMBA not in self.tree_components:
+            return False
+        if len(node.component_data) <= int(ComponentType.MAMBA):
+            return False
+        cd = node.component_data[ComponentType.MAMBA]
+        return cd.value is not None and cd.host_value is None and bool(node.hash_value)
+
+    def write_backup_anchor_only(self, node: UnifiedTreeNode) -> int:
+        """ANCHOR-ONLY BACKUP (NF y5a 30.09.): copy ONLY the node's Mamba anchor
+        D->H into the Mamba arena -- the KV is already backed (``backuped`` or
+        ``l3_present``), so no KV row is claimed or copied.
+
+        The KV-less write goes through the same controller write as every
+        backup (empty KV indices, the anchor as its one extra pool), is pinned
+        and tracked like a write-through (``ongoing_write_through``), and its
+        ack completes the anchor's arena slot only
+        (``_weg2_direct_complete``); the arena later writes it to L3 before its
+        slot is freed (#257). Returns 1 when issued, 0 when not (named)."""
+        if self.cache_controller is None or not self._weg2_anchor_only_candidate(node):
+            return 0
+        mp = self._weg2_mamba_pool()
+        if mp is None:
+            self._1421_refused("anchor_only_no_arena", node)
+            return 0
+        if not self._mamba_write_through_pin_admissible(node):
+            self._note_mamba_pin_skipped()
+            self._1421_refused("anchor_only_pin", node)
+            return 0
+        comp = self.components[ComponentType.MAMBA]
+        xfers = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
+        if not xfers:
+            return 0
+        mrows = self._weg2_mamba_claim(node, mp, node.hash_value[-1])
+        if mrows is None:
+            self._weg2_sweep_last_refusal = "mamba_claim"   # xsn342: a full arena ends the sweep
+            self._1421_refused("anchor_only_claim", node)
+            return 0
+        xfers[0].host_indices = mrows
+        kv_dv = node.component_data[BASE_COMPONENT_TYPE].value
+        empty_dev = kv_dv[:0]
+        empty_host = torch.empty((0,), dtype=torch.int64)
+        try:
+            got = self.cache_controller.write(
+                empty_dev, node_id=node.id, extra_pools=xfers, host_indices=empty_host,
+            )
+        except BaseException:
+            mp.abort_write(mrows)
+            raise
+        if got is None:
+            mp.abort_write(mrows)
+            self._1421_refused(
+                "anchor_only_write_none:%s" % getattr(self.cache_controller, "_weg2_last_write_refusal", "?"),
+                node,
+            )
+            return 0
+        self._weg2_direct_mamba_rows[node.id] = mrows   # in flight: no displacement takes it
+        self._weg2_anchor_only_ids.add(node.id)
+        comp.commit_hicache_transfer(node, CacheTransferPhase.BACKUP_HOST, transfers=xfers)
+        lock_params = self.inc_lock_ref(node).to_dec_params()
+        self._track_write_through_node(node, lock_params)
+        n = getattr(UnifiedRadixCache, "_weg2_anchor_only_n", 0) + 1
+        UnifiedRadixCache._weg2_anchor_only_n = n
+        if n <= 16 or n % 64 == 0:
+            logger.info(
+                "WEG2 ANCHOR-ONLY-BACKUP n=%d node=%s depth=%d kv=%s (the KV is backed; only the "
+                "device Mamba anchor is copied into the arena -- no flush drops it)",
+                n, node.id, self.weg2_node_depth(node),
+                "host" if node.backuped else "store",
+            )
+        return 1
+
     def _track_write_through_node(
         self,
         node: UnifiedTreeNode,
@@ -5011,6 +5094,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         reference, and mark the node store-present -- the sweep has nothing
         left to publish for it."""
         cc = self.cache_controller
+        _ao = getattr(self, "_weg2_anchor_only_ids", None)
+        if _ao and node.id in _ao:
+            # ANCHOR-ONLY BACKUP: this write carried no KV -- complete the
+            # anchor's arena slot only (the KV was complete before).
+            _ao.discard(node.id)
+            (getattr(self, "_weg2_direct_mamba_rows", None) or {}).pop(node.id, None)
+            mp = self._weg2_mamba_pool()
+            mhv = node.component_data[ComponentType.MAMBA].host_value
+            if mp is not None and mhv is not None and mhv.numel() and mp.is_arena_id(int(mhv.min())):
+                try:
+                    mp.complete_write(mhv)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("ANCHOR-ONLY complete raised: %r", exc)
+                else:
+                    self._weg2_release_inner_anchor(node, mp)
+            return True
         pool = getattr(cc, "mem_pool_host", None)
         if getattr(pool, "arena", None) is None:
             return False
@@ -5822,6 +5921,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 or node.backuped
                 or node.l3_present
             ):
+                # ANCHOR-ONLY BACKUP (y5a: 16x WEG2-ANCHOR-LOST at=flush): the
+                # KV of this node is on the host / in the store, its Mamba
+                # anchor on the device only -- the reset would drop it.
+                if node is not self.root_node and self._weg2_anchor_only_candidate(node):
+                    stats["unbacked"] += 1
+                    stats["anchor_only"] = stats.get("anchor_only", 0) + 1
+                    if stats["issued"] < max_issue:
+                        if self.write_backup_anchor_only(node) > 0:
+                            stats["issued"] += 1
+                        else:
+                            stats["refused"] += 1
                 continue
             if node.component_data[BASE_COMPONENT_TYPE].value is None:
                 continue

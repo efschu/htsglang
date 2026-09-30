@@ -1927,6 +1927,12 @@ class Envs:
     # the read's end when that node carries no state -- instead of releasing it
     # (the node then matched KV to 43200 with no state: "#928 REFUSING").
     SGLANG_WEG2_PREFETCH_ANCHOR_ATTACH = EnvBool(True)
+    # ANCHOR-ONLY BACKUP (NF y5a 30.09., 16x WEG2-ANCHOR-LOST at=flush): a node
+    # whose KV is already backed (backuped / l3_present) but whose Mamba anchor
+    # lives on the device only gets the anchor alone copied D->H into the Mamba
+    # arena (no KV copy); the publish sweep skipped such nodes and the flush
+    # reset dropped the anchor.
+    SGLANG_WEG2_ANCHOR_ONLY_BACKUP = EnvBool(True)
     # Per-request mamba checkpoint diagnostics: log match length, resume
     # length, checkpoint node/slot and cache-insert positions so a
     # nondeterministic resume (or a checkpoint at a wrong position) can be
