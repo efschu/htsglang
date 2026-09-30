@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: Apache-2.0
+"""DUAL-TP3PP3 unified KV (B): group P's KV actor.
+
+DANGER DIRECTIONS guarded here:
+* off unless dual layout + group P + a max token count: born() leaves every
+  tensor untouched (default path byte-identical);
+* born trims to 0 tokens on the fixed lattice and registers the tensor;
+* ensure() maps only what the card ledger granted -- a short grant maps
+  nothing and returns the partial grant (P waits, never presses D);
+* grow keeps the lattice cuts (a live move never remaps a kept extent);
+* release_all() caps the allocator to 0 BEFORE unmapping and returns exactly
+  the grown bytes to the ledger.
+"""
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest.mock as mock
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+import torch
+
+from sglang.srt.weg2 import card_kv_ledger as K
+from sglang.srt.weg2 import dual_p_kv_stage as S
+from sglang.srt.weg2.d_seat_vram import AllocInfo
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+G = 2 << 20
+ENV = {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P", S.MAX_TOKENS_ENV: "65536",
+       S.STEP_TOKENS_ENV: "4096"}
+
+
+class FakeSpans:
+    available = True
+
+    def __init__(self):
+        self.calls = []
+
+    def info(self, ptr):
+        return AllocInfo(size=ALLOC, mapped=0, planned=0, active=True)
+
+    def set_spans(self, ptr, spans, now):
+        self.calls.append((ptr, tuple(spans), now))
+        return 0
+
+
+class FakePool:
+    size, page_size = 65536, 64
+
+    def __init__(self):
+        self.rows = []
+
+    def set_stage_backed_rows(self, r):
+        self.rows.append(r)
+
+
+ROW = 2048  # bytes per token of one K buffer (11 FA layers would be 11 such tensors)
+ALLOC = (65536 + 64) * ROW
+
+
+class DualPKvStage(CustomTestCase):
+    def test_born_off_by_default(self):
+        t = torch.zeros(8)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIs(S.born(FakePool(), t, "k", spans=FakeSpans(), granule=G), t)
+            self.assertEqual(S.pool_tokens(1000), 1000)
+
+    def test_born_trims_and_actor_grows_and_releases(self):
+        S._P_BORN.clear()
+        spans = FakeSpans()
+        pool = FakePool()
+        t = torch.zeros(65536 + 64, ROW // 4, dtype=torch.float32)
+        with mock.patch.dict(os.environ, ENV):
+            self.assertEqual(S.pool_tokens(20000), 65536)
+            S.born(pool, t, "k0", spans=spans, granule=G)
+        self.assertEqual(len(S._P_BORN), 1)
+        self.assertEqual(pool.rows[-1], 64)                     # 0 tokens + the page
+        path = os.path.join(tempfile.mkdtemp(prefix="wkvp"), "card")
+        d = K.CardKvLedger(path, "D")
+        p = K.CardKvLedger(path, "P")
+        d.contribute(64 << 20, committed=40 << 20)
+        p.contribute(40 << 20)
+        caps = []
+        with mock.patch.dict(os.environ, ENV):
+            st = S.PKvStage(list(S._P_BORN), p, allocator=object(), pools=[pool], page_size=64,
+                            granule=G, top_tokens=65536, spans=spans,
+                            engage_cap=lambda a, tok, pg: caps.append(tok))
+        base = st.bytes_for(0)
+        self.assertTrue(st.ensure(10000))                        # -> 12288 on the lattice
+        self.assertEqual(st.mapped_tokens, 12288)
+        self.assertEqual(caps[-1], 12288)
+        got = p.state().committed["P"]
+        self.assertEqual(got, st.bytes_for(12288) - base)
+        self.assertFalse(st.ensure(65536))                       # more than the pool has free: waits
+        self.assertEqual(st.mapped_tokens, 12288)
+        self.assertEqual(p.state().committed["P"], got)          # the partial grant went back
+        n = st.release_all()
+        self.assertEqual(n, got)
+        self.assertEqual(caps[-2:], [0, 0])                      # cap to 0 before the unmap
+        self.assertEqual(p.state().committed["P"], 0)
+        self.assertEqual(st.mapped_tokens, 0)
+
+    def test_lattice_and_rounding(self):
+        self.assertEqual(S.round_up(1, 4096), 4096)
+        self.assertEqual(S.round_up(4096, 4096), 4096)
+        self.assertEqual(S.lattice(8192, 4096), [0, 4096, 8192])
+
+    def test_launcher_env_and_refusal(self):
+        from sglang.srt.weg2 import launcher as L
+
+        ns = L.build_parser().parse_args(["--tree", "/x", "--tag", "t", "--dual-share", "--dual-unified-kv", "on"])
+        L.resolve_dual_layout(ns)
+        self.assertEqual(L.dual_share_env(ns, "P")[S.MAX_TOKENS_ENV], "196608")
+        self.assertNotIn(S.MAX_TOKENS_ENV, L.dual_share_env(ns, "D"))
+        off = L.build_parser().parse_args(["--tree", "/x", "--tag", "t", "--dual-share"])
+        L.resolve_dual_layout(off)
+        self.assertNotIn(S.MAX_TOKENS_ENV, L.dual_share_env(off, "P"))
+        with self.assertRaises(L.Weg2DualLayoutRefused):
+            L.resolve_dual_layout(L.build_parser().parse_args(
+                ["--tree", "/x", "--tag", "t", "--dual-unified-kv", "on"]))
+
+    def test_hooks_are_wired(self):
+        import inspect
+
+        from sglang.srt.managers import weg2_store_told as T
+        from sglang.srt.mem_cache import memory_pool as MP
+        from sglang.srt.model_executor import model_runner_kv_cache_mixin as MX
+
+        self.assertIn("_dpk.on_intake(scheduler, req)", inspect.getsource(T.intake))
+        self.assertIn("_dpk.born(pool, t, name)", inspect.getsource(MP._kv_stage_born))
+        src = inspect.getsource(MX)
+        self.assertIn("_dpk.attach(self)", src)
+        self.assertIn("max_tokens = _dpk.pool_tokens(max_tokens)", src)
+        from sglang.srt.managers import scheduler as SC
+
+        self.assertIn("_dpk.on_idle(self)", inspect.getsource(SC.Scheduler.on_idle))
+

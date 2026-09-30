@@ -285,6 +285,10 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
     held: Dict[str, Any] = scheduler._weg2_store_held
     rid = _rid(req)
     forget_rid_leftovers(scheduler.tree_cache, rid)
+    # DUAL-TP3PP3 unified KV (B): every P rank maps this prompt from the card pool
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    _dpk.on_intake(scheduler, req)
     if int(scheduler.ps.pp_rank) == 0:
         if _twin.intake_defer(scheduler, req):
             # TW: a fork twin of a request in flight on P -- held WITHOUT a

@@ -19032,6 +19032,11 @@ class Scheduler(
         )
         if reclaim is not None:
             reclaim()
+        # DUAL-TP3PP3 unified KV (B): a fully idle P rank returns its context
+        # to the card pool (no-op unless the P actor is attached)
+        from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+        _dpk.on_idle(self)
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).

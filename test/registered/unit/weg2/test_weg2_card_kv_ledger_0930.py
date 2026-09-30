@@ -105,3 +105,18 @@ class CardKvLedger(CustomTestCase):
             self.assertEqual(got, committed, g)
         st = K.CardKvLedger(self.path, "D").state()
         self.assertLessEqual(sum(st.committed.values()), st.budget)
+
+    def test_pool_is_the_sum_of_both_boot_kv(self):
+        d = K.CardKvLedger(self.path, "D")
+        p = K.CardKvLedger(self.path, "P")
+        d.contribute(2400 * MIB, committed=2400 * MIB)     # D keeps its boot stage mapped
+        p.contribute(2000 * MIB, committed=0)              # P puts all of its KV into the pool
+        st = p.state()
+        self.assertEqual(st.budget, 4400 * MIB)
+        self.assertEqual(st.free, 2000 * MIB)
+        self.assertEqual(p.request(3000 * MIB), (2000 * MIB, 0))   # P waits for the rest
+        p.release(2000 * MIB)
+        self.assertEqual(d.request(2000 * MIB)[0], 2000 * MIB)     # D may grow into P's share
+        p.contribute(2000 * MIB, committed=0)                     # idempotent
+        self.assertEqual(p.state().budget, 4400 * MIB)
+

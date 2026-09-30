@@ -5243,6 +5243,10 @@ class ModelRunnerKVCacheMixin:
 
             _dsv.kv_stage_boot_cap(self.token_to_kv_pool_allocator, self.page_size)
             _dsv.note_capture_context(self)
+            # DUAL-TP3PP3 unified KV (B): P joins the card pool, keeps 0 mapped
+            from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+            _dpk.attach(self)
 
     def _hybrid_kv_token_cap(self: ModelRunner) -> Optional[int]:
         """Physically reachable ceiling on max_total_num_tokens for hybrid
@@ -7934,6 +7938,14 @@ class ModelRunnerKVCacheMixin:
             # host keeps its own allocator (see kv_stage_pool_tokens)
             draft_shares_slots=not bool(getattr(self, "is_draft_solo_host", False)),
         )
+        # DUAL-TP3PP3 unified KV (B): group P's pool is VIRTUALLY the top
+        # (--dual P KV max tokens); its boot KV goes into the card pool
+        # (weg2/dual_p_kv_stage.attach). Off: unchanged.
+        from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+        if _dpk.armed() and not getattr(self, "is_draft_worker", False):
+            self._dual_p_boot_tokens = int(max_tokens)
+            max_tokens = _dpk.pool_tokens(max_tokens)
         if max_tokens != config.max_total_num_tokens:
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 max_tokens, self.page_size

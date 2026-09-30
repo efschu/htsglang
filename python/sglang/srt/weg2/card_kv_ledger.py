@@ -40,9 +40,9 @@ from typing import Dict, Iterator, Optional, Tuple
 
 GROUPS = ("P", "D")
 _MAGIC = 0x4B564C47  # "KVLG"
-_VERSION = 1
-# magic, version, budget, epoch, then per group: pid, committed, demand, pressure
-_FMT = "<IIqq" + "qqqq" * len(GROUPS)
+_VERSION = 2
+# magic, version, budget, epoch, then per group: pid, committed, demand, pressure, contribution
+_FMT = "<IIqq" + "qqqqq" * len(GROUPS)
 _SIZE = struct.calcsize(_FMT)
 
 
@@ -78,6 +78,7 @@ class LedgerState:
     committed: Dict[str, int]
     demand: Dict[str, int]
     pressure: Dict[str, int]
+    contrib: Dict[str, int] = dataclasses.field(default_factory=lambda: {g: 0 for g in GROUPS})
 
     @property
     def free(self) -> int:
@@ -131,20 +132,22 @@ class CardKvLedger:
         magic, ver, budget, epoch = vals[:4]
         if magic != _MAGIC:
             budget, epoch = 0, 0
-            rest = [0] * (4 * len(GROUPS))
+            rest = [0] * (5 * len(GROUPS))
         else:
             if ver != _VERSION:
                 raise RuntimeError(f"card KV ledger {self.path}: version {ver}, expected {_VERSION}")
             rest = list(vals[4:])
-        st = LedgerState(budget, epoch, {}, {}, {}, {})
+        st = LedgerState(budget, epoch, {}, {}, {}, {}, {})
         for i, g in enumerate(GROUPS):
-            st.pid[g], st.committed[g], st.demand[g], st.pressure[g] = rest[4 * i:4 * i + 4]
+            (st.pid[g], st.committed[g], st.demand[g], st.pressure[g],
+             st.contrib[g]) = rest[5 * i:5 * i + 5]
         return st
 
     def _write(self, st: LedgerState) -> None:
         vals = [_MAGIC, _VERSION, int(st.budget), int(st.epoch)]
         for g in GROUPS:
-            vals += [int(st.pid[g]), int(st.committed[g]), int(st.demand[g]), int(st.pressure[g])]
+            vals += [int(st.pid[g]), int(st.committed[g]), int(st.demand[g]), int(st.pressure[g]),
+                     int(st.contrib[g])]
         struct.pack_into(_FMT, self._mm, 0, *vals)
 
     @contextmanager
@@ -167,6 +170,10 @@ class CardKvLedger:
                 st.committed[g] = 0
                 st.demand[g] = 0
                 st.pressure[g] = 0
+                # its KV bytes stay on the card for the survivor? No: a dead
+                # process's pool is gone with it; its contribution leaves too.
+                st.budget -= st.contrib[g]
+                st.contrib[g] = 0
 
     # -- API ------------------------------------------------------------------
     def join(self, budget: int, pid: Optional[int] = None) -> LedgerState:
@@ -186,10 +193,34 @@ class CardKvLedger:
             st.pid[self.group] = pid
             return dataclasses.replace(st)
 
+    def contribute(self, kv_bytes: int, committed: int = 0, pid: Optional[int] = None) -> LedgerState:
+        """Put this process's boot KV into the card's ONE pool: the budget is
+        the SUM of both processes' KV sizings (each sized its pool exactly as
+        before -- nothing new to plan), none of it is anyone's. ``committed``:
+        what this process keeps mapped right now (D: its boot stage; P: 0).
+        Idempotent per process (a second call replaces its own share)."""
+        pid = os.getpid() if pid is None else int(pid)
+        with self._locked() as st:
+            if st.pid[self.group] and st.pid[self.group] != pid and self._pid_alive(st.pid[self.group]):
+                raise RuntimeError(f"card KV ledger {self.path}: group {self.group} already held by pid "
+                                   f"{st.pid[self.group]}")
+            st.pid[self.group] = pid
+            st.budget += int(kv_bytes) - st.contrib[self.group]
+            st.contrib[self.group] = int(kv_bytes)
+            st.committed[self.group] = max(0, int(committed))
+            if sum(st.committed.values()) > st.budget:
+                raise RuntimeError(
+                    f"card KV ledger {self.path}: committed {dict(st.committed)} exceed the pool "
+                    f"{st.budget} after {self.group}'s contribution -- I1 cannot hold")
+            return dataclasses.replace(st, pid=dict(st.pid), committed=dict(st.committed),
+                                       demand=dict(st.demand), pressure=dict(st.pressure),
+                                       contrib=dict(st.contrib))
+
     def state(self) -> LedgerState:
         with self._locked() as st:
             return dataclasses.replace(st, pid=dict(st.pid), committed=dict(st.committed),
-                                       demand=dict(st.demand), pressure=dict(st.pressure))
+                                       demand=dict(st.demand), pressure=dict(st.pressure),
+                                       contrib=dict(st.contrib))
 
     def request(self, need: int, other_evictable: int = 0) -> Tuple[int, int]:
         """Commit up to ``need`` bytes for this group NOW (I1 under the lock).
@@ -224,6 +255,8 @@ class CardKvLedger:
             st.committed[self.group] = 0
             st.demand[self.group] = 0
             st.pressure[self.group] = 0
+            st.budget -= st.contrib[self.group]
+            st.contrib[self.group] = 0
 
     def close(self) -> None:
         try:

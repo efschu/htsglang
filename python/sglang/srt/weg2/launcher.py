@@ -13561,6 +13561,10 @@ def resolve_dual_layout(ns) -> None:
     Refused by name: --weg2-d-adopt on (D would hold placeholders that only a
     flip fills -- and there is no flip), --dual-mps on without --dual-layout.
     Off: no-op."""
+    if str(getattr(ns, "dual_unified_kv", "off")) == "on" and not getattr(ns, "dual_share", False):
+        raise Weg2DualLayoutRefused(
+            "DUAL-TP3PP3: --dual-unified-kv on needs --dual-share (the card KV ledger lives next to "
+            "the union image; P's pages are D's card)")
     if getattr(ns, "dual_share", False) and not getattr(ns, "dual_layout", False):
         print("WEG2-DUAL --dual-share implies --dual-layout", flush=True)
         ns.dual_layout = True
@@ -13649,6 +13653,10 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
            # Both groups stay awake: rank-side rules that assume the other
            # group sleeps read this (scheduler._weg2_store_short_max_cycles).
            "SGLANG_WEG2_DUAL_LAYOUT": "1"}
+    if group == "P" and str(getattr(ns, "dual_unified_kv", "off")) == "on":
+        # unified KV (user orders 30.09. 07:10Z/07:25Z): P's pool is virtually
+        # this big; its pages come from the card pool (weg2/dual_p_kv_stage.py)
+        env["SGLANG_WEG2_DUAL_P_KV_MAX_TOKENS"] = str(int(getattr(ns, "dual_p_kv_max_tokens", 0) or 0))
     if group == "P":
         env["SGLANG_WEG2_DUAL_SHARE"] = "1"
     return env
@@ -20833,6 +20841,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "(risk-1 bench, 5090): unlimited P takes ~90%% of the card and D's step runs "
                          "~7x slower; 50 splits ~50/50; the sum of both shares stays ~1.0 either way. "
                          "100 = no limit.")
+    ap.add_argument("--dual-unified-kv", choices=("off", "on"), default="off",
+                    help="DUAL-TP3PP3: one KV pool per card shared by P and D at runtime (user orders "
+                         "30.09. 07:10Z/07:25Z; weg2/card_kv_ledger.py). P maps KV only while it "
+                         "prefills and pauses when D is short. Needs --dual-share.")
+    ap.add_argument("--dual-p-kv-max-tokens", type=int, default=196608,
+                    help="DUAL-TP3PP3 --dual-unified-kv: P's KV pool rows (virtual; pages from the card "
+                         "pool). Each K/V buffer is born at this size and trimmed at once, so the boot "
+                         "transient is one buffer (tokens x bytes per token per layer).")
     ap.add_argument("--dual-mps", choices=("off", "on"), default="off",
                     help="DUAL-TP3PP3: start a private MPS control daemon before the groups (pipe dir "
                          "under the boot's run dir) so P and D kernels run concurrently on a card instead "
