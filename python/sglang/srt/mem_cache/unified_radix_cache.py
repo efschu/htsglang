@@ -475,6 +475,13 @@ class UnifiedTreeNode:
         # anchor of that request because the arena refused this node.
         self.weg2_anchor_rid: Optional[str] = None
         self.weg2_arena_displaced: bool = False
+        # ANCHOR-ONLY BACKUP, KV only in the store (y5d 19:52:54Z): the anchor was
+        # written into the mamba arena (keyed by the node's last page hash) and
+        # completed, but NOT committed as the tree's Mamba host value -- the
+        # tree law "aux host requires Full host" forbids it. The arena slot is
+        # what survives the flush; this flag keeps the sweep from rewriting it
+        # and ANCHOR-LOST from counting it.
+        self.weg2_anchor_secured: bool = False
         # #1481: the END-ANCHOR witness marks the N-1 node (set in
         # UnifiedRadixCache._weg2_note_end_anchor).
         self._weg2_end_anchor: bool = False
@@ -1061,6 +1068,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._weg2_anchor_ledger = _mad.RidAnchorLedger()
         self._weg2_direct_mamba_rows: dict = {}   # #1427: node id -> mamba arena rows in flight
         self._weg2_anchor_only_ids: set = set()   # ANCHOR-ONLY BACKUP: in-flight anchor-only writes
+        self._weg2_anchor_only_detached: set = set()   # ... of those: KV only in the store (no tree host value)
         self._weg2_rid_anchor_cfg = envs.SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS.get()
 
         self.tp_group = params.tp_cache_group
@@ -1466,6 +1474,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         mamba = getattr(ComponentType, "MAMBA", None)
         if mamba is None:
             return out
+        _det = self.__dict__.get("_weg2_anchor_only_detached") or ()
         stack = [self.root_node]
         while stack:
             node = stack.pop()
@@ -1478,6 +1487,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue
             if cd is None or cd.value is None or cd.host_value is not None:
                 continue
+            if getattr(node, "weg2_anchor_secured", False) or (_det and getattr(node, "id", None) in _det):
+                continue    # ANCHOR-ONLY (KV in the store): its arena slot carries it (or its write is in flight)
             out.append((self.weg2_node_depth(node), getattr(node, "weg2_anchor_rid", None)))
         out.sort()
         return out
@@ -4583,6 +4594,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         if node.write_through_pending_id is not None:
             return False
+        if getattr(node, "weg2_anchor_secured", False):
+            return False    # KV-in-store anchor already in the arena (not in the tree)
         if ComponentType.MAMBA not in self.tree_components:
             return False
         if len(node.component_data) <= int(ComponentType.MAMBA):
@@ -4640,7 +4653,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return 0
         self._weg2_direct_mamba_rows[node.id] = mrows   # in flight: no displacement takes it
         self._weg2_anchor_only_ids.add(node.id)
-        comp.commit_hicache_transfer(node, CacheTransferPhase.BACKUP_HOST, transfers=xfers)
+        # y5d (D TP0 19:52:54Z, sanity_check "node 147 mamba host present but
+        # Full.host_value=None"): the tree law is "aux host requires Full host"
+        # (evict_host, host leaves, the host LRUs, write_backup and load-back all
+        # key on Full.host_value). With the KV only in the store (l3_present, no
+        # host copy) the anchor goes into the arena slot of its page hash and
+        # is released there at the ack -- the slot, not the tree, carries it
+        # over the flush. Only a node whose KV has a host copy commits it.
+        if node.backuped:
+            comp.commit_hicache_transfer(node, CacheTransferPhase.BACKUP_HOST, transfers=xfers)
+        else:
+            self.__dict__.setdefault("_weg2_anchor_only_detached", set()).add(node.id)
         lock_params = self.inc_lock_ref(node).to_dec_params()
         self._track_write_through_node(node, lock_params)
         n = getattr(UnifiedRadixCache, "_weg2_anchor_only_n", 0) + 1
@@ -4648,9 +4671,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if n <= 16 or n % 64 == 0:
             logger.info(
                 "WEG2 ANCHOR-ONLY-BACKUP n=%d node=%s depth=%d kv=%s (the KV is backed; only the "
-                "device Mamba anchor is copied into the arena -- no flush drops it)",
+                "device Mamba anchor is copied into the arena -- no flush drops it; %s)",
                 n, node.id, self.weg2_node_depth(node),
                 "host" if node.backuped else "store",
+                "tree host value" if node.backuped else "arena slot only, not in the tree: Full has no host copy",
             )
         return 1
 
@@ -5099,8 +5123,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # ANCHOR-ONLY BACKUP: this write carried no KV -- complete the
             # anchor's arena slot only (the KV was complete before).
             _ao.discard(node.id)
-            (getattr(self, "_weg2_direct_mamba_rows", None) or {}).pop(node.id, None)
+            mrows = (getattr(self, "_weg2_direct_mamba_rows", None) or {}).pop(node.id, None)
             mp = self._weg2_mamba_pool()
+            _det = getattr(self, "_weg2_anchor_only_detached", None)
+            if _det is not None and node.id in _det:
+                # KV only in the store: complete the slot, give this write's
+                # reader reference back (the tree holds none), mark it secured
+                _det.discard(node.id)
+                if mp is not None and mrows is not None and mrows.numel() and mp.is_arena_id(int(mrows.min())):
+                    try:
+                        mp.complete_write(mrows)
+                        mp.free(mrows)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("ANCHOR-ONLY (store) complete raised: %r", exc)
+                    else:
+                        node.weg2_anchor_secured = True
+                return True
             mhv = node.component_data[ComponentType.MAMBA].host_value
             if mp is not None and mhv is not None and mhv.numel() and mp.is_arena_id(int(mhv.min())):
                 try:

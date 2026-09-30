@@ -163,3 +163,78 @@ def test_a_node_whose_anchor_is_on_the_host_is_not_touched():
     node.component_data[MC].host_value = torch.tensor([7], dtype=torch.int64)
     stats = _sweep(cache, _Arena())
     assert stats["issued"] == 0 and cache.cache_controller.writes == []
+
+
+# ------------------------------------------------------------------ y5d
+# NF y5d (image rc12z30y5f, 60e26b59d1) D TP0 19:52:54Z, rank death in on_idle ->
+# sanity_check: "node 147 mamba host present but Full.host_value=None; node 146
+# dito". Tree [137] root-child 0 -> [147] 41024 full+mamba -> [149] 192;
+# [146] 41024 -> [148] 192. 146/147 came out of L3 (l3_present, KV on the
+# device, NO Full host copy); WEG2 ANCHOR-ONLY-BACKUP n=5/6 kv=store committed
+# the anchor as the tree's Mamba host value. The tree law "aux host requires
+# Full host" stands (every host-tier reader keys on Full.host_value): with the
+# KV only in the store, the anchor lives in its arena slot, not in the tree.
+
+class _ArenaRef(_Arena):
+    def __init__(self, room=True):
+        super().__init__(room)
+        self.freed = []
+
+    def free(self, rows):
+        self.freed.append([int(x) for x in rows.tolist()])
+        return int(rows.numel())
+
+
+def _y5d_tree():
+    """Two 64-token siblings under the root, each with a 3-token child; the
+    siblings' KV came from L3 (l3_present, no host copy), anchors on device."""
+    cache, pool, kalloc = T._build()
+    heads = []
+    for base in (3000, 4000):
+        head = list(range(base, base + 64))
+        cache.insert(InsertParams(key=RadixKey(array("q", head)), value=kalloc.alloc(64),
+                                  mamba_value=pool.mamba_allocator.alloc(1).reshape(1)))
+        full = head + [base + 900, base + 901, base + 902]
+        cache.insert(InsertParams(key=RadixKey(array("q", full)), value=kalloc.alloc(67),
+                                  mamba_value=pool.mamba_allocator.alloc(1).reshape(1)))
+    for n in cache._collect_all_nodes():
+        if n is cache.root_node:
+            continue
+        n.hash_value = ["h%d_%d" % (n.id, i) for i in range(len(n.key))]
+        if len(n.key) == 64:
+            n.l3_present = True          # KV in the store only (the L3 read's span)
+            heads.append(n)
+    cache.cache_controller = _Ctl()
+    assert len(heads) == 2 and all(h.component_data[KV].host_value is None for h in heads)
+    return cache, heads
+
+
+def test_y5d_store_anchor_keeps_the_tree_law_and_the_arena_carries_it():
+    cache, heads = _y5d_tree()
+    cache.sanity_check()                                     # the state before: legal
+    arena = _ArenaRef()
+    stats = _sweep(cache, arena)
+    assert stats.get("anchor_only") == 2 and len(cache.cache_controller.writes) == 2
+    cache.sanity_check()                                     # y5d: AssertionError on 60e26b59d1
+    for h in heads:
+        assert h.component_data[MC].host_value is None, "no Mamba host value without a Full host value"
+    assert 64 not in [d for d, _ in cache.weg2_unbacked_anchors()], "in flight: not counted lost"
+    with mock.patch.object(UnifiedRadixCache, "_weg2_mamba_pool", lambda self: arena), \
+            mock.patch.object(UnifiedRadixCache, "_weg2_release_inner_anchor", lambda self, n, mp: None):
+        for h in heads:
+            assert cache._weg2_direct_complete(h) is True
+    assert sorted(arena.completed) == [[1000], [1001]], "each anchor's arena slot completes"
+    assert sorted(arena.freed) == [[1000], [1001]], "and this write's reader reference goes back"
+    assert all(h.weg2_anchor_secured for h in heads)
+    assert 64 not in [d for d, _ in cache.weg2_unbacked_anchors()], "secured: the flush drops nothing"
+    cache.sanity_check()
+    n_before = len(cache.cache_controller.writes)
+    _sweep(cache, arena)
+    assert len(cache.cache_controller.writes) == n_before, "a secured anchor is not rewritten"
+
+
+def test_a_host_backed_kv_still_commits_the_anchor_into_the_tree():
+    cache, node = _tree_with_backed_kv_and_device_anchor()
+    _sweep(cache, _ArenaRef())
+    assert int(node.component_data[MC].host_value[0]) == 1000
+    assert not getattr(node, "weg2_anchor_secured", False)
