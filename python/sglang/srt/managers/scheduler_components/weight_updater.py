@@ -9374,9 +9374,10 @@ class SchedulerWeightUpdaterManager:
                     # did not have. The buffer holds a whole tag (Option 1),
                     # so this completes without its collector.
                     # TAG-STALL-SENTINEL (NF y3z ep52: PP0 5.4 s process-wide
-                    # still at the first tag of P's sleep): faulthandler's C
-                    # watchdog writes every thread's stack if this tag outlives
-                    # SGLANG_WEG2_TAG_STALL_SENTINEL_S -- GIL held or not.
+                    # still at the first tag of P's sleep): the GIL sampler
+                    # (weg2/stall_sampler) writes every thread's stack if this
+                    # tag outlives SGLANG_WEG2_TAG_STALL_SENTINEL_S; late_ms
+                    # names a stall that held the GIL in C.
                     _stall = _tag_stall.arm(tag, rank=self._weg2_rank(),
                                             group=self._weg2_group_name())
                     if _po is not None:

@@ -1,19 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """TAG-STALL-SENTINEL (30.09., NF y3z ep52): all thread stacks of a sleep tag
-that stalls, written by faulthandler's own C watchdog thread.
+that stalls, written by the shared GIL sampler (weg2/stall_sampler.py).
 
 NF y3z ep52: PP0 stood still for 5.4 s process-wide -- every thread at once --
 at the first tag of P's sleep. Candidates: a C call holding the GIL (CUDA /
 TMS behind a driver lock) or a generation-2 GC. A Python-side sampler cannot
-tell them apart: it needs the GIL the stall holds. ``faulthandler``'s
-``dump_traceback_later`` runs its timer in a C thread and writes the stacks of
-every thread without taking the GIL, so a stall that outlives the timeout
-names the frame it sits in.
+tell them apart: it needs the GIL the stall holds. The first form used
+``faulthandler.dump_traceback_later`` (C thread, no GIL); 27B z30y8 showed that
+walk racing a changing frame into a PP1 SIGSEGV, so it now arms
+``stall_sampler`` (``sys._current_frames()`` under the GIL). The price is
+named, not hidden: a stall holding the GIL in C delays the dump until release,
+and ``late_ms`` (dump file mtime minus armed+timeout) says by how much -- a
+large ``late_ms`` IS the GIL-held-in-C verdict, a small one a Python stall.
 
 Per tag of the sleep loop (``_weg2_xchg_deposit_before_sleep`` -> sync ->
 pause -> credit): :func:`arm` opens ``<evidence>/weg2_tagstall_<group>_r<rank>_
 <tag>_<unix>.txt`` with one header line and arms the timer; :func:`disarm`
-cancels it and reads the file's SIZE (``fstat``, no device, no host sync):
+stops the sampler and reads the file's SIZE (``fstat``, no device, no host sync):
 grown past the header = the watchdog fired -> one ``TAG-STALL-SENTINEL fired``
 line naming rank, tag and file; not grown -> the file is removed.
 
@@ -24,7 +27,6 @@ two C calls per tag.
 
 from __future__ import annotations
 
-import faulthandler
 import logging
 import os
 import re
@@ -40,9 +42,10 @@ DEFAULT_TIMEOUT_S = 1.5
 class Armed:
     """One armed tag: the open dump file and its header length."""
 
-    __slots__ = ("fh", "path", "header_len", "tag", "rank", "group", "t0")
+    __slots__ = ("fh", "path", "header_len", "tag", "rank", "group", "t0", "sampler", "due_unix")
 
-    def __init__(self, fh, path: str, header_len: int, tag: str, rank, group: str, t0: float):
+    def __init__(self, fh, path: str, header_len: int, tag: str, rank, group: str, t0: float,
+                 sampler=None, due_unix: float = 0.0):
         self.fh = fh
         self.path = path
         self.header_len = header_len
@@ -50,6 +53,8 @@ class Armed:
         self.rank = rank
         self.group = group
         self.t0 = t0
+        self.sampler = sampler
+        self.due_unix = due_unix
 
 
 def timeout_s() -> float:
@@ -73,7 +78,7 @@ def _slug(value) -> str:
 
 def arm(tag: str, *, rank, group: str, directory: Optional[str] = None,
         timeout: Optional[float] = None) -> Optional[Armed]:
-    """Before one sleep tag: open its dump file and arm the C watchdog.
+    """Before one sleep tag: open its dump file and arm the GIL sampler.
     ``None`` when off or when the file cannot be opened (named once)."""
     t = timeout_s() if timeout is None else float(timeout)
     if t <= 0.0:
@@ -89,30 +94,43 @@ def arm(tag: str, *, rank, group: str, directory: Optional[str] = None,
             MARKER, group, rank, tag, now, t, os.getpid())
         fh.write(header)
         fh.flush()
-        faulthandler.dump_traceback_later(t, repeat=False, file=fh, exit=False)
-        return Armed(fh, path, len(header.encode()), str(tag), rank, str(group), time.perf_counter())
+        from sglang.srt.weg2 import stall_sampler
+
+        sampler = stall_sampler.arm(fh, t, name="tag-stall-sampler")
+        return Armed(fh, path, len(header.encode()), str(tag), rank, str(group), time.perf_counter(),
+                     sampler, now + t)
     except Exception as exc:  # noqa: BLE001 -- an instrument never breaks a sleep
         logger.warning("%s not armed for tag %s: %s: %s", MARKER, tag, type(exc).__name__, exc)
         return None
 
 
 def disarm(armed: Optional[Armed]) -> Optional[str]:
-    """After the tag: cancel the watchdog; return the dump path when it fired
+    """After the tag: stop the sampler; return the dump path when it fired
     (and log it), else remove the empty file and return ``None``."""
     if armed is None:
         return None
     try:
-        faulthandler.cancel_dump_traceback_later()
-        armed.fh.flush()
-        size = os.fstat(armed.fh.fileno()).st_size
-        armed.fh.close()
-        if size > armed.header_len:
+        from sglang.srt.weg2 import stall_sampler
+
+        stall_sampler.disarm(armed.sampler)
+        lock = armed.sampler.lock if armed.sampler is not None else None
+        if lock is not None:
+            lock.acquire()
+        try:
+            armed.fh.flush()
+            st = os.fstat(armed.fh.fileno())
+            armed.fh.close()
+        finally:
+            if lock is not None:
+                lock.release()
+        if st.st_size > armed.header_len:
             logger.warning(
-                "%s fired rank=%s tag=%s file=%s bytes=%d tag_ms=%.0f -- the tag outlived "
-                "the watchdog; the file holds every thread's stack at the timeout "
-                "(faulthandler C thread, written without the GIL)",
-                MARKER, armed.rank, armed.tag, armed.path, size,
-                (time.perf_counter() - armed.t0) * 1000)
+                "%s fired rank=%s tag=%s file=%s bytes=%d tag_ms=%.0f late_ms=%.0f -- the tag "
+                "outlived the sampler timeout; the file holds every thread's stack (GIL sampler; "
+                "late_ms >> 0 = the stall held the GIL in C)",
+                MARKER, armed.rank, armed.tag, armed.path, st.st_size,
+                (time.perf_counter() - armed.t0) * 1000,
+                max(0.0, (st.st_mtime - armed.due_unix) * 1000))
             return armed.path
         os.unlink(armed.path)
     except Exception as exc:  # noqa: BLE001 -- an instrument never breaks a sleep

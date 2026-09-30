@@ -48,7 +48,7 @@ def test_a_tag_that_stalls_2s_leaves_every_threads_stack_under_its_name(tmp_path
     assert fired is not None and os.path.basename(fired).startswith("weg2_tagstall_P_r0_weights_0_")
     text = open(fired).read()
     assert "tag=weights_0" in text.splitlines()[0]
-    assert "Thread 0x" in text or "Current thread" in text  # faulthandler's stack dump
+    assert "Thread 0x" in text and "under the GIL" in text  # the GIL sampler's stack dump
     assert "test_weg2_tag_stall_sentinel_0930.py" in text  # the frame the stall sat in
     # the sleep loop arms and disarms it around every tag
     from sglang.srt.managers.scheduler_components.weight_updater import (
@@ -89,3 +89,29 @@ def test_the_gc_warning_is_armed_for_group_p_by_default(monkeypatch):
     assert L.apply_p_gc_warn_default(ns2) is None
     assert gci.arm_after_boot(types.SimpleNamespace(gc_warning_threshold_secs=0.0), 0,
                               env=L.parse_group_env(ns2.env_p))["warn"] is None
+
+
+def test_no_faulthandler_walk_without_the_gil():
+    """27B z30y8: faulthandler's later-dump walked a changing frame without the
+    GIL into a PP1 SIGSEGV. The sentinel arms the shared GIL sampler instead."""
+    src = inspect.getsource(_sentinel())
+    assert "dump_traceback_later(" not in src.replace("``faulthandler.dump_traceback_later``", "")
+    assert "stall_sampler.arm(fh" in src and "stall_sampler.disarm(armed.sampler)" in src
+
+
+def test_a_gil_held_stall_is_named_by_late_ms(tmp_path, caplog):
+    """A stall holding the GIL delays the dump until release; late_ms says so."""
+    import logging
+    import threading
+
+    ts = _sentinel()
+    with caplog.at_level(logging.WARNING):
+        armed = ts.arm("weights_1", rank=0, group="P", directory=str(tmp_path), timeout=0.2)
+        t_end = time.perf_counter() + 1.0
+        x = 0
+        while time.perf_counter() < t_end:  # pure-Python spin: the sampler still gets the GIL
+            x += 1
+        fired = ts.disarm(armed)
+    assert fired is not None and threading.active_count() >= 1
+    line = next(m for m in caplog.messages if "TAG-STALL-SENTINEL fired" in m)
+    assert "late_ms=" in line
