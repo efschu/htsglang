@@ -725,6 +725,15 @@ class Envs:
     # floor. False = the lockstep, byte for byte.
     SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD = EnvBool(False)
     SGLANG_WEG2_DEPOSIT_LANE_AHEAD = EnvInt(1)
+    # TAG-STALL-SENTINEL (30.09., NF y3z ep52: PP0 still 5.4 s process-wide at
+    # the first tag of P's sleep): per sleep tag, faulthandler's C watchdog
+    # dumps every thread's stack into <evidence>/weg2_tagstall_*.txt when the
+    # tag outlives this many seconds (weg2/tag_stall_sentinel.py). 0 = off.
+    SGLANG_WEG2_TAG_STALL_SENTINEL_S = EnvFloat(1.5)
+    # WEG2-GC warn (30.09.): > 0 arms the gen-2 GC warning in the scheduler
+    # (weg2/gc_instrument.arm_after_boot) when --gc-warning-threshold-secs is
+    # 0; the launcher sets 0.5 for group P by default (--env-p states another).
+    SGLANG_WEG2_GC_WARN_SECS = EnvFloat(0.0)
     # the sleeping group(s) that take the lookahead (comma list, default the
     # P->D direction only: P sleeps, PP0's chain is the Flipzeit's legs).
     SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD_GROUPS = EnvStr("P")
