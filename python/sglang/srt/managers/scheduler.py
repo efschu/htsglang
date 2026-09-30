@@ -3058,6 +3058,10 @@ class Scheduler(
         # sampling warmup's barrier and the first sleep (rc12z30c: PP1 compiled
         # them inside the first real forward, ~9 s of fwd_ms=12783).
         self.warm_qsa_mqa_tilelang()
+        # P-PREWARM: the PLE admission armed and the MoE router's first call
+        # made BEFORE the sampling warmup's barrier and the first sleep
+        # (SGLANG_WEG2_ENABLE_TARGETED_PREWARM; each skips, named, while off).
+        self.warm_targeted_prewarm()
         # #603b: LAST in this method, after every worker, pool, backend and
         # graph exists. The warmup ends in a group barrier, so it must sit at a
         # point every rank reaches exactly once with the model fully built.
@@ -3091,6 +3095,18 @@ class Scheduler(
             model=getattr(runner, "model", None),
             device=self.tp_worker.device,
         )
+
+    def warm_targeted_prewarm(self):
+        """P-PREWARM: delegate to models/qwen4_exp_ple_admit.run_boot_prewarm
+        and layers/moe/router_prewarm.run_boot_prewarm (rank-local, no
+        collective; the #603b barrier right after pairs the ranks up)."""
+        from sglang.srt.layers.moe.router_prewarm import run_boot_prewarm as warm_router
+        from sglang.srt.models.qwen4_exp_ple_admit import run_boot_prewarm as warm_ple
+
+        runner = getattr(self.tp_worker, "model_runner", None)
+        model = getattr(runner, "model", None)
+        warm_ple(model=model)
+        warm_router(model=model, dtype=self.model_config.dtype, device=self.tp_worker.device)
 
     def warm_sampling_backend(self):
         """#603b: make the sampling JIT kernels resident BEFORE serving starts.

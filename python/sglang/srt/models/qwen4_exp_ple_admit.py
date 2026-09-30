@@ -252,6 +252,31 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
             self._pump(w)
             return out
 
+    # -- boot prewarm (P-PREWARM, 30.09.) ---------------------------------------
+    def prewarm(self, *, vocab_start: int, vocab_end: Optional[int]) -> str:
+        """At boot, with the weights on the device: exactly what the first
+        prefill gather sets before its read -- the vocab range (the layer's
+        own ``shard_indices``, the same pair every gather passes), the hash
+        constants on the host (``_warm_hash``: copies of the same buffers) --
+        plus the worker processes. From then on the first request's admission
+        reads its first chunk instead of logging ``skipped: no prefill gather
+        in this process yet``. No slot is mapped here: the admission maps its
+        own at its first read, as before. Returns ``warm`` or why not."""
+        with self._lock:
+            if self._disabled:
+                return "disabled"
+            end = self._table.total_rows if vocab_end is None else vocab_end
+            self._last_vocab = (int(vocab_start), int(end))
+            self._warm_hash()
+            try:
+                self._ensure_workers()
+            except (_pf.PleWorkerLost, OSError) as exc:
+                # what the first gather would do on the same failure
+                logger.error("PLE-PREFETCH disabled: %s -- this process gathers serially from now on", exc)
+                self._disable()
+                return "disabled"
+            return "warm"
+
     # -- admission ---------------------------------------------------------------
     def admit(self, rid: str, ids, chunk_size: Optional[int], *, dormant: bool, source: str,
               start: int = 0) -> Optional[str]:
@@ -471,3 +496,73 @@ def ple_admission_wanted() -> bool:
     except Exception:  # noqa: BLE001 -- no Weg-2 machinery: a stock engine admits
         group = ""
     return str(group).strip().upper() != "D"
+
+
+# --------------------------------------------------------------------------
+# P-PREWARM (30.09.): the admission armed at boot.
+# --------------------------------------------------------------------------
+#
+# Measured reason (y4k 09301110 / y4l 09301150, P logs, tree 3264fb08b5's
+# parent line): the first request of every boot is admitted before any
+# prefill gather ran in the process -- 'PLE-PREFETCH admit rid=weg2-0-5
+# skipped: no prefill gather in this process yet' (11:14:23 and 11:14:27) --
+# so its chunk 0 is read inside its own forward: 'chunk=0 rows=262144
+# ready=none wait_ms=195.1 ... host_ms=228.9', the worker processes spawned in
+# that same gather ('PLE-PREFETCH on' 11:14:27), ple_ms=334.2 against a warm
+# median of 39. Every later first chunk reads 'ready=yes ... host_ms=3-38'.
+# The vocab range and the hash constants do not depend on any request; the
+# boot sets them, the first admission reads.
+
+
+class PleAdmitPrewarmResult(collections.namedtuple("PleAdmitPrewarmResult", "gathers verdicts ms skipped")):
+    __slots__ = ()
+
+    def line(self) -> str:
+        if self.skipped:
+            return f"P-PREWARM PLE-ADMIT skipped: {self.skipped}"
+        return (
+            f"P-PREWARM PLE-ADMIT gathers={self.gathers} verdicts={list(self.verdicts)} "
+            f"ms={self.ms:.1f} -- vocab range and hash constants set, workers up: the "
+            f"first request's admission reads its first chunk"
+        )
+
+
+def admitting_gathers(modules) -> list:
+    """(gather, vocab_start, vocab_end) of every admitting PLE gather in
+    ``modules`` -- the ``Qwen4ExpPinnedHostEmbedding`` that owns it carries
+    the pair its gathers pass (``shard_indices.org_vocab_*_index``)."""
+    out = []
+    for m in modules:
+        g = getattr(m, "_ckpt_pread", None)
+        si = getattr(m, "shard_indices", None)
+        if isinstance(g, PleAdmitPrefetchGather) and si is not None:
+            if all(g is not x[0] for x in out):
+                out.append((g, int(si.org_vocab_start_index), int(si.org_vocab_end_index)))
+    return out
+
+
+def run_boot_prewarm(*, model, clock=time.perf_counter) -> Optional[PleAdmitPrewarmResult]:
+    """The scheduler's delegate (``SGLANG_WEG2_ENABLE_TARGETED_PREWARM``).
+    Skips, named, when the switch is off or the rank holds no admitting PLE
+    gather (group D, PP1/PP2, admission off). Never raises."""
+    try:
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_WEG2_ENABLE_TARGETED_PREWARM.get():
+            res = PleAdmitPrewarmResult(0, (), 0.0, "SGLANG_WEG2_ENABLE_TARGETED_PREWARM off")
+            logger.info("%s", res.line())
+            return res
+        found = admitting_gathers(model.modules()) if model is not None else []
+        if not found:
+            res = PleAdmitPrewarmResult(0, (), 0.0, "no admitting PLE gather on this rank")
+            logger.info("%s", res.line())
+            return res
+        t0 = clock()
+        verdicts = tuple(g.prewarm(vocab_start=vs, vocab_end=ve) for g, vs, ve in found)
+        res = PleAdmitPrewarmResult(len(found), verdicts, (clock() - t0) * 1000.0, "")
+        logger.info("%s", res.line())
+        return res
+    except Exception as exc:  # noqa: BLE001 -- a prewarm never kills a boot
+        logger.warning("P-PREWARM PLE-ADMIT failed (%s: %s); the first prefill gather "
+                       "arms the admission", type(exc).__name__, str(exc)[:200])
+        return None

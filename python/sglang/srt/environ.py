@@ -864,6 +864,14 @@ class Envs:
     # segment == copy events). Byte-identical under the table partials; the
     # single-wave (decode) path is untouched. Off until metal.
     SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP = EnvBool(False)
+    # P-PREWARM (30.09., NF y4k/y4l first P forward vs warm median): at boot,
+    # beside H101/H103/P-COLD, (a) the PLE admission armed -- vocab range,
+    # hash constants on the host, pread workers up (models/qwen4_exp_ple_admit
+    # run_boot_prewarm; ple 334 vs 39 ms, 'admit ... skipped: no prefill
+    # gather in this process yet') -- and (c) the MoE router's first call
+    # (layers/moe/router_prewarm; gate +80-105 ms per stage). No forward, no
+    # new RAM or VRAM. Off until metal.
+    SGLANG_WEG2_ENABLE_TARGETED_PREWARM = EnvBool(False)
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.
