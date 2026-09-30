@@ -407,6 +407,27 @@ int TorchMemorySaver::alloc_info(void* ptr, uint64_t* size, uint64_t* mapped, ui
     return 0;
 }
 
+#if defined(USE_CUDA)
+//: PAUSE-SUB: one cuMemUnmap + cuMemRelease pair on their own clocks.  The
+//: release is skipped when the unmap failed (the caller's CURESULT_CHECK then
+//: names the unmap's code, as before).
+CUresult TorchMemorySaver::timed_unmap_release(void* va, size_t size, CUmemGenericAllocationHandle h,
+                                               PauseSub* sub) {
+    auto t0 = std::chrono::steady_clock::now();
+    CUresult rc = cuMemUnmap((CUdeviceptr) va, size);
+    auto t1 = std::chrono::steady_clock::now();
+    sub->unmaps += 1;
+    sub->unmap_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    if (rc != CUDA_SUCCESS) {
+        return rc;
+    }
+    rc = cuMemRelease(h);
+    sub->release_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    return rc;
+}
+#endif
+
 void TorchMemorySaver::pause(const std::string& tag) {
 #if defined(USE_ROCM)
     ROCmHIPImplementation::rocm_pause(tag, allocation_metadata_, allocator_metadata_mutex_);
@@ -425,6 +446,8 @@ void TorchMemorySaver::pause(const std::string& tag) {
     // The ORDER is load-bearing and is what T4 pins: no page may be unmapped
     // before the copy that reads it has completed, so the single sync lies
     // strictly between pass 1 and pass 3.
+    const auto weg2_pause_t0 = std::chrono::steady_clock::now();   // PAUSE-SUB
+    PauseSub weg2_pause_sub;
     std::vector<void*> matched_ptrs;
     for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
         void *ptr = it->first;
@@ -503,12 +526,21 @@ void TorchMemorySaver::pause(const std::string& tag) {
             continue;
         }
 
+        // PAUSE-SUB: the same calls in the same order as before, each pair on
+        // its own clock (weg2_unmap_all's walk, inlined to be timed).
+        weg2_pause_sub.allocations += 1;
         if (metadata.weg2_extents.empty()) {
-            CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ptr, metadata.size));
-            CURESULT_CHECK(cuMemRelease(metadata.allocHandle));
+            CURESULT_CHECK(timed_unmap_release(ptr, metadata.size, metadata.allocHandle, &weg2_pause_sub));
         } else {
             // H95c: every extent of a span-mapped allocation goes back.
-            CURESULT_CHECK(weg2_unmap_all(ptr, metadata));
+            CUresult first = CUDA_SUCCESS;
+            for (size_t i = 0; i < metadata.weg2_extents.size(); ++i) {
+                const Weg2SpanExtent& e = metadata.weg2_extents[i];
+                CUresult rc = timed_unmap_release((char*) ptr + e.offset, e.size, e.handle, &weg2_pause_sub);
+                if (rc != CUDA_SUCCESS && first == CUDA_SUCCESS) first = rc;
+            }
+            metadata.weg2_extents.clear();
+            CURESULT_CHECK(first);
         }
 
         metadata.state = AllocationState::PAUSED;
@@ -523,6 +555,7 @@ void TorchMemorySaver::pause(const std::string& tag) {
                   << std::endl;
 #endif
     }
+    note_pause(tag, weg2_pause_sub, weg2_pause_t0);   // PAUSE-SUB
 #else
     #error "USE_PLATFORM is not set"
 #endif

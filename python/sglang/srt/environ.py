@@ -795,6 +795,16 @@ class Envs:
     # the sleeping group(s) that take the lookahead (comma list, default the
     # P->D direction only: P sleeps, PP0's chain is the Flipzeit's legs).
     SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD_GROUPS = EnvStr("P")
+    # SLEEP_PAUSE_OVERLAP (30.09., NF y4h/y4i, weg2/pause_overlap.py): the
+    # sleeper's pause(t)+credit(t) run on a worker beside deposit(t+1); at
+    # most one pause in flight, joined before every on-card-lane deposit and
+    # at the leg end. Measured: D's leg binds the D->P flip (TP1 37/39, TP2
+    # 23/31) and pause_ms is 26-28 ms per tag on the 3080 D ranks (5090: 6)
+    # with sync_ms=0 -- 465-517 ms per leg. Inert while H111b runs the leg.
+    # False = the per-tag chain, byte for byte. Off until the first series.
+    SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP = EnvBool(False)
+    # the sleeping group(s) that take it (comma list; default the D->P leg).
+    SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS = EnvStr("D")
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.

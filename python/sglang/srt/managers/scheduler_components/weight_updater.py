@@ -1566,6 +1566,11 @@ class SchedulerWeightUpdaterManager:
         tag a no-op instead of a gap -- while an UNMEASURABLE absence keeps
         the refusal, because nothing then vouches that the bytes are elsewhere.
         """
+        # PAUSE-OVERLAP: the census taken before the sleep loop (every tag
+        # mapped then) -- a running pause holds the saver's mutex.
+        _pre = getattr(self, "_weg2_resident_prefetch", None)
+        if _pre is not None and tag in _pre:
+            return _pre[tag]
         adapter = getattr(self, "memory_saver_adapter", None)
         getter = getattr(adapter, "tag_bytes", None)
         if getter is None:
@@ -3033,6 +3038,108 @@ class SchedulerWeightUpdaterManager:
         except Exception:  # noqa: BLE001 -- no lanes = the lockstep, never a crash
             logger.warning("WEG2-H111B pair lanes unreadable -> lockstep", exc_info=True)
             return []
+
+    @contextmanager
+    def _weg2_pause_overlap_scope(self, recv_req, weights_tags, h111b):
+        """PAUSE-OVERLAP of ONE sleep leg (weg2/pause_overlap.py), or None.
+
+        None (the per-tag chain, call for call) unless
+        SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP is on for this group, the leg
+        is a flip deposit whose on-card lane tags are readable, and H111b is
+        not running it (that form already moves the lanes, not the pause).
+        While armed, the saver's per-tag byte census the deposit's gap check
+        reads is taken ONCE before the loop (every tag is still mapped then),
+        so the loop never waits on the saver's mutex a running pause holds.
+        """
+        from sglang.srt.weg2 import pause_overlap as po
+
+        if h111b is not None or not po.overlap_on(self._weg2_group_name()):
+            yield None
+            return
+        flip_index = _weg2_flip_index_of(getattr(recv_req, "epoch", None))
+        diag = self._weg2_xchg_diag_tags(flip_index)
+        if diag is None:
+            logger.info("%s off for this leg: on-card lane tags unreadable "
+                        "(flip_index=%s) -- the per-tag chain", po.LINE, flip_index)
+            yield None
+            return
+        dev = self._weg2_device_index()
+
+        def _thread_init():
+            if int(dev) >= 0:
+                torch.cuda.set_device(int(dev))
+
+        self._weg2_resident_prefetch = {
+            t: self._weg2_tag_resident_bytes(t) for t in weights_tags}
+        look = po.PauseOverlap(diag, thread_init=_thread_init)
+        failed = False
+        try:
+            yield look
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            self._weg2_resident_prefetch = None
+            if failed:
+                # the loop's own exception names the fault; a pause that
+                # also raised is logged, never allowed to replace it
+                try:
+                    look.close()
+                except Exception:  # noqa: BLE001
+                    logger.exception("%s: the pending pause raised as well", po.LINE)
+            else:
+                look.close()
+                logger.info("%s diag=%s", look.summary(), ",".join(sorted(diag)) or "-")
+
+    def _weg2_xchg_diag_tags(self, flip_index: int):
+        """PAUSE-OVERLAP: the tags this rank deposits on its ON-CARD (diagonal)
+        lane in this flip -- a set (empty = none), or None when the plan cannot
+        be read (the caller then keeps the chain). The same source-hook plan
+        and the same grouping as ``_weg2_xchg_deposit_pair_lanes``; every desc
+        kind counts, so the set is never smaller than the lane's."""
+        from sglang.srt.weg2 import weight_exchange as wx
+        from sglang.srt.weg2 import weight_exchange_bounce as bx
+        from sglang.srt.weg2 import weight_exchange_shadow as sh
+
+        try:
+            if not wx.exchange_armed() or int(flip_index) < 0:
+                return None
+            group = self._weg2_group_name()
+            rank = self._weg2_rank()
+            if not group or rank is None or int(rank) < 0:
+                return None
+            if not wx.leg_enabled(sh.HOOK_SOURCE, group):
+                return None
+            plan, _reason = self._weg2_shadow_plan(
+                sh.HOOK_SOURCE, group, int(rank), agreed=None,
+                require_agreement=False)
+            if plan is None:
+                return None
+            by = bx.group_descs_by_pair(list(plan.descs))
+            return {str(getattr(d, "tag", "")) for d in by.get(None, [])}
+        except Exception:  # noqa: BLE001 -- unreadable = the chain, never a crash
+            logger.warning("WEG2-PAUSE-OVERLAP diag tags unreadable -> chain", exc_info=True)
+            return None
+
+    def _weg2_pause_sub_line(self, tag: str, pause_ms: float) -> None:
+        """PAUSE-SUB (30.09.): the saver's own split of the pause just made --
+        allocations, cuMemUnmap calls, unmap and release clocks. Absent (stock
+        hook, or the record is another tag's): no line, never a zero."""
+        getter = getattr(getattr(self, "memory_saver_adapter", None), "pause_stats", None)
+        if getter is None:
+            return
+        try:
+            st = getter(tag)
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the leg
+            return
+        if not st:
+            return
+        logger.info(
+            "WEG2-PAUSE-SUB tag=%s allocs=%d unmaps=%d unmap_ms=%.1f release_ms=%.1f "
+            "native_ms=%.1f pause_ms=%.1f (unmaps = cuMemUnmap calls: stock mappings + "
+            "H95c extents; native_ms = the saver's whole pause call)",
+            tag, st["allocations"], st["unmaps"], st["unmap_ms"], st["release_ms"],
+            st["total_ms"], float(pause_ms))
 
     def _weg2_xchg_wake_source_gap(self, tag, *, cdescs_present: bool,
                                    resident_bytes: Optional[int] = None,
@@ -9224,7 +9331,8 @@ class SchedulerWeightUpdaterManager:
             # fnFL2 H111b: the pair lanes one tag ahead of the pause
             # (weg2/deposit_lookahead.py); the scope yields None = lockstep.
             with self._weg2_pcie_lock_retired("sleep-D2H " + ",".join(weights_tags)), \
-                    self._weg2_h111b_scope(recv_req, weights_tags) as _h111b:
+                    self._weg2_h111b_scope(recv_req, weights_tags) as _h111b, \
+                    self._weg2_pause_overlap_scope(recv_req, weights_tags, _h111b) as _po:
                 _t_prev_end = None
                 logger.info("WEG2-SLEEP-PRELOOP ms " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _weg2_ph_l) + f" t={time.time():.3f}")
                 for _h111b_i, tag in enumerate(weights_tags):
@@ -9246,6 +9354,11 @@ class SchedulerWeightUpdaterManager:
                     # SGLANG_WEG2_TAG_STALL_SENTINEL_S -- GIL held or not.
                     _stall = _tag_stall.arm(tag, rank=self._weg2_rank(),
                                             group=self._weg2_group_name())
+                    if _po is not None:
+                        # PAUSE-OVERLAP: an on-card-lane deposit waits for the
+                        # pending pause (and its credit) -- the chain's view
+                        # of this card; any other deposit runs beside it.
+                        _po.before_deposit(tag)
                     _t_dep0 = time.perf_counter()
                     _gap_ms = ((_t_dep0 - _t_prev_end) * 1000
                                if _t_prev_end is not None else 0.0)
@@ -9270,35 +9383,49 @@ class SchedulerWeightUpdaterManager:
                     except Exception:  # noqa: BLE001 -- no device: nothing to wait for
                         pass
                     _sync_ms = (time.perf_counter() - _t_sync0) * 1000
-                    t_tag = time.perf_counter()
-                    self.memory_saver_adapter.pause(tag)
-                    weg2_per_tag[tag] = [
-                        float(tag_bytes.get(tag, 0)),
-                        (time.perf_counter() - t_tag) * 1000,
-                    ]
-                    _t_cr0 = time.perf_counter()
-                    if credit is not None:
-                        # The device bytes this tag's pause just gave back --
-                        # the same number, from the same instrument, that the
-                        # waking rank is waiting on.
-                        credit.publish(tag, tag_bytes.get(tag, 0))
-                    if _h111b is not None:
-                        _h111b.advance(_h111b_i)  # H111b: lanes may take the next tag
-                    _t_prev_end = time.perf_counter()
-                    # 2026-09-15 (Nutzer-Order: die Schlaefer-Schleife je Tag
-                    # messen): deposit = plan filter + gap check + lanes,
-                    # pause = tms unmap, credit = publish, gap = the loop's own
-                    # work between the previous tag's credit and this deposit.
-                    logger.info(
-                        "WEG2-SLEEP-TAG-TIME tag=%s deposit_ms=%.0f sync_ms=%.0f pause_ms=%.0f "
-                        "credit_ms=%.0f gap_ms=%.0f total_ms=%.0f t0=%.3f t=%.3f",
-                        tag, (_t_sync0 - _t_dep0) * 1000, _sync_ms,
-                        weg2_per_tag[tag][1], (_t_prev_end - _t_cr0) * 1000,
-                        _gap_ms, (_t_prev_end - _t_dep0) * 1000,
-                        # wall-clock stamps (order point 2 timeline): the
-                        # front log is wall-clock ms, so the legs align on it
-                        time.time() - (time.perf_counter() - _t_dep0),
-                        time.time())
+
+                    def _weg2_pause_step(tag=tag, _t_dep0=_t_dep0, _t_sync0=_t_sync0,
+                                         _sync_ms=_sync_ms, _gap_ms=_gap_ms,
+                                         _h111b_i=_h111b_i):
+                        t_tag = time.perf_counter()
+                        self.memory_saver_adapter.pause(tag)
+                        weg2_per_tag[tag] = [
+                            float(tag_bytes.get(tag, 0)),
+                            (time.perf_counter() - t_tag) * 1000,
+                        ]
+                        _t_cr0 = time.perf_counter()
+                        if credit is not None:
+                            # The device bytes this tag's pause just gave back --
+                            # the same number, from the same instrument, that the
+                            # waking rank is waiting on.
+                            credit.publish(tag, tag_bytes.get(tag, 0))
+                        if _h111b is not None:
+                            _h111b.advance(_h111b_i)  # H111b: lanes may take the next tag
+                        _t_end = time.perf_counter()
+                        # 2026-09-15 (Nutzer-Order: die Schlaefer-Schleife je Tag
+                        # messen): deposit = plan filter + gap check + lanes,
+                        # pause = tms unmap, credit = publish, gap = the loop's own
+                        # work between the previous tag's credit and this deposit.
+                        # PAUSE-OVERLAP: total/t then end at THIS tag's credit,
+                        # which may lie inside the next tag's deposit.
+                        logger.info(
+                            "WEG2-SLEEP-TAG-TIME tag=%s deposit_ms=%.0f sync_ms=%.0f pause_ms=%.0f "
+                            "credit_ms=%.0f gap_ms=%.0f total_ms=%.0f t0=%.3f t=%.3f",
+                            tag, (_t_sync0 - _t_dep0) * 1000, _sync_ms,
+                            weg2_per_tag[tag][1], (_t_end - _t_cr0) * 1000,
+                            _gap_ms, (_t_end - _t_dep0) * 1000,
+                            # wall-clock stamps (order point 2 timeline): the
+                            # front log is wall-clock ms, so the legs align on it
+                            time.time() - (time.perf_counter() - _t_dep0),
+                            time.time())
+                        self._weg2_pause_sub_line(tag, weg2_per_tag[tag][1])
+                        return _t_end
+
+                    if _po is None:
+                        _t_prev_end = _weg2_pause_step()
+                    else:
+                        _po.submit(tag, _weg2_pause_step)
+                        _t_prev_end = time.perf_counter()
                     _tag_stall.disarm(_stall)  # names the dump if it fired
             # #1360b: ONE `WEG2-RING NEED` LINE PER SAVED TAG, not per
             # ring-carried tag.  The loop above guards the `weights_*` family

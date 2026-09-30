@@ -270,6 +270,38 @@ def what_if(flip: dict) -> Optional[Dict[str, Dict[str, float]]]:
     return out
 
 
+def what_if_pause_overlap(flip: dict) -> Optional[dict]:
+    """PAUSE-OVERLAP (weg2/pause_overlap.py) on this flip's measured D leg.
+
+    Per D rank the steps are ``(tag, total_ms - pause_ms, pause_ms)`` in the
+    leg's order; the on-card lane of D rank TPk is the tag's band on the P
+    stage of the SAME card (PPk) when TPk holds a piece of it (no
+    ``pieces=0`` step). Returns the legs' end now and with the overlap, per
+    rank, both from the same model (``chain_end_ms``), plus the rank that
+    binds each."""
+    from sglang.srt.weg2.pause_overlap import chain_end_ms
+
+    p, d = flip.get("p"), flip.get("d")
+    if not p or not d or not flip.get("bytes"):
+        return None
+    t0 = min(min(x["t0"] for x in v) for v in p.values())
+    own = own_tags(flip)
+    noop = flip.get("noop", set())
+    now: Dict[str, float] = {}
+    over: Dict[str, float] = {}
+    for r, v in d.items():
+        recs = sorted(v, key=lambda x: x["t0"])
+        steps = [(x["tag"], x["total_ms"] - x["pause_ms"], x["pause_ms"]) for x in recs]
+        stage = "PP" + r[2:]
+        diag = {t for t in own.get(stage, set()) if (r, t) not in noop}
+        start = (recs[0]["t0"] - t0) * 1000.0
+        now[r] = chain_end_ms(steps, diag, start, overlap=False)[0]
+        over[r] = chain_end_ms(steps, diag, start, overlap=True)[0]
+    return {"now": now, "overlap": over,
+            "legs_end_now": max(now.values()), "legs_end_overlap": max(over.values()),
+            "crit_now": max(now, key=now.get), "crit_overlap": max(over, key=over.get)}
+
+
 def analyze(stem: str) -> List[dict]:
     with open(stem + ".front.log", errors="replace") as fh:
         flips = flips_from_front(fh)
@@ -281,6 +313,7 @@ def analyze(stem: str) -> List[dict]:
         if dec is None:
             continue
         dec["what_if"] = what_if(f)
+        dec["pause_overlap"] = what_if_pause_overlap(f)
         dec["first_chunk_ms"] = f.get("first_chunk_ms", {})
         rows.append(dec)
     return rows
@@ -324,6 +357,17 @@ def report(rows: List[dict]) -> str:
         gain = [r["legs_end"] - r["what_if"][v]["PP0"] for r in rows
                 if r.get("what_if") and "PP0" in r["what_if"].get(v, {})]
         out.append("  WHAT-IF %s band_ready %s  PP0-Gewinn %s" % (v, "  ".join(parts), _q(gain)))
+    po = [r["pause_overlap"] for r in rows if r.get("pause_overlap")]
+    if po:
+        crit: Dict[str, int] = defaultdict(int)
+        for x in po:
+            crit[x["crit_overlap"]] += 1
+        out.append("  WHAT-IF PAUSE-OVERLAP legs_end %s -> %s  Gewinn %s  crit=%s  (%s)" % (
+            _q([x["legs_end_now"] for x in po]), _q([x["legs_end_overlap"] for x in po]),
+            _q([x["legs_end_now"] - x["legs_end_overlap"] for x in po]), dict(crit),
+            "  ".join("D-%s %s->%s" % (rk, _q([x["now"][rk] for x in po if rk in x["now"]]).split("/")[0].strip(),
+                                        _q([x["overlap"][rk] for x in po if rk in x["overlap"]]).split("/")[0].strip())
+                      for rk in sorted({k for x in po for k in x["now"]}))))
     return "\n".join(out)
 
 
