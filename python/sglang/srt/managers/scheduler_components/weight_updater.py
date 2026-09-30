@@ -9916,7 +9916,18 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_rescan_store_index()
                 _weg2_sub_t("rescan", _sub_t0)
                 _rel = getattr(scheduler, "_weg2_release_dormant_hold", None)  # #1443
-                if callable(_rel):
+                from sglang.srt.environ import envs as _envs_hr
+
+                if callable(_rel) and _envs_hr.SGLANG_WEG2_HOLD_RELEASE_AFTER_REPLY.get():
+                    # HOLD-RELEASE-AFTER-REPLY (z30y8 epoch 26): the release -- the hold reads'
+                    # store work and their collectives -- no longer runs inside this RPC. It is
+                    # marked due here, on every rank of the group (this clear half runs on all of
+                    # them or on none, xsn410), and Scheduler.process_input_requests runs it right
+                    # after this resume's reply is sent, at the same list position on every rank.
+                    scheduler._weg2_hold_release_due = True
+                    logger.info("WEG2-HOLD-RELEASE deferred: the #1443 hold release runs after this "
+                                "resume's reply (held=%d)", len(getattr(scheduler, "weg2_dormant_hold", None) or []))
+                elif callable(_rel):
                     _sub_t0 = time.perf_counter()
                     _rel()
                     _weg2_sub_t("hold_release", _sub_t0)

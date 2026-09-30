@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,51 @@ def deferred(req) -> bool:
     return bool(getattr(req, DEFER_ATTR, False))
 
 
+#: HOLD-RELEASE instrument: the segments of one hold read's registration (prefetch_from_storage marks)
+SEGMENTS = (("pre", None, "lockref"), ("bind", "lockref", "bind"), ("alloc", "bind", "alloc"),
+            ("query", "alloc", "vote0"), ("collective", "vote0", "vote1"), ("post", "vote1", None))
+
+
+def _arm_marks(cache):
+    if cache is None:
+        return None
+    try:
+        marks = {}
+        cache.__dict__["_weg2_pfs_marks"] = marks
+        return marks
+    except Exception:  # noqa: BLE001 -- an instrument never breaks the release
+        return None
+
+
+def segment_ms(marks, t0: float, t1: float) -> dict:
+    """ms per segment of one hold read (None = that segment did not run, e.g. an ineligible read)."""
+    stamps = dict(marks or {})
+    stamps[None] = None
+    out = {}
+    for name, a, b in SEGMENTS:
+        ta = t0 if a is None else stamps.get(a)
+        tb = t1 if b is None else stamps.get(b)
+        out[name] = None if ta is None or tb is None else round((tb - ta) * 1000.0, 1)
+    out["total"] = round((t1 - t0) * 1000.0, 1)
+    return out
+
+
+def _report_marks(cache, req, marks, t0: float) -> None:
+    t1 = time.perf_counter()
+    try:
+        if cache is not None:
+            cache.__dict__.pop("_weg2_pfs_marks", None)
+        seg = segment_ms(marks, t0, t1)
+        logger.info("WEG2-HOLD-READ-TIME rid=%s total_ms=%s pre_ms=%s bind_ms=%s alloc_ms=%s query_ms=%s "
+                    "collective_ms=%s post_ms=%s (one hold read's registration: pre = match+eligibility+lock "
+                    "ref, query = everything between the placeholders and the group vote, collective = the "
+                    "vote's all_reduce -- a rank waiting there waits for the slowest)",
+                    str(getattr(req, "rid", "?"))[:12], *(seg[k] for k in
+                    ("total", "pre", "bind", "alloc", "query", "collective", "post")))
+    except Exception:  # noqa: BLE001 -- an instrument never breaks the release
+        pass
+
+
 def issue_deferred_reads(sched, hold) -> list:
     """``#1443 DORMANT-RELEASE``: issue the store read of every held request
     whose intake only looked it up, in hold order. Every rank runs this at
@@ -104,11 +150,17 @@ def issue_deferred_reads(sched, hold) -> list:
     whose read was issued -- the release parks them in the #1471 settle
     until the read is complete."""
     out = []
+    cache = getattr(sched, "tree_cache", None)
     for req in list(hold or ()):
         if not deferred(req):
             continue
         setattr(req, DEFER_ATTR, False)
-        verdict = sched._prefetch_kvcache(req)
+        marks = _arm_marks(cache)
+        t0 = time.perf_counter()
+        try:
+            verdict = sched._prefetch_kvcache(req)
+        finally:
+            _report_marks(cache, req, marks, t0)
         req._969c_verdict = verdict
         apply = getattr(sched, "_apply_prefetch_deferral", None)
         if apply is not None:

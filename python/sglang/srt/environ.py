@@ -1449,6 +1449,11 @@ class Envs:
     # (release) or wake (resume) RPC outlives this many seconds (weg2/rpc_stall_watchdog.py). A normal
     # leg is 1.5-2.3 s; 0 = off. Costs nothing while nothing hangs.
     SGLANG_WEG2_RPC_STALL_WATCHDOG_S = EnvFloat(3.0)
+    # HOLD-RELEASE-AFTER-REPLY (30.09., z30y8 epoch 26: the #1443 hold release inside the kv resume RPC
+    # took 15 s on TP0 -- TP1/TP2 waited in its hicache collective -- and the whole P->D flip with it).
+    # On: the resume only marks the release due; it runs right after the resume's reply is sent, at
+    # the same point of the same intake list on every rank. 0 = the old in-RPC release (A/B arm).
+    SGLANG_WEG2_HOLD_RELEASE_AFTER_REPLY = EnvBool(True)
     # #49 L2 (30.09., desk/27b-front-span-49-0930): at a D->P flip done (D's sleep leg published its tree
     # and joined the store queue) the texts D served in the ending epochs become store presences at D's own
     # #59 weg2_resumable_depth, never the prompt (front_tokens.TokenSpans.promote_published). Front only;

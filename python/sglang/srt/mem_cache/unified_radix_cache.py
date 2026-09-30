@@ -648,6 +648,15 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
+
+def _weg2_pfs_mark(cache, name: str) -> None:
+    """HOLD-RELEASE instrument (30.09., z30y8 epoch 26): a perf_counter stamp of one segment of
+    ``prefetch_from_storage`` -- only while ``park_l3.issue_deferred_reads`` armed the dict for a
+    hold read (one dict lookup otherwise)."""
+    d = cache.__dict__.get("_weg2_pfs_marks")
+    if d is not None:
+        d[name] = time.perf_counter()
+
 #: H108: tree attribute, rid -> key source ("handoff" / "own") of the #950
 #: presence probe the scheduler asked for that rid; printed on #915 REFUSED.
 PRESENCE_SRC_ATTR = "_h108_presence_src"
@@ -6630,17 +6639,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         need = prefetch_length
         if eligible:
             anchor_lock_params = self.inc_host_lock_ref(last_host_node).to_dec_params()
+            _weg2_pfs_mark(self, "lockref")
             _alloc_read = getattr(self.cache_controller.mem_pool_host, "alloc_read", None)
             _bind = getattr(self.cache_controller.mem_pool_host, "ensure_bound", None)
-            if callable(_alloc_read) and callable(_bind) and _bind(
+            _bound = callable(_alloc_read) and callable(_bind) and _bind(
                 self.cache_controller.storage_backend, role="kv"
-            ):
+            )
+            _weg2_pfs_mark(self, "bind")
+            if _bound:
                 # #1424 Stufe 3: read rows are arena slots, resolved at the
                 # read; the registration hands out placeholders, no budget.
                 host_indices = _alloc_read(prefetch_length)
                 read_placeholders = host_indices is not None
             else:
                 host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+            _weg2_pfs_mark(self, "alloc")
             if host_indices is None:
                 self.evict_host(prefetch_length)
                 host_indices = self.cache_controller.mem_pool_host.alloc(
@@ -6917,11 +6930,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _vote_list[2] = _end_base + local_len if local_len > 0 else 0
                 _vote_list += [-_end_base, _fa_host_base_vote(_end_base)]
             vote = torch.tensor(_vote_list, dtype=torch.int)
+            _weg2_pfs_mark(self, "vote0")
             self._all_reduce_attn_groups(
                 vote,
                 torch.distributed.ReduceOp.MIN,
                 label="prefetch_participation_vote",
             )
+            _weg2_pfs_mark(self, "vote1")
             tag_lo, tag_hi = int(vote[0].item()), -int(vote[1].item())
             if tag_lo != tag_hi or tag_lo != _PREFETCH_VOTE_TAG:
                 raise HiCacheCollectiveDesyncError(

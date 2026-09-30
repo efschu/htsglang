@@ -4306,6 +4306,11 @@ class Scheduler(
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
             _s_ms = (time.perf_counter() - _t_disp) * 1000.0 - _d_ms
+            if self.__dict__.get("_weg2_hold_release_due"):
+                # HOLD-RELEASE-AFTER-REPLY: the resume that marked it has just answered; the
+                # release runs HERE -- the same position of the same broadcast intake list on
+                # every rank -- before any later request of this list is dispatched.
+                self._weg2_run_deferred_hold_release()
             _disp_n += 1
             _disp_sum_ms += _d_ms + _s_ms
             if _d_ms + _s_ms > _disp_max_ms:
@@ -6734,6 +6739,30 @@ class Scheduler(
                 logger.info("#1471 SETTLE-RELEASE rid=%s state=%s lapsed=%s held_after_wake_s=%.1f",
                             str(_r.rid)[:12], _s, _l, now - float(getattr(_r, "_1471_since", now)))
         return len(release)
+
+    def _weg2_run_deferred_hold_release(self) -> int:
+        """HOLD-RELEASE-AFTER-REPLY (30.09., z30y8 epoch 26): the #1443 release the kv resume marked
+        due (weight_updater, SGLANG_WEG2_HOLD_RELEASE_AFTER_REPLY). Measured: inside the RPC it held
+        the P->D flip 15 s (wake=16638 ms) -- TP0 issued the hold reads' store work while TP1/TP2
+        waited in its hicache collective. Here the flip is already done. Runs on every rank at the
+        same point (see the call site); watched by the RPC-STALL-WATCHDOG as kind ``hold_release``.
+        Exceptions propagate as they did out of the resume (a partial release on one rank is the
+        disagreement the group stop exists for)."""
+        self._weg2_hold_release_due = False
+        from sglang.srt.weg2 import rpc_stall_watchdog as _rsw
+
+        armed = _rsw.arm("hold_release", rank=getattr(self, "tp_rank", "?"),
+                         group=os.environ.get("SGLANG_WEG2_GROUP", "") or "?")
+        t0 = time.perf_counter()
+        n_hold = len(getattr(self, "weg2_dormant_hold", None) or [])
+        try:
+            n = self._weg2_release_dormant_hold()
+        finally:
+            _rsw.disarm(armed)
+        logger.info("WEG2-HOLD-RELEASE after-reply held=%d released=%s ms=%.0f wake_seq=%s (the #1443 release "
+                    "outside the kv resume RPC: the flip was done before it began)", n_hold, n,
+                    (time.perf_counter() - t0) * 1000.0, getattr(self, "_weg2_wake_seq", None))
+        return n
 
     def _weg2_release_dormant_hold(self) -> int:
         """#1443: the wake cleared the dormant flag -- the held requests join
