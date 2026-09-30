@@ -7137,10 +7137,38 @@ def _l3_attach_from_index(log: Log, directory: str, dry: bool, epoch: float,
         jn.write("E", now, size, stem)
     files = nbytes = removed = orphans = orphan_bytes = 0
     rev_n = rev_bytes = rev_failed = 0
+    # 30.09. (27B dual1f 9pb9ex, launcher 101 % CPU in glob for minutes): one glob per open intent
+    # re-listed the intent's whole shard (~3200 names) -- 1.4M journal lines x 256 shards. List every
+    # directory ONCE and look the staging names up there; same files removed, O(entries) not O(intents x shard).
+    _listing: Dict[str, Dict[str, List[str]]] = {}
+
+    def _staging(final_path: str) -> List[str]:
+        d, base = os.path.split(final_path)
+        by_final = _listing.get(d)
+        if by_final is None:
+            by_final = {}
+            try:
+                names = os.listdir(d)
+            except OSError:
+                names = []
+            for n in names:
+                i = n.find(".tmp.")
+                if i > 0:
+                    by_final.setdefault(n[:i], []).append(os.path.join(d, n))
+            _listing[d] = by_final
+        return by_final.get(base, [])
+
+    def _shard_final(stem: str) -> str:
+        # the backend's shard rule WITHOUT page_path's existence probes: an open intent's page
+        # usually does not exist (the write died), and page_path then globs ALL shards per stem
+        pre = stem[:2]
+        shard = pre if len(pre) == 2 and all(c in "0123456789abcdef" for c in pre) else "zz"
+        return os.path.join(directory, shard, f"{stem}.bin")
+
     for stem in intents:
-        final = _sj.page_path(directory, stem)
-        for p in {glob.escape(final), glob.escape(os.path.join(directory, f"{stem}.bin"))}:
-            for tmp in glob.glob(p + ".tmp.*"):
+        final = _shard_final(stem)
+        for p in {final, os.path.join(directory, f"{stem}.bin")}:
+            for tmp in _staging(p):
                 if not dry:
                     try:
                         os.unlink(tmp)
