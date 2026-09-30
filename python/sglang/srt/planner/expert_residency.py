@@ -1103,7 +1103,8 @@ OWNED_EXACT_CHECKS = 64
 #: Form A). ``workers`` (default) is the x1 rule as before; ``round`` reports
 #: x1 but does not enforce it: feasible is every form with an edge on every
 #: rank, ranked by the synchronized round (max T_r over ALL ranks, then the
-#: sum, then the ownership move).
+#: next-worst rank -- :func:`owned_rank_key`, #287 -- then the sum, then the
+#: ownership move).
 OWNED_X1_ENV = "SGLANG_WEG2_OWNED_CUT_X1"
 OWNED_X1_SCOPES = ("workers", "round")
 
@@ -1181,6 +1182,27 @@ def owned_round_ms(fits: Sequence["DRankResidency"], *, host: int, num_experts: 
                 t += int(fa_layers) * float(lse_ms)
         out.append(t)
     return tuple(out)
+
+
+def owned_rank_key(ms: Sequence[float]) -> Tuple[Tuple[float, ...], float]:
+    """#287: how the owned solve ranks two forms by their T_r -- the T_r sorted
+    descending and compared lexicographically (leximax: the max first, then
+    the next-worst rank, ...), then the sum.
+
+    The old key was (max, sum). Whenever the host binds the max (every NF
+    boot of 29./30.09.: TP0 35.92 ms at bs1), every worker split ties on it,
+    and the sum cannot break the tie: the KV rows one 3080 gives up are the
+    rows the other takes, at the same cost per row (y3j 09291933 [7.35, 26.11]
+    and korr 09292034 [5.17, 28.29] both 33.46; 09300002 [5.17, 30.46] vs
+    [7.35, 28.28], both 35.63). The pick fell to rounding and to the lexical
+    order of the share vector -- the KV onto TP2 up to its x1 edge, TP2's
+    FR_D 0.393 -> 0.256 (62 -> 40 D-resident experts). bs1 did not move; from
+    bs2 on TP2 missed 2.5x (1.1 -> 2.2-3.8 per layer and forward at bs3, same
+    replayed load) and bound the synchronized round: bs3 42 -> 55-61 ms. The
+    next-worst rank is the one that binds as the seats fill, so it breaks the
+    tie; the bs1 objective (the max) is untouched."""
+    v = tuple(sorted((round(float(x), 9) for x in ms), reverse=True))
+    return v, round(float(sum(ms)), 9)
 
 
 def _compositions(total: int, parts: int, step: int):
@@ -1272,7 +1294,8 @@ def solve_owned_cut(
     ``share_step``s, the ownership over :func:`owned_ratio_vectors`.
 
     Objective (plan_s3_251 §1, not S2b's max-min): the smallest max_r T_r
-    of :func:`owned_round_ms` at bs1, ties by the sum, then by the smaller
+    of :func:`owned_round_ms` at bs1, ties by the next-worst rank
+    (:func:`owned_rank_key`, #287), then by the sum, then by the smaller
     ownership move. Feasible: every rank has an edge with room for its
     scratch plus two rows, and the x1 rule -- no worker carries more miss
     time than it does in Form A with the stated ownership (the workers are
@@ -1372,18 +1395,17 @@ def solve_owned_cut(
                 continue
             feas += 1
             # forced: a form keeping x1 wins over one that breaks it
-            ranked.append((0 if (x1 or not ranks_x1) else 1, round(max(ms), 9),
-                           round(sum(ms), 9), move, tuple(rat), tuple(sh)))
+            ranked.append((0 if (x1 or not ranks_x1) else 1, owned_rank_key(ms),
+                           move, tuple(rat), tuple(sh)))
     ranked.sort()
     best = None
     for key in ranked[:OWNED_EXACT_CHECKS]:
-        rat, sh = key[4], key[5]
+        rat, sh = key[3], key[4]
         fits, ms = _exact(rat, sh)
         x1 = _verdict(fits, ms)
         if x1 is None:
             continue
-        exact_key = (0 if (x1 or not ranks_x1) else 1, round(max(ms), 9), round(sum(ms), 9),
-                     key[3], rat, sh)
+        exact_key = (0 if (x1 or not ranks_x1) else 1, owned_rank_key(ms), key[2], rat, sh)
         if best is None or exact_key < best[0]:
             best = (exact_key, rat, sh, fits, ms)
         if best is not None and best[0][:2] <= key[:2]:
