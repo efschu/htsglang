@@ -323,7 +323,17 @@ class Envs:
     # when an insert frees a request's fresh KV slots in favour of the tree's
     # own (same tokens), move the draft rows the fresh slots hold to the kept
     # slots instead of dropping them. Off = no alias listener, byte-identical.
-    SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY = EnvBool(False)
+    # Default: the 27B release fixes of the published form's profile
+    # (weg2/form.py ModelProfile.d_release_fixes, qwen27b on since 30.09.,
+    # nextflash off); off without a form; an explicit value wins.
+    SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY = EnvBool(
+        _profile_default("SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY", False))
+    # Producer-phase census ledger: O(1) FIFO eviction at its cap (KR
+    # e54ac95c65, mem_cache/producer_phase_census.py, read once per process;
+    # the reader keeps its parse of an explicit value, only "1" arms). Default
+    # as DEDUP_CARRY above (ModelProfile.d_release_fixes).
+    SGLANG_WEG2_CENSUS_O1_EVICT = EnvBool(
+        _profile_default("SGLANG_WEG2_CENSUS_O1_EVICT", False))
     # DFLASH window pool, hole rows out of the draft softmax (27b-draftwin
     # 26.09.): window rows without draft KV (prefix from P / HiCache after a
     # flip or loadback) read the hole slot 0 and dilute the draft attention.

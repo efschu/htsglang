@@ -288,7 +288,8 @@ _LEDGER_MAX = 1 << 19  # 524288 keys; the measured store held 24277 pages.
 #: 24k evictions) showed 0.5 s and n4h/chunka (past the cap) 6.3/4.9 s.
 #: Armed (=1): the ledger becomes an OrderedDict on its first eviction and the
 #: oldest key leaves by ``popitem(last=False)`` -- O(1), same FIFO order, same
-#: contents, same readers. Default 0 = byte-identical to before.
+#: contents, same readers. Unset: the profile default (qwen27b on since
+#: 30.09.; nextflash and no form off = byte-identical to before).
 ENV_O1_EVICT = "SGLANG_WEG2_CENSUS_O1_EVICT"
 _o1_evict: bool | None = None
 
@@ -298,7 +299,16 @@ def census_o1_evict_armed() -> bool:
     is process-local; every rank of a group gets the same launcher env)."""
     global _o1_evict
     if _o1_evict is None:
-        _o1_evict = (os.environ.get(ENV_O1_EVICT, "0") or "0").strip() == "1"
+        raw = (os.environ.get(ENV_O1_EVICT, "") or "").strip()
+        if raw:
+            _o1_evict = raw == "1"
+        else:
+            # unset or blank: the published form's profile default (27B
+            # release fixes, weg2/form.py ModelProfile.d_release_fixes:
+            # qwen27b on since 30.09., nextflash off; no form: off).
+            from sglang.srt.weg2.form import profile_switch_default
+
+            _o1_evict = bool(profile_switch_default(ENV_O1_EVICT, False))
     return _o1_evict
 
 

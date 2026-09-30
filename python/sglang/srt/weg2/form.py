@@ -332,6 +332,14 @@ HG_BASE_SWITCHES: Tuple[str, ...] = (
     "SGLANG_DFLASH_PLAN_SYNC_FREE",
     "SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE",
 )
+#: 27B release-draft BUG FIXES (27b-release-draft.env ``_form``, every 27B boot
+#: since rc10/rc11), one registry field ``d_release_fixes``: the DFLASH window
+#: pool's draft-row carry across radix dedup (DK 7faa13dc1c) and the O(1) FIFO
+#: eviction of the producer-phase census ledger at its cap (KR e54ac95c65).
+RELEASE_FIX_SWITCHES: Tuple[str, ...] = (
+    "SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY",
+    "SGLANG_WEG2_CENSUS_O1_EVICT",
+)
 #: the one of them P and D must run identically (Befund M: the rendered
 #: prompt, hence the prefix keys, differ otherwise)
 PREFIX_SWITCH_P_EQ_D: Tuple[str, ...] = ("SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE",)
@@ -561,6 +569,19 @@ class ModelProfile:
     #: after the host wait moved (ff3d9ccfc3). qwen27b on (30.09.), nextflash
     #: off (its D is MTP; the four never act there). Explicit env wins.
     d_hostgap_base: bool = False
+    #: :data:`RELEASE_FIX_SWITCHES` on as ONE field (bug fixes of defects
+    #: MEASURED on 27B metal, running in every 27B boot since rc10/rc11):
+    #: DEDUP_CARRY -- ~2046 unmapped draft prefix slots per round and request,
+    #: 12.1 M per rank in i8h (D logs on d98b3ba08a), armed 3/3 in every boot
+    #: since ('DEDUP-CARRY armed', dkr27browauthoritybar1fs09291750);
+    #: CENSUS_O1_EVICT -- n4h dkr27bnvfp4bar1mwh09261131: 6.3 s of a 9.5 s
+    #: 240k P->D flip was the kv resume unread behind the quadratic evict at
+    #: the 524288-key cap; under agent load w109290020 hit the cap on 3/3 ranks
+    #: at 00:51:00 inside the P->D resume of epoch 150 and the first content
+    #: came 2.5 s after the flip ('KR CENSUS-O1-EVICT ledger at its cap').
+    #: qwen27b on (30.09.); nextflash off here -- NF decides its own default
+    #: (KR pick e17bd548b5). Explicit env wins.
+    d_release_fixes: bool = False
     #: 27B row 24b: --d-token-placement (weg2/d_token_placement.py) -- where
     #: group D's NEW KV tokens land. The launcher's DEFAULT for an unset flag
     #: on a checkpoint whose registry format is in ``d_token_placement_formats``
@@ -598,6 +619,8 @@ class ModelProfile:
             out[env_name] = bool(self.d_hostgap_levers)
         for env_name in HG_BASE_SWITCHES:
             out[env_name] = bool(self.d_hostgap_base)
+        for env_name in RELEASE_FIX_SWITCHES:
+            out[env_name] = bool(self.d_release_fixes)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -777,6 +800,8 @@ PROFILES: Dict[str, ModelProfile] = {
         d_hostgap_levers=True,
         # HG base (row 24h): the form HG was measured under -- see the field.
         d_hostgap_base=True,
+        # release-draft bug fixes (DEDUP_CARRY, CENSUS_O1_EVICT) -- see the field.
+        d_release_fixes=True,
         # row 24b: bandwidth on INT8 only (rc9meas -1.1 ... -3.1 % in depth).
         # --d-reshard stays off (wake-seg + drq: gain at 6 of 24 points, the
         # drq preset has no A/B of its own -- inventory class b).
@@ -935,6 +960,7 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: SGLANG_WEG2_FRONT_EXACT_TOKENS (``front_exact_tokens``, X-EXACT 26.09.).
 #: :data:`HG_SWITCHES` (``d_hostgap_levers``, 27B row 24h, on 29.09.).
 #: :data:`HG_BASE_SWITCHES` (``d_hostgap_base``, 27B row 24h, on 30.09.).
+#: :data:`RELEASE_FIX_SWITCHES` (``d_release_fixes``, 27B bug fixes, on 30.09.).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }

@@ -115,3 +115,68 @@ def test_early_draft_acts_on_the_27b_row_without_any_env(clean):
     assert H.early_draft_on() is True
     assert H.defer_seq_lens_cpu_on() is True
     assert H.defer_rebuild_on() is True
+
+
+# ---------------------------------------------------------------------------
+# Group 2: the two release-draft BUG FIXES (27b-release-draft.env _form, every
+# 27B boot since rc10/rc11), one registry field ``d_release_fixes``:
+#  * SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY (DK 7faa13dc1c): radix dedup freed
+#    fresh draft slots -> ~2046 unmapped draft prefix slots per round and
+#    request, 12.1 M per rank in i8h (D logs on d98b3ba08a); armed on metal
+#    in every 27B boot since ('DEDUP-CARRY armed' 3/3, 0929_175011).
+#  * SGLANG_WEG2_CENSUS_O1_EVICT (KR e54ac95c65): n4h dkr27bnvfp4bar1mwh09261131
+#    240k P->D flip 9.5 s, 6.3 s of it the kv resume unread behind the
+#    quadratic FIFO evict at the 524288-key cap. Witness on metal under agent
+#    load: w109290020 'KR CENSUS-O1-EVICT ledger at its cap (524288 keys)'
+#    3/3 ranks at 00:51:00 inside the P->D resume of epoch 150 (done
+#    00:50:58,740 -> first content 00:51:01,224 = 2.5 s, no 6 s stall).
+# ---------------------------------------------------------------------------
+
+FIXES = ("SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY", "SGLANG_WEG2_CENSUS_O1_EVICT")
+
+
+def _fix_readers():
+    from sglang.srt.mem_cache import producer_phase_census as C
+
+    def census():
+        C._o1_evict = None  # read once per process: reset the cache per case
+        return C.census_o1_evict_armed()
+
+    return {
+        "SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY":
+            lambda: bool(envs.SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY.get()),
+        "SGLANG_WEG2_CENSUS_O1_EVICT": census,
+    }
+
+
+def test_release_fixes_are_one_registry_field():
+    assert tuple(FM.RELEASE_FIX_SWITCHES) == FIXES
+    assert FM.PROFILES["qwen27b"].d_release_fixes is True
+    assert FM.PROFILES["nextflash"].d_release_fixes is False
+    for name in FIXES:
+        assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][name] is True
+        assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][name] is False
+
+
+@pytest.mark.parametrize("name", FIXES)
+@pytest.mark.parametrize("profile,explicit,want", [
+    ("qwen27b", None, True),
+    ("qwen27b", "", True),
+    ("qwen27b", "0", False),
+    ("qwen27b", "1", True),
+    ("nextflash", None, False),   # NF decides its own default (KR pick e17bd548b5)
+    ("nextflash", "1", True),
+    (None, None, False),
+])
+def test_release_fixes_default(clean, name, profile, explicit, want):
+    for n in FIXES:
+        clean.delenv(n, raising=False)
+    _as(clean, profile)
+    if explicit is not None:
+        clean.setenv(name, explicit)
+    try:
+        assert _fix_readers()[name]() is want
+    finally:
+        from sglang.srt.mem_cache import producer_phase_census as C
+
+        C._o1_evict = None
