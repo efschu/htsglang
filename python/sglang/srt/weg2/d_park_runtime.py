@@ -345,15 +345,30 @@ def _park_end(sched, running, *, reduce_min=None) -> int:
 _NO_ANCHOR = 1 << 62
 
 
-def _local_anchor(req) -> int:
+def _local_anchor(req, tree_cache=None) -> int:
     """This rank's view of the depth ``req``'s retaining retraction leaves
     as its resume anchor: the tracked position the mamba retention inserts
     at (``mamba_last_track_seqlen``, the #1469 RETAIN ``cache_len`` -- y3p
-    weg2-4-8 2368, weg2-8-12 16704), else the admission's matched prefix
-    (the anchor the request was admitted on stays on its path)."""
+    weg2-4-8 2368, weg2-8-12 16704).
+
+    H' (30.09.): without a pending track point the anchor is the one the TREE
+    already holds on the request's path -- the depth #59b names a few lines
+    later and the wake resumes from (``weg2_resumable_depth.local_depth``, the
+    side-effect-free admission probe). NOT ``len(prefix_indices)``: after the
+    D-direct extend's own retain (``cache_unfinished_req``) the track is
+    cleared and ``prefix_indices`` covers the whole extended KV, tombstoned
+    above the anchor. y3y weg2-14-34: RETAIN cache_len=2368, F4 anchor=4446
+    (window=default [3904, 4444)), #59b 2368, 'adopt=skipped:prefix:2368' and
+    D computed 2078 tokens again behind the wake; y3w weg2-2-7 (4448 vs
+    2368) and weg2-6-11 (18782 vs 16704) the same. Only without a tree (desk
+    stubs) the matched prefix stays the fallback."""
     t = req.mamba_last_track_seqlen
     if t is not None and int(t) >= 0:
         return int(t)
+    if tree_cache is not None:
+        # an unpriceable probe votes 0: no anchor, today's window
+        depth = int(weg2_resumable_depth.local_depth(tree_cache, req))
+        return depth if depth > 0 else _NO_ANCHOR
     if req.prefix_indices is not None:
         return len(req.prefix_indices)
     return _NO_ANCHOR
@@ -387,7 +402,8 @@ def _park_anchors(sched, running, *, reduce_min=None):
     from sglang.srt.managers import tp_match_floor
 
     follows = tp_match_floor.this_rank_follows()
-    local = [_NO_ANCHOR if follows else _local_anchor(r) for r in running]
+    tree = getattr(sched, "tree_cache", None)
+    local = [_NO_ANCHOR if follows else _local_anchor(r, tree) for r in running]
     if reduce:
         local = (reduce_min or weg2_resumable_depth._tp_min)(local)
     return [None if int(v) >= _NO_ANCHOR else int(v) for v in local], mode
