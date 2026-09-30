@@ -816,7 +816,8 @@ function cacheHtml(b, now, awake) {
     const x = c[g]; if (!x) return "";
     const w = x.window || {}, a = x.boot || {};
     const r = (o) => o.req_hit_share == null ? "\u2014" : `${pct(o.req_hit_share)} <span class="muted">(${fmt(o.cached)} / ${fmt(o.prompt)})</span>`;
-    return `<tr><td>${label}</td><td class="num">${r(w)}</td><td class="num">${r(a)}</td><td colspan="4" class="muted">${fmt(a.n)} Anfragen seit Boot</td></tr>`;
+    const bu = x.bursts_n ? `<tr><td class="muted">&nbsp;&nbsp;davon Burst identischer Prompts (Bench)</td><td class="num">${x.window.hit_no_burst == null ? "—" : pct(x.window.hit_no_burst) + " <span class=\"muted\">ohne Burst</span>"}</td><td class="num">${x.ring && x.ring.hit_no_burst != null ? pct(x.ring.hit_no_burst) + ` <span class="muted">ohne Burst, ${fmt(x.ring.span_s / 60)} min</span>` : "—"}</td><td colspan="4" class="muted">${fmt(x.bursts_n)} Burst(s) in ${fmt((x.ring || {}).span_s / 60 || 16)} min: ${x.bursts.map((z) => `${z.n}&times;${fmt(z.len)} Tok um ${hhmm(z.t)}`).join(", ")} &middot; k gleiche Prompts im selben P-Pass: keiner kann auf den ersten warten, cached = 0 ist dort Physik, kein Cache-Fehler</td></tr>` : "";
+    return `<tr><td>${label}</td><td class="num">${r(w)}</td><td class="num">${r(a)}</td><td colspan="4" class="muted">${fmt(a.n)} Anfragen seit Boot</td></tr>` + bu;
   };
   const prog = "";
   return `<div class="cachebox">

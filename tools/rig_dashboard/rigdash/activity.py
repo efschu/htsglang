@@ -315,6 +315,14 @@ class Model:
                 end = float(x["first_work_ts"])
             if end is None and x.get("flip_time_ms") is not None:
                 end = b + float(x["flip_time_ms"]) / 1000.0
+            if x.get("dir") == "D>P" and end is not None:
+                # the front's first-work stamp for D>P is the leg-1 DISPATCH (flip_user_time
+                # prefill_start_source "leg1_dispatch" on y4z too); P's prefill really starts with its
+                # first chunk (rank prefill.last) -- measured NF y4z 30.09.: up to 5 s later
+                pcs = self.pchunks.get("P", []) + self.pchunks.get("single", [])
+                first = min((c["s"] for c in pcs if done - 0.5 <= c["s"] <= done + 20.0), default=None)
+                if first is not None and first > end:
+                    end = first
             if end is not None and end > done:
                 out.append((done, end, x.get("dir") or ""))
         return out
@@ -340,7 +348,8 @@ class Model:
             raw.append((s, e, "flip_tail", 1))
         for g, cs in self.pchunks.items():
             k = "D" if g == "D" else "P"
-            for c in cs:
+            # a burst is one prefill phase: between two chunks of it the pipeline's other stages work
+            for c in bursts(cs):
                 raw.append((c["s"], c["e"], k, 2 if k == "P" else 3))
         for d in self.dec:
             for x, y in d["parts"]:
@@ -395,6 +404,9 @@ class Model:
         return segs
 
     def _why_unknown(self, x) -> str:
+        return self._why_unknown_base(x)
+
+    def _why_unknown_base(self, x) -> str:
         pairs = [(a, b) for a, b in zip(self.ring, self.ring[1:]) if a["t"] < x["e"] and b["t"] > x["s"]]
         if not pairs or any(b["t"] - a["t"] > SAMPLE_GAP_S for a, b in pairs):
             return "keine IPC-Probe in dieser Zeit"

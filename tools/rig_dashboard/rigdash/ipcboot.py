@@ -423,6 +423,27 @@ def totals_view(ring, keys, front, boot_t0, now) -> dict:
             "boot_wall_s": wall, "read_progress": 1.0}
 
 
+def identical_bursts(ring, group: str = "P") -> List[dict]:
+    """Bursts of identical prompts (NF-Operator 30.09.: dmatrix bs stages send k identical prompts at
+    once, e.g. 6 x 65602 tokens within 15 ms; in one P pass none can wait for the first, so all are
+    cached = 0 -- a bench pattern, not a broken cache).  From the front's served_tokens mirror
+    (state.json front, IPC): one mirror step whose Δn >= 2 legs all ended together, whose Δprompt
+    splits into Δn equal lengths and which read nothing from cache.  (A per-leg record would make
+    it exact; the mirror carries sums.)"""
+    out, prev = [], None
+    for smp in ring:
+        row = (((smp.get("front") or {}).get("served_tokens")) or {}).get(group)
+        if not isinstance(row, dict):
+            continue
+        cur = (float(row.get("n") or 0), float(row.get("prompt") or 0), float(row.get("cached") or 0))
+        if prev is not None and cur != prev:
+            dn, dp, dc = cur[0] - prev[0], cur[1] - prev[1], cur[2] - prev[2]
+            if dn >= 2 and dp > 0 and dc == 0 and abs(dp / dn - round(dp / dn)) < 1e-9 and dp / dn >= 1024:
+                out.append({"t": smp["t"], "n": int(dn), "len": int(round(dp / dn)), "prompt": dp})
+        prev = cur
+    return out
+
+
 def cache_view(ring, keys, now) -> dict:
     out = {}
     last = ring[-1] if ring else None
@@ -465,6 +486,19 @@ def cache_view(ring, keys, now) -> dict:
         wp, wc = pr - float(o.get("prompt") or 0), ca - float(o.get("cached") or 0)
         out["served_" + g] = {"boot": {"n": row.get("n"), "prompt": pr, "cached": ca, "req_hit_share": ca / pr if pr else None},
                               "window": {"prompt": wp, "cached": wc, "req_hit_share": wc / wp if wp > 0 else None}}
+        # hit rate without bursts of identical prompts (bench), over the window and over the ring
+        bu = identical_bursts(ring, g)
+        if bu:
+            first = next((x for x in ring if isinstance((((x.get("front") or {}).get("served_tokens")) or {}).get(g), dict)), None)
+            r0 = ((first or {}).get("front") or {}).get("served_tokens", {}).get(g) or {}
+            rp, rc = pr - float(r0.get("prompt") or 0), ca - float(r0.get("cached") or 0)
+            bw = sum(x["prompt"] for x in bu if x["t"] >= now - WINDOW_S)
+            ba = sum(x["prompt"] for x in bu)
+            out["served_" + g]["bursts"] = bu[-6:]
+            out["served_" + g]["bursts_n"] = len(bu)
+            out["served_" + g]["window"]["hit_no_burst"] = (wc / (wp - bw)) if wp - bw > 0 else None
+            out["served_" + g]["ring"] = {"prompt": rp, "cached": rc, "hit": rc / rp if rp > 0 else None,
+                                          "hit_no_burst": rc / (rp - ba) if rp - ba > 0 else None, "span_s": RING_S}
     return out
 
 

@@ -180,6 +180,23 @@ class TestPhaseStates(unittest.TestCase):
         unk = [x for x in m.segments(40.0) if x["k"] == "unknown"]
         self.assertTrue(unk and unk[-1]["s"] <= 30.0 and unk[-1]["e"] >= 38.0)
 
+    def test_dp_tail_runs_to_the_first_p_chunk(self):
+        # D>P: the first-work stamp is only the leg-1 dispatch; the tail ends where P's first chunk starts
+        ring = []
+        for i in range(21):
+            t = float(i)
+            done = 1 if t >= 12.0 else 0
+            ring.append({"t": t, "front": {"queue": 0, "outstanding": 0},
+                         "r": {"P.tp0pp0": ipcboot.compact({"ts": t, "prefill": {"chunks": done, "new_tokens": 16384 * done,
+                                                                                  "compute_ms": 2000.0 * done,
+                                                                                  "last": {"t": 12.0, "gpu_ms": 2000.0, "new": 16384} if done else None}})}})
+        fd = [{"sleep": "D", "wake": "P", "flip_begin_ts": 4.0, "t": 6.0}]
+        fw = [{"dir": "D>P", "flip_begin_ts": 4.0, "first_work_ts": 6.1, "flip_time_ms": 2100, "what": "p_leg1_dispatch"}]
+        m = activity.Model(ring, fd, fw, life={"serving_since": -1.0})
+        segs = [(x["k"], round(x["s"], 1), round(x["e"], 1)) for x in m.segments(20.0)]
+        self.assertIn(("flip_tail", 6.0, 10.0), segs)             # 10.0 = 12.0 - 2.0 s first chunk
+        self.assertIn(("flip_dp", 4.0, 6.0), segs)
+
     def test_open_flip_and_off(self):
         begins = [{"flip_begin_ts": 30.0, "sleep": "D", "wake": "P"}]
         m = activity.Model(self.ring(), self.FD, self.FW, begins=begins,
@@ -197,6 +214,26 @@ class TestPhaseStates(unittest.TestCase):
             for k in activity.STATES:
                 self.assertIn(".ph-k-%s {" % k, page)
             self.assertIn('const PHASE_ORDER = ["P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "idle", "off", "unknown"]', page)
+
+
+class TestIdenticalBurst(unittest.TestCase):
+    """dmatrix bench: 6 identical 65602-token prompts at once, all cached = 0 -- shown as a burst of
+    identical prompts, and the hit rate is also given without it."""
+
+    def test_synthetic_burst(self):
+        def smp(t, n, prompt, cached):
+            return {"t": t, "r": {}, "front": {"served_tokens": {"P": {"n": n, "prompt": prompt, "cached": cached}}}}
+        ring = [smp(0.0, 10, 100000, 40000), smp(5.0, 11, 110000, 48000),       # ordinary leg: 8k of 10k cached
+                smp(10.0, 17, 110000 + 6 * 65602, 48000),                           # burst: 6 x 65602, cached 0
+                smp(15.0, 18, 110000 + 6 * 65602 + 10000, 56000)]
+        bu = ipcboot.identical_bursts(ring)
+        self.assertEqual([(b["n"], b["len"]) for b in bu], [(6, 65602)])
+        c = ipcboot.cache_view(ring, set(), 16.0)["served_P"]
+        self.assertEqual(c["bursts_n"], 1)
+        self.assertAlmostEqual(c["ring"]["hit"], 16000 / (6 * 65602 + 20000), places=6)
+        self.assertAlmostEqual(c["ring"]["hit_no_burst"], 16000 / 20000, places=6)   # 80 % without the burst
+        # two different legs ending together are no burst of identical prompts when their sum does not split
+        self.assertEqual(ipcboot.identical_bursts([smp(0, 0, 0, 0), smp(1, 2, 3001, 0)]), [])
 
 
 class TestWhatNone(unittest.TestCase):
