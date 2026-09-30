@@ -637,6 +637,15 @@ class Envs:
     # weg2-16-29's L3 fills evicted 449 of its OWN kept pages (#248e
     # ORDERED-EVICT) -- 4 re-reads, 4.5 s held after the wake.
     SGLANG_WEG2_ENABLE_WAKE_READ_ARENA_GATE = EnvBool(True)
+    # X_FLOOR_CREDIT (H98x, 30.09., NF y4b D 03:50:21 weg2-14-27): on a Form A
+    # group the X gate credits the group's USABLE floor -- the depth every
+    # rank admits (host: its admission match, workers: their KV reach) --
+    # when it lies above the head/store terms. A Form A expert worker's head
+    # walk is refused by its own absent mamba bytes (#904 MambaComponent:
+    # absent) and votes 0, so the head MIN was 0 and W31 priced the whole
+    # prompt (110438) of a request whose 109440-token prefix sat on TP0's
+    # device: W50, P re-prefilled it. Off = the pre-H98x pricing.
+    SGLANG_WEG2_ENABLE_X_FLOOR_CREDIT = EnvBool(True)
     # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
     # rank 0, never the scheduler thread) that copies the kept pages of
     # parked and waiting rids from the arena to HiCacheFile without freeing

@@ -933,6 +933,16 @@ def _weg2_store_short_cycle(sched, req) -> int:
 WAKE_SHORT_DECIDE_ENV = "SGLANG_WEG2_WAKE_SHORT_DECIDE"
 
 
+def _weg2_x_floor_credit_on() -> bool:
+    """H98x: the X gate credits the group usable floor -- Form A only (there
+    the floor is every rank's admission depth; on a classic group it is taken
+    from the head walk and never exceeds it). Group-uniform: the env switch
+    and the installed role plan are the same on every rank."""
+    if not envs.SGLANG_WEG2_ENABLE_X_FLOOR_CREDIT.get():
+        return False
+    return bool(tp_match_floor.form_a_follow_active())
+
+
 def _weg2_settled_this_wake(sched, req) -> bool:
     """WT (28.09., NF rc12z22 D 14:56:26-29, weg2-4-11): a request the group
     released from the dormant hold / #1471 settle of THIS wake has had its
@@ -13248,6 +13258,29 @@ class Scheduler(
                     "#1424d X-PRICE-FLOOR rid=%s head=%d floor=%d uncached=%d n=%d (the group "
                     "admits the usable floor, so the extent is priced from it)",
                     str(getattr(req, "rid", "?"))[:16], priced_match, floor,
+                    max(0, total - floor), n,
+                )
+            priced_match = floor
+        elif floor is not None and floor > priced_match and _weg2_x_floor_credit_on():
+            # H98x (30.09., NF y4b D 03:50:21, weg2-14-27): on a Form A group the
+            # usable floor is the depth every rank ADMITS -- the host votes its
+            # admission match (H105b), a worker its KV reach, and admission
+            # takes every rank there (group_floor_cap / RU FORM-A FOLLOW). The
+            # head arm is no such depth there: a worker's own walk is refused by
+            # the mamba bytes it does not hold (#904 MambaComponent:absent) and
+            # votes 0, so the head MIN was 0 and W31 priced the whole prompt
+            # (head=0 store=0 floor=109440, 110438 tokens) -- W50, and P
+            # re-prefilled a prefix resident on D. Credit the floor: the extent
+            # D prefills is total - floor, a replicated term of the same reduce.
+            self._weg2_x_floor_credited = getattr(self, "_weg2_x_floor_credited", 0) + 1
+            n = self._weg2_x_floor_credited
+            if n <= 16 or n % 64 == 0:
+                logger.info(
+                    "H98x X-FLOOR-CREDIT rid=%s head=%d store=%s floor=%d total=%d "
+                    "uncached=%d n=%d (Form A: the group admits the usable floor; "
+                    "the head arm is a worker's mamba-refused walk, not a depth)",
+                    str(getattr(req, "rid", "?"))[:16], gm,
+                    "-" if gsm is None else int(gsm), floor, total,
                     max(0, total - floor), n,
                 )
             priced_match = floor
