@@ -140,11 +140,76 @@ class DualDKvStage(CustomTestCase):
         a._engage_cap(alloc, 96, 1)
         ids = alloc.alloc(80)                               # ids 1..80 live
         self.assertEqual(P.max_live_id(alloc, 1), 80)
-        self.assertEqual(a.group_shrink(16, live_floor_tokens=0), 0)   # a live id above 16: held
-        self.assertEqual(a.mapped_tokens, 96)
+        self.assertGreater(a.group_shrink(16, live_floor_tokens=80), 0)  # shrinks only down to the live floor
+        self.assertEqual(a.mapped_tokens, 80)
+        with self.assertRaises(P.Weg2DualKvCapBreach):                 # a floor that lies is a named stop
+            a.group_shrink(16, live_floor_tokens=0)
         alloc.free(ids)
         self.assertGreater(a.group_shrink(16, live_floor_tokens=0), 0)
         self.assertEqual(a.mapped_tokens, 16)
         P.check_cap(alloc, 16, 1, "test")                   # no free id above the new end
         self.assertLessEqual(int(alloc.alloc(10).max()), 17)
 
+
+
+class _Req:
+    def __init__(self, rid, n):
+        self.rid, self.origin_input_ids, self.output_ids = rid, list(range(n)), []
+
+
+class _Sched:
+    def __init__(self, actor, running, waiting, group):
+        import types
+
+        self.running_batch = types.SimpleNamespace(reqs=running)
+        self.chunked_req = None
+        self.waiting_queue = waiting
+        self.server_args = types.SimpleNamespace(chunked_prefill_size=4096, speculative_num_draft_tokens=8)
+        self.tp_worker = types.SimpleNamespace(model_runner=types.SimpleNamespace(dual_d_kv=actor))
+        self._weg2_group_min_ints = group
+
+
+class DemandReplayOfBsffsv(CustomTestCase):
+    """Metal bsffsv (...09301000): D grew to 86016 for weg2-0-6, its store read
+    landed short (X-DEFER prefetch_pending), D shrank while the request still
+    waited, the ranks shrank apart (TP0 kept 45056, TP1/TP2 40960) and TP2's
+    re-issued loadback never found rows (queue=36863 on TP2 only)."""
+
+    def _actor(self, mapped):
+        path = os.path.join(tempfile.mkdtemp(prefix="wkvb"), "card")
+        led = K.CardKvLedger(path, "D")
+        geom = P._geom_for(torch.zeros(131072 + 64, 512), 131072, 64, "k", (131072 + 64) * 2048)
+        a = D.DKvStage([(1, geom)], led, allocator=object(), pools=[], page_size=64, granule=G,
+                       top_tokens=131072, spans=FakeSpans(), step=4096, engage_cap=lambda *a: None,
+                       gmin=lambda v: v)
+        b = a.bytes_for(mapped) - a.bytes_for(0)
+        led.contribute(b, committed=b)
+        a.mapped_tokens, a._committed = mapped, b
+        return a
+
+    def test_waiting_deferred_request_holds_the_level(self):
+        a = self._actor(86016)
+        deferred = _Req("weg2-0-6", 40767)                       # X-DEFER: stays in the waiting queue
+        small = _Req("weg2-0-9", 72)
+        sched = _Sched(a, running=[], waiting=[small, deferred], group=lambda v: v)
+        with mock.patch.object(D._pk, "max_live_id", lambda *x: 0):
+            for _ in range(200):                                # far past the hold
+                D.tick(sched)
+        self.assertGreaterEqual(a.mapped_tokens, 40767 + 72, "D shrank below its waiting requests")
+
+    def test_ranks_decide_on_the_group_demand(self):
+        # rank B has not seen the deferred request yet (one iteration late): both must hold alike
+        seen = {}
+
+        def group(vals):                                        # the other rank reports the big demand
+            seen["vals"] = list(vals)
+            if len(vals) == 3:                                  # [-want, -p_wait, -live]: MAX via MIN of negatives
+                return [min(vals[0], -(40767 + 72 + 8192)), vals[1], vals[2]]
+            return list(vals)
+
+        a = self._actor(86016)
+        sched = _Sched(a, running=[], waiting=[], group=group)
+        with mock.patch.object(D._pk, "max_live_id", lambda *x: 0):
+            for _ in range(200):
+                D.tick(sched)
+        self.assertGreaterEqual(a.mapped_tokens, 40767, "a rank shrank on its local view")
