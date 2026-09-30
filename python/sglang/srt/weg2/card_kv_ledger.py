@@ -53,8 +53,20 @@ def _gi(group: str) -> int:
         raise ValueError(f"group must be one of {GROUPS}, got {group!r}") from None
 
 
+def card_key(card_uuid: str) -> str:
+    """One spelling per card. NVML (the launcher, the front) says
+    "GPU-31d7ef41-...", torch's device uuid (the ranks) says "31d7ef41-...".
+    Metal dual15: the front read a ledger nobody wrote, so P never saw
+    pressure and never paused."""
+    u = str(card_uuid or "").strip().lower()
+    for pre in ("gpu-", "mig-"):
+        if u.startswith(pre):
+            u = u[len(pre):]
+    return u
+
+
 def ledger_path(tag: str, card_uuid: str, root: str = "/dev/shm") -> str:
-    h = hashlib.sha1(f"{tag}|{card_uuid}".encode()).hexdigest()[:12]
+    h = hashlib.sha1(f"{tag}|{card_key(card_uuid)}".encode()).hexdigest()[:12]
     return os.path.join(root, f"wkv-{h}")
 
 
@@ -253,7 +265,7 @@ class CardKvLedger:
             st.pressure[self.group] = max(0, st.pressure[self.group] - n)
             return n
 
-    def reconcile(self, phys_free: int) -> int:
+    def reconcile(self, phys_free: int, cap: Optional[int] = None) -> int:
         """The card said no (cuMemCreate OOM) although the ledger had room: the
         budget promised bytes the card does not have. Lower it until the
         ledger's free equals the physical free bytes; returns the correction.
@@ -261,6 +273,8 @@ class CardKvLedger:
         own share out of the budget)."""
         with self._locked() as st:
             over = int(st.free) - max(0, int(phys_free))
+            if cap is not None:
+                over = min(over, int(cap))
             if over <= 0:
                 return 0
             st.budget -= over

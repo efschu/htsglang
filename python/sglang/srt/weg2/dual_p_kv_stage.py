@@ -390,6 +390,8 @@ def phys_free_bytes() -> Optional[int]:
 
 
 PHYS_CHECK_S = 10.0
+#: consecutive OVER-PROMISE checks before the gap is booked into the budget
+PHYS_BOOK_AFTER = 3
 
 
 def phys_check(actor, group: str) -> None:
@@ -411,11 +413,25 @@ def phys_check(actor, group: str) -> None:
     if st is None:
         return
     over = int(st.free) - int(phys)
+    win = actor.__dict__.setdefault("_phys_over", [])
     if over > 0:
+        win.append(over)
         logger.warning("%s LEDGER-PHYS OVER-PROMISE by %d B group=%s ledger_free=%d phys_free=%d budget=%d "
                        "committed=%s", MARK, over, group, int(st.free), int(phys), int(st.budget),
                        dict(st.committed))
+        if len(win) >= PHYS_BOOK_AFTER:
+            # metal dual15: 628359168 B of card use outside the KV pools stood
+            # for minutes. Persistent = real: book the SMALLEST over of the
+            # window, capped atomically by the gap measured now (the other
+            # process on the card may have booked it already -- never twice).
+            n = led.reconcile(phys, cap=min(win[-PHYS_BOOK_AFTER:]))
+            win.clear()
+            if n > 0:
+                logger.warning("%s LEDGER-PHYS BOOKED %d B of unbooked card use into the budget (group=%s, "
+                               "%d checks over %.0f s)", MARK, n, group, PHYS_BOOK_AFTER,
+                               PHYS_BOOK_AFTER * PHYS_CHECK_S)
     else:
+        win.clear()
         logger.info("%s LEDGER-PHYS ok group=%s ledger_free=%d phys_free=%d budget=%d committed=%s", MARK,
                     group, int(st.free), int(phys), int(st.budget), dict(st.committed))
 
