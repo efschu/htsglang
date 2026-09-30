@@ -3678,6 +3678,11 @@ def _env_switch_on(name: str) -> bool:
     return str(os.environ.get(name, "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
+
+#: DUAL-TP3PP3: why every flip is refused under --dual-layout.
+DUAL_NO_FLIP_WHY = ("--dual-layout: both groups stay awake and the front never flips "
+                    "(P prefills while D decodes; no group holds a released region to wake)")
+
 class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
@@ -9647,6 +9652,14 @@ class Front:
         if getattr(self, "state", None) == "STOP":
             self._refuse_flip_in_stop(src, dst, "before the flip")
             return
+        if getattr(self, "dual_layout", False):
+            # DUAL-TP3PP3: refused BEFORE any effect, whoever asks. Both groups
+            # stay awake and neither owns a released region; a flip leg would
+            # resume a kv_cache P never released (metal 30.09. ...09300304: W29
+            # KeyError 'kv_cache' on all P ranks after a POST /weg2/flip).
+            self.counters["flip_refused_dual"] += 1
+            logger.error("WEG2-FLIP REFUSED-DUAL sleep=%s wake=%s: %s", src, dst, DUAL_NO_FLIP_WHY)
+            return
         # #55 F2: unlock the clocks BEFORE anything of the flip runs -- both groups' legs use the cards.
         _ic = getattr(self, "_idle_clock", None)
         if _ic is not None:
@@ -11892,6 +11905,13 @@ class Front:
                 logger.error("WEG2-FLIP STALL check raised: %r", exc)
 
     async def handle_manual_flip(self, request: web.Request) -> web.Response:
+        if getattr(self, "dual_layout", False):
+            # DUAL-TP3PP3: refused with a name, before admission or any group
+            # is touched (flip() refuses too; this answers the caller).
+            self.counters["flip_refused_dual"] += 1
+            logger.error("WEG2-FLIP manual flip REFUSED-DUAL: %s", DUAL_NO_FLIP_WHY)
+            return web.json_response({"error": "manual-flip-refused", "code": "dual-layout",
+                                      "why": DUAL_NO_FLIP_WHY}, status=409)
         if self.state != "serving":
             return web.json_response({"error": self.state}, status=503)
         # #1493: a manual flip from D turns around inside one request, so the

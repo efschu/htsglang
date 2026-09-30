@@ -153,6 +153,49 @@ class DualLayoutFront(CustomTestCase):
         # the drain pool is called exactly once in the controller: the pass.
         self.assertEqual(src.count("await _p_drain_pool("), 1)
 
+    # Metal 30.09. boot ...09300304: serving + needle MATCH, then the arm's
+    # POST /weg2/flip ran a real D->P flip; P never slept, so its
+    # resume_memory_occupation(kv_cache) raised KeyError on all three ranks
+    # (W29) and the boot died. Under dual layout NO flip may touch a group.
+
+    def test_dual_manual_flip_refused_with_named_reason(self):
+        async def run():
+            f = _front(True)
+            f.state = "serving"
+            calls = []
+            f.rpc = lambda *a, **k: calls.append(a)  # any RPC would be a flip leg
+            resp = await f.handle_manual_flip(None)
+            return f, resp, calls
+
+        f, resp, calls = _run(run())
+        self.assertEqual(resp.status, 409)
+        body = json.loads(resp.body)
+        self.assertEqual(body["code"], "dual-layout")
+        self.assertIn("never flips", body["why"])
+        self.assertEqual(calls, [])
+        self.assertEqual(f.awake, "D")
+        self.assertNotEqual(f.state, "STOP")
+        self.assertTrue(f.admit_d, "a refused manual flip must not close D's admission")
+
+    def test_dual_flip_itself_refuses_before_any_effect(self):
+        async def run():
+            f = _front(True)
+            f.state = "serving"
+            calls = []
+
+            async def rpc(*a, **k):
+                calls.append(a)
+                return 200, "{}"
+
+            f.rpc = rpc
+            await f.flip("D", "P")
+            return f, calls
+
+        f, calls = _run(run())
+        self.assertEqual(calls, [])
+        self.assertEqual((f.awake, f.state), ("D", "serving"))
+        self.assertEqual(f.counters["flip_refused_dual"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
