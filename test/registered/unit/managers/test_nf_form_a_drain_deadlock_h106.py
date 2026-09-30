@@ -262,6 +262,8 @@ class DisplacedAfterTheDrainTest(unittest.TestCase):
             ps=SimpleNamespace(tp_size=3, pp_size=1),
             waiting_queue=[older],
             server_args=SimpleNamespace(max_running_requests=6),
+            # the seat trigger asks the KV too (NF review of 2d49cd45bf): room here
+            token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 1 << 30),
         )
         s._add_request_to_queue = lambda req, is_retracted=False: s.waiting_queue.append(req)
         s._prefetch_done_for = types.MethodType(Scheduler._prefetch_done_for, s)

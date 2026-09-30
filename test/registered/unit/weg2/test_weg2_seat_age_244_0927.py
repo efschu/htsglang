@@ -109,8 +109,11 @@ class DSide(unittest.TestCase):
             batch.reqs = [batch.reqs[i] for i in keep_indices]
 
         batch.filter_batch = filt
+        # a KV reading with room: the seat trigger now also asks whether the older one
+        # then fits the KV (NF review of 2d49cd45bf) -- these cases are about seats
         sched = types.SimpleNamespace(waiting_queue=list(waiting), server_args=types.SimpleNamespace(
-            max_running_requests=cap), running_batch=batch)
+            max_running_requests=cap), running_batch=batch,
+            token_to_kv_pool_allocator=types.SimpleNamespace(available_size=lambda: 1 << 30))
         sched._add_request_to_queue = lambda req, is_retracted=False: sched.waiting_queue.append(req)
         return sched, batch
 
