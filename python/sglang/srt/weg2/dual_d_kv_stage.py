@@ -343,6 +343,10 @@ def tick(sched) -> Optional[str]:
     verdict, level = decide(actor.mapped_tokens, want, p_waiting, below, actor.step)
     if verdict == "shrink" and p_missing:
         verdict, level = "hold", actor.mapped_tokens
+    if verdict != "grow" and st is not None and int(st.pressure.get("P", 0) or 0) > 0:
+        # D's demand fits what it maps (seats ended, aborted or shrunk): the pressure
+        # on P goes with it (metal dual20: it stood 4 min after the L seats were gone)
+        actor.ledger.clear_pressure()
     _pk.phys_check(actor, "D")
     actor._below = below
     if verdict == "grow":

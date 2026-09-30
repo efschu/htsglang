@@ -253,7 +253,10 @@ class CardKvLedger:
                                         other_committed=st.committed[other])
             st.committed[self.group] += grant
             st.demand[self.group] = max(0, int(need) - grant)
-            st.pressure[other] = max(st.pressure[other], pressure) if pressure else st.pressure[other]
+            # the CURRENT shortfall, not a high-water mark (metal dual20: the max kept
+            # 855638016 on a 3080 for 4 min after P held nothing and D's seats were gone;
+            # no P pass started, a user's LONG request starved). 0 when granted in full.
+            st.pressure[other] = int(pressure)
             assert sum(st.committed.values()) <= st.budget, "I1 violated"
             return grant, pressure
 
@@ -283,6 +286,13 @@ class CardKvLedger:
             other = GROUPS[1 - self._gi]
             st.contrib[other] = max(0, st.contrib[other] - (over - mine))
             return over
+
+    def clear_pressure(self) -> None:
+        """This group no longer needs what it asked the other one for (its demand
+        fits what it maps): the pressure it put on the other group goes."""
+        other = GROUPS[1 - self._gi]
+        with self._locked() as st:
+            st.pressure[other] = 0
 
     def pressure_on_me(self) -> int:
         """Bytes the other process asked this one to release from its cache."""

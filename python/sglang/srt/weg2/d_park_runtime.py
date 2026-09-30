@@ -534,6 +534,12 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
         cand = _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
         if cand is not None:
             local = no_token_rid is not None and _sa.rid_age(no_token_rid) <= _sa.rid_age(cand[0])
+            if local:
+                # user 30.09. (verbatim): "natürlich muss ein jüngerer nur verdrängt werden,
+                # wenn der ältere nicht draufpasst. nicht pauschal den jüngeren verdrängen" --
+                # only when displacing the youngest seats is ENOUGH for the older one (and it
+                # does not already fit); else nobody leaves and the backfill stays.
+                local = kv_displace_would_fit(sched, cand[0], reqs)
             gm = getattr(sched, "_weg2_group_min_flags", None)
             agreed = bool(gm([local])[0]) if callable(gm) else bool(local)
             if agreed:
@@ -595,6 +601,57 @@ def exclude_displaced(sched, prefetch_verdicts) -> Optional[str]:
                 "drain; excluded from this pass's admission (not-done verdict), it "
                 "resumes from the next pass", str(rid)[:16])
     return rid
+
+
+def victims_needed(need: int, available: int, young_first_sizes) -> Optional[int]:
+    """How many of the youngest running seats (sizes given youngest first) must
+    leave so that ``need`` tokens fit: 0 = it fits the free KV already; k = the
+    k youngest are enough; None = not even all of them are (older seats hold the
+    room -- nobody is displaced, the backfill stays)."""
+    need, have = int(need), int(available)
+    if need <= have:
+        return 0
+    for k, size in enumerate(young_first_sizes, start=1):
+        have += max(0, int(size))
+        if need <= have:
+            return k
+    return None
+
+
+def _req_kv_tokens(r) -> int:
+    return len(getattr(r, "origin_input_ids", None) or ()) + len(getattr(r, "output_ids", None) or ())
+
+
+def kv_displace_would_fit(sched, older_rid: str, running) -> bool:
+    """This rank's half of the KV displacement verdict (the group takes the MIN):
+    the older waiting request does not fit the free KV, and parking the youngest
+    running seats younger than it frees enough for it. Logs the outcome (throttled)."""
+    from sglang.srt.weg2 import seat_age as _sa
+
+    older = next((q for q in getattr(sched, "waiting_queue", ()) or () if str(q.rid) == str(older_rid)), None)
+    if older is None:
+        return False
+    need = max(0, _req_kv_tokens(older) - len(getattr(older, "prefix_indices", None) or ()))
+    try:
+        avail = int(sched.token_to_kv_pool_allocator.available_size())
+    except Exception:  # noqa: BLE001 -- no reading: no displacement
+        return False
+    try:
+        avail += int(sched.tree_cache.evictable_size() or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    young = sorted((r for r in running if _sa.rid_age(str(r.rid)) > _sa.rid_age(str(older_rid))),
+                   key=lambda r: _sa.rid_age(str(r.rid)), reverse=True)
+    k = victims_needed(need, avail, [_req_kv_tokens(r) for r in young])
+    n = getattr(sched, "_sa_kv_fit_n", 0) + 1
+    sched._sa_kv_fit_n = n
+    if k != 1 and (n <= 8 or (n & (n - 1)) == 0):
+        logger.info("SEAT-AGE KV-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d -> %s (n=%d)",
+                    str(older_rid)[:16], need, avail, len(young),
+                    "fits free, nobody leaves" if k == 0 else
+                    "not even with all younger seats: nobody leaves, backfill stays" if k is None else
+                    "%d youngest must leave (one per pass)" % k, n)
+    return bool(k)
 
 
 def _kv_displace_enabled(env=None) -> bool:

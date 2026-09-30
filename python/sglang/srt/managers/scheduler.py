@@ -16123,6 +16123,11 @@ class Scheduler(
         _burst_hold = None
         if adder.multi_anchor_tails and _count_veto:
             _burst_hold = self._weg2_burst_assembly_hold(adder, running_batch)
+        # WEG2 D-HOL (weg2/hol_overtake.py): a head that does not fit the free KV
+        # no longer ends the round for everyone behind it (group D only)
+        from sglang.srt.weg2 import hol_overtake as _hol_mod
+
+        _hol = _hol_mod.HolPass(self)
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if _burst_hold is not None:  # fnFL2 H42b: the burst is still assembling
@@ -16950,6 +16955,7 @@ class Scheduler(
                 # more and mean less.
                 consume_seam_grant(req)
 
+            _hol_go_on = False
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     # SP (partial park, KV trigger; weg2/d_park_runtime.displace_for_age):
@@ -16957,7 +16963,10 @@ class Scheduler(
                     # group MIN -- by the next pass's admission.
                     if getattr(self, "_weg2_sa_no_token", None) is None:
                         self._weg2_sa_no_token = str(req.rid)
-                    if self.enable_hierarchical_cache:
+                    _hol_go_on = _hol.may_overtake(req)
+                    if _hol_go_on:
+                        pass  # D-HOL backfill: later requests that fit the free KV still run
+                    elif self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
@@ -17061,10 +17070,15 @@ class Scheduler(
                                     count,
                                 )
                 _note_skip(f"add_result_{res.name}", req.rid)
+                if _hol_go_on:
+                    continue
                 break
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+        if _hol.head is not None:
+            _hol.finish([r for r in adder.can_run_list
+                         if str(getattr(r, "rid", "")) != _hol.head])
 
         # H105 RIEGEL: the built extend set is the host's, or the group stops
         # by name here -- never a decode on one rank against an extend on the
@@ -19021,9 +19035,12 @@ class Scheduler(
             self._weg2_hold_refetch()  # #1456
         # DUAL-TP3PP3: an idle P stage still drains its write-through acks
         # (D reads the tail only once they are processed; no-op off the dual P)
-        from sglang.srt.weg2.dual_p_kv_stage import flush_acks_when_idle
+        from sglang.srt.weg2.dual_p_kv_stage import flush_acks_when_idle, follower_release_aborted_chunk
 
         flush_acks_when_idle(self)
+        # DUAL-TP3PP3 (metal dual20): a follower's recorded chunked abort is applied
+        # once PP0 has been idle since (no-op off the dual P followers)
+        follower_release_aborted_chunk(self)
         # B1 part 1 (D-IDLE-PUBLISH): the nodes the flip's flush would publish,
         # published while D has nothing to run (replicated gate, no clock).
         _weg2_flush_nonblock.idle_publish(self)

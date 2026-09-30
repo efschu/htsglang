@@ -655,9 +655,90 @@ def flush_acks_when_idle(sched) -> bool:
     return True
 
 
+def _idle_marker(tag: str, root: str = "/dev/shm") -> str:
+    import hashlib
+
+    return os.path.join(root, "wkvs-%s-pp0-idle" % hashlib.sha1(str(tag).encode()).hexdigest()[:10])
+
+
+def _dual_tag() -> str:
+    return os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
+
+
+def mark_pp0_idle(sched, now: Optional[float] = None) -> bool:
+    """PP0, fully idle (dual P): stamp the time. A fully idle PP0 has applied its
+    own aborts and every pass it launched completed the ring -- the same fact
+    the #1268 lap's idle PP0 slot carries (the #791C liveness release), which
+    the dual layout never runs (no flip, no quiesce). Throttled to 1/s."""
+    import time as _t
+
+    if int(getattr(getattr(sched, "ps", None), "pp_rank", 0) or 0) != 0:
+        return False
+    t = _t.time() if now is None else float(now)
+    if t - float(getattr(sched, "_dual_pp0_idle_t", 0.0) or 0.0) < 1.0:
+        return False
+    sched._dual_pp0_idle_t = t
+    path = _idle_marker(_dual_tag())
+    try:
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w") as f:
+            f.write("%.6f" % t)
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def follower_release_aborted_chunk(sched, now: Optional[float] = None) -> bool:
+    """A dual P FOLLOWER holding a recorded chunked abort applies it once PP0 is
+    idle AFTER the abort reached this rank. Metal dual20: the front's pause
+    aborted B on all stages; PP0 applied it and released, PP1/PP2 kept B as
+    chunked_req ("applied when PP0's forwarded schedule stops naming it") --
+    PP0 sent no further frame, so they never did: never idle, never released,
+    855638016 B stayed committed on a 3080 and D's grow waited 45 s for it."""
+    import time as _t
+
+    if str(os.environ.get("SGLANG_WEG2_DUAL_LAYOUT", "")).strip() != "1":
+        return False
+    if str(os.environ.get("SGLANG_WEG2_GROUP", "")).strip().upper() != "P":
+        return False
+    if int(getattr(getattr(sched, "ps", None), "pp_rank", 0) or 0) == 0:
+        return False
+    req = getattr(sched, "_pending_chunked_abort_req", None)
+    if req is None:
+        sched._dual_abort_seen = None
+        return False
+    t = _t.time() if now is None else float(now)
+    seen = getattr(sched, "_dual_abort_seen", None)
+    if seen is None or seen[0] is not req:
+        sched._dual_abort_seen = (req, t)
+        return False
+    try:
+        with open(_idle_marker(_dual_tag())) as f:
+            idle_t = float(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return False
+    if idle_t <= seen[1]:
+        return False  # PP0 has not been idle since the abort reached this rank
+    drained = getattr(sched, "_pp_microbatches_drained", None)
+    if callable(drained) and not drained():
+        return False
+    sched._791c_pp0_drained = True
+    try:
+        sched.process_pending_chunked_abort()
+    finally:
+        sched._791c_pp0_drained = False
+    logger.info("%s FOLLOWER-ABORT-APPLIED rid=%s pp_rank=%s: PP0 idle since %.1f s after this rank "
+                "saw the abort (the #791C liveness release the dual layout has no lap for)", MARK,
+                str(getattr(req, "rid", "?"))[:16], getattr(sched.ps, "pp_rank", "?"), idle_t - seen[1])
+    return True
+
+
 def on_idle(sched) -> int:
     """A fully idle P rank gives its whole context back: device tree evicted
     (write-back keeps the pages in L2), then unmapped and released."""
+    if str(os.environ.get("SGLANG_WEG2_DUAL_LAYOUT", "")).strip() == "1":
+        mark_pp0_idle(sched)
     actor = _actor(sched)
     if actor is not None:
         phys_check(actor, "P")

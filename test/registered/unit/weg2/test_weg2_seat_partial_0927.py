@@ -56,7 +56,10 @@ def _run(fn, env=None):
 
 class KvTrigger(unittest.TestCase):
     def test_older_refused_for_kv_displaces_the_youngest_with_a_free_seat(self):
-        sched, batch = _sched([_req(R(5)), _req(R(9))], [_req(R(3), span=5000)], no_token=R(3))
+        # user 30.09.: displace only when it is ENOUGH -- the older (1000) fits once
+        # the youngest (1000) leaves: 100 free + 1000 >= 1000 (was span=5000, which
+        # not even both younger seats could fund: that case now displaces nobody)
+        sched, batch = _sched([_req(R(5)), _req(R(9))], [_req(R(3), span=1000)], no_token=R(3))
         with self.assertLogs(DPR.logger, level="WARNING") as cap:
             got = _run(lambda: DPR.displace_for_age(sched, batch))
         self.assertEqual(got, R(9))
@@ -67,6 +70,12 @@ class KvTrigger(unittest.TestCase):
         self.assertRegex(cap.output[0], r"pages_out=(window=\d+-\d+(\(retain\))?|\d+)")
         self.assertIsNone(sched._weg2_sa_no_token, "the signal is consumed")
         self.assertEqual(sched.calls, [[True]], "the verdict went through the group MIN")
+
+    def test_not_enough_even_with_all_younger_seats_no_displacement(self):
+        # dual20 policy: older 5000, free 100, younger seats 1000 + 1000 -> nobody leaves
+        sched, batch = _sched([_req(R(5)), _req(R(9))], [_req(R(3), span=5000)], no_token=R(3))
+        self.assertIsNone(_run(lambda: DPR.displace_for_age(sched, batch)))
+        self.assertEqual(batch.released, [])
 
     def test_ranks_disagree_no_displacement(self):
         sched, batch = _sched([_req(R(5)), _req(R(9))], [_req(R(3))], no_token=R(3),

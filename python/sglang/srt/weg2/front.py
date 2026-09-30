@@ -3182,6 +3182,7 @@ class Pending:
     x_requeues: int = 0
     #: DUAL-TP3PP3 unified KV: the front paused this leg 1 (D short of KV)
     dual_pause: bool = False
+    leg1_aborted: bool = False  # DUAL-TP3PP3: P ended the leg by an abort (200, prompt_tokens=0)
     dual_paused_n: int = 0
     #: H102: the client closed its connection before its answer; nothing is
     #: dispatched for it any more (no leg 1, no hand-off to D).
@@ -3698,6 +3699,26 @@ def _env_switch_on_or_profile(name: str) -> bool:
 #: DUAL-TP3PP3: why every flip is refused under --dual-layout.
 DUAL_NO_FLIP_WHY = ("--dual-layout: both groups stay awake and the front never flips "
                     "(P prefills while D decodes; no group holds a released region to wake)")
+
+
+def leg1_aborted(js: Any, prompt_tokens: int) -> bool:
+    """A leg-1 response that P ended by an abort: finish_reason type "abort"
+    (OpenAI choices or /generate meta_info), or no prompt accounted at all."""
+    try:
+        fr = None
+        if isinstance(js, dict):
+            ch = js.get("choices")
+            if isinstance(ch, list) and ch:
+                fr = (ch[0] or {}).get("finish_reason")
+            if fr is None:
+                fr = (js.get("meta_info") or {}).get("finish_reason")
+        if isinstance(fr, dict):
+            fr = fr.get("type")
+        if str(fr or "").lower() == "abort":
+            return True
+    except Exception:  # noqa: BLE001 -- a strange body is judged by its tokens
+        pass
+    return int(prompt_tokens or 0) <= 0
 
 
 def _dual_p_pressures(paths) -> List[int]:
@@ -7866,6 +7887,9 @@ class Front:
                 js = {}
             pt, ct, _, _ = usage_of(js)
             p.leg1_prompt_tokens = pt
+            # DUAL-TP3PP3 (metal dual20): P answers an aborted leg 1 with 200 and
+            # prompt_tokens=0 (finish_reason abort) -- not a failure, not a finish
+            p.leg1_aborted = leg1_aborted(js, pt)
             self._note_p_prefix_reuse(p, ct)
             # #1324: NO PRESENCE RECORD HERE. This site used to call
             # `self.spans.record(p.text, pt)`, i.e. it credited the span
@@ -11430,6 +11454,14 @@ class Front:
                     finally:
                         self._dual_inflight.pop(p.rid, None)
                     if getattr(p, "dual_pause", False):
+                        if getattr(p, "leg1_aborted", False):
+                            # metal dual20 (weg2-0-8, 14:25:49): OUR pause abort came back
+                            # as a 200 with prompt_tokens=0; taken as served, leg 2 went to
+                            # D with nothing prefilled -> W50 -> 503 after 557 s. It is the
+                            # pause: back to the head, still in leg 1.
+                            p.leg1_aborted = False
+                            self._dual_requeue_paused(p)
+                            return p
                         # the pause came after P had finished this leg: nothing to redo
                         p.dual_pause = False
                     p.leg1_done = True
