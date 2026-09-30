@@ -596,6 +596,12 @@ class SchedulerWeightUpdaterManager:
     #: ran, so under ``--weg2-d-adopt on`` the placeholder guard could never
     #: fall. None outside a placeholder wake.
     _weg2_adopt_acc: Any = None
+    #: PAUSE-OVERLAP (0a78051a4d): the per-tag resident-byte census taken ONCE
+    #: before an overlapped sleep loop, read by the deposit's gap check while a
+    #: pause runs; None outside such a loop. The fourth time for the slots
+    #: lesson above: y4j-po (30.09. 10:42:44Z) died on AttributeError in the
+    #: assignment on all three D ranks at the first sleep with the switch on.
+    _weg2_resident_prefetch: Any = None
     #: #1295: this rank's W8b verdict on the L3 store index it rebuilt at the
     #: wake, empty when there is none.  Written by
     #: :meth:`_weg2_rescan_store_index`, read and cleared by the resume fence,
