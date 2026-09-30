@@ -150,6 +150,15 @@ MANUAL_FLIP_PARK_CAUSE = "manual-flip"
 #: weg2zr2 pair) that produce X's fallback.  Only the FRONT's default; the
 #: launcher recomputes from this boot's own lines and tells the front (C2).
 X_FALLBACK_TOKENS = 22000
+def x_k_flip_enabled() -> bool:
+    """SGLANG_WEG2_X_K_FLIP (X-K-FLIP, 30.09.): the flip price is amortised over
+    THIS flip's riders, not over the boot's mean P phase."""
+    try:
+        return bool(envs.SGLANG_WEG2_X_K_FLIP.get())
+    except Exception:  # noqa: BLE001 -- an unknown switch is off
+        return False
+
+
 def flip_price_ms(rec: dict, *, exclude_drain: bool) -> Tuple[float, float]:
     """27B DPWAIT (row 28): what one completed flip record costs as a round-trip price.
 
@@ -7070,8 +7079,12 @@ class Front:
         # was 1.7x D's own prefill cap, which D then refused by construction.
         # The verdict names the two bases so a reader never has to work out
         # which number each bound was compared against.
+        # X-K-FLIP: the X this arrival is routed on amortises the round trip
+        # over the flip it would take -- itself plus the riders queued for P
+        # now -- not over the boot's mean P phase (switch off: the X in force).
+        _x_arrival = self._x_for_flip(1 + self._x_riders(), rid, "route")
         route = serviceable_route(remainder, carrier_est,
-                                  self.tp_prefill_max_tokens,
+                                  _x_arrival,
                                   self.carrier_max_tokens,
                                   carrier_exact=exact is not None)
         # Task #58: AN IMAGE REQUEST GOES TO P, whatever the length term says.
@@ -7099,7 +7112,7 @@ class Front:
         # batched over P) would take ~35 s. Below/at the start X and above the
         # live X nothing changes; `x_route` is the X this request was actually
         # routed on, and every line below prints it.
-        x_route = self.tp_prefill_max_tokens
+        x_route = _x_arrival
         _x_floor = self._x_band_floor()
         # UNIFY S7 (27B RC7-X): a band request the singleton rule sends to P
         # is DEFERRED (Pending.x_deferred) -- the idle re-grant may still serve
@@ -11449,6 +11462,12 @@ class Front:
             k_src = "record"
         else:
             k, k_src = 1.0, "none(1=no-amortisation)"
+        self._x_k_hist = (k, k_src)
+        if x_k_flip_enabled():
+            # X-K-FLIP: the X in force is the LONE request's (k_flip=1); the
+            # riders of a flip are priced per decision (_x_for_flip). The
+            # boot's mean P phase is shown, never amortised over.
+            return line, line_src, price, price_src, 1.0, f"flip:1(lone) hist={k:.2f}[{k_src}] display-only"
         return line, line_src, price, price_src, k, k_src
 
     def _resolve_x_cost_line(self) -> Optional[int]:
@@ -11508,6 +11527,8 @@ class Front:
         self.tp_prefill_max_tokens = x
         if self._x_min_work_follows:
             self.flip_min_work_tokens = x
+        self._x_solve_ctx = {"price": price, "line": line, "line_p": line_p, "r_p": r_p,
+                             "prefix": prefix, "floor": floor, "ceiling": self.x_ceiling_tokens}
         self.counters["x_resolves"] += 1
         bands = ", ".join(
             "%dk:%s" % (d // 1000, "-" if xb is None else "inf" if xb == float("inf") else int(xb))
@@ -11519,10 +11540,51 @@ class Front:
             x, prev, x_star, why, clamp, floor, int(line["n_lo"]), int(line["n_hi"]),
             self.x_ceiling_tokens, float(line["a_ms"]), float(line["b_ms"]),
             float(line["c_ms"]), line_src, int(prefix), price, price_src, k, k_src, p_src, bands)
-        self._note_x_cost_line(line, line_src, k, "D")
+        k_rec = getattr(self, "_x_k_hist", (k, k_src))[0]  # the sidecar keeps the measured mean
+        self._note_x_cost_line(line, line_src, k_rec, "D")
         if line_p is not None:
-            self._note_x_cost_line(line_p, line_p_src, k, "P")
+            self._note_x_cost_line(line_p, line_p_src, k_rec, "P")
         return x
+
+    def _x_riders(self) -> int:
+        """X-K-FLIP: the requests queued for P right now that a flip would
+        carry beside a new arrival (live, uncached work left, not handed to D)."""
+        n = 0
+        for q in self.queue:
+            fut = getattr(q, "fut", None)
+            if fut is not None and fut.done():
+                continue
+            if getattr(q, "d_direct", False) or int(getattr(q, "est_uncached", 0) or 0) <= 0:
+                continue
+            n += 1
+        return n
+
+    def _x_for_flip(self, k_flip: int, rid: str = "", site: str = "") -> int:
+        """X-K-FLIP: the X of a flip that carries ``k_flip`` requests -- the
+        round trip amortised over THIS flip's riders, on the last re-solve's
+        lines at its depth, clamped to its floor and never above the lone
+        request's X (the X in force). Switch off, no solve yet or k_flip <= 1:
+        the X in force. Named in one line whenever riders lower it."""
+        x1 = int(self.tp_prefill_max_tokens)
+        ctx = getattr(self, "_x_solve_ctx", None)
+        if not x_k_flip_enabled() or ctx is None or int(k_flip) <= 1:
+            return x1
+        cap = float(self.p_phase_max_requests) if self.p_phase_max_requests else float("inf")
+        k = min(cap, float(k_flip))
+        x_star, why = phase_policy.solve_x_cost_line(
+            price_s=ctx["price"], k=k, line=ctx["line"], r_p=ctx["r_p"],
+            prefix_tokens=ctx["prefix"], line_p=ctx["line_p"])
+        if x_star is None:
+            return x1
+        xk = int(min(max(x_star, ctx["floor"]), ctx["ceiling"], x1))
+        if xk < x1:
+            self.counters["x_k_flip_lowered"] += 1
+            hist = getattr(self, "_x_k_hist", (0.0, "none"))
+            logger.info("WEG2 X-FLIP-K site=%s rid=%s k_flip=%d (1 + %d queued for P) X_k=%d X_1=%d "
+                        "(%s) k_hist=%.2f[%s] display-only -- the round trip is amortised over this "
+                        "flip's riders", site, rid, int(k_flip), int(k_flip) - 1, xk, x1, why,
+                        float(hist[0]), hist[1])
+        return xk
 
     def _note_x_cost_line(self, line: dict, line_src: str, k: float, side: str) -> None:
         """X-COST-LINE: append this boot's first LIVE fitted lines of group
