@@ -24,12 +24,17 @@ in the answer's ``src``):
                groups.<G>.launch (CUDA_VISIBLE_DEVICES + --rank-gpu-id + tp/pp)
   host         Proxmox host /proc/stat, /proc/meminfo, memory.current of the htsglang containers'
                cgroups (the host currency) over the existing ssh alias; without ssh: this LXC's /proc
-  model        P-/D-Prefill tok/s (#new-token of the first rank's 'Prefill batch' per 5 s), Decode
-               tok/s and per stream (gen throughput / #running-req, spread over its interval),
-               KV usage (full token usage) -- log lines (Übergang); input-token classes
-               (cacheacct.py): state.json front.served_tokens with D_after_P when the image has it,
-               else the WEG2-SERVED lines paired by rid (Übergang); flips: events.jsonl
-               flip_first_work (IPC), else the log flip rows
+  model        IPC (Nutzer 30.09.: "keine IPC über Logs"): every 5 s the first rank of each group's
+               rankstats (<state>/rankstate/<G>/*.rankstats, weg2.rankstats/1, timer-written) --
+               P-/D-Prefill tok/s = Δprefill.new_tokens / Δts, Decode tok/s = Δdecode.tokens / Δts,
+               Decode je Stream = that / decode.running (only while D decoded continuously),
+               KV = sched.full_token_usage (level), input-token classes per CHUNK from
+               prefill.new_tokens / prefill.cached_tokens (P cached = cache, D cached = Übergabe P->D;
+               the rank cannot tell a D-direct prefix hit from the hand-over, so it is never counted as
+               cache), cache tiers from state.json front.served_tokens.*.cached_tier;
+               flips: events.jsonl flip_first_work.
+               A boot the recorder did not watch live (rigdash was down) is backfilled once from its
+               logs, only up to the first IPC sample, and that part is labelled "aus Log (Übergang)".
 """
 
 from __future__ import annotations
@@ -43,7 +48,7 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-from . import cacheacct, live
+from . import cacheacct, ipcfields, ipcstate, live
 
 LOG_LABEL = "aus Log (Übergang)"
 TIERS = (("p0", 1, 3 * 3600), ("p1", 10, 3 * 86400), ("p2", 60, 30 * 86400))
@@ -55,6 +60,9 @@ RANGES = {"15m": 900, "1h": 3600, "6h": 6 * 3600, "24h": 86400, "7d": 7 * 86400}
 MAX_POINTS = 1440
 STEPS = (5, 10, 20, 30, 60, 120, 300, 600, 900)    # multiples of the tier steps: no jitter
 MODELS = ("27B", "NF")
+IPC_LABEL = "rankstats (IPC)"
+IPC_STALE_S = 20.0          # a rank file older than this: the rank is gone, its group gives no value
+STREAM_BUSY_MIN = 0.5       # Decode je Stream only when decode GPU time covered >= half the interval
 
 
 def model_of(meta: dict, stem: str) -> str:
@@ -303,6 +311,95 @@ def level_buckets(events, key: str, lo: float, n: int, step: float, scale: float
     return [(s / c) if c else None for s, c in acc]
 
 
+def _f(x) -> Optional[float]:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _first(*xs):
+    for x in xs:
+        if x is not None:
+            return x
+    return None
+
+
+def rank_sample(stats: dict) -> Dict[str, dict]:
+    """{group: counters of its first rank (TP0/PP0)} from ``rankstats`` records (ipcfields.read_rank_files).
+    Each chunk is counted once: every PP stage and TP partner sees the same tokens."""
+    out: Dict[str, dict] = {}
+    for g in sorted({k.split(".", 1)[0] for k in stats}):
+        r = ipcfields._first_rank(stats, g) or {}
+        pre = r.get("prefill") if isinstance(r.get("prefill"), dict) else {}
+        dec = r.get("decode") if isinstance(r.get("decode"), dict) else {}
+        tok = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
+        sch = r.get("sched") if isinstance(r.get("sched"), dict) else {}
+        out[g] = {"ts": _f(r.get("ts")),
+                  "pnew": _first(_f(pre.get("new_tokens")), _f(tok.get("prefill_total"))),
+                  "pcached": _f(pre.get("cached_tokens")),
+                  "dtok": _first(_f(dec.get("tokens")), _f(tok.get("decode_total"))),
+                  "rounds": _f(dec.get("rounds")),
+                  "dgpu": _f(dec.get("gpu_ms")),
+                  "running": _first(_f(dec.get("running")), _f(sch.get("running_req"))),
+                  "kv": _f(sch.get("full_token_usage"))}
+    return out
+
+
+def _d(cur: dict, prev: dict, k: str) -> Optional[float]:
+    a, b = cur.get(k), prev.get(k)
+    if a is None or b is None:
+        return None
+    return a - b if a >= b else a          # a counter that went backwards restarted: count from 0
+
+
+def ipc_rates(prev: Optional[Dict[str, dict]], cur: Dict[str, dict], now: float) -> Dict[str, float]:
+    """One sample step -> the model series (rates in tok/s, levels in %).  Pure; unit-tested.
+
+    Rates are each group's counter delta over ITS OWN clock (rankstats ts), so a late file does
+    not stretch or squeeze a rate.  A group whose file is older than IPC_STALE_S gives nothing (its
+    rank is gone -- no value, not 0).  A group that is alive but idle (sleeping, flipped away) gives
+    0: that is the continuous line the log source could not draw."""
+    out: Dict[str, float] = {}
+    add = lambda k, v: out.__setitem__(k, out.get(k, 0.0) + v)  # noqa: E731
+    for g, c in cur.items():
+        if c.get("ts") is None or now - c["ts"] > IPC_STALE_S:
+            continue
+        role = g if g in ("P", "D") else "single"
+        if c.get("kv") is not None:
+            out["kv_p_pct" if role == "P" else "kv_pct"] = 100.0 * c["kv"]
+        p = (prev or {}).get(g)
+        if not p or p.get("ts") is None or c["ts"] <= p["ts"]:
+            continue
+        dt = c["ts"] - p["ts"]
+        pn, pc = _d(c, p, "pnew"), _d(c, p, "pcached")
+        if pn is not None:
+            add("d_tps" if role == "D" else "p_tps", pn / dt)
+            add("tok_comp_d" if role == "D" else "tok_comp_p", pn / dt)
+        if pc is not None:
+            add("tok_handoff" if role == "D" else "tok_cache", pc / dt)
+        dk = _d(c, p, "dtok")
+        if dk is not None and role != "P":
+            add("dec_tps", dk / dt)
+            run = c.get("running")
+            dr, dg = _d(c, p, "rounds"), _d(c, p, "dgpu")
+            busy = (dg / 1000.0 / dt) if dg is not None else None
+            if dk > 0 and run and run > 0 and (dr is None or dr > 0) and (busy is None or busy >= STREAM_BUSY_MIN):
+                out["stream_tps"] = dk / dt / run
+    if out:
+        for k in ("tok_cache", "tok_comp_p", "tok_comp_d", "tok_handoff"):
+            out.setdefault(k, 0.0)
+    return out
+
+
+def model_of_ipc(ipc: dict) -> str:
+    """27B or NF from the state dir's line (``/spinning/docker-acceptance/<line>/state/...``)."""
+    d = (ipc or {}).get("dir") or ""
+    tag = ((ipc or {}).get("tag") or "") + " " + ((ipc or {}).get("line") or "")
+    return "27B" if "/27b/" in d or "27b" in tag.lower() else "NF"
+
+
 def cache_buckets(legs, lo: float, n: int, step: float, p_rids: set) -> List[Dict[str, int]]:
     """Token classes per bucket from the served legs (cacheacct.split_legs), in time order; the
     P rids before ``lo`` must already be in ``p_rids``."""
@@ -365,18 +462,24 @@ def short_name(name: str) -> str:
 class Recorder:
     """The sampling threads: NVML 1 s, host 5 s, model buckets 5 s, compaction 60 s."""
 
-    def __init__(self, db: HistoryDB, logs, docker_ssh: Optional[List[str]] = None):
+    def __init__(self, db: HistoryDB, logs, docker_ssh: Optional[List[str]] = None, ipc=None):
         self.db = db
+        # its OWN reader of the state dirs, polled in its own 5-s loop: the log collector polls its
+        # IpcStates only after a round over all logs, which after a restart takes minutes -- the
+        # model series must not wait for a log (measured 30.09.: 4 empty buckets after a restart)
+        self.ipc = ipc if ipc is not None else ipcstate.IpcStates()
         self.logs = logs
         self.ssh = docker_ssh or []
         self.cards: List[dict] = db.get("cards", []) or []
         self.errors: Dict[str, str] = {}
-        self.now_vals: Dict[str, dict] = {}
         self._nvml = None
         self._cpu_prev = None
         self._cache_prev: Dict[str, dict] = {}
         self._tier_prev: Dict[str, dict] = {}
         self._p_rids: Dict[str, set] = {}
+        self._ipc_prev: Dict[str, Dict[str, dict]] = {}
+        self._ipc_acc: Dict[str, Tuple[int, float, Dict[str, float]]] = {}
+        self._flips_done: Dict[str, int] = {}
 
     # --- NVML -------------------------------------------------------------
     def sample_gpus(self, now: float) -> None:
@@ -449,6 +552,7 @@ class Recorder:
 
     # --- model buckets ----------------------------------------------------
     def ingest_models(self, now: float) -> None:
+        self.ingest_ipc(now)
         with self.logs.lock:
             boots = list(self.logs.boots.values())
         for b in sorted(boots, key=lambda x: x.first_t or 0):
@@ -456,6 +560,79 @@ class Recorder:
                 self._ingest_boot(b, now)
             except Exception as e:  # one boot's defect never stops the others
                 self.errors["boot:" + b.stem] = "%s: %s" % (type(e).__name__, e)
+
+    # --- model series from IPC (rankstats), every 5 s --------------------------
+    def ingest_ipc(self, now: float) -> None:
+        """Every serving boot's state dir (IpcStates, no log involved): sample the ranks' rankstats,
+        write the rates into the 5-s bucket of ``now``.  ``m.<model>.ipc`` = 1 marks the buckets a
+        live boot was sampled in (the page bridges a per-stream gap only inside those)."""
+        ipcs = self.ipc
+        if hasattr(ipcs, "poll"):
+            ipcs.poll(now)
+        if getattr(ipcs, "last_poll", None) is None:
+            return
+        step = MODEL_BUCKET_S
+        seen = set()
+        for ipc in ipcs.boots(now):
+            if ipc.get("terminal") or ipc.get("kind") not in (None, "boot"):
+                continue
+            key = ipc.get("boot_id") or ipc.get("dir")
+            try:
+                rank = ipcfields.read_rank_files(ipcfields.state_rankstate_dirs(ipc))
+                cur = rank_sample(rank["rankstats"])
+                if not cur:
+                    continue
+                vals = ipc_rates(self._ipc_prev.get(key), cur, now)
+                self._ipc_prev[key] = cur
+                seen.add(key)
+                if not vals:
+                    continue
+                model = model_of_ipc(ipc)
+                self._mark_flips(key, model, ipc)
+                if self.db.get("ipc0." + key) is None:
+                    self.db.set("ipc0." + key, now)
+                self._put_ipc(key, model, int((now // step) * step), vals, ipc)
+            except Exception as e:  # one boot's defect never stops the others
+                self.errors["ipc:" + str(key)] = "%s: %s" % (type(e).__name__, e)
+        for k in list(self._ipc_prev):
+            if k not in seen:
+                self._ipc_prev.pop(k, None)
+                self._ipc_acc.pop(k, None)
+
+    def _mark_flips(self, key: str, model: str, ipc: dict) -> None:
+        """events.jsonl flip_first_work (the front's one clock, ms): one mark per flip, new ones only."""
+        rows = (ipc or {}).get("flip_first_work") or []
+        done = self._flips_done.get(key, 0)
+        for dd in rows[done:] if done <= len(rows) else rows:
+            t0 = dd.get("flip_begin_ts") or dd.get("t")
+            if t0 is not None and dd.get("dir") in ("P>D", "D>P"):
+                self.db.mark(t0, model, "flip", dd["dir"] + " ipc", dd.get("flip_time_ms"))
+        self._flips_done[key] = len(rows)
+
+    def _put_ipc(self, key: str, model: str, ts: int, vals: Dict[str, float], ipc: dict) -> None:
+        # two samples in one 5-s bucket (loop jitter): their mean, never one overwriting the other
+        acc = self._ipc_acc.get(key)
+        if acc and acc[0] == ts:
+            n = acc[1] + 1.0
+            merged = {k: (acc[2].get(k, 0.0) * acc[1] + v) / n for k, v in vals.items()}
+            for k, v in acc[2].items():
+                merged.setdefault(k, v)
+            vals, cnt = merged, n
+        else:
+            cnt = 1.0
+        self._ipc_acc[key] = (ts, cnt, dict(vals))
+        pre = "m.%s." % model
+        rows = [(pre + k, ts, v) for k, v in vals.items()] + [(pre + "ipc", ts, 1.0)]
+        st = ((ipc or {}).get("front") or {}).get("served_tokens")
+        tiers = cacheacct.tiers_from_served_tokens(st) if isinstance(st, dict) else None
+        if tiers is not None:
+            prev = self._tier_prev.get(key)
+            self._tier_prev[key] = tiers
+            if prev is not None:
+                rows += [(pre + "tier_" + k, ts, (tiers[k] - prev.get(k, 0)) / MODEL_BUCKET_S)
+                         for k in tiers if tiers[k] > prev.get(k, 0)]
+            self.db.set("src.%s.tiers" % model, "ipc")
+        self.db.put(rows)
 
     def _ingest_boot(self, b, now: float) -> None:
         if b.first_t is None or b.read_progress() < 0.999 or getattr(self.logs.ipc, "last_poll", None) is None:
@@ -470,6 +647,11 @@ class Recorder:
             done = (b.first_t // step) * step
             self.db.mark(b.first_t, model, "boot", (b.meta or {}).get("tag") or b.stem)
         end_t = now - MODEL_LAG_S if is_live else b.newest_mtime + step
+        # the IPC sampler owns every bucket from its first sample of this boot on; the log only
+        # backfills what nobody watched live (Nutzer 30.09.: keine IPC über Logs)
+        ipc0 = self.db.get("ipc0." + ((ipc or {}).get("boot_id") or "")) if ipc else None
+        if ipc0 is not None:
+            end_t = min(end_t, ipc0)
         hi = (end_t // step) * step
         if ipc and ipc.get("launch"):
             roles = card_roles(ipc["launch"], self.cards)
@@ -504,44 +686,19 @@ class Recorder:
                 rows += [(pre + "p_tps", ts, p_tok[i] / step), (pre + "d_tps", ts, d_tok[i] / step),
                          (pre + "dec_tps", ts, dtok[i] / step), (pre + "stream_tps", ts, stream[i]),
                          (pre + "kv_pct", ts, kv[i])]
-            st = ((ipc or {}).get("front") or {}).get("served_tokens")
-            if is_live and cacheacct.has_handoff_row(st):
-                # IPC counters are cumulative: their deltas land at "now"; a finished boot's history
-                # is backfilled from its legs instead (same rule, cacheacct.split_legs)
-                cur = cacheacct.from_served_tokens(st)
-                d = cacheacct.delta(self._cache_prev.get(b.stem), cur)
-                self._cache_prev[b.stem] = cur
-                ts = int((now // step) * step)
-                rows += [(pre + "tok_" + k, ts, v / step) for k, v in d.items() if v]
-                tiers = cacheacct.tiers_from_served_tokens(st)
-                if tiers is not None:
-                    dt = {k: tiers[k] - (self._tier_prev.get(b.stem) or tiers).get(k, 0) for k in tiers}
-                    self._tier_prev[b.stem] = tiers
-                    rows += [(pre + "tier_" + k, ts, v / step) for k, v in dt.items() if v > 0]
-                    self.db.set("src.%s.tiers" % model, "ipc")
-                self.db.set("src.%s.cache" % model, "ipc")
-            else:
-                pr = self._p_rids.get(b.stem)
-                if pr is None:
-                    pr = self._p_rids[b.stem] = {x[3] for x in legs if x[1] == "P" and x[0] < lo and x[3]}
-                cb = cache_buckets(legs, lo, n, step, pr)
-                for i in range(n):
-                    ts = int(lo + i * step)
-                    rows += [(pre + "tok_" + k, ts, cb[i][k] / step) for k in cacheacct.CLASSES]
-                self.db.set("src.%s.cache" % model, "log")
+            pr = self._p_rids.get(b.stem)
+            if pr is None:
+                pr = self._p_rids[b.stem] = {x[3] for x in legs if x[1] == "P" and x[0] < lo and x[3]}
+            cb = cache_buckets(legs, lo, n, step, pr)
+            for i in range(n):
+                ts = int(lo + i * step)
+                rows += [(pre + "tok_" + k, ts, cb[i][k] / step) for k in cacheacct.CLASSES]
             self.db.put(rows)
             c1 = self.db.get("cursor.p1")
             if c1 is not None and lo < c1:
                 self.db.rebucket([r[0] for r in rows], lo, hi)
-            # flips: IPC flip_first_work (the front's one clock), else the log rows
-            ffw = [e for e in ((ipc or {}).get("ipc_events") or []) if e.get("type") == "flip_first_work"]
-            if ffw:
-                for e in ffw:
-                    dd = e.get("data") or {}
-                    t0 = dd.get("flip_begin_ts") or e.get("ts")
-                    if t0 is not None and dd.get("dir") in ("P>D", "D>P"):
-                        self.db.mark(t0, model, "flip", dd["dir"] + " ipc", dd.get("flip_time_ms"))
-            else:
+            # flips: IPC flip_first_work (ingest_ipc marks them); the log rows only for a boot without it
+            if not (ipc or {}).get("flip_first_work"):
                 for r in flips:
                     if lo - 60 <= r["t"] < hi and r.get("dir") in ("P>D", "D>P"):
                         self.db.mark(r["t"], model, "flip", r["dir"] + " log", r.get("ms"))
@@ -549,35 +706,6 @@ class Recorder:
         if not is_live and not self.db.get("ended." + b.stem):
             self.db.mark(b.newest_mtime, model, "end", "Boot-Ende (letzte Logzeile)")
             self.db.set("ended." + b.stem, True)
-
-    # --- now values for the tiles (live boots only) -----------------------
-    def sample_now(self, now: float) -> None:
-        with self.logs.lock:
-            boots = list(self.logs.boots.values())
-        vals: Dict[str, dict] = {}
-        for b in sorted(boots, key=lambda x: -x.newest_mtime):
-            if now - b.newest_mtime >= live.LIVE_S:
-                continue
-            model = model_of(b.meta, b.stem)
-            if model in vals:
-                continue
-            with b.lock:
-                pg = [g for g in b.groups_with("prefill_rank") if g in ("P", "single")]
-                v = {"stem": b.stem, "t": now,
-                     "p_tps": b._one_s(pg[0], "prefill", now) if pg else None,
-                     "d_tps": b._one_s("D", "prefill", now) if "D" in b.groups_with("prefill_rank") else None,
-                     "dec_tps": None, "stream_tps": None, "kv_pct": None}
-                dg = [g for g in b.groups_with("decode_batch") if g in ("D", "single")]
-                if dg:
-                    v["dec_tps"] = b._one_s(dg[0], "decode", now)
-                    last = b.last.get("%s_decode_batch" % dg[0]) or {}
-                    if last.get("gen_tps") is not None and last.get("running") and not last.get("gen_art") \
-                            and now - last["t"] <= 10:
-                        v["stream_tps"] = last["gen_tps"] / last["running"]
-                    if last.get("full_use") is not None:
-                        v["kv_pct"] = 100.0 * last["full_use"]
-            vals[model] = v
-        self.now_vals = vals
 
     # --- loop ----------------------------------------------------------------
     def run_forever(self, stop: threading.Event) -> None:
@@ -592,7 +720,7 @@ class Recorder:
                 stop.wait(max(0.05, period - (time.time() - t0)))
 
         for name, period, fn in (("nvml", 1.0, self.sample_gpus), ("host", 5.0, self.sample_host),
-                                 ("model", MODEL_BUCKET_S, self.ingest_models), ("now", 1.0, self.sample_now),
+                                 ("model", MODEL_BUCKET_S, self.ingest_models),
                                  ("compact", 60.0, self.db.compact)):
             threading.Thread(target=loop, args=(name, period, fn), name="rigdash-hist-" + name, daemon=True).start()
         stop.wait()
@@ -626,6 +754,20 @@ def _pct(xs: List[float], p: float) -> Optional[float]:
     return xs[max(0, math.ceil(p * len(xs)) - 1)]
 
 
+def model_src(ipc_marks: List[Optional[float]], values: List[List[Optional[float]]]) -> Optional[str]:
+    """The source label of the model series over the shown range: IPC where the sampler wrote
+    (``m.ipc``), the log backfill elsewhere -- said per range, never hidden behind one word."""
+    have = [i for i in range(len(ipc_marks)) if any(i < len(v) and v[i] is not None for v in values)]
+    if not have:
+        return None
+    n_ipc = sum(1 for i in have if ipc_marks[i] is not None)
+    if n_ipc == len(have):
+        return IPC_LABEL
+    if n_ipc == 0:
+        return LOG_LABEL
+    return "%s · ältere Abschnitte %s" % (IPC_LABEL, LOG_LABEL)
+
+
 def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now: Optional[float] = None) -> dict:
     now = now or time.time()
     rng = RANGES.get(range_key, 3600)
@@ -637,7 +779,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
         names += ["g%d.%s" % (c["index"], k) for k in ("temp", "power", "clock", "util", "mem")]
     names += ["host.cpu", "host.mem_pct", "host.bootmem_pct", "host.bootmem_gib"]
     mp = "m.%s." % model
-    msr = ["p_tps", "d_tps", "dec_tps", "stream_tps", "kv_pct"] + ["tok_" + k for k in cacheacct.CLASSES]
+    msr = ["p_tps", "d_tps", "dec_tps", "stream_tps", "kv_pct", "kv_p_pct", "ipc"] + ["tok_" + k for k in cacheacct.CLASSES]
     names += [mp + k for k in msr] + [mp + "tier_" + k for k in cacheacct.TIERS]
     data = db.query(names, lo, now, step, now)
     t0 = int(lo // step) * step
@@ -646,6 +788,12 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
     for n in names:
         d = data.get(n) or {}
         series[n.replace(mp, "m.")] = [d.get(t) for t in ts]
+    # Leistungsaufnahme (Nutzer 30.09.: "power draw von allen karten gemeinsam"): the sum of the cards
+    # that reported in the bucket; None only when no card did
+    pw = [series.get("g%d.power" % c["index"]) or [] for c in cards]
+    series["gsum.power"] = [(sum(a[i] for a in pw if i < len(a) and a[i] is not None)
+                             if any(i < len(a) and a[i] is not None for a in pw) else None) for i in range(len(ts))]
+    src_model = model_src(series["m.ipc"], [series["m.p_tps"], series["m.d_tps"], series["m.dec_tps"], series["m.kv_pct"]])
     # cards: newest first for "now"
     def latest(n):
         arr = series.get(n) or []
@@ -669,10 +817,8 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
                 flip_src.add(parts[1])
     flips_pd = [m["v"] for m in marks if m["kind"] == "flip" and m["label"] == "P>D" and m["v"] is not None]
     last_pd = next((m for m in reversed(marks) if m["kind"] == "flip" and m["label"] == "P>D" and m["v"] is not None), None)
-    nv = (rec.now_vals.get(model) if rec else None) or {}
     roles = {m: (db.get("roles." + m) or {}) for m in MODELS}
     card_info = [dict(c, roles={m: roles[m].get(c["uuid"], []) for m in MODELS}) for c in cards]
-    src_cache = db.get("src.%s.cache" % model)
     tiles = {
         "out_p50": _pct(series["m.stream_tps"], 0.5), "out_p90": _pct(series["m.stream_tps"], 0.9),
         "cache_hit": cacheacct.hit_share(tok), "tok": tok, "tiers": tiers,
@@ -685,8 +831,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
                          if any(p is not None for p in powers) else None),
         "power_sum_w": sum(p for p in powers if p is not None) if any(p is not None for p in powers) else None,
         "cpu_pct": latest("host.cpu"),
-        "p_tps": nv.get("p_tps"), "d_tps": nv.get("d_tps"), "dec_tps": nv.get("dec_tps"),
-        "live_stem": nv.get("stem"),
+        "live": latest("m.ipc") is not None,
         "flip_last_ms": last_pd["v"] if last_pd else None, "flip_last_t": last_pd["t"] if last_pd else None,
         "flip_median_ms": _pct(flips_pd, 0.5), "flip_n": len(flips_pd),
     }
@@ -704,14 +849,13 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
             "host": ("Proxmox-Host /proc + memory.current der htsglang-Container"
                      if getattr(rec, "host_where", None) == "proxmox" else "LXC /proc"),
             "roles": "state.json groups.launch",
-            "prefill": LOG_LABEL, "decode": LOG_LABEL, "kv": LOG_LABEL,
-            "cache": "state.json front.served_tokens (D_after_P)" if src_cache == "ipc" else LOG_LABEL,
+            "prefill": src_model, "decode": src_model, "kv": src_model, "cache": src_model,
+            "power": "NVML, Summe aller Karten",
             "cache_tiers": ("state.json front.served_tokens.*.cached_tier" if src_tiers == "ipc"
                             else "– (Feld served_tokens.*.cached_tier ab Image z30y2, 9266bdfb8d)"),
             "flip": ("events.jsonl flip_first_work" if flip_src == {"ipc"} else
                      LOG_LABEL if flip_src == {"log"} else
                      "events.jsonl flip_first_work + %s (ältere Boots)" % LOG_LABEL if flip_src else None),
-            "now_tiles": LOG_LABEL,
         },
         "errors": dict(rec.errors) if rec else {},
         "db": db.stats(),

@@ -140,19 +140,71 @@ python3 $U boot-override --boot <boot_id> --lifecycle "stopped (geplant)" --bele
 python3 $U md --out /spinning/gpu-arb/docs/FEATURES-SOLL-IST-0929.md   # Tabelle als Markdown, Werte vom laufenden rigdash
 ```
 
-## Verlauf wie Grafana (DASHBOARD-GRAFIKEN, Nutzer 29.09. ~13:40Z)
+## Verlauf in unserem eigenen Teil (Nutzer 30.09. ~15:30Z, ersetzt „Verlauf wie Grafana“ vom 29.09.)
 
-Oben auf der Seite: Kacheln und Verlaufsdiagramme im Stil der Grafana-Vorlage
-(`/spinning/gpu-arb/docs/vorlagen/dashboard-vorlage-grafana-0929.png`). 27B und NF sind getrennte
-Sichten, der Zeitraum ist wählbar (15m/1h/6h/24h/7d). Die Quelle steht an jeder Kachel und jedem Diagramm.
+Die Grafana-Vorlage (`/spinning/gpu-arb/docs/vorlagen/dashboard-vorlage-grafana-0929.png`) war ein
+Stilbeispiel, keine Kopiervorlage. Der dunkle Nachbau oben auf der Seite ist weg; seine Inhalte stehen
+verteilt in unserem Teil, im Seitendesign (dieselben Tokens, Schrift, Karten, hell und dunkel):
+
+- **Verlauf** (`#verlauf`, unter den Boot-Karten): Kacheln Decode je Stream p50/p90, Prefix-Cache-Treffer,
+  Flipzeit P→D; Diagramme Prefill-Durchsatz (P, D), Decode-Durchsatz (alle Streams + je Stream),
+  Input-Tokens aus Cache / neu gerechnet / Übergabe, KV-Belegung (D, P), Flipzeit je Flip.
+  Modell 27B|NF und Zeitraum 15m…7d oben in der Karte.
+- **Karten** (`#gpus-card`): Kacheln Leistungsaufnahme (Summe aller Karten), heißeste GPU, Host-CPU;
+  Diagramme **Leistungsaufnahme (Power draw)** als Summe aller Karten mit den Einzelkarten dünn
+  darunter, Temperatur, SM-Takt, Host CPU & Speicher. Die 15-min-Sparklines je Karte sind entfallen.
+- Stil: eine y-Achse je Diagramm (keine Doppelachse: Prefill und Decode getrennt), Einheit an der Achse,
+  Fläche unter der Linie, feines Raster, Endwert als Punkt, Legende mit dem letzten Wert, Cursor über alle
+  Diagramme gekoppelt. Farben: P blau (`--s1`), D orange (`--s2`), Decode grün (`--s3`), Karten violett/
+  gelb/magenta (`--s7/--s4/--s5`, dataviz-Referenzpalette, validiert), Summe in Textfarbe.
+- Die Boot-Kachel-Sparklines (`spark()`) tragen denselben Stil: Fläche, Viertelraster, −15/−10/−5/jetzt,
+  letzter Wert als Punkt und Zahl.
+
+### Quelle der Modellreihen: IPC, nicht Log (Nutzer 30.09.: „keine IPC über Logs“)
+
+`history.Recorder.ingest_ipc` liest alle 5 s mit einem **eigenen** `IpcStates` (nicht dem des
+Log-Sammlers, der erst nach einer Runde über alle Logs pollt) jede Boot-Zustandsablage und darin
+`rankstate/<G>/*.rankstats` (weg2.rankstats/1, Timer-geschrieben). Je Gruppe zählt der erste Rang (TP0/PP0):
+
+| Reihe | Rechnung |
+|---|---|
+| P-/D-Prefill tok/s | Δ`prefill.new_tokens` / Δ`ts` |
+| Decode tok/s | Δ`decode.tokens` / Δ`ts` |
+| Decode je Stream | das / `decode.running`, nur wenn Δ`decode.gpu_ms` ≥ 50 % der Wanduhr (sonst Flip/Leerlauf im Intervall) |
+| KV-Belegung D / P | `sched.full_token_usage` (Pegel) |
+| Input-Tokens | P: `cached_tokens` = aus Cache, `new_tokens` = neu gerechnet P; D: `new_tokens` = neu gerechnet D, `cached_tokens` = Übergabe P→D |
+| Cache-Stufen | `state.json front.served_tokens.*.cached_tier` |
+| Flipzeit | `events.jsonl flip_first_work` |
+
+Eine lebende, aber ruhende Gruppe liefert 0 (durchgehende Linie), ein Rang mit einer Datei älter als
+20 s liefert nichts (Lücke). `m.<Modell>.ipc` = 1 markiert jedes Intervall, in dem der Sampler einen
+lebenden Boot las; nur innerhalb solcher Intervalle überbrückt die Seite eine Lücke der je-Stream-Linie.
+Ein Boot, den rigdash nicht live gesehen hat (Dienst war aus), wird einmal aus seinen Logs nachgetragen,
+nur bis zur ersten IPC-Probe; das Etikett sagt dann „rankstats (IPC) · ältere Abschnitte aus Log (Übergang)“.
+
+**Offene Lücke (Vorschlag an den Implementierer-Sitz, nicht hier gebaut):** Der Rang kann bei D nicht
+trennen, ob `prefill.cached_tokens` die Übergabe P→D ist oder ein echter Präfix-Treffer einer
+D-direkt-Anfrage. rigdash zählt D-cached darum konservativ als Übergabe (nie als Cache). Ein Zähler
+`prefill.cached_tokens_handoff` in rankstats (Anteil der `cached_tokens`, deren rid ein P-Leg-1 hatte,
+das Wissen `Pending.leg1_ran` liegt in der Front und müsste mit dem Leg-2-Request an D gehen) macht es exakt.
+
+### Zwei Ausgaben aus einem Code: `--edition rig|release`
+
+`rig` (Vorgabe) liefert die ganze Seite. `release` (Env `RIGDASH_EDITION=release`) ist die veröffentlichte
+fLLiper-Ausgabe: `server.edition_page` schneidet jeden Block `<!--DEV:BEGIN-->…<!--DEV:END-->` aus
+(HTML, CSS `/* … */` und JS `// …`), also Entwicklungsstand, Startflags, Features Soll/Ist, Bausteine,
+Image-Änderungen, Container, GPU-Fensterplan, Letzte Boots und die LAN-Links. Es bleibt keine leere Hülle.
+`/api/live` antwortet ohne `features`, `image_changes`, `gpuq`; `/api/launch`, `/weg2` und `/api/weg2/*`
+geben 404. Neue Entwicklungsteile gehören in einen DEV-Block (`tests/test_edition_0930.py` prüft das).
+
+### Speicher und Stufen
 
 - `history.py`: `history.sqlite` im `--state-dir`. Tiers p0 (1 s NVML, 5 s Host und Modell), p1 (10 s)
   und p2 (60 s). Aufbewahrung 3 h / 3 d / 30 d, Deckel 256 MB. Es gibt keinen zusätzlichen Dienst.
   Jede Reihe ist eine Rate oder ein Pegel, nie ein Zähler. Deshalb bleibt das Mittel über jede Stufe richtig.
 - `cacheacct.py` rechnet die Cache-Falle: „aus Cache“ = Prefix-Treffer bei der Annahme. Die Übergabe P→D
-  (D liest, was P für DIESELBE rid gerechnet hat) ist eine eigene Reihe und nie Cache. Quelle ist
-  `state.json front.served_tokens.D_after_P` (Produzent 9266bdfb8d, ab Image z30y2). Bis dahin
-  werden die `WEG2-SERVED`-Zeilen per rid gepaart (Etikett „aus Log (Übergang)“).
+  ist eine eigene Reihe und nie Cache. Für Boots ohne IPC-Probe bleibt die Paarung der `WEG2-SERVED`-Zeilen
+  per rid (Etikett „aus Log (Übergang)“).
 - Neue Reihen: in `history.view` den Namen aufnehmen. Den Schreiber in `Recorder` setzen, nie aus
   einem neuen Log-Regex (`tests/test_no_new_log_parsers.py`).
 - Diagramme: `static/grafik.js` mit uPlot 1.6.32, lokal eingebettet (`static/uplot.*`, MIT). Es gibt kein CDN.

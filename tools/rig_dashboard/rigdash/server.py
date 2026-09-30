@@ -164,6 +164,7 @@ class App:
         self.hist_rec = history.Recorder(self.hist, self.logs, cfg["docker_ssh"])
         self.t0 = time.time()
         self.version = _version()
+        self.edition = getattr(args, "edition", "rig") or "rig"
 
     def energy_loop(self, stop: threading.Event):
         """Every 5 s: account the closed 5-s intervals of every live boot (energy.py)."""
@@ -236,6 +237,45 @@ class App:
         }
 
 
+EDITIONS = ("rig", "release")
+DEV_BEGIN, DEV_END = "<!--DEV:BEGIN-->", "<!--DEV:END-->"
+#: what the published fLLiper edition does not answer at all (the rig's own development state)
+RELEASE_DROP_KEYS = ("features", "image_changes", "gpuq")
+
+
+def edition_page(html: str, edition: str) -> str:
+    """The page for one edition (Nutzer 30.09.: "im veröffentlichten fLLiper dashboard soll natürlich
+    der untere entwicklungsstanddashboard leer sein oder fehlen").  ``rig`` = unchanged.  ``release``
+    = every ``<!--DEV:BEGIN-->…<!--DEV:END-->`` block cut out -- no empty shell, the ids are not in
+    the page -- and the title says fLLiper.  One page, one code path; the edition is a switch."""
+    if edition != "release":
+        return html
+    out, i = [], 0
+    while True:
+        a = html.find(DEV_BEGIN, i)
+        if a < 0:
+            out.append(html[i:])
+            break
+        b = html.find(DEV_END, a)
+        if b < 0:
+            raise ValueError("index.html: DEV:BEGIN ohne DEV:END")
+        out.append(html[i:a])
+        i = b + len(DEV_END)
+    page = "".join(out)
+    return (page.replace('<html lang="de">', '<html lang="de" data-edition="release">', 1)
+                .replace("<title>Rig-Dashboard</title>", "<title>fLLiper Dashboard</title>", 1)
+                .replace('<h1 id="title">Rig-Dashboard</h1>', '<h1 id="title">fLLiper Dashboard</h1>', 1))
+
+
+def edition_snapshot(snap: dict, edition: str) -> dict:
+    """/api/live of the release edition: the development state is not answered either."""
+    if edition == "release":
+        for k in RELEASE_DROP_KEYS:
+            snap.pop(k, None)
+        snap["edition"] = "release"
+    return snap
+
+
 def make_handler(app: App):
     class H(BaseHTTPRequestHandler):
         server_version = "rigdash/" + app.version
@@ -283,13 +323,13 @@ def make_handler(app: App):
             path = self.path.split("?", 1)[0]
             try:
                 if path in ("/", "/index.html"):
-                    with open(os.path.join(STATIC, "index.html"), "rb") as fh:
-                        return self._send(200, fh.read(), "text/html; charset=utf-8")
+                    with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as fh:
+                        return self._send(200, edition_page(fh.read(), app.edition), "text/html; charset=utf-8")
                 if path == "/api/live":
                     series = "noseries" not in self.path
                     snap = app.snapshot(series)
                     snap["via_proxy"] = self._via_proxy()
-                    return self._json(snap)
+                    return self._json(edition_snapshot(snap, app.edition))
                 if path == "/api/history":
                     # DASHBOARD-GRAFIKEN: tiles + series + marks of one model over one range
                     from urllib.parse import parse_qs, urlsplit
@@ -307,6 +347,9 @@ def make_handler(app: App):
                     name = "mark.svg" if path == "/favicon.svg" else path[1:]
                     with open(os.path.join(STATIC, name), "rb") as fh:
                         return self._send(200, fh.read(), "image/svg+xml")
+                if app.edition == "release" and (path in ("/weg2", "/weg2.html", "/api/launch")
+                                                 or path.startswith("/api/weg2/")):
+                    return self._send(404, "not found", "text/plain")
                 if path in ("/weg2", "/weg2.html") and self._via_proxy():
                     return self._send(403, "Startzeile nur im LAN: http://192.168.0.88:8890/weg2", "text/plain; charset=utf-8")
                 if path in ("/weg2", "/weg2.html"):
@@ -359,6 +402,10 @@ def main(argv=None):
                     help="git repo holding the image revs and feature commits")
     ap.add_argument("--release-profile", action="append", default=[],
                     help="profile name offered by the start-line wizard (repeatable; the unit names the release ones)")
+    ap.add_argument("--edition", choices=EDITIONS, default=os.environ.get("RIGDASH_EDITION", "rig"),
+                    help="rig = with the development state (Soll/Ist, Bausteine, Startflags, Sitze ...); "
+                         "release = the published fLLiper edition: speed, efficiency, statistics only "
+                         "(env RIGDASH_EDITION)")
     args = ap.parse_args(argv)
     app = App(args)
     app.start()

@@ -233,6 +233,14 @@ class IpcStates:
                     self._ev.pop(d, None)
         self.last_poll = now
 
+    def boots(self, now: Optional[float] = None) -> List[dict]:
+        """Every ``kind=boot`` state dir of the last SHOW_S (history.Recorder.ingest_ipc walks these:
+        the model series come from the ranks' rankstats, no log is involved)."""
+        now = now or time.time()
+        with self.lock:
+            items = [(d, st) for d, st in self._st.items() if st.get("kind") == "boot"]
+            return [boot_view(d, st, self._ev.get(d), now) for d, st in items]
+
     def for_tag(self, tag: Optional[str], now: Optional[float] = None) -> Optional[dict]:
         """The ``kind=boot`` state of this launcher tag (the newest one when a tag was reused)."""
         if not tag:

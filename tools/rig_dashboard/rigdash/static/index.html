@@ -15,6 +15,8 @@
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
   --good: #008300; --warn: #b77a00; --bad: #d03b3a;
   --bar: #2a78d6; --bar-bg: #e4e3de; --flip: #8f8e88;
+  /* Kategorische Slots 4/5/7 der dataviz-Referenzpalette (validiert, hell): Karten und Host im Verlauf */
+  --s4: #eda100; --s5: #e87ba4; --s7: #4a3aa7; --grid: rgba(11,11,11,0.07);
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -25,6 +27,7 @@
     --s1: #3987e5; --s2: #d95926; --s3: #199e70;
     --good: #3fb950; --warn: #d9a400; --bad: #e66767;
     --bar: #3987e5; --bar-bg: #2c2c29; --flip: #6e6d67;
+    --s4: #c98500; --s5: #d55181; --s7: #9085e9; --grid: rgba(255,255,255,0.07);
   }
 }
 :root[data-theme="dark"] {
@@ -35,6 +38,7 @@
   --s1: #3987e5; --s2: #d95926; --s3: #199e70;
   --good: #3fb950; --warn: #d9a400; --bad: #e66767;
   --bar: #3987e5; --bar-bg: #2c2c29; --flip: #6e6d67;
+  --s4: #c98500; --s5: #d55181; --s7: #9085e9; --grid: rgba(255,255,255,0.07);
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text);
@@ -45,7 +49,10 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
 header h1 { font-size: 18px; margin: 0; font-weight: 650; }
 header .brand { display: inline-flex; align-items: center; align-self: center; }
 header .brand img { display: block; height: 30px; width: auto; }
-header .logo-mark { display: none; }
+/* EIN Logo (Nutzer 30.09.: "das fllipe rlogo zweimal nebeneinander"): die Regel oben (0,1,2) schlug
+   das alte "header .logo-mark {display:none}" (0,1,1) -- Wortmarke UND Zeichen standen nebeneinander.
+   Beide Regeln jetzt mit derselben Spezifität wie die img-Regel, die Wortmarke breit, das Zeichen schmal. */
+header .brand img.logo-mark { display: none; }
 header .sub { color: var(--text-2); font-size: 13px; }
 header nav { margin-left: auto; display: flex; gap: 12px; font-size: 13px; }
 a { color: var(--s1); text-decoration: none; } a:hover { text-decoration: underline; }
@@ -55,6 +62,7 @@ main { padding: 12px 16px 40px; max-width: 1500px; margin: 0 auto; }
 html, body { overflow-anchor: none; }
 header .livebox { font-size: 13px; color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; }
 header .livebox .note { display: inline-block; min-width: 17em; color: var(--warn); }
+/* <!--DEV:BEGIN--> */
 /* Startflags (Nutzer 29.09.): eingeklappt, Tabellen umbrechen statt seitlich zu scrollen */
 .lf-tools { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin: 2px 0 8px; font-size: 12px; }
 .lf-tools input[type=search] { flex: 1 1 220px; max-width: 420px; padding: 4px 8px; border: 1px solid var(--line);
@@ -78,6 +86,7 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .lf button.copy { font: inherit; font-size: 11px; padding: 1px 8px; border-radius: 6px; border: 1px solid var(--line);
   background: var(--surface-2); color: var(--text); cursor: pointer; }
 .lf .miss { color: var(--warn); font-size: 12px; }
+/* <!--DEV:END--> */
 .cardstrip { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 6px; margin: -4px 0 12px; }
 .cardstrip > div { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
 .cardstrip b { font-size: 13px; }
@@ -187,7 +196,11 @@ td.stopped { color: var(--muted); font-size: 12px; }
 .alarm .why b { font-weight: 700; }
 section.card.dead { border: 3px solid var(--alarm-dead); }
 section.card.hang { border: 3px solid var(--alarm-hang); }
-.cachebox { margin-top: 12px; }
+.cachebox { margin-top: 12px; overflow-x: auto; }
+/* keine seitliche Seitenrolle (30.09.: die Quell-Plakette im Kachelkopf und die Cache-Tabelle schoben die Seite
+   auf 1933 px bei 1500 px Fenster): Plakette bricht um, breite Tabellen rollen in ihrer Karte */
+.tile .label { flex-wrap: wrap; min-width: 0; }
+.tile .label .ipcsrc, .tile .label .logsrc { white-space: normal; overflow-wrap: anywhere; }
 .cachebox td, .cachebox th { font-size: 12px; white-space: nowrap; }
 .launch { font-size: 11px; color: var(--text-2); margin-top: 6px; max-height: 360px; overflow: auto; }
 .launch div { padding: 2px 0; border-bottom: 1px dashed var(--line); overflow-wrap: anywhere; }
@@ -198,6 +211,7 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
 .pill.s-erwartet { color: var(--bar); } .pill.s-unbekannt { color: var(--muted); }
 .pill.f-ja, .pill.f-an { color: var(--good); } .pill.f-nein, .pill.f-aus { color: var(--bad); }
 .pill.f-teilweise { color: var(--warn); } .pill.f-unbekannt { color: var(--muted); }
+/* <!--DEV:BEGIN--> */
 tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
 .gain { white-space: nowrap; } .gain .art { font-size: 11px; color: var(--muted); }
 .imgseat + .imgseat { margin-top: 14px; }
@@ -218,65 +232,62 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
 .mx .m-ung { color: var(--bad); font-style: italic; } .mx .m-leer { color: var(--muted); }
 .prod details > summary { cursor: pointer; font-size: 11.5px; color: var(--text-2); }
 .imgseat td.ev { color: var(--text-2); font-size: 12px; max-width: 460px; overflow-wrap: anywhere; }
+/* <!--DEV:END--> */
 .note { font-size: 12px; color: var(--text-2); max-width: 900px; }
 .note b { color: var(--text); }
 .flipbar { display: flex; gap: 2px; align-items: flex-end; height: 34px; margin-top: 6px; }
 .flipbar b { flex: 1; max-width: 14px; border-radius: 3px 3px 0 0; background: var(--s1); min-height: 2px; }
 .flipbar b.dp { background: var(--s2); }
 @media (max-width: 760px) {
-  header .logo-full { display: none; }
-  header .logo-mark { display: block; }
+  header .brand .logo-full, header .brand .logo-full img { display: none; }
+  header .brand img.logo-mark { display: block; }
   .gpu { grid-template-columns: 1fr 1fr; }
   header nav { margin-left: 0; }
   .tile .big { font-size: 28px; }
 }
 .kv .kvb span { font-weight: 700; }
-/* DASHBOARD-GRAFIKEN (Nutzer 29.09.): Kacheln + Verlauf im Stil der Grafana-Vorlage -- immer dunkel,
-   dichte Kacheln, feines Raster, Legende unten. uPlot lokal (uplot.iife.min.js), kein CDN. */
-.gf { background: #111217; color: #ccccdc; border-radius: 4px; padding: 8px; margin: 0 0 14px; color-scheme: dark; }
-.gf-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 2px 4px 8px; font-size: 13px; }
-.gf-bar b { font-weight: 600; color: #fff; }
-.gf-tabs { display: inline-flex; border: 1px solid #2c3235; border-radius: 3px; overflow: hidden; }
-.gf-tabs button { background: #181b1f; color: #ccccdc; border: 0; border-right: 1px solid #2c3235; padding: 3px 10px;
-  font: 12px system-ui, sans-serif; cursor: pointer; }
-.gf-tabs button:last-child { border-right: 0; }
-.gf-tabs button.on { background: #3d71d9; color: #fff; }
-.gf-note { color: #8e8e9a; font-size: 12px; min-height: 1.4em; }
-.gf-tiles { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: 6px; }
-@media (max-width: 900px) { .gf-tiles { grid-template-columns: repeat(2, 1fr); } }
-.gf-tile { background: #181b1f; border: 1px solid #22252b; border-radius: 2px; height: 116px; padding: 6px 8px;
-  display: flex; flex-direction: column; overflow: hidden; }
-.gf-th { display: flex; justify-content: space-between; gap: 6px; font-size: 12.5px; font-weight: 500; color: #ccccdc;
-  white-space: nowrap; }
-.gf-th { overflow: hidden; text-overflow: ellipsis; }
-.gf-tf { display: flex; justify-content: space-between; align-items: center; gap: 6px; min-width: 0; }
-.gf-big { flex: 1; display: flex; align-items: center; justify-content: center; font-size: 40px; font-weight: 500;
-  color: #fff; font-variant-numeric: tabular-nums; letter-spacing: -0.5px; line-height: 1; }
-.gf-big small { font-size: 18px; margin-left: 2px; color: #ccccdc; }
-.gf-big.c1 { color: #6aa4ee; } .gf-big.c2 { color: #ee8a5f; } .gf-big.c3 { color: #3fc08f; }
-.gf-gauge { flex: 1; min-height: 0; width: 100%; }
-.gf-gv { fill: #fff; font: 600 11px system-ui, sans-serif; }
-.gf-ts { font-size: 10.5px; color: #8e8e9a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.gf-src { font-size: 9.5px; color: #8e8e9a; border: 1px solid #2c3235; border-radius: 2px; padding: 0 4px;
-  max-width: 45%; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 400; }
-.gf-src.log { color: #d9a400; border-color: #5a4a12; }
-.gf-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
-.gf-p { background: #181b1f; border: 1px solid #22252b; border-radius: 2px; padding: 6px 8px 2px; min-width: 0; grid-column: span 3; }
-.gf-p.w2 { grid-column: span 2; }
-.gf-p h3 { display: flex; justify-content: space-between; gap: 8px; margin: 0 0 4px; font-size: 13px; font-weight: 500; color: #ccccdc; }
-.gf-p h3 .muted { color: #8e8e9a; font-weight: 400; font-size: 11px; }
-.gf-p .u { min-height: 190px; }
-.gf .uplot { font-family: system-ui, sans-serif; }
-.gf .u-legend { font-size: 11.5px; color: #ccccdc; text-align: left; margin: 2px 0 2px; }
-.gf .u-legend .u-marker { width: 14px; height: 3px; border-radius: 2px; }
-.gf .u-legend th, .gf .u-legend td { border: 0; padding: 0 3px; background: none; }
-.gf .u-legend .u-series:first-child { display: none; }
-.gf .u-legend .u-series { padding: 0 10px 0 0; }
-.gf .u-legend th { font-weight: 400; }
-.gf .u-legend .u-value { color: #fff; font-variant-numeric: tabular-nums; }
-.gf .u-legend tr:first-child { color: #8e8e9a; }
-.gf .u-select { background: rgba(255,255,255,0.07); }
-@media (max-width: 1100px) { .gf-p, .gf-p.w2 { grid-column: span 6; } }
+/* Verlauf (Nutzer 30.09.): kein Grafana-Nachbau mehr, sondern unser eigener Kartenstil -- dieselben
+   Tokens, Schrift und Flächen wie der Rest der Seite, hell und dunkel. uPlot lokal, kein CDN. */
+.vl-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin-bottom: 10px; }
+.vl-bar h2 { margin: 0; }
+.seg { display: inline-flex; gap: 2px; }
+.seg button { font: inherit; font-size: 12px; padding: 2px 9px; border: 1px solid var(--line); background: var(--surface);
+  color: var(--text-2); border-radius: 5px; cursor: pointer; }
+.seg button.sel { background: var(--surface-2); color: var(--text); font-weight: 650; }
+.vl-note { color: var(--muted); font-size: 12px; min-height: 1.4em; }
+.vtiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.vtile { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px 8px; background: var(--surface); min-width: 0;
+  display: flex; flex-direction: column; height: 122px; }
+.vt-h { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vt-big { flex: 1; display: flex; align-items: center; font-size: 34px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.vt-big small { font-size: 14px; font-weight: 400; color: var(--text-2); margin-left: 4px; }
+.vt-gauge { flex: 1; min-height: 0; width: 100%; }
+.vt-gv { fill: var(--text); font: 650 11px system-ui, sans-serif; }
+.vt-f { display: flex; justify-content: space-between; align-items: center; gap: 6px; min-width: 0; }
+.vt-sub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.vt-f .logsrc, .vt-f .ipcsrc { max-width: 48%; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }
+.vgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.vp { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px 4px; background: var(--surface); min-width: 0; }
+.vp.w2 { grid-column: 1 / -1; }
+.vp h3 { display: flex; justify-content: space-between; gap: 8px; margin: 0 0 6px; font-size: 13px; font-weight: 650; }
+.vp h3 .muted { font-size: 12px; }
+.vp .u { min-height: 200px; }
+.vp .uplot { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+.vp .u-legend { font-size: 12px; color: var(--text-2); text-align: left; margin: 4px 0 2px; }
+.vp .u-legend .u-marker { width: 14px; height: 3px; border-radius: 2px; }
+.vp .u-legend th, .vp .u-legend td { border: 0; padding: 0 3px; background: none; font-size: 12px; }
+.vp .u-legend .u-series:first-child { display: none; }
+.vp .u-legend .u-series { padding: 0 12px 0 0; }
+.vp .u-legend th { font-weight: 400; }
+.vp .u-legend .u-value { color: var(--text); font-weight: 650; font-variant-numeric: tabular-nums; }
+.vp .u-select { background: var(--grid); }
+@media (max-width: 1000px) { .vgrid { grid-template-columns: 1fr; } }
+.devhead { margin: 26px 0 12px; padding-top: 14px; border-top: 2px solid var(--line); display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.devhead h2 { margin: 0; font-size: 17px; }
+.sparkbox .endv { position: absolute; right: 0; transform: translateY(-50%); font-size: 11px; font-weight: 650; color: var(--text);
+  background: var(--surface); padding: 0 3px; border-radius: 3px; pointer-events: none; font-variant-numeric: tabular-nums; }
+.spark .area { stroke: none; }
 </style>
 </head>
 <body>
@@ -285,74 +296,46 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
     <picture class="logo-full"><source srcset="logo-dark.svg" media="(prefers-color-scheme: dark)"><img src="logo.svg" alt="fLLiper" height="30"></picture>
     <img class="logo-mark" src="mark.svg" alt="fLLiper" height="30" width="30">
   </a>
-  <h1>Rig-Dashboard</h1>
+  <h1 id="title">Rig-Dashboard</h1>
   <span class="sub" id="sub">verbinde&hellip;</span>
   <label class="livebox"><input type="checkbox" id="live-pause"> Live-Update pausieren <span class="note" id="pausenote"></span></label>
   <nav>
+    <!--DEV:BEGIN-->
     <a id="gpuqlink" class="lan" href="#" target="_blank" rel="noopener">GPU-Fensterplan</a>
     <a id="weg2link" class="lan" href="weg2" target="_blank" rel="noopener">Startzeile</a>
     <a id="plannerlink" class="lan" href="#" target="_blank" rel="noopener">Planer (Tafeln, Wizard)</a>
     <span id="lannote" class="muted" style="display:none">Planer, GPU-Fensterplan, Startzeile: nur im LAN</span>
+    <!--DEV:END-->
     <a href="api/live" target="_blank" rel="noopener">JSON</a>
   </nav>
 </header>
 <main>
-  <section class="gf" id="gf" aria-label="Verlauf wie Grafana">
-    <div class="gf-bar"><b>Verlauf</b><span class="gf-tabs" id="gf-model"></span><span class="gf-tabs" id="gf-range"></span>
-      <span class="gf-note" id="gf-note">lade&hellip;</span></div>
-    <div class="gf-tiles" id="gf-tiles"></div>
-    <div class="gf-grid">
-      <div class="gf-p"><h3><span>Token-Durchsatz <span class="muted">P-Prefill / D-Prefill / Decode &middot; log-Skala &middot; Tokens je 5 s</span></span><span id="gf-s-thr"></span></h3><div class="u" id="gf-c-thr"></div></div>
-      <div class="gf-p"><h3><span>GPU-Temperatur <span class="muted">Kern (NVML); Hotspot/Junction nicht lesbar</span></span><span id="gf-s-temp"></span></h3><div class="u" id="gf-c-temp"></div></div>
-      <div class="gf-p"><h3><span>Input-Tokens: aus Cache / neu gerechnet <span class="muted">gestapelt &middot; Übergabe P&rarr;D gestrichelt, nie Cache &middot; je Leg bei Abschluss</span></span><span id="gf-s-cache"></span></h3><div class="u" id="gf-c-cache"></div></div>
-      <div class="gf-p"><h3><span>GPU-Leistung</span><span id="gf-s-power"></span></h3><div class="u" id="gf-c-power"></div></div>
-      <div class="gf-p w2"><h3><span>Decode je Stream <span class="muted">Mittel</span></span><span id="gf-s-stream"></span></h3><div class="u" id="gf-c-stream"></div></div>
-      <div class="gf-p w2"><h3><span>KV-Cache-Belegung</span><span id="gf-s-kv"></span></h3><div class="u" id="gf-c-kv"></div></div>
-      <div class="gf-p w2"><h3><span>Host CPU &amp; Speicher</span><span id="gf-s-host"></span></h3><div class="u" id="gf-c-host"></div></div>
-      <div class="gf-p"><h3><span>SM-Takt</span><span id="gf-s-clock"></span></h3><div class="u" id="gf-c-clock"></div></div>
-      <div class="gf-p"><h3><span>Flipzeit je Flip <span class="muted">P-Ende &rarr; erstes Decode-Token (P&rarr;D)</span></span><span id="gf-s-flip"></span></h3><div class="u" id="gf-c-flip"></div></div>
-    </div>
-  </section>
+  <!-- Oberer Teil: Geschwindigkeit, Effizienz, Statistik (auch in der veröffentlichten fLLiper-Ausgabe) -->
   <div class="chips" id="chips"></div>
   <div class="cardstrip" id="cardstrip"></div>
-  <section class="card" id="launch-card">
-    <h2>Startflags &amp; ENV <span class="muted">je Modell, laufender bzw. letzter Boot &middot; Container / Front / P / D &middot; P&harr;D-Vergleich</span><span class="ipcsrc" title="state.json: groups.{P,D}.launch, launch.front, launch.container">state.json</span></h2>
-    <div class="lf-tools">
-      <input type="search" id="lf-filter" placeholder="Filter über alle Flags und ENV (Name oder Wert)" autocomplete="off">
-      <span class="lf-legend lf"><span class="d-differ">P&ne;D</span><span class="d-onlyp">nur P</span><span class="d-onlyd">nur D</span></span>
-      <span class="muted" id="lf-note"></span>
-    </div>
-    <div id="launchbox"></div>
-  </section>
   <div id="boots"></div>
-  <section class="card" id="prod-card">
-    <h2>Features Soll/Ist <span class="muted">Produkt-Features je Modell: Soll (messbar) &middot; Ist nur mit Beleg, sonst &bdquo;unbelegt&ldquo; &middot; <span class="stale-key">gelb</span> = Beleg &auml;lter als der letzte Boot des Modells, neu messen &middot; Wert im aktuellen Boot aus live.py/state.json &middot; Bausteine = Commits/Fixes darunter</span></h2>
-    <div id="prod"></div>
-  </section>
-  <section class="card" id="feat-card">
-    <h2>Bausteine <span class="muted">Commits/Fixes je Modell: je Modell: fertig &middot; im Image (git-Vorfahr / patch-id / Betreff gegen die Image-REV, hier gerechnet) &middot; aktiv (state.json launch, sonst Profil) &middot; Gewinn &middot; Begr&uuml;ndung wenn aus</span>
-      <label class="muted" style="font-size:12px;float:right"><input type="checkbox" id="feat-only-off"> nur &bdquo;im Image, aber aus&ldquo;</label></h2>
-    <div id="feat"></div>
-  </section>
-  <section class="card" id="imgchg-card">
-    <h2>Image-&Auml;nderungen <span class="muted">was das laufende Boot-Image je Sitz gegen&uuml;ber seinem Vorg&auml;nger tr&auml;gt, erwartete Wirkung und Stand am Metall</span></h2>
-    <div id="imgchg"></div>
+  <section class="card" id="verlauf" aria-label="Verlauf je Modell">
+    <div class="vl-bar"><h2>Verlauf</h2><span class="seg" id="vl-model"></span><span class="seg" id="vl-range"></span>
+      <span class="vl-note" id="vl-note">lade&hellip;</span></div>
+    <div class="vtiles" id="vl-tiles"></div>
+    <div class="vgrid">
+      <div class="vp"><h3><span>Prefill-Durchsatz <span class="muted">tok/s &middot; P und D, je Chunk</span></span><span id="vl-s-pre"></span></h3><div class="u" id="vl-c-pre"></div></div>
+      <div class="vp"><h3><span>Decode-Durchsatz <span class="muted">tok/s &middot; alle Streams und je Stream</span></span><span id="vl-s-dec"></span></h3><div class="u" id="vl-c-dec"></div></div>
+      <div class="vp"><h3><span>Input-Tokens: aus Cache / neu gerechnet <span class="muted">tok/s, gestapelt &middot; Übergabe P&rarr;D gestrichelt, nie Cache</span></span><span id="vl-s-cache"></span></h3><div class="u" id="vl-c-cache"></div></div>
+      <div class="vp"><h3><span>KV-Cache-Belegung <span class="muted">% der KV-Token je Gruppe</span></span><span id="vl-s-kv"></span></h3><div class="u" id="vl-c-kv"></div></div>
+      <div class="vp w2"><h3><span>Flipzeit je Flip <span class="muted">s &middot; P&rarr;D: P-Ende &rarr; erstes Decode-Token &middot; D&rarr;P: bis erster P-Prefill</span></span><span id="vl-s-flip"></span></h3><div class="u" id="vl-c-flip"></div></div>
+    </div>
   </section>
   <section class="card" id="gpus-card">
-    <h2>Karten <span class="muted">nvidia-smi, alle 2 s &middot; Verlauf 15 min</span></h2>
+    <h2>Karten <span class="muted">NVML &middot; jetzt und Verlauf (Zeitraum wie oben)</span></h2>
+    <div class="vtiles" id="hw-tiles"></div>
     <div id="gpus"></div>
-  </section>
-  <section class="card">
-    <h2>Container <span class="muted">Docker auf dem Proxmox-Host (htsglang-*)</span></h2>
-    <div id="containers" class="tablewrap"></div>
-  </section>
-  <section class="card">
-    <h2>GPU-Fensterplan <span class="muted">gpuq, laufende und wartende Fenster</span></h2>
-    <div id="gpuq" class="tablewrap"></div>
-  </section>
-  <section class="card">
-    <h2>Letzte Boots <span class="muted">entdeckt aus den Boot-Logs der letzten 6 h; Kopf, Lebenszyklus und Stopp-Ursache aus state.json/events.jsonl, wo vorhanden</span><span class="logsrc" title="Boot-Entdeckung und Kacheln aus den Boot-Logs; Umstellung: DASHBOARD-AUS-IPC-INVENTAR-0929.md">Kacheln aus Log (&Uuml;bergang)</span></h2>
-    <div id="history" class="tablewrap"></div>
+    <div class="vgrid" style="margin-top:12px">
+      <div class="vp w2"><h3><span>Leistungsaufnahme (Power draw) <span class="muted">W &middot; Summe aller Karten, darunter je Karte</span></span><span id="hw-s-power"></span></h3><div class="u" id="hw-c-power"></div></div>
+      <div class="vp"><h3><span>GPU-Temperatur <span class="muted">&deg;C &middot; Kern (Hotspot per NVML nicht lesbar)</span></span><span id="hw-s-temp"></span></h3><div class="u" id="hw-c-temp"></div></div>
+      <div class="vp"><h3><span>SM-Takt <span class="muted">MHz</span></span><span id="hw-s-clock"></span></h3><div class="u" id="hw-c-clock"></div></div>
+      <div class="vp w2"><h3><span>Host: CPU &amp; Speicher <span class="muted">%</span></span><span id="hw-s-host"></span></h3><div class="u" id="hw-c-host"></div></div>
+    </div>
   </section>
   <section class="card note">
     <h2>Instrumente</h2>
@@ -373,11 +356,54 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
     <p>Quelle sind die Boot-Logs, die der weg2-Launcher ohnehin schreibt (per Byte-Offset gelesen, nie ganz).
     Das Dashboard schickt keinem Modell eine Anfrage au&szlig;er <span class="mono">GET /weg2/state</span> alle 10 s.</p>
   </section>
+  <!--DEV:BEGIN-->
+  <div class="devhead" id="dev-head"><h2>Entwicklungsstand</h2><span class="muted">nur im Rig-Dashboard; die veröffentlichte fLLiper-Ausgabe (<span class="mono">--edition release</span>) liefert diesen Teil nicht aus</span></div>
+  <section class="card" id="launch-card">
+    <h2>Startflags &amp; ENV <span class="muted">je Modell, laufender bzw. letzter Boot &middot; Container / Front / P / D &middot; P&harr;D-Vergleich</span><span class="ipcsrc" title="state.json: groups.{P,D}.launch, launch.front, launch.container">state.json</span></h2>
+    <div class="lf-tools">
+      <input type="search" id="lf-filter" placeholder="Filter über alle Flags und ENV (Name oder Wert)" autocomplete="off">
+      <span class="lf-legend lf"><span class="d-differ">P&ne;D</span><span class="d-onlyp">nur P</span><span class="d-onlyd">nur D</span></span>
+      <span class="muted" id="lf-note"></span>
+    </div>
+    <div id="launchbox"></div>
+  </section>
+  <section class="card" id="prod-card">
+    <h2>Features Soll/Ist <span class="muted">Produkt-Features je Modell: Soll (messbar) &middot; Ist nur mit Beleg, sonst &bdquo;unbelegt&ldquo; &middot; <span class="stale-key">gelb</span> = Beleg &auml;lter als der letzte Boot des Modells, neu messen &middot; Wert im aktuellen Boot aus live.py/state.json &middot; Bausteine = Commits/Fixes darunter</span></h2>
+    <div id="prod"></div>
+  </section>
+  <section class="card" id="feat-card">
+    <h2>Bausteine <span class="muted">Commits/Fixes je Modell: je Modell: fertig &middot; im Image (git-Vorfahr / patch-id / Betreff gegen die Image-REV, hier gerechnet) &middot; aktiv (state.json launch, sonst Profil) &middot; Gewinn &middot; Begr&uuml;ndung wenn aus</span>
+      <label class="muted" style="font-size:12px;float:right"><input type="checkbox" id="feat-only-off"> nur &bdquo;im Image, aber aus&ldquo;</label></h2>
+    <div id="feat"></div>
+  </section>
+  <section class="card" id="imgchg-card">
+    <h2>Image-&Auml;nderungen <span class="muted">was das laufende Boot-Image je Sitz gegen&uuml;ber seinem Vorg&auml;nger tr&auml;gt, erwartete Wirkung und Stand am Metall</span></h2>
+    <div id="imgchg"></div>
+  </section>
+  <section class="card">
+    <h2>Container <span class="muted">Docker auf dem Proxmox-Host (htsglang-*)</span></h2>
+    <div id="containers" class="tablewrap"></div>
+  </section>
+  <section class="card">
+    <h2>GPU-Fensterplan <span class="muted">gpuq, laufende und wartende Fenster</span></h2>
+    <div id="gpuq" class="tablewrap"></div>
+  </section>
+  <section class="card">
+    <h2>Letzte Boots <span class="muted">entdeckt aus den Boot-Logs der letzten 6 h; Kopf, Lebenszyklus und Stopp-Ursache aus state.json/events.jsonl, wo vorhanden</span><span class="logsrc" title="Boot-Entdeckung und Kacheln aus den Boot-Logs; Umstellung: DASHBOARD-AUS-IPC-INVENTAR-0929.md">Kacheln aus Log (&Uuml;bergang)</span></h2>
+    <div id="history" class="tablewrap"></div>
+  </section>
+  <!--DEV:END-->
 </main>
 <div class="tip" id="tip"></div>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
+// Ausgabe (server.py --edition): "rig" = ganze Seite, "release" = veröffentlichte fLLiper-Ausgabe,
+// dort fehlt der untere Teil ganz (der Server liefert die DEV-Blöcke nicht aus)
+const EDITION = document.documentElement.dataset.edition || "rig";
+const DEV = !!document.getElementById("dev-head");
+const PAGE_TITLE = EDITION === "release" ? "fLLiper Dashboard" : "Rig-Dashboard";
+document.getElementById("title").textContent = PAGE_TITLE;
 // DASHBOARD-AUS-IPC (Nutzer 29.09.): what still comes from a log line says so; the rest names its IPC source
 const LOGSRC = `<span class="logsrc" title="Quelle: Boot-Log (Regex in parse.py/live.py). Umstellung auf IPC: /spinning/gpu-arb/docs/DASHBOARD-AUS-IPC-INVENTAR-0929.md">aus Log (&Uuml;bergang)</span>`;
 const ipcTag = (what) => `<span class="ipcsrc" title="Quelle: IPC (${esc(what)})">${esc(what)}</span>`;
@@ -411,13 +437,23 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
   const nice = max > 0 ? mag * Math.ceil(max / mag) : 1;
   const y = (v) => padT + (H - padT - padB) * (1 - v / nice);
   // working = 2 px (step: a held value stays level until the next bucket), zero = thin base line
-  // (slept / flipped away / no work), no value = no line (no data yet, or a real failure: red mark)
-  let dWork = "", dZero = "", prev = null, prevV = null;
+  // (slept / flipped away / no work), no value = no line (no data yet, or a real failure: red mark).
+  // Nutzer 30.09. (Vorlage als Stilbeispiel): Fläche unter der Linie, feines Raster, Achse mit
+  // Einheit, der letzte Wert als Punkt und Zahl betont.
+  let dWork = "", dZero = "", prev = null, prevV = null, area = "", seg = [], last = null;
   const step = ts.length > 1 ? (ts[1] - ts[0]) : 5;
+  const base = y(0).toFixed(1);
+  const flush = () => {
+    if (seg.length > 1) area += `M${seg[0][0]},${base}` + seg.map(([X, Y]) => `L${X},${Y}`).join("") + `L${seg[seg.length - 1][0]},${base}Z`;
+    seg = [];
+  };
   for (const [t, v] of pts) {
     if (t < t0) continue;
     const cont = prev != null && t - prev <= step * 1.01;
     const X = x(t).toFixed(1), Y = y(v).toFixed(1);
+    if (!cont) flush();
+    if (cont) seg.push([X, y(prevV).toFixed(1)]);
+    seg.push([X, Y]);
     if (v > 0) {
       if (cont && prevV > 0) dWork += `L${X},${y(prevV).toFixed(1)}L${X},${Y}`;
       else if (cont && prevV === 0) dWork += `M${X},${y(0).toFixed(1)}L${X},${Y}`;
@@ -426,20 +462,30 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
       if (cont && prevV > 0) dWork += `L${X},${y(prevV).toFixed(1)}L${X},${Y}`;
       dZero += (cont && prevV === 0 ? "L" : "M") + `${X},${Y}`;
     }
-    prev = t; prevV = v;
+    prev = t; prevV = v; last = [t, v];
   }
+  flush();
   const hasGap = opt.gapFrom && opt.gapFrom > t0;
   const planned = opt.gapKind === "planned";
   const gap = hasGap ? `<line x1="${x(opt.gapFrom).toFixed(1)}" x2="${x(opt.gapFrom).toFixed(1)}" y1="0" y2="${H}" stroke="${planned ? "var(--muted)" : "var(--bad)"}" stroke-width="2" stroke-dasharray="4 3" vector-effect="non-scaling-stroke"/>` : "";
-  const svg = `<div class="sparkbox"><span class="ymax">${fmt(nice, digits)} ${unit}</span>${hasGap ? `<span class="gapmark${planned ? " planned" : ""}">${planned ? "■" : "✕"} ${esc(opt.gapReason || "Ausfall")} ${hhmm(opt.gapFrom)}</span>` : ""}
+  const grid = [0.25, 0.5, 0.75].map((f) => `<line class="grid" x1="0" x2="${W}" y1="${y(nice * f).toFixed(1)}" y2="${y(nice * f).toFixed(1)}" stroke-dasharray="2 3" vector-effect="non-scaling-stroke"/>`).join("")
+    + [300, 600].map((s) => `<line class="grid" y1="0" y2="${H}" x1="${x(t1 - s).toFixed(1)}" x2="${x(t1 - s).toFixed(1)}" stroke-dasharray="2 3" vector-effect="non-scaling-stroke"/>`).join("");
+  const endDot = last && last[0] >= t1 - 3 * step
+    ? `<path d="M${x(last[0]).toFixed(1)},${y(last[1]).toFixed(1)}l0,0" stroke="${color}" stroke-width="7" stroke-linecap="round" vector-effect="non-scaling-stroke"/>` : "";
+  const endLbl = last && last[0] >= t1 - 3 * step
+    ? `<span class="endv" style="top:${Math.max(7, Math.min(H - 7, y(last[1]))).toFixed(0)}px">${fmt(last[1], digits)}</span>` : "";
+  const svg = `<div class="sparkbox"><span class="ymax">${fmt(nice, digits)} ${unit}</span>${hasGap ? `<span class="gapmark${planned ? " planned" : ""}">${planned ? "■" : "✕"} ${esc(opt.gapReason || "Ausfall")} ${hhmm(opt.gapFrom)}</span>` : ""}${hasGap ? "" : endLbl}
     <svg class="spark" id="${svgId}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Verlauf 15 min, ${unit}" style="height:${H}px">
+    ${grid}
     <line class="grid" x1="0" x2="${W}" y1="${y(nice)}" y2="${y(nice)}" vector-effect="non-scaling-stroke"/>
     <line class="grid" x1="0" x2="${W}" y1="${y(0)}" y2="${y(0)}" vector-effect="non-scaling-stroke"/>
+    <path class="area" d="${area}" fill="${color}" fill-opacity=".16"/>
     <path d="${dZero}" fill="none" stroke="${color}" stroke-width="1" stroke-opacity=".7" vector-effect="non-scaling-stroke"/>
     <path d="${dWork}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>
+    ${endDot}
     ${gap}
     <line class="cross" x1="0" x2="0" y1="0" y2="${H}" stroke="var(--muted)" stroke-width="1" vector-effect="non-scaling-stroke" visibility="hidden"/>
-    </svg>${opt.noAxis ? "" : `<div class="xaxis"><span>−15 min</span><span>jetzt</span></div>`}${opt.caption ? `<div class="caption">${opt.caption}</div>` : ""}</div>`;
+    </svg>${opt.noAxis ? "" : `<div class="xaxis"><span>−15 min</span><span>−10</span><span>−5</span><span>jetzt</span></div>`}${opt.caption ? `<div class="caption">${opt.caption}</div>` : ""}</div>`;
   return {svg, bind: () => {
     const el = document.getElementById(svgId);
     if (!el) return;
@@ -882,26 +928,22 @@ function gpusHtml(d, binders) {
   const g = d.gpus || {};
   const cards = g.value || [];
   if (!cards.length) return `<div class="err">${esc(g.error || "keine Karten")}</div>`;
-  const s = d.gpu_series || {t: [], power: []};
   const pcie = {};
   (((d.pcie || {}).value) || []).forEach((p) => { pcie[p.index] = p; });
   return cards.map((c, i) => {
     const pw = c["power.draw"], pl = c["power.limit"], mu = c["memory.used"], mt = c["memory.total"];
     const pc = pcie[c.index] || {};
     const rx = pc.rx_mb_s, tx = pc.tx_mb_s;
-    const ser = (s.power || []).map((row) => row[i]);
-    const sp = s.t && s.t.length > 1 ? spark(`gp-${i}`, s.t, ser, "var(--s1)", "W", 0, d.t) : null;
-    if (sp) binders.push(sp.bind);
     return `<div class="gpu">
       <div class="name">${esc(c.name.replace("NVIDIA GeForce ", ""))} <span>nvml ${c.index} &middot; ${fmt(c["temperature.gpu"])} &deg;C &middot; ${fmt(c["clocks.sm"])} MHz</span></div>
       <div class="meter">Leistung <b class="num">${fmt(pw)} / ${fmt(pl)} W</b><div class="bar"><b style="width:${pl ? Math.min(100, 100 * pw / pl) : 0}%"></b></div></div>
       <div class="meter">VRAM <b class="num">${fmt(mu / 1024, 1)} / ${fmt(mt / 1024, 1)} GiB</b> &middot; Last ${fmt(c["utilization.gpu"])} %<div class="bar"><b style="width:${mt ? Math.min(100, 100 * mu / mt) : 0}%"></b></div></div>
       <div class="meter">PCIe &Oslash; 2 s <b class="num">RX ${fmt(rx, 1)} &middot; TX ${fmt(tx, 1)} MB/s</b></div>
-      <div>${sp ? sp.svg : ""}</div>
     </div>`;
   }).join("");
 }
 
+// <!--DEV:BEGIN-->  (Container, gpuq, Features Soll/Ist, Bausteine, Image-Änderungen, Letzte Boots: nur Rig-Ausgabe)
 function containersHtml(d) {
   const dk = d.docker;
   if (!dk) return `<div class="muted">Docker-Abfrage abgeschaltet</div>`;
@@ -1124,6 +1166,7 @@ function historyHtml(boots, now) {
     `</table><div class="muted" style="font-size:12px;margin-top:4px">Prefill-Spalten: Rechenrate (gpu-ms) des letzten Schubs, langsamster Rang; Decode: letzter gen-throughput-Wert.</div>`;
 }
 
+// <!--DEV:END-->
 function chipsHtml(d) {
   const out = [];
   const src = [["Karten", d.gpus], ["Docker", d.docker], ["gpuq", d.gpuq]];
@@ -1149,6 +1192,7 @@ function chipsHtml(d) {
 //     dazu der Schalter "Live-Update pausieren".
 const tplEl = document.createElement("template");
 function morph(el, html) {
+  if (!el) return;              // release: the dev part is not in the page
   tplEl.innerHTML = html;
   morphChildren(el, tplEl.content);
 }
@@ -1202,7 +1246,9 @@ function holdAnchor(chain) {
 const RESERVED = ["chips", "cardstrip", "boots", "prod", "feat", "imgchg", "gpus", "containers", "gpuq", "history"];
 function reserveHeights() {
   for (const id of RESERVED) {
-    const el = $(id), h = el.offsetHeight;
+    const el = $(id);
+    if (!el) continue;
+    const h = el.offsetHeight;
     if (h > (el._minH || 0)) { el._minH = h; el.style.minHeight = h + "px"; }
   }
 }
@@ -1221,6 +1267,7 @@ function pauseReason() {
   return left > 0 ? `pausiert beim Lesen, noch ${Math.ceil(left / 1000)} s` : "";
 }
 
+// <!--DEV:BEGIN-->  (Startflags: nur Rig-Ausgabe)
 // ---------------------------------------------------------------- Startflags (launchview.py)
 // Nur neu zeichnen, wenn sich ver (Digest des Gezeigten) ändert; Auf/Zu je <details> in localStorage.
 const LF_KEY = "rigdash.launch.open";
@@ -1331,13 +1378,13 @@ async function refreshLaunch() {
     lfInflight = false;
   }
 }
-$("launchbox").addEventListener("toggle", (e) => {
+if (DEV) $("launchbox").addEventListener("toggle", (e) => {
   const d = e.target;
   if (!d.id || (d.open && lfAutoIds.delete(d.id))) return;
   if (d.open) lfOpen.add(d.id); else lfOpen.delete(d.id);
   lfSaveOpen();
 }, true);
-$("launchbox").addEventListener("click", async (e) => {
+if (DEV) $("launchbox").addEventListener("click", async (e) => {
   const b = e.target.closest("button.copy");
   if (!b || !lfData) return;
   const [id, what] = b.dataset.copy.split("|");
@@ -1352,7 +1399,8 @@ $("launchbox").addEventListener("click", async (e) => {
   }
   setTimeout(() => { b.textContent = what === "argv" ? "argv kopieren" : "ENV kopieren"; }, 1500);
 });
-$("lf-filter").addEventListener("input", lfApplyFilter);
+if (DEV) $("lf-filter").addEventListener("input", lfApplyFilter);
+// <!--DEV:END-->
 
 let failures = 0, inflight = false;
 async function refresh(force) {
@@ -1377,13 +1425,15 @@ async function refresh(force) {
       : `<section class="card" id="boots-banner" style="border-color:var(--bad)"><b style="color:var(--bad)">Kein Modell schreibt gerade Logs.</b> <span class="muted">Unten der zuletzt aktive Boot mit seinen letzten Zahlen.</span></section>`) : "";
     morph($("boots"), banner + (shown.length ? shown.map((b) => bootCard(b, now, binders)).join("")
       : `<section class="card" id="boots-none"><div class="muted">Kein Boot-Log der letzten 6 h gefunden.</div></section>`));
-    morph($("prod"), prodHtml(d));
-    morph($("feat"), featHtml(d));
-    morph($("imgchg"), imgChgHtml(d));
+    if (DEV) {
+      morph($("prod"), prodHtml(d));
+      morph($("feat"), featHtml(d));
+      morph($("imgchg"), imgChgHtml(d));
+      morph($("containers"), containersHtml(d));
+      morph($("gpuq"), gpuqHtml(d));
+      morph($("history"), historyHtml(d.boots.filter((b) => !shown.includes(b)), now));
+    }
     morph($("gpus"), gpusHtml(d, binders));
-    morph($("containers"), containersHtml(d));
-    morph($("gpuq"), gpuqHtml(d));
-    morph($("history"), historyHtml(d.boots.filter((b) => !shown.includes(b)), now));
     morph($("chips"), chipsHtml(d));
     // compact card strip at the top: the load at a glance, also on a phone
     morph($("cardstrip"), ((d.gpus || {}).value || []).map((c) => `<div><b>${esc(c.name.replace("NVIDIA GeForce ", ""))}</b>
@@ -1391,9 +1441,9 @@ async function refresh(force) {
       <div class="bar"><i style="width:${c["power.limit"] ? Math.min(100, 100 * c["power.draw"] / c["power.limit"]) : 0}%"></i></div></div>`).join(""));
     // behind the public proxy the LAN-only services are not reachable: hide their links, say so once
     document.querySelectorAll("a.lan").forEach((a) => { a.style.display = d.via_proxy ? "none" : ""; });
-    $("lannote").style.display = d.via_proxy ? "" : "none";
+    if ($("lannote")) $("lannote").style.display = d.via_proxy ? "" : "none";
     const bad = live.filter((b) => b.alarm && (b.alarm.state === "TOT" || b.alarm.state === "HAENGT"));
-    document.title = bad.length ? `[${bad.map((b) => b.alarm.state === "TOT" ? "TOT" : "H\u00c4NGT").join(",")}] Rig-Dashboard` : "Rig-Dashboard";
+    document.title = bad.length ? `[${bad.map((b) => b.alarm.state === "TOT" ? "TOT" : "H\u00c4NGT").join(",")}] ${PAGE_TITLE}` : PAGE_TITLE;
     $("sub").textContent = `${live.length} Modell${live.length === 1 ? "" : "e"} live · Stand ${hhmm(now)} · rigdash ${d.version}`;
     binders.forEach((f) => f());
     bindPhaseBars();
@@ -1406,6 +1456,7 @@ async function refresh(force) {
     inflight = false;
   }
 }
+if (DEV) {
 $("gpuqlink").href = `${location.protocol}//${location.hostname}:8770/`;
 $("plannerlink").href = `${location.protocol}//${location.hostname}:8780/`;
 $("feat-only-off").checked = featOnlyOff;
@@ -1415,6 +1466,7 @@ $("feat-only-off").addEventListener("change", (e) => {
   releaseHeight($("feat"));
   refresh(true);
 });
+}
 try { $("live-pause").checked = localStorage.getItem("rigdash-live-pause") === "1"; } catch (e) { /* no storage */ }
 $("live-pause").addEventListener("change", (e) => {
   try { localStorage.setItem("rigdash-live-pause", e.target.checked ? "1" : "0"); } catch (err) { /* no storage */ }
@@ -1422,8 +1474,10 @@ $("live-pause").addEventListener("change", (e) => {
 });
 refresh(true);
 setInterval(() => refresh(), 2000);
-refreshLaunch();
-setInterval(() => refreshLaunch(), 15000);
+if (DEV) {
+  refreshLaunch();
+  setInterval(() => refreshLaunch(), 15000);
+}
 </script>
 <script src="uplot.iife.min.js"></script>
 <script src="grafik.js"></script>
