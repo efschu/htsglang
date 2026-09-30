@@ -628,6 +628,13 @@ class Envs:
     # (a reference over P's whole phase) stays closed. Model-neutral; off
     # until the first boot series, then default on.
     SGLANG_WEG2_ENABLE_WAKE_READ_EARLY = EnvBool(False)
+    # TAIL-STAGE-EARLY (30.09., NF y4k/y4l P->D, weg2/tail_adopt.stage_early):
+    # the E2 tail staging of the dormant hold starts at the START of D's weight
+    # legs (beside them, host-only) instead of at the first prefetch check
+    # after the wake. Measured: WEG2-TAIL-READY waited_ms (the H45 hold on a
+    # finished store read) median 291 ms (y4l, n=12) / 286 (y4k, n=14), up to
+    # 757 at a wake cohort of 6 -- inside flip_first_work. Off until metal.
+    SGLANG_WEG2_ENABLE_TAIL_STAGE_EARLY = EnvBool(False)
     # WAKE_READ_ARENA_GATE (#248f, 30.09., NF y4b ep18): the #248 hold reads of
     # a wake are issued in hold (arrival) order only while their pages fit in
     # the KV arena together (its slot count -- no reserve); a younger read

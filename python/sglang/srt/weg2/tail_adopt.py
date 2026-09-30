@@ -743,6 +743,85 @@ def stage(rid: str, tree_cache) -> None:
         logger.warning("WEG2-TAIL stage refused rid=%s (%s: %s)", rid, type(exc).__name__, exc)
 
 
+def stage_early_enabled() -> bool:
+    """SGLANG_WEG2_ENABLE_TAIL_STAGE_EARLY (TAIL-STAGE-EARLY, 30.09.)."""
+    try:
+        return bool(envs.SGLANG_WEG2_ENABLE_TAIL_STAGE_EARLY.get())
+    except Exception:  # noqa: BLE001 -- an unknown switch is off
+        return False
+
+
+def stage_early(rids, tree_cache) -> Dict[str, str]:
+    """TAIL-STAGE-EARLY (30.09., NF y4k/y4l P->D): at the START of D's weight
+    legs, start the tail staging of the dormant hold's requests -- the same
+    background read :func:`stage` starts at the first prefetch check after
+    the wake, only ~1.5 s earlier, beside the legs (host-only: part files,
+    digests, pinned buffers; ``held_shapes`` reads pool shapes, no bytes).
+
+    MEASURED (y4l 12 / y4k 14 P->D flips, D TP0 ``WEG2-TAIL-READY
+    waited_ms``): the H45 hold kept each hand-off's FINISHED store read from
+    terminating until its staging was done -- median 291 / 286 ms, 549-757 ms
+    at a wake cohort of 4-6; it sits between the kv resume and the first
+    pass, i.e. inside flip_first_work (P end -> first decode token).
+
+    Only a COMPLETE manifest starts a job here: a partial or absent one
+    leaves no job behind, so the first check after the wake creates it
+    exactly as before (its ``t_first`` bound unchanged). A job that exists
+    already is left alone. Rank-uniform: every rank calls this at the same
+    point of the same RPC with the same hold. Never raises. Returns rid ->
+    verdict (``started`` / ``exists`` / ``manifest_<state>`` / ``not_candidate``
+    / ``refused:<why>``)."""
+    out: Dict[str, str] = {}
+    for rid in rids:
+        rid = str(rid)
+        try:
+            if rid in _JOBS:
+                out[rid] = "exists"
+                continue
+            if not _candidate(rid):
+                out[rid] = "not_candidate"
+                continue
+            headers = th.headers_for(rid)
+            state, have, want = th.manifest_state(headers)
+            if state not in _STAGE_STATES:
+                out[rid] = f"manifest_{state}"
+                continue
+            stage(rid, tree_cache)  # the one staging entry: job + thread, as after the wake
+            job = _JOBS.get(rid)
+            out[rid] = "started" if job is not None and job.thread is not None else "refused:no_thread"
+        except Exception as exc:  # noqa: BLE001 -- the post-wake check stages what is left
+            out[rid] = f"refused:{type(exc).__name__}"
+    return out
+
+
+def stage_at_wake_begin(sched) -> Optional[Dict[str, str]]:
+    """The wake leg's call (weight_updater, beside WAKE-READ-EARLY): the
+    dormant hold's rids through :func:`stage_early`, one line per wake.
+    None when off or nothing is held. Never raises."""
+    try:
+        if not stage_early_enabled() or not adopt_enabled():
+            return None
+        hold = getattr(sched, "weg2_dormant_hold", None) or []
+        rids = [str(getattr(r, "rid", "")) for r in hold if getattr(r, "rid", None)]
+        if not rids:
+            return None
+        t0 = time.perf_counter()
+        out = stage_early(rids, sched.tree_cache)
+        if all(v == "not_candidate" for v in out.values()):
+            return out  # group P (it publishes, never adopts): nothing to say
+        started = sum(1 for v in out.values() if v == "started")
+        logger.info(
+            "WEG2-TAIL-STAGE-EARLY held=%d started=%d issue_ms=%.1f verdicts=%s (E2 tail staging "
+            "beside the weight legs; a partial manifest is staged by the first post-wake check)",
+            len(rids), started, (time.perf_counter() - t0) * 1000.0,
+            ",".join(f"{k}:{v}" for k, v in out.items()),
+        )
+        return out
+    except Exception as exc:  # noqa: BLE001 -- the post-wake check stages what is left
+        logger.warning("WEG2-TAIL-STAGE-EARLY n/a (%s: %s)", type(exc).__name__, exc)
+        return None
+
+
 def vote_hold(rid: str) -> int:
     """H45: this rank's slot in the prefetch termination MAX -- 1 while its
     staging of the rid is not finished (manifest incomplete or the read still

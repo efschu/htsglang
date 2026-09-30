@@ -10104,6 +10104,14 @@ class SchedulerWeightUpdaterManager:
                 except Exception as _early_exc:  # noqa: BLE001 -- the release issues what is left
                     logger.warning("#248 WAKE-READ-EARLY n/a (%s: %s) -- the release issues it",
                                    type(_early_exc).__name__, _early_exc)
+                # TAIL-STAGE-EARLY: the hold's E2 tail staging beside the legs
+                # (weg2/tail_adopt.stage_early; off = the first post-wake check)
+                try:
+                    from sglang.srt.weg2 import tail_adopt as _ta_early
+
+                    _ta_early.stage_at_wake_begin(self.scheduler)
+                except Exception as _ta_exc:  # noqa: BLE001 -- the post-wake check stages it
+                    logger.warning("WEG2-TAIL-STAGE-EARLY n/a (%s: %s)", type(_ta_exc).__name__, _ta_exc)
                 _weg2_ph("read_early")
             shm0 = self._weg2_rss_shmem_mib()
             tag_bytes = {tag: self._weg2_tag_bytes(tag) for tag in weights_tags}
