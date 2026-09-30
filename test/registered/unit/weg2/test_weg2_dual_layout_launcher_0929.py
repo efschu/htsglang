@@ -165,3 +165,20 @@ class DualLayoutLauncher(CustomTestCase):
         self.assertTrue(inc2("lm_head.weight"))
         self.assertTrue(inc2("model.language_model.norm.weight"))
         self.assertFalse(inc2("model.language_model.embed_tokens.weight"))
+
+    def test_dual_p_bar1_window(self):
+        # f9fch3: P's flip-default windows + D's overflow the 3080's BAR1 when P never sleeps.
+        on = L.build_parser().parse_args(["--tree", "/x", "--tag", "t", "--dual-layout"])
+        L.resolve_dual_layout(on)
+        self.assertEqual(on.p_barlink_bar1_window_mib, L.DUAL_P_BARLINK_BAR1_WINDOW_MIB)
+        pinned = L.build_parser().parse_args(["--tree", "/x", "--tag", "t", "--dual-layout",
+                                              "--p-barlink-bar1-window-mib", "8,PP_0=32"])
+        L.resolve_dual_layout(pinned)
+        self.assertEqual(pinned.p_barlink_bar1_window_mib, "8,PP_0=32")
+        off = L.build_parser().parse_args(["--tree", "/x", "--tag", "t"])
+        L.resolve_dual_layout(off)
+        self.assertEqual(off.p_barlink_bar1_window_mib, L.P_BARLINK_BAR1_WINDOW_MIB)
+        # the arithmetic: RM 19 + P + D (16+32+40) + reserve 32 fits 256
+        p = sum(int(x.split("=")[-1]) for x in L.DUAL_P_BARLINK_BAR1_WINDOW_MIB.split(","))
+        self.assertLessEqual(19 + p + 88 + 32, 256)
+

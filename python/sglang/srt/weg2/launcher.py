@@ -13546,6 +13546,24 @@ def resolve_dual_layout(ns) -> None:
         print(f"WEG2-DUAL --flip-weights {getattr(ns, 'flip_weights', 'family')} -> resident "
               "(both groups stay awake, no weight ever sleeps)", flush=True)
         ns.flip_weights = "resident"
+    if str(getattr(ns, "p_barlink_bar1_window_mib", P_BARLINK_BAR1_WINDOW_MIB)) == P_BARLINK_BAR1_WINDOW_MIB:
+        # Only the untouched default is replaced; an explicit operator value is kept.
+        print(f"WEG2-DUAL --p-barlink-bar1-window-mib {P_BARLINK_BAR1_WINDOW_MIB} -> "
+              f"{DUAL_P_BARLINK_BAR1_WINDOW_MIB} (P never sleeps, so both groups' BAR1 windows "
+              f"share the 3080's 256 MiB aperture)", flush=True)
+        ns.p_barlink_bar1_window_mib = DUAL_P_BARLINK_BAR1_WINDOW_MIB
+
+
+#: DUAL-TP3PP3: group P's BAR1 windows while BOTH groups are awake. Metal
+#: 30.09. boot f9fch3: with P at the flip default (24 + pp 96) D's dcp window
+#: was REFUSED on both 3080s (40 MiB wanted, 39 free). The 3080 has 256 MiB
+#: BAR1. The RM base, measured from that refusal line, is 19 MiB (NVML free 71
+#: with P 120 + D 46 held). So 19 + P 120 + D 88 = 227 left 29 free, under the
+#: 32 MiB reserve. The flip default only fits because P sleeps before D builds.
+#: With P at 16 + 64: 19 + 80 + 88 = 187, 69 free, 37 above the reserve. The
+#: price is more rounds per large pp send (per-round ~16 instead of ~24 MiB at
+#: ~323 us/round), about a millisecond on an 80 MiB hidden-state send.
+DUAL_P_BARLINK_BAR1_WINDOW_MIB = "16,PP_0=64"
 
 
 #: DUAL-TP3PP3 --dual-share: written by the launcher once D is READY; the P
