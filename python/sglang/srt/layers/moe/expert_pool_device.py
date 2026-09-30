@@ -646,6 +646,14 @@ def sync_tables(
         if off is not None and off[0] <= r < off[1]:
             continue  # H95c: an OFF seat row has no pages and stays OFF
         old = int(key[r])
+        if old == SEAT_OFF_KEY:
+            # RW-FINISH: a warm row reserved by reserve_warm_rows is OFF until
+            # its copy lands (commit_warm_rows / release_warm_rows own it):
+            # never freed here, never an index into hot_phys. y4u f50f51020f
+            # D TP1 15:18:30: an eager extend synced while TP1's warm rest
+            # had not landed (finish_landed=0) -> hot[0x7FFFFFFF] IndexError,
+            # scheduler_exception, W17 group D dead.
+            continue
         if old >= 0 and int(hot[old]) == r:
             hot[old] = -1
         key[r] = -1
@@ -678,10 +686,8 @@ def sync_tables(
     # prefetch mark on them is stale and would count a later hit as a
     # prefetch hit it never was.
     tables.pf_row.copy_(pf_row.to(dev))
-    if off is None:
-        owned = int((key[lo:hi] >= 0).sum())
-    else:
-        owned = int(((key[lo:hi] >= 0) & (key[lo:hi] < E)).sum())
+    # an OFF row (H95c seat row, RW-FINISH reserved warm row) owns no expert
+    owned = int(((key[lo:hi] >= 0) & (key[lo:hi] < E)).sum())
     return SyncReport(owned=owned, twins_freed=twins)
 
 

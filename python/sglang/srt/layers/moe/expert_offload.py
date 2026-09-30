@@ -7437,7 +7437,7 @@ class ResumeWarm:
         self.row_bytes = 0
         self.skipped_eager = self.skipped_cancel = 0
         self.cancel_reason = ""
-        self.finish_layers = self.finish_rows = self.finish_landed = 0
+        self.finish_layers = self.finish_rows = self.finish_landed = self.eager_landed = 0
         self.finish_reason = ""
         self.at_arm = False
         self.arm_ms = 0.0
@@ -7570,9 +7570,39 @@ class ResumeWarm:
         self._planned = True
 
     def eager_reached(self, cache) -> None:
-        """An eager forward reached ``cache``: never wait -- drop it (a planned
-        layer gives its reserved rows back; one in flight stays reserved until
-        its event completes)."""
+        """An eager forward reached ``cache``: a planned layer gives its
+        reserved rows back (no copy was issued for it). A layer IN FLIGHT on
+        the side stream is landed here, in issue order up to it: the forward
+        stream waits on the DEVICE for that copy's event (no host wait) and
+        the rows are committed before the eager pass plans and writes rows.
+
+        y4u f50f51020f D TP1 15:18:30Z: the in-flight layer stayed reserved
+        (row_key = SEAT_OFF_KEY), the eager pass wrote into the LRU rows
+        behind it, its sync read the OFF key as an expert id -> IndexError
+        hot[0x7FFFFFFF], scheduler_exception, group D dead; and the warm copy
+        still landing on the side stream could overwrite what the eager pass
+        fetched into the same row."""
+        idx = next((i for i, (c, _ev) in enumerate(self._inflight) if c is cache), None)
+        if idx is not None:
+            ops = self._ops
+            for c, ev in self._inflight[: idx + 1]:
+                if ev is not None and ops is not None:
+                    ops.current_waits(ev)  # device-side order, the eager pass is behind it
+                plan = getattr(c, "_rw_plan", None)
+                c._rw_plan = None
+                if plan is not None:
+                    c.warm_commit(plan)
+                    self._count(c, plan.rows)
+                self.finish_landed += 1
+                self.eager_landed += 1
+            del self._inflight[: idx + 1]
+            if not self._inflight:
+                logger.info("RW FINISH-LANDED layers=%d rows=%d reason=%s eager_landed=%d "
+                            "(RW-FINISH: the eager pass landed the layers it reached in flight, "
+                            "device-side wait on their copy, before it planned)",
+                            self.finish_landed, self.finish_rows, self.finish_reason or "-",
+                            self.eager_landed)
+            return
         if cache in self._queue:
             self._queue.remove(cache)
             plan = getattr(cache, "_rw_plan", None)

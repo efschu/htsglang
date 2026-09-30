@@ -253,6 +253,42 @@ class Finish(_Base):
         self.assertEqual(int(caches[2]._pool_tables.row_key[4]), -1)   # released
         self.assertEqual(rw.skipped_eager, 1)
 
+    def test_eager_lands_the_layers_it_reaches_in_flight(self):
+        """y4u f50f51020f D TP1 15:18:30Z: finish_landed=0 on TP1, an eager
+        extend synced a layer whose warm rows were still reserved ->
+        IndexError hot[0x7FFFFFFF]. The eager pass now lands that layer (and
+        the ones before it, one stream) with a DEVICE-side wait, then plans."""
+        os.environ[FINISH_ENV] = "1"
+        os.environ[eo.RESUME_WARM_LAYERS_ENV] = "1"
+        rw, caches = self._armed(4)
+
+        class _WaitOps(_Ops):
+            def current_waits(self, ev):  # the eager path may wait on the device
+                self.log.append(("current_waits",))
+
+        ops = rw._ops = _WaitOps()
+        rw.tick()
+        rw.cancel("first_decode")                          # layers 1..3 in flight, none done
+        self.assertEqual(int(caches[2]._pool_tables.row_key[4]), epd.SEAT_OFF_KEY)
+        with self.assertLogs(eo.logger, level=logging.INFO) as cm:
+            rw.eager_reached(caches[1])                    # lands layer 1 only
+            self.assertEqual(rw.eager_landed, 1)
+            self.assertEqual([c for c, _e in rw._inflight], caches[2:])
+            self.assertEqual(int(caches[1]._pool_tables.hot_phys[12]), 4)
+            rw.eager_reached(caches[3])                    # lands 2 and 3 in issue order
+        self.assertEqual(rw.eager_landed, 3)
+        self.assertEqual(rw._inflight, [])
+        self.assertEqual([x for x in ops.log if x == ("current_waits",)], [("current_waits",)] * 3)
+        self.assertTrue(any("RW FINISH-LANDED" in m and "eager_landed=3" in m for m in cm.output))
+        for c in caches[1:]:
+            t = c._pool_tables
+            self.assertNotIn(epd.SEAT_OFF_KEY, [int(k) for k in t.row_key[t.lru_start:t.pool_rows]])
+            # the eager pass writes row 4 now: the sync takes it, no OFF key left to trip on
+            epd.sync_tables(t, {4: 13}, keep_unwritten=True)
+            self.assertEqual((int(t.hot_phys[13]), int(t.hot_phys[12])), (4, -1))
+            self.assertEqual(epd.bijection_breaks(t), 0)
+        self.assertEqual(rw.skipped_eager, 0)
+
     def test_sleep_waits_for_copies_in_flight(self):
         os.environ[FINISH_ENV] = "1"
         rw, caches = self._armed(3)
@@ -286,7 +322,8 @@ class NoWaitInTheDecodePath(unittest.TestCase):
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
 
     def test_no_host_read_and_no_synchronize(self):
-        for fn in (eo.ResumeWarm.promote_ready, eo.ResumeWarm._finish, eo.deferred_rows_tick,
+        for fn in (eo.ResumeWarm.promote_ready, eo.ResumeWarm._finish, eo.ResumeWarm.eager_reached,
+                   eo.deferred_rows_tick,
                    eo.MoEExpertOffloadCache.warm_copy, eo.MoEExpertOffloadCache.warm_commit,
                    eo.MoEExpertOffloadCache.warm_release, epd.commit_warm_rows,
                    epd.reserve_warm_rows, epd.release_warm_rows):
