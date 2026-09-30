@@ -49,9 +49,11 @@ FLIP_TAIL_MAX_S = 60.0        # a 'first decode' later than this after FLIP done
 # after the begin always opens a run.
 FLIP_MARK_GAP_S = 0.5
 FLIP_MARKS_MAX = 100000
-# TODO(IPC, 27B-Review 29.09.): the Flipzeit is read from log lines (display for
-# humans only, no control). Switch to the front's events.jsonl as soon as the front
-# writes its flip events there (begin/done/first token) -- then drop the log scan.
+# IPC (30.09.): where the boot's events.jsonl carries ``flip_first_work`` (the front's
+# own clock, ms), apply_ipc_first_work replaces both directions with it.  The D->P
+# log mark was the wrong event: PP0 writes 'Prefill batch' only after the first chunk
+# has run through all PP stages, so it carried 5-8 s of prefill compute (y4i: 9.6 s
+# median vs 2.0 s to the first P leg).  The log scan stays for boots without IPC.
 #
 # Instrument per value (27B-Review 29.09.): 'first_token' = P-Ende -> erstes Token,
 # 'flip_total' = flip_total (reconciled) of WEG2-FLIP done.  The 27B history was
@@ -60,6 +62,50 @@ FLIP_MARKS_MAX = 100000
 # 27B regression.  Flip this when that boot exists.
 FIRST_TOKEN_HEADLINE_FOR_27B = False
 INSTRUMENTS = {"first_token": "P-Ende→erstes Token", "flip_total": "flip_total (reconciled)"}
+
+
+IPC_FIRST_WORK_MATCH_S = 0.05   # a log row and an IPC event share the front's flip_begin stamp
+
+
+def apply_ipc_first_work(ft: dict, first_work: List[dict]) -> dict:
+    """Flipzeit per direction from the front's ``flip_first_work`` events (IPC, ms).
+
+    D>P ends at the dispatch of the first P leg (``what=p_leg1_dispatch``), P>D at the
+    first decode token (``what=decode_token``); both are flip_begin -> that moment on
+    the front's one clock.  A direction without IPC events keeps its log figures; the
+    layer-swap figures (flip_total) stay from the log.  ``recent`` rows take the IPC
+    value when an event carries the row's begin stamp.
+    """
+    out = dict(ft)
+    by_dir: Dict[str, List[dict]] = {}
+    for x in first_work:
+        if x.get("dir") in ("P>D", "D>P") and x.get("flip_time_ms") is not None:
+            by_dir.setdefault(x["dir"], []).append(x)
+
+    def q(xs, p):
+        return xs[max(0, math.ceil(p * len(xs)) - 1)] if xs else None
+
+    for d, evs in by_dir.items():
+        evs = sorted(evs, key=lambda x: x.get("flip_begin_ts") or 0)
+        vals = sorted(int(x["flip_time_ms"]) for x in evs)
+        s = dict(out.get(d) or {})
+        s.update({"n": len(vals), "last": int(evs[-1]["flip_time_ms"]), "last_t": evs[-1].get("flip_begin_ts"),
+                  "median": q(vals, 0.5), "p90": q(vals, 0.9), "resolution_s": 0.001, "open": False,
+                  "src": "IPC flip_first_work (%s)" % (evs[-1].get("what") or "?")})
+        out[d] = s
+    begins = sorted((x.get("flip_begin_ts") or 0, x) for evs in by_dir.values() for x in evs)
+    keys = [b for b, _ in begins]
+    recent = []
+    for r in out.get("recent") or []:
+        r = dict(r)
+        i = bisect.bisect_left(keys, r["t"] - IPC_FIRST_WORK_MATCH_S)
+        hit = next((x for b, x in begins[i:i + 3] if abs(b - r["t"]) <= IPC_FIRST_WORK_MATCH_S
+                    and x.get("dir") == r.get("dir")), None)
+        if hit is not None:
+            r.update(ms=int(hit["flip_time_ms"]), state="ok", src="ipc")
+        recent.append(r)
+    out["recent"] = recent
+    return out
 
 
 def is_27b_boot(meta: dict, stem: str) -> bool:
@@ -1406,6 +1452,9 @@ class LiveLogs:
             last_line = max([t for t in b._last_t.values() if t] or [0]) or None
             v["ipc"] = self.ipc.for_tag((b.meta or {}).get("tag"), now)
             if v["ipc"]:
+                fw = v["ipc"].pop("flip_first_work", None)
+                if fw:
+                    v["flip_times"] = apply_ipc_first_work(v["flip_times"], fw)
                 v["end"] = stops.classify_ipc(v["ipc"])
             else:
                 v["end"] = stops.classify(b.stem, b.first_t, last_line or b.newest_mtime or None,
