@@ -112,6 +112,10 @@ class InsertResult:
     last_device_node: Any = None
     mamba_exist: bool = False
     inserted_host_node: Any = None
+    #: PREFETCH ANCHOR ATTACH: the existing node the host insert's key ended
+    #: at (the fetched span was already in the tree) -- set whether or not it
+    #: carries a host KV copy; ``inserted_host_node`` keeps its meaning.
+    matched_end_node: Any = None
 
     #: #841: the host-only insert declined to adopt the fetched tail because
     #: attaching it would have broken the contiguous-backup law (see

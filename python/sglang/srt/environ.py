@@ -1921,6 +1921,12 @@ class Envs:
     # the tree tombstones first under pool pressure, so it stays off until an
     # A/B boot has priced it against the fork's anchor/retention policy.
     SGLANG_MAMBA_LRU_REFRESH_USED_ONLY = EnvBool(False)
+    # PREFETCH ANCHOR ATTACH (NF y5a 30.09., weg2-19-28): a store read whose
+    # span is already in the tree (a sibling's load put the KV on the device
+    # first) keeps the Mamba anchor it read -- attached to the existing node at
+    # the read's end when that node carries no state -- instead of releasing it
+    # (the node then matched KV to 43200 with no state: "#928 REFUSING").
+    SGLANG_WEG2_PREFETCH_ANCHOR_ATTACH = EnvBool(True)
     # Per-request mamba checkpoint diagnostics: log match length, resume
     # length, checkpoint node/slot and cache-insert positions so a
     # nondeterministic resume (or a checkpoint at a wrong position) can be
