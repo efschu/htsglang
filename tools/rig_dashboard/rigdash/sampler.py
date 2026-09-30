@@ -44,6 +44,8 @@ class RingStore:
         self.db.execute("CREATE TABLE IF NOT EXISTS ring(key TEXT, t REAL, j TEXT, PRIMARY KEY(key, t)) WITHOUT ROWID")
         self.db.execute("CREATE INDEX IF NOT EXISTS ring_t ON ring(t)")
         self.db.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+        # the newest rank files of each boot (the fields' source): read by the sampler, never by the web server
+        self.db.execute("CREATE TABLE IF NOT EXISTS rank(key TEXT PRIMARY KEY, j TEXT)")
 
     def append(self, rows: List[tuple], keep: Dict[str, float]) -> None:
         """rows = (key, t, sample); keep = {key: oldest t still in the writer's ring} -- everything older,
@@ -73,6 +75,34 @@ class RingStore:
     def extent(self) -> Dict[str, float]:
         with self.lock:
             return dict(self.db.execute("SELECT key, MIN(t) FROM ring GROUP BY key").fetchall())
+
+    def set_raw(self, k: str, text: str) -> None:
+        with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)", (k, text))
+
+    def get_raw(self, k: str) -> Optional[str]:
+        with self.lock:
+            r = self.db.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+        return r[0] if r else None
+
+    def set_ranks(self, ranks: Dict[str, dict]) -> None:
+        with self.lock:
+            self.db.execute("BEGIN")
+            try:
+                self.db.executemany("INSERT OR REPLACE INTO rank(key, j) VALUES (?, ?)",
+                                    [(k, json.dumps(v, separators=(",", ":"))) for k, v in ranks.items()])
+                if ranks:
+                    self.db.execute("DELETE FROM rank WHERE key NOT IN (%s)" % ",".join("?" * len(ranks)), tuple(ranks))
+                else:
+                    self.db.execute("DELETE FROM rank")
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+
+    def ranks(self) -> Dict[str, dict]:
+        with self.lock:
+            return {k: json.loads(j) for k, j in self.db.execute("SELECT key, j FROM rank")}
 
     def set(self, k: str, v) -> None:
         with self.lock:
@@ -142,7 +172,11 @@ def main(argv=None) -> int:
     ap.add_argument("--state-dir", required=True)
     ap.add_argument("--docker-ssh", default="")
     ap.add_argument("--parent-pid", type=int, default=0)
+    ap.add_argument("--docker-host-prefix", default="")
+    ap.add_argument("--front", action="append", default=[])
+    ap.add_argument("--gpuq", default="http://127.0.0.1:8770")
     args = ap.parse_args(argv)
+    from . import energy, live, sources
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
     signal.signal(signal.SIGINT, lambda *a: stop.set())
@@ -152,13 +186,52 @@ def main(argv=None) -> int:
     rec = history.Recorder(db, boots, shlex.split(args.docker_ssh) if args.docker_ssh else [])
     threading.Thread(target=boots.run_forever, args=(stop,), name="sampler-ipc", daemon=True).start()
     threading.Thread(target=rec.run_forever, args=(stop,), name="sampler-hist", daemon=True).start()
+    # the page's other readings (30.09. ~22Z): cards/PCIe via NVML, docker, gpuq, fronts, and the energy book
+    ssh = shlex.split(args.docker_ssh) if args.docker_ssh else []
+    src = sources.Sources({"gpu_period": 1.0, "docker_ssh": ssh, "docker_host_prefix": args.docker_host_prefix,
+                           "weg2_fronts": args.front, "gpuq": args.gpuq, "state_dir": args.state_dir})
+    threading.Thread(target=src.run_forever, args=(stop,), name="sampler-sources", daemon=True).start()
+    book = energy.EnergyBook(args.state_dir, live.BUCKET_S)
+    errs: Dict[str, str] = {}
+
+    def publish_sources():
+        while not stop.is_set():
+            try:
+                store.set_raw("sources", json.dumps({"view": src.view(), "gpu_series": src.gpu_series(), "t": time.time()},
+                                                    separators=(",", ":")))
+                errs.pop("sources", None)
+            except Exception as e:  # noqa: BLE001
+                errs["sources"] = "%s: %s" % (type(e).__name__, e)
+            stop.wait(0.5)
+
+    def energy_loop():
+        """Every 5 s the closed 5-s intervals of every live boot (energy.py), as the web server did before."""
+        while not stop.is_set():
+            try:
+                now = time.time()
+                gs = src.gpu_series()
+                for b in boots.snapshot(now):
+                    if not b.get("live") or b.get("first_t") is None:
+                        continue
+                    book.update(b["stem"], b["first_t"],
+                                lambda start, n, bs, k=b["stem"]: boots.activity(k, start, n, bs),
+                                lambda start, n, bs: energy.power_buckets(gs, start, n, bs), now)
+                book.save(now)
+                with book.lock:
+                    store.set_raw("energy.books", json.dumps(book.books, separators=(",", ":")))
+                errs.pop("energy", None)
+            except Exception as e:  # noqa: BLE001
+                errs["energy"] = "%s: %s" % (type(e).__name__, e)
+            stop.wait(5.0)
+    threading.Thread(target=publish_sources, name="sampler-publish", daemon=True).start()
+    threading.Thread(target=energy_loop, name="sampler-energy", daemon=True).start()
     print("rigdash sampler pid %d, state %s" % (os.getpid(), args.state_dir), flush=True)
     while not stop.is_set():
         if args.parent_pid and os.getppid() != args.parent_pid:
             break                                   # the web server is gone: never a second writer
         try:
             store.set("beat", {"t": time.time(), "pid": os.getpid(), "held": rec.held_view(),
-                               "errors": dict(rec.errors, **({"ipc": boots.last_error} if boots.last_error else {}))})
+                               "errors": dict(rec.errors, **errs, **({"ipc": boots.last_error} if boots.last_error else {}))})
         except Exception as e:  # noqa: BLE001 -- the beat must not kill the sampler
             print("beat: %s" % e, file=sys.stderr, flush=True)
         stop.wait(1.0)

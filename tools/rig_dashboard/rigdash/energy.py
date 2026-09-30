@@ -117,3 +117,21 @@ def power_buckets(gpu_series: dict, start: float, n: int, bucket_s: float) -> Li
             acc[i][0] += sum(row)
             acc[i][1] += 1
     return [(a / k) if k else None for a, k in acc]
+
+
+class EnergyReader(EnergyBook):
+    """The web server's side: the books the sampler process keeps (sampler.RingStore meta
+    "energy.books"), read on demand; this process accounts nothing."""
+
+    def __init__(self, store, bucket_s: float = 5.0):
+        super().__init__(None, bucket_s)
+        self.store = store
+        self._raw = None
+
+    def view(self, stem: str, boot_wall_s: Optional[float]) -> Optional[dict]:
+        raw = self.store.get_raw("energy.books")
+        if raw is not None and raw != self._raw:
+            with self.lock:
+                self._raw = raw
+                self.books = json.loads(raw)
+        return super().view(stem, boot_wall_s)

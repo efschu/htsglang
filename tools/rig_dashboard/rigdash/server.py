@@ -199,9 +199,12 @@ class App:
             env = dict(os.environ)
             pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             env["PYTHONPATH"] = pkg_parent + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-            self.sup = sampler.Supervisor([sys.executable, "-m", "rigdash.sampler", "--state-dir", args.state_dir,
-                                           "--docker-ssh", args.docker_ssh or "", "--parent-pid", str(os.getpid())],
-                                          env=env, store=self.ring_store)
+            cmd = [sys.executable, "-m", "rigdash.sampler", "--state-dir", args.state_dir,
+                   "--docker-ssh", args.docker_ssh or "", "--parent-pid", str(os.getpid()),
+                   "--docker-host-prefix", args.docker_host_prefix or "", "--gpuq", args.gpuq]
+            for ep in args.front or []:
+                cmd += ["--front", ep]
+            self.sup = sampler.Supervisor(cmd, env=env, store=self.ring_store)
         else:
             self.boots = ipcboot.IpcBoots()
         cfg = {
@@ -212,9 +215,12 @@ class App:
             "gpuq": args.gpuq,
             "state_dir": args.state_dir or None,
         }
-        self.src = sources.Sources(cfg)
+        # the cards (NVML), docker, gpuq, fronts and the energy book are the sampler's too (30.09. ~22Z):
+        # this process reads what it published and measures nothing
+        self.src = sources.SourcesReader(self.ring_store) if self.sup is not None else sources.Sources(cfg)
         self.weg2 = weg2line.Weg2Lines(cfg["docker_ssh"], args.release_profile or [])
-        self.energy = energy.EnergyBook(args.state_dir or None, live.BUCKET_S)
+        self.energy = (energy.EnergyReader(self.ring_store, live.BUCKET_S) if self.sup is not None
+                       else energy.EnergyBook(args.state_dir or None, live.BUCKET_S))
         self.imgchg = imagechanges.ImageChanges(args.image_changes)
         self.imgchg_lock = threading.Lock()
         self.features = features.Features(args.features, args.features_repo)
@@ -246,8 +252,9 @@ class App:
             stop.wait(5.0)
 
     def start(self):
-        loops = [(self.boots.run_forever, "rigdash-ipcboots"), (self.src.run_forever, "rigdash-sources"),
-                 (self.energy_loop, "rigdash-energy")]
+        loops = [(self.boots.run_forever, "rigdash-ipcboots")]
+        if self.sup is None:
+            loops += [(self.src.run_forever, "rigdash-sources"), (self.energy_loop, "rigdash-energy")]
         loops.append((self.sup.run_forever, "rigdash-sampler-supervisor") if self.sup is not None
                      else (self.hist_rec.run_forever, "rigdash-history"))
         for target, name in loops:

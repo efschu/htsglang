@@ -1,4 +1,7 @@
-"""Non-log sources: nvidia-smi, the Docker host, the weg2 front, gpuq.
+"""Non-log sources: NVML (the cards; nvidia-smi until 30.09.), the Docker host, the weg2 front, gpuq.
+
+Since 30.09. ~22Z they run in the sampler process (sampler.py); the web server reads what they
+published through ``SourcesReader`` and measures nothing itself.
 
 Every source is a small sampler with its own period and its own last error,
 so one dead source (ssh to the host down, the front not listening) shows as
@@ -195,6 +198,7 @@ class Sources:
         # ~10 s of PCIe samples at the 0.25-s period (the mean uses the last 2 s)
         self.pcie_hist = collections.deque(maxlen=int(10.0 / cfg.get("pcie_period", 0.25)))
         self._nvml_ready = False
+        self._e_prev: Dict[int, tuple] = {}
         self.lock = threading.Lock()
         self.state_dir = cfg.get("state_dir")
         self._last_save = 0.0
@@ -238,15 +242,59 @@ class Sources:
 
     # --- samplers ------------------------------------------------------
     def sample_gpus(self):
-        out = run(["nvidia-smi", "--query-gpu=" + ",".join(NVSMI_FIELDS),
-                   "--format=csv,noheader,nounits"], 8.0)
-        cards = parse_nvsmi_csv(out)
+        """The card tiles and the power under tok/s/W from NVML in this process (30.09. ~22Z: no
+        nvidia-smi fork every 2 s).  power.draw = the energy counter's Δ over the interval since the
+        previous reading (nvmlDeviceGetTotalEnergyConsumption), the mean watts of that interval, so a
+        late reading loses no energy; the first reading and a card without the counter give the
+        momentary value (nvmlDeviceGetPowerUsage).  Same keys as the nvidia-smi CSV had."""
+        cards = self._nvml_cards()
         now = time.time()
         with self.lock:
             self.gpu_hist.append((now, [(c.get("power.draw"), c.get("memory.used"),
                                           c.get("utilization.gpu")) for c in cards]))
         self.save_history(now)
         return cards
+
+    def _nvml_cards(self) -> List[dict]:
+        import pynvml as n
+        if not self._nvml_ready:
+            n.nvmlInit()
+            self._nvml_ready = True
+
+        def rd(fn, *a):
+            try:
+                return fn(*a)
+            except Exception:
+                return None
+        out = []
+        for i in range(n.nvmlDeviceGetCount()):
+            h = n.nvmlDeviceGetHandleByIndex(i)
+            name, uuid = rd(n.nvmlDeviceGetName, h), rd(n.nvmlDeviceGetUUID, h)
+            t = time.time()
+            e = rd(n.nvmlDeviceGetTotalEnergyConsumption, h)
+            pw = None
+            prev = self._e_prev.get(i)
+            if e is not None:
+                self._e_prev[i] = (t, e)
+                if prev is not None and e >= prev[1] and t - prev[0] > 0.05:
+                    pw = (e - prev[1]) / 1000.0 / (t - prev[0])
+            if pw is None:
+                mw = rd(n.nvmlDeviceGetPowerUsage, h)
+                pw = mw / 1000.0 if mw is not None else None
+            lim = rd(n.nvmlDeviceGetEnforcedPowerLimit, h)
+            mem = rd(n.nvmlDeviceGetMemoryInfo, h)
+            u = rd(n.nvmlDeviceGetUtilizationRates, h)
+            out.append({"index": i, "name": name.decode() if isinstance(name, bytes) else name,
+                        "uuid": uuid.decode() if isinstance(uuid, bytes) else uuid,
+                        "power.draw": round(pw, 2) if pw is not None else None,
+                        "power.limit": lim / 1000.0 if lim is not None else None,
+                        "memory.used": mem.used / 1048576.0 if mem is not None else None,
+                        "memory.total": mem.total / 1048576.0 if mem is not None else None,
+                        "utilization.gpu": u.gpu if u is not None else None,
+                        "temperature.gpu": rd(n.nvmlDeviceGetTemperature, h, n.NVML_TEMPERATURE_GPU),
+                        "clocks.sm": rd(n.nvmlDeviceGetClockInfo, h, n.NVML_CLOCK_SM),
+                        "power_src": "nvml-energie" if prev is not None and e is not None else "nvml-moment"})
+        return out
 
     def sample_pcie(self):
         # pynvml is imported only here: a host without it must not break the
@@ -339,3 +387,39 @@ def front_for_boot(fronts: Dict[str, dict], tag: Optional[str]) -> Optional[dict
         if isinstance(val, dict) and val.get("tag") == tag:
             return dict(val, endpoint=ep.split(":", 1)[1], age_s=v.get("age_s"))
     return None
+
+
+class SourcesReader:
+    """The web server's side: the same ``view()`` / ``gpu_series()`` as ``Sources``, read from what the
+    sampler process published (sampler.RingStore meta "sources"), parsed once per new version."""
+
+    def __init__(self, store):
+        self.store = store
+        self._raw = None
+        self._val = {"view": {}, "gpu_series": {"t": [], "power": [], "mem": [], "util": []}, "t": None}
+        self.lock = threading.Lock()
+
+    def _get(self) -> dict:
+        raw = self.store.get_raw("sources")
+        with self.lock:
+            if raw is not None and raw != self._raw:
+                self._raw = raw
+                self._val = json.loads(raw)
+            return self._val
+
+    def view(self) -> dict:
+        v = self._get()
+        now = time.time()
+        out = {}
+        for k, x in (v.get("view") or {}).items():
+            x = dict(x)
+            if v.get("t") and x.get("age_s") is not None:
+                x["age_s"] = round(x["age_s"] + (now - v["t"]), 1)      # aged by the time since publishing
+            out[k] = x
+        return out
+
+    def gpu_series(self) -> dict:
+        return self._get().get("gpu_series") or {"t": [], "power": [], "mem": [], "util": []}
+
+    def run_forever(self, stop: threading.Event):
+        stop.wait()

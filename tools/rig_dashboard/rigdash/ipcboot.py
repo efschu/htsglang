@@ -745,6 +745,8 @@ class IpcBoots:
             seen.add(key)
             if key in self.final:
                 continue
+            if self.role == "reader":
+                continue                   # the rank files are the sampler's (store.ranks() in sync)
             rank = ipcfields.read_rank_files(ipcfields.state_rankstate_dirs(v))
             samp = {"t": now, "r": {k: compact(r) for k, r in rank["rankstats"].items()},
                     "front": _front_small(v.get("front") or {})}
@@ -767,6 +769,9 @@ class IpcBoots:
             keep = {k: r[0]["t"] for k, r in self.rings.items() if r}
         if self.role == "sampler" and self.store is not None:
             self.store.append(new, keep)
+            with self.lock:
+                ranks = dict(self.rank)
+            self.store.set_ranks({k: r for k, r in ranks.items() if k not in self.final or k in keep})
         if self.role == "reader" and self.store is not None:
             self.sync(now)
 
@@ -774,7 +779,9 @@ class IpcBoots:
         """Reader: the samples the sampler process wrote since the last sync, into the in-memory ring;
         every 10 s the ring is trimmed to what the store still holds."""
         rows = self.store.since(self._synced_t)
+        ranks = self.store.ranks()
         with self.lock:
+            self.rank = ranks
             for k, t, samp in rows:
                 self.rings.setdefault(k, deque()).append(samp)
                 self._synced_t = max(self._synced_t, t)

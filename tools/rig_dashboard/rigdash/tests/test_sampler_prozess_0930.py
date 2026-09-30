@@ -98,5 +98,105 @@ class TestSupervisor(unittest.TestCase):
             self.assertIn("rigdash.sampler", " ".join(app.sup.cmd))
 
 
+class TestWebServerMeasuresNothing(unittest.TestCase):
+    """Folgeauftrag 30.09. ~22Z: sources (cards, docker, gpuq, fronts), the energy book and the rank files
+    are the sampler's; the web server reads only what it published."""
+
+    def test_reader_never_opens_a_rank_file(self):
+        import builtins
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "nf", "state")
+            store = sampler.RingStore(os.path.join(tmp, "ring.sqlite"))
+            w = ipcboot.IpcBoots(roots=(root,), store=store, role="sampler")
+            r = ipcboot.IpcBoots(roots=(root,), store=sampler.RingStore(os.path.join(tmp, "ring.sqlite")), role="reader")
+            now = time.time()
+            key = _boot(root, now)
+            w.poll(now + 0.3)
+            opened, real = [], builtins.open
+
+            def spy(path, *a, **k):
+                opened.append(str(path))
+                return real(path, *a, **k)
+            builtins.open = spy
+            try:
+                r.poll(now + 1.0)
+            finally:
+                builtins.open = real
+            self.assertFalse([p for p in opened if p.endswith((".rankstats", ".json")) and "rankstate" in p])
+            self.assertIn(key, r.rank)                               # the fields' rank dict came from the store
+            self.assertEqual(r.rank[key]["rankstats"].keys(), w.rank[key]["rankstats"].keys())
+
+    def test_sources_and_energy_readers(self):
+        from rigdash import energy, sources
+        with tempfile.TemporaryDirectory() as tmp:
+            st = sampler.RingStore(os.path.join(tmp, "ring.sqlite"))
+            rd = sources.SourcesReader(st)
+            self.assertEqual(rd.view(), {})
+            st.set_raw("sources", json.dumps({"t": time.time() - 2, "view": {"gpus": {"value": [{"index": 0}], "age_s": 0.5}},
+                                              "gpu_series": {"t": [1.0], "power": [[100.0]], "mem": [[1.0]], "util": [[5]]}}))
+            v = rd.view()
+            self.assertEqual(v["gpus"]["value"], [{"index": 0}])
+            self.assertGreaterEqual(v["gpus"]["age_s"], 2.4)       # aged by the time since publishing
+            self.assertEqual(rd.gpu_series()["power"], [[100.0]])
+            er = energy.EnergyReader(st)
+            self.assertIsNone(er.view("x", 10.0))
+            book = energy.EnergyBook(None)
+            book.books["x"] = energy._blank()
+            book.books["x"]["covered_s"] = 5.0
+            st.set_raw("energy.books", json.dumps(book.books))
+            self.assertEqual(er.view("x", 10.0)["covered_s"], 5.0)
+
+    def test_server_wires_readers(self):
+        from rigdash import energy, sources
+        with tempfile.TemporaryDirectory() as tmp:
+            args = server.main.__globals__["argparse"].Namespace(
+                docker_ssh="", docker_host_prefix="/x", front=["http://127.0.0.1:30030"], gpuq="http://127.0.0.1:9",
+                state_dir=tmp, image_changes=os.path.join(tmp, "ic.json"), features=os.path.join(tmp, "f.json"),
+                features_repo=tmp, release_profile=[], edition="rig", sampler=None)
+            app = server.App(args)
+            self.assertIsInstance(app.src, sources.SourcesReader)
+            self.assertIsInstance(app.energy, energy.EnergyReader)
+            cmd = " ".join(app.sup.cmd)
+            for w in ("--front http://127.0.0.1:30030", "--gpuq http://127.0.0.1:9", "--docker-host-prefix /x"):
+                self.assertIn(w, cmd)
+
+    def test_nvml_cards_power_from_energy(self):
+        import types
+        from rigdash import sources
+        clock = {"e": 0.0}
+
+        class U:
+            gpu = 40
+
+        class M:
+            used, total = 1048576.0 * 1000, 1048576.0 * 20000
+        fake = types.SimpleNamespace(
+            nvmlInit=lambda: None, nvmlDeviceGetCount=lambda: 1, nvmlDeviceGetHandleByIndex=lambda i: i,
+            nvmlDeviceGetName=lambda h: b"NVIDIA GeForce RTX 5090", nvmlDeviceGetUUID=lambda h: "GPU-x",
+            nvmlDeviceGetTotalEnergyConsumption=lambda h: clock["e"], nvmlDeviceGetPowerUsage=lambda h: 123000,
+            nvmlDeviceGetEnforcedPowerLimit=lambda h: 575000, nvmlDeviceGetMemoryInfo=lambda h: M,
+            nvmlDeviceGetUtilizationRates=lambda h: U, nvmlDeviceGetTemperature=lambda h, k: 55,
+            nvmlDeviceGetClockInfo=lambda h, k: 2400, NVML_TEMPERATURE_GPU=0, NVML_CLOCK_SM=1)
+        old = sys.modules.get("pynvml")
+        sys.modules["pynvml"] = fake
+        try:
+            s = sources.Sources({"state_dir": None})
+            c0 = s._nvml_cards()[0]
+            self.assertEqual((c0["power.draw"], c0["power_src"]), (123.0, "nvml-moment"))   # first reading
+            t0 = s._e_prev[0][0]
+            time.sleep(0.2)
+            clock["e"] = 300.0 * 1000.0 * (time.time() - t0)                               # 300 W since then
+            c1 = s._nvml_cards()[0]
+            self.assertAlmostEqual(c1["power.draw"], 300.0, delta=15)
+            self.assertEqual(c1["power_src"], "nvml-energie")
+            self.assertEqual((c1["name"], c1["power.limit"], c1["memory.used"], c1["temperature.gpu"]),
+                             ("NVIDIA GeForce RTX 5090", 575.0, 1000.0, 55))
+        finally:
+            if old is not None:
+                sys.modules["pynvml"] = old
+            else:
+                sys.modules.pop("pynvml", None)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -88,6 +88,12 @@ der NVML-Thread 287 s lang keine Zeile (GIL).
   gezählt: `held` in `/api/health` (Ziel 0). Das `_hold` der Ansicht ist nur Notnagel und wird als `view_filled` gezählt.
 Tests: `tests/test_sampler_prozess_0930.py`, `tests/test_rates_glatt_0930.py::TestCounterBooking`.
 
+Folgeauftrag 30.09. ~22Z: Der Sampler liest auch `sources.py` (Karten, PCIe, docker, gpuq, Fronts) und die
+Rang-Dateien für die Felder, und er führt die Energie-Schleife. Die Karten kommen jetzt per NVML im selben Prozess
+statt per `nvidia-smi`-Fork, jede Sekunde. `power.draw` ist das Δ des Energie-Zählers über das Intervall.
+Der Webserver liest nur `ring.sqlite` (`SourcesReader`, `EnergyReader`, Rang-Tabelle) und `history.sqlite`;
+selbst misst er nichts mehr.
+
 ## Nur IPC, kein Boot-Log (Nutzer 29.09. über 27B; Rüge und Order 30.09.)
 
 „das dashboard soll auch aus der inter prozess kommunikation gespeist werden, nicht aus logs“ -- seit 30.09. ohne Ausnahme:
