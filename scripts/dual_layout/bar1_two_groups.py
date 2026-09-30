@@ -43,6 +43,36 @@ def _expected(n, world, rnd, dev):
     return sum((r + 1) * 1000.0 for r in range(world)) + world * (rnd * 7.0 + (i % 97))
 
 
+def _cold_triton_launch(dev, salt):
+    """Compile AND load a triton kernel nobody has seen (the constant is new, so
+    the cache misses): the host compiles, then the first launch runs
+    cuModuleLoadData -- exactly what D's 'triton cold module load' did on metal
+    (boot kw6pft 04:16:56, the load that never closed)."""
+    import importlib.util
+    import tempfile as _tf
+
+    src = (
+        "import triton, triton.language as tl\n"
+        "@triton.jit\n"
+        "def k(x_ptr, n, BLOCK: tl.constexpr):\n"
+        "    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n"
+        "    m = o < n\n"
+        f"    tl.store(x_ptr + o, tl.load(x_ptr + o, mask=m) * 1.0 + {float(salt)!r}, mask=m)\n"
+    )
+    d = _tf.mkdtemp(prefix="coldjit")
+    path = os.path.join(d, f"cold_{abs(hash(salt))}.py")
+    with open(path, "w") as f:
+        f.write(src)
+    spec = importlib.util.spec_from_file_location(f"cold_{abs(hash(salt))}", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    x = torch.zeros(1024, device=dev)
+    t0 = time.perf_counter()
+    mod.k[(4,)](x, 1024, BLOCK=256)
+    torch.cuda.synchronize(dev)
+    return (time.perf_counter() - t0) * 1e3
+
+
 def worker(rank, a, store):
     world = len(a.devs)
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(a.port), RANK=str(rank),
@@ -97,11 +127,20 @@ def worker(rank, a, store):
             time.sleep(a.start_at - now)
         dist.barrier()
         t_end = time.perf_counter() + a.dur
+        t_jit = (time.perf_counter() + a.jit_at) if a.jit_at > 0 else None
+        res["jit_ms"] = []
         rnd = 0
         while time.perf_counter() < t_end:
             rnd += 1
             if gemm is not None:
                 gemm()
+            if t_jit is not None and time.perf_counter() >= t_jit and (a.jit_ranks == "all" or str(rank) in a.jit_ranks.split(",")):
+                # the cold load lands while this group's previous collective and the
+                # OTHER group's kernels may still be resident (async launch)
+                inp_j = _pattern(n, rank, rnd, dev)
+                t.barlink_all_reduce(None, inp_j)  # left in flight, not synced
+                res["jit_ms"].append(round(_cold_triton_launch(dev, f"{a.name}{rank}{rnd}{time.time()}"), 1))
+                t_jit = (time.perf_counter() + a.jit_every) if a.jit_every > 0 else None
             if a.gemm_only:
                 torch.cuda.synchronize(dev)
             else:
@@ -156,6 +195,10 @@ def main():
     ap.add_argument("--verify-every", type=int, default=10)
     ap.add_argument("--gemm-only", action="store_true",
                     help="P's compute alone: the GEMM loop, no collectives (the transport is still built)")
+    ap.add_argument("--jit-at", type=float, default=0.0,
+                    help="seconds into the loop: this group loads a COLD triton module (0 = never)")
+    ap.add_argument("--jit-every", type=float, default=0.0, help="repeat the cold load every N s (0 = once)")
+    ap.add_argument("--jit-ranks", default="all", help="'all' or a comma list of ranks that do the cold load")
     ap.add_argument("--windows-mib", default="",
                     help="comma list: one BAR1 window per barlink group, e.g. D '16,32,40', P '16,64'")
     ap.add_argument("--bar1-snapshot", action="store_true", help="record nvidia-smi BAR1 usage once all windows exist")
