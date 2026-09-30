@@ -3599,6 +3599,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = InsertResult(prefix_len=matched_length, total_len=total_len)
         if len(key) == 0:
+            if node is not self.root_node:
+                result.matched_end_node = node
             if (
                 node is not self.root_node
                 and node.component_data[BASE_COMPONENT_TYPE].host_value is not None

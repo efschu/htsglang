@@ -1951,6 +1951,19 @@ class MambaComponent(TreeComponent):
             target_node = (
                 insert_result.inserted_host_node if insert_result is not None else None
             )
+            if target_node is None and loaded and host_indices is not None:
+                # PREFETCH ANCHOR ATTACH (NF y5a 30.09., weg2-19-28): the read
+                # claimed 665 pages with its anchor at page 664 (#1028B FETCH
+                # CAP anchors_in_range mamba (9, 664)), but the sibling's
+                # load had put that KV on the DEVICE first (#988 LOADBACK
+                # weg2-18-24 -> 43520, state only at 43520): the host insert
+                # found the whole span in the tree, inserted no host node, and
+                # the anchor was released here. The next match walked 43200
+                # KV tokens without one state ("#928 REFUSING ... NONE-ON-
+                # THIS-PATH") and 43396 tokens went back to P. The node the
+                # insert ENDED at is exactly the anchor's depth (the walk
+                # split it there); a node without any state takes the anchor.
+                target_node = self._prefetch_anchor_target(insert_result)
             if (
                 host_indices is None
                 or target_node is None
@@ -1971,6 +1984,31 @@ class MambaComponent(TreeComponent):
                     host_lru.insert_mru(target_node)
             if insert_result is not None:
                 insert_result.mamba_exist = False
+
+    def _prefetch_anchor_target(self, insert_result) -> Optional[UnifiedTreeNode]:
+        """PREFETCH ANCHOR ATTACH: the existing node at the read's end, when it
+        carries no Mamba state on device or host (a node WITH one keeps it;
+        the read's copy is then released as before). Switch
+        SGLANG_WEG2_PREFETCH_ANCHOR_ATTACH (default on)."""
+        if insert_result is None or not envs.SGLANG_WEG2_PREFETCH_ANCHOR_ATTACH.get():
+            return None
+        node = getattr(insert_result, "matched_end_node", None)
+        if node is None or node is self.cache.root_node:
+            return None
+        cd = node.component_data[self.component_type]
+        if cd.value is not None or cd.host_value is not None:
+            return None
+        cls = type(self)
+        cls._anchor_attach_n = getattr(cls, "_anchor_attach_n", 0) + 1
+        n = cls._anchor_attach_n
+        if n <= 16 or n % 256 == 0:
+            logger.info(
+                "WEG2 PREFETCH-ANCHOR-ATTACH n=%d node=%s depth=%s (the read's span was "
+                "already in the tree without a state; its anchor stays at the node, not released)",
+                n, getattr(node, "id", "?"),
+                getattr(self.cache, "weg2_node_depth", lambda _n: None)(node),
+            )
+        return node
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]
