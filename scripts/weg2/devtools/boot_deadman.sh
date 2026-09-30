@@ -20,6 +20,15 @@
 #      (2026-09-08) held state=flipping for 7 min with six live processes and
 #      HTTP 200 on all three ports, and neither tier fired, correctly. A
 #      LATCH, because the front emits the line once per stalled flip.
+#   4. PROGRESS-STALL (30.09., dual13 11:00-11:04Z): the front deadman only
+#      (WEG2_DEADMAN_GROUP=front, with the boot's state dir). outstanding > 0 while
+#      served and served_tokens do not move for PROGRESS_STALL_S (default 60 s) =
+#      HAENGT. NOT a verdict that ends this watcher: HAENGT is written as the STATE
+#      field `progress` (+ event) through weg2/state_file.py and as ONE line in the
+#      boot log; nothing is stopped, so scarcity probes keep running. LAEUFT WIEDER
+#      when progress resumes; a new boot_id resets. Tiers 1-3 were structurally
+#      blind to it: the log was not silent (P's WAIT lines), the heartbeats ran,
+#      /health 200, queue 0 with outstanding 3.
 # The verdict line names tier, timestamps, log-mtime age, and last log line.
 #
 # PASSIVE FIRST (#942 addendum, user 2026-08-30: "warum probt er periodisch?
@@ -1154,7 +1163,32 @@ BUSY_LIMIT="${BUSY_LIMIT:-3}"
 wedge=0
 WEDGE_LIMIT="${WEDGE_LIMIT:-3}"
 last_probe=0
+# Tier 4: PROGRESS-STALL. The step logic lives in weg2/state_file.py (progress-check:
+# pure step + field `progress` + event under the state lock); this only calls it and
+# copies its one line to stdout and the boot log. Off without the state dir, for any
+# deadman other than the front's, or with PROGRESS_STALL_S=0.
+PROGRESS_STALL_S="${PROGRESS_STALL_S:-60}"
+PROGRESS_MEMO="${PROGRESS_MEMO:-/tmp/deadman_progress_$$.json}"
+progress_on() {
+  [ "${WEG2_DEADMAN_GROUP:-}" = "front" ] && [ "$PROGRESS_STALL_S" != "0" ] \
+    && [ -n "${WEG2_STATE_DIR:-}" ] && [ -f "$WEG2_STATE_DIR/state.json" ] \
+    && [ -n "${WEG2_STATE_FILE_PY:-}" ] && [ -f "$WEG2_STATE_FILE_PY" ]
+}
+progress_check() {
+  local line
+  progress_on || return 0
+  line=$(WEG2_WRITER_PID=$$ "${WEG2_PY:-python3}" "$WEG2_STATE_FILE_PY" progress-check \
+         --dir "$WEG2_STATE_DIR" --memo "$PROGRESS_MEMO" --stall-s "$PROGRESS_STALL_S" 2>&1) || {
+    echo "DEADMAN[PROGRESS-STALL] $(date -Is) check failed (no verdict): $(printf '%s' "$line" | tail -1 | cut -c1-200)"
+    return 0; }
+  [ -n "$line" ] || return 0
+  echo "$line"
+  # ONE line into the boot log this deadman watches (O_APPEND, one write)
+  printf '%s\n' "$line" >> "$LOG" 2>/dev/null || true
+}
 while true; do
+  # Tier 4 first and every CHECK_S: it never ends this watcher (state + log line only).
+  progress_check
   # Tier 1: crash/exit — no serving process left (pattern excludes the router
   # by construction and this waiter itself via serving_alive).
   if ! serving_alive; then
