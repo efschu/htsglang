@@ -12377,10 +12377,12 @@ class Front:
 
 
 def start_host_census_sampler(record: str, key: str, store_dir: str,
-                              widths: List[int], period_s: float = 60.0):
+                              widths: List[int], period_s: float = 60.0, boot: str = ""):
     """29.09.: keep the host census record current (host_census.py). A daemon
     thread, off the watermark loop: a smaps walk over ~40 processes that map a
-    39 GiB store is not a 0.5 s-cadence read. One line per changed peak."""
+    39 GiB store is not a 0.5 s-cadence read. One line per changed peak.
+    30.09. CENSUS-FIXPUNKT: ``boot`` (the front's --tag) files every sample
+    under this boot too -- the per-boot history the ledger books from."""
     import threading
 
     from sglang.srt.weg2 import host_census as _hc
@@ -12391,7 +12393,7 @@ def start_host_census_sampler(record: str, key: str, store_dir: str,
             time.sleep(period_s)
             try:
                 c = _hc.sample_live(store_dir=store_dir, arena_booked_widths=widths)
-                ent = _hc.merge_into_record(record, key, c)
+                ent = _hc.merge_into_record(record, key, c, boot=boot)
                 logger.info("%s", _hc.census_line(key, _hc.ledger_terms(ent)))
             except Exception as exc:  # noqa: BLE001 -- an instrument never kills the front
                 if not warned:
@@ -12633,7 +12635,8 @@ def main():
     if args.host_census_record and args.host_census_key:
         start_host_census_sampler(
             args.host_census_record, args.host_census_key, args.host_census_store_dir,
-            [int(w) for w in args.host_census_arena_widths.split(",") if w.strip()])
+            [int(w) for w in args.host_census_arena_widths.split(",") if w.strip()],
+            boot=str(args.tag or ""))
     # #1275: say ONCE whether this boot has the live levers, and say it with the
     # PATH and a redaction -- never the key. The front log is world-readable and
     # is routinely pasted into records.
