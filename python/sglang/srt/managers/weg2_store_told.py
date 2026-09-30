@@ -130,6 +130,14 @@ def _with_fork(told, fork: int):
     return told
 
 
+def _dual_kv_wire(told, req):
+    """DUAL-TP3PP3 unified KV: PP0's group grant rides the told (followers map,
+    they never decide); absent = byte-identical."""
+    from sglang.srt.weg2.dual_p_kv_stage import with_dual_kv
+
+    return with_dual_kv(told, req)
+
+
 @dataclass
 class Weg2StoreAdmit:
     """#1416e: PP0's membership verdict for a PACED told -- PP0 admits the
@@ -285,11 +293,16 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
     held: Dict[str, Any] = scheduler._weg2_store_held
     rid = _rid(req)
     forget_rid_leftovers(scheduler.tree_cache, rid)
-    # DUAL-TP3PP3 unified KV (B): every P rank maps this prompt from the card pool
-    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
-
-    _dpk.on_intake(scheduler, req)
     if int(scheduler.ps.pp_rank) == 0:
+        # DUAL-TP3PP3 unified KV: PP0 takes the grant on ALL cards atomically
+        # before the store read registers; a short card holds the request
+        # (retried at the top of every PP0 pass, ``pp0_publish``).
+        from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+        if _dpk.pp0_grant(scheduler, req) == 0:
+            req._dual_kv_wait = True
+            held[rid] = req
+            return "declined:dual_kv_wait"
         if _twin.intake_defer(scheduler, req):
             # TW: a fork twin of a request in flight on P -- held WITHOUT a
             # store read until that sibling finished (pp0_publish releases).
@@ -797,6 +810,23 @@ def _parked(scheduler) -> set:
     return out
 
 
+def _dual_kv_retry(scheduler) -> None:
+    """DUAL-TP3PP3 unified KV: held requests whose group grant was short try
+    again; granted ones register their store read exactly as intake would."""
+    held: Dict[str, Any] = scheduler._weg2_store_held
+    waiting = [r for r in held.values() if getattr(r, "_dual_kv_wait", False)]
+    if not waiting:
+        return
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    for req in waiting:
+        if _dpk.pp0_grant(scheduler, req):
+            req._dual_kv_wait = False
+            scheduler._prefetch_kvcache(req)
+            if getattr(scheduler, "_weg2_told_paced_on", False):
+                _pace_intake_t(scheduler).setdefault(_rid(req), _clock())
+
+
 def pp0_publish(scheduler, recv_reqs: List) -> List:
     """Top of a PP0 pass, before the forward: turn terminated prefetches of
     held rids into ``Weg2StoreTold`` objects appended to the outgoing list.
@@ -806,6 +836,7 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     # also when nothing is held -- a twin arriving right after its sibling's
     # finish is held until that finish settled (the end anchor published).
     _twin.tick(scheduler)
+    _dual_kv_retry(scheduler)
     paced_on = bool(getattr(scheduler, "_weg2_told_paced_on", False))
     if paced_on:
         return _pp0_publish_paced(scheduler, recv_reqs)
@@ -832,6 +863,9 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
             held.pop(rid, None)
             _twin.take_pp0_twin(scheduler, rid)
             continue
+        if getattr(req, "_dual_kv_wait", False):
+            # DUAL unified KV: no group grant yet, no store read registered
+            continue
         if _twin.is_deferred(scheduler, rid):
             # TW: no store read registered yet -- nothing to publish.
             continue
@@ -845,9 +879,9 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
         _ple_admit_at_told(scheduler, req, told, absolute)
         told_map[rid] = told
         held.pop(rid, None)
-        out.append(_with_fork((Weg2StoreToldTwin if twin else Weg2StoreTold)(
+        out.append(_dual_kv_wire(_with_fork((Weg2StoreToldTwin if twin else Weg2StoreTold)(
             rid=rid, told=told, absolute=absolute, keys_digest=_pp0_keys_digest(req)),
-            _pp0_fork(scheduler, req, rid)))
+            _pp0_fork(scheduler, req, rid)), req))
         n = getattr(scheduler, "_weg2_store_told_published", 0) + 1
         scheduler._weg2_store_told_published = n
         if _log_due(n):
@@ -909,6 +943,10 @@ def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
             continue
         rid = str(item.rid)
         told = int(item.told)
+        # DUAL-TP3PP3 unified KV: adopt PP0's group grant (map only)
+        from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+        _dpk.on_told(scheduler, item)
         if getattr(item, "paced", False):
             # #1416e: read-ahead only. The read starts NOW, one pass behind
             # PP0's verdict; admission still skips until the Admit arrives.
@@ -1243,6 +1281,9 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             intake_t.pop(rid, None)
             _twin.take_pp0_twin(scheduler, rid)
             continue
+        if getattr(req, "_dual_kv_wait", False):
+            # DUAL unified KV: no group grant yet, no store read registered
+            continue
         if _twin.is_deferred(scheduler, rid):
             continue  # TW: no store read registered yet
         if getattr(req, "prefetch_deferred", None) is not None:
@@ -1260,7 +1301,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
         if told <= 0:
             # nothing to read on any rank: single-phase, as before
             told_map[rid] = told
-            out.append(_with_fork(_cls(rid=rid, told=told, **_extra), _fork))
+            out.append(_dual_kv_wire(_with_fork(_cls(rid=rid, told=told, **_extra), _fork), req))
             continue
         # #57: pace the READ, not the told -- the part below PP0's registered
         # head is on every rank already (rank-uniform: PP0 decides alone,
@@ -1279,7 +1320,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
                 )
         pacing[rid] = _Pace(req=req, told=told, published_at=now, published_pass=pass_n, window_s=window,
                             absolute=bool(absolute))
-        ahead = _with_fork(_cls(rid=rid, told=told, paced=True, **_extra), _fork)
+        ahead = _dual_kv_wire(_with_fork(_cls(rid=rid, told=told, paced=True, **_extra), _fork), req)
         if fb_on:
             # PF: ask the followers for their read state (wire marker, set
             # only here) and start the Frist.

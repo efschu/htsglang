@@ -186,20 +186,42 @@ class PKvStage:
             return False
         self._move(want)
         logger.info("%s GROW %d -> %d tokens (+%d B from the card pool)", MARK, self.mapped_tokens, want, need)
+        self._committed = int(getattr(self, "_committed", 0) or 0) + need
         self.mapped_tokens = want
         return True
+
+    def table(self) -> List[int]:
+        """Bytes this rank maps at every lattice level -- published so PP0 can
+        price the WHOLE group's grant (``stage_file``)."""
+        return [self.bytes_for(k) - self.bytes_for(0) for k in lattice(self.top, self.step)]
+
+    def map_granted(self, tokens: int) -> None:
+        """Adopt a grant PP0 already committed on this card's ledger for this
+        rank (the atomic group grant): map, no ledger request. The previous
+        commitment of this rank is dropped here -- a grant is always fresh."""
+        want = min(self.top, round_up(tokens, self.step))
+        # the commitments ACCUMULATE until the idle release: a previous
+        # request may still hold pages above ``want`` on this stage, so the
+        # ledger keeps covering the mapping (over-commit is the safe side of I1)
+        self._committed = int(getattr(self, "_committed", 0) or 0) + (self.bytes_for(want) - self.bytes_for(0))
+        if want > self.mapped_tokens:
+            self._move(want)
+            self.mapped_tokens = want
+        logger.info("%s MAPPED-BY-GRANT tokens=%d (PP0's atomic group grant) committed=%d B",
+                    MARK, want, self._committed)
 
     def release_all(self) -> int:
         """Unmap everything; the caller guarantees no request holds a page."""
         if self.mapped_tokens <= 0:
             return 0
-        n = self.bytes_for(self.mapped_tokens) - self.bytes_for(0)
+        n = int(getattr(self, "_committed", 0) or 0) or (self.bytes_for(self.mapped_tokens) - self.bytes_for(0))
         self._engage_cap(self.allocator, 0, self.page)
         self._sync()
         self._move(0)
         self.ledger.release(n)
         logger.info("%s RELEASE %d tokens -> 0 (-%d B back to the card pool)", MARK, self.mapped_tokens, n)
         self.mapped_tokens = 0
+        self._committed = 0
         return n
 
 
@@ -233,6 +255,7 @@ def attach(runner) -> Optional["PKvStage"]:
     ledger.contribute(boot_bytes, committed=0)
     actor._engage_cap(actor.allocator, 0, actor.page)
     setattr(runner, ACTOR_ATTR, actor)
+    publish_stage(actor, tag, int(getattr(runner, "pp_rank", 0) or 0))
     logger.info("%s JOIN card=%s boot_tokens=%d contributed=%d B top=%d tokens step=%d -- P keeps 0 "
                 "mapped; its KV is the card pool's", MARK, card[-12:], boot, boot_bytes, actor.top,
                 actor.step)
@@ -244,14 +267,103 @@ def _actor(sched) -> Optional["PKvStage"]:
     return getattr(runner, ACTOR_ATTR, None)
 
 
-def on_intake(sched, req) -> bool:
-    """Every P rank at a request's intake: map its prompt. False = the card
-    pool had no room (logged; the allocator cap holds admission back)."""
+#: the told's wire attribute: the token level PP0 granted on EVERY card
+WIRE_DUAL_KV = "dual_kv"
+
+
+def stage_file(tag: str, pp_rank: int, root: str = "/dev/shm") -> str:
+    import hashlib
+
+    return os.path.join(root, "wkvs-%s-pp%d.json" % (hashlib.sha1(str(tag).encode()).hexdigest()[:10],
+                                                      int(pp_rank)))
+
+
+def publish_stage(actor: "PKvStage", tag: str, pp_rank: int) -> str:
+    """This P rank's ledger and byte table, for PP0's group grant."""
+    import json
+
+    path = stage_file(tag, pp_rank)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump({"ledger": actor.ledger.path, "step": actor.step, "top": actor.top,
+                   "bytes": actor.table()}, f)
+    os.replace(tmp, path)
+    return path
+
+
+def group_grant(stages: Sequence[dict], tokens: int, open_ledger) -> int:
+    """ATOMIC over all P stages (operator order 30.09.: all or none, fixed card
+    order against deadlocks): commit each stage's bytes for ``tokens`` on its
+    card's ledger; if any card is short, return every grant already taken and
+    answer 0. Returns the granted token level."""
+    if not stages:
+        return 0
+    step = int(stages[0]["step"])
+    top = min(int(s["top"]) for s in stages)
+    want = min(top, round_up(tokens, step))
+    k = want // step
+    order = sorted(range(len(stages)), key=lambda i: str(stages[i]["ledger"]))
+    taken = []
+    for i in order:
+        need = int(stages[i]["bytes"][k])
+        led = open_ledger(stages[i]["ledger"])
+        got, _ = led.request(need)
+        taken.append((led, got))
+        if got < need:
+            for l2, g2 in taken:
+                if g2:
+                    l2.release(g2)
+            return 0
+    return want
+
+
+def pp0_grant(sched, req) -> Optional[int]:
+    """PP0 only: the atomic group grant for ``req``'s prompt. None = not armed
+    here (no actor / not PP0); 0 = a card is short (hold the request); else the
+    granted token level (PP0 maps its own now; the told carries it)."""
     actor = _actor(sched)
-    if actor is None:
-        return True
-    n = len(getattr(req, "origin_input_ids", None) or ()) + int(actor.page)
-    return actor.ensure(n)
+    if actor is None or int(getattr(getattr(sched, "ps", None), "pp_rank", 0) or 0) != 0:
+        return None
+    import json
+
+    from sglang.srt.weg2.card_kv_ledger import CardKvLedger
+
+    tag = os.environ.get("SGLANG_WEG2_TAG", "weg2")
+    pp = int(getattr(getattr(sched, "ps", None), "pp_size", 1) or 1)
+    stages = []
+    for r in range(pp):
+        try:
+            with open(stage_file(tag, r)) as f:
+                stages.append(json.load(f))
+        except OSError:
+            logger.warning("%s PP0 GRANT waits: stage %d has not published its table yet", MARK, r)
+            return 0
+    tokens = len(getattr(req, "origin_input_ids", None) or ()) + int(actor.page)
+    lvl = group_grant(stages, tokens, lambda pth: CardKvLedger(pth, "P"))
+    if lvl:
+        actor.map_granted(lvl)
+        req._dual_kv_tokens = lvl
+        logger.info("%s PP0 GRANT rid=%s tokens=%d on all %d cards", MARK,
+                    str(getattr(req, "rid", "?"))[:16], lvl, pp)
+    else:
+        logger.info("%s PP0 WAIT rid=%s tokens=%d: a card is short, nothing held (P never presses D)",
+                    MARK, str(getattr(req, "rid", "?"))[:16], tokens)
+    return lvl
+
+
+def on_told(sched, item) -> None:
+    """A follower adopts PP0's group grant carried by the told."""
+    lvl = int(getattr(item, WIRE_DUAL_KV, 0) or 0)
+    actor = _actor(sched)
+    if lvl > 0 and actor is not None:
+        actor.map_granted(lvl)
+
+
+def with_dual_kv(told, req):
+    lvl = int(getattr(req, "_dual_kv_tokens", 0) or 0)
+    if lvl > 0:
+        setattr(told, WIRE_DUAL_KV, lvl)
+    return told
 
 
 def on_idle(sched) -> int:

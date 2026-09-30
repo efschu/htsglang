@@ -130,7 +130,9 @@ class DualPKvStage(CustomTestCase):
         from sglang.srt.mem_cache import memory_pool as MP
         from sglang.srt.model_executor import model_runner_kv_cache_mixin as MX
 
-        self.assertIn("_dpk.on_intake(scheduler, req)", inspect.getsource(T.intake))
+        self.assertIn("_dpk.pp0_grant(scheduler, req) == 0", inspect.getsource(T.intake))
+        self.assertIn("_dpk.on_told(scheduler, item)", inspect.getsource(T._follower_absorb_impl))
+        self.assertIn("_dual_kv_retry(scheduler)", inspect.getsource(T.pp0_publish))
         self.assertIn("_dpk.born(pool, t, name)", inspect.getsource(MP._kv_stage_born))
         src = inspect.getsource(MX)
         self.assertIn("_dpk.attach(self)", src)
@@ -138,4 +140,77 @@ class DualPKvStage(CustomTestCase):
         from sglang.srt.managers import scheduler as SC
 
         self.assertIn("_dpk.on_idle(self)", inspect.getsource(SC.Scheduler.on_idle))
+
+    def _cards(self, budgets_mib):
+        root = tempfile.mkdtemp(prefix="wkvg")
+        paths, ds = [], []
+        for i, b in enumerate(budgets_mib):
+            pth = os.path.join(root, "card%d" % i)
+            d = K.CardKvLedger(pth, "D")
+            d.contribute(b << 20, committed=0)
+            paths.append(pth)
+            ds.append(d)
+        return paths, ds
+
+    def test_group_grant_is_all_or_none(self):
+        paths, ds = self._cards([100, 100, 100])
+        stages = [{"ledger": p, "step": 4096, "top": 16384, "bytes": [0, 10 << 20, 20 << 20, 30 << 20, 40 << 20]}
+                  for p in paths]
+        ds[1].request(95 << 20)                                # card 1 has only 5 MiB free
+        open_p = lambda pth: K.CardKvLedger(pth, "P")
+        self.assertEqual(S.group_grant(stages, 4000, open_p), 0)
+        for p in paths:                                        # nothing held anywhere
+            self.assertEqual(K.peek(p).committed["P"], 0)
+        ds[1].release(95 << 20)
+        self.assertEqual(S.group_grant(stages, 4000, open_p), 4096)
+        for p in paths:
+            self.assertEqual(K.peek(p).committed["P"], 10 << 20)
+
+    def test_d_growth_between_pp0_grant_and_follower_cannot_break_the_follower(self):
+        # operator order: D grows between PP0's grant and the follower's intake -> no alloc failure
+        paths, ds = self._cards([100, 100, 100])
+        stages = [{"ledger": p, "step": 4096, "top": 16384, "bytes": [0, 10 << 20, 20 << 20, 30 << 20, 40 << 20]}
+                  for p in paths]
+        led = K.CardKvLedger(paths[2], "P")
+        led.contribute(0)                                      # the follower joined at its boot
+        lvl = S.group_grant(stages, 8000, lambda pth: K.CardKvLedger(pth, "P"))
+        self.assertEqual(lvl, 8192)
+        for d in ds:                                           # D takes everything that is left
+            d.request(1 << 30)
+        spans = FakeSpans()
+        follower = S.PKvStage([(1, S._geom_for(torch.zeros(16448, 512), 16384, 64, "k", ALLOC))], led,
+                              allocator=object(), pools=[], page_size=64, granule=G, top_tokens=16384,
+                              spans=spans, engage_cap=lambda *a: None)
+        follower.map_granted(lvl)                              # maps, requests nothing -> cannot fail
+        self.assertEqual(follower.mapped_tokens, 8192)
+        self.assertEqual(K.peek(paths[2]).committed["P"], 20 << 20)   # PP0's commitment stands
+        self.assertLessEqual(sum(K.peek(paths[2]).committed.values()), K.peek(paths[2]).budget)
+
+    def test_told_carries_the_grant(self):
+        import types
+
+        from sglang.srt.managers import weg2_store_told as T
+
+        req = types.SimpleNamespace(_dual_kv_tokens=8192)
+        told = T._dual_kv_wire(T.Weg2StoreTold(rid="r", told=0), req)
+        self.assertEqual(getattr(told, S.WIRE_DUAL_KV), 8192)
+        plain = T._dual_kv_wire(T.Weg2StoreTold(rid="r", told=0), types.SimpleNamespace())
+        self.assertFalse(hasattr(plain, S.WIRE_DUAL_KV))
+
+    def test_grants_accumulate_until_idle_release(self):
+        paths, ds = self._cards([100])
+        led = K.CardKvLedger(paths[0], "P")
+        led.contribute(0)
+        st = S.PKvStage([(1, S._geom_for(torch.zeros(16448, 512), 16384, 64, "k", ALLOC))], led,
+                        allocator=object(), pools=[], page_size=64, granule=G, top_tokens=16384,
+                        spans=FakeSpans(), engage_cap=lambda *a: None)
+        stages = [{"ledger": paths[0], "step": 4096, "top": 16384, "bytes": st.table()}]
+        open_p = lambda pth: K.CardKvLedger(pth, "P")
+        st.map_granted(S.group_grant(stages, 12000, open_p))   # request 1: 12288 tokens
+        st.map_granted(S.group_grant(stages, 3000, open_p))    # request 2 while 1 still holds pages
+        self.assertEqual(st.mapped_tokens, 12288)             # the mapping never shrinks under a request
+        committed = K.peek(paths[0]).committed["P"]
+        self.assertGreaterEqual(committed, st.bytes_for(12288) - st.bytes_for(0))   # covers the mapping
+        self.assertEqual(st.release_all(), committed)
+        self.assertEqual(K.peek(paths[0]).committed["P"], 0)
 
