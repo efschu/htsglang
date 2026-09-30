@@ -282,9 +282,21 @@ class OutstandingBook:
     def __init__(self) -> None:
         self.arrival: dict = {}
         self.last_tok: dict = {}
+        #: y5c (30.09., weg2-0-2, 113k non-stream, 235 s): the rids whose client
+        #: asked no stream -- the front forwards D's answer whole at its end,
+        #: so it sees no token in between and has no per-rid IPC source for
+        #: one. Their rows say so (``stream`` 0, ``no_token_s`` None) instead of
+        #: reading "no token for N s" out of a blindness.
+        self.nonstream: set = set()
 
     def arrive(self, rid, now: float) -> None:
         self.arrival.setdefault(str(rid), float(now))
+
+    def stream(self, rid, is_stream: bool) -> None:
+        if is_stream:
+            self.nonstream.discard(str(rid))
+        else:
+            self.nonstream.add(str(rid))
 
     def token(self, rid, now: float) -> None:
         self.last_tok[str(rid)] = float(now)
@@ -292,6 +304,7 @@ class OutstandingBook:
     def end(self, rid) -> None:
         self.arrival.pop(str(rid), None)
         self.last_tok.pop(str(rid), None)
+        self.nonstream.discard(str(rid))
 
     def block(self, now: float, queued, p_out, d_out, parked, flipping: bool, top: int = 8) -> dict:
         """``queued``: (rid, t_arrive) of the front's queue; ``p_out``/``d_out``:
@@ -318,17 +331,25 @@ class OutstandingBook:
         entries = []
         for rid, (where, t) in rows.items():
             lt = self.last_tok.get(rid)
+            blind = rid in self.nonstream
             entries.append({"rid": rid, "where": where, "age_s": round(max(0.0, now - t), 1),
+                            "stream": 0 if blind else 1,
                             "last_token_s": None if lt is None else round(max(0.0, now - lt), 1),
-                            "no_token_s": round(max(0.0, now - (lt if lt is not None else t)), 1)})
+                            # non-stream: the front cannot see D's tokens -- None, not a stall
+                            "no_token_s": (None if blind else
+                                           round(max(0.0, now - (lt if lt is not None else t)), 1))})
         oldest = max(entries, key=lambda e: e["age_s"]) if entries else None
         return {
             "outstanding_n": len(entries),
+            "outstanding_nonstream_n": sum(1 for e in entries if not e["stream"]),
             "oldest_outstanding_age_s": oldest["age_s"] if oldest else None,
             "oldest_outstanding_first_token_s": oldest["last_token_s"] if oldest else None,
             "oldest_outstanding_rid": oldest["rid"] if oldest else None,
             "oldest_outstanding_where": oldest["where"] if oldest else None,
-            "outstanding_stalest": sorted(entries, key=lambda e: -e["no_token_s"])[:max(1, int(top))],
+            "oldest_outstanding_stream": oldest["stream"] if oldest else None,
+            "outstanding_stalest": sorted(
+                entries, key=lambda e: -(e["no_token_s"] if e["no_token_s"] is not None else -1.0)
+            )[:max(1, int(top))],
         }
 
 

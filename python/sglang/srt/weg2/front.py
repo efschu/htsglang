@@ -7079,6 +7079,10 @@ class Front:
             self.counters["W22_Weg2SpanUnknownPricedFull"] += 1
         self.counters["requests"] += 1
         stream = bool(payload.get("stream"))
+        # y5c: a non-stream rid shows the front no token before its end -- the
+        # IPC rows say so (stream 0) instead of a stall they cannot see
+        self._ipc_out_book().stream(rid, stream)
+        self._park_stuck().note_stream(rid, stream)
         exact = self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
         if _xx is not None:
             exact = _xx.n
@@ -8137,6 +8141,8 @@ class Front:
                         p, fits, v = q, True, _asr.FLIP_NOW
                         why = "%s; backfill past head %s (%s, waited %.1f s)" % (why2, head.rid, why, head_wait)
                         break
+        if v == _asr.FLIP_NOW and self._asr_min_dwell_held(p, D, now):
+            return False, not self.admit_d, None
         if v == _asr.FLIP_NOW:
             if st["flip_rid"] != p.rid:
                 st["flip_rid"] = p.rid
@@ -8160,6 +8166,52 @@ class Front:
                         "the next free seat in arrival order", _asr.MARKER, p.rid, v, why_wait,
                         int(getattr(p, "est_uncached", 0) or 0), x_tok, taken, n, why)
         return False, not self.admit_d, None
+
+    def _asr_min_dwell_held(self, p: "Pending", D: "Group", now: float) -> bool:
+        """ARRIVAL-SEAT MIN-DWELL (NF-Operator 30.09., y5c 19:17-19:21Z:
+        weg2-0-2 parked 6x by flip_now, park 4 at 19:19:52 came 1.1 s after its
+        resume at 19:19:50; 91 s decoded, 83 s parked, client gone at 235 s):
+        True = this flip_now waits. The decodes D resumed in THIS D phase
+        (#244's ``_seat_resumed_epoch``, resumed at the wake that began it)
+        must have decoded since that resume at least one measured flip round
+        trip (:meth:`_flip_round_trip_price`, the X-COST-LINE / K_FLIP price).
+        No resumed decode running, the switch off, or no price measured yet
+        (named once): no hold. The waiting arrival keeps its place and its
+        seat (the AGE PLAN reads it as fitting); nothing is rerouted."""
+        if not _asr.min_dwell_enabled():
+            return False
+        epochs = getattr(self, "_seat_resumed_epoch", None) or {}
+        t_res = float(self.t_awake)
+        resumed = {r: t_res for r, e in epochs.items() if e == self.epoch}
+        if not resumed:
+            return False
+        st = self._asr_st()
+        running = [r for r in self._flip_ledger(D) if r not in st["parked"]]
+        if not any(r in resumed for r in running):
+            return False
+        need_s, src = self._flip_round_trip_price()
+        if need_s is None:
+            if st.get("min_dwell_unmeasured") != self.epoch:
+                st["min_dwell_unmeasured"] = self.epoch
+                logger.info("%s MIN-DWELL unmeasured rid=%s src=%s epoch=%d -- no round trip measured "
+                            "yet (no record of this form): no hold, never a constant", _asr.MARKER,
+                            p.rid, src, self.epoch)
+            return False
+        hold = _asr.min_dwell_hold(resumed, running, now, need_s)
+        if hold is None:
+            return False
+        victim, dwell = hold
+        # DP-WAIT (#1416i): a request whose wait spans this hold names min-dwell
+        self._park_dwell_held_t = time.time()
+        if st.get("min_dwell_told") != (p.rid, self.epoch):
+            st["min_dwell_told"] = (p.rid, self.epoch)
+            self.counters["arrival_seat_min_dwell_hold"] += 1
+            logger.warning("%s MIN-DWELL hold rid=%s dwell_s=%.2f need_s=%.2f src=%s resumed_rid=%s "
+                           "resumed_n=%d epoch=%d -- the flip to P waits until the resumed decodes "
+                           "decoded one round trip (ski rental); the arrival keeps its place and seat",
+                           _asr.MARKER, p.rid, dwell, need_s, src, victim,
+                           sum(1 for r in running if r in resumed), self.epoch)
+        return True
 
     def _asr_queued_short_to_d(self, live_q: List["Pending"], now: float) -> List["Pending"]:
         """ARRIVAL-SEAT: every queued SHORT whose own route verdict was SHORT
@@ -8225,6 +8277,8 @@ class Front:
             v = _asr.verdict(True if plan else free, True if plan else fits_kv,
                              int(getattr(q, "est_uncached", 0) or 0),
                              min(x_tok, _x_p) if _x_p > 0 else x_tok)
+            if v == _asr.FLIP_NOW and self._asr_min_dwell_held(q, self.groups["D"], now):
+                return False, not self.admit_d, None    # MIN-DWELL: it keeps its place and seat
             if v == _asr.FLIP_NOW:
                 if st["flip_rid"] != q.rid:
                     st["flip_rid"] = q.rid
@@ -11448,6 +11502,21 @@ class Front:
             return seed, f"record:{seed['boot_tag']}@{seed['at']}(window {why}; boot {why_all})"
         return None, f"none(window {why}; boot {why_all})"
 
+    def _flip_round_trip_price(self) -> Tuple[Optional[float], str]:
+        """The measured flip round trip in seconds and its source -- X-COST-
+        LINE's (and so K_FLIP's) price, and ARRIVAL-SEAT MIN-DWELL's need: the
+        WARM legs of this boot (K7's D->P + P->D medians + the wake -> first
+        chunk) > the RECORD of this checkpoint x form > None (unmeasured,
+        named). Never a constant."""
+        dp_ms, pd_ms, resume_ms, legs_src = self._park_warm_legs_ms()
+        price = phase_policy.park_round_trip_s(dp_ms, pd_ms, resume_ms)
+        if price is not None:
+            return price, f"ski-live:{legs_src}"
+        if self._park_rt_seed is not None:
+            return (float(self._park_rt_seed["round_trip_s"]),
+                    f"ski-record:{self._park_rt_seed['boot_tag']}@{self._park_rt_seed['at']}")
+        return None, f"none:{legs_src}"
+
     def _x_cost_inputs(self) -> Tuple[Optional[dict], str, Optional[float], str, float, str]:
         """X-COST-LINE's inputs with their sources: ``(line, line_src, price_s,
         price_src, k, k_src)``. Every one is LIVE > RECORD of this checkpoint x
@@ -11455,15 +11524,7 @@ class Front:
         measurement is 1 (no amortisation), named as such."""
         line, line_src = self._x_cost_line_of(self._d_cost_rows, self._d_cost_all,
                                               self._x_cost_seed)
-        dp_ms, pd_ms, resume_ms, legs_src = self._park_warm_legs_ms()
-        price = phase_policy.park_round_trip_s(dp_ms, pd_ms, resume_ms)
-        if price is not None:
-            price_src = f"ski-live:{legs_src}"
-        elif self._park_rt_seed is not None:
-            price = float(self._park_rt_seed["round_trip_s"])
-            price_src = f"ski-record:{self._park_rt_seed['boot_tag']}@{self._park_rt_seed['at']}"
-        else:
-            price_src = f"none:{legs_src}"
+        price, price_src = Front._flip_round_trip_price(self)  # class-bound: tests drive it on a namespace
         cap = float(self.p_phase_max_requests) if self.p_phase_max_requests else float("inf")
         if self._p_phase_k:
             k = min(cap, max(1.0, statistics.mean(self._p_phase_k)))

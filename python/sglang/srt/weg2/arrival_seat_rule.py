@@ -67,6 +67,9 @@ COUNTERS = (
     # now (D's SEAT-AGE displaces younger ones for them), heads the plan found
     # blocked by OLDER running requests (-> backfill)
     "arrival_seat_age_to_d", "arrival_seat_age_blocked_by_elders",
+    # MIN-DWELL (30.09., y5c): flip_now verdicts held because the decodes
+    # resumed this D phase had not yet decoded one flip round trip
+    "arrival_seat_min_dwell_hold",
 )
 
 
@@ -309,6 +312,39 @@ def kv_fits(need: int, kv_reading: Optional[Mapping]) -> Tuple[bool, str]:
     if int(need) <= free:
         return True, f"kv need={int(need)} free={free}{tail}"
     return False, f"kv need={int(need)} > free={free}{tail}"
+
+
+def min_dwell_enabled(env=None) -> bool:
+    """MIN-DWELL switch (SGLANG_WEG2_ARRIVAL_MIN_DWELL, default on)."""
+    if env is not None:
+        raw = str(env.get("SGLANG_WEG2_ARRIVAL_MIN_DWELL", "") or "").strip().lower()
+        return raw not in ("0", "false", "no", "off")
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_ARRIVAL_MIN_DWELL.get())
+
+
+def min_dwell_hold(resumed_t: Mapping[str, float], running: Iterable[str], now: float,
+                   need_s: Optional[float]) -> Optional[Tuple[str, float]]:
+    """MIN-DWELL (NF-Operator 30.09., ski rental): may a flip_now to P come
+    now? ``resumed_t``: rid -> the time D resumed it in THIS D phase;
+    ``running``: the decodes D runs now; ``need_s``: the measured flip round
+    trip (None/<= 0 = unmeasured, never a constant -> no hold). Returns the
+    resumed running decode with the SHORTEST dwell and that dwell when it is
+    below ``need_s`` (hold), else None (the flip may come)."""
+    if need_s is None or float(need_s) <= 0.0:
+        return None
+    worst = None
+    for rid in running:
+        t = resumed_t.get(rid)
+        if t is None:
+            continue
+        dwell = max(0.0, float(now) - float(t))
+        if worst is None or dwell < worst[1]:
+            worst = (rid, dwell)
+    if worst is None or worst[1] >= float(need_s):
+        return None
+    return worst
 
 
 def backfill_allowed(head_wait_s: Optional[float], bound_s: float) -> bool:

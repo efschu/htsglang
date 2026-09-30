@@ -3734,6 +3734,15 @@ class Envs:
     # blanket park, no clock on the backfill. Needs
     # SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE; 0 = the ARRIVAL-SEAT/#246 front.
     SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN = EnvBool(True)
+    # ARRIVAL-SEAT MIN-DWELL (NF-Operator 30.09., y5c: weg2-0-2 parked 6x by
+    # flip_now, park 4 came 1.1 s after its resume): a flip_now to P waits
+    # until the decodes this D phase RESUMED have decoded since their resume
+    # at least one measured flip round trip -- the price X-COST-LINE / K_FLIP
+    # use (live warm legs > record of this checkpoint x form; unmeasured =
+    # no hold, named). The arrival waits in arrival order meanwhile (its seat
+    # stays its own under the AGE PLAN), is never rerouted. Name ordered by
+    # the operator (no ENABLE verb); default on: a stability fix.
+    SGLANG_WEG2_ARRIVAL_MIN_DWELL = EnvBool(True)
     # X-COST-LINE (29.09., third part of the ski-rental decision; NF z30w
     # 09290827 and 27B 09290020 both ran with `X NO-SOLVE: no r_d` because the
     # solo r_D probe never fired under load). X is re-solved from D's measured

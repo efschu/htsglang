@@ -13,6 +13,12 @@ rid in between (streamed chunks the front forwarded; a non-streamed request
 shows none until it ends, so every park of it counts). It ends when the rid
 leaves D (its seat is released). The front publishes the rids whose streak
 reached ``SGLANG_WEG2_PARK_STUCK_PHASES`` (default 3).
+
+y5c (30.09., weg2-0-2, 113k NON-stream): parked 6x, 1650 tokens decoded in
+between -- the front forwards a non-stream answer whole at its end, so it
+has no output of such a rid to count and no per-rid IPC source for one. Its
+parks are not a streak of "no progress" but a blindness: those rids are
+published apart (``blind_nonstream``: rid -> parks), never under ``stuck``.
 """
 
 from __future__ import annotations
@@ -26,6 +32,13 @@ class ParkStuck:
         self._chunks: Dict[str, int] = {}
         self._at_park: Dict[str, int] = {}
         self.max_seen = 0
+        self.nonstream: set = set()
+
+    def note_stream(self, rid, is_stream: bool) -> None:
+        if is_stream:
+            self.nonstream.discard(str(rid))
+        else:
+            self.nonstream.add(str(rid))
 
     def note_output(self, rid) -> None:
         r = str(rid)
@@ -40,22 +53,27 @@ class ParkStuck:
             else:
                 self.streak[r] = 1
             self._at_park[r] = c
-            self.max_seen = max(self.max_seen, self.streak[r])
+            if r not in self.nonstream:
+                self.max_seen = max(self.max_seen, self.streak[r])
 
     def done(self, rid) -> None:
         r = str(rid)
         self.streak.pop(r, None)
         self._chunks.pop(r, None)
         self._at_park.pop(r, None)
+        self.nonstream.discard(r)
 
     def block(self, min_phases: int) -> dict:
         n = max(1, int(min_phases))
-        stuck = sorted((r for r, s in self.streak.items() if s >= n),
-                       key=lambda r: -self.streak[r])
+        seen = {r: s for r, s in self.streak.items() if r not in self.nonstream}
+        blind = {r: s for r, s in self.streak.items() if r in self.nonstream}
+        stuck = sorted((r for r, s in seen.items() if s >= n), key=lambda r: -seen[r])
         return {
             "min_phases": n,
             "stuck": len(stuck),
-            "max_streak": max(self.streak.values(), default=0),
+            "max_streak": max(seen.values(), default=0),
             "max_streak_boot": int(self.max_seen),
-            "rids": {r: self.streak[r] for r in stuck[:8]},
+            "rids": {r: seen[r] for r in stuck[:8]},
+            # non-stream rids: parks counted, progress not visible to the front
+            "blind_nonstream": {r: blind[r] for r in sorted(blind, key=lambda r: -blind[r])[:8]},
         }
