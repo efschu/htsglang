@@ -199,6 +199,8 @@ from sglang.srt.weg2.ring_table import (  # noqa: E402
     TAG_POPULATION_WEIGHTS as WEG2_TAG_POPULATION_WEIGHTS,
 )
 
+from sglang.srt.weg2 import rpc_stall_watchdog as _rpc_stall  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 
@@ -8905,6 +8907,7 @@ class SchedulerWeightUpdaterManager:
         return out
 
     @_weg2_group_stop_on_leg_failure
+    @_rpc_stall.watched("release")  # RPC-STALL-WATCHDOG (hauenh 30.09.): stacks if the leg outlives 3 s
     @_vram_peak_leg("release")
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         # #1285 FIRST STATEMENT, before the idle assert and before any mutation:
@@ -9618,6 +9621,7 @@ class SchedulerWeightUpdaterManager:
         ))
 
     @_weg2_group_stop_on_leg_failure
+    @_rpc_stall.watched("resume")  # RPC-STALL-WATCHDOG (hauenh 30.09.): stacks if the leg outlives 3 s
     @_vram_peak_leg("resume")
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
         from sglang.srt.weg2.d_early_start import stop_free_read_journal

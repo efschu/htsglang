@@ -1444,6 +1444,11 @@ class Envs:
     # and stays on D. Line 'WEG2 P-ANCHOR-PRESENCE'. Off = no record (#1324:
     # P's leg 1 feeds no presence); A/B against the W50-REROUTE count.
     SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE = EnvBool(False)
+    # RPC-STALL-WATCHDOG (30.09., hauenh P->D epoch 6: D TP0 silent 6 s inside the wake RPC):
+    # faulthandler's C watchdog writes every thread's stack into its own file per rank when a sleep
+    # (release) or wake (resume) RPC outlives this many seconds (weg2/rpc_stall_watchdog.py). A normal
+    # leg is 1.5-2.3 s; 0 = off. Costs nothing while nothing hangs.
+    SGLANG_WEG2_RPC_STALL_WATCHDOG_S = EnvFloat(3.0)
     # The page grain of that end anchor (the store page, ArenaMHAHostPool #107).
     SGLANG_WEG2_FRONT_ANCHOR_PAGE = EnvInt(64)
     # H102 (Weg-2 front): a per-request watcher sees the client's connection
