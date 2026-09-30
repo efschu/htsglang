@@ -124,6 +124,82 @@ def born(pool, t, name: str, *, spans=None, granule: Optional[int] = None):
     return t
 
 
+class Weg2DualKvCapBreach(RuntimeError):
+    """A free id above the mapped span: the next allocation would write into
+    unmapped memory (metal e3hgpw: illegal memory access). Refused by name."""
+
+
+def engage_cap(allocator, tokens: int, page_size: int) -> int:
+    """The allocator cap at ``tokens`` -- ``d_seat_vram._engage_kv_cap`` with the
+    page count read correctly for EVERY allocator: the page-size-1
+    TokenToKVPoolAllocator has no ``num_pages``, and the d_seat_vram helper then
+    took 'no attribute' as 'the cap covers everything' and released it (metal
+    e3hgpw 30.09.: freed ids at the back of the free list were handed out above
+    the mapped span)."""
+    from sglang.srt.managers.kv_backing_relief import KvRowCap
+
+    page = max(1, int(page_size))
+    num_pages = getattr(allocator, "num_pages", None)
+    if num_pages is None:
+        num_pages = int(getattr(allocator, "size", 0) or 0) // page
+    cap = getattr(allocator, "_weg2_kv_stage_cap", None)
+    if cap is None:
+        cap = KvRowCap(allocator)
+        allocator._weg2_kv_stage_cap = cap
+    pages = int(tokens) // page
+    if pages >= int(num_pages):
+        if cap.engaged:
+            cap.release()
+        return pages
+    if cap.engaged and cap.cap is not None and pages > int(cap.cap):
+        cap.release()
+    cap.engage(pages)
+    return pages
+
+
+def max_live_id(allocator, page_size: int = 1) -> int:
+    """The highest id a request (or the tree) holds: every id in no free list
+    and not withheld by the cap -- ``d_seat_vram.max_live_page`` with the page
+    count read for EVERY allocator (the token allocator has no ``num_pages``;
+    there the helper answered 0 and a shrink floor would have been blind)."""
+    import torch
+
+    n = getattr(allocator, "num_pages", None)
+    if n is None:
+        n = int(getattr(allocator, "size", 0) or 0) // max(1, int(page_size))
+    n = int(n or 0)
+    if n <= 0:
+        return 0
+    live = torch.ones(n + 1, dtype=torch.bool)
+    live[0] = False
+    for name in ("free_pages", "release_pages"):
+        ids = getattr(allocator, name, None)
+        if ids is not None and hasattr(ids, "numel") and ids.numel():
+            live[ids.detach().to("cpu", torch.int64)] = False
+    cap = getattr(allocator, "_weg2_kv_stage_cap", None)
+    held = getattr(cap, "_withheld", None) if cap is not None else None
+    if held is not None and held.numel():
+        live[held.to("cpu", torch.int64)] = False
+    idx = torch.nonzero(live).flatten()
+    return int(idx.max()) if idx.numel() else 0
+
+
+def check_cap(allocator, tokens: int, page_size: int, where: str) -> None:
+    """Every free id must lie inside the mapped span ``[1, tokens + page]``."""
+    import torch
+
+    bound = (int(tokens) + int(page_size)) // max(1, int(page_size))
+    for name in ("free_pages", "release_pages"):
+        ids = getattr(allocator, name, None)
+        if ids is not None and hasattr(ids, "numel") and ids.numel():
+            hi = int(torch.max(ids).item())
+            if hi > bound:
+                raise Weg2DualKvCapBreach(
+                    "%s CAP-BREACH at %s: free id %d in %s lies above the mapped span (tokens=%d, page=%d, "
+                    "bound=%d) -- the next allocation would write into unmapped KV" % (
+                        MARK, where, hi, name, int(tokens), int(page_size), bound))
+
+
 def stage_pools(pool) -> List[object]:
     """The pools whose stage rows follow the mapping: the MHATokenToKVPool
     itself, or the inner FA pool of a HybridLinearKVPool (the 27B's
@@ -157,7 +233,7 @@ class PKvStage:
         self.top = int(top_tokens)
         self.spans = _sv.tms() if spans is None else spans
         self.step = int(step or step_tokens())
-        self._engage_cap = engage_cap or _sv._engage_kv_cap
+        self._engage_cap = engage_cap or globals()["engage_cap"]
         self._sync = sync or (lambda: None)
         self.mapped_tokens = 0
         self.cuts = None
@@ -183,6 +259,7 @@ class PKvStage:
         for pool in self.pools:
             pool.set_stage_backed_rows(rows)
         self._engage_cap(self.allocator, int(tokens), self.page)
+        check_cap(self.allocator, int(tokens), self.page, "move to %d" % int(tokens))
 
     def ensure(self, tokens: int) -> bool:
         """Map at least ``tokens`` (rounded up to the lattice). True when the
@@ -227,6 +304,13 @@ class PKvStage:
     def release_all(self) -> int:
         """Unmap everything; the caller guarantees no request holds a page."""
         if self.mapped_tokens <= 0:
+            return 0
+        try:
+            live = int(max_live_id(self.allocator, self.page))
+        except Exception:  # noqa: BLE001 -- an allocator without free lists: nothing to judge by
+            live = 0
+        if live > 0:
+            logger.warning("%s RELEASE HELD: page %d is still live -- no unmap under a live id", MARK, live)
             return 0
         n = int(getattr(self, "_committed", 0) or 0) or (self.bytes_for(self.mapped_tokens) - self.bytes_for(0))
         self._engage_cap(self.allocator, 0, self.page)

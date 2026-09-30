@@ -241,3 +241,44 @@ class HybridPoolResolution(CustomTestCase):
                         granule=G, top_tokens=16384, spans=FakeSpans(), engage_cap=lambda *a: None)
         st._move(4096)
         self.assertEqual(mha._stage_backed_rows, geom.slots_for(4096))
+
+
+class CapOnTheTokenAllocator(CustomTestCase):
+    """Metal e3hgpw (...09300907): after 'P-KV RELEASE 40960 -> 0' and the next
+    grant of 40960, the loadback wrote dst=[40768,77630] -- the page-size-1
+    TokenToKVPoolAllocator has no ``num_pages``, so d_seat_vram._engage_kv_cap
+    read it as 'the cap covers everything' and never engaged; the freed ids sat
+    at the back of the free list and the next allocation took ids above the
+    mapped span (illegal memory access)."""
+
+    def _alloc(self, size=200):
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+        return TokenToKVPoolAllocator(size, torch.float16, "cpu", None, False)
+
+    def test_two_grants_with_release_between_stay_inside_the_mapped_span(self):
+        alloc = self._alloc()
+        led = K.CardKvLedger(os.path.join(tempfile.mkdtemp(prefix="wkvc"), "card"), "P")
+        led.contribute(1 << 30)
+        st = S.PKvStage([(1, S._geom_for(torch.zeros(264, 8), 256, 1, "k", 264 * 32))], led, allocator=alloc,
+                        pools=[], page_size=1, granule=G, top_tokens=192, spans=FakeSpans(), step=16)
+        st.map_granted(40)                                   # level 48
+        ids = alloc.alloc(40)
+        self.assertLessEqual(int(ids.max()), 48)
+        alloc.free(ids)                                      # freed ids go to the BACK of the free list
+        st.release_all()
+        st.map_granted(40)
+        ids2 = alloc.alloc(40)
+        self.assertIsNotNone(ids2)
+        self.assertLessEqual(int(ids2.max()), st.mapped_tokens,
+                             "the allocator handed an id above the mapped span")
+
+    def test_breach_is_a_named_refusal(self):
+        alloc = self._alloc()
+        led = K.CardKvLedger(os.path.join(tempfile.mkdtemp(prefix="wkvc"), "card"), "P")
+        led.contribute(1 << 30)
+        st = S.PKvStage([(1, S._geom_for(torch.zeros(264, 8), 256, 1, "k", 264 * 32))], led, allocator=alloc,
+                        pools=[], page_size=1, granule=G, top_tokens=192, spans=FakeSpans(), step=16,
+                        engage_cap=lambda *a: None)          # a cap that does nothing
+        with self.assertRaises(S.Weg2DualKvCapBreach):
+            st.map_granted(40)

@@ -125,3 +125,26 @@ class DualDKvStage(CustomTestCase):
             self.assertIs(D.born(pool, t, "k", spans=FakeSpans(), granule=G), t)   # not a top-sized pool
             D._BOOT_TOKENS = None
 
+    def test_shrink_on_the_token_allocator_never_unmaps_a_live_row(self):
+        # order point 3: rows above the shrunk span must not stay occupied
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+        alloc = TokenToKVPoolAllocator(200, torch.float16, "cpu", None, False)
+        path = os.path.join(tempfile.mkdtemp(prefix="wkvd"), "card")
+        led = K.CardKvLedger(path, "D")
+        geom = P._geom_for(torch.zeros(264, 8), 256, 1, "k", 264 * 32)
+        a = D.DKvStage([(1, geom)], led, allocator=alloc, pools=[], page_size=1, granule=32, top_tokens=192,
+                       spans=FakeSpans(), step=16, gmin=lambda v: v)
+        led.contribute(a.bytes_for(96) - a.bytes_for(0), committed=a.bytes_for(96) - a.bytes_for(0))
+        a.mapped_tokens, a._committed = 96, a.bytes_for(96) - a.bytes_for(0)
+        a._engage_cap(alloc, 96, 1)
+        ids = alloc.alloc(80)                               # ids 1..80 live
+        self.assertEqual(P.max_live_id(alloc, 1), 80)
+        self.assertEqual(a.group_shrink(16, live_floor_tokens=0), 0)   # a live id above 16: held
+        self.assertEqual(a.mapped_tokens, 96)
+        alloc.free(ids)
+        self.assertGreater(a.group_shrink(16, live_floor_tokens=0), 0)
+        self.assertEqual(a.mapped_tokens, 16)
+        P.check_cap(alloc, 16, 1, "test")                   # no free id above the new end
+        self.assertLessEqual(int(alloc.alloc(10).max()), 17)
+

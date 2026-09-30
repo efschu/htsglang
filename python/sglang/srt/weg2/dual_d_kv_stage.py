@@ -160,6 +160,11 @@ class DKvStage(_pk.PKvStage):
         if target >= self.mapped_tokens:
             return 0
         self._engage_cap(self.allocator, int(target), self.page)
+        live = _pk.max_live_id(self.allocator, self.page) * self.page
+        if live > target:
+            # a page above the new end is still held on THIS rank: no unmap under it
+            logger.warning("%s SHRINK HELD: live token %d above target %d", MARK, live, target)
+            return 0
         self._sync()
         n = self.bytes_for(self.mapped_tokens) - self.bytes_for(target)
         self._move(target)
@@ -247,7 +252,7 @@ def tick(sched) -> Optional[str]:
     if verdict == "grow":
         actor.group_grow(level)
     elif verdict == "shrink":
-        live = _sv.max_live_page(actor.allocator) * actor.page
+        live = _pk.max_live_id(actor.allocator, actor.page) * actor.page
         floor = -int(actor.gmin([-int(live)])[0])
         if actor.group_shrink(level, floor):
             actor._below = 0
