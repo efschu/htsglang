@@ -3687,6 +3687,22 @@ DUAL_NO_FLIP_WHY = ("--dual-layout: both groups stay awake and the front never f
                     "(P prefills while D decodes; no group holds a released region to wake)")
 
 
+def _dual_p_pressures(paths) -> List[int]:
+    """DUAL-TP3PP3: the pressure every card ledger puts on P, in path order
+    (a missing ledger reads -1: nobody joined it -- the dual15 namespace class)."""
+    from sglang.srt.weg2.card_kv_ledger import peek
+
+    out: List[int] = []
+    for pth in paths or ():
+        try:
+            st = peek(pth)
+        except Exception as exc:  # noqa: BLE001 -- a ledger read never stops the pump
+            logger.warning("WEG2 DUAL card KV ledger read failed: %r", exc)
+            st = None
+        out.append(-1 if st is None else int(st.pressure["P"]))
+    return out
+
+
 def _dual_p_pressure(paths) -> int:
     """DUAL-TP3PP3 unified KV: the largest pressure a card ledger puts on P."""
     from sglang.srt.weg2.card_kv_ledger import p_pressure
@@ -10937,6 +10953,13 @@ class Front:
         an intake stall; the next controller tick starts the next pass. After a
         stall the pump waits DUAL_STALL_BACKOFF_S: P's pool is full and D is
         draining it through the store, a hot re-dispatch would only re-stall."""
+        # metal dual17 (wjt89v): D TP0 pressed P for 30 s (pressure_on_P up to
+        # 360710144) and the front never paused -- the pressure was read only
+        # AFTER "a pass is still running -> return", and a leg 1 in flight IS
+        # a running pass. The pressure is read first, every tick.
+        pressure = self._dual_pressure_tick() if self.dual_kv_ledgers else 0
+        if pressure > 0:
+            self._dual_pause_inflight(pressure)
         t = self._dual_task
         if t is not None and not t.done():
             return
@@ -10949,17 +10972,35 @@ class Front:
                 self._dual_backoff_until = time.time() + DUAL_STALL_BACKOFF_S
             elif getattr(self, "_p_intake_stalled", False):
                 self._dual_backoff_until = time.time() + DUAL_STALL_BACKOFF_S
-        if self.dual_kv_ledgers:
+        if pressure > 0:
             # User order 30.09. 07:25Z: VRAM-KV short -> P pauses, frees its
             # context, keeps what it finished in L2; resumes when KV is free.
-            pressure = _dual_p_pressure(self.dual_kv_ledgers)
-            if pressure > 0:
-                self._dual_pause_inflight(pressure)
-                return  # no new P pass while D is short
+            return  # no new P pass while D is short
         if not self.queue or time.time() < self._dual_backoff_until:
             return
         self.counters["dual_passes"] += 1
         self._dual_task = asyncio.get_running_loop().create_task(pass_fn())
+
+    #: seconds between two unchanged pressure-reader lines (the instrument)
+    DUAL_PRESSURE_LOG_S = 30.0
+
+    def _dual_pressure_tick(self) -> int:
+        """Read every card ledger's pressure on P; one instrument line on every
+        change of the pressed/unpressed state and at most every
+        DUAL_PRESSURE_LOG_S while it holds."""
+        per = _dual_p_pressures(self.dual_kv_ledgers)
+        worst = max([x for x in per if x > 0] or [0])
+        now = time.time()
+        state = (worst > 0, tuple(x < 0 for x in per))
+        last = getattr(self, "_dual_pr_last", None)
+        if state != last or (worst > 0 and now >= getattr(self, "_dual_pr_next", 0.0)):
+            self._dual_pr_last = state
+            self._dual_pr_next = now + self.DUAL_PRESSURE_LOG_S
+            t = self._dual_task
+            logger.info("WEG2 DUAL PRESSURE-READ max=%d per_card=%s inflight=%d pass_running=%s queue=%d "
+                        "(-1 = ledger absent)", worst, per, len(self._dual_inflight),
+                        bool(t is not None and not t.done()), len(self.queue))
+        return worst
 
     def _dual_pause_inflight(self, pressure: int) -> None:
         """Mark every leg 1 in flight on P as PAUSED and abort it on P (every
