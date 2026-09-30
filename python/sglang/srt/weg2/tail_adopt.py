@@ -113,6 +113,7 @@ from __future__ import annotations
 
 import logging
 import math
+import queue
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -439,9 +440,9 @@ def _stage_e1(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool
             st.verdict = why
             return st
     pin = torch.cuda.is_available()
-    if pin:
-        fa = {g: tuple(t.pin_memory() for t in ts) for g, ts in fa.items()}
-        gdn = {g: tuple(t.pin_memory() for t in ts) for g, ts in gdn.items()}
+    if pin or _arena_scope()[0] is not None:
+        fa = {g: tuple(_pin(t, pin) for t in ts) for g, ts in fa.items()}
+        gdn = {g: tuple(_pin(t, pin) for t in ts) for g, ts in gdn.items()}
     st.fa, st.gdn = fa, gdn
     if check_digest and held.owner is None:
         st.readback = _readback_buffers(fa, gdn, {}, None, pin)
@@ -614,7 +615,29 @@ def _end_shape_refusal(end: th.EndHeader, held: HeldShapes, fa, gdn, ring, ropes
 
 
 def _pin(t: torch.Tensor, pin: bool) -> torch.Tensor:
+    """The staged copy of ``t``: under TAIL-STAGE-WORKER a span of the rank's
+    arena (pinned once), else ``pin_memory()`` as before (counted fallback
+    when the arena has no room)."""
+    arena, rid = _arena_scope()
+    if arena is not None:
+        v = arena.take(rid, t.shape, t.dtype)
+        if v is not None:
+            v.copy_(t)
+            return v
+        _WORKER_STATS["fallback"] += 1
     return t.pin_memory() if pin else t
+
+
+def _pin_empty(shape, pin: bool) -> torch.Tensor:
+    """A host buffer of uint8 ``shape`` (the readback target): from the arena
+    under the worker, else a fresh (pinned) tensor."""
+    arena, rid = _arena_scope()
+    if arena is not None:
+        v = arena.take(rid, shape, torch.uint8)
+        if v is not None:
+            return v
+        _WORKER_STATS["fallback"] += 1
+    return torch.empty(shape, dtype=torch.uint8, pin_memory=pin)
 
 
 def _readback_buffers(fa, gdn, ring, rope, pin: bool) -> Dict[str, Tuple[torch.Tensor, ...]]:
@@ -624,7 +647,7 @@ def _readback_buffers(fa, gdn, ring, rope, pin: bool) -> Dict[str, Tuple[torch.T
     if rope is not None:
         src["rope"] = (rope,)
     return {
-        k: tuple(torch.empty(_as_bytes(t).shape, dtype=torch.uint8, pin_memory=pin) for t in ts)
+        k: tuple(_pin_empty(_as_bytes(t).shape, pin) for t in ts)
         for k, ts in src.items()
     }
 
@@ -692,6 +715,291 @@ def _candidate(rid: str) -> bool:
     return adopt_enabled() and rid.startswith("weg2-") and bool(th._dir()) and not _WEG2_END_ANCHOR
 
 
+# -- TAIL-STAGE-WORKER (30.09.) ---------------------------------------------------------
+#: one line per drained worker batch (= per wake): jobs, the worker's own clock
+#: split into read / digest / copy, the scheduler thread's submit cost, the
+#: arena's occupancy and where the digest ran
+WORKER_LINE = "WEG2-TAIL-STAGE-WORKER"
+#: the arena's host bytes, named like the other host posts (not in the arm sum)
+LEDGER_LINE = "WEG2-HOST-LEDGER TAIL-STAGE-ARENA"
+ARENA_ALIGN = 4096
+_MIB = float(1 << 20)
+
+
+def stage_worker_enabled() -> bool:
+    """SGLANG_WEG2_TAIL_STAGE_WORKER (TAIL-STAGE-WORKER, 30.09.)."""
+    try:
+        return bool(envs.SGLANG_WEG2_TAIL_STAGE_WORKER.get())
+    except Exception:  # noqa: BLE001 -- an unknown switch is off
+        return False
+
+
+_TLS = threading.local()
+_WORKER_STATS: Dict[str, int] = {"fallback": 0}
+
+
+def _arena_scope():
+    """(arena, rid) while the worker stages a rid on this thread, else (None, None)."""
+    return getattr(_TLS, "arena", None), getattr(_TLS, "rid", None)
+
+
+def _nbytes(spec: RowSpec, rows: int) -> int:
+    return int(rows) * math.prod(spec.shape) * torch.empty((), dtype=_dtype_of(spec.dtype)).element_size()
+
+
+def _dtype_of(name: str) -> torch.dtype:
+    return getattr(torch, str(name).replace("torch.", ""))
+
+
+def rid_bytes(held: HeldShapes, page_size: int, verify: bool) -> int:
+    """The pinned bytes one rid's staging takes on this rank, from the form:
+    E1 rows (< one page) and END rows (< two pages) of every held attention
+    layer (K, V, the QSA groups at 1/ratio), the GDN state twice (E1 + END),
+    the open QSA group's ring rows and RoPE row; twice again with the
+    readback buffers of the verify. Rounded per tensor to the arena's
+    alignment."""
+    page = max(1, int(page_size))
+    total, tensors = 0, 0
+    for rows in held.fa.values():
+        for j, spec in enumerate(rows):
+            n = 3 * page if j < 2 else -(-3 * page // max(1, held.qsa_ratio or 1))
+            total += _nbytes(spec, n)
+            tensors += 2
+    for rows in held.gdn.values():
+        for spec in rows:
+            total += 2 * _nbytes(spec, 1)
+            tensors += 2
+    ratio = max(held.qsa_ratio, held.ring_ratio, 1)
+    for spec in held.ring.values():
+        total += _nbytes(spec, ratio)
+        tensors += 1
+    if held.rope is not None:
+        total += _nbytes(held.rope, ratio)
+        tensors += 1
+    total += tensors * ARENA_ALIGN
+    return total * (2 if verify else 1)
+
+
+class PinArena:
+    """ONE pinned host buffer, taken in aligned spans per rid (first fit) and
+    given back per rid -- no pin_memory() per tensor. ``take`` returns None
+    when no span fits (the caller then pins as before, counted)."""
+
+    def __init__(self, nbytes: int, pin: bool = True):
+        self.nbytes = int(max(0, nbytes))
+        self.buf = torch.empty(self.nbytes, dtype=torch.uint8, pin_memory=pin) if self.nbytes else None
+        self._lock = threading.Lock()
+        self._free: List[Tuple[int, int]] = [(0, self.nbytes)] if self.nbytes else []
+        self._spans: Dict[str, List[Tuple[int, int]]] = {}
+        self.peak = 0
+
+    def used(self) -> int:
+        with self._lock:
+            return sum(n for spans in self._spans.values() for _o, n in spans)
+
+    def owners(self) -> List[str]:
+        with self._lock:
+            return list(self._spans)
+
+    def take(self, rid, shape, dtype) -> Optional[torch.Tensor]:
+        shape = tuple(int(x) for x in shape)
+        esize = torch.empty((), dtype=dtype).element_size()
+        n = math.prod(shape) * esize
+        if n == 0:
+            return torch.empty(shape, dtype=dtype)
+        need = -(-n // ARENA_ALIGN) * ARENA_ALIGN
+        with self._lock:
+            for i, (off, size) in enumerate(self._free):
+                if size >= need:
+                    if size == need:
+                        self._free.pop(i)
+                    else:
+                        self._free[i] = (off + need, size - need)
+                    self._spans.setdefault(str(rid), []).append((off, need))
+                    used = sum(m for spans in self._spans.values() for _o, m in spans)
+                    self.peak = max(self.peak, used)
+                    break
+            else:
+                return None
+        return self.buf[off:off + n].view(dtype).view(shape)
+
+    def release(self, rid) -> int:
+        with self._lock:
+            spans = self._spans.pop(str(rid), [])
+            if not spans:
+                return 0
+            free = sorted(self._free + spans)
+            merged: List[Tuple[int, int]] = []
+            for off, size in free:
+                if merged and merged[-1][0] + merged[-1][1] == off:
+                    merged[-1] = (merged[-1][0], merged[-1][1] + size)
+                else:
+                    merged.append((off, size))
+            self._free = merged
+            return sum(n for _o, n in spans)
+
+
+class _Handle:
+    """What ``_Job.thread`` holds under the worker: join / is_alive of ONE job."""
+
+    def __init__(self):
+        self._done = threading.Event()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        self._done.wait(timeout)
+
+    def is_alive(self) -> bool:
+        return not self._done.is_set()
+
+
+#: rids whose adopted rows are still in flight to the device (verify thread)
+_VERIFYING: Dict[str, int] = {}
+_VERIFYING_LOCK = threading.Lock()
+
+
+def _live_rids() -> set:
+    live = set(_JOBS) | set(_AGREED) | set(SKIP_PLANS)
+    live |= {str(i.spec.rid) for i in PENDING_INSTALLS}
+    with _VERIFYING_LOCK:
+        live |= set(_VERIFYING)
+    return live
+
+
+class StageWorker:
+    """ONE long-lived thread per rank with a queue: the rids are staged one
+    after another (no thread per rid), into the rank's pinned arena."""
+
+    def __init__(self, seats: Optional[int] = None, pin: Optional[bool] = None):
+        self.q: "queue.Queue" = queue.Queue()
+        self.thread: Optional[threading.Thread] = None
+        self.arena: Optional[PinArena] = None
+        self.seats = seats
+        self.pin = torch.cuda.is_available() if pin is None else bool(pin)
+        self.current: Optional[str] = None
+        self._lock = threading.Lock()
+        self._batch = self._fresh()
+
+    @staticmethod
+    def _fresh() -> Dict[str, float]:
+        return {"jobs": 0, "work_ms": 0.0, "read_ms": 0.0, "digest_ms": 0.0, "wait_ms_max": 0.0,
+                "submit_ms": 0.0, "released_mib": 0.0}
+
+    def prepare(self, held: HeldShapes, page_size: int, verify: bool, seats: Optional[int] = None) -> PinArena:
+        """The arena, pinned once (boot, or the first job): seats x rid_bytes."""
+        with self._lock:
+            if self.arena is None:
+                n = max(1, int(seats or self.seats or 6))
+                per = rid_bytes(held, page_size, verify)
+                t = time.perf_counter()
+                self.arena = PinArena(n * per, pin=self.pin)
+                logger.info(
+                    "%s bytes=%d mib=%.1f seats=%d per_rid_mib=%.1f page=%d verify=%s pin_ms=%.1f -- pinned "
+                    "once, reused by every staging of this rank (der Posten 'tail_stage_arena'; nicht in der "
+                    "Arm-Summe)", LEDGER_LINE, self.arena.nbytes, self.arena.nbytes / _MIB, n, per / _MIB,
+                    int(page_size), bool(verify), (time.perf_counter() - t) * 1000.0)
+            return self.arena
+
+    def reclaim(self) -> int:
+        """Give back the spans of every rid nothing holds any more (dropped,
+        evicted, never applied, or verified); the rid in work stays."""
+        if self.arena is None:
+            return 0
+        live = _live_rids()
+        if self.current is not None:
+            live.add(self.current)
+        freed = 0
+        for rid in self.arena.owners():
+            if rid not in live:
+                freed += self.arena.release(rid)
+        self._batch["released_mib"] += freed / _MIB
+        return freed
+
+    def submit(self, rid, box, headers, held, verify, device, page_size: int = 0) -> _Handle:
+        t = time.perf_counter()
+        self.reclaim()
+        h = _Handle()
+        self.q.put((str(rid), box, headers, held, bool(verify), device, int(page_size), h, time.perf_counter()))
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self._run, daemon=True, name="weg2-tail-stage-worker")
+            self.thread.start()
+        self._batch["submit_ms"] += (time.perf_counter() - t) * 1000.0
+        return h
+
+    def _run(self) -> None:
+        while True:
+            rid, box, headers, held, verify, device, page_size, h, t_sub = self.q.get()
+            t0 = time.perf_counter()
+            self._batch["wait_ms_max"] = max(self._batch["wait_ms_max"], (t0 - t_sub) * 1000.0)
+            self.current = rid
+            try:
+                ctx = torch.cuda.device(device) if (device is not None and self.pin) else th._null_ctx()
+                with ctx:
+                    arena = self.prepare(held, page_size, verify)
+                    arena.release(rid)  # a re-stage of a rid starts clean
+                    _TLS.arena, _TLS.rid = arena, rid
+                    th.stage_clock_reset()
+                    _stage_into(box, headers, held, verify, device)
+                    read_ms, digest_ms = th.stage_clock()
+                    self._batch["read_ms"] += read_ms
+                    self._batch["digest_ms"] += digest_ms
+            except Exception as exc:  # noqa: BLE001 -- a failed staging is a 0 vote, named
+                logger.warning("%s rid=%s raised %s: %s", WORKER_LINE, rid, type(exc).__name__, exc)
+                if not box:
+                    box.append(Staged(spec=headers[0].spec, headers=list(headers),
+                                      verdict=f"stage_raised:{type(exc).__name__}"))
+            finally:
+                _TLS.arena, _TLS.rid = None, None
+                self.current = None
+                self._batch["jobs"] += 1
+                self._batch["work_ms"] += (time.perf_counter() - t0) * 1000.0
+                h._done.set()
+            if self.q.empty():
+                self._log_batch()
+
+    def _log_batch(self) -> None:
+        b, self._batch = self._batch, self._fresh()
+        a = self.arena
+        work, read, dig = b["work_ms"], b["read_ms"], b["digest_ms"]
+        logger.info(
+            "%s jobs=%d worker_issue_ms=%.1f work_ms=%.1f read_ms=%.1f digest_ms=%.1f copy_ms=%.1f "
+            "queue_wait_ms_max=%.1f arena_used_mib=%.1f of %.1f peak_mib=%.1f released_mib=%.1f fallback=%d "
+            "digest=worker:pre-verdict (serial, one thread per rank; worker_issue = the scheduler thread's "
+            "submit cost; copy = work - read - digest: the copies into the pinned arena and the checks)",
+            WORKER_LINE, int(b["jobs"]), b["submit_ms"], work, read, dig, max(0.0, work - read - dig),
+            b["wait_ms_max"], (a.used() if a else 0) / _MIB, (a.nbytes if a else 0) / _MIB,
+            (a.peak if a else 0) / _MIB, b["released_mib"], _WORKER_STATS["fallback"])
+
+
+_STAGE_WORKER: List[Optional[StageWorker]] = [None]
+
+
+def _worker() -> StageWorker:
+    if _STAGE_WORKER[0] is None:
+        _STAGE_WORKER[0] = StageWorker()
+    return _STAGE_WORKER[0]
+
+
+def prepare_arena(model_runner, server_args) -> Optional[int]:
+    """Boot (D model worker init): pin the rank's arena once, from the form --
+    D's seat cap (--max-running-requests) x ``rid_bytes`` of the layers this
+    rank holds. None when the worker is off or this is not an adopting rank.
+    Never raises."""
+    try:
+        from sglang.srt.managers.schedule_policy import _WEG2_END_ANCHOR
+
+        if not stage_worker_enabled() or not adopt_enabled() or _WEG2_END_ANCHOR:
+            return None
+        held = held_shapes(model_runner.token_to_kv_pool, model_runner.req_to_token_pool)
+        seats = int(getattr(server_args, "max_running_requests", 0) or 0) or None
+        arena = _worker().prepare(held, int(getattr(server_args, "page_size", 1) or 1), verify_enabled(),
+                                  seats=seats)
+        return arena.nbytes
+    except Exception as exc:  # noqa: BLE001 -- the first job pins it then
+        logger.warning("%s boot pin n/a (%s: %s) -- the first staging pins it", LEDGER_LINE,
+                       type(exc).__name__, exc)
+        return None
+
+
 def _stage_into(box: List[Staged], headers, held: HeldShapes, check_digest: bool, device: Optional[int]) -> None:
     try:
         # pin on the rank's own card context, never a fresh one on device 0
@@ -736,6 +1044,11 @@ def stage(rid: str, tree_cache) -> None:
             return
         held = held_shapes(tree_cache.token_to_kv_pool_allocator.get_kvcache(), tree_cache.req_to_token_pool)
         device = torch.cuda.current_device() if torch.cuda.is_available() else None
+        if stage_worker_enabled():
+            # TAIL-STAGE-WORKER: one queue, one long-lived thread per rank
+            job.thread = _worker().submit(rid, job.box, headers, held, verify_enabled(), device,
+                                          page_size=int(getattr(tree_cache, "page_size", 0) or 0))
+            return
         job.thread = threading.Thread(target=_stage_into, args=(job.box, headers, held, verify_enabled(), device),
                                       daemon=True, name="weg2-tail-stage")
         job.thread.start()
@@ -1559,9 +1872,16 @@ def _install_step(inst: Install, layer_id: int) -> None:
 
 def _finish(inst: Install, verify: bool) -> None:
     event = None
-    if verify and torch.cuda.is_available() and inst.rows.is_cuda:
+    worker = stage_worker_enabled()
+    if (verify or worker) and torch.cuda.is_available() and inst.rows.is_cuda:
+        # TAIL-STAGE-WORKER: the arena span is given back only after the
+        # copies out of it completed -- the verify thread waits on this event
+        # (off the forward stream; the decode path never waits)
         event = torch.cuda.Event()
         event.record()
+    if worker:
+        with _VERIFYING_LOCK:
+            _VERIFYING[str(inst.spec.rid)] = _VERIFYING.get(str(inst.spec.rid), 0) + 1
     threading.Thread(target=_verify_and_log, args=(inst, verify, event), daemon=True,
                      name="weg2-tail-verify").start()
 
@@ -1639,6 +1959,7 @@ def _verify_and_log(inst: Install, verify: bool, event) -> None:
         dig = readback_digest(inst) if verify else "off"
     except Exception as exc:  # noqa: BLE001 -- an instrument, named
         dig = f"verify_raised:{type(exc).__name__}"
+    _release_verified(str(inst.spec.rid))
     rows = inst.spec.n_tokens - inst.spec.page_prefix if inst.end else inst.spec.rows
     _log_adopt(inst.spec, fa_rows=rows, fa_layers=len(inst.fa_dst), gdn_layers=len(inst.gdn_dst),
                digest=dig, ms=(time.perf_counter() - inst.t0) * 1000.0, issue_ms=inst.issue_ms, end=inst.end)
@@ -1655,3 +1976,20 @@ def _log_adopt(spec: th.TailSpec, fa_rows: int, fa_layers: int, gdn_layers: int,
         spec.rid, spec.page_prefix, rows, state_at, extend, fa_rows, fa_layers, gdn_layers,
         digest, ms, issue_ms,
     )
+
+
+def _release_verified(rid: str) -> None:
+    """TAIL-STAGE-WORKER: the rid's copies landed and its readback was read --
+    its arena spans go back (a second install of the same rid keeps them)."""
+    with _VERIFYING_LOCK:
+        n = _VERIFYING.get(rid, 0)
+        if n <= 0:
+            return
+        if n > 1:
+            _VERIFYING[rid] = n - 1
+            return
+        _VERIFYING.pop(rid, None)
+    w = _STAGE_WORKER[0]
+    if w is not None and w.arena is not None and rid not in _JOBS and rid not in _AGREED \
+            and rid not in SKIP_PLANS and rid != w.current:
+        w.arena.release(rid)

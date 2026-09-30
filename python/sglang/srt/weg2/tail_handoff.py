@@ -55,6 +55,7 @@ import itertools
 import logging
 import os
 import threading
+import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import msgspec
@@ -664,12 +665,31 @@ def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]
     return header
 
 
+#: TAIL-STAGE-WORKER (30.09.): the staging thread's own clock of this part
+#: reader -- read (torch.load) and digest ms, per thread, reset per rid
+_STAGE_CLOCK = threading.local()
+
+
+def stage_clock_reset() -> None:
+    _STAGE_CLOCK.read_ms = 0.0
+    _STAGE_CLOCK.digest_ms = 0.0
+
+
+def stage_clock() -> Tuple[float, float]:
+    return float(getattr(_STAGE_CLOCK, "read_ms", 0.0)), float(getattr(_STAGE_CLOCK, "digest_ms", 0.0))
+
+
+def _clock_add(name: str, t0: float) -> None:
+    setattr(_STAGE_CLOCK, name, getattr(_STAGE_CLOCK, name, 0.0) + (time.perf_counter() - t0) * 1000.0)
+
+
 def read_part(header: TailHeader, check_digest: bool = True) -> Tuple[Optional[dict], str]:
     """Load a part; with ``check_digest`` compare both sections against the
     publish digests. (bundle, '') or (None, reason) -- 'unreadable' or
     'digest_MISMATCH' (the reader then keeps the page-prefix resume: a wrong
     row is never applied)."""
     _j, ppath = part_paths(header.spec.rid, header.part)
+    t_read = time.perf_counter()
     try:
         if envs.SGLANG_OPT_WEG2_TAIL_READ_MMAP.get():
             # views of the part file's tmpfs pages: no anonymous copy of the
@@ -681,10 +701,15 @@ def read_part(header: TailHeader, check_digest: bool = True) -> Tuple[Optional[d
     except (OSError, RuntimeError, EOFError):
         logger.warning("WEG2-TAIL part unreadable: %s", ppath, exc_info=True)
         return None, "unreadable"
-    if check_digest and (
+    finally:
+        _clock_add("read_ms", t_read)
+    t_dig = time.perf_counter()
+    bad = check_digest and (
         digest(_fa_order(bundle["fa"])) != header.fa_digest
         or digest(_gdn_order(bundle["gdn"])) != header.gdn_digest
-    ):
+    )
+    _clock_add("digest_ms", t_dig)
+    if bad:
         logger.warning("WEG2-TAIL DIGEST MISMATCH rid=%s part=%s", header.spec.rid, header.part)
         return None, "digest_MISMATCH"
     return bundle, ""
@@ -696,11 +721,14 @@ def end_digest_refusal(header: TailHeader, bundle: dict) -> str:
     end, sec = header.end, bundle.get("end")
     if end is None or sec is None:
         return "end_missing"
-    if (
+    t_dig = time.perf_counter()
+    bad = (
         digest(_fa_order(sec["fa"])) != end.fa_digest
         or digest(_gdn_order(sec["gdn"])) != end.gdn_digest
         or digest(ring_order(sec["ring"], sec["rope"])) != end.ring_digest
-    ):
+    )
+    _clock_add("digest_ms", t_dig)
+    if bad:
         logger.warning("WEG2-TAIL END DIGEST MISMATCH rid=%s part=%s", header.spec.rid, header.part)
         return "end_digest_MISMATCH"
     return ""
