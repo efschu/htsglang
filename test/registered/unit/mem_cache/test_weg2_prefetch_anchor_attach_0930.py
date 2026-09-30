@@ -42,8 +42,10 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (  # no
     ComponentType,
 )
 
-_spec = importlib.util.spec_from_file_location(
-    "_t_compact_aa", os.path.join(os.path.dirname(__file__), "..", "weg2", "test_weg2_d_seat_compact_0930.py"))
+_BUILDER = os.path.join(os.path.dirname(__file__), "..", "weg2", "test_weg2_d_seat_compact_0930.py")
+if not os.path.exists(_BUILDER):  # 27B line: no D-seat compact test -- the same builder, standalone
+    _BUILDER = os.path.join(os.path.dirname(__file__), "_hybrid_tree_builder.py")
+_spec = importlib.util.spec_from_file_location("_t_compact_aa", _BUILDER)
 T = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(T)
 MC = ComponentType.MAMBA
