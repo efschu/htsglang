@@ -72,12 +72,26 @@ def main():
         "error": re.compile(r"Traceback|REFUSED:|CUDA error|out of memory|OutOfMemory|Weg2Stop|DualShareError|UnionShareError|STOP "),
         "mps": re.compile(r"MPS"),
         "duty": re.compile(r"duty throttle armed"),
+        # unified KV per card (dual1g)
+        "p_kv_join": re.compile(r"DUAL-TP3PP3 P-KV JOIN"),
+        "p_kv_grant": re.compile(r"DUAL-TP3PP3 P-KV PP0 GRANT"),
+        "p_kv_wait": re.compile(r"DUAL-TP3PP3 P-KV (PP0 )?WAIT"),
+        "p_kv_mapped": re.compile(r"DUAL-TP3PP3 P-KV MAPPED-BY-GRANT"),
+        "p_kv_release": re.compile(r"DUAL-TP3PP3 P-KV RELEASE"),
+        "d_kv_join": re.compile(r"DUAL-TP3PP3 D-KV JOIN"),
+        "d_kv_grow": re.compile(r"DUAL-TP3PP3 D-KV GROW"),
+        "d_kv_shrink": re.compile(r"DUAL-TP3PP3 D-KV SHRINK"),
+        "d_kv_wait": re.compile(r"DUAL-TP3PP3 D-KV GROUP-WAIT"),
+        "p_pause": re.compile(r"WEG2 DUAL P-PAUSE rid"),
+        "p_paused": re.compile(r"WEG2 DUAL P-PAUSED rid"),
+        "terminate": re.compile(r"terminate called"),
     }
     for k, p in fs.items():
         g = _grep(p, pats)
         print(f"\n== {k}: " + ", ".join(f"{n}={len(g.get(n + '#', []))}" for n in pats))
         for n in ("dual_launch", "front_dual", "p_stage", "p_bound", "union_owner", "union_peer", "d_ratios",
-                  "flip", "error", "duty"):
+                  "flip", "error", "duty", "p_kv_join", "p_kv_grant", "p_kv_wait", "p_kv_release", "d_kv_join",
+                  "d_kv_grow", "d_kv_shrink", "d_kv_wait", "p_pause", "p_paused", "terminate"):
             for line in g.get(n, [])[:3]:
                 print(f"   {n}: {line}")
     # overlap: PP0 prefill seconds vs TP0 decode seconds
