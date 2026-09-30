@@ -45,8 +45,6 @@ REASON_KV = "arrival-seat-kv"
 #: one KV displacement per this many seconds: longer than the front's KV
 #: reading cache (1 s), so the next verdict reads D after the park landed
 KV_PARK_COOLDOWN_S = 1.5
-#: AGE PLAN: the park reason D sees when the oldest waiter needs a SEAT
-REASON_AGE = "arrival-seat-age"
 #: AGE PLAN marker (one line per displacement and per plan verdict change)
 AGE_MARKER = "WEG2 SEAT-AGE-PLAN"
 
@@ -65,10 +63,10 @@ COUNTERS = (
     # rückt nach und verdrängt Jüngere"), and the KV need's two honest terms
     "arrival_seat_kv_displace", "arrival_seat_kv_displace_refused",
     "arrival_seat_kv_shared_tokens", "arrival_seat_kv_decode_clipped",
-    # AGE PLAN (30.09. ~14:45Z): displacements the plan took, heads it found
-    # blocked by OLDER running requests (-> backfill), the seat-need ones
-    "arrival_seat_age_displace", "arrival_seat_age_blocked_by_elders",
-    "arrival_seat_age_seat_displace",
+    # AGE PLAN (30.09. ~14:45Z): heads handed to D although they do not fit
+    # now (D's SEAT-AGE displaces younger ones for them), heads the plan found
+    # blocked by OLDER running requests (-> backfill)
+    "arrival_seat_age_to_d", "arrival_seat_age_blocked_by_elders",
 )
 
 
@@ -214,10 +212,10 @@ def kv_displace_victim(head_arrival: Optional[float], running: Iterable[str],
 
 
 def age_plan_enabled(env=None) -> bool:
-    """AGE PLAN switch -- acts only with the rule itself on."""
+    """AGE PLAN switch (default on) -- acts only with the rule itself on."""
     if env is not None:
         raw = str(env.get("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN", "") or "").strip().lower()
-        return raw in ("1", "true", "yes", "on") and enabled(env)
+        return raw not in ("0", "false", "no", "off") and enabled(env)
     from sglang.srt.environ import envs
 
     return bool(envs.SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN.get()) and enabled()
@@ -239,9 +237,10 @@ def displace_plan(head_arrival: Optional[float], seat_is_free: bool, deficit: in
     FEWEST running decodes, youngest arrival first, all younger than the head,
     whose parking gives it a seat (one, when none is free) and covers the KV
     ``deficit``. ``tokens_of`` is the front's lower bound of a decode's KV (the
-    prompt it priced); the caller parks the plan's FIRST rid per KV tick and
-    plans again on D's next reading, so an under-priced victim never takes a
-    second one with it. A rid without an arrival stamp counts as old."""
+    prompt it priced). The front only ADMITS by it (a non-empty plan hands the
+    head to D); the displacement itself is D's alone
+    (``d_park_runtime.displace_for_age`` / ``victims_needed`` on D's real KV).
+    A rid without an arrival stamp counts as old."""
     if head_arrival is None:
         return None
     need_seat = 0 if seat_is_free else 1

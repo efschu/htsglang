@@ -7730,19 +7730,21 @@ class Front:
             self.counters["arrival_seat_kv_displace_refused"] += 1
         return got
 
-    async def _arrival_seat_age_displace(self, head_rid: str, head_arrival: Optional[float],
-                                         seat_is_free: bool, deficit: int,
-                                         now: float) -> Tuple[Optional[List[str]], Optional[str]]:
-        """AGE PLAN (Nutzer 30.09. ~14:40Z/14:45Z): the oldest waiter does not
-        fit -> ``_asr.displace_plan`` over the running decodes that arrived
-        after it; ``(plan, parked)``. ``plan`` None: older running requests
-        block it (nobody is displaced, younger ones that fit are backfilled);
-        ``[]``: it fits. Otherwise the plan's FIRST (youngest) rid parks at
-        its round boundary (span retained) -- one per KV tick, D is read
-        again and the plan re-made, so no more are displaced than needed."""
+    def _arrival_seat_age_verdict(self, head_rid: str, head_arrival: Optional[float],
+                                  seat_is_free: bool, deficit: int) -> Optional[List[str]]:
+        """AGE PLAN (Nutzer 30.09. ~14:40Z/14:45Z), the FRONT's half: may the
+        oldest waiter go to D although it does not fit now? ``_asr.displace_plan``
+        over the running decodes that arrived after it, on the front's own
+        (lower-bound) prices. ``None``: older running requests block it -- it
+        stays here and younger ones that fit are backfilled. ``[]``: it fits.
+        A non-empty plan: displacing younger decodes can make it fit -- it is
+        handed to D, and D ALONE decides the displacement on its real KV and
+        seat cap (``d_park_runtime.displace_for_age``: SEAT-AGE seat trigger,
+        KV trigger with ``victims_needed`` -- only the youngest, only as many
+        as needed, only when that is enough). The front parks nothing here:
+        one displacement logic, on D."""
         st = self._asr_st()
-        D = self.groups["D"]
-        running = [r for r in self._flip_ledger(D) if r not in st["parked"] and r != head_rid]
+        running = [r for r in self._flip_ledger(self.groups["D"]) if r not in st["parked"] and r != head_rid]
         arrivals = {}
         for r in running:
             t = self._asr_arrival_of(r)
@@ -7756,32 +7758,13 @@ class Front:
             plans[head_rid] = key
             if plan is None:
                 self.counters["arrival_seat_age_blocked_by_elders"] += 1
-            logger.info("%s head=%s plan=%s seat_free=%s deficit=%d victims=%s -- %s", _asr.AGE_MARKER,
-                        head_rid, key, bool(seat_is_free), int(deficit), plan or [],
-                        "older running requests block it: nobody is displaced, younger ones that fit "
-                        "are backfilled" if plan is None else
-                        ("it fits: nobody is displaced" if not plan else
-                         "the fewest youngest that make it fit park, one per KV tick"))
-        if not plan:
-            return plan, None
-        if now - float(st.get("kv_park_t", 0.0)) < float(st.get("kv_park_cooldown", 0.0)):
-            return plan, None
-        victim = plan[0]
-        reason = _asr.REASON_KV if int(deficit) > 0 else _asr.REASON_AGE
-        got = await self._arrival_seat_park(D, victim, reason, now, "kv_park",
-                                            park_cooldown=_asr.KV_PARK_COOLDOWN_S)
-        if got is not None:
-            self.counters["arrival_seat_age_displace"] += 1
-            if not seat_is_free:
-                self.counters["arrival_seat_age_seat_displace"] += 1
-            st["kv"] = None  # the next plan reads D after the park
-            logger.warning("%s DISPLACE rid=%s head=%s seat_free=%s deficit=%d plan=%s -- the head does "
-                           "not fit otherwise; the youngest younger decode parks at its round boundary "
-                           "(span retained, L2)", _asr.AGE_MARKER, victim, head_rid, bool(seat_is_free),
-                           int(deficit), plan)
-        else:
-            self.counters["arrival_seat_kv_displace_refused"] += 1
-        return plan, got
+            logger.info("%s head=%s plan=%s seat_free=%s deficit=%d younger_victims_by_front_price=%s -- %s",
+                        _asr.AGE_MARKER, head_rid, key, bool(seat_is_free), int(deficit), plan or [],
+                        "older running requests block it: it waits here, younger ones that fit are "
+                        "backfilled" if plan is None else
+                        ("it fits" if not plan else
+                         "it goes to D; D's SEAT-AGE decides the displacement on its real KV"))
+        return plan
 
     def _asr_live_p_cands(self) -> List["Pending"]:
         """The queued requests that need P (the step's candidates)."""
@@ -7897,12 +7880,13 @@ class Front:
 
         It may act only when every OLDER waiter is blocked by its own elders
         (:meth:`_asr_older_blocked`). Acting: it fits (a seat and its KV) ->
-        granted (a backfill when an older one waits); it does not fit -> the
-        displacement plan (the fewest youngest younger decodes that make it
-        fit, else nobody). No time bound ends the backfill."""
+        granted (a backfill when an older one waits); it does not fit but
+        displacing younger decodes can make it fit -> granted too, and D's
+        SEAT-AGE decides that displacement (the front parks nothing); its
+        elders block it -> it waits, younger ones backfill. No time bound
+        ends the backfill."""
         st = self._asr_st()
         fits_of = st.setdefault("fits", {})
-        plans = st.setdefault("age_plan", {})
         fits_kv, why, deficit = await self._arrival_seat_kv(est_tokens, max_tokens, rid, uncached)
         terms = st.get("need_terms")
         fits = bool(free and fits_kv)
@@ -7916,26 +7900,26 @@ class Front:
         eligible = first or await self._asr_older_blocked(rid, t_mine, free)
         st["need_terms"] = terms
         arrival = self._asr_arrival_of(rid) or t_mine
-        if fits and eligible:
+        plan = None
+        if not fits:
+            plan = self._arrival_seat_age_verdict(rid, arrival, free, 0 if fits_kv else deficit)
+        to_d = bool(plan)   # does not fit, but D can make it fit by displacing younger ones
+        if eligible and (fits or to_d):
             st["granted"][rid] = time.time()
             self.counters["arrival_seat_d_prefill"] += 1
             self._asr_note_need_terms()
-            if not first:
+            if not first and fits:
                 self.counters["arrival_seat_backfill"] += 1
+            if to_d:
+                self.counters["arrival_seat_age_to_d"] += 1
             ms = self._asr_verdict_ms(rid, None)
             logger.info("%s rid=%s verdict=%s taken=%d n=%d %s%s waited_s=%.2f arrival_to_verdict_ms=%.0f "
                         "(D prefills it at its next round boundary)", _asr.MARKER, rid, _asr.D_PREFILL,
-                        taken, n, why, "" if first else "; backfill: every older waiter is blocked by "
-                        "its elders (AGE PLAN)", time.time() - t_mine, ms)
+                        taken, n, why,
+                        ("; AGE PLAN: to D, D's SEAT-AGE displaces younger ones for it" if to_d else
+                         "" if first else "; backfill: every older waiter is blocked by its elders (AGE PLAN)"),
+                        time.time() - t_mine, ms)
             return True
-        if not fits and eligible:
-            await self._arrival_seat_age_displace(rid, arrival, free, 0 if fits_kv else deficit, time.time())
-        elif not fits:
-            running = [r for r in self._flip_ledger(self.groups["D"]) if r not in st["parked"] and r != rid]
-            arrivals = {r: self._asr_arrival_of(r) for r in running if self._asr_arrival_of(r) is not None}
-            tokens = {s.rid: int(s.tokens) for s in (getattr(self, "_d_seats_live", ()) or ())}
-            plan = _asr.displace_plan(arrival, free, 0 if fits_kv else deficit, running, arrivals, tokens)
-            plans[rid] = "none" if plan is None else ("fits" if not plan else "displace")
         why_wait = "order" if fits else ("kv" if free else "seat")
         told = st.setdefault("age_told", {})
         if told.get(rid) != why_wait:
@@ -8067,16 +8051,22 @@ class Front:
             if (q is not first or older_waiter) and not await self._asr_older_blocked(q.rid, t_q, free):
                 break                                   # an older one keeps its right of way
             st["need_terms"] = terms
+            plan = (None if fits else self._arrival_seat_age_verdict(
+                q.rid, self._asr_arrival_of(q.rid) or t_q, free, 0 if fits_kv else deficit))
             _x_p = int(getattr(q, "x_routed", 0) or 0)
-            v = _asr.verdict(free, fits_kv, int(getattr(q, "est_uncached", 0) or 0),
+            # a plan = D can make it fit by displacing younger ones: admissible
+            v = _asr.verdict(True if plan else free, True if plan else fits_kv,
+                             int(getattr(q, "est_uncached", 0) or 0),
                              min(x_tok, _x_p) if _x_p > 0 else x_tok)
             if v == _asr.FLIP_NOW:
                 if st["flip_rid"] != q.rid:
                     st["flip_rid"] = q.rid
                     self.counters["arrival_seat_flip_now"] += 1
                     self._asr_note_need_terms()
-                    if q is not first:
+                    if q is not first and fits:
                         self.counters["arrival_seat_backfill"] += 1
+                    if plan:
+                        self.counters["arrival_seat_age_to_d"] += 1
                     ms = self._asr_verdict_ms(q.rid, getattr(q, "t_arrive", None), now)
                     logger.warning("%s rid=%s verdict=%s uncached=%d X=%d taken=%d n=%d %s%s "
                                    "arrival_to_verdict_ms=%.0f -- D pauses its decodes at the round "
@@ -8084,12 +8074,9 @@ class Front:
                                    int(getattr(q, "est_uncached", 0) or 0), x_tok, taken, n, why,
                                    "" if q is first else "; backfill past blocked elders (AGE PLAN)", ms)
                 return True, True, q
-            if fits:
-                break                                   # fits, not over X: waits as before
-            plan, _parked = await self._arrival_seat_age_displace(
-                q.rid, self._asr_arrival_of(q.rid) or t_q, free, 0 if fits_kv else deficit, now)
-            if plan is not None:
-                break                                   # being made to fit: younger ones wait
+            if fits or plan:
+                break                                   # admissible, not over X: waits as before
+            # plan None: its elders block it -> the next younger one may backfill
         why_wait = "kv" if free else "seat"
         if st["wait_rid"] != first.rid or st.get("wait_why") != why_wait:
             st["wait_rid"], st["wait_why"] = first.rid, why_wait

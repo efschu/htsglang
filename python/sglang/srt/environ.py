@@ -3684,9 +3684,13 @@ class Envs:
     # running ones is backfilled (no time limit); the oldest waiter displaces
     # younger running decodes ONLY when it does not fit otherwise -- the
     # fewest youngest that make it fit (seat and KV), and only when they do.
-    # Replaces the wait bound's blanket youngest park and the bound's end of
-    # backfill. Needs SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE; off = byte-identical.
-    SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN = EnvBool(False)
+    # ONE displacement logic, on D (d_park_runtime.displace_for_age, SEAT-AGE
+    # seat/KV trigger + victims_needed on D's real KV); the front only orders
+    # by age across the P and D waiters, admits a head D can make fit, and
+    # backfills past heads their elders block -- no front park, no wait-bound
+    # blanket park, no clock on the backfill. Needs
+    # SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE; 0 = the ARRIVAL-SEAT/#246 front.
+    SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN = EnvBool(True)
     # X-COST-LINE (29.09., third part of the ski-rental decision; NF z30w
     # 09290827 and 27B 09290020 both ran with `X NO-SOLVE: no r_d` because the
     # solo r_D probe never fired under load). X is re-solved from D's measured

@@ -24,7 +24,6 @@ The front before (ARRIVAL-SEAT + #246, 1f749bdad0):
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import time
 
@@ -39,23 +38,11 @@ from sglang.srt.weg2 import front as F  # noqa: E402
 
 def _on(monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "1")
-    monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN", "1")
+    monkeypatch.delenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN", raising=False)  # default on
 
 
 def _stamp(f, rid, t):
     f.__dict__.setdefault("_asr_arrive", {})[rid] = t
-
-
-def _freeing_rpc(f, kv, tokens):
-    """D parks the named decode; its KV comes back into D's free reading."""
-    async def rpc(g, path, body, timeout):
-        f.rpc_calls.append((path, dict(body)))
-        v = body.get("youngest")
-        if v:
-            kv["available"] = int(kv.get("available", 0)) + int(tokens.get(v, 0))
-            f.groups["D"].outstanding.pop(v, None)
-        return 200, json.dumps({"parked": [v] if v else [], "held": []})
-    f.rpc = rpc
 
 
 # ---------------------------------------------------------------- pure
@@ -81,6 +68,9 @@ def test_the_switch_needs_the_rule():
     assert asr.age_plan_enabled({"SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN": "1"}) is False
     assert asr.age_plan_enabled({"SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN": "1",
                                  "SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE": "1"}) is True
+    assert asr.age_plan_enabled({"SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE": "1"}) is True   # default on
+    assert asr.age_plan_enabled({"SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN": "0",
+                                 "SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE": "1"}) is False
 
 
 # ---------------------------------------------------------------- nicht pauschal
@@ -119,33 +109,33 @@ def test_a_head_that_fits_displaces_nobody_even_past_the_bound(monkeypatch):
     assert not f.rpc_calls, "the head fits: nobody is displaced"
 
 
-def test_an_older_head_takes_a_seat_from_the_youngest_at_once(monkeypatch):
+def test_an_older_head_goes_to_d_at_once_and_the_front_parks_nothing(monkeypatch):
     """Every seat held, the one running decode arrived AFTER the head, the
-    head's KV fits: the youngest parks now -- not after the 60 s bound."""
+    head's KV fits: the head is handed to D now (D's SEAT-AGE seat trigger
+    displaces the younger one) -- on the base it waited for the 60 s bound.
+    ONE displacement logic: the front sends no park."""
     _on(monkeypatch)
     now = time.time()
     kv = {"available": 400000, "evictable": 0, "decode_clip": 4096}
     f = _front(running=["young"], n=1, kv=kv, admit_t={"young": 1.0})
     _stamp(f, "young", now + 0.5)          # arrives after the head below
     F.Seat(f, "young", "short", tokens=3000)
-    _freeing_rpc(f, kv, {"young": 3000})
 
     async def run():
-        t = asyncio.ensure_future(f._acquire_short_seat("head", 2000, [], max_tokens=256))
         _stamp(f, "head", now)
-        await asyncio.sleep(0.3)
-        assert f.rpc_calls, "the older head displaced the younger at once"
-        assert f.rpc_calls[0][1]["youngest"] == "young"
-        assert f.rpc_calls[0][1]["reason"] == asr.REASON_AGE
-        assert len(f.rpc_calls) == 1
-        t.cancel()
+        seat = await asyncio.wait_for(f._acquire_short_seat("head", 2000, [], max_tokens=256), 1.0)
+        assert seat is not None and seat.rid == "head"
+        assert f.counters["arrival_seat_age_to_d"] == 1
+        assert not f.rpc_calls, "the front parks nothing: D decides the displacement"
 
     asyncio.run(run())
 
 
-def test_the_kv_displacement_parks_only_as_many_as_needed(monkeypatch):
-    """The control of minimality: two younger decodes, the youngest alone
-    covers the deficit -> exactly one park, then the head is granted."""
+def test_a_kv_head_d_can_make_fit_goes_to_d_without_a_front_park(monkeypatch):
+    """KV deficit 24096 (need 44096, free 20000), two younger decodes whose
+    priced KV can cover it: the head goes to D; how many leave is D's
+    ``victims_needed`` on its real KV -- the front parks none (before: the
+    front's #246 KV-DISPLACE parked one per tick beside D's own trigger)."""
     _on(monkeypatch)
     now = time.time()
     kv = {"available": 20000, "evictable": 0, "decode_clip": 4096}
@@ -154,17 +144,45 @@ def test_the_kv_displacement_parks_only_as_many_as_needed(monkeypatch):
     _stamp(f, "head", now - 10.0)
     _stamp(f, "y1", now - 5.0)
     _stamp(f, "y2", now - 4.0)
-    tok = {"old": 90000, "y1": 30000, "y2": 25000}
-    for r, t in tok.items():
+    for r, t in {"old": 90000, "y1": 30000, "y2": 25000}.items():
         F.Seat(f, r, "short", tokens=t)
-    _freeing_rpc(f, kv, tok)
 
     async def run():
-        seat = await asyncio.wait_for(f._acquire_short_seat("head", 40000, [], max_tokens=64000), 3.0)
+        seat = await asyncio.wait_for(f._acquire_short_seat("head", 40000, [], max_tokens=64000), 1.0)
         assert seat is not None and seat.rid == "head"
-        assert [b["youngest"] for _p, b in f.rpc_calls] == ["y2"]
+        assert not f.rpc_calls
 
     asyncio.run(run())
+
+
+def test_one_displacement_logic_the_front_park_paths_are_never_taken(monkeypatch):
+    """With the AGE PLAN the front's own park paths (#246 KV-DISPLACE, the
+    bound's YOUNGEST-PARK, any park RPC) are unreachable -- step and waiter."""
+    _on(monkeypatch)
+    now = time.time()
+    f = _front(running=["a", "b"], n=2, admit_t={"a": 1.0, "b": 2.0},
+               kv={"available": 1000, "evictable": 0, "decode_clip": 4096})
+    _stamp(f, "a", now - 1.0)
+    _stamp(f, "b", now - 0.5)
+
+    async def boom(*a, **k):
+        raise AssertionError("front park path taken")
+
+    f._arrival_seat_kv_displace = boom
+    f._arrival_seat_park_youngest = boom
+    f._arrival_seat_park = boom
+    f.t_awake = now - 200.0
+    f.queue = [_pending("big", 16448, now - 120.0, est_prompt=900000)]
+    _stamp(f, "big", now - 120.0)
+    asyncio.run(f._arrival_seat_step(f.groups["D"], now))
+
+    async def run():
+        t = asyncio.ensure_future(f._acquire_short_seat("w", 50000, [], max_tokens=64000))
+        await asyncio.sleep(0.2)
+        t.cancel()
+
+    asyncio.run(run())
+    assert not f.rpc_calls
 
 
 # ---------------------------------------------------------------- backfill has no time limit

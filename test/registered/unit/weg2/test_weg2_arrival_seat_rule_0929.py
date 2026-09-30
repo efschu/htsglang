@@ -116,6 +116,9 @@ def _front(running=(), n=6, bound=60.0, w_s=45.0, kv=None, admit_t=None):
 
 def _on(monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "1")
+    # 30.09.: these tests pin the ARRIVAL-SEAT/#246 FRONT displacement -- the
+    # AGE PLAN's off state (its own tests: test_weg2_arrival_seat_age_plan_0930)
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN", "0")
 
 
 def test_off_is_todays_path_seats_full_goes_to_p(monkeypatch):
