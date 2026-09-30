@@ -3590,11 +3590,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         child_key = key.child_key(self.page_size)
         matched_length = 0
+        # y5h: the read's rows/hashes of the node the walk is on (after a
+        # split at ``prefix_len`` that is exactly the node's span).
+        node_rows = node_hashes = None
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
             prefix_len = node.key.match(key, page_size=self.page_size)
 
+            node_rows = host_value[:prefix_len]
+            node_hashes = hash_value[: prefix_len // self.page_size]
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
@@ -3615,6 +3620,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 and node.component_data[BASE_COMPONENT_TYPE].host_value is not None
             ):
                 result.inserted_host_node = node
+            elif node is not self.root_node and node_rows is not None:
+                # y5h: the end node has no Full host copy; name the read's
+                # rows for its span so PREFETCH ANCHOR ATTACH can back it
+                # (weg2_adopt_read_rows_for_anchor) instead of hanging a
+                # Mamba host anchor on a node without one.
+                result.matched_end_host_kv = node_rows
+                result.matched_end_hashes = list(node_hashes)
             return result
 
         # #841: THE CONTIGUOUS-BACKUP LAW, enforced here because this is the
@@ -3866,6 +3878,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "pin covers a load-back or a running request; the caller "
                     "must select an unlocked node, never free under the pin."
                 )
+        if (
+            target == EvictLayer.HOST
+            and comp.component_type == BASE_COMPONENT_TYPE
+            and node.component_data[BASE_COMPONENT_TYPE].host_value is not None
+            and node.component_data[BASE_COMPONENT_TYPE].value is not None
+        ):
+            _evict_aux_host_before_full_host(self, node, tracker)
         device_freed, host_freed = comp.evict_component(node, target=target)
         if self._r12_rec is not None and EvictLayer.HOST in target and host_freed:
             self._r12_rec.append(node)  # R12: TP0's own host drop, sent to the workers
@@ -4463,6 +4482,79 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _r12.note_backup_ok(self, node)  # R12: supersedes an earlier "absent" (TP0 only)
         return len(host_indices)
 
+    def weg2_adopt_read_rows_for_anchor(self, node: UnifiedTreeNode, insert_result) -> Optional[str]:
+        """y5h PREFETCH ANCHOR ATTACH, the legal form (NF rc12z30y5h 30.09.,
+        D TP1/TP2 20:30:30Z: "node 540 mamba host present but
+        Full.host_value=None").
+
+        ATTACH fires exactly when the store read's span was already in the
+        tree and its end node carried NO Full host copy (otherwise the host
+        insert names that node as ``inserted_host_node``), so hanging the
+        read's Mamba anchor there as ``host_value`` broke the tree law "aux
+        host requires Full host" every single time -- the next PUBLISH-SWEEP
+        backup healed it, a refused one (``unbacked=1 refused=1``) left it for
+        the idle sanity check. The same read delivered the node's KV rows
+        (``matched_end_host_kv``; until now released as "already in the
+        tree"): the node adopts them as its Full host copy -- the state a new
+        host node of the same read would have -- and only then takes the
+        anchor. Returns None when adopted, else why not (the caller drops and
+        releases the anchor).
+
+        Laws kept: the rows are exactly the node's span; #841 (a host copy
+        under a parent without one only under ``write_back``, as in
+        ``_insert_helper_host``); no write-through in flight on the node. The
+        pages came out of the store, so the node is ``l3_present`` (no
+        publish re-writes them)."""
+        if node is None or node is self.root_node:
+            return "no_node"
+        full = node.component_data[BASE_COMPONENT_TYPE]
+        if full.host_value is not None:
+            return None
+        if full.value is None:
+            return "full_dead"
+        rows = getattr(insert_result, "matched_end_host_kv", None)
+        if rows is None or node.key is None or int(rows.numel()) != len(node.key):
+            return "no_read_rows"
+        if node.write_through_pending_id is not None:
+            return "write_in_flight"
+        write_back_policy = (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+        )
+        parent = node.parent
+        if (
+            not write_back_policy
+            and parent is not None
+            and parent is not self.root_node
+            and not parent.backuped
+        ):
+            return "parent_unbacked"
+        full.host_value = rows.clone()
+        hashes = getattr(insert_result, "matched_end_hashes", None)
+        page = max(1, int(self.page_size))
+        if hashes and len(hashes) == len(node.key) // page and (
+            not node.hash_value or len(node.hash_value) != len(hashes)
+        ):
+            node.hash_value = list(hashes)
+        node.l3_present = True
+        self._update_evictable_leaf_sets(node)
+        if parent is not None:
+            self._update_evictable_leaf_sets(parent)
+        insert_result.anchor_adopted_tokens = len(node.key)
+        return None
+
+    def _prefetch_head_free_to(self, insert_result, min_completed_tokens=None) -> int:
+        """End of the fetched span the prefetch completion releases (#841):
+        the whole span of a declined insert, else the matched head
+        (``prefix_len``, the tree already had it) minus the tail the tree
+        adopted for an anchor (y5h, ``weg2_adopt_read_rows_for_anchor``)."""
+        if insert_result.host_span_unclaimed:
+            if min_completed_tokens is None:
+                min_completed_tokens = insert_result.total_len
+            return int(min_completed_tokens)
+        adopted = int(getattr(insert_result, "anchor_adopted_tokens", 0) or 0)
+        return max(0, int(insert_result.prefix_len) - adopted)
+
     def _track_write_through_node(
         self,
         node: UnifiedTreeNode,
@@ -4835,6 +4927,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue   # pending write: the slots are not COMPLETE yet
             if any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data):
                 continue   # a load-back reads these rows
+            if any(
+                node.component_data[c.component_type].host_value is not None
+                and node.component_data[c.component_type].value is None
+                for c in _aux_components(self)
+            ):
+                continue   # y5h/park_l3: an aux state lives on the host only -- the node keeps its host life
             if int(hv.min()) < int(getattr(pool, "staging_rows", 0)):
                 continue   # staging rows are not arena slots
             cands.append(node)
@@ -5615,7 +5713,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if node.component_data[BASE_COMPONENT_TYPE].value is None or getattr(node, "evicted", False):
                 return
             freed = 0
-            for comp in self._components_tuple:
+            # y5h: aux host states first, the Full host copy last (never an
+            # aux host state without Full host, not even between two calls)
+            for comp in sorted(self._components_tuple,
+                               key=lambda c: c.component_type == BASE_COMPONENT_TYPE):
                 _, hf = self._evict_component_and_detach_lru(
                     node, comp, target=EvictLayer.HOST, tracker=None
                 )
@@ -7925,11 +8026,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # and when the contiguous-backup law declined the insert the fetched
         # TAIL was not adopted either. Both are this rank's to release: no
         # tree node references them, so nothing else ever will.
-        unclaimed_to = (
-            min_completed_tokens
-            if insert_result.host_span_unclaimed
-            else insert_result.prefix_len
-        )
+        # y5h: a matched-head tail the tree adopted as an anchor node's host
+        # copy (PREFETCH ANCHOR ATTACH) is the tree's now -- not released.
+        unclaimed_to = self._prefetch_head_free_to(insert_result, min_completed_tokens)
         # DIAGNOSTIC ONLY (#905 window): the decisive datum. If the pool object
         # or its clear-epoch moved between registration and here, the span being
         # freed was minted under a bookkeeping state that no longer exists, and
@@ -11357,3 +11456,47 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             for child in node.children.values():
                 stack.append((child, indent + 2))
+
+
+def _aux_components(tree) -> tuple:
+    """The tree's non-Full components (tolerant of trees built by hand)."""
+    comps = getattr(tree, "_components_tuple", None)
+    if comps is None:
+        comps = tuple((getattr(tree, "components", None) or {}).values())
+    return tuple(c for c in comps if c.component_type != BASE_COMPONENT_TYPE)
+
+
+def _evict_aux_host_before_full_host(tree, node, tracker) -> int:
+    """y5h, the net under every "Full host copy leaves, the node stays on the
+    device" path (W3 spill, PUBLISH-CHAIN host release, park_l3, the Form A
+    shadow reconcile, and whatever comes next): the tree law is "aux host
+    requires Full host" (``sanity_check``), so an aux component's host state
+    goes FIRST, through the same funnel (slot back to its pool, host LRU
+    detached). park_l3 already did this by hand; the others relied on their
+    caller. Returns the number of aux host states released here."""
+    n = 0
+    for comp in _aux_components(tree):
+        ct = comp.component_type
+        cd = node.component_data[ct]
+        if cd.host_value is None:
+            continue
+        if int(getattr(cd, "host_lock_ref", 0) or 0) > 0:
+            logger.warning(
+                "WEG2 AUX-HOST-WITH-FULL node=%s ct=%s host_lock_ref=%d: the Full host copy "
+                "leaves while a load reads this aux host state (caller bug, state kept)",
+                getattr(node, "id", "?"), getattr(ct, "name", ct), int(cd.host_lock_ref),
+            )
+            continue
+        tree._evict_component_and_detach_lru(node, comp, target=EvictLayer.HOST, tracker=tracker)
+        n += 1
+    if n:
+        k = getattr(UnifiedRadixCache, "_aux_host_with_full_n", 0) + 1
+        UnifiedRadixCache._aux_host_with_full_n = k
+        if k <= 16 or k % 256 == 0:
+            logger.info(
+                "WEG2 AUX-HOST-WITH-FULL n=%d node=%s released=%d (the node's Full host copy "
+                "leaves; its aux host states leave first -- never an aux host state without "
+                "Full host)",
+                k, getattr(node, "id", "?"), n,
+            )
+    return n

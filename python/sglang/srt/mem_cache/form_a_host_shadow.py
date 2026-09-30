@@ -663,7 +663,11 @@ def _reconcile(tree: Any, node: Any, exists: int, kv: int, m: int) -> str:
             return "pending"
     if has_kv and not want_kv:
         if not node.evicted:
-            for comp in tree._components_tuple:
+            # y5h: aux host first, the KV host rows last; an anchor TP0 kept
+            # without its KV host copy cannot stay either (aux host requires
+            # Full host) -- the funnel's net drops it with the KV rows
+            for comp in sorted(tree._components_tuple,
+                               key=lambda c: c.component_type == _base_ct()):
                 if want_m and comp.component_type == _anchor_ct():
                     # #248: TP0 gave only the KV rows back after a load-back
                     # (weg2.park_l3.release_loaded_host); the anchor stays

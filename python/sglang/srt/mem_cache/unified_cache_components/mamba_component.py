@@ -1999,14 +1999,39 @@ class MambaComponent(TreeComponent):
         if cd.value is not None or cd.host_value is not None:
             return None
         cls = type(self)
+        _depth = getattr(self.cache, "weg2_node_depth", lambda _n: None)(node)
+        # y5h (NF rc12z30y5h 30.09., D TP1/TP2 20:30:30Z "node 540 mamba host
+        # present but Full.host_value=None"): this branch is reached exactly
+        # when the end node has NO Full host copy (a node with one is
+        # ``inserted_host_node`` already), so the bare attach below broke the
+        # tree law "aux host requires Full host" every time. The node first
+        # adopts the read's own KV rows for its span as its Full host copy;
+        # where it cannot, the anchor is dropped -- the caller releases the
+        # slot to the pool (append_host_mem_release), nothing is hung.
+        why = None
+        _adopt = getattr(self.cache, "weg2_adopt_read_rows_for_anchor", None)
+        if node.component_data[ComponentType.FULL].host_value is None:
+            why = _adopt(node, insert_result) if callable(_adopt) else "full_unbacked"
+        if why is not None:
+            cls._anchor_attach_drop_n = getattr(cls, "_anchor_attach_drop_n", 0) + 1
+            k = cls._anchor_attach_drop_n
+            if k <= 16 or k % 256 == 0:
+                logger.info(
+                    "WEG2 PREFETCH-ANCHOR-ATTACH dropped n=%d node=%s depth=%s why=%s (the end "
+                    "node has no Full host copy and cannot take the read's rows; the anchor "
+                    "is released to the pool, never hung without Full host)",
+                    k, getattr(node, "id", "?"), _depth, why,
+                )
+            return None
         cls._anchor_attach_n = getattr(cls, "_anchor_attach_n", 0) + 1
         n = cls._anchor_attach_n
         if n <= 16 or n % 256 == 0:
             logger.info(
-                "WEG2 PREFETCH-ANCHOR-ATTACH n=%d node=%s depth=%s (the read's span was "
-                "already in the tree without a state; its anchor stays at the node, not released)",
-                n, getattr(node, "id", "?"),
-                getattr(self.cache, "weg2_node_depth", lambda _n: None)(node),
+                "WEG2 PREFETCH-ANCHOR-ATTACH n=%d node=%s depth=%s adopted_kv=%d (the read's span was "
+                "already in the tree without a state; its anchor stays at the node, not released; "
+                "the node's Full host copy = the read's rows for its span)",
+                n, getattr(node, "id", "?"), _depth,
+                int(getattr(insert_result, "anchor_adopted_tokens", 0) or 0),
             )
         return node
 
