@@ -160,3 +160,45 @@ def kv_resume_time_line(resume_ms: float, need_bytes, free_before, free_after,
         KV_TIME_MARK, float(resume_ms), need >> 20, mapped,
         "-" if stage is None else "S%d" % int(stage),
         "-" if tokens is None else int(tokens), epoch)
+
+
+#: seconds a kv_cache resume waits for the card to fund it before W114
+KV_FIT_WAIT_ENV = "SGLANG_WEG2_KV_RESUME_FIT_WAIT_S"
+KV_FIT_WAIT_DEFAULT_S = 20.0
+KV_FIT_POLL_S = 0.05
+
+
+def kv_fit_wait_s(env=None) -> float:
+    import os
+
+    e = os.environ if env is None else env
+    try:
+        return max(0.0, float(e.get(KV_FIT_WAIT_ENV, KV_FIT_WAIT_DEFAULT_S)))
+    except (TypeError, ValueError):
+        return KV_FIT_WAIT_DEFAULT_S
+
+
+def wait_for_kv_fit(read_free, need_bytes, floor_bytes: int = 0, wait_s: float = KV_FIT_WAIT_DEFAULT_S,
+                    poll_s: float = KV_FIT_POLL_S, sleep=None, now=None):
+    """Metal z30y7 (27b-row-authority, 17:26:55, PP0 on the 5090): the waker's
+    kv call runs the moment its weights leg returns, CONCURRENT with the
+    sleeper's own leg; D TP0 released its last two tags ('weights_draft',
+    'weights', 1824 MiB) about 0.3 s after P's fit check read the card:
+    "card_other_procs +1916 MiB" -> W114 short by 163 MiB, and P stayed DORMANT.
+    Every one of the 15 D->P wakes before read other=2528-2564 MiB (no leak;
+    the sleeper was simply slower this time: deposits 527/425/293/299 ms).
+
+    Wait, bounded, until the card funds the resume. Returns (refusal-or-None,
+    last free bytes, waited seconds). An unknown reading waits for nothing."""
+    import time as _t
+
+    sleep = _t.sleep if sleep is None else sleep
+    now = _t.monotonic if now is None else now
+    free = read_free()
+    unfit = kv_resume_fit_refusal(free, need_bytes, floor_bytes)
+    t0 = now()
+    while unfit is not None and free is not None and now() - t0 < float(wait_s):
+        sleep(float(poll_s))
+        free = read_free()
+        unfit = kv_resume_fit_refusal(free, need_bytes, floor_bytes)
+    return unfit, free, now() - t0

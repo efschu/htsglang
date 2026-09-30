@@ -9745,6 +9745,18 @@ class SchedulerWeightUpdaterManager:
                 logger.info("WEG2-WAKE-KV-FIT skipped (%s: %s)", type(_exc).__name__, _exc)
                 _kv_floor = 0
             _unfit = kv_resume_fit_refusal(_kv_free, _kv_need, _kv_floor)
+            if _unfit is not None and _kv_free is not None:
+                # z30y7: the sleeper's leg runs concurrently and may still be
+                # releasing -- wait for the card (bounded), then decide
+                from sglang.srt.weg2.wake_kv import kv_fit_wait_s, wait_for_kv_fit
+
+                _unfit_first = _unfit
+                _unfit, _kv_free, _waited = wait_for_kv_fit(
+                    self._weg2_free_bytes, _kv_need, _kv_floor, wait_s=kv_fit_wait_s())
+                logger.warning(
+                    "WEG2-WAKE-KV-FIT-WAIT epoch=%s first: %s -> after %.2f s: %s",
+                    _kv_epoch, _unfit_first, _waited,
+                    "fits (free=%d MiB), resuming" % (int(_kv_free or 0) >> 20) if _unfit is None else _unfit)
             # xsn410 (20.09.): THE GROUP VERDICT SITS HERE, BETWEEN THE RESUME AND
             # THE CLEAR HALF. Placed after the clear half (xsn409's fix), it
             # deadlocked: the two resumed ranks ran the clear half's collective
@@ -9936,6 +9948,7 @@ class SchedulerWeightUpdaterManager:
             return True
 
         _weg2_kv_done = False
+        _weg2_kv_refusal = ""
         from sglang.srt.weg2.wake_kv import wake_kv_plan as _wk_plan
         _kv_epoch = getattr(recv_req, "epoch", None)
         _kv_in = GPU_MEMORY_TYPE_KV_CACHE in tags
@@ -10766,6 +10779,18 @@ class SchedulerWeightUpdaterManager:
             if _weg2_kv_ok:
                 self._weg2_kv_epoch_done = _kv_epoch
                 self._weg2_kv_deferred = False
+            elif GPU_MEMORY_TYPE_KV_CACHE in tags:
+                # z30y7: the front's kv call used to get 200 here -- "WEG2-FLIP done
+                # woke=P" while P stayed DORMANT; the next request waited in the
+                # dormant hold forever (outstanding P=1, no line). A kv call whose
+                # resume was refused FAILS, named, through the same group fence the
+                # store verdict rides (every rank; the front sees non-200 -> W4).
+                from sglang.srt.weg2.wake_kv import kv_fit_wait_s as _kvw
+
+                _weg2_kv_refusal = (
+                    "W114 Weg2KvResumeRefused epoch=%s: the kv_cache resume was refused "
+                    "after the bounded fit wait (%.0f s) -- this group stays DORMANT; the "
+                    "wake is not done" % (_kv_epoch, _kvw()))
 
         report: Dict[str, Any] = {}
         # #1295 MUST_FIX 2: THE STORE VERDICT RIDES THE FENCE THAT IS ALREADY
@@ -10779,6 +10804,8 @@ class SchedulerWeightUpdaterManager:
         # inherit it.
         store_failure = self.weg2_store_rescan_failure
         self.weg2_store_rescan_failure = ""
+        if _weg2_kv_refusal:
+            store_failure = (store_failure + "; " if store_failure else "") + _weg2_kv_refusal
         if weg2_memory_saver_on:
             report = self._weg2_group_fence(
                 "resume tags=%s" % (list(tags),),
