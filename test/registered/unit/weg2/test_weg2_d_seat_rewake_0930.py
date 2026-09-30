@@ -469,5 +469,6 @@ def test_a_slot_above_every_smaller_limit_is_named_held(caplog):
     _idle_run(s, ctl, R.IDLE_ASK_ROUNDS * 3, [1000.0])
     held = [m for m in caplog.messages if "SHRINK HELD" in m]
     assert ctl.calls == [] and len(held) == 1 and "slots_held" in held[0]
-    # KEIL: every ask still enters the group MIN, voting no for n=1..3
-    assert len(calls) == 3 and all(c[1:] == [False, False, False] for c in calls)
+    # KEIL: every ask still enters the group MIN, voting no for n=1..3 (idle:
+    # then the COMPACT "without a move" flags)
+    assert len(calls) == 3 and all(c[1:4] == [False, False, False] for c in calls)

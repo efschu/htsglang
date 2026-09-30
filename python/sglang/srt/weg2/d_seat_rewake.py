@@ -78,10 +78,13 @@ class RewakeState:
     trigger: Optional[str] = None
     #: the last HELD key (epoch, reason) -- one line per change
     held: Optional[tuple] = None
+    #: a COMPACT survey that reached nothing: (ledger key, why) -- not walked again until it changes
+    compact_memo: Optional[tuple] = None
     counters: Dict[str, int] = field(default_factory=lambda: {"grow": 0, "shrink": 0,
                                                               "grow_refused": 0, "shrink_refused": 0,
                                                               "shrink_asked": 0, "shrink_idle": 0,
-                                                              "shrink_held": 0})
+                                                              "shrink_held": 0, "compact": 0,
+                                                              "compact_moved": 0, "compact_evicted": 0})
 
 
 def price_ms(rs: RewakeState, wake_apply_ms: Optional[float]) -> Optional[float]:
@@ -252,6 +255,64 @@ def _reseat(sched: Any, st: Any, n_new: int, grow: bool) -> Optional[float]:
     return ms
 
 
+def _compact_survey(sched: Any, rs: "RewakeState", st: Any, allocator: Any, size: int, cap: int,
+                    down: int, n: int, fit: int):
+    """This rank's COMPACT survey: (survey, tree view, None) or (None, None,
+    why). A survey that reached nothing is remembered against the ledger and
+    the in-flight copies, so a held idle D does not walk the tree at every
+    question. Never raises -- its answer is a vote."""
+    from sglang.srt.weg2 import d_seat_compact as C
+    from sglang.srt.weg2 import d_seat_vram as V
+
+    cache = getattr(sched, "tree_cache", None)
+    try:
+        used = C.used_ids(allocator.slot_used)
+        key = (st.epoch, n, down, tuple(used),
+               len(getattr(cache, "ongoing_write_through", None) or ()),
+               len(getattr(cache, "ongoing_load_back", None) or ()))
+        if rs.compact_memo is not None and rs.compact_memo[0] == key:
+            return None, None, rs.compact_memo[1]
+        sv, view = C.survey(cache, allocator, size, cap, down, n, fit, V.phase_slot_limit)
+    except Exception as exc:  # noqa: BLE001 -- a survey that cannot read the tree moves nothing
+        return None, None, "compact_survey_failed (%s: %s)" % (type(exc).__name__, exc)
+    if not any(sv.reach(m) for m in range(down, n)):
+        why = "slots_held (tree states above every limit below n=%d; compaction: %s)" % (
+            n, sv.why.get(down, "-"))
+        rs.compact_memo = (key, why)
+        return None, None, why
+    rs.compact_memo = None
+    return sv, view, None
+
+
+def _compact_run(sched: Any, rs: "RewakeState", sv: Any, view: Any, allocator: Any, n: int, target: int,
+                 fit: int) -> bool:
+    """This rank's part of the agreed COMPACT (nothing when its own states
+    already fit ``target``). True on success; the marker names the moved
+    states, their bytes and the time."""
+    from sglang.srt.weg2 import d_seat_compact as C
+
+    if target >= fit:
+        return True
+    plan = None if sv is None else sv.plans.get(target)
+    if plan is None:
+        logger.warning("%s COMPACT REFUSED n=%d->%d: no plan on this rank (%s)", MARKER, n, target,
+                       "-" if sv is None else sv.why.get(target, "-"))
+        return False
+    try:
+        res = C.execute(getattr(sched, "tree_cache", None), allocator, view, plan)
+    except Exception as exc:  # noqa: BLE001 -- named; the group MIN keeps n on every rank
+        logger.warning("%s COMPACT REFUSED n=%d->%d: %s: %s", MARKER, n, target, type(exc).__name__, exc)
+        return False
+    rs.counters["compact"] += 1
+    rs.counters["compact_moved"] += res.moved
+    rs.counters["compact_evicted"] += res.evicted
+    logger.warning("%s COMPACT moved=%d bytes=%d ms=%.1f evicted=%d n=%d->%d limit=%d (the tree's GDN "
+                   "states above the limit moved down by device copy, slot refs re-pointed; evicted = "
+                   "states whose L2 copy had landed and found no free slot)",
+                   MARKER, res.moved, res.bytes, res.ms, res.evicted, n, target, plan.limit)
+    return True
+
+
 def parts_text(ctl: Any, pause_ms: float) -> str:
     """The pause in parts: rows OFF (copies), cells released, cells mapped,
     device syncs, and the rest (the group MIN, the slot limit) -- per rank."""
@@ -364,34 +425,64 @@ def tick(sched: Any) -> Optional[str]:
     # could also have split n); a local reason is named AFTER the collective.
     pool = V._req_pool(sched)
     allocator = getattr(pool, "mamba_allocator", None)
-    fit, local_why = down, None
+    fit, local_why, ledger_ok, top = down, None, True, 0
     try:
         ledger = None if allocator is None else getattr(allocator, "slot_used", None)
         if ledger is not None:
             size = int(getattr(allocator, "size", 0) or 0)
             top = highest_used_slot(ledger)
             fit = seats_covering(size, cap, top, down)
-            if fit >= n:
-                local_why = ("slots_held (highest slot in use %d > limit of n=%d; the tree keeps "
-                             "GDN states there)" % (top, n - 1))
     except Exception as exc:  # noqa: BLE001 -- unreadable ledger: this rank votes no
-        fit, local_why = n, "slot_ledger_unreadable (%s: %s)" % (type(exc).__name__, exc)
+        fit, ledger_ok = n, False
+        local_why = "slot_ledger_unreadable (%s: %s)" % (type(exc).__name__, exc)
+    seats = list(range(down, n))
+    # COMPACT (NF-Operator 30.09., Produktentscheid): an EMPTY D moves the
+    # tree's GDN states above a smaller limit DOWN by device copy (eviction
+    # only of a state whose L2 copy landed, never an un-backed one). Surveyed
+    # here for every n' in down..n-1; its answers are VOTES in the one
+    # collective below, never an early return (KEIL).
+    idle = trigger == TRIGGER_IDLE
+    sv = view = None
+    if idle and ledger_ok and fit > down:
+        sv, view, cwhy = _compact_survey(sched, rs, st, allocator, size, cap, down, n, fit)
+        if cwhy is not None:
+            local_why = cwhy
+    reach = [(m >= fit and ledger_ok) or (sv is not None and sv.plans.get(m) is not None) for m in seats]
+    if ledger_ok and local_why is None and not any(reach):
+        local_why = ("slots_held (highest slot in use %d > limit of n=%d; the tree keeps "
+                     "GDN states there)" % (top, n - 1))
+        if sv is not None:
+            local_why += "; compaction: %s" % sv.why.get(down, "-")
     price = price_ms(rs, getattr(st, "apply_ms", None))
     idle_s = now - rs.idle_since
     rs.counters["shrink_asked"] += 1
-    seats = list(range(down, n))
-    mins = _group_min(sched, [shrink_due(idle_s, price)] + [m >= fit for m in seats])
-    if local_why is not None:
+    # the vote: due, per n' "I reach it", and (idle) per n' "without a move"
+    flags = [shrink_due(idle_s, price)] + reach
+    if idle:
+        flags += [m >= fit and ledger_ok for m in seats]
+    mins = _group_min(sched, flags)
+    if local_why is not None and (not any(reach) or local_why.startswith("compact_survey_failed")):
         _note_held(sched, rs, st, local_why, n, down)
     if not bool(mins[0]):
         return None
-    agreed = [m for m, ok in zip(seats, mins[1:]) if ok]
+    k = len(seats)
+    agreed = [(i, m) for i, (m, ok) in enumerate(zip(seats, mins[1:1 + k])) if ok]
     if not agreed:
-        if local_why is None:
+        if any(reach):
             _note_held(sched, rs, st, "group_slots_held (another rank's slots do not fit a limit below "
                        "n=%d; group MIN)" % n, n, down)
         return None
-    down = agreed[0]
+    i, target = agreed[0]
+    if idle and not bool(mins[1 + k + i]):
+        # some rank moves states for this target: every rank enters the
+        # second MIN (the agreed flag is replicated), a rank that could not
+        # move votes no and n stays everywhere
+        ok = _compact_run(sched, rs, sv, view, allocator, n, target, fit)
+        if not bool(_group_min(sched, [ok])[0]):
+            _note_held(sched, rs, st, "compact_refused (a rank could not move its states; n stays)", n, target)
+            rs.idle_since, rs.idle_rounds = now, 0
+            return None
+    down = target
     rows0 = getattr(V.controller(sched), "rows_on", None)
     ms = _reseat(sched, st, down, grow=False)
     if ms is None:
