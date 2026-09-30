@@ -653,6 +653,16 @@ class Envs:
     # kept in part, since the staging still starts before the first pass.
     # Off = the leg-start site of TAIL-STAGE-EARLY, unchanged.
     SGLANG_WEG2_TAIL_STAGE_AFTER_LEGS = EnvBool(False)
+    # TAIL-STAGE-WORKER (30.09., NF y4x/y4w P->D, weg2/tail_adopt): the E2 tail
+    # staging runs on ONE long-lived worker thread per rank (a queue, not a
+    # thread per rid) and copies into ONE host arena pinned once (sized from
+    # the form: D's seat cap x the held tail of one rid), never pin_memory()
+    # per tensor. Measured: staged at the legs' start (y4w, 6 seats) the
+    # per-rid threads slowed the D collectors (TP0 issue_ms 452 vs 247 in y4l,
+    # P credit waits 1069 vs 457); staged behind the legs (y4x, TSAL) they
+    # slowed the expert rearm (TP0 375 vs 90 ms) and TAIL-READY came back
+    # (338 ms). Off = one thread and pin_memory() per rid, unchanged.
+    SGLANG_WEG2_TAIL_STAGE_WORKER = EnvBool(False)
     # WAKE_READ_ARENA_GATE (#248f, 30.09., NF y4b ep18): the #248 hold reads of
     # a wake are issued in hold (arrival) order only while their pages fit in
     # the KV arena together (its slot count -- no reserve); a younger read
