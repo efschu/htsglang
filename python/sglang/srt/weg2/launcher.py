@@ -13613,6 +13613,17 @@ def resolve_dual_layout(ns) -> None:
 DUAL_P_BARLINK_BAR1_WINDOW_MIB = "16,PP_0=64"
 
 
+def dual_kv_ledger_paths(ns, cards) -> List[str]:
+    """DUAL-TP3PP3 unified KV: the card KV ledgers (weg2/card_kv_ledger.py) of
+    this boot, one per card; the ranks derive the same path from the tag and
+    their card uuid. Empty unless --dual-share."""
+    if not getattr(ns, "dual_share", False):
+        return []
+    from sglang.srt.weg2.card_kv_ledger import ledger_path
+
+    return [ledger_path(str(ns.tag), str(getattr(c, "uuid", ""))) for c in cards if getattr(c, "uuid", "")]
+
+
 #: DUAL-TP3PP3 --dual-share: written by the launcher once D is READY; the P
 #: stage waits for it before loading (model_executor/dual_stage_hull.py).
 DUAL_D_READY_FILE = "d_ready"
@@ -25907,7 +25918,9 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     ] + (["--weights-resident"] if getattr(ns, "flip_weights", "family") == "resident" else []) + (
         ["--dual-layout"] if getattr(ns, "dual_layout", False) else []) + (
         ["--dual-dbusy-file", dual_duty_env(ns)["SGLANG_WEG2_DUAL_DBUSY_FILE"]]
-        if dual_duty_env(ns) else []) + [
+        if dual_duty_env(ns) else []) + (
+        ["--dual-kv-ledgers", ",".join(dual_kv_ledger_paths(ns, cards))]
+        if dual_kv_ledger_paths(ns, cards) else []) + [
         "--carrier-max-tokens", str(carrier_max_tokens),
         "--p-concurrency", str(p_bs),
         "--d-bs", str(d_bs),

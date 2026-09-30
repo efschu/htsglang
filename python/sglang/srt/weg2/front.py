@@ -3180,6 +3180,9 @@ class Pending:
     posted_evt: Optional[asyncio.Event] = None
     #: C12: how often D refused this rid with W31.  A second one is W35.
     x_requeues: int = 0
+    #: DUAL-TP3PP3 unified KV: the front paused this leg 1 (D short of KV)
+    dual_pause: bool = False
+    dual_paused_n: int = 0
     #: H102: the client closed its connection before its answer; nothing is
     #: dispatched for it any more (no leg 1, no hand-off to D).
     client_gone: bool = False
@@ -3682,6 +3685,18 @@ def _env_switch_on(name: str) -> bool:
 #: DUAL-TP3PP3: why every flip is refused under --dual-layout.
 DUAL_NO_FLIP_WHY = ("--dual-layout: both groups stay awake and the front never flips "
                     "(P prefills while D decodes; no group holds a released region to wake)")
+
+
+def _dual_p_pressure(paths) -> int:
+    """DUAL-TP3PP3 unified KV: the largest pressure a card ledger puts on P."""
+    from sglang.srt.weg2.card_kv_ledger import p_pressure
+
+    try:
+        return int(p_pressure(paths))
+    except Exception as exc:  # noqa: BLE001 -- a ledger read never stops the pump
+        logger.warning("WEG2 DUAL card KV ledger read failed: %r", exc)
+        return 0
+
 
 class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
@@ -4195,6 +4210,12 @@ class Front:
         self.dual_layout = bool(dual_layout)
         self._dual_task: Optional[asyncio.Task] = None
         self._dual_backoff_until = 0.0
+        #: DUAL-TP3PP3 unified KV (user order 30.09. 07:25Z): the card KV
+        #: ledgers (weg2/card_kv_ledger.py). Set by main from --dual-kv-ledgers;
+        #: empty = no pause logic (byte-identical dual pump).
+        self.dual_kv_ledgers: List[str] = []
+        #: rids whose leg 1 is in flight on P under the dual pump
+        self._dual_inflight: Dict[str, "Pending"] = {}
         #: the D phase (epoch) whose immediate park was held by the dwell
         #: already named (one WEG2 PARK-IMMEDIATE-DWELL line per phase).
         self._park_immediate_dwell_epoch = -1
@@ -10928,10 +10949,54 @@ class Front:
                 self._dual_backoff_until = time.time() + DUAL_STALL_BACKOFF_S
             elif getattr(self, "_p_intake_stalled", False):
                 self._dual_backoff_until = time.time() + DUAL_STALL_BACKOFF_S
+        if self.dual_kv_ledgers:
+            # User order 30.09. 07:25Z: VRAM-KV short -> P pauses, frees its
+            # context, keeps what it finished in L2; resumes when KV is free.
+            pressure = _dual_p_pressure(self.dual_kv_ledgers)
+            if pressure > 0:
+                self._dual_pause_inflight(pressure)
+                return  # no new P pass while D is short
         if not self.queue or time.time() < self._dual_backoff_until:
             return
         self.counters["dual_passes"] += 1
         self._dual_task = asyncio.get_running_loop().create_task(pass_fn())
+
+    def _dual_pause_inflight(self, pressure: int) -> None:
+        """Mark every leg 1 in flight on P as PAUSED and abort it on P (every
+        PP rank; P stops at its next chunk boundary -- the finished chunks are
+        in L2 by the per-chunk write-through). ``one`` requeues the request at
+        the head without failing it: it stays in leg 1, no W50, no 503."""
+        for rid, p in list(self._dual_inflight.items()):
+            if getattr(p, "dual_pause", False):
+                continue
+            p.dual_pause = True
+            self.counters["dual_p_pauses"] += 1
+            logger.warning(
+                "WEG2 DUAL P-PAUSE rid=%s pressure=%d B: D is short of KV on a card -- P stops at "
+                "its next chunk boundary and frees its context; the finished chunks stay in L2 "
+                "(user order 07:25Z)", rid, int(pressure))
+            asyncio.get_running_loop().create_task(self._dual_abort_p(rid))
+
+    async def _dual_abort_p(self, rid: str) -> None:
+        try:
+            code, _b = await self.rpc(self.groups["P"], "/abort_request", {"rid": rid}, 30)
+            logger.info("WEG2 DUAL P-PAUSE rid=%s /abort_request on P -> %s", rid, code)
+        except Exception as exc:  # noqa: BLE001 -- the leg's own error path still requeues
+            logger.warning("WEG2 DUAL P-PAUSE rid=%s /abort_request on P raised: %s", rid, exc)
+
+    def _dual_requeue_paused(self, p: "Pending") -> None:
+        """The paused request goes back to the HEAD of the queue, still in leg 1.
+        Its next leg 1 READS the chunks P finished from L2 (#1400 intake) and
+        computes only the rest ("Lesen statt Rechnen")."""
+        p.dual_pause = False
+        p.leg1_done = False
+        p.dual_paused_n = int(getattr(p, "dual_paused_n", 0) or 0) + 1
+        self.queue.appendleft(p)
+        self.counters["dual_p_paused_requeued"] += 1
+        logger.warning(
+            "WEG2 DUAL P-PAUSED rid=%s requeued at the head (pauses=%d, queue=%d) -- resumes when "
+            "the card KV is free again, reading its finished chunks from L2",
+            p.rid, p.dual_paused_n, len(self.queue))
 
     async def _adopt_first_flip(self) -> None:
         """#108: EIN Flip-Paar, bevor der erste Request kommt.
@@ -11266,10 +11331,16 @@ class Front:
                     if p.client_gone:  # H102: its client left while it waited for a P slot
                         return p
                     try:
+                        if self.dual_kv_ledgers:
+                            self._dual_inflight[p.rid] = p
                         await self.leg1(p)
                     except Exception as e:  # noqa: BLE001
                         if p.client_gone:  # H102: aborted on P for a client that left
                             self.counters["leg1_client_gone"] += 1
+                            return p
+                        if getattr(p, "dual_pause", False):
+                            # DUAL unified KV: our own pause abort, not a failure
+                            self._dual_requeue_paused(p)
                             return p
                         if is_intake_stall(e) and not is_too_large(e):
                             await self._requeue_intake_stalled(p, e)
@@ -11288,6 +11359,11 @@ class Front:
                         if not p.fut.done():
                             p.fut.set_exception(e)
                         return p
+                    finally:
+                        self._dual_inflight.pop(p.rid, None)
+                    if getattr(p, "dual_pause", False):
+                        # the pause came after P had finished this leg: nothing to redo
+                        p.dual_pause = False
                     p.leg1_done = True
                     # xsn286: a request requeued by an intake stall is an
                     # ordinary request again once its leg 1 succeeded --
@@ -12028,6 +12104,10 @@ def main():
                          "to P; the parked ones resume first after the flip back. Unset = "
                          "SGLANG_WEG2_D_PARK_IMMEDIATE / the profile's d_park_immediate (on for qwen27b "
                          "and nextflash). D needs the same switch (its flip park).")
+    ap.add_argument("--dual-kv-ledgers", default="",
+                    help="DUAL-TP3PP3 unified KV: comma list of the card KV ledgers "
+                         "(weg2/card_kv_ledger.py); when D is short of KV on a card, P's leg 1 "
+                         "PAUSES (user order 30.09. 07:25Z). Empty = off.")
     ap.add_argument("--dual-dbusy-file", default="",
                     help="DUAL-TP3PP3 --dual-p-duty: the file the front rewrites with '1'/'0' when D's "
                          "outstanding set turns non-empty/empty; P's first stage throttles on it.")
@@ -12217,6 +12297,7 @@ def main():
     # the one pinned by test_27b_park_immediate (the class default is off).
     front.dual_layout = bool(getattr(args, "dual_layout", False))
     front.dual_dbusy_file = str(getattr(args, "dual_dbusy_file", "") or "")
+    front.dual_kv_ledgers = [x for x in str(getattr(args, "dual_kv_ledgers", "") or "").split(",") if x]
     if front.dual_layout:
         logger.info("WEG2 DUAL-LAYOUT on: both groups stay awake, the front never flips; "
                     "leg 1 -> P at once, leg 2 -> D right after leg 1")

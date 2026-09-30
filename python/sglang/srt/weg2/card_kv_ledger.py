@@ -230,3 +230,41 @@ class CardKvLedger:
             self._mm.close()
         finally:
             os.close(self._lock_fd)
+
+
+def peek(path: str) -> Optional[LedgerState]:
+    """Read one card's record without joining or writing (the front's view).
+    None when the ledger does not exist yet (no process joined)."""
+    if not os.path.exists(path):
+        return None
+    led = CardKvLedger.__new__(CardKvLedger)
+    led.path, led.group, led._gi, led._pid_alive = path, "P", 0, _pid_alive
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        if os.fstat(fd).st_size < _SIZE:
+            return None
+        mm = mmap.mmap(fd, _SIZE, prot=mmap.PROT_READ)
+    finally:
+        os.close(fd)
+    lock_fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        led._mm = mm
+        st = led._read()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        mm.close()
+    return st if st.budget else None
+
+
+def p_pressure(paths) -> int:
+    """The largest pressure any card puts on P (D is short there) -- the
+    front's pause trigger."""
+    worst = 0
+    for pth in paths or ():
+        st = peek(pth)
+        if st is not None:
+            worst = max(worst, int(st.pressure["P"]))
+    return worst
+

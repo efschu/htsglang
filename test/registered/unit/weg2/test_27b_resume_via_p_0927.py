@@ -203,7 +203,10 @@ def test_the_immediate_park_trigger_sees_the_p_only_leg1():
 
 def test_wiring_front_hooks():
     src = open(os.path.join(os.path.dirname(rvp.__file__), "front.py"), encoding="utf-8").read()
-    assert "self._rvp_take()\n                if self.awake == \"D\":" in src
+    # the controller takes the RVP queue first, then (DUAL-TP3PP3: after the
+    # dual pump's early continue, which the D branch never reaches) the D branch
+    _i = src.index("self._rvp_take()\n")
+    assert _i < src.index("if self.dual_layout:", _i) < src.index("if self.awake == \"D\":", _i)
     done = src.index("def _on_leg1_done(p: Pending) -> None:")
     assert src.index("if p.resume_via_p:", done) < src.index("self._ready_for_d.append(p)", done)
     assert 'if getattr(self, "_rvp_p_done", None) and rid in self._rvp_p_done:' in src
