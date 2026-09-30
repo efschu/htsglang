@@ -6832,6 +6832,7 @@ class Scheduler(
         try:
             from sglang.srt.weg2 import park_l3 as _pl3
 
+            _pl3.note_hold_order(hold)  # #248e: the kept pages leave in hold order
             _pl3.issue_deferred_reads(self, hold)
         except Exception as exc:  # noqa: BLE001 -- a failed issue is a short read: the settle re-reads
             logger.warning("#248 WAKE-READ n/a (%s: %s)", type(exc).__name__, exc)

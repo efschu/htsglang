@@ -134,6 +134,23 @@ def issue_deferred_reads(sched, hold) -> list:
     return out
 
 
+def note_hold_order(hold) -> None:
+    """#248e: every rid of the dormant hold, in hold order, to the keep order
+    (group D, the switch on; a no-op otherwise). Called right before each
+    :func:`issue_deferred_reads` (the release's and the F22 early one): the
+    hold order is also the order the kept pages leave the arena -- the L3
+    fills of this wake take the last-read rid's tail first, never the head
+    of an earlier read (``handoff_pending.victim_order``)."""
+    if not enabled() or not _group_d():
+        return
+    try:
+        from sglang.srt.weg2 import handoff_pending as _hp
+
+        _hp.note_read_order([str(getattr(r, "rid", "") or "") for r in (hold or ())])
+    except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
+        logger.warning("#248e hold order not noted", exc_info=True)
+
+
 def early_enabled() -> bool:
     try:
         from sglang.srt.environ import envs
@@ -165,6 +182,7 @@ def issue_reads_at_wake_begin(sched) -> list:
     hold = getattr(sched, "weg2_dormant_hold", None) or []
     if not hold:
         return []
+    note_hold_order(hold)
     out = issue_deferred_reads(sched, hold)
     if out:
         logger.info("#248 WAKE-READ-EARLY issued=%d at the weight legs' start (F22: the read runs "

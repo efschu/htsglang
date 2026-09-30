@@ -3083,7 +3083,9 @@ class HiCacheFile(HiCacheStorage):
                     full.append((i, st))
             if full:
                 try:
-                    self._arena_evict_to_disk(arena, max(256, len(full)))
+                    # #248e: kept pages (hand-off, park) only as many as this
+                    # fill lacks -- the 256 floor is for unkept pages
+                    self._arena_evict_to_disk(arena, max(256, len(full)), need=len(full))
                 except Exception:  # noqa: BLE001
                     pass
                 for (i, st), (slot, status, gen) in zip(
@@ -3135,9 +3137,23 @@ class HiCacheFile(HiCacheStorage):
                         filled / max(1e-6, ms / 1000.0))
         return out
 
-    def _arena_evict_to_disk(self, arena, want: int) -> int:
+    def _arena_evict_to_disk(self, arena, want: int, need: Optional[int] = None) -> int:
         """Move up to `want` complete, unreferenced, unpinned pages from the
-        arena to the disk store (the cold tier), then free their slots."""
+        arena to the disk store (the cold tier), then free their slots.
+
+        #248e (y3u 0930_002717, D TP0 00:35:41-47, weg2-12-24, 3841 pages):
+        the KV arena (6485 slots) held 3841 hand-off pages of 12-24 plus 2644
+        park pages of weg2-0-5 / weg2-12-23 -- every slot kept by ORDER, none
+        by reference. The wake's L3 fills for the two parks found it full and
+        called this clock with the pins as its only keep list: six rounds of
+        256 (want=max(256, 47|178) on each of the three ranks) took 1536
+        slots in slot order, 12-24's page 0 among them; its read came back
+        ``completed=0 of 3841 hit=3841``, HOLD-REFETCH, first token 3.88 s
+        after the wake. Now the kept pages (``handoff_pending.keep_for`` of
+        the pool that owns this arena) stay on the keep list: (i) up to
+        ``want`` unkept pages; (ii) only when those fall short of ``need``
+        (default ``want``), kept pages in hold order -- the rid read last
+        first, each chain from its tail (``evict_ordered``)."""
         _en = getattr(type(self), "_evict_log_n", 0) + 1
         type(self)._evict_log_n = _en
         if _en <= 16 or _en % 64 == 0:
@@ -3149,7 +3165,7 @@ class HiCacheFile(HiCacheStorage):
                 keep = list(getattr(pins, "pinned_stems", lambda: [])())
             except Exception:  # noqa: BLE001
                 keep = []
-        cands = arena.evict_candidates(want, keep_stems=keep)
+        cands = self._arena_evict_candidates(arena, int(want), int(want if need is None else need), keep)
         if not cands:
             return 0
         moved = self.arena_secure_to_disk(arena, cands)["written"]
@@ -3159,6 +3175,31 @@ class HiCacheFile(HiCacheStorage):
         for c in cands:
             stems.pop((c[1], c[2]), None)
         return moved
+
+    @staticmethod
+    def _arena_evict_candidates(arena, want: int, need: int, pin_stems) -> list:
+        """#248e: the clock's candidates for ``_arena_evict_to_disk`` -- the
+        pins always kept; the hand-off / park order of the pool that owns
+        ``arena`` kept in stage (i) and spent in hold order in stage (ii).
+        No pool with an order (P without a bound pool, a hermetic arena):
+        the pins-only clock, byte for byte."""
+        from sglang.srt.weg2 import handoff_pending as _hp
+
+        try:
+            pool = _hp.pool_for_arena(arena)
+            order = _hp.keep_for(pool) if pool is not None else None
+        except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
+            logger.warning("#248e ORDER unavailable for the clock evict", exc_info=True)
+            order = None
+        if order is None or not len(order):
+            return list(arena.evict_candidates(want, keep_stems=pin_stems))
+        cands = list(arena.evict_candidates(want, keep_stems=pin_stems, keep_lo=order.keys))
+        if len(cands) < need:
+            from sglang.srt.mem_cache.storage.file.hicache_arena import stem_keys_lo
+
+            protect = stem_keys_lo(pin_stems) if pin_stems else None
+            cands += _hp.evict_ordered(arena, order, need - len(cands), protect_lo=protect, site="l3fill")
+        return cands
 
     def arena_secure_to_disk(self, arena, cands) -> dict:
         """#257 (d): give every EVICTING candidate ``(slot, key_lo, key_hi,
