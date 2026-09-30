@@ -148,6 +148,9 @@ def _decode_block(mr) -> Optional[Dict[str, Any]]:
             str(bs): [int(v[0]), round(float(v[1]), 1)] for bs, v in list(by_bs.items())},
         "tokens": int(getattr(mr, "gen_tokens_total", 0) or 0),
         "running": getattr(mr, "last_running_reqs", None),
+        # FEHLT 6 (30.09.): the batch size of the last round (running counts
+        # the batch AFTER the round's admissions, not the round's bs)
+        "last_bs": (None if getattr(drl, "last_bs", None) is None else int(drl.last_bs)),
         "accept_len_ewma": None if ewma is None else round(float(ewma), 3),
         "accept_rate_ewma": None if rate is None else round(float(rate), 3),
         "cuda_graph": getattr(mr, "last_cuda_graph", None),
@@ -158,7 +161,8 @@ def _cache_block(scheduler) -> Dict[str, Any]:
     """§3 cache: the #988 / #1324 / #915 counters the paths already keep."""
     out: Dict[str, Any] = {"loadback_n": None, "loadback_tok": None,
                            "mamba_resume_n": None, "mamba_tok": None,
-                           "store_incomplete_n": None, "prefetch": None}
+                           "store_incomplete_n": None, "store_incomplete_delivered": None,
+                           "store_incomplete_deliverable": None, "prefetch": None}
     try:
         from sglang.srt.managers import schedule_policy as _sp
 
@@ -177,6 +181,10 @@ def _cache_block(scheduler) -> Dict[str, Any]:
     except Exception:  # noqa: BLE001 -- a missing module reads as unknown
         pass
     out["store_incomplete_n"] = int(getattr(scheduler, "_weg2_store_short_seen", 0) or 0)
+    # FEHLT 5 (30.09.): the L3 share of those reads -- tokens delivered against
+    # the tokens the store could deliver, summed over the #1324 site
+    out["store_incomplete_delivered"] = int(getattr(scheduler, "_weg2_store_short_delivered", 0) or 0)
+    out["store_incomplete_deliverable"] = int(getattr(scheduler, "_weg2_store_short_deliverable", 0) or 0)
     try:
         from sglang.srt.mem_cache import match_refusal_census as _mrc
 
@@ -232,6 +240,7 @@ def scheduler_counters(scheduler) -> Dict[str, Any]:
                   # PARK-WINDOW-GATE (29.09.): the front's window in force on this
                   # rank (left_ms as received; null = none) and the extends it held back
                   "park_window_left_ms": _park_window_left_ms(scheduler),
+                  "park_window_open": isinstance(getattr(scheduler, "_weg2_park_window", None), dict),
                   "park_window_defers": int(getattr(scheduler, "_weg2_park_window_defer_n", 0) or 0),
                   "park_window_hold_max_ms": int(getattr(scheduler, "_weg2_park_window_hold_max_ms", 0) or 0)},
         "cap": {"kv_tokens": getattr(scheduler, "max_total_num_tokens", None),
@@ -239,9 +248,21 @@ def scheduler_counters(scheduler) -> Dict[str, Any]:
     }
 
 
-def _park_window_left_ms(scheduler):
+def _park_window_left_ms(scheduler, now: Optional[float] = None):
+    """FEHLT 2 (30.09.): the ms the front's PARK-WINDOW is still open on this
+    rank -- ``left_ms`` as received minus the time since it arrived (the gate
+    stamps ``t_set``), never below 0; ``-1`` = no window in force (the gate is
+    clear, or never set: inert under the ARRIVAL-SEAT rule). Never null on a
+    running rank -- null read as "missing" on the dashboard."""
     win = getattr(scheduler, "_weg2_park_window", None)
-    return None if not isinstance(win, dict) else int(win.get("left_ms", 0))
+    if not isinstance(win, dict):
+        return -1
+    left = int(win.get("left_ms", 0))
+    t_set = win.get("t_set")
+    if t_set is None:
+        return left
+    now = time.monotonic() if now is None else float(now)
+    return max(0, int(left - (now - float(t_set)) * 1000.0))
 
 
 def _round_or_none(v, nd: int):

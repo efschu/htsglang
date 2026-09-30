@@ -14791,6 +14791,10 @@ class Scheduler(
         # advances, which is what ends the wait honestly.
         req._weg2_store_delivered = delivered
         self._weg2_store_short_seen = getattr(self, "_weg2_store_short_seen", 0) + 1
+        # DASHBOARD-AUS-IPC (30.09., FEHLT 5): the tokens these incomplete reads
+        # delivered and could have delivered, summed (rankstats cache block)
+        self._weg2_store_short_delivered = getattr(self, "_weg2_store_short_delivered", 0) + delivered
+        self._weg2_store_short_deliverable = getattr(self, "_weg2_store_short_deliverable", 0) + deliverable
         n = self._weg2_store_short_seen
         if n <= 8 or n % 64 == 0:
             logger.warning(

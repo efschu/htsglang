@@ -6337,6 +6337,10 @@ class Front:
         self.state = "STOP"
         self.counters["stop"] += 1
         logger.error("WEG2 STOP %s -- %s", name, detail)
+        _fwc = self.__dict__.get("_ipc_fw_clock")
+        _fw_none = _fwc.flush("front_stop") if _fwc is not None else None
+        if _fw_none is not None:  # FEHLT 3: the last flip's woken group never worked
+            self._ipc_publish("flip_first_work", _fw_none)
         for p in list(self.queue) + list(self._ready_for_d):
             if not p.fut.done():
                 p.fut.set_exception(self.stop)
@@ -6471,6 +6475,22 @@ class Front:
         out["served_tokens"] = dict(self.__dict__.get("_ipc_served_tokens") or {})
         out["d_phase_n"] = getattr(self, "_d_phase_n", None)
         out["d_parked_n"] = len(getattr(self, "_d_parked", None) or {})
+        # FEHLT 1 (30.09.; 27B d_phase_n null): D's seats on EVERY front. A
+        # standard-form wake fixes n (H95c: handoff_n + parked_n, capped at
+        # --d-bs); a front whose wakes carry no seat count (27B) or before the
+        # first wake has --d-bs seats -- the source says which.
+        _pn = out["d_phase_n"]
+        out["d_seats"] = {"n": int(_pn) if _pn is not None else int(getattr(self, "d_bs", 0) or 0),
+                          "cap": int(getattr(self, "d_bs", 0) or 0),
+                          "parked_n": out["d_parked_n"],
+                          "source": ("wake_phase_seats" if _pn is not None else "d_bs")}
+        # FEHLT 4 (30.09.): D's cached tokens split by the front's own served
+        # rows -- the P->D hand-off (a rid whose leg 1 ran on P: D_after_P) and
+        # the prefix D found without one (D minus D_after_P); cumulative
+        _st = out["served_tokens"]
+        _d_c = int(((_st.get("D") or {}).get("cached")) or 0)
+        _h_c = int(((_st.get("D_after_P") or {}).get("cached")) or 0)
+        out["d_cached_tokens"] = {"total": _d_c, "handoff": _h_c, "d_prefix_hit": max(0, _d_c - _h_c)}
         health = {}
         for g in self.groups.values():
             f = getattr(g, "health_facts", None)
@@ -8412,6 +8432,11 @@ class Front:
                     tier_carry: Optional[bytearray] = bytearray() if _strip_tier else None
 
                     async def _write_client(chunk: bytes) -> None:
+                        if chunk:
+                            # FEHLT 3: ANY D content after a P->D flip is its first
+                            # work -- a resumed stream too, not only a new leg's
+                            # first chunk (one dict read while nothing is armed)
+                            self._ipc_first_work_seen("D", "decode_token", rid)
                         try:
                             await resp.write(chunk)
                         except ConnectionError as e:
@@ -9816,7 +9841,9 @@ class Front:
         # `done`: with the tail overlap D can stream before the front logs `done`).
         self._ipc_publish("flip_begin", {"epoch_before": self.epoch, "sleep": src, "wake": dst,
                                          "flip_begin_ts": round(t_flip0, 3)})
-        self._ipc_first_work_clock().arm(self.epoch + 1, src, dst, t_flip0)
+        _fw_none = self._ipc_first_work_clock().arm(self.epoch + 1, src, dst, t_flip0)
+        if _fw_none is not None:  # FEHLT 3: the previous flip's woken group never worked
+            self._ipc_publish("flip_first_work", _fw_none)
         # H91 part C rule 2: the wake message to D carries the hand-off count
         # (`handoff_n`, plus `parked_n`) on its kv_cache resume -- every one of
         # the three sites below. Unbound call: partial test fronts work too.
@@ -10369,6 +10396,7 @@ class Front:
         # DASHBOARD-AUS-IPC (a): the flip_log record as `flip_done` (same begin stamp).
         from sglang.srt.weg2 import front_state_ipc as _fsi
         self._ipc_publish("flip_done", _fsi.flip_done_payload(rec, t_flip0))
+        self._ipc_first_work_clock().done(time.time())  # FEHLT 3: pairs with one flip_first_work
         if dc_off_path:
             _t = asyncio.get_running_loop().create_task(self._dc_reading_off_path(src, S.sid, rec))
             self._dc_tasks.add(_t)
