@@ -6366,6 +6366,33 @@ class Front:
         if ev is not None:
             self._ipc_publish("flip_first_work", ev)
 
+    def _ipc_out_book(self):
+        """Every open request's arrival and last token (front_state_ipc.OutstandingBook)."""
+        b = self.__dict__.get("_ipc_out_book_obj")
+        if b is None:
+            from sglang.srt.weg2.front_state_ipc import OutstandingBook
+
+            b = self.__dict__["_ipc_out_book_obj"] = OutstandingBook()
+        return b
+
+    def ipc_out_wrap(self, handler):
+        """The rid-end of the outstanding book: every return, exception and
+        cancel of the generate handler takes the rid out (the #243 seam's rid)."""
+        import functools
+
+        @functools.wraps(handler)
+        async def _wrapped(request):
+            try:
+                return await handler(request)
+            finally:
+                try:
+                    rid = request.get(_hs.RID_KEY)
+                except Exception:  # noqa: BLE001
+                    rid = None
+                if rid:
+                    self._ipc_out_book().end(rid)
+        return _wrapped
+
     def _park_stuck(self):
         """#287 NEED0 (c): the per-rid park streak (weg2/park_stuck.py)."""
         ps = self.__dict__.get("_park_stuck_obj")
@@ -6417,6 +6444,15 @@ class Front:
         if _asr.enabled():
             # ARRIVAL-SEAT: the rule's verdict counters (state.json front.arrival_seat)
             out["arrival_seat"] = _asr.state_block(self.counters, self._asr_st()["waiters"], True)
+        # y4y 17:05:40Z (two burst requests 300 s without a token beside a served
+        # anchor stream): the oldest open request and the ones longest without a
+        # token, for the progress watcher's HAENGT-EINZEL
+        _gp, _gd = self.groups.get("P"), self.groups.get("D")
+        out.update(self._ipc_out_book().block(
+            time.time(), [(q.rid, q.t_arrive) for q in list(getattr(self, "queue", None) or ())],
+            dict(getattr(_gp, "outstanding", None) or {}), dict(getattr(_gd, "outstanding", None) or {}),
+            list((getattr(self, "_d_parked", None) or {}).keys()),
+            getattr(self, "state", None) == "flipping"))
         return out
 
     def _ipc_group_health_observe(self, g) -> None:
@@ -6972,6 +7008,7 @@ class Front:
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
         _hs.note_request_rid(request, rid)  # #243 seam: the rid-end drop reads it
+        self._ipc_out_book().arrive(rid, time.time())  # state.json front.oldest_outstanding_*
         if _asr.enabled():
             self._asr_arrival_note(rid)  # NF-STAU: the TTFT clocks start here
         self._sess_note(rid, request, payload)  # SESSION-TRACE
@@ -7280,6 +7317,21 @@ class Front:
                         "through (gate held / seats / phase) and waits for a D seat behind the batch "
                         "work -- its D presence is kept, no leg 1 on P", rid, remainder, store_span,
                         self.epoch)
+        elif (_asr.enabled() and short_ok and not short_refused and self.state == "flipping"
+              and getattr(self, "_flip_dst", None) == "D"):
+            # y4y 17:05:48 (weg2-45-64/65, ~775 tokens each): a SHORT arriving
+            # while P flips to D was queued BATCH for P (awake was still P);
+            # under ARRIVAL-SEAT nothing owned that queue -- its candidates are
+            # the entries that need P -- and FLIP-ECONOMICS held 300 s. The
+            # flip's TARGET is D: the SHORT waits in D's admission line, like
+            # an arrival one flip later, no leg 1.
+            p.d_direct = True
+            self._ready_for_d.append(p)
+            self._sync_batch_gate()
+            self.counters["arrival_seat_short_in_flip"] += 1
+            logger.info("%s rid=%s verdict=%s SHORT-IN-FLIP uncached=%d X=%d epoch=%d: arrived while the flip "
+                        "to D runs -- queued for D (its admission line), not BATCH for P", _asr.MARKER, rid,
+                        _asr.D_PREFILL, remainder, int(self.tp_prefill_max_tokens), self.epoch)
         else:
             if _sk:
                 self.counters["short_kept_queue"] += 1
@@ -7986,6 +8038,11 @@ class Front:
             logger.info("%s PARKED-CLEAR n=%d why=lapsed rids=%s", _asr.MARKER, len(lapsed), lapsed[:4])
         bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
         live_q = [p for p in self.queue if not p.fut.done()]
+        # y4y: a queued SHORT has an owner -- D, as a d_prefill verdict (the
+        # candidates below are only the entries that need P)
+        handed = self._asr_queued_short_to_d(live_q, now) if live_q else []
+        if handed:
+            live_q = [p for p in live_q if all(p is not h for h in handed)]
         wait_s = _asr.oldest_wait_s([p.t_arrive for p in live_q] + list(st["waiters"].values()),
                                     self.t_awake, now)
         age_plan = _asr.age_plan_enabled()
@@ -7998,6 +8055,22 @@ class Front:
         cands = ([q for q in live_q if phase_policy.immediate_park_trigger([q], x_tok) is not None]
                  if live_q else [])
         if not cands:
+            # y4y NET: the wait bound fires for EVERY queued entry, a
+            # non-candidate too -- an entry no rule takes must not wait for
+            # ever behind FLIP-ECONOMICS (300 s there); fired, the flip to P
+            # takes the backlog (the fairness bound's path)
+            q_wait = _asr.oldest_wait_s([p.t_arrive for p in live_q], self.t_awake, now)
+            if live_q and _asr.bound_fired(q_wait, bound):
+                head = min(live_q, key=lambda q: float(q.t_arrive))
+                if st.get("wait_any_rid") != head.rid:
+                    st["wait_any_rid"] = head.rid
+                    self.counters["arrival_seat_wait_any"] += 1
+                    logger.warning("%s rid=%s WAIT-BOUND-ANY waited=%.1f s >= bound %.0f s uncached=%d "
+                                   "d_eligible=%s -- a queued entry no rule took: the bound fires (flip to P)",
+                                   _asr.MARKER, head.rid, q_wait, bound,
+                                   int(getattr(head, "est_uncached", 0) or 0),
+                                   bool(getattr(head, "d_eligible", False)))
+                return True, True, None
             return False, not self.admit_d, None
         if age_plan:
             return await self._arrival_seat_step_age(cands, x_tok, now)
@@ -8063,6 +8136,39 @@ class Front:
                         "the next free seat in arrival order", _asr.MARKER, p.rid, v, why_wait,
                         int(getattr(p, "est_uncached", 0) or 0), x_tok, taken, n, why)
         return False, not self.admit_d, None
+
+    def _asr_queued_short_to_d(self, live_q: List["Pending"], now: float) -> List["Pending"]:
+        """ARRIVAL-SEAT: every queued SHORT whose own route verdict was SHORT
+        (``d_eligible``: uncached <= X, no vision stage, never re-queued) goes
+        to D's admission line like an arrival -- the verdict d_prefill, no
+        flip, no leg 1 (the drain's filter, per request: law 4 holds for each,
+        an arrival's measure). Only while D admits and serves."""
+        if not (self.admit_d and self.state == "serving" and self.awake == "D"):
+            return []
+        d_busy = getattr(self, "x_split", False) and self._d_holds_work()
+        x = self._x_band_floor() if d_busy else int(self.tp_prefill_max_tokens)
+        def _g(p, k, d=None):  # getattr: partial test doubles (phase_policy's convention)
+            return getattr(p, k, d)
+        moved = [p for p in live_q
+                 if _g(p, "d_eligible", False) and not _g(p, "intake_stalled", False)
+                 and not _g(p, "leg1_done", False) and not _g(p, "reroutes", 0)
+                 and not _g(p, "x_requeues", 0) and not _g(p, "p_only", False)
+                 and not _g(p, "x_deferred", False) and 0 <= int(_g(p, "est_uncached", 0) or 0) <= x]
+        for p in moved:
+            try:
+                self.queue.remove(p)
+            except ValueError:
+                continue
+            p.d_direct = True
+            self._ready_for_d.append(p)
+            self.counters["arrival_seat_d_prefill"] += 1
+            self.counters["arrival_seat_queue_to_d"] += 1
+            logger.info("%s rid=%s verdict=%s QUEUED-SHORT uncached=%d X=%d waited=%.1f s -- a queued SHORT "
+                        "goes to D's admission line like an arrival (no flip, no leg 1)", _asr.MARKER, p.rid,
+                        _asr.D_PREFILL, int(p.est_uncached), x, max(0.0, now - float(p.t_arrive)))
+        if moved:
+            self._sync_batch_gate()
+        return moved
 
     async def _arrival_seat_step_age(self, cands: List["Pending"], x_tok: int,
                                      now: float) -> Tuple[bool, bool, Optional["Pending"]]:
@@ -9048,6 +9154,7 @@ class Front:
                         await _push(restate_inband_refusal(early_body, request.path))
                     else:
                         if first_chunk is not None:
+                            self._ipc_out_book().token(rid, time.time())
                             await _push(restate_inband_refusal(first_chunk, request.path))
                         while True:
                             chunk = await _next_d_chunk()
@@ -9056,6 +9163,7 @@ class Front:
                             if getattr(self, "_rvp_p_done", None) and rid in self._rvp_p_done:
                                 self._rvp_resumed(rid)
                             self._park_stuck().note_output(rid)  # #287 NEED0 (c): progress
+                            self._ipc_out_book().token(rid, time.time())  # front.outstanding_stalest
                             await _push(restate_inband_refusal(chunk, request.path))
                     if tier_carry and not client_io["gone"]:
                         await _write_client(strip_cached_tier(bytes(tier_carry), request.path, True))
@@ -10370,6 +10478,8 @@ class Front:
             # the STOP landed while the clock unlock was awaited
             self._refuse_flip_in_stop(src, dst, "during the clock unlock")
             return
+        # y4y: an arrival during the flip asks WHERE the flip goes, not only who is awake
+        self._flip_dst = dst
         self._flip_cushion_open(src, dst)
         t_flip0 = time.time()
         # #1262 tier 3: the open flip's identity, for `flip_stall_check`. Not
@@ -12933,6 +13043,8 @@ def main():
     # hand-off marks (weg2/handoff_seam.py:wrap_handler) -- bound once, here,
     # before the routes take the handler.
     front.handle_generate = _hs.wrap_handler(front.handle_generate)
+    # the outstanding book's rid-end (state.json front.oldest_outstanding_*)
+    front.handle_generate = front.ipc_out_wrap(front.handle_generate)
     # W3-STOP: a STOP answers the handlers in flight (Front.stop_guard).
     front.handle_generate = front.stop_guard(front.handle_generate)
     for path in FORWARD_PATHS:
