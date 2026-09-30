@@ -601,6 +601,14 @@ class Envs:
     # device load -- at the wake. False = the pre-#248 hold read (reference
     # and pin during the sleep), byte for byte.
     SGLANG_WEG2_ENABLE_PARK_L3 = EnvBool(True)
+    # ENABLE_PARK_HOLD_YIELD (HY, NF y3w 01:39:13 / y3u 00:36:46): a D park
+    # whose forced host write-through the full arena refuses takes the pages
+    # of a HELD (not running) request whose whole span has an L3 copy -- one
+    # MIN vote over the TP group, the same give-back on every rank, the
+    # refused backups again; the wake reads the held request from L3. Before:
+    # the park's KV died with the sleep and P recomputed ~125k tokens (30 s).
+    # False = the refusal stands (the marker line still counts need/held).
+    SGLANG_WEG2_ENABLE_PARK_HOLD_YIELD = EnvBool(True)
     # ENABLE_SHORT_READ_ANCHOR (SA, NF y3v 5327bdfa17, weg2-46-98): a store
     # read whose KV ended short still reads the recurrent state (and the QSA
     # index pages) at the deepest anchor inside the landed pages; that anchor
