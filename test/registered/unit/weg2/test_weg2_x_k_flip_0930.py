@@ -75,10 +75,14 @@ def test_the_model_reproduces_y5a():
     assert 1400 < x25 < 1600                     # the live X y5a ran on (1440-1900)
 
 
-def test_switch_default_off_keeps_the_mean(caplog):
-    assert envs.SGLANG_WEG2_X_K_FLIP.get() is False
+def test_switch_default_on():
+    assert envs.SGLANG_WEG2_X_K_FLIP.get() is True
+
+
+def test_switch_off_keeps_the_mean(caplog):
     ns = _front()
-    with envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), envs.SGLANG_WEG2_X_COST_MAX_STEP.override(10.0), \
+    with envs.SGLANG_WEG2_X_K_FLIP.override(False), \
+            envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), envs.SGLANG_WEG2_X_COST_MAX_STEP.override(10.0), \
             caplog.at_level(logging.INFO):
         x = F.Front._resolve_x_cost_line(ns)
     assert 1400 < x < 1600                       # y5a's live X: a 2.9k request goes to P

@@ -3769,7 +3769,8 @@ class Envs:
     # of 2087-2940 new tokens (k real 1-2). On: X in force = the lone request's
     # (k=1, ~4200 on y5a's lines); an arrival is routed on the X of the flip it
     # would take (1 + requests queued for P now). The mean stays display-only.
-    SGLANG_WEG2_X_K_FLIP = EnvBool(False)
+    # Default on for the NF freeze (y5c): the routing rule itself, not a tuning.
+    SGLANG_WEG2_X_K_FLIP = EnvBool(True)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at
