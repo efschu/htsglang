@@ -33,6 +33,7 @@ detail_full in cause-<seq>.txt und das Event verweist darauf).
   state_file.py get    --dir D [--key a.b]
   state_file.py new-boot-id --prefix P --kind K
   state_file.py deadman --dir D --tier T --name N [--group G] --detail T     (Phase 2, Wächter)
+  state_file.py progress-check --dir D --memo F [--stall-s S]              (Deadman-Riegel PROGRESS-STALL)
   state_file.py health  --dir D                                             (Phase 2, Healthcheck)
 
 Phase 2 (27B-Verbraucher, IPC-VERBRAUCHER-27B A4/W1): der Deadman schreibt sein
@@ -71,7 +72,8 @@ KINDS = ("dry", "d2", "boot")
 ORIGINS = ("preflight", "launcher", "rank", "front", "deadman", "operator", "container_exit", "oom", "host")
 #: stopping-/stopped_clean-Gründe (cause.code, origin operator); stopped_clean trägt cause.rc = 0 (A3)
 STOP_REASONS = ("stop_file", "operator", "window_end", "max_deaths", "probes_done", "d2_done")
-#: `deadman` (Phase 2): nur Herzschlag, Event deadman_verdict und stop_request.json -- keine Felder, keine Zustände
+#: `deadman` (Phase 2): Herzschlag, Event deadman_verdict und stop_request.json; seit 30.09. dazu genau ein
+#: Feld, `progress` (Riegel PROGRESS-STALL) -- keine Zustände
 WRITERS = ("host", "launcher", "front", "deadman", "rank")
 #: A1c Feld-Eigentum: oberstes Feld je Schreiber (heartbeat.<name> schreibt jeder für sich).
 #: Ein Eintrag mit Punkt besitzt nur diesen Teilbaum: ``launch`` teilen sich Host
@@ -81,7 +83,8 @@ OWNED_FIELDS = {
              "launch.container"),
     "launcher": ("groups", "invariants", "launch.front"),
     "front": ("front",),
-    "deadman": (),
+    #: PROGRESS-STALL (30.09.): das Urteil des 4. Deadman-Riegels, ein eigenes Feld, kein Zustand
+    "deadman": ("progress",),
     #: 30.09. RANK-DEATH: a rank owns no field -- only its own death
     "rank": (),
 }
@@ -488,6 +491,89 @@ def deadman_verdict(d: str, tier: str, detail: str, *, name: str = "", group=Non
     return {"written": True, "stop_request": req, "state": cur}
 
 
+#: PROGRESS-STALL (4. Deadman-Riegel, 30.09.; dual13 11:00-11:04Z: outstanding=3 bei queue=0, P schrieb
+#: WAIT-Zeilen, D lief mit 0 running -- das Log war nicht still, die Herzschläge liefen, /health 200,
+#: kein Riegel schlug an). Wie NFs progress_watch.py (host-seitig): HAENGT, wenn outstanding > 0 ist
+#: und sich weder `served` noch `served_tokens` (prompt+completion je Gruppe) STALL_S bewegt haben.
+#: Das Urteil ist ein ZUSTAND im Feld `progress` plus ein Event -- KEIN Stop (kein stop_request),
+#: damit Knappheitsproben weiterlaufen. Ein neuer boot_id setzt zurück.
+PROGRESS_STALL_S_DEFAULT = 60.0
+PROGRESS_LIVE = ("serving", "flipping")
+
+
+def progress_key(front: dict):
+    """(served gesamt, served_tokens prompt+completion gesamt) -- was sich bei Fortschritt bewegt."""
+    served_ = front.get("served") or {}
+    toks = front.get("served_tokens") or {}
+    tok_sum = 0
+    for g in toks.values():
+        if isinstance(g, dict):
+            tok_sum += int(g.get("prompt") or 0) + int(g.get("completion") or 0)
+    return [sum(int(v or 0) for v in served_.values() if isinstance(v, (int, float))), tok_sum]
+
+
+def progress_step(memo, st: dict, now: float, stall_s: float):
+    """Ein Schritt des Riegels, rein (kein I/O). ``memo`` = der Merker des vorigen Schritts
+    (None beim ersten). Rückgabe ``(memo_neu, ereignis)``, ereignis None | "HAENGT" | "LAEUFT".
+    Zurückgesetzt wird bei: anderem boot_id, Zustand nicht serving/flipping, outstanding == 0,
+    Bewegung von served/served_tokens. HAENGT einmal beim Eintritt, LAEUFT beim Austritt
+    (nur im selben Boot)."""
+    boot = st.get("boot_id")
+    lc = (st.get("lifecycle") or {}).get("state")
+    fr = st.get("front") or {}
+    key = progress_key(fr)
+    out = int(fr.get("outstanding") or 0)
+    m = dict(memo or {})
+    if (not m or m.get("boot") != boot or m.get("key") != key or out <= 0 or lc not in PROGRESS_LIVE):
+        ev = "LAEUFT" if (m.get("stalled") and m.get("boot") == boot) else None
+        since = m.get("since")
+        return {"boot": boot, "key": key, "since": now, "stalled": False,
+                "stalled_for": (now - float(since if since is not None else now)) if ev else 0.0}, ev
+    if not m.get("stalled") and now - float(m["since"]) >= float(stall_s):
+        m["stalled"] = True
+        return m, "HAENGT"
+    return m, None
+
+
+def deadman_progress(d: str, memo_path: str, stall_s: float = PROGRESS_STALL_S_DEFAULT, now=None):
+    """Der Riegel über den Merker ``memo_path`` (Datei des Deadmans): liest state.json, macht einen
+    Schritt, schreibt bei HAENGT/LAEUFT das Feld ``progress`` (Schreiber deadman) und ein Event.
+    Rückgabe: die EINE Log-Zeile oder "" (nichts geschehen). Ohne state.json: ""."""
+    st = read(d)
+    if not st:
+        return ""
+    now = time.time() if now is None else now
+    try:
+        memo = json.load(open(memo_path))
+    except (OSError, ValueError):
+        memo = None
+    new, ev = progress_step(memo, st, now, stall_s)
+    write_json_atomic(memo_path, new)
+    if ev is None:
+        return ""
+    fr = st.get("front") or {}
+    base = {"boot_id": st.get("boot_id"), "ts": round(now, 3), "stall_s": float(stall_s),
+            "outstanding": int(fr.get("outstanding") or 0), "outstanding_by_group": fr.get("outstanding_by_group"),
+            "queue": fr.get("queue"), "awake": fr.get("awake"), "front_state": fr.get("state"),
+            "served": new["key"][0], "tokens": new["key"][1]}
+    stamp = time.strftime("%H:%M:%SZ", time.gmtime(now))
+    if ev == "HAENGT":
+        rec = {"verdict": "HAENGT", "since_ts": round(float(new["since"]), 3), **base}
+        line = (f"DEADMAN[PROGRESS-STALL] {stamp} HAENGT boot={base['boot_id']} outstanding={base['outstanding']} "
+                f"by_group={base['outstanding_by_group']} queue={base['queue']} awake={base['awake']} "
+                f"state={base['front_state']}: kein Fortschritt seit {now - float(new['since']):.0f} s "
+                f"(served={base['served']} tokens={base['tokens']}, Schwelle {float(stall_s):.0f} s) -- "
+                f"Zustand, KEIN Stop")
+    else:
+        rec = {"verdict": "LAEUFT", "stalled_for_s": round(float(new["stalled_for"]), 1), **base}
+        line = (f"DEADMAN[PROGRESS-STALL] {stamp} LAEUFT WIEDER boot={base['boot_id']} nach "
+                f"{float(new['stalled_for']):.0f} s (served={base['served']} tokens={base['tokens']})")
+    transition(d, None, fields={"progress": rec}, writer="deadman")
+    add_event(d, "progress_stall" if ev == "HAENGT" else "progress_resumed", rec, writer="deadman",
+              code="DEADMAN_PROGRESS_STALL" if ev == "HAENGT" else None)
+    return line
+
+
 #: Rückgabe von `health`: 0 = der Zustand kennt keinen Tod, 1 = tot, 2 = kein lesbarer Zustand
 HEALTH_OK, HEALTH_DEAD, HEALTH_NO_STATE = 0, 1, 2
 
@@ -614,6 +700,8 @@ def main(argv=None) -> int:
     p = sub.add_parser("deadman"); p.add_argument("--dir", required=True); p.add_argument("--tier", required=True)
     p.add_argument("--name", default=""); p.add_argument("--group"); p.add_argument("--detail", default="")
     p = sub.add_parser("health"); p.add_argument("--dir", required=True)
+    p = sub.add_parser("progress-check"); p.add_argument("--dir", required=True); p.add_argument("--memo", required=True)
+    p.add_argument("--stall-s", type=float, default=None)
     a = ap.parse_args(argv)
 
     if a.cmd == "new-boot-id":
@@ -681,6 +769,17 @@ def main(argv=None) -> int:
         return 0
     if a.cmd == "deadman":
         print(json.dumps(deadman_verdict(a.dir, a.tier, a.detail, name=a.name, group=a.group), sort_keys=True))
+        return 0
+    if a.cmd == "progress-check":
+        s = a.stall_s
+        if s is None:
+            try:
+                s = float(os.environ.get("PROGRESS_STALL_S", "") or PROGRESS_STALL_S_DEFAULT)
+            except ValueError:
+                s = PROGRESS_STALL_S_DEFAULT
+        line = deadman_progress(a.dir, a.memo, s)
+        if line:
+            print(line)
         return 0
     if a.cmd == "health":
         code, why = health(a.dir)
