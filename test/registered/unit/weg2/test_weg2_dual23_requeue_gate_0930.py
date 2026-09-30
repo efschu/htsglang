@@ -121,3 +121,40 @@ class Dual23(CustomTestCase):
         src = inspect.getsource(F.Front.controller)
         self.assertIn("if self._dual_skip_after_requeue(p):", src)
         self.assertIn("self._dual_dispatch_held()", src)
+
+
+class FlipFormIsUntouched(CustomTestCase):
+    """z30y7 (27b-row-authority, flip form): a LONG request after the flip kick
+    must dispatch -- the dual gates act only under --dual-layout."""
+
+    def test_flip_front_dispatches_and_hands_to_d(self):
+        async def run():
+            f = F.Front(prefill="http://p", decode="http://d", awake="P", tag="flip", store_dir="/tmp",
+                        prefill_sid=0, decode_sid=0, dc_reserve={}, w_s=45.0, weight_chunks=2,
+                        flip_min_work_tokens=1, dual_layout=False)
+            f.dual_kv_ledgers = []
+            fut = asyncio.get_running_loop().create_future()
+            p = F.Pending("weg2-31-31", "/generate", {}, "x", time.time(), fut, est_prompt=6275,
+                          est_uncached=6275)
+            p.dual_requeued = True          # even a stray mark must not skip it in the flip form
+            f.queue = collections.deque([p])
+            legs, to_d = [], []
+
+            async def one(q):
+                legs.append(q.rid)
+                q.leg1_done = True
+                return q
+
+            def on_done(q):
+                if f._dual_skip_after_requeue(q):
+                    return
+                to_d.append(q.rid)
+
+            await asyncio.wait_for(F._p_drain_pool(
+                f.queue, 1, one, on_done,
+                lambda: not (f.dual_layout and f.dual_kv_ledgers and f._dual_dispatch_held())), timeout=5)
+            return legs, to_d
+
+        legs, to_d = _run(run())
+        self.assertEqual(legs, ["weg2-31-31"])
+        self.assertEqual(to_d, ["weg2-31-31"])

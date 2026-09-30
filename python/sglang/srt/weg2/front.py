@@ -11105,6 +11105,8 @@ class Front:
         the pass's ``one``, and the pool's ``on_done`` handed it to D anyway
         (D-ADMIT 68 ms after P-PAUSED): a never-started 129186-token B at D ->
         X refusal -> W50 re-route. A requeued pause is back in leg 1, never D's."""
+        if not self.dual_layout:
+            return False  # flip form: never a dual pause, never skipped
         if getattr(p, "dual_requeued", False):
             p.dual_requeued = False
             return True
@@ -11614,7 +11616,8 @@ class Front:
             passes = await _p_drain_pool(
                 self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
                 lambda: (self.state == "serving" and not self._p_intake_stalled
-                         and not (self.dual_kv_ledgers and self._dual_dispatch_held())),
+                         and not (self.dual_layout and self.dual_kv_ledgers
+                                  and self._dual_dispatch_held())),
                 # H91 part C rule 1: at most p_phase_max_requests leave the
                 # queue in this P phase, overlapping only as far as their
                 # est_prompt fits P's unified pool (0 = off, law 1 as before).
