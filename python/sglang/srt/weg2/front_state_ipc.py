@@ -259,6 +259,77 @@ class BoundedWriter:
                     self._on_error(fn, e)
 
 
+class DpFlipClock:
+    """D->P flip time in the USER's definition (FLIPZEIT-VERLAUF-0929.md, Folgepunkt
+    30.09.): Decode-Ende -> P-Prefill-Start, i.e. the last D decode round (the park
+    RPC's send when D's decodes were parked for this flip, else D's last served
+    leg 2), no earlier than the arrival of the oldest waiter -> the start of P's
+    first prefill (leg 1's end minus P's own prefill time ``weg2_prefill_s``; the
+    leg-1 dispatch when P's body does not carry it -- named as the source).
+
+    ``flip_first_work`` stays as it is (flip begin -> first dispatch); this is
+    ONE ``flip_user_time`` event per D->P flip that reached a first leg 1, with
+    the parts: ``park_rpc_ms`` (the park RPC before the begin), ``pre_begin_ms``
+    (decode end -> flip begin), ``legs_ms`` (begin -> done), ``first_chunk_ms``
+    (done -> P prefill start). One clock: time.time() of the front."""
+
+    def __init__(self) -> None:
+        self._park: Optional[dict] = None
+        self._last_d_served: Optional[float] = None
+        self._armed: Optional[dict] = None
+
+    def note_park(self, epoch: int, t_sent: Optional[float], rpc_ms: Optional[float]) -> None:
+        self._park = {"epoch": int(epoch), "t_sent": t_sent, "rpc_ms": rpc_ms}
+
+    def note_d_served(self, now: float) -> None:
+        self._last_d_served = float(now)
+
+    def begin(self, epoch_before: int, flip_begin_ts: float, oldest_waiter_ts: Optional[float]) -> None:
+        """A D->P flip begins (``epoch_before`` = the D phase that ends)."""
+        park = self._park if (self._park is not None and self._park["epoch"] == int(epoch_before)) else None
+        if park is not None and park.get("t_sent") is not None:
+            end, src = float(park["t_sent"]), "park_rpc_sent"
+        elif self._last_d_served is not None and self._last_d_served <= flip_begin_ts:
+            end, src = self._last_d_served, "last_d_served"
+        else:
+            end, src = float(flip_begin_ts), "flip_begin"
+        if oldest_waiter_ts is not None and float(oldest_waiter_ts) > end:
+            end, src = float(oldest_waiter_ts), "oldest_waiter_arrival"
+        self._armed = {"epoch": int(epoch_before) + 1, "start_ts": end, "start_source": src,
+                       "flip_begin_ts": float(flip_begin_ts),
+                       "park_rpc_ms": (None if park is None else park.get("rpc_ms")), "done_ts": None}
+        self._park = None
+
+    def done(self, now: float) -> None:
+        if self._armed is not None and self._armed["done_ts"] is None:
+            self._armed["done_ts"] = float(now)
+
+    def first_prefill(self, rid: Optional[str], t_dispatch: float, t_end: float,
+                      p_prefill_s: Optional[float]) -> Optional[dict]:
+        """The first leg 1 after the flip finished: the event, or None."""
+        a = self._armed
+        if a is None:
+            return None
+        self._armed = None
+        if p_prefill_s is not None and p_prefill_s > 0:
+            start, src = max(float(t_dispatch), float(t_end) - float(p_prefill_s)), "leg1_end_minus_p_prefill_s"
+        else:
+            start, src = float(t_dispatch), "leg1_dispatch"
+        done = a["done_ts"] if a["done_ts"] is not None else start
+
+        def ms(x, y):
+            return None if x is None or y is None else round((float(y) - float(x)) * 1000.0)
+        return {"epoch": a["epoch"], "dir": "D>P", "rid": rid,
+                "start_ts": round(a["start_ts"], 3), "start_source": a["start_source"],
+                "prefill_start_ts": round(start, 3), "prefill_start_source": src,
+                "flip_user_ms": ms(a["start_ts"], start),
+                "parts": {"park_rpc_ms": (None if a["park_rpc_ms"] is None else round(float(a["park_rpc_ms"]))),
+                          "pre_begin_ms": ms(a["start_ts"], a["flip_begin_ts"]),
+                          "legs_ms": ms(a["flip_begin_ts"], done),
+                          "first_chunk_ms": ms(done, start)},
+                "definition": "Decode-Ende -> P-Prefill-Start", "clock": "time.time front"}
+
+
 class FirstWorkClock:
     """Flip time from ONE clock (time.time() of the front's own process): the flip's
     begin stamp and the woken group's first work are both taken here.

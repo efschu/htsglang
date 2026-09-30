@@ -5044,6 +5044,8 @@ class Front:
             "before the new ones; the D->P drain waits only for still_running",
             self.epoch, body["reason"], code, len(known) + len(late), known[:8], unknown[:8],
             late[:8], still[:8], time.time() - t_park)
+        # D->P flip time (user definition): D's decodes stopped with this park
+        self._ipc_dp_clock().note_park(self.epoch, t_park, (time.time() - t_park) * 1000.0)
         return "parked"
 
     # ---------------- seat / gate bookkeeping (C4, C5) ----------------
@@ -6503,6 +6505,15 @@ class Front:
             c = self.__dict__["_ipc_fw_clock"] = front_state_ipc.FirstWorkClock()
         return c
 
+    def _ipc_dp_clock(self):
+        """D->P flip time, the user's definition (front_state_ipc.DpFlipClock)."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        c = self.__dict__.get("_ipc_dp_clk")
+        if c is None:
+            c = self.__dict__["_ipc_dp_clk"] = front_state_ipc.DpFlipClock()
+        return c
+
     def _ipc_first_work_seen(self, group: str, what: str, rid: Optional[str]) -> None:
         """The woken group's first work after a flip -> one ``flip_first_work`` event
         (the flip time from the front's one clock). Cheap when nothing is armed."""
@@ -6602,6 +6613,7 @@ class Front:
         D's ``cached`` there is the P->D hand-off, not a cache hit made before the
         request. A subset of ``D``, cumulative, never reset."""
         self._ipc_note_served("D", prompt, cached, completion, cached_tier)
+        self._ipc_dp_clock().note_d_served(time.time())  # D->P flip time: D's last served leg 2
         if pending is not None and pending.leg1_ran:
             self._ipc_note_served("D_after_P", prompt, cached, completion, cached_tier)
 
@@ -8044,6 +8056,11 @@ class Front:
             # refuses at admission, before P's prefill is spent.
             g.served += 1
             self._ipc_note_served("P", pt, ct, 0, cached_tier_of(js))
+            # D->P flip time (user definition): the first leg 1 after a D->P flip
+            # names P's prefill start -- its end minus P's own prefill time
+            _dp = self._ipc_dp_clock().first_prefill(p.rid, t0, time.time(), d_prefill_seconds(js))
+            if _dp is not None:
+                self._ipc_publish("flip_user_time", _dp)
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
         finally:
@@ -9890,6 +9907,9 @@ class Front:
         self._ipc_publish("flip_begin", {"epoch_before": self.epoch, "sleep": src, "wake": dst,
                                          "flip_begin_ts": round(t_flip0, 3)})
         _fw_none = self._ipc_first_work_clock().arm(self.epoch + 1, src, dst, t_flip0)
+        if src == "D" and dst == "P":
+            _live = [q.t_arrive for q in self.queue if getattr(q, "fut", None) is None or not q.fut.done()]
+            self._ipc_dp_clock().begin(self.epoch, t_flip0, min(_live) if _live else None)
         if _fw_none is not None:  # FEHLT 3: the previous flip's woken group never worked
             self._ipc_publish("flip_first_work", _fw_none)
         # H91 part C rule 2: the wake message to D carries the hand-off count
@@ -10445,6 +10465,7 @@ class Front:
         from sglang.srt.weg2 import front_state_ipc as _fsi
         self._ipc_publish("flip_done", _fsi.flip_done_payload(rec, t_flip0))
         self._ipc_first_work_clock().done(time.time())  # FEHLT 3: pairs with one flip_first_work
+        self._ipc_dp_clock().done(time.time())
         if dc_off_path:
             _t = asyncio.get_running_loop().create_task(self._dc_reading_off_path(src, S.sid, rec))
             self._dc_tasks.add(_t)
