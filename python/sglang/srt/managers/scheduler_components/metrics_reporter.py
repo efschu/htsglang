@@ -543,6 +543,12 @@ class RankPrefillLog:
                 _wc.note_extend(new_tokens, gpu_s * 1000.0)
         except Exception:  # noqa: BLE001 -- an instrument feed never breaks the line
             pass
+        try:  # P-MINIFWD (weg2/p_minifwd_hold): the measured lone-rest price bounds the told wait
+            from sglang.srt.weg2 import p_minifwd_hold as _mh
+
+            _mh.note_forward(new_tokens, k, gpu_s * 1000.0)
+        except Exception:  # noqa: BLE001 -- an instrument feed never breaks the line
+            pass
         try:  # X-COST-LINE (weg2/prefill_clock): the measured numbers, never the parsed line
             from sglang.srt.weg2 import prefill_clock as _pfc
 

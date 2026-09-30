@@ -111,14 +111,62 @@ def fold_enabled() -> bool:
     return bool(envs.SGLANG_WEG2_ENABLE_P_TAIL_FOLD.get()) and skip_extend_enabled()
 
 
-def fold_applies(n_tokens: int, page_size: int) -> bool:
+def fold_applies(n_tokens: int, page_size: int, start: Optional[int] = None,
+                 claim: Optional[int] = None, grid: Optional[int] = None) -> bool:
     """H63: may the tail of an N-token prompt run inside its last chunk?
-    Only where the last chunk's extra_buffer track lands on the same page
-    anchor the cut would give, floor_page(N) == floor_page(N-1), i.e. N not a
-    page multiple; at N % page == 0 the fold would anchor at N (one token
-    deeper than any reader may claim) and the cut stays."""
+    Where the last chunk's extra_buffer track lands on the same page anchor
+    the cut would give, floor_page(N) == floor_page(N-1), i.e. N not a page
+    multiple. At N % page == 0 the default track anchors at N (one token
+    deeper than any reader may claim); the fold then applies only where the
+    CLAIM ANCHOR track (``schedule_batch._weg2_claim_track``) moves that
+    anchor onto the reader's claim N - page INSIDE this last chunk
+    ``[start, N)`` (:func:`page_end_fold_applies`), otherwise the cut stays."""
     page = int(page_size or 1)
-    return fold_enabled() and page > 1 and int(n_tokens) % page != 0
+    if not (fold_enabled() and page > 1):
+        return False
+    if int(n_tokens) % page != 0:
+        return True
+    return page_end_fold_applies(n_tokens, page, start, claim, grid)
+
+
+def track_grid(page_size: int) -> int:
+    """The grid the extend track moves on (``server_args.mamba_cache_chunk_size``
+    = max(FLA chunk, page)); the page where no server args exist (desk)."""
+    page = max(1, int(page_size or 1))
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        g = int(getattr(get_server_args(), "mamba_cache_chunk_size", 0) or 0)
+    except Exception:  # noqa: BLE001 -- desk callers without a server
+        g = 0
+    return g if g > 0 else page
+
+
+def page_end_fold_applies(n_tokens: int, page_size: int, start: Optional[int],
+                          claim: Optional[int], grid: Optional[int] = None) -> bool:
+    """P-MINIFWD (y3r 09292330, SGLANG_WEG2_TAIL_FOLD_PAGE_END): the fold of a
+    page-multiple prompt. The END-ANCHOR split held its last 4 tokens back
+    (``WEG2 END-ANCHOR SPLIT ... 32828 of 32832``): a forward of its own for
+    the tail (1.37-1.57 s on PP0) and, because the body [.., N-4) was then
+    TRUNCATED, no co-admission of a waiting request -- the 60/124-token body
+    remainder ran alone too (weg2-74 chain: six 124-token forwards of
+    1.1 s each, their successors' chunk 0 shrank to 16320). The split existed
+    only to put the recurrent anchor at N - page, where a bigram reader of
+    N claims (floor_page(N-2)). The CLAIM ANCHOR track puts it there inside
+    the last chunk when that chunk starts below the claim on the track grid:
+    ``start < claim < N`` and ``(claim - start) % grid == 0`` -- exactly
+    ``fork_anchor.track_target(start, N, claim, grid, N) == claim``. Anything
+    else (no claim: not group P / not the bigram keying / a P-trim request; a
+    last chunk starting at or above the claim) keeps the split."""
+    if not envs.SGLANG_WEG2_TAIL_FOLD_PAGE_END.get():
+        return False
+    if start is None or claim is None:
+        return False
+    n, page, s, c = int(n_tokens), int(page_size), int(start), int(claim)
+    g = int(grid) if grid else track_grid(page)
+    if c != n - page or not (s < c < n) or g <= 0:
+        return False
+    return (c - s) % g == 0
 
 
 # -- geometry (pure) -------------------------------------------------------------
@@ -891,10 +939,12 @@ def _arm_fold_one(req, allocator, page_size: int, stream, tree_cache=None) -> bo
     if not _is_p_request(req) or getattr(req, "extend_range", None) is None:
         return False
     fill = req.full_untruncated_fill_ids
-    if int(req.extend_range.end) != len(fill) or not fold_applies(len(fill), page_size):
+    claim = claim_anchor_end(req, tree_cache)
+    if int(req.extend_range.end) != len(fill) or not fold_applies(
+            len(fill), page_size, start=int(req.extend_range.start), claim=claim):
         return False
     spec = fold_spec(req.rid, req.origin_input_ids, req.extra_key, page_size, _grain_of(allocator, page_size),
-                     claim=claim_anchor_end(req, tree_cache))
+                     claim=claim)
     if spec is None or spec.n_tokens != len(fill):
         return False
     _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn={}, event=None, stream=stream, e1=False)
