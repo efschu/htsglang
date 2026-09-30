@@ -653,6 +653,15 @@ class Envs:
     # the ZFS pool instead of the told store disk. A dry run only warns.
     # Empty = no filesystem is refused.
     SGLANG_WEG2_STORE_REFUSE_FS = EnvTuple(("overlay", "zfs"))
+    # STORE_MLOCK (30.09., NF y3z/y4a D load 99 s: 6-8 store files per rank
+    # whose registration stalled 4-17 s behind the host's direct compaction,
+    # which isolates the pinned 4K shmem store pages and fails to migrate
+    # them): mlock every expert-store mapping (layers/moe/shared_pinned.py)
+    # BEFORE its cudaHostRegister, so the pages sit on the unevictable LRU.
+    # Only effective together with the HOST sysctl
+    # vm.compact_unevictable_allowed=0; OFF until that is set and the metal
+    # shows it. A failed mlock is refused by name (Weg2StoreMlockRefused).
+    SGLANG_WEG2_STORE_MLOCK = EnvBool(False)
     # RANK_STATE_DIR (IPC Phase 1, user 28.09. "über logfiles?"): the
     # directory each rank writes its versioned RankState record into
     # (weg2/rank_state.py). Set by the weg2 launcher per group, next to the
