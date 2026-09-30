@@ -32,8 +32,8 @@ from sglang.srt.utils.device_timer import DeviceTimer, SplitDeviceTimer
 
 class MissWindowTimer(SplitDeviceTimer):
     """PR (30.09.): the per-rank prefill timer with the pool miss window of
-    ``layers.moe.pool_miss_cost`` around the same forward -- the misses the
-    forward's pool syncs report and the forward's own ``pool.fetch`` family
+    ``layers.moe.pool_miss_cost`` around the same forward -- the rows the
+    forward's host-plan fetches load and their own ``pool.host_fetch`` spans
     travel in ONE interval, so the prefill line pairs them or drops them
     together. Off (no record dir): the window is a dict nobody fills."""
 
@@ -51,9 +51,10 @@ class MissWindowTimer(SplitDeviceTimer):
 
 
 def _note_paired_miss(families, miss_window) -> None:
-    """PR: a PAIRED, split-known prefill duration hands its own pool.fetch ms
-    and the misses of its window to the miss record (refused there when the
-    window is empty or a decode step contaminated it). Never raises."""
+    """PR/PR2: a PAIRED, split-known prefill duration hands its own
+    ``pool.host_fetch`` ms and span count, with the rows its window's host-plan
+    fetches loaded, to the miss record (refused there unless the span count is
+    the window's fetch count). Never raises."""
     if miss_window is None:
         return
     try:
@@ -61,7 +62,7 @@ def _note_paired_miss(families, miss_window) -> None:
 
         ms, n = 0.0, 0
         for name, stat in (families or {}).items():
-            if str(name).split(":")[-1] == pool_miss_cost.FETCH_FAMILY:
+            if str(name).split(":")[-1] == pool_miss_cost.HOST_FETCH_FAMILY:
                 ms += float(stat.total_ms)
                 n += int(stat.count)
         pool_miss_cost.note_paired(fetch_ms=ms, fetch_count=n, window=miss_window)

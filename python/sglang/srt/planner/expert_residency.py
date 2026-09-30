@@ -872,8 +872,8 @@ OWNED_MISS_MS_SOURCE_SEED = "Saat UNMEASURED (plan_s3_251 §1, H29/x138)"
 #:
 #: * RECORD -- written by the D RANKS themselves at their sleep
 #:   (``layers.moe.pool_miss_cost``, ``SGLANG_WEG2_OWNED_MISS_RECORD=<dir>``):
-#:   PR (30.09.): per timed prefill forward, its pool.fetch device ms / the
-#:   rows the SAME forward missed (``pairing`` = OWNED_MISS_PAIRING), counted
+#:   PR2 (30.09.): per timed prefill forward, its host-plan fetch device ms /
+#:   the rows the SAME fetches loaded (``pairing`` = OWNED_MISS_PAIRING), counted
 #:   only from OWNED_MISS_MIN_PAIRED_FORWARDS paired forwards per rank;
 #: * LOG-BOOTSTRAP -- ``weg2.tools.owned_miss_record`` from one D log, the
 #:   TRANSITION ("aus Log (Uebergang)") until the first rank record exists;
@@ -968,10 +968,10 @@ def _owned_miss_model_ok(model: Optional[str], entry_model: object) -> bool:
 
 
 #: PR (30.09.): a rank record counts only in the PAIRED form of
-#: ``layers.moe.pool_miss_cost`` (one timed prefill forward's pool.fetch ms
-#: against the rows THE SAME forward missed) -- the older scope mixed graphed
-#: decode rows into the denominator.
-OWNED_MISS_PAIRING = "prefill_window_v2"
+#: ``layers.moe.pool_miss_cost`` (PR2: one timed prefill forward's host-plan
+#: fetch ms against the rows THE SAME fetches loaded) -- the older scopes mixed
+#: graphed decode rows into the denominator (v1) or paired foreign halves (v2).
+OWNED_MISS_PAIRING = "prefill_hostfetch_v3"
 #: PR: RECORD beats the seed only from this many paired forwards on EVERY rank
 #: of the youngest window; fewer stay the seed, and the line names the count.
 OWNED_MISS_MIN_PAIRED_FORWARDS = 16

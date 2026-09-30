@@ -5,13 +5,12 @@ launcher sets it for D by default; the layout of the VRAM contract M3,
 ``records/<line>/<model_id>/<kind>``): each D rank accumulates, over its
 phase, PAIRED per timed prefill forward (PR, 30.09.; see below):
 
-* the device ms of the pool's host->device expert traffic of THAT forward --
-  the collective clock's ``pool.fetch`` family of the per-rank prefill line's
-  split-known, #691-paired duration (``RankPrefillLog.flush``), and
-* the expert rows THAT forward missed -- the pool's own per-layer counters
-  (``take_report`` in ``sync_pool_from_host``) of the syncs inside the
-  forward's window, every pool layer, only when each reported exactly one
-  forward since its last sync (no graphed decode row in the denominator),
+* the device ms of THAT forward's host-plan expert fetches -- the collective
+  clock's ``pool.host_fetch`` family (one span per ``_fetch``) of the
+  per-rank prefill line's split-known, #691-paired duration
+  (``RankPrefillLog.flush``), and
+* the expert rows THOSE fetches loaded -- the host plan's own ``fetch_plan``
+  (PR2, see below): no device counter, no host read, no decode row,
 
 and writes one JSON record at D's sleep into ``<root>/<model_id>/owned_miss/``
 (:func:`record_dir_for`), next to the #276 heat record, before any pause. ``ms per missed row`` = fetch ms / missed rows is the cost the owned
@@ -22,12 +21,13 @@ these records (``read_owned_miss_rank_records`` on the same
 
 A phase without a paired forward writes NOTHING (named in one warning) -- a
 cost from half the numbers would be invented. Off, nothing is counted: one
-cached bool test per pool sync and per timed prefill forward.
+cached bool test per timed prefill forward and one ``None`` test per fetch.
 """
 
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 import logging
 import os
 import re
@@ -38,8 +38,7 @@ logger = logging.getLogger(__name__)
 
 MARKER = "OWNED-MISS-COST (#239 S3f)"
 RECORD_KIND = "owned_miss_rank"
-RECORD_VERSION = 2
-FETCH_FAMILY = "pool.fetch"
+RECORD_VERSION = 3
 RECORD_SUBDIR = "owned_miss"
 
 _DIR: Optional[str] = None
@@ -86,42 +85,45 @@ def _reset_for_test() -> None:
     _reset()
 
 
-def note_sync(forwards: int, misses: int) -> None:
-    """One pool layer's counters since its last sync (every layer, not the
-    sampled ones the log line prints)."""
-    if record_dir() is None:
-        return
-    _note_window(forwards, misses)
-
-
 # ---------------------------------------------------------------------------
-# PR (30.09.): the PAIRED record -- one timed prefill forward's pool.fetch ms
-# against the rows THE SAME forward missed.
+# The PAIRED record -- one timed prefill forward's host->device expert fetch
+# ms against the rows THE SAME fetches loaded.
 #
-# The record above paired the fetch ms of split decode rounds with the misses
-# of EVERY pool sync: a sync after an eager forward reports the device
-# counters since the previous sync, i.e. the graphed decode rounds in between
-# as well, whose fetch time no production round can split (graph reader off).
-# Five NF boots (y3u-y3z) never wrote one: D-EIGENTUM priced its misses with
-# the seed. Here a window opens and closes around each timed prefill forward
-# (the per-rank prefill timer's bracket, metrics_reporter), the pool syncs of
-# that forward land in it, and the forward's own pool.fetch family is added
-# only when the prefill line pairs its duration (the #691 guard holds) and
-# every pool layer reported exactly ONE forward since its last sync -- no
-# decode step in between, so no graphed decode row reaches the denominator.
+# PR (30.09., 363c173670) paired the forward's ``pool.fetch`` family with the
+# misses of the pool syncs inside its window. Both halves were foreign: a
+# device-planned eager forward (D-Mini-Extend) never syncs, so its misses
+# surface at the NEXT host-plan sync, among the graphed decode steps; and the
+# host-planned forward (``_run_eager_host_plan`` -> run_waves) -- the big D
+# prefills -- fetches through ``_fetch``, which carried no clock span, while
+# its sync reports only the device steps before it. So no window paired
+# anything, and a mixed one (device-step layers + host-plan layers) could pair
+# one forward's fetch with earlier decode misses.
+#
+# PR2: the host plan KNOWS the rows it reloads (``fetch_plan``). Each
+# ``_fetch`` inside a window adds its rows here and runs its copies under ONE
+# clock span of the family ``pool.host_fetch`` (device events, no host read);
+# the prefill line sums that family only. Numerator and denominator are the
+# same calls: the pair holds when the harvested span count equals the window's
+# fetch count. Device-step layers stay out of both halves (their rows are
+# device counters, readable only by a host sync), pool syncs feed nothing.
 # ---------------------------------------------------------------------------
 
-PAIRING = "prefill_window_v2"
+PAIRING = "prefill_hostfetch_v3"
+HOST_FETCH_FAMILY = "pool.host_fetch"
+#: A window times at most this many fetches -- beyond it the forward is
+#: dropped whole (never half a pair), and a token-major prefill's thousands of
+#: waves cannot load the forward with events.
+MAX_WINDOW_FETCHES = 4096
 _WIN: Optional[Dict[str, Any]] = None
 _PAIR: Dict[str, float] = {"fetch_ms": 0.0, "miss_rows": 0, "forwards": 0, "refused": 0}
 
 
 def open_window(holder: Dict[str, Any]) -> None:
-    """A timed prefill forward starts: its pool syncs fill ``holder``."""
+    """A timed prefill forward starts: its host-plan fetches fill ``holder``."""
     global _WIN
     if record_dir() is None:
         return
-    holder.update(layers=0, misses=0, clean=True)
+    holder.update(rows=0, fetches=0, clean=True)
     _WIN = holder
 
 
@@ -130,30 +132,48 @@ def close_window() -> None:
     _WIN = None
 
 
-def _note_window(forwards: int, misses: int) -> None:
+def window_open() -> bool:
+    return _WIN is not None
+
+
+def host_fetch_span(rows: int, clock=None):
+    """Around ONE host-plan ``_fetch`` (its copies and the join): inside an
+    open window, add its ``rows`` and return the clock's ``pool.host_fetch``
+    span; else a no-op context. A window whose clock is not armed (a refused
+    arming) or that is past MAX_WINDOW_FETCHES is marked unclean -- dropped
+    whole at the pairing. ``clock``: the process's collective clock unless
+    given."""
     w = _WIN
-    if w is None:
-        return
-    w["layers"] += 1
-    w["misses"] += int(misses)
-    if int(forwards) != 1:
-        w["clean"] = False  # a decode step since the last sync: not this forward's rows alone
+    if w is None or int(rows) <= 0:
+        return nullcontext()
+    if clock is None:
+        from sglang.srt.utils.collective_clock import collective_clock
+
+        clock = collective_clock()
+    if not clock.armed or int(w["fetches"]) >= MAX_WINDOW_FETCHES:
+        w["clean"] = False
+        return nullcontext()
+    w["rows"] += int(rows)
+    w["fetches"] += 1
+    return clock.span(HOST_FETCH_FAMILY)
 
 
 def note_paired(*, fetch_ms: float, fetch_count: int, window: Optional[Mapping[str, Any]]) -> bool:
     """The prefill line paired one duration with its record: add the forward's
-    pool.fetch ms and its own missed rows. Refused (counted, nothing added)
-    when the window is missing or empty (a forward the window did not cover),
-    contaminated by a decode step, or when the forward fetched nothing."""
+    ``pool.host_fetch`` ms and the rows those fetches loaded. Refused (counted,
+    nothing added) when the window is missing or empty, unclean, when the
+    harvested span count differs from the window's fetch count (not the same
+    calls), or when the forward fetched nothing."""
     if record_dir() is None:
         return False
-    ok = (window is not None and int(window.get("layers", 0)) > 0 and bool(window.get("clean"))
-          and int(window.get("misses", 0)) > 0 and int(fetch_count) > 0 and float(fetch_ms) > 0.0)
+    ok = (window is not None and bool(window.get("clean")) and int(window.get("rows", 0)) > 0
+          and int(window.get("fetches", 0)) > 0 and int(fetch_count) == int(window["fetches"])
+          and float(fetch_ms) > 0.0)
     if not ok:
         _PAIR["refused"] += 1
         return False
     _PAIR["fetch_ms"] += float(fetch_ms)
-    _PAIR["miss_rows"] += int(window["misses"])
+    _PAIR["miss_rows"] += int(window["rows"])
     _PAIR["forwards"] += 1
     return True
 
@@ -182,8 +202,8 @@ def rank_record(*, rank: int, group: str, reason: str, model: Optional[str],
         "paired_refused": int(_PAIR["refused"]),
         "pairing": PAIRING,
         "ms_per_row": fetch / rows,
-        "scope": "pool.fetch of timed prefill forwards / the rows the SAME forward missed "
-                 "(no decode step since the last sync)",
+        "scope": "pool.host_fetch ms of timed prefill forwards' host-plan fetches / the rows "
+                 "the SAME fetches loaded (device-step layers and decode rows in neither)",
     }
 
 
@@ -201,8 +221,8 @@ def flush(*, rank: int, group: str, reason: str, model: Optional[str],
         if rec is None:
             logger.warning(
                 "%s rank %d: no record (paired prefill forwards=%d, refused=%d, missed rows=%d, "
-                "fetch_ms=%.1f) -- no timed prefill forward of this phase fetched pool rows "
-                "without a decode step since the last sync",
+                "fetch_ms=%.1f) -- no timed prefill forward of this phase ran a host-plan fetch "
+                "the clock timed",
                 MARKER, rank, int(_PAIR["forwards"]), int(_PAIR["refused"]),
                 int(_PAIR["miss_rows"]), _PAIR["fetch_ms"])
             _reset()

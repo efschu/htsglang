@@ -46,18 +46,28 @@ def armed(tmp_path):
     pmc._reset_for_test()
 
 
-def _forward(misses_per_layer, forwards=1):
-    """One timed prefill forward: the window around its pool syncs."""
+class _Clock:
+    armed = True
+
+    @contextlib.contextmanager
+    def span(self, label=None):
+        yield
+
+
+def _forward(rows_per_layer):
+    """One timed prefill forward (PR2): the window around its host-plan
+    fetches, one per layer."""
     holder: dict = {}
     pmc.open_window(holder)
     for _ in range(LAYERS):
-        pmc.note_sync(forwards, misses_per_layer)
+        with pmc.host_fetch_span(rows_per_layer, _Clock()):
+            pass
     pmc.close_window()
     return holder
 
 
 def _fams(ms, count):
-    return {"pool.fetch": types.SimpleNamespace(total_ms=ms, count=count),
+    return {pmc.HOST_FETCH_FAMILY: types.SimpleNamespace(total_ms=ms, count=count),
             "tp.all_reduce": types.SimpleNamespace(total_ms=5.0, count=96)}
 
 
@@ -74,20 +84,12 @@ def test_a_paired_prefill_forward_writes_its_own_cost(armed):
     log = _log()
     log.record(2144, 0, timed=True)
     log._on_duration(4.0, None)  # the clock slot: none in this hermetic run
-    log._durations[-1] = (4.0, 0.4, _fams(12.0, 48), w)
+    log._durations[-1] = (4.0, 0.4, _fams(12.0, LAYERS), w)
     log.flush()
     rec = pmc.rank_record(rank=1, group="D", reason="test", model="m")
     assert rec is not None and rec["pairing"] == pmc.PAIRING
     assert rec["miss_rows"] == 4 * 10 and rec["rounds"] == 1
     assert abs(rec["ms_per_row"] - 12.0 / 40) < 1e-9
-
-
-def test_a_forward_behind_decode_steps_is_not_in_the_denominator(armed):
-    """The sync after an eager forward reports every step since the last one:
-    a graphed decode step in between (forwards=3) never reaches the record."""
-    w = _forward(10, forwards=3)
-    assert pmc.note_paired(fetch_ms=12.0, fetch_count=48, window=w) is False
-    assert pmc.rank_record(rank=1, group="D", reason="t", model="m") is None
 
 
 def test_a_foreign_forward_is_dropped(armed):
@@ -98,13 +100,13 @@ def test_a_foreign_forward_is_dropped(armed):
     log = _log()
     for _ in range(mr.RankPrefillLog.MAX_PAIR_SKEW + 2):
         log.record(8, 0, timed=True)
-    log._durations.append((0.1, 0.01, _fams(3.0, 12), _forward(5)))
+    log._durations.append((0.1, 0.01, _fams(3.0, LAYERS), _forward(5)))
     log.flush()  # skew > limit: refused, drained untimed
     assert log.pairing_refused
     assert pmc.rank_record(rank=1, group="D", reason="t", model="m") is None
 
 
-def _rec(rank, n, fetch=40.0, rows=100, pairing="prefill_window_v2"):
+def _rec(rank, n, fetch=40.0, rows=100, pairing="prefill_hostfetch_v3"):
     return {"kind": er.OWNED_MISS_RANK_KIND, "rank": rank, "time_unix": time.time(),
             "fetch_ms": fetch, "miss_rows": rows, "rounds": n, "model": None,
             "pairing": pairing}
@@ -159,7 +161,8 @@ def test_the_miss_window_timer_brackets_the_same_interval(armed):
     try:
         t = object.__new__(mr.MissWindowTimer)
         with t.wrap({"category": "extend"}):
-            pmc.note_sync(1, 7)
+            with pmc.host_fetch_span(7, _Clock()):
+                pass
     finally:
         mr.SplitDeviceTimer.wrap = orig
-    assert seen and seen[0]["miss_window"]["misses"] == 7 and pmc._WIN is None
+    assert seen and seen[0]["miss_window"]["rows"] == 7 and pmc._WIN is None

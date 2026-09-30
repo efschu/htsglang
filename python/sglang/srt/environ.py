@@ -2840,16 +2840,17 @@ class Envs:
     SGLANG_DEBUG_MOE_HEAT = EnvStr(None)
     # #239 S3f miss record (layers/moe/pool_miss_cost.py): the records root
     # of the line (``.../records/<line>``, IPC plan section 2.2 req. 7 / VRAM
-    # contract M3) turns it on. PR (30.09.): each D rank pairs, per timed
-    # prefill forward, that forward's pool.fetch device ms with the rows THE
-    # SAME forward missed (a window at the prefill timer's bracket; only a
-    # #691-paired, split-known duration whose layers saw no decode step since
-    # their last sync counts), and writes one JSON record per rank at its
+    # contract M3) turns it on. PR2 (30.09.): each D rank pairs, per timed
+    # prefill forward, the device ms of its host-plan expert fetches
+    # (``pool.host_fetch`` spans) with the rows THE SAME fetches loaded (a
+    # window at the prefill timer's bracket; only a #691-paired, split-known
+    # duration whose span count equals its fetch count counts), and writes
+    # one JSON record per rank at its
     # sleep into ``<root>/<model_id>/owned_miss/`` (next to the #276 heat
     # record). The launcher sets it for group D by default (evidence
     # ``records/weg2``; --env-d names another root, empty = off); its owned
     # solve reads RECORD from K paired forwards per rank, else the seed.
-    # Unset = off: one cached bool test per pool sync.
+    # Unset = off: one None test per fetch.
     SGLANG_WEG2_OWNED_MISS_RECORD = EnvStr(None)
     # H95c (Nutzer 26.09.: "1,6gb experten cache kostet es nur bei tatsaechlich
     # 6 sitzen"): D's per-seat posts are PHYSICALLY backed only for the seats

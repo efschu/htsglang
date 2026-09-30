@@ -13,6 +13,7 @@ at bs1/bs2 -- the solve steered on the seed.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import types
@@ -219,16 +220,25 @@ def miss_dir(tmp_path, monkeypatch):
     pmc._reset_for_test()
 
 
+class _Clock:
+    armed = True
+
+    @contextlib.contextmanager
+    def span(self, label=None):
+        yield
+
+
 def _paired_forwards(fetch_per_forward, miss_per_layer, forwards=100):
-    """PR (30.09.): the record pairs timed prefill forwards -- each one's
-    window sees every pool layer sync once, then its pool.fetch ms."""
+    """PR2 (30.09.): the record pairs timed prefill forwards -- each one's
+    window sees every layer's host-plan fetch once, then their span ms."""
     for _ in range(forwards):
         w: dict = {}
         pmc.open_window(w)
-        for _ in range(48):  # every pool layer syncs, one forward each
-            pmc.note_sync(1, miss_per_layer)
+        for _ in range(48):  # every pool layer fetches its missed rows once
+            with pmc.host_fetch_span(miss_per_layer, _Clock()):
+                pass
         pmc.close_window()
-        pmc.note_paired(fetch_ms=fetch_per_forward, fetch_count=12, window=w)
+        pmc.note_paired(fetch_ms=fetch_per_forward, fetch_count=48, window=w)
 
 
 def _phase(rank, fetch_per_forward, miss_per_layer, forwards=100, model=MODEL):
@@ -267,8 +277,9 @@ def test_off_counts_nothing_and_writes_nothing(monkeypatch):
 
 
 def test_a_phase_without_split_writes_no_record(miss_dir):
-    for _ in range(48):  # decode syncs outside any prefill window
-        pmc.note_sync(200, 10)
+    for _ in range(48):  # host fetches outside any prefill window
+        with pmc.host_fetch_span(10, _Clock()):
+            pass
     assert pmc.flush(rank=1, group="D", reason="sleep", model=MODEL) is None
     assert not miss_dir.exists() or not any(miss_dir.iterdir())
 
