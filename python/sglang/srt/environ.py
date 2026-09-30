@@ -3679,6 +3679,14 @@ class Envs:
     # ARRIVAL-SEAT: the decode part of an arrival's KV need when the client
     # set no max_tokens (prompt + this = the need checked against D's free KV).
     SGLANG_WEG2_ARRIVAL_DECODE_RESERVE_TOKENS = EnvInt(2048)
+    # ARRIVAL-SEAT AGE PLAN (Nutzer 30.09. ~14:40Z/14:45Z, the seat policy):
+    # age has the right of way; a younger request that fits beside older
+    # running ones is backfilled (no time limit); the oldest waiter displaces
+    # younger running decodes ONLY when it does not fit otherwise -- the
+    # fewest youngest that make it fit (seat and KV), and only when they do.
+    # Replaces the wait bound's blanket youngest park and the bound's end of
+    # backfill. Needs SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE; off = byte-identical.
+    SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN = EnvBool(False)
     # X-COST-LINE (29.09., third part of the ski-rental decision; NF z30w
     # 09290827 and 27B 09290020 both ran with `X NO-SOLVE: no r_d` because the
     # solo r_D probe never fired under load). X is re-solved from D's measured

@@ -30,7 +30,7 @@ Pure functions only -- the front's wiring is in ``weg2/front.py``
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, Mapping, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 MARKER = "WEG2 ARRIVAL-SEAT"
 
@@ -45,6 +45,10 @@ REASON_KV = "arrival-seat-kv"
 #: one KV displacement per this many seconds: longer than the front's KV
 #: reading cache (1 s), so the next verdict reads D after the park landed
 KV_PARK_COOLDOWN_S = 1.5
+#: AGE PLAN: the park reason D sees when the oldest waiter needs a SEAT
+REASON_AGE = "arrival-seat-age"
+#: AGE PLAN marker (one line per displacement and per plan verdict change)
+AGE_MARKER = "WEG2 SEAT-AGE-PLAN"
 
 #: counters the front keeps (all published under state.json front.arrival_seat)
 COUNTERS = (
@@ -61,6 +65,10 @@ COUNTERS = (
     # rückt nach und verdrängt Jüngere"), and the KV need's two honest terms
     "arrival_seat_kv_displace", "arrival_seat_kv_displace_refused",
     "arrival_seat_kv_shared_tokens", "arrival_seat_kv_decode_clipped",
+    # AGE PLAN (30.09. ~14:45Z): displacements the plan took, heads it found
+    # blocked by OLDER running requests (-> backfill), the seat-need ones
+    "arrival_seat_age_displace", "arrival_seat_age_blocked_by_elders",
+    "arrival_seat_age_seat_displace",
 )
 
 
@@ -203,6 +211,54 @@ def kv_displace_victim(head_arrival: Optional[float], running: Iterable[str],
     if sum(max(0, int(tokens_of.get(r, 0) or 0)) for _, r in younger) < int(deficit):
         return None
     return max(younger)[1]
+
+
+def age_plan_enabled(env=None) -> bool:
+    """AGE PLAN switch -- acts only with the rule itself on."""
+    if env is not None:
+        raw = str(env.get("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN", "") or "").strip().lower()
+        return raw in ("1", "true", "yes", "on") and enabled(env)
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN.get()) and enabled()
+
+
+def displace_plan(head_arrival: Optional[float], seat_is_free: bool, deficit: int,
+                  running: Iterable[str], arrival_of: Mapping[str, float],
+                  tokens_of: Mapping[str, int]) -> Optional[List[str]]:
+    """AGE PLAN (Nutzer 30.09. ~14:40Z: "der ältere ist immer bevorzugt ...
+    sobald keine ältesten mehr da sind die den kv für den mittleren
+    blockieren, wird der mittlere auf die karten gezogen und verdrängt ggf.
+    auch den jüngsten"; ~14:45Z: "natürlich muss ein jüngerer nur verdrängt
+    werden, wenn der ältere nicht draufpasst. nicht pauschal").
+
+    ``[]``: the head fits (a seat is free and ``deficit`` <= 0) -- nobody is
+    displaced. ``None``: parking every running decode that ARRIVED after the
+    head still gives it no seat or not its KV -- older running requests block
+    it; nobody is displaced and younger ones that fit are backfilled. Else the
+    FEWEST running decodes, youngest arrival first, all younger than the head,
+    whose parking gives it a seat (one, when none is free) and covers the KV
+    ``deficit``. ``tokens_of`` is the front's lower bound of a decode's KV (the
+    prompt it priced); the caller parks the plan's FIRST rid per KV tick and
+    plans again on D's next reading, so an under-priced victim never takes a
+    second one with it. A rid without an arrival stamp counts as old."""
+    if head_arrival is None:
+        return None
+    need_seat = 0 if seat_is_free else 1
+    deficit = max(0, int(deficit or 0))
+    if need_seat == 0 and deficit == 0:
+        return []
+    younger = sorted(((float(arrival_of[r]), r) for r in running
+                      if r in arrival_of and float(arrival_of[r]) > float(head_arrival)),
+                     reverse=True)
+    out: List[str] = []
+    freed = 0
+    for _t, r in younger:
+        out.append(r)
+        freed += max(0, int(tokens_of.get(r, 0) or 0))
+        if len(out) >= need_seat and freed >= deficit:
+            return out
+    return None
 
 
 def kv_need(est_prompt_tokens: int, reserve_tokens: int) -> int:
