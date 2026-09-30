@@ -628,6 +628,15 @@ class Envs:
     # (a reference over P's whole phase) stays closed. Model-neutral; off
     # until the first boot series, then default on.
     SGLANG_WEG2_ENABLE_WAKE_READ_EARLY = EnvBool(False)
+    # WAKE_READ_ARENA_GATE (#248f, 30.09., NF y4b ep18): the #248 hold reads of
+    # a wake are issued in hold (arrival) order only while their pages fit in
+    # the KV arena together (its slot count -- no reserve); a younger read
+    # whose pages would overrun it waits parked in the #1471 settle, by name,
+    # and is issued as soon as the older reads leave the settle. y4b: three
+    # hold reads of 1412 + 1728 + 3841 = 6981 pages against 6485 slots, and
+    # weg2-16-29's L3 fills evicted 449 of its OWN kept pages (#248e
+    # ORDERED-EVICT) -- 4 re-reads, 4.5 s held after the wake.
+    SGLANG_WEG2_ENABLE_WAKE_READ_ARENA_GATE = EnvBool(True)
     # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
     # rank 0, never the scheduler thread) that copies the kept pages of
     # parked and waiting rids from the arena to HiCacheFile without freeing

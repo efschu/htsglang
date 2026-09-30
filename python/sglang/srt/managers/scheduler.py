@@ -6638,6 +6638,22 @@ class Scheduler(
                 _ev()
         except Exception as exc:  # noqa: BLE001
             logger.info("#1471 SETTLE hicache events n/a (%s: %s)", type(exc).__name__, exc)
+        # #248f (30.09., NF y4b ep18): hold reads waiting for arena room are
+        # issued as the older reads leave the settle (arrival order); while
+        # they wait they are neither re-read, voted, nor released.
+        _cap_wait = []
+        try:
+            from sglang.srt.weg2 import park_l3 as _pl3f
+
+            _pl3f.issue_capacity_waiters(self, settle)
+            _cap_wait = [r for r in settle if _pl3f.capacity_waiting(r)]
+        except Exception as exc:  # noqa: BLE001 -- a failed issue leaves them waiting
+            logger.warning("#248f WAKE-READ capacity issue n/a (%s: %s)", type(exc).__name__, exc)
+        if _cap_wait:
+            _ids = {id(r) for r in _cap_wait}
+            settle = [r for r in settle if id(r) not in _ids]
+            if not settle:
+                return 0
         now = time.monotonic()
         _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
         keep, release = [], []
@@ -6764,7 +6780,7 @@ class Scheduler(
                 release.append((req, state, lapsed))
             else:
                 keep.append(req)
-        self.weg2_post_wake_settle = keep
+        self.weg2_post_wake_settle = keep + _cap_wait
         if release:
             try:  # #1461: back under the strict claim law
                 _cc = self.tree_cache.cache_controller
@@ -6852,6 +6868,9 @@ class Scheduler(
         # from a rank-local timer; "due" parks the request (the settle tick
         # re-issues it group-uniformly).
         for _r in list(hold):
+            if getattr(_r, "_weg2_248f_capacity_wait", False):  # #248f: unread, parked
+                _states.append("capacity")
+                continue
             try:
                 _state = _refetch(_r, _now, allow_reissue=False)
                 if _state == "due":
@@ -6873,7 +6892,8 @@ class Scheduler(
         # weg2rc2: a short read whose remainder fits in X is settled -- D
         # prefills the remainder (#1324 tail) instead of parking for 20 s.
         _tail = [_weg2_store_tail_settles(self, _r) for _r in list(hold)]
-        _agreed = _gmin([st == "complete" or t for st, t in zip(_states, _tail)])  # #1471e
+        _agreed = _gmin([(st == "complete" or t) and st != "capacity"
+                         for st, t in zip(_states, _tail)])  # #1471e, #248f
         for _r, ok, st, t in zip(list(hold), _agreed, _states, _tail):
             if ok and t and st != "complete":
                 logger.info("#1471 SETTLE-TAIL rid=%s delivered=%s remainder=%s -- released at the "
