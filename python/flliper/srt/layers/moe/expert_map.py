@@ -609,8 +609,8 @@ def _refuse_if_inconsistent_nested(emap: dict, total: int) -> Optional[str]:
         return f"D: {len(missing_d)} kalte Ids ohne Store-Platz (erste {missing_d[:4]})"
     if cold_ids and max(int(v) for v in slot_of_.values()) >= int(emap["slots"]):
         return f"ein Platz liegt hinter dem Ende der Datei ({emap['slots']})"
-    grund = nested_join_verdict(emap)
-    return grund[0] if grund else None
+    refuse_reason = nested_join_verdict(emap)
+    return refuse_reason[0] if refuse_reason else None
 
 
 def phase_of(group: str) -> str:

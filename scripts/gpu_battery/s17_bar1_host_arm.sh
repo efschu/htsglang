@@ -192,15 +192,15 @@ echo "GATE PASSED arm=$ARM (all $NGROUP group(s) ACHIEVED=bar1)"
 # #354 phase recipe); this script takes all four on every arm and the table
 # picks the phase-correct column, so a boot is never repeated for one number.
 for N in 1 8; do
-    hssh 900 "cd '$H_WT' && '$H_PY' '$H_WT/scripts/gpu_battery/s12_prefill_kurve.py' --mode messen \
-        --port $PORT --out-dir '$H_OUT' --arm '$ARM' --sessions $N --folge $N \
+    hssh 900 "cd '$H_WT' && '$H_PY' '$H_WT/scripts/gpu_battery/s12_prefill_curve.py' --mode messen \
+        --port $PORT --out-dir '$H_OUT' --arm '$ARM' --sessions $N --step_sequence $N \
         --point-seconds $POINT_S --warmup-seconds 6 --prompt-tokens 2048 \
         --with-decode 0 --server-log '$H_LOG'" >> "$OUT/messen_$ARM.log" 2>&1
     echo "  prefill s=$N rc=$?"
 done
 for B in 1 8; do
     hssh 900 "cd '$H_WT' && '$H_PY' '$H_WT/scripts/gpu_battery/s14_decode_punkt.py' \
-        --port $PORT --out-dir '$H_OUT' --arm '$ARM' --bs $B --folge $B \
+        --port $PORT --out-dir '$H_OUT' --arm '$ARM' --bs $B --step_sequence $B \
         --context-tokens 2048 --model-context-tokens 32768 --ramp-seconds 6 \
         --window-seconds $POINT_S --server-log '$H_LOG'" >> "$OUT/messen_$ARM.log" 2>&1
     echo "  decode bs=$B rc=$?"

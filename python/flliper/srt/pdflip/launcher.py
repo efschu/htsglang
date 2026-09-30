@@ -19104,9 +19104,9 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
             log("#107 PLATZTAUSCH-KARTE ENTFAELLT: P-Layer-Split %s passt "
                 "nicht zu %d P-Fractions -- Version-1-Karte wie bisher"
                 % (_stages or "unbekannt", len(fr_pp)))
-        grund = _em.refuse_if_inconsistent(emap)
-        if grund:
-            log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % grund)
+        refuse_reason = _em.refuse_if_inconsistent(emap)
+        if refuse_reason:
+            log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % refuse_reason)
             return ""
         _refuse_unbuilt_platztausch_buffers(emap, chunk_layers=chunk_layers)
         file_path = os.path.join(expert_map_dir(evidence_dir, log), f"expert_map_{ns.tag}.json")

@@ -222,10 +222,10 @@ STEPS: Tuple[Step, ...] = (
         locks="battery",
     ),
     Step(
-        step_id="s12_prefill_kurve",
+        step_id="s12_prefill_curve",
         title="Multi-session prefill curve 1/4/8/16, bar1 against the baseline, interleaved",
         model="sonnet",
-        script="s12_prefill_kurve.sh",
+        script="s12_prefill_curve.sh",
         check="check_s12_prefill_kurve.py",
         timeout_s=9000,
         expected_min=70,

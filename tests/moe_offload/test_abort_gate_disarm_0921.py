@@ -34,8 +34,8 @@ class _BrokenTransport:
     def poll_status_word(self):
         raise RuntimeError("die Statuszeile ist nicht gemappt")
 
-    def _abort_poll_disarm(self, grund):
-        self.disarmed_mit = grund
+    def _abort_poll_disarm(self, refuse_reason):
+        self.disarmed_mit = refuse_reason
 
 
 def test_failed_poll_disarms_its_transport(monkeypatch):
@@ -70,7 +70,7 @@ def test_healthy_transport_is_not_disarmed(monkeypatch):
     class _Heil:
         def __init__(self): self.disarmed_mit = None
         def poll_status_word(self): return 0
-        def _abort_poll_disarm(self, grund): self.disarmed_mit = grund
+        def _abort_poll_disarm(self, refuse_reason): self.disarmed_mit = refuse_reason
     h = _Heil()
     monkeypatch.setattr(gate, "_transports", [h])
     monkeypatch.setattr(gate, "registered", lambda: [h])
@@ -91,8 +91,8 @@ class _CountingTransport:
         self.polls += 1
         return False
 
-    def _abort_poll_disarm(self, grund):
-        self.disarmed_mit = grund
+    def _abort_poll_disarm(self, refuse_reason):
+        self.disarmed_mit = refuse_reason
 
 
 def test_failed_poll_ends_the_whole_round(monkeypatch):

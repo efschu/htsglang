@@ -24,7 +24,7 @@ with.
 Two entry points:
 
   --log arm:sessions:path   (repeatable) the server logs to read
-  --punkte punkte.jsonl     the run's points, for the request count per point
+  --data_points data_points.jsonl     the run's points, for the request count per point
 
 The request count is what separates the measured window from the warmup: the
 harness runs ``warmup_seconds`` of the identical load, then flushes, then runs
@@ -192,7 +192,7 @@ def collective_bytes(new_token: int, hidden: int, elem_bytes: int = 2) -> int:
     return new_token * hidden * elem_bytes
 
 
-def runden(payload_bytes: int, slot_bytes: int, welt: int) -> int:
+def round_list(payload_bytes: int, slot_bytes: int, welt: int) -> int:
     """Rounds a payload needs, given one slot per peer.
 
     BAR1 splits an all_reduce into ``welt`` equal shards (reduce-scatter, then
@@ -345,7 +345,7 @@ def decode_tick_aggregate(
 
 
 def load_points(path: str) -> dict:
-    """(arm, sessions) -> the point, from punkte.jsonl."""
+    """(arm, sessions) -> the point, from data_points.jsonl."""
     out: dict = {}
     if not path or not os.path.exists(path):
         return out
@@ -417,7 +417,7 @@ def evaluate(sources: list, points: dict, hidden: int, welt: int) -> dict:
     slot_bytes = (geo or {}).get("schlitz_kib", 0) * 1024
     max_payload = (geo or {}).get("max_nutzlast_kib", 0) * 1024
     for g in sizes:
-        g["runden"] = runden(g["nutzlast_bytes"], slot_bytes, welt)
+        g["round_list"] = round_list(g["nutzlast_bytes"], slot_bytes, welt)
         # "Does the direct path carry this payload at all" -- and since
         # ar_plan that question is answered by the ROUND PLAN, not by the
         # single-pass ceiling. The old predicate (`nutzlast <= max_nutzlast`)
@@ -427,7 +427,7 @@ def evaluate(sources: list, points: dict, hidden: int, welt: int) -> dict:
         # contains not one fallback line, while this field said "nein".
         # The runtime's own honesty rule is the cross-check -- every fallback
         # is reported by `warum_nicht()`, and there were none.
-        g["traegt_bar1"] = g["runden"] >= 1 if slot_bytes else None
+        g["traegt_bar1"] = g["round_list"] >= 1 if slot_bytes else None
         # Kept because it is the number the tipping point is derived from,
         # and it is what changes when the pipe takes its share of the window.
         g["einrundig"] = (
@@ -461,7 +461,7 @@ def check_window_basis(window_basis: dict) -> list:
 
     What CAN differ silently is the WINDOW BASIS. ``punkt_fenster`` counts the
     last ``requests`` large batches from the back, with ``requests`` taken from
-    punkte.jsonl; when the point is missing from that file the count falls
+    data_points.jsonl; when the point is missing from that file the count falls
     through to 0 and the window silently becomes "every large batch in the
     log, warmup included". Two arms of one comparison then aggregate different
     phases of the run, which is a work mismatch of a different kind and is
@@ -486,7 +486,7 @@ def check_window_basis(window_basis: dict) -> list:
         if bases == {0}:
             warnings.append(
                 f"sessions={sessions}: NO window basis for any arm "
-                f"({', '.join(sorted(arms))}) -- punkte.jsonl carried no "
+                f"({', '.join(sorted(arms))}) -- data_points.jsonl carried no "
                 "request count, so every arm aggregates its whole log "
                 "INCLUDING the warmup. The medians are comparable only if the "
                 "warmup share happens to match, which nothing here checks."
@@ -537,7 +537,7 @@ def tables(payload: dict) -> str:
         lines.append(
             f"| {g['arm']} | {g['sessions']} | {g['batches']} "
             f"| {_f(g['new_token_median'], 0)} | {g['new_token_max']} "
-            f"| {g['chunks_max']} | {g['nutzlast_bytes']} | {g['runden']} "
+            f"| {g['chunks_max']} | {g['nutzlast_bytes']} | {g['round_list']} "
             f"| {'yes' if g['traegt_bar1'] else 'no'} "
             f"| {'-' if occ is None else format(occ * 100, '.0f') + ' %'} |"
         )
@@ -568,7 +568,7 @@ def main() -> int:
         metavar="ARM:SESSIONS:PFAD",
         help="server log of one point, repeatable",
     )
-    ap.add_argument("--punkte", default="", help="punkte.jsonl of the run")
+    ap.add_argument("--data_points", default="", help="data_points.jsonl of the run")
     ap.add_argument("--hidden", type=int, default=5120)
     ap.add_argument("--welt", type=int, default=3, help="TP ranks in the group")
     ap.add_argument("--json", default="", help="write the payload here as well")
@@ -585,7 +585,7 @@ def main() -> int:
         print("no --log given", file=sys.stderr)
         return 2
 
-    payload = evaluate(sources, load_points(args.punkte), args.hidden, args.welt)
+    payload = evaluate(sources, load_points(args.data_points), args.hidden, args.welt)
     for warning in payload["fenster_basis_warnungen"]:
         print(f"WINDOW BASIS: {warning}", file=sys.stderr)
     if args.json:

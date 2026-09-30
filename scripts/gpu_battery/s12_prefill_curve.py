@@ -7,8 +7,8 @@ the rest of the battery:
 
   --mode messen           one point against a LIVE server: prefill throughput
                           at N sessions, plus one decode point at bs=1 and one
-                          at bs=16. Appends to punkte.jsonl.
-  --mode zusammenfassen   punkte.jsonl -> prefill_kurve.json + the live table.
+                          at bs=16. Appends to data_points.jsonl.
+  --mode zusammenfassen   data_points.jsonl -> prefill_kurve.json + the live table.
 
 Why the measurement looks the way it does:
 
@@ -678,7 +678,7 @@ def mode_measure(args) -> int:
         raw = prefill.pop("roh", [])
         arm_label = draw_label(args.arm, index, draws)
         point = {
-            "folge": args.folge,
+            "step_sequence": args.step_sequence,
             "arm": arm_label,
             "base_arm": args.arm,
             "draw": index,
@@ -698,7 +698,7 @@ def mode_measure(args) -> int:
             # copying it onto every draw would read as one phase per draw.
             "decode": decode if index == records[-1][0] else [],
         }
-        with open(os.path.join(out_dir, "punkte.jsonl"), "a") as f:
+        with open(os.path.join(out_dir, "data_points.jsonl"), "a") as f:
             f.write(json.dumps(point) + "\n")
         with open(
             os.path.join(out_dir, f"roh_{arm_label}_{args.sessions}.jsonl"), "w"
@@ -749,7 +749,7 @@ def mode_measure(args) -> int:
 
 
 def load_points(step_dir: str) -> list:
-    path = os.path.join(step_dir, "punkte.jsonl")
+    path = os.path.join(step_dir, "data_points.jsonl")
     points: list = []
     if not os.path.exists(path):
         return points
@@ -762,11 +762,11 @@ def load_points(step_dir: str) -> list:
                 points.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    points.sort(key=lambda p: p.get("folge", 0))
+    points.sort(key=lambda p: p.get("step_sequence", 0))
     return points
 
 
-def load_evidence(step_dir: str, folge, arm, sessions) -> dict:
+def load_evidence(step_dir: str, step_sequence, arm, sessions) -> dict:
     """What the boot behind a point REALLY ran.
 
     The transport name in the log says bar1 either way -- that cost a whole
@@ -775,7 +775,7 @@ def load_evidence(step_dir: str, folge, arm, sessions) -> dict:
     not a bar1 point, and a baseline point with any barlink group is not a
     baseline point.
     """
-    path = os.path.join(step_dir, "belege", f"{folge}_{arm}_{sessions}.txt")
+    path = os.path.join(step_dir, "evidence_items", f"{step_sequence}_{arm}_{sessions}.txt")
     out: dict = {"evidence_present": os.path.exists(path), "groups": []}
     if not out["evidence_present"]:
         return out
@@ -796,7 +796,7 @@ def load_evidence(step_dir: str, folge, arm, sessions) -> dict:
 def load_fatal(step_dir: str, arm, sessions) -> dict:
     """The fatal harvest of ONE boot.
 
-    s12_prefill_kurve.sh greps every boot's host log for OOM / NCCL error /
+    s12_prefill_curve.sh greps every boot's host log for OOM / NCCL error /
     traceback into logs/<arm>_<n>.fatal.txt. Nothing read that file, so eight
     boots that each died in a prefill OOM could still hand in throughput
     numbers and pass -- the only step in the battery without a fatal gate.
@@ -834,7 +834,7 @@ def summarize(step_dir: str, tol_pct: float, plan: list) -> dict:
         if arm in curves and isinstance(sessions, int):
             curves[arm][sessions] = rate
         record = {
-            "folge": p.get("folge"),
+            "step_sequence": p.get("step_sequence"),
             "arm": arm,
             "sessions": sessions,
             "zeit": p.get("zeit"),
@@ -845,7 +845,7 @@ def summarize(step_dir: str, tol_pct: float, plan: list) -> dict:
             "gap_before_s": p.get("gap_before_s"),
             "floor_series": p.get("floor_series"),
         }
-        record.update(load_evidence(step_dir, p.get("folge"), arm, sessions))
+        record.update(load_evidence(step_dir, p.get("step_sequence"), arm, sessions))
         record.update(load_fatal(step_dir, arm, sessions))
         order.append(record)
         for d in p.get("decode") or []:
@@ -878,17 +878,17 @@ def summarize(step_dir: str, tol_pct: float, plan: list) -> dict:
         "schema_version": SCHEMA_VERSION,
         "arme": list(ARMS),
         "sessions_geplant": plan,
-        "abbruch": _short("abbruch.txt"),
+        "abort_reason": _short("abort_reason.txt"),
         # A step that never got the cards must not be diagnosed through the
         # empty artifacts it left behind.
-        "blockiert": _short("blocked.txt"),
-        "host_erreichbar": not os.path.exists(
+        "is_blocked": _short("blocked.txt"),
+        "host_reachable": not os.path.exists(
             os.path.join(step_dir, "host_unreachable.txt")
         ),
         "integration_vorhanden": not os.path.exists(
             os.path.join(step_dir, "integration_missing.txt")
         ),
-        "punkte": len(points),
+        "data_points": len(points),
         "reihenfolge": order,
         # The A-vs-A floor of every multi-draw arm, with the two properties
         # that decide whether its spread may be used as a floor at all
@@ -898,7 +898,7 @@ def summarize(step_dir: str, tol_pct: float, plan: list) -> dict:
         # whether any of them died. Empty means every harvest came back clean.
         "fatal": [
             {
-                "folge": e.get("folge"),
+                "step_sequence": e.get("step_sequence"),
                 "arm": e.get("arm"),
                 "sessions": e.get("sessions"),
                 "line": e["fatal"],
@@ -908,7 +908,7 @@ def summarize(step_dir: str, tol_pct: float, plan: list) -> dict:
         ],
         "fatal_ungeprueft": [
             {
-                "folge": e.get("folge"),
+                "step_sequence": e.get("step_sequence"),
                 "arm": e.get("arm"),
                 "sessions": e.get("sessions"),
             }
@@ -1017,7 +1017,7 @@ def main() -> int:
     # and a closed choice list there would mean a second copy of this file.
     ap.add_argument("--arm", default="bar1")
     ap.add_argument("--sessions", type=int, default=1)
-    ap.add_argument("--folge", type=int, default=0)
+    ap.add_argument("--step_sequence", type=int, default=0)
     ap.add_argument("--out-dir", default=".")
     ap.add_argument("--step-dir", default=".")
     ap.add_argument("--point-seconds", type=float, default=15.0)

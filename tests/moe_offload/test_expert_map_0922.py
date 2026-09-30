@@ -85,8 +85,8 @@ def test_broken_map_is_named_not_swallowed():
     dann muss sie es sagen, mit Zahl."""
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
     k["phases"]["P"]["slot_of"]["0"] = 0        # Id 0 ist resident UND im Store
-    grund = em.refuse_if_inconsistent(k)
-    assert grund and "resident UND im Store" in grund
+    refuse_reason = em.refuse_if_inconsistent(k)
+    assert refuse_reason and "resident UND im Store" in refuse_reason
 
 
 def test_slot_of_gives_none_for_residents():

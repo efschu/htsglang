@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """s14 -- one DECODE point against a live server, task #294.
 
-Why this exists next to s12_prefill_kurve.py. That file measures a prefill
+Why this exists next to s12_prefill_curve.py. That file measures a prefill
 curve and carries a decode point as a by-product: it fires ``batch`` streaming
 chat requests with ``max_tokens: 256``, lets them run for the point's seconds
 and reads whatever ticks the scheduler happened to log. For a prefill window
@@ -476,7 +476,7 @@ def measure_point(args) -> dict:
     point = {
         "kind": KIND,
         "schema": SCHEMA_VERSION,
-        "folge": args.folge,
+        "step_sequence": args.step_sequence,
         "arm": args.arm,
         "bs": args.bs,
         "zeit": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -520,7 +520,7 @@ def main(argv=None) -> int:
     p.add_argument("--out-dir", required=True)
     p.add_argument("--arm", required=True)
     p.add_argument("--bs", type=int, required=True)
-    p.add_argument("--folge", type=int, default=0)
+    p.add_argument("--step_sequence", type=int, default=0)
     p.add_argument("--context-tokens", type=int, default=2048)
     p.add_argument("--model-context-tokens", type=int, default=CONTEXT_TOKENS_DEFAULT)
     p.add_argument("--ramp-seconds", type=float, default=6.0)

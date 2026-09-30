@@ -30,7 +30,7 @@ QUOTED = {
 
 def load():
     pre, dec = {}, {}
-    for r in (json.loads(x) for x in open(f"{OUT}/punkte.jsonl")):
+    for r in (json.loads(x) for x in open(f"{OUT}/data_points.jsonl")):
         pre[(r["arm"], r["sessions"])] = r["prefill"]["prefill_tok_s"]
     for r in (json.loads(x) for x in open(f"{OUT}/decode_punkte.jsonl")):
         dec[(r["arm"], r["bs"])] = (
