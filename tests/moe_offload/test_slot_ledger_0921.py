@@ -31,7 +31,7 @@ def test_swap_keeps_slot_count_constant():
     for i in range(1000):
         slot = board.swap(hot, cold_ids)
         assert board.slot_of(cold_ids) == slot
-        assert board.slot_of(hot) is None, "der Heisse liegt jetzt auf der Karte"
+        assert board.slot_of(hot) is None, "the hot one is now on the card"
         hot, cold_ids = cold_ids, hot
     assert board.capacity == 100
     assert len(board.as_map()) == 100
@@ -79,7 +79,7 @@ def test_release_really_frees_the_slot():
     board = ledger_for_cold_set([4, 5])
     slot = board.release(4)
     assert slot is not None and board.free_count == 1
-    assert board.assign(6) == slot, "der freie Platz wird wiederverwendet"
+    assert board.assign(6) == slot, "the free slot is reused"
 
 
 def test_release_of_unknown_is_not_an_error():
@@ -133,7 +133,7 @@ def test_swap_does_not_use_the_free_list():
     assert board.free_count == 3          # 0, 1, 2 sind frei und KLEINER
     alt = board.slot_of(8)
     assert board.swap(8, 42) == alt == 4
-    assert board.slot_of(42) == 4, "ueber die Freiliste waere es Platz 0 geworden"
+    assert board.slot_of(42) == 4, "via the free list it would have been slot 0"
 
 
 def test_assign_takes_smallest_free_slot():
@@ -143,4 +143,4 @@ def test_assign_takes_smallest_free_slot():
     board.assign(100)
     board.assign(200)
     board.release(100)
-    assert board.assign(300) == 0, "Platz 0 wurde frei und ist der kleinste"
+    assert board.assign(300) == 0, "slot 0 became free and is the smallest"

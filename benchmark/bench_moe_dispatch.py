@@ -333,7 +333,7 @@ def build_last(tokens: int, hidden: int, experts: int, topk: int,
         weight = torch.empty(experts, dtype=torch.float32)
         weight[rang_order] = w
     else:
-        raise ValueError(f"unbekannte Verteilung {distribution!r}")
+        raise ValueError(f"unknown distribution {distribution!r}")
 
     if tokens == 0:
         ids = torch.zeros((0, topk), dtype=torch.int64, device=dev)
@@ -502,19 +502,19 @@ def reports(results, tot, args, rank):
         return
     print()
     print("=" * 78)
-    print("MoE-Dispatch/Combine -- verschraenkt im selben Lauf")
+    print("MoE-Dispatch/Combine -- interleaved in the same run")
     print(
         f"hidden={args.hidden} experts={args.experts} topk={args.topk} "
         f"warmup>={args.warmup}s round_list={args.round_list} bound_value={args.bound_value}"
     )
     print("=" * 78)
     if tot:
-        print("TOTE VARIANTEN (nicht gemessen, nicht ersetzt):")
+        print("DEAD VARIANTS (not measured, not replaced):")
         for refuse_reason in tot:
             print(f"  - {refuse_reason}")
         print()
     if not results:
-        print("Keine lebende Variante. Es gibt nichts zu berichten.")
+        print("No alive variant. Nothing to report.")
         return
     header = (
         f"{'Variante':<10}{'Verteilung':<12}{'Token':>7}"
@@ -534,7 +534,7 @@ def reports(results, tot, args, rank):
     if bad:
         print()
         print(
-            "ACHTUNG: Zeilen mit Fehlrunden sind KEINE Messwerte -- in diesen "
+            "ACHTUNG: Rows with error rounds are KEINE measured values -- in these "
             "Runden stimmte das Ergebnis nicht, und eine Zeit ohne richtiges "
             "Ergebnis sagt nichts."
         )
@@ -553,16 +553,16 @@ def main() -> int:
     p.add_argument("--distribution", default="gleich,skewed")
     p.add_argument(
         "--variants", default="bar1ep,torch,deepep",
-        help="Komma-getrennt. Eine nicht genannte Variante wird weder gebaut "
+        help="Comma-separated. A variant not mentioned will neither be built "
              "noch als tot gemeldet -- sie wurde nicht gefragt.",
     )
     p.add_argument("--warmup", type=float, default=3.0,
-                   help="Sekunden Vorlauf je Variante und Form. Untergrenze 3.")
+                   help="Seconds of warmup per variant and form. Lower bound 3.")
     p.add_argument("--round_list", type=int, default=30)
     p.add_argument("--seed_value", type=int, default=1234)
     p.add_argument(
         "--bound_value", type=float, default=0.0,
-        help="Groesste erlaubte Abweichung vom Sollergebnis. 0 heisst "
+        help="Maximum allowed deviation from the expected result. 0 means "
              "bitgenau -- das ist der richtige Wert fuer bar1ep und torch, "
              "weil beide in float32 summieren und danach dieselbe Rundung "
              "machen. Fuer DeepEP kann eine kleine Schranke noetig sein; wer "
@@ -575,7 +575,7 @@ def main() -> int:
     args.distribution = [v for v in args.distribution.split(",") if v]
     args.variants = [v for v in args.variants.split(",") if v]
     if args.warmup < 3.0:
-        print("Vorlauf unter 3 s ist nicht vorgesehen -- auf 3 s gehoben.")
+        print("Warmup below 3 s is not intended -- raised to 3 s.")
         args.warmup = 3.0
 
     welt = _env_int("WORLD_SIZE", 1)
@@ -583,13 +583,13 @@ def main() -> int:
     local_rank = _env_int("LOCAL_RANK", 0)
     if welt < 2:
         print(
-            "Dieses Programm misst ein Kollektiv; mit einem Rang gibt es "
+            "This program measures a collective; with one rank there is "
             "keines. Aufruf ueber torchrun --nproc_per_node=N (N >= 2)."
         )
         return 2
     if args.experts % welt:
         print(
-            f"--experts {args.experts} ist nicht durch {welt} teilbar. Beide "
+            f"--experts {args.experts} is not divisible by {welt}. Both "
             f"Dispatcher bilden Experte e auf Rang e // num_local_experts ab; "
             f"ohne gleiche Teilung gibt es diese Abbildung nicht."
         )
@@ -600,7 +600,7 @@ def main() -> int:
     if "bar1ep" in args.variants:
         if os.environ.get("FLLIPER_BARLINK", "0") in ("0", "false", ""):
             print(
-                "FLLIPER_BARLINK ist nicht gesetzt. Ohne barlink gibt es keinen "
+                "FLLIPER_BARLINK is not set. Without barlink there is no "
                 "BAR1-Transport, und was dann liefe, waere die gloo-Ebene "
                 "unter dem Namen bar1ep. Abbruch."
             )

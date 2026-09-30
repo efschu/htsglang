@@ -32,7 +32,7 @@ class _BrokenTransport:
         self.disarmed_mit = None
 
     def poll_status_word(self):
-        raise RuntimeError("die Statuszeile ist nicht gemappt")
+        raise RuntimeError("the status row is not mapped")
 
     def _abort_poll_disarm(self, refuse_reason):
         self.disarmed_mit = refuse_reason
@@ -49,7 +49,7 @@ def test_failed_poll_disarms_its_transport(monkeypatch):
     monkeypatch.setattr(gate, "abort_check_enabled", lambda: True)
     monkeypatch.setattr(gate, "polling_paused", lambda: False)
     gate.poll_status_words()          # darf NICHT NameError werfen
-    assert t.disarmed_mit is not None, "der Transport wurde nicht stillgelegt"
+    assert t.disarmed_mit is not None, "the transport was not shut down"
     assert "poll" in t.disarmed_mit.lower()
 
 
@@ -111,9 +111,9 @@ def test_failed_poll_ends_the_whole_round(monkeypatch):
     monkeypatch.setattr(gate, "abort_check_enabled", lambda: True)
     monkeypatch.setattr(gate, "polling_paused", lambda: False)
     gate.poll_status_words()
-    assert kaputt.disarmed_mit is not None, "der Werfer wurde nicht stillgelegt"
+    assert kaputt.disarmed_mit is not None, "the thrower was not shut down"
     assert after_state.polls == 0, (
-        "nach einem gescheiterten Poll wurde ein weiteres Geraet gelesen -- "
+        "after a failed poll, another device was read -- "
         "genau der zweite Zugriff, der TP0 in w32/w33 toetete"
     )
 
@@ -132,7 +132,7 @@ def test_metal_signature_is_not_poison_but_aborts(monkeypatch):
     kaputt = _Metall()
     after_state = _CountingTransport()
     assert not gate.is_poison_error(RuntimeError("unknown parameter type")), (
-        "wenn diese Signatur Gift WAERE, pruefte dieser Test den #100-Pfad nicht"
+        "if this signature WERE Gift, this test would not check the #100 path"
     )
     monkeypatch.setattr(gate, "_transports", [kaputt, after_state])
     monkeypatch.setattr(gate, "registered", lambda: [kaputt, after_state])
@@ -151,4 +151,4 @@ def test_without_error_all_transports_still_polled(monkeypatch):
     monkeypatch.setattr(gate, "abort_check_enabled", lambda: True)
     monkeypatch.setattr(gate, "polling_paused", lambda: False)
     gate.poll_status_words()
-    assert (a.polls, b.polls) == (1, 1), "das Disarm-break greift im Normalfall"
+    assert (a.polls, b.polls) == (1, 1), "the Disarm-break applies in the normal case"

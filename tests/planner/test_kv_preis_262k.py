@@ -72,5 +72,5 @@ def test_price_enters_fraction_ceiling_as_reserve():
     assert mit[0] < without[0], f"{mit=} {without=}"
     assert all(m <= o for m, o in zip(mit, without))
     print(f"\nDecke OHNE KV-Posten: {[round(f,3) for f in without]}")
-    print(f"Decke MIT  KV-Posten: {[round(f,3) for f in mit]}")
-    print(f"KV-Preis je Stufe MiB: {[round(x) for x in kv]}")
+    print(f"Cap WITH  KV items: {[round(f,3) for f in mit]}")
+    print(f"KV price per stage MiB: {[round(x) for x in kv]}")

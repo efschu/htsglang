@@ -60,7 +60,7 @@ class SlotLedger:
     def __init__(self, capacity: int, *, occupied: Optional[Dict[int, int]] = None):
         cap = int(capacity)
         if cap <= 0:
-            raise ValueError(f"capacity muss positiv sein, nicht {capacity}")
+            raise ValueError(f"capacity must be positive, not {capacity}")
         self._capacity = cap
         self._by_expert: Dict[int, int] = {}
         self._by_slot: Dict[int, int] = {}
@@ -100,11 +100,11 @@ class SlotLedger:
     # -- Schreiben -----------------------------------------------------
     def _take(self, expert: int, slot: int) -> None:
         if not (0 <= slot < self._capacity):
-            raise ValueError(f"Platz {slot} liegt ausserhalb von 0..{self._capacity-1}")
+            raise ValueError(f"Slot {slot} lies outside 0..{self._capacity-1}")
         occupied_rows = self._by_slot.get(slot)
         if occupied_rows is not None and occupied_rows != expert:
             raise ValueError(
-                f"Platz {slot} gehoert schon Experte {occupied_rows}, nicht {expert}"
+                f"Slot {slot} already belongs to expert {occupied_rows}, not {expert}"
             )
         if slot in self._free:
             self._free.remove(slot)
@@ -120,7 +120,7 @@ class SlotLedger:
             return present
         if not self._free:
             raise SlotExhausted(
-                f"alle {self._capacity} Plaetze belegt, Experte {expert} bekaeme keinen"
+                f"all {self._capacity} slots occupied, Expert {expert} would get none"
             )
         slot = heapq.heappop(self._free)
         self._by_expert[expert] = slot
@@ -147,7 +147,7 @@ class SlotLedger:
         """
         hot, cold_ids = int(hot), int(cold_ids)
         if hot == cold_ids:
-            raise ValueError("Tausch mit sich selbst ist keiner")
+            raise ValueError("Swap with itself is no swap")
         slot = self._by_expert.pop(hot, None)
         if slot is None:
             # Der Heisse hatte gar keinen Platz (lag schon auf der Karte).

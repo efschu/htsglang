@@ -78,7 +78,7 @@ def test_the_missing_half_is_named():
 
     src = inspect.getsource(es.write_rows)
     assert "global_rows" in src, (
-        "write_rows indiziert noch ueber global_rows -- der Slot-Pool braucht "
+        "write_rows still indexes over global_rows -- the slot pool needs "
         "hier die Indirektion, sonst ist die kleinere Datei ein Fehler")
 
 
@@ -98,7 +98,7 @@ def test_only_cold_rows_reach_the_host():
     src = inspect.getsource(eo)
     assert "spill_ids = [e for e in range(E) if e not in resident_set]" in src
     assert "residents\n            # included" not in src, (
-        "der veraltete Satz ist wieder da")
+        "the stale set is back")
 
 
 def test_the_store_is_big_because_of_reserved_slots_not_content():

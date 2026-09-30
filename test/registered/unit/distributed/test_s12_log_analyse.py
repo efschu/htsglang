@@ -117,7 +117,7 @@ def _w(payload, arm, sessions, rang):
     for w in payload["wait"]:
         if (w["arm"], w["sessions"], w["rang"]) == (arm, sessions, rang):
             return w
-    raise AssertionError(f"kein Aggregat fuer {arm}/{sessions}/TP{rang}")
+    raise AssertionError(f"no aggregate for {arm}/{sessions}/TP{rang}")
 
 
 class TestRows:

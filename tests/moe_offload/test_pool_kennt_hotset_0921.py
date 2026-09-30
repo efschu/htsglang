@@ -27,7 +27,7 @@ def test_with_hotset_ids_count_not_first_r():
         num_local_experts=512, resident_count=188, scratch=32, resident_ids=ids
     )
     hot, cold = p.split_needed([5, 200, 250, 369, 370, 400])
-    assert 369 in hot, "369 steht im Hotset und ist resident"
+    assert 369 in hot, "369 is in the hotset and is resident"
     assert 5 in hot and 200 in hot, "200 liegt in 183..228, also resident"
     assert 250 in cold and 370 in cold and 400 in cold
 

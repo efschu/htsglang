@@ -432,7 +432,7 @@ def build_nested(total: int,
     stages = [int(s) for s in p_layer_stage]
     if stages and (min(stages) < 0 or max(stages) >= max(1, len(fs))):
         raise ValueError(
-            f"p_layer_stage nennt Stufe {max(stages)} bei {len(fs)} "
+            f"p_layer_stage names stage {max(stages)} at {len(fs)} "
             f"P-Fractions -- Karte und PP-Schnitt beschreiben nicht dieselbe "
             f"Pipeline")
     return {

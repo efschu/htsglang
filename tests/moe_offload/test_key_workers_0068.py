@@ -84,7 +84,7 @@ def test_default_is_serial_form(monkeypatch):
     src = inspect.getsource(wu.pread_safetensors_file)
     code = "\n".join(z for z in src.split("\n") if not z.lstrip().startswith("#"))
     i = code.index('FLLIPER_LOAD_KEY_WORKERS')
-    assert '"1"' in code[i : i + 120], "der Default ist nicht 1"
+    assert '"1"' in code[i : i + 120], "the default is not 1"
 
 
 def test_exception_is_not_swallowed(monkeypatch):
@@ -101,7 +101,7 @@ def test_exception_is_not_swallowed(monkeypatch):
     except RuntimeError as e:
         assert "#68 probe" in str(e)
     else:
-        raise AssertionError("die Ausnahme wurde verschluckt -- ein halb "
+        raise AssertionError("the exception was swallowed -- a half "
                              "gelesener Gewichtssatz laedt still falsch")
 
 
@@ -122,7 +122,7 @@ def test_68b_post_load_runs_in_key_thread(monkeypatch):
 
     d = wu.pread_safetensors_file(p, post_load=_pl)
     assert len(threads) > 1, (
-        f"post_load lief in {len(threads)} Thread(s) -- die CPU-Arbeit ist "
+        f"post_load ran in {len(threads)} thread(s) -- the CPU work is "
         f"weiter seriell, genau der Befund aus w56"
     )
     # und es wurde GENAU EINMAL je Tensor angewandt (nicht zweimal)
@@ -139,7 +139,7 @@ def test_68b_no_double_post_load_in_pread_path():
     i_serial = src.index("{k: post_load(k, v) for k, v in result.items()}")
     assert i_pread < i_serial
     assert "return _erg" in src[i_pread : i_pread + 200], (
-        "der pread-Pfad faellt in die serielle Schleife durch -- post_load "
+        "the pread path falls through into the serial loop -- post_load "
         "liefe zweimal und das Modell laedt still falsch"
     )
 
@@ -156,7 +156,7 @@ def test_68c_serial_branch_applies_post_load(monkeypatch):
     assert set(d) == set(expected)
     for k in expected:
         assert torch.equal(d[k], expected[k] * 2), (
-            f"{k} kam UNVERAENDERT zurueck -- post_load lief im seriellen "
+            f"{k} came back UNCHANGED -- post_load ran in the serial "
             f"Zweig nicht"
         )
 

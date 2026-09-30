@@ -589,7 +589,7 @@ def reference_from_logs(p_text: str, d_text: str, front_text: str, *, source: st
 
     m = _RX_ORDER.search(front_text)
     if m is None:
-        raise ValueError("%s: keine PDFLIP-FLIP-ORDER epoch=0 src=D-Zeile" % source)
+        raise ValueError("%s: no PDFLIP-FLIP-ORDER epoch=0 src=D row" % source)
     free = {int(k): float(v) for k, v in ast.literal_eval(m.group(1)).items()}
     order = tuple(ast.literal_eval(m.group(2)))
     n = len(p_card)
@@ -723,7 +723,7 @@ def recut_reference(ref: WakeReference, p_split: Sequence[int], *, chunk_layers:
     ref_split = reference_p_split(ref, int(n_layers))
     if ref_split is None:
         raise ValueError(
-            "%s: %s -- die Referenz %s nennt ihren Schnitt nicht (keine 'MoE expert-offload "
+            "%s: %s -- the reference %s does not name its cut (no 'MoE expert-offload "
             "active on layer'-Zeilen); Schnitt %s nicht umrechenbar"
             % (_pc.RECUT_REFUSAL_CODE, MARKER, ref.source, _pc.split_text(new_split)))
     _pc.recut_check(ref_split, new_split, ["x"] * int(n_layers), MARKER)
@@ -955,7 +955,7 @@ def plan_wake_credit(*, model: str, p_split: Sequence[int], chunk_layers: int,
         try:
             if not isinstance(key["p_split"], tuple):
                 raise ValueError(
-                    "W167 PdFlipPCutRecutRefused: %s %s -- der Schnitt der Referenz %s ist %s"
+                    "W167 PdFlipPCutRecutRefused: %s %s -- the cut of reference %s is %s"
                     % (MARKER, label, ref.source, key["p_split"]))
             ref = recut_reference(ref, have["p_split"], chunk_layers=int(chunk_layers),
                                   n_layers=int(n_layers))

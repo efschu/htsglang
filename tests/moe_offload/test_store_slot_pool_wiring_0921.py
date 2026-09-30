@@ -98,7 +98,7 @@ def test_more_cold_than_reserved_falls_back_to_the_full_store(monkeypatch, tmp_p
     """Der sichere Ausgang: lieber Host-RAM verlieren als Zeilen."""
     # Rang 0 reserviert 25 Plaetze; hier sind 40 Experten kalt.
     _, _, _, n_slots, index, _ = _rows_for(monkeypatch, tmp_path, 0, 40)
-    assert n_slots == 512, "die Datei muss wieder einen Platz je Experte haben"
+    assert n_slots == 512, "the file must have a slot per expert again"
     # und der Index ist wieder die globale Id
     assert sorted(index.values()) == list(range(20, 60))
 
@@ -160,5 +160,5 @@ def test_a_group_without_moe_ratios_does_not_crash(monkeypatch, tmp_path):
     layer = _Layer(0, 0, 171, num_experts=512, ratios=())
     layer.moe_ratio = None          # genau P's Fall
     _, _, _, n_slots, index, _ = eo._expert_store_rows_for(layer, _Plan([1, 2, 3]))
-    assert n_slots == 512, "ohne Ratios bleibt es beim vollen Store"
+    assert n_slots == 512, "without Ratios it stays with the full store"
     assert sorted(index.values()) == [0, 1, 2]
