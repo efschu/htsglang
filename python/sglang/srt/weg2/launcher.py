@@ -13606,7 +13606,10 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
            # Only the main model is shared: the draft is TP3-sharded in D and
            # TP1 in P, so none of its tensors has one form in both groups
            # (union_arena_bind.UNION_ROLES_ENV; metal 30.09. ...09300226).
-           "SGLANG_WEG2_UNION_ROLES": "main"}
+           "SGLANG_WEG2_UNION_ROLES": "main",
+           # Both groups stay awake: rank-side rules that assume the other
+           # group sleeps read this (scheduler._weg2_store_short_max_cycles).
+           "SGLANG_WEG2_DUAL_LAYOUT": "1"}
     if group == "P":
         env["SGLANG_WEG2_DUAL_SHARE"] = "1"
     return env

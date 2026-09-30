@@ -884,12 +884,27 @@ def _weg2_store_short_tail_x(sched) -> int:
 STORE_SHORT_MAX_CYCLES_ENV = "SGLANG_WEG2_STORE_SHORT_MAX_CYCLES"
 
 
+#: DUAL-TP3PP3 (metal tnybbz 30.09., D rid weg2-0-8): the 4-cycle bound is
+#: the flip form's -- there P SLEEPS once D is awake, so no writer can come
+#: (rc12y). Under the dual layout P never sleeps and its asynchronous
+#: write-through of a just-prefilled tail IS coming: 36863 of 40765 delivered,
+#: 4 marks in ~2 s ended the deferral, W31/W50, and the front re-routed the
+#: prompt through P for a second prefill. Still a bound (growth resets it as
+#: before); an explicit SGLANG_WEG2_STORE_SHORT_MAX_CYCLES wins.
+DUAL_LAYOUT_ENV = "SGLANG_WEG2_DUAL_LAYOUT"
+DUAL_STORE_SHORT_MAX_CYCLES_ENV = "SGLANG_WEG2_DUAL_STORE_SHORT_MAX_CYCLES"
+DUAL_STORE_SHORT_MAX_CYCLES_DEFAULT = 60
+
+
 def _weg2_store_short_max_cycles() -> int:
     """How many fresh store-short marks without growth a request may take
     before the fallback (``#1068 DEFERRED`` per rid at most this many);
-    env-overridable, floor 1, default 4."""
+    env-overridable, floor 1, default 4 (dual layout: 60, see above)."""
+    raw = os.environ.get(STORE_SHORT_MAX_CYCLES_ENV)
+    if raw is None and os.environ.get(DUAL_LAYOUT_ENV, "").strip() == "1":
+        raw = os.environ.get(DUAL_STORE_SHORT_MAX_CYCLES_ENV, str(DUAL_STORE_SHORT_MAX_CYCLES_DEFAULT))
     try:
-        return max(1, int(os.environ.get(STORE_SHORT_MAX_CYCLES_ENV, "4")))
+        return max(1, int(raw if raw is not None else "4"))
     except (TypeError, ValueError):
         return 4
 
