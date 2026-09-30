@@ -99,3 +99,47 @@ def test_both_weight_updater_rpcs_are_watched():
             seen.append(fn.__code__)
             fn = getattr(fn, "__wrapped__", None)
         assert ours in seen, name
+
+
+def test_z30y8_no_faulthandler_dump_the_python_sampler_writes_under_the_gil(tmp_path):
+    """z30y8 (18:41:55, P PP1 SIGSEGV): faulthandler.dump_traceback_later walked the main thread's
+    frames without the GIL while it was in logging.emit -- the dump stopped mid-stack and the rank died.
+    The watchdog must not call it any more; the Python sampler still names the hanging frame."""
+    import faulthandler
+
+    with mock.patch.object(faulthandler, "dump_traceback_later",
+                           side_effect=AssertionError("dump_traceback_later called")) as dtl, \
+            mock.patch.dict(os.environ, {"SGLANG_WEG2_EVIDENCE_DIR": str(tmp_path),
+                                         "SGLANG_WEG2_RPC_STALL_WATCHDOG_S": "0.3"}):
+        assert _Leg(0.6).resume(1) == 2
+    assert dtl.call_count == 0
+    text = open(_files(tmp_path)[0]).read()
+    assert "Python sampler, under the GIL" in text and "_sleep_in_a_named_frame" in text
+    assert "rpc-stall-sampler" not in text           # the sampler leaves itself out
+
+
+def test_a_second_dump_follows_while_the_rpc_still_runs(tmp_path):
+    with mock.patch.object(W, "REPEAT_S", 0.3), \
+            mock.patch.dict(os.environ, {"SGLANG_WEG2_EVIDENCE_DIR": str(tmp_path),
+                                         "SGLANG_WEG2_RPC_STALL_WATCHDOG_S": "0.2"}):
+        assert _Leg(0.9).resume(1) == 2
+    text = open(_files(tmp_path)[0]).read()
+    assert text.count("_sleep_in_a_named_frame") >= 2 and "Second dump" in text
+
+
+def test_the_shared_stall_sampler_interface(tmp_path):
+    """weg2/stall_sampler.py is the shared piece (NF's TAG-STALL-SENTINEL can switch to it):
+    arm(fh, timeout_s, repeat_s) / disarm(s, join_s)."""
+    from sglang.srt.weg2 import stall_sampler as S
+
+    p = tmp_path / "s.txt"
+    with open(p, "w") as fh:
+        s = S.arm(fh, 0.2, repeat_s=0)
+        _sleep_in_a_named_frame(0.5)
+        S.disarm(s, 1.0)
+        assert s.dumps == 1 and not s.thread.is_alive()
+    assert "_sleep_in_a_named_frame" in p.read_text()
+    with open(tmp_path / "q.txt", "w") as fh:
+        s = S.arm(fh, 5.0)
+        S.disarm(s, 1.0)                                 # stopped before the timeout: nothing written
+        assert s.dumps == 0 and not s.thread.is_alive()
