@@ -10152,6 +10152,10 @@ class SchedulerWeightUpdaterManager:
                 # 2026-09-15 (Punkt 2, SGLANG_WEG2_WAKE_OVERLAP default 1)
                 _wake_worker = None
                 _wake_futs = []
+                from sglang.srt.weg2 import wake_runahead as _weg2_runahead
+
+                _ra_any = _weg2_runahead.runahead_any_on()
+                _ra_waited = [0.0, 0]
                 if _weg2_wake_overlap_armed():
                     from concurrent.futures import ThreadPoolExecutor as _TPE
                     # 18.09. (xsn367): TWO collects in flight -- the flip's critical chain
@@ -10443,8 +10447,11 @@ class SchedulerWeightUpdaterManager:
                             # found no VRAM and the chain wedged (W68 at the
                             # sleeper's drain wait). Resume t+1 may overlap
                             # collect t, nothing further: wait for t-1 here.
-                            if len(_wake_futs) > _n_wake_workers:
-                                _wake_futs[-(_n_wake_workers + 1)][1].result()
+                            # WAKE-RUNAHEAD-ANY (weg2/wake_runahead.py): off = the
+                            # FIFO wait for the collect bound+1 places back
+                            _ra_waited[0] += _weg2_runahead.bound_wait(
+                                _wake_futs, _n_wake_workers, _ra_any)
+                            _ra_waited[1] += 1
                         else:
                             self._weg2_bar1_register(tag)
                             self._weg2_turns_register(tag)
@@ -10503,9 +10510,10 @@ class SchedulerWeightUpdaterManager:
                     except BaseException as _fexc:  # noqa: BLE001
                         _errs.append((_ftag, _fexc))
                 _wake_worker.shutdown(wait=True)
-                logger.info("WEG2-WAKE-OVERLAP collects=%d joined_ms=%.0f errors=%d",
+                logger.info("WEG2-WAKE-OVERLAP collects=%d joined_ms=%.0f errors=%d "
+                            "runahead=%s runahead_wait_ms=%.0f",
                             len(_wake_futs), (time.perf_counter() - _t_join) * 1000,
-                            len(_errs))
+                            len(_errs), "any" if _ra_any else "fifo", _ra_waited[0] * 1000)
                 if _errs:
                     raise _errs[0][1]
             # xsn265/266: the collector is the LAST reader of every lane it

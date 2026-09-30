@@ -210,7 +210,12 @@ def test_the_wake_pool_holds_every_collect_the_run_ahead_bound_submits():
     i = src.index('thread_name_prefix="weg2-wake-collect"')
     blk = src[i - 400:i]
     assert "_n_wake_workers + max(0, _envs_h11.SGLANG_WEG2_WAKE_COLLECT_SPARE.get())" in blk
-    assert "_wake_futs[-(_n_wake_workers + 1)][1].result()" in src
+    # WAKE-RUNAHEAD-ANY (30.09.): the bound moved into weg2/wake_runahead;
+    # switch off = this FIFO wait, byte for byte
+    from sglang.srt.weg2 import wake_runahead as _wr
+
+    assert "_weg2_runahead.bound_wait(" in src and "_wake_futs, _n_wake_workers, _ra_any" in src
+    assert "futs[-(bound + 1)][1].result()" in open(_wr.__file__).read()
     assert envs.SGLANG_WEG2_WAKE_COLLECT_SPARE.get() == 1
 
 

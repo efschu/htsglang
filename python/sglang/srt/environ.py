@@ -579,6 +579,14 @@ class Envs:
     # p0 waited 115/139 ms). 0 = the pool of the 2026-09-18 form. Resumes and
     # VRAM are unchanged by it.
     SGLANG_WEG2_WAKE_COLLECT_SPARE = EnvInt(1)
+    # WAKE_RUNAHEAD_ANY (30.09., NF y4k/y4l P->D, weg2/wake_runahead.py): the
+    # run-ahead bound waits for ANY collect in flight to finish instead of the
+    # OLDEST (a slow 3080 source's band held D TP1/TP2's resume of PP0's next
+    # band -- the flip's critical chain -- while newer collects were done;
+    # main-loop gaps 654/659 ms per flip, PP0 p0/p1 credit waits 313/138 ms).
+    # Same collects in flight, same resumes and credit waits, no VRAM. Per
+    # group (the waking group reads it); off until metal.
+    SGLANG_WEG2_WAKE_RUNAHEAD_ANY = EnvBool(False)
     # CREDIT_LIVE_STAGING: the waker's credit check subtracts only the peer's
     # stagings that are booked but not yet allocated; an allocated staging is
     # already missing from the free reading (x105 TP2: 943 MiB counted twice,
