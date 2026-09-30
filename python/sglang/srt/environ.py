@@ -2779,6 +2779,29 @@ class Envs:
     # the decode LRU. False: the plan before H107. Rank-uniform: every rank
     # reads the same launcher env; the waves are rank-local (no collective).
     SGLANG_OPT_MOE_POOL_EAGER_LRU_HITS = EnvBool(True)
+    # D-Mini-Extend (30.09., y3u): an eager forward under the pool whose routed
+    # ids fit the widest CAPTURED decode step (graph form: max graph bs x MTP
+    # verify rows x top-k, and the step's wave bound min(ids, E - R) <=
+    # waves x (LRU + staging) with waves <= SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES)
+    # runs the decode graph's device-planned step instead of the host plan:
+    # prepare_pool / run_pool_waves, eager. No per-layer D2H of the routing,
+    # no host plan, no sync_pool_from_host (its 4-5 device reads per layer);
+    # the misses are those of the decode step, promoted into the LRU by its
+    # own rule. y3u D TP0: extends of 2-6 new tokens cost 403-739 gpu-ms,
+    # every MoE layer serialized CPU launch and H2D behind its syncs. Single
+    # wave: bit-identical to the host plan (one apply over the same lanes on
+    # rows holding the same bytes). False: every eager forward plans on the
+    # host as before. Rank-local choice, no collective inside the MoE.
+    SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP = EnvBool(True)
+    # Metal instrument for SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP: the first N
+    # device-planned eager forwards PER LAYER also run the plain host plan
+    # (history-free, H107 off: every spill expert fetched fresh from the host
+    # store) as the reference and compare the MoE outputs. One line
+    # 'EAGER-DEVICE-STEP CHECK ... verdict=MATCH' per check; a deviation
+    # beyond fp rounding stops the rank by name ('EAGER-DEVICE-STEP
+    # MISMATCH'). 1 (default) = the first mini extend of the process proves
+    # all 48 layers once (one extra MoE pass); 0 = off.
+    SGLANG_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK = EnvInt(1)
     # H95: the captured decode step of the device-planned pool
     # (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool) in up to N OVERFLOW WAVES. 0 or 1
     # (default) = off, the Task #40 worst case: a captured batch needs
