@@ -282,6 +282,13 @@ class TestCounterBooking(unittest.TestCase):
         self.assertEqual(rec.held_view()["last_5min"], 2)
 
 
+class TestViewHoldCount(unittest.TestCase):
+    def test_only_interior_fills_count(self):
+        arr = [1.0, None, None, 2.0, None]
+        self.assertEqual(history._hold(arr, 2), 2)                # the gap 1..2 counts, the live edge not
+        self.assertEqual(arr, [1.0, 1.0, 1.0, 2.0, 2.0])
+
+
 class TestStaticZoom(unittest.TestCase):
     """The zoom is on every chart: the history charts (uPlot), the boot cards' curves and phase bar."""
 

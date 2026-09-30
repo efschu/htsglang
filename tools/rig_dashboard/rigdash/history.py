@@ -765,16 +765,18 @@ def _hold(arr: List[Optional[float]], max_buckets: int) -> int:
     """A level sampled at a fixed period holds until the next sample, at most ``max_buckets`` rows:
     the NVML loop slips like the rank sampler (measured 30.09. ~21:10Z: the 1-s raster missed a second
     of the 5090 every ~10 s), and a missing second is not a missing value."""
-    last, age, n = None, 0, 0
+    last, age, n, pend = None, 0, 0, 0
     for i, v in enumerate(arr):
         if v is not None:
             last, age = v, 0
+            n += pend              # counted only where a real reading follows: a gap, not the live edge
+            pend = 0
         elif last is not None and age < max_buckets:
             age += 1
             arr[i] = last
-            n += 1
+            pend += 1
         else:
-            last = None
+            last, pend = None, 0
     return n
 
 
@@ -809,7 +811,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
     names += [mp + k for k in msr] + [mp + "tier_" + k for k in cacheacct.TIERS]
     data = db.query(names, lo, hi, step, now)
     t0 = int(lo // step) * step
-    ts = list(range(t0, int(hi) + 1, step))
+    ts = list(range(t0, int(hi), step))      # the buckets the query can fill (rows with ts < int(hi))
     series = {}
     for n in names:
         d = data.get(n) or {}
