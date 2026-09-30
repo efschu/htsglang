@@ -9542,16 +9542,23 @@ class SchedulerWeightUpdaterManager:
         # H95: the P->D wake's kv_cache resume carries handoff_n/parked_n
         # (front rule 2); D's phase seat count follows from it on every rank.
         _phase_seats = None
+        # WT (30.09.): the kv call's first phase mark is cg_resume, so it carried
+        # everything before the graph resume (y4f median 99 ms vs rc12g 9 ms, the
+        # remap itself 3 ms) -- the seat/reshard work gets its own sub-counter.
+        _sub_t0 = time.perf_counter()
         if getattr(recv_req, "handoff_n", None) is not None:
             _note_seats = getattr(getattr(self, "scheduler", None), "weg2_d_note_wake_seats", None)
             if callable(_note_seats):
                 _phase_seats = _note_seats(recv_req)
+        _weg2_sub_t("wake_seats", _sub_t0)
         # H95c: BEFORE any tag of this request resumes -- the posts of the
         # phase's seats become pages (the first request of a wake without a
         # count: the cap form). A no-op unless SGLANG_OPT_WEG2_D_SEAT_VRAM on D.
+        _sub_t0 = time.perf_counter()
         _seat_vram = getattr(getattr(self, "scheduler", None), "weg2_d_seat_vram_wake", None)
         if callable(_seat_vram):
             _seat_vram(recv_req, _phase_seats)
+        _weg2_sub_t("seat_vram", _sub_t0)
         # C16/C17: this rank's own per-tag report of THIS leg, filled by the
         # weights block below and reduced over the group at the fence.
         weg2_per_tag: Dict[str, List[float]] = {}
@@ -9822,9 +9829,11 @@ class SchedulerWeightUpdaterManager:
         # xsn410: the fit is PER RANK (xsn377: TP1 funded, TP0 never) but the plan
         # must be the GROUP's, because the resume half now carries a collective --
         # one rank on "early" beside a sibling on "late" would deadlock there.
+        _sub_t0 = time.perf_counter()
         _fundable = (self._weg2_wake_kv_first_ok(tags) if _kv_in else False)
         if _kv_in:
             _fundable = self._weg2_kv_group_all(_fundable, "WAKE-KV-FIRST fundable")
+        _weg2_sub_t("kv_plan_vote", _sub_t0)
         _plan = _wk_plan(
             kv_in_tags=_kv_in,
             weights_in_tags=any(is_weights_family_tag(t) for t in tags),
@@ -9869,6 +9878,7 @@ class SchedulerWeightUpdaterManager:
             t_graph = time.perf_counter()
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
             _weg2_ph("cg_resume")
+            _weg2_sub_t("cg_remap", t_graph)
             graph_ms = (time.perf_counter() - t_graph) * 1000
             graph_bytes = self._weg2_tag_bytes(GPU_MEMORY_TYPE_CUDA_GRAPH)
             # WAKE INVARIANT FOR THE GRAPH TAG, the exact mirror of the
@@ -10674,7 +10684,8 @@ class SchedulerWeightUpdaterManager:
             if _weg2_sub:
                 logger.info("WEG2-WAKE-TAIL-SUB ms " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _weg2_sub.items())
                             + " (F22: reload = legs_barrier + reload_weights; dest_hook_compare = static_import"
-                            " + dest_leg + shadow_compare + rest; store_rescan = rescan + hold_release + rest)")
+                            " + dest_leg + shadow_compare + rest; store_rescan = rescan + hold_release + rest;"
+                            " WT: kv call cg_resume = wake_seats + seat_vram + kv_plan_vote + cg_remap + rest)")
         if store_failure and not report:
             # The fence did not gather: no memory saver, no cpu group, or
             # world <= 1. A single-rank engine cannot disagree with itself, so
@@ -10788,7 +10799,12 @@ def _export_static_state(model):
 
 
 def _import_static_state(model, static_params):
+    # WT (30.09.): a pinned host stash (sleep_staging.export_static_state_host)
+    # copies asynchronously on the current stream; the next forward is ordered
+    # behind it, and the pinned block stays owned by the caching host allocator
+    # until the copies that read it have completed.
+    non_blocking = bool(static_params.get("pinned", False))
     with torch.inference_mode():
         self_named_buffers = dict(model.named_buffers())
         for name, tensor in static_params["buffers"]:
-            self_named_buffers[name][...] = tensor
+            self_named_buffers[name].copy_(tensor, non_blocking=non_blocking)

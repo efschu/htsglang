@@ -115,13 +115,36 @@ def format_freed(freed: Dict[str, int]) -> str:
     return f"{total / _MIB:.1f} MiB ({parts or 'nothing held'})"
 
 
+#: offsets inside the pinned stash are aligned so every dtype view is legal
+_STASH_ALIGN = 256
+
+
 def export_static_state_host(model: Any) -> dict:
     """(b) The static-state stash (model buffers, restored at the wake by
     ``_import_static_state``'s in-place copy) on the HOST while asleep --
-    64 MiB on NF PP0 no pause covered. The import copies host -> device."""
-    return dict(
-        buffers=[(name, buffer.detach().to("cpu", copy=True)) for name, buffer in model.named_buffers()]
-    )
+    64 MiB on NF PP0 no pause covered. The import copies host -> device.
+
+    WT (30.09., NF y4f): ONE pinned host block, each buffer a view into it.
+    The pageable per-buffer stash cost the P->D wake ``static_import`` 111 ms
+    median on D TP0 (rc12g before 7002b171d5: 11 ms) -- a synchronous pageable
+    H2D per buffer on the wake's critical path. From pinned memory the import
+    is an asynchronous copy on the current stream (``pinned=True``), ordered
+    before the next forward. Without CUDA (a CPU double) the block is plain."""
+    import torch
+
+    named = [(name, buffer.detach()) for name, buffer in model.named_buffers()]
+    spans, total = [], 0
+    for _name, buf in named:
+        spans.append(total)
+        total += -(-_nbytes(buf) // _STASH_ALIGN) * _STASH_ALIGN
+    pinned = bool(total) and torch.cuda.is_available()
+    block = torch.empty(max(total, 1), dtype=torch.uint8, pin_memory=pinned)
+    buffers = []
+    for (name, buf), off in zip(named, spans):
+        view = block[off:off + _nbytes(buf)].view(buf.dtype).view(buf.shape)
+        view.copy_(buf)
+        buffers.append((name, view))
+    return dict(buffers=buffers, pinned=pinned, block=block)
 
 
 # -- (c) the holder report -------------------------------------------------------------
