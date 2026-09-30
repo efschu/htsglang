@@ -8838,6 +8838,11 @@ class Front:
         else:
             p.fut = asyncio.get_event_loop().create_future()
             p.t_arrive = time.time()
+            # NF-STAU-KV Wurzel 3 (NF 98218cc745, y3v weg2-28-58, 66.2 s hold): a kept SHORT that
+            # passed the P drain with skip_leg1 carries leg1_done=True without a leg 1 ever having
+            # run; re-routed "through P (leg 1, then leg 2)" it kept the flag, needs_p() said no and
+            # no flip came for it. Its leg 1 is ahead of it again, as HANDOFF-LOST/INTAKE-STALL say.
+            p.leg1_done = False
             if getattr(p, "short_kept", False) or getattr(p, "sk_void_seq", None) is not None:
                 # SK-X (W35 class, NF rc12t weg2-6-30): D refused a kept SHORT
                 # before the first byte. Its presence expires with this
