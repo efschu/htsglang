@@ -718,6 +718,17 @@ class Envs:
     # L3_WRITE_BEHIND_MIB: bytes copied per arena and pass (KV 786 KiB pages:
     # 325 per pass; mamba blobs 56 MiB: 4 per pass).
     SGLANG_WEG2_L3_WRITE_BEHIND_MIB = EnvInt(256)
+    # L3WB-SLICE (27B z30y10, dcdb9ab8f9, D TP0 20:03:52-20:04:10): ONE pass
+    # after the P->D gate opened ran 17.6 s (cpu_ms=17574.6) over new=4092
+    # stems for 8 pages written, and TP0 answered nothing in that window
+    # (front W3). SLICE_MS bounds one uninterrupted burst of the pass (census,
+    # stem read, stat, pair gate, write): when it is used up the pass stops at
+    # a slice edge, remembers where (per-arena cursor) and the thread
+    # continues after YIELD_MS instead of the full tick -- the work is
+    # stretched, never dropped. 0 = the pre-slice form (one pass does
+    # everything it finds).
+    SGLANG_WEG2_L3_WRITE_BEHIND_SLICE_MS = EnvFloat(25.0)
+    SGLANG_WEG2_L3_WRITE_BEHIND_YIELD_MS = EnvFloat(25.0)
     # L3FILL_JOIN_WAIT_MS (L3FILL-JOINED 30.09., NF y4a ep36 weg2-36-74): how
     # long an L3 -> L2 fill waits for a stem another writer has CLAIMED to
     # become COMPLETE before it counts as a miss. A prefix read ends at its
