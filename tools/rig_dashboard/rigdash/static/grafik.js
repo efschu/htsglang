@@ -136,7 +136,8 @@
     ctx.beginPath(); ctx.rect(left, top, width, height); ctx.clip();
     // Modellreihen: Abschnitte ohne IPC-Probe sind eine ehrliche Lücke, schraffiert und benannt
     // (Nutzer 30.09.: keine Reihe aus Boot-Logs; kein Boot live oder vor der IPC-Aufzeichnung)
-    if (u._model && data && data.series["m.ipc"]) {
+    const pid = (u.root && u.root.parentNode && u.root.parentNode.id) || "";
+    if (pid.startsWith("vl-c-") && pid !== "vl-c-flip" && data && data.series["m.ipc"]) {
       const al = data.series["m.ipc"], xs = data.t, step = data.step || 5;
       let i = 0;
       while (i < xs.length) {
@@ -206,8 +207,6 @@
     const u = new uPlot(Object.assign({ width: w, height: 200, legend: { live: true },
       cursor: { drag: { x: false, y: false }, sync: { key: "rigdash-verlauf" }, points: { size: 7 } },
       hooks: { draw: [marksDraw, endDots] } }, opts), rows, el);
-    u._model = id.startsWith("vl-c-") && id !== "vl-c-flip";
-    u.redraw();
     return u;
   }
 
