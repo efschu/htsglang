@@ -3147,6 +3147,118 @@ _WAVE_SLICE = {"pairs": None}
 _PARTIALS_MODE = {"mode": None}
 
 
+class PrefillFetchOverlap:
+    """PFO (#287 Hebel A, 30.09., NF y4k/y4l): the expert-major multi-wave
+    prefill fetches wave k+1 on the rank's prefetch stream while wave k's
+    grouped GEMM runs on the forward's stream.
+
+    MEASURED (FWD-TIMING-PREFILL vs MOE-OFFLOAD-TIMING-PREFILL, PP0 16k): the
+    compute stream's ``moe_fetch`` segment EQUALS the copies' own event sum
+    (y4k forward 1: 1453.5 = 1453.5 ms) -- today nothing overlaps: every wave is
+    fetch-join-apply on one stream (P-MINIFWD-THROTTLE put the joined copies on
+    the forward stream). PP0 16k chunk: 279 waves, 5859-7592 spill experts,
+    1.13-1.48 s of copies (~13 GB/s, the link) against ~1.4 s of other compute.
+
+    THE FORM. The scratch region [R, R+S) is split into two halves of
+    H = S // 2 slots; the spill waves are re-chunked to <= H experts (sorted
+    order kept, so the wave count about doubles); spill wave j uses half
+    (j - 1) % 2 (slot R + half * H + i). Wave w's copy is issued before wave
+    w - 1's apply is enqueued; it waits (``after``) for the apply event of wave
+    w - 2, the last reader of its half, or -- the first use of a half in this
+    forward -- for everything the forward's stream holds at issue time. The
+    forward's stream waits on the copy's event before the wave's apply. Events
+    only: no host sync, no join, no new VRAM (the scratch is SHARED, not grown).
+
+    Byte-identical to the serial form under the default partials table: every
+    (token, k) pair is computed once into its own row whatever the split
+    (see ``_run_waves_expert_major``), and the combine runs once at the end.
+    Not taken: the switch off, stream partials (fp32 sum order would follow
+    the split), H107 slot plans, graph capture, scratch < 2 or one spill wave.
+    The resident wave (w = 0) needs no copy -- spill wave 1 is issued before
+    it, so the first copy of every layer overlaps the resident GEMM."""
+
+    def __init__(self, stream, half: int):
+        self.stream = stream
+        self.half = int(half)
+        self.plans = {}
+        self.fetch_ev = {}
+        self.apply_ev = {}
+        self._cache = None
+        self._waves = None
+
+    def split(self, spill_waves):
+        h = self.half
+        return [g[i:i + h] for g in spill_waves for i in range(0, len(g), h)]
+
+    def begin(self, cache, all_waves) -> None:
+        self._cache = cache
+        self._waves = all_waves
+
+    def _plan(self, w):
+        slot_of_needed, fetch_plan = self._cache.planner.resolve(self._waves[w])
+        if w >= 1:
+            off = ((w - 1) % 2) * self.half
+            if off:
+                R = self._cache.planner.resident_count
+                moved = {e: s + off for e, s in slot_of_needed.items() if s >= R}
+                slot_of_needed = {**slot_of_needed, **moved}
+                fetch_plan = [(e, s + off) for e, s in fetch_plan]
+        return slot_of_needed, fetch_plan
+
+    def ensure(self, w):
+        """Plan wave ``w`` and issue its copy once; returns its slot map (None
+        past the last wave)."""
+        if w >= len(self._waves):
+            return None
+        if w not in self.plans:
+            self.plans[w] = self._plan(w)
+            after = self.apply_ev.get(w - 2) if w >= 3 else None
+            self.fetch_ev[w] = self._cache._fetch(self.plans[w][1], join=False,
+                                                  stream=self.stream, after=after)
+        return self.plans[w][0]
+
+    def wait(self, w) -> None:
+        ev = self.fetch_ev.get(w)
+        if ev is not None:
+            import torch
+
+            torch.cuda.current_stream().wait_event(ev)
+
+    def applied(self, w) -> None:
+        if self.stream is None:
+            return
+        import torch
+
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream())
+        self.apply_ev[w] = ev
+
+
+def prefill_fetch_overlap_on() -> bool:
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP.get())
+
+
+def prefill_fetch_overlap_form(cache, slot_plans, n_spill_waves: int):
+    """The PFO form for one expert-major forward, or None (the serial loop)."""
+    if not prefill_fetch_overlap_on():
+        return None
+    if slot_plans is not None or partials_mode() != "table":
+        return None
+    half = int(getattr(cache, "scratch", 0) or 0) // 2
+    if half < 1 or n_spill_waves < 1:
+        return None
+    stream = None
+    if getattr(cache, "_stream", None) is not None:
+        import torch
+
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        stream = pool_prefetch_stream()
+    return PrefillFetchOverlap(stream, half)
+
+
 def partials_mode() -> str:
     """SGLANG_MOE_OFFLOAD_PARTIALS: 'table' (default) keeps the [T*K, H]
     partials table and combines once at the end (byte-identical to the
@@ -4071,7 +4183,7 @@ class MoEExpertOffloadCache:
             import logging
             logging.getLogger(__name__).debug("[nan-guard] fetched check skipped: %s", exc)
 
-    def _fetch(self, fetch_plan, join: bool = True):
+    def _fetch(self, fetch_plan, join: bool = True, stream=None, after=None):
         """Async H2D-copy each wave's SPILL experts into their scratch slots,
         then join the copy stream before compute reads them. ``fetch_plan`` is
         (spill_expert_id, scratch_slot); the spill pool is indexed by
@@ -4083,11 +4195,19 @@ class MoEExpertOffloadCache:
         pool at all -- its row is a zero-copy view of a PEER's shared segment,
         resolved through ``self._cold_tier``. The copy itself is the same
         ``copy_`` over the same link; only the source address differs, which is
-        the whole design (the storage moved, the transport did not)."""
+        the whole design (the storage moved, the transport did not).
+
+        PFO (#287 Hebel A, 30.09.): ``stream`` given = the copies run on THAT
+        stream (the rank's one prefetch stream), ordered behind ``after`` (the
+        event of the apply that last read these slots) or, without one, behind
+        everything the forward's stream holds now; an event recorded behind the
+        copies is RETURNED and the caller's compute stream waits on it before
+        it reads the slots. No join here, no host sync. Without ``stream``
+        nothing below changes."""
         import torch
 
         if not fetch_plan:
-            return
+            return None
         for expert_id, slot in fetch_plan:
             self._scratch_holds[slot] = expert_id
         R = self.resident_count
@@ -4183,9 +4303,20 @@ class MoEExpertOffloadCache:
         miss_span = (_miss_cost.host_fetch_span(len(fetch_plan))
                      if join and _miss_cost.window_open() else nullcontext())
         miss_span.__enter__()
+        pfo_event = None
         if self._stream is None:
             # No CUDA context (desk test): same copies, same order, no streams.
             _copies()
+        elif stream is not None:
+            # PFO: the copies on the given stream, WAR-ordered by event
+            if after is not None:
+                stream.wait_event(after)
+            else:
+                stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                _copies()
+            pfo_event = torch.cuda.Event()
+            pfo_event.record(stream)
         else:
             if join and not self._side_copies_in_flight:
                 # P-MINIFWD-THROTTLE (30.09.): a JOINED fetch runs on the
@@ -4223,6 +4354,7 @@ class MoEExpertOffloadCache:
         self.planner.stats.h2d_bytes += moved
         self.planner.stats.remote_h2d_bytes += remote_moved
         miss_span.__exit__(None, None, None)
+        return pfo_event
 
     def _build_lut(self, slot_of_needed, dtype, device):
         """Global expert id -> slot LUT for one wave; -1 for every id the wave
@@ -6124,6 +6256,11 @@ class MoEExpertOffloadCache:
         device = topk_ids.device
         T, K = int(topk_ids.shape[0]), int(topk_ids.shape[1])
 
+        # PFO (#287 Hebel A): the double-buffered form, or the serial one
+        pfo = prefill_fetch_overlap_form(self, slot_plans, len(spill_waves))
+        if pfo is not None:
+            spill_waves = pfo.split(spill_waves)
+
         # pair index (t*K + k) -> wave: 0 = the fetch-free resident wave,
         # 1..n = spill groups, -1 = padded slot (contributes an exact zero).
         # flat_np: the [T*K] routed ids as int64 (list path: np.asarray of
@@ -6153,18 +6290,35 @@ class MoEExpertOffloadCache:
         out_acc = None  # [T, H] fp32 when streaming
         try:
             cfg.routed_scaling_factor = 1.0
-            for w, needed in enumerate([resident_used] + spill_waves):
+            all_waves = [resident_used] + spill_waves
+            if pfo is not None:
+                pfo.begin(self, all_waves)
+            for w, needed in enumerate(all_waves):
                 idx_np = np.flatnonzero(wave_of_pair == w)
-                if idx_np.size == 0:
+                if pfo is not None:
+                    # PFO: this wave's copy was issued a wave earlier; the
+                    # NEXT spill wave's copy is issued now, before this apply
+                    slot_of_needed = pfo.ensure(w)
+                    pfo.ensure(w + 1)
+                    if idx_np.size == 0:
+                        pfo.applied(w)
+                        continue
+                    fwd_mark("moe_plan")
+                    if _tm:
+                        _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
+                    pfo.wait(w)
+                    fetch_plan = pfo.plans[w][1]
+                elif idx_np.size == 0:
                     continue
-                if slot_plans is None:
+                elif slot_plans is None:
                     slot_of_needed, fetch_plan = self.planner.resolve(needed)
                 else:
                     slot_of_needed, fetch_plan = slot_plans[w]  # H107
-                fwd_mark("moe_plan")
-                if _tm:
-                    _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
-                self._fetch(fetch_plan)
+                if pfo is None:
+                    fwd_mark("moe_plan")
+                    if _tm:
+                        _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
+                    self._fetch(fetch_plan)
                 _hap.checkpoint("moe.fetch", layer=getattr(self.layer, "layer_id", None),
                                 wave=f"{w}/{len(spill_waves) + 1}", fetched=len(fetch_plan))
                 self._nan_trace_wave(w, needed, slot_of_needed)
@@ -6227,6 +6381,8 @@ class MoEExpertOffloadCache:
                     partials.index_copy_(0, idx, part.to(partials.dtype))
                 _hap.checkpoint("moe.apply", layer=getattr(self.layer, "layer_id", None),
                                 wave=f"{w}/{len(spill_waves) + 1}", pairs=int(idx_np.size))
+                if pfo is not None:
+                    pfo.applied(w)
                 fwd_mark("moe_apply")
                 if _tm:
                     _e2 = torch.cuda.Event(enable_timing=True); _e2.record()

@@ -856,6 +856,14 @@ class Envs:
     # forward once its event completed -- no host wait in the decode path.
     # Off until its own metal proof (layers/moe/expert_offload.ResumeWarm).
     SGLANG_WEG2_RESUME_WARM_FINISH = EnvBool(False)
+    # PFO (#287 Hebel A, 30.09., layers/moe/expert_offload.PrefillFetchOverlap):
+    # the expert-major multi-wave prefill copies wave k+1 on the rank's
+    # prefetch stream while wave k computes; the scratch is split in two
+    # halves (wave count ~doubles), events only, no host sync, no new VRAM.
+    # Measured today: PP0 16k fetch 1.13-1.48 s fully serial (moe_fetch
+    # segment == copy events). Byte-identical under the table partials; the
+    # single-wave (decode) path is untouched. Off until metal.
+    SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP = EnvBool(False)
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.
