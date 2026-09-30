@@ -134,6 +134,62 @@ def _unclaim_fill_joins(arena, joined) -> None:
                     "unclaimed, a miss for this read%s", k, len(joined), _FILL_JOIN_N[1], owners)
 
 
+#: L3FILL-JOINED (30.09.): the name prefix of the prefetch io threads
+#: (``HiCacheController._start_prefetch_io_workers``: ``hicache-prefetch-io-<k>``)
+PREFETCH_IO_THREAD_PREFIX = "hicache-prefetch-io"
+_JOIN_WAIT_N = [0, 0, 0]   # waits, stems waited for, stems that completed in the wait
+
+
+def fill_join_wait_ms() -> int:
+    """L3FILL-JOINED (2): how long this thread's fill may wait for a JOINED stem.
+
+    Only a prefetch io thread waits. The KV path that reaches the fill runs
+    there: ``prefetch_io_aux_func`` (thread ``hicache-prefetch-io-<k>``) ->
+    ``_page_transfer`` -> ``page_get_func`` = ``_generic_page_get`` ->
+    ``_arena_page_get`` -> ``arena_fill_from_disk(prefix=True)``. Every other
+    caller -- the scheduler's own thread (admission, load-back), the flip
+    legs, the decode, the write-behind -- gets 0 and keeps the immediate miss."""
+    if not threading.current_thread().name.startswith(PREFETCH_IO_THREAD_PREFIX):
+        return 0
+    try:
+        return max(0, int(envs.SGLANG_WEG2_L3FILL_JOIN_WAIT_MS.get()))
+    except Exception:  # noqa: BLE001 - no switch, no wait
+        return 0
+
+
+def _await_fill_joins(arena, stems, joined, wait_ms: int) -> dict:
+    """L3FILL-JOINED (2): poll the JOINED stems until another writer's claim
+    turns COMPLETE (same answer as claim status 2: complete, usable) or the
+    wait is spent. Returns {index: slot} of those that completed."""
+    find = getattr(arena, "find_slots", None)
+    if not joined or wait_ms <= 0 or not callable(find):
+        return {}
+    pend = {int(i): stems[int(i)] for i, _s, _g in joined}
+    done = {}
+    t0 = time.perf_counter()
+    deadline = t0 + wait_ms / 1000.0
+    while pend:
+        keys = list(pend)
+        for i, (slot, state) in zip(keys, find([pend[i] for i in keys])):
+            if int(slot) >= 0 and int(state) == 2:
+                done[i] = int(slot)
+                pend.pop(i)
+        if not pend or time.perf_counter() >= deadline:
+            break
+        time.sleep(0.005)
+    _JOIN_WAIT_N[0] += 1
+    _JOIN_WAIT_N[1] += len(joined)
+    _JOIN_WAIT_N[2] += len(done)
+    k = _JOIN_WAIT_N[0]
+    if k <= 16 or (k & (k - 1)) == 0 or pend:
+        logger.info("L3-FILL JOIN-WAIT n=%d stems=%d completed=%d still_claimed=%d waited_ms=%.0f "
+                    "bound_ms=%d totals=%d/%d (a JOINED stem another writer completed inside the "
+                    "wait is read from L2 instead of ending the prefix; prefetch io thread only)",
+                    k, len(joined), len(done), len(pend), (time.perf_counter() - t0) * 1000.0,
+                    int(wait_ms), _JOIN_WAIT_N[2], _JOIN_WAIT_N[1])
+    return done
+
+
 def _fill_claim(arena, stems, total_bytes: int):
     """The fill's claims, stamped with the l3fill role (L3FILL-JOINED); a
     hermetic fake arena without the keyword claims as before."""
@@ -3207,6 +3263,12 @@ class HiCacheFile(HiCacheStorage):
             # fill writes nothing into it, so its open-writer mark goes at once
             # -- left behind, the slot could never be reaped nor complete
             _unclaim_fill_joins(arena, joined)
+            # L3FILL-JOINED (2): wait (bounded, prefetch io thread only) for the
+            # other writer instead of ending the prefix at its page
+            _waited = _await_fill_joins(arena, stems, joined, fill_join_wait_ms())
+            for i, s_ in _waited.items():
+                out[i] = s_
+            joined = [j for j in joined if int(j[0]) not in _waited]
         if prefix and todo:
             # (a): the first stem that neither raced in complete nor got a
             # claim ends the prefix -- its successors are not read

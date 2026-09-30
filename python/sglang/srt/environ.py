@@ -647,6 +647,13 @@ class Envs:
     # L3_WRITE_BEHIND_MIB: bytes copied per arena and pass (KV 786 KiB pages:
     # 325 per pass; mamba blobs 56 MiB: 4 per pass).
     SGLANG_WEG2_L3_WRITE_BEHIND_MIB = EnvInt(256)
+    # L3FILL_JOIN_WAIT_MS (L3FILL-JOINED 30.09., NF y4a ep36 weg2-36-74): how
+    # long an L3 -> L2 fill waits for a stem another writer has CLAIMED to
+    # become COMPLETE before it counts as a miss. A prefix read ends at its
+    # first miss, so one JOINED page cut a 1070-page prefix at 146 (the rest
+    # re-prefilled). Only on the prefetch io threads (hicache-prefetch-io-<k>);
+    # the scheduler, flip and decode threads never wait. 0 = the pre-0930 form.
+    SGLANG_WEG2_L3FILL_JOIN_WAIT_MS = EnvInt(300)
     # STORE_REFUSE_FS (W57, user 28.09.: "L3 gehoert auf XFS, nie ZFS"): a
     # real boot whose store directory lives on one of these filesystems
     # (/proc/mounts) is refused by name -- the container layer (overlay) or
