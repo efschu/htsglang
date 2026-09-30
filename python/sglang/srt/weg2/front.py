@@ -8480,10 +8480,10 @@ class Front:
                     tier_carry: Optional[bytearray] = bytearray() if _strip_tier else None
 
                     async def _write_client(chunk: bytes) -> None:
-                        if chunk:
+                        if chunk and r.status == 200:
                             # FEHLT 3: ANY D content after a P->D flip is its first
                             # work -- a resumed stream too, not only a new leg's
-                            # first chunk (one dict read while nothing is armed)
+                            # first chunk (one dict read while nothing is armed); 200 only
                             self._ipc_first_work_seen("D", "decode_token", rid)
                         try:
                             await resp.write(chunk)
