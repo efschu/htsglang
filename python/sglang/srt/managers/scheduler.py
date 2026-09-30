@@ -22187,6 +22187,17 @@ def run_scheduler_process(
         pp_rank,
         dp_rank,
     )
+    # NUMPY-THP-SERVE (27B z30y11): no numpy MADV_HUGEPAGE in a rank process --
+    # a 2 MiB first touch compacts synchronously and migrates the shared arena
+    # under every rank (see gguf_numpy_hugepage.numpy_hugepage_off_for_serving).
+    try:
+        from sglang.srt.model_loader.gguf_numpy_hugepage import (
+            numpy_hugepage_off_for_serving,
+        )
+
+        numpy_hugepage_off_for_serving(f"scheduler tp={tp_rank} pp={pp_rank}")
+    except Exception:  # noqa: BLE001 - a page-size hint never stops a rank
+        logger.warning("[NUMPY-THP] switch failed", exc_info=True)
     parent_process = psutil.Process().parent()
 
     # VRAM flight recorder (#605). Armed here and nowhere later: this is the
