@@ -523,7 +523,19 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     trigger = "seat"
     pair = None
     if cap and len(reqs) >= int(cap):
-        pair = _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+        cand = _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+        if cand is not None:
+            # NF review of 2d49cd45bf: the seat trigger freed a seat without asking
+            # whether the older one then FITS the KV -- a victim for nothing, against the
+            # user's "nur wenn es reicht". Seat AND KV after the k youngest, else nobody.
+            # The KV half is rank-local, so it goes through the group MIN like the KV
+            # trigger (the precondition -- full seats, a candidate -- is replicated,
+            # so every rank enters the collective).
+            local = kv_displace_would_fit(sched, cand[0], reqs, seat=True)
+            gm = getattr(sched, "_weg2_group_min_flags", None)
+            agreed = bool(gm([local])[0]) if callable(gm) else bool(local)
+            if agreed:
+                pair = cand
     elif _kv_displace_enabled():
         # KV trigger: a seat is free, but an OLDER waiting request did not fit
         # D's KV while a younger one runs. The PRECONDITION is replicated (the
@@ -622,10 +634,13 @@ def _req_kv_tokens(r) -> int:
     return len(getattr(r, "origin_input_ids", None) or ()) + len(getattr(r, "output_ids", None) or ())
 
 
-def kv_displace_would_fit(sched, older_rid: str, running) -> bool:
-    """This rank's half of the KV displacement verdict (the group takes the MIN):
-    the older waiting request does not fit the free KV, and parking the youngest
-    running seats younger than it frees enough for it. Logs the outcome (throttled)."""
+def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False) -> bool:
+    """This rank's half of the displacement verdict (the group takes the MIN):
+    KV trigger (seat=False): the older waiting request does not fit the free KV,
+    and parking the youngest running seats younger than it frees enough for it.
+    Seat trigger (seat=True): every seat is held, so one victim is needed for the
+    seat anyway; it is taken only when the older one then also fits the KV
+    (k youngest, k >= 1). Logs the outcome (throttled)."""
     from sglang.srt.weg2 import seat_age as _sa
 
     older = next((q for q in getattr(sched, "waiting_queue", ()) or () if str(q.rid) == str(older_rid)), None)
@@ -643,11 +658,16 @@ def kv_displace_would_fit(sched, older_rid: str, running) -> bool:
     young = sorted((r for r in running if _sa.rid_age(str(r.rid)) > _sa.rid_age(str(older_rid))),
                    key=lambda r: _sa.rid_age(str(r.rid)), reverse=True)
     k = victims_needed(need, avail, [_req_kv_tokens(r) for r in young])
+    if seat and k is not None:
+        if not young:
+            k = None                                   # no younger seat to give
+        else:
+            k = max(1, k)                              # the seat itself needs one victim
     n = getattr(sched, "_sa_kv_fit_n", 0) + 1
     sched._sa_kv_fit_n = n
     if k != 1 and (n <= 8 or (n & (n - 1)) == 0):
-        logger.info("SEAT-AGE KV-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d -> %s (n=%d)",
-                    str(older_rid)[:16], need, avail, len(young),
+        logger.info("SEAT-AGE %s-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d -> %s (n=%d)",
+                    "SEAT" if seat else "KV", str(older_rid)[:16], need, avail, len(young),
                     "fits free, nobody leaves" if k == 0 else
                     "not even with all younger seats: nobody leaves, backfill stays" if k is None else
                     "%d youngest must leave (one per pass)" % k, n)

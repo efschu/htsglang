@@ -98,6 +98,14 @@ class KvTrigger(unittest.TestCase):
         self.assertIsNone(_run(lambda: DPR.displace_for_age(sched, batch),
                                {"SGLANG_WEG2_SEAT_AGE_KV_DISPLACE": "0"}))
 
+    def test_seat_trigger_only_when_the_older_then_fits_the_kv(self):
+        # NF review: seats full (cap 2), older 5000, free 100, younger seats 1000 + 1000:
+        # freeing the seat would not make it fit the KV -> nobody leaves
+        sched, batch = _sched([_req(R(5)), _req(R(9))], [_req(R(3), span=5000)], cap=2)
+        self.assertIsNone(_run(lambda: DPR.displace_for_age(sched, batch)))
+        self.assertEqual(batch.released, [])
+        self.assertEqual(sched.calls, [[False]], "the verdict went through the group MIN")
+
     def test_seat_trigger_unchanged(self):
         sched, batch = _sched([_req(R(5)), _req(R(9))], [_req(R(3))], cap=2)
         with self.assertLogs(DPR.logger, level="WARNING") as cap:
