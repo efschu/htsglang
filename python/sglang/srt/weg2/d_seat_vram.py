@@ -1533,6 +1533,20 @@ class SeatVram:
                 and any(lv for _m, _sp, lv in kv_plans)
                 and torch.cuda.is_initialized()):
             self._timed_sync()
+        # RB (NF y3w e033a931db, D 01:45:51, S7 -> S8 at incoming=77427):
+        # RELEASE BEFORE MAP. The KV prefix used to be mapped first and the
+        # expert bank released after it, so a grow that the planner paid
+        # with expert rows (rows_on 15/12 -> 6) needed the rows' pages AND
+        # the new KV pages at once. TP0/TP1 had the slack (card_free 2535 MiB
+        # on TP0), TP2 (3080, card_free 758 MiB) did not:
+        # ``WEG2-TMS-RESUME cuMemCreate FAILED rc=2 (out of memory)
+        # size=37748736`` -> Weg2DSeatVramRefused -> W17 group dead. The
+        # cell table never books more than the boot form, so with the
+        # shrinking side released first the growing side always fits:
+        # a bank that shrinks gives its cells back before the KV maps, a KV
+        # that shrinks (the loop order below, unchanged) before the bank maps.
+        if shrink:
+            self._set_bank_plans(bank_plans, census)
         for m, sp, live in kv_plans:
             self.set_plan(m.ptr, m.geom.geom.name, sp, live=live, census=census)
         page = int(self.kv_tensors[0].geom.token_pad) if self.kv_tensors else 0
@@ -1540,13 +1554,12 @@ class SeatVram:
             # zero_kv_data_buffers (the idle flush) writes only mapped rows --
             # #239 S3g: each pool's own (a token-cut FA pool: compacted)
             bound_stage_tokens(pool, tokens, page)
-        for m, sp, live in bank_plans:
-            self.set_plan(m.ptr, m.geom.name, sp, live=live, census=census)
         if not shrink:
+            self._set_bank_plans(bank_plans, census)
             for cache in self.caches:
                 cache.set_seat_rows_on(k, device_write=experts_live)
         log_live_spans(census, n=n, stage=j, rows_from=int(self.rows_on), rows_to=k,
-                       mamba_keep=self.mamba_keep)
+                       mamba_keep=self.mamba_keep, order="bank-first" if shrink else "kv-first")
         if experts_live:
             if k < int(self.rows_on):
                 self.evicted_rows += int(self.rows_on) - k
@@ -1563,6 +1576,10 @@ class SeatVram:
             kv_mapped=int(cell.kv_mapped))
         self.applied = applied
         return applied
+
+    def _set_bank_plans(self, bank_plans, census) -> None:
+        for m, sp, live in bank_plans:
+            self.set_plan(m.ptr, m.geom.name, sp, live=live, census=census)
 
     def _rows_off_live(self, k: int, experts_live: bool) -> None:
         """Turn bank rows OFF (coldest first) on a live bank: sync, then the
@@ -1680,7 +1697,7 @@ class SeatVram:
 
 
 def log_live_spans(census: Dict[str, int], *, n: int, stage: Optional[int], rows_from: int,
-                   rows_to: int, mamba_keep: Optional[int] = None) -> None:
+                   rows_to: int, mamba_keep: Optional[int] = None, order: str = "-") -> None:
     """The metal marker of a live apply (none when every allocation was
     paused: a plan moves no byte). ``wiped=0`` by construction --
     ``refuse_wipes`` stopped the apply otherwise."""
@@ -1688,12 +1705,13 @@ def log_live_spans(census: Dict[str, int], *, n: int, stage: Optional[int], rows
         return
     logger.info(
         "%s n=%d stage=%s rows_on %d->%d tensors=%d extents_kept=%d cells_freed=%d "
-        "cells_mapped=%d wiped=0 mamba_keep=%s (a live move releases whole lattice cells "
-        "only; mamba_keep = the GDN slots with pages = the flush's reset range, all = cap "
-        "form -- a live apply never moves it)",
+        "cells_mapped=%d wiped=0 mamba_keep=%s order=%s (a live move releases whole lattice "
+        "cells only; mamba_keep = the GDN slots with pages = the flush's reset range, all = "
+        "cap form -- a live apply never moves it; order = which side moved first, RB: the "
+        "shrinking side always releases before the growing side maps)",
         LIVE_MARK, int(n), "-" if stage is None else "S%d" % int(stage), int(rows_from),
         int(rows_to), census["tensors"], census["kept"], census["freed"], census["mapped"],
-        "all" if mamba_keep is None else int(mamba_keep))
+        "all" if mamba_keep is None else int(mamba_keep), order)
 
 
 # ---------------------------------------------------------------------------
