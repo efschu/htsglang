@@ -4497,6 +4497,8 @@ class Front:
             self.queue.append(p)
             self._rvp_inflight.add(rid)
             self.counters["rvp_rerouted"] += 1
+            if str(r.get("reason", "")).startswith("x_refusal_midstream"):
+                self.counters["route_reroute_midstream"] = self.counters.get("route_reroute_midstream", 0) + 1  # FEHLT 8
             logger.warning(
                 "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%d reason=%s path=%s "
                 "tokens=%d attempt=%s -- D kept the stream and parked the request; P prefills its "
@@ -6453,6 +6455,9 @@ class Front:
         if _asr.enabled():
             # ARRIVAL-SEAT: the rule's verdict counters (state.json front.arrival_seat)
             out["arrival_seat"] = _asr.state_block(self.counters, self._asr_st()["waiters"], True)
+        # FEHLT 8 (30.09., DASHBOARD-AUS-IPC-INVENTAR): the prefill site per request,
+        # exact -- rigdash derived it from the leg counts (5 s behind, blind to reroutes)
+        out["routes"] = routes_block(self.counters, getattr(self, "_route_x_live", None))
         # y4y 17:05:40Z (two burst requests 300 s without a token beside a served
         # anchor stream): the oldest open request and the ones longest without a
         # token, for the progress watcher's HAENGT-EINZEL
@@ -6515,6 +6520,11 @@ class Front:
         request. A subset of ``D``, cumulative, never reset."""
         self._ipc_note_served("D", prompt, cached, completion, cached_tier)
         self._ipc_dp_clock().note_d_served(time.time())  # D->P flip time: D's last served leg 2
+        # FEHLT 8 (state.json front.routes): the prefill site of THIS request,
+        # the X-EXACT-ERR `via` classification, counted once per served leg 2
+        # (that site is reached only on an _x_exact_rid hit; this one sees all)
+        _rc = route_counter_of(pending)
+        self.counters[_rc] = self.counters.get(_rc, 0) + 1
         if pending is not None and pending.leg1_ran:
             self._ipc_note_served("D_after_P", prompt, cached, completion, cached_tier)
 
@@ -7136,6 +7146,7 @@ class Front:
         # exceeds". Nothing read None as a number; the line simply never
         # showed the number. Instrument-text-lies, class A.
         self._note_front_price(rid, remainder)  # RESUME-VIA-P: the W50-REROUTE line's front_price
+        self._route_x_live = int(x_route)  # FEHLT 8: the X the last ROUTE-VERDICT decided with
         logger.info(
             "WEG2 ROUTE-VERDICT rid=%s verdict=%s uncached=%d (base for X=%d, "
             "what D must PREFILL, at CHARS_PER_TOKEN=%.1f minus the MEASURED "
@@ -12811,6 +12822,30 @@ class Front:
             )
         except Exception:  # noqa: BLE001 -- a guard may not break the endpoint
             return None
+
+
+#: FEHLT 8: the counters behind state.json ``front.routes``
+ROUTE_COUNTERS = {"d_direct": "route_d_direct", "via_p": "route_via_p", "d_drain": "route_d_drain",
+                  "reroute_midstream": "route_reroute_midstream"}
+
+
+def route_counter_of(pending) -> str:
+    """The X-EXACT-ERR ``via`` of a served leg 2 as a counter name: no pending =
+    the SHORT route straight to D; a pending handed to D without a leg 1 = the
+    D drain (``d_direct``); else the request came through P."""
+    if pending is None:
+        return ROUTE_COUNTERS["d_direct"]
+    if getattr(pending, "d_direct", False):
+        return ROUTE_COUNTERS["d_drain"]
+    return ROUTE_COUNTERS["via_p"]
+
+
+def routes_block(counters, x_live) -> dict:
+    """state.json ``front.routes``: cumulative counts per prefill site, the
+    mid-stream reroutes to P, and the X of the last route verdict."""
+    out = {k: int(counters.get(c, 0) or 0) for k, c in ROUTE_COUNTERS.items()}
+    out["x_live"] = None if x_live is None else int(x_live)
+    return out
 
 
 def _d_seat_rewake_on() -> bool:
