@@ -601,6 +601,15 @@ class Envs:
     # device load -- at the wake. False = the pre-#248 hold read (reference
     # and pin during the sleep), byte for byte.
     SGLANG_WEG2_ENABLE_PARK_L3 = EnvBool(True)
+    # ENABLE_SHORT_READ_ANCHOR (SA, NF y3v 5327bdfa17, weg2-46-98): a store
+    # read whose KV ended short still reads the recurrent state (and the QSA
+    # index pages) at the deepest anchor inside the landed pages; that anchor
+    # is the rank's #257 cut. Before: the extra pools were skipped for every
+    # short read, the #257 cut inserted 45824 KV tokens without a state, PP0's
+    # walk refused them (#TF told=0) and P re-prefilled 54226 tokens. Only
+    # where the rank decides its own cut (no attention-TP reduce). False = the
+    # pre-SA skip, byte for byte.
+    SGLANG_WEG2_ENABLE_SHORT_READ_ANCHOR = EnvBool(True)
     # ENABLE_WAKE_READ_EARLY (F22, 29.09.): the #248 hold read is issued at the
     # START of D's weight legs instead of after the kv resume, so the store
     # reads (aux threads, host only) run beside the ~1.5 s of legs. Measured
