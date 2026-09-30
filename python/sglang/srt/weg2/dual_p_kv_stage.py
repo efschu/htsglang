@@ -682,7 +682,11 @@ def mark_pp0_idle(sched, now: Optional[float] = None) -> bool:
     try:
         tmp = "%s.%d.tmp" % (path, os.getpid())
         with open(tmp, "w") as f:
-            f.write("%.6f" % t)
+            # metal dual22: "idle" alone is not ordered with the ring -- PP0 was idle while
+            # its last frame for the aborted rid (fwd 340) still sat in PP2's inbox. The
+            # stamp carries PP0's forward count: a follower applies only once it has
+            # executed every pass PP0 launched.
+            f.write("%.6f %d" % (t, int(getattr(sched, "forward_ct", 0) or 0)))
         os.replace(tmp, path)
     except OSError:
         return False
@@ -715,11 +719,17 @@ def follower_release_aborted_chunk(sched, now: Optional[float] = None) -> bool:
         return False
     try:
         with open(_idle_marker(_dual_tag())) as f:
-            idle_t = float(f.read().strip() or 0)
+            parts = f.read().split()
+        idle_t = float(parts[0]) if parts else 0.0
+        pp0_fwd = int(parts[1]) if len(parts) > 1 else None
     except (OSError, ValueError):
         return False
     if idle_t <= seen[1]:
         return False  # PP0 has not been idle since the abort reached this rank
+    if pp0_fwd is None:
+        return False  # an old stamp without PP0's pass count: not ordered with the ring
+    if int(getattr(sched, "forward_ct", 0) or 0) < pp0_fwd:
+        return False  # a pass PP0 launched (it may name the rid) has not run here yet
     drained = getattr(sched, "_pp_microbatches_drained", None)
     if callable(drained) and not drained():
         return False
@@ -729,8 +739,10 @@ def follower_release_aborted_chunk(sched, now: Optional[float] = None) -> bool:
     finally:
         sched._791c_pp0_drained = False
     logger.info("%s FOLLOWER-ABORT-APPLIED rid=%s pp_rank=%s: PP0 idle since %.1f s after this rank "
-                "saw the abort (the #791C liveness release the dual layout has no lap for)", MARK,
-                str(getattr(req, "rid", "?"))[:16], getattr(sched.ps, "pp_rank", "?"), idle_t - seen[1])
+                "saw the abort, every pass it launched ran here (fwd %d >= %d; the #791C liveness "
+                "release the dual layout has no lap for)", MARK,
+                str(getattr(req, "rid", "?"))[:16], getattr(sched.ps, "pp_rank", "?"), idle_t - seen[1],
+                int(getattr(sched, "forward_ct", 0) or 0), pp0_fwd)
     return True
 
 

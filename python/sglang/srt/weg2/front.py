@@ -11073,6 +11073,8 @@ class Front:
             return  # no new P pass while D is short
         if not self.queue or time.time() < self._dual_backoff_until:
             return
+        if self.dual_kv_ledgers and self._dual_resume_held():
+            return  # a paused request waits until every P stage released and D stopped growing
         self.counters["dual_passes"] += 1
         self._dual_task = asyncio.get_running_loop().create_task(pass_fn())
 
@@ -11096,6 +11098,40 @@ class Front:
                         "(-1 = ledger absent)", worst, per, len(self._dual_inflight),
                         bool(t is not None and not t.done()), len(self.queue))
         return worst
+
+    def _dual_resume_held(self) -> bool:
+        """A requeued PAUSED request at the head goes back to P only when every
+        card shows no pressure, nothing committed by P (all stages released) and
+        no D demand (card_kv_ledger.p_resume_ready). Metal dual22: the resume went
+        out 0.16 s after the requeue, PP1/PP2 then applied the old abort against
+        it (#1180 on PP2, W17), and it would have met D still growing (pause 2)."""
+        head = self.queue[0] if self.queue else None
+        if head is None or int(getattr(head, "dual_paused_n", 0) or 0) <= 0:
+            return False
+        from sglang.srt.weg2.card_kv_ledger import p_resume_ready
+
+        try:
+            ok, per = p_resume_ready(self.dual_kv_ledgers)
+        except Exception as exc:  # noqa: BLE001 -- a ledger read never stops the pump
+            logger.warning("WEG2 DUAL card KV ledger read failed: %r", exc)
+            return False
+        now = time.time()
+        if ok:
+            if getattr(self, "_dual_resume_wait_since", None) is not None:
+                logger.info("WEG2 DUAL RESUME rid=%s after %.1f s: every P stage released, D stopped "
+                            "growing (per card (pressure, P committed, D demand) = %s)", head.rid,
+                            now - self._dual_resume_wait_since, per)
+            self._dual_resume_wait_since = None
+            return False
+        if getattr(self, "_dual_resume_wait_since", None) is None:
+            self._dual_resume_wait_since = now
+            self._dual_resume_log_next = 0.0
+        if now >= getattr(self, "_dual_resume_log_next", 0.0):
+            self._dual_resume_log_next = now + self.DUAL_PRESSURE_LOG_S
+            logger.info("WEG2 DUAL RESUME-WAIT rid=%s waited %.1f s: per card (pressure, P committed, "
+                        "D demand) = %s -- resumes at all zeros", head.rid, now - self._dual_resume_wait_since,
+                        per)
+        return True
 
     def _dual_pause_inflight(self, pressure: int) -> None:
         """Mark every leg 1 in flight on P as PAUSED and abort it on P (every

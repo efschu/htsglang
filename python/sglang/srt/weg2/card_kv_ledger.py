@@ -293,6 +293,7 @@ class CardKvLedger:
         other = GROUPS[1 - self._gi]
         with self._locked() as st:
             st.pressure[other] = 0
+            st.demand[self.group] = 0
 
     def pressure_on_me(self) -> int:
         """Bytes the other process asked this one to release from its cache."""
@@ -339,6 +340,27 @@ def peek(path: str) -> Optional[LedgerState]:
         os.close(lock_fd)
         mm.close()
     return st if st.budget else None
+
+
+def p_resume_ready(paths):
+    """The front may send a PAUSED P request back only when EVERY card shows:
+    no pressure on P, nothing committed by P (every P stage released -- the
+    followers too), and no D demand left (D grew or stopped asking). Metal
+    dual22: the resume went out while PP1/PP2 still held the old instance, and
+    straight into a second pause (D still growing). Returns (ready, per-card
+    [(pressure, p_committed, d_demand)]); a missing ledger is not ready."""
+    out = []
+    ready = bool(paths)
+    for pth in paths or ():
+        st = peek(pth)
+        if st is None:
+            out.append(None)
+            ready = False
+            continue
+        row = (int(st.pressure["P"]), int(st.committed["P"]), int(st.demand["D"]))
+        out.append(row)
+        ready = ready and row == (0, 0, 0)
+    return ready, out
 
 
 def p_pressure(paths) -> int:
