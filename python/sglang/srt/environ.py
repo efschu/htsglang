@@ -872,6 +872,12 @@ class Envs:
     # (layers/moe/router_prewarm; gate +80-105 ms per stage). No forward, no
     # new RAM or VRAM. Off until metal.
     SGLANG_WEG2_ENABLE_TARGETED_PREWARM = EnvBool(False)
+    # P-HC-DYNROWS (30.09., NF y4k/y4l PP2 other_ms 1266 first / 329 second
+    # forward): the GatedResidual torch.compile fallbacks (layers/
+    # hyperconnection.py) mark the row count dynamic, so the first call
+    # compiles once and a new prefill length never recompiles. Bytes equal to
+    # the static compile. Off until metal.
+    SGLANG_ENABLE_HC_COMPILE_DYNAMIC_ROWS = EnvBool(False)
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.

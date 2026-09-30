@@ -35,6 +35,31 @@ def hc_mixer_int8_on(quant_config) -> bool:
     return True
 
 
+def hc_compile_dynamic_rows_on() -> bool:
+    """SGLANG_ENABLE_HC_COMPILE_DYNAMIC_ROWS (P-HC-DYNROWS, 30.09.): the
+    torch.compile fallbacks of :class:`GatedResidual` (``_mix_compute`` for
+    rows > 16 without the sm_100 CuTe mix, ``_combine_compute`` without the
+    JIT combine) take the row count as a dynamic dimension from their first
+    call. Measured reason (NF y4k 09301110 / y4l 09301150, P logs, PP2 = sm86,
+    the model-level mixer of the last stage): FWD-TIMING-PREFILL other_ms
+    1265.7 / 1228.1 on the first forward (16384 rows: a static compile), 328.9
+    / 332.2 on the second (65 rows: the automatic-dynamic RECOMPILE), 5-8 ms
+    after. Desk (CPU inductor): the stock wrapper builds 2 graphs over rows
+    16384, 65, 8258, 16, 17; with the rows marked dynamic 1 graph, bytes equal
+    to the static compile at every row count. Off until metal."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_ENABLE_HC_COMPILE_DYNAMIC_ROWS.get())
+
+
+def _mark_rows_dynamic(*tensors: torch.Tensor) -> None:
+    # maybe_: a row count dynamo must specialise (0/1) specialises instead of
+    # raising; every tensor carrying the rows is marked, so no unmarked twin
+    # pins the symbol back to a constant
+    for t in tensors:
+        torch._dynamo.maybe_mark_dynamic(t, 0)
+
+
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
     hc_count: int = 4
     hidden_size: int = 64
@@ -271,6 +296,7 @@ class GatedResidual(HyperConnectionBase):
 
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
+        self._compile_dynamic_rows = hc_compile_dynamic_rows_on()
 
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
@@ -331,6 +357,8 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             ).to(self.params_dtype)
         else:
+            if getattr(self, "_compile_dynamic_rows", False):
+                _mark_rows_dynamic(hyper_input_normed)
             mixed_input = self._mix_compute(
                 hyper_input_normed,
                 self.input_mix_weight_down.weight,
@@ -379,6 +407,8 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             )
 
+        if getattr(self, "_compile_dynamic_rows", False):
+            _mark_rows_dynamic(block_output, hyper_input, hyper_input_normed)
         updated_residuals = self._combine_compute(
             block_output,
             hyper_input,
