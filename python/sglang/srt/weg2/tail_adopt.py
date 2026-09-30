@@ -794,12 +794,45 @@ def stage_early(rids, tree_cache) -> Dict[str, str]:
     return out
 
 
-def stage_at_wake_begin(sched) -> Optional[Dict[str, str]]:
-    """The wake leg's call (weight_updater, beside WAKE-READ-EARLY): the
-    dormant hold's rids through :func:`stage_early`, one line per wake.
-    None when off or nothing is held. Never raises."""
+def stage_after_legs_enabled() -> bool:
+    """SGLANG_WEG2_TAIL_STAGE_AFTER_LEGS (TAIL-STAGE-AFTER-LEGS, 30.09.)."""
+    try:
+        return bool(envs.SGLANG_WEG2_TAIL_STAGE_AFTER_LEGS.get())
+    except Exception:  # noqa: BLE001 -- an unknown switch is off
+        return False
+
+
+#: the two call sites of the wake leg (weight_updater): beside WAKE-READ-EARLY
+#: at the legs' start, and behind the last weight collect (legs end)
+SITE_LEG_BEGIN = "leg_begin"
+SITE_LEGS_END = "legs_end"
+
+
+def stage_site() -> str:
+    """Where TAIL-STAGE-EARLY starts the staging: the legs' start (default),
+    or their end under SGLANG_WEG2_TAIL_STAGE_AFTER_LEGS.
+
+    MEASURED (y4s-tse vs y4l, P>D at 5-6 seats, D TP0/P PP0 WEG2-BAR1
+    lane-time): staged at the legs' start, the per-rid staging threads (part
+    read, digest, ``pin_memory`` per layer) ran beside the collectors; the
+    collectors' issue_ms rose 202-286 -> 359-1127 ms, their credits came back
+    late, P's deposit lanes waited 951-2094 ms on credit (y4l 451-584) and the
+    legs grew ~1522 -> ~2030 ms, while the copies themselves did not slow
+    (copy_sync_ms 674 -> 573 on P PP0 p0). Behind the last collect the
+    staging still starts before the kv resume and the first pass."""
+    return SITE_LEGS_END if stage_after_legs_enabled() else SITE_LEG_BEGIN
+
+
+def stage_at_wake_begin(sched, site: str = SITE_LEG_BEGIN) -> Optional[Dict[str, str]]:
+    """The wake leg's call (weight_updater): the dormant hold's rids through
+    :func:`stage_early`, one line per wake. ``site`` names the call site; only
+    the one :func:`stage_site` selects acts, so exactly one of the two calls
+    stages per wake. None when off, at the other site, or nothing is held.
+    Never raises."""
     try:
         if not stage_early_enabled() or not adopt_enabled():
+            return None
+        if site != stage_site():
             return None
         hold = getattr(sched, "weg2_dormant_hold", None) or []
         rids = [str(getattr(r, "rid", "")) for r in hold if getattr(r, "rid", None)]
@@ -811,10 +844,11 @@ def stage_at_wake_begin(sched) -> Optional[Dict[str, str]]:
             return out  # group P (it publishes, never adopts): nothing to say
         started = sum(1 for v in out.values() if v == "started")
         logger.info(
-            "WEG2-TAIL-STAGE-EARLY held=%d started=%d issue_ms=%.1f verdicts=%s (E2 tail staging "
-            "beside the weight legs; a partial manifest is staged by the first post-wake check)",
+            "WEG2-TAIL-STAGE-EARLY held=%d started=%d issue_ms=%.1f verdicts=%s site=%s (E2 tail "
+            "staging from the weight legs' %s; a partial manifest is staged by the first post-wake check)",
             len(rids), started, (time.perf_counter() - t0) * 1000.0,
-            ",".join(f"{k}:{v}" for k, v in out.items()),
+            ",".join(f"{k}:{v}" for k, v in out.items()), site,
+            "end" if site == SITE_LEGS_END else "start",
         )
         return out
     except Exception as exc:  # noqa: BLE001 -- the post-wake check stages what is left
