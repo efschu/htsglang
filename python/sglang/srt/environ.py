@@ -842,6 +842,14 @@ class Envs:
     # under the E2 skip, N - c under E1) instead of N - prefix; the KV charge is
     # unchanged. 0 = the old test on N - prefix.
     SGLANG_WEG2_TAIL_FIT_ON_COMPUTE = EnvBool(True)
+    # TAIL_FOLD_SHORT (metal y3r ...dauer09292330, P/D): under the H63 fold P
+    # published NO part when c = floor_grain(N-1) sat on a page boundary
+    # (N % page in 1..grain; 23 of 53 prompts, all N % 64 in {1, 2, 4}) and D
+    # re-ran 1-65 tokens as a real extend (2 tokens 0.6-0.7 s, 65 tokens
+    # 1.5-2.4 s, cold expert pass). On: the END-only part is published anyway
+    # (tail_handoff.fold_spec, page_prefix = the reader's claim, E1 rows may be
+    # 0) and D takes it as the E2 skip. 0 = spec_for (no part, D extends).
+    SGLANG_WEG2_TAIL_FOLD_SHORT = EnvBool(True)
     # TAIL FOLD (fnFL2 H63, group P, only with TAIL_HANDOFF + TAIL_ADOPT +
     # TAIL_SKIP_EXTEND): the END-ANCHOR no longer splits the last chunk at
     # c = floor_r(N-1) when N is not a page multiple -- the tail [c, N) runs

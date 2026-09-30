@@ -293,6 +293,40 @@ def spec_for(rid: str, ids: Sequence[int], extra_key: Optional[str], page_size: 
     return TailSpec(rid=str(rid), n_tokens=n, page_prefix=prefix, cut=cut, key=tail_key(ids, cut, extra_key))
 
 
+def fold_spec(rid: str, ids: Sequence[int], extra_key: Optional[str], page_size: int, grain: int,
+              claim: Optional[int] = None) -> Optional[TailSpec]:
+    """H63 END-only hand-off of an N-token prompt (the tail fold): the END
+    section [page_prefix, N) + the state after N + P's token IS the whole
+    hand-off, so -- unlike ``spec_for`` (E1: rows [floor_page(c), c) + the
+    state at c) -- a spec exists even when no row lies below the cut.
+
+    SHORT TAIL (y3r 09292330, SGLANG_WEG2_TAIL_FOLD_SHORT): ``spec_for`` is
+    None whenever c = floor_grain(N-1) sits ON a page boundary, i.e. N % page
+    in 1..grain; P published no part for 23 of 53 finished prompts (every one
+    of them N % 64 in {1, 2, 4}), D ran 'TAIL-READY verdict=no_parts' and a
+    real extend of 1-65 tokens: 0.6-0.7 s for 2 tokens (a cold expert pass),
+    1.5-2.4 s for 65, 19.9 s of EXTEND run_ms over the 17 wakes >= 2 s.
+
+    ``page_prefix`` is where D's store read re-enters: the reader's claim
+    (``claim_anchor_end``, the bigram NF keying floor_page(N-2): N-65 for
+    N % 64 == 1, where the CLAIM ANCHOR track put P's recurrent anchor), else
+    floor_page(c) as in ``spec_for``. Everywhere ``spec_for`` has a spec the
+    two agree (floor_page(floor_grain(N-1)) == floor_page(N-2) unless N-1 is
+    a page multiple), so the published geometry of those prompts is
+    unchanged."""
+    n = len(ids)
+    page = int(page_size or 1)
+    if n < 2 or page <= 1 or int(grain) >= page:
+        return None
+    cut = tail_cut(n, grain)
+    if not envs.SGLANG_WEG2_TAIL_FOLD_SHORT.get():
+        return spec_for(rid, ids, extra_key, page, grain)
+    prefix = page_floor(cut, page) if claim is None else int(claim)
+    if prefix < 0 or prefix % page or prefix > cut or cut >= n:
+        return None
+    return TailSpec(rid=str(rid), n_tokens=n, page_prefix=prefix, cut=cut, key=tail_key(ids, cut, extra_key))
+
+
 def extend_range(spec: TailSpec) -> Tuple[int, int]:
     """D's extend after an adopted tail: [c, N)."""
     return spec.cut, spec.n_tokens
@@ -831,19 +865,21 @@ def _capture_state(req, req_to_token_pool, allocator, page_size: int, stream) ->
 _FOLD_N = [0]
 
 
-def arm_fold(reqs, allocator, page_size: int, stream) -> int:
+def arm_fold(reqs, allocator, page_size: int, stream, tree_cache=None) -> int:
     """Scheduler entry (every extend batch, before its forward; H63): under
     the tail fold register an END-only capture for each request whose extend
     reaches the end of its prompt -- its last chunk carries the tail, so no
     stash at c ever happens and ``publish_rows`` needs the capture (and the
-    forward stream the END gather is ordered on) from here. Never raises into
-    the scheduler; returns how many were registered."""
+    forward stream the END gather is ordered on) from here. ``tree_cache``
+    names the reader's claim (``claim_anchor_end``), the page the END section
+    starts at. Never raises into the scheduler; returns how many were
+    registered."""
     if not fold_enabled():
         return 0
     n = 0
     for req in reqs:
         try:
-            if _arm_fold_one(req, allocator, page_size, stream):
+            if _arm_fold_one(req, allocator, page_size, stream, tree_cache):
                 n += 1
         except Exception as exc:  # noqa: BLE001 -- no capture = no part = D's page resume, named
             logger.warning("WEG2-TAIL-FOLD arm failed rid=%s (%s: %s)", getattr(req, "rid", "?"),
@@ -851,13 +887,14 @@ def arm_fold(reqs, allocator, page_size: int, stream) -> int:
     return n
 
 
-def _arm_fold_one(req, allocator, page_size: int, stream) -> bool:
+def _arm_fold_one(req, allocator, page_size: int, stream, tree_cache=None) -> bool:
     if not _is_p_request(req) or getattr(req, "extend_range", None) is None:
         return False
     fill = req.full_untruncated_fill_ids
     if int(req.extend_range.end) != len(fill) or not fold_applies(len(fill), page_size):
         return False
-    spec = spec_for(req.rid, req.origin_input_ids, req.extra_key, page_size, _grain_of(allocator, page_size))
+    spec = fold_spec(req.rid, req.origin_input_ids, req.extra_key, page_size, _grain_of(allocator, page_size),
+                     claim=claim_anchor_end(req, tree_cache))
     if spec is None or spec.n_tokens != len(fill):
         return False
     _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn={}, event=None, stream=stream, e1=False)
