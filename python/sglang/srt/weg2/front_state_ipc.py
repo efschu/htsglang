@@ -274,7 +274,11 @@ class FirstWorkClock:
     #: flip_first_work, NF 32 / 30): EVERY flip that reached ``done`` gets
     #: exactly one ``flip_first_work`` -- its first work, or ``what: "none"``
     #: with the time to the flip's end and the reason no work came (the next
-    #: flip began first, or the front stopped).
+    #: flip began first, or the front stopped). A ``none`` event has NO flip
+    #: time (user 29.09.: P end -> first decode token / decode end -> first
+    #: prefill, never flip_total): ``flip_time_ms`` null, the begin -> done span
+    #: only as ``flip_total_ms`` -- the dashboard's flip-time tile and history
+    #: marks take every non-null ``flip_time_ms``.
     NONE = "none"
 
     def __init__(self) -> None:
@@ -301,8 +305,8 @@ class FirstWorkClock:
         if a is None or a.get("done_ts") is None:
             return None
         return {"epoch": a["epoch"], "dir": a["dir"], "flip_begin_ts": round(a["flip_begin_ts"], 3),
-                "first_work_ts": None,
-                "flip_time_ms": round((a["done_ts"] - a["flip_begin_ts"]) * 1000.0),
+                "first_work_ts": None, "flip_time_ms": None,
+                "flip_total_ms": round((a["done_ts"] - a["flip_begin_ts"]) * 1000.0),
                 "what": self.NONE, "reason": reason, "rid": None, "clock": "time.time front"}
 
     def seen(self, group: str, what: str, rid: Optional[str], now: float) -> Optional[dict]:

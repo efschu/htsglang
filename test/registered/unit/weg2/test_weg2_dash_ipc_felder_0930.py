@@ -72,8 +72,8 @@ def test_3_the_clock_pairs_every_done_flip():
     assert c.arm(1, "P", "D", 10.0) is None
     c.done(12.0)
     ev = c.arm(2, "D", "P", 20.0)                                # D never worked
-    assert (ev["epoch"], ev["dir"], ev["what"], ev["reason"], ev["flip_time_ms"]) == \
-        (1, "P>D", "none", "next_flip_before_work", 2000)
+    assert (ev["epoch"], ev["dir"], ev["what"], ev["reason"], ev["flip_time_ms"], ev["flip_total_ms"]) == \
+        (1, "P>D", "none", "next_flip_before_work", None, 2000)
     assert c.seen("P", "p_leg1_dispatch", "r", 21.0)["dir"] == "D>P"
     c.done(22.0)
     assert c.flush("front_stop") is None                         # already fired
@@ -115,7 +115,32 @@ def test_3_the_front_publishes_one_first_work_per_flip_done():
     assert len(done) == 1 and len(fw) == 1
     w = fw[0]["data"]
     assert (w["dir"], w["what"], w["reason"]) == ("D>P", "none", "front_stop")
-    assert w["flip_time_ms"] >= 0 and w["flip_begin_ts"] == done[0]["data"]["flip_begin_ts"]
+    assert w["flip_time_ms"] is None and w["flip_total_ms"] >= 0
+    assert w["flip_begin_ts"] == done[0]["data"]["flip_begin_ts"]
+
+
+def test_3_a_none_event_never_carries_flip_total_as_the_flip_time():
+    """User 29.09. (flipzeit-ist-p-ende-bis-erstes-decode): the flip time is P end ->
+    first decode token (and decode end -> first prefill), NEVER flip_total. A ``none``
+    event has no first work, so no flip time: ``flip_time_ms`` null, the begin->done span
+    only as ``flip_total_ms``. The dashboard's B1/B2 tile (rigdash ipcfields
+    _flip_first_work) and the history marks take every non-null ``flip_time_ms`` of the
+    direction -- a flip_total there would sit in the flip-time median."""
+    c = fsi.FirstWorkClock()
+    rows = []
+    c.arm(1, "P", "D", 10.0)
+    c.done(13.0)
+    rows.append(c.seen("D", "decode_token", "r1", 21.0))            # real: 11 s
+    c.arm(2, "D", "P", 30.0)
+    c.done(32.0)
+    rows.append(c.arm(3, "P", "D", 40.0))                          # D>P none (flip_total 2 s)
+    c.done(43.0)
+    rows.append(c.flush("front_stop"))                             # P>D none (flip_total 3 s)
+    assert [r["what"] for r in rows] == ["decode_token", "none", "none"]
+    p2d_ms = [r["flip_time_ms"] for r in rows if r["dir"] == "P>D" and r.get("flip_time_ms") is not None]
+    d2p_ms = [r["flip_time_ms"] for r in rows if r["dir"] == "D>P" and r.get("flip_time_ms") is not None]
+    assert p2d_ms == [11000] and d2p_ms == []
+    assert [r.get("flip_total_ms") for r in rows[1:]] == [2000, 3000]
 
 
 def test_3_any_d_content_after_the_flip_is_first_work():
@@ -126,6 +151,10 @@ def test_3_any_d_content_after_the_flip_is_first_work():
     src = inspect.getsource(front_mod.Front.leg2)
     i = src.index("async def _write_client(chunk: bytes)")
     assert 'self._ipc_first_work_seen("D", "decode_token", rid)' in src[i:i + 500]
+    # 27B (flip time = P end -> first decode token): a 503 D streams (state
+    # refusal, the stream branch forwards r.status) is no decode token -- the same
+    # status-200 guard the leg's first-content site has
+    assert "if chunk and r.status == 200:" in src[i:i + 200]
 
 
 # ---------------------------------------------------------------- 4
