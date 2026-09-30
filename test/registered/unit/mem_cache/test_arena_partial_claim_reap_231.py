@@ -176,15 +176,17 @@ def test_complete_unreferenced_slots_still_go_first(arena, fast_reap):
     assert arena.stats()["claimed"] == 3
 
 
-def test_outside_the_mamba_anchor_arena_the_reap_is_a_no_op(arena, fast_reap):
-    """27B form (host_anchor_slots, 0 MAMBA-ARENA claims) and every KV arena:
-    the KV pool's claim room never reaps, orphans or not."""
+def test_the_kv_arena_reaps_its_orphans_before_any_page(arena, fast_reap):
+    """OS (NF y3w e033a931db, D 01:39:13: 753 orphan KV claims beside a full
+    arena): the KV pool's claim room reaps orphans FIRST -- they hold no page
+    anybody can read. Was: 'the KV pool's claim room never reaps' (this pin,
+    turned by the operator's order of 30.09.)."""
     for i in range(4):
         _orphan(arena, f"kv{i}")
     time.sleep(0.1)
     kv_pool = object.__new__(ArenaMHAHostPool)
-    assert ArenaMHAHostPool._evict_for_claim(kv_pool, arena, 1) == 0
-    assert arena.stats()["claimed"] == 4
+    assert ArenaMHAHostPool._evict_for_claim(kv_pool, arena, 1) == 4
+    assert arena.stats()["claimed"] == 0
 
 
 def test_payload_written_partials_are_never_judged(arena, fast_reap):
