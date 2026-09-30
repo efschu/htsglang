@@ -4,9 +4,15 @@
 #
 #   ./make_flat_ctx.sh --plan  [options]     check every input, print the context/build/tag/labels/blockers (read-only)
 #   ./make_flat_ctx.sh --write [options]     same checks, then create ctx/flat-<release>-<sha10>-<cu>/ (builds NOTHING)
-#   options: [--rev <sha|ref>] [--branch <branch>] [--release <version>] [--cu cu130] [--since 2026-09-01]
+#   options: [--rev <sha|ref>] [--branch <branch>] [--rev-nf <sha|ref>] [--branch-nf <branch>]
+#            [--release <version>] [--cu cu130] [--since 2026-09-01]
 #            [--kernels <list> ...] [--profiles "<name> ..."] [--source <url>] [--allow-unpushed]
 #            [--host] [--emit-kernels] [--no-hash] [--accepted "27b nf"] [--mem-profile auto|full|nf]
+#   --rev-nf (30.09., two frozen heads): the NF slot gets ITS OWN revision (src-nf/ = its own shallow clone), as the duo
+#   delta images carry today (27b d79ab218e4 + nf 351aa9c20f on rc12g-flat). Without --rev-nf, or with the same commit,
+#   both slots carry one tree exactly as before (FLAT-2). The Dockerfile learns which via the bake point FLLIPER_ONE_TREE.
+#   Env: CTX_ROOT (default $HERE/ctx; the ctx goes to $CTX_ROOT/flat-*), DFF (default: Dockerfile.flliper next to this
+#   script -- the repo copy docker/flliper/ -- else $HERE/Dockerfile.flliper).
 #   --mem-profile nf: build NEXT TO a running boot (NF Dauerbetrieb): builder cap 16g, 8 CPUs, the prebuild concurrency is
 #   baked into the ctx Dockerfile (ctx name gets -nf); full: no boot, full parallelism; auto: nf if --host sees a boot.
 #
@@ -58,9 +64,12 @@ PROFILE_OVERLAY=${PROFILE_OVERLAY:-$HERE/profiles_release}
 pf(){ if [ -f "$PROFILE_OVERLAY/$1.env" ]; then echo "$PROFILE_OVERLAY/$1.env"; else echo "$HERE/profiles/$1.env"; fi; }
 MIN_REV=b3180fb493c02d4a27ae4108a4bccaf3f7719c17   # operator 26.09.: b3180fb493 or newer
 ARB=/spinning/gpu-arb
+CTX_ROOT=${CTX_ROOT:-$HERE/ctx}
+_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+if [ -z "${DFF:-}" ]; then if [ -f "$_SELF_DIR/Dockerfile.flliper" ]; then DFF=$_SELF_DIR/Dockerfile.flliper; else DFF=$HERE/Dockerfile.flliper; fi; fi
 KERNEL_LISTS_DEFAULT="delta_kernels_rc10u.txt delta_kernels_rc9dwin.txt delta_kernels_rc9f.txt delta_kernels_rc9c.txt delta_kernels_rc9b.txt delta_kernels_rc9.txt"
 
-PLAN=0; WRITE=0; REV_IN=""; BRANCH=""; REL=""; CU=cu130; KLISTS=(); PROFILES=$PROFILES_DEFAULT; HOST=0; EMIT=0; HASH=1
+PLAN=0; WRITE=0; REV_IN=""; BRANCH=""; REV_NF_IN=""; BRANCH_NF=""; REL=""; CU=cu130; KLISTS=(); PROFILES=$PROFILES_DEFAULT; HOST=0; EMIT=0; HASH=1
 SINCE=2026-09-01; SOURCE=""; ALLOW_UNPUSHED=0; ACCEPTED=$ACCEPTED_DEFAULT; MEMPROF=auto; LOCK_FOLD=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -74,6 +83,8 @@ while [ $# -gt 0 ]; do
     --lock-fold) LOCK_FOLD=1; shift ;;   # PA 28.09. (Checkliste Punkt 8): PyPI-Pins der Overrides in den Lock, qwen-tts raus
     --rev) REV_IN=$2; shift 2 ;;
     --branch) BRANCH=$2; shift 2 ;;
+    --rev-nf) REV_NF_IN=$2; shift 2 ;;
+    --branch-nf) BRANCH_NF=$2; shift 2 ;;
     --release) REL=$2; shift 2 ;;
     --cu) CU=$2; shift 2 ;;
     --kernels) KLISTS+=("$2"); shift 2 ;;
@@ -81,7 +92,7 @@ while [ $# -gt 0 ]; do
     --host) HOST=1; shift ;;
     --emit-kernels) EMIT=1; shift ;;
     --no-hash) HASH=0; shift ;;
-    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -109,58 +120,77 @@ buildblock(){ if [ "$WRITE" = 1 ]; then warn "build-time: $*"; else blocker "$*"
 warn(){ WARNS+=("$*"); say "   WARN: $*"; }
 ok(){ say "   ok: $*"; }
 
-if [ "$WRITE" = 1 ]; then say "make_flat_ctx.sh --write  $(date -u +%FT%TZ)  (writes only below $HERE/ctx/flat-*; nothing is built)"
+if [ "$WRITE" = 1 ]; then say "make_flat_ctx.sh --write  $(date -u +%FT%TZ)  (writes only below $CTX_ROOT/flat-*; nothing is built)"
 else say "make_flat_ctx.sh --plan  $(date -u +%FT%TZ)  (read-only; nothing is written, nothing is built)"; fi
 
 # --- 1. Source tree -------------------------------------------------------------------------------------------------
-sec "1. Source tree (ONE unified tree for both slots)"
-if [ -z "$REV_IN" ]; then
-  REV_IN=desk/27b-unified-0926
-  git --no-optional-locks -C "$REPO" rev-parse -q --verify "refs/remotes/origin/$REV_IN" >/dev/null && REV_IN=origin/$REV_IN
-  say "   no --rev given: using the unified line head $REV_IN (NOT the release input -- the renamed commit does not exist yet)"
+sec "1. Source trees (27B head + NF head; ONE tree when --rev-nf is absent or the same commit)"
+# tree_checks <slot>: every check of the one-tree version, for the revision in REV_IN/BRANCH; sets REV SHA10 BRANCH
+# PUSH_STATE PKG PDF RENAMED for that slot (the caller saves them per slot).
+tree_checks(){ SLOT=$1
+  say "   -- slot $SLOT"
+  if [ -z "$REV_IN" ]; then
+    REV_IN=desk/27b-unified-0926
+    git --no-optional-locks -C "$REPO" rev-parse -q --verify "refs/remotes/origin/$REV_IN" >/dev/null && REV_IN=origin/$REV_IN
+    say "   no --rev given: using the unified line head $REV_IN (NOT the release input -- the renamed commit does not exist yet)"
+  fi
+  [ -n "$BRANCH" ] || BRANCH=${REV_IN#origin/}
+  REV=$("${G[@]}" rev-parse --verify -q "${REV_IN}^{commit}") || { say "   revision $REV_IN unknown in $REPO"; exit 2; }
+  SHA10=${REV:0:10}
+  say "   revision: $REV ($("${G[@]}" log -1 --format='%cI %s' "$REV" | cut -c1-110))"
+  BR=""
+  for b in "refs/heads/$BRANCH" "refs/remotes/origin/$BRANCH"; do
+    "${G[@]}" rev-parse -q --verify "$b" >/dev/null && "${G[@]}" merge-base --is-ancestor "$REV" "$b" 2>/dev/null && { BR=$b; break; }
+  done
+  if [ -n "$BR" ]; then ok "on branch $BR"; else blocker "revision ${SHA10} is on neither refs/heads/$BRANCH nor origin/$BRANCH"; fi
+  if "${G[@]}" merge-base --is-ancestor "$MIN_REV" "$REV" 2>/dev/null; then ok "descendant of ${MIN_REV:0:10} (operator minimum)"
+  else blocker "revision ${SHA10} is not ${MIN_REV:0:10} or newer (operator minimum)"; fi
+  PUSHED=$("${G[@]}" branch -r --contains "$REV" 2>/dev/null | sed 's/^[* ]*//' | grep -v -- '->' | grep -xF "origin/$BRANCH")
+  [ -n "$PUSHED" ] || PUSHED=$("${G[@]}" branch -r --contains "$REV" 2>/dev/null | sed 's/^[* ]*//' | grep -v -- '->' | head -3 | paste -sd, -)
+  if [ -n "$PUSHED" ]; then ok "pushed: $PUSHED (remote refs as of the last fetch)"
+  elif [ "$ALLOW_UNPUSHED" = 1 ]; then PUSHED=""; warn "revision ${SHA10} UNPUSHED (--allow-unpushed): BUILD_INFO/label carry UNPUSHED, publication locked"
+  else blocker "revision ${SHA10} is on no remote branch (UNPUSHED) -- push first or --allow-unpushed"; fi
+  PUSH_STATE=$([ -n "$PUSHED" ] && echo "pushed: $PUSHED" || echo "UNPUSHED, publication only after the user's push")
+  if "${G[@]}" cat-file -e "$REV:python/flliper" 2>/dev/null; then PKG=flliper; PDF=pdflip; RENAMED=1
+    ok "renamed layout: python/flliper, subsystem pdflip"
+  else PKG=sglang; PDF=weg2; RENAMED=0
+    relblock "B1: tree ${SHA10} is NOT renamed (python/sglang, weg2) -- RENAME_PLAN 8.15 steps 2-5 + translation missing; the flat fLLiper image needs the renamed commit"
+  fi
+  "${G[@]}" cat-file -e "$REV:python/$PKG/__init__.py" 2>/dev/null || blocker "python/$PKG/__init__.py missing in ${SHA10}"
+  # _version.py must be ignored by the tree's own .gitignore (Dockerfile step 4 check-ignore)
+  if "${G[@]}" ls-tree -r --name-only "$REV" | grep -qx "python/$PKG/_version.py"; then blocker "python/$PKG/_version.py is TRACKED in ${SHA10} (Dockerfile writes it)"
+  elif { "${G[@]}" show "$REV:python/.gitignore" 2>/dev/null; "${G[@]}" show "$REV:.gitignore" 2>/dev/null; } | grep -q '_version.py'; then ok "_version.py untracked and listed in a .gitignore"
+  else warn "_version.py not found in python/.gitignore or .gitignore of ${SHA10} -- Dockerfile check-ignore may FATAL"; fi
+  # stage-B seams (prepare_context.sh step 0, both spellings)
+  missing=()
+  for f in "python/$PKG/srt/$PDF/launcher.py" "python/$PKG/srt/$PDF/host_ledger.py" "python/$PKG/srt/$PDF/corridor_budget.py" \
+           "scripts/$PDF/tms/build_tms_preload.sh" "test/registered/unit/$PDF/test_${PDF}_rig_paths_env_docker.py"; do
+    "${G[@]}" grep -q -E '(SGLANG_WEG2|FLLIPER_PDFLIP)_(GPU_ARB|EVIDENCE_DIR|VENV|TMS_OUT_DIR)' "$REV" -- "$f" 2>/dev/null || missing+=("$f")
+  done
+  if [ "${#missing[@]}" = 0 ]; then ok "stage-B path seams present in all five files"; else blocker "stage-B seams missing in: ${missing[*]}"; fi
+  for f in docker/htsglang-chat_template.jinja docker/htsglang-entrypoint.sh; do
+    "${G[@]}" cat-file -e "$REV:$f" 2>/dev/null && ok "Dockerfile step 7 source present: $f" || warn "$f missing in ${SHA10} (Dockerfile step 7 copies it; renamed path?)"
+  done
+  NFILES=$("${G[@]}" ls-tree -r --name-only "$REV" | wc -l)
+  say "   tree: $NFILES tracked files (slot $SLOT)"
+  if [ "$RENAMED" = 1 ]; then
+    n_old=$("${G[@]}" grep -I -c -E '\bweg2\b|SGLANG_WEG2_' "$REV" -- "python/$PKG" 2>/dev/null | awk -F: '{s+=$NF} END{print s+0}')
+    say "   residue in python/$PKG: $n_old lines with weg2/SGLANG_WEG2_ (compat shims are expected; the translation gate owns the verdict)"
+  fi
+}
+tree_checks 27b
+REV_27B=$REV; SHA10_27B=$SHA10; BRANCH_27B=$BRANCH; PUSH_STATE_27B=$PUSH_STATE; PKG_27B=$PKG; PDF_27B=$PDF; RENAMED_27B=$RENAMED
+if [ -n "$REV_NF_IN" ]; then
+  REV_IN=$REV_NF_IN; BRANCH=$BRANCH_NF; tree_checks nf
+  REV_NF=$REV; SHA10_NF=$SHA10; BRANCH_NF=$BRANCH; PUSH_STATE_NF=$PUSH_STATE; PKG_NF=$PKG; PDF_NF=$PDF; RENAMED_NF=$RENAMED
+else
+  REV_NF=$REV_27B; SHA10_NF=$SHA10_27B; BRANCH_NF=$BRANCH_27B; PUSH_STATE_NF=$PUSH_STATE_27B; PKG_NF=$PKG_27B; PDF_NF=$PDF_27B; RENAMED_NF=$RENAMED_27B
 fi
-[ -n "$BRANCH" ] || BRANCH=${REV_IN#origin/}
-REV=$("${G[@]}" rev-parse --verify -q "${REV_IN}^{commit}") || { say "   revision $REV_IN unknown in $REPO"; exit 2; }
-SHA10=${REV:0:10}
-say "   revision: $REV ($("${G[@]}" log -1 --format='%cI %s' "$REV" | cut -c1-110))"
-BR=""
-for b in "refs/heads/$BRANCH" "refs/remotes/origin/$BRANCH"; do
-  "${G[@]}" rev-parse -q --verify "$b" >/dev/null && "${G[@]}" merge-base --is-ancestor "$REV" "$b" 2>/dev/null && { BR=$b; break; }
-done
-if [ -n "$BR" ]; then ok "on branch $BR"; else blocker "revision ${SHA10} is on neither refs/heads/$BRANCH nor origin/$BRANCH"; fi
-if "${G[@]}" merge-base --is-ancestor "$MIN_REV" "$REV" 2>/dev/null; then ok "descendant of ${MIN_REV:0:10} (operator minimum)"
-else blocker "revision ${SHA10} is not ${MIN_REV:0:10} or newer (operator minimum)"; fi
-PUSHED=$("${G[@]}" branch -r --contains "$REV" 2>/dev/null | sed 's/^[* ]*//' | grep -v -- '->' | grep -xF "origin/$BRANCH")
-[ -n "$PUSHED" ] || PUSHED=$("${G[@]}" branch -r --contains "$REV" 2>/dev/null | sed 's/^[* ]*//' | grep -v -- '->' | head -3 | paste -sd, -)
-if [ -n "$PUSHED" ]; then ok "pushed: $PUSHED (remote refs as of the last fetch)"
-elif [ "$ALLOW_UNPUSHED" = 1 ]; then PUSHED=""; warn "revision ${SHA10} UNPUSHED (--allow-unpushed): BUILD_INFO/label carry UNPUSHED, publication locked"
-else blocker "revision ${SHA10} is on no remote branch (UNPUSHED) -- push first or --allow-unpushed"; fi
-PUSH_STATE=$([ -n "$PUSHED" ] && echo "pushed: $PUSHED" || echo "UNPUSHED, publication only after the user's push")
-if "${G[@]}" cat-file -e "$REV:python/flliper" 2>/dev/null; then PKG=flliper; PDF=pdflip; RENAMED=1
-  ok "renamed layout: python/flliper, subsystem pdflip"
-else PKG=sglang; PDF=weg2; RENAMED=0
-  relblock "B1: tree ${SHA10} is NOT renamed (python/sglang, weg2) -- RENAME_PLAN 8.15 steps 2-5 + translation missing; the flat fLLiper image needs the renamed commit"
-fi
-"${G[@]}" cat-file -e "$REV:python/$PKG/__init__.py" 2>/dev/null || blocker "python/$PKG/__init__.py missing in ${SHA10}"
-# _version.py must be ignored by the tree's own .gitignore (Dockerfile step 4 check-ignore)
-if "${G[@]}" ls-tree -r --name-only "$REV" | grep -qx "python/$PKG/_version.py"; then blocker "python/$PKG/_version.py is TRACKED in ${SHA10} (Dockerfile writes it)"
-elif { "${G[@]}" show "$REV:python/.gitignore" 2>/dev/null; "${G[@]}" show "$REV:.gitignore" 2>/dev/null; } | grep -q '_version.py'; then ok "_version.py untracked and listed in a .gitignore"
-else warn "_version.py not found in python/.gitignore or .gitignore of ${SHA10} -- Dockerfile check-ignore may FATAL"; fi
-# stage-B seams (prepare_context.sh step 0, both spellings)
-missing=()
-for f in "python/$PKG/srt/$PDF/launcher.py" "python/$PKG/srt/$PDF/host_ledger.py" "python/$PKG/srt/$PDF/corridor_budget.py" \
-         "scripts/$PDF/tms/build_tms_preload.sh" "test/registered/unit/$PDF/test_${PDF}_rig_paths_env_docker.py"; do
-  "${G[@]}" grep -q -E '(SGLANG_WEG2|FLLIPER_PDFLIP)_(GPU_ARB|EVIDENCE_DIR|VENV|TMS_OUT_DIR)' "$REV" -- "$f" 2>/dev/null || missing+=("$f")
-done
-if [ "${#missing[@]}" = 0 ]; then ok "stage-B path seams present in all five files"; else blocker "stage-B seams missing in: ${missing[*]}"; fi
-for f in docker/htsglang-chat_template.jinja docker/htsglang-entrypoint.sh; do
-  "${G[@]}" cat-file -e "$REV:$f" 2>/dev/null && ok "Dockerfile step 7 source present: $f" || warn "$f missing in ${SHA10} (Dockerfile step 7 copies it; renamed path?)"
-done
-NFILES=$("${G[@]}" ls-tree -r --name-only "$REV" | wc -l)
-say "   tree: $NFILES tracked files; both slots src-27b/ and src-nf/ = the same revision (as rc10u..rc10z)"
-if [ "$RENAMED" = 1 ]; then
-  n_old=$("${G[@]}" grep -I -c -E '\bweg2\b|SGLANG_WEG2_' "$REV" -- "python/$PKG" 2>/dev/null | awk -F: '{s+=$NF} END{print s+0}')
-  say "   residue in python/$PKG: $n_old lines with weg2/SGLANG_WEG2_ (compat shims are expected; the translation gate owns the verdict)"
+# the 27B slot is the primary line (image revision label, stage-B note, Dockerfile step 7 sources)
+REV=$REV_27B; SHA10=$SHA10_27B; BRANCH=$BRANCH_27B; PUSH_STATE=$PUSH_STATE_27B; PKG=$PKG_27B; PDF=$PDF_27B; RENAMED=$RENAMED_27B
+if [ "$REV_NF" = "$REV_27B" ]; then ONE_TREE=1; say "   ONE tree: both slots carry ${SHA10} (FLAT-2)"
+else ONE_TREE=0; say "   TWO trees: src-27b @ ${SHA10_27B} ($BRANCH_27B), src-nf @ ${SHA10_NF} ($BRANCH_NF) -- as the duo delta images; FLAT-2 relaxed (FLLIPER_ONE_TREE=0)"
+  [ "$PKG_27B" = "$PKG_NF" ] || warn "the two trees differ in layout (27b: python/$PKG_27B, nf: python/$PKG_NF) -- the image allows it (layout-agnostic step 4), the release wants both renamed"
 fi
 
 # --- 2. Pinned inputs -----------------------------------------------------------------------------------------------
@@ -230,13 +260,15 @@ while IFS= read -r line; do
     *) mod=${W[0]%%:*} ;;
   esac
   [ -n "$mod" ] || continue
-  if [ "$RENAMED" = 1 ]; then mod=$(printf '%s' "$mod" | sed -E 's/^sglang\./flliper./; s/\.weg2\./.pdflip./g'); fi
+  # the line's own slot: NF lines carry PYTHONPATH=/opt/htsglang/src-nf/python and resolve in the NF tree
+  case "$line" in *src-nf/python*) lrev=$REV_NF; lren=$RENAMED_NF; lsha=$SHA10_NF ;; *) lrev=$REV_27B; lren=$RENAMED_27B; lsha=$SHA10_27B ;; esac
+  if [ "$lren" = 1 ]; then mod=$(printf '%s' "$mod" | sed -E 's/^sglang\./flliper./; s/\.weg2\./.pdflip./g'); fi
   p=python/${mod//.//}; nchk=$((nchk + 1))
-  if ! "${G[@]}" cat-file -e "$REV:$p.py" 2>/dev/null && ! "${G[@]}" cat-file -e "$REV:$p/__init__.py" 2>/dev/null; then
-    miss=$((miss + 1)); say "     module missing in ${SHA10}: $mod"
+  if ! "${G[@]}" cat-file -e "$lrev:$p.py" 2>/dev/null && ! "${G[@]}" cat-file -e "$lrev:$p/__init__.py" 2>/dev/null; then
+    miss=$((miss + 1)); say "     module missing in ${lsha}: $mod"
   fi
 done <<< "$UNION"
-if [ "$miss" = 0 ]; then ok "$nchk module references resolve in ${SHA10}"; else blocker "$miss of $nchk kernel-list modules do not exist in ${SHA10}"; fi
+if [ "$miss" = 0 ]; then ok "$nchk module references resolve (27B lines in ${SHA10_27B}, NF lines in ${SHA10_NF})"; else blocker "$miss of $nchk kernel-list modules do not exist in their slot's tree"; fi
 printf '%s\n' "$UNION" | grep -q '/opt/htsglang/' && say "   note: lines carry /opt/htsglang paths (PYTHONPATH=/opt/htsglang/src-nf/python, --report); keep them while the image paths stay /opt/htsglang"
 say "   the full Dockerfile has NO kernel-list step (only Dockerfile.delta*): tvm-ffi + 13 'fi' lines need Dockerfile.flliper step 6b (plan B3)"
 # tvm-ffi seed on the rig: usable in a cu13 base only if it links libcudart.so.13
@@ -360,11 +392,13 @@ else
 fi
 
 # --- 6. The context it would create, the build, tag and labels ------------------------------------------------------
-CTX=$HERE/ctx/flat-${REL}-${SHA10}-${CU}$([ "$MEMPROF" = nf ] && echo -nf)
+CTX=$CTX_ROOT/flat-${REL}-${SHA10}$([ "$ONE_TREE" = 1 ] || echo "-nf${SHA10_NF}")-${CU}$([ "$MEMPROF" = nf ] && echo -nf)
 sec "6. Context that the write mode would create (NOT created)"
 say "   $CTX/"
 say "     Dockerfile            <- Dockerfile.flliper (plan §3; B2/B3)"
-say "     src-27b/ src-nf/      <- two shallow clones of ${SHA10} (--shallow-since 2026-09-01), clean, with .git"
+if [ "$ONE_TREE" = 1 ]; then say "     src-27b/ src-nf/      <- two shallow clones of ${SHA10} (--shallow-since $SINCE), clean, with .git"
+else say "     src-27b/              <- shallow clone of ${SHA10_27B} ($BRANCH_27B, --shallow-since $SINCE), clean, with .git"
+     say "     src-nf/               <- shallow clone of ${SHA10_NF} ($BRANCH_NF), clean, with .git (own tree, FLLIPER_ONE_TREE=0)"; fi
 say "     lock/requirements.lock (pip freeze of $REF_VENV, without sglang-kernel), lock/overrides.txt <- $(basename "$OVERRIDES")"
 say "     assets/wheels/        <- $(basename "$KW_FILE") (${KW_SHA:0:12})"
 say "     assets/fi-wheels/     <- flashinfer_python 0.7.0 (${FIPY_SHA:0:12}), flashinfer_cubin 0.7.0 (${FICUBIN_SHA:0:12})"
@@ -372,7 +406,7 @@ say "     assets/flashinfer_modules.txt (52), assets/tvm-ffi/ (EMPTY), assets/nv
 say "     assets/devtools/ (boot_deadman.sh host_ledger_preflight.sh mem_timeseries.sh), assets/arb-seed-{27b,nf}/, assets/profiles/{27b,nf}/"
 say "     tools/{entrypoint.sh,healthcheck.sh,prebuild_jit.py,delta_prebuild.py,delta_postcheck.py}, tools/profiles/ ($(echo $PROFILES | wc -w) whitelisted)"
 say "     tools/kernels.txt     <- union list above ($N_ALL lines)"
-say "     BUILD_INFO.json (layout flat, release $REL, revision ${SHA10}, pins), BUILD_INFO-{27b,nf}.json, MANIFEST.sha256"
+say "     BUILD_INFO.json (layout duo + build flat, release $REL, 27b ${SHA10_27B}, nf ${SHA10_NF}, pins), BUILD_INFO-{27b,nf}.json, MANIFEST.sha256"
 sec "7. Build command (Proxmox host; host_build.sh route with IMAGE= and the flat Dockerfile)"
 say "   CTX=$CTX EXPECT_MANIFEST=<sha256 of MANIFEST.sha256> IMAGE=$TAG \\"
 say "     BUILD_MEM=${cap}g BUILD_CPUS=$CPUS MAX_JOBS=$MJ HEAVY_MAX_JOBS=$HJ PREBUILD_STRICT=1 $OVR \\"
@@ -380,10 +414,10 @@ say "     bash /spinning/subvol-999-disk-0/spinning/gpu-arb/docker/host_build.sh
 say "   then: docker tag $TAG $TAG2   (second, immutable tag)"
 sec "8. Tag and labels"
 say "   tags: $TAG  and  $TAG2   (registry after the user's Go: ghcr.io/efschu/flliper:<same>) -- no sglang/weg2/htsglang/27b-nf in a tag"
-say "   org.opencontainers.image.title=fLLiper version=$REL revision=$REV (plain sha, one tree)"
+say "   org.opencontainers.image.title=fLLiper version=$REL revision=$REV_27B (plain sha of the 27B slot = the primary line$([ "$ONE_TREE" = 1 ] && echo ', one tree'))"
 say "   org.opencontainers.image.source=$SOURCE licenses=Apache-2.0 base.name=<CUDA_BASE digest from host_build.sh>"
 say "   io.github.efschu.flliper.placeholders=\"$PLACEHOLDERS\""
-say "   io.github.efschu.flliper.slots=\"27b nf\" io.github.efschu.flliper.revision.27b=${SHA10}.. io.github.efschu.flliper.revision.nf=${SHA10}.. io.github.efschu.flliper.push_state=\"$PUSH_STATE\""
+say "   io.github.efschu.flliper.slots=\"27b nf\" io.github.efschu.flliper.revision.27b=${SHA10_27B}.. io.github.efschu.flliper.revision.nf=${SHA10_NF}.. io.github.efschu.flliper.push_state=\"$PUSH_STATE\""
 say "   io.github.efschu.flliper.cuda=$CU io.github.efschu.flliper.kernel_wheel.sha256=${KW_SHA:0:12}.. io.github.efschu.flliper.flashinfer=0.7.0+2f3bc5ac io.github.efschu.flliper.cute_dsl=4.7.1"
 say "   io.github.efschu.flliper.nccl=2.28.9+cuda13.0 io.github.efschu.flliper.driver.expected=595.58.03 io.github.efschu.flliper.build=flat"
 if [ "$EMIT" = 1 ]; then sec "kernel list (union, stdout only)"; printf '%s\n' "$UNION"; fi
@@ -391,11 +425,10 @@ if [ "$EMIT" = 1 ]; then sec "kernel list (union, stdout only)"; printf '%s\n' "
 # --- 7. Verdict -----------------------------------------------------------------------------------------------------
 sec "VERDICT"
 # Standing blockers that no input can clear (FLAT_IMAGE_PLAN.md §6)
-DFF=$HERE/Dockerfile.flliper
 if [ ! -f "$DFF" ]; then blocker "B3: Dockerfile.flliper missing (kernel-list step 6b, fLLiper labels, plain revision label) -- plan §3"
-else for ph in __FLLIPER_VERSION__ __FLLIPER_SOURCE__ __FLLIPER_PLACEHOLDERS__ __FLLIPER_LOCK_SHA256__; do
-       grep -q "=$ph\$" "$DFF" || blocker "Dockerfile.flliper lacks the bake point ARG ...=$ph"; done
-     ok "Dockerfile.flliper present ($(grep -c '^RUN ' "$DFF") RUN, bake points 4/4)"; fi
+else for ph in __FLLIPER_VERSION__ __FLLIPER_SOURCE__ __FLLIPER_PLACEHOLDERS__ __FLLIPER_LOCK_SHA256__ __FLLIPER_ONE_TREE__; do
+       grep -q "=$ph\$" "$DFF" || blocker "Dockerfile.flliper ($DFF) lacks the bake point ARG ...=$ph"; done
+     ok "Dockerfile.flliper present ($DFF, $(grep -c '^RUN ' "$DFF") RUN, bake points 5/5)"; fi
 grep -q 'FLLIPER_PROFILE' "$HERE/entrypoint.sh" || relblock "B2: entrypoint.sh reads HTSGLANG_PROFILE only; README promises FLLIPER_PROFILE, MODE=pdflip, /var/lib/flliper -- RENAME step 5"
 say "   warnings: ${#WARNS[@]}; blockers: ${#BLOCKERS[@]}; release blockers (ctx allowed): ${#RELBLOCKERS[@]}"
 for b in "${BLOCKERS[@]}"; do say "   - $b"; done
@@ -407,32 +440,43 @@ if [ "${#BLOCKERS[@]}" -gt 0 ]; then say "WRITE REFUSED: ${#BLOCKERS[@]} ctx blo
 # WRITE MODE -- creates the context below $HERE/ctx/flat-* and nothing else. No docker, no GPU, no build.
 # ======================================================================================================================
 OUT=$CTX; PART=$OUT.partial; DONE=0
-case "$OUT" in "$HERE"/ctx/flat-*) ;; *) say "WRITE REFUSED: target $OUT is not below $HERE/ctx/flat-*"; exit 3 ;; esac
+case "$OUT" in "$CTX_ROOT"/flat-*) ;; *) say "WRITE REFUSED: target $OUT is not below $CTX_ROOT/flat-*"; exit 3 ;; esac
 [ -e "$OUT" ] && { say "WRITE REFUSED: $OUT exists -- a ctx is never overwritten (new --release or revision)"; exit 3; }
 [ -e "$PART" ] && { say "WRITE REFUSED: $PART exists (earlier aborted run?) -- look at it and remove it by hand"; exit 3; }
-cleanup(){ if [ "$DONE" != 1 ]; then case "$PART" in "$HERE"/ctx/flat-*.partial) rm -rf -- "$PART" ;; esac; fi; }
+cleanup(){ if [ "$DONE" != 1 ]; then case "$PART" in "$CTX_ROOT"/flat-*.partial) rm -rf -- "$PART" ;; esac; fi; }
 trap cleanup EXIT
 fail(){ say "WRITE FAILED: $* -- partial ctx removed, nothing kept"; exit 3; }
 sec "WRITE $OUT"
 mkdir -p "$PART"/{lock,assets/wheels,assets/fi-wheels,assets/devtools,assets/tvm-ffi,assets/nvidia-open-595,assets/profiles/27b,assets/profiles/nf,tools/profiles} \
   "$PART"/assets/arb-seed-27b/weg2/calib "$PART"/assets/arb-seed-nf/weg2/calib || fail "mkdir"
 
-say "1/8 tree ${SHA10}: src-27b/ = shallow fetch since $SINCE, src-nf/ = copy (ONE tree, both slots)"
-SRCREF=refs/heads/$BRANCH
-if ! { "${G[@]}" rev-parse -q --verify "$SRCREF" >/dev/null && "${G[@]}" merge-base --is-ancestor "$REV" "$SRCREF"; }; then SRCREF=refs/remotes/origin/$BRANCH; fi
-S=(git -c init.defaultBranch=main -c advice.detachedHead=false -C "$PART/src-27b")
-git -c init.defaultBranch=main init -q "$PART/src-27b" || fail "git init"
-"${S[@]}" remote add origin "file://$REPO" || fail "remote add"
-"${S[@]}" fetch -q --shallow-since="$SINCE" origin "+$SRCREF:refs/remotes/origin/$BRANCH" || fail "fetch $SRCREF from $REPO"
-"${S[@]}" cat-file -e "$REV^{commit}" 2>/dev/null || fail "${SHA10} is not within --shallow-since $SINCE of $SRCREF"
-"${S[@]}" checkout -q --detach "$REV" || fail "checkout ${SHA10}"
-[ "$("${S[@]}" rev-parse HEAD)" = "$REV" ] || fail "HEAD != ${SHA10}"
-[ -z "$("${S[@]}" status --porcelain)" ] || fail "src-27b not clean"
-"${S[@]}" check-ignore -q "python/$PKG/_version.py" || fail "python/$PKG/_version.py not ignored (Dockerfile step 4 would FATAL)"
-cp -a "$PART/src-27b" "$PART/src-nf" || fail "copy src-nf"
-[ "$(git -C "$PART/src-nf" rev-parse HEAD)" = "$REV" ] && [ -z "$(git -C "$PART/src-nf" status --porcelain)" ] || fail "src-nf not clean at ${SHA10}"
+# clone_slot <dir> <rev> <branch> <pkg>: shallow fetch of <branch> since $SINCE into <dir>, detached at <rev>, clean
+clone_slot(){ local dir=$1 rev=$2 br=$3 pkg=$4 srcref
+  srcref=refs/heads/$br
+  if ! { "${G[@]}" rev-parse -q --verify "$srcref" >/dev/null && "${G[@]}" merge-base --is-ancestor "$rev" "$srcref"; }; then srcref=refs/remotes/origin/$br; fi
+  local S=(git -c init.defaultBranch=main -c advice.detachedHead=false -C "$dir")
+  git -c init.defaultBranch=main init -q "$dir" || fail "git init $dir"
+  "${S[@]}" remote add origin "file://$REPO" || fail "remote add"
+  "${S[@]}" fetch -q --shallow-since="$SINCE" origin "+$srcref:refs/remotes/origin/$br" || fail "fetch $srcref from $REPO"
+  "${S[@]}" cat-file -e "$rev^{commit}" 2>/dev/null || fail "${rev:0:10} is not within --shallow-since $SINCE of $srcref"
+  "${S[@]}" checkout -q --detach "$rev" || fail "checkout ${rev:0:10}"
+  [ "$("${S[@]}" rev-parse HEAD)" = "$rev" ] || fail "HEAD != ${rev:0:10} in $dir"
+  [ -z "$("${S[@]}" status --porcelain)" ] || fail "$dir not clean"
+  "${S[@]}" check-ignore -q "python/$pkg/_version.py" || fail "python/$pkg/_version.py not ignored in $dir (Dockerfile step 4 would FATAL)"
+  say "   $(basename "$dir"): $("${S[@]}" rev-list --count HEAD) commits (shallow), $("${S[@]}" ls-files | wc -l) files, package $pkg, source ref $srcref"
+}
+if [ "$ONE_TREE" = 1 ]; then
+  say "1/8 tree ${SHA10}: src-27b/ = shallow fetch since $SINCE, src-nf/ = copy (ONE tree, both slots)"
+  clone_slot "$PART/src-27b" "$REV_27B" "$BRANCH_27B" "$PKG_27B"
+  cp -a "$PART/src-27b" "$PART/src-nf" || fail "copy src-nf"
+else
+  say "1/8 trees: src-27b/ @ ${SHA10_27B} ($BRANCH_27B), src-nf/ @ ${SHA10_NF} ($BRANCH_NF) -- two shallow fetches since $SINCE"
+  clone_slot "$PART/src-27b" "$REV_27B" "$BRANCH_27B" "$PKG_27B"
+  clone_slot "$PART/src-nf" "$REV_NF" "$BRANCH_NF" "$PKG_NF"
+fi
+[ "$(git -C "$PART/src-27b" rev-parse HEAD)" = "$REV_27B" ] && [ -z "$(git -C "$PART/src-27b" status --porcelain)" ] || fail "src-27b not clean at ${SHA10_27B}"
+[ "$(git -C "$PART/src-nf" rev-parse HEAD)" = "$REV_NF" ] && [ -z "$(git -C "$PART/src-nf" status --porcelain)" ] || fail "src-nf not clean at ${SHA10_NF}"
 for f in 27b nf; do grep -q -E '://[^/@]+:[^/@]+@' "$PART/src-$f/.git/config" && fail "credentials in src-$f/.git/config"; done
-say "   $("${S[@]}" rev-list --count HEAD) commits (shallow), $("${S[@]}" ls-files | wc -l) files, package $PKG, source ref $SRCREF"
 
 say "2/8 lock (pip freeze of $REF_VENV without sglang-kernel) + overrides"
 "$REF_VENV/bin/python" -m pip freeze --exclude-editable > "$PART/lock/venv-freeze.full.txt" || fail "pip freeze"
@@ -533,6 +577,7 @@ sed -e "s#^ARG FLLIPER_VERSION=__FLLIPER_VERSION__\$#ARG FLLIPER_VERSION=$REL#" 
     -e "s#^ARG FLLIPER_SOURCE=__FLLIPER_SOURCE__\$#ARG FLLIPER_SOURCE=$SOURCE#" \
     -e "s#^ARG FLLIPER_PLACEHOLDERS=__FLLIPER_PLACEHOLDERS__\$#ARG FLLIPER_PLACEHOLDERS=\"$PLACEHOLDERS\"#" \
     -e "s#^ARG FLLIPER_LOCK_SHA256=__FLLIPER_LOCK_SHA256__\$#ARG FLLIPER_LOCK_SHA256=$LOCKW#" \
+    -e "s#^ARG FLLIPER_ONE_TREE=__FLLIPER_ONE_TREE__\$#ARG FLLIPER_ONE_TREE=$ONE_TREE#" \
     "$DFF" > "$PART/Dockerfile"
 grep -q '__FLLIPER_' "$PART/Dockerfile" && fail "Dockerfile: unbaked __FLLIPER_ point left"
 if [ "$MEMPROF" = nf ]; then   # concurrency next to a running boot (host_build.sh passes only MAX_JOBS / HEAVY_MAX_JOBS)
@@ -556,7 +601,8 @@ DRV=$(awk '/NVRM version/{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+$/)
 REL_JSON=$(printf '%s\n' "${RELBLOCKERS[@]}")
 PRS=$(for pr in $PROFILES; do printf '%s=%s\n' "$pr" "$(img_status "$pr")"; done)
 KL=$(for l in "${KLISTS[@]}"; do basename "$l"; done)
-FLAT_LOCK_FOLD=$LOCK_FOLD FLAT_MEMPROF=$MEMPROF python3 - "$PART" "$REL" "$CU" "$REV" "$BRANCH" "$PUSH_STATE" "$SINCE" "$REF_VENV" "$LOCKW" "$KW_SHA" "$(basename "$KW_FILE")" \
+FLAT_LOCK_FOLD=$LOCK_FOLD FLAT_MEMPROF=$MEMPROF FLAT_ONE_TREE=$ONE_TREE FLAT_REV_NF=$REV_NF FLAT_BRANCH_NF=$BRANCH_NF \
+FLAT_PUSH_NF="$PUSH_STATE_NF" FLAT_PKG_NF=$PKG_NF python3 - "$PART" "$REL" "$CU" "$REV" "$BRANCH" "$PUSH_STATE" "$SINCE" "$REF_VENV" "$LOCKW" "$KW_SHA" "$(basename "$KW_FILE")" \
           "$DRV" "$STAGE_B" "$PKG" "$SOURCE" "$PLACEHOLDERS" "$TAG" "$TAG2" "$REL_JSON" "$PRS" "$KL" "$FIM" <<'PYW' || fail "BUILD_INFO"
 import hashlib, json, os, pathlib, re, sys, time, glob, base64
 (out, rel, cu, rev, branch, push, since, venv, lock, kwsha, kwname, drv, stage_b, pkg, source, ph, tag, tag2,
@@ -583,15 +629,21 @@ common = {"revision": rev, "branch": branch, "push_state": push, "shallow_since"
           "nv_headers": {"in_image": False, "describe": "none", "patch_sha256_16": "none"}, "tvm_ffi_seed": False,
           "stage_b": stage_b, "nccl": nccl, "cuda": cu, "package": pkg,
           "base_image": "per --build-arg CUDA_BASE (digest) from host_build.sh"}
+E = os.environ
+slots = {"27b": {"revision": rev, "branch": branch, "push_state": push, "package": pkg},
+         "nf": {"revision": E.get("FLAT_REV_NF") or rev, "branch": E.get("FLAT_BRANCH_NF") or branch,
+                "push_state": E.get("FLAT_PUSH_NF") or push, "package": E.get("FLAT_PKG_NF") or pkg}}
+one_tree = E.get("FLAT_ONE_TREE", "1") == "1"
+assert one_tree == (slots["27b"]["revision"] == slots["nf"]["revision"]), "one_tree flag disagrees with the revisions"
 for slot in ("27b", "nf"):
-    (o / f"BUILD_INFO-{slot}.json").write_text(json.dumps({"line": slot} | common, indent=1))
+    (o / f"BUILD_INFO-{slot}.json").write_text(json.dumps({"line": slot} | common | slots[slot], indent=1))
 bi = {"layout": "duo", "build": "flat", "release": rel, "cuda": cu, "created_utc": now,
-      "lines": {s: {"revision": rev, "branch": branch, "push_state": push} for s in ("27b", "nf")},
-      "one_tree": True, "package": pkg, "lock_sha256": lock, "overrides": ovr,
+      "lines": {s: {k: slots[s][k] for k in ("revision", "branch", "push_state")} for s in ("27b", "nf")},
+      "one_tree": one_tree, "package": pkg, "packages": {s: slots[s]["package"] for s in slots}, "lock_sha256": lock, "overrides": ovr,
       "kernel_wheel": {"file": kwname, "sha256": kwsha}, "kernel_wheel_sha256": kwsha, "fi_wheels": fiw,
       "nccl": nccl, "nv_headers": common["nv_headers"], "driver_expected": common["driver_expected"],
       "flashinfer": "0.7.0", "flashinfer_source": "flashinfer-ai/flashinfer 2f3bc5ac (#5242)", "flashinfer_lock": common["flashinfer_lock"], "lock_fold": common["lock_fold"],
-      "tvm_ffi_seed": False, "push_state": f"27b: {push}; nf: {push}", "stage_b": stage_b,
+      "tvm_ffi_seed": False, "push_state": f"27b: {push}; nf: {slots['nf']['push_state']}", "stage_b": stage_b,
       "jit": {"flashinfer_modules": nfi, "flashinfer_modules_source": fim,
               "kernel_list": {"lines": len([l for l in kern.decode().splitlines() if l and not l.startswith("#")]),
                               "sha256": hashlib.sha256(kern).hexdigest(), "sources": kl.split()}},
@@ -602,7 +654,7 @@ bi = {"layout": "duo", "build": "flat", "release": rel, "cuda": cu, "created_utc
       "release_blockers": [l for l in relb.splitlines() if l]}
 (o / "BUILD_INFO.json").write_text(json.dumps(bi, indent=1))
 PYW
-say "   BUILD_INFO: layout duo + build flat, one tree ${SHA10}, stage B: $STAGE_B"
+say "   BUILD_INFO: layout duo + build flat, $([ "$ONE_TREE" = 1 ] && echo "one tree ${SHA10}" || echo "27b ${SHA10_27B} + nf ${SHA10_NF}"), stage B (27b): $STAGE_B"
 
 say "8/8 secret scan, manifest"
 hits=$(find "$PART" -path "$PART/src-27b" -prune -o -path "$PART/src-nf" -prune -o \( -name '*.adminkey' -o -name 'gpuq_booking.json' \
@@ -612,7 +664,7 @@ if grep -rIl -E 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-or-v1-[a-f
      "$PART/assets" "$PART/lock" "$PART/tools" "$PART"/BUILD_INFO*.json "$PART/Dockerfile" 2>/dev/null; then fail "key pattern in the ctx (files above)"; fi
 ( cd "$PART" && find Dockerfile assets lock tools BUILD_INFO.json BUILD_INFO-27b.json BUILD_INFO-nf.json .dockerignore -type f -print0 \
     | sort -z | xargs -0 sha256sum ) > "$PART/MANIFEST.sha256" || fail "manifest"
-echo "$(date -u +%FT%TZ) created by make_flat_ctx.sh --write (rev ${SHA10}, release $REL)" > "$PART/MANIFEST.history"
+echo "$(date -u +%FT%TZ) created by make_flat_ctx.sh --write (27b ${SHA10_27B}, nf ${SHA10_NF}, release $REL)" > "$PART/MANIFEST.history"
 mv -- "$PART" "$OUT" || fail "rename $PART -> $OUT"
 DONE=1
 MAN=$(sha256sum "$OUT/MANIFEST.sha256" | cut -d' ' -f1)

@@ -2,7 +2,9 @@
 # /spinning/gpu-arb/docs/FLAT_IMAGE_PLAN.md. Derived from ./Dockerfile (the proven rc8b full build, FL6 layout-agnostic);
 # every RUN body of steps 1-7 is unchanged except the marked FLAT changes:
 #   FLAT-1  release defaults: CUDA 13.0.2 base, kernel wheel 605c54e7, PREBUILD_STRICT=1, cuda label cu130.
-#   FLAT-2  ONE tree: REV_27B must equal REV_NF (both slots carry the same unified revision).
+#   FLAT-2  trees: FLLIPER_ONE_TREE=1 (baked by make_flat_ctx.sh when both slots carry one revision) requires
+#           REV_27B == REV_NF; FLLIPER_ONE_TREE=0 (30.09., two frozen heads, --rev-nf) lets each slot carry its own
+#           40-hex revision, as the duo delta images do today. Each tree is checked against ITS revision either way.
 #   FLAT-3  new step 6b: kernel list (tvm-ffi + FlashInfer 0.7.0 extras + barlink pipe) via delta_prebuild.py -- the
 #           full Dockerfile never had this step; until now only the delta images carried these kernels.
 #   FLAT-4  fLLiper labels (OCI + io.github.efschu.flliper.*), revision label = the plain 40-hex SHA; no htsglang.* labels.
@@ -185,8 +187,13 @@ ARG REV_NF
 ARG SCM_27B=0.0.0.dev0
 ARG SCM_NF=0.0.0.dev0
 ARG REQUIRE_INT8_ARM
+ARG FLLIPER_ONE_TREE=__FLLIPER_ONE_TREE__
 RUN set -eu; \
-    [ "${REV_27B}" = "${REV_NF}" ] || { echo "FATAL (FLAT-2): REV_27B ${REV_27B} != REV_NF ${REV_NF} -- the flat image carries ONE tree"; exit 1; }; \
+    case "${FLLIPER_ONE_TREE}" in \
+      1) [ "${REV_27B}" = "${REV_NF}" ] || { echo "FATAL (FLAT-2): FLLIPER_ONE_TREE=1 but REV_27B ${REV_27B} != REV_NF ${REV_NF}"; exit 1; } ;; \
+      0) for r in "${REV_27B}" "${REV_NF}"; do echo "$r" | grep -qxE '[0-9a-f]{40}' || { echo "FATAL (FLAT-2): two trees need two 40-hex revisions, got '$r'"; exit 1; }; done ;; \
+      *) echo "FATAL (FLAT-5): FLLIPER_ONE_TREE not baked by make_flat_ctx.sh (${FLLIPER_ONE_TREE})"; exit 1 ;; \
+    esac; \
     for f in 27b nf; do \
       d=/opt/htsglang/src-$f; case $f in 27b) want=${REV_27B}; scm=${SCM_27B};; nf) want=${REV_NF}; scm=${SCM_NF};; esac; \
       pkg=sglang; if [ -d $d/python/flliper ]; then pkg=flliper; fi; \
@@ -269,7 +276,8 @@ RUN set -eu; STRICT=""; if [ "${PREBUILD_STRICT}" = "1" ]; then STRICT="--strict
 # --- 6b. FLAT-3: kernel list for both slots (tvm-ffi jit_kernel, FlashInfer 0.7.0 extras, barlink pipe) ---------------
 # tools/flat/kernels.txt = union of all delta lists (make_flat_ctx.sh); the lines run with the 27B slot env (tvm-ffi and
 # FlashInfer caches are ONE directory each, so NF lines -- PYTHONPATH=/opt/htsglang/src-nf/python -- land as hits on the
-# same names and prove the NF slot). tools/flat/kernels-nf.txt = the barlink lines again, built into the NF slot's own
+# same names and prove the NF slot; with two trees (FLLIPER_ONE_TREE=0) they compile the NF tree's own sources).
+# tools/flat/kernels-nf.txt = the barlink lines again, built into the NF slot's own
 # TORCH_EXTENSIONS_DIR. Heavy lines (an explicit MAX_JOBS= token, e.g. fp4_gemm_cutlass_sm120 with 17 CUTLASS TUs at
 # ~6 GiB per nvcc) run FIRST and ALONE with HEAVY_MAX_JOBS; the light lines then run DELTA_JOBS at a time with
 # DELTA_ENTRY_MAX_JOBS nvcc each (~1 GiB + 2 x 0.8 GiB per job, host_build_delta.sh model). DELTA_JOBS empty ->
@@ -385,6 +393,7 @@ ARG FLLIPER_VERSION=__FLLIPER_VERSION__
 ARG FLLIPER_SOURCE=__FLLIPER_SOURCE__
 ARG FLLIPER_PLACEHOLDERS=__FLLIPER_PLACEHOLDERS__
 ARG FLLIPER_LOCK_SHA256=__FLLIPER_LOCK_SHA256__
+# FLLIPER_ONE_TREE: declared (baked) in step 4 and still in scope here (one build stage).
 ARG CUDA_BASE
 RUN set -eu; for v in "${FLLIPER_VERSION}" "${FLLIPER_SOURCE}" "${FLLIPER_PLACEHOLDERS}" "${FLLIPER_LOCK_SHA256}"; do \
       case "$v" in __*__) echo "FATAL (FLAT-5): Dockerfile not baked by make_flat_ctx.sh ($v)"; exit 1;; esac; done; \
@@ -396,7 +405,7 @@ LABEL org.opencontainers.image.title="fLLiper" \
       org.opencontainers.image.revision="${REV_27B}" \
       org.opencontainers.image.source="${FLLIPER_SOURCE}" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.description="fLLiper: prefill/decode flip serving on heterogeneous GPUs; slots 27b and nf from one tree; transport barlink BAR1 or NCCL" \
+      org.opencontainers.image.description="fLLiper: prefill/decode flip serving on heterogeneous GPUs; slots 27b and nf (see io.github.efschu.flliper.revision.*); transport barlink BAR1 or NCCL" \
       org.opencontainers.image.base.name="${CUDA_BASE}" \
       io.github.efschu.flliper.slots="27b nf" \
       io.github.efschu.flliper.revision.27b="${REV_27B}" \
@@ -411,6 +420,7 @@ LABEL org.opencontainers.image.title="fLLiper" \
       io.github.efschu.flliper.driver.expected="595.58.03" \
       io.github.efschu.flliper.lock.sha256="${FLLIPER_LOCK_SHA256}" \
       io.github.efschu.flliper.build="flat" \
+      io.github.efschu.flliper.one_tree="${FLLIPER_ONE_TREE}" \
       io.github.efschu.flliper.placeholders="${FLLIPER_PLACEHOLDERS}"
 
 # 30000 Server (MODE=server), 8780 Planner, 8770 rigmon, 30030 weg2-Front (MODE=weg2).
