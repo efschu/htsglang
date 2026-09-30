@@ -5723,6 +5723,12 @@ class Front:
                             rid, sess, len(ids))
                 return
             prev_rid, common, prev_len = got
+            # NF-STAU-KV: the ARRIVAL-SEAT KV need credits the prefix shared
+            # with this previous turn while it RUNS on D (bounded, oldest out)
+            sprev = self.__dict__.setdefault("_sess_prev", collections.OrderedDict())
+            sprev[str(rid)] = (str(prev_rid), int(common))
+            while len(sprev) > 4096:
+                sprev.popitem(last=False)
             logger.info("WEG2 SESSION-PREFIX rid=%s sess=%s prev_rid=%s common=%d prompt=%d "
                         "prev_prompt=%d (front token ids: where this prompt leaves the session's "
                         "previous one)", rid, sess, prev_rid, common, len(ids), prev_len)
@@ -7126,7 +7132,8 @@ class Front:
             # the seat is taken (the seat itself is not work).
             _x_busy_at_grant = self._d_holds_work()
             seat = await (self._acquire_short_seat(rid, est_prompt, short_refused,
-                                                   max_tokens=_asr.max_tokens_of(payload))
+                                                   max_tokens=_asr.max_tokens_of(payload),
+                                                   uncached=remainder)
                           if _asr.enabled()  # ARRIVAL-SEAT: the KV need's decode part
                           else self._acquire_short_seat(rid, est_prompt, short_refused))
             if seat is not None:
@@ -7453,7 +7460,8 @@ class Front:
 
     async def _acquire_short_seat(self, rid: str, est_tokens: int = 0,
                                   refused: Optional[List[str]] = None,
-                                  max_tokens: Optional[int] = None) -> Optional[Seat]:
+                                  max_tokens: Optional[int] = None,
+                                  uncached: Optional[int] = None) -> Optional[Seat]:
         """A SHORT arrival's seat -- behind the BATCH gate (C5/R-16).
 
         Returns ``None`` when the request must fall through to route BATCH:
@@ -7479,7 +7487,7 @@ class Front:
             # ARRIVAL-SEAT (b): no seat free or D's KV short -> wait for the
             # next free seat in arrival order, never the P detour (H91c3-3's
             # SEATS-FULL -> BATCH is off with the rule).
-            if not await self._arrival_seat_wait(rid, est_tokens, max_tokens):
+            if not await self._arrival_seat_wait(rid, est_tokens, max_tokens, uncached=uncached):
                 return None
         elif self._d_phase_seats_full(rid):
             # H91c3-3: D's seat cap n is full -- fall through to route BATCH
@@ -7601,11 +7609,104 @@ class Front:
         st["kv"] = (now, got)
         return got
 
-    async def _arrival_seat_fits(self, est_prompt: int, max_tokens: Optional[int]) -> Tuple[bool, str]:
-        need = _asr.kv_need(est_prompt, _asr.decode_reserve(max_tokens, _asr.default_reserve()))
-        return _asr.kv_fits(need, await self._arrival_seat_kv_reading())
+    async def _arrival_seat_fits(self, est_prompt: int, max_tokens: Optional[int],
+                                 rid: Optional[str] = None,
+                                 uncached: Optional[int] = None) -> Tuple[bool, str]:
+        fits, why, _deficit = await self._arrival_seat_kv(est_prompt, max_tokens, rid, uncached)
+        return fits, why
 
-    async def _arrival_seat_wait(self, rid: str, est_tokens: int, max_tokens: Optional[int]) -> bool:
+    def _asr_shared_credit(self, rid: Optional[str], est_prompt: int,
+                           uncached: Optional[int]) -> int:
+        """NF-STAU-KV: the prefix ``rid`` shares with its session's previous
+        turn while that turn RUNS on D (not parked: a parked turn's pages are
+        evictable and already in D's free reading)."""
+        if rid is None:
+            return 0
+        got = (self.__dict__.get("_sess_prev") or {}).get(str(rid))
+        if not got:
+            return 0
+        prev_rid, common = got
+        running = (prev_rid in self._flip_ledger(self.groups["D"])
+                   and prev_rid not in self._asr_st()["parked"])
+        return _asr.shared_prefix_credit(est_prompt, uncached, common, running)
+
+    async def _arrival_seat_kv(self, est_prompt: int, max_tokens: Optional[int],
+                               rid: Optional[str] = None,
+                               uncached: Optional[int] = None) -> Tuple[bool, str, int]:
+        """``(fits, why, deficit)`` of the ARRIVAL-SEAT KV test.
+
+        NF-STAU-KV (30.09., Klasse J; y3u weg2-38-56 need=141854 = 77854 +
+        64000 > free=131820, 13.6 s wait, 47 tokens decoded): the need is
+        what D's own admission asks -- the prompt minus the prefix a RUNNING
+        turn of the same session already holds on D, plus the decode term
+        clipped like D's ``PrefillAdder`` (``weg2_kv.decode_clip``); growth
+        past it is D's elastic pressure park, never a front-side worst case."""
+        reading = await self._arrival_seat_kv_reading()
+        clip = reading.get("decode_clip") if reading else None
+        if clip is None:
+            clip = _asr.default_decode_clip()
+        reserve = _asr.decode_reserve(max_tokens, _asr.default_reserve())
+        decode = _asr.decode_part(max_tokens, _asr.default_reserve(), clip)
+        shared = self._asr_shared_credit(rid, est_prompt, uncached)
+        need = _asr.kv_need(max(0, int(est_prompt or 0) - shared), decode)
+        fits, why = _asr.kv_fits(need, reading)
+        free = _asr.kv_free(reading)
+        deficit = 0 if (fits or free is None) else int(need) - int(free)
+        if shared or decode < reserve:
+            why = "%s [need = prompt %d - shared %d + decode %d of max_tokens %d, D clip %s]" % (
+                why, int(est_prompt or 0), shared, decode, reserve, clip)
+        st = self._asr_st()
+        st["need_terms"] = (shared, decode, reserve)
+        return fits, why, deficit
+
+    def _asr_note_need_terms(self) -> None:
+        """Counters for the two honest terms of the verdict just granted."""
+        terms = self._asr_st().pop("need_terms", None)
+        if not terms:
+            return
+        shared, decode, reserve = terms
+        self.counters["arrival_seat_kv_shared_tokens"] += int(shared)
+        if decode < reserve:
+            self.counters["arrival_seat_kv_decode_clipped"] += 1
+
+    async def _arrival_seat_kv_displace(self, head_rid: str, head_arrival: Optional[float],
+                                        deficit: int, now: float) -> Optional[str]:
+        """NF-STAU-KV (user rule #246 "Ältester rückt nach und verdrängt
+        Jüngere"): the head has a free seat but its KV does not fit -- the
+        youngest running decode that arrived AFTER it parks at its round
+        boundary (span retained), at once instead of after the 60 s bound (c).
+        One park per KV tick (the reading is re-taken before the next one);
+        never an older request, never a park that cannot cover the deficit."""
+        st = self._asr_st()
+        if now - float(st.get("kv_park_t", 0.0)) < float(st.get("kv_park_cooldown", 0.0)):
+            return None
+        D = self.groups["D"]
+        running = [r for r in self._flip_ledger(D) if r not in st["parked"] and r != head_rid]
+        arrivals = {}
+        for r in running:
+            t = self._asr_arrival_of(r)
+            if t is not None:
+                arrivals[r] = t
+        tokens = {s.rid: int(s.tokens) for s in (getattr(self, "_d_seats_live", ()) or ())}
+        victim = _asr.kv_displace_victim(head_arrival, running, arrivals, tokens, deficit)
+        if victim is None:
+            return None
+        got = await self._arrival_seat_park(D, victim, _asr.REASON_KV, now, "kv_park",
+                                            park_cooldown=_asr.KV_PARK_COOLDOWN_S)
+        if got is not None:
+            self.counters["arrival_seat_kv_displace"] += 1
+            st["kv"] = None  # the next KV test reads D after the park
+            logger.warning("%s KV-DISPLACE rid=%s head=%s deficit=%d younger_tokens_lb=%d -- the head's KV "
+                           "does not fit a free seat: the youngest decode that arrived after it parks at "
+                           "its round boundary (span retained) and the head takes the room (#246)",
+                           _asr.MARKER, victim, head_rid, int(deficit),
+                           sum(tokens.get(r, 0) for r in arrivals if arrivals[r] > float(head_arrival)))
+        else:
+            self.counters["arrival_seat_kv_displace_refused"] += 1
+        return got
+
+    async def _arrival_seat_wait(self, rid: str, est_tokens: int, max_tokens: Optional[int],
+                                 uncached: Optional[int] = None) -> bool:
         """ARRIVAL-SEAT (a)/(b) for an arrival D prefills itself (uncached <= X):
         True as soon as a seat is free, its KV need fits and it is the OLDEST
         seat waiter (arrival order, #244/#246); until then it waits here -- no P
@@ -7625,8 +7726,13 @@ class Front:
                 head = min(waiters.items(), key=lambda kv: kv[1])[0]
                 taken, n = self._arrival_seat_taken()
                 free = _asr.seat_free(taken, n)
-                fits, why = await self._arrival_seat_fits(est_tokens, max_tokens) if free else (True, "no seat")
+                fits, why, deficit = (await self._arrival_seat_kv(est_tokens, max_tokens, rid, uncached)
+                                      if free else (True, "no seat", 0))
                 fits_of[rid] = bool(free and fits)
+                if free and not fits and head == rid:
+                    # NF-STAU-KV (#246): the head displaces a younger decode
+                    await self._arrival_seat_kv_displace(
+                        rid, self._asr_arrival_of(rid) or waiters[rid], deficit, time.time())
                 backfill = False
                 if free and fits and head != rid:
                     # #246 KV backfill: every older waiter is blocked by its KV (a
@@ -7638,6 +7744,7 @@ class Front:
                 if free and fits and (head == rid or backfill):
                     st["granted"][rid] = time.time()
                     self.counters["arrival_seat_d_prefill"] += 1
+                    self._asr_note_need_terms()
                     if backfill:
                         self.counters["arrival_seat_backfill"] += 1
                     ms = self._asr_verdict_ms(rid, None)
@@ -7689,14 +7796,22 @@ class Front:
         p = cands[0]
         taken, n = self._arrival_seat_taken()
         free = _asr.seat_free(taken, n)
+        deficit = 0
         if free:
-            fits, why = await self._arrival_seat_fits(int(getattr(p, "est_prompt", 0) or 0),
-                                                      _asr.max_tokens_of(getattr(p, "payload", None)))
+            fits, why, deficit = await self._arrival_seat_kv(
+                int(getattr(p, "est_prompt", 0) or 0), _asr.max_tokens_of(getattr(p, "payload", None)),
+                p.rid, int(getattr(p, "est_uncached", 0) or 0))
         else:
             fits, why = False, "no seat"
         v = _asr.verdict(free, fits, int(getattr(p, "est_uncached", 0) or 0), x_tok)
         head = p
-        if v == _asr.WAIT_SEAT and free and not fits and len(cands) > 1:
+        displaced = None
+        if v == _asr.WAIT_SEAT and free and not fits:
+            # NF-STAU-KV (#246): strict arrival order first -- the head parks a
+            # younger decode for its room; backfill only when no younger one can
+            displaced = await self._arrival_seat_kv_displace(
+                p.rid, self._asr_arrival_of(p.rid) or float(getattr(p, "t_arrive", now)), deficit, now)
+        if v == _asr.WAIT_SEAT and free and not fits and len(cands) > 1 and displaced is None:
             # #246 KV backfill: the head's KV does not fit a free seat -- a later
             # arrival (arrival order among the fitting ones) that fits takes it.
             # The head is asked first on every tick; past the bound backfill
@@ -7706,7 +7821,8 @@ class Front:
                 for q in cands[1:]:
                     f2, why2 = await self._arrival_seat_fits(
                         int(getattr(q, "est_prompt", 0) or 0),
-                        _asr.max_tokens_of(getattr(q, "payload", None)))
+                        _asr.max_tokens_of(getattr(q, "payload", None)),
+                        q.rid, int(getattr(q, "est_uncached", 0) or 0))
                     if f2:
                         p, fits, v = q, True, _asr.FLIP_NOW
                         why = "%s; backfill past head %s (%s, waited %.1f s)" % (why2, head.rid, why, head_wait)
@@ -7715,6 +7831,7 @@ class Front:
             if st["flip_rid"] != p.rid:
                 st["flip_rid"] = p.rid
                 self.counters["arrival_seat_flip_now"] += 1
+                self._asr_note_need_terms()
                 if p is not head:
                     self.counters["arrival_seat_backfill"] += 1
                 ms = self._asr_verdict_ms(p.rid, getattr(p, "t_arrive", None), now)
@@ -7746,29 +7863,45 @@ class Front:
         victim = _asr.youngest_running(getattr(self, "_d_admit_t", None) or {}, running)
         if victim is None:
             return None
-        body = dict(phase_policy.park_body(self.epoch, bound, reason=_asr.REASON_YOUNGEST))
+        got = await self._arrival_seat_park(D, victim, _asr.REASON_YOUNGEST, now, "park",
+                                            park_cooldown=float(bound), bound=bound)
+        if got is not None:
+            self.counters["arrival_seat_youngest_park"] += 1
+            logger.warning("%s YOUNGEST-PARK rid=%s oldest_wait_s=%.1f bound_s=%.1f running=%d -- the youngest "
+                           "decode pauses at its round boundary; its seat goes to the oldest waiter (#246)",
+                           _asr.MARKER, victim, float(wait_s or 0.0), float(bound), len(running))
+            return victim
+        self.counters["arrival_seat_youngest_park_refused"] += 1
+        return None
+
+    async def _arrival_seat_park(self, D: "Group", victim: str, reason: str, now: float, key: str,
+                                 park_cooldown: float, bound: Optional[float] = None) -> Optional[str]:
+        """One named running decode parks at its round boundary on D (SA (3)'s
+        pressure shape): the one park RPC of ARRIVAL-SEAT (c) (``key`` "park")
+        and of the KV displacement (``key`` "kv_park"), each with its own
+        clock. Its front seat is released; the rule counts it parked. Returns
+        the rid, or None when D refused (asked again after 0.5 s)."""
+        st = self._asr_st()
+        if bound is None:
+            bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
+        body = dict(phase_policy.park_body(self.epoch, bound, reason=reason))
         body["youngest"] = victim
         try:
             code, text = await self.rpc(D, phase_policy.PARK_PATH, body, phase_policy.PARK_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001 -- a failed park is retried, never kills the phase
             code, text = 0, f"{type(e).__name__}: {e}"
         verdict, rids, why = phase_policy.park_verdict(code, text)
-        st["park_t"] = now
+        st[key + "_t"] = now
         if verdict == phase_policy.PARK_PARKED and victim in rids:
             st["parked"][victim] = now
-            st["park_cooldown"] = float(bound)
-            self.counters["arrival_seat_youngest_park"] += 1
+            st[key + "_cooldown"] = float(park_cooldown)
             for s in list(getattr(self, "_d_seats_live", ()) or ()):
                 if s.rid == victim:
-                    s.release("arrival-seat-youngest-park")
-            logger.warning("%s YOUNGEST-PARK rid=%s oldest_wait_s=%.1f bound_s=%.1f running=%d -- the youngest "
-                           "decode pauses at its round boundary; its seat goes to the oldest waiter (#246)",
-                           _asr.MARKER, victim, float(wait_s or 0.0), float(bound), len(running))
+                    s.release("arrival-seat-%s" % reason)
             return victim
-        st["park_cooldown"] = 0.5
-        self.counters["arrival_seat_youngest_park_refused"] += 1
-        logger.info("%s YOUNGEST-PARK refused rid=%s verdict=%s status=%s %s -- asked again next tick",
-                    _asr.MARKER, victim, verdict, code, why or (text or "")[:160])
+        st[key + "_cooldown"] = 0.5
+        logger.info("%s PARK refused rid=%s reason=%s verdict=%s status=%s %s -- asked again next tick",
+                    _asr.MARKER, victim, reason, verdict, code, why or (text or "")[:160])
         return None
 
     def _d_phase_seats_full(self, rid: str, own_seat: bool = False) -> bool:
@@ -9144,6 +9277,14 @@ class Front:
         else:
             p.fut = asyncio.get_event_loop().create_future()
             p.t_arrive = time.time()
+            # NF-STAU-KV (y3v 01:09:44 weg2-28-58, 66.2 s hold): the kept SHORT
+            # had passed the P drain with skip_leg1 (leg1_done=True, no leg 1
+            # ran); re-routed "through P (leg 1, then leg 2)" it kept the flag,
+            # so needs_p() said no and the ARRIVAL-SEAT step never saw it --
+            # no verdict, no flip, D decoded with free seats until an unrelated
+            # arrival flipped 66 s later. Its leg 1 is ahead of it again, as
+            # every other reroute path (HANDOFF-LOST, INTAKE-STALL) says.
+            p.leg1_done = False
             if getattr(p, "short_kept", False) or getattr(p, "sk_void_seq", None) is not None:
                 # SK-X (W35 class, NF rc12t weg2-6-30): D refused a kept SHORT
                 # before the first byte. Its presence expires with this
