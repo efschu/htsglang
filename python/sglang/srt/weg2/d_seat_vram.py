@@ -1973,11 +1973,11 @@ def _unmerged_extend(sched, running) -> list:
     return out
 
 
-def global_demand(sched) -> Tuple[int, int, frozenset]:
-    """REPLICATED (27B condition 2): the tokens the running requests hold,
-    the tokens the queue head wants, the running rids -- the request lists
-    are the same on every D rank, the page lists are not (#603). The
-    requests of an extend batch the merge has not taken yet run too."""
+def _demand_lists(sched) -> Tuple[list, list]:
+    """REPLICATED (27B condition 2): the running requests (with the chunked
+    one and an extend batch the merge has not taken yet) and the queued
+    requests the next admission can take -- the request lists are the same
+    on every D rank, the page lists are not (#603)."""
     running = list(getattr(getattr(sched, "running_batch", None), "reqs", None) or ())
     chunked = getattr(sched, "chunked_req", None)
     if chunked is not None and all(chunked is not r for r in running):
@@ -1993,10 +1993,77 @@ def global_demand(sched) -> Tuple[int, int, frozenset]:
                 "yet at this tick: its requests hold their pages (no end event, no shrink "
                 "below them)", UNMERGED_MARK, n, [str(getattr(r, "rid", ""))[:16] for r in extra],
                 sum(_req_tokens(r) for r in extra))
-    used = sum(_req_tokens(r) for r in running)
     queue = getattr(sched, "waiting_queue", None) or ()
-    incoming = sum(_req_tokens(r) for r in _admissible_queue(queue, _cap_of(sched) - len(running)))
+    return running, _admissible_queue(queue, _cap_of(sched) - len(running))
+
+
+def global_demand(sched) -> Tuple[int, int, frozenset]:
+    """REPLICATED (27B condition 2): the tokens the running requests hold,
+    the tokens the queue head wants, the running rids -- the request lists
+    are the same on every D rank, the page lists are not (#603). The
+    requests of an extend batch the merge has not taken yet run too."""
+    running, admissible = _demand_lists(sched)
+    used = sum(_req_tokens(r) for r in running)
+    incoming = sum(_req_tokens(r) for r in admissible)
     return used, incoming, frozenset(getattr(r, "rid", id(r)) for r in running)
+
+
+def _clip_max_new() -> int:
+    """``CLIP_MAX_NEW_TOKENS`` of ``schedule_policy`` (the same env var)."""
+    try:
+        from sglang.srt.environ import envs
+
+        return int(envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get())
+    except Exception:  # noqa: BLE001 -- a desk double without environ: the default
+        return int(os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096") or 4096)
+
+
+def _req_max_new(req, clip: int) -> int:
+    sp = getattr(req, "sampling_params", None)
+    mx = getattr(sp, "max_new_tokens", None)
+    if mx is None:
+        return 0
+    out = len(getattr(req, "output_ids", None) or ())
+    return max(0, min(int(mx) - out, int(clip)))
+
+
+def _new_token_ratio(sched) -> float:
+    tracker = getattr(sched, "new_token_ratio_tracker", None)
+    v = getattr(tracker, "current", None)
+    if v is None:
+        v = getattr(sched, "new_token_ratio", None)
+    try:
+        return max(0.0, float(v)) if v is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+#: NF y3z 0930_023308 ep44/ep58: the stage the census held while the gate refused
+GATE_PRICE_MARK = "WEG2 D-MEM-SCHED GATE-PRICE"
+
+
+def admission_reserve(sched, running, admissible) -> int:
+    """REPLICATED: what the admission gate charges beyond the census while a
+    request is queued -- ``PrefillAdder``'s ``rem_total_token_offset`` (every
+    running request's ``min(max_new - out, CLIP) * new_token_ratio``) plus
+    each candidate's ``min(max_new - out, CLIP) + page`` (``add_one_req``).
+
+    NF y3z 0930_023308 (30.09.): ep44 02:53:25 at S6 (229376) the census
+    needed 144571 + 78477 + air 4120 = 227168 and held; the attention host
+    priced weg2-42-101 at 82637 against a budget of 78336 (5 decode
+    reservations, 6469) -- NO_TOKEN at a free seat, batch-full until
+    weg2-41-100 ended 4 s later. ep58 02:58:12 the same at S5 with two free
+    seats (63071 > 59392, 8,1 s). S7..S9 were on the ladder (S7 at 02:52:15).
+    Zero with nothing queued: a reservation never moves an expert row on its
+    own. Inputs are request fields and the scheduler's ratio -- the same on
+    every D rank."""
+    if not admissible:
+        return 0
+    clip = _clip_max_new()
+    page = max(1, _page_size(sched))
+    ratio = _new_token_ratio(sched)
+    run = sum(int(math.ceil(_req_max_new(r, clip) * ratio)) for r in running)
+    return run + sum(_req_max_new(r, clip) + page for r in admissible)
 
 
 def kv_ladder_reading(sched) -> Optional[Dict[str, int]]:
@@ -2166,14 +2233,20 @@ def runtime_tick(sched):
         ms._epoch = st.epoch
         ms._rids = None
         setattr(sched, MEM_SCHED_ATTR, ms)
-    used, incoming, rids = global_demand(sched)
+    running, admissible = _demand_lists(sched)
+    used = sum(_req_tokens(r) for r in running)
+    incoming = sum(_req_tokens(r) for r in admissible)
+    rids = frozenset(getattr(r, "rid", id(r)) for r in running)
+    # NF y3z ep44/ep58 (30.09.): the machine grows for what the GATE charges,
+    # not for the bare census -- else it holds a stage the gate refuses in
+    reserve = admission_reserve(sched, running, admissible)
     ended = ms._rids is not None and bool(ms._rids - rids)
     ms._rids = rids
     floor = 0
-    if ms.pending is not None or ms.shrink_candidate(used, incoming):
+    if ms.pending is not None or ms.shrink_candidate(used, incoming + reserve):
         floor = _group_floor_tokens(sched)
     before, pending_before = ms.stage, ms.pending
-    step = ms.step(used, incoming, ended=ended, floor_tokens=floor)
+    step = ms.step(used, incoming + reserve, ended=ended, floor_tokens=floor)
     alloc = _kv_allocator(sched)
     page = _page_size(sched)
     # NF1d 09291811 (z30y3f): a pending shrink caps new pages below the wanted
@@ -2236,10 +2309,12 @@ def runtime_tick(sched):
     st.stage, st.stage_tokens = ms.stage, tokens[ms.stage]
     if ms.stage > before:
         _reopen_admission(sched)
-    logger.info("%s from=S%d to=S%d used=%d incoming=%d ended=%s floor=%d -- %s%s", ms.line(),
-                before, ms.stage, used, incoming, "yes" if ended else "no", floor, step.reason,
+    logger.info("%s from=S%d to=S%d used=%d incoming=%d ended=%s floor=%d -- %s%s gate_reserve=%d",
+                ms.line(), before, ms.stage, used, incoming, "yes" if ended else "no", floor,
+                step.reason,
                 "" if ctl is None else (" evicted_rows=%d refilled_rows=%d sync_ms=%.1f "
                                         "bytes_copied=%d copy_ms=%.1f rows_on=%s")
                 % (ctl.evicted_rows, ctl.refilled_rows, ctl.sync_ms, ctl.bytes_copied,
-                   ctl.copy_ms, "-" if applied is None else int(applied.extra_rows)))
+                   ctl.copy_ms, "-" if applied is None else int(applied.extra_rows)),
+                int(reserve))
     return step
