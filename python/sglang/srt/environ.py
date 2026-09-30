@@ -3762,6 +3762,14 @@ class Envs:
     SGLANG_WEG2_X_COST_FIT_MIN_SPREAD = EnvFloat(4.0)
     SGLANG_WEG2_X_COST_FIT_MIN_BIG = EnvInt(8)
     SGLANG_WEG2_X_COST_MAX_STEP = EnvFloat(0.25)
+    # X-K-FLIP (30.09., NF y5a front): the X COST-LINE re-solve amortised the
+    # flip's round trip over k = the MEAN requests per P phase of the boot
+    # (mean-of-19 = 2.4-2.6, inflated by the dmatrix 6-request bursts), so the
+    # live X fell 4096 -> 1440-1900 and 8 flips were fired by ONE agent request
+    # of 2087-2940 new tokens (k real 1-2). On: X in force = the lone request's
+    # (k=1, ~4200 on y5a's lines); an arrival is routed on the X of the flip it
+    # would take (1 + requests queued for P now). The mean stays display-only.
+    SGLANG_WEG2_X_K_FLIP = EnvBool(False)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at
