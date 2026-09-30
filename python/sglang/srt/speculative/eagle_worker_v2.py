@@ -2454,9 +2454,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # H24 (weg2 E2): forward_batch_generation's extend branch serves
         # skip-extend batches (tail_adopt.skip_tokens -> run_skip)
         tail_adopt.register_skip_server()
-        # TAIL-STAGE-WORKER: pin the rank's staging arena once, at boot, from
-        # the form (no-op unless SGLANG_WEG2_TAIL_STAGE_WORKER on an adopting rank)
-        tail_adopt.prepare_arena(target_worker.model_runner, server_args)
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm

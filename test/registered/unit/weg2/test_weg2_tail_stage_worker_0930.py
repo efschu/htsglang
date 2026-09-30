@@ -256,7 +256,30 @@ def test_no_synchronize_on_the_scheduler_thread_side():
 
 
 def test_the_d_worker_pins_it_at_boot():
-    src = (REPO / "python/sglang/srt/speculative/eagle_worker_v2.py").read_text()
-    i_reg = src.index("tail_adopt.register_skip_server()")
-    i_pin = src.index("tail_adopt.prepare_arena(target_worker.model_runner, server_args)")
-    assert i_reg < i_pin < i_reg + 400
+    """y5a 0110f8e132: at the spec worker's init the pools did not exist yet
+    (``boot pin n/a (AttributeError: 'ModelRunner' object has no attribute
+    'token_to_kv_pool')`` on TP0-2, the first staging pinned 1386 MiB inside
+    the first flip, pin_ms=757.4 on TP0). The pin rides the pool allocation."""
+    spec = (REPO / "python/sglang/srt/speculative/eagle_worker_v2.py").read_text()
+    assert "prepare_arena" not in spec
+    src = (REPO / "python/sglang/srt/managers/tp_worker.py").read_text()
+    i_def = src.index("    def alloc_memory_pool(")
+    i_alloc = src.index("self.model_runner.alloc_memory_pool(memory_pool_config)", i_def)
+    i_pin = src.index("_tail_adopt.prepare_arena(self.model_runner, self.server_args)", i_alloc)
+    i_next = src.index("    def init_attention_backends(", i_def)
+    assert i_def < i_alloc < i_pin < i_next
+    assert "if not self.is_draft_worker:" in src[i_alloc:i_pin]
+
+
+def test_prepare_arena_after_the_pools_pins_from_their_shapes(monkeypatch):
+    runner = types.SimpleNamespace(token_to_kv_pool="kv", req_to_token_pool="r2t")
+    seen = []
+    monkeypatch.setattr(ta, "held_shapes", lambda kv, r2t: seen.append((kv, r2t)) or _held())
+    monkeypatch.setattr(ta, "adopt_enabled", lambda: True)
+    ta._STAGE_WORKER[0] = ta.StageWorker(seats=2, pin=False)
+    try:
+        with envs.SGLANG_WEG2_TAIL_STAGE_WORKER.override(True):
+            n = ta.prepare_arena(runner, types.SimpleNamespace(max_running_requests=6, page_size=64))
+        assert seen == [("kv", "r2t")] and n == 6 * ta.rid_bytes(_held(), 64, ta.verify_enabled())
+    finally:
+        ta._STAGE_WORKER[0] = None
