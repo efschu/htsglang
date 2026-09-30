@@ -349,6 +349,12 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_claim_info.argtypes = [p_u8, i64, p_i64, p_i64, p_i64, p_i64, p_i64, p_i64, p_i8]
             lib.arena_oldest_claim.restype = i64
             lib.arena_oldest_claim.argtypes = [p_u8, p_i64]
+            lib.arena_quarantine_stale.restype = i64
+            lib.arena_quarantine_stale.argtypes = [p_u8, i64, p_i64, p_i64, i64, p_i8]
+            lib.arena_quarantine_sweep.restype = i64
+            lib.arena_quarantine_sweep.argtypes = [p_u8, i64]
+            lib.arena_free_if_gen.restype = i64
+            lib.arena_free_if_gen.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
             _lib = lib
             return lib
         except Exception as e:  # noqa: BLE001 - the arena is optional
@@ -703,6 +709,39 @@ class ShmArena:
         self._lib.arena_claim_info(self._base, n, c_sl, gen, age, pid, role, opn, st)
         return [(int(slots[i]), int(gen[i]), int(age[i]), int(pid[i]), int(role[i]), int(opn[i]),
                  int(st[i])) for i in range(n)]
+
+    def quarantine_stale(self, slots: Sequence[int], gens: Sequence[int], min_age_ms: int) -> list[int]:
+        """L3FILL-JOINED (3): take stale live claims away from their keys
+        (generation-checked). Per slot 1 quarantined, 0 young, 2 generation
+        moved / not claimed, 3 referenced."""
+        n = len(slots)
+        if n == 0:
+            return []
+        c_sl = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        c_g = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_quarantine_stale(self._base, n, c_sl, c_g, int(min_age_ms), st)
+        return list(st)
+
+    def quarantine_sweep(self, backstop_ms: int) -> int:
+        """L3FILL-JOINED (3): free quarantined slots nobody holds (or held
+        past the backstop). Returns the number freed."""
+        return int(self._lib.arena_quarantine_sweep(self._base, int(backstop_ms)))
+
+    def free_if_gen(self, slots: Sequence[int], gens: Sequence[int], reason: str = "unnamed") -> list[int]:
+        """Free this writer's own claims only while they still carry its
+        generation (a late free never hits the slot's next owner)."""
+        n = len(slots)
+        if n == 0:
+            return []
+        c_sl = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        c_g = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_free_if_gen(self._base, n, c_sl, c_g, st)
+        freed = [int(slots[i]) for i in range(n) if st[i] == 1]
+        if freed:
+            _note_free(reason, freed)
+        return list(st)
 
     def oldest_claim(self) -> dict:
         """L3FILL-JOINED: the oldest open CLAIMED slot and the claimed count."""

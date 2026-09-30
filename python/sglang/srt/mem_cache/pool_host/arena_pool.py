@@ -612,7 +612,7 @@ def _release_fresh(arena, slots, gens, site: str) -> None:
                 _RELEASE_N[1])
 
 
-_COMPLETE_LOST = {3: 0, 4: 0, 5: 0}  # arena_complete status -> slots lost, process-wide
+_COMPLETE_LOST = {3: 0, 4: 0, 5: 0, 6: 0}  # arena_complete status -> slots lost, process-wide
 _COMPLETE_LOST_CALLS = [0]
 _LOST_NAMES = {3: "recycled", 4: "not_claimed", 5: "overflow"}
 
@@ -661,10 +661,11 @@ def _note_complete_lost(st, slots, site: str) -> int:
     k = _COMPLETE_LOST_CALLS[0]
     if k <= 8 or (k & (k - 1)) == 0 or 5 in by:
         (logger.error if 5 in by else logger.warning)(
-            "#1427 ARENA-COMPLETE LOST site=%s recycled=%d not_claimed=%d overflow=%d slots=%s "
-            "calls=%d totals=recycled:%d,not_claimed:%d,overflow:%d",
-            site, by.get(3, 0), by.get(4, 0), by.get(5, 0), bad[:4], k,
-            _COMPLETE_LOST[3], _COMPLETE_LOST[4], _COMPLETE_LOST[5])
+            "#1427 ARENA-COMPLETE LOST site=%s recycled=%d not_claimed=%d overflow=%d "
+            "stale_reaped=%d slots=%s calls=%d "
+            "totals=recycled:%d,not_claimed:%d,overflow:%d,stale_reaped:%d",
+            site, by.get(3, 0), by.get(4, 0), by.get(5, 0), by.get(6, 0), bad[:4], k,
+            _COMPLETE_LOST[3], _COMPLETE_LOST[4], _COMPLETE_LOST[5], _COMPLETE_LOST[6])
     return len(bad)
 
 

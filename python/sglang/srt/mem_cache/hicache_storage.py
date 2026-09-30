@@ -190,6 +190,73 @@ def _await_fill_joins(arena, stems, joined, wait_ms: int) -> dict:
     return done
 
 
+_STALE_REAP_N = [0, 0]   # reaps, stems re-claimed
+_LATE_COMPLETE_N = [0, 0]   # lines, slots whose late completion was refused
+#: quarantined slots whose old writer never resolved are freed after this many
+#: stale bounds (the writer is gone for good)
+QUARANTINE_BACKSTOP_FACTOR = 12
+
+
+def fill_stale_claim_ms() -> int:
+    try:
+        return max(0, int(float(envs.SGLANG_WEG2_L3FILL_STALE_CLAIM_S.get()) * 1000.0))
+    except Exception:  # noqa: BLE001 - no switch, no reap
+        return 0
+
+
+def _reap_stale_live_joins(arena, stems, joined, total_bytes: int) -> list:
+    """L3FILL-JOINED (3): the JOINED stems whose holder delivered no byte for
+    ``SGLANG_WEG2_L3FILL_STALE_CLAIM_S`` are taken from their keys (quarantine,
+    generation-safe) and claimed fresh by this fill. Returns the new todo
+    entries (index, slot, generation, stem) -- read from disk like any fresh
+    claim. y4a ep36: 29 such stems ended a 1070-page prefix read at 146."""
+    min_ms = fill_stale_claim_ms()
+    q = getattr(arena, "quarantine_stale", None)
+    if not joined or min_ms <= 0 or not callable(q):
+        return []
+    try:
+        arena.quarantine_sweep(min_ms * QUARANTINE_BACKSTOP_FACTOR)
+    except Exception:  # noqa: BLE001 - the sweep is housekeeping
+        pass
+    owners = _join_owner_text(arena, joined)
+    st = q([int(s) for _, s, _ in joined], [int(g) for _, _, g in joined], min_ms)
+    reaped = [joined[k] for k, v in enumerate(st) if int(v) == 1]
+    if not reaped:
+        return []
+    fresh = []
+    for (i, _s, _g), (slot, status, gen) in zip(
+            reaped, _fill_claim(arena, [stems[int(i)] for i, _s, _g in reaped], int(total_bytes))):
+        if int(status) == 0:
+            fresh.append((int(i), int(slot), int(gen), stems[int(i)]))
+        elif int(status) == 1:
+            _unclaim_fill_joins(arena, [(int(i), int(slot), int(gen))])
+    _STALE_REAP_N[0] += 1
+    _STALE_REAP_N[1] += len(fresh)
+    k = _STALE_REAP_N[0]
+    if k <= 16 or (k & (k - 1)) == 0:
+        logger.warning(
+            "L3-FILL STALE-CLAIM-REAP n=%d stems=%d reaped=%d reclaimed=%d total=%d bound_ms=%d%s "
+            "(a claim with a live writer and no byte for the bound was quarantined from its key "
+            "-- generation kept, a late completion of the old writer is refused by name; the "
+            "stem is read from disk into a fresh slot)",
+            k, len(joined), len(reaped), len(fresh), _STALE_REAP_N[1], min_ms, owners)
+    return fresh
+
+
+def _note_late_complete(slots, statuses) -> None:
+    """L3FILL-JOINED (3): a fill's completion the arena refused because its
+    slot was reaped (6) or recycled (3) under it -- named, never freed again
+    (the slot may already be the stem's or another stem's new home)."""
+    _LATE_COMPLETE_N[0] += 1
+    _LATE_COMPLETE_N[1] += len(slots)
+    k = _LATE_COMPLETE_N[0]
+    if k <= 16 or (k & (k - 1)) == 0:
+        logger.warning("L3-FILL LATE-COMPLETE REFUSED n=%d slots=%s statuses=%s total=%d (6 = the "
+                       "claim was reaped as stale while this fill read it, 3 = recycled; the bytes "
+                       "are discarded, the slot is not freed by this writer)",
+                       k, list(slots)[:4], sorted(set(int(x) for x in statuses)), _LATE_COMPLETE_N[1])
+
+
 def _fill_claim(arena, stems, total_bytes: int):
     """The fill's claims, stamped with the l3fill role (L3FILL-JOINED); a
     hermetic fake arena without the keyword claims as before."""
@@ -3269,6 +3336,9 @@ class HiCacheFile(HiCacheStorage):
             for i, s_ in _waited.items():
                 out[i] = s_
             joined = [j for j in joined if int(j[0]) not in _waited]
+            # L3FILL-JOINED (3): a holder with no byte for the stale bound loses
+            # the stem; this fill claims it fresh and reads it from disk
+            todo.extend(_reap_stale_live_joins(arena, stems, joined, int(total_bytes)))
         if prefix and todo:
             # (a): the first stem that neither raced in complete nor got a
             # claim ends the prefix -- its successors are not read
@@ -3290,7 +3360,8 @@ class HiCacheFile(HiCacheStorage):
         ptrs = [arena.slot_ptr(slot) for _, slot, _, _ in todo]
         rc, threads = l3_read_pages_parallel(pio, paths, int(total_bytes), ptrs)
         ok = [k for k, r in enumerate(rc) if r == 0]
-        bad = [todo[k][1] for k, r in enumerate(rc) if r != 0]
+        bad = [(todo[k][1], todo[k][2]) for k, r in enumerate(rc) if r != 0]
+        late = []
         filled = 0
         if ok:
             cs = arena.complete_slots([todo[k][1] for k in ok], [todo[k][2] for k in ok],
@@ -3299,10 +3370,18 @@ class HiCacheFile(HiCacheStorage):
                 if c in (1, 2):
                     out[todo[k][0]] = todo[k][1]
                     filled += 1
+                elif c in (3, 6):
+                    late.append((todo[k][1], int(c)))   # reaped / recycled under us: not ours
                 else:
-                    bad.append(todo[k][1])
+                    bad.append((todo[k][1], todo[k][2]))
+        if late:
+            _note_late_complete([s for s, _ in late], [c for _, c in late])
         if bad:
-            _free_named(arena, bad, "l3fill_complete_refused")
+            _fg = getattr(arena, "free_if_gen", None)
+            if callable(_fg):
+                _fg([s for s, _ in bad], [g for _, g in bad], reason="l3fill_complete_refused")
+            else:
+                _free_named(arena, [s for s, _ in bad], "l3fill_complete_refused")
         k = getattr(self, "_1433_n", 0) + 1
         self._1433_n = k
         if k <= 8 or k % 256 == 0:
