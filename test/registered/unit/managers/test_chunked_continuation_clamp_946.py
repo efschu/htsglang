@@ -414,6 +414,11 @@ class TheRingInstrumentMustNotLIE(unittest.TestCase):
         log.addHandler(catcher)
         old = os.environ.get("SGLANG_947_RING_EVERY")
         os.environ["SGLANG_947_RING_EVERY"] = "25"
+        # The CADENCE is pinned with the census throttle OFF (30.09., dual13): with it on, an unchanged
+        # state goes out on a doubling backoff and the second tick of #998/#997d is held back -- fewer
+        # lines, never more (test_pp_census_throttle_0930.py pins that half).
+        old_thr = os.environ.get("SGLANG_PP_CENSUS_THROTTLE")
+        os.environ["SGLANG_PP_CENSUS_THROTTLE"] = "0"
         try:
             for _ in range(60):
                 self._note(h, "ring:pre_plan", True)
@@ -424,6 +429,10 @@ class TheRingInstrumentMustNotLIE(unittest.TestCase):
                 os.environ.pop("SGLANG_947_RING_EVERY", None)
             else:
                 os.environ["SGLANG_947_RING_EVERY"] = old
+            if old_thr is None:
+                os.environ.pop("SGLANG_PP_CENSUS_THROTTLE", None)
+            else:
+                os.environ["SGLANG_PP_CENSUS_THROTTLE"] = old_thr
         census = [m for m in catcher.messages if "#947 VOID-RING CENSUS" in m]
         self.assertEqual(
             len(census),

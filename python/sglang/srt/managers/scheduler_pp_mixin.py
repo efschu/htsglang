@@ -1200,6 +1200,59 @@ DEFAULT_RING_COMMIT_BUDGET_S = 120.0
 ENV_RING_COMMIT_BUDGET = "SGLANG_PP_RING_COMMIT_BUDGET_S"
 
 
+#: CENSUS THROTTLE (30.09., dual13 11:00-11:04Z): in the livelock P wrote #998 EXTEND-INVARIANT,
+#: #997d OUTPUT-FILL and #1000 SLOT-OCCUPANT ~68 lines/s EACH (12198 lines each in ~3 min) plus #996 -- the
+#: same content every time, which kept every silence watcher awake. A census line now goes out when its
+#: CONTENT CHANGES (at once, the first one too) and, while it stays the same, only on a doubling backoff --
+#: after 1, 2, 4, 8 ... passes AND 1, 2, 4 ... seconds -- carrying a count of the passes it stood for. So N
+#: unchanged passes give at most log2(N)+1 lines, and no information is lost: first line at once, every
+#: change at once, and the count says how long it held. SGLANG_PP_CENSUS_THROTTLE=0 restores every line.
+CENSUS_THROTTLE_ENV = "SGLANG_PP_CENSUS_THROTTLE"
+
+
+def _census_throttle(holder, marker: str, content, now: Optional[float] = None) -> Optional[str]:
+    """None = do not log this pass; else the suffix to append ('' when nothing was held back).
+
+    ``content`` is what the line says (the formatted arguments); equal content = the same state."""
+    if os.environ.get(CENSUS_THROTTLE_ENV, "1").strip() == "0":
+        return ""
+    now = time.monotonic() if now is None else now
+    table = getattr(holder, "_pp_census_throttle", None)
+    if table is None:
+        table = {}
+        holder._pp_census_throttle = table
+    st = table.get(marker)
+    key = repr(content)
+    if st is None or st["key"] != key:
+        held = st["held"] if st is not None else 0
+        table[marker] = {"key": key, "k": 0, "passes": 1, "held": 0, "t_emit": now, "t0": now}
+        return (" [census: content changed after %d unchanged pass(es) held back]" % held) if held else ""
+    st["passes"] += 1
+    due_passes = 1 << (st["k"] + 1)           # 2, 4, 8, ... passes since the change
+    due_s = float(1 << st["k"])               # 1, 2, 4, ... seconds since the last line
+    if st["passes"] >= due_passes and now - st["t_emit"] >= due_s:
+        st["k"] += 1
+        held, st["held"], st["t_emit"] = st["held"], 0, now
+        return (" [census: UNCHANGED for %d passes / %.0f s since the change; %d identical line(s) held "
+                "back, next after %d passes and %.0f s]" % (st["passes"], now - st["t0"], held,
+                                                              1 << (st["k"] + 1), float(1 << st["k"])))
+    st["held"] += 1
+    return None
+
+
+def _census_log(holder, marker: str, fmt: str, *args, key=None) -> bool:
+    """logger.warning(fmt, *args) through :func:`_census_throttle`; the count rides on the SAME line
+    (so N unchanged passes stay <= log2(N)+1 lines). ``key`` = what counts as the line's STATE when
+    some arguments are pure pass counters (#1000's seen/reason counts, #996's admission and site
+    counts rise on every pass of a livelock and would make every line "new"); default: all
+    arguments. The line itself always prints the current values. Returns whether it was written."""
+    suffix = _census_throttle(holder, marker, args if key is None else key)
+    if suffix is None:
+        return False
+    logger.warning(fmt + "%s", *args, suffix)
+    return True
+
+
 def _pp_ring_commit_budget_s() -> float:
     raw = os.environ.get(ENV_RING_COMMIT_BUDGET)
     if raw is None:
@@ -2649,7 +2702,8 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
                 _998_SEEN,
             )
 
-            logger.warning(
+            _census_log(
+                holder, "#998",
                 "#998 EXTEND-INVARIANT rank=%s seen=%d breaks=%d tracked=%d "
                 "sample=%s. Tuple is (start, end, len_prefix, len_input, "
                 "BREAK); BREAK = start - len(prefix_indices) and MUST be 0 "
@@ -2687,7 +2741,8 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
             # Denominator first and unconditional, then EVERY reason -- a
             # MOVED-ON of 0 is only a statement if the reasons beside it show
             # the probe was actually asked.
-            logger.warning(
+            _census_log(
+                holder, "#1000",
                 "#1000 SLOT-OCCUPANT rank=%s seen=%d reasons=%s specimens=%s. "
                 "MOVED-ON = this rank holds an occupant its upstream no longer "
                 "names for the slot, i.e. work that can never receive a proxy "
@@ -2702,6 +2757,8 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
                 _1000_SEEN[0],
                 dict(sorted(_1000_REASONS.items())) or "-",
                 _1000_SPECIMENS[:3] or "-",
+                key=(getattr(getattr(holder, "ps", None), "pp_rank", "?"),
+                     sorted(_1000_REASONS), repr(_1000_SPECIMENS[:3])),
             )
         except Exception:  # noqa: BLE001 - a census may never break admission
             pass
@@ -2711,7 +2768,8 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
             # is the check that cost boot 40. Denominator always, no hit
             # filter, sentinel -1 (0 is a legitimate output length).
             _m = getattr(holder, "_997d_last", None) or {}
-            logger.warning(
+            _census_log(
+                holder, "#997d",
                 "#997d OUTPUT-FILL rank=%s seen=%d tracked_rids=%d sample=%s. "
                 "Compare the SAME rid across ranks: a differing out_len means "
                 "the void path skipped this append on the lagging rank, which "
@@ -2740,7 +2798,8 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
         except Exception:  # noqa: BLE001 - a census may never break admission
             pass
         runs = list(hist)
-        logger.warning(
+        _census_log(
+            holder, "#996",
             "#996 group_floor=%s rank_budget=%s bound_by=%s. A floor of "
             "None means the #681 ceiling is NOT applied, so rank_budget caps "
             "extend_len on THIS rank alone; `bound_by` names WHICH term is "
@@ -2761,6 +2820,8 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
             max(runs) if runs else 0,
             (sum(runs) / len(runs)) if runs else 0.0,
             dict(sorted(counts.items())),
+            key=(getattr(holder, "_996_floor", "unset"), getattr(holder, "_996_budget", "unset"),
+                 getattr(holder, "_996_bind", "unset"), runs[-20:], sorted(counts)),
         )
 
 
