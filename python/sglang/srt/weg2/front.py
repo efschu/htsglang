@@ -3201,6 +3201,11 @@ class Pending:
     #: (Front._x_idle_regrant) serves it on D once D is idle and quiet.
     #: Only set under SGLANG_WEG2_X_IDLE_REGRANT (profile qwen27b).
     x_deferred: bool = False
+    #: #246b (NF y4c 04:39:57): the X this request was ROUTED on when the route
+    #: was LONG (the X-SOLO band floor X_busy while D was busy, else the live
+    #: X); phase_policy.needs_p() reads it: above it the request needs P. 0 =
+    #: not routed long / switch off.
+    x_routed: int = 0
     #: set when that drain handed it to D: its leg 2 then runs exactly as the
     #: SHORT route's (pending=None -- no leg 1 ever ran for it).
     d_direct: bool = False
@@ -7200,6 +7205,9 @@ class Front:
                     p_only=_verdict == VERDICT_STAGE,
                     # UNIFY S7 (27B RC7-X): queued by the busy/idle split, not by the phase.
                     x_deferred=_x_band_deferred and not short_refused,
+                    # #246b: needs P above the X it was routed on (ARRIVAL-SEAT)
+                    x_routed=(int(x_route) if route == "long"
+                              and envs.SGLANG_WEG2_ENABLE_X_ROUTED_NEEDS_P.get() else 0),
                     # 27B idle policy (b): only a request whose OWN route is SHORT
                     # may later be handed to D by --d-short-drain-tokens -- and
                     # only when it is queued because of the PHASE (the field's
@@ -7803,7 +7811,12 @@ class Front:
                 p.rid, int(getattr(p, "est_uncached", 0) or 0))
         else:
             fits, why = False, "no seat"
-        v = _asr.verdict(free, fits, int(getattr(p, "est_uncached", 0) or 0), x_tok)
+        # #246b: the X the head was routed on (X_busy band floor) decides D vs P
+        _x_p = int(getattr(p, "x_routed", 0) or 0)
+        v = _asr.verdict(free, fits, int(getattr(p, "est_uncached", 0) or 0),
+                         min(x_tok, _x_p) if _x_p > 0 else x_tok)
+        if 0 < _x_p < x_tok:
+            why = "%s x_routed=%d (routed LONG on the X_busy band floor)" % (why, _x_p)
         head = p
         displaced = None
         if v == _asr.WAIT_SEAT and free and not fits:
