@@ -8,6 +8,8 @@
 #            [--release <version>] [--cu cu130] [--since 2026-09-01]
 #            [--kernels <list> ...] [--profiles "<name> ..."] [--source <url>] [--allow-unpushed]
 #            [--host] [--emit-kernels] [--no-hash] [--accepted "27b nf"] [--mem-profile auto|full|nf]
+#   --require-in-27b <ref> (repeatable, 30.09.): a MERGE POINT -- <ref> must be an ancestor of the 27B revision, else a
+#   ctx blocker (release plan: the dual layout desk/27b-dual-tp3pp3-0929 at its frozen sha must be merged into the 27B head).
 #   --rev-nf (30.09., two frozen heads): the NF slot gets ITS OWN revision (src-nf/ = its own shallow clone), as the duo
 #   delta images carry today (27b d79ab218e4 + nf 351aa9c20f on rc12g-flat). Without --rev-nf, or with the same commit,
 #   both slots carry one tree exactly as before (FLAT-2). The Dockerfile learns which via the bake point FLLIPER_ONE_TREE.
@@ -69,7 +71,7 @@ _SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 if [ -z "${DFF:-}" ]; then if [ -f "$_SELF_DIR/Dockerfile.flliper" ]; then DFF=$_SELF_DIR/Dockerfile.flliper; else DFF=$HERE/Dockerfile.flliper; fi; fi
 KERNEL_LISTS_DEFAULT="delta_kernels_rc10u.txt delta_kernels_rc9dwin.txt delta_kernels_rc9f.txt delta_kernels_rc9c.txt delta_kernels_rc9b.txt delta_kernels_rc9.txt"
 
-PLAN=0; WRITE=0; REV_IN=""; BRANCH=""; REV_NF_IN=""; BRANCH_NF=""; REL=""; CU=cu130; KLISTS=(); PROFILES=$PROFILES_DEFAULT; HOST=0; EMIT=0; HASH=1
+PLAN=0; WRITE=0; REV_IN=""; BRANCH=""; REV_NF_IN=""; BRANCH_NF=""; REQ27=(); REL=""; CU=cu130; KLISTS=(); PROFILES=$PROFILES_DEFAULT; HOST=0; EMIT=0; HASH=1
 SINCE=2026-09-01; SOURCE=""; ALLOW_UNPUSHED=0; ACCEPTED=$ACCEPTED_DEFAULT; MEMPROF=auto; LOCK_FOLD=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -84,6 +86,7 @@ while [ $# -gt 0 ]; do
     --rev) REV_IN=$2; shift 2 ;;
     --branch) BRANCH=$2; shift 2 ;;
     --rev-nf) REV_NF_IN=$2; shift 2 ;;
+    --require-in-27b) REQ27+=("$2"); shift 2 ;;
     --branch-nf) BRANCH_NF=$2; shift 2 ;;
     --release) REL=$2; shift 2 ;;
     --cu) CU=$2; shift 2 ;;
@@ -188,6 +191,11 @@ else
 fi
 # the 27B slot is the primary line (image revision label, stage-B note, Dockerfile step 7 sources)
 REV=$REV_27B; SHA10=$SHA10_27B; BRANCH=$BRANCH_27B; PUSH_STATE=$PUSH_STATE_27B; PKG=$PKG_27B; PDF=$PDF_27B; RENAMED=$RENAMED_27B
+for rq in "${REQ27[@]}"; do
+  rs=$("${G[@]}" rev-parse --verify -q "${rq}^{commit}") || { blocker "merge point $rq unknown in $REPO"; continue; }
+  if "${G[@]}" merge-base --is-ancestor "$rs" "$REV_27B" 2>/dev/null; then ok "merge point $rq (${rs:0:10}) is in the 27B tree ${SHA10_27B}"
+  else blocker "merge point $rq (${rs:0:10}) is NOT in the 27B tree ${SHA10_27B} -- merge it first ($("${G[@]}" rev-list --count "$REV_27B..$rs") commits missing)"; fi
+done
 if [ "$REV_NF" = "$REV_27B" ]; then ONE_TREE=1; say "   ONE tree: both slots carry ${SHA10} (FLAT-2)"
 else ONE_TREE=0; say "   TWO trees: src-27b @ ${SHA10_27B} ($BRANCH_27B), src-nf @ ${SHA10_NF} ($BRANCH_NF) -- as the duo delta images; FLAT-2 relaxed (FLLIPER_ONE_TREE=0)"
   [ "$PKG_27B" = "$PKG_NF" ] || warn "the two trees differ in layout (27b: python/$PKG_27B, nf: python/$PKG_NF) -- the image allows it (layout-agnostic step 4), the release wants both renamed"

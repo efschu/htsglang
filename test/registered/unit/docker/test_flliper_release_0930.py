@@ -158,6 +158,28 @@ class TestMakeFlatCtx(unittest.TestCase):
         self.assertNotIn("-- slot nf", p.stdout)
 
 
+    @unittest.skipUnless(RIG_OK, "rig repo / reference venv / profiles not present")
+    def test_merge_point_is_enforced(self):
+        """--require-in-27b: the dual layout is planned as a MERGE POINT of the 27B head -- a ref that is not an
+        ancestor of the 27B revision is a ctx blocker (plan rc 3); an ancestor passes."""
+        r27 = _rev("refs/heads/desk/27b-z30y3-integ-0929")
+        if not r27:
+            self.skipTest("27B line head not present")
+        base = ["bash", str(MAKE), "--plan", "--no-hash", "--rev", r27, "--branch", "desk/27b-z30y3-integ-0929",
+                "--release", "0.0.0-test"]
+        env = dict(os.environ, CTX_ROOT=tempfile.mkdtemp())
+        anc = subprocess.run(["git", "-C", str(RIG), "rev-parse", r27 + "~3"], capture_output=True, text=True).stdout.strip()
+        p = subprocess.run(base + ["--require-in-27b", anc], capture_output=True, text=True, env=env, timeout=300)
+        self.assertIn(f"merge point {anc} ({anc[:10]}) is in the 27B tree", p.stdout)
+        # a commit that is NOT in the 27B tree: the 27B head's parent's sibling never is -- use the NF head if present
+        other = _rev("refs/remotes/origin/desk/nf-wake-tail-0930") or _rev("refs/heads/desk/nf-wake-tail-0930")
+        if not other:
+            self.skipTest("no foreign head to test the refusal")
+        p = subprocess.run(base + ["--require-in-27b", other], capture_output=True, text=True, env=env, timeout=300)
+        self.assertEqual(p.returncode, 3)
+        self.assertIn("is NOT in the 27B tree", p.stdout)
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # flliper_postcheck.sh against a docker stub
 # ---------------------------------------------------------------------------------------------------------------------
