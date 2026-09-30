@@ -317,6 +317,21 @@ HG_SWITCHES: Tuple[str, ...] = (
     "SGLANG_DFLASH_ACCEPT_SYNC_FUSED",
     "SGLANG_BARLINK_BAR1_CANON_ORDER",
 )
+#: 27B row 24h, the HG BASE (30.09., Leistungsschalter second pass): the four
+#: switches the dhg measurement ran UNDER in both arms (profiles/27b-int8-dhg.env:
+#: "Form = 27b.env (u.a. D_DEFER_SEQ_LENS_CPU=1 + D_DEFER_REBUILD=1,
+#: PLAN_SYNC_FREE=1, WINDOW_POOL_SYNC_FREE=1) plus genau die Schalter unten"),
+#: set by every 27B profile since RC9 (27b.env). EARLY_DRAFT is stage 3 of the
+#: deferred length read and inert without it, so a row with
+#: ``d_hostgap_levers`` needs ``d_hostgap_base``. All four act only in the
+#: DFLASH D worker (the only ``supports_deferred_seq_lens_cpu`` worker; NF's D
+#: is MTP), one registry field ``d_hostgap_base``.
+HG_BASE_SWITCHES: Tuple[str, ...] = (
+    "SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU",
+    "SGLANG_WEG2_D_DEFER_REBUILD",
+    "SGLANG_DFLASH_PLAN_SYNC_FREE",
+    "SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE",
+)
 #: the one of them P and D must run identically (Befund M: the rendered
 #: prompt, hence the prefix keys, differ otherwise)
 PREFIX_SWITCH_P_EQ_D: Tuple[str, ...] = ("SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE",)
@@ -537,6 +552,15 @@ class ModelProfile:
     #: CANON_ORDER would change its BAR1 reduction order unproven. An
     #: explicitly set env wins per switch.
     d_hostgap_levers: bool = False
+    #: 27B row 24h, :data:`HG_BASE_SWITCHES` on as ONE field -- the form the
+    #: HG levers were measured under (both dhg arms, 27b.env since RC9) and the
+    #: stage they act on. Metal markers in every 27B boot since, e.g. D log of
+    #: dkr27browauthoritybar1fs09291750 (410bb48e32): 'DGAP-DEFER armed'
+    #: 3/3 ranks, 'DFLASH window pool: SYNC-FREE mapper armed' 3/3; own
+    #: metal number of stage 1 (window pool): xsn423 round median 37.0 ms
+    #: after the host wait moved (ff3d9ccfc3). qwen27b on (30.09.), nextflash
+    #: off (its D is MTP; the four never act there). Explicit env wins.
+    d_hostgap_base: bool = False
     #: 27B row 24b: --d-token-placement (weg2/d_token_placement.py) -- where
     #: group D's NEW KV tokens land. The launcher's DEFAULT for an unset flag
     #: on a checkpoint whose registry format is in ``d_token_placement_formats``
@@ -572,6 +596,8 @@ class ModelProfile:
         out["SGLANG_WEG2_FRONT_EXACT_TOKENS"] = bool(self.front_exact_tokens)
         for env_name in HG_SWITCHES:
             out[env_name] = bool(self.d_hostgap_levers)
+        for env_name in HG_BASE_SWITCHES:
+            out[env_name] = bool(self.d_hostgap_base)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -749,6 +775,8 @@ PROFILES: Dict[str, ModelProfile] = {
         driver_carve_min_total_mib=32000,
         # HG (row 24h): proven together in dhg09261456 -- see the field.
         d_hostgap_levers=True,
+        # HG base (row 24h): the form HG was measured under -- see the field.
+        d_hostgap_base=True,
         # row 24b: bandwidth on INT8 only (rc9meas -1.1 ... -3.1 % in depth).
         # --d-reshard stays off (wake-seg + drq: gain at 6 of 24 points, the
         # drq preset has no A/B of its own -- inventory class b).
@@ -906,6 +934,7 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: SGLANG_WEG2_D_PARK_IMMEDIATE (``d_park_immediate``, 27B park 26.09.).
 #: SGLANG_WEG2_FRONT_EXACT_TOKENS (``front_exact_tokens``, X-EXACT 26.09.).
 #: :data:`HG_SWITCHES` (``d_hostgap_levers``, 27B row 24h, on 29.09.).
+#: :data:`HG_BASE_SWITCHES` (``d_hostgap_base``, 27B row 24h, on 30.09.).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }

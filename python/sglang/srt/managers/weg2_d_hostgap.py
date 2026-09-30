@@ -81,13 +81,24 @@ D_HOSTGAP_SPLIT_ENV = "SGLANG_WEG2_D_HOSTGAP_SPLIT"
 
 def defer_seq_lens_cpu_on() -> bool:
     """The deferred length read.  Read per call (an env lookup), so a test can
-    flip it; the scheduler caches it once at its first decode round."""
-    return os.environ.get(D_DEFER_SEQ_LENS_CPU_ENV, "") == "1"
+    flip it; the scheduler caches it once at its first decode round.  An
+    explicitly set value decides as always (only ``1`` arms); unset or blank
+    takes the published form's profile default (the HG base, 27B row 24h,
+    ``ModelProfile.d_hostgap_base``: qwen27b on since 30.09., nextflash off;
+    no form: off) -- the stage the registry-on HG levers act on."""
+    raw = os.environ.get(D_DEFER_SEQ_LENS_CPU_ENV, "")
+    if raw.strip():
+        return raw == "1"
+    return _profile_switch_on(D_DEFER_SEQ_LENS_CPU_ENV, os.environ.get(_FORM_ENV, ""))
 
 
 def defer_rebuild_on() -> bool:
-    """Stage 2 of the deferred read; inert unless the deferral itself is on."""
-    return os.environ.get(D_DEFER_REBUILD_ENV, "") == "1"
+    """Stage 2 of the deferred read; inert unless the deferral itself is on.
+    Explicit value / profile default as :func:`defer_seq_lens_cpu_on`."""
+    raw = os.environ.get(D_DEFER_REBUILD_ENV, "")
+    if raw.strip():
+        return raw == "1"
+    return _profile_switch_on(D_DEFER_REBUILD_ENV, os.environ.get(_FORM_ENV, ""))
 
 
 def early_draft_on() -> bool:

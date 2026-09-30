@@ -314,8 +314,11 @@ class Envs:
     # DFLASH window pool (SGLANG_DFLASH_WINDOW_POOL=1): run the draft-slot
     # mapper and the per-round window rebuild without host reads, so the host
     # is not held behind the verify (dflash_solo_pool sync-free mode). Off =
-    # the legacy mapper, byte-identical.
-    SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE = EnvBool(False)
+    # the legacy mapper, byte-identical. Default: the HG base of the published
+    # form's profile (weg2/form.py ModelProfile.d_hostgap_base, qwen27b on
+    # since 30.09., nextflash off); off without a form; explicit value wins.
+    SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE = EnvBool(
+        _profile_default("SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE", False))
     # DFLASH window pool, radix-dedup draft-row carry (27b-draftholes 26.09.):
     # when an insert frees a request's fresh KV slots in favour of the tree's
     # own (same tokens), move the draft rows the fresh slots hold to the kept
@@ -334,8 +337,21 @@ class Envs:
     # repeat_interleave, prefill.py plan .to("cpu"), flashinfer_backend
     # _host_sum_or_device). The verify's owned-slot index is built BEFORE the
     # draft in stream order and read back through an event that fires ahead
-    # of the draft. Off = the old planning path, byte-identical.
-    SGLANG_DFLASH_PLAN_SYNC_FREE = EnvBool(False)
+    # of the draft. Off = the old planning path, byte-identical. Default: the
+    # HG base (ModelProfile.d_hostgap_base, as WINDOW_POOL_SYNC_FREE above).
+    SGLANG_DFLASH_PLAN_SYNC_FREE = EnvBool(
+        _profile_default("SGLANG_DFLASH_PLAN_SYNC_FREE", False))
+    # 27B row 24h, the HG BASE (30.09.): the deferred host-length read and its
+    # stage 2 (managers/weg2_d_hostgap.py). The HG levers below act only on a
+    # deferred round (EARLY_DRAFT is stage 3 of this read), and the dhg
+    # measurement ran with all four base switches on in both arms. The reader
+    # (weg2_d_hostgap.defer_seq_lens_cpu_on / defer_rebuild_on) keeps its
+    # parse of an explicit value (only "1" arms) and takes this default when
+    # the env is unset or blank.
+    SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU = EnvBool(
+        _profile_default("SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU", False))
+    SGLANG_WEG2_D_DEFER_REBUILD = EnvBool(
+        _profile_default("SGLANG_WEG2_D_DEFER_REBUILD", False))
     # 27B row 24h (HG): the three D host-gap levers, ONE registry field
     # (weg2/form.py ModelProfile.d_hostgap_levers: qwen27b on since 29.09.,
     # nextflash off); off without a form; an explicitly set value wins. The
