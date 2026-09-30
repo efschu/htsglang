@@ -250,11 +250,41 @@ def _rid(req) -> str:
     return str(getattr(req, "rid", ""))
 
 
+def forget_rid_leftovers(tree, rid: str) -> bool:
+    """DUAL-TP3PP3 (metal tnybbz 30.09., rid weg2-0-8): drop the prefetch
+    records an EARLIER instance of this rid left on this rank's tree.
+
+    Under the dual layout P never sleeps, so nothing resets its per-rid state
+    between two requests that share a rid -- and the front does send a rid
+    back through P (W50-REROUTE after D's X refusal). The completion record is
+    deliberately NOT popped at admission (the ring report reads it later), so
+    instance 2's told compared instance 1's 36863 as its span: PP0 'TK
+    ABS-TOLD head=36863 span=36863 told=73726', PP1 'STORE-TOLD MISMATCH
+    told=40765 own_prefix=73726' -> W17. A NEW request cannot own a record
+    yet, so whatever is there at intake is a leftover. A live read of the rid
+    is never touched. Only under dual-share (SGLANG_WEG2_DUAL_SHARE=1, P)."""
+    if os.environ.get("SGLANG_WEG2_DUAL_SHARE", "").strip() != "1":
+        return False
+    rid = str(rid)
+    if rid in (getattr(tree, "ongoing_prefetch", None) or {}):
+        return False
+    dropped = []
+    for attr in ("_prefetch_completed_tokens", "prefetch_loaded_tokens_by_reqid"):
+        d = getattr(tree, attr, None)
+        if isinstance(d, dict) and rid in d:
+            dropped.append("%s=%s" % (attr, d.pop(rid)))
+    if dropped:
+        logger.warning("DUAL-TP3PP3 RID-REUSE rid=%s: a new instance found leftovers of an earlier one "
+                       "on this rank, dropped: %s", _rt(rid), ", ".join(dropped))
+    return bool(dropped)
+
+
 def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
     """The intake step. PP0: register as today and hold. Follower: hold only;
     the registration happens in :func:`follower_absorb` with PP0's told."""
     held: Dict[str, Any] = scheduler._weg2_store_held
     rid = _rid(req)
+    forget_rid_leftovers(scheduler.tree_cache, rid)
     if int(scheduler.ps.pp_rank) == 0:
         if _twin.intake_defer(scheduler, req):
             # TW: a fork twin of a request in flight on P -- held WITHOUT a
