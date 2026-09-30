@@ -512,23 +512,67 @@ def progress_key(front: dict):
     return [sum(int(v or 0) for v in served_.values() if isinstance(v, (int, float))), tok_sum]
 
 
-def progress_step(memo, st: dict, now: float, stall_s: float):
+def rank_work(d: str) -> Optional[int]:
+    """Summe der Arbeitszähler aller Ränge (``<d>/rankstate/*/*.rankstats``, weg2/rankstats.py,
+    der Fortschrittsvertrag ``progress`` = tokens_done + fwd_ct; ältere Dateien: tokens + work) --
+    dieselbe Lesart wie progress_watch.rank_work. None = keine lesbare Datei (kein Zeuge)."""
+    import glob
+
+    tot, seen = 0, 0
+    for f in glob.glob(os.path.join(d, "rankstate", "*", "*.rankstats")):
+        try:
+            with open(f) as fh:
+                r = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        seen += 1
+        pr = r.get("progress") or {}
+        if pr:
+            tot += int(pr.get("tokens_done") or 0) + int(pr.get("fwd_ct") or 0)
+        else:
+            tk = r.get("tokens") or {}
+            tot += int(tk.get("prefill_total") or 0) + int(tk.get("decode_total") or 0)
+            tot += int((r.get("work") or {}).get("forward_ct") or 0)
+    return tot if seen else None
+
+
+def only_nonstream(front: dict) -> bool:
+    """y5c (30.09. 19:32:42Z): sind ALLE offenen Requests Nicht-Stream? Dann sieht die Front bis zu
+    ihrem Ende kein Token (served/served_tokens stehen), obwohl D decodiert. Quelle: das
+    OutstandingBook der Front (``outstanding_n``, ``outstanding_nonstream_n``); ein Boot ohne das
+    Feld zählt als Stream (der alte Riegel, unverändert)."""
+    ns, n = front.get("outstanding_nonstream_n"), front.get("outstanding_n")
+    try:
+        return ns is not None and n is not None and int(n) > 0 and int(ns) >= int(n)
+    except (TypeError, ValueError):
+        return False
+
+
+def progress_step(memo, st: dict, now: float, stall_s: float, work: Optional[int] = None):
     """Ein Schritt des Riegels, rein (kein I/O). ``memo`` = der Merker des vorigen Schritts
     (None beim ersten). Rückgabe ``(memo_neu, ereignis)``, ereignis None | "HAENGT" | "LAEUFT".
     Zurückgesetzt wird bei: anderem boot_id, Zustand nicht serving/flipping, outstanding == 0,
-    Bewegung von served/served_tokens. HAENGT einmal beim Eintritt, LAEUFT beim Austritt
-    (nur im selben Boot)."""
+    Bewegung von served/served_tokens -- und, NUR wenn alle offenen Requests Nicht-Stream sind
+    (:func:`only_nonstream`), Bewegung der Rang-Arbeit ``work`` (:func:`rank_work`; y5c: zwei
+    Nicht-Stream-Requests, D decodierte bs2 weiter, served stand 61 s -> falscher Stall-Tod).
+    Steht die Rang-Arbeit, bleibt der Stall echt. HAENGT einmal beim Eintritt, LAEUFT beim
+    Austritt (nur im selben Boot)."""
     boot = st.get("boot_id")
     lc = (st.get("lifecycle") or {}).get("state")
     fr = st.get("front") or {}
     key = progress_key(fr)
     out = int(fr.get("outstanding") or 0)
     m = dict(memo or {})
-    if (not m or m.get("boot") != boot or m.get("key") != key or out <= 0 or lc not in PROGRESS_LIVE):
+    prev_work = m.get("work")
+    work_moved = (only_nonstream(fr) and work is not None and prev_work is not None
+                  and int(work) != int(prev_work))
+    if (not m or m.get("boot") != boot or m.get("key") != key or work_moved or out <= 0
+            or lc not in PROGRESS_LIVE):
         ev = "LAEUFT" if (m.get("stalled") and m.get("boot") == boot) else None
         since = m.get("since")
-        return {"boot": boot, "key": key, "since": now, "stalled": False,
+        return {"boot": boot, "key": key, "since": now, "stalled": False, "work": work,
                 "stalled_for": (now - float(since if since is not None else now)) if ev else 0.0}, ev
+    m["work"] = work
     if not m.get("stalled") and now - float(m["since"]) >= float(stall_s):
         m["stalled"] = True
         return m, "HAENGT"
@@ -547,23 +591,27 @@ def deadman_progress(d: str, memo_path: str, stall_s: float = PROGRESS_STALL_S_D
         memo = json.load(open(memo_path))
     except (OSError, ValueError):
         memo = None
-    new, ev = progress_step(memo, st, now, stall_s)
+    fr = st.get("front") or {}
+    # Rang-Arbeit nur lesen, wenn sie zählen darf (alle offenen Requests Nicht-Stream)
+    work = rank_work(d) if only_nonstream(fr) else None
+    new, ev = progress_step(memo, st, now, stall_s, work=work)
     write_json_atomic(memo_path, new)
     if ev is None:
         return ""
-    fr = st.get("front") or {}
     base = {"boot_id": st.get("boot_id"), "ts": round(now, 3), "stall_s": float(stall_s),
             "outstanding": int(fr.get("outstanding") or 0), "outstanding_by_group": fr.get("outstanding_by_group"),
             "queue": fr.get("queue"), "awake": fr.get("awake"), "front_state": fr.get("state"),
-            "served": new["key"][0], "tokens": new["key"][1]}
+            "served": new["key"][0], "tokens": new["key"][1],
+            "nonstream_only": only_nonstream(fr), "rank_work": work}
     stamp = time.strftime("%H:%M:%SZ", time.gmtime(now))
     if ev == "HAENGT":
         rec = {"verdict": "HAENGT", "since_ts": round(float(new["since"]), 3), **base}
         line = (f"DEADMAN[PROGRESS-STALL] {stamp} HAENGT boot={base['boot_id']} outstanding={base['outstanding']} "
                 f"by_group={base['outstanding_by_group']} queue={base['queue']} awake={base['awake']} "
                 f"state={base['front_state']}: kein Fortschritt seit {now - float(new['since']):.0f} s "
-                f"(served={base['served']} tokens={base['tokens']}, Schwelle {float(stall_s):.0f} s) -- "
-                f"Zustand, KEIN Stop")
+                f"(served={base['served']} tokens={base['tokens']}"
+                + (f", nur Nicht-Stream, Rang-Arbeit {work} steht" if base["nonstream_only"] else "")
+                + f", Schwelle {float(stall_s):.0f} s) -- Zustand, KEIN Stop")
     else:
         rec = {"verdict": "LAEUFT", "stalled_for_s": round(float(new["stalled_for"]), 1), **base}
         line = (f"DEADMAN[PROGRESS-STALL] {stamp} LAEUFT WIEDER boot={base['boot_id']} nach "

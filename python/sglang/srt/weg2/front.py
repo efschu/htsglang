@@ -6530,6 +6530,16 @@ class Front:
         out["outstanding_by_group"] = {g.name: len(g.outstanding) for g in self.groups.values()}
         out["served"] = {g.name: g.served for g in self.groups.values()}
         out["served_tokens"] = dict(self.__dict__.get("_ipc_served_tokens") or {})
+        # NF y5c: how many outstanding legs belong to non-stream requests (blind to the
+        # front until their end); entries of ended rids age out after an hour
+        _ns = self.__dict__.setdefault("_ipc_stream_of", {})
+        _now = time.time()
+        for _r in [r for r, (_s, t) in _ns.items() if _now - t > 3600.0]:
+            _ns.pop(_r, None)
+        _live = {r for g in self.groups.values() for r in (getattr(g, "outstanding", None) or {})}
+        # the two fields NF's OutstandingBook publishes (f0bc387040) -- state_file.only_nonstream reads them
+        out["outstanding_n"] = len(_live)
+        out["outstanding_nonstream_n"] = sum(1 for r in _live if r in _ns and not _ns[r][0])
         out["d_phase_n"] = getattr(self, "_d_phase_n", None)
         out["d_parked_n"] = len(getattr(self, "_d_parked", None) or {})
         # FEHLT 1 (30.09.; 27B d_phase_n null): D's seats on EVERY front. A
@@ -7165,6 +7175,11 @@ class Front:
             self.counters["W22_Weg2SpanUnknownPricedFull"] += 1
         self.counters["requests"] += 1
         stream = bool(payload.get("stream"))
+        # NF y5c (f0bc387040): a non-stream answer is forwarded whole at its end, so the
+        # front sees none of its tokens in between -- the state names it
+        # (state_file.only_nonstream: rank work then counts as progress, 60e26b59d1)
+        _ns = self.__dict__.setdefault("_ipc_stream_of", {})
+        _ns[rid] = (bool(stream), time.time())
         exact = self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
         if _xx is not None:
             exact = _xx.n
