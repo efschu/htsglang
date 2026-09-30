@@ -107,6 +107,7 @@ from sglang.srt.mem_cache.mamba_ckpt_utils import weg2_max_states_per_path
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.weg2.turn_anchor import PENDING_ATTR as _TURN_PENDING_ATTR
 from sglang.srt.weg2.turn_anchor import TWIN_PENDING_ATTR as _TWIN_PENDING_ATTR
+from sglang.srt.weg2.turn_anchor import FORK_PENDING_ATTR as _FORK_PENDING_ATTR
 
 
 def bigram_anchor_key(token_ids, cache_len: int, extra_key, *, is_bigram: bool,
@@ -2617,7 +2618,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # TWIN ANCHOR (weg2/twin_anchor.py): the step's twin-boundary tracks
         # ride the same insert, in position order.
         if (getattr(req, _TURN_PENDING_ATTR, None) is not None
-                or getattr(req, _TWIN_PENDING_ATTR, None)):
+                or getattr(req, _TWIN_PENDING_ATTR, None)
+                or getattr(req, _FORK_PENDING_ATTR, None) is not None):
             self._weg2_turn_insert(req, is_insert=is_insert)
 
         kv_committed_len = req.pop_committed_kv_cache()
@@ -2801,7 +2803,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # first, as its own node below this chunk's insert (only with a plan
         # pending; unarmed nothing is asked) -- with the twin-boundary tracks
         if (getattr(req, _TURN_PENDING_ATTR, None) is not None
-                or getattr(req, _TWIN_PENDING_ATTR, None)):
+                or getattr(req, _TWIN_PENDING_ATTR, None)
+                or getattr(req, _FORK_PENDING_ATTR, None) is not None):
             self._weg2_turn_insert(req)
 
         token_ids = req.get_fill_ids()
@@ -2997,8 +3000,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         from sglang.srt.weg2 import turn_anchor as _ta
 
-        # TWIN ANCHOR: the turn plan and the step's twin-boundary plans, lowest
-        # position first -- each is its own node on the request's path.
+        # TWIN ANCHOR / FORK TRACK: the turn plan, the step's twin-boundary
+        # plans and its told-fork plan, lowest position first -- each is its
+        # own node on the request's path.
         for kind, pend in _ta.pop_all_pending(req):
             self._weg2_turn_insert_one(req, pend, kind=kind, is_insert=is_insert)
 

@@ -55,7 +55,10 @@ THE RULE (PP0 decides the fork at its told; every stage cuts at that number):
     C)``, C the configured chunk). A cut that would cost a forward (the ~1.7 s
     expert-stream floor per forward, H118) is not taken and counted as
     ``paid``. Nothing else moves: the end-anchor split, the fold and the
-    chunk budget stay as they were.
+    chunk budget stay as they were. A paid fork is not lost: the step that
+    runs through it draws one more extend track there (FORK TRACK,
+    weg2/turn_anchor.py ``_note_fork_step``, NF y5k weg2-0-4) -- the anchor
+    without the forward.
   * under ``SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL`` the cut is taken only where
     that rule donates an anchor anyway (``fork - p >= interval``); an
     anchorless boundary would buy nothing.

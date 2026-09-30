@@ -4020,6 +4020,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         page=self.token_to_kv_pool_allocator.page_size,
                         tok=_turn_tok,
                         twin_bounds=(self.weg2_twin_bounds or {}).get(req.rid, ()),
+                        # FORK TRACK: PP0's told fork (P-FORK-CUT), a track
+                        # there when this step runs through it uncut
+                        fork_told=int(getattr(req, "_weg2_fork_told", 0) or 0),
                     )
 
             if self.return_logprob:

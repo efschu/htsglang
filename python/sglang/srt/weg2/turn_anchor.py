@@ -57,6 +57,12 @@ position, no transport, no collective, no log line in any control path.
     or frees the slot when a mark is missing. The step's own insert follows
     unchanged (its protected prefix is now t).
 
+FORK TRACK (NF y5k, 30.09.): the same second-track form at PP0's told fork
+(``req._weg2_fork_told``, weg2/p_fork_cut.py) when P-FORK-CUT found the cut
+``paid`` -- the store's KV of this prompt ends there, so the next request with
+that prefix stops reading there; without an anchor at it, it fell back to the
+previous chunk anchor (``_note_fork_step``).
+
 COST. Compute: one gather row per GDN/PLE layer per request (~34 MiB of
 state copied on PP0 per anchor, ~50 us at card bandwidth, inside a forward of
 >= 1.7 s). Device: one mamba slot per request with a turn boundary in the
@@ -79,6 +85,10 @@ POS_ATTR = "_weg2_turn_pos"
 #: TWIN ANCHOR (30.09., weg2/twin_anchor.py): the step's twin-boundary tracks,
 #: a list of plans of the same shape as PENDING_ATTR's, ascending by position
 TWIN_PENDING_ATTR = "_weg2_twin_pending"
+#: FORK TRACK (30.09., NF y5k weg2-0-4): the step's track at PP0's told fork
+#: (``req._weg2_fork_told``, P-FORK-CUT) when the cut was not free -- one plan
+#: of the same shape as PENDING_ATTR's
+FORK_PENDING_ATTR = "_weg2_fork_pending"
 
 #: the generation prompt of a thinking Qwen3.x turn is 5 tokens, the
 #: non-thinking one 8; the same window the FORK ANCHOR uses.
@@ -324,11 +334,14 @@ def conv_starts(ext_lens_cpu: Sequence[int], rows: Sequence[int], targets: Seque
 # -- the scheduler side --------------------------------------------------------------
 def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
               prefix: int, end: int, track_mask: bool, main_track: Optional[int],
-              chunk: int, page: int, tok: int,
-              twin_bounds: Sequence[int] = ()) -> Optional[TurnTracks]:
-    """prepare_for_extend, per request: plan the second track of this step
-    and (TWIN ANCHOR, weg2/twin_anchor.py) one more track per twin boundary
-    ``twin_bounds`` inside it. Returns the (possibly new) batch descriptor."""
+              chunk: int, page: int, tok: Optional[int],
+              twin_bounds: Sequence[int] = (),
+              fork_told: int = 0) -> Optional[TurnTracks]:
+    """prepare_for_extend, per request: plan the second track of this step,
+    (TWIN ANCHOR, weg2/twin_anchor.py) one more track per twin boundary
+    ``twin_bounds`` inside it, and (FORK TRACK) one at PP0's told fork
+    ``fork_told`` when this step runs through it. Returns the (possibly new)
+    batch descriptor."""
     stale = getattr(req, PENDING_ATTR, None)
     if stale is not None:
         # a plan the tree never consumed (a path that skipped the insert):
@@ -343,9 +356,27 @@ def note_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
         _free_slot(batch, st_pend[1])
     if getattr(req, TWIN_PENDING_ATTR, None):
         setattr(req, TWIN_PENDING_ATTR, None)
+    fk_stale = getattr(req, FORK_PENDING_ATTR, None)
+    if fk_stale is not None:
+        _free_slot(batch, fk_stale[1])
+        setattr(req, FORK_PENDING_ATTR, None)
     if not track_mask or len(getattr(req, "output_ids", None) or ()) > 0:
         return desc
-    t_abs = req_anchor_pos(req, tok, page)
+    desc = _note_turn_twin_steps(batch, desc, req, row, prefix, end, main_track,
+                                 chunk, page, tok, twin_bounds)
+    if fork_told:
+        desc = _note_fork_step(batch, desc, req, row, prefix, end, main_track,
+                               chunk, page, int(fork_told))
+    return desc
+
+
+def _note_turn_twin_steps(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
+                          prefix: int, end: int, main_track: Optional[int], chunk: int,
+                          page: int, tok: Optional[int],
+                          twin_bounds: Sequence[int]) -> Optional[TurnTracks]:
+    """The turn track and the twin-boundary tracks of this step (the body of
+    :func:`note_step` before the fork track joined it, unchanged)."""
+    t_abs = req_anchor_pos(req, tok, page) if tok is not None else None
     t = step_target(prefix, end, t_abs, chunk, main_track)
     if twin_bounds:
         desc = _note_twin_steps(batch, desc, req, row, prefix, end, main_track, chunk,
@@ -426,10 +457,92 @@ def _note_twin_steps(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
     return desc
 
 
+def fork_target(prefix: int, end: int, fork: int, prompt_len: int, chunk: int,
+                page: int, main_track: Optional[int]) -> Optional[int]:
+    """FORK TRACK position of the step ``[prefix, end)`` for the told fork
+    ``fork``, or None. The deepest position ``<= min(fork, prompt_len - 1)``
+    that is page-aligned (a reader's claim ends on a page, the same floor as
+    P-FORK-CUT's ``fork_cut``) and on the step's FLA grid, strictly inside the
+    step and below its own track (:func:`step_target`). Pure."""
+    page, chunk = max(1, int(page)), int(chunk)
+    if chunk <= 0 or int(fork) <= int(prefix):
+        return None
+    t = (min(int(fork), int(prompt_len) - 1) // page) * page
+    # page and grid both: at most chunk / gcd(page, chunk) page steps down
+    for _ in range(max(1, chunk)):
+        if t <= int(prefix):
+            return None
+        if (t - int(prefix)) % chunk == 0:
+            return step_target(prefix, end, t, chunk, main_track)
+        t -= page
+    return None
+
+
+def _note_fork_step(batch: Any, desc: Optional[TurnTracks], req: Any, row: int,
+                    prefix: int, end: int, main_track: Optional[int], chunk: int,
+                    page: int, fork: int) -> Optional[TurnTracks]:
+    """FORK TRACK (NF y5k, 30.09.; P PP0 22:12:15, weg2-0-4).
+
+    PP0's told fork (``req._weg2_fork_told``, weg2/p_fork_cut.py) is the depth
+    to which the store holds this prompt's KV -- where the NEXT request with
+    this prefix will stop reading. P-FORK-CUT ends a chunk there only when the
+    cut is free; a follow-up turn is ONE forward, so the cut is ``paid`` and
+    nothing ever anchored the fork: 'P-FORK-CUT TOLD fork=12544 src=store',
+    the step ran [2560, 14096) through it, '#1028B FETCH CAP kv=196 claimed=40
+    lost=156 ... MAMBA=(1, 39)' -- 9984 readable KV tokens recomputed, and
+    again by every later request with the same fork.
+
+    One more track in the same forward (the turn anchor's machinery: one
+    gather row per GDN/PLE layer, one mamba slot from the pool, no eviction,
+    no reserve), inserted as its own node before the step's insert and
+    published with the chain. Rank-uniform: the told fork is PP0's verdict,
+    set alike on every stage at admission. Skipped where the turn or a twin
+    track already writes the same position."""
+    t = fork_target(prefix, end, fork, len(getattr(req, "origin_input_ids", None) or ()),
+                    chunk, page, main_track)
+    if t is None:
+        return desc
+    rid = str(getattr(req, "rid", "?"))
+    if int(getattr(req, "cache_protected_len", 0) or 0) >= t:
+        return desc
+    turn = getattr(req, PENDING_ATTR, None)
+    taken = {int(p[0]) for p in (getattr(req, TWIN_PENDING_ATTR, None) or ())}
+    if turn is not None:
+        taken.add(int(turn[0]))
+    if t in taken:
+        n = _count("fork_shared")
+        if _log_due(n):
+            logger.info("WEG2 FORK-ANCHOR SHARED rid=%s at=%d fork_told=%d step=[%d,%d) "
+                        "(n=%d; the turn/twin track writes this very position)",
+                        rid, t, fork, prefix, end, n)
+        return desc
+    slot = _alloc_slot(batch)
+    if slot is None:
+        n = _count("fork_no_slot")
+        if _log_due(n):
+            logger.info("WEG2 FORK-ANCHOR SKIP rid=%s reason=no_free_slot at=%d fork_told=%d "
+                        "step=[%d,%d) (n=%d; no eviction, no reserve)",
+                        rid, t, fork, prefix, end, n)
+        return desc
+    if desc is None:
+        desc = TurnTracks(len(batch.reqs), need=slot_state_kinds(batch.req_to_token_pool))
+    desc.add(row, slot, t, prefix, end - prefix)
+    setattr(req, FORK_PENDING_ATTR, (t, slot, desc, int(prefix), int(end)))
+    n = _count("fork_planned")
+    if _log_due(n):
+        logger.info(
+            "WEG2 FORK-ANCHOR TRACK n=%d rid=%s step=[%d,%d) at=%d fork_told=%d main=%s "
+            "(extra extend track at the store fork the step runs through: the next "
+            "request with this prefix reads its KV up to here instead of recomputing "
+            "from the previous anchor)", n, rid, prefix, end, t, fork, main_track)
+    return desc
+
+
 def has_pending(req: Any) -> bool:
-    """A turn or twin plan waits for the tree's next insert of ``req``."""
+    """A turn, twin or fork plan waits for the tree's next insert of ``req``."""
     return (getattr(req, PENDING_ATTR, None) is not None
-            or bool(getattr(req, TWIN_PENDING_ATTR, None)))
+            or bool(getattr(req, TWIN_PENDING_ATTR, None))
+            or getattr(req, FORK_PENDING_ATTR, None) is not None)
 
 
 def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
@@ -443,6 +556,10 @@ def pop_all_pending(req: Any) -> List[Tuple[str, Any]]:
     if twins:
         setattr(req, TWIN_PENDING_ATTR, None)
         out.extend(("twin", p) for p in twins)
+    fork = getattr(req, FORK_PENDING_ATTR, None)
+    if fork is not None:
+        setattr(req, FORK_PENDING_ATTR, None)
+        out.append(("fork", fork))
     out.sort(key=lambda kp: int(kp[1][0]))
     return out
 
@@ -560,10 +677,18 @@ def insert_verdict(pend) -> Tuple[bool, str]:
     return True, "ok"
 
 
+def _label(kind: str) -> str:
+    return {"twin": "TWIN-ANCHOR", "fork": "FORK-ANCHOR"}.get(kind, "TURN-ANCHOR")
+
+
+def _kind_prefix(kind: str) -> str:
+    return kind + "_" if kind in ("twin", "fork") else ""
+
+
 def note_insert(req: Any, t: int, prefix_len: int, taken: bool, prompt: int,
                 step: Tuple[int, int], kind: str = "turn") -> None:
-    label = "TWIN-ANCHOR" if kind == "twin" else "TURN-ANCHOR"
-    n = _count(("twin_" if kind == "twin" else "") + ("inserted" if taken else "exists"))
+    label = _label(kind)
+    n = _count(_kind_prefix(kind) + ("inserted" if taken else "exists"))
     from sglang.srt.weg2 import twin_anchor as _tw
 
     if kind == "twin" or _tw.status(str(getattr(req, "rid", "?")), int(t)) is not None:
@@ -578,8 +703,8 @@ def note_insert(req: Any, t: int, prefix_len: int, taken: bool, prompt: int,
 
 
 def note_skip(req: Any, reason: str, t: int, kind: str = "turn") -> None:
-    label = "TWIN-ANCHOR" if kind == "twin" else "TURN-ANCHOR"
-    n = _count(("twin_" if kind == "twin" else "") + "skip:" + reason.split(":")[0])
+    label = _label(kind)
+    n = _count(_kind_prefix(kind) + "skip:" + reason.split(":")[0])
     from sglang.srt.weg2 import twin_anchor as _tw
 
     if kind == "twin" or _tw.status(str(getattr(req, "rid", "?")), int(t)) is not None:
