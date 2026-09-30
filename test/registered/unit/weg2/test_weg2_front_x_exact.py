@@ -584,7 +584,11 @@ def test_off_never_reprices_and_the_hooks_sit_behind_the_switch():
     src = inspect.getsource(F.Front)
     assert "if self.x_exact:\n            # X-EXACT: a held (#49) credit is bound to its epoch" in src
     # 4th: _p_anchor_presence (PREFILL-EINBRUCH-0929 K1), returns before it when x_exact is off
-    assert src.count("self._x_exact_reprice_queue(") == 4
+    # 5th: _d_epoch_publish_presence (#49 L2), returns before it when x_exact is off or its switch is
+    assert src.count("self._x_exact_reprice_queue(") == 5
+    i = src.index("def _d_epoch_publish_presence(")
+    body = src[i:src.index("self._x_exact_reprice_queue(", i)]
+    assert "if not envs.SGLANG_WEG2_ENABLE_D_EPOCH_PUBLISH_PRESENCE.get() or not self.x_exact" in body
 
 
 def test_the_w31_requeue_counts_the_whole_prompt_exactly():

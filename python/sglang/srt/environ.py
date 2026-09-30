@@ -1449,6 +1449,11 @@ class Envs:
     # (release) or wake (resume) RPC outlives this many seconds (weg2/rpc_stall_watchdog.py). A normal
     # leg is 1.5-2.3 s; 0 = off. Costs nothing while nothing hangs.
     SGLANG_WEG2_RPC_STALL_WATCHDOG_S = EnvFloat(3.0)
+    # #49 L2 (30.09., desk/27b-front-span-49-0930): at a D->P flip done (D's sleep leg published its tree
+    # and joined the store queue) the texts D served in the ending epochs become store presences at D's own
+    # #59 weg2_resumable_depth, never the prompt (front_tokens.TokenSpans.promote_published). Front only;
+    # default off until the first 27B flip boot proves it.
+    SGLANG_WEG2_ENABLE_D_EPOCH_PUBLISH_PRESENCE = EnvBool(False)
     # The page grain of that end anchor (the store page, ArenaMHAHostPool #107).
     SGLANG_WEG2_FRONT_ANCHOR_PAGE = EnvInt(64)
     # H102 (Weg-2 front): a per-request watcher sees the client's connection
